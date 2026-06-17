@@ -1,0 +1,15 @@
+[package]
+name = "coppa-ml"
+description = "Channel quality prediction (EWMA) and MCS selection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+rustfft = { workspace = true }
+num-complex = { workspace = true }
+
+[features]
+default = []

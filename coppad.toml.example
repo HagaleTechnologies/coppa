@@ -1,0 +1,71 @@
+# Coppa Daemon Configuration
+# Copy to coppad.toml and edit as needed.
+
+[audio]
+# Sample rate in Hz. Must match engine (48000 for OFDM).
+sample_rate = 48000
+# Ring buffer size in samples.
+buffer_size = 8192
+# Audio input device name (substring match, case-insensitive).
+# Empty string = system default.
+input_device = ""
+# Audio output device name (substring match, case-insensitive).
+# Empty string = system default.
+output_device = ""
+
+[radio]
+# PTT method: "none", "vox", "serial", or "rigctld"
+ptt_method = "none"
+# rigctld TCP address (hamlib)
+rigctld_address = "127.0.0.1:4532"
+# Serial port for serial PTT (e.g. "/dev/ttyUSB0")
+serial_port = ""
+# Serial line for PTT: "dtr" or "rts"
+serial_line = "dtr"
+# Delay in ms after keying PTT before sending audio
+ptt_pre_delay_ms = 50
+# Delay in ms after audio ends before unkeying PTT
+ptt_tail_delay_ms = 200
+# Safety: max TX duration in seconds before forced unkey
+max_tx_duration_s = 30
+
+[host]
+# Address all host servers (VARA-style TCP, WebSocket) bind to.
+# Default "127.0.0.1" restricts access to this machine only.
+# WARNING: setting this to "0.0.0.0" (or any non-loopback address) exposes an
+# UNAUTHENTICATED control plane to the network. Anyone who can reach this host
+# could key your transmitter. Only change this on a trusted, firewalled network.
+bind_address = "127.0.0.1"
+# VARA-style TCP control interface (not RF/waveform-compatible with VARA)
+vara_enabled = false
+vara_command_port = 8300
+vara_data_port = 8301
+# WebSocket JSON API
+websocket_enabled = false
+websocket_port = 8400
+
+[engine]
+# Profile: HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY
+profile = "HF_STANDARD"
+# Station callsign (required for connected sessions)
+callsign = ""
+# Enable ARQ for reliable delivery
+arq_enabled = false
+
+# --- Session Configuration (for connected mode) ---
+# These are operational defaults; session parameters are
+# negotiated with the peer during connection setup.
+
+# [session]
+# ARQ window size (1-32, default 8)
+# arq_window = 8
+# Max retransmit attempts per frame (default 5)
+# max_retries = 5
+# Turnaround delay in ms between RX/TX switching (default 500)
+# turnaround_ms = 500
+# Connection timeout in seconds (default 30)
+# connect_timeout_s = 30
+# Idle timeout in seconds before session drops (default 120)
+# idle_timeout_s = 120
+# Max frames per TX turn before yielding (default 4)
+# max_frames_per_turn = 4

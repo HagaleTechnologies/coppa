@@ -1,0 +1,13 @@
+[package]
+name = "coppa-channel"
+description = "Channel models for testing Coppa digital communications"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rand = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }

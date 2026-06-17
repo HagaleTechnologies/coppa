@@ -1,0 +1,19 @@
+[package]
+name = "coppa-audio"
+description = "Audio I/O backends for Coppa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+coppa-dsp = { path = "../coppa-dsp" }
+anyhow = { workspace = true }
+rtrb = { workspace = true }
+cpal = { workspace = true, optional = true }
+hound = { workspace = true, optional = true }
+
+[features]
+default = ["cpal-backend", "file-backend"]
+cpal-backend = ["dep:cpal"]
+file-backend = ["dep:hound"]

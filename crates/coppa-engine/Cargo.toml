@@ -1,0 +1,18 @@
+[package]
+name = "coppa-engine"
+description = "Core engine for Coppa digital communications"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+coppa-dsp = { path = "../coppa-dsp" }
+coppa-codec = { path = "../coppa-codec" }
+coppa-protocol = { path = "../coppa-protocol" }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+coppa-channel = { path = "../coppa-channel" }
+approx = { workspace = true }
+rand = { workspace = true }

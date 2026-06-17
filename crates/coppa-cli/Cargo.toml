@@ -1,0 +1,29 @@
+[package]
+name = "coppa-cli"
+description = "CLI binary for Coppa digital communications"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "coppa"
+path = "src/main.rs"
+
+[dependencies]
+coppa-engine = { path = "../coppa-engine" }
+coppa-audio = { path = "../coppa-audio" }
+coppa-radio = { path = "../coppa-radio" }
+coppa-codec = { path = "../coppa-codec" }
+coppa-protocol = { path = "../coppa-protocol" }
+coppa-host = { path = "../coppa-host" }
+coppa-daemon = { path = "../coppa-daemon" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+default = ["file-backend"]
+file-backend = ["coppa-audio/file-backend"]
+cpal-backend = ["coppa-audio/cpal-backend"]
+kiss-tnc = ["coppa-host/kiss-tnc", "coppa-daemon/kiss-tnc"]

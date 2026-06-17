@@ -1,0 +1,20 @@
+[package]
+name = "coppa-radio"
+description = "Radio control backends for Coppa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+default = []
+# Stub features: these modules compile but do NOT control real hardware.
+# Actual serial PTT requires the `serialport` crate; actual GPIO PTT requires
+# Linux sysfs access. These stubs exist to define the interface and allow
+# testing without hardware dependencies.
+serial-ptt-stub = []
+gpio-ptt-stub = []

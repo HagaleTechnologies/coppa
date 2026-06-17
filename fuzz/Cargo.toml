@@ -1,0 +1,28 @@
+[package]
+name = "coppa-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+coppa-protocol = { path = "../crates/coppa-protocol" }
+coppa-codec = { path = "../crates/coppa-codec" }
+
+[[bin]]
+name = "fuzz_frame_parse"
+path = "fuzz_targets/fuzz_frame_parse.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_viterbi"
+path = "fuzz_targets/fuzz_viterbi.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_callsign"
+path = "fuzz_targets/fuzz_callsign.rs"
+doc = false

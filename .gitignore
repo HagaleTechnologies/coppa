@@ -1,0 +1,77 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo lock file (optional - remove this line if you want to commit Cargo.lock)
+# Cargo.lock
+
+# IDE and editor files
+.idea/
+*.swp
+*.swo
+*~
+.vscode/
+*.iml
+.DS_Store
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Profiling
+perf.data
+perf.data.old
+flamegraph.svg
+*.profdata
+
+# Test artifacts
+tarpaulin-report.html
+cobertura.xml
+
+# Documentation build
+/target/doc/
+
+# Benchmark results
+/target/criterion/
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+*.log
+
+# Environment files
+.env
+.env.local
+
+# Python cache (for any Python scripts)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Coverage reports
+*.lcov
+coverage/
+
+# Build scripts artifacts
+/build/
+/dist/
+
+# Audio test files (if generated)
+*.wav
+*.raw
+test_audio/
+
+# Configuration overrides (local dev)
+config.local.toml
+vara.local.toml
+
+# Git worktrees
+.worktrees/

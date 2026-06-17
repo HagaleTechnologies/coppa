@@ -1,0 +1,71 @@
+[workspace]
+members = [
+    "crates/coppa-dsp",
+    "crates/coppa-codec",
+    "crates/coppa-protocol",
+    "crates/coppa-channel",
+    "crates/coppa-audio",
+    "crates/coppa-radio",
+    "crates/coppa-ml",
+    "crates/coppa-engine",
+    "crates/coppa-host",
+    "crates/coppa-ffi",
+    "crates/coppa-cli",
+    "crates/coppa-daemon",
+]
+exclude = ["fuzz"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+crc = "3.2"
+rand = "0.9"
+num-complex = "0.4"
+rustfft = "6.2"
+approx = "0.5"
+smallvec = "1.13"
+rtrb = "0.3"
+cpal = "0.15"
+hound = "3.5"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "io-util", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+lz4_flex = "0.11"
+proptest = "1.5"
+criterion = { version = "0.5", features = ["html_reports"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Root package for workspace-level integration tests
+[package]
+name = "coppa"
+version = "0.1.0"
+edition = "2021"
+description = "Open-source ham radio digital communications system"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+coppa-engine = { path = "crates/coppa-engine" }
+coppa-codec = { path = "crates/coppa-codec" }
+coppa-protocol = { path = "crates/coppa-protocol" }
+coppa-dsp = { path = "crates/coppa-dsp" }
+
+[dev-dependencies]
+coppa-channel = { path = "crates/coppa-channel" }
+coppa-audio = { path = "crates/coppa-audio" }
+num-complex = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "throughput"
+harness = false

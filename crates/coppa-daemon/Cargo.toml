@@ -1,0 +1,36 @@
+[package]
+name = "coppa-daemon"
+description = "Long-running daemon for Coppa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "coppad"
+path = "src/main.rs"
+
+[lib]
+name = "coppa_daemon"
+path = "src/lib.rs"
+
+[dependencies]
+coppa-engine = { path = "../coppa-engine" }
+coppa-audio = { path = "../coppa-audio" }
+coppa-radio = { path = "../coppa-radio" }
+coppa-host = { path = "../coppa-host" }
+coppa-protocol = { path = "../coppa-protocol" }
+coppa-codec = { path = "../coppa-codec" }
+coppa-dsp = { path = "../coppa-dsp" }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+default = []
+cpal-backend = ["coppa-audio/cpal-backend"]
+websocket = ["coppa-host/websocket"]
+kiss-tnc = ["coppa-host/kiss-tnc"]

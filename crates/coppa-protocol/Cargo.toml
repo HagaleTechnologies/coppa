@@ -1,0 +1,19 @@
+[package]
+name = "coppa-protocol"
+description = "Protocol framing, FEC, ARQ, and session management for Coppa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+coppa-codec = { path = "../coppa-codec" }
+coppa-dsp = { path = "../coppa-dsp" }
+anyhow = { workspace = true }
+crc = { workspace = true }
+lz4_flex = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
+rand = { workspace = true }
+proptest = { workspace = true }

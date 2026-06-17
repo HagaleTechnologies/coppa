@@ -1,0 +1,22 @@
+[package]
+name = "coppa-host"
+description = "Host interfaces (TCP, WebSocket) for Coppa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+coppa-engine = { path = "../coppa-engine" }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tokio-tungstenite = { version = "0.21", optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[features]
+default = ["vara-tcp"]
+vara-tcp = []
+websocket = ["dep:serde", "dep:serde_json", "dep:tokio-tungstenite", "dep:futures-util"]
+kiss-tnc = []
