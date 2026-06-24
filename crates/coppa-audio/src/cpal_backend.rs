@@ -16,7 +16,10 @@ pub fn list_cpal_devices() -> Result<Vec<AudioDevice>> {
         .devices()
         .map_err(|e| anyhow!("Failed to list devices: {}", e))?
     {
-        let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+        let name = device
+            .description()
+            .map(|d| d.name().to_string())
+            .unwrap_or_else(|_| "Unknown".to_string());
         let mut max_sr = 0u32;
         let mut in_ch = 0u16;
         let mut out_ch = 0u16;
@@ -24,13 +27,13 @@ pub fn list_cpal_devices() -> Result<Vec<AudioDevice>> {
         if let Ok(configs) = device.supported_input_configs() {
             for config in configs {
                 in_ch = in_ch.max(config.channels());
-                max_sr = max_sr.max(config.max_sample_rate().0);
+                max_sr = max_sr.max(config.max_sample_rate());
             }
         }
         if let Ok(configs) = device.supported_output_configs() {
             for config in configs {
                 out_ch = out_ch.max(config.channels());
-                max_sr = max_sr.max(config.max_sample_rate().0);
+                max_sr = max_sr.max(config.max_sample_rate());
             }
         }
 
@@ -122,7 +125,7 @@ impl CpalSource {
 
         let config = StreamConfig {
             channels: 1,
-            sample_rate: cpal::SampleRate(sample_rate),
+            sample_rate,
             buffer_size: cpal::BufferSize::Default,
         };
 
@@ -147,7 +150,7 @@ impl CpalSource {
     ) -> Result<Self> {
         let config = StreamConfig {
             channels: 1,
-            sample_rate: cpal::SampleRate(sample_rate),
+            sample_rate,
             buffer_size: cpal::BufferSize::Default,
         };
 
@@ -179,7 +182,7 @@ impl AudioSource for CpalSource {
         let stream = self
             .device
             .build_input_stream(
-                &self.config,
+                self.config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     producer.write(data);
                 },
@@ -219,7 +222,7 @@ impl CpalSink {
 
         let config = StreamConfig {
             channels: 1,
-            sample_rate: cpal::SampleRate(sample_rate),
+            sample_rate,
             buffer_size: cpal::BufferSize::Default,
         };
 
@@ -243,7 +246,7 @@ impl CpalSink {
     ) -> Result<Self> {
         let config = StreamConfig {
             channels: 1,
-            sample_rate: cpal::SampleRate(sample_rate),
+            sample_rate,
             buffer_size: cpal::BufferSize::Default,
         };
 
@@ -275,7 +278,7 @@ impl AudioSink for CpalSink {
         let stream = self
             .device
             .build_output_stream(
-                &self.config,
+                self.config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let read = consumer.read(data);
                     // Fill remaining with silence
@@ -324,8 +327,8 @@ pub fn find_input_device_by_name(name: &str) -> Option<cpal::Device> {
     let host = cpal::default_host();
     let needle = name.to_lowercase();
     host.input_devices().ok()?.find(|d| {
-        d.name()
-            .map(|n| n.to_lowercase().contains(&needle))
+        d.description()
+            .map(|info| info.name().to_lowercase().contains(&needle))
             .unwrap_or(false)
     })
 }
@@ -340,8 +343,8 @@ pub fn find_output_device_by_name(name: &str) -> Option<cpal::Device> {
     let host = cpal::default_host();
     let needle = name.to_lowercase();
     host.output_devices().ok()?.find(|d| {
-        d.name()
-            .map(|n| n.to_lowercase().contains(&needle))
+        d.description()
+            .map(|info| info.name().to_lowercase().contains(&needle))
             .unwrap_or(false)
     })
 }

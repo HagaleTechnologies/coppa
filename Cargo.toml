@@ -31,7 +31,7 @@ rustfft = "6.2"
 approx = "0.5"
 smallvec = "1.13"
 rtrb = "0.3"
-cpal = "0.15"
+cpal = "0.18"
 hound = "3.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "io-util", "time"] }
 serde = { version = "1", features = ["derive"] }
