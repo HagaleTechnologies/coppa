@@ -7,8 +7,9 @@ use coppa_dsp::fft::FftProcessor;
 use coppa_dsp::filter::RrcFilter;
 use coppa_engine::CoppaCore;
 use coppa_protocol::fec::convolutional::{ConvEncoder, ViterbiDecoder};
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use num_complex::Complex32;
+use std::hint::black_box;
 
 fn bench_encode(c: &mut Criterion) {
     let core = CoppaCore::new();

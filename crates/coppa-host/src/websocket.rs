@@ -140,11 +140,9 @@ impl WebSocketServer {
         println!("WebSocket server listening on ws://{}", addr);
 
         // Bound per-connection memory: cap WebSocket message/frame sizes.
-        let ws_config = WebSocketConfig {
-            max_message_size: Some(MAX_WS_MESSAGE_SIZE),
-            max_frame_size: Some(MAX_WS_FRAME_SIZE),
-            ..Default::default()
-        };
+        let ws_config = WebSocketConfig::default()
+            .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
+            .max_frame_size(Some(MAX_WS_FRAME_SIZE));
 
         let next_id = AtomicU32::new(1);
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
@@ -190,7 +188,7 @@ impl WebSocketServer {
                         result = broadcast_rx.recv() => {
                             match result {
                                 Ok(json) => {
-                                    if sink.send(tokio_tungstenite::tungstenite::Message::Text(json)).await.is_err() {
+                                    if sink.send(tokio_tungstenite::tungstenite::Message::Text(json.into())).await.is_err() {
                                         break;
                                     }
                                 }
@@ -244,7 +242,7 @@ impl WebSocketServer {
                                                 };
                                                 if let Ok(json) = serde_json::to_string(&resp) {
                                                     let _ = sink
-                                                        .send(tokio_tungstenite::tungstenite::Message::Text(json))
+                                                        .send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
                                                         .await;
                                                 }
                                                 continue;
@@ -258,7 +256,7 @@ impl WebSocketServer {
                                         };
                                         if let Ok(json) = serde_json::to_string(&resp) {
                                             let _ = sink
-                                                .send(tokio_tungstenite::tungstenite::Message::Text(json))
+                                                .send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
                                                 .await;
                                         }
                                     }
@@ -470,7 +468,7 @@ mod integration_tests {
                                                 snr: None,
                                             };
                                             if let Ok(json) = serde_json::to_string(&resp) {
-                                                let _ = sink.send(Message::Text(json)).await;
+                                                let _ = sink.send(Message::Text(json.into())).await;
                                             }
                                             continue;
                                         }
@@ -486,7 +484,7 @@ mod integration_tests {
                                         message: format!("Invalid message: {}", e),
                                     };
                                     if let Ok(json) = serde_json::to_string(&resp) {
-                                        let _ = sink.send(Message::Text(json)).await;
+                                        let _ = sink.send(Message::Text(json.into())).await;
                                     }
                                 }
                             }
@@ -513,11 +511,9 @@ mod integration_tests {
         assert!(matches!(event, HostEvent::Connected { .. }));
 
         // Send data
-        ws.send(Message::Text(
-            r#"{"type":"send","data":"Hello"}"#.to_string(),
-        ))
-        .await
-        .unwrap();
+        ws.send(Message::Text(r#"{"type":"send","data":"Hello"}"#.into()))
+            .await
+            .unwrap();
 
         let event = event_rx.recv().await.unwrap();
         match event {
@@ -541,7 +537,7 @@ mod integration_tests {
         let _ = event_rx.recv().await.unwrap();
 
         // Request status
-        ws.send(Message::Text(r#"{"type":"status"}"#.to_string()))
+        ws.send(Message::Text(r#"{"type":"status"}"#.into()))
             .await
             .unwrap();
 
@@ -570,7 +566,7 @@ mod integration_tests {
         let _ = event_rx.recv().await.unwrap();
 
         // Send garbage JSON
-        ws.send(Message::Text("not valid json".to_string()))
+        ws.send(Message::Text("not valid json".into()))
             .await
             .unwrap();
 
