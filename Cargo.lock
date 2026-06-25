@@ -322,6 +322,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "coppa-bench"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "coppa-channel",
+ "coppa-codec",
+ "coppa-protocol",
+ "rand",
+]
+
+[[package]]
 name = "coppa-channel"
 version = "0.1.0"
 dependencies = [

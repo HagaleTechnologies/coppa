@@ -12,6 +12,7 @@ members = [
     "crates/coppa-ffi",
     "crates/coppa-cli",
     "crates/coppa-daemon",
+    "crates/coppa-bench",
 ]
 exclude = ["fuzz"]
 resolver = "2"

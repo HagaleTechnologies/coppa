@@ -1,0 +1,14 @@
+[package]
+name = "coppa-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Measurement harness: BER/FER/goodput-vs-SNR for Coppa PHY modes"
+
+[dependencies]
+coppa-codec = { path = "../coppa-codec" }
+coppa-protocol = { path = "../coppa-protocol" }
+coppa-channel = { path = "../coppa-channel" }
+rand = { workspace = true }
+clap = { workspace = true }
