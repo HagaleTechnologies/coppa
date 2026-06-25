@@ -90,6 +90,8 @@ pub fn select_profile(level: u8) -> CoppaProfile {
 pub enum ChannelSpec {
     /// AWGN only (no fading).
     Awgn,
+    /// Watterson HF fading (applied before AWGN).
+    Watterson(coppa_channel::watterson::WattersonPreset),
 }
 
 /// A measurement scenario: one mode swept over SNR points on one channel.

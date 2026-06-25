@@ -7,6 +7,7 @@ use rand::{Rng, SeedableRng};
 
 use crate::metrics::{aggregate, bit_errors, MeasurementPoint, TrialOutcome};
 use crate::scenario::{mode_for_level, select_profile, ChannelSpec, Scenario};
+use coppa_channel::watterson::WattersonPreset;
 
 fn make_header(level: u8, payload_len: u16) -> CoppaHeader {
     // phy_mode/bandwidth are fixed here to mirror CoppaCore::encode_bytes, which also
@@ -45,6 +46,15 @@ fn run_trial(
         ChannelSpec::Awgn => {
             coppa_channel::awgn_seeded(&clean, snr_db, seed ^ 0x5555_5555_5555_5555)
         }
+        ChannelSpec::Watterson(preset) => {
+            let faded = coppa_channel::watterson::watterson_preset(
+                &clean,
+                crate::scenario::SAMPLE_RATE as f32,
+                preset,
+                seed ^ 0x3333_3333_3333_3333,
+            );
+            coppa_channel::awgn_seeded(&faded, snr_db, seed ^ 0x5555_5555_5555_5555)
+        }
     };
 
     let outcome = match tx.receive(&rx_samples) {
@@ -77,6 +87,9 @@ pub fn run_scenario(scenario: &Scenario) -> Vec<MeasurementPoint> {
     let tx = CoppaTransceiver::new(select_profile(scenario.level), 1);
     let channel_name = match scenario.channel {
         ChannelSpec::Awgn => "awgn",
+        ChannelSpec::Watterson(WattersonPreset::Good) => "watterson-good",
+        ChannelSpec::Watterson(WattersonPreset::Moderate) => "watterson-moderate",
+        ChannelSpec::Watterson(WattersonPreset::Poor) => "watterson-poor",
     };
 
     let mut points = Vec::with_capacity(scenario.snr_db_points.len());

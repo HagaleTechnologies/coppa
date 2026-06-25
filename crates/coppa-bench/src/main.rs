@@ -34,6 +34,23 @@ struct Args {
     /// Base RNG seed.
     #[arg(long, default_value_t = 0x00C0_FFEE)]
     seed: u64,
+    /// Channel: awgn | good | moderate | poor (Watterson presets).
+    #[arg(long, default_value = "awgn")]
+    channel: String,
+}
+
+fn parse_channel(s: &str) -> ChannelSpec {
+    use coppa_channel::watterson::WattersonPreset;
+    match s {
+        "awgn" => ChannelSpec::Awgn,
+        "good" => ChannelSpec::Watterson(WattersonPreset::Good),
+        "moderate" => ChannelSpec::Watterson(WattersonPreset::Moderate),
+        "poor" => ChannelSpec::Watterson(WattersonPreset::Poor),
+        other => {
+            eprintln!("error: unknown --channel '{other}' (expected: awgn|good|moderate|poor)");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn snr_points(min: f32, max: f32, step: f32) -> Vec<f32> {
@@ -50,12 +67,18 @@ fn snr_points(min: f32, max: f32, step: f32) -> Vec<f32> {
 fn main() {
     let args = Args::parse();
     let snrs = snr_points(args.snr_min, args.snr_max, args.snr_step);
+    let chan = parse_channel(&args.channel);
+
+    let title = match args.channel.as_str() {
+        "awgn" => "AWGN".to_string(),
+        other => format!("Watterson ({})", other),
+    };
 
     let mut all_points = Vec::new();
     for mode in MODES {
         let scenario = Scenario {
             level: mode.level,
-            channel: ChannelSpec::Awgn,
+            channel: chan,
             snr_db_points: snrs.clone(),
             trials: args.trials,
             seed: args.seed,
@@ -65,9 +88,9 @@ fn main() {
     }
 
     fs::create_dir_all(&args.out_dir).expect("create out dir");
-    let csv_path = args.out_dir.join("awgn.csv");
+    let csv_path = args.out_dir.join(format!("{}.csv", args.channel));
     fs::write(&csv_path, to_csv(&all_points)).expect("write csv");
     eprintln!("Wrote {}", csv_path.display());
 
-    println!("{}", to_markdown(&all_points, "AWGN"));
+    println!("{}", to_markdown(&all_points, &title));
 }
