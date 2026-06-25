@@ -7,6 +7,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+coppa-dsp = { path = "../coppa-dsp" }
+num-complex = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]

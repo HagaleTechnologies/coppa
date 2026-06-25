@@ -6,8 +6,11 @@
 //! Note: the [`fading`] function is a simple deterministic sinusoidal amplitude
 //! fade (periodic AM), NOT a statistical HF/VHF channel model. It is intended
 //! for exercising AGC tracking, not for evaluating performance over a realistic
-//! ionospheric channel. There is no Rayleigh, Watterson, or Doppler-spread
-//! model in this crate.
+//! ionospheric channel. For a realistic Rayleigh/Watterson HF channel model,
+//! see the [`watterson`] module.
+
+pub mod watterson;
+
 use std::f32::consts::TAU;
 
 /// Add white Gaussian noise at the specified SNR (in dB).

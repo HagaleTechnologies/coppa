@@ -337,6 +337,8 @@ name = "coppa-channel"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "coppa-dsp",
+ "num-complex",
  "rand",
 ]
 
