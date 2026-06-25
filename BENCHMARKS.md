@@ -127,6 +127,16 @@ spread a transfer across many coherence times, or retransmitted, would beat thes
 numbers. But the collapse is large enough — total failure even on "Good" — that those
 caveats don't rescue the current PHY.
 
+### Update: robust sync implemented — and it confirms sync is *not* the bottleneck
+
+A follow-up replaced the multipath-fragile preamble cross-correlation with Schmidl-Cox
+autocorrelation plus fine timing. The `fading_diagnosis` example confirms it drops the
+multipath sync-failure rate from ~⅓ of frames to ~0, leaves clean-channel decoding unchanged,
+and even recovers some BPSK 1/4 frames under fading. But it does **not** lift the collapse:
+with sync failures eliminated, the modes still fail at the LDPC / diversity floor. This
+*proves* the bottleneck is diversity, not sync. (The Watterson tables above predate this fix
+and slightly understate BPSK 1/4; the qualitative collapse is unchanged.)
+
 ## Limitations
 
 - **Coverage.** AWGN and Watterson (Good/Moderate/Poor) channels are measured; there is no
