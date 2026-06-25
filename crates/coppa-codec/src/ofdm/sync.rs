@@ -358,6 +358,125 @@ pub fn detect_coppa_version(samples: &[f32], profile: &CoppaProfile) -> Option<(
     }
 }
 
+/// Robust preamble timing detection via Schmidl-Cox autocorrelation.
+///
+/// The 2-symbol Coppa preamble is two identical OFDM symbols, so the received
+/// signal satisfies `r[d+m] ≈ r[d+m+symbol_len]` across the preamble *even under
+/// multipath* — the channel distorts both copies identically, so their
+/// self-similarity survives fading that would break a cross-correlation against a
+/// clean template. We detect that self-similarity instead.
+///
+/// Returns `Some((version, offset))` with `offset` = the start of the preamble
+/// (same semantics as [`detect_coppa_version`]), or `None`. The version is nominal
+/// (1); the live demod path uses only the timing offset.
+pub fn detect_coppa_sync(samples: &[f32], profile: &CoppaProfile) -> Option<(u8, usize)> {
+    let symbol_len = profile.fft_size + profile.cp_samples;
+    if symbol_len == 0 || samples.len() < 2 * symbol_len {
+        return None;
+    }
+    let search_end = samples.len() - 2 * symbol_len + 1;
+
+    // Schmidl-Cox metric M(d) = |P(d)|^2 / (E1·E2), ≈ 1.0 when the two copies match.
+    let threshold = 0.6f32;
+    let mut best_metric = 0.0f32;
+    let mut best_offset = 0usize;
+
+    for d in 0..search_end {
+        let mut p = 0.0f32; // real autocorrelation of the two copies
+        let mut e1 = 0.0f32;
+        let mut e2 = 0.0f32;
+        for m in 0..symbol_len {
+            let a = samples[d + m];
+            let b = samples[d + m + symbol_len];
+            p += a * b;
+            e1 += a * a;
+            e2 += b * b;
+        }
+        let denom = (e1 * e2).max(1e-20);
+        let metric = (p * p) / denom;
+        if metric > best_metric {
+            best_metric = metric;
+            best_offset = d;
+        }
+    }
+
+    if best_metric < threshold {
+        return None;
+    }
+
+    // Fine timing: the autocorrelation peak sits on a ~CP-wide plateau, which is too
+    // coarse under fading (an off-by-tens-of-samples FFT window corrupts the header).
+    // Refine within ±CP of the coarse offset by cross-correlating the clean reference
+    // and taking the local argmax. A *local* search is robust even when the faded
+    // preamble's absolute correlation is low — we only rank alignments near the
+    // already-detected position, never threshold on the value.
+    let reference = generate_coppa_preamble(profile, 1);
+    let ref_len = reference.len();
+    let lo = best_offset.saturating_sub(profile.cp_samples);
+    let hi = (best_offset + profile.cp_samples).min(samples.len().saturating_sub(ref_len));
+    if hi < lo {
+        return Some((1, best_offset));
+    }
+
+    let mut best_xc = -1.0f32;
+    let mut refined = best_offset;
+    for d in lo..=hi {
+        let mut corr = 0.0f32;
+        let mut sig_e = 0.0f32;
+        for (i, &r) in reference.iter().enumerate() {
+            let s = samples[d + i];
+            corr += s * r;
+            sig_e += s * s;
+        }
+        let nc = corr.abs() / sig_e.sqrt().max(1e-20);
+        if nc > best_xc {
+            best_xc = nc;
+            refined = d;
+        }
+    }
+    Some((1, refined))
+}
+
+#[cfg(test)]
+mod robust_sync_tests {
+    use super::*;
+
+    #[test]
+    fn detect_coppa_sync_survives_multipath_echo() {
+        let profile = CoppaProfile::hf_standard();
+        let symbol_len = profile.fft_size + profile.cp_samples;
+        let preamble = generate_coppa_preamble(&profile, 1);
+
+        // Leading gap + preamble + tail (room for the demod's +3-symbol data_start).
+        let lead = 137usize;
+        let mut clean = vec![0.0f32; lead];
+        clean.extend_from_slice(&preamble);
+        clean.extend(std::iter::repeat_n(0.0f32, 4 * symbol_len));
+
+        // 2-tap multipath: direct + a 0.5 ms echo (24 samples), like the Good channel.
+        let delay = 24usize;
+        let mut rx = vec![0.0f32; clean.len()];
+        for k in 0..clean.len() {
+            let echo = if k >= delay {
+                0.6 * clean[k - delay]
+            } else {
+                0.0
+            };
+            rx[k] = 0.8 * clean[k] + echo;
+        }
+
+        let (_v, offset) = detect_coppa_sync(&rx, &profile)
+            .expect("autocorrelation sync should detect the preamble under multipath");
+        // Timing within the cyclic prefix is good enough for OFDM.
+        let err = (offset as i64 - lead as i64).abs();
+        assert!(
+            err <= profile.cp_samples as i64,
+            "offset {offset} should be within CP ({}) of {lead}, err={err}",
+            profile.cp_samples
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

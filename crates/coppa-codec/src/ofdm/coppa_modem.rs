@@ -16,7 +16,7 @@ use super::equalizer::{mmse_equalize, LinearInterpolationEstimator};
 use super::frame::CoppaHeader;
 use super::papr_clip;
 use super::pilots::CoppaPilotPattern;
-use super::sync::{detect_coppa_version, generate_coppa_preamble};
+use super::sync::{detect_coppa_sync, generate_coppa_preamble};
 use super::CoppaProfile;
 use crate::traits::ChannelEstimator;
 
@@ -316,7 +316,7 @@ impl CoppaModem {
         let total_active = self.profile.total_active_carriers();
 
         // 1. Detect preamble version
-        let (_version, timing_offset) = detect_coppa_version(samples, &self.profile)?;
+        let (_version, timing_offset) = detect_coppa_sync(samples, &self.profile)?;
 
         // 2. Skip past preamble: 2 sync symbols + 1 fine sync = 3 symbols
         let data_start = timing_offset + 3 * symbol_len;
@@ -411,7 +411,7 @@ impl CoppaModem {
         let total_active = self.profile.total_active_carriers();
 
         // 1. Sync
-        let (_version, timing_offset) = detect_coppa_version(samples, &self.profile)?;
+        let (_version, timing_offset) = detect_coppa_sync(samples, &self.profile)?;
         let data_start = timing_offset + 3 * symbol_len;
         if data_start >= samples.len() {
             return None;
@@ -489,7 +489,7 @@ impl CoppaModem {
         let total_active = self.profile.total_active_carriers();
 
         // 1. Sync
-        let (_version, timing_offset) = detect_coppa_version(samples, &self.profile)?;
+        let (_version, timing_offset) = detect_coppa_sync(samples, &self.profile)?;
         let data_start = timing_offset + 3 * symbol_len;
         if data_start >= samples.len() {
             return None;
