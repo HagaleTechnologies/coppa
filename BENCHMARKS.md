@@ -53,10 +53,76 @@ Three honest caveats the data also reveals:
   would break the densest constellation. PAPR may still be costing link margin (these
   thresholds are well above an ideal AWGN bound); quantifying that loss is a follow-up.
 
+## Watterson HF fading channels
+
+Same methodology, but each frame is passed through a Watterson HF channel (faded two-path
+multipath + Doppler, ITU-R F.1487 presets) *before* AWGN. Generated with
+`cargo run -p coppa-bench --release -- --channel {good|moderate|poor} --trials 50`.
+
+### Good (0.5 ms delay, 0.1 Hz Doppler)
+
+| Mode | SNR @ FER=10% | SNR @ FER=1% | Peak goodput (bps) |
+|------|---------------|--------------|--------------------|
+| BPSK 1/4 | — | — | 139 |
+| BPSK 1/2 | — | — | 74 |
+| QPSK 1/2 | — | — | 0 |
+| QPSK 3/4 | — | — | 0 |
+| 8PSK 2/3 | — | — | 0 |
+| 16QAM 1/2 | — | — | 0 |
+| 16QAM 3/4 | — | — | 0 |
+| 64QAM 2/3 | — | — | 0 |
+| 64QAM 7/8 | — | — | 0 |
+
+### Moderate (1 ms, 0.5 Hz) / Poor (2 ms, 1 Hz)
+
+| Mode | Moderate peak goodput | Poor peak goodput |
+|------|-----------------------|-------------------|
+| BPSK 1/4 | 51 bps | 15 bps |
+| all other modes | 0 | 0 |
+
+(Full per-SNR data in `results/{good,moderate,poor}.csv`.)
+
+### Verdict: the current PHY does not survive realistic HF fading
+
+This is the most important result here, and it's the opposite of the AWGN story.
+**Under Watterson multipath fading, coppa's PHY essentially collapses** — even on the
+*mildest* "Good" channel, even at 30 dB SNR, **no mode reaches a 10% frame-error
+threshold.** Only the most robust mode (BPSK 1/4) gets any frames through at all
+(≈139 bps on Good, falling to ≈15 bps on Poor), and every higher-order mode — the very
+modes that shine in AWGN — delivers **zero**.
+
+Why, and why more SNR doesn't help: at HF Doppler the channel is block-Rayleigh (coherence
+time ≫ one frame), so each frame carries a single LDPC codeword through *one* fading
+realization. Rayleigh statistics make deep fades common, and a codeword caught in a deep
+fade is lost no matter the SNR — the errors are **fading-limited, not noise-limited**, so
+the curves hit an irreducible floor instead of improving with SNR. The two-path multipath
+adds frequency-selective notches across the subcarriers on top of that. The current PHY
+frame has **no diversity to average fading out**: no interleaving spanning multiple
+coherence times, no PHY-layer retransmission, and the amplitude-sensitive high-order modes
+fail first.
+
+The honest implication: coppa's bespoke PHY produces excellent *AWGN* throughput but, as it
+stands, is **not viable over realistic HF multipath** — the dominant real-world impairment.
+This is the concrete, measured version of the gap this project suspected from the start
+(coppa had never been validated against HF conditions), and it didn't survive even the mild
+channel. Closing it is real work — time/frequency diversity (deep interleaving across
+coherence times), more robust preamble sync and channel equalization under fading, possibly
+PHY-layer ARQ — and it is exactly why a battle-tested HF waveform (e.g. FreeDV, which Mercury
+reuses) earns its keep, and why these hardening steps come before any on-air claim.
+
+One fairness caveat so the result isn't overstated: this benchmark sends **one codeword per
+fading block with no link-layer interleaving or ARQ retransmission**. A complete system that
+spread a transfer across many coherence times, or retransmitted, would beat these single-shot
+numbers. But the collapse is large enough — total failure even on "Good" — that those
+caveats don't rescue the current PHY.
+
 ## Limitations
 
-- **AWGN only.** There is no realistic HF (Rayleigh/Watterson) fading channel yet — that is
-  the next milestone. These numbers describe ideal-channel behavior.
+- **Coverage.** AWGN and Watterson (Good/Moderate/Poor) channels are measured; there is no
+  CFO, frequency-offset, or combined CFO+fading case yet.
+- **One codeword per fading block, no PHY interleaving/ARQ.** The fading results are
+  single-shot per frame (see the fairness caveat above); they are a lower bound on what a
+  full link layer could achieve.
 - **No CFO tolerance.** The receive path does not correct carrier-frequency offset, so these
   results assume ideal frequency/timing.
 - **50 trials per point**, so FER resolution is ~2%; the "FER=1%" column is really "the first
