@@ -12,7 +12,8 @@ use coppa_bench::scenario::{ChannelSpec, Scenario, MODES};
 #[derive(Parser)]
 #[command(
     name = "coppa-bench",
-    about = "BER/FER/goodput-vs-SNR for Coppa PHY modes"
+    about = "BER/FER/goodput-vs-SNR for Coppa PHY modes",
+    allow_negative_numbers = true
 )]
 struct Args {
     /// Trials per SNR point.
@@ -36,6 +37,7 @@ struct Args {
 }
 
 fn snr_points(min: f32, max: f32, step: f32) -> Vec<f32> {
+    assert!(step > 0.0, "snr_step must be positive (got {step})");
     let mut v = Vec::new();
     let mut s = min;
     while s <= max + 1e-6 {
