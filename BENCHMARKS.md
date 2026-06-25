@@ -91,15 +91,26 @@ threshold.** Only the most robust mode (BPSK 1/4) gets any frames through at all
 (≈139 bps on Good, falling to ≈15 bps on Poor), and every higher-order mode — the very
 modes that shine in AWGN — delivers **zero**.
 
-Why, and why more SNR doesn't help: at HF Doppler the channel is block-Rayleigh (coherence
-time ≫ one frame), so each frame carries a single LDPC codeword through *one* fading
-realization. Rayleigh statistics make deep fades common, and a codeword caught in a deep
-fade is lost no matter the SNR — the errors are **fading-limited, not noise-limited**, so
-the curves hit an irreducible floor instead of improving with SNR. The two-path multipath
-adds frequency-selective notches across the subcarriers on top of that. The current PHY
-frame has **no diversity to average fading out**: no interleaving spanning multiple
-coherence times, no PHY-layer retransmission, and the amplitude-sensitive high-order modes
-fail first.
+Why, and why more SNR doesn't help (root-caused with the `fading_diagnosis` example, which
+categorizes sync-vs-decode failures across controlled channels): the failures are
+**SNR-independent** — Good fading at 30 dB and at 60 dB give near-identical results — so this
+is a channel-*structure* limit, not a noise limit. The diagnostic localizes two distinct
+mechanisms:
+
+1. **Multipath breaks the preamble sync.** With the two-path channel, roughly a third of
+   frames fail at synchronization — the delayed echo corrupts the correlation peak. A *flat*
+   (single-path) fade, by contrast, produces **zero** sync failures. So part of the collapse
+   is sync fragility to multipath, which is a bounded, fixable DSP problem.
+2. **No diversity against fading.** Once synced, the fading erases enough of the signal that
+   the LDPC can't recover, regardless of SNR. Even a *flat* time-varying fade costs ~half the
+   frames; the two-path frequency-selective nulls (which the 4–8 pilots can't track) make it
+   near-total. The lowest-rate code (BPSK 1/4) survives most often — more FEC redundancy —
+   which is why it is the only mode that passes any frames.
+
+The current PHY has no mechanism to average fading out: one LDPC codeword per fading block,
+no interleaving spanning multiple coherence times, no PHY-layer retransmission, sparse pilots,
+and a sync the echo can corrupt. (Cyclic-prefix overflow is *not* the cause — the HF CP is
+6.25 ms, far longer than the 0.5–2 ms echoes.)
 
 The honest implication: coppa's bespoke PHY produces excellent *AWGN* throughput but, as it
 stands, is **not viable over realistic HF multipath** — the dominant real-world impairment.
