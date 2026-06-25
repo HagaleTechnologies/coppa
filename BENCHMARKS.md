@@ -43,10 +43,11 @@ Three honest caveats the data also reveals:
   OFDM profile (104 vs 44 data carriers), not purely the modulation. Read the ladder within
   each profile: `hf_standard` (levels 1–4) and `vhf_wide` (levels 5–10).
 
-- **A mode-table inefficiency.** 16QAM 1/2 (level 6) delivers about the same goodput as
-  8PSK 2/3 (level 5) — 5,061 vs 5,544 bps — but is *more robust* (FER=1% at 6.0 dB vs
-  9.0 dB). Level 6 weakly dominates level 5, so the level-5 rung looks misplaced; the
-  speed-level table is worth revisiting.
+- **A mode-table trade-off worth a look.** 16QAM 1/2 (level 6) reaches roughly the same
+  goodput as 8PSK 2/3 (level 5) — 5,061 vs 5,544 bps (level 5 is actually ~9% higher) — but
+  is noticeably *more robust* (FER=1% at 6.0 dB vs 9.0 dB). So level 6 trades ~9% less peak
+  throughput for ~3 dB more robustness; depending on the target, that can make the level-5
+  rung look redundant. Worth revisiting the speed-level ordering.
 
 - **64QAM 7/8 does decode** (FER=1% ≈ 21 dB), contrary to the concern that PAPR clipping
   would break the densest constellation. PAPR may still be costing link margin (these

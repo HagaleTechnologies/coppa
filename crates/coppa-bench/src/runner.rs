@@ -9,6 +9,9 @@ use crate::metrics::{aggregate, bit_errors, MeasurementPoint, TrialOutcome};
 use crate::scenario::{mode_for_level, select_profile, ChannelSpec, Scenario};
 
 fn make_header(level: u8, payload_len: u16) -> CoppaHeader {
+    // phy_mode/bandwidth are fixed here to mirror CoppaCore::encode_bytes, which also
+    // hardcodes them regardless of speed level; the modem selects its OFDM profile from
+    // construction, not from these header fields, so the measurement stays representative.
     CoppaHeader {
         version: 1,
         phy_mode: 0,
