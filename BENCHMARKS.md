@@ -264,9 +264,35 @@ So denser pilots transform the selective channels: Moderate and Poor go from nea
 carrying QPSK-class throughput with real SNR thresholds. The cost is slightly lower goodput for
 the *robust* modes on Good (fewer data carriers) — irrelevant since higher modes now dominate; a
 real link would pick the profile by channel. The erasure path is healthy (no equalizer change
-was needed). **Higher-order QAM (16/64) still mostly deliver 0 under fading** (16QAM 1/2 trickles
-~97 bps on Good) — that residue is the genuine frequency-diversity floor where explicit carrier
-repetition / MRC (the deferred Approach B) or a more redundant waveform would be the next lever.
+was needed).
+
+### 2D time+frequency channel estimation (cross-symbol pilot pooling)
+
+The pilot pattern already alternates pilot carrier positions even/odd between OFDM symbols, but
+the RX estimated the channel per-symbol from only that symbol's pilots. Because HF fading is
+block-fading (the channel is ~constant in time within a frame), pooling pilots **across
+neighbouring symbols** combines the complementary even/odd positions into a **~2× denser
+frequency comb** and noise-averages it — at **zero throughput cost** (no change to pilot count or
+data carriers). The pooling is windowed to **±2 symbols (~105 ms)** so it stays inside the channel
+coherence time even on Poor (1 Hz Doppler ≈ 160 ms); pooling the *whole frame* was measured to
+blur Poor's time-varying channel and dropped its per-frame recovery 72 % → 12 %, so the window is
+load-bearing.
+
+Per-frame `postFEC` @30 dB and ladder peak goodput, **before → after** 2D estimation:
+
+| Channel / profile | per-frame postFEC | peak goodput |
+|-------------------|-------------------|--------------|
+| standard / Good | 77 % → 77 % | 1087 → **1790 bps** (8PSK now works) |
+| standard / Moderate | 22 % → **90 %** | 329 → **988 bps** (QPSK now works) |
+| robust / Moderate | 95 % → 95 % | 1095 → **1449 bps** (8PSK now works) |
+| robust / Poor | 72 % → **82 %** | 563 → **1073 bps** (8PSK now works on Poor) |
+
+So cross-symbol pilot pooling is a free, broad win — it lifts every selective channel and pushes
+the working modulation an order higher (8PSK reaches Poor), with the biggest gains where pilots
+were sparsest (the `standard` profile). **Higher-order QAM (16/64) still mostly deliver 0 under
+fading** (16QAM 1/2 trickles ~150 bps on Good) — that residue is the genuine frequency-diversity
+floor where explicit carrier repetition / MRC (the deferred Approach B) or a more redundant
+waveform would be the next lever.
 
 ## Limitations
 
