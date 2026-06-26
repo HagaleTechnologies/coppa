@@ -169,6 +169,7 @@ pub fn run_transfer_scenario(
     trials: usize,
     base_seed: u64,
 ) -> Vec<TransferPoint> {
+    assert!(trials > 0, "run_transfer_scenario needs at least one trial");
     let total_bytes = phy.payload_bytes();
     let mut points = Vec::with_capacity(snr_db_points.len());
 
