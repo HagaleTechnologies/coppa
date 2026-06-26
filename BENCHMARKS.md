@@ -226,14 +226,47 @@ near-flat channel, which the equal-power two-tap multipath denies.
 
 - **Lower code rate** is what keeps Poor alive — BPSK 1/4 is the only survivor, so rate is the
   dominant robustness knob; there is no lower rate available today.
-- **Frequency diversity** is the real remaining lever: the equal-power two-tap channel nulls
-  ~10 % of the band on Good rising to ~40 % on Poor, and a nulled carrier carries no signal that
-  any equalizer or interleaver can recover. Spreading each bit's energy across the band (or a
-  fundamentally more redundant waveform, as FreeDV's DATAC modes use) is what Poor needs.
+- **Channel-estimation density** turned out to be the dominant lever — see "denser pilots" below,
+  which lifted Moderate/Poor from near-dead to QPSK-class throughput.
+- **Explicit frequency diversity** (carrier repetition / MRC, or a more redundant waveform like
+  FreeDV's DATAC) remains the lever for the *residual* floor that denser pilots don't reach:
+  higher-order QAM under fading, where ~10–40 % of the band sits in deep nulls that carry no
+  recoverable signal.
 - **Cross-frame time interleaving (V2)** was re-evaluated after the fix: it now *helps* slightly
   on a strong channel (Good ≥18 dB: V2 100 % vs V1 ~97 %) but still *hurts* on Moderate/Poor
   (V2 ≈ 21 % vs V1 ≈ 45 % on Moderate) — the textbook interleaving trade-off. It is not a general
   robustness win, so it stays shelved as a measurement, not a shipped feature.
+
+### Frequency-selective robustness: denser pilots (`hf_robust`, the big win)
+
+The dominant remaining failure on Moderate/Poor turned out to be **channel-estimation
+undersampling**, not irreducible null loss. `hf_standard` has 4 pilots across 48 carriers
+(600 Hz spacing), but the equal-power two-tap channel's coherence bandwidth is 1 kHz (Moderate)
+/ 500 Hz (Poor) — so the pilots undersample the selective channel and interpolation
+mis-estimates broadly. The `hf_robust` profile raises pilots to **12 (200 Hz spacing), data
+carriers 44 → 36** (−18 % raw capacity). No other change.
+
+The per-frame diagnosis confirms the mechanism directly: under `hf_robust`, the hard-error rate
+on *non-flagged* carriers (`err@lowNV`) collapses from 7.8 %→0.03 % (Moderate) and
+18 %→1.4 % (Poor); residual errors are now confined to correctly-flagged null carriers (soft
+erasures the FEC corrects). Per-frame `postFEC` recovery at 30 dB, `hf_standard` → `hf_robust`:
+Good 77 %→88 %, **Moderate 22 %→95 %, Poor 0 %→72 %**.
+
+Full mode ladder, peak goodput (40 trials), `hf_standard` → `hf_robust`:
+
+| Channel | hf_standard | hf_robust | notes |
+|---------|-------------|-----------|-------|
+| Good | QPSK 1/2, 1087 bps | **QPSK 3/4 / 8PSK, ~1390 bps** | QPSK 1/2 now clears FER<10 % @ 9 dB |
+| Moderate | BPSK only, 329 bps | **QPSK 1/2, 1095 bps** (~3.3×) | QPSK 1/2 @ 18 dB; BPSK 1/2 @ 12 dB |
+| Poor | BPSK 1/4, 64 bps | **BPSK 1/2, 563 bps** (~9×) | BPSK 1/4 @ 9 dB, BPSK 1/2 @ 21 dB; QPSK 1/2 partial |
+
+So denser pilots transform the selective channels: Moderate and Poor go from near-dead to
+carrying QPSK-class throughput with real SNR thresholds. The cost is slightly lower goodput for
+the *robust* modes on Good (fewer data carriers) — irrelevant since higher modes now dominate; a
+real link would pick the profile by channel. The erasure path is healthy (no equalizer change
+was needed). **Higher-order QAM (16/64) still mostly deliver 0 under fading** (16QAM 1/2 trickles
+~97 bps on Good) — that residue is the genuine frequency-diversity floor where explicit carrier
+repetition / MRC (the deferred Approach B) or a more redundant waveform would be the next lever.
 
 ## Limitations
 
