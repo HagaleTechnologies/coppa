@@ -532,6 +532,10 @@ impl CoppaModem {
         let mut payload_symbols = Vec::new();
         let mut noise_variances = Vec::new();
 
+        // Pass 1: demodulate every payload symbol and collect its carriers + pilots.
+        let mut sym_carriers: Vec<(usize, Vec<Complex32>)> = Vec::with_capacity(num_payload_syms);
+        let mut per_symbol_pilots: Vec<Vec<(usize, Complex32, Complex32)>> =
+            Vec::with_capacity(num_payload_syms);
         for sym_idx in 0..num_payload_syms {
             let global_sym = num_header_syms + sym_idx;
             let sym_start = data_start + global_sym * symbol_len;
@@ -541,15 +545,22 @@ impl CoppaModem {
             let sym_samples = &samples[sym_start..sym_start + symbol_len];
             let carriers = self.demod_ofdm_symbol(sym_samples);
             let pilot_info = self.extract_pilot_info(&carriers, global_sym);
+            per_symbol_pilots.push(pilot_info);
+            sym_carriers.push((global_sym, carriers));
+        }
 
-            let mut estimator = LinearInterpolationEstimator::new(total_active);
-            estimator.update(&pilot_info);
-            let equalized = mmse_equalize(&carriers, &estimator, total_active);
+        // 2D estimate: pool pilots across symbols (even∪odd comb, noise-averaged). Valid for HF
+        // block-fading, where the channel is constant in time within the frame.
+        let combined_pilots = pool_pilots(&per_symbol_pilots);
+        let mut estimator = LinearInterpolationEstimator::new(total_active);
+        estimator.update(&combined_pilots);
 
-            let data = self.pilots.extract_data(&equalized, global_sym);
-            let data_indices = self.pilots.data_indices(global_sym);
+        // Pass 2: equalize each payload symbol with the single shared estimate.
+        for (global_sym, carriers) in &sym_carriers {
+            let equalized = mmse_equalize(carriers, &estimator, total_active);
+            let data = self.pilots.extract_data(&equalized, *global_sym);
+            let data_indices = self.pilots.data_indices(*global_sym);
             let carrier_noise = estimator.per_carrier_noise(&data_indices);
-
             payload_symbols.extend_from_slice(&data);
             noise_variances.extend_from_slice(&carrier_noise);
         }
@@ -581,6 +592,29 @@ impl CoppaModem {
         estimator.update(pilot_info);
         mmse_equalize(carriers, &estimator, num_carriers)
     }
+}
+
+/// Pool per-symbol pilot observations into one combined pilot set, averaging the received
+/// value at each carrier index across the symbols that sample it. Valid because the channel is
+/// time-invariant within a frame (HF block-fading); the even/odd pilot alternation means the
+/// pooled indices form a denser frequency comb than any single symbol's pilots.
+fn pool_pilots(
+    per_symbol: &[Vec<(usize, Complex32, Complex32)>],
+) -> Vec<(usize, Complex32, Complex32)> {
+    use std::collections::BTreeMap;
+    let mut acc: BTreeMap<usize, (Complex32, usize, Complex32)> = BTreeMap::new();
+    for sym in per_symbol {
+        for &(idx, received, known) in sym {
+            let e = acc
+                .entry(idx)
+                .or_insert((Complex32::new(0.0, 0.0), 0, known));
+            e.0 += received;
+            e.1 += 1;
+        }
+    }
+    acc.into_iter()
+        .map(|(idx, (sum, count, known))| (idx, sum * (1.0 / count as f32), known))
+        .collect()
 }
 
 #[cfg(test)]
@@ -761,5 +795,26 @@ mod tests {
         // Verify specific values
         assert_eq!(bpsk.papr_target_db, 6.0);
         assert_eq!(qam64.papr_target_db, 11.0);
+    }
+
+    #[test]
+    fn pool_pilots_combines_complementary_symbols() {
+        // Symbol A pilots at {0,4}; symbol B at {2,4} (index 4 shared).
+        let a = vec![
+            (0usize, Complex32::new(2.0, 0.0), Complex32::new(1.0, 0.0)),
+            (4usize, Complex32::new(1.0, 0.0), Complex32::new(1.0, 0.0)),
+        ];
+        let b = vec![
+            (2usize, Complex32::new(3.0, 0.0), Complex32::new(1.0, 0.0)),
+            (4usize, Complex32::new(3.0, 0.0), Complex32::new(1.0, 0.0)),
+        ];
+        let pooled = pool_pilots(&[a, b]);
+        let idxs: Vec<usize> = pooled.iter().map(|(i, _, _)| *i).collect();
+        assert_eq!(idxs, vec![0, 2, 4]);
+        let at4 = pooled.iter().find(|(i, _, _)| *i == 4).unwrap().1;
+        assert!(
+            (at4.re - 2.0).abs() < 1e-6 && at4.im.abs() < 1e-6,
+            "got {at4:?}"
+        );
     }
 }
