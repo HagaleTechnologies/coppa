@@ -13,6 +13,31 @@ payload → OFDM modulate → AWGN → demodulate/decode. SNR is **audio-band SN
 Eb/N0), swept −6…30 dB in 3 dB steps. "Goodput" = `payload_bits × (1 − FER) / frame_airtime`.
 Raw per-point data is regenerable into `results/awgn.csv` (gitignored).
 
+## Current performance (all fixes applied)
+
+This is the headline current state, with the `hf_robust` profile (12 pilots, 2D estimation) and
+all the PHY fixes below (scale-invariant LDPC decoder, gain-normalized QAM demap, CFO correction).
+Peak goodput per channel (best working mode), 50 trials:
+
+| Channel | Best mode | Peak goodput | Notes |
+|---------|-----------|--------------|-------|
+| AWGN | 64QAM 7/8 | **4615 bps** | full ladder works, clean 3–15 dB thresholds |
+| Watterson Good | 8PSK 2/3 | **1846 bps** | every mode delivers; 64QAM 2/3 ≈ 1481 |
+| Watterson Moderate | 16QAM 1/2 | **1630 bps** | every mode delivers; 8PSK ≈ 1546 |
+| Watterson Poor | 16QAM 1/2 | **1203 bps** | all but 64QAM 7/8 deliver; 8PSK ≈ 1159 |
+| CFO | — | ±15 Hz | live RX estimates + removes carrier offset |
+
+This is a complete reversal of where the PHY started: under realistic HF multipath every mode used
+to collapse to ~0 (only a trickle of BPSK 1/4 survived). The path there — each step measured, several
+hypotheses falsified along the way — is documented in the sections below. The short version: the
+"fading collapse" was **three bugs and one missing feature**, not a fundamental limit —
+(1) the LDPC offset-min-sum decoder was not scale-invariant and discarded correctable faded frames;
+(2) pilots were too sparse to resolve frequency-selective fading (fixed by `hf_robust` + 2D
+cross-symbol pilot pooling); (3) the MMSE equalizer's amplitude bias broke high-order QAM under any
+fading; and (4) the live RX did not correct carrier frequency offset. Notably, the **cross-frame
+time-interleaving** ("diversity") hypothesis was built and *falsified* — it made things worse — and a
+diagnose-first **gate** twice redirected the work away from the wrong fix.
+
 ## AWGN channel
 
 | Mode | SNR @ FER=10% | SNR @ FER=1% | Peak goodput (bps) |
