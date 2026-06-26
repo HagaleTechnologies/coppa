@@ -7,6 +7,7 @@ use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use std::fmt::Write as _;
 
 use crate::scenario::{mode_for_level, select_profile, ChannelSpec, SAMPLE_RATE};
 
@@ -211,6 +212,59 @@ pub fn run_transfer_scenario(
     points
 }
 
+/// CSV header for transfer results.
+pub const TRANSFER_CSV_HEADER: &str =
+    "phy,level,channel,snr_db,frames,trials,recovery_fraction,goodput_bps,latency_s";
+
+/// Build a CSV document from transfer points.
+pub fn transfer_to_csv(points: &[TransferPoint]) -> String {
+    let mut out = String::from(TRANSFER_CSV_HEADER);
+    out.push('\n');
+    for p in points {
+        let _ = writeln!(
+            out,
+            "{},{},{},{:.1},{},{},{:.6},{:.2},{:.3}",
+            p.phy_name,
+            p.level,
+            p.channel,
+            p.snr_db,
+            p.frames,
+            p.trials,
+            p.recovery_fraction,
+            p.goodput_bps,
+            p.latency_s
+        );
+    }
+    out
+}
+
+/// Build a markdown table (recovery fraction per SNR) for one channel.
+pub fn transfer_to_markdown(points: &[TransferPoint], title: &str) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "## {title}\n");
+    let _ = writeln!(
+        out,
+        "| PHY | Level | SNR | Recovery | Goodput (bps) | Latency (s) |"
+    );
+    let _ = writeln!(
+        out,
+        "|-----|-------|-----|----------|---------------|-------------|"
+    );
+    for p in points {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {:.0} dB | {:.1}% | {:.0} | {:.2} |",
+            p.phy_name,
+            p.level,
+            p.snr_db,
+            p.recovery_fraction * 100.0,
+            p.goodput_bps,
+            p.latency_s
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +372,25 @@ mod tests {
         );
         assert!(points[0].goodput_bps > 0.0);
         assert!(points[0].latency_s > 0.0);
+    }
+
+    #[test]
+    fn transfer_csv_and_markdown_render() {
+        let p = TransferPoint {
+            phy_name: "v1",
+            level: 2,
+            channel: "watterson-good",
+            snr_db: 18.0,
+            frames: 8,
+            trials: 50,
+            recovery_fraction: 0.12,
+            goodput_bps: 90.0,
+            latency_s: 10.4,
+        };
+        let csv = transfer_to_csv(std::slice::from_ref(&p));
+        assert_eq!(csv.lines().next().unwrap(), TRANSFER_CSV_HEADER);
+        assert_eq!(csv.lines().nth(1).unwrap().split(',').count(), 9);
+        let md = transfer_to_markdown(&[p], "Test");
+        assert!(md.contains("| v1 | 2 |"));
     }
 }
