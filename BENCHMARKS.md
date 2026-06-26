@@ -206,9 +206,34 @@ recovery dramatically (level 2, 30 dB, end-to-end through `receive()`):
 So **most of the "fading collapse" was a decoder bug, not a fundamental PHY limitation** — the
 Watterson and transfer-level tables above were measured before this fix and badly understate
 the PHY. The earlier "diversity floor" and "frequency nulls" framings were downstream symptoms.
-Watterson **Poor** remains at 0 %: its ~26 % raw pre-FEC BER genuinely exceeds rate-1/2 LDPC
-capacity — a real code-rate / frequency-diversity floor that a lower rate or true frequency
-diversity (not the cross-frame interleaver) would need to address.
+
+### Post-fix per-mode results (supersedes the pre-fix Watterson tables above)
+
+Full mode ladder re-measured with normalized min-sum (50 trials, −6…30 dB):
+
+| Channel | Modes that get frames through | Best peak goodput |
+|---------|-------------------------------|-------------------|
+| Watterson Good | BPSK 1/4, BPSK 1/2 (FER<10% @30 dB), QPSK 1/2, QPSK 3/4 | **QPSK 1/2 ≈ 1080 bps** |
+| Watterson Moderate | BPSK 1/4, BPSK 1/2 only | ≈ 322 bps |
+| Watterson Poor | BPSK 1/4 only | ≈ 66 bps |
+
+Good HF is now genuinely usable (up to QPSK, ~1 kbps — vs ~0 for everything but a trickle of
+BPSK 1/4 before the fix). Moderate carries the robust BPSK modes. Poor still only passes
+BPSK 1/4 and barely. Higher-order QAM (16/64) deliver 0 on every fading channel — they need a
+near-flat channel, which the equal-power two-tap multipath denies.
+
+### Remaining levers (what's left for Moderate/Poor and higher-order modes)
+
+- **Lower code rate** is what keeps Poor alive — BPSK 1/4 is the only survivor, so rate is the
+  dominant robustness knob; there is no lower rate available today.
+- **Frequency diversity** is the real remaining lever: the equal-power two-tap channel nulls
+  ~10 % of the band on Good rising to ~40 % on Poor, and a nulled carrier carries no signal that
+  any equalizer or interleaver can recover. Spreading each bit's energy across the band (or a
+  fundamentally more redundant waveform, as FreeDV's DATAC modes use) is what Poor needs.
+- **Cross-frame time interleaving (V2)** was re-evaluated after the fix: it now *helps* slightly
+  on a strong channel (Good ≥18 dB: V2 100 % vs V1 ~97 %) but still *hurts* on Moderate/Poor
+  (V2 ≈ 21 % vs V1 ≈ 45 % on Moderate) — the textbook interleaving trade-off. It is not a general
+  robustness win, so it stays shelved as a measurement, not a shipped feature.
 
 ## Limitations
 

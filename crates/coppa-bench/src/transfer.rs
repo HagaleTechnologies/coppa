@@ -728,40 +728,55 @@ mod tests {
 
     #[test]
     #[ignore = "slow characterization (~minutes in debug); run with `cargo test -- --ignored`"]
-    fn interleaving_is_lossless_on_awgn_but_hurts_under_fading() {
-        // CHARACTERIZATION of a FALSIFIED hypothesis (see BENCHMARKS.md "V2 cross-frame
-        // interleaving"). The cross-frame interleaver is a lossless permutation (AWGN
-        // recovery is unchanged), but under HF fading it makes recovery WORSE, not better:
-        // coppa's per-frame link averages BELOW the LDPC threshold, so V1's concentration of
-        // errors lets a minority of well-faded frames decode fully, while V2's spreading
-        // pushes every codeword above threshold and they all fail together. This guards the
-        // finding — if a future change makes V2 actually beat V1 under fading, this test
-        // should be revisited (and celebrated).
+    fn interleaving_helps_strong_channels_but_hurts_marginal_ones() {
+        // CHARACTERIZATION of cross-frame interleaving AFTER the LDPC scale-bug fix (see
+        // BENCHMARKS.md). The interleaver is a lossless permutation (AWGN unchanged). Its
+        // effect under fading depends on the regime relative to the LDPC threshold:
+        //   * Strong channel (Watterson Good at decent SNR): the per-frame link is mostly
+        //     above threshold, so spreading mops up V1's residual frame failures → V2 >= V1.
+        //   * Marginal channel (Watterson Moderate): the per-frame average is below threshold,
+        //     so spreading turns V1's lucky survivors into uniform failure → V2 < V1.
+        // This is the textbook interleaving trade-off, and it's why cross-frame diversity is
+        // NOT a general robustness win here.
         let v1 = V1Phy::new(2, 8);
         let v2 = V2Phy::new(2, 8);
 
-        // (a) On AWGN the interleaver is lossless: both recover fully.
+        // (a) AWGN: the interleaver is lossless — both recover fully.
         let awgn = run_paired_comparison(&v1, &v2, 2, ChannelSpec::Awgn, &[30.0], 5, 0x5EED);
         assert!(awgn[0].v1_recovery > 0.99 && awgn[0].v2_recovery > 0.99);
 
-        // (b) Under Watterson Good the diversity hypothesis fails: V2 does NOT beat V1
-        //     (in fact it is measurably worse). Assert the falsification, not a target.
+        // (b) Strong channel (Good @ 24 dB): interleaving does NOT hurt (it helps or ties).
         let good = run_paired_comparison(
             &v1,
             &v2,
             2,
             ChannelSpec::Watterson(WattersonPreset::Good),
+            &[24.0],
+            10,
+            0x5EED,
+        );
+        assert!(
+            good[0].v2_recovery + 1e-9 >= good[0].v1_recovery,
+            "on a strong channel V2 should not underperform V1 (v1={:.3}, v2={:.3})",
+            good[0].v1_recovery,
+            good[0].v2_recovery
+        );
+
+        // (c) Marginal channel (Moderate): interleaving still HURTS (below-threshold regime).
+        let moderate = run_paired_comparison(
+            &v1,
+            &v2,
+            2,
+            ChannelSpec::Watterson(WattersonPreset::Moderate),
             &[18.0],
             10,
             0x5EED,
         );
-        let p = &good[0];
         assert!(
-            p.v2_recovery < p.v1_recovery,
-            "cross-frame interleaving should currently underperform V1 under fading \
-             (v1={:.3}, v2={:.3})",
-            p.v1_recovery,
-            p.v2_recovery
+            moderate[0].v2_recovery < moderate[0].v1_recovery,
+            "on a marginal channel V2 should underperform V1 (v1={:.3}, v2={:.3})",
+            moderate[0].v1_recovery,
+            moderate[0].v2_recovery
         );
     }
 }
