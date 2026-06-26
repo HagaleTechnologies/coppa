@@ -377,23 +377,30 @@ pub fn detect_coppa_sync(samples: &[f32], profile: &CoppaProfile) -> Option<(u8,
     let search_end = samples.len() - 2 * symbol_len + 1;
 
     // Schmidl-Cox metric M(d) = |P(d)|^2 / (E1·E2), ≈ 1.0 when the two copies match.
+    // We compute P(d) on the ANALYTIC (complex) signal: a carrier frequency offset rotates
+    // the second copy relative to the first by a fixed phase, which leaves |P(d)|^2 invariant
+    // (it only rotates P's angle). A real-valued autocorrelation instead picks up cos(rotation),
+    // which collapses the metric past a few Hz of CFO and breaks detection — exactly the
+    // failure this CFO path exists to fix. Working on the analytic signal makes coarse timing
+    // CFO-tolerant; the de-rotation in the demod then removes the offset itself.
+    let analytic = analytic_signal(samples);
     let threshold = 0.6f32;
     let mut best_metric = 0.0f32;
     let mut best_offset = 0usize;
 
     for d in 0..search_end {
-        let mut p = 0.0f32; // real autocorrelation of the two copies
+        let mut p = Complex32::new(0.0, 0.0); // complex autocorrelation of the two copies
         let mut e1 = 0.0f32;
         let mut e2 = 0.0f32;
         for m in 0..symbol_len {
-            let a = samples[d + m];
-            let b = samples[d + m + symbol_len];
-            p += a * b;
-            e1 += a * a;
-            e2 += b * b;
+            let a = analytic[d + m];
+            let b = analytic[d + m + symbol_len];
+            p += a.conj() * b;
+            e1 += a.norm_sqr();
+            e2 += b.norm_sqr();
         }
         let denom = (e1 * e2).max(1e-20);
-        let metric = (p * p) / denom;
+        let metric = p.norm_sqr() / denom;
         if metric > best_metric {
             best_metric = metric;
             best_offset = d;
@@ -435,6 +442,70 @@ pub fn detect_coppa_sync(samples: &[f32], profile: &CoppaProfile) -> Option<(u8,
         }
     }
     Some((1, refined))
+}
+
+// ---------------------------------------------------------------------------
+// Carrier frequency offset (CFO) estimation + correction
+// ---------------------------------------------------------------------------
+
+/// Analytic (complex) signal via FFT-Hilbert. Mirrors the watterson/frequency_shift routine:
+/// keep DC, double positive-frequency bins, zero the negative ones, then inverse FFT.
+fn analytic_signal(x: &[f32]) -> Vec<Complex32> {
+    let n = x.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let fft = FftProcessor::new(n);
+    let xc: Vec<Complex32> = x.iter().map(|&v| Complex32::new(v, 0.0)).collect();
+    let mut xf = fft.forward(&xc);
+    let half = n / 2;
+    for s in xf.iter_mut().take(n).skip(half + 1) {
+        *s = Complex32::new(0.0, 0.0);
+    }
+    for s in xf.iter_mut().take(half).skip(1) {
+        *s *= 2.0;
+    }
+    // Odd n has no exact Nyquist bin, so `half` is a positive frequency too.
+    if n % 2 == 1 && half >= 1 {
+        xf[half] *= 2.0;
+    }
+    fft.inverse(&xf)
+}
+
+/// Estimate carrier frequency offset (Hz) from the Schmidl-Cox preamble (two identical
+/// `symbol_len` blocks at `timing_offset`). Unambiguous within ±sample_rate/(2*symbol_len).
+pub fn estimate_cfo_hz(
+    samples: &[f32],
+    timing_offset: usize,
+    symbol_len: usize,
+    sample_rate: f32,
+) -> f32 {
+    use std::f32::consts::TAU;
+    let end = (timing_offset + 2 * symbol_len).min(samples.len());
+    if symbol_len == 0 || end <= timing_offset + symbol_len {
+        return 0.0;
+    }
+    let a = analytic_signal(&samples[timing_offset..end]);
+    let lim = symbol_len.min(a.len().saturating_sub(symbol_len));
+    let mut p = Complex32::new(0.0, 0.0);
+    for m in 0..lim {
+        p += a[m].conj() * a[m + symbol_len];
+    }
+    p.arg() * sample_rate / (TAU * symbol_len as f32)
+}
+
+/// Remove a carrier frequency offset of `cfo_hz` from a real passband signal (de-rotate the
+/// analytic signal by -cfo and take the real part).
+pub fn remove_cfo(samples: &[f32], cfo_hz: f32, sample_rate: f32) -> Vec<f32> {
+    use std::f32::consts::TAU;
+    let a = analytic_signal(samples);
+    a.iter()
+        .enumerate()
+        .map(|(i, &z)| {
+            let ph = -TAU * cfo_hz * i as f32 / sample_rate;
+            (z * Complex32::new(ph.cos(), ph.sin())).re
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -480,6 +551,36 @@ mod robust_sync_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn estimate_cfo_recovers_injected_offset() {
+        use crate::ofdm::coppa_modem::CoppaModem;
+        use crate::ofdm::frame::{CoppaFrameType, CoppaHeader};
+        let profile = CoppaProfile::hf_standard();
+        let symbol_len = profile.fft_size + profile.cp_samples;
+        let modem = CoppaModem::new(profile.clone(), 1);
+        // Build a real frame (preamble starts at sample 0).
+        let header = CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: 4,
+        };
+        let symbols = vec![num_complex::Complex32::new(1.0, 0.0); 200];
+        let frame = modem.modulate_mapped(&header, &symbols, 6.0);
+        // Inject +5 Hz by removing -5 Hz.
+        let injected = remove_cfo(&frame, -5.0, profile.sample_rate as f32);
+        let est = estimate_cfo_hz(&injected, 0, symbol_len, profile.sample_rate as f32);
+        assert!((est - 5.0).abs() < 1.0, "estimate {est} should be ~+5 Hz");
+        // And removing it returns ~0 estimate.
+        let corrected = remove_cfo(&injected, est, profile.sample_rate as f32);
+        let est2 = estimate_cfo_hz(&corrected, 0, symbol_len, profile.sample_rate as f32);
+        assert!(est2.abs() < 1.0, "residual {est2} should be ~0");
+    }
 
     #[test]
     fn test_schmidl_cox_detects_repeated_pattern() {

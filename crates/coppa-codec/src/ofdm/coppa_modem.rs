@@ -490,6 +490,23 @@ impl CoppaModem {
 
         // 1. Sync
         let (_version, timing_offset) = detect_coppa_sync(samples, &self.profile)?;
+
+        // 1b. Estimate and remove carrier frequency offset (CFO) from the preamble.
+        // A residual CFO de-rotates every subcarrier and collapses the link past ~2 Hz;
+        // de-rotating the whole buffer here lets all downstream demod use the corrected signal.
+        let cfo = crate::ofdm::sync::estimate_cfo_hz(
+            samples,
+            timing_offset,
+            symbol_len,
+            self.profile.sample_rate as f32,
+        );
+        let corrected: Vec<f32> = if cfo.abs() > 0.1 {
+            crate::ofdm::sync::remove_cfo(samples, cfo, self.profile.sample_rate as f32)
+        } else {
+            samples.to_vec()
+        };
+        let samples: &[f32] = &corrected;
+
         let data_start = timing_offset + 3 * symbol_len;
         if data_start >= samples.len() {
             return None;
