@@ -549,14 +549,19 @@ impl CoppaModem {
             sym_carriers.push((global_sym, carriers));
         }
 
-        // 2D estimate: pool pilots across symbols (even∪odd comb, noise-averaged). Valid for HF
-        // block-fading, where the channel is constant in time within the frame.
-        let combined_pilots = pool_pilots(&per_symbol_pilots);
-        let mut estimator = LinearInterpolationEstimator::new(total_active);
-        estimator.update(&combined_pilots);
-
-        // Pass 2: equalize each payload symbol with the single shared estimate.
-        for (global_sym, carriers) in &sym_carriers {
+        // Pass 2: 2D estimation — for each symbol, pool pilots over a SLIDING WINDOW of
+        // neighbouring symbols (even∪odd → ~2x frequency comb density, plus noise averaging).
+        // The window is kept small (±EST_WINDOW symbols ≈ 105 ms) so it stays inside the channel
+        // coherence time even on the worst HF case (Poor, 1 Hz Doppler ≈ 160 ms) — pooling the
+        // WHOLE frame instead blurs the time-varying channel and hurts Poor.
+        const EST_WINDOW: usize = 2;
+        let n_syms = sym_carriers.len();
+        for (i, (global_sym, carriers)) in sym_carriers.iter().enumerate() {
+            let lo = i.saturating_sub(EST_WINDOW);
+            let hi = (i + EST_WINDOW + 1).min(n_syms);
+            let combined = pool_pilots(&per_symbol_pilots[lo..hi]);
+            let mut estimator = LinearInterpolationEstimator::new(total_active);
+            estimator.update(&combined);
             let equalized = mmse_equalize(carriers, &estimator, total_active);
             let data = self.pilots.extract_data(&equalized, *global_sym);
             let data_indices = self.pilots.data_indices(*global_sym);
