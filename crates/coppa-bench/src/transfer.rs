@@ -155,4 +155,56 @@ mod tests {
             "AWGN at 30 dB should recover the full transfer"
         );
     }
+
+    #[test]
+    fn fading_is_correlated_across_adjacent_frames() {
+        use coppa_channel::watterson::WattersonPreset;
+        // 16 identical deterministic "frames"; estimate each frame's real gain by
+        // projecting the faded window onto the clean frame. Use the Poor preset
+        // (1.0 Hz Doppler): its coherence time (~0.1-0.2 s) is short enough that this
+        // ~1.4 s transfer spans several coherence times, so per-frame fading varies
+        // meaningfully while adjacent frames stay more correlated than distant ones --
+        // the regime where SP2's time interleaving buys diversity. (Good's 0.1 Hz
+        // coherence time exceeds this transfer length, so its gains barely vary.)
+        let l = 4096usize;
+        let n = 16usize;
+        let frame: Vec<f32> = (0..l).map(|i| (i as f32 * 0.13).sin() * 0.5).collect();
+        let concat: Vec<f32> = (0..n).flat_map(|_| frame.iter().copied()).collect();
+        let faded = coppa_channel::watterson::watterson(
+            &concat,
+            48_000.0,
+            &WattersonPreset::Poor.config(),
+            7,
+        );
+        let denom: f32 = frame.iter().map(|x| x * x).sum();
+        let gains: Vec<f32> = (0..n)
+            .map(|k| {
+                let w = &faded[k * l..(k + 1) * l];
+                w.iter().zip(&frame).map(|(a, b)| a * b).sum::<f32>() / denom
+            })
+            .collect();
+
+        // Fading varies meaningfully across the transfer (there is diversity to exploit).
+        let mean = gains.iter().sum::<f32>() / n as f32;
+        let var = gains.iter().map(|g| (g - mean).powi(2)).sum::<f32>() / n as f32;
+        assert!(
+            var > 1e-3,
+            "fading should vary meaningfully across the transfer (var={var})"
+        );
+
+        // Adjacent frames are more similar than distant ones → correlated in time,
+        // decorrelating with separation (the premise SP2 relies on).
+        let adj: f32 = (0..n - 1)
+            .map(|k| (gains[k + 1] - gains[k]).abs())
+            .sum::<f32>()
+            / (n - 1) as f32;
+        let dist: f32 = (0..n - 8)
+            .map(|k| (gains[k + 8] - gains[k]).abs())
+            .sum::<f32>()
+            / (n - 8) as f32;
+        assert!(
+            adj < dist,
+            "adjacent gains should be closer than distant (adj={adj}, dist={dist})"
+        );
+    }
 }
