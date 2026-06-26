@@ -175,6 +175,22 @@ impl CoppaProfile {
         }
     }
 
+    /// HF robust profile: same 48 active carriers / 50 Hz spacing as `hf_standard`, but with
+    /// 12 pilots (200 Hz spacing) instead of 4, to resolve frequency-selective HF multipath
+    /// (the equal-power two-tap Watterson channel's coherence bandwidth is ~500 Hz on Poor).
+    /// Trades ~18% of data carriers (36 vs 44) for channel-estimation accuracy.
+    pub fn hf_robust() -> Self {
+        Self {
+            fft_size: 960,
+            sample_rate: 48_000,
+            cp_samples: 300,
+            data_carriers: 36,
+            pilot_carriers: 12,
+            phy_mode: 0,
+            bandwidth_id: 3,
+        }
+    }
+
     /// HF narrow profile: reduced carrier count for maximum range / congested bands.
     pub fn hf_narrow() -> Self {
         Self {
@@ -507,6 +523,21 @@ impl OfdmDemodulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hf_robust_has_dense_pilots() {
+        let p = CoppaProfile::hf_robust();
+        assert_eq!(
+            p.total_active_carriers(),
+            48,
+            "same active-carrier count as hf_standard"
+        );
+        assert_eq!(p.data_carriers, 36);
+        assert_eq!(p.pilot_carriers, 12);
+        // Per-symbol pilot spacing = 48 / 12 = 4 carriers = 200 Hz at 50 Hz spacing,
+        // below Poor's ~500 Hz coherence bandwidth.
+        assert_eq!(p.total_active_carriers() / p.pilot_carriers, 4);
+    }
 
     #[test]
     fn test_ofdm_profile_calculations() {
