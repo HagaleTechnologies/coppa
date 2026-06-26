@@ -3,7 +3,16 @@
 //! the baseline (V1) PHY against the future interleaved (V2) PHY.
 
 use coppa_channel::watterson::WattersonPreset;
+use coppa_codec::ofdm::coppa_modem::CoppaModem;
+use coppa_codec::ofdm::cross_frame_interleaver::CrossFrameInterleaver;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
+use coppa_codec::ofdm::interleaver::BlockInterleaver;
+use coppa_codec::ofdm::CoppaProfile;
+use coppa_codec::traits::{ConstellationMapper, FecCodec};
+use coppa_protocol::fec::ldpc::codes::CodeRate;
+use coppa_protocol::fec::ldpc::LdpcCodec;
+use coppa_protocol::fec::scrambler::scramble;
+use coppa_protocol::modem::speed_levels::{speed_level_components, speed_level_entry};
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -89,6 +98,121 @@ impl TransferPhy for V1Phy {
             }
         }
         out
+    }
+}
+
+/// Number of coded bits in one LDPC codeword (fixed across all rates in this codec).
+const CODED_BITS: usize = 1944;
+
+/// V2 PHY: N codewords are cross-frame interleaved so each frame carries a 1/N stripe of
+/// every codeword. Rate-neutral vs `V1Phy` (same payload, frames, and airtime); the only
+/// difference is the `CrossFrameInterleaver` nested outside the per-frame `BlockInterleaver`.
+pub struct V2Phy {
+    level: u8,
+    frames: usize,
+    per_frame_bytes: usize,
+    profile: CoppaProfile,
+    modem: CoppaModem,
+    mapper: Box<dyn ConstellationMapper>,
+    code_rate: CodeRate,
+    cross: CrossFrameInterleaver,
+    papr_db: f32,
+}
+
+impl V2Phy {
+    pub fn new(level: u8, frames: usize) -> Self {
+        let per_frame_bytes = mode_for_level(level)
+            .unwrap_or_else(|| panic!("unknown speed level {level}"))
+            .payload_bytes();
+        let profile = select_profile(level);
+        let modem = CoppaModem::new(profile.clone(), 1);
+        let (mapper, code_rate) =
+            speed_level_components(level).unwrap_or_else(|e| panic!("speed level {level}: {e}"));
+        let papr_db = speed_level_entry(level)
+            .unwrap_or_else(|| panic!("no speed-level entry for {level}"))
+            .papr_target_db;
+        let cross = CrossFrameInterleaver::new(frames, CODED_BITS);
+        Self {
+            level,
+            frames,
+            per_frame_bytes,
+            profile,
+            modem,
+            mapper,
+            code_rate,
+            cross,
+            papr_db,
+        }
+    }
+
+    fn make_header(&self, seq_num: u8, payload_len: u16) -> CoppaHeader {
+        CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: self.level,
+            seq_num,
+            payload_len,
+        }
+    }
+}
+
+impl TransferPhy for V2Phy {
+    fn frames_per_transfer(&self) -> usize {
+        self.frames
+    }
+
+    fn payload_bytes(&self) -> usize {
+        self.frames * self.per_frame_bytes
+    }
+
+    fn encode_transfer(&self, payload: &[u8]) -> Vec<Vec<f32>> {
+        let n = self.frames;
+        let pfb = self.per_frame_bytes;
+        let info_bits = self.code_rate.info_bits();
+        let data_carriers = self.profile.data_carriers;
+
+        // 1. LDPC-encode each chunk into one codeword; concatenate codeword-major.
+        let mut all_coded: Vec<u8> = Vec::with_capacity(n * CODED_BITS);
+        for k in 0..n {
+            let chunk = &payload[k * pfb..(k + 1) * pfb];
+            let mut bits = Vec::with_capacity(info_bits);
+            for &byte in chunk {
+                for shift in (0..8).rev() {
+                    bits.push((byte >> shift) & 1);
+                }
+            }
+            bits.resize(info_bits, 0u8);
+            scramble(&mut bits);
+            let mut codec = LdpcCodec::new(self.code_rate);
+            let coded = codec.encode(&bits); // CODED_BITS long
+            all_coded.extend_from_slice(&coded);
+        }
+
+        // 2. Cross-frame interleave (the diversity step).
+        let interleaved = self.cross.interleave(&all_coded); // frame-major, n*CODED_BITS
+
+        // 3. Per frame: intra-frame block interleave -> constellation map -> OFDM modulate.
+        (0..n)
+            .map(|f| {
+                let frame_bits = &interleaved[f * CODED_BITS..(f + 1) * CODED_BITS];
+                let bi = BlockInterleaver::new(CODED_BITS, data_carriers);
+                let block = bi.interleave(frame_bits);
+                let symbols = self.mapper.map_bits(&block);
+                self.modem.modulate_mapped(
+                    &self.make_header(f as u8, pfb as u16),
+                    &symbols,
+                    self.papr_db,
+                )
+            })
+            .collect()
+    }
+
+    fn decode_transfer(&self, _frame_windows: &[&[f32]]) -> Vec<u8> {
+        // Implemented in Task 3.
+        vec![0u8; self.payload_bytes()]
     }
 }
 
@@ -351,6 +475,26 @@ mod tests {
         assert!(
             adj < dist,
             "adjacent gains should be closer than distant (adj={adj}, dist={dist})"
+        );
+    }
+
+    #[test]
+    fn v2_encode_produces_uniform_frames() {
+        let phy = V2Phy::new(2, 8);
+        let total = phy.payload_bytes();
+        assert_eq!(
+            total,
+            V1Phy::new(2, 8).payload_bytes(),
+            "V2 must be rate-neutral vs V1"
+        );
+        let payload: Vec<u8> = (0..total).map(|i| (i * 3 + 1) as u8).collect();
+        let frames = phy.encode_transfer(&payload);
+        assert_eq!(frames.len(), 8, "must emit N frame-signals");
+        let l0 = frames[0].len();
+        assert!(l0 > 0);
+        assert!(
+            frames.iter().all(|f| f.len() == l0),
+            "frame signals must be uniform length"
         );
     }
 
