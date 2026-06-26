@@ -40,6 +40,9 @@ struct Args {
     /// OFDM profile: default (per-level) | standard | robust (dense pilots).
     #[arg(long, default_value = "default")]
     profile: String,
+    /// Carrier frequency offset (Hz) applied after the channel; 0.0 = none.
+    #[arg(long, default_value_t = 0.0)]
+    cfo: f32,
 }
 
 fn parse_channel(s: &str) -> ChannelSpec {
@@ -87,6 +90,7 @@ fn main() {
             trials: args.trials,
             seed: args.seed,
             profile_override: profile_override.clone(),
+            cfo_hz: args.cfo,
         };
         eprintln!("Measuring level {} ({})...", mode.level, mode.name);
         all_points.extend(run_scenario(&scenario));

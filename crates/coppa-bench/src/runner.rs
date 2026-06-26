@@ -33,6 +33,7 @@ fn run_trial(
     payload_bytes: usize,
     snr_db: f32,
     channel: ChannelSpec,
+    cfo_hz: f32,
     seed: u64,
 ) -> (TrialOutcome, usize) {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -42,7 +43,7 @@ fn run_trial(
     let clean = tx.transmit(&header, &payload);
     let frame_samples = clean.len();
 
-    let rx_samples = match channel {
+    let faded = match channel {
         ChannelSpec::Awgn => {
             coppa_channel::awgn_seeded(&clean, snr_db, seed ^ 0x5555_5555_5555_5555)
         }
@@ -57,7 +58,13 @@ fn run_trial(
         }
     };
 
-    let outcome = match tx.receive(&rx_samples) {
+    let rx_signal = if cfo_hz != 0.0 {
+        coppa_channel::frequency_shift(&faded, cfo_hz, crate::scenario::SAMPLE_RATE as f32)
+    } else {
+        faded
+    };
+
+    let outcome = match tx.receive(&rx_signal) {
         Ok((_h, rx_payload)) => {
             let n = payload.len().min(rx_payload.len());
             let errs = bit_errors(&payload[..n], &rx_payload[..n]);
@@ -111,6 +118,7 @@ pub fn run_scenario(scenario: &Scenario) -> Vec<MeasurementPoint> {
                 payload_bytes,
                 snr_db,
                 scenario.channel,
+                scenario.cfo_hz,
                 seed,
             );
             frame_samples = fs;
@@ -143,6 +151,7 @@ mod tests {
             trials: 10,
             seed: 0xABCD,
             profile_override: None,
+            cfo_hz: 0.0,
         };
         let points = run_scenario(&scenario);
         assert_eq!(points.len(), 2);
@@ -169,6 +178,7 @@ mod tests {
             trials: 5,
             seed: 0xBEEF,
             profile_override: Some(coppa_codec::ofdm::CoppaProfile::hf_robust()),
+            cfo_hz: 0.0,
         };
         let points = run_scenario(&scenario);
         assert_eq!(points.len(), 1);

@@ -116,6 +116,8 @@ pub struct Scenario {
     pub seed: u64,
     /// Optional profile override; `None` uses `select_profile(level)`.
     pub profile_override: Option<CoppaProfile>,
+    /// Carrier frequency offset (Hz) applied after the channel; 0.0 = none.
+    pub cfo_hz: f32,
 }
 
 #[cfg(test)]
