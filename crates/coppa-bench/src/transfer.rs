@@ -445,6 +445,76 @@ pub fn transfer_to_markdown(points: &[TransferPoint], title: &str) -> String {
     out
 }
 
+/// One paired V1-vs-V2 measurement point (both PHYs through identical channel draws).
+#[derive(Debug, Clone)]
+pub struct PairedPoint {
+    pub level: u8,
+    pub channel: &'static str,
+    pub snr_db: f32,
+    pub trials: usize,
+    pub v1_recovery: f64,
+    pub v2_recovery: f64,
+    pub delta: f64, // v2_recovery - v1_recovery
+}
+
+/// Run V1 and V2 through IDENTICAL channel draws and score both, per SNR point.
+///
+/// The fading seed (`chan_seed`) depends only on the trial index, not the SNR index, so the
+/// SAME fading realization is reused across all SNR points (clean monotone curves; only AWGN
+/// changes with SNR). At each (SNR, trial) V1 and V2 see the same Watterson fade and AWGN, so
+/// the comparison is genuinely paired.
+pub fn run_paired_comparison(
+    v1: &dyn TransferPhy,
+    v2: &dyn TransferPhy,
+    level: u8,
+    channel: ChannelSpec,
+    snr_db_points: &[f32],
+    trials: usize,
+    base_seed: u64,
+) -> Vec<PairedPoint> {
+    assert!(trials > 0, "run_paired_comparison needs at least one trial");
+    assert_eq!(
+        v1.payload_bytes(),
+        v2.payload_bytes(),
+        "V1 and V2 must carry equal payloads to be comparable"
+    );
+    let total_bytes = v1.payload_bytes();
+    let mut points = Vec::with_capacity(snr_db_points.len());
+
+    for &snr_db in snr_db_points {
+        let mut v1_sum = 0.0f64;
+        let mut v2_sum = 0.0f64;
+        for t in 0..trials {
+            let chan_seed = base_seed.wrapping_add(t as u64);
+            let payload_seed = base_seed ^ 0xA5A5_A5A5_0000_0000 ^ (t as u64);
+            let mut rng = StdRng::seed_from_u64(payload_seed);
+            let payload: Vec<u8> = (0..total_bytes).map(|_| rng.random::<u8>()).collect();
+
+            let f1 = v1.encode_transfer(&payload);
+            let w1 = apply_transfer_channel(&f1, channel, snr_db, chan_seed);
+            let r1: Vec<&[f32]> = w1.iter().map(|w| w.as_slice()).collect();
+            v1_sum += recovery_fraction(&payload, &v1.decode_transfer(&r1));
+
+            let f2 = v2.encode_transfer(&payload);
+            let w2 = apply_transfer_channel(&f2, channel, snr_db, chan_seed);
+            let r2: Vec<&[f32]> = w2.iter().map(|w| w.as_slice()).collect();
+            v2_sum += recovery_fraction(&payload, &v2.decode_transfer(&r2));
+        }
+        let v1r = v1_sum / trials as f64;
+        let v2r = v2_sum / trials as f64;
+        points.push(PairedPoint {
+            level,
+            channel: channel_label(channel),
+            snr_db,
+            trials,
+            v1_recovery: v1r,
+            v2_recovery: v2r,
+            delta: v2r - v1r,
+        });
+    }
+    points
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,5 +691,77 @@ mod tests {
         assert_eq!(csv.lines().nth(1).unwrap().split(',').count(), 9);
         let md = transfer_to_markdown(&[p], "Test");
         assert!(md.contains("| v1 | 2 |"));
+    }
+
+    #[test]
+    fn paired_comparison_is_deterministic() {
+        let v1 = V1Phy::new(2, 8);
+        let v2 = V2Phy::new(2, 8);
+        let a = run_paired_comparison(&v1, &v2, 2, ChannelSpec::Awgn, &[24.0], 2, 0x1234);
+        let b = run_paired_comparison(&v1, &v2, 2, ChannelSpec::Awgn, &[24.0], 2, 0x1234);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].v1_recovery, b[0].v1_recovery);
+        assert_eq!(a[0].v2_recovery, b[0].v2_recovery);
+    }
+
+    #[test]
+    fn channel_draw_depends_only_on_seed() {
+        // Same seed + same signal => identical faded output (so V1/V2 at a point are paired).
+        let frames = vec![vec![0.3f32; 2048], vec![-0.2f32; 2048]];
+        let a = apply_transfer_channel(
+            &frames,
+            ChannelSpec::Watterson(WattersonPreset::Moderate),
+            18.0,
+            777,
+        );
+        let b = apply_transfer_channel(
+            &frames,
+            ChannelSpec::Watterson(WattersonPreset::Moderate),
+            18.0,
+            777,
+        );
+        assert_eq!(
+            a, b,
+            "identical seed+signal must give identical channel realization"
+        );
+    }
+
+    #[test]
+    #[ignore = "slow characterization (~minutes in debug); run with `cargo test -- --ignored`"]
+    fn interleaving_is_lossless_on_awgn_but_hurts_under_fading() {
+        // CHARACTERIZATION of a FALSIFIED hypothesis (see BENCHMARKS.md "V2 cross-frame
+        // interleaving"). The cross-frame interleaver is a lossless permutation (AWGN
+        // recovery is unchanged), but under HF fading it makes recovery WORSE, not better:
+        // coppa's per-frame link averages BELOW the LDPC threshold, so V1's concentration of
+        // errors lets a minority of well-faded frames decode fully, while V2's spreading
+        // pushes every codeword above threshold and they all fail together. This guards the
+        // finding — if a future change makes V2 actually beat V1 under fading, this test
+        // should be revisited (and celebrated).
+        let v1 = V1Phy::new(2, 8);
+        let v2 = V2Phy::new(2, 8);
+
+        // (a) On AWGN the interleaver is lossless: both recover fully.
+        let awgn = run_paired_comparison(&v1, &v2, 2, ChannelSpec::Awgn, &[30.0], 5, 0x5EED);
+        assert!(awgn[0].v1_recovery > 0.99 && awgn[0].v2_recovery > 0.99);
+
+        // (b) Under Watterson Good the diversity hypothesis fails: V2 does NOT beat V1
+        //     (in fact it is measurably worse). Assert the falsification, not a target.
+        let good = run_paired_comparison(
+            &v1,
+            &v2,
+            2,
+            ChannelSpec::Watterson(WattersonPreset::Good),
+            &[18.0],
+            10,
+            0x5EED,
+        );
+        let p = &good[0];
+        assert!(
+            p.v2_recovery < p.v1_recovery,
+            "cross-frame interleaving should currently underperform V1 under fading \
+             (v1={:.3}, v2={:.3})",
+            p.v1_recovery,
+            p.v2_recovery
+        );
     }
 }
