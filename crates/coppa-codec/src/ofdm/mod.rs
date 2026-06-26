@@ -26,6 +26,7 @@
 //! Both are retained intentionally. Start with the generic stack to learn the
 //! mechanics, then read the Coppa stack for the production design.
 pub mod coppa_modem;
+pub mod cross_frame_interleaver;
 pub mod equalizer;
 pub mod frame;
 pub mod interleaver;
