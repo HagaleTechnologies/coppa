@@ -230,8 +230,10 @@ callsign = "VK2ABC"
     fn test_load_invalid_config_is_fatal() {
         // E3: Write a file with invalid TOML and verify it returns Err.
         // Process-unique path so parallel test binaries can't race on a shared file.
-        let path = std::env::temp_dir()
-            .join(format!("coppa_test_invalid_config_{}.toml", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "coppa_test_invalid_config_{}.toml",
+            std::process::id()
+        ));
         std::fs::write(&path, "this is not valid [[[toml").unwrap();
         let result = DaemonConfig::load_or_default(path.to_str().unwrap());
         assert!(
