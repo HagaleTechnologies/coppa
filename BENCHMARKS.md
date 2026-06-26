@@ -84,6 +84,11 @@ multipath + Doppler, ITU-R F.1487 presets) *before* AWGN. Generated with
 
 ### Verdict: the current PHY does not survive realistic HF fading
 
+> **⚠️ Superseded — read "Root cause of the fading collapse" below.** These Watterson tables
+> were measured before a decoder bug was found and fixed. The collapse was substantially an
+> LDPC offset-min-sum scale bug, not a fundamental PHY limit; with normalized min-sum, Good
+> recovers ~77 % and flat fading ~100 %. The narrative below reflects the pre-fix state.
+
 This is the most important result here, and it's the opposite of the AWGN story.
 **Under Watterson multipath fading, coppa's PHY essentially collapses** — even on the
 *mildest* "Good" channel, even at 30 dB SNR, **no mode reaches a 10% frame-error
@@ -165,12 +170,45 @@ above-threshold average and they all fail together (collapsing to the ~0.4 % cha
 Interleaving only helps when the average is *below* threshold with rare bursts — the opposite
 of coppa's situation here.
 
-**Implication:** the real bottleneck is **per-frame link robustness under frequency-selective
-fading** (equalization, pilot density, the waveform itself), not codeword-level time
-diversity. More diversity cannot rescue a per-frame link that is already below threshold on
-average. This is precisely the part that fixed, proven HF waveforms (e.g. FreeDV's DATAC
-modes, which Mercury reuses) are engineered around, and precisely coppa's bespoke-OFDM weak
-spot.
+**Implication (at the time):** the bottleneck looked like per-frame link robustness rather
+than diversity. Running that down led to the actual root cause below — which turned out to be
+a decoder bug, not the channel.
+
+## Root cause of the fading collapse: an LDPC decoder scale bug (fixed)
+
+A per-frame link diagnosis (`cargo run --release -p coppa-bench --example
+per_frame_link_diagnosis`) localized the collapse precisely. The decisive clue: a **flat
+1-tap Rayleigh** fade produces **0.00 % pre-FEC bit errors**, yet 43 of 60 such frames were
+discarded — and across every fading condition the dominant failure was `LdpcNotConverged`
+(56–57 of 60), not sync, header, or CRC. A frame with zero hard errors *is* a valid codeword,
+so the decoder was throwing away perfectly good frames.
+
+**The cause:** the LDPC decoder used **offset min-sum with a fixed 0.5 offset**, which is not
+scale-invariant. Under fading the MMSE equalizer yields correct-sign but tiny LLRs (a deeply
+faded carrier's LLR scales as ≈|Ĥ|⁴). When message magnitudes fall below 0.5, the check-node
+update `(min − 0.5).max(0)` clamps **every** message to zero — BP is silently switched off and
+cannot correct even one residual error. AWGN at 30 dB has huge LLRs, so the offset is
+negligible and it decodes perfectly; fading collapses the LLR scale and the offset annihilates
+it.
+
+**The fix:** replace the fixed offset with **normalized min-sum** (a multiplicative factor
+α = 0.8), which is inherently scale-invariant. Decoding identical inputs, this lifts per-frame
+recovery dramatically (level 2, 30 dB, end-to-end through `receive()`):
+
+| Channel | post-FEC before | post-FEC after |
+|---------|-----------------|----------------|
+| AWGN | 100 % | 100 % (no regression) |
+| Flat 1-tap Rayleigh | 28 % | **100 %** |
+| Watterson Good | 1.7 % | **76.7 %** |
+| Watterson Moderate | 0 % | **21.7 %** |
+| Watterson Poor | 0 % | 0 % |
+
+So **most of the "fading collapse" was a decoder bug, not a fundamental PHY limitation** — the
+Watterson and transfer-level tables above were measured before this fix and badly understate
+the PHY. The earlier "diversity floor" and "frequency nulls" framings were downstream symptoms.
+Watterson **Poor** remains at 0 %: its ~26 % raw pre-FEC BER genuinely exceeds rate-1/2 LDPC
+capacity — a real code-rate / frequency-diversity floor that a lower rate or true frequency
+diversity (not the cross-frame interleaver) would need to address.
 
 ## Limitations
 
