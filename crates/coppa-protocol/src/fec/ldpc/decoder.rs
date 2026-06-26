@@ -19,8 +19,14 @@
 //! hard decision satisfies all parity checks. If so, it stops immediately.
 use super::codes::{LdpcCode, LIFTING_FACTOR};
 
-/// Default offset for the min-sum approximation.
-const DEFAULT_OFFSET: f32 = 0.5;
+/// Default scaling factor for the normalized min-sum approximation.
+///
+/// Min-sum overestimates check-node reliability; a multiplicative factor in (0,1] corrects
+/// it. Crucially, normalized min-sum is **scale-invariant** (scaling all input LLRs by `c`
+/// scales every message by `c`, leaving the hard decisions unchanged) — unlike the previous
+/// fixed *offset* min-sum, which annihilated the small LLRs that fading produces and silently
+/// discarded correctable frames. See `decoder_is_scale_invariant`.
+const DEFAULT_SCALE: f32 = 0.8;
 
 /// Default maximum number of decoding iterations.
 const DEFAULT_MAX_ITERATIONS: usize = 50;
@@ -86,31 +92,31 @@ impl TannerGraph {
 pub struct LdpcDecoder {
     code: LdpcCode,
     graph: TannerGraph,
-    /// Offset parameter for the min-sum approximation.
-    offset: f32,
+    /// Scaling factor for the normalized min-sum approximation (in (0,1]).
+    scale: f32,
     /// Maximum number of BP iterations before giving up.
     max_iterations: usize,
 }
 
 impl LdpcDecoder {
-    /// Create a new decoder with default parameters (offset=0.5, max_iter=50).
+    /// Create a new decoder with default parameters (normalized min-sum scale=0.8, max_iter=50).
     pub fn new(code: LdpcCode) -> Self {
         let graph = TannerGraph::from_code(&code);
         Self {
             code,
             graph,
-            offset: DEFAULT_OFFSET,
+            scale: DEFAULT_SCALE,
             max_iterations: DEFAULT_MAX_ITERATIONS,
         }
     }
 
-    /// Create a decoder with custom parameters.
-    pub fn with_params(code: LdpcCode, offset: f32, max_iterations: usize) -> Self {
+    /// Create a decoder with a custom normalized-min-sum `scale` (in (0,1]) and iteration cap.
+    pub fn with_params(code: LdpcCode, scale: f32, max_iterations: usize) -> Self {
         let graph = TannerGraph::from_code(&code);
         Self {
             code,
             graph,
-            offset,
+            scale,
             max_iterations,
         }
     }
@@ -226,13 +232,13 @@ impl LdpcDecoder {
                     // Sign: total product divided by this edge's sign
                     let outgoing_sign = total_sign * signs[local_idx];
 
-                    // Magnitude: minimum of all OTHER magnitudes, minus offset
+                    // Magnitude: minimum of all OTHER magnitudes, scaled (normalized min-sum).
                     let min_other = if local_idx == min1_idx {
                         min2_val
                     } else {
                         min1_val
                     };
-                    let mag = (min_other - self.offset).max(0.0);
+                    let mag = min_other * self.scale;
 
                     check_to_var[edge_idx] = outgoing_sign * mag;
                 }
@@ -478,22 +484,58 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_offset() {
+    fn test_custom_scale() {
         let code = LdpcCode::new(CodeRate::Rate1_2);
         let enc = LdpcEncoder::new(code.clone());
 
-        // Test with different offsets
-        for &offset in &[0.0, 0.25, 0.5, 0.75] {
-            let dec = LdpcDecoder::with_params(code.clone(), offset, 50);
+        // Normalized min-sum with different scaling factors — all decode a perfect channel.
+        for &scale in &[0.5, 0.75, 0.8, 1.0] {
+            let dec = LdpcDecoder::with_params(code.clone(), scale, 50);
             let info = vec![0u8; code.info_bits()];
             let soft = encode_and_make_soft(&enc, &info);
             let decoded = dec.decode_block(&soft);
             assert_eq!(
                 decoded, info,
-                "offset={}: perfect channel should always work",
-                offset
+                "scale={}: perfect channel should always work",
+                scale
             );
         }
+    }
+
+    #[test]
+    fn decoder_is_scale_invariant() {
+        // Regression test for the offset-min-sum scale bug: a faded HF frame yields
+        // correct-sign but tiny LLRs, and the fixed 0.5 offset annihilated them, discarding
+        // correctable frames. A correct decoder must give the SAME result regardless of the
+        // overall LLR magnitude — decoding identical-sign LLRs at unit scale and at 0.01x
+        // scale must both converge to the same codeword.
+        let code = LdpcCode::new(CodeRate::Rate1_2);
+        let enc = LdpcEncoder::new(code.clone());
+        let dec = LdpcDecoder::new(code.clone());
+
+        let info: Vec<u8> = (0..code.info_bits()).map(|i| (i % 3 == 0) as u8).collect();
+        let coded = enc.encode_block(&info);
+        // Correct-sign unit LLRs, then flip a handful of signs (errors within rate-1/2 capacity).
+        let mut llrs: Vec<f32> = coded
+            .iter()
+            .map(|&b| if b == 0 { 1.0 } else { -1.0 })
+            .collect();
+        for &i in &[5usize, 99, 333, 700, 1500] {
+            llrs[i] = -llrs[i];
+        }
+
+        let (d_unit, c_unit) = dec.decode_block_checked(&llrs);
+        let small: Vec<f32> = llrs.iter().map(|x| x * 0.01).collect();
+        let (d_small, c_small) = dec.decode_block_checked(&small);
+
+        assert!(
+            c_unit && d_unit == info,
+            "must converge+correct at unit LLR scale"
+        );
+        assert!(
+            c_small && d_small == info,
+            "must ALSO converge+correct at 0.01x LLR scale (scale invariance)"
+        );
     }
 
     #[test]

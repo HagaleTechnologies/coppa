@@ -167,6 +167,20 @@ mod tests {
     }
 
     #[test]
+    fn test_transceiver_cfo_correction() {
+        // An 8 Hz CFO collapses the link without correction; the RX must estimate + remove it.
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let payload = b"CFO correction works";
+        let header = make_header(2, payload.len() as u16);
+        let samples = tx.transmit(&header, payload);
+        let injected = coppa_codec::ofdm::sync::remove_cfo(&samples, -8.0, 48_000.0); // +8 Hz
+        let (_h, rx) = tx
+            .receive(&injected)
+            .expect("should recover after CFO correction");
+        assert_eq!(&rx[..payload.len()], payload.as_slice());
+    }
+
+    #[test]
     fn test_transceiver_bpsk_rate_half_loopback() {
         let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
         let payload = b"Hello Phase C!";
@@ -203,6 +217,49 @@ mod tests {
         let (rx_header, rx_payload) = tx.receive(&samples).expect("decode should succeed");
 
         assert_eq!(rx_header.speed_level, 6);
+        assert_eq!(&rx_payload[..payload.len()], payload.as_slice());
+    }
+
+    #[test]
+    fn test_transceiver_16qam_survives_flat_gain() {
+        // A flat channel gain (0.5) shrinks the constellation; MMSE leaves the equalized symbols
+        // at the wrong amplitude and 16QAM mis-decodes. Gain-normalization (Y/H) must restore it.
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_robust(), 1);
+        let payload = vec![0x3Cu8; 40];
+        let header = make_header(6, payload.len() as u16); // 16QAM 1/2
+        let mut samples = tx.transmit(&header, payload.as_slice());
+        for s in samples.iter_mut() {
+            *s *= 0.5; // flat channel gain
+        }
+        let (_h, rx) = tx
+            .receive(&samples)
+            .expect("16QAM should survive a flat 0.5 gain");
+        assert_eq!(&rx[..payload.len()], payload.as_slice());
+    }
+
+    #[test]
+    fn test_transceiver_hf_robust_bpsk_loopback() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_robust(), 1);
+        let payload = b"Hello robust HF profile!";
+        let header = make_header(2, payload.len() as u16); // BPSK 1/2
+        let samples = tx.transmit(&header, payload);
+        let (rx_header, rx_payload) = tx
+            .receive(&samples)
+            .expect("hf_robust decode should succeed");
+        assert_eq!(rx_header.speed_level, 2);
+        assert_eq!(&rx_payload[..payload.len()], payload.as_slice());
+    }
+
+    #[test]
+    fn test_transceiver_hf_robust_qpsk_loopback() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_robust(), 1);
+        let payload = vec![0x5Au8; 60];
+        let header = make_header(3, payload.len() as u16); // QPSK 1/2
+        let samples = tx.transmit(&header, payload.as_slice());
+        let (rx_header, rx_payload) = tx
+            .receive(&samples)
+            .expect("hf_robust QPSK decode should succeed");
+        assert_eq!(rx_header.speed_level, 3);
         assert_eq!(&rx_payload[..payload.len()], payload.as_slice());
     }
 }

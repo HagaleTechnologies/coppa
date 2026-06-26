@@ -13,6 +13,31 @@ payload → OFDM modulate → AWGN → demodulate/decode. SNR is **audio-band SN
 Eb/N0), swept −6…30 dB in 3 dB steps. "Goodput" = `payload_bits × (1 − FER) / frame_airtime`.
 Raw per-point data is regenerable into `results/awgn.csv` (gitignored).
 
+## Current performance (all fixes applied)
+
+This is the headline current state, with the `hf_robust` profile (12 pilots, 2D estimation) and
+all the PHY fixes below (scale-invariant LDPC decoder, gain-normalized QAM demap, CFO correction).
+Peak goodput per channel (best working mode), 50 trials:
+
+| Channel | Best mode | Peak goodput | Notes |
+|---------|-----------|--------------|-------|
+| AWGN | 64QAM 7/8 | **4615 bps** | full ladder works, clean 3–15 dB thresholds |
+| Watterson Good | 8PSK 2/3 | **1846 bps** | every mode delivers; 64QAM 2/3 ≈ 1481 |
+| Watterson Moderate | 16QAM 1/2 | **1630 bps** | every mode delivers; 8PSK ≈ 1546 |
+| Watterson Poor | 16QAM 1/2 | **1203 bps** | all but 64QAM 7/8 deliver; 8PSK ≈ 1159 |
+| CFO | — | ±15 Hz | live RX estimates + removes carrier offset |
+
+This is a complete reversal of where the PHY started: under realistic HF multipath every mode used
+to collapse to ~0 (only a trickle of BPSK 1/4 survived). The path there — each step measured, several
+hypotheses falsified along the way — is documented in the sections below. The short version: the
+"fading collapse" was **three bugs and one missing feature**, not a fundamental limit —
+(1) the LDPC offset-min-sum decoder was not scale-invariant and discarded correctable faded frames;
+(2) pilots were too sparse to resolve frequency-selective fading (fixed by `hf_robust` + 2D
+cross-symbol pilot pooling); (3) the MMSE equalizer's amplitude bias broke high-order QAM under any
+fading; and (4) the live RX did not correct carrier frequency offset. Notably, the **cross-frame
+time-interleaving** ("diversity") hypothesis was built and *falsified* — it made things worse — and a
+diagnose-first **gate** twice redirected the work away from the wrong fix.
+
 ## AWGN channel
 
 | Mode | SNR @ FER=10% | SNR @ FER=1% | Peak goodput (bps) |
@@ -84,6 +109,11 @@ multipath + Doppler, ITU-R F.1487 presets) *before* AWGN. Generated with
 
 ### Verdict: the current PHY does not survive realistic HF fading
 
+> **⚠️ Superseded — read "Root cause of the fading collapse" below.** These Watterson tables
+> were measured before a decoder bug was found and fixed. The collapse was substantially an
+> LDPC offset-min-sum scale bug, not a fundamental PHY limit; with normalized min-sum, Good
+> recovers ~77 % and flat fading ~100 %. The narrative below reflects the pre-fix state.
+
 This is the most important result here, and it's the opposite of the AWGN story.
 **Under Watterson multipath fading, coppa's PHY essentially collapses** — even on the
 *mildest* "Good" channel, even at 30 dB SNR, **no mode reaches a 10% frame-error
@@ -133,19 +163,223 @@ A follow-up replaced the multipath-fragile preamble cross-correlation with Schmi
 autocorrelation plus fine timing. The `fading_diagnosis` example confirms it drops the
 multipath sync-failure rate from ~⅓ of frames to ~0, leaves clean-channel decoding unchanged,
 and even recovers some BPSK 1/4 frames under fading. But it does **not** lift the collapse:
-with sync failures eliminated, the modes still fail at the LDPC / diversity floor. This
-*proves* the bottleneck is diversity, not sync. (The Watterson tables above predate this fix
-and slightly understate BPSK 1/4; the qualitative collapse is unchanged.)
+with sync failures eliminated, the modes still fail under fading. This rules out sync as the
+cause — but, contrary to what we first inferred, the remaining limiter is **not** a lack of
+time diversity (see the next section, which tested and falsified that hypothesis). (The
+Watterson tables above predate this fix and slightly understate BPSK 1/4; the qualitative
+collapse is unchanged.)
+
+## Transfer-level cross-frame interleaving: a falsified diversity hypothesis
+
+The natural next hypothesis was that the collapse is a *diversity* floor — one LDPC codeword
+lives or dies in a single fading block, with no spreading across coherence times. To test it
+we built a transfer-level harness (a payload over N=8 frames through one *correlated*
+multi-frame Watterson realization) and a deep **cross-frame interleaver** (V2) that spreads
+every codeword's coded bits evenly across all 8 frames, against the baseline per-frame PHY
+(V1). Both carry the same payload over the same airtime (rate-neutral); both see *identical*
+paired fading + AWGN draws. Level 2 (BPSK 1/2), 20 trials:
+
+| Channel | V1 recovery | V2 recovery | Δ |
+|---------|-------------|-------------|-----|
+| AWGN | 100 % | 100 % | 0 (interleaver is lossless) |
+| Watterson Good | ~20 % | ~6–10 % | **−11 to −12 pts** |
+| Watterson Moderate | ~5 % | ~0.4 % | **−3 to −5 pts** |
+| Watterson Poor | ~1.7 % | ~0.4 % | **−1 to −2 pts** |
+
+**The hypothesis is falsified: cross-frame diversity makes things *worse*, on every fading
+channel.** The cause is a regime mismatch. coppa's per-frame link under fading averages
+*below* the LDPC correction threshold. V1 *concentrates* errors per codeword, so the minority
+of frames that land in good fade conditions decode fully (on Good, ~20 % ≈ 1.4 of 8
+codewords). V2 *spreads* each codeword across all 8 frames, so every codeword inherits the
+above-threshold average and they all fail together (collapsing to the ~0.4 % chance floor).
+Interleaving only helps when the average is *below* threshold with rare bursts — the opposite
+of coppa's situation here.
+
+**Implication (at the time):** the bottleneck looked like per-frame link robustness rather
+than diversity. Running that down led to the actual root cause below — which turned out to be
+a decoder bug, not the channel.
+
+## Root cause of the fading collapse: an LDPC decoder scale bug (fixed)
+
+A per-frame link diagnosis (`cargo run --release -p coppa-bench --example
+per_frame_link_diagnosis`) localized the collapse precisely. The decisive clue: a **flat
+1-tap Rayleigh** fade produces **0.00 % pre-FEC bit errors**, yet 43 of 60 such frames were
+discarded — and across every fading condition the dominant failure was `LdpcNotConverged`
+(56–57 of 60), not sync, header, or CRC. A frame with zero hard errors *is* a valid codeword,
+so the decoder was throwing away perfectly good frames.
+
+**The cause:** the LDPC decoder used **offset min-sum with a fixed 0.5 offset**, which is not
+scale-invariant. Under fading the MMSE equalizer yields correct-sign but tiny LLRs (a deeply
+faded carrier's LLR scales as ≈|Ĥ|⁴). When message magnitudes fall below 0.5, the check-node
+update `(min − 0.5).max(0)` clamps **every** message to zero — BP is silently switched off and
+cannot correct even one residual error. AWGN at 30 dB has huge LLRs, so the offset is
+negligible and it decodes perfectly; fading collapses the LLR scale and the offset annihilates
+it.
+
+**The fix:** replace the fixed offset with **normalized min-sum** (a multiplicative factor
+α = 0.8), which is inherently scale-invariant. Decoding identical inputs, this lifts per-frame
+recovery dramatically (level 2, 30 dB, end-to-end through `receive()`):
+
+| Channel | post-FEC before | post-FEC after |
+|---------|-----------------|----------------|
+| AWGN | 100 % | 100 % (no regression) |
+| Flat 1-tap Rayleigh | 28 % | **100 %** |
+| Watterson Good | 1.7 % | **76.7 %** |
+| Watterson Moderate | 0 % | **21.7 %** |
+| Watterson Poor | 0 % | 0 % |
+
+So **most of the "fading collapse" was a decoder bug, not a fundamental PHY limitation** — the
+Watterson and transfer-level tables above were measured before this fix and badly understate
+the PHY. The earlier "diversity floor" and "frequency nulls" framings were downstream symptoms.
+
+### Post-fix per-mode results (supersedes the pre-fix Watterson tables above)
+
+Full mode ladder re-measured with normalized min-sum (50 trials, −6…30 dB):
+
+| Channel | Modes that get frames through | Best peak goodput |
+|---------|-------------------------------|-------------------|
+| Watterson Good | BPSK 1/4, BPSK 1/2 (FER<10% @30 dB), QPSK 1/2, QPSK 3/4 | **QPSK 1/2 ≈ 1080 bps** |
+| Watterson Moderate | BPSK 1/4, BPSK 1/2 only | ≈ 322 bps |
+| Watterson Poor | BPSK 1/4 only | ≈ 66 bps |
+
+Good HF is now genuinely usable (up to QPSK, ~1 kbps — vs ~0 for everything but a trickle of
+BPSK 1/4 before the fix). Moderate carries the robust BPSK modes. Poor still only passes
+BPSK 1/4 and barely. Higher-order QAM (16/64) deliver 0 on every fading channel at this stage —
+later traced to an MMSE amplitude-bias bug (not the channel) and fixed; see "High-order QAM under
+fading" below.
+
+### Remaining levers (what's left for Moderate/Poor and higher-order modes)
+
+- **Lower code rate** is what keeps Poor alive — BPSK 1/4 is the only survivor, so rate is the
+  dominant robustness knob; there is no lower rate available today.
+- **Channel-estimation density** turned out to be the dominant lever — see "denser pilots" below,
+  which lifted Moderate/Poor from near-dead to QPSK-class throughput.
+- **Explicit frequency diversity** (carrier repetition / MRC, or a more redundant waveform like
+  FreeDV's DATAC) remains the lever for the *residual* floor that denser pilots don't reach:
+  higher-order QAM under fading, where ~10–40 % of the band sits in deep nulls that carry no
+  recoverable signal.
+- **Cross-frame time interleaving (V2)** was re-evaluated after the fix: it now *helps* slightly
+  on a strong channel (Good ≥18 dB: V2 100 % vs V1 ~97 %) but still *hurts* on Moderate/Poor
+  (V2 ≈ 21 % vs V1 ≈ 45 % on Moderate) — the textbook interleaving trade-off. It is not a general
+  robustness win, so it stays shelved as a measurement, not a shipped feature.
+
+### Frequency-selective robustness: denser pilots (`hf_robust`, the big win)
+
+The dominant remaining failure on Moderate/Poor turned out to be **channel-estimation
+undersampling**, not irreducible null loss. `hf_standard` has 4 pilots across 48 carriers
+(600 Hz spacing), but the equal-power two-tap channel's coherence bandwidth is 1 kHz (Moderate)
+/ 500 Hz (Poor) — so the pilots undersample the selective channel and interpolation
+mis-estimates broadly. The `hf_robust` profile raises pilots to **12 (200 Hz spacing), data
+carriers 44 → 36** (−18 % raw capacity). No other change.
+
+The per-frame diagnosis confirms the mechanism directly: under `hf_robust`, the hard-error rate
+on *non-flagged* carriers (`err@lowNV`) collapses from 7.8 %→0.03 % (Moderate) and
+18 %→1.4 % (Poor); residual errors are now confined to correctly-flagged null carriers (soft
+erasures the FEC corrects). Per-frame `postFEC` recovery at 30 dB, `hf_standard` → `hf_robust`:
+Good 77 %→88 %, **Moderate 22 %→95 %, Poor 0 %→72 %**.
+
+Full mode ladder, peak goodput (40 trials), `hf_standard` → `hf_robust`:
+
+| Channel | hf_standard | hf_robust | notes |
+|---------|-------------|-----------|-------|
+| Good | QPSK 1/2, 1087 bps | **QPSK 3/4 / 8PSK, ~1390 bps** | QPSK 1/2 now clears FER<10 % @ 9 dB |
+| Moderate | BPSK only, 329 bps | **QPSK 1/2, 1095 bps** (~3.3×) | QPSK 1/2 @ 18 dB; BPSK 1/2 @ 12 dB |
+| Poor | BPSK 1/4, 64 bps | **BPSK 1/2, 563 bps** (~9×) | BPSK 1/4 @ 9 dB, BPSK 1/2 @ 21 dB; QPSK 1/2 partial |
+
+So denser pilots transform the selective channels: Moderate and Poor go from near-dead to
+carrying QPSK-class throughput with real SNR thresholds. The cost is slightly lower goodput for
+the *robust* modes on Good (fewer data carriers) — irrelevant since higher modes now dominate; a
+real link would pick the profile by channel. The erasure path is healthy (no equalizer change
+was needed).
+
+### 2D time+frequency channel estimation (cross-symbol pilot pooling)
+
+The pilot pattern already alternates pilot carrier positions even/odd between OFDM symbols, but
+the RX estimated the channel per-symbol from only that symbol's pilots. Because HF fading is
+block-fading (the channel is ~constant in time within a frame), pooling pilots **across
+neighbouring symbols** combines the complementary even/odd positions into a **~2× denser
+frequency comb** and noise-averages it — at **zero throughput cost** (no change to pilot count or
+data carriers). The pooling is windowed to **±2 symbols (~105 ms)** so it stays inside the channel
+coherence time even on Poor (1 Hz Doppler ≈ 160 ms); pooling the *whole frame* was measured to
+blur Poor's time-varying channel and dropped its per-frame recovery 72 % → 12 %, so the window is
+load-bearing.
+
+Per-frame `postFEC` @30 dB and ladder peak goodput, **before → after** 2D estimation:
+
+| Channel / profile | per-frame postFEC | peak goodput |
+|-------------------|-------------------|--------------|
+| standard / Good | 77 % → 77 % | 1087 → **1790 bps** (8PSK now works) |
+| standard / Moderate | 22 % → **90 %** | 329 → **988 bps** (QPSK now works) |
+| robust / Moderate | 95 % → 95 % | 1095 → **1449 bps** (8PSK now works) |
+| robust / Poor | 72 % → **82 %** | 563 → **1073 bps** (8PSK now works on Poor) |
+
+So cross-symbol pilot pooling is a free, broad win — it lifts every selective channel and pushes
+the working modulation an order higher (8PSK reaches Poor), with the biggest gains where pilots
+were sparsest (the `standard` profile). (At this point higher-order QAM still delivered ~0 under
+fading — that turned out to be a separate equalizer bug, fixed next.)
+
+### High-order QAM under fading: an MMSE amplitude-bias bug (fixed)
+
+A diagnostic gate (extending `per_frame_link_diagnosis` to levels 6/9) was run before building the
+planned frequency-repetition lever — and it falsified that plan. Under *any* fading (including
+**flat 1-tap**, which has no nulls at all) 16/64-QAM decoded near-randomly, with errors **uniform
+across carriers** (err@highNV ≈ err@lowNV), not concentrated at nulls. So the cause was not
+frequency nulls (which repetition would address) but **amplitude**: the MMSE equalizer outputs
+`X̂ = Y·H*/(|H|²+σ²) = g·x` with a per-carrier gain `g = |H|²/(|H|²+σ²) < 1`, while the QAM
+`demap_soft` compares against the fixed unit-power constellation. BPSK/QPSK decide by sign/quadrant
+(gain-independent) so they were unaffected; QAM's amplitude levels are not, so it failed under any
+fading while working in AWGN (where `g≈1`).
+
+The fix un-biases the equalized data symbols by `1/g` (= zero-forcing `Y/H`, restoring constellation
+scale), consistent with the `σ²/|H|²` noise the demap already uses. Per-frame postFEC @30 dB,
+before → after (robust profile):
+
+| Mode | Good | Moderate | Poor |
+|------|------|----------|------|
+| 16QAM 1/2 | 0 % → **78 %** | 0 % → **83 %** | 0 % → **37 %** |
+| 64QAM 2/3 | 0 % → **40 %** | 0 % → **28 %** | 0 % → **18 %** |
+
+Ladder peak goodput (robust): **16/64-QAM now deliver on every fading channel** — Good 16QAM 1/2
+**1698 bps** / 64QAM 2/3 **1587 bps**; Moderate 16QAM 1/2 **1698** / 64QAM 2/3 **1499**; Poor 16QAM 1/2
+**1116** / 64QAM 2/3 **882** — all of which were **0** before. This was the diagnose-first gate paying
+off: the originally-planned frequency-repetition build would not have fixed it, since the failure was
+amplitude, not nulls.
+
+### Carrier frequency offset (CFO) tolerance
+
+Real HF radios have a carrier frequency offset (oscillator tolerance ~1 ppm at 14 MHz ≈ 14 Hz, plus
+SSB tuning error). A `--cfo` bench knob (a clean FFT-Hilbert frequency shift) measured coppa's
+envelope, gated *before* building any fix. **Before:** the pilot phase tracking held only to ~2 Hz,
+then everything collapsed by 5 Hz (the within-symbol phase rotation smears the FFT). That is well
+below realistic HF, so a fix was warranted.
+
+The fix adds **preamble-based CFO estimation + de-rotation in the live RX**: the analytic
+(FFT-Hilbert) preamble's two identical Schmidl-Cox halves give the offset from their phase
+difference (`ĉfo = arg(Σ a[n]·conj(a[n+L]))·fs/(2π·L)`), and the frame is de-rotated before demod.
+The coarse sync metric was also moved from a real to a complex (`|P|²`) autocorrelation so detection
+itself is rotation-invariant. CFO recovery envelope (robust profile, AWGN), before → after:
+
+| CFO | 0 Hz | 2 Hz | 5 Hz | 10 Hz | 15 Hz | 20 Hz |
+|-----|------|------|------|-------|-------|-------|
+| before | ✓ | ✓ (degraded) | ✗ | ✗ | ✗ | ✗ |
+| after  | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ |
+
+So tolerance went **~2 Hz → 15 Hz** at full goodput, with no regression at 0 Hz. The 20 Hz failure is
+the ±fs/(2·symbol_len) ≈ ±19 Hz unambiguous range of the fractional Schmidl-Cox estimator — beyond
+that the estimate wraps; an integer-CFO stage would extend it, but ±15 Hz already covers typical HF.
 
 ## Limitations
 
-- **Coverage.** AWGN and Watterson (Good/Moderate/Poor) channels are measured; there is no
-  CFO, frequency-offset, or combined CFO+fading case yet.
-- **One codeword per fading block, no PHY interleaving/ARQ.** The fading results are
-  single-shot per frame (see the fairness caveat above); they are a lower bound on what a
-  full link layer could achieve.
-- **No CFO tolerance.** The receive path does not correct carrier-frequency offset, so these
-  results assume ideal frequency/timing.
+- **Coverage.** AWGN and Watterson (Good/Moderate/Poor) channels are measured, plus a CFO sweep
+  (see "Carrier frequency offset tolerance"); a *combined* CFO+fading sweep is not yet characterized.
+- **One codeword per fading block; cross-frame interleaving tested and counterproductive.**
+  The per-frame fading results are single-shot (see the fairness caveat above). Deep
+  cross-frame interleaving was implemented and measured at the transfer level (see "a
+  falsified diversity hypothesis" above) and made recovery *worse*, not better — so these
+  numbers are not improved by PHY interleaving. ARQ is a separate, untested lever.
+- **CFO tolerance is ±15 Hz**, not unlimited: the live RX now estimates and removes carrier
+  frequency offset (see above), but the fractional Schmidl-Cox estimator wraps beyond ±~19 Hz, so
+  larger offsets need an integer-CFO stage (not yet built). Sample-clock offset is also uncorrected.
 - **50 trials per point**, so FER resolution is ~2%; the "FER=1%" column is really "the first
   SNR with zero failures in 50 trials," and thresholds are quantized to the 3 dB grid. Treat
   them as indicative, not precise.

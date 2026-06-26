@@ -49,6 +49,24 @@ impl LinearInterpolationEstimator {
             })
             .collect()
     }
+
+    /// Per-carrier Wiener gain g[k] = |H[k]|^2 / (|H[k]|^2 + sigma^2) — the amplitude bias the
+    /// MMSE equalizer applies. Dividing an equalized symbol by g un-biases it to constellation
+    /// scale (equivalent to zero-forcing), which matters for amplitude-bearing QAM.
+    pub fn per_carrier_gain(&self, data_carrier_indices: &[usize]) -> Vec<f32> {
+        let sigma2 = self.noise_var;
+        data_carrier_indices
+            .iter()
+            .map(|&k| {
+                let h_sq = if k < self.h_estimates.len() {
+                    self.h_estimates[k].norm_sqr()
+                } else {
+                    1.0
+                };
+                (h_sq / (h_sq + sigma2)).max(1e-6)
+            })
+            .collect()
+    }
 }
 
 impl ChannelEstimator for LinearInterpolationEstimator {

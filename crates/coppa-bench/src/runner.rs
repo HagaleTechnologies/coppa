@@ -33,6 +33,7 @@ fn run_trial(
     payload_bytes: usize,
     snr_db: f32,
     channel: ChannelSpec,
+    cfo_hz: f32,
     seed: u64,
 ) -> (TrialOutcome, usize) {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -42,7 +43,7 @@ fn run_trial(
     let clean = tx.transmit(&header, &payload);
     let frame_samples = clean.len();
 
-    let rx_samples = match channel {
+    let faded = match channel {
         ChannelSpec::Awgn => {
             coppa_channel::awgn_seeded(&clean, snr_db, seed ^ 0x5555_5555_5555_5555)
         }
@@ -57,7 +58,13 @@ fn run_trial(
         }
     };
 
-    let outcome = match tx.receive(&rx_samples) {
+    let rx_signal = if cfo_hz != 0.0 {
+        coppa_channel::frequency_shift(&faded, cfo_hz, crate::scenario::SAMPLE_RATE as f32)
+    } else {
+        faded
+    };
+
+    let outcome = match tx.receive(&rx_signal) {
         Ok((_h, rx_payload)) => {
             let n = payload.len().min(rx_payload.len());
             let errs = bit_errors(&payload[..n], &rx_payload[..n]);
@@ -84,7 +91,11 @@ pub fn run_scenario(scenario: &Scenario) -> Vec<MeasurementPoint> {
     let mode = mode_for_level(scenario.level)
         .unwrap_or_else(|| panic!("unknown speed level {}", scenario.level));
     let payload_bytes = mode.payload_bytes();
-    let tx = CoppaTransceiver::new(select_profile(scenario.level), 1);
+    let profile = scenario
+        .profile_override
+        .clone()
+        .unwrap_or_else(|| select_profile(scenario.level));
+    let tx = CoppaTransceiver::new(profile, 1);
     let channel_name = match scenario.channel {
         ChannelSpec::Awgn => "awgn",
         ChannelSpec::Watterson(WattersonPreset::Good) => "watterson-good",
@@ -107,6 +118,7 @@ pub fn run_scenario(scenario: &Scenario) -> Vec<MeasurementPoint> {
                 payload_bytes,
                 snr_db,
                 scenario.channel,
+                scenario.cfo_hz,
                 seed,
             );
             frame_samples = fs;
@@ -138,6 +150,8 @@ mod tests {
             snr_db_points: vec![30.0, -15.0],
             trials: 10,
             seed: 0xABCD,
+            profile_override: None,
+            cfo_hz: 0.0,
         };
         let points = run_scenario(&scenario);
         assert_eq!(points.len(), 2);
@@ -152,5 +166,26 @@ mod tests {
             points[1].fer
         );
         assert!(points[0].goodput_bps > 0.0);
+    }
+
+    #[test]
+    fn profile_override_is_used() {
+        // hf_robust must also decode cleanly at high SNR when forced via the override.
+        let scenario = Scenario {
+            level: 2,
+            channel: ChannelSpec::Awgn,
+            snr_db_points: vec![30.0],
+            trials: 5,
+            seed: 0xBEEF,
+            profile_override: Some(coppa_codec::ofdm::CoppaProfile::hf_robust()),
+            cfo_hz: 0.0,
+        };
+        let points = run_scenario(&scenario);
+        assert_eq!(points.len(), 1);
+        assert!(
+            points[0].fer < 0.2,
+            "hf_robust should decode at 30 dB AWGN (fer={})",
+            points[0].fer
+        );
     }
 }

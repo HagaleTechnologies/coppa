@@ -11,7 +11,49 @@
 
 pub mod watterson;
 
+use coppa_dsp::fft::FftProcessor;
+use num_complex::Complex32;
 use std::f32::consts::TAU;
+
+/// Apply a clean wideband carrier-frequency offset to a real passband signal.
+///
+/// Unlike the narrowband [`freq_offset`] (which mixes around a single carrier),
+/// this shifts the *entire* band by `offset_hz`. It forms the analytic (complex)
+/// signal via an FFT Hilbert transform, rotates it by `offset_hz`, and returns
+/// the real part. Used to measure CFO tolerance.
+pub fn frequency_shift(samples: &[f32], offset_hz: f32, sample_rate: f32) -> Vec<f32> {
+    let n = samples.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let fft = FftProcessor::new(n);
+
+    // Analytic signal via FFT Hilbert: keep DC, double positive-frequency bins,
+    // zero the negative ones (mirrors `watterson::analytic`).
+    let xc: Vec<Complex32> = samples.iter().map(|&v| Complex32::new(v, 0.0)).collect();
+    let mut xf = fft.forward(&xc);
+    let half = n / 2;
+    for s in xf.iter_mut().take(n).skip(half + 1) {
+        *s = Complex32::new(0.0, 0.0);
+    }
+    for s in xf.iter_mut().take(half).skip(1) {
+        *s *= 2.0;
+    }
+    // Odd n has no exact Nyquist bin, so `half` is a positive frequency too.
+    if n % 2 == 1 && half >= 1 {
+        xf[half] *= 2.0;
+    }
+    let analytic = fft.inverse(&xf);
+
+    analytic
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let phase = TAU * offset_hz * i as f32 / sample_rate;
+            (c * Complex32::new(phase.cos(), phase.sin())).re
+        })
+        .collect()
+}
 
 /// Add white Gaussian noise at the specified SNR (in dB).
 ///
@@ -253,6 +295,34 @@ mod tests {
         let samples: Vec<f32> = (0..200).map(|i| (i as f32 * 0.1).sin()).collect();
         let delayed = timing_offset(&samples, 3.7);
         assert_eq!(delayed.len(), samples.len());
+    }
+
+    #[test]
+    fn frequency_shift_moves_a_tone() {
+        // A pure tone at 1000 Hz, shifted by +200 Hz, should peak near 1200 Hz.
+        let sr = 8000.0f32;
+        let n = 4096usize;
+        let f0 = 1000.0f32;
+        let tone: Vec<f32> = (0..n)
+            .map(|i| (std::f32::consts::TAU * f0 * i as f32 / sr).sin())
+            .collect();
+        let shifted = frequency_shift(&tone, 200.0, sr);
+        assert_eq!(shifted.len(), n);
+        // Find the dominant positive-frequency bin of the shifted signal via a coarse DFT at a few freqs.
+        let power_at = |freq: f32, x: &[f32]| -> f32 {
+            let (mut re, mut im) = (0.0f32, 0.0f32);
+            for (i, &v) in x.iter().enumerate() {
+                let ph = std::f32::consts::TAU * freq * i as f32 / sr;
+                re += v * ph.cos();
+                im += v * ph.sin();
+            }
+            re * re + im * im
+        };
+        // Power should be higher at 1200 Hz (shifted) than at the original 1000 Hz.
+        assert!(
+            power_at(1200.0, &shifted) > power_at(1000.0, &shifted),
+            "tone should move from 1000 to ~1200 Hz"
+        );
     }
 
     #[test]
