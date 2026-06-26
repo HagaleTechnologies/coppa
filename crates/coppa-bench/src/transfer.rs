@@ -210,9 +210,65 @@ impl TransferPhy for V2Phy {
             .collect()
     }
 
-    fn decode_transfer(&self, _frame_windows: &[&[f32]]) -> Vec<u8> {
-        // Implemented in Task 3.
-        vec![0u8; self.payload_bytes()]
+    fn decode_transfer(&self, frame_windows: &[&[f32]]) -> Vec<u8> {
+        let n = self.frames;
+        let pfb = self.per_frame_bytes;
+        let data_carriers = self.profile.data_carriers;
+        let bps = self.mapper.bits_per_symbol();
+        let symbols_needed = CODED_BITS.div_ceil(bps);
+
+        // 1. Per frame: demodulate -> soft LLRs -> intra-frame de-interleave -> frame LLR block.
+        //    A frame that fails sync contributes an all-zero (erasure) block.
+        let mut frame_llrs: Vec<f32> = vec![0.0; n * CODED_BITS];
+        for (f, window) in frame_windows.iter().enumerate().take(n) {
+            if let Some((_h, eq_symbols, noise_vars)) = self.modem.demodulate_soft_coded(window) {
+                let mut llrs = Vec::with_capacity(CODED_BITS);
+                for (i, &sym) in eq_symbols.iter().take(symbols_needed).enumerate() {
+                    let nv = if i < noise_vars.len() {
+                        noise_vars[i].max(0.001)
+                    } else {
+                        0.01
+                    };
+                    llrs.extend(self.mapper.demap_soft(sym, nv));
+                }
+                llrs.truncate(CODED_BITS);
+                llrs.resize(CODED_BITS, 0.0);
+                for v in &mut llrs {
+                    *v = v.clamp(-20.0, 20.0);
+                }
+                let bi = BlockInterleaver::new(CODED_BITS, data_carriers);
+                let deint = bi.deinterleave(&llrs);
+                frame_llrs[f * CODED_BITS..(f + 1) * CODED_BITS].copy_from_slice(&deint);
+            }
+        }
+
+        // 2. Cross-frame de-interleave: frame-major LLRs -> codeword-major LLRs.
+        let codeword_llrs = self.cross.deinterleave(&frame_llrs);
+
+        // 3. Per codeword: LDPC decode -> descramble -> bytes -> place in slot k.
+        let mut out = vec![0u8; self.payload_bytes()];
+        for k in 0..n {
+            let llr = &codeword_llrs[k * CODED_BITS..(k + 1) * CODED_BITS];
+            let codec = LdpcCodec::new(self.code_rate);
+            let (mut bits, converged) = codec.decode_checked(llr);
+            if !converged {
+                continue;
+            }
+            scramble(&mut bits); // involution: undoes TX-side scrambling
+            let mut bytes = Vec::with_capacity(pfb);
+            for chunk in bits.chunks(8) {
+                if chunk.len() == 8 && bytes.len() < pfb {
+                    let mut byte = 0u8;
+                    for (i, &b) in chunk.iter().enumerate() {
+                        byte |= (b & 1) << (7 - i);
+                    }
+                    bytes.push(byte);
+                }
+            }
+            let m = bytes.len().min(pfb);
+            out[k * pfb..k * pfb + m].copy_from_slice(&bytes[..m]);
+        }
+        out
     }
 }
 
@@ -495,6 +551,35 @@ mod tests {
         assert!(
             frames.iter().all(|f| f.len() == l0),
             "frame signals must be uniform length"
+        );
+    }
+
+    #[test]
+    fn v2_clean_loopback_recovers_payload() {
+        let phy = V2Phy::new(2, 8);
+        let total = phy.payload_bytes();
+        let payload: Vec<u8> = (0..total).map(|i| (i * 11 + 3) as u8).collect();
+        let frames = phy.encode_transfer(&payload);
+        let windows: Vec<&[f32]> = frames.iter().map(|f| f.as_slice()).collect();
+        let recovered = phy.decode_transfer(&windows);
+        assert_eq!(
+            recovered, payload,
+            "clean loopback must recover the full V2 transfer"
+        );
+    }
+
+    #[test]
+    fn v2_recovers_over_awgn_at_high_snr() {
+        let phy = V2Phy::new(2, 8);
+        let total = phy.payload_bytes();
+        let payload: Vec<u8> = (0..total).map(|i| (i * 17 + 7) as u8).collect();
+        let frames = phy.encode_transfer(&payload);
+        let windows_owned = apply_transfer_channel(&frames, ChannelSpec::Awgn, 30.0, 4242);
+        let windows: Vec<&[f32]> = windows_owned.iter().map(|w| w.as_slice()).collect();
+        let recovered = phy.decode_transfer(&windows);
+        assert_eq!(
+            recovered, payload,
+            "V2 over AWGN at 30 dB should recover fully"
         );
     }
 
