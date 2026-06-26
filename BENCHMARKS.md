@@ -219,8 +219,9 @@ Full mode ladder re-measured with normalized min-sum (50 trials, −6…30 dB):
 
 Good HF is now genuinely usable (up to QPSK, ~1 kbps — vs ~0 for everything but a trickle of
 BPSK 1/4 before the fix). Moderate carries the robust BPSK modes. Poor still only passes
-BPSK 1/4 and barely. Higher-order QAM (16/64) deliver 0 on every fading channel — they need a
-near-flat channel, which the equal-power two-tap multipath denies.
+BPSK 1/4 and barely. Higher-order QAM (16/64) deliver 0 on every fading channel at this stage —
+later traced to an MMSE amplitude-bias bug (not the channel) and fixed; see "High-order QAM under
+fading" below.
 
 ### Remaining levers (what's left for Moderate/Poor and higher-order modes)
 
@@ -289,10 +290,35 @@ Per-frame `postFEC` @30 dB and ladder peak goodput, **before → after** 2D esti
 
 So cross-symbol pilot pooling is a free, broad win — it lifts every selective channel and pushes
 the working modulation an order higher (8PSK reaches Poor), with the biggest gains where pilots
-were sparsest (the `standard` profile). **Higher-order QAM (16/64) still mostly deliver 0 under
-fading** (16QAM 1/2 trickles ~150 bps on Good) — that residue is the genuine frequency-diversity
-floor where explicit carrier repetition / MRC (the deferred Approach B) or a more redundant
-waveform would be the next lever.
+were sparsest (the `standard` profile). (At this point higher-order QAM still delivered ~0 under
+fading — that turned out to be a separate equalizer bug, fixed next.)
+
+### High-order QAM under fading: an MMSE amplitude-bias bug (fixed)
+
+A diagnostic gate (extending `per_frame_link_diagnosis` to levels 6/9) was run before building the
+planned frequency-repetition lever — and it falsified that plan. Under *any* fading (including
+**flat 1-tap**, which has no nulls at all) 16/64-QAM decoded near-randomly, with errors **uniform
+across carriers** (err@highNV ≈ err@lowNV), not concentrated at nulls. So the cause was not
+frequency nulls (which repetition would address) but **amplitude**: the MMSE equalizer outputs
+`X̂ = Y·H*/(|H|²+σ²) = g·x` with a per-carrier gain `g = |H|²/(|H|²+σ²) < 1`, while the QAM
+`demap_soft` compares against the fixed unit-power constellation. BPSK/QPSK decide by sign/quadrant
+(gain-independent) so they were unaffected; QAM's amplitude levels are not, so it failed under any
+fading while working in AWGN (where `g≈1`).
+
+The fix un-biases the equalized data symbols by `1/g` (= zero-forcing `Y/H`, restoring constellation
+scale), consistent with the `σ²/|H|²` noise the demap already uses. Per-frame postFEC @30 dB,
+before → after (robust profile):
+
+| Mode | Good | Moderate | Poor |
+|------|------|----------|------|
+| 16QAM 1/2 | 0 % → **78 %** | 0 % → **83 %** | 0 % → **37 %** |
+| 64QAM 2/3 | 0 % → **40 %** | 0 % → **28 %** | 0 % → **18 %** |
+
+Ladder peak goodput (robust): **16/64-QAM now deliver on every fading channel** — Good 16QAM 1/2
+**1698 bps** / 64QAM 2/3 **1587 bps**; Moderate 16QAM 1/2 **1698** / 64QAM 2/3 **1499**; Poor 16QAM 1/2
+**1116** / 64QAM 2/3 **882** — all of which were **0** before. This was the diagnose-first gate paying
+off: the originally-planned frequency-repetition build would not have fixed it, since the failure was
+amplitude, not nulls.
 
 ## Limitations
 
