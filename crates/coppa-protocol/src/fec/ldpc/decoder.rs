@@ -528,7 +528,10 @@ mod tests {
         let small: Vec<f32> = llrs.iter().map(|x| x * 0.01).collect();
         let (d_small, c_small) = dec.decode_block_checked(&small);
 
-        assert!(c_unit && d_unit == info, "must converge+correct at unit LLR scale");
+        assert!(
+            c_unit && d_unit == info,
+            "must converge+correct at unit LLR scale"
+        );
         assert!(
             c_small && d_small == info,
             "must ALSO converge+correct at 0.01x LLR scale (scale invariance)"
