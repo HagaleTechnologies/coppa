@@ -30,7 +30,7 @@ use coppa_protocol::fec::scrambler::scramble;
 use coppa_protocol::modem::speed_levels::{speed_level_components, speed_level_entry};
 use coppa_protocol::modem::transceiver::{CoppaTransceiver, ReceiveError};
 
-use coppa_bench::scenario::{mode_for_level, select_profile};
+use coppa_bench::scenario::mode_for_level;
 use coppa_channel::watterson::{watterson, Tap, WattersonConfig, WattersonPreset};
 
 const CODED_BITS: usize = 1944;
@@ -78,12 +78,14 @@ struct Stats {
     flagged_frac: f64,
 }
 
-fn measure(label: &str, cond: &Cond) -> Stats {
+fn measure(label: &str, cond: &Cond, profile: &coppa_codec::ofdm::CoppaProfile) -> Stats {
     let level = 2u8;
-    let profile = select_profile(level);
+    let profile = profile.clone();
     let modem = CoppaModem::new(profile.clone(), 1);
     let (mapper, code_rate) = speed_level_components(level).expect("level 2 components");
-    let papr = speed_level_entry(level).expect("level 2 entry").papr_target_db;
+    let papr = speed_level_entry(level)
+        .expect("level 2 entry")
+        .papr_target_db;
     let info_bits = code_rate.info_bits();
     let data_carriers = profile.data_carriers;
     let pfb = mode_for_level(level).expect("level 2 mode").payload_bytes();
@@ -213,6 +215,18 @@ fn measure(label: &str, cond: &Cond) -> Stats {
 }
 
 fn main() {
+    let profile_name = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "standard".to_string());
+    let profile = match profile_name.as_str() {
+        "standard" => coppa_codec::ofdm::CoppaProfile::hf_standard(),
+        "robust" => coppa_codec::ofdm::CoppaProfile::hf_robust(),
+        other => panic!("unknown profile '{other}' (expected: standard|robust)"),
+    };
+    println!(
+        "Profile: {profile_name} ({} data / {} pilots)",
+        profile.data_carriers, profile.pilot_carriers
+    );
     println!("Per-frame link diagnosis — level 2 (BPSK 1/2), {SNR_DB} dB, {TRIALS} trials/cond");
     println!("(high SNR: failures are channel-induced, not noise-induced)\n");
     println!(
@@ -220,11 +234,23 @@ fn main() {
         "condition", "raw pre-FEC", "post-FEC", "A2-probe", "A1-probe", "nulls"
     );
 
-    measure("AWGN", &Cond::Awgn);
-    measure("flat-1tap", &Cond::Fading(flat_config()));
-    measure("Good-2tap", &Cond::Fading(WattersonPreset::Good.config()));
-    measure("Moderate", &Cond::Fading(WattersonPreset::Moderate.config()));
-    measure("Poor", &Cond::Fading(WattersonPreset::Poor.config()));
+    measure("AWGN", &Cond::Awgn, &profile);
+    measure("flat-1tap", &Cond::Fading(flat_config()), &profile);
+    measure(
+        "Good-2tap",
+        &Cond::Fading(WattersonPreset::Good.config()),
+        &profile,
+    );
+    measure(
+        "Moderate",
+        &Cond::Fading(WattersonPreset::Moderate.config()),
+        &profile,
+    );
+    measure(
+        "Poor",
+        &Cond::Fading(WattersonPreset::Poor.config()),
+        &profile,
+    );
 
     println!(
         "\nReading: A-vs-B — if flat-1tap rawBER is low but 2-tap is high, the cause is\n\
