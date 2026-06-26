@@ -320,17 +320,41 @@ Ladder peak goodput (robust): **16/64-QAM now deliver on every fading channel** 
 off: the originally-planned frequency-repetition build would not have fixed it, since the failure was
 amplitude, not nulls.
 
+### Carrier frequency offset (CFO) tolerance
+
+Real HF radios have a carrier frequency offset (oscillator tolerance ~1 ppm at 14 MHz ≈ 14 Hz, plus
+SSB tuning error). A `--cfo` bench knob (a clean FFT-Hilbert frequency shift) measured coppa's
+envelope, gated *before* building any fix. **Before:** the pilot phase tracking held only to ~2 Hz,
+then everything collapsed by 5 Hz (the within-symbol phase rotation smears the FFT). That is well
+below realistic HF, so a fix was warranted.
+
+The fix adds **preamble-based CFO estimation + de-rotation in the live RX**: the analytic
+(FFT-Hilbert) preamble's two identical Schmidl-Cox halves give the offset from their phase
+difference (`ĉfo = arg(Σ a[n]·conj(a[n+L]))·fs/(2π·L)`), and the frame is de-rotated before demod.
+The coarse sync metric was also moved from a real to a complex (`|P|²`) autocorrelation so detection
+itself is rotation-invariant. CFO recovery envelope (robust profile, AWGN), before → after:
+
+| CFO | 0 Hz | 2 Hz | 5 Hz | 10 Hz | 15 Hz | 20 Hz |
+|-----|------|------|------|-------|-------|-------|
+| before | ✓ | ✓ (degraded) | ✗ | ✗ | ✗ | ✗ |
+| after  | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ |
+
+So tolerance went **~2 Hz → 15 Hz** at full goodput, with no regression at 0 Hz. The 20 Hz failure is
+the ±fs/(2·symbol_len) ≈ ±19 Hz unambiguous range of the fractional Schmidl-Cox estimator — beyond
+that the estimate wraps; an integer-CFO stage would extend it, but ±15 Hz already covers typical HF.
+
 ## Limitations
 
-- **Coverage.** AWGN and Watterson (Good/Moderate/Poor) channels are measured; there is no
-  CFO, frequency-offset, or combined CFO+fading case yet.
+- **Coverage.** AWGN and Watterson (Good/Moderate/Poor) channels are measured, plus a CFO sweep
+  (see "Carrier frequency offset tolerance"); a *combined* CFO+fading sweep is not yet characterized.
 - **One codeword per fading block; cross-frame interleaving tested and counterproductive.**
   The per-frame fading results are single-shot (see the fairness caveat above). Deep
   cross-frame interleaving was implemented and measured at the transfer level (see "a
   falsified diversity hypothesis" above) and made recovery *worse*, not better — so these
   numbers are not improved by PHY interleaving. ARQ is a separate, untested lever.
-- **No CFO tolerance.** The receive path does not correct carrier-frequency offset, so these
-  results assume ideal frequency/timing.
+- **CFO tolerance is ±15 Hz**, not unlimited: the live RX now estimates and removes carrier
+  frequency offset (see above), but the fractional Schmidl-Cox estimator wraps beyond ±~19 Hz, so
+  larger offsets need an integer-CFO stage (not yet built). Sample-clock offset is also uncorrected.
 - **50 trials per point**, so FER resolution is ~2%; the "FER=1%" column is really "the first
   SNR with zero failures in 50 trials," and thresholds are quantized to the 3 dB grid. Treat
   them as indicative, not precise.
