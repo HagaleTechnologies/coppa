@@ -328,6 +328,7 @@ dependencies = [
  "clap",
  "coppa-channel",
  "coppa-codec",
+ "coppa-ml",
  "coppa-protocol",
  "rand",
 ]
