@@ -205,4 +205,30 @@ mod tests {
         assert_eq!(rx_header.speed_level, 6);
         assert_eq!(&rx_payload[..payload.len()], payload.as_slice());
     }
+
+    #[test]
+    fn test_transceiver_hf_robust_bpsk_loopback() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_robust(), 1);
+        let payload = b"Hello robust HF profile!";
+        let header = make_header(2, payload.len() as u16); // BPSK 1/2
+        let samples = tx.transmit(&header, payload);
+        let (rx_header, rx_payload) = tx
+            .receive(&samples)
+            .expect("hf_robust decode should succeed");
+        assert_eq!(rx_header.speed_level, 2);
+        assert_eq!(&rx_payload[..payload.len()], payload.as_slice());
+    }
+
+    #[test]
+    fn test_transceiver_hf_robust_qpsk_loopback() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_robust(), 1);
+        let payload = vec![0x5Au8; 60];
+        let header = make_header(3, payload.len() as u16); // QPSK 1/2
+        let samples = tx.transmit(&header, payload.as_slice());
+        let (rx_header, rx_payload) = tx
+            .receive(&samples)
+            .expect("hf_robust QPSK decode should succeed");
+        assert_eq!(rx_header.speed_level, 3);
+        assert_eq!(&rx_payload[..payload.len()], payload.as_slice());
+    }
 }
