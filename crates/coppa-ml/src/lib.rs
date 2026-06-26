@@ -18,7 +18,9 @@ pub mod registry;
 pub mod spectrum_sensor;
 
 pub use channel_predictor::EwmaPredictor;
-pub use mcs::{select_mcs, McsEntry, MCS_TABLE};
+pub use mcs::{
+    channel_capacity, select_mcs, select_speed_level, McsEntry, MCS_TABLE, SPEED_LEVEL_EFFICIENCY,
+};
 pub use registry::ModelRegistry;
 pub use spectrum_sensor::SpectrumSensor;
 

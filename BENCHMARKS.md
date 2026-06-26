@@ -368,6 +368,32 @@ So tolerance went **~2 Hz → 15 Hz** at full goodput, with no regression at 0 H
 the ±fs/(2·symbol_len) ≈ ±19 Hz unambiguous range of the fractional Schmidl-Cox estimator — beyond
 that the estimate wraps; an integer-CFO stage would extend it, but ±15 Hz already covers typical HF.
 
+## Adaptive MCS (capacity selector) + the noise-estimate fix that unblocked it
+
+A channel-quality-aware speed-level selector (`coppa-ml::select_speed_level`) picks the highest mode
+whose spectral efficiency fits the **average per-carrier Shannon capacity** `C = mean(log2(1 + 1/nv[k]))`
+minus a margin. `C` (from the RX's per-carrier noise `nv`) captures both SNR and frequency selectivity
+in one mode-independent number. A validation harness compares its goodput to an oracle (best level per
+point) and to the best fixed mode.
+
+**The harness first falsified the metric on fading** — `C` collapsed to ~0.3 on every Watterson channel
+(selecting BPSK 1/4 everywhere) even though the PHY delivers 16QAM there. Root cause: the equalizer's
+`noise_var` was estimated from the pilot residual against the *stale pre-update* channel estimate, so it
+measured `|H − 1|²` (channel deviation), not noise — inflated ~6× under fading. The LDPC decoder
+tolerated this (it uses `nv` only for *relative* weighting), but an *absolute* capacity metric did not.
+
+**The fix:** estimate per-carrier noise from the **second difference of the pilot channel estimates**
+(`σ² ≈ mean(|H[i−1] − 2H[i] + H[i+1]|²)/6`) — a smooth channel cancels in the second difference, leaving
+~noise, so it reflects *true* noise and is not inflated by (smooth) selectivity. Re-validated against the
+full fading ladder: **no decoder regression** (Good/Moderate/Poor goodput unchanged within trial noise —
+the relative weighting is preserved), and `C` on fading rose from ~0.3 to a real **2.2–5.3**.
+
+**Result (margin 2.5, calibrated to the Shannon-to-practical gap):** adaptive selection now tracks the
+oracle to an aggregate **0.83** of oracle goodput across AWGN + Watterson Good/Moderate/Poor (up from
+0.51 with the broken metric), e.g. Poor@12 dB hits the oracle exactly. The residual gap is honest
+margin/finite-blocklength slack (the metric slightly over-reads at low SNR); a per-η or SNR-aware margin
+would close it further. Closed-loop wiring (feeding the recommendation back via ARQ) remains a follow-on.
+
 ## Limitations
 
 - **Coverage.** AWGN and Watterson (Good/Moderate/Poor) channels are measured, plus a CFO sweep

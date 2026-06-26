@@ -150,6 +150,50 @@ pub fn select_mcs(snr_db: f32, margin_db: f32) -> &'static McsEntry {
     best
 }
 
+/// Average per-carrier Shannon capacity (bits/s/Hz) from RX per-carrier noise variances
+/// `nv[k] = sigma^2/|H[k]|^2` (per-carrier SNR = `1/nv[k]`). Captures BOTH effective SNR and
+/// frequency selectivity in one number (deep nulls => huge nv => ~0 contribution). Mode-independent
+/// because `nv` is pilot-derived. Supersedes the SNR-only `MCS_TABLE` for channel-adaptive selection.
+pub fn channel_capacity(noise_vars: &[f32]) -> f32 {
+    if noise_vars.is_empty() {
+        return 0.0;
+    }
+    let sum: f32 = noise_vars
+        .iter()
+        .map(|&nv| (1.0 + 1.0 / nv.max(1e-9)).log2())
+        .sum();
+    sum / noise_vars.len() as f32
+}
+
+/// (speed level, spectral efficiency η = bits_per_symbol × code_rate) for the real 9 levels,
+/// ascending by η, lower modulation order listed first at an η tie (more fading-robust).
+pub const SPEED_LEVEL_EFFICIENCY: [(u8, f32); 9] = [
+    (1, 0.25),
+    (2, 0.50),
+    (3, 1.00),
+    (4, 1.50),
+    (5, 2.00), // 8PSK 2/3 (tie with 16QAM 1/2; lower order first)
+    (6, 2.00), // 16QAM 1/2
+    (7, 3.00),
+    (9, 4.00),
+    (10, 5.25),
+];
+
+/// Highest speed level whose spectral efficiency fits `capacity - margin` (Shannon-to-practical
+/// coding gap). At an η tie the first-listed (lower-order) level wins. Returns level 1 if none fit.
+pub fn select_speed_level(capacity: f32, margin: f32) -> u8 {
+    let budget = capacity - margin;
+    let mut best_level = SPEED_LEVEL_EFFICIENCY[0].0;
+    let mut best_eta = -1.0f32;
+    for &(level, eta) in &SPEED_LEVEL_EFFICIENCY {
+        if eta <= budget && eta > best_eta {
+            best_level = level;
+            best_eta = eta;
+        }
+    }
+    best_level
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +251,29 @@ mod tests {
         // At 7 dB with 3 dB margin, effective = 4, gets BPSK 1/2
         let mcs = select_mcs(7.0, 3.0);
         assert_eq!(mcs.index, 2);
+    }
+
+    #[test]
+    fn capacity_reflects_snr_and_nulls() {
+        let strong = vec![0.001f32; 48];
+        let c_strong = channel_capacity(&strong);
+        assert!(c_strong > 9.0, "strong channel capacity {c_strong}");
+        let mut half = vec![0.001f32; 24];
+        half.extend(vec![1e6f32; 24]);
+        let c_half = channel_capacity(&half);
+        assert!(
+            (c_half - c_strong / 2.0).abs() < 1.0,
+            "half-nulled {c_half} vs {}",
+            c_strong / 2.0
+        );
+        assert_eq!(channel_capacity(&[]), 0.0);
+    }
+
+    #[test]
+    fn select_speed_level_is_capacity_aware() {
+        assert_eq!(select_speed_level(10.0, 1.0), 10);
+        assert_eq!(select_speed_level(2.5, 1.0), 4);
+        assert_eq!(select_speed_level(2.0, 0.0), 5); // eta=2.0 tie -> lower-order 8PSK (level 5)
+        assert_eq!(select_speed_level(0.1, 1.0), 1);
     }
 }

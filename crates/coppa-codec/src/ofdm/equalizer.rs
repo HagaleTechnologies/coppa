@@ -88,22 +88,21 @@ impl ChannelEstimator for LinearInterpolationEstimator {
             return;
         }
 
-        // Estimate noise variance from pilot prediction error:
-        // |received_pilot - H_est * known_pilot|^2
-        // This gives the true noise variance for the MMSE denominator,
-        // rather than tracking channel variation between updates.
-        let mut noise_sum = 0.0f32;
-        let mut noise_count = 0usize;
-        for &(idx, received, known) in pilots {
-            if idx < self.num_carriers && known.norm() > 1e-10 {
-                let predicted = self.h_estimates[idx] * known;
-                let residual = (received - predicted).norm_sqr();
-                noise_sum += residual;
-                noise_count += 1;
+        // Estimate noise from the 2nd difference of pilot channel estimates: a smooth channel
+        // cancels in H[i-1] - 2H[i] + H[i+1] (~0), leaving ~noise. Var(2nd diff) = 6*sigma^2 for
+        // independent per-pilot noise, so sigma^2 ~= mean(|d2|^2)/6. This reflects TRUE noise and is
+        // not inflated by (smooth) frequency selectivity — unlike the old |H - H_stale|^2 estimate.
+        if pilot_estimates.len() >= 3 {
+            let mut acc = 0.0f32;
+            let mut n = 0usize;
+            for w in pilot_estimates.windows(3) {
+                let d2 = w[0].1 - w[1].1 * 2.0 + w[2].1;
+                acc += d2.norm_sqr();
+                n += 1;
             }
-        }
-        if noise_count > 0 {
-            self.noise_var = (noise_sum / noise_count as f32).max(1e-10);
+            self.noise_var = (acc / n as f32 / 6.0).max(1e-10);
+        } else {
+            self.noise_var = 1e-3; // too few pilots to estimate; small default
         }
 
         // Linear interpolation between pilot positions
@@ -324,6 +323,53 @@ mod tests {
                 n
             );
         }
+    }
+
+    #[test]
+    fn noise_estimate_ignores_smooth_selectivity() {
+        // A smoothly-varying (linear) channel with NO noise must give ~zero noise_var — the old
+        // estimator returned |H-1|^2 and wrongly reported large "noise" for a strong off-unity channel.
+        let mut est = LinearInterpolationEstimator::new(48);
+        // Pilots at 0,8,16,24,32,40 with H varying linearly from 0.5 to 1.5 (smooth, no noise).
+        let pilots: Vec<(usize, Complex32, Complex32)> = (0..6)
+            .map(|j| {
+                let k = j * 8;
+                let h = 0.5 + (k as f32) / 40.0; // linear ramp 0.5..1.5
+                (k, Complex32::new(h, 0.0), Complex32::new(1.0, 0.0))
+            })
+            .collect();
+        est.update(&pilots);
+        assert!(
+            est.noise_variance() < 0.01,
+            "smooth selective channel must read low noise, got {}",
+            est.noise_variance()
+        );
+    }
+
+    #[test]
+    fn noise_estimate_recovers_true_noise() {
+        // A flat channel (H=1) plus a known per-pilot noise => noise_var ~ the noise power.
+        let mut est = LinearInterpolationEstimator::new(48);
+        // Deterministic +/- noise of magnitude 0.1 on a flat unit channel.
+        let noise = [0.1f32, -0.1, 0.1, -0.1, 0.1, -0.1, 0.1, -0.1];
+        let pilots: Vec<(usize, Complex32, Complex32)> = (0..8)
+            .map(|j| {
+                let k = j * 6;
+                (
+                    k,
+                    Complex32::new(1.0 + noise[j], 0.0),
+                    Complex32::new(1.0, 0.0),
+                )
+            })
+            .collect();
+        est.update(&pilots);
+        // The noise has magnitude ~0.1 => variance ~0.01; second-difference estimator should land
+        // in a sane band (not ~0, not hugely inflated).
+        let nv = est.noise_variance();
+        assert!(
+            nv > 0.001 && nv < 0.1,
+            "noise_var {nv} should reflect ~0.01-scale noise"
+        );
     }
 
     #[test]

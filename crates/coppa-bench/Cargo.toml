@@ -10,5 +10,6 @@ description = "Measurement harness: BER/FER/goodput-vs-SNR for Coppa PHY modes"
 coppa-codec = { path = "../coppa-codec" }
 coppa-protocol = { path = "../coppa-protocol" }
 coppa-channel = { path = "../coppa-channel" }
+coppa-ml = { path = "../coppa-ml" }
 rand = { workspace = true }
 clap = { workspace = true }
