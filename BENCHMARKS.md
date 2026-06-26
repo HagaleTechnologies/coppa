@@ -368,6 +368,28 @@ So tolerance went **~2 Hz → 15 Hz** at full goodput, with no regression at 0 H
 the ±fs/(2·symbol_len) ≈ ±19 Hz unambiguous range of the fractional Schmidl-Cox estimator — beyond
 that the estimate wraps; an integer-CFO stage would extend it, but ±15 Hz already covers typical HF.
 
+## Adaptive MCS: a capacity selector, and a metric blocked on the noise estimate
+
+A channel-quality-aware speed-level selector (`coppa-ml::select_speed_level`) was built on the idea
+that the average per-carrier Shannon capacity `C = mean(log2(1 + 1/nv[k]))` — from the RX's
+per-carrier noise variance `nv` — captures both SNR and frequency selectivity in one mode-independent
+number, and a validation harness compares its goodput to an oracle (best level per point) and the best
+fixed mode.
+
+The harness then **falsified the metric on fading channels.** Selecting from `C` tracks the oracle
+*well on AWGN* (C≈5.4 → picks 16QAM 3/4 … 64QAM, ratio 0.6–1.0), but on **every Watterson channel `C`
+collapses to ~0.0–0.6** and the selector picks BPSK 1/4 everywhere — even though the PHY *actually*
+delivers 16QAM (~1700 bps) there. Root cause: the equalizer's `noise_var` is a residual-based estimate
+that conflates channel deviation with noise, so under fading it is inflated ~6×; `1/nv` then badly
+*under*-states the true per-carrier SNR. The LDPC decoder tolerates this (it uses `nv` only for
+*relative* carrier weighting), but an *absolute* capacity metric does not.
+
+So the selector logic is correct (it correctly identifies that the metric is unreliable under fading),
+but a trustworthy capacity-from-noise metric needs the **per-carrier noise estimate fixed first**
+(compute the pilot residual against the *final* interpolated channel estimate, not the stale
+pre-update one). That fix would also tighten the decoder's LLRs — a high-value PHY task that unblocks
+adaptive MCS. Until then, adaptive selection is reliable on AWGN-like channels only.
+
 ## Limitations
 
 - **Coverage.** AWGN and Watterson (Good/Moderate/Poor) channels are measured, plus a CFO sweep
