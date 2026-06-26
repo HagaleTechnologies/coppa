@@ -133,17 +133,54 @@ A follow-up replaced the multipath-fragile preamble cross-correlation with Schmi
 autocorrelation plus fine timing. The `fading_diagnosis` example confirms it drops the
 multipath sync-failure rate from ~⅓ of frames to ~0, leaves clean-channel decoding unchanged,
 and even recovers some BPSK 1/4 frames under fading. But it does **not** lift the collapse:
-with sync failures eliminated, the modes still fail at the LDPC / diversity floor. This
-*proves* the bottleneck is diversity, not sync. (The Watterson tables above predate this fix
-and slightly understate BPSK 1/4; the qualitative collapse is unchanged.)
+with sync failures eliminated, the modes still fail under fading. This rules out sync as the
+cause — but, contrary to what we first inferred, the remaining limiter is **not** a lack of
+time diversity (see the next section, which tested and falsified that hypothesis). (The
+Watterson tables above predate this fix and slightly understate BPSK 1/4; the qualitative
+collapse is unchanged.)
+
+## Transfer-level cross-frame interleaving: a falsified diversity hypothesis
+
+The natural next hypothesis was that the collapse is a *diversity* floor — one LDPC codeword
+lives or dies in a single fading block, with no spreading across coherence times. To test it
+we built a transfer-level harness (a payload over N=8 frames through one *correlated*
+multi-frame Watterson realization) and a deep **cross-frame interleaver** (V2) that spreads
+every codeword's coded bits evenly across all 8 frames, against the baseline per-frame PHY
+(V1). Both carry the same payload over the same airtime (rate-neutral); both see *identical*
+paired fading + AWGN draws. Level 2 (BPSK 1/2), 20 trials:
+
+| Channel | V1 recovery | V2 recovery | Δ |
+|---------|-------------|-------------|-----|
+| AWGN | 100 % | 100 % | 0 (interleaver is lossless) |
+| Watterson Good | ~20 % | ~6–10 % | **−11 to −12 pts** |
+| Watterson Moderate | ~5 % | ~0.4 % | **−3 to −5 pts** |
+| Watterson Poor | ~1.7 % | ~0.4 % | **−1 to −2 pts** |
+
+**The hypothesis is falsified: cross-frame diversity makes things *worse*, on every fading
+channel.** The cause is a regime mismatch. coppa's per-frame link under fading averages
+*below* the LDPC correction threshold. V1 *concentrates* errors per codeword, so the minority
+of frames that land in good fade conditions decode fully (on Good, ~20 % ≈ 1.4 of 8
+codewords). V2 *spreads* each codeword across all 8 frames, so every codeword inherits the
+above-threshold average and they all fail together (collapsing to the ~0.4 % chance floor).
+Interleaving only helps when the average is *below* threshold with rare bursts — the opposite
+of coppa's situation here.
+
+**Implication:** the real bottleneck is **per-frame link robustness under frequency-selective
+fading** (equalization, pilot density, the waveform itself), not codeword-level time
+diversity. More diversity cannot rescue a per-frame link that is already below threshold on
+average. This is precisely the part that fixed, proven HF waveforms (e.g. FreeDV's DATAC
+modes, which Mercury reuses) are engineered around, and precisely coppa's bespoke-OFDM weak
+spot.
 
 ## Limitations
 
 - **Coverage.** AWGN and Watterson (Good/Moderate/Poor) channels are measured; there is no
   CFO, frequency-offset, or combined CFO+fading case yet.
-- **One codeword per fading block, no PHY interleaving/ARQ.** The fading results are
-  single-shot per frame (see the fairness caveat above); they are a lower bound on what a
-  full link layer could achieve.
+- **One codeword per fading block; cross-frame interleaving tested and counterproductive.**
+  The per-frame fading results are single-shot (see the fairness caveat above). Deep
+  cross-frame interleaving was implemented and measured at the transfer level (see "a
+  falsified diversity hypothesis" above) and made recovery *worse*, not better — so these
+  numbers are not improved by PHY interleaving. ARQ is a separate, untested lever.
 - **No CFO tolerance.** The receive path does not correct carrier-frequency offset, so these
   results assume ideal frequency/timing.
 - **50 trials per point**, so FER resolution is ~2%; the "FER=1%" column is really "the first
