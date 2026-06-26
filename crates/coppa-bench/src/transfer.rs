@@ -5,7 +5,7 @@
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 
-use crate::scenario::{mode_for_level, select_profile};
+use crate::scenario::{mode_for_level, select_profile, ChannelSpec, SAMPLE_RATE};
 
 /// A PHY's transfer strategy: encode a full-transfer payload into N frame-signals,
 /// decode N received frame-windows back to recovered bytes.
@@ -88,6 +88,37 @@ impl TransferPhy for V1Phy {
     }
 }
 
+/// Concatenate the per-frame signals, apply the channel ONCE (so fading is correlated
+/// across frames), then split back into per-frame windows of the original length.
+pub fn apply_transfer_channel(
+    frames: &[Vec<f32>],
+    channel: ChannelSpec,
+    snr_db: f32,
+    seed: u64,
+) -> Vec<Vec<f32>> {
+    let l = frames.first().map(|f| f.len()).unwrap_or(0);
+    let concat: Vec<f32> = frames.iter().flatten().copied().collect();
+
+    let faded = match channel {
+        ChannelSpec::Awgn => {
+            coppa_channel::awgn_seeded(&concat, snr_db, seed ^ 0x5555_5555_5555_5555)
+        }
+        ChannelSpec::Watterson(preset) => {
+            let f = coppa_channel::watterson::watterson(
+                &concat,
+                SAMPLE_RATE as f32,
+                &preset.config(),
+                seed ^ 0x3333_3333_3333_3333,
+            );
+            coppa_channel::awgn_seeded(&f, snr_db, seed ^ 0x5555_5555_5555_5555)
+        }
+    };
+
+    (0..frames.len())
+        .map(|k| faded[k * l..(k + 1) * l].to_vec())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +138,21 @@ mod tests {
         assert_eq!(
             recovered, payload,
             "clean loopback must recover the full transfer"
+        );
+    }
+
+    #[test]
+    fn v1_transfer_recovers_over_awgn_at_high_snr() {
+        let phy = V1Phy::new(2, 4);
+        let total = phy.payload_bytes();
+        let payload: Vec<u8> = (0..total).map(|i| (i * 13 + 5) as u8).collect();
+        let frames = phy.encode_transfer(&payload);
+        let windows_owned = apply_transfer_channel(&frames, ChannelSpec::Awgn, 30.0, 99);
+        let windows: Vec<&[f32]> = windows_owned.iter().map(|w| w.as_slice()).collect();
+        let recovered = phy.decode_transfer(&windows);
+        assert_eq!(
+            recovered, payload,
+            "AWGN at 30 dB should recover the full transfer"
         );
     }
 }
