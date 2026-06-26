@@ -25,8 +25,6 @@ use coppa_codec::ofdm::coppa_modem::CoppaModem;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_codec::ofdm::interleaver::BlockInterleaver;
 use coppa_codec::traits::FecCodec;
-use coppa_protocol::fec::ldpc::codes::LdpcCode;
-use coppa_protocol::fec::ldpc::decoder::LdpcDecoder;
 use coppa_protocol::fec::ldpc::LdpcCodec;
 use coppa_protocol::fec::scrambler::scramble;
 use coppa_protocol::modem::speed_levels::{speed_level_components, speed_level_entry};
@@ -214,104 +212,6 @@ fn measure(label: &str, cond: &Cond) -> Stats {
     s
 }
 
-/// Phase-3 hypothesis test: is the fixed 0.5 offset (not the channel) discarding frames?
-/// Decode the SAME faded LLRs three ways and count converged AND correct:
-///   * offset 0.5  — the current decoder (matches `receive()`).
-///   * offset 0.0  — pure min-sum, exactly scale-invariant (isolates the offset).
-///   * offset 0.5 on LLRs normalized to a sane scale — the candidate fix.
-fn confirm_scaling(label: &str, cond: &Cond) {
-    let level = 2u8;
-    let profile = select_profile(level);
-    let modem = CoppaModem::new(profile.clone(), 1);
-    let (mapper, code_rate) = speed_level_components(level).expect("components");
-    let papr = speed_level_entry(level).expect("entry").papr_target_db;
-    let info_bits = code_rate.info_bits();
-    let k = info_bits;
-    let data_carriers = profile.data_carriers;
-    let pfb = mode_for_level(level).expect("mode").payload_bytes();
-
-    let dec_off = LdpcDecoder::with_params(LdpcCode::new(code_rate), 0.5, 50);
-    let dec_ms = LdpcDecoder::with_params(LdpcCode::new(code_rate), 0.0, 50);
-
-    let (mut ok_off, mut ok_ms, mut ok_norm) = (0usize, 0usize, 0usize);
-
-    for t in 0..TRIALS {
-        let seed = 0x0D1A_6005_u64.wrapping_mul(t as u64 + 1);
-        let payload: Vec<u8> = (0..pfb)
-            .map(|i| (seed.wrapping_add(i as u64).wrapping_mul(2654435761) >> 24) as u8)
-            .collect();
-        let mut bits = Vec::with_capacity(info_bits);
-        for &byte in &payload {
-            for shift in (0..8).rev() {
-                bits.push((byte >> shift) & 1);
-            }
-        }
-        bits.resize(info_bits, 0u8);
-        scramble(&mut bits);
-        let info_scrambled = bits.clone(); // expected systematic info bits if decode is correct
-        let coded = LdpcCodec::new(code_rate).encode(&bits);
-        let interleaved = BlockInterleaver::new(CODED_BITS, data_carriers).interleave(&coded);
-        let symbols = mapper.map_bits(&interleaved);
-        let signal = modem.modulate_mapped(&make_header(level, pfb as u16), &symbols, papr);
-        let faded = match cond {
-            Cond::Awgn => coppa_channel::awgn_seeded(&signal, SNR_DB, seed ^ 0x5555),
-            Cond::Fading(cfg) => {
-                let f = watterson(&signal, 48_000.0, cfg, seed ^ 0x3333);
-                coppa_channel::awgn_seeded(&f, SNR_DB, seed ^ 0x5555)
-            }
-        };
-        let Some((_h, eq, nv)) = modem.demodulate_soft_coded(&faded) else {
-            continue;
-        };
-        // Build LLRs exactly as receive() does (BPSK: 2*re/nv), clip to ±20, deinterleave.
-        let mut llrs: Vec<f32> = (0..CODED_BITS)
-            .map(|i| {
-                if i < eq.len() && i < nv.len() {
-                    (2.0 * eq[i].re / nv[i].max(1e-10)).clamp(-20.0, 20.0)
-                } else {
-                    0.0
-                }
-            })
-            .collect();
-        let deint = BlockInterleaver::new(CODED_BITS, data_carriers).deinterleave(&llrs);
-
-        // Normalized variant: scale so the median |LLR| ~ 4 (≫ the 0.5 offset).
-        let mut mags: Vec<f32> = llrs.iter().map(|x| x.abs()).filter(|&m| m > 1e-9).collect();
-        let scale = if mags.is_empty() {
-            1.0
-        } else {
-            mags.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let median = mags[mags.len() / 2].max(1e-6);
-            4.0 / median
-        };
-        for v in &mut llrs {
-            *v = (*v * scale).clamp(-20.0, 20.0);
-        }
-        let deint_norm = BlockInterleaver::new(CODED_BITS, data_carriers).deinterleave(&llrs);
-
-        if true_correct(&dec_off, &deint, &info_scrambled, k) {
-            ok_off += 1;
-        }
-        if true_correct(&dec_ms, &deint, &info_scrambled, k) {
-            ok_ms += 1;
-        }
-        if true_correct(&dec_off, &deint_norm, &info_scrambled, k) {
-            ok_norm += 1;
-        }
-    }
-
-    println!(
-        "{:<12} correct/{TRIALS}:  offset0.5(current)={ok_off:>3}   offset0.0(min-sum)={ok_ms:>3}   normalized+0.5={ok_norm:>3}",
-        label
-    );
-}
-
-/// Decode and check the (scrambled-domain) systematic info bits against the expected vector.
-fn true_correct(dec: &LdpcDecoder, llr: &[f32], expected_scrambled: &[u8], k: usize) -> bool {
-    let (info, conv) = dec.decode_block_checked(llr);
-    conv && info.len() >= k && info[..k] == expected_scrambled[..k]
-}
-
 fn main() {
     println!("Per-frame link diagnosis — level 2 (BPSK 1/2), {SNR_DB} dB, {TRIALS} trials/cond");
     println!("(high SNR: failures are channel-induced, not noise-induced)\n");
@@ -325,14 +225,6 @@ fn main() {
     measure("Good-2tap", &Cond::Fading(WattersonPreset::Good.config()));
     measure("Moderate", &Cond::Fading(WattersonPreset::Moderate.config()));
     measure("Poor", &Cond::Fading(WattersonPreset::Poor.config()));
-
-    println!(
-        "\n--- Phase-3 test: is the fixed 0.5 min-sum offset discarding correctable frames? ---"
-    );
-    confirm_scaling("flat-1tap", &Cond::Fading(flat_config()));
-    confirm_scaling("Good-2tap", &Cond::Fading(WattersonPreset::Good.config()));
-    confirm_scaling("Moderate", &Cond::Fading(WattersonPreset::Moderate.config()));
-    confirm_scaling("Poor", &Cond::Fading(WattersonPreset::Poor.config()));
 
     println!(
         "\nReading: A-vs-B — if flat-1tap rawBER is low but 2-tap is high, the cause is\n\
