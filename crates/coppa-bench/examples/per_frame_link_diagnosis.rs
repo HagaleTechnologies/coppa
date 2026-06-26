@@ -78,8 +78,12 @@ struct Stats {
     flagged_frac: f64,
 }
 
-fn measure(label: &str, cond: &Cond, profile: &coppa_codec::ofdm::CoppaProfile) -> Stats {
-    let level = 2u8;
+fn measure(
+    label: &str,
+    cond: &Cond,
+    profile: &coppa_codec::ofdm::CoppaProfile,
+    level: u8,
+) -> Stats {
     let profile = profile.clone();
     let modem = CoppaModem::new(profile.clone(), 1);
     let (mapper, code_rate) = speed_level_components(level).expect("level 2 components");
@@ -227,6 +231,11 @@ fn main() {
         "Profile: {profile_name} ({} data / {} pilots)",
         profile.data_carriers, profile.pilot_carriers
     );
+    let level: u8 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    println!("Level: {level}");
     println!("Per-frame link diagnosis — level 2 (BPSK 1/2), {SNR_DB} dB, {TRIALS} trials/cond");
     println!("(high SNR: failures are channel-induced, not noise-induced)\n");
     println!(
@@ -234,22 +243,25 @@ fn main() {
         "condition", "raw pre-FEC", "post-FEC", "A2-probe", "A1-probe", "nulls"
     );
 
-    measure("AWGN", &Cond::Awgn, &profile);
-    measure("flat-1tap", &Cond::Fading(flat_config()), &profile);
+    measure("AWGN", &Cond::Awgn, &profile, level);
+    measure("flat-1tap", &Cond::Fading(flat_config()), &profile, level);
     measure(
         "Good-2tap",
         &Cond::Fading(WattersonPreset::Good.config()),
         &profile,
+        level,
     );
     measure(
         "Moderate",
         &Cond::Fading(WattersonPreset::Moderate.config()),
         &profile,
+        level,
     );
     measure(
         "Poor",
         &Cond::Fading(WattersonPreset::Poor.config()),
         &profile,
+        level,
     );
 
     println!(
