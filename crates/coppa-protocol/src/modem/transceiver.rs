@@ -167,6 +167,20 @@ mod tests {
     }
 
     #[test]
+    fn test_transceiver_cfo_correction() {
+        // An 8 Hz CFO collapses the link without correction; the RX must estimate + remove it.
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let payload = b"CFO correction works";
+        let header = make_header(2, payload.len() as u16);
+        let samples = tx.transmit(&header, payload);
+        let injected = coppa_codec::ofdm::sync::remove_cfo(&samples, -8.0, 48_000.0); // +8 Hz
+        let (_h, rx) = tx
+            .receive(&injected)
+            .expect("should recover after CFO correction");
+        assert_eq!(&rx[..payload.len()], payload.as_slice());
+    }
+
+    #[test]
     fn test_transceiver_bpsk_rate_half_loopback() {
         let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
         let payload = b"Hello Phase C!";
