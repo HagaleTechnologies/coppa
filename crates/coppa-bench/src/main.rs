@@ -37,6 +37,9 @@ struct Args {
     /// Channel: awgn | good | moderate | poor (Watterson presets).
     #[arg(long, default_value = "awgn")]
     channel: String,
+    /// OFDM profile: default (per-level) | standard | robust (dense pilots).
+    #[arg(long, default_value = "default")]
+    profile: String,
 }
 
 fn parse_channel(s: &str) -> ChannelSpec {
@@ -68,6 +71,7 @@ fn main() {
     let args = Args::parse();
     let snrs = snr_points(args.snr_min, args.snr_max, args.snr_step);
     let chan = parse_channel(&args.channel);
+    let profile_override = coppa_bench::scenario::profile_by_name(&args.profile);
 
     let title = match args.channel.as_str() {
         "awgn" => "AWGN".to_string(),
@@ -82,6 +86,7 @@ fn main() {
             snr_db_points: snrs.clone(),
             trials: args.trials,
             seed: args.seed,
+            profile_override: profile_override.clone(),
         };
         eprintln!("Measuring level {} ({})...", mode.level, mode.name);
         all_points.extend(run_scenario(&scenario));

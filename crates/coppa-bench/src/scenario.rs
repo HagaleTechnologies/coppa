@@ -85,6 +85,17 @@ pub fn select_profile(level: u8) -> CoppaProfile {
     }
 }
 
+/// Resolve a named override profile for benchmarking. `"default"` means "use the per-level
+/// `select_profile` rule"; `"standard"`/`"robust"` force that profile for every level.
+pub fn profile_by_name(name: &str) -> Option<CoppaProfile> {
+    match name {
+        "default" => None,
+        "standard" => Some(CoppaProfile::hf_standard()),
+        "robust" => Some(CoppaProfile::hf_robust()),
+        other => panic!("unknown profile '{other}' (expected: default|standard|robust)"),
+    }
+}
+
 /// Channel under test.
 #[derive(Debug, Clone, Copy)]
 pub enum ChannelSpec {
@@ -103,6 +114,8 @@ pub struct Scenario {
     pub trials: usize,
     /// Base RNG seed; per-trial seeds are derived from this.
     pub seed: u64,
+    /// Optional profile override; `None` uses `select_profile(level)`.
+    pub profile_override: Option<CoppaProfile>,
 }
 
 #[cfg(test)]
