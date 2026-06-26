@@ -2,8 +2,11 @@
 //! multi-frame channel, scored by payload-recovery fraction. Foundation for comparing
 //! the baseline (V1) PHY against the future interleaved (V2) PHY.
 
+use coppa_channel::watterson::WattersonPreset;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 use crate::scenario::{mode_for_level, select_profile, ChannelSpec, SAMPLE_RATE};
 
@@ -119,6 +122,94 @@ pub fn apply_transfer_channel(
         .collect()
 }
 
+/// Fraction of bytes in `recovered` that match `sent`.
+pub fn recovery_fraction(sent: &[u8], recovered: &[u8]) -> f64 {
+    if sent.is_empty() {
+        return 1.0;
+    }
+    let n = sent.len().min(recovered.len());
+    let correct = sent[..n]
+        .iter()
+        .zip(&recovered[..n])
+        .filter(|(a, b)| a == b)
+        .count();
+    correct as f64 / sent.len() as f64
+}
+
+fn channel_label(c: ChannelSpec) -> &'static str {
+    match c {
+        ChannelSpec::Awgn => "awgn",
+        ChannelSpec::Watterson(WattersonPreset::Good) => "watterson-good",
+        ChannelSpec::Watterson(WattersonPreset::Moderate) => "watterson-moderate",
+        ChannelSpec::Watterson(WattersonPreset::Poor) => "watterson-poor",
+    }
+}
+
+/// One transfer measurement point.
+#[derive(Debug, Clone)]
+pub struct TransferPoint {
+    pub phy_name: &'static str,
+    pub level: u8,
+    pub channel: &'static str,
+    pub snr_db: f32,
+    pub frames: usize,
+    pub trials: usize,
+    pub recovery_fraction: f64,
+    pub goodput_bps: f64,
+    pub latency_s: f64,
+}
+
+/// Sweep a transfer PHY over SNR on one channel.
+pub fn run_transfer_scenario(
+    phy: &dyn TransferPhy,
+    phy_name: &'static str,
+    level: u8,
+    channel: ChannelSpec,
+    snr_db_points: &[f32],
+    trials: usize,
+    base_seed: u64,
+) -> Vec<TransferPoint> {
+    let total_bytes = phy.payload_bytes();
+    let mut points = Vec::with_capacity(snr_db_points.len());
+
+    for (si, &snr_db) in snr_db_points.iter().enumerate() {
+        let mut recov_sum = 0.0f64;
+        let mut frame_samples_total = 0usize;
+        for t in 0..trials {
+            let seed = base_seed
+                .wrapping_add((si as u64) << 32)
+                .wrapping_add(t as u64);
+            let mut rng = StdRng::seed_from_u64(seed);
+            let payload: Vec<u8> = (0..total_bytes).map(|_| rng.random::<u8>()).collect();
+            let frames = phy.encode_transfer(&payload);
+            frame_samples_total = frames.iter().map(|f| f.len()).sum();
+            let windows_owned = apply_transfer_channel(&frames, channel, snr_db, seed);
+            let windows: Vec<&[f32]> = windows_owned.iter().map(|w| w.as_slice()).collect();
+            let recovered = phy.decode_transfer(&windows);
+            recov_sum += recovery_fraction(&payload, &recovered);
+        }
+        let recovery = recov_sum / trials as f64;
+        let airtime_s = frame_samples_total as f64 / SAMPLE_RATE as f64;
+        let goodput_bps = if airtime_s > 0.0 {
+            (total_bytes * 8) as f64 * recovery / airtime_s
+        } else {
+            0.0
+        };
+        points.push(TransferPoint {
+            phy_name,
+            level,
+            channel: channel_label(channel),
+            snr_db,
+            frames: phy.frames_per_transfer(),
+            trials,
+            recovery_fraction: recovery,
+            goodput_bps,
+            latency_s: airtime_s,
+        });
+    }
+    points
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +297,25 @@ mod tests {
             adj < dist,
             "adjacent gains should be closer than distant (adj={adj}, dist={dist})"
         );
+    }
+
+    #[test]
+    fn recovery_fraction_counts_matching_bytes() {
+        assert_eq!(recovery_fraction(&[1, 2, 3, 4], &[1, 2, 3, 4]), 1.0);
+        assert_eq!(recovery_fraction(&[1, 2, 3, 4], &[1, 9, 3, 9]), 0.5);
+    }
+
+    #[test]
+    fn transfer_scenario_recovers_over_awgn() {
+        let phy = V1Phy::new(2, 4);
+        let points = run_transfer_scenario(&phy, "v1", 2, ChannelSpec::Awgn, &[30.0], 3, 0xABCD);
+        assert_eq!(points.len(), 1);
+        assert!(
+            points[0].recovery_fraction > 0.99,
+            "AWGN should recover (got {})",
+            points[0].recovery_fraction
+        );
+        assert!(points[0].goodput_bps > 0.0);
+        assert!(points[0].latency_s > 0.0);
     }
 }
