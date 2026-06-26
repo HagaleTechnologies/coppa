@@ -563,9 +563,15 @@ impl CoppaModem {
             let mut estimator = LinearInterpolationEstimator::new(total_active);
             estimator.update(&combined);
             let equalized = mmse_equalize(carriers, &estimator, total_active);
-            let data = self.pilots.extract_data(&equalized, *global_sym);
+            let mut data = self.pilots.extract_data(&equalized, *global_sym);
             let data_indices = self.pilots.data_indices(*global_sym);
             let carrier_noise = estimator.per_carrier_noise(&data_indices);
+            // Un-bias the equalized data symbols by 1/g (zero-forcing Y/H) so amplitude-bearing
+            // QAM lands at constellation scale; consistent with the σ²/|H|² per-carrier noise above.
+            let gains = estimator.per_carrier_gain(&data_indices);
+            for (sym, &g) in data.iter_mut().zip(gains.iter()) {
+                *sym *= 1.0 / g;
+            }
             payload_symbols.extend_from_slice(&data);
             noise_variances.extend_from_slice(&carrier_noise);
         }
