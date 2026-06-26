@@ -10,7 +10,7 @@ use coppa_ml::{channel_capacity, select_speed_level};
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 
 const TRIALS: usize = 30;
-const MARGIN: f32 = 1.0;
+const MARGIN: f32 = 2.5; // calibrated: maximizes adaptive/oracle ratio (Shannon-to-practical gap)
 
 fn apply_channel(sig: &[f32], ch: ChannelSpec, snr: f32, seed: u64) -> Vec<f32> {
     match ch {

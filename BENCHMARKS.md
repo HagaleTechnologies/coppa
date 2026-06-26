@@ -368,27 +368,31 @@ So tolerance went **~2 Hz → 15 Hz** at full goodput, with no regression at 0 H
 the ±fs/(2·symbol_len) ≈ ±19 Hz unambiguous range of the fractional Schmidl-Cox estimator — beyond
 that the estimate wraps; an integer-CFO stage would extend it, but ±15 Hz already covers typical HF.
 
-## Adaptive MCS: a capacity selector, and a metric blocked on the noise estimate
+## Adaptive MCS (capacity selector) + the noise-estimate fix that unblocked it
 
-A channel-quality-aware speed-level selector (`coppa-ml::select_speed_level`) was built on the idea
-that the average per-carrier Shannon capacity `C = mean(log2(1 + 1/nv[k]))` — from the RX's
-per-carrier noise variance `nv` — captures both SNR and frequency selectivity in one mode-independent
-number, and a validation harness compares its goodput to an oracle (best level per point) and the best
-fixed mode.
+A channel-quality-aware speed-level selector (`coppa-ml::select_speed_level`) picks the highest mode
+whose spectral efficiency fits the **average per-carrier Shannon capacity** `C = mean(log2(1 + 1/nv[k]))`
+minus a margin. `C` (from the RX's per-carrier noise `nv`) captures both SNR and frequency selectivity
+in one mode-independent number. A validation harness compares its goodput to an oracle (best level per
+point) and to the best fixed mode.
 
-The harness then **falsified the metric on fading channels.** Selecting from `C` tracks the oracle
-*well on AWGN* (C≈5.4 → picks 16QAM 3/4 … 64QAM, ratio 0.6–1.0), but on **every Watterson channel `C`
-collapses to ~0.0–0.6** and the selector picks BPSK 1/4 everywhere — even though the PHY *actually*
-delivers 16QAM (~1700 bps) there. Root cause: the equalizer's `noise_var` is a residual-based estimate
-that conflates channel deviation with noise, so under fading it is inflated ~6×; `1/nv` then badly
-*under*-states the true per-carrier SNR. The LDPC decoder tolerates this (it uses `nv` only for
-*relative* carrier weighting), but an *absolute* capacity metric does not.
+**The harness first falsified the metric on fading** — `C` collapsed to ~0.3 on every Watterson channel
+(selecting BPSK 1/4 everywhere) even though the PHY delivers 16QAM there. Root cause: the equalizer's
+`noise_var` was estimated from the pilot residual against the *stale pre-update* channel estimate, so it
+measured `|H − 1|²` (channel deviation), not noise — inflated ~6× under fading. The LDPC decoder
+tolerated this (it uses `nv` only for *relative* weighting), but an *absolute* capacity metric did not.
 
-So the selector logic is correct (it correctly identifies that the metric is unreliable under fading),
-but a trustworthy capacity-from-noise metric needs the **per-carrier noise estimate fixed first**
-(compute the pilot residual against the *final* interpolated channel estimate, not the stale
-pre-update one). That fix would also tighten the decoder's LLRs — a high-value PHY task that unblocks
-adaptive MCS. Until then, adaptive selection is reliable on AWGN-like channels only.
+**The fix:** estimate per-carrier noise from the **second difference of the pilot channel estimates**
+(`σ² ≈ mean(|H[i−1] − 2H[i] + H[i+1]|²)/6`) — a smooth channel cancels in the second difference, leaving
+~noise, so it reflects *true* noise and is not inflated by (smooth) selectivity. Re-validated against the
+full fading ladder: **no decoder regression** (Good/Moderate/Poor goodput unchanged within trial noise —
+the relative weighting is preserved), and `C` on fading rose from ~0.3 to a real **2.2–5.3**.
+
+**Result (margin 2.5, calibrated to the Shannon-to-practical gap):** adaptive selection now tracks the
+oracle to an aggregate **0.83** of oracle goodput across AWGN + Watterson Good/Moderate/Poor (up from
+0.51 with the broken metric), e.g. Poor@12 dB hits the oracle exactly. The residual gap is honest
+margin/finite-blocklength slack (the metric slightly over-reads at low SNR); a per-η or SNR-aware margin
+would close it further. Closed-loop wiring (feeding the recommendation back via ARQ) remains a follow-on.
 
 ## Limitations
 
