@@ -227,6 +227,38 @@ mod tests {
     }
 
     #[test]
+    fn viterbi_decode_is_scale_invariant() {
+        // Audit guard: unlike the LDPC offset-min-sum decoder (whose fixed additive offset broke
+        // scale-invariance and discarded faded frames), the Viterbi Euclidean branch metric
+        // (s - ±1)^2 is scale-invariant — scaling all soft inputs by c>0 scales every competing
+        // path-metric difference by c, preserving the argmin. Decoding the SAME soft symbols at
+        // unit, tiny, and large scale must give the identical bits.
+        let mut enc = ConvEncoder::new();
+        let dec = ViterbiDecoder::new();
+        let input: Vec<u8> = vec![1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0];
+        let encoded = enc.encode(&input);
+        let soft: Vec<f32> = encoded
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| {
+                let base = if b == 0 { 1.0 } else { -1.0 };
+                base + 0.3 * ((i as f32 * 1.7).sin())
+            })
+            .collect();
+
+        let unit = dec.decode(&soft);
+        assert_eq!(unit, input, "baseline soft decode must be correct");
+        for scale in [0.01f32, 0.1, 10.0, 100.0] {
+            let scaled: Vec<f32> = soft.iter().map(|s| s * scale).collect();
+            assert_eq!(
+                dec.decode(&scaled),
+                unit,
+                "Viterbi must be scale-invariant (scale={scale})"
+            );
+        }
+    }
+
+    #[test]
     fn test_viterbi_soft_decision() {
         let mut enc = ConvEncoder::new();
         let dec = ViterbiDecoder::new();
