@@ -368,6 +368,12 @@ So tolerance went **~2 Hz → 15 Hz** at full goodput, with no regression at 0 H
 the ±fs/(2·symbol_len) ≈ ±19 Hz unambiguous range of the fractional Schmidl-Cox estimator — beyond
 that the estimate wraps; an integer-CFO stage would extend it, but ±15 Hz already covers typical HF.
 
+**CFO + fading together (the realistic case).** Real HF has *both* offset and multipath. Re-running the
+robust-profile ladder with a 5–10 Hz CFO *on top of* Watterson Good/Poor shows peak goodput essentially
+unchanged vs CFO=0 — Good 16QAM 1/2 ≈ 1747 → 1617 bps, Poor ≈ 1100 → 1035 bps, QPSK/BPSK flat (all within
+trial noise). The correction survives fading because the preamble's two identical halves fade together, so
+their phase difference (the offset estimate) is preserved. So CFO tolerance is not an AWGN-only artifact.
+
 ## Adaptive MCS (capacity selector) + the noise-estimate fix that unblocked it
 
 A channel-quality-aware speed-level selector (`coppa-ml::select_speed_level`) picks the highest mode
@@ -415,7 +421,7 @@ gap would need a second selectivity feature; closed-loop ARQ feedback remains th
 ## Limitations
 
 - **Coverage.** AWGN and Watterson (Good/Moderate/Poor) channels are measured, plus a CFO sweep
-  (see "Carrier frequency offset tolerance"); a *combined* CFO+fading sweep is not yet characterized.
+  (see "Carrier frequency offset tolerance"), including a combined CFO+fading sweep (CFO correction holds under fading).
 - **One codeword per fading block; cross-frame interleaving tested and counterproductive.**
   The per-frame fading results are single-shot (see the fairness caveat above). Deep
   cross-frame interleaving was implemented and measured at the transfer level (see "a
