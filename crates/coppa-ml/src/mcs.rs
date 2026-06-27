@@ -233,6 +233,24 @@ pub const SPEED_LEVEL_MIN_CAPACITY: [(u8, f32); 9] = [
     (10, 8.0),
 ];
 
+/// Selectivity reference (≈ the selectivity the per-level thresholds were calibrated at, i.e. the
+/// fading channels) and the per-unit-selectivity capacity correction. Derived from the calibration
+/// grid: at C≈6, a flat channel (selectivity ≈0.6) is goodput-optimal at 16QAM 3/4 (L7) while a
+/// selective one (≈2.0) is at 16QAM 1/2 (L6); the correction shifts effective capacity to separate
+/// them.
+const SELECTIVITY_REF: f32 = 1.5;
+const SELECTIVITY_GAIN: f32 = 0.7;
+
+/// Channel-adaptive speed-level selection using BOTH average capacity and frequency selectivity.
+/// A flatter channel (low selectivity) supports a higher modulation order at the same average
+/// capacity than a selective one, which the calibrated capacity table alone cannot express. This
+/// applies a selectivity correction to the capacity (flat → boost, selective → penalty) and looks
+/// the result up in the per-level threshold table, resolving the channel-dependent overlap.
+pub fn select_speed_level_2d(capacity: f32, selectivity: f32) -> u8 {
+    let effective = capacity + SELECTIVITY_GAIN * (SELECTIVITY_REF - selectivity);
+    select_speed_level_calibrated(effective)
+}
+
 /// Select the highest speed level whose calibrated minimum capacity `C_min(L)` is at most the
 /// measured channel capacity. Returns level 1 if none qualify. Unlike the flat-margin rule, the
 /// per-level thresholds absorb the channel-dependent, nonlinear Shannon-to-practical gap.
@@ -351,6 +369,25 @@ mod tests {
         assert_eq!(select_speed_level_calibrated(6.0), 6); // conservative overlap region
         assert_eq!(select_speed_level_calibrated(7.25), 9); // >=7.2 (L9), <8.0 (L10)
         assert_eq!(select_speed_level_calibrated(8.5), 10);
+    }
+
+    #[test]
+    fn select_speed_level_2d_separates_overlap() {
+        // Same average capacity (~6), different selectivity: a flat channel (AWGN-like) should
+        // reach a higher order than a selective one (fading), resolving the C-alone ambiguity.
+        let flat = select_speed_level_2d(6.0, 0.6);
+        let selective = select_speed_level_2d(6.0, 2.1);
+        assert!(
+            flat > selective,
+            "flat {flat} should exceed selective {selective} at equal C"
+        );
+        assert_eq!(flat, 7); // 16QAM 3/4
+        assert_eq!(selective, 6); // 16QAM 1/2
+                                  // At the calibration reference selectivity it matches the 1D table.
+        assert_eq!(
+            select_speed_level_2d(5.0, super::SELECTIVITY_REF),
+            select_speed_level_calibrated(5.0)
+        );
     }
 
     #[test]

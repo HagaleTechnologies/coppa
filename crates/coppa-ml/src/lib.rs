@@ -19,7 +19,7 @@ pub mod spectrum_sensor;
 
 pub use channel_predictor::EwmaPredictor;
 pub use mcs::{
-    channel_capacity, channel_selectivity, select_mcs, select_speed_level,
+    channel_capacity, channel_selectivity, select_mcs, select_speed_level, select_speed_level_2d,
     select_speed_level_calibrated, McsEntry, MCS_TABLE, SPEED_LEVEL_EFFICIENCY,
     SPEED_LEVEL_MIN_CAPACITY,
 };
