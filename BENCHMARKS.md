@@ -430,6 +430,36 @@ this reaches **0.97 of oracle** (vs 0.91 for capacity alone), fixing both ambigu
 over-selection at the L6 threshold), not the channel-dependent ambiguity. Closed-loop ARQ feedback remains
 the further follow-on.
 
+## The frame header is the dominant fading failure — and it's unprotected
+
+The 48-bit frame header is hard-decision BPSK with **no FEC and no integrity check** (`from_bits`
+only rejects an invalid 4-bit `frame_type`). The payload, by contrast, is LDPC-coded. That asymmetry
+turns out to dominate the fading failure rate. `header_diagnostic` (robust profile, 100 trials/cell)
+classifies every dropped frame: a loss is **header-caused** if the header is unparseable or a
+*decode-relevant* field is wrong (only `speed_level` and `payload_len` actually steer `receive()`;
+the other fields are parsed but ignored), otherwise it is **payload-caused**.
+
+| mode | AWGN | fading: failures that are header-caused |
+|------|------|-----------------------------------------|
+| BPSK 1/2 (L2)  | 0 failures | **100%** (224/224 — payload never fails) |
+| QPSK 1/2 (L3)  | 0 failures | **100%** (278/278 — payload never fails) |
+| 16QAM 1/2 (L6) | 0 failures | **79%** (442/558; the other 21% is genuine 16QAM-on-Poor) |
+| **all three, all fading cells** | — | **89%** (944/1060) |
+
+The header floor is steep and **does not improve with SNR**: on Watterson Good at 30 dB, BPSK 1/2
+still drops 17/100 frames — *all* header-caused, with a payload that would have decoded every time.
+Moderate/Poor at 30 dB sit at ~7–12% for the robust modes, again entirely header. On AWGN the header
+never fails, so this is purely a fading effect (the hard-decision header has no diversity or coding to
+ride out a fade that the LDPC payload survives).
+
+**Implication:** for the robust modes, coppa's *entire* residual fading FER is a header artifact, not
+a PHY/FEC limit — the "does not survive realistic HF fading" framing is wrong for BPSK/QPSK 1/2, whose
+payloads decode through Good/Moderate/Poor. A soft and/or lightly-coded header (e.g. repetition or a
+short block code over the 48 bits, plus a CRC so corrupt headers are *detected* rather than silently
+mis-parametrizing the payload) would recover ~12–24% of frames on fading channels. This is a
+wire-format change, so it is scoped but not yet built. Reproduce with
+`cargo run --release -p coppa-bench --example header_diagnostic`.
+
 ## Limitations
 
 - **Coverage.** AWGN and Watterson (Good/Moderate/Poor) channels are measured, plus a CFO sweep
