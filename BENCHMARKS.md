@@ -404,13 +404,25 @@ from calibration) by `mcs_compare`:
 | selector | aggregate goodput / oracle (held-out seed) |
 |----------|--------------------------------------------|
 | flat margin 2.5 | 0.77 |
-| **calibrated thresholds** | **0.91** |
+| **calibrated thresholds (C)** | **0.91** |
+| **2D selector (C, selectivity)** | **0.97** |
 
 The calibrated table fixes the flat margin's worst losses (Poor: BPSK 1/4 → QPSK, 0.28 → 1.00; Good:
-0.5 → 1.00 at most SNRs). The remaining ~9% is an **honest limit of `C` as a single feature**: at
+0.5 → 1.00 at most SNRs). Its remaining ~9% was an **honest limit of `C` as a single feature**: at
 `C ≈ 5.9–6.4` the goodput-optimal level is channel-dependent (AWGN wants 16QAM 3/4, Good wants 16QAM 1/2
-because of residual selectivity), so one `C → level` table must be conservative there. Closing that last
-gap would need a second selectivity feature; closed-loop ARQ feedback remains the further follow-on.
+because of residual selectivity).
+
+### Adding a selectivity feature (2D selector)
+
+That last gap was closed with a second, mode-independent feature: **`channel_selectivity`** = the std of
+per-carrier capacity (≈0 for flat AWGN, ~2 for fading). The calibration data shows it separates the
+overlap cleanly — at `C≈6`, AWGN reads selectivity ≈0.6 (→ 16QAM 3/4) while Good reads ≈2.1 (→ 16QAM 1/2).
+`select_speed_level_2d` applies a selectivity correction to the capacity (`C_eff = C + 0.7·(1.5 − sel)`:
+flat → boost, selective → penalty) and looks it up in the same per-level table. On the **held-out seed**
+this reaches **0.97 of oracle** (vs 0.91 for capacity alone), fixing both ambiguous cases — AWGN@6 dB
+(0.66→1.00) and Good@24–30 dB (0.55→1.00). The residual ~3% is a Moderate-channel boundary effect (slight
+over-selection at the L6 threshold), not the channel-dependent ambiguity. Closed-loop ARQ feedback remains
+the further follow-on.
 
 ## Limitations
 

@@ -7,7 +7,7 @@ use coppa_bench::scenario::{mode_for_level, profile_by_name, ChannelSpec, MODES,
 use coppa_channel::watterson::WattersonPreset;
 use coppa_codec::ofdm::coppa_modem::CoppaModem;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
-use coppa_ml::channel_capacity;
+use coppa_ml::{channel_capacity, channel_selectivity};
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 
 const TRIALS: usize = 40;
@@ -68,19 +68,18 @@ fn fer(
 
 /// Sounded capacity, AVERAGED over several frames — a single sounding frame is too noisy on deep
 /// fading (one frame can land in a deep fade), so average to get a stable channel-quality estimate.
-fn sound_capacity(
+fn sound(
     profile: &coppa_codec::ofdm::CoppaProfile,
     ch: ChannelSpec,
     snr: f32,
     seed: u64,
-) -> f32 {
+) -> (f32, f32) {
     let tx = CoppaTransceiver::new(profile.clone(), 1);
     let modem = CoppaModem::new(profile.clone(), 1);
     let pfb = mode_for_level(2).unwrap().payload_bytes();
     let payload = vec![0x5Au8; pfb];
     let sig = tx.transmit(&make_header(2, pfb as u16), &payload);
-    let mut acc = 0.0f32;
-    let mut n = 0usize;
+    let (mut accc, mut accs, mut n) = (0.0f32, 0.0f32, 0usize);
     for s in 0..8u64 {
         let faded = apply_channel(
             &sig,
@@ -89,14 +88,15 @@ fn sound_capacity(
             seed.wrapping_add(s.wrapping_mul(0x9E37_79B9)),
         );
         if let Some((_h, _eq, nv)) = modem.demodulate_soft_coded(&faded) {
-            acc += channel_capacity(&nv);
+            accc += channel_capacity(&nv);
+            accs += channel_selectivity(&nv);
             n += 1;
         }
     }
     if n > 0 {
-        acc / n as f32
+        (accc / n as f32, accs / n as f32)
     } else {
-        0.0
+        (0.0, 0.0)
     }
 }
 
@@ -123,10 +123,10 @@ fn main() {
     eprintln!("calibration seed=0x{seed:X}");
     for (ch, cname) in channels {
         for &snr in &snrs {
-            let c = sound_capacity(&profile, ch, snr, seed);
+            let (c, sel) = sound(&profile, ch, snr, seed);
             for m in MODES {
                 let f = fer(&profile, m.level, ch, snr, seed);
-                println!("DATA {cname} {snr:.0} {c:.2} {} {f:.3}", m.level);
+                println!("DATA {cname} {snr:.0} {c:.2} {sel:.2} {} {f:.3}", m.level);
             }
         }
     }
