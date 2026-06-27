@@ -165,6 +165,24 @@ pub fn channel_capacity(noise_vars: &[f32]) -> f32 {
     sum / noise_vars.len() as f32
 }
 
+/// Channel frequency-selectivity metric: the standard deviation of per-carrier capacity
+/// `log2(1 + 1/nv[k])` across carriers. ~0 for a flat (AWGN) channel; larger when carrier SNRs
+/// spread out (frequency-selective fading). Two channels can share the same average capacity `C`
+/// but differ in selectivity — and higher-order modes are more sensitive to the spread — so this is
+/// the second feature that resolves the channel-dependent ambiguity `C` alone leaves.
+pub fn channel_selectivity(noise_vars: &[f32]) -> f32 {
+    if noise_vars.is_empty() {
+        return 0.0;
+    }
+    let caps: Vec<f32> = noise_vars
+        .iter()
+        .map(|&nv| (1.0 + 1.0 / nv.max(1e-9)).log2())
+        .collect();
+    let mean = caps.iter().sum::<f32>() / caps.len() as f32;
+    let var = caps.iter().map(|c| (c - mean).powi(2)).sum::<f32>() / caps.len() as f32;
+    var.sqrt()
+}
+
 /// (speed level, spectral efficiency η = bits_per_symbol × code_rate) for the real 9 levels,
 /// ascending by η, lower modulation order listed first at an η tie (more fading-robust).
 pub const SPEED_LEVEL_EFFICIENCY: [(u8, f32); 9] = [
@@ -309,6 +327,20 @@ mod tests {
         assert_eq!(select_speed_level(2.5, 1.0), 4);
         assert_eq!(select_speed_level(2.0, 0.0), 5); // eta=2.0 tie -> lower-order 8PSK (level 5)
         assert_eq!(select_speed_level(0.1, 1.0), 1);
+    }
+
+    #[test]
+    fn selectivity_zero_for_flat_high_for_spread() {
+        // Flat channel: all carriers equal nv => zero selectivity.
+        assert!(channel_selectivity(&[0.01f32; 48]) < 1e-4);
+        // Spread: half strong, half weak => non-trivial selectivity.
+        let mut spread = vec![0.001f32; 24];
+        spread.extend(vec![10.0f32; 24]);
+        assert!(
+            channel_selectivity(&spread) > 1.0,
+            "selective channel should read high"
+        );
+        assert_eq!(channel_selectivity(&[]), 0.0);
     }
 
     #[test]
