@@ -6,7 +6,9 @@ use coppa_bench::scenario::{mode_for_level, profile_by_name, ChannelSpec, MODES,
 use coppa_channel::watterson::WattersonPreset;
 use coppa_codec::ofdm::coppa_modem::CoppaModem;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
-use coppa_ml::{channel_capacity, select_speed_level, select_speed_level_calibrated};
+use coppa_ml::{
+    channel_capacity, select_speed_level, select_speed_level_2d, select_speed_level_calibrated,
+};
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 
 const TRIALS: usize = 40;
@@ -76,13 +78,13 @@ fn sound_capacity(
     ch: ChannelSpec,
     snr: f32,
     seed: u64,
-) -> f32 {
+) -> (f32, f32) {
     let tx = CoppaTransceiver::new(profile.clone(), 1);
     let modem = CoppaModem::new(profile.clone(), 1);
     let pfb = mode_for_level(2).unwrap().payload_bytes();
     let payload = vec![0x5Au8; pfb];
     let sig = tx.transmit(&make_header(2, pfb as u16), &payload);
-    let (mut acc, mut n) = (0.0f32, 0usize);
+    let (mut accc, mut accs, mut n) = (0.0f32, 0.0f32, 0usize);
     for s in 0..8u64 {
         let faded = apply_channel(
             &sig,
@@ -91,14 +93,15 @@ fn sound_capacity(
             seed.wrapping_add(s.wrapping_mul(0x9E37_79B9)),
         );
         if let Some((_h, _eq, nv)) = modem.demodulate_soft_coded(&faded) {
-            acc += channel_capacity(&nv);
+            accc += channel_capacity(&nv);
+            accs += coppa_ml::channel_selectivity(&nv);
             n += 1;
         }
     }
     if n > 0 {
-        acc / n as f32
+        (accc / n as f32, accs / n as f32)
     } else {
-        0.0
+        (0.0, 0.0)
     }
 }
 
@@ -125,40 +128,36 @@ fn main() {
     let levels: Vec<u8> = MODES.iter().map(|m| m.level).collect();
 
     println!("HELD-OUT seed=0x{seed:X}  (calibration used 0xCA11B)");
-    println!("channel   snr   C     cal  marg  | calGP  margGP  oracle | calR margR");
-    let (mut tc, mut tm, mut to) = (0f64, 0f64, 0f64);
+    println!("channel   snr   C   sel  marg cal  2d  | margGP calGP  2dGP oracle | mR  cR  2dR");
+    let (mut tm, mut tc, mut t2, mut to) = (0f64, 0f64, 0f64, 0f64);
     for (ch, cname) in channels {
         for &snr in &snrs {
-            let c = sound_capacity(&profile, ch, snr, seed);
-            let lc = select_speed_level_calibrated(c);
+            let (c, sel) = sound_capacity(&profile, ch, snr, seed);
             let lm = select_speed_level(c, MARGIN);
-            let gc = goodput(&profile, lc, ch, snr, seed ^ 0xBEEF);
+            let lc = select_speed_level_calibrated(c);
+            let l2 = select_speed_level_2d(c, sel);
             let gm = goodput(&profile, lm, ch, snr, seed ^ 0xBEEF);
+            let gc = goodput(&profile, lc, ch, snr, seed ^ 0xBEEF);
+            let g2 = goodput(&profile, l2, ch, snr, seed ^ 0xBEEF);
             let og = levels
                 .iter()
                 .map(|&l| goodput(&profile, l, ch, snr, seed ^ 0xBEEF))
                 .fold(0f64, f64::max);
-            tc += gc;
             tm += gm;
+            tc += gc;
+            t2 += g2;
             to += og;
+            let r = |g: f64| if og > 0.0 { g / og } else { 1.0 };
             println!(
-                "{:<8} {:>4.0}  {:>4.1}  L{:<3} L{:<3} | {:>5.0}  {:>5.0}  {:>5.0} | {:.2} {:.2}",
-                cname,
-                snr,
-                c,
-                lc,
-                lm,
-                gc,
-                gm,
-                og,
-                if og > 0.0 { gc / og } else { 1.0 },
-                if og > 0.0 { gm / og } else { 1.0 }
+                "{:<8} {:>4.0} {:>4.1} {:>4.2} L{:<3} L{:<3} L{:<3}| {:>5.0} {:>5.0} {:>5.0} {:>5.0} | {:.2} {:.2} {:.2}",
+                cname, snr, c, sel, lm, lc, l2, gm, gc, g2, og, r(gm), r(gc), r(g2)
             );
         }
     }
     println!(
-        "\nAGGREGATE: calibrated/oracle = {:.3}   margin2.5/oracle = {:.3}",
+        "\nAGGREGATE / oracle:  margin2.5 = {:.3}   calibrated(C) = {:.3}   2d(C,sel) = {:.3}",
+        tm / to.max(1.0),
         tc / to.max(1.0),
-        tm / to.max(1.0)
+        t2 / to.max(1.0)
     );
 }
