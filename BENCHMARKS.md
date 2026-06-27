@@ -388,11 +388,29 @@ tolerated this (it uses `nv` only for *relative* weighting), but an *absolute* c
 full fading ladder: **no decoder regression** (Good/Moderate/Poor goodput unchanged within trial noise —
 the relative weighting is preserved), and `C` on fading rose from ~0.3 to a real **2.2–5.3**.
 
-**Result (margin 2.5, calibrated to the Shannon-to-practical gap):** adaptive selection now tracks the
-oracle to an aggregate **0.83** of oracle goodput across AWGN + Watterson Good/Moderate/Poor (up from
-0.51 with the broken metric), e.g. Poor@12 dB hits the oracle exactly. The residual gap is honest
-margin/finite-blocklength slack (the metric slightly over-reads at low SNR); a per-η or SNR-aware margin
-would close it further. Closed-loop wiring (feeding the recommendation back via ARQ) remains a follow-on.
+**Result (flat margin 2.5):** adaptive selection tracks the oracle to an aggregate **0.83** of oracle
+goodput across AWGN + Watterson Good/Moderate/Poor (up from 0.51 with the broken metric). The residual
+gap is the flat margin over-reading at low SNR (over-selecting a level that fails).
+
+### Calibrated per-level thresholds (closing the gap, validated held-out)
+
+The flat margin can't model that the Shannon-to-practical gap is **nonlinear and channel-dependent**
+(larger at low SNR / higher order). So `select_speed_level_calibrated` replaces it with a per-level
+**minimum-capacity table** `C_min(L)`, derived from a measured grid sweep (`mcs_calibration`, robust
+profile) by the level that is *goodput-optimal* at each `C` — using **8-frame averaged sounding**, since
+a single sounding frame's `C` is too noisy on deep fading. Validated on a **held-out RNG seed** (distinct
+from calibration) by `mcs_compare`:
+
+| selector | aggregate goodput / oracle (held-out seed) |
+|----------|--------------------------------------------|
+| flat margin 2.5 | 0.77 |
+| **calibrated thresholds** | **0.91** |
+
+The calibrated table fixes the flat margin's worst losses (Poor: BPSK 1/4 → QPSK, 0.28 → 1.00; Good:
+0.5 → 1.00 at most SNRs). The remaining ~9% is an **honest limit of `C` as a single feature**: at
+`C ≈ 5.9–6.4` the goodput-optimal level is channel-dependent (AWGN wants 16QAM 3/4, Good wants 16QAM 1/2
+because of residual selectivity), so one `C → level` table must be conservative there. Closing that last
+gap would need a second selectivity feature; closed-loop ARQ feedback remains the further follow-on.
 
 ## Limitations
 

@@ -181,6 +181,9 @@ pub const SPEED_LEVEL_EFFICIENCY: [(u8, f32); 9] = [
 
 /// Highest speed level whose spectral efficiency fits `capacity - margin` (Shannon-to-practical
 /// coding gap). At an η tie the first-listed (lower-order) level wins. Returns level 1 if none fit.
+///
+/// This flat-margin rule reaches ~0.83 of oracle; for the calibrated table that closes more of the
+/// gap (and handles the channel-dependent gap nonlinearity), prefer `select_speed_level_calibrated`.
 pub fn select_speed_level(capacity: f32, margin: f32) -> u8 {
     let budget = capacity - margin;
     let mut best_level = SPEED_LEVEL_EFFICIENCY[0].0;
@@ -189,6 +192,37 @@ pub fn select_speed_level(capacity: f32, margin: f32) -> u8 {
         if eta <= budget && eta > best_eta {
             best_level = level;
             best_eta = eta;
+        }
+    }
+    best_level
+}
+
+/// (speed level, minimum average per-carrier capacity C at which the level is goodput-optimal),
+/// ascending. Calibrated from a measured grid sweep (`mcs_calibration` example, robust profile,
+/// seed 0xCA11B, 8-frame averaged sounding): thresholds are anchored by the clean regions —
+/// Good/Moderate→16QAM 1/2 (L6) at C≈4–6.4, AWGN→16QAM 3/4 (L7) @5.9 / 64QAM 2/3 (L9) @7.25 /
+/// 64QAM 7/8 (L10) @8.1 — and made conservative in the C≈5.9–6.4 overlap where the goodput-optimal
+/// level is channel-dependent (AWGN wants L7, Good wants L6), so the safe L6 is chosen there.
+pub const SPEED_LEVEL_MIN_CAPACITY: [(u8, f32); 9] = [
+    (1, 0.0),
+    (2, 1.5),
+    (3, 2.2),
+    (4, 2.6),
+    (5, 3.0),
+    (6, 4.0),
+    (7, 6.5),
+    (9, 7.2),
+    (10, 8.0),
+];
+
+/// Select the highest speed level whose calibrated minimum capacity `C_min(L)` is at most the
+/// measured channel capacity. Returns level 1 if none qualify. Unlike the flat-margin rule, the
+/// per-level thresholds absorb the channel-dependent, nonlinear Shannon-to-practical gap.
+pub fn select_speed_level_calibrated(capacity: f32) -> u8 {
+    let mut best_level = SPEED_LEVEL_MIN_CAPACITY[0].0;
+    for &(level, c_min) in &SPEED_LEVEL_MIN_CAPACITY {
+        if capacity >= c_min {
+            best_level = level;
         }
     }
     best_level
@@ -275,5 +309,37 @@ mod tests {
         assert_eq!(select_speed_level(2.5, 1.0), 4);
         assert_eq!(select_speed_level(2.0, 0.0), 5); // eta=2.0 tie -> lower-order 8PSK (level 5)
         assert_eq!(select_speed_level(0.1, 1.0), 1);
+    }
+
+    #[test]
+    fn select_speed_level_calibrated_uses_thresholds() {
+        assert_eq!(select_speed_level_calibrated(0.0), 1); // below all but L1's 0.0
+        assert_eq!(select_speed_level_calibrated(2.4), 3); // >=2.2 (L3), <2.6 (L4)
+        assert_eq!(select_speed_level_calibrated(5.0), 6); // >=4.0 (L6), <6.5 (L7)
+        assert_eq!(select_speed_level_calibrated(6.0), 6); // conservative overlap region
+        assert_eq!(select_speed_level_calibrated(7.25), 9); // >=7.2 (L9), <8.0 (L10)
+        assert_eq!(select_speed_level_calibrated(8.5), 10);
+    }
+
+    #[test]
+    fn select_speed_level_calibrated_is_monotonic() {
+        let mut prev = 0u8;
+        let mut c = 0.0f32;
+        while c < 10.0 {
+            let lvl = select_speed_level_calibrated(c);
+            // level index in the ordered table must not decrease as C grows
+            let idx = |l: u8| {
+                SPEED_LEVEL_MIN_CAPACITY
+                    .iter()
+                    .position(|&(x, _)| x == l)
+                    .unwrap()
+            };
+            assert!(
+                prev == 0 || idx(lvl) >= idx(prev),
+                "non-monotonic at C={c}: {prev}->{lvl}"
+            );
+            prev = lvl;
+            c += 0.25;
+        }
     }
 }
