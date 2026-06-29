@@ -13,4 +13,4 @@ crate-type = ["cdylib", "staticlib"]
 coppa-engine = { path = "../coppa-engine" }
 
 [build-dependencies]
-cbindgen = "0.27"
+cbindgen = "0.29"
