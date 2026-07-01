@@ -430,11 +430,13 @@ this reaches **0.97 of oracle** (vs 0.91 for capacity alone), fixing both ambigu
 over-selection at the L6 threshold), not the channel-dependent ambiguity. Closed-loop ARQ feedback remains
 the further follow-on.
 
-## The frame header is the dominant fading failure — and it's unprotected
+## The frame header was the dominant fading failure — now protected (Golay + CRC + 2D)
 
-The 48-bit frame header is hard-decision BPSK with **no FEC and no integrity check** (`from_bits`
-only rejects an invalid 4-bit `frame_type`). The payload, by contrast, is LDPC-coded. That asymmetry
-turns out to dominate the fading failure rate. `header_diagnostic` (robust profile, 100 trials/cell)
+### Before: an unprotected header dominated fading loss
+
+The 48-bit frame header used to be hard-decision BPSK with **no FEC and no integrity check**
+(`from_bits` only rejected an invalid 4-bit `frame_type`). The payload, by contrast, is LDPC-coded.
+That asymmetry dominated the fading failure rate. `header_diagnostic` (robust profile, 100 trials/cell)
 classifies every dropped frame: a loss is **header-caused** if the header is unparseable or a
 *decode-relevant* field is wrong (only `speed_level` and `payload_len` actually steer `receive()`;
 the other fields are parsed but ignored), otherwise it is **payload-caused**.
@@ -446,18 +448,36 @@ the other fields are parsed but ignored), otherwise it is **payload-caused**.
 | 16QAM 1/2 (L6) | 0 failures | **79%** (442/558; the other 21% is genuine 16QAM-on-Poor) |
 | **all three, all fading cells** | — | **89%** (944/1060) |
 
-The header floor is steep and **does not improve with SNR**: on Watterson Good at 30 dB, BPSK 1/2
-still drops 17/100 frames — *all* header-caused, with a payload that would have decoded every time.
-Moderate/Poor at 30 dB sit at ~7–12% for the robust modes, again entirely header. On AWGN the header
-never fails, so this is purely a fading effect (the hard-decision header has no diversity or coding to
-ride out a fade that the LDPC payload survives).
+The floor did **not** improve with SNR: on Watterson Good at 30 dB, BPSK 1/2 still dropped 17/100
+frames — *all* header-caused, with a payload that would have decoded every time. On AWGN the header
+never failed, so this was purely a fading effect (a hard-decision header has no diversity or coding to
+ride out a fade the LDPC payload survives). For the robust modes, coppa's *entire* residual fading FER
+was a header artifact, not a PHY/FEC limit — the "does not survive realistic HF fading" framing was
+wrong for BPSK/QPSK 1/2, whose payloads decode through Good/Moderate/Poor.
 
-**Implication:** for the robust modes, coppa's *entire* residual fading FER is a header artifact, not
-a PHY/FEC limit — the "does not survive realistic HF fading" framing is wrong for BPSK/QPSK 1/2, whose
-payloads decode through Good/Moderate/Poor. A soft and/or lightly-coded header (e.g. repetition or a
-short block code over the 48 bits, plus a CRC so corrupt headers are *detected* rather than silently
-mis-parametrizing the payload) would recover ~12–24% of frames on fading channels. This is a
-wire-format change, so it is scoped but not yet built. Reproduce with
+### After: protected header (Golay(24,12) + CRC-16 + stride interleave + 2D estimation)
+
+The header is now FEC-protected: 48 header bits + CRC-16 + 8 pad → 6× Golay(24,12) → 144 coded bits
+→ stride-5 interleave → BPSK, decoded with the **same 2D cross-symbol pilot pooling the payload uses**
+(a `demodulate_header_bits` helper; the header spans ~105 ms < the Poor coherence time). Corrupt
+headers now **fail the CRC and are dropped** instead of silently mis-parametrizing the payload. The
+header grew from 2 to 4 OFDM symbols (+52.5 ms/frame on the robust profile).
+
+Header-caused failures per 100 frames at 30 dB — unprotected → hard-Golay only → +2D estimation:
+
+| cell | unprotected | Golay only | **+2D (shipped)** |
+|------|-------------|-----------|-------------------|
+| Good BPSK 1/2 | 17 | 0 | **0** |
+| Moderate 16QAM 1/2 | 22 | 1 | **0** |
+| Poor BPSK 1/2 | 11 | 18 | **5** |
+| Poor QPSK 1/2 | 12 | 23 | **3** |
+
+Two lessons in that table: (1) Golay alone *regressed* Poor — the longer, single-symbol-estimated,
+hard-decision header could not ride out Poor's deep fast-fading nulls, so the CRC correctly dropped
+frames the payload would have decoded; (2) applying the payload's 2D estimation to the header fixed it,
+pushing Poor **below** the original unprotected baseline. **Total fading frame failures: 1060
+(unprotected) → 441 (−58%).** AWGN stays at 0; no channel regresses. The remaining Poor loss on 16QAM
+1/2 is now genuine *payload* limit (16QAM on Poor), not the header. Reproduce with
 `cargo run --release -p coppa-bench --example header_diagnostic`.
 
 ## Limitations
