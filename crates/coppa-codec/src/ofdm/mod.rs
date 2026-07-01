@@ -29,6 +29,8 @@ pub mod coppa_modem;
 pub mod cross_frame_interleaver;
 pub mod equalizer;
 pub mod frame;
+pub mod golay;
+pub mod header_fec;
 pub mod interleaver;
 pub mod modem;
 pub mod pilots;
