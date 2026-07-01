@@ -240,22 +240,46 @@ pub struct CoppaHeader {
 }
 
 impl CoppaHeader {
-    /// Pack the header into 48 bits (one bit per element, MSB first).
-    pub fn to_bits(&self) -> Vec<u8> {
-        // Pack into 6 bytes first
+    /// Pack the header into 6 bytes (the on-air field layout).
+    pub fn to_bytes(&self) -> [u8; 6] {
         let payload_hi = ((self.payload_len >> 4) & 0xFF) as u8;
         let payload_lo = ((self.payload_len & 0x0F) as u8) << 4; // low nibble in upper half of byte 5
-
-        let bytes: [u8; 6] = [
+        [
             (self.version << 4) | (self.phy_mode & 0x0F),
             ((self.frame_type as u8) << 4) | (self.bandwidth & 0x0F),
             (self.fec_type << 4) | (self.speed_level & 0x0F),
             self.seq_num,
             payload_hi,
             payload_lo, // reserved nibble is 0
-        ];
+        ]
+    }
 
-        // Extract individual bits, MSB first
+    /// Reconstruct a `CoppaHeader` from 6 bytes. Returns `None` on an invalid frame type.
+    pub fn from_bytes(bytes: &[u8; 6]) -> Option<Self> {
+        let version = (bytes[0] >> 4) & 0x0F;
+        let phy_mode = bytes[0] & 0x0F;
+        let frame_type_raw = (bytes[1] >> 4) & 0x0F;
+        let bandwidth = bytes[1] & 0x0F;
+        let fec_type = (bytes[2] >> 4) & 0x0F;
+        let speed_level = bytes[2] & 0x0F;
+        let seq_num = bytes[3];
+        let payload_len = ((bytes[4] as u16) << 4) | ((bytes[5] as u16) >> 4);
+        let frame_type = CoppaFrameType::from_u8(frame_type_raw)?;
+        Some(CoppaHeader {
+            version,
+            phy_mode,
+            frame_type,
+            bandwidth,
+            fec_type,
+            speed_level,
+            seq_num,
+            payload_len,
+        })
+    }
+
+    /// Pack the header into 48 bits (one bit per element, MSB first).
+    pub fn to_bits(&self) -> Vec<u8> {
+        let bytes = self.to_bytes();
         let mut bits = Vec::with_capacity(48);
         for byte in &bytes {
             for shift in (0..8).rev() {
@@ -271,36 +295,13 @@ impl CoppaHeader {
         if bits.len() < 48 {
             return None;
         }
-
-        // Reconstruct 6 bytes from bits
         let mut bytes = [0u8; 6];
         for (i, byte) in bytes.iter_mut().enumerate() {
             for bit_idx in 0..8 {
                 *byte |= (bits[i * 8 + bit_idx] & 1) << (7 - bit_idx);
             }
         }
-
-        let version = (bytes[0] >> 4) & 0x0F;
-        let phy_mode = bytes[0] & 0x0F;
-        let frame_type_raw = (bytes[1] >> 4) & 0x0F;
-        let bandwidth = bytes[1] & 0x0F;
-        let fec_type = (bytes[2] >> 4) & 0x0F;
-        let speed_level = bytes[2] & 0x0F;
-        let seq_num = bytes[3];
-        let payload_len = ((bytes[4] as u16) << 4) | ((bytes[5] as u16) >> 4);
-
-        let frame_type = CoppaFrameType::from_u8(frame_type_raw)?;
-
-        Some(CoppaHeader {
-            version,
-            phy_mode,
-            frame_type,
-            bandwidth,
-            fec_type,
-            speed_level,
-            seq_num,
-            payload_len,
-        })
+        Self::from_bytes(&bytes)
     }
 }
 
@@ -460,6 +461,30 @@ mod tests {
         assert_eq!(decoded.payload_len, 4095);
         assert_eq!(decoded.seq_num, 255);
         assert_eq!(decoded.speed_level, 10);
+    }
+
+    #[test]
+    fn test_coppa_header_bytes_roundtrip() {
+        let header = CoppaHeader {
+            version: 1,
+            phy_mode: 2,
+            frame_type: CoppaFrameType::Data,
+            bandwidth: 3,
+            fec_type: 4,
+            speed_level: 6,
+            seq_num: 200,
+            payload_len: 1234,
+        };
+        let bytes = header.to_bytes();
+        assert_eq!(bytes.len(), 6);
+        assert_eq!(CoppaHeader::from_bytes(&bytes), Some(header.clone()));
+        let mut expected_bits = Vec::new();
+        for byte in &bytes {
+            for shift in (0..8).rev() {
+                expected_bits.push((byte >> shift) & 1);
+            }
+        }
+        assert_eq!(header.to_bits(), expected_bits);
     }
 
     #[test]
