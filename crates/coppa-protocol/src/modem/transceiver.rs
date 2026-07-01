@@ -262,4 +262,29 @@ mod tests {
         assert_eq!(rx_header.speed_level, 3);
         assert_eq!(&rx_payload[..payload.len()], payload.as_slice());
     }
+
+    #[test]
+    fn test_header_survives_bit_errors_in_header_region() {
+        // A few sign flips in the header OFDM symbols used to corrupt the frame
+        // (unprotected header). With Golay+CRC protection the header must recover.
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_robust(), 1);
+        let payload = vec![0x5Au8; 40];
+        let header = make_header(2, payload.len() as u16); // BPSK 1/2
+        let mut samples = tx.transmit(&header, payload.as_slice());
+        // Perturb a handful of samples inside the header region (after preamble +
+        // fine-sync = 3 symbols). One robust symbol = fft_size + cp = 1260 samples.
+        let sym = 1260;
+        let header_start = 3 * sym;
+        for i in 0..8 {
+            let idx = header_start + i * 37;
+            if idx < samples.len() {
+                samples[idx] += 0.15; // small additive perturbation
+            }
+        }
+        let (rx_header, rx_payload) = tx
+            .receive(&samples)
+            .expect("protected header should recover from small perturbations");
+        assert_eq!(rx_header.speed_level, 2);
+        assert_eq!(&rx_payload[..payload.len()], payload.as_slice());
+    }
 }

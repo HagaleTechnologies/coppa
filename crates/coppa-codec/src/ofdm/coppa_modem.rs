@@ -14,6 +14,7 @@ use coppa_dsp::fft::FftProcessor;
 
 use super::equalizer::{mmse_equalize, LinearInterpolationEstimator};
 use super::frame::CoppaHeader;
+use super::header_fec;
 use super::papr_clip;
 use super::pilots::CoppaPilotPattern;
 use super::sync::{detect_coppa_sync, generate_coppa_preamble};
@@ -186,8 +187,8 @@ impl CoppaModem {
         let fine_sync_carriers = vec![Complex32::new(1.0, 0.0); total_active];
         samples.extend(self.build_ofdm_symbol(&fine_sync_carriers));
 
-        // 3. Encode header bits and modulate as BPSK OFDM symbols
-        let header_bits = header.to_bits();
+        // 3. FEC-encode header (Golay+CRC+interleave) and modulate as BPSK OFDM symbols
+        let header_bits = header_fec::encode_header(header);
         let header_bpsk: Vec<Complex32> = header_bits
             .iter()
             .map(|&b| {
@@ -268,8 +269,8 @@ impl CoppaModem {
         let fine_sync_carriers = vec![Complex32::new(1.0, 0.0); total_active];
         samples.extend(self.build_ofdm_symbol(&fine_sync_carriers));
 
-        // 3. Header as BPSK (same as modulate())
-        let header_bits = header.to_bits();
+        // 3. FEC-encoded header as BPSK (same as modulate())
+        let header_bits = header_fec::encode_header(header);
         let header_bpsk: Vec<Complex32> = header_bits
             .iter()
             .map(|&b| {
@@ -324,9 +325,9 @@ impl CoppaModem {
             return None;
         }
 
-        // 3. Demodulate header symbols (2 symbols -> 88+ bits, take first 48)
-        let num_header_syms = 48usize.div_ceil(data_per_sym);
-        let mut header_bits = Vec::with_capacity(48);
+        // 3. Demodulate protected header symbols and FEC-decode them.
+        let num_header_syms = header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(data_per_sym);
+        let mut header_bits = Vec::with_capacity(header_fec::PROTECTED_HEADER_CODED_BITS);
 
         for sym_idx in 0..num_header_syms {
             let sym_start = data_start + sym_idx * symbol_len;
@@ -344,14 +345,14 @@ impl CoppaModem {
             // Extract data carriers and BPSK hard decision
             let data = self.pilots.extract_data(&equalized, sym_idx);
             for &val in &data {
-                if header_bits.len() < 48 {
+                if header_bits.len() < header_fec::PROTECTED_HEADER_CODED_BITS {
                     header_bits.push(if val.re >= 0.0 { 0u8 } else { 1u8 });
                 }
             }
         }
 
-        // 4. Parse header
-        let header = CoppaHeader::from_bits(&header_bits)?;
+        // 4. FEC-decode + CRC-check header (None => drop frame)
+        let header = header_fec::decode_header(&header_bits)?;
 
         // 5. Demodulate payload symbols
         let total_payload_bits = header.payload_len as usize * 8;
@@ -417,9 +418,9 @@ impl CoppaModem {
             return None;
         }
 
-        // 2. Header (hard-decision BPSK, same as demodulate)
-        let num_header_syms = 48usize.div_ceil(data_per_sym);
-        let mut header_bits = Vec::with_capacity(48);
+        // 2. Protected header (hard-decision BPSK slice -> FEC decode)
+        let num_header_syms = header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(data_per_sym);
+        let mut header_bits = Vec::with_capacity(header_fec::PROTECTED_HEADER_CODED_BITS);
 
         for sym_idx in 0..num_header_syms {
             let sym_start = data_start + sym_idx * symbol_len;
@@ -432,13 +433,13 @@ impl CoppaModem {
             let equalized = self.equalize_carriers(&carriers, &pilot_info, total_active);
             let data = self.pilots.extract_data(&equalized, sym_idx);
             for &val in &data {
-                if header_bits.len() < 48 {
+                if header_bits.len() < header_fec::PROTECTED_HEADER_CODED_BITS {
                     header_bits.push(if val.re >= 0.0 { 0u8 } else { 1u8 });
                 }
             }
         }
 
-        let header = CoppaHeader::from_bits(&header_bits)?;
+        let header = header_fec::decode_header(&header_bits)?;
 
         // 3. Payload: return equalized symbols + per-carrier noise
         let total_payload_bits = header.payload_len as usize * 8;
@@ -512,9 +513,9 @@ impl CoppaModem {
             return None;
         }
 
-        // 2. Header (hard-decision BPSK)
-        let num_header_syms = 48usize.div_ceil(data_per_sym);
-        let mut header_bits = Vec::with_capacity(48);
+        // 2. Protected header (hard-decision BPSK slice -> FEC decode)
+        let num_header_syms = header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(data_per_sym);
+        let mut header_bits = Vec::with_capacity(header_fec::PROTECTED_HEADER_CODED_BITS);
 
         for sym_idx in 0..num_header_syms {
             let sym_start = data_start + sym_idx * symbol_len;
@@ -527,13 +528,13 @@ impl CoppaModem {
             let equalized = self.equalize_carriers(&carriers, &pilot_info, total_active);
             let data = self.pilots.extract_data(&equalized, sym_idx);
             for &val in &data {
-                if header_bits.len() < 48 {
+                if header_bits.len() < header_fec::PROTECTED_HEADER_CODED_BITS {
                     header_bits.push(if val.re >= 0.0 { 0u8 } else { 1u8 });
                 }
             }
         }
 
-        let header = CoppaHeader::from_bits(&header_bits)?;
+        let header = header_fec::decode_header(&header_bits)?;
 
         // Compute coded payload symbols from header's speed level.
         // 1944 = LDPC coded block length (Z=81, 24 base columns).
