@@ -93,6 +93,53 @@ fn awgn_with_rng<R: rand::Rng>(samples: &[f32], snr_db: f32, rng: &mut R) -> Vec
         .collect()
 }
 
+/// Conventional HF noise reference bandwidth (Hz). SNRs quoted by HF modems
+/// (MIL-STD-188-110, FreeDV, VARA) reference noise power in a 3 kHz bandwidth.
+pub const HF_NOISE_BW_HZ: f32 = 3000.0;
+
+/// Mean power (mean square) of a real signal. Empty input → 0.0.
+pub fn mean_power(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    samples.iter().map(|x| x * x).sum::<f32>() / samples.len() as f32
+}
+
+/// Add white Gaussian noise at an SNR defined by the HF convention:
+/// signal power is the caller-supplied `ref_signal_power` (measure it on the
+/// CLEAN signal so that channel fading costs SNR instead of being renormalized
+/// away), and noise power is referenced to a 3 kHz noise bandwidth
+/// ([`HF_NOISE_BW_HZ`]) rather than the full Nyquist band. The noise itself is
+/// white across the whole band; there is simply (fs/2)/3000 ≈ 8x more of it in
+/// total than a full-band SNR at the same nominal dB (≈ +9.03 dB of noise).
+pub fn awgn_ref_seeded(
+    samples: &[f32],
+    snr_db: f32,
+    ref_signal_power: f32,
+    sample_rate: f32,
+    seed: u64,
+) -> Vec<f32> {
+    use rand::rngs::StdRng;
+    use rand::Rng;
+    use rand::SeedableRng;
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let snr_linear = 10.0f32.powf(snr_db / 10.0);
+    let noise_power = ref_signal_power / snr_linear * (sample_rate / 2.0) / HF_NOISE_BW_HZ;
+    let noise_std = noise_power.sqrt();
+    let mut rng = StdRng::seed_from_u64(seed);
+    samples
+        .iter()
+        .map(|&s| {
+            let u1: f32 = (1.0 - rng.random::<f32>()).max(1e-10);
+            let theta: f32 = rng.random_range(0.0f32..TAU);
+            let noise = noise_std * (-2.0 * u1.ln()).sqrt() * theta.cos();
+            s + noise
+        })
+        .collect()
+}
+
 /// Apply a true single-sideband frequency shift to a passband signal.
 pub fn freq_offset(
     samples: &[f32],
@@ -338,5 +385,35 @@ mod tests {
         let faded = fading(&samples, 1.0, 20.0, 8000.0);
         let min = faded.iter().cloned().fold(f32::MAX, f32::min);
         assert!(min < 0.5, "Fading should reduce amplitude at some points");
+    }
+
+    #[test]
+    fn mean_power_of_unit_square_wave_is_one() {
+        let x = vec![1.0f32, -1.0, 1.0, -1.0];
+        assert!((mean_power(&x) - 1.0).abs() < 1e-6);
+        assert_eq!(mean_power(&[]), 0.0);
+    }
+
+    #[test]
+    fn awgn_ref_noise_power_follows_3khz_convention() {
+        // Zeros in, ref power 1.0, 0 dB SNR(3 kHz) at 48 kHz → total noise power
+        // = 1.0 * (24000/3000) = 8.0. n=200_000 → sample std of the power estimate
+        // is ~8*sqrt(2/n) ≈ 0.025, so 5% tolerance is >15 sigma.
+        let n = 200_000;
+        let noisy = awgn_ref_seeded(&vec![0.0f32; n], 0.0, 1.0, 48_000.0, 42);
+        let p = mean_power(&noisy);
+        assert!(
+            (p - 8.0).abs() / 8.0 < 0.05,
+            "noise power should be ~8.0, got {p}"
+        );
+    }
+
+    #[test]
+    fn awgn_ref_high_snr_preserves_signal() {
+        let x = vec![1.0f32; 1000];
+        let noisy = awgn_ref_seeded(&x, 60.0, mean_power(&x), 48_000.0, 7);
+        for s in &noisy {
+            assert!(*s > 0.5, "60 dB SNR should preserve sign, got {s}");
+        }
     }
 }
