@@ -102,18 +102,22 @@ fn analytic(fft: &FftProcessor, x: &[f32]) -> Vec<Complex32> {
     fft.inverse(&xf)
 }
 
-/// A unit-average-power complex Gaussian fading process of length `n`, band-limited
-/// to a Gaussian Doppler spectrum of width `doppler_hz`, via the spectrum method
-/// (shape white complex Gaussian in the frequency domain, then IFFT).
+/// A complex Gaussian fading process of length `n`, band-limited to a Gaussian
+/// Doppler PSD with the given **sigma** (`doppler_sigma_hz`), via the spectrum
+/// method. Ensemble-normalized: E|g[i]|² = 1 across realizations, while each
+/// realization keeps its Rayleigh amplitude statistics (deep fades included).
+/// Per-realization normalization would pin every frame's power to 1 and delete
+/// flat fading — see the module docs.
 fn fading_process(
     fft: &FftProcessor,
     n: usize,
-    doppler_hz: f32,
+    doppler_sigma_hz: f32,
     fs: f32,
     rng: &mut impl Rng,
 ) -> Vec<Complex32> {
-    let d = doppler_hz.max(1e-6);
+    let d = doppler_sigma_hz.max(1e-6);
     let mut spec = vec![Complex32::new(0.0, 0.0); n];
+    let mut shape_energy = 0.0f32;
     for (k, s) in spec.iter_mut().enumerate() {
         // Bin frequency in [-fs/2, fs/2).
         let f = if k <= n / 2 {
@@ -123,13 +127,16 @@ fn fading_process(
         } * fs
             / n as f32;
         let shape = (-0.5 * (f / d).powi(2)).exp();
+        shape_energy += shape * shape;
         let (g1, g2) = gaussian_pair(rng);
         *s = Complex32::new(g1 * shape, g2 * shape);
     }
     let mut g = fft.inverse(&spec);
-    let p = g.iter().map(|c| c.norm_sqr()).sum::<f32>() / n as f32;
-    if p > 1e-20 {
-        let scale = (1.0 / p).sqrt();
+    // E|g[i]|² = (2/N²)·Σ shape² for the 1/N-scaled IFFT of independent
+    // CN(0, 2·shape²) bins; divide by sqrt of that deterministic constant.
+    let expected_p = 2.0 * shape_energy / (n as f32 * n as f32);
+    if expected_p > 1e-30 {
+        let scale = (1.0 / expected_p).sqrt();
         for c in &mut g {
             *c *= scale;
         }
@@ -243,5 +250,38 @@ mod tests {
         assert_eq!(poor.taps.len(), 2);
         assert!((poor.taps[1].delay_s - 0.002).abs() < 1e-9);
         assert!((poor.doppler_spread_hz - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fading_process_has_unit_ensemble_power_and_rayleigh_spread() {
+        // At sigma = 0.1 Hz over 8192/48k ≈ 171 ms the frequency resolution
+        // (48000/8192 ≈ 5.9 Hz) means only the DC bin has non-negligible shape:
+        // the tap is a single complex Gaussian per realization, so per-frame
+        // power ~ Exp(1): CV = 1, and P(power < 0.1) ≈ 9.5% → deep fades exist.
+        let n = 8192;
+        let fft = FftProcessor::new(n);
+        let mut powers = Vec::new();
+        for seed in 0..300u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let g = fading_process(&fft, n, 0.1, 48_000.0, &mut rng);
+            powers.push(g.iter().map(|c| c.norm_sqr()).sum::<f32>() / n as f32);
+        }
+        let mean = powers.iter().sum::<f32>() / powers.len() as f32;
+        // std of the mean of 300 Exp(1) draws ≈ 1/sqrt(300) ≈ 0.058 → 0.2 is >3 sigma.
+        assert!(
+            (mean - 1.0).abs() < 0.2,
+            "ensemble mean power ~1, got {mean}"
+        );
+        let var = powers.iter().map(|p| (p - mean).powi(2)).sum::<f32>() / powers.len() as f32;
+        let cv = var.sqrt() / mean;
+        assert!(
+            cv > 0.6,
+            "per-realization power must vary (Rayleigh), cv={cv}"
+        );
+        let min = powers.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(
+            min < 0.1 * mean,
+            "deep fades must exist, min={min} mean={mean}"
+        );
     }
 }
