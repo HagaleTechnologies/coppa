@@ -8,19 +8,18 @@
 //! # How to interpret it
 //!
 //! - **Block-fading regime.** At HF Doppler spreads (0.1–1 Hz) the channel coherence
-//!   time (~1–10 s) is far longer than a single modem frame (~1 s or less). Within one
-//!   frame the fading is therefore essentially *constant in time* — which is physically
-//!   correct for HF, not an artifact. The real impairment this model applies to a frame
-//!   is the **frequency-selective Rayleigh fading produced by the delayed tap** (multipath
-//!   ISI across the OFDM subcarriers); it does not exercise fast within-frame Doppler
-//!   (inter-carrier interference), which is negligible at these Doppler values. Averaging
-//!   over many seeds samples the Rayleigh fading distribution.
-//! - **`doppler_spread_hz` is the Gaussian PSD sigma** (1-sigma half-width); the RMS
-//!   Doppler bandwidth is `doppler_spread_hz / sqrt(2)`.
-//! - The per-tap fading process is generated two-sided in the frequency domain (richer
-//!   short-block statistics than a one-sided/analytic process); after multiplying the
-//!   analytic signal and taking the real part, output power is normalized to the input,
-//!   so a following `awgn` call sets a meaningful SNR.
+//!   time (~1–10 s) is comparable to or longer than a modem frame, so within one frame
+//!   the fading is slowly varying; averaging over many seeds samples the Rayleigh
+//!   fading distribution, including deep flat fades that cost real SNR.
+//! - **`doppler_spread_hz` is the ITU-R F.1487 frequency spread (the two-sigma width
+//!   of the Gaussian Doppler PSD)**; the PSD sigma is `doppler_spread_hz / 2`.
+//! - The fading process is ensemble-normalized (E|g|² = 1): each realization keeps its
+//!   Rayleigh amplitude, so per-frame output power varies. Normalizing power
+//!   per-realization instead (to exactly 1 every time) would pin every frame's power
+//!   and delete flat fading entirely — the whole point of a Rayleigh channel model is
+//!   that some frames arrive faded deep and some do not. Set noise from the CLEAN
+//!   signal power (see `awgn_ref_seeded`), never from the faded output, or fading
+//!   cannot cost SNR.
 
 use coppa_dsp::fft::FftProcessor;
 use num_complex::Complex32;
@@ -40,6 +39,15 @@ pub struct Tap {
 pub struct WattersonConfig {
     pub taps: Vec<Tap>,
     pub doppler_spread_hz: f32,
+}
+
+impl WattersonConfig {
+    /// Gaussian Doppler PSD sigma. ITU-R F.1487 defines the channel's
+    /// "frequency spread" as the two-sigma width of the Doppler spectrum, so
+    /// sigma is half the configured spread.
+    pub fn doppler_sigma_hz(&self) -> f32 {
+        self.doppler_spread_hz * 0.5
+    }
 }
 
 /// Standard ITU-R F.1487 / CCIR HF test channels (two equal-power paths).
@@ -145,8 +153,9 @@ fn fading_process(
 }
 
 /// Pass a real passband signal through a Watterson HF channel. Deterministic in
-/// `seed`. The output's average power is normalized to the input's, so a following
-/// `awgn` call sets a meaningful SNR.
+/// `seed`. Output power is preserved only in ensemble average across seeds; each
+/// realization fades (use [`crate::awgn_ref_seeded`] with the CLEAN signal's
+/// power as reference so that fading costs SNR).
 pub fn watterson(
     samples: &[f32],
     sample_rate: f32,
@@ -165,22 +174,16 @@ pub fn watterson(
     for tap in &config.taps {
         let delay = (tap.delay_s * sample_rate).round() as usize;
         let amp = tap.power.max(0.0).sqrt();
-        let g = fading_process(&fft, n, config.doppler_spread_hz, sample_rate, &mut rng);
+        let g = fading_process(&fft, n, config.doppler_sigma_hz(), sample_rate, &mut rng);
         for i in delay..n {
             out[i] += a[i - delay] * g[i] * amp;
         }
     }
 
-    let mut real: Vec<f32> = out.iter().map(|c| c.re).collect();
-    let in_p = samples.iter().map(|s| s * s).sum::<f32>() / n as f32;
-    let out_p = real.iter().map(|s| s * s).sum::<f32>() / n as f32;
-    if out_p > 1e-20 {
-        let scale = (in_p / out_p).sqrt();
-        for s in &mut real {
-            *s *= scale;
-        }
-    }
-    real
+    // No output renormalization: tap powers sum to 1 and the fading process is
+    // ensemble-unit-power, so the ENSEMBLE average output power equals the input
+    // power, while each frame keeps its Rayleigh fade (a deep fade arrives quiet).
+    out.iter().map(|c| c.re).collect()
 }
 
 /// Convenience: pass through a named preset channel.
@@ -210,14 +213,87 @@ mod tests {
     }
 
     #[test]
-    fn average_power_is_preserved() {
+    fn ensemble_power_is_preserved() {
+        // Per-frame power now varies (Rayleigh); only the ensemble average over
+        // seeds must match the input power. 2-tap equal-power channel with a
+        // near-constant-per-frame tap: frame power ≈ (|g1|²+|g2|²)/2, a mean-1
+        // Gamma(2, 1/2) variable with CV = 1/sqrt(2) ≈ 0.707. Over 200 seeds the
+        // std of the mean is ≈ 0.707/sqrt(200) ≈ 0.05 → 0.2 tolerance is 4 sigma.
         let x = test_signal(8192);
-        let y = watterson_preset(&x, 48_000.0, WattersonPreset::Poor, 7);
         let px = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
-        let py = y.iter().map(|v| v * v).sum::<f32>() / y.len() as f32;
+        let mut ratios = Vec::new();
+        for seed in 0..200u64 {
+            let y = watterson_preset(&x, 48_000.0, WattersonPreset::Good, seed);
+            let py = y.iter().map(|v| v * v).sum::<f32>() / y.len() as f32;
+            ratios.push(py / px);
+        }
+        let mean = ratios.iter().sum::<f32>() / ratios.len() as f32;
         assert!(
-            (py - px).abs() / px < 0.05,
-            "power should be preserved: px={px}, py={py}"
+            (mean - 1.0).abs() < 0.2,
+            "ensemble power ratio should be ~1, got {mean}"
+        );
+    }
+
+    #[test]
+    fn flat_fades_cost_power() {
+        // A deep flat fade must be possible: over 200 seeds of a 2-tap channel,
+        // at least one frame should arrive at less than 15% of the input power
+        // (P(Gamma(2,1/2) < 0.15) ≈ 3.7% per seed → P(none in 200) ≈ 0.05%),
+        // and at least one above 2x (P ≈ 9.2% per seed).
+        let x = test_signal(8192);
+        let px = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+        let mut min_ratio = f32::MAX;
+        let mut max_ratio = 0.0f32;
+        for seed in 0..200u64 {
+            let y = watterson_preset(&x, 48_000.0, WattersonPreset::Good, seed);
+            let py = y.iter().map(|v| v * v).sum::<f32>() / y.len() as f32;
+            min_ratio = min_ratio.min(py / px);
+            max_ratio = max_ratio.max(py / px);
+        }
+        assert!(
+            min_ratio < 0.15,
+            "deep fades must exist, min ratio {min_ratio}"
+        );
+        assert!(
+            max_ratio > 2.0,
+            "up-fades must exist, max ratio {max_ratio}"
+        );
+    }
+
+    #[test]
+    fn doppler_sigma_is_half_the_itu_spread() {
+        // ITU-R F.1487 frequency spread = 2 sigma of the Gaussian Doppler PSD.
+        let cfg = WattersonPreset::Poor.config(); // spread 1.0 Hz
+        assert!((cfg.doppler_sigma_hz() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fading_process_autocorrelation_matches_gaussian_psd() {
+        // The per-bin *amplitude* weight is shape(f) = exp(-0.5(f/sigma)^2), so the
+        // power spectral density (E|s_k|^2 ∝ shape(f)^2) is exp(-f^2/sigma^2) — a
+        // Gaussian with variance sigma^2/2 in the exp(-f^2/2v) form. Its Fourier
+        // pair gives rho(tau) = exp(-2 pi^2 v tau^2) = exp(-pi^2 sigma^2 tau^2).
+        // sigma = 0.5 Hz, tau = 0.2 s -> rho ≈ 0.906. (Under the old sigma=spread
+        // convention Poor used sigma=1.0 Hz -> rho ≈ 0.674 by the same formula,
+        // confirmed empirically at ~0.67 with these n/fs; the two conventions are
+        // well separated, so this also guards the 2-sigma convention end to end.)
+        // Average over 50 seeds; per-seed estimates are noisy but the mean is tight.
+        let n = 48_000; // 1 s at 48 kHz
+        let lag = 9_600; // 0.2 s
+        let fft = FftProcessor::new(n);
+        let mut rho_sum = 0.0f32;
+        for seed in 0..50u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let g = fading_process(&fft, n, 0.5, 48_000.0, &mut rng);
+            let num: f32 = (0..n - lag).map(|t| (g[t] * g[t + lag].conj()).re).sum();
+            let den: f32 = (0..n - lag).map(|t| g[t].norm_sqr()).sum();
+            rho_sum += num / den.max(1e-20);
+        }
+        let rho = rho_sum / 50.0;
+        assert!(
+            (0.85..0.99).contains(&rho),
+            "rho(0.2s) at sigma=0.5 should be ~0.91 (well above the ~0.67 the old \
+             sigma=spread convention would give), got {rho}"
         );
     }
 
@@ -234,13 +310,25 @@ mod tests {
     #[test]
     fn channel_actually_distorts_the_signal() {
         // A faded multipath channel must change the signal, not pass it through.
+        // With true (non-renormalized) Rayleigh statistics, a single hardcoded
+        // seed can legitimately land near an identity-like channel (a benign
+        // fade), so this asserts the MEDIAN distortion over many seeds instead
+        // of a single seed's — robust to the occasional benign-fade outlier
+        // while still requiring the channel to genuinely distort typically.
         let x = test_signal(8192);
-        let y = watterson_preset(&x, 48_000.0, WattersonPreset::Poor, 5);
-        let diff = x.iter().zip(&y).map(|(a, b)| (a - b).powi(2)).sum::<f32>();
         let energy = x.iter().map(|v| v * v).sum::<f32>();
+        let mut ratios: Vec<f32> = (0..20u64)
+            .map(|seed| {
+                let y = watterson_preset(&x, 48_000.0, WattersonPreset::Poor, seed);
+                let diff = x.iter().zip(&y).map(|(a, b)| (a - b).powi(2)).sum::<f32>();
+                diff / energy
+            })
+            .collect();
+        ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = ratios[ratios.len() / 2];
         assert!(
-            diff / energy > 0.1,
-            "channel should distort the signal meaningfully"
+            median > 0.1,
+            "channel should distort the signal meaningfully (median), got {median}"
         );
     }
 
