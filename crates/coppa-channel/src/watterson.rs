@@ -111,11 +111,15 @@ fn analytic(fft: &FftProcessor, x: &[f32]) -> Vec<Complex32> {
 }
 
 /// A complex Gaussian fading process of length `n`, band-limited to a Gaussian
-/// Doppler PSD with the given **sigma** (`doppler_sigma_hz`), via the spectrum
-/// method. Ensemble-normalized: E|g[i]|² = 1 across realizations, while each
-/// realization keeps its Rayleigh amplitude statistics (deep fades included).
-/// Per-realization normalization would pin every frame's power to 1 and delete
-/// flat fading — see the module docs.
+/// Doppler PSD with the given **power**-PSD sigma (`doppler_sigma_hz`), via the
+/// spectrum method. `doppler_sigma_hz` is the sigma of the process's *power*
+/// spectrum `exp(-f²/(2σ²))`; each bin's complex Gaussian is weighted by the
+/// *amplitude* — the square root of that PSD, `exp(-f²/(4σ²))` — so that
+/// squaring the weight recovers the intended power spectrum. Ensemble-normalized:
+/// E|g[i]|² = 1 across realizations, while each realization keeps its Rayleigh
+/// amplitude statistics (deep fades included). Per-realization normalization
+/// would pin every frame's power to 1 and delete flat fading — see the module
+/// docs.
 fn fading_process(
     fft: &FftProcessor,
     n: usize,
@@ -134,7 +138,7 @@ fn fading_process(
             k as f32 - n as f32
         } * fs
             / n as f32;
-        let shape = (-0.5 * (f / d).powi(2)).exp();
+        let shape = (-0.25 * (f / d).powi(2)).exp();
         shape_energy += shape * shape;
         let (g1, g2) = gaussian_pair(rng);
         *s = Complex32::new(g1 * shape, g2 * shape);
@@ -269,14 +273,22 @@ mod tests {
 
     #[test]
     fn fading_process_autocorrelation_matches_gaussian_psd() {
-        // The per-bin *amplitude* weight is shape(f) = exp(-0.5(f/sigma)^2), so the
-        // power spectral density (E|s_k|^2 ∝ shape(f)^2) is exp(-f^2/sigma^2) — a
-        // Gaussian with variance sigma^2/2 in the exp(-f^2/2v) form. Its Fourier
-        // pair gives rho(tau) = exp(-2 pi^2 v tau^2) = exp(-pi^2 sigma^2 tau^2).
-        // sigma = 0.5 Hz, tau = 0.2 s -> rho ≈ 0.906. (Under the old sigma=spread
-        // convention Poor used sigma=1.0 Hz -> rho ≈ 0.674 by the same formula,
-        // confirmed empirically at ~0.67 with these n/fs; the two conventions are
-        // well separated, so this also guards the 2-sigma convention end to end.)
+        // The per-bin *amplitude* weight is shape(f) = exp(-f^2/(4 sigma^2)), so the
+        // power spectral density (E|s_k|^2 ∝ shape(f)^2) is exp(-f^2/(2 sigma^2)) —
+        // sigma is the power-PSD sigma, matching ITU-R F.1487's 2-sigma frequency
+        // spread definition. That Gaussian's Fourier pair gives the continuous-limit
+        // autocorrelation rho(tau) = exp(-2 pi^2 sigma^2 tau^2). At sigma = 0.5 Hz,
+        // tau = 0.2 s -> rho ≈ 0.821.
+        //
+        // The discrete grid perturbs this: at n=48000, fs=48000 the bin spacing is
+        // 1 Hz, comparable to sigma=0.5 Hz, so only a few bins carry real weight
+        // (effectively a 3-bin quantization of the continuous Gaussian). Measured
+        // here: rho ≈ 0.821 (averaged over 50 seeds), matching the continuous
+        // prediction closely. Under the old (pre-fix) amplitude-weight convention
+        // (shape = exp(-0.5(f/sigma)^2), i.e. power-PSD sigma = sigma/sqrt(2))
+        // this same call measured rho ≈ 0.9496; under the original wrong
+        // "sigma = spread" convention it measured ≈ 0.67. The window below is
+        // centered on the measured value and is narrow enough to exclude both.
         // Average over 50 seeds; per-seed estimates are noisy but the mean is tight.
         let n = 48_000; // 1 s at 48 kHz
         let lag = 9_600; // 0.2 s
@@ -291,9 +303,10 @@ mod tests {
         }
         let rho = rho_sum / 50.0;
         assert!(
-            (0.85..0.99).contains(&rho),
-            "rho(0.2s) at sigma=0.5 should be ~0.91 (well above the ~0.67 the old \
-             sigma=spread convention would give), got {rho}"
+            (0.741..0.901).contains(&rho),
+            "rho(0.2s) at power-PSD sigma=0.5 should be ~0.82 (excludes both the old \
+             amplitude-sigma=0.5 convention's ~0.95 and the original sigma=spread \
+             convention's ~0.67), got {rho}"
         );
     }
 
