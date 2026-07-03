@@ -161,6 +161,12 @@ pub struct CoppaProfile {
     pub phy_mode: u8,
     /// Bandwidth class identifier encoded in the Coppa frame header.
     pub bandwidth_id: u8,
+    /// Index of the first active FFT bin minus 1: active carrier `i` maps to bin
+    /// `carrier_offset + 1 + i`. Bins `1..=carrier_offset` are unused guard bins.
+    /// Set to 6 on all profiles so HF waveforms sit at 350-2700 Hz, clear of a
+    /// typical SSB radio's passband filters (see
+    /// docs/superpowers/plans/2026-07-03-phase1-radio-reality.md Task 1).
+    pub carrier_offset: usize,
 }
 
 impl CoppaProfile {
@@ -174,6 +180,7 @@ impl CoppaProfile {
             pilot_carriers: 4,
             phy_mode: 0,
             bandwidth_id: 1,
+            carrier_offset: 6,
         }
     }
 
@@ -190,6 +197,7 @@ impl CoppaProfile {
             pilot_carriers: 12,
             phy_mode: 0,
             bandwidth_id: 3,
+            carrier_offset: 6,
         }
     }
 
@@ -203,19 +211,26 @@ impl CoppaProfile {
             pilot_carriers: 2,
             phy_mode: 0,
             bandwidth_id: 0,
+            carrier_offset: 6,
         }
     }
 
     /// HF wide profile: maximum HF throughput.
+    ///
+    /// Redefined for Phase 1 (carrier_offset=6) to 46 data + 4 pilot carriers (50
+    /// active, bins 7..=56, ~350-2800 Hz). This exceeds many radios' narrow TX
+    /// filter passbands; hf_wide is documented as marginal for tighter SSB filters
+    /// (see docs/superpowers/plans/2026-07-03-phase1-radio-reality.md Task 1).
     pub fn hf_wide() -> Self {
         Self {
             fft_size: 960,
             sample_rate: 48_000,
             cp_samples: 300,
-            data_carriers: 50,
+            data_carriers: 46,
             pilot_carriers: 4,
             phy_mode: 0,
             bandwidth_id: 2,
+            carrier_offset: 6,
         }
     }
 
@@ -229,6 +244,7 @@ impl CoppaProfile {
             pilot_carriers: 4,
             phy_mode: 1,
             bandwidth_id: 1,
+            carrier_offset: 6,
         }
     }
 
@@ -242,6 +258,7 @@ impl CoppaProfile {
             pilot_carriers: 8,
             phy_mode: 1,
             bandwidth_id: 2,
+            carrier_offset: 6,
         }
     }
 
@@ -268,6 +285,20 @@ impl CoppaProfile {
     /// Number of complete OFDM symbols per second.
     pub fn symbols_per_second(&self) -> f32 {
         self.sample_rate as f32 / (self.fft_size + self.cp_samples) as f32
+    }
+
+    /// First active FFT bin (DC is bin 0; guard bins 1..=carrier_offset are unused).
+    pub fn first_active_bin(&self) -> usize {
+        self.carrier_offset + 1
+    }
+
+    /// (lowest, highest) active-carrier frequencies in Hz.
+    pub fn band_edges_hz(&self) -> (f32, f32) {
+        let df = self.carrier_spacing_hz();
+        (
+            self.first_active_bin() as f32 * df,
+            (self.carrier_offset + self.total_active_carriers()) as f32 * df,
+        )
     }
 }
 
@@ -775,9 +806,12 @@ mod tests {
     #[test]
     fn test_coppa_hf_wide_profile() {
         let p = CoppaProfile::hf_wide();
-        assert_eq!(p.data_carriers, 50);
+        // updated for Phase 1 carrier_offset=6, see
+        // docs/superpowers/plans/2026-07-03-phase1-radio-reality.md Task 1:
+        // hf_wide redefined to 46 data + 4 pilots (50 active, bins 7..=56, ~350-2800 Hz).
+        assert_eq!(p.data_carriers, 46);
         assert_eq!(p.pilot_carriers, 4);
-        assert_eq!(p.total_active_carriers(), 54);
+        assert_eq!(p.total_active_carriers(), 50);
         assert_eq!(p.bandwidth_id, 2);
     }
 
@@ -829,6 +863,31 @@ mod tests {
                 s
             );
         }
+    }
+
+    #[test]
+    fn hf_profiles_sit_in_the_ssb_passband() {
+        for p in [
+            CoppaProfile::hf_standard(),
+            CoppaProfile::hf_robust(),
+            CoppaProfile::hf_narrow(),
+        ] {
+            let (lo, hi) = p.band_edges_hz();
+            assert!(
+                lo >= 300.0,
+                "lowest carrier {lo} Hz must clear SSB highpass (~300 Hz)"
+            );
+            assert!(
+                hi <= 2750.0,
+                "highest carrier {hi} Hz must clear SSB lowpass (~2.7 kHz)"
+            );
+        }
+        let w = CoppaProfile::hf_wide();
+        assert!(w.band_edges_hz().0 >= 300.0);
+        assert!(
+            w.band_edges_hz().1 <= 2850.0,
+            "hf_wide is documented as marginal, but bounded"
+        );
     }
 
     #[test]
