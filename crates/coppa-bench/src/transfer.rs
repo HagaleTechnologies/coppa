@@ -274,6 +274,11 @@ impl TransferPhy for V2Phy {
 
 /// Concatenate the per-frame signals, apply the channel ONCE (so fading is correlated
 /// across frames), then split back into per-frame windows of the original length.
+///
+/// `snr_db` uses the HF convention: noise power referenced to a 3 kHz bandwidth
+/// ([`coppa_channel::HF_NOISE_BW_HZ`]) and signal power measured on the CLEAN
+/// concatenated signal, so Watterson fades cost receive power rather than being
+/// renormalized away.
 pub fn apply_transfer_channel(
     frames: &[Vec<f32>],
     channel: ChannelSpec,
@@ -283,18 +288,22 @@ pub fn apply_transfer_channel(
     let l = frames.first().map(|f| f.len()).unwrap_or(0);
     let concat: Vec<f32> = frames.iter().flatten().copied().collect();
 
+    // Same convention as runner::run_trial: 3 kHz-referenced SNR against clean power.
+    let p_clean = coppa_channel::mean_power(&concat);
+    let noise_seed = seed ^ 0x5555_5555_5555_5555;
+    let sr = SAMPLE_RATE as f32;
     let faded = match channel {
         ChannelSpec::Awgn => {
-            coppa_channel::awgn_seeded(&concat, snr_db, seed ^ 0x5555_5555_5555_5555)
+            coppa_channel::awgn_ref_seeded(&concat, snr_db, p_clean, sr, noise_seed)
         }
         ChannelSpec::Watterson(preset) => {
             let f = coppa_channel::watterson::watterson(
                 &concat,
-                SAMPLE_RATE as f32,
+                sr,
                 &preset.config(),
                 seed ^ 0x3333_3333_3333_3333,
             );
-            coppa_channel::awgn_seeded(&f, snr_db, seed ^ 0x5555_5555_5555_5555)
+            coppa_channel::awgn_ref_seeded(&f, snr_db, p_clean, sr, noise_seed)
         }
     };
 
@@ -354,13 +363,14 @@ pub fn run_transfer_scenario(
     let total_bytes = phy.payload_bytes();
     let mut points = Vec::with_capacity(snr_db_points.len());
 
-    for (si, &snr_db) in snr_db_points.iter().enumerate() {
+    for &snr_db in snr_db_points.iter() {
         let mut recov_sum = 0.0f64;
         let mut frame_samples_total = 0usize;
         for t in 0..trials {
-            let seed = base_seed
-                .wrapping_add((si as u64) << 32)
-                .wrapping_add(t as u64);
+            // Seed depends only on the trial index, NOT the SNR index: every SNR
+            // point sees the identical payloads and channel draws, so per-PHY
+            // SNR curves are paired (matching run_paired_comparison below).
+            let seed = base_seed.wrapping_add(t as u64);
             let mut rng = StdRng::seed_from_u64(seed);
             let payload: Vec<u8> = (0..total_bytes).map(|_| rng.random::<u8>()).collect();
             let frames = phy.encode_transfer(&payload);
