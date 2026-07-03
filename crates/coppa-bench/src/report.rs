@@ -5,12 +5,13 @@ use std::fmt::Write as _;
 use crate::metrics::MeasurementPoint;
 
 /// CSV header line.
-pub const CSV_HEADER: &str = "level,mode,channel,snr_db,trials,frame_errors,fer,ber,goodput_bps";
+pub const CSV_HEADER: &str =
+    "level,mode,channel,snr_db,trials,frame_errors,fer,fer_lo,fer_hi,ber,goodput_bps";
 
 /// Format one `MeasurementPoint` as a CSV row (no trailing newline).
 pub fn csv_row(p: &MeasurementPoint) -> String {
     format!(
-        "{},{},{},{:.1},{},{},{:.6},{:.8},{:.2}",
+        "{},{},{},{:.1},{},{},{:.6},{:.6},{:.6},{:.8},{:.2}",
         p.level,
         p.mode_name,
         p.channel,
@@ -18,6 +19,8 @@ pub fn csv_row(p: &MeasurementPoint) -> String {
         p.trials,
         p.frame_errors,
         p.fer,
+        p.fer_lo,
+        p.fer_hi,
         p.ber,
         p.goodput_bps
     )
@@ -35,11 +38,13 @@ pub fn to_csv(points: &[MeasurementPoint]) -> String {
     out
 }
 
-/// Lowest SNR at which a level's FER is at or below `target_fer`.
+/// Lowest SNR at which a level's FER is at or below `target_fer` **with 95%
+/// confidence** (the Wilson upper bound must clear the target, so "0 failures
+/// in 10 trials" cannot claim FER<=1%).
 pub fn fer_threshold(points: &[MeasurementPoint], level: u8, target_fer: f64) -> Option<f32> {
     points
         .iter()
-        .filter(|p| p.level == level && p.fer <= target_fer)
+        .filter(|p| p.level == level && p.fer_hi <= target_fer)
         .map(|p| p.snr_db)
         .min_by(|a, b| a.total_cmp(b))
 }
@@ -50,11 +55,11 @@ pub fn to_markdown(points: &[MeasurementPoint], channel_title: &str) -> String {
     let _ = writeln!(out, "## {} channel\n", channel_title);
     let _ = writeln!(
         out,
-        "| Mode | SNR @ FER=10% | SNR @ FER=1% | Peak goodput (bps) |"
+        "| Mode | SNR @ FER≤10% (95% CI) | SNR @ FER≤1% (95% CI) | Peak goodput (bps) |"
     );
     let _ = writeln!(
         out,
-        "|------|---------------|--------------|--------------------|"
+        "|------|------------------------|-----------------------|--------------------|"
     );
 
     let mut levels: Vec<u8> = points.iter().map(|p| p.level).collect();
@@ -97,24 +102,28 @@ mod tests {
             trials: 100,
             frame_errors: (fer * 100.0) as usize,
             fer,
+            fer_lo: fer * 0.5,
+            fer_hi: (fer * 1.5).clamp(0.02, 1.0),
             ber: 0.0,
             goodput_bps: goodput,
         }
     }
 
     #[test]
-    fn csv_row_has_nine_fields() {
-        let row = csv_row(&point(2, 10.0, 0.0, 968.0));
-        assert_eq!(row.split(',').count(), 9);
-    }
-
-    #[test]
     fn fer_threshold_picks_lowest_passing_snr() {
-        let pts = vec![
+        let mut pts = vec![
             point(2, 0.0, 0.5, 0.0),
             point(2, 4.0, 0.05, 500.0),
             point(2, 8.0, 0.0, 968.0),
         ];
+        // Set fer_hi values to match the test intent:
+        // - point at 0.0 dB has fer_hi > 0.10 (fails 10% target)
+        // - point at 4.0 dB has fer_hi <= 0.10 but > 0.01 (passes 10%, fails 1%)
+        // - point at 8.0 dB has fer_hi <= 0.01 (passes both)
+        pts[0].fer_hi = 0.25;
+        pts[1].fer_hi = 0.08;
+        pts[2].fer_hi = 0.008;
+
         assert_eq!(fer_threshold(&pts, 2, 0.10), Some(4.0));
         assert_eq!(fer_threshold(&pts, 2, 0.01), Some(8.0));
     }
@@ -125,5 +134,24 @@ mod tests {
         let md = to_markdown(&pts, "AWGN");
         assert!(md.contains("AWGN channel"));
         assert_eq!(md.matches("| TEST |").count(), 2);
+    }
+
+    #[test]
+    fn fer_threshold_uses_upper_confidence_bound() {
+        // Point FER 0.0 but wide CI (0/10 trials → hi ≈ 0.28) must NOT count as
+        // meeting a 10% target; a tight CI (0/500 → hi ≈ 0.0077) must.
+        let mut loose = point(2, 4.0, 0.0, 500.0);
+        loose.fer_hi = 0.28;
+        let mut tight = point(2, 8.0, 0.0, 968.0);
+        tight.fer_hi = 0.0077;
+        let pts = vec![loose, tight];
+        assert_eq!(fer_threshold(&pts, 2, 0.10), Some(8.0));
+    }
+
+    #[test]
+    fn csv_includes_ci_columns() {
+        let row = csv_row(&point(2, 10.0, 0.0, 968.0));
+        assert_eq!(row.split(',').count(), 11);
+        assert!(CSV_HEADER.contains("fer_lo") && CSV_HEADER.contains("fer_hi"));
     }
 }
