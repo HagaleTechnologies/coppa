@@ -128,13 +128,18 @@ impl CoppaModem {
     ///
     /// Places carriers at bins 1..N with Hermitian symmetry, IFFTs,
     /// and prepends cyclic prefix.
-    fn build_ofdm_symbol(&self, active_carriers: &[Complex32]) -> Vec<f32> {
+    pub(crate) fn build_ofdm_symbol(&self, active_carriers: &[Complex32]) -> Vec<f32> {
         let n = self.profile.fft_size;
         let cp = self.profile.cp_samples;
 
+        debug_assert!(
+            self.profile.carrier_offset + self.profile.total_active_carriers() < n / 2,
+            "active band must stay well below Nyquist"
+        );
+
         let mut freq = vec![Complex32::new(0.0, 0.0); n];
         for (i, &val) in active_carriers.iter().enumerate() {
-            let bin = i + 1; // skip DC at bin 0
+            let bin = self.profile.first_active_bin() + i;
             if bin < n / 2 {
                 freq[bin] = val;
                 freq[n - bin] = val.conj();
@@ -167,9 +172,11 @@ impl CoppaModem {
         let input: Vec<Complex32> = data.iter().map(|&s| Complex32::new(s, 0.0)).collect();
         let freq = self.fft.forward(&input);
 
-        // Extract active carriers from positive frequency bins 1..total_active
+        // Extract active carriers from the profile's active band, starting at
+        // first_active_bin (carrier_offset + 1).
         let total_active = self.profile.total_active_carriers();
-        (0..total_active).map(|i| freq[i + 1]).collect()
+        let first = self.profile.first_active_bin();
+        (0..total_active).map(|i| freq[first + i]).collect()
     }
 
     /// Modulate a frame (header + payload) into audio samples.
@@ -838,6 +845,54 @@ mod tests {
         assert!(
             (at4.re - 2.0).abs() < 1e-6 && at4.im.abs() < 1e-6,
             "got {at4:?}"
+        );
+    }
+
+    #[test]
+    fn modulated_energy_is_confined_to_the_active_band() {
+        // FFT one OFDM symbol built directly from active carriers and confirm the
+        // energy sits only on the profile's active-band bins (carrier_offset=6 on
+        // hf_standard -> bins 7..=54), with negligible leakage on the guard bins
+        // below the offset and none above the active band (up to N/2).
+        let profile = CoppaProfile::hf_standard();
+        let modem = CoppaModem::new(profile.clone(), 1);
+        let total_active = profile.total_active_carriers();
+        let carriers = vec![Complex32::new(1.0, 0.0); total_active];
+
+        let symbol = modem.build_ofdm_symbol(&carriers);
+        let n = profile.fft_size;
+        let cp = profile.cp_samples;
+        let body: Vec<Complex32> = symbol[cp..cp + n]
+            .iter()
+            .map(|&s| Complex32::new(s, 0.0))
+            .collect();
+        let fft = FftProcessor::new(n);
+        let spec = fft.forward(&body);
+
+        let first = profile.first_active_bin();
+        let last = first + total_active - 1;
+
+        let max_mag = spec[1..n / 2]
+            .iter()
+            .map(|c| c.norm())
+            .fold(0.0f32, f32::max);
+        for &bin in &spec[1..first] {
+            assert!(
+                bin.norm() < 1e-6 * max_mag,
+                "guard bin below the active band should be ~0, got {}",
+                bin.norm()
+            );
+        }
+
+        let total_energy: f32 = spec[1..n / 2].iter().map(|c| c.norm_sqr()).sum();
+        let in_band_energy: f32 = spec[first..=last]
+            .iter()
+            .map(|c: &Complex32| c.norm_sqr())
+            .sum();
+        assert!(
+            in_band_energy / total_energy > 0.999,
+            "active band should contain >99.9% of positive-frequency energy, got {}",
+            in_band_energy / total_energy
         );
     }
 }
