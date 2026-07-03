@@ -75,4 +75,4 @@ Single workflow at `.github/workflows/ci.yml` runs on push/PR to main:
 - Daemon hardware audio requires the `cpal-backend` feature; without it the daemon runs but moves no audio
 - WebSocket server lacks integration tests
 - Channel adaptation is EWMA-only; there is no ML model loading or inference (the `coppa-ml` model registry always falls back to EWMA)
-- `coppa-channel` HAS a Watterson model (`crates/coppa-channel/src/watterson.rs`, CCIR presets) — an earlier version of this bullet claimed otherwise. A 2026-07 audit found two correctness issues to fix before any benchmark use: (1) Doppler-spread convention is ~41% too fast vs ITU-R F.1487 (code treats spread as amplitude-spectrum sigma; the standard's spread is 2σ of the PSD); (2) per-realization power renormalization with noise measured on the faded signal forces constant per-block SNR, erasing the fading dynamics ARQ tests are meant to measure
+- `coppa-channel` models AWGN + a two-tap Watterson/ITU-R F.1487 HF channel (Rayleigh taps, Gaussian Doppler). The sinusoidal `fading()` helper is AGC-test-only.
