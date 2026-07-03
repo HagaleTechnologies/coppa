@@ -115,7 +115,10 @@ Two correctness defects were fixed on `feature/hotfix-fec-correctness` (technica
 bug present). "After" = `results/hotfix-2026-07/awgn.csv` (same seed and trial count, both
 fixes applied). Levels 6/7/9/10 (16-QAM/64-QAM, code rates 1/2 through 7/8) were chosen
 because the puncture bug's parity cost is proportional to code rate — these are where an
-effect should be most visible.
+effect should be most visible. The LDPC message clamp (this hotfix's other fix) is
+provably decision-neutral — clamping never flips a message's sign, and hard decisions
+depend only on sign — so it cannot change any frame's decode outcome; this paired
+comparison therefore isolates the interleaver fix's effect specifically.
 
 | Mode (level, rate) | FER≤10% before → after | FER≤1% before → after |
 |---|---|---|
@@ -147,11 +150,15 @@ counts at 12/21 dB) but the improvement did not cross a full 3 dB grid line on t
 threshold columns at this trial count/seed — a finer SNR step or more trials would likely
 resolve a threshold shift there too, but that is not claimed here.
 
-**Low-rate spot check (levels 1–3: BPSK 1/4, BPSK 1/2, QPSK 1/2):** every swept SNR point
-is bit-for-bit identical between before and after (same frame-error counts at every point),
-confirming no measurable impact at low code rate — exactly as predicted, since the puncture
-bug only ever cost parity bits and R≤1/2 codes have enough margin to absorb 1.8% fewer
-parity bits invisibly at this trial count.
+**Low-rate spot check (levels 1–3: BPSK 1/4, BPSK 1/2, QPSK 1/2):** levels 1–2 (BPSK 1/4,
+BPSK 1/2) are bit-for-bit identical at every swept SNR point. Level 3 (QPSK 1/2) is
+identical except for one borderline frame at 9 dB (399/400 → 400/400 frame errors) — a
+single marginal frame flipping from success to failure due to the interleaver fix
+re-permuting which coded bits land on which carriers (and therefore which noise
+realizations they see under the same RNG seed), not from any change in coding gain at
+this low code rate. This is consistent with the prediction that the puncture bug only
+ever cost parity bits and R≤1/2 codes have enough margin to absorb 1.8% fewer parity
+bits invisibly at this trial count.
 
 ## Current performance (all fixes applied)
 
