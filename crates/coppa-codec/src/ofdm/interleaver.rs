@@ -25,7 +25,10 @@ impl BlockInterleaver {
         for col in 0..self.cols {
             for row in 0..self.rows {
                 let idx = row * self.cols + col;
-                if output.len() < n {
+                // Pad cells (idx >= n) are skipped entirely: the scan emits exactly
+                // the n real bits. Emitting pads used to puncture the tail of the
+                // codeword (35 bits lost on 1944/44) — see the regression tests.
+                if idx < n {
                     output.push(grid[idx]);
                 }
             }
@@ -41,7 +44,7 @@ impl BlockInterleaver {
         for col in 0..self.cols {
             for row in 0..self.rows {
                 let idx = row * self.cols + col;
-                if i < n {
+                if idx < n && i < n {
                     grid[idx] = llrs[i];
                     i += 1;
                 }
@@ -56,20 +59,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_interleave_roundtrip() {
-        let interleaver = BlockInterleaver::new(1944, 44);
-        let bits: Vec<u8> = (0..1944).map(|i| (i % 2) as u8).collect();
-        let interleaved = interleaver.interleave(&bits);
-        let as_llr: Vec<f32> = interleaved
+    fn interleave_is_a_bijection_no_bit_dropped() {
+        // 1944 over 44 carriers has 36 pad cells mid-scan — the historic puncture bug.
+        // Use a pattern that is NOT periodic in 2 or 44 so no dropped index can hide.
+        let il = BlockInterleaver::new(1944, 44);
+        let bits: Vec<u8> = (0..1944u32)
+            .map(|i| ((i.wrapping_mul(2654435761)) >> 31) as u8 & 1)
+            .collect();
+        let llrs: Vec<f32> = bits
             .iter()
             .map(|&b| if b == 0 { 1.0 } else { -1.0 })
             .collect();
-        let deinterleaved = interleaver.deinterleave(&as_llr);
-        let recovered: Vec<u8> = deinterleaved
-            .iter()
-            .map(|&l| if l > 0.0 { 0 } else { 1 })
+        let rx = il.deinterleave(
+            &il.interleave(&bits)
+                .iter()
+                .map(|&b| if b == 0 { 1.0 } else { -1.0 })
+                .collect::<Vec<f32>>(),
+        );
+        for (i, (&a, &b)) in llrs.iter().zip(rx.iter()).enumerate() {
+            assert_eq!(a, b, "position {i} not preserved (puncture regression)");
+        }
+    }
+
+    #[test]
+    fn interleave_never_emits_pad_and_never_drops_tail() {
+        // Direct regression on the exact historic failure: the 35 indices ≡ 43 (mod 44)
+        // from 439..=1935 were dropped and 35 zeros emitted in their place.
+        let il = BlockInterleaver::new(1944, 44);
+        // Mark exactly the historically-dropped positions with 1s, everything else 0.
+        let mut bits = vec![0u8; 1944];
+        for m in 0..35 {
+            bits[439 + 44 * m] = 1;
+        }
+        let out = il.interleave(&bits);
+        let ones_out: usize = out.iter().map(|&b| b as usize).sum();
+        assert_eq!(
+            ones_out, 35,
+            "all 35 historically-punctured bits must be transmitted"
+        );
+    }
+
+    #[test]
+    fn interleave_exact_grid_sizes_unchanged() {
+        // hf_robust: 1944 over 36 carriers = 54x36 exact (no pads). Behavior must be
+        // identical before/after the fix — guard with a spot-check permutation property.
+        let il = BlockInterleaver::new(1944, 36);
+        let bits: Vec<u8> = (0..1944u32)
+            .map(|i| ((i * 40503) >> 13) as u8 & 1)
             .collect();
-        assert_eq!(bits, recovered);
+        let llrs: Vec<f32> = il
+            .interleave(&bits)
+            .iter()
+            .map(|&b| if b == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let rx = il.deinterleave(&llrs);
+        for (i, &v) in rx.iter().enumerate() {
+            let expect = if bits[i] == 0 { 1.0 } else { -1.0 };
+            assert_eq!(v, expect, "exact-grid case regressed at {i}");
+        }
     }
 
     #[test]
@@ -86,21 +133,5 @@ mod tests {
         let bits: Vec<u8> = (0..10).collect();
         let interleaved = interleaver.interleave(&bits);
         assert_eq!(interleaved.len(), 10);
-    }
-
-    #[test]
-    fn test_deinterleave_llr_roundtrip() {
-        let interleaver = BlockInterleaver::new(1944, 44);
-        let llrs: Vec<f32> = (0..1944).map(|i| i as f32 * 0.1).collect();
-        let bits: Vec<u8> = llrs.iter().map(|&l| if l >= 0.0 { 0 } else { 1 }).collect();
-        let interleaved = interleaver.interleave(&bits);
-        let interleaved_llrs: Vec<f32> = interleaved
-            .iter()
-            .map(|&b| if b == 0 { 1.0 } else { -1.0 })
-            .collect();
-        let deinterleaved = interleaver.deinterleave(&interleaved_llrs);
-        for (orig, recov) in llrs.iter().zip(deinterleaved.iter()) {
-            assert_eq!(orig.signum(), recov.signum(), "Sign mismatch");
-        }
     }
 }
