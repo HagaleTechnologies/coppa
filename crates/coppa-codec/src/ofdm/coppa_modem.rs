@@ -17,7 +17,7 @@ use super::frame::CoppaHeader;
 use super::header_fec;
 use super::papr_clip;
 use super::pilots::CoppaPilotPattern;
-use super::sync::{detect_coppa_sync, generate_coppa_preamble};
+use super::sync::{coppa_pn_sequence, detect_coppa_sync, generate_coppa_preamble};
 use super::CoppaProfile;
 use crate::traits::ChannelEstimator;
 
@@ -272,9 +272,15 @@ impl CoppaModem {
         // 1. Preamble
         let mut samples = generate_coppa_preamble(&self.profile, self.version);
 
-        // 2. Fine sync symbol
-        let fine_sync_carriers = vec![Complex32::new(1.0, 0.0); total_active];
-        samples.extend(self.build_ofdm_symbol(&fine_sync_carriers));
+        // 2. Probe symbol: version-keyed BPSK PN on ALL active carriers. Serves as a
+        // full-comb channel probe (consumed by the Phase-2 estimator; skipped by RX
+        // today) and replaces the unused all-ones symbol whose impulse-like PAPR
+        // (19.8 dB) was clipped into splatter.
+        let pn = coppa_pn_sequence(self.version);
+        let probe_carriers: Vec<Complex32> = (0..total_active)
+            .map(|i| Complex32::new(pn[i % pn.len()], 0.0))
+            .collect();
+        samples.extend(self.build_ofdm_symbol(&probe_carriers));
 
         // 3. FEC-encoded header as BPSK (same as modulate())
         let header_bits = header_fec::encode_header(header);
