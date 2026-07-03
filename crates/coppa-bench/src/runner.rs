@@ -43,18 +43,23 @@ fn run_trial(
     let clean = tx.transmit(&header, &payload);
     let frame_samples = clean.len();
 
+    // SNR convention: 3 kHz noise bandwidth, referenced to the CLEAN signal's
+    // power — a fade costs receive power instead of being renormalized away.
+    let p_clean = coppa_channel::mean_power(&clean);
+    let noise_seed = seed ^ 0x5555_5555_5555_5555;
+    let sr = crate::scenario::SAMPLE_RATE as f32;
     let faded = match channel {
         ChannelSpec::Awgn => {
-            coppa_channel::awgn_seeded(&clean, snr_db, seed ^ 0x5555_5555_5555_5555)
+            coppa_channel::awgn_ref_seeded(&clean, snr_db, p_clean, sr, noise_seed)
         }
         ChannelSpec::Watterson(preset) => {
             let faded = coppa_channel::watterson::watterson_preset(
                 &clean,
-                crate::scenario::SAMPLE_RATE as f32,
+                sr,
                 preset,
                 seed ^ 0x3333_3333_3333_3333,
             );
-            coppa_channel::awgn_seeded(&faded, snr_db, seed ^ 0x5555_5555_5555_5555)
+            coppa_channel::awgn_ref_seeded(&faded, snr_db, p_clean, sr, noise_seed)
         }
     };
 
@@ -186,6 +191,42 @@ mod tests {
             points[0].fer < 0.2,
             "hf_robust should decode at 30 dB AWGN (fer={})",
             points[0].fer
+        );
+    }
+
+    #[test]
+    fn snr_is_referenced_to_clean_power_not_faded_power() {
+        // With clean-reference SNR, a Watterson channel at a fixed nominal SNR must
+        // show HIGHER FER than AWGN at the same nominal SNR near threshold — fades
+        // now cost signal power. Level 2 at 15 dB(3kHz): AWGN decodes essentially
+        // always; Watterson Poor must lose a nontrivial fraction to fades.
+        //
+        // ADJUSTED from the brief's 6 dB: with the new 3 kHz-referenced convention
+        // (~+9 dB more noise at the same nominal dB vs the old full-Nyquist-band
+        // convention), 6 dB now sits far below the level-2 threshold — AWGN itself
+        // is already at fer=1, leaving no room to show fading's extra cost. Measured
+        // (40 trials, seed 0x5EED): 6 dB -> awgn fer=1, poor fer=0.975 (no
+        // discrimination, both at ceiling). 15 dB keeps AWGN clean (fer=0) while
+        // Watterson Poor still loses a large fraction to fades (fer=0.45), which is
+        // the regime this test is meant to exercise.
+        let mk = |channel| Scenario {
+            level: 2,
+            channel,
+            snr_db_points: vec![15.0],
+            trials: 40,
+            seed: 0x5EED,
+            profile_override: None,
+            cfo_hz: 0.0,
+        };
+        let awgn = run_scenario(&mk(ChannelSpec::Awgn));
+        let poor = run_scenario(&mk(ChannelSpec::Watterson(
+            coppa_channel::watterson::WattersonPreset::Poor,
+        )));
+        assert!(
+            poor[0].fer > awgn[0].fer + 0.05,
+            "fading must cost SNR: poor fer={} awgn fer={}",
+            poor[0].fer,
+            awgn[0].fer
         );
     }
 }
