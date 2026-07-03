@@ -4,7 +4,7 @@
 //! - Lifting factor Z = 81
 //! - 24-column base matrices
 //! - 1,944 coded bits for all rates
-//! - Offset min-sum belief propagation decoder with early termination
+//! - Normalized min-sum belief propagation decoder (alpha = 0.8) with early termination
 //!
 //! Supported code rates: 1/4, 1/3, 1/2, 2/3, 3/4, 7/8.
 pub mod codes;
