@@ -16,7 +16,12 @@ pub fn wilson_ci95(errors: usize, trials: usize) -> (f64, f64) {
     let center = (p + z2 / (2.0 * n)) / denom;
     let half = z * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt() / denom;
     let lo = (center - half).max(0.0);
-    // Round very small values to 0 to avoid floating point precision artifacts
+    // When errors == 0, center and half are mathematically identical (both reduce to
+    // z^2/(2n)/denom), but are computed via different arithmetic paths (a direct
+    // division for `center` vs. a sqrt-of-a-product for `half`), so they can differ by
+    // a ULP-level residual (~1e-18-1e-17) instead of cancelling to exactly 0. That
+    // residual is positive, so `.max(0.0)` above doesn't clamp it. Snap it to a clean
+    // 0.0 so a zero-error measurement reports an exact lower bound.
     let lo = if lo > 0.0 && lo < 1e-14 { 0.0 } else { lo };
     let hi = (center + half).min(1.0);
     (lo, hi)
