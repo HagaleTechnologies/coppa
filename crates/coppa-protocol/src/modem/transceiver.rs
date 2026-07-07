@@ -21,6 +21,14 @@ const CODED_BLOCK_LEN: usize = 1944;
 struct LevelComponents {
     codec: LdpcCodec,
     interleaver: BlockInterleaver,
+    /// `ConstellationMapper` is only `: Send`, not `: Send + Sync` (see its
+    /// definition in `coppa_codec::traits`), and `speed_level_components`
+    /// returns `Box<dyn ConstellationMapper>` (no `Sync`). As a result,
+    /// `CoppaTransceiver` — which embeds this cache — is intentionally
+    /// `!Sync`. That's fine for `Send`-only use (no `Mutex`/similar needed to
+    /// move it across a thread boundary), but a future caller cannot put a
+    /// bare `CoppaTransceiver` behind `Arc<CoppaTransceiver>` for shared
+    /// concurrent access without wrapping it in a `Mutex` (or similar) first.
     mapper: Box<dyn ConstellationMapper + Send>,
 }
 
@@ -114,6 +122,15 @@ impl CoppaTransceiver {
     /// The OFDM profile this transceiver was built for.
     pub fn profile(&self) -> &CoppaProfile {
         &self.profile
+    }
+
+    /// Data (non-pilot) carriers per OFDM symbol, as computed internally by the
+    /// wrapped `CoppaModem` (`pilots.num_data()`). Exposed so callers (e.g.
+    /// `StreamingReceiver`) can assert this coincides with their own,
+    /// independently-derived `profile.data_carriers` — see
+    /// `StreamingReceiver::new`'s `debug_assert_eq!`.
+    pub fn data_carriers_per_symbol(&self) -> usize {
+        self.modem.data_carriers_per_symbol()
     }
 
     pub fn transmit(&self, header: &CoppaHeader, payload: &[u8]) -> Vec<f32> {
