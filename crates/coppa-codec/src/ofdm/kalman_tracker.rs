@@ -129,8 +129,10 @@ use super::delay_domain::tau_basis;
 /// model doesn't represent well at a near-unity `a`.
 ///
 /// A direct, systematic empirical sweep of `a` ∈ {0.5, 0.6, 0.7, 0.8, 0.9, 0.95,
-/// 0.99} (`crates/coppa-bench/examples/task7_quick_check.rs`, a fast reduced-scale
-/// FER check, 150 trials/point, watterson-moderate level 2) after fixing the
+/// 0.99} (a fast reduced-scale FER check, 150 trials/point, watterson-moderate
+/// level 2 — run via a scratch harness since deleted per this project's
+/// scratch-file-cleanup convention; see `task7_gate.rs` for the full-scale,
+/// still-present 400-trials/point gate check) after fixing the
 /// overlapping-observation bug (see the module doc's "Why raw per-symbol pilots"
 /// section) found ALL of these values perform similarly — none clears the FER≤10%
 /// Wilson-bound anywhere in -6..30 dB at this trial count, with `a`∈{0.7,0.8}
@@ -389,6 +391,19 @@ impl TrackedTaps {
     /// `Var(H(k))` from the tracked covariance: the quadratic form `bᴴ·P·b` where
     /// `b[ℓ] = τ(k,ℓ)`. Real by construction (P is Hermitian); floored to avoid a
     /// literal zero downstream.
+    ///
+    /// # This is the tracker's posterior uncertainty about the CHANNEL TAP, not a
+    /// # receiver observation-noise estimate
+    ///
+    /// Unlike [`super::delay_domain::DelayDomainEstimator`]'s `noise_var` (a
+    /// per-observation residual variance from the least-squares fit — an actual
+    /// estimate of `σ_v²`, the noise on the received sample), `noise_at` is purely
+    /// a function of the Kalman covariance `P`: how confident the tracker is about
+    /// `h`, given everything it has observed so far. As the tracker accumulates
+    /// evidence within a frame, `P` (and hence this value) shrinks regardless of
+    /// the actual receiver noise floor. See [`Self::equalize`]'s doc and the
+    /// caller in `coppa_modem.rs`'s `demodulate_frame` for why this matters for
+    /// LLR calibration.
     pub fn noise_at(&self, carrier: usize) -> f32 {
         let l = self.taps.len();
         let b: Vec<Complex32> = (0..l).map(|ell| tau_basis(self.nc, carrier, ell)).collect();
@@ -402,9 +417,17 @@ impl TrackedTaps {
     }
 
     /// Zero-force equalize `carriers`, returning per-carrier `(x̂, effective noise)`
-    /// — same contract as [`super::delay_domain::DelayDomainEstimator::equalize`],
-    /// except the noise is per-carrier (from the tracked covariance) rather than a
-    /// single scalar divided by `|Ĥ|²`.
+    /// — same call signature as
+    /// [`super::delay_domain::DelayDomainEstimator::equalize`], except the noise
+    /// numerator is per-carrier (from the tracked covariance, [`Self::noise_at`])
+    /// rather than a single frame-wide scalar. NOTE: despite the matching
+    /// signature this is not necessarily the same *quantity* — see `noise_at`'s
+    /// doc; the returned noise here is `Var(Ĥ(k))/|Ĥ(k)|²` (posterior tap
+    /// uncertainty scaled by channel gain), which may understate the true
+    /// zero-forcing symbol-error variance (dominated by observation noise
+    /// `σ_v²/|Ĥ(k)|²`) once the tracker is confident. Flagged as a suspected
+    /// LLR-overconfidence source, not fixed — see the detailed discussion at this
+    /// function's call site in `coppa_modem.rs`'s `demodulate_frame`.
     pub fn equalize(&self, carriers: &[Complex32]) -> (Vec<Complex32>, Vec<f32>) {
         let mut xhat = Vec::with_capacity(carriers.len());
         let mut noise = Vec::with_capacity(carriers.len());

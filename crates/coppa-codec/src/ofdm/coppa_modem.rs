@@ -568,11 +568,39 @@ impl CoppaModem {
             let data = self.pilots.extract_data(&equalized, *global_sym);
             let data_indices = self.pilots.data_indices(*global_sym);
             // Unlike `DelayDomainEstimator::equalize`'s single frame-wide noise
-            // scalar, `TrackedTaps::noise_at` already yields a genuine per-carrier
-            // posterior variance from the tracked covariance — informed by exactly
-            // how many (and how reliable) observations fed each tap so far, so no
-            // separate pooling-count rescale is needed here (see `kalman_tracker`'s
-            // module doc and `TrackedTaps::noise_at`'s doc).
+            // scalar, `TrackedTaps::noise_at` yields a genuine per-carrier value
+            // from the tracked covariance, informed by exactly how many (and how
+            // reliable) observations fed each tap so far.
+            //
+            // # CAUTION: this is the estimator's posterior tap uncertainty, NOT a
+            // full observation-noise estimate — suspected LLR-overconfidence source
+            //
+            // `TrackedTaps::noise_at(k)` returns `Var(Ĥ(k))` (`bᴴ·P·b`, the Kalman
+            // covariance's quadratic form) — the tracker's own uncertainty about the
+            // channel TAP itself, not the receiver's observation noise `σ_v²` on the
+            // current sample `y`. `equalize` then divides this by `|Ĥ(k)|²`, i.e. the
+            // value fed downstream as "noise" is `Var(Ĥ(k))/|Ĥ(k)|²`. For zero-forcing
+            // (`x̂ = y/Ĥ`), the quantity the LDPC LLR calculation actually wants is
+            // dominated by the OBSERVATION noise term `σ_v²/|Ĥ(k)|²` propagated through
+            // the division — a different quantity from the estimator's posterior tap
+            // variance. (Contrast `DelayDomainEstimator::equalize`, a few lines up in
+            // this same comment: its `noise_var` field IS a per-observation residual
+            // variance from the fit, i.e. closer in spirit to `σ_v²` — `TrackedTaps`
+            // has no equivalent field; `P` is purely the tracker's state covariance.)
+            //
+            // Once the tracker has run for a while on a stable channel, `P` (and hence
+            // `Var(Ĥ(k))`) shrinks well below the true observation noise floor, so this
+            // feeds the LDPC decoder LLRs that are systematically too confident — a
+            // classic LLR-overconfidence bug, and a real suspect (not yet confirmed) for
+            // part of why Task 7's bench gate was not met (see
+            // `.superpowers/sdd/p2-task-7-report.md`). This was flagged during a
+            // post-Task-7 doc-cleanup review, not fixed here — fixing it is a real
+            // design question (whether/how to combine the tracked posterior with a
+            // separately estimated observation-noise term, and whether that needs its
+            // own Kalman state) out of scope for a documentation-only change. Task 5
+            // (turbo re-estimation, which builds on this same equalize/noise interface)
+            // should investigate this before assuming `noise_at`'s output is
+            // well-calibrated for LLR purposes.
             let carrier_noise: Vec<f32> = data_indices
                 .iter()
                 .map(|&idx| noise_full.get(idx).copied().unwrap_or(1e6))
@@ -688,11 +716,22 @@ impl CoppaModem {
     }
 
     /// Fit a [`DelayDomainEstimator`] from pooled pilot observations and
-    /// zero-force equalize `carriers` against it. Shared by both the payload
-    /// estimation pass in `demodulate_frame` and the header estimation pass in
-    /// `demodulate_header_bits` (previously each ran its own separate
-    /// `LinearInterpolationEstimator`/`mmse_equalize` pass; both now go through the
-    /// same delay-domain model — see Task 1 of the Phase 2 receiver-harvest plan).
+    /// zero-force equalize `carriers` against it.
+    ///
+    /// # No longer shared with the payload pass (post-Task-7)
+    ///
+    /// This was originally shared by both the payload estimation pass in
+    /// `demodulate_frame` and the header estimation pass in
+    /// `demodulate_header_bits` (Task 1: previously each ran its own separate
+    /// `LinearInterpolationEstimator`/`mmse_equalize` pass; both were unified onto
+    /// this same delay-domain model). That is now stale: since Task 7,
+    /// `demodulate_frame`'s payload pass builds a [`KalmanLagSmoother`] and calls
+    /// `TrackedTaps::equalize` directly (see its call site), not this function. The
+    /// only remaining call site of `estimate_and_equalize` is
+    /// `demodulate_header_bits`'s `KALMAN_HEADER_ENABLED == false` fallback branch —
+    /// i.e. this is now the header's non-Kalman fallback path only, not a
+    /// payload/header-shared path. (Verified by grepping for
+    /// `estimate_and_equalize(` — it has exactly one call site.)
     ///
     /// `coarse_delay` (from [`Self::probe_calibration`]) is removed from both the
     /// pooled observations and `carriers` before fitting/equalizing (a per-carrier
@@ -740,6 +779,19 @@ impl CoppaModem {
     /// suggested follow-ups (e.g. a smoothed/Kalman-style per-window delay estimate
     /// instead of a hard re-derivation, or gating on a proper per-window confidence
     /// measure beyond the coherence check that was tried).
+    ///
+    /// Note this caveat is not specific to this fallback function: the live
+    /// Task 7 Kalman path (`demodulate_frame`'s payload pass and
+    /// `demodulate_header_bits`'s `KALMAN_HEADER_ENABLED == true` branch) reuses
+    /// the exact same single frame-global `coarse_delay`/derotation (see
+    /// `probe_calibration` and the `derot`/`coarse_delay_rotation` calls in both
+    /// call sites) — it does not re-derive or track the bulk-delay reference
+    /// per-window either, so the same monotonic within-frame drift risk applies
+    /// there too. A reader should not assume the Kalman tracker's per-tap AR(1)
+    /// state solves this; it tracks tap *amplitude*, not the coarse-delay
+    /// reference, which is still fixed for the whole frame (see Task 7's report,
+    /// "Recommendation" section, for the hypothesis that this is in fact the same
+    /// underlying limitation surfacing again).
     fn estimate_and_equalize(
         &self,
         carriers: &[Complex32],
