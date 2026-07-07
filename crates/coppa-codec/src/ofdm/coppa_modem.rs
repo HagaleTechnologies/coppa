@@ -15,6 +15,7 @@ use coppa_dsp::fft::FftProcessor;
 use super::delay_domain::DelayDomainEstimator;
 use super::frame::CoppaHeader;
 use super::header_fec;
+use super::kalman_tracker::{self, KalmanLagSmoother};
 use super::papr_clip;
 use super::pilots::CoppaPilotPattern;
 use super::sync::{coppa_pn_sequence, generate_coppa_preamble};
@@ -97,6 +98,12 @@ pub const SPEED_LEVELS: [SpeedLevel; 9] = [
     },
 ];
 
+/// Whether `demodulate_header_bits` uses the Task 7 Kalman/lag-2-smoother tracker
+/// (`true`) or Task 1's original independent per-window re-fit (`false`). See
+/// `demodulate_header_bits`'s doc for why this is an explicit, separately-measured
+/// toggle rather than assumed safe from the payload pass's result.
+const KALMAN_HEADER_ENABLED: bool = true;
+
 /// Raised-cosine inter-symbol taper width in samples (0.5 ms @ 48 kHz).
 const RC_OVERLAP: usize = 24;
 /// TX peak normalization target (fraction of full scale).
@@ -136,6 +143,17 @@ pub struct CoppaModem {
     /// `measure_bulk_bias`'s doc for why this must be a fixed, profile-specific
     /// constant rather than something re-derived per received frame.
     calibrated_bias: f32,
+}
+
+/// One frame's probe-derived delay-domain calibration: the fixed bulk-delay bias,
+/// the chosen tap-model order, and the probe's own tap estimate + residual noise
+/// variance — the latter two seed [`KalmanLagSmoother`] (see
+/// `CoppaModem::probe_calibration`'s doc).
+struct ProbeCalibration {
+    coarse_delay: f32,
+    order: usize,
+    taps: Vec<Complex32>,
+    noise_var: f32,
 }
 
 impl CoppaModem {
@@ -455,7 +473,8 @@ impl CoppaModem {
         // (the header pass, in `demodulate_header_bits`, re-derives the same value
         // itself since `demodulate_header` is also a standalone public entry point
         // used by `StreamingReceiver` without this frame-level context).
-        let (coarse_delay, probe_order) = self.probe_calibration(samples, data_start);
+        let calib = self.probe_calibration(samples, data_start);
+        let coarse_delay = calib.coarse_delay;
 
         // 2. Protected header (2D-pooled estimation, hard-decision BPSK) -> FEC decode.
         let num_header_syms = header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(data_per_sym);
@@ -492,29 +511,71 @@ impl CoppaModem {
             sym_carriers.push((global_sym, carriers));
         }
 
-        // Pass 2: 2D estimation — for each symbol, pool pilots over a SLIDING WINDOW of
-        // neighbouring symbols (even∪odd → ~2x frequency comb density, plus noise averaging).
-        // The window is kept small (±EST_WINDOW symbols ≈ 105 ms) so it stays inside the channel
-        // coherence time even on the worst HF case (Poor, 1 Hz Doppler ≈ 160 ms) — pooling the
-        // WHOLE frame instead blurs the time-varying channel and hurts Poor.
-        const EST_WINDOW: usize = 2;
-        let n_syms = sym_carriers.len();
+        // Pass 2: Kalman-tracked 2D estimation (Task 7) — instead of independently
+        // re-fitting the delay-domain model from each ±EST_WINDOW-symbol POOLED
+        // window (Task 1's approach, which either reused one frame-stale fit or let
+        // a single bad window corrupt the LDPC-facing noise variance — see Task 1's
+        // report), a single `KalmanLagSmoother` tracks the taps ACROSS symbols with
+        // an AR(1) process prior, and each symbol's FINAL estimate is the lag-2
+        // (RTS) smoothed state — see `kalman_tracker`'s module doc.
+        //
+        // # Why raw per-symbol pilots, not the ±EST_WINDOW pooled window
+        //
+        // An earlier version of this fed each Kalman step the SAME ±2-symbol
+        // POOLED window Task 1's per-window refit used. That is WRONG for a
+        // recursive Bayesian filter: consecutive steps' pooled windows overlap by
+        // up to 4 of 5 symbols, so the same raw pilot samples get re-submitted as
+        // "new" evidence to up to 5 consecutive `advance()` calls. With `a` close
+        // to 1 (barely forgetting), the filter has no way to know this evidence is
+        // redundant, and its posterior confidence compounds far beyond what the
+        // genuinely independent information content justifies — measured directly
+        // (`estimator_diagnosis` with temporary per-window debug prints, Task 7
+        // investigation): `noise_at()` came out ~100-100,000x smaller than Task 1's
+        // comparable per-window residual, and the tracked `h_at(k)` DIVERGED
+        // (grew unboundedly across a frame) instead of tracking the true channel,
+        // while a controlled synthetic check (independent, non-overlapping
+        // observations of a genuinely static channel) confirmed the core
+        // predict/update/RTS-smooth recursion itself converges correctly — the bug
+        // was specifically the overlapping-observation over-counting, not the
+        // recursion math. Feeding each step the RAW single-symbol pilot set (no
+        // pre-pooling) makes consecutive steps' observations genuinely independent
+        // (a fresh symbol's worth of pilots each time), so the Kalman recursion's
+        // own temporal accumulation (governed by `a`/`Q`) is the ONLY source of
+        // cross-symbol pooling — not stacked on top of a second, overlapping
+        // pooling layer.
+        let derot = coarse_delay_rotation(self.profile.total_active_carriers(), coarse_delay);
+        let windows: Vec<Vec<(usize, Complex32, f32)>> = per_symbol_pilots
+            .iter()
+            .map(|sym_pilots| {
+                sym_pilots
+                    .iter()
+                    .map(|&(idx, h)| (idx, h * derot(idx), 1.0))
+                    .collect()
+            })
+            .collect();
+        let mut tracker = self.build_tracker(&calib);
+        for w in &windows {
+            tracker.advance(w);
+        }
         for (i, (global_sym, carriers)) in sym_carriers.iter().enumerate() {
-            let lo = i.saturating_sub(EST_WINDOW);
-            let hi = (i + EST_WINDOW + 1).min(n_syms);
-            let combined = pool_pilots(&per_symbol_pilots[lo..hi]);
-            let pool_scale = mean_weight(&combined);
-            let (equalized, noise_full) =
-                self.estimate_and_equalize(carriers, &combined, probe_order, coarse_delay);
+            let tt = tracker.smoothed(i);
+            let rotated_carriers: Vec<Complex32> = carriers
+                .iter()
+                .enumerate()
+                .map(|(k, &y)| y * derot(k))
+                .collect();
+            let (equalized, noise_full) = tt.equalize(&rotated_carriers);
             let data = self.pilots.extract_data(&equalized, *global_sym);
             let data_indices = self.pilots.data_indices(*global_sym);
-            // `noise_full` is the delay-domain fit's residual σ² *per pooled
-            // observation*; scale by the window's mean pooling count to get the
-            // effective noise for the single, unpooled data carrier being decoded
-            // here (see `DelayDomainEstimator::equalize`'s doc).
+            // Unlike `DelayDomainEstimator::equalize`'s single frame-wide noise
+            // scalar, `TrackedTaps::noise_at` already yields a genuine per-carrier
+            // posterior variance from the tracked covariance — informed by exactly
+            // how many (and how reliable) observations fed each tap so far, so no
+            // separate pooling-count rescale is needed here (see `kalman_tracker`'s
+            // module doc and `TrackedTaps::noise_at`'s doc).
             let carrier_noise: Vec<f32> = data_indices
                 .iter()
-                .map(|&idx| noise_full.get(idx).copied().unwrap_or(1e6) * pool_scale)
+                .map(|&idx| noise_full.get(idx).copied().unwrap_or(1e6))
                 .collect();
             payload_symbols.extend_from_slice(&data);
             noise_variances.extend_from_slice(&carrier_noise);
@@ -536,10 +597,9 @@ impl CoppaModem {
         self.pilots.extract_pilots(carriers, symbol_num)
     }
 
-    /// Calibrate the delay-domain model order from the full-comb PROBE symbol — the
+    /// Calibrate the delay-domain model from the full-comb PROBE symbol — the
     /// version-keyed BPSK PN sequence transmitted on every active carrier right
-    /// before the header (see `modulate_mapped` step 2). Returns `(coarse_delay,
-    /// order)`:
+    /// before the header (see `modulate_mapped` step 2).
     ///
     /// - `coarse_delay` is always `self.calibrated_bias` (see `measure_bulk_bias`'s
     ///   doc for why this is a fixed, once-measured constant rather than something
@@ -547,17 +607,29 @@ impl CoppaModem {
     /// - `order` (2..=8 taps): one LS fit against `l=8` on the probe (after removing
     ///   `calibrated_bias`), keeping only the taps that clear the noise floor — see
     ///   [`DelayDomainEstimator::select_order`].
+    /// - `taps`/`noise_var`: the probe re-fit AT that chosen order — seeds
+    ///   [`kalman_tracker::KalmanLagSmoother`]'s initial state (`taps`) and supplies
+    ///   its frame-global observation-noise floor (`noise_var`). See
+    ///   `KalmanLagSmoother::new`'s doc for why this is deliberately a single
+    ///   frame-wide value rather than something re-derived per estimation window
+    ///   (Task 1's rejected per-window noise re-estimation is exactly the failure
+    ///   mode that choice avoids).
     ///
-    /// Falls back to `(calibrated_bias, 6)` if the probe symbol isn't fully within
-    /// `samples` (e.g. a truncated capture) rather than failing outright — the
-    /// payload/header passes still run, just with a possibly-suboptimal (not
-    /// incorrect) model order.
-    fn probe_calibration(&self, samples: &[f32], data_start: usize) -> (f32, usize) {
+    /// Falls back to a generic single-tap/order-6 calibration if the probe symbol
+    /// isn't fully within `samples` (e.g. a truncated capture) rather than failing
+    /// outright — the payload/header passes still run, just with a
+    /// possibly-suboptimal (not incorrect) model.
+    fn probe_calibration(&self, samples: &[f32], data_start: usize) -> ProbeCalibration {
         let symbol_len = self.profile.fft_size + self.profile.cp_samples;
         let nc = self.profile.total_active_carriers();
         let probe_start = data_start.saturating_sub(symbol_len);
         if probe_start + symbol_len > samples.len() {
-            return (self.calibrated_bias, 6);
+            return ProbeCalibration {
+                coarse_delay: self.calibrated_bias,
+                order: 6,
+                taps: vec![Complex32::new(1.0, 0.0)],
+                noise_var: 1.0,
+            };
         }
         let carriers = self.demod_ofdm_symbol(&samples[probe_start..probe_start + symbol_len]);
         let pn = coppa_pn_sequence(self.version);
@@ -575,7 +647,44 @@ impl CoppaModem {
             .map(|(k, &h)| h * derot(k))
             .collect();
         let order = DelayDomainEstimator::select_order(nc, &derotated);
-        (self.calibrated_bias, order)
+        let obs: Vec<(usize, Complex32, f32)> = derotated
+            .iter()
+            .enumerate()
+            .map(|(k, &h)| (k, h, 1.0))
+            .collect();
+        let est = DelayDomainEstimator::fit(nc, order, &obs);
+        ProbeCalibration {
+            coarse_delay: self.calibrated_bias,
+            order,
+            taps: est.taps().to_vec(),
+            noise_var: est.noise_var(),
+        }
+    }
+
+    /// AR(1) one-step correlation coefficient for this profile's OFDM symbol period
+    /// (`T_s = (fft_size+cp_samples)/sample_rate`) — see
+    /// [`kalman_tracker::ar1_coefficient`]'s doc for the full derivation.
+    fn kalman_ar1(&self) -> f32 {
+        let symbol_len = self.profile.fft_size + self.profile.cp_samples;
+        let t_s = symbol_len as f32 / self.profile.sample_rate as f32;
+        kalman_tracker::ar1_coefficient(kalman_tracker::DEFAULT_SIGMA_D_HZ, t_s)
+    }
+
+    /// Build a fresh [`KalmanLagSmoother`] seeded from this frame's probe
+    /// calibration — used independently by the header pass
+    /// (`demodulate_header_bits`) and the payload pass (`demodulate_frame`), each
+    /// starting its own tracker from the same probe (see their call sites' docs for
+    /// why these are two independent trackers rather than one shared across both
+    /// passes).
+    fn build_tracker(&self, calib: &ProbeCalibration) -> KalmanLagSmoother {
+        let nc = self.profile.total_active_carriers();
+        KalmanLagSmoother::new(
+            nc,
+            calib.order,
+            self.kalman_ar1(),
+            calib.noise_var,
+            &calib.taps,
+        )
     }
 
     /// Fit a [`DelayDomainEstimator`] from pooled pilot observations and
@@ -686,6 +795,21 @@ impl CoppaModem {
     /// header fragile on fast-fading (Poor) channels; pooling pilots over a small symbol
     /// window (the header spans ~105 ms < the Poor coherence time) recovers it. Returns
     /// `None` if the samples are too short for `num_header_syms` symbols.
+    ///
+    /// # Kalman tracker on the header pass (Task 7)
+    ///
+    /// Whether the header pass uses the [`KalmanLagSmoother`] (like the payload
+    /// pass) or Task 1's original per-window independent re-fit is controlled by
+    /// [`KALMAN_HEADER_ENABLED`] — deliberately kept as an explicit, documented
+    /// toggle rather than folded silently into one path, because Task 1's report
+    /// found the header uniquely sensitive to changes in this estimation step
+    /// (enabling per-window adaptive re-estimation for the header alone tripled its
+    /// frame-drop rate, 23/200 → 70/200, even though the same change measurably
+    /// helped the payload). The Kalman/smoother approach is a different mechanism
+    /// than what Task 1 tried (a persistent Bayesian prior across steps, not an
+    /// independent re-derivation per window), so it was re-measured on the header
+    /// specifically rather than assumed safe — see the Task 7 report for the actual
+    /// A/B bench numbers and which setting shipped.
     fn demodulate_header_bits(
         &self,
         samples: &[f32],
@@ -693,7 +817,9 @@ impl CoppaModem {
         num_header_syms: usize,
     ) -> Option<Vec<u8>> {
         let symbol_len = self.profile.fft_size + self.profile.cp_samples;
-        let (coarse_delay, l) = self.probe_calibration(samples, data_start);
+        let calib = self.probe_calibration(samples, data_start);
+        let coarse_delay = calib.coarse_delay;
+        let l = calib.order;
 
         // Pass 1: collect each header symbol's carriers + pilot observations.
         let mut sym_carriers = Vec::with_capacity(num_header_syms);
@@ -709,20 +835,60 @@ impl CoppaModem {
         }
 
         // Pass 2: pool pilots over a +/-EST_WINDOW symbol window (denser comb + noise
-        // averaging), delay-domain fit + zero-force equalize, and BPSK hard-slice.
+        // averaging), then either Kalman-track (Task 7) or independently re-fit
+        // (Task 1) the delay-domain model per window, zero-force equalize, and BPSK
+        // hard-slice.
         const EST_WINDOW: usize = 2;
         let n = sym_carriers.len();
         let mut bits = Vec::with_capacity(header_fec::PROTECTED_HEADER_CODED_BITS);
-        for (i, carriers) in sym_carriers.iter().enumerate() {
-            let lo = i.saturating_sub(EST_WINDOW);
-            let hi = (i + EST_WINDOW + 1).min(n);
-            let combined = pool_pilots(&per_symbol_pilots[lo..hi]);
-            let (equalized, _noise) =
-                self.estimate_and_equalize(carriers, &combined, l, coarse_delay);
-            let data = self.pilots.extract_data(&equalized, i);
-            for &val in &data {
-                if bits.len() < header_fec::PROTECTED_HEADER_CODED_BITS {
-                    bits.push(if val.re >= 0.0 { 0u8 } else { 1u8 });
+
+        if KALMAN_HEADER_ENABLED {
+            let nc = self.profile.total_active_carriers();
+            let derot = coarse_delay_rotation(nc, coarse_delay);
+            // Raw per-symbol pilots (not the ±EST_WINDOW pool) — see the payload
+            // pass's doc comment above for why: feeding the Kalman tracker
+            // overlapping pooled windows double-counts evidence and causes runaway
+            // overconfidence (measured directly during Task 7's investigation).
+            let windows: Vec<Vec<(usize, Complex32, f32)>> = per_symbol_pilots
+                .iter()
+                .map(|sym_pilots| {
+                    sym_pilots
+                        .iter()
+                        .map(|&(idx, h)| (idx, h * derot(idx), 1.0))
+                        .collect()
+                })
+                .collect();
+            let mut tracker = self.build_tracker(&calib);
+            for w in &windows {
+                tracker.advance(w);
+            }
+            for (i, carriers) in sym_carriers.iter().enumerate() {
+                let tt = tracker.smoothed(i);
+                let rotated: Vec<Complex32> = carriers
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &y)| y * derot(k))
+                    .collect();
+                let (equalized, _noise) = tt.equalize(&rotated);
+                let data = self.pilots.extract_data(&equalized, i);
+                for &val in &data {
+                    if bits.len() < header_fec::PROTECTED_HEADER_CODED_BITS {
+                        bits.push(if val.re >= 0.0 { 0u8 } else { 1u8 });
+                    }
+                }
+            }
+        } else {
+            for (i, carriers) in sym_carriers.iter().enumerate() {
+                let lo = i.saturating_sub(EST_WINDOW);
+                let hi = (i + EST_WINDOW + 1).min(n);
+                let combined = pool_pilots(&per_symbol_pilots[lo..hi]);
+                let (equalized, _noise) =
+                    self.estimate_and_equalize(carriers, &combined, l, coarse_delay);
+                let data = self.pilots.extract_data(&equalized, i);
+                for &val in &data {
+                    if bits.len() < header_fec::PROTECTED_HEADER_CODED_BITS {
+                        bits.push(if val.re >= 0.0 { 0u8 } else { 1u8 });
+                    }
                 }
             }
         }
@@ -808,17 +974,6 @@ fn pool_pilots(per_symbol: &[Vec<(usize, Complex32)>]) -> Vec<(usize, Complex32,
     acc.into_iter()
         .map(|(idx, (sum, count))| (idx, sum * (1.0 / count as f32), count as f32))
         .collect()
-}
-
-/// Mean pooling weight across a pooled observation set — used to rescale the
-/// delay-domain fit's per-*pooled*-observation noise variance back up to the
-/// effective noise on a single, unpooled data carrier (see
-/// `DelayDomainEstimator::equalize`'s doc and its call site in `demodulate_frame`).
-fn mean_weight(pooled: &[(usize, Complex32, f32)]) -> f32 {
-    if pooled.is_empty() {
-        return 1.0;
-    }
-    pooled.iter().map(|&(_, _, w)| w).sum::<f32>() / pooled.len() as f32
 }
 
 #[cfg(test)]
