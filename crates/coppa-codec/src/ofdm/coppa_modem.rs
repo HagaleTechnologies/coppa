@@ -1,9 +1,8 @@
 //! Coppa modem: end-to-end OFDM modulate/demodulate pipeline.
 //!
 //! Assembles preamble + header + payload into audio samples, and demodulates
-//! audio back into frames. `modulate` is a simple raw-BPSK mapping (kept for
-//! its own tests); `modulate_mapped`/`demodulate_frame` is the generic
-//! constellation-mapped path used with FEC coding.
+//! audio back into frames via `modulate_mapped`/`demodulate_frame`, the
+//! generic constellation-mapped path used with FEC coding.
 //!
 //! This is the canonical/reference OFDM path used by the engine and
 //! `CoppaTransceiver`. See the [`crate::ofdm`] module docs for how it relates
@@ -217,82 +216,6 @@ impl CoppaModem {
         let total_active = self.profile.total_active_carriers();
         let first = self.profile.first_active_bin();
         (0..total_active).map(|i| freq[first + i]).collect()
-    }
-
-    /// Modulate a frame (header + payload) into audio samples.
-    ///
-    /// Structure: [preamble (2 sync symbols)] [fine sync symbol] [header symbols] [payload symbols]
-    /// All symbols use BPSK mapping: bit 0 -> +1, bit 1 -> -1.
-    pub fn modulate(&self, header: &CoppaHeader, payload: &[u8]) -> Vec<f32> {
-        let total_active = self.profile.total_active_carriers();
-        let data_per_sym = self.data_carriers_per_symbol();
-
-        // 1. Generate preamble (2 Schmidl-Cox sync symbols)
-        let mut samples = generate_coppa_preamble(&self.profile, self.version);
-
-        // 2. Generate fine sync symbol: known BPSK +1 on all active carriers
-        let fine_sync_carriers = vec![Complex32::new(1.0, 0.0); total_active];
-        samples.extend(self.build_ofdm_symbol(&fine_sync_carriers));
-
-        // 3. FEC-encode header (Golay+CRC+interleave) and modulate as BPSK OFDM symbols
-        let header_bits = header_fec::encode_header(header);
-        let header_bpsk: Vec<Complex32> = header_bits
-            .iter()
-            .map(|&b| {
-                if b == 0 {
-                    Complex32::new(1.0, 0.0)
-                } else {
-                    Complex32::new(-1.0, 0.0)
-                }
-            })
-            .collect();
-
-        let num_header_syms = header_bpsk.len().div_ceil(data_per_sym);
-        for sym_idx in 0..num_header_syms {
-            let start = sym_idx * data_per_sym;
-            let end = (start + data_per_sym).min(header_bpsk.len());
-            let mut data = header_bpsk[start..end].to_vec();
-            // Pad remaining data carriers with +1
-            data.resize(data_per_sym, Complex32::new(1.0, 0.0));
-            // Insert pilots and build symbol
-            // Symbol numbering for pilot alternation: header symbols start at 0
-            let carriers = self.pilots.insert_pilots(&data, sym_idx);
-            samples.extend(self.build_ofdm_symbol(&carriers));
-        }
-
-        // 4. Encode payload as BPSK (MSB first)
-        let mut payload_bits = Vec::with_capacity(payload.len() * 8);
-        for &byte in payload {
-            for shift in (0..8).rev() {
-                payload_bits.push((byte >> shift) & 1);
-            }
-        }
-
-        let payload_bpsk: Vec<Complex32> = payload_bits
-            .iter()
-            .map(|&b| {
-                if b == 0 {
-                    Complex32::new(1.0, 0.0)
-                } else {
-                    Complex32::new(-1.0, 0.0)
-                }
-            })
-            .collect();
-
-        let num_payload_syms = payload_bpsk.len().div_ceil(data_per_sym);
-        for sym_idx in 0..num_payload_syms {
-            let start = sym_idx * data_per_sym;
-            let end = (start + data_per_sym).min(payload_bpsk.len());
-            let mut data = payload_bpsk[start..end].to_vec();
-            data.resize(data_per_sym, Complex32::new(1.0, 0.0));
-            // Continue symbol numbering from header
-            let global_sym = num_header_syms + sym_idx;
-            let carriers = self.pilots.insert_pilots(&data, global_sym);
-            samples.extend(self.build_ofdm_symbol(&carriers));
-        }
-
-        // 5. Apply PAPR clipping (BPSK-only path; matches SPEED_LEVELS levels 1-2)
-        papr_clip(&samples, 6.0)
     }
 
     /// Modulate a frame with pre-mapped Complex32 payload symbols.
@@ -729,36 +652,6 @@ mod tests {
             );
             let (rx_header, _, _) = soft.unwrap();
             assert_eq!(rx_header.speed_level, speed_level);
-        }
-    }
-
-    #[test]
-    fn test_coppa_modem_modulate_produces_audio() {
-        let profile = CoppaProfile::hf_standard();
-        let modem = CoppaModem::new(profile, 1);
-
-        let header = CoppaHeader {
-            version: 1,
-            phy_mode: 0,
-            frame_type: CoppaFrameType::Data,
-            bandwidth: 1,
-            fec_type: 0,
-            speed_level: 2,
-            seq_num: 0,
-            payload_len: 100,
-        };
-        let payload = vec![0xABu8; 100];
-
-        let samples = modem.modulate(&header, &payload);
-
-        assert!(!samples.is_empty(), "Output should be non-empty");
-        assert!(
-            samples.len() > 5000,
-            "Output should be longer than 5000 samples, got {}",
-            samples.len()
-        );
-        for (i, &s) in samples.iter().enumerate() {
-            assert!(s.is_finite(), "Sample {} should be finite, got {}", i, s);
         }
     }
 
