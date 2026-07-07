@@ -532,6 +532,15 @@ impl EventLoop {
         // bookkeeping the old DECODE_WINDOW/SLIDE_STEP/MAX_STREAM_BUFFER block used
         // to do by hand here; this just dispatches whatever frames complete as a
         // result of this chunk.
+        //
+        // Whichever call completes a candidate runs the full demod/FEC pass
+        // synchronously (see `StreamingReceiver::push_samples`'s doc) — since we're
+        // called with no `spawn_blocking`, that stalls this async event loop for
+        // the frame's decode time (~tens of ms). Accepted for now: input audio is
+        // buffered in `audio_in`'s ring during the stall, and its overflow counter
+        // (`poll_audio_input`) would surface it if that ring ever actually
+        // overflowed. Moving the decode to a worker thread would be the fix if this
+        // ever becomes a real problem.
         for frame in self.engine.push_samples(samples) {
             match frame.message {
                 Ok(message) => {
