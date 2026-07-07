@@ -24,7 +24,6 @@
 use coppa_codec::ofdm::coppa_modem::CoppaModem;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_codec::ofdm::interleaver::BlockInterleaver;
-use coppa_codec::traits::FecCodec;
 use coppa_protocol::fec::ldpc::LdpcCodec;
 use coppa_protocol::fec::scrambler::scramble;
 use coppa_protocol::modem::speed_levels::{speed_level_components, speed_level_entry};

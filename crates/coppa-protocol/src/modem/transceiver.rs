@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::fec::ldpc::LdpcCodec;
 use crate::fec::scrambler::scramble;
 use crate::modem::speed_levels::speed_level_components;
@@ -5,6 +7,22 @@ use coppa_codec::ofdm::coppa_modem::{CoppaModem, SPEED_LEVELS};
 use coppa_codec::ofdm::frame::CoppaHeader;
 use coppa_codec::ofdm::interleaver::BlockInterleaver;
 use coppa_codec::ofdm::CoppaProfile;
+use coppa_codec::traits::ConstellationMapper;
+
+/// LDPC coded block length (Z=81, 24 base columns) — constant for all code rates.
+const CODED_BLOCK_LEN: usize = 1944;
+
+/// Cached per-speed-level components: building the LDPC codec, interleaver, and
+/// constellation mapper is ~0.105 ms and ~4801 allocs (~525 KB) per call — expensive
+/// enough that doing it on every single `transmit`/`receive` (as the pre-Task-7 code
+/// did) shows up directly in the per-frame decode budget. All of these depend only
+/// on the speed level + this transceiver's fixed profile, so they're built once, in
+/// `CoppaTransceiver::new`, for all 9 levels.
+struct LevelComponents {
+    codec: LdpcCodec,
+    interleaver: BlockInterleaver,
+    mapper: Box<dyn ConstellationMapper + Send>,
+}
 
 pub struct CoppaTransceiver {
     modem: CoppaModem,
@@ -20,6 +38,9 @@ pub struct CoppaTransceiver {
     /// attenuation at 100 Hz and 4 kHz, flat passband at 500 Hz), so no new
     /// tap-count derivation is needed for this filter specifically.
     rx_bpf: Option<coppa_dsp::fir::Fir>,
+    /// Per-speed-level cached codec/interleaver/mapper, built eagerly for all 9
+    /// levels in `new` (see `LevelComponents`'s doc).
+    codecs: HashMap<u8, LevelComponents>,
 }
 
 #[derive(Debug)]
@@ -61,22 +82,48 @@ impl CoppaTransceiver {
             ))
         });
         let modem = CoppaModem::new(profile.clone(), version);
+
+        // Eagerly build every speed level's codec/interleaver/mapper (see
+        // `LevelComponents`'s doc). Reserved/invalid levels (e.g. 8) simply have no
+        // entry in the map; `transmit`/`receive` treat a missing entry the same way
+        // the old per-call `speed_level_components` lookup treated an `Err`.
+        let mut codecs = HashMap::with_capacity(SPEED_LEVELS.len());
+        for sl in SPEED_LEVELS.iter() {
+            if let Ok((mapper, code_rate)) = speed_level_components(sl.level) {
+                let codec = LdpcCodec::new(code_rate);
+                let interleaver = BlockInterleaver::new(CODED_BLOCK_LEN, profile.data_carriers);
+                codecs.insert(
+                    sl.level,
+                    LevelComponents {
+                        codec,
+                        interleaver,
+                        mapper,
+                    },
+                );
+            }
+        }
+
         Self {
             modem,
             profile,
             rx_bpf,
+            codecs,
         }
     }
 
-    pub fn transmit(&self, header: &CoppaHeader, payload: &[u8]) -> Vec<f32> {
-        use coppa_codec::traits::FecCodec;
+    /// The OFDM profile this transceiver was built for.
+    pub fn profile(&self) -> &CoppaProfile {
+        &self.profile
+    }
 
-        let (mapper, code_rate) =
-            speed_level_components(header.speed_level).expect("invalid speed level in header");
+    pub fn transmit(&self, header: &CoppaHeader, payload: &[u8]) -> Vec<f32> {
+        let comp = self
+            .codecs
+            .get(&header.speed_level)
+            .expect("invalid speed level in header");
 
         // 1. LDPC encode
-        let mut codec = LdpcCodec::new(code_rate);
-        let info_bits = code_rate.info_bits();
+        let info_bits = comp.codec.code().info_bits();
         let mut payload_bits = Vec::with_capacity(info_bits);
         for &byte in payload {
             for shift in (0..8).rev() {
@@ -86,15 +133,13 @@ impl CoppaTransceiver {
         payload_bits.resize(info_bits, 0u8);
         // Scramble info bits to randomize zero-padding (prevents degenerate LDPC codewords)
         scramble(&mut payload_bits);
-        let coded_bits = codec.encode(&payload_bits);
+        let coded_bits = comp.codec.encode(&payload_bits);
 
         // 2. Interleave
-        let data_carriers = self.profile.data_carriers;
-        let interleaver = BlockInterleaver::new(coded_bits.len(), data_carriers);
-        let interleaved = interleaver.interleave(&coded_bits);
+        let interleaved = comp.interleaver.interleave(&coded_bits);
 
         // 3. Constellation map
-        let symbols = mapper.map_bits(&interleaved);
+        let symbols = comp.mapper.map_bits(&interleaved);
 
         // 4. OFDM modulate
         // Look up PAPR target from speed level table
@@ -106,7 +151,52 @@ impl CoppaTransceiver {
             .modulate_mapped(header, &symbols, sl.papr_target_db)
     }
 
+    /// Peek at just the header of a buffered candidate window (samples starting at,
+    /// or shortly before, a frame's preamble), without demodulating the payload.
+    /// Applies the same RX bandpass `receive` does (HF profiles only) before
+    /// delegating to [`CoppaModem::demodulate_header`] — see that method's doc for
+    /// why no CFO correction is applied here.
+    ///
+    /// Unlike [`Self::receive_with_metrics`] (which re-derives its own timing via a
+    /// fresh internal `SyncDetector::detect_all`, so tolerates arbitrary leading
+    /// margin/silence before the frame), this takes an explicit `data_start` and
+    /// does no timing search of its own — so the caller must ensure `samples`
+    /// includes enough leading context before the header for this transceiver's
+    /// one-shot block RX filter to settle before `data_start` (its group delay is
+    /// 300 samples for the 601-tap HF filter; a slice starting exactly at the
+    /// frame's preamble, with no leading context at all, shifts the correctly
+    /// filtered header later by that much — see `StreamingReceiver::header_peek`
+    /// in `coppa-protocol::modem::streaming`, its only caller, for how it handles
+    /// this).
+    pub fn demodulate_header(&self, samples: &[f32], data_start: usize) -> Option<CoppaHeader> {
+        let filtered;
+        let samples: &[f32] = match &self.rx_bpf {
+            Some(bpf) => {
+                filtered = bpf.filter_block(samples);
+                &filtered
+            }
+            None => samples,
+        };
+        self.modem.demodulate_header(samples, data_start)
+    }
+
     pub fn receive(&self, samples: &[f32]) -> Result<(CoppaHeader, Vec<u8>), ReceiveError> {
+        self.receive_with_metrics(samples)
+            .map(|(h, p, _snr)| (h, p))
+    }
+
+    /// Like [`Self::receive`], but also returns the frame's SNR estimate (dB),
+    /// derived from the per-carrier noise-variance estimates the payload equalizer
+    /// already produces: `snr_db = 10*log10(1 / mean(noise_vars))`. Added for
+    /// `StreamingReceiver`'s `DecodedFrame::snr_db` (Task 7), so the daemon can feed
+    /// the rate controller a real per-carrier-noise SNR instead of the crude
+    /// whole-buffer RMS proxy it used before (`20*log10(rms) + 40`, flagged
+    /// elsewhere as a known hack). `receive` itself is unchanged and still used by
+    /// every existing (batch) call site.
+    pub fn receive_with_metrics(
+        &self,
+        samples: &[f32],
+    ) -> Result<(CoppaHeader, Vec<u8>, f32), ReceiveError> {
         // 0. RX bandpass: reject out-of-passband noise/interference before demod, mirroring
         // the TX bandpass already applied at modulate time (HF profiles only).
         let filtered;
@@ -125,12 +215,14 @@ impl CoppaTransceiver {
             .ok_or(ReceiveError::SyncFailed)?;
 
         // 2. Resolve speed level components
-        let (mapper, code_rate) =
-            speed_level_components(header.speed_level).map_err(|_| ReceiveError::HeaderCorrupt)?;
+        let comp = self
+            .codecs
+            .get(&header.speed_level)
+            .ok_or(ReceiveError::HeaderCorrupt)?;
 
         // 3. Soft demap: convert equalized symbols to LLRs
-        let bps = mapper.bits_per_symbol();
-        let coded_bits_needed: usize = 1944; // LDPC codeword length
+        let bps = comp.mapper.bits_per_symbol();
+        let coded_bits_needed: usize = CODED_BLOCK_LEN;
         let symbols_needed = coded_bits_needed.div_ceil(bps);
         let mut llrs = Vec::with_capacity(coded_bits_needed);
 
@@ -140,7 +232,7 @@ impl CoppaTransceiver {
             } else {
                 0.01
             };
-            llrs.extend(mapper.demap_soft(sym, nv));
+            llrs.extend(comp.mapper.demap_soft(sym, nv));
         }
         llrs.truncate(coded_bits_needed);
         llrs.resize(coded_bits_needed, 0.0);
@@ -152,13 +244,10 @@ impl CoppaTransceiver {
         }
 
         // 4. De-interleave
-        let data_carriers = self.profile.data_carriers;
-        let interleaver = BlockInterleaver::new(coded_bits_needed, data_carriers);
-        let deinterleaved = interleaver.deinterleave(&llrs);
+        let deinterleaved = comp.interleaver.deinterleave(&llrs);
 
         // 5. LDPC decode
-        let codec = LdpcCodec::new(code_rate);
-        let (mut decoded_bits, converged) = codec.decode_checked(&deinterleaved);
+        let (mut decoded_bits, converged) = comp.codec.decode_checked(&deinterleaved);
         // Descramble to undo TX-side scrambling
         scramble(&mut decoded_bits);
 
@@ -179,7 +268,15 @@ impl CoppaTransceiver {
             }
         }
 
-        Ok((header, payload))
+        // SNR estimate from the same per-carrier noise variances used for LLR scaling.
+        let mean_nv = if noise_vars.is_empty() {
+            1.0
+        } else {
+            noise_vars.iter().sum::<f32>() / noise_vars.len() as f32
+        };
+        let snr_db = 10.0 * (1.0 / mean_nv.max(1e-6)).log10();
+
+        Ok((header, payload, snr_db))
     }
 }
 
