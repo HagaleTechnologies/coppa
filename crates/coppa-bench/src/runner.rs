@@ -147,6 +147,33 @@ mod tests {
     use super::*;
     use crate::scenario::ChannelSpec;
 
+    /// Regression test: `select_profile` routes speed level >= 5 to `vhf_wide`. A
+    /// prior bug left VHF profiles on an unconditioned TX path whose preamble sat
+    /// ~30-34 dB hotter than the header/payload body; since this sweep's SNR is
+    /// referenced to the whole frame's mean power, that imbalance silently starved
+    /// the payload of its noise budget and caused 100% frame errors at every SNR,
+    /// including 30 dB. Level 2 (HF) already has `awgn_sweep_decodes_at_high_snr_and_fails_at_low_snr`
+    /// below; this covers the VHF-routed side of `select_profile`.
+    #[test]
+    fn vhf_routed_level_awgn_sweep_decodes_at_high_snr() {
+        let scenario = Scenario {
+            level: 5,
+            channel: ChannelSpec::Awgn,
+            snr_db_points: vec![30.0],
+            trials: 20,
+            seed: 0xABCD,
+            profile_override: None,
+            cfo_hz: 0.0,
+        };
+        let points = run_scenario(&scenario);
+        assert_eq!(points.len(), 1);
+        assert!(
+            points[0].fer <= 0.1,
+            "level 5 (VHF-routed) should decode cleanly at 30 dB AWGN (fer={})",
+            points[0].fer
+        );
+    }
+
     #[test]
     fn awgn_sweep_decodes_at_high_snr_and_fails_at_low_snr() {
         let scenario = Scenario {
