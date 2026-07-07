@@ -126,3 +126,21 @@ jobs:
       - uses: rustsec/audit-check@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Summary gate for branch protection. bench-fuzz and platform are excluded:
+  # bench-fuzz is compile-only (slow, no test signal) and platform is a matrix
+  # job that duplicates linux coverage already in test-full/test-features.
+  ci:
+    name: CI
+    needs: [check, test-features, test-full, clippy, fmt, msrv, deny, audit]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: All CI checks passed
+        run: |
+          results='${{ toJSON(needs.*.result) }}'
+          if echo "$results" | grep -q '"failure"\|"cancelled"'; then
+            echo "One or more required CI jobs failed"
+            exit 1
+          fi
+          echo "All required CI jobs passed"
