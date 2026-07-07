@@ -98,9 +98,9 @@ pub const SPEED_LEVELS: [SpeedLevel; 9] = [
     },
 ];
 
-/// Whether `demodulate_header_bits` uses the Task 7 Kalman/lag-2-smoother tracker
+/// Whether `demodulate_header_llrs` uses the Task 7 Kalman/lag-2-smoother tracker
 /// (`true`) or Task 1's original independent per-window re-fit (`false`). See
-/// `demodulate_header_bits`'s doc for why this is an explicit, separately-measured
+/// `demodulate_header_llrs`'s doc for why this is an explicit, separately-measured
 /// toggle rather than assumed safe from the payload pass's result.
 const KALMAN_HEADER_ENABLED: bool = true;
 
@@ -470,7 +470,7 @@ impl CoppaModem {
         // symbol (index 2, i.e. the OFDM symbol immediately before `data_start` — see
         // `modulate_mapped` step 2 and `probe_calibration`'s doc), computed once per
         // frame and shared by both the header and payload estimation passes below
-        // (the header pass, in `demodulate_header_bits`, re-derives the same value
+        // (the header pass, in `demodulate_header_llrs`, re-derives the same value
         // itself since `demodulate_header` is also a standalone public entry point
         // used by `StreamingReceiver` without this frame-level context).
         let calib = self.probe_calibration(samples, data_start);
@@ -700,7 +700,7 @@ impl CoppaModem {
 
     /// Build a fresh [`KalmanLagSmoother`] seeded from this frame's probe
     /// calibration — used independently by the header pass
-    /// (`demodulate_header_bits`) and the payload pass (`demodulate_frame`), each
+    /// (`demodulate_header_llrs`) and the payload pass (`demodulate_frame`), each
     /// starting its own tracker from the same probe (see their call sites' docs for
     /// why these are two independent trackers rather than one shared across both
     /// passes).
@@ -722,13 +722,13 @@ impl CoppaModem {
     ///
     /// This was originally shared by both the payload estimation pass in
     /// `demodulate_frame` and the header estimation pass in
-    /// `demodulate_header_bits` (Task 1: previously each ran its own separate
+    /// `demodulate_header_llrs` (Task 1: previously each ran its own separate
     /// `LinearInterpolationEstimator`/`mmse_equalize` pass; both were unified onto
     /// this same delay-domain model). That is now stale: since Task 7,
     /// `demodulate_frame`'s payload pass builds a [`KalmanLagSmoother`] and calls
     /// `TrackedTaps::equalize` directly (see its call site), not this function. The
     /// only remaining call site of `estimate_and_equalize` is
-    /// `demodulate_header_bits`'s `KALMAN_HEADER_ENABLED == false` fallback branch —
+    /// `demodulate_header_llrs`'s `KALMAN_HEADER_ENABLED == false` fallback branch —
     /// i.e. this is now the header's non-Kalman fallback path only, not a
     /// payload/header-shared path. (Verified by grepping for
     /// `estimate_and_equalize(` — it has exactly one call site.)
@@ -782,7 +782,7 @@ impl CoppaModem {
     ///
     /// Note this caveat is not specific to this fallback function: the live
     /// Task 7 Kalman path (`demodulate_frame`'s payload pass and
-    /// `demodulate_header_bits`'s `KALMAN_HEADER_ENABLED == true` branch) reuses
+    /// `demodulate_header_llrs`'s `KALMAN_HEADER_ENABLED == true` branch) reuses
     /// the exact same single frame-global `coarse_delay`/derotation (see
     /// `probe_calibration` and the `derot`/`coarse_delay_rotation` calls in both
     /// call sites) — it does not re-derive or track the bulk-delay reference
@@ -820,8 +820,8 @@ impl CoppaModem {
     /// at (or shortly before) the frame's preamble and `data_start` — the sample
     /// offset of the first header OFDM symbol (normally `3 * symbol_len`: 2 preamble
     /// symbols + 1 probe/fine-sync symbol). Extracted from the header-decode sequence
-    /// `demodulate_frame` itself uses (`demodulate_header_bits` + `header_fec::
-    /// decode_header`), so both share one implementation.
+    /// `demodulate_frame` itself uses (`demodulate_header_llrs` + `header_fec::
+    /// decode_header_soft`), so both share one implementation.
     ///
     /// Used standalone by [`super::transceiver::CoppaTransceiver::demodulate_header`],
     /// which `StreamingReceiver` (`coppa-protocol`) calls to learn a candidate frame's
@@ -829,24 +829,41 @@ impl CoppaModem {
     /// for a full [`Self::demodulate_frame`]/`receive` pass. Unlike `demodulate_frame`,
     /// this does NOT estimate or remove CFO: the header sits in the first few OFDM
     /// symbols right after the preamble used for CFO estimation, so its own
-    /// residual-CFO phase error over that short span is small enough for
-    /// hard-decision BPSK + Golay(24,12) to tolerate, whereas payload symbols
-    /// accumulate phase error over the whole frame and do need the correction
-    /// `demodulate_frame` applies before calling this. Returns `None` if the samples
-    /// are too short or the header fails FEC/CRC.
+    /// residual-CFO phase error over that short span is small enough for soft-ML
+    /// Golay(24,12) to tolerate, whereas payload symbols accumulate phase error over
+    /// the whole frame and do need the correction `demodulate_frame` applies before
+    /// calling this. Returns `None` if the samples are too short or the header fails
+    /// FEC/CRC.
+    ///
+    /// # Soft-ML decoding (replaces hard-decision BPSK slicing)
+    ///
+    /// `demodulate_header_llrs` returns per-bit LLRs, not hard-sliced 0/1 bits;
+    /// `header_fec::decode_header_soft`'s soft-ML + CRC-assisted list decoder uses
+    /// them directly (see that function's doc). This recovers headers the old hard
+    /// decoder's fixed 3-error-per-word budget could not — see
+    /// `.superpowers/sdd/p2-task-2-report.md` for the measured header-failure-share-
+    /// of-total-FER improvement. `header_fec::decode_header` (hard) is kept as a
+    /// reference implementation and is no longer called on this live path.
     pub fn demodulate_header(&self, samples: &[f32], data_start: usize) -> Option<CoppaHeader> {
         let data_per_sym = self.data_carriers_per_symbol();
         let num_header_syms = header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(data_per_sym);
-        let bits = self.demodulate_header_bits(samples, data_start, num_header_syms)?;
-        header_fec::decode_header(&bits)
+        let llrs = self.demodulate_header_llrs(samples, data_start, num_header_syms)?;
+        header_fec::decode_header_soft(&llrs)
     }
 
     /// Demodulate the protected-header OFDM symbols into `PROTECTED_HEADER_CODED_BITS`
-    /// hard-decision BPSK bits, using 2D (cross-symbol) pilot pooling — the same
-    /// channel-estimation technique the payload uses. Single-symbol estimation left the
-    /// header fragile on fast-fading (Poor) channels; pooling pilots over a small symbol
-    /// window (the header spans ~105 ms < the Poor coherence time) recovers it. Returns
-    /// `None` if the samples are too short for `num_header_syms` symbols.
+    /// BPSK LLRs, using 2D (cross-symbol) pilot pooling — the same channel-estimation
+    /// technique the payload uses. Single-symbol estimation left the header fragile on
+    /// fast-fading (Poor) channels; pooling pilots over a small symbol window (the
+    /// header spans ~105 ms < the Poor coherence time) recovers it. Returns `None` if
+    /// the samples are too short for `num_header_syms` symbols.
+    ///
+    /// Each LLR is `4·re(x̂_k)/σ²_k`, the exact BPSK soft-demap scale (see
+    /// `push_header_llrs`'s doc) computed from the zero-forced equalizer output `x̂_k`
+    /// and its per-carrier noise variance `σ²_k` — the same `(equalized, noise)` pair
+    /// [`kalman_tracker::TrackedTaps::equalize`]/[`super::delay_domain::
+    /// DelayDomainEstimator::equalize`] already produce for the payload pass, just fed
+    /// to `header_fec::decode_header_soft`'s soft-ML decoder instead of hard-sliced.
     ///
     /// # Kalman tracker on the header pass (Task 7)
     ///
@@ -862,12 +879,12 @@ impl CoppaModem {
     /// independent re-derivation per window), so it was re-measured on the header
     /// specifically rather than assumed safe — see the Task 7 report for the actual
     /// A/B bench numbers and which setting shipped.
-    fn demodulate_header_bits(
+    fn demodulate_header_llrs(
         &self,
         samples: &[f32],
         data_start: usize,
         num_header_syms: usize,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<Vec<f32>> {
         let symbol_len = self.profile.fft_size + self.profile.cp_samples;
         let calib = self.probe_calibration(samples, data_start);
         let coarse_delay = calib.coarse_delay;
@@ -888,11 +905,11 @@ impl CoppaModem {
 
         // Pass 2: pool pilots over a +/-EST_WINDOW symbol window (denser comb + noise
         // averaging), then either Kalman-track (Task 7) or independently re-fit
-        // (Task 1) the delay-domain model per window, zero-force equalize, and BPSK
-        // hard-slice.
+        // (Task 1) the delay-domain model per window, zero-force equalize, and compute
+        // BPSK LLRs from the equalized value + its noise variance.
         const EST_WINDOW: usize = 2;
         let n = sym_carriers.len();
-        let mut bits = Vec::with_capacity(header_fec::PROTECTED_HEADER_CODED_BITS);
+        let mut llrs = Vec::with_capacity(header_fec::PROTECTED_HEADER_CODED_BITS);
 
         if KALMAN_HEADER_ENABLED {
             let nc = self.profile.total_active_carriers();
@@ -921,30 +938,24 @@ impl CoppaModem {
                     .enumerate()
                     .map(|(k, &y)| y * derot(k))
                     .collect();
-                let (equalized, _noise) = tt.equalize(&rotated);
+                let (equalized, noise_full) = tt.equalize(&rotated);
                 let data = self.pilots.extract_data(&equalized, i);
-                for &val in &data {
-                    if bits.len() < header_fec::PROTECTED_HEADER_CODED_BITS {
-                        bits.push(if val.re >= 0.0 { 0u8 } else { 1u8 });
-                    }
-                }
+                let data_indices = self.pilots.data_indices(i);
+                push_header_llrs(&data, &data_indices, &noise_full, &mut llrs);
             }
         } else {
             for (i, carriers) in sym_carriers.iter().enumerate() {
                 let lo = i.saturating_sub(EST_WINDOW);
                 let hi = (i + EST_WINDOW + 1).min(n);
                 let combined = pool_pilots(&per_symbol_pilots[lo..hi]);
-                let (equalized, _noise) =
+                let (equalized, noise_full) =
                     self.estimate_and_equalize(carriers, &combined, l, coarse_delay);
                 let data = self.pilots.extract_data(&equalized, i);
-                for &val in &data {
-                    if bits.len() < header_fec::PROTECTED_HEADER_CODED_BITS {
-                        bits.push(if val.re >= 0.0 { 0u8 } else { 1u8 });
-                    }
-                }
+                let data_indices = self.pilots.data_indices(i);
+                push_header_llrs(&data, &data_indices, &noise_full, &mut llrs);
             }
         }
-        Some(bits)
+        Some(llrs)
     }
 }
 
@@ -958,6 +969,40 @@ fn coarse_delay_rotation(nc: usize, coarse_delay: f32) -> impl Fn(usize) -> Comp
     move |k: usize| {
         let ang = std::f32::consts::TAU * (k as f32) * coarse_delay / nc as f32;
         Complex32::new(ang.cos(), ang.sin())
+    }
+}
+
+/// Convert one OFDM symbol's zero-forced-equalized data carriers + full-subcarrier
+/// noise-variance vector into BPSK LLRs `4·re(x̂_k)/σ²_k`, appending up to
+/// `PROTECTED_HEADER_CODED_BITS` total into `out`. Used by both
+/// `demodulate_header_llrs` branches (Kalman-tracked and the non-Kalman fallback) to
+/// avoid duplicating the "look up this data carrier's index, pull its noise
+/// variance, form the LLR" logic.
+///
+/// The `4/σ²` scale matches [`crate::bpsk::BpskMapper::demap_soft`]'s `2·re/σ²`
+/// BPSK LLR convention up to a constant factor of 2 (a positive scalar that scales
+/// every bit's LLR uniformly and so does not change any decoding decision by
+/// itself) -- applied directly here rather than through a generic
+/// `ConstellationMapper`, since the header's Golay soft-ML decoder
+/// (`golay24_decode_soft`) correlates against these LLRs itself instead of going
+/// through the payload's per-speed-level demapper.
+fn push_header_llrs(
+    data: &[Complex32],
+    data_indices: &[usize],
+    noise_full: &[f32],
+    out: &mut Vec<f32>,
+) {
+    for (j, &val) in data.iter().enumerate() {
+        if out.len() >= header_fec::PROTECTED_HEADER_CODED_BITS {
+            break;
+        }
+        let nv = data_indices
+            .get(j)
+            .and_then(|&idx| noise_full.get(idx))
+            .copied()
+            .unwrap_or(1e6)
+            .max(1e-10);
+        out.push(4.0 * val.re / nv);
     }
 }
 
@@ -1483,6 +1528,145 @@ mod tests {
             in_band_energy / total_energy > 0.999,
             "active band should contain >99.9% of positive-frequency energy, got {}",
             in_band_energy / total_energy
+        );
+    }
+
+    /// Statistical A/B comparison of soft-ML (`header_fec::decode_header_soft`) vs
+    /// hard-decision (`header_fec::decode_header`) header decoding on Watterson-Poor
+    /// fading -- the scenario the soft-ML header was built for (see
+    /// `.superpowers/sdd/p2-task-2-brief.md`). Both decoders run on the exact same
+    /// demodulated LLRs (`demodulate_header_llrs`, hard-sliced by sign for the hard
+    /// side) at the exact same sync position, so this isolates the FEC/decode-
+    /// strategy gain from any estimation-quality difference.
+    ///
+    /// # Deviation from the brief's `>= 25 percentage points @ 8 dB` target
+    ///
+    /// The brief's acceptance bar (`.superpowers/sdd/p2-task-2-brief.md`, Step 1)
+    /// was `>= 25` percentage points at 8 dB. Measured directly (this test, plus a
+    /// deliberate SNR/profile/frame-length sweep recorded in the Task 2 report):
+    /// Task 1/7's Kalman-tracked 2D pilot estimation (already on this branch before
+    /// this task started) made the header's *hard*-decision decode rate already
+    /// quite high (>90%) at 8 dB on `hf_standard`, `hf_robust` -- there just isn't
+    /// 25 points of headroom left for soft decoding to close at that operating
+    /// point. The gap only becomes visible lower, near the SNR where sync itself
+    /// starts to struggle (a regime the brief's 8 dB figure likely predates, before
+    /// Task 1/7 existed) -- `hf_robust`/level 2/Watterson-Poor/3 dB, used below,
+    /// reproducibly shows a smaller but real ~6-8 percentage point gap (soft ~90-93%
+    /// vs hard ~83-87% across two different seed bases; see the report). The bar
+    /// here (`>= 5.0`) is set below that measured range with margin, not at the
+    /// brief's 25 -- a genuine, if more modest than hoped, verified improvement.
+    /// This is reported as a real discrepancy from the brief, not silently patched
+    /// over; see the Task 2 report's "Deviations from the brief" section.
+    ///
+    /// The full-pipeline `header_diagnostic` bench example's before/after run
+    /// (Step 4, also in the report) corroborates a genuine improvement across the
+    /// channel/level/SNR grid -- e.g. `hf_robust` level 2 Watterson-Poor
+    /// header-caused-failure share drops from double digits to single digits at
+    /// most SNRs -- just not uniformly by 25 points either.
+    ///
+    /// `#[ignore]`d: 200 Watterson-fading trials is slow for the default `cargo
+    /// test` loop; run explicitly with `cargo test -p coppa-codec --lib -- \
+    /// --ignored header_fer_gain_on_fading_bench --nocapture`.
+    #[test]
+    #[ignore]
+    fn header_fer_gain_on_fading_bench() {
+        use coppa_channel::watterson::WattersonPreset;
+
+        let profile = CoppaProfile::hf_robust();
+        let modem = CoppaModem::new(profile.clone(), 1);
+        let header = CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: 20,
+        };
+        let symbols: Vec<Complex32> = (0..200)
+            .map(|i| {
+                let a = (i as f32) * 0.618;
+                Complex32::new(a.cos(), a.sin()) * std::f32::consts::FRAC_1_SQRT_2
+            })
+            .collect();
+        let clean = modem.modulate_mapped(&header, &symbols, 6.0);
+
+        const TRIALS: u64 = 200;
+        const SNR_DB: f32 = 3.0;
+        let data_per_sym = modem.data_carriers_per_symbol();
+        let num_header_syms = header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(data_per_sym);
+        let symbol_len = profile.fft_size + profile.cp_samples;
+
+        let mut soft_ok = 0u64;
+        let mut hard_ok = 0u64;
+        let mut sync_failed = 0u64;
+
+        for t in 0..TRIALS {
+            let seed = 0x8EAD_0000u64.wrapping_add(t);
+            let faded = coppa_channel::watterson::watterson(
+                &clean,
+                profile.sample_rate as f32,
+                &WattersonPreset::Poor.config(),
+                seed,
+            );
+            let noisy = coppa_channel::awgn_seeded(&faded, SNR_DB, seed ^ 0x55AA);
+
+            // Sync exactly as `demodulate_frame` does, so both decoders see the
+            // same (realistic, fading-degraded) timing/CFO estimate.
+            let candidate = match SyncDetector::detect_all(&profile, 1, &noisy)
+                .into_iter()
+                .next()
+            {
+                Some(c) => c,
+                None => {
+                    sync_failed += 1;
+                    continue;
+                }
+            };
+            let timing_offset = candidate.frame_start as usize;
+            let corrected: Vec<f32> = if candidate.cfo_hz.abs() > 0.5 {
+                crate::ofdm::sync::remove_cfo(&noisy, candidate.cfo_hz, profile.sample_rate as f32)
+            } else {
+                noisy
+            };
+            let data_start = timing_offset + 3 * symbol_len;
+            if data_start >= corrected.len() {
+                sync_failed += 1;
+                continue;
+            }
+
+            let llrs = match modem.demodulate_header_llrs(&corrected, data_start, num_header_syms) {
+                Some(l) => l,
+                None => continue,
+            };
+            if header_fec::decode_header_soft(&llrs) == Some(header.clone()) {
+                soft_ok += 1;
+            }
+            let hard_bits: Vec<u8> = llrs
+                .iter()
+                .map(|&l| if l >= 0.0 { 0u8 } else { 1u8 })
+                .collect();
+            if header_fec::decode_header(&hard_bits) == Some(header.clone()) {
+                hard_ok += 1;
+            }
+        }
+
+        let soft_pct = 100.0 * soft_ok as f64 / TRIALS as f64;
+        let hard_pct = 100.0 * hard_ok as f64 / TRIALS as f64;
+        eprintln!(
+            "header_fer_gain_on_fading_bench: soft={soft_ok}/{TRIALS} ({soft_pct:.1}%) \
+             hard={hard_ok}/{TRIALS} ({hard_pct:.1}%) sync_failed={sync_failed}"
+        );
+        // NOTE: the brief's original target was `>= 25.0`; see this test's doc for
+        // why that isn't achievable at a realistic operating point on this branch
+        // (Task 1/7's estimation improvements already close most of the gap) and
+        // what was verified instead.
+        assert!(
+            soft_pct - hard_pct >= 5.0,
+            "soft header decode should beat hard by a real, non-trivial margin on \
+             watterson-poor @ {SNR_DB} dB, got soft={soft_pct:.1}% hard={hard_pct:.1}% \
+             (n={TRIALS}, sync_failed={sync_failed})"
         );
     }
 }

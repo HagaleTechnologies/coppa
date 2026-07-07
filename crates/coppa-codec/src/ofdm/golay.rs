@@ -66,6 +66,19 @@ fn syndrome_table() -> &'static HashMap<u16, u32> {
 
 /// Decode a 24-bit received word. Returns `(info12, n_corrected)` when the error is
 /// correctable (weight <= 3), else `None` (>= 4 errors detected).
+///
+/// # Superseded on the live header path
+///
+/// The frame header no longer calls this: `header_fec::decode_header_soft` uses
+/// [`golay24_decode_soft`] instead, an exhaustive soft-ML search that (unlike this
+/// hard syndrome decoder's fixed weight-<=3 error budget) also recovers words with
+/// many more than 3 corrupted bits, as long as erasures/soft errors don't fully
+/// invert the correlation with the true codeword (see `golay24_decode_soft`'s doc).
+/// This function -- and `header_fec::decode_header`, its hard-decision caller -- are
+/// kept as an exact, exhaustively-tested reference implementation (this crate is a
+/// reference implementation of an HF modem's DSP/FEC stack; see the crate's
+/// top-level docs) and as the "hard" side of the soft-vs-hard comparisons in
+/// `header_fec`'s and `coppa_modem`'s test suites.
 pub fn golay24_decode(received: u32) -> Option<(u16, u8)> {
     let r = received & 0x00FF_FFFF;
     let s = syndrome(r);
@@ -73,6 +86,61 @@ pub fn golay24_decode(received: u32) -> Option<(u16, u8)> {
     let corrected = r ^ err;
     let info = ((corrected >> 12) & 0xFFF) as u16;
     Some((info, err.count_ones() as u8))
+}
+
+/// All 4096 codewords, indexed by info word (`table[i] == golay24_encode(i as u16)`).
+/// Built once (`OnceLock`) and cached for [`golay24_decode_soft`]'s exhaustive
+/// correlation search -- unlike [`syndrome_table`]'s error-syndrome map (which only
+/// makes sense for a fixed weight-<=3 hard-decision budget), the soft-ML decoder
+/// scores literally every codeword against the received LLRs, so it needs the plain
+/// codeword list rather than a syndrome lookup.
+fn codeword_table() -> &'static [u32; 4096] {
+    static TABLE: OnceLock<Box<[u32; 4096]>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut t = Box::new([0u32; 4096]);
+        for (info, cw) in t.iter_mut().enumerate() {
+            *cw = golay24_encode(info as u16);
+        }
+        t
+    })
+}
+
+/// Soft-maximum-likelihood Golay(24,12) decode. Returns the two best-scoring info
+/// words (by bipolar correlation against the 24 received LLRs), for CRC-assisted
+/// list-2 selection in `header_fec::decode_header_soft`.
+///
+/// Score = `Σ (1-2·c_b)·llr_b` over all 4096 codewords -- an exhaustive ML search
+/// (cheap at this block length: 4096 codewords x 24 bits per header word x 6 words
+/// per header). Unlike the hard syndrome decoder's fixed weight-<=3 error budget,
+/// this can recover a word even when far more than 3 of its bits are individually
+/// wrong or erased (LLR ~= 0), as long as the true codeword's correlation with the
+/// received LLRs still edges out every other codeword's -- e.g. it provably
+/// survives up to `d_min - 1 = 7` full erasures on an otherwise-clean word (the
+/// classical erasure-correction bound for a distance-8 code), far beyond the hard
+/// decoder's 3-error budget.
+pub fn golay24_decode_soft(llrs: &[f32; 24]) -> [(u16, f32); 2] {
+    let table = codeword_table();
+    let (mut best, mut best_s) = (0u16, f32::MIN);
+    let (mut second, mut second_s) = (0u16, f32::MIN);
+    for (info, &cw) in table.iter().enumerate() {
+        // score = correlation of the bipolar codeword with the LLRs:
+        // bit b of cw (MSB-first over 24 bits): 0 → +llr, 1 → −llr
+        let mut s = 0.0f32;
+        for (b, &l) in llrs.iter().enumerate() {
+            let bit = (cw >> (23 - b)) & 1;
+            s += if bit == 0 { l } else { -l };
+        }
+        if s > best_s {
+            second = best;
+            second_s = best_s;
+            best = info as u16;
+            best_s = s;
+        } else if s > second_s {
+            second = info as u16;
+            second_s = s;
+        }
+    }
+    [(best, best_s), (second, second_s)]
 }
 
 #[cfg(test)]
@@ -128,5 +196,26 @@ mod tests {
     #[test]
     fn syndrome_table_has_2325_distinct_entries() {
         assert_eq!(syndrome_table().len(), 2325);
+    }
+
+    #[test]
+    fn codeword_table_has_4096_entries_matching_encode() {
+        let t = codeword_table();
+        assert_eq!(t.len(), 4096);
+        for info in 0u16..4096 {
+            assert_eq!(t[info as usize], golay24_encode(info), "info={info:#05x}");
+        }
+    }
+
+    #[test]
+    fn soft_decode_matches_hard_on_clean_codeword() {
+        for info in [0u16, 0xFFF, 0xABC, 0x001, 0x800] {
+            let cw = golay24_encode(info);
+            let llrs: [f32; 24] =
+                std::array::from_fn(|b| if (cw >> (23 - b)) & 1 == 0 { 4.0 } else { -4.0 });
+            let [(best, _), (second, _)] = golay24_decode_soft(&llrs);
+            assert_eq!(best, info, "info={info:#05x}");
+            assert_ne!(second, best);
+        }
     }
 }
