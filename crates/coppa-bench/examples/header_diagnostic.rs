@@ -94,7 +94,7 @@ fn run_cell(
         // Attribute the failure. Re-demodulate to recover the parsed header (receive() discards it
         // on error). None => unparseable header (invalid frame_type) or sync loss — frame aborted
         // before payload decode, so header-caused for our purposes.
-        match modem.demodulate_soft_coded(&faded) {
+        match modem.demodulate_frame(&faded) {
             None => tally.hdr_caused += 1,
             Some((parsed, _sym, _nv)) => {
                 let decode_relevant_ok = parsed.speed_level == truth.speed_level

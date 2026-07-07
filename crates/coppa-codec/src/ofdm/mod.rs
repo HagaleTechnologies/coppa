@@ -11,17 +11,21 @@
 //!
 //! - **Coppa stack (canonical / reference path).** [`CoppaProfile`],
 //!   [`coppa_modem::CoppaModem`], [`pilots::CoppaPilotPattern`],
-//!   [`frame::CoppaHeader`], and [`sync::SchmidlCox`] form the end-to-end PHY
-//!   that the engine and `CoppaTransceiver` actually use. This is the path that
-//!   carries real traffic; if you want to understand how Coppa transmits, read
-//!   `CoppaModem`.
+//!   [`frame::CoppaHeader`], and [`sync_detector::SyncDetector`] form the
+//!   end-to-end PHY that the engine and `CoppaTransceiver` actually use. This
+//!   is the path that carries real traffic; if you want to understand how
+//!   Coppa transmits, read `CoppaModem`.
 //! - **Generic stack (pedagogical example).** [`OfdmProfile`], [`OfdmModulator`],
-//!   [`OfdmDemodulator`], [`modem::OfdmModem`], and
-//!   [`equalizer::LinearInterpolationEstimator`] are a simpler, self-contained
-//!   single-symbol OFDM implementation kept as a teaching example. It is *not*
-//!   on the engine's data path. It is easier to read first because each step
-//!   (IFFT + cyclic prefix, FFT, equalize) is isolated and unencumbered by the
-//!   framing/sync machinery of the Coppa stack.
+//!   [`OfdmDemodulator`], and [`equalizer::LinearInterpolationEstimator`] are a
+//!   simpler, self-contained single-symbol OFDM implementation kept as a
+//!   teaching example. It is *not* on the engine's data path. It is easier to
+//!   read first because each step (IFFT + cyclic prefix, FFT, equalize) is
+//!   isolated and unencumbered by the framing/sync machinery of the Coppa
+//!   stack. (A third piece of this generic stack, `modem::OfdmModem`, was
+//!   removed alongside `sync::SchmidlCox` in the streaming `SyncDetector`
+//!   migration — see `sync_detector` module docs — since it had no consumer
+//!   outside its own tests and existed only to wire `SchmidlCox` into the
+//!   `Modem` trait.)
 //!
 //! Both are retained intentionally. Start with the generic stack to learn the
 //! mechanics, then read the Coppa stack for the production design.
@@ -32,9 +36,9 @@ pub mod frame;
 pub mod golay;
 pub mod header_fec;
 pub mod interleaver;
-pub mod modem;
 pub mod pilots;
 pub mod sync;
+pub mod sync_detector;
 
 use num_complex::Complex32;
 

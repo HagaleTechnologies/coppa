@@ -139,7 +139,7 @@ fn measure(
         };
 
         // --- Raw (pre-FEC) BER + nv partition.
-        if let Some((_h, eq, nv)) = modem.demodulate_soft_coded(&faded) {
+        if let Some((_h, eq, nv)) = modem.demodulate_frame(&faded) {
             let n = CODED_BITS.min(eq.len()).min(nv.len());
             if n > 0 {
                 // Per-frame median nv for the A1/A2 partition.

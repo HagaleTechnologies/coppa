@@ -9,10 +9,13 @@
 //!   `coppa-protocol`.
 //! - [`ChannelEstimator`] is used via `&dyn ChannelEstimator` by the OFDM
 //!   equalizer, but currently has a single implementor.
-//! - [`Modem`] is a uniform interface implemented by `BpskModem` and
-//!   `OfdmModem`. It is an extension point rather than the hot path: the
-//!   flagship `CoppaModem` does not implement it and is called directly, and
-//!   nothing dispatches over `dyn Modem`.
+//! - [`Modem`] is a uniform interface implemented by `BpskModem` (the OFDM
+//!   pedagogical implementor, `ofdm::modem::OfdmModem`, was removed in the
+//!   streaming `SyncDetector` migration — see `ofdm::sync_detector` docs —
+//!   since it had no consumer outside its own tests). It is an extension
+//!   point rather than the hot path: the flagship `CoppaModem` does not
+//!   implement it and is called directly, and nothing dispatches over
+//!   `dyn Modem`.
 //! - [`FecCodec`] has no implementor in this crate. The real codecs
 //!   (convolutional and LDPC) implement it in `coppa-protocol`, and the
 //!   reference pipeline wires them in concretely rather than through this

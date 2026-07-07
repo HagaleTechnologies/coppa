@@ -84,7 +84,7 @@ fn sound_capacity(
     let payload = vec![0x5Au8; pfb];
     let sig = tx.transmit(&make_header(2, pfb as u16), &payload);
     let faded = apply_channel(&sig, ch, snr, seed);
-    match modem.demodulate_soft_coded(&faded) {
+    match modem.demodulate_frame(&faded) {
         Some((_h, _eq, nv)) => channel_capacity(&nv),
         None => 0.0,
     }

@@ -92,7 +92,7 @@ fn sound_capacity(
             snr,
             seed.wrapping_add(s.wrapping_mul(0x9E37_79B9)),
         );
-        if let Some((_h, _eq, nv)) = modem.demodulate_soft_coded(&faded) {
+        if let Some((_h, _eq, nv)) = modem.demodulate_frame(&faded) {
             accc += channel_capacity(&nv);
             accs += coppa_ml::channel_selectivity(&nv);
             n += 1;

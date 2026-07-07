@@ -14,5 +14,4 @@ pub mod qpsk;
 pub mod traits;
 
 pub use bpsk::BpskModem;
-pub use ofdm::modem::OfdmModem;
 pub use traits::{ConstellationMapper, Modem};
