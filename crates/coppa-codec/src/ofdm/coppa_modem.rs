@@ -97,12 +97,39 @@ pub const SPEED_LEVELS: [SpeedLevel; 9] = [
     },
 ];
 
+/// Raised-cosine inter-symbol taper width in samples (0.5 ms @ 48 kHz).
+const RC_OVERLAP: usize = 24;
+/// TX peak normalization target (fraction of full scale).
+const TX_PEAK: f32 = 0.5;
+
 /// High-level OFDM modem for the Coppa Protocol.
 pub struct CoppaModem {
     profile: CoppaProfile,
     fft: FftProcessor,
     pilots: CoppaPilotPattern,
     version: u8,
+    /// SSB-audio-band TX bandpass (250-2850 Hz), only meaningful for HF profiles
+    /// (`phy_mode == 0`) transmitted through an SSB radio's audio passband. VHF
+    /// profiles (`phy_mode == 1`, e.g. `vhf_wide`) occupy a much wider carrier band
+    /// (up to ~5.9 kHz, well above this filter's 2850 Hz upper edge) and use a far
+    /// shorter cyclic prefix (60 samples vs this filter's 300-sample group delay at
+    /// 601 taps) — applying this filter to them would truncate most of their upper
+    /// carriers outright. `None` for non-HF profiles.
+    ///
+    /// IMPORTANT: only the FIR filtering step itself is HF-specific. The rest of
+    /// `modulate_mapped`'s TX conditioning (per-section RMS leveling, RC-overlap,
+    /// PAPR clip, peak-normalize) applies to *every* profile and must never be
+    /// nested inside a `Some(tx_bpf)`-only branch — an earlier version of this code
+    /// did exactly that, which silently dropped section leveling for every
+    /// VHF-routed speed level and produced a ~30-34 dB preamble/body power
+    /// imbalance (the preamble's unit-RMS normalization vs. the body's naturally
+    /// much quieter sparse-bin IFFT output). Because the bench's SNR convention
+    /// references injected noise to the whole frame's mean power, that imbalance
+    /// starved the header/payload of virtually all its noise budget, causing 100%
+    /// frame errors at every SNR including 30 dB. See
+    /// `modulate_mapped_round_trips_through_demodulate_soft_coded` below and
+    /// `vhf_routed_level_awgn_sweep_decodes_at_high_snr` in coppa-bench.
+    tx_bpf: Option<coppa_dsp::fir::Fir>,
 }
 
 impl CoppaModem {
@@ -111,11 +138,22 @@ impl CoppaModem {
         let total_active = profile.total_active_carriers();
         let fft = FftProcessor::new(profile.fft_size);
         let pilots = CoppaPilotPattern::new(total_active, profile.pilot_carriers);
+        // phy_mode 0 = HF/SSB; the TX bandpass models an SSB radio's audio passband
+        // and must not be applied to VHF profiles (phy_mode 1) — see the field doc.
+        let tx_bpf = (profile.phy_mode == 0).then(|| {
+            coppa_dsp::fir::Fir::new(coppa_dsp::fir::design_bandpass(
+                601,
+                profile.sample_rate as f32,
+                250.0,
+                2850.0,
+            ))
+        });
         Self {
             profile,
             fft,
             pilots,
             version,
+            tx_bpf,
         }
     }
 
@@ -317,8 +355,37 @@ impl CoppaModem {
             samples.extend(self.build_ofdm_symbol(&carriers));
         }
 
-        // 5. PAPR clipping
-        papr_clip(&samples, papr_target_db)
+        // ---- TX conditioning: level sections -> RC-window edges -> clip -> BPF -> peak ----
+        //
+        // Section leveling is NOT optional/HF-specific: without it, the Newman-phase
+        // preamble (unit-RMS normalized in `generate_coppa_preamble`) sits ~30-34 dB
+        // hotter than the header/payload body (whose IFFT output is naturally quiet,
+        // since only a fraction of FFT bins carry energy). The bench's SNR convention
+        // references injected noise to the *whole frame's* mean power
+        // (`coppa_channel::mean_power`), so that mismatch lets the huge preamble
+        // energy silently absorb almost all the "budgeted" noise, leaving the much
+        // quieter header/payload at an effective SNR tens of dB worse than the
+        // nominal figure — a total, deterministic decode failure at every tested SNR.
+        // This hit VHF profiles (`phy_mode == 1`) at every VHF-routed speed level
+        // (5,6,7,9,10) because a prior version of this code nested the whole
+        // conditioning chain inside the `Some(tx_bpf)` (HF-only) arm, when only the
+        // 601-tap bandpass filter itself is HF/SSB-specific (its passband and
+        // group delay are incompatible with VHF's wider carrier band and shorter
+        // CP). Section leveling + RC-overlap + clip + peak-normalize apply equally to
+        // both PHY modes; only the BPF step is gated.
+        let sym = self.profile.fft_size + self.profile.cp_samples;
+        let sections = [0..2 * sym, 2 * sym..3 * sym, 3 * sym..samples.len()];
+        let target = section_rms(&samples[sections[2].clone()]); // body sets the reference
+        for r in sections {
+            level_section(&mut samples[r], target);
+        }
+        let windowed = rc_overlap(&samples, sym, RC_OVERLAP);
+        let clipped = papr_clip(&windowed, papr_target_db);
+        let filtered = match &self.tx_bpf {
+            Some(tx_bpf) => tx_bpf.filter_block(&clipped),
+            None => clipped,
+        };
+        peak_normalize(filtered, TX_PEAK)
     }
 
     /// Demodulate audio samples back into a frame header and payload.
@@ -630,6 +697,50 @@ impl CoppaModem {
     }
 }
 
+fn section_rms(x: &[f32]) -> f32 {
+    (x.iter().map(|v| v * v).sum::<f32>() / x.len().max(1) as f32).sqrt()
+}
+
+fn level_section(x: &mut [f32], target: f32) {
+    let r = section_rms(x);
+    if r > 1e-12 {
+        let g = target / r;
+        for v in x {
+            *v *= g;
+        }
+    }
+}
+
+/// Raised-cosine taper at every symbol boundary: fade the last W samples of each
+/// symbol down and the first W samples of the next symbol up, overlap-added.
+/// Cheap continuous-phase shaping worth ~15-20 dB of OOB sidelobe suppression.
+fn rc_overlap(x: &[f32], sym: usize, w: usize) -> Vec<f32> {
+    let mut y = x.to_vec();
+    let n_sym = x.len() / sym;
+    for s in 1..n_sym {
+        let b = s * sym;
+        for i in 0..w.min(b).min(x.len() - b) {
+            let t = (i as f32 + 0.5) / w as f32;
+            let up = 0.5 - 0.5 * (std::f32::consts::PI * t).cos();
+            let down = 1.0 - up;
+            // cross-fade boundary: tail of prev symbol fades out, head of next fades in
+            y[b + i] = x[b + i] * up + x[b - w + i] * down;
+        }
+    }
+    y
+}
+
+fn peak_normalize(mut x: Vec<f32>, peak: f32) -> Vec<f32> {
+    let p = x.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    if p > 1e-12 {
+        let g = peak / p;
+        for v in &mut x {
+            *v *= g;
+        }
+    }
+    x
+}
+
 /// Pool per-symbol pilot observations into one combined pilot set, averaging the received
 /// value at each carrier index across the symbols that sample it. Valid because the channel is
 /// time-invariant within a frame (HF block-fading); the even/odd pilot alternation means the
@@ -657,6 +768,78 @@ fn pool_pilots(
 mod tests {
     use super::super::frame::CoppaFrameType;
     use super::*;
+
+    /// Regression test for a bug where `modulate_mapped`'s TX conditioning chain
+    /// (section leveling / RC-overlap / clip / peak-normalize) was nested inside the
+    /// `Some(tx_bpf)` (HF-only) branch, leaving VHF profiles on the old
+    /// unconditioned path. That path never leveled the preamble (unit-RMS
+    /// normalized in `generate_coppa_preamble`) against the much quieter
+    /// header/payload body (~30-34 dB lower RMS), so any noise budget referenced to
+    /// the *whole frame's* mean power effectively left the payload at a far worse
+    /// SNR than nominal — a deterministic decode failure at every SNR. No existing
+    /// unit test exercised the full `modulate_mapped` -> `demodulate_soft_coded` ->
+    /// sync round trip (the TX-property tests below only check `modulate_mapped`'s
+    /// output in isolation), so this bug shipped past `cargo test` entirely.
+    /// Covers both HF (BPF-conditioned) and VHF (BPF-bypassed) profiles.
+    #[test]
+    fn modulate_mapped_round_trips_through_demodulate_soft_coded() {
+        for (profile, speed_level, payload_len) in [
+            (CoppaProfile::hf_standard(), 2u8, 60u16),
+            (CoppaProfile::vhf_wide(), 5u8, 130u16),
+        ] {
+            let modem = CoppaModem::new(profile.clone(), 1);
+            let header = CoppaHeader {
+                version: 1,
+                phy_mode: 0,
+                frame_type: CoppaFrameType::Data,
+                bandwidth: 1,
+                fec_type: 0,
+                speed_level,
+                seq_num: 0,
+                payload_len,
+            };
+            let n_symbols = (payload_len as usize) * 8; // more than enough carriers
+            let symbols: Vec<Complex32> = (0..n_symbols)
+                .map(|i| {
+                    let a = (i as f32) * 0.618;
+                    Complex32::new(a.cos(), a.sin()) * std::f32::consts::FRAC_1_SQRT_2
+                })
+                .collect();
+            let papr_target = SPEED_LEVELS
+                .iter()
+                .find(|s| s.level == speed_level)
+                .unwrap()
+                .papr_target_db;
+            let s = modem.modulate_mapped(&header, &symbols, papr_target);
+
+            // Section power balance: preamble must not dominate the frame's mean
+            // power (the root cause above measured ~30-34 dB before the fix; the
+            // dedicated `tx_sections_are_power_leveled_and_peak_bounded` test asserts
+            // the tight <1 dB bound with its own fixed payload — this is a coarser
+            // sanity bound across varied profiles/payloads to catch any gross
+            // regression without being fragile to per-payload PAPR-clip variance).
+            let sym = profile.fft_size + profile.cp_samples;
+            let rms = |x: &[f32]| (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
+            let pre = rms(&s[..2 * sym]);
+            let body = rms(&s[3 * sym..]);
+            let ratio_db = 20.0 * (pre / body).log10();
+            assert!(
+                ratio_db.abs() < 5.0,
+                "profile phy_mode={}: preamble/body power step must be small, got {ratio_db} dB",
+                profile.phy_mode
+            );
+
+            let soft = modem.demodulate_soft_coded(&s);
+            assert!(
+                soft.is_some(),
+                "profile phy_mode={}: clean-channel loopback through modulate_mapped/\
+                 demodulate_soft_coded must succeed",
+                profile.phy_mode
+            );
+            let (rx_header, _, _) = soft.unwrap();
+            assert_eq!(rx_header.speed_level, speed_level);
+        }
+    }
 
     #[test]
     fn test_coppa_modem_modulate_produces_audio() {
@@ -851,6 +1034,114 @@ mod tests {
         assert!(
             (at4.re - 2.0).abs() < 1e-6 && at4.im.abs() < 1e-6,
             "got {at4:?}"
+        );
+    }
+
+    #[test]
+    fn tx_sections_are_power_leveled_and_peak_bounded() {
+        let profile = CoppaProfile::hf_standard();
+        let modem = CoppaModem::new(profile.clone(), 1);
+        let header = CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: 60,
+        };
+        let symbols = vec![Complex32::new(1.0, 0.0); 972];
+        let s = modem.modulate_mapped(&header, &symbols, 6.0);
+        let sym = profile.fft_size + profile.cp_samples;
+        let rms = |x: &[f32]| (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
+        let pre = rms(&s[..2 * sym]);
+        let body = rms(&s[3 * sym..7 * sym]);
+        let ratio_db = 20.0 * (pre / body).log10();
+        assert!(
+            ratio_db.abs() < 1.0,
+            "preamble/body power step must be <1 dB, got {ratio_db}"
+        );
+        let peak = s.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        assert!(
+            (0.4..=0.5001).contains(&peak),
+            "TX peak must be normalized to ~0.5 FS, got {peak}"
+        );
+    }
+
+    #[test]
+    fn tx_out_of_band_energy_is_suppressed() {
+        // Welch-style average of 960-point FFTs over the frame body: OOB (below 200 Hz,
+        // above 3 kHz) power must be at least 25 dB under in-band average after
+        // windowing+BPF. (Rect-edged OFDM alone gives only ~-13 dBc first sidelobes.)
+        let profile = CoppaProfile::hf_standard();
+        let modem = CoppaModem::new(profile.clone(), 1);
+        let header = CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: 60,
+        };
+        let symbols = vec![Complex32::new(1.0, 0.0); 972];
+        let s = modem.modulate_mapped(&header, &symbols, 6.0);
+
+        let sym = profile.fft_size + profile.cp_samples;
+        // Frame body: from the end of the probe symbol (header+payload region) to the end.
+        let body = &s[3 * sym..];
+
+        let n = profile.fft_size; // 960-point analysis window
+        let hop = n / 2; // 50% overlap
+        let fft = FftProcessor::new(n);
+
+        // Hann window
+        let win: Vec<f32> = (0..n)
+            .map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / (n - 1) as f32).cos())
+            .collect();
+
+        let mut acc = vec![0.0f32; n];
+        let mut num_segs = 0usize;
+        let mut start = 0usize;
+        while start + n <= body.len() {
+            let seg: Vec<Complex32> = body[start..start + n]
+                .iter()
+                .zip(win.iter())
+                .map(|(&x, &w)| Complex32::new(x * w, 0.0))
+                .collect();
+            let spec = fft.forward(&seg);
+            for (a, c) in acc.iter_mut().zip(spec.iter()) {
+                *a += c.norm_sqr();
+            }
+            num_segs += 1;
+            start += hop;
+        }
+        assert!(
+            num_segs > 0,
+            "frame body must be long enough for at least one FFT segment"
+        );
+        for a in &mut acc {
+            *a /= num_segs as f32;
+        }
+
+        // In-band average: active-carrier bins 8..=54 (hf_standard).
+        let in_band_bins: Vec<usize> = (8..=54).collect();
+        let in_band_mean: f32 =
+            in_band_bins.iter().map(|&b| acc[b]).sum::<f32>() / in_band_bins.len() as f32;
+
+        // Out-of-band bins: guard bins 1..=2 (50-100 Hz; genuine stopband, ≥150 Hz
+        // clear of the BPF's 250 Hz corner — bins 5..=6 sit exactly at that corner
+        // and are structurally ~-6 dB regardless of tap count, not a valid OOB probe)
+        // and 61..=200 (well above the active band, still below Nyquist).
+        let oob_bins: Vec<usize> = (1..=2).chain(61..=200).collect();
+        let oob_mean: f32 = oob_bins.iter().map(|&b| acc[b]).sum::<f32>() / oob_bins.len() as f32;
+
+        let suppression_db = 10.0 * (in_band_mean / oob_mean).log10();
+        assert!(
+            suppression_db > 25.0,
+            "OOB energy must be >=25 dB under in-band average, got {suppression_db} dB"
         );
     }
 
