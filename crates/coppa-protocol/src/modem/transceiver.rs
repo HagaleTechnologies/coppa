@@ -9,6 +9,17 @@ use coppa_codec::ofdm::CoppaProfile;
 pub struct CoppaTransceiver {
     modem: CoppaModem,
     profile: CoppaProfile,
+    /// RX-side SSB-audio-band bandpass (250-2850 Hz), mirroring the TX bandpass
+    /// already applied in `CoppaModem::modulate_mapped`. Only meaningful for HF
+    /// profiles (`phy_mode == 0`) received through an SSB radio's audio chain;
+    /// `None` for non-HF profiles (see `CoppaModem::tx_bpf`'s doc for why VHF's
+    /// wider carrier band and shorter cyclic prefix are incompatible with this
+    /// filter's passband and 300-sample group delay). Reuses the exact same
+    /// 601-tap / 250-2850 Hz design already verified by
+    /// `coppa_dsp::fir::tests::bandpass_rejects_out_of_band_tones` (>=30 dB
+    /// attenuation at 100 Hz and 4 kHz, flat passband at 500 Hz), so no new
+    /// tap-count derivation is needed for this filter specifically.
+    rx_bpf: Option<coppa_dsp::fir::Fir>,
 }
 
 #[derive(Debug)]
@@ -40,8 +51,21 @@ impl std::error::Error for ReceiveError {}
 
 impl CoppaTransceiver {
     pub fn new(profile: CoppaProfile, version: u8) -> Self {
+        // phy_mode 0 = HF/SSB; mirrors the TX bandpass gate in `CoppaModem::new`.
+        let rx_bpf = (profile.phy_mode == 0).then(|| {
+            coppa_dsp::fir::Fir::new(coppa_dsp::fir::design_bandpass(
+                601,
+                profile.sample_rate as f32,
+                250.0,
+                2850.0,
+            ))
+        });
         let modem = CoppaModem::new(profile.clone(), version);
-        Self { modem, profile }
+        Self {
+            modem,
+            profile,
+            rx_bpf,
+        }
     }
 
     pub fn transmit(&self, header: &CoppaHeader, payload: &[u8]) -> Vec<f32> {
@@ -83,6 +107,17 @@ impl CoppaTransceiver {
     }
 
     pub fn receive(&self, samples: &[f32]) -> Result<(CoppaHeader, Vec<u8>), ReceiveError> {
+        // 0. RX bandpass: reject out-of-passband noise/interference before demod, mirroring
+        // the TX bandpass already applied at modulate time (HF profiles only).
+        let filtered;
+        let samples: &[f32] = match &self.rx_bpf {
+            Some(bpf) => {
+                filtered = bpf.filter_block(samples);
+                &filtered
+            }
+            None => samples,
+        };
+
         // 1. Demodulate to soft symbols (coded symbol count derived from header speed level)
         let (header, eq_symbols, noise_vars) = self
             .modem
@@ -212,6 +247,38 @@ mod tests {
             seq_num: 0,
             payload_len,
         }
+    }
+
+    #[test]
+    #[ignore = "until Task 6"]
+    fn loopback_survives_ssb_filter_and_50hz_mistune() {
+        // The bar Phase 1 exists to clear: a real radio's passband + a realistic mistune.
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let payload = vec![0xA7u8; 100];
+        let header = make_header(2, payload.len() as u16);
+        let s = tx.transmit(&header, &payload);
+        let through_rig = coppa_channel::ssb_filter(&s, 48_000.0);
+        let mistuned = coppa_channel::frequency_shift(&through_rig, 47.0, 48_000.0);
+        let (_h, rx) = tx
+            .receive(&mistuned)
+            .expect("must decode through SSB filter + 47 Hz CFO");
+        assert_eq!(&rx[..payload.len()], payload.as_slice());
+    }
+
+    #[test]
+    fn loopback_survives_ssb_filter_only() {
+        // Same as above but with 0 Hz mistune: this is the part of the bar this task must
+        // clear now (CFO correction on this mistuned path lands in Task 6).
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let payload = vec![0xA7u8; 100];
+        let header = make_header(2, payload.len() as u16);
+        let s = tx.transmit(&header, &payload);
+        let through_rig = coppa_channel::ssb_filter(&s, 48_000.0);
+        let untuned = coppa_channel::frequency_shift(&through_rig, 0.0, 48_000.0);
+        let (_h, rx) = tx
+            .receive(&untuned)
+            .expect("must decode through SSB filter alone (no mistune)");
+        assert_eq!(&rx[..payload.len()], payload.as_slice());
     }
 
     #[test]

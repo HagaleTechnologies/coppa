@@ -27,6 +27,7 @@ fn make_header(level: u8, payload_len: u16) -> CoppaHeader {
 
 /// One trial: random payload → transmit → channel(snr) → receive.
 /// Returns the outcome and the transmitted-frame sample count (airtime).
+#[allow(clippy::too_many_arguments)]
 fn run_trial(
     tx: &CoppaTransceiver,
     level: u8,
@@ -34,6 +35,7 @@ fn run_trial(
     snr_db: f32,
     channel: ChannelSpec,
     cfo_hz: f32,
+    ssb: bool,
     seed: u64,
 ) -> (TrialOutcome, usize) {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -42,19 +44,30 @@ fn run_trial(
     let header = make_header(level, payload_bytes as u16);
     let clean = tx.transmit(&header, &payload);
     let frame_samples = clean.len();
-
-    // SNR convention: 3 kHz noise bandwidth, referenced to the CLEAN signal's
-    // power — a fade costs receive power instead of being renormalized away.
-    let p_clean = coppa_channel::mean_power(&clean);
-    let noise_seed = seed ^ 0x5555_5555_5555_5555;
     let sr = crate::scenario::SAMPLE_RATE as f32;
+
+    // Rig TX filter -> channel: emulate a realistic SSB audio passband on the
+    // clean signal BEFORE Watterson/AWGN. A second RX-side filter is
+    // unnecessary here — `CoppaTransceiver::receive` already applies its own
+    // 250-2850 Hz RX bandpass on HF profiles.
+    let tx_signal = if ssb {
+        coppa_channel::ssb_filter(&clean, sr)
+    } else {
+        clean
+    };
+
+    // SNR convention: 3 kHz noise bandwidth, referenced to the CLEAN (post-rig-filter,
+    // pre-fade) signal's power — a fade costs receive power instead of being
+    // renormalized away.
+    let p_clean = coppa_channel::mean_power(&tx_signal);
+    let noise_seed = seed ^ 0x5555_5555_5555_5555;
     let faded = match channel {
         ChannelSpec::Awgn => {
-            coppa_channel::awgn_ref_seeded(&clean, snr_db, p_clean, sr, noise_seed)
+            coppa_channel::awgn_ref_seeded(&tx_signal, snr_db, p_clean, sr, noise_seed)
         }
         ChannelSpec::Watterson(preset) => {
             let faded = coppa_channel::watterson::watterson_preset(
-                &clean,
+                &tx_signal,
                 sr,
                 preset,
                 seed ^ 0x3333_3333_3333_3333,
@@ -124,6 +137,7 @@ pub fn run_scenario(scenario: &Scenario) -> Vec<MeasurementPoint> {
                 snr_db,
                 scenario.channel,
                 scenario.cfo_hz,
+                scenario.ssb,
                 seed,
             );
             frame_samples = fs;
@@ -164,6 +178,7 @@ mod tests {
             seed: 0xABCD,
             profile_override: None,
             cfo_hz: 0.0,
+            ssb: false,
         };
         let points = run_scenario(&scenario);
         assert_eq!(points.len(), 1);
@@ -184,6 +199,7 @@ mod tests {
             seed: 0xABCD,
             profile_override: None,
             cfo_hz: 0.0,
+            ssb: false,
         };
         let points = run_scenario(&scenario);
         assert_eq!(points.len(), 2);
@@ -211,6 +227,7 @@ mod tests {
             seed: 0xBEEF,
             profile_override: Some(coppa_codec::ofdm::CoppaProfile::hf_robust()),
             cfo_hz: 0.0,
+            ssb: false,
         };
         let points = run_scenario(&scenario);
         assert_eq!(points.len(), 1);
@@ -244,6 +261,7 @@ mod tests {
             seed: 0x5EED,
             profile_override: None,
             cfo_hz: 0.0,
+            ssb: false,
         };
         let awgn = run_scenario(&mk(ChannelSpec::Awgn));
         let poor = run_scenario(&mk(ChannelSpec::Watterson(
@@ -254,6 +272,31 @@ mod tests {
             "fading must cost SNR: poor fer={} awgn fer={}",
             poor[0].fer,
             awgn[0].fer
+        );
+    }
+
+    #[test]
+    fn ssb_channel_flag_decodes_cleanly_at_high_snr() {
+        // Sanity check for the `ssb` wrapper: an HF-routed level through a realistic
+        // rig audio passband (300-2700 Hz) plus the transceiver's own RX bandpass
+        // (250-2850 Hz) must still decode cleanly at high AWGN SNR — both filters'
+        // passbands comfortably contain the HF profile's active band (350-2700 Hz).
+        let scenario = Scenario {
+            level: 2,
+            channel: ChannelSpec::Awgn,
+            snr_db_points: vec![30.0],
+            trials: 20,
+            seed: 0x5CAB,
+            profile_override: None,
+            cfo_hz: 0.0,
+            ssb: true,
+        };
+        let points = run_scenario(&scenario);
+        assert_eq!(points.len(), 1);
+        assert!(
+            points[0].fer <= 0.1,
+            "ssb-filtered level 2 should decode cleanly at 30 dB AWGN (fer={})",
+            points[0].fer
         );
     }
 }

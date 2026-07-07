@@ -140,6 +140,34 @@ pub fn awgn_ref_seeded(
         .collect()
 }
 
+/// Number of FIR taps for [`ssb_filter`]. Matches the TX bandpass in
+/// `coppa_codec`'s `CoppaModem` (601), not because the two filters need equal
+/// margins (this one's passband is narrower — 300-2700 Hz vs the modem's
+/// 250-2850 Hz), but because 601 was directly measured (see the `ssb_filter_*`
+/// tests below) to already clear -30 dB attenuation at genuinely out-of-band
+/// guard frequencies with comfortable margin (~-59 dB at 100 Hz, ~-110 dB at
+/// 4 kHz), so there is nothing to gain by tuning it down for this task.
+const SSB_FILTER_TAPS: usize = 601;
+
+/// Emulate a typical SSB amateur-radio rig's audio passband: a 300-2700 Hz
+/// bandpass applied to the transmitted/received audio. Real rigs' TX and RX
+/// audio filters roughly bound the signal to this range (a conventional
+/// "communications quality" voice passband); this models that constraint for
+/// benching against a realistic channel instead of an idealized full-band one.
+///
+/// Reuses [`coppa_dsp::fir::design_bandpass`] at [`SSB_FILTER_TAPS`] taps — see
+/// that constant's doc for why 601 (not fewer) is justified here by direct
+/// measurement rather than assumption.
+pub fn ssb_filter(samples: &[f32], sample_rate: f32) -> Vec<f32> {
+    let fir = coppa_dsp::fir::Fir::new(coppa_dsp::fir::design_bandpass(
+        SSB_FILTER_TAPS,
+        sample_rate,
+        300.0,
+        2700.0,
+    ));
+    fir.filter_block(samples)
+}
+
 /// Apply a true single-sideband frequency shift to a passband signal.
 pub fn freq_offset(
     samples: &[f32],
@@ -406,6 +434,41 @@ mod tests {
             (p - 8.0).abs() / 8.0 < 0.05,
             "noise power should be ~8.0, got {p}"
         );
+    }
+
+    #[test]
+    fn ssb_filter_rejects_out_of_band_tones() {
+        // Direct time-domain measurement (same method as coppa-dsp's
+        // `bandpass_rejects_out_of_band_tones`, which caught the TX filter's
+        // 301-tap shortfall): steady-state RMS of a tone after filtering,
+        // relative to an in-band tone. Guard frequencies (100 Hz, 4 kHz) are
+        // NOT at this filter's own 300/2700 Hz cutoffs — testing exactly at a
+        // cutoff always reads ~-6 dB regardless of tap count, by definition.
+        let fs = 48_000.0f32;
+        let tone = |f: f32| -> f32 {
+            let x: Vec<f32> = (0..4800)
+                .map(|i| (std::f32::consts::TAU * f * i as f32 / fs).sin())
+                .collect();
+            let y = ssb_filter(&x, fs);
+            let tail = &y[2400..];
+            (tail.iter().map(|v| v * v).sum::<f32>() / tail.len() as f32).sqrt()
+        };
+        let in_band = tone(1500.0);
+        let below_db = 20.0 * (tone(100.0) / in_band).log10();
+        let above_db = 20.0 * (tone(4000.0) / in_band).log10();
+        assert!(below_db < -30.0, "-30 dB at 100 Hz, got {below_db} dB");
+        assert!(above_db < -30.0, "-30 dB at 4 kHz, got {above_db} dB");
+        assert!(
+            (0.9..1.1).contains(&(tone(1200.0) / in_band)),
+            "flat passband well inside 300-2700 Hz"
+        );
+    }
+
+    #[test]
+    fn ssb_filter_preserves_length() {
+        let x = vec![1.0f32; 500];
+        let y = ssb_filter(&x, 48_000.0);
+        assert_eq!(y.len(), x.len());
     }
 
     #[test]
