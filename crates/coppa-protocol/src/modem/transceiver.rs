@@ -153,6 +153,54 @@ mod tests {
     use super::*;
     use coppa_codec::ofdm::frame::CoppaFrameType;
 
+    /// Regression test: VHF-routed speed levels (5,6,7,9,10 via `select_profile` in
+    /// coppa-bench, which chooses `vhf_wide` for level >= 5) previously fell back to
+    /// an unconditioned TX path that never leveled the preamble against the much
+    /// quieter header/payload body, leaving the transmitted peak above full scale
+    /// (measured ~1.026 before the fix) and the payload badly underpowered relative
+    /// to the whole-frame mean power any AWGN budget is referenced to. Exercise many
+    /// random payloads through the full `CoppaTransceiver` (LDPC + interleave +
+    /// mapping) at a VHF speed level with zero channel impairment.
+    #[test]
+    fn vhf_level5_transceiver_round_trips_with_bounded_peak() {
+        use coppa_codec::ofdm::CoppaProfile;
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        let profile = CoppaProfile::vhf_wide();
+        let tx = CoppaTransceiver::new(profile, 1);
+        let mut ok_count = 0;
+        for trial in 0..20u64 {
+            let seed = 0xABCDu64.wrapping_add(trial);
+            let mut rng = StdRng::seed_from_u64(seed);
+            let payload_bytes = 130usize; // level 5 payload size per bench MODES
+            let payload: Vec<u8> = (0..payload_bytes).map(|_| rng.random::<u8>()).collect();
+            let header = CoppaHeader {
+                version: 1,
+                phy_mode: 0,
+                frame_type: CoppaFrameType::Data,
+                bandwidth: 1,
+                fec_type: 0,
+                speed_level: 5,
+                seq_num: 0,
+                payload_len: payload_bytes as u16,
+            };
+            let clean = tx.transmit(&header, &payload);
+            let peak = clean.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+            assert!(
+                peak <= 0.5001,
+                "trial {trial}: TX peak must be normalized to ~0.5 FS, got {peak}"
+            );
+            let result = tx.receive(&clean);
+            if result.is_ok() {
+                ok_count += 1;
+            }
+        }
+        assert!(
+            ok_count == 20,
+            "all 20 clean-channel VHF trials should decode, got {ok_count}/20"
+        );
+    }
+
     fn make_header(speed_level: u8, payload_len: u16) -> CoppaHeader {
         CoppaHeader {
             version: 1,
