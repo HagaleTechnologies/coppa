@@ -10,10 +10,17 @@
 //! - Opens/closes a candidate plateau on `M` crossing 0.5, then CONFIRMS the
 //!   candidate against the cached clean preamble (rejecting steady tones and
 //!   other non-preamble self-similar signals) and refines timing to the
-//!   *first* multipath arrival rather than the strongest one.
+//!   *strongest* multipath arrival, falling back to the *first* arrival only
+//!   when the two are separated by more than half the cyclic prefix (see
+//!   `docs/adr/004-strongest-path-timing.md`: anchoring on a weak-but-earliest
+//!   tap under realistic HF Watterson fading measurably wrecked the sparse-pilot
+//!   protected header's channel estimate; Task 5 originally anchored on the
+//!   first arrival unconditionally, which is what this ADR corrects).
 //!
 //! See `docs/superpowers/plans/2026-07-03-phase1-radio-reality.md` Task 5 (or its
-//! successor Phase-2 rate-loop plan) for the design rationale and locked algorithm.
+//! successor Phase-2 rate-loop plan) for the original design rationale and locked
+//! algorithm, and `docs/adr/004-strongest-path-timing.md` for the timing-anchor
+//! correction on top of it.
 use std::collections::VecDeque;
 
 use num_complex::Complex32;
@@ -36,8 +43,11 @@ const PLATEAU_THRESHOLD: f32 = 0.5;
 /// non-preamble self-similar signals (measured tone-vs-Newman-comb xcorr <= ~0.1).
 const CONFIRM_THRESHOLD: f32 = 0.25;
 /// First-path local-peak acceptance fraction of the window's global xcorr max.
+/// Only used to compute the FALLBACK anchor when the strongest tap is too far
+/// from the earliest one to trust (see `docs/adr/004-strongest-path-timing.md`);
+/// the strongest tap itself is preferred whenever it's within `cp/2` of first path.
 const FIRST_PATH_FRACTION: f32 = 0.5;
-/// Backoff (samples) from the detected first-path arrival into the cyclic
+/// Backoff (samples) from the detected timing anchor into the cyclic
 /// prefix, giving the downstream FFT window margin against timing jitter.
 ///
 /// DEVIATION FROM THE TASK 5 SPEC (documented per its "not to be changed
@@ -63,7 +73,8 @@ const TIMING_BACKOFF: u64 = 30;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SyncCandidate {
     /// Sample index (in the coordinate system of all samples ever pushed) of the
-    /// preamble start, after first-path refinement and TIMING_BACKOFF.
+    /// preamble start, after strongest/first-path timing refinement and
+    /// TIMING_BACKOFF (see `docs/adr/004-strongest-path-timing.md`).
     pub frame_start: u64,
     /// Two-stage Moose CFO estimate (Hz), from `estimate_cfo_two_stage` run on the
     /// coarse plateau peak's analytic window. The modem removes this from the whole
@@ -74,7 +85,9 @@ pub struct SyncCandidate {
 }
 
 /// Streaming preamble sync detector: O(1) per-sample cost, thresholded
-/// confirmation, first-path (not strongest-path) timing.
+/// confirmation, strongest-path timing (falling back to first-path only when
+/// the two are separated by more than half the cyclic prefix — see
+/// `docs/adr/004-strongest-path-timing.md`).
 pub struct SyncDetector {
     profile: CoppaProfile,
     /// OFDM symbol length (fft_size + cp_samples) — the Schmidl-Cox lag `L`.
@@ -353,6 +366,7 @@ impl SyncDetector {
         let n_positions = (hi - lo + 1) as usize;
         let mut xcorr = Vec::with_capacity(n_positions);
         let mut best = 0.0f32;
+        let mut best_idx = 0usize;
         for d in lo..=hi {
             let start = (d - lo) as usize;
             let mut corr = 0.0f32;
@@ -367,6 +381,7 @@ impl SyncDetector {
             xcorr.push(nc);
             if nc > best {
                 best = nc;
+                best_idx = start;
             }
         }
 
@@ -374,7 +389,30 @@ impl SyncDetector {
             return true;
         }
 
-        let local_peak_abs = find_first_path(&xcorr, lo, best);
+        let strongest_abs = lo + best_idx as u64;
+        let first_path_abs = find_first_path(&xcorr, lo, best);
+        // Prefer the STRONGEST tap as the timing anchor (the composite channel's
+        // energy-weighted arrival point) over the earliest-arriving one, UNLESS the two
+        // are separated by more than half the cyclic prefix — see
+        // `docs/adr/004-strongest-path-timing.md` for the full evidence trail. Anchoring
+        // at the strongest tap keeps the 2D-pooled, sparse-pilot header estimator's
+        // linear interpolation tracking a much better-conditioned per-carrier response
+        // than anchoring at a possibly-much-weaker first arrival does — measured directly
+        // to cut Watterson-Moderate/Poor header decode failures on `hf_standard` levels
+        // 1-2 from a hard ~30% FER floor back to matching (or beating) pre-Phase-1
+        // levels, with real but smaller/partial gains for levels 3-4 (see
+        // `.superpowers/sdd/p1-fading-regression-fix-report.md` for the full numbers),
+        // and zero AWGN cost (a single dominant path, where the two anchors coincide).
+        // The `cp/2` bound preserves the original first-path SAFETY intent
+        // (never anchor on a late, dominant echo that could carry the FFT window
+        // dangerously close to running out of cyclic-prefix margin) for delay spreads
+        // beyond anything this codebase's own HF channel models produce (Watterson
+        // Poor's modeled delay is 96 samples on this profile's 300-sample CP).
+        let local_peak_abs = if strongest_abs.abs_diff(first_path_abs) > cp / 2 {
+            first_path_abs
+        } else {
+            strongest_abs
+        };
         let frame_start = local_peak_abs.saturating_sub(TIMING_BACKOFF);
         out.push(SyncCandidate {
             frame_start,
@@ -617,19 +655,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn detector_locks_first_path_not_strongest() {
-        let profile = CoppaProfile::hf_standard();
-        let frame = test_frame(&profile);
+    /// Two-tap test signal: `clean` delayed by `delay` samples and scaled by
+    /// `echo_amp`, added to `direct_amp * clean`.
+    fn two_tap(clean: &[f32], direct_amp: f32, echo_amp: f32, delay: usize) -> Vec<f32> {
+        let mut rx = vec![0.0f32; clean.len()];
+        for k in 0..clean.len() {
+            let echo = if k >= delay {
+                echo_amp * clean[k - delay]
+            } else {
+                0.0
+            };
+            rx[k] = direct_amp * clean[k] + echo;
+        }
+        rx
+    }
 
-        // Leading gap + preamble/frame + tail (room for the confirm/refine window).
-        // The lead must comfortably exceed the streaming detector's bootstrap
-        // window (2*symbol_len analytic samples) so the very first Schmidl-Cox
-        // window is pure silence (M ~ 0) rather than already straddling the
-        // preamble — otherwise the plateau "opens" before the detector has ever
-        // seen a clean silence baseline, which the batch/full-search legacy
-        // detector this replaces didn't have to worry about (it had no bootstrap
-        // window at all).
+    /// Leading gap + preamble/frame + tail (room for the confirm/refine window).
+    /// The lead must comfortably exceed the streaming detector's bootstrap
+    /// window (2*symbol_len analytic samples) so the very first Schmidl-Cox
+    /// window is pure silence (M ~ 0) rather than already straddling the
+    /// preamble.
+    fn leading_clean_frame(profile: &CoppaProfile) -> (usize, Vec<f32>) {
+        let frame = test_frame(profile);
         let lead = 4 * (profile.fft_size + profile.cp_samples);
         let mut clean = vec![0.0f32; lead];
         clean.extend_from_slice(&frame);
@@ -637,20 +684,36 @@ mod tests {
             0.0f32,
             4 * (profile.fft_size + profile.cp_samples),
         ));
+        (lead, clean)
+    }
+
+    /// **Corrected behavior (see `docs/adr/004-strongest-path-timing.md`)**: at a
+    /// delay spread on the scale this codebase's own Watterson HF channel models
+    /// actually produce (96 samples = Watterson-Poor's modeled 2 ms delay spread
+    /// on this 48 kHz profile), the detector must anchor on the STRONGER tap, not
+    /// the earliest one. Task 5 originally required the opposite (see the removed
+    /// `detector_locks_first_path_not_strongest` test this replaces) on the theory
+    /// that first-path anchoring is always safer; measured directly (paired,
+    /// same-seed Watterson-Moderate bench + a same-seed bit-error comparison) that
+    /// anchoring on a weak-but-earliest tap at this delay scale corrupts the
+    /// protected header's sparse-pilot (4-pilot `hf_standard`) 2D channel estimate
+    /// badly enough to floor FER at ~30% regardless of SNR (level 1, BPSK 1/4), while
+    /// anchoring on the strongest tap restores the pre-Phase-1 ~2-5% FER there. Levels
+    /// 3-4 recover most but not all of the gap (see
+    /// `.superpowers/sdd/p1-fading-regression-fix-report.md`). The two anchors coincide
+    /// (no behavior change at all) whenever one tap dominates, which is why AWGN
+    /// and the VHF (denser-pilot) levels were and remain unaffected.
+    #[test]
+    fn detector_prefers_strongest_path_at_realistic_hf_delay() {
+        let profile = CoppaProfile::hf_standard();
+        let (lead, clean) = leading_clean_frame(&profile);
 
         // Two-tap channel: a WEAKER direct path plus a STRONGER echo +96 samples
-        // later. The detector must lock onto the direct (first) arrival, not
-        // the stronger echo.
+        // later (Watterson-Poor's modeled delay spread on this profile). The
+        // detector must now lock onto the stronger echo, not the weaker direct
+        // arrival.
         let delay = 96usize;
-        let mut rx = vec![0.0f32; clean.len()];
-        for k in 0..clean.len() {
-            let echo = if k >= delay {
-                1.0 * clean[k - delay]
-            } else {
-                0.0
-            };
-            rx[k] = 0.6 * clean[k] + echo;
-        }
+        let rx = two_tap(&clean, 0.6, 1.0, delay);
 
         let candidates = SyncDetector::detect_all(&profile, 1, &rx);
         assert_eq!(
@@ -659,14 +722,49 @@ mod tests {
             "expected exactly one candidate, got {candidates:?}"
         );
 
-        // Expected position: the DIRECT path's TRUE (post-TX-bandpass) arrival
-        // minus the deliberate TIMING_BACKOFF — see `tx_bpf_group_delay`.
+        // Expected position: the ECHO's TRUE (post-TX-bandpass) arrival minus the
+        // deliberate TIMING_BACKOFF — see `tx_bpf_group_delay`.
+        let expected =
+            lead as i64 + tx_bpf_group_delay(&profile) + delay as i64 - TIMING_BACKOFF as i64;
+        let err = (candidates[0].frame_start as i64 - expected).abs();
+        assert!(
+            err <= 30,
+            "frame_start {} should be within 30 of the STRONGER echo's arrival - backoff \
+             ({expected}), not the weaker direct path; err={err}",
+            candidates[0].frame_start
+        );
+    }
+
+    /// The original first-path SAFETY property is still preserved for delay
+    /// spreads well beyond anything this codebase's HF channel models produce:
+    /// once the stronger tap is more than half the cyclic prefix away from the
+    /// earliest one, anchoring on it would risk running the FFT window too close
+    /// to (or past) the edge of the cyclic-prefix-protected, ISI-free region, so
+    /// the detector falls back to the earliest (direct) arrival instead.
+    #[test]
+    fn detector_falls_back_to_first_path_beyond_half_cp() {
+        let profile = CoppaProfile::hf_standard();
+        let (lead, clean) = leading_clean_frame(&profile);
+
+        // Delay well beyond cp/2 (150 samples on this profile) but still within
+        // one cyclic prefix (300 samples), so the confirm/refine search window
+        // (+/- cp around the coarse peak) still covers both taps.
+        let delay = profile.cp_samples * 3 / 4;
+        let rx = two_tap(&clean, 0.6, 1.0, delay);
+
+        let candidates = SyncDetector::detect_all(&profile, 1, &rx);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "expected exactly one candidate, got {candidates:?}"
+        );
+
         let expected = lead as i64 + tx_bpf_group_delay(&profile) - TIMING_BACKOFF as i64;
         let err = (candidates[0].frame_start as i64 - expected).abs();
         assert!(
             err <= 30,
-            "frame_start {} should be within 30 of the DIRECT path's arrival - backoff ({expected}), \
-             not the echo; err={err}",
+            "frame_start {} should be within 30 of the DIRECT path's arrival - backoff \
+             ({expected}), not the far, stronger echo; err={err}",
             candidates[0].frame_start
         );
     }

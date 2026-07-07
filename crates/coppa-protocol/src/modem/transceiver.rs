@@ -391,6 +391,47 @@ mod tests {
         assert_eq!(&rx[..payload.len()], payload.as_slice());
     }
 
+    /// Regression test for the sync timing-anchor fix in
+    /// `docs/adr/004-strongest-path-timing.md`: `hf_standard`'s sparse (4-)pilot
+    /// protected header must survive Watterson-Moderate fading at a level (1,
+    /// BPSK 1/4) and SNR (21 dB) that pre-Phase-1 measurements
+    /// (`results/rebaseline-2026-07/moderate.csv`) clear comfortably. The bug this
+    /// guards against (`SyncDetector` anchoring on a weak-but-earliest multipath
+    /// tap instead of the strongest one) floored this exact scenario at a ~65-70%
+    /// success rate regardless of SNR; the 80% bar is comfortably below normal
+    /// trial-to-trial variance at this operating point and well above that floor.
+    #[test]
+    fn hf_standard_header_survives_watterson_moderate_fading() {
+        use coppa_channel::watterson::WattersonPreset;
+
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let payload = vec![0x5Au8; 20];
+        let header = make_header(1, payload.len() as u16); // level 1 = BPSK 1/4
+        let clean = tx.transmit(&header, &payload);
+
+        const TRIALS: u64 = 30;
+        let mut ok = 0u64;
+        for trial in 0..TRIALS {
+            let seed = 0xFADE_0000u64.wrapping_add(trial);
+            let faded = coppa_channel::watterson::watterson(
+                &clean,
+                48_000.0,
+                &WattersonPreset::Moderate.config(),
+                seed,
+            );
+            let noisy = coppa_channel::awgn_seeded(&faded, 21.0, seed ^ 0x55AA);
+            if matches!(tx.receive(&noisy), Ok((_, rx)) if rx[..payload.len()] == payload[..]) {
+                ok += 1;
+            }
+        }
+        assert!(
+            ok * 100 >= TRIALS * 80,
+            "hf_standard level-1 header should survive Watterson-Moderate fading at 21 dB in \
+             the large majority of trials, got {ok}/{TRIALS} -- if this regresses, check the \
+             sync timing anchor policy (docs/adr/004-strongest-path-timing.md)"
+        );
+    }
+
     #[test]
     fn test_transceiver_bpsk_rate_half_loopback() {
         let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
