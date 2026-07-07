@@ -121,7 +121,7 @@ impl CoppaTransceiver {
         // 1. Demodulate to soft symbols (coded symbol count derived from header speed level)
         let (header, eq_symbols, noise_vars) = self
             .modem
-            .demodulate_soft_coded(samples)
+            .demodulate_frame(samples)
             .ok_or(ReceiveError::SyncFailed)?;
 
         // 2. Resolve speed level components
