@@ -31,6 +31,7 @@
 //! mechanics, then read the Coppa stack for the production design.
 pub mod coppa_modem;
 pub mod cross_frame_interleaver;
+pub mod delay_domain;
 pub mod equalizer;
 pub mod frame;
 pub mod golay;

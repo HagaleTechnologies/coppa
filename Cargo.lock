@@ -330,6 +330,7 @@ dependencies = [
  "coppa-codec",
  "coppa-ml",
  "coppa-protocol",
+ "num-complex",
  "rand",
 ]
 
