@@ -31,7 +31,7 @@ cargo bench --workspace
 
 ## Testing Policy
 
-**Always run `cargo test --workspace` locally before pushing.** The full test suite (integration tests, proptest roundtrips) is not run in CI to save GitHub Actions minutes. At minimum, run `cargo test --workspace --lib` for quick feedback.
+**Run `cargo test --workspace` locally before pushing for fast feedback.** The full test suite (integration tests, proptest roundtrips) now runs in CI on every push/PR (`test-full` job, Linux, `--features cpal-backend,websocket`). Local full-suite runs are still recommended before pushing — CI catches it, but local runs are faster feedback. At minimum, run `cargo test --workspace --lib` for a quick sanity check.
 
 ## Workspace Structure
 
@@ -62,7 +62,7 @@ cargo bench --workspace
 ## CI
 
 Single workflow at `.github/workflows/ci.yml` runs on push/PR to main:
-- `cargo check`, `cargo test --lib` (with features), clippy, fmt, MSRV (1.85.0), platform checks (Linux/macOS/Windows), security audit.
+- `cargo check`, `cargo test --lib` (fast signal, with features), **full test suite** (`cargo test --workspace --features cpal-backend,websocket`, Linux), clippy, fmt, MSRV (1.85.0), platform checks (Linux/macOS/Windows, `--lib` only on non-Linux to save runner minutes), **cargo-deny** supply-chain check, security audit (rustsec/audit-check).
 
 ## MSRV
 
