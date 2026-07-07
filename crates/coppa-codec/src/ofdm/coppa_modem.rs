@@ -12,7 +12,7 @@ use num_complex::Complex32;
 
 use coppa_dsp::fft::FftProcessor;
 
-use super::equalizer::{mmse_equalize, LinearInterpolationEstimator};
+use super::delay_domain::DelayDomainEstimator;
 use super::frame::CoppaHeader;
 use super::header_fec;
 use super::papr_clip;
@@ -20,7 +20,6 @@ use super::pilots::CoppaPilotPattern;
 use super::sync::{coppa_pn_sequence, generate_coppa_preamble};
 use super::sync_detector::SyncDetector;
 use super::CoppaProfile;
-use crate::traits::ChannelEstimator;
 
 /// Speed level configuration for future MCS support.
 #[derive(Debug, Clone, Copy)]
@@ -131,6 +130,12 @@ pub struct CoppaModem {
     /// `modulate_mapped_round_trips_through_demodulate_frame` below and
     /// `vhf_routed_level_awgn_sweep_decodes_at_high_snr` in coppa-bench.
     tx_bpf: Option<coppa_dsp::fir::Fir>,
+    /// Deterministic bulk delay (grid units) between `SyncDetector`'s timing anchor
+    /// and this profile's TX chain's true zero-delay reference, measured ONCE on a
+    /// clean (no-channel) calibration frame at construction time — see
+    /// `measure_bulk_bias`'s doc for why this must be a fixed, profile-specific
+    /// constant rather than something re-derived per received frame.
+    calibrated_bias: f32,
 }
 
 impl CoppaModem {
@@ -149,13 +154,99 @@ impl CoppaModem {
                 2850.0,
             ))
         });
-        Self {
+        let mut modem = Self {
             profile,
             fft,
             pilots,
             version,
             tx_bpf,
+            calibrated_bias: 0.0,
+        };
+        modem.calibrated_bias = modem.measure_bulk_bias();
+        modem
+    }
+
+    /// Measure this profile's fixed sync-detector-vs-TX-chain bulk delay bias on a
+    /// clean (no propagation channel) calibration frame.
+    ///
+    /// # Why this exists (a correction discovered by measurement during Task 1)
+    ///
+    /// `SyncDetector`'s correlation-based timing lock is deliberately CP-tolerant —
+    /// any timing offset within the cyclic prefix is a normal, load-bearing property
+    /// of OFDM sync, not a bug. For HF profiles specifically (whose TX chain runs the
+    /// whole frame, preamble included, through a 601-tap TX bandpass FIR — see the
+    /// `tx_bpf` field doc), this codebase's detector locks ~30 samples earlier than
+    /// the filter's exact group delay, a *deterministic* property of this TX-chain +
+    /// detector combination (confirmed directly: `hf_standard` measures a bulk delay
+    /// of ≈1.5 grid units on a clean loopback; `vhf_narrow`, with no TX bandpass,
+    /// measures ≈0). `DelayDomainEstimator`'s basis only spans integer delay-grid
+    /// positions `ℓ=0..L-1` (`L≤8`); a non-integer bulk delay this large, left
+    /// uncorrected, spreads (Dirichlet-kernel leakage) across most of those `L` taps
+    /// instead of concentrating in one, producing enormous apparent fit noise even on
+    /// a genuinely clean, noise-free channel (measured: `noise_var` in the *hundreds*
+    /// — see Task 1's report).
+    ///
+    /// This measures that bias ONCE, from a clean calibration frame, rather than
+    /// re-deriving it adaptively from each received (possibly faded) frame's probe.
+    /// That distinction matters: `estimate_coarse_delay` on a REAL two-tap Watterson
+    /// channel converges toward a power-weighted average of the two taps' delays,
+    /// which — because both ITU-R F.1487 taps have EQUAL average power and fade
+    /// independently — swings toward whichever tap happens to be instantaneously
+    /// stronger in a given fading realization. Using that adaptive (per-frame)
+    /// estimate as the derotation was tried first and directly measured to regress
+    /// `hf_standard_header_survives_watterson_moderate_fading` from ~100% to ~73%
+    /// (22/30): whichever tap was momentarily weaker would sometimes land at a
+    /// NEGATIVE relative delay after derotation — unrepresentable by this model's
+    /// non-negative integer-grid basis — silently discarding it. Fixing the bias at
+    /// construction time (measured once, on a clean reference, so it reflects only
+    /// the deterministic TX/detector artifact) leaves genuine per-frame multipath
+    /// entirely in its own natural, non-negative reference frame (both ITU-R taps
+    /// start at delay ≥ 0 by construction), matching this estimator's assumptions.
+    fn measure_bulk_bias(&self) -> f32 {
+        let header = CoppaHeader {
+            version: self.version,
+            phy_mode: self.profile.phy_mode,
+            frame_type: super::frame::CoppaFrameType::Data,
+            bandwidth: self.profile.bandwidth_id,
+            fec_type: 0,
+            speed_level: 1,
+            seq_num: 0,
+            payload_len: 8,
+        };
+        let symbols = vec![Complex32::new(1.0, 0.0); 64];
+        let samples = self.modulate_mapped(&header, &symbols, 6.0);
+
+        let Some(candidate) = SyncDetector::detect_all(&self.profile, self.version, &samples)
+            .into_iter()
+            .next()
+        else {
+            return 0.0;
+        };
+        let timing_offset = candidate.frame_start as usize;
+        let corrected: Vec<f32> = if candidate.cfo_hz.abs() > 0.5 {
+            crate::ofdm::sync::remove_cfo(
+                &samples,
+                candidate.cfo_hz,
+                self.profile.sample_rate as f32,
+            )
+        } else {
+            samples
+        };
+        let symbol_len = self.profile.fft_size + self.profile.cp_samples;
+        let data_start = timing_offset + 3 * symbol_len;
+        let probe_start = data_start.saturating_sub(symbol_len);
+        if probe_start + symbol_len > corrected.len() {
+            return 0.0;
         }
+        let carriers = self.demod_ofdm_symbol(&corrected[probe_start..probe_start + symbol_len]);
+        let pn = coppa_pn_sequence(self.version);
+        let nc = self.profile.total_active_carriers();
+        let probe_h: Vec<Complex32> = carriers
+            .iter()
+            .enumerate()
+            .map(|(i, &y)| y * pn[i % pn.len()])
+            .collect();
+        super::delay_domain::estimate_coarse_delay(nc, &probe_h)
     }
 
     /// Number of data carriers per OFDM symbol (excluding pilots).
@@ -327,7 +418,6 @@ impl CoppaModem {
     ) -> Option<(CoppaHeader, Vec<Complex32>, Vec<f32>)> {
         let symbol_len = self.profile.fft_size + self.profile.cp_samples;
         let data_per_sym = self.data_carriers_per_symbol();
-        let total_active = self.profile.total_active_carriers();
 
         // 1. Sync: streaming O(1) detector (see `sync_detector` module docs), which now
         // also produces a two-stage Moose CFO estimate (`cfo_hz`, ±50 Hz range) alongside
@@ -358,6 +448,15 @@ impl CoppaModem {
             return None;
         }
 
+        // 1c. Delay-domain model calibration: one LS fit against the full-comb PROBE
+        // symbol (index 2, i.e. the OFDM symbol immediately before `data_start` — see
+        // `modulate_mapped` step 2 and `probe_calibration`'s doc), computed once per
+        // frame and shared by both the header and payload estimation passes below
+        // (the header pass, in `demodulate_header_bits`, re-derives the same value
+        // itself since `demodulate_header` is also a standalone public entry point
+        // used by `StreamingReceiver` without this frame-level context).
+        let (coarse_delay, probe_order) = self.probe_calibration(samples, data_start);
+
         // 2. Protected header (2D-pooled estimation, hard-decision BPSK) -> FEC decode.
         let num_header_syms = header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(data_per_sym);
         let header = self.demodulate_header(samples, data_start)?;
@@ -378,7 +477,7 @@ impl CoppaModem {
 
         // Pass 1: demodulate every payload symbol and collect its carriers + pilots.
         let mut sym_carriers: Vec<(usize, Vec<Complex32>)> = Vec::with_capacity(num_payload_syms);
-        let mut per_symbol_pilots: Vec<Vec<(usize, Complex32, Complex32)>> =
+        let mut per_symbol_pilots: Vec<Vec<(usize, Complex32)>> =
             Vec::with_capacity(num_payload_syms);
         for sym_idx in 0..num_payload_syms {
             let global_sym = num_header_syms + sym_idx;
@@ -404,18 +503,19 @@ impl CoppaModem {
             let lo = i.saturating_sub(EST_WINDOW);
             let hi = (i + EST_WINDOW + 1).min(n_syms);
             let combined = pool_pilots(&per_symbol_pilots[lo..hi]);
-            let mut estimator = LinearInterpolationEstimator::new(total_active);
-            estimator.update(&combined);
-            let equalized = mmse_equalize(carriers, &estimator, total_active);
-            let mut data = self.pilots.extract_data(&equalized, *global_sym);
+            let pool_scale = mean_weight(&combined);
+            let (equalized, noise_full) =
+                self.estimate_and_equalize(carriers, &combined, probe_order, coarse_delay);
+            let data = self.pilots.extract_data(&equalized, *global_sym);
             let data_indices = self.pilots.data_indices(*global_sym);
-            let carrier_noise = estimator.per_carrier_noise(&data_indices);
-            // Un-bias the equalized data symbols by 1/g (zero-forcing Y/H) so amplitude-bearing
-            // QAM lands at constellation scale; consistent with the σ²/|H|² per-carrier noise above.
-            let gains = estimator.per_carrier_gain(&data_indices);
-            for (sym, &g) in data.iter_mut().zip(gains.iter()) {
-                *sym *= 1.0 / g;
-            }
+            // `noise_full` is the delay-domain fit's residual σ² *per pooled
+            // observation*; scale by the window's mean pooling count to get the
+            // effective noise for the single, unpooled data carrier being decoded
+            // here (see `DelayDomainEstimator::equalize`'s doc).
+            let carrier_noise: Vec<f32> = data_indices
+                .iter()
+                .map(|&idx| noise_full.get(idx).copied().unwrap_or(1e6) * pool_scale)
+                .collect();
             payload_symbols.extend_from_slice(&data);
             noise_variances.extend_from_slice(&carrier_noise);
         }
@@ -423,17 +523,136 @@ impl CoppaModem {
         Some((header, payload_symbols, noise_variances))
     }
 
-    /// Extract pilot info tuples from demodulated carriers for a given symbol number.
+    /// Extract pilot (index, received-value) pairs from demodulated carriers for a
+    /// given symbol number. Coppa pilots are always known BPSK +1.0 symbols, so the
+    /// received value at a pilot position already *is* the channel estimate `H[idx]`
+    /// there (`Y = H·1 + noise`) — no separate "known pilot value" needs to be
+    /// tracked or divided out.
     fn extract_pilot_info(
         &self,
         carriers: &[Complex32],
         symbol_num: usize,
-    ) -> Vec<(usize, Complex32, Complex32)> {
-        self.pilots
-            .extract_pilots(carriers, symbol_num)
+    ) -> Vec<(usize, Complex32)> {
+        self.pilots.extract_pilots(carriers, symbol_num)
+    }
+
+    /// Calibrate the delay-domain model order from the full-comb PROBE symbol — the
+    /// version-keyed BPSK PN sequence transmitted on every active carrier right
+    /// before the header (see `modulate_mapped` step 2). Returns `(coarse_delay,
+    /// order)`:
+    ///
+    /// - `coarse_delay` is always `self.calibrated_bias` (see `measure_bulk_bias`'s
+    ///   doc for why this is a fixed, once-measured constant rather than something
+    ///   re-derived per received frame).
+    /// - `order` (2..=8 taps): one LS fit against `l=8` on the probe (after removing
+    ///   `calibrated_bias`), keeping only the taps that clear the noise floor — see
+    ///   [`DelayDomainEstimator::select_order`].
+    ///
+    /// Falls back to `(calibrated_bias, 6)` if the probe symbol isn't fully within
+    /// `samples` (e.g. a truncated capture) rather than failing outright — the
+    /// payload/header passes still run, just with a possibly-suboptimal (not
+    /// incorrect) model order.
+    fn probe_calibration(&self, samples: &[f32], data_start: usize) -> (f32, usize) {
+        let symbol_len = self.profile.fft_size + self.profile.cp_samples;
+        let nc = self.profile.total_active_carriers();
+        let probe_start = data_start.saturating_sub(symbol_len);
+        if probe_start + symbol_len > samples.len() {
+            return (self.calibrated_bias, 6);
+        }
+        let carriers = self.demod_ofdm_symbol(&samples[probe_start..probe_start + symbol_len]);
+        let pn = coppa_pn_sequence(self.version);
+        // Ĥ_probe(k) = Y_k / pn_k; pn_k ∈ {+1,-1}, so dividing is the same as
+        // multiplying (and avoids a division).
+        let probe_h: Vec<Complex32> = carriers
             .iter()
-            .map(|&(idx, received)| (idx, received, Complex32::new(1.0, 0.0)))
-            .collect()
+            .enumerate()
+            .map(|(i, &y)| y * pn[i % pn.len()])
+            .collect();
+        let derot = coarse_delay_rotation(nc, self.calibrated_bias);
+        let derotated: Vec<Complex32> = probe_h
+            .iter()
+            .enumerate()
+            .map(|(k, &h)| h * derot(k))
+            .collect();
+        let order = DelayDomainEstimator::select_order(nc, &derotated);
+        (self.calibrated_bias, order)
+    }
+
+    /// Fit a [`DelayDomainEstimator`] from pooled pilot observations and
+    /// zero-force equalize `carriers` against it. Shared by both the payload
+    /// estimation pass in `demodulate_frame` and the header estimation pass in
+    /// `demodulate_header_bits` (previously each ran its own separate
+    /// `LinearInterpolationEstimator`/`mmse_equalize` pass; both now go through the
+    /// same delay-domain model — see Task 1 of the Phase 2 receiver-harvest plan).
+    ///
+    /// `coarse_delay` (from [`Self::probe_calibration`]) is removed from both the
+    /// pooled observations and `carriers` before fitting/equalizing (a per-carrier
+    /// phase de-rotation), and is transparent to the caller: the returned `x̂`
+    /// values are still `y/Ĥ` in the *original* (non-derotated) frame, because the
+    /// same rotation is applied to both the model input and the signal being
+    /// equalized — see [`super::delay_domain::estimate_coarse_delay`]'s doc.
+    ///
+    /// `l` is clamped so the fit keeps at least 2 degrees of freedom
+    /// (`pooled.len() - l >= 2`) rather than using the order `select_order` chose
+    /// from the PROBE verbatim. This matters because the probe is a full 48-carrier
+    /// observation (dof = 48-8 = 40, comfortably well-conditioned at any order up to
+    /// 8), but `pooled` — the per-symbol pilot pool this method actually fits — is
+    /// far sparser (e.g. `hf_standard`'s 4-pilot pattern pools to only ~8 distinct
+    /// carriers even across a multi-symbol window, since even/odd alternation caps
+    /// the achievable comb density at 2x a single symbol's pilot count). Using the
+    /// probe's order (often 6-8, sized correctly for a genuine 2-tap Watterson
+    /// spread) directly against only 8 pooled observations leaves as little as 0
+    /// dof — a numerically fragile, near-singular fit. Measured directly: without
+    /// this clamp, real link performance on `watterson-moderate` at level 2
+    /// *regressed* against the pre-Task-1 baseline (FER@10% threshold 18 dB -> 24
+    /// dB) despite every synthetic `delay_domain` unit test passing — the clamp is
+    /// what makes the per-symbol fit match the dof regime those unit tests actually
+    /// exercised (`recovers_two_tap_channel_far_better_than_linear_interp` uses
+    /// exactly `P=8, L=6`, i.e. dof=2, not the unclamped probe order).
+    ///
+    /// # Known unresolved limitation (found by measurement, not fixed in this task)
+    ///
+    /// `coarse_delay` is a single value computed once per frame (see
+    /// `probe_calibration`) and reused unchanged for every window in the frame. Real
+    /// HF channels have non-zero Doppler spread (ITU-R F.1487 Watterson-Moderate:
+    /// 0.5 Hz), so the true bulk-delay reference actually drifts over a frame's
+    /// ~100+ ms duration; reusing one fixed value produces a measured, monotonic
+    /// degradation across a frame (mean |Ĥ|² decaying from ~4 to ~0.1, noise_var
+    /// climbing from ~40 to ~360 over consecutive windows of the SAME frame — see
+    /// Task 1's report). A per-window local re-estimate (tried during this task,
+    /// `estimate_coarse_delay_sparse`, since removed) fixed that monotonic drift and
+    /// measurably improved raw hard-decision symbol accuracy, but net *regressed*
+    /// full-sweep FER — some individual low-SNR windows produced wildly wrong local
+    /// estimates that corrupted the soft-decision noise_var fed to the LDPC decoder
+    /// (observed noise_var maxima in the billions), and gating the header's use of
+    /// it separately didn't fully resolve the trade-off within this task's time
+    /// budget. This remains the primary open lead for why Task 1's bench gate isn't
+    /// met on `hf_standard`/level 2 — see the report for the full account and
+    /// suggested follow-ups (e.g. a smoothed/Kalman-style per-window delay estimate
+    /// instead of a hard re-derivation, or gating on a proper per-window confidence
+    /// measure beyond the coherence check that was tried).
+    fn estimate_and_equalize(
+        &self,
+        carriers: &[Complex32],
+        pooled: &[(usize, Complex32, f32)],
+        l: usize,
+        coarse_delay: f32,
+    ) -> (Vec<Complex32>, Vec<f32>) {
+        let nc = self.profile.total_active_carriers();
+        let max_safe_l = pooled.len().saturating_sub(2).clamp(2, 8);
+        let l = l.min(max_safe_l);
+        let derot = coarse_delay_rotation(nc, coarse_delay);
+        let rotated_pooled: Vec<(usize, Complex32, f32)> = pooled
+            .iter()
+            .map(|&(idx, h, w)| (idx, h * derot(idx), w))
+            .collect();
+        let est = DelayDomainEstimator::fit(nc, l, &rotated_pooled);
+        let rotated_carriers: Vec<Complex32> = carriers
+            .iter()
+            .enumerate()
+            .map(|(k, &y)| y * derot(k))
+            .collect();
+        est.equalize(&rotated_carriers)
     }
 
     /// Demodulate and FEC-decode just the protected header, given samples that start
@@ -474,7 +693,7 @@ impl CoppaModem {
         num_header_syms: usize,
     ) -> Option<Vec<u8>> {
         let symbol_len = self.profile.fft_size + self.profile.cp_samples;
-        let total_active = self.profile.total_active_carriers();
+        let (coarse_delay, l) = self.probe_calibration(samples, data_start);
 
         // Pass 1: collect each header symbol's carriers + pilot observations.
         let mut sym_carriers = Vec::with_capacity(num_header_syms);
@@ -490,7 +709,7 @@ impl CoppaModem {
         }
 
         // Pass 2: pool pilots over a +/-EST_WINDOW symbol window (denser comb + noise
-        // averaging), MMSE-equalize, and BPSK hard-slice.
+        // averaging), delay-domain fit + zero-force equalize, and BPSK hard-slice.
         const EST_WINDOW: usize = 2;
         let n = sym_carriers.len();
         let mut bits = Vec::with_capacity(header_fec::PROTECTED_HEADER_CODED_BITS);
@@ -498,9 +717,8 @@ impl CoppaModem {
             let lo = i.saturating_sub(EST_WINDOW);
             let hi = (i + EST_WINDOW + 1).min(n);
             let combined = pool_pilots(&per_symbol_pilots[lo..hi]);
-            let mut estimator = LinearInterpolationEstimator::new(total_active);
-            estimator.update(&combined);
-            let equalized = mmse_equalize(carriers, &estimator, total_active);
+            let (equalized, _noise) =
+                self.estimate_and_equalize(carriers, &combined, l, coarse_delay);
             let data = self.pilots.extract_data(&equalized, i);
             for &val in &data {
                 if bits.len() < header_fec::PROTECTED_HEADER_CODED_BITS {
@@ -509,6 +727,19 @@ impl CoppaModem {
             }
         }
         Some(bits)
+    }
+}
+
+/// Per-carrier phase rotation `exp(+j2π·k·coarse_delay/nc)` that undoes a coarse bulk
+/// delay of `coarse_delay` grid units — the sign is the inverse of `tau_basis`'s
+/// `exp(-j2π·k·ℓ/nc)`, so multiplying a `coarse_delay`-shifted observation by this
+/// brings it back to a zero-bulk-delay reference frame before fitting the sparse
+/// per-symbol multipath model. See `estimate_and_equalize`'s doc and
+/// `delay_domain::estimate_coarse_delay`'s doc for why this step exists.
+fn coarse_delay_rotation(nc: usize, coarse_delay: f32) -> impl Fn(usize) -> Complex32 {
+    move |k: usize| {
+        let ang = std::f32::consts::TAU * (k as f32) * coarse_delay / nc as f32;
+        Complex32::new(ang.cos(), ang.sin())
     }
 }
 
@@ -556,27 +787,38 @@ fn peak_normalize(mut x: Vec<f32>, peak: f32) -> Vec<f32> {
     x
 }
 
-/// Pool per-symbol pilot observations into one combined pilot set, averaging the received
-/// value at each carrier index across the symbols that sample it. Valid because the channel is
-/// time-invariant within a frame (HF block-fading); the even/odd pilot alternation means the
-/// pooled indices form a denser frequency comb than any single symbol's pilots.
-fn pool_pilots(
-    per_symbol: &[Vec<(usize, Complex32, Complex32)>],
-) -> Vec<(usize, Complex32, Complex32)> {
+/// Pool per-symbol pilot observations into one combined `(carrier_index, H_estimate,
+/// weight)` set for [`DelayDomainEstimator::fit`]: the received value at each carrier
+/// index is averaged across the symbols that sample it, and the pooling COUNT becomes
+/// the fit weight (denser pooling ⇒ lower per-observation noise ⇒ higher LS weight —
+/// exactly the `weights = pooling counts` the estimator's `fit` doc calls for). Valid
+/// because the channel is time-invariant within a frame (HF block-fading); the
+/// even/odd pilot alternation means the pooled indices form a denser frequency comb
+/// than any single symbol's pilots.
+fn pool_pilots(per_symbol: &[Vec<(usize, Complex32)>]) -> Vec<(usize, Complex32, f32)> {
     use std::collections::BTreeMap;
-    let mut acc: BTreeMap<usize, (Complex32, usize, Complex32)> = BTreeMap::new();
+    let mut acc: BTreeMap<usize, (Complex32, usize)> = BTreeMap::new();
     for sym in per_symbol {
-        for &(idx, received, known) in sym {
-            let e = acc
-                .entry(idx)
-                .or_insert((Complex32::new(0.0, 0.0), 0, known));
+        for &(idx, received) in sym {
+            let e = acc.entry(idx).or_insert((Complex32::new(0.0, 0.0), 0));
             e.0 += received;
             e.1 += 1;
         }
     }
     acc.into_iter()
-        .map(|(idx, (sum, count, known))| (idx, sum * (1.0 / count as f32), known))
+        .map(|(idx, (sum, count))| (idx, sum * (1.0 / count as f32), count as f32))
         .collect()
+}
+
+/// Mean pooling weight across a pooled observation set — used to rescale the
+/// delay-domain fit's per-*pooled*-observation noise variance back up to the
+/// effective noise on a single, unpooled data carrier (see
+/// `DelayDomainEstimator::equalize`'s doc and its call site in `demodulate_frame`).
+fn mean_weight(pooled: &[(usize, Complex32, f32)]) -> f32 {
+    if pooled.is_empty() {
+        return 1.0;
+    }
+    pooled.iter().map(|&(_, _, w)| w).sum::<f32>() / pooled.len() as f32
 }
 
 #[cfg(test)]
@@ -858,12 +1100,12 @@ mod tests {
     fn pool_pilots_combines_complementary_symbols() {
         // Symbol A pilots at {0,4}; symbol B at {2,4} (index 4 shared).
         let a = vec![
-            (0usize, Complex32::new(2.0, 0.0), Complex32::new(1.0, 0.0)),
-            (4usize, Complex32::new(1.0, 0.0), Complex32::new(1.0, 0.0)),
+            (0usize, Complex32::new(2.0, 0.0)),
+            (4usize, Complex32::new(1.0, 0.0)),
         ];
         let b = vec![
-            (2usize, Complex32::new(3.0, 0.0), Complex32::new(1.0, 0.0)),
-            (4usize, Complex32::new(3.0, 0.0), Complex32::new(1.0, 0.0)),
+            (2usize, Complex32::new(3.0, 0.0)),
+            (4usize, Complex32::new(3.0, 0.0)),
         ];
         let pooled = pool_pilots(&[a, b]);
         let idxs: Vec<usize> = pooled.iter().map(|(i, _, _)| *i).collect();
@@ -873,6 +1115,12 @@ mod tests {
             (at4.re - 2.0).abs() < 1e-6 && at4.im.abs() < 1e-6,
             "got {at4:?}"
         );
+        // Index 4 was pooled from 2 symbols; its weight (pooling count) must reflect that.
+        let w4 = pooled.iter().find(|(i, _, _)| *i == 4).unwrap().2;
+        assert!((w4 - 2.0).abs() < 1e-6, "expected weight 2.0, got {w4}");
+        // Indices 0 and 2 each came from only 1 symbol: weight 1.
+        let w0 = pooled.iter().find(|(i, _, _)| *i == 0).unwrap().2;
+        assert!((w0 - 1.0).abs() < 1e-6, "expected weight 1.0, got {w0}");
     }
 
     #[test]

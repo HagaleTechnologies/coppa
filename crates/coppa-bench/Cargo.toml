@@ -13,3 +13,4 @@ coppa-channel = { path = "../coppa-channel" }
 coppa-ml = { path = "../coppa-ml" }
 rand = { workspace = true }
 clap = { workspace = true }
+num-complex = { workspace = true }
