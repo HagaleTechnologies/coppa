@@ -6,4 +6,5 @@ pub mod agc;
 pub mod carrier_recovery;
 pub mod fft;
 pub mod filter;
+pub mod fir;
 pub mod timing_recovery;
