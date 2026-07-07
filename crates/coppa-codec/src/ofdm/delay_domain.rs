@@ -112,7 +112,11 @@ fn solve_ridge(
 /// [`DelayDomainEstimator::equalize`] — the same `exp(-j·2π·k·ℓ/nc)` model
 /// `solve_ridge` fits against (kept as an independent definition there per the
 /// task brief's "transcribe verbatim" instruction for the ridge solver).
-fn tau_basis(nc: usize, k: usize, ell: usize) -> Complex32 {
+///
+/// `pub(crate)` so [`super::kalman_tracker`] can reuse the exact same basis
+/// instead of re-deriving it (Task 7's Kalman/RTS tracker evaluates the same
+/// `H(k) = Σ_ℓ h_ℓ·τ(k,ℓ)` model at each step).
+pub(crate) fn tau_basis(nc: usize, k: usize, ell: usize) -> Complex32 {
     let ang = -std::f32::consts::TAU * (k as f32) * (ell as f32) / nc as f32;
     Complex32::new(ang.cos(), ang.sin())
 }
@@ -238,6 +242,13 @@ impl DelayDomainEstimator {
     /// Fit residual noise variance (per observation).
     pub fn noise_var(&self) -> f32 {
         self.noise_var
+    }
+
+    /// The fitted delay-domain tap coefficients `h_0..h_{L-1}`. Exposed so callers
+    /// (e.g. [`super::kalman_tracker`]) can seed a stateful tracker from a one-shot
+    /// probe fit without re-deriving the ridge solve.
+    pub fn taps(&self) -> &[Complex32] {
+        &self.taps
     }
 
     /// Zero-force equalize `carriers` against the fitted model, returning

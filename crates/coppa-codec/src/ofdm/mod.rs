@@ -37,6 +37,7 @@ pub mod frame;
 pub mod golay;
 pub mod header_fec;
 pub mod interleaver;
+pub mod kalman_tracker;
 pub mod pilots;
 pub mod sync;
 pub mod sync_detector;
