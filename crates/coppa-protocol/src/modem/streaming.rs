@@ -160,6 +160,19 @@ impl StreamingReceiver {
         let sync = SyncDetector::new(profile.clone(), version);
         let transceiver = CoppaTransceiver::new(profile, version);
 
+        // Cross-crate invariant: `data_carriers` (used here for frame-length
+        // bookkeeping) must equal what `CoppaModem` computes internally as
+        // `pilots.num_data()` (exposed via `CoppaTransceiver::data_carriers_per_symbol`).
+        // Nothing enforces this at the type level — a future profile change that
+        // breaks the coincidence would silently mis-size the ring/accumulation
+        // buffers instead of failing loudly, so check it here.
+        debug_assert_eq!(
+            data_carriers,
+            transceiver.data_carriers_per_symbol(),
+            "StreamingReceiver's profile.data_carriers must match CoppaModem's \
+             internally-computed data carriers per symbol"
+        );
+
         Self {
             symbol_len,
             data_carriers,
@@ -362,8 +375,10 @@ impl StreamingReceiver {
     /// this DOES need `data_start` to be exactly right. `start` itself is already
     /// correctly located in the RAW domain (that's what `SyncDetector` — also fed
     /// raw samples — determined, and its own tests confirm this works directly on
-    /// unfiltered signals: `detector_locks_first_path_not_strongest` computes its
-    /// expected position from `tx_bpf_group_delay` alone, no RX filter involved).
+    /// unfiltered signals: `detector_prefers_strongest_path_at_realistic_hf_delay`
+    /// and `detector_falls_back_to_first_path_beyond_half_cp` (in
+    /// `coppa-codec/src/ofdm/sync_detector.rs`) both compute their expected
+    /// position from `tx_bpf_group_delay` alone, no RX filter involved).
     /// But `demodulate_header` (like `receive`) runs its OWN one-shot RX-bandpass
     /// filter over whatever slice it's given, which — being a linear-phase FIR —
     /// delays the correctly-filtered content within ITS OWN output by exactly its

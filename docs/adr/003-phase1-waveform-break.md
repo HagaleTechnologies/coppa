@@ -4,6 +4,10 @@
 
 Accepted
 
+See also: ADR-004 (corrects an early root-cause speculation in this document's Consequences
+section — the Watterson-fading regression was bisected to Task 5's `SyncDetector` commit, not
+Tasks 1-4 as speculated below).
+
 ## Context
 
 Coppa's waveform, as it existed through the `feature/hotfix-fec-correctness` baseline, occupied

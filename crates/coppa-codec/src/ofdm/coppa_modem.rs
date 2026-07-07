@@ -159,14 +159,15 @@ impl CoppaModem {
     }
 
     /// Number of data carriers per OFDM symbol (excluding pilots).
-    fn data_carriers_per_symbol(&self) -> usize {
+    pub fn data_carriers_per_symbol(&self) -> usize {
         self.pilots.num_data()
     }
 
     /// Build one OFDM symbol from active-carrier complex values.
     ///
-    /// Places carriers at bins 1..N with Hermitian symmetry, IFFTs,
-    /// and prepends cyclic prefix.
+    /// Places carriers starting at `self.profile.first_active_bin()` (which
+    /// accounts for `carrier_offset`, not always bin 1) with Hermitian
+    /// symmetry, IFFTs, and prepends cyclic prefix.
     pub(crate) fn build_ofdm_symbol(&self, active_carriers: &[Complex32]) -> Vec<f32> {
         let n = self.profile.fft_size;
         let cp = self.profile.cp_samples;
