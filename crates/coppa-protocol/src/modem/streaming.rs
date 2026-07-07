@@ -5,7 +5,11 @@
 //! already know where a whole frame lives in a buffer) with a state machine that
 //! owns a ring of raw samples plus a [`SyncDetector`], and only pays for a full
 //! LDPC/interleave/demap pass once per completed (or provably-failed) candidate —
-//! not once per pushed chunk.
+//! not once per pushed chunk. That "once per candidate, not once per chunk" framing
+//! is a statement about amortized throughput across a session, not about the
+//! latency of any one [`StreamingReceiver::push_samples`] call: the specific call
+//! that completes a candidate pays that full demod/FEC cost synchronously before
+//! returning (see that method's doc).
 //!
 //! State machine (locked, see `docs/superpowers/plans/2026-07-03-phase1-radio-reality.md`
 //! Task 7): `Searching` (represented here as `pending: None`) feeds every pushed
@@ -210,10 +214,23 @@ impl StreamingReceiver {
         self.ring.is_empty()
     }
 
-    /// Feed audio; returns zero or more completed frames. O(chunk) amortized: the
-    /// per-sample cost of buffering + sync detection is O(1), and the one O(frame
-    /// length) demod/FEC pass per candidate is amortized over all the pushes that
-    /// buffered it.
+    /// Feed audio; returns zero or more completed frames.
+    ///
+    /// O(chunk) amortized *throughput*: the per-sample cost of buffering + sync
+    /// detection is O(1), and the one O(frame length) demod/FEC pass per candidate
+    /// is amortized over all the pushes that buffered it — so averaged over a
+    /// session, the cost per sample pushed stays small.
+    ///
+    /// This is NOT a bound on *worst-case per-call latency*. Whichever call happens
+    /// to supply the last sample a pending candidate needs pays the full
+    /// `receive_with_metrics` demod/FEC cost synchronously, inline, before
+    /// returning — measured at ~26-33ms for the slower/most robust speed levels on
+    /// this profile. A caller on a latency-sensitive loop (e.g. an async event
+    /// loop driving audio I/O) should expect an occasional call to stall for a
+    /// full frame's decode time, not assume every call is cheap. See
+    /// `coppa-daemon/src/event_loop.rs`'s `handle_audio_in` for how the daemon
+    /// accepts this trade-off (ring-buffered input + an overflow counter) rather
+    /// than routing the decode through a worker thread.
     pub fn push_samples(&mut self, samples: &[f32]) -> Vec<DecodedFrame> {
         let mut out = Vec::new();
         if samples.is_empty() {
