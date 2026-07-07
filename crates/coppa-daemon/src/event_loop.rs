@@ -49,10 +49,13 @@ pub struct EventLoop {
     ptt: Box<dyn PttControl>,
     /// Optional sender for host responses (decoded data, status updates).
     response_tx: Option<mpsc::Sender<coppa_host::HostResponse>>,
-    /// Accumulated audio input window for decode attempts.
-    audio_window: Vec<f32>,
     /// Counter for audio output ring buffer overflow (dropped samples).
     audio_out_overflow_count: u64,
+    /// Last-seen value of the audio input ring's overflow counter (see
+    /// `AudioRingConsumer::overflow_count`); `poll_audio_input` compares against
+    /// this each poll and logs a warning when it grows (silent RX sample loss was
+    /// a Phase-0-era finding).
+    audio_in_overflow_count: u64,
     /// Shutdown flag shared with audio threads for clean shutdown (E5).
     shutdown_flag: Arc<AtomicBool>,
     /// ARQ transmitter state (active when arq_enabled is true).
@@ -123,8 +126,8 @@ impl EventLoop {
             audio_in: None,
             ptt,
             response_tx: None,
-            audio_window: Vec::new(),
             audio_out_overflow_count: 0,
+            audio_in_overflow_count: 0,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             arq_tx,
             arq_rx,
@@ -285,15 +288,32 @@ impl EventLoop {
 
     /// Poll the audio input ring buffer for new samples.
     async fn poll_audio_input(&mut self) {
+        let mut chunk = None;
         if let Some(ref mut consumer) = self.audio_in {
             let available = consumer.available();
             if available > 0 {
                 let mut buf = vec![0.0f32; available];
                 let read = consumer.read(&mut buf);
                 if read > 0 {
-                    self.handle_audio_in(&buf[..read]).await;
+                    buf.truncate(read);
+                    chunk = Some(buf);
                 }
             }
+
+            // Check the input ring's overflow counter each poll and log a warning
+            // when it grows — silent RX sample loss was a Phase-0-era finding.
+            let overflow = consumer.overflow_count();
+            if overflow > self.audio_in_overflow_count {
+                tracing::warn!(
+                    dropped = overflow - self.audio_in_overflow_count,
+                    cumulative_dropped = overflow,
+                    "Audio input buffer overflow"
+                );
+                self.audio_in_overflow_count = overflow;
+            }
+        }
+        if let Some(buf) = chunk {
+            self.handle_audio_in(&buf).await;
         }
     }
 
@@ -507,43 +527,52 @@ impl EventLoop {
         }
     }
 
-    /// Minimum samples before attempting decode (one OFDM frame ~2048 samples + preamble)
-    const DECODE_WINDOW: usize = 8192;
-    /// Maximum buffer size before draining oldest samples
-    const MAX_STREAM_BUFFER: usize = 131_072;
-    /// Samples to slide forward on failed decode
-    const SLIDE_STEP: usize = 2048;
-
     async fn handle_audio_in(&mut self, samples: &[f32]) {
-        self.audio_window.extend_from_slice(samples);
+        // `CoppaCore::push_samples` owns all the buffering/sync/frame-boundary
+        // bookkeeping the old DECODE_WINDOW/SLIDE_STEP/MAX_STREAM_BUFFER block used
+        // to do by hand here; this just dispatches whatever frames complete as a
+        // result of this chunk.
+        for frame in self.engine.push_samples(samples) {
+            match frame.message {
+                Ok(message) => {
+                    let decoded_bytes = message.as_bytes();
 
-        if self.audio_window.len() < Self::DECODE_WINDOW {
-            return;
-        }
+                    // Try to parse as MAC PDU for session handling
+                    if let Ok(mac_pdu) = MacPdu::from_bytes(decoded_bytes) {
+                        self.handle_mac_pdu(mac_pdu).await;
+                        continue;
+                    }
 
-        // Try to decode the accumulated window
-        match self.engine.decode(&self.audio_window) {
-            Ok(message) => {
-                let decoded_bytes = message.as_bytes();
-
-                // Try to parse as MAC PDU for session handling
-                if let Ok(mac_pdu) = MacPdu::from_bytes(decoded_bytes) {
-                    self.handle_mac_pdu(mac_pdu).await;
-                    self.audio_window.clear();
-                    return;
-                }
-
-                // E6: If ARQ enabled, parse decoded bytes as TransportPdu
-                let output_data = if self.config.engine.arq_enabled {
-                    match TransportPdu::from_bytes(decoded_bytes) {
-                        Ok(pdu) => {
-                            match pdu.transport_type {
-                                TransportType::Reliable | TransportType::Unreliable => {
-                                    // Feed to ARQ receiver
-                                    if let Some(ref mut arq_rx) = self.arq_rx {
-                                        let delivered =
-                                            arq_rx.receive(pdu.seq_num, pdu.payload.clone());
-                                        // Process ACK info back to our TX side
+                    // E6: If ARQ enabled, parse decoded bytes as TransportPdu
+                    let output_data = if self.config.engine.arq_enabled {
+                        match TransportPdu::from_bytes(decoded_bytes) {
+                            Ok(pdu) => {
+                                match pdu.transport_type {
+                                    TransportType::Reliable | TransportType::Unreliable => {
+                                        // Feed to ARQ receiver
+                                        if let Some(ref mut arq_rx) = self.arq_rx {
+                                            let delivered =
+                                                arq_rx.receive(pdu.seq_num, pdu.payload.clone());
+                                            // Process ACK info back to our TX side
+                                            if let Some(ref mut arq_tx) = self.arq_tx {
+                                                arq_tx.process_ack(
+                                                    pdu.ack_num,
+                                                    pdu.ack_bitmap,
+                                                    Instant::now(),
+                                                );
+                                            }
+                                            // Collect all delivered payloads
+                                            let mut all_data = Vec::new();
+                                            for (_seq, data) in delivered {
+                                                all_data.extend(data);
+                                            }
+                                            all_data
+                                        } else {
+                                            pdu.payload
+                                        }
+                                    }
+                                    TransportType::Ack | TransportType::Nak => {
+                                        // Pure ACK/NAK: process and don't forward to host
                                         if let Some(ref mut arq_tx) = self.arq_tx {
                                             arq_tx.process_ack(
                                                 pdu.ack_num,
@@ -551,90 +580,61 @@ impl EventLoop {
                                                 Instant::now(),
                                             );
                                         }
-                                        // Collect all delivered payloads
-                                        let mut all_data = Vec::new();
-                                        for (_seq, data) in delivered {
-                                            all_data.extend(data);
-                                        }
-                                        all_data
-                                    } else {
-                                        pdu.payload
+                                        Vec::new()
                                     }
-                                }
-                                TransportType::Ack | TransportType::Nak => {
-                                    // Pure ACK/NAK: process and don't forward to host
-                                    if let Some(ref mut arq_tx) = self.arq_tx {
-                                        arq_tx.process_ack(
-                                            pdu.ack_num,
-                                            pdu.ack_bitmap,
-                                            Instant::now(),
-                                        );
+                                    TransportType::Reset => {
+                                        // Reset ARQ state
+                                        self.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+                                        self.arq_rx = Some(ArqRx::new(8));
+                                        Vec::new()
                                     }
-                                    Vec::new()
-                                }
-                                TransportType::Reset => {
-                                    // Reset ARQ state
-                                    self.arq_tx = Some(ArqTx::new(ArqConfig::default()));
-                                    self.arq_rx = Some(ArqRx::new(8));
-                                    Vec::new()
                                 }
                             }
+                            Err(e) => {
+                                tracing::debug!(error = %e, "Failed to parse TransportPdu; forwarding raw bytes");
+                                decoded_bytes.to_vec()
+                            }
                         }
-                        Err(e) => {
-                            tracing::debug!(error = %e, "Failed to parse TransportPdu; forwarding raw bytes");
-                            decoded_bytes.to_vec()
-                        }
-                    }
-                } else {
-                    decoded_bytes.to_vec()
-                };
+                    } else {
+                        decoded_bytes.to_vec()
+                    };
 
-                if !output_data.is_empty() {
-                    tracing::info!(bytes = output_data.len(), "Frame decoded successfully");
-                    // Send decoded data back to host clients
-                    if let Some(ref tx) = self.response_tx {
-                        let response = coppa_host::HostResponse::DataOut {
-                            client_id: 0, // broadcast to all clients
-                            data: output_data.clone(),
-                        };
-                        if let Err(e) = tx.try_send(response) {
-                            tracing::warn!(error = %e, "Failed to send decoded response to host");
+                    if !output_data.is_empty() {
+                        tracing::info!(bytes = output_data.len(), "Frame decoded successfully");
+                        // Send decoded data back to host clients
+                        if let Some(ref tx) = self.response_tx {
+                            let response = coppa_host::HostResponse::DataOut {
+                                client_id: 0, // broadcast to all clients
+                                data: output_data.clone(),
+                            };
+                            if let Err(e) = tx.try_send(response) {
+                                tracing::warn!(error = %e, "Failed to send decoded response to host");
+                            }
+                        }
+                        // Forward to WebSocket broadcast channel
+                        #[cfg(feature = "websocket")]
+                        if let Some(ref ws_tx) = self.ws_broadcast {
+                            let text = String::from_utf8_lossy(&output_data).into_owned();
+                            let _ = ws_tx.send(text);
                         }
                     }
-                    // Forward to WebSocket broadcast channel
-                    #[cfg(feature = "websocket")]
-                    if let Some(ref ws_tx) = self.ws_broadcast {
-                        let text = String::from_utf8_lossy(&output_data).into_owned();
-                        let _ = ws_tx.send(text);
-                    }
+                    // Feed the real per-carrier-noise SNR estimate (`StreamFrame::
+                    // snr_db`) to the rate controller — replaces the crude
+                    // whole-buffer RMS proxy (`20*log10(rms) + 40`) used before
+                    // Task 7, which was a known hack (see the Task 7 report).
+                    let new_mcs = self.engine.rate_controller_mut().update(frame.snr_db, true);
+                    tracing::debug!(
+                        snr_db = %format!("{:.1}", frame.snr_db),
+                        mcs = new_mcs,
+                        "Rate controller updated (decode success)"
+                    );
                 }
-                // Feed SNR estimate to rate controller
-                let signal_rms = if self.audio_window.is_empty() {
-                    0.0
-                } else {
-                    (self.audio_window.iter().map(|&s| s * s).sum::<f32>()
-                        / self.audio_window.len() as f32)
-                        .sqrt()
-                };
-                let snr_db = if signal_rms > 1e-10 {
-                    20.0 * signal_rms.log10() + 40.0
-                } else {
-                    0.0
-                };
-                let new_mcs = self.engine.rate_controller_mut().update(snr_db, true);
-                tracing::debug!(snr_db = %format!("{:.1}", snr_db), mcs = new_mcs, "Rate controller updated (decode success)");
-                // Successful decode: clear the window
-                self.audio_window.clear();
-            }
-            Err(_) => {
-                // No valid frame found — slide forward by SLIDE_STEP to align with OFDM boundaries
-                if self.audio_window.len() > Self::DECODE_WINDOW + Self::SLIDE_STEP {
-                    self.audio_window.drain(..Self::SLIDE_STEP);
-                }
-                // Safety: if buffer grows too large, drain oldest half
-                if self.audio_window.len() > Self::MAX_STREAM_BUFFER {
-                    let half = self.audio_window.len() / 2;
-                    self.audio_window.drain(..half);
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        frame_start = frame.frame_start,
+                        "Streaming frame failed to decode"
+                    );
                 }
             }
         }

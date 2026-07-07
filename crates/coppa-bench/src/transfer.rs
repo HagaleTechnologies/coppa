@@ -8,7 +8,7 @@ use coppa_codec::ofdm::cross_frame_interleaver::CrossFrameInterleaver;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_codec::ofdm::interleaver::BlockInterleaver;
 use coppa_codec::ofdm::CoppaProfile;
-use coppa_codec::traits::{ConstellationMapper, FecCodec};
+use coppa_codec::traits::ConstellationMapper;
 use coppa_protocol::fec::ldpc::codes::CodeRate;
 use coppa_protocol::fec::ldpc::LdpcCodec;
 use coppa_protocol::fec::scrambler::scramble;
@@ -186,7 +186,7 @@ impl TransferPhy for V2Phy {
             }
             bits.resize(info_bits, 0u8);
             scramble(&mut bits);
-            let mut codec = LdpcCodec::new(self.code_rate);
+            let codec = LdpcCodec::new(self.code_rate);
             let coded = codec.encode(&bits); // CODED_BITS long
             all_coded.extend_from_slice(&coded);
         }

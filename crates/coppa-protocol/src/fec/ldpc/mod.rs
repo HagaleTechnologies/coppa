@@ -46,6 +46,20 @@ impl LdpcCodec {
     pub fn decode_checked(&self, llrs: &[f32]) -> (Vec<u8>, bool) {
         self.decoder.decode_block_checked(llrs)
     }
+
+    /// Encode info bits into a coded block (1944 bits for all rates).
+    ///
+    /// Unlike the [`FecCodec::encode`] trait method (which takes `&mut self` for
+    /// generality across codecs that might need mutable state), the underlying
+    /// [`LdpcEncoder::encode_block`] is already `&self` — this inherent method
+    /// exposes that directly. Added for `CoppaTransceiver`'s per-speed-level codec
+    /// cache (Task 7): `decode_checked` above was already `&self`, so this was the
+    /// only obstacle to holding cached `LdpcCodec`s as plain immutable values with
+    /// no `RefCell`/interior mutability — see the Task 7 report for the full
+    /// decision.
+    pub fn encode(&self, info_bits: &[u8]) -> Vec<u8> {
+        self.encoder.encode_block(info_bits)
+    }
 }
 
 impl FecCodec for LdpcCodec {

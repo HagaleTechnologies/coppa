@@ -15,6 +15,13 @@ typedef struct CoppaHandle CoppaHandle;
 
 /**
  * Opaque handle to a streaming decode session.
+ *
+ * `coppa_feed_samples` pushes samples directly into the engine's internal
+ * `StreamingReceiver` (via `CoppaCore::push_samples`), which owns its own
+ * ring/sync-detector/frame-boundary bookkeeping — no buffer growth cap or
+ * rescanning is needed here, since the receiver never re-examines samples it's
+ * already consumed and bounds its own memory (`2 * max_frame_samples`; see
+ * `coppa_protocol::modem::streaming`).
  */
 typedef struct CoppaStreamHandle CoppaStreamHandle;
 
@@ -126,6 +133,12 @@ int32_t coppa_decode(struct CoppaHandle *handle,
 
 /**
  * Feed samples into a streaming decode session.
+ *
+ * Samples are pushed directly into the engine's `StreamingReceiver`, which
+ * detects frame boundaries and demodulates each completed frame on its own —
+ * the caller can feed any chunk size at any time; there is no minimum-samples
+ * threshold to reach before a decode is attempted. Any frames the receiver
+ * completes as a result of this call are queued for [`coppa_get_decoded`].
  *
  * Returns `-4` if the internal lock is poisoned, or `-5` if an internal
  * panic occurred. **After either of these errors the stream handle is

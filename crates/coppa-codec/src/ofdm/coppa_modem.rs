@@ -436,9 +436,7 @@ impl CoppaModem {
 
         // 2. Protected header (2D-pooled estimation, hard-decision BPSK) -> FEC decode.
         let num_header_syms = header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(data_per_sym);
-        let header_bits = self.demodulate_header_bits(samples, data_start, num_header_syms)?;
-
-        let header = header_fec::decode_header(&header_bits)?;
+        let header = self.demodulate_header(samples, data_start)?;
 
         // Compute coded payload symbols from header's speed level.
         // 1944 = LDPC coded block length (Z=81, 24 base columns).
@@ -512,6 +510,31 @@ impl CoppaModem {
             .iter()
             .map(|&(idx, received)| (idx, received, Complex32::new(1.0, 0.0)))
             .collect()
+    }
+
+    /// Demodulate and FEC-decode just the protected header, given samples that start
+    /// at (or shortly before) the frame's preamble and `data_start` — the sample
+    /// offset of the first header OFDM symbol (normally `3 * symbol_len`: 2 preamble
+    /// symbols + 1 probe/fine-sync symbol). Extracted from the header-decode sequence
+    /// `demodulate_frame` itself uses (`demodulate_header_bits` + `header_fec::
+    /// decode_header`), so both share one implementation.
+    ///
+    /// Used standalone by [`super::transceiver::CoppaTransceiver::demodulate_header`],
+    /// which `StreamingReceiver` (`coppa-protocol`) calls to learn a candidate frame's
+    /// speed level (and therefore its total length) before buffering the whole frame
+    /// for a full [`Self::demodulate_frame`]/`receive` pass. Unlike `demodulate_frame`,
+    /// this does NOT estimate or remove CFO: the header sits in the first few OFDM
+    /// symbols right after the preamble used for CFO estimation, so its own
+    /// residual-CFO phase error over that short span is small enough for
+    /// hard-decision BPSK + Golay(24,12) to tolerate, whereas payload symbols
+    /// accumulate phase error over the whole frame and do need the correction
+    /// `demodulate_frame` applies before calling this. Returns `None` if the samples
+    /// are too short or the header fails FEC/CRC.
+    pub fn demodulate_header(&self, samples: &[f32], data_start: usize) -> Option<CoppaHeader> {
+        let data_per_sym = self.data_carriers_per_symbol();
+        let num_header_syms = header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(data_per_sym);
+        let bits = self.demodulate_header_bits(samples, data_start, num_header_syms)?;
+        header_fec::decode_header(&bits)
     }
 
     /// Demodulate the protected-header OFDM symbols into `PROTECTED_HEADER_CODED_BITS`

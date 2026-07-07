@@ -39,18 +39,21 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::sync::Mutex;
 
-/// Maximum streaming buffer size (256k samples ~ 32 seconds at 8kHz).
-const MAX_STREAM_BUFFER: usize = 256_000;
-
 /// Opaque handle to a Coppa engine instance.
 pub struct CoppaHandle {
     engine: Mutex<coppa_engine::CoppaCore>,
 }
 
 /// Opaque handle to a streaming decode session.
+///
+/// `coppa_feed_samples` pushes samples directly into the engine's internal
+/// `StreamingReceiver` (via `CoppaCore::push_samples`), which owns its own
+/// ring/sync-detector/frame-boundary bookkeeping — no buffer growth cap or
+/// rescanning is needed here, since the receiver never re-examines samples it's
+/// already consumed and bounds its own memory (`2 * max_frame_samples`; see
+/// `coppa_protocol::modem::streaming`).
 pub struct CoppaStreamHandle {
     engine: Mutex<coppa_engine::CoppaCore>,
-    sample_buffer: Mutex<Vec<f32>>,
     decoded_messages: Mutex<VecDeque<String>>,
 }
 
@@ -246,7 +249,6 @@ pub extern "C" fn coppa_start_stream() -> *mut CoppaStreamHandle {
     let result = std::panic::catch_unwind(|| {
         let handle = Box::new(CoppaStreamHandle {
             engine: Mutex::new(coppa_engine::CoppaCore::new()),
-            sample_buffer: Mutex::new(Vec::with_capacity(65536)),
             decoded_messages: Mutex::new(VecDeque::new()),
         });
         Box::into_raw(handle)
@@ -255,6 +257,12 @@ pub extern "C" fn coppa_start_stream() -> *mut CoppaStreamHandle {
 }
 
 /// Feed samples into a streaming decode session.
+///
+/// Samples are pushed directly into the engine's `StreamingReceiver`, which
+/// detects frame boundaries and demodulates each completed frame on its own —
+/// the caller can feed any chunk size at any time; there is no minimum-samples
+/// threshold to reach before a decode is attempted. Any frames the receiver
+/// completes as a result of this call are queued for [`coppa_get_decoded`].
 ///
 /// Returns `-4` if the internal lock is poisoned, or `-5` if an internal
 /// panic occurred. **After either of these errors the stream handle is
@@ -281,33 +289,21 @@ pub unsafe extern "C" fn coppa_feed_samples(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let sample_slice = std::slice::from_raw_parts(samples, num_samples);
 
-        let mut buffer = match (*handle).sample_buffer.lock() {
-            Ok(b) => b,
+        let mut engine = match (*handle).engine.lock() {
+            Ok(e) => e,
             Err(_) => return -4,
         };
 
-        buffer.extend_from_slice(sample_slice);
-
-        // Try to decode when we have enough samples
-        // A minimum frame is about 10000 samples at 8kHz
-        if buffer.len() >= 10000 {
-            let engine = match (*handle).engine.lock() {
-                Ok(e) => e,
-                Err(_) => return -4,
-            };
-
-            if let Ok(message) = engine.decode(&buffer) {
-                if let Ok(mut messages) = (*handle).decoded_messages.lock() {
-                    // After successful decode, clear the buffer. The OFDM
-                    // transceiver consumes the entire preamble+frame.
-                    messages.push_back(message);
-                    buffer.clear();
-                }
-            } else {
-                // Cap buffer size to prevent unbounded growth
-                if buffer.len() > MAX_STREAM_BUFFER {
-                    let drain_to = buffer.len() / 2;
-                    buffer.drain(..drain_to);
+        let frames = engine.push_samples(sample_slice);
+        if !frames.is_empty() {
+            if let Ok(mut messages) = (*handle).decoded_messages.lock() {
+                // Frames that failed decompression/UTF-8 conversion are dropped,
+                // exactly like a failed batch `decode()` was silently dropped
+                // before Task 7's migration to `push_samples`.
+                for frame in frames {
+                    if let Ok(message) = frame.message {
+                        messages.push_back(message);
+                    }
                 }
             }
         }
@@ -519,6 +515,17 @@ mod tests {
 
     #[test]
     fn test_stream_roundtrip() {
+        // Updated for Task 7's `StreamingReceiver` migration: unlike the old
+        // 10 000-sample-threshold + full-buffer-rescan design (which this test
+        // used to tolerate a `None` decode result for), the streaming receiver
+        // deterministically finds and decodes a frame given a real silence
+        // lead-in (its `SyncDetector` needs a clean baseline in its bootstrap
+        // window before a preamble — see `coppa_codec::ofdm::sync_detector`'s
+        // and `coppa_protocol::modem::streaming`'s own tests) and a little
+        // trailing pad (the RX bandpass filter's group delay shifts the frame's
+        // content later in the filtered domain the receiver operates in). This
+        // test now asserts the decode unconditionally instead of only checking
+        // it "if" a message happened to be produced.
         let mut handle = coppa_engine_create();
         let msg = c"Test".as_ptr();
         let mut out_samples: *mut f32 = std::ptr::null_mut();
@@ -530,17 +537,74 @@ mod tests {
         let stream = coppa_start_stream();
         assert!(!stream.is_null());
 
-        let sample_slice = unsafe { std::slice::from_raw_parts(out_samples, out_len) };
+        let encoded = unsafe { std::slice::from_raw_parts(out_samples, out_len) };
+        let mut sample_slice = vec![0.0f32; 8192];
+        sample_slice.extend_from_slice(encoded);
+        sample_slice.extend(std::iter::repeat_n(0.0f32, 2048));
+
         let result =
             unsafe { coppa_feed_samples(stream, sample_slice.as_ptr(), sample_slice.len()) };
         assert_eq!(result, 0);
 
         let decoded = unsafe { coppa_get_decoded(stream) };
-        if !decoded.is_null() {
-            let decoded_str = unsafe { CStr::from_ptr(decoded) }.to_str().unwrap();
-            assert_eq!(decoded_str, "Test");
-            unsafe { coppa_free_string(decoded) };
+        assert!(
+            !decoded.is_null(),
+            "streaming receiver should have decoded the fed frame"
+        );
+        let decoded_str = unsafe { CStr::from_ptr(decoded) }.to_str().unwrap();
+        assert_eq!(decoded_str, "Test");
+        unsafe { coppa_free_string(decoded) };
+
+        unsafe {
+            coppa_free_samples(out_samples, out_len);
+            coppa_stop_stream(stream);
+            coppa_engine_destroy(&mut handle);
         }
+    }
+
+    #[test]
+    fn test_stream_roundtrip_fed_in_odd_chunks() {
+        // Exercises the new streaming design's core promise: any chunk size,
+        // fed at any time, with no minimum-samples threshold to reach first.
+        let mut handle = coppa_engine_create();
+        let msg = c"Chunked FFI stream".as_ptr();
+        let mut out_samples: *mut f32 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let result = unsafe { coppa_encode(handle, msg, &mut out_samples, &mut out_len) };
+        assert_eq!(result, 0);
+
+        let encoded = unsafe { std::slice::from_raw_parts(out_samples, out_len) };
+        let mut full = vec![0.0f32; 8192];
+        full.extend_from_slice(encoded);
+        full.extend(std::iter::repeat_n(0.0f32, 2048));
+
+        let stream = coppa_start_stream();
+        assert!(!stream.is_null());
+
+        let mut decoded_str = None;
+        let chunk_sizes = [1usize, 7, 64, 480, 4096];
+        let mut i = 0;
+        let mut chunk_idx = 0;
+        while i < full.len() {
+            let want = chunk_sizes[chunk_idx % chunk_sizes.len()];
+            chunk_idx += 1;
+            let end = (i + want).min(full.len());
+            let result = unsafe { coppa_feed_samples(stream, full[i..end].as_ptr(), end - i) };
+            assert_eq!(result, 0);
+            let decoded = unsafe { coppa_get_decoded(stream) };
+            if !decoded.is_null() {
+                decoded_str = Some(
+                    unsafe { CStr::from_ptr(decoded) }
+                        .to_str()
+                        .unwrap()
+                        .to_string(),
+                );
+                unsafe { coppa_free_string(decoded) };
+            }
+            i = end;
+        }
+
+        assert_eq!(decoded_str.as_deref(), Some("Chunked FFI stream"));
 
         unsafe {
             coppa_free_samples(out_samples, out_len);

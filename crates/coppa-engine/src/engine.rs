@@ -6,6 +6,7 @@ use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::compression::huffman::HuffmanCodec;
 use coppa_protocol::compression::lz4::{lz4_compress, lz4_decompress};
+use coppa_protocol::modem::streaming::StreamingReceiver;
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 
 use crate::config::EngineConfig;
@@ -16,6 +17,26 @@ use crate::rate_control::RateController;
 /// On decode, if the first byte of the payload is this marker, the rest is
 /// Huffman+LZ4 compressed. Otherwise the payload is raw.
 const COMPRESSION_MARKER: u8 = 0xFE;
+
+/// One decode result surfaced by [`CoppaCore::push_samples`] for a single frame
+/// `StreamingReceiver` completed.
+///
+/// `message` mirrors `decode`'s batch-path contract exactly: the frame's payload
+/// goes through this engine's optional Huffman+LZ4 decompression (if the
+/// compression marker byte is present) and then a UTF-8 conversion, either of
+/// which can fail (both daemon and FFI callers want a UTF-8 `String`, the same
+/// as the batch `decode` they used before Task 7 — see the Task 7 report for why
+/// `push_samples` keeps that constraint rather than switching to raw bytes).
+#[derive(Debug)]
+pub struct StreamFrame {
+    pub message: Result<String>,
+    /// Real per-carrier-noise SNR estimate (dB) from `CoppaTransceiver::
+    /// receive_with_metrics`, `10*log10(1/mean(noise_vars))` — NOT the crude
+    /// whole-buffer RMS proxy `handle_audio_in` used to compute before Task 7.
+    pub snr_db: f32,
+    pub cfo_hz: f32,
+    pub frame_start: u64,
+}
 
 /// Core engine for Coppa digital communications.
 ///
@@ -42,6 +63,13 @@ pub struct CoppaCore {
     transceiver: CoppaTransceiver,
     config: EngineConfig,
     rate_controller: RateController,
+    /// Streaming receive path used by [`Self::push_samples`] (daemon/FFI). Owns its
+    /// own internal `CoppaTransceiver` (built for the same profile as
+    /// `transceiver` above) — see the Task 7 report for why `StreamingReceiver`'s
+    /// locked constructor builds its own rather than sharing `transceiver`, and why
+    /// that one-time extra per-level cache construction at startup is an
+    /// acceptable, bounded cost (not a hot-path duplication).
+    streaming: StreamingReceiver,
 }
 
 impl CoppaCore {
@@ -66,24 +94,28 @@ impl CoppaCore {
             "vhf" => CoppaProfile::vhf_wide(),
             _ => CoppaProfile::hf_standard(),
         };
-        let transceiver = CoppaTransceiver::new(ofdm_profile, 1);
+        let transceiver = CoppaTransceiver::new(ofdm_profile.clone(), 1);
+        let streaming = StreamingReceiver::new(ofdm_profile, 1);
         let rate_controller = RateController::new(0, 0, 10);
         Self {
             transceiver,
             config,
             rate_controller,
+            streaming,
         }
     }
 
     /// Build the engine from a config, selecting the appropriate OFDM profile.
     fn build(config: EngineConfig) -> Self {
         let ofdm_profile = Self::select_ofdm_profile(config.speed_level);
-        let transceiver = CoppaTransceiver::new(ofdm_profile, 1);
+        let transceiver = CoppaTransceiver::new(ofdm_profile.clone(), 1);
+        let streaming = StreamingReceiver::new(ofdm_profile, 1);
         let rate_controller = RateController::new(0, 0, 10);
         Self {
             transceiver,
             config,
             rate_controller,
+            streaming,
         }
     }
 
@@ -158,21 +190,8 @@ impl CoppaCore {
     /// 2. Receive via CoppaTransceiver
     /// 3. Optionally decompress (LZ4 + Huffman)
     pub fn decode_bytes(&self, samples: &[f32]) -> Result<Vec<u8>> {
-        // Squelch: check RMS power before decode attempt
-        if self.config.squelch_threshold_db > f32::NEG_INFINITY {
-            let rms = if samples.is_empty() {
-                0.0f32
-            } else {
-                (samples.iter().map(|&s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
-            };
-            let rms_db = if rms > 1e-10 {
-                20.0 * rms.log10()
-            } else {
-                -120.0
-            };
-            if rms_db < self.config.squelch_threshold_db {
-                return Err(anyhow::anyhow!("No signal detected"));
-            }
+        if self.is_squelched(samples) {
+            return Err(anyhow::anyhow!("No signal detected"));
         }
 
         if samples.is_empty() {
@@ -184,20 +203,74 @@ impl CoppaCore {
             .receive(samples)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-        // Decompress if compression is enabled and the marker byte is present
-        let data = if self.config.compression_enabled
+        self.decompress_if_needed(payload)
+    }
+
+    /// Feed a chunk of audio samples through the streaming receiver, returning
+    /// zero or more decode results for any frames that completed as a result of
+    /// this chunk.
+    ///
+    /// This is the streaming counterpart of `decode`/`decode_bytes` (used by the
+    /// daemon and FFI, which previously re-ran a batch `decode` over a
+    /// hand-managed sliding window — see the Task 7 report for the migration and
+    /// why squelch is evaluated per pushed chunk here, rather than per
+    /// accumulated window as the batch path did): each incoming chunk is
+    /// squelch-gated exactly like `decode_bytes` before it reaches the
+    /// `StreamingReceiver`, and each frame the receiver completes has this
+    /// engine's Huffman+LZ4 decompression + UTF-8 conversion applied to its
+    /// payload, exactly like `decode` applies to a whole buffer in the batch path.
+    pub fn push_samples(&mut self, samples: &[f32]) -> Vec<StreamFrame> {
+        if self.is_squelched(samples) {
+            return Vec::new();
+        }
+        let frames = self.streaming.push_samples(samples);
+        frames
+            .into_iter()
+            .map(|f| StreamFrame {
+                message: self
+                    .decompress_if_needed(f.payload)
+                    .and_then(|data| String::from_utf8(data).map_err(Into::into)),
+                snr_db: f.snr_db,
+                cfo_hz: f.cfo_hz,
+                frame_start: f.frame_start,
+            })
+            .collect()
+    }
+
+    /// RMS-power squelch check, shared by `decode_bytes` and `push_samples`.
+    /// Disabled entirely when `squelch_threshold_db == f32::NEG_INFINITY` (the
+    /// default in every profile shipped today, and the default `EngineConfig`).
+    fn is_squelched(&self, samples: &[f32]) -> bool {
+        if self.config.squelch_threshold_db == f32::NEG_INFINITY {
+            return false;
+        }
+        let rms = if samples.is_empty() {
+            0.0f32
+        } else {
+            (samples.iter().map(|&s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+        };
+        let rms_db = if rms > 1e-10 {
+            20.0 * rms.log10()
+        } else {
+            -120.0
+        };
+        rms_db < self.config.squelch_threshold_db
+    }
+
+    /// Undo this engine's optional Huffman+LZ4 compression if the marker byte is
+    /// present, shared by `decode_bytes` and `push_samples`.
+    fn decompress_if_needed(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
+        if self.config.compression_enabled
             && !payload.is_empty()
             && payload[0] == COMPRESSION_MARKER
         {
             let lz4_data = &payload[1..];
             let huffman_bytes = lz4_decompress(lz4_data)?;
             let huffman = HuffmanCodec::new();
-            huffman.decode(&huffman_bytes)
+            Ok(huffman.decode(&huffman_bytes))
         } else {
-            payload
-        };
-
-        Ok(data)
+            Ok(payload)
+        }
     }
 
     /// Get a reference to the current configuration.
@@ -220,6 +293,7 @@ impl CoppaCore {
         let new = Self::build(config);
         self.transceiver = new.transceiver;
         self.config = new.config;
+        self.streaming = new.streaming;
     }
 }
 
@@ -355,5 +429,87 @@ mod tests {
         let samples = core.encode_bytes(&data).expect("encode 0xFE data");
         let decoded = core.decode_bytes(&samples).expect("decode 0xFE data");
         assert_eq!(decoded, data);
+    }
+
+    /// The streaming `SyncDetector` needs a clean silence baseline in its
+    /// bootstrap window before a preamble arrives (see
+    /// `coppa_codec::ofdm::sync_detector`'s own tests and
+    /// `coppa_protocol::modem::streaming`'s tests, which all lead with silence
+    /// before the first frame) — `encode()`'s output starts exactly at its own
+    /// sample 0 with no such lead-in, so streaming tests prepend one. A trailing
+    /// pad is needed too: the RX bandpass filter's group delay shifts the frame's
+    /// content later in the filtered domain `StreamingReceiver` operates in, so
+    /// without a little padding after the frame, `push_samples` sees end-of-input
+    /// a few hundred samples before the (filtered-domain) frame is fully buffered.
+    fn with_lead_and_trail(samples: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; 8192];
+        out.extend_from_slice(samples);
+        out.extend(std::iter::repeat_n(0.0f32, 2048));
+        out
+    }
+
+    #[test]
+    fn test_push_samples_roundtrip() {
+        let mut core = CoppaCore::new();
+        let samples = core
+            .encode("Streaming works")
+            .expect("encode should succeed");
+        let samples = with_lead_and_trail(&samples);
+        let frames = core.push_samples(&samples);
+        assert_eq!(frames.len(), 1, "expected exactly one decoded frame");
+        assert_eq!(
+            frames[0].message.as_deref().unwrap(),
+            "Streaming works",
+            "push_samples should recover the encoded message"
+        );
+        assert!(
+            frames[0].snr_db.is_finite(),
+            "snr_db should be a finite estimate on a clean channel"
+        );
+    }
+
+    #[test]
+    fn test_push_samples_compression_roundtrip() {
+        let config = EngineConfig {
+            compression_enabled: true,
+            ..Default::default()
+        };
+        let mut core = CoppaCore::with_config(config);
+        let message = "CQ CQ CQ DE VK2ABC K";
+        let samples = core.encode(message).expect("encode with compression");
+        let samples = with_lead_and_trail(&samples);
+        let frames = core.push_samples(&samples);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].message.as_deref().unwrap(), message);
+    }
+
+    #[test]
+    fn test_push_samples_fed_in_chunks() {
+        let mut core = CoppaCore::new();
+        let samples = core
+            .encode("Chunked streaming")
+            .expect("encode should succeed");
+        let samples = with_lead_and_trail(&samples);
+        let mut frames = Vec::new();
+        for chunk in samples.chunks(777) {
+            frames.extend(core.push_samples(chunk));
+        }
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].message.as_deref().unwrap(), "Chunked streaming");
+    }
+
+    #[test]
+    fn test_push_samples_squelch_rejects_silence() {
+        let config = EngineConfig {
+            squelch_threshold_db: -40.0,
+            ..Default::default()
+        };
+        let mut core = CoppaCore::with_config(config);
+        let silence = vec![1e-6; 48000];
+        let frames = core.push_samples(&silence);
+        assert!(
+            frames.is_empty(),
+            "squelched silence should never reach the streaming receiver"
+        );
     }
 }

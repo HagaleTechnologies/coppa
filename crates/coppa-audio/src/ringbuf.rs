@@ -2,27 +2,38 @@
 
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Producer side of an audio ring buffer.
 pub struct AudioRingProducer {
     inner: Producer<f32>,
-    overflow_count: AtomicU64,
+    overflow_count: Arc<AtomicU64>,
 }
 
 /// Consumer side of an audio ring buffer.
 pub struct AudioRingConsumer {
     inner: Consumer<f32>,
+    /// Shared with the producer, so the consuming side (e.g. the daemon's
+    /// `audio_in`, which only ever holds the consumer half) can also observe
+    /// overflow on the producer side that's writing into this ring — added for
+    /// Task 7's streaming migration, which checks this each poll and logs a
+    /// warning when it grows (silent RX sample loss was a Phase-0-era finding).
+    overflow_count: Arc<AtomicU64>,
 }
 
 /// Create a split audio ring buffer with the given capacity in samples.
 pub fn audio_ring(capacity: usize) -> (AudioRingProducer, AudioRingConsumer) {
     let (producer, consumer) = RingBuffer::new(capacity);
+    let overflow_count = Arc::new(AtomicU64::new(0));
     (
         AudioRingProducer {
             inner: producer,
-            overflow_count: AtomicU64::new(0),
+            overflow_count: overflow_count.clone(),
         },
-        AudioRingConsumer { inner: consumer },
+        AudioRingConsumer {
+            inner: consumer,
+            overflow_count,
+        },
     )
 }
 
@@ -84,6 +95,12 @@ impl AudioRingConsumer {
     /// Returns true if the producer has been dropped.
     pub fn is_abandoned(&self) -> bool {
         self.inner.is_abandoned()
+    }
+
+    /// Returns the total number of samples dropped on the producer side of this
+    /// ring due to buffer overflow (see `AudioRingProducer::overflow_count`).
+    pub fn overflow_count(&self) -> u64 {
+        self.overflow_count.load(Ordering::Relaxed)
     }
 }
 
