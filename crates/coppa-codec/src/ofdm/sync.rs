@@ -121,7 +121,10 @@ pub fn generate_coppa_preamble(profile: &CoppaProfile, version: u8) -> Vec<f32> 
 
 /// Analytic (complex) signal via FFT-Hilbert. Mirrors the watterson/frequency_shift routine:
 /// keep DC, double positive-frequency bins, zero the negative ones, then inverse FFT.
-fn analytic_signal(x: &[f32]) -> Vec<Complex32> {
+///
+/// `pub(crate)`: also used by `sync_detector` to derotate its real-valued confirmation
+/// window by the two-stage CFO estimate before the confirm/first-path xcorr steps.
+pub(crate) fn analytic_signal(x: &[f32]) -> Vec<Complex32> {
     let n = x.len();
     if n == 0 {
         return Vec::new();
@@ -143,6 +146,31 @@ fn analytic_signal(x: &[f32]) -> Vec<Complex32> {
     fft.inverse(&xf)
 }
 
+/// Single-lag Moose CFO estimate: `arg(Sum_m z*[start+m]*z[start+m+lag]) * fs / (2*pi*lag)`,
+/// summed over `m in 0..len`. This is the one Moose correlation shared by both the
+/// legacy single-lag `estimate_cfo_hz` (lag = symbol_len, unambiguous within
+/// ±fs/(2*symbol_len)) and the two-stage `estimate_cfo_two_stage` below (lag = N/2 for a
+/// wide-but-noisy coarse estimate, disambiguating a lag = symbol_len fine estimate).
+/// Returns 0.0 if the window doesn't fit (rather than panicking) so callers can pass a
+/// possibly-short trailing window without their own bounds bookkeeping.
+fn moose_lag_estimate(
+    analytic: &[Complex32],
+    start: usize,
+    lag: usize,
+    len: usize,
+    sample_rate: f32,
+) -> f32 {
+    use std::f32::consts::TAU;
+    if lag == 0 || len == 0 || start + len + lag > analytic.len() {
+        return 0.0;
+    }
+    let mut p = Complex32::new(0.0, 0.0);
+    for m in 0..len {
+        p += analytic[start + m].conj() * analytic[start + m + lag];
+    }
+    p.arg() * sample_rate / (TAU * lag as f32)
+}
+
 /// Estimate carrier frequency offset (Hz) from the Schmidl-Cox preamble (two identical
 /// `symbol_len` blocks at `timing_offset`). Unambiguous within ±sample_rate/(2*symbol_len).
 pub fn estimate_cfo_hz(
@@ -151,18 +179,57 @@ pub fn estimate_cfo_hz(
     symbol_len: usize,
     sample_rate: f32,
 ) -> f32 {
-    use std::f32::consts::TAU;
     let end = (timing_offset + 2 * symbol_len).min(samples.len());
     if symbol_len == 0 || end <= timing_offset + symbol_len {
         return 0.0;
     }
     let a = analytic_signal(&samples[timing_offset..end]);
-    let lim = symbol_len.min(a.len().saturating_sub(symbol_len));
-    let mut p = Complex32::new(0.0, 0.0);
-    for m in 0..lim {
-        p += a[m].conj() * a[m + symbol_len];
+    let len = symbol_len.min(a.len().saturating_sub(symbol_len));
+    moose_lag_estimate(&a, 0, symbol_len, len, sample_rate)
+}
+
+/// Two-stage Moose CFO from the 2-symbol preamble at `coarse_start` (see the task/design
+/// doc for the derivation): a coarse estimate at lag `fft_size/2` (unambiguous within
+/// ±fs/(fft_size), e.g. ±50 Hz at fft_size=960/fs=48k) disambiguates a fine estimate at lag
+/// `symbol_len = fft_size+cp` (unambiguous within ±fs/(2*symbol_len) ~ ±19 Hz at this
+/// profile, but far more precise since it integrates over a much longer lag/window).
+///
+/// `analytic` must be an analytic-signal window covering at least
+/// `coarse_start..coarse_start+2*symbol_len` (the full 2-symbol preamble); `coarse_start`
+/// is the sample index, within `analytic`, of the very first preamble sample (i.e. the
+/// start of its own cyclic prefix).
+///
+/// Math (locked, see task brief): `f_coarse` sums lag-`fft_size/2` products over
+/// `m in cp..cp+(fft_size-fft_size/2)` (one half of the first preamble symbol's body,
+/// correlated against the other half — the comb's even-bin placement makes the body
+/// periodic with `fft_size/2`, which is exactly what a `fft_size/2`-sample lag measures).
+/// `f_fine` sums lag-`symbol_len` products over the whole 2-symbol preamble
+/// (`m in 0..symbol_len`) — the ordinary single-lag Moose estimate `estimate_cfo_hz` also
+/// computes, just operating directly on an already-analytic window instead of re-deriving
+/// one from real samples. `k = round((f_coarse-f_fine)/Delta)` picks the fine estimate's
+/// wrap count using the coarse (wide-range, low-precision) estimate as a coarse compass;
+/// `f_hat = f_fine + k*Delta` is the final, wide-range AND precise estimate.
+pub fn estimate_cfo_two_stage(
+    analytic: &[Complex32],
+    coarse_start: usize,
+    fft_size: usize,
+    cp: usize,
+    sample_rate: f32,
+) -> f32 {
+    let n_half = fft_size / 2;
+    let symbol_len = fft_size + cp;
+    let coarse_len = fft_size.saturating_sub(n_half);
+    let body_start = coarse_start + cp;
+
+    let f_coarse = moose_lag_estimate(analytic, body_start, n_half, coarse_len, sample_rate);
+    let f_fine = moose_lag_estimate(analytic, coarse_start, symbol_len, symbol_len, sample_rate);
+
+    let delta = sample_rate / symbol_len as f32;
+    if delta <= 0.0 {
+        return f_fine;
     }
-    p.arg() * sample_rate / (TAU * symbol_len as f32)
+    let k = ((f_coarse - f_fine) / delta).round();
+    f_fine + k * delta
 }
 
 /// Remove a carrier frequency offset of `cfo_hz` from a real passband signal (de-rotate the
@@ -211,6 +278,45 @@ mod tests {
         let corrected = remove_cfo(&injected, est, profile.sample_rate as f32);
         let est2 = estimate_cfo_hz(&corrected, 0, symbol_len, profile.sample_rate as f32);
         assert!(est2.abs() < 1.0, "residual {est2} should be ~0");
+    }
+
+    #[test]
+    fn two_stage_cfo_recovers_large_offsets() {
+        // +-47 Hz is beyond the old +-19 Hz single-lag-1260 wrap; must recover to <1 Hz
+        // error using the coarse (lag 480) estimate to disambiguate the fine one.
+        use crate::ofdm::coppa_modem::CoppaModem;
+        use crate::ofdm::frame::{CoppaFrameType, CoppaHeader};
+        let profile = CoppaProfile::hf_standard();
+        let modem = CoppaModem::new(profile.clone(), 1);
+        let header = CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: 4,
+        };
+        let symbols = vec![Complex32::new(1.0, 0.0); 200];
+        let frame = modem.modulate_mapped(&header, &symbols, 6.0);
+
+        for inj in [-47.0f32, -25.0, 13.0, 31.0, 47.0] {
+            // Inject `inj` Hz by removing `-inj` Hz (frame's preamble starts at sample 0).
+            let shifted = remove_cfo(&frame, -inj, profile.sample_rate as f32);
+            let analytic = analytic_signal(&shifted);
+            let est = estimate_cfo_two_stage(
+                &analytic,
+                0,
+                profile.fft_size,
+                profile.cp_samples,
+                profile.sample_rate as f32,
+            );
+            assert!(
+                (est - inj).abs() < 1.0,
+                "injected {inj} Hz: estimate {est} should be within 1 Hz"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

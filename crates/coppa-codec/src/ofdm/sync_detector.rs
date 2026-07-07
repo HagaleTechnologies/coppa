@@ -65,7 +65,9 @@ pub struct SyncCandidate {
     /// Sample index (in the coordinate system of all samples ever pushed) of the
     /// preamble start, after first-path refinement and TIMING_BACKOFF.
     pub frame_start: u64,
-    /// Two-stage CFO estimate in Hz (Task 6 fills this; 0.0 until then).
+    /// Two-stage Moose CFO estimate (Hz), from `estimate_cfo_two_stage` run on the
+    /// coarse plateau peak's analytic window. The modem removes this from the whole
+    /// buffer once (only when `|cfo_hz| > 0.5` Hz) before symbol demod.
     pub cfo_hz: f32,
     /// Normalized confirmation cross-correlation (0..1) — quality metric.
     pub confirm_xcorr: f32,
@@ -105,6 +107,9 @@ pub struct SyncDetector {
     in_plateau: bool,
     plateau_best_m: f32,
     plateau_best_d: u64,
+    /// Two-stage CFO estimate captured at `plateau_best_d`'s analytic window (see
+    /// `estimate_cfo_from_ring`); carried through to the resolved `SyncCandidate`.
+    plateau_best_cfo: f32,
 
     /// Raw (real) sample history, needed for the confirm/first-path steps
     /// (which correlate against the real-valued cached preamble).
@@ -115,8 +120,9 @@ pub struct SyncDetector {
     retain_samples: u64,
 
     /// Coarse peak estimates (raw-domain) awaiting enough future samples to
-    /// run the confirm + first-path refinement steps.
-    pending: VecDeque<u64>,
+    /// run the confirm + first-path refinement steps, paired with the
+    /// two-stage CFO estimate captured when each peak was recorded.
+    pending: VecDeque<(u64, f32)>,
 
     /// Total raw samples ever pushed.
     total_pushed: u64,
@@ -148,6 +154,7 @@ impl SyncDetector {
             in_plateau: false,
             plateau_best_m: 0.0,
             plateau_best_d: 0,
+            plateau_best_cfo: 0.0,
             history: VecDeque::with_capacity(retain_samples as usize + 64),
             history_base: 0,
             retain_samples,
@@ -252,15 +259,33 @@ impl SyncDetector {
             if !self.in_plateau || m > self.plateau_best_m {
                 self.plateau_best_m = m;
                 self.plateau_best_d = self.d;
+                self.plateau_best_cfo = self.estimate_cfo_from_ring();
             }
             self.in_plateau = true;
         } else if self.in_plateau {
             self.in_plateau = false;
             let coarse_peak = self.plateau_best_d.saturating_sub(GROUP_DELAY);
-            if !self.try_resolve_one(coarse_peak, out) {
-                self.pending.push_back(coarse_peak);
+            let cfo_hz = self.plateau_best_cfo;
+            if !self.try_resolve_one(coarse_peak, cfo_hz, out) {
+                self.pending.push_back((coarse_peak, cfo_hz));
             }
         }
+    }
+
+    /// Two-stage CFO estimate (`estimate_cfo_two_stage`) from the ring's CURRENT
+    /// contents. Whenever `evaluate_metric` runs, `self.ring` holds exactly
+    /// `2*symbol_len` analytic samples spanning the window `[self.d, self.d+2*symbol_len)`
+    /// (see the recurrence comment in `ingest_analytic_sample`), which is exactly the
+    /// analytic window `estimate_cfo_two_stage` needs for `coarse_start = 0`.
+    fn estimate_cfo_from_ring(&self) -> f32 {
+        let window: Vec<Complex32> = self.ring.iter().copied().collect();
+        super::sync::estimate_cfo_two_stage(
+            &window,
+            0,
+            self.profile.fft_size,
+            self.profile.cp_samples,
+            self.profile.sample_rate as f32,
+        )
     }
 
     /// Try to resolve any pending candidates now that more history may have
@@ -268,8 +293,8 @@ impl SyncDetector {
     fn resolve_pending(&mut self, out: &mut Vec<SyncCandidate>) {
         let mut i = 0;
         while i < self.pending.len() {
-            let peak = self.pending[i];
-            if self.try_resolve_one(peak, out) {
+            let (peak, cfo_hz) = self.pending[i];
+            if self.try_resolve_one(peak, cfo_hz, out) {
                 self.pending.remove(i);
             } else {
                 i += 1;
@@ -281,7 +306,18 @@ impl SyncDetector {
     /// Returns `true` if resolved (whether accepted or rejected — in which
     /// case nothing is pushed to `out`), or `false` if more future samples
     /// are still needed (caller should keep it pending).
-    fn try_resolve_one(&mut self, coarse_peak: u64, out: &mut Vec<SyncCandidate>) -> bool {
+    ///
+    /// `cfo_hz` is the two-stage CFO estimate captured at this peak (see
+    /// `estimate_cfo_from_ring`); per the locked order (coarse peak -> CFO
+    /// estimate -> derotate -> confirm/refine), the confirmation window is
+    /// derotated by it BEFORE correlating against the (CFO-free) cached
+    /// reference preamble, so a real mistune doesn't rot the confirm xcorr.
+    fn try_resolve_one(
+        &mut self,
+        coarse_peak: u64,
+        cfo_hz: f32,
+        out: &mut Vec<SyncCandidate>,
+    ) -> bool {
         let cp = self.profile.cp_samples as u64;
         let ref_len = self.reference.len() as u64;
         let lo = coarse_peak.saturating_sub(cp);
@@ -299,15 +335,30 @@ impl SyncDetector {
             return true;
         }
 
+        let window_start = (lo - self.history_base) as usize;
+        let window_len = (needed_end - lo) as usize;
+        let raw_window: Vec<f32> = self
+            .history
+            .iter()
+            .skip(window_start)
+            .take(window_len)
+            .copied()
+            .collect();
+        // Absolute (not window-local) sample index as the phase origin: this must match
+        // the convention `remove_cfo` uses when the modem later de-rotates the WHOLE
+        // buffer once with this same `cfo_hz` — a window-local origin would leave an
+        // arbitrary residual phase that a constant per-window offset can't correct.
+        let derotated = derotate_window(&raw_window, lo, cfo_hz, self.profile.sample_rate as f32);
+
         let n_positions = (hi - lo + 1) as usize;
         let mut xcorr = Vec::with_capacity(n_positions);
         let mut best = 0.0f32;
         for d in lo..=hi {
-            let start = (d - self.history_base) as usize;
+            let start = (d - lo) as usize;
             let mut corr = 0.0f32;
             let mut sig_e = 0.0f32;
             for (i, &r) in self.reference.iter().enumerate() {
-                let s = self.history[start + i];
+                let s = derotated[start + i];
                 corr += s * r;
                 sig_e += s * s;
             }
@@ -327,7 +378,7 @@ impl SyncDetector {
         let frame_start = local_peak_abs.saturating_sub(TIMING_BACKOFF);
         out.push(SyncCandidate {
             frame_start,
-            cfo_hz: 0.0,
+            cfo_hz,
             confirm_xcorr: best,
         });
         true
@@ -339,7 +390,7 @@ impl SyncDetector {
         let earliest_pending = self
             .pending
             .iter()
-            .map(|&p| p.saturating_sub(cp))
+            .map(|&(p, _)| p.saturating_sub(cp))
             .min()
             .unwrap_or(u64::MAX);
         let keep_from = default_keep_from.min(earliest_pending);
@@ -348,6 +399,27 @@ impl SyncDetector {
             self.history_base += 1;
         }
     }
+}
+
+/// De-rotate a real-valued window by `e^{-j*2*pi*cfo_hz*t/sample_rate}` (converting to
+/// analytic first, as `sync::remove_cfo` does), using `t = abs_start + i` — the ABSOLUTE
+/// sample index — as the phase origin, not a window-local `i` starting at 0. `samples[0]`
+/// is sample `abs_start` of the overall stream.
+fn derotate_window(samples: &[f32], abs_start: u64, cfo_hz: f32, sample_rate: f32) -> Vec<f32> {
+    use std::f32::consts::TAU;
+    if cfo_hz == 0.0 {
+        return samples.to_vec();
+    }
+    let analytic = super::sync::analytic_signal(samples);
+    analytic
+        .iter()
+        .enumerate()
+        .map(|(i, &z)| {
+            let t = abs_start as f32 + i as f32;
+            let ph = -TAU * cfo_hz * t / sample_rate;
+            (z * Complex32::new(ph.cos(), ph.sin())).re
+        })
+        .collect()
 }
 
 /// A plain O(1)-per-sample delay line: `process` emits `x[n - delay]` for each

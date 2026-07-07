@@ -250,7 +250,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "until Task 6"]
     fn loopback_survives_ssb_filter_and_50hz_mistune() {
         // The bar Phase 1 exists to clear: a real radio's passband + a realistic mistune.
         let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);

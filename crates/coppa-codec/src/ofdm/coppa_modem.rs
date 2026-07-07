@@ -405,25 +405,25 @@ impl CoppaModem {
         let data_per_sym = self.data_carriers_per_symbol();
         let total_active = self.profile.total_active_carriers();
 
-        // 1. Sync: streaming O(1) detector (see `sync_detector` module docs). Its
-        // `cfo_hz` field is 0.0 until Task 6 wires in two-stage CFO estimation, so
-        // CFO estimation/removal below still runs as its own explicit step.
+        // 1. Sync: streaming O(1) detector (see `sync_detector` module docs), which now
+        // also produces a two-stage Moose CFO estimate (`cfo_hz`, ±50 Hz range) alongside
+        // timing — see `sync::estimate_cfo_two_stage` and `SyncDetector::estimate_cfo_from_ring`.
         let candidate = SyncDetector::detect_all(&self.profile, self.version, samples)
             .into_iter()
             .next()?;
         let timing_offset = candidate.frame_start as usize;
 
-        // 1b. Estimate and remove carrier frequency offset (CFO) from the preamble.
-        // A residual CFO de-rotates every subcarrier and collapses the link past ~2 Hz;
-        // de-rotating the whole buffer here lets all downstream demod use the corrected signal.
-        let cfo = crate::ofdm::sync::estimate_cfo_hz(
-            samples,
-            timing_offset,
-            symbol_len,
-            self.profile.sample_rate as f32,
-        );
-        let corrected: Vec<f32> = if cfo.abs() > 0.1 {
-            crate::ofdm::sync::remove_cfo(samples, cfo, self.profile.sample_rate as f32)
+        // 1b. Remove the estimated CFO from the whole buffer once. A residual CFO
+        // de-rotates every subcarrier and collapses the link past ~2 Hz; de-rotating the
+        // whole buffer here lets all downstream demod use the corrected signal. The 0.5 Hz
+        // floor skips a whole-buffer FFT-based de-rotation pass when the estimate is
+        // noise-level (matches the task brief's `|f_hat| > 0.5 Hz` gate).
+        let corrected: Vec<f32> = if candidate.cfo_hz.abs() > 0.5 {
+            crate::ofdm::sync::remove_cfo(
+                samples,
+                candidate.cfo_hz,
+                self.profile.sample_rate as f32,
+            )
         } else {
             samples.to_vec()
         };
