@@ -118,6 +118,15 @@ pub struct Scenario {
     pub profile_override: Option<CoppaProfile>,
     /// Carrier frequency offset (Hz) applied after the channel; 0.0 = none.
     pub cfo_hz: f32,
+    /// Emulate a realistic SSB rig's audio passband (`coppa_channel::ssb_filter`,
+    /// 300-2700 Hz) applied to the clean TX signal before fading/noise. `false`
+    /// (the default) benches against the idealized full-band signal, matching
+    /// all pre-existing scenarios. Kept as a sibling `Scenario` field alongside
+    /// `cfo_hz` rather than folded into `ChannelSpec`: `ChannelSpec` is consumed
+    /// by `coppa-bench`'s examples/`transfer.rs` via bare enum pattern matches,
+    /// and `cfo_hz` already established the precedent that "impairments applied
+    /// around the channel" live on `Scenario`, not inside `ChannelSpec` itself.
+    pub ssb: bool,
 }
 
 #[cfg(test)]

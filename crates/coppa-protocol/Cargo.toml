@@ -17,3 +17,4 @@ lz4_flex = { workspace = true }
 approx = { workspace = true }
 rand = { workspace = true }
 proptest = { workspace = true }
+coppa-channel = { path = "../coppa-channel" }

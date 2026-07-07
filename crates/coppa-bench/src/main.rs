@@ -43,6 +43,10 @@ struct Args {
     /// Carrier frequency offset (Hz) applied after the channel; 0.0 = none.
     #[arg(long, default_value_t = 0.0)]
     cfo: f32,
+    /// Emulate a realistic SSB rig audio passband (300-2700 Hz) on the TX signal
+    /// before the channel, in addition to the transceiver's own RX bandpass.
+    #[arg(long, default_value_t = false)]
+    ssb: bool,
 }
 
 fn parse_channel(s: &str) -> ChannelSpec {
@@ -91,6 +95,7 @@ fn main() {
             seed: args.seed,
             profile_override: profile_override.clone(),
             cfo_hz: args.cfo,
+            ssb: args.ssb,
         };
         eprintln!("Measuring level {} ({})...", mode.level, mode.name);
         all_points.extend(run_scenario(&scenario));
