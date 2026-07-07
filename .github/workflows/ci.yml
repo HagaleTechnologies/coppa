@@ -22,7 +22,7 @@ jobs:
       - run: cargo check --workspace
 
   test-features:
-    name: Test with Features
+    name: Test with Features (fast, lib-only)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -32,6 +32,17 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - run: cargo test --workspace --features cpal-backend,websocket --lib
       - run: cargo check --workspace --no-default-features
+
+  test-full:
+    name: Full test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ALSA dev headers (for cpal)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: cargo test --workspace --features cpal-backend,websocket
 
   bench-fuzz:
     name: Bench & Fuzz Compilation
@@ -100,12 +111,18 @@ jobs:
         if: runner.os != 'Linux'
         run: cargo test -p coppa-audio --lib --features cpal-backend
 
+  deny:
+    name: Supply-chain check (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-      - run: cargo audit
+      - uses: rustsec/audit-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
