@@ -475,6 +475,22 @@ impl NrBg2Decoder {
         let mut check_to_var = vec![0.0f32; self.total_edges_unlifted * z];
         let mut converged = false;
         let mut iterations_used = 0;
+        // Hard-decision cache, maintained incrementally as `total_llr` is
+        // updated below rather than recomputed from scratch by a separate
+        // full pass in `check_syndrome`. A variable node is touched by every
+        // row (base-graph column) it participates in -- average degree here
+        // is `total_edges_unlifted*z / n` (~3.8) -- so `check_syndrome`
+        // previously re-derived the same hard bit from a 4-byte `f32`
+        // compare on each of those visits; profiling
+        // (`examples/task4_decode_profile.rs`, Task 4 report) found this
+        // syndrome pass a substantial fraction of per-decode cost. Updating
+        // `hard[var]` right where `total_llr[var]` is written folds the sign
+        // decision into the update pass (which already visits every
+        // variable node at least once per iteration, since every column of
+        // a valid parity-check matrix appears in at least one row), leaving
+        // `check_syndrome` a pure integer XOR over 1-byte lookups with no
+        // float comparisons at all.
+        let mut hard: Vec<u8> = total_llr.iter().map(|&l| (l < 0.0) as u8).collect();
 
         for iter in 0..self.max_iterations {
             iterations_used = iter + 1;
@@ -523,13 +539,15 @@ impl NrBg2Decoder {
                             .clamp(-NR_MSG_CLAMP, NR_MSG_CLAMP);
                         let edge_idx = (base_edge + k) * z + i;
                         check_to_var[edge_idx] = new_msg;
-                        total_llr[vars[k]] = (total_llr[vars[k]] + (new_msg - old_msgs[k]))
+                        let updated = (total_llr[vars[k]] + (new_msg - old_msgs[k]))
                             .clamp(-NR_MSG_CLAMP, NR_MSG_CLAMP);
+                        total_llr[vars[k]] = updated;
+                        hard[vars[k]] = (updated < 0.0) as u8;
                     }
                 }
             }
 
-            if self.check_syndrome(&total_llr) {
+            if self.check_syndrome(&hard) {
                 converged = true;
                 break;
             }
@@ -538,7 +556,14 @@ impl NrBg2Decoder {
         (total_llr, iterations_used, converged)
     }
 
-    fn check_syndrome(&self, total_llr: &[f32]) -> bool {
+    /// Check whether the current hard decisions satisfy every parity check.
+    /// `hard` is a precomputed per-variable-node hard-decision cache (`1` if
+    /// the posterior LLR is negative, `0` otherwise), kept in sync with
+    /// `total_llr` by `decode`'s update loop -- see the comment there. This
+    /// keeps the syndrome pass a pure XOR reduction over 1-byte lookups
+    /// instead of re-deriving each hard bit from a 4-byte float compare on
+    /// every one of a variable node's (multiple) row memberships.
+    fn check_syndrome(&self, hard: &[u8]) -> bool {
         let z = nr_bg2::ZC;
         for (r, edges) in self.rows_edges.iter().enumerate() {
             let deg = edges.len();
@@ -547,13 +572,9 @@ impl NrBg2Decoder {
                 let mut syn = 0u8;
                 let row_base = i * deg;
                 for k in 0..deg {
-                    let var = var_row[row_base + k];
-                    if total_llr[var] < 0.0 {
-                        syn ^= 1;
-                    }
+                    syn ^= hard[var_row[row_base + k]];
                 }
                 if syn != 0 {
-                    let _ = r;
                     return false;
                 }
             }

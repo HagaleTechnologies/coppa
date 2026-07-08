@@ -333,6 +333,39 @@ mod nr_ldpc_codec_tests {
         }
     }
 
+    /// Regression guard for the alpha-calibration bug fixed during Task 4:
+    /// an alpha (normalized min-sum scale) value swept and picked at level 2
+    /// only (see `decoder::NR_DEFAULT_SCALE`'s doc) broke real convergence
+    /// at level 10 with a tiny (1-byte) payload -- extreme known-pad pinning,
+    /// the most rate/pinning-dependent operating point in the whole ladder --
+    /// even on a perfectly clean channel (0% LLR corruption, i.e. this is not
+    /// a noise-margin issue, it's a structural convergence failure). This was
+    /// only ever caught by `tests/phase_c_loopback.rs`'s
+    /// `test_all_levels_min_payload` / `test_awgn_level_10_above_threshold`,
+    /// which are workspace integration tests that CI does NOT run (CI only
+    /// runs `cargo test --lib`, per this crate's `CLAUDE.md`); the existing
+    /// `perfect_llr_loopback_every_level` test above uses a 400-bit payload
+    /// for every level, which does not reproduce the triggering condition.
+    /// This test reproduces it directly at the FEC layer so
+    /// `cargo test -p coppa-protocol --lib` alone would catch a regression.
+    #[test]
+    fn perfect_llr_loopback_level_10_tiny_payload() {
+        let ldpc = NrLdpc::new();
+        let k_used = 1620; // level 10 (see ALL_LEVELS_K_USED)
+        let payload_bits = 8; // 1 byte -- the exact size that broke alpha=0.80
+        let (converged, decoded, original) =
+            loopback(&ldpc, k_used, payload_bits, 0.0, 0xA1FA_0000);
+        assert!(
+            converged,
+            "level 10 (k_used={k_used}) tiny (1-byte) payload: decoder did not converge -- \
+             this is the exact condition that broke with a mis-calibrated normalized min-sum alpha"
+        );
+        assert_eq!(
+            decoded, original,
+            "level 10 (k_used={k_used}) tiny (1-byte) payload: payload mismatch"
+        );
+    }
+
     #[test]
     fn perfect_llr_loopback_max_payload_every_level() {
         let ldpc = NrLdpc::new();
