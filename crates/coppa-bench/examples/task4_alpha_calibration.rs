@@ -19,7 +19,7 @@ use coppa_protocol::fec::ldpc::{nr_bg2, pin_known_pad};
 use coppa_protocol::fec::scrambler::scramble;
 use coppa_protocol::modem::speed_levels::{k_used_for_level, speed_level_components};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 const CODED_LEN: usize = 1944;
 const LEVEL: u8 = 2;

@@ -21,7 +21,7 @@ use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::modem::streaming::StreamingReceiver;
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 fn main() {
     let profile = CoppaProfile::hf_standard();

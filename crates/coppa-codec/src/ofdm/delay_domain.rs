@@ -281,7 +281,7 @@ impl DelayDomainEstimator {
 mod tests {
     use super::*;
     use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
 
     /// Complex circularly-symmetric Gaussian sample with total variance `variance`
     /// (i.e. `CN(0, variance)`: each of re/im is `N(0, variance/2)`).

@@ -13,6 +13,7 @@ pub mod watterson;
 
 use coppa_dsp::fft::FftProcessor;
 use num_complex::Complex32;
+use rand::RngExt;
 use std::f32::consts::TAU;
 
 /// Apply a clean wideband carrier-frequency offset to a real passband signal.
@@ -120,7 +121,6 @@ pub fn awgn_ref_seeded(
     seed: u64,
 ) -> Vec<f32> {
     use rand::rngs::StdRng;
-    use rand::Rng;
     use rand::SeedableRng;
     if samples.is_empty() {
         return Vec::new();

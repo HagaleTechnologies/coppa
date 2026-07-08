@@ -6,7 +6,7 @@ use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::modem::speed_levels::k_used_for_level;
 use coppa_protocol::modem::CoppaTransceiver;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 /// Max payload capacity for a speed level: the NR BG2 mother code's
 /// shortened `k_used` info width for that level (Task 4), in bytes. Was

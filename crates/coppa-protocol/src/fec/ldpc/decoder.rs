@@ -813,7 +813,7 @@ mod nr_bg2_decoder_tests {
         use crate::fec::ldpc::NrLdpc;
         use crate::fec::scrambler::scramble;
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
 
         const K_USED: usize = 972; // level 2
         const PAYLOAD_BITS: usize = 964; // near-full capacity, matches the bench gate convention
@@ -967,7 +967,7 @@ mod tests {
     #[test]
     fn test_decode_with_noise() {
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
 
         let code = LdpcCode::new(CodeRate::Rate1_2);
         let enc = LdpcEncoder::new(code.clone());
@@ -1179,7 +1179,7 @@ mod tests {
     #[test]
     fn test_low_rate_strong_correction() {
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
 
         // Rate 1/4 has the most redundancy -- should correct more errors
         let code = LdpcCode::new(CodeRate::Rate1_4);

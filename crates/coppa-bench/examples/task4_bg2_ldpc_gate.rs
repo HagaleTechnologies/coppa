@@ -40,7 +40,7 @@ use coppa_protocol::fec::scrambler::scramble;
 use coppa_protocol::modem::speed_levels::{k_used_for_level, speed_level_components};
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::time::Instant;
 
 const CODED_LEN: usize = 1944;
