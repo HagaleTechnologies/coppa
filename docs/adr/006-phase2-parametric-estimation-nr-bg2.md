@@ -277,7 +277,7 @@ non-functional.
 Phase-2-specific effect). The CFO sweep surfaces a **new regression not visible in plain AWGN**:
 level 4 (QPSK 3/4) goes from clearing FER≤10%/≤1% at 15/18 dB to never clearing at all under a
 40 Hz offset (peak goodput 1849→994 bps) — not exercised by any single dev task's own bench
-gate, flagged as a follow-up.
+gate, flagged as a follow-up. **This has since been fixed — see the Addendum below.**
 
 **Header failure share on Poor**: met in aggregate (4.3% across levels 2/3/6, all SNR points),
 briefly exceeding 10% only at the two lowest SNR points tested (6/12 dB, where the payload
@@ -316,6 +316,37 @@ not decodable by any pre-Phase-2 codec, and vice versa — this compounds Phase 
 break (ADR-003) and Task 4's own LDPC break (ADR-005) into a single Phase 2 wire-format
 generation. This is acceptable pre-1.0 (no deployed installed base).
 
+## Addendum (2026-07-08): CFO×level-4 regression fixed
+
+The CFO×level-4 interaction flagged as a follow-up above (decision-adjacent finding from Task
+8's phase-gate sweep, not one of the phase's own four stated acceptance criteria) has since been
+investigated and fixed, in two follow-up commits on top of this ADR's own Phase 2 work:
+
+- **`5e7ba93`** ("fix(codec): bounded per-frame coarse-delay correction fixes CFO x level-4 FER
+  floor") root-caused the floor to the same frame-global-reference mechanism this ADR's
+  decisions 1 and 3 already implicate for the (still-open) Watterson-Moderate regression: a
+  nonzero CFO induces several-sample sync-timing jitter (worst-measured delta ≈0.36 grid units)
+  that Task 1's single, construction-time `calibrated_bias` cannot represent, leaking probe
+  energy into a spurious second delay-domain tap and corrupting LDPC LLRs identically at every
+  level — level 4's tight rate-3/4 margin is simply the first to lose convergence outright. The
+  fix, `CoppaModem::bounded_coarse_delay` (`COARSE_DELAY_JITTER_BOUND = 0.15`), clamps the
+  per-frame correction to a small window: large enough to fully clear the CFO floor (FER→0.00
+  across the whole 30-50 Hz band) but small enough to avoid reopening the Watterson-fading
+  regression this exact code area caused once before (ADR-004) — verified at a cost within
+  trial noise (~1.2σ) against `hf_standard_header_survives_watterson_moderate_fading` and a
+  broader levels-1-4 × Good/Moderate/Poor sanity sweep.
+- **`daf1d45`** (post-merge review) closed the one remaining gap: CFO and Watterson-fading had
+  only ever been measured independently. A combined sweep (level 4, Watterson-Moderate,
+  CFO∈{0, 39.5, 40} Hz × 6-30 dB) confirmed no new interaction — the severe AWGN-only CFO floor
+  does not reappear under real fading, and the fixed-vs-pre-fix diff under the combined
+  condition is ~0 (mean −0.011 FER).
+
+This does not change this ADR's own decisions or its Watterson-Moderate/level-2 regression
+(decisions 1/3, still open) — it closes out only the separate, later-discovered CFO×level-4
+finding. See `.superpowers/sdd/p2-cfo-level4-investigation-report.md` and
+`p2-cfo-level4-fix-report.md` for full measurement detail, and `BENCHMARKS.md`'s `--cfo 40`
+sweep section for the before/after numbers.
+
 ## Related
 
 - `docs/adr/003-phase1-waveform-break.md`, `docs/adr/004-strongest-path-timing.md` — Phase 1's
@@ -325,4 +356,7 @@ generation. This is acceptable pre-1.0 (no deployed installed base).
   ADR summarizes.
 - `.superpowers/sdd/p2-task-8-report.md` — this task's full report, including the complete
   cumulative re-baseline data.
+- `.superpowers/sdd/p2-cfo-level4-investigation-report.md`,
+  `.superpowers/sdd/p2-cfo-level4-fix-report.md` — the CFO×level-4 regression's investigation
+  and fix (see "Addendum" above).
 - `BENCHMARKS.md`'s Phase 2 section — full before/after tables.

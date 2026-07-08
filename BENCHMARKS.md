@@ -40,7 +40,14 @@ called out here up front rather than left to a body subsection:** under a 40 Hz 
 frequency offset, level 4 (QPSK 3/4) collapses from clean convergence (0/400 errors by 18 dB in
 Phase 1) to a flat ~46-52% FER floor across the *entire* 9-30 dB range in Phase 2 — a hard floor
 that does not improve with more SNR at all, not just reduced margin (see "`--cfo 40` sweep"
-below). To a lesser but still real degree, Watterson-Moderate levels 3-6 (QPSK, 8PSK, 16QAM 1/2)
+below).
+
+> **UPDATE (2026-07-08): the CFO×level-4 floor above is FIXED**, by
+> `CoppaModem::bounded_coarse_delay` (commit `5e7ba93`), independently reverified safe under
+> combined CFO+Watterson-fading conditions (commit `daf1d45`). See the "UPDATE" note in the
+> "`--cfo 40` sweep" section below and the Acceptance summary table for the fixed numbers.
+
+To a lesser but still real degree, Watterson-Moderate levels 3-6 (QPSK, 8PSK, 16QAM 1/2)
 regress at matched operating SNR relative to the Phase 1 exit baseline (see "Watterson Moderate"
 below). Neither of these was part of the phase's original four stated acceptance criteria, but
 both are real findings from this same measurement that belong in the acceptance summary, not
@@ -224,8 +231,10 @@ level 4 (QPSK 3/4) under a 40 Hz carrier offset goes from clearing FER≤10%/≤
 3-9 dB more margin than before. Levels 1/2/5/6 are flat-to-marginally-different (matching the
 AWGN pattern); levels 7/9/10 show the same real gains AWGN shows. This CFO×level-4 interaction
 was not exercised by any single Phase 2 dev task's own bench gate (none of them swept `--cfo`)
-and is new information from this phase-gate sweep — flagged as a follow-up item, not
-investigated further here.
+and was new information from this phase-gate sweep.
+
+**UPDATE (2026-07-08): level 4's CFO floor is FIXED — see the "UPDATE" note directly below**,
+in the detailed mechanism/measurement writeup that follows this table.
 
 **A plausible (not proven) mechanism**: a static CFO offset is exactly the kind of fixed
 phase-ramp that Task 1's frame-global `calibrated_bias` reference could mismodel. That
@@ -237,6 +246,52 @@ the kind of effect that construction-time calibration against a static reference
 know about or correct for — plausibly compounding with level 4's already-tighter LLR margins
 (QPSK 3/4, the highest-rate HF-profile mode) to produce the flat floor. Not investigated
 further here.
+
+**UPDATE (2026-07-08): this speculated mechanism was confirmed correct, and the floor is
+FIXED.** A follow-up investigation (`.superpowers/sdd/p2-cfo-level4-investigation-report.md`)
+directly measured the mechanism above rather than leaving it speculative: a nonzero CFO induces
+several-sample sync-timing jitter in `SyncDetector`'s strongest-path `frame_start` (worst
+observed `|delta|` from `calibrated_bias` ≈ 0.36 grid units, at CFO=39/39.5 Hz — exactly the
+worst-FER CFO values), which the single frame-global `calibrated_bias` cannot represent; the
+mismatch leaks real probe energy into a spurious second delay-domain tap, corrupting the LDPC
+input LLRs identically at every level, and level 4's tight rate-3/4 margin is the first to lose
+convergence outright (confirmed deterministic: near-identical fitted taps/`noise_var` across 10
+independent seeds at the same CFO — not an SNR effect, which is why more SNR never helped).
+CFO estimation itself, turbo re-estimation, and LDPC alpha/iteration tuning were all directly
+ruled out as the cause (see the investigation report).
+
+The fix (`.superpowers/sdd/p2-cfo-level4-fix-report.md`, commit `5e7ba93`) adds
+`CoppaModem::bounded_coarse_delay`, which clamps the per-frame coarse-delay correction to
+`±COARSE_DELAY_JITTER_BOUND = 0.15` grid units instead of trusting the raw per-frame estimate —
+small enough that it cannot reach the multi-grid-unit swings a real two-tap Watterson channel
+produces (the failure mode that broke the earlier fully-adaptive attempt referenced in
+`docs/adr/004-strongest-path-timing.md`), but large enough to fully clear the CFO floor (the
+minimal sufficient bound measured at ≈0.07). Before/after, level 4, `--cfo 40`-band, 30 dB, AWGN:
+
+| CFO (Hz) | Before (unmodified) FER | After (bound=0.15) FER |
+|---|---|---|
+| 0 | 0.000 | 0.000 |
+| 33-38 | 0.017-0.067 | 0.000 |
+| 39 | **1.000** | 0.000 |
+| 39.5 | **1.000** | 0.000 |
+| 40 | **0.417** | 0.000 |
+| 40.5-45 | 0.000-0.033 | 0.000 |
+
+Full 30-50 Hz band at 1 Hz steps, 80 trials/point, post-fix: all-zero. SNR sweep at the
+worst pre-fix point (CFO=39.5) shows a near-complete recovery of the clean SNR-response curve
+(cost under 3 dB, full recovery by ~9 dB, vs. the unfixed floor's total non-response to SNR at
+all). The exact regression test this code area previously broke
+(`hf_standard_header_survives_watterson_moderate_fading`) still passes, and a precise
+(not just pass/fail) pass-rate comparison shows the bound's cost against Watterson-Moderate is
+within trial noise: 98.33-98.67% (bound=0.15) vs. 98.78-99.00% (baseline) at n=300-900, a
+0.3-0.5 percentage-point gap against a ≈0.4% binomial std (~1.2σ) — not a reproducible
+regression. A broader levels-1-4 × Good/Moderate/Poor sanity sweep (48 points) found no other
+regression (mean diff ≈ 0, no systematic direction). A later post-merge review
+(commit `daf1d45`) additionally swept the untested *combined* CFO+Watterson-fading case
+directly (level 4, Watterson-Moderate, CFO∈{0, 39.5, 40} Hz × 6-30 dB) and confirmed the same
+result holds jointly: the AWGN-only CFO floor does not reappear under real fading, and the
+fixed-vs-pre-fix diff under the combined condition is ~0 (mean −0.011 FER). Full test suite,
+clippy, and fmt all clean after the fix.
 
 ### Header failure share on Poor (soft Golay) — `header_diagnostic`, 100 trials/cell
 
@@ -277,7 +332,7 @@ honestly rather than folded away.
 | Watterson-poor/level 2 ≥ +3 dB at FER@10%-CI | **Not measurable as literally specified** — neither the Phase 1 nor Phase 2 codec ever crosses the 10% Wilson-CI bound on Poor at level 2. The underlying FER is substantially better at every SNR (roughly halved at 30 dB: 44.25%→21.75%), a real, large, verified gain — but the specific dB-shift metric the bar names cannot be computed |
 | Watterson-poor/level 6 ≥ +1.5 dB at FER@10%-CI | **Not met.** Also not measurable by the literal metric (never crosses 10%), and unlike level 2, the underlying FER shows no net improvement — essentially flat from 18 dB up, with individual SNR points within trial noise of each other (18/24 dB marginally better, 21/27/30 dB marginally worse) |
 | Header failures < 10% of residual frame failures on poor (soft Golay) | **Met in aggregate** (4.3% across levels 2/3/6, all SNRs); briefly exceeds 10% only at the two lowest SNR points tested (6/12 dB), where the payload itself is already failing 30-60% of the time — from 18 dB up, every cell is ≤4% |
-| *(not an original criterion, added here as a same-measurement finding)* CFO×level-4 interaction | **New severe regression.** Under a 40 Hz carrier offset, level 4 (QPSK 3/4) goes from clean convergence (0/400 errors by 18 dB in Phase 1) to a flat ~46-52% FER floor across the entire 9-30 dB range — a hard ceiling that does not recede with more SNR at all, not just reduced margin. See "`--cfo 40` sweep" below |
+| *(not an original criterion, added here as a same-measurement finding)* CFO×level-4 interaction | **FIXED (2026-07-08, was: new severe regression).** Under a 40 Hz carrier offset, level 4 (QPSK 3/4) went from clean convergence (0/400 errors by 18 dB in Phase 1) to a flat ~46-52% FER floor across the entire 9-30 dB range in Phase 2 — a hard ceiling that did not recede with more SNR at all. Root-caused to CFO-induced sync jitter desyncing the frame-global `calibrated_bias` reference; fixed by `CoppaModem::bounded_coarse_delay` (commit `5e7ba93`), which restores FER→0.00 across the whole CFO band at a cost within trial noise against Watterson-fading (~1.2σ), independently reverified safe under combined CFO+Watterson-fading conditions (commit `daf1d45`). See "`--cfo 40` sweep" below |
 | *(not an original criterion, added here as a same-measurement finding)* Watterson-Moderate levels 3-6 | **Real regression at matched SNR.** QPSK 1/2 (3), QPSK 3/4 (4), 8PSK 2/3 (5), and 16QAM 1/2 (6) genuinely regress at the SNRs that matter most relative to the Phase 1 exit baseline — most severely levels 5/6, roughly doubling FER at 27-30 dB (level 5: 23.25%→50.25% at 27 dB; level 6: 10.25%→40.0% at 30 dB). See "Watterson Moderate" below |
 
 **Overall: the phase's own stated acceptance bar is not cleanly met.** The AWGN criterion is met
