@@ -514,7 +514,7 @@ mod tests {
     #[test]
     fn test_error_correction_rate_1_2() {
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
 
         let mut codec = LdpcCodec::new(CodeRate::Rate1_2);
         let info_bits = codec.code().info_bits();
@@ -629,7 +629,7 @@ mod tests {
     fn test_ldpc_near_threshold_rate_1_4() {
         // Rate 1/4 has the most redundancy — should decode at moderate noise
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
 
         let mut codec = LdpcCodec::new(CodeRate::Rate1_4);
         let info_bits = codec.code().info_bits();
@@ -664,7 +664,7 @@ mod tests {
     fn test_ldpc_beyond_capacity_does_not_panic() {
         // Very high noise — decoder should terminate gracefully, not hang or panic
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
 
         let mut codec = LdpcCodec::new(CodeRate::Rate1_2);
         let info_bits = codec.code().info_bits();
@@ -701,7 +701,7 @@ mod tests {
     /// used throughout the existing FEC tests.
     fn awgn_soft(encoded: &[u8], noise_std: f32, seed: u64) -> Vec<f32> {
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
 
         let mut rng = StdRng::seed_from_u64(seed);
         encoded

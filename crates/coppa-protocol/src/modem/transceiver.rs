@@ -859,7 +859,7 @@ mod tests {
             for trial in 0..SEEDS {
                 let seed = 0x7075_0000u64.wrapping_add(trial);
                 use rand::rngs::StdRng;
-                use rand::{Rng, SeedableRng};
+                use rand::{RngExt, SeedableRng};
                 let mut rng = StdRng::seed_from_u64(seed);
                 let payload: Vec<u8> = (0..PAYLOAD_BYTES).map(|_| rng.random::<u8>()).collect();
                 let clean = tx.transmit(&header, &payload);
@@ -906,7 +906,7 @@ mod tests {
     fn vhf_level5_transceiver_round_trips_with_bounded_peak() {
         use coppa_codec::ofdm::CoppaProfile;
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let profile = CoppaProfile::vhf_wide();
         let tx = CoppaTransceiver::new(profile, 1);
         let mut ok_count = 0;
@@ -1223,7 +1223,7 @@ mod tests {
         use crate::fec::scrambler::prbs_bits;
         use coppa_codec::bpsk::BpskMapper;
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
 
         const PAYLOAD_BYTES: usize = 20;
         const PIN: f32 = 64.0;

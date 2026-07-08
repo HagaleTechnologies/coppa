@@ -487,7 +487,7 @@ mod tests {
         stream.extend_from_slice(&frame1);
         // 5000 samples of noise between the two frames.
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = StdRng::seed_from_u64(11);
         stream.extend((0..5000).map(|_| rng.random_range(-0.01f32..0.01f32)));
         let frame2_start = stream.len() as u64;
@@ -533,7 +533,7 @@ mod tests {
         let mut rx = StreamingReceiver::new(profile.clone(), 1);
 
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = StdRng::seed_from_u64(99);
 
         let sr = profile.sample_rate as usize;

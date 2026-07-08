@@ -22,7 +22,7 @@ use coppa_codec::traits::ConstellationMapper;
 use coppa_protocol::fec::ldpc::{CodeRate, LdpcCodec};
 use coppa_protocol::fec::scrambler::{prbs_bits, scramble};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 const PAYLOAD_BYTES: usize = 20;
 const TRIALS: usize = 400;

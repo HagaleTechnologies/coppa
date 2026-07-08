@@ -24,7 +24,7 @@
 use coppa_dsp::fft::FftProcessor;
 use num_complex::Complex32;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use std::f32::consts::TAU;
 
 /// One propagation path: relative delay (seconds) and average power (linear).

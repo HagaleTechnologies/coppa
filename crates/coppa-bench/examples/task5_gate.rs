@@ -23,7 +23,7 @@ use coppa_channel::watterson::WattersonPreset;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 const LEVELS: [u8; 3] = [2, 5, 6];
 const TRIALS: usize = 200;

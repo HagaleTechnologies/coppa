@@ -20,7 +20,7 @@ use coppa_channel::watterson::WattersonPreset;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 const LEVEL: u8 = 2;
 const SHORT_PAYLOAD_BYTES: usize = 20;

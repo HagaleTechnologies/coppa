@@ -561,7 +561,7 @@ mod tests {
         // was ruled out, by direct measurement, as the source of an early
         // debugging surprise below — see `TX_BPF_GROUP_DELAY`).
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = StdRng::seed_from_u64(7);
         let symbols: Vec<Complex32> = (0..480)
             .map(|_| {
