@@ -35,6 +35,17 @@ net change, and a few show a real net regression. **The phase's own stated accep
 failures <10% of residual on poor) is not cleanly met — see "Acceptance summary" below for
 exactly where and by how much.**
 
+**Two further findings are the single most severe results in this cumulative sweep, and are
+called out here up front rather than left to a body subsection:** under a 40 Hz carrier
+frequency offset, level 4 (QPSK 3/4) collapses from clean convergence (0/400 errors by 18 dB in
+Phase 1) to a flat ~46-52% FER floor across the *entire* 9-30 dB range in Phase 2 — a hard floor
+that does not improve with more SNR at all, not just reduced margin (see "`--cfo 40` sweep"
+below). To a lesser but still real degree, Watterson-Moderate levels 3-6 (QPSK, 8PSK, 16QAM 1/2)
+regress at matched operating SNR relative to the Phase 1 exit baseline (see "Watterson Moderate"
+below). Neither of these was part of the phase's original four stated acceptance criteria, but
+both are real findings from this same measurement that belong in the acceptance summary, not
+just in body prose — both are added there as additional rows below.
+
 Command: `cargo run -p coppa-bench --release -- --channel {awgn|good|moderate|poor} --trials 400
 [--ssb] [--cfo 40]` (seed `0x00C0FFEE`, the CLI default). Raw CSVs:
 `results/p2-final/{awgn,good,moderate,poor}.csv`, `results/p2-final-ssb/awgn.csv`,
@@ -157,13 +168,21 @@ the metric as literally specified is not met (not measurable), but the underlyin
 quantity it was meant to proxy shows a real, substantial, verified gain.
 
 **Level 6 — the phase's other named acceptance point — shows no such gain.** The FER curve is
-flat to marginally *worse* at every SNR from 18 dB up, consistent with Task 5's own finding that
-turbo re-estimation rescues only 1-2% of first-pass failures on level 6/Watterson-Poor (vs.
+essentially flat (no net improvement) from 18 dB up, with results at individual SNR points
+within trial noise of each other — two of the five points from 18 dB up are actually
+marginally *better* (18 dB: 88.75%→87.5%; 24 dB: 79.0%→77.75%), while 21/27/30 dB are
+marginally worse (30 dB: 74.0%→76.25%), consistent with Task 5's own finding that turbo
+re-estimation rescues only 1-2% of first-pass failures on level 6/Watterson-Poor (vs.
 21-50% at level 2), leaving Task 1/7's estimator regression comparatively unmasked at this
 level. **The ≥+1.5 dB level-6 bar is not met, in either its literal (undefined-threshold) or
-underlying (flat-to-worse FER) sense.**
+underlying (essentially-flat, no-net-improvement FER) sense.**
 
 ### `--ssb` sweep (AWGN + realistic SSB rig passband, all levels)
+
+Phase 1 column cites `results/p1-final-ssb/awgn.csv` — the pre-hotfix baseline (same
+substitution as the Good-channel table above, since no `p1-hotfix`-generation SSB sweep exists).
+This is immaterial here for the same reason it's immaterial for Good: the interleaver/LDPC-clamp
+hotfix only touched Watterson-fading sync timing, not the AWGN+SSB path this sweep exercises.
 
 VHF-profile levels (5-10) fail completely under `--ssb` in both the Phase 1 and Phase 2
 codecs — expected, not a defect (`vhf_wide`'s ~350-5900 Hz occupied band is far wider than the
@@ -181,6 +200,11 @@ Matches the AWGN ladder's own pattern closely (level 4 real gain, a couple of sm
 regressions) — the SSB emulation doesn't introduce any new Phase-2-specific effect.
 
 ### `--cfo 40` sweep (AWGN + 40 Hz carrier offset, all levels)
+
+Phase 1 column cites `results/p1-final-cfo40/awgn.csv` — the pre-hotfix baseline (same
+substitution as the Good-channel table above, since no `p1-hotfix`-generation CFO sweep exists).
+This is immaterial here for the same reason it's immaterial for Good: the interleaver/LDPC-clamp
+hotfix only touched Watterson-fading sync timing, not the AWGN+CFO path this sweep exercises.
 
 | Mode (level) | Phase 1 `--cfo 40` FER≤10%/≤1% | Phase 2 `--cfo 40` FER≤10%/≤1% |
 |---|---|---|
@@ -202,6 +226,17 @@ AWGN pattern); levels 7/9/10 show the same real gains AWGN shows. This CFO×leve
 was not exercised by any single Phase 2 dev task's own bench gate (none of them swept `--cfo`)
 and is new information from this phase-gate sweep — flagged as a follow-up item, not
 investigated further here.
+
+**A plausible (not proven) mechanism**: a static CFO offset is exactly the kind of fixed
+phase-ramp that Task 1's frame-global `calibrated_bias` reference could mismodel. That
+reference is derived once, at `CoppaModem::new()`, via a clean-channel (no propagation
+impairment) self-calibration frame, and is then reused unchanged for every frame afterward
+(see "Watterson Moderate" above and Task 1's own report for the same frame-global-reference
+mechanism implicated there). A persistent CFO-induced phase drift across the frame is exactly
+the kind of effect that construction-time calibration against a static reference has no way to
+know about or correct for — plausibly compounding with level 4's already-tighter LLR margins
+(QPSK 3/4, the highest-rate HF-profile mode) to produce the flat floor. Not investigated
+further here.
 
 ### Header failure share on Poor (soft Golay) — `header_diagnostic`, 100 trials/cell
 
@@ -240,8 +275,10 @@ honestly rather than folded away.
 |---|---|
 | AWGN ladder ≥ +1 dB from the code swap | **Met and exceeded** (level 4 +3 dB, level 7 +3 dB, level 9 +6 dB at FER≤10%; level 10 fixed from non-convergent to clearing cleanly) — with two small, real FER≤1%-only exceptions (levels 6, 9) |
 | Watterson-poor/level 2 ≥ +3 dB at FER@10%-CI | **Not measurable as literally specified** — neither the Phase 1 nor Phase 2 codec ever crosses the 10% Wilson-CI bound on Poor at level 2. The underlying FER is substantially better at every SNR (roughly halved at 30 dB: 44.25%→21.75%), a real, large, verified gain — but the specific dB-shift metric the bar names cannot be computed |
-| Watterson-poor/level 6 ≥ +1.5 dB at FER@10%-CI | **Not met.** Also not measurable by the literal metric (never crosses 10%), and unlike level 2, the underlying FER shows no net improvement — flat to marginally worse at every SNR from 18 dB up |
+| Watterson-poor/level 6 ≥ +1.5 dB at FER@10%-CI | **Not met.** Also not measurable by the literal metric (never crosses 10%), and unlike level 2, the underlying FER shows no net improvement — essentially flat from 18 dB up, with individual SNR points within trial noise of each other (18/24 dB marginally better, 21/27/30 dB marginally worse) |
 | Header failures < 10% of residual frame failures on poor (soft Golay) | **Met in aggregate** (4.3% across levels 2/3/6, all SNRs); briefly exceeds 10% only at the two lowest SNR points tested (6/12 dB), where the payload itself is already failing 30-60% of the time — from 18 dB up, every cell is ≤4% |
+| *(not an original criterion, added here as a same-measurement finding)* CFO×level-4 interaction | **New severe regression.** Under a 40 Hz carrier offset, level 4 (QPSK 3/4) goes from clean convergence (0/400 errors by 18 dB in Phase 1) to a flat ~46-52% FER floor across the entire 9-30 dB range — a hard ceiling that does not recede with more SNR at all, not just reduced margin. See "`--cfo 40` sweep" below |
+| *(not an original criterion, added here as a same-measurement finding)* Watterson-Moderate levels 3-6 | **Real regression at matched SNR.** QPSK 1/2 (3), QPSK 3/4 (4), 8PSK 2/3 (5), and 16QAM 1/2 (6) genuinely regress at the SNRs that matter most relative to the Phase 1 exit baseline — most severely levels 5/6, roughly doubling FER at 27-30 dB (level 5: 23.25%→50.25% at 27 dB; level 6: 10.25%→40.0% at 30 dB). See "Watterson Moderate" below |
 
 **Overall: the phase's own stated acceptance bar is not cleanly met.** The AWGN criterion is met
 and exceeded; the two Watterson-Poor criteria are not met, one because the literal metric is
