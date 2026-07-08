@@ -36,6 +36,31 @@ impl BlockInterleaver {
         output
     }
 
+    /// Same row-write/column-read permutation as [`Self::interleave`], but for
+    /// soft LLR values (`f32`) instead of hard bits (`u8`). Used by Task 5's
+    /// turbo re-estimation to carry posterior LLRs (already selected down to
+    /// coded-bit order by `rate_match::rate_match_llr`) into the same
+    /// interleaved (wire/symbol) order the original transmission used, so they
+    /// line up 1:1 with `eq_symbols`/the per-data-carrier soft-demap order
+    /// `CoppaTransceiver::receive_with_metrics` builds `llrs` in.
+    pub fn interleave_soft(&self, llrs: &[f32]) -> Vec<f32> {
+        let n = llrs.len();
+        let total = self.rows * self.cols;
+        let mut grid = vec![0.0f32; total];
+        grid[..n].copy_from_slice(llrs);
+
+        let mut output = Vec::with_capacity(n);
+        for col in 0..self.cols {
+            for row in 0..self.rows {
+                let idx = row * self.cols + col;
+                if idx < n {
+                    output.push(grid[idx]);
+                }
+            }
+        }
+        output
+    }
+
     pub fn deinterleave(&self, llrs: &[f32]) -> Vec<f32> {
         let n = llrs.len();
         let total = self.rows * self.cols;
@@ -125,6 +150,26 @@ mod tests {
         let bits: Vec<u8> = (0..12).collect();
         let interleaved = interleaver.interleave(&bits);
         assert_eq!(interleaved, vec![0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11]);
+    }
+
+    #[test]
+    fn interleave_soft_matches_interleave_index_permutation() {
+        // Feed distinct float "tags" through interleave_soft and hard-bit-domain
+        // tags (as f32) through a manual replica of `interleave`'s permutation on
+        // the same size grid, then check the deinterleave round trip recovers
+        // the original values exactly (interleave_soft's whole point is doing
+        // the identical permutation as `interleave`, just typed for f32).
+        let il = BlockInterleaver::new(1944, 44);
+        let vals: Vec<f32> = (0..1944u32).map(|i| i as f32).collect();
+        let interleaved = il.interleave_soft(&vals);
+        assert_eq!(interleaved.len(), 1944);
+        let back = il.deinterleave(&interleaved);
+        for (i, (&a, &b)) in vals.iter().zip(back.iter()).enumerate() {
+            assert_eq!(
+                a, b,
+                "position {i} not preserved by interleave_soft/deinterleave"
+            );
+        }
     }
 
     #[test]

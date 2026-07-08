@@ -8,6 +8,8 @@
 //! `CoppaTransceiver`. See the [`crate::ofdm`] module docs for how it relates
 //! to the simpler generic OFDM stack. Synchronization (preamble detection +
 //! CFO removal) is provided by [`super::sync_detector::SyncDetector`].
+use std::cell::RefCell;
+
 use num_complex::Complex32;
 
 use coppa_dsp::fft::FftProcessor;
@@ -143,6 +145,18 @@ pub struct CoppaModem {
     /// `measure_bulk_bias`'s doc for why this must be a fixed, profile-specific
     /// constant rather than something re-derived per received frame.
     calibrated_bias: f32,
+    /// Per-symbol raw carriers + real-pilot observations retained from the most
+    /// recent [`Self::demodulate_frame`] call, so a caller (`CoppaTransceiver`'s
+    /// turbo re-estimation, Task 5) can request a re-equalization pass that
+    /// folds in soft "virtual pilot" observations at data-carrier positions
+    /// without re-running sync/FFT/pilot-extraction from scratch. `RefCell`
+    /// because `demodulate_frame`/`reequalize_with_virtual_pilots` are both
+    /// `&self` (matching every other method on this type) — see
+    /// [`LastFrameWorkspace`]'s doc for the field-by-field rationale. `None`
+    /// until the first `demodulate_frame` call, and reset (overwritten) by
+    /// every subsequent one; `reequalize_with_virtual_pilots` returns empty
+    /// vectors if called with no frame demodulated yet.
+    last_frame_workspace: RefCell<Option<LastFrameWorkspace>>,
 }
 
 /// One frame's probe-derived delay-domain calibration: the fixed bulk-delay bias,
@@ -154,6 +168,59 @@ struct ProbeCalibration {
     order: usize,
     taps: Vec<Complex32>,
     noise_var: f32,
+}
+
+/// State retained from the most recent [`CoppaModem::demodulate_frame`] call,
+/// letting [`CoppaModem::reequalize_with_virtual_pilots`] (Task 5's turbo
+/// re-estimation entry point) re-fit the delay-domain channel model with extra
+/// observations without redoing sync/FFT/pilot-extraction.
+///
+/// # Why `DelayDomainEstimator` (`estimate_and_equalize`), not the live Kalman
+/// # tracker, for the turbo re-fit
+///
+/// `demodulate_frame`'s normal payload pass equalizes via a per-frame
+/// [`KalmanLagSmoother`] (see that method's doc). Turbo re-estimation instead
+/// reuses `estimate_and_equalize`'s one-shot [`DelayDomainEstimator`] path
+/// (the same one `demodulate_header_llrs`'s `KALMAN_HEADER_ENABLED == false`
+/// fallback uses) for two reasons: (1) `DelayDomainEstimator::fit`'s own doc
+/// already anticipates exactly this use (`weights` = "pooling counts ... or
+/// `|x̄|²` (turbo virtual pilots)"), so no new estimator-side plumbing is
+/// needed, just new callers; (2) `DelayDomainEstimator::noise_var` is a
+/// genuine per-observation residual-variance estimate (`σ_v²`), whereas
+/// `KalmanLagSmoother`/`TrackedTaps::noise_at` is flagged (see
+/// `demodulate_frame`'s payload-pass doc comment) as the tracker's *posterior
+/// tap uncertainty*, not real observation noise — feeding turbo's
+/// already-uncertain virtual-pilot observations through the same
+/// possibly-overconfident quantity a second time seemed like a bad idea to
+/// stack on an already-flagged risk. This means the turbo retry's LLR
+/// calibration comes from a DIFFERENT (arguably more honest) noise model than
+/// the first-pass equalization did — see the Task 5 report for whether this
+/// asymmetry was observed to matter in practice.
+struct LastFrameWorkspace {
+    /// Tap-model order used for the frame's Kalman seed / non-Kalman fallback
+    /// (`ProbeCalibration::order`) — reused as-is for the turbo re-fit rather
+    /// than re-deriving a new order from the augmented observation set.
+    order: usize,
+    /// This frame's fixed coarse-delay bulk bias (`ProbeCalibration::coarse_delay`,
+    /// always `self.calibrated_bias` — see `measure_bulk_bias`'s doc).
+    coarse_delay: f32,
+    /// Per-payload-OFDM-symbol `(global_sym, raw_carriers)`, in frame order —
+    /// exactly `demodulate_frame`'s Pass-1 `sym_carriers`, retained instead of
+    /// discarded. `raw_carriers` is the RAW (non-derotated) full active-carrier
+    /// set for that symbol (both pilot and data positions), matching the
+    /// convention `estimate_and_equalize` expects (it derotates internally).
+    sym_carriers: Vec<(usize, Vec<Complex32>)>,
+    /// Per-payload-OFDM-symbol raw (non-derotated) real-pilot `(carrier_index,
+    /// H_estimate)` pairs, in the same frame order as `sym_carriers` — exactly
+    /// `demodulate_frame`'s Pass-1 `per_symbol_pilots`.
+    per_symbol_pilots: Vec<Vec<(usize, Complex32)>>,
+    /// Flat, frame-order map from a data-carrier position (matching the
+    /// `payload_symbols`/`noise_variances` vectors `demodulate_frame` returns)
+    /// to `(workspace symbol index, carrier index within that symbol)` — lets
+    /// `reequalize_with_virtual_pilots` translate its `soft_symbols`/`weights`
+    /// inputs (also in that same frame order) back to a specific raw carrier
+    /// observation to divide out.
+    data_carrier_map: Vec<(usize, usize)>,
 }
 
 impl CoppaModem {
@@ -179,6 +246,7 @@ impl CoppaModem {
             version,
             tx_bpf,
             calibrated_bias: 0.0,
+            last_frame_workspace: RefCell::new(None),
         };
         modem.calibrated_bias = modem.measure_bulk_bias();
         modem
@@ -557,6 +625,7 @@ impl CoppaModem {
         for w in &windows {
             tracker.advance(w);
         }
+        let mut data_carrier_map: Vec<(usize, usize)> = Vec::new();
         for (i, (global_sym, carriers)) in sym_carriers.iter().enumerate() {
             let tt = tracker.smoothed(i);
             let rotated_carriers: Vec<Complex32> = carriers
@@ -567,6 +636,7 @@ impl CoppaModem {
             let (equalized, noise_full) = tt.equalize(&rotated_carriers);
             let data = self.pilots.extract_data(&equalized, *global_sym);
             let data_indices = self.pilots.data_indices(*global_sym);
+            data_carrier_map.extend(data_indices.iter().map(|&idx| (i, idx)));
             // Unlike `DelayDomainEstimator::equalize`'s single frame-wide noise
             // scalar, `TrackedTaps::noise_at` yields a genuine per-carrier value
             // from the tracked covariance, informed by exactly how many (and how
@@ -609,7 +679,104 @@ impl CoppaModem {
             noise_variances.extend_from_slice(&carrier_noise);
         }
 
+        *self.last_frame_workspace.borrow_mut() = Some(LastFrameWorkspace {
+            order: calib.order,
+            coarse_delay,
+            sym_carriers,
+            per_symbol_pilots,
+            data_carrier_map,
+        });
+
         Some((header, payload_symbols, noise_variances))
+    }
+
+    /// Turbo re-estimation entry point (Task 5): re-fit the delay-domain
+    /// channel model for the most recently `demodulate_frame`d payload, folding
+    /// in `soft_symbols`/`weights` as extra "virtual pilot" observations at
+    /// data-carrier positions, and re-equalize.
+    ///
+    /// `soft_symbols`/`weights` must be in the same frame order as the
+    /// `payload_symbols`/`noise_variances` `demodulate_frame` returned (one
+    /// entry per data carrier, across the whole frame) — `weights[i] =
+    /// |soft_symbols[i]|²`, `0.0` (or any value `<= 1e-6`) meaning "skip this
+    /// carrier's virtual pilot entirely" (an unreliable posterior, per the
+    /// task brief's "0 = skip"). Shorter than the full frame's data-carrier
+    /// count is fine (e.g. only the LDPC codeword's worth of carriers has a
+    /// posterior LLR) — carriers beyond `soft_symbols.len()` just get no
+    /// virtual-pilot augmentation for that re-fit window.
+    ///
+    /// For each payload OFDM symbol, pools real pilots over the same
+    /// `±EST_WINDOW`-symbol window `demodulate_header_llrs`'s non-Kalman
+    /// fallback uses, adds any in-window virtual-pilot observations
+    /// (`H_est = y/x̄`, weight `|x̄|²`), re-fits via
+    /// [`Self::estimate_and_equalize`], and re-extracts data/noise exactly as
+    /// `demodulate_frame`'s payload pass does. Returns `(vec![], vec![])` if no
+    /// frame has been demodulated yet (or the workspace was somehow empty).
+    ///
+    /// See [`LastFrameWorkspace`]'s doc for why this reuses
+    /// `DelayDomainEstimator` (via `estimate_and_equalize`) rather than the
+    /// live per-frame `KalmanLagSmoother`.
+    pub fn reequalize_with_virtual_pilots(
+        &self,
+        soft_symbols: &[Complex32],
+        weights: &[f32],
+    ) -> (Vec<Complex32>, Vec<f32>) {
+        let workspace = self.last_frame_workspace.borrow();
+        let Some(ws) = workspace.as_ref() else {
+            return (Vec::new(), Vec::new());
+        };
+
+        const EST_WINDOW: usize = 2;
+        let n = ws.sym_carriers.len();
+        let mut out_symbols = Vec::new();
+        let mut out_noise = Vec::new();
+
+        for i in 0..n {
+            let lo = i.saturating_sub(EST_WINDOW);
+            let hi = (i + EST_WINDOW + 1).min(n);
+            let mut pooled = pool_pilots(&ws.per_symbol_pilots[lo..hi]);
+
+            for (flat_idx, &(sym_pos, carrier_idx)) in ws.data_carrier_map.iter().enumerate() {
+                if sym_pos < lo || sym_pos >= hi {
+                    continue;
+                }
+                let Some(&w) = weights.get(flat_idx) else {
+                    continue;
+                };
+                if w <= 1e-6 {
+                    continue;
+                }
+                let Some(&xbar) = soft_symbols.get(flat_idx) else {
+                    continue;
+                };
+                let xbar_pow = xbar.norm_sqr();
+                if xbar_pow <= 1e-6 {
+                    continue;
+                }
+                let y = ws.sym_carriers[sym_pos].1[carrier_idx];
+                // H_est = y / x̄ = y * conj(x̄) / |x̄|^2 -- same "received value at a
+                // known-transmitted-symbol position is a channel estimate" logic
+                // real pilots use (see `extract_pilot_info`'s doc), generalized from
+                // the known pilot value 1.0 to the posterior soft estimate x̄.
+                let h_est = y * xbar.conj() * (1.0 / xbar_pow);
+                pooled.push((carrier_idx, h_est, w));
+            }
+
+            let (_, carriers) = &ws.sym_carriers[i];
+            let (equalized, noise_full) =
+                self.estimate_and_equalize(carriers, &pooled, ws.order, ws.coarse_delay);
+            let global_sym = ws.sym_carriers[i].0;
+            let data = self.pilots.extract_data(&equalized, global_sym);
+            let data_indices = self.pilots.data_indices(global_sym);
+            let carrier_noise: Vec<f32> = data_indices
+                .iter()
+                .map(|&idx| noise_full.get(idx).copied().unwrap_or(1e6))
+                .collect();
+            out_symbols.extend_from_slice(&data);
+            out_noise.extend_from_slice(&carrier_noise);
+        }
+
+        (out_symbols, out_noise)
     }
 
     /// Extract pilot (index, received-value) pairs from demodulated carriers for a
@@ -1255,6 +1422,77 @@ mod tests {
              expected a small residual rate, not {:.1}%",
             rx_symbols.len(),
             rate * 100.0,
+            rate * 100.0
+        );
+    }
+
+    #[test]
+    fn reequalize_with_virtual_pilots_is_empty_before_any_demodulate_frame_call() {
+        let modem = CoppaModem::new(CoppaProfile::hf_standard(), 1);
+        let (symbols, noise) = modem.reequalize_with_virtual_pilots(&[], &[]);
+        assert!(symbols.is_empty());
+        assert!(noise.is_empty());
+    }
+
+    /// Task 5's `reequalize_with_virtual_pilots`: feeding the (normally unknown)
+    /// TRUE transmitted symbols back in as perfect "virtual pilots" (weight 1.0
+    /// each, i.e. maximally confident) should re-equalize at least as accurately
+    /// as the first pass, since every data carrier now effectively has a known
+    /// pilot value augmenting the real pilots' pooled fit. This doesn't exercise
+    /// the turbo *use case* (soft, imperfect posterior symbols) but does verify
+    /// the plumbing end-to-end: workspace retention, the virtual-pilot
+    /// `H_est = y/x̄` augmentation, and re-fit/re-equalize all produce a
+    /// same-length, coherent result on a real (if clean) frame.
+    #[test]
+    fn reequalize_with_virtual_pilots_recovers_symbols_given_perfect_pilots() {
+        let profile = CoppaProfile::hf_standard();
+        let modem = CoppaModem::new(profile, 1);
+        let header = CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: 22,
+        };
+        let n_symbols = 3000;
+        let symbols: Vec<Complex32> = (0..n_symbols)
+            .map(|i| {
+                if i % 3 == 0 {
+                    Complex32::new(-1.0, 0.0)
+                } else {
+                    Complex32::new(1.0, 0.0)
+                }
+            })
+            .collect();
+        let samples = modem.modulate_mapped(&header, &symbols, 6.0);
+        let (_, rx_symbols, _noise) = modem
+            .demodulate_frame(&samples)
+            .expect("demodulation should succeed");
+
+        // Perfect virtual pilots: the exact TX symbols (truncated/padded to
+        // rx_symbols' length, matching frame order).
+        let n = rx_symbols.len();
+        let mut perfect: Vec<Complex32> = symbols.iter().take(n).copied().collect();
+        perfect.resize(n, Complex32::new(1.0, 0.0));
+        let weights: Vec<f32> = perfect.iter().map(|s| s.norm_sqr()).collect();
+
+        let (re_symbols, re_noise) = modem.reequalize_with_virtual_pilots(&perfect, &weights);
+        assert_eq!(re_symbols.len(), n);
+        assert_eq!(re_noise.len(), n);
+
+        let mismatches = re_symbols
+            .iter()
+            .zip(perfect.iter())
+            .filter(|(&rx, &tx)| (if rx.re >= 0.0 { 1.0 } else { -1.0 }) != tx.re)
+            .count();
+        let rate = mismatches as f32 / n as f32;
+        assert!(
+            rate <= 0.05,
+            "{mismatches} of {n} symbols ({:.1}%) failed to round-trip with perfect virtual \
+             pilots -- expected at least as good as the plain first pass",
             rate * 100.0
         );
     }
