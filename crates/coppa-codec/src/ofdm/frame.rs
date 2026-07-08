@@ -229,7 +229,15 @@ pub struct CoppaHeader {
     pub frame_type: CoppaFrameType,
     /// Bandwidth class (4 bits).
     pub bandwidth: u8,
-    /// FEC scheme identifier (4 bits).
+    /// FEC scheme identifier (4 bits). As of Phase 3 Task 3 (IR-HARQ), the
+    /// low 2 bits (`fec_type & 0x03`) carry the frame's redundancy version
+    /// (RV, 0-3) for incremental-redundancy HARQ combining -- see
+    /// `coppa_protocol::modem::transceiver`'s `RV_MASK` and
+    /// `coppa_protocol::arq::rv_for_attempt`. The high 2 bits are reserved/
+    /// unused (always `0` today), available for a future FEC-scheme selector
+    /// without another wire-format break. A fresh (non-retransmitted) frame
+    /// always has `fec_type = 0` (RV0), matching the pre-Task-3 wire format
+    /// exactly.
     pub fec_type: u8,
     /// Speed/MCS level (4 bits).
     pub speed_level: u8,
