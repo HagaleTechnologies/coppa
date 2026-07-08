@@ -1996,4 +1996,41 @@ mod tests {
             );
         }
     }
+
+    /// Task 3 failing-test scenario (c), part 3: `harq_evict` (decision 3's
+    /// "cumulative-ACK advance" trigger -- a higher layer telling the
+    /// transceiver a seq is fully delivered and will never be retransmitted
+    /// again) actually removes that seq's buffer, and only that seq's.
+    #[test]
+    fn harq_buffer_evicted_on_cumulative_ack_advance() {
+        let payload = vec![0x55u8; 20];
+        let (tx, mother, k_used, payload_bits) = harq_test_fixture(&payload);
+        // Deliberately weak (non-converging) LLRs so the buffer is retained
+        // (not auto-evicted by a CRC pass) -- isolates the explicit
+        // `harq_evict` call from the CRC-pass eviction path tested above.
+        let weak_llrs = erased_coded_llrs(&mother, k_used, 0, 0.9, 8.0, 0xFACE);
+
+        let _ = tx.harq_combine_and_decode(10, 0, k_used, payload_bits, &weak_llrs);
+        let _ = tx.harq_combine_and_decode(11, 0, k_used, payload_bits, &weak_llrs);
+        assert!(
+            tx.harq_rx.borrow().contains(10) && tx.harq_rx.borrow().contains(11),
+            "both seqs should have live buffers before eviction"
+        );
+
+        tx.harq_evict(10);
+
+        assert!(
+            !tx.harq_rx.borrow().contains(10),
+            "harq_evict must remove the evicted seq's buffer"
+        );
+        assert!(
+            tx.harq_rx.borrow().contains(11),
+            "harq_evict must not disturb a different seq's buffer"
+        );
+
+        // A no-op on a seq with no buffer (already evicted, or never seen).
+        tx.harq_evict(10);
+        tx.harq_evict(99);
+        assert!(!tx.harq_rx.borrow().contains(10));
+    }
 }
