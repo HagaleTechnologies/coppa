@@ -129,13 +129,14 @@ jobs:
 
   wiki-lint:
     name: Wiki lint
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Clone sunto
-        run: git clone https://github.com/HagaleTechnologies/sunto.git /tmp/sunto
       - name: Lint wiki
-        run: python3 /tmp/sunto/bin/wiki-lint wiki/
+        uses: HagaleTechnologies/sunto@v1
+        with:
+          path: wiki/
 
   # Summary gate for branch protection. bench-fuzz and platform are excluded:
   # bench-fuzz is compile-only (slow, no test signal) and platform is a matrix
