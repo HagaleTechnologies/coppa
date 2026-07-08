@@ -93,7 +93,9 @@ fn run(level: u8, kind: &Chan, snr_db: f32, trials: u32) -> Counts {
         let seed = 0x1000_0000u64 + t as u64;
         let mut rng = StdRng::seed_from_u64(seed);
         let payload: Vec<u8> = (0..pb).map(|_| rng.random::<u8>()).collect();
-        let clean = tx.transmit(&make_header(level, pb as u16), &payload);
+        let clean = tx
+            .transmit(&make_header(level, pb as u16), &payload)
+            .expect("payload within this level's capacity");
         let rx = apply(kind, &clean, snr_db, seed);
         match tx.receive(&rx) {
             Ok((_h, p)) => {

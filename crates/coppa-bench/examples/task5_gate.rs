@@ -85,7 +85,9 @@ fn run_trial(
 ) -> (TrialOutcome, usize, bool) {
     let mut rng = StdRng::seed_from_u64(seed);
     let payload: Vec<u8> = (0..payload_bytes).map(|_| rng.random::<u8>()).collect();
-    let clean = tx.transmit(header, &payload);
+    let clean = tx
+        .transmit(header, &payload)
+        .expect("payload within this level's capacity");
     let frame_samples = clean.len();
     let sr = SAMPLE_RATE as f32;
 
@@ -191,7 +193,9 @@ fn turbo_overhead_us_per_frame(level: u8, snr_db: f32, trials: usize) -> (f64, f
         let seed = 0x7075_11FEu64.wrapping_add(trial as u64);
         let mut rng = StdRng::seed_from_u64(seed);
         let payload: Vec<u8> = (0..payload_bytes).map(|_| rng.random::<u8>()).collect();
-        let clean = tx_on.transmit(&header, &payload);
+        let clean = tx_on
+            .transmit(&header, &payload)
+            .expect("payload within this level's capacity");
         let p_clean = coppa_channel::mean_power(&clean);
         let noise_seed = seed ^ 0x5555_5555_5555_5555;
         let faded = coppa_channel::watterson::watterson_preset(

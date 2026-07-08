@@ -99,7 +99,9 @@ fn main() {
             payload_len: 60,
         };
         let payload = vec![0xA5u8; 60];
-        let frame = tx.transmit(&header, &payload);
+        let frame = tx
+            .transmit(&header, &payload)
+            .expect("payload within this level's capacity");
 
         let symbol_len = profile.fft_size + profile.cp_samples;
         let mut one_shot = vec![0.0f32; 4 * symbol_len];

@@ -81,7 +81,9 @@ fn run_cell(
         let payload: Vec<u8> = (0..pfb)
             .map(|i| (seed.wrapping_add(i as u64).wrapping_mul(2654435761) >> 24) as u8)
             .collect();
-        let sig = tx.transmit(&truth, &payload);
+        let sig = tx
+            .transmit(&truth, &payload)
+            .expect("payload within this level's capacity");
         let faded = apply_channel(&sig, ch, snr, seed);
 
         let ok =

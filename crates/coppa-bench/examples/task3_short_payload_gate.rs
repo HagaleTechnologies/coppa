@@ -58,7 +58,9 @@ fn run_trial(
     let payload: Vec<u8> = (0..payload_bytes).map(|_| rng.random::<u8>()).collect();
 
     let header = make_header(level, payload_bytes as u16);
-    let clean = tx.transmit(&header, &payload);
+    let clean = tx
+        .transmit(&header, &payload)
+        .expect("payload within this level's capacity");
     let frame_samples = clean.len();
     let sr = SAMPLE_RATE as f32;
 

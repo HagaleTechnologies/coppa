@@ -70,7 +70,9 @@ fn main() {
                 .wrapping_add(trial as u64);
             let mut rng = StdRng::seed_from_u64(seed);
             let payload: Vec<u8> = (0..payload_bytes).map(|_| rng.random::<u8>()).collect();
-            let clean = tx.transmit(&header, &payload);
+            let clean = tx
+                .transmit(&header, &payload)
+                .expect("payload within this level's capacity");
             let p_clean = coppa_channel::mean_power(&clean);
             let noise_seed = seed ^ 0x5555_5555_5555_5555;
             let preset = match channel {

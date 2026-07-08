@@ -3,19 +3,20 @@
 use coppa_codec::ofdm::coppa_modem::SPEED_LEVELS;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_codec::ofdm::CoppaProfile;
-use coppa_protocol::modem::speed_levels::k_used_for_level;
+use coppa_protocol::modem::speed_levels::max_payload_for_level;
 use coppa_protocol::modem::CoppaTransceiver;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-/// Max payload capacity for a speed level: the NR BG2 mother code's
-/// shortened `k_used` info width for that level (Task 4), in bytes. Was
-/// `code_rate.info_bits()/8` pre-Task-4 (the old per-rate 802.11 QC-LDPC
-/// codec's info width, which for level 10 was 1701 bits/7/8 rate; the new
-/// mother code's level 10 is 1620 bits/5/6 rate -- a wire-format break, see
-/// `CLAUDE.md`'s Known Limitations and this task's ADR).
+/// Max application-payload capacity for a speed level: the NR BG2 mother code's
+/// shortened `k_used` info width for that level (Task 4), in bytes, minus the
+/// 4-byte CRC-32 trailer `CoppaTransceiver::transmit` appends (Phase 3 Task 1) --
+/// see `max_payload_for_level`'s doc. Was `code_rate.info_bits()/8` pre-Task-4
+/// (the old per-rate 802.11 QC-LDPC codec's info width, which for level 10 was
+/// 1701 bits/7/8 rate; the new mother code's level 10 is 1620 bits/5/6 rate -- a
+/// wire-format break, see `CLAUDE.md`'s Known Limitations and this task's ADR).
 fn max_payload_bytes(wire_level: u8) -> usize {
-    k_used_for_level(wire_level).unwrap() / 8
+    max_payload_for_level(wire_level).unwrap()
 }
 
 fn make_header(speed_level: u8, payload_len: u16) -> CoppaHeader {
@@ -35,7 +36,9 @@ fn loopback_test(wire_level: u8, payload: &[u8]) {
     let transceiver = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
     let header = make_header(wire_level, payload.len() as u16);
 
-    let samples = transceiver.transmit(&header, payload);
+    let samples = transceiver
+        .transmit(&header, payload)
+        .expect("payload within this level's capacity");
     assert!(
         !samples.is_empty(),
         "Level {}: transmit produced no samples",
@@ -168,7 +171,9 @@ fn test_header_fields_roundtrip() {
     };
     let payload = vec![0xFF; 10];
 
-    let samples = transceiver.transmit(&header, &payload);
+    let samples = transceiver
+        .transmit(&header, &payload)
+        .expect("payload within this level's capacity");
     let (rx_header, _) = transceiver.receive(&samples).expect("should decode");
 
     assert_eq!(rx_header.version, 1);
@@ -228,7 +233,9 @@ fn awgn_above_threshold(wire_level: u8) {
     let mut failures = 0;
 
     for seed in 0..num_frames {
-        let samples = transceiver.transmit(&header, &payload);
+        let samples = transceiver
+            .transmit(&header, &payload)
+            .expect("payload within this level's capacity");
         let noisy = add_awgn(&samples, snr, seed);
         match transceiver.receive(&noisy) {
             Ok((_, rx_payload)) => {
@@ -254,7 +261,9 @@ fn awgn_below_threshold(wire_level: u8) {
     let header = make_header(wire_level, payload.len() as u16);
 
     let snr = required_snr(wire_level) - 6.0;
-    let samples = transceiver.transmit(&header, &payload);
+    let samples = transceiver
+        .transmit(&header, &payload)
+        .expect("payload within this level's capacity");
     let noisy = add_awgn(&samples, snr, 999);
 
     // Should either fail to decode or produce wrong payload — both acceptable.
@@ -352,7 +361,9 @@ fn test_snr_fer_monte_carlo() {
         while snr <= snr_end + 0.01 {
             let mut errors = 0u64;
             for seed in 0..num_frames {
-                let samples = transceiver.transmit(&header, &payload);
+                let samples = transceiver
+                    .transmit(&header, &payload)
+                    .expect("payload within this level's capacity");
                 let noisy = add_awgn(&samples, snr, seed);
                 match transceiver.receive(&noisy) {
                     Ok((_, rx_payload)) => {

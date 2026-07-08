@@ -315,7 +315,9 @@ fn new_ofdm_trial(
     seed: u64,
 ) -> bool {
     let header = make_header(level, payload.len() as u16);
-    let clean = tx.transmit(&header, payload);
+    let clean = tx
+        .transmit(&header, payload)
+        .expect("payload within this level's capacity");
     let faded = watterson(&clean, 48_000.0, &WattersonPreset::Poor.config(), seed);
     let noisy = coppa_channel::awgn_seeded(&faded, snr_db, seed ^ 0x5A5A);
     match tx.receive(&noisy) {

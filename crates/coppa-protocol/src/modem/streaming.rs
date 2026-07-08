@@ -444,6 +444,7 @@ mod tests {
     fn make_frame(tx: &CoppaTransceiver, speed_level: u8, payload: &[u8]) -> Vec<f32> {
         let h = header(speed_level, payload.len() as u16);
         tx.transmit(&h, payload)
+            .expect("payload within this test's speed level capacity")
     }
 
     /// Feed chunk sizes cycling through this list, regardless of how evenly they
