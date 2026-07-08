@@ -37,7 +37,9 @@ use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::fec::ldpc::rate_match::{rate_dematch, rate_match};
 use coppa_protocol::fec::ldpc::{pin_known_pad, CodeRate, LdpcCodec, NrLdpc};
 use coppa_protocol::fec::scrambler::scramble;
-use coppa_protocol::modem::speed_levels::{k_used_for_level, speed_level_components};
+use coppa_protocol::modem::speed_levels::{
+    k_used_for_level, max_payload_for_level, speed_level_components,
+};
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -475,10 +477,16 @@ fn main() {
     println!("| level | SNR (dB) | old FER | new FER |");
     println!("|---|---|---|---|");
     for &level in &LEVELS {
-        let k_used = k_used_for_level(level).unwrap();
         let old_info_bits = LdpcCodec::new(old_code_rate(level)).code().info_bits();
-        let payload_bits = k_used.min(old_info_bits) - 8;
-        let payload_bytes = payload_bits / 8;
+        // Old codec's own historic 1-byte margin below its raw info-bit capacity.
+        let old_payload_bytes = (old_info_bits - 8) / 8;
+        // New codec's real capacity via `CoppaTransceiver::transmit`'s actual
+        // accessor (Phase 3 Task 1: reserves 4 bytes for the CRC-32 trailer
+        // `transmit` appends -- the old `k_used/8 - 8bits` margin here predates
+        // that and isn't wide enough, which made `new_ofdm_trial`'s `transmit`
+        // call panic with `PayloadTooLarge`).
+        let new_payload_bytes = max_payload_for_level(level).unwrap();
+        let payload_bytes = old_payload_bytes.min(new_payload_bytes);
         let payload: Vec<u8> = (0..payload_bytes).map(|i| (i * 37 + 5) as u8).collect();
 
         // Informed base SNR per level (coarse, from the existing
