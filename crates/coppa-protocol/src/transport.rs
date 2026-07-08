@@ -1,11 +1,18 @@
 //! Transport layer Protocol Data Unit for Coppa.
 //!
 //! ```text
-//! Transport PDU → [SessionID 4b][Type 4b][SeqNum 1B][AckNum 1B][AckBitmap 1B][App PDU]
+//! Transport PDU → [SessionID 4b][Type 4b][SeqNum 1B][AckNum 1B][AckBitmap 4B][App PDU]
 //! ```
 //!
 //! The transport layer provides reliable, ordered delivery over the MAC layer
 //! using sequence numbers and selective acknowledgment bitmaps.
+//!
+//! The SACK bitmap is 32 bits wide (Phase 3 Task 2, decision 4: "SACK bitmap
+//! widened to cover the full window") so it can express selective-ACK status for
+//! every segment in an ARQ window up to `coppa_protocol::arq::MAX_WINDOW_SIZE`
+//! (32) beyond the cumulative ACK, not just a fixed 8 — see
+//! `coppa_protocol::arq::SACK_RANGE`'s doc for why 31 of these 32 bits are used
+//! and how that interacts with the ARQ ring buffer size.
 
 use anyhow::{anyhow, Result};
 
@@ -53,14 +60,15 @@ pub struct TransportPdu {
     /// this number have been received.
     pub ack_num: u8,
     /// Selective ACK bitmap: bit N set means segment (ack_num + N + 1) received.
-    /// Covers 8 segments beyond the cumulative ACK.
-    pub ack_bitmap: u8,
+    /// 32 bits wide; see `coppa_protocol::arq::SACK_RANGE` for how many of those
+    /// bits are actually meaningful for a given window size.
+    pub ack_bitmap: u32,
     /// Application PDU payload.
     pub payload: Vec<u8>,
 }
 
-/// Transport PDU header size: 1 (session_id+type) + 1 (seq) + 1 (ack) + 1 (bitmap) = 4 bytes.
-pub const TRANSPORT_HEADER_SIZE: usize = 4;
+/// Transport PDU header size: 1 (session_id+type) + 1 (seq) + 1 (ack) + 4 (bitmap) = 7 bytes.
+pub const TRANSPORT_HEADER_SIZE: usize = 7;
 
 impl TransportPdu {
     /// Create a new reliable data segment.
@@ -88,7 +96,7 @@ impl TransportPdu {
     }
 
     /// Create a standalone ACK.
-    pub fn new_ack(session_id: u8, ack_num: u8, ack_bitmap: u8) -> Self {
+    pub fn new_ack(session_id: u8, ack_num: u8, ack_bitmap: u32) -> Self {
         Self {
             session_id: session_id & 0x0F,
             transport_type: TransportType::Ack,
@@ -100,7 +108,7 @@ impl TransportPdu {
     }
 
     /// Create a NAK (negative acknowledgment / retransmit request).
-    pub fn new_nak(session_id: u8, ack_num: u8, ack_bitmap: u8) -> Self {
+    pub fn new_nak(session_id: u8, ack_num: u8, ack_bitmap: u32) -> Self {
         Self {
             session_id: session_id & 0x0F,
             transport_type: TransportType::Nak,
@@ -138,9 +146,11 @@ impl TransportPdu {
             // seq < ack_num (considering wrapping)
             return true;
         }
-        // Selective ACK bitmap: bit 0 = ack_num+1, bit 1 = ack_num+2, etc.
-        if diff <= 8 {
-            let bit_index = diff - 1;
+        // Selective ACK bitmap: bit 0 = ack_num+1, bit 1 = ack_num+2, etc., covering
+        // `crate::arq::SACK_RANGE` segments beyond the cumulative ACK (widened to
+        // cover a full ARQ window -- see that constant's doc).
+        if diff <= crate::arq::SACK_RANGE {
+            let bit_index = (diff - 1) as u32;
             return (self.ack_bitmap >> bit_index) & 1 == 1;
         }
         false
@@ -159,8 +169,9 @@ impl TransportPdu {
         // Byte 2: acknowledgment number
         out.push(self.ack_num);
 
-        // Byte 3: selective ACK bitmap
-        out.push(self.ack_bitmap);
+        // Bytes 3-6: selective ACK bitmap (big-endian, matching this crate's other
+        // multi-byte wire fields -- see e.g. the payload CRC-32 in `modem::transceiver`).
+        out.extend_from_slice(&self.ack_bitmap.to_be_bytes());
 
         // Application payload
         out.extend_from_slice(&self.payload);
@@ -182,7 +193,7 @@ impl TransportPdu {
         let transport_type = TransportType::from_u8(bytes[0] & 0x0F)?;
         let seq_num = bytes[1];
         let ack_num = bytes[2];
-        let ack_bitmap = bytes[3];
+        let ack_bitmap = u32::from_be_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]);
         let payload = bytes[TRANSPORT_HEADER_SIZE..].to_vec();
 
         Ok(Self {
@@ -337,6 +348,28 @@ mod tests {
         assert!(pdu.is_acked(14)); // ack_num+4, bit 3 = 1
         assert!(!pdu.is_acked(15)); // ack_num+5, bit 4 = 0
         assert!(!pdu.is_acked(19)); // beyond bitmap range
+    }
+
+    #[test]
+    fn test_sack_bitmap_round_trips_24_bits() {
+        // Decision 4: SACK bitmap widened to a full 32-bit field so it can cover
+        // an entire ARQ window (up to MAX_WINDOW_SIZE=32 in coppa-protocol::arq).
+        // Exercise a 24-bit-wide pattern (window sizes up to 24 are the plan's
+        // assumed common case) to confirm no truncation to the old 8-bit width.
+        let bitmap: u32 = 0x00FF_FF0F; // 24 significant bits, scattered pattern
+        let pdu = TransportPdu::new_ack(1, 100, bitmap);
+        let bytes = pdu.to_bytes();
+        let decoded = TransportPdu::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.ack_bitmap, bitmap);
+    }
+
+    #[test]
+    fn test_sack_bitmap_round_trips_full_32_bits() {
+        let bitmap: u32 = 0xFFFF_FFFF;
+        let pdu = TransportPdu::new_ack(1, 100, bitmap);
+        let bytes = pdu.to_bytes();
+        let decoded = TransportPdu::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.ack_bitmap, bitmap);
     }
 
     #[test]
