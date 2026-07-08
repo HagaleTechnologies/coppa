@@ -74,6 +74,21 @@ pub fn k_used_for_level(wire_level: u8) -> Option<usize> {
     }
 }
 
+/// Maximum application-payload size (bytes) `CoppaTransceiver::transmit` will accept
+/// for a given wire-encoded speed level (Phase 3 Task 1: payload CRC-32 + hard
+/// oversize rejection).
+///
+/// `CoppaTransceiver::transmit` appends a CRC-32 (4 bytes) to the payload before
+/// scrambling/padding into this level's shortened `k_used`-bit NR BG2 info block
+/// (see `k_used_for_level`'s doc), so the real per-level payload budget is
+/// `PAYLOAD_CRC_LEN` (4) bytes less than the raw `k_used/8` byte capacity:
+/// `max_payload = k_used/8 - PAYLOAD_CRC_LEN` (integer division). Returns `None`
+/// for reserved/invalid levels, mirroring `k_used_for_level`.
+pub fn max_payload_for_level(wire_level: u8) -> Option<usize> {
+    use crate::modem::transceiver::PAYLOAD_CRC_LEN;
+    k_used_for_level(wire_level).map(|k_used| k_used / 8 - PAYLOAD_CRC_LEN)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +111,40 @@ mod tests {
                 k_used_for_level(level),
                 Some(expected),
                 "level {level}: k_used mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn max_payload_matches_k_used_minus_crc_trailer() {
+        // max_payload = k_used/8 - 4 (integer division), per this level's k_used.
+        let cases = [
+            (1, 56),   // 486/8=60 (floor) - 4
+            (2, 117),  // 972/8=121 - 4
+            (3, 117),  // 972/8=121 - 4
+            (4, 178),  // 1458/8=182 - 4
+            (5, 158),  // 1296/8=162 - 4
+            (6, 117),  // 972/8=121 - 4
+            (7, 178),  // 1458/8=182 - 4
+            (9, 158),  // 1296/8=162 - 4
+            (10, 198), // 1620/8=202 - 4
+        ];
+        for (level, expected) in cases {
+            assert_eq!(
+                max_payload_for_level(level),
+                Some(expected),
+                "level {level}: max_payload mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn max_payload_reserved_and_invalid_levels_are_none() {
+        for level in [0, 8, 11, 255] {
+            assert_eq!(
+                max_payload_for_level(level),
+                None,
+                "level {level} should be None"
             );
         }
     }

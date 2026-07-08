@@ -83,7 +83,9 @@ impl TransferPhy for V1Phy {
         (0..self.frames)
             .map(|k| {
                 let chunk = &payload[k * pfb..(k + 1) * pfb];
-                self.tx.transmit(&self.make_header(pfb as u16), chunk)
+                self.tx
+                    .transmit(&self.make_header(pfb as u16), chunk)
+                    .expect("payload within this level's capacity")
             })
             .collect()
     }

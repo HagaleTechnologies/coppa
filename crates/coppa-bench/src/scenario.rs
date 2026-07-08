@@ -15,9 +15,16 @@ pub struct ModeInfo {
 }
 
 impl ModeInfo {
-    /// Maximum payload bytes that fit in one frame.
+    /// Maximum application-payload bytes that fit in one frame, i.e.
+    /// `CoppaTransceiver::transmit`'s actual per-level capacity
+    /// (`coppa_protocol::modem::speed_levels::max_payload_for_level`): this
+    /// level's raw `info_bits/8` byte capacity minus the 4-byte CRC-32 trailer
+    /// `transmit` appends (Phase 3 Task 1). Was `info_bits/8` pre-Task-1, back
+    /// when a full-capacity payload had no trailer competing for the same
+    /// bits.
     pub fn payload_bytes(&self) -> usize {
-        self.info_bits / 8
+        coppa_protocol::modem::speed_levels::max_payload_for_level(self.level)
+            .unwrap_or_else(|| panic!("unknown speed level {}", self.level))
     }
 }
 
@@ -143,9 +150,10 @@ mod tests {
     }
 
     #[test]
-    fn payload_bytes_match_info_bits() {
-        assert_eq!(mode_for_level(2).unwrap().payload_bytes(), 121);
-        assert_eq!(mode_for_level(10).unwrap().payload_bytes(), 202);
+    fn payload_bytes_match_info_bits_minus_crc_trailer() {
+        // info_bits/8 - 4 (CRC-32 trailer, Phase 3 Task 1): 972/8=121-4=117; 1620/8=202-4=198.
+        assert_eq!(mode_for_level(2).unwrap().payload_bytes(), 117);
+        assert_eq!(mode_for_level(10).unwrap().payload_bytes(), 198);
     }
 
     #[test]

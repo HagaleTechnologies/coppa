@@ -1,12 +1,13 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 
+use crc::{Crc, CRC_32_ISO_HDLC};
 use num_complex::Complex32;
 
 use crate::fec::ldpc::nr_bg2;
 use crate::fec::ldpc::{pin_known_pad, rate_match, NrLdpc};
 use crate::fec::scrambler::scramble;
-use crate::modem::speed_levels::{k_used_for_level, speed_level_components};
+use crate::modem::speed_levels::{k_used_for_level, max_payload_for_level, speed_level_components};
 use coppa_codec::ofdm::coppa_modem::{CoppaModem, SPEED_LEVELS};
 use coppa_codec::ofdm::frame::CoppaHeader;
 use coppa_codec::ofdm::interleaver::BlockInterleaver;
@@ -160,6 +161,25 @@ fn soft_symbol(mapper: &dyn ConstellationMapper, llrs: &[f32]) -> Complex32 {
 /// property.
 const CODED_BLOCK_LEN: usize = 1944;
 
+/// Payload integrity check (Phase 3 Task 1): a CRC-32 (CRC-32/ISO-HDLC, the
+/// familiar "zip/gzip/ethernet" polynomial) appended to the application payload
+/// on TX (before scrambling/padding into the LDPC info block) and verified on RX
+/// (after descrambling/LDPC decode). This closes a real gap the LDPC layer alone
+/// doesn't cover: LDPC convergence only means the decoder found *a* valid
+/// codeword, not that it's the *right* one -- rare but possible at low SNR (a
+/// wrong-codeword convergence looks identical to a correct one from the decoder's
+/// point of view). See `CoppaTransceiver::transmit`/`receive_with_metrics` for
+/// the two call sites, and `ReceiveError::CrcMismatch` for the RX-side failure
+/// this guards.
+const PAYLOAD_CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+
+/// Number of CRC-32 trailer bytes appended to every payload by `transmit` (see
+/// `PAYLOAD_CRC32`'s doc). Also the fixed overhead subtracted in
+/// `crate::modem::speed_levels::max_payload_for_level`'s `k_used/8 - 4` formula --
+/// `pub(crate)` and referenced from there directly so the two call sites can't
+/// silently drift apart.
+pub(crate) const PAYLOAD_CRC_LEN: usize = 4;
+
 /// Cached per-speed-level components: building the interleaver and
 /// constellation mapper is ~0.105 ms and ~4801 allocs (~525 KB) per call — expensive
 /// enough that doing it on every single `transmit`/`receive` (as the pre-Task-7 code
@@ -258,6 +278,31 @@ impl std::fmt::Display for ReceiveError {
 }
 
 impl std::error::Error for ReceiveError {}
+
+/// TX-side errors from [`CoppaTransceiver::transmit`] (Phase 3 Task 1).
+#[derive(Debug, PartialEq, Eq)]
+pub enum TransmitError {
+    /// `payload.len()` exceeded this speed level's capacity
+    /// (`crate::modem::speed_levels::max_payload_for_level`). Oversized payloads
+    /// are a hard error now -- the pre-Task-1 codec silently truncated them
+    /// instead, which is a data-loss footgun a caller can't detect.
+    PayloadTooLarge { max: usize },
+}
+
+impl std::fmt::Display for TransmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PayloadTooLarge { max } => {
+                write!(
+                    f,
+                    "payload too large for this speed level (max {max} bytes)"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for TransmitError {}
 
 /// Median of the per-carrier noise-variance estimates, used as the fallback
 /// noise variance for carriers with a missing or degenerate (near-zero)
@@ -374,24 +419,45 @@ impl CoppaTransceiver {
         self.modem.data_carriers_per_symbol()
     }
 
-    pub fn transmit(&self, header: &CoppaHeader, payload: &[u8]) -> Vec<f32> {
+    pub fn transmit(
+        &self,
+        header: &CoppaHeader,
+        payload: &[u8],
+    ) -> Result<Vec<f32>, TransmitError> {
         let comp = self
             .codecs
             .get(&header.speed_level)
             .expect("invalid speed level in header");
         let k_used = comp.k_used;
 
-        // 1. Build the fixed-width (1760-bit) NR BG2 mother-code info block:
-        //    payload bits, truncated to this level's k_used capacity (matches
-        //    the pre-Task-4 per-rate codec's silent-truncation behavior for an
-        //    oversized payload), zero-padded out to k_used, then zero-padded
-        //    further out to the mother code's full fixed info width (the
-        //    shortened tail beyond k_used, never transmitted -- see
+        // 0. Hard-reject oversized payloads (Phase 3 Task 1): the pre-Task-1 codec
+        //    silently truncated a payload beyond this level's capacity instead --
+        //    a data-loss footgun a caller couldn't detect. `max_payload_for_level`
+        //    already reserves room for the CRC-32 trailer step 1 appends below.
+        let max = max_payload_for_level(header.speed_level).expect("invalid speed level in header");
+        if payload.len() > max {
+            return Err(TransmitError::PayloadTooLarge { max });
+        }
+
+        // 1. Append a CRC-32 trailer over the payload (Phase 3 Task 1): LDPC
+        //    convergence alone only means the decoder found *a* valid codeword,
+        //    not that it's the *right* one -- this closes that gap. See
+        //    `PAYLOAD_CRC32`'s doc.
+        let checksum = PAYLOAD_CRC32.checksum(payload);
+        let mut payload_with_crc = Vec::with_capacity(payload.len() + PAYLOAD_CRC_LEN);
+        payload_with_crc.extend_from_slice(payload);
+        payload_with_crc.extend_from_slice(&checksum.to_be_bytes());
+
+        // 2. Build the fixed-width (1760-bit) NR BG2 mother-code info block:
+        //    payload+CRC bits (guaranteed to fit within k_used by the oversize
+        //    check above -- never truncated), zero-padded out to k_used, then
+        //    zero-padded further out to the mother code's full fixed info width
+        //    (the shortened tail beyond k_used, never transmitted -- see
         //    `crate::fec::ldpc::rate_match`). The whole 1760-bit block is
         //    scrambled to randomize zero-padding (prevents degenerate LDPC
         //    codewords).
         let mut info_bits = Vec::with_capacity(NrLdpc::INFO_LEN);
-        for &byte in payload {
+        for &byte in &payload_with_crc {
             for shift in (0..8).rev() {
                 info_bits.push((byte >> shift) & 1);
             }
@@ -400,27 +466,28 @@ impl CoppaTransceiver {
         info_bits.resize(NrLdpc::INFO_LEN, 0u8);
         scramble(&mut info_bits);
 
-        // 2. NR BG2 encode: fixed 1760-bit info -> 8800-bit mother codeword.
+        // 3. NR BG2 encode: fixed 1760-bit info -> 8800-bit mother codeword.
         let mother = self.ldpc.encode(&info_bits);
 
-        // 3. Rate match: mother codeword -> CODED_BLOCK_LEN=1944 coded bits
+        // 4. Rate match: mother codeword -> CODED_BLOCK_LEN=1944 coded bits
         //    for this level's k_used (RV0 -- Phase 2 doesn't use HARQ-IR).
         let coded_bits = rate_match::rate_match(&mother, k_used, CODED_BLOCK_LEN, 0);
 
-        // 4. Interleave
+        // 5. Interleave
         let interleaved = comp.interleaver.interleave(&coded_bits);
 
-        // 5. Constellation map
+        // 6. Constellation map
         let symbols = comp.mapper.map_bits(&interleaved);
 
-        // 6. OFDM modulate
+        // 7. OFDM modulate
         // Look up PAPR target from speed level table
         let sl = SPEED_LEVELS
             .iter()
             .find(|s| s.level == header.speed_level)
             .expect("invalid speed level in header");
-        self.modem
-            .modulate_mapped(header, &symbols, sl.papr_target_db)
+        Ok(self
+            .modem
+            .modulate_mapped(header, &symbols, sl.papr_target_db))
     }
 
     /// Peek at just the header of a buffered candidate window (samples starting at,
@@ -551,7 +618,10 @@ impl CoppaTransceiver {
         // buffer's shortened region, which `rate_dematch` otherwise leaves
         // at 0.0) in one pass -- see `pin_known_pad`'s doc.
         const PIN: f32 = 64.0;
-        let payload_bits = (header.payload_len as usize) * 8;
+        // `payload_len` bytes of application payload + `PAYLOAD_CRC_LEN` bytes of
+        // CRC-32 trailer (Phase 3 Task 1) are the real (non-pad) bits `transmit`
+        // wrote -- see `PAYLOAD_CRC32`'s doc.
+        let payload_bits = (header.payload_len as usize + PAYLOAD_CRC_LEN) * 8;
         if payload_bits > k_used {
             // A corrupted header claiming a payload larger than this level's
             // shortened capacity can't be genuine -- treat as header corruption
@@ -647,18 +717,37 @@ impl CoppaTransceiver {
             return Err(ReceiveError::LdpcNotConverged { iterations });
         }
 
-        // 7. Extract payload bytes
+        // 7. Extract payload+CRC bytes (Phase 3 Task 1: `payload_len` application
+        //    bytes followed by a `PAYLOAD_CRC_LEN`-byte CRC-32 trailer -- see
+        //    `PAYLOAD_CRC32`'s doc).
         let payload_len = header.payload_len as usize;
-        let mut payload = Vec::with_capacity(payload_len);
+        let total_len = payload_len + PAYLOAD_CRC_LEN;
+        let mut payload_and_crc = Vec::with_capacity(total_len);
         for chunk in decoded_bits.chunks(8) {
-            if chunk.len() == 8 && payload.len() < payload_len {
+            if chunk.len() == 8 && payload_and_crc.len() < total_len {
                 let mut byte = 0u8;
                 for (i, &bit) in chunk.iter().enumerate() {
                     byte |= (bit & 1) << (7 - i);
                 }
-                payload.push(byte);
+                payload_and_crc.push(byte);
             }
         }
+
+        // 8. Verify the CRC-32 trailer: LDPC convergence alone only means the
+        //    decoder found *a* valid codeword, not that it's the *right* one --
+        //    this catches the rare (but real, especially at low SNR) case where
+        //    it converged to the wrong one.
+        let (payload_bytes, crc_bytes) = payload_and_crc.split_at(payload_len);
+        let received_crc = u32::from_be_bytes(
+            crc_bytes
+                .try_into()
+                .expect("payload_and_crc always has exactly PAYLOAD_CRC_LEN trailer bytes"),
+        );
+        let expected_crc = PAYLOAD_CRC32.checksum(payload_bytes);
+        if expected_crc != received_crc {
+            return Err(ReceiveError::CrcMismatch);
+        }
+        let payload = payload_bytes.to_vec();
 
         // SNR estimate from the same per-carrier noise variances used for LLR scaling.
         let mean_nv = if noise_vars.is_empty() {
@@ -817,7 +906,9 @@ mod tests {
         assert!(!tx.turbo());
         let payload = vec![0x5Au8; 20];
         let header = make_header(2, payload.len() as u16);
-        let samples = tx.transmit(&header, &payload);
+        let samples = tx
+            .transmit(&header, &payload)
+            .expect("payload within this test's speed level capacity");
         let (_h, rx) = tx.receive(&samples).expect("clean loopback should decode");
         assert_eq!(&rx[..payload.len()], payload.as_slice());
         assert_eq!(tx.turbo_attempts(), 0);
@@ -829,7 +920,9 @@ mod tests {
         assert!(tx.turbo());
         let payload = vec![0x5Au8; 20];
         let header = make_header(2, payload.len() as u16);
-        let samples = tx.transmit(&header, &payload);
+        let samples = tx
+            .transmit(&header, &payload)
+            .expect("payload within this test's speed level capacity");
         let (_h, rx) = tx.receive(&samples).expect("clean loopback should decode");
         assert_eq!(&rx[..payload.len()], payload.as_slice());
     }
@@ -862,7 +955,9 @@ mod tests {
                 use rand::{RngExt, SeedableRng};
                 let mut rng = StdRng::seed_from_u64(seed);
                 let payload: Vec<u8> = (0..PAYLOAD_BYTES).map(|_| rng.random::<u8>()).collect();
-                let clean = tx.transmit(&header, &payload);
+                let clean = tx
+                    .transmit(&header, &payload)
+                    .expect("payload within this test's speed level capacity");
                 let faded = coppa_channel::watterson::watterson(
                     &clean,
                     48_000.0,
@@ -925,7 +1020,9 @@ mod tests {
                 seq_num: 0,
                 payload_len: payload_bytes as u16,
             };
-            let clean = tx.transmit(&header, &payload);
+            let clean = tx
+                .transmit(&header, &payload)
+                .expect("payload within this test's speed level capacity");
             let peak = clean.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
             assert!(
                 peak <= 0.5001,
@@ -955,13 +1052,109 @@ mod tests {
         }
     }
 
+    /// Phase 3 Task 1(a): a completely valid, well-formed frame (LDPC converges
+    /// cleanly) whose payload trailer is a deliberately WRONG CRC-32 must be
+    /// rejected by `receive` with `Err(ReceiveError::CrcMismatch)`.
+    ///
+    /// Per the task brief: reliably corrupting a converged LDPC decode to the
+    /// *wrong* codeword via LLR flips isn't reliably constructible (that's the
+    /// rare failure mode this whole feature exists to catch, not something to
+    /// engineer on demand in a unit test). Instead this tests the CRC path
+    /// directly by replicating `transmit`'s exact pipeline (same pattern as
+    /// `known_pad_prbs_matches_scrambled_pad_ground_truth` above) but appending a
+    /// wrong CRC-32 trailer instead of the real checksum over `payload` --
+    /// everything downstream (LDPC encode, rate-match, interleave, map,
+    /// modulate) is untouched production code, so this exercises the real
+    /// decode + CRC-check path on RX, not a mock.
+    #[test]
+    fn receive_rejects_wrong_crc() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let comp = tx.codecs.get(&2).expect("level 2 must exist"); // BPSK 1/2
+        let k_used = comp.k_used;
+        let payload = vec![0x11u8; 20];
+        let header = make_header(2, payload.len() as u16);
+
+        let real_crc = PAYLOAD_CRC32.checksum(&payload);
+        let wrong_crc = real_crc ^ 0xFFFF_FFFF; // definitely different
+        assert_ne!(real_crc, wrong_crc);
+
+        let mut payload_with_bad_crc = payload.clone();
+        payload_with_bad_crc.extend_from_slice(&wrong_crc.to_be_bytes());
+
+        let mut info_bits = Vec::with_capacity(NrLdpc::INFO_LEN);
+        for &byte in &payload_with_bad_crc {
+            for shift in (0..8).rev() {
+                info_bits.push((byte >> shift) & 1);
+            }
+        }
+        info_bits.resize(k_used, 0u8);
+        info_bits.resize(NrLdpc::INFO_LEN, 0u8);
+        scramble(&mut info_bits);
+
+        let mother = tx.ldpc.encode(&info_bits);
+        let coded_bits = rate_match::rate_match(&mother, k_used, CODED_BLOCK_LEN, 0);
+        let interleaved = comp.interleaver.interleave(&coded_bits);
+        let symbols = comp.mapper.map_bits(&interleaved);
+        let sl = SPEED_LEVELS.iter().find(|s| s.level == 2).unwrap();
+        let samples = tx
+            .modem
+            .modulate_mapped(&header, &symbols, sl.papr_target_db);
+
+        let result = tx.receive(&samples);
+        assert!(
+            matches!(result, Err(ReceiveError::CrcMismatch)),
+            "expected Err(CrcMismatch) for a wrong CRC-32 trailer, got {result:?}"
+        );
+    }
+
+    /// Phase 3 Task 1(b): `transmit` with `payload.len() > max_payload(level)`
+    /// must return `Err(TransmitError::PayloadTooLarge { max })` instead of the
+    /// pre-Task-1 codec's silent truncation.
+    #[test]
+    fn transmit_rejects_oversize_payload() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let level = 2u8; // BPSK 1/2
+        let max = max_payload_for_level(level).expect("level 2 must exist");
+        let payload = vec![0u8; max + 1];
+        let header = make_header(level, payload.len() as u16);
+
+        let result = tx.transmit(&header, &payload);
+        assert_eq!(
+            result,
+            Err(TransmitError::PayloadTooLarge { max }),
+            "expected Err(PayloadTooLarge {{ max: {max} }}) for an oversized payload"
+        );
+    }
+
+    /// Phase 3 Task 1(c): a payload at exactly this level's max capacity must
+    /// still transmit and round-trip cleanly (the oversize check is a strict
+    /// `>`, not `>=`).
+    #[test]
+    fn loopback_exact_max_payload_succeeds() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let level = 2u8; // BPSK 1/2
+        let max = max_payload_for_level(level).expect("level 2 must exist");
+        let payload = vec![0x7Eu8; max];
+        let header = make_header(level, payload.len() as u16);
+
+        let samples = tx
+            .transmit(&header, &payload)
+            .expect("exact-max payload should transmit");
+        let (_h, rx) = tx
+            .receive(&samples)
+            .expect("exact-max payload should round-trip");
+        assert_eq!(&rx[..payload.len()], payload.as_slice());
+    }
+
     #[test]
     fn loopback_survives_ssb_filter_and_50hz_mistune() {
         // The bar Phase 1 exists to clear: a real radio's passband + a realistic mistune.
         let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
         let payload = vec![0xA7u8; 100];
         let header = make_header(2, payload.len() as u16);
-        let s = tx.transmit(&header, &payload);
+        let s = tx
+            .transmit(&header, &payload)
+            .expect("payload within this test's speed level capacity");
         let through_rig = coppa_channel::ssb_filter(&s, 48_000.0);
         let mistuned = coppa_channel::frequency_shift(&through_rig, 47.0, 48_000.0);
         let (_h, rx) = tx
@@ -977,7 +1170,9 @@ mod tests {
         let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
         let payload = vec![0xA7u8; 100];
         let header = make_header(2, payload.len() as u16);
-        let s = tx.transmit(&header, &payload);
+        let s = tx
+            .transmit(&header, &payload)
+            .expect("payload within this test's speed level capacity");
         let through_rig = coppa_channel::ssb_filter(&s, 48_000.0);
         let untuned = coppa_channel::frequency_shift(&through_rig, 0.0, 48_000.0);
         let (_h, rx) = tx
@@ -992,7 +1187,9 @@ mod tests {
         let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
         let payload = b"CFO correction works";
         let header = make_header(2, payload.len() as u16);
-        let samples = tx.transmit(&header, payload);
+        let samples = tx
+            .transmit(&header, payload)
+            .expect("payload within this test's speed level capacity");
         let injected = coppa_codec::ofdm::sync::remove_cfo(&samples, -8.0, 48_000.0); // +8 Hz
         let (_h, rx) = tx
             .receive(&injected)
@@ -1016,7 +1213,9 @@ mod tests {
         let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
         let payload = vec![0x5Au8; 20];
         let header = make_header(1, payload.len() as u16); // level 1 = BPSK 1/4
-        let clean = tx.transmit(&header, &payload);
+        let clean = tx
+            .transmit(&header, &payload)
+            .expect("payload within this test's speed level capacity");
 
         const TRIALS: u64 = 30;
         let mut ok = 0u64;
@@ -1047,7 +1246,9 @@ mod tests {
         let payload = b"Hello Phase C!";
         let header = make_header(2, payload.len() as u16);
 
-        let samples = tx.transmit(&header, payload);
+        let samples = tx
+            .transmit(&header, payload)
+            .expect("payload within this test's speed level capacity");
         let (rx_header, rx_payload) = tx.receive(&samples).expect("decode should succeed");
 
         assert_eq!(rx_header.speed_level, header.speed_level);
@@ -1061,7 +1262,9 @@ mod tests {
         let payload = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
         let header = make_header(3, payload.len() as u16);
 
-        let samples = tx.transmit(&header, payload.as_slice());
+        let samples = tx
+            .transmit(&header, payload.as_slice())
+            .expect("payload within this test's speed level capacity");
         let (rx_header, rx_payload) = tx.receive(&samples).expect("decode should succeed");
 
         assert_eq!(rx_header.speed_level, 3);
@@ -1074,7 +1277,9 @@ mod tests {
         let payload = vec![0x42u8; 100];
         let header = make_header(6, payload.len() as u16);
 
-        let samples = tx.transmit(&header, payload.as_slice());
+        let samples = tx
+            .transmit(&header, payload.as_slice())
+            .expect("payload within this test's speed level capacity");
         let (rx_header, rx_payload) = tx.receive(&samples).expect("decode should succeed");
 
         assert_eq!(rx_header.speed_level, 6);
@@ -1088,7 +1293,9 @@ mod tests {
         let tx = CoppaTransceiver::new(CoppaProfile::hf_robust(), 1);
         let payload = vec![0x3Cu8; 40];
         let header = make_header(6, payload.len() as u16); // 16QAM 1/2
-        let mut samples = tx.transmit(&header, payload.as_slice());
+        let mut samples = tx
+            .transmit(&header, payload.as_slice())
+            .expect("payload within this test's speed level capacity");
         for s in samples.iter_mut() {
             *s *= 0.5; // flat channel gain
         }
@@ -1103,7 +1310,9 @@ mod tests {
         let tx = CoppaTransceiver::new(CoppaProfile::hf_robust(), 1);
         let payload = b"Hello robust HF profile!";
         let header = make_header(2, payload.len() as u16); // BPSK 1/2
-        let samples = tx.transmit(&header, payload);
+        let samples = tx
+            .transmit(&header, payload)
+            .expect("payload within this test's speed level capacity");
         let (rx_header, rx_payload) = tx
             .receive(&samples)
             .expect("hf_robust decode should succeed");
@@ -1116,7 +1325,9 @@ mod tests {
         let tx = CoppaTransceiver::new(CoppaProfile::hf_robust(), 1);
         let payload = vec![0x5Au8; 60];
         let header = make_header(3, payload.len() as u16); // QPSK 1/2
-        let samples = tx.transmit(&header, payload.as_slice());
+        let samples = tx
+            .transmit(&header, payload.as_slice())
+            .expect("payload within this test's speed level capacity");
         let (rx_header, rx_payload) = tx
             .receive(&samples)
             .expect("hf_robust QPSK decode should succeed");
@@ -1131,7 +1342,9 @@ mod tests {
         let tx = CoppaTransceiver::new(CoppaProfile::hf_robust(), 1);
         let payload = vec![0x5Au8; 40];
         let header = make_header(2, payload.len() as u16); // BPSK 1/2
-        let mut samples = tx.transmit(&header, payload.as_slice());
+        let mut samples = tx
+            .transmit(&header, payload.as_slice())
+            .expect("payload within this test's speed level capacity");
         // Perturb a handful of samples inside the header region (after preamble +
         // fine-sync = 3 symbols). One robust symbol = fft_size + cp = 1260 samples.
         let sym = 1260;
@@ -1151,28 +1364,37 @@ mod tests {
 
     /// Step 1(c): the pinned positions computed in `receive` must equal the
     /// pad's actual scrambled (transmitted) value, for every position beyond
-    /// the payload. Replicates `transmit`'s exact `info_bits` construction
-    /// (real payload bits + zero pad out to k_used + zero pad out to the
-    /// fixed NR BG2 mother-code info width, whole vector scrambled) as ground
-    /// truth, then checks it against `prbs_bits(NrLdpc::INFO_LEN)` at the
-    /// same indices -- this is exactly what `receive`'s `pin_known_pad` call
-    /// relies on (Task 3, extended for the mother code in Task 4).
+    /// the payload+CRC. Replicates `transmit`'s exact `info_bits` construction
+    /// (real payload bits + CRC-32 trailer bits (Phase 3 Task 1) + zero pad out
+    /// to k_used + zero pad out to the fixed NR BG2 mother-code info width, whole
+    /// vector scrambled) as ground truth, then checks it against
+    /// `prbs_bits(NrLdpc::INFO_LEN)` at the same indices -- this is exactly what
+    /// `receive`'s `pin_known_pad` call relies on (Task 3, extended for the
+    /// mother code in Task 4, extended again for the CRC trailer in Phase 3
+    /// Task 1).
     #[test]
     fn known_pad_prbs_matches_scrambled_pad_ground_truth() {
         let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
         let comp = tx.codecs.get(&2).expect("level 2 must exist"); // BPSK 1/2
         let k_used = comp.k_used;
         let payload_bytes = 20usize;
-        let payload_bits_count = payload_bytes * 8;
+        // Real (non-pad) bits now cover payload + CRC-32 trailer -- see
+        // `PAYLOAD_CRC32`'s doc.
+        let real_bits_count = (payload_bytes + PAYLOAD_CRC_LEN) * 8;
         assert!(
-            payload_bits_count < k_used,
+            real_bits_count < k_used,
             "test assumes real padding exists within k_used"
         );
 
         // Ground truth: exactly replicate `transmit`'s info_bits construction.
         let payload = vec![0xA5u8; payload_bytes];
+        let checksum = PAYLOAD_CRC32.checksum(&payload);
+        let mut payload_with_crc = Vec::with_capacity(payload.len() + PAYLOAD_CRC_LEN);
+        payload_with_crc.extend_from_slice(&payload);
+        payload_with_crc.extend_from_slice(&checksum.to_be_bytes());
+
         let mut info_bits = Vec::with_capacity(NrLdpc::INFO_LEN);
-        for &byte in &payload {
+        for &byte in &payload_with_crc {
             for shift in (0..8).rev() {
                 info_bits.push((byte >> shift) & 1);
             }
@@ -1183,8 +1405,8 @@ mod tests {
 
         let pad_prbs = crate::fec::scrambler::prbs_bits(NrLdpc::INFO_LEN);
         assert_eq!(
-            &info_bits[payload_bits_count..],
-            &pad_prbs[payload_bits_count..],
+            &info_bits[real_bits_count..],
+            &pad_prbs[real_bits_count..],
             "prbs_bits(NrLdpc::INFO_LEN)'s pad-region tail must match transmit()'s actual \
              scrambled pad -- this is the ground truth `receive`'s pinning relies on"
         );

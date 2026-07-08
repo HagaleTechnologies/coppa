@@ -57,7 +57,9 @@ fn goodput(
         let payload: Vec<u8> = (0..pfb)
             .map(|i| (seed.wrapping_add(i as u64).wrapping_mul(2654435761) >> 24) as u8)
             .collect();
-        let sig = tx.transmit(&make_header(level, pfb as u16), &payload);
+        let sig = tx
+            .transmit(&make_header(level, pfb as u16), &payload)
+            .expect("payload within this level's capacity");
         airtime = sig.len() as f64 / SAMPLE_RATE as f64;
         let faded = apply_channel(&sig, ch, snr, seed);
         if let Ok((_h, p)) = tx.receive(&faded) {
@@ -83,7 +85,9 @@ fn sound_capacity(
     let modem = CoppaModem::new(profile.clone(), 1);
     let pfb = mode_for_level(2).unwrap().payload_bytes();
     let payload = vec![0x5Au8; pfb];
-    let sig = tx.transmit(&make_header(2, pfb as u16), &payload);
+    let sig = tx
+        .transmit(&make_header(2, pfb as u16), &payload)
+        .expect("payload within this level's capacity");
     let (mut accc, mut accs, mut n) = (0.0f32, 0.0f32, 0usize);
     for s in 0..8u64 {
         let faded = apply_channel(

@@ -172,7 +172,10 @@ impl CoppaCore {
             payload_len: payload.len() as u16,
         };
 
-        let samples = self.transceiver.transmit(&header, &payload);
+        let samples = self
+            .transceiver
+            .transmit(&header, &payload)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
         Ok(samples)
     }
 

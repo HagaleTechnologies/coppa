@@ -28,7 +28,9 @@ fn main() {
         seq_num: 0,
         payload_len: payload.len() as u16,
     };
-    let clean = tx.transmit(&header, &payload);
+    let clean = tx
+        .transmit(&header, &payload)
+        .expect("payload within this level's capacity");
 
     let mut ok = 0u64;
     for trial in 0..trials {
