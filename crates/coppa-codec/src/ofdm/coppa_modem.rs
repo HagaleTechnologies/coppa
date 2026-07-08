@@ -924,6 +924,23 @@ impl CoppaModem {
     /// std ≈0.41% at n=600; the 0.5pp gap is ~1.2σ, not significant) — unlike
     /// bound=0.2's ~1.67pp gap (~4σ, a real if still-passing regression). See
     /// `.superpowers/sdd/p2-cfo-level4-fix-report.md` for the full sweep data.
+    ///
+    /// # Combined CFO + Watterson-fading case (post-merge verification)
+    ///
+    /// The two dimensions above were each measured with the other held at zero
+    /// (CFO sweep under AWGN; Watterson sweep under CFO=0). A follow-up sweep
+    /// (level 4, Watterson-Moderate, CFO∈{0, 39.5, 40} Hz × 6-30 dB SNR) checked
+    /// the untested combination directly: under real fading, CFO=39.5/40 track
+    /// CFO=0's FER curve within ordinary trial noise (no systematic gap, mean
+    /// diff ≈0), and a pre-fix-vs-fixed rerun of the same combined sweep shows no
+    /// regression either (mean diff ≈ -0.01 FER, fixed slightly better if
+    /// anything). The AWGN-only CFO floor (FER≈1.0 at 39-40 Hz) simply does not
+    /// reappear once real Watterson multipath is present — the pre-existing
+    /// level-4 Watterson floor (~40-50% FER at high SNR, unrelated to this fix,
+    /// see CLAUDE.md's Known Limitations) dominates and CFO adds no measurable
+    /// extra degradation on top of it. See
+    /// `.superpowers/sdd/p2-cfo-level4-fix-report.md`'s "Combined CFO + Watterson
+    /// fading" addendum for the raw data.
     fn bounded_coarse_delay(&self, nc: usize, probe_h: &[Complex32]) -> f32 {
         const COARSE_DELAY_JITTER_BOUND: f32 = 0.15;
         let raw_estimate = super::delay_domain::estimate_coarse_delay(nc, probe_h);
