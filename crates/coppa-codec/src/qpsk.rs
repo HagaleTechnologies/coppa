@@ -59,9 +59,14 @@ impl ConstellationMapper for QpskMapper {
 
     fn demap_soft(&self, symbol: Complex32, noise_variance: f32) -> Vec<f32> {
         let nv = noise_variance.max(1e-10);
-        // LLR(b0) from imaginary, LLR(b1) from real
-        // Positive LLR = more likely bit 0
-        vec![2.0 * symbol.im / nv, 2.0 * symbol.re / nv]
+        // Exact max-log LLR per axis (decision 8): QPSK is two independent
+        // orthogonal BPSK sub-channels, each with per-axis amplitude
+        // `SCALE = 1/sqrt(2)`. Substituting that amplitude into the exact
+        // max-log BPSK scale (`4 * a * component / sigma^2`, see
+        // `bpsk::BpskMapper::demap_soft`) gives `4/sqrt(2) = 2*sqrt(2)` per axis.
+        // LLR(b0) from imaginary, LLR(b1) from real. Positive LLR = more likely bit 0.
+        const LLR_SCALE: f32 = 2.0 * std::f32::consts::SQRT_2;
+        vec![LLR_SCALE * symbol.im / nv, LLR_SCALE * symbol.re / nv]
     }
 }
 
@@ -109,6 +114,27 @@ mod tests {
         let llr = mapper.demap_soft(Complex32::new(-0.5, -0.5), 1.0);
         assert!(llr[0] < 0.0);
         assert!(llr[1] < 0.0);
+    }
+
+    /// Exact max-log QPSK LLR scale (decision 8): `2*sqrt(2) * component / sigma^2`
+    /// per axis.
+    #[test]
+    fn test_qpsk_soft_demap_exact_max_log_scale() {
+        let mapper = QpskMapper;
+        let expected = 2.0 * std::f32::consts::SQRT_2 * 1.0 / 0.5;
+        let llr = mapper.demap_soft(Complex32::new(1.0, 1.0), 0.5);
+        assert!(
+            (llr[0] - expected).abs() < 1e-4,
+            "LLR(b0) should be 2*sqrt(2)*1.0/0.5 = {}, got {}",
+            expected,
+            llr[0]
+        );
+        assert!(
+            (llr[1] - expected).abs() < 1e-4,
+            "LLR(b1) should be 2*sqrt(2)*1.0/0.5 = {}, got {}",
+            expected,
+            llr[1]
+        );
     }
 
     #[test]

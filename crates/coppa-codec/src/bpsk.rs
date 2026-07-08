@@ -50,8 +50,12 @@ impl ConstellationMapper for BpskMapper {
         } else {
             1e-10
         };
-        // LLR = 2 * re / sigma^2 (positive means more likely 0)
-        vec![2.0 * symbol.re / nv]
+        // Exact max-log BPSK LLR = 4 * re / sigma^2 (positive means more likely 0).
+        // Matches `push_header_llrs` in `coppa_codec::ofdm::coppa_modem` (the
+        // protected-header path), which already uses this exact scale -- see
+        // Task 2's review finding: this mapper previously used `2 * re / sigma^2`,
+        // a factor-of-2 mismatch against the header path.
+        vec![4.0 * symbol.re / nv]
     }
 }
 
@@ -228,13 +232,27 @@ mod tests {
         let llr = mapper.demap_soft(Complex32::new(0.5, 0.0), 1.0);
         assert!(llr[0] > 0.0, "Positive re should give positive LLR (bit 0)");
         assert!(
-            (llr[0] - 1.0).abs() < 0.01,
-            "LLR should be ~2*0.5/1.0 = 1.0, got {}",
+            (llr[0] - 2.0).abs() < 0.01,
+            "LLR should be ~4*0.5/1.0 = 2.0, got {}",
             llr[0]
         );
 
         let llr = mapper.demap_soft(Complex32::new(-0.5, 0.0), 1.0);
         assert!(llr[0] < 0.0, "Negative re should give negative LLR (bit 1)");
+    }
+
+    /// Exact max-log BPSK LLR scale (decision 8): `4 * re / sigma^2`. Matches
+    /// `push_header_llrs`'s scale in `coppa_codec::ofdm::coppa_modem` exactly, so the
+    /// header and payload paths compute LLRs on the same footing.
+    #[test]
+    fn test_bpsk_soft_demap_exact_max_log_scale() {
+        let mapper = BpskMapper;
+        let llr = mapper.demap_soft(Complex32::new(1.0, 0.0), 0.5);
+        assert!(
+            (llr[0] - 8.0).abs() < 1e-4,
+            "LLR should be exactly 4*1.0/0.5 = 8.0, got {}",
+            llr[0]
+        );
     }
 
     #[test]

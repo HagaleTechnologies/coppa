@@ -78,6 +78,28 @@ impl std::fmt::Display for ReceiveError {
 
 impl std::error::Error for ReceiveError {}
 
+/// Median of the per-carrier noise-variance estimates, used as the fallback
+/// noise variance for carriers with a missing or degenerate (near-zero)
+/// estimate -- see the call site in `receive_with_metrics` for why a
+/// frame-local median is a better fallback than a fixed constant.
+///
+/// Returns `1.0` (a neutral value: neither artificially confident nor
+/// artificially flat) if `noise_vars` is empty, since there is then no
+/// frame-local data to derive a fallback from at all.
+fn median_noise_variance(noise_vars: &[f32]) -> f32 {
+    if noise_vars.is_empty() {
+        return 1.0;
+    }
+    let mut sorted: Vec<f32> = noise_vars.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
+    }
+}
+
 impl CoppaTransceiver {
     pub fn new(profile: CoppaProfile, version: u8) -> Self {
         // phy_mode 0 = HF/SSB; mirrors the TX bandpass gate in `CoppaModem::new`.
@@ -243,11 +265,23 @@ impl CoppaTransceiver {
         let symbols_needed = coded_bits_needed.div_ceil(bps);
         let mut llrs = Vec::with_capacity(coded_bits_needed);
 
+        // Fallback noise variance for carriers with no estimate (or a degenerate
+        // near-zero one): the median of the per-carrier estimates we do have, rather
+        // than a fixed `0.01`/`0.001` magic constant. A fixed fallback either
+        // over-trusts a carrier with no real estimate (too small a variance inflates
+        // its LLR magnitude) or under-trusts it relative to the actual channel (too
+        // large flattens it) -- the median of this frame's own measured noise floor
+        // is a much better prior than an arbitrary constant tuned on a different
+        // channel/SNR regime.
+        let fallback_nv = median_noise_variance(&noise_vars);
+
         for (i, &sym) in eq_symbols.iter().take(symbols_needed).enumerate() {
-            let nv = if i < noise_vars.len() {
-                noise_vars[i].max(0.001)
-            } else {
-                0.01
+            let nv = match noise_vars.get(i) {
+                // A present-but-near-zero estimate is as uninformative as a missing
+                // one (dividing by it would blow the LLR up towards +/-infinity), so
+                // both cases fall back to the same median-based estimate.
+                Some(&v) if v > 1e-6 => v,
+                _ => fallback_nv,
             };
             llrs.extend(comp.mapper.demap_soft(sym, nv));
         }
@@ -261,7 +295,25 @@ impl CoppaTransceiver {
         }
 
         // 4. De-interleave
-        let deinterleaved = comp.interleaver.deinterleave(&llrs);
+        let mut deinterleaved = comp.interleaver.deinterleave(&llrs);
+
+        // Known-bit pinning: info bits beyond the payload are zero-padded then scrambled
+        // on TX, so RX knows their exact values -- pin to ±PIN (effective code shortening;
+        // worth 1.5-3 dB on short payloads).
+        const PIN: f32 = 64.0;
+        let info_bits = comp.codec.code().info_bits();
+        let payload_bits = (header.payload_len as usize) * 8;
+        if payload_bits < info_bits {
+            let pad_prbs = crate::fec::scrambler::prbs_bits(info_bits);
+            for (i, &prbs_bit) in pad_prbs
+                .iter()
+                .enumerate()
+                .take(info_bits)
+                .skip(payload_bits)
+            {
+                deinterleaved[i] = if prbs_bit == 0 { PIN } else { -PIN };
+            }
+        }
 
         // 5. LDPC decode
         let (mut decoded_bits, converged) = comp.codec.decode_checked(&deinterleaved);
@@ -555,5 +607,155 @@ mod tests {
             .expect("protected header should recover from small perturbations");
         assert_eq!(rx_header.speed_level, 2);
         assert_eq!(&rx_payload[..payload.len()], payload.as_slice());
+    }
+
+    /// Step 1(c): the pinned positions computed in `receive` must equal the
+    /// pad's actual scrambled (transmitted) value, for every position beyond
+    /// the payload. Replicates `transmit`'s exact `payload_bits` construction
+    /// (real payload bits + zero pad, whole vector scrambled) as ground truth,
+    /// then checks it against `prbs_bits(info_bits)` at the same indices --
+    /// this is exactly what `receive`'s pinning block relies on (see its
+    /// "Known-bit pinning" comment).
+    #[test]
+    fn known_pad_prbs_matches_scrambled_pad_ground_truth() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let comp = tx.codecs.get(&2).expect("level 2 must exist"); // BPSK 1/2
+        let info_bits = comp.codec.code().info_bits();
+        let payload_bytes = 20usize;
+        let payload_bits_count = payload_bytes * 8;
+        assert!(
+            payload_bits_count < info_bits,
+            "test assumes real padding exists (972-bit info, 160 real bits)"
+        );
+
+        // Ground truth: exactly replicate `transmit`'s payload_bits construction.
+        let payload = vec![0xA5u8; payload_bytes];
+        let mut payload_bits = Vec::with_capacity(info_bits);
+        for &byte in &payload {
+            for shift in (0..8).rev() {
+                payload_bits.push((byte >> shift) & 1);
+            }
+        }
+        payload_bits.resize(info_bits, 0u8);
+        scramble(&mut payload_bits);
+
+        let pad_prbs = crate::fec::scrambler::prbs_bits(info_bits);
+        assert_eq!(
+            &payload_bits[payload_bits_count..],
+            &pad_prbs[payload_bits_count..],
+            "prbs_bits(info_bits)'s pad-region tail must match transmit()'s actual \
+             scrambled pad -- this is the ground truth `receive`'s pinning relies on"
+        );
+    }
+
+    /// Step 1(b): statistical integration test for known-pad LLR pinning (Task 3).
+    ///
+    /// `CoppaTransceiver::receive`'s full OFDM pipeline can't demonstrate this
+    /// directly: a dedicated bench sweep (`coppa-bench`'s `task3_short_payload_gate`
+    /// example; see the Task 3 report for the full before/after CSVs) found that
+    /// for a 20-byte payload at level 2 on `hf_standard`/AWGN, *every* frame
+    /// failure across the whole relevant SNR range is a sync/header failure, not
+    /// an LDPC non-convergence -- confirmed by direct instrumentation showing the
+    /// LDPC decode converges 100% of the time whenever sync succeeds, identically
+    /// whether or not pad bits are pinned. OFDM sync is strictly the binding
+    /// constraint here, so the pinning's effect on the LDPC margin is invisible
+    /// end-to-end.
+    ///
+    /// To test the actual mechanism (not masked by sync), this replicates the
+    /// exact code path `receive`/`transmit` use for the FEC layer -- `scramble`,
+    /// `prbs_bits`, `LdpcCodec`, and `BpskMapper`'s (now-fixed) exact max-log LLR
+    /// scale -- but maps coded bits directly to BPSK symbols and adds AWGN,
+    /// bypassing OFDM/sync entirely. This is exactly the isolated measurement
+    /// `coppa-bench`'s `task3_fec_isolated_gate` example performs; see the Task 3
+    /// report for the full sweep. That sweep found: no-pin FER<=10% threshold =
+    /// 2.0 dB, pinned threshold = -1.0 dB (a 3.0 dB shift, matching the brief's
+    /// expected 1.5-3 dB). This test fixes the SNR at 1.5 dB below the no-pinning
+    /// threshold (0.5 dB) and asserts pinning recovers the large majority of
+    /// frames there (measured 393/400 = 98.25% in the full sweep at this exact
+    /// point; 100 seeds here for a quick but still statistically meaningful
+    /// check).
+    #[test]
+    #[ignore = "statistical (100 seeds); run manually: cargo test -p coppa-protocol --lib -- --ignored known_pad_pinning_recovers_below_no_pinning_threshold"]
+    fn known_pad_pinning_recovers_below_no_pinning_threshold() {
+        use crate::fec::ldpc::{CodeRate, LdpcCodec};
+        use crate::fec::scrambler::prbs_bits;
+        use coppa_codec::bpsk::BpskMapper;
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        const PAYLOAD_BYTES: usize = 20;
+        const PIN: f32 = 64.0;
+        const LLR_CLIP: f32 = 20.0;
+        // Measured no-pinning FER<=10% threshold (task3_fec_isolated_gate) is 2.0 dB;
+        // 1.5 dB below that is 0.5 dB.
+        const TEST_SNR_DB: f32 = 0.5;
+        const SEEDS: u64 = 100;
+
+        let codec = LdpcCodec::new(CodeRate::Rate1_2); // level 2: BPSK 1/2, 972 info bits
+        let info_bits = codec.code().info_bits();
+        let payload_bits_count = PAYLOAD_BYTES * 8;
+        let mapper = BpskMapper;
+
+        let mut successes = 0u64;
+        for trial in 0..SEEDS {
+            let seed = 0x9EED_0000u64.wrapping_add(trial);
+            let mut rng = StdRng::seed_from_u64(seed);
+            let payload: Vec<u8> = (0..PAYLOAD_BYTES).map(|_| rng.random::<u8>()).collect();
+
+            let mut info: Vec<u8> = Vec::with_capacity(info_bits);
+            for &byte in &payload {
+                for shift in (0..8).rev() {
+                    info.push((byte >> shift) & 1);
+                }
+            }
+            info.resize(info_bits, 0u8);
+            scramble(&mut info);
+            let coded = codec.encode(&info);
+
+            let clean: Vec<f32> = coded.iter().map(|&b| mapper.map(&[b]).re).collect();
+            let noisy =
+                coppa_channel::awgn_seeded(&clean, TEST_SNR_DB, seed ^ 0x5A5A_5A5A_5A5A_5A5Au64);
+            let nv = 10f32.powf(-TEST_SNR_DB / 10.0);
+            let mut llrs: Vec<f32> = noisy
+                .iter()
+                .map(|&re| (4.0 * re / nv).clamp(-LLR_CLIP, LLR_CLIP))
+                .collect();
+
+            let pad_prbs = prbs_bits(info_bits);
+            for (i, &prbs_bit) in pad_prbs
+                .iter()
+                .enumerate()
+                .take(info_bits)
+                .skip(payload_bits_count)
+            {
+                llrs[i] = if prbs_bit == 0 { PIN } else { -PIN };
+            }
+
+            let (mut decoded, converged) = codec.decode_checked(&llrs);
+            if !converged {
+                continue;
+            }
+            scramble(&mut decoded);
+
+            let mut out = Vec::with_capacity(PAYLOAD_BYTES);
+            for chunk in decoded.chunks(8) {
+                if chunk.len() == 8 && out.len() < PAYLOAD_BYTES {
+                    let mut byte = 0u8;
+                    for (i, &bit) in chunk.iter().enumerate() {
+                        byte |= (bit & 1) << (7 - i);
+                    }
+                    out.push(byte);
+                }
+            }
+            if out == payload {
+                successes += 1;
+            }
+        }
+
+        assert!(
+            successes * 100 >= SEEDS * 90,
+            "known-pad pinning should recover the large majority of frames 1.5 dB below \
+             the no-pinning FER<=10% threshold, got {successes}/{SEEDS}"
+        );
     }
 }
