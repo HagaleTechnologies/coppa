@@ -201,8 +201,10 @@ struct LastFrameWorkspace {
     /// (`ProbeCalibration::order`) — reused as-is for the turbo re-fit rather
     /// than re-deriving a new order from the augmented observation set.
     order: usize,
-    /// This frame's fixed coarse-delay bulk bias (`ProbeCalibration::coarse_delay`,
-    /// always `self.calibrated_bias` — see `measure_bulk_bias`'s doc).
+    /// This frame's coarse-delay bulk bias (`ProbeCalibration::coarse_delay` —
+    /// `self.calibrated_bias` plus a tightly bounded per-frame jitter correction,
+    /// see [`CoppaModem::bounded_coarse_delay`]'s doc), reused as-is for the turbo
+    /// re-fit rather than re-derived from the augmented observation set.
     coarse_delay: f32,
     /// Per-payload-OFDM-symbol `(global_sym, raw_carriers)`, in frame order —
     /// exactly `demodulate_frame`'s Pass-1 `sym_carriers`, retained instead of
@@ -796,11 +798,14 @@ impl CoppaModem {
     /// version-keyed BPSK PN sequence transmitted on every active carrier right
     /// before the header (see `modulate_mapped` step 2).
     ///
-    /// - `coarse_delay` is always `self.calibrated_bias` (see `measure_bulk_bias`'s
-    ///   doc for why this is a fixed, once-measured constant rather than something
-    ///   re-derived per received frame).
+    /// - `coarse_delay` is `self.calibrated_bias` plus a tightly bounded per-frame
+    ///   jitter correction (see [`Self::bounded_coarse_delay`]'s doc) — NOT a fully
+    ///   adaptive per-frame re-derivation. That distinction is load-bearing: see
+    ///   `measure_bulk_bias`'s doc for why an unconstrained per-frame estimate was
+    ///   already tried and rejected (it regressed Watterson-fading header survival
+    ///   from ~100% to ~73%).
     /// - `order` (2..=8 taps): one LS fit against `l=8` on the probe (after removing
-    ///   `calibrated_bias`), keeping only the taps that clear the noise floor — see
+    ///   `coarse_delay`), keeping only the taps that clear the noise floor — see
     ///   [`DelayDomainEstimator::select_order`].
     /// - `taps`/`noise_var`: the probe re-fit AT that chosen order — seeds
     ///   [`kalman_tracker::KalmanLagSmoother`]'s initial state (`taps`) and supplies
@@ -835,7 +840,8 @@ impl CoppaModem {
             .enumerate()
             .map(|(i, &y)| y * pn[i % pn.len()])
             .collect();
-        let derot = coarse_delay_rotation(nc, self.calibrated_bias);
+        let coarse_delay = self.bounded_coarse_delay(nc, &probe_h);
+        let derot = coarse_delay_rotation(nc, coarse_delay);
         let derotated: Vec<Complex32> = probe_h
             .iter()
             .enumerate()
@@ -849,11 +855,81 @@ impl CoppaModem {
             .collect();
         let est = DelayDomainEstimator::fit(nc, order, &obs);
         ProbeCalibration {
-            coarse_delay: self.calibrated_bias,
+            coarse_delay,
             order,
             taps: est.taps().to_vec(),
             noise_var: est.noise_var(),
         }
+    }
+
+    /// Per-frame coarse-delay bulk bias: `self.calibrated_bias` plus a delta from
+    /// this frame's own probe, clamped to `±COARSE_DELAY_JITTER_BOUND` grid units.
+    ///
+    /// # Why this exists (Phase 2 CFO×level-4 fix)
+    ///
+    /// A nonzero CFO induces a several-sample timing-lock jitter in
+    /// `SyncDetector`'s strongest-path `frame_start` (always within cyclic-prefix
+    /// tolerance — a normal, harmless side effect of CP-OFDM timing lock). But
+    /// `calibrated_bias` is measured ONCE, on a clean zero-CFO calibration frame at
+    /// construction (`measure_bulk_bias`), and has no way to represent that jitter.
+    /// Left uncorrected, the mismatch (directly measured at ≈0.24–0.36 grid units
+    /// across the 30–50 Hz CFO band that provokes it, worst near 39–40 Hz) leaks
+    /// real probe energy into a spurious second delay-domain tap, corrupting the
+    /// LDPC input LLRs identically at every HF-profile level — level 4 (QPSK 3/4,
+    /// the tightest-margin HF-profile code) is the first to lose LDPC convergence
+    /// entirely, producing a flat, SNR-unresponsive ~40–100% FER floor. See
+    /// `.superpowers/sdd/p2-cfo-level4-investigation-report.md` for the full
+    /// measurement.
+    ///
+    /// # Why bounded rather than a full per-frame re-derivation
+    ///
+    /// `measure_bulk_bias`'s doc already documents why letting this value be fully
+    /// adaptive per frame was tried and rejected: `estimate_coarse_delay` on a REAL
+    /// two-tap Watterson channel converges toward a power-weighted average of the
+    /// two taps' delays, which swings toward whichever tap is instantaneously
+    /// stronger — directly measured here at a median |delta| of ≈0.59 grid units
+    /// and a 95th percentile of ≈1.28 (Watterson Moderate, whose two taps are
+    /// physically separated by ≈2.4 grid units at this profile's `nc`), reaching
+    /// the full ~2.4 unit separation in the extreme. An unconstrained correction of
+    /// that size is exactly what regressed
+    /// `hf_standard_header_survives_watterson_moderate_fading` from ~100% to ~73%
+    /// (a momentarily-weaker tap landing at an unrepresentable negative relative
+    /// delay after derotation).
+    ///
+    /// # Why the bound is 0.15, not something closer to the CFO-jitter scale itself
+    ///
+    /// The naive assumption — pick a bound just under the ~0.36 worst-case
+    /// CFO-induced delta so the correction can fully absorb it — was directly
+    /// measured to be UNSAFE: a bound of 0.5 (comfortably above 0.36, and still
+    /// comfortably below the ~0.59-2.4 real-Watterson-swing range) fixes the CFO
+    /// floor completely but drops `hf_standard_header_survives_watterson_moderate_fading`'s
+    /// underlying pass rate from a 99.00% baseline (594/600, unmodified code) to
+    /// 84.00% (252/300) — a real, reproducible regression, not noise, even though
+    /// it still clears the test's 80% bar. A bound-vs-both-metrics sweep (0.0-0.5
+    /// in 0.05 steps, 300-600 trials per point) instead showed: (a) the CFO floor
+    /// is fully fixed by a bound as small as ≈0.07 (this problem needs only a
+    /// PARTIAL correction of the jitter to restore LDPC convergence, not a full
+    /// one), and (b) Watterson header survival degrades measurably starting
+    /// around bound=0.2 (97.33%, ~584/600) and worsens monotonically above that
+    /// (92% at 0.3, 84% at 0.5) — i.e. any measurable cost to real multipath
+    /// tolerance starts far below the multi-grid-unit swing scale that broke the
+    /// original unconstrained attempt, so "smaller than a real multipath swing"
+    /// alone is NOT a sufficient safety criterion; the actual constraint is
+    /// "smaller than the Watterson-survival degradation threshold," which sits
+    /// much closer to the CFO-jitter scale than to the multipath-swing scale.
+    /// `COARSE_DELAY_JITTER_BOUND = 0.15` sits at ~2x the minimal value that
+    /// fully clears the CFO floor (margin against under-fixing) while keeping the
+    /// measured Watterson header pass rate (98.50%, 591/600) statistically
+    /// indistinguishable from the 99.00% unmodified-code baseline (binomial
+    /// std ≈0.41% at n=600; the 0.5pp gap is ~1.2σ, not significant) — unlike
+    /// bound=0.2's ~1.67pp gap (~4σ, a real if still-passing regression). See
+    /// `.superpowers/sdd/p2-cfo-level4-fix-report.md` for the full sweep data.
+    fn bounded_coarse_delay(&self, nc: usize, probe_h: &[Complex32]) -> f32 {
+        const COARSE_DELAY_JITTER_BOUND: f32 = 0.15;
+        let raw_estimate = super::delay_domain::estimate_coarse_delay(nc, probe_h);
+        let delta = (raw_estimate - self.calibrated_bias)
+            .clamp(-COARSE_DELAY_JITTER_BOUND, COARSE_DELAY_JITTER_BOUND);
+        self.calibrated_bias + delta
     }
 
     /// AR(1) one-step correlation coefficient for this profile's OFDM symbol period
