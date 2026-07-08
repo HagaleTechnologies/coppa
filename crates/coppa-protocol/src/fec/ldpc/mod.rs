@@ -10,6 +10,8 @@
 pub mod codes;
 pub mod decoder;
 pub mod encoder;
+pub mod nr_bg2;
+pub mod rate_match;
 
 pub use codes::{CodeRate, LdpcCode};
 pub use decoder::LdpcDecoder;
@@ -62,6 +64,151 @@ impl LdpcCodec {
     }
 }
 
+/// NR BG2 mother code (Task 4): one code for every speed level, rate-matched
+/// down per level via `rate_match`/`rate_dematch` instead of switching
+/// between per-rate base matrices (the old `LdpcCodec` approach above, kept
+/// for reference/back-compat but no longer used by `CoppaTransceiver`).
+///
+/// Cache **one** `NrLdpc` instance and reuse it for every speed level and
+/// every frame -- see `nr_bg2` for the (Zc=176, fixed) lifted-graph
+/// construction cost this amortizes.
+#[derive(Debug, Clone)]
+pub struct NrLdpc {
+    encoder: encoder::NrBg2Encoder,
+    decoder: decoder::NrBg2Decoder,
+}
+
+impl Default for NrLdpc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NrLdpc {
+    pub fn new() -> Self {
+        Self {
+            encoder: encoder::NrBg2Encoder::new(),
+            decoder: decoder::NrBg2Decoder::new(),
+        }
+    }
+
+    /// Fixed info width for every speed level: `KB * ZC` = 1760.
+    pub const INFO_LEN: usize = nr_bg2::KB * nr_bg2::ZC;
+    /// Fixed mother-codeword width: `(BASE_COLS - PUNCTURED_INFO_COLS) * ZC` = 8800.
+    pub const MOTHER_LEN: usize = (nr_bg2::BASE_COLS - nr_bg2::PUNCTURED_INFO_COLS) * nr_bg2::ZC;
+
+    /// Encode `info` (length [`Self::INFO_LEN`] = 1760) into the mother
+    /// codeword ([`Self::MOTHER_LEN`] = 8800 bits): `[info[2*ZC..], parity]`
+    /// (the leading `2*ZC` = 352 systematic bits are punctured -- never
+    /// transmitted -- per standard NR practice; see `rate_match` module
+    /// docs).
+    ///
+    /// # Panics
+    /// Panics if `info.len() != Self::INFO_LEN`.
+    pub fn encode(&self, info: &[u8]) -> Vec<u8> {
+        self.encoder.encode_mother(info)
+    }
+
+    /// Decode. `mother_llrs` must have length [`Self::MOTHER_LEN`] = 8800,
+    /// in the *same domain* as [`Self::encode`]'s output (i.e. NOT
+    /// including the always-punctured leading `2*ZC` positions -- those are
+    /// prepended internally as LLR = 0.0, standard treatment for punctured
+    /// bits the decoder must still recover through the graph's parity
+    /// constraints).
+    ///
+    /// Returns `(posterior, info, converged)`:
+    /// - `posterior`: full-graph posterior LLRs, length `BASE_COLS * ZC` =
+    ///   9152 (index 0 is the first punctured info bit).
+    /// - `info`: hard-decided information bits, length [`Self::INFO_LEN`] =
+    ///   1760 (`posterior[..1760]`, sign-decided).
+    /// - `converged`: whether all parity checks were satisfied.
+    ///
+    /// # Panics
+    /// Panics if `mother_llrs.len() != Self::MOTHER_LEN`.
+    pub fn decode_soft(&self, mother_llrs: &[f32]) -> (Vec<f32>, Vec<u8>, bool) {
+        let (posterior, info, converged, _iters) = self.decode_soft_stats(mother_llrs);
+        (posterior, info, converged)
+    }
+
+    /// Like [`Self::decode_soft`], but also returns the number of layered
+    /// iterations used before early-exit (or exhausting the iteration cap).
+    /// Used by the Task 4 bench gate to record early-exit iteration
+    /// statistics; not part of the brief's minimum interface, but additive
+    /// (doesn't change `decode_soft`'s signature or behavior).
+    pub fn decode_soft_stats(&self, mother_llrs: &[f32]) -> (Vec<f32>, Vec<u8>, bool, usize) {
+        assert_eq!(
+            mother_llrs.len(),
+            Self::MOTHER_LEN,
+            "expected {} mother LLRs, got {}",
+            Self::MOTHER_LEN,
+            mother_llrs.len()
+        );
+        let punctured_len = nr_bg2::PUNCTURED_INFO_COLS * nr_bg2::ZC;
+        let mut full_llrs = Vec::with_capacity(nr_bg2::BASE_COLS * nr_bg2::ZC);
+        full_llrs.resize(punctured_len, 0.0f32);
+        full_llrs.extend_from_slice(mother_llrs);
+
+        let (posterior, iterations, converged) = self.decoder.decode(&full_llrs);
+        let info: Vec<u8> = posterior[..Self::INFO_LEN]
+            .iter()
+            .map(|&l| if l >= 0.0 { 0 } else { 1 })
+            .collect();
+        (posterior, info, converged, iterations)
+    }
+}
+
+/// Pin known-zero padding LLRs into a mother-domain dematched buffer
+/// (Task 3's known-pad pinning mechanism, extended for the NR BG2 mother
+/// code -- Task 4 Step 4).
+///
+/// `dematched` must be [`NrLdpc::MOTHER_LEN`]-long (the same domain
+/// [`rate_match::rate_dematch`] produces / [`NrLdpc::decode_soft`] expects).
+/// Every info bit beyond the actual payload (`payload_bits..KB*ZC`, i.e.
+/// *both* the shortened-but-transmitted padding `payload_bits..k_used` *and*
+/// the never-transmitted shortened tail `k_used..KB*ZC` -- the latter is
+/// exactly the region `rate_dematch` leaves at `0.0`) is scrambled zero on
+/// TX (see `crate::fec::scrambler::prbs_bits`'s doc for why the RX can
+/// compute this exact value without knowing the payload), so it is pinned
+/// here to a high-confidence LLR instead of trusting the (noisy, or in the
+/// shortened case entirely absent) channel observation. One pass covers
+/// both sub-ranges uniformly -- the pin value only depends on the PRBS
+/// keystream, not on which side of `k_used` a position falls.
+///
+/// Positions `0..payload_bits.min(PUNCTURED_INFO_COLS*ZC)` (real payload
+/// bits that happen to fall in the always-punctured leading `2*ZC` region)
+/// are deliberately left untouched -- those are genuine unknown payload
+/// data recovered only through the code's redundancy, exactly as intended
+/// by standard NR LDPC puncturing.
+///
+/// # Panics
+/// Panics if `dematched.len() != NrLdpc::MOTHER_LEN` or `payload_bits >
+/// k_used` (payload can never exceed a level's shortened capacity).
+pub fn pin_known_pad(dematched: &mut [f32], payload_bits: usize, k_used: usize, pin: f32) {
+    assert_eq!(dematched.len(), NrLdpc::MOTHER_LEN);
+    assert!(
+        payload_bits <= k_used,
+        "payload_bits={payload_bits} must not exceed k_used={k_used}"
+    );
+
+    let punctured_len = nr_bg2::PUNCTURED_INFO_COLS * nr_bg2::ZC;
+    let info_len = nr_bg2::KB * nr_bg2::ZC;
+    if payload_bits >= info_len {
+        return; // full-width payload, nothing to pin
+    }
+
+    let prbs = crate::fec::scrambler::prbs_bits(info_len);
+    let pin_start_overall = payload_bits.max(punctured_len);
+    for (overall_idx, &prbs_bit) in prbs
+        .iter()
+        .enumerate()
+        .take(info_len)
+        .skip(pin_start_overall)
+    {
+        let dematch_idx = overall_idx - punctured_len;
+        dematched[dematch_idx] = if prbs_bit == 0 { pin } else { -pin };
+    }
+}
+
 impl FecCodec for LdpcCodec {
     fn rate(&self) -> f32 {
         self.code_rate.as_f32()
@@ -73,6 +220,178 @@ impl FecCodec for LdpcCodec {
 
     fn decode(&self, soft_symbols: &[f32]) -> Vec<u8> {
         self.decoder.decode_block(soft_symbols)
+    }
+}
+
+#[cfg(test)]
+mod nr_ldpc_codec_tests {
+    //! Task 4 Step 2: end-to-end codec-level tests for the NR BG2 mother
+    //! code + rate matching + known-pad pinning, one level at a time. These
+    //! exercise exactly the pipeline `CoppaTransceiver` uses (Step 4), but
+    //! at the FEC layer directly (no OFDM/interleaver/constellation), so a
+    //! regression here localizes to LDPC/rate-matching/pinning specifically.
+    use super::*;
+    use crate::fec::scrambler::scramble;
+
+    const E: usize = 1944;
+
+    /// `(wire_level, k_used)` for every non-reserved level -- mirrors
+    /// `crate::modem::speed_levels::k_used_for_level` (duplicated here as a
+    /// literal so this FEC-layer test module doesn't need to depend on
+    /// `crate::modem`; `speed_levels.rs` is the single source of truth for
+    /// production code, this is verification data only -- see
+    /// `speed_levels::tests::k_used_matches_audited_ladder` for the
+    /// production-side pin of the same table).
+    const ALL_LEVELS_K_USED: [(u8, usize); 9] = [
+        (1, 486),
+        (2, 972),
+        (3, 972),
+        (4, 1458),
+        (5, 1296),
+        (6, 972),
+        (7, 1458),
+        (9, 1296),
+        (10, 1620),
+    ];
+
+    /// Build a scrambled 1760-bit info block for `payload_bits` of
+    /// deterministic pseudo-random payload followed by zero padding, exactly
+    /// as `CoppaTransceiver::transmit` will (Step 4).
+    fn build_info(payload_bits: usize, seed: u64) -> Vec<u8> {
+        let mut info = vec![0u8; NrLdpc::INFO_LEN];
+        let mut state = seed;
+        for bit in info.iter_mut().take(payload_bits) {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *bit = ((state >> 63) & 1) as u8;
+        }
+        scramble(&mut info);
+        info
+    }
+
+    /// Full TX->channel->RX loopback for one `(k_used, payload_bits)` pair.
+    /// `flip_fraction` of the E=1944 transmitted coded bits are hard-flipped
+    /// (simulating channel errors) before soft-demapping to LLRs.
+    fn loopback(
+        ldpc: &NrLdpc,
+        k_used: usize,
+        payload_bits: usize,
+        flip_fraction: f32,
+        seed: u64,
+    ) -> (bool, Vec<u8>, Vec<u8>) {
+        let info = build_info(payload_bits, seed);
+        let mother = ldpc.encode(&info);
+        let matched = rate_match::rate_match(&mother, k_used, E, 0);
+
+        let mut llrs: Vec<f32> = matched
+            .iter()
+            .map(|&b| if b == 0 { 3.0 } else { -3.0 })
+            .collect();
+        // Corrupt exactly `n_flip` evenly-spaced LLRs: sign-flip at a *lower*
+        // magnitude than the clean bits (1.0 vs 3.0), i.e. weak-but-wrong
+        // evidence rather than adversarial maximum-confidence errors -- this
+        // is what real channel noise near the decision boundary actually
+        // looks like (a genuinely maximum-confidence-wrong bit at a full 5%
+        // rate is a far harsher condition than any AWGN/fading channel this
+        // codec targets would produce, and is not what "5% LLR corruption"
+        // is meant to model here).
+        let n_flip = ((E as f32) * flip_fraction) as usize;
+        for k in 0..n_flip {
+            let idx = (k * E) / n_flip.max(1);
+            llrs[idx] = if llrs[idx] > 0.0 { -1.0 } else { 1.0 };
+        }
+
+        let dematched = rate_match::rate_dematch(&llrs, k_used, E, 0, NrLdpc::MOTHER_LEN);
+        let mut dematched = dematched;
+        pin_known_pad(&mut dematched, payload_bits, k_used, 64.0);
+
+        let (_, mut decoded_info, converged) = ldpc.decode_soft(&dematched);
+        scramble(&mut decoded_info); // descramble
+        let decoded_payload_bits = decoded_info[..payload_bits].to_vec();
+        let original_payload_bits = {
+            let mut original = build_info(payload_bits, seed);
+            scramble(&mut original); // undo the scramble build_info applied
+            original[..payload_bits].to_vec()
+        };
+        (converged, decoded_payload_bits, original_payload_bits)
+    }
+
+    #[test]
+    fn perfect_llr_loopback_every_level() {
+        let ldpc = NrLdpc::new();
+        for (level, k_used) in ALL_LEVELS_K_USED {
+            let payload_bits = (k_used - 16).min(400); // comfortably under capacity
+            let (converged, decoded, original) =
+                loopback(&ldpc, k_used, payload_bits, 0.0, 0xC0FFEE + level as u64);
+            assert!(
+                converged,
+                "level {level} (k_used={k_used}): decoder did not converge"
+            );
+            assert_eq!(
+                decoded, original,
+                "level {level} (k_used={k_used}): payload mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn perfect_llr_loopback_max_payload_every_level() {
+        let ldpc = NrLdpc::new();
+        for (level, k_used) in ALL_LEVELS_K_USED {
+            let payload_bits = k_used; // full capacity, no padding at all
+            let (converged, decoded, original) =
+                loopback(&ldpc, k_used, payload_bits, 0.0, 0xFACE + level as u64);
+            assert!(
+                converged,
+                "level {level} (k_used={k_used}) @ max payload: did not converge"
+            );
+            assert_eq!(
+                decoded, original,
+                "level {level} (k_used={k_used}) @ max payload: mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_5_percent_of_llrs_still_decodes_every_level() {
+        // 5% of E=1944 coded bits hard-flipped (~97 bits) before soft
+        // demapping -- well within a real LDPC code's correction capability
+        // at a reasonable operating point, across the whole ladder.
+        let ldpc = NrLdpc::new();
+        for (level, k_used) in ALL_LEVELS_K_USED {
+            let payload_bits = (k_used / 2).max(64);
+            let (converged, decoded, original) = loopback(
+                &ldpc,
+                k_used,
+                payload_bits,
+                0.05,
+                0xBEEF_0000 + level as u64,
+            );
+            assert!(
+                converged,
+                "level {level} (k_used={k_used}): did not converge with 5% LLR corruption"
+            );
+            assert_eq!(
+                decoded, original,
+                "level {level} (k_used={k_used}): payload mismatch with 5% LLR corruption"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_match_output_is_exactly_e_for_every_level_and_rv() {
+        let ldpc = NrLdpc::new();
+        let info = vec![0u8; NrLdpc::INFO_LEN];
+        let mother = ldpc.encode(&info);
+        for (level, k_used) in ALL_LEVELS_K_USED {
+            for rv in 0..=3u8 {
+                let matched = rate_match::rate_match(&mother, k_used, E, rv);
+                assert_eq!(
+                    matched.len(),
+                    E,
+                    "level {level} rv={rv}: wrong rate_match length"
+                );
+            }
+        }
     }
 }
 

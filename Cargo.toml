@@ -13,6 +13,7 @@ members = [
     "crates/coppa-cli",
     "crates/coppa-daemon",
     "crates/coppa-bench",
+    "tools/gen_nr_bg2",
 ]
 exclude = ["fuzz"]
 resolver = "2"

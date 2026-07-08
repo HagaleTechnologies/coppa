@@ -65,8 +65,12 @@ pub const MODES: &[ModeInfo] = &[
     },
     ModeInfo {
         level: 10,
-        name: "64QAM 7/8",
-        info_bits: 1701,
+        // Task 4 (NR BG2 mother code) moved level 10's rate from 7/8 to 5/6
+        // (wire-format break -- see CLAUDE.md's Known Limitations and
+        // docs/adr/005-nr-bg2-ldpc.md). k_used = 1620, not the pre-Task-4
+        // 1701.
+        name: "64QAM 5/6",
+        info_bits: 1620,
     },
 ];
 
@@ -141,7 +145,7 @@ mod tests {
     #[test]
     fn payload_bytes_match_info_bits() {
         assert_eq!(mode_for_level(2).unwrap().payload_bytes(), 121);
-        assert_eq!(mode_for_level(10).unwrap().payload_bytes(), 212);
+        assert_eq!(mode_for_level(10).unwrap().payload_bytes(), 202);
     }
 
     #[test]

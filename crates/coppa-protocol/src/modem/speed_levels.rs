@@ -34,9 +34,97 @@ pub fn speed_level_entry(
     SPEED_LEVELS.iter().find(|sl| sl.level == wire_level)
 }
 
+/// `k_used` (shortened NR BG2 mother-code info length) per wire-encoded
+/// speed level, Task 4 of the Phase 2 remediation roadmap.
+///
+/// Coppa now uses **one** LDPC mother code ([`crate::fec::ldpc::NrLdpc`],
+/// Zc=176 BG2, fixed `KB*ZC = 1760`-bit info width) for every speed level,
+/// instead of switching between nine different per-rate base matrices. Each
+/// level's nominal code rate is instead realized by *shortening*: only the
+/// first `k_used` of the 1760 systematic info bits actually carry payload
+/// (plus zero-pad up to `k_used`); the remaining `1760 - k_used` are known
+/// zero-pad, never transmitted, and pinned back in at RX (see
+/// `CoppaTransceiver::receive_with_metrics`'s pinning block). `rate_match`
+/// then selects exactly 1944 coded bits from the (rate-matched) mother
+/// codeword, matching this codec's fixed OFDM/interleaver block size.
+///
+/// `k_used = round(rate * 1944)` for this ladder's existing rates, with one
+/// **wire-format-breaking exception**: level 10 (64-QAM) changes from rate
+/// 7/8 (1701) to rate **5/6** (1620), per the Phase 2 decision audit ("k_used
+/// table" decision) -- 7/8 was found to hit LDPC non-convergence at high SNR
+/// (see `CLAUDE.md`'s Known Limitations), and 5/6 is both a real reduction
+/// in that failure mode and a cleaner NR-standard-adjacent rate. **Frames
+/// encoded with the pre-Task-4 codec are not decodable by this codec, and
+/// vice versa** -- this is a wire-format break exactly like the Phase 1 OFDM
+/// waveform break (see `docs/adr/003-phase1-waveform-break.md` for the
+/// pattern, and this task's own ADR for this specific change).
+pub fn k_used_for_level(wire_level: u8) -> Option<usize> {
+    match wire_level {
+        1 => Some(486),   // BPSK, rate 1/4
+        2 => Some(972),   // BPSK, rate 1/2
+        3 => Some(972),   // QPSK, rate 1/2
+        4 => Some(1458),  // QPSK, rate 3/4
+        5 => Some(1296),  // 8PSK, rate 2/3
+        6 => Some(972),   // 16QAM, rate 1/2
+        7 => Some(1458),  // 16QAM, rate 3/4
+        9 => Some(1296),  // 64QAM, rate 2/3
+        10 => Some(1620), // 64QAM, rate 5/6 (was 7/8 pre-Task-4 -- wire break, see doc above)
+        8 => None,        // reserved
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn k_used_matches_audited_ladder() {
+        let cases = [
+            (1, 486),
+            (2, 972),
+            (3, 972),
+            (4, 1458),
+            (5, 1296),
+            (6, 972),
+            (7, 1458),
+            (9, 1296),
+            (10, 1620),
+        ];
+        for (level, expected) in cases {
+            assert_eq!(
+                k_used_for_level(level),
+                Some(expected),
+                "level {level}: k_used mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn k_used_reserved_and_invalid_levels_are_none() {
+        for level in [0, 8, 11, 255] {
+            assert_eq!(
+                k_used_for_level(level),
+                None,
+                "level {level} should be None"
+            );
+        }
+    }
+
+    #[test]
+    fn k_used_within_mother_code_bounds() {
+        // Every k_used must be >= 2*Zc (the punctured prefix) and <= KB*Zc
+        // (the mother code's full info width) -- see rate_match.rs.
+        use crate::fec::ldpc::nr_bg2::{KB, PUNCTURED_INFO_COLS, ZC};
+        for level in [1, 2, 3, 4, 5, 6, 7, 9, 10] {
+            let k = k_used_for_level(level).unwrap();
+            assert!(
+                k >= PUNCTURED_INFO_COLS * ZC,
+                "level {level}: k_used={k} too small"
+            );
+            assert!(k <= KB * ZC, "level {level}: k_used={k} too large");
+        }
+    }
 
     #[test]
     fn test_all_valid_levels_return_ok() {

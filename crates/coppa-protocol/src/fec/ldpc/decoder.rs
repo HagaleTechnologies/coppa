@@ -326,6 +326,588 @@ fn two_smallest(values: &[f32]) -> (f32, usize, f32) {
     (min1, min1_idx, min2)
 }
 
+// =========================================================================
+// NR BG2 mother-code decoder (Task 4): layered (row-based) normalized
+// min-sum.
+// =========================================================================
+//
+// A "layered" (a.k.a. row-layered, or shuffled) schedule processes one base
+// row (a "layer" -- Zc lifted check rows sharing the same base-graph row) at
+// a time and updates variable-node posteriors *immediately*, so later
+// layers in the same iteration already see the updated beliefs from earlier
+// layers -- unlike flooding (`LdpcDecoder` above), which only updates
+// posteriors once per full iteration. This is the standard technique for
+// halving LDPC iteration counts in practice; see e.g. Mansour & Shanbhag,
+// "High-Throughput LDPC Decoders" (2003), or any modern QC-LDPC ASIC/DSP
+// decoder writeup. The normalized min-sum node update itself is identical
+// to `LdpcDecoder`'s (reuses [`two_smallest`]).
+use super::nr_bg2;
+
+/// Default normalized min-sum scale for the BG2 layered decoder.
+///
+/// `coppa-bench`'s `task4_alpha_calibration` swept alpha in [0.60, 1.00] at
+/// level 2 only (isolated FEC layer, near-full-capacity payload, 300
+/// trials/point) across a 5-point SNR band straddling that level's FER<=10%
+/// threshold, and picked 0.80 as measurably better than 0.75 there (avg FER
+/// 0.441 vs. 0.451 across the band). **That pick turned out not to
+/// generalize**: `tests/phase_c_loopback.rs`'s `test_all_levels_min_payload`
+/// and `test_awgn_level_10_above_threshold` -- level 10 (the highest rate,
+/// least redundancy, and thus most pinning-dependent level) with a tiny
+/// (1-byte) payload, i.e. extreme known-pad pinning -- failed to converge at
+/// 0.80 even on a clean channel, and passed again once reverted to 0.75.
+/// 0.80 was calibrated against a single level/payload-size combination and
+/// happened to sit in a region that is fine for level 2 but breaks level
+/// 10's very different operating point (see the Task 4 report for the full
+/// story); 0.75 is the value validated across the whole ladder and every
+/// existing test, so it is what ships. A properly generalizing calibration
+/// (sweeping every level, not just level 2) is flagged as follow-up work,
+/// not attempted again here given the time already spent chasing this once.
+const NR_DEFAULT_SCALE: f32 = 0.75;
+
+/// Default max iterations. Layered schedules converge in fewer iterations
+/// than flooding at the same error-correction performance, so this is
+/// smaller than `DEFAULT_MAX_ITERATIONS` above; see the Task 4 report's
+/// early-exit iteration statistics.
+const NR_DEFAULT_MAX_ITERATIONS: usize = 30;
+
+/// Message magnitude clamp (see `MSG_CLAMP`'s doc above for the rationale --
+/// identical failure mode, identical fix).
+const NR_MSG_CLAMP: f32 = 64.0;
+
+/// Layered normalized min-sum decoder for the NR BG2 mother code
+/// (Zc=176, 42 base rows, 52 base columns -- the *full* graph, i.e. `N =
+/// BASE_COLS*ZC = 9152` variable nodes, including the `PUNCTURED_INFO_COLS *
+/// ZC = 352` always-punctured leading info bits).
+#[derive(Debug, Clone)]
+pub struct NrBg2Decoder {
+    scale: f32,
+    max_iterations: usize,
+    /// Per base row, the list of (base_col, shift) edges. Length
+    /// `BASE_ROWS`.
+    rows_edges: Vec<Vec<(usize, usize)>>,
+    /// Cumulative (unlifted) edge count before base row `r`, i.e.
+    /// `edge_offset[r] = sum_{r' < r} rows_edges[r'].len()`. Used to compute
+    /// a flat message index for `(base_row, sub_row, local_edge)`.
+    edge_offset: Vec<usize>,
+    /// Total (unlifted) edge count, `sum(rows_edges[r].len())` = 197.
+    total_edges_unlifted: usize,
+    /// Precomputed variable-node index for every (base_row, sub_row `i`,
+    /// local edge `k`), flattened as `var_table[r][i*deg(r) + k]`. This is
+    /// exactly `col*Z + (i+shift)%Z`, computed once here instead of on
+    /// every edge visit of every iteration of every `decode()` call --
+    /// `Z=176` is not a power of two, so `(i+shift)%Z` is a genuine integer
+    /// division, and profiling (`examples/task4_decode_profile.rs`, Task 4
+    /// report) found the per-iteration layered-update pass, not allocation
+    /// or wrapper overhead, dominates decode cost; precomputing this table
+    /// removes ~35,000 runtime modulo operations per iteration.
+    var_table: Vec<Vec<usize>>,
+}
+
+impl Default for NrBg2Decoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NrBg2Decoder {
+    pub fn new() -> Self {
+        Self::with_params(NR_DEFAULT_SCALE, NR_DEFAULT_MAX_ITERATIONS)
+    }
+
+    pub fn with_params(scale: f32, max_iterations: usize) -> Self {
+        let z = nr_bg2::ZC;
+        let mut rows_edges: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nr_bg2::BASE_ROWS];
+        for &(r, c, s) in nr_bg2::ENTRIES {
+            rows_edges[r].push((c, s));
+        }
+        let mut edge_offset = Vec::with_capacity(nr_bg2::BASE_ROWS);
+        let mut cum = 0usize;
+        for edges in &rows_edges {
+            edge_offset.push(cum);
+            cum += edges.len();
+        }
+
+        let var_table: Vec<Vec<usize>> = rows_edges
+            .iter()
+            .map(|edges| {
+                let deg = edges.len();
+                let mut table = vec![0usize; z * deg];
+                for i in 0..z {
+                    for (k, &(col, shift)) in edges.iter().enumerate() {
+                        table[i * deg + k] = col * z + (i + shift) % z;
+                    }
+                }
+                table
+            })
+            .collect();
+
+        Self {
+            scale,
+            max_iterations,
+            rows_edges,
+            edge_offset,
+            total_edges_unlifted: cum,
+            var_table,
+        }
+    }
+
+    /// Number of variable nodes in the full graph (`BASE_COLS * ZC` = 9152).
+    pub fn num_vars(&self) -> usize {
+        nr_bg2::BASE_COLS * nr_bg2::ZC
+    }
+
+    /// Decode. `full_llrs` must have length [`Self::num_vars`] (the *full*
+    /// graph, including the leading `PUNCTURED_INFO_COLS*ZC` always-erased
+    /// bits -- callers normally get this via
+    /// [`NrLdpc::decode_soft`](super::NrLdpc::decode_soft), which handles
+    /// that prepend). Returns `(posterior, iterations_used, converged)`.
+    pub fn decode(&self, full_llrs: &[f32]) -> (Vec<f32>, usize, bool) {
+        let z = nr_bg2::ZC;
+        let n = self.num_vars();
+        assert_eq!(
+            full_llrs.len(),
+            n,
+            "expected {n} full-graph LLRs, got {}",
+            full_llrs.len()
+        );
+
+        let mut total_llr = full_llrs.to_vec();
+        let mut check_to_var = vec![0.0f32; self.total_edges_unlifted * z];
+        let mut converged = false;
+        let mut iterations_used = 0;
+
+        for iter in 0..self.max_iterations {
+            iterations_used = iter + 1;
+            for (r, edges) in self.rows_edges.iter().enumerate() {
+                let deg = edges.len();
+                if deg == 0 {
+                    continue;
+                }
+                let base_edge = self.edge_offset[r];
+                let var_row = &self.var_table[r];
+
+                // Fixed-size stack buffers -- BG2's max row degree here is
+                // 10 (see nr_bg2 provenance docs' printed weights), but size
+                // generously; assert (not debug_assert) so an out-of-range
+                // degree can never silently corrupt memory in release
+                // builds (mirrors `LdpcDecoder`'s `check node degree`
+                // assert above).
+                assert!(
+                    deg <= 32,
+                    "base row {r} degree {deg} exceeds fixed buffer size 32"
+                );
+                let mut signs = [0.0f32; 32];
+                let mut mags = [0.0f32; 32];
+                let mut vars = [0usize; 32];
+                let mut old_msgs = [0.0f32; 32];
+
+                for i in 0..z {
+                    let row_base = i * deg;
+                    for k in 0..deg {
+                        let var = var_row[row_base + k];
+                        let edge_idx = (base_edge + k) * z + i;
+                        let old_msg = check_to_var[edge_idx];
+                        let extrinsic = total_llr[var] - old_msg;
+                        signs[k] = if extrinsic >= 0.0 { 1.0 } else { -1.0 };
+                        mags[k] = extrinsic.abs();
+                        vars[k] = var;
+                        old_msgs[k] = old_msg;
+                    }
+
+                    let total_sign: f32 = signs[..deg].iter().product();
+                    let (min1, min1_idx, min2) = two_smallest(&mags[..deg]);
+
+                    for k in 0..deg {
+                        let min_other = if k == min1_idx { min2 } else { min1 };
+                        let new_msg = (total_sign * signs[k] * min_other * self.scale)
+                            .clamp(-NR_MSG_CLAMP, NR_MSG_CLAMP);
+                        let edge_idx = (base_edge + k) * z + i;
+                        check_to_var[edge_idx] = new_msg;
+                        total_llr[vars[k]] = (total_llr[vars[k]] + (new_msg - old_msgs[k]))
+                            .clamp(-NR_MSG_CLAMP, NR_MSG_CLAMP);
+                    }
+                }
+            }
+
+            if self.check_syndrome(&total_llr) {
+                converged = true;
+                break;
+            }
+        }
+
+        (total_llr, iterations_used, converged)
+    }
+
+    fn check_syndrome(&self, total_llr: &[f32]) -> bool {
+        let z = nr_bg2::ZC;
+        for (r, edges) in self.rows_edges.iter().enumerate() {
+            let deg = edges.len();
+            let var_row = &self.var_table[r];
+            for i in 0..z {
+                let mut syn = 0u8;
+                let row_base = i * deg;
+                for k in 0..deg {
+                    let var = var_row[row_base + k];
+                    if total_llr[var] < 0.0 {
+                        syn ^= 1;
+                    }
+                }
+                if syn != 0 {
+                    let _ = r;
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Flooding-schedule variant of the same normalized min-sum decoder, kept
+/// only for the A/B comparison in the Task 4 report (iteration count /
+/// timing vs. the layered schedule above) -- not used by production code.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct NrBg2FloodingDecoder {
+    scale: f32,
+    max_iterations: usize,
+    rows_edges: Vec<Vec<(usize, usize)>>,
+    edge_offset: Vec<usize>,
+    total_edges_unlifted: usize,
+}
+
+#[cfg(test)]
+impl NrBg2FloodingDecoder {
+    pub(crate) fn with_params(scale: f32, max_iterations: usize) -> Self {
+        let mut rows_edges: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nr_bg2::BASE_ROWS];
+        for &(r, c, s) in nr_bg2::ENTRIES {
+            rows_edges[r].push((c, s));
+        }
+        let mut edge_offset = Vec::with_capacity(nr_bg2::BASE_ROWS);
+        let mut cum = 0usize;
+        for edges in &rows_edges {
+            edge_offset.push(cum);
+            cum += edges.len();
+        }
+        Self {
+            scale,
+            max_iterations,
+            rows_edges,
+            edge_offset,
+            total_edges_unlifted: cum,
+        }
+    }
+
+    pub(crate) fn decode(&self, full_llrs: &[f32]) -> (Vec<f32>, usize, bool) {
+        let z = nr_bg2::ZC;
+        let n = nr_bg2::BASE_COLS * z;
+        assert_eq!(full_llrs.len(), n);
+
+        let mut check_to_var = vec![0.0f32; self.total_edges_unlifted * z];
+        let mut total_llr = full_llrs.to_vec();
+        let mut converged = false;
+        let mut iterations_used = 0;
+
+        for iter in 0..self.max_iterations {
+            iterations_used = iter + 1;
+            let var_to_check_snapshot = {
+                // Flooding: all check updates for this iteration read the
+                // PREVIOUS iteration's posteriors (snapshot), unlike the
+                // layered decoder which updates in place row-by-row.
+                total_llr.clone()
+            };
+
+            let mut new_check_to_var = check_to_var.clone();
+            for (r, edges) in self.rows_edges.iter().enumerate() {
+                let deg = edges.len();
+                if deg == 0 {
+                    continue;
+                }
+                let base_edge = self.edge_offset[r];
+                let mut signs = [0.0f32; 32];
+                let mut mags = [0.0f32; 32];
+
+                for i in 0..z {
+                    for (k, &(col, shift)) in edges.iter().enumerate() {
+                        let var = col * z + (i + shift) % z;
+                        let edge_idx = (base_edge + k) * z + i;
+                        let extrinsic = var_to_check_snapshot[var] - check_to_var[edge_idx];
+                        signs[k] = if extrinsic >= 0.0 { 1.0 } else { -1.0 };
+                        mags[k] = extrinsic.abs();
+                    }
+                    let total_sign: f32 = signs[..deg].iter().product();
+                    let (min1, min1_idx, min2) = two_smallest(&mags[..deg]);
+                    for (k, &sign_k) in signs[..deg].iter().enumerate() {
+                        let min_other = if k == min1_idx { min2 } else { min1 };
+                        let edge_idx = (base_edge + k) * z + i;
+                        new_check_to_var[edge_idx] = (total_sign * sign_k * min_other * self.scale)
+                            .clamp(-NR_MSG_CLAMP, NR_MSG_CLAMP);
+                    }
+                }
+            }
+            check_to_var = new_check_to_var;
+
+            // Recompute all posteriors from scratch (flooding: one pass per
+            // iteration).
+            total_llr.copy_from_slice(full_llrs);
+            for (r, edges) in self.rows_edges.iter().enumerate() {
+                let base_edge = self.edge_offset[r];
+                for i in 0..z {
+                    for (k, &(col, shift)) in edges.iter().enumerate() {
+                        let var = col * z + (i + shift) % z;
+                        let edge_idx = (base_edge + k) * z + i;
+                        total_llr[var] = (total_llr[var] + check_to_var[edge_idx])
+                            .clamp(-NR_MSG_CLAMP, NR_MSG_CLAMP);
+                    }
+                }
+            }
+
+            if self.check_syndrome(&total_llr) {
+                converged = true;
+                break;
+            }
+        }
+
+        (total_llr, iterations_used, converged)
+    }
+
+    fn check_syndrome(&self, total_llr: &[f32]) -> bool {
+        let z = nr_bg2::ZC;
+        for edges in &self.rows_edges {
+            for i in 0..z {
+                let mut syn = 0u8;
+                for &(col, shift) in edges {
+                    let var = col * z + (i + shift) % z;
+                    if total_llr[var] < 0.0 {
+                        syn ^= 1;
+                    }
+                }
+                if syn != 0 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod nr_bg2_decoder_tests {
+    use super::*;
+    use crate::fec::ldpc::encoder::NrBg2Encoder;
+
+    fn full_codeword_llrs(
+        mother_len_full_including_punctured: usize,
+        full_codeword: &[u8],
+    ) -> Vec<f32> {
+        assert_eq!(full_codeword.len(), mother_len_full_including_punctured);
+        full_codeword
+            .iter()
+            .map(|&b| if b == 0 { 4.0 } else { -4.0 })
+            .collect()
+    }
+
+    fn encode_full(enc: &NrBg2Encoder, info: &[u8]) -> Vec<u8> {
+        let z = nr_bg2::ZC;
+        let punctured = nr_bg2::PUNCTURED_INFO_COLS;
+        let mother = enc.encode_mother(info);
+        let mut full = Vec::with_capacity(nr_bg2::BASE_COLS * z);
+        full.extend_from_slice(&info[..punctured * z]);
+        full.extend_from_slice(&mother);
+        full
+    }
+
+    #[test]
+    fn decodes_perfect_channel() {
+        let enc = NrBg2Encoder::new();
+        let dec = NrBg2Decoder::new();
+        let info: Vec<u8> = (0..nr_bg2::KB * nr_bg2::ZC)
+            .map(|i| (i % 2) as u8)
+            .collect();
+        let full = encode_full(&enc, &info);
+        let llrs = full_codeword_llrs(full.len(), &full);
+        let (posterior, _iters, converged) = dec.decode(&llrs);
+        assert!(converged);
+        let decoded_info: Vec<u8> = posterior[..info.len()]
+            .iter()
+            .map(|&l| if l >= 0.0 { 0 } else { 1 })
+            .collect();
+        assert_eq!(decoded_info, info);
+    }
+
+    #[test]
+    fn layered_and_flooding_agree_on_perfect_channel() {
+        let enc = NrBg2Encoder::new();
+        let info: Vec<u8> = (0..nr_bg2::KB * nr_bg2::ZC)
+            .map(|i| ((i * 5 + 1) % 2) as u8)
+            .collect();
+        let full = encode_full(&enc, &info);
+        let llrs = full_codeword_llrs(full.len(), &full);
+
+        let layered = NrBg2Decoder::new();
+        let flooding =
+            NrBg2FloodingDecoder::with_params(NR_DEFAULT_SCALE, NR_DEFAULT_MAX_ITERATIONS);
+
+        let (post_l, _iters_l, conv_l) = layered.decode(&llrs);
+        let (post_f, _iters_f, conv_f) = flooding.decode(&llrs);
+        assert!(conv_l && conv_f);
+
+        let hard = |p: &[f32]| -> Vec<u8> {
+            p[..info.len()]
+                .iter()
+                .map(|&l| if l >= 0.0 { 0 } else { 1 })
+                .collect()
+        };
+        assert_eq!(hard(&post_l), info);
+        assert_eq!(hard(&post_f), info);
+    }
+
+    /// Statistical diagnostic (not a pass/fail gate -- see the Task 4 report):
+    /// does the layered schedule's FER at a real noisy operating point match
+    /// its own flooding reference (same table, same alpha, same iteration
+    /// cap, same channel realizations)? If layered measurably *underperforms*
+    /// flooding here, that's a real layered-schedule bug, not a code-vs-code
+    /// coding-gain limit -- this isolates the schedule from every other
+    /// variable (rate matching, mapper, calibration all held fixed and
+    /// identical between the two runs).
+    ///
+    /// Uses level 2's k_used=972 at a fixed, deliberately-hard SNR (BPSK,
+    /// AWGN, mapped directly -- no OFDM, real-valued channel per
+    /// `coppa-bench`'s established `task3_fec_isolated_gate` convention) in
+    /// the waterfall region (bracketed empirically: 0.0 dB saturates both
+    /// decoders near 100% failure, 2.0 dB saturates both near 0%; 1.0 dB is
+    /// the discriminating point), so a schedule difference would actually
+    /// show up in the FER rather than being swamped by a floor/ceiling
+    /// effect. Note this test's SNR label uses the real-valued-channel
+    /// convention (matches `task3_fec_isolated_gate.rs`), NOT
+    /// `task4_bg2_ldpc_gate`'s generic-complex-symbol convention (which
+    /// applies noise to both I/Q components even for BPSK, matching how the
+    /// real OFDM receiver's per-carrier complex noise estimates work) --
+    /// the two conventions differ by close to 3 dB for BPSK specifically
+    /// (BPSK only carries information on one axis), so their SNR labels are
+    /// not directly comparable. See the Task 4 report for this finding.
+    #[test]
+    #[ignore = "statistical (500 trials); run manually: cargo test -p coppa-protocol --lib -- --ignored layered_matches_flooding_fer_at_noisy_operating_point --nocapture"]
+    fn layered_matches_flooding_fer_at_noisy_operating_point() {
+        use crate::fec::ldpc::rate_match::{rate_dematch, rate_match};
+        use crate::fec::ldpc::NrLdpc;
+        use crate::fec::scrambler::scramble;
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        const K_USED: usize = 972; // level 2
+        const PAYLOAD_BITS: usize = 964; // near-full capacity, matches the bench gate convention
+        const E: usize = 1944;
+        const SNR_DB: f32 = 1.0; // discriminating point in the waterfall region (real-channel convention)
+        const TRIALS: usize = 500;
+
+        let enc = NrBg2Encoder::new();
+        let layered = NrBg2Decoder::new();
+        let flooding =
+            NrBg2FloodingDecoder::with_params(NR_DEFAULT_SCALE, NR_DEFAULT_MAX_ITERATIONS);
+
+        let run = |dec_layered: bool, seed: u64| -> bool {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut info: Vec<u8> = (0..PAYLOAD_BITS)
+                .map(|_| rng.random_range(0..2u8))
+                .collect();
+            info.resize(nr_bg2::KB * nr_bg2::ZC, 0u8);
+            let truth = info.clone();
+            scramble(&mut info);
+            let mother = enc.encode_mother(&info);
+            let matched = rate_match(&mother, K_USED, E, 0);
+
+            // BPSK-map + AWGN directly (no OFDM), same convention as the
+            // isolated bench gate.
+            let noise_std = (10f32.powf(-SNR_DB / 10.0)).sqrt();
+            let mut rng2 = StdRng::seed_from_u64(seed ^ 0xA11CE);
+            let llrs: Vec<f32> = matched
+                .iter()
+                .map(|&b| {
+                    let base = if b == 0 { 1.0 } else { -1.0 };
+                    let u1: f32 = rng2.random::<f32>().max(1e-10);
+                    let u2: f32 = rng2.random();
+                    let noise = noise_std
+                        * (-2.0 * u1.ln()).sqrt()
+                        * (2.0 * std::f32::consts::PI * u2).cos();
+                    let rx = base + noise;
+                    4.0 * rx / (noise_std * noise_std)
+                })
+                .collect();
+
+            let mut dematched = rate_dematch(&llrs, K_USED, E, 0, NrLdpc::MOTHER_LEN);
+            crate::fec::ldpc::pin_known_pad(&mut dematched, PAYLOAD_BITS, K_USED, 64.0);
+
+            let punctured_len = nr_bg2::PUNCTURED_INFO_COLS * nr_bg2::ZC;
+            let mut full_llrs = Vec::with_capacity(nr_bg2::BASE_COLS * nr_bg2::ZC);
+            full_llrs.resize(punctured_len, 0.0f32);
+            full_llrs.extend_from_slice(&dematched);
+
+            let (posterior, _iters, converged) = if dec_layered {
+                layered.decode(&full_llrs)
+            } else {
+                flooding.decode(&full_llrs)
+            };
+            if !converged {
+                return false;
+            }
+            let mut decoded: Vec<u8> = posterior[..nr_bg2::KB * nr_bg2::ZC]
+                .iter()
+                .map(|&l| if l >= 0.0 { 0 } else { 1 })
+                .collect();
+            scramble(&mut decoded);
+            decoded[..PAYLOAD_BITS] == truth[..PAYLOAD_BITS]
+        };
+
+        let mut layered_fails = 0usize;
+        let mut flooding_fails = 0usize;
+        for t in 0..TRIALS {
+            let seed = 0xFEED_0000u64.wrapping_add(t as u64);
+            if !run(true, seed) {
+                layered_fails += 1;
+            }
+            if !run(false, seed) {
+                flooding_fails += 1;
+            }
+        }
+
+        println!(
+            "layered FER={}/{TRIALS} ({:.3}), flooding FER={}/{TRIALS} ({:.3})",
+            layered_fails,
+            layered_fails as f64 / TRIALS as f64,
+            flooding_fails,
+            flooding_fails as f64 / TRIALS as f64
+        );
+
+        // Layered must not be *meaningfully worse* than flooding (allow a
+        // small statistical margin, not an exact match -- both are
+        // stochastic and share only the channel realization, not identical
+        // internal message order). A layered schedule that's much worse
+        // than its own flooding reference indicates a schedule bug, not a
+        // code-vs-code limit.
+        assert!(
+            layered_fails <= flooding_fails + (TRIALS / 20), // 5% of TRIALS slack
+            "layered decoder ({layered_fails}/{TRIALS} failures) performs meaningfully worse than \
+             its own flooding reference ({flooding_fails}/{TRIALS} failures) at the same alpha/cap -- \
+             this points to a layered-schedule bug, not an inherent code-vs-code limit"
+        );
+    }
+
+    #[test]
+    fn decode_survives_pathological_llrs_without_nan() {
+        let dec = NrBg2Decoder::new();
+        let n = dec.num_vars();
+        let llrs: Vec<f32> = (0..n)
+            .map(|i| if i % 3 == 0 { 20.0 } else { -20.0 })
+            .collect();
+        let (posterior, _iters, converged) = dec.decode(&llrs);
+        assert!(!converged);
+        assert!(
+            posterior.iter().all(|v| v.is_finite()),
+            "posterior must never contain NaN/inf"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

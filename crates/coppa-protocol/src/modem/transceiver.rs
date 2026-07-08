@@ -1,25 +1,29 @@
 use std::collections::HashMap;
 
-use crate::fec::ldpc::LdpcCodec;
+use crate::fec::ldpc::{pin_known_pad, rate_match, NrLdpc};
 use crate::fec::scrambler::scramble;
-use crate::modem::speed_levels::speed_level_components;
+use crate::modem::speed_levels::{k_used_for_level, speed_level_components};
 use coppa_codec::ofdm::coppa_modem::{CoppaModem, SPEED_LEVELS};
 use coppa_codec::ofdm::frame::CoppaHeader;
 use coppa_codec::ofdm::interleaver::BlockInterleaver;
 use coppa_codec::ofdm::CoppaProfile;
 use coppa_codec::traits::ConstellationMapper;
 
-/// LDPC coded block length (Z=81, 24 base columns) — constant for all code rates.
+/// Coded block length: this codec's fixed OFDM/interleaver block size,
+/// rate-matched down from the NR BG2 mother code for every speed level (see
+/// `crate::fec::ldpc::rate_match`). Unchanged in value from the pre-Task-4
+/// per-rate 802.11 QC-LDPC codec (Z=81, 24 base columns also gave 1944), but
+/// now a fixed rate-matching target rather than an intrinsic per-code
+/// property.
 const CODED_BLOCK_LEN: usize = 1944;
 
-/// Cached per-speed-level components: building the LDPC codec, interleaver, and
+/// Cached per-speed-level components: building the interleaver and
 /// constellation mapper is ~0.105 ms and ~4801 allocs (~525 KB) per call — expensive
 /// enough that doing it on every single `transmit`/`receive` (as the pre-Task-7 code
 /// did) shows up directly in the per-frame decode budget. All of these depend only
 /// on the speed level + this transceiver's fixed profile, so they're built once, in
 /// `CoppaTransceiver::new`, for all 9 levels.
 struct LevelComponents {
-    codec: LdpcCodec,
     interleaver: BlockInterleaver,
     /// `ConstellationMapper` is only `: Send`, not `: Send + Sync` (see its
     /// definition in `coppa_codec::traits`), and `speed_level_components`
@@ -30,6 +34,9 @@ struct LevelComponents {
     /// bare `CoppaTransceiver` behind `Arc<CoppaTransceiver>` for shared
     /// concurrent access without wrapping it in a `Mutex` (or similar) first.
     mapper: Box<dyn ConstellationMapper + Send>,
+    /// Shortened NR BG2 mother-code info width for this level (Task 4) --
+    /// see `crate::modem::speed_levels::k_used_for_level`.
+    k_used: usize,
 }
 
 pub struct CoppaTransceiver {
@@ -46,8 +53,15 @@ pub struct CoppaTransceiver {
     /// attenuation at 100 Hz and 4 kHz, flat passband at 500 Hz), so no new
     /// tap-count derivation is needed for this filter specifically.
     rx_bpf: Option<coppa_dsp::fir::Fir>,
-    /// Per-speed-level cached codec/interleaver/mapper, built eagerly for all 9
-    /// levels in `new` (see `LevelComponents`'s doc).
+    /// **One** NR BG2 mother-code LDPC instance (Task 4), shared by every
+    /// speed level (rate-matched down per level instead of switching between
+    /// per-rate base matrices -- see `crate::fec::ldpc::NrLdpc` and
+    /// `rate_match`). Building the lifted graph + core-parity inverse is a
+    /// one-time cost amortized across every `transmit`/`receive` call, same
+    /// spirit as `LevelComponents` below (Task 7).
+    ldpc: NrLdpc,
+    /// Per-speed-level cached interleaver/mapper/k_used, built eagerly for
+    /// all 9 levels in `new` (see `LevelComponents`'s doc).
     codecs: HashMap<u8, LevelComponents>,
 }
 
@@ -113,21 +127,26 @@ impl CoppaTransceiver {
         });
         let modem = CoppaModem::new(profile.clone(), version);
 
-        // Eagerly build every speed level's codec/interleaver/mapper (see
+        // ONE NR BG2 mother-code instance for every speed level (Task 4) --
+        // see `NrLdpc`'s doc.
+        let ldpc = NrLdpc::new();
+
+        // Eagerly build every speed level's interleaver/mapper/k_used (see
         // `LevelComponents`'s doc). Reserved/invalid levels (e.g. 8) simply have no
         // entry in the map; `transmit`/`receive` treat a missing entry the same way
         // the old per-call `speed_level_components` lookup treated an `Err`.
         let mut codecs = HashMap::with_capacity(SPEED_LEVELS.len());
         for sl in SPEED_LEVELS.iter() {
-            if let Ok((mapper, code_rate)) = speed_level_components(sl.level) {
-                let codec = LdpcCodec::new(code_rate);
+            if let (Ok((mapper, _code_rate)), Some(k_used)) =
+                (speed_level_components(sl.level), k_used_for_level(sl.level))
+            {
                 let interleaver = BlockInterleaver::new(CODED_BLOCK_LEN, profile.data_carriers);
                 codecs.insert(
                     sl.level,
                     LevelComponents {
-                        codec,
                         interleaver,
                         mapper,
+                        k_used,
                     },
                 );
             }
@@ -137,6 +156,7 @@ impl CoppaTransceiver {
             modem,
             profile,
             rx_bpf,
+            ldpc,
             codecs,
         }
     }
@@ -160,27 +180,41 @@ impl CoppaTransceiver {
             .codecs
             .get(&header.speed_level)
             .expect("invalid speed level in header");
+        let k_used = comp.k_used;
 
-        // 1. LDPC encode
-        let info_bits = comp.codec.code().info_bits();
-        let mut payload_bits = Vec::with_capacity(info_bits);
+        // 1. Build the fixed-width (1760-bit) NR BG2 mother-code info block:
+        //    payload bits, truncated to this level's k_used capacity (matches
+        //    the pre-Task-4 per-rate codec's silent-truncation behavior for an
+        //    oversized payload), zero-padded out to k_used, then zero-padded
+        //    further out to the mother code's full fixed info width (the
+        //    shortened tail beyond k_used, never transmitted -- see
+        //    `crate::fec::ldpc::rate_match`). The whole 1760-bit block is
+        //    scrambled to randomize zero-padding (prevents degenerate LDPC
+        //    codewords).
+        let mut info_bits = Vec::with_capacity(NrLdpc::INFO_LEN);
         for &byte in payload {
             for shift in (0..8).rev() {
-                payload_bits.push((byte >> shift) & 1);
+                info_bits.push((byte >> shift) & 1);
             }
         }
-        payload_bits.resize(info_bits, 0u8);
-        // Scramble info bits to randomize zero-padding (prevents degenerate LDPC codewords)
-        scramble(&mut payload_bits);
-        let coded_bits = comp.codec.encode(&payload_bits);
+        info_bits.resize(k_used, 0u8);
+        info_bits.resize(NrLdpc::INFO_LEN, 0u8);
+        scramble(&mut info_bits);
 
-        // 2. Interleave
+        // 2. NR BG2 encode: fixed 1760-bit info -> 8800-bit mother codeword.
+        let mother = self.ldpc.encode(&info_bits);
+
+        // 3. Rate match: mother codeword -> CODED_BLOCK_LEN=1944 coded bits
+        //    for this level's k_used (RV0 -- Phase 2 doesn't use HARQ-IR).
+        let coded_bits = rate_match::rate_match(&mother, k_used, CODED_BLOCK_LEN, 0);
+
+        // 4. Interleave
         let interleaved = comp.interleaver.interleave(&coded_bits);
 
-        // 3. Constellation map
+        // 5. Constellation map
         let symbols = comp.mapper.map_bits(&interleaved);
 
-        // 4. OFDM modulate
+        // 6. OFDM modulate
         // Look up PAPR target from speed level table
         let sl = SPEED_LEVELS
             .iter()
@@ -295,36 +329,48 @@ impl CoppaTransceiver {
         }
 
         // 4. De-interleave
-        let mut deinterleaved = comp.interleaver.deinterleave(&llrs);
+        let deinterleaved = comp.interleaver.deinterleave(&llrs);
 
-        // Known-bit pinning: info bits beyond the payload are zero-padded then scrambled
-        // on TX, so RX knows their exact values -- pin to ±PIN (effective code shortening;
-        // worth 1.5-3 dB on short payloads).
+        // 5. Rate dematch: scatter the E=1944 received LLRs back into a
+        // mother-length (8800) LLR buffer. Positions never observed --
+        // including the shortened tail beyond k_used -- are left at 0.0.
+        let k_used = comp.k_used;
+        let mut dematched = rate_match::rate_dematch(
+            &deinterleaved,
+            k_used,
+            CODED_BLOCK_LEN,
+            0,
+            NrLdpc::MOTHER_LEN,
+        );
+
+        // Known-bit pinning (Task 3, extended in Task 4): info bits beyond the
+        // payload are zero-padded then scrambled on TX, so RX knows their
+        // exact values -- pin to +/-PIN (effective code shortening; worth
+        // 1.5-3 dB on short payloads). Covers *both* the shortened-but-
+        // transmitted padding (payload_bits..k_used) and the never-
+        // transmitted shortened tail (k_used..KB*ZC, i.e. the dematch
+        // buffer's shortened region, which `rate_dematch` otherwise leaves
+        // at 0.0) in one pass -- see `pin_known_pad`'s doc.
         const PIN: f32 = 64.0;
-        let info_bits = comp.codec.code().info_bits();
         let payload_bits = (header.payload_len as usize) * 8;
-        if payload_bits < info_bits {
-            let pad_prbs = crate::fec::scrambler::prbs_bits(info_bits);
-            for (i, &prbs_bit) in pad_prbs
-                .iter()
-                .enumerate()
-                .take(info_bits)
-                .skip(payload_bits)
-            {
-                deinterleaved[i] = if prbs_bit == 0 { PIN } else { -PIN };
-            }
+        if payload_bits > k_used {
+            // A corrupted header claiming a payload larger than this level's
+            // shortened capacity can't be genuine -- treat as header corruption
+            // rather than let `pin_known_pad`'s invariant assert panic.
+            return Err(ReceiveError::HeaderCorrupt);
         }
+        pin_known_pad(&mut dematched, payload_bits, k_used, PIN);
 
-        // 5. LDPC decode
-        let (mut decoded_bits, converged) = comp.codec.decode_checked(&deinterleaved);
+        // 6. NR BG2 layered decode
+        let (_, mut decoded_bits, converged, iterations) = self.ldpc.decode_soft_stats(&dematched);
         // Descramble to undo TX-side scrambling
         scramble(&mut decoded_bits);
 
         if !converged {
-            return Err(ReceiveError::LdpcNotConverged { iterations: 50 });
+            return Err(ReceiveError::LdpcNotConverged { iterations });
         }
 
-        // 6. Extract payload bytes
+        // 7. Extract payload bytes
         let payload_len = header.payload_len as usize;
         let mut payload = Vec::with_capacity(payload_len);
         for chunk in decoded_bits.chunks(8) {
@@ -611,39 +657,41 @@ mod tests {
 
     /// Step 1(c): the pinned positions computed in `receive` must equal the
     /// pad's actual scrambled (transmitted) value, for every position beyond
-    /// the payload. Replicates `transmit`'s exact `payload_bits` construction
-    /// (real payload bits + zero pad, whole vector scrambled) as ground truth,
-    /// then checks it against `prbs_bits(info_bits)` at the same indices --
-    /// this is exactly what `receive`'s pinning block relies on (see its
-    /// "Known-bit pinning" comment).
+    /// the payload. Replicates `transmit`'s exact `info_bits` construction
+    /// (real payload bits + zero pad out to k_used + zero pad out to the
+    /// fixed NR BG2 mother-code info width, whole vector scrambled) as ground
+    /// truth, then checks it against `prbs_bits(NrLdpc::INFO_LEN)` at the
+    /// same indices -- this is exactly what `receive`'s `pin_known_pad` call
+    /// relies on (Task 3, extended for the mother code in Task 4).
     #[test]
     fn known_pad_prbs_matches_scrambled_pad_ground_truth() {
         let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
         let comp = tx.codecs.get(&2).expect("level 2 must exist"); // BPSK 1/2
-        let info_bits = comp.codec.code().info_bits();
+        let k_used = comp.k_used;
         let payload_bytes = 20usize;
         let payload_bits_count = payload_bytes * 8;
         assert!(
-            payload_bits_count < info_bits,
-            "test assumes real padding exists (972-bit info, 160 real bits)"
+            payload_bits_count < k_used,
+            "test assumes real padding exists within k_used"
         );
 
-        // Ground truth: exactly replicate `transmit`'s payload_bits construction.
+        // Ground truth: exactly replicate `transmit`'s info_bits construction.
         let payload = vec![0xA5u8; payload_bytes];
-        let mut payload_bits = Vec::with_capacity(info_bits);
+        let mut info_bits = Vec::with_capacity(NrLdpc::INFO_LEN);
         for &byte in &payload {
             for shift in (0..8).rev() {
-                payload_bits.push((byte >> shift) & 1);
+                info_bits.push((byte >> shift) & 1);
             }
         }
-        payload_bits.resize(info_bits, 0u8);
-        scramble(&mut payload_bits);
+        info_bits.resize(k_used, 0u8);
+        info_bits.resize(NrLdpc::INFO_LEN, 0u8);
+        scramble(&mut info_bits);
 
-        let pad_prbs = crate::fec::scrambler::prbs_bits(info_bits);
+        let pad_prbs = crate::fec::scrambler::prbs_bits(NrLdpc::INFO_LEN);
         assert_eq!(
-            &payload_bits[payload_bits_count..],
+            &info_bits[payload_bits_count..],
             &pad_prbs[payload_bits_count..],
-            "prbs_bits(info_bits)'s pad-region tail must match transmit()'s actual \
+            "prbs_bits(NrLdpc::INFO_LEN)'s pad-region tail must match transmit()'s actual \
              scrambled pad -- this is the ground truth `receive`'s pinning relies on"
         );
     }
