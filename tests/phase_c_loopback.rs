@@ -3,15 +3,19 @@
 use coppa_codec::ofdm::coppa_modem::SPEED_LEVELS;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_codec::ofdm::CoppaProfile;
-use coppa_protocol::modem::speed_levels::speed_level_components;
+use coppa_protocol::modem::speed_levels::k_used_for_level;
 use coppa_protocol::modem::CoppaTransceiver;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+/// Max payload capacity for a speed level: the NR BG2 mother code's
+/// shortened `k_used` info width for that level (Task 4), in bytes. Was
+/// `code_rate.info_bits()/8` pre-Task-4 (the old per-rate 802.11 QC-LDPC
+/// codec's info width, which for level 10 was 1701 bits/7/8 rate; the new
+/// mother code's level 10 is 1620 bits/5/6 rate -- a wire-format break, see
+/// `CLAUDE.md`'s Known Limitations and this task's ADR).
 fn max_payload_bytes(wire_level: u8) -> usize {
-    let (_, code_rate) = speed_level_components(wire_level).unwrap();
-    let info_bits = code_rate.info_bits();
-    info_bits / 8
+    k_used_for_level(wire_level).unwrap() / 8
 }
 
 fn make_header(speed_level: u8, payload_len: u16) -> CoppaHeader {
@@ -112,8 +116,13 @@ fn test_level_9_64qam_rate_2_3() {
 }
 
 #[test]
-#[ignore = "known LDPC non-convergence at 64-QAM levels 9/10 — see CLAUDE.md Known Limitations"]
-fn test_level_10_64qam_rate_7_8() {
+fn test_level_10_64qam_rate_5_6() {
+    // Renamed from `rate_7_8`: Task 4's k_used table moved level 10 from
+    // 7/8 to 5/6 (wire-format break, see CLAUDE.md's Known Limitations).
+    // The #[ignore] main previously had here (routing around the old
+    // per-rate LDPC codec's level-9/10 non-convergence) is removed: Task 4's
+    // NR BG2 mother code fixes this — verified via a fresh
+    // test_snr_fer_monte_carlo run showing FER=0.00 at every level 1-10.
     loopback_test(10, &[0x78; 150]);
 }
 
