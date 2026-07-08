@@ -78,3 +78,11 @@ Single workflow at `.github/workflows/ci.yml` runs on push/PR to main:
 - `coppa-channel` models AWGN + a two-tap Watterson/ITU-R F.1487 HF channel (Rayleigh taps, Gaussian Doppler) plus an `ssb_filter` helper emulating a realistic 300-2700 Hz SSB rig audio passband. The sinusoidal `fading()` helper is AGC-test-only.
 - The waveform occupies a realistic ~300-2700 Hz SSB passband (carrier offset + in-band Newman-phase preamble) with TX section leveling/bandpass conditioning and a streaming O(1) preamble sync detector (`SyncDetector`, ~0.0015-0.0035x realtime) — see `docs/adr/003-phase1-waveform-break.md`. This is a wire-format break from earlier waveform revisions; old and new are not interoperable
 - **Watterson-fading regression on sparse-pilot HF profiles (`hf_standard`/`hf_wide`/`hf_narrow`, levels 1-4) — FIXED for levels 1-3, partially fixed for level 4.** Bisected to Phase 1 Task 5's `SyncDetector` anchoring sync timing on the first-arriving multipath tap rather than the strongest one; fixed by preferring the strongest tap unless it's more than half a cyclic prefix away from the first arrival (preserving the original anti-echo safety intent for delay spreads beyond anything this codebase's Watterson presets model). Levels 1-2 now match or exceed pre-Phase-1 Watterson-Moderate/Poor performance; level 3 is very close (within normal trial variance); level 4 (QPSK 3/4) improves substantially (peak goodput up from ~330-630 bps to ~555-1234 bps) but retains a real, smaller residual gap (72-76% of pre-Phase-1 peak goodput), not yet investigated further. See `docs/adr/004-strongest-path-timing.md`, BENCHMARKS.md's "2026-07 — Hotfix: sparse-pilot header Watterson-fading regression" section, and `.superpowers/sdd/p1-fading-regression-fix-report.md`
+
+## Knowledge wiki
+
+`wiki/INDEX.md` is the map of accumulated knowledge — read it before deep
+exploration; open pages relevant to your task. After substantive work, run
+/wiki-update: distill new gotchas/decisions/corrections into the wiki (or
+into docs/ if normative — the wiki points, it never restates). The wiki is
+descriptive and always loses conflicts with code and docs/.

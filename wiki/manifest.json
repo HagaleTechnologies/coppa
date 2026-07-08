@@ -1,0 +1,302 @@
+{
+  "generated_at": "2026-07-07T22:17:27Z",
+  "head_commit": "c1d2676",
+  "pages": [
+    {
+      "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
+      "id": "adr-001-workspace-layout",
+      "kind": "decision-digest",
+      "links": [
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/adr-001-workspace-layout.md",
+      "sources": [
+        "docs/adr/001-workspace-layout.md"
+      ],
+      "status": "current",
+      "title": "Why is coppa a 12-crate Cargo workspace?",
+      "verified_commit": "c1d2676",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:3de737f89acdd20aaadd17892016414a0617d48594a1958bc91c8e79fa843971",
+      "id": "adr-002-fec-strategy",
+      "kind": "decision-digest",
+      "links": [
+        "overview",
+        "coppa-protocol",
+        "ldpc-non-convergence"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/adr-002-fec-strategy.md",
+      "sources": [
+        "docs/adr/002-fec-strategy.md",
+        "crates/coppa-protocol/src/fec/**"
+      ],
+      "status": "current",
+      "title": "Why does coppa use both convolutional and LDPC codes?",
+      "verified_commit": "c1d2676",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:884e3d0f197d73d91fdbab63fab3eb759bbeb852fab2f835a7a88511f3f24416",
+      "id": "adr-003-waveform-break",
+      "kind": "decision-digest",
+      "links": [
+        "overview",
+        "waveform-wire-break",
+        "adr-004-strongest-path-timing"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/adr-003-waveform-break.md",
+      "sources": [
+        "docs/adr/003-phase1-waveform-break.md",
+        "BENCHMARKS.md"
+      ],
+      "status": "current",
+      "title": "Why does Phase 1 break the waveform and what changed?",
+      "verified_commit": "c1d2676",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:d3aeb14d2a024d73f6e55a29f86211d6cd2297fe4945ffa6385ff2d6156e4fd0",
+      "id": "adr-004-strongest-path-timing",
+      "kind": "decision-digest",
+      "links": [
+        "overview",
+        "adr-003-waveform-break",
+        "watterson-level-4-gap"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/adr-004-strongest-path-timing.md",
+      "sources": [
+        "docs/adr/004-strongest-path-timing.md",
+        "crates/coppa-codec/src/ofdm/sync_detector.rs"
+      ],
+      "status": "current",
+      "title": "Why does SyncDetector prefer the strongest multipath tap, not the first?",
+      "verified_commit": "c1d2676",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:1e8cc90c7f275ce69fd4c89e93f1cc924b86c12dc632b990ee5fe31751fa5737",
+      "id": "band-conventions",
+      "kind": "interface",
+      "links": [
+        "overview",
+        "coppa-engine"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/band-conventions.md",
+      "sources": [
+        "CLAUDE.md",
+        "crates/coppa-engine/src/**",
+        "crates/coppa-codec/src/ofdm/**"
+      ],
+      "status": "current",
+      "title": "What band and sample-rate conventions does coppa use?",
+      "verified_commit": "c1d2676",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:2e5535309e731793b2f70c8431ff924cf3960ecd46e4e24ce0d0208ef153c6bb",
+      "id": "coppa-dsp",
+      "kind": "subsystem",
+      "links": [
+        "overview",
+        "coppa-dsp-skimmer-interface"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/coppa-dsp.md",
+      "sources": [
+        "crates/coppa-dsp/**"
+      ],
+      "status": "current",
+      "title": "How does coppa-dsp work and what does it expose?",
+      "verified_commit": "c1d2676",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:5a42cb5106558549a4be135fd475d64f0460c0d274c6005625f2b4eef7a95b5d",
+      "id": "coppa-dsp-skimmer-interface",
+      "kind": "interface",
+      "links": [
+        "coppa-dsp",
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/coppa-dsp-skimmer-interface.md",
+      "sources": [
+        "crates/coppa-dsp/src/**"
+      ],
+      "status": "current",
+      "title": "What contract does coppa-dsp expose to skimmer?",
+      "verified_commit": "c1d2676",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:3bb1d4fe2ca6575fcffac70d8becdbcdd41587af5693f57c6be0e3749e3d4149",
+      "id": "coppa-engine",
+      "kind": "subsystem",
+      "links": [
+        "overview",
+        "coppa-protocol"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/coppa-engine.md",
+      "sources": [
+        "crates/coppa-engine/**",
+        "crates/coppa-protocol/src/**"
+      ],
+      "status": "current",
+      "title": "How does coppa-engine orchestrate the modem pipeline?",
+      "verified_commit": "c1d2676",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:6ee961d75e700d018a2eeb2bec8bd0e7bcd57a49092653d863b9a78f98171a8c",
+      "id": "coppa-protocol",
+      "kind": "subsystem",
+      "links": [
+        "overview",
+        "adr-002-fec-strategy",
+        "ldpc-non-convergence"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/coppa-protocol.md",
+      "sources": [
+        "crates/coppa-protocol/**"
+      ],
+      "status": "current",
+      "title": "How does coppa-protocol handle framing, FEC, and ARQ?",
+      "verified_commit": "c1d2676",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:4c050d6d7a647fae7d4c6c50a7f88b27bb6c062f05317af61a6e419702923cb7",
+      "id": "cpal-feature-gate",
+      "kind": "gotcha",
+      "links": [
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/cpal-feature-gate.md",
+      "sources": [
+        "crates/coppa-audio/Cargo.toml",
+        "crates/coppa-daemon/src/**"
+      ],
+      "status": "current",
+      "title": "What will bite you about the cpal-backend feature flag?",
+      "verified_commit": "c1d2676",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:a221079c12b5d4990b83d05dd02a20a34c458320b91f078722133105ea157eff",
+      "id": "ldpc-non-convergence",
+      "kind": "gotcha",
+      "links": [
+        "coppa-protocol",
+        "adr-002-fec-strategy"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/ldpc-non-convergence.md",
+      "sources": [
+        "crates/coppa/tests/phase_c_loopback.rs",
+        "crates/coppa-protocol/src/fec/ldpc/**"
+      ],
+      "status": "current",
+      "title": "What will bite you about LDPC at speed levels 9 and 10?",
+      "verified_commit": "c1d2676",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:80c604736a9406e16ad5efebf4c5e949e1dabe8a3066e79c0b18dfeebba3435c",
+      "id": "overview",
+      "kind": "overview",
+      "links": [],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/overview.md",
+      "sources": [
+        "README.md",
+        "ARCHITECTURE.md",
+        "CLAUDE.md"
+      ],
+      "status": "current",
+      "title": "Coppa \u2014 what is this and where do things live?",
+      "verified_commit": "c1d2676",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:f95a1d35538c1e6e48fb4699080bb5c497408adf3d90b517b931d1ccf640788f",
+      "id": "watterson-level-4-gap",
+      "kind": "gotcha",
+      "links": [
+        "adr-004-strongest-path-timing",
+        "adr-003-waveform-break"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/watterson-level-4-gap.md",
+      "sources": [
+        "docs/adr/004-strongest-path-timing.md",
+        "crates/coppa-codec/src/ofdm/sync_detector.rs",
+        ".superpowers/sdd/p1-fading-regression-fix-report.md",
+        "BENCHMARKS.md"
+      ],
+      "status": "current",
+      "title": "What will bite you about Watterson fading at speed level 4?",
+      "verified_commit": "c1d2676",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:4999ff9bd999509270b56c25719b41525eb5dcfcc6d5b7f09b1059c0441f5479",
+      "id": "waveform-wire-break",
+      "kind": "gotcha",
+      "links": [
+        "adr-003-waveform-break",
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/waveform-wire-break.md",
+      "sources": [
+        "docs/adr/003-phase1-waveform-break.md",
+        "crates/coppa-codec/src/ofdm/**"
+      ],
+      "status": "current",
+      "title": "What will bite you about waveform compatibility with pre-Phase-1 code?",
+      "verified_commit": "c1d2676",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    }
+  ],
+  "repo": "coppa",
+  "schema": "wiki-manifest/v1",
+  "visibility": "public"
+}

@@ -127,12 +127,22 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  wiki-lint:
+    name: Wiki lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Clone sunto
+        run: git clone https://github.com/HagaleTechnologies/sunto.git /tmp/sunto
+      - name: Lint wiki
+        run: python3 /tmp/sunto/bin/wiki-lint wiki/
+
   # Summary gate for branch protection. bench-fuzz and platform are excluded:
   # bench-fuzz is compile-only (slow, no test signal) and platform is a matrix
   # job that duplicates linux coverage already in test-full/test-features.
   ci:
     name: CI
-    needs: [check, test-features, test-full, clippy, fmt, msrv, deny, audit]
+    needs: [check, test-features, test-full, clippy, fmt, msrv, deny, audit, wiki-lint]
     runs-on: ubuntu-latest
     if: always()
     steps:

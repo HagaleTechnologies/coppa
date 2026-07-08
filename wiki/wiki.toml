@@ -1,0 +1,4 @@
+schema = "wiki-config/v1"
+repo = "coppa"
+# public | private
+visibility = "public"
