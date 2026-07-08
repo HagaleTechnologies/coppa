@@ -10,7 +10,7 @@ use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::modem::transceiver::{CoppaTransceiver, ReceiveError};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 const FS: f32 = 48_000.0;
 

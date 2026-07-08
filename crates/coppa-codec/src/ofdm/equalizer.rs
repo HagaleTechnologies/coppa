@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn test_equalize_frequency_selective_with_noise() {
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
 
         let num_carriers = 16;
         let mut est = LinearInterpolationEstimator::new(num_carriers);

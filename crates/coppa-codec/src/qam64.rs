@@ -164,7 +164,7 @@ impl ConstellationMapper for Qam64Mapper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
+    use rand::RngExt;
 
     #[test]
     fn test_64qam_roundtrip() {

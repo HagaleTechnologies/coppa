@@ -728,7 +728,7 @@ mod tests {
     #[test]
     fn test_ofdm_roundtrip_with_awgn() {
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
 
         let profile = OfdmProfile::HF_STANDARD;
         let modulator = OfdmModulator::new(profile.clone());

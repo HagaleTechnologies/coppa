@@ -551,7 +551,7 @@ impl KalmanLagSmoother {
 mod tests {
     use super::*;
     use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
 
     #[test]
     fn recursion_converges_correctly_for_independent_observations_of_a_static_channel() {

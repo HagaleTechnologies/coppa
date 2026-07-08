@@ -15,7 +15,7 @@ use coppa_protocol::fec::scrambler::scramble;
 use coppa_protocol::modem::speed_levels::{speed_level_components, speed_level_entry};
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::fmt::Write as _;
 
 use crate::scenario::{mode_for_level, select_profile, ChannelSpec, SAMPLE_RATE};
