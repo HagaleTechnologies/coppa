@@ -456,6 +456,7 @@ dependencies = [
  "coppa-dsp",
  "crc",
  "lz4_flex",
+ "num-complex",
  "proptest",
  "rand",
 ]

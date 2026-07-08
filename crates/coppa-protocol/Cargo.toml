@@ -12,6 +12,7 @@ coppa-dsp = { path = "../coppa-dsp" }
 anyhow = { workspace = true }
 crc = { workspace = true }
 lz4_flex = { workspace = true }
+num-complex = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }

@@ -99,6 +99,26 @@ pub fn rate_match(mother: &[u8], k_used: usize, e: usize, rv: u8) -> Vec<u8> {
     (0..e).map(|i| buf[(k0 + i) % buf_len]).collect()
 }
 
+/// Same circular-buffer selection as [`rate_match`], but for soft LLR values
+/// (`f32`) instead of hard bits (`u8`). Used by Task 5's turbo re-estimation:
+/// `NrLdpc::decode_soft`'s posterior LLRs live in the same mother-codeword
+/// domain [`rate_match`]'s input does (see that function's caller in
+/// `CoppaTransceiver::receive_with_metrics`), and to build "virtual pilot" soft
+/// symbols in the same wire/interleaved order the original transmission used,
+/// the posterior must be selected down to the `E`-length coded-bit-order slice
+/// exactly the way the original coded bits were -- i.e. this exact index
+/// selection, just carried through in the LLR domain instead of discarding it
+/// via a hard decision first.
+///
+/// # Panics
+/// See [`matching_buffer`] and [`k0_offset`].
+pub fn rate_match_llr(mother_llrs: &[f32], k_used: usize, e: usize, rv: u8) -> Vec<f32> {
+    let buf = matching_buffer(mother_llrs, k_used);
+    let buf_len = buf.len();
+    let k0 = k0_offset(buf_len, rv);
+    (0..e).map(|i| buf[(k0 + i) % buf_len]).collect()
+}
+
 /// Inverse of [`rate_match`]: scatter `E` received LLRs back into a
 /// mother-length LLR buffer. Positions never observed (including the
 /// shortened tail `k_used..KB*ZC`, which this function deliberately leaves
@@ -246,6 +266,31 @@ mod tests {
                     llr, 0.0,
                     "k_used={k_used}: shortened tail must be left at 0.0"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn rate_match_llr_selects_the_same_indices_as_rate_match() {
+        // Build a mother "codeword" of distinct float values (position index as
+        // the value) so any index-selection mismatch between the bit and LLR
+        // paths shows up directly as a value mismatch.
+        let mother_f: Vec<f32> = (0..MOTHER_LEN).map(|i| i as f32).collect();
+        let mother_b: Vec<u8> = (0..MOTHER_LEN).map(|i| (i % 2) as u8).collect();
+        for &k_used in &ALL_K_USED {
+            for rv in 0..=3u8 {
+                let sel_f = rate_match_llr(&mother_f, k_used, E, rv);
+                let sel_b = rate_match(&mother_b, k_used, E, rv);
+                assert_eq!(sel_f.len(), E);
+                for i in 0..E {
+                    // sel_f[i] is the ORIGINAL MOTHER_LEN index that was selected;
+                    // sel_b[i] must be mother_b at that exact same index.
+                    let idx = sel_f[i] as usize;
+                    assert_eq!(
+                        sel_b[i], mother_b[idx],
+                        "k_used={k_used} rv={rv} i={i}: LLR and bit paths selected different indices"
+                    );
+                }
             }
         }
     }

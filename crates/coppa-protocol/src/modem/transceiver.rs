@@ -1,5 +1,9 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 
+use num_complex::Complex32;
+
+use crate::fec::ldpc::nr_bg2;
 use crate::fec::ldpc::{pin_known_pad, rate_match, NrLdpc};
 use crate::fec::scrambler::scramble;
 use crate::modem::speed_levels::{k_used_for_level, speed_level_components};
@@ -8,6 +12,145 @@ use coppa_codec::ofdm::frame::CoppaHeader;
 use coppa_codec::ofdm::interleaver::BlockInterleaver;
 use coppa_codec::ofdm::CoppaProfile;
 use coppa_codec::traits::ConstellationMapper;
+
+/// One-round "turbo" re-estimation soft-symbol closed forms (Task 5).
+///
+/// When the first LDPC decode attempt fails to converge, its posterior LLRs
+/// (over the coded bits) are turned into soft "virtual pilot" symbols -- the
+/// same `x̄ = E[x | LLRs]` expectation a genuine pilot symbol would give the
+/// channel estimator, just derived from the decoder's current best guess
+/// instead of a known TX value -- and fed back into
+/// `CoppaModem::reequalize_with_virtual_pilots` as extra weighted
+/// observations before a single retry demap/decode.
+///
+/// All bit-LLR inputs use this codebase's universal convention (see
+/// `coppa_codec::traits::ConstellationMapper::demap_soft`'s doc): positive LLR
+/// means the bit is more likely 0. Under that convention `E[1-2b] =
+/// tanh(L/2)` for a single bit `b` with LLR `L` (standard sigmoid-posterior
+/// identity), which is the building block every closed form below composes.
+///
+/// BPSK/QPSK are transcribed directly from the task brief (already exact/
+/// correct there). PAM4 (16-QAM's per-axis 2-bit mapping) and the 64-QAM
+/// per-axis (3-bit) form are DERIVED here from the actual Gray tables in
+/// `coppa_codec::qam16`/`coppa_codec::qam64` (not transcribed from the
+/// brief's intentionally-incomplete sketch) -- see the derivation comments
+/// below and the brute-force-verified unit tests in this module's `tests`.
+/// BPSK bit 0 -> +1 (matches `coppa_codec::bpsk::BpskMapper`).
+fn soft_symbol_bpsk(l: f32) -> Complex32 {
+    Complex32::new((l / 2.0).tanh(), 0.0)
+}
+
+/// QPSK: `coppa_codec::qpsk::QpskMapper` maps `(b0,b1)` to
+/// `SCALE*(1-2*b1, 1-2*b0)` (`b0` sets the imaginary sign, `b1` the real
+/// sign -- see that mapper's doc/`CONSTELLATION` table). `l_b0`/`l_b1` are
+/// `b0`'s/`b1`'s LLRs.
+fn soft_symbol_qpsk(l_b0: f32, l_b1: f32) -> Complex32 {
+    let s = std::f32::consts::FRAC_1_SQRT_2;
+    Complex32::new(s * (l_b1 / 2.0).tanh(), s * (l_b0 / 2.0).tanh())
+}
+
+/// Gray PAM-4 axis expectation (one 16-QAM axis, 2 LLRs, levels `{+-1,+-3}/
+/// sqrt(10)`).
+///
+/// # Derivation from `coppa_codec::qam16::Qam16Mapper`'s actual table
+///
+/// `Qam16Mapper::bits_to_level(b_msb, b_lsb)` computes `idx = (b_msb<<1)|b_lsb`
+/// and returns `LEVEL[idx]*NORM` with `LEVEL = [3,1,-1,-3]`. Writing
+/// `x = 1-2*b_msb`, `y = 1-2*b_lsb` (each in `{+1,-1}`), the 4 `(x,y) ->
+/// unnormalized level` pairs are `(1,1)->3, (1,-1)->1, (-1,1)->-1,
+/// (-1,-1)->-3`. Solving the bilinear system `level = a + b*x + c*y + d*x*y`
+/// against these 4 points gives the EXACT identity (no residual/cross term):
+/// `level = 2*x + y` (verified: `(1,1)->2+1=3`, `(1,-1)->2-1=1`,
+/// `(-1,1)->-2+1=-1`, `(-1,-1)->-2-1=-3`). Since `d=0`, `E[level] = 2*E[x] +
+/// E[y] = 2*tanh(l_msb/2) + tanh(l_lsb/2)` is EXACT (not merely a leading-order
+/// approximation) under the assumed bit independence -- confirmed against a
+/// brute-force `sum_x x*P(x|LLRs)` reference in this module's tests to
+/// 1e-6-level agreement (float-rounding only).
+fn soft_pam4(l_msb: f32, l_lsb: f32) -> f32 {
+    let norm = 1.0 / 10.0f32.sqrt(); // matches qam16::NORM (kept independent to avoid a cross-crate `pub` just for a test constant)
+    (2.0 * (l_msb / 2.0).tanh() + (l_lsb / 2.0).tanh()) * norm
+}
+
+/// Gray 64-QAM axis expectation (one axis, 3 LLRs, levels `{+-1,+-3,+-5,+-7}/
+/// sqrt(42)`) -- the brief's "same per-axis approach with 3 LLRs/axis" for
+/// 64-QAM.
+///
+/// # Derivation from `coppa_codec::qam64::Qam64Mapper`'s actual table
+///
+/// `Qam64Mapper::bits_to_level(b0,b1,b2)` Gray-encodes `(b0,b1,b2)` through
+/// `GRAY_TO_IDX = [0,1,3,2,7,6,4,5]` into `LEVEL = [7,5,3,1,-1,-3,-5,-7]`.
+/// Writing `x=1-2*b0, y=1-2*b1, z=1-2*b2`, tabulating all 8 `(x,y,z) ->
+/// unnormalized level` points and solving the exact `2^3`-term Walsh-Hadamard
+/// expansion `level = a + b*x + c*y + d*z + e*xy + f*xz + g*yz + h*xyz`
+/// against them gives `a=b=...=0` except `b=4` (coefficient of `x`), `e=2`
+/// (coefficient of `xy`), `h=1` (coefficient of `xyz`) -- i.e. EXACTLY `level
+/// = 4*x + 2*x*y + x*y*z = x*(4 + 2*y + y*z)` (verified against all 8 points,
+/// e.g. `(1,1,1)->4+2+1=7`, `(1,1,-1)->4+2-1=5`, `(1,-1,1)->4-2-1=1`,
+/// `(1,-1,-1)->4-2+1=3`, and the `x=-1` rows negate those). Under independent
+/// bits, `E[xy]=E[x]E[y]` and `E[xyz]=E[x]E[y]E[z]`, so `E[level] = E[x]*(4 +
+/// 2*E[y] + E[y]*E[z])` is EXACT (again verified against brute force in this
+/// module's tests).
+fn soft_qam64_axis(l0: f32, l1: f32, l2: f32) -> f32 {
+    let norm = 1.0 / 42.0f32.sqrt(); // matches qam64::NORM
+    let (s0, s1, s2) = ((l0 / 2.0).tanh(), (l1 / 2.0).tanh(), (l2 / 2.0).tanh());
+    s0 * (4.0 + 2.0 * s1 + s1 * s2) * norm
+}
+
+/// Exact brute-force soft-symbol expectation `sum_x x * P(x|LLRs)` over all
+/// `2^bits_per_symbol` constellation points (independent-bit assumption),
+/// used for any modulation without a hand-derived closed form above. Only
+/// 8-PSK (this codec's bits_per_symbol=3 modulation, speed level 5) hits this
+/// path today: its constant-modulus circular geometry doesn't decompose into
+/// independent per-axis product terms the way rectangular QAM's grid does, so
+/// there's no small closed form to derive the way there is for BPSK/QPSK/PAM4/
+/// 64-QAM. This is still EXACT (same expectation, just evaluated by
+/// enumeration instead of a derived formula), and cheap: `bits_per_symbol<=6`
+/// everywhere in this codec, so at most 64 constellation points, evaluated
+/// only on the rare turbo-retry path (after a first-pass LDPC failure).
+fn soft_symbol_generic(mapper: &dyn ConstellationMapper, llrs: &[f32]) -> Complex32 {
+    let bps = llrs.len();
+    let mut acc = Complex32::new(0.0, 0.0);
+    let mut norm = 0.0f32;
+    for idx in 0..(1usize << bps) {
+        let bits: Vec<u8> = (0..bps)
+            .map(|b| ((idx >> (bps - 1 - b)) & 1) as u8)
+            .collect();
+        let mut p = 1.0f32;
+        for (i, &bit) in bits.iter().enumerate() {
+            // P(bit=0) = sigmoid(L) = 1/(1+exp(-L)) under this codebase's
+            // "positive LLR = bit more likely 0" convention.
+            let p0 = 1.0 / (1.0 + (-llrs[i]).exp());
+            p *= if bit == 0 { p0 } else { 1.0 - p0 };
+        }
+        acc += mapper.map(&bits) * p;
+        norm += p;
+    }
+    if norm > 1e-9 {
+        acc * (1.0 / norm)
+    } else {
+        acc
+    }
+}
+
+/// Build one data carrier's soft "virtual pilot" symbol from its
+/// `bits_per_symbol` posterior LLRs, dispatched by bit width. This codec's
+/// fixed `SPEED_LEVELS` ladder maps `bits_per_symbol` uniquely to a modulation
+/// (1=BPSK, 2=QPSK, 3=8PSK, 4=16-QAM, 6=64-QAM -- see
+/// `speed_levels::speed_level_components`), so switching on `llrs.len()` alone
+/// is unambiguous for every currently defined speed level without needing a
+/// `dyn Any` downcast on `mapper`.
+fn soft_symbol(mapper: &dyn ConstellationMapper, llrs: &[f32]) -> Complex32 {
+    match llrs.len() {
+        1 => soft_symbol_bpsk(llrs[0]),
+        2 => soft_symbol_qpsk(llrs[0], llrs[1]),
+        4 => Complex32::new(soft_pam4(llrs[0], llrs[1]), soft_pam4(llrs[2], llrs[3])),
+        6 => Complex32::new(
+            soft_qam64_axis(llrs[0], llrs[1], llrs[2]),
+            soft_qam64_axis(llrs[3], llrs[4], llrs[5]),
+        ),
+        _ => soft_symbol_generic(mapper, llrs),
+    }
+}
 
 /// Coded block length: this codec's fixed OFDM/interleaver block size,
 /// rate-matched down from the NR BG2 mother code for every speed level (see
@@ -63,6 +206,30 @@ pub struct CoppaTransceiver {
     /// Per-speed-level cached interleaver/mapper/k_used, built eagerly for
     /// all 9 levels in `new` (see `LevelComponents`'s doc).
     codecs: HashMap<u8, LevelComponents>,
+    /// One-round turbo re-estimation gate (Task 5): when `true` (the
+    /// default), a first-pass LDPC non-convergence triggers one retry --
+    /// soft "virtual pilot" symbols built from the failed decode's posterior
+    /// LLRs, folded into a channel re-fit
+    /// (`CoppaModem::reequalize_with_virtual_pilots`), then one re-demap +
+    /// re-decode -- before giving up. `false` reproduces the exact pre-Task-5
+    /// behavior (single decode attempt only). See [`Self::with_turbo`].
+    turbo: bool,
+    /// Count of frames where the turbo retry path actually fired (first-pass
+    /// non-convergence with `turbo` enabled), for bench instrumentation (Task
+    /// 5's Step 3 gate records firing rate per SNR point). `Cell` because
+    /// `receive`/`receive_with_metrics` are `&self` like every other method on
+    /// this type.
+    turbo_attempts: Cell<u64>,
+    /// Count of `turbo_attempts` where the retry decode actually converged
+    /// (i.e. the frame would otherwise have returned `LdpcNotConverged`, but
+    /// didn't). This is the LDPC-level "rescue" count -- `turbo_rescues() /
+    /// turbo_attempts()` is the rescue rate bench instrumentation needs to
+    /// measure turbo's effect independent of any FER-threshold confound (see
+    /// the Task 5 report's discussion of the Watterson-Poor channel's
+    /// pre-existing FER floor, where a straight FER@10%-threshold comparison
+    /// is undefined for either turbo setting but a rescue rate is still
+    /// directly measurable).
+    turbo_rescues: Cell<u64>,
 }
 
 #[derive(Debug)]
@@ -158,7 +325,39 @@ impl CoppaTransceiver {
             rx_bpf,
             ldpc,
             codecs,
+            turbo: true,
+            turbo_attempts: Cell::new(0),
+            turbo_rescues: Cell::new(0),
         }
+    }
+
+    /// Enable/disable one-round turbo re-estimation (Task 5, default: on).
+    /// Builder-style so bench code can construct a turbo-off transceiver for
+    /// an A/B comparison: `CoppaTransceiver::new(profile, version).with_turbo(false)`.
+    pub fn with_turbo(mut self, on: bool) -> Self {
+        self.turbo = on;
+        self
+    }
+
+    /// Whether one-round turbo re-estimation is enabled.
+    pub fn turbo(&self) -> bool {
+        self.turbo
+    }
+
+    /// Number of `receive`/`receive_with_metrics` calls (since construction)
+    /// where the turbo retry path actually fired (first-pass LDPC
+    /// non-convergence with `turbo` enabled) -- bench instrumentation for
+    /// Task 5's Step 3 firing-rate-per-SNR-point measurement.
+    pub fn turbo_attempts(&self) -> u64 {
+        self.turbo_attempts.get()
+    }
+
+    /// Number of `turbo_attempts` (first-pass failures with `turbo` on) whose
+    /// retry decode actually converged -- the LDPC-level "rescue" count. See
+    /// this field's doc for why this is tracked separately from
+    /// `turbo_attempts`.
+    pub fn turbo_rescues(&self) -> u64 {
+        self.turbo_rescues.get()
     }
 
     /// The OFDM profile this transceiver was built for.
@@ -282,7 +481,7 @@ impl CoppaTransceiver {
         };
 
         // 1. Demodulate to soft symbols (coded symbol count derived from header speed level)
-        let (header, eq_symbols, noise_vars) = self
+        let (header, eq_symbols, mut noise_vars) = self
             .modem
             .demodulate_frame(samples)
             .ok_or(ReceiveError::SyncFailed)?;
@@ -362,7 +561,85 @@ impl CoppaTransceiver {
         pin_known_pad(&mut dematched, payload_bits, k_used, PIN);
 
         // 6. NR BG2 layered decode
-        let (_, mut decoded_bits, converged, iterations) = self.ldpc.decode_soft_stats(&dematched);
+        let (posterior, mut decoded_bits, mut converged, mut iterations) =
+            self.ldpc.decode_soft_stats(&dematched);
+
+        // 6b. One-round turbo re-estimation (Task 5): on a first-pass non-convergence,
+        // build soft "virtual pilot" symbols from the failed decode's posterior LLRs,
+        // fold them into a channel re-fit, re-demap, re-pin, and retry the decode
+        // exactly once. See `soft_symbol`'s doc for the closed forms and
+        // `CoppaModem::reequalize_with_virtual_pilots`'s doc for the re-fit itself.
+        if !converged && self.turbo {
+            self.turbo_attempts.set(self.turbo_attempts.get() + 1);
+
+            // Posterior -> mother-domain LLRs (strip the always-punctured leading
+            // `PUNCTURED_INFO_COLS*ZC` positions -- see `NrLdpc::decode_soft`'s doc)
+            // -> the same E=1944-length coded-bit-order slice `rate_match` selected
+            // at TX time -> re-interleaved into wire/symbol order (matching
+            // `eq_symbols`'/`llrs`' original order above).
+            let punctured_len = nr_bg2::PUNCTURED_INFO_COLS * nr_bg2::ZC;
+            let mother_only = &posterior[punctured_len..];
+            let coded_posterior =
+                rate_match::rate_match_llr(mother_only, k_used, CODED_BLOCK_LEN, 0);
+            let interleaved_posterior = comp.interleaver.interleave_soft(&coded_posterior);
+
+            let n_syms = interleaved_posterior.len() / bps;
+            let mut soft_symbols = Vec::with_capacity(n_syms);
+            let mut weights = Vec::with_capacity(n_syms);
+            for i in 0..n_syms {
+                let chunk = &interleaved_posterior[i * bps..(i + 1) * bps];
+                let s = soft_symbol(comp.mapper.as_ref(), chunk);
+                weights.push(s.norm_sqr());
+                soft_symbols.push(s);
+            }
+
+            let (re_eq_symbols, re_noise_vars) = self
+                .modem
+                .reequalize_with_virtual_pilots(&soft_symbols, &weights);
+
+            if !re_eq_symbols.is_empty() {
+                // Re-demap exactly as step 3 did, against the re-equalized symbols.
+                let mut llrs2 = Vec::with_capacity(coded_bits_needed);
+                let fallback_nv2 = median_noise_variance(&re_noise_vars);
+                for (i, &sym) in re_eq_symbols.iter().take(symbols_needed).enumerate() {
+                    let nv = match re_noise_vars.get(i) {
+                        Some(&v) if v > 1e-6 => v,
+                        _ => fallback_nv2,
+                    };
+                    llrs2.extend(comp.mapper.demap_soft(sym, nv));
+                }
+                llrs2.truncate(coded_bits_needed);
+                llrs2.resize(coded_bits_needed, 0.0);
+                for llr in &mut llrs2 {
+                    *llr = llr.clamp(-llr_clip, llr_clip);
+                }
+
+                // Re-deinterleave / re-dematch / re-pin (Task 3's exact pinning
+                // mechanism, reused verbatim -- not reimplemented).
+                let deinterleaved2 = comp.interleaver.deinterleave(&llrs2);
+                let mut dematched2 = rate_match::rate_dematch(
+                    &deinterleaved2,
+                    k_used,
+                    CODED_BLOCK_LEN,
+                    0,
+                    NrLdpc::MOTHER_LEN,
+                );
+                pin_known_pad(&mut dematched2, payload_bits, k_used, PIN);
+
+                // Retry the decode exactly once.
+                let (_, retry_bits, retry_converged, retry_iterations) =
+                    self.ldpc.decode_soft_stats(&dematched2);
+
+                iterations += retry_iterations;
+                if retry_converged {
+                    self.turbo_rescues.set(self.turbo_rescues.get() + 1);
+                    decoded_bits = retry_bits;
+                    converged = true;
+                    noise_vars = re_noise_vars;
+                }
+            }
+        }
+
         // Descramble to undo TX-side scrambling
         scramble(&mut decoded_bits);
 
@@ -399,6 +676,223 @@ impl CoppaTransceiver {
 mod tests {
     use super::*;
     use coppa_codec::ofdm::frame::CoppaFrameType;
+
+    /// Independent brute-force reference: `sum_x x * P(x|LLRs)` over every
+    /// `2^bits_per_symbol` constellation point, with `P(x|LLRs) =
+    /// prod_i P(bit_i|LLRs[i])` computed directly from the sigmoid identity
+    /// (NOT by calling `soft_symbol_generic`, so this is a genuinely
+    /// independent check, not the production code checking itself). Per the
+    /// task brief: "brute-force `sum_x x*P(x|LLRs)` over the constellation
+    /// points ... removes all labeling ambiguity."
+    fn brute_force_soft_symbol(mapper: &dyn ConstellationMapper, llrs: &[f32]) -> Complex32 {
+        let bps = llrs.len();
+        let mut acc = Complex32::new(0.0, 0.0);
+        for idx in 0..(1usize << bps) {
+            let bits: Vec<u8> = (0..bps)
+                .map(|b| ((idx >> (bps - 1 - b)) & 1) as u8)
+                .collect();
+            let mut p = 1.0f32;
+            for (i, &bit) in bits.iter().enumerate() {
+                let p0 = 1.0 / (1.0 + (-llrs[i]).exp());
+                p *= if bit == 0 { p0 } else { 1.0 - p0 };
+            }
+            acc += mapper.map(&bits) * p;
+        }
+        acc
+    }
+
+    /// A handful of varied (non-trivial, non-symmetric) LLR fixtures -- not just
+    /// all-zero/all-huge -- so the brute-force check actually exercises the
+    /// closed forms' cross terms, not just their behavior at symmetric points
+    /// where many terms coincidentally vanish.
+    fn llr_fixtures(n: usize) -> Vec<Vec<f32>> {
+        let raw: [f32; 8] = [2.7, -1.3, 0.4, -3.8, 5.1, -0.2, 1.9, -6.4];
+        (0..4)
+            .map(|shift| raw.iter().cycle().skip(shift).take(n).copied().collect())
+            .collect()
+    }
+
+    #[test]
+    fn soft_symbol_bpsk_matches_brute_force() {
+        let mapper = coppa_codec::bpsk::BpskMapper;
+        for llrs in llr_fixtures(1) {
+            let closed = soft_symbol_bpsk(llrs[0]);
+            let brute = brute_force_soft_symbol(&mapper, &llrs);
+            assert!(
+                (closed - brute).norm() < 1e-5,
+                "llrs={llrs:?}: closed={closed:?} brute={brute:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_symbol_qpsk_matches_brute_force() {
+        let mapper = coppa_codec::qpsk::QpskMapper;
+        for llrs in llr_fixtures(2) {
+            let closed = soft_symbol_qpsk(llrs[0], llrs[1]);
+            let brute = brute_force_soft_symbol(&mapper, &llrs);
+            assert!(
+                (closed - brute).norm() < 1e-5,
+                "llrs={llrs:?}: closed={closed:?} brute={brute:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_pam4_matches_brute_force_16qam_per_axis() {
+        // Brute force over the full 16-point 2D constellation, split per axis:
+        // re depends only on bits[0..2], im only on bits[2..4] (Qam16Mapper's
+        // `map`), so a 4-point per-axis brute force (fixing the OTHER axis's
+        // bits, which don't affect this axis' marginal) is equivalent to (and
+        // cheaper than) enumerating all 16 -- but to genuinely avoid assuming
+        // that independence structure in the *test*, brute-force the full
+        // 4-LLR/16-point joint expectation and compare against the closed-form
+        // combination directly.
+        let mapper = coppa_codec::qam16::Qam16Mapper;
+        for llrs in llr_fixtures(4) {
+            let closed = Complex32::new(soft_pam4(llrs[0], llrs[1]), soft_pam4(llrs[2], llrs[3]));
+            let brute = brute_force_soft_symbol(&mapper, &llrs);
+            assert!(
+                (closed - brute).norm() < 1e-5,
+                "llrs={llrs:?}: closed={closed:?} brute={brute:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_qam64_axis_matches_brute_force_64qam_per_axis() {
+        let mapper = coppa_codec::qam64::Qam64Mapper;
+        for llrs in llr_fixtures(6) {
+            let closed = Complex32::new(
+                soft_qam64_axis(llrs[0], llrs[1], llrs[2]),
+                soft_qam64_axis(llrs[3], llrs[4], llrs[5]),
+            );
+            let brute = brute_force_soft_symbol(&mapper, &llrs);
+            assert!(
+                (closed - brute).norm() < 1e-5,
+                "llrs={llrs:?}: closed={closed:?} brute={brute:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_symbol_generic_8psk_matches_brute_force() {
+        let mapper = coppa_codec::psk8::Psk8Mapper;
+        for llrs in llr_fixtures(3) {
+            let generic = soft_symbol_generic(&mapper, &llrs);
+            let brute = brute_force_soft_symbol(&mapper, &llrs);
+            assert!(
+                (generic - brute).norm() < 1e-5,
+                "llrs={llrs:?}: generic={generic:?} brute={brute:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_symbol_dispatch_matches_bits_per_symbol() {
+        // Sanity check the bits_per_symbol -> modulation dispatch in `soft_symbol`
+        // agrees with each mapper's own bits_per_symbol for every currently
+        // defined speed level (guards the "bits_per_symbol uniquely identifies
+        // modulation in this ladder" assumption `soft_symbol`'s doc relies on).
+        for level in [1u8, 2, 3, 4, 5, 6, 7, 9, 10] {
+            let (mapper, _) = crate::modem::speed_levels::speed_level_components(level).unwrap();
+            let bps = mapper.bits_per_symbol();
+            let llrs = vec![1.0f32; bps];
+            // Must not panic and must produce a finite symbol.
+            let s = soft_symbol(mapper.as_ref(), &llrs);
+            assert!(
+                s.re.is_finite() && s.im.is_finite(),
+                "level {level}: non-finite {s:?}"
+            );
+        }
+    }
+
+    /// Regression test: `with_turbo(false)` reproduces the exact pre-Task-5
+    /// single-decode-attempt behavior on a clean channel (no first-pass failure
+    /// to retry, so turbo on/off should be indistinguishable here) -- and
+    /// `turbo_attempts()` must stay at 0 when nothing ever fails.
+    #[test]
+    fn turbo_off_still_decodes_cleanly_and_never_fires() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1).with_turbo(false);
+        assert!(!tx.turbo());
+        let payload = vec![0x5Au8; 20];
+        let header = make_header(2, payload.len() as u16);
+        let samples = tx.transmit(&header, &payload);
+        let (_h, rx) = tx.receive(&samples).expect("clean loopback should decode");
+        assert_eq!(&rx[..payload.len()], payload.as_slice());
+        assert_eq!(tx.turbo_attempts(), 0);
+    }
+
+    #[test]
+    fn turbo_on_still_decodes_cleanly_on_clean_channel() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        assert!(tx.turbo());
+        let payload = vec![0x5Au8; 20];
+        let header = make_header(2, payload.len() as u16);
+        let samples = tx.transmit(&header, &payload);
+        let (_h, rx) = tx.receive(&samples).expect("clean loopback should decode");
+        assert_eq!(&rx[..payload.len()], payload.as_slice());
+    }
+
+    /// Step 1 (statistical, run manually in Step 3): 200 poor-channel seeds at
+    /// the pre-Task-5 ~30% FER operating point (measured directly below, not
+    /// assumed) -- acceptance: turbo-on FER <= 0.75x turbo-off FER.
+    ///
+    /// Run: `cargo test -p coppa-protocol --lib -- --ignored --nocapture \
+    /// turbo_reestimation_reduces_fer_on_poor_channel`
+    #[test]
+    #[ignore = "statistical (200 seeds x 2 configs); run manually, see doc comment"]
+    fn turbo_reestimation_reduces_fer_on_poor_channel() {
+        use coppa_channel::watterson::WattersonPreset;
+
+        const LEVEL: u8 = 2; // BPSK 1/2
+        const PAYLOAD_BYTES: usize = 121; // level 2's full-codeword payload (MODES table)
+                                          // Measured directly (separate probe, not assumed) as the pre-Task-5
+                                          // ~30% FER operating point on hf_standard/watterson-poor for level 2.
+        const SNR_DB: f32 = 9.0;
+        const SEEDS: u64 = 200;
+
+        let run = |turbo: bool| -> usize {
+            let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1).with_turbo(turbo);
+            let header = make_header(LEVEL, PAYLOAD_BYTES as u16);
+            let mut failures = 0usize;
+            for trial in 0..SEEDS {
+                let seed = 0x7075_0000u64.wrapping_add(trial);
+                use rand::rngs::StdRng;
+                use rand::{Rng, SeedableRng};
+                let mut rng = StdRng::seed_from_u64(seed);
+                let payload: Vec<u8> = (0..PAYLOAD_BYTES).map(|_| rng.random::<u8>()).collect();
+                let clean = tx.transmit(&header, &payload);
+                let faded = coppa_channel::watterson::watterson(
+                    &clean,
+                    48_000.0,
+                    &WattersonPreset::Poor.config(),
+                    seed ^ 0x3333_3333_3333_3333,
+                );
+                let noisy =
+                    coppa_channel::awgn_seeded(&faded, SNR_DB, seed ^ 0x5555_5555_5555_5555);
+                let ok =
+                    matches!(tx.receive(&noisy), Ok((_, rx)) if rx[..payload.len()] == payload[..]);
+                if !ok {
+                    failures += 1;
+                }
+            }
+            failures
+        };
+
+        let off_failures = run(false);
+        let on_failures = run(true);
+        let off_fer = off_failures as f64 / SEEDS as f64;
+        let on_fer = on_failures as f64 / SEEDS as f64;
+        println!(
+            "turbo-off: {off_failures}/{SEEDS} (FER={off_fer:.3}); turbo-on: {on_failures}/{SEEDS} (FER={on_fer:.3})"
+        );
+        assert!(
+            (on_failures as f64) <= 0.75 * (off_failures as f64),
+            "turbo-on FER ({on_fer:.3}) should be <= 0.75x turbo-off FER ({off_fer:.3}): \
+             on={on_failures} off={off_failures}"
+        );
+    }
 
     /// Regression test: VHF-routed speed levels (5,6,7,9,10 via `select_profile` in
     /// coppa-bench, which chooses `vhf_wide` for level >= 5) previously fell back to
