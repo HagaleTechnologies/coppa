@@ -144,6 +144,28 @@ pub fn rto_floor(
     Duration::from_secs_f64(floor_s.min(MAX_RTO_SECS))
 }
 
+/// IR-HARQ redundancy-version cycling order (Phase 3 Task 3, decision 3).
+///
+/// `attempt` is the 0-indexed count of transmissions of a segment that have
+/// already happened *before* the one about to be sent: `0` for the very
+/// first, original transmission (which is therefore always RV0 -- unchanged
+/// wire behavior when a segment is never retransmitted), `1` for the first
+/// retransmission, `2` for the second, and so on, wrapping every 4 attempts.
+/// [`ArqTx::transmit_count`] already reports exactly this value for an
+/// in-flight segment's *next* transmission (see that method's doc), so the
+/// typical call is `rv_for_attempt(tx.transmit_count(seq).unwrap_or(0))`.
+///
+/// Standard IR-HARQ order, as used in LTE/5G-NR: RV2 first on the first
+/// retransmission (maximizes NEW parity bits sent, since RV0 and RV2 sample
+/// very different regions of the rate-matching circular buffer -- see
+/// `crate::fec::ldpc::rate_match`'s module doc), then RV3, then RV1, before
+/// cycling back to RV0 (which starts Chase-combining with the original
+/// transmission once every RV has been tried once) on the 4th retransmission.
+pub fn rv_for_attempt(attempt: u8) -> u8 {
+    const CYCLE: [u8; 4] = [0, 2, 3, 1];
+    CYCLE[(attempt % 4) as usize]
+}
+
 /// ARQ configuration.
 #[derive(Debug, Clone)]
 pub struct ArqConfig {
@@ -529,6 +551,27 @@ impl ArqTx {
             .map(|s| s.data.as_slice())
     }
 
+    /// Current transmit count for a still-in-flight segment (`None` if `seq`
+    /// isn't currently in the TX buffer -- e.g. already acked/evicted, or
+    /// never sent).
+    ///
+    /// This is exactly the 0-indexed `attempt` [`rv_for_attempt`] expects for
+    /// `seq`'s *next* transmission: `transmit_count` already counts how many
+    /// transmissions of this segment have happened so far (`1` right after
+    /// [`Self::send`], before incrementing again on
+    /// [`Self::mark_retransmitted`]), which is exactly the attempt index of
+    /// the transmission about to happen (attempt `0` = the original send,
+    /// counted before any segment exists yet, so a caller about to call
+    /// [`Self::send`] for the first time should use `rv_for_attempt(0)`
+    /// directly rather than calling this method).
+    pub fn transmit_count(&self, seq: u8) -> Option<u8> {
+        let idx = seq as usize % MAX_WINDOW_SIZE as usize;
+        self.tx_buf[idx]
+            .as_ref()
+            .filter(|s| s.seq_num == seq)
+            .map(|s| s.transmit_count)
+    }
+
     /// Current send base (oldest unacked sequence number).
     pub fn send_base(&self) -> u8 {
         self.send_base
@@ -642,6 +685,75 @@ impl ArqRx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── IR-HARQ RV cycling (Phase 3 Task 3) ──────────────────────────
+
+    /// Task 3 failing-test scenario (b): RV cycling `attempt -> rv` must be
+    /// exactly `[0,2,3,1][attempt % 4]` (standard IR-HARQ order -- RV2 first
+    /// on the first retransmission maximizes new parity, NOT plain
+    /// `attempt % 4`, which would give RV1 first).
+    #[test]
+    fn test_rv_for_attempt_cycles_standard_order() {
+        let expected = [0u8, 2, 3, 1, 0, 2, 3, 1, 0];
+        for (attempt, &want) in expected.iter().enumerate() {
+            assert_eq!(
+                rv_for_attempt(attempt as u8),
+                want,
+                "attempt {attempt}: expected rv {want}, got {}",
+                rv_for_attempt(attempt as u8)
+            );
+        }
+    }
+
+    /// `ArqTx::transmit_count`'s doc: it already reports exactly the 0-indexed
+    /// `attempt` `rv_for_attempt` expects for a segment's *next* transmission.
+    /// Exercises the real attempt-counter -> RV wiring across a full 4-attempt
+    /// cycle (original send + 3 retransmits), not just the pure function.
+    #[test]
+    fn test_transmit_count_feeds_rv_for_attempt_across_full_cycle() {
+        let mut tx = ArqTx::new(ArqConfig::default());
+        let now = Instant::now();
+        let seq = tx.send(vec![0xAA], now).unwrap();
+
+        // First TX itself is always RV0 (decision 3: "unchanged wire behavior
+        // when no losses") -- there's no in-flight segment yet at that point,
+        // so a caller uses `rv_for_attempt(0)` directly; `transmit_count` after
+        // `send()` reports the attempt index of the segment's NEXT
+        // transmission (the first retransmission).
+        assert_eq!(tx.transmit_count(seq), Some(1));
+        assert_eq!(
+            rv_for_attempt(tx.transmit_count(seq).unwrap()),
+            2,
+            "first retransmission must use RV2"
+        );
+
+        tx.mark_retransmitted(seq, now).unwrap();
+        assert_eq!(
+            rv_for_attempt(tx.transmit_count(seq).unwrap()),
+            3,
+            "second retransmission must use RV3"
+        );
+
+        tx.mark_retransmitted(seq, now).unwrap();
+        assert_eq!(
+            rv_for_attempt(tx.transmit_count(seq).unwrap()),
+            1,
+            "third retransmission must use RV1"
+        );
+
+        tx.mark_retransmitted(seq, now).unwrap();
+        assert_eq!(
+            rv_for_attempt(tx.transmit_count(seq).unwrap()),
+            0,
+            "fourth retransmission cycles back to RV0 (Chase-combines with the original TX)"
+        );
+    }
+
+    #[test]
+    fn test_transmit_count_none_for_unknown_seq() {
+        let tx = ArqTx::new(ArqConfig::default());
+        assert_eq!(tx.transmit_count(0), None);
+    }
 
     // ── RTT estimator tests ─────────────────────────────────────────
 

@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use crc::{Crc, CRC_32_ISO_HDLC};
@@ -202,6 +202,111 @@ struct LevelComponents {
     k_used: usize,
 }
 
+/// Known-bit-pinning LLR magnitude (Task 3 (Phase 2)/Task 4): the confident
+/// LLR value assigned to positions whose transmitted value is known exactly
+/// (zero-padded, scrambled shortening bits) rather than trusted from a noisy
+/// channel observation. Hoisted to a shared module constant (previously two
+/// identical `const PIN: f32 = 64.0;` locals in `receive_with_metrics`'s two
+/// decode call sites) now that Task 3 (Phase 3, IR-HARQ) adds a third call
+/// site (`harq_combine_and_decode`) that needs the exact same value.
+const PIN_LLR: f32 = 64.0;
+
+/// Mask selecting the 2 bits of [`CoppaHeader::fec_type`] (4 bits total, see
+/// that field's doc) used for the IR-HARQ redundancy version (RV, Phase 3
+/// Task 3): `fec_type & RV_MASK` is always `0..=3`. The remaining 2 bits
+/// (`fec_type & !RV_MASK`) are reserved/unused -- always `0` today, available
+/// for a future FEC-scheme selector without another wire-format break.
+const RV_MASK: u8 = 0x03;
+
+/// Bounded, LRU-evicting map of in-flight IR-HARQ receive-side LLR
+/// accumulation buffers (Phase 3 Task 3, decision 3), keyed by frame sequence
+/// number (`CoppaHeader::seq_num`).
+///
+/// One entry per sequence number currently being combined across
+/// retransmissions: each entry is a [`NrLdpc::MOTHER_LEN`]-long ("mother-
+/// length", per decision 3) LLR buffer that every transmission's
+/// [`rate_match::rate_dematch`] output is added into (simple elementwise
+/// addition -- valid because this codec's LLR scales are already calibrated,
+/// per decision 3; no reweighting needed). Evicted on CRC pass, on an
+/// explicit external cumulative-ACK advance (see
+/// [`CoppaTransceiver::harq_evict`]), or on LRU overflow beyond
+/// [`HARQ_MAX_BUFFERS`] -- whichever comes first.
+///
+/// Decision 3's brief pseudocode names this `LruMap<u8, Vec<f32>>`; there is
+/// no such crate in this workspace's dependencies and the plan disallows
+/// adding one ("Rust; no new dependencies"), so this is a small hand-rolled
+/// bounded map + recency list, in the same spirit as this codebase's other
+/// hand-rolled bounded/evicting state -- see `StreamingReceiver::evict_ring`
+/// in `modem/streaming.rs` and `SyncDetector::evict_history` in
+/// `coppa_codec::ofdm::sync_detector` (same idea, different eviction
+/// trigger: those evict by a fixed retained-sample budget, this one by LRU
+/// recency + an explicit count cap).
+struct HarqRxBuffers {
+    /// seq -> accumulated mother-length LLR buffer.
+    map: HashMap<u8, Vec<f32>>,
+    /// Recency order, least-recently-used at the front, most-recently-used at
+    /// the back. Each live seq appears at most once (enforced by `touch`). A
+    /// linear scan/removal is fine at this size (capped at
+    /// [`HARQ_MAX_BUFFERS`] = 32 entries).
+    order: Vec<u8>,
+}
+
+/// LRU cap on the number of distinct in-flight seqs [`HarqRxBuffers`] holds
+/// buffers for simultaneously (decision 3: "LRU cap of 32 seqs").
+const HARQ_MAX_BUFFERS: usize = 32;
+
+impl HarqRxBuffers {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: Vec::new(),
+        }
+    }
+
+    /// Mark `seq` as most-recently-used.
+    fn touch(&mut self, seq: u8) {
+        self.order.retain(|&s| s != seq);
+        self.order.push(seq);
+    }
+
+    /// Get this seq's accumulator, creating a fresh zero-filled one (and
+    /// evicting the least-recently-used entry first if this insert would
+    /// exceed [`HARQ_MAX_BUFFERS`]) if this is the first transmission of
+    /// `seq` seen since it was last evicted. Touches `seq` either way.
+    fn get_or_create(&mut self, seq: u8) -> &mut Vec<f32> {
+        if !self.map.contains_key(&seq) {
+            if self.map.len() >= HARQ_MAX_BUFFERS && !self.order.is_empty() {
+                let lru = self.order.remove(0);
+                self.map.remove(&lru);
+            }
+            self.map.insert(seq, vec![0.0f32; NrLdpc::MOTHER_LEN]);
+        }
+        self.touch(seq);
+        self.map
+            .get_mut(&seq)
+            .expect("just inserted or already present above")
+    }
+
+    /// Evict `seq`'s buffer, if any (decision 3: CRC pass or an explicit
+    /// cumulative-ACK advance). A no-op if `seq` has no buffer.
+    fn evict(&mut self, seq: u8) {
+        self.map.remove(&seq);
+        self.order.retain(|&s| s != seq);
+    }
+
+    /// Number of distinct seqs currently buffered (test/introspection only).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether `seq` currently has a buffer (test/introspection only).
+    #[cfg(test)]
+    fn contains(&self, seq: u8) -> bool {
+        self.map.contains_key(&seq)
+    }
+}
+
 pub struct CoppaTransceiver {
     modem: CoppaModem,
     profile: CoppaProfile,
@@ -250,6 +355,25 @@ pub struct CoppaTransceiver {
     /// is undefined for either turbo setting but a rescue rate is still
     /// directly measurable).
     turbo_rescues: Cell<u64>,
+    /// IR-HARQ receive-side LLR combining state (Phase 3 Task 3): one
+    /// mother-length accumulator buffer per in-flight seq, added into across
+    /// retransmissions and evicted on CRC pass / cumulative-ACK advance / LRU
+    /// overflow -- see [`HarqRxBuffers`]'s doc.
+    ///
+    /// `RefCell`, not `&mut self` on `receive`/`receive_with_metrics`: this
+    /// codebase already has interior-mutability precedent right in this file
+    /// (`turbo_attempts`/`turbo_rescues` above use `Cell` for the same
+    /// `&self`-must-stay-`&self` reason), and threading `&mut self` through
+    /// `receive` would force every call site across the workspace (CLI,
+    /// daemon, streaming receiver, every bench example, every integration
+    /// test) to hold `CoppaTransceiver` behind a mutable binding purely to
+    /// support the rare HARQ-combining case, for a type that's already `!Sync`
+    /// (see [`LevelComponents::mapper`]'s doc) and today only ever
+    /// constructed once per session and read from concurrently in spirit
+    /// (never actually mutated observably by any *other* field). `Cell` alone
+    /// doesn't work here (its value isn't `Copy`), so `RefCell` is the natural
+    /// next step up, not a new pattern.
+    harq_rx: RefCell<HarqRxBuffers>,
 }
 
 #[derive(Debug)]
@@ -373,6 +497,7 @@ impl CoppaTransceiver {
             turbo: true,
             turbo_attempts: Cell::new(0),
             turbo_rescues: Cell::new(0),
+            harq_rx: RefCell::new(HarqRxBuffers::new()),
         }
     }
 
@@ -470,8 +595,15 @@ impl CoppaTransceiver {
         let mother = self.ldpc.encode(&info_bits);
 
         // 4. Rate match: mother codeword -> CODED_BLOCK_LEN=1944 coded bits
-        //    for this level's k_used (RV0 -- Phase 2 doesn't use HARQ-IR).
-        let coded_bits = rate_match::rate_match(&mother, k_used, CODED_BLOCK_LEN, 0);
+        //    for this level's k_used, at the redundancy version encoded in
+        //    the header's `fec_type` (Phase 3 Task 3, IR-HARQ). A fresh
+        //    (non-retransmitted) header always has `fec_type=0` -> RV0,
+        //    identical wire behavior to the pre-Task-3 hardcoded-RV0 codec
+        //    when nothing is ever retransmitted -- see `RV_MASK`'s doc for the
+        //    bit layout and `crate::arq::rv_for_attempt` for the cycling order
+        //    a retransmitting sender should set here.
+        let rv = header.fec_type & RV_MASK;
+        let coded_bits = rate_match::rate_match(&mother, k_used, CODED_BLOCK_LEN, rv);
 
         // 5. Interleave
         let interleaved = comp.interleaver.interleave(&coded_bits);
@@ -522,6 +654,86 @@ impl CoppaTransceiver {
     pub fn receive(&self, samples: &[f32]) -> Result<(CoppaHeader, Vec<u8>), ReceiveError> {
         self.receive_with_metrics(samples)
             .map(|(h, p, _snr)| (h, p))
+    }
+
+    /// Core IR-HARQ combining + decode step (Phase 3 Task 3).
+    ///
+    /// `deinterleaved_llrs` (length `CODED_BLOCK_LEN`) is this ONE transmission's
+    /// de-interleaved coded-bit-order LLRs -- exactly what step 4 of
+    /// `receive_with_metrics` produces from the real OFDM/demap pipeline, or
+    /// what a test can construct directly to exercise combining without OFDM
+    /// at all (see e.g. `harq_ir_combines_two_half_corrupted_transmissions`
+    /// below). It is:
+    ///
+    /// 1. Rate-dematched at `rv` into a fresh mother-length ([`NrLdpc::MOTHER_LEN`])
+    ///    buffer (positions this transmission didn't observe are `0.0`).
+    /// 2. Added, elementwise, into `seq`'s persistent accumulator in
+    ///    [`Self::harq_rx`] (creating a zero-filled one first if this is the
+    ///    first transmission of `seq` seen since it was last evicted) -- simple
+    ///    addition is valid because this codec's LLR scales are already
+    ///    calibrated (decision 3), so no reweighting between transmissions (even
+    ///    across different RVs, or repeats of the same RV -- Chase combining) is
+    ///    needed.
+    /// 3. Snapshotted, known-pad-pinned (fresh each call, from the immutable
+    ///    `payload_bits`/`k_used` -- not itself accumulated, so pin confidence
+    ///    never grows unboundedly across retransmissions), and NR BG2
+    ///    layered-decoded.
+    ///
+    /// The caller is responsible for evicting `seq`'s buffer on a successful,
+    /// CRC-verified decode (`receive_with_metrics` does this) -- a non-converged
+    /// or CRC-mismatched decode leaves the accumulator in place so the next
+    /// retransmission's contribution keeps combining with it.
+    ///
+    /// Note: Task 5's turbo re-estimation retry (see the call site below) is
+    /// deliberately NOT folded into this accumulator -- it's a single-shot
+    /// re-estimate of the CURRENT transmission's own re-equalized symbols, not
+    /// itself persisted across retransmissions. Combining turbo's retry
+    /// contribution into the long-lived IR-HARQ buffer too would be a plausible
+    /// future enhancement but isn't required by any of Task 3's failing-test
+    /// scenarios; out of scope here (YAGNI).
+    fn harq_combine_and_decode(
+        &self,
+        seq: u8,
+        rv: u8,
+        k_used: usize,
+        payload_bits: usize,
+        deinterleaved_llrs: &[f32],
+    ) -> (Vec<f32>, Vec<u8>, bool, usize) {
+        let per_tx = rate_match::rate_dematch(
+            deinterleaved_llrs,
+            k_used,
+            CODED_BLOCK_LEN,
+            rv,
+            NrLdpc::MOTHER_LEN,
+        );
+
+        let mut dematched = {
+            let mut harq = self.harq_rx.borrow_mut();
+            let acc = harq.get_or_create(seq);
+            for (a, &d) in acc.iter_mut().zip(per_tx.iter()) {
+                *a += d;
+            }
+            acc.clone()
+        };
+
+        pin_known_pad(&mut dematched, payload_bits, k_used, PIN_LLR);
+
+        self.ldpc.decode_soft_stats(&dematched)
+    }
+
+    /// Evict `seq`'s in-flight IR-HARQ receive buffer, if any (Phase 3 Task 3,
+    /// decision 3's "cumulative-ACK advance" eviction trigger, alongside CRC
+    /// pass and LRU overflow -- both handled automatically by
+    /// [`Self::harq_combine_and_decode`]/[`HarqRxBuffers`]).
+    ///
+    /// Once a higher layer's (e.g. [`crate::arq::ArqRx`]'s) cumulative ACK
+    /// boundary has advanced past `seq` -- meaning it has been fully delivered
+    /// and the sender will never retransmit it again -- any residual combining
+    /// state for it is stale and can be freed immediately rather than waiting
+    /// for LRU eviction to reclaim it. A no-op if `seq` has no buffer (e.g. it
+    /// already decoded on the first attempt, or was already evicted).
+    pub fn harq_evict(&self, seq: u8) {
+        self.harq_rx.borrow_mut().evict(seq);
     }
 
     /// Like [`Self::receive`], but also returns the frame's SNR estimate (dB),
@@ -597,30 +809,10 @@ impl CoppaTransceiver {
         // 4. De-interleave
         let deinterleaved = comp.interleaver.deinterleave(&llrs);
 
-        // 5. Rate dematch: scatter the E=1944 received LLRs back into a
-        // mother-length (8800) LLR buffer. Positions never observed --
-        // including the shortened tail beyond k_used -- are left at 0.0.
-        let k_used = comp.k_used;
-        let mut dematched = rate_match::rate_dematch(
-            &deinterleaved,
-            k_used,
-            CODED_BLOCK_LEN,
-            0,
-            NrLdpc::MOTHER_LEN,
-        );
-
-        // Known-bit pinning (Task 3, extended in Task 4): info bits beyond the
-        // payload are zero-padded then scrambled on TX, so RX knows their
-        // exact values -- pin to +/-PIN (effective code shortening; worth
-        // 1.5-3 dB on short payloads). Covers *both* the shortened-but-
-        // transmitted padding (payload_bits..k_used) and the never-
-        // transmitted shortened tail (k_used..KB*ZC, i.e. the dematch
-        // buffer's shortened region, which `rate_dematch` otherwise leaves
-        // at 0.0) in one pass -- see `pin_known_pad`'s doc.
-        const PIN: f32 = 64.0;
         // `payload_len` bytes of application payload + `PAYLOAD_CRC_LEN` bytes of
         // CRC-32 trailer (Phase 3 Task 1) are the real (non-pad) bits `transmit`
         // wrote -- see `PAYLOAD_CRC32`'s doc.
+        let k_used = comp.k_used;
         let payload_bits = (header.payload_len as usize + PAYLOAD_CRC_LEN) * 8;
         if payload_bits > k_used {
             // A corrupted header claiming a payload larger than this level's
@@ -628,11 +820,16 @@ impl CoppaTransceiver {
             // rather than let `pin_known_pad`'s invariant assert panic.
             return Err(ReceiveError::HeaderCorrupt);
         }
-        pin_known_pad(&mut dematched, payload_bits, k_used, PIN);
 
-        // 6. NR BG2 layered decode
+        // 5/6. Rate-dematch this transmission's coded LLRs at its redundancy
+        // version into the mother domain, combine (simple addition) into this
+        // seq's running IR-HARQ accumulator, known-pad-pin the combined
+        // buffer, and NR BG2 layered-decode it (Phase 3 Task 3) -- see
+        // `Self::harq_combine_and_decode`'s doc.
+        let seq = header.seq_num;
+        let rv = header.fec_type & RV_MASK;
         let (posterior, mut decoded_bits, mut converged, mut iterations) =
-            self.ldpc.decode_soft_stats(&dematched);
+            self.harq_combine_and_decode(seq, rv, k_used, payload_bits, &deinterleaved);
 
         // 6b. One-round turbo re-estimation (Task 5): on a first-pass non-convergence,
         // build soft "virtual pilot" symbols from the failed decode's posterior LLRs,
@@ -649,8 +846,13 @@ impl CoppaTransceiver {
             // `eq_symbols`'/`llrs`' original order above).
             let punctured_len = nr_bg2::PUNCTURED_INFO_COLS * nr_bg2::ZC;
             let mother_only = &posterior[punctured_len..];
+            // Project the (possibly IR-HARQ-combined, Phase 3 Task 3) posterior
+            // back down through THIS transmission's own redundancy version --
+            // not always RV0 now that retransmissions cycle RVs (see
+            // `crate::arq::rv_for_attempt`) -- to match the coded-bit-order
+            // slice `eq_symbols`/`llrs` above actually observed.
             let coded_posterior =
-                rate_match::rate_match_llr(mother_only, k_used, CODED_BLOCK_LEN, 0);
+                rate_match::rate_match_llr(mother_only, k_used, CODED_BLOCK_LEN, rv);
             let interleaved_posterior = comp.interleaver.interleave_soft(&coded_posterior);
 
             let n_syms = interleaved_posterior.len() / bps;
@@ -685,16 +887,21 @@ impl CoppaTransceiver {
                 }
 
                 // Re-deinterleave / re-dematch / re-pin (Task 3's exact pinning
-                // mechanism, reused verbatim -- not reimplemented).
+                // mechanism, reused verbatim -- not reimplemented). This retry
+                // is a single-shot re-estimate of THIS transmission only (not
+                // itself folded into the persistent IR-HARQ accumulator --
+                // see `Self::harq_combine_and_decode`'s doc for that scope
+                // decision), so it dematches at this transmission's own `rv`
+                // into a fresh buffer, same as the pre-Task-3 codec did.
                 let deinterleaved2 = comp.interleaver.deinterleave(&llrs2);
                 let mut dematched2 = rate_match::rate_dematch(
                     &deinterleaved2,
                     k_used,
                     CODED_BLOCK_LEN,
-                    0,
+                    rv,
                     NrLdpc::MOTHER_LEN,
                 );
-                pin_known_pad(&mut dematched2, payload_bits, k_used, PIN);
+                pin_known_pad(&mut dematched2, payload_bits, k_used, PIN_LLR);
 
                 // Retry the decode exactly once.
                 let (_, retry_bits, retry_converged, retry_iterations) =
@@ -748,6 +955,11 @@ impl CoppaTransceiver {
             return Err(ReceiveError::CrcMismatch);
         }
         let payload = payload_bytes.to_vec();
+
+        // CRC pass (Phase 3 Task 3, decision 3): this seq is fully, correctly
+        // delivered -- evict its IR-HARQ accumulator now rather than waiting
+        // for LRU eviction to reclaim it.
+        self.harq_rx.borrow_mut().evict(seq);
 
         // SNR estimate from the same per-carrier noise variances used for LLR scaling.
         let mean_nv = if noise_vars.is_empty() {
@@ -1521,5 +1733,267 @@ mod tests {
             "known-pad pinning should recover the large majority of frames 1.5 dB below \
              the no-pinning FER<=10% threshold, got {successes}/{SEEDS}"
         );
+    }
+
+    // ── Phase 3 Task 3: IR-HARQ ──────────────────────────────────────────
+
+    /// Shared setup for the IR-HARQ combining tests below: replicates
+    /// `transmit`'s exact info-bit construction (payload + CRC-32 trailer,
+    /// zero-padded to `k_used` then to `NrLdpc::INFO_LEN`, scrambled) and
+    /// returns `(tx, mother, k_used, payload_bits)` -- everything needed to
+    /// call `rate_match`/`harq_combine_and_decode` directly, bypassing OFDM
+    /// entirely (same bypass style as
+    /// `known_pad_pinning_recovers_below_no_pinning_threshold` above).
+    ///
+    /// Uses level 10 (64-QAM, rate 5/6 -- this ladder's LEAST redundant code,
+    /// see `speed_levels::k_used_for_level`'s doc) with a near-max payload,
+    /// not level 2's BPSK 1/2. A quick empirical margin sweep (see this
+    /// task's report) found that level 2's heavy rate-1/2 redundancy plus
+    /// known-pad pinning is robust enough to correctly decode through 60-70%
+    /// random coded-bit erasure on a single transmission -- there's no
+    /// erasure fraction near the brief's illustrative "30%" that reliably
+    /// fails alone for that code. Level 10's much thinner redundancy margin
+    /// is where 30% erasure lands exactly on a clean, reliably-separated
+    /// single-fails/combined-succeeds operating point (see
+    /// `erased_coded_llrs`'s doc for the corruption model itself).
+    fn harq_test_fixture(payload: &[u8]) -> (CoppaTransceiver, Vec<u8>, usize, usize) {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let comp = tx.codecs.get(&10).expect("level 10 must exist"); // 64-QAM, rate 5/6
+        let k_used = comp.k_used;
+
+        let checksum = PAYLOAD_CRC32.checksum(payload);
+        let mut payload_with_crc = payload.to_vec();
+        payload_with_crc.extend_from_slice(&checksum.to_be_bytes());
+
+        let mut info_bits = Vec::with_capacity(NrLdpc::INFO_LEN);
+        for &byte in &payload_with_crc {
+            for shift in (0..8).rev() {
+                info_bits.push((byte >> shift) & 1);
+            }
+        }
+        info_bits.resize(k_used, 0u8);
+        info_bits.resize(NrLdpc::INFO_LEN, 0u8);
+        scramble(&mut info_bits);
+        let mother = tx.ldpc.encode(&info_bits);
+
+        let payload_bits = (payload.len() + PAYLOAD_CRC_LEN) * 8;
+        (tx, mother, k_used, payload_bits)
+    }
+
+    /// Build one transmission's coded-bit-order LLRs at redundancy version
+    /// `rv`: strong-confidence, CORRECT-sign LLRs (`confident_llr`, `0 ->
+    /// +confident_llr`, matching this codec's universal "positive LLR = bit
+    /// more likely 0" convention) for a `1 - erasure_frac` fraction of
+    /// positions, and exactly `0.0` ("no information", not a wrong-sign
+    /// guess) for the rest -- a clean erasure-channel model of a fade eating
+    /// a deterministic (seeded, not per-run-random) random subset of a
+    /// transmission's own coded bits. Deliberately NOT modeled as AWGN +
+    /// erasure together: an early version of this fixture found that mixing
+    /// in AWGN let a FEW strong-confidence WRONG-sign bits (an unlucky deep
+    /// fade) dominate the normalized-min-sum decoder's behavior far more than
+    /// many weak/erased ones, making single-vs-combined outcomes non-
+    /// monotonic in the erasure fraction and unsuitable for a deterministic
+    /// unit test; pure erasure (this function) is monotonic and reliable.
+    fn erased_coded_llrs(
+        mother: &[u8],
+        k_used: usize,
+        rv: u8,
+        erasure_frac: f32,
+        confident_llr: f32,
+        seed: u64,
+    ) -> Vec<f32> {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        let coded_bits = rate_match::rate_match(mother, k_used, CODED_BLOCK_LEN, rv);
+        let mut rng = StdRng::seed_from_u64(seed);
+        coded_bits
+            .iter()
+            .map(|&b| {
+                if rng.random::<f32>() < erasure_frac {
+                    0.0
+                } else if b == 0 {
+                    confident_llr
+                } else {
+                    -confident_llr
+                }
+            })
+            .collect()
+    }
+
+    /// Decode `decoded_bits` (post `NrLdpc::decode_soft_stats`, still
+    /// scrambled) back into payload bytes the same way `receive_with_metrics`
+    /// does (descramble, then repack 8 bits at a time), for tests that call
+    /// `harq_combine_and_decode` directly instead of going through `receive`.
+    fn descramble_to_payload(decoded_bits: &[u8], payload_len: usize) -> Vec<u8> {
+        let mut decoded = decoded_bits.to_vec();
+        scramble(&mut decoded);
+        let mut out = Vec::with_capacity(payload_len);
+        for chunk in decoded.chunks(8) {
+            if chunk.len() == 8 && out.len() < payload_len {
+                let mut byte = 0u8;
+                for (i, &bit) in chunk.iter().enumerate() {
+                    byte |= (bit & 1) << (7 - i);
+                }
+                out.push(byte);
+            }
+        }
+        out
+    }
+
+    /// Task 3 failing-test scenario (a): two half-corrupted transmissions (RV0
+    /// then RV1, each with 30% of their own coded LLRs erased) decode after
+    /// IR-HARQ combining, even though neither decodes alone.
+    #[test]
+    fn harq_ir_combines_two_half_corrupted_transmissions() {
+        let payload = vec![0x42u8; 198]; // level 10's near-max payload capacity
+        let (tx, mother, k_used, payload_bits) = harq_test_fixture(&payload);
+
+        let llrs_rv0 = erased_coded_llrs(&mother, k_used, 0, 0.30, 8.0, 0xA11CE);
+        let llrs_rv1 = erased_coded_llrs(&mother, k_used, 1, 0.30, 8.0, 0xB0B1E5);
+
+        // Neither transmission decodes (correctly) alone (fresh, distinct
+        // seqs so these probes don't share accumulator state with each other
+        // or with the combined case below). "Decodes correctly" -- not just
+        // `converged` -- because LDPC convergence alone only means the
+        // decoder found *a* valid codeword, not that it's the *right* one
+        // (see `PAYLOAD_CRC32`'s doc); an early version of this test that
+        // checked `converged` alone was misled by exactly that on a stale
+        // (accumulator-reuse) bug during development.
+        let (_, d_rv0_alone, converged_rv0_alone, _) =
+            tx.harq_combine_and_decode(101, 0, k_used, payload_bits, &llrs_rv0);
+        assert!(
+            !(converged_rv0_alone && descramble_to_payload(&d_rv0_alone, payload.len()) == payload),
+            "RV0 alone (30% erasure) must NOT decode correctly -- test fixture invariant"
+        );
+        let (_, d_rv1_alone, converged_rv1_alone, _) =
+            tx.harq_combine_and_decode(102, 1, k_used, payload_bits, &llrs_rv1);
+        assert!(
+            !(converged_rv1_alone && descramble_to_payload(&d_rv1_alone, payload.len()) == payload),
+            "RV1 alone (30% erasure) must NOT decode correctly -- test fixture invariant"
+        );
+
+        // Combined: same seq for both transmissions.
+        const SEQ: u8 = 200;
+        let (_, d_first, converged_first, _) =
+            tx.harq_combine_and_decode(SEQ, 0, k_used, payload_bits, &llrs_rv0);
+        assert!(
+            !(converged_first && descramble_to_payload(&d_first, payload.len()) == payload),
+            "first transmission (RV0) alone must not decode correctly (sanity, same as the \
+             isolated probe above)"
+        );
+        let (_, decoded_bits, converged_combined, _) =
+            tx.harq_combine_and_decode(SEQ, 1, k_used, payload_bits, &llrs_rv1);
+        assert!(
+            converged_combined,
+            "RV0+RV1 combined via IR-HARQ must converge even though neither alone does"
+        );
+        assert_eq!(
+            descramble_to_payload(&decoded_bits, payload.len()),
+            payload,
+            "combined decode must recover the exact original payload"
+        );
+    }
+
+    /// Task 3 failing-test scenario (d): combining after Chase-only (the SAME
+    /// RV sent twice, each independently 30%-erased) also works -- adding
+    /// LLRs at the same mother-domain positions both times.
+    #[test]
+    fn harq_ir_chase_combines_same_rv_sent_twice() {
+        let payload = vec![0x7Bu8; 198]; // level 10's near-max payload capacity
+        let (tx, mother, k_used, payload_bits) = harq_test_fixture(&payload);
+
+        // Same RV (0) both times, but independent erasure patterns -- a
+        // position erased on the first transmission is very likely NOT
+        // erased on the second (and vice versa), so Chase-combining recovers
+        // it.
+        let llrs_a = erased_coded_llrs(&mother, k_used, 0, 0.30, 8.0, 0x5EED_0001);
+        let llrs_b = erased_coded_llrs(&mother, k_used, 0, 0.30, 8.0, 0x5EED_0002);
+
+        let (_, d_alone, converged_alone, _) =
+            tx.harq_combine_and_decode(210, 0, k_used, payload_bits, &llrs_a);
+        assert!(
+            !(converged_alone && descramble_to_payload(&d_alone, payload.len()) == payload),
+            "one RV0 transmission alone (30% erasure) must NOT decode correctly -- test fixture invariant"
+        );
+
+        const SEQ: u8 = 211;
+        let (_, d_first, converged_first, _) =
+            tx.harq_combine_and_decode(SEQ, 0, k_used, payload_bits, &llrs_a);
+        assert!(
+            !(converged_first && descramble_to_payload(&d_first, payload.len()) == payload),
+            "first RV0 transmission alone must not decode correctly (sanity)"
+        );
+        let (_, decoded_bits, converged_combined, _) =
+            tx.harq_combine_and_decode(SEQ, 0, k_used, payload_bits, &llrs_b);
+        assert!(
+            converged_combined,
+            "two independently-erased RV0 transmissions of the same seq (Chase combining) \
+             must converge even though neither alone does"
+        );
+        assert_eq!(
+            descramble_to_payload(&decoded_bits, payload.len()),
+            payload,
+            "Chase-combined decode must recover the exact original payload"
+        );
+    }
+
+    /// Task 3 failing-test scenario (c), part 1: a clean, CRC-passing decode
+    /// through the real `receive` path must evict its seq's IR-HARQ buffer
+    /// afterward, not leak it forever.
+    #[test]
+    fn harq_buffer_evicted_on_crc_pass() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let payload = vec![0x11u8; 20];
+        let header = make_header(2, payload.len() as u16); // fec_type=0 -> RV0, seq_num=0
+        let samples = tx
+            .transmit(&header, &payload)
+            .expect("payload within this test's speed level capacity");
+
+        assert!(
+            !tx.harq_rx.borrow().contains(header.seq_num),
+            "no buffer should exist before any receive"
+        );
+        let (_h, rx) = tx.receive(&samples).expect("clean loopback should decode");
+        assert_eq!(&rx[..payload.len()], payload.as_slice());
+        assert!(
+            !tx.harq_rx.borrow().contains(header.seq_num),
+            "a CRC-passing decode must evict its seq's IR-HARQ buffer, not leak it"
+        );
+    }
+
+    /// Task 3 failing-test scenario (c), part 2: inserting more than
+    /// `HARQ_MAX_BUFFERS` distinct in-flight seqs evicts the least-recently-
+    /// used ones to stay within the cap.
+    #[test]
+    fn harq_buffer_evicted_on_lru_overflow() {
+        let payload = vec![0x33u8; 20];
+        let (tx, mother, k_used, payload_bits) = harq_test_fixture(&payload);
+        // Deliberately weak (non-converging) LLRs so every seq's buffer is
+        // retained (not evicted by a CRC pass) -- isolates the LRU-overflow
+        // eviction path from the CRC-pass eviction path tested above.
+        let weak_llrs = erased_coded_llrs(&mother, k_used, 0, 0.9, 8.0, 0xDEAD);
+
+        let extra = 5u8;
+        for seq in 0u8..(HARQ_MAX_BUFFERS as u8 + extra) {
+            let _ = tx.harq_combine_and_decode(seq, 0, k_used, payload_bits, &weak_llrs);
+        }
+
+        assert_eq!(
+            tx.harq_rx.borrow().len(),
+            HARQ_MAX_BUFFERS,
+            "buffer count must be capped at HARQ_MAX_BUFFERS"
+        );
+        for seq in 0u8..extra {
+            assert!(
+                !tx.harq_rx.borrow().contains(seq),
+                "seq {seq} (least recently used) should have been evicted"
+            );
+        }
+        for seq in extra..(HARQ_MAX_BUFFERS as u8 + extra) {
+            assert!(
+                tx.harq_rx.borrow().contains(seq),
+                "seq {seq} (recently used) should still be buffered"
+            );
+        }
     }
 }
