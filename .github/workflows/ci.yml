@@ -133,10 +133,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Clone sunto
+        env:
+          SUNTO_TOKEN: ${{ secrets.SUNTO_RO_TOKEN }}
+        run: git clone "https://x-access-token:${SUNTO_TOKEN}@github.com/HagaleTechnologies/sunto.git" /tmp/sunto
       - name: Lint wiki
-        uses: HagaleTechnologies/sunto@v1
-        with:
-          path: wiki/
+        run: python3 /tmp/sunto/bin/wiki-lint wiki/
 
   # Summary gate for branch protection. bench-fuzz and platform are excluded:
   # bench-fuzz is compile-only (slow, no test signal) and platform is a matrix
