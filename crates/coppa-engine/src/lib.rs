@@ -8,9 +8,7 @@ pub mod config;
 pub mod engine;
 
 pub mod profiles;
-pub mod rate_control;
 
 pub use config::EngineConfig;
 pub use engine::CoppaCore;
 pub use profiles::{Profile, EMERGENCY, HF_ROBUST, HF_STANDARD, VHF_FAST};
-pub use rate_control::RateController;
