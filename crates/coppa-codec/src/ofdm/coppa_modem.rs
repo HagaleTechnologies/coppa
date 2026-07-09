@@ -111,6 +111,64 @@ const RC_OVERLAP: usize = 24;
 /// TX peak normalization target (fraction of full scale).
 const TX_PEAK: f32 = 0.5;
 
+/// Sampling-clock-offset (SCO) tracking tuning constants (Phase 3 Task 6,
+/// decision 7 -- see `demodulate_frame_impl`'s Pass 1 loop for where these are
+/// used, and its comment there for the method).
+///
+/// # Deviation from the plan's literal `alpha=0.1`
+///
+/// Decision 7's text specifies `alpha=0.1` verbatim. That value was tried
+/// first and directly measured to REGRESS
+/// `hf_standard_header_survives_watterson_moderate_fading` -- a channel with
+/// ZERO real sampling-clock offset (TX and RX share one sample clock; the only
+/// impairment is Watterson-Moderate multipath fading) -- from a 294/300
+/// (98.0%) baseline to 264/300 (88.0%) at a dedicated n=300 A/B sweep (not
+/// n=30 noise: a 10-point gap at n=300 is roughly 12 sigma under a binomial
+/// model). Root cause: this loop's per-symbol phase-slope estimate
+/// (`delay_domain::timing_offset_samples`) is exactly as susceptible, at
+/// PER-SYMBOL scale, to the same "swings toward whichever tap is
+/// instantaneously stronger" failure `estimate_coarse_delay`'s own doc warns
+/// about for a real two-tap Watterson channel (measured there, at FRAME
+/// scale, to swing up to the taps' full ~2.4-grid-unit separation -- around
+/// 48 real samples at `hf_standard`). With only ~4 pilots (3 usable adjacent
+/// pairs) per symbol to estimate from, a single momentarily-dominant-tap-swap
+/// can produce a huge, wrong single-symbol `tau`; at `alpha=0.1` one such
+/// symbol alone can jump the EWMA state by 10% of that huge (tens-of-samples)
+/// value -- comfortably past the 0.5-sample trigger threshold in one step,
+/// applying a real, wrong window slip despite there being no real SCO at all.
+///
+/// # Why lowering alpha (rather than only threshold) is safe for real SCO
+///
+/// This loop's raw per-symbol `tau` is the CURRENT accumulated drift since
+/// the last slip (not a per-symbol rate), because the FFT window doesn't
+/// move between symbols until a slip fires -- so a genuine steady SCO grows
+/// this value roughly linearly, symbol after symbol, regardless of `alpha`.
+/// A smaller `alpha` only adds LAG (more symbols of real drift accumulate
+/// before the EWMA catches up and crosses the threshold) -- harmless given
+/// `hf_standard`'s 300-sample cyclic prefix and the measured ~29-sample
+/// worst-case accumulated drift at 120ppm over a 5s frame (see
+/// `sco_tracking_recovers_multi_codeword_frame_under_sample_clock_offset`):
+/// enormous headroom to trade lag for noise rejection. A slower `alpha` also
+/// gives a MUCH longer effective averaging window (~1/alpha symbols) relative
+/// to Watterson-Moderate's ~0.3-0.6s fading coherence time, letting genuine
+/// zero-mean fading-driven swings (which reverse direction as the channel
+/// re-fades) average out over multiple independent fade realizations, while a
+/// real, one-directional SCO ramp keeps accumulating in the persistent EWMA
+/// state regardless.
+const SCO_EWMA_ALPHA: f32 = 0.05;
+/// Trigger threshold, in samples, per decision 7 (unchanged from the plan).
+const SCO_SLIP_THRESHOLD: f32 = 0.5;
+/// Clamp applied to each symbol's RAW phase-slope estimate before folding it
+/// into the EWMA (a second, independent defense alongside the lower `alpha`
+/// above). Real per-symbol SCO contributions are tiny fractions of a sample
+/// (~0.15 samples/symbol even at a generous 120ppm on `hf_standard`); a raw
+/// estimate anywhere near this bound is essentially always a transient
+/// 2-tap-fading "dominant path swing" artifact (which, unclamped, can measure
+/// tens of samples -- see `SCO_EWMA_ALPHA`'s doc), not real SCO, so this
+/// bounds how much any single noisy/faded symbol can perturb the persistent
+/// EWMA state in one step.
+const SCO_PER_SYMBOL_CLAMP: f32 = 2.0;
+
 /// High-level OFDM modem for the Coppa Protocol.
 pub struct CoppaModem {
     profile: CoppaProfile,
@@ -505,6 +563,29 @@ impl CoppaModem {
         &self,
         samples: &[f32],
     ) -> Option<(CoppaHeader, Vec<Complex32>, Vec<f32>)> {
+        self.demodulate_frame_impl(samples, true)
+    }
+
+    /// Test-only escape hatch: identical to [`Self::demodulate_frame`] but with
+    /// Phase 3 Task 6's sampling-clock-offset (SCO) tracking disabled, so a test
+    /// can demonstrate the effect SCO tracking fixes (a real decode failure on a
+    /// long, sample-clock-drifted frame with it off) against the exact same code
+    /// path used with it on -- not a hand-rolled duplicate that could silently
+    /// drift out of sync with the real implementation. Not `pub` outside tests:
+    /// this is not part of the public API.
+    #[cfg(test)]
+    pub(crate) fn demodulate_frame_without_sco(
+        &self,
+        samples: &[f32],
+    ) -> Option<(CoppaHeader, Vec<Complex32>, Vec<f32>)> {
+        self.demodulate_frame_impl(samples, false)
+    }
+
+    fn demodulate_frame_impl(
+        &self,
+        samples: &[f32],
+        sco_enabled: bool,
+    ) -> Option<(CoppaHeader, Vec<Complex32>, Vec<f32>)> {
         let symbol_len = self.profile.fft_size + self.profile.cp_samples;
         let data_per_sym = self.data_carriers_per_symbol();
 
@@ -576,19 +657,112 @@ impl CoppaModem {
         let mut payload_symbols = Vec::new();
         let mut noise_variances = Vec::new();
 
+        // `nc`/`derot` are needed both by SCO tracking below (to remove the fixed
+        // per-frame bulk-delay bias before estimating per-symbol drift -- see the
+        // SCO comment below) and by Pass 2 further down; computed once here since
+        // `coarse_delay` is already known (from `calib`, above) before Pass 1 runs.
+        let nc = self.profile.total_active_carriers();
+        let derot = coarse_delay_rotation(nc, coarse_delay);
+
         // Pass 1: demodulate every payload symbol and collect its carriers + pilots.
         let mut sym_carriers: Vec<(usize, Vec<Complex32>)> = Vec::with_capacity(num_payload_syms);
         let mut per_symbol_pilots: Vec<Vec<(usize, Complex32)>> =
             Vec::with_capacity(num_payload_syms);
+
+        // Sampling-clock-offset (SCO) tracking (Phase 3 Task 6, decision 7): a
+        // slow, LINEAR drift in apparent symbol timing across a long (possibly
+        // multi-codeword, Task 5) frame, caused by a small TX/RX sample-clock
+        // rate mismatch -- distinct from CFO (carrier frequency, already
+        // removed above) and from `coarse_delay` (a single bulk-delay reference
+        // fit ONCE from the probe symbol just before the header, see
+        // `probe_calibration`'s doc, and otherwise reused unchanged for the
+        // whole frame -- see `estimate_and_equalize`'s "Known unresolved
+        // limitation" doc for why that fixed reference does NOT itself track
+        // real intra-frame drift). Left uncorrected, a modest ppm-level clock
+        // error accumulates past half a sample by the end of a multi-second,
+        // multi-codeword frame, which this loop's plain
+        // `sym_start = data_start + global_sym * symbol_len` (the only formula
+        // used here before this task) has no mechanism to correct.
+        //
+        // # Method: per-symbol pilot phase slope (chosen over the brief's
+        // # alternative)
+        //
+        // The brief offered two options: (1) fit this symbol's pilot phase
+        // slope across frequency directly, or (2) re-run
+        // `DelayDomainEstimator::fit` at a +/-1-sample window slip and pick
+        // whichever of the 3 candidates has the lowest residual. (1) is a
+        // handful of complex multiply-adds over this symbol's ~4 pilots;
+        // (2) is 3 full ridge-regression solves per symbol. (1) is used here
+        // (`delay_domain::timing_offset_samples` -- see its doc for the full
+        // derivation and units) for exactly that cost reason, and because it's
+        // a natural, cheap-to-compute companion to `estimate_coarse_delay`
+        // (same "adjacent-pair product" technique), not a new estimator class.
+        //
+        // The per-symbol estimate is taken AFTER derotating this symbol's
+        // pilots by the SAME `derot` Pass 2 (below) applies -- i.e. with the
+        // fixed, frame-constant `coarse_delay` bias already removed -- so the
+        // measured slope reflects only DRIFT accumulated since the probe
+        // calibration (what we want to correct), not the constant calibration
+        // bias itself (which is not real SCO and must not falsely trigger a
+        // slip).
+        //
+        // EWMA-accumulated (alpha=0.1/symbol, per decision 7) rather than acted
+        // on directly per symbol: with only ~4 pilots/symbol the raw estimate is
+        // noisy (fading-induced pilot-phase wobble looks identical to a tiny
+        // real SCO contribution at a single symbol), and heavy smoothing is
+        // what lets a real, small, steady drift accumulate to significance
+        // while symbol-to-symbol noise averages toward zero. When the
+        // magnitude of the accumulated estimate reaches the decision's 0.5-
+        // sample threshold, `round()` of it is applied as an integer-sample
+        // slip to `sym_start` for all SUBSEQUENT symbols (accumulated in
+        // `sco_slip`, which persists across loop iterations so `sym_start`
+        // stays `frame_start`-relative-consistent -- every symbol after a slip
+        // is computed relative to the SAME running total, never reset), and
+        // the applied (rounded) amount is subtracted back out of the EWMA
+        // state so it tracks only the residual sub-sample error going forward,
+        // not the part just corrected.
+        let mut sco_ewma: f32 = 0.0;
+        let mut sco_slip: i64 = 0;
         for sym_idx in 0..num_payload_syms {
             let global_sym = num_header_syms + sym_idx;
-            let sym_start = data_start + global_sym * symbol_len;
+            let base_start = data_start as i64 + global_sym as i64 * symbol_len as i64;
+            let sym_start = if sco_enabled {
+                base_start + sco_slip
+            } else {
+                base_start
+            };
+            if sym_start < 0 {
+                break;
+            }
+            let sym_start = sym_start as usize;
             if sym_start + symbol_len > samples.len() {
                 break;
             }
             let sym_samples = &samples[sym_start..sym_start + symbol_len];
             let carriers = self.demod_ofdm_symbol(sym_samples);
             let pilot_info = self.extract_pilot_info(&carriers, global_sym);
+
+            if sco_enabled {
+                let derotated_pilots: Vec<(usize, Complex32)> = pilot_info
+                    .iter()
+                    .map(|&(idx, h)| (idx, h * derot(idx)))
+                    .collect();
+                if let Some(tau) = super::delay_domain::timing_offset_samples(
+                    self.profile.fft_size,
+                    &derotated_pilots,
+                ) {
+                    // Clamp before folding into the EWMA -- see `SCO_PER_SYMBOL_CLAMP`'s
+                    // doc for why an unclamped raw per-symbol estimate is unsafe.
+                    let tau = tau.clamp(-SCO_PER_SYMBOL_CLAMP, SCO_PER_SYMBOL_CLAMP);
+                    sco_ewma = SCO_EWMA_ALPHA * tau + (1.0 - SCO_EWMA_ALPHA) * sco_ewma;
+                }
+                if sco_ewma.abs() >= SCO_SLIP_THRESHOLD {
+                    let slip = sco_ewma.round() as i64;
+                    sco_slip += slip;
+                    sco_ewma -= slip as f32;
+                }
+            }
+
             per_symbol_pilots.push(pilot_info);
             sym_carriers.push((global_sym, carriers));
         }
@@ -625,7 +799,9 @@ impl CoppaModem {
         // own temporal accumulation (governed by `a`/`Q`) is the ONLY source of
         // cross-symbol pooling — not stacked on top of a second, overlapping
         // pooling layer.
-        let derot = coarse_delay_rotation(self.profile.total_active_carriers(), coarse_delay);
+        //
+        // `derot`/`nc` are the same instances computed above (before Pass 1),
+        // reused here rather than re-derived.
         let windows: Vec<Vec<(usize, Complex32, f32)>> = per_symbol_pilots
             .iter()
             .map(|sym_pilots| {
@@ -2018,6 +2194,153 @@ mod tests {
             "soft header decode should beat hard by a real, non-trivial margin on \
              watterson-poor @ {SNR_DB} dB, got soft={soft_pct:.1}% hard={hard_pct:.1}% \
              (n={TRIALS}, sync_failed={sync_failed})"
+        );
+    }
+
+    /// Resample by a linearly-growing fractional delay to simulate a genuine
+    /// sampling-clock-offset (SCO) of `ppm` parts-per-million between TX and RX
+    /// sample clocks. Distinct from `coppa_channel::timing_offset` (a FIXED
+    /// delay applied to the whole buffer, used elsewhere in this codebase to
+    /// simulate a one-time sync/multipath offset): this grows LINEARLY with
+    /// sample index, so the desync compounds across a long frame exactly as a
+    /// real ADC clock-rate mismatch would (rather than a one-time constant
+    /// shift). Plain linear interpolation (not windowed-sinc): this test only
+    /// needs a realistic TIMING effect over a multi-second frame, not spectral
+    /// purity, and the timing drift this produces (a small fraction of a
+    /// sample per output sample) is what Task 6's tracker needs to correct,
+    /// not an artifact this resampler itself introduces.
+    fn resample_with_sco_ppm(samples: &[f32], ppm: f32) -> Vec<f32> {
+        let scale = 1.0 + ppm / 1.0e6;
+        let out_len = ((samples.len() as f32) / scale).floor() as usize;
+        let mut out = Vec::with_capacity(out_len);
+        for i in 0..out_len {
+            let src = i as f32 * scale;
+            let idx = src.floor() as usize;
+            let frac = src - idx as f32;
+            if idx + 1 < samples.len() {
+                out.push(samples[idx] * (1.0 - frac) + samples[idx + 1] * frac);
+            } else if idx < samples.len() {
+                out.push(samples[idx]);
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Deterministic, non-trivial (not all +1) BPSK +/-1 bit pattern via a
+    /// small xorshift PRNG -- avoids both an all-ones pattern (which couldn't
+    /// reveal a systematic sign error) and a real `rand` dependency for what's
+    /// just a fixed test fixture.
+    fn deterministic_bpsk_pattern(n: usize) -> Vec<Complex32> {
+        let mut state: u32 = 0x9E37_79B9;
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                Complex32::new(if state & 1 == 0 { 1.0 } else { -1.0 }, 0.0)
+            })
+            .collect()
+    }
+
+    /// Phase 3 Task 6 (decision 7): a 5-second, multi-codeword (Task 5), level-2
+    /// (BPSK) frame under a realistic +120 ppm sampling-clock offset must decode
+    /// correctly WITH SCO tracking on, and must demonstrably fail (or at least
+    /// decode far worse) WITH IT OFF -- guarding both directions, per the task
+    /// brief, so this is a real, demonstrated effect rather than "passes either
+    /// way." `demodulate_frame`/`demodulate_frame_without_sco` are the exact
+    /// same code path modulo the SCO-tracking block itself (see
+    /// `demodulate_frame_impl`), so this isolates that block's effect
+    /// specifically, not some unrelated difference.
+    #[test]
+    fn sco_tracking_recovers_multi_codeword_frame_under_sample_clock_offset() {
+        let profile = CoppaProfile::hf_standard();
+        let modem = CoppaModem::new(profile.clone(), 1);
+
+        const CODED_BLOCK_LEN: usize = 1944; // one LDPC codeword's coded-bit count
+        let level = 2u8; // BPSK (SPEED_LEVELS[level 2].bits_per_symbol == 1)
+        let codewords = 4u8; // ~5s of payload at hf_standard's symbol rate, see below
+        let coded_symbols = CODED_BLOCK_LEN * codewords as usize;
+        let tx_symbols = deterministic_bpsk_pattern(coded_symbols);
+
+        let header = CoppaHeader {
+            version: 1,
+            phy_mode: profile.phy_mode,
+            frame_type: CoppaFrameType::Data,
+            bandwidth: profile.bandwidth_id,
+            fec_type: 0,
+            speed_level: level,
+            seq_num: 0,
+            payload_len: 8,
+            codewords,
+        };
+
+        let clean = modem.modulate_mapped(&header, &tx_symbols, 6.0);
+        let duration_s = clean.len() as f32 / profile.sample_rate as f32;
+        assert!(
+            duration_s >= 4.0,
+            "test fixture should be a multi-second frame (Task 5 multi-codeword), got {duration_s}s"
+        );
+
+        // +120 ppm sample-clock offset, growing linearly across the whole frame
+        // (~28-29 samples of accumulated drift by the end of a ~4.8s frame at
+        // 48 kHz -- comfortably within `hf_standard`'s 300-sample cyclic prefix,
+        // so this exercises SCO's actual failure mode (a growing phase-slope
+        // error the fixed-per-frame delay-domain model can't represent, not
+        // literal inter-symbol interference from falling outside the CP).
+        let drifted = resample_with_sco_ppm(&clean, 120.0);
+
+        let with_sco = modem
+            .demodulate_frame(&drifted)
+            .expect("header + payload should demodulate with SCO tracking on");
+        let without_sco = modem.demodulate_frame_without_sco(&drifted);
+
+        let bit_error_rate = |rx_symbols: &[Complex32]| -> f32 {
+            let n = rx_symbols.len().min(tx_symbols.len());
+            let errors = rx_symbols[..n]
+                .iter()
+                .zip(tx_symbols[..n].iter())
+                .filter(|(&rx, &tx)| (if rx.re >= 0.0 { 1.0 } else { -1.0 }) != tx.re)
+                .count();
+            errors as f32 / n as f32
+        };
+
+        let (rx_header, with_sco_symbols, _) = with_sco;
+        assert_eq!(rx_header.codewords, codewords);
+        let with_sco_ber = bit_error_rate(&with_sco_symbols);
+
+        // WITHOUT SCO tracking: either demodulation fails outright, or it
+        // "succeeds" but with a far higher bit error rate than the SCO-on case.
+        let without_sco_ber = match without_sco {
+            Some((_, rx_symbols, _)) => bit_error_rate(&rx_symbols),
+            None => 1.0,
+        };
+
+        eprintln!(
+            "sco_tracking test: with_sco_ber={:.4} without_sco_ber={:.4}",
+            with_sco_ber, without_sco_ber
+        );
+
+        // With SCO tracking: near-clean recovery (the pre-existing
+        // `test_coppa_modem_clean_loopback` documents a ~3-5% residual
+        // clean-channel mismatch rate unrelated to timing, so this allows
+        // comparable headroom).
+        assert!(
+            with_sco_ber < 0.08,
+            "SCO tracking ON should recover this frame with a low bit error rate, got {with_sco_ber:.4}"
+        );
+        // Without SCO tracking: a real, substantially worse outcome -- not
+        // "passes either way".
+        assert!(
+            without_sco_ber > 0.20,
+            "SCO tracking OFF should measurably fail to track the drift (expected a much \
+             higher bit error rate than the {with_sco_ber:.4} SCO-on case), got {without_sco_ber:.4}"
+        );
+        assert!(
+            without_sco_ber > with_sco_ber + 0.15,
+            "SCO tracking should make a real, demonstrated difference: on={with_sco_ber:.4} \
+             off={without_sco_ber:.4}"
         );
     }
 }

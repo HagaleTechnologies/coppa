@@ -181,6 +181,100 @@ pub fn estimate_coarse_delay(nc: usize, probe_h: &[Complex32]) -> f32 {
     -acc.arg() * nc as f32 / std::f32::consts::TAU
 }
 
+/// Estimate a per-symbol sampling-clock-offset (SCO) contribution, in REAL ADC
+/// SAMPLES, from a sparse set of pilot `(active_carrier_index, received_value)`
+/// pairs -- the fine-grained, per-symbol, real-sample-domain sibling of
+/// [`estimate_coarse_delay`]'s full-comb bulk-delay estimate. See
+/// `docs/superpowers/plans/2026-07-03-phase3-system-layer.md` decision 7 /
+/// `.superpowers/sdd/task-6-brief.md` ("Task 6: SCO tracking") for the design
+/// this implements.
+///
+/// # Units: real samples, NOT [`estimate_coarse_delay`]'s "grid units"
+///
+/// This is the one important, easy-to-get-wrong distinction from
+/// [`estimate_coarse_delay`]/[`tau_basis`]'s convention, which normalizes by
+/// `nc` (the ACTIVE CARRIER COUNT) rather than the FFT size, i.e. its output
+/// is in "grid units" where 1 unit = `fft_size / nc` real ADC samples (for
+/// `hf_standard`: `960/48 = 20` samples/unit -- this is exactly why
+/// `bounded_coarse_delay`'s doc can simultaneously say "≈1.5 grid units" and
+/// "locks ~30 samples earlier": `1.5 * 20 = 30`). Coppa packs its `nc` active
+/// carriers into `nc` CONSECUTIVE FFT bins (`bin = first_active_bin() + k`,
+/// see `CoppaModem::demod_ofdm_symbol`), so a genuine timing offset of `τ`
+/// REAL SAMPLES produces `H(bin) ∝ exp(-j·2π·bin·τ/fft_size)` (the ordinary
+/// DFT shift theorem against the FULL `fft_size`-point transform) -- and,
+/// because consecutive active-carrier indices map 1:1 to consecutive bins,
+/// the exact same ramp holds w.r.t. active-carrier index `k`:
+/// `dφ/dk = -2π·τ/fft_size`. This function solves for `τ` directly in that
+/// (real-sample) convention -- callers that want a value in the OTHER
+/// (`nc`-normalized, `tau_basis`-compatible) convention should NOT reuse this
+/// function; multiply this function's output by `nc/fft_size` if that's ever
+/// needed.
+///
+/// # Method
+///
+/// Coppa pilots are always known +1 BPSK, so each `h` already IS that
+/// carrier's channel estimate (see `CoppaModem::extract_pilot_info`'s doc) --
+/// no separate "known pilot value" needs to be divided out. This sorts the
+/// given pilots by carrier index, finds the (generally > 1, and not
+/// necessarily 1 -- see [`super::pilots::CoppaPilotPattern`]'s even/odd comb)
+/// modal gap between consecutive pilots, accumulates
+/// `Σ h[k+gap]·conj(h[k])` over only the pairs matching that modal gap (a
+/// single irregular/clipped final pilot -- `CoppaPilotPattern`'s
+/// `.min(total_carriers - 1)` edge clamp -- is thus excluded rather than
+/// skewing the estimate), and solves for `τ` from the accumulated phase, the
+/// same "sum of adjacent-pair products, take arg of the sum" technique
+/// [`estimate_coarse_delay`] uses for the frame-global bulk delay (which
+/// implicitly weights each pair's contribution by its own magnitude, so
+/// weak/noisy pilots contribute less).
+///
+/// Returns `None` if fewer than 2 pilots are given, no pair shares the modal
+/// gap, or the resulting accumulator is degenerately small (near-zero
+/// magnitude — no reliable phase to extract).
+///
+/// # Aliasing range
+///
+/// The accumulated phase wraps every `fft_size/gap` samples of `τ`, so this
+/// is only unambiguous for `|τ| < fft_size/(2·gap)`. For `hf_standard`'s
+/// 4-pilot comb (`gap=12`, `fft_size=960`) that is `±40` samples -- generous
+/// headroom for the sub-CP (`cp_samples=300`) per-symbol drift this function
+/// targets.
+pub fn timing_offset_samples(fft_size: usize, pilots: &[(usize, Complex32)]) -> Option<f32> {
+    if fft_size == 0 || pilots.len() < 2 {
+        return None;
+    }
+    let mut sorted: Vec<(usize, Complex32)> = pilots.to_vec();
+    sorted.sort_by_key(|&(k, _)| k);
+
+    // Modal (most common exact) gap between consecutive pilots -- ordinarily
+    // every gap in one of Coppa's evenly-spaced combs is identical, but an
+    // arithmetic mean would let a single irregular/clipped edge pilot (see
+    // this function's doc) skew the reference gap away from EVERY actual
+    // pair, so this counts exact-gap frequency instead and takes the winner.
+    use std::collections::BTreeMap;
+    let mut gap_counts: BTreeMap<usize, usize> = BTreeMap::new();
+    for w in sorted.windows(2) {
+        let (k0, _) = w[0];
+        let (k1, _) = w[1];
+        if k1 > k0 {
+            *gap_counts.entry(k1 - k0).or_insert(0) += 1;
+        }
+    }
+    let (&ref_gap, _) = gap_counts.iter().max_by_key(|&(_, &count)| count)?;
+
+    let mut acc = Complex32::new(0.0, 0.0);
+    for w in sorted.windows(2) {
+        let (k0, h0) = w[0];
+        let (k1, h1) = w[1];
+        if k1.saturating_sub(k0) == ref_gap {
+            acc += h1 * h0.conj();
+        }
+    }
+    if acc.norm_sqr() < 1e-20 {
+        return None;
+    }
+    Some(-acc.arg() * fft_size as f32 / (std::f32::consts::TAU * ref_gap as f32))
+}
+
 impl DelayDomainEstimator {
     /// Fit from (carrier_index, observed H, weight) triples. Weights are pooling
     /// counts (pilots pooled over a symbol window) or `|x̄|²` (turbo virtual pilots).
@@ -489,5 +583,74 @@ mod tests {
         let probe_h = vec![Complex32::new(1.0, 0.0); nc];
         let est_ell = estimate_coarse_delay(nc, &probe_h);
         assert!(est_ell.abs() < 1e-4, "expected ~0, got {est_ell}");
+    }
+
+    /// `timing_offset_samples` must recover a known REAL-SAMPLE delay from a
+    /// sparse pilot comb matching Coppa's actual pilot spacing (4 pilots,
+    /// gap=12, `hf_standard`'s even/odd comb) -- and, critically, must NOT be
+    /// off by the `fft_size/nc` scale factor that distinguishes it from
+    /// `estimate_coarse_delay`'s "grid unit" convention (see this function's
+    /// doc).
+    #[test]
+    fn timing_offset_samples_recovers_known_sample_delay_from_sparse_pilots() {
+        let fft_size = 960;
+        let true_tau = 4.5f32; // real ADC samples
+        let pilots: Vec<(usize, Complex32)> = [0usize, 12, 24, 36]
+            .iter()
+            .map(|&k| {
+                let ang = -std::f32::consts::TAU * (k as f32) * true_tau / fft_size as f32;
+                (k, Complex32::new(ang.cos(), ang.sin()))
+            })
+            .collect();
+        let est = timing_offset_samples(fft_size, &pilots).expect("should estimate a slope");
+        assert!(
+            (est - true_tau).abs() < 0.01,
+            "expected ~{true_tau}, got {est}"
+        );
+    }
+
+    #[test]
+    fn timing_offset_samples_recovers_negative_delay() {
+        let fft_size = 960;
+        let true_tau = -3.2f32;
+        let pilots: Vec<(usize, Complex32)> = [6usize, 18, 30, 42]
+            .iter()
+            .map(|&k| {
+                let ang = -std::f32::consts::TAU * (k as f32) * true_tau / fft_size as f32;
+                (k, Complex32::new(ang.cos(), ang.sin()))
+            })
+            .collect();
+        let est = timing_offset_samples(fft_size, &pilots).expect("should estimate a slope");
+        assert!(
+            (est - true_tau).abs() < 0.01,
+            "expected ~{true_tau}, got {est}"
+        );
+    }
+
+    #[test]
+    fn timing_offset_samples_needs_at_least_two_pilots() {
+        assert!(timing_offset_samples(960, &[]).is_none());
+        assert!(timing_offset_samples(960, &[(0, Complex32::new(1.0, 0.0))]).is_none());
+    }
+
+    #[test]
+    fn timing_offset_samples_ignores_a_clipped_edge_pilot() {
+        // Same 4-pilot comb as above, but the last pilot has been clipped to
+        // `total_carriers - 1` (47) instead of the regular grid position (36),
+        // as `CoppaPilotPattern::new` does for edge cases -- the mismatched
+        // final gap (11, not 12) must be excluded rather than skew the
+        // estimate.
+        let fft_size = 960;
+        let true_tau = 2.0f32;
+        let h_at = |k: usize| {
+            let ang = -std::f32::consts::TAU * (k as f32) * true_tau / fft_size as f32;
+            Complex32::new(ang.cos(), ang.sin())
+        };
+        let pilots = vec![(0, h_at(0)), (12, h_at(12)), (24, h_at(24)), (47, h_at(35))];
+        let est = timing_offset_samples(fft_size, &pilots).expect("should estimate a slope");
+        assert!(
+            (est - true_tau).abs() < 0.01,
+            "expected ~{true_tau}, got {est}"
+        );
     }
 }
