@@ -35,10 +35,8 @@ use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::arq::DEFAULT_TURNAROUND;
 use coppa_protocol::modem::airtime::frame_airtime_s;
 use coppa_protocol::modem::speed_levels::{max_multi_payload_for_level, max_payload_for_level};
+use coppa_protocol::modem::transceiver::MAX_CODEWORDS;
 use coppa_protocol::modem::CoppaTransceiver;
-
-/// Multi-codeword frames, per decision 6: up to 8 codewords per frame.
-const MAX_CODEWORDS: u8 = 8;
 
 /// 10 kB transfer, matching the job item's own wording.
 const TOTAL_BYTES: usize = 10 * 1024;

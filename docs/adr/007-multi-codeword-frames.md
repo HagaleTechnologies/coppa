@@ -27,8 +27,12 @@ little rather than one codeword a lot.
    before this task, and the common case after it) encodes to nibble `0`, byte-for-byte identical
    to the pre-this-task `reserved: 0` wire format -- this is what makes the change backward
    compatible for single-codeword frames specifically, not a fully-general "any header change is
-   fine" claim. The 4-bit field's full range is `codewords ∈ 1..=16`; only `1..=8` (the plan's
-   budget) is produced/accepted by `CoppaTransceiver` today, the rest is unused wire headroom.
+   fine" claim. The 4-bit field's full range is `codewords ∈ 1..=16`; only `1..=8`
+   (`transceiver::MAX_CODEWORDS`, the plan's budget) is actually produced/accepted --
+   `transmit` rejects a request above it (`TransmitError::TooManyCodewords`) and `receive_core`
+   rejects a decoded header claiming more (`ReceiveError::HeaderCorrupt`), both added as a
+   review fix (task review of the initial implementation found this stated as a design
+   invariant but not actually enforced in code). `9..=16` remains unused wire headroom.
 
 2. **Payload CRC-32 moves from "one CRC over the whole payload" to "one CRC-32 per codeword".**
    `CoppaTransceiver::transmit` splits the payload across `codewords` near-equal chunks
