@@ -27,6 +27,7 @@ fn main() {
         speed_level: 1,
         seq_num: 0,
         payload_len: payload.len() as u16,
+        codewords: 1,
     };
     let clean = tx
         .transmit(&header, &payload)

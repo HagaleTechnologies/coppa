@@ -164,6 +164,7 @@ impl CoppaCore {
             speed_level: self.config.speed_level,
             seq_num: 0,
             payload_len: payload.len() as u16,
+            codewords: 1,
         };
 
         let samples = self

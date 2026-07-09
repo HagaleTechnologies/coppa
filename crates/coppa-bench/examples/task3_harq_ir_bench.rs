@@ -86,6 +86,7 @@ fn make_header(payload_len: u16, seq_num: u8, rv: u8) -> CoppaHeader {
         speed_level: LEVEL,
         seq_num,
         payload_len,
+        codewords: 1,
     }
 }
 

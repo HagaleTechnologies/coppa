@@ -300,6 +300,7 @@ impl CoppaModem {
             speed_level: 1,
             seq_num: 0,
             payload_len: 8,
+            codewords: 1,
         };
         let symbols = vec![Complex32::new(1.0, 0.0); 64];
         let samples = self.modulate_mapped(&header, &symbols, 6.0);
@@ -552,11 +553,22 @@ impl CoppaModem {
 
         // Compute coded payload symbols from header's speed level.
         // 1944 = LDPC coded block length (Z=81, 24 base columns).
+        //
+        // Phase 3 Task 5 (multi-codeword frames): `header.codewords` (1..=8 in
+        // production, see `CoppaHeader`'s doc) codewords are carried back-to-back
+        // in this one frame's payload, each its own independent 1944-coded-bit
+        // LDPC codeword mapped to its own run of constellation symbols -- so the
+        // total constellation-symbol count this frame's payload occupies is
+        // `codewords` times one codeword's count. `codewords == 1` (every frame
+        // before this task) reproduces the exact pre-Task-5 symbol count.
         const CODED_BLOCK_LEN: usize = 1944;
         let coded_symbols = SPEED_LEVELS
             .iter()
             .find(|s| s.level == header.speed_level)
-            .map(|s| CODED_BLOCK_LEN.div_ceil(s.bits_per_symbol as usize))
+            .map(|s| {
+                CODED_BLOCK_LEN.div_ceil(s.bits_per_symbol as usize)
+                    * header.codewords.max(1) as usize
+            })
             .unwrap_or(CODED_BLOCK_LEN);
 
         // 3. Payload: demodulate enough OFDM symbols for `coded_symbols` complex values
@@ -1366,6 +1378,7 @@ mod tests {
                 speed_level,
                 seq_num: 0,
                 payload_len,
+                codewords: 1,
             };
             let n_symbols = (payload_len as usize) * 8; // more than enough carriers
             let symbols: Vec<Complex32> = (0..n_symbols)
@@ -1451,6 +1464,7 @@ mod tests {
             speed_level: 2,
             seq_num: 7,
             payload_len: 22,
+            codewords: 1,
         };
 
         // Enough BPSK-like symbols to cover a full LDPC codeword's worth of
@@ -1549,6 +1563,7 @@ mod tests {
             speed_level: 2,
             seq_num: 0,
             payload_len: 22,
+            codewords: 1,
         };
         let n_symbols = 3000;
         let symbols: Vec<Complex32> = (0..n_symbols)
@@ -1604,6 +1619,7 @@ mod tests {
             speed_level: 3,
             seq_num: 0,
             payload_len: 50,
+            codewords: 1,
         };
 
         let payload_symbols: Vec<Complex32> = (0..100)
@@ -1634,6 +1650,7 @@ mod tests {
             speed_level: 2,
             seq_num: 0,
             payload_len: 20,
+            codewords: 1,
         };
         let symbols: Vec<Complex32> = (0..3000)
             .map(|i| {
@@ -1719,6 +1736,7 @@ mod tests {
             speed_level: 2,
             seq_num: 0,
             payload_len: 60,
+            codewords: 1,
         };
         let symbols = vec![Complex32::new(1.0, 0.0); 972];
         let s = modem.modulate_mapped(&header, &symbols, 6.0);
@@ -1754,6 +1772,7 @@ mod tests {
             speed_level: 2,
             seq_num: 0,
             payload_len: 60,
+            codewords: 1,
         };
         let symbols = vec![Complex32::new(1.0, 0.0); 972];
         let s = modem.modulate_mapped(&header, &symbols, 6.0);
@@ -1914,6 +1933,7 @@ mod tests {
             speed_level: 2,
             seq_num: 0,
             payload_len: 20,
+            codewords: 1,
         };
         let symbols: Vec<Complex32> = (0..200)
             .map(|i| {

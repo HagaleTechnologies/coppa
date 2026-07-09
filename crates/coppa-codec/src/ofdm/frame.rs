@@ -217,8 +217,25 @@ impl CoppaFrameType {
 /// byte 2: [fec_type:4][speed_level:4]
 /// byte 3: [seq_num:8]
 /// byte 4: [payload_len high 8 bits]
-/// byte 5: [payload_len low 4 bits][reserved:4]
+/// byte 5: [payload_len low 4 bits][codewords-1:4]
 /// ```
+///
+/// # Multi-codeword frames (Phase 3 Task 5)
+///
+/// The byte 5 low nibble, `reserved:4` pre-Task-5, now carries `codewords - 1`
+/// (i.e. `0..=15`, encoding `codewords ∈ 1..=16`): this frame's LDPC codeword
+/// count. Only `1..=8` are actually produced/accepted by
+/// `coppa_protocol::modem::transceiver::CoppaTransceiver` today (the plan's "up
+/// to 8 codewords back-to-back" budget) -- `9..=16` are valid on the wire
+/// (roundtrip cleanly through `to_bytes`/`from_bytes`) but unused, headroom for
+/// a future larger batch without another wire-format break.
+///
+/// Encoding `codewords - 1` (not `codewords` directly) is deliberate: it makes
+/// `codewords == 1` -- every frame before this task, and the overwhelmingly
+/// common case after it -- encode to nibble `0`, byte-for-byte IDENTICAL to
+/// the pre-Task-5 `reserved: 0` wire format. This is what makes the change
+/// backward-compatible for single-codeword frames despite reusing what used
+/// to be dead bits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoppaHeader {
     /// Protocol version (4 bits).
@@ -243,8 +260,19 @@ pub struct CoppaHeader {
     pub speed_level: u8,
     /// Sequence number (8 bits).
     pub seq_num: u8,
-    /// Payload length in bytes (12 bits, max 4095).
+    /// Payload length in bytes (12 bits, max 4095). For a multi-codeword frame
+    /// (`codewords > 1`) this is the TOTAL application-payload length summed
+    /// across every codeword, not any single codeword's share -- see
+    /// `coppa_protocol::modem::transceiver::split_payload_across_codewords`
+    /// for how a receiver recovers each codeword's individual byte range from
+    /// this total plus `codewords`.
     pub payload_len: u16,
+    /// Number of LDPC codewords carried back-to-back in this frame's payload
+    /// (Phase 3 Task 5), `1..=16` on the wire (see this struct's doc for the
+    /// `codewords - 1` encoding and the `1..=8` production range). `1` (the
+    /// default/pre-Task-5 value) means today's single-codeword frame, encoded
+    /// identically to every frame before this field existed.
+    pub codewords: u8,
 }
 
 impl CoppaHeader {
@@ -252,13 +280,14 @@ impl CoppaHeader {
     pub fn to_bytes(&self) -> [u8; 6] {
         let payload_hi = ((self.payload_len >> 4) & 0xFF) as u8;
         let payload_lo = ((self.payload_len & 0x0F) as u8) << 4; // low nibble in upper half of byte 5
+        let codewords_field = self.codewords.saturating_sub(1) & 0x0F; // codewords-1: see doc
         [
             (self.version << 4) | (self.phy_mode & 0x0F),
             ((self.frame_type as u8) << 4) | (self.bandwidth & 0x0F),
             (self.fec_type << 4) | (self.speed_level & 0x0F),
             self.seq_num,
             payload_hi,
-            payload_lo, // reserved nibble is 0
+            payload_lo | codewords_field,
         ]
     }
 
@@ -272,6 +301,7 @@ impl CoppaHeader {
         let speed_level = bytes[2] & 0x0F;
         let seq_num = bytes[3];
         let payload_len = ((bytes[4] as u16) << 4) | ((bytes[5] as u16) >> 4);
+        let codewords = (bytes[5] & 0x0F) + 1;
         let frame_type = CoppaFrameType::from_u8(frame_type_raw)?;
         Some(CoppaHeader {
             version,
@@ -282,6 +312,7 @@ impl CoppaHeader {
             speed_level,
             seq_num,
             payload_len,
+            codewords,
         })
     }
 
@@ -403,6 +434,7 @@ mod tests {
             speed_level: 5,
             seq_num: 42,
             payload_len: 512,
+            codewords: 1,
         };
         let bits = header.to_bits();
         assert_eq!(bits.len(), 48);
@@ -416,6 +448,63 @@ mod tests {
         assert_eq!(decoded.speed_level, 5);
         assert_eq!(decoded.seq_num, 42);
         assert_eq!(decoded.payload_len, 512);
+    }
+
+    /// Task 5 scenario (a): the header round-trips `codewords` for every value
+    /// in the production range `1..=8` (and a couple of headroom values beyond
+    /// it, `9`/`16`, to confirm the full 4-bit field roundtrips even though
+    /// only `1..=8` is actually produced by `CoppaTransceiver` today).
+    #[test]
+    fn test_coppa_header_codewords_roundtrip() {
+        for codewords in [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 16] {
+            let header = CoppaHeader {
+                version: 1,
+                phy_mode: 0,
+                frame_type: CoppaFrameType::Data,
+                bandwidth: 2,
+                fec_type: 0,
+                speed_level: 6,
+                seq_num: 7,
+                payload_len: 800,
+                codewords,
+            };
+            let bytes = header.to_bytes();
+            let decoded = CoppaHeader::from_bytes(&bytes).expect("valid frame type");
+            assert_eq!(
+                decoded.codewords, codewords,
+                "codewords={codewords} should round-trip through to_bytes/from_bytes"
+            );
+
+            // Also exercise the bit-level path (to_bits/from_bits), which just
+            // wraps to_bytes/from_bytes.
+            let bits = header.to_bits();
+            let decoded_bits = CoppaHeader::from_bits(&bits).expect("valid frame type");
+            assert_eq!(decoded_bits.codewords, codewords);
+        }
+    }
+
+    /// A single-codeword header (`codewords: 1`, the default/pre-Task-5 value)
+    /// must encode to EXACTLY the same 6 bytes as the pre-Task-5 wire format,
+    /// where byte 5's low nibble was `reserved: 0`. This is the backward-
+    /// compatibility guarantee the `codewords - 1` encoding (rather than
+    /// `codewords` directly) is chosen for -- see `CoppaHeader`'s doc.
+    #[test]
+    fn test_coppa_header_single_codeword_byte_identical_to_pre_task5() {
+        let header = CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: CoppaFrameType::Data,
+            bandwidth: 2,
+            fec_type: 3,
+            speed_level: 5,
+            seq_num: 42,
+            payload_len: 512,
+            codewords: 1,
+        };
+        let bytes = header.to_bytes();
+        // byte 5: payload_len low nibble (512 & 0xF = 0) in the high nibble,
+        // reserved/codewords-1 nibble (0) in the low nibble -- both zero here.
+        assert_eq!(bytes[5] & 0x0F, 0, "codewords=1 must encode to nibble 0");
     }
 
     #[test]
@@ -439,6 +528,7 @@ mod tests {
                 speed_level: 2,
                 seq_num: 0,
                 payload_len: 100,
+                codewords: 1,
             };
             let bits = header.to_bits();
             let decoded = CoppaHeader::from_bits(&bits).unwrap();
@@ -461,6 +551,7 @@ mod tests {
             speed_level: 10,
             seq_num: 255,
             payload_len: 4095,
+            codewords: 1,
         };
         let bits = header.to_bits();
         assert_eq!(bits.len(), 48);
@@ -482,6 +573,7 @@ mod tests {
             speed_level: 6,
             seq_num: 200,
             payload_len: 1234,
+            codewords: 1,
         };
         let bytes = header.to_bytes();
         assert_eq!(bytes.len(), 6);
