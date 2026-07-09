@@ -34,9 +34,10 @@
 //! vary it, by design (measuring the actual in-flight frame, not a separate probe), which is exactly
 //! what exposes a self-reinforcing bias: the higher the current level climbs, the more inflated its
 //! own capacity reading becomes, so the loop keeps getting told to climb further regardless of the
-//! real channel. This is a real, pre-existing property of the shared channel-estimation/capacity
-//! layer (consistent with the still-open channel-estimation limitation in CLAUDE.md's Known
-//! Limitations), not a bug introduced by this bench or by `RateLoop`'s hysteresis logic -- and fixing
+//! real channel. If this hypothesis holds, it would be a pre-existing property of the shared
+//! channel-estimation/capacity layer (consistent with the still-open channel-estimation
+//! limitation in CLAUDE.md's Known Limitations), not a bug introduced by this bench or by
+//! `RateLoop`'s hysteresis logic -- and fixing
 //! it is out of this task's scope (it would mean either a level-invariant capacity metric or a
 //! per-level-recalibrated threshold table, both belonging to the channel-estimation/MCS-calibration
 //! work, not the rate-loop controller). See `.superpowers/sdd/task-4-report.md` for the full
