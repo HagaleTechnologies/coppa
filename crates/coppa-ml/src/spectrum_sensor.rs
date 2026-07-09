@@ -143,7 +143,15 @@ impl SpectrumSensor {
         if half == 0 {
             return 0.0;
         }
-        let res = self.frequency_resolution();
+        // NOT `self.frequency_resolution()` (`sample_rate / fft_size`, the constructor's
+        // FIXED size): `power_spectrum` computes an FFT of `n = fft_size.min(samples.len())`,
+        // so whenever the caller passes fewer samples than `fft_size` (the daemon's normal
+        // steady-state case -- see this method's call site in `BusyGate`, fed whatever a
+        // ~20ms poll tick currently has available, routinely fewer than a 1024-sample
+        // `fft_size` at 48kHz) the REAL bin spacing of `spectrum` is `sample_rate / n`, not
+        // `sample_rate / fft_size`. Using the fixed-size resolution here would silently
+        // mis-band the 300-2800 Hz gate under exactly the block sizes this actually runs on.
+        let res = self.sample_rate / n as f32;
         let threshold = self.noise_floor + margin_db;
 
         let lo_bin = ((low_hz / res).floor().max(0.0) as usize).min(half);
@@ -304,6 +312,32 @@ mod tests {
             occ < 0.05,
             "Out-of-band tone must not register as significant in-band occupancy: {}",
             occ
+        );
+    }
+
+    /// Review finding: `band_occupancy` must use the ACTUAL spectrum length's bin
+    /// resolution (`sample_rate / n`), not the constructor's fixed `fft_size` -- the
+    /// daemon's real call site (`BusyGate`, fed whatever a ~20ms poll tick has available)
+    /// routinely passes fewer samples than `fft_size`. Under the old (buggy) fixed-size
+    /// resolution, a shorter block's `half` (correctly derived from the real spectrum
+    /// length) no longer lines up with the fixed-size resolution's bin math, silently
+    /// widening the gated band -- e.g. at fft_size=1024/sample_rate=8000 fed only 512
+    /// samples, the old code's hi_bin clamped to the (correct) `half=256`, which in real
+    /// frequency terms is 4000 Hz, not the intended 2800 Hz -- so a 3200 Hz tone
+    /// (genuinely out of the 300-2800 Hz band) would have been misclassified as in-band.
+    #[test]
+    fn test_band_occupancy_uses_actual_block_length_not_constructor_fft_size() {
+        let mut sensor = SpectrumSensor::new(1024, 8000.0);
+        settle_noise_floor(&mut sensor);
+
+        // Half as many samples as the constructor's fft_size -- exactly the daemon's
+        // normal "poll tick has less than fft_size samples available" case.
+        let tone = generate_tone(3200.0, 8000.0, 512, 1.0);
+        let occ = sensor.band_occupancy(&tone, 300.0, 2800.0, 6.0);
+        assert!(
+            occ < 0.05,
+            "a 3200 Hz tone is outside the 300-2800 Hz band and must not register as \
+             in-band occupancy even when fed a shorter-than-fft_size block: {occ}"
         );
     }
 
