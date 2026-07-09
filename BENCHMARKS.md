@@ -53,14 +53,19 @@ further hysteresis tuning; the acceptance target (adaptive/best-fixed > 1.0,
 adaptive/oracle ≥ 0.8) is out of reach via `RateLoop`'s parameters alone at this
 operating point.
 
-**Root cause, confirmed by direct measurement:** the per-carrier capacity metric
-this recommendation is built on (`channel_capacity`/`noise_vars`, already used
-elsewhere and calibrated before this task) is not invariant to which speed
-level the measured frame happened to use — at a fixed, true, injected AWGN SNR
-(no fading), averaged over 30 seeds, a level-7 transmission's own channel
-estimate reads several dB higher "capacity" than an identical channel measured
-via a level-1 or level-2 transmission (confirmed on both `hf_standard` and
-`hf_robust`, and independent of turbo re-estimation). But `SPEED_LEVEL_MIN_CAPACITY`
+**Root cause, from an ad-hoc (not committed) diagnostic — a well-reasoned
+hypothesis, not independently-verifiable fact until a reproducible bench
+exists:** the per-carrier capacity metric this recommendation is built on
+(`channel_capacity`/`noise_vars`, already used elsewhere and calibrated before
+this task) appears not invariant to which speed level the measured frame
+happened to use — at a fixed, true, injected AWGN SNR (no fading), averaged
+over 30 seeds via temporary, uncommitted probes, a level-7 transmission's own
+channel estimate read several dB higher "capacity" than an identical channel
+measured via a level-1 or level-2 transmission (both `hf_standard` and
+`hf_robust`, independent of turbo re-estimation). This measurement was not
+committed as a reproducible script/test — a follow-up should either commit it
+or treat this explanation as a hypothesis consistent with the evidence below,
+not settled fact. But `SPEED_LEVEL_MIN_CAPACITY`
 (the table `select_speed_level_2d` looks up into) was calibrated exclusively via
 a *fixed* level-2 probe frame (`mcs_calibration.rs`/`adaptive_mcs_validation.rs`'s
 `sound_capacity`, which always transmits the sounding frame at level 2
