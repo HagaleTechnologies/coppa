@@ -122,6 +122,43 @@ impl SpectrumSensor {
         self.sample_rate / self.fft_size as f32
     }
 
+    /// Estimate occupancy as a fraction of bins above `noise_floor() + margin_db`,
+    /// restricted to the `[low_hz, high_hz)` band (e.g. Coppa's ~300-2800 Hz SSB
+    /// passband — see `docs/adr/003-phase1-waveform-break.md`). Unlike
+    /// `channel_occupancy` (which scans the whole positive-frequency half of the
+    /// spectrum), this is the band-limited occupancy gate Phase 3 Task 7's daemon
+    /// telemetry (`BUSY ON`/`OFF`) needs: energy outside the modem's own passband
+    /// (e.g. a co-channel signal well below 300 Hz) shouldn't count as "the channel
+    /// is busy" for this modem's purposes.
+    pub fn band_occupancy(
+        &self,
+        samples: &[f32],
+        low_hz: f32,
+        high_hz: f32,
+        margin_db: f32,
+    ) -> f32 {
+        let spectrum = self.power_spectrum(samples);
+        let n = spectrum.len();
+        let half = n / 2; // Only positive frequencies are meaningful.
+        if half == 0 {
+            return 0.0;
+        }
+        let res = self.frequency_resolution();
+        let threshold = self.noise_floor + margin_db;
+
+        let lo_bin = ((low_hz / res).floor().max(0.0) as usize).min(half);
+        let hi_bin = ((high_hz / res).ceil().max(0.0) as usize).min(half);
+        if hi_bin <= lo_bin {
+            return 0.0;
+        }
+
+        let occupied = spectrum[lo_bin..hi_bin]
+            .iter()
+            .filter(|&&p| p > threshold)
+            .count();
+        occupied as f32 / (hi_bin - lo_bin) as f32
+    }
+
     /// Get the averaged power spectrum (if accumulations have been done).
     pub fn averaged_spectrum(&self) -> Vec<f32> {
         if self.accum_count == 0 {
@@ -212,6 +249,61 @@ mod tests {
             occupancy < 0.1,
             "Silence should have low occupancy: {}",
             occupancy
+        );
+    }
+
+    #[test]
+    fn test_band_occupancy_silence_is_low() {
+        let mut sensor = SpectrumSensor::new(1024, 8000.0);
+        let silence = vec![0.0f32; 1024];
+        sensor.update(&silence);
+        sensor.update(&silence);
+
+        let occ = sensor.band_occupancy(&silence, 300.0, 2800.0, 6.0);
+        assert!(occ < 0.2, "Silence should have low band occupancy: {}", occ);
+    }
+
+    /// Establish a realistic (non-zero) noise floor with low-level broadband noise.
+    /// An idealized all-zero "silence" floor sits near the FFT's own numerical noise
+    /// floor (~-200 dB), which makes ordinary spectral leakage from any tone look
+    /// "occupied" nearly everywhere -- not representative of a real receiver.
+    fn settle_noise_floor(sensor: &mut SpectrumSensor) {
+        for _ in 0..10 {
+            let noise: Vec<f32> = (0..1024)
+                .map(|_| 0.01 * (rand_like_hash() as f32 / u32::MAX as f32 - 0.5))
+                .collect();
+            sensor.update(&noise);
+        }
+    }
+
+    #[test]
+    fn test_band_occupancy_detects_in_band_tone() {
+        let mut sensor = SpectrumSensor::new(1024, 8000.0);
+        settle_noise_floor(&mut sensor);
+
+        // A strong 1500 Hz tone sits inside the 300-2800 Hz band.
+        let tone = generate_tone(1500.0, 8000.0, 1024, 1.0);
+        let occ = sensor.band_occupancy(&tone, 300.0, 2800.0, 6.0);
+        assert!(
+            occ > 0.0,
+            "In-band tone should raise band occupancy above zero: {}",
+            occ
+        );
+    }
+
+    #[test]
+    fn test_band_occupancy_ignores_out_of_band_tone() {
+        let mut sensor = SpectrumSensor::new(1024, 8000.0);
+        settle_noise_floor(&mut sensor);
+
+        // A modest 100 Hz tone -- well below the 300-2800 Hz band -- shouldn't read
+        // as significant in-band occupancy once clear of its own near-tone leakage.
+        let tone = generate_tone(100.0, 8000.0, 1024, 0.05);
+        let occ = sensor.band_occupancy(&tone, 300.0, 2800.0, 6.0);
+        assert!(
+            occ < 0.05,
+            "Out-of-band tone must not register as significant in-band occupancy: {}",
+            occ
         );
     }
 

@@ -22,6 +22,7 @@ coppa-host = { path = "../coppa-host" }
 coppa-protocol = { path = "../coppa-protocol" }
 coppa-codec = { path = "../coppa-codec" }
 coppa-dsp = { path = "../coppa-dsp" }
+coppa-ml = { path = "../coppa-ml" }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

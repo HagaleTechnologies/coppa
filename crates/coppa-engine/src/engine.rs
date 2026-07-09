@@ -35,6 +35,11 @@ pub struct StreamFrame {
     pub snr_db: f32,
     pub cfo_hz: f32,
     pub frame_start: u64,
+    /// Speed level (1-10) the transmitting station encoded this frame at, from the
+    /// decoded protected header (`DecodedFrame::header.speed_level`). Added for
+    /// Phase 3 Task 7 so daemon/host telemetry (WebSocket `status`'s `level` field)
+    /// can report the link's real current speed level rather than a placeholder.
+    pub speed_level: u8,
 }
 
 /// Core engine for Coppa digital communications.
@@ -231,6 +236,7 @@ impl CoppaCore {
                 snr_db: f.snr_db,
                 cfo_hz: f.cfo_hz,
                 frame_start: f.frame_start,
+                speed_level: f.header.speed_level,
             })
             .collect()
     }
