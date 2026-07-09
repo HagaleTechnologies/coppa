@@ -98,7 +98,7 @@ fn run(level: u8, kind: &Chan, snr_db: f32, trials: u32) -> Counts {
             .expect("payload within this level's capacity");
         let rx = apply(kind, &clean, snr_db, seed);
         match tx.receive(&rx) {
-            Ok((_h, p)) => {
+            Ok((_h, p, _rec_level)) => {
                 if p.len() >= payload.len() && p[..payload.len()] == payload[..] {
                     c.correct += 1;
                 } else {

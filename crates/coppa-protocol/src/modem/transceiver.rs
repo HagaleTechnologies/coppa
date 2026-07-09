@@ -651,9 +651,15 @@ impl CoppaTransceiver {
         self.modem.demodulate_header(samples, data_start)
     }
 
-    pub fn receive(&self, samples: &[f32]) -> Result<(CoppaHeader, Vec<u8>), ReceiveError> {
-        self.receive_with_metrics(samples)
-            .map(|(h, p, _snr)| (h, p))
+    /// Decode a frame, additionally surfacing a per-frame recommended speed level
+    /// (Phase 3 Task 4, closed-loop rate adaptation): `coppa_ml::recommend_speed_level`
+    /// applied to this frame's per-carrier noise-variance estimates (the same ones the
+    /// payload equalizer/LLR scaling already produce). A caller acting as the far end's
+    /// receiver feeds this back to the sender on the ACK (`TransportPdu::
+    /// new_ack_with_rate`); the sender applies it via `coppa_ml::RateLoop`.
+    pub fn receive(&self, samples: &[f32]) -> Result<(CoppaHeader, Vec<u8>, u8), ReceiveError> {
+        self.receive_core(samples)
+            .map(|(h, p, _snr, noise_vars)| (h, p, coppa_ml::recommend_speed_level(&noise_vars)))
     }
 
     /// Core IR-HARQ combining + decode step (Phase 3 Task 3).
@@ -740,14 +746,28 @@ impl CoppaTransceiver {
     /// derived from the per-carrier noise-variance estimates the payload equalizer
     /// already produces: `snr_db = 10*log10(1 / mean(noise_vars))`. Added for
     /// `StreamingReceiver`'s `DecodedFrame::snr_db` (Task 7), so the daemon can feed
-    /// the rate controller a real per-carrier-noise SNR instead of the crude
-    /// whole-buffer RMS proxy it used before (`20*log10(rms) + 40`, flagged
-    /// elsewhere as a known hack). `receive` itself is unchanged and still used by
+    /// real per-carrier-noise telemetry instead of the crude whole-buffer RMS proxy
+    /// it used before (`20*log10(rms) + 40`, since replaced). `receive` itself is
+    /// unchanged (beyond Task 4's added recommended-level return) and still used by
     /// every existing (batch) call site.
     pub fn receive_with_metrics(
         &self,
         samples: &[f32],
     ) -> Result<(CoppaHeader, Vec<u8>, f32), ReceiveError> {
+        self.receive_core(samples)
+            .map(|(h, p, snr, _noise_vars)| (h, p, snr))
+    }
+
+    /// Core decode pipeline shared by [`Self::receive`] and [`Self::receive_with_metrics`]:
+    /// returns the header, payload, SNR estimate (dB), AND this frame's per-carrier noise
+    /// variances (`nv[k] = sigma^2/|H[k]|^2`) -- the latter is what `receive` feeds to
+    /// `coppa_ml::recommend_speed_level` for the closed-loop rate-adaptation recommendation
+    /// (Phase 3 Task 4). Kept as one shared implementation so the two public methods can't
+    /// drift apart.
+    fn receive_core(
+        &self,
+        samples: &[f32],
+    ) -> Result<(CoppaHeader, Vec<u8>, f32, Vec<f32>), ReceiveError> {
         // 0. RX bandpass: reject out-of-passband noise/interference before demod, mirroring
         // the TX bandpass already applied at modulate time (HF profiles only).
         let filtered;
@@ -969,7 +989,7 @@ impl CoppaTransceiver {
         };
         let snr_db = 10.0 * (1.0 / mean_nv.max(1e-6)).log10();
 
-        Ok((header, payload, snr_db))
+        Ok((header, payload, snr_db, noise_vars))
     }
 }
 
@@ -1121,7 +1141,7 @@ mod tests {
         let samples = tx
             .transmit(&header, &payload)
             .expect("payload within this test's speed level capacity");
-        let (_h, rx) = tx.receive(&samples).expect("clean loopback should decode");
+        let (_h, rx, _lvl) = tx.receive(&samples).expect("clean loopback should decode");
         assert_eq!(&rx[..payload.len()], payload.as_slice());
         assert_eq!(tx.turbo_attempts(), 0);
     }
@@ -1135,7 +1155,7 @@ mod tests {
         let samples = tx
             .transmit(&header, &payload)
             .expect("payload within this test's speed level capacity");
-        let (_h, rx) = tx.receive(&samples).expect("clean loopback should decode");
+        let (_h, rx, _lvl) = tx.receive(&samples).expect("clean loopback should decode");
         assert_eq!(&rx[..payload.len()], payload.as_slice());
     }
 
@@ -1179,7 +1199,7 @@ mod tests {
                 let noisy =
                     coppa_channel::awgn_seeded(&faded, SNR_DB, seed ^ 0x5555_5555_5555_5555);
                 let ok =
-                    matches!(tx.receive(&noisy), Ok((_, rx)) if rx[..payload.len()] == payload[..]);
+                    matches!(tx.receive(&noisy), Ok((_, rx, _)) if rx[..payload.len()] == payload[..]);
                 if !ok {
                     failures += 1;
                 }
@@ -1352,7 +1372,7 @@ mod tests {
         let samples = tx
             .transmit(&header, &payload)
             .expect("exact-max payload should transmit");
-        let (_h, rx) = tx
+        let (_h, rx, _lvl) = tx
             .receive(&samples)
             .expect("exact-max payload should round-trip");
         assert_eq!(&rx[..payload.len()], payload.as_slice());
@@ -1369,7 +1389,7 @@ mod tests {
             .expect("payload within this test's speed level capacity");
         let through_rig = coppa_channel::ssb_filter(&s, 48_000.0);
         let mistuned = coppa_channel::frequency_shift(&through_rig, 47.0, 48_000.0);
-        let (_h, rx) = tx
+        let (_h, rx, _lvl) = tx
             .receive(&mistuned)
             .expect("must decode through SSB filter + 47 Hz CFO");
         assert_eq!(&rx[..payload.len()], payload.as_slice());
@@ -1387,7 +1407,7 @@ mod tests {
             .expect("payload within this test's speed level capacity");
         let through_rig = coppa_channel::ssb_filter(&s, 48_000.0);
         let untuned = coppa_channel::frequency_shift(&through_rig, 0.0, 48_000.0);
-        let (_h, rx) = tx
+        let (_h, rx, _lvl) = tx
             .receive(&untuned)
             .expect("must decode through SSB filter alone (no mistune)");
         assert_eq!(&rx[..payload.len()], payload.as_slice());
@@ -1403,7 +1423,7 @@ mod tests {
             .transmit(&header, payload)
             .expect("payload within this test's speed level capacity");
         let injected = coppa_codec::ofdm::sync::remove_cfo(&samples, -8.0, 48_000.0); // +8 Hz
-        let (_h, rx) = tx
+        let (_h, rx, _lvl) = tx
             .receive(&injected)
             .expect("should recover after CFO correction");
         assert_eq!(&rx[..payload.len()], payload.as_slice());
@@ -1440,7 +1460,7 @@ mod tests {
                 seed,
             );
             let noisy = coppa_channel::awgn_seeded(&faded, 21.0, seed ^ 0x55AA);
-            if matches!(tx.receive(&noisy), Ok((_, rx)) if rx[..payload.len()] == payload[..]) {
+            if matches!(tx.receive(&noisy), Ok((_, rx, _)) if rx[..payload.len()] == payload[..]) {
                 ok += 1;
             }
         }
@@ -1461,11 +1481,16 @@ mod tests {
         let samples = tx
             .transmit(&header, payload)
             .expect("payload within this test's speed level capacity");
-        let (rx_header, rx_payload) = tx.receive(&samples).expect("decode should succeed");
+        let (rx_header, rx_payload, rec_level) =
+            tx.receive(&samples).expect("decode should succeed");
 
         assert_eq!(rx_header.speed_level, header.speed_level);
         assert_eq!(rx_header.payload_len, header.payload_len);
         assert_eq!(&rx_payload[..payload.len()], payload.as_slice());
+        assert!(
+            (1..=10).contains(&rec_level),
+            "recommended level in range: {rec_level}"
+        );
     }
 
     #[test]
@@ -1477,7 +1502,7 @@ mod tests {
         let samples = tx
             .transmit(&header, payload.as_slice())
             .expect("payload within this test's speed level capacity");
-        let (rx_header, rx_payload) = tx.receive(&samples).expect("decode should succeed");
+        let (rx_header, rx_payload, _lvl) = tx.receive(&samples).expect("decode should succeed");
 
         assert_eq!(rx_header.speed_level, 3);
         assert_eq!(&rx_payload[..payload.len()], payload.as_slice());
@@ -1492,7 +1517,7 @@ mod tests {
         let samples = tx
             .transmit(&header, payload.as_slice())
             .expect("payload within this test's speed level capacity");
-        let (rx_header, rx_payload) = tx.receive(&samples).expect("decode should succeed");
+        let (rx_header, rx_payload, _lvl) = tx.receive(&samples).expect("decode should succeed");
 
         assert_eq!(rx_header.speed_level, 6);
         assert_eq!(&rx_payload[..payload.len()], payload.as_slice());
@@ -1511,7 +1536,7 @@ mod tests {
         for s in samples.iter_mut() {
             *s *= 0.5; // flat channel gain
         }
-        let (_h, rx) = tx
+        let (_h, rx, _lvl) = tx
             .receive(&samples)
             .expect("16QAM should survive a flat 0.5 gain");
         assert_eq!(&rx[..payload.len()], payload.as_slice());
@@ -1525,7 +1550,7 @@ mod tests {
         let samples = tx
             .transmit(&header, payload)
             .expect("payload within this test's speed level capacity");
-        let (rx_header, rx_payload) = tx
+        let (rx_header, rx_payload, _lvl) = tx
             .receive(&samples)
             .expect("hf_robust decode should succeed");
         assert_eq!(rx_header.speed_level, 2);
@@ -1540,7 +1565,7 @@ mod tests {
         let samples = tx
             .transmit(&header, payload.as_slice())
             .expect("payload within this test's speed level capacity");
-        let (rx_header, rx_payload) = tx
+        let (rx_header, rx_payload, _lvl) = tx
             .receive(&samples)
             .expect("hf_robust QPSK decode should succeed");
         assert_eq!(rx_header.speed_level, 3);
@@ -1567,7 +1592,7 @@ mod tests {
                 samples[idx] += 0.15; // small additive perturbation
             }
         }
-        let (rx_header, rx_payload) = tx
+        let (rx_header, rx_payload, _lvl) = tx
             .receive(&samples)
             .expect("protected header should recover from small perturbations");
         assert_eq!(rx_header.speed_level, 2);
@@ -1953,7 +1978,7 @@ mod tests {
             !tx.harq_rx.borrow().contains(header.seq_num),
             "no buffer should exist before any receive"
         );
-        let (_h, rx) = tx.receive(&samples).expect("clean loopback should decode");
+        let (_h, rx, _lvl) = tx.receive(&samples).expect("clean loopback should decode");
         assert_eq!(&rx[..payload.len()], payload.as_slice());
         assert!(
             !tx.harq_rx.borrow().contains(header.seq_num),

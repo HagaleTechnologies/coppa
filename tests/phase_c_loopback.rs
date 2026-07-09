@@ -45,7 +45,7 @@ fn loopback_test(wire_level: u8, payload: &[u8]) {
         wire_level
     );
 
-    let (rx_header, rx_payload) = transceiver
+    let (rx_header, rx_payload, _rec_level) = transceiver
         .receive(&samples)
         .unwrap_or_else(|e| panic!("Level {}: receive failed: {}", wire_level, e));
 
@@ -174,7 +174,7 @@ fn test_header_fields_roundtrip() {
     let samples = transceiver
         .transmit(&header, &payload)
         .expect("payload within this level's capacity");
-    let (rx_header, _) = transceiver.receive(&samples).expect("should decode");
+    let (rx_header, _, _) = transceiver.receive(&samples).expect("should decode");
 
     assert_eq!(rx_header.version, 1);
     assert_eq!(rx_header.phy_mode, 2);
@@ -238,7 +238,7 @@ fn awgn_above_threshold(wire_level: u8) {
             .expect("payload within this level's capacity");
         let noisy = add_awgn(&samples, snr, seed);
         match transceiver.receive(&noisy) {
-            Ok((_, rx_payload)) => {
+            Ok((_, rx_payload, _)) => {
                 if rx_payload[..payload.len()] != payload[..] {
                     failures += 1;
                 }
@@ -366,7 +366,7 @@ fn test_snr_fer_monte_carlo() {
                     .expect("payload within this level's capacity");
                 let noisy = add_awgn(&samples, snr, seed);
                 match transceiver.receive(&noisy) {
-                    Ok((_, rx_payload)) => {
+                    Ok((_, rx_payload, _)) => {
                         if rx_payload[..payload.len()] != payload[..] {
                             errors += 1;
                         }

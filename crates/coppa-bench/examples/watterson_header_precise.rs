@@ -42,7 +42,7 @@ fn main() {
             seed,
         );
         let noisy = coppa_channel::awgn_seeded(&faded, 21.0, seed ^ 0x55AA);
-        if matches!(tx.receive(&noisy), Ok((_, rx)) if rx[..payload.len()] == payload[..]) {
+        if matches!(tx.receive(&noisy), Ok((_, rx, _)) if rx[..payload.len()] == payload[..]) {
             ok += 1;
         }
     }

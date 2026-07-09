@@ -89,7 +89,7 @@ fn main() {
 
             let before_attempts = tx.turbo_attempts();
             let ok =
-                matches!(tx.receive(&noisy), Ok((_, rx)) if rx[..payload.len()] == payload[..]);
+                matches!(tx.receive(&noisy), Ok((_, rx, _)) if rx[..payload.len()] == payload[..]);
             let did_fire = tx.turbo_attempts() > before_attempts;
 
             if ok {
