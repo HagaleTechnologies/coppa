@@ -65,6 +65,7 @@ impl V1Phy {
             speed_level: self.level,
             seq_num: 0,
             payload_len,
+            codewords: 1,
         }
     }
 }
@@ -157,6 +158,7 @@ impl V2Phy {
             speed_level: self.level,
             seq_num,
             payload_len,
+            codewords: 1,
         }
     }
 }

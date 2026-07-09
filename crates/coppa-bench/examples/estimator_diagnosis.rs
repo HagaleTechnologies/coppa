@@ -23,6 +23,7 @@ fn main() {
         speed_level: 2,
         seq_num: 0,
         payload_len: 121,
+        codewords: 1,
     };
     // Known BPSK-like symbol pattern (matches the existing clean-loopback test style).
     let n_symbols = 3000;

@@ -29,6 +29,7 @@ fn make_header(speed_level: u8, payload_len: u16) -> CoppaHeader {
         speed_level,
         seq_num: 42,
         payload_len,
+        codewords: 1,
     }
 }
 
@@ -168,6 +169,7 @@ fn test_header_fields_roundtrip() {
         speed_level: 3,
         seq_num: 255,
         payload_len: 10,
+        codewords: 1,
     };
     let payload = vec![0xFF; 10];
 

@@ -97,6 +97,7 @@ fn main() {
             speed_level: 2,
             seq_num: 0,
             payload_len: 60,
+            codewords: 1,
         };
         let payload = vec![0xA5u8; 60];
         let frame = tx

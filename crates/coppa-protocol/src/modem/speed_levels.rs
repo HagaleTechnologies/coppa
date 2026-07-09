@@ -89,6 +89,19 @@ pub fn max_payload_for_level(wire_level: u8) -> Option<usize> {
     k_used_for_level(wire_level).map(|k_used| k_used / 8 - PAYLOAD_CRC_LEN)
 }
 
+/// Maximum TOTAL application-payload size (bytes) a multi-codeword frame
+/// (Phase 3 Task 5) will accept for a given wire-encoded speed level and
+/// codeword count: `codewords` independent LDPC codewords, each with its own
+/// CRC-32 trailer, so the total budget is simply `codewords *
+/// max_payload_for_level(level)` -- see
+/// `crate::modem::transceiver::split_payload_across_codewords` for how a
+/// payload at or under this cap is guaranteed to split into per-codeword
+/// chunks that each individually fit `max_payload_for_level(level)` too.
+/// Returns `None` for reserved/invalid levels, mirroring `max_payload_for_level`.
+pub fn max_multi_payload_for_level(wire_level: u8, codewords: u8) -> Option<usize> {
+    max_payload_for_level(wire_level).map(|per_cw| per_cw * codewords.max(1) as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

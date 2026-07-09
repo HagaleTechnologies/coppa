@@ -267,6 +267,7 @@ mod tests {
             speed_level: 2,
             seq_num: 0,
             payload_len: 4,
+            codewords: 1,
         };
         let symbols = vec![num_complex::Complex32::new(1.0, 0.0); 200];
         let frame = modem.modulate_mapped(&header, &symbols, 6.0);
@@ -297,6 +298,7 @@ mod tests {
             speed_level: 2,
             seq_num: 0,
             payload_len: 4,
+            codewords: 1,
         };
         let symbols = vec![Complex32::new(1.0, 0.0); 200];
         let frame = modem.modulate_mapped(&header, &symbols, 6.0);

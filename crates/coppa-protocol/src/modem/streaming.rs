@@ -438,6 +438,7 @@ mod tests {
             speed_level,
             seq_num: 0,
             payload_len,
+            codewords: 1,
         }
     }
 

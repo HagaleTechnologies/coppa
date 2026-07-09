@@ -554,6 +554,7 @@ mod tests {
             speed_level: 2,
             seq_num: 0,
             payload_len: 60,
+            codewords: 1,
         };
         // Random (not smoothly-rotating) payload phases: real payload data is
         // LDPC-coded/scrambled noise-like bits, so this is the representative

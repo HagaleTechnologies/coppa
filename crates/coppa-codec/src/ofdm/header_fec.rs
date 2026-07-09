@@ -237,6 +237,7 @@ mod tests {
             speed_level: 6,
             seq_num: 42,
             payload_len: 1500,
+            codewords: 1,
         }
     }
 
@@ -308,6 +309,7 @@ mod tests {
                 speed_level: 0,
                 seq_num: 0,
                 payload_len: 0,
+                codewords: 1,
             },
             CoppaHeader {
                 version: 15,
@@ -318,6 +320,7 @@ mod tests {
                 speed_level: 15,
                 seq_num: 255,
                 payload_len: 4095,
+                codewords: 1,
             },
             CoppaHeader {
                 version: 5,
@@ -328,6 +331,7 @@ mod tests {
                 speed_level: 9,
                 seq_num: 128,
                 payload_len: 777,
+                codewords: 1,
             },
         ];
         for h in headers {
