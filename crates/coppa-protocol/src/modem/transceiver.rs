@@ -191,6 +191,19 @@ const PAYLOAD_CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 /// silently drift apart.
 pub(crate) const PAYLOAD_CRC_LEN: usize = 4;
 
+/// Maximum codewords `transmit` will pack into one frame, and the bound `receive_core`
+/// enforces on a decoded header's `codewords` field (Phase 3 Task 5, decision 6: "up to
+/// 8 codewords back-to-back"). The wire field itself (`CoppaHeader.codewords`, packed as
+/// `codewords - 1` into a 4-bit nibble) can represent up to 16 -- this constant is the
+/// actual codec-enforced design limit, not the field's raw bit width. It also bounds how
+/// far the cross-codeword interleaving span (up to `MAX_CODEWORDS` OFDM-symbol-spans wide)
+/// can stretch, which decision 6's "~4s at level 5 covers the 0.4s coherence-time fade with
+/// margin" reasoning assumes -- an unbounded `codewords` would silently blow past that
+/// margin. `transmit` rejects an oversized request as `TransmitError::TooManyCodewords`;
+/// `receive_core` rejects a header claiming more as `ReceiveError::HeaderCorrupt` (a
+/// corrupted/foreign frame, not a legitimate one this codec would ever produce).
+pub const MAX_CODEWORDS: u8 = 8;
+
 /// Cached per-speed-level components: building the interleaver and
 /// constellation mapper is ~0.105 ms and ~4801 allocs (~525 KB) per call — expensive
 /// enough that doing it on every single `transmit`/`receive` (as the pre-Task-7 code
@@ -435,6 +448,8 @@ pub enum TransmitError {
     /// are a hard error now -- the pre-Task-1 codec silently truncated them
     /// instead, which is a data-loss footgun a caller can't detect.
     PayloadTooLarge { max: usize },
+    /// `header.codewords` exceeded [`MAX_CODEWORDS`] (Phase 3 Task 5).
+    TooManyCodewords { max: u8 },
 }
 
 impl std::fmt::Display for TransmitError {
@@ -445,6 +460,9 @@ impl std::fmt::Display for TransmitError {
                     f,
                     "payload too large for this speed level (max {max} bytes)"
                 )
+            }
+            Self::TooManyCodewords { max } => {
+                write!(f, "too many codewords requested (max {max})")
             }
         }
     }
@@ -632,6 +650,14 @@ impl CoppaTransceiver {
             .expect("invalid speed level in header");
         let k_used = comp.k_used;
         let codewords = header.codewords.max(1) as usize;
+
+        // -1. Hard-reject a request beyond MAX_CODEWORDS (Phase 3 Task 5): the
+        //    field can represent up to 16 (`codewords - 1` in a 4-bit nibble),
+        //    but the codec's design (interleaving span, per-frame overhead
+        //    amortization) is only sound up to 8 -- see `MAX_CODEWORDS`'s doc.
+        if header.codewords > MAX_CODEWORDS {
+            return Err(TransmitError::TooManyCodewords { max: MAX_CODEWORDS });
+        }
 
         // 0. Hard-reject oversized payloads (Phase 3 Task 1, extended for
         //    multi-codeword frames by Phase 3 Task 5): `max_multi_payload_for_level`
@@ -881,6 +907,13 @@ impl CoppaTransceiver {
             .modem
             .demodulate_frame(samples)
             .ok_or(ReceiveError::SyncFailed)?;
+
+        // A header claiming more than MAX_CODEWORDS is not one this codec would ever
+        // legitimately produce (`transmit` rejects it) -- treat as corruption rather
+        // than decode against an unbounded interleaving/symbol-count assumption.
+        if header.codewords > MAX_CODEWORDS {
+            return Err(ReceiveError::HeaderCorrupt);
+        }
 
         // Phase 3 Task 5 dispatch: a single-codeword frame (`codewords <= 1`, every frame
         // before this task and still the common case) takes the exact pre-Task-5 code path
@@ -2487,6 +2520,78 @@ mod tests {
         let header = make_header_multi(6, payload.len() as u16, 7);
         let err = tx.transmit(&header, &payload).unwrap_err();
         assert_eq!(err, TransmitError::PayloadTooLarge { max });
+    }
+
+    /// Review finding on Task 5: `transmit` must reject `codewords > MAX_CODEWORDS`
+    /// (the wire field can represent up to 16 via `codewords - 1` in a 4-bit
+    /// nibble, but the codec's design is only sound up to `MAX_CODEWORDS`).
+    #[test]
+    fn transmit_rejects_too_many_codewords() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let codewords = MAX_CODEWORDS + 1;
+        let max = max_multi_payload_for_level(2, codewords).expect("level 2 must exist");
+        let payload = vec![0u8; max.min(10)];
+        let header = make_header_multi(2, payload.len() as u16, codewords);
+        let err = tx.transmit(&header, &payload).unwrap_err();
+        assert_eq!(
+            err,
+            TransmitError::TooManyCodewords { max: MAX_CODEWORDS },
+            "codewords={codewords} exceeds MAX_CODEWORDS={MAX_CODEWORDS}, must be rejected"
+        );
+    }
+
+    /// Review finding on Task 5: `receive` must reject a header claiming
+    /// `codewords > MAX_CODEWORDS` as corrupt, even though `transmit` itself
+    /// (as of the fix above) can never produce one -- this is defense against a
+    /// malformed/foreign frame, not a self-consistency check. Manually replicates
+    /// `transmit`'s multi-codeword pipeline (bypassing its own guard) at level 2
+    /// (below the cross-codeword-interleave gate, so no `CrossFrameInterleaver`
+    /// step is needed) to construct a frame `transmit` itself would now refuse.
+    #[test]
+    fn receive_rejects_too_many_codewords() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let codewords = (MAX_CODEWORDS + 1) as usize;
+        let comp = tx.codecs.get(&2).expect("level 2 must exist"); // BPSK 1/2
+        let k_used = comp.k_used;
+        let per_cw_payload = 10usize;
+        let header = make_header_multi(2, (per_cw_payload * codewords) as u16, codewords as u8);
+
+        let mut all_coded: Vec<u8> = Vec::with_capacity(codewords * CODED_BLOCK_LEN);
+        for cw in 0..codewords {
+            let chunk = vec![(cw * 7 + 1) as u8; per_cw_payload];
+            let checksum = PAYLOAD_CRC32.checksum(&chunk);
+            let mut payload_with_crc = chunk.clone();
+            payload_with_crc.extend_from_slice(&checksum.to_be_bytes());
+            let mut info_bits = Vec::with_capacity(NrLdpc::INFO_LEN);
+            for &byte in &payload_with_crc {
+                for shift in (0..8).rev() {
+                    info_bits.push((byte >> shift) & 1);
+                }
+            }
+            info_bits.resize(k_used, 0u8);
+            info_bits.resize(NrLdpc::INFO_LEN, 0u8);
+            scramble(&mut info_bits);
+            let mother = tx.ldpc.encode(&info_bits);
+            let coded_bits = rate_match::rate_match(&mother, k_used, CODED_BLOCK_LEN, 0);
+            all_coded.extend_from_slice(&coded_bits);
+        }
+
+        let mut symbols = Vec::new();
+        for k in 0..codewords {
+            let slot = &all_coded[k * CODED_BLOCK_LEN..(k + 1) * CODED_BLOCK_LEN];
+            let interleaved = comp.interleaver.interleave(slot);
+            symbols.extend(comp.mapper.map_bits(&interleaved));
+        }
+        let sl = SPEED_LEVELS.iter().find(|s| s.level == 2).unwrap();
+        let samples = tx
+            .modem
+            .modulate_mapped(&header, &symbols, sl.papr_target_db);
+
+        let result = tx.receive(&samples);
+        assert!(
+            matches!(result, Err(ReceiveError::HeaderCorrupt)),
+            "expected Err(HeaderCorrupt) for codewords={codewords} > MAX_CODEWORDS, got {result:?}"
+        );
     }
 
     /// Task 5 scenario (b): an 800-byte payload at level 6 (16-QAM, rate 1/2)
