@@ -345,6 +345,59 @@ impl DelayDomainEstimator {
         &self.taps
     }
 
+    /// Measured multipath delay spread, in milliseconds, derived from this estimator's
+    /// fitted taps (Task 6b: short-CP spread gate).
+    ///
+    /// # Method
+    ///
+    /// 1. Apply [`Self::select_order`]'s own significance test to every fitted tap: a tap
+    ///    `ell` "clears" if `|h_ell|² > max(0.05 * max_ell(|h_ell|²), 2 * noise_var)` — the
+    ///    same relative-floor/absolute-noise-floor rule `select_order` uses to decide model
+    ///    order, reused here (not re-derived) so "significant tap" means the same thing in
+    ///    both places.
+    /// 2. Find the first and last tap index that clears the test. The span between them,
+    ///    in delay-domain *grid units*, is `last - first` (a single surviving tap, or none,
+    ///    gives a span of 0 grid units — a channel indistinguishable from flat/single-path
+    ///    has no measurable spread).
+    /// 3. Convert grid units to real time. Per [`timing_offset_samples`]'s doc, this
+    ///    estimator's `tau_basis(nc, k, ell)` convention normalizes delay by `nc` (active
+    ///    carriers), so 1 grid unit = `fft_size / nc` real ADC samples — this is the *same*
+    ///    conversion [`estimate_coarse_delay`]'s callers use, not a new one invented here.
+    ///    Multiplying by `1000 / sample_rate` turns that sample count into milliseconds.
+    ///
+    /// `fft_size` and `sample_rate` are passed in (rather than stored on the estimator)
+    /// because `DelayDomainEstimator` itself is profile-agnostic — only `nc` (active
+    /// carrier count) is intrinsic to the fit; `fft_size`/`sample_rate` come from whichever
+    /// `CoppaProfile` produced the pilots being fit.
+    pub fn delay_spread_ms(&self, fft_size: usize, sample_rate: u32) -> f32 {
+        if self.taps.is_empty() || fft_size == 0 || sample_rate == 0 || self.nc == 0 {
+            return 0.0;
+        }
+        let max_h2 = self
+            .taps
+            .iter()
+            .map(|h| h.norm_sqr())
+            .fold(0.0f32, f32::max);
+        let threshold = (0.05 * max_h2).max(2.0 * self.noise_var);
+
+        let mut first: Option<usize> = None;
+        let mut last: Option<usize> = None;
+        for (ell, h) in self.taps.iter().enumerate() {
+            if h.norm_sqr() > threshold {
+                if first.is_none() {
+                    first = Some(ell);
+                }
+                last = Some(ell);
+            }
+        }
+        let (Some(first), Some(last)) = (first, last) else {
+            return 0.0;
+        };
+        let span_grid_units = (last - first) as f32;
+        let samples_per_grid_unit = fft_size as f32 / self.nc as f32;
+        span_grid_units * samples_per_grid_unit / sample_rate as f32 * 1000.0
+    }
+
     /// Zero-force equalize `carriers` against the fitted model, returning
     /// per-carrier `(x̂, effective_noise_variance)`. `x̂_k = y_k / Ĥ_k` when
     /// `|Ĥ_k|² ≥ 1e-4`; otherwise the carrier is treated as a null and given a
@@ -651,6 +704,89 @@ mod tests {
         assert!(
             (est - true_tau).abs() < 0.01,
             "expected ~{true_tau}, got {est}"
+        );
+    }
+
+    /// Task 6b: `delay_spread_ms` on a clean two-tap Watterson-Poor-shaped channel (taps at
+    /// grid 0 and grid 5, the same fixture `two_tap_h`/`recovers_two_tap_channel_far_better_
+    /// than_linear_interp` uses, whose own comment already establishes grid-5 as "≈2 ms" for
+    /// `hf_standard`'s nc=48) should read back close to that ≈2 ms figure.
+    #[test]
+    fn delay_spread_ms_recovers_two_tap_poor_like_spread() {
+        let nc = 48;
+        let fft_size = 960; // hf_standard geometry: 20 samples/grid-unit
+        let sample_rate = 48_000;
+        let true_h = two_tap_h(nc);
+        let pilot_idx: Vec<usize> = (0..8).map(|i| i * 6).collect();
+
+        let mut rng = StdRng::seed_from_u64(11);
+        let obs: Vec<(usize, Complex32, f32)> = pilot_idx
+            .iter()
+            .map(|&k| (k, true_h(k) + complex_gaussian(&mut rng, 0.02), 1.0))
+            .collect();
+        // l=8 so the fit can actually represent the tap at grid index 5.
+        let est = DelayDomainEstimator::fit(nc, 8, &obs);
+
+        let spread = est.delay_spread_ms(fft_size, sample_rate);
+        // 5 grid units * (960/48 samples/unit) / 48000 * 1000 = 2.083 ms.
+        assert!(
+            (spread - 2.083).abs() < 0.3,
+            "expected ~2.08 ms spread, got {spread}"
+        );
+    }
+
+    /// A flat single-path channel (only tap 0 has real energy) has no measurable spread: no
+    /// second significant tap clears the significance threshold, so first==last and the
+    /// span is 0 ms.
+    #[test]
+    fn delay_spread_ms_is_zero_for_flat_single_path_channel() {
+        let nc = 48;
+        let obs: Vec<(usize, Complex32, f32)> = (0..nc)
+            .map(|k| (k, Complex32::new(1.0, 0.0), 1.0))
+            .collect();
+        let est = DelayDomainEstimator::fit(nc, 8, &obs);
+        let spread = est.delay_spread_ms(960, 48_000);
+        assert!(spread.abs() < 1e-3, "expected 0 ms spread, got {spread}");
+    }
+
+    /// A Watterson-Good-like tight two-tap channel (taps one grid unit apart, ≈0.42 ms at
+    /// this geometry) should read back a small spread, well under the Poor-like fixture
+    /// above -- confirms the conversion actually scales with real physical separation, not
+    /// just "any second tap present."
+    #[test]
+    fn delay_spread_ms_recovers_tight_good_like_spread() {
+        let nc = 48;
+        let fft_size = 960;
+        let sample_rate = 48_000;
+        let h0 = Complex32::from_polar(0.707, 0.2);
+        let h1 = Complex32::from_polar(0.707, -0.9);
+        let true_h = move |k: usize| h0 * tau_basis(nc, k, 0) + h1 * tau_basis(nc, k, 1);
+        let pilot_idx: Vec<usize> = (0..8).map(|i| i * 6).collect();
+
+        let mut rng = StdRng::seed_from_u64(13);
+        let obs: Vec<(usize, Complex32, f32)> = pilot_idx
+            .iter()
+            .map(|&k| (k, true_h(k) + complex_gaussian(&mut rng, 0.02), 1.0))
+            .collect();
+        let est = DelayDomainEstimator::fit(nc, 8, &obs);
+
+        let spread = est.delay_spread_ms(fft_size, sample_rate);
+        // 1 grid unit * (960/48) / 48000 * 1000 = 0.417 ms.
+        assert!(
+            (spread - 0.417).abs() < 0.3,
+            "expected ~0.42 ms spread, got {spread}"
+        );
+        let poor_like = DelayDomainEstimator::fit(nc, 8, &{
+            let true_h_poor = two_tap_h(nc);
+            let mut rng2 = StdRng::seed_from_u64(11);
+            pilot_idx
+                .iter()
+                .map(|&k| (k, true_h_poor(k) + complex_gaussian(&mut rng2, 0.02), 1.0))
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            spread < poor_like.delay_spread_ms(fft_size, sample_rate),
+            "tight (Good-like) spread {spread} should be less than the Poor-like spread"
         );
     }
 }
