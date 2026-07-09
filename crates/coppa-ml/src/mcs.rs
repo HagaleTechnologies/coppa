@@ -131,7 +131,10 @@ pub fn recommend_speed_level(noise_vars: &[f32]) -> u8 {
     if noise_vars.is_empty() {
         return 1;
     }
-    select_speed_level_2d(channel_capacity(noise_vars), channel_selectivity(noise_vars))
+    select_speed_level_2d(
+        channel_capacity(noise_vars),
+        channel_selectivity(noise_vars),
+    )
 }
 
 #[cfg(test)]
