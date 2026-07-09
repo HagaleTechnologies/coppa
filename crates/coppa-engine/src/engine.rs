@@ -11,7 +11,6 @@ use coppa_protocol::modem::transceiver::CoppaTransceiver;
 
 use crate::config::EngineConfig;
 use crate::profiles::Profile;
-use crate::rate_control::RateController;
 
 /// Marker byte prepended to frames to indicate compression.
 /// On decode, if the first byte of the payload is this marker, the rest is
@@ -62,7 +61,6 @@ pub struct StreamFrame {
 pub struct CoppaCore {
     transceiver: CoppaTransceiver,
     config: EngineConfig,
-    rate_controller: RateController,
     /// Streaming receive path used by [`Self::push_samples`] (daemon/FFI). Owns its
     /// own internal `CoppaTransceiver` (built for the same profile as
     /// `transceiver` above) — see the Task 7 report for why `StreamingReceiver`'s
@@ -96,11 +94,9 @@ impl CoppaCore {
         };
         let transceiver = CoppaTransceiver::new(ofdm_profile.clone(), 1);
         let streaming = StreamingReceiver::new(ofdm_profile, 1);
-        let rate_controller = RateController::new(0, 0, 10);
         Self {
             transceiver,
             config,
-            rate_controller,
             streaming,
         }
     }
@@ -110,11 +106,9 @@ impl CoppaCore {
         let ofdm_profile = Self::select_ofdm_profile(config.speed_level);
         let transceiver = CoppaTransceiver::new(ofdm_profile.clone(), 1);
         let streaming = StreamingReceiver::new(ofdm_profile, 1);
-        let rate_controller = RateController::new(0, 0, 10);
         Self {
             transceiver,
             config,
-            rate_controller,
             streaming,
         }
     }
@@ -201,7 +195,7 @@ impl CoppaCore {
             return Err(anyhow::anyhow!("No samples to decode"));
         }
 
-        let (_header, payload) = self
+        let (_header, payload, _recommended_level) = self
             .transceiver
             .receive(samples)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -279,16 +273,6 @@ impl CoppaCore {
     /// Get a reference to the current configuration.
     pub fn config(&self) -> &EngineConfig {
         &self.config
-    }
-
-    /// Get the current MCS index from the rate controller.
-    pub fn current_mcs(&self) -> u8 {
-        self.rate_controller.current_mcs()
-    }
-
-    /// Get mutable access to the rate controller for SNR feedback.
-    pub fn rate_controller_mut(&mut self) -> &mut RateController {
-        &mut self.rate_controller
     }
 
     /// Rebuild the engine with a new configuration.

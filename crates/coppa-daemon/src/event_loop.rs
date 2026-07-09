@@ -627,16 +627,23 @@ impl EventLoop {
                             let _ = ws_tx.send(text);
                         }
                     }
-                    // Feed the real per-carrier-noise SNR estimate (`StreamFrame::
-                    // snr_db`) to the rate controller — replaces the crude
-                    // whole-buffer RMS proxy (`20*log10(rms) + 40`) used before
-                    // Task 7, which was a known hack (see the Task 7 report).
-                    let new_mcs = self.engine.rate_controller_mut().update(frame.snr_db, true);
-                    tracing::debug!(
-                        snr_db = %format!("{:.1}", frame.snr_db),
-                        mcs = new_mcs,
-                        "Rate controller updated (decode success)"
-                    );
+                    // Closed-loop rate adaptation (Phase 3 Task 4) lives in
+                    // `coppa_ml::RateLoop` now, not the old `coppa-engine::RateController`
+                    // this call site used to feed (deleted: it only ever logged a debug
+                    // line, its `current_mcs()`/`rate_controller_mut()` had no other
+                    // caller, so nothing downstream regresses). Wiring `RateLoop` into this
+                    // daemon requires two pieces this event loop doesn't have yet: (a) the
+                    // daemon never constructs/sends an ACK PDU at all (`arq_tx.process_ack`
+                    // only *consumes* incoming ACKs; there's no `TransportPdu::
+                    // new_ack_with_rate` call site to attach a recommendation to), and (b)
+                    // `CoppaTransceiver::receive`'s new recommended-level return
+                    // (`recommend_speed_level` over this frame's noise vars) isn't
+                    // threaded up through `StreamingReceiver`/`StreamFrame` yet. Both are
+                    // real daemon features, not a one-line swap — left for the daemon/ARQ
+                    // wiring work this phase's plan explicitly defers. See
+                    // `crates/coppa-ml/src/rate_loop.rs` and the validation bench
+                    // `crates/coppa-bench/examples/closed_loop_arq.rs` for the
+                    // already-working, ARQ-agnostic controller and its acceptance numbers.
                 }
                 Err(e) => {
                     tracing::debug!(
