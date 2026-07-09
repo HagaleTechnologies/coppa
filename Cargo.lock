@@ -395,6 +395,7 @@ dependencies = [
  "coppa-dsp",
  "coppa-engine",
  "coppa-host",
+ "coppa-ml",
  "coppa-protocol",
  "coppa-radio",
  "serde",

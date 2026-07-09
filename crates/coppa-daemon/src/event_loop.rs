@@ -5,18 +5,25 @@
 use anyhow::Result;
 use coppa_audio::{AudioRingConsumer, AudioRingProducer};
 use coppa_engine::CoppaCore;
+use coppa_host::vara::VaraResponse;
 use coppa_host::HostEvent;
+use coppa_ml::BusyGate;
 use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx};
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu};
 use coppa_protocol::session::{LinkCapabilities, SessionManager, SessionState};
 use coppa_protocol::transport::{TransportPdu, TransportType};
 use coppa_radio::{NullPtt, PttControl, PttState};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::config::DaemonConfig;
+
+/// Map of connected VARA command-port clients' response senders
+/// (`VaraServer::response_senders()`), used to broadcast `VaraResponse` telemetry.
+type VaraResponseSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<VaraResponse>>>>;
 
 /// Event types flowing through the daemon event loop.
 #[derive(Debug)]
@@ -70,14 +77,31 @@ pub struct EventLoop {
     /// Optional WebSocket broadcast sender for forwarding decoded data.
     #[cfg(feature = "websocket")]
     ws_broadcast: Option<tokio::sync::broadcast::Sender<String>>,
+    /// Optional shared live-status snapshot for the WebSocket `status` reply
+    /// (decision 8: "WebSocket `status` reply carries real values"). Updated
+    /// alongside VARA telemetry whenever a frame decodes.
+    #[cfg(feature = "websocket")]
+    ws_status: Option<Arc<Mutex<coppa_host::websocket::WsStatus>>>,
+    /// Optional map of connected VARA command-port clients' response senders, for
+    /// broadcasting `VaraResponse` telemetry (SNR/PTT/BUFFER/BUSY — decision 8).
+    /// Wired by `main.rs` from `VaraServer::response_senders()`.
+    vara_responses: Option<VaraResponseSenders>,
+    /// Outbound raw payload bytes queued for encode+transmit (the primary
+    /// raw/ARQ `HostEvent::DataReceived` TX path). `VaraResponse::Buffer` telemetry
+    /// reports this queue's length on every push/pop.
+    tx_queue: VecDeque<Vec<u8>>,
+    /// Spectral-occupancy busy gate (decision 8: `BUSY ON`/`OFF` telemetry), fed
+    /// raw incoming audio in `handle_audio_in`.
+    busy_gate: BusyGate,
     /// Session manager for connected-mode operation.
     session_mgr: SessionManager,
     /// Local station callsign (parsed from config).
     local_callsign: Option<Callsign>,
     /// Whether we are listening for incoming connections.
     listening: bool,
-    /// Whether we are currently in a TX turn.
-    #[allow(dead_code)] // enforcement deferred to real-world testing
+    /// Whether the link is currently mid-transmission (PTT asserted). Gates
+    /// `try_drain_tx_queue` so only one frame transmits at a time; set/cleared in
+    /// `handle_ptt_change`.
     is_transmitting: bool,
     /// Number of data frames sent in the current TX turn.
     tx_frame_count: usize,
@@ -116,6 +140,8 @@ impl EventLoop {
             Callsign::new(&config.engine.callsign).ok()
         };
 
+        let busy_gate = BusyGate::new(config.audio.sample_rate as f32);
+
         Self {
             config,
             engine,
@@ -135,6 +161,11 @@ impl EventLoop {
             arq_next_seq: 0,
             #[cfg(feature = "websocket")]
             ws_broadcast: None,
+            #[cfg(feature = "websocket")]
+            ws_status: None,
+            vara_responses: None,
+            tx_queue: VecDeque::new(),
+            busy_gate,
             session_mgr: SessionManager::new(),
             local_callsign,
             listening: false,
@@ -203,6 +234,65 @@ impl EventLoop {
         self.ws_broadcast = Some(tx);
     }
 
+    /// Set the shared live-status snapshot the WebSocket server's `status` reply
+    /// reads from (`WebSocketServer::status()`). See decision 8.
+    #[cfg(feature = "websocket")]
+    pub fn set_ws_status(&mut self, status: Arc<Mutex<coppa_host::websocket::WsStatus>>) {
+        self.ws_status = Some(status);
+    }
+
+    /// Set the map of connected VARA command-port clients' response senders, for
+    /// broadcasting `VaraResponse` telemetry (`VaraServer::response_senders()`).
+    /// See decision 8.
+    pub fn set_vara_responses(&mut self, senders: VaraResponseSenders) {
+        self.vara_responses = Some(senders);
+    }
+
+    /// Broadcast one `VaraResponse` to every connected VARA command-port client, if
+    /// any are wired up (`set_vara_responses`). A no-op (silently) if telemetry
+    /// hasn't been wired, or if a given client's channel happens to be full/closed
+    /// — telemetry is best-effort and must never block or fail the caller.
+    async fn emit_vara(&self, response: VaraResponse) {
+        if let Some(ref senders) = self.vara_responses {
+            let senders = senders.lock().await;
+            for tx in senders.values() {
+                let _ = tx.try_send(response.clone());
+            }
+        }
+    }
+
+    /// Push one raw payload onto the outbound TX queue, emit the resulting
+    /// `BUFFER` telemetry, and attempt to start transmitting immediately if the
+    /// link is currently idle. See `tx_queue`'s field doc and `try_drain_tx_queue`.
+    async fn enqueue_tx(&mut self, data: Vec<u8>) {
+        self.tx_queue.push_back(data);
+        self.emit_vara(VaraResponse::Buffer(self.tx_queue.len()))
+            .await;
+        self.try_drain_tx_queue().await;
+    }
+
+    /// If the link isn't currently mid-transmission, pop the next queued payload
+    /// (if any), emit the resulting `BUFFER` count, and encode+transmit it. Called
+    /// after every enqueue and after every PTT release, so the queue drains one
+    /// frame at a time as each transmission completes.
+    async fn try_drain_tx_queue(&mut self) {
+        if self.is_transmitting {
+            return;
+        }
+        if let Some(data) = self.tx_queue.pop_front() {
+            self.emit_vara(VaraResponse::Buffer(self.tx_queue.len()))
+                .await;
+            match self.engine.encode_bytes(&data) {
+                // Boxed: `transmit_samples` -> `handle_ptt_change` -> (on PTT
+                // release) `try_drain_tx_queue` forms a 3-way async call cycle;
+                // one edge needs indirection to give the compiler a finite-sized
+                // future.
+                Ok(samples) => Box::pin(self.transmit_samples(&samples)).await,
+                Err(e) => tracing::warn!(error = %e, "Encode failed for queued TX frame"),
+            }
+        }
+    }
+
     /// Get a clone of the shutdown flag for use in audio threads (E5).
     pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
         self.shutdown_flag.clone()
@@ -242,7 +332,7 @@ impl EventLoop {
                             self.handle_audio_out(&samples);
                         }
                         Some(DaemonEvent::PttChange(tx)) => {
-                            self.handle_ptt_change(tx);
+                            self.handle_ptt_change(tx).await;
                         }
                     }
                 }
@@ -385,15 +475,9 @@ impl EventLoop {
                     data.clone()
                 };
 
-                // Encode binary data via the engine's byte-level API
-                match self.engine.encode_bytes(&tx_bytes) {
-                    Ok(samples) => {
-                        self.transmit_samples(&samples).await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(client_id, error = %e, "Encode failed");
-                    }
-                }
+                // Queue for encode+transmit (Task 7: BUFFER telemetry tracks this
+                // queue's depth; see `enqueue_tx`/`try_drain_tx_queue`).
+                self.enqueue_tx(tx_bytes).await;
             }
             HostEvent::VaraCommand { client_id, command } => {
                 tracing::debug!(client_id, command = %command, "VARA command received");
@@ -528,6 +612,13 @@ impl EventLoop {
     }
 
     async fn handle_audio_in(&mut self, samples: &[f32]) {
+        // Spectral-occupancy busy gate (decision 8): fed every incoming audio
+        // block, regardless of whether it ends up containing a decodable frame.
+        // Only emits telemetry on an actual BUSY ON/OFF transition.
+        if let Some(new_state) = self.busy_gate.observe(samples) {
+            self.emit_vara(VaraResponse::Busy(new_state)).await;
+        }
+
         // `CoppaCore::push_samples` owns all the buffering/sync/frame-boundary
         // bookkeeping the old DECODE_WINDOW/SLIDE_STEP/MAX_STREAM_BUFFER block used
         // to do by hand here; this just dispatches whatever frames complete as a
@@ -542,8 +633,30 @@ impl EventLoop {
         // overflowed. Moving the decode to a worker thread would be the fix if this
         // ever becomes a real problem.
         for frame in self.engine.push_samples(samples) {
+            let snr_db = frame.snr_db;
+            #[cfg(feature = "websocket")]
+            let cfo_hz = frame.cfo_hz;
+            #[cfg(feature = "websocket")]
+            let speed_level = frame.speed_level;
             match frame.message {
                 Ok(message) => {
+                    // Telemetry: SNR (decision 8) after every decoded frame,
+                    // regardless of what the frame's payload turns out to be —
+                    // `DecodedFrame::snr_db` is known as soon as decode succeeds.
+                    self.emit_vara(VaraResponse::Snr(snr_db.round() as i32))
+                        .await;
+
+                    // WebSocket `status` reply: keep the live snapshot current
+                    // (decision 8: "connected, snr, level, cfo").
+                    #[cfg(feature = "websocket")]
+                    if let Some(ref status) = self.ws_status {
+                        let mut snap = status.lock().await;
+                        snap.connected = true;
+                        snap.snr = Some(snr_db.round() as i32);
+                        snap.level = Some(speed_level);
+                        snap.cfo = Some(cfo_hz);
+                    }
+
                     let decoded_bytes = message.as_bytes();
 
                     // Try to parse as MAC PDU for session handling
@@ -684,7 +797,7 @@ impl EventLoop {
     /// Transmit encoded audio samples: assert PTT, write to ring buffer, schedule PTT release.
     async fn transmit_samples(&mut self, samples: &[f32]) {
         // Assert PTT before transmitting
-        self.handle_ptt_change(true);
+        self.handle_ptt_change(true).await;
         // Enforce PTT pre-delay before writing audio
         let pre_delay_ms = self.config.radio.ptt_pre_delay_ms;
         if pre_delay_ms > 0 {
@@ -921,12 +1034,22 @@ impl EventLoop {
         }
     }
 
-    fn handle_ptt_change(&mut self, tx: bool) {
+    async fn handle_ptt_change(&mut self, tx: bool) {
         let state = if tx { PttState::Tx } else { PttState::Rx };
         if let Err(e) = self.ptt.set_ptt(state) {
             tracing::warn!(error = %e, "PTT control error");
         }
         tracing::info!(state = if tx { "TX" } else { "RX" }, "PTT state change");
+        // Telemetry: VaraResponse::Ptt at the same moment physical PTT changes
+        // (decision 8), not a separately-timed emission.
+        self.emit_vara(VaraResponse::Ptt(tx)).await;
+        if tx {
+            self.is_transmitting = true;
+        } else {
+            self.is_transmitting = false;
+            // PTT just released: continue draining the TX queue if more is queued.
+            self.try_drain_tx_queue().await;
+        }
     }
 
     /// Check if the loop is running.
@@ -1238,5 +1361,293 @@ mod tests {
 
         event_loop.run().await.unwrap();
         assert!(!event_loop.listening);
+    }
+
+    // ── Task 7: live SNR/PTT/BUFFER/BUSY telemetry on the VARA port ──────────
+    //
+    // These are the "host-level integration tests with a mock client" the Task 7
+    // brief calls for: a real `coppa_host::vara::VaraServer` command port, a raw
+    // `TcpStream` standing in for a VARA client, wired to `EventLoop` exactly the
+    // way `main.rs` wires it (`set_vara_responses`), reading back the literal wire
+    // strings `VaraResponse::format()` produces.
+
+    mod telemetry {
+        use super::*;
+        use coppa_host::vara::VaraServer;
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+        use tokio::net::TcpStream;
+
+        /// Config tuned so a real `transmit_samples` call's scheduled PTT-release
+        /// delay resolves in ~0ms: a very high nominal sample rate makes
+        /// `audio_duration_ms`/`drain_ms` truncate to 0 (integer ms math), and the
+        /// pre/tail delays are zeroed. This only affects the *scheduling* math in
+        /// `transmit_samples` — the engine's own internal encode rate is fixed at
+        /// 48 kHz regardless (see `CLAUDE.md`), so encoding real payloads is
+        /// unaffected.
+        fn fast_ptt_config() -> DaemonConfig {
+            let mut config = DaemonConfig::default();
+            config.audio.sample_rate = 100_000_000;
+            config.audio.buffer_size = 0;
+            config.radio.ptt_pre_delay_ms = 0;
+            config.radio.ptt_tail_delay_ms = 0;
+            config
+        }
+
+        /// Spin up a real `VaraServer` on the given (distinct per test, to avoid
+        /// cross-test port collisions) command/data ports, wire its response
+        /// senders into `event_loop` (mirroring `main.rs`'s
+        /// `set_vara_responses(vara_server.response_senders())`), start the
+        /// server, connect a raw `TcpStream` "mock client" to the command port,
+        /// and consume its initial `VERSION ...` greeting. Returns a line reader
+        /// over the client's read half, plus its write half — callers MUST hold
+        /// onto the write half for the test's duration (even unused): dropping it
+        /// shuts down the client's write direction, which the server's command
+        /// handler reads as EOF and reacts to by tearing down (and no longer
+        /// writing) the *whole* connection, well before any later telemetry
+        /// response arrives.
+        async fn connect_mock_vara_client(
+            event_loop: &mut EventLoop,
+            cmd_port: u16,
+            data_port: u16,
+        ) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
+            let server = VaraServer::new(cmd_port, data_port);
+            event_loop.set_vara_responses(server.response_senders());
+
+            tokio::spawn(async move {
+                let _ = server.run().await;
+            });
+            // Give the server a moment to bind before connecting.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let stream = TcpStream::connect(("127.0.0.1", cmd_port))
+                .await
+                .expect("mock client should connect to the VARA command port");
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+
+            let mut greeting = String::new();
+            reader
+                .read_line(&mut greeting)
+                .await
+                .expect("should read the initial VERSION greeting");
+            assert!(
+                greeting.starts_with("VERSION"),
+                "expected a VERSION greeting first, got: {}",
+                greeting
+            );
+
+            (reader, write_half)
+        }
+
+        /// Read one `\r\n`-terminated line, timing out (rather than hanging
+        /// forever) if the client never receives one.
+        async fn read_line(reader: &mut BufReader<OwnedReadHalf>) -> String {
+            let mut line = String::new();
+            let n = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
+                .await
+                .expect("timed out waiting for a VARA response line")
+                .expect("reading a VARA response line should not error");
+            assert!(n > 0, "connection closed before a response line arrived");
+            line
+        }
+
+        /// Drain every line currently available within a short per-line window,
+        /// stopping (not erroring) once nothing more arrives — used where the
+        /// exact response count is a secondary detail and the assertions care
+        /// about relative order/content of a subset (e.g. only the `BUSY` lines).
+        async fn read_available_lines(reader: &mut BufReader<OwnedReadHalf>) -> Vec<String> {
+            let mut lines = Vec::new();
+            loop {
+                let mut line = String::new();
+                match tokio::time::timeout(Duration::from_millis(300), reader.read_line(&mut line))
+                    .await
+                {
+                    Ok(Ok(n)) if n > 0 => lines.push(line),
+                    _ => break,
+                }
+            }
+            lines
+        }
+
+        /// Zero-lead/trail-padded encode, mirroring `coppa-engine`'s own streaming
+        /// tests: `StreamingReceiver`'s `SyncDetector` wants a clean silence
+        /// bootstrap before the preamble, and the RX bandpass filter's group delay
+        /// needs a little trailing pad so `push_samples` doesn't see end-of-input
+        /// before the (filtered-domain) frame is fully buffered.
+        fn with_lead_and_trail(samples: &[f32]) -> Vec<f32> {
+            let mut out = vec![0.0f32; 8192];
+            out.extend_from_slice(samples);
+            out.extend(std::iter::repeat_n(0.0f32, 2048));
+            out
+        }
+
+        /// Required scenario: "decoded frame -> SNR line arrives."
+        #[tokio::test]
+        async fn test_snr_telemetry_emitted_on_decoded_frame() {
+            let config = DaemonConfig::default();
+            let mut event_loop = EventLoop::new(config);
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19400, 19401).await;
+
+            let core = coppa_engine::CoppaCore::new();
+            let samples = core
+                .encode("Hello telemetry")
+                .expect("encode should succeed");
+            let samples = with_lead_and_trail(&samples);
+
+            event_loop.handle_audio_in(&samples).await;
+
+            let line = read_line(&mut reader).await;
+            assert!(
+                line.starts_with("SNR "),
+                "expected an SNR line after a decoded frame, got: {}",
+                line
+            );
+        }
+
+        /// Required scenario: "transmit -> PTT ON/OFF bracket."
+        ///
+        /// `EventLoop` isn't `Send` (its engine holds trait objects/raw-pointer
+        /// ring-buffer internals that aren't), so `run()` can't go through a plain
+        /// `tokio::spawn`. A `LocalSet` + `spawn_local` runs it concurrently with
+        /// the rest of this test on the same thread instead, with no `Send` bound.
+        #[tokio::test]
+        async fn test_ptt_telemetry_brackets_transmission() {
+            let config = fast_ptt_config();
+            let mut event_loop = EventLoop::new(config);
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19410, 19411).await;
+            let tx = event_loop.event_sender();
+
+            let local = tokio::task::LocalSet::new();
+            local.spawn_local(async move {
+                let _ = event_loop.run().await;
+            });
+
+            local
+                .run_until(async move {
+                    tx.send(DaemonEvent::Host(HostEvent::DataReceived {
+                        client_id: 1,
+                        data: b"Hello".to_vec(),
+                    }))
+                    .await
+                    .unwrap();
+
+                    // A real TX cycle also emits BUFFER telemetry (enqueue then
+                    // drain) — read enough lines to be sure both PTT lines have
+                    // arrived, then check their relative order among whatever
+                    // else showed up.
+                    let mut lines = Vec::new();
+                    for _ in 0..8 {
+                        lines.push(read_line(&mut reader).await);
+                        let ptt_so_far: Vec<&str> = lines
+                            .iter()
+                            .map(|s| s.trim_end())
+                            .filter(|s| s.starts_with("PTT"))
+                            .collect();
+                        if ptt_so_far == ["PTT ON", "PTT OFF"] {
+                            return; // bracket observed in order — test passes
+                        }
+                    }
+                    panic!(
+                        "expected a PTT ON ... PTT OFF bracket within the first 8 lines, got: {:?}",
+                        lines
+                    );
+                })
+                .await;
+        }
+
+        /// Required scenario: "queue 3 frames -> BUFFER 3…0 progression."
+        ///
+        /// Forces `is_transmitting = true` before enqueuing so all three frames
+        /// stack up in the queue instead of draining immediately (simulating a
+        /// client bursting frames faster than the half-duplex link can send them),
+        /// then drains deterministically (bypassing the real scheduled-PTT-release
+        /// timer, which `test_ptt_telemetry_brackets_transmission` already covers)
+        /// by calling the same internal hooks `handle_ptt_change(false)` would
+        /// trigger on each real transmission's completion.
+        #[tokio::test]
+        async fn test_buffer_telemetry_progression_3_to_0() {
+            let config = fast_ptt_config();
+            let mut event_loop = EventLoop::new(config);
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19420, 19421).await;
+
+            event_loop.is_transmitting = true;
+            event_loop.enqueue_tx(b"frame1".to_vec()).await;
+            event_loop.enqueue_tx(b"frame2".to_vec()).await;
+            event_loop.enqueue_tx(b"frame3".to_vec()).await;
+            assert_eq!(event_loop.tx_queue.len(), 3);
+
+            event_loop.is_transmitting = false;
+            event_loop.try_drain_tx_queue().await; // starts draining frame1 -> len 2
+            event_loop.handle_ptt_change(false).await; // frame1 "done" -> drains frame2 -> len 1
+            event_loop.handle_ptt_change(false).await; // frame2 "done" -> drains frame3 -> len 0
+            event_loop.handle_ptt_change(false).await; // frame3 "done" -> queue empty, no more drains
+            assert_eq!(event_loop.tx_queue.len(), 0);
+
+            let lines = read_available_lines(&mut reader).await;
+            let buffer_values: Vec<&str> = lines
+                .iter()
+                .map(|s| s.trim_end())
+                .filter(|s| s.starts_with("BUFFER"))
+                .collect();
+            assert_eq!(
+                buffer_values,
+                vec!["BUFFER 1", "BUFFER 2", "BUFFER 3", "BUFFER 2", "BUFFER 1", "BUFFER 0"],
+                "expected the queue to build 1,2,3 then drain 2,1,0"
+            );
+        }
+
+        /// Required scenario: "injected band-limited noise burst -> BUSY ON then
+        /// OFF."
+        #[tokio::test]
+        async fn test_busy_telemetry_on_then_off_from_noise_burst() {
+            let config = DaemonConfig::default();
+            let mut event_loop = EventLoop::new(config);
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19430, 19431).await;
+
+            // Deterministic PRNG (no external `rand` dependency needed here).
+            let mut seed: u32 = 12345;
+            let mut next = move || {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                seed
+            };
+            let mut noise_block = |amplitude: f32| -> Vec<f32> {
+                (0..1024)
+                    .map(|_| amplitude * ((next() >> 8) as f32 / (1u32 << 24) as f32 - 0.5))
+                    .collect()
+            };
+
+            // Settle the busy gate's noise floor on quiet blocks first.
+            for _ in 0..10 {
+                event_loop.handle_audio_in(&noise_block(0.01)).await;
+            }
+            // Inject a band-limited noise burst well above the settled floor.
+            for _ in 0..5 {
+                event_loop.handle_audio_in(&noise_block(0.5)).await;
+            }
+            // Burst ends; back to quiet.
+            for _ in 0..10 {
+                event_loop.handle_audio_in(&noise_block(0.01)).await;
+            }
+
+            let lines = read_available_lines(&mut reader).await;
+            let busy_values: Vec<&str> = lines
+                .iter()
+                .map(|s| s.trim_end())
+                .filter(|s| s.starts_with("BUSY"))
+                .collect();
+            let on_idx = busy_values.iter().position(|&s| s == "BUSY ON");
+            let off_idx = busy_values.iter().position(|&s| s == "BUSY OFF");
+            assert!(
+                on_idx.is_some() && off_idx.is_some() && on_idx.unwrap() < off_idx.unwrap(),
+                "expected a BUSY ON before a BUSY OFF, got: {:?}",
+                busy_values
+            );
+        }
     }
 }

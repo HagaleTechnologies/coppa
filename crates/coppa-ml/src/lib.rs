@@ -18,6 +18,7 @@
 
 use anyhow::Result;
 
+pub mod busy_gate;
 pub mod channel_predictor;
 pub mod cp_gate;
 pub mod mcs;
@@ -25,6 +26,7 @@ pub mod rate_loop;
 pub mod registry;
 pub mod spectrum_sensor;
 
+pub use busy_gate::BusyGate;
 pub use channel_predictor::EwmaPredictor;
 pub use cp_gate::{CpGate, CpRecommendation};
 pub use mcs::{

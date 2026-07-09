@@ -227,6 +227,10 @@ async fn main() -> Result<()> {
             });
         }
 
+        // Wire VARA command-port response senders so the event loop can broadcast
+        // SNR/PTT/BUFFER/BUSY telemetry (decision 8, Phase 3 Task 7).
+        event_loop.set_vara_responses(vara_server.response_senders());
+
         // Bridge response_rx to VARA data_senders (decoded data goes via the data port)
         let vara_data_senders = vara_server.data_senders();
         tokio::spawn(async move {
@@ -281,6 +285,9 @@ async fn main() -> Result<()> {
 
         // Wire broadcast sender so the event loop can forward decoded data to WS clients
         event_loop.set_ws_broadcast(ws_server.broadcast_sender());
+        // Wire the live status snapshot so `status` replies carry real values
+        // (decision 8, Phase 3 Task 7).
+        event_loop.set_ws_status(ws_server.status());
 
         tokio::spawn(async move {
             if let Err(e) = ws_server.run().await {

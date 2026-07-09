@@ -38,6 +38,13 @@ pub enum WsServerMessage {
         remote_call: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         snr: Option<i32>,
+        /// Current speed level (1-10) of the last decoded frame (decision 8).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        level: Option<u8>,
+        /// Carrier frequency offset (Hz) estimated on the last decoded frame
+        /// (decision 8).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cfo: Option<f32>,
     },
     /// Data received from remote station.
     #[serde(rename = "data")]
@@ -62,6 +69,20 @@ const MAX_WS_MESSAGE_SIZE: usize = 1 << 20; // 1 MiB
 /// Maximum size (bytes) of a single WebSocket frame.
 const MAX_WS_FRAME_SIZE: usize = 256 * 1024;
 
+/// Live status snapshot the daemon updates as frames decode (and as
+/// connect/disconnect events happen), read by [`WebSocketServer::run`] whenever a
+/// client sends a `status` request. Phase 3 Task 7 / decision 8: "WebSocket
+/// `status` reply carries real values (connected, snr, level, cfo)" — before this,
+/// every `status` reply was a hardcoded `connected: false` placeholder.
+#[derive(Debug, Clone, Default)]
+pub struct WsStatus {
+    pub connected: bool,
+    pub remote_call: Option<String>,
+    pub snr: Option<i32>,
+    pub level: Option<u8>,
+    pub cfo: Option<f32>,
+}
+
 /// WebSocket server configuration.
 pub struct WebSocketServer {
     port: u16,
@@ -70,6 +91,9 @@ pub struct WebSocketServer {
     event_rx: Option<mpsc::Receiver<HostEvent>>,
     /// Broadcast channel for pushing messages from the engine to all connected WS clients.
     broadcast_tx: tokio::sync::broadcast::Sender<String>,
+    /// Shared live status snapshot; see [`WsStatus`]. The daemon holds the sender
+    /// side (via [`Self::status`]) and updates it as frames decode.
+    status: std::sync::Arc<tokio::sync::Mutex<WsStatus>>,
 }
 
 impl WebSocketServer {
@@ -88,6 +112,7 @@ impl WebSocketServer {
             event_tx,
             event_rx: Some(event_rx),
             broadcast_tx,
+            status: std::sync::Arc::new(tokio::sync::Mutex::new(WsStatus::default())),
         }
     }
 
@@ -117,6 +142,13 @@ impl WebSocketServer {
     /// connected WebSocket clients (e.g., decoded data, status updates).
     pub fn broadcast_sender(&self) -> tokio::sync::broadcast::Sender<String> {
         self.broadcast_tx.clone()
+    }
+
+    /// Get a clone of the shared live status snapshot. The daemon updates this
+    /// (e.g. on each decoded frame) so that `run()`'s `status` reply reflects real
+    /// values instead of a hardcoded placeholder — see [`WsStatus`].
+    pub fn status(&self) -> std::sync::Arc<tokio::sync::Mutex<WsStatus>> {
+        self.status.clone()
     }
 
     /// Run the WebSocket server, accepting connections and piping events.
@@ -164,6 +196,7 @@ impl WebSocketServer {
             let client_id = next_id.fetch_add(1, Ordering::Relaxed);
             let event_tx = self.event_tx.clone();
             let mut broadcast_rx = self.broadcast_tx.subscribe();
+            let status = self.status.clone();
 
             println!("WebSocket client {} connected from {}", client_id, peer);
 
@@ -235,10 +268,13 @@ impl WebSocketServer {
                                                 }
                                             }
                                             WsClientMessage::Status => {
+                                                let snapshot = status.lock().await.clone();
                                                 let resp = WsServerMessage::Status {
-                                                    connected: false,
-                                                    remote_call: None,
-                                                    snr: None,
+                                                    connected: snapshot.connected,
+                                                    remote_call: snapshot.remote_call,
+                                                    snr: snapshot.snr,
+                                                    level: snapshot.level,
+                                                    cfo: snapshot.cfo,
                                                 };
                                                 if let Ok(json) = serde_json::to_string(&resp) {
                                                     let _ = sink
@@ -293,10 +329,14 @@ mod tests {
             connected: true,
             remote_call: Some("VK3DEF".to_string()),
             snr: Some(15),
+            level: Some(4),
+            cfo: Some(12.5),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("connected"));
         assert!(json.contains("VK3DEF"));
+        assert!(json.contains("\"level\":4"));
+        assert!(json.contains("\"cfo\":12.5"));
     }
 
     #[test]
@@ -393,10 +433,14 @@ mod tests {
             connected: false,
             remote_call: None,
             snr: None,
+            level: None,
+            cfo: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(!json.contains("remote_call"));
         assert!(!json.contains("snr"));
+        assert!(!json.contains("level"));
+        assert!(!json.contains("cfo"));
     }
 }
 
@@ -466,6 +510,8 @@ mod integration_tests {
                                                 connected: false,
                                                 remote_call: None,
                                                 snr: None,
+                                                level: None,
+                                                cfo: None,
                                             };
                                             if let Ok(json) = serde_json::to_string(&resp) {
                                                 let _ = sink.send(Message::Text(json.into())).await;
@@ -552,6 +598,70 @@ mod integration_tests {
                 ..
             }
         ));
+
+        ws.close(None).await.ok();
+    }
+
+    /// Task 7 required scenario: "WebSocket `status` carries real `snr`/`level`."
+    /// Unlike `test_ws_integration_status_response` above (which exercises the
+    /// hand-rolled `start_server()` test helper, a separate stand-in that predates
+    /// this task and still hardcodes `connected: false`), this test runs the real
+    /// `WebSocketServer::run()` and verifies its `status` reply reflects whatever
+    /// the daemon last wrote into `WebSocketServer::status()` -- e.g. after a frame
+    /// decodes with a known SNR/speed level/CFO.
+    #[tokio::test]
+    async fn test_ws_integration_real_server_status_carries_live_values() {
+        // Bind on an ephemeral port so we can discover it before calling run().
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // free it up for the real server to bind
+
+        let server = WebSocketServer::with_bind_addr(port, "127.0.0.1".to_string());
+        let status = server.status();
+
+        // Simulate what the daemon does after a frame decodes: write real values
+        // into the shared status snapshot.
+        {
+            let mut snap = status.lock().await;
+            snap.connected = true;
+            snap.remote_call = Some("VK3DEF".to_string());
+            snap.snr = Some(18);
+            snap.level = Some(5);
+            snap.cfo = Some(-3.5);
+        }
+
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        // Give the server a moment to bind.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        ws.send(Message::Text(r#"{"type":"status"}"#.into()))
+            .await
+            .unwrap();
+
+        let resp = ws.next().await.unwrap().unwrap();
+        let text = resp.to_text().unwrap();
+        let msg: WsServerMessage = serde_json::from_str(text).unwrap();
+        match msg {
+            WsServerMessage::Status {
+                connected,
+                remote_call,
+                snr,
+                level,
+                cfo,
+            } => {
+                assert!(connected, "status should reflect the live connected flag");
+                assert_eq!(remote_call.as_deref(), Some("VK3DEF"));
+                assert_eq!(snr, Some(18), "status should carry the real SNR");
+                assert_eq!(level, Some(5), "status should carry the real speed level");
+                assert_eq!(cfo, Some(-3.5), "status should carry the real CFO estimate");
+            }
+            other => panic!("Expected Status, got {:?}", other),
+        }
 
         ws.close(None).await.ok();
     }
