@@ -29,9 +29,15 @@ impl RateLoop {
         }
     }
 
-    /// The standard coppa level set, dwell 3, starting at the most robust level.
+    /// The standard coppa level set, starting at the most robust level. `raise_dwell = 5` is the
+    /// value found by sweeping 3/4/5/6/8/10/12/15 against `crates/coppa-bench/examples/
+    /// closed_loop_arq.rs`'s time-varying-channel bench (`robust` profile): 5 was the peak
+    /// (adaptive/best-fixed and adaptive/oracle both highest there and falling off on both
+    /// sides), not just a monotonic "more dwell is safer" choice -- see that bench's module doc
+    /// for the measured numbers and the deeper reason this configuration still falls short of
+    /// the plan's acceptance bar.
     pub fn default_coppa() -> Self {
-        Self::new(VALID_SPEED_LEVELS.to_vec(), 3, 1)
+        Self::new(VALID_SPEED_LEVELS.to_vec(), 5, 1)
     }
 
     /// Index of the highest level `<= level` (clamped into range).

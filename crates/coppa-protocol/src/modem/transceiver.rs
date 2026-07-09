@@ -1198,8 +1198,7 @@ mod tests {
                 );
                 let noisy =
                     coppa_channel::awgn_seeded(&faded, SNR_DB, seed ^ 0x5555_5555_5555_5555);
-                let ok =
-                    matches!(tx.receive(&noisy), Ok((_, rx, _)) if rx[..payload.len()] == payload[..]);
+                let ok = matches!(tx.receive(&noisy), Ok((_, rx, _)) if rx[..payload.len()] == payload[..]);
                 if !ok {
                     failures += 1;
                 }
