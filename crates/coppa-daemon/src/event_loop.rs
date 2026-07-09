@@ -648,10 +648,25 @@ impl EventLoop {
 
                     // WebSocket `status` reply: keep the live snapshot current
                     // (decision 8: "connected, snr, level, cfo").
+                    //
+                    // Review finding: `connected` must NOT be "was any frame ever
+                    // decoded since daemon start" (that flips true once and stays
+                    // true forever, even after the session drops or the remote goes
+                    // silent -- a monitoring client would misread a dead link as
+                    // live). Recomputed from `session_mgr`'s real established-session
+                    // state instead, at the same point the rest of the snapshot
+                    // updates. Still only refreshed on a decode event (this whole
+                    // snapshot has no independent tick), so a session that drops
+                    // WITHOUT any further decode won't flip this back to false until
+                    // the next decoded frame -- an accepted, smaller residual gap,
+                    // not the same "stays true forever, unconditionally" bug.
                     #[cfg(feature = "websocket")]
                     if let Some(ref status) = self.ws_status {
+                        let established = self.session_mgr.active_sessions().iter().any(|&id| {
+                            self.session_mgr.get(id).is_some_and(|s| s.is_established())
+                        });
                         let mut snap = status.lock().await;
-                        snap.connected = true;
+                        snap.connected = established;
                         snap.snr = Some(snr_db.round() as i32);
                         snap.level = Some(speed_level);
                         snap.cfo = Some(cfo_hz);
