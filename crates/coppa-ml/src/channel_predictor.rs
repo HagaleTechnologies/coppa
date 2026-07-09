@@ -1,6 +1,6 @@
 //! EWMA-based channel quality predictor with trend extrapolation.
 
-use crate::{mcs::select_mcs, ChannelPredictor, MlModel};
+use crate::{ChannelPredictor, MlModel};
 
 /// Exponentially Weighted Moving Average channel predictor.
 ///
@@ -19,8 +19,6 @@ pub struct EwmaPredictor {
     observations: usize,
     /// Confidence based on number of observations.
     confidence_val: f32,
-    /// SNR margin for MCS selection (dB).
-    snr_margin: f32,
 }
 
 impl EwmaPredictor {
@@ -36,13 +34,7 @@ impl EwmaPredictor {
             trend: 0.0,
             observations: 0,
             confidence_val: 0.0,
-            snr_margin: 3.0,
         }
-    }
-
-    /// Set the SNR margin for MCS selection.
-    pub fn set_snr_margin(&mut self, margin: f32) {
-        self.snr_margin = margin;
     }
 
     /// Get the current smoothed SNR estimate.
@@ -87,10 +79,6 @@ impl ChannelPredictor for EwmaPredictor {
     fn predict(&self, frames_ahead: usize) -> f32 {
         // Linear extrapolation from current smoothed value
         self.smoothed + self.trend * frames_ahead as f32
-    }
-
-    fn recommend_mcs(&self) -> u8 {
-        select_mcs(self.smoothed, self.snr_margin).index
     }
 }
 
@@ -177,23 +165,6 @@ mod tests {
         assert!(
             future > now,
             "Future prediction should be higher with positive trend"
-        );
-    }
-
-    #[test]
-    fn test_ewma_mcs_selection() {
-        let mut pred = EwmaPredictor::new(0.3, 20.0);
-        for _ in 0..50 {
-            pred.observe(20.0);
-        }
-
-        let mcs = pred.recommend_mcs();
-        // At 20 dB with 3 dB margin -> effective 17 dB
-        // Should select 16QAM 1/2 (min_snr 16 dB, index 8)
-        assert!(
-            (7..=9).contains(&mcs),
-            "MCS {} unexpected at 20 dB SNR",
-            mcs
         );
     }
 

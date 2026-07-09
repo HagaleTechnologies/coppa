@@ -1,159 +1,15 @@
-//! Modulation and Coding Scheme (MCS) table and selection.
-
-/// A single MCS entry defining modulation, coding rate, and throughput.
-#[derive(Debug, Clone, Copy)]
-pub struct McsEntry {
-    /// MCS index (0 = most robust).
-    pub index: u8,
-    /// Human-readable name.
-    pub name: &'static str,
-    /// Minimum SNR in dB required for reliable operation.
-    pub min_snr_db: f32,
-    /// Approximate throughput in bits per second at 8 kHz sample rate.
-    pub throughput_bps: f32,
-    /// Bits per symbol for the modulation.
-    pub bits_per_symbol: u8,
-    /// FEC code rate numerator.
-    pub fec_rate_num: u8,
-    /// FEC code rate denominator.
-    pub fec_rate_den: u8,
-}
-
-impl McsEntry {
-    /// FEC code rate as a float.
-    pub fn fec_rate(&self) -> f32 {
-        self.fec_rate_num as f32 / self.fec_rate_den as f32
-    }
-
-    /// Spectral efficiency in bits/s/Hz.
-    pub fn spectral_efficiency(&self) -> f32 {
-        self.bits_per_symbol as f32 * self.fec_rate()
-    }
-}
-
-/// MCS table ordered from most robust (index 0) to fastest (index 10).
-pub const MCS_TABLE: [McsEntry; 11] = [
-    McsEntry {
-        index: 0,
-        name: "BPSK 1/4",
-        min_snr_db: -2.0,
-        throughput_bps: 31.0,
-        bits_per_symbol: 1,
-        fec_rate_num: 1,
-        fec_rate_den: 4,
-    },
-    McsEntry {
-        index: 1,
-        name: "BPSK 1/3",
-        min_snr_db: 0.0,
-        throughput_bps: 42.0,
-        bits_per_symbol: 1,
-        fec_rate_num: 1,
-        fec_rate_den: 3,
-    },
-    McsEntry {
-        index: 2,
-        name: "BPSK 1/2",
-        min_snr_db: 2.0,
-        throughput_bps: 62.0,
-        bits_per_symbol: 1,
-        fec_rate_num: 1,
-        fec_rate_den: 2,
-    },
-    McsEntry {
-        index: 3,
-        name: "BPSK 3/4",
-        min_snr_db: 5.0,
-        throughput_bps: 94.0,
-        bits_per_symbol: 1,
-        fec_rate_num: 3,
-        fec_rate_den: 4,
-    },
-    McsEntry {
-        index: 4,
-        name: "QPSK 1/2",
-        min_snr_db: 7.0,
-        throughput_bps: 125.0,
-        bits_per_symbol: 2,
-        fec_rate_num: 1,
-        fec_rate_den: 2,
-    },
-    McsEntry {
-        index: 5,
-        name: "QPSK 3/4",
-        min_snr_db: 10.0,
-        throughput_bps: 188.0,
-        bits_per_symbol: 2,
-        fec_rate_num: 3,
-        fec_rate_den: 4,
-    },
-    McsEntry {
-        index: 6,
-        name: "8PSK 1/2",
-        min_snr_db: 12.0,
-        throughput_bps: 188.0,
-        bits_per_symbol: 3,
-        fec_rate_num: 1,
-        fec_rate_den: 2,
-    },
-    McsEntry {
-        index: 7,
-        name: "8PSK 3/4",
-        min_snr_db: 15.0,
-        throughput_bps: 281.0,
-        bits_per_symbol: 3,
-        fec_rate_num: 3,
-        fec_rate_den: 4,
-    },
-    McsEntry {
-        index: 8,
-        name: "16QAM 1/2",
-        min_snr_db: 16.0,
-        throughput_bps: 250.0,
-        bits_per_symbol: 4,
-        fec_rate_num: 1,
-        fec_rate_den: 2,
-    },
-    McsEntry {
-        index: 9,
-        name: "16QAM 3/4",
-        min_snr_db: 20.0,
-        throughput_bps: 375.0,
-        bits_per_symbol: 4,
-        fec_rate_num: 3,
-        fec_rate_den: 4,
-    },
-    McsEntry {
-        index: 10,
-        name: "64QAM 3/4",
-        min_snr_db: 25.0,
-        throughput_bps: 563.0,
-        bits_per_symbol: 6,
-        fec_rate_num: 3,
-        fec_rate_den: 4,
-    },
-];
-
-/// Select the best MCS for the given SNR with a safety margin.
-///
-/// Returns the highest-throughput MCS whose min_snr is at most `snr_db - margin_db`.
-pub fn select_mcs(snr_db: f32, margin_db: f32) -> &'static McsEntry {
-    let effective_snr = snr_db - margin_db;
-    let mut best = &MCS_TABLE[0];
-    for entry in &MCS_TABLE {
-        if effective_snr >= entry.min_snr_db {
-            best = entry;
-        } else {
-            break;
-        }
-    }
-    best
-}
+//! Modulation and Coding Scheme (MCS) selection.
+//!
+//! The channel-adaptive selectors below (`channel_capacity`/`channel_selectivity`/
+//! `select_speed_level_2d`) are the only selection path in this module. An earlier,
+//! now-deleted `MCS_TABLE`/`select_mcs` (a stale, SNR-only, 8 kHz-era 11-entry table) was
+//! superseded by this capacity-based approach and had no real caller left (only its own
+//! predictor test) — see `docs/superpowers/plans/2026-07-03-phase3-system-layer.md` decision 5.
 
 /// Average per-carrier Shannon capacity (bits/s/Hz) from RX per-carrier noise variances
 /// `nv[k] = sigma^2/|H[k]|^2` (per-carrier SNR = `1/nv[k]`). Captures BOTH effective SNR and
 /// frequency selectivity in one number (deep nulls => huge nv => ~0 contribution). Mode-independent
-/// because `nv` is pilot-derived. Supersedes the SNR-only `MCS_TABLE` for channel-adaptive selection.
+/// because `nv` is pilot-derived.
 pub fn channel_capacity(noise_vars: &[f32]) -> f32 {
     if noise_vars.is_empty() {
         return 0.0;
@@ -264,64 +120,23 @@ pub fn select_speed_level_calibrated(capacity: f32) -> u8 {
     best_level
 }
 
+/// Recommend a speed level from a frame's per-carrier noise variances in one call — the single
+/// source of truth for the closed-loop rate feedback's receiver-side recommendation (fed back on
+/// the ACK, see `coppa_ml::rate_loop::RateLoop`). Wraps `channel_capacity`, `channel_selectivity`,
+/// and `select_speed_level_2d` together; kept as one small function (rather than inlined at each
+/// call site) so it can later be pointed at per-codeword noise vars (once multi-codeword frames
+/// exist) without touching more than one place. Returns level 1 for an empty `noise_vars` (no
+/// channel information).
+pub fn recommend_speed_level(noise_vars: &[f32]) -> u8 {
+    if noise_vars.is_empty() {
+        return 1;
+    }
+    select_speed_level_2d(channel_capacity(noise_vars), channel_selectivity(noise_vars))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_mcs_table_ordered() {
-        for i in 1..MCS_TABLE.len() {
-            assert!(
-                MCS_TABLE[i].min_snr_db >= MCS_TABLE[i - 1].min_snr_db,
-                "MCS table not ordered by SNR at index {}",
-                i
-            );
-        }
-    }
-
-    #[test]
-    fn test_select_mcs_low_snr() {
-        let mcs = select_mcs(-5.0, 2.0);
-        assert_eq!(mcs.index, 0); // Most robust
-    }
-
-    #[test]
-    fn test_select_mcs_high_snr() {
-        let mcs = select_mcs(30.0, 2.0);
-        assert_eq!(mcs.index, 10); // Fastest
-    }
-
-    #[test]
-    fn test_select_mcs_mid_snr() {
-        let mcs = select_mcs(12.0, 2.0);
-        // 12 - 2 = 10 dB effective, QPSK 3/4 needs 10 dB
-        assert_eq!(mcs.index, 5);
-    }
-
-    #[test]
-    fn test_mcs_fec_rate() {
-        assert!((MCS_TABLE[2].fec_rate() - 0.5).abs() < 0.001);
-        assert!((MCS_TABLE[3].fec_rate() - 0.75).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_mcs_spectral_efficiency() {
-        // BPSK 1/2: 1 * 0.5 = 0.5
-        assert!((MCS_TABLE[2].spectral_efficiency() - 0.5).abs() < 0.001);
-        // QPSK 3/4: 2 * 0.75 = 1.5
-        assert!((MCS_TABLE[5].spectral_efficiency() - 1.5).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_select_mcs_with_margin() {
-        // At exactly 7 dB with 0 margin, should get QPSK 1/2
-        let mcs = select_mcs(7.0, 0.0);
-        assert_eq!(mcs.index, 4);
-
-        // At 7 dB with 3 dB margin, effective = 4, gets BPSK 1/2
-        let mcs = select_mcs(7.0, 3.0);
-        assert_eq!(mcs.index, 2);
-    }
 
     #[test]
     fn capacity_reflects_snr_and_nulls() {
@@ -410,5 +225,15 @@ mod tests {
             prev = lvl;
             c += 0.25;
         }
+    }
+
+    #[test]
+    fn recommend_speed_level_matches_2d_selector_and_handles_empty() {
+        let nv = vec![0.001f32; 48]; // strong, flat channel
+        assert_eq!(
+            recommend_speed_level(&nv),
+            select_speed_level_2d(channel_capacity(&nv), channel_selectivity(&nv))
+        );
+        assert_eq!(recommend_speed_level(&[]), 1);
     }
 }

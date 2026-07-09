@@ -1,9 +1,13 @@
-//! Channel quality prediction (EWMA) and MCS selection for Coppa.
+//! Channel quality prediction (EWMA), capacity-based MCS/speed-level selection, and the
+//! closed-loop sender-side rate controller for Coppa.
 //!
 //! Despite the crate name, this is not machine learning. It provides:
 //! - an exponentially-weighted-moving-average (EWMA) channel-quality
 //!   predictor with a simple linear trend extrapolation,
-//! - a static SNR-to-MCS lookup table for picking a modulation/coding scheme,
+//! - channel-capacity-based speed-level selection (`mcs::select_speed_level_2d` /
+//!   `mcs::recommend_speed_level`) for picking a modulation/coding scheme,
+//! - `RateLoop`, the sender-side closed-loop rate controller that applies a
+//!   receiver-recommended speed level (fed back on the ACK) with hysteresis,
 //! - FFT-based spectrum sensing for noise-floor and occupancy estimation.
 //!
 //! No model is ever loaded and there is no inference runtime. The registry
@@ -14,15 +18,17 @@ use anyhow::Result;
 
 pub mod channel_predictor;
 pub mod mcs;
+pub mod rate_loop;
 pub mod registry;
 pub mod spectrum_sensor;
 
 pub use channel_predictor::EwmaPredictor;
 pub use mcs::{
-    channel_capacity, channel_selectivity, select_mcs, select_speed_level, select_speed_level_2d,
-    select_speed_level_calibrated, McsEntry, MCS_TABLE, SPEED_LEVEL_EFFICIENCY,
+    channel_capacity, channel_selectivity, recommend_speed_level, select_speed_level,
+    select_speed_level_2d, select_speed_level_calibrated, SPEED_LEVEL_EFFICIENCY,
     SPEED_LEVEL_MIN_CAPACITY,
 };
+pub use rate_loop::{RateLoop, VALID_SPEED_LEVELS};
 pub use registry::ModelRegistry;
 pub use spectrum_sensor::SpectrumSensor;
 
@@ -36,22 +42,20 @@ pub trait MlModel: Send + Sync {
     fn confidence(&self) -> f32;
 }
 
-/// Predicts future channel quality and recommends modulation/coding schemes.
+/// Predicts future channel quality.
 pub trait ChannelPredictor: MlModel {
     fn observe(&mut self, quality: f32);
     fn predict(&self, frames_ahead: usize) -> f32;
-    fn recommend_mcs(&self) -> u8;
 }
 
 /// A no-op predictor that always returns a fixed quality estimate.
 pub struct FixedPredictor {
     quality: f32,
-    mcs: u8,
 }
 
 impl FixedPredictor {
-    pub fn new(quality: f32, mcs: u8) -> Self {
-        Self { quality, mcs }
+    pub fn new(quality: f32) -> Self {
+        Self { quality }
     }
 }
 
@@ -74,10 +78,6 @@ impl ChannelPredictor for FixedPredictor {
 
     fn predict(&self, _frames_ahead: usize) -> f32 {
         self.quality
-    }
-
-    fn recommend_mcs(&self) -> u8 {
-        self.mcs
     }
 }
 
@@ -106,13 +106,12 @@ mod tests {
 
     #[test]
     fn test_fixed_predictor_basics() {
-        let mut pred = FixedPredictor::new(15.0, 3);
+        let mut pred = FixedPredictor::new(15.0);
         assert_eq!(pred.model_type(), "fixed-predictor");
         assert_eq!(pred.version(), "0.0.0");
         assert_eq!(pred.confidence(), 0.0);
         assert_eq!(pred.predict(0), 15.0);
         assert_eq!(pred.predict(10), 15.0);
-        assert_eq!(pred.recommend_mcs(), 3);
         pred.observe(30.0);
         assert_eq!(pred.predict(0), 15.0);
     }
