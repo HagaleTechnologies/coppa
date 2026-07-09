@@ -17,12 +17,15 @@
 //! both sides of that peak, so this isn't a case of "needs a bit more damping": more dwell keeps
 //! failing to converge on the same shape of problem.
 //!
-//! Root cause, confirmed by direct measurement (not guessed): `coppa_ml::recommend_speed_level`'s
-//! underlying capacity metric (`channel_capacity`/`noise_vars`, from `CoppaTransceiver::
-//! receive_with_metrics`) is NOT invariant to which speed level the frame being measured happened
-//! to use -- at a fixed TRUE injected AWGN SNR, measuring via a level-1 transmission reads
-//! meaningfully lower "capacity" than measuring via a level-7 transmission (verified with 30-seed
-//! averages, both `hf_standard` and `hf_robust`, no fading at all). But `SPEED_LEVEL_MIN_CAPACITY`
+//! Root cause, from an ad-hoc diagnostic (temporary probes, not committed -- see caveat below):
+//! `coppa_ml::recommend_speed_level`'s underlying capacity metric (`channel_capacity`/`noise_vars`,
+//! from `CoppaTransceiver::receive_with_metrics`) appears NOT invariant to which speed level the
+//! frame being measured happened to use -- at a fixed TRUE injected AWGN SNR, measuring via a
+//! level-1 transmission read meaningfully lower "capacity" than measuring via a level-7
+//! transmission (30-seed averages, both `hf_standard` and `hf_robust`, no fading at all). This
+//! measurement was NOT committed as a reproducible bench/test -- treat it as a well-reasoned
+//! hypothesis consistent with the evidence below, not as independently-verifiable fact, until a
+//! committed diagnostic exists. But `SPEED_LEVEL_MIN_CAPACITY`
 //! (the calibration table this recommendation is looked up in) was calibrated exclusively via a
 //! FIXED level-2 probe frame (see `mcs_calibration.rs`/`adaptive_mcs_validation.rs`'s
 //! `sound_capacity`, which always transmits at `mode_for_level(2)` regardless of the level being
