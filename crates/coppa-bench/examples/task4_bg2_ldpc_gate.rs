@@ -323,7 +323,7 @@ fn new_ofdm_trial(
     let faded = watterson(&clean, 48_000.0, &WattersonPreset::Poor.config(), seed);
     let noisy = coppa_channel::awgn_seeded(&faded, snr_db, seed ^ 0x5A5A);
     match tx.receive(&noisy) {
-        Ok((rx_header, rx_payload)) => {
+        Ok((rx_header, rx_payload, _rec_level)) => {
             rx_header.speed_level == level && rx_payload[..payload.len()] == payload[..]
         }
         Err(_) => false,

@@ -178,7 +178,7 @@ fn measure(
         // --- Post-FEC: decode the SAME faded signal through the real receive path,
         //     recording WHERE it dies.
         match tx.receive(&faded) {
-            Ok((_h, p)) => {
+            Ok((_h, p, _rec_level)) => {
                 if p.len() >= pfb && p[..pfb] == payload[..] {
                     post_ok += 1;
                     n_ok += 1;

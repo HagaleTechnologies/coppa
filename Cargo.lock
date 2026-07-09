@@ -465,6 +465,7 @@ dependencies = [
  "coppa-channel",
  "coppa-codec",
  "coppa-dsp",
+ "coppa-ml",
  "crc",
  "lz4_flex",
  "num-complex",

@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 coppa-codec = { path = "../coppa-codec" }
 coppa-dsp = { path = "../coppa-dsp" }
+coppa-ml = { path = "../coppa-ml" }
 anyhow = { workspace = true }
 crc = { workspace = true }
 lz4_flex = { workspace = true }

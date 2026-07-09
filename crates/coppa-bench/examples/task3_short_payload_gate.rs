@@ -80,7 +80,7 @@ fn run_trial(
     };
 
     let outcome = match tx.receive(&faded) {
-        Ok((_h, rx_payload)) => {
+        Ok((_h, rx_payload, _rec_level)) => {
             let n = payload.len().min(rx_payload.len());
             let errs = bit_errors(&payload[..n], &rx_payload[..n]);
             let success =

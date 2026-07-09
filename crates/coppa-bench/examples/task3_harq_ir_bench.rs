@@ -143,7 +143,7 @@ fn first_tx_fer(snr_db: f32, payload_bytes: usize, profile: &CoppaProfile) -> f6
             .transmit(&header, &payload)
             .expect("payload within this level's capacity");
         let noisy = corrupt(&clean, snr_db, trial as u64, 0);
-        let ok = matches!(tx.receive(&noisy), Ok((_, rx)) if rx[..payload.len()] == payload[..]);
+        let ok = matches!(tx.receive(&noisy), Ok((_, rx, _)) if rx[..payload.len()] == payload[..]);
         if !ok {
             failures += 1;
         }
@@ -199,7 +199,7 @@ fn simulate_trial(
             .transmit(&header, &payload)
             .expect("payload within this level's capacity");
         let noisy = corrupt(&clean, snr_db, trial, attempt);
-        let ok = matches!(tx.receive(&noisy), Ok((_, rx)) if rx[..payload.len()] == payload[..]);
+        let ok = matches!(tx.receive(&noisy), Ok((_, rx, _)) if rx[..payload.len()] == payload[..]);
 
         if strategy == Strategy::Plain {
             // No combining: forget this attempt's LLRs regardless of outcome.

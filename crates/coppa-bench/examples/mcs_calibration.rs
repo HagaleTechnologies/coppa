@@ -59,7 +59,7 @@ fn fer(
             .transmit(&make_header(level, pfb as u16), &payload)
             .expect("payload within this level's capacity");
         let faded = apply_channel(&sig, ch, snr, seed);
-        if let Ok((_h, p)) = tx.receive(&faded) {
+        if let Ok((_h, p, _rec)) = tx.receive(&faded) {
             if p.len() >= pfb && p[..pfb] == payload[..] {
                 ok += 1;
             }

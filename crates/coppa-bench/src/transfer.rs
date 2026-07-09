@@ -94,7 +94,7 @@ impl TransferPhy for V1Phy {
         let pfb = self.per_frame_bytes;
         let mut out = vec![0u8; self.payload_bytes()];
         for (k, window) in frame_windows.iter().enumerate() {
-            if let Ok((_h, bytes)) = self.tx.receive(window) {
+            if let Ok((_h, bytes, _rec_level)) = self.tx.receive(window) {
                 let n = bytes.len().min(pfb);
                 out[k * pfb..k * pfb + n].copy_from_slice(&bytes[..n]);
             }

@@ -87,7 +87,7 @@ fn run_cell(
         let faded = apply_channel(&sig, ch, snr, seed);
 
         let ok =
-            matches!(tx.receive(&faded), Ok((_h, p)) if p.len() >= pfb && p[..pfb] == payload[..]);
+            matches!(tx.receive(&faded), Ok((_h, p, _)) if p.len() >= pfb && p[..pfb] == payload[..]);
         if ok {
             continue;
         }
