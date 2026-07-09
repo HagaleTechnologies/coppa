@@ -87,7 +87,12 @@ impl CpGate {
     /// recommendation.
     pub fn observe(&mut self, spread_ms: f32) -> CpRecommendation {
         if spread_ms < self.threshold_ms {
-            self.run += 1;
+            // Capped at `consecutive_needed`, not just saturating at `u8::MAX`: once the
+            // gate has switched to ShortCp, sustained calm-channel use would otherwise
+            // keep incrementing `run` indefinitely, overflow-panicking (debug/test builds)
+            // or silently wrapping (release) after 255 consecutive calm frames. Nothing
+            // reads `run` above `consecutive_needed` anyway (see `run_len`'s doc).
+            self.run = self.run.saturating_add(1).min(self.consecutive_needed);
             if self.run >= self.consecutive_needed {
                 self.recommendation = CpRecommendation::ShortCp;
             }
@@ -193,5 +198,28 @@ mod tests {
     fn consecutive_needed_is_clamped_to_at_least_one() {
         let mut gate = CpGate::new(2.5, 0);
         assert_eq!(gate.observe(0.1), CpRecommendation::ShortCp);
+    }
+
+    /// Review finding on Task 6b: `run` must not overflow on a long run of consecutive
+    /// calm-channel observations (the expected common case once switched to ShortCp) --
+    /// 300 calls previously would have panicked (debug) or silently wrapped (release) at
+    /// the 256th, since `run` is a `u8` and was previously incremented unbounded.
+    #[test]
+    fn run_counter_does_not_overflow_on_a_long_calm_run() {
+        let mut gate = CpGate::new(2.5, 4);
+        let mut last = CpRecommendation::LongCp;
+        for _ in 0..300 {
+            last = gate.observe(0.1);
+        }
+        assert_eq!(
+            last,
+            CpRecommendation::ShortCp,
+            "300 consecutive calm observations must have switched to ShortCp"
+        );
+        assert_eq!(
+            gate.run_len(),
+            4,
+            "run must cap at consecutive_needed, not grow past it"
+        );
     }
 }
