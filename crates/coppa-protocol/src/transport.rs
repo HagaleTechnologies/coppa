@@ -107,6 +107,25 @@ impl TransportPdu {
         }
     }
 
+    /// Create an ACK that piggybacks a suggested speed level (closed-loop rate feedback,
+    /// Phase 3 Task 4). The level is carried as a 1-byte payload; a plain `new_ack` has no
+    /// payload.
+    pub fn new_ack_with_rate(
+        session_id: u8,
+        ack_num: u8,
+        ack_bitmap: u32,
+        suggested_level: u8,
+    ) -> Self {
+        Self {
+            session_id: session_id & 0x0F,
+            transport_type: TransportType::Ack,
+            seq_num: 0,
+            ack_num,
+            ack_bitmap,
+            payload: vec![suggested_level],
+        }
+    }
+
     /// Create a NAK (negative acknowledgment / retransmit request).
     pub fn new_nak(session_id: u8, ack_num: u8, ack_bitmap: u32) -> Self {
         Self {
@@ -154,6 +173,16 @@ impl TransportPdu {
             return (self.ack_bitmap >> bit_index) & 1 == 1;
         }
         false
+    }
+
+    /// The suggested speed level carried by an ACK, if any (closed-loop rate feedback,
+    /// Phase 3 Task 4). `None` for a plain `new_ack` (no payload) or any non-ACK PDU.
+    pub fn suggested_rate(&self) -> Option<u8> {
+        if self.transport_type == TransportType::Ack {
+            self.payload.first().copied()
+        } else {
+            None
+        }
     }
 
     /// Serialize to bytes.
@@ -250,6 +279,24 @@ mod tests {
         assert_eq!(decoded.ack_num, 50);
         assert_eq!(decoded.ack_bitmap, 0b10101010);
         assert!(decoded.payload.is_empty());
+    }
+
+    #[test]
+    fn test_ack_with_rate_roundtrip() {
+        let pdu = TransportPdu::new_ack_with_rate(1, 50, 0b10101010, 6);
+        assert_eq!(pdu.suggested_rate(), Some(6));
+        let bytes = pdu.to_bytes();
+        let decoded = TransportPdu::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.transport_type, TransportType::Ack);
+        assert_eq!(decoded.ack_num, 50);
+        assert_eq!(decoded.ack_bitmap, 0b10101010);
+        assert_eq!(decoded.suggested_rate(), Some(6));
+    }
+
+    #[test]
+    fn test_plain_ack_has_no_rate() {
+        let pdu = TransportPdu::new_ack(1, 50, 0);
+        assert_eq!(pdu.suggested_rate(), None);
     }
 
     #[test]
