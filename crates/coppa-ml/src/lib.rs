@@ -8,6 +8,8 @@
 //!   `mcs::recommend_speed_level`) for picking a modulation/coding scheme,
 //! - `RateLoop`, the sender-side closed-loop rate controller that applies a
 //!   receiver-recommended speed level (fed back on the ACK) with hysteresis,
+//! - `CpGate`, a spread-gated recommendation of whether the short-CP HF profile is
+//!   currently safe to use, from measured per-frame delay-spread history,
 //! - FFT-based spectrum sensing for noise-floor and occupancy estimation.
 //!
 //! No model is ever loaded and there is no inference runtime. The registry
@@ -17,12 +19,14 @@
 use anyhow::Result;
 
 pub mod channel_predictor;
+pub mod cp_gate;
 pub mod mcs;
 pub mod rate_loop;
 pub mod registry;
 pub mod spectrum_sensor;
 
 pub use channel_predictor::EwmaPredictor;
+pub use cp_gate::{CpGate, CpRecommendation};
 pub use mcs::{
     channel_capacity, channel_selectivity, recommend_speed_level, select_speed_level,
     select_speed_level_2d, select_speed_level_calibrated, SPEED_LEVEL_EFFICIENCY,

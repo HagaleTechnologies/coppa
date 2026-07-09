@@ -240,6 +240,33 @@ impl CoppaProfile {
         }
     }
 
+    /// HF standard profile with a short cyclic prefix (Task 6b, spread-gated short-CP HF
+    /// profile): identical to [`Self::hf_standard`] except `cp_samples: 144` (144/48000 =
+    /// 3.0 ms flat, vs. `hf_standard`'s 300 samples = 6.25 ms) and its own distinct
+    /// `bandwidth_id`.
+    ///
+    /// Rationale (from the task brief): mid-latitude 95th-percentile composite HF multipath
+    /// delay spread is ≤ 3 ms, so a 3 ms CP covers essentially all real channels with ~1 ms
+    /// of slop above the ITU-R Watterson-Good preset's 0.5 ms nominal spread, while a
+    /// calmer channel no longer pays for `hf_standard`'s full 6.25 ms of headroom. This is
+    /// NOT a universal replacement for `hf_standard` — see `coppa_ml::cp_gate::CpGate` for
+    /// the spread-gated recommendation logic that decides, from measured delay spread, when
+    /// it's safe to prefer this profile over the long-CP default (on Watterson-Poor-like
+    /// channels, whose ~2 ms spread eats most of the slop budget, `hf_standard` should stay
+    /// the default).
+    pub fn hf_standard_short_cp() -> Self {
+        Self {
+            fft_size: 960,
+            sample_rate: 48_000,
+            cp_samples: 144,
+            data_carriers: 44,
+            pilot_carriers: 4,
+            phy_mode: 0,
+            bandwidth_id: 4,
+            carrier_offset: 6,
+        }
+    }
+
     /// VHF narrow profile: shorter CP for reduced multipath, standard carrier count.
     pub fn vhf_narrow() -> Self {
         Self {
@@ -819,6 +846,57 @@ mod tests {
         assert_eq!(p.pilot_carriers, 4);
         assert_eq!(p.total_active_carriers(), 50);
         assert_eq!(p.bandwidth_id, 2);
+    }
+
+    #[test]
+    fn test_coppa_hf_standard_short_cp_profile() {
+        let p = CoppaProfile::hf_standard_short_cp();
+        // Identical to hf_standard except cp_samples and bandwidth_id.
+        let long = CoppaProfile::hf_standard();
+        assert_eq!(p.fft_size, long.fft_size);
+        assert_eq!(p.sample_rate, long.sample_rate);
+        assert_eq!(p.data_carriers, long.data_carriers);
+        assert_eq!(p.pilot_carriers, long.pilot_carriers);
+        assert_eq!(p.phy_mode, long.phy_mode);
+        assert_eq!(p.carrier_offset, long.carrier_offset);
+
+        assert_eq!(p.cp_samples, 144);
+        assert_eq!(
+            p.bandwidth_id, 4,
+            "must be a distinct bandwidth_id from every other profile"
+        );
+        // 144/48000 = 3.0 ms flat CP.
+        assert!(
+            ((p.cp_samples as f32 / p.sample_rate as f32 * 1000.0) - 3.0).abs() < 0.01,
+            "expected 3.0 ms CP, got {}",
+            p.cp_samples as f32 / p.sample_rate as f32 * 1000.0
+        );
+        // symbol_duration_ms = (960 + 144) / 48000 * 1000 = 23.0
+        assert!(
+            (p.symbol_duration_ms() - 23.0).abs() < 0.01,
+            "expected 23.0 ms symbol duration, got {}",
+            p.symbol_duration_ms()
+        );
+    }
+
+    #[test]
+    fn test_bandwidth_ids_are_all_distinct_among_hf_profiles() {
+        // hf_narrow=0, hf_standard=1, hf_wide=2, hf_robust=3, hf_standard_short_cp=4.
+        let ids = [
+            CoppaProfile::hf_narrow().bandwidth_id,
+            CoppaProfile::hf_standard().bandwidth_id,
+            CoppaProfile::hf_wide().bandwidth_id,
+            CoppaProfile::hf_robust().bandwidth_id,
+            CoppaProfile::hf_standard_short_cp().bandwidth_id,
+        ];
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                assert_ne!(
+                    ids[i], ids[j],
+                    "bandwidth_id collision between HF profile index {i} and {j}: {ids:?}"
+                );
+            }
+        }
     }
 
     #[test]
