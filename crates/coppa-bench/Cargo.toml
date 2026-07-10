@@ -14,3 +14,6 @@ coppa-ml = { path = "../coppa-ml" }
 rand = { workspace = true }
 clap = { workspace = true }
 num-complex = { workspace = true }
+hound = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
