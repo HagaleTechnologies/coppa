@@ -341,8 +341,11 @@ dependencies = [
  "coppa-codec",
  "coppa-ml",
  "coppa-protocol",
+ "hound",
  "num-complex",
  "rand 0.10.2",
+ "serde",
+ "toml",
 ]
 
 [[package]]
@@ -468,10 +471,13 @@ dependencies = [
  "coppa-dsp",
  "coppa-ml",
  "crc",
+ "hound",
  "lz4_flex",
  "num-complex",
  "proptest",
  "rand 0.10.2",
+ "serde",
+ "toml",
 ]
 
 [[package]]
