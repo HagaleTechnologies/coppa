@@ -67,10 +67,12 @@ Test Infrastructure  → Channel models (AWGN, fading), fuzzing
 - **GPIO PTT**: Linux sysfs GPIO pin control (stub — requires hardware)
 
 #### Channel Adaptation (`coppa-ml`)
-- `ChannelPredictor` trait with an EWMA + linear-trend predictor (the only predictor implemented — there is no machine learning or model inference)
-- An optional model registry that scans for model files and always falls back to the EWMA predictor (no inference runtime is integrated)
-- MCS selection from a static SNR-threshold lookup table
+- Capacity-based MCS selection (`select_speed_level_2d`) from measured per-carrier noise variance, not a static SNR-threshold table
+- `RateLoop`: sender-side closed-loop speed-level control, applying a receiver-computed recommendation fed back over the ACK, with raise-slow/drop-fast hysteresis
+- `CpGate`: spread-gated short-CP profile recommendation from measured delay-spread history
+- `BusyGate`: spectral-occupancy transition gate for daemon telemetry
 - Spectrum sensing utilities
+- None of the above is ML/inference-based — all are deterministic functions of measurements the receiver already produces. The old EWMA channel-quality predictor and optional model-file registry were dead code (zero callers) and were removed in Phase 3
 
 #### Engine (`coppa-engine`)
 - `CoppaCore`: integrates modem, FEC, and framing into encode/decode pipelines

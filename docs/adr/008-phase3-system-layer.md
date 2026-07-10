@@ -36,8 +36,8 @@ loop** (adaptive/best-fixed = 0.894, adaptive/oracle = 0.751, vs. required >1.0/
 peak-confirmed shortfall, root-caused to a level-dependent bias in the shared channel-capacity
 metric, not a `RateLoop` logic bug), and **Task 8's benchmark-program acceptance targets**
 (`milstd`: 0/27 operating points pass, even with +12 dB margin; `session`: 0/5 Moderate/Poor and
-2/5 Good sessions drop — see BENCHMARKS.md's Task 8 section for the full, twice-corrected honest
-diagnosis of why). Neither shortfall is a regression introduced by this phase's own code — both
+3/5 Good sessions complete drop-free — see BENCHMARKS.md's Task 8 section for the full,
+twice-corrected honest diagnosis of why). Neither shortfall is a regression introduced by this phase's own code — both
 are pre-existing PHY/channel-estimation-layer realities that this phase's new, more rigorous
 measurement tools (a real closed-loop bench, a real MIL-STD-style ladder, a real session
 simulator) exposed for the first time, consistent with the project's history of later phases'

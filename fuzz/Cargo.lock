@@ -67,12 +67,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "coppa-ml"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
+ "rustfft",
+]
+
+[[package]]
 name = "coppa-protocol"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "coppa-codec",
  "coppa-dsp",
+ "coppa-ml",
  "crc",
  "lz4_flex",
  "num-complex",
