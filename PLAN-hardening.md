@@ -92,17 +92,14 @@ These are areas where the implementation compiles and passes tests but is either
 
 ---
 
-## 6. ML Model Loading Is No-Op
+## 6. ML Model Loading Is No-Op — OBSOLETE (Phase 3 Task 9)
 
-**Problem:** `load_channel_predictor()` scans a `models/` directory that doesn't exist and always returns EWMA. The change from the original was purely cosmetic.
-
-**Fix:** This is actually fine for now — there are no trained ONNX models to load. But document it clearly:
-1. Add a `models/.gitkeep` with a README explaining the expected model format
-2. Update the function doc comment to explain: "Currently always returns EWMA. To use a trained model, place a `channel_predictor.onnx` file in the `models/` directory and enable the `ml` feature (not yet implemented)."
-
-**Files:** `crates/coppa-ml/src/lib.rs`, `models/README.md`
-
-**Est:** ~15 lines
+`load_channel_predictor()` and the whole `ChannelPredictor`/model-registry
+scaffolding it belonged to had zero callers anywhere in the workspace and
+were deleted as dead code in Phase 3 Task 9 (see
+`docs/adr/008-phase3-system-layer.md`). Channel adaptation is now handled
+by `coppa_ml::RateLoop`/`CpGate`/`BusyGate`, none of which load models.
+This backlog item no longer applies.
 
 ---
 
