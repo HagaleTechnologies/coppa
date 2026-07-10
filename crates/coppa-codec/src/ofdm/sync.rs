@@ -173,6 +173,17 @@ fn moose_lag_estimate(
 
 /// Estimate carrier frequency offset (Hz) from the Schmidl-Cox preamble (two identical
 /// `symbol_len` blocks at `timing_offset`). Unambiguous within ±sample_rate/(2*symbol_len).
+///
+/// **Legacy, test-only (Task 9):** superseded in production by
+/// `estimate_cfo_two_stage` below (wider unambiguous range via a coarse+fine
+/// pair sharing the same `moose_lag_estimate` primitive this function also
+/// uses). Confirmed via a full-repo grep to have zero production callers --
+/// `#[cfg(test)]`-gated rather than deleted outright because it still
+/// provides real, useful isolated coverage of the shared single-lag Moose
+/// math (see `estimate_cfo_recovers_injected_offset` below), the same
+/// treatment already applied to the Golay hard-decision reference decoder
+/// (Phase 2).
+#[cfg(test)]
 pub fn estimate_cfo_hz(
     samples: &[f32],
     timing_offset: usize,

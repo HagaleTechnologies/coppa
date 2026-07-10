@@ -1,15 +1,25 @@
 //! PHY Frame structure for Coppa protocol.
 //!
-//! Preserves backward compatibility with the original Frame struct while adding
-//! MAC PDU awareness. The PHY frame format is:
+//! This is a legacy, pre-consolidation frame format: it predates
+//! `CoppaHeader`/`CoppaModem`'s OFDM pipeline (`coppa_codec::ofdm::frame`),
+//! which is what every production TX/RX path in this crate actually uses.
+//! Nothing outside this file's own tests and `tests/proptest_roundtrip.rs`
+//! calls into it -- it is kept only as an already-tested, self-contained
+//! artifact of the project's history, not because anything downstream
+//! depends on it. Preserves MAC PDU awareness. The frame format is:
 //!
 //! ```text
-//! [Preamble 128b][Sync 16b][PHY Header 16b][MAC PDU][CRC-16]
+//! [Preamble 128b][Sync 16b][Length 8b][MAC PDU][CRC-16]
 //! ```
 //!
-//! The PHY header contains:
-//! - Length (8 bits): payload length in bytes (0-255)
-//! - Reserved (8 bits): reserved for future use
+//! The CRC-16 covers the length byte AND the MAC PDU bytes (not just the MAC
+//! PDU) -- a corrupted length field is itself caught by the CRC, not just by
+//! the truncation-bounds check in `parse_payload`. (Task 9 folded this
+//! length-covering CRC scope in from a since-deleted `to_bits_split_v2`/
+//! `from_payload_bits_v2` duplicate pair that also added an always-zero,
+//! never-used "reserved" byte to the header; that byte carried no real
+//! information, so it was dropped rather than folded in too -- see
+//! `.superpowers/sdd/task-9-report.md`.)
 //!
 //! The preamble and sync word are transmitted uncoded so the receiver can find
 //! the frame boundary before invoking FEC decoding.
@@ -84,15 +94,23 @@ impl Frame {
         Ok(Self { data })
     }
 
-    /// Convert frame to bits for transmission (V1 format).
+    /// Convert frame to bits for transmission.
     ///
     /// Returns (header_bits, payload_bits) where:
     /// - header_bits = preamble + sync word (transmitted uncoded)
     /// - payload_bits = length + data + CRC (to be FEC-encoded before transmission)
     ///
-    /// **CRC scope (V1):** The CRC-16 covers only the `data` bytes (not the
-    /// length field). Compare with `to_bits_split_v2` where the CRC covers
-    /// the PHY header (length + reserved) plus data.
+    /// **CRC scope:** the CRC-16 covers the length byte AND the `data` bytes
+    /// (not just `data`), so a corrupted length field is itself detected by
+    /// the CRC rather than relying solely on the truncation-length bounds
+    /// check in [`Self::parse_payload`]. (This folds in what used to be a
+    /// separate `to_bits_split_v2`/`from_payload_bits_v2` pair that existed
+    /// only to demonstrate a length-covering CRC over a wider "PHY header"
+    /// layout with an extra reserved byte; that reserved byte carried no
+    /// information and was always discarded on read, so Task 9 folded its one
+    /// real difference -- CRC covering the length field -- into this method
+    /// directly and deleted the duplicate. See
+    /// `.superpowers/sdd/task-9-report.md` for the fold decision.)
     pub fn to_bits_split(&self) -> Result<(Vec<u8>, Vec<u8>)> {
         let mut header = Vec::new();
         let mut payload = Vec::new();
@@ -119,7 +137,10 @@ impl Frame {
                 payload.push((byte >> i) & 1);
             }
         }
-        let crc = Self::calculate_crc(&self.data);
+        let mut crc_input = Vec::with_capacity(1 + self.data.len());
+        crc_input.push(length);
+        crc_input.extend_from_slice(&self.data);
+        let crc = Self::CRC.checksum(&crc_input);
         for i in (0..16).rev() {
             payload.push(((crc >> i) & 1) as u8);
         }
@@ -225,104 +246,6 @@ impl Frame {
         &self.data
     }
 
-    // -- PHY header helpers (evolved frame) --
-
-    /// Serialize an evolved PHY frame with a 2-byte PHY header.
-    ///
-    /// PHY header layout:
-    /// - Byte 0: payload length (0-255)
-    /// - Byte 1: reserved (set to 0)
-    ///
-    /// Returns (header_bits, payload_bits) for FEC split encoding.
-    ///
-    /// **CRC scope (V2):** The CRC-16 covers the PHY header bytes (length +
-    /// reserved) AND the data bytes, unlike V1 where only data is covered.
-    #[cfg(test)]
-    pub fn to_bits_split_v2(&self) -> Result<(Vec<u8>, Vec<u8>)> {
-        let mut header = Vec::new();
-        let mut payload = Vec::new();
-
-        // Preamble (128 bits of PN m-sequence)
-        for &byte in &PN_PREAMBLE {
-            for i in (0..8).rev() {
-                header.push((byte >> i) & 1);
-            }
-        }
-        // Sync word (16 bits)
-        for i in (0..16).rev() {
-            header.push(((Self::SYNC_WORD >> i) & 1) as u8);
-        }
-
-        // PHY header: length (8 bits) + reserved (8 bits)
-        let length = self.data.len() as u8;
-        for i in (0..8).rev() {
-            payload.push((length >> i) & 1);
-        }
-        // Reserved byte
-        payload.resize(payload.len() + 8, 0);
-
-        // MAC PDU payload
-        for byte in &self.data {
-            for i in (0..8).rev() {
-                payload.push((byte >> i) & 1);
-            }
-        }
-
-        // CRC-16 over the whole payload (PHY header + data)
-        let mut crc_input = vec![length, 0x00];
-        crc_input.extend_from_slice(&self.data);
-        let crc = Self::CRC.checksum(&crc_input);
-        for i in (0..16).rev() {
-            payload.push(((crc >> i) & 1) as u8);
-        }
-
-        Ok((header, payload))
-    }
-
-    /// Parse a V2 payload (PHY header + MAC PDU + CRC).
-    #[cfg(test)]
-    pub fn from_payload_bits_v2(payload_bits: &[u8]) -> Result<Self> {
-        // Minimum: 8 (length) + 8 (reserved) + 0 (data) + 16 (CRC) = 32
-        if payload_bits.len() < 32 {
-            return Err(anyhow!("V2 payload too short"));
-        }
-
-        let mut idx = 0;
-
-        // PHY header
-        let length = Self::bits_to_u8(&payload_bits[idx..idx + 8]);
-        idx += 8;
-        let _reserved = Self::bits_to_u8(&payload_bits[idx..idx + 8]);
-        idx += 8;
-
-        let data_bits_needed = length as usize * 8;
-        if idx + data_bits_needed + 16 > payload_bits.len() {
-            return Err(anyhow!("Truncated V2 frame: missing data or CRC"));
-        }
-
-        let mut data = Vec::with_capacity(length as usize);
-        for _ in 0..length {
-            data.push(Self::bits_to_u8(&payload_bits[idx..idx + 8]));
-            idx += 8;
-        }
-
-        // Verify CRC over (PHY header bytes + data)
-        let received_crc = Self::bits_to_u16(&payload_bits[idx..idx + 16]);
-        let mut crc_input = vec![length, 0x00];
-        crc_input.extend_from_slice(&data);
-        let calculated_crc = Self::CRC.checksum(&crc_input);
-
-        if received_crc != calculated_crc {
-            return Err(anyhow!(
-                "V2 CRC mismatch: expected 0x{:04X}, got 0x{:04X}",
-                calculated_crc,
-                received_crc
-            ));
-        }
-
-        Ok(Self { data })
-    }
-
     // -- Internal helpers --
 
     /// Expand PN_PREAMBLE into a 128-element bit array for correlation.
@@ -382,9 +305,14 @@ impl Frame {
             bit_index += 8;
         }
 
-        // Read and verify CRC
+        // Read and verify CRC (covers the length byte AND the data bytes --
+        // see `to_bits_split`'s doc comment for why the length field is
+        // included in the CRC scope).
         let received_crc = Self::bits_to_u16(&bits[bit_index..bit_index + 16]);
-        let calculated_crc = Self::calculate_crc(&data);
+        let mut crc_input = Vec::with_capacity(1 + data.len());
+        crc_input.push(length);
+        crc_input.extend_from_slice(&data);
+        let calculated_crc = Self::CRC.checksum(&crc_input);
 
         if received_crc != calculated_crc {
             return Err(anyhow!(
@@ -415,10 +343,6 @@ impl Frame {
             }
         }
         value
-    }
-
-    fn calculate_crc(data: &[u8]) -> u16 {
-        Self::CRC.checksum(data)
     }
 }
 
@@ -504,7 +428,10 @@ mod tests {
         for i in (0..8).rev() {
             bits.push((0x42u8 >> i) & 1);
         }
-        let crc = Frame::calculate_crc(&[0x42]);
+        // The exact CRC value doesn't matter here -- this test asserts on
+        // preamble validation, which rejects the frame before parse_payload
+        // (and thus the CRC check) is ever reached.
+        let crc = Frame::CRC.checksum(&[0x42]);
         for i in (0..16).rev() {
             bits.push(((crc >> i) & 1) as u8);
         }
@@ -558,77 +485,26 @@ mod tests {
         assert_eq!(decoded.mac_pdu_bytes(), &mac_bytes[..]);
     }
 
-    // -- V2 (evolved PHY header) tests --
+    // -- CRC now covers the length field too (folded in from the former
+    // to_bits_split_v2/from_payload_bits_v2 duplicate; see Task 9) --
 
     #[test]
-    fn test_v2_roundtrip() {
-        let data = b"V2 frame test".to_vec();
-        let frame = Frame::new(data.clone()).unwrap();
-        let (_header, payload) = frame.to_bits_split_v2().unwrap();
-        let decoded = Frame::from_payload_bits_v2(&payload).unwrap();
-        assert_eq!(decoded.data, data);
-    }
-
-    #[test]
-    fn test_v2_empty() {
-        let frame = Frame::new(Vec::new()).unwrap();
-        let (_header, payload) = frame.to_bits_split_v2().unwrap();
-        let decoded = Frame::from_payload_bits_v2(&payload).unwrap();
-        assert!(decoded.data.is_empty());
-    }
-
-    #[test]
-    fn test_v2_max_length() {
-        let data = vec![0xAB; 255];
-        let frame = Frame::new(data.clone()).unwrap();
-        let (_header, payload) = frame.to_bits_split_v2().unwrap();
-        let decoded = Frame::from_payload_bits_v2(&payload).unwrap();
-        assert_eq!(decoded.data, data);
-    }
-
-    #[test]
-    fn test_v2_crc_corruption() {
-        let frame = Frame::new(b"CRC test".to_vec()).unwrap();
-        let (_header, mut payload) = frame.to_bits_split_v2().unwrap();
-        // Flip last bit (CRC)
-        let last = payload.len() - 1;
-        payload[last] ^= 1;
-        assert!(Frame::from_payload_bits_v2(&payload).is_err());
-    }
-
-    #[test]
-    fn test_v2_header_bits_size() {
-        let frame = Frame::new(b"size".to_vec()).unwrap();
-        let (header, payload) = frame.to_bits_split_v2().unwrap();
-        // Header: 128 preamble + 16 sync = 144
-        assert_eq!(header.len(), 144);
-        // Payload: 8 len + 8 reserved + 4*8 data + 16 CRC = 64
-        assert_eq!(payload.len(), 8 + 8 + 4 * 8 + 16);
-    }
-
-    #[test]
-    fn test_v2_payload_too_short() {
-        let short = vec![0u8; 16]; // less than 32 bits minimum
-        assert!(Frame::from_payload_bits_v2(&short).is_err());
-    }
-
-    // -- Backward compatibility: old and new coexist --
-
-    #[test]
-    fn test_v1_and_v2_independent() {
-        let data = b"compat".to_vec();
-        let frame = Frame::new(data.clone()).unwrap();
-
-        // V1 path
-        let (_, v1_payload) = frame.to_bits_split().unwrap();
-        let d1 = Frame::from_payload_bits(&v1_payload).unwrap();
-
-        // V2 path
-        let (_, v2_payload) = frame.to_bits_split_v2().unwrap();
-        let d2 = Frame::from_payload_bits_v2(&v2_payload).unwrap();
-
-        assert_eq!(d1.data, data);
-        assert_eq!(d2.data, data);
+    fn test_crc_covers_length_field() {
+        // Corrupt the length field to a DIFFERENT valid-looking length (one
+        // that still leaves enough trailing bits to look like a complete
+        // frame, so the truncation-bounds check in parse_payload does not
+        // fire first) and confirm the CRC mismatch -- not the truncation
+        // check -- is what catches it. This is exactly the gap the CRC-scope
+        // fold closed: before it, the length byte was unprotected by the CRC.
+        let frame = Frame::new(b"AB".to_vec()).unwrap();
+        let (_, mut payload) = frame.to_bits_split().unwrap();
+        // Original length is 2 (0b00000010); flip it to 1 (0b00000001) --
+        // still a plausible length given the remaining payload bits, so this
+        // does NOT trip the "not enough bits for this length" truncation
+        // check, only the CRC (which was computed over length=2).
+        payload[6] = 0; // bit 6 of the length byte (value 2 = ...010)
+        payload[7] = 1; // -> length byte becomes 1
+        assert!(Frame::from_payload_bits(&payload).is_err());
     }
 
     // -- Error path tests --
