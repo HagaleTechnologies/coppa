@@ -41,9 +41,35 @@
 //! (not guessed) while building this generator:
 //!
 //! - **AWGN**: 100% frame loss at every SNR from 12-24 dB (3 kHz-referenced
-//!   convention, this crate's `awgn_ref_seeded`), clearing to FER=0 at 30 dB --
-//!   a real waterfall right around there, not a bug. `LEVEL9_AWGN_SNR_DB`
-//!   below reflects the verified working point, not the brief's literal 12 dB.
+//!   convention, this crate's `awgn_ref_seeded`). CORRECTED (a Task 8 review
+//!   caught this): this does NOT "clear to FER=0 at 30 dB" as an earlier
+//!   version of this doc claimed. Direct re-measurement at 30 dB with three
+//!   well-separated seeds gives 50%/86%/98% FER (50 trials each) -- the
+//!   opposite of a clean waterfall. More tellingly: holding one seed fixed
+//!   and sweeping SNR from 30 dB up to 60 dB (near-noiseless) leaves the
+//!   frame-error count *exactly* unchanged -- 25/50 at every one of
+//!   30/33/36/39/42/45/48/60 dB for one seed, 43/50 unchanged the same way
+//!   for another -- proving this is not a noise-limited waterfall at all.
+//!   Above ~24-30 dB, whether a given (payload, noise-realization) pair
+//!   decodes is governed by a payload-dependent decode floor, not by SNR
+//!   headroom; raising SNR further does not help. `LEVEL9_AWGN_SNR_DB`
+//!   (30 dB) is therefore NOT a "verified clean operating point" -- it is a
+//!   high-SNR regime where thermal noise is no longer the dominant failure
+//!   mode, so the seed search below (which varies PAYLOADS, not SNR) can and
+//!   does reliably land on one of the apparently-common payloads that falls
+//!   on the "decodes" side of that floor (this corpus's `L9_awgn12` needed
+//!   only 1 attempt). That committed seed is directly verified to decode
+//!   correctly and is frozen into a WAV file (no re-randomization at test
+//!   time), so it will not spontaneously flip on its own -- but it sits in a
+//!   regime with real, structural, seed-to-seed instability, not a
+//!   comfortably-passing "typical" point, so a future numerical tweak to the
+//!   FEC/demod path is not guaranteed to leave it decoding. A stable,
+//!   comfortably-low-FER SNR was searched for (18-60 dB, multiple seeds) and
+//!   not found -- re-deriving one is not simply a matter of picking a better
+//!   dB value, since the failure mode above is not SNR-driven. Root-causing
+//!   the floor itself (plausibly connected to the already-documented LDPC/
+//!   turbo-re-estimation limitations in CLAUDE.md, but not confirmed) is out
+//!   of scope for this benchmark/golden-vector task.
 //! - **Watterson Poor**: 100% frame loss at EVERY tested SNR up to 54 dB.
 //!   Re-tested under Watterson GOOD (the mildest fading preset) up to 48 dB:
 //!   still 100% frame loss. This is a genuine, structural, already-known-class
@@ -59,8 +85,12 @@
 //!   future channel-estimation fix ever makes this decode, the integration
 //!   test will flag the manifest as stale (a good thing to notice).
 //! - **ssb+cfo**: no fading in this combination (AWGN + SSB passband + CFO
-//!   only), so once `hf_standard` is forced, it behaves like the AWGN case --
-//!   `LEVEL9_SSBCFO_SNR_DB` is bumped accordingly and verified to decode.
+//!   only), so once `hf_standard` is forced, it behaves like the AWGN case
+//!   above -- including, presumably, the same payload-dependent floor rather
+//!   than a clean SNR waterfall (not independently re-swept to the same
+//!   depth as AWGN above, since the underlying mechanism appears shared).
+//!   `LEVEL9_SSBCFO_SNR_DB` is bumped accordingly, and its one committed seed
+//!   is directly verified to decode.
 //!
 //! This is not root-caused further here (out of scope for a benchmark/golden-
 //! vector task) -- see the module doc's citations for the pre-existing,
@@ -126,8 +156,12 @@ const DEFAULT_SSBCFO_SNR_DB: f32 = 20.0;
 /// +-50 Hz two-stage-acquisition tolerance (CLAUDE.md Known Limitations).
 const SSB_CFO_HZ: f32 = 15.0;
 
-/// Level 9's verified-working AWGN/ssb+cfo operating points (see module doc:
-/// the literal 12/20 dB grid values are structurally too low for 64QAM 2/3).
+/// Level 9's AWGN/ssb+cfo operating points (see module doc: the literal
+/// 12/20 dB grid values are structurally too low for 64QAM 2/3 -- 100% frame
+/// loss below ~24-30 dB). NOT "verified-clean" SNRs: per the module doc's
+/// correction, above ~24-30 dB this level's decode outcome is governed by a
+/// payload-dependent floor, not by SNR headroom, so these values just place
+/// the seed search in the regime where thermal noise stops dominating.
 const LEVEL9_AWGN_SNR_DB: f32 = 30.0;
 const LEVEL9_SSBCFO_SNR_DB: f32 = 33.0;
 
