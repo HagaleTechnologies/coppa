@@ -16,6 +16,7 @@ lz4_flex = { workspace = true }
 num-complex = { workspace = true }
 
 [dev-dependencies]
+coppa-bench = { path = "../coppa-bench" }
 approx = { workspace = true }
 rand = { workspace = true }
 proptest = { workspace = true }

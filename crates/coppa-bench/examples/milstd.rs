@@ -245,9 +245,17 @@ fn main() {
         "{passed_with_margin}/{total} pass even with a generous +12dB margin over the reference SNR."
     );
     println!(
-        "\nSee this task's report for why the literal pass rate is low: this reflects this \
-         codebase's currently real, already-documented Watterson-channel estimation gap \
-         (CLAUDE.md's \"Phase 2 channel estimation\" / \"Turbo re-estimation\" known limitations), \
-         not a bug in this bench -- independently re-verified here with direct sweeps up to 54 dB."
+        "\nSee this task's report for why the literal pass rate is low. The dominant cause, on \
+         every channel including Good, is this ladder's own approximation: its reference SNRs \
+         are borrowed and rounded from a DIFFERENT waveform's published operating points (see \
+         module doc) and simply do not transfer onto Coppa's own measured thresholds -- e.g. \
+         level 2's Good op. point here is -6.0 dB, but this codec's own independently-measured \
+         Good-preset FER<=10% threshold for that mode is 12.0 dB (see BENCHMARKS.md), an 18 dB \
+         gap that has nothing to do with any fading-specific bug. The already-documented \
+         Watterson-Moderate/Poor channel-estimation gap (CLAUDE.md's \"Phase 2 channel \
+         estimation\" / \"Turbo re-estimation\" known limitations) is a REAL, ADDITIONAL \
+         contributing factor for the moderate/poor rows specifically -- but it is not a \
+         blanket explanation for every failing row, including Good's, where no such known bug \
+         applies at all."
     );
 }

@@ -466,6 +466,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "approx",
+ "coppa-bench",
  "coppa-channel",
  "coppa-codec",
  "coppa-dsp",

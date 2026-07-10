@@ -27,6 +27,7 @@
 
 use std::path::{Path, PathBuf};
 
+use coppa_bench::scenario::select_profile;
 use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 
@@ -56,21 +57,26 @@ fn golden_dir() -> PathBuf {
 }
 
 /// Mirrors `golden_vectors_gen.rs`'s `profile_for`: every level uses its normal
-/// per-level routing (levels 1-4 -> hf_standard, 5+ -> vhf_wide) EXCEPT the
-/// `poor25` and `ssbcfo` channel conditions, which force `hf_standard` for
-/// every level (an HF-multipath Watterson channel is not a fair test of the
-/// VHF-routed profile's much shorter cyclic prefix, and the SSB rig passband
-/// filter is an HF-specific impairment not applicable to the VHF-routed
-/// profile's wider active band -- see that generator's module doc).
+/// per-level routing (delegated to `coppa_bench::scenario::select_profile`, the
+/// single source of truth for that rule -- levels 1-4 -> hf_standard, 5+ ->
+/// vhf_wide) EXCEPT the `poor25` and `ssbcfo` channel conditions, which force
+/// `hf_standard` for every level (an HF-multipath Watterson channel is not a
+/// fair test of the VHF-routed profile's much shorter cyclic prefix, and the
+/// SSB rig passband filter is an HF-specific impairment not applicable to the
+/// VHF-routed profile's wider active band -- see that generator's module doc).
+///
+/// This pulls in `coppa-bench` as a dev-dependency of `coppa-protocol`, which
+/// looks like it should be a cycle (`coppa-bench` depends on `coppa-protocol`
+/// as a normal dependency) but isn't: Cargo resolves dev-dependency edges
+/// separately from the normal dependency graph, since they're only needed to
+/// build this crate's own tests/examples, not to build `coppa-protocol` itself
+/// as a library -- verified directly (`cargo check -p coppa-protocol --tests`
+/// and `cargo tree -p coppa-protocol -e dev` both resolve cleanly here).
 fn profile_for(level: u8, channel: &str) -> CoppaProfile {
     if channel == "poor25" || channel == "ssbcfo" {
         return CoppaProfile::hf_standard();
     }
-    if level >= 5 {
-        CoppaProfile::vhf_wide()
-    } else {
-        CoppaProfile::hf_standard()
-    }
+    select_profile(level)
 }
 
 fn decode_hex(s: &str) -> Vec<u8> {
@@ -99,11 +105,16 @@ fn read_wav_f32(path: &Path) -> (Vec<f32>, u32) {
         "golden WAV {} is not integer PCM",
         path.display()
     );
+    // Full-scale normalization, matching `coppa_audio::file_backend::WavSource::open`'s
+    // `1i64 << (bits_per_sample - 1)` convention (32768 for 16-bit), not `i16::MAX` (32767).
+    // The two differ only by a ~1/32768 amplitude scale -- not a correctness bug on its own
+    // (this reader and `golden_vectors_gen.rs`'s writer were self-consistent either way), but
+    // an unnecessary, undocumented divergence from house style.
+    let max_val = (1i64 << (spec.bits_per_sample - 1)) as f32;
     let samples: Vec<f32> = reader
         .samples::<i16>()
         .map(|s| {
-            s.unwrap_or_else(|e| panic!("bad sample in {}: {e}", path.display())) as f32
-                / i16::MAX as f32
+            s.unwrap_or_else(|e| panic!("bad sample in {}: {e}", path.display())) as f32 / max_val
         })
         .collect();
     (samples, spec.sample_rate)
