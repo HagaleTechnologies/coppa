@@ -45,7 +45,7 @@ use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx};
 use coppa_protocol::modem::{frame_airtime_s, CoppaTransceiver};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 /// Speed level used for the whole session (fixed, not rate-adaptive -- rate
 /// adaptation is a separate mechanism, `coppa-ml`'s `RateLoop`, exercised by

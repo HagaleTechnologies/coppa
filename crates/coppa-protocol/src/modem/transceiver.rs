@@ -2217,7 +2217,7 @@ mod tests {
         seed: u64,
     ) -> Vec<f32> {
         use rand::rngs::StdRng;
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let coded_bits = rate_match::rate_match(mother, k_used, CODED_BLOCK_LEN, rv);
         let mut rng = StdRng::seed_from_u64(seed);
         coded_bits
