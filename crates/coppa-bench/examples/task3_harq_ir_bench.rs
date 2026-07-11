@@ -58,7 +58,7 @@ use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::arq::rv_for_attempt;
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 const LEVEL: u8 = 10; // 64-QAM, rate 5/6 (least redundant code -- see task-3-report)
 const SAMPLE_RATE: f32 = 48_000.0;

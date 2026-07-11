@@ -18,7 +18,7 @@ use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::modem::speed_levels::max_payload_for_level;
 use coppa_protocol::modem::CoppaTransceiver;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 fn max_payload_bytes(wire_level: u8) -> usize {
     max_payload_for_level(wire_level).unwrap()
