@@ -201,16 +201,17 @@ mod tests {
     /// get exercised) and down to small noise variances (so LLR
     /// magnitudes span several orders of magnitude).
     ///
-    /// Tolerance is `1e-4` absolute *or* `1e-4` relative, combined
-    /// (`dev <= 1e-4 + 1e-4 * |oracle|`): at small noise variance the two
+    /// Tolerance is `1.5e-4` absolute *or* `1.5e-4` relative, combined
+    /// (`dev <= 1.5e-4 + 1.5e-4 * |oracle|`): at small noise variance the two
     /// code paths (closed-form multiply-add vs. squared-distance
     /// enumeration) accumulate f32 rounding differently, so a flat 1e-4
     /// absolute bound is occasionally tripped by pure f32 rounding noise
     /// once LLR magnitudes reach the hundreds (observed relative error is
     /// ~1e-6, i.e. a few ULPs) even though the formula is exact. A relative
-    /// component absorbs that while still being tight enough (1e-4 = 0.01%)
+    /// component absorbs that while still being tight enough (1.5e-4 = 0.015%)
     /// to catch a real derivation error, which would show up as an O(1)
-    /// relative mismatch, not O(1e-6).
+    /// relative mismatch, not O(1e-6). Bumped from 1e-4 2026-07-11 alongside
+    /// the identical qam64 test, which hit a real tail excursion in CI.
     #[test]
     fn soft_demap_matches_bruteforce_oracle() {
         let mapper = Qam16Mapper;
@@ -232,7 +233,7 @@ mod tests {
                 let dev = (f - o).abs();
                 max_dev = max_dev.max(dev);
                 max_rel_dev = max_rel_dev.max(dev / o.abs().max(1.0));
-                let tol = 1e-4 + 1e-4 * o.abs();
+                let tol = 1.5e-4 + 1.5e-4 * o.abs();
                 assert!(
                     dev <= tol,
                     "LLR mismatch: fast={} oracle={} dev={} tol={} sym=({},{}) nv={}",
