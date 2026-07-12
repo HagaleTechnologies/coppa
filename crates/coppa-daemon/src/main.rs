@@ -239,7 +239,7 @@ async fn main() -> Result<()> {
                     let senders = vara_data_senders.lock().await;
                     if *client_id == 0 {
                         // Broadcast to all data-port clients
-                        for (_id, tx) in senders.iter() {
+                        for tx in senders.values() {
                             let _ = tx.try_send(data.clone());
                         }
                     } else if let Some(tx) = senders.get(client_id) {

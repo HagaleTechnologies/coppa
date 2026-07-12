@@ -115,31 +115,35 @@ impl BusyGate {
 mod tests {
     use super::*;
 
-    // Simple deterministic hash for test "randomness" (mirrors spectrum_sensor's own).
-    fn rand_like_hash() -> u32 {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        COUNTER
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_mul(2654435761)
+    // Simple deterministic hash for test "randomness" (mirrors spectrum_sensor's
+    // own generator, but threads a per-test-local counter instead of using a
+    // shared `static`: a shared static counter here made these tests genuinely
+    // flaky under cargo's default parallel test runner, since concurrently
+    // running tests stole each other's counter values and corrupted each
+    // other's noise sequences -- reproduced by running this module's tests
+    // repeatedly under default parallelism (failed most runs) vs.
+    // `--test-threads=1` (always passed).
+    fn rand_like_hash(counter: &mut u32) -> u32 {
+        *counter = counter.wrapping_add(1);
+        counter.wrapping_mul(2654435761)
     }
 
-    fn noise_block(amplitude: f32) -> Vec<f32> {
+    fn noise_block(amplitude: f32, counter: &mut u32) -> Vec<f32> {
         (0..1024)
-            .map(|_| amplitude * (rand_like_hash() as f32 / u32::MAX as f32 - 0.5))
+            .map(|_| amplitude * (rand_like_hash(counter) as f32 / u32::MAX as f32 - 0.5))
             .collect()
     }
 
-    fn quiet_block() -> Vec<f32> {
-        noise_block(0.01)
+    fn quiet_block(counter: &mut u32) -> Vec<f32> {
+        noise_block(0.01, counter)
     }
 
     /// A genuinely broadband "noise burst" (unlike a single tone, which only
     /// elevates a narrow sliver of bins near its own frequency): amplitude ~50x
     /// the quiet-block level, so it raises essentially every in-band bin well
     /// above the settled noise floor at once.
-    fn band_limited_noise_burst() -> Vec<f32> {
-        noise_block(0.5)
+    fn band_limited_noise_burst(counter: &mut u32) -> Vec<f32> {
+        noise_block(0.5, counter)
     }
 
     #[test]
@@ -150,9 +154,10 @@ mod tests {
 
     #[test]
     fn stays_quiet_on_low_level_noise_only() {
+        let mut counter = 0u32;
         let mut gate = BusyGate::new(8000.0);
         for _ in 0..20 {
-            let transition = gate.observe(&quiet_block());
+            let transition = gate.observe(&quiet_block(&mut counter));
             assert_eq!(transition, None, "quiet blocks must never trigger BUSY ON");
         }
         assert!(!gate.current());
@@ -160,17 +165,18 @@ mod tests {
 
     #[test]
     fn band_limited_noise_burst_triggers_busy_on_then_off() {
+        let mut counter = 0u32;
         let mut gate = BusyGate::new(8000.0);
 
         // Settle the noise floor on quiet blocks first.
         for _ in 0..10 {
-            assert_eq!(gate.observe(&quiet_block()), None);
+            assert_eq!(gate.observe(&quiet_block(&mut counter)), None);
         }
         assert!(!gate.current());
 
         // Inject a band-limited noise burst -- broadband energy well above the
         // settled floor across the whole 300-2800 Hz band, not a single tone.
-        let burst = band_limited_noise_burst();
+        let burst = band_limited_noise_burst(&mut counter);
         let mut saw_busy_on = false;
         for _ in 0..5 {
             if gate.observe(&burst) == Some(true) {
@@ -184,7 +190,7 @@ mod tests {
         // Burst ends; back to quiet -> gate must clear.
         let mut saw_busy_off = false;
         for _ in 0..10 {
-            if gate.observe(&quiet_block()) == Some(false) {
+            if gate.observe(&quiet_block(&mut counter)) == Some(false) {
                 saw_busy_off = true;
                 break;
             }
