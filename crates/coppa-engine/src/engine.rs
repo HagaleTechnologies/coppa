@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 
+use coppa_codec::ofdm::coppa_modem::TX_PEAK;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::compression::huffman::HuffmanCodec;
@@ -16,6 +17,15 @@ use crate::profiles::Profile;
 /// On decode, if the first byte of the payload is this marker, the rest is
 /// Huffman+LZ4 compressed. Otherwise the payload is raw.
 const COMPRESSION_MARKER: u8 = 0xFE;
+
+/// Low tone of the standard SSB two-tone TX-level calibration signal (Hz).
+/// 700 Hz + 1900 Hz is standard amateur-radio TUNE/two-tone practice: both
+/// fall well inside the waveform's ~300-2700 Hz SSB passband (see
+/// `CLAUDE.md`) and are far enough apart that ALC/scope readings aren't
+/// confused by beat artifacts.
+pub const TUNE_TONE_LOW_HZ: f32 = 700.0;
+/// High tone of the standard SSB two-tone TX-level calibration signal (Hz).
+pub const TUNE_TONE_HIGH_HZ: f32 = 1900.0;
 
 /// One decode result surfaced by [`CoppaCore::push_samples`] for a single frame
 /// `StreamingReceiver` completed.
@@ -177,6 +187,45 @@ impl CoppaCore {
             .transmit(&header, &payload)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         Ok(samples)
+    }
+
+    /// Generate a TX-level calibration ("TUNE") tone: an operator keys this and
+    /// advances their radio's audio drive until ALC just registers, then backs
+    /// off — standard amateur SSB practice (analogous to VARA's `TUNE`).
+    ///
+    /// Defaults to the standard SSB two-tone test signal (`TUNE_TONE_LOW_HZ` +
+    /// `TUNE_TONE_HIGH_HZ`, equal amplitude). Pass `single_hz` for a
+    /// single-tone variant (e.g. for power measurement with a wattmeter, where
+    /// a two-tone signal's fluctuating envelope makes a peak reading ambiguous).
+    ///
+    /// Peak-normalized to the same [`TX_PEAK`] frames use, so the drive level
+    /// an operator sets here transfers directly to real traffic.
+    pub fn tune_tone(&self, seconds: f32, single_hz: Option<f32>) -> Vec<f32> {
+        let sample_rate = self.config.sample_rate as f32;
+        let n = (seconds * sample_rate).round().max(0.0) as usize;
+        let two_pi = std::f32::consts::TAU;
+
+        let mut samples: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sample_rate;
+                match single_hz {
+                    Some(freq) => (two_pi * freq * t).sin(),
+                    None => {
+                        (two_pi * TUNE_TONE_LOW_HZ * t).sin()
+                            + (two_pi * TUNE_TONE_HIGH_HZ * t).sin()
+                    }
+                }
+            })
+            .collect();
+
+        let peak = samples.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        if peak > 1e-12 {
+            let gain = TX_PEAK / peak;
+            for s in &mut samples {
+                *s *= gain;
+            }
+        }
+        samples
     }
 
     /// Decode audio samples back to a text message.
@@ -505,5 +554,130 @@ mod tests {
             frames.is_empty(),
             "squelched silence should never reach the streaming receiver"
         );
+    }
+
+    // ── Task 1 (Phase 4): TX level calibration (TUNE) ─────────────────────
+
+    mod tune_tone {
+        use super::*;
+        use coppa_dsp::fft::FftProcessor;
+        use num_complex::Complex32;
+
+        /// Magnitude spectrum of a 1-second buffer at `sample_rate`: with a
+        /// 1-second window, FFT bin `k` corresponds to exactly `k` Hz, so tone
+        /// frequencies land on exact integer bins with no spectral leakage.
+        fn magnitude_spectrum(samples: &[f32], sample_rate: usize) -> Vec<f32> {
+            assert_eq!(samples.len(), sample_rate);
+            let fft = FftProcessor::new(sample_rate);
+            let input: Vec<Complex32> = samples.iter().map(|&s| Complex32::new(s, 0.0)).collect();
+            fft.forward(&input).iter().map(|c| c.norm()).collect()
+        }
+
+        #[test]
+        fn test_duration_correct() {
+            let core = CoppaCore::new();
+            let sample_rate = core.config().sample_rate;
+
+            assert_eq!(core.tune_tone(1.0, None).len(), sample_rate as usize);
+            assert_eq!(
+                core.tune_tone(2.5, None).len(),
+                (2.5 * sample_rate as f32).round() as usize
+            );
+            assert_eq!(core.tune_tone(0.0, None).len(), 0);
+        }
+
+        #[test]
+        fn test_default_duration_matches_cli_default_of_10s() {
+            // The CLI/daemon default is 10 seconds (task brief); the engine
+            // itself takes an explicit duration, but confirm 10s produces the
+            // expected sample count at the default profile's sample rate.
+            let core = CoppaCore::new();
+            let sample_rate = core.config().sample_rate;
+            assert_eq!(core.tune_tone(10.0, None).len(), sample_rate as usize * 10);
+        }
+
+        #[test]
+        fn test_peak_equals_tx_peak() {
+            let core = CoppaCore::new();
+            let samples = core.tune_tone(1.0, None);
+            let peak = samples.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+            assert!(
+                (peak - TX_PEAK).abs() < 1e-4,
+                "two-tone peak {} should equal TX_PEAK {}",
+                peak,
+                TX_PEAK
+            );
+
+            let single = core.tune_tone(1.0, Some(1500.0));
+            let single_peak = single.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+            assert!(
+                (single_peak - TX_PEAK).abs() < 1e-4,
+                "single-tone peak {} should equal TX_PEAK {}",
+                single_peak,
+                TX_PEAK
+            );
+        }
+
+        #[test]
+        fn test_two_tone_buffer_is_exactly_700_and_1900_hz_equal_amplitude() {
+            let core = CoppaCore::new();
+            let sample_rate = core.config().sample_rate as usize;
+            let samples = core.tune_tone(1.0, None);
+            let mag = magnitude_spectrum(&samples, sample_rate);
+
+            let bin_low = mag[TUNE_TONE_LOW_HZ as usize];
+            let bin_high = mag[TUNE_TONE_HIGH_HZ as usize];
+            assert!(
+                bin_low > 0.0 && bin_high > 0.0,
+                "both tones must be present"
+            );
+            assert!(
+                (bin_low - bin_high).abs() / bin_low.max(bin_high) < 0.01,
+                "tones should be equal amplitude: {} vs {}",
+                bin_low,
+                bin_high
+            );
+
+            // A real-valued signal's spectrum mirrors around Nyquist; the tone
+            // energy should live entirely in these four bins (mirror images
+            // included). Nothing else should carry meaningful energy.
+            let mirror_low = mag[sample_rate - TUNE_TONE_LOW_HZ as usize];
+            let mirror_high = mag[sample_rate - TUNE_TONE_HIGH_HZ as usize];
+            let tone_energy = bin_low + bin_high + mirror_low + mirror_high;
+            let total_energy: f32 = mag.iter().sum();
+            assert!(
+                tone_energy / total_energy > 0.98,
+                "tone energy should dominate the spectrum: {} / {}",
+                tone_energy,
+                total_energy
+            );
+        }
+
+        #[test]
+        fn test_single_tone_variant_is_exactly_one_frequency() {
+            let core = CoppaCore::new();
+            let sample_rate = core.config().sample_rate as usize;
+            let samples = core.tune_tone(1.0, Some(1500.0));
+            let mag = magnitude_spectrum(&samples, sample_rate);
+
+            let bin = mag[1500];
+            assert!(bin > 0.0, "1500 Hz tone must be present");
+
+            // Every other bin (excluding the tone's mirror image) should be
+            // negligible in comparison.
+            let mirror = mag[sample_rate - 1500];
+            let tone_energy = bin + mirror;
+            let total_energy: f32 = mag.iter().sum();
+            assert!(
+                tone_energy / total_energy > 0.98,
+                "single tone should dominate the spectrum: {} / {}",
+                tone_energy,
+                total_energy
+            );
+
+            // The two-tone frequencies should carry no meaningful energy here.
+            assert!(mag[TUNE_TONE_LOW_HZ as usize] / bin < 0.01);
+            assert!(mag[TUNE_TONE_HIGH_HZ as usize] / bin < 0.01);
+        }
     }
 }

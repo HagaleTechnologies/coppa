@@ -10,5 +10,5 @@ pub mod engine;
 pub mod profiles;
 
 pub use config::EngineConfig;
-pub use engine::CoppaCore;
+pub use engine::{CoppaCore, TUNE_TONE_HIGH_HZ, TUNE_TONE_LOW_HZ};
 pub use profiles::{Profile, EMERGENCY, HF_ROBUST, HF_STANDARD, VHF_FAST};

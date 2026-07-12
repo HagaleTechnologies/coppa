@@ -488,6 +488,22 @@ impl EventLoop {
                 } else if cmd == "LISTEN OFF" {
                     self.listening = false;
                     tracing::info!("Stopped listening for incoming connections");
+                } else if cmd == "TUNE" || cmd.starts_with("TUNE ") {
+                    // Task 1 (Phase 4): TX level calibration. `TUNE` (or `TUNE
+                    // <seconds>`) generates the standard SSB two-tone
+                    // calibration signal and sends it through the same
+                    // PTT-key/stream/PTT-unkey path real frames use
+                    // (`transmit_samples`), so an operator can set their
+                    // radio's audio drive level via ALC exactly as they would
+                    // for real traffic.
+                    let seconds = cmd
+                        .strip_prefix("TUNE ")
+                        .and_then(|s| s.trim().parse::<f32>().ok())
+                        .filter(|s| *s > 0.0)
+                        .unwrap_or(10.0);
+                    tracing::info!(seconds, "TUNE: transmitting TX-level calibration tone");
+                    let samples = self.engine.tune_tone(seconds, None);
+                    self.transmit_samples(&samples).await;
                 }
             }
             HostEvent::ConnectRequest {
@@ -1572,6 +1588,72 @@ mod tests {
                     );
                 })
                 .await;
+        }
+
+        /// Task 1 (Phase 4): the VARA `TUNE` command keys PTT, streams the
+        /// two-tone calibration signal to the audio-out sink, then unkeys —
+        /// exactly the same PTT bracket real frame transmission produces
+        /// (`transmit_samples`), verified here with a mock ring-buffer sink
+        /// standing in for the real audio device.
+        #[tokio::test]
+        async fn test_tune_command_keys_ptt_streams_tone_and_unkeys() {
+            let config = fast_ptt_config();
+            let mut event_loop = EventLoop::new(config);
+            let (audio_tx, mut audio_rx) = coppa_audio::audio_ring(10_000_000);
+            event_loop.set_audio_out(audio_tx);
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19412, 19413).await;
+            let tx = event_loop.event_sender();
+
+            let local = tokio::task::LocalSet::new();
+            local.spawn_local(async move {
+                let _ = event_loop.run().await;
+            });
+
+            local
+                .run_until(async move {
+                    tx.send(DaemonEvent::Host(HostEvent::VaraCommand {
+                        client_id: 1,
+                        command: "TUNE 1".to_string(),
+                    }))
+                    .await
+                    .unwrap();
+
+                    let mut lines = Vec::new();
+                    for _ in 0..8 {
+                        lines.push(read_line(&mut reader).await);
+                        let ptt_so_far: Vec<&str> = lines
+                            .iter()
+                            .map(|s| s.trim_end())
+                            .filter(|s| s.starts_with("PTT"))
+                            .collect();
+                        if ptt_so_far == ["PTT ON", "PTT OFF"] {
+                            return; // bracket observed in order — test passes
+                        }
+                    }
+                    panic!(
+                        "expected a PTT ON ... PTT OFF bracket for TUNE within the first 8 lines, got: {:?}",
+                        lines
+                    );
+                })
+                .await;
+
+            // The mock sink should have received the streamed tone: 1 second
+            // at 48kHz (fast_ptt_config's `sample_rate` scheduling override
+            // doesn't touch the engine's own fixed 48kHz encode rate).
+            let available = audio_rx.available();
+            assert!(
+                available > 0,
+                "TUNE should have streamed tone samples to the audio-out sink"
+            );
+            let mut buf = vec![0.0f32; available];
+            audio_rx.read(&mut buf);
+            let peak = buf.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+            assert!(
+                peak > 0.0,
+                "streamed tone samples should be non-silent, got peak {}",
+                peak
+            );
         }
 
         /// Required scenario: "queue 3 frames -> BUFFER 3…0 progression."

@@ -427,6 +427,7 @@ dependencies = [
  "coppa-codec",
  "coppa-dsp",
  "coppa-protocol",
+ "num-complex",
  "rand 0.10.2",
 ]
 

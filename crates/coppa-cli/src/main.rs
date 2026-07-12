@@ -90,6 +90,32 @@ enum Commands {
         #[arg(long)]
         device: Option<String>,
     },
+    /// Transmit a TX-level calibration ("TUNE") tone: standard SSB two-tone
+    /// (700 Hz + 1900 Hz) by default, or a single tone via `--single`. Key
+    /// this while advancing your radio's audio drive level until ALC just
+    /// registers, then back off. See `docs/OPERATING.md`.
+    Tune {
+        /// Duration to key the tone, in seconds.
+        #[arg(long, default_value = "10")]
+        seconds: f32,
+        /// Transmit a single tone at this frequency (Hz) instead of the
+        /// default two-tone signal, e.g. for power measurement with a
+        /// wattmeter.
+        #[arg(long)]
+        single: Option<f32>,
+        /// Output file for audio samples (WAV format) instead of live playback.
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Operational profile name (e.g., HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY).
+        #[arg(long)]
+        profile: Option<String>,
+        /// Audio output device name (substring match).
+        #[arg(long)]
+        device: Option<String>,
+        /// PTT method: "rigctld", "vox", "none" (default: "none")
+        #[arg(long, default_value = "none")]
+        ptt: String,
+    },
     /// List available audio devices.
     Devices,
     /// Show current configuration.
@@ -181,6 +207,22 @@ fn main() -> Result<()> {
             callsign.as_deref(),
             raw,
             device.as_deref(),
+            verbosity,
+        )?,
+        Some(Commands::Tune {
+            seconds,
+            single,
+            output,
+            profile,
+            device,
+            ptt,
+        }) => cmd_tune(
+            seconds,
+            single,
+            output.as_deref(),
+            profile.as_deref(),
+            device.as_deref(),
+            &ptt,
             verbosity,
         )?,
         Some(Commands::Devices) => cmd_devices()?,
@@ -316,6 +358,152 @@ fn cmd_tx(
                 sink.write(&samples)?;
 
                 // Wait for audio to play out
+                let duration_ms =
+                    (samples.len() as f64 / engine_config.sample_rate as f64 * 1000.0) as u64;
+                std::thread::sleep(std::time::Duration::from_millis(duration_ms + 200));
+
+                // Unkey PTT
+                let _ = ptt_ctrl.set_ptt(PttState::Rx);
+                sink.stop()?;
+
+                if verbosity != Verbosity::Quiet {
+                    eprintln!(
+                        "Transmitted {} samples ({:.2}s)",
+                        samples.len(),
+                        duration_ms as f64 / 1000.0
+                    );
+                }
+            }
+            #[cfg(not(feature = "cpal-backend"))]
+            {
+                let _ = device;
+                let _ = ptt;
+                if verbosity != Verbosity::Quiet {
+                    println!("Live audio output not available (compile with cpal-backend feature)");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// TX level calibration ("TUNE"): generate the standard SSB two-tone signal
+/// (or a single tone via `single`), key PTT, stream it out, then unkey —
+/// mirroring `cmd_tx`'s live-playback path. See `docs/OPERATING.md` for the
+/// calibration procedure this is meant to support.
+fn cmd_tune(
+    seconds: f32,
+    single: Option<f32>,
+    output: Option<&str>,
+    profile: Option<&str>,
+    device: Option<&str>,
+    ptt: &str,
+    verbosity: Verbosity,
+) -> Result<()> {
+    let config = resolve_config(profile)?;
+    let core = CoppaCore::with_config(config);
+
+    if verbosity != Verbosity::Quiet {
+        match single {
+            Some(freq) => println!(
+                "Generating single-tone calibration signal: {} Hz, {:.1}s",
+                freq, seconds
+            ),
+            None => println!(
+                "Generating two-tone calibration signal: {} Hz + {} Hz, {:.1}s",
+                coppa_engine::TUNE_TONE_LOW_HZ,
+                coppa_engine::TUNE_TONE_HIGH_HZ,
+                seconds
+            ),
+        }
+    }
+
+    let samples = core.tune_tone(seconds, single);
+    if verbosity != Verbosity::Quiet {
+        println!("Generated {} audio samples", samples.len());
+    }
+
+    match output {
+        Some(path) => {
+            #[cfg(feature = "file-backend")]
+            {
+                use coppa_audio::{file_backend::WavSink, AudioSink};
+                let mut sink = WavSink::new(path, core.config().sample_rate);
+                sink.start()?;
+                sink.write(&samples)?;
+                sink.stop()?;
+                if verbosity != Verbosity::Quiet {
+                    println!("Written to {}", path);
+                }
+            }
+            #[cfg(not(feature = "file-backend"))]
+            {
+                let _ = path;
+                if verbosity != Verbosity::Quiet {
+                    println!("File output not available (compile with file-backend feature)");
+                }
+            }
+        }
+        None => {
+            #[cfg(feature = "cpal-backend")]
+            {
+                use coppa_audio::AudioSink;
+                use coppa_radio::{PttControl, PttState};
+
+                let engine_config = core.config();
+
+                // Create PTT controller
+                let mut ptt_ctrl: Box<dyn PttControl> = match ptt {
+                    "rigctld" => match coppa_radio::RigctldClient::connect("127.0.0.1:4532") {
+                        Ok(client) => Box::new(client),
+                        Err(e) => {
+                            eprintln!("WARNING: rigctld connect failed ({}), using no PTT", e);
+                            Box::new(coppa_radio::NullPtt::new())
+                        }
+                    },
+                    "vox" => Box::new(coppa_radio::VoxPtt::new()),
+                    _ => Box::new(coppa_radio::NullPtt::new()),
+                };
+
+                // Create audio sink
+                let mut sink = match device {
+                    Some(name) => match coppa_audio::find_output_device_by_name(name) {
+                        Some(dev) => {
+                            if verbosity != Verbosity::Quiet {
+                                eprintln!("Using output device matching '{}'", name);
+                            }
+                            coppa_audio::cpal_backend::CpalSink::from_device(
+                                dev,
+                                engine_config.sample_rate,
+                                8192,
+                            )?
+                        }
+                        None => {
+                            eprintln!(
+                                "WARNING: No output device matching '{}', using default",
+                                name
+                            );
+                            coppa_audio::cpal_backend::CpalSink::new(
+                                engine_config.sample_rate,
+                                8192,
+                            )?
+                        }
+                    },
+                    None => {
+                        coppa_audio::cpal_backend::CpalSink::new(engine_config.sample_rate, 8192)?
+                    }
+                };
+                sink.start()?;
+
+                // Key PTT
+                let _ = ptt_ctrl.set_ptt(PttState::Tx);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+
+                // Stream the tone
+                sink.write(&samples)?;
+
+                // Wait for the tone to play out
                 let duration_ms =
                     (samples.len() as f64 / engine_config.sample_rate as f64 * 1000.0) as u64;
                 std::thread::sleep(std::time::Duration::from_millis(duration_ms + 200));
@@ -662,6 +850,50 @@ mod tests {
             Verbosity::Normal,
         )
         .expect("tx to file should succeed");
+        #[cfg(feature = "file-backend")]
+        {
+            assert!(path.exists(), "WAV file should be created");
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    #[test]
+    fn test_tune_to_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("coppa_test_tune.wav");
+        let path_str = path.to_str().unwrap();
+        cmd_tune(
+            0.5,
+            None,
+            Some(path_str),
+            None,
+            None,
+            "none",
+            Verbosity::Normal,
+        )
+        .expect("tune to file should succeed");
+        #[cfg(feature = "file-backend")]
+        {
+            assert!(path.exists(), "WAV file should be created");
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    #[test]
+    fn test_tune_single_tone_to_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("coppa_test_tune_single.wav");
+        let path_str = path.to_str().unwrap();
+        cmd_tune(
+            0.5,
+            Some(1500.0),
+            Some(path_str),
+            None,
+            None,
+            "none",
+            Verbosity::Quiet,
+        )
+        .expect("single-tone tune to file should succeed");
         #[cfg(feature = "file-backend")]
         {
             assert!(path.exists(), "WAV file should be created");
