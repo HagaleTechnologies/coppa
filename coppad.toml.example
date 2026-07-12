@@ -47,10 +47,34 @@ websocket_port = 8400
 [engine]
 # Profile: HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY
 profile = "HF_STANDARD"
-# Station callsign (required for connected sessions)
+# Station callsign (required for connected sessions, and for the station-ID
+# timer / beacon mode below -- both stay off while this is empty).
 callsign = ""
+# Optional Maidenhead grid locator (e.g. "FN20"), included in station-ID/
+# beacon frames alongside the callsign. Free text, not validated.
+# grid = ""
 # Enable ARQ for reliable delivery
 arq_enabled = false
+
+[station_id]
+# Busy-channel courtesy gate: once a TX request finds the channel busy (via
+# the spectral-occupancy busy detector), the poll interval in ms used while
+# waiting for it to clear, followed by a randomized 0.5-2s courtesy holdoff
+# once it does. 0 (default) disables the gate entirely -- TX proceeds
+# immediately regardless of busy state. Never adds delay when the channel is
+# already clear at request time.
+busy_hold_ms = 0
+# Station-ID timer: minimum interval in seconds between automatic
+# identification. Defaults to 540 (9 minutes) for margin under FCC Part
+# 97.119's 10-minute requirement. An ID is only ever prepended to a real
+# outgoing transmission (never sent standalone), and only while [engine]
+# callsign above is set.
+id_interval_secs = 540
+# Beacon mode: interval in seconds between standalone beacon transmissions,
+# sent only when the channel reads clear (skipped, not deferred, if busy --
+# retried on the next tick). 0 (default) disables beacon mode. Also requires
+# [engine] callsign to be set.
+beacon_interval_secs = 0
 
 # --- Session Configuration (for connected mode) ---
 # These are operational defaults; session parameters are

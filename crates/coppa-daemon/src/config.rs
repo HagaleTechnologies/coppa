@@ -15,6 +15,9 @@ pub struct DaemonConfig {
     pub host: HostConfig,
     /// Engine configuration.
     pub engine: EngineSection,
+    /// Busy-channel courtesy / station-ID / beacon-mode configuration
+    /// (Phase 4 Task 3).
+    pub station_id: StationIdConfig,
 }
 
 /// Audio configuration section.
@@ -188,10 +191,57 @@ pub struct HostConfig {
 pub struct EngineSection {
     /// Operational profile name.
     pub profile: String,
-    /// Station callsign.
+    /// Station callsign. Required (non-empty) for the station-ID timer and
+    /// beacon mode (Phase 4 Task 3) to activate; empty (the default) keeps
+    /// both off regardless of their interval settings.
     pub callsign: String,
+    /// Optional free-text Maidenhead grid locator (e.g. "FN20"), included in
+    /// the station-ID/beacon payload alongside the callsign when set. No
+    /// validation beyond being a plain string -- this is an operator-supplied
+    /// field, not a parsed/validated grid square.
+    pub grid: Option<String>,
     /// Enable ARQ (Automatic Repeat reQuest) transport layer.
     pub arq_enabled: bool,
+}
+
+/// Busy-channel courtesy / station-ID timer / beacon-mode configuration
+/// (Phase 4 Task 3). All three sub-features are off by default (see each
+/// field's doc); the station-ID timer and beacon mode additionally require
+/// `[engine] callsign` to be set (see `EngineSection::callsign`'s doc) --
+/// there is no meaningful "identify" or "beacon" transmission without one.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct StationIdConfig {
+    /// Busy-channel gate: once a TX request finds the channel busy (via
+    /// `coppa_ml::BusyGate`), the poll interval (ms) used while waiting for
+    /// it to clear. `0` (the default) disables the busy-channel gate
+    /// entirely -- TX proceeds immediately regardless of busy state, exactly
+    /// as before this feature existed. When non-zero, a TX request that
+    /// finds the channel busy is deferred until it reads clear, followed by
+    /// a randomized 0.5-2s courtesy holdoff (so multiple deferred stations
+    /// don't all key up in the same instant) before actually transmitting.
+    /// Does NOT add any delay to a TX request when the channel is already
+    /// clear at request time.
+    pub busy_hold_ms: u64,
+    /// Station-ID timer: minimum interval (seconds) between automatic ID
+    /// transmissions. Defaults to 540 (9 minutes) -- FCC Part 97.119 requires
+    /// identification at least every 10 minutes; 9 minutes leaves margin
+    /// against clock/scheduling jitter. Only actually fires if `[engine]
+    /// callsign` is set AND at least one real transmission has happened
+    /// since the last ID (an ID is prepended to the next outgoing frame, not
+    /// sent standalone on a bare timer -- an idle station never needs to
+    /// identify). Note this default alone does NOT enable the feature: with
+    /// the default empty callsign, no ID is ever sent regardless of this
+    /// value (see `EngineSection::callsign`'s doc) -- this is why "ID timer
+    /// off by default" and "id_interval_secs defaults to the FCC-safe 540"
+    /// are both true simultaneously.
+    pub id_interval_secs: u64,
+    /// Beacon mode: interval (seconds) between automatic standalone beacon
+    /// transmissions (sent whenever the channel reads clear at the interval
+    /// tick; skipped -- not deferred -- if busy, and retried on the next
+    /// tick). `0` (the default) disables beacon mode. Also requires
+    /// `[engine] callsign` to be set.
+    pub beacon_interval_secs: u64,
 }
 
 // Sub-structs have non-trivial defaults (custom port numbers, strings, etc.),
@@ -204,6 +254,7 @@ impl Default for DaemonConfig {
             radio: RadioConfig::default(),
             host: HostConfig::default(),
             engine: EngineSection::default(),
+            station_id: StationIdConfig::default(),
         }
     }
 }
@@ -249,7 +300,18 @@ impl Default for EngineSection {
         Self {
             profile: "HF_STANDARD".to_string(),
             callsign: String::new(),
+            grid: None,
             arq_enabled: false,
+        }
+    }
+}
+
+impl Default for StationIdConfig {
+    fn default() -> Self {
+        Self {
+            busy_hold_ms: 0,
+            id_interval_secs: 540,
+            beacon_interval_secs: 0,
         }
     }
 }
@@ -324,6 +386,49 @@ callsign = "VK2ABC"
         assert_eq!(config.radio.ptt_method, "rigctld");
         assert!(config.host.websocket_enabled);
         assert_eq!(config.engine.callsign, "VK2ABC");
+    }
+
+    // ── StationIdConfig defaults (Phase 4 Task 3) ─────────────────────
+
+    #[test]
+    fn test_station_id_config_defaults() {
+        let config = DaemonConfig::default();
+        assert_eq!(
+            config.station_id.busy_hold_ms, 0,
+            "busy-channel gate must be off by default"
+        );
+        assert_eq!(
+            config.station_id.id_interval_secs, 540,
+            "station-ID interval should default to 9 minutes (FCC margin)"
+        );
+        assert_eq!(
+            config.station_id.beacon_interval_secs, 0,
+            "beacon mode must be off by default"
+        );
+        assert_eq!(
+            config.engine.callsign, "",
+            "callsign must be unset by default"
+        );
+        assert_eq!(config.engine.grid, None);
+    }
+
+    #[test]
+    fn test_parse_station_id_toml() {
+        let toml = r#"
+[engine]
+callsign = "VK2ABC"
+grid = "QF22"
+
+[station_id]
+busy_hold_ms = 250
+id_interval_secs = 300
+beacon_interval_secs = 600
+"#;
+        let config: DaemonConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.engine.grid.as_deref(), Some("QF22"));
+        assert_eq!(config.station_id.busy_hold_ms, 250);
+        assert_eq!(config.station_id.id_interval_secs, 300);
+        assert_eq!(config.station_id.beacon_interval_secs, 600);
     }
 
     #[test]

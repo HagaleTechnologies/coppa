@@ -407,6 +407,7 @@ dependencies = [
  "coppa-ml",
  "coppa-protocol",
  "coppa-radio",
+ "rand 0.10.2",
  "serde",
  "tokio",
  "toml 1.1.2+spec-1.1.0",

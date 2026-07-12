@@ -189,6 +189,51 @@ impl CoppaCore {
         Ok(samples)
     }
 
+    /// Encode arbitrary binary data to audio samples at an explicit `level`
+    /// (1-10), overriding `self.config.speed_level` for this one call.
+    ///
+    /// Reuses `self.transceiver` directly rather than constructing a second
+    /// transceiver/engine instance: `CoppaTransceiver::new` eagerly builds
+    /// per-speed-level modulation/FEC state (`LevelComponents`) for *every*
+    /// speed level up front, keyed purely off `CoppaHeader::speed_level` --
+    /// see `CoppaTransceiver::transmit`. The one thing that stays fixed is the
+    /// OFDM PHY layer itself (FFT size/carrier layout/HF-bandpass, chosen by
+    /// whichever `CoppaProfile` this engine was built with) -- forcing
+    /// `level` here does NOT switch between the HF and VHF profiles. That's
+    /// intentional: a level-1 frame sent over a *different* OFDM profile than
+    /// the rest of this link's traffic would be a physically different
+    /// waveform a fixed-profile `StreamingReceiver` (this engine's own, and
+    /// any peer's) couldn't sync to -- level here means "most robust
+    /// modulation/FEC within the profile already in use for this link", not
+    /// "force HF profile regardless of link config".
+    ///
+    /// No compression is applied (unlike `encode_bytes`): callers needing a
+    /// forced-level frame (station ID / beacon, Phase 4 Task 3) send small,
+    /// simple payloads where compression overhead isn't worth the complexity.
+    pub fn encode_bytes_at_level(&self, data: &[u8], level: u8) -> Result<Vec<f32>> {
+        if data.len() > u16::MAX as usize {
+            anyhow::bail!("Payload too large ({} bytes, max {})", data.len(), u16::MAX);
+        }
+
+        let header = CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: CoppaFrameType::Beacon,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: level,
+            seq_num: 0,
+            payload_len: data.len() as u16,
+            codewords: 1,
+        };
+
+        let samples = self
+            .transceiver
+            .transmit(&header, data)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        Ok(samples)
+    }
+
     /// Generate a TX-level calibration ("TUNE") tone: an operator keys this and
     /// advances their radio's audio drive until ALC just registers, then backs
     /// off — standard amateur SSB practice (analogous to VARA's `TUNE`).
@@ -554,6 +599,48 @@ mod tests {
             frames.is_empty(),
             "squelched silence should never reach the streaming receiver"
         );
+    }
+
+    // ── Task 3 (Phase 4): forced-level encoding (station ID / beacon) ─────
+
+    #[test]
+    fn test_encode_bytes_at_level_forces_level_regardless_of_config() {
+        // Engine configured at speed_level 3, but we force level 1.
+        let config = EngineConfig {
+            speed_level: 3,
+            ..Default::default()
+        };
+        let core = CoppaCore::with_config(config);
+        let data = b"VK3ABC";
+        let samples = core
+            .encode_bytes_at_level(data, 1)
+            .expect("encode at forced level 1 should succeed");
+        assert!(!samples.is_empty());
+
+        // Decoding via the transceiver directly should report speed_level 1,
+        // not the engine's configured level 3.
+        let decoded = core.decode_bytes(&samples).expect("decode should succeed");
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_encode_bytes_at_level_roundtrips_via_push_samples() {
+        let mut core = CoppaCore::new(); // default speed_level 1
+        let data = b"ID payload";
+        let samples = core
+            .encode_bytes_at_level(data, 1)
+            .expect("encode should succeed");
+        let samples = with_lead_and_trail(&samples);
+        let frames = core.push_samples(&samples);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].speed_level, 1);
+    }
+
+    #[test]
+    fn test_encode_bytes_at_level_rejects_oversized_payload() {
+        let core = CoppaCore::new();
+        let data = vec![0u8; u16::MAX as usize + 1];
+        assert!(core.encode_bytes_at_level(&data, 1).is_err());
     }
 
     // ── Task 1 (Phase 4): TX level calibration (TUNE) ─────────────────────

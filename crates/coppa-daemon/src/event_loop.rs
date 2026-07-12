@@ -9,14 +9,15 @@ use coppa_host::vara::VaraResponse;
 use coppa_host::HostEvent;
 use coppa_ml::BusyGate;
 use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx};
-use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu};
+use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu, StationIdPayload};
 use coppa_protocol::session::{LinkCapabilities, SessionManager, SessionState};
 use coppa_protocol::transport::{TransportPdu, TransportType};
 use coppa_radio::{NullPtt, PttControl, PttState};
+use rand::RngExt;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::config::DaemonConfig;
@@ -110,6 +111,17 @@ pub struct EventLoop {
     /// Turnaround delay in ms between RX/TX switching.
     #[allow(dead_code)] // enforcement deferred to real-world testing
     turnaround_ms: u64,
+    /// Time of the last station-ID frame actually sent (or `EventLoop`
+    /// construction, if none yet). Compared against `[station_id]
+    /// id_interval_secs` in `id_due` -- see `transmit_samples`'s doc for why
+    /// an ID is only ever prepended to a real outgoing transmission, never
+    /// sent standalone on a bare timer (Phase 4 Task 3).
+    last_id_time: Instant,
+    /// Time of the last standalone beacon frame actually sent (or
+    /// `EventLoop` construction, if none yet). Compared against
+    /// `[station_id] beacon_interval_secs` in `maybe_send_beacon` (Phase 4
+    /// Task 3).
+    last_beacon_time: Instant,
 }
 
 impl EventLoop {
@@ -176,6 +188,8 @@ impl EventLoop {
             tx_frame_count: 0,
             max_frames_per_turn: 4,
             turnaround_ms: 500,
+            last_id_time: Instant::now(),
+            last_beacon_time: Instant::now(),
         })
     }
 
@@ -364,6 +378,9 @@ impl EventLoop {
         let mut retransmit_poll = tokio::time::interval(tokio::time::Duration::from_millis(500));
         // Session cleanup and keepalive interval (5s)
         let mut session_cleanup = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        // Beacon-mode check interval (Phase 4 Task 3): cheap no-op tick when
+        // beacon mode is disabled (the default); see `maybe_send_beacon`.
+        let mut beacon_poll = tokio::time::interval(tokio::time::Duration::from_secs(1));
 
         while self.running {
             tokio::select! {
@@ -395,6 +412,9 @@ impl EventLoop {
                 _ = retransmit_poll.tick() => {
                     // E6: Check for ARQ retransmits
                     self.check_arq_retransmits();
+                }
+                _ = beacon_poll.tick() => {
+                    self.maybe_send_beacon().await;
                 }
                 _ = session_cleanup.tick() => {
                     let removed = self.session_mgr.cleanup_timed_out();
@@ -879,7 +899,40 @@ impl EventLoop {
     }
 
     /// Transmit encoded audio samples: assert PTT, write to ring buffer, schedule PTT release.
+    ///
+    /// This is the single chokepoint every TX path in this event loop funnels
+    /// through (host-driven encode, ARQ-adjacent session control frames, the
+    /// raw/ARQ TX-queue drain, `TUNE`), so busy-channel courtesy (Phase 4
+    /// Task 3, decision: gate here rather than duplicate at each call site)
+    /// and the station-ID timer's prepend both live here and apply uniformly
+    /// to every caller -- none of them are exempted; deferring a
+    /// CONNECT_ACK/CFM by a fraction of a second for channel courtesy is
+    /// judged better than bulldozing over real QRM, and none of this event
+    /// loop's TX paths have a "must never be deferred" real-time constraint.
     async fn transmit_samples(&mut self, samples: &[f32]) {
+        self.wait_for_clear_channel().await;
+
+        // Station-ID timer (Phase 4 Task 3): prepend an ID/beacon frame to
+        // this transmission if due. Deliberately only checked here, at an
+        // actual TX opportunity -- an idle station that never transmits never
+        // needs to identify, so "no activity -> no ID" falls out of this
+        // placement for free rather than needing separate bookkeeping.
+        let combined;
+        let samples: &[f32] = if self.id_due() {
+            match self.encode_id_beacon_frame() {
+                Some(id_samples) => {
+                    self.last_id_time = Instant::now();
+                    let mut buf = id_samples;
+                    buf.extend_from_slice(samples);
+                    combined = buf;
+                    &combined
+                }
+                None => samples,
+            }
+        } else {
+            samples
+        };
+
         // Assert PTT before transmitting
         self.handle_ptt_change(true).await;
         // Enforce PTT pre-delay before writing audio
@@ -913,6 +966,138 @@ impl EventLoop {
                 tracing::warn!(error = %e, "Failed to deassert PTT after TX");
             }
         });
+    }
+
+    /// Busy-channel courtesy gate (Phase 4 Task 3): if `[station_id]
+    /// busy_hold_ms` is `0`, or the channel doesn't currently read busy, this
+    /// is a no-op (no wait, no holdoff -- an already-clear channel never
+    /// pays any extra TX latency for this feature). Otherwise, waits for
+    /// `coppa_ml::BusyGate` to read clear, then applies a randomized 0.5-2s
+    /// courtesy backoff (so multiple stations that were all waiting on the
+    /// same busy channel don't all key up in the same instant once it
+    /// clears), re-checking busy state after the backoff in case the channel
+    /// went busy again during it -- looping back to wait again if so.
+    ///
+    /// `BusyGate` only updates when fed fresh audio via `handle_audio_in`,
+    /// which this event loop otherwise only calls from `run`'s own
+    /// `audio_poll` tick -- a `tokio::select!` branch that can't run
+    /// concurrently with this same call (both execute on the same task).
+    /// This loop therefore drives `poll_audio_input` itself on every
+    /// iteration so real RX audio queued in the input ring (kept filling by
+    /// a separate OS-level audio thread/callback even while this task is
+    /// blocked here) actually reaches `BusyGate::observe` during the wait,
+    /// instead of the gate's state going stale for the whole hold.
+    async fn wait_for_clear_channel(&mut self) {
+        let hold_ms = self.config.station_id.busy_hold_ms;
+        if hold_ms == 0 || !self.busy_gate.current() {
+            return;
+        }
+        loop {
+            while self.busy_gate.current() {
+                // Boxed: `transmit_samples` -> `wait_for_clear_channel` ->
+                // `poll_audio_input` -> `handle_audio_in` -> `handle_mac_pdu`
+                // -> (e.g.) `handle_incoming_connect` -> `transmit_samples`
+                // forms an async call cycle; one edge needs indirection to
+                // give the compiler a finite-sized future (same pattern as
+                // `try_drain_tx_queue`'s call into `transmit_samples`).
+                Box::pin(self.poll_audio_input()).await;
+                tokio::time::sleep(Duration::from_millis(hold_ms)).await;
+            }
+
+            let holdoff_secs: f32 = rand::rng().random_range(0.5f32..2.0f32);
+            tokio::time::sleep(Duration::from_secs_f32(holdoff_secs)).await;
+            Box::pin(self.poll_audio_input()).await; // pick up anything that arrived during the holdoff
+
+            if !self.busy_gate.current() {
+                return;
+            }
+            // Busy again during the holdoff -- loop back and wait again.
+        }
+    }
+
+    /// Whether a station-ID frame is due to be prepended to the next
+    /// transmission (Phase 4 Task 3): requires a configured callsign, a
+    /// non-zero `[station_id] id_interval_secs`, and at least that many
+    /// seconds since the last ID actually sent (or since `EventLoop`
+    /// construction, if none yet).
+    fn id_due(&self) -> bool {
+        if self.config.engine.callsign.is_empty() {
+            return false;
+        }
+        let interval = self.config.station_id.id_interval_secs;
+        if interval == 0 {
+            return false;
+        }
+        self.last_id_time.elapsed() >= Duration::from_secs(interval)
+    }
+
+    /// Build the `Beacon`-type `MacPdu` carrying this station's
+    /// `StationIdPayload` (callsign + optional grid + level, per Task 3's
+    /// brief). `dest`/`src` are both this station's own callsign: a
+    /// station-ID/beacon frame isn't directed at any particular remote
+    /// (nothing in this codebase has a dedicated "CQ"/broadcast callsign
+    /// constant, and self-addressing is a reasonable, simple convention for
+    /// "not directed at anyone"). Returns `None` if no local callsign is
+    /// configured.
+    fn build_beacon_mac_pdu(&self) -> Option<MacPdu> {
+        let local = self.local_callsign.clone()?;
+        let id_payload = StationIdPayload {
+            callsign: local.as_str().to_string(),
+            grid: self.config.engine.grid.clone(),
+            level: 1,
+        };
+        Some(MacPdu::new(
+            MacFrameType::Beacon,
+            local.clone(),
+            local,
+            0,
+            id_payload.to_bytes(),
+        ))
+    }
+
+    /// Encode a station-ID/beacon frame at speed level 1 (the most robust
+    /// single-codeword level -- Task 3's brief), for prepending
+    /// (`transmit_samples`) or standalone sending (`maybe_send_beacon`).
+    /// Returns `None` if no local callsign is configured, or if encoding
+    /// unexpectedly fails (logged; the caller falls back to proceeding
+    /// without an ID rather than dropping the real payload it was about to
+    /// send).
+    fn encode_id_beacon_frame(&self) -> Option<Vec<f32>> {
+        let pdu = self.build_beacon_mac_pdu()?;
+        match self.engine.encode_bytes_at_level(&pdu.to_bytes(), 1) {
+            Ok(samples) => Some(samples),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to encode station-ID/beacon frame");
+                None
+            }
+        }
+    }
+
+    /// Beacon mode (Phase 4 Task 3): called on `beacon_poll`'s 1s tick.
+    /// Sends a standalone beacon frame once `[station_id]
+    /// beacon_interval_secs` has elapsed since the last one, if a callsign
+    /// is configured and the channel currently reads clear. If busy, this
+    /// cycle is skipped (not deferred) -- the next tick will try again, per
+    /// the brief's "sends a beacon every interval when enabled and channel
+    /// is clear."
+    async fn maybe_send_beacon(&mut self) {
+        let interval = self.config.station_id.beacon_interval_secs;
+        if interval == 0 || self.config.engine.callsign.is_empty() {
+            return;
+        }
+        if self.last_beacon_time.elapsed() < Duration::from_secs(interval) {
+            return;
+        }
+        if self.busy_gate.current() {
+            return;
+        }
+        if let Some(samples) = self.encode_id_beacon_frame() {
+            self.last_beacon_time = Instant::now();
+            // A beacon already fully identifies the station; avoid also
+            // prepending a redundant separate ID frame to it.
+            self.last_id_time = Instant::now();
+            self.transmit_samples(&samples).await;
+        }
     }
 
     /// E6: Check for ARQ retransmits and send them.
@@ -956,10 +1141,25 @@ impl EventLoop {
             MacFrameType::Disconnect => self.handle_incoming_disconnect(pdu),
             MacFrameType::Data => self.handle_session_data(pdu),
             MacFrameType::Keepalive => self.handle_keepalive_rx(pdu),
+            MacFrameType::Beacon => self.handle_beacon_rx(pdu),
             _ => {
                 tracing::debug!(frame_type = ?pdu.frame_type, "Unhandled MAC frame type");
             }
         }
+    }
+
+    /// Received a station-ID/beacon frame (Phase 4 Task 3) from another
+    /// station. No session/state-machine effect (a beacon isn't directed at
+    /// this station specifically) -- just logged for operator visibility;
+    /// full decode of the inner `StationIdPayload` (grid/level) is left to
+    /// whatever's consuming the log/telemetry rather than surfaced further,
+    /// matching this task's "don't overbuild" guidance.
+    fn handle_beacon_rx(&self, pdu: MacPdu) {
+        tracing::info!(
+            from = %pdu.src,
+            bytes = pdu.payload.len(),
+            "Station-ID/beacon frame received"
+        );
     }
 
     async fn handle_incoming_connect(&mut self, pdu: MacPdu) {
@@ -1848,6 +2048,397 @@ mod tests {
                 "expected a BUSY ON before a BUSY OFF, got: {:?}",
                 busy_values
             );
+        }
+    }
+
+    // ── Task 3 (Phase 4): busy-channel courtesy, station-ID timer, beacon ────
+
+    mod station_id {
+        use super::*;
+
+        /// Same lead/trail padding convention as `coppa_engine::CoppaCore`'s and
+        /// `telemetry`'s own copies (see their docs): the streaming sync detector
+        /// needs a clean silence bootstrap, and the RX bandpass filter's group
+        /// delay needs a little trailing pad.
+        fn with_lead_and_trail(samples: &[f32]) -> Vec<f32> {
+            let mut out = vec![0.0f32; 8192];
+            out.extend_from_slice(samples);
+            out.extend(std::iter::repeat_n(0.0f32, 2048));
+            out
+        }
+
+        /// Deterministic per-call PRNG (mirrors the existing busy-telemetry
+        /// test's own generator, and `coppa-ml::busy_gate`'s test-doc note about
+        /// why a *shared* `static` counter made this exact kind of test flaky
+        /// under parallel execution): threads a local counter instead.
+        fn noise_block(amplitude: f32, counter: &mut u32) -> Vec<f32> {
+            (0..1024)
+                .map(|_| {
+                    *counter = counter.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    amplitude * ((*counter >> 8) as f32 / (1u32 << 24) as f32 - 0.5)
+                })
+                .collect()
+        }
+
+        fn config_with_callsign() -> DaemonConfig {
+            let mut config = DaemonConfig::default();
+            config.engine.callsign = "VK3ABC".to_string();
+            config
+        }
+
+        // ── (a) busy-defer-with-holdoff ───────────────────────────────
+
+        #[tokio::test(start_paused = true)]
+        async fn test_transmit_deferred_while_busy_then_holdoff_applied() {
+            let mut config = DaemonConfig::default();
+            config.station_id.busy_hold_ms = 10;
+            let mut event_loop = EventLoop::new(config).unwrap();
+
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+            let (mut audio_in_tx, audio_in_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_in(audio_in_rx);
+
+            let mut counter = 1u32;
+            // Settle the busy gate's noise floor, then inject a burst so the
+            // channel reads busy at the moment `transmit_samples` is called
+            // (this is the "injected occupancy" the brief's scenario (a) asks
+            // for).
+            for _ in 0..10 {
+                event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.01, &mut counter));
+            }
+            for _ in 0..5 {
+                event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.5, &mut counter));
+            }
+            assert!(
+                event_loop.busy_gate.current(),
+                "channel should read busy after the injected burst"
+            );
+
+            // Pre-load the input ring with several quiet blocks so that when
+            // `wait_for_clear_channel`'s loop drives `poll_audio_input` itself
+            // (see that method's doc for why it must), it actually observes
+            // fresh, below-threshold audio and the gate clears -- without this,
+            // the wait would never resolve, since nothing else in this test
+            // concurrently feeds the ring.
+            for _ in 0..15 {
+                audio_in_tx.write(&noise_block(0.01, &mut counter));
+            }
+
+            let payload = vec![0.25f32; 500]; // stand-in "encoded frame" audio
+            let start = tokio::time::Instant::now();
+            event_loop.transmit_samples(&payload).await;
+            let elapsed = start.elapsed();
+
+            assert!(
+                !event_loop.busy_gate.current(),
+                "channel should read clear after the wait"
+            );
+            assert!(
+                elapsed >= Duration::from_millis(500),
+                "expected at least the 0.5s courtesy holdoff lower bound, got {:?}",
+                elapsed
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "holdoff should stay within its documented 0.5-2s bound (plus polling), got {:?}",
+                elapsed
+            );
+
+            let available = audio_out_rx.available();
+            assert!(
+                available >= payload.len(),
+                "the deferred transmission should still have gone out eventually"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn test_transmit_not_deferred_when_channel_already_clear() {
+            let mut config = DaemonConfig::default();
+            config.station_id.busy_hold_ms = 10;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+
+            assert!(!event_loop.busy_gate.current());
+
+            let payload = vec![0.25f32; 500];
+            let start = tokio::time::Instant::now();
+            event_loop.transmit_samples(&payload).await;
+            let elapsed = start.elapsed();
+
+            assert!(
+                elapsed < Duration::from_millis(100),
+                "an already-clear channel must not pay any busy-gate latency, got {:?}",
+                elapsed
+            );
+            assert_eq!(audio_out_rx.available(), payload.len());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn test_busy_gate_disabled_by_default_does_not_defer_tx() {
+            // (d) busy-channel gate OFF by default: busy_hold_ms == 0.
+            let config = DaemonConfig::default();
+            assert_eq!(config.station_id.busy_hold_ms, 0);
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+
+            let mut counter = 7u32;
+            for _ in 0..10 {
+                event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.01, &mut counter));
+            }
+            for _ in 0..5 {
+                event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.5, &mut counter));
+            }
+            assert!(event_loop.busy_gate.current(), "gate should read busy");
+
+            let payload = vec![0.25f32; 500];
+            let start = tokio::time::Instant::now();
+            event_loop.transmit_samples(&payload).await;
+            let elapsed = start.elapsed();
+
+            assert!(
+                elapsed < Duration::from_millis(100),
+                "busy_hold_ms == 0 must transmit immediately even while busy, got {:?}",
+                elapsed
+            );
+            assert_eq!(audio_out_rx.available(), payload.len());
+        }
+
+        // ── (b) station-ID timer ───────────────────────────────────────
+
+        #[tokio::test]
+        async fn test_id_timer_prepends_id_frame_after_interval_elapsed() {
+            let mut event_loop = EventLoop::new(config_with_callsign()).unwrap();
+            assert_eq!(event_loop.config.station_id.id_interval_secs, 540);
+            // Simulate 10 minutes of elapsed time since the last ID (or, here,
+            // since construction) without any real sleep.
+            event_loop.last_id_time = Instant::now() - Duration::from_secs(600);
+
+            let (audio_out_tx, mut audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+
+            let core = coppa_engine::CoppaCore::new();
+            let payload_samples = core.encode_bytes(b"hello").expect("encode should succeed");
+            let payload_len = payload_samples.len();
+
+            event_loop.transmit_samples(&payload_samples).await;
+
+            let available = audio_out_rx.available();
+            assert!(
+                available > payload_len,
+                "an ID frame should have been prepended, growing the transmitted audio \
+                 (payload was {} samples, got {})",
+                payload_len,
+                available
+            );
+            assert!(
+                event_loop.last_id_time.elapsed() < Duration::from_secs(1),
+                "last_id_time should be refreshed after sending an ID"
+            );
+
+            // Verify it's a real, decodable prepended frame: the combined
+            // stream should decode as two frames back-to-back (streaming
+            // receivers decoding multiple concatenated frames is already
+            // exercised elsewhere in this codebase).
+            let mut captured = vec![0.0f32; available];
+            audio_out_rx.read(&mut captured);
+            let padded = with_lead_and_trail(&captured);
+            let mut decoder = coppa_engine::CoppaCore::new();
+            let frames = decoder.push_samples(&padded);
+            assert_eq!(
+                frames.len(),
+                2,
+                "expected the prepended ID frame plus the original payload frame"
+            );
+            assert_eq!(
+                frames[0].speed_level, 1,
+                "the ID frame must be sent at speed level 1 (most robust)"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_id_timer_no_prepend_when_interval_not_elapsed() {
+            let mut event_loop = EventLoop::new(config_with_callsign()).unwrap();
+            // `last_id_time` defaults to construction time -- far less than
+            // `id_interval_secs` (540s) has "elapsed".
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+
+            let core = coppa_engine::CoppaCore::new();
+            let payload_samples = core.encode_bytes(b"hello").expect("encode should succeed");
+            let payload_len = payload_samples.len();
+
+            event_loop.transmit_samples(&payload_samples).await;
+
+            assert_eq!(
+                audio_out_rx.available(),
+                payload_len,
+                "no ID should be prepended before the interval elapses"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_id_timer_no_activity_means_no_id_ever_sent() {
+            // "no activity -> no ID": an ID is only ever prepended to a real
+            // TX opportunity (see `transmit_samples`'s doc), so a station that
+            // never transmits must never emit one either, no matter how much
+            // (simulated) time has passed.
+            let mut event_loop = EventLoop::new(config_with_callsign()).unwrap();
+            event_loop.last_id_time = Instant::now() - Duration::from_secs(3600);
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+
+            // No call to transmit_samples / maybe_send_beacon at all.
+            assert_eq!(audio_out_rx.available(), 0);
+        }
+
+        // ── (c) beacon mode ─────────────────────────────────────────────
+
+        #[tokio::test]
+        async fn test_beacon_sends_when_enabled_interval_elapsed_and_clear() {
+            let mut config = config_with_callsign();
+            config.station_id.beacon_interval_secs = 5;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            event_loop.last_beacon_time = Instant::now() - Duration::from_secs(10);
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+
+            assert!(!event_loop.busy_gate.current(), "channel starts clear");
+
+            event_loop.maybe_send_beacon().await;
+
+            assert!(
+                audio_out_rx.available() > 0,
+                "a beacon frame should have been transmitted"
+            );
+            assert!(
+                event_loop.last_beacon_time.elapsed() < Duration::from_secs(1),
+                "last_beacon_time should be refreshed after sending"
+            );
+
+            // Immediately calling again (interval not yet elapsed) must not
+            // send a second beacon.
+            let sent_once = audio_out_rx.available();
+            event_loop.maybe_send_beacon().await;
+            assert_eq!(
+                audio_out_rx.available(),
+                sent_once,
+                "beacon must not re-fire before beacon_interval_secs elapses again"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_beacon_skipped_not_deferred_when_channel_busy() {
+            let mut config = config_with_callsign();
+            config.station_id.beacon_interval_secs = 5;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            event_loop.last_beacon_time = Instant::now() - Duration::from_secs(10);
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+
+            let mut counter = 42u32;
+            for _ in 0..10 {
+                event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.01, &mut counter));
+            }
+            for _ in 0..5 {
+                event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.5, &mut counter));
+            }
+            assert!(event_loop.busy_gate.current());
+
+            let last_beacon_before = event_loop.last_beacon_time;
+            event_loop.maybe_send_beacon().await;
+
+            assert_eq!(
+                audio_out_rx.available(),
+                0,
+                "a busy channel must skip this beacon cycle, not defer it"
+            );
+            assert_eq!(
+                event_loop.last_beacon_time, last_beacon_before,
+                "a skipped cycle must not consume the timer, so the very next tick retries"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_beacon_off_by_default() {
+            // (d) beacon mode OFF by default: beacon_interval_secs == 0.
+            let mut config = config_with_callsign();
+            assert_eq!(config.station_id.beacon_interval_secs, 0);
+            config.station_id.beacon_interval_secs = 0; // explicit, for clarity
+            let mut event_loop = EventLoop::new(config).unwrap();
+            event_loop.last_beacon_time = Instant::now() - Duration::from_secs(3600);
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+
+            event_loop.maybe_send_beacon().await;
+
+            assert_eq!(audio_out_rx.available(), 0);
+        }
+
+        // ── (d) all three OFF when callsign unset ────────────────────────
+
+        #[tokio::test]
+        async fn test_id_and_beacon_off_when_callsign_unset() {
+            let mut config = DaemonConfig::default(); // callsign is empty
+            config.station_id.id_interval_secs = 1; // would otherwise fire immediately
+            config.station_id.beacon_interval_secs = 1;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            event_loop.last_id_time = Instant::now() - Duration::from_secs(3600);
+            event_loop.last_beacon_time = Instant::now() - Duration::from_secs(3600);
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+
+            let core = coppa_engine::CoppaCore::new();
+            let payload_samples = core.encode_bytes(b"hello").expect("encode should succeed");
+            let payload_len = payload_samples.len();
+
+            event_loop.transmit_samples(&payload_samples).await;
+            assert_eq!(
+                audio_out_rx.available(),
+                payload_len,
+                "no ID should be prepended without a configured callsign"
+            );
+
+            let (audio_out_tx2, audio_out_rx2) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx2);
+            event_loop.maybe_send_beacon().await;
+            assert_eq!(
+                audio_out_rx2.available(),
+                0,
+                "no beacon should be sent without a configured callsign"
+            );
+        }
+
+        #[test]
+        fn test_default_config_all_three_features_off() {
+            let config = DaemonConfig::default();
+            assert_eq!(
+                config.station_id.busy_hold_ms, 0,
+                "busy gate off by default"
+            );
+            assert_eq!(
+                config.station_id.beacon_interval_secs, 0,
+                "beacon mode off by default"
+            );
+            assert_eq!(config.engine.callsign, "", "callsign unset by default");
+            // id_interval_secs defaults to the FCC-safe 540s (see StationIdConfig's
+            // doc for why this alone doesn't mean the feature is "on" -- callsign
+            // being unset by default still keeps it inactive).
+            assert_eq!(config.station_id.id_interval_secs, 540);
         }
     }
 }
