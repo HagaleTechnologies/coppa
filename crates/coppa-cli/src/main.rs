@@ -243,6 +243,110 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Write `samples` to a WAV file at `path` (file-backend only) — shared by
+/// `cmd_tx`'s and `cmd_tune`'s file-output paths.
+fn write_wav_output(
+    path: &str,
+    samples: &[f32],
+    sample_rate: u32,
+    verbosity: Verbosity,
+) -> Result<()> {
+    #[cfg(feature = "file-backend")]
+    {
+        use coppa_audio::{file_backend::WavSink, AudioSink};
+        let mut sink = WavSink::new(path, sample_rate);
+        sink.start()?;
+        sink.write(samples)?;
+        sink.stop()?;
+        if verbosity != Verbosity::Quiet {
+            println!("Written to {}", path);
+        }
+    }
+    #[cfg(not(feature = "file-backend"))]
+    {
+        let _ = path;
+        let _ = samples;
+        let _ = sample_rate;
+        if verbosity != Verbosity::Quiet {
+            println!("File output not available (compile with file-backend feature)");
+        }
+    }
+    Ok(())
+}
+
+/// Key PTT, stream `samples` out through the resolved audio device, then
+/// unkey — the live-playback sequencing shared by `cmd_tx` and `cmd_tune`.
+#[cfg(feature = "cpal-backend")]
+fn transmit_live(
+    samples: &[f32],
+    sample_rate: u32,
+    device: Option<&str>,
+    ptt: &str,
+    verbosity: Verbosity,
+) -> Result<()> {
+    use coppa_audio::AudioSink;
+    use coppa_radio::{PttControl, PttState};
+
+    // Create PTT controller
+    let mut ptt_ctrl: Box<dyn PttControl> = match ptt {
+        "rigctld" => match coppa_radio::RigctldClient::connect("127.0.0.1:4532") {
+            Ok(client) => Box::new(client),
+            Err(e) => {
+                eprintln!("WARNING: rigctld connect failed ({}), using no PTT", e);
+                Box::new(coppa_radio::NullPtt::new())
+            }
+        },
+        "vox" => Box::new(coppa_radio::VoxPtt::new()),
+        _ => Box::new(coppa_radio::NullPtt::new()),
+    };
+
+    // Create audio sink
+    let mut sink = match device {
+        Some(name) => match coppa_audio::find_output_device_by_name(name) {
+            Some(dev) => {
+                if verbosity != Verbosity::Quiet {
+                    eprintln!("Using output device matching '{}'", name);
+                }
+                coppa_audio::cpal_backend::CpalSink::from_device(dev, sample_rate, 8192)?
+            }
+            None => {
+                eprintln!(
+                    "WARNING: No output device matching '{}', using default",
+                    name
+                );
+                coppa_audio::cpal_backend::CpalSink::new(sample_rate, 8192)?
+            }
+        },
+        None => coppa_audio::cpal_backend::CpalSink::new(sample_rate, 8192)?,
+    };
+    sink.start()?;
+
+    // Key PTT
+    let _ = ptt_ctrl.set_ptt(PttState::Tx);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Write audio
+    sink.write(samples)?;
+
+    // Wait for audio to play out
+    let duration_ms = (samples.len() as f64 / sample_rate as f64 * 1000.0) as u64;
+    std::thread::sleep(std::time::Duration::from_millis(duration_ms + 200));
+
+    // Unkey PTT
+    let _ = ptt_ctrl.set_ptt(PttState::Rx);
+    sink.stop()?;
+
+    if verbosity != Verbosity::Quiet {
+        eprintln!(
+            "Transmitted {} samples ({:.2}s)",
+            samples.len(),
+            duration_ms as f64 / 1000.0
+        );
+    }
+
+    Ok(())
+}
+
 fn cmd_tx(
     message: &str,
     output: Option<&str>,
@@ -279,100 +383,11 @@ fn cmd_tx(
     }
 
     match output {
-        Some(path) => {
-            #[cfg(feature = "file-backend")]
-            {
-                use coppa_audio::{file_backend::WavSink, AudioSink};
-                let mut sink = WavSink::new(path, core.config().sample_rate);
-                sink.start()?;
-                sink.write(&samples)?;
-                sink.stop()?;
-                if verbosity != Verbosity::Quiet {
-                    println!("Written to {}", path);
-                }
-            }
-            #[cfg(not(feature = "file-backend"))]
-            {
-                let _ = path;
-                if verbosity != Verbosity::Quiet {
-                    println!("File output not available (compile with file-backend feature)");
-                }
-            }
-        }
+        Some(path) => write_wav_output(path, &samples, core.config().sample_rate, verbosity)?,
         None => {
             #[cfg(feature = "cpal-backend")]
             {
-                use coppa_audio::AudioSink;
-                use coppa_radio::{PttControl, PttState};
-
-                let engine_config = core.config();
-
-                // Create PTT controller
-                let mut ptt_ctrl: Box<dyn PttControl> = match ptt {
-                    "rigctld" => match coppa_radio::RigctldClient::connect("127.0.0.1:4532") {
-                        Ok(client) => Box::new(client),
-                        Err(e) => {
-                            eprintln!("WARNING: rigctld connect failed ({}), using no PTT", e);
-                            Box::new(coppa_radio::NullPtt::new())
-                        }
-                    },
-                    "vox" => Box::new(coppa_radio::VoxPtt::new()),
-                    _ => Box::new(coppa_radio::NullPtt::new()),
-                };
-
-                // Create audio sink
-                let mut sink = match device {
-                    Some(name) => match coppa_audio::find_output_device_by_name(name) {
-                        Some(dev) => {
-                            if verbosity != Verbosity::Quiet {
-                                eprintln!("Using output device matching '{}'", name);
-                            }
-                            coppa_audio::cpal_backend::CpalSink::from_device(
-                                dev,
-                                engine_config.sample_rate,
-                                8192,
-                            )?
-                        }
-                        None => {
-                            eprintln!(
-                                "WARNING: No output device matching '{}', using default",
-                                name
-                            );
-                            coppa_audio::cpal_backend::CpalSink::new(
-                                engine_config.sample_rate,
-                                8192,
-                            )?
-                        }
-                    },
-                    None => {
-                        coppa_audio::cpal_backend::CpalSink::new(engine_config.sample_rate, 8192)?
-                    }
-                };
-                sink.start()?;
-
-                // Key PTT
-                let _ = ptt_ctrl.set_ptt(PttState::Tx);
-                std::thread::sleep(std::time::Duration::from_millis(50));
-
-                // Write audio
-                sink.write(&samples)?;
-
-                // Wait for audio to play out
-                let duration_ms =
-                    (samples.len() as f64 / engine_config.sample_rate as f64 * 1000.0) as u64;
-                std::thread::sleep(std::time::Duration::from_millis(duration_ms + 200));
-
-                // Unkey PTT
-                let _ = ptt_ctrl.set_ptt(PttState::Rx);
-                sink.stop()?;
-
-                if verbosity != Verbosity::Quiet {
-                    eprintln!(
-                        "Transmitted {} samples ({:.2}s)",
-                        samples.len(),
-                        duration_ms as f64 / 1000.0
-                    );
-                }
+                transmit_live(&samples, core.config().sample_rate, device, ptt, verbosity)?;
             }
             #[cfg(not(feature = "cpal-backend"))]
             {
@@ -425,100 +440,11 @@ fn cmd_tune(
     }
 
     match output {
-        Some(path) => {
-            #[cfg(feature = "file-backend")]
-            {
-                use coppa_audio::{file_backend::WavSink, AudioSink};
-                let mut sink = WavSink::new(path, core.config().sample_rate);
-                sink.start()?;
-                sink.write(&samples)?;
-                sink.stop()?;
-                if verbosity != Verbosity::Quiet {
-                    println!("Written to {}", path);
-                }
-            }
-            #[cfg(not(feature = "file-backend"))]
-            {
-                let _ = path;
-                if verbosity != Verbosity::Quiet {
-                    println!("File output not available (compile with file-backend feature)");
-                }
-            }
-        }
+        Some(path) => write_wav_output(path, &samples, core.config().sample_rate, verbosity)?,
         None => {
             #[cfg(feature = "cpal-backend")]
             {
-                use coppa_audio::AudioSink;
-                use coppa_radio::{PttControl, PttState};
-
-                let engine_config = core.config();
-
-                // Create PTT controller
-                let mut ptt_ctrl: Box<dyn PttControl> = match ptt {
-                    "rigctld" => match coppa_radio::RigctldClient::connect("127.0.0.1:4532") {
-                        Ok(client) => Box::new(client),
-                        Err(e) => {
-                            eprintln!("WARNING: rigctld connect failed ({}), using no PTT", e);
-                            Box::new(coppa_radio::NullPtt::new())
-                        }
-                    },
-                    "vox" => Box::new(coppa_radio::VoxPtt::new()),
-                    _ => Box::new(coppa_radio::NullPtt::new()),
-                };
-
-                // Create audio sink
-                let mut sink = match device {
-                    Some(name) => match coppa_audio::find_output_device_by_name(name) {
-                        Some(dev) => {
-                            if verbosity != Verbosity::Quiet {
-                                eprintln!("Using output device matching '{}'", name);
-                            }
-                            coppa_audio::cpal_backend::CpalSink::from_device(
-                                dev,
-                                engine_config.sample_rate,
-                                8192,
-                            )?
-                        }
-                        None => {
-                            eprintln!(
-                                "WARNING: No output device matching '{}', using default",
-                                name
-                            );
-                            coppa_audio::cpal_backend::CpalSink::new(
-                                engine_config.sample_rate,
-                                8192,
-                            )?
-                        }
-                    },
-                    None => {
-                        coppa_audio::cpal_backend::CpalSink::new(engine_config.sample_rate, 8192)?
-                    }
-                };
-                sink.start()?;
-
-                // Key PTT
-                let _ = ptt_ctrl.set_ptt(PttState::Tx);
-                std::thread::sleep(std::time::Duration::from_millis(50));
-
-                // Stream the tone
-                sink.write(&samples)?;
-
-                // Wait for the tone to play out
-                let duration_ms =
-                    (samples.len() as f64 / engine_config.sample_rate as f64 * 1000.0) as u64;
-                std::thread::sleep(std::time::Duration::from_millis(duration_ms + 200));
-
-                // Unkey PTT
-                let _ = ptt_ctrl.set_ptt(PttState::Rx);
-                sink.stop()?;
-
-                if verbosity != Verbosity::Quiet {
-                    eprintln!(
-                        "Transmitted {} samples ({:.2}s)",
-                        samples.len(),
-                        duration_ms as f64 / 1000.0
-                    );
-                }
+                transmit_live(&samples, core.config().sample_rate, device, ptt, verbosity)?;
             }
             #[cfg(not(feature = "cpal-backend"))]
             {
