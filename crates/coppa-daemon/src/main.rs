@@ -59,8 +59,11 @@ async fn main() -> Result<()> {
         "Daemon configuration loaded"
     );
 
-    // Create event loop
-    let mut event_loop = EventLoop::new(config.clone());
+    // Create event loop. Fails loudly (rather than silently falling back to
+    // NullPtt) if [radio] ptt_method doesn't parse or names an
+    // unrecognized/unbuilt PTT backend -- see EventLoop::create_ptt.
+    let mut event_loop = EventLoop::new(config.clone())
+        .map_err(|e| anyhow::anyhow!("failed to start daemon event loop: {e}"))?;
     let event_tx = event_loop.event_sender();
 
     // Create response channel and wire it to the event loop

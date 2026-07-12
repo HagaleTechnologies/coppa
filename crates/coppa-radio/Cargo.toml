@@ -9,12 +9,16 @@ rust-version.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 tokio = { workspace = true }
+serialport = { workspace = true, optional = true }
 
 [features]
 default = []
-# Stub features: these modules compile but do NOT control real hardware.
-# Actual serial PTT requires the `serialport` crate; actual GPIO PTT requires
-# Linux sysfs access. These stubs exist to define the interface and allow
-# testing without hardware dependencies.
-serial-ptt-stub = []
-gpio-ptt-stub = []
+# Real hardware PTT backends, following the same one-feature-per-backend
+# pattern as coppa-audio's `cpal-backend`. Neither is compiled by default.
+#
+# `serial-ptt`: DTR/RTS PTT via the `serialport` crate (any OS it supports).
+# `gpio-ptt`: raw `/sys/class/gpio` sysfs PTT; real hardware access is
+# Linux-only (see `ptt_gpio`'s module docs), but the module itself compiles
+# on any OS so its state-machine logic can be unit-tested with a mock.
+serial-ptt = ["dep:serialport"]
+gpio-ptt = []

@@ -51,6 +51,15 @@ enum Commands {
         /// PTT method: "rigctld", "vox", "none" (default: "none")
         #[arg(long, default_value = "none")]
         ptt: String,
+        /// rigctld address for CAT PTT (only used when --ptt rigctld).
+        #[arg(long, default_value = "127.0.0.1:4532")]
+        rigctld: String,
+        /// Milliseconds to key PTT before audio starts playing.
+        #[arg(long, default_value = "50")]
+        ptt_lead_ms: u64,
+        /// Milliseconds to hold PTT keyed after audio finishes playing.
+        #[arg(long, default_value = "200")]
+        ptt_tail_ms: u64,
     },
     /// Receive and decode audio.
     Rx {
@@ -115,6 +124,15 @@ enum Commands {
         /// PTT method: "rigctld", "vox", "none" (default: "none")
         #[arg(long, default_value = "none")]
         ptt: String,
+        /// rigctld address for CAT PTT (only used when --ptt rigctld).
+        #[arg(long, default_value = "127.0.0.1:4532")]
+        rigctld: String,
+        /// Milliseconds to key PTT before audio starts playing.
+        #[arg(long, default_value = "50")]
+        ptt_lead_ms: u64,
+        /// Milliseconds to hold PTT keyed after audio finishes playing.
+        #[arg(long, default_value = "200")]
+        ptt_tail_ms: u64,
     },
     /// List available audio devices.
     Devices,
@@ -178,6 +196,9 @@ fn main() -> Result<()> {
             callsign,
             device,
             ptt,
+            rigctld,
+            ptt_lead_ms,
+            ptt_tail_ms,
         }) => cmd_tx(
             &message,
             output.as_deref(),
@@ -185,6 +206,9 @@ fn main() -> Result<()> {
             callsign.as_deref(),
             device.as_deref(),
             &ptt,
+            &rigctld,
+            ptt_lead_ms,
+            ptt_tail_ms,
             verbosity,
         )?,
         Some(Commands::Rx {
@@ -216,6 +240,9 @@ fn main() -> Result<()> {
             profile,
             device,
             ptt,
+            rigctld,
+            ptt_lead_ms,
+            ptt_tail_ms,
         }) => cmd_tune(
             seconds,
             single,
@@ -223,6 +250,9 @@ fn main() -> Result<()> {
             profile.as_deref(),
             device.as_deref(),
             &ptt,
+            &rigctld,
+            ptt_lead_ms,
+            ptt_tail_ms,
             verbosity,
         )?,
         Some(Commands::Devices) => cmd_devices()?,
@@ -274,22 +304,14 @@ fn write_wav_output(
     Ok(())
 }
 
-/// Key PTT, stream `samples` out through the resolved audio device, then
-/// unkey — the live-playback sequencing shared by `cmd_tx` and `cmd_tune`.
+/// Build the PTT controller for `--ptt <method>`, using `rigctld_addr` when
+/// `method` is `"rigctld"`. Split out from `transmit_live` so the
+/// `--rigctld`/CLI-flag plumbing can be unit-tested without a real audio
+/// device.
 #[cfg(feature = "cpal-backend")]
-fn transmit_live(
-    samples: &[f32],
-    sample_rate: u32,
-    device: Option<&str>,
-    ptt: &str,
-    verbosity: Verbosity,
-) -> Result<()> {
-    use coppa_audio::AudioSink;
-    use coppa_radio::{PttControl, PttState};
-
-    // Create PTT controller
-    let mut ptt_ctrl: Box<dyn PttControl> = match ptt {
-        "rigctld" => match coppa_radio::RigctldClient::connect("127.0.0.1:4532") {
+fn build_ptt(ptt: &str, rigctld_addr: &str) -> Box<dyn coppa_radio::PttControl> {
+    match ptt {
+        "rigctld" => match coppa_radio::RigctldClient::connect(rigctld_addr) {
             Ok(client) => Box::new(client),
             Err(e) => {
                 eprintln!("WARNING: rigctld connect failed ({}), using no PTT", e);
@@ -298,7 +320,46 @@ fn transmit_live(
         },
         "vox" => Box::new(coppa_radio::VoxPtt::new()),
         _ => Box::new(coppa_radio::NullPtt::new()),
-    };
+    }
+}
+
+/// Compute the PTT lead-in delay (before audio starts) and the post-audio
+/// tail delay (audio playout duration + configured tail) that
+/// `transmit_live` sleeps for around the actual audio write. Split out so
+/// the CLI's `--ptt-lead-ms`/`--ptt-tail-ms` flags' effect on the real
+/// playback sequencing can be verified by a fast, deterministic unit test.
+#[cfg(feature = "cpal-backend")]
+fn ptt_timings(
+    sample_count: usize,
+    sample_rate: u32,
+    lead_ms: u64,
+    tail_ms: u64,
+) -> (std::time::Duration, std::time::Duration) {
+    let lead = std::time::Duration::from_millis(lead_ms);
+    let duration_ms = (sample_count as f64 / sample_rate as f64 * 1000.0) as u64;
+    let tail = std::time::Duration::from_millis(duration_ms + tail_ms);
+    (lead, tail)
+}
+
+/// Key PTT, stream `samples` out through the resolved audio device, then
+/// unkey — the live-playback sequencing shared by `cmd_tx` and `cmd_tune`.
+#[cfg(feature = "cpal-backend")]
+#[allow(clippy::too_many_arguments)]
+fn transmit_live(
+    samples: &[f32],
+    sample_rate: u32,
+    device: Option<&str>,
+    ptt: &str,
+    rigctld_addr: &str,
+    ptt_lead_ms: u64,
+    ptt_tail_ms: u64,
+    verbosity: Verbosity,
+) -> Result<()> {
+    use coppa_audio::AudioSink;
+    use coppa_radio::PttState;
+
+    // Create PTT controller
+    let mut ptt_ctrl = build_ptt(ptt, rigctld_addr);
 
     // Create audio sink
     let mut sink = match device {
@@ -321,32 +382,32 @@ fn transmit_live(
     };
     sink.start()?;
 
+    let (lead_delay, tail_delay) =
+        ptt_timings(samples.len(), sample_rate, ptt_lead_ms, ptt_tail_ms);
+
     // Key PTT
     let _ = ptt_ctrl.set_ptt(PttState::Tx);
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::thread::sleep(lead_delay);
 
     // Write audio
     sink.write(samples)?;
 
     // Wait for audio to play out
-    let duration_ms = (samples.len() as f64 / sample_rate as f64 * 1000.0) as u64;
-    std::thread::sleep(std::time::Duration::from_millis(duration_ms + 200));
+    std::thread::sleep(tail_delay);
 
     // Unkey PTT
     let _ = ptt_ctrl.set_ptt(PttState::Rx);
     sink.stop()?;
 
     if verbosity != Verbosity::Quiet {
-        eprintln!(
-            "Transmitted {} samples ({:.2}s)",
-            samples.len(),
-            duration_ms as f64 / 1000.0
-        );
+        let duration_s = samples.len() as f64 / sample_rate as f64;
+        eprintln!("Transmitted {} samples ({:.2}s)", samples.len(), duration_s);
     }
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_tx(
     message: &str,
     output: Option<&str>,
@@ -354,6 +415,9 @@ fn cmd_tx(
     callsign: Option<&str>,
     device: Option<&str>,
     ptt: &str,
+    rigctld: &str,
+    ptt_lead_ms: u64,
+    ptt_tail_ms: u64,
     verbosity: Verbosity,
 ) -> Result<()> {
     let config = resolve_config(profile)?;
@@ -387,12 +451,24 @@ fn cmd_tx(
         None => {
             #[cfg(feature = "cpal-backend")]
             {
-                transmit_live(&samples, core.config().sample_rate, device, ptt, verbosity)?;
+                transmit_live(
+                    &samples,
+                    core.config().sample_rate,
+                    device,
+                    ptt,
+                    rigctld,
+                    ptt_lead_ms,
+                    ptt_tail_ms,
+                    verbosity,
+                )?;
             }
             #[cfg(not(feature = "cpal-backend"))]
             {
                 let _ = device;
                 let _ = ptt;
+                let _ = rigctld;
+                let _ = ptt_lead_ms;
+                let _ = ptt_tail_ms;
                 if verbosity != Verbosity::Quiet {
                     println!("Live audio output not available (compile with cpal-backend feature)");
                 }
@@ -407,6 +483,7 @@ fn cmd_tx(
 /// (or a single tone via `single`), key PTT, stream it out, then unkey —
 /// mirroring `cmd_tx`'s live-playback path. See `docs/OPERATING.md` for the
 /// calibration procedure this is meant to support.
+#[allow(clippy::too_many_arguments)]
 fn cmd_tune(
     seconds: f32,
     single: Option<f32>,
@@ -414,6 +491,9 @@ fn cmd_tune(
     profile: Option<&str>,
     device: Option<&str>,
     ptt: &str,
+    rigctld: &str,
+    ptt_lead_ms: u64,
+    ptt_tail_ms: u64,
     verbosity: Verbosity,
 ) -> Result<()> {
     let config = resolve_config(profile)?;
@@ -444,12 +524,24 @@ fn cmd_tune(
         None => {
             #[cfg(feature = "cpal-backend")]
             {
-                transmit_live(&samples, core.config().sample_rate, device, ptt, verbosity)?;
+                transmit_live(
+                    &samples,
+                    core.config().sample_rate,
+                    device,
+                    ptt,
+                    rigctld,
+                    ptt_lead_ms,
+                    ptt_tail_ms,
+                    verbosity,
+                )?;
             }
             #[cfg(not(feature = "cpal-backend"))]
             {
                 let _ = device;
                 let _ = ptt;
+                let _ = rigctld;
+                let _ = ptt_lead_ms;
+                let _ = ptt_tail_ms;
                 if verbosity != Verbosity::Quiet {
                     println!("Live audio output not available (compile with cpal-backend feature)");
                 }
@@ -773,6 +865,9 @@ mod tests {
             None,
             None,
             "none",
+            "127.0.0.1:4532",
+            50,
+            200,
             Verbosity::Normal,
         )
         .expect("tx to file should succeed");
@@ -795,6 +890,9 @@ mod tests {
             None,
             None,
             "none",
+            "127.0.0.1:4532",
+            50,
+            200,
             Verbosity::Normal,
         )
         .expect("tune to file should succeed");
@@ -817,6 +915,9 @@ mod tests {
             None,
             None,
             "none",
+            "127.0.0.1:4532",
+            50,
+            200,
             Verbosity::Quiet,
         )
         .expect("single-tone tune to file should succeed");
@@ -839,6 +940,9 @@ mod tests {
             Some("VK2ABC"),
             None,
             "none",
+            "127.0.0.1:4532",
+            50,
+            200,
             Verbosity::Verbose,
         )
         .expect("tx with callsign should succeed");
@@ -897,5 +1001,134 @@ mod tests {
     fn test_resolve_config_unknown() {
         let result = resolve_config(Some("NONEXISTENT"));
         assert!(result.is_err());
+    }
+
+    // ── Task 2 (Phase 4): --rigctld / --ptt-lead-ms / --ptt-tail-ms ──────
+
+    #[test]
+    fn test_cli_parses_tx_rigctld_and_ptt_timing_flags() {
+        let cli = Cli::parse_from([
+            "coppa",
+            "tx",
+            "hello",
+            "--rigctld",
+            "192.168.1.50:4532",
+            "--ptt-lead-ms",
+            "75",
+            "--ptt-tail-ms",
+            "500",
+        ]);
+        match cli.command {
+            Some(Commands::Tx {
+                rigctld,
+                ptt_lead_ms,
+                ptt_tail_ms,
+                ..
+            }) => {
+                assert_eq!(rigctld, "192.168.1.50:4532");
+                assert_eq!(ptt_lead_ms, 75);
+                assert_eq!(ptt_tail_ms, 500);
+            }
+            _ => panic!("expected Tx command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_tx_ptt_flags_default() {
+        let cli = Cli::parse_from(["coppa", "tx", "hello"]);
+        match cli.command {
+            Some(Commands::Tx {
+                rigctld,
+                ptt_lead_ms,
+                ptt_tail_ms,
+                ..
+            }) => {
+                assert_eq!(rigctld, "127.0.0.1:4532");
+                assert_eq!(ptt_lead_ms, 50);
+                assert_eq!(ptt_tail_ms, 200);
+            }
+            _ => panic!("expected Tx command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_tune_rigctld_and_ptt_timing_flags() {
+        let cli = Cli::parse_from([
+            "coppa",
+            "tune",
+            "--rigctld",
+            "10.0.0.5:4532",
+            "--ptt-lead-ms",
+            "10",
+            "--ptt-tail-ms",
+            "20",
+        ]);
+        match cli.command {
+            Some(Commands::Tune {
+                rigctld,
+                ptt_lead_ms,
+                ptt_tail_ms,
+                ..
+            }) => {
+                assert_eq!(rigctld, "10.0.0.5:4532");
+                assert_eq!(ptt_lead_ms, 10);
+                assert_eq!(ptt_tail_ms, 20);
+            }
+            _ => panic!("expected Tune command"),
+        }
+    }
+
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn test_ptt_timings_uses_configured_lead_and_tail() {
+        // 48000 samples at 48kHz = exactly 1s of audio.
+        let (lead, tail) = ptt_timings(48_000, 48_000, 1_000, 3_000);
+        assert_eq!(lead, std::time::Duration::from_millis(1_000));
+        assert_eq!(tail, std::time::Duration::from_millis(1_000 + 3_000));
+    }
+
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn test_ptt_timings_default_matches_old_hardcoded_values() {
+        // Guards against silently changing the pre-flag defaults (50ms
+        // lead-in, duration + 200ms tail) this function replaced.
+        let (lead, tail) = ptt_timings(24_000, 48_000, 50, 200);
+        assert_eq!(lead, std::time::Duration::from_millis(50));
+        assert_eq!(tail, std::time::Duration::from_millis(500 + 200));
+    }
+
+    /// "CLI flags reach the engine": `--rigctld` must actually be the address
+    /// `build_ptt` connects to, not a hardcoded one. A real loopback
+    /// `TcpListener` bound to an OS-assigned port stands in for rigctld --
+    /// if the configured address is threaded through correctly, the
+    /// listener observes a connection.
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn test_build_ptt_rigctld_uses_configured_address() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = listener.accept();
+            let _ = tx.send(result.is_ok());
+        });
+
+        let _ptt = build_ptt("rigctld", &addr);
+
+        let connected = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("listener should have observed a connection attempt");
+        assert!(
+            connected,
+            "rigctld PTT should have connected to the configured --rigctld address"
+        );
+    }
+
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn test_build_ptt_none_and_vox_do_not_touch_network() {
+        // Sanity check that non-rigctld methods don't try to connect anywhere.
+        let _ = build_ptt("none", "127.0.0.1:1");
+        let _ = build_ptt("vox", "127.0.0.1:1");
     }
 }

@@ -35,20 +35,129 @@ pub struct AudioConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct RadioConfig {
-    /// PTT method: "none", "vox", "serial", "rigctld".
+    /// PTT method/config string. Either a simple backend name --
+    /// `"none"`, `"vox"`, `"rigctld"` -- for backward compatibility, or an
+    /// extended `method:args` form for backends that need extra parameters:
+    /// `"serial:/dev/ttyUSB0:dtr"`, `"serial:/dev/ttyUSB0:rts"`,
+    /// `"gpio:17"`. See [`PttConfig::parse`].
     pub ptt_method: String,
     /// rigctld address (e.g., "127.0.0.1:4532").
     pub rigctld_address: String,
-    /// Serial port for PTT (e.g., "/dev/ttyUSB0").
-    pub serial_port: String,
-    /// Serial PTT line: "dtr" or "rts".
-    pub serial_line: String,
     /// Delay in ms after asserting PTT before transmitting audio.
     pub ptt_pre_delay_ms: u64,
     /// Delay in ms after audio ends before releasing PTT.
     pub ptt_tail_delay_ms: u64,
     /// Maximum TX duration in seconds before forced PTT unkey (safety).
     pub max_tx_duration_s: u64,
+}
+
+/// Which serial control line a `PttConfig::Serial` should drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PttSerialLine {
+    Dtr,
+    Rts,
+}
+
+/// Parsed form of [`RadioConfig::ptt_method`] -- which PTT backend to
+/// construct, and any backend-specific parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PttConfig {
+    /// No PTT control. Only reachable via an explicit `"none"` (or blank)
+    /// config string -- an unrecognized string is a parse error instead, so
+    /// a typo never silently falls back to no PTT.
+    None,
+    Vox,
+    Rigctld,
+    Serial {
+        port: String,
+        line: PttSerialLine,
+    },
+    Gpio {
+        pin: String,
+    },
+}
+
+impl PttConfig {
+    /// Parse a `ptt_method` config string.
+    ///
+    /// Backward-compatible with the pre-Phase-4 flat values (`"none"`,
+    /// `"vox"`, `"rigctld"`); `"serial"`/`"gpio"` require the extended
+    /// `method:args` syntax since they need extra parameters.
+    pub fn parse(s: &str) -> Result<Self, PttConfigError> {
+        let trimmed = s.trim();
+        let (method, rest) = match trimmed.split_once(':') {
+            Some((m, r)) => (m, Some(r)),
+            None => (trimmed, None),
+        };
+
+        match (method.to_ascii_lowercase().as_str(), rest) {
+            ("" | "none", None) => Ok(PttConfig::None),
+            ("vox", None) => Ok(PttConfig::Vox),
+            ("rigctld", None) => Ok(PttConfig::Rigctld),
+            ("serial", Some(rest)) => {
+                let (port, line) = rest.rsplit_once(':').ok_or_else(|| {
+                    PttConfigError(format!(
+                        "serial PTT config {s:?} is missing the line; expected \
+                         \"serial:<port>:<dtr|rts>\""
+                    ))
+                })?;
+                let line = match line.to_ascii_lowercase().as_str() {
+                    "dtr" => PttSerialLine::Dtr,
+                    "rts" => PttSerialLine::Rts,
+                    other => {
+                        return Err(PttConfigError(format!(
+                        "unknown serial PTT line {other:?} in {s:?}; expected \"dtr\" or \"rts\""
+                    )))
+                    }
+                };
+                if port.is_empty() {
+                    return Err(PttConfigError(format!(
+                        "serial PTT config {s:?} is missing the port; expected \
+                         \"serial:<port>:<dtr|rts>\""
+                    )));
+                }
+                Ok(PttConfig::Serial {
+                    port: port.to_string(),
+                    line,
+                })
+            }
+            ("gpio", Some(pin)) => {
+                if pin.is_empty() {
+                    return Err(PttConfigError(format!(
+                        "gpio PTT config {s:?} is missing the pin; expected \"gpio:<pin>\""
+                    )));
+                }
+                Ok(PttConfig::Gpio {
+                    pin: pin.to_string(),
+                })
+            }
+            _ => Err(PttConfigError(format!(
+                "unknown PTT method {s:?}; expected one of \"none\", \"vox\", \"rigctld\", \
+                 \"serial:<port>:<dtr|rts>\", \"gpio:<pin>\""
+            ))),
+        }
+    }
+}
+
+/// A `ptt_method` config string failed to parse. `Display`s a
+/// human-readable, actionable message suitable for a hard daemon-startup
+/// error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PttConfigError(String);
+
+impl std::fmt::Display for PttConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for PttConfigError {}
+
+impl RadioConfig {
+    /// Parse [`Self::ptt_method`] into a [`PttConfig`].
+    pub fn ptt_config(&self) -> Result<PttConfig, PttConfigError> {
+        PttConfig::parse(&self.ptt_method)
+    }
 }
 
 /// Host interface configuration section.
@@ -115,8 +224,6 @@ impl Default for RadioConfig {
         Self {
             ptt_method: "none".to_string(),
             rigctld_address: "127.0.0.1:4532".to_string(),
-            serial_port: String::new(),
-            serial_line: "dtr".to_string(),
             ptt_pre_delay_ms: 50,
             ptt_tail_delay_ms: 200,
             max_tx_duration_s: 30,
@@ -224,6 +331,92 @@ callsign = "VK2ABC"
         let path = std::env::temp_dir().join("nonexistent_coppa_config.toml");
         let config = DaemonConfig::load_or_default(path.to_str().unwrap()).unwrap();
         assert_eq!(config.audio.sample_rate, 48_000);
+    }
+
+    // ── PttConfig::parse ──────────────────────────────────────────────
+
+    #[test]
+    fn test_ptt_parse_none() {
+        assert_eq!(PttConfig::parse("none").unwrap(), PttConfig::None);
+        assert_eq!(PttConfig::parse("").unwrap(), PttConfig::None);
+        assert_eq!(PttConfig::parse("  none  ").unwrap(), PttConfig::None);
+    }
+
+    #[test]
+    fn test_ptt_parse_vox_and_rigctld_backward_compatible() {
+        assert_eq!(PttConfig::parse("vox").unwrap(), PttConfig::Vox);
+        assert_eq!(PttConfig::parse("rigctld").unwrap(), PttConfig::Rigctld);
+    }
+
+    #[test]
+    fn test_ptt_parse_serial_dtr() {
+        assert_eq!(
+            PttConfig::parse("serial:/dev/ttyUSB0:dtr").unwrap(),
+            PttConfig::Serial {
+                port: "/dev/ttyUSB0".to_string(),
+                line: PttSerialLine::Dtr,
+            }
+        );
+    }
+
+    #[test]
+    fn test_ptt_parse_serial_rts_case_insensitive() {
+        assert_eq!(
+            PttConfig::parse("serial:/dev/ttyUSB0:RTS").unwrap(),
+            PttConfig::Serial {
+                port: "/dev/ttyUSB0".to_string(),
+                line: PttSerialLine::Rts,
+            }
+        );
+    }
+
+    #[test]
+    fn test_ptt_parse_serial_missing_line_errors() {
+        let err = PttConfig::parse("serial:/dev/ttyUSB0").unwrap_err();
+        assert!(err.to_string().contains("serial:<port>:<dtr|rts>"));
+    }
+
+    #[test]
+    fn test_ptt_parse_serial_unknown_line_errors() {
+        let err = PttConfig::parse("serial:/dev/ttyUSB0:bogus").unwrap_err();
+        assert!(err.to_string().contains("bogus"));
+    }
+
+    #[test]
+    fn test_ptt_parse_gpio_pin() {
+        assert_eq!(
+            PttConfig::parse("gpio:17").unwrap(),
+            PttConfig::Gpio {
+                pin: "17".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_ptt_parse_gpio_missing_pin_errors() {
+        let err = PttConfig::parse("gpio").unwrap_err();
+        assert!(err.to_string().contains("gpio:<pin>"));
+    }
+
+    #[test]
+    fn test_ptt_parse_unknown_method_errors() {
+        let err = PttConfig::parse("carrier-pigeon").unwrap_err();
+        assert!(err.to_string().contains("carrier-pigeon"));
+        assert!(err.to_string().contains("none"));
+    }
+
+    #[test]
+    fn test_radio_config_ptt_config_helper() {
+        let radio = RadioConfig {
+            ptt_method: "gpio:4".to_string(),
+            ..RadioConfig::default()
+        };
+        assert_eq!(
+            radio.ptt_config().unwrap(),
+            PttConfig::Gpio {
+                pin: "4".to_string()
+            }
+        );
     }
 
     #[test]

@@ -114,9 +114,12 @@ pub struct EventLoop {
 
 impl EventLoop {
     /// Create a new event loop with the given configuration.
-    pub fn new(config: DaemonConfig) -> Self {
+    ///
+    /// Fails if `[radio] ptt_method` doesn't parse or names an
+    /// unrecognized/unbuilt PTT backend -- see `create_ptt`.
+    pub fn new(config: DaemonConfig) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::channel(256);
-        let ptt = Self::create_ptt(&config);
+        let ptt = Self::create_ptt(&config)?;
 
         // Create engine from profile; all profiles use 48kHz internally
         let engine =
@@ -142,7 +145,7 @@ impl EventLoop {
 
         let busy_gate = BusyGate::new(config.audio.sample_rate as f32);
 
-        Self {
+        Ok(Self {
             config,
             engine,
             event_rx,
@@ -173,38 +176,88 @@ impl EventLoop {
             tx_frame_count: 0,
             max_frames_per_turn: 4,
             turnaround_ms: 500,
-        }
+        })
     }
 
     /// Create the appropriate PTT controller based on config.
-    fn create_ptt(config: &DaemonConfig) -> Box<dyn PttControl> {
-        match config.radio.ptt_method.as_str() {
-            "vox" => Box::new(coppa_radio::VoxPtt::new()),
-            "rigctld" => {
+    ///
+    /// Fails loudly (hard startup error) on an unrecognized/unimplemented
+    /// `[radio] ptt_method` -- `NullPtt` is only reachable via an explicit
+    /// `ptt_method = "none"` (or blank), never as a silent fallback for a
+    /// typo'd or unbuilt backend. The one deliberate exception is
+    /// `rigctld`'s *runtime connection* failure (address configured
+    /// correctly, but nothing answering it right now): that already-existing
+    /// behavior -- warn and fall back to `NullPtt` -- is unchanged, since
+    /// it's a live/transient condition rather than an unrecognized config.
+    fn create_ptt(config: &DaemonConfig) -> Result<Box<dyn PttControl>> {
+        let parsed = config
+            .radio
+            .ptt_config()
+            .map_err(|e| anyhow::anyhow!("invalid [radio] ptt_method: {e}"))?;
+
+        match parsed {
+            crate::config::PttConfig::None => Ok(Box::new(NullPtt::new())),
+            crate::config::PttConfig::Vox => Ok(Box::new(coppa_radio::VoxPtt::new())),
+            crate::config::PttConfig::Rigctld => {
                 match coppa_radio::rigctld::RigctldClient::connect(&config.radio.rigctld_address) {
-                    Ok(client) => Box::new(client),
+                    Ok(client) => Ok(Box::new(client)),
                     Err(e) => {
                         tracing::warn!(
                             address = %config.radio.rigctld_address,
                             error = %e,
                             "Failed to connect to rigctld; falling back to no PTT"
                         );
-                        Box::new(NullPtt::new())
+                        Ok(Box::new(NullPtt::new()))
                     }
                 }
             }
-            // E4: Serial and GPIO PTT are not yet implemented
-            "serial" => {
-                tracing::warn!(
-                    "PTT method 'serial' is not yet implemented; falling back to no PTT"
-                );
-                Box::new(NullPtt::new())
+            crate::config::PttConfig::Serial { port, line } => {
+                #[cfg(feature = "serial-ptt")]
+                {
+                    let serial_line = match line {
+                        crate::config::PttSerialLine::Dtr => {
+                            coppa_radio::ptt_serial::SerialPttLine::Dtr
+                        }
+                        crate::config::PttSerialLine::Rts => {
+                            coppa_radio::ptt_serial::SerialPttLine::Rts
+                        }
+                    };
+                    let ptt = coppa_radio::ptt_serial::SerialPtt::open(&port, serial_line, false)
+                        .map_err(|e| {
+                        anyhow::anyhow!("failed to open serial PTT port {port}: {e}")
+                    })?;
+                    Ok(Box::new(ptt))
+                }
+                #[cfg(not(feature = "serial-ptt"))]
+                {
+                    let _ = (port, line);
+                    Err(anyhow::anyhow!(
+                        "PTT method 'serial' requires coppad to be built with \
+                         --features serial-ptt"
+                    ))
+                }
             }
-            "gpio" => {
-                tracing::warn!("PTT method 'gpio' is not yet implemented; falling back to no PTT");
-                Box::new(NullPtt::new())
+            crate::config::PttConfig::Gpio { pin } => {
+                #[cfg(all(feature = "gpio-ptt", target_os = "linux"))]
+                {
+                    let pin_num: u32 = pin.parse().map_err(|_| {
+                        anyhow::anyhow!(
+                            "invalid GPIO pin {pin:?}: expected a plain pin number, e.g. \"gpio:17\""
+                        )
+                    })?;
+                    let ptt = coppa_radio::ptt_gpio::GpioPtt::open(pin_num, false)
+                        .map_err(|e| anyhow::anyhow!("failed to open GPIO PTT pin {pin}: {e}"))?;
+                    Ok(Box::new(ptt))
+                }
+                #[cfg(not(all(feature = "gpio-ptt", target_os = "linux")))]
+                {
+                    let _ = pin;
+                    Err(anyhow::anyhow!(
+                        "PTT method 'gpio' requires coppad to be built with \
+                         --features gpio-ptt, on Linux"
+                    ))
+                }
             }
-            _ => Box::new(NullPtt::new()),
         }
     }
 
@@ -1094,10 +1147,60 @@ impl EventLoop {
 mod tests {
     use super::*;
 
+    // ── Task 2 (Phase 4): explicit PTT config, no silent NullPtt ─────────
+
+    #[test]
+    fn test_create_ptt_explicit_none_succeeds() {
+        let mut config = DaemonConfig::default();
+        config.radio.ptt_method = "none".to_string();
+        assert!(EventLoop::create_ptt(&config).is_ok());
+    }
+
+    #[test]
+    fn test_create_ptt_unknown_method_is_hard_error() {
+        let mut config = DaemonConfig::default();
+        config.radio.ptt_method = "carrier-pigeon".to_string();
+        let err = EventLoop::create_ptt(&config)
+            .err()
+            .expect("unrecognized PTT method must be a hard error, not a silent NullPtt");
+        assert!(err.to_string().contains("carrier-pigeon"));
+    }
+
+    #[test]
+    fn test_create_ptt_unimplemented_serial_without_feature_is_hard_error() {
+        // Without the `serial-ptt` feature compiled in, a well-formed
+        // "serial:..." config must still fail loudly, not fall back silently.
+        let mut config = DaemonConfig::default();
+        config.radio.ptt_method = "serial:/dev/ttyUSB0:dtr".to_string();
+        let result = EventLoop::create_ptt(&config);
+        #[cfg(not(feature = "serial-ptt"))]
+        assert!(
+            result.is_err(),
+            "serial PTT without the serial-ptt feature must be a hard error"
+        );
+        #[cfg(feature = "serial-ptt")]
+        {
+            // With the feature enabled, parsing succeeds but opening the
+            // (nonexistent, in this test environment) port still fails --
+            // still an error, just for a different, real-hardware reason.
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn test_event_loop_new_propagates_ptt_config_error() {
+        let mut config = DaemonConfig::default();
+        config.radio.ptt_method = "not-a-real-method".to_string();
+        assert!(
+            EventLoop::new(config).is_err(),
+            "EventLoop::new should fail loudly on an unrecognized ptt_method"
+        );
+    }
+
     #[tokio::test]
     async fn test_event_loop_shutdown() {
         let config = DaemonConfig::default();
-        let mut event_loop = EventLoop::new(config);
+        let mut event_loop = EventLoop::new(config).unwrap();
         let tx = event_loop.event_sender();
 
         // Send shutdown immediately
@@ -1110,7 +1213,7 @@ mod tests {
     #[tokio::test]
     async fn test_event_loop_host_event() {
         let config = DaemonConfig::default();
-        let mut event_loop = EventLoop::new(config);
+        let mut event_loop = EventLoop::new(config).unwrap();
         let tx = event_loop.event_sender();
 
         tx.send(DaemonEvent::Host(HostEvent::Connected { client_id: 1 }))
@@ -1124,7 +1227,7 @@ mod tests {
     #[tokio::test]
     async fn test_event_loop_ptt_change() {
         let config = DaemonConfig::default();
-        let mut event_loop = EventLoop::new(config);
+        let mut event_loop = EventLoop::new(config).unwrap();
         let tx = event_loop.event_sender();
 
         tx.send(DaemonEvent::PttChange(true)).await.unwrap();
@@ -1137,7 +1240,7 @@ mod tests {
     #[tokio::test]
     async fn test_audio_in_decode() {
         let config = DaemonConfig::default();
-        let mut event_loop = EventLoop::new(config);
+        let mut event_loop = EventLoop::new(config).unwrap();
         let tx = event_loop.event_sender();
 
         // Send silence (won't decode, but should not crash)
@@ -1151,7 +1254,7 @@ mod tests {
     #[tokio::test]
     async fn test_audio_out_event() {
         let config = DaemonConfig::default();
-        let mut event_loop = EventLoop::new(config);
+        let mut event_loop = EventLoop::new(config).unwrap();
         let tx = event_loop.event_sender();
 
         let samples = vec![0.5f32; 100];
@@ -1164,7 +1267,7 @@ mod tests {
     #[tokio::test]
     async fn test_audio_out_with_ring_buffer() {
         let config = DaemonConfig::default();
-        let mut event_loop = EventLoop::new(config);
+        let mut event_loop = EventLoop::new(config).unwrap();
         let tx = event_loop.event_sender();
 
         // Wire up a ring buffer
@@ -1187,7 +1290,7 @@ mod tests {
     #[tokio::test]
     async fn test_audio_in_with_ring_buffer() {
         let config = DaemonConfig::default();
-        let mut event_loop = EventLoop::new(config);
+        let mut event_loop = EventLoop::new(config).unwrap();
         let tx = event_loop.event_sender();
 
         // Wire up a ring buffer for input
@@ -1206,7 +1309,7 @@ mod tests {
     #[tokio::test]
     async fn test_host_event_data_received() {
         let config = DaemonConfig::default();
-        let mut event_loop = EventLoop::new(config);
+        let mut event_loop = EventLoop::new(config).unwrap();
         let tx = event_loop.event_sender();
 
         tx.send(DaemonEvent::Host(HostEvent::DataReceived {
@@ -1223,7 +1326,7 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_events_sequence() {
         let config = DaemonConfig::default();
-        let mut event_loop = EventLoop::new(config);
+        let mut event_loop = EventLoop::new(config).unwrap();
         let tx = event_loop.event_sender();
 
         tx.send(DaemonEvent::Host(HostEvent::Connected { client_id: 1 }))
@@ -1244,7 +1347,7 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown_leaves_not_running() {
         let config = DaemonConfig::default();
-        let mut event_loop = EventLoop::new(config);
+        let mut event_loop = EventLoop::new(config).unwrap();
         let tx = event_loop.event_sender();
 
         // Send shutdown and verify the loop exits with running=false
@@ -1257,7 +1360,7 @@ mod tests {
     #[tokio::test]
     async fn test_ptt_uses_null_by_default() {
         let config = DaemonConfig::default();
-        let mut event_loop = EventLoop::new(config);
+        let mut event_loop = EventLoop::new(config).unwrap();
         let tx = event_loop.event_sender();
 
         // PTT change should not error with NullPtt
@@ -1271,7 +1374,7 @@ mod tests {
     #[tokio::test]
     async fn test_connect_requires_callsign() {
         let config = DaemonConfig::default(); // callsign is empty
-        let mut event_loop = EventLoop::new(config);
+        let mut event_loop = EventLoop::new(config).unwrap();
         let (resp_tx, mut resp_rx) = mpsc::channel(16);
         event_loop.set_response_tx(resp_tx);
         let tx = event_loop.event_sender();
@@ -1301,7 +1404,7 @@ mod tests {
     async fn test_connect_with_callsign_creates_session() {
         let mut config = DaemonConfig::default();
         config.engine.callsign = "VK3ABC".to_string();
-        let mut event_loop = EventLoop::new(config);
+        let mut event_loop = EventLoop::new(config).unwrap();
         let (resp_tx, mut resp_rx) = mpsc::channel(16);
         event_loop.set_response_tx(resp_tx);
         let tx = event_loop.event_sender();
@@ -1341,7 +1444,7 @@ mod tests {
     async fn test_disconnect_without_session() {
         let mut config = DaemonConfig::default();
         config.engine.callsign = "VK3ABC".to_string();
-        let mut event_loop = EventLoop::new(config);
+        let mut event_loop = EventLoop::new(config).unwrap();
         let tx = event_loop.event_sender();
 
         // Should not panic when disconnecting with no active session
@@ -1358,7 +1461,7 @@ mod tests {
     #[tokio::test]
     async fn test_listen_on_off() {
         let config = DaemonConfig::default();
-        let mut event_loop = EventLoop::new(config);
+        let mut event_loop = EventLoop::new(config).unwrap();
         let tx = event_loop.event_sender();
 
         assert!(!event_loop.listening);
@@ -1378,7 +1481,7 @@ mod tests {
     #[tokio::test]
     async fn test_listen_off() {
         let config = DaemonConfig::default();
-        let mut event_loop = EventLoop::new(config);
+        let mut event_loop = EventLoop::new(config).unwrap();
         event_loop.listening = true;
         let tx = event_loop.event_sender();
 
@@ -1518,7 +1621,7 @@ mod tests {
         #[tokio::test]
         async fn test_snr_telemetry_emitted_on_decoded_frame() {
             let config = DaemonConfig::default();
-            let mut event_loop = EventLoop::new(config);
+            let mut event_loop = EventLoop::new(config).unwrap();
             let (mut reader, _write_half) =
                 connect_mock_vara_client(&mut event_loop, 19400, 19401).await;
 
@@ -1547,7 +1650,7 @@ mod tests {
         #[tokio::test]
         async fn test_ptt_telemetry_brackets_transmission() {
             let config = fast_ptt_config();
-            let mut event_loop = EventLoop::new(config);
+            let mut event_loop = EventLoop::new(config).unwrap();
             let (mut reader, _write_half) =
                 connect_mock_vara_client(&mut event_loop, 19410, 19411).await;
             let tx = event_loop.event_sender();
@@ -1598,7 +1701,7 @@ mod tests {
         #[tokio::test]
         async fn test_tune_command_keys_ptt_streams_tone_and_unkeys() {
             let config = fast_ptt_config();
-            let mut event_loop = EventLoop::new(config);
+            let mut event_loop = EventLoop::new(config).unwrap();
             let (audio_tx, mut audio_rx) = coppa_audio::audio_ring(10_000_000);
             event_loop.set_audio_out(audio_tx);
             let (mut reader, _write_half) =
@@ -1668,7 +1771,7 @@ mod tests {
         #[tokio::test]
         async fn test_buffer_telemetry_progression_3_to_0() {
             let config = fast_ptt_config();
-            let mut event_loop = EventLoop::new(config);
+            let mut event_loop = EventLoop::new(config).unwrap();
             let (mut reader, _write_half) =
                 connect_mock_vara_client(&mut event_loop, 19420, 19421).await;
 
@@ -1703,7 +1806,7 @@ mod tests {
         #[tokio::test]
         async fn test_busy_telemetry_on_then_off_from_noise_burst() {
             let config = DaemonConfig::default();
-            let mut event_loop = EventLoop::new(config);
+            let mut event_loop = EventLoop::new(config).unwrap();
             let (mut reader, _write_half) =
                 connect_mock_vara_client(&mut event_loop, 19430, 19431).await;
 

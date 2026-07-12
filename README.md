@@ -74,7 +74,7 @@ coppa config
 | `coppa-protocol` | Framing, FEC (convolutional + LDPC), ARQ, compression, session management |
 | `coppa-channel` | Channel models for testing: AWGN, sinusoidal fading, frequency offset |
 | `coppa-audio` | Audio backends: CPAL real-time I/O, WAV file read/write |
-| `coppa-radio` | Radio control: rigctld CAT, serial PTT (stub), GPIO PTT (stub) |
+| `coppa-radio` | Radio control: rigctld CAT, serial PTT (DTR/RTS, `serial-ptt` feature), GPIO PTT (Linux sysfs, `gpio-ptt` feature) |
 | `coppa-ml` | Channel prediction: EWMA predictor, MCS selection, spectrum sensing |
 | `coppa-engine` | Core engine orchestrating modem, FEC, and framing pipelines |
 | `coppa-host` | Host interfaces: VARA-style TCP control server, WebSocket JSON API |
