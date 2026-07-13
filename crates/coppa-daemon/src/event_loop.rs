@@ -1338,23 +1338,53 @@ impl EventLoop {
             return;
         }
         let now = Instant::now();
-        // Collect retransmit data first to avoid borrow conflict
-        let mut retransmit_pdus: Vec<Vec<u8>> = Vec::new();
+        // Collect retransmit data first to avoid borrow conflict. Sequence
+        // numbers are threaded alongside the encoded PDU bytes so the second
+        // loop (after the `arq_tx` borrow ends) can call
+        // `ArqTx::mark_retransmitted` for the segment it actually just sent --
+        // `get_retransmits`'s documented contract requires this (see its doc):
+        // without it, `last_sent`/`transmit_count` never advance, so the same
+        // segment reads as "still expired" on every subsequent 500ms poll
+        // (an unbounded retransmit storm) and never reaches
+        // `config.max_retransmit` to give up.
+        let mut retransmit_pdus: Vec<(u8, Vec<u8>)> = Vec::new();
         if let Some(ref mut arq_tx) = self.arq_tx {
             let retransmit_seqs = arq_tx.get_retransmits(now);
             for seq in retransmit_seqs {
                 if let Some(data) = arq_tx.get_segment_data(seq) {
                     let pdu =
                         TransportPdu::new_reliable(self.arq_session_id, seq, 0, data.to_vec());
-                    retransmit_pdus.push(pdu.to_bytes());
+                    retransmit_pdus.push((seq, pdu.to_bytes()));
                 }
             }
         }
         // Now encode and transmit (no more borrow on arq_tx)
-        for pdu_bytes in retransmit_pdus {
+        for (seq, pdu_bytes) in retransmit_pdus {
             match self.engine.encode_bytes(&pdu_bytes) {
                 Ok(samples) => {
                     self.transmit_samples(&samples).await;
+                    // Only mark a segment retransmitted once its bytes were
+                    // actually sent -- an encode failure below means nothing
+                    // went out over the air, so the segment must still read
+                    // as due for retry on the next poll rather than have its
+                    // `last_sent`/`transmit_count` bookkeeping advance for a
+                    // transmission that never happened. Timestamp freshly
+                    // *after* `transmit_samples` returns (rather than reusing
+                    // the top-of-function `now`), since `transmit_samples`
+                    // can itself await for a while (busy-channel courtesy
+                    // backoff up to ~2s -- see its doc) before the audio
+                    // actually goes out; using a stale pre-wait timestamp
+                    // would understate `last_sent` and make the next RTO
+                    // check fire early.
+                    if let Some(ref mut arq_tx) = self.arq_tx {
+                        if let Err(e) = arq_tx.mark_retransmitted(seq, Instant::now()) {
+                            tracing::warn!(
+                                seq,
+                                error = %e,
+                                "Failed to mark ARQ segment retransmitted"
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "ARQ retransmit encode failed");
@@ -2215,17 +2245,17 @@ mod tests {
         /// than driving them through a spawned `run()` loop and its real
         /// 500ms `retransmit_poll` timer (contrast
         /// `test_ptt_telemetry_brackets_transmission`, which does use a real
-        /// `run()` loop for a *single* host-driven TX): `check_arq_retransmits`
-        /// doesn't call `ArqTx::mark_retransmitted` after retransmitting (a
-        /// real, separate, pre-existing gap -- out of scope for this fix,
-        /// noted in this task's report), so the same segment reads as
-        /// "still expired" on every subsequent tick, and a `run()`-driven
+        /// `run()` loop for a *single* host-driven TX): a `run()`-driven
         /// version of this test was observed to be genuinely flaky under
         /// parallel test-suite load (multiple overlapping PTT ON/OFF pairs
         /// racing before the first release event could be dispatched).
         /// Calling both methods directly, one shot, sidesteps that
         /// independently-flaky timing entirely while still proving the one
-        /// thing this test exists to prove.
+        /// thing this test exists to prove. (`check_arq_retransmits` now
+        /// does call `ArqTx::mark_retransmitted` after each retransmit --
+        /// see `test_arq_retransmit_marks_retransmitted_and_caps` below for
+        /// that contract's own regression coverage -- but this test still
+        /// prefers the direct-call pattern for the flakiness reason above.)
         #[tokio::test]
         async fn test_arq_retransmit_asserts_ptt() {
             let mut config = fast_ptt_config();
@@ -2266,6 +2296,109 @@ mod tests {
             event_loop.handle_ptt_change(false).await;
             let off_line = read_line(&mut reader).await;
             assert_eq!(off_line.trim_end(), "PTT OFF");
+        }
+
+        /// Regression test for the `get_retransmits`/`mark_retransmitted`
+        /// contract bug: `check_arq_retransmits` used to never call
+        /// `ArqTx::mark_retransmitted` after actually retransmitting a
+        /// segment, so `last_sent` stayed frozen at the segment's original
+        /// send time forever (an unbounded retransmit storm -- the same
+        /// expired segment retransmitted on every single poll) and
+        /// `transmit_count` never advanced (so `max_retransmit`'s bounded
+        /// give-up never triggered either). See `crates/coppa-protocol/src/arq.rs`'s
+        /// `ArqTx::get_retransmits` doc for the contract.
+        ///
+        /// Uses a small, custom `ArqConfig` (tiny `initial_rto`, small
+        /// `max_retransmit`) swapped directly into `event_loop.arq_tx` --
+        /// the same "reach into the private field directly" technique
+        /// `test_arq_retransmit_asserts_ptt` uses for seeding a segment --
+        /// so the whole test runs in milliseconds of real wall-clock time
+        /// rather than waiting out the daemon's real 5s default RTO five
+        /// times over. Calls `check_arq_retransmits` directly (not via a
+        /// spawned `run()` loop), for the same flakiness reason documented
+        /// on `test_arq_retransmit_asserts_ptt`.
+        #[tokio::test]
+        async fn test_arq_retransmit_marks_retransmitted_and_caps() {
+            let mut config = fast_ptt_config();
+            config.engine.arq_enabled = true;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19418, 19419).await;
+
+            // Small max_retransmit(2) and a short initial_rto(20ms) so the
+            // whole round trip (seed -> expire -> retransmit -> re-expire ->
+            // retransmit -> exceed cap) fits in well under a second of real
+            // time instead of the crate default 5s RTO x 5 attempts.
+            let arq_config = ArqConfig::new(8, 2, Duration::from_millis(20))
+                .expect("window_size=8 is within 1..=MAX_WINDOW_SIZE");
+            let mut arq_tx = ArqTx::new(arq_config);
+            let send_time = Instant::now() - Duration::from_millis(100);
+            arq_tx
+                .send(b"stuck segment".to_vec(), send_time)
+                .expect("a fresh ARQ window should have room for one segment");
+            event_loop.arq_tx = Some(arq_tx);
+
+            // Round 1: the segment's RTO (20ms) has already elapsed relative
+            // to `send_time` (100ms ago), so this retransmits it.
+            event_loop.check_arq_retransmits().await;
+            assert_eq!(
+                event_loop.arq_tx.as_ref().unwrap().transmit_count(0),
+                Some(2),
+                "check_arq_retransmits should call mark_retransmitted, \
+                 advancing transmit_count from 1 (send) to 2"
+            );
+
+            // Immediately calling again (no time elapsed since the just-updated
+            // `last_sent`) must NOT retransmit the same segment again -- this
+            // is the core of the bug: before the fix, `last_sent` was frozen
+            // at `send_time`, so this second call would retransmit
+            // unconditionally on every poll regardless of the real RTO.
+            event_loop.check_arq_retransmits().await;
+            assert_eq!(
+                event_loop.arq_tx.as_ref().unwrap().transmit_count(0),
+                Some(2),
+                "a segment retransmitted moments ago (well inside its RTO) \
+                 must not be retransmitted again immediately"
+            );
+            assert!(
+                !event_loop.arq_tx.as_ref().unwrap().is_failed(0),
+                "transmit_count(2) should not yet exceed max_retransmit(2)"
+            );
+
+            // Wait out the 20ms RTO for real, then retransmit again -- this
+            // is the second (and, per max_retransmit=2, last allowed) retry.
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            event_loop.check_arq_retransmits().await;
+            assert_eq!(
+                event_loop.arq_tx.as_ref().unwrap().transmit_count(0),
+                Some(3),
+                "a second real RTO expiry should retransmit again, advancing \
+                 transmit_count to 3"
+            );
+
+            // A third RTO expiry must NOT retransmit again: transmit_count(3)
+            // already exceeds max_retransmit(2), so `get_retransmits` excludes
+            // it and the segment reads as given-up (`is_failed`) -- proving
+            // the bounded-retry mechanism this bug also broke now actually
+            // triggers.
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            event_loop.check_arq_retransmits().await;
+            assert_eq!(
+                event_loop.arq_tx.as_ref().unwrap().transmit_count(0),
+                Some(3),
+                "a segment already past max_retransmit must not be \
+                 retransmitted again"
+            );
+            assert!(
+                event_loop.arq_tx.as_ref().unwrap().is_failed(0),
+                "transmit_count(3) > max_retransmit(2) should read as failed/given-up"
+            );
+
+            // Drain whatever PTT telemetry accumulated so the mock client's
+            // read buffer doesn't matter for this test's assertions -- unlike
+            // `test_arq_retransmit_asserts_ptt`, this test cares about `ArqTx`
+            // bookkeeping, not the PTT bracket itself (already covered there).
+            let _ = read_available_lines(&mut reader).await;
         }
 
         /// Same regression as `test_arq_retransmit_asserts_ptt`, for the
