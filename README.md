@@ -88,6 +88,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full system design, TX/RX pipelin
 
 See [PLAN-hardening.md](PLAN-hardening.md) for known issues and the hardening roadmap.
 
+See [docs/SPEC.md](docs/SPEC.md) for the normative waveform/FEC/protocol conformance specification — the reference for building an independent, interoperable implementation.
+
+See [docs/OPERATING.md](docs/OPERATING.md) for field-operation guidance, including TX level calibration (`coppa tune`).
+
 ## License
 
 Licensed under either of
