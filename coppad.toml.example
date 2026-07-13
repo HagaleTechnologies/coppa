@@ -14,14 +14,16 @@ input_device = ""
 output_device = ""
 
 [radio]
-# PTT method: "none", "vox", "serial", or "rigctld"
+# PTT method: "none", "vox", "rigctld", "serial:<port>:<dtr|rts>", or
+# "gpio:<pin>". A bare "serial" or "gpio" (missing the required arguments)
+# is a startup ERROR, not a silent fallback to no PTT -- see the daemon's
+# own hard-error-on-unrecognized-PTT-config design.
 ptt_method = "none"
+# Example serial PTT via DTR: ptt_method = "serial:/dev/ttyUSB0:dtr"
+# Example serial PTT via RTS: ptt_method = "serial:/dev/ttyUSB0:rts"
+# Example Linux sysfs GPIO PTT: ptt_method = "gpio:17"
 # rigctld TCP address (hamlib)
 rigctld_address = "127.0.0.1:4532"
-# Serial port for serial PTT (e.g. "/dev/ttyUSB0")
-serial_port = ""
-# Serial line for PTT: "dtr" or "rts"
-serial_line = "dtr"
 # Delay in ms after keying PTT before sending audio
 ptt_pre_delay_ms = 50
 # Delay in ms after audio ends before unkeying PTT
