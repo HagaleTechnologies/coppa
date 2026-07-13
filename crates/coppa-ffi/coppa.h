@@ -9,9 +9,18 @@
 #include <stdlib.h>
 
 /**
- * Opaque handle to a Coppa engine instance.
+ * Opaque handle to a Coppa engine instance (`coppa_engine_t` in the
+ * generated C header — see `cbindgen.toml`'s `[export.rename]`).
+ *
+ * Shared by both the v1 text/batch API ([`coppa_engine_create`],
+ * [`coppa_encode`], [`coppa_decode`]) and the v2 binary/config/event API
+ * (Phase 4 Task 6: [`coppa_engine_new_with`], [`coppa_encode_bytes`],
+ * [`coppa_engine_feed_samples`], [`coppa_next_frame`]). `frame_queue` and
+ * `next_seq` exist only for the v2 event-style streaming API — v1
+ * functions never touch them, so extending this struct changes no v1
+ * signature or behavior.
  */
-typedef struct CoppaHandle CoppaHandle;
+typedef struct coppa_engine_t coppa_engine_t;
 
 /**
  * Opaque handle to a streaming decode session.
@@ -22,8 +31,81 @@ typedef struct CoppaHandle CoppaHandle;
  * rescanning is needed here, since the receiver never re-examines samples it's
  * already consumed and bounds its own memory (`2 * max_frame_samples`; see
  * `coppa_protocol::modem::streaming`).
+ *
+ * **Deprecated since FFI v2 (Phase 4 Task 6):** kept, unchanged, as a
+ * deprecated wrapper for one release — see [`coppa_start_stream`]'s doc.
+ * New code should use [`CoppaHandle`] (`coppa_engine_t`) with
+ * [`coppa_engine_feed_samples`]/[`coppa_next_frame`] instead.
  */
 typedef struct CoppaStreamHandle CoppaStreamHandle;
+
+/**
+ * C-compatible engine configuration for [`coppa_engine_new_with`]
+ * (`coppa_config_t` in the generated header).
+ *
+ * # Field semantics
+ *
+ * - `sample_rate`: sample rate in Hz. `0` means "use the resolved
+ *   profile's/default sample rate" (every shipped profile is 48000 Hz
+ *   today — see `coppa_engine::profiles`). `0` is never itself a valid
+ *   sample rate, so it unambiguously means "unset" here.
+ * - `profile`: optional pointer to a null-terminated profile name (e.g.
+ *   `"HF_ROBUST"`), resolved case-insensitively via
+ *   `coppa_engine::profiles::get_profile` — the same resolution
+ *   `coppa-cli`'s own `resolve_config` uses. Pass null or an empty string
+ *   to start from `EngineConfig::default()` instead. An unrecognized
+ *   non-empty profile name is a config-rejection error (see
+ *   [`coppa_engine_new_with`]'s return value).
+ * - `speed_level`: wire speed-level override (1-10; 8 is reserved),
+ *   applied after `profile` resolution. `0` means "use the resolved
+ *   profile's/default speed_level" (0 is never itself a valid wire speed
+ *   level, so it unambiguously means "unset" here too). A non-zero,
+ *   invalid level (out of 1-10, or the reserved 8) is a config-rejection
+ *   error.
+ * - `callsign`: optional pointer to a null-terminated station-callsign
+ *   string, for the FFI caller's own bookkeeping convenience only —
+ *   `CoppaCore`/`EngineConfig` have no callsign concept at all (callsign
+ *   is a daemon-level station-ID/beacon concept layered above the engine,
+ *   added in Phase 4 Task 3; nothing in `coppa-engine` consumes it). This
+ *   field is validated (must be valid UTF-8 if non-null, else a
+ *   config-rejection error) and then **discarded** — it is not retained
+ *   on the returned handle and has no accessor. Storing it with no reader
+ *   anywhere would be dead weight the "don't overbuild" discipline this
+ *   codebase follows argues against; a future task adding a real
+ *   config-readback API (e.g. `coppa_engine_get_config`) should add
+ *   storage and an accessor together. Pass null if unused.
+ */
+typedef struct coppa_config_t {
+  uint32_t sample_rate;
+  const char *profile;
+  uint8_t speed_level;
+  const char *callsign;
+} coppa_config_t;
+
+/**
+ * One frame popped by [`coppa_next_frame`] (`coppa_frame_t` in the
+ * generated header).
+ *
+ * `payload`/`payload_len` are an owned heap buffer allocated by this crate
+ * and must be freed with [`coppa_free_frame_payload`] using the exact
+ * `payload_len` value — same length-must-match-exactly convention as
+ * [`coppa_free_samples`]. When [`coppa_next_frame`] returns `1` ("no frame
+ * pending"), `*out` is zeroed (`payload = null`, `payload_len = 0`, all
+ * other fields `0`) — freeing a null `payload` is a safe no-op, same as
+ * `coppa_free_samples`.
+ *
+ * `seq` is a per-handle monotonic counter this crate assigns (see
+ * [`QueuedFrame`]'s doc) — `coppa_engine::StreamFrame` itself has no
+ * sequence-number field.
+ */
+typedef struct coppa_frame_t {
+  uint8_t *payload;
+  uintptr_t payload_len;
+  float snr_db;
+  float cfo_hz;
+  uint8_t speed_level;
+  uint64_t seq;
+} coppa_frame_t;
 
 /**
  * Create a new Coppa engine instance.
@@ -31,7 +113,7 @@ typedef struct CoppaStreamHandle CoppaStreamHandle;
  * Returns a pointer to the engine handle, or null on failure.
  * The caller must free the handle with [`coppa_engine_destroy`].
  */
- struct CoppaHandle *coppa_engine_create(void);
+ struct coppa_engine_t *coppa_engine_create(void);
 
 /**
  * Destroy a Coppa engine instance and free its resources.
@@ -44,7 +126,7 @@ typedef struct CoppaStreamHandle CoppaStreamHandle;
  * `handle_ptr` must be either null or a valid pointer to a variable that
  * holds a pointer returned by [`coppa_engine_create`].
  */
- void coppa_engine_destroy(struct CoppaHandle **handle_ptr);
+ void coppa_engine_destroy(struct coppa_engine_t **handle_ptr);
 
 /**
  * Get the library version string.
@@ -71,7 +153,7 @@ typedef struct CoppaStreamHandle CoppaStreamHandle;
  * null-terminated C string.
  */
 
-int32_t coppa_encode(struct CoppaHandle *handle,
+int32_t coppa_encode(struct coppa_engine_t *handle,
                      const char *message,
                      float **out_samples,
                      uintptr_t *out_len);
@@ -92,7 +174,7 @@ int32_t coppa_encode(struct CoppaHandle *handle,
  * `num_samples` valid f32 values.
  */
 
-int32_t coppa_decode(struct CoppaHandle *handle,
+int32_t coppa_decode(struct coppa_engine_t *handle,
                      const float *samples,
                      uintptr_t num_samples,
                      char **out_message);
@@ -125,9 +207,163 @@ int32_t coppa_decode(struct CoppaHandle *handle,
  void coppa_free_string(char *s);
 
 /**
+ * Construct a new engine handle from a [`CoppaConfig`] (`coppa_config_t`).
+ *
+ * Returns null if `cfg` is null, or for any config-rejection case (see
+ * [`resolve_engine_config`] and [`CoppaConfig`]'s field docs): invalid
+ * UTF-8 in `profile` or `callsign`, an unrecognized non-empty `profile`
+ * name, or a non-zero `speed_level` that isn't a valid wire speed level
+ * (1-10; 8 is reserved).
+ *
+ * The returned handle is a plain [`CoppaHandle`] (`coppa_engine_t`) —
+ * exactly what [`coppa_engine_create`] returns, just built from an
+ * explicit config instead of `EngineConfig::default()`. It must be freed
+ * with [`coppa_engine_destroy`], and every v1 function
+ * (`coppa_encode`/`coppa_decode`/etc.) works on it too.
+ *
+ * # Safety
+ *
+ * `cfg` must be null or point to a valid, fully-initialized `CoppaConfig`.
+ * `cfg->profile` and `cfg->callsign`, if non-null, must be valid
+ * null-terminated C strings.
+ */
+ struct coppa_engine_t *coppa_engine_new_with(const struct coppa_config_t *cfg);
+
+/**
+ * Change an existing engine handle's configured speed level.
+ *
+ * Rebuilds the engine's transceiver/streaming receiver for the new level
+ * (see `CoppaCore::set_speed_level`) — any samples already buffered inside
+ * the streaming receiver but not yet resolved into a completed frame are
+ * discarded as a result. Frames already queued for [`coppa_next_frame`]
+ * (fully decoded before this call) are **not** affected.
+ *
+ * Returns `0` on success, `-1` if `handle` is null, `-6` if `level` is not
+ * a valid wire speed level (1-10; 8 is reserved — see
+ * `coppa_protocol::modem::speed_level_components`), `-4` if the internal
+ * lock is poisoned, or `-5` if an internal panic occurred. **After either
+ * of the latter two the handle is permanently broken** — destroy it with
+ * `coppa_engine_destroy` and create a new one.
+ *
+ * # Safety
+ *
+ * `handle` must be a valid engine handle.
+ */
+ int32_t coppa_engine_set_speed_level(struct coppa_engine_t *handle, uint8_t level);
+
+/**
+ * Encode raw binary data to audio samples — binary counterpart to
+ * [`coppa_encode`] (which is text/UTF-8-only).
+ *
+ * On success, `out_samples`/`out_len` are populated exactly like
+ * `coppa_encode`'s: free with [`coppa_free_samples`] using the exact
+ * `out_len` value.
+ *
+ * Returns `-1` if `handle`, `out_samples`, or `out_len` is null, or if
+ * `data` is null while `len > 0`. Returns `-3` if encoding failed (e.g.
+ * payload too large for the configured speed level). Returns `-4` if the
+ * internal lock is poisoned, or `-5` if an internal panic occurred.
+ * **After either of the latter two the handle is permanently broken** —
+ * destroy it with `coppa_engine_destroy` and create a new one.
+ *
+ * # Safety
+ *
+ * `handle` must be a valid engine handle. `data` must point to `len` valid
+ * bytes (`data` may be null only if `len == 0`).
+ */
+
+int32_t coppa_encode_bytes(struct coppa_engine_t *handle,
+                           const uint8_t *data,
+                           uintptr_t len,
+                           float **out_samples,
+                           uintptr_t *out_len);
+
+/**
+ * Push samples into an engine handle's internal streaming receiver —
+ * binary counterpart to the deprecated [`coppa_feed_samples`] (which
+ * requires a separate `CoppaStreamHandle` and only surfaces valid-UTF-8
+ * text messages).
+ *
+ * Samples are pushed directly into the engine's `StreamingReceiver`,
+ * exactly like `coppa_feed_samples` — the caller can feed any chunk size
+ * at any time; there is no minimum-samples threshold to reach before a
+ * decode is attempted. Any frames the receiver completes as a result of
+ * this call whose payload decompressed successfully are queued (raw
+ * bytes, no UTF-8 forcing — see `coppa_engine::StreamFrame`'s doc) for
+ * [`coppa_next_frame`] to pop; a frame whose payload failed decompression
+ * is dropped (there is no raw byte payload to surface for it).
+ *
+ * Returns `0` on success (including when zero frames complete or queue).
+ * Returns `-1` if `handle` or `samples` is null (`len == 0` with non-null
+ * pointers is a safe no-op returning `0`). Returns `-4` if the internal
+ * lock is poisoned, or `-5` if an internal panic occurred. **After either
+ * of the latter two the handle is permanently broken** — destroy it with
+ * `coppa_engine_destroy` and create a new one.
+ *
+ * # Safety
+ *
+ * `handle` must be a valid engine handle. `samples` must point to `len`
+ * valid f32 values.
+ */
+
+int32_t coppa_engine_feed_samples(struct coppa_engine_t *handle,
+                                  const float *samples,
+                                  uintptr_t len);
+
+/**
+ * Pop one queued frame from an engine handle into `*out`.
+ *
+ * # Return-code convention
+ *
+ * This module's error-code table establishes `0` = success everywhere
+ * else in this file. This function's own originating design note said
+ * "0 = none pending" — read literally, that would contradict the
+ * module-wide convention for this one function (a caller checking `if
+ * (coppa_next_frame(h, &f) == 0)` to mean "success" elsewhere in this API
+ * would silently misread an empty queue as a popped frame). Resolved as
+ * follows, to stay internally consistent with the rest of this file:
+ *
+ * - `0`: a frame was popped; `*out` is populated and its `payload` must
+ *   be freed with [`coppa_free_frame_payload`].
+ * - `1`: no frame is currently pending — **not an error**; `*out` is
+ *   zeroed (see [`CoppaFrame`]'s doc).
+ * - `-1`: `handle` or `out` is null.
+ * - `-4`: internal lock poisoned. `-5`: internal panic. Both leave the
+ *   handle permanently broken, same as every other function here.
+ *
+ * # Safety
+ *
+ * `handle` must be a valid engine handle. `out` must point to valid,
+ * writable [`CoppaFrame`] storage.
+ */
+ int32_t coppa_next_frame(struct coppa_engine_t *handle, struct coppa_frame_t *out);
+
+/**
+ * Free a frame payload buffer returned by [`coppa_next_frame`].
+ *
+ * `len` **must** be the exact `payload_len` value written alongside
+ * `payload` by `coppa_next_frame`. Passing a different length is undefined
+ * behavior. A null `payload` (e.g. from a `1`/"no frame pending" result)
+ * is a safe no-op, same as [`coppa_free_samples`].
+ *
+ * # Safety
+ *
+ * `payload` must be a pointer returned by `coppa_next_frame`, and `len`
+ * must be the exact length returned alongside it in `payload_len`.
+ */
+ void coppa_free_frame_payload(uint8_t *payload, uintptr_t len);
+
+/**
  * Start a streaming decode session.
  *
  * Returns a handle to the stream, or null on failure.
+ *
+ * **Deprecated since FFI v2 (Phase 4 Task 6):** use [`coppa_engine_new_with`]
+ * / [`coppa_engine_create`] plus [`coppa_engine_feed_samples`] and
+ * [`coppa_next_frame`] instead — this quartet is kept, unchanged, as a
+ * deprecated wrapper API for one release. Its text-only, UTF-8-forcing
+ * contract silently drops real binary session/ARQ traffic that the v2 raw
+ * byte API surfaces correctly (see [`coppa_feed_samples`]'s doc).
  */
  struct CoppaStreamHandle *coppa_start_stream(void);
 
@@ -149,6 +385,12 @@ int32_t coppa_decode(struct CoppaHandle *handle,
  *
  * `handle` must be a valid stream handle. `samples` must point to
  * `num_samples` valid f32 values.
+ *
+ * **Deprecated since FFI v2 (Phase 4 Task 6):** use
+ * [`coppa_engine_feed_samples`] instead — same underlying
+ * `StreamingReceiver`, but surfaces raw binary payloads (no UTF-8
+ * requirement) via [`coppa_next_frame`] rather than dropping every frame
+ * whose payload isn't valid UTF-8 (see the note in this function's body).
  */
 
 int32_t coppa_feed_samples(struct CoppaStreamHandle *handle,
@@ -164,6 +406,10 @@ int32_t coppa_feed_samples(struct CoppaStreamHandle *handle,
  * # Safety
  *
  * `handle` must be a valid stream handle.
+ *
+ * **Deprecated since FFI v2 (Phase 4 Task 6):** use [`coppa_next_frame`]
+ * instead — pops a `coppa_frame_t` with the raw payload plus SNR/CFO/speed
+ * level/seq metadata, instead of a bare text message.
  */
  char *coppa_get_decoded(struct CoppaStreamHandle *handle);
 
@@ -173,6 +419,10 @@ int32_t coppa_feed_samples(struct CoppaStreamHandle *handle,
  * # Safety
  *
  * `handle` must be a valid stream handle returned by `coppa_start_stream`.
+ *
+ * **Deprecated since FFI v2 (Phase 4 Task 6):** use [`coppa_engine_destroy`]
+ * instead, if this handle was created via [`coppa_engine_new_with`]/
+ * [`coppa_engine_create`].
  */
  void coppa_stop_stream(struct CoppaStreamHandle *handle);
 

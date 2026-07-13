@@ -13,6 +13,19 @@ parse_deps = false
 include = []
 exclude = []
 
+# Phase 4 Task 6 (FFI v2): the v2 binary/config/event API and the pre-existing
+# v1 text API share one Rust handle type (`CoppaHandle`) -- see that struct's
+# doc comment in lib.rs for why. Rename it to `coppa_engine_t` in the
+# generated header only (Rust-side name stays `CoppaHandle`) so the C API
+# matches the v2 pseudocode's naming without forcing a snake_case Rust type
+# name. `CoppaConfig`/`CoppaFrame` are renamed the same way, for the same
+# reason (exact C names from the task brief's pseudocode: `coppa_config_t`,
+# `coppa_frame_t`).
+[export.rename]
+"CoppaHandle" = "coppa_engine_t"
+"CoppaConfig" = "coppa_config_t"
+"CoppaFrame" = "coppa_frame_t"
+
 [fn]
 # Prefix all exported functions (already prefixed with coppa_)
 prefix = ""

@@ -388,6 +388,29 @@ impl CoppaCore {
         self.config = new.config;
         self.streaming = new.streaming;
     }
+
+    /// Change this engine's configured speed level in place (Phase 4 Task 6,
+    /// added for FFI v2's `coppa_engine_set_speed_level`).
+    ///
+    /// This is not a cheap field mutation: `level` also selects the HF/VHF
+    /// OFDM profile threshold (see `select_ofdm_profile`), so this rebuilds
+    /// the transceiver and streaming receiver exactly like `reconfigure`
+    /// does -- any samples already buffered in the streaming receiver (not
+    /// yet resolved into a completed frame) are discarded as a result.
+    ///
+    /// Returns an error, leaving this engine's current config untouched, if
+    /// `level` is not a valid wire speed level (1-10; 8 is reserved) -- see
+    /// `coppa_protocol::modem::speed_level_components`, the single source of
+    /// truth for valid levels that this deliberately defers to rather than
+    /// duplicating.
+    pub fn set_speed_level(&mut self, level: u8) -> Result<()> {
+        coppa_protocol::modem::speed_level_components(level)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let mut config = self.config.clone();
+        config.speed_level = level;
+        self.reconfigure(config);
+        Ok(())
+    }
 }
 
 impl Default for CoppaCore {
@@ -727,6 +750,40 @@ mod tests {
         let core = CoppaCore::new();
         let data = vec![0u8; u16::MAX as usize + 1];
         assert!(core.encode_bytes_at_level(&data, 1).is_err());
+    }
+
+    // ── Task 6 (Phase 4): `set_speed_level` mutator for FFI v2 ────────────
+
+    #[test]
+    fn test_set_speed_level_valid_updates_config_and_roundtrips() {
+        let mut core = CoppaCore::new(); // default speed_level 1
+        core.set_speed_level(3).expect("level 3 is valid");
+        assert_eq!(core.config().speed_level, 3);
+
+        let data = b"level three";
+        let samples = core.encode_bytes(data).expect("encode should succeed");
+        let decoded = core.decode_bytes(&samples).expect("decode should succeed");
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_set_speed_level_rejects_reserved_level_8() {
+        let mut core = CoppaCore::new();
+        let before = core.config().speed_level;
+        assert!(core.set_speed_level(8).is_err(), "level 8 is reserved");
+        assert_eq!(
+            core.config().speed_level,
+            before,
+            "rejected level must not mutate the existing config"
+        );
+    }
+
+    #[test]
+    fn test_set_speed_level_rejects_out_of_range() {
+        let mut core = CoppaCore::new();
+        assert!(core.set_speed_level(0).is_err());
+        assert!(core.set_speed_level(11).is_err());
+        assert!(core.set_speed_level(255).is_err());
     }
 
     // ── Task 1 (Phase 4): TX level calibration (TUNE) ─────────────────────
