@@ -5,6 +5,7 @@
 
 mod config;
 mod event_loop;
+mod spectrum;
 
 #[cfg(feature = "kiss-tnc")]
 mod tnc;

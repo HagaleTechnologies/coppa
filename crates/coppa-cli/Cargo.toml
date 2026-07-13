@@ -22,6 +22,12 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 
+[dev-dependencies]
+# Golden-vector manifest parsing (tests/rx_golden.rs), matching
+# crates/coppa-protocol/tests/golden_vectors.rs's approach.
+serde = { workspace = true }
+toml = { workspace = true }
+
 [features]
 default = ["file-backend"]
 file-backend = ["coppa-audio/file-backend"]

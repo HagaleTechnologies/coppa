@@ -131,6 +131,24 @@ pub struct EventLoop {
     /// doc (Finding 1 fix, Phase 4 Task 3 review). Empty outside of a busy
     /// wait; no data is lost, decode is just deferred.
     pending_busy_wait_audio: Vec<f32>,
+    /// Dedicated FFT sensor for the `spectrum` WebSocket broadcast (Phase 4
+    /// Task 4) -- separate from `busy_gate`'s own internal `SpectrumSensor`
+    /// (smaller FFT, tuned for occupancy margin rather than bin resolution).
+    /// Only meaningful (and only fed) when `ws_broadcast` is set; see
+    /// `maybe_broadcast_spectrum`.
+    #[cfg(feature = "websocket")]
+    spectrum_sensor: coppa_ml::SpectrumSensor,
+    /// Rolling window of the most recent
+    /// `crate::spectrum::SPECTRUM_FFT_SIZE` raw RX samples, fed by every
+    /// `handle_audio_in` call -- `maybe_broadcast_spectrum`'s FFT input.
+    #[cfg(feature = "websocket")]
+    spectrum_buffer: Vec<f32>,
+    /// Wall-clock time of the last `spectrum` broadcast (or `EventLoop`
+    /// construction, if none yet) -- gates `maybe_broadcast_spectrum` to
+    /// `crate::spectrum::SPECTRUM_UPDATE_HZ` rather than computing/
+    /// broadcasting one on every audio callback.
+    #[cfg(feature = "websocket")]
+    last_spectrum_broadcast: Instant,
 }
 
 impl EventLoop {
@@ -183,6 +201,11 @@ impl EventLoop {
         };
 
         let busy_gate = BusyGate::new(config.audio.sample_rate as f32);
+        #[cfg(feature = "websocket")]
+        let spectrum_sensor = coppa_ml::SpectrumSensor::new(
+            crate::spectrum::SPECTRUM_FFT_SIZE,
+            config.audio.sample_rate as f32,
+        );
 
         Ok(Self {
             config,
@@ -218,6 +241,12 @@ impl EventLoop {
             last_id_time: Instant::now(),
             last_beacon_time: Instant::now(),
             pending_busy_wait_audio: Vec::new(),
+            #[cfg(feature = "websocket")]
+            spectrum_sensor,
+            #[cfg(feature = "websocket")]
+            spectrum_buffer: Vec::new(),
+            #[cfg(feature = "websocket")]
+            last_spectrum_broadcast: Instant::now(),
         })
     }
 
@@ -792,7 +821,61 @@ impl EventLoop {
         if let Some(new_state) = self.busy_gate.observe(samples) {
             self.emit_vara(VaraResponse::Busy(new_state)).await;
         }
+        #[cfg(feature = "websocket")]
+        self.maybe_broadcast_spectrum(samples);
         self.decode_and_dispatch_audio(samples).await;
+    }
+
+    /// Waterfall spectrum production (Phase 4 Task 4): accumulate `samples`
+    /// into a rolling `crate::spectrum::SPECTRUM_FFT_SIZE`-sample window and,
+    /// no more often than `crate::spectrum::SPECTRUM_UPDATE_HZ`, compute and
+    /// broadcast a `spectrum` WebSocket message over `ws_broadcast` (the same
+    /// existing conduit the "data" broadcast already uses -- see
+    /// `set_ws_broadcast`'s doc; per-client opt-in filtering happens on the
+    /// `coppa-host::websocket` side, not here).
+    ///
+    /// A no-op whenever `ws_broadcast` isn't set (no host attached) -- this
+    /// only ever runs with a real audio-in consumer wired up (`set_audio_in`),
+    /// so the FFT cost of a disconnected/headless daemon is never paid; once a
+    /// host IS attached, this computes/serializes a spectrum on every
+    /// `SPECTRUM_UPDATE_HZ` tick regardless of whether any currently-connected
+    /// client has actually opted in (the daemon has no visibility into that
+    /// per-connection state) -- cheap enough (one FFT of `SPECTRUM_FFT_SIZE`
+    /// samples at 4 Hz) not to bother threading that visibility through.
+    #[cfg(feature = "websocket")]
+    fn maybe_broadcast_spectrum(&mut self, samples: &[f32]) {
+        let Some(ref ws_tx) = self.ws_broadcast else {
+            return;
+        };
+
+        self.spectrum_buffer.extend_from_slice(samples);
+        if self.spectrum_buffer.len() > crate::spectrum::SPECTRUM_FFT_SIZE {
+            let excess = self.spectrum_buffer.len() - crate::spectrum::SPECTRUM_FFT_SIZE;
+            self.spectrum_buffer.drain(0..excess);
+        }
+        if self.spectrum_buffer.len() < crate::spectrum::SPECTRUM_FFT_SIZE {
+            return; // not enough audio yet for a full-resolution spectrum
+        }
+
+        let period = Duration::from_secs_f64(1.0 / crate::spectrum::SPECTRUM_UPDATE_HZ);
+        if self.last_spectrum_broadcast.elapsed() < period {
+            return;
+        }
+        self.last_spectrum_broadcast = Instant::now();
+
+        let bins = crate::spectrum::compute_spectrum_bins(
+            &self.spectrum_sensor,
+            &self.spectrum_buffer,
+            self.config.audio.sample_rate as f32,
+        );
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let msg = coppa_host::websocket::WsServerMessage::Spectrum { bins, timestamp_ms };
+        if let Ok(json) = serde_json::to_string(&msg) {
+            let _ = ws_tx.send(json);
+        }
     }
 
     /// Decode whatever frames complete as a result of `samples` and dispatch
@@ -1570,6 +1653,80 @@ mod tests {
         tx.send(DaemonEvent::Shutdown).await.unwrap();
 
         event_loop.run().await.unwrap();
+    }
+
+    /// Phase 4 Task 4 required scenario: "spectrum frames of the right
+    /// shape/rate" (mock time). Feeds real audio through `handle_audio_in`
+    /// and checks the `spectrum` messages broadcast over `ws_broadcast`:
+    /// 128 bins each, and rate-limited to `crate::spectrum::SPECTRUM_UPDATE_HZ`
+    /// rather than one per audio callback.
+    ///
+    /// "Mock time" here follows this file's own existing convention for
+    /// `Instant`-gated periodic behavior (see `last_id_time`/`last_beacon_time`'s
+    /// tests below, e.g. `event_loop.last_id_time = Instant::now() -
+    /// Duration::from_secs(600)`): directly backdate the `Instant` field a
+    /// rate gate compares against, rather than `tokio::time::advance` (which
+    /// only affects `tokio::time::Instant`, not the `std::time::Instant`
+    /// these fields actually use, so it wouldn't do anything here).
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn test_spectrum_broadcast_is_128_bins_and_rate_limited() {
+        let config = DaemonConfig::default();
+        let mut event_loop = EventLoop::new(config).unwrap();
+
+        let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+        event_loop.set_ws_broadcast(ws_tx);
+
+        // Backdate so the very first push (once enough audio has
+        // accumulated) is already past the rate-limit period.
+        event_loop.last_spectrum_broadcast = Instant::now() - Duration::from_secs(1);
+
+        // Feed exactly one full FFT window's worth of audio in one call.
+        let samples = vec![0.01f32; crate::spectrum::SPECTRUM_FFT_SIZE];
+        event_loop.handle_audio_in(&samples).await;
+
+        // Drain the broadcast channel for `spectrum` messages.
+        let mut first_spectrum = None;
+        while let Ok(json) = ws_rx.try_recv() {
+            if let Ok(coppa_host::websocket::WsServerMessage::Spectrum { bins, .. }) =
+                serde_json::from_str(&json)
+            {
+                first_spectrum = Some(bins);
+            }
+        }
+        let bins =
+            first_spectrum.expect("expected a spectrum broadcast after backdating the rate gate");
+        assert_eq!(
+            bins.len(),
+            crate::spectrum::SPECTRUM_NUM_BINS,
+            "spectrum message should carry exactly SPECTRUM_NUM_BINS bins"
+        );
+
+        // Immediately push more audio (no backdating this time): real
+        // wall-clock elapsed since the broadcast above is far under the
+        // rate-limit period, so this must NOT produce a second broadcast.
+        event_loop.handle_audio_in(&samples).await;
+        assert!(
+            ws_rx.try_recv().is_err(),
+            "a second push within the rate-limit period must not re-broadcast"
+        );
+
+        // Backdate again to simulate the rate-limit period having elapsed,
+        // and confirm the gate re-opens.
+        event_loop.last_spectrum_broadcast = Instant::now() - Duration::from_secs(1);
+        event_loop.handle_audio_in(&samples).await;
+        let mut second_spectrum = None;
+        while let Ok(json) = ws_rx.try_recv() {
+            if let Ok(coppa_host::websocket::WsServerMessage::Spectrum { bins, .. }) =
+                serde_json::from_str(&json)
+            {
+                second_spectrum = Some(bins);
+            }
+        }
+        assert!(
+            second_spectrum.is_some(),
+            "the rate gate should re-open once its period has (mock-)elapsed"
+        );
     }
 
     #[tokio::test]

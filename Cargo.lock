@@ -377,7 +377,9 @@ dependencies = [
  "coppa-host",
  "coppa-protocol",
  "coppa-radio",
+ "serde",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
 ]
 
 [[package]]
@@ -409,6 +411,7 @@ dependencies = [
  "coppa-radio",
  "rand 0.10.2",
  "serde",
+ "serde_json",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tracing",

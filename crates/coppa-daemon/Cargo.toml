@@ -27,6 +27,7 @@ anyhow = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -42,7 +43,7 @@ tokio = { workspace = true, features = ["test-util"] }
 [features]
 default = []
 cpal-backend = ["coppa-audio/cpal-backend"]
-websocket = ["coppa-host/websocket"]
+websocket = ["coppa-host/websocket", "dep:serde_json"]
 kiss-tnc = ["coppa-host/kiss-tnc"]
 serial-ptt = ["coppa-radio/serial-ptt"]
 gpio-ptt = ["coppa-radio/gpio-ptt"]

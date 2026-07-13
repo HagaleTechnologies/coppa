@@ -61,17 +61,22 @@ enum Commands {
         #[arg(long, default_value = "200")]
         ptt_tail_ms: u64,
     },
-    /// Receive and decode audio.
+    /// Receive and decode audio (streaming: WAV file if --input is given,
+    /// otherwise live capture from an audio input device until Ctrl+C).
     Rx {
-        /// Input file containing audio samples (WAV format).
+        /// Input file containing audio samples (WAV format). If omitted,
+        /// captures live audio from an input device instead.
         #[arg(short, long)]
         input: Option<String>,
         /// Operational profile name.
         #[arg(long)]
         profile: Option<String>,
-        /// Print only the decoded text with no labels.
+        /// Print only the decoded payload (lowercase hex) with no labels.
         #[arg(long)]
         raw: bool,
+        /// Audio input device name (substring match, live capture only).
+        #[arg(long)]
+        device: Option<String>,
     },
     /// Run a loopback test (encode -> decode).
     Loopback {
@@ -215,7 +220,14 @@ fn main() -> Result<()> {
             input,
             profile,
             raw,
-        }) => cmd_rx(input.as_deref(), profile.as_deref(), raw, verbosity)?,
+            device,
+        }) => cmd_rx(
+            input.as_deref(),
+            profile.as_deref(),
+            raw,
+            device.as_deref(),
+            verbosity,
+        )?,
         Some(Commands::Loopback { message, profile }) => {
             cmd_loopback(&message, profile.as_deref(), verbosity)?
         }
@@ -552,12 +564,29 @@ fn cmd_tune(
     Ok(())
 }
 
+/// `coppa rx`: stream audio (a WAV file via `--input`, or a live capture
+/// device otherwise) through `CoppaCore::push_samples` (the same
+/// `StreamingReceiver`-based path the daemon uses), printing each decoded
+/// frame's payload + SNR as it completes.
+///
+/// Unlike the old one-shot `core.decode(&samples)` batch call this replaces,
+/// `push_samples` never forces a UTF-8 conversion (Phase 4 Task 3.5) -- frame
+/// payloads are raw bytes, printed here as lowercase hex (see
+/// `print_stream_frame`'s doc for why hex, not text).
 fn cmd_rx(
     input: Option<&str>,
     profile: Option<&str>,
     raw: bool,
+    device: Option<&str>,
     verbosity: Verbosity,
 ) -> Result<()> {
+    let config = resolve_config(profile)?;
+    let mut core = CoppaCore::with_config(config);
+
+    if verbosity == Verbosity::Verbose {
+        eprintln!("[verbose] sample_rate: {}", core.config().sample_rate);
+    }
+
     if let Some(path) = input {
         #[cfg(feature = "file-backend")]
         {
@@ -567,47 +596,162 @@ fn cmd_rx(
             if verbosity != Verbosity::Quiet && !raw {
                 println!("Reading {} samples from {}", total, path);
             }
-
-            let mut samples = vec![0.0f32; total];
             source.start()?;
-            source.read(&mut samples)?;
-
-            let config = resolve_config(profile)?;
-            let core = CoppaCore::with_config(config);
-
-            if verbosity == Verbosity::Verbose {
-                eprintln!(
-                    "[verbose] Input samples: {}, sample_rate: {}",
-                    total,
-                    core.config().sample_rate
-                );
-            }
-
-            match core.decode(&samples) {
-                Ok(message) => {
-                    if raw {
-                        print!("{}", message);
-                    } else {
-                        println!("Decoded: \"{}\"", message);
-                    }
-                }
-                Err(e) => println!("Decode failed: {}", e),
-            }
+            stream_decode(&mut core, &mut source, Some(total), raw, verbosity)?;
+            source.stop()?;
         }
         #[cfg(not(feature = "file-backend"))]
         {
             let _ = path;
-            let _ = profile;
-            let _ = raw;
+            let _ = &mut core;
             if verbosity != Verbosity::Quiet {
                 println!("File input not available (compile with file-backend feature)");
             }
         }
-    } else if verbosity != Verbosity::Quiet {
-        println!("Live audio input not yet implemented. Use --input to specify a WAV file.");
+    } else {
+        #[cfg(feature = "cpal-backend")]
+        {
+            use coppa_audio::AudioSource;
+            let engine_rate = core.config().sample_rate;
+            let mut source = match device {
+                Some(name) => match coppa_audio::find_input_device_by_name(name) {
+                    Some(dev) => {
+                        if verbosity != Verbosity::Quiet {
+                            eprintln!("Using input device matching '{}'", name);
+                        }
+                        coppa_audio::cpal_backend::CpalSource::from_device(dev, engine_rate, 8192)?
+                    }
+                    None => {
+                        eprintln!(
+                            "WARNING: No input device matching '{}', using default",
+                            name
+                        );
+                        coppa_audio::cpal_backend::CpalSource::new(engine_rate, 8192)?
+                    }
+                },
+                None => coppa_audio::cpal_backend::CpalSource::new(engine_rate, 8192)?,
+            };
+            source.start()?;
+            if verbosity != Verbosity::Quiet && !raw {
+                println!("Listening for live audio (Ctrl+C to stop)...");
+            }
+            stream_decode(&mut core, &mut source, None, raw, verbosity)?;
+            source.stop()?;
+        }
+        #[cfg(not(feature = "cpal-backend"))]
+        {
+            let _ = device;
+            let _ = &mut core;
+            if verbosity != Verbosity::Quiet {
+                println!("Live audio input not available (compile with cpal-backend feature)");
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Trailing silence (samples) fed to `core` after a finite (`--input <wav>`)
+/// source is exhausted, so a frame whose nominal end coincides with (or is
+/// close to) the file's own end can still complete.
+///
+/// `StreamingReceiver` needs `rx_group_delay` samples past a candidate's
+/// nominal end before it will emit that frame -- the RX bandpass filter's
+/// group delay for HF profiles (300 samples, `(601-1)/2`; VHF profiles have
+/// no RX bandpass and need none) -- see
+/// `coppa_protocol::modem::streaming`'s module doc and `header_peek`'s doc.
+/// A golden-vector WAV (one frame, no trailing padding baked in) demonstrates
+/// this concretely: without this flush, `coppa rx --input testdata/golden/
+/// L1_clean.wav` decoded 0 frames even though the identical samples decode
+/// cleanly via the batch `CoppaTransceiver::receive` API golden_vectors.rs
+/// uses, which has no such requirement. 8192 comfortably covers every
+/// profile's `rx_group_delay` with margin.
+const TRAILING_FLUSH_SAMPLES: usize = 8192;
+
+/// Push audio from `source` through `core`'s streaming decoder
+/// (`CoppaCore::push_samples`) in fixed-size chunks, printing each decoded
+/// frame as it completes (see `print_stream_frame`).
+///
+/// `total_samples`, when known (the `--input <wav>` case), bounds the loop to
+/// exactly that many samples so it terminates at end-of-file without relying
+/// on a `read() == 0` EOF signal (live sources also return 0 whenever no new
+/// audio has arrived yet, which is not EOF -- see the `None` branch below).
+/// Once exhausted, `TRAILING_FLUSH_SAMPLES` of silence are pushed so a frame
+/// right at the file's end can still complete (see that constant's doc).
+///
+/// When `total_samples` is `None` (live capture), this runs until the
+/// process is interrupted (Ctrl+C), briefly sleeping on an empty read to
+/// avoid a busy-spin against the non-blocking device source.
+fn stream_decode(
+    core: &mut CoppaCore,
+    source: &mut dyn coppa_audio::AudioSource,
+    total_samples: Option<usize>,
+    raw: bool,
+    verbosity: Verbosity,
+) -> Result<()> {
+    let mut buf = vec![0.0f32; 4096];
+    let mut consumed = 0usize;
+    loop {
+        let n = source.read(&mut buf)?;
+        if n > 0 {
+            consumed += n;
+            for frame in core.push_samples(&buf[..n]) {
+                print_stream_frame(&frame, raw, verbosity);
+            }
+        }
+        match total_samples {
+            Some(total) => {
+                if consumed >= total {
+                    break;
+                }
+            }
+            None if n == 0 => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            None => {}
+        }
+    }
+
+    if total_samples.is_some() {
+        let silence = vec![0.0f32; TRAILING_FLUSH_SAMPLES];
+        for frame in core.push_samples(&silence) {
+            print_stream_frame(&frame, raw, verbosity);
+        }
+    }
+
+    Ok(())
+}
+
+/// Print one decoded `StreamFrame` (`CoppaCore::push_samples`'s per-frame
+/// result). Payloads are raw bytes -- never UTF-8-forced, see
+/// `coppa_engine::StreamFrame::payload`'s doc -- so printed as lowercase hex,
+/// directly comparable to `testdata/golden/manifest.toml`'s `payload_hex`
+/// field. `raw` mirrors the flag's existing meaning ("print only the decoded
+/// content with no labels"): just the hex string, one per line, on stdout.
+/// Decode failures are reported on stderr (never stdout, so they never
+/// corrupt a `--raw` capture), suppressed entirely in `Verbosity::Quiet`.
+fn print_stream_frame(frame: &coppa_engine::StreamFrame, raw: bool, verbosity: Verbosity) {
+    match &frame.payload {
+        Ok(bytes) => {
+            let hex: String = bytes.iter().map(|b: &u8| format!("{:02x}", b)).collect();
+            if raw {
+                println!("{}", hex);
+            } else {
+                println!("Decoded: {}  (SNR: {:.1} dB)", hex, frame.snr_db);
+            }
+            if verbosity == Verbosity::Verbose {
+                eprintln!(
+                    "[verbose] level={} cfo_hz={:.1} frame_start={}",
+                    frame.speed_level, frame.cfo_hz, frame.frame_start
+                );
+            }
+        }
+        Err(e) => {
+            if verbosity != Verbosity::Quiet {
+                eprintln!("Decode failed: {}", e);
+            }
+        }
+    }
 }
 
 fn cmd_loopback(message: &str, profile: Option<&str>, verbosity: Verbosity) -> Result<()> {
@@ -960,6 +1104,7 @@ mod tests {
                 Some("/tmp/coppa_nonexistent_12345.wav"),
                 None,
                 false,
+                None,
                 Verbosity::Normal,
             );
             assert!(result.is_err(), "rx of nonexistent file should error");
@@ -1130,5 +1275,38 @@ mod tests {
         // Sanity check that non-rigctld methods don't try to connect anywhere.
         let _ = build_ptt("none", "127.0.0.1:1");
         let _ = build_ptt("vox", "127.0.0.1:1");
+    }
+
+    /// Task 4 (Phase 4): `cmd_rx`'s `--input` path now streams through
+    /// `CoppaCore::push_samples` in chunks (rather than a single batch
+    /// `core.decode()` call) -- a round-trip smoke test that this still
+    /// decodes cleanly end-to-end (content is checked separately by the
+    /// dedicated `tests/rx_golden.rs` integration test, which asserts on
+    /// actual printed hex; this just proves `cmd_rx` doesn't error).
+    #[test]
+    fn test_rx_streams_encoded_wav_file() {
+        #[cfg(feature = "file-backend")]
+        {
+            let dir = std::env::temp_dir();
+            let path = dir.join("coppa_test_rx_streaming.wav");
+            let path_str = path.to_str().unwrap();
+            cmd_tx(
+                "streaming rx roundtrip",
+                Some(path_str),
+                None,
+                None,
+                None,
+                "none",
+                "127.0.0.1:4532",
+                50,
+                200,
+                Verbosity::Quiet,
+            )
+            .expect("tx to file should succeed");
+
+            let result = cmd_rx(Some(path_str), None, true, None, Verbosity::Quiet);
+            std::fs::remove_file(&path).ok();
+            result.expect("streaming rx of a freshly-encoded WAV should succeed");
+        }
     }
 }
