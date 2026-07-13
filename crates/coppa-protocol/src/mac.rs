@@ -290,16 +290,35 @@ pub struct StationIdPayload {
 impl StationIdPayload {
     /// Serialize to bytes: `[callsign_len: u8][callsign][grid_len: u8][grid][level: u8]`.
     /// `grid_len == 0` means no grid was configured.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    ///
+    /// Both length prefixes are single bytes, so a `callsign`/`grid` longer
+    /// than 255 bytes can't be represented -- these are unvalidated
+    /// operator-supplied config strings (real callsigns/grids are short in
+    /// practice, but nothing upstream enforces that), so this returns an
+    /// error rather than silently truncating the length prefix and emitting
+    /// a corrupted frame.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let callsign_bytes = self.callsign.as_bytes();
         let grid_bytes = self.grid.as_deref().unwrap_or("").as_bytes();
+        if callsign_bytes.len() > u8::MAX as usize {
+            return Err(anyhow!(
+                "StationIdPayload: callsign too long to encode ({} bytes, max 255)",
+                callsign_bytes.len()
+            ));
+        }
+        if grid_bytes.len() > u8::MAX as usize {
+            return Err(anyhow!(
+                "StationIdPayload: grid too long to encode ({} bytes, max 255)",
+                grid_bytes.len()
+            ));
+        }
         let mut out = Vec::with_capacity(2 + callsign_bytes.len() + grid_bytes.len() + 1);
         out.push(callsign_bytes.len() as u8);
         out.extend_from_slice(callsign_bytes);
         out.push(grid_bytes.len() as u8);
         out.extend_from_slice(grid_bytes);
         out.push(self.level);
-        out
+        Ok(out)
     }
 
     /// Deserialize from bytes produced by [`Self::to_bytes`].
@@ -592,7 +611,7 @@ mod tests {
             grid: Some("QF22".to_string()),
             level: 1,
         };
-        let bytes = payload.to_bytes();
+        let bytes = payload.to_bytes().unwrap();
         let decoded = StationIdPayload::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, payload);
     }
@@ -604,7 +623,7 @@ mod tests {
             grid: None,
             level: 1,
         };
-        let bytes = payload.to_bytes();
+        let bytes = payload.to_bytes().unwrap();
         let decoded = StationIdPayload::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, payload);
         assert_eq!(decoded.grid, None);
@@ -617,9 +636,29 @@ mod tests {
             grid: None,
             level: 7,
         };
-        let bytes = payload.to_bytes();
+        let bytes = payload.to_bytes().unwrap();
         let decoded = StationIdPayload::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.level, 7);
+    }
+
+    #[test]
+    fn test_station_id_payload_to_bytes_errors_on_oversized_callsign() {
+        let payload = StationIdPayload {
+            callsign: "X".repeat(256),
+            grid: None,
+            level: 1,
+        };
+        assert!(payload.to_bytes().is_err());
+    }
+
+    #[test]
+    fn test_station_id_payload_to_bytes_errors_on_oversized_grid() {
+        let payload = StationIdPayload {
+            callsign: "VK3ABC".to_string(),
+            grid: Some("G".repeat(256)),
+            level: 1,
+        };
+        assert!(payload.to_bytes().is_err());
     }
 
     #[test]
@@ -646,7 +685,7 @@ mod tests {
             cs.clone(),
             cs.clone(),
             0,
-            id_payload.to_bytes(),
+            id_payload.to_bytes().unwrap(),
         );
         let bytes = pdu.to_bytes();
         let decoded_pdu = MacPdu::from_bytes(&bytes).unwrap();

@@ -122,6 +122,15 @@ pub struct EventLoop {
     /// `[station_id] beacon_interval_secs` in `maybe_send_beacon` (Phase 4
     /// Task 3).
     last_beacon_time: Instant,
+    /// Raw audio samples read from the input ring by
+    /// `observe_busy_gate_from_audio_input` while `wait_for_clear_channel`
+    /// was blocked, already fed to `busy_gate.observe` there but not yet
+    /// decoded/dispatched. Flushed (decode-and-dispatch only, no repeat
+    /// busy-gate observation) by the next `poll_audio_input` call from
+    /// `run`'s main select loop -- see `observe_busy_gate_from_audio_input`'s
+    /// doc (Finding 1 fix, Phase 4 Task 3 review). Empty outside of a busy
+    /// wait; no data is lost, decode is just deferred.
+    pending_busy_wait_audio: Vec<f32>,
 }
 
 impl EventLoop {
@@ -152,7 +161,25 @@ impl EventLoop {
         let local_callsign = if config.engine.callsign.is_empty() {
             None
         } else {
-            Callsign::new(&config.engine.callsign).ok()
+            match Callsign::new(&config.engine.callsign) {
+                Ok(cs) => Some(cs),
+                Err(e) => {
+                    // A non-empty but unparseable callsign string leaves
+                    // `local_callsign` at `None`, which silently disables the
+                    // station-ID timer and beacon mode (both check
+                    // `local_callsign.is_some()`, not the raw config string --
+                    // see `id_due`/`maybe_send_beacon`). Warn once at startup
+                    // so this doesn't look like the feature is "on" per config
+                    // but never actually fires.
+                    tracing::warn!(
+                        callsign = %config.engine.callsign,
+                        error = %e,
+                        "Invalid [engine] callsign; station ID/beacon and \
+                         connect handling will be unavailable"
+                    );
+                    None
+                }
+            }
         };
 
         let busy_gate = BusyGate::new(config.audio.sample_rate as f32);
@@ -190,6 +217,7 @@ impl EventLoop {
             turnaround_ms: 500,
             last_id_time: Instant::now(),
             last_beacon_time: Instant::now(),
+            pending_busy_wait_audio: Vec::new(),
         })
     }
 
@@ -449,8 +477,14 @@ impl EventLoop {
         Ok(())
     }
 
-    /// Poll the audio input ring buffer for new samples.
-    async fn poll_audio_input(&mut self) {
+    /// Drain whatever samples are currently available on the audio input
+    /// ring (non-blocking), if any, logging when the ring's own overflow
+    /// counter grows (silent RX sample loss was a Phase-0-era finding).
+    /// Shared by `poll_audio_input` (full decode+dispatch) and
+    /// `observe_busy_gate_from_audio_input` (busy-gate-only, used while
+    /// `wait_for_clear_channel` is blocked) so both read from the ring the
+    /// same way.
+    fn drain_audio_input_ring(&mut self) -> Option<Vec<f32>> {
         let mut chunk = None;
         if let Some(ref mut consumer) = self.audio_in {
             let available = consumer.available();
@@ -463,8 +497,6 @@ impl EventLoop {
                 }
             }
 
-            // Check the input ring's overflow counter each poll and log a warning
-            // when it grows — silent RX sample loss was a Phase-0-era finding.
             let overflow = consumer.overflow_count();
             if overflow > self.audio_in_overflow_count {
                 tracing::warn!(
@@ -475,8 +507,61 @@ impl EventLoop {
                 self.audio_in_overflow_count = overflow;
             }
         }
-        if let Some(buf) = chunk {
+        chunk
+    }
+
+    /// Poll the audio input ring buffer for new samples, and flush anything
+    /// buffered by a prior busy-wait (see `pending_busy_wait_audio`) ahead of
+    /// it. Only ever called from `run`'s main `tokio::select!` loop (the
+    /// `audio_poll` tick) -- this is deliberate: it's the one place full MAC
+    /// PDU decode/dispatch (which may itself call `transmit_samples`, e.g.
+    /// for a CONNECT_ACK/CFM response) is allowed to run from. See
+    /// `observe_busy_gate_from_audio_input`'s doc for the narrower method
+    /// `wait_for_clear_channel` uses instead, and why.
+    async fn poll_audio_input(&mut self) {
+        // Decode+dispatch audio observed (for busy-gate purposes only) during
+        // a prior busy-wait first, preserving temporal order against
+        // whatever's freshly available on the ring below. Not re-fed to
+        // `busy_gate.observe` here -- that already happened when it was read.
+        if !self.pending_busy_wait_audio.is_empty() {
+            let pending = std::mem::take(&mut self.pending_busy_wait_audio);
+            self.decode_and_dispatch_audio(&pending).await;
+        }
+        if let Some(buf) = self.drain_audio_input_ring() {
             self.handle_audio_in(&buf).await;
+        }
+    }
+
+    /// Read available audio input samples and feed them to
+    /// `busy_gate.observe` only -- no frame decode, no `MacPdu` dispatch.
+    ///
+    /// Used exclusively by `wait_for_clear_channel`'s poll loop (Finding 1,
+    /// Phase 4 Task 3 review) so real RX audio keeps updating busy-gate
+    /// occupancy while that call is blocked waiting for the channel to
+    /// clear, without also running `handle_audio_in`'s full protocol
+    /// dispatch on this call stack. That dispatch (frame decode ->
+    /// `handle_mac_pdu` -> e.g. `handle_incoming_connect` /
+    /// `handle_connect_ack_rx`, both of which call `transmit_samples`
+    /// directly) used to run here via a boxed recursive call into
+    /// `poll_audio_input`; that was a real reentrancy hazard -- a
+    /// CONNECT_REQ/CONNECT_ACK decoded mid-wait could run a second, nested
+    /// PTT-key/write-audio/schedule-release cycle interleaved with the
+    /// already-in-flight *outer* `transmit_samples` call, before
+    /// `is_transmitting` is even set (it's only set once the outer call
+    /// reaches `handle_ptt_change` *after* this wait returns, so
+    /// `try_drain_tx_queue`'s guard can't catch it either).
+    ///
+    /// Samples read here are saved into `pending_busy_wait_audio` rather than
+    /// dropped: `poll_audio_input` decodes and dispatches them for real, via
+    /// the normal path, the next time it runs from `run`'s main select loop.
+    /// No incoming traffic is lost -- decode is just deferred until it's safe
+    /// to run full dispatch again.
+    async fn observe_busy_gate_from_audio_input(&mut self) {
+        if let Some(buf) = self.drain_audio_input_ring() {
+            if let Some(new_state) = self.busy_gate.observe(&buf) {
+                self.emit_vara(VaraResponse::Busy(new_state)).await;
+            }
+            self.pending_busy_wait_audio.extend_from_slice(&buf);
         }
     }
 
@@ -707,20 +792,31 @@ impl EventLoop {
         if let Some(new_state) = self.busy_gate.observe(samples) {
             self.emit_vara(VaraResponse::Busy(new_state)).await;
         }
+        self.decode_and_dispatch_audio(samples).await;
+    }
 
-        // `CoppaCore::push_samples` owns all the buffering/sync/frame-boundary
-        // bookkeeping the old DECODE_WINDOW/SLIDE_STEP/MAX_STREAM_BUFFER block used
-        // to do by hand here; this just dispatches whatever frames complete as a
-        // result of this chunk.
-        //
-        // Whichever call completes a candidate runs the full demod/FEC pass
-        // synchronously (see `StreamingReceiver::push_samples`'s doc) — since we're
-        // called with no `spawn_blocking`, that stalls this async event loop for
-        // the frame's decode time (~tens of ms). Accepted for now: input audio is
-        // buffered in `audio_in`'s ring during the stall, and its overflow counter
-        // (`poll_audio_input`) would surface it if that ring ever actually
-        // overflowed. Moving the decode to a worker thread would be the fix if this
-        // ever becomes a real problem.
+    /// Decode whatever frames complete as a result of `samples` and dispatch
+    /// each one (MAC PDU handling, ARQ, host forwarding, WebSocket
+    /// broadcast). Split out from `handle_audio_in` (Finding 1, Phase 4 Task
+    /// 3 review) so `poll_audio_input` can run this on audio that was merely
+    /// *observed* by the busy gate during a `wait_for_clear_channel` busy
+    /// wait (see `observe_busy_gate_from_audio_input`) without re-feeding
+    /// that same audio into `busy_gate.observe` a second time.
+    ///
+    /// `CoppaCore::push_samples` owns all the buffering/sync/frame-boundary
+    /// bookkeeping the old DECODE_WINDOW/SLIDE_STEP/MAX_STREAM_BUFFER block used
+    /// to do by hand here; this just dispatches whatever frames complete as a
+    /// result of this chunk.
+    ///
+    /// Whichever call completes a candidate runs the full demod/FEC pass
+    /// synchronously (see `StreamingReceiver::push_samples`'s doc) — since we're
+    /// called with no `spawn_blocking`, that stalls this async event loop for
+    /// the frame's decode time (~tens of ms). Accepted for now: input audio is
+    /// buffered in `audio_in`'s ring during the stall, and its overflow counter
+    /// (`poll_audio_input`) would surface it if that ring ever actually
+    /// overflowed. Moving the decode to a worker thread would be the fix if this
+    /// ever becomes a real problem.
+    async fn decode_and_dispatch_audio(&mut self, samples: &[f32]) {
         for frame in self.engine.push_samples(samples) {
             let snr_db = frame.snr_db;
             #[cfg(feature = "websocket")]
@@ -978,15 +1074,25 @@ impl EventLoop {
     /// clears), re-checking busy state after the backoff in case the channel
     /// went busy again during it -- looping back to wait again if so.
     ///
-    /// `BusyGate` only updates when fed fresh audio via `handle_audio_in`,
-    /// which this event loop otherwise only calls from `run`'s own
-    /// `audio_poll` tick -- a `tokio::select!` branch that can't run
-    /// concurrently with this same call (both execute on the same task).
-    /// This loop therefore drives `poll_audio_input` itself on every
-    /// iteration so real RX audio queued in the input ring (kept filling by
-    /// a separate OS-level audio thread/callback even while this task is
-    /// blocked here) actually reaches `BusyGate::observe` during the wait,
-    /// instead of the gate's state going stale for the whole hold.
+    /// Deliberately independent of `callsign`/station-ID configuration
+    /// (unlike `id_due`/`maybe_send_beacon`, which both require
+    /// `local_callsign.is_some()`): channel courtesy is basic good operating
+    /// practice, not a regulatory identification requirement, so it applies
+    /// even when no callsign is configured. Confirmed with Tony (project
+    /// owner) as a deliberate design decision, not an oversight against the
+    /// brief's literal "all three features off when callsign unset" text.
+    ///
+    /// `BusyGate` only updates when fed fresh audio, which this event loop
+    /// otherwise only reads from `run`'s own `audio_poll` tick -- a
+    /// `tokio::select!` branch that can't run concurrently with this same
+    /// call (both execute on the same task). This loop therefore drains the
+    /// audio input ring and feeds `BusyGate::observe` itself on every
+    /// iteration (`observe_busy_gate_from_audio_input` -- see its doc for why
+    /// it's a narrower call than `poll_audio_input`), so real RX audio queued
+    /// in the input ring (kept filling by a separate OS-level audio
+    /// thread/callback even while this task is blocked here) actually
+    /// reaches the gate during the wait, instead of its state going stale for
+    /// the whole hold.
     async fn wait_for_clear_channel(&mut self) {
         let hold_ms = self.config.station_id.busy_hold_ms;
         if hold_ms == 0 || !self.busy_gate.current() {
@@ -994,19 +1100,13 @@ impl EventLoop {
         }
         loop {
             while self.busy_gate.current() {
-                // Boxed: `transmit_samples` -> `wait_for_clear_channel` ->
-                // `poll_audio_input` -> `handle_audio_in` -> `handle_mac_pdu`
-                // -> (e.g.) `handle_incoming_connect` -> `transmit_samples`
-                // forms an async call cycle; one edge needs indirection to
-                // give the compiler a finite-sized future (same pattern as
-                // `try_drain_tx_queue`'s call into `transmit_samples`).
-                Box::pin(self.poll_audio_input()).await;
+                self.observe_busy_gate_from_audio_input().await;
                 tokio::time::sleep(Duration::from_millis(hold_ms)).await;
             }
 
             let holdoff_secs: f32 = rand::rng().random_range(0.5f32..2.0f32);
             tokio::time::sleep(Duration::from_secs_f32(holdoff_secs)).await;
-            Box::pin(self.poll_audio_input()).await; // pick up anything that arrived during the holdoff
+            self.observe_busy_gate_from_audio_input().await; // pick up anything that arrived during the holdoff
 
             if !self.busy_gate.current() {
                 return;
@@ -1021,7 +1121,13 @@ impl EventLoop {
     /// seconds since the last ID actually sent (or since `EventLoop`
     /// construction, if none yet).
     fn id_due(&self) -> bool {
-        if self.config.engine.callsign.is_empty() {
+        // Check `local_callsign` (the parsed form), not the raw config
+        // string -- an invalid-but-non-empty `callsign` string parses to
+        // `local_callsign: None` (see `EventLoop::new`), and matches the
+        // same check `build_beacon_mac_pdu` uses, so this can't report "due"
+        // for a frame that `build_beacon_mac_pdu` then silently refuses to
+        // build.
+        if self.local_callsign.is_none() {
             return false;
         }
         let interval = self.config.station_id.id_interval_secs;
@@ -1046,12 +1152,24 @@ impl EventLoop {
             grid: self.config.engine.grid.clone(),
             level: 1,
         };
+        // `to_bytes` only fails on a >255-byte callsign/grid; a parsed
+        // `Callsign` is already bounded well under that, and `grid` is a
+        // small free-text locator in practice, but this is still real,
+        // operator-supplied config -- log and skip rather than panic/corrupt
+        // the frame on the (currently unreachable in practice) error path.
+        let payload_bytes = match id_payload.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to encode station-ID payload");
+                return None;
+            }
+        };
         Some(MacPdu::new(
             MacFrameType::Beacon,
             local.clone(),
             local,
             0,
-            id_payload.to_bytes(),
+            payload_bytes,
         ))
     }
 
@@ -1082,7 +1200,10 @@ impl EventLoop {
     /// is clear."
     async fn maybe_send_beacon(&mut self) {
         let interval = self.config.station_id.beacon_interval_secs;
-        if interval == 0 || self.config.engine.callsign.is_empty() {
+        // See `id_due`'s comment: check the parsed `local_callsign`, not the
+        // raw config string, so this can't report "due" for a callsign that
+        // `build_beacon_mac_pdu` will then silently refuse to build a frame for.
+        if interval == 0 || self.local_callsign.is_none() {
             return;
         }
         if self.last_beacon_time.elapsed() < Duration::from_secs(interval) {
@@ -2153,6 +2274,148 @@ mod tests {
             assert!(
                 available >= payload.len(),
                 "the deferred transmission should still have gone out eventually"
+            );
+        }
+
+        // ── Finding 1 fix (Task 3 review): busy-wait reentrancy hazard ──
+        //
+        // `wait_for_clear_channel` used to drive the *full* `poll_audio_input`
+        // (frame decode + MAC-PDU dispatch) on every iteration of its wait
+        // loop. A CONNECT_REQ/CONNECT_ACK decoded mid-wait would run
+        // `handle_incoming_connect`/`handle_connect_ack_rx`, both of which
+        // call `transmit_samples` directly -- a second, nested PTT-key/
+        // write-audio/schedule-release cycle interleaved with the
+        // already-in-flight *outer* `transmit_samples` call, before
+        // `is_transmitting` is even set. The fix makes this structurally
+        // impossible: the wait loop now only ever calls
+        // `observe_busy_gate_from_audio_input`, which feeds the busy gate
+        // but never reaches `decode_and_dispatch_audio`/`handle_mac_pdu`.
+        // This test proves the *behavior* that structural change produces:
+        // a decodable CONNECT_REQ arriving mid-wait is captured (not
+        // dropped) but not dispatched until control returns to `run`'s main
+        // loop.
+        #[tokio::test(start_paused = true)]
+        async fn test_incoming_connect_req_mid_busy_wait_is_not_dispatched_until_after() {
+            use coppa_protocol::session::Session;
+
+            let mut config = config_with_callsign(); // local callsign "VK3ABC"
+            config.station_id.busy_hold_ms = 10;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            event_loop.listening = true;
+
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+            let (mut audio_in_tx, audio_in_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_in(audio_in_rx);
+
+            // Force the busy gate busy, same pattern as the test above.
+            let mut counter = 99u32;
+            for _ in 0..10 {
+                event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.01, &mut counter));
+            }
+            for _ in 0..5 {
+                event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.5, &mut counter));
+            }
+            assert!(event_loop.busy_gate.current());
+
+            // Build a real, decodable CONNECT_REQ from a remote station
+            // "W1AW", addressed to our own "VK3ABC" -- exactly what
+            // `handle_incoming_connect` needs to create a session and fire
+            // back a CONNECT_ACK via `transmit_samples`.
+            let local_cs = Callsign::new("VK3ABC").unwrap();
+            let remote_cs = Callsign::new("W1AW").unwrap();
+            let mut remote_session = Session::new(
+                0,
+                remote_cs.clone(),
+                local_cs.clone(),
+                0,
+                LinkCapabilities::default(),
+            );
+            let req_pdu = remote_session.initiate().unwrap();
+            let req_samples = event_loop
+                .engine
+                .encode_bytes(&req_pdu.to_bytes())
+                .expect("encode should succeed");
+            let req_audio = with_lead_and_trail(&req_samples);
+
+            // Sanity check (independent decoder instance, not the event
+            // loop's own): the constructed audio really is a decodable
+            // frame at the PHY/FEC layer, so this test's premise -- real
+            // traffic arriving mid-wait -- actually holds.
+            //
+            // NOTE: `frame.message` is expected to be `Err(..)` here even on
+            // a full, correct decode -- `CoppaCore::push_samples`'s
+            // `StreamFrame::message: Result<String>` requires the decoded
+            // payload to be valid UTF-8, which a real (binary) `MacPdu`
+            // essentially never is (packed 6-bit callsigns, binary session
+            // negotiation payloads, and this engine's default
+            // Huffman+LZ4 compression). That's a separate, pre-existing
+            // limitation in the daemon's streaming decode path -- unrelated
+            // to Finding 1's reentrancy bug, not fixed here, flagged in the
+            // fix report. It's why this test checks that the buffered
+            // CONNECT_REQ audio is decoded (frame found at the PHY/FEC
+            // layer) and not lost/dropped, rather than checking that a
+            // session actually gets created from it end-to-end.
+            let mut probe = coppa_engine::CoppaCore::new();
+            assert_eq!(
+                probe.push_samples(&req_audio).len(),
+                1,
+                "sanity check: the constructed CONNECT_REQ audio must be \
+                 independently decodable for this test's premise to hold"
+            );
+
+            // Pre-load the ring: quiet noise first (so the busy gate reads
+            // clear during the wait, same as the injected-occupancy test
+            // above), then the CONNECT_REQ audio after it.
+            for _ in 0..15 {
+                audio_in_tx.write(&noise_block(0.01, &mut counter));
+            }
+            audio_in_tx.write(&req_audio);
+
+            let payload = vec![0.25f32; 500]; // stand-in "encoded frame" audio
+            event_loop.transmit_samples(&payload).await;
+
+            assert!(
+                !event_loop.busy_gate.current(),
+                "channel should read clear after the wait"
+            );
+            assert_eq!(
+                audio_out_rx.available(),
+                payload.len(),
+                "exactly the outer transmission should have gone out -- a \
+                 nested CONNECT_ACK transmission mid-wait would show up as \
+                 extra bytes here"
+            );
+            assert!(
+                event_loop.session_mgr.active_sessions().is_empty(),
+                "the CONNECT_REQ must not have been dispatched (no session \
+                 created) while the outer transmit_samples call was still \
+                 waiting"
+            );
+            assert!(
+                !event_loop.pending_busy_wait_audio.is_empty(),
+                "audio observed by the busy gate during the wait must be \
+                 queued for later decode, not dropped"
+            );
+
+            // Once control returns to the main loop -- simulated here by
+            // calling `poll_audio_input` directly, exactly as `run`'s own
+            // `audio_poll` tick would -- the deferred audio is hand off to
+            // the decoder for real (traffic is deferred, not lost): this
+            // must not panic, and the pending buffer must drain. (Full
+            // MAC-level dispatch success is separately gated by the
+            // pre-existing UTF-8 limitation noted above, so it isn't
+            // asserted here -- see the fix report.)
+            event_loop.poll_audio_input().await;
+
+            assert!(
+                event_loop.pending_busy_wait_audio.is_empty(),
+                "pending busy-wait audio should have been flushed and handed \
+                 to the decoder on the next main-loop poll"
             );
         }
 
