@@ -425,8 +425,9 @@ The 48 raw header bits are **never** sent unprotected. `header_fec`
   is 8, correcting up to 3 errors per 24-bit word (verified offline per the
   module doc, `crates/coppa-codec/src/ofdm/golay.rs:5-7`; correction-radius
   test at `crates/coppa-codec/src/ofdm/header_fec.rs:262-271`).
-- **Stride-5 interleave**: `interleave(coded)[i] = coded[(i * 5) mod 144]`
-  is applied to the concatenated 144 coded bits before BPSK mapping
+- **Stride-5 interleave**: `interleave(coded)[(i * 5) mod 144] = coded[i]`
+  (coded bit `i` is placed at output position `(i * 5) mod 144`) is applied
+  to the concatenated 144 coded bits before BPSK mapping
   (`crates/coppa-codec/src/ofdm/header_fec.rs:35-41`), a bijection since
   `gcd(5, 144) = 1` (round-trip test at `:254-259`). This spreads each
   Golay word's 24 bits across the header's OFDM symbols so a persistent
