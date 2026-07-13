@@ -30,15 +30,21 @@ pub const TUNE_TONE_HIGH_HZ: f32 = 1900.0;
 /// One decode result surfaced by [`CoppaCore::push_samples`] for a single frame
 /// `StreamingReceiver` completed.
 ///
-/// `message` mirrors `decode`'s batch-path contract exactly: the frame's payload
-/// goes through this engine's optional Huffman+LZ4 decompression (if the
-/// compression marker byte is present) and then a UTF-8 conversion, either of
-/// which can fail (both daemon and FFI callers want a UTF-8 `String`, the same
-/// as the batch `decode` they used before Task 7 — see the Task 7 report for why
-/// `push_samples` keeps that constraint rather than switching to raw bytes).
+/// `payload` is raw bytes: the frame's payload after this engine's optional
+/// Huffman+LZ4 decompression (if the compression marker byte is present), with
+/// NO UTF-8 conversion. This deliberately differs from `decode`'s batch-path
+/// contract (`decode` -> `decode_bytes` + `String::from_utf8`), which is a
+/// separate, text-message-only API used only by `coppa-cli`. `push_samples` is
+/// the daemon's and FFI's real streaming-decode path, and real session/ARQ
+/// traffic (`MacPdu`/`TransportPdu`, especially once Huffman+LZ4-compressed) is
+/// essentially never valid UTF-8 — forcing a UTF-8 conversion here silently
+/// dropped every such frame (Phase 4 Task 3.5 fix: this field used to be
+/// `message: Result<String>` and forced exactly that conversion). Callers that
+/// want a text message (e.g. FFI's existing text-message contract) can still
+/// attempt `String::from_utf8` themselves on the raw bytes.
 #[derive(Debug)]
 pub struct StreamFrame {
-    pub message: Result<String>,
+    pub payload: Result<Vec<u8>>,
     /// Real per-carrier-noise SNR estimate (dB) from `CoppaTransceiver::
     /// receive_with_metrics`, `10*log10(1/mean(noise_vars))` — NOT the crude
     /// whole-buffer RMS proxy `handle_audio_in` used to compute before Task 7.
@@ -314,8 +320,9 @@ impl CoppaCore {
     /// accumulated window as the batch path did): each incoming chunk is
     /// squelch-gated exactly like `decode_bytes` before it reaches the
     /// `StreamingReceiver`, and each frame the receiver completes has this
-    /// engine's Huffman+LZ4 decompression + UTF-8 conversion applied to its
-    /// payload, exactly like `decode` applies to a whole buffer in the batch path.
+    /// engine's Huffman+LZ4 decompression applied to its payload (no UTF-8
+    /// conversion — see `StreamFrame::payload`'s doc for why this differs from
+    /// `decode`'s batch-path contract).
     pub fn push_samples(&mut self, samples: &[f32]) -> Vec<StreamFrame> {
         if self.is_squelched(samples) {
             return Vec::new();
@@ -324,9 +331,7 @@ impl CoppaCore {
         frames
             .into_iter()
             .map(|f| StreamFrame {
-                message: self
-                    .decompress_if_needed(f.payload)
-                    .and_then(|data| String::from_utf8(data).map_err(Into::into)),
+                payload: self.decompress_if_needed(f.payload),
                 snr_db: f.snr_db,
                 cfo_hz: f.cfo_hz,
                 frame_start: f.frame_start,
@@ -546,9 +551,9 @@ mod tests {
         let frames = core.push_samples(&samples);
         assert_eq!(frames.len(), 1, "expected exactly one decoded frame");
         assert_eq!(
-            frames[0].message.as_deref().unwrap(),
-            "Streaming works",
-            "push_samples should recover the encoded message"
+            frames[0].payload.as_deref().unwrap(),
+            "Streaming works".as_bytes(),
+            "push_samples should recover the encoded message's raw bytes"
         );
         assert!(
             frames[0].snr_db.is_finite(),
@@ -568,7 +573,7 @@ mod tests {
         let samples = with_lead_and_trail(&samples);
         let frames = core.push_samples(&samples);
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].message.as_deref().unwrap(), message);
+        assert_eq!(frames[0].payload.as_deref().unwrap(), message.as_bytes());
     }
 
     #[test]
@@ -583,7 +588,88 @@ mod tests {
             frames.extend(core.push_samples(chunk));
         }
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].message.as_deref().unwrap(), "Chunked streaming");
+        assert_eq!(
+            frames[0].payload.as_deref().unwrap(),
+            "Chunked streaming".as_bytes()
+        );
+    }
+
+    // ── Task 3.5 (Phase 4): streaming decode must not force UTF-8 ─────────
+    //
+    // Regression tests for a real, pre-existing bug: `StreamFrame` used to be
+    // `message: Result<String>`, and `push_samples` forced
+    // `String::from_utf8` on every decoded frame's payload. Real binary
+    // session/ARQ traffic (`MacPdu`/`TransportPdu`, especially once this
+    // engine's own Huffman+LZ4 compression is applied) is essentially never
+    // valid UTF-8, so every such frame landed in the `Err` branch and was
+    // silently dropped by both real consumers (`coppa-daemon`,
+    // `coppa-ffi`) -- real session establishment over actual RF audio
+    // through the daemon's real streaming decode path has likely never
+    // worked. Fixed by switching `StreamFrame::message: Result<String>` to
+    // `StreamFrame::payload: Result<Vec<u8>>` with no UTF-8 conversion.
+
+    #[test]
+    fn test_push_samples_recovers_non_utf8_binary_payload() {
+        // A payload containing an invalid UTF-8 byte sequence (0xFF/0xFE are
+        // never valid UTF-8 in this position, per se). Under the OLD code,
+        // `frames[0].message` would have been `Err(FromUtf8Error)` here and
+        // the frame would have been unusable to any caller that only
+        // handled `Ok` (which is exactly what both real consumers did).
+        let mut core = CoppaCore::new();
+        let data: Vec<u8> = vec![b'A', b'B', 0xFF, 0xFE, b'C', 0x00, 0x01, 0x02, b'D'];
+        assert!(
+            String::from_utf8(data.clone()).is_err(),
+            "test payload must actually be invalid UTF-8 for this regression test to mean anything"
+        );
+
+        let samples = core.encode_bytes(&data).expect("encode should succeed");
+        let samples = with_lead_and_trail(&samples);
+        let frames = core.push_samples(&samples);
+        assert_eq!(frames.len(), 1, "expected exactly one decoded frame");
+        assert_eq!(
+            frames[0].payload.as_deref().unwrap(),
+            data.as_slice(),
+            "binary payload should roundtrip exactly via push_samples, not be \
+             silently dropped as a UTF-8 conversion error"
+        );
+    }
+
+    #[test]
+    fn test_push_samples_recovers_real_binary_mac_pdu() {
+        // The exact real-world shape this bug broke: a `MacPdu` (packed
+        // 6-bit callsigns + a binary payload) pushed through the engine's
+        // real streaming decode path, then re-parsed with `MacPdu::from_bytes`
+        // exactly like `coppa-daemon::event_loop::decode_and_dispatch_audio`
+        // does. Under the OLD code this would have failed at the UTF-8
+        // conversion step, before `MacPdu::from_bytes` ever ran.
+        use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu};
+
+        let mut core = CoppaCore::new();
+        let dest = Callsign::new("VK3ABC").unwrap();
+        let src = Callsign::new("W1AW").unwrap();
+        // Binary inner payload guaranteed not to be valid UTF-8.
+        let inner_payload: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x80, 0x81, 0xC0];
+        let mac_pdu = MacPdu::new(MacFrameType::Data, dest, src, 0, inner_payload);
+        let pdu_bytes = mac_pdu.to_bytes();
+
+        let samples = core
+            .encode_bytes(&pdu_bytes)
+            .expect("encode should succeed");
+        let samples = with_lead_and_trail(&samples);
+        let frames = core.push_samples(&samples);
+        assert_eq!(frames.len(), 1, "expected exactly one decoded frame");
+
+        let decoded_payload = frames[0]
+            .payload
+            .as_deref()
+            .expect("payload should decode successfully, not be dropped as a UTF-8 error");
+        assert_eq!(decoded_payload, pdu_bytes.as_slice());
+
+        let decoded_pdu =
+            MacPdu::from_bytes(decoded_payload).expect("MacPdu::from_bytes should parse cleanly");
+        assert_eq!(decoded_pdu.frame_type, MacFrameType::Data);
+        assert_eq!(decoded_pdu.dest.as_str(), "VK3ABC");
+        assert_eq!(decoded_pdu.src.as_str(), "W1AW");
     }
 
     #[test]

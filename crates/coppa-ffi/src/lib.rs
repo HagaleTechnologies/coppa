@@ -297,12 +297,24 @@ pub unsafe extern "C" fn coppa_feed_samples(
         let frames = engine.push_samples(sample_slice);
         if !frames.is_empty() {
             if let Ok(mut messages) = (*handle).decoded_messages.lock() {
-                // Frames that failed decompression/UTF-8 conversion are dropped,
-                // exactly like a failed batch `decode()` was silently dropped
-                // before Task 7's migration to `push_samples`.
+                // This function's contract (FFI v1) is text messages only: a
+                // frame whose raw (post-decompression) payload isn't valid
+                // UTF-8 is dropped here, same net behavior as before Phase 4
+                // Task 3.5 -- but now the UTF-8 attempt happens here, on the
+                // engine's raw `payload: Result<Vec<u8>>`, rather than being
+                // forced inside the engine itself (which used to silently
+                // drop real binary MAC-PDU/ARQ frames before they ever
+                // reached any consumer, FFI included). Frames that failed
+                // decompression are still dropped here too, exactly like a
+                // failed batch `decode()` was silently dropped before Task
+                // 7's migration to `push_samples`. Raw binary frame access
+                // for FFI callers is planned separately as Task 6 (FFI v2,
+                // not implemented here).
                 for frame in frames {
-                    if let Ok(message) = frame.message {
-                        messages.push_back(message);
+                    if let Ok(payload) = frame.payload {
+                        if let Ok(message) = String::from_utf8(payload) {
+                            messages.push_back(message);
+                        }
                     }
                 }
             }

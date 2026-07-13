@@ -823,8 +823,8 @@ impl EventLoop {
             let cfo_hz = frame.cfo_hz;
             #[cfg(feature = "websocket")]
             let speed_level = frame.speed_level;
-            match frame.message {
-                Ok(message) => {
+            match frame.payload {
+                Ok(payload) => {
                     // Telemetry: SNR (decision 8) after every decoded frame,
                     // regardless of what the frame's payload turns out to be —
                     // `DecodedFrame::snr_db` is known as soon as decode succeeds.
@@ -857,7 +857,7 @@ impl EventLoop {
                         snap.cfo = Some(cfo_hz);
                     }
 
-                    let decoded_bytes = message.as_bytes();
+                    let decoded_bytes = payload.as_slice();
 
                     // Try to parse as MAC PDU for session handling
                     if let Ok(mac_pdu) = MacPdu::from_bytes(decoded_bytes) {
@@ -2347,25 +2347,39 @@ mod tests {
             // frame at the PHY/FEC layer, so this test's premise -- real
             // traffic arriving mid-wait -- actually holds.
             //
-            // NOTE: `frame.message` is expected to be `Err(..)` here even on
-            // a full, correct decode -- `CoppaCore::push_samples`'s
-            // `StreamFrame::message: Result<String>` requires the decoded
-            // payload to be valid UTF-8, which a real (binary) `MacPdu`
-            // essentially never is (packed 6-bit callsigns, binary session
-            // negotiation payloads, and this engine's default
-            // Huffman+LZ4 compression). That's a separate, pre-existing
-            // limitation in the daemon's streaming decode path -- unrelated
-            // to Finding 1's reentrancy bug, not fixed here, flagged in the
-            // fix report. It's why this test checks that the buffered
-            // CONNECT_REQ audio is decoded (frame found at the PHY/FEC
-            // layer) and not lost/dropped, rather than checking that a
-            // session actually gets created from it end-to-end.
-            let mut probe = coppa_engine::CoppaCore::new();
+            // Previously (before the Phase 4 Task 3.5 fix), `frame.message`
+            // would have been `Err(..)` here even on a full, correct decode --
+            // `CoppaCore::push_samples`'s old `StreamFrame::message:
+            // Result<String>` forced UTF-8 conversion on the decoded payload,
+            // which a real (binary) `MacPdu` essentially never satisfies
+            // (packed 6-bit callsigns, binary session negotiation payloads).
+            // That was a separate, pre-existing bug in the daemon's streaming
+            // decode path -- unrelated to Finding 1's reentrancy bug, not fixed
+            // by that fix, but fixed since by Task 3.5's `StreamFrame::payload:
+            // Result<Vec<u8>>` (no UTF-8 conversion). This sanity check now
+            // asserts the full raw-bytes roundtrip, not just "a frame was
+            // found".
+            // Use the same profile (HF_STANDARD, compression enabled) the
+            // daemon's own `event_loop.engine` was built with -- a plain
+            // `CoppaCore::new()` defaults to compression *disabled* and would
+            // fail to undo `event_loop.engine`'s Huffman+LZ4 compression,
+            // which isn't what this sanity check is about.
+            let probe_profile = coppa_engine::profiles::get_profile("HF_STANDARD")
+                .expect("HF_STANDARD is a built-in profile");
+            let mut probe = coppa_engine::CoppaCore::from_profile(probe_profile);
+            let probe_frames = probe.push_samples(&req_audio);
             assert_eq!(
-                probe.push_samples(&req_audio).len(),
+                probe_frames.len(),
                 1,
                 "sanity check: the constructed CONNECT_REQ audio must be \
                  independently decodable for this test's premise to hold"
+            );
+            assert_eq!(
+                probe_frames[0].payload.as_deref().unwrap(),
+                req_pdu.to_bytes().as_slice(),
+                "sanity check: the binary CONNECT_REQ MacPdu must roundtrip \
+                 byte-for-byte through push_samples now that it no longer \
+                 forces UTF-8"
             );
 
             // Pre-load the ring: quiet noise first (so the busy gate reads
@@ -2404,18 +2418,28 @@ mod tests {
 
             // Once control returns to the main loop -- simulated here by
             // calling `poll_audio_input` directly, exactly as `run`'s own
-            // `audio_poll` tick would -- the deferred audio is hand off to
-            // the decoder for real (traffic is deferred, not lost): this
-            // must not panic, and the pending buffer must drain. (Full
-            // MAC-level dispatch success is separately gated by the
-            // pre-existing UTF-8 limitation noted above, so it isn't
-            // asserted here -- see the fix report.)
+            // `audio_poll` tick would -- the deferred audio is handed off to
+            // the decoder for real (traffic is deferred, not lost): this must
+            // not panic, the pending buffer must drain, and (since the Phase 4
+            // Task 3.5 fix) full MAC-level dispatch must actually succeed --
+            // this test predates that fix and used to only assert PHY/FEC
+            // decodability here, because the old UTF-8-forcing bug meant the
+            // CONNECT_REQ could never reach `MacPdu::from_bytes` at all.
             event_loop.poll_audio_input().await;
 
             assert!(
                 event_loop.pending_busy_wait_audio.is_empty(),
                 "pending busy-wait audio should have been flushed and handed \
                  to the decoder on the next main-loop poll"
+            );
+            assert_eq!(
+                event_loop.session_mgr.active_sessions().len(),
+                1,
+                "the deferred CONNECT_REQ should now be fully dispatched end \
+                 to end (a session created via handle_incoming_connect) -- \
+                 this only happens if MacPdu::from_bytes succeeded on the \
+                 frame's payload, proving the Task 3.5 fix rather than just \
+                 PHY/FEC decodability"
             );
         }
 
