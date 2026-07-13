@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod event_loop;
+#[cfg(feature = "websocket")]
 pub mod spectrum;
 #[cfg(feature = "kiss-tnc")]
 pub mod tnc;

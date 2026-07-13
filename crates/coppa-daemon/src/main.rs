@@ -5,6 +5,7 @@
 
 mod config;
 mod event_loop;
+#[cfg(feature = "websocket")]
 mod spectrum;
 
 #[cfg(feature = "kiss-tnc")]
