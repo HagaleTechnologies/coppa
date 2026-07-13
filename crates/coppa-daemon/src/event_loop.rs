@@ -468,7 +468,7 @@ impl EventLoop {
                 }
                 _ = retransmit_poll.tick() => {
                     // E6: Check for ARQ retransmits
-                    self.check_arq_retransmits();
+                    self.check_arq_retransmits().await;
                 }
                 _ = beacon_poll.tick() => {
                     self.maybe_send_beacon().await;
@@ -493,7 +493,7 @@ impl EventLoop {
                                 if let Ok(ka_pdu) = session.keepalive() {
                                     let ka_bytes = ka_pdu.to_bytes();
                                     if let Ok(samples) = self.engine.encode_bytes(&ka_bytes) {
-                                        self.handle_audio_out(&samples);
+                                        self.transmit_samples(&samples).await;
                                     }
                                 }
                             }
@@ -1052,6 +1052,16 @@ impl EventLoop {
         }
     }
 
+    /// Low-level write of raw samples to the audio-out ring. Does NOT assert
+    /// PTT, does NOT apply busy-channel-courtesy deferral, and does NOT
+    /// trigger the station-ID timer -- callers that are actually keying a
+    /// transmitter must go through `transmit_samples` (the real PTT
+    /// chokepoint) instead, which itself calls this as its last step. The
+    /// only other direct caller today is the `DaemonEvent::AudioOut` arm in
+    /// `run()`, a raw pass-through hook (unused by any in-tree production TX
+    /// path as of this writing; exercised only by this file's own tests) --
+    /// a future real caller of that event should route through
+    /// `transmit_samples` instead if it represents an actual transmission.
     fn handle_audio_out(&mut self, samples: &[f32]) {
         if samples.is_empty() {
             return;
@@ -1080,14 +1090,24 @@ impl EventLoop {
     /// Transmit encoded audio samples: assert PTT, write to ring buffer, schedule PTT release.
     ///
     /// This is the single chokepoint every TX path in this event loop funnels
-    /// through (host-driven encode, ARQ-adjacent session control frames, the
-    /// raw/ARQ TX-queue drain, `TUNE`), so busy-channel courtesy (Phase 4
-    /// Task 3, decision: gate here rather than duplicate at each call site)
-    /// and the station-ID timer's prepend both live here and apply uniformly
-    /// to every caller -- none of them are exempted; deferring a
+    /// through (host-driven encode, ARQ-adjacent session control frames
+    /// including session keepalives, the raw/ARQ TX-queue drain, ARQ
+    /// retransmits, `TUNE`), so busy-channel courtesy (Phase 4 Task 3,
+    /// decision: gate here rather than duplicate at each call site) and the
+    /// station-ID timer's prepend both live here and apply uniformly to
+    /// every caller -- none of them are exempted; deferring a
     /// CONNECT_ACK/CFM by a fraction of a second for channel courtesy is
     /// judged better than bulldozing over real QRM, and none of this event
     /// loop's TX paths have a "must never be deferred" real-time constraint.
+    ///
+    /// Historical note: until this file's Phase 4 whole-branch-review fix,
+    /// `check_arq_retransmits` and the session-keepalive sender in `run()`
+    /// both wrote directly to the audio-out ring via `handle_audio_out`,
+    /// bypassing PTT assertion, busy-channel deferral, and the station-ID
+    /// prepend entirely -- silently inert while PTT was a stub, but a real
+    /// on-air-silence bug once PTT became real hardware control (Task 2).
+    /// Both are now routed through this function like every other TX path,
+    /// making the "none of them are exempted" claim above actually true.
     async fn transmit_samples(&mut self, samples: &[f32]) {
         self.wait_for_clear_channel().await;
 
@@ -1305,7 +1325,15 @@ impl EventLoop {
     }
 
     /// E6: Check for ARQ retransmits and send them.
-    fn check_arq_retransmits(&mut self) {
+    ///
+    /// Each retransmitted PDU is routed through `transmit_samples` (the PTT
+    /// chokepoint) one at a time, matching `try_drain_tx_queue`'s existing
+    /// one-frame-at-a-time pattern: `transmit_samples` schedules its own PTT
+    /// release asynchronously per call, so sending retransmit N+1 only after
+    /// awaiting retransmit N's `transmit_samples` call keeps each one's PTT
+    /// assert/busy-wait/station-ID-prepend logic correctly scoped to that one
+    /// frame, rather than batching multiple PDUs under a single PTT key-up.
+    async fn check_arq_retransmits(&mut self) {
         if !self.config.engine.arq_enabled {
             return;
         }
@@ -1326,7 +1354,7 @@ impl EventLoop {
         for pdu_bytes in retransmit_pdus {
             match self.engine.encode_bytes(&pdu_bytes) {
                 Ok(samples) => {
-                    self.handle_audio_out(&samples);
+                    self.transmit_samples(&samples).await;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "ARQ retransmit encode failed");
@@ -2165,6 +2193,149 @@ mod tests {
                     }
                     panic!(
                         "expected a PTT ON ... PTT OFF bracket within the first 8 lines, got: {:?}",
+                        lines
+                    );
+                })
+                .await;
+        }
+
+        /// Regression test for the Phase 4 whole-branch-review PTT-chokepoint
+        /// bug: `check_arq_retransmits` used to write straight to the
+        /// audio-out ring via `handle_audio_out`, bypassing PTT assertion,
+        /// busy-channel-courtesy deferral, and the station-ID timer entirely
+        /// -- silently inert while PTT was a stub, but a real on-air-silence
+        /// bug once PTT became real hardware control (Task 2). Seeds one ARQ
+        /// segment whose RTO has already elapsed and calls
+        /// `check_arq_retransmits` directly, confirming it emits real
+        /// "PTT ON" telemetry (via `emit_vara`, the same call
+        /// `transmit_samples`/`handle_ptt_change` make for every other TX
+        /// path) -- not just that audio appeared in the ring.
+        ///
+        /// Calls `check_arq_retransmits`/`handle_ptt_change` directly rather
+        /// than driving them through a spawned `run()` loop and its real
+        /// 500ms `retransmit_poll` timer (contrast
+        /// `test_ptt_telemetry_brackets_transmission`, which does use a real
+        /// `run()` loop for a *single* host-driven TX): `check_arq_retransmits`
+        /// doesn't call `ArqTx::mark_retransmitted` after retransmitting (a
+        /// real, separate, pre-existing gap -- out of scope for this fix,
+        /// noted in this task's report), so the same segment reads as
+        /// "still expired" on every subsequent tick, and a `run()`-driven
+        /// version of this test was observed to be genuinely flaky under
+        /// parallel test-suite load (multiple overlapping PTT ON/OFF pairs
+        /// racing before the first release event could be dispatched).
+        /// Calling both methods directly, one shot, sidesteps that
+        /// independently-flaky timing entirely while still proving the one
+        /// thing this test exists to prove.
+        #[tokio::test]
+        async fn test_arq_retransmit_asserts_ptt() {
+            let mut config = fast_ptt_config();
+            config.engine.arq_enabled = true;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19414, 19415).await;
+
+            // Seed one ARQ segment "sent" long enough ago that its RTO has
+            // already elapsed by the time `check_arq_retransmits` runs.
+            event_loop
+                .arq_tx
+                .as_mut()
+                .expect("arq_enabled = true should construct an ArqTx")
+                .send(
+                    b"stuck segment".to_vec(),
+                    Instant::now() - Duration::from_secs(120),
+                )
+                .expect("a fresh ARQ window should have room for one segment");
+
+            event_loop.check_arq_retransmits().await;
+            let on_line = read_line(&mut reader).await;
+            assert_eq!(
+                on_line.trim_end(),
+                "PTT ON",
+                "ARQ retransmit should assert real PTT telemetry, not just \
+                 write to the audio-out ring"
+            );
+
+            // Simulate the scheduled PTT release completing -- exactly what
+            // `run()`'s event-channel dispatch of the `DaemonEvent::PttChange(false)`
+            // `transmit_samples` spawns would do, called directly for the
+            // same determinism reason as above (mirrors
+            // `test_buffer_telemetry_progression_3_to_0`'s established
+            // technique of bypassing the real scheduled-release timer, which
+            // `test_ptt_telemetry_brackets_transmission` already covers
+            // end-to-end for the host-driven TX path).
+            event_loop.handle_ptt_change(false).await;
+            let off_line = read_line(&mut reader).await;
+            assert_eq!(off_line.trim_end(), "PTT OFF");
+        }
+
+        /// Same regression as `test_arq_retransmit_asserts_ptt`, for the
+        /// session-keepalive sender inline in `run()`'s `session_cleanup.tick()`
+        /// arm, which had the identical `handle_audio_out`-bypasses-PTT bug.
+        /// Seeds one `Established` session whose `last_activity` is already
+        /// well past a (deliberately tiny) `keepalive_interval`, so the very
+        /// next `session_cleanup` tick (real 5s wall-clock interval; this
+        /// event loop's periodic gates all use `std::time::Instant`, not
+        /// mockable via `tokio::time::pause`, per this file's own established
+        /// convention -- see `test_spectrum_broadcast_is_128_bins_and_rate_limited`'s
+        /// doc) sends a keepalive, and confirms it too now produces a real PTT
+        /// bracket instead of silently writing to the audio-out ring.
+        #[tokio::test]
+        async fn test_session_keepalive_asserts_ptt() {
+            let config = fast_ptt_config();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19416, 19417).await;
+
+            let local_cs = Callsign::new("VK3ABC").unwrap();
+            let remote_cs = Callsign::new("W1AW").unwrap();
+            let id = event_loop
+                .session_mgr
+                .create(local_cs, remote_cs, 0, LinkCapabilities::default())
+                .expect("a fresh SessionManager should have a free slot");
+            {
+                let session = event_loop
+                    .session_mgr
+                    .get_mut(id)
+                    .expect("just-created session should exist");
+                session.state = SessionState::Established;
+                session.keepalive_interval = Duration::from_millis(1);
+                // 65s ago: past the 1ms keepalive_interval, but well inside
+                // the default 120s session_timeout, so `cleanup_timed_out`
+                // (called earlier in the same tick) doesn't remove the
+                // session before the keepalive check runs.
+                session.last_activity = Instant::now() - Duration::from_secs(65);
+            }
+
+            let local = tokio::task::LocalSet::new();
+            local.spawn_local(async move {
+                let _ = event_loop.run().await;
+            });
+
+            local
+                .run_until(async move {
+                    // `session_cleanup` only ticks every real 5s (unlike
+                    // `retransmit_poll`'s 500ms), so this polls with
+                    // `read_available_lines` (no hard per-call timeout
+                    // panic) rather than `read_line` (hardcoded 2s timeout --
+                    // too short here) across a generous ~10s total budget.
+                    let mut lines = Vec::new();
+                    for _ in 0..34 {
+                        lines.extend(read_available_lines(&mut reader).await);
+                        let ptt_so_far: Vec<&str> = lines
+                            .iter()
+                            .map(|s| s.trim_end())
+                            .filter(|s| s.starts_with("PTT"))
+                            .collect();
+                        if ptt_so_far.len() >= 2
+                            && ptt_so_far[0] == "PTT ON"
+                            && ptt_so_far[1] == "PTT OFF"
+                        {
+                            return; // bracket observed in order — test passes
+                        }
+                    }
+                    panic!(
+                        "expected a PTT ON ... PTT OFF bracket from the \
+                         session keepalive within ~10s, got: {:?}",
                         lines
                     );
                 })
