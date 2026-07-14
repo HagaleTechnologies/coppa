@@ -9,10 +9,10 @@ pub mod null_ptt;
 pub mod rigctld;
 pub mod vox_ptt;
 
-#[cfg(feature = "serial-ptt-stub")]
+#[cfg(feature = "serial-ptt")]
 pub mod ptt_serial;
 
-#[cfg(feature = "gpio-ptt-stub")]
+#[cfg(feature = "gpio-ptt")]
 pub mod ptt_gpio;
 
 pub use null_ptt::NullPtt;

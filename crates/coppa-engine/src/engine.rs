@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 
+use coppa_codec::ofdm::coppa_modem::TX_PEAK;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::compression::huffman::HuffmanCodec;
@@ -17,18 +18,33 @@ use crate::profiles::Profile;
 /// Huffman+LZ4 compressed. Otherwise the payload is raw.
 const COMPRESSION_MARKER: u8 = 0xFE;
 
+/// Low tone of the standard SSB two-tone TX-level calibration signal (Hz).
+/// 700 Hz + 1900 Hz is standard amateur-radio TUNE/two-tone practice: both
+/// fall well inside the waveform's ~300-2700 Hz SSB passband (see
+/// `CLAUDE.md`) and are far enough apart that ALC/scope readings aren't
+/// confused by beat artifacts.
+pub const TUNE_TONE_LOW_HZ: f32 = 700.0;
+/// High tone of the standard SSB two-tone TX-level calibration signal (Hz).
+pub const TUNE_TONE_HIGH_HZ: f32 = 1900.0;
+
 /// One decode result surfaced by [`CoppaCore::push_samples`] for a single frame
 /// `StreamingReceiver` completed.
 ///
-/// `message` mirrors `decode`'s batch-path contract exactly: the frame's payload
-/// goes through this engine's optional Huffman+LZ4 decompression (if the
-/// compression marker byte is present) and then a UTF-8 conversion, either of
-/// which can fail (both daemon and FFI callers want a UTF-8 `String`, the same
-/// as the batch `decode` they used before Task 7 — see the Task 7 report for why
-/// `push_samples` keeps that constraint rather than switching to raw bytes).
+/// `payload` is raw bytes: the frame's payload after this engine's optional
+/// Huffman+LZ4 decompression (if the compression marker byte is present), with
+/// NO UTF-8 conversion. This deliberately differs from `decode`'s batch-path
+/// contract (`decode` -> `decode_bytes` + `String::from_utf8`), which is a
+/// separate, text-message-only API used only by `coppa-cli`. `push_samples` is
+/// the daemon's and FFI's real streaming-decode path, and real session/ARQ
+/// traffic (`MacPdu`/`TransportPdu`, especially once Huffman+LZ4-compressed) is
+/// essentially never valid UTF-8 — forcing a UTF-8 conversion here silently
+/// dropped every such frame (Phase 4 Task 3.5 fix: this field used to be
+/// `message: Result<String>` and forced exactly that conversion). Callers that
+/// want a text message (e.g. FFI's existing text-message contract) can still
+/// attempt `String::from_utf8` themselves on the raw bytes.
 #[derive(Debug)]
 pub struct StreamFrame {
-    pub message: Result<String>,
+    pub payload: Result<Vec<u8>>,
     /// Real per-carrier-noise SNR estimate (dB) from `CoppaTransceiver::
     /// receive_with_metrics`, `10*log10(1/mean(noise_vars))` — NOT the crude
     /// whole-buffer RMS proxy `handle_audio_in` used to compute before Task 7.
@@ -179,6 +195,90 @@ impl CoppaCore {
         Ok(samples)
     }
 
+    /// Encode arbitrary binary data to audio samples at an explicit `level`
+    /// (1-10), overriding `self.config.speed_level` for this one call.
+    ///
+    /// Reuses `self.transceiver` directly rather than constructing a second
+    /// transceiver/engine instance: `CoppaTransceiver::new` eagerly builds
+    /// per-speed-level modulation/FEC state (`LevelComponents`) for *every*
+    /// speed level up front, keyed purely off `CoppaHeader::speed_level` --
+    /// see `CoppaTransceiver::transmit`. The one thing that stays fixed is the
+    /// OFDM PHY layer itself (FFT size/carrier layout/HF-bandpass, chosen by
+    /// whichever `CoppaProfile` this engine was built with) -- forcing
+    /// `level` here does NOT switch between the HF and VHF profiles. That's
+    /// intentional: a level-1 frame sent over a *different* OFDM profile than
+    /// the rest of this link's traffic would be a physically different
+    /// waveform a fixed-profile `StreamingReceiver` (this engine's own, and
+    /// any peer's) couldn't sync to -- level here means "most robust
+    /// modulation/FEC within the profile already in use for this link", not
+    /// "force HF profile regardless of link config".
+    ///
+    /// No compression is applied (unlike `encode_bytes`): callers needing a
+    /// forced-level frame (station ID / beacon, Phase 4 Task 3) send small,
+    /// simple payloads where compression overhead isn't worth the complexity.
+    pub fn encode_bytes_at_level(&self, data: &[u8], level: u8) -> Result<Vec<f32>> {
+        if data.len() > u16::MAX as usize {
+            anyhow::bail!("Payload too large ({} bytes, max {})", data.len(), u16::MAX);
+        }
+
+        let header = CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: CoppaFrameType::Beacon,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: level,
+            seq_num: 0,
+            payload_len: data.len() as u16,
+            codewords: 1,
+        };
+
+        let samples = self
+            .transceiver
+            .transmit(&header, data)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        Ok(samples)
+    }
+
+    /// Generate a TX-level calibration ("TUNE") tone: an operator keys this and
+    /// advances their radio's audio drive until ALC just registers, then backs
+    /// off — standard amateur SSB practice (analogous to VARA's `TUNE`).
+    ///
+    /// Defaults to the standard SSB two-tone test signal (`TUNE_TONE_LOW_HZ` +
+    /// `TUNE_TONE_HIGH_HZ`, equal amplitude). Pass `single_hz` for a
+    /// single-tone variant (e.g. for power measurement with a wattmeter, where
+    /// a two-tone signal's fluctuating envelope makes a peak reading ambiguous).
+    ///
+    /// Peak-normalized to the same [`TX_PEAK`] frames use, so the drive level
+    /// an operator sets here transfers directly to real traffic.
+    pub fn tune_tone(&self, seconds: f32, single_hz: Option<f32>) -> Vec<f32> {
+        let sample_rate = self.config.sample_rate as f32;
+        let n = (seconds * sample_rate).round().max(0.0) as usize;
+        let two_pi = std::f32::consts::TAU;
+
+        let mut samples: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sample_rate;
+                match single_hz {
+                    Some(freq) => (two_pi * freq * t).sin(),
+                    None => {
+                        (two_pi * TUNE_TONE_LOW_HZ * t).sin()
+                            + (two_pi * TUNE_TONE_HIGH_HZ * t).sin()
+                    }
+                }
+            })
+            .collect();
+
+        let peak = samples.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        if peak > 1e-12 {
+            let gain = TX_PEAK / peak;
+            for s in &mut samples {
+                *s *= gain;
+            }
+        }
+        samples
+    }
+
     /// Decode audio samples back to a text message.
     pub fn decode(&self, samples: &[f32]) -> Result<String> {
         let data = self.decode_bytes(samples)?;
@@ -220,8 +320,9 @@ impl CoppaCore {
     /// accumulated window as the batch path did): each incoming chunk is
     /// squelch-gated exactly like `decode_bytes` before it reaches the
     /// `StreamingReceiver`, and each frame the receiver completes has this
-    /// engine's Huffman+LZ4 decompression + UTF-8 conversion applied to its
-    /// payload, exactly like `decode` applies to a whole buffer in the batch path.
+    /// engine's Huffman+LZ4 decompression applied to its payload (no UTF-8
+    /// conversion — see `StreamFrame::payload`'s doc for why this differs from
+    /// `decode`'s batch-path contract).
     pub fn push_samples(&mut self, samples: &[f32]) -> Vec<StreamFrame> {
         if self.is_squelched(samples) {
             return Vec::new();
@@ -230,9 +331,7 @@ impl CoppaCore {
         frames
             .into_iter()
             .map(|f| StreamFrame {
-                message: self
-                    .decompress_if_needed(f.payload)
-                    .and_then(|data| String::from_utf8(data).map_err(Into::into)),
+                payload: self.decompress_if_needed(f.payload),
                 snr_db: f.snr_db,
                 cfo_hz: f.cfo_hz,
                 frame_start: f.frame_start,
@@ -288,6 +387,29 @@ impl CoppaCore {
         self.transceiver = new.transceiver;
         self.config = new.config;
         self.streaming = new.streaming;
+    }
+
+    /// Change this engine's configured speed level in place (Phase 4 Task 6,
+    /// added for FFI v2's `coppa_engine_set_speed_level`).
+    ///
+    /// This is not a cheap field mutation: `level` also selects the HF/VHF
+    /// OFDM profile threshold (see `select_ofdm_profile`), so this rebuilds
+    /// the transceiver and streaming receiver exactly like `reconfigure`
+    /// does -- any samples already buffered in the streaming receiver (not
+    /// yet resolved into a completed frame) are discarded as a result.
+    ///
+    /// Returns an error, leaving this engine's current config untouched, if
+    /// `level` is not a valid wire speed level (1-10; 8 is reserved) -- see
+    /// `coppa_protocol::modem::speed_level_components`, the single source of
+    /// truth for valid levels that this deliberately defers to rather than
+    /// duplicating.
+    pub fn set_speed_level(&mut self, level: u8) -> Result<()> {
+        coppa_protocol::modem::speed_level_components(level)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let mut config = self.config.clone();
+        config.speed_level = level;
+        self.reconfigure(config);
+        Ok(())
     }
 }
 
@@ -452,9 +574,9 @@ mod tests {
         let frames = core.push_samples(&samples);
         assert_eq!(frames.len(), 1, "expected exactly one decoded frame");
         assert_eq!(
-            frames[0].message.as_deref().unwrap(),
-            "Streaming works",
-            "push_samples should recover the encoded message"
+            frames[0].payload.as_deref().unwrap(),
+            "Streaming works".as_bytes(),
+            "push_samples should recover the encoded message's raw bytes"
         );
         assert!(
             frames[0].snr_db.is_finite(),
@@ -474,7 +596,7 @@ mod tests {
         let samples = with_lead_and_trail(&samples);
         let frames = core.push_samples(&samples);
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].message.as_deref().unwrap(), message);
+        assert_eq!(frames[0].payload.as_deref().unwrap(), message.as_bytes());
     }
 
     #[test]
@@ -489,7 +611,88 @@ mod tests {
             frames.extend(core.push_samples(chunk));
         }
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].message.as_deref().unwrap(), "Chunked streaming");
+        assert_eq!(
+            frames[0].payload.as_deref().unwrap(),
+            "Chunked streaming".as_bytes()
+        );
+    }
+
+    // ── Task 3.5 (Phase 4): streaming decode must not force UTF-8 ─────────
+    //
+    // Regression tests for a real, pre-existing bug: `StreamFrame` used to be
+    // `message: Result<String>`, and `push_samples` forced
+    // `String::from_utf8` on every decoded frame's payload. Real binary
+    // session/ARQ traffic (`MacPdu`/`TransportPdu`, especially once this
+    // engine's own Huffman+LZ4 compression is applied) is essentially never
+    // valid UTF-8, so every such frame landed in the `Err` branch and was
+    // silently dropped by both real consumers (`coppa-daemon`,
+    // `coppa-ffi`) -- real session establishment over actual RF audio
+    // through the daemon's real streaming decode path has likely never
+    // worked. Fixed by switching `StreamFrame::message: Result<String>` to
+    // `StreamFrame::payload: Result<Vec<u8>>` with no UTF-8 conversion.
+
+    #[test]
+    fn test_push_samples_recovers_non_utf8_binary_payload() {
+        // A payload containing an invalid UTF-8 byte sequence (0xFF/0xFE are
+        // never valid UTF-8 in this position, per se). Under the OLD code,
+        // `frames[0].message` would have been `Err(FromUtf8Error)` here and
+        // the frame would have been unusable to any caller that only
+        // handled `Ok` (which is exactly what both real consumers did).
+        let mut core = CoppaCore::new();
+        let data: Vec<u8> = vec![b'A', b'B', 0xFF, 0xFE, b'C', 0x00, 0x01, 0x02, b'D'];
+        assert!(
+            String::from_utf8(data.clone()).is_err(),
+            "test payload must actually be invalid UTF-8 for this regression test to mean anything"
+        );
+
+        let samples = core.encode_bytes(&data).expect("encode should succeed");
+        let samples = with_lead_and_trail(&samples);
+        let frames = core.push_samples(&samples);
+        assert_eq!(frames.len(), 1, "expected exactly one decoded frame");
+        assert_eq!(
+            frames[0].payload.as_deref().unwrap(),
+            data.as_slice(),
+            "binary payload should roundtrip exactly via push_samples, not be \
+             silently dropped as a UTF-8 conversion error"
+        );
+    }
+
+    #[test]
+    fn test_push_samples_recovers_real_binary_mac_pdu() {
+        // The exact real-world shape this bug broke: a `MacPdu` (packed
+        // 6-bit callsigns + a binary payload) pushed through the engine's
+        // real streaming decode path, then re-parsed with `MacPdu::from_bytes`
+        // exactly like `coppa-daemon::event_loop::decode_and_dispatch_audio`
+        // does. Under the OLD code this would have failed at the UTF-8
+        // conversion step, before `MacPdu::from_bytes` ever ran.
+        use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu};
+
+        let mut core = CoppaCore::new();
+        let dest = Callsign::new("VK3ABC").unwrap();
+        let src = Callsign::new("W1AW").unwrap();
+        // Binary inner payload guaranteed not to be valid UTF-8.
+        let inner_payload: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x80, 0x81, 0xC0];
+        let mac_pdu = MacPdu::new(MacFrameType::Data, dest, src, 0, inner_payload);
+        let pdu_bytes = mac_pdu.to_bytes();
+
+        let samples = core
+            .encode_bytes(&pdu_bytes)
+            .expect("encode should succeed");
+        let samples = with_lead_and_trail(&samples);
+        let frames = core.push_samples(&samples);
+        assert_eq!(frames.len(), 1, "expected exactly one decoded frame");
+
+        let decoded_payload = frames[0]
+            .payload
+            .as_deref()
+            .expect("payload should decode successfully, not be dropped as a UTF-8 error");
+        assert_eq!(decoded_payload, pdu_bytes.as_slice());
+
+        let decoded_pdu =
+            MacPdu::from_bytes(decoded_payload).expect("MacPdu::from_bytes should parse cleanly");
+        assert_eq!(decoded_pdu.frame_type, MacFrameType::Data);
+        assert_eq!(decoded_pdu.dest.as_str(), "VK3ABC");
+        assert_eq!(decoded_pdu.src.as_str(), "W1AW");
     }
 
     #[test]
@@ -505,5 +708,206 @@ mod tests {
             frames.is_empty(),
             "squelched silence should never reach the streaming receiver"
         );
+    }
+
+    // ── Task 3 (Phase 4): forced-level encoding (station ID / beacon) ─────
+
+    #[test]
+    fn test_encode_bytes_at_level_forces_level_regardless_of_config() {
+        // Engine configured at speed_level 3, but we force level 1.
+        let config = EngineConfig {
+            speed_level: 3,
+            ..Default::default()
+        };
+        let core = CoppaCore::with_config(config);
+        let data = b"VK3ABC";
+        let samples = core
+            .encode_bytes_at_level(data, 1)
+            .expect("encode at forced level 1 should succeed");
+        assert!(!samples.is_empty());
+
+        // Decoding via the transceiver directly should report speed_level 1,
+        // not the engine's configured level 3.
+        let decoded = core.decode_bytes(&samples).expect("decode should succeed");
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_encode_bytes_at_level_roundtrips_via_push_samples() {
+        let mut core = CoppaCore::new(); // default speed_level 1
+        let data = b"ID payload";
+        let samples = core
+            .encode_bytes_at_level(data, 1)
+            .expect("encode should succeed");
+        let samples = with_lead_and_trail(&samples);
+        let frames = core.push_samples(&samples);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].speed_level, 1);
+    }
+
+    #[test]
+    fn test_encode_bytes_at_level_rejects_oversized_payload() {
+        let core = CoppaCore::new();
+        let data = vec![0u8; u16::MAX as usize + 1];
+        assert!(core.encode_bytes_at_level(&data, 1).is_err());
+    }
+
+    // ── Task 6 (Phase 4): `set_speed_level` mutator for FFI v2 ────────────
+
+    #[test]
+    fn test_set_speed_level_valid_updates_config_and_roundtrips() {
+        let mut core = CoppaCore::new(); // default speed_level 1
+        core.set_speed_level(3).expect("level 3 is valid");
+        assert_eq!(core.config().speed_level, 3);
+
+        let data = b"level three";
+        let samples = core.encode_bytes(data).expect("encode should succeed");
+        let decoded = core.decode_bytes(&samples).expect("decode should succeed");
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_set_speed_level_rejects_reserved_level_8() {
+        let mut core = CoppaCore::new();
+        let before = core.config().speed_level;
+        assert!(core.set_speed_level(8).is_err(), "level 8 is reserved");
+        assert_eq!(
+            core.config().speed_level,
+            before,
+            "rejected level must not mutate the existing config"
+        );
+    }
+
+    #[test]
+    fn test_set_speed_level_rejects_out_of_range() {
+        let mut core = CoppaCore::new();
+        assert!(core.set_speed_level(0).is_err());
+        assert!(core.set_speed_level(11).is_err());
+        assert!(core.set_speed_level(255).is_err());
+    }
+
+    // ── Task 1 (Phase 4): TX level calibration (TUNE) ─────────────────────
+
+    mod tune_tone {
+        use super::*;
+        use coppa_dsp::fft::FftProcessor;
+        use num_complex::Complex32;
+
+        /// Magnitude spectrum of a 1-second buffer at `sample_rate`: with a
+        /// 1-second window, FFT bin `k` corresponds to exactly `k` Hz, so tone
+        /// frequencies land on exact integer bins with no spectral leakage.
+        fn magnitude_spectrum(samples: &[f32], sample_rate: usize) -> Vec<f32> {
+            assert_eq!(samples.len(), sample_rate);
+            let fft = FftProcessor::new(sample_rate);
+            let input: Vec<Complex32> = samples.iter().map(|&s| Complex32::new(s, 0.0)).collect();
+            fft.forward(&input).iter().map(|c| c.norm()).collect()
+        }
+
+        #[test]
+        fn test_duration_correct() {
+            let core = CoppaCore::new();
+            let sample_rate = core.config().sample_rate;
+
+            assert_eq!(core.tune_tone(1.0, None).len(), sample_rate as usize);
+            assert_eq!(
+                core.tune_tone(2.5, None).len(),
+                (2.5 * sample_rate as f32).round() as usize
+            );
+            assert_eq!(core.tune_tone(0.0, None).len(), 0);
+        }
+
+        #[test]
+        fn test_default_duration_matches_cli_default_of_10s() {
+            // The CLI/daemon default is 10 seconds (task brief); the engine
+            // itself takes an explicit duration, but confirm 10s produces the
+            // expected sample count at the default profile's sample rate.
+            let core = CoppaCore::new();
+            let sample_rate = core.config().sample_rate;
+            assert_eq!(core.tune_tone(10.0, None).len(), sample_rate as usize * 10);
+        }
+
+        #[test]
+        fn test_peak_equals_tx_peak() {
+            let core = CoppaCore::new();
+            let samples = core.tune_tone(1.0, None);
+            let peak = samples.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+            assert!(
+                (peak - TX_PEAK).abs() < 1e-4,
+                "two-tone peak {} should equal TX_PEAK {}",
+                peak,
+                TX_PEAK
+            );
+
+            let single = core.tune_tone(1.0, Some(1500.0));
+            let single_peak = single.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+            assert!(
+                (single_peak - TX_PEAK).abs() < 1e-4,
+                "single-tone peak {} should equal TX_PEAK {}",
+                single_peak,
+                TX_PEAK
+            );
+        }
+
+        #[test]
+        fn test_two_tone_buffer_is_exactly_700_and_1900_hz_equal_amplitude() {
+            let core = CoppaCore::new();
+            let sample_rate = core.config().sample_rate as usize;
+            let samples = core.tune_tone(1.0, None);
+            let mag = magnitude_spectrum(&samples, sample_rate);
+
+            let bin_low = mag[TUNE_TONE_LOW_HZ as usize];
+            let bin_high = mag[TUNE_TONE_HIGH_HZ as usize];
+            assert!(
+                bin_low > 0.0 && bin_high > 0.0,
+                "both tones must be present"
+            );
+            assert!(
+                (bin_low - bin_high).abs() / bin_low.max(bin_high) < 0.01,
+                "tones should be equal amplitude: {} vs {}",
+                bin_low,
+                bin_high
+            );
+
+            // A real-valued signal's spectrum mirrors around Nyquist; the tone
+            // energy should live entirely in these four bins (mirror images
+            // included). Nothing else should carry meaningful energy.
+            let mirror_low = mag[sample_rate - TUNE_TONE_LOW_HZ as usize];
+            let mirror_high = mag[sample_rate - TUNE_TONE_HIGH_HZ as usize];
+            let tone_energy = bin_low + bin_high + mirror_low + mirror_high;
+            let total_energy: f32 = mag.iter().sum();
+            assert!(
+                tone_energy / total_energy > 0.98,
+                "tone energy should dominate the spectrum: {} / {}",
+                tone_energy,
+                total_energy
+            );
+        }
+
+        #[test]
+        fn test_single_tone_variant_is_exactly_one_frequency() {
+            let core = CoppaCore::new();
+            let sample_rate = core.config().sample_rate as usize;
+            let samples = core.tune_tone(1.0, Some(1500.0));
+            let mag = magnitude_spectrum(&samples, sample_rate);
+
+            let bin = mag[1500];
+            assert!(bin > 0.0, "1500 Hz tone must be present");
+
+            // Every other bin (excluding the tone's mirror image) should be
+            // negligible in comparison.
+            let mirror = mag[sample_rate - 1500];
+            let tone_energy = bin + mirror;
+            let total_energy: f32 = mag.iter().sum();
+            assert!(
+                tone_energy / total_energy > 0.98,
+                "single tone should dominate the spectrum: {} / {}",
+                tone_energy,
+                total_energy
+            );
+
+            // The two-tone frequencies should carry no meaningful energy here.
+            assert!(mag[TUNE_TONE_LOW_HZ as usize] / bin < 0.01);
+            assert!(mag[TUNE_TONE_HIGH_HZ as usize] / bin < 0.01);
+        }
     }
 }

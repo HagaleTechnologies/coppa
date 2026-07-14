@@ -24,14 +24,26 @@ coppa-codec = { path = "../coppa-codec" }
 coppa-dsp = { path = "../coppa-dsp" }
 coppa-ml = { path = "../coppa-ml" }
 anyhow = { workspace = true }
+rand = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+[dev-dependencies]
+# test-util: only pulled in for test builds (Cargo dev-dependency feature
+# unification under resolver = "2" doesn't leak into the release binary) --
+# needed for `#[tokio::test(start_paused = true)]` / `tokio::time::advance`
+# in Task 3's busy-gate-holdoff tests, so timer waits resolve deterministically
+# without consuming real wall-clock time.
+tokio = { workspace = true, features = ["test-util"] }
+
 [features]
 default = []
 cpal-backend = ["coppa-audio/cpal-backend"]
-websocket = ["coppa-host/websocket"]
+websocket = ["coppa-host/websocket", "dep:serde_json"]
 kiss-tnc = ["coppa-host/kiss-tnc"]
+serial-ptt = ["coppa-radio/serial-ptt"]
+gpio-ptt = ["coppa-radio/gpio-ptt"]

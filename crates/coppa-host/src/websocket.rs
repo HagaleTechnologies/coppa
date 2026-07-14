@@ -24,6 +24,11 @@ pub enum WsClientMessage {
     /// Get status.
     #[serde(rename = "status")]
     Status,
+    /// Opt in/out of periodic `spectrum` broadcast messages (Phase 4 Task 4).
+    /// See [`WsServerMessage::Spectrum`]'s doc for why this is opt-in rather
+    /// than broadcast to every client unconditionally.
+    #[serde(rename = "spectrum")]
+    Spectrum { enabled: bool },
 }
 
 /// JSON message sent to a WebSocket client.
@@ -58,6 +63,29 @@ pub enum WsServerMessage {
     /// Disconnected.
     #[serde(rename = "disconnected")]
     Disconnected,
+    /// Periodic spectrum/waterfall update (Phase 4 Task 4): a 128-bin
+    /// log-magnitude (dB) power spectrum of Coppa's ~300-2800 Hz SSB
+    /// passband, produced by the daemon from the RX audio stream at a ~4 Hz
+    /// update rate (`crates/coppa-daemon/src/spectrum.rs`).
+    ///
+    /// Opt-in per client (`WsClientMessage::Spectrum { enabled: true }`),
+    /// not broadcast to every connection by default: this is the only
+    /// message type on the shared broadcast channel with an inherent
+    /// periodic rate (4 Hz) rather than being purely event-driven (a decoded
+    /// frame, a connect/disconnect) or client-request/response (`status`) --
+    /// unconditionally forwarding it to every connected client, most of
+    /// which have no use for a waterfall display, would flood them with
+    /// data they didn't ask for. `WebSocketServer::run`'s per-connection
+    /// forwarding loop checks each broadcast message's own `type` field and
+    /// only delivers a `spectrum` message to connections that opted in.
+    #[serde(rename = "spectrum")]
+    Spectrum {
+        /// 128 log-magnitude (dB) bins spanning the ~300-2800 Hz band,
+        /// lowest frequency first.
+        bins: Vec<f32>,
+        /// Wall-clock time this spectrum was computed (Unix epoch, ms).
+        timestamp_ms: u64,
+    },
 }
 
 /// Maximum number of concurrent WebSocket client connections.
@@ -81,6 +109,32 @@ pub struct WsStatus {
     pub snr: Option<i32>,
     pub level: Option<u8>,
     pub cfo: Option<f32>,
+}
+
+/// Whether a pre-serialized broadcast JSON string is a `spectrum` message
+/// (`WsServerMessage::Spectrum`), used by each connection's forwarding loop
+/// in [`WebSocketServer::run`] to gate delivery on that connection's own
+/// opt-in state.
+///
+/// The shared broadcast channel (`WebSocketServer::broadcast_tx`) carries
+/// pre-serialized JSON `String`s, not a typed enum -- by the time a message
+/// reaches here it's already text. A full `serde_json::Value` parse (rather
+/// than a cheaper raw prefix/substring check on the JSON text) is the
+/// deliberate choice here: correctness over cleverness. `#[serde(tag =
+/// "type")]`'s internally-tagged encoding does, in practice, always place
+/// `"type"` first in the emitted object, so a `starts_with(r#"{"type":
+/// "spectrum""#)` check would likely work too and avoid a parse -- but that's
+/// an implementation detail of serde's internal tagging, not a stability
+/// guarantee this code should quietly depend on. This runs once per
+/// broadcast message per connected client, at a message rate (status/data
+/// events, plus at most a 4 Hz spectrum stream, across up to
+/// `MAX_CONCURRENT_CONNECTIONS` clients) far too low for the parse cost to
+/// matter.
+fn is_spectrum_broadcast(json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.get("type")?.as_str().map(|s| s == "spectrum"))
+        .unwrap_or(false)
 }
 
 /// WebSocket server configuration.
@@ -214,6 +268,11 @@ impl WebSocketServer {
 
                 let (mut sink, mut ws_stream) = ws.split();
 
+                // Per-connection opt-in state for the `spectrum` broadcast stream
+                // (Phase 4 Task 4) -- see `WsServerMessage::Spectrum`'s doc for why
+                // this defaults to off and must be explicitly requested.
+                let mut spectrum_enabled = false;
+
                 // Main select loop: handle both client messages and engine broadcasts
                 loop {
                     tokio::select! {
@@ -221,6 +280,13 @@ impl WebSocketServer {
                         result = broadcast_rx.recv() => {
                             match result {
                                 Ok(json) => {
+                                    if is_spectrum_broadcast(&json) && !spectrum_enabled {
+                                        // This client hasn't opted in; every other
+                                        // broadcast message type is delivered
+                                        // unconditionally, matching this channel's
+                                        // pre-existing behavior.
+                                        continue;
+                                    }
                                     if sink.send(tokio_tungstenite::tungstenite::Message::Text(json.into())).await.is_err() {
                                         break;
                                     }
@@ -283,6 +349,10 @@ impl WebSocketServer {
                                                 }
                                                 continue;
                                             }
+                                            WsClientMessage::Spectrum { enabled } => {
+                                                spectrum_enabled = enabled;
+                                                continue;
+                                            }
                                         };
                                         let _ = event_tx.send(host_event).await;
                                     }
@@ -337,6 +407,64 @@ mod tests {
         assert!(json.contains("VK3DEF"));
         assert!(json.contains("\"level\":4"));
         assert!(json.contains("\"cfo\":12.5"));
+    }
+
+    #[test]
+    fn test_ws_spectrum_client_message_parse() {
+        let json = r#"{"type":"spectrum","enabled":true}"#;
+        let msg: WsClientMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            WsClientMessage::Spectrum { enabled } => assert!(enabled),
+            _ => panic!("Wrong variant"),
+        }
+
+        let json_off = r#"{"type":"spectrum","enabled":false}"#;
+        let msg: WsClientMessage = serde_json::from_str(json_off).unwrap();
+        match msg {
+            WsClientMessage::Spectrum { enabled } => assert!(!enabled),
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_ws_spectrum_server_message_format() {
+        let msg = WsServerMessage::Spectrum {
+            bins: vec![-80.0; 128],
+            timestamp_ms: 1_700_000_000_000,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"spectrum""#));
+        assert!(json.contains("\"timestamp_ms\":1700000000000"));
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["bins"].as_array().unwrap().len(), 128);
+    }
+
+    #[test]
+    fn test_is_spectrum_broadcast_identifies_spectrum_messages_only() {
+        let spectrum_json = serde_json::to_string(&WsServerMessage::Spectrum {
+            bins: vec![0.0; 128],
+            timestamp_ms: 0,
+        })
+        .unwrap();
+        assert!(is_spectrum_broadcast(&spectrum_json));
+
+        let data_json = serde_json::to_string(&WsServerMessage::Data {
+            data: "hello".to_string(),
+        })
+        .unwrap();
+        assert!(!is_spectrum_broadcast(&data_json));
+
+        let status_json = serde_json::to_string(&WsServerMessage::Status {
+            connected: false,
+            remote_call: None,
+            snr: None,
+            level: None,
+            cfo: None,
+        })
+        .unwrap();
+        assert!(!is_spectrum_broadcast(&status_json));
+
+        assert!(!is_spectrum_broadcast("not valid json"));
     }
 
     #[test]
@@ -522,6 +650,13 @@ mod integration_tests {
                                             client_id,
                                             command: text.to_string(),
                                         },
+                                        WsClientMessage::Spectrum { .. } => {
+                                            // This test-only helper doesn't exercise
+                                            // broadcast forwarding at all (see its own
+                                            // doc), so there's no per-connection
+                                            // opt-in state to update here.
+                                            continue;
+                                        }
                                     };
                                     let _ = tx.send(host_event).await;
                                 }
@@ -709,5 +844,99 @@ mod integration_tests {
             .unwrap()
             .unwrap();
         assert!(matches!(event, HostEvent::Disconnected { .. }));
+    }
+
+    /// Phase 4 Task 4 required scenario: "WS client subscribing gets spectrum
+    /// frames" -- AND the flip side, which is the actual point of making this
+    /// opt-in: a client that never sends `{"type":"spectrum","enabled":true}`
+    /// must NOT receive `spectrum` broadcasts, even though every other
+    /// broadcast message type (e.g. `data`) reaches every connection
+    /// unconditionally. Runs the real `WebSocketServer::run()` (not the
+    /// hand-rolled `start_server()` helper, which doesn't touch the broadcast
+    /// channel at all).
+    #[tokio::test]
+    async fn test_ws_spectrum_is_opt_in_per_client() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let server = WebSocketServer::with_bind_addr(port, "127.0.0.1".to_string());
+        let broadcast_tx = server.broadcast_sender();
+
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+
+        // Client A subscribes to spectrum.
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws_a.send(Message::Text(
+            r#"{"type":"spectrum","enabled":true}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        // Client B never opts in.
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        // Give both connections' select loops a moment to register the
+        // subscribe message (Client A) before broadcasting.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let spectrum_msg = WsServerMessage::Spectrum {
+            bins: vec![-90.0; 128],
+            timestamp_ms: 12345,
+        };
+        let spectrum_json = serde_json::to_string(&spectrum_msg).unwrap();
+        broadcast_tx.send(spectrum_json.clone()).unwrap();
+
+        // Client A (subscribed) must receive it.
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(2), ws_a.next())
+            .await
+            .expect("subscribed client should receive the spectrum broadcast")
+            .unwrap()
+            .unwrap();
+        let received: WsServerMessage = serde_json::from_str(resp.to_text().unwrap()).unwrap();
+        match received {
+            WsServerMessage::Spectrum { bins, timestamp_ms } => {
+                assert_eq!(bins.len(), 128);
+                assert_eq!(timestamp_ms, 12345);
+            }
+            other => panic!("expected Spectrum, got {:?}", other),
+        }
+
+        // Client B (not subscribed) must NOT receive the spectrum message.
+        // Prove it not merely by a timeout (which could also mean "arriving
+        // late") but by following up with a distinguishable broadcast Client
+        // B unconditionally SHOULD receive (a `data` message, gated on
+        // nothing) and confirming THAT is the first thing Client B sees.
+        let canary = WsServerMessage::Data {
+            data: "canary".to_string(),
+        };
+        broadcast_tx
+            .send(serde_json::to_string(&canary).unwrap())
+            .unwrap();
+
+        let resp_b = tokio::time::timeout(std::time::Duration::from_secs(2), ws_b.next())
+            .await
+            .expect("client B should still receive the unconditional canary broadcast")
+            .unwrap()
+            .unwrap();
+        let received_b: WsServerMessage = serde_json::from_str(resp_b.to_text().unwrap()).unwrap();
+        match received_b {
+            WsServerMessage::Data { data } => {
+                assert_eq!(
+                    data, "canary",
+                    "non-subscribed client's first received message must be the canary, \
+                     not the filtered-out spectrum broadcast"
+                );
+            }
+            other => panic!("expected the canary Data message, got {:?}", other),
+        }
+
+        ws_a.close(None).await.ok();
+        ws_b.close(None).await.ok();
     }
 }

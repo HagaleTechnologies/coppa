@@ -109,7 +109,12 @@ const KALMAN_HEADER_ENABLED: bool = true;
 /// Raised-cosine inter-symbol taper width in samples (0.5 ms @ 48 kHz).
 const RC_OVERLAP: usize = 24;
 /// TX peak normalization target (fraction of full scale).
-const TX_PEAK: f32 = 0.5;
+///
+/// `pub` so other TX-adjacent code that must match this level (e.g.
+/// `coppa-engine`'s `CoppaCore::tune_tone` TX-level-calibration tone
+/// generator) can reference the same value directly instead of duplicating
+/// the magic number and risking drift.
+pub const TX_PEAK: f32 = 0.5;
 
 /// Sampling-clock-offset (SCO) tracking tuning constants (Phase 3 Task 6,
 /// decision 7 -- see `demodulate_frame_impl`'s Pass 1 loop for where these are

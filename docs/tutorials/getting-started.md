@@ -101,6 +101,10 @@ sample_rate = 48000
 buffer_size = 8192
 
 [radio]
+# "none" (default), "vox", "rigctld", or "serial:<port>:<dtr|rts>" /
+# "gpio:<pin>" (Linux only; requires coppad built with --features
+# serial-ptt / gpio-ptt respectively). An unrecognized value is a hard
+# startup error, not a silent fallback to no PTT.
 ptt_method = "none"
 
 [host]

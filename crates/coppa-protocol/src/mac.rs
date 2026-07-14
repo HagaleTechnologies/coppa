@@ -263,6 +263,101 @@ impl MacPdu {
     }
 }
 
+/// Payload carried inside a [`MacFrameType::Beacon`] frame (station ID / beacon
+/// mode, Phase 4 Task 3): the operator's callsign, an optional free-text grid
+/// locator (e.g. "FN20"), and the speed level the frame itself was sent at.
+///
+/// This is distinct from -- and redundant with -- `MacPdu::src`'s packed 6-bit
+/// callsign encoding: `src` is what a receiving station's MAC layer uses to
+/// route/identify the frame, while this payload is the actual human-readable
+/// identification *content* (what an operator or a logging tool would display),
+/// matching the task brief's literal "callsign + grid (optional) + level"
+/// payload spec. Kept deliberately simple (length-prefixed ASCII fields, no
+/// compression, no versioning) since it's always sent as a small, level-1
+/// single-codeword frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StationIdPayload {
+    /// Station callsign, e.g. "VK3ABC".
+    pub callsign: String,
+    /// Optional free-text Maidenhead grid locator, e.g. "FN20". No validation
+    /// beyond what [`Self::to_bytes`]/[`Self::from_bytes`] need (this is an
+    /// operator-supplied free-text field).
+    pub grid: Option<String>,
+    /// Speed level (1-10) this frame was encoded at.
+    pub level: u8,
+}
+
+impl StationIdPayload {
+    /// Serialize to bytes: `[callsign_len: u8][callsign][grid_len: u8][grid][level: u8]`.
+    /// `grid_len == 0` means no grid was configured.
+    ///
+    /// Both length prefixes are single bytes, so a `callsign`/`grid` longer
+    /// than 255 bytes can't be represented -- these are unvalidated
+    /// operator-supplied config strings (real callsigns/grids are short in
+    /// practice, but nothing upstream enforces that), so this returns an
+    /// error rather than silently truncating the length prefix and emitting
+    /// a corrupted frame.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let callsign_bytes = self.callsign.as_bytes();
+        let grid_bytes = self.grid.as_deref().unwrap_or("").as_bytes();
+        if callsign_bytes.len() > u8::MAX as usize {
+            return Err(anyhow!(
+                "StationIdPayload: callsign too long to encode ({} bytes, max 255)",
+                callsign_bytes.len()
+            ));
+        }
+        if grid_bytes.len() > u8::MAX as usize {
+            return Err(anyhow!(
+                "StationIdPayload: grid too long to encode ({} bytes, max 255)",
+                grid_bytes.len()
+            ));
+        }
+        let mut out = Vec::with_capacity(2 + callsign_bytes.len() + grid_bytes.len() + 1);
+        out.push(callsign_bytes.len() as u8);
+        out.extend_from_slice(callsign_bytes);
+        out.push(grid_bytes.len() as u8);
+        out.extend_from_slice(grid_bytes);
+        out.push(self.level);
+        Ok(out)
+    }
+
+    /// Deserialize from bytes produced by [`Self::to_bytes`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.is_empty() {
+            return Err(anyhow!("StationIdPayload: empty input"));
+        }
+        let callsign_len = bytes[0] as usize;
+        let callsign_end = 1 + callsign_len;
+        if bytes.len() < callsign_end + 1 {
+            return Err(anyhow!("StationIdPayload: truncated callsign field"));
+        }
+        let callsign = String::from_utf8(bytes[1..callsign_end].to_vec())
+            .map_err(|e| anyhow!("StationIdPayload: invalid callsign UTF-8: {e}"))?;
+
+        let grid_len = bytes[callsign_end] as usize;
+        let grid_start = callsign_end + 1;
+        let grid_end = grid_start + grid_len;
+        if bytes.len() < grid_end + 1 {
+            return Err(anyhow!("StationIdPayload: truncated grid/level field"));
+        }
+        let grid = if grid_len == 0 {
+            None
+        } else {
+            Some(
+                String::from_utf8(bytes[grid_start..grid_end].to_vec())
+                    .map_err(|e| anyhow!("StationIdPayload: invalid grid UTF-8: {e}"))?,
+            )
+        };
+        let level = bytes[grid_end];
+
+        Ok(Self {
+            callsign,
+            grid,
+            level,
+        })
+    }
+}
+
 // ── 6-bit charset helpers ───────────────────────────────────────────
 
 fn char_to_code(ch: char) -> Option<u8> {
@@ -505,6 +600,100 @@ mod tests {
         let bytes = pdu.to_bytes();
         let decoded = MacPdu::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.payload, payload);
+    }
+
+    // ── StationIdPayload tests (Phase 4 Task 3) ───────────────────────
+
+    #[test]
+    fn test_station_id_payload_roundtrip_with_grid() {
+        let payload = StationIdPayload {
+            callsign: "VK3ABC".to_string(),
+            grid: Some("QF22".to_string()),
+            level: 1,
+        };
+        let bytes = payload.to_bytes().unwrap();
+        let decoded = StationIdPayload::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn test_station_id_payload_roundtrip_no_grid() {
+        let payload = StationIdPayload {
+            callsign: "W1AW".to_string(),
+            grid: None,
+            level: 1,
+        };
+        let bytes = payload.to_bytes().unwrap();
+        let decoded = StationIdPayload::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.grid, None);
+    }
+
+    #[test]
+    fn test_station_id_payload_encodes_level() {
+        let payload = StationIdPayload {
+            callsign: "N0CALL".to_string(),
+            grid: None,
+            level: 7,
+        };
+        let bytes = payload.to_bytes().unwrap();
+        let decoded = StationIdPayload::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.level, 7);
+    }
+
+    #[test]
+    fn test_station_id_payload_to_bytes_errors_on_oversized_callsign() {
+        let payload = StationIdPayload {
+            callsign: "X".repeat(256),
+            grid: None,
+            level: 1,
+        };
+        assert!(payload.to_bytes().is_err());
+    }
+
+    #[test]
+    fn test_station_id_payload_to_bytes_errors_on_oversized_grid() {
+        let payload = StationIdPayload {
+            callsign: "VK3ABC".to_string(),
+            grid: Some("G".repeat(256)),
+            level: 1,
+        };
+        assert!(payload.to_bytes().is_err());
+    }
+
+    #[test]
+    fn test_station_id_payload_from_bytes_empty_errors() {
+        assert!(StationIdPayload::from_bytes(&[]).is_err());
+    }
+
+    #[test]
+    fn test_station_id_payload_from_bytes_truncated_errors() {
+        // Claims a 10-byte callsign but only provides 2 bytes of data.
+        assert!(StationIdPayload::from_bytes(&[10, b'A', b'B']).is_err());
+    }
+
+    #[test]
+    fn test_station_id_payload_as_beacon_mac_pdu_roundtrip() {
+        let cs = Callsign::new("VK3ABC").unwrap();
+        let id_payload = StationIdPayload {
+            callsign: "VK3ABC".to_string(),
+            grid: Some("QF22".to_string()),
+            level: 1,
+        };
+        let pdu = MacPdu::new(
+            MacFrameType::Beacon,
+            cs.clone(),
+            cs.clone(),
+            0,
+            id_payload.to_bytes().unwrap(),
+        );
+        let bytes = pdu.to_bytes();
+        let decoded_pdu = MacPdu::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded_pdu.frame_type, MacFrameType::Beacon);
+        assert_eq!(decoded_pdu.src.as_str(), "VK3ABC");
+        assert_eq!(decoded_pdu.dest.as_str(), "VK3ABC");
+        let decoded_id = StationIdPayload::from_bytes(&decoded_pdu.payload).unwrap();
+        assert_eq!(decoded_id, id_payload);
     }
 
     #[test]

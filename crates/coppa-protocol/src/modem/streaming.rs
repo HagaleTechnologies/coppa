@@ -300,7 +300,7 @@ impl StreamingReceiver {
             }
 
             if !header_known {
-                match self.header_peek(start) {
+                match self.header_peek(start, cfo_hz) {
                     Some(header) => {
                         match SPEED_LEVELS.iter().find(|s| s.level == header.speed_level) {
                             Some(sl) => {
@@ -389,7 +389,35 @@ impl StreamingReceiver {
     /// symbols and broke every header decode; see the Task 7 report for the
     /// measured before/after), the header begins not at `3 * symbol_len` but at
     /// `rx_group_delay + 3 * symbol_len`.
-    fn header_peek(&self, start: u64) -> Option<CoppaHeader> {
+    /// `cfo_hz` is the sync candidate's own two-stage Moose CFO estimate
+    /// (`Pending::cfo_hz`, carried through from `SyncCandidate::cfo_hz`) —
+    /// see below for why this slice needs its own CFO correction, separate
+    /// from the full-frame path's.
+    ///
+    /// Review finding: this used to demodulate the raw (CFO-uncorrected)
+    /// slice directly. `CoppaModem::demodulate_frame_impl` (the batch/
+    /// full-search path `receive_with_metrics` below ultimately reaches)
+    /// removes the candidate's estimated CFO from the whole buffer BEFORE
+    /// calling `demodulate_header` -- residual CFO de-rotates every
+    /// subcarrier and can break the header's hard-decision BPSK demod
+    /// outright. Without the same correction here, `header_peek` silently
+    /// discarded every candidate with a non-negligible CFO -- not just an
+    /// intentionally-injected one (e.g. the golden vectors' `ssbcfo` channel,
+    /// 15 Hz) but also a merely noise-induced nonzero sync CFO estimate at
+    /// moderate SNR (e.g. the `awgn12` golden vectors, no injected CFO at
+    /// all) -- even though the full-frame path (reached only if this peek
+    /// succeeds) re-derives its own timing/CFO independently on the extended
+    /// slice and would have handled it fine. Confirmed via
+    /// `crates/coppa-cli/tests/rx_golden.rs`: those vectors decoded via the
+    /// batch `CoppaTransceiver::receive` API (no `header_peek` in that path)
+    /// but produced zero frames via `StreamingReceiver::push_samples` before
+    /// this fix, despite `push_samples` being handed the exact same samples.
+    /// `remove_cfo`'s correction is local to whatever slice it's given (a
+    /// pure per-sample de-rotation from that slice's own index 0, not tied
+    /// to absolute time) -- the same 0.5 Hz noise-floor gate
+    /// `demodulate_frame_impl` uses avoids a needless pass when the estimate
+    /// is negligible.
+    fn header_peek(&self, start: u64, cfo_hz: f32) -> Option<CoppaHeader> {
         let need = self.pending.as_ref()?.need;
         let start_rel = (start - self.ring_base) as usize;
         let slice: Vec<f32> = self
@@ -399,8 +427,18 @@ impl StreamingReceiver {
             .take(need)
             .copied()
             .collect();
+
+        let corrected;
+        let slice: &[f32] = if cfo_hz.abs() > 0.5 {
+            let sample_rate = self.transceiver.profile().sample_rate as f32;
+            corrected = coppa_codec::ofdm::sync::remove_cfo(&slice, cfo_hz, sample_rate);
+            &corrected
+        } else {
+            &slice
+        };
+
         let data_start = self.rx_group_delay + 3 * self.symbol_len;
-        self.transceiver.demodulate_header(&slice, data_start)
+        self.transceiver.demodulate_header(slice, data_start)
     }
 
     /// Evict ring samples no longer needed: from `pending.start` while accumulating,
@@ -526,6 +564,45 @@ mod tests {
             "frame2_start {} should be near {frame2_start}",
             decoded[1].frame_start
         );
+    }
+
+    /// Regression test for the `header_peek` CFO fix (Phase 4 Task 4 review
+    /// finding, see `header_peek`'s doc): a frame with a real injected CFO
+    /// must still decode via the streaming path, not just the batch
+    /// `CoppaTransceiver::receive` API. Before the fix, `header_peek` never
+    /// applied the sync candidate's own CFO estimate before demodulating the
+    /// header, so ANY candidate with a non-negligible CFO was silently
+    /// discarded (header decode "failure") even though the full-frame path
+    /// (reached only if the header peek succeeds) re-derives its own
+    /// timing/CFO independently and would have decoded it fine.
+    #[test]
+    fn streaming_decodes_a_frame_with_injected_cfo() {
+        let profile = CoppaProfile::hf_standard();
+        let tx = CoppaTransceiver::new(profile.clone(), 1);
+        let payload = b"CFO-affected streaming frame".to_vec();
+        let frame = make_frame(&tx, 2, &payload);
+
+        // Inject +15 Hz (matches testdata/golden/*_ssbcfo.wav's injected offset)
+        // by removing -15 Hz, the same trick `sync.rs`'s own
+        // `estimate_cfo_recovers_injected_offset` test uses.
+        let cfo_frame =
+            coppa_codec::ofdm::sync::remove_cfo(&frame, -15.0, profile.sample_rate as f32);
+
+        let symbol_len_lead = profile.fft_size + profile.cp_samples;
+        let mut stream = Vec::new();
+        stream.extend(std::iter::repeat_n(0.0f32, 4 * symbol_len_lead));
+        stream.extend_from_slice(&cfo_frame);
+        stream.extend(std::iter::repeat_n(0.0f32, 4 * symbol_len_lead));
+
+        let mut rx = StreamingReceiver::new(profile, 1);
+        let decoded = rx.push_samples(&stream);
+
+        assert_eq!(
+            decoded.len(),
+            1,
+            "expected exactly one decoded frame despite the injected +15 Hz CFO"
+        );
+        assert_eq!(decoded[0].payload[..payload.len()], payload[..]);
     }
 
     #[test]
