@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-07-15T04:28:22Z",
-  "head_commit": "59b0b63",
+  "generated_at": "2026-07-15T04:29:05Z",
+  "head_commit": "8b55a76",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -423,5 +423,8 @@
       "verified_date": "2026-07-07",
       "visibility": "public"
     }
-  ]
+  ],
+  "repo": "coppa",
+  "schema": "wiki-manifest/v1",
+  "visibility": "public"
 }
