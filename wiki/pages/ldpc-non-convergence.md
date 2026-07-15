@@ -5,35 +5,44 @@ kind: gotcha
 status: current
 maintainer: agent
 sources:
-  - crates/coppa/tests/phase_c_loopback.rs
+  - tests/phase_c_loopback.rs
   - crates/coppa-protocol/src/fec/ldpc/**
+  - docs/adr/005-nr-bg2-ldpc.md
+  - BENCHMARKS.md
 verified:
-  commit: c1d2676
-  date: 2026-07-07
+  commit: 59b0b63
+  date: 2026-07-14
 links:
   - coppa-protocol
   - adr-002-fec-strategy
+  - adr-005-nr-bg2-ldpc
 ---
-Speed levels 9 and 10 (64-QAM with 7/8 and 3/4 LDPC) fail to decode reliably
-even at high SNR in `crates/coppa/tests/phase_c_loopback.rs`. The decoder exits
-without convergence, producing bit errors that are not a PAPR-clipping problem
-(despite levels 9/10 having the highest PAPR targets, 14 dB at 64-QAM). The
-root cause is a decoder/code-rate issue, not a signal conditioning one.
+The original gotcha this page described — levels 9/10 (64-QAM) failing to
+converge even at high SNR in loopback — is **FIXED** by Phase 2's NR BG2 mother
+code plus level 10's rate change from 7/8 to 5/6 (see [[adr-005-nr-bg2-ldpc]]).
+`tests/phase_c_loopback.rs`'s `test_snr_fer_monte_carlo` now shows FER=0.00/100
+for every level 1–10 across its whole swept SNR range. What remains is a
+narrower, real, still-open level-9 problem under fading.
 
-## Symptom
+## What is fixed
 
-`phase_c_loopback` tests at levels 9 and 10 report decode failures or high BER
-at SNRs where lower speed levels decode cleanly. The LDPC belief-propagation
-decoder hits its iteration limit (50) without reaching a valid codeword.
+Clean-channel and AWGN decode at levels 9/10 converges cleanly. Do not
+re-add workarounds (skips, `#[ignore]`s) for the old high-SNR non-convergence —
+stale `#[ignore]`s for exactly this were already removed once during the
+Phase 2 merge.
 
-## Cause and workaround
+## What still bites
 
-64-QAM's dense decision regions mean any residual channel-estimation error or
-timing imperfection produces enough soft-decision noise to prevent LDPC
-convergence. This is documented as a known limitation in `CLAUDE.md` ("levels
-9/10 (64-QAM) hitting LDPC non-convergence at high SNR ... a decoder/code-rate
-issue, not a PAPR-clipping one"). The 64-QAM constellation mappers are
-implemented and verified, but the full integration is not robust at these levels.
+Level 9 (64-QAM 2/3) has an unusually high, steep, and strongly seed-dependent
+AWGN SNR requirement (a real waterfall, not an SNR-independent floor), and
+**never converges under any tested Watterson fading up to 54 dB** (Phase 3
+Task 8 measurement, see `BENCHMARKS.md`'s "Phase 3 Task 8" section). This is
+tracked as its own future investigation. If a bench or session run pins level 9
+under fading and shows 100% loss, that is this known issue — not a regression.
 
-Workaround: use speed levels 1–8 for reliable operation. Do not add or depend on
-levels 9/10 paths in production code until this is investigated further.
+## Related tuning trap
+
+LDPC decoder-parameter changes (e.g. the normalized-min-sum alpha) must be
+validated across the whole speed ladder and payload-size extremes, not a single
+level: an alpha picked from a level-2-only sweep once broke level 10 to 100%
+frame loss on a clean channel. See [[adr-005-nr-bg2-ldpc]].

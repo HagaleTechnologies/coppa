@@ -8,29 +8,34 @@ sources:
   - docs/adr/002-fec-strategy.md
   - crates/coppa-protocol/src/fec/**
 verified:
-  commit: c1d2676
-  date: 2026-07-07
+  commit: 59b0b63
+  date: 2026-07-14
 links:
   - overview
   - coppa-protocol
+  - adr-005-nr-bg2-ldpc
   - ldpc-non-convergence
 ---
 Two FEC families cover the range of channel conditions: rate-1/2 K=7
-convolutional code (low complexity, default for BPSK) and QC-LDPC at 6 rates
-from 1/4 to 7/8 (higher complexity, intended for OFDM modes). Both expose
-`encode()`/`decode()` behind the `FecCodec` trait so the engine can swap
-without structural changes. Turbo codes are explicitly deferred.
+convolutional code (low complexity, soft Viterbi) and LDPC for the OFDM payload
+path. Both expose `encode()`/`decode()` behind the `FecCodec` trait so the
+engine can swap without structural changes. Turbo codes are explicitly deferred.
 
 ## Digest
 
-Convolutional FEC won for BPSK because it is well-understood and low-complexity.
-LDPC won for OFDM because configurable code rate allows adaptation across a wide
-SNR range. LDPC always uses 1,944 coded bits regardless of rate, which simplifies
-frame sizing. The `FecCodec` abstraction is not yet fully wired through the
-flagship modems — LDPC is implemented and tested in isolation but not in the
-live engine data path.
+Convolutional FEC won for the low-complexity side because it is well-understood
+and cheap. LDPC won for OFDM because configurable code rate allows adaptation
+across a wide SNR range.
 
-Important caveat: no operating SNR curves are published; LDPC at levels 9/10
-shows non-convergence issues (see [[ldpc-non-convergence]]).
+**Superseded detail:** this ADR's original LDPC design (six separate 802.11
+QC-LDPC base matrices at a fixed 1,944-bit codeword) was replaced in Phase 2 by
+a single 5G-NR-style BG2 mother code (Zc=176) rate-matched per speed level via
+a circular buffer — a wire-format break. The two-family strategy itself stands;
+the LDPC family's internals are now governed by [[adr-005-nr-bg2-ldpc]].
 
-Full rationale: `docs/adr/002-fec-strategy.md`
+The old caveat about levels 9/10 non-convergence at high SNR is fixed (by the
+BG2 change plus level 10 moving 7/8 → 5/6); a narrower level-9-under-fading
+issue remains open — see [[ldpc-non-convergence]].
+
+Full rationale: `docs/adr/002-fec-strategy.md` (original decision) and
+`docs/adr/005-nr-bg2-ldpc.md` (current LDPC layer).
