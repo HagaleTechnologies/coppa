@@ -8,9 +8,14 @@
 - [Why does coppa use both convolutional and LDPC codes?](pages/adr-002-fec-strategy.md) — Two FEC families cover the range of channel conditions: rate-1/2 K=7
 - [Why does Phase 1 break the waveform and what changed?](pages/adr-003-waveform-break.md) — Phase 1 ("radio reality") moved the waveform from a full-Nyquist band (starting
 - [Why does SyncDetector prefer the strongest multipath tap, not the first?](pages/adr-004-strongest-path-timing.md) — Phase 1's `SyncDetector` originally anchored sync timing on the first-arriving
+- [Why did the LDPC layer move to a single NR BG2 mother code?](pages/adr-005-nr-bg2-ldpc.md) — Phase 2 replaced nine separate per-rate 802.11 QC-LDPC codes with one
+- [What did Phase 2's channel-estimation work fix, break, and leave open?](pages/adr-006-phase2-estimation.md) — Phase 2 replaced the linear-interpolation channel estimator with a delay-domain
+- [Why do multi-codeword frames retransmit whole, not per codeword?](pages/adr-007-multi-codeword-frames.md) — Phase 3 added multi-codeword frames (up to `MAX_CODEWORDS=8` per frame, with
+- [What did Phase 3's system layer ship, and which targets did it miss?](pages/adr-008-phase3-system-layer.md) — Phase 3 shipped the system layer: payload CRC-32, half-duplex ARQ discipline
 - [What will bite you about the cpal-backend feature flag?](pages/cpal-feature-gate.md) — The daemon (`coppad`) compiles and runs without the `cpal-backend` feature flag,
-- [What will bite you about LDPC at speed levels 9 and 10?](pages/ldpc-non-convergence.md) — Speed levels 9 and 10 (64-QAM with 7/8 and 3/4 LDPC) fail to decode reliably
+- [What will bite you about LDPC at speed levels 9 and 10?](pages/ldpc-non-convergence.md) — The original gotcha this page described — levels 9/10 (64-QAM) failing to
 - [What will bite you about Watterson fading at speed level 4?](pages/watterson-level-4-gap.md) — Speed level 4 (QPSK 3/4 with sparse-pilot `hf_standard`/`hf_wide`/`hf_narrow`
+- [What will bite you in the daemon's real-radio TX/RX path?](pages/phase4-field-readiness.md) — Phase 4 made the daemon field-ready: real serial (DTR/RTS) and Linux GPIO PTT,
 - [What will bite you about waveform compatibility with pre-Phase-1 code?](pages/waveform-wire-break.md) — The Phase 1 waveform is a hard wire-format break from all earlier coppa revisions.
 - [What band and sample-rate conventions does coppa use?](pages/band-conventions.md) — Coppa operates at a fixed 48 kHz sample rate across all profiles and speed
 - [What contract does coppa-dsp expose to skimmer?](pages/coppa-dsp-skimmer-interface.md) — `coppa-dsp` is consumed by the skimmer repo as a pure-DSP library — it provides

@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-07-07T22:17:27Z",
-  "head_commit": "c1d2676",
+  "generated_at": "2026-07-15T04:29:05Z",
+  "head_commit": "8b55a76",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -22,12 +22,13 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:3de737f89acdd20aaadd17892016414a0617d48594a1958bc91c8e79fa843971",
+      "hash": "sha256:5236467cf8a4d75d2289d781a27ee787b302c2ed3a0333c953301e03caf854e5",
       "id": "adr-002-fec-strategy",
       "kind": "decision-digest",
       "links": [
         "overview",
         "coppa-protocol",
+        "adr-005-nr-bg2-ldpc",
         "ldpc-non-convergence"
       ],
       "locked": false,
@@ -39,8 +40,8 @@
       ],
       "status": "current",
       "title": "Why does coppa use both convolutional and LDPC codes?",
-      "verified_commit": "c1d2676",
-      "verified_date": "2026-07-07",
+      "verified_commit": "59b0b63",
+      "verified_date": "2026-07-14",
       "visibility": "public"
     },
     {
@@ -85,6 +86,98 @@
       "title": "Why does SyncDetector prefer the strongest multipath tap, not the first?",
       "verified_commit": "c1d2676",
       "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:ae61ac1a948faeaaeace7a8f38e570992789485672910161c0c912cdc6acab71",
+      "id": "adr-005-nr-bg2-ldpc",
+      "kind": "decision-digest",
+      "links": [
+        "overview",
+        "coppa-protocol",
+        "adr-002-fec-strategy",
+        "ldpc-non-convergence"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/adr-005-nr-bg2-ldpc.md",
+      "sources": [
+        "docs/adr/005-nr-bg2-ldpc.md",
+        "crates/coppa-protocol/src/fec/ldpc/**"
+      ],
+      "status": "current",
+      "title": "Why did the LDPC layer move to a single NR BG2 mother code?",
+      "verified_commit": "59b0b63",
+      "verified_date": "2026-07-14",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:66f02146c268eb0ab5968fa1c2d044910103399747d4731860aac4c6d811fc53",
+      "id": "adr-006-phase2-estimation",
+      "kind": "decision-digest",
+      "links": [
+        "overview",
+        "adr-004-strongest-path-timing",
+        "watterson-level-4-gap",
+        "adr-005-nr-bg2-ldpc"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/adr-006-phase2-estimation.md",
+      "sources": [
+        "docs/adr/006-phase2-parametric-estimation-nr-bg2.md",
+        "crates/coppa-protocol/src/modem/**"
+      ],
+      "status": "current",
+      "title": "What did Phase 2's channel-estimation work fix, break, and leave open?",
+      "verified_commit": "59b0b63",
+      "verified_date": "2026-07-14",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:9219b090dddc3e5569773e6e05b2a094c93edd62b5f41de0682116972a6f9919",
+      "id": "adr-007-multi-codeword-frames",
+      "kind": "decision-digest",
+      "links": [
+        "overview",
+        "coppa-protocol",
+        "adr-008-phase3-system-layer"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/adr-007-multi-codeword-frames.md",
+      "sources": [
+        "docs/adr/007-multi-codeword-frames.md",
+        "crates/coppa-protocol/src/**"
+      ],
+      "status": "current",
+      "title": "Why do multi-codeword frames retransmit whole, not per codeword?",
+      "verified_commit": "59b0b63",
+      "verified_date": "2026-07-14",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:8192581e162b532e7611786d7a3220b340a6f7e96f5bead2e449d59c9b2634cd",
+      "id": "adr-008-phase3-system-layer",
+      "kind": "decision-digest",
+      "links": [
+        "overview",
+        "coppa-protocol",
+        "adr-007-multi-codeword-frames",
+        "phase4-field-readiness"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/adr-008-phase3-system-layer.md",
+      "sources": [
+        "docs/adr/008-phase3-system-layer.md",
+        "crates/coppa-ml/src/**",
+        "crates/coppa-bench/examples/**"
+      ],
+      "status": "current",
+      "title": "What did Phase 3's system layer ship, and which targets did it miss?",
+      "verified_commit": "59b0b63",
+      "verified_date": "2026-07-14",
       "visibility": "public"
     },
     {
@@ -150,12 +243,13 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:3bb1d4fe2ca6575fcffac70d8becdbcdd41587af5693f57c6be0e3749e3d4149",
+      "hash": "sha256:c66c3b32f04ff399f02f156bb8185ecaf41c4f18c8c6b525784792aca9b5adaa",
       "id": "coppa-engine",
       "kind": "subsystem",
       "links": [
         "overview",
-        "coppa-protocol"
+        "coppa-protocol",
+        "phase4-field-readiness"
       ],
       "locked": false,
       "maintainer": "agent",
@@ -166,17 +260,20 @@
       ],
       "status": "current",
       "title": "How does coppa-engine orchestrate the modem pipeline?",
-      "verified_commit": "c1d2676",
-      "verified_date": "2026-07-07",
+      "verified_commit": "59b0b63",
+      "verified_date": "2026-07-14",
       "visibility": "public"
     },
     {
-      "hash": "sha256:6ee961d75e700d018a2eeb2bec8bd0e7bcd57a49092653d863b9a78f98171a8c",
+      "hash": "sha256:ded4a63c3be17073355512e9eba9ba7eae76ad82b9cd1c5accaa22165714b98d",
       "id": "coppa-protocol",
       "kind": "subsystem",
       "links": [
         "overview",
         "adr-002-fec-strategy",
+        "adr-005-nr-bg2-ldpc",
+        "adr-007-multi-codeword-frames",
+        "adr-008-phase3-system-layer",
         "ldpc-non-convergence"
       ],
       "locked": false,
@@ -187,8 +284,8 @@
       ],
       "status": "current",
       "title": "How does coppa-protocol handle framing, FEC, and ARQ?",
-      "verified_commit": "c1d2676",
-      "verified_date": "2026-07-07",
+      "verified_commit": "59b0b63",
+      "verified_date": "2026-07-14",
       "visibility": "public"
     },
     {
@@ -212,28 +309,31 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:a221079c12b5d4990b83d05dd02a20a34c458320b91f078722133105ea157eff",
+      "hash": "sha256:55df459a291a1020ab3b0256f54458d5b6377ab7d5c852ead89c893c0960e48f",
       "id": "ldpc-non-convergence",
       "kind": "gotcha",
       "links": [
         "coppa-protocol",
-        "adr-002-fec-strategy"
+        "adr-002-fec-strategy",
+        "adr-005-nr-bg2-ldpc"
       ],
       "locked": false,
       "maintainer": "agent",
       "path": "pages/ldpc-non-convergence.md",
       "sources": [
-        "crates/coppa/tests/phase_c_loopback.rs",
-        "crates/coppa-protocol/src/fec/ldpc/**"
+        "tests/phase_c_loopback.rs",
+        "crates/coppa-protocol/src/fec/ldpc/**",
+        "docs/adr/005-nr-bg2-ldpc.md",
+        "BENCHMARKS.md"
       ],
       "status": "current",
       "title": "What will bite you about LDPC at speed levels 9 and 10?",
-      "verified_commit": "c1d2676",
-      "verified_date": "2026-07-07",
+      "verified_commit": "59b0b63",
+      "verified_date": "2026-07-14",
       "visibility": "public"
     },
     {
-      "hash": "sha256:80c604736a9406e16ad5efebf4c5e949e1dabe8a3066e79c0b18dfeebba3435c",
+      "hash": "sha256:62565d2aa64e43caa64422af75ec693abf9bcc60ee46bc0da6bb6e633c62d0e9",
       "id": "overview",
       "kind": "overview",
       "links": [],
@@ -247,31 +347,59 @@
       ],
       "status": "current",
       "title": "Coppa \u2014 what is this and where do things live?",
-      "verified_commit": "c1d2676",
-      "verified_date": "2026-07-07",
+      "verified_commit": "59b0b63",
+      "verified_date": "2026-07-14",
       "visibility": "public"
     },
     {
-      "hash": "sha256:f95a1d35538c1e6e48fb4699080bb5c497408adf3d90b517b931d1ccf640788f",
+      "hash": "sha256:4b9d9ebc050e2d2f762a721182f7f5ffb0011924445c31a3fd34fc3bba06202e",
+      "id": "phase4-field-readiness",
+      "kind": "gotcha",
+      "links": [
+        "overview",
+        "coppa-engine",
+        "coppa-protocol",
+        "cpal-feature-gate"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/phase4-field-readiness.md",
+      "sources": [
+        "crates/coppa-daemon/src/**",
+        "crates/coppa-radio/src/**",
+        "crates/coppa-ffi/src/lib.rs",
+        "docs/OPERATING.md",
+        "docs/SPEC.md"
+      ],
+      "status": "current",
+      "title": "What will bite you in the daemon's real-radio TX/RX path?",
+      "verified_commit": "59b0b63",
+      "verified_date": "2026-07-14",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:ef55c7a0ce1f6a7f46bf351ab29ac09a824708f502b0917f8a77296b49a27164",
       "id": "watterson-level-4-gap",
       "kind": "gotcha",
       "links": [
         "adr-004-strongest-path-timing",
-        "adr-003-waveform-break"
+        "adr-003-waveform-break",
+        "adr-006-phase2-estimation"
       ],
       "locked": false,
       "maintainer": "agent",
       "path": "pages/watterson-level-4-gap.md",
       "sources": [
         "docs/adr/004-strongest-path-timing.md",
+        "docs/adr/006-phase2-parametric-estimation-nr-bg2.md",
         "crates/coppa-codec/src/ofdm/sync_detector.rs",
         ".superpowers/sdd/p1-fading-regression-fix-report.md",
         "BENCHMARKS.md"
       ],
       "status": "current",
       "title": "What will bite you about Watterson fading at speed level 4?",
-      "verified_commit": "c1d2676",
-      "verified_date": "2026-07-07",
+      "verified_commit": "59b0b63",
+      "verified_date": "2026-07-14",
       "visibility": "public"
     },
     {
