@@ -95,7 +95,9 @@ combination in the tested range does measurably better.
 
 Watterson-Moderate/level 2 FER≤10% with the drift tracker enabled is **18.0 dB**, against a
 required **≤16.5 dB** — not met. AWGN is exactly unchanged at both levels (no regression, bar
-clause satisfied). Watterson-Poor never clears either way (unaffected). But the more important
+clause satisfied). Watterson-Poor never clears either way (unaffected). Watterson-Good was not
+part of the measured channel set (consistent with `task1_gate.rs`/`task7_gate.rs` convention);
+a future revisit should add a Good measurement before re-evaluating the bar. But the more important
 number is the comparison against this branch's *own current* baseline established in Step 1:
 enabling the drift tracker takes Watterson-Moderate/level 2 from **15.0 dB → 18.0 dB**, a real
 **~3 dB regression** against what already ships today — not merely "doesn't reach the target,"

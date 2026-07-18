@@ -144,7 +144,6 @@ impl DriftTracker {
 /// count, giving `r` roughly the same footing as `KalmanLagSmoother`'s
 /// fixed-per-frame `sigma_v2` convention (`kalman_tracker.rs`). Starting
 /// point for the Task 5 gate sweep.
-#[allow(dead_code)]
 const DRIFT_NOISE_SCALE: f32 = 1.0;
 
 /// Derive one step's `(z, r)` observation for [`DriftTracker::advance`]
@@ -162,7 +161,6 @@ const DRIFT_NOISE_SCALE: f32 = 1.0;
 ///
 /// Returns `None` if `pilots` has too few entries for
 /// [`timing_offset_samples`] to produce an estimate.
-#[allow(dead_code)]
 pub(crate) fn observe_drift(
     fft_size: usize,
     nc: usize,
