@@ -376,6 +376,7 @@ pub struct TrackedTaps {
     nc: usize,
     taps: Vec<Complex32>,
     cov: Vec<Complex32>,
+    sigma_v2: f32,
 }
 
 impl TrackedTaps {
@@ -392,21 +393,25 @@ impl TrackedTaps {
     /// `b[ℓ] = τ(k,ℓ)`. Real by construction (P is Hermitian); floored to avoid a
     /// literal zero downstream.
     ///
-    /// # This is the tracker's posterior uncertainty about the CHANNEL TAP, not a
+    /// # The tracker's posterior uncertainty about the CHANNEL TAP, not a
     /// # receiver observation-noise estimate
     ///
     /// Unlike [`super::delay_domain::DelayDomainEstimator`]'s `noise_var` (a
     /// per-observation residual variance from the least-squares fit — an actual
-    /// estimate of `σ_v²`, the noise on the received sample), `noise_at` is purely
+    /// estimate of `σ_v²`, the noise on the received sample), this is purely
     /// a function of the Kalman covariance `P`: how confident the tracker is about
     /// `h`, given everything it has observed so far. As the tracker accumulates
     /// evidence within a frame, `P` (and hence this value) shrinks regardless of
-    /// the actual receiver noise floor. See [`Self::equalize`]'s doc for why this
-    /// matters for LLR calibration, and `.superpowers/sdd/p2-task-7-report.md` for
-    /// the full investigation. This is a suspected, unresolved LLR-overconfidence
-    /// source: Task 5 (turbo re-estimation) or whoever next touches this should
-    /// investigate it before assuming `noise_at`'s output is well-calibrated for
-    /// LLR purposes.
+    /// the actual receiver noise floor.
+    ///
+    /// Previously fed directly into [`Self::equalize`]'s LLR-facing noise output —
+    /// flagged as a suspected overconfidence source since Task 7 (see
+    /// `.superpowers/sdd/p2-task-7-report.md`), fixed by the Cascaded design
+    /// (`docs/superpowers/specs/2026-07-18-cascaded-drift-tracker-design.md`):
+    /// `equalize` now uses the tracker's fixed `sigma_v2` observation-noise floor
+    /// instead. This accessor is kept, unchanged, as an honest diagnostic for the
+    /// tracker's own posterior tap uncertainty — just no longer what feeds the
+    /// decoder.
     pub fn noise_at(&self, carrier: usize) -> f32 {
         let l = self.taps.len();
         let b: Vec<Complex32> = (0..l).map(|ell| tau_basis(self.nc, carrier, ell)).collect();
@@ -420,32 +425,41 @@ impl TrackedTaps {
     }
 
     /// Zero-force equalize `carriers`, returning per-carrier `(x̂, effective noise)`
-    /// — same call signature as
-    /// [`super::delay_domain::DelayDomainEstimator::equalize`], except the noise
-    /// numerator is per-carrier (from the tracked covariance, [`Self::noise_at`])
-    /// rather than a single frame-wide scalar. NOTE: despite the matching
-    /// signature this is not necessarily the same *quantity* — see `noise_at`'s
-    /// doc; the returned noise here is `Var(Ĥ(k))/|Ĥ(k)|²` (posterior tap
-    /// uncertainty scaled by channel gain), which may understate the true
-    /// zero-forcing symbol-error variance (dominated by observation noise
-    /// `σ_v²/|Ĥ(k)|²`) once the tracker is confident. Flagged as a suspected
-    /// LLR-overconfidence source, not fixed — see
-    /// `.superpowers/sdd/p2-task-7-report.md` for the full investigation. Task 5
-    /// (turbo re-estimation) should investigate this before assuming `noise_at`'s
-    /// output is well-calibrated for LLR purposes.
+    /// — same call signature and shape as
+    /// [`super::delay_domain::DelayDomainEstimator::equalize`]. The noise fed
+    /// downstream is `sigma_v2/|Ĥ(k)|²` — the tracker's fixed per-frame
+    /// observation-noise floor (the same `sigma_v2` used as the Kalman
+    /// update's `R`, see [`KalmanLagSmoother::new`]'s doc), matching the
+    /// exact shape `DelayDomainEstimator::equalize` already uses.
+    ///
+    /// # Fixed: previously fed the tracker's posterior tap variance instead
+    ///
+    /// Earlier versions of this method used `noise_at(k)/|Ĥ(k)|²` (the
+    /// Kalman covariance's posterior tap-variance estimate) here instead —
+    /// a suspected LLR-overconfidence bug, flagged but not fixed since Task
+    /// 7 (see `.superpowers/sdd/p2-task-7-report.md`'s addendum): as the
+    /// tracker accumulates evidence within a frame, its posterior
+    /// confidence about the channel TAP shrinks regardless of the actual
+    /// receiver noise floor, which is a different quantity from the
+    /// observation noise the LLR calculation actually wants. Fixed as part
+    /// of the Cascaded design
+    /// (`docs/superpowers/specs/2026-07-18-cascaded-drift-tracker-design.md`),
+    /// which reintroduces this tracker as a live payload path.
+    /// [`Self::noise_at`] itself is unchanged and still available as an
+    /// honest accessor for the tracker's own posterior tap uncertainty — it
+    /// simply no longer feeds the decoder.
     pub fn equalize(&self, carriers: &[Complex32]) -> (Vec<Complex32>, Vec<f32>) {
         let mut xhat = Vec::with_capacity(carriers.len());
         let mut noise = Vec::with_capacity(carriers.len());
         for (k, &y) in carriers.iter().enumerate() {
             let h = self.h_at(k);
             let h_sq = h.norm_sqr();
-            let nv = self.noise_at(k);
             if h_sq >= 1e-4 {
                 xhat.push(y / h);
-                noise.push(nv / h_sq);
+                noise.push(self.sigma_v2 / h_sq);
             } else {
                 xhat.push(Complex32::new(0.0, 0.0));
-                noise.push(1e6 * nv);
+                noise.push(1e6 * self.sigma_v2);
             }
         }
         (xhat, noise)
@@ -535,6 +549,7 @@ impl KalmanLagSmoother {
             nc: self.nc,
             taps: smooth.h,
             cov: smooth.p,
+            sigma_v2: self.sigma_v2,
         }
     }
 
@@ -548,6 +563,7 @@ impl KalmanLagSmoother {
             nc: self.nc,
             taps: f.h.clone(),
             cov: f.p.clone(),
+            sigma_v2: self.sigma_v2,
         }
     }
 }
@@ -889,6 +905,130 @@ mod tests {
         assert!(
             max_noise < 50.0,
             "no per-carrier noise estimate should explode from one faded window, got max {max_noise}"
+        );
+    }
+
+    #[test]
+    fn equalize_uses_fixed_observation_noise_not_posterior_tap_variance() {
+        let nc = 48;
+        let l = 2;
+        let h0 = Complex32::from_polar(1.0, 0.0);
+        let h1 = Complex32::from_polar(0.5, 0.5);
+        // Taps at ell=0,1 directly (not the shared two_tap_h test helper,
+        // which places its second tap at ell=5 -- inconsistent with l=2
+        // here, since ell=5 isn't representable in a 2-dim model).
+        let true_h = |k: usize| h0 * tau_basis(nc, k, 0) + h1 * tau_basis(nc, k, 1);
+        let pilot_idx: [usize; 8] = [0, 6, 12, 18, 24, 30, 36, 42];
+        let sigma_v2 = 0.02f32;
+        let h_probe = vec![h0, h1];
+        let mut tracker = KalmanLagSmoother::new(nc, l, 0.999, sigma_v2, &h_probe);
+        // Many confident, noise-free observations: posterior tap variance
+        // (noise_at) shrinks well below sigma_v2 as the tracker accumulates
+        // evidence -- exactly the scenario that made the old
+        // noise_at-based equalize() output overconfident.
+        for _ in 0..20 {
+            let obs: Vec<(usize, Complex32, f32)> =
+                pilot_idx.iter().map(|&k| (k, true_h(k), 1.0)).collect();
+            tracker.advance(&obs);
+        }
+        let tt = tracker.smoothed(19);
+        let carrier = 24;
+        let posterior_var = tt.noise_at(carrier);
+        assert!(
+            posterior_var < sigma_v2,
+            "expected the posterior tap variance to have shrunk below sigma_v2 \
+             after 20 confident observations (setup precondition for this test), \
+             got noise_at={posterior_var} sigma_v2={sigma_v2}"
+        );
+
+        let h = tt.h_at(carrier);
+        let carriers = vec![h * Complex32::new(1.0, 0.0); nc];
+        let (_, noise) = tt.equalize(&carriers);
+        let expected = sigma_v2 / h.norm_sqr();
+        assert!(
+            (noise[carrier] - expected).abs() < 1e-6,
+            "equalize's noise should be sigma_v2/|H(k)|^2 ({expected}), not the \
+             (now much smaller) posterior tap variance, got {}",
+            noise[carrier]
+        );
+    }
+
+    #[test]
+    fn per_window_derotation_tracks_drift_better_than_one_fixed_derotation() {
+        // A channel whose true coarse-delay reference drifts linearly across the
+        // frame (grid units, tau_basis's convention) -- the exact scenario the
+        // original single-fixed-derotation path (one coarse_delay reused for
+        // every window) can't represent. Compares the AR(1) tracker's own
+        // tracking error when fed (A) the raw drifting channel directly
+        // (mimicking the original path) against (B) pilots pre-derotated by
+        // the TRUE per-window delay (mimicking a perfectly-tracked
+        // DriftTracker output -- isolates whether the AR(1) tracker benefits
+        // from correct per-window derotation, independent of how well
+        // DriftTracker itself estimates it, which drift_tracker.rs tests
+        // separately).
+        let nc = 48;
+        let l = 2;
+        let h0 = Complex32::from_polar(1.0, 0.0);
+        let h1 = Complex32::from_polar(0.6, -0.7);
+        let pilot_idx: [usize; 8] = [0, 6, 12, 18, 24, 30, 36, 42];
+        let sigma_v2 = 0.01f32;
+        let steps = 20;
+        let a = 0.9f32;
+
+        // True bulk delay drifts from 0.0 to 0.6 grid units across the frame.
+        let true_tau_at = |t: usize| 0.6 * t as f32 / (steps - 1) as f32;
+        let bulk_delay_phase = |k: usize, delay: f32| -> Complex32 {
+            let ang = -std::f32::consts::TAU * (k as f32) * delay / nc as f32;
+            Complex32::new(ang.cos(), ang.sin())
+        };
+        let true_static_h = |k: usize| h0 * tau_basis(nc, k, 0) + h1 * tau_basis(nc, k, 1);
+        let true_drifting_h =
+            |t: usize, k: usize| true_static_h(k) * bulk_delay_phase(k, true_tau_at(t));
+
+        // Path A: fed the raw drifting channel directly (no per-window
+        // correction) -- the original single-fixed-derotation failure mode.
+        let mut fixed_tracker = KalmanLagSmoother::new(nc, l, a, sigma_v2, &[h0, h1]);
+        // Path B: fed pilots pre-derotated by the TRUE per-window delay --
+        // reduces to tracking a genuinely static target.
+        let mut tracked_tracker = KalmanLagSmoother::new(nc, l, a, sigma_v2, &[h0, h1]);
+
+        for t in 0..steps {
+            let obs_fixed: Vec<(usize, Complex32, f32)> = pilot_idx
+                .iter()
+                .map(|&k| (k, true_drifting_h(t, k), 1.0))
+                .collect();
+            fixed_tracker.advance(&obs_fixed);
+
+            let obs_tracked: Vec<(usize, Complex32, f32)> = pilot_idx
+                .iter()
+                .map(|&k| {
+                    let derotated = true_drifting_h(t, k) * bulk_delay_phase(k, -true_tau_at(t));
+                    (k, derotated, 1.0)
+                })
+                .collect();
+            tracked_tracker.advance(&obs_tracked);
+        }
+
+        let mut fixed_err_sum = 0.0f32;
+        let mut tracked_err_sum = 0.0f32;
+        for t in 0..steps {
+            let fixed_tt = fixed_tracker.smoothed(t);
+            let tracked_tt = tracked_tracker.smoothed(t);
+            fixed_err_sum += (0..nc)
+                .map(|k| (fixed_tt.h_at(k) - true_drifting_h(t, k)).norm_sqr())
+                .sum::<f32>()
+                / nc as f32;
+            tracked_err_sum += (0..nc)
+                .map(|k| (tracked_tt.h_at(k) - true_static_h(k)).norm_sqr())
+                .sum::<f32>()
+                / nc as f32;
+        }
+
+        assert!(
+            tracked_err_sum < 0.5 * fixed_err_sum,
+            "per-window-derotated tracking should beat one fixed derotation on a \
+             drifting-reference channel: tracked_sum={tracked_err_sum} \
+             fixed_sum={fixed_err_sum}"
         );
     }
 
