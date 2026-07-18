@@ -401,9 +401,12 @@ impl TrackedTaps {
     /// a function of the Kalman covariance `P`: how confident the tracker is about
     /// `h`, given everything it has observed so far. As the tracker accumulates
     /// evidence within a frame, `P` (and hence this value) shrinks regardless of
-    /// the actual receiver noise floor. See [`Self::equalize`]'s doc and the
-    /// caller in `coppa_modem.rs`'s `demodulate_frame` for why this matters for
-    /// LLR calibration.
+    /// the actual receiver noise floor. See [`Self::equalize`]'s doc for why this
+    /// matters for LLR calibration, and `.superpowers/sdd/p2-task-7-report.md` for
+    /// the full investigation. This is a suspected, unresolved LLR-overconfidence
+    /// source: Task 5 (turbo re-estimation) or whoever next touches this should
+    /// investigate it before assuming `noise_at`'s output is well-calibrated for
+    /// LLR purposes.
     pub fn noise_at(&self, carrier: usize) -> f32 {
         let l = self.taps.len();
         let b: Vec<Complex32> = (0..l).map(|ell| tau_basis(self.nc, carrier, ell)).collect();
@@ -426,8 +429,10 @@ impl TrackedTaps {
     /// uncertainty scaled by channel gain), which may understate the true
     /// zero-forcing symbol-error variance (dominated by observation noise
     /// `σ_v²/|Ĥ(k)|²`) once the tracker is confident. Flagged as a suspected
-    /// LLR-overconfidence source, not fixed — see the detailed discussion at this
-    /// function's call site in `coppa_modem.rs`'s `demodulate_frame`.
+    /// LLR-overconfidence source, not fixed — see
+    /// `.superpowers/sdd/p2-task-7-report.md` for the full investigation. Task 5
+    /// (turbo re-estimation) should investigate this before assuming `noise_at`'s
+    /// output is well-calibrated for LLR purposes.
     pub fn equalize(&self, carriers: &[Complex32]) -> (Vec<Complex32>, Vec<f32>) {
         let mut xhat = Vec::with_capacity(carriers.len());
         let mut noise = Vec::with_capacity(carriers.len());

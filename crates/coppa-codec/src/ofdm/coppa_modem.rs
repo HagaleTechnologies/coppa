@@ -15,6 +15,7 @@ use num_complex::Complex32;
 use coppa_dsp::fft::FftProcessor;
 
 use super::delay_domain::DelayDomainEstimator;
+use super::drift_tracker;
 use super::frame::CoppaHeader;
 use super::header_fec;
 use super::kalman_tracker::{self, KalmanLagSmoother};
@@ -105,6 +106,54 @@ pub const SPEED_LEVELS: [SpeedLevel; 9] = [
 /// `demodulate_header_llrs`'s doc for why this is an explicit, separately-measured
 /// toggle rather than assumed safe from the payload pass's result.
 const KALMAN_HEADER_ENABLED: bool = true;
+
+/// Payload-pass toggle (Task 3): `false` uses the existing Task 7
+/// `KalmanLagSmoother` path (`equalize_payload_kalman`); `true` uses the
+/// new [`drift_tracker::DriftTracker`]-based path
+/// (`equalize_payload_drift_tracked`), which tracks the coarse-delay
+/// reference as its own random-walk state instead of assuming it's fixed
+/// for the whole frame.
+///
+/// **Left `false` (Task 5, gate NOT met).** The Task 5 gate bench
+/// (`drift_tracker_gate`) measured this path at **18.0 dB** for the
+/// Watterson-Moderate/level 2 FER≤10% threshold (400 trials/point,
+/// `DRIFT_Q_TAU`/`DRIFT_Q_DOT` below) against a required ≤16.5 dB — not
+/// met. Worse still, the *current* (`false`) baseline on this same branch
+/// already measures **15.0 dB** on that same metric (well below the 16.5 dB
+/// bar and below the 18.0 dB pre-Phase-2 figure this whole effort was
+/// chartered against — a real improvement accumulated from turbo
+/// re-estimation, the Phase 2 Task 8 cumulative rebaseline, and later
+/// phases' fixes, not from anything in this file), so enabling the drift
+/// tracker is a measured ~3 dB *regression* against the branch's own
+/// current baseline, not just a shortfall against the design's target. AWGN
+/// is unchanged (6.0 dB, both paths) and Watterson-Poor never clears
+/// either way, so this is isolated to Watterson-Moderate. See
+/// `.superpowers/sdd/task-5-report.md` and `BENCHMARKS.md`'s corresponding
+/// subsection for the full numbers, and
+/// `docs/superpowers/specs/2026-07-17-coarse-delay-drift-tracker-design.md`
+/// for the design.
+const DRIFT_TRACKER_ENABLED: bool = false;
+
+/// Process-noise variance on the tracked delay `τ` itself (grid units²/step)
+/// — a [`drift_tracker::DriftTracker`] tuning knob. Empirically tuned (Task
+/// 5): a reduced-scale (150 trials, watterson-moderate/level 2, 9-27 dB)
+/// sweep over all 9 combinations of `DRIFT_Q_TAU ∈ {1e-5,1e-4,1e-3}` ×
+/// `DRIFT_Q_DOT ∈ {1e-6,1e-5,1e-4}` came back essentially flat — every
+/// combination produced the same FER curve to within trial noise, none
+/// clearing the FER≤10% Wilson bound in the swept range. This value is the
+/// plan's original starting point, kept as the shipped (but currently
+/// disabled, see `DRIFT_TRACKER_ENABLED`) default because the sweep gave no
+/// evidence any other combination in the tested range does better — the
+/// same "tuning axis is close to exhausted" conclusion Task 7's own
+/// `DEFAULT_SIGMA_D_HZ` sweep reached. See `.superpowers/sdd/task-5-report.md`
+/// for the full sweep table.
+const DRIFT_Q_TAU: f32 = 1e-4;
+
+/// Process-noise variance on the tracked delay-rate `τ̇` (grid
+/// units²/step²) — a [`drift_tracker::DriftTracker`] tuning knob.
+/// Empirically tuned (Task 5); see [`DRIFT_Q_TAU`]'s doc for the sweep that
+/// produced this value (flat across the tested range).
+const DRIFT_Q_DOT: f32 = 1e-5;
 
 /// Raised-cosine inter-symbol taper width in samples (0.5 ms @ 48 kHz).
 const RC_OVERLAP: usize = 24;
@@ -659,8 +708,6 @@ impl CoppaModem {
 
         // 3. Payload: demodulate enough OFDM symbols for `coded_symbols` complex values
         let num_payload_syms = coded_symbols.div_ceil(data_per_sym);
-        let mut payload_symbols = Vec::new();
-        let mut noise_variances = Vec::new();
 
         // `nc`/`derot` are needed both by SCO tracking below (to remove the fixed
         // per-frame bulk-delay bias before estimating per-symbol drift -- see the
@@ -772,107 +819,24 @@ impl CoppaModem {
             sym_carriers.push((global_sym, carriers));
         }
 
-        // Pass 2: Kalman-tracked 2D estimation (Task 7) — instead of independently
-        // re-fitting the delay-domain model from each ±EST_WINDOW-symbol POOLED
-        // window (Task 1's approach, which either reused one frame-stale fit or let
-        // a single bad window corrupt the LDPC-facing noise variance — see Task 1's
-        // report), a single `KalmanLagSmoother` tracks the taps ACROSS symbols with
-        // an AR(1) process prior, and each symbol's FINAL estimate is the lag-2
-        // (RTS) smoothed state — see `kalman_tracker`'s module doc.
-        //
-        // # Why raw per-symbol pilots, not the ±EST_WINDOW pooled window
-        //
-        // An earlier version of this fed each Kalman step the SAME ±2-symbol
-        // POOLED window Task 1's per-window refit used. That is WRONG for a
-        // recursive Bayesian filter: consecutive steps' pooled windows overlap by
-        // up to 4 of 5 symbols, so the same raw pilot samples get re-submitted as
-        // "new" evidence to up to 5 consecutive `advance()` calls. With `a` close
-        // to 1 (barely forgetting), the filter has no way to know this evidence is
-        // redundant, and its posterior confidence compounds far beyond what the
-        // genuinely independent information content justifies — measured directly
-        // (`estimator_diagnosis` with temporary per-window debug prints, Task 7
-        // investigation): `noise_at()` came out ~100-100,000x smaller than Task 1's
-        // comparable per-window residual, and the tracked `h_at(k)` DIVERGED
-        // (grew unboundedly across a frame) instead of tracking the true channel,
-        // while a controlled synthetic check (independent, non-overlapping
-        // observations of a genuinely static channel) confirmed the core
-        // predict/update/RTS-smooth recursion itself converges correctly — the bug
-        // was specifically the overlapping-observation over-counting, not the
-        // recursion math. Feeding each step the RAW single-symbol pilot set (no
-        // pre-pooling) makes consecutive steps' observations genuinely independent
-        // (a fresh symbol's worth of pilots each time), so the Kalman recursion's
-        // own temporal accumulation (governed by `a`/`Q`) is the ONLY source of
-        // cross-symbol pooling — not stacked on top of a second, overlapping
-        // pooling layer.
-        //
-        // `derot`/`nc` are the same instances computed above (before Pass 1),
-        // reused here rather than re-derived.
-        let windows: Vec<Vec<(usize, Complex32, f32)>> = per_symbol_pilots
-            .iter()
-            .map(|sym_pilots| {
-                sym_pilots
-                    .iter()
-                    .map(|&(idx, h)| (idx, h * derot(idx), 1.0))
-                    .collect()
-            })
-            .collect();
-        let mut tracker = self.build_tracker(&calib);
-        for w in &windows {
-            tracker.advance(w);
-        }
-        let mut data_carrier_map: Vec<(usize, usize)> = Vec::new();
-        for (i, (global_sym, carriers)) in sym_carriers.iter().enumerate() {
-            let tt = tracker.smoothed(i);
-            let rotated_carriers: Vec<Complex32> = carriers
-                .iter()
-                .enumerate()
-                .map(|(k, &y)| y * derot(k))
-                .collect();
-            let (equalized, noise_full) = tt.equalize(&rotated_carriers);
-            let data = self.pilots.extract_data(&equalized, *global_sym);
-            let data_indices = self.pilots.data_indices(*global_sym);
-            data_carrier_map.extend(data_indices.iter().map(|&idx| (i, idx)));
-            // Unlike `DelayDomainEstimator::equalize`'s single frame-wide noise
-            // scalar, `TrackedTaps::noise_at` yields a genuine per-carrier value
-            // from the tracked covariance, informed by exactly how many (and how
-            // reliable) observations fed each tap so far.
-            //
-            // # CAUTION: this is the estimator's posterior tap uncertainty, NOT a
-            // full observation-noise estimate — suspected LLR-overconfidence source
-            //
-            // `TrackedTaps::noise_at(k)` returns `Var(Ĥ(k))` (`bᴴ·P·b`, the Kalman
-            // covariance's quadratic form) — the tracker's own uncertainty about the
-            // channel TAP itself, not the receiver's observation noise `σ_v²` on the
-            // current sample `y`. `equalize` then divides this by `|Ĥ(k)|²`, i.e. the
-            // value fed downstream as "noise" is `Var(Ĥ(k))/|Ĥ(k)|²`. For zero-forcing
-            // (`x̂ = y/Ĥ`), the quantity the LDPC LLR calculation actually wants is
-            // dominated by the OBSERVATION noise term `σ_v²/|Ĥ(k)|²` propagated through
-            // the division — a different quantity from the estimator's posterior tap
-            // variance. (Contrast `DelayDomainEstimator::equalize`, a few lines up in
-            // this same comment: its `noise_var` field IS a per-observation residual
-            // variance from the fit, i.e. closer in spirit to `σ_v²` — `TrackedTaps`
-            // has no equivalent field; `P` is purely the tracker's state covariance.)
-            //
-            // Once the tracker has run for a while on a stable channel, `P` (and hence
-            // `Var(Ĥ(k))`) shrinks well below the true observation noise floor, so this
-            // feeds the LDPC decoder LLRs that are systematically too confident — a
-            // classic LLR-overconfidence bug, and a real suspect (not yet confirmed) for
-            // part of why Task 7's bench gate was not met (see
-            // `.superpowers/sdd/p2-task-7-report.md`). This was flagged during a
-            // post-Task-7 doc-cleanup review, not fixed here — fixing it is a real
-            // design question (whether/how to combine the tracked posterior with a
-            // separately estimated observation-noise term, and whether that needs its
-            // own Kalman state) out of scope for a documentation-only change. Task 5
-            // (turbo re-estimation, which builds on this same equalize/noise interface)
-            // should investigate this before assuming `noise_at`'s output is
-            // well-calibrated for LLR purposes.
-            let carrier_noise: Vec<f32> = data_indices
-                .iter()
-                .map(|&idx| noise_full.get(idx).copied().unwrap_or(1e6))
-                .collect();
-            payload_symbols.extend_from_slice(&data);
-            noise_variances.extend_from_slice(&carrier_noise);
-        }
+        // Pass 2: payload equalization, behind `DRIFT_TRACKER_ENABLED` — see
+        // `equalize_payload_kalman`'s doc (the `false`/default path, extracted
+        // unchanged from this frame's previous inline Task 7 Kalman-tracked
+        // 2D estimation; `kalman_tracker`'s module doc has the full "why raw
+        // per-symbol pilots, not pooled windows" and `TrackedTaps::noise_at`
+        // rationale) and `equalize_payload_drift_tracked`'s doc (the `true`
+        // path, Task 3).
+        let (payload_symbols, noise_variances, data_carrier_map) = if DRIFT_TRACKER_ENABLED {
+            self.equalize_payload_drift_tracked(&calib, &sym_carriers, &per_symbol_pilots)
+        } else {
+            self.equalize_payload_kalman(
+                &calib,
+                &sym_carriers,
+                &per_symbol_pilots,
+                nc,
+                coarse_delay,
+            )
+        };
 
         *self.last_frame_workspace.borrow_mut() = Some(LastFrameWorkspace {
             order: calib.order,
@@ -1140,6 +1104,113 @@ impl CoppaModem {
         let delta = (raw_estimate - self.calibrated_bias)
             .clamp(-COARSE_DELAY_JITTER_BOUND, COARSE_DELAY_JITTER_BOUND);
         self.calibrated_bias + delta
+    }
+
+    /// Existing Task 7 Kalman-tracked payload equalization (the
+    /// `DRIFT_TRACKER_ENABLED == false` path) — extracted unchanged from
+    /// `demodulate_frame_impl`'s previous inline Pass 2 so the new
+    /// [`Self::equalize_payload_drift_tracked`] path (Task 3) can be
+    /// selected alongside it behind the same toggle. See `kalman_tracker`'s
+    /// module doc for the full model this uses.
+    fn equalize_payload_kalman(
+        &self,
+        calib: &ProbeCalibration,
+        sym_carriers: &[(usize, Vec<Complex32>)],
+        per_symbol_pilots: &[Vec<(usize, Complex32)>],
+        nc: usize,
+        coarse_delay: f32,
+    ) -> (Vec<Complex32>, Vec<f32>, Vec<(usize, usize)>) {
+        let derot = coarse_delay_rotation(nc, coarse_delay);
+        let windows: Vec<Vec<(usize, Complex32, f32)>> = per_symbol_pilots
+            .iter()
+            .map(|sym_pilots| {
+                sym_pilots
+                    .iter()
+                    .map(|&(idx, h)| (idx, h * derot(idx), 1.0))
+                    .collect()
+            })
+            .collect();
+        let mut tracker = self.build_tracker(calib);
+        for w in &windows {
+            tracker.advance(w);
+        }
+        let mut payload_symbols = Vec::new();
+        let mut noise_variances = Vec::new();
+        let mut data_carrier_map: Vec<(usize, usize)> = Vec::new();
+        for (i, (global_sym, carriers)) in sym_carriers.iter().enumerate() {
+            let tt = tracker.smoothed(i);
+            let rotated_carriers: Vec<Complex32> = carriers
+                .iter()
+                .enumerate()
+                .map(|(k, &y)| y * derot(k))
+                .collect();
+            let (equalized, noise_full) = tt.equalize(&rotated_carriers);
+            let data = self.pilots.extract_data(&equalized, *global_sym);
+            let data_indices = self.pilots.data_indices(*global_sym);
+            data_carrier_map.extend(data_indices.iter().map(|&idx| (i, idx)));
+            let carrier_noise: Vec<f32> = data_indices
+                .iter()
+                .map(|&idx| noise_full.get(idx).copied().unwrap_or(1e6))
+                .collect();
+            payload_symbols.extend_from_slice(&data);
+            noise_variances.extend_from_slice(&carrier_noise);
+        }
+        (payload_symbols, noise_variances, data_carrier_map)
+    }
+
+    /// New (Task 3, `DRIFT_TRACKER_ENABLED == true`) payload equalization: a
+    /// [`drift_tracker::DriftTracker`] tracks the coarse-delay reference
+    /// across the frame with a random-walk model and robust per-window
+    /// observation weighting (see that module's doc for why this targets
+    /// the Watterson-Moderate/level 2 regression the Kalman tap tracker
+    /// does not), and each window's pooled-pilot tap fit reuses the
+    /// existing, already-validated [`Self::estimate_and_equalize`] path
+    /// with that window's TRACKED delay instead of the frame-fixed
+    /// `calib.coarse_delay`. Also resolves the `TrackedTaps::noise_at`
+    /// posterior-tap-variance-vs-observation-noise gap for free:
+    /// `estimate_and_equalize` (via `DelayDomainEstimator::noise_var`) is
+    /// already a genuine per-observation residual, unlike
+    /// `TrackedTaps::noise_at`.
+    fn equalize_payload_drift_tracked(
+        &self,
+        calib: &ProbeCalibration,
+        sym_carriers: &[(usize, Vec<Complex32>)],
+        per_symbol_pilots: &[Vec<(usize, Complex32)>],
+    ) -> (Vec<Complex32>, Vec<f32>, Vec<(usize, usize)>) {
+        const EST_WINDOW: usize = 2;
+        let fft_size = self.profile.fft_size;
+        let nc = self.profile.total_active_carriers();
+        let n = sym_carriers.len();
+
+        let mut drift =
+            drift_tracker::DriftTracker::new(calib.coarse_delay, DRIFT_Q_TAU, DRIFT_Q_DOT);
+        let mut tau_by_window: Vec<f32> = Vec::with_capacity(n);
+        for sym_pilots in per_symbol_pilots {
+            let obs = drift_tracker::observe_drift(fft_size, nc, calib.noise_var, sym_pilots);
+            drift.advance(obs);
+            tau_by_window.push(drift.tau(tau_by_window.len()));
+        }
+
+        let mut payload_symbols = Vec::new();
+        let mut noise_variances = Vec::new();
+        let mut data_carrier_map: Vec<(usize, usize)> = Vec::new();
+        for (i, (global_sym, carriers)) in sym_carriers.iter().enumerate() {
+            let lo = i.saturating_sub(EST_WINDOW);
+            let hi = (i + EST_WINDOW + 1).min(n);
+            let pooled = pool_pilots(&per_symbol_pilots[lo..hi]);
+            let (equalized, noise_full) =
+                self.estimate_and_equalize(carriers, &pooled, calib.order, tau_by_window[i]);
+            let data = self.pilots.extract_data(&equalized, *global_sym);
+            let data_indices = self.pilots.data_indices(*global_sym);
+            data_carrier_map.extend(data_indices.iter().map(|&idx| (i, idx)));
+            let carrier_noise: Vec<f32> = data_indices
+                .iter()
+                .map(|&idx| noise_full.get(idx).copied().unwrap_or(1e6))
+                .collect();
+            payload_symbols.extend_from_slice(&data);
+            noise_variances.extend_from_slice(&carrier_noise);
+        }
+        (payload_symbols, noise_variances, data_carrier_map)
     }
 
     /// AR(1) one-step correlation coefficient for this profile's OFDM symbol period
