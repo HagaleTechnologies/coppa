@@ -112,20 +112,47 @@ const KALMAN_HEADER_ENABLED: bool = true;
 /// new [`drift_tracker::DriftTracker`]-based path
 /// (`equalize_payload_drift_tracked`), which tracks the coarse-delay
 /// reference as its own random-walk state instead of assuming it's fixed
-/// for the whole frame. Defaults to `false` until the gate bench
-/// (`drift_tracker_gate`, Task 4/5) confirms it clears the Watterson-
-/// Moderate/level 2 FER≤10% bar — see
-/// `docs/superpowers/specs/2026-07-17-coarse-delay-drift-tracker-design.md`.
+/// for the whole frame.
+///
+/// **Left `false` (Task 5, gate NOT met).** The Task 5 gate bench
+/// (`drift_tracker_gate`) measured this path at **18.0 dB** for the
+/// Watterson-Moderate/level 2 FER≤10% threshold (400 trials/point,
+/// `DRIFT_Q_TAU`/`DRIFT_Q_DOT` below) against a required ≤16.5 dB — not
+/// met. Worse still, the *current* (`false`) baseline on this same branch
+/// already measures **15.0 dB** on that same metric (well below the 16.5 dB
+/// bar and below the 18.0 dB pre-Phase-2 figure this whole effort was
+/// chartered against — a real improvement accumulated from turbo
+/// re-estimation, the Phase 2 Task 8 cumulative rebaseline, and later
+/// phases' fixes, not from anything in this file), so enabling the drift
+/// tracker is a measured ~3 dB *regression* against the branch's own
+/// current baseline, not just a shortfall against the design's target. AWGN
+/// is unchanged (6.0 dB, both paths) and Watterson-Poor never clears
+/// either way, so this is isolated to Watterson-Moderate. See
+/// `.superpowers/sdd/task-5-report.md` and `BENCHMARKS.md`'s corresponding
+/// subsection for the full numbers, and
+/// `docs/superpowers/specs/2026-07-17-coarse-delay-drift-tracker-design.md`
+/// for the design.
 const DRIFT_TRACKER_ENABLED: bool = false;
 
 /// Process-noise variance on the tracked delay `τ` itself (grid units²/step)
-/// — a [`drift_tracker::DriftTracker`] tuning knob. Starting point for the
-/// Task 5 gate sweep, not empirically derived.
+/// — a [`drift_tracker::DriftTracker`] tuning knob. Empirically tuned (Task
+/// 5): a reduced-scale (150 trials, watterson-moderate/level 2, 9-27 dB)
+/// sweep over all 9 combinations of `DRIFT_Q_TAU ∈ {1e-5,1e-4,1e-3}` ×
+/// `DRIFT_Q_DOT ∈ {1e-6,1e-5,1e-4}` came back essentially flat — every
+/// combination produced the same FER curve to within trial noise, none
+/// clearing the FER≤10% Wilson bound in the swept range. This value is the
+/// plan's original starting point, kept as the shipped (but currently
+/// disabled, see `DRIFT_TRACKER_ENABLED`) default because the sweep gave no
+/// evidence any other combination in the tested range does better — the
+/// same "tuning axis is close to exhausted" conclusion Task 7's own
+/// `DEFAULT_SIGMA_D_HZ` sweep reached. See `.superpowers/sdd/task-5-report.md`
+/// for the full sweep table.
 const DRIFT_Q_TAU: f32 = 1e-4;
 
 /// Process-noise variance on the tracked delay-rate `τ̇` (grid
-/// units²/step²) — a [`drift_tracker::DriftTracker`] tuning knob. Starting
-/// point for the Task 5 gate sweep, not empirically derived.
+/// units²/step²) — a [`drift_tracker::DriftTracker`] tuning knob.
+/// Empirically tuned (Task 5); see [`DRIFT_Q_TAU`]'s doc for the sweep that
+/// produced this value (flat across the tested range).
 const DRIFT_Q_DOT: f32 = 1e-5;
 
 /// Raised-cosine inter-symbol taper width in samples (0.5 ms @ 48 kHz).
