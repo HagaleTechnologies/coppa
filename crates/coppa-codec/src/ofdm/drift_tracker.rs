@@ -38,6 +38,9 @@
 //! `coppa_modem.rs`'s `SCO_PER_SYMBOL_CLAMP` pattern for the same class of
 //! problem.
 
+use super::delay_domain::timing_offset_samples;
+use num_complex::Complex32;
+
 /// Reject any observation whose innovation (`z - predicted τ`) exceeds this
 /// many grid units, regardless of its claimed `r` — see the module doc's
 /// "Robustness" section. Starting point for the Task 5 gate sweep, not a
@@ -135,6 +138,44 @@ impl DriftTracker {
     }
 }
 
+/// Per-frame fixed noise-floor scaling for [`observe_drift`]'s returned `r`
+/// — multiplies the frame's probe-derived `noise_var`
+/// (`CoppaModem::probe_calibration`) before dividing by the pilot-pair
+/// count, giving `r` roughly the same footing as `KalmanLagSmoother`'s
+/// fixed-per-frame `sigma_v2` convention (`kalman_tracker.rs`). Starting
+/// point for the Task 5 gate sweep.
+#[allow(dead_code)]
+const DRIFT_NOISE_SCALE: f32 = 1.0;
+
+/// Derive one step's `(z, r)` observation for [`DriftTracker::advance`]
+/// from a symbol's raw (non-derotated) pilot set: `z` is the absolute bulk
+/// delay (grid units, [`super::delay_domain::tau_basis`]'s convention)
+/// measured from this symbol's own pilot phase slope via
+/// [`timing_offset_samples`]; `r` is a FIXED noise floor (the frame's
+/// probe-derived `sigma_v2`) scaled down by the number of pilot pairs this
+/// symbol contributed — more pilots, lower variance, WITHOUT re-deriving
+/// the noise floor itself from this window's own (possibly noisy) data.
+/// Deliberately reusing a fixed per-frame floor rather than a per-window
+/// residual is the same lesson `KalmanLagSmoother::new`'s doc already
+/// documents: re-deriving noise scale per window was exactly the mechanism
+/// that corrupted Task 1's rejected per-window re-fit.
+///
+/// Returns `None` if `pilots` has too few entries for
+/// [`timing_offset_samples`] to produce an estimate.
+#[allow(dead_code)]
+pub(crate) fn observe_drift(
+    fft_size: usize,
+    nc: usize,
+    sigma_v2: f32,
+    pilots: &[(usize, Complex32)],
+) -> Option<(f32, f32)> {
+    let tau_samples = timing_offset_samples(fft_size, pilots)?;
+    let z = tau_samples * nc as f32 / fft_size as f32;
+    let pairs = (pilots.len() as f32 - 1.0).max(1.0);
+    let r = (DRIFT_NOISE_SCALE * sigma_v2.max(1e-6)) / pairs;
+    Some((z, r))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +255,52 @@ mod tests {
         assert!(
             (after - before).abs() < 0.05,
             "an implausible jump must be rejected by the innovation clamp regardless of claimed r: before={before} after={after}"
+        );
+    }
+
+    #[test]
+    fn observe_drift_recovers_a_known_bulk_delay_in_grid_units() {
+        let fft_size = 960;
+        let nc = 48;
+        let true_tau_samples = 6.0f32; // real ADC samples
+        let pilots: Vec<(usize, Complex32)> = [0usize, 12, 24, 36]
+            .iter()
+            .map(|&k| {
+                let ang = -std::f32::consts::TAU * (k as f32) * true_tau_samples / fft_size as f32;
+                (k, Complex32::new(ang.cos(), ang.sin()))
+            })
+            .collect();
+        let (z, r) = observe_drift(fft_size, nc, 0.1, &pilots).expect("should estimate");
+        let expected_grid_units = true_tau_samples * nc as f32 / fft_size as f32; // 0.3
+        assert!(
+            (z - expected_grid_units).abs() < 0.01,
+            "expected ~{expected_grid_units}, got {z}"
+        );
+        assert!(r > 0.0 && r.is_finite());
+    }
+
+    #[test]
+    fn observe_drift_returns_none_with_too_few_pilots() {
+        assert!(observe_drift(960, 48, 0.1, &[(0, Complex32::new(1.0, 0.0))]).is_none());
+    }
+
+    #[test]
+    fn observe_drift_gives_denser_pilot_sets_lower_r() {
+        let fft_size = 960;
+        let nc = 48;
+        let tau = 2.0f32;
+        let h_at = |k: usize| {
+            let ang = -std::f32::consts::TAU * (k as f32) * tau / fft_size as f32;
+            Complex32::new(ang.cos(), ang.sin())
+        };
+        let sparse: Vec<(usize, Complex32)> = [0usize, 12].iter().map(|&k| (k, h_at(k))).collect();
+        let dense: Vec<(usize, Complex32)> =
+            [0usize, 12, 24, 36].iter().map(|&k| (k, h_at(k))).collect();
+        let (_, r_sparse) = observe_drift(fft_size, nc, 0.1, &sparse).expect("sparse estimate");
+        let (_, r_dense) = observe_drift(fft_size, nc, 0.1, &dense).expect("dense estimate");
+        assert!(
+            r_dense < r_sparse,
+            "more pilot pairs should give a lower (more confident) r: dense={r_dense} sparse={r_sparse}"
         );
     }
 }
