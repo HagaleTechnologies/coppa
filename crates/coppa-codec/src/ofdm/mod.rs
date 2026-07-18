@@ -32,6 +32,7 @@
 pub mod coppa_modem;
 pub mod cross_frame_interleaver;
 pub mod delay_domain;
+pub mod drift_tracker;
 pub mod equalizer;
 pub mod frame;
 pub mod golay;
