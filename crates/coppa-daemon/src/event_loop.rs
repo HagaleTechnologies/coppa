@@ -7,7 +7,7 @@ use coppa_audio::{AudioRingConsumer, AudioRingProducer};
 use coppa_engine::CoppaCore;
 use coppa_host::vara::VaraResponse;
 use coppa_host::HostEvent;
-use coppa_ml::BusyGate;
+use coppa_ml::{BusyGate, RateLoop};
 use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx};
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu, StationIdPayload};
 use coppa_protocol::session::{LinkCapabilities, SessionManager, SessionState};
@@ -72,6 +72,11 @@ pub struct EventLoop {
     arq_rx: Option<ArqRx>,
     /// Current ARQ session ID.
     arq_session_id: u8,
+    /// Sender-side closed-loop rate controller (Phase 3 Task 4's `coppa_ml::
+    /// RateLoop`), updated from the peer's ACK-carried recommendation
+    /// (`TransportPdu::suggested_rate`) and applied to `self.engine` via
+    /// `CoppaCore::set_speed_level`.
+    rate_loop: RateLoop,
     /// Next TX sequence number for transport PDUs.
     #[allow(dead_code)] // used when ARQ TX path sends segmented frames
     arq_next_seq: u8,
@@ -223,6 +228,7 @@ impl EventLoop {
             arq_tx,
             arq_rx,
             arq_session_id: 0,
+            rate_loop: RateLoop::default_coppa(),
             arq_next_seq: 0,
             #[cfg(feature = "websocket")]
             ws_broadcast: None,
@@ -902,6 +908,7 @@ impl EventLoop {
     async fn decode_and_dispatch_audio(&mut self, samples: &[f32]) {
         for frame in self.engine.push_samples(samples) {
             let snr_db = frame.snr_db;
+            let recommended_level = frame.recommended_level;
             #[cfg(feature = "websocket")]
             let cfo_hz = frame.cfo_hz;
             #[cfg(feature = "websocket")]
@@ -955,26 +962,51 @@ impl EventLoop {
                                 match pdu.transport_type {
                                     TransportType::Reliable | TransportType::Unreliable => {
                                         // Feed to ARQ receiver
-                                        if let Some(ref mut arq_rx) = self.arq_rx {
-                                            let delivered =
-                                                arq_rx.receive(pdu.seq_num, pdu.payload.clone());
-                                            // Process ACK info back to our TX side
-                                            if let Some(ref mut arq_tx) = self.arq_tx {
-                                                arq_tx.process_ack(
-                                                    pdu.ack_num,
-                                                    pdu.ack_bitmap,
-                                                    Instant::now(),
-                                                );
+                                        let (result_data, ack_info) =
+                                            if let Some(ref mut arq_rx) = self.arq_rx {
+                                                let delivered = arq_rx
+                                                    .receive(pdu.seq_num, pdu.payload.clone());
+                                                // Process ACK info back to our TX side
+                                                if let Some(ref mut arq_tx) = self.arq_tx {
+                                                    arq_tx.process_ack(
+                                                        pdu.ack_num,
+                                                        pdu.ack_bitmap,
+                                                        Instant::now(),
+                                                    );
+                                                }
+                                                // Collect all delivered payloads
+                                                let mut all_data = Vec::new();
+                                                for (_seq, data) in delivered {
+                                                    all_data.extend(data);
+                                                }
+                                                (all_data, Some(arq_rx.ack_info()))
+                                            } else {
+                                                (pdu.payload, None)
+                                            };
+                                        // Acknowledge every successfully-processed
+                                        // incoming data PDU (one ACK per frame, per
+                                        // decision 4 -- batching was considered and
+                                        // not chosen). Mirrors the RECEIVED pdu's own
+                                        // session_id back rather than sourcing it
+                                        // from either of this daemon's own two
+                                        // (mutually inconsistent) session-id fields.
+                                        if let Some((ack_num, ack_bitmap)) = ack_info {
+                                            let ack_pdu = TransportPdu::new_ack_with_rate(
+                                                pdu.session_id,
+                                                ack_num,
+                                                ack_bitmap,
+                                                recommended_level,
+                                            );
+                                            match self.engine.encode_bytes(&ack_pdu.to_bytes()) {
+                                                Ok(ack_samples) => {
+                                                    self.transmit_samples(&ack_samples).await;
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(error = %e, "Failed to encode outgoing ACK");
+                                                }
                                             }
-                                            // Collect all delivered payloads
-                                            let mut all_data = Vec::new();
-                                            for (_seq, data) in delivered {
-                                                all_data.extend(data);
-                                            }
-                                            all_data
-                                        } else {
-                                            pdu.payload
                                         }
+                                        result_data
                                     }
                                     TransportType::Ack | TransportType::Nak => {
                                         // Pure ACK/NAK: process and don't forward to host
@@ -984,6 +1016,19 @@ impl EventLoop {
                                                 pdu.ack_bitmap,
                                                 Instant::now(),
                                             );
+                                        }
+                                        // Closed-loop rate adaptation: apply the
+                                        // peer's recommendation (if this ACK carries
+                                        // one) and push the resulting level into the
+                                        // encoder for subsequent outgoing frames.
+                                        if let Some(rate) = pdu.suggested_rate() {
+                                            self.rate_loop.on_ack(rate, true);
+                                            if let Err(e) = self
+                                                .engine
+                                                .set_speed_level(self.rate_loop.current_level())
+                                            {
+                                                tracing::warn!(error = %e, "Failed to apply RateLoop's recommended speed level");
+                                            }
                                         }
                                         Vec::new()
                                     }
@@ -1023,23 +1068,13 @@ impl EventLoop {
                             let _ = ws_tx.send(text);
                         }
                     }
-                    // Closed-loop rate adaptation (Phase 3 Task 4) lives in
-                    // `coppa_ml::RateLoop` now, not the old `coppa-engine::RateController`
-                    // this call site used to feed (deleted: it only ever logged a debug
-                    // line, its `current_mcs()`/`rate_controller_mut()` had no other
-                    // caller, so nothing downstream regresses). Wiring `RateLoop` into this
-                    // daemon requires two pieces this event loop doesn't have yet: (a) the
-                    // daemon never constructs/sends an ACK PDU at all (`arq_tx.process_ack`
-                    // only *consumes* incoming ACKs; there's no `TransportPdu::
-                    // new_ack_with_rate` call site to attach a recommendation to), and (b)
-                    // `CoppaTransceiver::receive`'s new recommended-level return
-                    // (`recommend_speed_level` over this frame's noise vars) isn't
-                    // threaded up through `StreamingReceiver`/`StreamFrame` yet. Both are
-                    // real daemon features, not a one-line swap — left for the daemon/ARQ
-                    // wiring work this phase's plan explicitly defers. See
-                    // `crates/coppa-ml/src/rate_loop.rs` and the validation bench
-                    // `crates/coppa-bench/examples/closed_loop_arq.rs` for the
-                    // already-working, ARQ-agnostic controller and its acceptance numbers.
+                    // Closed-loop rate adaptation (Phase 3 Task 4) is wired: `self.
+                    // rate_loop` (`coppa_ml::RateLoop`) is fed from the peer's ACK-carried
+                    // recommendation (`TransportPdu::suggested_rate` on incoming
+                    // `TransportType::Ack | Nak` PDUs, see that match arm) and from
+                    // retransmit-timeout events in `check_arq_retransmits`, then applied
+                    // to outgoing frames via `CoppaCore::set_speed_level`. See
+                    // `crates/coppa-ml/src/rate_loop.rs` for the controller itself.
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -1350,6 +1385,15 @@ impl EventLoop {
         let mut retransmit_pdus: Vec<(u8, Vec<u8>)> = Vec::new();
         if let Some(ref mut arq_tx) = self.arq_tx {
             let retransmit_seqs = arq_tx.get_retransmits(now);
+            // One timeout EVENT (any number of expired segments in this single
+            // poll) maps to exactly one `RateLoop::on_timeout` call, matching
+            // `get_retransmits`'s own documented one-call-per-event contract.
+            if !retransmit_seqs.is_empty() {
+                self.rate_loop.on_timeout();
+                if let Err(e) = self.engine.set_speed_level(self.rate_loop.current_level()) {
+                    tracing::warn!(error = %e, "Failed to apply RateLoop's recommended speed level after timeout");
+                }
+            }
             for seq in retransmit_seqs {
                 if let Some(data) = arq_tx.get_segment_data(seq) {
                     let pdu =
@@ -2031,6 +2075,213 @@ mod tests {
 
         event_loop.run().await.unwrap();
         assert!(!event_loop.listening);
+    }
+
+    // ── Task 5: real wire-level round-trip integration tests ─────────────────
+    //
+    // Unlike `crates/coppa-bench/examples/closed_loop_arq.rs` (which drives
+    // `ArqTx`/`ArqRx` directly, in-process, bypassing encode/decode entirely),
+    // these two tests exercise the REAL wire path: an independent "peer"
+    // `CoppaTransceiver` encodes real OFDM audio samples, `EventLoop` decodes
+    // them through its actual `decode_and_dispatch_audio` (the same path
+    // `handle_audio_in` uses), and -- for the RX-side test -- whatever the
+    // daemon queues as its own outgoing transmission is decoded back with a
+    // second, independent `CoppaTransceiver`, exactly as a real remote station
+    // would. This is exactly the class of gap this project has been bitten by
+    // before (a live decode path silently broken despite passing simulated/
+    // unit-level validation).
+
+    /// Zero-lead/trail-padded encode, mirroring `coppa-engine`'s own streaming
+    /// tests and this file's `telemetry`/`station_id` submodules: `EventLoop`'s
+    /// `decode_and_dispatch_audio` runs through `CoppaCore::push_samples`'s
+    /// STREAMING receiver (`StreamingReceiver`), which wants a clean silence
+    /// bootstrap before the preamble, plus a little trailing pad so the RX
+    /// bandpass filter's group delay doesn't leave `push_samples` seeing
+    /// end-of-input before the (filtered-domain) frame is fully buffered. This
+    /// padding is NOT needed for `CoppaTransceiver::receive` (the one-shot,
+    /// non-streaming decode the RX-side test below uses to read back the
+    /// daemon's own transmitted ACK) -- that path re-derives its own timing via
+    /// a fresh `SyncDetector::detect_all` on whatever slice it's given, with
+    /// zero caller-supplied margin, exactly like every other direct
+    /// `CoppaTransceiver::receive` unit test in this workspace.
+    fn with_lead_and_trail(samples: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; 8192];
+        out.extend_from_slice(samples);
+        out.extend(std::iter::repeat_n(0.0f32, 2048));
+        out
+    }
+
+    #[tokio::test]
+    async fn arq_receive_transmits_a_real_ack_with_rate() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        event_loop.arq_rx = Some(ArqRx::new(8));
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+
+        let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
+        event_loop.set_audio_out(producer);
+
+        // Build a real Reliable TransportPdu from an independent "peer" encoder
+        // (a bare CoppaTransceiver, not another EventLoop) and encode it exactly
+        // as a real remote station would.
+        let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
+        let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
+        let session_id = 5u8;
+        let data_pdu = TransportPdu::new_reliable(session_id, 3, 0, b"hello coppa".to_vec());
+        let header = coppa_codec::ofdm::frame::CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: coppa_codec::ofdm::frame::CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: data_pdu.to_bytes().len() as u16,
+            codewords: 1,
+        };
+        let samples = peer_tx
+            .transmit(&header, &data_pdu.to_bytes())
+            .expect("peer transmit should succeed");
+
+        event_loop
+            .decode_and_dispatch_audio(&with_lead_and_trail(&samples))
+            .await;
+
+        // Read back whatever the daemon queued as its own outgoing transmission.
+        let mut buf = vec![0.0f32; 1_000_000];
+        let read = consumer.read(&mut buf);
+        assert!(read > 0, "expected the daemon to have transmitted an ACK");
+
+        // Decode it back exactly as the real peer would. `DaemonConfig::default`'s
+        // "HF_STANDARD" profile has `compression: true` (see
+        // `coppa_engine::profiles::HF_STANDARD`), so `EventLoop`'s own
+        // `encode_bytes` call Huffman+LZ4-compresses the ACK's `TransportPdu`
+        // bytes before framing -- a bare `CoppaTransceiver::receive` only
+        // recovers the still-compressed bytes (marker byte `0xFE` + LZ4 payload)
+        // and fails to parse as a `TransportPdu`. A real peer station would also
+        // be a `CoppaCore` (or `EventLoop`) built from the same profile, so
+        // decode through `CoppaCore::decode_bytes` (public, one-shot,
+        // decompression-aware) here too, not a bare transceiver -- otherwise
+        // this step doesn't decode "exactly as a real peer would" as intended,
+        // it decodes as an incomplete peer would.
+        let peer_core = coppa_engine::CoppaCore::from_profile(
+            coppa_engine::profiles::get_profile("HF_STANDARD")
+                .expect("HF_STANDARD is a built-in profile"),
+        );
+        let ack_bytes = peer_core
+            .decode_bytes(&buf[..read])
+            .expect("the transmitted ACK should decode cleanly");
+        let ack_pdu = TransportPdu::from_bytes(&ack_bytes).expect("should parse as TransportPdu");
+
+        assert_eq!(ack_pdu.transport_type, TransportType::Ack);
+        assert_eq!(
+            ack_pdu.session_id & 0x0F,
+            session_id & 0x0F,
+            "ACK should mirror the received PDU's own session_id"
+        );
+        assert!(
+            ack_pdu.suggested_rate().is_some(),
+            "ACK should carry a rate recommendation"
+        );
+    }
+
+    #[tokio::test]
+    async fn incoming_ack_with_rate_updates_rate_loop_and_encoder() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+
+        let before_level = event_loop.rate_loop.current_level();
+
+        // A peer ACK recommending a level clearly different from the default
+        // (RateLoop::default_coppa starts at level 1) -- enough consecutive
+        // higher recommendations to actually step, matching RateLoop's own
+        // "raise slow" semantics (raise_dwell = 5 by default).
+        let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
+        let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
+        for _ in 0..5 {
+            let ack_pdu = TransportPdu::new_ack_with_rate(0, 0, 0, 10);
+            let header = coppa_codec::ofdm::frame::CoppaHeader {
+                version: 1,
+                phy_mode: 0,
+                frame_type: coppa_codec::ofdm::frame::CoppaFrameType::Data,
+                bandwidth: 1,
+                fec_type: 0,
+                speed_level: 2,
+                seq_num: 0,
+                payload_len: ack_pdu.to_bytes().len() as u16,
+                codewords: 1,
+            };
+            let samples = peer_tx
+                .transmit(&header, &ack_pdu.to_bytes())
+                .expect("peer transmit should succeed");
+            event_loop
+                .decode_and_dispatch_audio(&with_lead_and_trail(&samples))
+                .await;
+        }
+
+        assert!(
+            event_loop.rate_loop.current_level() > before_level,
+            "RateLoop should have raised its level after 5 consecutive higher recommendations"
+        );
+        assert_eq!(
+            event_loop.engine.speed_level(),
+            event_loop.rate_loop.current_level(),
+            "the engine's configured speed level should track RateLoop's current level"
+        );
+    }
+
+    /// Bonus regression test (Task 4 review finding): `check_arq_retransmits`
+    /// must call `RateLoop::on_timeout` exactly ONCE per poll, no matter how
+    /// many segments expired together in that single `ArqTx::get_retransmits`
+    /// call -- not once per expired segment. This is already correct by code
+    /// inspection (see `check_arq_retransmits`'s own comment: "one timeout
+    /// EVENT ... maps to exactly one `RateLoop::on_timeout` call"), but had no
+    /// test locking the contract in before this.
+    ///
+    /// Seeds two segments whose RTO has already elapsed by the time
+    /// `check_arq_retransmits` polls, so `get_retransmits` returns both in one
+    /// `Vec` -- the exact "multiple segments expire together" scenario the
+    /// contract is about. Starts `rate_loop` at level 5 (not the default level
+    /// 1) specifically so a single `on_timeout` step-down (level 5 -> 4) is
+    /// distinguishable from the bug this guards against (two calls would drop
+    /// to level 3): level 1 can't tell the difference, since
+    /// `idx.saturating_sub(1)` floors at 0 either way.
+    #[tokio::test]
+    async fn check_arq_retransmits_calls_on_timeout_once_per_poll_not_per_segment() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+
+        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 5);
+        assert_eq!(event_loop.rate_loop.current_level(), 5);
+
+        // Two segments, both already past a short RTO by the time
+        // `check_arq_retransmits` polls -- `get_retransmits` returns both
+        // sequence numbers from this single call.
+        let arq_config = ArqConfig::new(8, 5, Duration::from_millis(20))
+            .expect("window_size=8 is within 1..=MAX_WINDOW_SIZE");
+        let mut arq_tx = ArqTx::new(arq_config);
+        let send_time = Instant::now() - Duration::from_millis(100);
+        arq_tx
+            .send(b"segment one".to_vec(), send_time)
+            .expect("a fresh ARQ window should have room");
+        arq_tx
+            .send(b"segment two".to_vec(), send_time)
+            .expect("a fresh ARQ window should have room for a second segment");
+        event_loop.arq_tx = Some(arq_tx);
+
+        event_loop.check_arq_retransmits().await;
+
+        assert_eq!(
+            event_loop.rate_loop.current_level(),
+            4,
+            "two segments expiring in the same poll should drop RateLoop by \
+             exactly ONE step (5 -> 4), not one step per expired segment \
+             (which would read as 3)"
+        );
     }
 
     // ── Task 7: live SNR/PTT/BUFFER/BUSY telemetry on the VARA port ──────────

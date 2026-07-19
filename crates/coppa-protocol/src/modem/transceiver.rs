@@ -870,13 +870,17 @@ impl CoppaTransceiver {
     /// real per-carrier-noise telemetry instead of the crude whole-buffer RMS proxy
     /// it used before (`20*log10(rms) + 40`, since replaced). `receive` itself is
     /// unchanged (beyond Task 4's added recommended-level return) and still used by
-    /// every existing (batch) call site.
+    /// every existing (batch) call site. Now also returns the same per-frame
+    /// recommended speed level `receive` does (Task 4's `recommend_speed_level`),
+    /// for the streaming/daemon path to feed back on an outgoing ACK -- see
+    /// `DecodedFrame::recommended_level`.
     pub fn receive_with_metrics(
         &self,
         samples: &[f32],
-    ) -> Result<(CoppaHeader, Vec<u8>, f32), ReceiveError> {
-        self.receive_core(samples)
-            .map(|(h, p, snr, _noise_vars)| (h, p, snr))
+    ) -> Result<(CoppaHeader, Vec<u8>, f32, u8), ReceiveError> {
+        self.receive_core(samples).map(|(h, p, snr, noise_vars)| {
+            (h, p, snr, coppa_ml::recommend_speed_level(&noise_vars))
+        })
     }
 
     /// Core decode pipeline shared by [`Self::receive`] and [`Self::receive_with_metrics`]:
@@ -2824,6 +2828,39 @@ mod tests {
             on_avg - off_avg >= 2.0,
             "interleaving ON should recover >= 2 more codewords on average than OFF \
              (on_avg={on_avg:.2}, off_avg={off_avg:.2})"
+        );
+    }
+
+    #[test]
+    fn receive_with_metrics_recommendation_matches_receive() {
+        // The two public methods share `receive_core` and must never disagree
+        // about the recommended level for the same input.
+        let profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
+        let tx = CoppaTransceiver::new(profile, 1);
+        let header = coppa_codec::ofdm::frame::CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: coppa_codec::ofdm::frame::CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: 8,
+            codewords: 1,
+        };
+        let payload = b"testdata";
+        let samples = tx
+            .transmit(&header, payload)
+            .expect("transmit should succeed");
+
+        let (_, _, via_receive_level) = tx.receive(&samples).expect("receive should decode");
+        let (_, _, _, via_metrics_level) = tx
+            .receive_with_metrics(&samples)
+            .expect("receive_with_metrics should decode");
+
+        assert_eq!(
+            via_receive_level, via_metrics_level,
+            "receive() and receive_with_metrics() must agree on the recommended level"
         );
     }
 }

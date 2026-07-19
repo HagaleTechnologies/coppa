@@ -56,6 +56,10 @@ pub struct StreamFrame {
     /// Phase 3 Task 7 so daemon/host telemetry (WebSocket `status`'s `level` field)
     /// can report the link's real current speed level rather than a placeholder.
     pub speed_level: u8,
+    /// This station's recommended speed level for its PEER's next transmission
+    /// to it (`DecodedFrame::recommended_level`) — fed back on an outgoing ACK so
+    /// `coppa_ml::RateLoop` on the peer's side can apply it.
+    pub recommended_level: u8,
 }
 
 /// Core engine for Coppa digital communications.
@@ -336,6 +340,7 @@ impl CoppaCore {
                 cfo_hz: f.cfo_hz,
                 frame_start: f.frame_start,
                 speed_level: f.header.speed_level,
+                recommended_level: f.recommended_level,
             })
             .collect()
     }
@@ -410,6 +415,14 @@ impl CoppaCore {
         config.speed_level = level;
         self.reconfigure(config);
         Ok(())
+    }
+
+    /// The speed level currently configured for outgoing `encode_bytes` calls.
+    /// Added alongside `set_speed_level` (also FFI-v2-motivated) so callers —
+    /// including tests — can verify a `set_speed_level` call actually took effect
+    /// without reaching into private config state.
+    pub fn speed_level(&self) -> u8 {
+        self.config.speed_level
     }
 }
 
@@ -743,6 +756,26 @@ mod tests {
         let frames = core.push_samples(&samples);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].speed_level, 1);
+    }
+
+    #[test]
+    fn stream_frame_carries_recommended_level() {
+        let config = EngineConfig {
+            speed_level: 2,
+            ..Default::default()
+        };
+        let mut core = CoppaCore::with_config(config);
+        let samples = core.encode_bytes(b"hello").expect("encode should succeed");
+        let samples = with_lead_and_trail(&samples);
+        let frames = core.push_samples(&samples);
+        assert_eq!(frames.len(), 1);
+        // A clean loopback should recommend a real level in the valid 1-10 range
+        // (excluding reserved 8), not a placeholder/zero value.
+        let level = frames[0].recommended_level;
+        assert!(
+            (1..=10).contains(&level) && level != 8,
+            "expected a valid recommended level, got {level}"
+        );
     }
 
     #[test]
