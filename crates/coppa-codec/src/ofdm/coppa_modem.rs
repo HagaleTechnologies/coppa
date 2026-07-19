@@ -313,6 +313,31 @@ struct ProbeCalibration {
     noise_var: f32,
 }
 
+/// DIAGNOSTIC ONLY: output of [`CoppaModem::diagnose_drift_tracking`],
+/// exposing `DriftTracker`'s internal per-window state for an external
+/// investigation into the Cascaded/Replace designs' shared 18.0 dB ceiling.
+/// Not used by any production path.
+pub struct DriftDiagnostics {
+    pub speed_level: u8,
+    /// The frame-fixed reference the ORIGINAL (unchanged) payload path uses
+    /// unchanged for the whole frame — `self.calibrated_bias` alone (the
+    /// construction-time clean-channel measurement), for comparison against
+    /// the per-frame-bounded `coarse_delay` below.
+    pub calibrated_bias: f32,
+    /// This frame's `bounded_coarse_delay` result (`calibrated_bias` plus a
+    /// tightly bounded per-frame jitter correction) — `DriftTracker`'s seed
+    /// and the baseline every `tau_by_window` entry is implicitly compared
+    /// against.
+    pub coarse_delay: f32,
+    /// `DriftTracker`'s filtered (causal) delay estimate at each window,
+    /// grid units, same convention as `coarse_delay`.
+    pub tau_by_window: Vec<f32>,
+    /// The RAW `(z, r)` observation `observe_drift` produced at each window,
+    /// before Kalman filtering — `None` where too few pilots were available
+    /// for an estimate that step.
+    pub raw_observations: Vec<Option<(f32, f32)>>,
+}
+
 /// State retained from the most recent [`CoppaModem::demodulate_frame`] call,
 /// letting [`CoppaModem::reequalize_with_virtual_pilots`] (Task 5's turbo
 /// re-estimation entry point) re-fit the delay-domain channel model with extra
@@ -1327,6 +1352,96 @@ impl CoppaModem {
             noise_variances.extend_from_slice(&carrier_noise);
         }
         (payload_symbols, noise_variances, data_carrier_map)
+    }
+
+    /// DIAGNOSTIC ONLY (Hypothesis-1 investigation into the Cascaded/Replace
+    /// designs' shared 18.0 dB ceiling): runs the exact same sync/CFO/header/
+    /// Pass-1 pipeline as `demodulate_frame_impl`, then exercises
+    /// `DriftTracker`'s per-window tracking exactly as
+    /// `equalize_payload_cascaded` does (regardless of `DRIFT_CASCADE_ENABLED`),
+    /// returning both the filtered `tau_by_window` and the RAW per-window
+    /// `observe_drift` observations that fed it — letting an external caller
+    /// judge the estimate's own quality (noise, bias, lag) independent of
+    /// either downstream consumer (fresh LS refit vs. AR(1) tap tracker).
+    /// Not used by any production path; scratch investigation tooling.
+    pub fn diagnose_drift_tracking(&self, samples: &[f32]) -> Option<DriftDiagnostics> {
+        let symbol_len = self.profile.fft_size + self.profile.cp_samples;
+        let data_per_sym = self.data_carriers_per_symbol();
+
+        let candidate = SyncDetector::detect_all(&self.profile, self.version, samples)
+            .into_iter()
+            .next()?;
+        let timing_offset = candidate.frame_start as usize;
+        let corrected: Vec<f32> = if candidate.cfo_hz.abs() > 0.5 {
+            crate::ofdm::sync::remove_cfo(
+                samples,
+                candidate.cfo_hz,
+                self.profile.sample_rate as f32,
+            )
+        } else {
+            samples.to_vec()
+        };
+        let samples: &[f32] = &corrected;
+
+        let data_start = timing_offset + 3 * symbol_len;
+        if data_start >= samples.len() {
+            return None;
+        }
+        let calib = self.probe_calibration(samples, data_start);
+
+        let num_header_syms = header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(data_per_sym);
+        let header = self.demodulate_header(samples, data_start)?;
+
+        const CODED_BLOCK_LEN: usize = 1944;
+        let coded_symbols = SPEED_LEVELS
+            .iter()
+            .find(|s| s.level == header.speed_level)
+            .map(|s| {
+                CODED_BLOCK_LEN.div_ceil(s.bits_per_symbol as usize)
+                    * header.codewords.max(1) as usize
+            })
+            .unwrap_or(CODED_BLOCK_LEN);
+        let num_payload_syms = coded_symbols.div_ceil(data_per_sym);
+
+        let mut per_symbol_pilots: Vec<Vec<(usize, Complex32)>> =
+            Vec::with_capacity(num_payload_syms);
+        for sym_idx in 0..num_payload_syms {
+            let global_sym = num_header_syms + sym_idx;
+            let sym_start = data_start as i64 + global_sym as i64 * symbol_len as i64;
+            if sym_start < 0 {
+                break;
+            }
+            let sym_start = sym_start as usize;
+            if sym_start + symbol_len > samples.len() {
+                break;
+            }
+            let sym_samples = &samples[sym_start..sym_start + symbol_len];
+            let carriers = self.demod_ofdm_symbol(sym_samples);
+            let pilot_info = self.extract_pilot_info(&carriers, global_sym);
+            per_symbol_pilots.push(pilot_info);
+        }
+
+        let fft_size = self.profile.fft_size;
+        let nc = self.profile.total_active_carriers();
+        let mut drift =
+            drift_tracker::DriftTracker::new(calib.coarse_delay, DRIFT_Q_TAU, DRIFT_Q_DOT);
+        let mut tau_by_window: Vec<f32> = Vec::with_capacity(per_symbol_pilots.len());
+        let mut raw_observations: Vec<Option<(f32, f32)>> =
+            Vec::with_capacity(per_symbol_pilots.len());
+        for sym_pilots in &per_symbol_pilots {
+            let obs = drift_tracker::observe_drift(fft_size, nc, calib.noise_var, sym_pilots);
+            raw_observations.push(obs);
+            drift.advance(obs);
+            tau_by_window.push(drift.tau(tau_by_window.len()));
+        }
+
+        Some(DriftDiagnostics {
+            speed_level: header.speed_level,
+            calibrated_bias: self.calibrated_bias,
+            coarse_delay: calib.coarse_delay,
+            tau_by_window,
+            raw_observations,
+        })
     }
 
     /// AR(1) one-step correlation coefficient for this profile's OFDM symbol period

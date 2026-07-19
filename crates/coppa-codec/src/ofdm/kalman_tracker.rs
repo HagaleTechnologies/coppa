@@ -128,6 +128,37 @@ use super::delay_domain::tau_basis;
 /// Task 1's report), a process an amplitude-fading-derived, mean-reverting AR(1)
 /// model doesn't represent well at a near-unity `a`.
 ///
+/// # Correction (2026-07, post-Cascade root-cause investigation): the "~1-10s
+/// # coherence time" premise above is wrong for Watterson-Moderate specifically,
+/// # and amplitude fading is very likely the dominant driver after all
+///
+/// The paragraph above's "~1-10s, genuinely slow" coherence-time figure was
+/// never checked against `coppa-channel`'s actually-configured Watterson-Moderate
+/// Doppler spread (`doppler_spread_hz = 0.5`, i.e. PSD sigma `0.25` — note this
+/// module's own "the plan's literal spec says default 0.5 Hz" text a few
+/// paragraphs above also conflates the *spread* with the *sigma*, a related unit
+/// slip). Plugging the correct sigma into `watterson.rs`'s own verified
+/// `rho(τ)=exp(-2π²σ²τ²)` autocorrelation shows a level-2 (`hf_standard`, 1.365 s)
+/// frame decorrelates to ~10% correlation by frame-end — the channel loses
+/// coherence WITHIN a single frame, not over "1-10s." A follow-on investigation
+/// (`crates/coppa-bench/examples/regression_root_cause.rs`) measured a **flat
+/// single-tap channel** (no multipath at all, so a "stale coarse-delay
+/// reference" isn't even a coherent failure mode there) at Moderate's real
+/// Doppler producing FER comparable to or worse than the real 2-tap channel at
+/// low-to-mid SNR, and found `LdpcNotConverged` failures are SNR-*independent*
+/// across 9-24 dB — the signature of a hard fading-outage floor, not an
+/// estimation-quality problem. A companion investigation
+/// (`crates/coppa-bench/examples/drift_estimate_quality_diagnosis.rs`) also
+/// found the `DriftTracker`-based designs' own tracked delay never converges
+/// even at 24 dB on real Watterson-Moderate frames (unlike its clean AWGN-control
+/// convergence), because it's chasing a power-weighted average of two
+/// independently-fading taps — consistent with the apparent "coarse-delay drift"
+/// being a *symptom* of amplitude fading rather than a separate phenomenon this
+/// module's AR(1) tap model was ever going to fix. See CLAUDE.md's Known
+/// Limitations (the "Phase 2 channel estimation" bullet and its follow-on
+/// update) for the full account across all four attempts this affects (Task 1,
+/// Task 7 here, and the later Replace/Cascade designs).
+///
 /// A direct, systematic empirical sweep of `a` ∈ {0.5, 0.6, 0.7, 0.8, 0.9, 0.95,
 /// 0.99} (a fast reduced-scale FER check, 150 trials/point, watterson-moderate
 /// level 2 — run via a scratch harness since deleted per this project's
