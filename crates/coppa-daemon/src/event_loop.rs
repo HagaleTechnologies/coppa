@@ -2077,6 +2077,213 @@ mod tests {
         assert!(!event_loop.listening);
     }
 
+    // ── Task 5: real wire-level round-trip integration tests ─────────────────
+    //
+    // Unlike `crates/coppa-bench/examples/closed_loop_arq.rs` (which drives
+    // `ArqTx`/`ArqRx` directly, in-process, bypassing encode/decode entirely),
+    // these two tests exercise the REAL wire path: an independent "peer"
+    // `CoppaTransceiver` encodes real OFDM audio samples, `EventLoop` decodes
+    // them through its actual `decode_and_dispatch_audio` (the same path
+    // `handle_audio_in` uses), and -- for the RX-side test -- whatever the
+    // daemon queues as its own outgoing transmission is decoded back with a
+    // second, independent `CoppaTransceiver`, exactly as a real remote station
+    // would. This is exactly the class of gap this project has been bitten by
+    // before (a live decode path silently broken despite passing simulated/
+    // unit-level validation).
+
+    /// Zero-lead/trail-padded encode, mirroring `coppa-engine`'s own streaming
+    /// tests and this file's `telemetry`/`station_id` submodules: `EventLoop`'s
+    /// `decode_and_dispatch_audio` runs through `CoppaCore::push_samples`'s
+    /// STREAMING receiver (`StreamingReceiver`), which wants a clean silence
+    /// bootstrap before the preamble, plus a little trailing pad so the RX
+    /// bandpass filter's group delay doesn't leave `push_samples` seeing
+    /// end-of-input before the (filtered-domain) frame is fully buffered. This
+    /// padding is NOT needed for `CoppaTransceiver::receive` (the one-shot,
+    /// non-streaming decode the RX-side test below uses to read back the
+    /// daemon's own transmitted ACK) -- that path re-derives its own timing via
+    /// a fresh `SyncDetector::detect_all` on whatever slice it's given, with
+    /// zero caller-supplied margin, exactly like every other direct
+    /// `CoppaTransceiver::receive` unit test in this workspace.
+    fn with_lead_and_trail(samples: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; 8192];
+        out.extend_from_slice(samples);
+        out.extend(std::iter::repeat_n(0.0f32, 2048));
+        out
+    }
+
+    #[tokio::test]
+    async fn arq_receive_transmits_a_real_ack_with_rate() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        event_loop.arq_rx = Some(ArqRx::new(8));
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+
+        let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
+        event_loop.set_audio_out(producer);
+
+        // Build a real Reliable TransportPdu from an independent "peer" encoder
+        // (a bare CoppaTransceiver, not another EventLoop) and encode it exactly
+        // as a real remote station would.
+        let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
+        let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
+        let session_id = 5u8;
+        let data_pdu = TransportPdu::new_reliable(session_id, 3, 0, b"hello coppa".to_vec());
+        let header = coppa_codec::ofdm::frame::CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: coppa_codec::ofdm::frame::CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: data_pdu.to_bytes().len() as u16,
+            codewords: 1,
+        };
+        let samples = peer_tx
+            .transmit(&header, &data_pdu.to_bytes())
+            .expect("peer transmit should succeed");
+
+        event_loop
+            .decode_and_dispatch_audio(&with_lead_and_trail(&samples))
+            .await;
+
+        // Read back whatever the daemon queued as its own outgoing transmission.
+        let mut buf = vec![0.0f32; 1_000_000];
+        let read = consumer.read(&mut buf);
+        assert!(read > 0, "expected the daemon to have transmitted an ACK");
+
+        // Decode it back exactly as the real peer would. `DaemonConfig::default`'s
+        // "HF_STANDARD" profile has `compression: true` (see
+        // `coppa_engine::profiles::HF_STANDARD`), so `EventLoop`'s own
+        // `encode_bytes` call Huffman+LZ4-compresses the ACK's `TransportPdu`
+        // bytes before framing -- a bare `CoppaTransceiver::receive` only
+        // recovers the still-compressed bytes (marker byte `0xFE` + LZ4 payload)
+        // and fails to parse as a `TransportPdu`. A real peer station would also
+        // be a `CoppaCore` (or `EventLoop`) built from the same profile, so
+        // decode through `CoppaCore::decode_bytes` (public, one-shot,
+        // decompression-aware) here too, not a bare transceiver -- otherwise
+        // this step doesn't decode "exactly as a real peer would" as intended,
+        // it decodes as an incomplete peer would.
+        let peer_core = coppa_engine::CoppaCore::from_profile(
+            coppa_engine::profiles::get_profile("HF_STANDARD")
+                .expect("HF_STANDARD is a built-in profile"),
+        );
+        let ack_bytes = peer_core
+            .decode_bytes(&buf[..read])
+            .expect("the transmitted ACK should decode cleanly");
+        let ack_pdu = TransportPdu::from_bytes(&ack_bytes).expect("should parse as TransportPdu");
+
+        assert_eq!(ack_pdu.transport_type, TransportType::Ack);
+        assert_eq!(
+            ack_pdu.session_id & 0x0F,
+            session_id & 0x0F,
+            "ACK should mirror the received PDU's own session_id"
+        );
+        assert!(
+            ack_pdu.suggested_rate().is_some(),
+            "ACK should carry a rate recommendation"
+        );
+    }
+
+    #[tokio::test]
+    async fn incoming_ack_with_rate_updates_rate_loop_and_encoder() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+
+        let before_level = event_loop.rate_loop.current_level();
+
+        // A peer ACK recommending a level clearly different from the default
+        // (RateLoop::default_coppa starts at level 1) -- enough consecutive
+        // higher recommendations to actually step, matching RateLoop's own
+        // "raise slow" semantics (raise_dwell = 5 by default).
+        let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
+        let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
+        for _ in 0..5 {
+            let ack_pdu = TransportPdu::new_ack_with_rate(0, 0, 0, 10);
+            let header = coppa_codec::ofdm::frame::CoppaHeader {
+                version: 1,
+                phy_mode: 0,
+                frame_type: coppa_codec::ofdm::frame::CoppaFrameType::Data,
+                bandwidth: 1,
+                fec_type: 0,
+                speed_level: 2,
+                seq_num: 0,
+                payload_len: ack_pdu.to_bytes().len() as u16,
+                codewords: 1,
+            };
+            let samples = peer_tx
+                .transmit(&header, &ack_pdu.to_bytes())
+                .expect("peer transmit should succeed");
+            event_loop
+                .decode_and_dispatch_audio(&with_lead_and_trail(&samples))
+                .await;
+        }
+
+        assert!(
+            event_loop.rate_loop.current_level() > before_level,
+            "RateLoop should have raised its level after 5 consecutive higher recommendations"
+        );
+        assert_eq!(
+            event_loop.engine.speed_level(),
+            event_loop.rate_loop.current_level(),
+            "the engine's configured speed level should track RateLoop's current level"
+        );
+    }
+
+    /// Bonus regression test (Task 4 review finding): `check_arq_retransmits`
+    /// must call `RateLoop::on_timeout` exactly ONCE per poll, no matter how
+    /// many segments expired together in that single `ArqTx::get_retransmits`
+    /// call -- not once per expired segment. This is already correct by code
+    /// inspection (see `check_arq_retransmits`'s own comment: "one timeout
+    /// EVENT ... maps to exactly one `RateLoop::on_timeout` call"), but had no
+    /// test locking the contract in before this.
+    ///
+    /// Seeds two segments whose RTO has already elapsed by the time
+    /// `check_arq_retransmits` polls, so `get_retransmits` returns both in one
+    /// `Vec` -- the exact "multiple segments expire together" scenario the
+    /// contract is about. Starts `rate_loop` at level 5 (not the default level
+    /// 1) specifically so a single `on_timeout` step-down (level 5 -> 4) is
+    /// distinguishable from the bug this guards against (two calls would drop
+    /// to level 3): level 1 can't tell the difference, since
+    /// `idx.saturating_sub(1)` floors at 0 either way.
+    #[tokio::test]
+    async fn check_arq_retransmits_calls_on_timeout_once_per_poll_not_per_segment() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+
+        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 5);
+        assert_eq!(event_loop.rate_loop.current_level(), 5);
+
+        // Two segments, both already past a short RTO by the time
+        // `check_arq_retransmits` polls -- `get_retransmits` returns both
+        // sequence numbers from this single call.
+        let arq_config = ArqConfig::new(8, 5, Duration::from_millis(20))
+            .expect("window_size=8 is within 1..=MAX_WINDOW_SIZE");
+        let mut arq_tx = ArqTx::new(arq_config);
+        let send_time = Instant::now() - Duration::from_millis(100);
+        arq_tx
+            .send(b"segment one".to_vec(), send_time)
+            .expect("a fresh ARQ window should have room");
+        arq_tx
+            .send(b"segment two".to_vec(), send_time)
+            .expect("a fresh ARQ window should have room for a second segment");
+        event_loop.arq_tx = Some(arq_tx);
+
+        event_loop.check_arq_retransmits().await;
+
+        assert_eq!(
+            event_loop.rate_loop.current_level(),
+            4,
+            "two segments expiring in the same poll should drop RateLoop by \
+             exactly ONE step (5 -> 4), not one step per expired segment \
+             (which would read as 3)"
+        );
+    }
+
     // ── Task 7: live SNR/PTT/BUFFER/BUSY telemetry on the VARA port ──────────
     //
     // These are the "host-level integration tests with a mock client" the Task 7
