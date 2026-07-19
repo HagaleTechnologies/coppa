@@ -134,6 +134,37 @@ const KALMAN_HEADER_ENABLED: bool = true;
 /// for the design.
 const DRIFT_TRACKER_ENABLED: bool = false;
 
+/// Payload-pass toggle for the Cascaded design
+/// (`docs/superpowers/specs/2026-07-18-cascaded-drift-tracker-design.md`):
+/// combines [`drift_tracker::DriftTracker`]'s per-window coarse-delay
+/// tracking with the AR(1) [`KalmanLagSmoother`] tap-amplitude tracker
+/// (instead of [`Self::equalize_payload_drift_tracked`]'s fresh per-window
+/// [`DelayDomainEstimator::fit`] refits). Takes priority over
+/// `DRIFT_TRACKER_ENABLED` in `demodulate_frame_impl`'s Pass 2 dispatch —
+/// see that dispatch site's doc.
+///
+/// **Left `false` (Task 4, gate NOT met).** The Task 4 gate bench
+/// (`drift_cascade_gate`) measured this path at **18.0 dB** for the
+/// Watterson-Moderate/level 2 FER≤10% threshold (400 trials/point,
+/// `DRIFT_Q_TAU`/`DRIFT_Q_DOT` below, reused as-is) against a required
+/// ≤16.5 dB — not met. The *current* (`false`) baseline on this same
+/// branch (with this plan's own Task 1 `TrackedTaps::equalize` LLR fix
+/// already included, which turned out not to move this particular number)
+/// measures **15.0 dB**, so enabling the Cascade is a measured ~3 dB
+/// *regression* against the branch's own current baseline, not just a
+/// shortfall against the design's target — and lands at exactly the same
+/// 18.0 dB the pure `DriftTracker`-only "Replace" design
+/// (`DRIFT_TRACKER_ENABLED`, above) measured; combining it with the AR(1)
+/// tap tracker made no measurable difference. AWGN is unchanged (6.0 dB,
+/// all three paths) and Watterson-Poor never clears in any of them, so
+/// this is isolated to Watterson-Moderate. This is the third and, per the
+/// design plan's own framing, final attempt at this regression in this
+/// line of investigation — see `.superpowers/sdd/task-4-report.md` and
+/// `BENCHMARKS.md`'s corresponding subsection for the full numbers, and
+/// `docs/superpowers/specs/2026-07-18-cascaded-drift-tracker-design.md`
+/// for the design.
+const DRIFT_CASCADE_ENABLED: bool = false;
+
 /// Process-noise variance on the tracked delay `τ` itself (grid units²/step)
 /// — a [`drift_tracker::DriftTracker`] tuning knob. Empirically tuned (Task
 /// 5): a reduced-scale (150 trials, watterson-moderate/level 2, 9-27 dB)
@@ -819,14 +850,19 @@ impl CoppaModem {
             sym_carriers.push((global_sym, carriers));
         }
 
-        // Pass 2: payload equalization, behind `DRIFT_TRACKER_ENABLED` — see
-        // `equalize_payload_kalman`'s doc (the `false`/default path, extracted
-        // unchanged from this frame's previous inline Task 7 Kalman-tracked
-        // 2D estimation; `kalman_tracker`'s module doc has the full "why raw
-        // per-symbol pilots, not pooled windows" and `TrackedTaps::noise_at`
-        // rationale) and `equalize_payload_drift_tracked`'s doc (the `true`
-        // path, Task 3).
-        let (payload_symbols, noise_variances, data_carrier_map) = if DRIFT_TRACKER_ENABLED {
+        // Pass 2: payload equalization, a three-way branch across
+        // `DRIFT_CASCADE_ENABLED`/`DRIFT_TRACKER_ENABLED` — see
+        // `equalize_payload_kalman`'s doc (both `false`, the default path,
+        // extracted unchanged from this frame's previous inline Task 7
+        // Kalman-tracked 2D estimation; `kalman_tracker`'s module doc has
+        // the full "why raw per-symbol pilots, not pooled windows"
+        // rationale), `equalize_payload_drift_tracked`'s doc
+        // (`DRIFT_TRACKER_ENABLED` true, the measured-negative "Replace"
+        // design), and `equalize_payload_cascaded`'s doc
+        // (`DRIFT_CASCADE_ENABLED` true, this design).
+        let (payload_symbols, noise_variances, data_carrier_map) = if DRIFT_CASCADE_ENABLED {
+            self.equalize_payload_cascaded(&calib, &sym_carriers, &per_symbol_pilots)
+        } else if DRIFT_TRACKER_ENABLED {
             self.equalize_payload_drift_tracked(&calib, &sym_carriers, &per_symbol_pilots)
         } else {
             self.equalize_payload_kalman(
@@ -1200,6 +1236,86 @@ impl CoppaModem {
             let pooled = pool_pilots(&per_symbol_pilots[lo..hi]);
             let (equalized, noise_full) =
                 self.estimate_and_equalize(carriers, &pooled, calib.order, tau_by_window[i]);
+            let data = self.pilots.extract_data(&equalized, *global_sym);
+            let data_indices = self.pilots.data_indices(*global_sym);
+            data_carrier_map.extend(data_indices.iter().map(|&idx| (i, idx)));
+            let carrier_noise: Vec<f32> = data_indices
+                .iter()
+                .map(|&idx| noise_full.get(idx).copied().unwrap_or(1e6))
+                .collect();
+            payload_symbols.extend_from_slice(&data);
+            noise_variances.extend_from_slice(&carrier_noise);
+        }
+        (payload_symbols, noise_variances, data_carrier_map)
+    }
+
+    /// New (Cascaded design, `DRIFT_CASCADE_ENABLED == true`) payload
+    /// equalization: combines [`drift_tracker::DriftTracker`]'s per-window
+    /// coarse-delay tracking (same as
+    /// [`Self::equalize_payload_drift_tracked`]) with the AR(1)
+    /// tap-amplitude [`KalmanLagSmoother`] (same as
+    /// [`Self::equalize_payload_kalman`]) instead of choosing one over the
+    /// other — each window's raw per-symbol pilots are derotated by THAT
+    /// window's own tracked delay (not one frame-fixed value) before being
+    /// fed to the AR(1) tracker, restoring its validated lag-2
+    /// RTS-smoothing benefit on top of a correctly-evolving reference. See
+    /// `docs/superpowers/specs/2026-07-18-cascaded-drift-tracker-design.md`.
+    ///
+    /// # Known rough edge
+    ///
+    /// `build_tracker`'s seed (`calib.taps`, derotated by the frame's fixed
+    /// `calib.coarse_delay`) is very slightly out of reference-frame with
+    /// `tau_by_window[0]` (which has already evolved one Kalman step from
+    /// `calib.coarse_delay` by the time window 0 is processed) — a small,
+    /// bounded mismatch, self-correcting via the Kalman update at window 0
+    /// itself, not a structural issue.
+    fn equalize_payload_cascaded(
+        &self,
+        calib: &ProbeCalibration,
+        sym_carriers: &[(usize, Vec<Complex32>)],
+        per_symbol_pilots: &[Vec<(usize, Complex32)>],
+    ) -> (Vec<Complex32>, Vec<f32>, Vec<(usize, usize)>) {
+        let fft_size = self.profile.fft_size;
+        let nc = self.profile.total_active_carriers();
+        let n = sym_carriers.len();
+
+        let mut drift =
+            drift_tracker::DriftTracker::new(calib.coarse_delay, DRIFT_Q_TAU, DRIFT_Q_DOT);
+        let mut tau_by_window: Vec<f32> = Vec::with_capacity(n);
+        for sym_pilots in per_symbol_pilots {
+            let obs = drift_tracker::observe_drift(fft_size, nc, calib.noise_var, sym_pilots);
+            drift.advance(obs);
+            tau_by_window.push(drift.tau(tau_by_window.len()));
+        }
+
+        let windows: Vec<Vec<(usize, Complex32, f32)>> = per_symbol_pilots
+            .iter()
+            .enumerate()
+            .map(|(i, sym_pilots)| {
+                let derot = coarse_delay_rotation(nc, tau_by_window[i]);
+                sym_pilots
+                    .iter()
+                    .map(|&(idx, h)| (idx, h * derot(idx), 1.0))
+                    .collect()
+            })
+            .collect();
+        let mut tracker = self.build_tracker(calib);
+        for w in &windows {
+            tracker.advance(w);
+        }
+
+        let mut payload_symbols = Vec::new();
+        let mut noise_variances = Vec::new();
+        let mut data_carrier_map: Vec<(usize, usize)> = Vec::new();
+        for (i, (global_sym, carriers)) in sym_carriers.iter().enumerate() {
+            let tt = tracker.smoothed(i);
+            let derot = coarse_delay_rotation(nc, tau_by_window[i]);
+            let rotated_carriers: Vec<Complex32> = carriers
+                .iter()
+                .enumerate()
+                .map(|(k, &y)| y * derot(k))
+                .collect();
+            let (equalized, noise_full) = tt.equalize(&rotated_carriers);
             let data = self.pilots.extract_data(&equalized, *global_sym);
             let data_indices = self.pilots.data_indices(*global_sym);
             data_carrier_map.extend(data_indices.iter().map(|&idx| (i, idx)));
