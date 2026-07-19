@@ -191,6 +191,11 @@ turbo re-estimation and other Phase 2 Task 8 changes) already clears this task's
 target today without either Kalman variant contributing anything positive to that specific
 metric.
 
+**Update (2026-07-18):** the Cascaded fallback architecture described above was subsequently
+attempted and also did not clear the bar — see "Cascaded coarse-delay drift + AR(1) tap tracker"
+above, which measured the same 18.0 dB and closes out this line of investigation as the third and
+final attempt.
+
 Reproduce: `cargo run -p coppa-bench --release --example drift_tracker_gate` (toggle
 `DRIFT_TRACKER_ENABLED` in `coppa_modem.rs` to select which path is measured). Full report:
 `.superpowers/sdd/task-5-report.md`.
