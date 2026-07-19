@@ -60,6 +60,11 @@ pub struct DecodedFrame {
     /// `10*log10(1 / mean(per-carrier noise variance))`, from
     /// `CoppaTransceiver::receive_with_metrics`.
     pub snr_db: f32,
+    /// Per-frame recommended speed level (`coppa_ml::recommend_speed_level`), from
+    /// `CoppaTransceiver::receive_with_metrics`'s 4th element -- fed back to the
+    /// remote sender on an outgoing ACK (`TransportPdu::new_ack_with_rate`), which
+    /// applies it via `coppa_ml::RateLoop`.
+    pub recommended_level: u8,
     /// Two-stage Moose CFO estimate (Hz) captured when this frame's candidate was
     /// first confirmed by the `SyncDetector` (see `sync_detector` module docs).
     pub cfo_hz: f32,
@@ -345,11 +350,12 @@ impl StreamingReceiver {
                 // unit test already calls it: directly on `transmit`'s raw output,
                 // zero leading margin).
                 match self.transceiver.receive_with_metrics(&slice) {
-                    Ok((header, payload, snr_db)) => {
+                    Ok((header, payload, snr_db, recommended_level)) => {
                         out.push(DecodedFrame {
                             header,
                             payload,
                             snr_db,
+                            recommended_level,
                             cfo_hz,
                             frame_start: start,
                         });
