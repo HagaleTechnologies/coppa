@@ -902,6 +902,7 @@ impl EventLoop {
     async fn decode_and_dispatch_audio(&mut self, samples: &[f32]) {
         for frame in self.engine.push_samples(samples) {
             let snr_db = frame.snr_db;
+            let recommended_level = frame.recommended_level;
             #[cfg(feature = "websocket")]
             let cfo_hz = frame.cfo_hz;
             #[cfg(feature = "websocket")]
@@ -955,26 +956,51 @@ impl EventLoop {
                                 match pdu.transport_type {
                                     TransportType::Reliable | TransportType::Unreliable => {
                                         // Feed to ARQ receiver
-                                        if let Some(ref mut arq_rx) = self.arq_rx {
-                                            let delivered =
-                                                arq_rx.receive(pdu.seq_num, pdu.payload.clone());
-                                            // Process ACK info back to our TX side
-                                            if let Some(ref mut arq_tx) = self.arq_tx {
-                                                arq_tx.process_ack(
-                                                    pdu.ack_num,
-                                                    pdu.ack_bitmap,
-                                                    Instant::now(),
-                                                );
+                                        let (result_data, ack_info) =
+                                            if let Some(ref mut arq_rx) = self.arq_rx {
+                                                let delivered = arq_rx
+                                                    .receive(pdu.seq_num, pdu.payload.clone());
+                                                // Process ACK info back to our TX side
+                                                if let Some(ref mut arq_tx) = self.arq_tx {
+                                                    arq_tx.process_ack(
+                                                        pdu.ack_num,
+                                                        pdu.ack_bitmap,
+                                                        Instant::now(),
+                                                    );
+                                                }
+                                                // Collect all delivered payloads
+                                                let mut all_data = Vec::new();
+                                                for (_seq, data) in delivered {
+                                                    all_data.extend(data);
+                                                }
+                                                (all_data, Some(arq_rx.ack_info()))
+                                            } else {
+                                                (pdu.payload, None)
+                                            };
+                                        // Acknowledge every successfully-processed
+                                        // incoming data PDU (one ACK per frame, per
+                                        // decision 4 -- batching was considered and
+                                        // not chosen). Mirrors the RECEIVED pdu's own
+                                        // session_id back rather than sourcing it
+                                        // from either of this daemon's own two
+                                        // (mutually inconsistent) session-id fields.
+                                        if let Some((ack_num, ack_bitmap)) = ack_info {
+                                            let ack_pdu = TransportPdu::new_ack_with_rate(
+                                                pdu.session_id,
+                                                ack_num,
+                                                ack_bitmap,
+                                                recommended_level,
+                                            );
+                                            match self.engine.encode_bytes(&ack_pdu.to_bytes()) {
+                                                Ok(ack_samples) => {
+                                                    self.transmit_samples(&ack_samples).await;
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(error = %e, "Failed to encode outgoing ACK");
+                                                }
                                             }
-                                            // Collect all delivered payloads
-                                            let mut all_data = Vec::new();
-                                            for (_seq, data) in delivered {
-                                                all_data.extend(data);
-                                            }
-                                            all_data
-                                        } else {
-                                            pdu.payload
                                         }
+                                        result_data
                                     }
                                     TransportType::Ack | TransportType::Nak => {
                                         // Pure ACK/NAK: process and don't forward to host
