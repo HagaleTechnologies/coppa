@@ -142,6 +142,27 @@ const DRIFT_TRACKER_ENABLED: bool = false;
 /// [`DelayDomainEstimator::fit`] refits). Takes priority over
 /// `DRIFT_TRACKER_ENABLED` in `demodulate_frame_impl`'s Pass 2 dispatch —
 /// see that dispatch site's doc.
+///
+/// **Left `false` (Task 4, gate NOT met).** The Task 4 gate bench
+/// (`drift_cascade_gate`) measured this path at **18.0 dB** for the
+/// Watterson-Moderate/level 2 FER≤10% threshold (400 trials/point,
+/// `DRIFT_Q_TAU`/`DRIFT_Q_DOT` below, reused as-is) against a required
+/// ≤16.5 dB — not met. The *current* (`false`) baseline on this same
+/// branch (with this plan's own Task 1 `TrackedTaps::equalize` LLR fix
+/// already included, which turned out not to move this particular number)
+/// measures **15.0 dB**, so enabling the Cascade is a measured ~3 dB
+/// *regression* against the branch's own current baseline, not just a
+/// shortfall against the design's target — and lands at exactly the same
+/// 18.0 dB the pure `DriftTracker`-only "Replace" design
+/// (`DRIFT_TRACKER_ENABLED`, above) measured; combining it with the AR(1)
+/// tap tracker made no measurable difference. AWGN is unchanged (6.0 dB,
+/// all three paths) and Watterson-Poor never clears in any of them, so
+/// this is isolated to Watterson-Moderate. This is the third and, per the
+/// design plan's own framing, final attempt at this regression in this
+/// line of investigation — see `.superpowers/sdd/task-4-report.md` and
+/// `BENCHMARKS.md`'s corresponding subsection for the full numbers, and
+/// `docs/superpowers/specs/2026-07-18-cascaded-drift-tracker-design.md`
+/// for the design.
 const DRIFT_CASCADE_ENABLED: bool = false;
 
 /// Process-noise variance on the tracked delay `τ` itself (grid units²/step)
