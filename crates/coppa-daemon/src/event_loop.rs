@@ -7,7 +7,7 @@ use coppa_audio::{AudioRingConsumer, AudioRingProducer};
 use coppa_engine::CoppaCore;
 use coppa_host::vara::VaraResponse;
 use coppa_host::HostEvent;
-use coppa_ml::BusyGate;
+use coppa_ml::{BusyGate, RateLoop};
 use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx};
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu, StationIdPayload};
 use coppa_protocol::session::{LinkCapabilities, SessionManager, SessionState};
@@ -72,6 +72,11 @@ pub struct EventLoop {
     arq_rx: Option<ArqRx>,
     /// Current ARQ session ID.
     arq_session_id: u8,
+    /// Sender-side closed-loop rate controller (Phase 3 Task 4's `coppa_ml::
+    /// RateLoop`), updated from the peer's ACK-carried recommendation
+    /// (`TransportPdu::suggested_rate`) and applied to `self.engine` via
+    /// `CoppaCore::set_speed_level`.
+    rate_loop: RateLoop,
     /// Next TX sequence number for transport PDUs.
     #[allow(dead_code)] // used when ARQ TX path sends segmented frames
     arq_next_seq: u8,
@@ -223,6 +228,7 @@ impl EventLoop {
             arq_tx,
             arq_rx,
             arq_session_id: 0,
+            rate_loop: RateLoop::default_coppa(),
             arq_next_seq: 0,
             #[cfg(feature = "websocket")]
             ws_broadcast: None,
@@ -1011,6 +1017,19 @@ impl EventLoop {
                                                 Instant::now(),
                                             );
                                         }
+                                        // Closed-loop rate adaptation: apply the
+                                        // peer's recommendation (if this ACK carries
+                                        // one) and push the resulting level into the
+                                        // encoder for subsequent outgoing frames.
+                                        if let Some(rate) = pdu.suggested_rate() {
+                                            self.rate_loop.on_ack(rate, true);
+                                            if let Err(e) = self
+                                                .engine
+                                                .set_speed_level(self.rate_loop.current_level())
+                                            {
+                                                tracing::warn!(error = %e, "Failed to apply RateLoop's recommended speed level");
+                                            }
+                                        }
                                         Vec::new()
                                     }
                                     TransportType::Reset => {
@@ -1049,23 +1068,13 @@ impl EventLoop {
                             let _ = ws_tx.send(text);
                         }
                     }
-                    // Closed-loop rate adaptation (Phase 3 Task 4) lives in
-                    // `coppa_ml::RateLoop` now, not the old `coppa-engine::RateController`
-                    // this call site used to feed (deleted: it only ever logged a debug
-                    // line, its `current_mcs()`/`rate_controller_mut()` had no other
-                    // caller, so nothing downstream regresses). Wiring `RateLoop` into this
-                    // daemon requires two pieces this event loop doesn't have yet: (a) the
-                    // daemon never constructs/sends an ACK PDU at all (`arq_tx.process_ack`
-                    // only *consumes* incoming ACKs; there's no `TransportPdu::
-                    // new_ack_with_rate` call site to attach a recommendation to), and (b)
-                    // `CoppaTransceiver::receive`'s new recommended-level return
-                    // (`recommend_speed_level` over this frame's noise vars) isn't
-                    // threaded up through `StreamingReceiver`/`StreamFrame` yet. Both are
-                    // real daemon features, not a one-line swap — left for the daemon/ARQ
-                    // wiring work this phase's plan explicitly defers. See
-                    // `crates/coppa-ml/src/rate_loop.rs` and the validation bench
-                    // `crates/coppa-bench/examples/closed_loop_arq.rs` for the
-                    // already-working, ARQ-agnostic controller and its acceptance numbers.
+                    // Closed-loop rate adaptation (Phase 3 Task 4) is wired: `self.
+                    // rate_loop` (`coppa_ml::RateLoop`) is fed from the peer's ACK-carried
+                    // recommendation (`TransportPdu::suggested_rate` on incoming
+                    // `TransportType::Ack | Nak` PDUs, see that match arm) and from
+                    // retransmit-timeout events in `check_arq_retransmits`, then applied
+                    // to outgoing frames via `CoppaCore::set_speed_level`. See
+                    // `crates/coppa-ml/src/rate_loop.rs` for the controller itself.
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -1376,6 +1385,15 @@ impl EventLoop {
         let mut retransmit_pdus: Vec<(u8, Vec<u8>)> = Vec::new();
         if let Some(ref mut arq_tx) = self.arq_tx {
             let retransmit_seqs = arq_tx.get_retransmits(now);
+            // One timeout EVENT (any number of expired segments in this single
+            // poll) maps to exactly one `RateLoop::on_timeout` call, matching
+            // `get_retransmits`'s own documented one-call-per-event contract.
+            if !retransmit_seqs.is_empty() {
+                self.rate_loop.on_timeout();
+                if let Err(e) = self.engine.set_speed_level(self.rate_loop.current_level()) {
+                    tracing::warn!(error = %e, "Failed to apply RateLoop's recommended speed level after timeout");
+                }
+            }
             for seq in retransmit_seqs {
                 if let Some(data) = arq_tx.get_segment_data(seq) {
                     let pdu =
