@@ -13,6 +13,55 @@ payload → OFDM modulate → AWGN → demodulate/decode. SNR is **audio-band SN
 Eb/N0), swept −6…30 dB in 3 dB steps. "Goodput" = `payload_bits × (1 − FER) / frame_airtime`.
 Raw per-point data is regenerable into `results/awgn.csv` (gitignored).
 
+## 2026-07 — Short-CP coherence-time lever: measured against real fading
+
+Follow-up to the "Fading root-cause investigation" section below, which found Watterson-Moderate/Poor's real Doppler coherence time is much shorter than a frame, and flagged "coherence-time/airtime reduction (shorter frames — the existing `hf_standard_short_cp` infrastructure already reduces frame duration)" as an untried candidate lever. This entry measures that lever directly: `hf_standard` (6.25 ms CP) vs. `hf_standard_short_cp` (3.0 ms CP, ~12% less airtime) at levels 2 (BPSK 1/2) and 4 (QPSK 3/4) — the two levels that route through an HF profile by default — under AWGN, Watterson-Moderate, and Watterson-Poor. 400 trials/point, −6→30 dB step 3, seed `0x00C0FFEE`.
+
+**This was exploratory measurement, not a fix-attempt gate — there was no acceptance bar going in.** The table below reports what was measured, in both directions.
+
+### Full comparison: FER thresholds + peak goodput
+
+| Level | Channel | Profile | FER≤10% | FER≤1% | Peak goodput (bps) | Peak goodput Δ |
+|---|---|---|---|---|---|---|
+| 2 | AWGN | hf_standard | 6.0 dB | 9.0 dB | 686 | — |
+| 2 | AWGN | short_cp | 6.0 dB | 6.0 dB | 783 | **+14.1%** |
+| 4 | AWGN | hf_standard | 6.0 dB | 9.0 dB | 1808 | — |
+| 4 | AWGN | short_cp | 6.0 dB | 9.0 dB | 2064 | **+14.2%** |
+| 2 | Watterson-Moderate | hf_standard | 15.0 dB | never | 660 | — |
+| 2 | Watterson-Moderate | short_cp | **12.0 dB** | never | 769 | **+16.5%** |
+| 4 | Watterson-Moderate | hf_standard | never | never | 1112 | — |
+| 4 | Watterson-Moderate | short_cp | never | never | 1187 | **+6.7%** |
+| 2 | Watterson-Poor | hf_standard | never | never | 501 | — |
+| 2 | Watterson-Poor | short_cp | never | never | 644 | **+28.5%** |
+| 4 | Watterson-Poor | hf_standard | never | never | 841 | — |
+| 4 | Watterson-Poor | short_cp | never | never | 1331 | **+58.3%** |
+
+Raw per-point CSVs (all 6 channel×profile combinations, both levels): `results/short-cp-fading-gate/{channel}_{profile}.csv` (gitignored, regenerate with `cargo run -p coppa-bench --release --example short_cp_fading_gate`).
+
+### AWGN: harness sanity check, as expected
+
+AWGN is FER-neutral to slightly *better* for `short_cp` (level 2's FER≤1% threshold actually improves 9.0→6.0 dB, both hit 0.000 FER by 6 dB either way — noise, not signal, at this trial count) and goodput is uniformly ~14% higher, matching `short_cp`'s ~12-14% lower airtime overhead almost exactly. AWGN has no multipath/coherence-time story, so this is the harness behaving as expected, not a coherence-time result — included for completeness per the plan, not as a finding.
+
+### Watterson-Moderate: a real, unambiguous win at level 2; flat-to-mixed FER but still a goodput win at level 4
+
+**Level 2 (BPSK 1/2) is the cleanest result in this whole measurement.** `short_cp`'s FER≤10% threshold improves a full 3 dB grid-step (15.0→12.0 dB), and per-point FER in the CSV is lower for `short_cp` at *every single* swept SNR from −3 through 30 dB (e.g. 6 dB: 34.5%→32.5%; 12 dB: 11.5%→6.0%; 18 dB: 3.75%→2.5%). Goodput is higher for `short_cp` at every SNR point too (e.g. 9 dB: 557→681 bps, +22%; 18 dB: 660→763 bps, +16%) — both the FER and the airtime-savings effects point the same direction here, reinforcing rather than trading off against each other.
+
+**Level 4 (QPSK 3/4) never clears FER≤10% either way** (consistent with the already-documented residual Watterson-fading gap for this level in CLAUDE.md's Known Limitations). Per-point FER is flat-to-mixed: `short_cp` is a few points better at low-mid SNR (0-12 dB, e.g. 6 dB: 88.25%→85.75%) but a few points *worse* at high SNR (18-30 dB, e.g. 21 dB: 44.25%→48.75%), with no consistent direction and both differences well inside normal 400-trial sampling variance at these FER levels. Despite that, goodput favors `short_cp` at **every** SNR point measured, including the ones where its FER is nominally worse (e.g. 21 dB: 1008→1058 bps even though FER went up) — the airtime savings alone outweighs the small FER wobble.
+
+### Watterson-Poor: level 2 shows a genuine SNR-dependent crossover; level 4 is a large, consistent win
+
+**Level 2 (BPSK 1/2)** shows the one genuinely two-directional result in this dataset: `short_cp`'s FER is *worse* than `hf_standard`'s from −3 through 9 dB (e.g. 6 dB: 65.75%→70.25%; 9 dB: 49.25%→55.0%) but *better* from 12 dB through 30 dB (e.g. 15 dB: 38.75%→28.5%; 27 dB: 27.0%→17.75%) — a real crossover around 10-12 dB, not noise scattered randomly across the sweep. Goodput tracks this: it's roughly flat at the low end (6 dB: 234.9→232.8 bps, the only negative goodput point in the entire dataset, a −0.9% dip within sampling noise) and substantially better from 12 dB up (15 dB: 420→560 bps, +33%). Neither profile ever clears FER≤10% on this channel (matches Poor's documented irreducible-outage-floor character), so this crossover doesn't flip any pass/fail threshold — it's visible only in the raw per-point numbers.
+
+**Level 4 (QPSK 3/4)** is the largest and most consistent win in the whole sweep: `short_cp`'s FER is lower than `hf_standard`'s at every SNR point from 0 through 30 dB, often by a large margin (12 dB: 73.5%→58.25%; 15 dB: 66.5%→41.75%; 18 dB: 67.5%→42.5%). Goodput follows: peak goodput is up 58.3% (841→1331 bps), and at individual points the gain is even larger (15 dB: 606→1202 bps, +98%). Neither profile clears FER≤10% here either, so again this doesn't flip a threshold, but it's a large, one-directional effect at exactly the level/channel combination (QPSK 3/4 on the harshest fading preset) where the original coherence-time hypothesis would predict the most benefit.
+
+### Recommendation: pursue Phase 2
+
+**Yes** — the measurement supports wiring `CpGate`'s recommendation into a live control path. The evidence: of the four (level, fading-channel) combinations measured, one shows a clean, unambiguous win on both FER (a full 3 dB FER≤10% threshold improvement) and goodput at every SNR point (level 2/Watterson-Moderate); one shows a very large, consistent FER and goodput win at every SNR point despite never crossing a pass/fail threshold (level 4/Watterson-Poor, goodput +58% peak, +98% at some points); one shows flat/mixed FER but a goodput win at every single SNR point regardless (level 4/Watterson-Moderate); and only one shows a genuinely mixed picture, and even that one (level 2/Watterson-Poor) is net-positive on goodput everywhere except a single, sub-1%, noise-level dip at 6 dB. There is no combination in this dataset where `short_cp` is a clear net loss. AWGN — where no coherence-time effect should exist — behaves exactly as expected (FER-neutral, goodput up ~14% from airtime savings alone), which is the harness sanity-checking itself correctly rather than a real finding.
+
+One nuance worth flagging for whoever picks up Phase 2: `CpGate` (`crates/coppa-ml/src/cp_gate.rs`) currently gates its short-CP recommendation on **measured delay spread** (an ISI-margin signal — "is there enough CP left over multipath spread"), not on a Doppler/coherence-time signal. The mechanism behind this section's measured gains — shorter frame duration decorrelating less within a fast-fading channel — is a *different* channel property than the one `CpGate` currently measures, and the two need not correlate on a given channel realization (a channel can have short delay spread but fast Doppler, or vice versa). `CpGate` has zero callers today (confirmed via grep), so Phase 2 is free to either wire it as-is and treat this as a reasonable first cut, or extend/pair it with a Doppler-rate signal before wiring — genuinely either is defensible from this data alone, but the discrepancy is worth being explicit about rather than assuming `CpGate`'s existing threshold already captures the effect measured here. The level 2/Watterson-Poor crossover (worse below ~10-12 dB, better above) is a second concrete thing a real gate's threshold tuning should account for — a naive "always prefer short_cp when the channel looks calm" policy would need calm to imply *both* low delay spread and adequate SNR margin, not just the former.
+
+Reproduce: `cargo run -p coppa-bench --release --example short_cp_fading_gate` (~46 min wall-clock for the full 2×3×2×13×400 sweep on a 10-core Apple Silicon machine, single-threaded).
+
 ## 2026-07 — Fading root-cause investigation: the coarse-delay-reference theory falsified
 
 The Cascaded design (below) and the earlier Replace design (PR #41) both measured Watterson-Moderate/level 2 FER≤10% at exactly **18.0 dB** — identical despite different downstream mechanisms (fresh per-window least-squares refits vs. an AR(1) Kalman tap tracker) consuming the same `DriftTracker` per-window coarse-delay estimate. That coincidence motivated two parallel diagnostic investigations, run down independently, both landing on the same conclusion: the "accumulating phase/coarse-delay reference error, not stationary Rayleigh amplitude fading" theory that motivated all four attempts (Task 1, Task 7, Replace, Cascade) is very likely **backwards**.
