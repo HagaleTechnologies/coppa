@@ -24,7 +24,12 @@ design rationale). This entry is that diagnostic, committed and run for real:
 speed level (1-7, 9-10 — level 8 is not a defined mode) — not just `mcs_calibration.rs`'s fixed
 level-2 probe — against AWGN and Watterson Good/Moderate/Poor, at 5 SNR points (6/12/18/24/30 dB),
 40 trials per (channel, SNR, level) cell, seed `0xCA11B`, and reports whether mean
-`channel_capacity` trends with level beyond each cell's own 2-standard-error noise bound.
+`channel_capacity` trends with level beyond each cell's own 2-standard-error noise bound. All
+levels/channels sound against the same fixed `robust` profile (matching `mcs_calibration.rs`'s own
+convention, and the profile `SPEED_LEVEL_MIN_CAPACITY`'s calibration was itself derived under) so
+that level, not per-level profile choice, is the only thing varying — the live daemon instead
+routes levels 1-4 through `hf_standard` and 5+ through `vhf_wide`, so this measures the level
+effect in isolation, not the exact live per-level path.
 
 **Real SUMMARY output:**
 
@@ -54,7 +59,12 @@ is level-dependent on the *same underlying channel* (the core suspicion), but re
 mechanism away from fading-coherence time and toward something in the AWGN-reproducible per-level
 measurement path itself. Distinguishing which specific stage of that path (pilot extraction,
 equalization, or the noise-variance estimator feeding `channel_capacity`) is responsible is out of
-scope for this diagnose-only task and is the natural next investigation.
+scope for this diagnose-only task and is the natural next investigation. Note the Watterson
+channels' "within noise" verdict is an underpowered negative, not evidence the bias is absent
+under fading: all three fading channels show the same positive-signed gap AWGN does (Good +0.051,
+Moderate +0.485, Poor +0.540), just too small relative to fading's much larger per-trial capacity
+variance for 40 trials to resolve — a real possibility worth keeping in mind for the next
+investigation is that the same mechanism is present under fading too, just buried in that noise.
 
 ## 2026-07 — Short-CP coherence-time lever: measured against real fading
 
