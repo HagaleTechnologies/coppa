@@ -13,6 +13,49 @@ payload → OFDM modulate → AWGN → demodulate/decode. SNR is **audio-band SN
 Eb/N0), swept −6…30 dB in 3 dB steps. "Goodput" = `payload_bits × (1 − FER) / frame_airtime`.
 Raw per-point data is regenerable into `results/awgn.csv` (gitignored).
 
+## 2026-07 — RateLoop capacity-metric level-bias diagnosis
+
+CLAUDE.md's `RateLoop` known-limitation bullet root-causes its unmet acceptance bar to
+`coppa_ml::channel_capacity` possibly "not being invariant to which speed level a measured frame
+happened to use" — a hypothesis that was, until now, an informal, uncommitted diagnostic (see
+`docs/superpowers/specs/2026-07-20-rateloop-capacity-metric-bias-diagnosis-design.md` for the full
+design rationale). This entry is that diagnostic, committed and run for real:
+`cargo run -p coppa-bench --release --example capacity_metric_level_bias` sounds *every* real
+speed level (1-7, 9-10 — level 8 is not a defined mode) — not just `mcs_calibration.rs`'s fixed
+level-2 probe — against AWGN and Watterson Good/Moderate/Poor, at 5 SNR points (6/12/18/24/30 dB),
+40 trials per (channel, SNR, level) cell, seed `0xCA11B`, and reports whether mean
+`channel_capacity` trends with level beyond each cell's own 2-standard-error noise bound.
+
+**Real SUMMARY output:**
+
+```
+SUMMARY (per channel, averaged across SNR grid):
+  AWGN: level1->level10 mean capacity gap = +1.581 bits/s/Hz (2*SE bound = 0.121) -> LIKELY REAL TREND
+  Good: level1->level10 mean capacity gap = +0.051 bits/s/Hz (2*SE bound = 1.013) -> within noise
+  Moderate: level1->level10 mean capacity gap = +0.485 bits/s/Hz (2*SE bound = 0.876) -> within noise
+  Poor: level1->level10 mean capacity gap = +0.540 bits/s/Hz (2*SE bound = 1.175) -> within noise
+```
+
+**Interpretation.** AWGN — the negative control, with no fading drift and therefore no reason for
+duration/coherence-time effects to matter — is the *one* channel that shows a level-dependent
+trend clearing its own noise bound (+1.581 bits/s/Hz, over 13x the 0.121 bound), while all three
+Watterson channels (Good, Moderate, Poor) show gaps well within their (much larger, fading-driven)
+noise bounds. Per the design doc's "AWGN as negative control is load-bearing" open question, this
+result points **away** from the coherence-time/fading-duration mechanism the existing CLAUDE.md
+hypothesis was built around, not toward it — a real, reproducible level-dependence exists, but it
+is present (and clearest) on the one channel where fading-coherence effects cannot be the cause.
+The per-level DATA rows show the AWGN capacity reading climbing fairly monotonically with level at
+every SNR (e.g. at 24 dB: level 1 = 8.412, level 5 = 10.567, level 10 = 10.628 bits/s/Hz), which is
+consistent with something structural to how `channel_capacity` is computed per level (e.g. pilot
+density/placement, equalizer behavior, or noise-variance estimation differing systematically by
+modulation/constellation order) rather than anything fading-related. This is a real, useful, but
+different finding than the one CLAUDE.md's existing bullet assumed: it confirms `channel_capacity`
+is level-dependent on the *same underlying channel* (the core suspicion), but redirects the likely
+mechanism away from fading-coherence time and toward something in the AWGN-reproducible per-level
+measurement path itself. Distinguishing which specific stage of that path (pilot extraction,
+equalization, or the noise-variance estimator feeding `channel_capacity`) is responsible is out of
+scope for this diagnose-only task and is the natural next investigation.
+
 ## 2026-07 — Short-CP coherence-time lever: measured against real fading
 
 Follow-up to the "Fading root-cause investigation" section below, which found Watterson-Moderate/Poor's real Doppler coherence time is much shorter than a frame, and flagged "coherence-time/airtime reduction (shorter frames — the existing `hf_standard_short_cp` infrastructure already reduces frame duration)" as an untried candidate lever. This entry measures that lever directly: `hf_standard` (6.25 ms CP) vs. `hf_standard_short_cp` (3.0 ms CP, ~12% less airtime) at levels 2 (BPSK 1/2) and 4 (QPSK 3/4) — the two levels that route through an HF profile by default — under AWGN, Watterson-Moderate, and Watterson-Poor. 400 trials/point, −6→30 dB step 3, seed `0x00C0FFEE`.
