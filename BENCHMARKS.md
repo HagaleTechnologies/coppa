@@ -219,6 +219,19 @@ section above recorded, concentrated in the Watterson-fading portion of this par
 schedule, not a general worsening of the AWGN-only case the correction was built and validated
 against.
 
+**Correction on the "no ground truth" framing above, and a concrete next step.** A final
+whole-branch review pointed out that "the receiver has no ground truth about which channel produced
+a given frame" overstates the case: `channel_selectivity(noise_vars)` is already computed on the
+very next line inside `recommend_speed_level` and IS a cheap, already-available discriminator
+(near-zero on AWGN's flat floor, substantially higher under frequency-selective Watterson fading) —
+it just isn't used to gate or scale the correction today. The most promising untried lever for
+closing this Watterson-tail regression is a selectivity-scaled correction: attenuate the AWGN-derived
+correction as raw selectivity rises above the AWGN floor, rather than gating it to zero on fading,
+since the underlying PAPR-clip self-noise bias is a TX-side effect present on every channel type,
+not an AWGN-specific artifact — a hard on/off gate would under-correct the real bias on fading, not
+just avoid over-correcting it. Not attempted here; left as the next concrete step for whoever picks
+this up.
+
 No regression observed on `tests/phase_c_loopback.rs`'s full-ladder AWGN/Watterson FER sweep (Step
 2 above) — the correction, applied only inside `recommend_speed_level`, does not affect
 `channel_capacity`/`channel_selectivity`'s other callers or the LDPC-facing noise-variance path.
