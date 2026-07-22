@@ -779,8 +779,10 @@ impl CoppaTransceiver {
     /// receiver feeds this back to the sender on the ACK (`TransportPdu::
     /// new_ack_with_rate`); the sender applies it via `coppa_ml::RateLoop`.
     pub fn receive(&self, samples: &[f32]) -> Result<(CoppaHeader, Vec<u8>, u8), ReceiveError> {
-        self.receive_core(samples)
-            .map(|(h, p, _snr, noise_vars)| (h, p, coppa_ml::recommend_speed_level(&noise_vars)))
+        self.receive_core(samples).map(|(h, p, _snr, noise_vars)| {
+            let level = coppa_ml::recommend_speed_level(&noise_vars, h.speed_level);
+            (h, p, level)
+        })
     }
 
     /// Core IR-HARQ combining + decode step (Phase 3 Task 3).
@@ -879,7 +881,8 @@ impl CoppaTransceiver {
         samples: &[f32],
     ) -> Result<(CoppaHeader, Vec<u8>, f32, u8), ReceiveError> {
         self.receive_core(samples).map(|(h, p, snr, noise_vars)| {
-            (h, p, snr, coppa_ml::recommend_speed_level(&noise_vars))
+            let level = coppa_ml::recommend_speed_level(&noise_vars, h.speed_level);
+            (h, p, snr, level)
         })
     }
 

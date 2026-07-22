@@ -168,7 +168,6 @@ const SELECTIVITY_LEVEL_CORRECTION: [[f32; 5]; 9] = [
 /// `coppa_protocol::modem::transceiver` computes independently for its own SNR telemetry
 /// (`10*log10(1/mean(noise_vars))`), duplicated here rather than shared to avoid coppa-ml
 /// depending on coppa-protocol.
-#[allow(dead_code)]
 fn estimate_snr_db(noise_vars: &[f32]) -> f32 {
     let mean_nv = if noise_vars.is_empty() {
         1.0
@@ -183,7 +182,6 @@ fn estimate_snr_db(noise_vars: &[f32]) -> f32 {
 /// `CORRECTION_LEVELS` (shouldn't occur -- headers only ever carry real levels) get a `0.0`
 /// correction rather than panicking, the same "if we don't know, don't correct" default
 /// `select_speed_level_calibrated` uses for an unmatched capacity.
-#[allow(dead_code)]
 fn interpolate_correction(table: &[[f32; 5]; 9], level: u8, snr_db: f32) -> f32 {
     let Some(row_idx) = CORRECTION_LEVELS.iter().position(|&l| l == level) else {
         return 0.0;
@@ -206,7 +204,6 @@ fn interpolate_correction(table: &[[f32; 5]; 9], level: u8, snr_db: f32) -> f32 
 /// Correct a raw `(capacity, selectivity)` reading measured at `measured_at_level` for that
 /// level's known, deterministic PAPR-clip-induced self-noise floor (PR #51/#52), bringing it onto
 /// the level-2 probe's scale `SPEED_LEVEL_MIN_CAPACITY` was calibrated against.
-#[allow(dead_code)]
 fn correct_for_level_bias(
     capacity: f32,
     selectivity: f32,
@@ -222,19 +219,25 @@ fn correct_for_level_bias(
 
 /// Recommend a speed level from a frame's per-carrier noise variances in one call — the single
 /// source of truth for the closed-loop rate feedback's receiver-side recommendation (fed back on
-/// the ACK, see `coppa_ml::rate_loop::RateLoop`). Wraps `channel_capacity`, `channel_selectivity`,
-/// and `select_speed_level_2d` together; kept as one small function (rather than inlined at each
-/// call site) so it can later be pointed at per-codeword noise vars (once multi-codeword frames
-/// exist) without touching more than one place. Returns level 1 for an empty `noise_vars` (no
-/// channel information).
-pub fn recommend_speed_level(noise_vars: &[f32]) -> u8 {
+/// the ACK, see `coppa_ml::rate_loop::RateLoop`). `measured_at_level` is the speed level the frame
+/// these `noise_vars` came from was actually sent at (the decoded header's `speed_level`) --
+/// needed because `channel_capacity`/`channel_selectivity` carry a known, level-dependent
+/// self-noise floor from that level's own PAPR clip target (PR #51/#52); `correct_for_level_bias`
+/// removes it, bringing the reading onto the fixed level-2 probe's scale, before the calibrated
+/// lookup. Wraps `channel_capacity`, `channel_selectivity`, and `select_speed_level_2d` together;
+/// kept as one small function (rather than inlined at each call site) so it can later be pointed
+/// at per-codeword noise vars (once multi-codeword frames exist) without touching more than one
+/// place. Returns level 1 for an empty `noise_vars` (no channel information).
+pub fn recommend_speed_level(noise_vars: &[f32], measured_at_level: u8) -> u8 {
     if noise_vars.is_empty() {
         return 1;
     }
-    select_speed_level_2d(
-        channel_capacity(noise_vars),
-        channel_selectivity(noise_vars),
-    )
+    let raw_capacity = channel_capacity(noise_vars);
+    let raw_selectivity = channel_selectivity(noise_vars);
+    let snr_db = estimate_snr_db(noise_vars);
+    let (capacity, selectivity) =
+        correct_for_level_bias(raw_capacity, raw_selectivity, snr_db, measured_at_level);
+    select_speed_level_2d(capacity, selectivity)
 }
 
 #[cfg(test)]
@@ -332,12 +335,35 @@ mod tests {
 
     #[test]
     fn recommend_speed_level_matches_2d_selector_and_handles_empty() {
+        // Level 2's correction is 0.0 at every SNR by construction, so recommend_speed_level's
+        // level-2 behavior must be bit-for-bit identical to the uncorrected 2D selector -- a
+        // natural regression guard for the correction logic.
         let nv = vec![0.001f32; 48]; // strong, flat channel
         assert_eq!(
-            recommend_speed_level(&nv),
+            recommend_speed_level(&nv, 2),
             select_speed_level_2d(channel_capacity(&nv), channel_selectivity(&nv))
         );
-        assert_eq!(recommend_speed_level(&[]), 1);
+        assert_eq!(recommend_speed_level(&[], 2), 1);
+    }
+
+    #[test]
+    fn recommend_speed_level_corrects_high_level_readings_downward() {
+        // A borderline channel whose RAW level-10 reading would recommend level 10, but whose
+        // level-2-equivalent (corrected) reading is lower -- reproduces the self-reinforcing bias
+        // PR #51/#52 diagnosed: measuring via a high level should no longer read artificially
+        // better than measuring the same real channel via level 2.
+        let nv = vec![0.00335f32; 48]; // raw capacity ~= 8.2 bits/s/Hz, ~24 dB by estimate_snr_db
+        let raw_capacity = channel_capacity(&nv);
+        let raw_selectivity = channel_selectivity(&nv);
+        let uncorrected = select_speed_level_2d(raw_capacity, raw_selectivity);
+        let corrected_via_level10 = recommend_speed_level(&nv, 10);
+        // Level 10's correction at ~24 dB is a ~2.5 bits/s/Hz downward shift plus a selectivity
+        // correction that ALSO reduces the effective-capacity boost -- the corrected
+        // recommendation must not exceed the uncorrected one.
+        assert!(
+            corrected_via_level10 <= uncorrected,
+            "corrected {corrected_via_level10} should not exceed uncorrected {uncorrected}"
+        );
     }
 
     #[test]
