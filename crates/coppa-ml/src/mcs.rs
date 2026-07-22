@@ -227,13 +227,20 @@ fn correct_for_level_bias(
 /// lookup. Wraps `channel_capacity`, `channel_selectivity`, and `select_speed_level_2d` together;
 /// kept as one small function (rather than inlined at each call site) so it can later be pointed
 /// at per-codeword noise vars (once multi-codeword frames exist) without touching more than one
-/// place. Returns level 1 for an empty `noise_vars` (no channel information).
+/// place. Returns level 1 for an empty `noise_vars` (no channel information). Currently regresses
+/// `closed_loop_arq`'s Watterson-fading tail (net negative on that bench, though not on the
+/// AWGN-only case this correction was built and validated against) — see `BENCHMARKS.md`'s
+/// "RateLoop capacity/selectivity level-bias correction" section for the measured numbers and the
+/// known next step (a selectivity-scaled correction).
 pub fn recommend_speed_level(noise_vars: &[f32], measured_at_level: u8) -> u8 {
     if noise_vars.is_empty() {
         return 1;
     }
     let raw_capacity = channel_capacity(noise_vars);
     let raw_selectivity = channel_selectivity(noise_vars);
+    // Carries the same residual level bias as raw_capacity/raw_selectivity (the PAPR-clip effect
+    // that inflates capacity at higher levels also lowers mean noise variance) -- an approximation
+    // of the frame's true SNR, not the true SNR itself.
     let snr_db = estimate_snr_db(noise_vars);
     let (capacity, selectivity) =
         correct_for_level_bias(raw_capacity, raw_selectivity, snr_db, measured_at_level);
