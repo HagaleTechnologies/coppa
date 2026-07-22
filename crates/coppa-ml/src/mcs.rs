@@ -120,6 +120,106 @@ pub fn select_speed_level_calibrated(capacity: f32) -> u8 {
     best_level
 }
 
+/// SNR grid points (dB) the `*_LEVEL_CORRECTION` tables below are calibrated at. Measured under
+/// AWGN by `crates/coppa-bench/examples/capacity_level_correction_calibration.rs` (profile
+/// `robust`, seed `0xCA11B`, 200 trials/cell) -- see `BENCHMARKS.md`'s dated section for the real
+/// run this table was generated from.
+const CORRECTION_SNR_GRID: [f32; 5] = [6.0, 12.0, 18.0, 24.0, 30.0];
+
+/// Levels in the same order as `SPEED_LEVEL_EFFICIENCY`/`SPEED_LEVEL_MIN_CAPACITY` (level 8 is
+/// reserved and excluded).
+const CORRECTION_LEVELS: [u8; 9] = [1, 2, 3, 4, 5, 6, 7, 9, 10];
+
+/// `CAPACITY_LEVEL_CORRECTION[level_idx][snr_idx]` = mean AWGN `channel_capacity` at that level and
+/// SNR, minus the same at level 2 (the probe `SPEED_LEVEL_MIN_CAPACITY` was itself calibrated
+/// against in `mcs_calibration.rs`) -- see PR #51/#52's diagnosis (`BENCHMARKS.md`) for why this
+/// bias exists (the per-level PAPR clip target distorts the pilot subcarriers the noise-variance
+/// estimate is read from) and why it grows with SNR rather than being a flat per-level offset.
+/// Level 2's row is all-zeros by construction.
+const CAPACITY_LEVEL_CORRECTION: [[f32; 5]; 9] = [
+    [0.0988, 0.1214, 0.1591, 0.1883, 0.1980], // level 1
+    [0.0000, 0.0000, 0.0000, 0.0000, 0.0000], // level 2
+    [0.1779, 0.4456, 0.9628, 1.5613, 1.9017], // level 3
+    [0.3748, 0.5513, 1.0393, 1.6476, 1.9984], // level 4
+    [0.5117, 0.7046, 1.3565, 2.3573, 3.1329], // level 5
+    [0.6852, 0.8296, 1.4354, 2.3614, 3.0481], // level 6
+    [0.7263, 0.8348, 1.4593, 2.4551, 3.2263], // level 7
+    [0.8057, 0.9124, 1.5354, 2.5364, 3.3269], // level 9
+    [0.8784, 0.9243, 1.5268, 2.5208, 3.3047], // level 10
+];
+
+/// Same as `CAPACITY_LEVEL_CORRECTION` but for `channel_selectivity` -- the same clip-induced bias
+/// separately depresses apparent selectivity at higher levels, which compounds the capacity bias in
+/// `select_speed_level_2d` (lower selectivity reads as flatter, boosting effective capacity
+/// further).
+const SELECTIVITY_LEVEL_CORRECTION: [[f32; 5]; 9] = [
+    [-0.0099, -0.0133, -0.0144, -0.0148, -0.0149], // level 1
+    [0.0000, 0.0000, 0.0000, 0.0000, 0.0000],      // level 2
+    [-0.0743, -0.0910, -0.0967, -0.0982, -0.0985], // level 3
+    [-0.0403, -0.0489, -0.0510, -0.0515, -0.0516], // level 4
+    [-0.0752, -0.0970, -0.1038, -0.1057, -0.1063], // level 5
+    [-0.0806, -0.1022, -0.1077, -0.1090, -0.1093], // level 6
+    [-0.0878, -0.1150, -0.1229, -0.1249, -0.1254], // level 7
+    [-0.0953, -0.1236, -0.1321, -0.1343, -0.1348], // level 9
+    [-0.1051, -0.1453, -0.1649, -0.1743, -0.1780], // level 10
+];
+
+/// SNR estimate (dB) from per-carrier noise variances -- same formula
+/// `coppa_protocol::modem::transceiver` computes independently for its own SNR telemetry
+/// (`10*log10(1/mean(noise_vars))`), duplicated here rather than shared to avoid coppa-ml
+/// depending on coppa-protocol.
+#[allow(dead_code)]
+fn estimate_snr_db(noise_vars: &[f32]) -> f32 {
+    let mean_nv = if noise_vars.is_empty() {
+        1.0
+    } else {
+        noise_vars.iter().sum::<f32>() / noise_vars.len() as f32
+    };
+    10.0 * (1.0 / mean_nv.max(1e-6)).log10()
+}
+
+/// Linearly interpolate `table`'s row for `level` at `snr_db`, clamped to `CORRECTION_SNR_GRID`'s
+/// range (no extrapolation beyond the calibrated 6-30 dB span). Levels absent from
+/// `CORRECTION_LEVELS` (shouldn't occur -- headers only ever carry real levels) get a `0.0`
+/// correction rather than panicking, the same "if we don't know, don't correct" default
+/// `select_speed_level_calibrated` uses for an unmatched capacity.
+#[allow(dead_code)]
+fn interpolate_correction(table: &[[f32; 5]; 9], level: u8, snr_db: f32) -> f32 {
+    let Some(row_idx) = CORRECTION_LEVELS.iter().position(|&l| l == level) else {
+        return 0.0;
+    };
+    let row = &table[row_idx];
+    let snr = snr_db.clamp(
+        CORRECTION_SNR_GRID[0],
+        CORRECTION_SNR_GRID[CORRECTION_SNR_GRID.len() - 1],
+    );
+    for i in 0..CORRECTION_SNR_GRID.len() - 1 {
+        let (lo, hi) = (CORRECTION_SNR_GRID[i], CORRECTION_SNR_GRID[i + 1]);
+        if snr <= hi {
+            let t = (snr - lo) / (hi - lo);
+            return row[i] + t * (row[i + 1] - row[i]);
+        }
+    }
+    row[row.len() - 1]
+}
+
+/// Correct a raw `(capacity, selectivity)` reading measured at `measured_at_level` for that
+/// level's known, deterministic PAPR-clip-induced self-noise floor (PR #51/#52), bringing it onto
+/// the level-2 probe's scale `SPEED_LEVEL_MIN_CAPACITY` was calibrated against.
+#[allow(dead_code)]
+fn correct_for_level_bias(
+    capacity: f32,
+    selectivity: f32,
+    snr_db: f32,
+    measured_at_level: u8,
+) -> (f32, f32) {
+    let cap_correction =
+        interpolate_correction(&CAPACITY_LEVEL_CORRECTION, measured_at_level, snr_db);
+    let sel_correction =
+        interpolate_correction(&SELECTIVITY_LEVEL_CORRECTION, measured_at_level, snr_db);
+    (capacity - cap_correction, selectivity - sel_correction)
+}
+
 /// Recommend a speed level from a frame's per-carrier noise variances in one call — the single
 /// source of truth for the closed-loop rate feedback's receiver-side recommendation (fed back on
 /// the ACK, see `coppa_ml::rate_loop::RateLoop`). Wraps `channel_capacity`, `channel_selectivity`,
@@ -238,5 +338,103 @@ mod tests {
             select_speed_level_2d(channel_capacity(&nv), channel_selectivity(&nv))
         );
         assert_eq!(recommend_speed_level(&[]), 1);
+    }
+
+    #[test]
+    fn level_bias_correction_is_zero_at_anchor_level() {
+        for &snr in &[0.0, 6.0, 15.0, 24.0, 40.0] {
+            assert_eq!(
+                interpolate_correction(&CAPACITY_LEVEL_CORRECTION, 2, snr),
+                0.0
+            );
+            assert_eq!(
+                interpolate_correction(&SELECTIVITY_LEVEL_CORRECTION, 2, snr),
+                0.0
+            );
+        }
+    }
+
+    #[test]
+    fn level_bias_correction_interpolates_between_grid_points() {
+        // Level 10's capacity correction row: [0.8784, 0.9243, 1.5268, 2.5208, 3.3047] at
+        // SNR grid [6, 12, 18, 24, 30]. At 15 dB (halfway between 12 and 18), the interpolated
+        // value should be the midpoint of 0.9243 and 1.5268.
+        let expected = 0.9243 + 0.5 * (1.5268 - 0.9243);
+        let got = interpolate_correction(&CAPACITY_LEVEL_CORRECTION, 10, 15.0);
+        assert!(
+            (got - expected).abs() < 1e-3,
+            "got {got}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn level_bias_correction_clamps_outside_grid() {
+        // Level 10's capacity row's first/last entries: 0.8784 (6 dB), 3.3047 (30 dB). Below 6 dB
+        // or above 30 dB must clamp to the nearest grid endpoint, not extrapolate.
+        assert!(
+            (interpolate_correction(&CAPACITY_LEVEL_CORRECTION, 10, 0.0) - 0.8784).abs() < 1e-3
+        );
+        assert!(
+            (interpolate_correction(&CAPACITY_LEVEL_CORRECTION, 10, 50.0) - 3.3047).abs() < 1e-3
+        );
+    }
+
+    #[test]
+    fn level_bias_correction_falls_back_to_zero_for_unknown_level() {
+        // Level 8 is reserved and never appears in CORRECTION_LEVELS.
+        assert_eq!(
+            interpolate_correction(&CAPACITY_LEVEL_CORRECTION, 8, 18.0),
+            0.0
+        );
+        assert_eq!(
+            interpolate_correction(&SELECTIVITY_LEVEL_CORRECTION, 8, 18.0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn capacity_correction_matches_calibration_bench_raw_data() {
+        // Independent spot-check against `capacity_level_correction_calibration.rs`'s own raw
+        // DATA output (not the RUST_TABLE block this const was transcribed from): "DATA 24 10
+        // 10.7188 ..." and "DATA 24 2 8.1981 ...". Level 10's correction at 24 dB must equal
+        // their difference -- catches a transcription slip in either copy.
+        let level10_raw_24db = 10.7188_f32;
+        let level2_raw_24db = 8.1981_f32;
+        let expected = level10_raw_24db - level2_raw_24db;
+        // Level 10 is CORRECTION_LEVELS' last entry (index 8); 24 dB is CORRECTION_SNR_GRID's
+        // index 3.
+        assert!(
+            (CAPACITY_LEVEL_CORRECTION[8][3] - expected).abs() < 0.001,
+            "level 10 @ 24dB correction {} != raw diff {}",
+            CAPACITY_LEVEL_CORRECTION[8][3],
+            expected
+        );
+    }
+
+    #[test]
+    fn selectivity_correction_matches_calibration_bench_raw_data() {
+        // Same independent spot-check for selectivity: "DATA 24 10 ... 0.0170" and
+        // "DATA 24 2 ... 0.1913".
+        let level10_raw_24db = 0.0170_f32;
+        let level2_raw_24db = 0.1913_f32;
+        let expected = level10_raw_24db - level2_raw_24db;
+        assert!(
+            (SELECTIVITY_LEVEL_CORRECTION[8][3] - expected).abs() < 0.001,
+            "level 10 @ 24dB correction {} != raw diff {}",
+            SELECTIVITY_LEVEL_CORRECTION[8][3],
+            expected
+        );
+    }
+
+    #[test]
+    fn estimate_snr_db_matches_transceiver_formula() {
+        // Same formula as coppa_protocol::modem::transceiver's own SNR estimate
+        // (10*log10(1/mean(noise_vars))), duplicated here to avoid coppa-ml depending on
+        // coppa-protocol.
+        let nv = vec![0.01_f32; 48]; // mean_nv = 0.01 -> 10*log10(100) = 20 dB
+        let got = estimate_snr_db(&nv);
+        assert!((got - 20.0).abs() < 1e-3, "got {got}");
+        // Empty input falls back to mean_nv = 1.0 -> 10*log10(1) = 0.0 dB.
+        assert_eq!(estimate_snr_db(&[]), 0.0);
     }
 }
