@@ -83,7 +83,28 @@ adaptive/best-fixed = 0.801 and adaptive/oracle = 0.667 (previously 0.894/0.751)
 better, concentrated in the bench's Watterson-fading tail where the AWGN-derived correction is an
 explicitly-flagged, unvalidated extrapolation. The bar remains unmet and the fix, while landed
 (scoped correctly to the measurement layer, no Watterson FER regression on
-`tests/phase_c_loopback.rs`), does not close this gap for this bench's schedule.
+`tests/phase_c_loopback.rs`), does not close this gap for this bench's schedule. **A
+selectivity-gated version of this correction was designed, calibrated (200 trials/cell, AWGN +
+Watterson Good/Moderate/Poor), and fully measured in a throwaway worktree — not shipped, nothing
+landed on `main` from this attempt.** A weight sweep (0.0 through 1.0, bypassing the calibrated
+curve) found the relationship is cleanly monotonic with no local optimum: *any* amount of the
+correction hurts this bench (adaptive/best-fixed 0.886 at weight 0.0, degrading smoothly to 0.801 at
+weight 1.0), so no gate curve built on top of it can beat simply not correcting — which even then
+only gets close to, not confidently past, the historical 0.894/0.751 baseline. Investigating *why*
+surfaced counter-evidence against this bullet's own "Not a `RateLoop` hysteresis bug" framing above:
+a per-frame oracle probe shows the Watterson-fading tail's real channel realizations frequently
+*do* support levels 5-10, interleaved almost frame-to-frame with only-L1/L2-survivable frames —
+fast fluctuation, not a sustained bad channel — identically across every tested correction weight,
+which is itself the tell that the correction table isn't the driver. `RateLoop::default_coppa()`'s
+"raise slow" hysteresis (5 consecutive higher recommendations required to step up, already the
+swept-optimum `raise_dwell`) very plausibly cannot accumulate 5 consecutive raises under that kind
+of rapid alternation once it has dropped, staying pinned low long after the channel has partially
+recovered. This does not refute that the PAPR-clip cross-level measurement bias above is real and
+worth having fixed on its own terms — it's evidence that it is not the dominant cause of *this
+bench's* specific fading-tail shortfall. The real next lever for this bench's acceptance bar is
+therefore believed to be a hysteresis/control-policy fix for fast-fluctuating channels (e.g. faster
+recovery after a spurious drop, or dwell logic sensitive to recent oscillation rate), not further
+correction-table tuning — not yet designed.
 - **Multi-codeword frames (Phase 3 Task 5) do not extend ACK addressing, turbo re-estimation, or persistent IR-HARQ combining to the per-codeword level.** A multi-codeword frame is retransmitted, if at all, as a whole (same `seq`, cycling RV via the existing mechanism) rather than by `(seq, codeword-index)`; turbo re-estimation and IR-HARQ's persistent cross-retransmission LLR accumulator are both scoped to `codewords <= 1` only, taking the exact pre-Task-5 decode path. These are real, deliberate scope cuts (not oversights) — see `docs/adr/007-multi-codeword-frames.md` (decisions 4-5) for the full reasoning
 - **Decision 4's block-ACK cadence (Phase 3 Task 2) was never implemented.** The plan called for batching ACKs to once per received burst boundary or every 2 frames rather than one ACK per decoded frame; this sub-decision has no corresponding code (confirmed via grep across `arq.rs`/`transport.rs`) — every decoded frame still triggers its own ACK today. Does not compromise correctness (more ACKs than strictly necessary is airtime-inefficient, not incorrect), but is a real, previously-undocumented gap against the plan's literal text. See `docs/adr/008-phase3-system-layer.md` (decision 4)
 - **The Phase 3 benchmark program (Task 8: `milstd`, `session`) does not clear its own acceptance targets, and both gaps are honestly measured rather than hidden.** `milstd` (`cargo run -p coppa-bench --release --example milstd`) passes 0 of 27 MIL-STD-188-110-style operating points, even with a generous +12 dB margin over the reference SNR — root-caused to the ladder's borrowed reference SNRs not transferring onto Coppa's own measured thresholds on any channel, including Good (not a fading-specific bug, though the already-tracked Watterson-Moderate/Poor channel-estimation gap below is a real, additional contributing factor for those specific rows). `session` (10-minute simulated ARQ sessions via the real `ArqTx`/`ArqRx` state machines) completes drop-free on only 3/5 Good, 0/5 Moderate, and 0/5 Poor sessions against a "zero drops on good/moderate" target — root-caused to level 2's real Good-preset FER not being zero even above its nominal threshold (~8-12% at 12 dB, ~2% by 18 dB), so a sustained low-SNR ramp trough can exhaust the ARQ's bounded retransmit budget on a non-trivial fraction of trials (not an ARQ state-machine bug). Level 9 (64-QAM 2/3) separately shows an unusually high, steep, and strongly seed-dependent AWGN SNR requirement (a real waterfall, not an SNR-independent floor, per a corrected re-measurement) that never converges at all under any tested Watterson fading up to 54 dB — worth its own future investigation. See `BENCHMARKS.md`'s "Phase 3 Task 8" section and `docs/adr/008-phase3-system-layer.md` (decision 9) for the complete, twice-corrected diagnosis
