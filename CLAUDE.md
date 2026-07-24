@@ -104,7 +104,36 @@ worth having fixed on its own terms — it's evidence that it is not the dominan
 bench's* specific fading-tail shortfall. The real next lever for this bench's acceptance bar is
 therefore believed to be a hysteresis/control-policy fix for fast-fluctuating channels (e.g. faster
 recovery after a spurious drop, or dwell logic sensitive to recent oscillation rate), not further
-correction-table tuning — not yet designed.
+correction-table tuning. **A first such fix was designed, built, and measured (2026-07-24), and is
+DISCONFIRMED — nothing shipped.** The candidate (bound the recommendation-driven drop to one step
+per ack instead of jumping straight to the recommendation, matching the existing failure/timeout
+drop granularity; decay the raise counter on a hold instead of hard-resetting it, so interleaved
+low/high recommendations don't erase all accumulated progress) was built for real in a throwaway
+worktree and re-measured against `closed_loop_arq`: 0.798/0.665 at the shipped `raise_dwell = 5`,
+statistically indistinguishable from (very slightly worse than) current `main`'s 0.801/0.667. A
+follow-up `raise_dwell` sweep (1 through 15) with the new logic found a monotonic relationship
+favoring the most aggressive dwell tested (`dwell=1`: 0.833/0.695) rather than an interior peak —
+the opposite shape from the original sweep that found 5 a genuine optimum — and even that best point
+falls short of both the acceptance bar and the historical pre-PR#53 baseline (0.894/0.751). A
+follow-up isolation test (reverting the drop-cliff to its original jump-straight-to-recommendation
+behavior, keeping only the leaky-raise decay) produced nearly identical numbers across the same
+dwell sweep, showing the bounded-drop change contributes almost nothing on its own and the
+leaky-raise change alone is not an improvement at the shipped dwell value. A per-frame diagnostic
+during the fading tail showed the hysteresis mechanism working exactly as designed (the loop does
+reach L2 in patches it previously couldn't) but not moving the aggregate metric, because per-frame
+recommendations during the tail are themselves frequently and genuinely low (not merely
+under-credited by hysteresis loss), and real delivery failures recur often enough to fully reset the
+raise counter via the untouched failure path regardless of the hold-decay behavior. This falsifies
+the specific mechanism this fix targeted; the diagnostic evidence instead points at the raw
+per-frame recommendation signal's own volatility/low readings during fast fading as the dominant
+factor (plausibly connected to the still-open per-level channel-estimation/capacity-measurement
+limitation elsewhere in this list, though not confirmed as the same root cause), not the shape of
+`RateLoop`'s hysteresis. Full measured detail is in the local (not committed, per `.gitignore`)
+design doc `docs/superpowers/specs/2026-07-24-rateloop-bounded-drop-leaky-raise-design.md`'s
+"Outcome" section. **The real next lever is therefore believed to be improving the underlying
+per-frame recommendation
+signal's quality/stability during fast fading, not further hysteresis-mechanism tuning** — not yet
+designed.
 - **Multi-codeword frames (Phase 3 Task 5) do not extend ACK addressing, turbo re-estimation, or persistent IR-HARQ combining to the per-codeword level.** A multi-codeword frame is retransmitted, if at all, as a whole (same `seq`, cycling RV via the existing mechanism) rather than by `(seq, codeword-index)`; turbo re-estimation and IR-HARQ's persistent cross-retransmission LLR accumulator are both scoped to `codewords <= 1` only, taking the exact pre-Task-5 decode path. These are real, deliberate scope cuts (not oversights) — see `docs/adr/007-multi-codeword-frames.md` (decisions 4-5) for the full reasoning
 - **Decision 4's block-ACK cadence (Phase 3 Task 2) was never implemented.** The plan called for batching ACKs to once per received burst boundary or every 2 frames rather than one ACK per decoded frame; this sub-decision has no corresponding code (confirmed via grep across `arq.rs`/`transport.rs`) — every decoded frame still triggers its own ACK today. Does not compromise correctness (more ACKs than strictly necessary is airtime-inefficient, not incorrect), but is a real, previously-undocumented gap against the plan's literal text. See `docs/adr/008-phase3-system-layer.md` (decision 4)
 - **The Phase 3 benchmark program (Task 8: `milstd`, `session`) does not clear its own acceptance targets, and both gaps are honestly measured rather than hidden.** `milstd` (`cargo run -p coppa-bench --release --example milstd`) passes 0 of 27 MIL-STD-188-110-style operating points, even with a generous +12 dB margin over the reference SNR — root-caused to the ladder's borrowed reference SNRs not transferring onto Coppa's own measured thresholds on any channel, including Good (not a fading-specific bug, though the already-tracked Watterson-Moderate/Poor channel-estimation gap below is a real, additional contributing factor for those specific rows). `session` (10-minute simulated ARQ sessions via the real `ArqTx`/`ArqRx` state machines) completes drop-free on only 3/5 Good, 0/5 Moderate, and 0/5 Poor sessions against a "zero drops on good/moderate" target — root-caused to level 2's real Good-preset FER not being zero even above its nominal threshold (~8-12% at 12 dB, ~2% by 18 dB), so a sustained low-SNR ramp trough can exhaust the ARQ's bounded retransmit budget on a non-trivial fraction of trials (not an ARQ state-machine bug). Level 9 (64-QAM 2/3) separately shows an unusually high, steep, and strongly seed-dependent AWGN SNR requirement (a real waterfall, not an SNR-independent floor, per a corrected re-measurement) that never converges at all under any tested Watterson fading up to 54 dB — worth its own future investigation. See `BENCHMARKS.md`'s "Phase 3 Task 8" section and `docs/adr/008-phase3-system-layer.md` (decision 9) for the complete, twice-corrected diagnosis
