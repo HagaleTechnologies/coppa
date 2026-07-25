@@ -42,6 +42,29 @@
 //! per-level-recalibrated threshold table, both belonging to the channel-estimation/MCS-calibration
 //! work, not the rate-loop controller). See `.superpowers/sdd/task-4-report.md` for the full
 //! measured evidence and reasoning.
+//!
+//! ## 2026-07-25 update: active overshoot probing closes most of the remaining gap, still short of
+//! the bar
+//!
+//! Several follow-up investigations (level-bias correction, hysteresis tuning, a probe-level-accuracy
+//! diagnosis -- see `CLAUDE.md`'s RateLoop bullet for the full history) converged on: the passive
+//! per-frame recommendation is itself a weak same-frame predictor of what a frame could actually
+//! support when measured via a low-order probe, and that accuracy scales with the probing modulation
+//! order. This bench now demonstrates `RateLoop`'s active overshoot probing
+//! (`with_probing`/`level_for_next_transmission`/`on_probe_result`): periodically transmit above the
+//! current level on purpose to get real ground truth instead of a noisy passive read. An exhaustive
+//! sweep of `(probe_interval, probe_offset)` (plus `raise_dwell`, plus a rejected slow-start growing
+//! offset variant, plus stall-gating -- which measurably helped and is now permanent behavior) found
+//! `probe_interval=2, probe_offset=1` the peak: **adaptive/best-fixed = 0.931, adaptive/oracle =
+//! 0.775** at the unchanged `raise_dwell=5` default -- clearly better than both this bench's prior
+//! `main` state (0.801/0.667) and the historical pre-level-bias-correction baseline (0.894/0.751),
+//! but still short of the plan's `>1.0`/`>=0.8` bar. Multiple refinements (dwell tuning, slow-start,
+//! stall-gating) all converged on the same ~0.78/~0.93 plateau, suggesting this is a real ceiling for
+//! this family of designs on this bench, not a remaining tuning gap. Shipped anyway per the same
+//! honest-partial-progress precedent as the level-bias correction (PR #53): real, verified,
+//! substantial improvement, gap documented rather than hidden. See
+//! `docs/superpowers/specs/2026-07-25-rateloop-active-overshoot-probing-design.md`'s "Outcome"
+//! section for the full sweep data.
 
 use coppa_bench::scenario::{mode_for_level, profile_by_name, ChannelSpec, SAMPLE_RATE};
 use coppa_channel::watterson::WattersonPreset;
@@ -182,20 +205,28 @@ fn main() {
         oracle_bits += best;
     }
 
-    // --- Adaptive closed-loop run --- (its own fresh transceiver, same reasoning as above)
+    // --- Adaptive closed-loop run, with active overshoot probing --- (its own fresh transceiver,
+    // same reasoning as above). `.with_probing(2, 1)` is the (probe_interval, probe_offset)
+    // combination measured best via an exhaustive sweep -- see the module doc above.
+    // `RateLoop::default_coppa()`'s own `raise_dwell = 5` is unchanged (probing is opt-in on top of
+    // it, not baked into the default constructor -- see `RateLoop::default_coppa`'s doc).
     let tx = CoppaTransceiver::new(profile, 1);
-    let mut loop_ctl = RateLoop::default_coppa();
+    let mut loop_ctl = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 5, 1).with_probing(2, 1);
     let mut adaptive_bits = 0usize;
     let mut trace: Vec<(usize, f32, u8)> = Vec::new();
     for f in 0..N_FRAMES {
-        let level = loop_ctl.current_level();
+        let (level, is_probe) = loop_ctl.level_for_next_transmission();
         let (ok, rec) = run_frame(&tx, level, f);
         if ok {
             adaptive_bits += info_bits(level);
         }
-        match rec {
-            Some(r) => loop_ctl.on_ack(r, ok),
-            None => loop_ctl.on_timeout(),
+        if is_probe {
+            loop_ctl.on_probe_result(level, ok);
+        } else {
+            match rec {
+                Some(r) => loop_ctl.on_ack(r, ok),
+                None => loop_ctl.on_timeout(),
+            }
         }
         let (_ch, snr) = schedule(f);
         if f % 15 == 0 {
