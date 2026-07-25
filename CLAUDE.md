@@ -157,7 +157,29 @@ transmitting above the current level, trading airtime/decode-failure risk for si
 materially different, larger-scoped kind of change than every fix attempted on this bench so far
 (all purely receiver-side/measurement-layer, explicitly zero-extra-airtime by design, per
 `closed_loop_arq.rs`'s own module doc). Not yet designed; deliberately left for a fresh cycle given
-the scope jump.
+the scope jump. **This active-probing design was built (2026-07-25), de-risked, refined, and
+shipped** — `RateLoop` now has opt-in `with_probing`/`level_for_next_transmission`/`on_probe_result`
+(a probe is an ordinary Data frame opportunistically encoded above the current level; a failed probe
+is an ordinary ARQ-retransmitted loss, no wire-format change). An exhaustive sweep of
+`(probe_interval, probe_offset)`, `raise_dwell`, a rejected slow-start growing-offset variant, and a
+stall-gating refinement (skip a probe while the passive signal is already climbing on its own —
+adopted, small consistent win) converged on `probe_interval=2, probe_offset=1` as a genuine interior
+peak (`probe_interval=1`, probing every frame, collapses to 0.471/0.565 -- forfeiting guaranteed
+current-level throughput on every gamble). Measured result at the unchanged `raise_dwell=5` (left
+unchanged deliberately -- `coppa-daemon`'s real production traffic still calls only `on_ack`, which
+reads `raise_dwell`, and doesn't yet call the new probing API, so changing the shared default would
+have silently changed production behavior for a component not using this feature):
+**adaptive/best-fixed = 0.931, adaptive/oracle = 0.775** -- clearly better than both this bench's
+prior state (0.801/0.667) and the historical pre-level-bias-correction baseline (0.894/0.751), but
+still short of the plan's `>1.0`/`>=0.8` bar. Multiple refinements all converged on the same
+~0.78/~0.93 plateau, suggesting a real ceiling for this family of designs on this bench rather than a
+remaining tuning gap. Shipped anyway per the same honest-partial-progress precedent as the
+capacity/selectivity level-bias correction above: real, verified, substantial improvement, gap
+documented rather than hidden. Real daemon wiring (applying a probe level to one live outgoing frame
+and reverting afterward) remains explicitly deferred to a future cycle. See
+`crates/coppa-bench/examples/closed_loop_arq.rs`'s module doc and
+`docs/superpowers/specs/2026-07-25-rateloop-active-overshoot-probing-design.md`'s "Outcome" section
+for the complete sweep data.
 - **Multi-codeword frames (Phase 3 Task 5) do not extend ACK addressing, turbo re-estimation, or persistent IR-HARQ combining to the per-codeword level.** A multi-codeword frame is retransmitted, if at all, as a whole (same `seq`, cycling RV via the existing mechanism) rather than by `(seq, codeword-index)`; turbo re-estimation and IR-HARQ's persistent cross-retransmission LLR accumulator are both scoped to `codewords <= 1` only, taking the exact pre-Task-5 decode path. These are real, deliberate scope cuts (not oversights) — see `docs/adr/007-multi-codeword-frames.md` (decisions 4-5) for the full reasoning
 - **Decision 4's block-ACK cadence (Phase 3 Task 2) was never implemented.** The plan called for batching ACKs to once per received burst boundary or every 2 frames rather than one ACK per decoded frame; this sub-decision has no corresponding code (confirmed via grep across `arq.rs`/`transport.rs`) — every decoded frame still triggers its own ACK today. Does not compromise correctness (more ACKs than strictly necessary is airtime-inefficient, not incorrect), but is a real, previously-undocumented gap against the plan's literal text. See `docs/adr/008-phase3-system-layer.md` (decision 4)
 - **The Phase 3 benchmark program (Task 8: `milstd`, `session`) does not clear its own acceptance targets, and both gaps are honestly measured rather than hidden.** `milstd` (`cargo run -p coppa-bench --release --example milstd`) passes 0 of 27 MIL-STD-188-110-style operating points, even with a generous +12 dB margin over the reference SNR — root-caused to the ladder's borrowed reference SNRs not transferring onto Coppa's own measured thresholds on any channel, including Good (not a fading-specific bug, though the already-tracked Watterson-Moderate/Poor channel-estimation gap below is a real, additional contributing factor for those specific rows). `session` (10-minute simulated ARQ sessions via the real `ArqTx`/`ArqRx` state machines) completes drop-free on only 3/5 Good, 0/5 Moderate, and 0/5 Poor sessions against a "zero drops on good/moderate" target — root-caused to level 2's real Good-preset FER not being zero even above its nominal threshold (~8-12% at 12 dB, ~2% by 18 dB), so a sustained low-SNR ramp trough can exhaust the ARQ's bounded retransmit budget on a non-trivial fraction of trials (not an ARQ state-machine bug). Level 9 (64-QAM 2/3) separately shows an unusually high, steep, and strongly seed-dependent AWGN SNR requirement (a real waterfall, not an SNR-independent floor, per a corrected re-measurement) that never converges at all under any tested Watterson fading up to 54 dB — worth its own future investigation. See `BENCHMARKS.md`'s "Phase 3 Task 8" section and `docs/adr/008-phase3-system-layer.md` (decision 9) for the complete, twice-corrected diagnosis
