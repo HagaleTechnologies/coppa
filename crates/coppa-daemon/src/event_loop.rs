@@ -226,13 +226,27 @@ impl EventLoop {
         // 2026-07-25-rateloop-daemon-probe-wiring-design.md`) is off by
         // default -- `rate_loop_probe_interval == 0` matches
         // `RateLoop::with_probing`'s own "0 disables" convention.
+        //
+        // Seeded from `engine`'s own actual constructed speed level (whatever
+        // the configured profile specifies), NOT `RateLoop::default_coppa()`'s
+        // hardcoded level 1 -- otherwise a fresh daemon's very first outgoing
+        // frame would silently force the engine down to level 1 via
+        // `try_drain_tx_queue`'s unconditional `set_speed_level(rate_loop.
+        // current_level())`, even with probing disabled. `levels`/`raise_dwell`
+        // still match `default_coppa()`'s own choices -- only the initial
+        // level differs.
+        let rate_loop = RateLoop::new(
+            coppa_ml::VALID_SPEED_LEVELS.to_vec(),
+            5,
+            engine.speed_level(),
+        );
         let rate_loop = if config.engine.rate_loop_probe_interval > 0 {
-            RateLoop::default_coppa().with_probing(
+            rate_loop.with_probing(
                 config.engine.rate_loop_probe_interval,
                 config.engine.rate_loop_probe_offset,
             )
         } else {
-            RateLoop::default_coppa()
+            rate_loop
         };
 
         Ok(Self {
@@ -1877,19 +1891,21 @@ mod tests {
         config.engine.rate_loop_probe_offset = 1;
         let mut event_loop = EventLoop::new(config).unwrap();
 
-        // RateLoop::default_coppa() starts at level 1 (idx 0); offset 1 steps
-        // to idx 1 = level 2. Probe should trigger on the 3rd call.
+        // `DaemonConfig::default()`'s profile ("HF_STANDARD") constructs the
+        // engine at speed_level 2, so `rate_loop` now starts at level 2
+        // (idx 1 in VALID_SPEED_LEVELS); offset 1 steps to idx 2 = level 3.
+        // Probe should trigger on the 3rd call.
         assert_eq!(
             event_loop.rate_loop.level_for_next_transmission(),
-            (1, false)
+            (2, false)
         );
         assert_eq!(
             event_loop.rate_loop.level_for_next_transmission(),
-            (1, false)
+            (2, false)
         );
         assert_eq!(
             event_loop.rate_loop.level_for_next_transmission(),
-            (2, true)
+            (3, true)
         );
     }
 
@@ -1900,7 +1916,7 @@ mod tests {
         for _ in 0..20 {
             assert_eq!(
                 event_loop.rate_loop.level_for_next_transmission(),
-                (1, false)
+                (2, false)
             );
         }
     }
