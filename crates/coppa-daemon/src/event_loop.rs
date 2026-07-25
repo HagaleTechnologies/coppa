@@ -1047,27 +1047,46 @@ impl EventLoop {
                                 match pdu.transport_type {
                                     TransportType::Reliable | TransportType::Unreliable => {
                                         // Feed to ARQ receiver
-                                        let (result_data, ack_info) =
+                                        //
+                                        // Deviation from the Task 5 brief's literal code
+                                        // (documented in the Task 5 report): the brief's
+                                        // snippet calls `self.resolve_probe_if_acked(..)`
+                                        // (which reborrows all of `self`) from inside this
+                                        // `if let Some(ref mut arq_rx) = self.arq_rx` arm,
+                                        // but `arq_rx` is used again below
+                                        // (`arq_rx.ack_info()`), so its borrow is still
+                                        // live at that point and the whole-`self` reborrow
+                                        // doesn't compile (E0499). Restructured to finish
+                                        // with `arq_rx` (and drop its borrow) before doing
+                                        // anything with `self.arq_tx`/`self`, using
+                                        // `had_arq_rx` to preserve the original behavior of
+                                        // only running `process_ack` when `arq_rx` was
+                                        // `Some` -- same observable behavior, no `self`
+                                        // aliasing.
+                                        let (result_data, ack_info, had_arq_rx) =
                                             if let Some(ref mut arq_rx) = self.arq_rx {
                                                 let delivered = arq_rx
                                                     .receive(pdu.seq_num, pdu.payload.clone());
-                                                // Process ACK info back to our TX side
-                                                if let Some(ref mut arq_tx) = self.arq_tx {
-                                                    arq_tx.process_ack(
-                                                        pdu.ack_num,
-                                                        pdu.ack_bitmap,
-                                                        Instant::now(),
-                                                    );
-                                                }
                                                 // Collect all delivered payloads
                                                 let mut all_data = Vec::new();
                                                 for (_seq, data) in delivered {
                                                     all_data.extend(data);
                                                 }
-                                                (all_data, Some(arq_rx.ack_info()))
+                                                (all_data, Some(arq_rx.ack_info()), true)
                                             } else {
-                                                (pdu.payload, None)
+                                                (pdu.payload, None, false)
                                             };
+                                        // Process ACK info back to our TX side
+                                        if had_arq_rx {
+                                            if let Some(ref mut arq_tx) = self.arq_tx {
+                                                let newly_acked = arq_tx.process_ack(
+                                                    pdu.ack_num,
+                                                    pdu.ack_bitmap,
+                                                    Instant::now(),
+                                                );
+                                                self.resolve_probe_if_acked(&newly_acked);
+                                            }
+                                        }
                                         // Acknowledge every successfully-processed
                                         // incoming data PDU (one ACK per frame, per
                                         // decision 4 -- batching was considered and
@@ -1095,24 +1114,37 @@ impl EventLoop {
                                     }
                                     TransportType::Ack | TransportType::Nak => {
                                         // Pure ACK/NAK: process and don't forward to host
+                                        let mut probe_resolved = false;
                                         if let Some(ref mut arq_tx) = self.arq_tx {
-                                            arq_tx.process_ack(
+                                            let newly_acked = arq_tx.process_ack(
                                                 pdu.ack_num,
                                                 pdu.ack_bitmap,
                                                 Instant::now(),
                                             );
+                                            probe_resolved =
+                                                self.resolve_probe_if_acked(&newly_acked);
                                         }
                                         // Closed-loop rate adaptation: apply the
                                         // peer's recommendation (if this ACK carries
                                         // one) and push the resulting level into the
                                         // encoder for subsequent outgoing frames.
-                                        if let Some(rate) = pdu.suggested_rate() {
-                                            self.rate_loop.on_ack(rate, true);
-                                            if let Err(e) = self
-                                                .engine
-                                                .set_speed_level(self.rate_loop.current_level())
-                                            {
-                                                tracing::warn!(error = %e, "Failed to apply RateLoop's recommended speed level");
+                                        // Skipped when this same ACK just resolved an
+                                        // outstanding probe -- a probe's outcome is
+                                        // stronger, direct ground truth than the
+                                        // passive per-frame recommendation, and
+                                        // `on_probe_result`/`on_ack` are mutually
+                                        // exclusive per event (see
+                                        // `docs/superpowers/specs/
+                                        // 2026-07-25-rateloop-daemon-probe-wiring-design.md`).
+                                        if !probe_resolved {
+                                            if let Some(rate) = pdu.suggested_rate() {
+                                                self.rate_loop.on_ack(rate, true);
+                                                if let Err(e) = self
+                                                    .engine
+                                                    .set_speed_level(self.rate_loop.current_level())
+                                                {
+                                                    tracing::warn!(error = %e, "Failed to apply RateLoop's recommended speed level");
+                                                }
                                             }
                                         }
                                         Vec::new()
@@ -1442,6 +1474,28 @@ impl EventLoop {
             self.last_id_time = Instant::now();
             self.transmit_samples(&samples).await;
         }
+    }
+
+    /// If a probe is outstanding and its seq appears in `newly_acked`, resolve
+    /// it as a successful active-overshoot probe (`RateLoop::on_probe_result`),
+    /// apply the resulting level, and clear `probe_state`. Returns `true` if a
+    /// probe was resolved by this call -- the caller must then skip its own
+    /// normal `on_ack` application for this event (mutually exclusive
+    /// dispatch, matching `coppa_ml::RateLoop`'s `level_for_next_transmission`/
+    /// `on_probe_result` call-site contract). See `docs/superpowers/specs/
+    /// 2026-07-25-rateloop-daemon-probe-wiring-design.md`.
+    fn resolve_probe_if_acked(&mut self, newly_acked: &[u8]) -> bool {
+        if let Some((seq, level)) = self.probe_state {
+            if newly_acked.contains(&seq) {
+                self.rate_loop.on_probe_result(level, true);
+                if let Err(e) = self.engine.set_speed_level(self.rate_loop.current_level()) {
+                    tracing::warn!(error = %e, "Failed to apply speed level after probe success");
+                }
+                self.probe_state = None;
+                return true;
+            }
+        }
+        false
     }
 
     /// E6: Check for ARQ retransmits and send them.
@@ -2452,6 +2506,58 @@ mod tests {
             event_loop.rate_loop.current_level(),
             "the engine's configured speed level should track RateLoop's current level"
         );
+    }
+
+    #[tokio::test]
+    async fn probe_ack_resolves_probe_and_skips_normal_on_ack_for_the_same_event() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        let mut arq_tx = ArqTx::new(ArqConfig::default());
+        let seq = arq_tx
+            .send(b"probed segment".to_vec(), Instant::now())
+            .expect("a fresh ARQ window should have room");
+        event_loop.arq_tx = Some(arq_tx);
+        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 1);
+        event_loop.probe_state = Some((seq, 6)); // pretend we probed up to level 6
+
+        // One ACK event that BOTH cumulatively acks `seq` (resolving the probe)
+        // AND carries a lower suggested_rate (2) that would, if `on_ack` were
+        // mistakenly also applied for this same event, immediately drop the
+        // level back down (on_ack's "drop is immediate" rule) -- making a bug
+        // here observable rather than silently absorbed by raise_dwell.
+        let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
+        let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
+        let ack_pdu = TransportPdu::new_ack_with_rate(0, seq.wrapping_add(1), 0, 2);
+        let header = coppa_codec::ofdm::frame::CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: coppa_codec::ofdm::frame::CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: ack_pdu.to_bytes().len() as u16,
+            codewords: 1,
+        };
+        let samples = peer_tx
+            .transmit(&header, &ack_pdu.to_bytes())
+            .expect("peer transmit should succeed");
+        event_loop
+            .decode_and_dispatch_audio(&with_lead_and_trail(&samples))
+            .await;
+
+        assert_eq!(
+            event_loop.probe_state, None,
+            "the probe should be resolved and cleared"
+        );
+        assert_eq!(
+            event_loop.rate_loop.current_level(),
+            6,
+            "on_probe_result's jump to the probed level must win -- on_ack's lower \
+             suggested_rate must NOT also apply for the same ACK event"
+        );
+        assert_eq!(event_loop.engine.speed_level(), 6);
     }
 
     /// Bonus regression test (Task 4 review finding): `check_arq_retransmits`
