@@ -10,6 +10,7 @@ use coppa_host::HostEvent;
 use coppa_ml::{BusyGate, RateLoop};
 use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx};
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu, StationIdPayload};
+use coppa_protocol::modem::max_payload_for_level;
 use coppa_protocol::session::{LinkCapabilities, SessionManager, SessionState};
 use coppa_protocol::transport::{TransportPdu, TransportType};
 use coppa_radio::{NullPtt, PttControl, PttState};
@@ -80,6 +81,12 @@ pub struct EventLoop {
     /// Next TX sequence number for transport PDUs.
     #[allow(dead_code)] // used when ARQ TX path sends segmented frames
     arq_next_seq: u8,
+    /// At most one active-overshoot probe outstanding at a time: `(seq,
+    /// probed_level)`. `None` when no probe is in flight. Only ever set/read
+    /// when ARQ is enabled -- see `docs/superpowers/specs/
+    /// 2026-07-25-rateloop-daemon-probe-wiring-design.md`.
+    #[allow(dead_code)] // used by Tasks 4-6
+    probe_state: Option<(u8, u8)>,
     /// Optional WebSocket broadcast sender for forwarding decoded data.
     #[cfg(feature = "websocket")]
     ws_broadcast: Option<tokio::sync::broadcast::Sender<String>>,
@@ -93,9 +100,12 @@ pub struct EventLoop {
     /// Wired by `main.rs` from `VaraServer::response_senders()`.
     vara_responses: Option<VaraResponseSenders>,
     /// Outbound raw payload bytes queued for encode+transmit (the primary
-    /// raw/ARQ `HostEvent::DataReceived` TX path). `VaraResponse::Buffer` telemetry
-    /// reports this queue's length on every push/pop.
-    tx_queue: VecDeque<Vec<u8>>,
+    /// raw/ARQ `HostEvent::DataReceived` TX path), tagged with the ARQ seq
+    /// number assigned by `ArqTx::send` when this entry came from the
+    /// ARQ-enabled path (`None` otherwise -- non-ARQ sends are never probe
+    /// candidates). `VaraResponse::Buffer` telemetry reports this queue's
+    /// length on every push/pop.
+    tx_queue: VecDeque<(Option<u8>, Vec<u8>)>,
     /// Spectral-occupancy busy gate (decision 8: `BUSY ON`/`OFF` telemetry), fed
     /// raw incoming audio in `handle_audio_in`.
     busy_gate: BusyGate,
@@ -212,6 +222,33 @@ impl EventLoop {
             config.audio.sample_rate as f32,
         );
 
+        // Active overshoot probing (see `docs/superpowers/specs/
+        // 2026-07-25-rateloop-daemon-probe-wiring-design.md`) is off by
+        // default -- `rate_loop_probe_interval == 0` matches
+        // `RateLoop::with_probing`'s own "0 disables" convention.
+        //
+        // Seeded from `engine`'s own actual constructed speed level (whatever
+        // the configured profile specifies), NOT `RateLoop::default_coppa()`'s
+        // hardcoded level 1 -- otherwise a fresh daemon's very first outgoing
+        // frame would silently force the engine down to level 1 via
+        // `try_drain_tx_queue`'s unconditional `set_speed_level(rate_loop.
+        // current_level())`, even with probing disabled. `levels`/`raise_dwell`
+        // still match `default_coppa()`'s own choices -- only the initial
+        // level differs.
+        let rate_loop = RateLoop::new(
+            coppa_ml::VALID_SPEED_LEVELS.to_vec(),
+            5,
+            engine.speed_level(),
+        );
+        let rate_loop = if config.engine.rate_loop_probe_interval > 0 {
+            rate_loop.with_probing(
+                config.engine.rate_loop_probe_interval,
+                config.engine.rate_loop_probe_offset,
+            )
+        } else {
+            rate_loop
+        };
+
         Ok(Self {
             config,
             engine,
@@ -228,8 +265,9 @@ impl EventLoop {
             arq_tx,
             arq_rx,
             arq_session_id: 0,
-            rate_loop: RateLoop::default_coppa(),
+            rate_loop,
             arq_next_seq: 0,
+            probe_state: None,
             #[cfg(feature = "websocket")]
             ws_broadcast: None,
             #[cfg(feature = "websocket")]
@@ -394,8 +432,8 @@ impl EventLoop {
     /// Push one raw payload onto the outbound TX queue, emit the resulting
     /// `BUFFER` telemetry, and attempt to start transmitting immediately if the
     /// link is currently idle. See `tx_queue`'s field doc and `try_drain_tx_queue`.
-    async fn enqueue_tx(&mut self, data: Vec<u8>) {
-        self.tx_queue.push_back(data);
+    async fn enqueue_tx(&mut self, seq: Option<u8>, data: Vec<u8>) {
+        self.tx_queue.push_back((seq, data));
         self.emit_vara(VaraResponse::Buffer(self.tx_queue.len()))
             .await;
         self.try_drain_tx_queue().await;
@@ -409,16 +447,82 @@ impl EventLoop {
         if self.is_transmitting {
             return;
         }
-        if let Some(data) = self.tx_queue.pop_front() {
+        if let Some((seq_opt, data)) = self.tx_queue.pop_front() {
             self.emit_vara(VaraResponse::Buffer(self.tx_queue.len()))
                 .await;
+
+            // Active overshoot probing (see `docs/superpowers/specs/
+            // 2026-07-25-rateloop-daemon-probe-wiring-design.md`) only applies
+            // to a fresh ARQ-tracked segment's first transmission (never a
+            // retransmit -- those go through `check_arq_retransmits` instead),
+            // only one probe outstanding at a time, and only when ARQ is
+            // enabled (probing needs the ACK/timeout feedback loop to
+            // attribute an outcome).
+            let probing_eligible = self.probe_state.is_none()
+                && self.config.engine.arq_enabled
+                && self.arq_tx.is_some();
+
+            let (level, is_probe) = match seq_opt {
+                Some(_) if probing_eligible => {
+                    let (lvl, probe) = self.rate_loop.level_for_next_transmission();
+                    if probe {
+                        // Bounds check: `max_payload_for_level` isn't
+                        // monotonic across the ladder (e.g. level 4 = 178
+                        // bytes, level 5 = 158) -- a segment that fits at the
+                        // current level can fail to fit at a probed higher
+                        // one. Skip the probe (send normally) rather than
+                        // growing to multiple codewords.
+                        match max_payload_for_level(lvl) {
+                            Some(max) if data.len() <= max => (lvl, true),
+                            _ => (self.rate_loop.current_level(), false),
+                        }
+                    } else {
+                        (lvl, false)
+                    }
+                }
+                _ => (self.rate_loop.current_level(), false),
+            };
+
+            // Apply the chosen level: for a probe this is the probed (higher)
+            // level; otherwise it's just `rate_loop`'s current steady-state
+            // level, which the encoder must be kept in sync with for every
+            // fresh send (not only when actually probing). Guarded against
+            // the common case where `level` already matches the engine's
+            // current speed level -- `CoppaCore::set_speed_level` does a full
+            // `reconfigure` (rebuilds the transceiver and streaming receiver)
+            // every time, so calling it unconditionally on every fresh send
+            // is real, avoidable per-frame cost whenever the level hasn't
+            // actually changed.
+            if self.engine.speed_level() != level {
+                if let Err(e) = self.engine.set_speed_level(level) {
+                    tracing::warn!(error = %e, "Failed to apply speed level for queued TX frame");
+                }
+            }
+
             match self.engine.encode_bytes(&data) {
                 // Boxed: `transmit_samples` -> `handle_ptt_change` -> (on PTT
                 // release) `try_drain_tx_queue` forms a 3-way async call cycle;
                 // one edge needs indirection to give the compiler a finite-sized
                 // future.
-                Ok(samples) => Box::pin(self.transmit_samples(&samples)).await,
+                Ok(samples) => {
+                    // Only now that the probe frame has actually been handed
+                    // to `transmit_samples` does it become a real outstanding
+                    // probe -- an encode failure below never reached the air,
+                    // so it must not block future probing via a phantom
+                    // `probe_state`.
+                    if is_probe {
+                        self.probe_state =
+                            Some((seq_opt.expect("is_probe implies Some(seq)"), level));
+                    }
+                    Box::pin(self.transmit_samples(&samples)).await;
+                }
                 Err(e) => tracing::warn!(error = %e, "Encode failed for queued TX frame"),
+            }
+
+            if is_probe {
+                if let Err(e) = self.engine.set_speed_level(self.rate_loop.current_level()) {
+                    tracing::warn!(error = %e, "Failed to revert speed level after probe");
+                }
             }
         }
     }
@@ -643,7 +747,7 @@ impl EventLoop {
 
                 // Fall through: no session — use raw/ARQ encode path
                 // E6: If ARQ is enabled, wrap data in a TransportPdu before encoding
-                let tx_bytes = if self.config.engine.arq_enabled {
+                let (seq_opt, tx_bytes) = if self.config.engine.arq_enabled {
                     if let Some(ref mut arq_tx) = self.arq_tx {
                         let now = Instant::now();
                         match arq_tx.send(data.clone(), now) {
@@ -654,7 +758,7 @@ impl EventLoop {
                                     0, // ack_num filled by ARQ layer
                                     data.clone(),
                                 );
-                                pdu.to_bytes()
+                                (Some(seq), pdu.to_bytes())
                             }
                             Err(e) => {
                                 tracing::warn!(client_id, error = %e, "ARQ window full; dropping TX");
@@ -662,15 +766,18 @@ impl EventLoop {
                             }
                         }
                     } else {
-                        data.clone()
+                        (None, data.clone())
                     }
                 } else {
-                    data.clone()
+                    (None, data.clone())
                 };
 
                 // Queue for encode+transmit (Task 7: BUFFER telemetry tracks this
-                // queue's depth; see `enqueue_tx`/`try_drain_tx_queue`).
-                self.enqueue_tx(tx_bytes).await;
+                // queue's depth; see `enqueue_tx`/`try_drain_tx_queue`). `seq_opt`
+                // is `Some` only for a fresh ARQ-tracked segment -- used by active
+                // overshoot probing (`RateLoop::level_for_next_transmission`) to
+                // attribute a probe's later outcome back to its ACK/timeout.
+                self.enqueue_tx(seq_opt, tx_bytes).await;
             }
             HostEvent::VaraCommand { client_id, command } => {
                 tracing::debug!(client_id, command = %command, "VARA command received");
@@ -962,27 +1069,46 @@ impl EventLoop {
                                 match pdu.transport_type {
                                     TransportType::Reliable | TransportType::Unreliable => {
                                         // Feed to ARQ receiver
-                                        let (result_data, ack_info) =
+                                        //
+                                        // Deviation from the Task 5 brief's literal code
+                                        // (documented in the Task 5 report): the brief's
+                                        // snippet calls `self.resolve_probe_if_acked(..)`
+                                        // (which reborrows all of `self`) from inside this
+                                        // `if let Some(ref mut arq_rx) = self.arq_rx` arm,
+                                        // but `arq_rx` is used again below
+                                        // (`arq_rx.ack_info()`), so its borrow is still
+                                        // live at that point and the whole-`self` reborrow
+                                        // doesn't compile (E0499). Restructured to finish
+                                        // with `arq_rx` (and drop its borrow) before doing
+                                        // anything with `self.arq_tx`/`self`, using
+                                        // `had_arq_rx` to preserve the original behavior of
+                                        // only running `process_ack` when `arq_rx` was
+                                        // `Some` -- same observable behavior, no `self`
+                                        // aliasing.
+                                        let (result_data, ack_info, had_arq_rx) =
                                             if let Some(ref mut arq_rx) = self.arq_rx {
                                                 let delivered = arq_rx
                                                     .receive(pdu.seq_num, pdu.payload.clone());
-                                                // Process ACK info back to our TX side
-                                                if let Some(ref mut arq_tx) = self.arq_tx {
-                                                    arq_tx.process_ack(
-                                                        pdu.ack_num,
-                                                        pdu.ack_bitmap,
-                                                        Instant::now(),
-                                                    );
-                                                }
                                                 // Collect all delivered payloads
                                                 let mut all_data = Vec::new();
                                                 for (_seq, data) in delivered {
                                                     all_data.extend(data);
                                                 }
-                                                (all_data, Some(arq_rx.ack_info()))
+                                                (all_data, Some(arq_rx.ack_info()), true)
                                             } else {
-                                                (pdu.payload, None)
+                                                (pdu.payload, None, false)
                                             };
+                                        // Process ACK info back to our TX side
+                                        if had_arq_rx {
+                                            if let Some(ref mut arq_tx) = self.arq_tx {
+                                                let newly_acked = arq_tx.process_ack(
+                                                    pdu.ack_num,
+                                                    pdu.ack_bitmap,
+                                                    Instant::now(),
+                                                );
+                                                self.resolve_probe_if_acked(&newly_acked);
+                                            }
+                                        }
                                         // Acknowledge every successfully-processed
                                         // incoming data PDU (one ACK per frame, per
                                         // decision 4 -- batching was considered and
@@ -1010,24 +1136,37 @@ impl EventLoop {
                                     }
                                     TransportType::Ack | TransportType::Nak => {
                                         // Pure ACK/NAK: process and don't forward to host
+                                        let mut probe_resolved = false;
                                         if let Some(ref mut arq_tx) = self.arq_tx {
-                                            arq_tx.process_ack(
+                                            let newly_acked = arq_tx.process_ack(
                                                 pdu.ack_num,
                                                 pdu.ack_bitmap,
                                                 Instant::now(),
                                             );
+                                            probe_resolved =
+                                                self.resolve_probe_if_acked(&newly_acked);
                                         }
                                         // Closed-loop rate adaptation: apply the
                                         // peer's recommendation (if this ACK carries
                                         // one) and push the resulting level into the
                                         // encoder for subsequent outgoing frames.
-                                        if let Some(rate) = pdu.suggested_rate() {
-                                            self.rate_loop.on_ack(rate, true);
-                                            if let Err(e) = self
-                                                .engine
-                                                .set_speed_level(self.rate_loop.current_level())
-                                            {
-                                                tracing::warn!(error = %e, "Failed to apply RateLoop's recommended speed level");
+                                        // Skipped when this same ACK just resolved an
+                                        // outstanding probe -- a probe's outcome is
+                                        // stronger, direct ground truth than the
+                                        // passive per-frame recommendation, and
+                                        // `on_probe_result`/`on_ack` are mutually
+                                        // exclusive per event (see
+                                        // `docs/superpowers/specs/
+                                        // 2026-07-25-rateloop-daemon-probe-wiring-design.md`).
+                                        if !probe_resolved {
+                                            if let Some(rate) = pdu.suggested_rate() {
+                                                self.rate_loop.on_ack(rate, true);
+                                                if let Err(e) = self
+                                                    .engine
+                                                    .set_speed_level(self.rate_loop.current_level())
+                                                {
+                                                    tracing::warn!(error = %e, "Failed to apply RateLoop's recommended speed level");
+                                                }
                                             }
                                         }
                                         Vec::new()
@@ -1036,6 +1175,15 @@ impl EventLoop {
                                         // Reset ARQ state
                                         self.arq_tx = Some(ArqTx::new(ArqConfig::default()));
                                         self.arq_rx = Some(ArqRx::new(8));
+                                        // A Reset restarts ARQ sequence numbering from 0,
+                                        // so any outstanding probe's tracked seq is no
+                                        // longer meaningful: leaving it set could either
+                                        // permanently block future probing (if its seq is
+                                        // never reused) or cause a later, unrelated fresh
+                                        // segment that happens to reuse the same seq to be
+                                        // spuriously resolved as a "successful probe" via
+                                        // `resolve_probe_if_acked`.
+                                        self.probe_state = None;
                                         Vec::new()
                                     }
                                 }
@@ -1359,6 +1507,28 @@ impl EventLoop {
         }
     }
 
+    /// If a probe is outstanding and its seq appears in `newly_acked`, resolve
+    /// it as a successful active-overshoot probe (`RateLoop::on_probe_result`),
+    /// apply the resulting level, and clear `probe_state`. Returns `true` if a
+    /// probe was resolved by this call -- the caller must then skip its own
+    /// normal `on_ack` application for this event (mutually exclusive
+    /// dispatch, matching `coppa_ml::RateLoop`'s `level_for_next_transmission`/
+    /// `on_probe_result` call-site contract). See `docs/superpowers/specs/
+    /// 2026-07-25-rateloop-daemon-probe-wiring-design.md`.
+    fn resolve_probe_if_acked(&mut self, newly_acked: &[u8]) -> bool {
+        if let Some((seq, level)) = self.probe_state {
+            if newly_acked.contains(&seq) {
+                self.rate_loop.on_probe_result(level, true);
+                if let Err(e) = self.engine.set_speed_level(self.rate_loop.current_level()) {
+                    tracing::warn!(error = %e, "Failed to apply speed level after probe success");
+                }
+                self.probe_state = None;
+                return true;
+            }
+        }
+        false
+    }
+
     /// E6: Check for ARQ retransmits and send them.
     ///
     /// Each retransmitted PDU is routed through `transmit_samples` (the PTT
@@ -1385,15 +1555,43 @@ impl EventLoop {
         let mut retransmit_pdus: Vec<(u8, Vec<u8>)> = Vec::new();
         if let Some(ref mut arq_tx) = self.arq_tx {
             let retransmit_seqs = arq_tx.get_retransmits(now);
-            // One timeout EVENT (any number of expired segments in this single
-            // poll) maps to exactly one `RateLoop::on_timeout` call, matching
-            // `get_retransmits`'s own documented one-call-per-event contract.
-            if !retransmit_seqs.is_empty() {
+
+            // If the tracked probe's seq is among the expired seqs, it
+            // resolves as a FAILED active overshoot probe -- an ordinary
+            // ARQ-retransmitted loss (the retransmit loop below still resends
+            // it normally, at whatever level `current_level()` now is), but
+            // must not itself drop RateLoop's idx the way a genuine passive
+            // timeout does (`on_probe_result`'s failure path is a no-op by
+            // design). See `docs/superpowers/specs/
+            // 2026-07-25-rateloop-daemon-probe-wiring-design.md`.
+            let probe_failed_seq = self
+                .probe_state
+                .filter(|&(seq, _)| retransmit_seqs.contains(&seq))
+                .map(|(seq, _)| seq);
+            if let Some((seq, level)) = self.probe_state {
+                if Some(seq) == probe_failed_seq {
+                    self.rate_loop.on_probe_result(level, false);
+                    self.probe_state = None;
+                }
+            }
+
+            // One timeout EVENT (any number of expired NON-PROBE segments in
+            // this single poll) maps to exactly one `RateLoop::on_timeout`
+            // call, matching `get_retransmits`'s own documented
+            // one-call-per-event contract. If the ONLY expired seq this poll
+            // was the probe (already handled above), no `on_timeout` call
+            // happens at all.
+            let other_timeouts = retransmit_seqs
+                .iter()
+                .filter(|&&s| Some(s) != probe_failed_seq)
+                .count();
+            if other_timeouts > 0 {
                 self.rate_loop.on_timeout();
                 if let Err(e) = self.engine.set_speed_level(self.rate_loop.current_level()) {
                     tracing::warn!(error = %e, "Failed to apply RateLoop's recommended speed level after timeout");
                 }
             }
+
             for seq in retransmit_seqs {
                 if let Some(data) = arq_tx.get_segment_data(seq) {
                     let pdu =
@@ -1701,6 +1899,144 @@ mod tests {
             EventLoop::new(config).is_err(),
             "EventLoop::new should fail loudly on an unrecognized ptt_method"
         );
+    }
+
+    #[test]
+    fn new_wires_probe_config_into_rate_loop() {
+        let mut config = DaemonConfig::default();
+        config.engine.rate_loop_probe_interval = 3;
+        config.engine.rate_loop_probe_offset = 1;
+        let mut event_loop = EventLoop::new(config).unwrap();
+
+        // `DaemonConfig::default()`'s profile ("HF_STANDARD") constructs the
+        // engine at speed_level 2, so `rate_loop` now starts at level 2
+        // (idx 1 in VALID_SPEED_LEVELS); offset 1 steps to idx 2 = level 3.
+        // Probe should trigger on the 3rd call.
+        assert_eq!(
+            event_loop.rate_loop.level_for_next_transmission(),
+            (2, false)
+        );
+        assert_eq!(
+            event_loop.rate_loop.level_for_next_transmission(),
+            (2, false)
+        );
+        assert_eq!(
+            event_loop.rate_loop.level_for_next_transmission(),
+            (3, true)
+        );
+    }
+
+    #[test]
+    fn new_defaults_to_probing_disabled() {
+        let config = DaemonConfig::default();
+        let mut event_loop = EventLoop::new(config).unwrap();
+        for _ in 0..20 {
+            assert_eq!(
+                event_loop.rate_loop.level_for_next_transmission(),
+                (2, false)
+            );
+        }
+    }
+
+    #[test]
+    fn new_starts_with_no_probe_outstanding() {
+        let event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        assert_eq!(event_loop.probe_state, None);
+    }
+
+    #[tokio::test]
+    async fn enqueue_tx_carries_optional_arq_seq_through_the_queue() {
+        let config = DaemonConfig::default();
+        let mut event_loop = EventLoop::new(config).unwrap();
+        event_loop.is_transmitting = true; // block draining so the queue can be inspected
+
+        event_loop.enqueue_tx(None, b"no-seq".to_vec()).await;
+        event_loop.enqueue_tx(Some(7), b"has-seq".to_vec()).await;
+
+        let queued: Vec<_> = event_loop.tx_queue.iter().cloned().collect();
+        assert_eq!(queued[0], (None, b"no-seq".to_vec()));
+        assert_eq!(queued[1], (Some(7), b"has-seq".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn probe_send_applies_level_sets_probe_state_and_reverts() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+        event_loop.rate_loop =
+            RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 1).with_probing(1, 1);
+
+        let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
+        event_loop.set_audio_out(producer);
+
+        event_loop
+            .tx_queue
+            .push_back((Some(0), b"probe me".to_vec()));
+        event_loop.try_drain_tx_queue().await;
+
+        assert_eq!(
+            event_loop.probe_state,
+            Some((0, 2)),
+            "a successful probe transmission should record (seq, probed_level)"
+        );
+        assert_eq!(
+            event_loop.engine.speed_level(),
+            event_loop.rate_loop.current_level(),
+            "engine speed level should be reverted to RateLoop's steady-state level \
+             after the probe transmission completes"
+        );
+        assert_eq!(
+            event_loop.rate_loop.current_level(),
+            1,
+            "a probe transmission (outcome not yet known) must not itself change \
+             RateLoop's current_level"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_send_skips_when_candidate_oversize_for_probe_level() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+        // Level 4's budget is 178 bytes; level 5 (the probe target at offset 1)
+        // is only 158 -- a real dip in `max_payload_for_level`. A payload in
+        // between fits at the current level but not at the probe level.
+        event_loop.rate_loop =
+            RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 4).with_probing(1, 1);
+
+        let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
+        event_loop.set_audio_out(producer);
+
+        let oversize_for_probe = vec![0u8; 170];
+        event_loop.tx_queue.push_back((Some(0), oversize_for_probe));
+        event_loop.try_drain_tx_queue().await;
+
+        assert_eq!(
+            event_loop.probe_state, None,
+            "an oversize probe candidate must fall back to a normal send, not become a probe"
+        );
+        assert_eq!(event_loop.engine.speed_level(), 4);
+    }
+
+    #[tokio::test]
+    async fn non_arq_send_is_never_a_probe_candidate() {
+        let config = DaemonConfig::default(); // arq_enabled = false by default
+        let mut event_loop = EventLoop::new(config).unwrap();
+        event_loop.rate_loop =
+            RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 1).with_probing(1, 1);
+
+        let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
+        event_loop.set_audio_out(producer);
+
+        event_loop
+            .tx_queue
+            .push_back((None, b"plain data".to_vec()));
+        event_loop.try_drain_tx_queue().await;
+
+        assert_eq!(event_loop.probe_state, None);
+        assert_eq!(event_loop.engine.speed_level(), 1);
     }
 
     #[tokio::test]
@@ -2233,6 +2569,168 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn probe_ack_resolves_probe_and_skips_normal_on_ack_for_the_same_event() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        let mut arq_tx = ArqTx::new(ArqConfig::default());
+        let seq = arq_tx
+            .send(b"probed segment".to_vec(), Instant::now())
+            .expect("a fresh ARQ window should have room");
+        event_loop.arq_tx = Some(arq_tx);
+        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 1);
+        event_loop.probe_state = Some((seq, 6)); // pretend we probed up to level 6
+
+        // One ACK event that BOTH cumulatively acks `seq` (resolving the probe)
+        // AND carries a lower suggested_rate (2) that would, if `on_ack` were
+        // mistakenly also applied for this same event, immediately drop the
+        // level back down (on_ack's "drop is immediate" rule) -- making a bug
+        // here observable rather than silently absorbed by raise_dwell.
+        let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
+        let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
+        let ack_pdu = TransportPdu::new_ack_with_rate(0, seq.wrapping_add(1), 0, 2);
+        let header = coppa_codec::ofdm::frame::CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: coppa_codec::ofdm::frame::CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: ack_pdu.to_bytes().len() as u16,
+            codewords: 1,
+        };
+        let samples = peer_tx
+            .transmit(&header, &ack_pdu.to_bytes())
+            .expect("peer transmit should succeed");
+        event_loop
+            .decode_and_dispatch_audio(&with_lead_and_trail(&samples))
+            .await;
+
+        assert_eq!(
+            event_loop.probe_state, None,
+            "the probe should be resolved and cleared"
+        );
+        assert_eq!(
+            event_loop.rate_loop.current_level(),
+            6,
+            "on_probe_result's jump to the probed level must win -- on_ack's lower \
+             suggested_rate must NOT also apply for the same ACK event"
+        );
+        assert_eq!(event_loop.engine.speed_level(), 6);
+    }
+
+    /// Whole-branch review Fix 2: a `TransportType::Reset` rebuilds `arq_tx`/
+    /// `arq_rx` fresh (restarting ARQ sequence numbering from 0) but must also
+    /// clear any outstanding `probe_state` -- otherwise a stale probe's seq
+    /// could either permanently block future probing or be spuriously
+    /// resolved by an unrelated later segment that happens to reuse the same
+    /// seq number. Drives a real wire-encoded `TransportPdu::new_reset` through
+    /// `decode_and_dispatch_audio` (the real `TransportType::Reset` code path),
+    /// following the same encode/decode boilerplate as
+    /// `probe_ack_resolves_probe_and_skips_normal_on_ack_for_the_same_event`.
+    #[tokio::test]
+    async fn reset_clears_outstanding_probe_state() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+        event_loop.arq_rx = Some(ArqRx::new(8));
+        event_loop.probe_state = Some((3, 6)); // pretend a probe is outstanding
+
+        let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
+        let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
+        let reset_pdu = TransportPdu::new_reset(0);
+        let header = coppa_codec::ofdm::frame::CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: coppa_codec::ofdm::frame::CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: reset_pdu.to_bytes().len() as u16,
+            codewords: 1,
+        };
+        let samples = peer_tx
+            .transmit(&header, &reset_pdu.to_bytes())
+            .expect("peer transmit should succeed");
+        event_loop
+            .decode_and_dispatch_audio(&with_lead_and_trail(&samples))
+            .await;
+
+        assert_eq!(
+            event_loop.probe_state, None,
+            "a Reset must clear any outstanding probe_state, not just rebuild arq_tx/arq_rx"
+        );
+    }
+
+    /// Whole-branch review Fix 4: `resolve_probe_if_acked` is also called from
+    /// the `TransportType::Reliable | Unreliable` branch (a piggybacked ACK
+    /// riding on an incoming DATA frame's own `ack_num`/`ack_bitmap`), not just
+    /// the standalone `Ack | Nak` branch already covered by
+    /// `probe_ack_resolves_probe_and_skips_normal_on_ack_for_the_same_event`.
+    /// Seeds `probe_state`, then sends a real wire-encoded
+    /// `TransportPdu::new_reliable` whose `ack_num` cumulatively acks the
+    /// probed seq, through `decode_and_dispatch_audio`, and asserts the probe
+    /// resolves. Uses `arq_receive_transmits_a_real_ack_with_rate`'s
+    /// `Reliable`-PDU construction as a template.
+    #[tokio::test]
+    async fn probe_resolves_via_piggybacked_ack_on_reliable_data_frame() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        let mut arq_tx = ArqTx::new(ArqConfig::default());
+        let seq = arq_tx
+            .send(b"probed segment".to_vec(), Instant::now())
+            .expect("a fresh ARQ window should have room");
+        event_loop.arq_tx = Some(arq_tx);
+        event_loop.arq_rx = Some(ArqRx::new(8));
+        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 1);
+        event_loop.probe_state = Some((seq, 6)); // pretend we probed up to level 6
+
+        let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
+        event_loop.set_audio_out(producer);
+
+        // Peer sends a Reliable DATA frame (not a standalone Ack/Nak) whose
+        // own ack_num cumulatively acks the probed seq -- the piggybacked-ack
+        // path, driven through the `Reliable | Unreliable` match arm.
+        let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
+        let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
+        let data_pdu =
+            TransportPdu::new_reliable(5, 9, seq.wrapping_add(1), b"incoming data".to_vec());
+        let header = coppa_codec::ofdm::frame::CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: coppa_codec::ofdm::frame::CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: data_pdu.to_bytes().len() as u16,
+            codewords: 1,
+        };
+        let samples = peer_tx
+            .transmit(&header, &data_pdu.to_bytes())
+            .expect("peer transmit should succeed");
+        event_loop
+            .decode_and_dispatch_audio(&with_lead_and_trail(&samples))
+            .await;
+
+        assert_eq!(
+            event_loop.probe_state, None,
+            "the probe should be resolved and cleared via the piggybacked ack on \
+             an incoming Reliable data frame, not just the standalone Ack/Nak path"
+        );
+        assert_eq!(
+            event_loop.rate_loop.current_level(),
+            6,
+            "on_probe_result's jump to the probed level must apply"
+        );
+        assert_eq!(event_loop.engine.speed_level(), 6);
+    }
+
     /// Bonus regression test (Task 4 review finding): `check_arq_retransmits`
     /// must call `RateLoop::on_timeout` exactly ONCE per poll, no matter how
     /// many segments expired together in that single `ArqTx::get_retransmits`
@@ -2281,6 +2779,74 @@ mod tests {
             "two segments expiring in the same poll should drop RateLoop by \
              exactly ONE step (5 -> 4), not one step per expired segment \
              (which would read as 3)"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_timeout_alone_resolves_as_failed_probe_without_on_timeout() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+
+        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 5);
+        assert_eq!(event_loop.rate_loop.current_level(), 5);
+
+        let arq_config = ArqConfig::new(8, 5, Duration::from_millis(20))
+            .expect("window_size=8 is within 1..=MAX_WINDOW_SIZE");
+        let mut arq_tx = ArqTx::new(arq_config);
+        let send_time = Instant::now() - Duration::from_millis(100);
+        let seq = arq_tx
+            .send(b"probed segment".to_vec(), send_time)
+            .expect("a fresh ARQ window should have room");
+        event_loop.arq_tx = Some(arq_tx);
+        event_loop.probe_state = Some((seq, 9)); // pretend we probed up to level 9
+
+        event_loop.check_arq_retransmits().await;
+
+        assert_eq!(
+            event_loop.probe_state, None,
+            "the failed probe should be resolved and cleared"
+        );
+        assert_eq!(
+            event_loop.rate_loop.current_level(),
+            5,
+            "a failed probe must NOT drop RateLoop's current_level \
+             (on_probe_result's no-op-on-failure rule) -- only a genuine \
+             on_timeout would"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_timeout_alongside_other_expired_segment_still_calls_on_timeout_once() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+
+        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 5);
+        assert_eq!(event_loop.rate_loop.current_level(), 5);
+
+        let arq_config = ArqConfig::new(8, 5, Duration::from_millis(20))
+            .expect("window_size=8 is within 1..=MAX_WINDOW_SIZE");
+        let mut arq_tx = ArqTx::new(arq_config);
+        let send_time = Instant::now() - Duration::from_millis(100);
+        let probe_seq = arq_tx
+            .send(b"probed segment".to_vec(), send_time)
+            .expect("a fresh ARQ window should have room");
+        arq_tx
+            .send(b"ordinary segment".to_vec(), send_time)
+            .expect("a fresh ARQ window should have room for a second segment");
+        event_loop.arq_tx = Some(arq_tx);
+        event_loop.probe_state = Some((probe_seq, 9));
+
+        event_loop.check_arq_retransmits().await;
+
+        assert_eq!(event_loop.probe_state, None);
+        assert_eq!(
+            event_loop.rate_loop.current_level(),
+            4,
+            "the OTHER expired segment is a genuine passive timeout -- on_timeout \
+             should still fire exactly once (5 -> 4), separate from the probe's \
+             own resolution"
         );
     }
 
@@ -2809,9 +3375,9 @@ mod tests {
                 connect_mock_vara_client(&mut event_loop, 19420, 19421).await;
 
             event_loop.is_transmitting = true;
-            event_loop.enqueue_tx(b"frame1".to_vec()).await;
-            event_loop.enqueue_tx(b"frame2".to_vec()).await;
-            event_loop.enqueue_tx(b"frame3".to_vec()).await;
+            event_loop.enqueue_tx(None, b"frame1".to_vec()).await;
+            event_loop.enqueue_tx(None, b"frame2".to_vec()).await;
+            event_loop.enqueue_tx(None, b"frame3".to_vec()).await;
             assert_eq!(event_loop.tx_queue.len(), 3);
 
             event_loop.is_transmitting = false;
