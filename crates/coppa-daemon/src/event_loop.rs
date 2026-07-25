@@ -10,6 +10,7 @@ use coppa_host::HostEvent;
 use coppa_ml::{BusyGate, RateLoop};
 use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx};
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu, StationIdPayload};
+use coppa_protocol::modem::max_payload_for_level;
 use coppa_protocol::session::{LinkCapabilities, SessionManager, SessionState};
 use coppa_protocol::transport::{TransportPdu, TransportType};
 use coppa_radio::{NullPtt, PttControl, PttState};
@@ -432,16 +433,74 @@ impl EventLoop {
         if self.is_transmitting {
             return;
         }
-        if let Some((_seq_opt, data)) = self.tx_queue.pop_front() {
+        if let Some((seq_opt, data)) = self.tx_queue.pop_front() {
             self.emit_vara(VaraResponse::Buffer(self.tx_queue.len()))
                 .await;
+
+            // Active overshoot probing (see `docs/superpowers/specs/
+            // 2026-07-25-rateloop-daemon-probe-wiring-design.md`) only applies
+            // to a fresh ARQ-tracked segment's first transmission (never a
+            // retransmit -- those go through `check_arq_retransmits` instead),
+            // only one probe outstanding at a time, and only when ARQ is
+            // enabled (probing needs the ACK/timeout feedback loop to
+            // attribute an outcome).
+            let probing_eligible = self.probe_state.is_none()
+                && self.config.engine.arq_enabled
+                && self.arq_tx.is_some();
+
+            let (level, is_probe) = match seq_opt {
+                Some(_) if probing_eligible => {
+                    let (lvl, probe) = self.rate_loop.level_for_next_transmission();
+                    if probe {
+                        // Bounds check: `max_payload_for_level` isn't
+                        // monotonic across the ladder (e.g. level 4 = 178
+                        // bytes, level 5 = 158) -- a segment that fits at the
+                        // current level can fail to fit at a probed higher
+                        // one. Skip the probe (send normally) rather than
+                        // growing to multiple codewords.
+                        match max_payload_for_level(lvl) {
+                            Some(max) if data.len() <= max => (lvl, true),
+                            _ => (self.rate_loop.current_level(), false),
+                        }
+                    } else {
+                        (lvl, false)
+                    }
+                }
+                _ => (self.rate_loop.current_level(), false),
+            };
+
+            // Apply the chosen level unconditionally: for a probe this is the
+            // probed (higher) level; otherwise it's just `rate_loop`'s current
+            // steady-state level, which the encoder must be kept in sync with
+            // for every fresh send (not only when actually probing).
+            if let Err(e) = self.engine.set_speed_level(level) {
+                tracing::warn!(error = %e, "Failed to apply speed level for queued TX frame");
+            }
+
             match self.engine.encode_bytes(&data) {
                 // Boxed: `transmit_samples` -> `handle_ptt_change` -> (on PTT
                 // release) `try_drain_tx_queue` forms a 3-way async call cycle;
                 // one edge needs indirection to give the compiler a finite-sized
                 // future.
-                Ok(samples) => Box::pin(self.transmit_samples(&samples)).await,
+                Ok(samples) => {
+                    // Only now that the probe frame has actually been handed
+                    // to `transmit_samples` does it become a real outstanding
+                    // probe -- an encode failure below never reached the air,
+                    // so it must not block future probing via a phantom
+                    // `probe_state`.
+                    if is_probe {
+                        self.probe_state =
+                            Some((seq_opt.expect("is_probe implies Some(seq)"), level));
+                    }
+                    Box::pin(self.transmit_samples(&samples)).await;
+                }
                 Err(e) => tracing::warn!(error = %e, "Encode failed for queued TX frame"),
+            }
+
+            if is_probe {
+                if let Err(e) = self.engine.set_speed_level(self.rate_loop.current_level()) {
+                    tracing::warn!(error = %e, "Failed to revert speed level after probe");
+                }
             }
         }
     }
@@ -1782,6 +1841,87 @@ mod tests {
         let queued: Vec<_> = event_loop.tx_queue.iter().cloned().collect();
         assert_eq!(queued[0], (None, b"no-seq".to_vec()));
         assert_eq!(queued[1], (Some(7), b"has-seq".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn probe_send_applies_level_sets_probe_state_and_reverts() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+        event_loop.rate_loop =
+            RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 1).with_probing(1, 1);
+
+        let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
+        event_loop.set_audio_out(producer);
+
+        event_loop
+            .tx_queue
+            .push_back((Some(0), b"probe me".to_vec()));
+        event_loop.try_drain_tx_queue().await;
+
+        assert_eq!(
+            event_loop.probe_state,
+            Some((0, 2)),
+            "a successful probe transmission should record (seq, probed_level)"
+        );
+        assert_eq!(
+            event_loop.engine.speed_level(),
+            event_loop.rate_loop.current_level(),
+            "engine speed level should be reverted to RateLoop's steady-state level \
+             after the probe transmission completes"
+        );
+        assert_eq!(
+            event_loop.rate_loop.current_level(),
+            1,
+            "a probe transmission (outcome not yet known) must not itself change \
+             RateLoop's current_level"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_send_skips_when_candidate_oversize_for_probe_level() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+        // Level 4's budget is 178 bytes; level 5 (the probe target at offset 1)
+        // is only 158 -- a real dip in `max_payload_for_level`. A payload in
+        // between fits at the current level but not at the probe level.
+        event_loop.rate_loop =
+            RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 4).with_probing(1, 1);
+
+        let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
+        event_loop.set_audio_out(producer);
+
+        let oversize_for_probe = vec![0u8; 170];
+        event_loop.tx_queue.push_back((Some(0), oversize_for_probe));
+        event_loop.try_drain_tx_queue().await;
+
+        assert_eq!(
+            event_loop.probe_state, None,
+            "an oversize probe candidate must fall back to a normal send, not become a probe"
+        );
+        assert_eq!(event_loop.engine.speed_level(), 4);
+    }
+
+    #[tokio::test]
+    async fn non_arq_send_is_never_a_probe_candidate() {
+        let config = DaemonConfig::default(); // arq_enabled = false by default
+        let mut event_loop = EventLoop::new(config).unwrap();
+        event_loop.rate_loop =
+            RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 1).with_probing(1, 1);
+
+        let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
+        event_loop.set_audio_out(producer);
+
+        event_loop
+            .tx_queue
+            .push_back((None, b"plain data".to_vec()));
+        event_loop.try_drain_tx_queue().await;
+
+        assert_eq!(event_loop.probe_state, None);
+        assert_eq!(event_loop.engine.speed_level(), 1);
     }
 
     #[tokio::test]
