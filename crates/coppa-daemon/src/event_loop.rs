@@ -80,6 +80,12 @@ pub struct EventLoop {
     /// Next TX sequence number for transport PDUs.
     #[allow(dead_code)] // used when ARQ TX path sends segmented frames
     arq_next_seq: u8,
+    /// At most one active-overshoot probe outstanding at a time: `(seq,
+    /// probed_level)`. `None` when no probe is in flight. Only ever set/read
+    /// when ARQ is enabled -- see `docs/superpowers/specs/
+    /// 2026-07-25-rateloop-daemon-probe-wiring-design.md`.
+    #[allow(dead_code)] // used by Tasks 4-6
+    probe_state: Option<(u8, u8)>,
     /// Optional WebSocket broadcast sender for forwarding decoded data.
     #[cfg(feature = "websocket")]
     ws_broadcast: Option<tokio::sync::broadcast::Sender<String>>,
@@ -212,6 +218,19 @@ impl EventLoop {
             config.audio.sample_rate as f32,
         );
 
+        // Active overshoot probing (see `docs/superpowers/specs/
+        // 2026-07-25-rateloop-daemon-probe-wiring-design.md`) is off by
+        // default -- `rate_loop_probe_interval == 0` matches
+        // `RateLoop::with_probing`'s own "0 disables" convention.
+        let rate_loop = if config.engine.rate_loop_probe_interval > 0 {
+            RateLoop::default_coppa().with_probing(
+                config.engine.rate_loop_probe_interval,
+                config.engine.rate_loop_probe_offset,
+            )
+        } else {
+            RateLoop::default_coppa()
+        };
+
         Ok(Self {
             config,
             engine,
@@ -228,8 +247,9 @@ impl EventLoop {
             arq_tx,
             arq_rx,
             arq_session_id: 0,
-            rate_loop: RateLoop::default_coppa(),
+            rate_loop,
             arq_next_seq: 0,
+            probe_state: None,
             #[cfg(feature = "websocket")]
             ws_broadcast: None,
             #[cfg(feature = "websocket")]
@@ -1701,6 +1721,47 @@ mod tests {
             EventLoop::new(config).is_err(),
             "EventLoop::new should fail loudly on an unrecognized ptt_method"
         );
+    }
+
+    #[test]
+    fn new_wires_probe_config_into_rate_loop() {
+        let mut config = DaemonConfig::default();
+        config.engine.rate_loop_probe_interval = 3;
+        config.engine.rate_loop_probe_offset = 1;
+        let mut event_loop = EventLoop::new(config).unwrap();
+
+        // RateLoop::default_coppa() starts at level 1 (idx 0); offset 1 steps
+        // to idx 1 = level 2. Probe should trigger on the 3rd call.
+        assert_eq!(
+            event_loop.rate_loop.level_for_next_transmission(),
+            (1, false)
+        );
+        assert_eq!(
+            event_loop.rate_loop.level_for_next_transmission(),
+            (1, false)
+        );
+        assert_eq!(
+            event_loop.rate_loop.level_for_next_transmission(),
+            (2, true)
+        );
+    }
+
+    #[test]
+    fn new_defaults_to_probing_disabled() {
+        let config = DaemonConfig::default();
+        let mut event_loop = EventLoop::new(config).unwrap();
+        for _ in 0..20 {
+            assert_eq!(
+                event_loop.rate_loop.level_for_next_transmission(),
+                (1, false)
+            );
+        }
+    }
+
+    #[test]
+    fn new_starts_with_no_probe_outstanding() {
+        let event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        assert_eq!(event_loop.probe_state, None);
     }
 
     #[tokio::test]
