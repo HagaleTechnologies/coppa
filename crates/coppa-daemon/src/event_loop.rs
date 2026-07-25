@@ -483,12 +483,20 @@ impl EventLoop {
                 _ => (self.rate_loop.current_level(), false),
             };
 
-            // Apply the chosen level unconditionally: for a probe this is the
-            // probed (higher) level; otherwise it's just `rate_loop`'s current
-            // steady-state level, which the encoder must be kept in sync with
-            // for every fresh send (not only when actually probing).
-            if let Err(e) = self.engine.set_speed_level(level) {
-                tracing::warn!(error = %e, "Failed to apply speed level for queued TX frame");
+            // Apply the chosen level: for a probe this is the probed (higher)
+            // level; otherwise it's just `rate_loop`'s current steady-state
+            // level, which the encoder must be kept in sync with for every
+            // fresh send (not only when actually probing). Guarded against
+            // the common case where `level` already matches the engine's
+            // current speed level -- `CoppaCore::set_speed_level` does a full
+            // `reconfigure` (rebuilds the transceiver and streaming receiver)
+            // every time, so calling it unconditionally on every fresh send
+            // is real, avoidable per-frame cost whenever the level hasn't
+            // actually changed.
+            if self.engine.speed_level() != level {
+                if let Err(e) = self.engine.set_speed_level(level) {
+                    tracing::warn!(error = %e, "Failed to apply speed level for queued TX frame");
+                }
             }
 
             match self.engine.encode_bytes(&data) {
