@@ -1524,15 +1524,43 @@ impl EventLoop {
         let mut retransmit_pdus: Vec<(u8, Vec<u8>)> = Vec::new();
         if let Some(ref mut arq_tx) = self.arq_tx {
             let retransmit_seqs = arq_tx.get_retransmits(now);
-            // One timeout EVENT (any number of expired segments in this single
-            // poll) maps to exactly one `RateLoop::on_timeout` call, matching
-            // `get_retransmits`'s own documented one-call-per-event contract.
-            if !retransmit_seqs.is_empty() {
+
+            // If the tracked probe's seq is among the expired seqs, it
+            // resolves as a FAILED active overshoot probe -- an ordinary
+            // ARQ-retransmitted loss (the retransmit loop below still resends
+            // it normally, at whatever level `current_level()` now is), but
+            // must not itself drop RateLoop's idx the way a genuine passive
+            // timeout does (`on_probe_result`'s failure path is a no-op by
+            // design). See `docs/superpowers/specs/
+            // 2026-07-25-rateloop-daemon-probe-wiring-design.md`.
+            let probe_failed_seq = self
+                .probe_state
+                .filter(|&(seq, _)| retransmit_seqs.contains(&seq))
+                .map(|(seq, _)| seq);
+            if let Some((seq, level)) = self.probe_state {
+                if Some(seq) == probe_failed_seq {
+                    self.rate_loop.on_probe_result(level, false);
+                    self.probe_state = None;
+                }
+            }
+
+            // One timeout EVENT (any number of expired NON-PROBE segments in
+            // this single poll) maps to exactly one `RateLoop::on_timeout`
+            // call, matching `get_retransmits`'s own documented
+            // one-call-per-event contract. If the ONLY expired seq this poll
+            // was the probe (already handled above), no `on_timeout` call
+            // happens at all.
+            let other_timeouts = retransmit_seqs
+                .iter()
+                .filter(|&&s| Some(s) != probe_failed_seq)
+                .count();
+            if other_timeouts > 0 {
                 self.rate_loop.on_timeout();
                 if let Err(e) = self.engine.set_speed_level(self.rate_loop.current_level()) {
                     tracing::warn!(error = %e, "Failed to apply RateLoop's recommended speed level after timeout");
                 }
             }
+
             for seq in retransmit_seqs {
                 if let Some(data) = arq_tx.get_segment_data(seq) {
                     let pdu =
@@ -2608,6 +2636,74 @@ mod tests {
             "two segments expiring in the same poll should drop RateLoop by \
              exactly ONE step (5 -> 4), not one step per expired segment \
              (which would read as 3)"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_timeout_alone_resolves_as_failed_probe_without_on_timeout() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+
+        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 5);
+        assert_eq!(event_loop.rate_loop.current_level(), 5);
+
+        let arq_config = ArqConfig::new(8, 5, Duration::from_millis(20))
+            .expect("window_size=8 is within 1..=MAX_WINDOW_SIZE");
+        let mut arq_tx = ArqTx::new(arq_config);
+        let send_time = Instant::now() - Duration::from_millis(100);
+        let seq = arq_tx
+            .send(b"probed segment".to_vec(), send_time)
+            .expect("a fresh ARQ window should have room");
+        event_loop.arq_tx = Some(arq_tx);
+        event_loop.probe_state = Some((seq, 9)); // pretend we probed up to level 9
+
+        event_loop.check_arq_retransmits().await;
+
+        assert_eq!(
+            event_loop.probe_state, None,
+            "the failed probe should be resolved and cleared"
+        );
+        assert_eq!(
+            event_loop.rate_loop.current_level(),
+            5,
+            "a failed probe must NOT drop RateLoop's current_level \
+             (on_probe_result's no-op-on-failure rule) -- only a genuine \
+             on_timeout would"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_timeout_alongside_other_expired_segment_still_calls_on_timeout_once() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+
+        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 5);
+        assert_eq!(event_loop.rate_loop.current_level(), 5);
+
+        let arq_config = ArqConfig::new(8, 5, Duration::from_millis(20))
+            .expect("window_size=8 is within 1..=MAX_WINDOW_SIZE");
+        let mut arq_tx = ArqTx::new(arq_config);
+        let send_time = Instant::now() - Duration::from_millis(100);
+        let probe_seq = arq_tx
+            .send(b"probed segment".to_vec(), send_time)
+            .expect("a fresh ARQ window should have room");
+        arq_tx
+            .send(b"ordinary segment".to_vec(), send_time)
+            .expect("a fresh ARQ window should have room for a second segment");
+        event_loop.arq_tx = Some(arq_tx);
+        event_loop.probe_state = Some((probe_seq, 9));
+
+        event_loop.check_arq_retransmits().await;
+
+        assert_eq!(event_loop.probe_state, None);
+        assert_eq!(
+            event_loop.rate_loop.current_level(),
+            4,
+            "the OTHER expired segment is a genuine passive timeout -- on_timeout \
+             should still fire exactly once (5 -> 4), separate from the probe's \
+             own resolution"
         );
     }
 
