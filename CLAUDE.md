@@ -132,8 +132,32 @@ limitation elsewhere in this list, though not confirmed as the same root cause),
 design doc `docs/superpowers/specs/2026-07-24-rateloop-bounded-drop-leaky-raise-design.md`'s
 "Outcome" section. **The real next lever is therefore believed to be improving the underlying
 per-frame recommendation
-signal's quality/stability during fast fading, not further hysteresis-mechanism tuning** — not yet
-designed.
+signal's quality/stability during fast fading, not further hysteresis-mechanism tuning.** **A
+follow-up diagnostic (2026-07-24, same session, no code shipped) narrowed this down further, and
+ruled out the most obvious first guess.** Two quick measurements (an ad-hoc, uncommitted diagnostic
+example, not a permanent bench) were run over the same `closed_loop_arq` schedule's Watterson-fading
+tail (frames 200-299): (1) frame-to-frame correlation of the *oracle's* true best-achievable level
+between consecutive frames is only 0.144 — the channel really is close to decorrelated frame-to-frame
+here, which rules out temporal smoothing/averaging of the recommendation across recent frames as a
+fix (it would mostly average in stale, already-irrelevant readings); (2) same-frame correlation
+between `recommend_speed_level`'s output and the oracle's true best level for that *same* frame, when
+probed via a level-1 (BPSK) transmission, is only 0.241 — a real same-frame accuracy problem, not a
+timing/lag problem. A follow-up sweep of the probing level (reusing `closed_loop_arq`'s own
+fixed-level-run data, no new transmissions) found this same-frame correlation rises cleanly with
+probe modulation order — L1 0.241, L3 0.364, L5 0.526, L6 0.639 (all well-sampled, 38-95/100 tail
+frames) — confirming `channel_capacity`/`channel_selectivity`'s documented "mode-independent because
+nv is pilot-derived" design assumption does not hold at the resolution this bench needs: a
+low-order-modulation frame's pilots genuinely carry less information about whether a high-order mode
+would decode. But this comes bundled with why `RateLoop` can't just exploit it passively: the sample
+size collapses as probe level rises (L1 95/100 -> L6 38/100 -> L9 14/100) because higher-order frames
+increasingly fail to decode at all — precisely when the channel is bad, which is exactly when
+`RateLoop` is pinned low and would most need the better signal. Getting a more accurate reading this
+way isn't free measurement-layer tuning; it looks like it requires *active* probing (periodically
+transmitting above the current level, trading airtime/decode-failure risk for signal quality) — a
+materially different, larger-scoped kind of change than every fix attempted on this bench so far
+(all purely receiver-side/measurement-layer, explicitly zero-extra-airtime by design, per
+`closed_loop_arq.rs`'s own module doc). Not yet designed; deliberately left for a fresh cycle given
+the scope jump.
 - **Multi-codeword frames (Phase 3 Task 5) do not extend ACK addressing, turbo re-estimation, or persistent IR-HARQ combining to the per-codeword level.** A multi-codeword frame is retransmitted, if at all, as a whole (same `seq`, cycling RV via the existing mechanism) rather than by `(seq, codeword-index)`; turbo re-estimation and IR-HARQ's persistent cross-retransmission LLR accumulator are both scoped to `codewords <= 1` only, taking the exact pre-Task-5 decode path. These are real, deliberate scope cuts (not oversights) — see `docs/adr/007-multi-codeword-frames.md` (decisions 4-5) for the full reasoning
 - **Decision 4's block-ACK cadence (Phase 3 Task 2) was never implemented.** The plan called for batching ACKs to once per received burst boundary or every 2 frames rather than one ACK per decoded frame; this sub-decision has no corresponding code (confirmed via grep across `arq.rs`/`transport.rs`) — every decoded frame still triggers its own ACK today. Does not compromise correctness (more ACKs than strictly necessary is airtime-inefficient, not incorrect), but is a real, previously-undocumented gap against the plan's literal text. See `docs/adr/008-phase3-system-layer.md` (decision 4)
 - **The Phase 3 benchmark program (Task 8: `milstd`, `session`) does not clear its own acceptance targets, and both gaps are honestly measured rather than hidden.** `milstd` (`cargo run -p coppa-bench --release --example milstd`) passes 0 of 27 MIL-STD-188-110-style operating points, even with a generous +12 dB margin over the reference SNR — root-caused to the ladder's borrowed reference SNRs not transferring onto Coppa's own measured thresholds on any channel, including Good (not a fading-specific bug, though the already-tracked Watterson-Moderate/Poor channel-estimation gap below is a real, additional contributing factor for those specific rows). `session` (10-minute simulated ARQ sessions via the real `ArqTx`/`ArqRx` state machines) completes drop-free on only 3/5 Good, 0/5 Moderate, and 0/5 Poor sessions against a "zero drops on good/moderate" target — root-caused to level 2's real Good-preset FER not being zero even above its nominal threshold (~8-12% at 12 dB, ~2% by 18 dB), so a sustained low-SNR ramp trough can exhaust the ARQ's bounded retransmit budget on a non-trivial fraction of trials (not an ARQ state-machine bug). Level 9 (64-QAM 2/3) separately shows an unusually high, steep, and strongly seed-dependent AWGN SNR requirement (a real waterfall, not an SNR-independent floor, per a corrected re-measurement) that never converges at all under any tested Watterson fading up to 54 dB — worth its own future investigation. See `BENCHMARKS.md`'s "Phase 3 Task 8" section and `docs/adr/008-phase3-system-layer.md` (decision 9) for the complete, twice-corrected diagnosis
