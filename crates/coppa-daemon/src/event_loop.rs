@@ -1167,6 +1167,15 @@ impl EventLoop {
                                         // Reset ARQ state
                                         self.arq_tx = Some(ArqTx::new(ArqConfig::default()));
                                         self.arq_rx = Some(ArqRx::new(8));
+                                        // A Reset restarts ARQ sequence numbering from 0,
+                                        // so any outstanding probe's tracked seq is no
+                                        // longer meaningful: leaving it set could either
+                                        // permanently block future probing (if its seq is
+                                        // never reused) or cause a later, unrelated fresh
+                                        // segment that happens to reuse the same seq to be
+                                        // spuriously resolved as a "successful probe" via
+                                        // `resolve_probe_if_acked`.
+                                        self.probe_state = None;
                                         Vec::new()
                                     }
                                 }
@@ -2602,6 +2611,51 @@ mod tests {
              suggested_rate must NOT also apply for the same ACK event"
         );
         assert_eq!(event_loop.engine.speed_level(), 6);
+    }
+
+    /// Whole-branch review Fix 2: a `TransportType::Reset` rebuilds `arq_tx`/
+    /// `arq_rx` fresh (restarting ARQ sequence numbering from 0) but must also
+    /// clear any outstanding `probe_state` -- otherwise a stale probe's seq
+    /// could either permanently block future probing or be spuriously
+    /// resolved by an unrelated later segment that happens to reuse the same
+    /// seq number. Drives a real wire-encoded `TransportPdu::new_reset` through
+    /// `decode_and_dispatch_audio` (the real `TransportType::Reset` code path),
+    /// following the same encode/decode boilerplate as
+    /// `probe_ack_resolves_probe_and_skips_normal_on_ack_for_the_same_event`.
+    #[tokio::test]
+    async fn reset_clears_outstanding_probe_state() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+        event_loop.arq_rx = Some(ArqRx::new(8));
+        event_loop.probe_state = Some((3, 6)); // pretend a probe is outstanding
+
+        let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
+        let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
+        let reset_pdu = TransportPdu::new_reset(0);
+        let header = coppa_codec::ofdm::frame::CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: coppa_codec::ofdm::frame::CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: reset_pdu.to_bytes().len() as u16,
+            codewords: 1,
+        };
+        let samples = peer_tx
+            .transmit(&header, &reset_pdu.to_bytes())
+            .expect("peer transmit should succeed");
+        event_loop
+            .decode_and_dispatch_audio(&with_lead_and_trail(&samples))
+            .await;
+
+        assert_eq!(
+            event_loop.probe_state, None,
+            "a Reset must clear any outstanding probe_state, not just rebuild arq_tx/arq_rx"
+        );
     }
 
     /// Bonus regression test (Task 4 review finding): `check_arq_retransmits`
