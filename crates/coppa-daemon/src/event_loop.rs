@@ -99,9 +99,12 @@ pub struct EventLoop {
     /// Wired by `main.rs` from `VaraServer::response_senders()`.
     vara_responses: Option<VaraResponseSenders>,
     /// Outbound raw payload bytes queued for encode+transmit (the primary
-    /// raw/ARQ `HostEvent::DataReceived` TX path). `VaraResponse::Buffer` telemetry
-    /// reports this queue's length on every push/pop.
-    tx_queue: VecDeque<Vec<u8>>,
+    /// raw/ARQ `HostEvent::DataReceived` TX path), tagged with the ARQ seq
+    /// number assigned by `ArqTx::send` when this entry came from the
+    /// ARQ-enabled path (`None` otherwise -- non-ARQ sends are never probe
+    /// candidates). `VaraResponse::Buffer` telemetry reports this queue's
+    /// length on every push/pop.
+    tx_queue: VecDeque<(Option<u8>, Vec<u8>)>,
     /// Spectral-occupancy busy gate (decision 8: `BUSY ON`/`OFF` telemetry), fed
     /// raw incoming audio in `handle_audio_in`.
     busy_gate: BusyGate,
@@ -414,8 +417,8 @@ impl EventLoop {
     /// Push one raw payload onto the outbound TX queue, emit the resulting
     /// `BUFFER` telemetry, and attempt to start transmitting immediately if the
     /// link is currently idle. See `tx_queue`'s field doc and `try_drain_tx_queue`.
-    async fn enqueue_tx(&mut self, data: Vec<u8>) {
-        self.tx_queue.push_back(data);
+    async fn enqueue_tx(&mut self, seq: Option<u8>, data: Vec<u8>) {
+        self.tx_queue.push_back((seq, data));
         self.emit_vara(VaraResponse::Buffer(self.tx_queue.len()))
             .await;
         self.try_drain_tx_queue().await;
@@ -429,7 +432,7 @@ impl EventLoop {
         if self.is_transmitting {
             return;
         }
-        if let Some(data) = self.tx_queue.pop_front() {
+        if let Some((_seq_opt, data)) = self.tx_queue.pop_front() {
             self.emit_vara(VaraResponse::Buffer(self.tx_queue.len()))
                 .await;
             match self.engine.encode_bytes(&data) {
@@ -663,7 +666,7 @@ impl EventLoop {
 
                 // Fall through: no session — use raw/ARQ encode path
                 // E6: If ARQ is enabled, wrap data in a TransportPdu before encoding
-                let tx_bytes = if self.config.engine.arq_enabled {
+                let (seq_opt, tx_bytes) = if self.config.engine.arq_enabled {
                     if let Some(ref mut arq_tx) = self.arq_tx {
                         let now = Instant::now();
                         match arq_tx.send(data.clone(), now) {
@@ -674,7 +677,7 @@ impl EventLoop {
                                     0, // ack_num filled by ARQ layer
                                     data.clone(),
                                 );
-                                pdu.to_bytes()
+                                (Some(seq), pdu.to_bytes())
                             }
                             Err(e) => {
                                 tracing::warn!(client_id, error = %e, "ARQ window full; dropping TX");
@@ -682,15 +685,18 @@ impl EventLoop {
                             }
                         }
                     } else {
-                        data.clone()
+                        (None, data.clone())
                     }
                 } else {
-                    data.clone()
+                    (None, data.clone())
                 };
 
                 // Queue for encode+transmit (Task 7: BUFFER telemetry tracks this
-                // queue's depth; see `enqueue_tx`/`try_drain_tx_queue`).
-                self.enqueue_tx(tx_bytes).await;
+                // queue's depth; see `enqueue_tx`/`try_drain_tx_queue`). `seq_opt`
+                // is `Some` only for a fresh ARQ-tracked segment -- used by active
+                // overshoot probing (`RateLoop::level_for_next_transmission`) to
+                // attribute a probe's later outcome back to its ACK/timeout.
+                self.enqueue_tx(seq_opt, tx_bytes).await;
             }
             HostEvent::VaraCommand { client_id, command } => {
                 tracing::debug!(client_id, command = %command, "VARA command received");
@@ -1762,6 +1768,20 @@ mod tests {
     fn new_starts_with_no_probe_outstanding() {
         let event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
         assert_eq!(event_loop.probe_state, None);
+    }
+
+    #[tokio::test]
+    async fn enqueue_tx_carries_optional_arq_seq_through_the_queue() {
+        let config = DaemonConfig::default();
+        let mut event_loop = EventLoop::new(config).unwrap();
+        event_loop.is_transmitting = true; // block draining so the queue can be inspected
+
+        event_loop.enqueue_tx(None, b"no-seq".to_vec()).await;
+        event_loop.enqueue_tx(Some(7), b"has-seq".to_vec()).await;
+
+        let queued: Vec<_> = event_loop.tx_queue.iter().cloned().collect();
+        assert_eq!(queued[0], (None, b"no-seq".to_vec()));
+        assert_eq!(queued[1], (Some(7), b"has-seq".to_vec()));
     }
 
     #[tokio::test]
@@ -2870,9 +2890,9 @@ mod tests {
                 connect_mock_vara_client(&mut event_loop, 19420, 19421).await;
 
             event_loop.is_transmitting = true;
-            event_loop.enqueue_tx(b"frame1".to_vec()).await;
-            event_loop.enqueue_tx(b"frame2".to_vec()).await;
-            event_loop.enqueue_tx(b"frame3".to_vec()).await;
+            event_loop.enqueue_tx(None, b"frame1".to_vec()).await;
+            event_loop.enqueue_tx(None, b"frame2".to_vec()).await;
+            event_loop.enqueue_tx(None, b"frame3".to_vec()).await;
             assert_eq!(event_loop.tx_queue.len(), 3);
 
             event_loop.is_transmitting = false;
