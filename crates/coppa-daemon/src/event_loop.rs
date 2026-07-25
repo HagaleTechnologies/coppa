@@ -2666,6 +2666,71 @@ mod tests {
         );
     }
 
+    /// Whole-branch review Fix 4: `resolve_probe_if_acked` is also called from
+    /// the `TransportType::Reliable | Unreliable` branch (a piggybacked ACK
+    /// riding on an incoming DATA frame's own `ack_num`/`ack_bitmap`), not just
+    /// the standalone `Ack | Nak` branch already covered by
+    /// `probe_ack_resolves_probe_and_skips_normal_on_ack_for_the_same_event`.
+    /// Seeds `probe_state`, then sends a real wire-encoded
+    /// `TransportPdu::new_reliable` whose `ack_num` cumulatively acks the
+    /// probed seq, through `decode_and_dispatch_audio`, and asserts the probe
+    /// resolves. Uses `arq_receive_transmits_a_real_ack_with_rate`'s
+    /// `Reliable`-PDU construction as a template.
+    #[tokio::test]
+    async fn probe_resolves_via_piggybacked_ack_on_reliable_data_frame() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        let mut arq_tx = ArqTx::new(ArqConfig::default());
+        let seq = arq_tx
+            .send(b"probed segment".to_vec(), Instant::now())
+            .expect("a fresh ARQ window should have room");
+        event_loop.arq_tx = Some(arq_tx);
+        event_loop.arq_rx = Some(ArqRx::new(8));
+        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 1);
+        event_loop.probe_state = Some((seq, 6)); // pretend we probed up to level 6
+
+        let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
+        event_loop.set_audio_out(producer);
+
+        // Peer sends a Reliable DATA frame (not a standalone Ack/Nak) whose
+        // own ack_num cumulatively acks the probed seq -- the piggybacked-ack
+        // path, driven through the `Reliable | Unreliable` match arm.
+        let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
+        let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
+        let data_pdu =
+            TransportPdu::new_reliable(5, 9, seq.wrapping_add(1), b"incoming data".to_vec());
+        let header = coppa_codec::ofdm::frame::CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: coppa_codec::ofdm::frame::CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: data_pdu.to_bytes().len() as u16,
+            codewords: 1,
+        };
+        let samples = peer_tx
+            .transmit(&header, &data_pdu.to_bytes())
+            .expect("peer transmit should succeed");
+        event_loop
+            .decode_and_dispatch_audio(&with_lead_and_trail(&samples))
+            .await;
+
+        assert_eq!(
+            event_loop.probe_state, None,
+            "the probe should be resolved and cleared via the piggybacked ack on \
+             an incoming Reliable data frame, not just the standalone Ack/Nak path"
+        );
+        assert_eq!(
+            event_loop.rate_loop.current_level(),
+            6,
+            "on_probe_result's jump to the probed level must apply"
+        );
+        assert_eq!(event_loop.engine.speed_level(), 6);
+    }
+
     /// Bonus regression test (Task 4 review finding): `check_arq_retransmits`
     /// must call `RateLoop::on_timeout` exactly ONCE per poll, no matter how
     /// many segments expired together in that single `ArqTx::get_retransmits`
