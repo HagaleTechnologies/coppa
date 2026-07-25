@@ -202,6 +202,18 @@ pub struct EngineSection {
     pub grid: Option<String>,
     /// Enable ARQ (Automatic Repeat reQuest) transport layer.
     pub arq_enabled: bool,
+    /// Frames between `coppa_ml::RateLoop` active overshoot probes (see
+    /// `RateLoop::with_probing`). `0` (the default) disables probing entirely --
+    /// an explicit opt-in, matching how `CpGate`'s daemon wiring is also still
+    /// deferred/off by default. Only takes effect when `arq_enabled` is also
+    /// `true` -- probing needs the ARQ ACK/timeout feedback loop to attribute a
+    /// probe's outcome. See `docs/superpowers/specs/
+    /// 2026-07-25-rateloop-daemon-probe-wiring-design.md`.
+    pub rate_loop_probe_interval: u32,
+    /// Index-steps up the speed-level ladder a probe reaches for (see
+    /// `RateLoop::with_probing`'s `probe_offset`). Ignored when
+    /// `rate_loop_probe_interval == 0`.
+    pub rate_loop_probe_offset: usize,
 }
 
 /// Busy-channel courtesy / station-ID timer / beacon-mode configuration
@@ -302,6 +314,8 @@ impl Default for EngineSection {
             callsign: String::new(),
             grid: None,
             arq_enabled: false,
+            rate_loop_probe_interval: 0,
+            rate_loop_probe_offset: 0,
         }
     }
 }
@@ -386,6 +400,28 @@ callsign = "VK2ABC"
         assert_eq!(config.radio.ptt_method, "rigctld");
         assert!(config.host.websocket_enabled);
         assert_eq!(config.engine.callsign, "VK2ABC");
+    }
+
+    #[test]
+    fn test_rate_loop_probing_defaults_to_disabled() {
+        let config = DaemonConfig::default();
+        assert_eq!(
+            config.engine.rate_loop_probe_interval, 0,
+            "active overshoot probing must be off by default"
+        );
+        assert_eq!(config.engine.rate_loop_probe_offset, 0);
+    }
+
+    #[test]
+    fn test_rate_loop_probing_toml_override() {
+        let toml = r#"
+[engine]
+rate_loop_probe_interval = 2
+rate_loop_probe_offset = 1
+"#;
+        let config: DaemonConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.engine.rate_loop_probe_interval, 2);
+        assert_eq!(config.engine.rate_loop_probe_offset, 1);
     }
 
     // ── StationIdConfig defaults (Phase 4 Task 3) ─────────────────────
