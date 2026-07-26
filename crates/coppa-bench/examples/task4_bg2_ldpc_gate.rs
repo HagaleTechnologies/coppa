@@ -325,12 +325,21 @@ fn new_ofdm_trial(
         .expect("payload within this level's capacity");
     let faded = watterson(&clean, 48_000.0, &WattersonPreset::Poor.config(), seed);
     let noisy = coppa_channel::awgn_seeded(&faded, snr_db, seed ^ 0x5A5A);
-    match tx.receive(&noisy) {
+    let ok = match tx.receive(&noisy) {
         Ok((rx_header, rx_payload, _rec_level)) => {
             rx_header.speed_level == level && rx_payload[..payload.len()] == payload[..]
         }
         Err(_) => false,
-    }
+    };
+    // Every trial here is an independent random-payload draw sharing seq_num 0
+    // on one `tx` reused across `trials` calls (see `ofdm_fer_at`) -- not a
+    // real retransmission. Evict unconditionally so a trial that genuinely
+    // fails to converge (expected near this level's threshold) can't corrupt
+    // the next trial's IR-HARQ accumulator. See coppa-bench's
+    // `runner.rs::ascending_sweep_low_snr_failure_does_not_poison_later_high_snr_trials`
+    // for the bug this mirrors.
+    tx.harq_evict(0);
+    ok
 }
 
 fn ofdm_fer_at(level: u8, new_codec: bool, snr_db: f32, trials: usize, payload: &[u8]) -> f64 {

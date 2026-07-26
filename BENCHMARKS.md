@@ -731,7 +731,7 @@ bug (per-trial logs show sessions surviving well into the low-SNR stretch before
 Moderate's all-5-drop result is consistent with the separately-documented Watterson-Moderate
 channel-estimation regression.
 
-### Golden vectors: 20 WAVs + manifest, 1 intentional documented failure as a regression tripwire
+### Golden vectors: 20 WAVs + manifest, all 20 expected to decode
 
 `crates/coppa-bench/examples/golden_vectors_gen.rs` generates 20 combinations (levels {1, 2, 5,
 6, 9} × channels {clean, awgn@12dB, poor@25dB, ssb+cfo}) as 48 kHz/16-bit-PCM WAVs +
@@ -740,19 +740,19 @@ seed-searched (up to 500 attempts) to a payload the current codec actually decod
 that operating point. `crates/coppa-protocol/tests/golden_vectors.rs` (a new integration test,
 part of `cargo test --workspace`) decodes all 20 and asserts against the manifest.
 
-19 of 20 vectors are expected to decode successfully and do. **`L9_awgn12` needed a
-non-literal operating point** (30 dB, not the brief's literal 12 dB — level 9's 100%-frame-loss
-region at low SNR, confirmed by direct sweeps) and is not a comfortably-passing, representative
-operating point even at 30 dB (most random payloads at that SNR still fail; the generator's
-seed-search happens to land on one that decodes) — flagged as a real, not-yet-closed
-follow-up (a higher, ~53+ dB point looks more promising per the `milstd` seed-424242 data, but
-wasn't fully explored). **`L9_poor25` is committed with `expected_decode_ok = false`** — level 9
-under Watterson fading is structurally undecodable at any tested SNR (confirmed to 54 dB, even
-under the mildest Good preset), so rather than silently drop this combination or fake a pass, it
-is generated anyway and the integration test asserts the manifest's documented failure
-expectation. This is a deliberate regression/regression-fix tripwire: if a future
-channel-estimation fix ever makes this decode, the test will flag the manifest as stale, which is
-useful to notice.
+**UPDATE (2026-07-26): the original characterization below (19/20, `L9_poor25` "structurally
+undecodable") was itself the same stale-IR-HARQ-accumulator bench bug found and fixed in
+`runner.rs` (see the `milstd` section's UPDATE above and PR #61)** — this generator's seed-search
+loop had the identical vulnerable shape (one reused `CoppaTransceiver`, hardcoded `seq_num: 0`,
+across up to 500 attempts with no eviction between them), so an early failed attempt could poison
+every later one at that seq. Fixed the same way and re-measured directly: level 9's real AWGN
+threshold is an ordinary ~18-21 dB (not "30 dB, still mostly failing"), and Watterson Poor is
+genuinely bad but **not** zero — 86-91% FER at 25 dB, i.e. a real ~9-14% success rate, easily
+enough for a 500-attempt search to find. All 20 combinations, including `L9_poor25`, now decode
+and are committed with `expected_decode_ok = true`; `LEVEL9_AWGN_SNR_DB`/`LEVEL9_SSBCFO_SNR_DB`
+are corrected from 30/33 dB down to 24 dB. See `golden_vectors_gen.rs`'s module doc for the full
+corrected diagnosis. The underlying Watterson-Poor weakness itself is real and not fixed by this —
+just no longer mischaracterized as absolute.
 
 ## 2026-07 — Phase 3 Task 4: closed-loop adaptive rate
 
@@ -2102,6 +2102,22 @@ this reaches **0.97 of oracle** (vs 0.91 for capacity alone), fixing both ambigu
 (0.66→1.00) and Good@24–30 dB (0.55→1.00). The residual ~3% is a Moderate-channel boundary effect (slight
 over-selection at the L6 threshold), not the channel-dependent ambiguity. Closed-loop ARQ feedback remains
 the further follow-on.
+
+**UPDATE (2026-07-26): all three headline oracle-ratio numbers in this section were measured on a
+bench with the same stale-IR-HARQ-accumulator bug found and fixed in `runner.rs` (see the `milstd`
+section's UPDATE above and PR #61) — `mcs_calibration.rs`, `mcs_compare.rs`, and
+`adaptive_mcs_validation.rs` all reused one `CoppaTransceiver` with hardcoded `seq_num: 0` across many
+trials per (level, channel, SNR) cell without evicting the IR-HARQ buffer between them, so an early
+trial's genuine failure could inflate that cell's measured FER by corrupting later, unrelated trials
+sharing the same seq.** Fixed the same way (unconditional `harq_evict` after every trial) and
+re-measured on the same held-out seed: **calibrated thresholds (C) = 0.741** (was 0.91), **2D selector
+(C, selectivity) = 0.828** (was 0.97), flat margin 2.5 = 0.598 (was 0.77); `adaptive_mcs_validation`'s
+own flat-margin-2.5 aggregate = **0.661** (was 0.83). The *relative* ordering and conclusion are
+unchanged (2D > calibrated > flat margin, by comparable margins), so the qualitative story in this
+section still holds — but every absolute oracle-ratio figure here was overstated by the same bug that
+affected `milstd`/level 9, and `SPEED_LEVEL_MIN_CAPACITY` (the static per-level table baked from
+`mcs_calibration`'s contaminated sweep) has not been recalibrated from clean data. Re-deriving that
+table is real, not-yet-done follow-up work — left for a future cycle rather than attempted here.
 
 ## The frame header was the dominant fading failure — now protected (Golay + CRC + 2D)
 

@@ -177,13 +177,16 @@ fn golden_vectors_rx_cli_decodes_and_prints_payloads() {
     );
 }
 
-/// Self-check: of the manifest's 20 vectors, 1 is a documented
-/// `expected_decode_ok = false` known failure, 2 are the documented
-/// `StreamingReceiver` sync-sensitivity gap (module doc), and the remaining
-/// 17 are exactly what `golden_vectors_rx_cli_decodes_and_prints_payloads`
-/// above actually exercises -- catches either exclusion list silently
-/// drifting out of sync with the manifest (e.g. a regenerated manifest
-/// changing which vectors exist).
+/// Self-check: of the manifest's 20 vectors, all 20 are `expected_decode_ok`
+/// (as of 2026-07-26 -- see `golden_vectors_gen.rs`'s module doc: the
+/// previous `L9_poor25` "structurally undecodable" classification was a
+/// stale-IR-HARQ-accumulator bench bug, fixed, and that vector now decodes
+/// like every other), 2 are the documented `StreamingReceiver`
+/// sync-sensitivity gap (module doc), and the remaining 18 are exactly what
+/// `golden_vectors_rx_cli_decodes_and_prints_payloads` above actually
+/// exercises -- catches either exclusion list silently drifting out of sync
+/// with the manifest (e.g. a regenerated manifest changing which vectors
+/// exist).
 #[test]
 fn test_rx_golden_vectors_cover_every_vector_exactly_once() {
     let manifest = read_manifest();
@@ -200,8 +203,8 @@ fn test_rx_golden_vectors_cover_every_vector_exactly_once() {
         .collect();
     assert_eq!(
         expected_ok.len(),
-        19,
-        "expected 19 known-good golden vectors"
+        20,
+        "expected 20 known-good golden vectors"
     );
 
     let known_gap_count = expected_ok
@@ -219,8 +222,8 @@ fn test_rx_golden_vectors_cover_every_vector_exactly_once() {
         .filter(|v| !is_known_streaming_receiver_gap(v.level, &v.channel))
         .count();
     assert_eq!(
-        covered, 17,
-        "expected 17 vectors actually covered by the rx CLI test"
+        covered, 18,
+        "expected 18 vectors actually covered by the rx CLI test"
     );
 
     for v in &expected_ok {

@@ -34,97 +34,69 @@
 //! have no multipath or out-of-band filtering, so they keep each level's
 //! normal profile routing.
 //!
-//! ## Level 9's exception, and why it's real (not a generator bug)
+//! ## Level 9's exception -- CORRECTED 2026-07-26 (was a bench bug, not a codec limitation)
 //!
-//! Level 9 (64QAM 2/3) needed real, DIFFERENT operating points than the
-//! literal 12 dB / 25 dB grid, verified with direct `coppa-bench` sweeps
-//! (not guessed) while building this generator:
+//! Level 9 (64QAM 2/3) previously needed non-literal operating points here,
+//! and `L9_poor25` was committed with `expected_decode_ok = false` as a
+//! documented "structurally undecodable at any SNR" case. **Both were wrong.**
+//! Root cause: this generator's seed-search loop reused one `CoppaTransceiver`
+//! (and hardcoded `seq_num: 0`) across up to `MAX_SEED_ATTEMPTS` attempts.
+//! `CoppaTransceiver`'s IR-HARQ receive-side LLR accumulator only evicts on a
+//! successful decode, so the first attempt that failed to converge (routine
+//! at a marginal operating point -- that's what a seed search is for) left
+//! its buffer un-evicted, and every subsequent attempt at that seq inherited
+//! the contamination -- cascading into "no seed in 500 attempts decoded" or
+//! "only seed N out of hundreds happened to work before the buffer was
+//! poisoned." This is the exact same bug found and fixed in
+//! `crates/coppa-bench/src/runner.rs` (see
+//! `ascending_sweep_low_snr_failure_does_not_poison_later_high_snr_trials`
+//! there); this generator's search loop had the identical vulnerable shape
+//! and just hadn't been checked.
 //!
-//! - **AWGN**: 100% frame loss at every SNR from 12-24 dB (3 kHz-referenced
-//!   convention, this crate's `awgn_ref_seeded`).
+//! Fixed by evicting the HARQ buffer unconditionally after every attempt
+//! (regardless of outcome), then re-measured level 9 directly (100-300
+//! trials/point, fresh transceiver + eviction per trial, bypassing this
+//! generator's seed-search framing entirely):
 //!
-//!   CORRECTED TWICE (two successive Task 8 reviews each caught an overclaim
-//!   here -- see git history for both): this does NOT "clear to FER=0 at
-//!   30 dB" as the original doc claimed, and it is also NOT an
-//!   "SNR-independent payload-dependent floor" as a first correction attempt
-//!   then claimed. Direct, finer-grained re-measurement (single-SNR-point
-//!   runs, one seed held fixed, `--trials 50`) shows a genuine noise-limited
-//!   waterfall -- just an unusually late and steep one, and strongly
-//!   seed-dependent. Seed 424242: 38/50 frame errors flat from 30 dB through
-//!   51 dB, then a sharp transition -- 1/50 at 52 dB, 0/50 at 53 dB and
-//!   above (a real waterfall confined to roughly a 1 dB window well above
-//!   where lower levels clear). Seed 8675309: already 0/50 at 30 dB (this
-//!   level's normal per-level 30 dB reference point simply happens to suit
-//!   this seed). Seed 20260709: 23/50 at 30 dB, dropping to 2/50 by
-//!   48-72 dB -- a partial waterfall down to a small (~4%) residual floor
-//!   that does look roughly SNR-independent past ~48 dB for that seed
-//!   specifically, but that is not evidence the whole level is
-//!   SNR-independent (seed 424242 shows SNR clearly matters, and matters
-//!   sharply).
+//! - **AWGN** (`vhf_wide`, this level's default profile): a completely
+//!   ordinary waterfall -- 100% FER at 12/15 dB (genuinely below threshold),
+//!   6% at 18 dB, then a clean 0% from 21-27 dB, 1% at 30 dB. Real threshold
+//!   is ~18-21 dB, not "30 dB and still mostly failing." `LEVEL9_AWGN_SNR_DB`
+//!   is corrected to 24 dB (comfortably clear, matching the margin other
+//!   levels' reference SNRs use).
+//! - **ssb+cfo** (`hf_standard` forced, 15 Hz CFO): even cleaner -- 0% FER
+//!   at every tested point from 18-33 dB. `LEVEL9_SSBCFO_SNR_DB` corrected
+//!   to 24 dB.
+//! - **Watterson Poor** (`hf_standard` forced, matching this combination's
+//!   profile override): genuinely bad, but NOT zero -- 86-91% FER at 25 dB
+//!   (100-300 trials), flat out to 54 dB. A ~9-14% real success rate is
+//!   easily enough for a 500-attempt seed search to find a decodable frame
+//!   (verified: it does). This IS a real, severe channel-estimation-class
+//!   gap for 64QAM under deep HF fading -- consistent with CLAUDE.md's
+//!   "Phase 2 channel estimation" and "Turbo re-estimation... concentrated
+//!   on low-order modulation" limitations -- just not the literal "0% at any
+//!   SNR" this doc previously claimed. `L9_poor25` is now generated like
+//!   every other combination (searched, decoded, `expected_decode_ok = true`)
+//!   rather than hand-classified as an unconditional failure.
 //!
-//!   The accurate characterization: level 9 needs an unusually high and
-//!   strongly seed/payload-dependent SNR to clear reliably, with at least
-//!   one sampled payload showing a real but very steep (~1 dB-wide)
-//!   transition rather than a gradual waterfall, and at least one other
-//!   sampled payload retaining a small residual floor at very high SNR.
-//!   `LEVEL9_AWGN_SNR_DB` (30 dB) is therefore NOT a "verified clean
-//!   operating point" in the sense the other levels' reference SNRs are --
-//!   most seeds still fail there -- but the seed search below (which varies
-//!   PAYLOADS at this fixed SNR, not SNR itself) reliably finds one of the
-//!   payloads that happens to sit on the "decodes" side of whatever this
-//!   level's transition looks like at 30 dB (this corpus's `L9_awgn12`
-//!   needed only 1 attempt). That committed seed is directly verified to
-//!   decode correctly and is frozen into a WAV file (no re-randomization at
-//!   test time), so it will not spontaneously flip on its own -- but 30 dB
-//!   sits in a regime with real seed-to-seed instability for this level, not
-//!   a comfortably-passing "typical" point, so a future numerical tweak to
-//!   the FEC/demod path is not guaranteed to leave it decoding. A stable,
-//!   comfortably-low-FER SNR was searched for (18-60 dB, multiple seeds) and
-//!   not reliably found across seeds -- a higher SNR (e.g. 53+ dB, per the
-//!   seed-424242 data above) looks more promising than 30 dB and was not
-//!   fully explored across more seeds here; re-deriving `LEVEL9_AWGN_SNR_DB`
-//!   at such a point is plausible future work, just not completed in this
-//!   pass. Root-causing why this level's transition sits so much higher and
-//!   steeper than the other levels' (plausibly connected to the
-//!   already-documented LDPC/turbo-re-estimation limitations in CLAUDE.md,
-//!   but not confirmed) is out of scope for this benchmark/golden-vector
-//!   task.
-//! - **Watterson Poor**: 100% frame loss at EVERY tested SNR up to 54 dB.
-//!   Re-tested under Watterson GOOD (the mildest fading preset) up to 48 dB:
-//!   still 100% frame loss. This is a genuine, structural, already-known-class
-//!   gap (see CLAUDE.md's "Phase 2 channel estimation" and "Turbo
-//!   re-estimation... concentrated on low-order modulation" limitations,
-//!   though this generator's direct measurement is a more extreme instance
-//!   than either of those entries states outright) -- 64QAM 2/3 order simply
-//!   does not survive this codec's current Watterson channel estimation at
-//!   ANY SNR, not something a different seed or a higher SNR fixes. Rather
-//!   than quietly drop this combination or fake a pass, `L9_poor25` is
-//!   generated anyway with `expected_decode_ok = false` and the exact
-//!   verified conditions recorded -- a real, honest regression tripwire: if a
-//!   future channel-estimation fix ever makes this decode, the integration
-//!   test will flag the manifest as stale (a good thing to notice).
-//! - **ssb+cfo**: no fading in this combination (AWGN + SSB passband + CFO
-//!   only), so once `hf_standard` is forced, it behaves like the AWGN case
-//!   above -- including, presumably, the same seed-dependent late/steep
-//!   transition described above (not independently re-swept to the same
-//!   depth as AWGN above, since the underlying mechanism appears shared).
-//!   `LEVEL9_SSBCFO_SNR_DB` is bumped accordingly, and its one committed seed
-//!   is directly verified to decode.
-//!
-//! This is not root-caused further here (out of scope for a benchmark/golden-
-//! vector task) -- see the module doc's citations for the pre-existing,
-//! related known limitations.
+//! Root-causing *why* level 9 specifically (vs. levels 1/2/5/6 here) is worse
+//! under Watterson Poor is still out of scope for this generator -- that part
+//! of the original diagnosis stands, just corrected from "impossible" to
+//! "real but not universal."
 //!
 //! ## Seed selection
 //!
-//! For combinations expected to decode, this generator searches a small,
-//! deterministic sequence of payload seeds (see `MAX_SEED_ATTEMPTS`) for one
-//! that this commit's codec actually decodes correctly at that operating
-//! point -- this is meant to be a KNOWN-GOOD regression corpus (a future
-//! regression is "this exact frame no longer decodes", not "we rolled dice
-//! and got unlucky at generation time"). The manifest records which seed (and
-//! how many attempts) each entry needed. For `L9_poor25` (expected to fail,
-//! see above), no search is performed -- the base seed is used directly.
+//! This generator searches a small, deterministic sequence of payload seeds
+//! (see `MAX_SEED_ATTEMPTS`) for one that this commit's codec actually
+//! decodes correctly at that operating point, for every combination
+//! (including `L9_poor25` as of the correction above) -- this is meant to be
+//! a KNOWN-GOOD regression corpus (a future regression is "this exact frame
+//! no longer decodes", not "we rolled dice and got unlucky at generation
+//! time"). The manifest records which seed (and how many attempts) each
+//! entry needed. A combination that exhausts `MAX_SEED_ATTEMPTS` without a
+//! clean decode is skipped with a warning rather than silently committed --
+//! see the bug this replaced above for why that skip condition itself needs
+//! a HARQ-buffer-eviction guarantee to be trustworthy.
 
 use std::path::PathBuf;
 
@@ -175,14 +147,16 @@ const DEFAULT_SSBCFO_SNR_DB: f32 = 20.0;
 /// +-50 Hz two-stage-acquisition tolerance (CLAUDE.md Known Limitations).
 const SSB_CFO_HZ: f32 = 15.0;
 
-/// Level 9's AWGN/ssb+cfo operating points (see module doc: the literal
-/// 12/20 dB grid values are structurally too low for 64QAM 2/3 -- 100% frame
-/// loss below ~24-30 dB). NOT "verified-clean" SNRs: per the module doc, this
-/// level's real waterfall sits much higher (and is strongly seed-dependent)
-/// than these values -- they just place the seed search where at least some
-/// payloads are known to decode, not where most payloads reliably do.
-const LEVEL9_AWGN_SNR_DB: f32 = 30.0;
-const LEVEL9_SSBCFO_SNR_DB: f32 = 33.0;
+/// Level 9's AWGN/ssb+cfo operating points. Corrected 2026-07-26 (see module
+/// doc's "Level 9's exception" section): the literal 12/20 dB grid values
+/// are still too low for 64QAM 2/3, but the level's real threshold is an
+/// ordinary ~18-21 dB AWGN / ~18 dB ssb+cfo -- NOT the ~30 dB "late, steep,
+/// seed-dependent waterfall" this generator previously (incorrectly)
+/// characterized. These values are comfortably above that real threshold
+/// (verified 0% FER over 100 trials at both), not marginal seed-search
+/// anchors.
+const LEVEL9_AWGN_SNR_DB: f32 = 24.0;
+const LEVEL9_SSBCFO_SNR_DB: f32 = 24.0;
 
 /// Deterministic payload seeds to try per combination before giving up.
 const MAX_SEED_ATTEMPTS: u64 = 500;
@@ -221,14 +195,6 @@ fn awgn_snr_for(level: u8, channel: Channel) -> f32 {
         (_, Channel::SsbCfo) => DEFAULT_SSBCFO_SNR_DB,
         (_, Channel::Clean) => f32::INFINITY,
     }
-}
-
-/// Combinations verified (module doc) to be structurally undecodable at ANY
-/// SNR this codec currently supports -- generated anyway (with
-/// `expected_decode_ok = false`) as an honest regression tripwire, not skipped
-/// and not seed-searched (there is nothing a different seed could fix).
-fn known_undecodable(level: u8, channel: Channel) -> bool {
-    matches!((level, channel), (9, Channel::Poor25))
 }
 
 /// Apply `channel` to `clean` (the TX signal) at `snr_db` (ignored for
@@ -325,11 +291,8 @@ fn main() {
                 h
             };
 
-            let undecodable = known_undecodable(level, channel);
-            let attempts_budget = if undecodable { 1 } else { MAX_SEED_ATTEMPTS };
-
             let mut found = None;
-            for attempt in 0..attempts_budget {
+            for attempt in 0..MAX_SEED_ATTEMPTS {
                 let seed = base_seed.wrapping_add(attempt);
                 let mut rng = StdRng::seed_from_u64(seed);
                 let payload: Vec<u8> = (0..payload_bytes).map(|_| rng.random::<u8>()).collect();
@@ -339,23 +302,29 @@ fn main() {
                     .expect("payload within this level's capacity");
                 let rx_signal = apply_channel(channel, &clean, snr_db, seed);
 
-                if undecodable {
-                    // No search: this combination is a documented, verified
-                    // known failure (module doc). Use this seed's WAV as-is.
-                    found = Some((seed, attempt, payload, rx_signal, false));
+                let decoded_ok = if let Ok((_h, bytes, _lvl)) = tx.receive(&rx_signal) {
+                    bytes.len() >= payload.len() && bytes[..payload.len()] == payload[..]
+                } else {
+                    false
+                };
+                // Every attempt here is an independent random-payload draw sharing
+                // seq_num 0 on one `tx` reused across `MAX_SEED_ATTEMPTS` attempts --
+                // not a real retransmission. Evict unconditionally so an attempt
+                // that fails to converge (expected during a search at a marginal
+                // operating point) can't corrupt the next attempt's IR-HARQ
+                // accumulator. See coppa-bench's
+                // `runner.rs::ascending_sweep_low_snr_failure_does_not_poison_later_high_snr_trials`
+                // for the bug this mirrors.
+                tx.harq_evict(0);
+                if decoded_ok {
+                    found = Some((seed, attempt, payload, rx_signal));
                     break;
-                }
-                if let Ok((_h, bytes, _lvl)) = tx.receive(&rx_signal) {
-                    if bytes.len() >= payload.len() && bytes[..payload.len()] == payload[..] {
-                        found = Some((seed, attempt, payload, rx_signal, true));
-                        break;
-                    }
                 }
             }
 
-            let Some((seed, attempts, payload, rx_signal, decoded)) = found else {
+            let Some((seed, attempts, payload, rx_signal)) = found else {
                 eprintln!(
-                    "WARNING: {id}: no seed in {attempts_budget} attempts decoded cleanly -- SKIPPED"
+                    "WARNING: {id}: no seed in {MAX_SEED_ATTEMPTS} attempts decoded cleanly -- SKIPPED"
                 );
                 continue;
             };
@@ -364,11 +333,10 @@ fn main() {
             write_wav_i16(&out_dir.join(&wav_name), &rx_signal, SAMPLE_RATE);
 
             println!(
-                "{id}: seed=0x{seed:016X} attempts={} payload_bytes={} samples={} decoded={}",
+                "{id}: seed=0x{seed:016X} attempts={} payload_bytes={} samples={}",
                 attempts + 1,
                 payload.len(),
                 rx_signal.len(),
-                decoded,
             );
 
             generated.push(GeneratedVector {
@@ -389,7 +357,11 @@ fn main() {
                 } else {
                     None
                 },
-                expected_decode_ok: decoded,
+                // Always true: `found` above only sets when a seed actually
+                // decoded correctly (there is no longer a deliberately-failing
+                // combination -- see this generator's 2026-07-26 correction in
+                // the module doc's "Level 9's exception" section).
+                expected_decode_ok: true,
             });
         }
     }
@@ -403,13 +375,7 @@ fn main() {
         "# Each vector: a 48kHz/16-bit-PCM WAV of one Coppa frame through a fixed channel\n",
     );
     manifest_toml.push_str(
-        "# condition, plus the payload it must decode back to exactly (see golden_vectors.rs).\n",
-    );
-    manifest_toml.push_str(
-        "# expected_decode_ok=false entries are DOCUMENTED, VERIFIED known-limitation failures\n",
-    );
-    manifest_toml.push_str(
-        "# (see golden_vectors_gen.rs's module doc), not generator bugs -- kept as a tripwire.\n\n",
+        "# condition, plus the payload it must decode back to exactly (see golden_vectors.rs).\n\n",
     );
     for v in &generated {
         manifest_toml.push_str("[[vectors]]\n");
