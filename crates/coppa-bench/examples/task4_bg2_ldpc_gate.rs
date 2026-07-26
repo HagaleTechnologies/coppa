@@ -269,7 +269,9 @@ fn old_ofdm_trial(level: u8, payload: &[u8], snr_db: f32, seed: u64) -> bool {
     let faded = watterson(&clean, 48_000.0, &WattersonPreset::Poor.config(), seed);
     let noisy = coppa_channel::awgn_seeded(&faded, snr_db, seed ^ 0x5A5A);
 
-    let Some((rx_header, eq_symbols, noise_vars)) = modem.demodulate_frame(&noisy) else {
+    let Some((rx_header, eq_symbols, noise_vars, _delay_spread_ms)) =
+        modem.demodulate_frame(&noisy)
+    else {
         return false;
     };
     if rx_header.speed_level != level {

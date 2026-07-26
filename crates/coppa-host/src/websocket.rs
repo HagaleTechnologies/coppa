@@ -50,6 +50,14 @@ pub enum WsServerMessage {
         /// (decision 8).
         #[serde(skip_serializing_if = "Option::is_none")]
         cfo: Option<f32>,
+        /// `coppa_ml::CpGate`'s live short-CP recommendation: `Some(true)` =
+        /// `CpRecommendation::ShortCp`, `Some(false)` = `CpRecommendation::
+        /// LongCp`, `None` = `[engine] cp_gate_enabled` is off or no frame has
+        /// decoded yet. Measurement/telemetry only -- does not mean the daemon
+        /// has switched (or will switch) CP profile. See `docs/superpowers/
+        /// specs/2026-07-25-cpgate-daemon-wiring-design.md`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        short_cp_ok: Option<bool>,
     },
     /// Data received from remote station.
     #[serde(rename = "data")]
@@ -109,6 +117,8 @@ pub struct WsStatus {
     pub snr: Option<i32>,
     pub level: Option<u8>,
     pub cfo: Option<f32>,
+    /// See `WsServerMessage::Status::short_cp_ok`'s doc.
+    pub short_cp_ok: Option<bool>,
 }
 
 /// Whether a pre-serialized broadcast JSON string is a `spectrum` message
@@ -341,6 +351,7 @@ impl WebSocketServer {
                                                     snr: snapshot.snr,
                                                     level: snapshot.level,
                                                     cfo: snapshot.cfo,
+                                                    short_cp_ok: snapshot.short_cp_ok,
                                                 };
                                                 if let Ok(json) = serde_json::to_string(&resp) {
                                                     let _ = sink
@@ -401,6 +412,7 @@ mod tests {
             snr: Some(15),
             level: Some(4),
             cfo: Some(12.5),
+            short_cp_ok: Some(true),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("connected"));
@@ -460,6 +472,7 @@ mod tests {
             snr: None,
             level: None,
             cfo: None,
+            short_cp_ok: None,
         })
         .unwrap();
         assert!(!is_spectrum_broadcast(&status_json));
@@ -563,12 +576,14 @@ mod tests {
             snr: None,
             level: None,
             cfo: None,
+            short_cp_ok: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(!json.contains("remote_call"));
         assert!(!json.contains("snr"));
         assert!(!json.contains("level"));
         assert!(!json.contains("cfo"));
+        assert!(!json.contains("short_cp_ok"));
     }
 }
 
@@ -640,6 +655,7 @@ mod integration_tests {
                                                 snr: None,
                                                 level: None,
                                                 cfo: None,
+                                                short_cp_ok: None,
                                             };
                                             if let Ok(json) = serde_json::to_string(&resp) {
                                                 let _ = sink.send(Message::Text(json.into())).await;
@@ -788,12 +804,17 @@ mod integration_tests {
                 snr,
                 level,
                 cfo,
+                short_cp_ok,
             } => {
                 assert!(connected, "status should reflect the live connected flag");
                 assert_eq!(remote_call.as_deref(), Some("VK3DEF"));
                 assert_eq!(snr, Some(18), "status should carry the real SNR");
                 assert_eq!(level, Some(5), "status should carry the real speed level");
                 assert_eq!(cfo, Some(-3.5), "status should carry the real CFO estimate");
+                assert_eq!(
+                    short_cp_ok, None,
+                    "short_cp_ok should stay None when cp_gate isn't fed"
+                );
             }
             other => panic!("Expected Status, got {:?}", other),
         }

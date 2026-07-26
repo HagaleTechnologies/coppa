@@ -98,7 +98,7 @@ fn run_cell(
         // before payload decode, so header-caused for our purposes.
         match modem.demodulate_frame(&faded) {
             None => tally.hdr_caused += 1,
-            Some((parsed, _sym, _nv)) => {
+            Some((parsed, _sym, _nv, _delay_spread_ms)) => {
                 let decode_relevant_ok = parsed.speed_level == truth.speed_level
                     && parsed.payload_len == truth.payload_len;
                 if decode_relevant_ok {

@@ -60,6 +60,10 @@ pub struct StreamFrame {
     /// to it (`DecodedFrame::recommended_level`) — fed back on an outgoing ACK so
     /// `coppa_ml::RateLoop` on the peer's side can apply it.
     pub recommended_level: u8,
+    /// This frame's measured multipath delay spread (ms), from
+    /// `DecodedFrame::delay_spread_ms`. Feeds `coppa_ml::CpGate` in the daemon —
+    /// see `docs/superpowers/specs/2026-07-25-cpgate-daemon-wiring-design.md`.
+    pub delay_spread_ms: f32,
 }
 
 /// Core engine for Coppa digital communications.
@@ -341,6 +345,7 @@ impl CoppaCore {
                 frame_start: f.frame_start,
                 speed_level: f.header.speed_level,
                 recommended_level: f.recommended_level,
+                delay_spread_ms: f.delay_spread_ms,
             })
             .collect()
     }
@@ -594,6 +599,10 @@ mod tests {
         assert!(
             frames[0].snr_db.is_finite(),
             "snr_db should be a finite estimate on a clean channel"
+        );
+        assert!(
+            frames[0].delay_spread_ms.is_finite() && frames[0].delay_spread_ms >= 0.0,
+            "delay_spread_ms should be a finite, non-negative estimate on a clean channel"
         );
     }
 

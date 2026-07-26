@@ -90,7 +90,7 @@ fn sound_capacity(
         .expect("payload within this level's capacity");
     let faded = apply_channel(&sig, ch, snr, seed);
     match modem.demodulate_frame(&faded) {
-        Some((_h, _eq, nv)) => channel_capacity(&nv),
+        Some((_h, _eq, nv, _delay_spread_ms)) => channel_capacity(&nv),
         None => 0.0,
     }
 }

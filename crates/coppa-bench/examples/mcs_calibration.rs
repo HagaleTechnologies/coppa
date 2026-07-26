@@ -92,7 +92,7 @@ fn sound(
             snr,
             seed.wrapping_add(s.wrapping_mul(0x9E37_79B9)),
         );
-        if let Some((_h, _eq, nv)) = modem.demodulate_frame(&faded) {
+        if let Some((_h, _eq, nv, _delay_spread_ms)) = modem.demodulate_frame(&faded) {
             accc += channel_capacity(&nv);
             accs += channel_selectivity(&nv);
             n += 1;

@@ -204,8 +204,7 @@ pub struct EngineSection {
     pub arq_enabled: bool,
     /// Frames between `coppa_ml::RateLoop` active overshoot probes (see
     /// `RateLoop::with_probing`). `0` (the default) disables probing entirely --
-    /// an explicit opt-in, matching how `CpGate`'s daemon wiring is also still
-    /// deferred/off by default. Only takes effect when `arq_enabled` is also
+    /// an explicit opt-in. Only takes effect when `arq_enabled` is also
     /// `true` -- probing needs the ARQ ACK/timeout feedback loop to attribute a
     /// probe's outcome. See `docs/superpowers/specs/
     /// 2026-07-25-rateloop-daemon-probe-wiring-design.md`.
@@ -214,6 +213,18 @@ pub struct EngineSection {
     /// `RateLoop::with_probing`'s `probe_offset`). Ignored when
     /// `rate_loop_probe_interval == 0`.
     pub rate_loop_probe_offset: usize,
+    /// Enable `coppa_ml::CpGate`'s live spread-gated short-CP recommendation.
+    /// `false` (the default) is an explicit opt-in, matching
+    /// `rate_loop_probe_interval`'s convention. When enabled, every fully
+    /// decoded frame's measured delay spread feeds a live `CpGate`, and its
+    /// current recommendation is exposed via the WebSocket `status` reply's
+    /// `short_cp_ok` field. **This does NOT switch the engine's CP profile
+    /// automatically** -- it is measurement/telemetry only; actually
+    /// switching `CoppaProfile` mid-session needs a peer-negotiation
+    /// handshake that doesn't exist yet (CP length isn't in-band negotiable
+    /// the way speed level is). See `docs/superpowers/specs/
+    /// 2026-07-25-cpgate-daemon-wiring-design.md` for the full reasoning.
+    pub cp_gate_enabled: bool,
 }
 
 /// Busy-channel courtesy / station-ID timer / beacon-mode configuration
@@ -316,6 +327,7 @@ impl Default for EngineSection {
             arq_enabled: false,
             rate_loop_probe_interval: 0,
             rate_loop_probe_offset: 0,
+            cp_gate_enabled: false,
         }
     }
 }
@@ -422,6 +434,25 @@ rate_loop_probe_offset = 1
         let config: DaemonConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.engine.rate_loop_probe_interval, 2);
         assert_eq!(config.engine.rate_loop_probe_offset, 1);
+    }
+
+    #[test]
+    fn test_cp_gate_defaults_to_disabled() {
+        let config = DaemonConfig::default();
+        assert!(
+            !config.engine.cp_gate_enabled,
+            "CpGate daemon wiring must be off by default"
+        );
+    }
+
+    #[test]
+    fn test_cp_gate_toml_override() {
+        let toml = r#"
+[engine]
+cp_gate_enabled = true
+"#;
+        let config: DaemonConfig = toml::from_str(toml).unwrap();
+        assert!(config.engine.cp_gate_enabled);
     }
 
     // ── StationIdConfig defaults (Phase 4 Task 3) ─────────────────────

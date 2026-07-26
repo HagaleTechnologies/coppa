@@ -779,10 +779,11 @@ impl CoppaTransceiver {
     /// receiver feeds this back to the sender on the ACK (`TransportPdu::
     /// new_ack_with_rate`); the sender applies it via `coppa_ml::RateLoop`.
     pub fn receive(&self, samples: &[f32]) -> Result<(CoppaHeader, Vec<u8>, u8), ReceiveError> {
-        self.receive_core(samples).map(|(h, p, _snr, noise_vars)| {
-            let level = coppa_ml::recommend_speed_level(&noise_vars, h.speed_level);
-            (h, p, level)
-        })
+        self.receive_core(samples)
+            .map(|(h, p, _snr, noise_vars, _delay_spread_ms)| {
+                let level = coppa_ml::recommend_speed_level(&noise_vars, h.speed_level);
+                (h, p, level)
+            })
     }
 
     /// Core IR-HARQ combining + decode step (Phase 3 Task 3).
@@ -872,18 +873,22 @@ impl CoppaTransceiver {
     /// real per-carrier-noise telemetry instead of the crude whole-buffer RMS proxy
     /// it used before (`20*log10(rms) + 40`, since replaced). `receive` itself is
     /// unchanged (beyond Task 4's added recommended-level return) and still used by
-    /// every existing (batch) call site. Now also returns the same per-frame
+    /// every existing (batch) call site. Also returns the same per-frame
     /// recommended speed level `receive` does (Task 4's `recommend_speed_level`),
     /// for the streaming/daemon path to feed back on an outgoing ACK -- see
-    /// `DecodedFrame::recommended_level`.
+    /// `DecodedFrame::recommended_level` -- and this frame's measured delay spread
+    /// (ms), for `coppa_ml::CpGate`'s daemon wiring -- see `DecodedFrame::
+    /// delay_spread_ms` and `docs/superpowers/specs/
+    /// 2026-07-25-cpgate-daemon-wiring-design.md`.
     pub fn receive_with_metrics(
         &self,
         samples: &[f32],
-    ) -> Result<(CoppaHeader, Vec<u8>, f32, u8), ReceiveError> {
-        self.receive_core(samples).map(|(h, p, snr, noise_vars)| {
-            let level = coppa_ml::recommend_speed_level(&noise_vars, h.speed_level);
-            (h, p, snr, level)
-        })
+    ) -> Result<(CoppaHeader, Vec<u8>, f32, u8, f32), ReceiveError> {
+        self.receive_core(samples)
+            .map(|(h, p, snr, noise_vars, delay_spread_ms)| {
+                let level = coppa_ml::recommend_speed_level(&noise_vars, h.speed_level);
+                (h, p, snr, level, delay_spread_ms)
+            })
     }
 
     /// Core decode pipeline shared by [`Self::receive`] and [`Self::receive_with_metrics`]:
@@ -892,10 +897,11 @@ impl CoppaTransceiver {
     /// `coppa_ml::recommend_speed_level` for the closed-loop rate-adaptation recommendation
     /// (Phase 3 Task 4). Kept as one shared implementation so the two public methods can't
     /// drift apart.
+    #[allow(clippy::type_complexity)]
     fn receive_core(
         &self,
         samples: &[f32],
-    ) -> Result<(CoppaHeader, Vec<u8>, f32, Vec<f32>), ReceiveError> {
+    ) -> Result<(CoppaHeader, Vec<u8>, f32, Vec<f32>, f32), ReceiveError> {
         // 0. RX bandpass: reject out-of-passband noise/interference before demod, mirroring
         // the TX bandpass already applied at modulate time (HF profiles only).
         let filtered;
@@ -909,8 +915,13 @@ impl CoppaTransceiver {
 
         // 1. Demodulate to soft symbols (coded symbol count derived from header speed level
         // AND, since Phase 3 Task 5, header.codewords -- see `CoppaModem::demodulate_frame`'s
-        // doc for the multi-codeword symbol-count change).
-        let (header, eq_symbols, noise_vars) = self
+        // doc for the multi-codeword symbol-count change). `delay_spread_ms` is this frame's
+        // measured multipath delay spread (`coppa_ml::CpGate`'s daemon wiring input -- see
+        // `docs/superpowers/specs/2026-07-25-cpgate-daemon-wiring-design.md`), captured here
+        // (before the codeword dispatch below) and reattached to whichever result that
+        // dispatch produces, since neither `receive_single_codeword` nor
+        // `receive_multi_codeword` need to know about it.
+        let (header, eq_symbols, noise_vars, delay_spread_ms) = self
             .modem
             .demodulate_frame(samples)
             .ok_or(ReceiveError::SyncFailed)?;
@@ -929,11 +940,12 @@ impl CoppaTransceiver {
         // (`receive_multi_codeword`) that does NOT get turbo re-estimation or persistent
         // IR-HARQ combining across retransmissions -- an explicit, documented scope
         // decision (see `receive_multi_codeword`'s doc), not an oversight.
-        if header.codewords <= 1 {
+        let result = if header.codewords <= 1 {
             self.receive_single_codeword(header, eq_symbols, noise_vars)
         } else {
             self.receive_multi_codeword(header, eq_symbols, noise_vars)
-        }
+        };
+        result.map(|(h, p, snr, nv)| (h, p, snr, nv, delay_spread_ms))
     }
 
     /// Pre-Task-5 single-codeword decode path (unchanged): resolves speed-level
@@ -1380,7 +1392,8 @@ impl CoppaTransceiver {
             }
             None => samples,
         };
-        let (header, eq_symbols, noise_vars) = self.modem.demodulate_frame(samples)?;
+        let (header, eq_symbols, noise_vars, _delay_spread_ms) =
+            self.modem.demodulate_frame(samples)?;
         let outcomes = self.decode_codeword_outcomes(&header, &eq_symbols, &noise_vars)?;
         let per_codeword_ok = outcomes.into_iter().map(|(ok, _)| ok).collect();
         Some((header, per_codeword_ok))
@@ -2857,13 +2870,43 @@ mod tests {
             .expect("transmit should succeed");
 
         let (_, _, via_receive_level) = tx.receive(&samples).expect("receive should decode");
-        let (_, _, _, via_metrics_level) = tx
+        let (_, _, _, via_metrics_level, _) = tx
             .receive_with_metrics(&samples)
             .expect("receive_with_metrics should decode");
 
         assert_eq!(
             via_receive_level, via_metrics_level,
             "receive() and receive_with_metrics() must agree on the recommended level"
+        );
+    }
+
+    #[test]
+    fn receive_with_metrics_returns_finite_delay_spread_ms() {
+        let profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
+        let tx = CoppaTransceiver::new(profile, 1);
+        let header = coppa_codec::ofdm::frame::CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: coppa_codec::ofdm::frame::CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: 8,
+            codewords: 1,
+        };
+        let payload = b"testdata";
+        let samples = tx
+            .transmit(&header, payload)
+            .expect("transmit should succeed");
+
+        let (_, _, _, _, delay_spread_ms) = tx
+            .receive_with_metrics(&samples)
+            .expect("receive_with_metrics should decode");
+
+        assert!(
+            delay_spread_ms.is_finite() && delay_spread_ms >= 0.0,
+            "delay_spread_ms should be a finite, non-negative estimate, got {delay_spread_ms}"
         );
     }
 }

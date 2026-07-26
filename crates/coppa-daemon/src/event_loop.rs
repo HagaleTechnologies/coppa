@@ -7,7 +7,9 @@ use coppa_audio::{AudioRingConsumer, AudioRingProducer};
 use coppa_engine::CoppaCore;
 use coppa_host::vara::VaraResponse;
 use coppa_host::HostEvent;
-use coppa_ml::{BusyGate, RateLoop};
+#[cfg(feature = "websocket")]
+use coppa_ml::CpRecommendation;
+use coppa_ml::{BusyGate, CpGate, RateLoop};
 use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx};
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu, StationIdPayload};
 use coppa_protocol::modem::max_payload_for_level;
@@ -78,6 +80,13 @@ pub struct EventLoop {
     /// (`TransportPdu::suggested_rate`) and applied to `self.engine` via
     /// `CoppaCore::set_speed_level`.
     rate_loop: RateLoop,
+    /// Spread-gated short-CP recommender (`coppa_ml::CpGate`), fed this
+    /// station's own measured delay spread on every fully decoded frame when
+    /// `[engine] cp_gate_enabled` is set. Measurement/telemetry only -- its
+    /// live recommendation is exposed via `WsStatus::short_cp_ok`, but nothing
+    /// currently applies it to the engine's CP profile. See
+    /// `docs/superpowers/specs/2026-07-25-cpgate-daemon-wiring-design.md`.
+    cp_gate: CpGate,
     /// Next TX sequence number for transport PDUs.
     #[allow(dead_code)] // used when ARQ TX path sends segmented frames
     arq_next_seq: u8,
@@ -249,6 +258,15 @@ impl EventLoop {
             rate_loop
         };
 
+        // Always constructed (cheap; mirrors RateLoop's own "hardcode the
+        // hysteresis constants, only expose the interval/offset-equivalent
+        // via config" pattern -- no config knobs for threshold_ms/
+        // consecutive_needed, YAGNI per CLAUDE.md's alpha-calibration
+        // cautionary tale). Whether it's ever fed a real observation is
+        // gated by `config.engine.cp_gate_enabled` in
+        // `decode_and_dispatch_audio`.
+        let cp_gate = CpGate::default_coppa();
+
         Ok(Self {
             config,
             engine,
@@ -266,6 +284,7 @@ impl EventLoop {
             arq_rx,
             arq_session_id: 0,
             rate_loop,
+            cp_gate,
             arq_next_seq: 0,
             probe_state: None,
             #[cfg(feature = "websocket")]
@@ -1016,6 +1035,7 @@ impl EventLoop {
         for frame in self.engine.push_samples(samples) {
             let snr_db = frame.snr_db;
             let recommended_level = frame.recommended_level;
+            let delay_spread_ms = frame.delay_spread_ms;
             #[cfg(feature = "websocket")]
             let cfo_hz = frame.cfo_hz;
             #[cfg(feature = "websocket")]
@@ -1027,6 +1047,27 @@ impl EventLoop {
                     // `DecodedFrame::snr_db` is known as soon as decode succeeds.
                     self.emit_vara(VaraResponse::Snr(snr_db.round() as i32))
                         .await;
+
+                    // `CpGate` (`docs/superpowers/specs/
+                    // 2026-07-25-cpgate-daemon-wiring-design.md`): feed this
+                    // frame's measured delay spread on the same "decode fully
+                    // succeeded" event the SNR/level telemetry above uses. Off
+                    // by default (`cp_gate_enabled`). Runs regardless of
+                    // whether the `websocket` feature is compiled in -- only
+                    // the telemetry *surface* below is feature-gated, not the
+                    // gate's own hysteresis state.
+                    if self.config.engine.cp_gate_enabled {
+                        let before = self.cp_gate.current();
+                        let after = self.cp_gate.observe(delay_spread_ms);
+                        if after != before {
+                            tracing::info!(
+                                ?before,
+                                ?after,
+                                delay_spread_ms,
+                                "CpGate recommendation changed"
+                            );
+                        }
+                    }
 
                     // WebSocket `status` reply: keep the live snapshot current
                     // (decision 8: "connected, snr, level, cfo").
@@ -1052,6 +1093,11 @@ impl EventLoop {
                         snap.snr = Some(snr_db.round() as i32);
                         snap.level = Some(speed_level);
                         snap.cfo = Some(cfo_hz);
+                        snap.short_cp_ok = if self.config.engine.cp_gate_enabled {
+                            Some(self.cp_gate.current() == CpRecommendation::ShortCp)
+                        } else {
+                            None
+                        };
                     }
 
                     let decoded_bytes = payload.as_slice();
@@ -2968,6 +3014,63 @@ mod tests {
             out.extend_from_slice(samples);
             out.extend(std::iter::repeat_n(0.0f32, 2048));
             out
+        }
+
+        /// `CpGate`'s live recommendation reaches `WsStatus.short_cp_ok` once
+        /// enabled and a frame has decoded (design doc: `docs/superpowers/
+        /// specs/2026-07-25-cpgate-daemon-wiring-design.md`). A single clean
+        /// loopback frame's real (near-zero) delay spread isn't enough on its
+        /// own to flip `CpGate::default_coppa()`'s hysteresis to `ShortCp`
+        /// (`consecutive_needed = 4`), so this only asserts the field is
+        /// populated (`Some(_)`), not which recommendation it holds -- the
+        /// hysteresis threshold/count themselves are already covered by
+        /// `coppa-ml::cp_gate`'s own unit tests.
+        #[cfg(feature = "websocket")]
+        #[tokio::test]
+        async fn test_cp_gate_populates_ws_status_when_enabled() {
+            let mut config = DaemonConfig::default();
+            config.engine.cp_gate_enabled = true;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let status = Arc::new(Mutex::new(coppa_host::websocket::WsStatus::default()));
+            event_loop.set_ws_status(status.clone());
+
+            let core = coppa_engine::CoppaCore::new();
+            let samples = core.encode("Hello CpGate").expect("encode should succeed");
+            let samples = with_lead_and_trail(&samples);
+
+            event_loop.decode_and_dispatch_audio(&samples).await;
+
+            let snap = status.lock().await;
+            assert!(
+                snap.short_cp_ok.is_some(),
+                "short_cp_ok should be populated once CpGate is enabled and a frame has decoded"
+            );
+        }
+
+        /// The default (`cp_gate_enabled = false`) must leave `short_cp_ok`
+        /// at `None` -- this feature must be a true no-op when off.
+        #[cfg(feature = "websocket")]
+        #[tokio::test]
+        async fn test_cp_gate_disabled_by_default_leaves_ws_status_none() {
+            let config = DaemonConfig::default();
+            assert!(!config.engine.cp_gate_enabled);
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let status = Arc::new(Mutex::new(coppa_host::websocket::WsStatus::default()));
+            event_loop.set_ws_status(status.clone());
+
+            let core = coppa_engine::CoppaCore::new();
+            let samples = core
+                .encode("Hello without CpGate")
+                .expect("encode should succeed");
+            let samples = with_lead_and_trail(&samples);
+
+            event_loop.decode_and_dispatch_audio(&samples).await;
+
+            let snap = status.lock().await;
+            assert_eq!(
+                snap.short_cp_ok, None,
+                "short_cp_ok must stay None when cp_gate_enabled is false (the default)"
+            );
         }
 
         /// Required scenario: "decoded frame -> SNR line arrives."

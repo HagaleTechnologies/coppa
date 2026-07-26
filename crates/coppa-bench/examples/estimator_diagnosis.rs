@@ -68,7 +68,7 @@ fn main() {
 
         match modem.demodulate_frame(&noisy) {
             None => sync_fail += 1,
-            Some((h, rx_symbols, noise_vars)) => {
+            Some((h, rx_symbols, noise_vars, _delay_spread_ms)) => {
                 if h.speed_level != 2 {
                     header_fail += 1;
                     continue;

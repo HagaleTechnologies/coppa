@@ -311,6 +311,12 @@ struct ProbeCalibration {
     order: usize,
     taps: Vec<Complex32>,
     noise_var: f32,
+    /// Measured multipath delay spread (ms), from this frame's own probe-symbol
+    /// `DelayDomainEstimator` fit — see `DelayDomainEstimator::delay_spread_ms`'s
+    /// doc (Task 6b: short-CP spread gate). Threaded out through
+    /// `demodulate_frame` for `coppa_ml::CpGate`'s daemon wiring; see
+    /// `docs/superpowers/specs/2026-07-25-cpgate-daemon-wiring-design.md`.
+    delay_spread_ms: f32,
 }
 
 /// DIAGNOSTIC ONLY: output of [`CoppaModem::diagnose_drift_tracking`],
@@ -672,7 +678,7 @@ impl CoppaModem {
     pub fn demodulate_frame(
         &self,
         samples: &[f32],
-    ) -> Option<(CoppaHeader, Vec<Complex32>, Vec<f32>)> {
+    ) -> Option<(CoppaHeader, Vec<Complex32>, Vec<f32>, f32)> {
         self.demodulate_frame_impl(samples, true)
     }
 
@@ -687,7 +693,7 @@ impl CoppaModem {
     pub(crate) fn demodulate_frame_without_sco(
         &self,
         samples: &[f32],
-    ) -> Option<(CoppaHeader, Vec<Complex32>, Vec<f32>)> {
+    ) -> Option<(CoppaHeader, Vec<Complex32>, Vec<f32>, f32)> {
         self.demodulate_frame_impl(samples, false)
     }
 
@@ -695,7 +701,7 @@ impl CoppaModem {
         &self,
         samples: &[f32],
         sco_enabled: bool,
-    ) -> Option<(CoppaHeader, Vec<Complex32>, Vec<f32>)> {
+    ) -> Option<(CoppaHeader, Vec<Complex32>, Vec<f32>, f32)> {
         let symbol_len = self.profile.fft_size + self.profile.cp_samples;
         let data_per_sym = self.data_carriers_per_symbol();
 
@@ -737,6 +743,7 @@ impl CoppaModem {
         // used by `StreamingReceiver` without this frame-level context).
         let calib = self.probe_calibration(samples, data_start);
         let coarse_delay = calib.coarse_delay;
+        let delay_spread_ms = calib.delay_spread_ms;
 
         // 2. Protected header (2D-pooled estimation, hard-decision BPSK) -> FEC decode.
         let num_header_syms = header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(data_per_sym);
@@ -907,7 +914,7 @@ impl CoppaModem {
             data_carrier_map,
         });
 
-        Some((header, payload_symbols, noise_variances))
+        Some((header, payload_symbols, noise_variances, delay_spread_ms))
     }
 
     /// Turbo re-estimation entry point (Task 5): re-fit the delay-domain
@@ -1047,6 +1054,7 @@ impl CoppaModem {
                 order: 6,
                 taps: vec![Complex32::new(1.0, 0.0)],
                 noise_var: 1.0,
+                delay_spread_ms: 0.0,
             };
         }
         let carriers = self.demod_ofdm_symbol(&samples[probe_start..probe_start + symbol_len]);
@@ -1072,11 +1080,13 @@ impl CoppaModem {
             .map(|(k, &h)| (k, h, 1.0))
             .collect();
         let est = DelayDomainEstimator::fit(nc, order, &obs);
+        let delay_spread_ms = est.delay_spread_ms(self.profile.fft_size, self.profile.sample_rate);
         ProbeCalibration {
             coarse_delay,
             order,
             taps: est.taps().to_vec(),
             noise_var: est.noise_var(),
+            delay_spread_ms,
         }
     }
 
@@ -1901,7 +1911,7 @@ mod tests {
                  demodulate_frame must succeed",
                 profile.phy_mode
             );
-            let (rx_header, _, _) = soft.unwrap();
+            let (rx_header, _, _, _) = soft.unwrap();
             assert_eq!(rx_header.speed_level, speed_level);
         }
     }
@@ -1972,7 +1982,7 @@ mod tests {
 
         let samples = modem.modulate_mapped(&header, &symbols, 6.0);
 
-        let (rx_header, rx_symbols, _noise) = modem
+        let (rx_header, rx_symbols, _noise, _delay_spread_ms) = modem
             .demodulate_frame(&samples)
             .expect("Demodulation should succeed");
 
@@ -2059,7 +2069,7 @@ mod tests {
             })
             .collect();
         let samples = modem.modulate_mapped(&header, &symbols, 6.0);
-        let (_, rx_symbols, _noise) = modem
+        let (_, rx_symbols, _noise, _delay_spread_ms) = modem
             .demodulate_frame(&samples)
             .expect("demodulation should succeed");
 
@@ -2143,7 +2153,7 @@ mod tests {
             .collect();
         let samples = modem.modulate_mapped(&header, &symbols, 6.0);
 
-        let (rx_header, symbols, noise_vars) = modem
+        let (rx_header, symbols, noise_vars, _delay_spread_ms) = modem
             .demodulate_frame(&samples)
             .expect("demodulate_frame should succeed");
 
@@ -2159,6 +2169,45 @@ mod tests {
         for &nv in &noise_vars {
             assert!(nv > 0.0, "Noise variance should be positive");
         }
+    }
+
+    #[test]
+    fn test_demodulate_frame_returns_delay_spread_ms() {
+        let profile = CoppaProfile::hf_standard();
+        let modem = CoppaModem::new(profile, 1);
+
+        let header = CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: 20,
+            codewords: 1,
+        };
+        let symbols: Vec<Complex32> = (0..3000)
+            .map(|i| {
+                let a = (i as f32) * 0.618;
+                Complex32::new(a.cos(), a.sin()) * std::f32::consts::FRAC_1_SQRT_2
+            })
+            .collect();
+        let samples = modem.modulate_mapped(&header, &symbols, 6.0);
+
+        let (_rx_header, _symbols, _noise_vars, delay_spread_ms) = modem
+            .demodulate_frame(&samples)
+            .expect("demodulate_frame should succeed");
+
+        assert!(
+            delay_spread_ms.is_finite() && delay_spread_ms >= 0.0,
+            "delay_spread_ms should be a finite, non-negative estimate, got {delay_spread_ms}"
+        );
+        assert!(
+            delay_spread_ms < 1.0,
+            "a clean single-path channel (no injected multipath) should measure a small \
+             delay spread, got {delay_spread_ms} ms"
+        );
     }
 
     #[test]
@@ -2613,14 +2662,14 @@ mod tests {
             errors as f32 / n as f32
         };
 
-        let (rx_header, with_sco_symbols, _) = with_sco;
+        let (rx_header, with_sco_symbols, _, _) = with_sco;
         assert_eq!(rx_header.codewords, codewords);
         let with_sco_ber = bit_error_rate(&with_sco_symbols);
 
         // WITHOUT SCO tracking: either demodulation fails outright, or it
         // "succeeds" but with a far higher bit error rate than the SCO-on case.
         let without_sco_ber = match without_sco {
-            Some((_, rx_symbols, _)) => bit_error_rate(&rx_symbols),
+            Some((_, rx_symbols, _, _)) => bit_error_rate(&rx_symbols),
             None => 1.0,
         };
 
