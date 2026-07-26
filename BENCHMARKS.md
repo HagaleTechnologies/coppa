@@ -679,6 +679,31 @@ fading (Good or Poor) at any SNR tested up to 54 dB. The already-documented Watt
 Poor channel-estimation gap (see Known Limitations) is a real, *additional* contributing factor
 for those specific rows, layered on top of the ladder-mismatch finding, not a substitute for it.
 
+**UPDATE (2026-07-26): the "genuine, late, steep, and strongly seed-dependent noise waterfall"
+above was itself a third mis-diagnosis — this time a real bug, but in the bench harness, not the
+codec.** `coppa-bench`'s `run_scenario`/`run_trial` (used by both the main AWGN/Watterson ladder
+CLI and `milstd`) hardcodes every synthetic trial's `seq_num` to `0` and reuses one
+`CoppaTransceiver` across a whole ascending SNR sweep. `CoppaTransceiver`'s IR-HARQ receive-side
+LLR accumulator (Phase 3 Task 3) only evicts on a successful decode, so a trial that genuinely
+fails at a low-SNR sweep point (expected and correct — that's the point of sweeping from low SNR)
+left its accumulator un-evicted; the next unrelated random-payload trial at the same seq then had
+its LLRs added on top of that stale buffer, corrupting every later trial at that seq for the rest
+of the sweep — including trials at much higher SNR that should trivially decode. This exactly
+explains both the reported seed-dependence (how much low-SNR contamination happens to accumulate
+before the sweep reaches a genuinely-clearing SNR) and why levels 1-6 never showed it (their real
+thresholds are low enough that the first successful decode evicts the buffer before much poison
+builds up). Confirmed with a regression test that reproduces the corruption pre-fix
+(`ascending_sweep_low_snr_failure_does_not_poison_later_high_snr_trials` in
+`crates/coppa-bench/src/runner.rs`) and fixed by unconditionally evicting each trial's HARQ buffer
+after every `receive()` call, regardless of outcome. Re-measured AWGN ladder (400 trials/point,
+same -6..30 dB sweep): level 9 now clears **both** FER≤10% and FER≤1% cleanly at **21.0 dB**, with
+no residual floor at all (goodput 6609 bps) — previously reported as "18.0 dB / never, with a
+~1-1.25% floor to 30 dB." Level 10 similarly tightens to a clean 24.0/24.0 dB (previously
+24.0/27.0 dB). **This fix does NOT extend to the Watterson-fading claim in the same paragraph**:
+re-measuring level 9 post-fix under both Watterson Good and Poor (200 trials/point, 6-30 dB) still
+shows it never clearing FER≤10% on either preset (peak goodput 330 bps Good / 132 bps Poor) — the
+fading-side non-convergence is a real, separate, still-open gap, not a rehash of this bench bug.
+
 ### `session`: simulated 10-minute ARQ sessions — Good 3/5, Moderate 0/5, Poor 0/5 drop-free
 
 `cargo run -p coppa-bench --release --example session` drives the real `ArqTx`/`ArqRx`
