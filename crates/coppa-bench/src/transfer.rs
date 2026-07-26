@@ -225,7 +225,9 @@ impl TransferPhy for V2Phy {
         //    A frame that fails sync contributes an all-zero (erasure) block.
         let mut frame_llrs: Vec<f32> = vec![0.0; n * CODED_BITS];
         for (f, window) in frame_windows.iter().enumerate().take(n) {
-            if let Some((_h, eq_symbols, noise_vars)) = self.modem.demodulate_frame(window) {
+            if let Some((_h, eq_symbols, noise_vars, _delay_spread_ms)) =
+                self.modem.demodulate_frame(window)
+            {
                 let mut llrs = Vec::with_capacity(CODED_BITS);
                 for (i, &sym) in eq_symbols.iter().take(symbols_needed).enumerate() {
                     let nv = if i < noise_vars.len() {

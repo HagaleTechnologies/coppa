@@ -71,6 +71,12 @@ pub struct DecodedFrame {
     /// Absolute sample index (in the coordinate system of every sample ever pushed
     /// to this receiver) of the frame's preamble start.
     pub frame_start: u64,
+    /// This frame's measured multipath delay spread (ms), from
+    /// `CoppaTransceiver::receive_with_metrics`'s 5th element (originally
+    /// `DelayDomainEstimator::delay_spread_ms`, Task 6b). Feeds `coppa_ml::CpGate`'s
+    /// daemon wiring -- see `docs/superpowers/specs/
+    /// 2026-07-25-cpgate-daemon-wiring-design.md`.
+    pub delay_spread_ms: f32,
 }
 
 /// An in-progress candidate being accumulated toward a full frame.
@@ -350,7 +356,7 @@ impl StreamingReceiver {
                 // unit test already calls it: directly on `transmit`'s raw output,
                 // zero leading margin).
                 match self.transceiver.receive_with_metrics(&slice) {
-                    Ok((header, payload, snr_db, recommended_level)) => {
+                    Ok((header, payload, snr_db, recommended_level, delay_spread_ms)) => {
                         out.push(DecodedFrame {
                             header,
                             payload,
@@ -358,6 +364,7 @@ impl StreamingReceiver {
                             recommended_level,
                             cfo_hz,
                             frame_start: start,
+                            delay_spread_ms,
                         });
                     }
                     Err(_) => {

@@ -168,7 +168,8 @@ fn main() {
         // --- 2d. LDPC decode_checked alone, given the actual LLRs from this frame. ---
         use coppa_protocol::fec::ldpc::codes::CodeRate;
         use coppa_protocol::fec::ldpc::LdpcCodec;
-        let (_h, eq_symbols, noise_vars) = modem.demodulate_frame(&frame).unwrap();
+        let (_h, eq_symbols, noise_vars, _delay_spread_ms) =
+            modem.demodulate_frame(&frame).unwrap();
         let mapper = coppa_codec::bpsk::BpskMapper;
         use coppa_codec::traits::ConstellationMapper;
         let coded_bits_needed = 1944usize;
