@@ -84,7 +84,9 @@ fn main() {
                 let diag = modem.diagnose_drift_tracking(&noisy);
                 let decode = modem.demodulate_frame(&noisy);
 
-                let (Some(diag), Some((h, rx_symbols, _noise_vars))) = (diag, decode) else {
+                let (Some(diag), Some((h, rx_symbols, _noise_vars, _delay_spread_ms))) =
+                    (diag, decode)
+                else {
                     fails += 1;
                     continue;
                 };

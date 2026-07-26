@@ -58,7 +58,7 @@ fn sound_level(
             .wrapping_add(t as u64)
             .wrapping_add((level as u64).wrapping_mul(0x1000_0000));
         let faded = coppa_channel::awgn_seeded(&sig, snr, seed ^ 0x5555);
-        if let Some((_h, _eq, nv)) = modem.demodulate_frame(&faded) {
+        if let Some((_h, _eq, nv, _delay_spread_ms)) = modem.demodulate_frame(&faded) {
             accc += channel_capacity(&nv);
             accs += channel_selectivity(&nv);
             n += 1;

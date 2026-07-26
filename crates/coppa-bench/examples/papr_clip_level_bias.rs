@@ -154,7 +154,7 @@ fn sound(
             .wrapping_add(t as u64)
             .wrapping_add((level as u64).wrapping_mul(0x1000_0000));
         let faded = coppa_channel::awgn_seeded(&sig, snr, seed ^ 0x5555);
-        if let Some((h, _eq, nv)) = modem.demodulate_frame(&faded) {
+        if let Some((h, _eq, nv, _delay_spread_ms)) = modem.demodulate_frame(&faded) {
             if h.speed_level == level {
                 out.push(channel_capacity(&nv));
             }

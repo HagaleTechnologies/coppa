@@ -81,7 +81,7 @@ fn sound_level(
             .wrapping_add(t as u64)
             .wrapping_add((mode.level as u64).wrapping_mul(0x1000_0000));
         let faded = apply_channel(&sig, ch, snr, seed);
-        if let Some((_h, _eq, nv)) = modem.demodulate_frame(&faded) {
+        if let Some((_h, _eq, nv, _delay_spread_ms)) = modem.demodulate_frame(&faded) {
             out.push((channel_capacity(&nv), channel_selectivity(&nv)));
         }
     }
