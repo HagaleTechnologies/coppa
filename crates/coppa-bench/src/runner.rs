@@ -104,6 +104,20 @@ fn run_trial(
         },
     };
 
+    // Every synthetic trial is an independent random payload, never a real
+    // retransmission of a previous one -- but every trial shares `seq_num: 0`
+    // (see `make_header`) and this same `tx` is reused across a whole SNR
+    // sweep. `CoppaTransceiver`'s IR-HARQ receive-side LLR accumulator (Phase
+    // 3 Task 3) only evicts on a successful decode, so a trial that
+    // genuinely fails to converge (expected at a low-SNR sweep point) would
+    // otherwise leave its buffer un-evicted and corrupt every later trial at
+    // this seq -- including ones at much higher SNR that should trivially
+    // decode. Evicting unconditionally here (a no-op on the already-evicted
+    // success path) keeps trials i.i.d., matching what this sweep is
+    // actually meant to measure. See
+    // `ascending_sweep_low_snr_failure_does_not_poison_later_high_snr_trials`.
+    tx.harq_evict(header.seq_num);
+
     (outcome, frame_samples)
 }
 
@@ -217,6 +231,53 @@ mod tests {
             points[1].fer
         );
         assert!(points[0].goodput_bps > 0.0);
+    }
+
+    /// Regression test for a real bug found investigating level 9's documented
+    /// "anomalous, seed-dependent AWGN waterfall" (BENCHMARKS.md's `milstd`
+    /// section): `run_trial` hardcodes every synthetic trial's `seq_num` to
+    /// `0` and reuses one `CoppaTransceiver` across a whole SNR sweep.
+    /// `CoppaTransceiver`'s IR-HARQ receive-side LLR accumulator (Phase 3
+    /// Task 3) is only evicted on a *successful* decode -- so a trial that
+    /// genuinely fails to converge (expected and correct at a low-SNR sweep
+    /// point) leaves its accumulator un-evicted, and the next unrelated
+    /// random-payload trial at the same seq gets its LLRs added on top of
+    /// that stale buffer, corrupting every later trial at that seq --
+    /// including ones at much higher SNR that should trivially decode.
+    ///
+    /// A real ascending sweep (`snr_points`, used by every CLI/example caller)
+    /// hits this immediately: level 9's (64-QAM 2/3) genuine AWGN threshold is
+    /// ~18 dB, so any sweep starting below that poisons the buffer before the
+    /// sweep ever reaches a point that should succeed. Ordering the points
+    /// high-then-low (as `awgn_sweep_decodes_at_high_snr_and_fails_at_low_snr`
+    /// above does) hides this entirely, which is why that test never caught
+    /// it -- this test uses ascending order specifically to reproduce it.
+    #[test]
+    fn ascending_sweep_low_snr_failure_does_not_poison_later_high_snr_trials() {
+        let scenario = Scenario {
+            level: 9,
+            channel: ChannelSpec::Awgn,
+            snr_db_points: vec![15.0, 60.0],
+            trials: 20,
+            seed: 0xABCD,
+            profile_override: None,
+            cfo_hz: 0.0,
+            ssb: false,
+        };
+        let points = run_scenario(&scenario);
+        assert_eq!(points.len(), 2);
+        assert!(
+            points[0].fer >= 0.5,
+            "15 dB is genuinely below level 9's threshold, should mostly fail (fer={})",
+            points[0].fer
+        );
+        assert!(
+            points[1].fer <= 0.1,
+            "60 dB (near-noiseless) must decode cleanly regardless of the earlier \
+             15 dB point's failures (fer={}) -- a non-zero FER here means a prior \
+             trial's un-evicted IR-HARQ buffer is contaminating this one",
+            points[1].fer
+        );
     }
 
     #[test]
