@@ -68,6 +68,14 @@ fn goodput(
                 ok += 1;
             }
         }
+        // Every trial is an independent random-payload draw sharing seq_num 0
+        // on one `tx` reused across `TRIALS` calls -- not a real
+        // retransmission. Evict unconditionally so a trial that fails to
+        // converge (expected near this level's threshold) can't corrupt the
+        // next trial's IR-HARQ accumulator. See coppa-bench's
+        // `runner.rs::ascending_sweep_low_snr_failure_does_not_poison_later_high_snr_trials`
+        // for the bug this mirrors.
+        tx.harq_evict(0);
     }
     if airtime > 0.0 {
         (pfb * 8) as f64 * (ok as f64 / TRIALS as f64) / airtime
