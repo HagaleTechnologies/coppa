@@ -704,6 +704,41 @@ re-measuring level 9 post-fix under both Watterson Good and Poor (200 trials/poi
 shows it never clearing FER≤10% on either preset (peak goodput 330 bps Good / 132 bps Poor) — the
 fading-side non-convergence is a real, separate, still-open gap, not a rehash of this bench bug.
 
+**UPDATE (2026-07-26): full 27-point `milstd` ladder re-measured now that the fix above is
+committed (`ba98a23`/`f125ad3`, PR #61/#62) — `milstd` calls `run_scenario`/`run_trial` directly,
+so it was fully in-scope for the same fix.** Fresh run (100 trials/point, same 27 operating
+points, `hf_standard` forced per level as before):
+
+| Level | Mode | Rate class (bps) | Good | Moderate | Poor |
+|---|---|---|---|---|---|
+| 1 | BPSK 1/4 | 75 | 100% FER @ −9 dB | 98% @ −3 dB | 63% @ 3 dB |
+| 2 | BPSK 1/2 | 150 | 100% @ −6 dB | 89% @ 0 dB | 64% @ 6 dB |
+| 3 | QPSK 1/2 | 300 | 99% @ −3 dB | 81% @ 3 dB | 54% @ 9 dB |
+| 4 | QPSK 3/4 | 600 | 99% @ 0 dB | 86% @ 6 dB | 65% @ 12 dB |
+| 5 | 8PSK 2/3 | 1200 | 100% @ 3 dB | 93% @ 9 dB | 70% @ 15 dB |
+| 6 | 16QAM 1/2 | 1200 | 99% @ 3 dB | 91% @ 9 dB | 71% @ 15 dB |
+| 7 | 16QAM 3/4 | 2400 | 100% @ 6 dB | 99% @ 12 dB | 84% @ 18 dB |
+| 9 | 64QAM 2/3 | 4800 | 100% @ 9 dB | 99% @ 15 dB | 93% @ 21 dB |
+| 10 | 64QAM 5/6 | 9600 | 100% @ 12 dB | 99% @ 18 dB | 97% @ 24 dB |
+
+**Pass count is unchanged: 0/27 at the literal reference SNR, 0/27 even at +12 dB margin** — the
+dominant cause remains the ladder-mismatch diagnosis above, which this fix doesn't touch. But the
+underlying FER numbers moved, almost every row improving (dropping), most visibly at
+moderate/poor for levels 5-10 (e.g. level 6 poor 100%→71%, level 9 poor 100%→93%, level 9 moderate
+100%→99%, level 10 poor 100%→97%) — the exact rows this bug's poisoning mechanism (repeated
+trials at one seq, one shared `CoppaTransceiver`, more failures to poison from at higher levels/
+worse channels) would be expected to distort most. Levels 1-4 shifted by only 1-8 points, within
+ordinary 100-trial sampling noise. **This improvement is not attributable to today's fix alone**:
+a second, separate, already-landed fix (`4761faf`, PR #42, merged before this task started) also
+changed the default decode path in the same window — `TrackedTaps::equalize`
+(`crates/coppa-codec/src/ofdm/kalman_tracker.rs:482-493`) previously fed the LDPC decoder the
+Kalman tracker's posterior tap-covariance variance instead of its fixed observation-noise floor
+(a suspected LLR-overconfidence bug, flagged at Task 7 but not fixed until PR #42), unconditionally,
+for every level's default Kalman payload-equalization pass, not just the still-disabled
+drift-tracker/cascade code paths. Both fixes were already on `main` before this re-run; this task
+did not attempt to isolate their individual contributions (out of scope for a pure re-baseline) —
+the combined, current, honestly-measured state is the table above.
+
 ### `session`: simulated 10-minute ARQ sessions — Good 3/5, Moderate 0/5, Poor 0/5 drop-free
 
 `cargo run -p coppa-bench --release --example session` drives the real `ArqTx`/`ArqRx`
@@ -730,6 +765,36 @@ ARQ's bounded 5-retransmit budget on a non-trivial fraction of trials — not an
 bug (per-trial logs show sessions surviving well into the low-SNR stretch before dropping).
 Moderate's all-5-drop result is consistent with the separately-documented Watterson-Moderate
 channel-estimation regression.
+
+**UPDATE (2026-07-26): re-run — NOT unchanged, unlike `milstd`'s harness fix does not apply here
+directly.** `session.rs` manages its own single `CoppaTransceiver` per session and never calls
+`run_trial`/`run_scenario` (confirmed: it drives `ArqTx`/`ArqRx` and `CoppaTransceiver::transmit`/
+`receive` directly), so today's stale-IR-HARQ-accumulator fix (PR #61/#62) is not in its call
+path and could not have changed its numbers. It also does not call `CoppaTransceiver::harq_evict`
+itself, but that's expected and correct: real IR-HARQ combining across a session's own naturally-
+wrapping seq numbers, gated by ARQ's window/ACK bookkeeping, is exactly what production traffic
+does — not the isolated-trial-reuse bug this task's fix targets.
+
+Fresh numbers (5 sessions/preset, same seeds, same 20→0→20 dB ramp):
+
+| Preset | Drop-free sessions | Avg. net goodput (bytes/min) |
+|---|---|---|
+| Good | 2/5 (was 3/5) | 1314.3 (was 1241.0) |
+| Moderate | 0/5 (unchanged) | 1039.2 (was 363.1) |
+| Poor | 0/5 (unchanged) | 342.1 (was 350.8) |
+
+Same seeds, same deterministic sim, no source changed *by this task* — but the numbers moved
+anyway, most dramatically Moderate's avg goodput (363.1→1039.2 bytes/min, nearly 3x). Root cause:
+between when these numbers were first measured and today, an unrelated, already-shipped fix
+(`4761faf`, PR #42, "LLR-overconfidence fix") landed on `main` and changed
+`TrackedTaps::equalize`'s default noise/LLR output (see the `milstd` UPDATE above for the same
+fix) — and that fix's own stated target was specifically Watterson-Moderate at level 2, exactly
+this bench's preset/level. That timing and target match is strong circumstantial evidence for the
+cause, but this task did not run an ablation (reverting just that one commit and re-measuring) to
+confirm it in isolation — out of scope for a pure re-baseline. The acceptance verdict itself is
+unchanged (**NOT MET** — Good still drops on 2-3 of 5 trials, Moderate/Poor still drop on all 5),
+so the "root cause: level 2's Good-preset FER isn't zero above nominal threshold" diagnosis above
+still holds; only the exact drop count and goodput figures moved.
 
 ### Golden vectors: 20 WAVs + manifest, all 20 expected to decode
 
