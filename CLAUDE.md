@@ -186,8 +186,8 @@ fixed a stale-IR-HARQ-accumulator bench-harness bug that had corrupted `mcs_cali
 per-level FER readings — the exact data `SPEED_LEVEL_MIN_CAPACITY`'s original thresholds were
 calibrated from — so this table was recalibrated from a fresh, clean `mcs_calibration` run
 (seed `0xCA11B`) using the same goodput-proxy argmax methodology as before. Every threshold in the
-9-entry table dropped (most sharply at the top: L7 6.5→4.5, L9 7.2→6.4, L10 8.0→7.6; L4 6.5's
-sibling anchor 2.6→1.8 was newly data-anchored directly at Good's lowest tested SNR, since Good
+9-entry table dropped (most sharply at the top: L7 6.5→4.5, L9 7.2→6.4, L10 8.0→7.6; L4's anchor 2.6→1.8
+was newly data-anchored directly at Good's lowest tested SNR, since Good
 turned out to never favor anything except L4 anywhere in its tested 6-30 dB range) — full
 derivation table in `BENCHMARKS.md`'s "SPEED_LEVEL_MIN_CAPACITY recalibration from clean
 (post-HARQ-fix) data" section. Re-validated against the held-out seed (`mcs_compare`, `0x5A1AD`):

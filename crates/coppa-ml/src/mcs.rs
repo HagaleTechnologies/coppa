@@ -117,9 +117,9 @@ pub const SPEED_LEVEL_MIN_CAPACITY: [(u8, f32); 9] = [
 
 /// Selectivity reference (≈ the selectivity the per-level thresholds were calibrated at, i.e. the
 /// fading channels) and the per-unit-selectivity capacity correction. Derived from the calibration
-/// grid: at C≈6, a flat channel (selectivity ≈0.6) is goodput-optimal at 16QAM 3/4 (L7) while a
-/// selective one (≈2.0) is at 16QAM 1/2 (L6); the correction shifts effective capacity to separate
-/// them.
+/// grid: at C≈4.3 (the recalibrated L6/L7 boundary, see `SPEED_LEVEL_MIN_CAPACITY`'s doc comment),
+/// a flat channel (selectivity ≈0.6) is goodput-optimal at 16QAM 3/4 (L7) while a selective one
+/// (≈2.0) is at 16QAM 1/2 (L6); the correction shifts effective capacity to separate them.
 const SELECTIVITY_REF: f32 = 1.5;
 const SELECTIVITY_GAIN: f32 = 0.7;
 

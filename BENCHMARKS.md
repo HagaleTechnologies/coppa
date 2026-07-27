@@ -112,7 +112,11 @@ The whole ladder compressed downward — every threshold dropped, most sharply a
 (L7 -2.0, L9 -0.8, L10 -0.4) — consistent with the pre-fix table having been calibrated against
 FER readings that were, at least at some grid points, corrupted upward by stale IR-HARQ carryover
 from an earlier failing trial at the same seq (the exact mechanism PR #61/#62 fixed elsewhere in
-the bench suite).
+the bench suite). Not isolated as the sole cause, in the same spirit as the `milstd`/`session`
+re-baseline above: this fresh `mcs_calibration` run also went through the default `receive()`
+decode path carrying PR #42's separate `TrackedTaps::equalize` LLR/noise-floor fix, so some of the
+downward shift may be attributable to that change too, not only to the HARQ fix. The two effects
+were not disentangled here.
 
 ### Step 4: dependent unit tests
 
