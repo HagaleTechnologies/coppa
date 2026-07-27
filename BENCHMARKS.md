@@ -13,6 +13,161 @@ payload → OFDM modulate → AWGN → demodulate/decode. SNR is **audio-band SN
 Eb/N0), swept −6…30 dB in 3 dB steps. "Goodput" = `payload_bits × (1 − FER) / frame_airtime`.
 Raw per-point data is regenerable into `results/awgn.csv` (gitignored).
 
+## 2026-07-26 — SPEED_LEVEL_MIN_CAPACITY recalibration from clean (post-HARQ-fix) data
+
+PR #61/#62 fixed a bench-harness bug where `coppa-bench`'s trial runners reused one
+`CoppaTransceiver`/`seq_num` across many `receive()` calls sharing an IR-HARQ accumulator that
+only evicts on success, so an early genuine low-SNR failure could poison every later, unrelated
+trial at the same seq. PR #62's commit message flagged one piece of explicit follow-up: whether
+`SPEED_LEVEL_MIN_CAPACITY` (`crates/coppa-ml/src/mcs.rs`), originally calibrated from
+`mcs_calibration.rs` output produced *before* that fix, is systematically off. This section is
+that recalibration, done for real.
+
+Note `mcs_calibration.rs`'s `sound()` function (which reads `channel_capacity`/`channel_selectivity`)
+never went through the shared-accumulator `receive()` path in the first place, so the raw C
+readings themselves aren't expected to change from the fix. What the fix affects is `fer()` — every
+per-level FER reading used to choose which level is goodput-optimal at a given C — and `mcs_calibration.rs`
+now unconditionally calls `tx.harq_evict(0)` after every trial (see the file's own comment
+referencing `runner.rs`'s regression test), so today's FER readings are clean.
+
+### Step 1-2: calibration grid + derivation
+
+`cargo run -p coppa-bench --release --example mcs_calibration 0xCA11B` (robust profile, 8-frame
+averaged sounding, `TRIALS=40`/level/cell, 4 channels × 5 SNRs × 9 levels = 180 `DATA` rows).
+Goodput proxy = `eta(level) * (1 - fer)` using `SPEED_LEVEL_EFFICIENCY`. For each `(channel, snr)`
+grid point, the argmax level and its goodput:
+
+| channel  | snr | C    | sel  | argmax level | goodput |
+|----------|-----|------|------|--------------|---------|
+| AWGN     | 6   | 4.53 | 0.20 | **L7**       | 3.000 (FER=0.00 for L1-L7 already; only L9/L10 not yet converged) |
+| AWGN     | 12  | 6.43 | 0.19 | **L9**       | 4.000 (FER=0.00) |
+| AWGN     | 18  | 7.64 | 0.19 | **L10**      | 5.119 (FER=0.025) |
+| AWGN     | 24  | 8.18 | 0.19 | L10          | 4.856 |
+| AWGN     | 30  | 8.36 | 0.19 | L10          | 4.856 |
+| Good     | 6   | 1.82 | 0.42 | **L4**       | 1.050 |
+| Good     | 12  | 2.11 | 0.45 | L4           | 1.050 |
+| Good     | 18  | 2.22 | 0.46 | L4           | 1.087 |
+| Good     | 24  | 2.24 | 0.46 | L4           | 1.087 |
+| Good     | 30  | 2.25 | 0.46 | L4           | 1.087 |
+| Moderate | 6   | 1.35 | 0.25 | L4           | 0.788 |
+| Moderate | 12  | 1.68 | 0.33 | L6 (0.900) vs L4 (0.870) — 3-pt margin, within 40-trial noise | |
+| Moderate | 18  | 1.91 | 0.40 | L4           | 0.938 |
+| Moderate | 24  | 1.94 | 0.40 | L4 (0.930) vs L6 (0.900) — flips to L6 at 30 dB, same C | |
+| Moderate | 30  | 1.94 | 0.40 | L6 (1.000) vs L4 (0.930) — the flip referenced above | |
+| Poor     | *   | 1.26-2.32 | 0.47-0.76 | L6 @ 1.26, then L7 from 1.92 up | excluded from anchoring (outage-floor channel, same precedent as the original table) |
+
+**Anchors used** (lowest tested C where a level is the clean, unambiguous argmax in AWGN, then
+Good — Moderate/Poor are informative but not anchor sources, same convention the original table's
+own doc comment used):
+
+- **L7 @ C=4.53** (AWGN 6 dB) — AWGN's waterfall is steep enough that L1-L7 already read FER=0.00
+  at the *lowest tested* AWGN grid point, so the highest-eta among them (L7, eta=3.0) wins
+  outright; L9 (eta=4.0, FER=0.325 there) and L10 (FER=1.0) aren't yet converged enough to compete.
+- **L9 @ C=6.43** (AWGN 12 dB) — first point where L9 itself reads FER=0.00.
+- **L10 @ C=7.64** (AWGN 18 dB) — first point where L10's goodput (5.119, at FER=0.025) exceeds
+  L9's (4.000, FER=0.00).
+- **L4 @ C=1.82** (Good 6 dB) — L4 is the *only* level that is ever goodput-optimal anywhere across
+  Good's whole tested 6-30 dB range; there is no C in the tested Good sweep where anything else wins.
+
+**L2/L3/L5/L6 have no unambiguous single-level win anywhere in the tested clean-region grid**: L2
+and L3 never win in *any* tested (channel, SNR) cell at all (not even in Poor's lowest-C point);
+L5 never wins anywhere; L6's apparent wins in Moderate (C=1.68 and C=1.94) are within sampling
+noise of a tie with L4 — at C=1.94 specifically, the argmax literally flips between the 24 dB and
+30 dB grid points (a 2-percentage-point FER wobble, well inside a 40-trial Bernoulli confidence
+interval) despite testing essentially the same C, the signature of noise rather than a real
+transition. L6's one clean win is in Poor at C=1.26, and Poor is the known outage-floor channel
+excluded from anchoring (same precedent the *original* table's own doc comment used — it never
+cited Poor as an anchor source either).
+
+Per the brief's "conservative in an ambiguous/untested region" rule (same principle the original
+table used to resolve its AWGN-vs-Good C≈5.9-6.4 overlap), these four un-anchored levels
+(L2, L3, L5, L6) are **interpolated**, not directly anchored, by preserving the *previous* table's
+relative fractional position within each newly-anchored bracketing interval:
+
+- L2, L3 interpolated between L1=0.0 and the new L4=1.82, using the same fraction the old table's
+  L2=1.5, L3=2.2 held within the old [L1=0.0, L4=2.6] interval (0.577, 0.846) → L2=1.05→1.1,
+  L3=1.54→1.5.
+- L5, L6 interpolated between the new L4=1.82 and new L7=4.53, using the same fraction the old
+  table's L5=3.0, L6=4.0 held within the old [L4=2.6, L7=6.5] interval (0.103, 0.359) →
+  L5=2.10→2.1, L6=2.79→2.8.
+
+Sanity-checked against `select_speed_level_calibrated_is_monotonic` (table index non-decreasing
+as C grows) by eye and by the test itself — passes.
+
+### Step 3: old vs. new table
+
+| level | old `C_min` | new `C_min` | anchor type |
+|-------|-------------|-------------|-------------|
+| 1     | 0.0         | 0.0         | baseline convention (unchanged) |
+| 2     | 1.5         | 1.1         | interpolated |
+| 3     | 2.2         | 1.5         | interpolated |
+| 4     | 2.6         | **1.8**     | **data-anchored** (Good 6 dB) |
+| 5     | 3.0         | 2.1         | interpolated |
+| 6     | 4.0         | 2.8         | interpolated |
+| 7     | 6.5         | **4.5**     | **data-anchored** (AWGN 6 dB) |
+| 9     | 7.2         | **6.4**     | **data-anchored** (AWGN 12 dB) |
+| 10    | 8.0         | **7.6**     | **data-anchored** (AWGN 18 dB) |
+
+The whole ladder compressed downward — every threshold dropped, most sharply at the top
+(L7 -2.0, L9 -0.8, L10 -0.4) — consistent with the pre-fix table having been calibrated against
+FER readings that were, at least at some grid points, corrupted upward by stale IR-HARQ carryover
+from an earlier failing trial at the same seq (the exact mechanism PR #61/#62 fixed elsewhere in
+the bench suite). Not isolated as the sole cause, in the same spirit as the `milstd`/`session`
+re-baseline above: this fresh `mcs_calibration` run also went through the default `receive()`
+decode path carrying PR #42's separate `TrackedTaps::equalize` LLR/noise-floor fix, so some of the
+downward shift may be attributable to that change too, not only to the HARQ fix. The two effects
+were not disentangled here.
+
+### Step 4: dependent unit tests
+
+`select_speed_level_calibrated_uses_thresholds` and `select_speed_level_2d_separates_overlap`
+(`crates/coppa-ml/src/mcs.rs`) had their hardcoded `C`/expected-level literals retargeted to the
+new table (same assertion *shape* — boundary + conservative-region + overlap-resolution — just
+new numbers). `cargo test -p coppa-ml --lib mcs::` — 15/15 pass.
+
+### Step 5: held-out-seed validation (`mcs_compare`, seed 0x5A1AD)
+
+| selector       | pre-fix baseline (PR #62) | recalibrated |
+|----------------|---------------------------|--------------|
+| calibrated(C)  | 0.741                     | **0.859**    |
+| 2D(C, sel)     | 0.828                     | **0.892**    |
+
+Both aggregate ratios (adaptive-selector goodput ÷ per-cell oracle goodput, held-out seed) improve
+meaningfully — the recalibration is a real, unambiguous win on this metric.
+
+### Step 6: `closed_loop_arq` — the real point of this task
+
+```
+adaptive throughput : 326680 bits
+best fixed (L4)     : 357424 bits
+per-frame oracle    : 428936 bits
+adaptive/oracle = 0.762   adaptive/best-fixed = 0.914
+```
+
+Compared against the current committed baseline (0.931/0.775, from PR #58's active overshoot
+probing) and the plan's acceptance bar (`adaptive/best-fixed > 1.0`, `adaptive/oracle >= 0.8`):
+
+- **adaptive/best-fixed: 0.931 → 0.914** (slightly worse)
+- **adaptive/oracle: 0.775 → 0.762** (slightly worse)
+- **The acceptance bar is still not met.** Both ratios move in the wrong direction, though only
+  marginally (within the kind of run-to-run noise band this bench has shown at other points in its
+  history) — this is **not** the "recalibration closes the gap" outcome, and is reported plainly
+  rather than adjusted or buried. `mcs_compare`'s held-out-seed win (Step 5) does not transfer into
+  a `closed_loop_arq` win; the two benches are measuring different things (a static-oracle-vs-selector
+  ratio at fixed channel snapshots, vs. a live closed-loop hysteresis-and-probing system's aggregate
+  throughput over a full non-stationary SNR trajectory), and this result shows they can move in
+  different directions from the same underlying table change.
+
+**Conclusion:** `SPEED_LEVEL_MIN_CAPACITY`'s recalibration from clean, HARQ-fix-correct data was
+real, necessary follow-up work (the old table's anchors were partly derived from corrupted FER
+readings, and the new table's anchors are meaningfully different — every threshold dropped), and it
+measurably improves the static `mcs_compare` selector-accuracy metric. It does **not**, however,
+move `RateLoop`'s `closed_loop_arq` acceptance-bar shortfall — the gap there remains open, for the
+same reasons already tracked in CLAUDE.md's RateLoop bullet (the raw per-frame recommendation
+signal's volatility during fast fading, not the calibration table's own accuracy, is still believed
+to be the dominant remaining factor). See CLAUDE.md's RateLoop Known Limitations bullet for the
+updated framing.
+
 ## 2026-07 — RateLoop capacity-metric level-bias diagnosis
 
 CLAUDE.md's `RateLoop` known-limitation bullet root-causes its unmet acceptance bar to
@@ -704,6 +859,41 @@ re-measuring level 9 post-fix under both Watterson Good and Poor (200 trials/poi
 shows it never clearing FER≤10% on either preset (peak goodput 330 bps Good / 132 bps Poor) — the
 fading-side non-convergence is a real, separate, still-open gap, not a rehash of this bench bug.
 
+**UPDATE (2026-07-26): full 27-point `milstd` ladder re-measured now that the fix above is
+committed (`ba98a23`/`f125ad3`, PR #61/#62) — `milstd` calls `run_scenario`/`run_trial` directly,
+so it was fully in-scope for the same fix.** Fresh run (100 trials/point, same 27 operating
+points, `hf_standard` forced per level as before):
+
+| Level | Mode | Rate class (bps) | Good | Moderate | Poor |
+|---|---|---|---|---|---|
+| 1 | BPSK 1/4 | 75 | 100% FER @ −9 dB | 98% @ −3 dB | 63% @ 3 dB |
+| 2 | BPSK 1/2 | 150 | 100% @ −6 dB | 89% @ 0 dB | 64% @ 6 dB |
+| 3 | QPSK 1/2 | 300 | 99% @ −3 dB | 81% @ 3 dB | 54% @ 9 dB |
+| 4 | QPSK 3/4 | 600 | 99% @ 0 dB | 86% @ 6 dB | 65% @ 12 dB |
+| 5 | 8PSK 2/3 | 1200 | 100% @ 3 dB | 93% @ 9 dB | 70% @ 15 dB |
+| 6 | 16QAM 1/2 | 1200 | 99% @ 3 dB | 91% @ 9 dB | 71% @ 15 dB |
+| 7 | 16QAM 3/4 | 2400 | 100% @ 6 dB | 99% @ 12 dB | 84% @ 18 dB |
+| 9 | 64QAM 2/3 | 4800 | 100% @ 9 dB | 99% @ 15 dB | 93% @ 21 dB |
+| 10 | 64QAM 5/6 | 9600 | 100% @ 12 dB | 99% @ 18 dB | 97% @ 24 dB |
+
+**Pass count is unchanged: 0/27 at the literal reference SNR, 0/27 even at +12 dB margin** — the
+dominant cause remains the ladder-mismatch diagnosis above, which this fix doesn't touch. But the
+underlying FER numbers moved, almost every row improving (dropping), most visibly at
+moderate/poor for levels 5-10 (e.g. level 6 poor 100%→71%, level 9 poor 100%→93%, level 9 moderate
+100%→99%, level 10 poor 100%→97%) — the exact rows this bug's poisoning mechanism (repeated
+trials at one seq, one shared `CoppaTransceiver`, more failures to poison from at higher levels/
+worse channels) would be expected to distort most. Levels 1-4 shifted by only 1-8 points, within
+ordinary 100-trial sampling noise. **This improvement is not attributable to today's fix alone**:
+a second, separate, already-landed fix (`4761faf`, PR #42, merged before this task started) also
+changed the default decode path in the same window — `TrackedTaps::equalize`
+(`crates/coppa-codec/src/ofdm/kalman_tracker.rs:482-493`) previously fed the LDPC decoder the
+Kalman tracker's posterior tap-covariance variance instead of its fixed observation-noise floor
+(a suspected LLR-overconfidence bug, flagged at Task 7 but not fixed until PR #42), unconditionally,
+for every level's default Kalman payload-equalization pass, not just the still-disabled
+drift-tracker/cascade code paths. Both fixes were already on `main` before this re-run; this task
+did not attempt to isolate their individual contributions (out of scope for a pure re-baseline) —
+the combined, current, honestly-measured state is the table above.
+
 ### `session`: simulated 10-minute ARQ sessions — Good 3/5, Moderate 0/5, Poor 0/5 drop-free
 
 `cargo run -p coppa-bench --release --example session` drives the real `ArqTx`/`ArqRx`
@@ -730,6 +920,36 @@ ARQ's bounded 5-retransmit budget on a non-trivial fraction of trials — not an
 bug (per-trial logs show sessions surviving well into the low-SNR stretch before dropping).
 Moderate's all-5-drop result is consistent with the separately-documented Watterson-Moderate
 channel-estimation regression.
+
+**UPDATE (2026-07-26): re-run — numbers moved, even though `milstd`'s harness fix does not apply
+here directly.** `session.rs` manages its own single `CoppaTransceiver` per session and never calls
+`run_trial`/`run_scenario` (confirmed: it drives `ArqTx`/`ArqRx` and `CoppaTransceiver::transmit`/
+`receive` directly), so today's stale-IR-HARQ-accumulator fix (PR #61/#62) is not in its call
+path and could not have changed its numbers. It also does not call `CoppaTransceiver::harq_evict`
+itself, but that's expected and correct: real IR-HARQ combining across a session's own naturally-
+wrapping seq numbers, gated by ARQ's window/ACK bookkeeping, is exactly what production traffic
+does — not the isolated-trial-reuse bug this task's fix targets.
+
+Fresh numbers (5 sessions/preset, same seeds, same 20→0→20 dB ramp):
+
+| Preset | Drop-free sessions | Avg. net goodput (bytes/min) |
+|---|---|---|
+| Good | 2/5 (was 3/5) | 1314.3 (was 1241.0) |
+| Moderate | 0/5 (unchanged) | 1039.2 (was 363.1) |
+| Poor | 0/5 (unchanged) | 342.1 (was 350.8) |
+
+Same seeds, same deterministic sim, no source changed *by this task* — but the numbers moved
+anyway, most dramatically Moderate's avg goodput (363.1→1039.2 bytes/min, nearly 3x). Root cause:
+between when these numbers were first measured and today, an unrelated, already-shipped fix
+(`4761faf`, PR #42, "LLR-overconfidence fix") landed on `main` and changed
+`TrackedTaps::equalize`'s default noise/LLR output (see the `milstd` UPDATE above for the same
+fix) — and that fix's own stated target was specifically Watterson-Moderate at level 2, exactly
+this bench's preset/level. That timing and target match is strong circumstantial evidence for the
+cause, but this task did not run an ablation (reverting just that one commit and re-measuring) to
+confirm it in isolation — out of scope for a pure re-baseline. The acceptance verdict itself is
+unchanged (**NOT MET** — Good still drops on 2-3 of 5 trials, Moderate/Poor still drop on all 5),
+so the "root cause: level 2's Good-preset FER isn't zero above nominal threshold" diagnosis above
+still holds; only the exact drop count and goodput figures moved.
 
 ### Golden vectors: 20 WAVs + manifest, all 20 expected to decode
 
