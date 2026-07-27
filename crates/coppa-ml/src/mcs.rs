@@ -72,21 +72,47 @@ pub fn select_speed_level(capacity: f32, margin: f32) -> u8 {
 }
 
 /// (speed level, minimum average per-carrier capacity C at which the level is goodput-optimal),
-/// ascending. Calibrated from a measured grid sweep (`mcs_calibration` example, robust profile,
-/// seed 0xCA11B, 8-frame averaged sounding): thresholds are anchored by the clean regions —
-/// Good/Moderate→16QAM 1/2 (L6) at C≈4–6.4, AWGN→16QAM 3/4 (L7) @5.9 / 64QAM 2/3 (L9) @7.25 /
-/// 64QAM 7/8 (L10) @8.1 — and made conservative in the C≈5.9–6.4 overlap where the goodput-optimal
-/// level is channel-dependent (AWGN wants L7, Good wants L6), so the safe L6 is chosen there.
+/// ascending. **Recalibrated 2026-07-26** from a clean grid sweep (`mcs_calibration` example,
+/// robust profile, seed 0xCA11B, 8-frame averaged sounding, `TRIALS=40`/level/cell) run *after*
+/// PR #61/#62's stale-IR-HARQ-accumulator bench fix. That fix didn't touch this file's `sound()`
+/// path (which never used the shared-accumulator `receive()` call), but it did affect the
+/// per-level `fer()` readings the goodput-optimal levels below are computed from, and the
+/// original 2026-07 table (`(6,4.0),(7,6.5),(9,7.2),(10,8.0)`) was calibrated against those
+/// pre-fix, HARQ-poisoned FER readings.
+///
+/// Directly data-anchored (lowest tested C at which the level is the unambiguous
+/// `eta * (1 - fer)` goodput-proxy argmax across the clean AWGN/Good regions):
+/// AWGN→16QAM 3/4 (L7) @ C=4.5 (AWGN's waterfall is steep enough that every level 1-7 already
+/// reads FER=0.00 at the *lowest tested* AWGN grid point, 6 dB, so the highest-eta among them,
+/// L7, wins outright by a landslide; L9/L10 aren't yet at FER=0 there) / 64QAM 2/3 (L9) @ C=6.4 /
+/// 64QAM 7/8 (L10) @ C=7.6; Good→16QAM 1/2's L6 turned out not to win anywhere in Good's tested
+/// range at all — the only level that is ever goodput-optimal across Good's whole 6-30 dB sweep
+/// is QPSK 3/4 (L4), first at C=1.8.
+///
+/// L2/L3/L5/L6 have no unambiguous single-level win anywhere in the tested clean-region grid: L2
+/// and L3 never win in *any* tested channel/SNR cell; L5 never wins; L6's apparent wins in
+/// Moderate (C=1.68 and C=1.94) are within sampling noise of a tie with L4 — the argmax flips
+/// between adjacent SNR points at nearly the *same* C (e.g. at C=1.94, 24 dB picks L4 and 30 dB
+/// picks L6, a 2-point FER wobble well inside a 40-trial Bernoulli confidence interval), the
+/// signature of noise rather than a real transition, and its one clean win is in Poor at C=1.26 —
+/// Poor is the known outage-floor channel excluded from anchoring here, same as the original
+/// table's own precedent. Per the same "conservative in an ambiguous/untested region" rule the
+/// original table used, these four are interpolated (not directly anchored) within their bracketing
+/// anchored interval, preserving the *previous* table's relative spacing inside each interval
+/// (e.g. L6 sits at the same fractional position between the new L4 and L7 anchors that the old
+/// L6 sat between the old L4 and L7 anchors) rather than a blind refit. See `BENCHMARKS.md`'s
+/// "SPEED_LEVEL_MIN_CAPACITY recalibration from clean (post-HARQ-fix) data" section for the full
+/// derivation table.
 pub const SPEED_LEVEL_MIN_CAPACITY: [(u8, f32); 9] = [
     (1, 0.0),
-    (2, 1.5),
-    (3, 2.2),
-    (4, 2.6),
-    (5, 3.0),
-    (6, 4.0),
-    (7, 6.5),
-    (9, 7.2),
-    (10, 8.0),
+    (2, 1.1),
+    (3, 1.5),
+    (4, 1.8),
+    (5, 2.1),
+    (6, 2.8),
+    (7, 4.5),
+    (9, 6.4),
+    (10, 7.6),
 ];
 
 /// Selectivity reference (≈ the selectivity the per-level thresholds were calibrated at, i.e. the
@@ -292,19 +318,22 @@ mod tests {
     #[test]
     fn select_speed_level_calibrated_uses_thresholds() {
         assert_eq!(select_speed_level_calibrated(0.0), 1); // below all but L1's 0.0
-        assert_eq!(select_speed_level_calibrated(2.4), 3); // >=2.2 (L3), <2.6 (L4)
-        assert_eq!(select_speed_level_calibrated(5.0), 6); // >=4.0 (L6), <6.5 (L7)
-        assert_eq!(select_speed_level_calibrated(6.0), 6); // conservative overlap region
-        assert_eq!(select_speed_level_calibrated(7.25), 9); // >=7.2 (L9), <8.0 (L10)
+        assert_eq!(select_speed_level_calibrated(1.6), 3); // >=1.5 (L3), <1.8 (L4)
+        assert_eq!(select_speed_level_calibrated(3.0), 6); // >=2.8 (L6), <4.5 (L7)
+        assert_eq!(select_speed_level_calibrated(4.4), 6); // still L6 just below the AWGN-anchored
+                                                           // L7 threshold -- the untested
+                                                           // C=2.25-4.5 gap is conservatively kept
+                                                           // at L6 rather than assumed to jump early
+        assert_eq!(select_speed_level_calibrated(7.0), 9); // >=6.4 (L9), <7.6 (L10)
         assert_eq!(select_speed_level_calibrated(8.5), 10);
     }
 
     #[test]
     fn select_speed_level_2d_separates_overlap() {
-        // Same average capacity (~6), different selectivity: a flat channel (AWGN-like) should
+        // Same average capacity (~4.3), different selectivity: a flat channel (AWGN-like) should
         // reach a higher order than a selective one (fading), resolving the C-alone ambiguity.
-        let flat = select_speed_level_2d(6.0, 0.6);
-        let selective = select_speed_level_2d(6.0, 2.1);
+        let flat = select_speed_level_2d(4.3, 0.6);
+        let selective = select_speed_level_2d(4.3, 2.1);
         assert!(
             flat > selective,
             "flat {flat} should exceed selective {selective} at equal C"
