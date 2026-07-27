@@ -766,8 +766,8 @@ bug (per-trial logs show sessions surviving well into the low-SNR stretch before
 Moderate's all-5-drop result is consistent with the separately-documented Watterson-Moderate
 channel-estimation regression.
 
-**UPDATE (2026-07-26): re-run — NOT unchanged, unlike `milstd`'s harness fix does not apply here
-directly.** `session.rs` manages its own single `CoppaTransceiver` per session and never calls
+**UPDATE (2026-07-26): re-run — numbers moved, even though `milstd`'s harness fix does not apply
+here directly.** `session.rs` manages its own single `CoppaTransceiver` per session and never calls
 `run_trial`/`run_scenario` (confirmed: it drives `ArqTx`/`ArqRx` and `CoppaTransceiver::transmit`/
 `receive` directly), so today's stale-IR-HARQ-accumulator fix (PR #61/#62) is not in its call
 path and could not have changed its numbers. It also does not call `CoppaTransceiver::harq_evict`
