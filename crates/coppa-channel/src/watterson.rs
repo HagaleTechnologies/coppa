@@ -166,15 +166,30 @@ pub fn watterson(
     config: &WattersonConfig,
     seed: u64,
 ) -> Vec<f32> {
+    watterson_with_gains(samples, sample_rate, config, seed).0
+}
+
+/// Same as [`watterson`], but also returns each tap's raw (pre-amplitude) complex fading gain
+/// array `g` (one value per output sample), for ground-truth diagnostics that need the actual
+/// per-subcarrier channel response `H(f, t) = sum_taps sqrt(tap.power) * g_tap[t] *
+/// exp(-i*2*pi*f*tap.delay_s)` a given seed produced, not just the time-domain output. Returned in
+/// the same order as `config.taps`.
+pub fn watterson_with_gains(
+    samples: &[f32],
+    sample_rate: f32,
+    config: &WattersonConfig,
+    seed: u64,
+) -> (Vec<f32>, Vec<(Tap, Vec<Complex32>)>) {
     let n = samples.len();
     if n == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let fft = FftProcessor::new(n);
     let mut rng = StdRng::seed_from_u64(seed);
 
     let a = analytic(&fft, samples);
     let mut out = vec![Complex32::new(0.0, 0.0); n];
+    let mut gains = Vec::with_capacity(config.taps.len());
     for tap in &config.taps {
         let delay = (tap.delay_s * sample_rate).round() as usize;
         let amp = tap.power.max(0.0).sqrt();
@@ -182,12 +197,13 @@ pub fn watterson(
         for i in delay..n {
             out[i] += a[i - delay] * g[i] * amp;
         }
+        gains.push((*tap, g));
     }
 
     // No output renormalization: tap powers sum to 1 and the fading process is
     // ensemble-unit-power, so the ENSEMBLE average output power equals the input
     // power, while each frame keeps its Rayleigh fade (a deep fade arrives quiet).
-    out.iter().map(|c| c.re).collect()
+    (out.iter().map(|c| c.re).collect(), gains)
 }
 
 /// Convenience: pass through a named preset channel.
@@ -308,6 +324,22 @@ mod tests {
              amplitude-sigma=0.5 convention's ~0.95 and the original sigma=spread \
              convention's ~0.67), got {rho}"
         );
+    }
+
+    #[test]
+    fn watterson_with_gains_matches_watterson_output() {
+        // watterson() must delegate to watterson_with_gains() and return the identical
+        // time-domain output (not just something derived from it).
+        let x = test_signal(4096);
+        let cfg = WattersonPreset::Moderate.config();
+        let plain = watterson(&x, 48_000.0, &cfg, 7);
+        let (with_gains, gains) = watterson_with_gains(&x, 48_000.0, &cfg, 7);
+        assert_eq!(plain, with_gains);
+        assert_eq!(gains.len(), cfg.taps.len());
+        for (tap, g) in &gains {
+            assert_eq!(g.len(), x.len());
+            assert!(cfg.taps.iter().any(|t| t.delay_s == tap.delay_s));
+        }
     }
 
     #[test]
