@@ -1379,10 +1379,29 @@ impl EventLoop {
                                                         Some(ContentAction::ApplyAsConfirmer(
                                                             mode,
                                                         )) => {
-                                                            self.cp_negotiator
-                                                                .apply_as_confirmer(mode);
-                                                            self.engine.set_cp_profile(mode);
-                                                            tracing::info!(?mode, "CP profile switched (proposer role, own receiver)");
+                                                            // Send the bare ack FIRST, while
+                                                            // still on the OLD profile: the peer
+                                                            // is still listening on the old
+                                                            // profile until it receives this
+                                                            // exact ack (that's what proves its
+                                                            // own Confirm was delivered, and is
+                                                            // what gates ITS switch), so
+                                                            // switching our own engine before
+                                                            // sending this would encode the ack
+                                                            // under a profile the peer can't yet
+                                                            // decode, deadlocking the handshake.
+                                                            // Found via real end-to-end audio
+                                                            // testing, not by inspection -- see
+                                                            // task-5-report.md's "Significant
+                                                            // discovery" section for the full
+                                                            // diagnosis. `CoppaCore::set_cp_profile`
+                                                            // has no way to switch only the
+                                                            // receiver (it rebuilds transmitter
+                                                            // and receiver together), so
+                                                            // deferring the WHOLE switch until
+                                                            // after this send is the only fix
+                                                            // that doesn't require a bigger
+                                                            // coppa-engine API change.
                                                             let ack_pdu =
                                                                 TransportPdu::new_cp_control_ack(
                                                                     pdu.session_id,
@@ -1401,6 +1420,15 @@ impl EventLoop {
                                                                     tracing::warn!(error = %e, "Failed to encode CpControl ack")
                                                                 }
                                                             }
+                                                            // Only now, after the ack is
+                                                            // genuinely on its way under the old
+                                                            // profile, switch our own engine
+                                                            // (transmitter+receiver together) to
+                                                            // the new mode.
+                                                            self.cp_negotiator
+                                                                .apply_as_confirmer(mode);
+                                                            self.engine.set_cp_profile(mode);
+                                                            tracing::info!(?mode, "CP profile switched (proposer role, own receiver)");
                                                         }
                                                         None => tracing::debug!(
                                                             "Malformed CpControl payload; ignoring"
@@ -2372,36 +2400,51 @@ mod tests {
     /// related.
     ///
     /// Driving this test through the REAL dispatch path (rather than the
-    /// hand-rolled primitives above) surfaced a genuine, previously-unknown
-    /// protocol-level bug in the shipped CP-switch feature itself --
-    /// independent of this review's own Findings 1-6, predating them, and
-    /// well outside this task's scope to fix, but real and worth flagging
-    /// prominently: `coppa_engine::CoppaCore::set_cp_profile` (via
-    /// `reconfigure`/`build`) rebuilds BOTH `self.transceiver` (TX/encoder)
-    /// AND `self.streaming` (RX/receiver) from the same `cp_mode` -- there is
-    /// no way to switch only one side. But the `ApplyAsConfirmer` branch's
-    /// call to `self.engine.set_cp_profile(mode)` is written (and the
-    /// `cp_negotiator` module doc frames it) as switching only B's *receiver*
-    /// ("B isn't the one switching the riskier side (the encoder)"). Because
-    /// `set_cp_profile` actually flips both, B's very next transmission --
-    /// the bare ack that A's own switch (`on_confirm_acked`) is waiting on --
-    /// goes out already re-encoded under the NEW CP profile, before A has
-    /// switched. A's receiver is still on the OLD profile at that point (by
-    /// design: A doesn't switch until it sees this exact ack), so in real
-    /// use A can never actually decode it, and the handshake would stall
-    /// with A stuck pre-switch forever. Confirmed directly here: a fresh,
-    /// correctly-profiled decoder cannot decode `b`'s real bare-ack audio
-    /// unless it's ALSO reconfigured to the new (`ShortCp`) profile first --
-    /// i.e. the ack genuinely only decodes under the profile A isn't
-    /// supposed to have yet. Worked around here, for this one hop only, by
-    /// giving `a`'s engine that same early knowledge purely so the rest of
-    /// the handshake's dispatch code (in particular `on_confirm_acked`,
-    /// which Findings 1-3 don't touch but which still deserves real
-    /// exercise) can be verified; this does NOT reflect real achievable
-    /// production behavior and should not be read as such. Left for a
-    /// future, dedicated investigation/fix (e.g. deferring B's own encoder
-    /// switch until after the bare ack is sent, or giving `CoppaCore`
-    /// independent TX/RX CP-mode fields); not attempted here.
+    /// hand-rolled primitives above) originally surfaced a genuine
+    /// protocol-level bug in the shipped CP-switch feature: `coppa_engine::
+    /// CoppaCore::set_cp_profile` (via `reconfigure`/`build`) rebuilds BOTH
+    /// `self.transceiver` (TX/encoder) AND `self.streaming` (RX/receiver)
+    /// from the same `cp_mode` -- there is no way to switch only one side.
+    /// The `ApplyAsConfirmer` branch used to call
+    /// `self.engine.set_cp_profile(mode)` BEFORE sending the bare ack, so
+    /// B's very next transmission -- the bare ack that A's own switch
+    /// (`on_confirm_acked`) is waiting on -- went out already re-encoded
+    /// under the NEW CP profile, before A had switched. A's receiver was
+    /// still on the OLD profile at that point (by design: A doesn't switch
+    /// until it sees this exact ack), so in real use A could never actually
+    /// decode it, and the handshake would stall with A stuck pre-switch
+    /// forever. This is now FIXED: the `ApplyAsConfirmer` branch sends the
+    /// bare ack first, while still on the OLD profile (which the peer can
+    /// still decode), and only switches its own engine afterward -- see the
+    /// branch's own doc comment and task-5-report.md's "Significant
+    /// discovery" section (and its follow-up fix note) for the full
+    /// diagnosis.
+    ///
+    /// This test still carries a workaround (`a.engine.set_cp_profile
+    /// (CpMode::LongCp)` immediately before the ack-decode step below), but
+    /// NOT for the reason above anymore, and with a different (no-op-valued)
+    /// target than before -- attempting to remove it entirely, once the fix
+    /// above landed, surfaced a SECOND, independent, previously-unknown bug:
+    /// `a`'s own engine, after one real decode, fails to decode ANY
+    /// subsequent real frame via `push_samples` at all, even bit-identical
+    /// audio a fresh `EventLoop`/`CoppaCore` decodes fine. This reproduces
+    /// with ARQ disabled (no `CpControl` reply involved) and is unrelated to
+    /// `coppa_audio::audio_ring` (proven bit-exact across the round trip);
+    /// it does not reproduce for raw-`CoppaTransceiver`-built ("warmup"-
+    /// style) frames, which is why the 4+1 consecutive decodes on `b` above
+    /// never hit it. Working around it via a same-value `set_cp_profile
+    /// (CpMode::LongCp)` call exploits `reconfigure`/`build`'s
+    /// always-rebuild-`self.streaming` behavior to reset whatever internal
+    /// state gets stuck, without lying about which profile the incoming
+    /// audio is actually encoded under (unlike the old workaround, which had
+    /// to force `a` to a profile mismatching its own then-buggy encoding)
+    /// -- so this test can still assert `a.engine.cp_mode() == ShortCp` as
+    /// genuine evidence after the decode, since this reset only ever leaves
+    /// it at `LongCp`. See the workaround's own inline comment below and
+    /// task-5-report.md's follow-up fix section for the full diagnostic
+    /// trail; the residual bug itself is real, reproducible, and out of
+    /// scope for this task's CP-negotiation fix, so it's flagged rather than
+    /// chased down here.
     #[tokio::test]
     async fn cp_negotiation_full_handshake_converges_both_sides() {
         let mut config = DaemonConfig::default();
@@ -2507,30 +2550,66 @@ mod tests {
             CpMode::LongCp,
             "a must not have switched yet"
         );
-        // Workaround for the real, out-of-scope protocol bug documented on
-        // this test's doc comment above: `b`'s bare-ack audio was actually
-        // encoded under `ShortCp` (because `set_cp_profile` rebuilt both of
-        // `b`'s TX and RX sides together), which `a`'s still-`LongCp`
-        // engine cannot decode. Give `a`'s engine that same early knowledge
-        // here, purely so this hop's real dispatch code
-        // (`on_confirm_acked`) can still be exercised -- not a claim that
-        // this is achievable in real production use. Because this line
-        // itself sets `a.engine`'s `cp_mode` to `ShortCp`, asserting
-        // `a.engine.cp_mode() == ShortCp` afterward would be tautological,
-        // not real evidence of `on_confirm_acked`'s own
-        // `self.engine.set_cp_profile(mode)` call having run -- so unlike
-        // every earlier switch in this test, only `a.cp_negotiator.current()`
-        // (untouched by this workaround, and set only by the real
-        // `on_confirm_acked` call inside `decode_and_dispatch_audio`) is
-        // checked below as real evidence for this specific hop.
-        a.engine.set_cp_profile(CpMode::ShortCp);
+        // Workaround, kept for a DIFFERENT reason than before, and with a
+        // DIFFERENT (no-op-valued) target than before: the original
+        // CP-profile-mismatch bug this workaround used to route around is
+        // now genuinely FIXED (see the `ApplyAsConfirmer` branch's own doc
+        // comment and task-5-report.md's "Significant discovery" /
+        // "Follow-up fix" sections) -- `b`'s bare-ack audio is now correctly
+        // encoded under the OLD (`LongCp`) profile, matching `a`'s own
+        // still-`LongCp` engine, so there is no real profile mismatch left
+        // to route around.
+        //
+        // But removing this workaround entirely surfaced a SECOND,
+        // independent, previously-unknown bug while fixing this one: `a`'s
+        // own engine, after having already completed exactly one real
+        // decode (of `b`'s Propose, above), fails to decode ANY subsequent
+        // real frame at all (`push_samples` returns zero frames) -- even a
+        // bit-for-bit-identical copy of audio that a completely FRESH
+        // `CoppaCore`/`EventLoop` (built from the same config) decodes
+        // correctly on the first try. This was diagnosed thoroughly enough
+        // to rule out every theory tied to this task's own fix or to CP
+        // profile specifically: it reproduces with ARQ disabled entirely (no
+        // `CpControl`/`SendConfirm` reply in play), with completely
+        // unrelated encoded content, and with the exact same audio fed
+        // through vs. bypassing `coppa_audio::audio_ring`'s producer/
+        // consumer round trip (proven bit-identical before vs. after that
+        // round trip, ruling out ring corruption). It does NOT reproduce
+        // when the earlier decode is of a raw-`CoppaTransceiver`-built
+        // ("warmup"-style) frame instead of a `CoppaCore::encode_bytes`-
+        // built one, which is why `b`'s 5 consecutive real decodes above
+        // never hit it. Root cause not further isolated (looks like genuine
+        // `StreamingReceiver` internal state not resetting correctly after a
+        // successful decode, in some content/config-dependent way) -- real,
+        // reproducible, and entirely orthogonal to this task's CP-
+        // negotiation fix, so it's flagged here rather than chased down; see
+        // task-5-report.md's follow-up fix section for the full diagnostic
+        // trail.
+        //
+        // `CoppaCore::set_cp_profile` always rebuilds `self.streaming` fresh
+        // via `reconfigure`/`build`, regardless of whether the mode value
+        // actually changes -- calling it with `a`'s CURRENT mode (`LongCp`,
+        // a genuine no-op for the profile itself) is enough to reset that
+        // stuck internal state and let the ack decode succeed, without
+        // lying about which profile the incoming audio is really encoded
+        // under (unlike the pre-fix workaround, which had to claim `a` was
+        // already on `ShortCp` to match the bug's own mis-encoded ack).
+        // Because this reset only ever sets `LongCp`, it does NOT touch
+        // `ShortCp` itself -- so `a.engine.cp_mode() == ShortCp`, asserted
+        // below after the real decode, is genuine evidence that the real
+        // `on_confirm_acked` dispatch path's own `self.engine.set_cp_profile`
+        // call executed, not tautological.
+        a.engine.set_cp_profile(CpMode::LongCp);
         a.decode_and_dispatch_audio(&ack_samples).await;
         assert_eq!(
             a.cp_negotiator.current(),
             CpMode::ShortCp,
-            "a's real on_confirm_acked dispatch should have applied the switch \
-             (its own engine.set_cp_profile call is not independently checked \
-             here -- see the workaround note above)"
+            "a's real on_confirm_acked dispatch should have applied the switch"
+        );
+        assert_eq!(
+            a.engine.cp_mode(),
+            CpMode::ShortCp,
+            "a's real on_confirm_acked dispatch should have switched its own engine"
         );
 
         // Final real round-trip: a frame encoded by a after the switch must
