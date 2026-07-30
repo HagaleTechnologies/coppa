@@ -415,9 +415,13 @@ impl CoppaCore {
     /// yet resolved into a completed frame) are discarded as a result.
     ///
     /// Crossing the HF/VHF threshold (level >= 5) also resets `cp_mode` to
-    /// `CpMode::LongCp` (VHF has no short-CP variant) -- this happens
-    /// automatically as a side effect of `select_ofdm_profile`'s own
-    /// level-based branching, not a separate reset step.
+    /// `CpMode::LongCp` (VHF has no short-CP variant) -- this is an
+    /// explicit reset step below, not a side effect of
+    /// `select_ofdm_profile` (which is a pure function of its two
+    /// arguments and has no side effects itself). This reset is permanent
+    /// until something calls `set_cp_profile` again: dropping back below
+    /// level 5 later does NOT automatically restore a previously
+    /// negotiated `ShortCp` -- see `EngineConfig::cp_mode`'s field doc.
     ///
     /// Returns an error, leaving this engine's current config untouched, if
     /// `level` is not a valid wire speed level (1-10; 8 is reserved) -- see
