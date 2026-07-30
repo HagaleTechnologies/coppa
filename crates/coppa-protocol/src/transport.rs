@@ -30,6 +30,13 @@ pub enum TransportType {
     Nak = 3,
     /// Reset the transport session.
     Reset = 4,
+    /// CP-switch peer-negotiation control message (Propose/Confirm content,
+    /// or a bare ack for the dedicated CP-control ArqTx/ArqRx pair -- see
+    /// `coppa_protocol::cp_negotiator`). Rides its OWN small ArqTx/ArqRx
+    /// pair, entirely separate from the ordinary data `Reliable` pair's
+    /// sequence space, so there is never ambiguity about what a given seq
+    /// number represents.
+    CpControl = 5,
 }
 
 impl TransportType {
@@ -40,6 +47,7 @@ impl TransportType {
             2 => Ok(TransportType::Ack),
             3 => Ok(TransportType::Nak),
             4 => Ok(TransportType::Reset),
+            5 => Ok(TransportType::CpControl),
             v => Err(anyhow!("Unknown transport type: {}", v)),
         }
     }
@@ -146,6 +154,44 @@ impl TransportPdu {
             seq_num: 0,
             ack_num: 0,
             ack_bitmap: 0,
+            payload: Vec::new(),
+        }
+    }
+
+    /// Create a CpControl PDU carrying Propose/Confirm content (a 2-byte
+    /// payload: `[kind, mode]` -- see `coppa_protocol::cp_negotiator`),
+    /// piggybacking an ack for whatever the dedicated CP-control
+    /// `ArqRx` most recently has to acknowledge -- mirrors
+    /// `new_ack_with_rate`'s existing "content + ack in one PDU" shape.
+    pub fn new_cp_control_content(
+        session_id: u8,
+        seq_num: u8,
+        ack_num: u8,
+        ack_bitmap: u32,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            session_id: session_id & 0x0F,
+            transport_type: TransportType::CpControl,
+            seq_num,
+            ack_num,
+            ack_bitmap,
+            payload,
+        }
+    }
+
+    /// Create a bare CpControl ack (empty payload) -- acknowledges a
+    /// previously-received CpControl content PDU on the dedicated
+    /// CP-control `ArqTx`/`ArqRx` pair. Mirrors `new_ack`'s shape, but
+    /// tagged `CpControl` so the receiver routes it to that pair instead
+    /// of the ordinary shared `arq_tx`.
+    pub fn new_cp_control_ack(session_id: u8, ack_num: u8, ack_bitmap: u32) -> Self {
+        Self {
+            session_id: session_id & 0x0F,
+            transport_type: TransportType::CpControl,
+            seq_num: 0,
+            ack_num,
+            ack_bitmap,
             payload: Vec::new(),
         }
     }
@@ -338,7 +384,7 @@ mod tests {
 
     #[test]
     fn test_invalid_transport_type() {
-        assert!(TransportType::from_u8(5).is_err());
+        assert!(TransportType::from_u8(6).is_err());
         assert!(TransportType::from_u8(15).is_err());
     }
 
@@ -445,5 +491,46 @@ mod tests {
         let bytes = pdu.to_bytes();
         let decoded = TransportPdu::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn test_cp_control_content_roundtrip() {
+        let pdu = TransportPdu::new_cp_control_content(2, 7, 3, 0b101, vec![0x01, 0x01]);
+        let bytes = pdu.to_bytes();
+        let decoded = TransportPdu::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.session_id, 2);
+        assert_eq!(decoded.transport_type, TransportType::CpControl);
+        assert_eq!(decoded.seq_num, 7);
+        assert_eq!(decoded.ack_num, 3);
+        assert_eq!(decoded.ack_bitmap, 0b101);
+        assert_eq!(decoded.payload, vec![0x01, 0x01]);
+    }
+
+    #[test]
+    fn test_cp_control_ack_roundtrip() {
+        let pdu = TransportPdu::new_cp_control_ack(2, 9, 0b11);
+        let bytes = pdu.to_bytes();
+        let decoded = TransportPdu::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.transport_type, TransportType::CpControl);
+        assert_eq!(decoded.ack_num, 9);
+        assert_eq!(decoded.ack_bitmap, 0b11);
+        assert!(decoded.payload.is_empty());
+    }
+
+    #[test]
+    fn test_cp_control_included_in_all_transport_types() {
+        let types = [
+            TransportType::Unreliable,
+            TransportType::Reliable,
+            TransportType::Ack,
+            TransportType::Nak,
+            TransportType::Reset,
+            TransportType::CpControl,
+        ];
+        for &tt in &types {
+            let val = tt as u8;
+            let decoded = TransportType::from_u8(val).unwrap();
+            assert_eq!(decoded, tt);
+        }
     }
 }
