@@ -7,10 +7,10 @@ use coppa_audio::{AudioRingConsumer, AudioRingProducer};
 use coppa_engine::CoppaCore;
 use coppa_host::vara::VaraResponse;
 use coppa_host::HostEvent;
-#[cfg(feature = "websocket")]
 use coppa_ml::CpRecommendation;
 use coppa_ml::{BusyGate, CpGate, RateLoop};
 use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx};
+use coppa_protocol::cp_negotiator::{ContentAction, CpMode, CpNegotiator};
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu, StationIdPayload};
 use coppa_protocol::modem::max_payload_for_level;
 use coppa_protocol::session::{LinkCapabilities, SessionManager, SessionState};
@@ -87,6 +87,17 @@ pub struct EventLoop {
     /// currently applies it to the engine's CP profile. See
     /// `docs/superpowers/specs/2026-07-25-cpgate-daemon-wiring-design.md`.
     cp_gate: CpGate,
+    /// Pure CP-switch negotiation decision state (`coppa_protocol::cp_negotiator`).
+    /// See `docs/superpowers/specs/2026-07-29-cp-switch-peer-negotiation-design.md`.
+    cp_negotiator: CpNegotiator,
+    /// Dedicated small ArqTx/ArqRx pair for `TransportType::CpControl`
+    /// traffic -- entirely separate sequence space from the ordinary data
+    /// `arq_tx`/`arq_rx` pair, so there is never ambiguity about what a
+    /// given seq number represents. Always constructed (cheap), gated by
+    /// `cp_negotiation_enabled` only at the point traffic is actually sent
+    /// or acted on -- same pattern as `cp_gate`.
+    cp_control_arq_tx: ArqTx,
+    cp_control_arq_rx: ArqRx,
     /// Next TX sequence number for transport PDUs.
     #[allow(dead_code)] // used when ARQ TX path sends segmented frames
     arq_next_seq: u8,
@@ -267,6 +278,17 @@ impl EventLoop {
         // `decode_and_dispatch_audio`.
         let cp_gate = CpGate::default_coppa();
 
+        // Always constructed (cheap; mirrors `cp_gate`'s own pattern above).
+        // Whether CP-control traffic is ever actually sent or acted on is
+        // gated by `config.engine.cp_negotiation_enabled` at each call site.
+        let cp_negotiator = CpNegotiator::new();
+        let cp_control_arq_config = ArqConfig {
+            window_size: 2,
+            ..ArqConfig::default()
+        };
+        let cp_control_arq_tx = ArqTx::new(cp_control_arq_config);
+        let cp_control_arq_rx = ArqRx::new(2);
+
         Ok(Self {
             config,
             engine,
@@ -285,6 +307,9 @@ impl EventLoop {
             arq_session_id: 0,
             rate_loop,
             cp_gate,
+            cp_negotiator,
+            cp_control_arq_tx,
+            cp_control_arq_rx,
             arq_next_seq: 0,
             probe_state: None,
             #[cfg(feature = "websocket")]
@@ -1066,6 +1091,36 @@ impl EventLoop {
                                 delay_spread_ms,
                                 "CpGate recommendation changed"
                             );
+                            if self.config.engine.cp_negotiation_enabled {
+                                let mode = match after {
+                                    CpRecommendation::ShortCp => CpMode::ShortCp,
+                                    CpRecommendation::LongCp => CpMode::LongCp,
+                                };
+                                let payload = CpNegotiator::propose_payload(mode);
+                                let now = Instant::now();
+                                match self.cp_control_arq_tx.send(payload.clone(), now) {
+                                    Ok(seq) => {
+                                        let (ack_num, ack_bitmap) =
+                                            self.cp_control_arq_rx.ack_info();
+                                        let pdu = TransportPdu::new_cp_control_content(
+                                            self.arq_session_id,
+                                            seq,
+                                            ack_num,
+                                            ack_bitmap,
+                                            payload,
+                                        );
+                                        match self.engine.encode_bytes(&pdu.to_bytes()) {
+                                            Ok(samples) => self.transmit_samples(&samples).await,
+                                            Err(e) => {
+                                                tracing::warn!(error = %e, "Failed to encode CpControl Propose")
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "cp_control_arq_tx window full; dropping Propose")
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -1230,7 +1285,118 @@ impl EventLoop {
                                         // spuriously resolved as a "successful probe" via
                                         // `resolve_probe_if_acked`.
                                         self.probe_state = None;
+                                        // Also reset the CP-control pair and
+                                        // negotiator -- see this arm's doc
+                                        // above for why Reset (not a
+                                        // MAC-session event) is this
+                                        // feature's reset point.
+                                        self.cp_control_arq_tx = ArqTx::new(ArqConfig {
+                                            window_size: 2,
+                                            ..ArqConfig::default()
+                                        });
+                                        self.cp_control_arq_rx = ArqRx::new(2);
+                                        self.cp_negotiator = CpNegotiator::new();
                                         Vec::new()
+                                    }
+                                    TransportType::CpControl => {
+                                        if !self.config.engine.cp_negotiation_enabled {
+                                            tracing::debug!("CpControl PDU received but cp_negotiation_enabled is false; ignoring");
+                                            Vec::new()
+                                        } else {
+                                            let now = Instant::now();
+                                            let newly_acked = self.cp_control_arq_tx.process_ack(
+                                                pdu.ack_num,
+                                                pdu.ack_bitmap,
+                                                now,
+                                            );
+                                            if let Some(mode) =
+                                                self.cp_negotiator.on_confirm_acked(&newly_acked)
+                                            {
+                                                self.engine.set_cp_profile(mode);
+                                                tracing::info!(?mode, "CP profile switched (proposer role, confirmed by peer)");
+                                            }
+                                            if pdu.payload.is_empty() {
+                                                // Bare ack only; nothing further to do.
+                                            } else {
+                                                self.cp_control_arq_rx
+                                                    .receive(pdu.seq_num, pdu.payload.clone());
+                                                let (ack_num, ack_bitmap) =
+                                                    self.cp_control_arq_rx.ack_info();
+                                                match CpNegotiator::on_content_received(
+                                                    &pdu.payload,
+                                                ) {
+                                                    Some(ContentAction::SendConfirm(
+                                                        confirm_payload,
+                                                    )) => {
+                                                        match self
+                                                            .cp_control_arq_tx
+                                                            .send(confirm_payload.clone(), now)
+                                                        {
+                                                            Ok(seq) => {
+                                                                let mode = CpMode::from_wire(
+                                                                    confirm_payload[1],
+                                                                );
+                                                                self.cp_negotiator
+                                                                    .track_pending_confirm(
+                                                                        seq, mode,
+                                                                    );
+                                                                let reply = TransportPdu::new_cp_control_content(
+                                                                    pdu.session_id,
+                                                                    seq,
+                                                                    ack_num,
+                                                                    ack_bitmap,
+                                                                    confirm_payload,
+                                                                );
+                                                                match self
+                                                                    .engine
+                                                                    .encode_bytes(&reply.to_bytes())
+                                                                {
+                                                                    Ok(samples) => {
+                                                                        self.transmit_samples(
+                                                                            &samples,
+                                                                        )
+                                                                        .await
+                                                                    }
+                                                                    Err(e) => {
+                                                                        tracing::warn!(error = %e, "Failed to encode CpControl Confirm")
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::warn!(error = %e, "cp_control_arq_tx window full; dropping Confirm")
+                                                            }
+                                                        }
+                                                    }
+                                                    Some(ContentAction::ApplyAsConfirmer(mode)) => {
+                                                        self.cp_negotiator.apply_as_confirmer(mode);
+                                                        self.engine.set_cp_profile(mode);
+                                                        tracing::info!(?mode, "CP profile switched (confirmer role, own receiver)");
+                                                        let ack_pdu =
+                                                            TransportPdu::new_cp_control_ack(
+                                                                pdu.session_id,
+                                                                ack_num,
+                                                                ack_bitmap,
+                                                            );
+                                                        match self
+                                                            .engine
+                                                            .encode_bytes(&ack_pdu.to_bytes())
+                                                        {
+                                                            Ok(samples) => {
+                                                                self.transmit_samples(&samples)
+                                                                    .await
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::warn!(error = %e, "Failed to encode CpControl ack")
+                                                            }
+                                                        }
+                                                    }
+                                                    None => tracing::debug!(
+                                                        "Malformed CpControl payload; ignoring"
+                                                    ),
+                                                }
+                                            }
+                                            Vec::new()
+                                        }
                                     }
                                 }
                             }
@@ -1679,6 +1845,41 @@ impl EventLoop {
                 }
             }
         }
+
+        // CP-control retransmits: same collect-then-transmit shape as the
+        // arq_tx block above, using the entirely separate cp_control_arq_tx/
+        // cp_control_arq_rx pair (own sequence space, own small window).
+        if self.config.engine.cp_negotiation_enabled {
+            let now = Instant::now();
+            let cp_retransmit_seqs = self.cp_control_arq_tx.get_retransmits(now);
+            let mut cp_retransmit_pdus: Vec<(u8, Vec<u8>)> = Vec::new();
+            if !cp_retransmit_seqs.is_empty() {
+                let (ack_num, ack_bitmap) = self.cp_control_arq_rx.ack_info();
+                for seq in &cp_retransmit_seqs {
+                    if let Some(data) = self.cp_control_arq_tx.get_segment_data(*seq) {
+                        let pdu = TransportPdu::new_cp_control_content(
+                            self.arq_session_id,
+                            *seq,
+                            ack_num,
+                            ack_bitmap,
+                            data.to_vec(),
+                        );
+                        cp_retransmit_pdus.push((*seq, pdu.to_bytes()));
+                    }
+                }
+            }
+            for (seq, pdu_bytes) in cp_retransmit_pdus {
+                match self.engine.encode_bytes(&pdu_bytes) {
+                    Ok(samples) => {
+                        self.transmit_samples(&samples).await;
+                        let _ = self
+                            .cp_control_arq_tx
+                            .mark_retransmitted(seq, Instant::now());
+                    }
+                    Err(e) => tracing::warn!(error = %e, "Failed to encode CpControl retransmit"),
+                }
+            }
+        }
     }
 
     // ── Session handling methods ──────────────────────────────────────
@@ -1969,6 +2170,142 @@ mod tests {
         assert_eq!(
             event_loop.rate_loop.level_for_next_transmission(),
             (3, true)
+        );
+    }
+
+    #[tokio::test]
+    async fn cp_negotiation_full_handshake_converges_both_sides() {
+        use coppa_ml::CpRecommendation;
+        use coppa_protocol::cp_negotiator::CpMode;
+
+        // Two independent EventLoops standing in for two stations, both
+        // with ARQ and CP negotiation enabled. `b` will play "the station
+        // that observed a calm channel and proposes ShortCp"; `a` will play
+        // "the station that receives Propose, confirms, and eventually
+        // flips its own encoder." `EventLoop::new` builds its own internal
+        // event channel (confirmed signature: `pub fn new(config:
+        // DaemonConfig) -> Result<Self>`) -- mirrors this file's own
+        // existing `new_wires_probe_config_into_rate_loop` test's
+        // construction pattern exactly.
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        config.engine.cp_gate_enabled = true;
+        config.engine.cp_negotiation_enabled = true;
+        let mut a = EventLoop::new(config.clone()).unwrap();
+        let mut b = EventLoop::new(config).unwrap();
+
+        assert_eq!(a.engine.cp_mode(), CpMode::LongCp);
+        assert_eq!(b.cp_negotiator.current(), CpMode::LongCp);
+
+        // b's CpGate observes a qualifying transition (4 consecutive calm
+        // frames, per CpGate::default_coppa) and proposes ShortCp.
+        let mut rec = CpRecommendation::LongCp;
+        for _ in 0..4 {
+            rec = b.cp_gate.observe(0.1);
+        }
+        assert_eq!(rec, CpRecommendation::ShortCp);
+        let propose_payload = CpNegotiator::propose_payload(CpMode::ShortCp);
+        let now = std::time::Instant::now();
+        let seq_propose = b
+            .cp_control_arq_tx
+            .send(propose_payload.clone(), now)
+            .unwrap();
+        let (ack_num0, ack_bitmap0) = b.cp_control_arq_rx.ack_info();
+        let propose_pdu = coppa_protocol::transport::TransportPdu::new_cp_control_content(
+            b.arq_session_id,
+            seq_propose,
+            ack_num0,
+            ack_bitmap0,
+            propose_payload,
+        );
+
+        // a receives the Propose: registers it, replies with Confirm.
+        a.cp_control_arq_rx
+            .receive(propose_pdu.seq_num, propose_pdu.payload.clone());
+        let (a_ack_num, a_ack_bitmap) = a.cp_control_arq_rx.ack_info();
+        let action = CpNegotiator::on_content_received(&propose_pdu.payload).unwrap();
+        let confirm_payload = match action {
+            coppa_protocol::cp_negotiator::ContentAction::SendConfirm(p) => p,
+            other => panic!("expected SendConfirm, got {other:?}"),
+        };
+        let seq_confirm = a
+            .cp_control_arq_tx
+            .send(confirm_payload.clone(), now)
+            .unwrap();
+        a.cp_negotiator
+            .track_pending_confirm(seq_confirm, CpMode::ShortCp);
+        let confirm_pdu = coppa_protocol::transport::TransportPdu::new_cp_control_content(
+            a.arq_session_id,
+            seq_confirm,
+            a_ack_num,
+            a_ack_bitmap,
+            confirm_payload,
+        );
+
+        // b receives the Confirm: applies to its own receiver immediately,
+        // processes the piggybacked ack for its own Propose, and replies
+        // with a bare ack for a's Confirm.
+        let newly_acked_propose =
+            b.cp_control_arq_tx
+                .process_ack(confirm_pdu.ack_num, confirm_pdu.ack_bitmap, now);
+        assert!(newly_acked_propose.contains(&seq_propose));
+        b.cp_control_arq_rx
+            .receive(confirm_pdu.seq_num, confirm_pdu.payload.clone());
+        let (b_ack_num, b_ack_bitmap) = b.cp_control_arq_rx.ack_info();
+        match CpNegotiator::on_content_received(&confirm_pdu.payload).unwrap() {
+            coppa_protocol::cp_negotiator::ContentAction::ApplyAsConfirmer(mode) => {
+                b.cp_negotiator.apply_as_confirmer(mode);
+                b.engine.set_cp_profile(mode);
+            }
+            other => panic!("expected ApplyAsConfirmer, got {other:?}"),
+        }
+        assert_eq!(b.cp_negotiator.current(), CpMode::ShortCp);
+        assert_eq!(
+            b.engine.cp_mode(),
+            CpMode::ShortCp,
+            "b's own RECEIVER must switch first"
+        );
+
+        let bare_ack = coppa_protocol::transport::TransportPdu::new_cp_control_ack(
+            b.arq_session_id,
+            b_ack_num,
+            b_ack_bitmap,
+        );
+
+        // a receives the bare ack for its Confirm: NOW (and only now) a
+        // flips its own encoder.
+        assert_eq!(
+            a.engine.cp_mode(),
+            CpMode::LongCp,
+            "a must not have switched yet"
+        );
+        let newly_acked_confirm =
+            a.cp_control_arq_tx
+                .process_ack(bare_ack.ack_num, bare_ack.ack_bitmap, now);
+        assert!(newly_acked_confirm.contains(&seq_confirm));
+        let mode = a
+            .cp_negotiator
+            .on_confirm_acked(&newly_acked_confirm)
+            .unwrap();
+        a.engine.set_cp_profile(mode);
+
+        assert_eq!(a.cp_negotiator.current(), CpMode::ShortCp);
+        assert_eq!(
+            a.engine.cp_mode(),
+            CpMode::ShortCp,
+            "a's own ENCODER switches last, after proof of delivery"
+        );
+
+        // A frame encoded by a under the new profile must decode correctly
+        // against a receiver built for hf_standard_short_cp -- confirms
+        // this isn't just bookkeeping, the actual profile really changed.
+        let samples = a.engine.encode_bytes(b"after switch").unwrap();
+        let mut check_receiver = coppa_engine::CoppaCore::new();
+        check_receiver.set_cp_profile(CpMode::ShortCp);
+        let decoded = check_receiver.decode_bytes(&samples);
+        assert!(
+            decoded.is_ok(),
+            "frame sent after the switch must decode under the matching short-CP profile"
         );
     }
 
