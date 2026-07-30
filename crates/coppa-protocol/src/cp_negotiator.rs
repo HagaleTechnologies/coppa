@@ -13,33 +13,28 @@
 //!
 //! ## Roles per handshake
 //!
-//! - **Proposer** (the station whose `CpGate` observed a qualifying
-//!   transition): sends a `Propose(mode)` payload via `propose_payload`.
-//!   Retried by the caller's `ArqTx` polling loop like ordinary data --
-//!   this module has no state for the proposer side; once the proposer's
-//!   Propose is acked, nothing further happens until a Confirm arrives.
-//! - **Confirmer** (the station that received a Propose): accepts
-//!   unconditionally (`on_content_received` on a Propose payload always
-//!   yields `SendConfirm`), replies with a Confirm, and applies the new
-//!   mode to its own RECEIVER immediately via `apply_as_confirmer` (it can
-//!   do this the moment it decodes the Propose -- no need to wait for its
-//!   own Confirm to be acked, since the confirmer isn't the one switching
-//!   the risky side: it just needs to be ready to decode the proposer's
-//!   future frames under the new CP).
-//! - **Proposer, second half:** the proposer applies the new mode to its
-//!   own ENCODER only once it sees its peer's bare ack for the peer's
-//!   Confirm (`track_pending_confirm`/`on_confirm_acked`) -- this is what
-//!   guarantees it never switches before the confirmer is proven ready.
+//! Call the station that observed a calm channel and wants a CP change "B"
+//! (it sends Propose), and the station whose transmissions B wants changed
+//! "A" (it receives Propose, sends Confirm).
 //!
-//! Concretely, with the roles named as in the design doc: call the station
-//! that observed a calm channel and wants a change "B" (it sends Propose),
-//! and the station whose transmissions B wants changed "A" (it receives
-//! Propose, sends Confirm). B applies the new mode to its OWN RECEIVER as
-//! soon as it receives A's Confirm content (`on_content_received` ->
-//! `ApplyAsConfirmer`, then `apply_as_confirmer`). A applies the new mode
-//! to its OWN ENCODER only once B's bare ack for A's Confirm arrives
-//! (`track_pending_confirm` when A sends the Confirm, `on_confirm_acked`
-//! when that ack lands).
+//! - **B (proposer):** sends a `Propose(mode)` payload via
+//!   `propose_payload`, retried by the caller's `ArqTx` polling loop like
+//!   ordinary data -- this module holds no state for B's side of that
+//!   send; once B's Propose is acked, nothing further happens on B's side
+//!   until a Confirm arrives. When B receives A's Confirm content
+//!   (`on_content_received` -> `ContentAction::ApplyAsConfirmer`), B calls
+//!   `apply_as_confirmer` to switch its OWN RECEIVER to the new mode
+//!   immediately -- no need to wait for anything further, since B isn't
+//!   the one switching the riskier side (the encoder); it just needs to be
+//!   ready to decode A's future frames under the new CP.
+//! - **A (confirmer):** accepts a Propose unconditionally
+//!   (`on_content_received` on Propose content always yields
+//!   `ContentAction::SendConfirm`), replies with a Confirm, and records
+//!   the ARQ seq it sent that Confirm at via `track_pending_confirm`. A
+//!   applies the new mode to its OWN ENCODER only once it sees B's bare
+//!   ack for that Confirm (`on_confirm_acked`) -- this is what guarantees
+//!   A never switches before B is proven ready to receive under the new
+//!   CP.
 
 /// A CP profile choice. Wire values: `LongCp = 0x00`, `ShortCp = 0x01`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
