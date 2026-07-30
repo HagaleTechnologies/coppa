@@ -220,11 +220,29 @@ pub struct EngineSection {
     /// current recommendation is exposed via the WebSocket `status` reply's
     /// `short_cp_ok` field. **This does NOT switch the engine's CP profile
     /// automatically** -- it is measurement/telemetry only; actually
-    /// switching `CoppaProfile` mid-session needs a peer-negotiation
-    /// handshake that doesn't exist yet (CP length isn't in-band negotiable
-    /// the way speed level is). See `docs/superpowers/specs/
-    /// 2026-07-25-cpgate-daemon-wiring-design.md` for the full reasoning.
+    /// switching `CoppaProfile` mid-session needs the peer-negotiation
+    /// handshake in `coppa_protocol::cp_negotiator`, gated separately by
+    /// `cp_negotiation_enabled` (see that field's own doc). See
+    /// `docs/superpowers/specs/2026-07-25-cpgate-daemon-wiring-design.md`
+    /// for the full reasoning behind this module's own telemetry-only scope.
     pub cp_gate_enabled: bool,
+    /// Enable the CP-switch peer-negotiation handshake (see
+    /// `coppa_protocol::cp_negotiator` and `docs/superpowers/specs/
+    /// 2026-07-29-cp-switch-peer-negotiation-design.md`). `false` (the
+    /// default) is an explicit opt-in, matching `cp_gate_enabled`'s and
+    /// `rate_loop_probe_interval`'s convention exactly. Both stations must
+    /// set this locally -- there is no peer-capability negotiation (see the
+    /// design doc's "disjoint subsystems" finding for why); a station with
+    /// this off simply never proposes or acts on `TransportType::CpControl`
+    /// PDUs. Independent of `cp_gate_enabled`: this can be on with
+    /// `cp_gate_enabled` off (nothing to propose, ever) or vice versa
+    /// (telemetry-only, as PR #60 shipped). Also requires `arq_enabled =
+    /// true` to actually transmit or act on anything -- CP-control traffic
+    /// rides its own dedicated ArqTx/ArqRx pair, but that pair's
+    /// propose/retransmit/dispatch code paths are all additionally gated on
+    /// `arq_enabled` for consistency with the rest of this daemon's
+    /// reliable-delivery machinery.
+    pub cp_negotiation_enabled: bool,
 }
 
 /// Busy-channel courtesy / station-ID timer / beacon-mode configuration
@@ -328,6 +346,7 @@ impl Default for EngineSection {
             rate_loop_probe_interval: 0,
             rate_loop_probe_offset: 0,
             cp_gate_enabled: false,
+            cp_negotiation_enabled: false,
         }
     }
 }
@@ -453,6 +472,25 @@ cp_gate_enabled = true
 "#;
         let config: DaemonConfig = toml::from_str(toml).unwrap();
         assert!(config.engine.cp_gate_enabled);
+    }
+
+    #[test]
+    fn test_cp_negotiation_defaults_to_disabled() {
+        let config = DaemonConfig::default();
+        assert!(
+            !config.engine.cp_negotiation_enabled,
+            "CP-switch peer negotiation must be off by default"
+        );
+    }
+
+    #[test]
+    fn test_cp_negotiation_toml_override() {
+        let toml = r#"
+[engine]
+cp_negotiation_enabled = true
+"#;
+        let config: DaemonConfig = toml::from_str(toml).unwrap();
+        assert!(config.engine.cp_negotiation_enabled);
     }
 
     // ── StationIdConfig defaults (Phase 4 Task 3) ─────────────────────

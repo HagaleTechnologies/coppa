@@ -9,12 +9,14 @@
 //! derived from real channel-estimation taps), whether it's currently safe to recommend the
 //! short-CP profile.
 //!
-//! This module only computes the recommendation. It does not carry it anywhere: per the
-//! Task 6b brief, actually switching CP profiles mid-link rides the *existing*
-//! reconfigure/rate-feedback path (`coppa_ml::RateLoop` / the ACK-carried speed-level
-//! recommendation) — daemon-level wiring for that is explicitly out of scope here, the same
-//! way `RateLoop` itself left daemon-level ACK wiring unimplemented (see that module's own
-//! doc / the Phase 3 Task 4 report).
+//! This module only computes the recommendation; it does not carry it anywhere itself.
+//! Since PR #60 the daemon feeds it live per-frame delay-spread measurements and exposes
+//! the recommendation over WebSocket telemetry (`[engine] cp_gate_enabled`, off by default).
+//! **UPDATE (2026-07-29):** a peer-negotiation handshake (`coppa_protocol::cp_negotiator`)
+//! now lets the daemon *act* on a recommendation change — proposing and confirming a CP
+//! profile switch with the peer — gated by its own `cp_negotiation_enabled` flag,
+//! independent of this module's `cp_gate_enabled`. See `coppa-daemon`'s `config.rs` for both
+//! flags' docs.
 //!
 //! # Hysteresis (mirrors `RateLoop`'s "raise slow, drop fast" pattern)
 //!

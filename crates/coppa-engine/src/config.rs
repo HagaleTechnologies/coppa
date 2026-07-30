@@ -1,6 +1,7 @@
 //! Configuration types for the Coppa engine.
 
 use crate::profiles::Profile;
+use coppa_protocol::cp_negotiator::CpMode;
 
 /// Runtime configuration for [`CoppaCore`](crate::CoppaCore).
 ///
@@ -18,6 +19,19 @@ pub struct EngineConfig {
     /// Squelch threshold in dBFS. Signals below this level are rejected.
     /// Set to `f32::NEG_INFINITY` to disable squelch.
     pub squelch_threshold_db: f32,
+    /// Negotiated CP profile within the HF range (levels 1-4). At VHF
+    /// levels (>=5, no short-CP variant exists), this field is not merely
+    /// ignored: `CoppaCore::set_speed_level` actively resets it to
+    /// `CpMode::LongCp` as a side effect of crossing the threshold, and
+    /// that reset is NOT automatically undone if the level later drops
+    /// back below 5 -- a previously-negotiated `ShortCp` is lost, not
+    /// suspended. This matches the design doc's "resets to the HF default"
+    /// scoping and is an accepted v1 boundary, not a bug; restoring a lost
+    /// negotiation after a VHF round-trip would need a fresh Propose/
+    /// Confirm handshake, which is a daemon-level (`coppa-daemon`)
+    /// concern, not this field's. See `coppa_protocol::cp_negotiator` and
+    /// `docs/superpowers/specs/2026-07-29-cp-switch-peer-negotiation-design.md`.
+    pub cp_mode: CpMode,
 }
 
 impl Default for EngineConfig {
@@ -27,6 +41,7 @@ impl Default for EngineConfig {
             sample_rate: 48_000,
             compression_enabled: false,
             squelch_threshold_db: f32::NEG_INFINITY,
+            cp_mode: CpMode::LongCp,
         }
     }
 }
@@ -39,6 +54,7 @@ impl EngineConfig {
             sample_rate: profile.sample_rate,
             compression_enabled: profile.compression,
             squelch_threshold_db: f32::NEG_INFINITY,
+            cp_mode: CpMode::LongCp,
         }
     }
 }
@@ -79,5 +95,14 @@ mod tests {
         let config = EngineConfig::from_profile(&HF_STANDARD);
         assert_eq!(config.speed_level, 2);
         assert!(config.compression_enabled);
+    }
+
+    #[test]
+    fn test_default_cp_mode_is_long_cp() {
+        let config = EngineConfig::default();
+        assert_eq!(
+            config.cp_mode,
+            coppa_protocol::cp_negotiator::CpMode::LongCp
+        );
     }
 }

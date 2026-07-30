@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod arq;
+pub mod cp_negotiator;
 pub mod fec;
 pub mod frame;
 pub mod mac;
