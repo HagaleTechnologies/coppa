@@ -72,7 +72,8 @@ pub enum ContentAction {
     /// outright" decision) and send this Confirm payload back.
     SendConfirm(Vec<u8>),
     /// Received a Confirm; apply this mode to OUR OWN RECEIVER immediately
-    /// -- the confirmer's half of the handshake, see the module doc.
+    /// -- this is what B (the proposer) does upon receiving A's Confirm,
+    /// see the module doc.
     ApplyAsConfirmer(CpMode),
 }
 
@@ -147,9 +148,10 @@ impl CpNegotiator {
         }
     }
 
-    /// Apply `mode` immediately (confirmer role, on receiving Confirm
-    /// content -- see the module doc for why the confirmer doesn't wait
-    /// for an ack first).
+    /// Apply `mode` immediately -- this is B's (the proposer's) step on
+    /// receiving Confirm content, see the module doc for why B doesn't
+    /// wait for an ack first (unlike A, which does, via
+    /// `track_pending_confirm`/`on_confirm_acked`).
     pub fn apply_as_confirmer(&mut self, mode: CpMode) {
         self.current = mode;
     }
