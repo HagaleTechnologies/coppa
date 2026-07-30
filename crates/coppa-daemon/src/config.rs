@@ -220,10 +220,11 @@ pub struct EngineSection {
     /// current recommendation is exposed via the WebSocket `status` reply's
     /// `short_cp_ok` field. **This does NOT switch the engine's CP profile
     /// automatically** -- it is measurement/telemetry only; actually
-    /// switching `CoppaProfile` mid-session needs a peer-negotiation
-    /// handshake that doesn't exist yet (CP length isn't in-band negotiable
-    /// the way speed level is). See `docs/superpowers/specs/
-    /// 2026-07-25-cpgate-daemon-wiring-design.md` for the full reasoning.
+    /// switching `CoppaProfile` mid-session needs the peer-negotiation
+    /// handshake in `coppa_protocol::cp_negotiator`, gated separately by
+    /// `cp_negotiation_enabled` (see that field's own doc). See
+    /// `docs/superpowers/specs/2026-07-25-cpgate-daemon-wiring-design.md`
+    /// for the full reasoning behind this module's own telemetry-only scope.
     pub cp_gate_enabled: bool,
     /// Enable the CP-switch peer-negotiation handshake (see
     /// `coppa_protocol::cp_negotiator` and `docs/superpowers/specs/
