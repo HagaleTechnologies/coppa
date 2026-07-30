@@ -7,6 +7,7 @@ use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::compression::huffman::HuffmanCodec;
 use coppa_protocol::compression::lz4::{lz4_compress, lz4_decompress};
+use coppa_protocol::cp_negotiator::CpMode;
 use coppa_protocol::modem::streaming::StreamingReceiver;
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 
@@ -132,7 +133,7 @@ impl CoppaCore {
 
     /// Build the engine from a config, selecting the appropriate OFDM profile.
     fn build(config: EngineConfig) -> Self {
-        let ofdm_profile = Self::select_ofdm_profile(config.speed_level);
+        let ofdm_profile = Self::select_ofdm_profile(config.speed_level, config.cp_mode);
         let transceiver = CoppaTransceiver::new(ofdm_profile.clone(), 1);
         let streaming = StreamingReceiver::new(ofdm_profile, 1);
         Self {
@@ -142,13 +143,18 @@ impl CoppaCore {
         }
     }
 
-    /// Select OFDM profile based on speed level.
-    /// Speed levels 1-4 use HF standard; 5+ use VHF wide.
-    fn select_ofdm_profile(speed_level: u8) -> CoppaProfile {
+    /// Select OFDM profile based on speed level and negotiated CP mode.
+    /// Speed levels 1-4 use HF standard (long or short CP per `cp_mode`);
+    /// 5+ use VHF wide regardless of `cp_mode` (no VHF short-CP variant
+    /// exists).
+    pub(crate) fn select_ofdm_profile(speed_level: u8, cp_mode: CpMode) -> CoppaProfile {
         if speed_level >= 5 {
             CoppaProfile::vhf_wide()
         } else {
-            CoppaProfile::hf_standard()
+            match cp_mode {
+                CpMode::LongCp => CoppaProfile::hf_standard(),
+                CpMode::ShortCp => CoppaProfile::hf_standard_short_cp(),
+            }
         }
     }
 
@@ -188,7 +194,7 @@ impl CoppaCore {
             version: 1,
             phy_mode: 0,
             frame_type: CoppaFrameType::Data,
-            bandwidth: 1,
+            bandwidth: self.transceiver.profile().bandwidth_id,
             fec_type: 0,
             speed_level: self.config.speed_level,
             seq_num: 0,
@@ -233,7 +239,7 @@ impl CoppaCore {
             version: 1,
             phy_mode: 0,
             frame_type: CoppaFrameType::Beacon,
-            bandwidth: 1,
+            bandwidth: self.transceiver.profile().bandwidth_id,
             fec_type: 0,
             speed_level: level,
             seq_num: 0,
@@ -408,6 +414,11 @@ impl CoppaCore {
     /// does -- any samples already buffered in the streaming receiver (not
     /// yet resolved into a completed frame) are discarded as a result.
     ///
+    /// Crossing the HF/VHF threshold (level >= 5) also resets `cp_mode` to
+    /// `CpMode::LongCp` (VHF has no short-CP variant) -- this happens
+    /// automatically as a side effect of `select_ofdm_profile`'s own
+    /// level-based branching, not a separate reset step.
+    ///
     /// Returns an error, leaving this engine's current config untouched, if
     /// `level` is not a valid wire speed level (1-10; 8 is reserved) -- see
     /// `coppa_protocol::modem::speed_level_components`, the single source of
@@ -418,6 +429,11 @@ impl CoppaCore {
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         let mut config = self.config.clone();
         config.speed_level = level;
+        // Reset cp_mode to LongCp when crossing into VHF (level >= 5) since
+        // VHF has no short-CP variant.
+        if level >= 5 && config.cp_mode != CpMode::LongCp {
+            config.cp_mode = CpMode::LongCp;
+        }
         self.reconfigure(config);
         Ok(())
     }
@@ -428,6 +444,25 @@ impl CoppaCore {
     /// without reaching into private config state.
     pub fn speed_level(&self) -> u8 {
         self.config.speed_level
+    }
+
+    /// Change this engine's configured CP mode in place. Only affects HF
+    /// range (speed level < 5) profile selection -- see `select_ofdm_profile`.
+    /// Unlike `set_speed_level`, there's no invalid `CpMode` value to
+    /// reject, so this is infallible.
+    ///
+    /// Like `set_speed_level`, this rebuilds the transceiver and streaming
+    /// receiver (any samples buffered mid-frame in the streaming receiver
+    /// are discarded).
+    pub fn set_cp_profile(&mut self, mode: CpMode) {
+        let mut config = self.config.clone();
+        config.cp_mode = mode;
+        self.reconfigure(config);
+    }
+
+    /// The CP mode currently configured for outgoing `encode_bytes` calls.
+    pub fn cp_mode(&self) -> CpMode {
+        self.config.cp_mode
     }
 }
 
@@ -951,5 +986,86 @@ mod tests {
             assert!(mag[TUNE_TONE_LOW_HZ as usize] / bin < 0.01);
             assert!(mag[TUNE_TONE_HIGH_HZ as usize] / bin < 0.01);
         }
+    }
+
+    #[test]
+    fn test_select_ofdm_profile_respects_cp_mode_within_hf_range() {
+        use coppa_protocol::cp_negotiator::CpMode;
+        let long_cp = CoppaCore::select_ofdm_profile(2, CpMode::LongCp);
+        let short_cp = CoppaCore::select_ofdm_profile(2, CpMode::ShortCp);
+        assert_eq!(long_cp.cp_samples, CoppaProfile::hf_standard().cp_samples);
+        assert_eq!(
+            short_cp.cp_samples,
+            CoppaProfile::hf_standard_short_cp().cp_samples
+        );
+        assert_ne!(long_cp.cp_samples, short_cp.cp_samples);
+    }
+
+    #[test]
+    fn test_select_ofdm_profile_ignores_cp_mode_in_vhf_range() {
+        use coppa_protocol::cp_negotiator::CpMode;
+        let long_cp = CoppaCore::select_ofdm_profile(5, CpMode::LongCp);
+        let short_cp = CoppaCore::select_ofdm_profile(5, CpMode::ShortCp);
+        assert_eq!(long_cp.cp_samples, CoppaProfile::vhf_wide().cp_samples);
+        assert_eq!(short_cp.cp_samples, CoppaProfile::vhf_wide().cp_samples);
+    }
+
+    #[test]
+    fn test_set_cp_profile_switches_cp_samples() {
+        use coppa_protocol::cp_negotiator::CpMode;
+        let mut core = CoppaCore::new(); // speed_level 1, hf_standard, LongCp default
+        assert_eq!(core.cp_mode(), CpMode::LongCp);
+        core.set_cp_profile(CpMode::ShortCp);
+        assert_eq!(core.cp_mode(), CpMode::ShortCp);
+        // Encoding still succeeds under the new profile.
+        assert!(core.encode_bytes(b"hello").is_ok());
+    }
+
+    #[test]
+    fn test_set_speed_level_preserves_cp_mode_within_hf_range() {
+        use coppa_protocol::cp_negotiator::CpMode;
+        let mut core = CoppaCore::new();
+        core.set_cp_profile(CpMode::ShortCp);
+        core.set_speed_level(3).unwrap(); // still HF range (< 5)
+        assert_eq!(
+            core.cp_mode(),
+            CpMode::ShortCp,
+            "a speed-level change within HF range must not silently drop the negotiated CP mode"
+        );
+    }
+
+    #[test]
+    fn test_set_speed_level_resets_cp_mode_when_crossing_into_vhf() {
+        use coppa_protocol::cp_negotiator::CpMode;
+        let mut core = CoppaCore::new();
+        core.set_cp_profile(CpMode::ShortCp);
+        core.set_speed_level(5).unwrap(); // crosses into VHF
+        assert_eq!(
+            core.cp_mode(),
+            CpMode::LongCp,
+            "crossing into VHF (no short-CP variant) must reset to the HF default"
+        );
+    }
+
+    #[test]
+    fn test_encode_bytes_writes_real_bandwidth_id_not_hardcoded_one() {
+        use coppa_protocol::cp_negotiator::CpMode;
+        use coppa_protocol::modem::transceiver::CoppaTransceiver;
+
+        let mut core = CoppaCore::new(); // hf_standard, bandwidth_id = 1
+        core.set_cp_profile(CpMode::ShortCp); // hf_standard_short_cp, bandwidth_id = 4
+        let samples = core.encode_bytes(b"x").unwrap();
+
+        // Decode the header back out via CoppaTransceiver::receive (confirmed
+        // signature: `pub fn receive(&self, samples: &[f32]) -> Result<(CoppaHeader,
+        // Vec<u8>, u8), ReceiveError>`) to confirm the wire bandwidth field is
+        // really 4, not the old hardcoded 1.
+        let transceiver = CoppaTransceiver::new(CoppaProfile::hf_standard_short_cp(), 1);
+        let (header, _payload, _recommended_level) =
+            transceiver.receive(&samples).expect("frame should decode");
+        assert_eq!(
+            header.bandwidth,
+            CoppaProfile::hf_standard_short_cp().bandwidth_id
+        );
     }
 }
