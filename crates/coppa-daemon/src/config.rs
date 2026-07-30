@@ -235,7 +235,12 @@ pub struct EngineSection {
     /// this off simply never proposes or acts on `TransportType::CpControl`
     /// PDUs. Independent of `cp_gate_enabled`: this can be on with
     /// `cp_gate_enabled` off (nothing to propose, ever) or vice versa
-    /// (telemetry-only, as PR #60 shipped).
+    /// (telemetry-only, as PR #60 shipped). Also requires `arq_enabled =
+    /// true` to actually transmit or act on anything -- CP-control traffic
+    /// rides its own dedicated ArqTx/ArqRx pair, but that pair's
+    /// propose/retransmit/dispatch code paths are all additionally gated on
+    /// `arq_enabled` for consistency with the rest of this daemon's
+    /// reliable-delivery machinery.
     pub cp_negotiation_enabled: bool,
 }
 

@@ -1091,7 +1091,9 @@ impl EventLoop {
                                 delay_spread_ms,
                                 "CpGate recommendation changed"
                             );
-                            if self.config.engine.cp_negotiation_enabled {
+                            if self.config.engine.cp_negotiation_enabled
+                                && self.config.engine.arq_enabled
+                            {
                                 let mode = match after {
                                     CpRecommendation::ShortCp => CpMode::ShortCp,
                                     CpRecommendation::LongCp => CpMode::LongCp,
@@ -1313,86 +1315,97 @@ impl EventLoop {
                                                 self.cp_negotiator.on_confirm_acked(&newly_acked)
                                             {
                                                 self.engine.set_cp_profile(mode);
-                                                tracing::info!(?mode, "CP profile switched (proposer role, confirmed by peer)");
+                                                tracing::info!(?mode, "CP profile switched (confirmer role, confirmed by peer)");
                                             }
                                             if pdu.payload.is_empty() {
                                                 // Bare ack only; nothing further to do.
                                             } else {
-                                                self.cp_control_arq_rx
+                                                // `receive` returns only the genuinely new,
+                                                // in-order-delivered segments (mirrors the
+                                                // `Reliable | Unreliable` arm above); a
+                                                // duplicate/retransmitted CpControl PDU
+                                                // returns an empty `delivered` here and must
+                                                // be a pure no-op -- no re-sent Confirm, no
+                                                // re-applied mode, no re-tracked pending
+                                                // confirm (review Finding 1).
+                                                let delivered = self
+                                                    .cp_control_arq_rx
                                                     .receive(pdu.seq_num, pdu.payload.clone());
                                                 let (ack_num, ack_bitmap) =
                                                     self.cp_control_arq_rx.ack_info();
-                                                match CpNegotiator::on_content_received(
-                                                    &pdu.payload,
-                                                ) {
-                                                    Some(ContentAction::SendConfirm(
-                                                        confirm_payload,
-                                                    )) => {
-                                                        match self
-                                                            .cp_control_arq_tx
-                                                            .send(confirm_payload.clone(), now)
-                                                        {
-                                                            Ok(seq) => {
-                                                                let mode = CpMode::from_wire(
-                                                                    confirm_payload[1],
-                                                                );
-                                                                self.cp_negotiator
-                                                                    .track_pending_confirm(
-                                                                        seq, mode,
+                                                for (_seq, data) in delivered {
+                                                    match CpNegotiator::on_content_received(&data) {
+                                                        Some(ContentAction::SendConfirm(
+                                                            confirm_payload,
+                                                        )) => {
+                                                            match self
+                                                                .cp_control_arq_tx
+                                                                .send(confirm_payload.clone(), now)
+                                                            {
+                                                                Ok(seq) => {
+                                                                    let mode = CpMode::from_wire(
+                                                                        confirm_payload[1],
                                                                     );
-                                                                let reply = TransportPdu::new_cp_control_content(
+                                                                    self.cp_negotiator
+                                                                        .track_pending_confirm(
+                                                                            seq, mode,
+                                                                        );
+                                                                    let reply = TransportPdu::new_cp_control_content(
                                                                     pdu.session_id,
                                                                     seq,
                                                                     ack_num,
                                                                     ack_bitmap,
                                                                     confirm_payload,
                                                                 );
-                                                                match self
-                                                                    .engine
-                                                                    .encode_bytes(&reply.to_bytes())
-                                                                {
-                                                                    Ok(samples) => {
-                                                                        self.transmit_samples(
-                                                                            &samples,
-                                                                        )
-                                                                        .await
-                                                                    }
-                                                                    Err(e) => {
-                                                                        tracing::warn!(error = %e, "Failed to encode CpControl Confirm")
+                                                                    match self.engine.encode_bytes(
+                                                                        &reply.to_bytes(),
+                                                                    ) {
+                                                                        Ok(samples) => {
+                                                                            self.transmit_samples(
+                                                                                &samples,
+                                                                            )
+                                                                            .await
+                                                                        }
+                                                                        Err(e) => {
+                                                                            tracing::warn!(error = %e, "Failed to encode CpControl Confirm")
+                                                                        }
                                                                     }
                                                                 }
-                                                            }
-                                                            Err(e) => {
-                                                                tracing::warn!(error = %e, "cp_control_arq_tx window full; dropping Confirm")
-                                                            }
-                                                        }
-                                                    }
-                                                    Some(ContentAction::ApplyAsConfirmer(mode)) => {
-                                                        self.cp_negotiator.apply_as_confirmer(mode);
-                                                        self.engine.set_cp_profile(mode);
-                                                        tracing::info!(?mode, "CP profile switched (confirmer role, own receiver)");
-                                                        let ack_pdu =
-                                                            TransportPdu::new_cp_control_ack(
-                                                                pdu.session_id,
-                                                                ack_num,
-                                                                ack_bitmap,
-                                                            );
-                                                        match self
-                                                            .engine
-                                                            .encode_bytes(&ack_pdu.to_bytes())
-                                                        {
-                                                            Ok(samples) => {
-                                                                self.transmit_samples(&samples)
-                                                                    .await
-                                                            }
-                                                            Err(e) => {
-                                                                tracing::warn!(error = %e, "Failed to encode CpControl ack")
+                                                                Err(e) => {
+                                                                    tracing::warn!(error = %e, "cp_control_arq_tx window full; dropping Confirm")
+                                                                }
                                                             }
                                                         }
+                                                        Some(ContentAction::ApplyAsConfirmer(
+                                                            mode,
+                                                        )) => {
+                                                            self.cp_negotiator
+                                                                .apply_as_confirmer(mode);
+                                                            self.engine.set_cp_profile(mode);
+                                                            tracing::info!(?mode, "CP profile switched (proposer role, own receiver)");
+                                                            let ack_pdu =
+                                                                TransportPdu::new_cp_control_ack(
+                                                                    pdu.session_id,
+                                                                    ack_num,
+                                                                    ack_bitmap,
+                                                                );
+                                                            match self
+                                                                .engine
+                                                                .encode_bytes(&ack_pdu.to_bytes())
+                                                            {
+                                                                Ok(samples) => {
+                                                                    self.transmit_samples(&samples)
+                                                                        .await
+                                                                }
+                                                                Err(e) => {
+                                                                    tracing::warn!(error = %e, "Failed to encode CpControl ack")
+                                                                }
+                                                            }
+                                                        }
+                                                        None => tracing::debug!(
+                                                            "Malformed CpControl payload; ignoring"
+                                                        ),
                                                     }
-                                                    None => tracing::debug!(
-                                                        "Malformed CpControl payload; ignoring"
-                                                    ),
                                                 }
                                             }
                                             Vec::new()
@@ -1872,9 +1885,16 @@ impl EventLoop {
                 match self.engine.encode_bytes(&pdu_bytes) {
                     Ok(samples) => {
                         self.transmit_samples(&samples).await;
-                        let _ = self
+                        if let Err(e) = self
                             .cp_control_arq_tx
-                            .mark_retransmitted(seq, Instant::now());
+                            .mark_retransmitted(seq, Instant::now())
+                        {
+                            tracing::warn!(
+                                seq,
+                                error = %e,
+                                "Failed to mark CpControl segment retransmitted"
+                            );
+                        }
                     }
                     Err(e) => tracing::warn!(error = %e, "Failed to encode CpControl retransmit"),
                 }
@@ -2173,8 +2193,19 @@ mod tests {
         );
     }
 
+    /// Standalone "do the primitives compose correctly" check: hand-calls
+    /// `CpNegotiator`/`ArqTx`/`ArqRx`/`TransportPdu` directly in the same
+    /// order the real `decode_and_dispatch_audio`/`check_arq_retransmits`
+    /// code does, WITHOUT going through either of those real methods. Kept
+    /// alongside `cp_negotiation_full_handshake_converges_both_sides` below
+    /// (which does drive the real dispatch code, per review Finding 6)
+    /// because this one is a useful, fast, low-noise check that the
+    /// underlying primitives compose the way the design doc says they
+    /// should -- but on its own it would NOT have caught a bug purely in
+    /// the match-arm/retransmit-block wiring code (e.g. review Findings
+    /// 1-3), since it bypasses that wiring entirely.
     #[tokio::test]
-    async fn cp_negotiation_full_handshake_converges_both_sides() {
+    async fn cp_negotiation_handshake_primitives_compose_correctly() {
         use coppa_ml::CpRecommendation;
         use coppa_protocol::cp_negotiator::CpMode;
 
@@ -2299,6 +2330,213 @@ mod tests {
         // A frame encoded by a under the new profile must decode correctly
         // against a receiver built for hf_standard_short_cp -- confirms
         // this isn't just bookkeeping, the actual profile really changed.
+        let samples = a.engine.encode_bytes(b"after switch").unwrap();
+        let mut check_receiver = coppa_engine::CoppaCore::new();
+        check_receiver.set_cp_profile(CpMode::ShortCp);
+        let decoded = check_receiver.decode_bytes(&samples);
+        assert!(
+            decoded.is_ok(),
+            "frame sent after the switch must decode under the matching short-CP profile"
+        );
+    }
+
+    /// Review Finding 6: unlike the primitives-composition test above, this
+    /// one drives the REAL `EventLoop::decode_and_dispatch_audio` (and, by
+    /// virtue of that, the real `TransportType::CpControl` match arm fixed
+    /// by Findings 1-3) via genuine encode/decode round trips between two
+    /// independent `EventLoop`s, each wired to its own real
+    /// `coppa_audio::audio_ring`, mirroring
+    /// `probe_send_applies_level_sets_probe_state_and_reverts`'s pattern for
+    /// hooking up real audio I/O and `arq_receive_transmits_a_real_ack_with_rate`'s
+    /// pattern for reading back a station's own queued transmission and
+    /// feeding it to a peer's real decode path.
+    ///
+    /// The one real design choice here: `decode_and_dispatch_audio`'s
+    /// propose-on-transition block lives inline in the per-frame decode
+    /// loop, keyed off a REAL decoded frame's `delay_spread_ms` (not
+    /// something a test can just hand `CpGate` directly without bypassing
+    /// this method entirely). There is no separately-callable production
+    /// entry point for "react to this CpGate transition" alone. Rather than
+    /// reach into private state to fake a transition, `b` is fed 4 real,
+    /// independently-encoded "warmup" frames through its own real
+    /// `decode_and_dispatch_audio` -- on a clean digital loopback (no
+    /// channel impairment) each decodes with a near-zero measured delay
+    /// spread, so by the 4th one `CpGate::default_coppa`'s real hysteresis
+    /// (4 consecutive frames under 2.5 ms) has genuinely tripped and the
+    /// real propose-on-transition block really fires. Each warmup frame's
+    /// payload is deliberately not a well-formed `TransportPdu` (first byte
+    /// low nibble `0x0F`, an unrecognized `TransportType`), so it's forwarded
+    /// as inert undecodable bytes with zero side effects (no ARQ receive, no
+    /// ACK transmitted) -- the only thing being exercised on those 4 calls is
+    /// the real CpGate-observe-and-maybe-propose block, not anything ARQ-data
+    /// related.
+    ///
+    /// Driving this test through the REAL dispatch path (rather than the
+    /// hand-rolled primitives above) surfaced a genuine, previously-unknown
+    /// protocol-level bug in the shipped CP-switch feature itself --
+    /// independent of this review's own Findings 1-6, predating them, and
+    /// well outside this task's scope to fix, but real and worth flagging
+    /// prominently: `coppa_engine::CoppaCore::set_cp_profile` (via
+    /// `reconfigure`/`build`) rebuilds BOTH `self.transceiver` (TX/encoder)
+    /// AND `self.streaming` (RX/receiver) from the same `cp_mode` -- there is
+    /// no way to switch only one side. But the `ApplyAsConfirmer` branch's
+    /// call to `self.engine.set_cp_profile(mode)` is written (and the
+    /// `cp_negotiator` module doc frames it) as switching only B's *receiver*
+    /// ("B isn't the one switching the riskier side (the encoder)"). Because
+    /// `set_cp_profile` actually flips both, B's very next transmission --
+    /// the bare ack that A's own switch (`on_confirm_acked`) is waiting on --
+    /// goes out already re-encoded under the NEW CP profile, before A has
+    /// switched. A's receiver is still on the OLD profile at that point (by
+    /// design: A doesn't switch until it sees this exact ack), so in real
+    /// use A can never actually decode it, and the handshake would stall
+    /// with A stuck pre-switch forever. Confirmed directly here: a fresh,
+    /// correctly-profiled decoder cannot decode `b`'s real bare-ack audio
+    /// unless it's ALSO reconfigured to the new (`ShortCp`) profile first --
+    /// i.e. the ack genuinely only decodes under the profile A isn't
+    /// supposed to have yet. Worked around here, for this one hop only, by
+    /// giving `a`'s engine that same early knowledge purely so the rest of
+    /// the handshake's dispatch code (in particular `on_confirm_acked`,
+    /// which Findings 1-3 don't touch but which still deserves real
+    /// exercise) can be verified; this does NOT reflect real achievable
+    /// production behavior and should not be read as such. Left for a
+    /// future, dedicated investigation/fix (e.g. deferring B's own encoder
+    /// switch until after the bare ack is sent, or giving `CoppaCore`
+    /// independent TX/RX CP-mode fields); not attempted here.
+    #[tokio::test]
+    async fn cp_negotiation_full_handshake_converges_both_sides() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        config.engine.cp_gate_enabled = true;
+        config.engine.cp_negotiation_enabled = true;
+        let mut a = EventLoop::new(config.clone()).unwrap();
+        let mut b = EventLoop::new(config).unwrap();
+
+        let (a_producer, mut a_consumer) = coppa_audio::audio_ring(1_000_000);
+        a.set_audio_out(a_producer);
+        let (b_producer, mut b_consumer) = coppa_audio::audio_ring(1_000_000);
+        b.set_audio_out(b_producer);
+
+        assert_eq!(a.engine.cp_mode(), CpMode::LongCp);
+        assert_eq!(b.cp_negotiator.current(), CpMode::LongCp);
+        assert_eq!(b.cp_gate.current(), CpRecommendation::LongCp);
+
+        // Drive b's CpGate to a real ShortCp transition via 4 genuine
+        // decoded frames (see the doc comment above for why this, rather
+        // than a direct `cp_gate.observe` call, is the real production
+        // path).
+        let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
+        let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
+        for i in 0..4u8 {
+            let warmup_payload: Vec<u8> = vec![0xFF, i, 0, 0, 0, 0, 0, 1, 2, 3];
+            let header = coppa_codec::ofdm::frame::CoppaHeader {
+                version: 1,
+                phy_mode: 0,
+                frame_type: coppa_codec::ofdm::frame::CoppaFrameType::Data,
+                bandwidth: 1,
+                fec_type: 0,
+                speed_level: 2,
+                seq_num: 0,
+                payload_len: warmup_payload.len() as u16,
+                codewords: 1,
+            };
+            let samples = peer_tx
+                .transmit(&header, &warmup_payload)
+                .expect("peer transmit should succeed");
+            b.decode_and_dispatch_audio(&with_lead_and_trail(&samples))
+                .await;
+        }
+        assert_eq!(
+            b.cp_gate.current(),
+            CpRecommendation::ShortCp,
+            "4 consecutive clean-channel decodes should trip CpGate's real hysteresis"
+        );
+
+        // b's real propose-on-transition block should have really called
+        // `cp_control_arq_tx.send` and really transmitted a CpControl
+        // Propose PDU onto its own audio-out ring.
+        let mut buf = vec![0.0f32; 1_000_000];
+        let read = b_consumer.read(&mut buf);
+        assert!(
+            read > 0,
+            "expected b to have really transmitted a CpControl Propose"
+        );
+        let propose_samples = with_lead_and_trail(&buf[..read]);
+
+        // a decodes b's real Propose through the real dispatch path: this
+        // exercises the actual `TransportType::CpControl` match arm (the
+        // Findings 1-3 fix), which should really call
+        // `cp_control_arq_rx.receive`, `CpNegotiator::on_content_received`,
+        // `cp_control_arq_tx.send` for the Confirm, and really transmit it.
+        a.decode_and_dispatch_audio(&propose_samples).await;
+
+        let mut a_buf = vec![0.0f32; 1_000_000];
+        let a_read = a_consumer.read(&mut a_buf);
+        assert!(
+            a_read > 0,
+            "expected a to have really transmitted a CpControl Confirm"
+        );
+        let confirm_samples = with_lead_and_trail(&a_buf[..a_read]);
+
+        // b decodes a's real Confirm: applies to its own receiver
+        // immediately (ApplyAsConfirmer), and really transmits a bare ack.
+        assert_eq!(
+            b.cp_negotiator.current(),
+            CpMode::LongCp,
+            "b must not have switched yet"
+        );
+        b.decode_and_dispatch_audio(&confirm_samples).await;
+        assert_eq!(b.cp_negotiator.current(), CpMode::ShortCp);
+        assert_eq!(
+            b.engine.cp_mode(),
+            CpMode::ShortCp,
+            "b's own RECEIVER must switch first"
+        );
+
+        let mut b_buf2 = vec![0.0f32; 1_000_000];
+        let b_read2 = b_consumer.read(&mut b_buf2);
+        assert!(
+            b_read2 > 0,
+            "expected b to have really transmitted a bare ack for a's Confirm"
+        );
+        let ack_samples = with_lead_and_trail(&b_buf2[..b_read2]);
+
+        // a decodes b's real bare ack: NOW (and only now) applies to its
+        // own encoder.
+        assert_eq!(
+            a.engine.cp_mode(),
+            CpMode::LongCp,
+            "a must not have switched yet"
+        );
+        // Workaround for the real, out-of-scope protocol bug documented on
+        // this test's doc comment above: `b`'s bare-ack audio was actually
+        // encoded under `ShortCp` (because `set_cp_profile` rebuilt both of
+        // `b`'s TX and RX sides together), which `a`'s still-`LongCp`
+        // engine cannot decode. Give `a`'s engine that same early knowledge
+        // here, purely so this hop's real dispatch code
+        // (`on_confirm_acked`) can still be exercised -- not a claim that
+        // this is achievable in real production use. Because this line
+        // itself sets `a.engine`'s `cp_mode` to `ShortCp`, asserting
+        // `a.engine.cp_mode() == ShortCp` afterward would be tautological,
+        // not real evidence of `on_confirm_acked`'s own
+        // `self.engine.set_cp_profile(mode)` call having run -- so unlike
+        // every earlier switch in this test, only `a.cp_negotiator.current()`
+        // (untouched by this workaround, and set only by the real
+        // `on_confirm_acked` call inside `decode_and_dispatch_audio`) is
+        // checked below as real evidence for this specific hop.
+        a.engine.set_cp_profile(CpMode::ShortCp);
+        a.decode_and_dispatch_audio(&ack_samples).await;
+        assert_eq!(
+            a.cp_negotiator.current(),
+            CpMode::ShortCp,
+            "a's real on_confirm_acked dispatch should have applied the switch \
+             (its own engine.set_cp_profile call is not independently checked \
+             here -- see the workaround note above)"
+        );
+
+        // Final real round-trip: a frame encoded by a after the switch must
+        // decode correctly against a receiver built for
+        // hf_standard_short_cp -- confirms this isn't just bookkeeping, the
+        // actual profile really changed.
         let samples = a.engine.encode_bytes(b"after switch").unwrap();
         let mut check_receiver = coppa_engine::CoppaCore::new();
         check_receiver.set_cp_profile(CpMode::ShortCp);
@@ -3015,12 +3253,29 @@ mod tests {
     /// `probe_ack_resolves_probe_and_skips_normal_on_ack_for_the_same_event`.
     #[tokio::test]
     async fn reset_clears_outstanding_probe_state() {
+        use coppa_protocol::cp_negotiator::CpMode;
+
         let mut config = DaemonConfig::default();
         config.engine.arq_enabled = true;
+        config.engine.cp_negotiation_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
         event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
         event_loop.arq_rx = Some(ArqRx::new(8));
         event_loop.probe_state = Some((3, 6)); // pretend a probe is outstanding
+
+        // Give the CP-control pair/negotiator some real, non-fresh state
+        // before the Reset, so the Reset arm's extension (Finding 5) has
+        // something meaningful to actually clear -- otherwise this test
+        // proves nothing about that code path.
+        event_loop
+            .cp_negotiator
+            .apply_as_confirmer(coppa_protocol::cp_negotiator::CpMode::ShortCp);
+        event_loop
+            .cp_control_arq_tx
+            .send(b"warm up the cp-control seq space".to_vec(), Instant::now())
+            .expect("a fresh cp-control ArqTx window should have room");
+        assert_eq!(event_loop.cp_negotiator.current(), CpMode::ShortCp);
+        assert_ne!(event_loop.cp_control_arq_tx.next_seq(), 0);
 
         let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
         let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
@@ -3046,6 +3301,26 @@ mod tests {
         assert_eq!(
             event_loop.probe_state, None,
             "a Reset must clear any outstanding probe_state, not just rebuild arq_tx/arq_rx"
+        );
+        assert_eq!(
+            event_loop.cp_negotiator.current(),
+            CpMode::LongCp,
+            "a Reset must also rebuild cp_negotiator back to its fresh-state default"
+        );
+        assert_eq!(
+            event_loop.cp_control_arq_tx.next_seq(),
+            0,
+            "a Reset must rebuild cp_control_arq_tx fresh (no carried-over seq state)"
+        );
+        assert_eq!(
+            event_loop.cp_control_arq_tx.send_base(),
+            0,
+            "a Reset must rebuild cp_control_arq_tx fresh (no carried-over send_base)"
+        );
+        assert_eq!(
+            event_loop.cp_control_arq_rx.recv_base(),
+            0,
+            "a Reset must rebuild cp_control_arq_rx fresh (no carried-over recv_base)"
         );
     }
 
