@@ -1509,6 +1509,15 @@ impl CoppaModem {
     /// judge the estimate's own quality (noise, bias, lag) independent of
     /// either downstream consumer (fresh LS refit vs. AR(1) tap tracker).
     /// Not used by any production path; scratch investigation tooling.
+    ///
+    /// Unlike the production consumers of `calibrated_bias`
+    /// (`demodulate_frame_impl`, `header_peek`), this function does NOT apply
+    /// the VHF leading-margin padding those two use to avoid the
+    /// zero-vs-realistic-offset calibration desync (see `bounded_coarse_delay`'s
+    /// doc). On VHF profiles, this means readings from this function sit in a
+    /// different reference frame than `calibrated_bias` assumes elsewhere --
+    /// don't cross-compare a VHF `DriftDiagnostics` reading against
+    /// production behavior without accounting for that.
     pub fn diagnose_drift_tracking(&self, samples: &[f32]) -> Option<DriftDiagnostics> {
         let symbol_len = self.profile.fft_size + self.profile.cp_samples;
         let data_per_sym = self.data_carriers_per_symbol();

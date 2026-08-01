@@ -1701,33 +1701,41 @@ mod tests {
     fn vhf_all_levels_survive_realistic_leading_offset() {
         use coppa_codec::ofdm::CoppaProfile;
 
-        // Mirrors `sync_detector::TIMING_BACKOFF`'s value; kept as a literal
-        // here (rather than importing the private constant) since this test's
-        // whole point is to exercise a REALISTIC leading offset, not to track
-        // whatever the constant happens to be tuned to.
-        const LEADING_OFFSET: usize = 30;
+        // `sync_detector::TIMING_BACKOFF`'s value (30) is one of these, kept as
+        // a literal here (rather than importing the private constant) since
+        // this test's whole point is to exercise realistic leading offsets,
+        // not to track whatever the constant happens to be tuned to. Swept
+        // across several distinct offsets (not just the exact backoff value)
+        // per CLAUDE.md's Phase 2 Task 4 cautionary tale about validating a
+        // fix at only one operating point: 0 is the degenerate
+        // session-start-only case the original bug's saturation hid behind;
+        // 1 and 30 bracket the backoff's own saturation boundary; 500 is a
+        // large, clearly-non-saturating realistic margin.
+        const LEADING_OFFSETS: [usize; 4] = [0, 1, 30, 500];
 
         for level in [5u8, 6, 7, 9, 10] {
-            let profile = CoppaProfile::vhf_wide();
-            let tx = CoppaTransceiver::new(profile, 1);
-            let payload = vec![0x7Eu8; 40];
-            let header = make_header(level, payload.len() as u16);
+            for &leading_offset in &LEADING_OFFSETS {
+                let profile = CoppaProfile::vhf_wide();
+                let tx = CoppaTransceiver::new(profile, 1);
+                let payload = vec![0x7Eu8; 40];
+                let header = make_header(level, payload.len() as u16);
 
-            let clean = tx
-                .transmit(&header, &payload)
-                .expect("payload within this test's speed level capacity");
+                let clean = tx
+                    .transmit(&header, &payload)
+                    .expect("payload within this test's speed level capacity");
 
-            let mut with_lead = vec![0.0f32; LEADING_OFFSET];
-            with_lead.extend_from_slice(&clean);
+                let mut with_lead = vec![0.0f32; leading_offset];
+                with_lead.extend_from_slice(&clean);
 
-            let (rx_header, rx_payload, _lvl) = tx.receive(&with_lead).unwrap_or_else(|e| {
-                panic!(
-                    "VHF level {level} should decode a frame with a realistic non-zero \
-                     leading offset, got {e:?}"
-                )
-            });
-            assert_eq!(rx_header.speed_level, level);
-            assert_eq!(&rx_payload[..payload.len()], payload.as_slice());
+                let (rx_header, rx_payload, _lvl) = tx.receive(&with_lead).unwrap_or_else(|e| {
+                    panic!(
+                        "VHF level {level} should decode a frame with a leading \
+                         offset of {leading_offset} samples, got {e:?}"
+                    )
+                });
+                assert_eq!(rx_header.speed_level, level);
+                assert_eq!(&rx_payload[..payload.len()], payload.as_slice());
+            }
         }
     }
 
