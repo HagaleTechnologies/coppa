@@ -430,16 +430,57 @@ impl StreamingReceiver {
     /// to absolute time) -- the same 0.5 Hz noise-floor gate
     /// `demodulate_frame_impl` uses avoids a needless pass when the estimate
     /// is negligible.
+    ///
+    /// # `SYNC_LEAD_MARGIN`/`HEADER_PEEK_ANCHOR_MARGIN` padding (confirmed VHF
+    /// `TIMING_BACKOFF` bug fix, see
+    /// `.superpowers/sdd/vhf-timing-backoff-fix-report.md`)
+    ///
+    /// For a profile with no TX bandpass filter (VHF, i.e. `self.rx_group_delay
+    /// == 0` -- see that field's doc) ONLY: `demodulate_header` ->
+    /// `demodulate_header_llrs` -> `probe_calibration` reads
+    /// `CoppaModem::calibrated_bias`, which (post-fix, VHF only) is measured
+    /// assuming at least `coppa_codec::ofdm::coppa_modem::SYNC_LEAD_MARGIN`
+    /// samples of leading margin before the true preamble -- see
+    /// `measure_bulk_bias`'s doc. `demodulate_frame_impl` (the full-frame path)
+    /// guarantees that itself by padding its own incoming buffer (same VHF-only
+    /// gate) before running a FRESH sync detection pass, which self-corrects the
+    /// anchor regardless of how much margin was already there. This peek
+    /// deliberately has no such fresh detection step (`start` already comes from
+    /// the caller's own persistent, session-wide `SyncDetector`, and re-running
+    /// full detection here would defeat the point of a cheap "peek" -- see this
+    /// method's doc above), so for VHF it must instead reconstruct the SAME
+    /// anchor `demodulate_frame_impl` would have found, using
+    /// `HEADER_PEEK_ANCHOR_MARGIN` (`SYNC_LEAD_MARGIN - TIMING_BACKOFF`, see its
+    /// doc for the full derivation and the confirmed-safe-in-practice caveat
+    /// about `start` itself possibly already being partially backed off).
+    /// Skipping this desyncs this peek's header decode from `calibrated_bias`'s
+    /// real reference frame for VHF -- confirmed the hard way: an earlier
+    /// version of this fix used `SYNC_LEAD_MARGIN` directly (no `-
+    /// TIMING_BACKOFF` term) here, which passed every test in
+    /// `coppa-codec`/`coppa-protocol` but broke every VHF golden vector in
+    /// `crates/coppa-cli/tests/rx_golden.rs`. This is NOT the same historical
+    /// mistake this doc's earlier paragraph warns about (adding an arbitrary
+    /// margin here once broke header decode) -- that margin was never reflected
+    /// into `data_start`; this one is, by construction, always exactly
+    /// `HEADER_PEEK_ANCHOR_MARGIN`.
+    ///
+    /// HF profiles (`rx_group_delay > 0`) apply NEITHER padding here, matching
+    /// `measure_bulk_bias`/`demodulate_frame_impl`'s own VHF-only gating on the
+    /// codec side: their own RX bandpass filter's group delay already keeps
+    /// everything comfortably clear of `TIMING_BACKOFF`'s saturation with zero
+    /// padding, and applying it anyway was measured to cause a real regression
+    /// (a marginal Watterson-Poor golden vector) -- see
+    /// `CoppaModem::demodulate_frame_impl`'s "0." step doc for the specifics.
     fn header_peek(&self, start: u64, cfo_hz: f32) -> Option<CoppaHeader> {
+        use coppa_codec::ofdm::coppa_modem::{HEADER_PEEK_ANCHOR_MARGIN, SYNC_LEAD_MARGIN};
+
         let need = self.pending.as_ref()?.need;
         let start_rel = (start - self.ring_base) as usize;
-        let slice: Vec<f32> = self
-            .ring
-            .iter()
-            .skip(start_rel)
-            .take(need)
-            .copied()
-            .collect();
+        let is_vhf = self.rx_group_delay == 0;
+        let lead_pad = if is_vhf { SYNC_LEAD_MARGIN } else { 0 };
+        let mut slice: Vec<f32> = Vec::with_capacity(lead_pad + need);
+        slice.resize(lead_pad, 0.0);
+        slice.extend(self.ring.iter().skip(start_rel).take(need).copied());
 
         let corrected;
         let slice: &[f32] = if cfo_hz.abs() > 0.5 {
@@ -450,7 +491,8 @@ impl StreamingReceiver {
             &slice
         };
 
-        let data_start = self.rx_group_delay + 3 * self.symbol_len;
+        let anchor_margin = if is_vhf { HEADER_PEEK_ANCHOR_MARGIN } else { 0 };
+        let data_start = anchor_margin + self.rx_group_delay + 3 * self.symbol_len;
         self.transceiver.demodulate_header(slice, data_start)
     }
 

@@ -1679,6 +1679,58 @@ mod tests {
         );
     }
 
+    /// Regression test for the confirmed VHF `TIMING_BACKOFF`/calibration bug
+    /// (see `.superpowers/sdd/vhf-timing-backoff-fix-report.md`): every "clean
+    /// loopback" test above transmits with the preamble starting at sample 0 of
+    /// the buffer, so `SyncDetector`'s `local_peak_abs.saturating_sub(TIMING_BACKOFF)`
+    /// silently saturates to 0 for VHF profiles (no TX bandpass filter, so
+    /// nothing pushes the detected anchor comfortably above `TIMING_BACKOFF` at
+    /// position 0) — meaning the deliberate backoff was never actually applied
+    /// in those tests, OR in the one-time `CoppaModem::measure_bulk_bias`
+    /// calibration frame (also built at position 0) meant to compensate for it.
+    /// A REAL received frame essentially always has some nonzero leading offset
+    /// (there is always prior audio/silence before any given frame except
+    /// literally the first sample of a session), which engages the full,
+    /// backed-off timing anchor and its linear phase ramp -- a ramp
+    /// `calibrated_bias` was never actually calibrated against for VHF. Simulate
+    /// that here by prepending a realistic leading offset before the frame, for
+    /// every VHF-routed speed level (5, 6, 7, 9, 10 -- 8 is reserved), not just
+    /// one -- this is exactly the kind of single-operating-point validation gap
+    /// CLAUDE.md's Phase 2 Task 4 cautionary tale warns about.
+    #[test]
+    fn vhf_all_levels_survive_realistic_leading_offset() {
+        use coppa_codec::ofdm::CoppaProfile;
+
+        // Mirrors `sync_detector::TIMING_BACKOFF`'s value; kept as a literal
+        // here (rather than importing the private constant) since this test's
+        // whole point is to exercise a REALISTIC leading offset, not to track
+        // whatever the constant happens to be tuned to.
+        const LEADING_OFFSET: usize = 30;
+
+        for level in [5u8, 6, 7, 9, 10] {
+            let profile = CoppaProfile::vhf_wide();
+            let tx = CoppaTransceiver::new(profile, 1);
+            let payload = vec![0x7Eu8; 40];
+            let header = make_header(level, payload.len() as u16);
+
+            let clean = tx
+                .transmit(&header, &payload)
+                .expect("payload within this test's speed level capacity");
+
+            let mut with_lead = vec![0.0f32; LEADING_OFFSET];
+            with_lead.extend_from_slice(&clean);
+
+            let (rx_header, rx_payload, _lvl) = tx.receive(&with_lead).unwrap_or_else(|e| {
+                panic!(
+                    "VHF level {level} should decode a frame with a realistic non-zero \
+                     leading offset, got {e:?}"
+                )
+            });
+            assert_eq!(rx_header.speed_level, level);
+            assert_eq!(&rx_payload[..payload.len()], payload.as_slice());
+        }
+    }
+
     fn make_header(speed_level: u8, payload_len: u16) -> CoppaHeader {
         CoppaHeader {
             version: 1,

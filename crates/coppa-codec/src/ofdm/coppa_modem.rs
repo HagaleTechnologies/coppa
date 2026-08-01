@@ -25,6 +25,58 @@ use super::sync::{coppa_pn_sequence, generate_coppa_preamble};
 use super::sync_detector::SyncDetector;
 use super::CoppaProfile;
 
+/// Minimum leading margin (samples) guaranteed before sync detection, for every
+/// caller-supplied buffer this module hands to `SyncDetector::detect_all`
+/// (`measure_bulk_bias`'s one-time calibration frame AND `demodulate_frame_impl`'s
+/// real per-frame decode). See `measure_bulk_bias`'s "Leading pad" doc section for
+/// the full incident this fixes (`.superpowers/sdd/vhf-timing-backoff-fix-report.md`):
+/// without a guaranteed minimum margin, a profile with no TX bandpass filter (VHF)
+/// gets a DIFFERENT (saturated-vs-not) timing/phase-ramp outcome depending purely on
+/// how much leading silence the caller's buffer happened to already have, which
+/// desynced the one-time `calibrated_bias` measurement from real per-frame decodes.
+/// Comfortably larger than `TIMING_BACKOFF` so `local_peak_abs.saturating_sub(TIMING_BACKOFF)`
+/// never saturates for any profile, at either call site.
+///
+/// `pub` (not just `pub(crate)`): `coppa-protocol`'s `StreamingReceiver::header_peek`
+/// is a THIRD consumer of `calibrated_bias` (via `CoppaModem::probe_calibration`) —
+/// one that, unlike `measure_bulk_bias`/`demodulate_frame_impl`, does not call
+/// `SyncDetector::detect_all` itself (it takes an explicit, externally-computed
+/// `data_start` instead). It must apply this SAME margin to its own slice/`data_start`
+/// computation to stay in the same reference frame `calibrated_bias` now assumes —
+/// confirmed the hard way: an earlier version of this fix touched only
+/// `measure_bulk_bias`/`demodulate_frame_impl` and passed every test in
+/// `coppa-codec`/`coppa-protocol`, but broke `coppa-cli`'s golden-vector regression
+/// test (`crates/coppa-cli/tests/rx_golden.rs`), which goes through
+/// `StreamingReceiver`/`header_peek`.
+pub const SYNC_LEAD_MARGIN: usize = 4 * super::sync_detector::TIMING_BACKOFF as usize;
+
+/// The sync ANCHOR's position (samples) within a buffer that has had
+/// `SYNC_LEAD_MARGIN` zero samples prepended before the true preamble --
+/// i.e. what `demodulate_frame_impl`'s own fresh `SyncDetector::detect_all` call
+/// would compute as `candidate.frame_start` on such a buffer:
+/// `local_peak_abs (== SYNC_LEAD_MARGIN + a small, ~constant intrinsic detector
+/// offset) .saturating_sub(TIMING_BACKOFF)`. `StreamingReceiver::header_peek`
+/// (`coppa-protocol`) needs exactly this value: it prepends the same
+/// `SYNC_LEAD_MARGIN` to its own slice but, unlike `demodulate_frame_impl`, does
+/// NOT re-run `SyncDetector::detect_all` on it (that's the whole point of a
+/// "peek" -- see its doc), so it cannot recompute this anchor itself and must be
+/// given the fixed value it would have found.
+///
+/// This is deliberately NOT adjusted for whether `header_peek`'s own OUTER
+/// (session-wide, unpadded) `SyncDetector` instance's `frame_start` was itself
+/// saturated by `TIMING_BACKOFF` or not -- there is no way to tell after the
+/// fact from `frame_start` alone which case occurred, and the header region is
+/// always plain BPSK regardless of speed level, which tolerates the resulting
+/// (at most `TIMING_BACKOFF`-sized, i.e. small and constant) reference-point
+/// error in the unsaturated case fine in practice (confirmed directly: golden
+/// vectors re-tested with 15/50/200/1000 extra leading silence samples prepended
+/// -- spanning both the saturated and unsaturated regimes -- all still decode).
+/// The payload (which can be high-order QAM, and is NOT tolerant of this) never
+/// goes through this path -- it's demodulated by `demodulate_frame_impl`'s own
+/// fresh, fully self-correcting detection instead.
+pub const HEADER_PEEK_ANCHOR_MARGIN: usize =
+    SYNC_LEAD_MARGIN - super::sync_detector::TIMING_BACKOFF as usize;
+
 /// Speed level configuration for future MCS support.
 #[derive(Debug, Clone, Copy)]
 pub struct SpeedLevel {
@@ -464,6 +516,38 @@ impl CoppaModem {
     /// the deterministic TX/detector artifact) leaves genuine per-frame multipath
     /// entirely in its own natural, non-negative reference frame (both ITU-R taps
     /// start at delay ≥ 0 by construction), matching this estimator's assumptions.
+    ///
+    /// # Leading pad (confirmed VHF bug fix, see
+    /// `.superpowers/sdd/vhf-timing-backoff-fix-report.md`)
+    ///
+    /// For a profile with no TX bandpass filter (VHF — see `tx_bpf`'s doc) ONLY,
+    /// the calibration frame is prepended with `SYNC_LEAD_MARGIN` samples of
+    /// silence before sync detection, and every downstream index (`timing_offset`,
+    /// `data_start`, `probe_start`) stays in that SAME padded buffer's coordinate
+    /// frame rather than being re-expressed relative to the unpadded frame.
+    /// Without this, VHF transmits its calibration frame with the preamble
+    /// starting at sample 0 of the buffer, so the detected timing anchor sits
+    /// near 0 and `SyncDetector`'s `local_peak_abs.saturating_sub(TIMING_BACKOFF)`
+    /// silently saturates to 0 — the calibration frame never actually exercises
+    /// the deliberate `TIMING_BACKOFF` margin. A REAL received buffer, by
+    /// contrast, essentially always has some leading context before the
+    /// preamble, so it engages the full, un-saturated backoff and the linear
+    /// phase ramp that comes with it — a ramp `calibrated_bias` was never
+    /// actually calibrated against for VHF, because its own calibration frame
+    /// hit a saturation clamp calibration should never hit.
+    /// `demodulate_frame_impl` applies this SAME margin, under the SAME
+    /// VHF-only condition, to every real per-frame decode too (see its own "0."
+    /// step doc), so `calibrated_bias` and a real frame's own sync detection
+    /// always experience the identical (non-saturated) regime for VHF —
+    /// regardless of how much leading silence the caller's own buffer happened
+    /// to already have.
+    ///
+    /// HF profiles skip this padding entirely (`self.tx_bpf.is_some()`): their
+    /// own TX bandpass filter's ~300-sample group delay already keeps the
+    /// detected anchor comfortably above `TIMING_BACKOFF` with zero padding, so
+    /// they never needed this fix, and applying it to them anyway was measured
+    /// to cause a real regression elsewhere — see `demodulate_frame_impl`'s "0."
+    /// step doc for the specifics.
     fn measure_bulk_bias(&self) -> f32 {
         let header = CoppaHeader {
             version: self.version,
@@ -477,7 +561,12 @@ impl CoppaModem {
             codewords: 1,
         };
         let symbols = vec![Complex32::new(1.0, 0.0); 64];
-        let samples = self.modulate_mapped(&header, &symbols, 6.0);
+        let mut samples = if self.tx_bpf.is_none() {
+            vec![0.0f32; SYNC_LEAD_MARGIN]
+        } else {
+            Vec::new()
+        };
+        samples.extend_from_slice(&self.modulate_mapped(&header, &symbols, 6.0));
 
         let Some(candidate) = SyncDetector::detect_all(&self.profile, self.version, &samples)
             .into_iter()
@@ -704,6 +793,52 @@ impl CoppaModem {
     ) -> Option<(CoppaHeader, Vec<Complex32>, Vec<f32>, f32)> {
         let symbol_len = self.profile.fft_size + self.profile.cp_samples;
         let data_per_sym = self.data_carriers_per_symbol();
+
+        // 0. Guarantee a fixed minimum leading margin before sync detection, for
+        // profiles with no TX bandpass filter (VHF) ONLY — see `SYNC_LEAD_MARGIN`'s
+        // doc and `measure_bulk_bias`'s "Leading pad" section for the full incident
+        // this fixes (`.superpowers/sdd/vhf-timing-backoff-fix-report.md`).
+        // `receive_with_metrics`/`demodulate_frame` is documented (see
+        // `StreamingReceiver`'s doc and `receive_with_metrics`'s doc) to "tolerate
+        // arbitrary leading margin/silence before the frame" via this fresh
+        // internal `SyncDetector::detect_all` — a real, load-bearing guarantee
+        // both `StreamingReceiver` (zero margin) and every existing
+        // `CoppaTransceiver::receive` unit test (also zero margin) rely on. But
+        // for a profile with no TX bandpass filter (VHF — see `tx_bpf`'s doc),
+        // a caller-supplied buffer with LESS margin than `TIMING_BACKOFF` makes
+        // `SyncDetector`'s own `local_peak_abs.saturating_sub(TIMING_BACKOFF)`
+        // saturate to 0, while a buffer with MORE margin engages the full,
+        // un-saturated backoff — two different timing/phase-ramp outcomes for
+        // the exact same frame, depending purely on incidental buffer framing.
+        // Prepending a fixed, comfortable margin here — before detection, kept in
+        // this same padded buffer's coordinate frame for the rest of this
+        // function — makes that outcome buffer-framing-INVARIANT (matching
+        // `calibrated_bias`, which now also always measures the non-saturated
+        // case), so it no longer matters whether the caller's own buffer had 0,
+        // `TIMING_BACKOFF`, or any other amount of leading silence.
+        //
+        // Deliberately gated on `self.tx_bpf.is_none()` (VHF only) rather than
+        // applied unconditionally: HF profiles' own TX bandpass filter already
+        // supplies ~300 samples of intrinsic margin, comfortably avoiding the
+        // saturation this pads around, so they never needed this fix in the first
+        // place — and applying it to them anyway was measured to introduce a real,
+        // deterministic regression on `coppa-cli`'s golden-vector test
+        // (`L1_poor25`, a marginal Watterson-Poor HF case), most likely via
+        // `remove_cfo`'s per-sample phase reference (`-TAU*cfo_hz*i/sample_rate`,
+        // `i` relative to whatever buffer it's given) shifting by the pad amount
+        // for any frame with a nonzero (even noise-induced) sync CFO estimate.
+        // Scoping this to VHF-only avoids that risk entirely for every profile
+        // that didn't need the fix.
+        let padded_buf;
+        let samples: &[f32] = if self.tx_bpf.is_none() {
+            let mut buf = Vec::with_capacity(SYNC_LEAD_MARGIN + samples.len());
+            buf.resize(SYNC_LEAD_MARGIN, 0.0);
+            buf.extend_from_slice(samples);
+            padded_buf = buf;
+            &padded_buf
+        } else {
+            samples
+        };
 
         // 1. Sync: streaming O(1) detector (see `sync_detector` module docs), which now
         // also produces a two-stage Moose CFO estimate (`cfo_hz`, ±50 Hz range) alongside
