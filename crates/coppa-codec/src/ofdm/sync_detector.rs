@@ -67,7 +67,32 @@ const FIRST_PATH_FRACTION: f32 = 0.5;
 /// a comfortable margin below the measured 50-51 breaking point while still
 /// giving real cyclic-prefix headroom for timing jitter; all of
 /// `cargo test -p coppa-codec -p coppa-protocol --lib` passes at this value.
-const TIMING_BACKOFF: u64 = 30;
+///
+/// CONFIRMED VHF BUG, FIXED ELSEWHERE, NOT HERE (see
+/// `.superpowers/sdd/vhf-timing-backoff-fix-report.md`): this constant itself
+/// does not need to scale with `cp_samples` (an earlier fix attempt tried
+/// exactly that and, measured directly, did NOT fix the bug — see the report).
+/// The 30-sample linear phase ramp it introduces is a fixed number of
+/// *samples* (independent of CP length, since every profile shares the same
+/// `fft_size`), and is meant to be fully compensated by
+/// `CoppaModem::calibrated_bias`, measured once per profile at construction
+/// (`measure_bulk_bias`) and applied every frame via `bounded_coarse_delay`.
+/// The real bug was that whether `local_peak_abs.saturating_sub(TIMING_BACKOFF)`
+/// actually saturates to 0 depends on how much leading margin the buffer handed
+/// to `SyncDetector::detect_all` happens to have — HF profiles' 601-tap TX
+/// bandpass filter (`tx_bpf`) supplies a ~300-sample group delay that always
+/// avoids this, but VHF profiles have none, so a position-0 buffer saturates
+/// (no real backoff applied) while a buffer with `>= TIMING_BACKOFF` leading
+/// samples does not (full backoff applied) — two different phase-ramp outcomes
+/// for the same frame depending purely on incidental buffer framing, and BOTH
+/// are real, currently-used call patterns (see the report). Fixed by
+/// `CoppaModem::SYNC_LEAD_MARGIN`: guaranteeing the same fixed, comfortable
+/// leading margin before every `SyncDetector::detect_all` call on a
+/// caller-supplied buffer (both `measure_bulk_bias`'s one-time calibration
+/// frame and `demodulate_frame_impl`'s real per-frame decode), making the
+/// saturation outcome buffer-framing-invariant, rather than by changing this
+/// constant.
+pub(super) const TIMING_BACKOFF: u64 = 30;
 
 /// A confirmed synchronization candidate.
 #[derive(Debug, Clone, Copy, PartialEq)]
