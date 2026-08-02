@@ -536,6 +536,52 @@ impl ArqTx {
         }
     }
 
+    /// Give up on `seq` permanently: clear its slot and advance `send_base`
+    /// past any now-resolved (acked or abandoned) prefix, mirroring
+    /// [`Self::process_ack`]'s cumulative advance.
+    ///
+    /// This exists because nothing else ever evicts a given-up segment.
+    /// [`Self::get_retransmits`]'s `transmit_count <= max_retransmit` guard
+    /// silently stops *retrying* a dead segment but never *removes* it, and
+    /// only `process_ack` clears a slot -- so a segment whose peer is gone
+    /// parks in the window forever, permanently consuming one slot. On the
+    /// two-slot CP-control pair (COP-1) that means one failed negotiation
+    /// leaves the pair half-dead and a second failure wedges it completely.
+    ///
+    /// **This is deliberately NOT "reset the pair."** `next_seq` is
+    /// untouched, so a sequence number is never reused. A caller that
+    /// instead rebuilt the [`ArqTx`] would rewind `next_seq` to 0, and if
+    /// its peer had not rebuilt at the same instant (give-up timings
+    /// genuinely skew -- some triggers are ARQ-budget-driven and some are
+    /// wall-clock-driven) the peer's [`ArqRx`] would silently swallow the
+    /// recycled seq as an already-delivered duplicate, reintroducing a
+    /// stuck handshake by a different route. Do not "simplify" this into a
+    /// rebuild.
+    ///
+    /// A no-op for a seq that is not currently in the TX buffer -- never
+    /// sent, already acked, or already abandoned.
+    pub fn abandon(&mut self, seq: u8) {
+        let idx = seq as usize % MAX_WINDOW_SIZE as usize;
+        match self.tx_buf[idx] {
+            Some(ref seg) if seg.seq_num == seq => self.tx_buf[idx] = None,
+            _ => return,
+        }
+
+        // Advance send_base over the contiguous resolved prefix. A slot is
+        // resolved if it is empty (abandoned, or cumulatively acked) or
+        // holds a selectively-acked segment -- the same two conditions
+        // `process_ack`'s cumulative loop consumes.
+        while self.send_base != self.next_seq {
+            let i = self.send_base as usize % MAX_WINDOW_SIZE as usize;
+            match self.tx_buf[i] {
+                None => {}
+                Some(ref s) if s.acked => self.tx_buf[i] = None,
+                _ => break,
+            }
+            self.send_base = self.send_base.wrapping_add(1);
+        }
+    }
+
     /// Check if a segment has exceeded max retransmit count.
     pub fn is_failed(&self, seq: u8) -> bool {
         let idx = seq as usize % MAX_WINDOW_SIZE as usize;
@@ -1372,6 +1418,97 @@ mod tests {
             total_elapsed <= rto1 * 2 + Duration::from_millis(600),
             "recovery took {total_elapsed:?}, expected within ~2 RTOs ({:?})",
             rto1 * 2
+        );
+    }
+    // ── COP-1: `abandon` -- release a given-up segment ────────────────────
+
+    #[test]
+    fn abandon_frees_the_window_slot() {
+        let mut tx = ArqTx::new(ArqConfig {
+            window_size: 2,
+            ..ArqConfig::default()
+        });
+        let now = Instant::now();
+        let s0 = tx.send(vec![1, 2], now).unwrap();
+        let _s1 = tx.send(vec![3, 4], now).unwrap();
+        assert!(tx.send(vec![5, 6], now).is_err(), "window should be full");
+        tx.abandon(s0);
+        assert!(
+            tx.send(vec![5, 6], now).is_ok(),
+            "abandon must free the slot"
+        );
+    }
+
+    #[test]
+    fn abandon_does_not_rewind_the_sequence_space() {
+        let mut tx = ArqTx::new(ArqConfig {
+            window_size: 2,
+            ..ArqConfig::default()
+        });
+        let now = Instant::now();
+        let s0 = tx.send(vec![1], now).unwrap();
+        let next_before = tx.next_seq();
+        tx.abandon(s0);
+        assert_eq!(
+            tx.next_seq(),
+            next_before,
+            "abandon must never reuse a seq -- see its doc for the \
+             divergent-sequence-space hazard that motivates this"
+        );
+    }
+
+    #[test]
+    fn abandon_advances_send_base_past_contiguously_abandoned_segments() {
+        let mut tx = ArqTx::new(ArqConfig {
+            window_size: 2,
+            ..ArqConfig::default()
+        });
+        let now = Instant::now();
+        let s0 = tx.send(vec![1], now).unwrap();
+        let s1 = tx.send(vec![2], now).unwrap();
+        // Abandon out of order: s1 first (a hole), then s0 (which resolves
+        // the whole contiguous prefix at once).
+        tx.abandon(s1);
+        tx.abandon(s0);
+        assert!(tx.get_segment_data(s0).is_none());
+        assert!(tx.get_segment_data(s1).is_none());
+        assert!(tx
+            .get_retransmits(now + Duration::from_secs(600))
+            .is_empty());
+        assert_eq!(tx.in_flight(), 0, "both slots must be fully released");
+    }
+
+    #[test]
+    fn abandon_an_unknown_or_already_abandoned_seq_is_a_no_op() {
+        let mut tx = ArqTx::new(ArqConfig {
+            window_size: 2,
+            ..ArqConfig::default()
+        });
+        tx.abandon(200); // never sent
+        let s0 = tx.send(vec![1], Instant::now()).unwrap();
+        tx.abandon(s0);
+        tx.abandon(s0); // twice
+        assert_eq!(tx.in_flight(), 0);
+    }
+
+    #[test]
+    fn an_abandoned_segment_is_no_longer_reported_failed() {
+        let mut tx = ArqTx::new(ArqConfig {
+            window_size: 2,
+            ..ArqConfig::default()
+        });
+        let mut now = Instant::now();
+        let s0 = tx.send(vec![1], now).unwrap();
+        for _ in 0..=DEFAULT_MAX_RETRANSMIT {
+            now += Duration::from_secs(120);
+            let _ = tx.get_retransmits(now);
+            let _ = tx.mark_retransmitted(s0, now);
+        }
+        assert!(tx.is_failed(s0));
+        tx.abandon(s0);
+        assert!(
+            !tx.is_failed(s0),
+            "abandon must clear the failed state it resolves"
         );
     }
 }
