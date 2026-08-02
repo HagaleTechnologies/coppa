@@ -150,7 +150,10 @@ pub struct StreamingReceiver {
     /// Searching never considers a candidate whose `frame_start` is before this —
     /// advanced past a candidate's data once it's been resolved (successfully or
     /// not), and by exactly `symbol_len` (not the whole buffered window) on a
-    /// header decode failure, per the locked state machine.
+    /// header decode failure, per the locked state machine. On a header-decode
+    /// failure specifically, the `symbol_len` skip is clamped by
+    /// [`Self::advance_resume_from_past`] so it never passes an already-queued
+    /// later candidate — see that method's doc for why.
     resume_from: u64,
     pending: Option<Pending>,
 }
@@ -305,7 +308,7 @@ impl StreamingReceiver {
             if start < self.ring_base {
                 // Shouldn't happen given `evict_ring`'s policy, but never index before
                 // the ring's retained history.
-                self.resume_from = start + self.symbol_len as u64;
+                self.advance_resume_from_past(start);
                 self.pending = None;
                 continue;
             }
@@ -326,7 +329,7 @@ impl StreamingReceiver {
                                 // loop again: may already have enough for full_need
                             }
                             None => {
-                                self.resume_from = start + self.symbol_len as u64;
+                                self.advance_resume_from_past(start);
                                 self.pending = None;
                             }
                         }
@@ -335,7 +338,7 @@ impl StreamingReceiver {
                         // Header decode failure: discard this candidate and resume
                         // search right after just the first symbol, not the whole
                         // buffered header window.
-                        self.resume_from = start + self.symbol_len as u64;
+                        self.advance_resume_from_past(start);
                         self.pending = None;
                     }
                 }
@@ -378,6 +381,33 @@ impl StreamingReceiver {
 
         self.evict_ring();
         out
+    }
+
+    /// Advance `resume_from` to `start + symbol_len`, but never past an
+    /// already-queued later candidate.
+    ///
+    /// This is the recovery step after a header-decode failure at `start`: the
+    /// state machine deliberately resumes search right after just the failed
+    /// candidate's first symbol, not the whole buffered header window (see the
+    /// call sites' comments). But `self.candidates` can already contain a
+    /// genuine, not-yet-tried candidate whose `frame_start` is very close to
+    /// `start` — a spurious candidate near the tail of one frame and the real
+    /// start of the next can land within a few samples of each other,
+    /// depending on inter-frame gap length and content. An unclamped skip can
+    /// overshoot that real candidate's `frame_start`, and the very next loop
+    /// iteration's staleness filter (`candidates.front() < resume_from`) would
+    /// then discard it — silently losing a real frame (the confirmed root
+    /// cause of a previously-reported spurious-second-decode bug affecting
+    /// VHF speed levels 5 and 7 at specific inter-frame gap lengths). Clamping
+    /// the skip to stop at, not past, the next queued candidate closes that
+    /// gap without weakening the skip for the common case where no such
+    /// candidate is waiting.
+    fn advance_resume_from_past(&mut self, start: u64) {
+        let proposed = start + self.symbol_len as u64;
+        self.resume_from = match self.candidates.front() {
+            Some(c) if c.frame_start > start => proposed.min(c.frame_start),
+            _ => proposed,
+        };
     }
 
     /// Demodulate just the header of the candidate starting at `start`.

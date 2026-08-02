@@ -579,6 +579,69 @@ mod tests {
         );
     }
 
+    /// Regression test for a confirmed real bug: a spurious sync candidate near
+    /// the tail of frame 1 fails `StreamingReceiver::header_peek`, and the
+    /// resulting one-symbol-length skip-ahead used to overshoot the real frame
+    /// 2 candidate -- already queued by the time the failure was resolved -- by
+    /// a handful of samples, dropping it as stale and silently losing the
+    /// frame. Confirmed via direct instrumentation at VHF speed level 7 with a
+    /// 30ms inter-frame gap: a spurious candidate advanced `resume_from` one
+    /// sample past the real candidate's `frame_start`. Deterministic at this
+    /// exact level/gap/payload combination (verified repeatedly) -- reproduced
+    /// directly here rather than swept. Exercises the same `CoppaCore::
+    /// encode_bytes` -> `push_samples` path the original bug report used; a
+    /// raw `CoppaTransceiver::transmit`-built frame does not reproduce this
+    /// (content differences from `encode_bytes`'s own framing/compression
+    /// evidently matter to whether the spurious candidate lands in the fatal
+    /// window), so this test intentionally goes through the public engine API
+    /// rather than `coppa-protocol`'s lower-level primitives.
+    #[test]
+    fn second_frame_survives_spurious_tail_candidate_at_level7() {
+        let config = EngineConfig {
+            speed_level: 7,
+            ..Default::default()
+        };
+        let mut core = CoppaCore::with_config(config);
+
+        let payload1: Vec<u8> = (0..15u8).collect();
+        let payload2: Vec<u8> = (0..15u8).map(|i| (i * 7 + 3) % 251).collect();
+        let samples1 = core.encode_bytes(&payload1).expect("encode payload1");
+        let samples2 = core.encode_bytes(&payload2).expect("encode payload2");
+
+        // 30ms gap at 48kHz -- the confirmed-failing gap length from direct
+        // instrumentation of this exact repro.
+        let gap = vec![0.0f32; 30 * 48];
+
+        let mut chunk1 = samples1;
+        chunk1.extend_from_slice(&gap);
+        let frames1 = core.push_samples(&chunk1);
+        assert_eq!(
+            frames1.len(),
+            1,
+            "frame 1 should decode on its own chunk, got {} frames",
+            frames1.len()
+        );
+        assert_eq!(
+            frames1[0].payload.as_ref().expect("payload1 decompresses"),
+            &payload1
+        );
+
+        let mut chunk2 = samples2;
+        chunk2.extend_from_slice(&gap);
+        let frames2 = core.push_samples(&chunk2);
+        assert_eq!(
+            frames2.len(),
+            1,
+            "frame 2 must decode; a spurious tail candidate near frame 1's end \
+             must not cause the real second frame to be dropped, got {} frames",
+            frames2.len()
+        );
+        assert_eq!(
+            frames2[0].payload.as_ref().expect("payload2 decompresses"),
+            &payload2
+        );
+    }
+
     #[test]
     fn test_compression_roundtrip() {
         let config = EngineConfig {
