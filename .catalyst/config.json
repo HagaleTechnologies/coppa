@@ -1,0 +1,46 @@
+{
+  "catalyst": {
+    "projectKey": "HagaleTechnologies",
+    "repository": {
+      "org": "HagaleTechnologies",
+      "name": "coppa"
+    },
+    "project": {
+      "ticketPrefix": "COP",
+      "name": "coppa"
+    },
+    "linear": {
+      "teamKey": "COP",
+      "stateMap": {
+        "backlog": "Backlog",
+        "todo": "Todo",
+        "research": "In Progress",
+        "planning": "In Progress",
+        "inProgress": "In Progress",
+        "inReview": "In Review",
+        "done": "Done",
+        "canceled": "Canceled"
+      },
+      "teamId": "1ded4977-d930-4373-b3f1-e63ebf86a1d3"
+    },
+    "thoughts": {
+      "user": null,
+      "directory": "coppa",
+      "profile": "HagaleTechnologies"
+    },
+    "sweep": {
+      "idleHours": 48,
+      "intervalHours": 1,
+      "salvagePush": false,
+      "maxRemovalsPerRun": 10
+    },
+    "executionCore": {
+      "maxParallel": 3,
+      "minParallel": 1,
+      "maxParallelCeiling": 3
+    },
+    "orchestration": {
+      "executor": "codex-exec"
+    }
+  }
+}
