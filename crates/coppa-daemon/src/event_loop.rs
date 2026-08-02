@@ -1426,9 +1426,20 @@ impl EventLoop {
                                                             // (transmitter+receiver together) to
                                                             // the new mode.
                                                             self.cp_negotiator
-                                                                .apply_as_confirmer(mode);
+                                                                .apply_as_confirmer(mode, now);
                                                             self.engine.set_cp_profile(mode);
                                                             tracing::info!(?mode, "CP profile switched (proposer role, own receiver)");
+                                                        }
+                                                        Some(ContentAction::PeerSwitched(mode)) => {
+                                                            // COP-1 third leg: proof our own
+                                                            // switch was not made in vain --
+                                                            // disarm probation. (The bare ack
+                                                            // that resolves the peer's
+                                                            // ARQ-tracked leg is sent by the
+                                                            // Phase 3 wiring below.)
+                                                            self.cp_negotiator
+                                                                .on_peer_switched(mode);
+                                                            tracing::info!(?mode, "Peer confirmed its own CP switch; handshake complete");
                                                         }
                                                         None => tracing::debug!(
                                                             "Malformed CpControl payload; ignoring"
@@ -2313,7 +2324,7 @@ mod tests {
         let (b_ack_num, b_ack_bitmap) = b.cp_control_arq_rx.ack_info();
         match CpNegotiator::on_content_received(&confirm_pdu.payload).unwrap() {
             coppa_protocol::cp_negotiator::ContentAction::ApplyAsConfirmer(mode) => {
-                b.cp_negotiator.apply_as_confirmer(mode);
+                b.cp_negotiator.apply_as_confirmer(mode, now);
                 b.engine.set_cp_profile(mode);
             }
             other => panic!("expected ApplyAsConfirmer, got {other:?}"),
@@ -3346,9 +3357,10 @@ mod tests {
         // before the Reset, so the Reset arm's extension (Finding 5) has
         // something meaningful to actually clear -- otherwise this test
         // proves nothing about that code path.
-        event_loop
-            .cp_negotiator
-            .apply_as_confirmer(coppa_protocol::cp_negotiator::CpMode::ShortCp);
+        event_loop.cp_negotiator.apply_as_confirmer(
+            coppa_protocol::cp_negotiator::CpMode::ShortCp,
+            Instant::now(),
+        );
         event_loop
             .cp_control_arq_tx
             .send(b"warm up the cp-control seq space".to_vec(), Instant::now())
