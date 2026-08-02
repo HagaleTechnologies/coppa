@@ -560,6 +560,29 @@ impl ArqTx {
     ///
     /// A no-op for a seq that is not currently in the TX buffer -- never
     /// sent, already acked, or already abandoned.
+    ///
+    /// # Window room is freed by the *prefix*, not by this seq alone
+    ///
+    /// [`Self::in_flight`] is `next_seq - send_base`, and the advance loop
+    /// below stops at the first slot still holding a live unacked segment.
+    /// Abandoning a seq that is not at (or contiguously reachable from)
+    /// `send_base` therefore empties its slot but frees **no window room** --
+    /// [`Self::can_send`] stays `false` until every older segment is acked or
+    /// abandoned too. That is the same rule cumulative-ack ARQ already has for
+    /// [`Self::process_ack`]; `abandon` deliberately does not special-case it,
+    /// because tracking abandoned slots as tombstones would mean computing
+    /// `in_flight` from live segments rather than from the two cursors, a
+    /// change to the shared data path that this ticket's CP-control use does
+    /// not need.
+    ///
+    /// It does not need it because the caller abandons the whole set together:
+    /// `coppa-daemon`'s give-up block reads every tracked CP leg *before*
+    /// clearing any bookkeeping and abandons them all in one pass, so the
+    /// prefix resolves and the pair really does come back to `in_flight() ==
+    /// 0`. A caller that abandons only *some* of its outstanding segments must
+    /// expect the slot to stay occupied until the rest resolve. See
+    /// `abandoning_a_non_base_seq_alone_frees_no_window_room` for the exact
+    /// behavior, asserted rather than assumed.
     pub fn abandon(&mut self, seq: u8) {
         let idx = seq as usize % MAX_WINDOW_SIZE as usize;
         match self.tx_buf[idx] {
@@ -1489,6 +1512,40 @@ mod tests {
         tx.abandon(s0);
         tx.abandon(s0); // twice
         assert_eq!(tx.in_flight(), 0);
+    }
+
+    #[test]
+    fn abandoning_a_non_base_seq_alone_frees_no_window_room() {
+        // The documented limitation, asserted rather than assumed (review
+        // finding): `in_flight` is `next_seq - send_base`, so emptying a slot
+        // the advance loop cannot reach leaves `can_send` false. The three
+        // daemon give-up comments used to claim the slot was "released"
+        // unconditionally; it is released only once the whole prefix resolves.
+        let mut tx = ArqTx::new(ArqConfig {
+            window_size: 2,
+            ..ArqConfig::default()
+        });
+        let now = Instant::now();
+        let s0 = tx.send(vec![1], now).unwrap();
+        let s1 = tx.send(vec![2], now).unwrap();
+        assert!(!tx.can_send(), "test setup: the two-slot window is full");
+
+        tx.abandon(s1);
+        assert!(
+            tx.get_segment_data(s1).is_none(),
+            "the slot itself really is emptied"
+        );
+        assert_eq!(
+            tx.in_flight(),
+            2,
+            "but no window room is freed while the older s0 is still live"
+        );
+        assert!(!tx.can_send());
+
+        // Resolving the base is what actually releases both.
+        tx.abandon(s0);
+        assert_eq!(tx.in_flight(), 0);
+        assert!(tx.can_send());
     }
 
     #[test]

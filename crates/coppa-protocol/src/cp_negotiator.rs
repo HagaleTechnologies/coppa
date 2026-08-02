@@ -149,11 +149,22 @@
 //! The fix is to make step 6 **re-elicitable** rather than to give B yet
 //! another deadline. A's third leg is ARQ-tracked, so A retransmits it; the
 //! daemon's `handle_cp_control` now emits a bare ack for a *duplicate*
-//! content PDU too (one whose seq `ArqRx` has already delivered, so
-//! `delivered` comes back empty) instead of dropping it silently. Step 6 is
+//! `CpSwitched` content PDU too (one whose seq `ArqRx` has already delivered,
+//! so `delivered` comes back empty) instead of dropping it silently. Step 6 is
 //! therefore covered by ordinary retransmission, the same mechanism that
 //! covers legs 1, 2 and 4 -- and the handshake completes on the NEW mode
 //! rather than giving up.
+//!
+//! That re-ack is deliberately restricted to the `CpSwitched` kind, and step 6
+//! is the only frame that needs it. Re-acking *every* duplicate would silently
+//! disarm the give-up triggers the table above depends on: a retransmitted
+//! `Propose` would get acked, clearing B's `cp_propose_seq` so G1 could never
+//! fire on the row-2 (`Confirm` lost) case, and a retransmitted `Confirm`
+//! would be acked under the NEW profile that A -- which has not switched --
+//! cannot decode, so the ack buys nothing while still costing A's G2 its
+//! trigger. Only for `CpSwitched` are both stations already on the same, new
+//! profile, which is exactly what makes the re-ack meaningful there and
+//! harmful everywhere else.
 //!
 //! Giving B a second deadline instead was considered and rejected: nothing
 //! could clear it on an idle link (the only remaining signal would be "some
@@ -170,6 +181,42 @@
 //! This module owns only G3's clock; G1/G2/G4 are ARQ-budget-driven and
 //! live in the daemon, which polls `pending_confirm_seq`/
 //! `pending_switched_seq` against `ArqTx::is_failed`.
+//!
+//! ## One negotiation at a time -- enforced, not assumed
+//!
+//! There is exactly **one** `CpNegotiator` per daemon: one `current`, one
+//! `revert_to`, one `probation`, one `pending_confirm`, one
+//! `pending_switched`. Nothing about the roles above makes a station
+//! intrinsically an A or a B -- both stations run `CpGate` over the same
+//! channel and either may observe a transition first -- so the roles are not
+//! disjoint by construction. An earlier revision of the daemon's
+//! `drive_cp_negotiation` doc claimed they were ("only B arms probation and
+//! only A tracks a pending `Switched`, so they can never both fire on the same
+//! station"). That was **false**: two stations transitioning at once cross
+//! their `Propose`s, and a station that accepted an inbound `Propose` while
+//! its own was in flight would hold both roles in one set of single-slot
+//! fields.
+//!
+//! The daemon now enforces the invariant instead of assuming it, via
+//! [`CpNegotiator::negotiation_in_flight`] plus its own `cp_propose_seq`:
+//! a `CpGate` transition does not start a `Propose` while a negotiation is in
+//! flight, and an inbound `Propose` arriving in that state is dropped without
+//! a `Confirm` and without an ack -- so the peer's G1 fires and it converges on
+//! its pre-negotiation mode rather than being left waiting. Both stations in a
+//! crossed-`Propose` collision drop each other's, both fire G1, and both stay
+//! on the mode they already agreed on; the next `CpGate` transition proposes
+//! again.
+//!
+//! **Residual, stated plainly:** the guard cannot see the window between B's
+//! `Propose` being *acked* (which clears `cp_propose_seq`) and A's `Confirm`
+//! arriving, because nothing is tracked in between. A `Propose` inbound in
+//! exactly that window is still accepted and can put one station in both
+//! roles. Every give-up trigger still converges in that case -- the daemon's
+//! give-up block reads and abandons *all* tracked legs before clearing any
+//! bookkeeping, and reverts once -- so the outcome is a wasted negotiation,
+//! not a desync. Closing it properly means keying negotiator state by
+//! negotiation rather than by station, which is a larger change than this
+//! ticket takes on.
 
 use std::time::{Duration, Instant};
 
@@ -392,8 +439,17 @@ impl CpNegotiator {
     /// silently cancel the one safety net that makes the failure case
     /// recoverable.
     ///
-    /// A no-op when no probation is armed.
-    pub fn on_peer_switched(&mut self, mode: CpMode) {
+    /// Returns whether the leg was **accepted** -- `false` for a leg naming a
+    /// different mode, and for one arriving with no probation armed at all
+    /// (a no-op, not an error).
+    ///
+    /// The caller must ack only an accepted leg. Acking a rejected one
+    /// resolves the sender's G4 -- telling it the handshake completed -- while
+    /// this station's own probation stays armed and later reverts it: the
+    /// permanent desync COP-1 exists to eliminate, reached by a different
+    /// route. Leaving a rejected leg unacked instead lets the sender's G4 fire
+    /// and both stations converge on their pre-negotiation mode.
+    pub fn on_peer_switched(&mut self, mode: CpMode) -> bool {
         if matches!(self.probation, Some((_, target)) if target == mode) {
             self.probation = None;
             // The negotiation is complete on our side, so there is no longer a
@@ -402,6 +458,9 @@ impl CpNegotiator {
             // `revert_to` armed would make a later `abort()` rewind two
             // negotiations instead of one.
             self.revert_to = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -438,6 +497,23 @@ impl CpNegotiator {
     /// The ARQ seq of our outstanding third leg, if any (give-up trigger G4).
     pub fn pending_switched_seq(&self) -> Option<u8> {
         self.pending_switched
+    }
+
+    /// Whether this negotiator is holding state for a negotiation that has
+    /// not converged yet -- an unacked Confirm, an unacked third leg, or an
+    /// armed probation.
+    ///
+    /// The daemon uses this as a **re-entrancy guard**: there is exactly one
+    /// `CpNegotiator` per daemon (one `current`/`revert_to`/`probation` and
+    /// one of each `pending_*`), so a station that took on a second
+    /// negotiation while one was in flight would be running both roles
+    /// through the same single-slot state. See the module doc's
+    /// "One negotiation at a time" section for the residual case this
+    /// predicate cannot see.
+    pub fn negotiation_in_flight(&self) -> bool {
+        self.pending_confirm.is_some()
+            || self.pending_switched.is_some()
+            || self.probation.is_some()
     }
 
     /// The one and only give-up rule: return `current` to the mode this
@@ -480,10 +556,22 @@ impl CpNegotiator {
     /// fires exactly once no matter how often the caller polls -- the daemon
     /// calls this from a 500 ms tick, and a re-firing revert would spam
     /// `set_cp_profile` (a full engine rebuild) twice a second.
+    ///
+    /// Returns `None` -- while still disarming the expired probation -- when
+    /// there is no pre-negotiation mode left to go back to (`revert_to` is
+    /// `None`, i.e. the negotiation this probation belonged to already
+    /// completed by some other route). `revert()` would return `current`
+    /// unchanged there, and reporting that as a `RevertTo` made the daemon
+    /// call `set_cp_profile` with the mode it was already on: a full
+    /// transceiver + streaming-receiver rebuild that discards mid-frame
+    /// samples, plus a "reverted" operator warning naming no actual change.
     pub fn tick(&mut self, now: Instant) -> Option<CpTimeout> {
         if let Some((deadline, _target)) = self.probation {
             if now >= deadline {
                 self.probation = None;
+                // Disarmed either way; only *report* a revert when there is
+                // genuinely a pre-negotiation mode to go back to.
+                self.revert_to?;
                 return Some(CpTimeout::RevertTo(self.revert()));
             }
         }
@@ -799,6 +887,65 @@ mod tests {
             n.tick(t0 + Duration::from_secs(SWITCH_PROBATION_SECS * 10)),
             None
         );
+    }
+
+    #[test]
+    fn probation_expiring_with_nothing_to_revert_to_reports_no_timeout() {
+        // Review finding: `tick` used to report `RevertTo(current)` here, so
+        // the daemon rebuilt the transceiver onto the mode it was already on
+        // and warned "reverted" about a change that never happened. Reachable
+        // when the negotiation this probation belonged to completed by another
+        // route -- which is what `on_switched_acked` does to `revert_to`.
+        let t0 = Instant::now();
+        let mut n = CpNegotiator::new();
+        n.apply_as_confirmer(CpMode::ShortCp, t0);
+        n.track_pending_switched(9);
+        assert!(n.on_switched_acked(&[9]), "test setup: clears revert_to");
+
+        assert_eq!(
+            n.tick(t0 + Duration::from_secs(SWITCH_PROBATION_SECS + 1)),
+            None,
+            "no pre-negotiation mode left, so nothing to report"
+        );
+        assert_eq!(
+            n.current(),
+            CpMode::ShortCp,
+            "and the settled mode must be left alone"
+        );
+        // Probation is still disarmed, so this cannot re-fire later either.
+        assert_eq!(
+            n.tick(t0 + Duration::from_secs(SWITCH_PROBATION_SECS * 10)),
+            None
+        );
+    }
+
+    #[test]
+    fn negotiation_in_flight_tracks_every_wait_state() {
+        let t0 = Instant::now();
+
+        let mut fresh = CpNegotiator::new();
+        assert!(!fresh.negotiation_in_flight());
+        assert_eq!(fresh.abort(), CpMode::LongCp);
+        assert!(!fresh.negotiation_in_flight());
+
+        let mut a = CpNegotiator::new();
+        a.track_pending_confirm(1, CpMode::ShortCp);
+        assert!(a.negotiation_in_flight(), "an unacked Confirm counts");
+        assert_eq!(a.on_confirm_acked(&[1]), Some(CpMode::ShortCp));
+        assert!(
+            !a.negotiation_in_flight(),
+            "an acked Confirm alone leaves nothing tracked"
+        );
+        a.track_pending_switched(2);
+        assert!(a.negotiation_in_flight(), "an unacked third leg counts");
+        assert!(a.on_switched_acked(&[2]));
+        assert!(!a.negotiation_in_flight());
+
+        let mut b = CpNegotiator::new();
+        b.apply_as_confirmer(CpMode::ShortCp, t0);
+        assert!(b.negotiation_in_flight(), "armed probation counts");
+        b.on_peer_switched(CpMode::ShortCp);
+        assert!(!b.negotiation_in_flight());
     }
 
     #[test]
