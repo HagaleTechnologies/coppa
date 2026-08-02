@@ -57,6 +57,18 @@ ack-sending code. The existing retransmit machinery is **inert** against this
 gap, not a partial mitigation. COP-1 had to add a third handshake leg
 (`CpSwitched`) precisely because nothing cheaper works.
 
+**Amended by COP-1's own final review.** `handle_cp_control` now *does* emit a
+bare ack for a content PDU that delivered nothing, so the dedupe no longer
+blocks a re-ack outright. That does not rescue step 3's ack and does not make
+the third leg redundant — by the time B would re-ack a retransmitted `Confirm`
+it has already switched, so the re-ack encodes under a profile A cannot yet
+decode. What it *does* rescue is the handshake's **fifth** droppable frame: B's
+bare ack for the third leg, where both stations are already on the new profile
+and the re-ack therefore lands. Without it, losing that frame left A's G4 to
+revert A while B — probation already disarmed by `on_peer_switched` — stayed on
+the new profile forever, i.e. the exact gap this page describes, one step later.
+Read this section's "inert" claim as scoped to step 3 from here on.
+
 Relatedly: B cannot simply defer its switch until it hears A on the new
 profile, because `CoppaCore::set_cp_profile` rebuilds transmitter and receiver
 *together* — there is no RX-only switch and no dual-profile receive. That same

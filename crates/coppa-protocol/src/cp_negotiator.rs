@@ -76,28 +76,96 @@
 //! mutually-undecodable profiles forever. Steps 4-6 plus the give-up
 //! triggers below are COP-1's fix.
 //!
-//! ## Give-up triggers -- every wait state converges on `LongCp`
+//! **Note that the six-step diagram contains FIVE droppable frames, not
+//! four** (steps 1, 2, 3, 4 and 6 all go on the air; step 5 is B's local
+//! state change). The first four are covered by the give-up triggers below;
+//! step 6 -- the bare ack for the third leg -- is covered instead by making
+//! it *re-elicitable*, see "The fifth droppable frame" below.
+//!
+//! ## Give-up triggers -- every wait state converges on the pre-negotiation mode
 //!
 //! | # | Who waits | For what | Trigger | Action |
 //! |---|---|---|---|---|
-//! | G1 | B | its `Propose` acked | `ArqTx::is_failed(propose_seq)` | abandon segment, clear state (already `LongCp`) |
-//! | G2 | A | its `Confirm` acked | `ArqTx::is_failed(confirm_seq)` | abandon segment, `abort()` (already `LongCp`) |
-//! | G3 | B | `CpSwitched` from A | `tick` past the probation deadline | **revert engine + negotiator to `LongCp`** |
-//! | G4 | A | its `CpSwitched` acked | `ArqTx::is_failed(switched_seq)` | abandon segment, `abort()`, **revert engine to `LongCp`** |
+//! | G1 | B | its `Propose` acked | `ArqTx::is_failed(propose_seq)` | abandon segment, clear seq (B never switched) |
+//! | G2 | A | its `Confirm` acked | `ArqTx::is_failed(confirm_seq)` | abandon segment, `abort()` (A never switched) |
+//! | G3 | B | `CpSwitched` from A | `tick` past the probation deadline | **revert engine + negotiator** |
+//! | G4 | A | its `CpSwitched` acked | `ArqTx::is_failed(switched_seq)` | abandon segment, `abort()`, **revert engine** |
 //!
 //! Every single-leg loss fires a trigger on *both* stations, which is what
 //! makes convergence total:
 //!
-//! | Lost leg | B fires | A fires | Converges to |
+//! | Lost frame | B fires | A fires | Converges to |
 //! |---|---|---|---|
-//! | `Propose` | G1 | -- (never saw anything) | `LongCp` |
-//! | `Confirm` | G1 (its Propose is never acked either) | G2 | `LongCp` |
-//! | bare ack | G3 | G2 | `LongCp` |
-//! | `CpSwitched` | G3 | G4 | `LongCp` |
+//! | 1. `Propose` | G1 | -- (never saw anything) | pre-negotiation mode |
+//! | 2. `Confirm` | G1 (its Propose is never acked either) | G2 | pre-negotiation mode |
+//! | 3. bare ack for the `Confirm` | G3 | G2 | pre-negotiation mode |
+//! | 4. `CpSwitched` | G3 | G4 | pre-negotiation mode |
+//! | 6. bare ack for the `CpSwitched` | -- | -- (A's retransmit re-elicits it) | the NEW mode |
 //!
-//! `LongCp` is the convergence target because it is the mode both stations
-//! boot into (`CpNegotiator::new`) and therefore the only mode a station
-//! can safely assume a confused peer is on.
+//! ### The convergence target is the **pre-negotiation mode**, not `LongCp`
+//!
+//! Both give-up paths -- `abort()` (G2/G4) and `tick()` (G3) -- revert to
+//! the mode this station was on *before* this negotiation started, via the
+//! single private `revert()` helper so there is exactly one rule and the two
+//! paths cannot drift apart. That mode is the last one both stations are
+//! known to have *agreed* on, since a negotiation only ever starts from a
+//! converged state.
+//!
+//! For the first negotiation of a session that mode is `LongCp` (both
+//! stations boot into it, `CpNegotiator::new`), which is why an earlier
+//! revision of this module hardcoded `LongCp` in `abort()` and described the
+//! target as "always `LongCp`". That was **wrong for the second and later
+//! negotiations**, and `CpGate` produces those routinely: it reverts to
+//! `CpRecommendation::LongCp` on any single frame at or above threshold
+//! ("drop fast", `coppa_ml::cp_gate`), and the daemon turns that transition
+//! into a real `Propose(LongCp)` -- so a `ShortCp` -> `LongCp` negotiation
+//! is a first-class production path, and it is the one that runs exactly
+//! when the channel is degrading and legs get lost. With two different
+//! targets, three of the five droppable frames desynced the link
+//! permanently in that direction:
+//!
+//! - **`Confirm` lost:** A never switched at all, yet the old `abort()`
+//!   dragged it to `LongCp` while B (G1, also never switched) stayed on
+//!   `ShortCp`.
+//! - **bare ack lost:** A's G2 reached `LongCp` and B's `tick` was *already*
+//!   on `LongCp` (it had applied the proposed mode) -- so the old G3, by
+//!   restoring `previous` while `abort` forced `LongCp`, actively *broke* an
+//!   agreement the two stations had already reached.
+//! - **`CpSwitched` lost:** same shape as the bare ack case.
+//!
+//! Reverting to the pre-negotiation mode is correct in all five cases and is
+//! bit-identical to the old behavior for a `LongCp` -> `ShortCp` negotiation
+//! (where the pre-negotiation mode *is* `LongCp`).
+//!
+//! ### The fifth droppable frame (step 6's bare ack)
+//!
+//! Step 6 is B's bare ack for A's third leg. It is un-retryable by
+//! construction for the same reason step 3 is, and `on_peer_switched`
+//! disarms B's probation the moment the third leg arrives -- so if step 6
+//! were simply lost, A's G4 would fire and revert A while B, with no timer
+//! left at all, stayed on the new mode: exactly the permanent desync COP-1
+//! exists to eliminate, reintroduced one step later.
+//!
+//! The fix is to make step 6 **re-elicitable** rather than to give B yet
+//! another deadline. A's third leg is ARQ-tracked, so A retransmits it; the
+//! daemon's `handle_cp_control` now emits a bare ack for a *duplicate*
+//! content PDU too (one whose seq `ArqRx` has already delivered, so
+//! `delivered` comes back empty) instead of dropping it silently. Step 6 is
+//! therefore covered by ordinary retransmission, the same mechanism that
+//! covers legs 1, 2 and 4 -- and the handshake completes on the NEW mode
+//! rather than giving up.
+//!
+//! Giving B a second deadline instead was considered and rejected: nothing
+//! could clear it on an idle link (the only remaining signal would be "some
+//! frame decoded later", which is precisely the traffic-dependent trigger
+//! the third leg exists to replace), so it would reintroduce the
+//! idle-link-churn failure mode documented in this feature's design doc.
+//!
+//! **Residual, stated plainly:** if step 6 *and* every retransmission of the
+//! third leg are lost, A's G4 fires and reverts A while B stays on the new
+//! mode. That is multi-leg loss, which this design does not claim to cover
+//! for any leg (see `CLAUDE.md`'s COP-1 bullet); single-leg loss of all five
+//! droppable frames does converge.
 //!
 //! This module owns only G3's clock; G1/G2/G4 are ARQ-budget-driven and
 //! live in the daemon, which polls `pending_confirm_seq`/
@@ -194,10 +262,22 @@ pub struct CpNegotiator {
     /// A's side: the ARQ seq of the `CpSwitched` third leg we sent and are
     /// waiting to see acked (G4).
     pending_switched: Option<u8>,
-    /// B's side: `(deadline, mode we switched away from, mode we switched
-    /// to)`. Armed by `apply_as_confirmer`, disarmed by `on_peer_switched`
-    /// for the matching target mode, fired once by `tick` (G3).
-    probation: Option<(Instant, CpMode, CpMode)>,
+    /// B's side: `(deadline, mode we switched to)`. Armed by
+    /// `apply_as_confirmer`, disarmed by `on_peer_switched` for the matching
+    /// target mode, fired once by `tick` (G3).
+    probation: Option<(Instant, CpMode)>,
+    /// The mode to return to if the in-flight negotiation gives up: the mode
+    /// this station was on before it started, which is the last mode both
+    /// stations are known to have agreed on. `None` when no negotiation is in
+    /// flight.
+    ///
+    /// Armed at whichever end of the handshake this station entered it from
+    /// (`track_pending_confirm` for A, `apply_as_confirmer` for B), and read
+    /// by the single [`CpNegotiator::revert`] helper that backs *both*
+    /// give-up paths -- see the module doc's "The convergence target is the
+    /// pre-negotiation mode" section for why one shared rule matters and what
+    /// two divergent ones broke.
+    revert_to: Option<CpMode>,
 }
 
 impl CpNegotiator {
@@ -207,6 +287,7 @@ impl CpNegotiator {
             pending_confirm: None,
             pending_switched: None,
             probation: None,
+            revert_to: None,
         }
     }
 
@@ -252,7 +333,15 @@ impl CpNegotiator {
     /// Record that we (as confirmer) just sent a Confirm for `mode` at ARQ
     /// sequence `seq`, so `on_confirm_acked` can recognize when it's safe
     /// to apply `mode` to our own encoder.
+    ///
+    /// This is A's entry point into a negotiation, so it also arms the
+    /// give-up target: whatever mode we are on now is the one both stations
+    /// agreed on, and therefore the one to come back to if any later leg is
+    /// lost. `get_or_insert` rather than a plain assignment so a second
+    /// Confirm inside one negotiation cannot overwrite the genuine
+    /// pre-negotiation mode with a mid-handshake one.
     pub fn track_pending_confirm(&mut self, seq: u8, mode: CpMode) {
+        self.revert_to.get_or_insert(self.current);
         self.pending_confirm = Some((seq, mode));
     }
 
@@ -287,13 +376,13 @@ impl CpNegotiator {
     /// test can inject a synthetic future `Instant` instead of sleeping out
     /// a 180-second probation.
     pub fn apply_as_confirmer(&mut self, mode: CpMode, now: Instant) {
-        let previous = self.current;
+        // B's entry point into a negotiation: arm the give-up target before
+        // switching, for the same reason `track_pending_confirm` does on A's
+        // side. `tick` (G3) reads it through `revert`, so B and A come back to
+        // the same mode.
+        self.revert_to.get_or_insert(self.current);
         self.current = mode;
-        self.probation = Some((
-            now + Duration::from_secs(SWITCH_PROBATION_SECS),
-            previous,
-            mode,
-        ));
+        self.probation = Some((now + Duration::from_secs(SWITCH_PROBATION_SECS), mode));
     }
 
     /// Disarm probation on proof the peer switched to the mode we switched
@@ -305,8 +394,14 @@ impl CpNegotiator {
     ///
     /// A no-op when no probation is armed.
     pub fn on_peer_switched(&mut self, mode: CpMode) {
-        if matches!(self.probation, Some((_, _, target)) if target == mode) {
+        if matches!(self.probation, Some((_, target)) if target == mode) {
             self.probation = None;
+            // The negotiation is complete on our side, so there is no longer a
+            // pre-negotiation mode to fall back to; the mode we just settled on
+            // becomes the baseline for the NEXT negotiation. Leaving a stale
+            // `revert_to` armed would make a later `abort()` rewind two
+            // negotiations instead of one.
+            self.revert_to = None;
         }
     }
 
@@ -326,6 +421,9 @@ impl CpNegotiator {
         match self.pending_switched {
             Some(seq) if newly_acked.contains(&seq) => {
                 self.pending_switched = None;
+                // Handshake complete on our side -- clear the give-up target
+                // for the same reason `on_peer_switched` does on B's side.
+                self.revert_to = None;
                 true
             }
             _ => false,
@@ -342,17 +440,39 @@ impl CpNegotiator {
         self.pending_switched
     }
 
-    /// Give up on the in-flight negotiation and return to the conservative
-    /// default. Idempotent, and safe to call from any state.
+    /// The one and only give-up rule: return `current` to the mode this
+    /// station was on before the in-flight negotiation started, and report
+    /// which mode that is.
     ///
-    /// Callers that may already have switched their engine (G4) must pair
-    /// this with `engine.set_cp_profile(CpMode::LongCp)` -- this method only
-    /// owns the bookkeeping half.
-    pub fn abort(&mut self) {
+    /// Both give-up paths (`abort` for G2/G4, `tick` for G3) go through here
+    /// so they cannot possibly disagree -- they used to, and three of the five
+    /// droppable frames desynced a `ShortCp` -> `LongCp` negotiation as a
+    /// result. See the module doc's "The convergence target is the
+    /// pre-negotiation mode" section.
+    ///
+    /// With nothing armed (no negotiation in flight) this leaves `current`
+    /// alone: there is no negotiation to rewind, and forcing `LongCp` here is
+    /// exactly the bug described above.
+    fn revert(&mut self) -> CpMode {
+        if let Some(mode) = self.revert_to.take() {
+            self.current = mode;
+        }
+        self.current
+    }
+
+    /// Give up on the in-flight negotiation and return to the pre-negotiation
+    /// mode (G2/G4). Idempotent, and safe to call from any state.
+    ///
+    /// Returns the mode reverted to. Callers that may already have switched
+    /// their engine (G4) **must** pair this with
+    /// `engine.set_cp_profile(returned_mode)` -- this method only owns the
+    /// bookkeeping half, and passing anything other than the returned mode is
+    /// how the engine and this negotiator drift apart.
+    pub fn abort(&mut self) -> CpMode {
         self.pending_confirm = None;
         self.pending_switched = None;
         self.probation = None;
-        self.current = CpMode::LongCp;
+        self.revert()
     }
 
     /// Drive wall-clock deadlines (give-up trigger G3). Returns at most one
@@ -361,11 +481,10 @@ impl CpNegotiator {
     /// calls this from a 500 ms tick, and a re-firing revert would spam
     /// `set_cp_profile` (a full engine rebuild) twice a second.
     pub fn tick(&mut self, now: Instant) -> Option<CpTimeout> {
-        if let Some((deadline, previous, _target)) = self.probation {
+        if let Some((deadline, _target)) = self.probation {
             if now >= deadline {
                 self.probation = None;
-                self.current = previous;
-                return Some(CpTimeout::RevertTo(previous));
+                return Some(CpTimeout::RevertTo(self.revert()));
             }
         }
         None
@@ -560,19 +679,115 @@ mod tests {
     }
 
     #[test]
-    fn abort_clears_all_wait_state_and_restores_long_cp() {
+    fn abort_clears_all_wait_state_and_reverts_to_the_pre_negotiation_mode() {
         let t0 = Instant::now();
         let mut n = CpNegotiator::new();
         n.track_pending_confirm(3, CpMode::ShortCp);
         n.track_pending_switched(4);
         n.apply_as_confirmer(CpMode::ShortCp, t0);
-        n.abort();
+        // Pre-negotiation mode here is the LongCp this negotiator booted into.
+        assert_eq!(n.abort(), CpMode::LongCp);
         assert_eq!(n.current(), CpMode::LongCp);
         assert_eq!(n.pending_confirm_seq(), None);
         assert_eq!(n.pending_switched_seq(), None);
         assert_eq!(
             n.tick(t0 + Duration::from_secs(SWITCH_PROBATION_SECS + 1)),
             None
+        );
+    }
+
+    // ── COP-1 remediation: ONE convergence target, the pre-negotiation mode ──
+    //
+    // `abort()` (G2/G4) used to hardcode `LongCp` while `tick()` (G3) restored
+    // the pre-switch mode. Equivalent only while the stations were on LongCp
+    // before the negotiation -- so every one of these tests passes trivially in
+    // the LongCp -> ShortCp direction and is about the ShortCp -> LongCp one,
+    // which `CpGate`'s "drop fast" revert makes a first-class production path.
+
+    /// Put a negotiator in the state a station is really in after one
+    /// successful negotiation: converged on `mode`, nothing pending, no stale
+    /// give-up target left armed.
+    fn converged_on(mode: CpMode) -> CpNegotiator {
+        let mut n = CpNegotiator::new();
+        n.apply_as_confirmer(mode, Instant::now());
+        n.on_peer_switched(mode);
+        assert_eq!(n.current(), mode);
+        n
+    }
+
+    #[test]
+    fn abort_reverts_to_the_pre_negotiation_mode_not_unconditionally_long_cp() {
+        // A is converged on ShortCp and now confirms a ShortCp -> LongCp
+        // downshift. If its Confirm (or its third leg) is lost, it must come
+        // back to ShortCp -- the mode the peer is still on -- not to LongCp.
+        let mut a = converged_on(CpMode::ShortCp);
+        a.track_pending_confirm(1, CpMode::LongCp);
+        assert_eq!(a.abort(), CpMode::ShortCp);
+        assert_eq!(a.current(), CpMode::ShortCp);
+    }
+
+    #[test]
+    fn abort_and_tick_converge_on_the_same_mode_in_the_short_to_long_direction() {
+        // The heart of the desync: A gives up via `abort` (G2/G4) and B via
+        // `tick` (G3) on the same failed negotiation. The two MUST agree.
+        let t0 = Instant::now();
+
+        let mut a = converged_on(CpMode::ShortCp);
+        a.track_pending_confirm(1, CpMode::LongCp);
+        let a_target = a.abort();
+
+        let mut b = converged_on(CpMode::ShortCp);
+        b.apply_as_confirmer(CpMode::LongCp, t0);
+        let b_target = match b.tick(t0 + Duration::from_secs(SWITCH_PROBATION_SECS + 1)) {
+            Some(CpTimeout::RevertTo(mode)) => mode,
+            other => panic!("expected a probation timeout, got {other:?}"),
+        };
+
+        assert_eq!(
+            a_target, b_target,
+            "the two give-up paths must have one convergence target"
+        );
+        assert_eq!(
+            a_target,
+            CpMode::ShortCp,
+            "and it is the pre-negotiation mode"
+        );
+        assert_eq!(a.current(), b.current());
+    }
+
+    #[test]
+    fn giving_up_with_no_negotiation_in_flight_leaves_the_settled_mode_alone() {
+        // A bare `abort()` must not drag a station off a mode it legitimately
+        // settled on -- there is no negotiation to rewind.
+        let mut n = converged_on(CpMode::ShortCp);
+        assert_eq!(n.abort(), CpMode::ShortCp);
+        assert_eq!(n.current(), CpMode::ShortCp);
+    }
+
+    #[test]
+    fn a_completed_negotiation_clears_the_give_up_target_on_both_sides() {
+        // Otherwise a later `abort()` rewinds two negotiations instead of one.
+        let t0 = Instant::now();
+
+        // A's side: the third leg being acked completes the handshake.
+        let mut a = CpNegotiator::new();
+        a.track_pending_confirm(1, CpMode::ShortCp);
+        assert_eq!(a.on_confirm_acked(&[1]), Some(CpMode::ShortCp));
+        a.track_pending_switched(2);
+        assert!(a.on_switched_acked(&[2]));
+        // Second negotiation, ShortCp -> LongCp: giving up returns to ShortCp,
+        // not all the way to the LongCp the FIRST negotiation started from.
+        a.track_pending_confirm(3, CpMode::LongCp);
+        assert_eq!(a.abort(), CpMode::ShortCp);
+
+        // B's side: the third leg arriving completes the handshake.
+        let mut b = CpNegotiator::new();
+        b.apply_as_confirmer(CpMode::ShortCp, t0);
+        b.on_peer_switched(CpMode::ShortCp);
+        b.apply_as_confirmer(CpMode::LongCp, t0);
+        assert_eq!(
+            b.tick(t0 + Duration::from_secs(SWITCH_PROBATION_SECS + 1)),
+            Some(CpTimeout::RevertTo(CpMode::ShortCp))
         );
     }
 
