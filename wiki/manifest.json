@@ -289,6 +289,29 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:e91e865efabdb6821f9b4953e338f59c417a3fb7538e5cd4a7ea32678dcf699a",
+      "id": "cp-negotiation-gotchas",
+      "kind": "gotcha",
+      "links": [
+        "adr-008-phase3-system-layer",
+        "coppa-protocol"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/cp-negotiation-gotchas.md",
+      "sources": [
+        "crates/coppa-protocol/src/cp_negotiator.rs",
+        "crates/coppa-protocol/src/arq.rs",
+        "crates/coppa-daemon/src/event_loop.rs",
+        "docs/adr/008-phase3-system-layer.md"
+      ],
+      "status": "current",
+      "title": "What will bite you about the CP-switch negotiation handshake?",
+      "verified_commit": "01f0ecb",
+      "verified_date": "2026-08-01",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:4c050d6d7a647fae7d4c6c50a7f88b27bb6c062f05317af61a6e419702923cb7",
       "id": "cpal-feature-gate",
       "kind": "gotcha",
