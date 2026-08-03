@@ -95,6 +95,7 @@ fn main() {
             seed: args.seed,
             profile_override: profile_override.clone(),
             cfo_hz: args.cfo,
+            sco_ppm: 0.0,
             ssb: args.ssb,
         };
         eprintln!("Measuring level {} ({})...", mode.level, mode.name);
