@@ -2499,7 +2499,7 @@ pushing Poor **below** the original unprotected baseline. **Total fading frame f
 
 ## Sample-clock offset over session-length transmissions (COP-3)
 
-Measured at revision `b54f2ba` with:
+Measured at revision `8f11bda` with:
 
 ```bash
 cargo run -p coppa-bench --release --example sample_clock_offset
@@ -2535,26 +2535,26 @@ failure mode.
 | Preset | ppm | Completed/dropped | Retransmits | Delivered bytes | bytes/min |
 |---|---:|---:|---:|---:|---:|
 | Good | −120 | 1/0 | 31 | 16,380 | 1,634.4 |
-| Good | −100 | 0/1 | 16 | 7,605 | 1,236.6 |
-| Good | −50 | 1/0 | 29 | 16,965 | 1,681.3 |
+| Good | −100 | 0/1 | 19 | 7,605 | 1,111.3 |
+| Good | −50 | 1/0 | 25 | 16,965 | 1,690.9 |
 | Good | 0 | 0/1 | 9 | 7,605 | 1,114.4 |
 | Good | +50 | 0/1 | 9 | 7,605 | 1,114.4 |
 | Good | +100 | 1/0 | 22 | 17,082 | 1,702.8 |
 | Good | +120 | 0/1 | 12 | 7,605 | 1,103.4 |
 | Moderate | −120 | 0/1 | 15 | 7,722 | 1,131.0 |
 | Moderate | −100 | 0/1 | 15 | 7,722 | 1,131.0 |
-| Moderate | −50 | 1/0 | 33 | 14,859 | 1,483.8 |
+| Moderate | −50 | 0/1 | 16 | 7,254 | 991.6 |
 | Moderate | 0 | 1/0 | 32 | 14,976 | 1,491.3 |
-| Moderate | +50 | 0/1 | 20 | 7,371 | 1,040.9 |
-| Moderate | +100 | 0/1 | 25 | 7,371 | 1,026.8 |
-| Moderate | +120 | 1/0 | 39 | 14,508 | 1,449.7 |
-| Poor | −120 | 0/1 | 21 | 3,393 | 620.5 |
-| Poor | −100 | 0/1 | 21 | 3,393 | 620.5 |
-| Poor | −50 | 0/1 | 20 | 3,393 | 674.7 |
-| Poor | 0 | 0/1 | 25 | 3,159 | 470.0 |
-| Poor | +50 | 0/1 | 20 | 2,340 | 484.5 |
-| Poor | +100 | 0/1 | 33 | 2,808 | 406.2 |
-| Poor | +120 | 0/1 | 22 | 2,106 | 456.0 |
+| Moderate | +50 | 0/1 | 15 | 7,722 | 1,131.0 |
+| Moderate | +100 | 1/0 | 34 | 14,859 | 1,481.7 |
+| Moderate | +120 | 0/1 | 30 | 7,605 | 1,050.3 |
+| Poor | −120 | 1/0 | 45 | 5,265 | 526.2 |
+| Poor | −100 | 1/0 | 43 | 5,382 | 537.8 |
+| Poor | −50 | 0/1 | 23 | 2,340 | 399.0 |
+| Poor | 0 | 0/1 | 28 | 2,457 | 390.6 |
+| Poor | +50 | 0/1 | 28 | 2,457 | 390.6 |
+| Poor | +100 | 0/1 | 38 | 2,808 | 382.9 |
+| Poor | +120 | 0/1 | 46 | 3,042 | 402.7 |
 
 The single-session cells are diagnostic rather than statistical acceptance
 thresholds. In particular, the zero-ppm Good control itself dropped while
@@ -2562,7 +2562,9 @@ several signed-offset Good cells completed, and the known zero-ppm session
 benchmark already has nonzero Good/Moderate drop rates. The results therefore
 do not support attributing individual session drops to SCO. Good/Moderate
 goodput at completed signed-offset cells is comparable to the zero-ppm completed
-Moderate control; Poor drops at every offset including zero.
+Moderate control. Poor's two negative stress cells completed while its zero-ppm
+control and the other offsets dropped, further demonstrating that a one-session
+cell cannot support a monotonic SCO-attribution claim.
 
 ### Decision
 
