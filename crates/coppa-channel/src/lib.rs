@@ -248,14 +248,16 @@ pub fn timing_offset(samples: &[f32], delay_samples: f32) -> Vec<f32> {
 /// SCO test fixture. This impairment models timing drift, rather than serving
 /// as a general-purpose high-fidelity sample-rate converter.
 ///
-/// Returns `None` when `ppm` is non-finite or when its resulting scale is not
-/// positive. The output length is `floor(samples.len() / scale)`.
+/// Returns `None` when `ppm` is non-finite or its resulting scale is below 0.5.
+/// The lower bound limits this impairment API to at most 2x expansion and
+/// prevents near-zero scales from requesting impractically large allocations.
+/// The output length is `floor(samples.len() / scale)`.
 pub fn sample_clock_offset(samples: &[f32], ppm: f32) -> Option<Vec<f32>> {
     if !ppm.is_finite() {
         return None;
     }
     let scale = 1.0f64 + f64::from(ppm) / 1.0e6;
-    if scale <= 0.0 {
+    if scale < 0.5 {
         return None;
     }
     if samples.is_empty() {
@@ -358,6 +360,7 @@ mod tests {
         assert!(sample_clock_offset(&[1.0], f32::NAN).is_none());
         assert!(sample_clock_offset(&[1.0], f32::INFINITY).is_none());
         assert!(sample_clock_offset(&[1.0], -1_000_000.0).is_none());
+        assert!(sample_clock_offset(&[1.0], -500_001.0).is_none());
     }
 
     #[test]
@@ -381,6 +384,23 @@ mod tests {
             let displacement = output[index] as f64 - index as f64;
             let expected = index as f64 * f64::from(ppm) / 1.0e6;
             assert!((displacement - expected).abs() < 0.05);
+        }
+    }
+
+    #[test]
+    fn sample_clock_offset_moves_a_landmark_with_the_documented_sign() {
+        let mut input = vec![0.0; 20_000];
+        input[10_000] = 1.0;
+        for ppm in [-120.0, 120.0] {
+            let output = sample_clock_offset(&input, ppm).unwrap();
+            let peak = output
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .unwrap()
+                .0;
+            let expected = (10_000.0 / (1.0 + f64::from(ppm) / 1.0e6)).round() as usize;
+            assert!(peak.abs_diff(expected) <= 1, "ppm={ppm}, peak={peak}");
         }
     }
 

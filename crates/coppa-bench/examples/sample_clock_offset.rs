@@ -134,6 +134,7 @@ fn apply_channel(
     coppa_channel::sample_clock_offset(&noisy, ppm).expect("diagnostic ppm is valid")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn transmit_once(
     phy: &CoppaTransceiver,
     seq: u8,
@@ -142,15 +143,16 @@ fn transmit_once(
     snr_db: f32,
     ppm: f32,
     seed: u64,
-) -> (Result<bool, ReceiveError>, usize) {
+    evict_after: bool,
+) -> (Result<Vec<u8>, ReceiveError>, usize) {
     let header = make_header(data.len(), seq);
     let clean = phy.transmit(&header, data).expect("level payload fits");
     let tx_samples = clean.len();
     let received = apply_channel(&clean, channel, snr_db, ppm, seed);
-    let result = phy
-        .receive(&received)
-        .map(|(_, payload, _)| payload.len() >= data.len() && payload[..data.len()] == data[..]);
-    phy.harq_evict(seq);
+    let result = phy.receive(&received).map(|(_, payload, _)| payload);
+    if evict_after {
+        phy.harq_evict(seq);
+    }
     (result, tx_samples)
 }
 
@@ -162,8 +164,10 @@ fn run_frame_cell(channel: TestChannel, snr_db: f32, ppm: f32) -> OutcomeCounts 
         let seed = paired_seed(0xC0_0003, trial);
         let mut rng = StdRng::seed_from_u64(seed);
         let payload: Vec<u8> = (0..payload_bytes).map(|_| rng.random()).collect();
-        let (outcome, _) = transmit_once(&phy, 0, &payload, channel, snr_db, ppm, seed);
-        counts.record(outcome);
+        let (outcome, _) = transmit_once(&phy, 0, &payload, channel, snr_db, ppm, seed, true);
+        counts.record(outcome.map(|decoded| {
+            decoded.len() >= payload.len() && decoded[..payload.len()] == payload[..]
+        }));
     }
     counts
 }
@@ -211,11 +215,12 @@ fn run_session(preset: WattersonPreset, ppm: f32, seed: u64, duration: Duration)
                 snr,
                 ppm,
                 frame_seed,
+                false,
             );
             now += Duration::from_secs_f64(tx_samples as f64 / SAMPLE_RATE as f64);
-            if matches!(outcome, Ok(true)) {
+            if let Ok(decoded) = outcome {
                 summary.bytes_delivered += rx
-                    .receive(seq, data)
+                    .receive(seq, decoded)
                     .iter()
                     .map(|(_, d)| d.len())
                     .sum::<usize>();
@@ -249,11 +254,12 @@ fn run_session(preset: WattersonPreset, ppm: f32, seed: u64, duration: Duration)
                 snr,
                 ppm,
                 retry_seed,
+                false,
             );
             now += Duration::from_secs_f64(tx_samples as f64 / SAMPLE_RATE as f64);
-            if matches!(outcome, Ok(true)) {
+            if let Ok(decoded) = outcome {
                 summary.bytes_delivered += rx
-                    .receive(seq, data)
+                    .receive(seq, decoded)
                     .iter()
                     .map(|(_, d)| d.len())
                     .sum::<usize>();
