@@ -45,6 +45,7 @@ fn main() {
                 seed: 0x00C0_FFEE,
                 profile_override: None,
                 cfo_hz: 0.0,
+                sco_ppm: 0.0,
                 ssb: false,
             };
             let points = run_scenario(&scenario);

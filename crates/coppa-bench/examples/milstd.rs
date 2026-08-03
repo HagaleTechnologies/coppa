@@ -206,6 +206,7 @@ fn main() {
                 // SNR when this override was left off, confirmed by a direct A/B).
                 profile_override: Some(CoppaProfile::hf_standard()),
                 cfo_hz: 0.0,
+                sco_ppm: 0.0,
                 ssb: false,
             };
             let points = run_scenario(&scenario);

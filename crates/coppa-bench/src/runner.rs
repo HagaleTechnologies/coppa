@@ -36,6 +36,7 @@ fn run_trial(
     snr_db: f32,
     channel: ChannelSpec,
     cfo_hz: f32,
+    sco_ppm: f32,
     ssb: bool,
     seed: u64,
 ) -> (TrialOutcome, usize) {
@@ -84,6 +85,9 @@ fn run_trial(
     } else {
         faded
     };
+
+    let rx_signal = coppa_channel::sample_clock_offset(&rx_signal, sco_ppm)
+        .expect("Scenario SCO ppm must produce a positive finite clock scale");
 
     let outcome = match tx.receive(&rx_signal) {
         Ok((_h, rx_payload, _rec_level)) => {
@@ -154,6 +158,7 @@ pub fn run_scenario(scenario: &Scenario) -> Vec<MeasurementPoint> {
                 snr_db,
                 scenario.channel,
                 scenario.cfo_hz,
+                scenario.sco_ppm,
                 scenario.ssb,
                 seed,
             );
@@ -195,6 +200,7 @@ mod tests {
             seed: 0xABCD,
             profile_override: None,
             cfo_hz: 0.0,
+            sco_ppm: 0.0,
             ssb: false,
         };
         let points = run_scenario(&scenario);
@@ -216,6 +222,7 @@ mod tests {
             seed: 0xABCD,
             profile_override: None,
             cfo_hz: 0.0,
+            sco_ppm: 0.0,
             ssb: false,
         };
         let points = run_scenario(&scenario);
@@ -262,6 +269,7 @@ mod tests {
             seed: 0xABCD,
             profile_override: None,
             cfo_hz: 0.0,
+            sco_ppm: 0.0,
             ssb: false,
         };
         let points = run_scenario(&scenario);
@@ -291,6 +299,7 @@ mod tests {
             seed: 0xBEEF,
             profile_override: Some(coppa_codec::ofdm::CoppaProfile::hf_robust()),
             cfo_hz: 0.0,
+            sco_ppm: 0.0,
             ssb: false,
         };
         let points = run_scenario(&scenario);
@@ -325,6 +334,7 @@ mod tests {
             seed: 0x5EED,
             profile_override: None,
             cfo_hz: 0.0,
+            sco_ppm: 0.0,
             ssb: false,
         };
         let awgn = run_scenario(&mk(ChannelSpec::Awgn));
@@ -353,6 +363,7 @@ mod tests {
             seed: 0x5CAB,
             profile_override: None,
             cfo_hz: 0.0,
+            sco_ppm: 0.0,
             ssb: true,
         };
         let points = run_scenario(&scenario);
@@ -362,5 +373,43 @@ mod tests {
             "ssb-filtered level 2 should decode cleanly at 30 dB AWGN (fer={})",
             points[0].fer
         );
+    }
+
+    #[test]
+    fn sample_clock_offset_is_deterministic_and_zero_is_compatible() {
+        let scenario = Scenario {
+            level: 2,
+            channel: ChannelSpec::Awgn,
+            snr_db_points: vec![30.0],
+            trials: 3,
+            seed: 0x5C0,
+            profile_override: None,
+            cfo_hz: 0.0,
+            sco_ppm: 100.0,
+            ssb: false,
+        };
+        let first = run_scenario(&scenario);
+        let second = run_scenario(&scenario);
+        assert_eq!(first[0].frame_errors, second[0].frame_errors);
+
+        let mut zero = scenario;
+        zero.sco_ppm = 0.0;
+        assert_eq!(run_scenario(&zero)[0].frame_errors, 0);
+    }
+
+    #[test]
+    fn extreme_sample_clock_offset_is_not_ignored() {
+        let scenario = Scenario {
+            level: 2,
+            channel: ChannelSpec::Awgn,
+            snr_db_points: vec![60.0],
+            trials: 3,
+            seed: 0x5C0,
+            profile_override: Some(coppa_codec::ofdm::CoppaProfile::hf_standard()),
+            cfo_hz: 0.0,
+            sco_ppm: 50_000.0,
+            ssb: false,
+        };
+        assert!(run_scenario(&scenario)[0].frame_errors > 0);
     }
 }

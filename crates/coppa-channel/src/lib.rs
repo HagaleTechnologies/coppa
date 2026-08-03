@@ -237,6 +237,51 @@ pub fn timing_offset(samples: &[f32], delay_samples: f32) -> Vec<f32> {
     output
 }
 
+/// Resample a waveform to model a constant sampling-clock offset (SCO).
+///
+/// The relative receiver clock scale is `1 + ppm / 1e6`. Positive `ppm`
+/// advances through the source faster and therefore produces a shorter receive
+/// buffer; negative `ppm` produces a longer one. Unlike [`timing_offset`], the
+/// source-position displacement grows linearly with the output sample index.
+///
+/// Linear interpolation intentionally matches the modem's original validated
+/// SCO test fixture. This impairment models timing drift, rather than serving
+/// as a general-purpose high-fidelity sample-rate converter.
+///
+/// Returns `None` when `ppm` is non-finite or its resulting scale is below 0.5.
+/// The lower bound limits this impairment API to at most 2x expansion and
+/// prevents near-zero scales from requesting impractically large allocations.
+/// The output length is `floor(samples.len() / scale)`.
+pub fn sample_clock_offset(samples: &[f32], ppm: f32) -> Option<Vec<f32>> {
+    if !ppm.is_finite() {
+        return None;
+    }
+    let scale = 1.0f64 + f64::from(ppm) / 1.0e6;
+    if scale < 0.5 {
+        return None;
+    }
+    if samples.is_empty() {
+        return Some(Vec::new());
+    }
+    if ppm == 0.0 {
+        return Some(samples.to_vec());
+    }
+
+    let out_len = (samples.len() as f64 / scale).floor() as usize;
+    let mut output = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let source = i as f64 * scale;
+        let index = source.floor() as usize;
+        let fraction = (source - index as f64) as f32;
+        match (samples.get(index), samples.get(index + 1)) {
+            (Some(&left), Some(&right)) => output.push(left + (right - left) * fraction),
+            (Some(&last), None) => output.push(last),
+            (None, _) => break,
+        }
+    }
+    Some(output)
+}
+
 /// Apply a deterministic sinusoidal amplitude fade (periodic AM).
 ///
 /// This is NOT Rayleigh, Watterson, or any Doppler-spread fading model. It
@@ -306,6 +351,58 @@ fn blackman_harris(k: f32, half_window: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_clock_offset_validates_domain_and_identity() {
+        assert_eq!(sample_clock_offset(&[], 120.0), Some(Vec::new()));
+        let input = vec![0.0, 1.0, 2.0, 3.0];
+        assert_eq!(sample_clock_offset(&input, 0.0), Some(input));
+        assert!(sample_clock_offset(&[1.0], f32::NAN).is_none());
+        assert!(sample_clock_offset(&[1.0], f32::INFINITY).is_none());
+        assert!(sample_clock_offset(&[1.0], -1_000_000.0).is_none());
+        assert!(sample_clock_offset(&[1.0], -500_001.0).is_none());
+    }
+
+    #[test]
+    fn sample_clock_offset_has_signed_length_and_interpolation() {
+        let ramp: Vec<f32> = (0..10_000).map(|value| value as f32).collect();
+        let positive = sample_clock_offset(&ramp, 100_000.0).unwrap();
+        let negative = sample_clock_offset(&ramp, -100_000.0).unwrap();
+        assert_eq!(positive.len(), 9_090);
+        assert_eq!(negative.len(), 11_111);
+        assert!((positive[5] - 5.5).abs() < 1.0e-5);
+        assert!((negative[5] - 4.5).abs() < 1.0e-5);
+        assert!(negative.last().copied().unwrap() <= 9_999.0);
+    }
+
+    #[test]
+    fn sample_clock_offset_accumulates_expected_displacement() {
+        let ramp: Vec<f32> = (0..1_000_000).map(|value| value as f32).collect();
+        for ppm in [-120.0, 120.0] {
+            let output = sample_clock_offset(&ramp, ppm).unwrap();
+            let index = output.len() / 2;
+            let displacement = output[index] as f64 - index as f64;
+            let expected = index as f64 * f64::from(ppm) / 1.0e6;
+            assert!((displacement - expected).abs() < 0.05);
+        }
+    }
+
+    #[test]
+    fn sample_clock_offset_moves_a_landmark_with_the_documented_sign() {
+        let mut input = vec![0.0; 20_000];
+        input[10_000] = 1.0;
+        for ppm in [-120.0, 120.0] {
+            let output = sample_clock_offset(&input, ppm).unwrap();
+            let peak = output
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .unwrap()
+                .0;
+            let expected = (10_000.0 / (1.0 + f64::from(ppm) / 1.0e6)).round() as usize;
+            assert!(peak.abs_diff(expected) <= 1, "ppm={ppm}, peak={peak}");
+        }
+    }
 
     #[test]
     fn test_awgn_preserves_length() {

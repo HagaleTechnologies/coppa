@@ -2697,37 +2697,6 @@ mod tests {
         );
     }
 
-    /// Resample by a linearly-growing fractional delay to simulate a genuine
-    /// sampling-clock-offset (SCO) of `ppm` parts-per-million between TX and RX
-    /// sample clocks. Distinct from `coppa_channel::timing_offset` (a FIXED
-    /// delay applied to the whole buffer, used elsewhere in this codebase to
-    /// simulate a one-time sync/multipath offset): this grows LINEARLY with
-    /// sample index, so the desync compounds across a long frame exactly as a
-    /// real ADC clock-rate mismatch would (rather than a one-time constant
-    /// shift). Plain linear interpolation (not windowed-sinc): this test only
-    /// needs a realistic TIMING effect over a multi-second frame, not spectral
-    /// purity, and the timing drift this produces (a small fraction of a
-    /// sample per output sample) is what Task 6's tracker needs to correct,
-    /// not an artifact this resampler itself introduces.
-    fn resample_with_sco_ppm(samples: &[f32], ppm: f32) -> Vec<f32> {
-        let scale = 1.0 + ppm / 1.0e6;
-        let out_len = ((samples.len() as f32) / scale).floor() as usize;
-        let mut out = Vec::with_capacity(out_len);
-        for i in 0..out_len {
-            let src = i as f32 * scale;
-            let idx = src.floor() as usize;
-            let frac = src - idx as f32;
-            if idx + 1 < samples.len() {
-                out.push(samples[idx] * (1.0 - frac) + samples[idx + 1] * frac);
-            } else if idx < samples.len() {
-                out.push(samples[idx]);
-            } else {
-                break;
-            }
-        }
-        out
-    }
-
     /// Deterministic, non-trivial (not all +1) BPSK +/-1 bit pattern via a
     /// small xorshift PRNG -- avoids both an all-ones pattern (which couldn't
     /// reveal a systematic sign error) and a real `rand` dependency for what's
@@ -2789,7 +2758,8 @@ mod tests {
         // so this exercises SCO's actual failure mode (a growing phase-slope
         // error the fixed-per-frame delay-domain model can't represent, not
         // literal inter-symbol interference from falling outside the CP).
-        let drifted = resample_with_sco_ppm(&clean, 120.0);
+        let drifted = coppa_channel::sample_clock_offset(&clean, 120.0)
+            .expect("+120 ppm is a valid clock scale");
 
         let with_sco = modem
             .demodulate_frame(&drifted)

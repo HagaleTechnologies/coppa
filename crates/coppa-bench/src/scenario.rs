@@ -129,6 +129,9 @@ pub struct Scenario {
     pub profile_override: Option<CoppaProfile>,
     /// Carrier frequency offset (Hz) applied after the channel; 0.0 = none.
     pub cfo_hz: f32,
+    /// Relative receiver sampling-clock offset in ppm; `0.0` disables it.
+    /// Uses [`coppa_channel::sample_clock_offset`]'s signed-rate convention.
+    pub sco_ppm: f32,
     /// Emulate a realistic SSB rig's audio passband (`coppa_channel::ssb_filter`,
     /// 300-2700 Hz) applied to the clean TX signal before fading/noise. `false`
     /// (the default) benches against the idealized full-band signal, matching

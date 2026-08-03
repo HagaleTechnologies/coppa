@@ -72,6 +72,7 @@ fn main() {
                     seed: SEED,
                     profile_override: profile_override.clone(),
                     cfo_hz: 0.0,
+                    sco_ppm: 0.0,
                     ssb: false,
                 };
                 eprintln!("Measuring level {level} on {chan_name} ({profile_name})...");

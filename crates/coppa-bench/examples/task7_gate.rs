@@ -56,6 +56,7 @@ fn main() {
                 seed: SEED,
                 profile_override: None,
                 cfo_hz: 0.0,
+                sco_ppm: 0.0,
                 ssb: false,
             };
             eprintln!("Measuring level {level} on {name}...");
