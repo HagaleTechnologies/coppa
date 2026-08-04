@@ -1992,15 +1992,38 @@ impl EventLoop {
         // Only for `CpSwitched` are both stations already on the same, new
         // profile, which is what makes the re-ack both meaningful and safe.
         if delivered.is_empty() {
-            let is_switched = matches!(
-                CpNegotiator::on_content_received(&pdu.payload),
-                Some(ContentAction::PeerSwitched(_))
-            );
-            if !is_switched {
+            let switched_mode = match CpNegotiator::on_content_received(&pdu.payload) {
+                Some(ContentAction::PeerSwitched(mode)) => Some(mode),
+                _ => None,
+            };
+            let Some(mode) = switched_mode else {
                 tracing::debug!(
                     seq = pdu.seq_num,
                     "Duplicate/out-of-order CpControl content that is not a third leg; \
                      ignored so the peer's own give-up trigger still fires"
+                );
+                return;
+            };
+            // Re-check acceptance on the duplicate, not just the payload KIND
+            // (review finding). `on_peer_switched` itself can't be re-called
+            // here -- it mutates `probation`/`revert_to` on success, so a
+            // second call after a genuine accept would find `probation`
+            // already cleared and incorrectly report rejection. `current()`
+            // is the safe read-only proxy: `apply_as_confirmer` sets it to
+            // the target mode BEFORE `on_peer_switched` ever runs, so it
+            // already equals `mode` for both a first-time accept and a
+            // legitimate re-ack of one. It only stops matching `mode` once
+            // G3's `revert()` has fired (a genuine reject/timeout) or when
+            // this station never negotiated to `mode` at all -- exactly the
+            // two cases the first-reception path at `on_peer_switched`
+            // (below) also rejects.
+            if self.cp_negotiator.current() != mode {
+                tracing::warn!(
+                    ?mode,
+                    negotiator_mode = ?self.cp_negotiator.current(),
+                    seq = pdu.seq_num,
+                    "Duplicate CpSwitched leg does not match our current mode; \
+                     not re-acked, so the peer's own give-up trigger still fires"
                 );
                 return;
             }
@@ -4164,6 +4187,62 @@ mod tests {
             "a rejected leg must not be acked -- the sender's G4 has to fire"
         );
         // And b's own safety net is untouched: probation still reverts it.
+        b.drive_cp_negotiation(t0 + Duration::from_secs(SWITCH_PROBATION_SECS + 1));
+        assert_eq!(b.cp_negotiator.current(), CpMode::LongCp);
+        assert_eq!(b.engine.cp_mode(), CpMode::LongCp);
+    }
+
+    #[tokio::test]
+    async fn a_retransmitted_cp_switched_we_rejected_is_still_not_acked() {
+        // The duplicate-CpSwitched re-ack path (rescuing a lost ack for step
+        // 6, see the module doc) tested only the payload KIND, never whether
+        // `on_peer_switched` would actually accept the leg -- so it re-granted
+        // exactly the ack `a_cp_switched_we_are_not_awaiting_is_not_acked`
+        // above proves the first-reception path deliberately withholds. The
+        // sender then never sees its G4 fire, and the two stations can strand
+        // on different profiles forever. This reproduces that exact sequence:
+        // reject on first arrival, then the peer's own retransmission (ARQ
+        // resends until acked) must land in the *duplicate* path and still be
+        // rejected, not silently re-acked the second time around.
+        let mut b = EventLoop::new(cp_enabled_config()).unwrap();
+        let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
+        b.set_audio_out(producer);
+
+        let t0 = Instant::now();
+        b.cp_negotiator.apply_as_confirmer(CpMode::ShortCp, t0);
+        b.engine.set_cp_profile(CpMode::ShortCp);
+
+        // A third leg naming LongCp -- a mode b never switched to. Same
+        // fixture as the sibling test above.
+        let stale = TransportPdu::new_cp_control_content(
+            b.arq_session_id,
+            0,
+            0,
+            0,
+            CpNegotiator::switched_payload(CpMode::LongCp),
+        );
+        let frame = peer_frame(
+            &stale,
+            coppa_codec::ofdm::CoppaProfile::hf_standard_short_cp(),
+        );
+
+        // First reception: rejected via the non-duplicate on_peer_switched path.
+        b.decode_and_dispatch_audio(&frame).await;
+
+        // The sender never saw an ack, so it retransmits the identical PDU
+        // (same seq) -- ArqRx has already delivered that seq once, so this
+        // lands in the duplicate branch this fix covers.
+        b.decode_and_dispatch_audio(&frame).await;
+
+        let mut buf = vec![0.0f32; 1_000_000];
+        assert_eq!(
+            consumer.read(&mut buf),
+            0,
+            "the retransmitted rejected leg must not be acked either -- re-acking it \
+             would resolve the sender's G4 while b's own probation stays armed to \
+             revert it, stranding the two stations on different profiles"
+        );
+        // b's own safety net is still untouched: probation still reverts it.
         b.drive_cp_negotiation(t0 + Duration::from_secs(SWITCH_PROBATION_SECS + 1));
         assert_eq!(b.cp_negotiator.current(), CpMode::LongCp);
         assert_eq!(b.engine.cp_mode(), CpMode::LongCp);
