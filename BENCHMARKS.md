@@ -2497,6 +2497,47 @@ pushing Poor **below** the original unprotected baseline. **Total fading frame f
 - **SNR is audio-band SNR, not Eb/N0**, so absolute values are not comparable to textbook
   BER curves — use this table for *relative* comparison between coppa's modes.
 
+## COP-6 LDPC decode CPU
+
+Measured on the aarch64 development host at `99a9943` with the safe-Rust,
+edge-outer/sub-row-inner BG2 decoder. The decoder now stores only a 1.9 KiB
+row/edge graph description instead of the former 271 KiB variable-index table.
+The output is bit-identical to the frozen legacy loop over the complete 9,152
+element posterior in the committed characterization tests.
+
+`cargo run -p coppa-bench --release --example task4_bg2_ldpc_gate` produced:
+
+| Level | old rate | timing SNR | old µs/frame | new µs/frame | ratio | avg iterations | ≤3x |
+|---:|:---:|---:|---:|---:|---:|---:|:---:|
+| 1 | 1/4 | 3.0 | 135.06 | 557.76 | 4.13x | 2.00 | NOT met |
+| 2 | 1/2 | 5.0 | 79.25 | 266.39 | 3.36x | 1.00 | NOT met |
+| 3 | 1/2 | 8.0 | 57.21 | 249.75 | 4.37x | 1.00 | NOT met |
+| 4 | 3/4 | 10.5 | 45.25 | 268.93 | 5.94x | 1.00 | NOT met |
+| 5 | 2/3 | 13.5 | 49.98 | 502.92 | 10.06x | 2.00 | NOT met |
+| 6 | 1/2 | 14.5 | 108.75 | 520.54 | 4.79x | 2.00 | NOT met |
+| 7 | 3/4 | 18.0 | 45.12 | 286.40 | 6.35x | 1.00 | NOT met |
+| 9 | 2/3 | 20.5 | 53.75 | 521.49 | 9.70x | 2.00 | NOT met |
+| 10 | 7/8 | 25.0 | 38.77 | 264.72 | 6.83x | 1.00 | NOT met |
+
+The worst cell is level 5 at 10.06x (old-codec rate 2/3). No level meets the
+accepted ≤3x budget. The permanent `ldpc_decode_timing` harness measured a
+forced-iteration fit of 273.56 µs/iteration with a −397.67 µs fitted intercept;
+the pre-change cost reconstructed from the original profiler is approximately
+302.8 µs/iteration, so the central layout change is about a 10% marginal-cost
+improvement, not the predicted 2–3.5x reduction. The negative intercept also
+confirms that the old “~220 µs fixed cost” interpretation was invalid: a
+one-iteration call includes a real iteration whose syndrome check exits at a
+different depth. Likewise, the previously reported 12.3% wrapper overhead
+compared different punctured inputs (`±3.0` versus `0.0`) and was not an
+apples-to-apples wrapper measurement.
+
+One planned scalar experiment stored all pass-A extrinsics and hoisted the
+scale multiplication. It regressed the fit to 301.31 µs/iteration and was
+reverted. The remaining gap is therefore a safe-portable implementation and
+fixed-graph-size ceiling for this attempt, not an untried scalar tuning knob;
+wider explicit SIMD, graph changes, or build/unsafe policy changes remain
+separate decisions.
+
 ## Sample-clock offset over session-length transmissions (COP-3)
 
 Measured at revision `8f11bda` with:

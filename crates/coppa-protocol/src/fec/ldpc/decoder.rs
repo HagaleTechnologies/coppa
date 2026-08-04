@@ -926,6 +926,67 @@ mod nr_bg2_decoder_tests {
         assert!(saw_valid && saw_invalid);
     }
 
+    #[test]
+    fn hoisted_scale_matches_unhoisted_on_boundary_magnitudes() {
+        let magnitudes = [
+            0.0f32, -0.0, 1e-30, 1.0, 63.999_996, 64.0, 85.333_336, 128.0,
+        ];
+        for magnitude in magnitudes {
+            for sign in [1.0f32, -1.0] {
+                assert_eq!(
+                    ((sign * magnitude) * NR_DEFAULT_SCALE).to_bits(),
+                    (sign * (magnitude * NR_DEFAULT_SCALE)).to_bits(),
+                    "magnitude={magnitude:?}, sign={sign}"
+                );
+            }
+        }
+    }
+
+    /// Slow, release-only equivalence tier. Manual mutation checks must make
+    /// this test or `nr_bg2_bitexact_matches_reference_fast` fail: replacing
+    /// `.abs()` with sign-select, changing strict `<` to `<=`, changing the
+    /// scale, reassociating the posterior update, or dropping either clamp.
+    #[test]
+    #[ignore = "512 full BG2 reference/production decodes; run in release mode"]
+    fn nr_bg2_decode_is_bit_identical_to_reference_exhaustive() {
+        let n = nr_bg2::BASE_COLS * nr_bg2::ZC;
+        let decoder = NrBg2Decoder::new();
+        let mut state = 0xDEC0_DED0_C0FF_EE01u64;
+        for vector_index in 0..512 {
+            let llrs: Vec<f32> = (0..n)
+                .map(|i| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    match vector_index % 5 {
+                        0 => {
+                            if i % 3 == 0 {
+                                3.0
+                            } else {
+                                -3.0
+                            }
+                        }
+                        1 => ((state >> 32) as i32 as f32) / i32::MAX as f32 * 12.0,
+                        2 => [0.0, -0.0, 64.0, -64.0][i % 4],
+                        3 => [f32::MIN_POSITIVE, -1e30, 1e30, 0.0][i % 4],
+                        _ => ((state & 0xff) as f32 - 127.5) / 8.0,
+                    }
+                })
+                .collect();
+            let expected = decode_reference(&llrs, NR_DEFAULT_SCALE, NR_DEFAULT_MAX_ITERATIONS);
+            let actual = decoder.decode(&llrs);
+            assert_eq!(actual.1, expected.1, "iterations, vector {vector_index}");
+            assert_eq!(actual.2, expected.2, "converged, vector {vector_index}");
+            for (index, (actual, expected)) in actual.0.iter().zip(&expected.0).enumerate() {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "vector {vector_index}, posterior index {index}"
+                );
+            }
+        }
+    }
+
     fn full_codeword_llrs(
         mother_len_full_including_punctured: usize,
         full_codeword: &[u8],
