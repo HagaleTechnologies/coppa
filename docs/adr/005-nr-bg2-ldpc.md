@@ -97,16 +97,16 @@ Coppa's speed ladder needs; BG1 targets larger transport blocks Coppa has no use
   LDPC is itself a reasonably well-optimized code, and DE thresholds are asymptotic), not a
   decoder bug (ruled out via the flooding A/B above), but not chased further. COP-6 safely
   restructured the decoder into contiguous edge/sub-row runs and deleted the 271 KiB lifted-index
-  table, but the fresh decode CPU/frame result remains 3.36x-10.06x the old codec, over the
-  accepted 3x budget at every level:
+  table. The fresh realistic-payload result is 1.48x-4.33x the old codec; five levels meet the
+  accepted 3x budget and four remain over it:
 
   | level | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 9 | 10 |
   |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-  | ratio | 4.13x | 3.36x | 4.37x | 5.94x | 10.06x | 4.79x | 6.35x | 9.70x | 6.83x |
-  | verdict | NOT met | NOT met | NOT met | NOT met | NOT met | NOT met | NOT met | NOT met | NOT met |
+  | ratio | 1.48x | 3.45x | 1.69x | 2.29x | 4.33x | 3.34x | 2.54x | 3.66x | 2.80x |
+  | verdict | met | NOT met | met | met | NOT met | NOT met | met | NOT met | met |
 
-  The worst level is 5 (old rate 2/3) at 10.06x. The safe contiguous reformulation reduced the
-  reconstructed marginal iteration cost only about 10% (302.8 to 273.56 us/iteration); a measured
+  The worst level is 5 (old rate 2/3) at 4.33x. The safe contiguous reformulation reduced the
+  reconstructed marginal iteration cost about 11% (302.8 to 270.97 us/iteration); a measured
   extrinsic-scratch/scale-hoist follow-up regressed to 301.31 us/iteration and was reverted. The
   remaining gap is structural: the shared graph no longer shrinks for high-rate levels the way
   per-rate graphs used to. See `BENCHMARKS.md`'s “COP-6 LDPC decode CPU” section for absolute

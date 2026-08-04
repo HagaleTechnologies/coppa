@@ -860,7 +860,7 @@ mod nr_bg2_decoder_tests {
     #[test]
     fn nr_bg2_bitexact_matches_reference_fast() {
         let n = nr_bg2::BASE_COLS * nr_bg2::ZC;
-        let vectors = [
+        let mut vectors = vec![
             (0..n)
                 .map(|i| if i % 3 == 0 { 3.0 } else { -3.0 })
                 .collect::<Vec<_>>(),
@@ -875,6 +875,19 @@ mod nr_bg2_decoder_tests {
                 })
                 .collect(),
         ];
+        let mut state = 0xB17E_7AC7_C0DE_0001u64;
+        for scale in [0.25f32, 1.0, 4.0, 16.0] {
+            vectors.push(
+                (0..n)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        ((state >> 32) as i32 as f32) / i32::MAX as f32 * scale
+                    })
+                    .collect(),
+            );
+        }
         let decoder = NrBg2Decoder::new();
         for (vector_index, llrs) in vectors.iter().enumerate() {
             let expected = decode_reference(llrs, NR_DEFAULT_SCALE, NR_DEFAULT_MAX_ITERATIONS);
