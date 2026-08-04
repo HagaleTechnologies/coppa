@@ -222,6 +222,108 @@ plus a 300-iteration regression test. **Disclosed, not fixed, limitation**: `CpG
 swept/calibrated against a real bench the way `SPEED_LEVEL_MIN_CAPACITY` was — see CLAUDE.md's
 Known Limitations.
 
+**Follow-on 1 (PR #67, 2026-07-29): CP-switch peer negotiation.** The "no daemon integration, no
+live mid-session renegotiation" scope cut above was closed by `coppa_protocol::cp_negotiator`, a
+receiver-initiated two-leg handshake (`Propose` → `Confirm` → bare ack) gated by
+`cp_negotiation_enabled` (off by default). Roles, using the code's own labels: **B (proposer)**
+sends `Propose` and switches its own receiver on receiving `Confirm`; **A (confirmer)** sends
+`Confirm` and switches its own encoder only once it sees B's bare ack. Note that plain English and
+the code collide here — the station performing the *act* of acknowledging is B, not A — and both
+CLAUDE.md and the PR #67 body inverted the names as a result; `cp_negotiator.rs`'s module doc now
+calls the collision out explicitly.
+
+**Follow-on 2 (COP-1, PR #72, 2026-08-01): converging when a handshake leg is lost.** PR #67's
+final bare ack was un-retryable *by construction* — it never reaches `ArqTx::send`, and a
+retransmitted `Confirm` cannot re-elicit it because `ArqRx`'s dedupe swallows the duplicate before
+it reaches the ack-sending code — yet B irrevocably commits both its transmitter and receiver to
+the new profile immediately after sending it. Losing that ack left the two stations on
+mutually-undecodable CP profiles with no timer, no retry, and no reachable recovery path.
+
+Fixed by combining **both** remedies, because neither converges alone:
+
+1. **A third handshake leg**, `CpSwitched` (wire kind `0x03`), sent by A under the *new* profile
+   the instant it switches, ARQ-tracked. This gives B a deterministic, immediate proof-of-switch
+   instead of a traffic-dependent one — on an idle link, no inferable traffic ever arrives.
+2. **A bounded revert on both sides.** Every wait state gets a give-up trigger, all converging on
+   the **pre-negotiation mode** — the last mode both stations are known to have *agreed* on, since a
+   negotiation only ever starts from a converged state. For the first negotiation of a session that
+   mode is the `CpMode::LongCp` both stations boot into:
+
+   | # | Who waits | For what | Trigger | Action |
+   |---|---|---|---|---|
+   | G1 | B | its `Propose` acked | `ArqTx::is_failed(propose_seq)` | abandon segment, clear seq (B never switched) |
+   | G2 | A | its `Confirm` acked | `ArqTx::is_failed(confirm_seq)` | abandon segment, `abort()` (A never switched) |
+   | G3 | B | `CpSwitched` from A | probation deadline elapsed | **revert engine + negotiator** |
+   | G4 | A | its `CpSwitched` acked | `ArqTx::is_failed(switched_seq)` | abandon segment, `abort()`, **revert engine** |
+
+   Every single-leg loss fires a trigger on *both* stations, which is what makes convergence total:
+   losing `Propose` fires G1 alone (A never saw anything); losing `Confirm` fires G1+G2; losing the
+   bare ack fires G3+G2; losing `CpSwitched` fires G3+G4.
+
+   **Amended by the branch's own final review, before merge.** As first written this decision said
+   the target was *always* `LongCp`, and `CpNegotiator::abort()` hardcoded it while `tick()`
+   restored the pre-switch mode. Those two agree only when the stations were on `LongCp` before the
+   negotiation — but `CpGate` reverts to `CpRecommendation::LongCp` on any single frame at or above
+   threshold ("drop fast"), and the daemon turns that transition into a real `Propose(LongCp)`, so a
+   `ShortCp` → `LongCp` negotiation is a first-class production path, and it is the one that runs
+   exactly when the channel is degrading and legs get lost. In that direction three of the five
+   droppable frames desynced the link *permanently*: with the `Confirm` lost, A had never switched
+   at all yet `abort()` still dragged it to `LongCp` while B stayed on `ShortCp`; with the bare ack
+   or `CpSwitched` lost, G3's revert-to-previous actively *broke* an agreement the two stations had
+   already reached. Both paths now go through one private `CpNegotiator::revert()` helper so they
+   cannot drift apart again, and `abort()` returns the mode it reverted to so the daemon passes that
+   to `set_cp_profile` instead of a hardcoded constant. Bit-identical to the shipped behavior in the
+   `LongCp` → `ShortCp` direction, which is why every pre-existing test stayed green.
+
+3. **A re-ack for duplicate CP-control content**, which covers the handshake's *fifth* droppable
+   frame. The six-step diagram in `cp_negotiator.rs` puts five frames on the air, not four: step 6
+   is B's bare ack for A's third leg, and `on_peer_switched` disarms B's probation the instant that
+   leg arrives. So losing step 6 left A's G4 to fire and revert A while B, with no timer left at
+   all, stayed on the new profile — the same permanent desync this follow-on exists to eliminate,
+   reintroduced one step later. A's retransmitted third leg could not re-elicit the ack either,
+   because `ArqRx` swallows an already-delivered seq before it reaches the ack-sending code: the
+   very dedupe trap that made step 3's ack un-retryable. `handle_cp_control` now emits a bare ack
+   for a content PDU that delivered nothing (a duplicate, or a gap-filler buffered ahead of
+   `recv_base`) without re-running its content action, which makes step 6 recoverable by ordinary
+   retransmission — the same mechanism that covers legs 1, 2 and 4. Giving B a second deadline
+   instead was considered and rejected: nothing could clear it on an idle link, so it would
+   reintroduce exactly the churn failure mode described below. Note this does *not* rescue step 3's
+   ack, where B has already switched and the re-ack would encode under a profile A cannot yet
+   decode; G2/G3 still own that case.
+
+The third leg alone does not converge when it is itself lost. The bounded revert alone converges
+but causes idle-link churn: with no third leg the only disarm signal is "some frame decoded after
+the switch," so a quiet link spuriously reverts and — because `CpGate` only proposes on a
+*transition* and its recommendation is already `ShortCp` — never re-proposes, silently abandoning
+short-CP on exactly the calm channels the feature exists to exploit.
+
+Three supporting changes: `ArqTx::abandon` releases a given-up segment (nothing previously evicted
+one — `get_retransmits`'s `max_retransmit` guard stops retrying but never removes, so the
+two-slot CP-control window leaked a slot per failed negotiation), deliberately *not* by rebuilding
+the pair, since that would rewind `next_seq` on whichever station gave up first and the peer's
+`ArqRx` would then swallow the recycled seq as a duplicate. The `Reset` arm now calls
+`engine.set_cp_profile(LongCp)` alongside its `CpNegotiator::new()` — it previously reset the
+bookkeeping only, leaving an already-switched station's engine and negotiator disagreeing. And
+`send_cp_switched`'s window-full `Err` arm now walks the engine back rather than only logging: its
+caller has already committed the engine to the new profile (it must — the third leg is encoded under
+it), so returning left the station switched with no tracked leg, hence no `pending_switched_seq`,
+hence no G4 that could ever fire. That was an unbounded wait reached silently, by the one path that
+escaped the give-up machinery entirely. The `encode_bytes` `Err` arm beside it deliberately does not
+do this: there the seq *is* tracked, so the retransmit loop re-encodes it and, failing that, G4
+fires normally.
+
+**Verification and its limits, stated plainly**: end-to-end loss-injection tests — one per droppable
+frame, in both negotiation directions — drive two real `EventLoop`s through the real
+`decode_and_dispatch_audio` path with one frame's samples discarded, plus
+`after_a_failed_negotiation_a_later_negotiation_still_succeeds`, the only check that recovery leaves
+the link *usable* rather than merely *consistent*. Still unproven: `cp_negotiation_enabled` remains
+`false` by default (enabling it is COP-2), so none of this has run in a deployment;
+`SWITCH_PROBATION_SECS = 180` is derived from the ARQ worst case (≈135 s) plus margin rather than
+swept, the same "no bench exists for it" caveat `CpGate`'s own constants carry above; verification is
+daemon-to-daemon in-process, with no live two-radio field test; and multi-leg (as opposed to
+single-leg) loss is not tested — including the one residual the fifth frame's fix leaves: if step 6
+*and* every retransmission of the third leg are lost, A's G4 reverts A while B stays on the new mode.
+
 ### 8. Telemetry (Task 7)
 
 **Plan**: daemon emits `SNR <db>` after each decoded frame, `PTT ON/OFF` around transmit,

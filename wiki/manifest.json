@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-07-15T04:29:05Z",
-  "head_commit": "8b55a76",
+  "generated_at": "2026-08-02T05:30:43Z",
+  "head_commit": "75fb995",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -286,6 +286,29 @@
       "title": "How does coppa-protocol handle framing, FEC, and ARQ?",
       "verified_commit": "59b0b63",
       "verified_date": "2026-07-14",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:54b9682dc09c9d2d9dfd79eb25cc946cafee4ac2ca869c76bf06023499a9bf6d",
+      "id": "cp-negotiation-gotchas",
+      "kind": "gotcha",
+      "links": [
+        "adr-008-phase3-system-layer",
+        "coppa-protocol"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/cp-negotiation-gotchas.md",
+      "sources": [
+        "crates/coppa-protocol/src/cp_negotiator.rs",
+        "crates/coppa-protocol/src/arq.rs",
+        "crates/coppa-daemon/src/event_loop.rs",
+        "docs/adr/008-phase3-system-layer.md"
+      ],
+      "status": "current",
+      "title": "What will bite you about the CP-switch negotiation handshake?",
+      "verified_commit": "01f0ecb",
+      "verified_date": "2026-08-01",
       "visibility": "public"
     },
     {

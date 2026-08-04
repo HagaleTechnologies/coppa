@@ -98,6 +98,14 @@ pub struct EventLoop {
     /// or acted on -- same pattern as `cp_gate`.
     cp_control_arq_tx: ArqTx,
     cp_control_arq_rx: ArqRx,
+    /// COP-1 (give-up trigger G1): the CP-control ARQ seq of a `Propose` we
+    /// sent and have not yet seen acked. Kept here rather than inside
+    /// `CpNegotiator` deliberately, to preserve that module's documented
+    /// "holds no state for B's send" property -- `drive_cp_negotiation` only
+    /// needs the seq to poll `ArqTx::is_failed` against, which is a daemon
+    /// concern (the negotiator has no `ArqTx`). `None` when no Propose is
+    /// outstanding.
+    cp_propose_seq: Option<u8>,
     /// Next TX sequence number for transport PDUs.
     #[allow(dead_code)] // used when ARQ TX path sends segmented frames
     arq_next_seq: u8,
@@ -308,6 +316,7 @@ impl EventLoop {
             rate_loop,
             cp_gate,
             cp_negotiator,
+            cp_propose_seq: None,
             cp_control_arq_tx,
             cp_control_arq_rx,
             arq_next_seq: 0,
@@ -1093,6 +1102,26 @@ impl EventLoop {
                             );
                             if self.config.engine.cp_negotiation_enabled
                                 && self.config.engine.arq_enabled
+                                // COP-1 re-entrancy guard: never start a
+                                // second negotiation while one is in flight.
+                                // There is ONE `CpNegotiator` per daemon (one
+                                // `probation`, one `pending_confirm`, one
+                                // `pending_switched`) and one
+                                // `cp_propose_seq`, so a second Propose here
+                                // used to overwrite the first seq outright:
+                                // G1 watches exactly one seq,
+                                // `get_retransmits` stops retrying past the
+                                // budget but never evicts, and only `abandon`
+                                // evicts -- so the orphaned seq parked at
+                                // `send_base` forever, permanently consuming
+                                // one of the CP-control pair's two slots.
+                                // Skipping is right rather than replacing:
+                                // the in-flight negotiation still has a
+                                // give-up trigger armed, and once it resolves
+                                // the next `CpGate` transition proposes
+                                // afresh. See `cp_negotiator`'s
+                                // "One negotiation at a time" section.
+                                && !self.cp_negotiation_in_flight()
                             {
                                 let mode = match after {
                                     CpRecommendation::ShortCp => CpMode::ShortCp,
@@ -1102,6 +1131,15 @@ impl EventLoop {
                                 let now = Instant::now();
                                 match self.cp_control_arq_tx.send(payload.clone(), now) {
                                     Ok(seq) => {
+                                        // COP-1 G1: remember the seq so
+                                        // `drive_cp_negotiation` can release the
+                                        // window slot if this Propose is never
+                                        // acked (`get_retransmits` gives up
+                                        // silently but never evicts). The guard
+                                        // above guarantees we are not
+                                        // overwriting a live seq here.
+                                        debug_assert!(self.cp_propose_seq.is_none());
+                                        self.cp_propose_seq = Some(seq);
                                         let (ack_num, ack_bitmap) =
                                             self.cp_control_arq_rx.ack_info();
                                         let pdu = TransportPdu::new_cp_control_content(
@@ -1122,6 +1160,14 @@ impl EventLoop {
                                         tracing::warn!(error = %e, "cp_control_arq_tx window full; dropping Propose")
                                     }
                                 }
+                            } else if self.config.engine.cp_negotiation_enabled
+                                && self.config.engine.arq_enabled
+                            {
+                                tracing::debug!(
+                                    ?after,
+                                    "CpGate transition observed but a CP negotiation is already \
+                                     in flight; not proposing"
+                                );
                             }
                         }
                     }
@@ -1298,146 +1344,21 @@ impl EventLoop {
                                         });
                                         self.cp_control_arq_rx = ArqRx::new(2);
                                         self.cp_negotiator = CpNegotiator::new();
+                                        self.cp_propose_seq = None;
+                                        // COP-1: `CpNegotiator::new()` starts
+                                        // at LongCp, so without this the
+                                        // bookkeeping and the engine disagree
+                                        // whenever a Reset reaches a station
+                                        // that had already switched -- exactly
+                                        // the desync this ticket exists to
+                                        // prevent, just reached by a different
+                                        // route.
+                                        self.engine.set_cp_profile(CpMode::LongCp);
                                         Vec::new()
                                     }
                                     TransportType::CpControl => {
-                                        if !self.config.engine.cp_negotiation_enabled {
-                                            tracing::debug!("CpControl PDU received but cp_negotiation_enabled is false; ignoring");
-                                            Vec::new()
-                                        } else {
-                                            let now = Instant::now();
-                                            let newly_acked = self.cp_control_arq_tx.process_ack(
-                                                pdu.ack_num,
-                                                pdu.ack_bitmap,
-                                                now,
-                                            );
-                                            if let Some(mode) =
-                                                self.cp_negotiator.on_confirm_acked(&newly_acked)
-                                            {
-                                                self.engine.set_cp_profile(mode);
-                                                tracing::info!(?mode, "CP profile switched (confirmer role, confirmed by peer)");
-                                            }
-                                            if pdu.payload.is_empty() {
-                                                // Bare ack only; nothing further to do.
-                                            } else {
-                                                // `receive` returns only the genuinely new,
-                                                // in-order-delivered segments (mirrors the
-                                                // `Reliable | Unreliable` arm above); a
-                                                // duplicate/retransmitted CpControl PDU
-                                                // returns an empty `delivered` here and must
-                                                // be a pure no-op -- no re-sent Confirm, no
-                                                // re-applied mode, no re-tracked pending
-                                                // confirm (review Finding 1).
-                                                let delivered = self
-                                                    .cp_control_arq_rx
-                                                    .receive(pdu.seq_num, pdu.payload.clone());
-                                                let (ack_num, ack_bitmap) =
-                                                    self.cp_control_arq_rx.ack_info();
-                                                for (_seq, data) in delivered {
-                                                    match CpNegotiator::on_content_received(&data) {
-                                                        Some(ContentAction::SendConfirm(
-                                                            confirm_payload,
-                                                        )) => {
-                                                            match self
-                                                                .cp_control_arq_tx
-                                                                .send(confirm_payload.clone(), now)
-                                                            {
-                                                                Ok(seq) => {
-                                                                    let mode = CpMode::from_wire(
-                                                                        confirm_payload[1],
-                                                                    );
-                                                                    self.cp_negotiator
-                                                                        .track_pending_confirm(
-                                                                            seq, mode,
-                                                                        );
-                                                                    let reply = TransportPdu::new_cp_control_content(
-                                                                    pdu.session_id,
-                                                                    seq,
-                                                                    ack_num,
-                                                                    ack_bitmap,
-                                                                    confirm_payload,
-                                                                );
-                                                                    match self.engine.encode_bytes(
-                                                                        &reply.to_bytes(),
-                                                                    ) {
-                                                                        Ok(samples) => {
-                                                                            self.transmit_samples(
-                                                                                &samples,
-                                                                            )
-                                                                            .await
-                                                                        }
-                                                                        Err(e) => {
-                                                                            tracing::warn!(error = %e, "Failed to encode CpControl Confirm")
-                                                                        }
-                                                                    }
-                                                                }
-                                                                Err(e) => {
-                                                                    tracing::warn!(error = %e, "cp_control_arq_tx window full; dropping Confirm")
-                                                                }
-                                                            }
-                                                        }
-                                                        Some(ContentAction::ApplyAsConfirmer(
-                                                            mode,
-                                                        )) => {
-                                                            // Send the bare ack FIRST, while
-                                                            // still on the OLD profile: the peer
-                                                            // is still listening on the old
-                                                            // profile until it receives this
-                                                            // exact ack (that's what proves its
-                                                            // own Confirm was delivered, and is
-                                                            // what gates ITS switch), so
-                                                            // switching our own engine before
-                                                            // sending this would encode the ack
-                                                            // under a profile the peer can't yet
-                                                            // decode, deadlocking the handshake.
-                                                            // Found via real end-to-end audio
-                                                            // testing, not by inspection -- see
-                                                            // task-5-report.md's "Significant
-                                                            // discovery" section for the full
-                                                            // diagnosis. `CoppaCore::set_cp_profile`
-                                                            // has no way to switch only the
-                                                            // receiver (it rebuilds transmitter
-                                                            // and receiver together), so
-                                                            // deferring the WHOLE switch until
-                                                            // after this send is the only fix
-                                                            // that doesn't require a bigger
-                                                            // coppa-engine API change.
-                                                            let ack_pdu =
-                                                                TransportPdu::new_cp_control_ack(
-                                                                    pdu.session_id,
-                                                                    ack_num,
-                                                                    ack_bitmap,
-                                                                );
-                                                            match self
-                                                                .engine
-                                                                .encode_bytes(&ack_pdu.to_bytes())
-                                                            {
-                                                                Ok(samples) => {
-                                                                    self.transmit_samples(&samples)
-                                                                        .await
-                                                                }
-                                                                Err(e) => {
-                                                                    tracing::warn!(error = %e, "Failed to encode CpControl ack")
-                                                                }
-                                                            }
-                                                            // Only now, after the ack is
-                                                            // genuinely on its way under the old
-                                                            // profile, switch our own engine
-                                                            // (transmitter+receiver together) to
-                                                            // the new mode.
-                                                            self.cp_negotiator
-                                                                .apply_as_confirmer(mode);
-                                                            self.engine.set_cp_profile(mode);
-                                                            tracing::info!(?mode, "CP profile switched (proposer role, own receiver)");
-                                                        }
-                                                        None => tracing::debug!(
-                                                            "Malformed CpControl payload; ignoring"
-                                                        ),
-                                                    }
-                                                }
-                                            }
-                                            Vec::new()
-                                        }
+                                        self.handle_cp_control(&pdu).await;
+                                        Vec::new()
                                     }
                                 }
                             }
@@ -1911,21 +1832,507 @@ impl EventLoop {
             }
             for (seq, pdu_bytes) in cp_retransmit_pdus {
                 match self.engine.encode_bytes(&pdu_bytes) {
-                    Ok(samples) => {
-                        self.transmit_samples(&samples).await;
-                        if let Err(e) = self
-                            .cp_control_arq_tx
-                            .mark_retransmitted(seq, Instant::now())
-                        {
-                            tracing::warn!(
-                                seq,
-                                error = %e,
-                                "Failed to mark CpControl segment retransmitted"
-                            );
-                        }
-                    }
+                    Ok(samples) => self.transmit_samples(&samples).await,
                     Err(e) => tracing::warn!(error = %e, "Failed to encode CpControl retransmit"),
                 }
+                // Count the attempt whether or not the encode succeeded
+                // (review finding). `ArqTx::is_failed` -- the sole trigger
+                // behind G1, G2 and G4 -- reads `transmit_count`, which only
+                // `mark_retransmitted` advances. Advancing it only on a
+                // successful encode meant a persistently failing encode left
+                // the budget frozen forever, so no give-up trigger could ever
+                // fire and the CP-control pair leaked its slot for good: the
+                // exact unbounded wait COP-1 exists to eliminate, reached by
+                // the one path the give-up machinery could not see. An attempt
+                // that could not even be encoded is still an attempt spent,
+                // and this also restarts the RTO so the next poll paces
+                // itself rather than spinning.
+                //
+                // Scoped to the CP-control pair deliberately: the ordinary
+                // data `arq_tx` loop above keeps its encode-gated counting,
+                // where a frozen budget means retrying forever rather than
+                // wedging a two-slot control channel.
+                if let Err(e) = self
+                    .cp_control_arq_tx
+                    .mark_retransmitted(seq, Instant::now())
+                {
+                    tracing::warn!(
+                        seq,
+                        error = %e,
+                        "Failed to mark CpControl segment retransmitted"
+                    );
+                }
+            }
+        }
+
+        // COP-1: drive the CP-negotiation give-up triggers off this same
+        // 500 ms poll. Must run AFTER the retransmit block above, so a
+        // segment gets its full retransmit budget spent this tick before
+        // `is_failed` is consulted. Returns immediately when
+        // `cp_negotiation_enabled` is false (the default).
+        self.drive_cp_negotiation(Instant::now());
+    }
+
+    // ── CP-switch peer negotiation (COP-1) ────────────────────────────
+
+    /// Whether this station is already part of a CP negotiation that has not
+    /// converged yet -- either as the proposer (`cp_propose_seq`, whose
+    /// give-up trigger G1 the daemon owns) or via any of the negotiator's own
+    /// wait states (`CpNegotiator::negotiation_in_flight`).
+    ///
+    /// The re-entrancy guard both the `CpGate`-transition block and the
+    /// inbound-`Propose` arm consult. See `cp_negotiator`'s
+    /// "One negotiation at a time" section for what it enforces, and for the
+    /// one window (a `Propose` acked but its `Confirm` not yet received) it
+    /// cannot see.
+    fn cp_negotiation_in_flight(&self) -> bool {
+        self.cp_propose_seq.is_some() || self.cp_negotiator.negotiation_in_flight()
+    }
+
+    /// Handle one received `TransportType::CpControl` PDU: the CP-switch
+    /// peer-negotiation handshake's whole receive side.
+    ///
+    /// Extracted from `decode_and_dispatch_audio`'s match arm in COP-1 --
+    /// the arm had grown past 150 lines at six levels of nesting, which is
+    /// exactly where the third leg had to be added. Pure code motion apart
+    /// from the COP-1 additions called out inline below.
+    ///
+    /// See `coppa_protocol::cp_negotiator`'s module doc for the three-leg
+    /// diagram and the G1-G4 give-up table this pairs with.
+    async fn handle_cp_control(&mut self, pdu: &TransportPdu) {
+        if !self.config.engine.cp_negotiation_enabled {
+            tracing::debug!("CpControl PDU received but cp_negotiation_enabled is false; ignoring");
+            return;
+        }
+
+        let now = Instant::now();
+        let newly_acked = self
+            .cp_control_arq_tx
+            .process_ack(pdu.ack_num, pdu.ack_bitmap, now);
+
+        // COP-1 (G1 bookkeeping): our Propose is resolved, so stop watching
+        // it for failure. Without this, `drive_cp_negotiation` would keep
+        // polling `is_failed` on a seq whose slot has already been freed and
+        // possibly recycled by a later negotiation.
+        if let Some(seq) = self.cp_propose_seq {
+            if newly_acked.contains(&seq) {
+                self.cp_propose_seq = None;
+            }
+        }
+
+        if let Some(mode) = self.cp_negotiator.on_confirm_acked(&newly_acked) {
+            self.engine.set_cp_profile(mode);
+            tracing::info!(
+                ?mode,
+                "CP profile switched (confirmer role, confirmed by peer)"
+            );
+            // COP-1 third leg: tell the peer, explicitly and ARQ-tracked,
+            // that we have switched. Encoded under the NEW profile, which
+            // the peer is already listening on -- that is exactly what its
+            // bare ack (the thing we just processed) proved. Without this
+            // the peer's only disarm signal would be "some frame decoded
+            // eventually," which never arrives on an idle link.
+            self.send_cp_switched(pdu.session_id, mode, now).await;
+        }
+
+        // COP-1: our own third leg may be acked by this same PDU, which
+        // completes the handshake on our side and disarms G4.
+        if self.cp_negotiator.on_switched_acked(&newly_acked) {
+            tracing::debug!("CP switch fully confirmed by peer; handshake complete");
+        }
+
+        if pdu.payload.is_empty() {
+            // Bare ack only; nothing further to do.
+            return;
+        }
+
+        // `receive` returns only the genuinely new, in-order-delivered
+        // segments (mirrors the `Reliable | Unreliable` arm); a
+        // duplicate/retransmitted CpControl PDU returns an empty `delivered`
+        // here and must not re-run any content action -- no re-sent Confirm,
+        // no re-applied mode, no re-tracked pending confirm (review Finding 1).
+        let delivered = self
+            .cp_control_arq_rx
+            .receive(pdu.seq_num, pdu.payload.clone());
+        let (ack_num, ack_bitmap) = self.cp_control_arq_rx.ack_info();
+
+        // COP-1 remediation: re-ack a *`CpSwitched`* content PDU that
+        // delivered nothing.
+        //
+        // It is a duplicate (a seq `ArqRx` has already delivered, which lands
+        // outside its window and so returns empty) or a gap-filler buffered
+        // ahead of `recv_base`. Either way the peer is still waiting on an ack
+        // it did not get, and dropping this silently is what made the bare ack
+        // for the third leg (step 6 of the module doc's six-step diagram)
+        // *un-retryable*: A retransmits its ARQ-tracked `CpSwitched`, the
+        // dedupe swallowed it before it could reach the ack-sending code
+        // below, so B's lost ack could never be re-elicited -- A's G4 then
+        // reverted A while B, having already disarmed probation, stayed on the
+        // new profile forever. Acking here makes step 6 recoverable by
+        // ordinary retransmission, the same mechanism that covers legs 1, 2
+        // and 4.
+        //
+        // Cannot loop: a bare ack has an empty payload and returns above,
+        // before ever reaching `receive`.
+        //
+        // **Restricted to the `CpSwitched` kind** (review finding). Re-acking
+        // every duplicate disarms the give-up triggers the module doc's
+        // convergence table depends on:
+        //
+        // - a retransmitted `Propose` would be acked, clearing the peer's
+        //   `cp_propose_seq`, so G1 could never fire on the "`Confirm` lost"
+        //   row -- and if this station had itself dropped that `Propose` under
+        //   the re-entrancy guard, the ack would leave the peer waiting on a
+        //   `Confirm` that is never coming, with no trigger left at all;
+        // - a retransmitted `Confirm` would be acked under the NEW profile
+        //   (B has already switched by then) which A, still on the old one,
+        //   cannot decode -- so the ack buys A nothing while still costing it
+        //   its G2 trigger. G2/G3 own that case, exactly as before.
+        //
+        // Only for `CpSwitched` are both stations already on the same, new
+        // profile, which is what makes the re-ack both meaningful and safe.
+        if delivered.is_empty() {
+            let switched_mode = match CpNegotiator::on_content_received(&pdu.payload) {
+                Some(ContentAction::PeerSwitched(mode)) => Some(mode),
+                _ => None,
+            };
+            let Some(mode) = switched_mode else {
+                tracing::debug!(
+                    seq = pdu.seq_num,
+                    "Duplicate/out-of-order CpControl content that is not a third leg; \
+                     ignored so the peer's own give-up trigger still fires"
+                );
+                return;
+            };
+            // Re-check acceptance on the duplicate, not just the payload KIND
+            // (review finding). `on_peer_switched` itself can't be re-called
+            // here -- it mutates `probation`/`revert_to` on success, so a
+            // second call after a genuine accept would find `probation`
+            // already cleared and incorrectly report rejection. `current()`
+            // is the safe read-only proxy: `apply_as_confirmer` sets it to
+            // the target mode BEFORE `on_peer_switched` ever runs, so it
+            // already equals `mode` for both a first-time accept and a
+            // legitimate re-ack of one. It only stops matching `mode` once
+            // G3's `revert()` has fired (a genuine reject/timeout) or when
+            // this station never negotiated to `mode` at all -- exactly the
+            // two cases the first-reception path at `on_peer_switched`
+            // (below) also rejects.
+            if self.cp_negotiator.current() != mode {
+                tracing::warn!(
+                    ?mode,
+                    negotiator_mode = ?self.cp_negotiator.current(),
+                    seq = pdu.seq_num,
+                    "Duplicate CpSwitched leg does not match our current mode; \
+                     not re-acked, so the peer's own give-up trigger still fires"
+                );
+                return;
+            }
+            let ack_pdu = TransportPdu::new_cp_control_ack(pdu.session_id, ack_num, ack_bitmap);
+            match self.engine.encode_bytes(&ack_pdu.to_bytes()) {
+                Ok(samples) => self.transmit_samples(&samples).await,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to encode CpControl duplicate re-ack")
+                }
+            }
+            tracing::debug!(
+                seq = pdu.seq_num,
+                "Duplicate CpSwitched; re-acked without re-running its action"
+            );
+            return;
+        }
+
+        for (_seq, data) in delivered {
+            match CpNegotiator::on_content_received(&data) {
+                Some(ContentAction::SendConfirm(confirm_payload)) => {
+                    // COP-1 re-entrancy guard (the other half of the one in
+                    // the CpGate-transition block): this daemon has exactly
+                    // ONE `CpNegotiator`, so taking on the confirmer role
+                    // while our own negotiation is still in flight would run
+                    // both roles through the same single-slot state. Drop the
+                    // Propose without a Confirm AND without an ack: the peer's
+                    // G1 then fires and it converges on its pre-negotiation
+                    // mode, whereas acking would clear its `cp_propose_seq`
+                    // and leave it waiting on a Confirm forever with no
+                    // trigger. Two stations whose `CpGate`s transition at once
+                    // cross their Proposes, both drop, both fire G1, and both
+                    // stay on the mode they already agreed on -- the next
+                    // transition proposes again.
+                    if self.cp_negotiation_in_flight() {
+                        tracing::debug!(
+                            seq = pdu.seq_num,
+                            "Inbound Propose while our own CP negotiation is in flight; \
+                             dropped unacked so the peer's G1 fires"
+                        );
+                        continue;
+                    }
+                    match self.cp_control_arq_tx.send(confirm_payload.clone(), now) {
+                        Ok(seq) => {
+                            let mode = CpMode::from_wire(confirm_payload[1]);
+                            self.cp_negotiator.track_pending_confirm(seq, mode);
+                            let reply = TransportPdu::new_cp_control_content(
+                                pdu.session_id,
+                                seq,
+                                ack_num,
+                                ack_bitmap,
+                                confirm_payload,
+                            );
+                            match self.engine.encode_bytes(&reply.to_bytes()) {
+                                Ok(samples) => self.transmit_samples(&samples).await,
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "Failed to encode CpControl Confirm")
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // The Propose has already been DELIVERED by
+                            // `cp_control_arq_rx.receive` (recv_base has
+                            // advanced), so no retransmission of it can reach
+                            // this arm again -- and with no Confirm sent,
+                            // `track_pending_confirm` never runs, so G2 never
+                            // arms. That is survivable, not a desync, and only
+                            // because of two other properties: we have not
+                            // switched anything (the mode is applied on the
+                            // Confirm's ack, not here), and the duplicate
+                            // re-ack above is restricted to `CpSwitched`, so
+                            // the peer's retransmitted Propose stays unacked
+                            // and its own G1 fires. Both stations therefore
+                            // converge on the pre-negotiation mode; the
+                            // negotiation is simply wasted.
+                            //
+                            // The window is two slots wide and the
+                            // re-entrancy guard above already refuses this
+                            // Propose whenever one of ours is in flight, so
+                            // reaching here at all means the pair is holding
+                            // segments the give-up triggers have not reclaimed
+                            // yet -- worth a warn, not a silent debug.
+                            tracing::warn!(error = %e, "cp_control_arq_tx window full; dropping Confirm (peer's G1 converges it)")
+                        }
+                    }
+                }
+                Some(ContentAction::ApplyAsConfirmer(mode)) => {
+                    // Send the bare ack FIRST, while still on the OLD
+                    // profile: the peer is still listening on the old profile
+                    // until it receives this exact ack (that's what proves
+                    // its own Confirm was delivered, and is what gates ITS
+                    // switch), so switching our own engine before sending
+                    // this would encode the ack under a profile the peer
+                    // can't yet decode, deadlocking the handshake. Found via
+                    // real end-to-end audio testing, not by inspection -- see
+                    // task-5-report.md's "Significant discovery" section for
+                    // the full diagnosis. `CoppaCore::set_cp_profile` has no
+                    // way to switch only the receiver (it rebuilds
+                    // transmitter and receiver together), so deferring the
+                    // WHOLE switch until after this send is the only fix that
+                    // doesn't require a bigger coppa-engine API change.
+                    //
+                    // COP-1: this ack is still fire-and-forget -- it cannot
+                    // be ARQ-tracked without recreating the very deadlock
+                    // above. What changed is that losing it is no longer
+                    // fatal: we arm probation below, and the peer's own
+                    // Confirm eventually fails its retransmit budget (G2), so
+                    // both sides converge on LongCp instead of stranding on
+                    // mutually-undecodable profiles.
+                    let ack_pdu =
+                        TransportPdu::new_cp_control_ack(pdu.session_id, ack_num, ack_bitmap);
+                    match self.engine.encode_bytes(&ack_pdu.to_bytes()) {
+                        Ok(samples) => self.transmit_samples(&samples).await,
+                        Err(e) => tracing::warn!(error = %e, "Failed to encode CpControl ack"),
+                    }
+                    // Only now, after the ack is genuinely on its way under
+                    // the old profile, switch our own engine
+                    // (transmitter+receiver together) to the new mode. This
+                    // also arms COP-1's probation deadline (G3): having
+                    // switched, we are deaf to the peer's old profile, so it
+                    // now has a bounded window to prove it switched too.
+                    self.cp_negotiator.apply_as_confirmer(mode, now);
+                    self.engine.set_cp_profile(mode);
+                    tracing::info!(
+                        ?mode,
+                        probation_secs = coppa_protocol::cp_negotiator::SWITCH_PROBATION_SECS,
+                        "CP profile switched (proposer role, own receiver); awaiting peer's Switched leg"
+                    );
+                }
+                Some(ContentAction::PeerSwitched(mode)) => {
+                    // COP-1 third leg received: proof our own switch was not
+                    // made in vain, so disarm probation. Ack it so the peer's
+                    // ARQ-tracked leg resolves (G4) -- we are already on
+                    // `mode`, so this ack encodes under exactly the profile
+                    // the peer is now listening on.
+                    //
+                    // Only ack an ACCEPTED leg (review finding). A leg naming
+                    // a mode we did not switch to, or one arriving with no
+                    // probation armed (e.g. after G3 already reverted us), is
+                    // rejected by `on_peer_switched` -- and acking it anyway
+                    // resolved the sender's G4 while our own probation stayed
+                    // armed to revert us seconds later, stranding the two
+                    // stations on different profiles. Staying silent instead
+                    // lets the sender's G4 fire, and both converge on the
+                    // pre-negotiation mode.
+                    if !self.cp_negotiator.on_peer_switched(mode) {
+                        tracing::warn!(
+                            ?mode,
+                            negotiator_mode = ?self.cp_negotiator.current(),
+                            "CpSwitched leg does not match any switch we are awaiting; \
+                             not acked, so the peer's G4 converges it"
+                        );
+                        continue;
+                    }
+                    let ack_pdu =
+                        TransportPdu::new_cp_control_ack(pdu.session_id, ack_num, ack_bitmap);
+                    match self.engine.encode_bytes(&ack_pdu.to_bytes()) {
+                        Ok(samples) => self.transmit_samples(&samples).await,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to encode CpControl Switched-ack")
+                        }
+                    }
+                    tracing::info!(
+                        ?mode,
+                        "Peer confirmed its own CP switch; handshake complete"
+                    );
+                }
+                None => tracing::debug!("Malformed CpControl payload; ignoring"),
+            }
+        }
+    }
+
+    /// Emit COP-1's third leg (`CpSwitched`) under the profile we just
+    /// switched to, ARQ-tracked so give-up trigger G4 can notice if the peer
+    /// never acks it.
+    async fn send_cp_switched(&mut self, session_id: u8, mode: CpMode, now: Instant) {
+        let payload = CpNegotiator::switched_payload(mode);
+        match self.cp_control_arq_tx.send(payload.clone(), now) {
+            Ok(seq) => {
+                self.cp_negotiator.track_pending_switched(seq);
+                let (ack_num, ack_bitmap) = self.cp_control_arq_rx.ack_info();
+                let switched_pdu = TransportPdu::new_cp_control_content(
+                    session_id, seq, ack_num, ack_bitmap, payload,
+                );
+                match self.engine.encode_bytes(&switched_pdu.to_bytes()) {
+                    Ok(samples) => self.transmit_samples(&samples).await,
+                    Err(e) => tracing::warn!(error = %e, "Failed to encode CpControl Switched"),
+                }
+            }
+            Err(e) => {
+                // The caller has ALREADY committed our engine to `mode` (it
+                // must -- the third leg has to be encoded under the new
+                // profile). Simply logging here would leave us switched with
+                // no tracked leg, hence no `pending_switched_seq`, hence no
+                // way for G4 to ever fire: precisely the unbounded wait COP-1
+                // exists to eliminate. So walk the engine back instead.
+                //
+                // The `encode_bytes` Err arm above deliberately does NOT do
+                // this: there the seq IS tracked, so the retransmit loop
+                // re-encodes it and, failing that, G4 fires normally. Only the
+                // send failure escapes the give-up machinery entirely.
+                //
+                // That justification is only true because the CP retransmit
+                // loop now advances `transmit_count` even when the re-encode
+                // fails. It previously called `mark_retransmitted` solely on a
+                // successful encode, so a persistently failing encode froze
+                // the budget and `is_failed` -- hence G4 -- was unreachable,
+                // making the sentence above assert the opposite of what the
+                // code did. See `check_arq_retransmits`'s CP block.
+                let reverted = self.cp_negotiator.abort();
+                self.engine.set_cp_profile(reverted);
+                tracing::warn!(
+                    error = %e,
+                    ?reverted,
+                    "cp_control_arq_tx window full; dropping Switched and reverting (no G4 could arm)"
+                );
+            }
+        }
+    }
+
+    /// Drive the CP-negotiation give-up triggers (COP-1). Takes `now`
+    /// explicitly, `arq.rs`-style, so tests can inject a future `Instant`
+    /// rather than sleeping out a 180-second probation.
+    ///
+    /// Every trigger converges on the **pre-negotiation mode** -- the last
+    /// mode both stations are known to have agreed on, which for the first
+    /// negotiation of a session is the `CpMode::LongCp` both boot into. See
+    /// `coppa_protocol::cp_negotiator`'s module doc for the full G1-G4 table,
+    /// the per-lost-frame convergence matrix, and why a hardcoded `LongCp`
+    /// here was wrong for a `ShortCp` -> `LongCp` negotiation.
+    ///
+    /// Not `async`: nothing here transmits. A give-up is deliberately silent
+    /// -- the whole premise is that the peer cannot hear us.
+    ///
+    /// G2, G3 and G4 are resolved as **one** give-up, not three independent
+    /// ones. An earlier revision claimed G3 and G4 were "role-disjoint by
+    /// construction: only B arms probation and only A tracks a pending
+    /// `Switched`, so they can never both fire on the same station." That was
+    /// false -- there is one `CpNegotiator` per daemon, both stations run
+    /// `CpGate` over the same channel, and nothing made a station
+    /// intrinsically an A or a B (see `cp_negotiator`'s "One negotiation at a
+    /// time" section, and the re-entrancy guard that now enforces the
+    /// invariant the claim assumed). Treating them separately had a concrete
+    /// cost even so: G4's `abort()` clears `pending_confirm`, so a co-pending
+    /// Confirm seq was dropped before the G2 block below could read and
+    /// abandon it -- leaking the very window slot G2 exists to reclaim.
+    ///
+    /// So: read every tracked leg first, decide, then abandon them all,
+    /// `abort()` once, and `set_cp_profile` once. Abandoning the whole set
+    /// together is also what makes the window really come back to
+    /// `in_flight() == 0` -- `ArqTx::abandon` only advances `send_base` over a
+    /// fully-resolved prefix, so abandoning a subset frees no room (see its
+    /// doc).
+    fn drive_cp_negotiation(&mut self, now: Instant) {
+        if !self.config.engine.cp_negotiation_enabled {
+            return;
+        }
+
+        // Snapshot the ARQ-tracked legs BEFORE anything clears them.
+        let confirm_seq = self.cp_negotiator.pending_confirm_seq();
+        let switched_seq = self.cp_negotiator.pending_switched_seq();
+
+        // G3: probation expired -- the peer never proved it switched. This is
+        // THE trigger the lost-bare-ack case depends on. `tick` disarms the
+        // probation either way and reports `None` when there is no
+        // pre-negotiation mode left to go back to, so a no-op revert costs
+        // neither an engine rebuild nor a misleading operator warning.
+        let g3 = self.cp_negotiator.tick(now).is_some();
+        // G4: our own Switched leg was never acked -- the peer is unreachable
+        // under the new profile, so fall back with it.
+        let g4 = switched_seq.is_some_and(|seq| self.cp_control_arq_tx.is_failed(seq));
+        // G2: our Confirm was never acked. We never switched, so only
+        // bookkeeping needs clearing -- but the engine is still re-applied
+        // below so the negotiator and the engine cannot drift apart.
+        let g2 = confirm_seq.is_some_and(|seq| self.cp_control_arq_tx.is_failed(seq));
+
+        if g2 || g3 || g4 {
+            for seq in [confirm_seq, switched_seq].into_iter().flatten() {
+                self.cp_control_arq_tx.abandon(seq);
+            }
+            // Revert to the mode `abort` reports, NOT unconditionally to
+            // `LongCp`. On a ShortCp -> LongCp negotiation those differ, and
+            // using the wrong one is what desynced the link (see
+            // `cp_negotiator`'s module doc). After a G3 tick this is the mode
+            // `tick` already reverted to, so the two agree by construction.
+            let reverted = self.cp_negotiator.abort();
+            self.engine.set_cp_profile(reverted);
+            tracing::warn!(
+                g2,
+                g3,
+                g4,
+                ?confirm_seq,
+                ?switched_seq,
+                ?reverted,
+                "CP negotiation gave up; both bookkeeping and engine walked back"
+            );
+        }
+
+        // G1: our Propose was never acked. Clear it so a later CpGate
+        // transition can propose again -- `get_retransmits` gives up silently
+        // but never evicts, so without the `abandon` the two-slot CP-control
+        // window leaks one slot per failed negotiation. Kept separate from the
+        // block above because the daemon, not the negotiator, owns this seq,
+        // and because B reaching G1 has nothing to walk back: it never
+        // switched.
+        if let Some(seq) = self.cp_propose_seq {
+            if self.cp_control_arq_tx.is_failed(seq) {
+                self.cp_control_arq_tx.abandon(seq);
+                self.cp_propose_seq = None;
+                tracing::warn!(seq, "CpControl Propose leg failed; negotiation abandoned");
             }
         }
     }
@@ -2313,7 +2720,7 @@ mod tests {
         let (b_ack_num, b_ack_bitmap) = b.cp_control_arq_rx.ack_info();
         match CpNegotiator::on_content_received(&confirm_pdu.payload).unwrap() {
             coppa_protocol::cp_negotiator::ContentAction::ApplyAsConfirmer(mode) => {
-                b.cp_negotiator.apply_as_confirmer(mode);
+                b.cp_negotiator.apply_as_confirmer(mode, now);
                 b.engine.set_cp_profile(mode);
             }
             other => panic!("expected ApplyAsConfirmer, got {other:?}"),
@@ -2624,6 +3031,1306 @@ mod tests {
             decoded.is_ok(),
             "frame sent after the switch must decode under the matching short-CP profile"
         );
+    }
+
+    // ── COP-1 Phase 3: daemon wiring for the third leg and give-up ────────
+
+    use coppa_protocol::cp_negotiator::SWITCH_PROBATION_SECS;
+
+    /// Build a real, decodable frame carrying `pdu`, encoded under `profile`
+    /// by an independent peer transceiver (not another `EventLoop`), ready to
+    /// hand to `decode_and_dispatch_audio`.
+    fn peer_frame(pdu: &TransportPdu, profile: coppa_codec::ofdm::CoppaProfile) -> Vec<f32> {
+        let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(profile, 1);
+        let bytes = pdu.to_bytes();
+        let header = coppa_codec::ofdm::frame::CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: coppa_codec::ofdm::frame::CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: bytes.len() as u16,
+            codewords: 1,
+        };
+        let samples = peer_tx
+            .transmit(&header, &bytes)
+            .expect("peer transmit should succeed");
+        with_lead_and_trail(&samples)
+    }
+
+    fn cp_enabled_config() -> DaemonConfig {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        config.engine.cp_negotiation_enabled = true;
+        config
+    }
+
+    /// Drive `seq` past its retransmit budget so `ArqTx::is_failed` reports
+    /// it, without waiting out real RTOs. `mark_retransmitted` is the same
+    /// call the real retransmit loop makes; doing it `max_retransmit` times
+    /// is exactly what a peer that never acks produces.
+    fn exhaust_retransmits(tx: &mut ArqTx, seq: u8) {
+        let mut now = Instant::now();
+        for _ in 0..coppa_protocol::arq::DEFAULT_MAX_RETRANSMIT {
+            now += Duration::from_secs(120);
+            let _ = tx.get_retransmits(now);
+            tx.mark_retransmitted(seq, now)
+                .expect("segment should still be in flight");
+        }
+        assert!(
+            tx.is_failed(seq),
+            "test setup: segment should read as failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmer_emits_cp_switched_under_the_new_profile_when_its_confirm_is_acked() {
+        let mut a = EventLoop::new(cp_enabled_config()).unwrap();
+        let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
+        a.set_audio_out(producer);
+
+        // Put `a` in the real "sent a Confirm, waiting for the peer's bare
+        // ack" state (the state the real SendConfirm arm leaves it in).
+        let confirm_payload = match CpNegotiator::on_content_received(
+            &CpNegotiator::propose_payload(CpMode::ShortCp),
+        ) {
+            Some(ContentAction::SendConfirm(p)) => p,
+            other => panic!("expected SendConfirm, got {other:?}"),
+        };
+        let seq_confirm = a
+            .cp_control_arq_tx
+            .send(confirm_payload, Instant::now())
+            .unwrap();
+        a.cp_negotiator
+            .track_pending_confirm(seq_confirm, CpMode::ShortCp);
+        assert_eq!(a.engine.cp_mode(), CpMode::LongCp);
+
+        // The peer's bare ack, encoded under the OLD profile `a` is still on
+        // -- exactly what the real peer sends (see the ApplyAsConfirmer arm's
+        // send-ack-before-switching ordering).
+        let bare_ack =
+            TransportPdu::new_cp_control_ack(a.arq_session_id, seq_confirm.wrapping_add(1), 0);
+        a.decode_and_dispatch_audio(&peer_frame(
+            &bare_ack,
+            coppa_codec::ofdm::CoppaProfile::hf_standard(),
+        ))
+        .await;
+
+        assert_eq!(
+            a.engine.cp_mode(),
+            CpMode::ShortCp,
+            "the bare ack is a's proof of delivery; it must switch its encoder now"
+        );
+        let switched_seq = a
+            .cp_negotiator
+            .pending_switched_seq()
+            .expect("a must track its own third leg for give-up trigger G4");
+
+        // And it must really have TRANSMITTED that third leg, under the NEW
+        // profile (which is what the peer is now listening on).
+        let mut buf = vec![0.0f32; 1_000_000];
+        let read = consumer.read(&mut buf);
+        assert!(
+            read > 0,
+            "expected a to have really transmitted a CpSwitched"
+        );
+        // Decode with an engine built EXACTLY the way the daemon builds its
+        // own -- `CoppaCore::new()` would differ in `compression_enabled`,
+        // silently yielding the still-compressed bytes rather than the PDU.
+        // (The pre-existing handshake test only asserts `decoded.is_ok()`,
+        // which is why that difference never surfaced before.)
+        let mut check = EventLoop::new(cp_enabled_config()).unwrap();
+        check.engine.set_cp_profile(CpMode::ShortCp);
+        let decoded = check
+            .engine
+            .decode_bytes(&buf[..read])
+            .expect("the third leg must be encoded under the NEW profile");
+        let leg = TransportPdu::from_bytes(&decoded).expect("must be a TransportPdu");
+        assert_eq!(leg.transport_type, TransportType::CpControl);
+        assert_eq!(
+            leg.payload,
+            CpNegotiator::switched_payload(CpMode::ShortCp),
+            "payload must be the CpSwitched kind naming the mode we switched to"
+        );
+        assert_eq!(
+            leg.seq_num, switched_seq,
+            "the leg must carry its tracked seq"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposer_disarms_probation_and_acks_on_receiving_cp_switched() {
+        let mut b = EventLoop::new(cp_enabled_config()).unwrap();
+        let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
+        b.set_audio_out(producer);
+
+        // `b` has switched and armed probation (the real ApplyAsConfirmer
+        // arm's end state).
+        let t0 = Instant::now();
+        b.cp_negotiator.apply_as_confirmer(CpMode::ShortCp, t0);
+        b.engine.set_cp_profile(CpMode::ShortCp);
+
+        // The peer's third leg arrives, encoded under the NEW profile.
+        let switched = TransportPdu::new_cp_control_content(
+            b.arq_session_id,
+            0,
+            0,
+            0,
+            CpNegotiator::switched_payload(CpMode::ShortCp),
+        );
+        b.decode_and_dispatch_audio(&peer_frame(
+            &switched,
+            coppa_codec::ofdm::CoppaProfile::hf_standard_short_cp(),
+        ))
+        .await;
+
+        // Probation must now be permanently disarmed: even far past the
+        // deadline, nothing reverts.
+        b.drive_cp_negotiation(t0 + Duration::from_secs(SWITCH_PROBATION_SECS + 1));
+        assert_eq!(b.cp_negotiator.current(), CpMode::ShortCp);
+        assert_eq!(
+            b.engine.cp_mode(),
+            CpMode::ShortCp,
+            "a confirmed peer switch must cancel probation, not merely delay it"
+        );
+
+        // And b must really have acked the leg, so the peer's G4 disarms too.
+        let mut buf = vec![0.0f32; 1_000_000];
+        assert!(
+            consumer.read(&mut buf) > 0,
+            "expected b to have really transmitted a bare ack for the third leg"
+        );
+    }
+
+    #[tokio::test]
+    async fn probation_expiry_reverts_the_engine_not_just_the_negotiator() {
+        // The regression this whole ticket exists to prevent: bookkeeping and
+        // engine must never be left disagreeing.
+        let mut b = EventLoop::new(cp_enabled_config()).unwrap();
+        let t0 = Instant::now();
+        b.cp_negotiator.apply_as_confirmer(CpMode::ShortCp, t0);
+        b.engine.set_cp_profile(CpMode::ShortCp);
+
+        // Just before the deadline: nothing happens.
+        b.drive_cp_negotiation(t0 + Duration::from_secs(SWITCH_PROBATION_SECS - 1));
+        assert_eq!(b.engine.cp_mode(), CpMode::ShortCp);
+
+        // Past it: BOTH must walk back.
+        b.drive_cp_negotiation(t0 + Duration::from_secs(SWITCH_PROBATION_SECS + 1));
+        assert_eq!(b.cp_negotiator.current(), CpMode::LongCp);
+        assert_eq!(
+            b.engine.cp_mode(),
+            CpMode::LongCp,
+            "G3 must revert the ENGINE, not just the negotiator's bookkeeping"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_confirm_aborts_and_frees_the_cp_control_window() {
+        let mut a = EventLoop::new(cp_enabled_config()).unwrap();
+        let confirm_payload = vec![0x02, CpMode::ShortCp.to_wire()];
+        let seq = a
+            .cp_control_arq_tx
+            .send(confirm_payload, Instant::now())
+            .unwrap();
+        a.cp_negotiator.track_pending_confirm(seq, CpMode::ShortCp);
+        exhaust_retransmits(&mut a.cp_control_arq_tx, seq);
+
+        a.drive_cp_negotiation(Instant::now());
+
+        assert_eq!(a.cp_negotiator.pending_confirm_seq(), None);
+        assert_eq!(
+            a.engine.cp_mode(),
+            CpMode::LongCp,
+            "a never switched, so it must still be on the conservative default"
+        );
+        // The parked-segment leak: the window must be usable again.
+        assert!(
+            a.cp_control_arq_tx.send(vec![1, 2], Instant::now()).is_ok(),
+            "the given-up segment must have been abandoned, freeing its slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_propose_aborts_and_frees_the_cp_control_window() {
+        let mut b = EventLoop::new(cp_enabled_config()).unwrap();
+        let seq = b
+            .cp_control_arq_tx
+            .send(
+                CpNegotiator::propose_payload(CpMode::ShortCp),
+                Instant::now(),
+            )
+            .unwrap();
+        b.cp_propose_seq = Some(seq);
+        exhaust_retransmits(&mut b.cp_control_arq_tx, seq);
+
+        b.drive_cp_negotiation(Instant::now());
+
+        assert_eq!(b.cp_propose_seq, None, "G1 must clear the tracked seq");
+        assert_eq!(b.engine.cp_mode(), CpMode::LongCp);
+        assert!(
+            b.cp_control_arq_tx.send(vec![1, 2], Instant::now()).is_ok(),
+            "G1 must free the slot so a later CpGate transition can propose again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_cp_switched_reverts_the_confirmer_to_long_cp() {
+        // G4: `a` switched and sent its third leg, which the peer never acks.
+        // The peer is unreachable under the new profile, so `a` must fall
+        // back with it rather than sit deaf forever.
+        let mut a = EventLoop::new(cp_enabled_config()).unwrap();
+        a.engine.set_cp_profile(CpMode::ShortCp);
+        let seq = a
+            .cp_control_arq_tx
+            .send(
+                CpNegotiator::switched_payload(CpMode::ShortCp),
+                Instant::now(),
+            )
+            .unwrap();
+        a.cp_negotiator.track_pending_switched(seq);
+        exhaust_retransmits(&mut a.cp_control_arq_tx, seq);
+
+        a.drive_cp_negotiation(Instant::now());
+
+        assert_eq!(a.cp_negotiator.current(), CpMode::LongCp);
+        assert_eq!(
+            a.engine.cp_mode(),
+            CpMode::LongCp,
+            "G4 must revert the ENGINE too, not just the negotiator"
+        );
+        assert_eq!(a.cp_negotiator.pending_switched_seq(), None);
+    }
+
+    #[tokio::test]
+    async fn drive_cp_negotiation_is_inert_when_cp_negotiation_is_disabled() {
+        // Default config: cp_negotiation_enabled = false.
+        let mut a = EventLoop::new(DaemonConfig::default()).unwrap();
+        let t0 = Instant::now();
+        // Set up state that WOULD trigger every give-up path if enabled.
+        a.cp_negotiator.apply_as_confirmer(CpMode::ShortCp, t0);
+        a.engine.set_cp_profile(CpMode::ShortCp);
+        let seq = a
+            .cp_control_arq_tx
+            .send(CpNegotiator::switched_payload(CpMode::ShortCp), t0)
+            .unwrap();
+        a.cp_negotiator.track_pending_switched(seq);
+        a.cp_propose_seq = Some(seq);
+        exhaust_retransmits(&mut a.cp_control_arq_tx, seq);
+
+        a.drive_cp_negotiation(t0 + Duration::from_secs(SWITCH_PROBATION_SECS * 10));
+
+        assert_eq!(
+            a.cp_negotiator.current(),
+            CpMode::ShortCp,
+            "disabled means genuinely inert -- no state change at any `now`"
+        );
+        assert_eq!(a.engine.cp_mode(), CpMode::ShortCp);
+        assert_eq!(a.cp_negotiator.pending_switched_seq(), Some(seq));
+        assert_eq!(a.cp_propose_seq, Some(seq));
+    }
+
+    #[tokio::test]
+    async fn drive_cp_negotiation_is_a_no_op_when_no_negotiation_is_in_flight() {
+        // Guards against the 500 ms poll spuriously reverting a settled link.
+        let mut a = EventLoop::new(cp_enabled_config()).unwrap();
+        a.drive_cp_negotiation(Instant::now() + Duration::from_secs(SWITCH_PROBATION_SECS * 10));
+        assert_eq!(a.cp_negotiator.current(), CpMode::LongCp);
+        assert_eq!(a.engine.cp_mode(), CpMode::LongCp);
+        assert_eq!(a.cp_propose_seq, None);
+    }
+
+    // ── COP-1 Phase 4: end-to-end loss injection ──────────────────────────
+    //
+    // Two real `EventLoop`s, real audio rings, real `decode_and_dispatch_audio`
+    // -- modelled on `cp_negotiation_full_handshake_converges_both_sides`.
+    // Loss injection is simply reading a leg's samples out of the sender's
+    // ring and NOT delivering them; no new infrastructure is required.
+    //
+    // Why this tier matters: the `e59bf56` handshake-deadlock bug was found
+    // only by driving the real end-to-end audio path (not by inspection, and
+    // not by the lower-level primitives test), and the VHF `TIMING_BACKOFF`
+    // bug likewise only reproduced past a session's first real frame.
+
+    /// Read everything a station has queued for transmission, assert it is
+    /// non-empty, and pad it for the peer's decoder.
+    ///
+    /// The non-empty assertion is load-bearing: without it a loss-injection
+    /// test could silently pass because nothing was ever transmitted, rather
+    /// than because the recovery path worked.
+    fn take_leg(consumer: &mut coppa_audio::AudioRingConsumer, what: &str) -> Vec<f32> {
+        let mut buf = vec![0.0f32; 1_000_000];
+        let read = consumer.read(&mut buf);
+        assert!(
+            read > 0,
+            "expected the station to have really transmitted {what}"
+        );
+        with_lead_and_trail(&buf[..read])
+    }
+
+    /// The ticket's acceptance criterion, as one assertion: engine and
+    /// bookkeeping agree, on both stations, on the same mode.
+    fn assert_converged(a: &EventLoop, b: &EventLoop, expected: CpMode) {
+        assert_eq!(a.engine.cp_mode(), expected, "a's engine");
+        assert_eq!(b.engine.cp_mode(), expected, "b's engine");
+        assert_eq!(a.cp_negotiator.current(), expected, "a's negotiator");
+        assert_eq!(b.cp_negotiator.current(), expected, "b's negotiator");
+    }
+
+    /// Spend every ARQ-budget-driven give-up trigger a station could be
+    /// waiting on (G1/G2/G4), then drive `drive_cp_negotiation` far enough
+    /// into the future to also fire the wall-clock one (G3).
+    ///
+    /// Exhausting the retransmit budget by hand is what the real 500 ms poll
+    /// does over ~135 s of real time (5 attempts with exponential backoff);
+    /// `exhaust_retransmits` makes the same calls the retransmit loop makes,
+    /// so this compresses the wait without faking the mechanism.
+    fn give_up(station: &mut EventLoop) {
+        for seq in [
+            station.cp_propose_seq,
+            station.cp_negotiator.pending_confirm_seq(),
+            station.cp_negotiator.pending_switched_seq(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if station.cp_control_arq_tx.get_segment_data(seq).is_some() {
+                exhaust_retransmits(&mut station.cp_control_arq_tx, seq);
+            }
+        }
+        station
+            .drive_cp_negotiation(Instant::now() + Duration::from_secs(SWITCH_PROBATION_SECS + 1));
+    }
+
+    /// Drive `station` through a real `LongCp -> ShortCp` `CpGate` transition
+    /// by decoding 4 real clean-channel frames, which is what trips
+    /// `CpGate::default_coppa`'s real hysteresis (`consecutive_needed = 4`).
+    ///
+    /// Going through `decode_and_dispatch_audio` rather than poking `cp_gate`
+    /// directly is the whole point: the propose-on-transition block lives
+    /// inside that function and is the production path. See
+    /// `cp_negotiation_full_handshake_converges_both_sides`'s doc.
+    async fn trip_cp_gate(station: &mut EventLoop) {
+        let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
+        let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
+        for i in 0..4u8 {
+            // First byte's low nibble 0x0F is an unrecognized TransportType,
+            // so these are inert: they exercise only the real
+            // CpGate-observe-and-maybe-propose block, with no ARQ side effects.
+            let warmup_payload: Vec<u8> = vec![0xFF, i, 0, 0, 0, 0, 0, 1, 2, 3];
+            let header = coppa_codec::ofdm::frame::CoppaHeader {
+                version: 1,
+                phy_mode: 0,
+                frame_type: coppa_codec::ofdm::frame::CoppaFrameType::Data,
+                bandwidth: 1,
+                fec_type: 0,
+                speed_level: 2,
+                seq_num: 0,
+                payload_len: warmup_payload.len() as u16,
+                codewords: 1,
+            };
+            let samples = peer_tx
+                .transmit(&header, &warmup_payload)
+                .expect("peer transmit should succeed");
+            station
+                .decode_and_dispatch_audio(&with_lead_and_trail(&samples))
+                .await;
+        }
+        assert_eq!(
+            station.cp_gate.current(),
+            CpRecommendation::ShortCp,
+            "4 consecutive clean-channel decodes should trip CpGate's real hysteresis"
+        );
+    }
+
+    /// Two real stations with real audio rings, with `b` having genuinely
+    /// transmitted a `Propose` via the real CpGate-transition path (4 real
+    /// decoded frames trip `CpGate::default_coppa`'s real hysteresis -- see
+    /// `cp_negotiation_full_handshake_converges_both_sides`'s doc for why
+    /// this, rather than poking `cp_gate` directly, is the production path).
+    async fn cp_pair_at_propose() -> (
+        EventLoop,
+        EventLoop,
+        coppa_audio::AudioRingConsumer,
+        coppa_audio::AudioRingConsumer,
+    ) {
+        let mut config = cp_enabled_config();
+        config.engine.cp_gate_enabled = true;
+        let mut a = EventLoop::new(config.clone()).unwrap();
+        let mut b = EventLoop::new(config).unwrap();
+
+        let (a_producer, a_consumer) = coppa_audio::audio_ring(1_000_000);
+        a.set_audio_out(a_producer);
+        let (b_producer, b_consumer) = coppa_audio::audio_ring(1_000_000);
+        b.set_audio_out(b_producer);
+
+        trip_cp_gate(&mut b).await;
+        assert!(
+            b.cp_propose_seq.is_some(),
+            "the real propose-on-transition block should have tracked its seq for G1"
+        );
+        (a, b, a_consumer, b_consumer)
+    }
+
+    #[tokio::test]
+    async fn lost_propose_leaves_both_endpoints_on_long_cp() {
+        let (a, mut b, _a_consumer, mut b_consumer) = cp_pair_at_propose().await;
+
+        // DROP b's Propose: `a` never learns a negotiation was attempted.
+        let _dropped = take_leg(&mut b_consumer, "a CpControl Propose");
+
+        give_up(&mut b);
+
+        assert_converged(&a, &b, CpMode::LongCp);
+        assert_eq!(b.cp_propose_seq, None, "G1 must clear the tracked seq");
+        assert!(
+            b.cp_control_arq_tx.send(vec![1, 2], Instant::now()).is_ok(),
+            "b's CP-control window must be usable again"
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_confirm_converges_both_endpoints_on_long_cp() {
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = cp_pair_at_propose().await;
+
+        let propose = take_leg(&mut b_consumer, "a CpControl Propose");
+        a.decode_and_dispatch_audio(&propose).await;
+        assert!(
+            a.cp_negotiator.pending_confirm_seq().is_some(),
+            "a should be waiting on its own Confirm"
+        );
+
+        // DROP a's Confirm. Neither station ever switched, so this asserts the
+        // fix does not *introduce* a desync on a leg that was previously
+        // merely inert.
+        let _dropped = take_leg(&mut a_consumer, "a CpControl Confirm");
+
+        give_up(&mut a); // G2
+        give_up(&mut b); // G1 -- b's Propose is never acked either
+
+        assert_converged(&a, &b, CpMode::LongCp);
+        assert_eq!(a.cp_negotiator.pending_confirm_seq(), None);
+        assert_eq!(b.cp_propose_seq, None);
+    }
+
+    #[tokio::test]
+    async fn lost_bare_ack_converges_both_endpoints_on_long_cp() {
+        // THE ticket's scenario: the un-retryable bare ack is lost, and before
+        // COP-1 this left the two stations on mutually-undecodable CP profiles
+        // permanently, with no automatic recovery.
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = cp_pair_at_propose().await;
+
+        let propose = take_leg(&mut b_consumer, "a CpControl Propose");
+        a.decode_and_dispatch_audio(&propose).await;
+        let confirm = take_leg(&mut a_consumer, "a CpControl Confirm");
+        b.decode_and_dispatch_audio(&confirm).await;
+
+        // b has switched (and armed probation); a has not.
+        assert_eq!(b.engine.cp_mode(), CpMode::ShortCp);
+        assert_eq!(a.engine.cp_mode(), CpMode::LongCp);
+
+        // DROP b's bare ack. This is the exact frame whose loss used to be
+        // unrecoverable.
+        let _dropped = take_leg(&mut b_consumer, "a bare ack for a's Confirm");
+
+        give_up(&mut a); // G2: a's Confirm is never acked
+        give_up(&mut b); // G3: probation expires with no proof a switched
+
+        assert_converged(&a, &b, CpMode::LongCp);
+
+        // And the link is genuinely ALIVE again, not merely consistent: a
+        // frame a encodes now must decode on b.
+        let samples = a.engine.encode_bytes(b"link alive").unwrap();
+        assert_eq!(
+            b.engine
+                .decode_bytes(&samples)
+                .expect("b must decode a's frame after convergence"),
+            b"link alive".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_cp_switched_converges_both_endpoints_on_long_cp() {
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = cp_pair_at_propose().await;
+
+        let propose = take_leg(&mut b_consumer, "a CpControl Propose");
+        a.decode_and_dispatch_audio(&propose).await;
+        let confirm = take_leg(&mut a_consumer, "a CpControl Confirm");
+        b.decode_and_dispatch_audio(&confirm).await;
+        let bare_ack = take_leg(&mut b_consumer, "a bare ack for a's Confirm");
+
+        // Deliver the bare ack, so `a` switches AND emits the third leg...
+        //
+        // Same workaround, for the same reason, as
+        // `cp_negotiation_full_handshake_converges_both_sides` carries at its
+        // own ack-decode step: this is `a`'s SECOND real decode of a
+        // `CoppaCore::encode_bytes`-built frame, and `CoppaCore` reliably
+        // fails every decode after its first one (CLAUDE.md's standalone
+        // known-limitation bullet, "Bug B" -- real, reproducible, narrowed to
+        // a payload-size-dependent spurious sync candidate, and entirely
+        // orthogonal to CP negotiation). `set_cp_profile` always rebuilds
+        // `self.streaming`, so calling it with `a`'s CURRENT mode is a
+        // genuine no-op for the profile that nonetheless clears the stuck
+        // state. Because it only ever sets `LongCp`, the `ShortCp` assertion
+        // immediately below remains real evidence, not tautology.
+        //
+        // The other loss-injection tests here don't need it: they either
+        // decode only one frame on `a`, or happen to pass through a
+        // `drive_cp_negotiation` give-up (which calls `set_cp_profile` itself)
+        // first. Not fixed here -- out of scope for this ticket.
+        a.engine.set_cp_profile(CpMode::LongCp);
+        a.decode_and_dispatch_audio(&bare_ack).await;
+        assert_eq!(a.engine.cp_mode(), CpMode::ShortCp);
+        assert!(a.cp_negotiator.pending_switched_seq().is_some());
+
+        // ...then DROP that third leg.
+        let _dropped = take_leg(&mut a_consumer, "a CpControl Switched");
+
+        give_up(&mut a); // G4
+        give_up(&mut b); // G3
+
+        assert_converged(&a, &b, CpMode::LongCp);
+    }
+
+    #[tokio::test]
+    async fn after_a_failed_negotiation_a_later_negotiation_still_succeeds() {
+        // The regression `ArqTx::abandon` exists to prevent: a failed
+        // negotiation must not leave the two-slot CP-control window leaking a
+        // parked segment, nor leave the two sequence spaces diverged. This is
+        // the only check that recovery leaves the link genuinely USABLE rather
+        // than merely consistent.
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = cp_pair_at_propose().await;
+
+        // ── Negotiation 1: fails on a lost bare ack. ──
+        let propose = take_leg(&mut b_consumer, "a CpControl Propose");
+        a.decode_and_dispatch_audio(&propose).await;
+        let confirm = take_leg(&mut a_consumer, "a CpControl Confirm");
+        b.decode_and_dispatch_audio(&confirm).await;
+        let _dropped = take_leg(&mut b_consumer, "a bare ack for a's Confirm");
+        give_up(&mut a);
+        give_up(&mut b);
+        assert_converged(&a, &b, CpMode::LongCp);
+
+        // ── Negotiation 2: must run to completion. ──
+        //
+        // `CpGate` only proposes on a *transition*, and its recommendation is
+        // already `ShortCp`, so a second real transition cannot be produced on
+        // a clean loopback (the measured delay spread is always near zero, so
+        // it can never swing back to `LongCp` first). This replicates exactly
+        // what the real propose-on-transition block does -- send via the
+        // CP-control `ArqTx`, record the seq for G1, transmit the PDU -- which
+        // is precisely the machinery whose state the first failure could have
+        // corrupted.
+        let payload = CpNegotiator::propose_payload(CpMode::ShortCp);
+        let seq = b
+            .cp_control_arq_tx
+            .send(payload.clone(), Instant::now())
+            .expect("the CP-control window must have room after a failed negotiation");
+        b.cp_propose_seq = Some(seq);
+        let (ack_num, ack_bitmap) = b.cp_control_arq_rx.ack_info();
+        let propose2 = TransportPdu::new_cp_control_content(
+            b.arq_session_id,
+            seq,
+            ack_num,
+            ack_bitmap,
+            payload,
+        );
+        let samples = b.engine.encode_bytes(&propose2.to_bytes()).unwrap();
+        b.transmit_samples(&samples).await;
+
+        let propose2_samples = take_leg(&mut b_consumer, "a second CpControl Propose");
+        a.decode_and_dispatch_audio(&propose2_samples).await;
+        let confirm2 = take_leg(&mut a_consumer, "a second CpControl Confirm");
+        b.decode_and_dispatch_audio(&confirm2).await;
+        let bare_ack2 = take_leg(&mut b_consumer, "a second bare ack");
+        a.decode_and_dispatch_audio(&bare_ack2).await;
+        let switched = take_leg(&mut a_consumer, "a CpControl Switched");
+        b.decode_and_dispatch_audio(&switched).await;
+
+        assert_converged(&a, &b, CpMode::ShortCp);
+        assert_eq!(
+            b.cp_negotiator.current(),
+            CpMode::ShortCp,
+            "b's probation must have been disarmed by the third leg"
+        );
+        // Probation is genuinely cancelled, not merely deferred.
+        b.drive_cp_negotiation(Instant::now() + Duration::from_secs(SWITCH_PROBATION_SECS * 2));
+        assert_converged(&a, &b, CpMode::ShortCp);
+    }
+
+    // ── COP-1 remediation: the ShortCp -> LongCp direction, and the fifth
+    //    droppable frame ────────────────────────────────────────────────────
+    //
+    // Every loss-injection test above drives the LongCp -> ShortCp direction
+    // only, which is exactly why neither of the two convergence bugs these
+    // cover was caught: in that direction the pre-negotiation mode IS LongCp,
+    // so `abort()`'s old hardcoded LongCp and `tick()`'s revert-to-previous
+    // were accidentally equivalent. `CpGate` reverts to `CpRecommendation::
+    // LongCp` on any single frame at or above threshold, and the
+    // propose-on-transition block turns that into a real `Propose(LongCp)`, so
+    // the untested direction is a production path -- and the one that runs
+    // exactly when the channel is degrading and legs get lost.
+
+    /// Two real stations with real audio rings and CP negotiation enabled,
+    /// with `cp_gate` left OFF: these tests drive proposals explicitly, so the
+    /// gate must not inject transitions of its own.
+    fn cp_pair() -> (
+        EventLoop,
+        EventLoop,
+        coppa_audio::AudioRingConsumer,
+        coppa_audio::AudioRingConsumer,
+    ) {
+        let mut a = EventLoop::new(cp_enabled_config()).unwrap();
+        let mut b = EventLoop::new(cp_enabled_config()).unwrap();
+        let (a_producer, a_consumer) = coppa_audio::audio_ring(1_000_000);
+        a.set_audio_out(a_producer);
+        let (b_producer, b_consumer) = coppa_audio::audio_ring(1_000_000);
+        b.set_audio_out(b_producer);
+        (a, b, a_consumer, b_consumer)
+    }
+
+    /// Send a real `Propose(mode)` from `b`, replicating exactly what the
+    /// propose-on-transition block does (ARQ send, record the seq for G1,
+    /// transmit the PDU).
+    ///
+    /// Driving it by hand rather than through `CpGate` is unavoidable for a
+    /// *second* negotiation: the gate only proposes on a transition, and on a
+    /// clean loopback the measured delay spread is always near zero, so its
+    /// recommendation can never swing back to `LongCp` to produce one. Same
+    /// reasoning, and the same code, as
+    /// `after_a_failed_negotiation_a_later_negotiation_still_succeeds`.
+    async fn propose_manually(b: &mut EventLoop, mode: CpMode) {
+        let payload = CpNegotiator::propose_payload(mode);
+        let seq = b
+            .cp_control_arq_tx
+            .send(payload.clone(), Instant::now())
+            .expect("the CP-control window must have room for a Propose");
+        b.cp_propose_seq = Some(seq);
+        let (ack_num, ack_bitmap) = b.cp_control_arq_rx.ack_info();
+        let pdu = TransportPdu::new_cp_control_content(
+            b.arq_session_id,
+            seq,
+            ack_num,
+            ack_bitmap,
+            payload,
+        );
+        let samples = b.engine.encode_bytes(&pdu.to_bytes()).unwrap();
+        b.transmit_samples(&samples).await;
+    }
+
+    /// Clear `CoppaCore`'s cross-decode stuck state before a station's second
+    /// or later real decode.
+    ///
+    /// Same workaround, for the same reason, as
+    /// `lost_cp_switched_converges_both_endpoints_on_long_cp` carries inline:
+    /// `CoppaCore` reliably fails every decode after its first one of a
+    /// `CoppaCore::encode_bytes`-built frame (CLAUDE.md's "Bug B", real,
+    /// reproducible, and entirely orthogonal to CP negotiation).
+    /// `set_cp_profile` always rebuilds `self.streaming`, so calling it with
+    /// the station's CURRENT mode is a genuine no-op for the profile that
+    /// nonetheless clears the stuck state -- it can never manufacture the mode
+    /// a test is asserting on.
+    fn unstick_decoder(station: &mut EventLoop) {
+        let mode = station.engine.cp_mode();
+        station.engine.set_cp_profile(mode);
+    }
+
+    /// Drive one COMPLETE, successful negotiation for `mode` -- all six steps,
+    /// real frames through `decode_and_dispatch_audio` on both stations --
+    /// leaving both converged on it with no give-up state armed.
+    async fn negotiate(
+        a: &mut EventLoop,
+        b: &mut EventLoop,
+        a_consumer: &mut coppa_audio::AudioRingConsumer,
+        b_consumer: &mut coppa_audio::AudioRingConsumer,
+        mode: CpMode,
+    ) {
+        propose_manually(b, mode).await;
+        let propose = take_leg(b_consumer, "a CpControl Propose");
+        unstick_decoder(a);
+        a.decode_and_dispatch_audio(&propose).await;
+        let confirm = take_leg(a_consumer, "a CpControl Confirm");
+        unstick_decoder(b);
+        b.decode_and_dispatch_audio(&confirm).await;
+        let bare_ack = take_leg(b_consumer, "a bare ack for the Confirm");
+        unstick_decoder(a);
+        a.decode_and_dispatch_audio(&bare_ack).await;
+        let switched = take_leg(a_consumer, "a CpControl Switched");
+        unstick_decoder(b);
+        b.decode_and_dispatch_audio(&switched).await;
+        let switched_ack = take_leg(b_consumer, "a bare ack for the Switched leg");
+        unstick_decoder(a);
+        a.decode_and_dispatch_audio(&switched_ack).await;
+        assert_converged(a, b, mode);
+        assert_eq!(
+            a.cp_negotiator.pending_switched_seq(),
+            None,
+            "the third leg's ack must have disarmed G4"
+        );
+    }
+
+    /// Retransmit whatever CP-control segments are due, mirroring the real
+    /// retransmit block in `poll_once`.
+    async fn retransmit_cp_control(station: &mut EventLoop) {
+        let now = Instant::now() + Duration::from_secs(60);
+        let seqs = station.cp_control_arq_tx.get_retransmits(now);
+        assert!(
+            !seqs.is_empty(),
+            "test setup: a segment should be due for retransmit"
+        );
+        let (ack_num, ack_bitmap) = station.cp_control_arq_rx.ack_info();
+        for seq in seqs {
+            let Some(data) = station
+                .cp_control_arq_tx
+                .get_segment_data(seq)
+                .map(<[u8]>::to_vec)
+            else {
+                continue;
+            };
+            let pdu = TransportPdu::new_cp_control_content(
+                station.arq_session_id,
+                seq,
+                ack_num,
+                ack_bitmap,
+                data,
+            );
+            let samples = station.engine.encode_bytes(&pdu.to_bytes()).unwrap();
+            station.transmit_samples(&samples).await;
+            station
+                .cp_control_arq_tx
+                .mark_retransmitted(seq, now)
+                .expect("segment should still be in flight");
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_bare_ack_in_the_short_to_long_direction_converges_on_short_cp() {
+        // The desync `abort()`'s hardcoded LongCp caused. Both stations are
+        // settled on ShortCp and negotiating a downshift to LongCp when the
+        // bare ack is lost. `a` gives up via G2, `b` via G3 -- and before the
+        // remediation those two landed on DIFFERENT modes (a: LongCp, because
+        // `abort` forced it; b: ShortCp, because `tick` restored the
+        // pre-switch mode), leaving the link permanently undecodable.
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = cp_pair();
+        negotiate(
+            &mut a,
+            &mut b,
+            &mut a_consumer,
+            &mut b_consumer,
+            CpMode::ShortCp,
+        )
+        .await;
+
+        // ── Negotiation 2: ShortCp -> LongCp, bare ack dropped. ──
+        propose_manually(&mut b, CpMode::LongCp).await;
+        let propose = take_leg(&mut b_consumer, "a second CpControl Propose");
+        unstick_decoder(&mut a);
+        a.decode_and_dispatch_audio(&propose).await;
+        let confirm = take_leg(&mut a_consumer, "a second CpControl Confirm");
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&confirm).await;
+        assert_eq!(
+            b.engine.cp_mode(),
+            CpMode::LongCp,
+            "b applies the proposed mode on receiving the Confirm"
+        );
+
+        let _dropped = take_leg(&mut b_consumer, "a bare ack for the second Confirm");
+
+        give_up(&mut a); // G2
+        give_up(&mut b); // G3
+
+        assert_converged(&a, &b, CpMode::ShortCp);
+
+        // And the link is genuinely ALIVE, not merely consistent.
+        let samples = a.engine.encode_bytes(b"link alive").unwrap();
+        assert_eq!(
+            b.engine
+                .decode_bytes(&samples)
+                .expect("b must decode a's frame after convergence"),
+            b"link alive".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_confirm_in_the_short_to_long_direction_converges_on_short_cp() {
+        // The other half of the same bug: here `a` never switched at all, yet
+        // the old `abort()` still dragged it to LongCp while `b` (G1, also
+        // never switched) stayed on ShortCp.
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = cp_pair();
+        negotiate(
+            &mut a,
+            &mut b,
+            &mut a_consumer,
+            &mut b_consumer,
+            CpMode::ShortCp,
+        )
+        .await;
+
+        propose_manually(&mut b, CpMode::LongCp).await;
+        let propose = take_leg(&mut b_consumer, "a second CpControl Propose");
+        unstick_decoder(&mut a);
+        a.decode_and_dispatch_audio(&propose).await;
+        assert!(a.cp_negotiator.pending_confirm_seq().is_some());
+
+        let _dropped = take_leg(&mut a_consumer, "a second CpControl Confirm");
+
+        give_up(&mut a); // G2
+        give_up(&mut b); // G1
+
+        assert_converged(&a, &b, CpMode::ShortCp);
+    }
+
+    #[tokio::test]
+    async fn a_lost_ack_for_the_third_leg_is_recovered_by_retransmission() {
+        // The FIFTH droppable frame (step 6 of the module doc's six-step
+        // diagram), which the original G1-G4 table did not enumerate.
+        //
+        // `on_peer_switched` disarms b's probation the instant the third leg
+        // arrives, so before the remediation a lost ack left a's G4 to fire
+        // and revert a while b -- with no timer left at all -- stayed on
+        // ShortCp: verbatim the permanent desync COP-1 exists to eliminate,
+        // reintroduced one step later. a's retransmitted third leg could not
+        // re-elicit the ack either, because `ArqRx` swallows an
+        // already-delivered seq before it reaches the ack-sending code.
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = cp_pair();
+
+        propose_manually(&mut b, CpMode::ShortCp).await;
+        let propose = take_leg(&mut b_consumer, "a CpControl Propose");
+        a.decode_and_dispatch_audio(&propose).await;
+        let confirm = take_leg(&mut a_consumer, "a CpControl Confirm");
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&confirm).await;
+        let bare_ack = take_leg(&mut b_consumer, "a bare ack for the Confirm");
+        unstick_decoder(&mut a);
+        a.decode_and_dispatch_audio(&bare_ack).await;
+        let switched = take_leg(&mut a_consumer, "a CpControl Switched");
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&switched).await;
+
+        // DROP b's ack for the third leg.
+        let _dropped = take_leg(&mut b_consumer, "a bare ack for the Switched leg");
+        assert!(
+            a.cp_negotiator.pending_switched_seq().is_some(),
+            "a is still waiting on its third leg (G4 armed)"
+        );
+
+        // a's ARQ retransmits the third leg. b must RE-ACK the duplicate --
+        // that is what makes step 6 recoverable -- without re-running the
+        // `PeerSwitched` action.
+        retransmit_cp_control(&mut a).await;
+        let retx = take_leg(&mut a_consumer, "a retransmitted CpControl Switched");
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&retx).await;
+        let re_ack = take_leg(&mut b_consumer, "b's re-ack for the duplicate Switched");
+        unstick_decoder(&mut a);
+        a.decode_and_dispatch_audio(&re_ack).await;
+
+        assert_eq!(
+            a.cp_negotiator.pending_switched_seq(),
+            None,
+            "the re-ack must resolve a's third leg and disarm G4"
+        );
+        // Converged on the NEW mode: unlike the other four frames, losing this
+        // one does not cost the switch.
+        assert_converged(&a, &b, CpMode::ShortCp);
+
+        // No give-up can still fire on either side.
+        give_up(&mut a);
+        give_up(&mut b);
+        assert_converged(&a, &b, CpMode::ShortCp);
+    }
+
+    #[tokio::test]
+    async fn a_full_cp_control_window_at_the_third_leg_reverts_instead_of_stranding() {
+        // `send_cp_switched`'s window-full arm used to only log. By then the
+        // caller has already committed the engine to the new profile (it must
+        // -- the third leg is encoded under it), so returning left the station
+        // switched with no tracked leg, hence no `pending_switched_seq`, hence
+        // no G4 that could ever fire: an unbounded wait, silently.
+        let mut a = EventLoop::new(cp_enabled_config()).unwrap();
+        let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
+        a.set_audio_out(producer);
+
+        // Put `a` in the real state right after its Confirm was acked.
+        a.cp_negotiator.track_pending_confirm(9, CpMode::ShortCp);
+        assert_eq!(
+            a.cp_negotiator.on_confirm_acked(&[9]),
+            Some(CpMode::ShortCp)
+        );
+        a.engine.set_cp_profile(CpMode::ShortCp);
+
+        // Fill the two-slot CP-control window so the third leg cannot be sent.
+        while a
+            .cp_control_arq_tx
+            .send(vec![0xEE, 0x00], Instant::now())
+            .is_ok()
+        {}
+
+        a.send_cp_switched(0, CpMode::ShortCp, Instant::now()).await;
+
+        assert_eq!(
+            a.engine.cp_mode(),
+            CpMode::LongCp,
+            "a must walk its ENGINE back rather than sit on a profile it never announced"
+        );
+        assert_eq!(a.cp_negotiator.current(), CpMode::LongCp);
+        assert_eq!(
+            a.cp_negotiator.pending_switched_seq(),
+            None,
+            "nothing is pending, so nothing is silently waiting on a G4 that cannot arm"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_restores_the_engine_to_long_cp_not_just_the_negotiator() {
+        // The Reset arm rebuilds `cp_negotiator` (whose fresh `current` is
+        // LongCp) but used to leave the ENGINE wherever it was -- so a Reset
+        // arriving at an already-switched station left bookkeeping and engine
+        // disagreeing, the same class of desync this ticket exists to fix,
+        // just reached by a different route.
+        let mut event_loop = EventLoop::new(cp_enabled_config()).unwrap();
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+        event_loop.arq_rx = Some(ArqRx::new(8));
+        event_loop
+            .cp_negotiator
+            .apply_as_confirmer(CpMode::ShortCp, Instant::now());
+        event_loop.engine.set_cp_profile(CpMode::ShortCp);
+        assert_eq!(event_loop.engine.cp_mode(), CpMode::ShortCp);
+
+        // A real Reset PDU must be encoded under the profile the station is
+        // actually listening on, which is now ShortCp.
+        let reset_pdu = TransportPdu::new_reset(0);
+        event_loop
+            .decode_and_dispatch_audio(&peer_frame(
+                &reset_pdu,
+                coppa_codec::ofdm::CoppaProfile::hf_standard_short_cp(),
+            ))
+            .await;
+
+        assert_eq!(event_loop.cp_negotiator.current(), CpMode::LongCp);
+        assert_eq!(
+            event_loop.engine.cp_mode(),
+            CpMode::LongCp,
+            "a Reset must restore the ENGINE too, not just the negotiator"
+        );
+        assert_eq!(event_loop.cp_propose_seq, None);
+    }
+
+    // ── COP-1 remediation round 2: one negotiation at a time, and every
+    //    tracked leg reclaimed ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_second_cp_gate_transition_does_not_orphan_the_first_propose() {
+        // `cp_propose_seq` used to be overwritten unconditionally. G1 watches
+        // exactly one seq, `get_retransmits` stops retrying past the budget but
+        // never evicts, and only `abandon` evicts -- so the displaced seq parked
+        // at `send_base` forever, permanently consuming one of the CP-control
+        // pair's two slots. A second failure would then wedge the pair
+        // completely.
+        let (_a, mut b, _a_consumer, mut b_consumer) = cp_pair_at_propose().await;
+        let first = b
+            .cp_propose_seq
+            .expect("test setup: b has a real Propose in flight");
+        let _propose = take_leg(&mut b_consumer, "the first CpControl Propose");
+        assert_eq!(b.cp_control_arq_tx.in_flight(), 1);
+
+        // Force `CpGate` back to LongCp ("drop fast" -- one frame at or above
+        // threshold), directly rather than through a decode, because a clean
+        // loopback's measured delay spread is always near zero and can never
+        // produce that swing on its own. The transition being tested is the
+        // one BACK to ShortCp, which is driven through the real decode path.
+        assert_eq!(b.cp_gate.observe(50.0), CpRecommendation::LongCp);
+        trip_cp_gate(&mut b).await;
+
+        assert_eq!(
+            b.cp_propose_seq,
+            Some(first),
+            "the in-flight negotiation's seq must survive the second transition"
+        );
+        assert_eq!(
+            b.cp_control_arq_tx.in_flight(),
+            1,
+            "and no second slot may be consumed"
+        );
+
+        // The one negotiation still gives up cleanly and hands the WHOLE
+        // window back -- which is the property the orphan destroyed.
+        give_up(&mut b);
+        assert_eq!(b.cp_propose_seq, None);
+        assert_eq!(b.cp_control_arq_tx.in_flight(), 0);
+        assert!(b.cp_control_arq_tx.can_send());
+    }
+
+    #[tokio::test]
+    async fn an_inbound_propose_while_our_own_is_in_flight_is_dropped_unacked() {
+        // The other half of the re-entrancy guard. One `CpNegotiator` per
+        // daemon means a station holding both roles runs them through the same
+        // single-slot state. Dropping the inbound Propose WITHOUT an ack is
+        // deliberate: the peer's G1 then fires, whereas acking would clear its
+        // `cp_propose_seq` and leave it waiting on a Confirm forever with no
+        // trigger at all.
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = cp_pair();
+
+        // Both stations propose at once -- what two `CpGate`s transitioning
+        // over the same channel really produce.
+        propose_manually(&mut a, CpMode::ShortCp).await;
+        propose_manually(&mut b, CpMode::ShortCp).await;
+        let a_propose = take_leg(&mut a_consumer, "a's Propose");
+        let b_propose = take_leg(&mut b_consumer, "b's Propose");
+
+        unstick_decoder(&mut a);
+        a.decode_and_dispatch_audio(&b_propose).await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&a_propose).await;
+
+        for (station, who) in [(&a, "a"), (&b, "b")] {
+            assert_eq!(
+                station.cp_negotiator.pending_confirm_seq(),
+                None,
+                "{who} must not have taken on the confirmer role too"
+            );
+            assert_eq!(
+                station.cp_control_arq_tx.in_flight(),
+                1,
+                "{who} must still hold only its own Propose"
+            );
+        }
+        let mut buf = vec![0.0f32; 1_000_000];
+        assert_eq!(
+            a_consumer.read(&mut buf),
+            0,
+            "a must not have transmitted anything in reply -- not even a bare ack"
+        );
+        assert_eq!(b_consumer.read(&mut buf), 0, "nor must b");
+
+        // Both converge on the mode they already agreed on, with the window
+        // fully released so the next CpGate transition can propose again.
+        give_up(&mut a);
+        give_up(&mut b);
+        assert_converged(&a, &b, CpMode::LongCp);
+        assert!(a.cp_control_arq_tx.can_send());
+        assert!(b.cp_control_arq_tx.can_send());
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_propose_is_not_re_acked_so_the_peer_s_g1_still_fires() {
+        // The duplicate re-ack that rescues step 6 is restricted to
+        // `CpSwitched`. Re-acking a retransmitted Propose would clear the
+        // peer's `cp_propose_seq`, disarming the G1 the module doc's
+        // convergence table depends on for the "`Confirm` lost" row.
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = cp_pair();
+
+        propose_manually(&mut b, CpMode::ShortCp).await;
+        let propose = take_leg(&mut b_consumer, "a CpControl Propose");
+        a.decode_and_dispatch_audio(&propose).await;
+        // DROP a's Confirm, so b keeps retransmitting its Propose.
+        let _dropped = take_leg(&mut a_consumer, "a CpControl Confirm");
+
+        retransmit_cp_control(&mut b).await;
+        let retx = take_leg(&mut b_consumer, "a retransmitted CpControl Propose");
+        unstick_decoder(&mut a);
+        a.decode_and_dispatch_audio(&retx).await;
+
+        let mut buf = vec![0.0f32; 1_000_000];
+        assert_eq!(
+            a_consumer.read(&mut buf),
+            0,
+            "a must stay silent: the duplicate is neither re-acked nor re-confirmed"
+        );
+        assert!(
+            b.cp_propose_seq.is_some(),
+            "b's G1 must still be armed -- an ack here would have disarmed it"
+        );
+
+        give_up(&mut a); // G2
+        give_up(&mut b); // G1
+        assert_converged(&a, &b, CpMode::LongCp);
+    }
+
+    #[tokio::test]
+    async fn a_cp_switched_we_are_not_awaiting_is_not_acked() {
+        // `on_peer_switched` ignores a leg naming a mode other than the
+        // probation target (or arriving with no probation armed), but the
+        // daemon acked it anyway and logged "handshake complete". That ack
+        // resolves the sender's G4 while this station's own probation stays
+        // armed to revert it seconds later -- the permanent desync COP-1
+        // exists to eliminate, reached one step further along.
+        let mut b = EventLoop::new(cp_enabled_config()).unwrap();
+        let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
+        b.set_audio_out(producer);
+
+        let t0 = Instant::now();
+        b.cp_negotiator.apply_as_confirmer(CpMode::ShortCp, t0);
+        b.engine.set_cp_profile(CpMode::ShortCp);
+
+        // A third leg naming LongCp -- a mode b never switched to.
+        let stale = TransportPdu::new_cp_control_content(
+            b.arq_session_id,
+            0,
+            0,
+            0,
+            CpNegotiator::switched_payload(CpMode::LongCp),
+        );
+        b.decode_and_dispatch_audio(&peer_frame(
+            &stale,
+            coppa_codec::ofdm::CoppaProfile::hf_standard_short_cp(),
+        ))
+        .await;
+
+        let mut buf = vec![0.0f32; 1_000_000];
+        assert_eq!(
+            consumer.read(&mut buf),
+            0,
+            "a rejected leg must not be acked -- the sender's G4 has to fire"
+        );
+        // And b's own safety net is untouched: probation still reverts it.
+        b.drive_cp_negotiation(t0 + Duration::from_secs(SWITCH_PROBATION_SECS + 1));
+        assert_eq!(b.cp_negotiator.current(), CpMode::LongCp);
+        assert_eq!(b.engine.cp_mode(), CpMode::LongCp);
+    }
+
+    #[tokio::test]
+    async fn a_retransmitted_cp_switched_we_rejected_is_still_not_acked() {
+        // The duplicate-CpSwitched re-ack path (rescuing a lost ack for step
+        // 6, see the module doc) tested only the payload KIND, never whether
+        // `on_peer_switched` would actually accept the leg -- so it re-granted
+        // exactly the ack `a_cp_switched_we_are_not_awaiting_is_not_acked`
+        // above proves the first-reception path deliberately withholds. The
+        // sender then never sees its G4 fire, and the two stations can strand
+        // on different profiles forever. This reproduces that exact sequence:
+        // reject on first arrival, then the peer's own retransmission (ARQ
+        // resends until acked) must land in the *duplicate* path and still be
+        // rejected, not silently re-acked the second time around.
+        let mut b = EventLoop::new(cp_enabled_config()).unwrap();
+        let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
+        b.set_audio_out(producer);
+
+        let t0 = Instant::now();
+        b.cp_negotiator.apply_as_confirmer(CpMode::ShortCp, t0);
+        b.engine.set_cp_profile(CpMode::ShortCp);
+
+        // A third leg naming LongCp -- a mode b never switched to. Same
+        // fixture as the sibling test above.
+        let stale = TransportPdu::new_cp_control_content(
+            b.arq_session_id,
+            0,
+            0,
+            0,
+            CpNegotiator::switched_payload(CpMode::LongCp),
+        );
+        let frame = peer_frame(
+            &stale,
+            coppa_codec::ofdm::CoppaProfile::hf_standard_short_cp(),
+        );
+
+        // First reception: rejected via the non-duplicate on_peer_switched path.
+        b.decode_and_dispatch_audio(&frame).await;
+
+        // The sender never saw an ack, so it retransmits the identical PDU
+        // (same seq) -- ArqRx has already delivered that seq once, so this
+        // lands in the duplicate branch this fix covers.
+        b.decode_and_dispatch_audio(&frame).await;
+
+        let mut buf = vec![0.0f32; 1_000_000];
+        assert_eq!(
+            consumer.read(&mut buf),
+            0,
+            "the retransmitted rejected leg must not be acked either -- re-acking it \
+             would resolve the sender's G4 while b's own probation stays armed to \
+             revert it, stranding the two stations on different profiles"
+        );
+        // b's own safety net is still untouched: probation still reverts it.
+        b.drive_cp_negotiation(t0 + Duration::from_secs(SWITCH_PROBATION_SECS + 1));
+        assert_eq!(b.cp_negotiator.current(), CpMode::LongCp);
+        assert_eq!(b.engine.cp_mode(), CpMode::LongCp);
+    }
+
+    #[tokio::test]
+    async fn giving_up_reclaims_a_co_pending_confirm_not_just_the_failed_leg() {
+        // G4's `abort()` clears `pending_confirm`, so reading
+        // `pending_confirm_seq()` afterwards -- as the old separate G2 block
+        // did -- found `None` and never abandoned that segment, leaking the
+        // very window slot G2 exists to reclaim. Reachable whenever one
+        // station holds both roles (see `cp_negotiator`'s "One negotiation at
+        // a time" residual).
+        let mut a = EventLoop::new(cp_enabled_config()).unwrap();
+        let now = Instant::now();
+
+        let confirm_seq = a
+            .cp_control_arq_tx
+            .send(vec![0x02, CpMode::ShortCp.to_wire()], now)
+            .unwrap();
+        a.cp_negotiator
+            .track_pending_confirm(confirm_seq, CpMode::ShortCp);
+        let switched_seq = a
+            .cp_control_arq_tx
+            .send(CpNegotiator::switched_payload(CpMode::ShortCp), now)
+            .unwrap();
+        a.cp_negotiator.track_pending_switched(switched_seq);
+        a.engine.set_cp_profile(CpMode::ShortCp);
+        assert_eq!(a.cp_control_arq_tx.in_flight(), 2, "both slots occupied");
+
+        // Only the third leg exhausts its budget; the Confirm is still live.
+        exhaust_retransmits(&mut a.cp_control_arq_tx, switched_seq);
+        assert!(!a.cp_control_arq_tx.is_failed(confirm_seq));
+
+        a.drive_cp_negotiation(Instant::now());
+
+        assert_eq!(a.cp_negotiator.pending_switched_seq(), None);
+        assert_eq!(a.cp_negotiator.pending_confirm_seq(), None);
+        assert_eq!(
+            a.cp_control_arq_tx.in_flight(),
+            0,
+            "giving up must abandon EVERY tracked leg, not just the failed one"
+        );
+        assert!(a.cp_control_arq_tx.can_send());
+        assert_eq!(
+            a.engine.cp_mode(),
+            CpMode::LongCp,
+            "and the engine walks back exactly once, to the pre-negotiation mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_arq_retransmits_drives_the_give_up_when_negotiation_is_enabled() {
+        // The only production call site of `drive_cp_negotiation` was never
+        // exercised with `cp_negotiation_enabled = true`: every give-up test
+        // calls it directly with an injected Instant. The ordering contract
+        // the call site asserts -- the give-up runs AFTER the retransmit
+        // block, so a segment spends its full budget this tick before
+        // `is_failed` is consulted -- was therefore unverified, and a refactor
+        // could have dropped the call with the whole COP-1 suite still green.
+        let mut b = EventLoop::new(cp_enabled_config()).unwrap();
+        let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
+        b.set_audio_out(producer);
+
+        let seq = b
+            .cp_control_arq_tx
+            .send(
+                CpNegotiator::propose_payload(CpMode::ShortCp),
+                Instant::now(),
+            )
+            .unwrap();
+        b.cp_propose_seq = Some(seq);
+        // One attempt short of the budget: only the retransmit block running
+        // first can push it over, so this also pins the ordering.
+        for _ in 0..coppa_protocol::arq::DEFAULT_MAX_RETRANSMIT - 1 {
+            b.cp_control_arq_tx
+                .mark_retransmitted(seq, Instant::now() - Duration::from_secs(600))
+                .unwrap();
+        }
+        assert!(!b.cp_control_arq_tx.is_failed(seq), "test setup: not yet");
+
+        b.check_arq_retransmits().await;
+
+        assert_eq!(
+            b.cp_propose_seq, None,
+            "the real poll must retransmit, exhaust the budget, and then fire G1"
+        );
+        assert_eq!(b.cp_control_arq_tx.in_flight(), 0);
     }
 
     #[test]
@@ -3346,9 +5053,10 @@ mod tests {
         // before the Reset, so the Reset arm's extension (Finding 5) has
         // something meaningful to actually clear -- otherwise this test
         // proves nothing about that code path.
-        event_loop
-            .cp_negotiator
-            .apply_as_confirmer(coppa_protocol::cp_negotiator::CpMode::ShortCp);
+        event_loop.cp_negotiator.apply_as_confirmer(
+            coppa_protocol::cp_negotiator::CpMode::ShortCp,
+            Instant::now(),
+        );
         event_loop
             .cp_control_arq_tx
             .send(b"warm up the cp-control seq space".to_vec(), Instant::now())
