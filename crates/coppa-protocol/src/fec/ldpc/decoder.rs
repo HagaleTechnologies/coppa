@@ -522,6 +522,9 @@ impl NrBg2Decoder {
                             for (offset, i) in range.enumerate() {
                                 let var = var_start + offset;
                                 let extrinsic = total_llr[var] - check_to_var[message_base + i];
+                                // Bit-exactness contract: keep `.abs()`, `>= 0.0`, strict `<`,
+                                // ascending k, and the original arithmetic order. In particular,
+                                // a sign-select replacement for `.abs()` diverges on -0.0.
                                 let sign = if extrinsic >= 0.0 { 1.0 } else { -1.0 };
                                 total_sign[i] *= sign;
                                 let magnitude = extrinsic.abs();
@@ -886,6 +889,41 @@ mod nr_bg2_decoder_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn nr_bg2_check_syndrome_matches_reference_on_random_hard_vectors() {
+        let decoder = NrBg2Decoder::new();
+        let n = nr_bg2::BASE_COLS * nr_bg2::ZC;
+        let mut state = 0xC0FF_EE12_3456_789Au64;
+        let mut saw_valid = false;
+        let mut saw_invalid = false;
+        for trial in 0..200 {
+            let mut hard = vec![0u8; n];
+            if trial != 0 {
+                for bit in &mut hard {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    *bit = (state % 31 == 0) as u8;
+                }
+            }
+            let expected = (0..nr_bg2::BASE_ROWS).all(|row| {
+                (0..nr_bg2::ZC).all(|i| {
+                    nr_bg2::ENTRIES.iter().filter(|&&(r, _, _)| r == row).fold(
+                        0u8,
+                        |syn, &(_, column, shift)| {
+                            syn ^ hard[column * nr_bg2::ZC + (i + shift) % nr_bg2::ZC]
+                        },
+                    ) == 0
+                })
+            });
+            let actual = decoder.check_syndrome(&hard);
+            saw_valid |= actual;
+            saw_invalid |= !actual;
+            assert_eq!(actual, expected, "trial {trial}");
+        }
+        assert!(saw_valid && saw_invalid);
     }
 
     fn full_codeword_llrs(
