@@ -414,6 +414,14 @@ fn timing_and_iterations(level: u8, ldpc: &NrLdpc, snr_db: f32, trials: usize) -
         dematched
     };
 
+    // This older gate is retained for its FER/OFDM checks, but its timing
+    // output is superseded by `ldpc_decode_timing`, which also pins realistic
+    // payload bits. Warm both allocators here so this diagnostic no longer
+    // contradicts that canonical CPU instrument merely because it starts cold.
+    for _ in 0..50 {
+        std::hint::black_box(old_codec.decode_checked(std::hint::black_box(&old_llrs)));
+        std::hint::black_box(ldpc.decode_soft_stats(std::hint::black_box(&new_dematched)));
+    }
     let t0 = Instant::now();
     for _ in 0..trials {
         std::hint::black_box(old_codec.decode_checked(std::hint::black_box(&old_llrs)));

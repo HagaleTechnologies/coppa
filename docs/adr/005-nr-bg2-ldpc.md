@@ -105,11 +105,15 @@ Coppa's speed ladder needs; BG1 targets larger transport blocks Coppa has no use
   | ratio | 1.48x | 3.45x | 1.69x | 2.29x | 4.33x | 3.34x | 2.54x | 3.66x | 2.80x |
   | verdict | met | NOT met | met | met | NOT met | NOT met | met | NOT met | met |
 
-  The worst level is 5 (old rate 2/3) at 4.33x. The safe contiguous reformulation reduced the
-  reconstructed marginal iteration cost about 11% (302.8 to 270.97 us/iteration); a measured
+  Levels 5 and 9 (both old rate 2/3) are tied within run variation at roughly 4.1-4.3x. The
+  apparent shift from the older published 3.5x-9.5x range is predominantly a benchmark-method
+  correction (warm-up plus pinned realistic payloads), not a code-driven multi-fold speedup.
+  The forced-iteration fit has a physically impossible negative intercept, so it does not support
+  the former single-number ~11% marginal-cost claim. A measured
   extrinsic-scratch/scale-hoist follow-up regressed to 301.31 us/iteration and was reverted. The
-  remaining gap is structural: the shared graph no longer shrinks for high-rate levels the way
-  per-rate graphs used to. See `BENCHMARKS.md`'s “COP-6 LDPC decode CPU” section for absolute
+  remaining gap is structural for this implementation: the shared graph no longer shrinks for
+  high-rate levels the way per-rate graphs used to. Reusable decoder scratch buffers are an
+  untried safe/portable follow-up. See `BENCHMARKS.md`'s “COP-6 LDPC decode CPU” section for absolute
   per-level timings and the corrected fixed-cost/wrapper-overhead interpretations. The original
   investigation also caught and fixed a real correctness
   bug this same investigation caught and fixed: an alpha value calibrated at level 2 only broke

@@ -35,11 +35,13 @@ Two measured gaps against the change's own acceptance targets were kept open
 rather than hidden: (1) the coding gain at matched rate/block-length is real
 but smaller than predicted (+0.5 dB measured vs ~1.8 dB predicted at level 2;
 a layered-vs-flooding A/B ruled out a decoder-schedule bug — believed to be a
-finite-length effect); (2) after COP-6's safe contiguous sub-row rewrite and
-271 KiB index-table deletion, decode CPU/frame is 1.48–4.33x the old codec
+finite-length effect); (2) the corrected warm, realistic-payload instrument
+measures decode CPU/frame at 1.48–4.33x the old codec
 (levels 1/2/3/4/5/6/7/9/10: 1.48/3.45/1.69/2.29/4.33/3.34/2.54/3.66/2.80x;
-budget ≤3x; levels 1/3/4/7/10 met, 2/5/6/9 did not). The worst is level 5,
-whose old codec used rate 2/3.
+budget ≤3x; levels 1/3/4/7/10 met, 2/5/6/9 did not). The improvement from
+the older 3.5–9.5x report is predominantly a measurement correction (warm-up
+and pinned realistic payloads), not a code-driven multi-fold speedup. Levels 5
+and 9, whose old codecs used rate 2/3, are tied within run variation.
 The shared graph no longer shrinks at high rates; a measured scalar follow-up
 regressed and was reverted, leaving a structural safe-portable ceiling.
 

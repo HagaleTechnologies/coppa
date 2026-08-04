@@ -112,29 +112,30 @@ fn time_level(level: u8, snr_db: f32, payload_bits: usize) -> (f64, f64, f64, u6
         black_box(old.decode_checked(black_box(&old_llrs)));
         black_box(new.decode_soft_stats(black_box(&new_llrs)));
     }
-    let calls = 300;
     let start = Instant::now();
     let mut old_sum = 0u64;
-    for _ in 0..calls {
+    for _ in 0..CALLS {
         let result = old.decode_checked(black_box(&old_llrs));
+        assert!(result.1, "old decoder did not converge at level {level}");
         old_sum = old_sum.wrapping_add(checksum(&result.0, result.1));
         black_box(&result);
     }
-    let old_us = start.elapsed().as_secs_f64() * 1e6 / calls as f64;
+    let old_us = start.elapsed().as_secs_f64() * 1e6 / CALLS as f64;
     let start = Instant::now();
     let mut new_sum = 0u64;
     let mut iterations = 0usize;
-    for _ in 0..calls {
+    for _ in 0..CALLS {
         let result = new.decode_soft_stats(black_box(&new_llrs));
+        assert!(result.2, "new decoder did not converge at level {level}");
         iterations += result.3;
         new_sum = new_sum.wrapping_add(checksum(&result.1, result.2));
         black_box(&result);
     }
-    let new_us = start.elapsed().as_secs_f64() * 1e6 / calls as f64;
+    let new_us = start.elapsed().as_secs_f64() * 1e6 / CALLS as f64;
     (
         old_us,
         new_us,
-        iterations as f64 / calls as f64,
+        iterations as f64 / CALLS as f64,
         old_sum,
         new_sum,
     )

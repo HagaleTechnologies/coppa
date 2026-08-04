@@ -438,10 +438,15 @@ impl NrBg2Decoder {
                 "base row {r} degree {} is outside 3..={NR_MAX_ROW_DEGREE}",
                 row_edges.len()
             );
-            for (i, &(col, _)) in row_edges.iter().enumerate() {
+            for (i, &(col, shift)) in row_edges.iter().enumerate() {
                 assert!(
                     row_edges[..i].iter().all(|&(other, _)| other != col),
                     "base row {r} repeats base column {col}; layered sub-rows are not independent"
+                );
+                assert!(
+                    shift < nr_bg2::ZC,
+                    "base row {r}, column {col} shift {shift} is not reduced modulo Zc={}",
+                    nr_bg2::ZC
                 );
             }
             rows.push(NrRowSpan {
@@ -939,26 +944,10 @@ mod nr_bg2_decoder_tests {
         assert!(saw_valid && saw_invalid);
     }
 
-    #[test]
-    fn hoisted_scale_matches_unhoisted_on_boundary_magnitudes() {
-        let magnitudes = [
-            0.0f32, -0.0, 1e-30, 1.0, 63.999_996, 64.0, 85.333_336, 128.0,
-        ];
-        for magnitude in magnitudes {
-            for sign in [1.0f32, -1.0] {
-                assert_eq!(
-                    ((sign * magnitude) * NR_DEFAULT_SCALE).to_bits(),
-                    (sign * (magnitude * NR_DEFAULT_SCALE)).to_bits(),
-                    "magnitude={magnitude:?}, sign={sign}"
-                );
-            }
-        }
-    }
-
     /// Slow, release-only equivalence tier. Manual mutation checks must make
     /// this test or `nr_bg2_bitexact_matches_reference_fast` fail: replacing
     /// `.abs()` with sign-select, changing strict `<` to `<=`, changing the
-    /// scale, reassociating the posterior update, or dropping either clamp.
+    /// scale, or dropping either clamp.
     #[test]
     #[ignore = "512 full BG2 reference/production decodes; run in release mode"]
     fn nr_bg2_decode_is_bit_identical_to_reference_exhaustive() {
