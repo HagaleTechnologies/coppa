@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-07-15T04:29:05Z",
-  "head_commit": "8b55a76",
+  "generated_at": "2026-08-02T05:30:43Z",
+  "head_commit": "75fb995",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -289,7 +289,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:e91e865efabdb6821f9b4953e338f59c417a3fb7538e5cd4a7ea32678dcf699a",
+      "hash": "sha256:54b9682dc09c9d2d9dfd79eb25cc946cafee4ac2ca869c76bf06023499a9bf6d",
       "id": "cp-negotiation-gotchas",
       "kind": "gotcha",
       "links": [
