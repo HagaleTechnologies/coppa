@@ -69,10 +69,6 @@ jobs:
           # PAT under an account Codex already recognizes, stored as an org
           # secret, used ONLY to post this one comment.
           GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
-          # Read-only fallback, always available even to a fork PR (unlike
-          # CODEX_REVIEW_PAT) — used ONLY for the fork-discovery path below,
-          # never for posting.
-          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
         run: |
@@ -85,31 +81,27 @@ jobs:
           # blocking a fork contributor's re-push behind a hard failure
           # instead of just skipping the re-review request (Codex P1,
           # flagged reviewing this file).
+          #
+          # DELIBERATELY NOT auto-discovering a maintainer's manual `@codex
+          # review` comment here: an earlier version of this fix tried that
+          # (a REST lookup + node_id capture) and Codex's review of THAT fix
+          # found three more real gaps in it — unpaginated (misses anything
+          # past GitHub's default 30-comment page), one-shot (a comment added
+          # during the 70-minute wait is never seen), and its knock-on effect
+          # on the error-comment check below. Chasing that kept spawning new
+          # edge cases in a path this repo is unlikely to ever exercise (a
+          # private repo with a single admin taking no outside fork PRs
+          # today). Accepted, deliberate scope limit instead: on a fork
+          # re-push, the poll step still catches a formal review tied to
+          # HEAD_SHA with zero extra code (that path never needed a captured
+          # comment id). The one case this doesn't cover — Codex's clean-pass
+          # landing ONLY as a reaction on a maintainer's own manually-posted
+          # comment, never a formal review — degrades to the 70-minute
+          # timeout, at which point the repo's admin-only bypass (configured
+          # on every HagaleTechnologies ruleset) is the intended way through,
+          # not more automation for a rare path.
           if [ -z "$GH_TOKEN" ]; then
-            echo "CODEX_REVIEW_PAT not available (fork PR, or secret unset) — skipping the fresh re-review request."
-            # Don't just give up: a maintainer may already have left a manual
-            # `@codex review` comment themselves (the trigger works fine from
-            # a real human account regardless of fork status). Discover it
-            # with the always-available read-only token and capture its
-            # node_id, so the poll step's comment-reaction signal still has
-            # something to check — otherwise a fork re-push was GUARANTEED to
-            # burn the full 70-minute timeout with zero chance of success,
-            # even when a maintainer did everything right (Codex P2, flagged
-            # reviewing this file).
-            RUN_STARTED_LOCAL=$(cat /tmp/codex-run-started.txt 2>/dev/null || echo "")
-            found=$(GH_TOKEN="$FALLBACK_TOKEN" gh api "repos/$REPO/issues/$PR/comments" \
-              | jq --arg since "$RUN_STARTED_LOCAL" '
-                  [.[] | select(.body | test("@codex review"; "i"))
-                       | select(.user.type != "Bot")
-                       | select(.created_at >= $since)]
-                  | sort_by(.created_at) | last // empty')
-            node_id=$(echo "$found" | jq -r '.node_id // empty')
-            if [ -n "$node_id" ]; then
-              echo "$node_id" > /tmp/codex-review-comment-id.json
-              echo "Found a manual @codex review request from $(echo "$found" | jq -r '.user.login // "a maintainer"') — polling will watch for a response to it."
-            else
-              echo "No manual @codex review request found yet — polling will still catch a formal review tied to this head if a maintainer requests one before the timeout."
-            fi
+            echo "CODEX_REVIEW_PAT not available (fork PR, or secret unset) — skipping the fresh re-review request. A formal Codex review tied to this head still resolves the check normally; a maintainer can otherwise use the repo's admin bypass."
             exit 0
           fi
 
@@ -219,7 +211,7 @@ jobs:
                 }
               }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" -F hasComment="$HAS_COMMENT" -f commentId="${COMMENT_ID:-placeholder}" \
               | jq --arg since "$RUN_STARTED" --arg sha "$HEAD_SHA" '
-                def is_error_shaped: test("(quota|rate.?limit|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start))"; "i");
+                def is_error_shaped: test("(quota|rate.?limit|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start)|create a codex account and connect)"; "i");
                 .data.repository.pullRequest as $p
                 | ([$p.comments.nodes[] | select(.author.login=="chatgpt-codex-connector" and .createdAt >= $since)]) as $fresh_comments
                 | {
@@ -234,20 +226,6 @@ jobs:
             reviews=$(echo "$poll" | jq '.reviews')
             thumbsup=$(echo "$poll" | jq '.thumbsup')
             comment_thumbsup=$(echo "$poll" | jq '.comment_thumbsup')
-            if [ "$error_comments" -gt 0 ]; then
-              # Codex replies with an issue comment for its own failures too
-              # (auth/workspace/quota errors), which previously satisfied the
-              # non-sync "any comment counts" branch below and turned this
-              # required check green with no actual review ever happening
-              # (Codex P2, flagged reviewing this file). Fail loudly and
-              # immediately instead of either silently accepting it as success
-              # OR silently waiting out the remaining timeout hoping for a
-              # different signal — Tony's own directive: don't waste wall-
-              # clock time on a wait that a Codex-reported error already
-              # tells us won't resolve itself.
-              echo "::error::Codex reported an error (quota/auth/workspace) instead of reviewing $HEAD_SHA — failing now rather than waiting out the remaining timeout. Re-run this check once the underlying Codex issue is resolved."
-              exit 1
-            fi
             if [ "$reviews" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ]; then
               # A 👍 on the @codex-review comment itself is just as tightly
               # scoped to "responded to THIS request" as a formal review tied
@@ -266,13 +244,36 @@ jobs:
               # ever arriving (Codex P1, flagged reviewing this file). Only
               # accept the two signals that are provably tied to this
               # specific request: a review against HEAD_SHA, or a reaction on
-              # the comment that requested it.
+              # the comment that requested it. `error_comments` is
+              # deliberately NOT checked on this branch — it exists only to
+              # keep a bare error comment from satisfying the non-sync
+              # "any comment counts" condition below, and an unscoped error
+              # from some earlier, unrelated request must not fail the
+              # CURRENT push's own still-pending signal (Codex P2, flagged
+              # reviewing this file).
               if [ "$reviews" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ]; then
                 echo "Codex responded on this revision: reviews=$reviews comment_thumbsup=$comment_thumbsup"
                 responded=1
                 break
               fi
             else
+              if [ "$error_comments" -gt 0 ]; then
+                # Codex replies with an issue comment for its own failures too
+                # (auth/workspace/quota/account-connection errors), which
+                # would otherwise satisfy the "any comment counts" condition
+                # just below and turn this required check green with no
+                # actual review ever happening (Codex P2, flagged reviewing
+                # this file). Only reachable here (never on a re-push, see
+                # above) since this is the one branch that treats a bare
+                # comment as a success signal at all. Fail loudly and
+                # immediately rather than either accepting it as success OR
+                # silently waiting out the remaining timeout for a different
+                # signal — Tony's own directive: don't waste wall-clock time
+                # on a wait that a Codex-reported error already tells us
+                # won't resolve itself.
+                echo "::error::Codex reported an error (quota/auth/workspace/account-connection) instead of reviewing $HEAD_SHA — failing now rather than waiting out the remaining timeout. Re-run this check once the underlying Codex issue is resolved."
+                exit 1
+              fi
               if [ "$comments" -gt 0 ] || [ "$reviews" -gt 0 ] || [ "$thumbsup" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ]; then
                 echo "Codex responded on this revision: comments=$comments reviews=$reviews thumbsup=$thumbsup comment_thumbsup=$comment_thumbsup"
                 responded=1
