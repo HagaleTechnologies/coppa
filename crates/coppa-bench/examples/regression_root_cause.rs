@@ -19,11 +19,12 @@
 //!
 //! Run: `cargo run --release -p coppa-bench --example regression_root_cause`
 
+use coppa_bench::metrics::FailureCounts;
 use coppa_bench::scenario::mode_for_level;
 use coppa_channel::watterson::{watterson, Tap, WattersonConfig, WattersonPreset};
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_codec::ofdm::CoppaProfile;
-use coppa_protocol::modem::transceiver::{CoppaTransceiver, ReceiveError};
+use coppa_protocol::modem::transceiver::CoppaTransceiver;
 
 const LEVEL: u8 = 2;
 const TRIALS: usize = 400;
@@ -55,22 +56,6 @@ fn flat_config(doppler_spread_hz: f32) -> WattersonConfig {
     }
 }
 
-#[derive(Default)]
-struct Outcomes {
-    ok: usize,
-    sync_fail: usize,
-    header_fail: usize,
-    ldpc_fail: usize,
-    crc_fail: usize,
-    wrong_codeword: usize,
-}
-
-impl Outcomes {
-    fn fer(&self) -> f64 {
-        1.0 - self.ok as f64 / TRIALS as f64
-    }
-}
-
 fn run(
     tx: &CoppaTransceiver,
     clean: &[f32],
@@ -78,8 +63,8 @@ fn run(
     snr_db: f32,
     cfg: Option<&WattersonConfig>,
     seed_base: u64,
-) -> Outcomes {
-    let mut o = Outcomes::default();
+) -> FailureCounts {
+    let mut o = FailureCounts::default();
     for t in 0..TRIALS {
         let seed = seed_base.wrapping_add(t as u64);
         let (faded, clean_power) = match cfg {
@@ -91,19 +76,12 @@ fn run(
         };
         let noisy =
             coppa_channel::awgn_ref_seeded(&faded, snr_db, clean_power, 48_000.0, seed ^ 0x55AA);
-        match tx.receive(&noisy) {
-            Ok((_h, p, _lvl)) => {
-                if p.len() >= payload.len() && p[..payload.len()] == payload[..] {
-                    o.ok += 1;
-                } else {
-                    o.wrong_codeword += 1;
-                }
-            }
-            Err(ReceiveError::SyncFailed) => o.sync_fail += 1,
-            Err(ReceiveError::HeaderCorrupt) => o.header_fail += 1,
-            Err(ReceiveError::LdpcNotConverged { .. }) => o.ldpc_fail += 1,
-            Err(ReceiveError::CrcMismatch) => o.crc_fail += 1,
-        }
+        let received = tx.receive(&noisy);
+        o.record(
+            received
+                .as_ref()
+                .map(|(_h, p, _lvl)| p.len() >= payload.len() && p[..payload.len()] == payload[..]),
+        );
     }
     o
 }
@@ -142,12 +120,12 @@ fn main() {
         println!(
             "{:>6.1} {:>6} {:>5} {:>5} {:>8} {:>5} {:>13} {:>8.2}",
             snr,
-            o.ok,
-            o.sync_fail,
-            o.header_fail,
-            o.ldpc_fail,
-            o.crc_fail,
-            o.wrong_codeword,
+            o.correct,
+            o.sync_failed,
+            o.header_corrupt,
+            o.ldpc_not_converged,
+            o.crc_mismatch,
+            o.wrong_payload,
             o.fer() * 100.0
         );
     }

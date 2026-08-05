@@ -5,7 +5,7 @@ use coppa_protocol::modem::transceiver::CoppaTransceiver;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-use crate::metrics::{aggregate, bit_errors, MeasurementPoint, TrialOutcome};
+use crate::metrics::{aggregate, bit_errors, FailureMode, MeasurementPoint, TrialOutcome};
 use crate::scenario::{mode_for_level, select_profile, ChannelSpec, Scenario};
 use coppa_channel::watterson::WattersonPreset;
 
@@ -99,12 +99,14 @@ fn run_trial(
                 success,
                 bit_errors: errs,
                 comparable: true,
+                failure: (!success).then_some(FailureMode::WrongPayload),
             }
         }
-        Err(_) => TrialOutcome {
+        Err(error) => TrialOutcome {
             success: false,
             bit_errors: 0,
             comparable: false,
+            failure: Some(FailureMode::from(&error)),
         },
     };
 
@@ -411,5 +413,24 @@ mod tests {
             ssb: false,
         };
         assert!(run_scenario(&scenario)[0].frame_errors > 0);
+    }
+
+    #[test]
+    fn run_scenario_records_failure_modes_at_low_snr() {
+        let scenario = Scenario {
+            level: 2,
+            channel: ChannelSpec::Awgn,
+            snr_db_points: vec![-6.0],
+            trials: 20,
+            seed: 0xABCD,
+            profile_override: None,
+            cfo_hz: 0.0,
+            sco_ppm: 0.0,
+            ssb: false,
+        };
+        let points = run_scenario(&scenario);
+        let failures = &points[0].failures;
+        assert!(failures.frame_errors() > 0, "expected failures at -6 dB");
+        assert_eq!(failures.frame_errors(), points[0].frame_errors);
     }
 }

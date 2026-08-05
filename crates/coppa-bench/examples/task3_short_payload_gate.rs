@@ -90,12 +90,14 @@ fn run_trial(
                 success,
                 bit_errors: errs,
                 comparable: true,
+                failure: (!success).then_some(coppa_bench::metrics::FailureMode::WrongPayload),
             }
         }
-        Err(_) => TrialOutcome {
+        Err(error) => TrialOutcome {
             success: false,
             bit_errors: 0,
             comparable: false,
+            failure: Some(coppa_bench::metrics::FailureMode::from(&error)),
         },
     };
     (outcome, frame_samples)

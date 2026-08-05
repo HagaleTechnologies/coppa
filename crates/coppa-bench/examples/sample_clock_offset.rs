@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use coppa_bench::metrics::wilson_ci95;
+use coppa_bench::metrics::{wilson_ci95, FailureCounts};
 use coppa_bench::scenario::{mode_for_level, select_profile, SAMPLE_RATE};
 use coppa_channel::watterson::WattersonPreset;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
@@ -22,46 +22,6 @@ const SESSION_DURATION: Duration = Duration::from_secs(600);
 const SESSIONS_PER_CELL: usize = 1;
 const WINDOW: u8 = 8;
 const TURNAROUND: Duration = Duration::from_millis(150);
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct OutcomeCounts {
-    correct: usize,
-    wrong_payload: usize,
-    sync_failed: usize,
-    header_corrupt: usize,
-    ldpc_not_converged: usize,
-    crc_mismatch: usize,
-}
-
-impl OutcomeCounts {
-    fn record(&mut self, result: Result<bool, ReceiveError>) {
-        match result {
-            Ok(true) => self.correct += 1,
-            Ok(false) => self.wrong_payload += 1,
-            Err(ReceiveError::SyncFailed) => self.sync_failed += 1,
-            Err(ReceiveError::HeaderCorrupt) => self.header_corrupt += 1,
-            Err(ReceiveError::LdpcNotConverged { .. }) => self.ldpc_not_converged += 1,
-            Err(ReceiveError::CrcMismatch) => self.crc_mismatch += 1,
-        }
-    }
-
-    fn trials(self) -> usize {
-        self.correct
-            + self.wrong_payload
-            + self.sync_failed
-            + self.header_corrupt
-            + self.ldpc_not_converged
-            + self.crc_mismatch
-    }
-
-    fn frame_errors(self) -> usize {
-        self.trials() - self.correct
-    }
-
-    fn fer(self) -> f64 {
-        self.frame_errors() as f64 / self.trials().max(1) as f64
-    }
-}
 
 #[derive(Debug, Clone, Copy)]
 enum TestChannel {
@@ -156,16 +116,16 @@ fn transmit_once(
     (result, tx_samples)
 }
 
-fn run_frame_cell(channel: TestChannel, snr_db: f32, ppm: f32) -> OutcomeCounts {
+fn run_frame_cell(channel: TestChannel, snr_db: f32, ppm: f32) -> FailureCounts {
     let phy = CoppaTransceiver::new(select_profile(LEVEL), 1);
     let payload_bytes = mode_for_level(LEVEL).unwrap().payload_bytes();
-    let mut counts = OutcomeCounts::default();
+    let mut counts = FailureCounts::default();
     for trial in 0..FRAME_TRIALS {
         let seed = paired_seed(0xC0_0003, trial);
         let mut rng = StdRng::seed_from_u64(seed);
         let payload: Vec<u8> = (0..payload_bytes).map(|_| rng.random()).collect();
         let (outcome, _) = transmit_once(&phy, 0, &payload, channel, snr_db, ppm, seed, true);
-        counts.record(outcome.map(|decoded| {
+        counts.record(outcome.as_ref().map(|decoded| {
             decoded.len() >= payload.len() && decoded[..payload.len()] == payload[..]
         }));
     }
@@ -345,7 +305,7 @@ mod tests {
 
     #[test]
     fn outcome_categories_and_fer_are_complete() {
-        let mut counts = OutcomeCounts::default();
+        let mut counts = FailureCounts::default();
         for result in [
             Ok(true),
             Ok(false),
@@ -354,7 +314,7 @@ mod tests {
             Err(ReceiveError::LdpcNotConverged { iterations: 4 }),
             Err(ReceiveError::CrcMismatch),
         ] {
-            counts.record(result);
+            counts.record(result.as_ref().map(|value| *value));
         }
         assert_eq!(counts.trials(), 6);
         assert_eq!(counts.frame_errors(), 5);
