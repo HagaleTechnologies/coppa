@@ -317,7 +317,18 @@ frame, in both negotiation directions — drive two real `EventLoop`s through th
 `decode_and_dispatch_audio` path with one frame's samples discarded, plus
 `after_a_failed_negotiation_a_later_negotiation_still_succeeds`, the only check that recovery leaves
 the link *usable* rather than merely *consistent*. Still unproven: `cp_negotiation_enabled` remains
-`false` by default (enabling it is COP-2), so none of this has run in a deployment;
+`false` by default, so none of this has run in a deployment — and **COP-2 (2026-08-05) established
+why that flag is not the single switch it looks like**. Turning live negotiation on is a conjunction
+of *three* flags. The flag itself gates only *acting on* the handshake, which is `handle_cp_control`'s
+sole guard (`event_loop.rs:1903-1905`); the only code that can *initiate* a negotiation sits inside
+`if self.config.engine.cp_gate_enabled` (`:1093`), so without that flag a negotiation-enabled station
+is structurally incapable of proposing; and `arq_enabled` gates the inbound `TransportPdu` parse that
+is the sole route to any CpControl PDU. The consequence is asymmetric and deserves deliberate thought
+rather than a default change: the flag alone never initiates, but once `arq_enabled` is on it makes
+the station a full **responder**, so a peer can talk it onto short CP without it ever asking. COP-2
+therefore changed **no default** — the flip was treated as a HUMAN DECISION GATE in decision 5's
+sense, evaluated against the evidence and declined, not deferred as future work — and left every
+other unknown in this list exactly as it stands;
 `SWITCH_PROBATION_SECS = 180` is derived from the ARQ worst case (≈135 s) plus margin rather than
 swept, the same "no bench exists for it" caveat `CpGate`'s own constants carry above; verification is
 daemon-to-daemon in-process, with no live two-radio field test; and multi-leg (as opposed to
@@ -425,6 +436,25 @@ FER≤10% through 36 dB. A perfect-CSI, decode-independent bound nevertheless ad
 Watterson-Good frames at 30 dB (95% CI 88.84–93.73%), versus 15.0% real decode success (95% CI
 11.40–19.48%). This is implementation headroom in FEC coverage/diversity, not proof of a physical
 64-QAM ceiling and not a reason to change profile routing. See BENCHMARKS.md's COP-4 section.
+
+**COP-2 update (2026-08-05):** Task 4's bar was re-measured with `closed_loop_arq`'s metric
+airtime-normalized, and the bar itself is the primary finding. The previous bits-per-frame-*slot*
+convention was structurally blind to an airtime lever, but normalizing does not rescue the bar
+either: short CP scales every level's frame airtime by one constant (`1104/1260`, +14.130%), and a
+ratio of two goodputs divided by the same constant is unchanged, so this bar cannot express an
+airtime improvement by construction. Measured on `hf_standard` ↔ `hf_standard_short_cp`, 5 seeds ×
+300 frames: against the pre-committed joint 18-cell comparator the CP-adaptive arm reads 0.948 /
+0.654 — **NOT MET**, clearing `> 1.0` on 1 of 5 seeds — while the *same* arm scored against a
+long-CP-only 9-cell comparator, the one denied short CP, reads 1.101 and clears on all five, a pass
+that is pure denominator arithmetic (the gaps to the bar are +9.41% and +4.99% against a +14.130%
+constant). Where the win is real is the denominator: best-fixed goodput 2179.1 → 2531.6 bps
+(+16.18%), oracle 3066.6 → 3670.5 bps (+19.69%), with best-fixed(joint) selecting a short-CP cell on
+5/5 seeds. CP *adaptivity* added nothing over simply always running short CP (−5.21% against the
+best fixed short-CP cell) and the schedule produced exactly one `CpGate` transition per run, so the
+evidence routes to short CP as a **static (negotiated) configuration for HF levels 1-4** — not an
+adaptive control, and not fade-diversity interleaving, which stays available but unrouted. Like
+COP-5 above, this redefines what the metric can honestly be asked and records it, rather than
+forcing the number.
 
 ### A real, undocumented-until-now plan deviation
 

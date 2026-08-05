@@ -17,6 +17,6 @@
 - [What will bite you about Watterson fading at speed level 4?](pages/watterson-level-4-gap.md) — Speed level 4 (QPSK 3/4 with sparse-pilot `hf_standard`/`hf_wide`/`hf_narrow`
 - [What will bite you in the daemon's real-radio TX/RX path?](pages/phase4-field-readiness.md) — Phase 4 made the daemon field-ready: real serial (DTR/RTS) and Linux GPIO PTT,
 - [What will bite you about waveform compatibility with pre-Phase-1 code?](pages/waveform-wire-break.md) — The Phase 1 waveform is a hard wire-format break from all earlier coppa revisions.
-- [What will bite you about the CP-switch negotiation handshake?](pages/cp-negotiation-gotchas.md) — Three things about `coppa_protocol::cp_negotiator` have each already cost real
+- [What will bite you about the CP-switch negotiation handshake?](pages/cp-negotiation-gotchas.md) — Five things about the CP-switch negotiation handshake have each already cost
 - [What band and sample-rate conventions does coppa use?](pages/band-conventions.md) — Coppa operates at a fixed 48 kHz sample rate across all profiles and speed
 - [What contract does coppa-dsp expose to skimmer?](pages/coppa-dsp-skimmer-interface.md) — `coppa-dsp` is consumed by the skimmer repo as a pure-DSP library — it provides
