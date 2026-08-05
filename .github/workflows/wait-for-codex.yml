@@ -1,23 +1,29 @@
 name: Wait for Codex
 
-# INTERIM VARIANT — pull_request, not pull_request_target, deliberately.
-# This repo has no wait-for-codex.yml on main yet, and pull_request_target
-# always reads its definition from the BASE branch — switching to it on a
-# branch that's ADDING the file for the first time goes dark (neither
-# trigger type fires: pull_request no longer matches this file's own `on:`,
-# and pull_request_target has nothing on base to match either). Land THIS
-# pull_request-triggered version first so main has a working baseline, then
-# a fast follow-up PR switches to pull_request_target for the real security
-# reason documented in that PR (a same-repo PR modifying the merged file
-# could otherwise exfiltrate CODEX_REVIEW_PAT or self-resolve its own
-# review threads before human review — see HagaleTechnologies/harbor#59/#60).
+# pull_request_target (not pull_request): this workflow handles a
+# Codex-recognized PAT and a write-scoped GITHUB_TOKEN. On `pull_request`, a
+# same-repo PR that edits THIS FILE runs its own edited version with full
+# secret/write access before any human reviews it — letting PR-controlled
+# code exfiltrate CODEX_REVIEW_PAT or self-resolve its own review threads,
+# bypassing the exact gate this rollout exists to enforce (flagged by Codex
+# reviewing this exact file, both on HagaleTechnologies/harbor#59 and again
+# on this repo's own interim pull_request-triggered PR). pull_request_target
+# always runs the workflow definition from the BASE branch, so a PR
+# modifying this file has zero effect on what runs for it until the change
+# is actually merged. Safe here because this workflow never checks out or
+# executes the PR's own code — only `gh api` calls against metadata (PR
+# number, head SHA) from the event payload. This follows the interim
+# pull_request-triggered version that established a working baseline on
+# main (pull_request_target can't be the FIRST version of this file — it
+# reads its trigger definition from the base branch, which had nothing to
+# match until that interim version merged).
 on:
   # `reopened` dropped: Codex's own docs describe automatic review as firing
   # when a PR is newly opened for review, with re-requests done explicitly
   # via `@codex review` — a reopen gets neither, so gating merge on it meant
   # 70 minutes of passive polling for a signal that was never coming (Codex
   # P2, flagged reviewing this file).
-  pull_request:
+  pull_request_target:
     types: [opened, ready_for_review, synchronize]
 
 permissions:
@@ -80,14 +86,15 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
         run: |
           set -o pipefail
-          # GitHub does not expose secrets to a `pull_request`-triggered
-          # workflow run for a fork PR (by design — see GitHub's own docs on
-          # securely using pull_request_target/pull_request with forks), so
-          # CODEX_REVIEW_PAT expands to empty here and every `gh api` call
-          # below would fail auth and crash this step under `bash -e`,
-          # blocking a fork contributor's re-push behind a hard failure
-          # instead of just skipping the re-review request (Codex P1,
-          # flagged reviewing this file).
+          # Under pull_request_target, secrets ARE available even for fork
+          # PRs (that's the whole point of this trigger type) — so this
+          # guard is now purely a defensive catch-all for CODEX_REVIEW_PAT
+          # being genuinely unset/misconfigured, not a fork-specific
+          # concern (it WAS fork-specific on this repo's earlier interim
+          # pull_request-triggered version, where GitHub withholds secrets
+          # from fork-originated runs by design). Kept rather than removed:
+          # a missing secret should degrade to skipping the re-review
+          # request, not crash this step under `bash -e`.
           #
           # DELIBERATELY NOT auto-discovering a maintainer's manual `@codex
           # review` comment here: an earlier version of this fix tried that
@@ -98,17 +105,17 @@ jobs:
           # on the error-comment check below. Chasing that kept spawning new
           # edge cases in a path this repo is unlikely to ever exercise (a
           # private repo with a single admin taking no outside fork PRs
-          # today). Accepted, deliberate scope limit instead: on a fork
-          # re-push, the poll step still catches a formal review tied to
-          # HEAD_SHA with zero extra code (that path never needed a captured
-          # comment id). The one case this doesn't cover — Codex's clean-pass
-          # landing ONLY as a reaction on a maintainer's own manually-posted
-          # comment, never a formal review — degrades to the 70-minute
-          # timeout, at which point the repo's admin-only bypass (configured
-          # on every HagaleTechnologies ruleset) is the intended way through,
-          # not more automation for a rare path.
+          # today). Accepted, deliberate scope limit instead: the poll step
+          # still catches a formal review tied to HEAD_SHA with zero extra
+          # code (that path never needed a captured comment id). The one case
+          # this doesn't cover — Codex's clean-pass landing ONLY as a
+          # reaction on a maintainer's own manually-posted comment, never a
+          # formal review — degrades to the 70-minute timeout, at which point
+          # the repo's admin-only bypass (configured on every
+          # HagaleTechnologies ruleset) is the intended way through, not more
+          # automation for a rare path.
           if [ -z "$GH_TOKEN" ]; then
-            echo "CODEX_REVIEW_PAT not available (fork PR, or secret unset) — skipping the fresh re-review request. A formal Codex review tied to this head still resolves the check normally; a maintainer can otherwise use the repo's admin bypass."
+            echo "CODEX_REVIEW_PAT not set — skipping the fresh re-review request. A formal Codex review tied to this head still resolves the check normally; a maintainer can otherwise use the repo's admin bypass."
             exit 0
           fi
 
