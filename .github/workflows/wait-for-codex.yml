@@ -69,9 +69,14 @@ jobs:
           # PAT under an account Codex already recognizes, stored as an org
           # secret, used ONLY to post this one comment.
           GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
+          # Read-only fallback, always available even to a fork PR (unlike
+          # CODEX_REVIEW_PAT) — used ONLY for the fork-discovery path below,
+          # never for posting.
+          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
         run: |
+          set -o pipefail
           # GitHub does not expose secrets to a `pull_request`-triggered
           # workflow run for a fork PR (by design — see GitHub's own docs on
           # securely using pull_request_target/pull_request with forks), so
@@ -79,10 +84,32 @@ jobs:
           # below would fail auth and crash this step under `bash -e`,
           # blocking a fork contributor's re-push behind a hard failure
           # instead of just skipping the re-review request (Codex P1,
-          # flagged reviewing this file). Skip cleanly instead — the poll
-          # step still passively waits for whatever signal already exists.
+          # flagged reviewing this file).
           if [ -z "$GH_TOKEN" ]; then
-            echo "CODEX_REVIEW_PAT not available (fork PR, or secret unset) — skipping re-review request; passive polling will still catch any existing signal."
+            echo "CODEX_REVIEW_PAT not available (fork PR, or secret unset) — skipping the fresh re-review request."
+            # Don't just give up: a maintainer may already have left a manual
+            # `@codex review` comment themselves (the trigger works fine from
+            # a real human account regardless of fork status). Discover it
+            # with the always-available read-only token and capture its
+            # node_id, so the poll step's comment-reaction signal still has
+            # something to check — otherwise a fork re-push was GUARANTEED to
+            # burn the full 70-minute timeout with zero chance of success,
+            # even when a maintainer did everything right (Codex P2, flagged
+            # reviewing this file).
+            RUN_STARTED_LOCAL=$(cat /tmp/codex-run-started.txt 2>/dev/null || echo "")
+            found=$(GH_TOKEN="$FALLBACK_TOKEN" gh api "repos/$REPO/issues/$PR/comments" \
+              | jq --arg since "$RUN_STARTED_LOCAL" '
+                  [.[] | select(.body | test("@codex review"; "i"))
+                       | select(.user.type != "Bot")
+                       | select(.created_at >= $since)]
+                  | sort_by(.created_at) | last // empty')
+            node_id=$(echo "$found" | jq -r '.node_id // empty')
+            if [ -n "$node_id" ]; then
+              echo "$node_id" > /tmp/codex-review-comment-id.json
+              echo "Found a manual @codex review request from $(echo "$found" | jq -r '.user.login // "a maintainer"') — polling will watch for a response to it."
+            else
+              echo "No manual @codex review request found yet — polling will still catch a formal review tied to this head if a maintainer requests one before the timeout."
+            fi
             exit 0
           fi
 
@@ -147,6 +174,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           IS_SYNC: ${{ github.event.action == 'synchronize' }}
         run: |
+          set -o pipefail
           # Only count signals created at/after this run started, and reviews
           # submitted against the CURRENT head commit AND after this round
           # started (a small buffer absorbs clock skew between this runner
@@ -179,7 +207,7 @@ jobs:
               query($owner: String!, $name: String!, $pr: Int!, $hasComment: Boolean!, $commentId: ID!) {
                 repository(owner: $owner, name: $name) {
                   pullRequest(number: $pr) {
-                    comments(last: 50) { nodes { author { login } createdAt } }
+                    comments(last: 50) { nodes { author { login } body createdAt } }
                     reviews(last: 50) { nodes { author { login } commit { oid } submittedAt } }
                     reactions(last: 50, content: THUMBS_UP) { nodes { user { login } createdAt } }
                   }
@@ -191,17 +219,35 @@ jobs:
                 }
               }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" -F hasComment="$HAS_COMMENT" -f commentId="${COMMENT_ID:-placeholder}" \
               | jq --arg since "$RUN_STARTED" --arg sha "$HEAD_SHA" '
+                def is_error_shaped: test("(quota|rate.?limit|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start))"; "i");
                 .data.repository.pullRequest as $p
+                | ([$p.comments.nodes[] | select(.author.login=="chatgpt-codex-connector" and .createdAt >= $since)]) as $fresh_comments
                 | {
-                    comments: ([$p.comments.nodes[] | select(.author.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length),
+                    comments: ([$fresh_comments[] | select(.body | is_error_shaped | not)] | length),
+                    error_comments: ([$fresh_comments[] | select(.body | is_error_shaped)] | length),
                     reviews: ([$p.reviews.nodes[] | select(.author.login=="chatgpt-codex-connector" and .commit.oid==$sha and .submittedAt >= $since)] | length),
                     thumbsup: ([$p.reactions.nodes[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length),
                     comment_thumbsup: ([(.commentNode.reactions.nodes // [])[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length)
                   }')
             comments=$(echo "$poll" | jq '.comments')
+            error_comments=$(echo "$poll" | jq '.error_comments')
             reviews=$(echo "$poll" | jq '.reviews')
             thumbsup=$(echo "$poll" | jq '.thumbsup')
             comment_thumbsup=$(echo "$poll" | jq '.comment_thumbsup')
+            if [ "$error_comments" -gt 0 ]; then
+              # Codex replies with an issue comment for its own failures too
+              # (auth/workspace/quota errors), which previously satisfied the
+              # non-sync "any comment counts" branch below and turned this
+              # required check green with no actual review ever happening
+              # (Codex P2, flagged reviewing this file). Fail loudly and
+              # immediately instead of either silently accepting it as success
+              # OR silently waiting out the remaining timeout hoping for a
+              # different signal — Tony's own directive: don't waste wall-
+              # clock time on a wait that a Codex-reported error already
+              # tells us won't resolve itself.
+              echo "::error::Codex reported an error (quota/auth/workspace) instead of reviewing $HEAD_SHA — failing now rather than waiting out the remaining timeout. Re-run this check once the underlying Codex issue is resolved."
+              exit 1
+            fi
             if [ "$reviews" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ]; then
               # A 👍 on the @codex-review comment itself is just as tightly
               # scoped to "responded to THIS request" as a formal review tied
