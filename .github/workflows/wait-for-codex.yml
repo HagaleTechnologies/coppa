@@ -12,8 +12,13 @@ name: Wait for Codex
 # could otherwise exfiltrate CODEX_REVIEW_PAT or self-resolve its own
 # review threads before human review — see HagaleTechnologies/harbor#59/#60).
 on:
+  # `reopened` dropped: Codex's own docs describe automatic review as firing
+  # when a PR is newly opened for review, with re-requests done explicitly
+  # via `@codex review` — a reopen gets neither, so gating merge on it meant
+  # 70 minutes of passive polling for a signal that was never coming (Codex
+  # P2, flagged reviewing this file).
   pull_request:
-    types: [opened, reopened, ready_for_review, synchronize]
+    types: [opened, ready_for_review, synchronize]
 
 permissions:
   contents: read
@@ -67,6 +72,20 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
         run: |
+          # GitHub does not expose secrets to a `pull_request`-triggered
+          # workflow run for a fork PR (by design — see GitHub's own docs on
+          # securely using pull_request_target/pull_request with forks), so
+          # CODEX_REVIEW_PAT expands to empty here and every `gh api` call
+          # below would fail auth and crash this step under `bash -e`,
+          # blocking a fork contributor's re-push behind a hard failure
+          # instead of just skipping the re-review request (Codex P1,
+          # flagged reviewing this file). Skip cleanly instead — the poll
+          # step still passively waits for whatever signal already exists.
+          if [ -z "$GH_TOKEN" ]; then
+            echo "CODEX_REVIEW_PAT not available (fork PR, or secret unset) — skipping re-review request; passive polling will still catch any existing signal."
+            exit 0
+          fi
+
           OWNER="${REPO%%/*}"
           NAME="${REPO##*/}"
 
@@ -111,11 +130,13 @@ jobs:
               | .id]' \
             > /tmp/codex-baseline-threads.json
 
-          # Capture the comment's own id: a clean re-review can land as a 👍
-          # reaction on THIS comment specifically, not on the PR/issue itself
-          # (issue-level and comment-level reactions are separate REST
-          # endpoints — flagged reviewing this file, on harbor#59).
-          gh api "repos/$REPO/issues/$PR/comments" -f body="@codex review" --jq '.id' \
+          # Capture the comment's own GraphQL node_id (not its REST numeric
+          # id — the poll step's combined query looks it up via GraphQL's
+          # `node(id:)`, which needs the node_id): a clean re-review can land
+          # as a 👍 reaction on THIS comment specifically, not on the PR/
+          # issue itself (issue-level and comment-level reactions are
+          # separate endpoints — flagged reviewing this file, on harbor#59).
+          gh api "repos/$REPO/issues/$PR/comments" -f body="@codex review" --jq '.node_id' \
             > /tmp/codex-review-comment-id.json
 
       - name: Poll for a terminal Codex signal on this revision
@@ -132,19 +153,16 @@ jobs:
           # and Codex; the timestamp bound on reviews specifically closes the
           # stale-review gap noted in the step above).
           #
-          # NOTE: `gh api --jq` is gh's OWN limited jq subset and does NOT
-          # accept `--arg`/`--argjson` the way real `jq` does (`gh api ...
-          # --jq --arg x y '...'` silently mis-parses as extra positional args
-          # and errors "unknown flag: --arg", killing the job on its first
-          # loop iteration under `bash -e`). Pipe raw JSON into real `jq`
-          # instead — this bit this exact workflow TWICE already (the polling
-          # queries below, and — until this fix — the auto-resolve mutation
-          # query further down, which crashed immediately after every single
-          # successful wait: Codex would respond, `reviewed_head` would be
-          # set, and the very next `--jq --argjson ... --arg ...` call would
-          # exit 1 before any thread was ever resolved. Every "Wait for Codex
-          # Review" failure observed across this rollout — whether it failed
-          # after 7 minutes or 55 — was this exact crash, not a real timeout.
+          # A single combined GraphQL query per poll, not 3-4 separate REST
+          # calls: `GITHUB_TOKEN` is capped at 1,000 requests/hour/repository
+          # (shared across every concurrent workflow run in the repo, not
+          # just this one), and the previous 4-calls-per-20s loop could drive
+          # 1,000+ req/hr on its own with just two concurrent PRs under
+          # review — enough to make this required check fail on a rate limit
+          # rather than a real Codex signal (Codex P2, flagged reviewing this
+          # file, this rollout's own auto-merge PR).
+          OWNER="${REPO%%/*}"
+          NAME="${REPO##*/}"
           RUN_STARTED=$(cat /tmp/codex-run-started.txt 2>/dev/null || date -u -d '15 seconds ago' +%Y-%m-%dT%H:%M:%SZ)
           # Bumped from 18min -> 28min -> 70min over this rollout: burst load
           # (many PRs/pushes landing across the org at once) has pushed
@@ -154,14 +172,36 @@ jobs:
           responded=""
           reviewed_head=""
           COMMENT_ID=$(cat /tmp/codex-review-comment-id.json 2>/dev/null || echo "")
+          HAS_COMMENT="false"
+          [ -n "$COMMENT_ID" ] && HAS_COMMENT="true"
           while [ $SECONDS -lt $END ]; do
-            comments=$(gh api --paginate --slurp "repos/$REPO/issues/$PR/comments" | jq --arg since "$RUN_STARTED" '[.[] | .[] | select(.user.login=="chatgpt-codex-connector[bot]" and .created_at >= $since)] | length')
-            reviews=$(gh api --paginate --slurp "repos/$REPO/pulls/$PR/reviews" | jq --arg sha "$HEAD_SHA" --arg since "$RUN_STARTED" '[.[] | .[] | select(.user.login=="chatgpt-codex-connector[bot]" and .commit_id == $sha and .submitted_at >= $since)] | length')
-            thumbsup=$(gh api --paginate --slurp "repos/$REPO/issues/$PR/reactions" | jq --arg since "$RUN_STARTED" '[.[] | .[] | select(.user.login=="chatgpt-codex-connector[bot]" and .content=="+1" and .created_at >= $since)] | length')
-            comment_thumbsup=0
-            if [ -n "$COMMENT_ID" ]; then
-              comment_thumbsup=$(gh api --paginate --slurp "repos/$REPO/issues/comments/$COMMENT_ID/reactions" | jq '[.[] | .[] | select(.user.login=="chatgpt-codex-connector[bot]" and .content=="+1")] | length')
-            fi
+            poll=$(gh api graphql -f query='
+              query($owner: String!, $name: String!, $pr: Int!, $hasComment: Boolean!, $commentId: ID!) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $pr) {
+                    comments(last: 50) { nodes { author { login } createdAt } }
+                    reviews(last: 50) { nodes { author { login } commit { oid } submittedAt } }
+                    reactions(last: 50, content: THUMBS_UP) { nodes { user { login } createdAt } }
+                  }
+                }
+                commentNode: node(id: $commentId) @include(if: $hasComment) {
+                  ... on IssueComment {
+                    reactions(last: 50, content: THUMBS_UP) { nodes { user { login } createdAt } }
+                  }
+                }
+              }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" -F hasComment="$HAS_COMMENT" -f commentId="${COMMENT_ID:-placeholder}" \
+              | jq --arg since "$RUN_STARTED" --arg sha "$HEAD_SHA" '
+                .data.repository.pullRequest as $p
+                | {
+                    comments: ([$p.comments.nodes[] | select(.author.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length),
+                    reviews: ([$p.reviews.nodes[] | select(.author.login=="chatgpt-codex-connector" and .commit.oid==$sha and .submittedAt >= $since)] | length),
+                    thumbsup: ([$p.reactions.nodes[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length),
+                    comment_thumbsup: ([(.commentNode.reactions.nodes // [])[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length)
+                  }')
+            comments=$(echo "$poll" | jq '.comments')
+            reviews=$(echo "$poll" | jq '.reviews')
+            thumbsup=$(echo "$poll" | jq '.thumbsup')
+            comment_thumbsup=$(echo "$poll" | jq '.comment_thumbsup')
             if [ "$reviews" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ]; then
               # A 👍 on the @codex-review comment itself is just as tightly
               # scoped to "responded to THIS request" as a formal review tied
@@ -170,10 +210,28 @@ jobs:
               # this file, on harbor#59).
               reviewed_head=1
             fi
-            if [ "$comments" -gt 0 ] || [ "$reviews" -gt 0 ] || [ "$thumbsup" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ]; then
-              echo "Codex responded on this revision: comments=$comments reviews=$reviews thumbsup=$thumbsup comment_thumbsup=$comment_thumbsup"
-              responded=1
-              break
+            if [ "$IS_SYNC" = "true" ]; then
+              # On a re-push specifically, a bare new issue comment or a
+              # generic issue-level thumbsup is NOT proof Codex looked at
+              # THIS head — either could be a stale signal from an unrelated
+              # earlier review landing after RUN_STARTED but before the fresh
+              # `@codex review` request was actually processed, which let
+              # this required check pass without any head-tied Codex signal
+              # ever arriving (Codex P1, flagged reviewing this file). Only
+              # accept the two signals that are provably tied to this
+              # specific request: a review against HEAD_SHA, or a reaction on
+              # the comment that requested it.
+              if [ "$reviews" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ]; then
+                echo "Codex responded on this revision: reviews=$reviews comment_thumbsup=$comment_thumbsup"
+                responded=1
+                break
+              fi
+            else
+              if [ "$comments" -gt 0 ] || [ "$reviews" -gt 0 ] || [ "$thumbsup" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ]; then
+                echo "Codex responded on this revision: comments=$comments reviews=$reviews thumbsup=$thumbsup comment_thumbsup=$comment_thumbsup"
+                responded=1
+                break
+              fi
             fi
             echo "Still waiting for Codex to respond to $HEAD_SHA..."
             sleep 20
