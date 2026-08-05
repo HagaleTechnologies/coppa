@@ -22,38 +22,19 @@
 //! component. Run: `cargo run --release -p coppa-bench --example per_frame_link_diagnosis`.
 
 use coppa_codec::ofdm::coppa_modem::CoppaModem;
-use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
-use coppa_codec::ofdm::interleaver::BlockInterleaver;
-use coppa_protocol::fec::ldpc::LdpcCodec;
-use coppa_protocol::fec::scrambler::scramble;
-use coppa_protocol::modem::speed_levels::{speed_level_components, speed_level_entry};
+use coppa_protocol::modem::speed_levels::speed_level_components;
 use coppa_protocol::modem::transceiver::{CoppaTransceiver, ReceiveError};
 
+use coppa_bench::per_frame_link::{
+    build_diagnostic_frame, hard_decide, symbols_needed, CODED_BLOCK_LEN,
+};
 use coppa_bench::scenario::mode_for_level;
 use coppa_channel::watterson::{watterson, Tap, WattersonConfig, WattersonPreset};
-
-const CODED_BITS: usize = 1944;
-const SNR_DB: f32 = 30.0; // high SNR: any failure is channel-induced, not noise-induced
-const TRIALS: usize = 60;
 
 /// Channel under test for the diagnosis.
 enum Cond {
     Awgn,
     Fading(WattersonConfig),
-}
-
-fn make_header(level: u8, payload_len: u16) -> CoppaHeader {
-    CoppaHeader {
-        version: 1,
-        phy_mode: 0,
-        frame_type: CoppaFrameType::Data,
-        bandwidth: 1,
-        fec_type: 0,
-        speed_level: level,
-        seq_num: 0,
-        payload_len,
-        codewords: 1,
-    }
 }
 
 /// Flat (frequency-non-selective) single-tap Rayleigh fade — pure amplitude fading.
@@ -83,16 +64,16 @@ fn measure(
     cond: &Cond,
     profile: &coppa_codec::ofdm::CoppaProfile,
     level: u8,
+    snr_db: f32,
+    trials: usize,
 ) -> Stats {
     let profile = profile.clone();
     let modem = CoppaModem::new(profile.clone(), 1);
-    let (mapper, code_rate) = speed_level_components(level).expect("level 2 components");
-    let papr = speed_level_entry(level)
-        .expect("level 2 entry")
-        .papr_target_db;
-    let info_bits = code_rate.info_bits();
-    let data_carriers = profile.data_carriers;
-    let pfb = mode_for_level(level).expect("level 2 mode").payload_bytes();
+    let (mapper, _) = speed_level_components(level).expect("speed-level components");
+    let bits_per_symbol = mapper.bits_per_symbol();
+    let pfb = mode_for_level(level)
+        .expect("speed-level mode")
+        .payload_bytes();
     let tx = CoppaTransceiver::new(profile.clone(), 1);
 
     let mut total_bits = 0usize;
@@ -108,52 +89,45 @@ fn measure(
     let (mut n_ok, mut n_sync, mut n_header, mut n_ldpc, mut n_crc, mut n_mismatch) =
         (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
 
-    for t in 0..TRIALS {
+    for t in 0..trials {
         let seed = 0x0D1A_6005_u64.wrapping_mul(t as u64 + 1);
         // Deterministic pseudo-random payload from the seed (no rng dep needed here).
         let payload: Vec<u8> = (0..pfb)
             .map(|i| (seed.wrapping_add(i as u64).wrapping_mul(2654435761) >> 24) as u8)
             .collect();
 
-        // --- Encode exactly as V1/transceiver does, keeping the transmitted (interleaved) bits.
-        let mut bits = Vec::with_capacity(info_bits);
-        for &byte in &payload {
-            for shift in (0..8).rev() {
-                bits.push((byte >> shift) & 1);
-            }
-        }
-        bits.resize(info_bits, 0u8);
-        scramble(&mut bits);
-        let coded = LdpcCodec::new(code_rate).encode(&bits); // CODED_BITS
-        let interleaved = BlockInterleaver::new(CODED_BITS, data_carriers).interleave(&coded);
-        let symbols = mapper.map_bits(&interleaved);
-        let signal = modem.modulate_mapped(&make_header(level, pfb as u16), &symbols, papr);
+        // --- Encode exactly as the production transceiver does, keeping the transmitted bits.
+        let frame = build_diagnostic_frame(&profile, level, &payload);
 
         // --- Channel (same faded signal feeds both the raw-BER probe and the post-FEC decode).
         let faded = match cond {
-            Cond::Awgn => coppa_channel::awgn_seeded(&signal, SNR_DB, seed ^ 0x5555),
+            Cond::Awgn => coppa_channel::awgn_seeded(&frame.signal, snr_db, seed ^ 0x5555),
             Cond::Fading(cfg) => {
-                let f = watterson(&signal, 48_000.0, cfg, seed ^ 0x3333);
-                coppa_channel::awgn_seeded(&f, SNR_DB, seed ^ 0x5555)
+                let f = watterson(&frame.signal, 48_000.0, cfg, seed ^ 0x3333);
+                coppa_channel::awgn_seeded(&f, snr_db, seed ^ 0x5555)
             }
         };
 
         // --- Raw (pre-FEC) BER + nv partition.
         if let Some((_h, eq, nv, _delay_spread_ms)) = modem.demodulate_frame(&faded) {
-            let n = CODED_BITS.min(eq.len()).min(nv.len());
-            if n > 0 {
+            let symbol_count = symbols_needed(bits_per_symbol).min(eq.len()).min(nv.len());
+            if symbol_count > 0 {
+                let decided = hard_decide(&*mapper, &eq[..symbol_count]);
+                let n = CODED_BLOCK_LEN
+                    .min(decided.len())
+                    .min(frame.interleaved_bits.len());
                 // Per-frame median nv for the A1/A2 partition.
-                let mut sorted: Vec<f32> = nv[..n].to_vec();
+                let mut sorted: Vec<f32> = nv[..symbol_count].to_vec();
                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let median = sorted[n / 2].max(1e-9);
+                let median = sorted[symbol_count / 2].max(1e-9);
                 for i in 0..n {
-                    let hard = if eq[i].re < 0.0 { 1u8 } else { 0u8 };
-                    let err = hard != interleaved[i];
+                    let symbol_nv = nv[i / bits_per_symbol];
+                    let err = decided[i] != frame.interleaved_bits[i];
                     total_bits += 1;
                     if err {
                         total_errs += 1;
                     }
-                    if nv[i] > median {
+                    if symbol_nv > median {
                         n_high += 1;
                         if err {
                             errs_high += 1;
@@ -165,15 +139,15 @@ fn measure(
                         }
                     }
                     flagged_denom += 1;
-                    if nv[i] > 10.0 * median {
+                    if symbol_nv > 10.0 * median {
                         flagged += 1;
                     }
                 }
             }
         } else {
             // Sync failure counts as an all-error frame (every bit wrong-ish).
-            total_bits += CODED_BITS;
-            total_errs += CODED_BITS / 2;
+            total_bits += CODED_BLOCK_LEN;
+            total_errs += CODED_BLOCK_LEN / 2;
         }
 
         // --- Post-FEC: decode the SAME faded signal through the real receive path,
@@ -201,7 +175,7 @@ fn measure(
 
     let s = Stats {
         raw_ber: total_errs as f64 / total_bits.max(1) as f64,
-        post_fec_success: post_ok as f64 / TRIALS as f64,
+        post_fec_success: post_ok as f64 / trials as f64,
         err_rate_high_nv: errs_high as f64 / n_high.max(1) as f64,
         err_rate_low_nv: errs_low as f64 / n_low.max(1) as f64,
         flagged_frac: flagged as f64 / flagged_denom.max(1) as f64,
@@ -219,50 +193,80 @@ fn measure(
 }
 
 fn main() {
+    let level: u8 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
     let profile_name = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "standard".to_string());
     let profile = match profile_name.as_str() {
+        "default" => coppa_bench::scenario::select_profile(level),
         "standard" => coppa_codec::ofdm::CoppaProfile::hf_standard(),
         "robust" => coppa_codec::ofdm::CoppaProfile::hf_robust(),
-        other => panic!("unknown profile '{other}' (expected: standard|robust)"),
+        "vhf" => coppa_codec::ofdm::CoppaProfile::vhf_wide(),
+        other => panic!("unknown profile '{other}' (expected: default|standard|robust|vhf)"),
     };
     println!(
         "Profile: {profile_name} ({} data / {} pilots)",
         profile.data_carriers, profile.pilot_carriers
     );
-    let level: u8 = std::env::args()
-        .nth(2)
+    let trials: usize = std::env::var("TRIALS")
+        .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(2);
+        .unwrap_or(60);
+    let snrs: Vec<f32> = std::env::var("SNRS")
+        .unwrap_or_else(|_| "30".to_string())
+        .split(',')
+        .map(|s| s.trim().parse().expect("SNRS entries must be numbers"))
+        .collect();
     println!("Level: {level}");
-    println!("Per-frame link diagnosis — level 2 (BPSK 1/2), {SNR_DB} dB, {TRIALS} trials/cond");
-    println!("(high SNR: failures are channel-induced, not noise-induced)\n");
-    println!(
-        "{:<12} {:>13}  {:>13}   {:>16}  {:>14}  {:>11}",
-        "condition", "raw pre-FEC", "post-FEC", "A2-probe", "A1-probe", "nulls"
-    );
+    let mode = mode_for_level(level).expect("measurable speed level");
+    for snr_db in snrs {
+        println!(
+            "Per-frame link diagnosis — level {level} ({}), {snr_db} dB, {trials} trials/cond",
+            mode.name
+        );
+        println!("(at high SNR, failures are channel-induced rather than noise-induced)\n");
+        println!(
+            "{:<12} {:>13}  {:>13}   {:>16}  {:>14}  {:>11}",
+            "condition", "raw pre-FEC", "post-FEC", "A2-probe", "A1-probe", "nulls"
+        );
 
-    measure("AWGN", &Cond::Awgn, &profile, level);
-    measure("flat-1tap", &Cond::Fading(flat_config()), &profile, level);
-    measure(
-        "Good-2tap",
-        &Cond::Fading(WattersonPreset::Good.config()),
-        &profile,
-        level,
-    );
-    measure(
-        "Moderate",
-        &Cond::Fading(WattersonPreset::Moderate.config()),
-        &profile,
-        level,
-    );
-    measure(
-        "Poor",
-        &Cond::Fading(WattersonPreset::Poor.config()),
-        &profile,
-        level,
-    );
+        measure("AWGN", &Cond::Awgn, &profile, level, snr_db, trials);
+        measure(
+            "flat-1tap",
+            &Cond::Fading(flat_config()),
+            &profile,
+            level,
+            snr_db,
+            trials,
+        );
+        measure(
+            "Good-2tap",
+            &Cond::Fading(WattersonPreset::Good.config()),
+            &profile,
+            level,
+            snr_db,
+            trials,
+        );
+        measure(
+            "Moderate",
+            &Cond::Fading(WattersonPreset::Moderate.config()),
+            &profile,
+            level,
+            snr_db,
+            trials,
+        );
+        measure(
+            "Poor",
+            &Cond::Fading(WattersonPreset::Poor.config()),
+            &profile,
+            level,
+            snr_db,
+            trials,
+        );
+    }
 
     println!(
         "\nReading: A-vs-B — if flat-1tap rawBER is low but 2-tap is high, the cause is\n\

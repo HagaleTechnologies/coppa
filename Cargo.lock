@@ -347,6 +347,7 @@ dependencies = [
  "coppa-codec",
  "coppa-ml",
  "coppa-protocol",
+ "crc",
  "hound",
  "num-complex",
  "rand 0.10.2",
