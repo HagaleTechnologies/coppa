@@ -414,14 +414,17 @@ impl CoppaCore {
     /// does -- any samples already buffered in the streaming receiver (not
     /// yet resolved into a completed frame) are discarded as a result.
     ///
-    /// Crossing the HF/VHF threshold (level >= 5) also resets `cp_mode` to
-    /// `CpMode::LongCp` (VHF has no short-CP variant) -- this is an
-    /// explicit reset step below, not a side effect of
-    /// `select_ofdm_profile` (which is a pure function of its two
-    /// arguments and has no side effects itself). This reset is permanent
-    /// until something calls `set_cp_profile` again: dropping back below
-    /// level 5 later does NOT automatically restore a previously
-    /// negotiated `ShortCp` -- see `EngineConfig::cp_mode`'s field doc.
+    /// Crossing the HF/VHF threshold (level >= 5) does NOT touch `cp_mode`. It does
+    /// not need to: `select_ofdm_profile` already ignores `cp_mode` entirely at VHF
+    /// (see `test_select_ofdm_profile_ignores_cp_mode_in_vhf_range`), so a retained
+    /// `ShortCp` cannot select a nonexistent VHF short-CP profile. `cp_mode` is the
+    /// *negotiated HF CP mode*: in effect while `speed_level < 5`, retained (dormant)
+    /// above it -- so a `RateLoop` excursion into VHF and back cannot silently
+    /// discard a mode the peer still believes is in force. Before COP-2 this reset
+    /// was permanent, and dropping back below level 5 rebuilt onto `hf_standard`
+    /// while the peer stayed on `hf_standard_short_cp`: a mutually-undecodable link
+    /// with no give-up trigger armed anywhere (the negotiation had already
+    /// succeeded) and no reachable recovery path.
     ///
     /// Returns an error, leaving this engine's current config untouched, if
     /// `level` is not a valid wire speed level (1-10; 8 is reserved) -- see
@@ -433,11 +436,6 @@ impl CoppaCore {
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         let mut config = self.config.clone();
         config.speed_level = level;
-        // Reset cp_mode to LongCp when crossing into VHF (level >= 5) since
-        // VHF has no short-CP variant.
-        if level >= 5 && config.cp_mode != CpMode::LongCp {
-            config.cp_mode = CpMode::LongCp;
-        }
         self.reconfigure(config);
         Ok(())
     }
@@ -465,6 +463,13 @@ impl CoppaCore {
     }
 
     /// The CP mode currently configured for outgoing `encode_bytes` calls.
+    ///
+    /// At `speed_level() >= 5` this reports the *retained negotiated HF mode*, NOT
+    /// the profile actually on air -- `select_ofdm_profile` builds `vhf_wide` there
+    /// regardless (see `set_speed_level`'s doc for why the mode is retained rather
+    /// than reset). A caller reading this to infer the live waveform would be wrong
+    /// above level 5; it answers "what CP mode did this station and its peer agree
+    /// on", which is what COP-2's engine/negotiator invariant is about.
     pub fn cp_mode(&self) -> CpMode {
         self.config.cp_mode
     }
@@ -1101,16 +1106,59 @@ mod tests {
         );
     }
 
+    /// COP-2: crossing into VHF must RETAIN the negotiated CP mode, and coming
+    /// back down must land on the profile the peer is still listening on.
+    ///
+    /// This is a **deliberate inversion** of the pinning test that used to live
+    /// here (`test_set_speed_level_resets_cp_mode_when_crossing_into_vhf`), not
+    /// a test deleted to turn a suite green. The reset it pinned was
+    /// redundant -- `select_ofdm_profile` ignores `cp_mode` entirely at
+    /// `speed_level >= 5`, which
+    /// `test_select_ofdm_profile_ignores_cp_mode_in_vhf_range` (kept unchanged)
+    /// asserts directly, so a retained `ShortCp` cannot select a nonexistent
+    /// VHF short-CP profile. It was also actively harmful: the reset was
+    /// permanent, so a `RateLoop` excursion to level 5 and back rebuilt onto
+    /// `hf_standard` (CP 300) while the peer stayed on `hf_standard_short_cp`
+    /// (CP 144) -- a mutually-undecodable link with no give-up trigger armed
+    /// anywhere (the negotiation had already succeeded) and no reachable
+    /// recovery path. See `crates/coppa-daemon/src/event_loop.rs`'s
+    /// `a_rate_loop_vhf_excursion_does_not_desync_a_negotiated_short_cp` for
+    /// the same property proved end-to-end through the real daemon path.
+    ///
+    /// The level-3 half asserts the PROFILE, not just the field: it reads the
+    /// wire `bandwidth` id back out through a receiver built for
+    /// `hf_standard_short_cp`, the same waveform-level style as
+    /// `test_encode_bytes_writes_real_bandwidth_id_not_hardcoded_one` below. A
+    /// `cp_mode()` accessor check alone would pass even if `select_ofdm_profile`
+    /// silently disagreed with the field.
     #[test]
-    fn test_set_speed_level_resets_cp_mode_when_crossing_into_vhf() {
+    fn test_set_speed_level_preserves_cp_mode_across_a_vhf_excursion() {
         use coppa_protocol::cp_negotiator::CpMode;
+        use coppa_protocol::modem::transceiver::CoppaTransceiver;
+
         let mut core = CoppaCore::new();
         core.set_cp_profile(CpMode::ShortCp);
+
         core.set_speed_level(5).unwrap(); // crosses into VHF
         assert_eq!(
             core.cp_mode(),
-            CpMode::LongCp,
-            "crossing into VHF (no short-CP variant) must reset to the HF default"
+            CpMode::ShortCp,
+            "crossing into VHF must RETAIN the negotiated CP mode (dormant while \
+             `select_ofdm_profile` builds vhf_wide), not discard it -- the peer \
+             still believes it is in force"
+        );
+
+        core.set_speed_level(3).unwrap(); // back into the HF range
+        assert_eq!(core.cp_mode(), CpMode::ShortCp);
+        let samples = core.encode_bytes(b"x").unwrap();
+        let transceiver = CoppaTransceiver::new(CoppaProfile::hf_standard_short_cp(), 1);
+        let (header, _payload, _recommended_level) = transceiver
+            .receive(&samples)
+            .expect("a frame sent after returning from VHF must still decode under short CP");
+        assert_eq!(
+            header.bandwidth,
+            CoppaProfile::hf_standard_short_cp().bandwidth_id,
+            "returning below level 5 must rebuild onto hf_standard_short_cp, not hf_standard"
         );
     }
 
