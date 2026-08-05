@@ -69,6 +69,13 @@ jobs:
           # PAT under an account Codex already recognizes, stored as an org
           # secret, used ONLY to post this one comment.
           GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
+          # Read-only, always fully scoped (unlike a fine-grained PAT, which
+          # this step's own docs say is provisioned ONLY for posting the
+          # comment below) — used for the baseline review-threads read so a
+          # minimally-scoped PAT lacking PR-read can't crash this step before
+          # the request is even posted (Codex P2, flagged reviewing this
+          # file).
+          READ_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
         run: |
@@ -129,7 +136,18 @@ jobs:
           # paginate past 50 replies in one thread (both flagged on harbor#59
           # /#60). Neither is realistic on these repos; revisit if that ever
           # stops being true.
-          gh api graphql -f query='
+          #
+          # NOTE on the author check below: "github-actions" (no `[bot]`
+          # suffix) is deliberate, not a REST-vs-GraphQL mixup — verified
+          # empirically against this exact rollout's own data (2026-08-05):
+          # GraphQL's `author.login` never carries the `[bot]` suffix REST
+          # uses (`dependabot`, not `dependabot[bot]`, appears in this same
+          # repo's own review-thread comments), matching `chatgpt-codex-
+          # connector` elsewhere in this file. A later Codex pass suggested
+          # adding the `[bot]`-suffixed form here on the theory that it's
+          # what a GITHUB_TOKEN-authored reply's login looks like — that
+          # variant does not occur in GraphQL responses, so it was not added.
+          GH_TOKEN="$READ_TOKEN" gh api graphql -f query='
             query($owner: String!, $name: String!, $pr: Int!) {
               repository(owner: $owner, name: $name) {
                 pullRequest(number: $pr) {
@@ -257,27 +275,48 @@ jobs:
                 break
               fi
             else
-              if [ "$error_comments" -gt 0 ]; then
-                # Codex replies with an issue comment for its own failures too
-                # (auth/workspace/quota/account-connection errors), which
-                # would otherwise satisfy the "any comment counts" condition
-                # just below and turn this required check green with no
-                # actual review ever happening (Codex P2, flagged reviewing
-                # this file). Only reachable here (never on a re-push, see
-                # above) since this is the one branch that treats a bare
-                # comment as a success signal at all. Fail loudly and
-                # immediately rather than either accepting it as success OR
-                # silently waiting out the remaining timeout for a different
-                # signal — Tony's own directive: don't waste wall-clock time
-                # on a wait that a Codex-reported error already tells us
-                # won't resolve itself.
-                echo "::error::Codex reported an error (quota/auth/workspace/account-connection) instead of reviewing $HEAD_SHA — failing now rather than waiting out the remaining timeout. Re-run this check once the underlying Codex issue is resolved."
-                exit 1
-              fi
+              # Check for a genuine success FIRST, error fail-fast second: a
+              # manually re-run job reuses the original event's cutoff, so an
+              # older transient Codex error and a later real success can both
+              # be in-window on the same poll. Only fail fast on the error
+              # when there's no success signal alongside it — otherwise a
+              # rerun (which this exact error message tells maintainers to
+              # do) could stay permanently poisoned by the first attempt's
+              # failure even after Codex succeeds on the second (Codex P2,
+              # flagged reviewing this file).
               if [ "$comments" -gt 0 ] || [ "$reviews" -gt 0 ] || [ "$thumbsup" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ]; then
                 echo "Codex responded on this revision: comments=$comments reviews=$reviews thumbsup=$thumbsup comment_thumbsup=$comment_thumbsup"
                 responded=1
                 break
+              fi
+              if [ "$error_comments" -gt 0 ]; then
+                # Codex replies with an issue comment for its own failures too
+                # (auth/workspace/quota/account-connection errors), which
+                # would otherwise satisfy the "any comment counts" condition
+                # above and turn this required check green with no actual
+                # review ever happening (Codex P2, flagged reviewing this
+                # file). Only reachable here (never on a re-push, see above)
+                # since this is the one branch that treats a bare comment as
+                # a success signal at all. Fail loudly and immediately rather
+                # than either accepting it as success OR silently waiting out
+                # the remaining timeout for a different signal — Tony's own
+                # directive: don't waste wall-clock time on a wait that a
+                # Codex-reported error already tells us won't resolve itself.
+                #
+                # KNOWN LIMITATION, accepted not fixed: a fresh, genuinely
+                # unrelated Codex issue comment (e.g. someone asks
+                # `@codex fix CI` while this gate is waiting) would also
+                # satisfy the "any comment counts" condition above and pass
+                # as if it were a real review — this branch only guards
+                # against Codex's own documented error phrases, not against
+                # positively confirming a comment IS a completed review.
+                # Building a reliable positive classifier for "this comment
+                # proves a real review happened" is real ongoing work for
+                # marginal benefit on a low-traffic gate; revisit if an
+                # unrelated-comment false-pass is ever actually observed
+                # (flagged reviewing this file).
+                echo "::error::Codex reported an error (quota/auth/workspace/account-connection) instead of reviewing $HEAD_SHA — failing now rather than waiting out the remaining timeout. Re-run this check once the underlying Codex issue is resolved."
+                exit 1
               fi
             fi
             echo "Still waiting for Codex to respond to $HEAD_SHA..."
