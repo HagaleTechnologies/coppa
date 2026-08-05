@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-08-02T05:30:43Z",
-  "head_commit": "75fb995",
+  "generated_at": "2026-08-04T23:46:19Z",
+  "head_commit": "2e49e50",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -89,7 +89,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:ae61ac1a948faeaaeace7a8f38e570992789485672910161c0c912cdc6acab71",
+      "hash": "sha256:0ff4615b291b99f8f57e5d372badf48c198131ef8b784723fc8929a7e0f085c0",
       "id": "adr-005-nr-bg2-ldpc",
       "kind": "decision-digest",
       "links": [

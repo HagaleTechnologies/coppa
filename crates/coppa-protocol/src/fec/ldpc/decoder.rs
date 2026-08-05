@@ -382,25 +382,36 @@ const NR_MSG_CLAMP: f32 = 64.0;
 pub struct NrBg2Decoder {
     scale: f32,
     max_iterations: usize,
-    /// Per base row, the list of (base_col, shift) edges. Length
-    /// `BASE_ROWS`.
-    rows_edges: Vec<Vec<(usize, usize)>>,
-    /// Cumulative (unlifted) edge count before base row `r`, i.e.
-    /// `edge_offset[r] = sum_{r' < r} rows_edges[r'].len()`. Used to compute
-    /// a flat message index for `(base_row, sub_row, local_edge)`.
-    edge_offset: Vec<usize>,
+    rows: Vec<NrRowSpan>,
+    edges: Vec<NrEdge>,
     /// Total (unlifted) edge count, `sum(rows_edges[r].len())` = 197.
     total_edges_unlifted: usize,
-    /// Precomputed variable-node index for every (base_row, sub_row `i`,
-    /// local edge `k`), flattened as `var_table[r][i*deg(r) + k]`. This is
-    /// exactly `col*Z + (i+shift)%Z`, computed once here instead of on
-    /// every edge visit of every iteration of every `decode()` call --
-    /// `Z=176` is not a power of two, so `(i+shift)%Z` is a genuine integer
-    /// division, and profiling (`examples/task4_decode_profile.rs`, Task 4
-    /// report) found the per-iteration layered-update pass, not allocation
-    /// or wrapper overhead, dominates decode cost; precomputing this table
-    /// removes ~35,000 runtime modulo operations per iteration.
-    var_table: Vec<Vec<usize>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NrRowSpan {
+    edge_start: u32,
+    degree: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NrEdge {
+    var_base: u32,
+    shift: u16,
+}
+
+const NR_MAX_ROW_DEGREE: usize = 10;
+const _: () = assert!(std::mem::size_of::<NrRowSpan>() == 8);
+const _: () = assert!(std::mem::size_of::<NrEdge>() == 8);
+
+#[inline(always)]
+fn for_each_nr_edge_run(mut f: impl FnMut(std::ops::Range<usize>, usize), edge: NrEdge) {
+    let split = nr_bg2::ZC - usize::from(edge.shift);
+    let var_base = edge.var_base as usize;
+    f(0..split, var_base + usize::from(edge.shift));
+    if split < nr_bg2::ZC {
+        f(split..nr_bg2::ZC, var_base);
+    }
 }
 
 impl Default for NrBg2Decoder {
@@ -415,39 +426,45 @@ impl NrBg2Decoder {
     }
 
     pub fn with_params(scale: f32, max_iterations: usize) -> Self {
-        let z = nr_bg2::ZC;
         let mut rows_edges: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nr_bg2::BASE_ROWS];
         for &(r, c, s) in nr_bg2::ENTRIES {
             rows_edges[r].push((c, s));
         }
-        let mut edge_offset = Vec::with_capacity(nr_bg2::BASE_ROWS);
-        let mut cum = 0usize;
-        for edges in &rows_edges {
-            edge_offset.push(cum);
-            cum += edges.len();
+        let mut rows = Vec::with_capacity(nr_bg2::BASE_ROWS);
+        let mut edges = Vec::with_capacity(nr_bg2::ENTRIES.len());
+        for (r, row_edges) in rows_edges.iter().enumerate() {
+            assert!(
+                (3..=NR_MAX_ROW_DEGREE).contains(&row_edges.len()),
+                "base row {r} degree {} is outside 3..={NR_MAX_ROW_DEGREE}",
+                row_edges.len()
+            );
+            for (i, &(col, shift)) in row_edges.iter().enumerate() {
+                assert!(
+                    row_edges[..i].iter().all(|&(other, _)| other != col),
+                    "base row {r} repeats base column {col}; layered sub-rows are not independent"
+                );
+                assert!(
+                    shift < nr_bg2::ZC,
+                    "base row {r}, column {col} shift {shift} is not reduced modulo Zc={}",
+                    nr_bg2::ZC
+                );
+            }
+            rows.push(NrRowSpan {
+                edge_start: edges.len() as u32,
+                degree: row_edges.len() as u8,
+            });
+            edges.extend(row_edges.iter().map(|&(col, shift)| NrEdge {
+                var_base: (col * nr_bg2::ZC) as u32,
+                shift: shift as u16,
+            }));
         }
-
-        let var_table: Vec<Vec<usize>> = rows_edges
-            .iter()
-            .map(|edges| {
-                let deg = edges.len();
-                let mut table = vec![0usize; z * deg];
-                for i in 0..z {
-                    for (k, &(col, shift)) in edges.iter().enumerate() {
-                        table[i * deg + k] = col * z + (i + shift) % z;
-                    }
-                }
-                table
-            })
-            .collect();
 
         Self {
             scale,
             max_iterations,
-            rows_edges,
-            edge_offset,
-            total_edges_unlifted: cum,
-            var_table,
+            rows,
+            edges,
+            total_edges_unlifted: nr_bg2::ENTRIES.len(),
         }
     }
 
@@ -494,56 +511,67 @@ impl NrBg2Decoder {
 
         for iter in 0..self.max_iterations {
             iterations_used = iter + 1;
-            for (r, edges) in self.rows_edges.iter().enumerate() {
-                let deg = edges.len();
-                if deg == 0 {
-                    continue;
+            for row in &self.rows {
+                let edge_start = row.edge_start as usize;
+                let degree = usize::from(row.degree);
+                let mut min1 = [f32::MAX; nr_bg2::ZC];
+                let mut min2 = [f32::MAX; nr_bg2::ZC];
+                let mut min1_idx = [0u8; nr_bg2::ZC];
+                let mut total_sign = [1.0f32; nr_bg2::ZC];
+
+                for k in 0..degree {
+                    let edge = self.edges[edge_start + k];
+                    let message_base = (edge_start + k) * z;
+                    for_each_nr_edge_run(
+                        |range, var_start| {
+                            for (offset, i) in range.enumerate() {
+                                let var = var_start + offset;
+                                let extrinsic = total_llr[var] - check_to_var[message_base + i];
+                                // Bit-exactness contract: keep `.abs()`, `>= 0.0`, strict `<`,
+                                // ascending k, and the original arithmetic order. In particular,
+                                // a sign-select replacement for `.abs()` diverges on -0.0.
+                                let sign = if extrinsic >= 0.0 { 1.0 } else { -1.0 };
+                                total_sign[i] *= sign;
+                                let magnitude = extrinsic.abs();
+                                if magnitude < min1[i] {
+                                    min2[i] = min1[i];
+                                    min1[i] = magnitude;
+                                    min1_idx[i] = k as u8;
+                                } else if magnitude < min2[i] {
+                                    min2[i] = magnitude;
+                                }
+                            }
+                        },
+                        edge,
+                    );
                 }
-                let base_edge = self.edge_offset[r];
-                let var_row = &self.var_table[r];
 
-                // Fixed-size stack buffers -- BG2's max row degree here is
-                // 10 (see nr_bg2 provenance docs' printed weights), but size
-                // generously; assert (not debug_assert) so an out-of-range
-                // degree can never silently corrupt memory in release
-                // builds (mirrors `LdpcDecoder`'s `check node degree`
-                // assert above).
-                assert!(
-                    deg <= 32,
-                    "base row {r} degree {deg} exceeds fixed buffer size 32"
-                );
-                let mut signs = [0.0f32; 32];
-                let mut mags = [0.0f32; 32];
-                let mut vars = [0usize; 32];
-                let mut old_msgs = [0.0f32; 32];
-
-                for i in 0..z {
-                    let row_base = i * deg;
-                    for k in 0..deg {
-                        let var = var_row[row_base + k];
-                        let edge_idx = (base_edge + k) * z + i;
-                        let old_msg = check_to_var[edge_idx];
-                        let extrinsic = total_llr[var] - old_msg;
-                        signs[k] = if extrinsic >= 0.0 { 1.0 } else { -1.0 };
-                        mags[k] = extrinsic.abs();
-                        vars[k] = var;
-                        old_msgs[k] = old_msg;
-                    }
-
-                    let total_sign: f32 = signs[..deg].iter().product();
-                    let (min1, min1_idx, min2) = two_smallest(&mags[..deg]);
-
-                    for k in 0..deg {
-                        let min_other = if k == min1_idx { min2 } else { min1 };
-                        let new_msg = (total_sign * signs[k] * min_other * self.scale)
-                            .clamp(-NR_MSG_CLAMP, NR_MSG_CLAMP);
-                        let edge_idx = (base_edge + k) * z + i;
-                        check_to_var[edge_idx] = new_msg;
-                        let updated = (total_llr[vars[k]] + (new_msg - old_msgs[k]))
-                            .clamp(-NR_MSG_CLAMP, NR_MSG_CLAMP);
-                        total_llr[vars[k]] = updated;
-                        hard[vars[k]] = (updated < 0.0) as u8;
-                    }
+                for k in 0..degree {
+                    let edge = self.edges[edge_start + k];
+                    let message_base = (edge_start + k) * z;
+                    for_each_nr_edge_run(
+                        |range, var_start| {
+                            for (offset, i) in range.enumerate() {
+                                let var = var_start + offset;
+                                let old_msg = check_to_var[message_base + i];
+                                let extrinsic = total_llr[var] - old_msg;
+                                let sign = if extrinsic >= 0.0 { 1.0 } else { -1.0 };
+                                let min_other = if k == usize::from(min1_idx[i]) {
+                                    min2[i]
+                                } else {
+                                    min1[i]
+                                };
+                                let new_msg = (total_sign[i] * sign * min_other * self.scale)
+                                    .clamp(-NR_MSG_CLAMP, NR_MSG_CLAMP);
+                                check_to_var[message_base + i] = new_msg;
+                                let updated = (total_llr[var] + (new_msg - old_msg))
+                                    .clamp(-NR_MSG_CLAMP, NR_MSG_CLAMP);
+                                total_llr[var] = updated;
+                                hard[var] = (updated < 0.0) as u8;
+                            }
+                        },
+                        edge,
+                    );
                 }
             }
 
@@ -564,19 +592,22 @@ impl NrBg2Decoder {
     /// instead of re-deriving each hard bit from a 4-byte float compare on
     /// every one of a variable node's (multiple) row memberships.
     fn check_syndrome(&self, hard: &[u8]) -> bool {
-        let z = nr_bg2::ZC;
-        for (r, edges) in self.rows_edges.iter().enumerate() {
-            let deg = edges.len();
-            let var_row = &self.var_table[r];
-            for i in 0..z {
-                let mut syn = 0u8;
-                let row_base = i * deg;
-                for k in 0..deg {
-                    syn ^= hard[var_row[row_base + k]];
-                }
-                if syn != 0 {
-                    return false;
-                }
+        for row in &self.rows {
+            let edge_start = row.edge_start as usize;
+            let mut syndrome = [0u8; nr_bg2::ZC];
+            for edge in &self.edges[edge_start..edge_start + usize::from(row.degree)] {
+                for_each_nr_edge_run(
+                    |range, var_start| {
+                        for (offset, i) in range.enumerate() {
+                            let var = var_start + offset;
+                            syndrome[i] ^= hard[var];
+                        }
+                    },
+                    *edge,
+                );
+            }
+            if syndrome.iter().any(|&value| value != 0) {
+                return false;
             }
         }
         true
@@ -715,6 +746,248 @@ impl NrBg2FloodingDecoder {
 mod nr_bg2_decoder_tests {
     use super::*;
     use crate::fec::ldpc::encoder::NrBg2Encoder;
+
+    fn decode_reference(
+        full_llrs: &[f32],
+        scale: f32,
+        max_iterations: usize,
+    ) -> (Vec<f32>, usize, bool) {
+        let z = nr_bg2::ZC;
+        let mut rows_edges: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nr_bg2::BASE_ROWS];
+        for &(r, c, s) in nr_bg2::ENTRIES {
+            rows_edges[r].push((c, s));
+        }
+        let mut edge_offset = Vec::with_capacity(nr_bg2::BASE_ROWS);
+        let mut total_edges = 0usize;
+        for edges in &rows_edges {
+            edge_offset.push(total_edges);
+            total_edges += edges.len();
+        }
+        let var_table: Vec<Vec<usize>> = rows_edges
+            .iter()
+            .map(|edges| {
+                let mut table = vec![0usize; z * edges.len()];
+                for i in 0..z {
+                    for (k, &(col, shift)) in edges.iter().enumerate() {
+                        table[i * edges.len() + k] = col * z + (i + shift) % z;
+                    }
+                }
+                table
+            })
+            .collect();
+        let check = |hard: &[u8]| {
+            rows_edges.iter().enumerate().all(|(r, edges)| {
+                (0..z).all(|i| {
+                    let row_base = i * edges.len();
+                    (0..edges.len()).fold(0u8, |syn, k| syn ^ hard[var_table[r][row_base + k]]) == 0
+                })
+            })
+        };
+
+        let mut total_llr = full_llrs.to_vec();
+        let mut check_to_var = vec![0.0f32; total_edges * z];
+        let mut hard: Vec<u8> = total_llr.iter().map(|&llr| (llr < 0.0) as u8).collect();
+        let mut iterations = 0;
+        for iter in 0..max_iterations {
+            iterations = iter + 1;
+            for (r, edges) in rows_edges.iter().enumerate() {
+                let degree = edges.len();
+                let mut signs = [0.0f32; 32];
+                let mut mags = [0.0f32; 32];
+                let mut vars = [0usize; 32];
+                let mut old_msgs = [0.0f32; 32];
+                for i in 0..z {
+                    for k in 0..degree {
+                        let var = var_table[r][i * degree + k];
+                        let edge_idx = (edge_offset[r] + k) * z + i;
+                        let old_msg = check_to_var[edge_idx];
+                        let extrinsic = total_llr[var] - old_msg;
+                        signs[k] = if extrinsic >= 0.0 { 1.0 } else { -1.0 };
+                        mags[k] = extrinsic.abs();
+                        vars[k] = var;
+                        old_msgs[k] = old_msg;
+                    }
+                    let total_sign: f32 = signs[..degree].iter().product();
+                    let (min1, min1_idx, min2) = two_smallest(&mags[..degree]);
+                    for k in 0..degree {
+                        let min_other = if k == min1_idx { min2 } else { min1 };
+                        let new_msg = (total_sign * signs[k] * min_other * scale)
+                            .clamp(-NR_MSG_CLAMP, NR_MSG_CLAMP);
+                        let edge_idx = (edge_offset[r] + k) * z + i;
+                        check_to_var[edge_idx] = new_msg;
+                        let updated = (total_llr[vars[k]] + (new_msg - old_msgs[k]))
+                            .clamp(-NR_MSG_CLAMP, NR_MSG_CLAMP);
+                        total_llr[vars[k]] = updated;
+                        hard[vars[k]] = (updated < 0.0) as u8;
+                    }
+                }
+            }
+            if check(&hard) {
+                return (total_llr, iterations, true);
+            }
+        }
+        (total_llr, iterations, false)
+    }
+
+    #[test]
+    fn nr_bg2_rows_have_no_repeated_base_col() {
+        for row in 0..nr_bg2::BASE_ROWS {
+            let columns: Vec<_> = nr_bg2::ENTRIES
+                .iter()
+                .filter_map(|&(r, column, _)| (r == row).then_some(column))
+                .collect();
+            assert!((3..=NR_MAX_ROW_DEGREE).contains(&columns.len()));
+            for (i, column) in columns.iter().enumerate() {
+                assert!(!columns[..i].contains(column), "row {row}, column {column}");
+            }
+        }
+    }
+
+    #[test]
+    fn nr_bg2_edge_var_run_matches_rotation_identity() {
+        for &(_, column, shift) in nr_bg2::ENTRIES {
+            let edge = NrEdge {
+                var_base: (column * nr_bg2::ZC) as u32,
+                shift: shift as u16,
+            };
+            let mut actual = Vec::with_capacity(nr_bg2::ZC);
+            for_each_nr_edge_run(
+                |range, var_start| actual.extend(range.enumerate().map(|(n, _)| var_start + n)),
+                edge,
+            );
+            let expected: Vec<_> = (0..nr_bg2::ZC)
+                .map(|i| column * nr_bg2::ZC + (i + shift) % nr_bg2::ZC)
+                .collect();
+            assert_eq!(actual, expected, "column={column}, shift={shift}");
+        }
+    }
+
+    #[test]
+    fn nr_bg2_bitexact_matches_reference_fast() {
+        let n = nr_bg2::BASE_COLS * nr_bg2::ZC;
+        let mut vectors = vec![
+            (0..n)
+                .map(|i| if i % 3 == 0 { 3.0 } else { -3.0 })
+                .collect::<Vec<_>>(),
+            vec![0.0; n],
+            vec![-0.0; n],
+            (0..n)
+                .map(|i| match i % 4 {
+                    0 => f32::MIN_POSITIVE,
+                    1 => -1e30,
+                    2 => 1e30,
+                    _ => 0.0,
+                })
+                .collect(),
+        ];
+        let mut state = 0xB17E_7AC7_C0DE_0001u64;
+        for scale in [0.25f32, 1.0, 4.0, 16.0] {
+            vectors.push(
+                (0..n)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        ((state >> 32) as i32 as f32) / i32::MAX as f32 * scale
+                    })
+                    .collect(),
+            );
+        }
+        let decoder = NrBg2Decoder::new();
+        for (vector_index, llrs) in vectors.iter().enumerate() {
+            let expected = decode_reference(llrs, NR_DEFAULT_SCALE, NR_DEFAULT_MAX_ITERATIONS);
+            let actual = decoder.decode(llrs);
+            assert_eq!(actual.1, expected.1, "iterations, vector {vector_index}");
+            assert_eq!(actual.2, expected.2, "converged, vector {vector_index}");
+            for (index, (actual, expected)) in actual.0.iter().zip(&expected.0).enumerate() {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "vector {vector_index}, posterior index {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nr_bg2_check_syndrome_matches_reference_on_random_hard_vectors() {
+        let decoder = NrBg2Decoder::new();
+        let n = nr_bg2::BASE_COLS * nr_bg2::ZC;
+        let mut state = 0xC0FF_EE12_3456_789Au64;
+        let mut saw_valid = false;
+        let mut saw_invalid = false;
+        for trial in 0..200 {
+            let mut hard = vec![0u8; n];
+            if trial != 0 {
+                for bit in &mut hard {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    *bit = (state % 31 == 0) as u8;
+                }
+            }
+            let expected = (0..nr_bg2::BASE_ROWS).all(|row| {
+                (0..nr_bg2::ZC).all(|i| {
+                    nr_bg2::ENTRIES.iter().filter(|&&(r, _, _)| r == row).fold(
+                        0u8,
+                        |syn, &(_, column, shift)| {
+                            syn ^ hard[column * nr_bg2::ZC + (i + shift) % nr_bg2::ZC]
+                        },
+                    ) == 0
+                })
+            });
+            let actual = decoder.check_syndrome(&hard);
+            saw_valid |= actual;
+            saw_invalid |= !actual;
+            assert_eq!(actual, expected, "trial {trial}");
+        }
+        assert!(saw_valid && saw_invalid);
+    }
+
+    /// Slow, release-only equivalence tier. Manual mutation checks must make
+    /// this test or `nr_bg2_bitexact_matches_reference_fast` fail: replacing
+    /// `.abs()` with sign-select, changing strict `<` to `<=`, changing the
+    /// scale, or dropping either clamp.
+    #[test]
+    #[ignore = "512 full BG2 reference/production decodes; run in release mode"]
+    fn nr_bg2_decode_is_bit_identical_to_reference_exhaustive() {
+        let n = nr_bg2::BASE_COLS * nr_bg2::ZC;
+        let decoder = NrBg2Decoder::new();
+        let mut state = 0xDEC0_DED0_C0FF_EE01u64;
+        for vector_index in 0..512 {
+            let llrs: Vec<f32> = (0..n)
+                .map(|i| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    match vector_index % 5 {
+                        0 => {
+                            if i % 3 == 0 {
+                                3.0
+                            } else {
+                                -3.0
+                            }
+                        }
+                        1 => ((state >> 32) as i32 as f32) / i32::MAX as f32 * 12.0,
+                        2 => [0.0, -0.0, 64.0, -64.0][i % 4],
+                        3 => [f32::MIN_POSITIVE, -1e30, 1e30, 0.0][i % 4],
+                        _ => ((state & 0xff) as f32 - 127.5) / 8.0,
+                    }
+                })
+                .collect();
+            let expected = decode_reference(&llrs, NR_DEFAULT_SCALE, NR_DEFAULT_MAX_ITERATIONS);
+            let actual = decoder.decode(&llrs);
+            assert_eq!(actual.1, expected.1, "iterations, vector {vector_index}");
+            assert_eq!(actual.2, expected.2, "converged, vector {vector_index}");
+            for (index, (actual, expected)) in actual.0.iter().zip(&expected.0).enumerate() {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "vector {vector_index}, posterior index {index}"
+                );
+            }
+        }
+    }
 
     fn full_codeword_llrs(
         mother_len_full_including_punctured: usize,

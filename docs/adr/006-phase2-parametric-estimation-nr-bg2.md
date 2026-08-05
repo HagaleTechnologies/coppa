@@ -142,9 +142,12 @@ duplicated here; **two shortfalls from ADR-005's own acceptance targets are carr
 honestly**: level-2 AWGN isolated-FEC-layer coding gain measured **+0.5 dB** (target ≥1.2 dB,
 believed to be a genuine finite-length effect against an asymptotic density-evolution prediction,
 not a decoder-schedule bug — ruled out via a direct layered-vs-flooding A/B), and decode CPU/frame
-measured **3.5x-9.5x** the old codec across the ladder (target ≤3x, because the shared mother
-code's graph no longer shrinks for high-rate levels the way the old per-rate graphs did — a real,
-verified ~19% optimization was found and shipped but did not close the gap; a follow-up syndrome-
+originally measured **3.5x-9.5x** the old codec across the ladder (target ≤3x). This timing is
+superseded by ADR-005 and `BENCHMARKS.md`'s COP-6 section: the corrected warm, realistic-payload
+instrument measures 1.48x-4.33x, with five of nine levels meeting the budget. The verdict shift is
+predominantly a measurement correction, not a decoder speedup; COP-6 also removed the former
+lifted-index-table optimization credited here. The shared mother code's graph no longer shrinks for
+high-rate levels the way the old per-rate graphs did; a follow-up syndrome-
 check optimization was also implemented, verified correct, but measured **no further CPU
 reduction**, reported honestly per that follow-up's own instruction not to force an appearance of
 improvement).

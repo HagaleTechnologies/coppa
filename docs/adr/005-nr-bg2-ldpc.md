@@ -95,14 +95,27 @@ Coppa's speed ladder needs; BG1 targets larger transport blocks Coppa has no use
   coding gain at level 2 (the primary acceptance point) measured +0.5 dB, short of the ~1.2-1.8 dB
   predicted from the density-evolution gap -- believed to be a genuine finite-length effect (802.11
   LDPC is itself a reasonably well-optimized code, and DE thresholds are asymptotic), not a
-  decoder bug (ruled out via the flooding A/B above), but not chased further. Decode CPU/frame is
-  3.5x-9.5x the old codec across the ladder, over the accepted 3x budget, even after a real,
-  verified ~19% reduction from precomputing the lifted variable-index table (Zc=176 is not a power
-  of two, so the naive per-edge `% Zc` was a genuine avoidable cost) and a cache-friendlier message
-  layout -- the remaining gap is structural: the shared graph no longer shrinks for high-rate
-  levels the way per-rate graphs used to, and closing it further would need a substantially larger
-  effort (SIMD, unsafe bounds-check elision, cache-aware node relabeling). See
-  `.superpowers/sdd/p2-task-4-report.md` for the full investigation, including a real correctness
+  decoder bug (ruled out via the flooding A/B above), but not chased further. COP-6 safely
+  restructured the decoder into contiguous edge/sub-row runs and deleted the 271 KiB lifted-index
+  table. The fresh realistic-payload result is 1.48x-4.33x the old codec; five levels meet the
+  accepted 3x budget and four remain over it:
+
+  | level | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 9 | 10 |
+  |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+  | ratio | 1.48x | 3.45x | 1.69x | 2.29x | 4.33x | 3.34x | 2.54x | 3.66x | 2.80x |
+  | verdict | met | NOT met | met | met | NOT met | NOT met | met | NOT met | met |
+
+  Levels 5 and 9 (both old rate 2/3) are tied within run variation at roughly 4.1-4.3x. The
+  apparent shift from the older published 3.5x-9.5x range is predominantly a benchmark-method
+  correction (warm-up plus pinned realistic payloads), not a code-driven multi-fold speedup.
+  The forced-iteration fit has a physically impossible negative intercept, so it does not support
+  the former single-number ~11% marginal-cost claim. A measured
+  extrinsic-scratch/scale-hoist follow-up regressed to 301.31 us/iteration and was reverted. The
+  remaining gap is structural for this implementation: the shared graph no longer shrinks for
+  high-rate levels the way per-rate graphs used to. Reusable decoder scratch buffers are an
+  untried safe/portable follow-up. See `BENCHMARKS.md`'s “COP-6 LDPC decode CPU” section for absolute
+  per-level timings and the corrected fixed-cost/wrapper-overhead interpretations. The original
+  investigation also caught and fixed a real correctness
   bug this same investigation caught and fixed: an alpha value calibrated at level 2 only broke
   real convergence at level 10's very different operating point, caught by existing tests, not the
   new codec's own; the shipped default (0.75) is the value validated across the whole ladder.
