@@ -7,8 +7,8 @@ maintainer: agent
 sources:
   - crates/coppa-protocol/**
 verified:
-  commit: 59b0b63
-  date: 2026-07-14
+  commit: be2141b
+  date: 2026-08-05
 links:
   - overview
   - adr-002-fec-strategy
@@ -55,8 +55,9 @@ The speed-level abstraction lives here and in `coppa-engine`; see [[coppa-engine
 
 ## Known gotchas
 
-- Level 9 (64-QAM 2/3) never converges under tested Watterson fading; the old
-  high-SNR levels-9/10 non-convergence is fixed. See [[ldpc-non-convergence]].
+- Level 9 (64-QAM 2/3) remains well above its FER target under tested Watterson
+  fading, although a perfect-CSI COP-4 oracle proves implementation headroom.
+  See [[ldpc-non-convergence]].
 - Multi-codeword frames deliberately do NOT extend ACK addressing, turbo
   re-estimation, or persistent IR-HARQ combining to per-codeword granularity —
   enforced in code, not just documented. See [[adr-007-multi-codeword-frames]].

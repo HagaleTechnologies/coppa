@@ -288,3 +288,12 @@ in other clones, branches, or worktrees.
 - **Flush at the end:** push (`--force-with-lease` only) and open/update your
   PR before finishing. Unpushed work is invisible work.
 - **Main moves only by PR merge.**
+
+**UPDATE (2026-08-05, COP-4):** The level-9 Watterson limitation is now instrumented rather than
+attributed to a physical 64-QAM ceiling. A corrected modulation-aware per-frame diagnostic shows
+LDPC non-convergence dominates and errors concentrate more strongly on high-noise-variance
+carriers. A 300-trial profile/CP matrix finds no arm clearing FER≤10% through 36 dB, but a
+perfect-CSI bound admits 91.6% of Watterson-Good frames at 30 dB (95% CI 88.84–93.73%) versus
+15.0% real decode success (95% CI 11.40–19.48%). This proves implementation headroom in
+fade-diversity/FEC coverage; it does not justify a profile-routing change. See BENCHMARKS.md's
+"Level 9 Watterson fading diagnosis (COP-4)" section.
