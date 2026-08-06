@@ -332,7 +332,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          IS_SYNC: ${{ github.event.action == 'synchronize' }}
+          IS_SYNC: ${{ github.event.action == 'synchronize' || github.event.action == 'reopened' || github.run_attempt > 1 }}
         run: |
           set -o pipefail
           # Only count signals created at/after this run started, and reviews
