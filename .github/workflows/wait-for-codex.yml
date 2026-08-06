@@ -1,5 +1,8 @@
 name: Wait for Codex
 
+# Triggering a fresh synchronize event to test the classic PAT (repo scope)
+# fix confirmed working on pancetta#239 — no logic changed.
+#
 # pull_request_target (not pull_request): this workflow handles a
 # Codex-recognized PAT and a write-scoped GITHUB_TOKEN. On `pull_request`, a
 # same-repo PR that edits THIS FILE runs its own edited version with full
