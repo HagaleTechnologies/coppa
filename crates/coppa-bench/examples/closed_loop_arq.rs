@@ -396,17 +396,31 @@ struct FrameOutcome {
 }
 
 /// Transmit one known frame at `level` through the scheduled channel.
-fn run_frame(tx: &CoppaTransceiver, level: u8, f: usize, n: usize, run_seed: u64) -> FrameOutcome {
+// Review finding (P1): B-vs-C (and any long-vs-short comparison) changes BOTH the CP length
+// AND the header's `bandwidth` codeword (`tx.profile().bandwidth_id` differs per profile --
+// hf_robust=3 vs the synthetic short-CP profile=5; the `standard` pair's 1 vs 4), and
+// `BENCHMARKS.md`'s own header-codeword ablation shows the codeword ALONE can shift delivered
+// bits by up to 0.81%. `header_bandwidth_override` lets a caller pin the transmitted header's
+// `bandwidth` field to a DIFFERENT value than the profile actually transmitting -- the real OFDM
+// modulation (CP length, subcarriers) still comes from `tx`'s true profile, only the header's
+// metadata field changes. This isolates the header-codeword effect from the CP-length effect;
+// see `run_bandwidth_id_ablation`.
+fn run_frame(
+    tx: &CoppaTransceiver,
+    level: u8,
+    f: usize,
+    n: usize,
+    run_seed: u64,
+    header_bandwidth_override: Option<u8>,
+) -> FrameOutcome {
     let pfb = mode_for_level(level).unwrap().payload_bytes();
     let payload: Vec<u8> = (0..pfb)
         .map(|i| (i as u64 * 0x9E37 + f as u64) as u8)
         .collect();
     let seq = (f % 256) as u8;
+    let bandwidth = header_bandwidth_override.unwrap_or(tx.profile().bandwidth_id);
     let sig = tx
-        .transmit(
-            &make_header(level, pfb as u16, seq, tx.profile().bandwidth_id),
-            &payload,
-        )
+        .transmit(&make_header(level, pfb as u16, seq, bandwidth), &payload)
         .expect("payload sized from this level's own payload_bytes() always fits");
     let (ch, snr) = schedule(f, n);
     let faded = apply_channel(&sig, ch, snr, frame_seed(run_seed, f));
@@ -466,7 +480,13 @@ struct ArmResult {
     rebuilds: usize,
 }
 
-fn run_arm(kind: &ArmKind, pair: &CpProfilePair, run_seed: u64, n: usize) -> ArmResult {
+fn run_arm(
+    kind: &ArmKind,
+    pair: &CpProfilePair,
+    run_seed: u64,
+    n: usize,
+    header_bandwidth_override: Option<u8>,
+) -> ArmResult {
     let mut slots: Vec<FrameSlot> = Vec::with_capacity(n);
     let mut trace: Vec<(usize, f32, u8)> = Vec::new();
     let mut hist: [SpreadHistogram; 4] = Default::default();
@@ -546,7 +566,7 @@ fn run_arm(kind: &ArmKind, pair: &CpProfilePair, run_seed: u64, n: usize) -> Arm
             },
         };
 
-        let out = run_frame(&tx, level, f, n, run_seed);
+        let out = run_frame(&tx, level, f, n, run_seed, header_bandwidth_override);
 
         // Airtime bookkeeping on the CONTROL (long-CP) basis, per D1a.
         let long_air = frame_airtime_s(level, &pair.long).unwrap_or(0.0);
@@ -664,6 +684,9 @@ struct SeedAgg {
     /// See `SeedResult::arm_c`'s doc for why this replaced `best_arm(short_cells())` as the
     /// B-vs-C isolation comparator.
     arm_c: f64,
+    /// Arm C with the header's `bandwidth` field pinned to `pair.long.bandwidth_id`. See
+    /// `SeedResult::arm_c_bw_ablation`'s doc.
+    arm_c_bw_ablation: f64,
     bf_long: f64,
     bf_joint: f64,
     orc_long: f64,
@@ -690,6 +713,12 @@ struct SeedResult {
     /// fixed level. The old comparator (`best_arm(short_cells())`, fixed rate AND fixed CP) is
     /// kept below as a separate upper-bound reference, never as the isolation claim's C.
     arm_c: ArmResult,
+    /// Review finding: arm C's header carries `pair.short.bandwidth_id`, differing from every
+    /// long-CP arm's `pair.long.bandwidth_id` -- so B-vs-C conflated CP length with this header
+    /// codeword (BENCHMARKS.md's own ablation moves delivered bits by up to 0.81% on the
+    /// codeword alone). Arm C', identical to arm C except the header's `bandwidth` field is
+    /// pinned to `pair.long.bandwidth_id`, isolates that effect at constant (short) CP.
+    arm_c_bw_ablation: ArmResult,
     /// The 18 comparator cells, `[LongCp 9 levels..., ShortCp 9 levels...]`.
     cells: Vec<Vec<FrameSlot>>,
 }
@@ -714,7 +743,7 @@ fn run_seed(pair: &CpProfilePair, seed: u64, n: usize) -> SeedResult {
     let mut cells: Vec<Vec<FrameSlot>> = Vec::with_capacity(2 * VALID_SPEED_LEVELS.len());
     for mode in [CpMode::LongCp, CpMode::ShortCp] {
         for &lvl in VALID_SPEED_LEVELS.iter() {
-            let r = run_arm(&ArmKind::Fixed { level: lvl, mode }, pair, seed, n);
+            let r = run_arm(&ArmKind::Fixed { level: lvl, mode }, pair, seed, n, None);
             eprintln!(
                 "  seed {seed} fixed {:?} L{lvl}: {}/{} delivered, {:.1} bps",
                 mode,
@@ -733,6 +762,7 @@ fn run_seed(pair: &CpProfilePair, seed: u64, n: usize) -> SeedResult {
         pair,
         seed,
         n,
+        None,
     );
     eprintln!(
         "  seed {seed} arm A  : {:.1} bps",
@@ -746,10 +776,34 @@ fn run_seed(pair: &CpProfilePair, seed: u64, n: usize) -> SeedResult {
         pair,
         seed,
         n,
+        None,
     );
     eprintln!(
         "  seed {seed} arm C  : {:.1} bps (adaptive rate, fixed short CP -- B's CP-isolation control)",
         goodput_bps(&arm_c.slots)
+    );
+
+    // Review finding (P1): arm C's header carries pair.short.bandwidth_id, which differs from
+    // pair.long.bandwidth_id (the ID every long-CP arm's header carries) -- so B-vs-C changes
+    // BOTH CP length and this header codeword, and BENCHMARKS.md's own ablation shows the
+    // codeword alone can move delivered bits by up to 0.81%. `arm_c_bw_ablation` re-runs arm C
+    // (same real short-CP transmission, same RateLoop) but with the header's `bandwidth` field
+    // PINNED to `pair.long.bandwidth_id` -- everything else identical to arm C. The
+    // arm_c-vs-arm_c_bw_ablation delta isolates the header-codeword effect at CONSTANT (short)
+    // CP, so it can be subtracted out of (or compared against) the B-vs-C delta.
+    let arm_c_bw_ablation = run_arm(
+        &ArmKind::FixedCpAdaptiveRate {
+            mode: CpMode::ShortCp,
+        },
+        pair,
+        seed,
+        n,
+        Some(pair.long.bandwidth_id),
+    );
+    eprintln!(
+        "  seed {seed} arm C' : {:.1} bps (arm C, header bandwidth pinned to long-CP's ID {} -- header-codeword isolation)",
+        goodput_bps(&arm_c_bw_ablation.slots),
+        pair.long.bandwidth_id
     );
 
     let arm_b = run_arm(
@@ -759,6 +813,7 @@ fn run_seed(pair: &CpProfilePair, seed: u64, n: usize) -> SeedResult {
         pair,
         seed,
         n,
+        None,
     );
     eprintln!(
         "  seed {seed} arm B  : {:.1} bps, {} switches",
@@ -766,7 +821,7 @@ fn run_seed(pair: &CpProfilePair, seed: u64, n: usize) -> SeedResult {
         arm_b.switches.len()
     );
 
-    let arm_b0 = run_arm(&ArmKind::CpAdaptive { latency: 0 }, pair, seed, n);
+    let arm_b0 = run_arm(&ArmKind::CpAdaptive { latency: 0 }, pair, seed, n, None);
     eprintln!(
         "  seed {seed} arm B0 : {:.1} bps, {} switches",
         goodput_bps(&arm_b0.slots),
@@ -775,7 +830,7 @@ fn run_seed(pair: &CpProfilePair, seed: u64, n: usize) -> SeedResult {
 
     // Arm P rebuilds on exactly arm B's switch frames, so it must run after B.
     let rebuild_at: Vec<usize> = arm_b.switches.iter().map(|s| s.effective_from).collect();
-    let arm_p = run_arm(&ArmKind::Placebo { rebuild_at }, pair, seed, n);
+    let arm_p = run_arm(&ArmKind::Placebo { rebuild_at }, pair, seed, n, None);
     // Arm B's rebuild count is printed BESIDE arm P's, not just P's own. The placebo is only a
     // control while the two rebuild sets match, and `CpPolicy::applied_on` now makes them match by
     // construction -- but a mismatch printed is a mismatch someone can see, whereas the divergence
@@ -800,6 +855,7 @@ fn run_seed(pair: &CpProfilePair, seed: u64, n: usize) -> SeedResult {
         arm_b,
         arm_b0,
         arm_c,
+        arm_c_bw_ablation,
         cells,
     }
 }
@@ -847,7 +903,7 @@ fn main() {
     println!("base pair    : {}", pair.label);
     println!(
         "frames/run   : {n}   seeds: {seeds:?}   runs: {}",
-        n_seeds * 23
+        n_seeds * 24
     );
     if pair.synthetic {
         println!(
@@ -867,20 +923,21 @@ fn main() {
         "The `airtime(s)` and `goodput` columns are DATA-AIRTIME-ONLY (= switch cost x0) for EVERY\n\
          arm, arm B included. Arm B's CP-handshake air is real and is charged separately in the\n\
          SWITCH ACCOUNTING block below (and as the x1 half of every ratio in THE BAR); it is NOT in\n\
-         this table's denominator. Arms A / P / B0 / C and all 18 comparator cells have no handshake\n\
-         air at all, so for them x0 is the whole story."
+         this table's denominator. Arms A / P / B0 / C / C' and all 18 comparator cells have no\n\
+         handshake air at all, so for them x0 is the whole story."
     );
     println!(
         "{:<6} {:<5} {:>9} {:>10} {:>11} {:>10} {:>7} {:>17}",
         "seed", "arm", "deliv", "bits", "airtime(s)", "goodput", "FER", "delivery 95% CI"
     );
     for (si, r) in results.iter().enumerate() {
-        let arms: [(&str, &ArmResult); 5] = [
+        let arms: [(&str, &ArmResult); 6] = [
             ("A", &r.arm_a),
             ("P", &r.arm_p),
             ("B", &r.arm_b),
             ("B0", &r.arm_b0),
             ("C", &r.arm_c),
+            ("C'", &r.arm_c_bw_ablation),
         ];
         for (name, a) in arms {
             let d = delivered_count(&a.slots);
@@ -965,6 +1022,7 @@ fn main() {
                 1.0,
             ),
             arm_c: goodput_bps(&r.arm_c.slots),
+            arm_c_bw_ablation: goodput_bps(&r.arm_c_bw_ablation.slots),
             bf_long: lg,
             bf_joint: jg,
             orc_long: ol,
@@ -1197,6 +1255,32 @@ fn main() {
          {:>9.1} bps -- fixed rate AND fixed CP, so B/this delta still conflates both adaptive\n  \
          dimensions; kept for reference only, per-frame in the seed table above as row \"C\".",
         m_c_upper_bound
+    );
+
+    // Review finding (P1): B-vs-C changes CP length AND the header's `bandwidth` codeword
+    // (arm C's header carries pair.short.bandwidth_id, every long-CP arm's carries
+    // pair.long.bandwidth_id). Arm C' is arm C with the header codeword pinned to
+    // pair.long.bandwidth_id -- same real short-CP transmission, same RateLoop, only the
+    // header's metadata field differs from arm C. The delta below is the header-codeword
+    // effect ALONE, at constant (short) CP -- how much of B-vs-C's delta this ablation
+    // shows could be header-driven rather than CP-driven.
+    println!(
+        "\nHEADER-CODEWORD ISOLATION (arm C vs arm C', same short CP, header bandwidth ID only):"
+    );
+    let m_c_prime = mean(&|s| s.arm_c_bw_ablation);
+    println!(
+        "  arm C (header id {}) {:>9.1} bps   vs   arm C' (header id {}) {:>9.1} bps  ({:+.2}%)",
+        pair.short.bandwidth_id,
+        m_c,
+        pair.long.bandwidth_id,
+        m_c_prime,
+        100.0 * (m_c_prime / m_c.max(1e-9) - 1.0)
+    );
+    println!(
+        "  for scale: B-vs-C was {:+.2}% (x0). If |C-vs-C'| is comparable to |B-vs-C|, the\n\
+         CP-specific conclusion above is confounded by the header codeword and should not be\n\
+         drawn without controlling for it.",
+        100.0 * (m_b / m_c.max(1e-9) - 1.0)
     );
 
     // D9's pre-committed decision rule: sign consistency across every seed, NOT a mean crossing a
