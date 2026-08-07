@@ -197,7 +197,7 @@ use coppa_bench::adaptive_goodput::{
 };
 use coppa_bench::cp_arm::{
     self, frame_seed, goodput_with_switch_cost_bps, same_profile, switch_airtime_s, CpPolicy,
-    CpSwitch, SpreadHistogram, SEEDS, SWITCH_LATENCY_FRAMES,
+    CpSwitch, SpreadHistogram, MAX_FRAMES, SEEDS, SEED_STRIDE, SWITCH_LATENCY_FRAMES,
 };
 use coppa_bench::scenario::{mode_for_level, profile_by_name, ChannelSpec, SAMPLE_RATE};
 use coppa_channel::watterson::WattersonPreset;
@@ -283,13 +283,23 @@ impl CpProfilePair {
 /// fresh transceiver decodes reliably).
 ///
 /// **COP-2 correction to the paragraph above.** Varying `seq` is still correct and still what a real
-/// link does, but the IR-HARQ justification does not actually bind in a run of this length:
+/// link does, but the IR-HARQ justification does not actually bind here at all:
 /// `HARQ_MAX_BUFFERS = 32` with LRU eviction, against a seq reuse distance of 256 frames, means a
 /// reused seq's accumulator has ALWAYS been evicted before it comes round again, so combining is an
-/// add-to-zero no-op. The load-bearing condition is therefore `N_FRAMES <= 256 + 32`; a future
-/// `COPPA_CL_FRAMES` above ~288, or a smaller `HARQ_MAX_BUFFERS`, would make the accumulator able to
-/// combine again and this comment's original hazard genuinely live. Stated so that change is
-/// visibly load-bearing rather than silently safe.
+/// add-to-zero no-op.
+///
+/// **Second COP-2 correction — to the first one.** That paragraph used to continue "the load-bearing
+/// condition is therefore `N_FRAMES <= 256 + 32`; a future `COPPA_CL_FRAMES` above ~288, or a smaller
+/// `HARQ_MAX_BUFFERS`, would make the accumulator able to combine again". **Both halves are wrong,
+/// and the first is self-refuting**: `DEFAULT_N_FRAMES` is 300, so the condition it declares
+/// load-bearing is violated by this file's own default and by every committed figure in
+/// `BENCHMARKS.md`. The real condition is `seq_reuse_distance > HARQ_MAX_BUFFERS`, i.e. `256 > 32` --
+/// and because this bench advances `seq` by exactly one per frame, that reuse distance is a constant
+/// 256 **independent of `N_FRAMES`**. There is no frame count at which IR-HARQ combining returns, and
+/// a smaller `HARQ_MAX_BUFFERS` only widens the margin. What WOULD make the hazard live is a change
+/// to how this bench assigns `seq` (batching, reuse, or a stride > 1). The genuine `N_FRAMES` ceiling
+/// is the cross-seed channel-realization collision instead -- see `cp_arm::MAX_FRAMES`, which `main`
+/// now asserts against.
 ///
 /// `bandwidth` is read from the transmitting profile rather than hardcoded to 1, mirroring
 /// `CoppaCore::encode_bytes` (`crates/coppa-engine/src/engine.rs:197`) -- required here because a
@@ -473,13 +483,24 @@ fn run_arm(kind: &ArmKind, pair: &CpProfilePair, run_seed: u64, n: usize) -> Arm
     for f in 0..n {
         // The ordering contract `CpPolicy` documents: pick the profile for frame `f` BEFORE
         // feeding frame `f`'s measurement, exactly as the daemon does.
-        let mode = match policy.as_mut() {
-            Some(p) => p.mode_for_frame(f),
-            None => boot_mode,
+        let (mode, applied_this_frame) = match policy.as_mut() {
+            Some(p) => {
+                let m = p.mode_for_frame(f);
+                (m, p.applied_on(f))
+            }
+            None => (boot_mode, false),
         };
         if policy.is_some() {
             let want = pair.for_mode(mode);
-            if !same_profile(tx.profile(), &want) {
+            // Rebuild on switch APPLICATION, not merely on profile inequality. The
+            // inequality term stays as a defensive backstop, but `applied_on` is what
+            // makes arm B's rebuild set equal `switches[].effective_from` BY
+            // CONSTRUCTION -- which is what arm P rebuilds on. Gating on inequality
+            // alone silently skipped the `from == to` case (reachable at latency 5, and
+            // printed as "NO-OP" by the switch-accounting block) while arm P still
+            // rebuilt there, so the placebo stopped being a control. See
+            // `CpPolicy::applied_on`.
+            if applied_this_frame || !same_profile(tx.profile(), &want) {
                 // No profile setter exists: `CoppaTransceiver::new` takes the profile BY VALUE
                 // (transceiver.rs:526). A CP switch is a REBUILD.
                 tx = CoppaTransceiver::new(want, 1);
@@ -524,8 +545,14 @@ fn run_arm(kind: &ArmKind, pair: &CpProfilePair, run_seed: u64, n: usize) -> Arm
 
         if let Some(p) = policy.as_mut() {
             if let Some(sw) = p.observe(f, level, out.delay_spread_ms) {
+                // Price the handshake on THIS run's pair, not on the `hf_standard` pair
+                // `cp_arm::profile_for` builds: the default base is `robust`, whose 36
+                // data carriers make every frame 61 symbols instead of 52, so
+                // reconstructing the profiles here undercharged the robust runs by ~15%
+                // -- an undercharge that inflates arm B. See `switch_airtime_s`'s doc.
                 switch_air_s +=
-                    switch_airtime_s(&sw).expect("switch level comes from VALID_SPEED_LEVELS");
+                    switch_airtime_s(&sw, &pair.for_mode(sw.from), &pair.for_mode(sw.to))
+                        .expect("switch level comes from VALID_SPEED_LEVELS");
             }
         }
 
@@ -577,12 +604,28 @@ fn wilson(k: usize, n: usize) -> (f64, f64) {
 }
 
 /// One seed's row of headline goodput figures, in bits/s. Every ratio and delta the report prints is
-/// built from these seven numbers, so they are named rather than carried as a tuple -- a 7-tuple of
-/// `f64` is exactly the shape where a transposed field silently reports the wrong quantity.
+/// built from these numbers, so they are named rather than carried as a tuple -- a tuple of `f64` is
+/// exactly the shape where a transposed field silently reports the wrong quantity.
+///
+/// # `arm_b` is the x0 (data-airtime-only) figure, and every consumer prints the x1 band beside it
+///
+/// `arm_b` was for a long time the ONLY arm-B number any headline consumed, and it is
+/// `delivered_bits / data_airtime` -- identically the x0 no-charge bound. The handshake airtime the
+/// run computed was accumulated into `ArmResult::switch_air_s` and then spent nowhere except the
+/// later SWITCH ACCOUNTING block, so the bar ratios, the aggregate mean, the per-seed D9 deltas and
+/// the primary table all quietly reported an arm B that paid nothing for its own switches (~3.3-4.5%
+/// pro-arm-B on this schedule) with no label saying so.
+///
+/// The fix is NOT to silently swap the primary to x1: `goodput_with_switch_cost_bps`'s doc records a
+/// deliberate refusal to commit to one guess about a cost this bench cannot measure. So both are
+/// carried, and every consumer prints the band.
 struct SeedAgg {
     arm_a: f64,
     arm_p: f64,
+    /// Arm B at cost x0 -- data airtime only. See the type doc.
     arm_b: f64,
+    /// Arm B at cost x1 -- the loss-free nominal, with one handshake's air charged per switch.
+    arm_b_x1: f64,
     bf_long: f64,
     bf_joint: f64,
     orc_long: f64,
@@ -676,11 +719,23 @@ fn run_seed(pair: &CpProfilePair, seed: u64, n: usize) -> SeedResult {
     // Arm P rebuilds on exactly arm B's switch frames, so it must run after B.
     let rebuild_at: Vec<usize> = arm_b.switches.iter().map(|s| s.effective_from).collect();
     let arm_p = run_arm(&ArmKind::Placebo { rebuild_at }, pair, seed, n);
+    // Arm B's rebuild count is printed BESIDE arm P's, not just P's own. The placebo is only a
+    // control while the two rebuild sets match, and `CpPolicy::applied_on` now makes them match by
+    // construction -- but a mismatch printed is a mismatch someone can see, whereas the divergence
+    // this replaced was invisible in the output for exactly as long as it existed.
     eprintln!(
-        "  seed {seed} arm P  : {:.1} bps ({} rebuilds)",
+        "  seed {seed} arm P  : {:.1} bps ({} rebuilds; arm B had {})",
         goodput_bps(&arm_p.slots),
-        arm_p.rebuilds
+        arm_p.rebuilds,
+        arm_b.rebuilds
     );
+    if arm_p.rebuilds != arm_b.rebuilds {
+        eprintln!(
+            "  seed {seed} WARNING: arm P rebuilt {} times but arm B rebuilt {} -- the placebo is \
+             NOT a control for this seed and arm B must not be read against it",
+            arm_p.rebuilds, arm_b.rebuilds
+        );
+    }
 
     SeedResult {
         arm_a,
@@ -710,6 +765,21 @@ fn main() {
     }
     let pair = CpProfilePair::for_base(&base);
     let n = env_usize("COPPA_CL_FRAMES", DEFAULT_N_FRAMES);
+    // `env_usize` is parse-or-default with no range check, in contrast to the seed count on the
+    // next line, which IS clamped. `cp_arm::MAX_FRAMES` is the cross-seed collision boundary
+    // (= SEED_STRIDE): above it, seed k's tail reproduces seed k+1's head value-for-value and the
+    // seeds stop being independent. An ASSERT rather than a clamp, because the override's
+    // documented purpose is to SHRINK the run: someone passing a larger value wants more frames,
+    // and silently giving them fewer would be worse than refusing.
+    //
+    // NOT the `256 + 32` this file's `make_header` doc used to name as the binding ceiling -- that
+    // number is wrong and is violated by DEFAULT_N_FRAMES itself. See `cp_arm::MAX_FRAMES`.
+    assert!(
+        n > 0 && n <= MAX_FRAMES,
+        "COPPA_CL_FRAMES={n} is out of range: must be 1..={MAX_FRAMES}, the frame_seed stride \
+         (SEED_STRIDE = {SEED_STRIDE}) -- above it two run seeds share channel realizations at an \
+         offset. The override exists to shrink the run for a smoke test."
+    );
     let n_seeds = env_usize("COPPA_CL_SEEDS", SEEDS.len())
         .min(SEEDS.len())
         .max(1);
@@ -735,6 +805,13 @@ fn main() {
 
     // ---- Per-seed primary table -------------------------------------------------
     println!("\n=== PRIMARY: airtime-normalized goodput (bits/s) ===");
+    println!(
+        "The `airtime(s)` and `goodput` columns are DATA-AIRTIME-ONLY (= switch cost x0) for EVERY\n\
+         arm, arm B included. Arm B's CP-handshake air is real and is charged separately in the\n\
+         SWITCH ACCOUNTING block below (and as the x1 half of every ratio in THE BAR); it is NOT in\n\
+         this table's denominator. Arms A / P / B0 / C and all 18 comparator cells have no handshake\n\
+         air at all, so for them x0 is the whole story."
+    );
     println!(
         "{:<6} {:<5} {:>9} {:>10} {:>11} {:>10} {:>7} {:>17}",
         "seed", "arm", "deliv", "bits", "airtime(s)", "goodput", "FER", "delivery 95% CI"
@@ -820,6 +897,12 @@ fn main() {
             arm_a: goodput_bps(&r.arm_a.slots),
             arm_p: goodput_bps(&r.arm_p.slots),
             arm_b: goodput_bps(&r.arm_b.slots),
+            arm_b_x1: goodput_with_switch_cost_bps(
+                delivered_bits(&r.arm_b.slots) as f64,
+                total_airtime(&r.arm_b.slots),
+                r.arm_b.switch_air_s,
+                1.0,
+            ),
             bf_long: lg,
             bf_joint: jg,
             orc_long: ol,
@@ -830,19 +913,27 @@ fn main() {
     // ---- Ratios against the bar -------------------------------------------------
     println!("\n=== THE BAR (adaptive/best-fixed > 1.0, adaptive/oracle >= 0.8) ===");
     println!(
-        "{:<6} {:>12} {:>12} {:>12} {:>12}",
+        "Each ratio is printed at BOTH switch-cost multipliers: x0 (arm B's data airtime only) and\n\
+         x1 (the loss-free nominal, one handshake charged per switch). x0 alone is what these rows\n\
+         used to report, unlabelled -- an arm B that paid nothing for its own switches."
+    );
+    println!(
+        "{:<6} {:>17} {:>17} {:>17} {:>17}",
         "seed", "B/bf(long)", "B/orc(long)", "B/bf(joint)", "B/orc(joint)"
     );
+    let band =
+        |x0: f64, x1: f64, d: f64| format!("{:.3}/{:.3}", x0 / d.max(1e-9), x1 / d.max(1e-9));
     for (si, s) in agg.iter().enumerate() {
         println!(
-            "{:<6} {:>12.3} {:>12.3} {:>12.3} {:>12.3}",
+            "{:<6} {:>17} {:>17} {:>17} {:>17}",
             seeds[si],
-            s.arm_b / s.bf_long.max(1e-9),
-            s.arm_b / s.orc_long.max(1e-9),
-            s.arm_b / s.bf_joint.max(1e-9),
-            s.arm_b / s.orc_joint.max(1e-9)
+            band(s.arm_b, s.arm_b_x1, s.bf_long),
+            band(s.arm_b, s.arm_b_x1, s.orc_long),
+            band(s.arm_b, s.arm_b_x1, s.bf_joint),
+            band(s.arm_b, s.arm_b_x1, s.orc_joint),
         );
     }
+    println!("(each cell is x0/x1)");
     println!(
         "\nREMINDER (Key Discovery 1): a uniform CP change is ONE CONSTANT airtime divisor, so it\n\
          cancels out of any ratio. The `(long)` columns let a short-CP arm bank a spurious\n\
@@ -974,6 +1065,7 @@ fn main() {
     let m_a = mean(&|s| s.arm_a);
     let m_p = mean(&|s| s.arm_p);
     let m_b = mean(&|s| s.arm_b);
+    let m_b_x1 = mean(&|s| s.arm_b_x1);
     let m_bf_long = mean(&|s| s.bf_long);
     let m_bf_joint = mean(&|s| s.bf_joint);
     let m_orc_long = mean(&|s| s.orc_long);
@@ -1007,15 +1099,28 @@ fn main() {
         .sum::<f64>()
         / results.len() as f64;
     println!(
-        "  arm B (CP-adaptive) {:>9.1} bps   vs   arm C (fixed short CP) {:>9.1} bps  ({:+.2}%)",
+        "  arm B (CP-adaptive) {:>9.1} bps   vs   arm C (fixed short CP) {:>9.1} bps  ({:+.2}%)   [x0]",
         m_b,
         m_c,
         100.0 * (m_b / m_c.max(1e-9) - 1.0)
     );
     println!(
-        "  arm B / best-fixed(joint) = {:.3}  (bar: > 1.0)\n  arm B / oracle(joint)     = {:.3}  (bar: >= 0.8)",
+        "  arm B (CP-adaptive) {:>9.1} bps   vs   arm C (fixed short CP) {:>9.1} bps  ({:+.2}%)   [x1]",
+        m_b_x1,
+        m_c,
+        100.0 * (m_b_x1 / m_c.max(1e-9) - 1.0)
+    );
+    println!(
+        "  arm B / best-fixed(joint) = {:.3} (x0) / {:.3} (x1)  (bar: > 1.0)\n  \
+         arm B / oracle(joint)     = {:.3} (x0) / {:.3} (x1)  (bar: >= 0.8)",
         m_b / m_bf_joint.max(1e-9),
-        m_b / m_orc_joint.max(1e-9)
+        m_b_x1 / m_bf_joint.max(1e-9),
+        m_b / m_orc_joint.max(1e-9),
+        m_b_x1 / m_orc_joint.max(1e-9)
+    );
+    println!(
+        "  x0 = arm B's data airtime only; x1 = its handshake air charged once per switch. Arm C\n\
+         has no handshake air at all, so only arm B's side of each comparison moves."
     );
 
     // D9's pre-committed decision rule: sign consistency across every seed, NOT a mean crossing a
@@ -1023,34 +1128,56 @@ fn main() {
     // COP-3's "diagnostic rather than statistical acceptance thresholds" precedent.
     println!("\nD9 DECISION RULE -- per-seed paired deltas, decided on SIGN CONSISTENCY:");
     println!(
-        "{:<6} {:>14} {:>14} {:>16}",
-        "seed", "B-A (bps)", "B-C (bps)", "B/bf(joint)"
+        "Deltas are shown at x0 and x1. The sign counts below are tallied at BOTH, because a sign\n\
+         that survives x0 but not x1 is a result the no-charge accounting manufactured."
+    );
+    println!(
+        "{:<6} {:>21} {:>21} {:>17}",
+        "seed", "B-A (bps) x0/x1", "B-C (bps) x0/x1", "B/bf(joint)"
     );
     let mut pos_ba = 0usize;
     let mut pos_bc = 0usize;
+    let mut pos_ba_x1 = 0usize;
+    let mut pos_bc_x1 = 0usize;
     for (si, r) in results.iter().enumerate() {
         let s = &agg[si];
         let c = best_arm(r.short_cells()).map(|(_, g)| g).unwrap_or(0.0);
         let d_ba = s.arm_b - s.arm_a;
         let d_bc = s.arm_b - c;
+        let d_ba_x1 = s.arm_b_x1 - s.arm_a;
+        let d_bc_x1 = s.arm_b_x1 - c;
         if d_ba > 0.0 {
             pos_ba += 1;
         }
         if d_bc > 0.0 {
             pos_bc += 1;
         }
+        if d_ba_x1 > 0.0 {
+            pos_ba_x1 += 1;
+        }
+        if d_bc_x1 > 0.0 {
+            pos_bc_x1 += 1;
+        }
         println!(
-            "{:<6} {:>+14.1} {:>+14.1} {:>16.3}",
+            "{:<6} {:>21} {:>21} {:>17}",
             seeds[si],
-            d_ba,
-            d_bc,
-            s.arm_b / s.bf_joint.max(1e-9)
+            format!("{d_ba:+.1}/{d_ba_x1:+.1}"),
+            format!("{d_bc:+.1}/{d_bc_x1:+.1}"),
+            format!(
+                "{:.3}/{:.3}",
+                s.arm_b / s.bf_joint.max(1e-9),
+                s.arm_b_x1 / s.bf_joint.max(1e-9)
+            ),
         );
     }
     let n_seeds_run = results.len();
     println!(
-        "  B > A on {}/{} seeds; B > C on {}/{} seeds.",
+        "  x0: B > A on {}/{} seeds; B > C on {}/{} seeds.",
         pos_ba, n_seeds_run, pos_bc, n_seeds_run
+    );
+    println!(
+        "  x1: B > A on {}/{} seeds; B > C on {}/{} seeds.",
+        pos_ba_x1, n_seeds_run, pos_bc_x1, n_seeds_run
     );
     println!(
         "  Sign-consistent (all {} seeds one way) => a DIRECTIONAL result. Mixed signs => no result,\n\

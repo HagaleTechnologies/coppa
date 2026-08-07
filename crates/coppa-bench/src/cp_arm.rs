@@ -78,10 +78,32 @@ pub const HANDSHAKE_FRAMES_OLD_PROFILE: usize = 3;
 /// on-air frames; step 5 is B's local state change and costs no air.
 pub const HANDSHAKE_FRAMES_NEW_PROFILE: usize = 2;
 
-/// Data-frame slots a completed handshake displaces before the new mode takes
-/// effect. Each control frame costs a full frame's airtime at the current level
+/// Whole data-frame slots the switch is **delayed by** while the handshake
+/// completes — NOT slots that carry no data. Those five frames still transmit real
+/// payload; they simply transmit it under the OLD profile, because the new one is
+/// not in force yet. The handshake's own air is a separate charge, levied by
+/// [`switch_airtime_s`]. See [`CpPolicy::new`]'s `latency_frames` parameter for the
+/// same definition stated precisely.
+///
+/// This doc used to open "Data-frame slots a completed handshake displaces", which
+/// reads as if the five slots were consumed by control traffic — and a PR review
+/// thread duly read it that way and proposed replacing those five data iterations
+/// with control frames to stop "double-counting" them. **That change is rejected,
+/// and the imprecise wording that invited it is what is fixed here.** There is no
+/// double-count to remove: `SWITCH_LATENCY_FRAMES` adds no airtime term anywhere,
+/// it only selects which profile five frames of a FIXED workload transmit under,
+/// and the bias it does introduce runs arm-B-PESSIMISTIC (five frames held on the
+/// more expensive long CP). Making them control frames would give the CP-adaptive
+/// arm 295 delivered slots against 300 for arms A / P / B0 and all 18 comparator
+/// cells, breaking the FER/Wilson denominators and the fixed-workload basis of
+/// every cross-arm delta, to chase a sub-0.1% effect that is not an error.
+///
+/// Each control frame does cost a full frame's airtime at the current level
 /// (`airtime.rs:44-51`: `transmit` always rate-matches to a fixed
-/// `CODED_BLOCK_LEN`, so a small CpControl PDU is not cheaper than a data frame).
+/// `CODED_BLOCK_LEN`, so a small CpControl PDU is not cheaper than a data frame) —
+/// which is precisely why [`switch_airtime_s`] charges it separately rather than by
+/// deleting data slots.
+///
 /// DERIVED, NOT SWEPT -- same status as `SWITCH_PROBATION_SECS = 180`; the
 /// zero-latency arm bounds its influence.
 pub const SWITCH_LATENCY_FRAMES: usize = 5;
@@ -163,16 +185,33 @@ pub struct CpSwitch {
 /// switch whose `to` already equals `current`. The daemon has the same property —
 /// it derives the proposed mode from the gate transition and never compares it
 /// against `cp_negotiator.current()` — so this type records it faithfully: five
-/// control frames of air spent for zero CP change. [`same_profile`] makes the
-/// arm's transceiver rebuild a no-op in that case, which is also what
-/// `set_cp_profile` would do (`cp_negotiator::tick`'s doc calls out the same
-/// "switch to the mode it was already on" case).
+/// control frames of air spent for zero CP change.
+///
+/// **That case is what [`CpPolicy::applied_on`] exists for, and the comment here
+/// used to get its justification exactly backwards.** It claimed [`same_profile`]
+/// making the arm's rebuild a no-op "is also what `set_cp_profile` would do". It is
+/// not: `CoppaCore::set_cp_profile`
+/// (`crates/coppa-engine/src/engine.rs:459-463`) clones the config and calls
+/// `reconfigure` **unconditionally**, with no equality guard, and the very doc that
+/// claim cited (`cp_negotiator.rs:564-567`) describes calling it with the mode it
+/// was already on as "a full transceiver + streaming-receiver rebuild that discards
+/// mid-frame samples". The discarded state is real — `harq_rx` is per-transceiver
+/// and freshly constructed in `CoppaTransceiver::new`, so a rebuild clears the
+/// IR-HARQ LLR accumulator. Gating the arm's rebuild on profile inequality
+/// therefore made a `from == to` switch rebuild-free in arm B while arm P — its
+/// rebuild placebo, which rebuilds on every recorded switch — still rebuilt, so the
+/// control silently stopped being a control. [`CpPolicy::applied_on`] reports switch
+/// APPLICATION instead, so arm B's rebuild set equals `switches[].effective_from`
+/// by construction, `from == to` included.
 pub struct CpPolicy {
     gate: CpGate,
     latency_frames: usize,
     current: CpMode,
     pending: Option<CpSwitch>,
     switches: Vec<CpSwitch>,
+    /// Frame index at which [`CpPolicy::mode_for_frame`] last applied a pending
+    /// switch. Read by [`CpPolicy::applied_on`]; see that method's doc.
+    applied_at: Option<usize>,
 }
 
 impl CpPolicy {
@@ -191,6 +230,7 @@ impl CpPolicy {
             current: CpMode::LongCp,
             pending: None,
             switches: Vec::new(),
+            applied_at: None,
         }
     }
 
@@ -262,9 +302,27 @@ impl CpPolicy {
             if frame >= sw.effective_from {
                 self.current = sw.to;
                 self.pending = None;
+                self.applied_at = Some(frame);
             }
         }
         self.current
+    }
+
+    /// Whether the [`CpPolicy::mode_for_frame`] call for `frame` **applied** a
+    /// pending switch — i.e. whether `frame` is a switch's `effective_from`.
+    ///
+    /// This is the arm loop's rebuild trigger, and it is deliberately NOT "the
+    /// profile changed". A `from == to` switch (see the type doc) applies a mode
+    /// equal to the one already in force, so a profile-inequality test reports
+    /// `false` there while a real `set_cp_profile` would still rebuild — which is
+    /// what let arm B's rebuild set diverge from arm P's. Keyed to the frame rather
+    /// than a bare flag so a caller that forgets to clear it cannot silently rebuild
+    /// on every subsequent frame.
+    ///
+    /// Only meaningful immediately after `mode_for_frame(frame)`, which is the order
+    /// the ordering contract already requires.
+    pub fn applied_on(&self, frame: usize) -> bool {
+        self.applied_at == Some(frame)
     }
 
     /// The mode in effect as of the last [`CpPolicy::mode_for_frame`] call,
@@ -282,13 +340,27 @@ impl CpPolicy {
 }
 
 /// On-air seconds one completed CP handshake costs: [`HANDSHAKE_FRAMES_OLD_PROFILE`]
-/// frames at `sw.from`'s profile plus [`HANDSHAKE_FRAMES_NEW_PROFILE`] at
-/// `sw.to`'s, both at `sw.level`.
+/// frames on `old` (the profile `sw.from` resolves to) plus
+/// [`HANDSHAKE_FRAMES_NEW_PROFILE`] on `new` (`sw.to`'s), both at `sw.level`.
 ///
 /// The split matters and is pinned in both directions: long→short and short→long
-/// cost *different* amounts (at level 2, 6.487 s vs 6.318 s), so charging all five
-/// frames at one profile — the obvious wrong implementation — is a test failure
-/// rather than a silent bias.
+/// cost *different* amounts (at level 2 on the standard pair, 6.487 s vs 6.318 s),
+/// so charging all five frames at one profile — the obvious wrong implementation —
+/// is a test failure rather than a silent bias.
+///
+/// # The caller supplies the profiles; this function does NOT reconstruct them
+///
+/// It used to call [`profile_for`] on `sw.from`/`sw.to`, which hardcodes the
+/// `hf_standard` pair — so the `robust` base (the DEFAULT base, whose pair is
+/// `hf_robust`'s 36 data / 12 pilot carriers against a synthetic short-CP twin) was
+/// charged the 44-carrier standard price. Fewer data carriers means MORE symbols
+/// per frame (61 vs 52 at bits/symbol 1), so the robust handshake really costs
+/// ~7.61 s against the ~6.487 s that was charged: a ~15% UNDERCHARGE, and an
+/// undercharge inflates the CP-adaptive arm's goodput — the same pro-arm-B
+/// direction as the four omissions below, but this one was undisclosed and
+/// unintended. Every profile-agnostic caller must therefore pass its own pair;
+/// [`profile_for`] remains the standard-pair constructor only. Pinned by
+/// `switch_airtime_scales_with_the_pair_the_caller_passes`.
 ///
 /// `None` for a reserved/unknown level, mirroring `frame_airtime_s`'s own contract
 /// (`airtime.rs:101-104`) instead of substituting a zero that would inflate the
@@ -299,10 +371,10 @@ impl CpPolicy {
 /// `DEFAULT_MAX_RETRANSMIT = 5`), the four half-duplex turnarounds, and
 /// handshakes that spend the full budget and then revert via G1-G4 for zero CP
 /// change. All three omissions favour the CP-adaptive arm.
-pub fn switch_airtime_s(sw: &CpSwitch) -> Option<f64> {
-    let old = frame_airtime_s(sw.level, &profile_for(sw.from))?;
-    let new = frame_airtime_s(sw.level, &profile_for(sw.to))?;
-    Some(HANDSHAKE_FRAMES_OLD_PROFILE as f64 * old + HANDSHAKE_FRAMES_NEW_PROFILE as f64 * new)
+pub fn switch_airtime_s(sw: &CpSwitch, old: &CoppaProfile, new: &CoppaProfile) -> Option<f64> {
+    let old_s = frame_airtime_s(sw.level, old)?;
+    let new_s = frame_airtime_s(sw.level, new)?;
+    Some(HANDSHAKE_FRAMES_OLD_PROFILE as f64 * old_s + HANDSHAKE_FRAMES_NEW_PROFILE as f64 * new_s)
 }
 
 /// Airtime-normalized goodput with the CP handshake's air charged at
@@ -344,10 +416,51 @@ pub const SEEDS: [u64; 5] = [0, 1, 2, 3, 4];
 /// Spacing between consecutive run seeds' frame-seed blocks. Must exceed the run's
 /// frame count or two runs share channel realizations at an offset — the failure
 /// this and `frame_seed_is_distinct_across_seeds_within_a_run` exist to prevent.
-/// 1024 clears the 300-frame default with room for a `COPPA_CL_FRAMES` override up
-/// to 1024; a larger override needs a larger stride, and the test is what will say
-/// so.
+/// 1024 clears [`MAX_FRAMES`] with room to spare.
+///
+/// This used to promise that "a larger override needs a larger stride, and the test
+/// is what will say so". **It did not say so**: the test hardcoded a 300-frame run
+/// and never read `COPPA_CL_FRAMES`, so nothing checked a larger override at all.
+/// Both ends are now real — the test is written against [`MAX_FRAMES`], and the
+/// example asserts its own `n` against the same constant — so the two cannot drift.
 pub const SEED_STRIDE: u64 = 1024;
+
+/// Hard ceiling on a run's frame count, enforced by `closed_loop_arq`'s `main`
+/// against its `COPPA_CL_FRAMES` override and by
+/// `frame_seed_is_distinct_across_seeds_within_a_run`.
+///
+/// The binding hazard is the **cross-seed channel-realization collision**:
+/// `frame_seed(k, f) = k * SEED_STRIDE + f`, so once `f` can reach [`SEED_STRIDE`],
+/// seed `k`'s tail reproduces seed `k+1`'s head value-for-value — and the seed
+/// reaches the RNG directly (`apply_channel` passes `seed ^ 0x5555` / `seed ^
+/// 0x3333` into `StdRng::seed_from_u64`), so the "independent" seeds the multi-seed
+/// sign-consistency rule depends on would share channel realizations at an offset.
+/// `n == SEED_STRIDE` is the last safe value: seed 0's frames run `0..=1023` and
+/// seed 1's start at 1024.
+///
+/// # Why this is NOT `256 + 32`, despite what `closed_loop_arq` used to claim
+///
+/// That file's `make_header` doc asserted the load-bearing condition was
+/// `N_FRAMES <= 256 + 32` — "a future `COPPA_CL_FRAMES` above ~288 would make the
+/// IR-HARQ accumulator able to combine again". Two things are wrong with it, and
+/// enforcing it as written would have **panicked the bench's own default run**
+/// (`DEFAULT_N_FRAMES = 300`, and the committed 5 × 300-frame figures in
+/// `BENCHMARKS.md` were measured there).
+///
+/// The reasoning does not hold either. `seq` wraps mod 256 and this bench advances
+/// it by one per frame, so the reuse distance between two frames sharing a seq is a
+/// constant **256 frames, independent of `n`** — and those 256 frames insert 255
+/// distinct other seqs into a `HARQ_MAX_BUFFERS = 32` LRU map
+/// (`transceiver.rs:300-312`: `get_or_create` evicts the least-recently-used entry
+/// on every insert past the cap). 255 ≫ 32, so a reused seq's accumulator has
+/// **always** been evicted, at every `n`. The safety condition is
+/// `seq_reuse_distance > HARQ_MAX_BUFFERS`, which holds unconditionally here; it is
+/// not a bound on `n` at all. A *smaller* `HARQ_MAX_BUFFERS` cannot break it either
+/// — only a change to how this bench assigns `seq` could.
+///
+/// The stale claim is corrected at its source (`closed_loop_arq`'s `make_header`)
+/// rather than restated here.
+pub const MAX_FRAMES: usize = SEED_STRIDE as usize;
 
 /// Per-frame channel seed for run `run_seed`, frame `f`.
 ///
@@ -574,6 +687,83 @@ mod tests {
         assert_eq!(policy.mode_for_frame(4), CpMode::ShortCp);
     }
 
+    /// `applied_on` reports switch APPLICATION, which is what the arm loop rebuilds
+    /// on — and the case that separates it from a profile-inequality test is the
+    /// `from == to` switch the type doc describes.
+    ///
+    /// The sequence is the documented one, and every step is load-bearing:
+    /// frames 0-3 calm decide a `LongCp -> ShortCp` switch effective at 9; frame 4's
+    /// threshold reading transitions the gate back to `LongCp` but is DROPPED by the
+    /// re-entrancy guard (leaving the gate standing at `LongCp` with the pending
+    /// switch intact); frames 5-8 stay at threshold so the gate cannot re-transition
+    /// before the switch lands; frame 9 applies it; and four calm readings from
+    /// frame 9 on then transition the gate to `ShortCp` again — deciding a switch
+    /// whose `to` already equals `current`.
+    ///
+    /// The final assertion is the regression: `same_profile` is TRUE across that
+    /// switch, so the old inequality-gated rebuild reported nothing to do while arm
+    /// P — which rebuilds on every recorded switch — still rebuilt.
+    #[test]
+    fn cp_policy_reports_a_from_equals_to_switch_as_a_rebuild_point() {
+        let mut policy = CpPolicy::new(SWITCH_LATENCY_FRAMES);
+
+        for f in 0..3 {
+            assert_eq!(policy.mode_for_frame(f), CpMode::LongCp);
+            assert_eq!(policy.observe(f, 2, Some(0.5)), None);
+        }
+        assert_eq!(policy.mode_for_frame(3), CpMode::LongCp);
+        let up = policy.observe(3, 2, Some(0.5)).expect("dwell of 4 reached");
+        assert_eq!(up.effective_from, 9);
+
+        // Dropped by the guard, but the gate itself still moves back to LongCp.
+        assert_eq!(policy.mode_for_frame(4), CpMode::LongCp);
+        assert_eq!(policy.observe(4, 2, Some(3.0)), None);
+        for f in 5..9 {
+            assert_eq!(policy.mode_for_frame(f), CpMode::LongCp);
+            assert_eq!(policy.observe(f, 2, Some(3.0)), None);
+            assert!(!policy.applied_on(f), "nothing applies before frame 9");
+        }
+
+        assert_eq!(policy.mode_for_frame(9), CpMode::ShortCp);
+        assert!(
+            policy.applied_on(9),
+            "frame 9 is the switch's effective_from"
+        );
+        assert!(!policy.applied_on(8), "applied_on is keyed to the frame");
+        assert_eq!(policy.observe(9, 2, Some(0.5)), None);
+
+        for f in 10..12 {
+            assert_eq!(policy.mode_for_frame(f), CpMode::ShortCp);
+            assert!(!policy.applied_on(f));
+            assert_eq!(policy.observe(f, 2, Some(0.5)), None);
+        }
+        assert_eq!(policy.mode_for_frame(12), CpMode::ShortCp);
+        let noop = policy
+            .observe(12, 2, Some(0.5))
+            .expect("four calm frames since the drop re-transition the gate");
+        assert_eq!(noop.from, CpMode::ShortCp);
+        assert_eq!(noop.to, CpMode::ShortCp, "the from == to case");
+        assert_eq!(noop.effective_from, 18);
+
+        for f in 13..18 {
+            assert_eq!(policy.mode_for_frame(f), CpMode::ShortCp);
+            assert!(!policy.applied_on(f));
+        }
+        assert_eq!(policy.mode_for_frame(18), CpMode::ShortCp);
+        assert!(
+            policy.applied_on(18),
+            "a from == to switch is still an APPLICATION, and the arm must rebuild \
+             there — this is exactly where a profile-inequality test reports nothing \
+             while arm P rebuilds anyway"
+        );
+        assert!(
+            same_profile(&profile_for(noop.from), &profile_for(noop.to)),
+            "test premise: the profiles really are equal across this switch, so \
+             only application (not inequality) can detect it"
+        );
+        assert_eq!(policy.switches().len(), 2);
+    }
+
     /// COP-1's re-entrancy guard (`event_loop.rs:1103-1124`). Without it the bench
     /// would model a queueing daemon that does not exist — and in the real one a
     /// second `Propose` orphaned the first seq outright.
@@ -592,6 +782,12 @@ mod tests {
         assert_eq!(policy.switches().len(), 1);
     }
 
+    /// The standard pair, passed explicitly — as every caller must now do. See
+    /// `switch_airtime_scales_with_the_pair_the_caller_passes` for why.
+    fn standard_pair_airtime(sw: &CpSwitch) -> Option<f64> {
+        switch_airtime_s(sw, &profile_for(sw.from), &profile_for(sw.to))
+    }
+
     #[test]
     fn switch_airtime_long_to_short_charges_three_long_and_two_short_frames() {
         // level 2 / `hf_standard`: 52 symbols * 1260 samples / 48000 = 1.365 s
@@ -604,7 +800,7 @@ mod tests {
             effective_from: 9,
             level: 2,
         };
-        let t = switch_airtime_s(&sw).expect("level 2 is valid");
+        let t = standard_pair_airtime(&sw).expect("level 2 is valid");
         let expected = 3.0 * 1.365 + 2.0 * 1.196;
         assert!(
             (t - expected).abs() < 1e-6,
@@ -624,13 +820,13 @@ mod tests {
             effective_from: 9,
             level: 2,
         };
-        let t = switch_airtime_s(&sw).expect("level 2 is valid");
+        let t = standard_pair_airtime(&sw).expect("level 2 is valid");
         let expected = 3.0 * 1.196 + 2.0 * 1.365;
         assert!(
             (t - expected).abs() < 1e-6,
             "expected {expected}s (3 short + 2 long), got {t}"
         );
-        let other = switch_airtime_s(&CpSwitch {
+        let other = standard_pair_airtime(&CpSwitch {
             from: CpMode::LongCp,
             to: CpMode::ShortCp,
             decided_at: 3,
@@ -644,6 +840,57 @@ mod tests {
         );
     }
 
+    /// The regression this signature exists to make impossible: `switch_airtime_s`
+    /// used to reconstruct the profiles from `profile_for`, so EVERY caller paid the
+    /// 44-carrier `hf_standard` price regardless of the pair it was actually
+    /// transmitting on — and the bench's DEFAULT base is `hf_robust` (36 data / 12
+    /// pilot).
+    ///
+    /// Fewer data carriers means more symbols per frame: at bits/symbol 1,
+    /// `header_syms = ceil(144/36) = 4` and `payload_syms = ceil(1944/36) = 54`, so
+    /// 3 + 4 + 54 = **61** symbols against `hf_standard`'s 3 + 4 + 45 = **52**. The
+    /// robust handshake is therefore STRICTLY more expensive at the same level and
+    /// same CP samples, and an undercharge inflates the CP-adaptive arm's goodput.
+    ///
+    /// Asserted as a strict inequality plus the exact 61/52 ratio: the inequality is
+    /// the property that matters, the ratio is what catches a future carrier-layout
+    /// change silently making the two prices equal again.
+    #[test]
+    fn switch_airtime_scales_with_the_pair_the_caller_passes() {
+        let sw = CpSwitch {
+            from: CpMode::LongCp,
+            to: CpMode::ShortCp,
+            decided_at: 3,
+            effective_from: 9,
+            level: 1, // bits/symbol 1, the level the schedule boots on
+        };
+
+        let std_long = CoppaProfile::hf_standard();
+        let std_short = CoppaProfile::hf_standard_short_cp();
+        let rob_long = CoppaProfile::hf_robust();
+        let rob_short = CoppaProfile {
+            cp_samples: 144,
+            bandwidth_id: 5,
+            ..CoppaProfile::hf_robust()
+        };
+        assert_eq!(rob_long.data_carriers, 36, "test premise: robust is 36+12");
+        assert_eq!(std_long.data_carriers, 44, "test premise: standard is 44+4");
+
+        let std_price = switch_airtime_s(&sw, &std_long, &std_short).expect("level 1 is valid");
+        let rob_price = switch_airtime_s(&sw, &rob_long, &rob_short).expect("level 1 is valid");
+
+        assert!(
+            rob_price > std_price,
+            "the 36-carrier pair must price STRICTLY higher than the 44-carrier pair \
+             at the same level: robust {rob_price}s vs standard {std_price}s"
+        );
+        assert!(
+            (rob_price / std_price - 61.0 / 52.0).abs() < 1e-9,
+            "the ratio is the symbol-count ratio 61/52; got {}",
+            rob_price / std_price
+        );
+    }
+
     #[test]
     fn switch_airtime_is_none_for_reserved_level_8() {
         let sw = CpSwitch {
@@ -653,7 +900,7 @@ mod tests {
             effective_from: 1,
             level: 8,
         };
-        assert!(switch_airtime_s(&sw).is_none());
+        assert!(standard_pair_airtime(&sw).is_none());
     }
 
     #[test]
@@ -681,9 +928,15 @@ mod tests {
     /// A seed stride at or below the frame count makes two runs share channel
     /// realizations at an offset, which would silently correlate the "independent"
     /// seeds the multi-seed aggregate's sign-consistency rule depends on.
+    ///
+    /// Written against [`MAX_FRAMES`], not a hardcoded 300. The hardcoded version
+    /// could not do the job [`SEED_STRIDE`]'s doc claimed for it — it exercised only
+    /// the committed default, so a `COPPA_CL_FRAMES` override large enough to
+    /// collide would have sailed past it. `closed_loop_arq`'s `main` asserts its own
+    /// `n` against the same constant, so the promise and the check cannot drift.
     #[test]
     fn frame_seed_is_distinct_across_seeds_within_a_run() {
-        let frames = 300;
+        let frames = MAX_FRAMES;
         let mut seen = std::collections::HashSet::new();
         for run_seed in SEEDS {
             for f in 0..frames {
@@ -697,6 +950,33 @@ mod tests {
         assert!(
             SEED_STRIDE >= frames as u64,
             "stride {SEED_STRIDE} must cover a {frames}-frame run"
+        );
+    }
+
+    /// [`MAX_FRAMES`] must be exactly the largest `n` at which no two seeds share a
+    /// frame seed — no lower (it would reject the bench's own committed 300-frame
+    /// default) and no higher (it would admit the collision it exists to prevent).
+    ///
+    /// The upper end is checked by construction rather than by assertion:
+    /// `frame_seed(0, MAX_FRAMES)` is the first value that belongs to seed 1.
+    #[test]
+    fn max_frames_is_exactly_the_cross_seed_collision_boundary() {
+        assert_eq!(MAX_FRAMES as u64, SEED_STRIDE);
+        assert_eq!(
+            frame_seed(0, MAX_FRAMES - 1) + 1,
+            frame_seed(1, 0),
+            "seed 0's last admissible frame must sit immediately below seed 1's first"
+        );
+        // `closed_loop_arq::DEFAULT_N_FRAMES`, which this crate's lib cannot import
+        // (it lives in an example). Bound rather than const-folded so clippy's
+        // `assertions_on_constants` does not fire on what is a real cross-module
+        // consistency check.
+        let committed_default_frames: usize = 300;
+        assert!(
+            MAX_FRAMES >= committed_default_frames,
+            "the ceiling must admit the committed 5 x {committed_default_frames}-frame \
+             run; a ceiling of 256 + 32 = 288 (the stale IR-HARQ claim) would panic \
+             the default"
         );
     }
 

@@ -263,11 +263,20 @@ pub struct EngineSection {
     /// asserts both halves) and by `test_cp_negotiation_requires_two_more_flags_by_default`
     /// below.
     ///
-    /// With all three off (the shipped default) the only live effect of this
-    /// subsystem is `drive_cp_negotiation` and the CP-control retransmit loop
-    /// running on empty state every 500 ms poll -- both return immediately, so
-    /// the cost is a couple of field reads per tick and nothing reaches the
-    /// air.
+    /// With all three off (the shipped default) this subsystem is **structurally
+    /// unreachable**, and the flag that makes it so is `arq_enabled` -- not this
+    /// one. `check_arq_retransmits` returns at
+    /// `crates/coppa-daemon/src/event_loop.rs:1715-1717` on `!arq_enabled`, which is
+    /// *before* both the CP-control retransmit block (`:1814`) and the sole
+    /// production call to `drive_cp_negotiation` (`:1873`). So on the shipped
+    /// default neither COP-1's G1-G4 give-up triggers nor COP-2's desync canary run
+    /// at all -- not "run on empty state and return immediately", which is what this
+    /// paragraph used to claim. The whole residual cost is the one `bool` read in
+    /// `check_arq_retransmits`, and nothing reaches the air.
+    ///
+    /// The per-tick cost only becomes "a couple of field reads" once `arq_enabled`
+    /// *and* this flag are on; that is the condition under which the canary's own
+    /// cost note should be read.
     ///
     /// Both stations must set all three locally: there is no peer-capability
     /// negotiation (see the design doc's "disjoint subsystems" finding for

@@ -1125,12 +1125,21 @@ mod tests {
     /// `a_rate_loop_vhf_excursion_does_not_desync_a_negotiated_short_cp` for
     /// the same property proved end-to-end through the real daemon path.
     ///
-    /// The level-3 half asserts the PROFILE, not just the field: it reads the
-    /// wire `bandwidth` id back out through a receiver built for
-    /// `hf_standard_short_cp`, the same waveform-level style as
+    /// BOTH halves assert the PROFILE, not just the field: each reads the wire
+    /// `bandwidth` id back out through a receiver built for the profile that half
+    /// expects, the same waveform-level style as
     /// `test_encode_bytes_writes_real_bandwidth_id_not_hardcoded_one` below. A
     /// `cp_mode()` accessor check alone would pass even if `select_ofdm_profile`
     /// silently disagreed with the field.
+    ///
+    /// The level-5 half's waveform assertion matters specifically because this
+    /// branch made `speed_level >= 5 && cp_mode == ShortCp` reachable through
+    /// `set_speed_level` for the FIRST time, so `select_ofdm_profile`'s VHF branch
+    /// is now entered with a retained `ShortCp` on a live engine. The only thing
+    /// pinning "a retained ShortCp cannot corrupt a VHF frame" used to be
+    /// `test_select_ofdm_profile_ignores_cp_mode_in_vhf_range`, which calls the pure
+    /// function directly and never exercises `build()` / `encode_bytes()` -- so the
+    /// property was proved of the mapping but never of a real transmitted frame.
     #[test]
     fn test_set_speed_level_preserves_cp_mode_across_a_vhf_excursion() {
         use coppa_protocol::cp_negotiator::CpMode;
@@ -1146,6 +1155,21 @@ mod tests {
             "crossing into VHF must RETAIN the negotiated CP mode (dormant while \
              `select_ofdm_profile` builds vhf_wide), not discard it -- the peer \
              still believes it is in force"
+        );
+
+        // The retained mode must be DORMANT, not merely retained: a real frame
+        // encoded here has to be `vhf_wide` on the wire, decodable by a peer that
+        // knows nothing about the CP negotiation.
+        let vhf_samples = core.encode_bytes(b"x").unwrap();
+        let vhf_rx = CoppaTransceiver::new(CoppaProfile::vhf_wide(), 1);
+        let (vhf_header, _payload, _recommended_level) = vhf_rx
+            .receive(&vhf_samples)
+            .expect("a frame sent while dwelling at level 5 must decode as vhf_wide");
+        assert_eq!(
+            vhf_header.bandwidth,
+            CoppaProfile::vhf_wide().bandwidth_id,
+            "a RETAINED ShortCp must not leak into the VHF waveform -- \
+             select_ofdm_profile ignores cp_mode at level >= 5"
         );
 
         core.set_speed_level(3).unwrap(); // back into the HF range

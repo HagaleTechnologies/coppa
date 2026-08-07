@@ -58,6 +58,17 @@ pub enum WsServerMessage {
         /// specs/2026-07-25-cpgate-daemon-wiring-design.md`.
         #[serde(skip_serializing_if = "Option::is_none")]
         short_cp_ok: Option<bool>,
+        /// COP-2: count of distinct CP-mode desync episodes the daemon has observed
+        /// since start (`EventLoop::check_cp_desync`). A non-zero value means this
+        /// station has, at least once, been transmitting a waveform its peer could
+        /// not decode -- see that method's doc for the two conditions. `0` is the
+        /// healthy value and the only one an operator should ever see.
+        ///
+        /// Always serialized (not `skip_serializing_if`), unlike `short_cp_ok`: an
+        /// absent field is indistinguishable from "no episodes" to a client, and the
+        /// whole point of surfacing this is that the daemon used to report a healthy
+        /// station through every operator-facing channel while the link was dead.
+        cp_desync_episodes: u32,
     },
     /// Data received from remote station.
     #[serde(rename = "data")]
@@ -119,6 +130,8 @@ pub struct WsStatus {
     pub cfo: Option<f32>,
     /// See `WsServerMessage::Status::short_cp_ok`'s doc.
     pub short_cp_ok: Option<bool>,
+    /// See `WsServerMessage::Status::cp_desync_episodes`'s doc.
+    pub cp_desync_episodes: u32,
 }
 
 /// Whether a pre-serialized broadcast JSON string is a `spectrum` message
@@ -352,6 +365,7 @@ impl WebSocketServer {
                                                     level: snapshot.level,
                                                     cfo: snapshot.cfo,
                                                     short_cp_ok: snapshot.short_cp_ok,
+                                                    cp_desync_episodes: snapshot.cp_desync_episodes,
                                                 };
                                                 if let Ok(json) = serde_json::to_string(&resp) {
                                                     let _ = sink
@@ -413,6 +427,7 @@ mod tests {
             level: Some(4),
             cfo: Some(12.5),
             short_cp_ok: Some(true),
+            cp_desync_episodes: 0,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("connected"));
@@ -473,6 +488,7 @@ mod tests {
             level: None,
             cfo: None,
             short_cp_ok: None,
+            cp_desync_episodes: 0,
         })
         .unwrap();
         assert!(!is_spectrum_broadcast(&status_json));
@@ -577,6 +593,7 @@ mod tests {
             level: None,
             cfo: None,
             short_cp_ok: None,
+            cp_desync_episodes: 0,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(!json.contains("remote_call"));
@@ -584,6 +601,15 @@ mod tests {
         assert!(!json.contains("level"));
         assert!(!json.contains("cfo"));
         assert!(!json.contains("short_cp_ok"));
+        // COP-2: the deliberate exception. `cp_desync_episodes` is NOT
+        // `skip_serializing_if`, because to a client an absent field and "zero
+        // episodes" are indistinguishable -- and the reason this field exists is that
+        // a desynced daemon used to look healthy through every operator-facing
+        // channel. A healthy `0` must be positively reported, not inferred.
+        assert!(
+            json.contains(r#""cp_desync_episodes":0"#),
+            "cp_desync_episodes must be serialized even at its healthy value: {json}"
+        );
     }
 }
 
@@ -656,6 +682,7 @@ mod integration_tests {
                                                 level: None,
                                                 cfo: None,
                                                 short_cp_ok: None,
+                                                cp_desync_episodes: 0,
                                             };
                                             if let Ok(json) = serde_json::to_string(&resp) {
                                                 let _ = sink.send(Message::Text(json.into())).await;
@@ -805,6 +832,7 @@ mod integration_tests {
                 level,
                 cfo,
                 short_cp_ok,
+                cp_desync_episodes,
             } => {
                 assert!(connected, "status should reflect the live connected flag");
                 assert_eq!(remote_call.as_deref(), Some("VK3DEF"));
@@ -814,6 +842,11 @@ mod integration_tests {
                 assert_eq!(
                     short_cp_ok, None,
                     "short_cp_ok should stay None when cp_gate isn't fed"
+                );
+                assert_eq!(
+                    cp_desync_episodes, 0,
+                    "a station that never desynced must report 0, and must report it \
+                     over the wire rather than by omission"
                 );
             }
             other => panic!("Expected Status, got {:?}", other),

@@ -2809,13 +2809,19 @@ The gaps to the bar are +9.41% (0.914 → 1.0) and +4.99% (0.762 → 0.8); the u
 **This is the pre-registered reward-hack observed live, not hypothesized** — and it is the single most
 important number in this section.
 
+> **Cost-model caveat on the "5/5".** Every figure in this table is arm B at switch-cost ×0 (data
+> airtime only). Charging the handshake at ×1 costs arm B ~3.3–4.5%, which puts seed 2 (1.047) at
+> roughly 1.00 — so a strict `>` could read 4/5 rather than 5/5. Treat the *shape* as the finding, not
+> the count: the gaps above are 1.5–2.8× the CP constant either way. See Table 3's switch-cost
+> paragraph.
+
 ### Table 3 — arms, comparators, and the denominator delta (D4a's primary answer)
 
 | Quantity | `standard` | `robust` |
 |---|---|---|
 | arm A (long-CP control) | 1838.3 bps | 1506.2 bps |
 | arm P (rebuild placebo) | 1838.3 bps (**+0.00%**) | 1506.2 bps (**+0.00%**) |
-| arm B (CP-adaptive) | 2399.8 bps | 1912.4 bps |
+| arm B (CP-adaptive) — *data airtime only, = ×0* | 2399.8 bps | 1912.4 bps |
 | arm C (fixed short CP) | 2531.6 bps | 2270.1 bps |
 | best-fixed(long) → best-fixed(joint) | 2179.1 → 2531.6 (**+16.18%**) | 1948.3 → 2270.1 (**+16.52%**) |
 | oracle(long) → oracle(joint) | 3066.6 → 3670.5 (**+19.69%**) | 2736.5 → 3262.6 (**+19.23%**) |
@@ -2828,12 +2834,39 @@ because the joint comparator also re-picks the *level*, not only the CP mode —
 best static *configuration*, and short CP shifts which level that is. `best-fixed(joint)` selected a
 short-CP cell on 5/5 seeds on both bases.
 
-**Switch cost.** One switch per run, five on-air frames, 6.49 s charged — 3.4–4.7% of arm B's
-airtime. Goodput at ×0 / ×1 / ×6 multipliers (no-charge bound / loss-free nominal / ARQ-budget
-ceiling at `DEFAULT_MAX_RETRANSMIT = 5`) on `standard` seed 0: 2301.4 / 2207.8 / 1834.6 bps. Four
-things are **not** charged and all four bias arm B optimistic: leg retransmissions, the four
+**Switch cost, and where it is (and is not) in the numbers above.** One switch per run, five on-air
+frames. Goodput at ×0 / ×1 / ×6 multipliers (no-charge bound / loss-free nominal / ARQ-budget ceiling
+at `DEFAULT_MAX_RETRANSMIT = 5`) on `standard` seed 0: 2301.4 / 2207.8 / 1834.6 bps. Four things are
+**not** charged at any multiplier and all four bias arm B optimistic: leg retransmissions, the four
 half-duplex turnarounds at `DEFAULT_TURNAROUND = 150 ms`, handshakes that fail and revert via COP-1's
 G1-G4 having spent the full budget for zero CP change, and the levels ≥ 5 divergence from production.
+
+Two corrections to how this cost was reported when these tables were first written, both found by the
+branch's own PR review and both fixed in the bench (`cp_arm::switch_airtime_s`,
+`closed_loop_arq`'s `SeedAgg`); neither moves a verdict above, and **no re-run was needed for
+either**, since both are accounting, not measurement:
+
+- **The charge quoted here was the `standard` price applied to both bases.** `switch_airtime_s`
+  reconstructed the profile pair from `cp_arm::profile_for`, which is hardcoded to
+  `hf_standard`/`hf_standard_short_cp` — so the `robust` runs, whose pair is `hf_robust` (36 data / 12
+  pilot carriers), were charged the 44-carrier price. Fewer data carriers means more symbols per frame
+  (61 vs 52 at bits/symbol 1), so the true `robust` charge is **~7.61 s (~4.2% of arm B's airtime)**,
+  not the ~6.49 s / 3.4–4.7% this paragraph used to quote for both. `standard`'s 6.487 s was correct.
+  The function now takes the pair from its caller.
+- **Every headline arm-B figure above is the ×0 (data-airtime-only) number.** The switch airtime the
+  run computed was accumulated but spent only in the bench's own SWITCH ACCOUNTING block — never in
+  the bar ratios, the aggregate mean, or the per-seed deltas, and with no label saying so. Charging it
+  at ×1 moves arm B by roughly −3.3 to −4.5% (`standard` seed 0: 2301.4 → 2207.8 bps), which
+  **deepens every already-negative arm-B result** rather than changing its sign: `B/bf(joint)` 0.948 →
+  ~0.910, `arm B vs arm C` −5.21% → more negative. The bench now prints every one of those quantities
+  at both ×0 and ×1 so the band is visible at the point of use; it deliberately does *not* silently
+  adopt ×1 as the primary, because this bench cannot measure which multiplier is right.
+
+The one number above that is **not** robust to the cost model is Table 2's "5/5 seeds clear
+`B/bf(long) > 1.0`": seed 2 sits at 1.047 under ×0 and lands at ~1.00 under ×1, so a strict `>` could
+make it 4/5. That does not weaken the finding it illustrates — the false pass is a *denominator*
+artifact, and the +9.41% / +4.99% gaps against a +14.130% CP constant are what carry it — but the
+"5/5" itself should not be quoted as though the cost model were settled.
 
 **Arm P is the load-bearing control here.** It rebuilds the transceiver on exactly arm B's switch
 frames with the *same* profile, and matched arm A to the printed decimal on all 5 seeds on both
@@ -2841,6 +2874,17 @@ bases. A CP switch in this bench is a transceiver rebuild (there is no profile s
 has twice shipped bugs that were invisible to inspection and showed up only as state carried across
 that boundary (PR #61/#62's stale IR-HARQ accumulator, PR #69's `calibrated_bias` saturation). The
 rebuild's inertness is now measured rather than argued, so arm B is read against arm A.
+
+*Post-hoc hardening (no number moves).* When these runs were taken, arm B's rebuild was gated on
+profile *inequality* while arm P's fired on every recorded switch — so on a `from == to` switch (five
+control frames for zero CP change, reachable at latency 5) arm P would have rebuilt and arm B would
+not, and the placebo would have quietly stopped being a control. It never happened here: this
+schedule produces exactly one non-degenerate transition per run (see Table 4), so both arms rebuilt at
+frame 9 and the sets matched. It was worth closing anyway, because the divergence was *invisible* —
+only arm P's rebuild count was printed — and Table 4's own routed follow-up (re-deriving the 2.5 ms
+threshold) is precisely the change that would make drop-backs, and therefore `from == to`, live. Arm
+B's rebuild set is now equal to `switches[].effective_from` by construction
+(`cp_arm::CpPolicy::applied_on`), both counts are printed, and a mismatch prints a warning.
 
 **Airtime share (D1a).** ~94% of arm B's airtime ran under short CP, split roughly 33–53% at levels
 ≤ 4 and 42–60% at levels ≥ 5. **Only the levels ≤ 4 share is production-reachable**:
