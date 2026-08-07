@@ -301,6 +301,17 @@ impl CpProfilePair {
 /// is the cross-seed channel-realization collision instead -- see `cp_arm::MAX_FRAMES`, which `main`
 /// now asserts against.
 ///
+/// **Third COP-2 correction — to the second one.** `seq_reuse_distance (256) > HARQ_MAX_BUFFERS (32)`
+/// does NOT mean a reused seq's accumulator has always been evicted, because the 32-entry LRU only
+/// holds FAILED sequences: a successful decode evicts its own entry immediately
+/// (`transceiver.rs:1153-1156`), it never occupies an LRU slot at all. Capacity-driven eviction only
+/// fires once 32 *other* sequences have failed and stayed buffered since the one in question --
+/// at any failure rate below roughly 32-in-256 (~12.5%), which is the common case away from the low-SNR
+/// tail of a sweep, the buffer never fills and a stale failed accumulator can sit resident well past
+/// the 256-frame wrap. `run_frame` below now calls `harq_evict(seq)` unconditionally after every
+/// frame (matching `runner.rs::run_trial`), so this is no longer load-bearing either way -- eviction
+/// is explicit, not inferred from reuse-distance-vs-buffer-size arithmetic.
+///
 /// `bandwidth` is read from the transmitting profile rather than hardcoded to 1, mirroring
 /// `CoppaCore::encode_bytes` (`crates/coppa-engine/src/engine.rs:197`) -- required here because a
 /// CP-adaptive arm transmits under two different `bandwidth_id`s within one run.
@@ -399,7 +410,7 @@ fn run_frame(tx: &CoppaTransceiver, level: u8, f: usize, n: usize, run_seed: u64
         .expect("payload sized from this level's own payload_bytes() always fits");
     let (ch, snr) = schedule(f, n);
     let faded = apply_channel(&sig, ch, snr, frame_seed(run_seed, f));
-    match tx.receive_with_metrics(&faded) {
+    let result = match tx.receive_with_metrics(&faded) {
         Ok((_h, p, _snr, rec, spread)) => FrameOutcome {
             delivered: p.len() >= pfb && p[..pfb] == payload[..],
             recommended: Some(rec),
@@ -410,7 +421,18 @@ fn run_frame(tx: &CoppaTransceiver, level: u8, f: usize, n: usize, run_seed: u64
             recommended: None,
             delay_spread_ms: None,
         },
-    }
+    };
+
+    // Evict this seq's IR-HARQ accumulator unconditionally (a no-op on the already-evicted
+    // CRC-pass path), matching `runner.rs::run_trial`. The `seq_reuse_distance (256) >
+    // HARQ_MAX_BUFFERS (32)` argument above does NOT make this redundant: the 32-entry LRU
+    // only holds FAILED sequences (a successful decode evicts its own entry immediately), so
+    // at a low failure rate the buffer never fills to 32 and a stale failed accumulator can sit
+    // resident well past the 256-frame wrap, combining into the next unrelated frame at the
+    // same seq on decode failure and corrupting FER/RateLoop/comparator scores.
+    tx.harq_evict(seq);
+
+    result
 }
 
 #[derive(Clone)]
