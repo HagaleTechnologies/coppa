@@ -68,6 +68,14 @@ pub enum WsServerMessage {
         /// absent field is indistinguishable from "no episodes" to a client, and the
         /// whole point of surfacing this is that the daemon used to report a healthy
         /// station through every operator-facing channel while the link was dead.
+        ///
+        /// `#[serde(default)]` on the READ side only: a client built against this
+        /// version still always SERIALIZES the field (no `skip_serializing_if`
+        /// above), but deserializing an older daemon's reply (or a persisted
+        /// pre-COP-2 status message) that lacks it must not fail outright --
+        /// default to `0`, the healthy value, rather than erroring the whole
+        /// message over one new telemetry field.
+        #[serde(default)]
         cp_desync_episodes: u32,
     },
     /// Data received from remote station.
@@ -610,6 +618,23 @@ mod tests {
             json.contains(r#""cp_desync_episodes":0"#),
             "cp_desync_episodes must be serialized even at its healthy value: {json}"
         );
+    }
+
+    /// COP-2 review finding: a client built against this version must still be able
+    /// to deserialize a `status` message from an OLDER daemon (or a persisted
+    /// pre-COP-2 message) that predates `cp_desync_episodes` and so never included
+    /// it. Without `#[serde(default)]` this fails outright with a missing-field
+    /// error instead of defaulting to the healthy `0`.
+    #[test]
+    fn test_ws_status_deserializes_without_cp_desync_episodes_field() {
+        let json = r#"{"type":"status","connected":false}"#;
+        let msg: WsServerMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            WsServerMessage::Status {
+                cp_desync_episodes, ..
+            } => assert_eq!(cp_desync_episodes, 0),
+            other => panic!("expected Status, got {other:?}"),
+        }
     }
 }
 

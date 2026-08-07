@@ -543,6 +543,18 @@ fn run_arm(kind: &ArmKind, pair: &CpProfilePair, run_seed: u64, n: usize) -> Arm
         );
         hist[segment(f, n)].observe(out.delay_spread_ms);
 
+        // Review finding (P2, declined): production feeds `cp_gate.observe` on EVERY
+        // successfully decoded frame (event_loop.rs:1119-1147), data or CP-control alike,
+        // so a Propose/Confirm/ack/Switched reception also advances or resets the gate's
+        // dwell state. This loop only observes the data-frame slot below; the five
+        // control-frame legs of a handshake are priced as pure airtime (switch_air_s
+        // above) and never touch `policy`'s dwell state. Left as a documented scope
+        // boundary rather than simulated: this harness never runs a decode for a
+        // control frame at all (only `switch_airtime_s` prices it), so there is no
+        // measured `delay_spread_ms` to feed the policy with for those legs — inventing
+        // one would model noise, not the daemon. The gap can only bias switch
+        // timing/counts during the brief handshake window itself, not the steady-state
+        // dwell behavior the benchmark exists to compare.
         if let Some(p) = policy.as_mut() {
             if let Some(sw) = p.observe(f, level, out.delay_spread_ms) {
                 // Price the handshake on THIS run's pair, not on the `hf_standard` pair
