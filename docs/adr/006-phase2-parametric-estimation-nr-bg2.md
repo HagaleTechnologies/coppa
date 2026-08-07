@@ -253,9 +253,9 @@ reserved 32-QAM and excluded, matching every prior gate in this codebase), again
 
 **AWGN**: met and exceeded. Level 4 gains +3 dB, level 7 +3 dB, level 9 +6 dB at FER≤10%; level
 10's rate-7/8→5/6 change fixes the pre-Phase-2 non-convergence entirely (peak goodput
-399→8450 bps). Two small, real exceptions: levels 6 and 9 each show their FER≤1% threshold get
-3 dB worse or undefined (a residual ~1-1.25% error floor), consistent with Task 4's own finding
-that the new mother code's coding gain is real but modest at matched block length.
+399→8450 bps). The former level-9 AWGN floor was later traced to stale IR-HARQ state in the
+benchmark harness; after unconditional per-trial eviction, level 9 clears FER≤10% and ≤1% at
+21 dB. COP-4 separately investigates the remaining Watterson-specific gap.
 
 **Watterson Good** (no Phase-1-exit baseline; compared to `results/p1-final/good.csv`): a clean
 win — levels 1-2 improve 9-15 dB at FER≤10%, most other levels show real goodput gains, level 6

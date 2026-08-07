@@ -10,8 +10,8 @@ sources:
   - docs/adr/005-nr-bg2-ldpc.md
   - BENCHMARKS.md
 verified:
-  commit: 59b0b63
-  date: 2026-07-14
+  commit: be2141b
+  date: 2026-08-05
 links:
   - coppa-protocol
   - adr-002-fec-strategy
@@ -33,12 +33,12 @@ Phase 2 merge.
 
 ## What still bites
 
-Level 9 (64-QAM 2/3) has an unusually high, steep, and strongly seed-dependent
-AWGN SNR requirement (a real waterfall, not an SNR-independent floor), and
-**never converges under any tested Watterson fading up to 54 dB** (Phase 3
-Task 8 measurement, see `BENCHMARKS.md`'s "Phase 3 Task 8" section). This is
-tracked as its own future investigation. If a bench or session run pins level 9
-under fading and shows 100% loss, that is this known issue — not a regression.
+Level 9 (64-QAM 2/3) clears AWGN at 21 dB after the stale IR-HARQ benchmark
+state was fixed. Under Watterson fading, COP-4's 300-trial profile/CP matrix
+still finds no profile clearing FER≤10% through 36 dB. The dominant real-receiver
+failure is LDPC non-convergence, but a perfect-CSI oracle shows substantial
+headroom; this is an open FEC-coverage/diversity limitation, not a proven
+physical ceiling and not simply a short-CP failure.
 
 ## Related tuning trap
 

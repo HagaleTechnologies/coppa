@@ -6,12 +6,12 @@ use crate::metrics::MeasurementPoint;
 
 /// CSV header line.
 pub const CSV_HEADER: &str =
-    "level,mode,channel,snr_db,trials,frame_errors,fer,fer_lo,fer_hi,ber,goodput_bps";
+    "level,mode,channel,snr_db,trials,frame_errors,fer,fer_lo,fer_hi,ber,goodput_bps,sync_failed,header_corrupt,ldpc_not_converged,crc_mismatch,wrong_payload";
 
 /// Format one `MeasurementPoint` as a CSV row (no trailing newline).
 pub fn csv_row(p: &MeasurementPoint) -> String {
     format!(
-        "{},{},{},{:.1},{},{},{:.6},{:.6},{:.6},{:.8},{:.2}",
+        "{},{},{},{:.1},{},{},{:.6},{:.6},{:.6},{:.8},{:.2},{},{},{},{},{}",
         p.level,
         p.mode_name,
         p.channel,
@@ -22,8 +22,33 @@ pub fn csv_row(p: &MeasurementPoint) -> String {
         p.fer_lo,
         p.fer_hi,
         p.ber,
-        p.goodput_bps
+        p.goodput_bps,
+        p.failures.sync_failed,
+        p.failures.header_corrupt,
+        p.failures.ldpc_not_converged,
+        p.failures.crc_mismatch,
+        p.failures.wrong_payload,
     )
+}
+
+/// Build a detailed failure-mode breakdown for every measured point.
+pub fn to_failure_mode_markdown(points: &[MeasurementPoint]) -> String {
+    let mut out = String::new();
+    for p in points {
+        let _ = writeln!(out, "### Level {} at {:.1} dB\n", p.level, p.snr_db);
+        let _ = writeln!(out, "| failure mode | count |");
+        let _ = writeln!(out, "|---|---:|");
+        let _ = writeln!(out, "| sync_failed | {} |", p.failures.sync_failed);
+        let _ = writeln!(out, "| header_corrupt | {} |", p.failures.header_corrupt);
+        let _ = writeln!(
+            out,
+            "| ldpc_not_converged | {} |",
+            p.failures.ldpc_not_converged
+        );
+        let _ = writeln!(out, "| crc_mismatch | {} |", p.failures.crc_mismatch);
+        let _ = writeln!(out, "| wrong_payload | {} |\n", p.failures.wrong_payload);
+    }
+    out
 }
 
 /// Build a full CSV document from measurement points.
@@ -106,6 +131,7 @@ mod tests {
             fer_hi: (fer * 1.5).clamp(0.02, 1.0),
             ber: 0.0,
             goodput_bps: goodput,
+            failures: Default::default(),
         }
     }
 
@@ -151,7 +177,28 @@ mod tests {
     #[test]
     fn csv_includes_ci_columns() {
         let row = csv_row(&point(2, 10.0, 0.0, 968.0));
-        assert_eq!(row.split(',').count(), 11);
+        assert_eq!(row.split(',').count(), 16);
         assert!(CSV_HEADER.contains("fer_lo") && CSV_HEADER.contains("fer_hi"));
+    }
+
+    #[test]
+    fn csv_includes_failure_mode_columns() {
+        assert_eq!(CSV_HEADER.split(',').count(), 16);
+        assert_eq!(csv_row(&point(9, 30.0, 1.0, 0.0)).split(',').count(), 16);
+    }
+
+    #[test]
+    fn failure_mode_markdown_lists_each_bucket() {
+        let pts = vec![point(9, 30.0, 1.0, 0.0)];
+        let md = to_failure_mode_markdown(&pts);
+        for name in [
+            "sync_failed",
+            "header_corrupt",
+            "ldpc_not_converged",
+            "crc_mismatch",
+            "wrong_payload",
+        ] {
+            assert!(md.contains(name), "missing bucket {name}");
+        }
     }
 }

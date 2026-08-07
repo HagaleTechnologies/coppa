@@ -23,19 +23,17 @@
 //!
 //! Run: `cargo run --release -p coppa-bench --example capacity_ground_truth_diagnosis`.
 
+use coppa_bench::ground_truth::{ground_truth_capacity, pearson};
 use coppa_bench::scenario::{mode_for_level, profile_by_name, SAMPLE_RATE};
-use coppa_channel::watterson::{watterson_with_gains, Tap, WattersonPreset};
+use coppa_channel::watterson::{watterson_with_gains, WattersonPreset};
 use coppa_codec::ofdm::coppa_modem::CoppaModem;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_ml::{channel_capacity, channel_selectivity};
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
-use num_complex::Complex32;
-use std::f32::consts::TAU;
 
 const TRIALS: usize = 300;
 const SNR_DB: f32 = 24.0; // matches closed_loop_arq's Watterson-Poor tail nominal SNR
 const LEVEL: u8 = 1; // BPSK: the passive-probe level RateLoop reads most when pinned low
-const TIME_STRIDE: usize = 97; // subsample time (prime-ish stride, avoids symbol-period aliasing)
 
 fn make_header(level: u8, len: u16) -> CoppaHeader {
     CoppaHeader {
@@ -49,56 +47,6 @@ fn make_header(level: u8, len: u16) -> CoppaHeader {
         payload_len: len,
         codewords: 1,
     }
-}
-
-fn pearson(xs: &[f32], ys: &[f32]) -> f32 {
-    let n = xs.len() as f32;
-    let mx = xs.iter().sum::<f32>() / n;
-    let my = ys.iter().sum::<f32>() / n;
-    let (mut cov, mut vx, mut vy) = (0.0f32, 0.0f32, 0.0f32);
-    for i in 0..xs.len() {
-        let (dx, dy) = (xs[i] - mx, ys[i] - my);
-        cov += dx * dy;
-        vx += dx * dx;
-        vy += dy * dy;
-    }
-    cov / (vx.sqrt() * vy.sqrt()).max(1e-9)
-}
-
-/// Ground-truth (capacity, selectivity) from the channel model's own per-tap gains, evaluated at
-/// every `TIME_STRIDE`'th sample in `[start, end)`. `nv_ref` is the REAL receiver's own measured
-/// per-carrier noise variance at unit channel gain (no fading) -- calibrating against it (rather
-/// than assuming a theoretical SNR-to-per-subcarrier-SNR translation) removes any guesswork about
-/// FFT processing gain / guard-band / CP overhead between the whole-signal `snr_db` convention and
-/// actual post-demod per-subcarrier SNR.
-fn ground_truth(
-    gains: &[(Tap, Vec<Complex32>)],
-    start: usize,
-    end: usize,
-    carrier_freqs: &[f32],
-    nv_ref: f32,
-) -> (f32, f32) {
-    let times: Vec<usize> = (start..end).step_by(TIME_STRIDE).collect();
-    let mut caps = Vec::with_capacity(carrier_freqs.len());
-    for &f in carrier_freqs {
-        let mut acc = 0.0f32;
-        for &t in &times {
-            let mut h = Complex32::new(0.0, 0.0);
-            for (tap, g) in gains {
-                let amp = tap.power.max(0.0).sqrt();
-                let phase = -TAU * f * tap.delay_s;
-                h += g[t] * amp * Complex32::new(phase.cos(), phase.sin());
-            }
-            acc += h.norm_sqr();
-        }
-        let mean_h2 = acc / times.len().max(1) as f32;
-        // nv scales as 1/|H|^2 relative to the unit-gain reference nv_ref.
-        let nv_k = nv_ref / mean_h2.max(1e-9);
-        caps.push((1.0 + 1.0 / nv_k.max(1e-9)).log2());
-    }
-    let mean = caps.iter().sum::<f32>() / caps.len() as f32;
-    let var = caps.iter().map(|c| (c - mean).powi(2)).sum::<f32>() / caps.len() as f32;
-    (mean, var.sqrt())
 }
 
 /// The real receiver's own measured mean noise variance with NO fading (unit channel gain) at
@@ -158,8 +106,8 @@ fn run(preset: WattersonPreset, label: &str) {
         let n = faded.len();
         // Two disjoint time windows -- if ground truth is stable across them (as the
         // long-coherence-time assumption predicts), the two should closely agree.
-        let (c_full, s_full) = ground_truth(&gains, 0, n, &carrier_freqs, nv_ref);
-        let (c_half, s_half) = ground_truth(&gains, n / 2, n, &carrier_freqs, nv_ref);
+        let (c_full, s_full) = ground_truth_capacity(&gains, 0, n, &carrier_freqs, nv_ref);
+        let (c_half, s_half) = ground_truth_capacity(&gains, n / 2, n, &carrier_freqs, nv_ref);
         gt_cap_full.push(c_full);
         gt_sel_full.push(s_full);
         gt_cap_half.push(c_half);

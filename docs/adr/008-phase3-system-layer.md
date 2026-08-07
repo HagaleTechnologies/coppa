@@ -379,10 +379,9 @@ an ARQ state-machine bug). A real bug was found and fixed while building both: `
 defaults levels ≥5 to a VHF profile whose 60-sample CP causes 100% frame loss under any
 Watterson fading — worked around by forcing `hf_standard` for every level in these two
 HF-specific tools (domain-correct regardless, since MIL-STD-188-110 is an HF standard). The
-golden-vector corpus itself (deliverable c) is complete and passing: 19/20 vectors decode to
-their exact manifest payload; the 20th (`L9_poor25`) is committed with `expected_decode_ok =
-false` as a deliberate, documented regression tripwire (level 9's Watterson-Poor non-convergence
-is real and structural, verified to 54 dB — not something a different seed/payload could fix).
+golden-vector corpus itself (deliverable c) is complete and passing: all 20 vectors, including
+`L9_poor25`, decode to their exact manifest payload. The Poor vector is seed-selected and does not
+imply that level 9 meets a statistical FER target under Watterson fading.
 
 ## Consequences
 
@@ -418,6 +417,14 @@ drop-free sessions; Moderate and Poor remain diagnostic-only pending their separ
 limitations. This is a reproducible regression policy, not a production reliability guarantee.
 Increasing retries would tune production ARQ policy to this synthetic trough, while adding
 `RateLoop` would defeat the benchmark's fixed-level ARQ-isolation purpose, so neither was chosen.
+
+**COP-4 update (2026-08-05):** the old level-9 fading explanation was measurement-incomplete.
+A corrected modulation-aware per-frame diagnostic shows errors concentrated more strongly on
+high-noise-variance carriers, while a 300-trial profile/CP matrix shows that no tested profile clears
+FER≤10% through 36 dB. A perfect-CSI, decode-independent bound nevertheless admits 91.6% of
+Watterson-Good frames at 30 dB (95% CI 88.84–93.73%), versus 15.0% real decode success (95% CI
+11.40–19.48%). This is implementation headroom in FEC coverage/diversity, not proof of a physical
+64-QAM ceiling and not a reason to change profile routing. See BENCHMARKS.md's COP-4 section.
 
 ### A real, undocumented-until-now plan deviation
 

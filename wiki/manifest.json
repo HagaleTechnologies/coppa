@@ -265,7 +265,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:ded4a63c3be17073355512e9eba9ba7eae76ad82b9cd1c5accaa22165714b98d",
+      "hash": "sha256:7477efa7bd7802b3e7d22d5e5d3bbed5232209e75b27f423a65310ac134db09c",
       "id": "coppa-protocol",
       "kind": "subsystem",
       "links": [
@@ -284,8 +284,8 @@
       ],
       "status": "current",
       "title": "How does coppa-protocol handle framing, FEC, and ARQ?",
-      "verified_commit": "59b0b63",
-      "verified_date": "2026-07-14",
+      "verified_commit": "be2141b",
+      "verified_date": "2026-08-05",
       "visibility": "public"
     },
     {
@@ -332,7 +332,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:55df459a291a1020ab3b0256f54458d5b6377ab7d5c852ead89c893c0960e48f",
+      "hash": "sha256:7c7ad23fa09f0c3845b4f4ab8c9ada3aace5892ac60a4107f275af6c995de901",
       "id": "ldpc-non-convergence",
       "kind": "gotcha",
       "links": [
@@ -351,8 +351,8 @@
       ],
       "status": "current",
       "title": "What will bite you about LDPC at speed levels 9 and 10?",
-      "verified_commit": "59b0b63",
-      "verified_date": "2026-07-14",
+      "verified_commit": "be2141b",
+      "verified_date": "2026-08-05",
       "visibility": "public"
     },
     {

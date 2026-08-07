@@ -4,11 +4,13 @@
 //! decode failure vs success) across controlled channel conditions, to localize the
 //! failure: sync (H1), frequency-selective multipath / equalizer (H2), or noise.
 
+use coppa_bench::metrics::FailureCounts;
+use coppa_bench::scenario::mode_for_level;
 use coppa_channel::awgn_seeded;
 use coppa_channel::watterson::{watterson, Tap, WattersonConfig, WattersonPreset};
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_codec::ofdm::CoppaProfile;
-use coppa_protocol::modem::transceiver::{CoppaTransceiver, ReceiveError};
+use coppa_protocol::modem::transceiver::CoppaTransceiver;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
@@ -36,31 +38,6 @@ fn select_profile(level: u8) -> CoppaProfile {
     }
 }
 
-fn payload_bytes(level: u8) -> usize {
-    match level {
-        1 => 60,
-        2 => 121,
-        3 => 121,
-        4 => 182,
-        5 => 162,
-        6 => 121,
-        7 => 182,
-        9 => 162,
-        10 => 212,
-        _ => 121,
-    }
-}
-
-#[derive(Default)]
-struct Counts {
-    correct: u32,
-    ok_wrong: u32,
-    sync_failed: u32,
-    header_corrupt: u32,
-    ldpc_fail: u32,
-    crc: u32,
-}
-
 enum Chan {
     Awgn,
     Flat,
@@ -86,10 +63,12 @@ fn apply(kind: &Chan, clean: &[f32], snr_db: f32, seed: u64) -> Vec<f32> {
     awgn_seeded(&faded, snr_db, seed ^ 0x5555_5555_5555_5555)
 }
 
-fn run(level: u8, kind: &Chan, snr_db: f32, trials: u32) -> Counts {
+fn run(level: u8, kind: &Chan, snr_db: f32, trials: u32) -> FailureCounts {
     let tx = CoppaTransceiver::new(select_profile(level), 1);
-    let pb = payload_bytes(level);
-    let mut c = Counts::default();
+    let pb = mode_for_level(level)
+        .expect("known speed level")
+        .payload_bytes();
+    let mut c = FailureCounts::default();
     for t in 0..trials {
         let seed = 0x1000_0000u64 + t as u64;
         let mut rng = StdRng::seed_from_u64(seed);
@@ -98,19 +77,10 @@ fn run(level: u8, kind: &Chan, snr_db: f32, trials: u32) -> Counts {
             .transmit(&make_header(level, pb as u16), &payload)
             .expect("payload within this level's capacity");
         let rx = apply(kind, &clean, snr_db, seed);
-        match tx.receive(&rx) {
-            Ok((_h, p, _rec_level)) => {
-                if p.len() >= payload.len() && p[..payload.len()] == payload[..] {
-                    c.correct += 1;
-                } else {
-                    c.ok_wrong += 1;
-                }
-            }
-            Err(ReceiveError::SyncFailed) => c.sync_failed += 1,
-            Err(ReceiveError::HeaderCorrupt) => c.header_corrupt += 1,
-            Err(ReceiveError::LdpcNotConverged { .. }) => c.ldpc_fail += 1,
-            Err(ReceiveError::CrcMismatch) => c.crc += 1,
-        }
+        let received = tx.receive(&rx);
+        c.record(received.as_ref().map(|(_h, p, _rec_level)| {
+            p.len() >= payload.len() && p[..payload.len()] == payload[..]
+        }));
     }
     c
 }
@@ -150,9 +120,15 @@ fn main() {
             let c = run(level, kind, *snr, trials);
             println!(
                 "{:14} {:>4.0} | {:>7} {:>8} | {:>9} {:>4} {:>9}",
-                name, snr, c.correct, c.ok_wrong, c.sync_failed, c.header_corrupt, c.ldpc_fail
+                name,
+                snr,
+                c.correct,
+                c.wrong_payload,
+                c.sync_failed,
+                c.header_corrupt,
+                c.ldpc_not_converged
             );
-            let _ = c.crc;
+            let _ = c.crc_mismatch;
         }
         println!();
     }

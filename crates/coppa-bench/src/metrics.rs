@@ -1,6 +1,7 @@
 //! Metrics: aggregate per-trial outcomes into FER, BER, and goodput.
 
 use crate::scenario::SAMPLE_RATE;
+use coppa_protocol::modem::transceiver::ReceiveError;
 
 /// 95% Wilson score interval for a binomial proportion (errors out of trials).
 /// Returns (lo, hi) clamped to [0, 1]. Zero trials → (0.0, 1.0).
@@ -27,6 +28,83 @@ pub fn wilson_ci95(errors: usize, trials: usize) -> (f64, f64) {
     (lo, hi)
 }
 
+/// Failure category produced by a receive attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureMode {
+    SyncFailed,
+    HeaderCorrupt,
+    LdpcNotConverged,
+    CrcMismatch,
+    WrongPayload,
+}
+
+impl From<&ReceiveError> for FailureMode {
+    fn from(error: &ReceiveError) -> Self {
+        match error {
+            ReceiveError::SyncFailed => Self::SyncFailed,
+            ReceiveError::HeaderCorrupt => Self::HeaderCorrupt,
+            ReceiveError::LdpcNotConverged { .. } => Self::LdpcNotConverged,
+            ReceiveError::CrcMismatch => Self::CrcMismatch,
+        }
+    }
+}
+
+/// Counts successful trials and each distinct receive failure mode.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FailureCounts {
+    pub correct: usize,
+    pub wrong_payload: usize,
+    pub sync_failed: usize,
+    pub header_corrupt: usize,
+    pub ldpc_not_converged: usize,
+    pub crc_mismatch: usize,
+}
+
+impl FailureCounts {
+    pub fn record(&mut self, result: Result<bool, &ReceiveError>) {
+        match result {
+            Ok(true) => self.correct += 1,
+            Ok(false) => self.wrong_payload += 1,
+            Err(ReceiveError::SyncFailed) => self.sync_failed += 1,
+            Err(ReceiveError::HeaderCorrupt) => self.header_corrupt += 1,
+            Err(ReceiveError::LdpcNotConverged { .. }) => self.ldpc_not_converged += 1,
+            Err(ReceiveError::CrcMismatch) => self.crc_mismatch += 1,
+        }
+    }
+
+    pub fn trials(self) -> usize {
+        self.correct
+            + self.wrong_payload
+            + self.sync_failed
+            + self.header_corrupt
+            + self.ldpc_not_converged
+            + self.crc_mismatch
+    }
+
+    pub fn frame_errors(self) -> usize {
+        self.trials() - self.correct
+    }
+
+    pub fn fer(self) -> f64 {
+        self.frame_errors() as f64 / self.trials().max(1) as f64
+    }
+
+    fn record_outcome(&mut self, outcome: &TrialOutcome) {
+        if outcome.success {
+            self.correct += 1;
+            return;
+        }
+        match outcome.failure {
+            Some(FailureMode::SyncFailed) => self.sync_failed += 1,
+            Some(FailureMode::HeaderCorrupt) => self.header_corrupt += 1,
+            Some(FailureMode::LdpcNotConverged) => self.ldpc_not_converged += 1,
+            Some(FailureMode::CrcMismatch) => self.crc_mismatch += 1,
+            Some(FailureMode::WrongPayload) => self.wrong_payload += 1,
+            None => self.wrong_payload += 1,
+        }
+    }
+}
+
 /// Outcome of a single transmit → channel → receive trial.
 #[derive(Debug, Clone, Copy)]
 pub struct TrialOutcome {
@@ -37,6 +115,8 @@ pub struct TrialOutcome {
     /// Whether the receiver produced a payload to compare (true) or failed to
     /// decode entirely (false). BER is averaged only over comparable trials.
     pub comparable: bool,
+    /// Failure category, absent on a successful trial.
+    pub failure: Option<FailureMode>,
 }
 
 /// Aggregated measurement at one (mode, channel, SNR) point.
@@ -54,6 +134,7 @@ pub struct MeasurementPoint {
     pub fer_hi: f64,
     pub ber: f64,
     pub goodput_bps: f64,
+    pub failures: FailureCounts,
 }
 
 /// Count differing bits between two byte slices (Hamming distance), comparing
@@ -108,6 +189,10 @@ pub fn aggregate(
     } else {
         0.0
     };
+    let mut failures = FailureCounts::default();
+    for outcome in outcomes {
+        failures.record_outcome(outcome);
+    }
 
     MeasurementPoint {
         level,
@@ -121,12 +206,14 @@ pub fn aggregate(
         fer_hi,
         ber,
         goodput_bps,
+        failures,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coppa_protocol::modem::transceiver::ReceiveError;
 
     #[test]
     fn bit_errors_counts_differing_bits() {
@@ -140,7 +227,8 @@ mod tests {
             TrialOutcome {
                 success: true,
                 bit_errors: 0,
-                comparable: true
+                comparable: true,
+                failure: None
             };
             10
         ];
@@ -156,7 +244,8 @@ mod tests {
             TrialOutcome {
                 success: false,
                 bit_errors: 0,
-                comparable: false
+                comparable: false,
+                failure: Some(FailureMode::SyncFailed)
             };
             5
         ];
@@ -185,7 +274,8 @@ mod tests {
             TrialOutcome {
                 success: true,
                 bit_errors: 0,
-                comparable: true
+                comparable: true,
+                failure: None
             };
             50
         ];
@@ -196,5 +286,94 @@ mod tests {
             "0/50 upper CI ~0.071, got {}",
             p.fer_hi
         );
+    }
+
+    #[test]
+    fn failure_counts_cover_every_receive_error_variant() {
+        let mut c = FailureCounts::default();
+        c.record(Ok(true));
+        c.record(Ok(false));
+        c.record(Err(&ReceiveError::SyncFailed));
+        c.record(Err(&ReceiveError::HeaderCorrupt));
+        c.record(Err(&ReceiveError::LdpcNotConverged { iterations: 30 }));
+        c.record(Err(&ReceiveError::CrcMismatch));
+        assert_eq!(c.trials(), 6);
+        assert_eq!(c.frame_errors(), 5);
+    }
+
+    #[test]
+    fn aggregate_tallies_failure_modes_per_bucket() {
+        let outcomes = vec![
+            TrialOutcome {
+                success: true,
+                bit_errors: 0,
+                comparable: true,
+                failure: None,
+            },
+            TrialOutcome {
+                success: false,
+                bit_errors: 0,
+                comparable: false,
+                failure: Some(FailureMode::SyncFailed),
+            },
+            TrialOutcome {
+                success: false,
+                bit_errors: 0,
+                comparable: false,
+                failure: Some(FailureMode::LdpcNotConverged),
+            },
+            TrialOutcome {
+                success: false,
+                bit_errors: 0,
+                comparable: false,
+                failure: Some(FailureMode::LdpcNotConverged),
+            },
+        ];
+        let p = aggregate(
+            9,
+            "64-QAM 2/3",
+            "watterson-good",
+            30.0,
+            196,
+            48_000,
+            &outcomes,
+        );
+        assert_eq!(p.failures.sync_failed, 1);
+        assert_eq!(p.failures.ldpc_not_converged, 2);
+        assert_eq!(p.failures.header_corrupt, 0);
+    }
+
+    #[test]
+    fn failure_buckets_sum_to_frame_errors() {
+        let outcomes = vec![
+            TrialOutcome {
+                success: true,
+                bit_errors: 0,
+                comparable: true,
+                failure: None,
+            },
+            TrialOutcome {
+                success: false,
+                bit_errors: 3,
+                comparable: true,
+                failure: Some(FailureMode::WrongPayload),
+            },
+            TrialOutcome {
+                success: false,
+                bit_errors: 0,
+                comparable: false,
+                failure: Some(FailureMode::CrcMismatch),
+            },
+        ];
+        let p = aggregate(
+            9,
+            "64-QAM 2/3",
+            "watterson-poor",
+            30.0,
+            196,
+            48_000,
+            &outcomes,
+        );
+        assert_eq!(p.failures.frame_errors(), p.frame_errors);
     }
 }

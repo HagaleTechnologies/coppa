@@ -1009,17 +1009,12 @@ of `cargo test --workspace`) is the executable check: for every manifest
 entry it constructs a `CoppaTransceiver` for that level's profile, calls
 `receive()` on the WAV samples, and asserts the recovered `speed_level` and
 payload bytes exactly match the manifest (`crates/coppa-protocol/tests/golden_vectors.rs:144-190`).
-One entry (`L9_poor25`) has `expected_decode_ok = false` — a **documented,
-verified known-limitation failure** (level 9's steep, seed-dependent AWGN
-threshold under fading, per CLAUDE.md's Known Limitations), not a generator
-bug; the test asserts this entry *fails* to decode, as a tripwire against
-that failure silently disappearing or a *different* vector silently
-starting to fail.
+All 20 entries, including `L9_poor25`, have `expected_decode_ok = true`.
+The test requires every vector to decode to its exact manifest payload.
 
 An independent implementer **SHOULD** treat this manifest + WAV set as the
-primary interoperability conformance suite: correctly demodulating every
-`expected_decode_ok = true` WAV to its exact `payload_hex`, and correctly
-*failing* to decode `L9_poor25`, is strong evidence of wire-format
-compatibility with this reference implementation. Vectors are regenerated
+primary interoperability conformance suite: correctly demodulating all 20 WAVs
+to their exact `payload_hex` is strong evidence of wire-format compatibility
+with this reference implementation. Vectors are regenerated
 (not hand-authored) via `cargo run -p coppa-bench --release --example
 golden_vectors_gen` (`crates/coppa-protocol/tests/golden_vectors.rs:3-4,129`).
