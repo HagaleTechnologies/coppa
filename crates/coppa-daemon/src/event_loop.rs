@@ -482,6 +482,37 @@ impl EventLoop {
         self.ws_status = Some(status);
     }
 
+    /// Publish `cp_desync_episodes` to the WebSocket status snapshot, independent
+    /// of the decode event loop.
+    ///
+    /// Review finding (COP-2): the snapshot used to update `cp_desync_episodes`
+    /// only at the same point as `connected`/`snr`/`level`/`cfo` -- i.e. only on a
+    /// successful decode. That is fine for those fields (they describe the current
+    /// decode), but wrong for this one: the VHF-profile desync this canary exists
+    /// to catch is precisely the case where the peer can no longer decode this
+    /// station's frames, which on a duplex-ish link commonly means this station
+    /// stops decoding the peer too. The counter incremented internally in
+    /// `check_cp_desync` regardless, but the WebSocket-facing snapshot stayed at
+    /// its last decode-time value -- `0` if the desync's first episode ever -- for
+    /// as long as the outage lasted, i.e. the snapshot could read "healthy"
+    /// throughout the exact outage it exists to surface.
+    ///
+    /// `check_cp_desync` itself stays synchronous (see its doc: it runs off the
+    /// 500 ms retransmit poll and cannot take this `async` lock without making
+    /// that whole poll path async for one `u32` field). Called from
+    /// `check_arq_retransmits` instead, right after `drive_cp_negotiation`, which
+    /// already runs on that same poll independent of decode activity.
+    #[cfg(feature = "websocket")]
+    async fn publish_desync_episodes(&self) {
+        if let Some(ref status) = self.ws_status {
+            let mut snap = status.lock().await;
+            snap.cp_desync_episodes = self.cp_desync_episodes;
+        }
+    }
+
+    #[cfg(not(feature = "websocket"))]
+    async fn publish_desync_episodes(&self) {}
+
     /// Set the map of connected VARA command-port clients' response senders, for
     /// broadcasting `VaraResponse` telemetry (`VaraServer::response_senders()`).
     /// See decision 8.
@@ -1901,6 +1932,9 @@ impl EventLoop {
         // `is_failed` is consulted. Returns immediately when
         // `cp_negotiation_enabled` is false (the default).
         self.drive_cp_negotiation(Instant::now());
+        // COP-2 review finding: publish the desync counter here too, not only on
+        // the next successful decode -- see `publish_desync_episodes`'s doc.
+        self.publish_desync_episodes().await;
     }
 
     // ── CP-switch peer negotiation (COP-1) ────────────────────────────
@@ -2340,6 +2374,29 @@ impl EventLoop {
     ///    (`crates/coppa-engine/src/config.rs:44-46`); the canary would have been a
     ///    detector that could not see the only desync still live in the field.
     ///
+    /// # Condition 2's known false-positive, and why it stays as-is
+    ///
+    /// Review finding (COP-2): if the PEER *also* independently climbs to level 5
+    /// or above with `ShortCp` negotiated, its engine builds `vhf_wide` too --
+    /// both waveforms match, nothing is actually desynced, yet this station still
+    /// flags itself because the check is entirely local: `speed_level()` here is
+    /// this station's own RateLoop-driven estimate of ITS receive conditions, and
+    /// this daemon has no channel carrying the peer's speed level or on-air
+    /// profile. Distinguishing "peer independently reached VHF too" from "peer is
+    /// still on HF and can no longer decode me" needs peer-profile telemetry that
+    /// does not exist on the wire today -- adding it is a protocol change, not a
+    /// canary fix, and out of COP-2's scope.
+    ///
+    /// Left in place anyway, deliberately: condition 2 is the only branch that
+    /// fires in practice (condition 1 is future-regression cost only, see above),
+    /// so removing or gating it away would leave this canary permanently silent on
+    /// its one real job. `check_cp_desync`'s log line reflects the asymmetry --
+    /// worded as a confirmed violation only when condition 1 also holds, and as a
+    /// local-evidence-only "possible" desync when condition 2 fired alone -- but
+    /// `cp_desync_episodes` still counts either, since a local-only signal that
+    /// sometimes over-reports remains more useful to an operator than no signal at
+    /// all for the case that dominates in the field.
+    ///
     /// # It does not self-heal, and it does not panic
     ///
     /// Repairing here would mask the regression and, on a 500 ms poll, could rebuild
@@ -2368,6 +2425,20 @@ impl EventLoop {
         if desynced && !self.cp_desync_warned {
             self.cp_desync_warned = true;
             self.cp_desync_episodes = self.cp_desync_episodes.saturating_add(1);
+            // Condition 1 (bookkeeping_desync) is confirmed by construction --
+            // both sides of the comparison are this station's own state. Condition
+            // 2 alone (vhf_profile_desync) is local evidence only: it cannot rule
+            // out the peer having independently reached VHF too, in which case
+            // both waveforms already match and nothing is actually desynced (see
+            // this fn's doc, "Condition 2's known false-positive").
+            let message = if bookkeeping_desync {
+                "CP mode desync (COP-2 invariant violated); logged ONCE per episode, \
+                 not repaired -- see check_cp_desync"
+            } else {
+                "Possible CP mode desync (VHF profile risk, local evidence only -- \
+                 cannot confirm without peer-profile telemetry); logged ONCE per \
+                 episode, not repaired -- see check_cp_desync"
+            };
             tracing::warn!(
                 // Named `engine_cp_mode`, but above level 5 it is the DORMANT
                 // negotiated mode, not the live waveform -- hence `cp_mode_in_effect`
@@ -2379,8 +2450,7 @@ impl EventLoop {
                 bookkeeping_desync,
                 vhf_profile_desync,
                 episode = self.cp_desync_episodes,
-                "CP mode desync (COP-2 invariant violated); logged ONCE per episode, \
-                 not repaired -- see check_cp_desync"
+                "{message}"
             );
         } else if !desynced && self.cp_desync_warned {
             self.cp_desync_warned = false;
@@ -3618,6 +3688,42 @@ mod tests {
             "back below level 5 the negotiated mode is in effect again"
         );
         assert_eq!(a.cp_desync_episodes, 1);
+    }
+
+    /// Review finding (COP-2): the WebSocket snapshot's `cp_desync_episodes` used
+    /// to update only inside `decode_and_dispatch_audio`'s decode-event handling,
+    /// so a station whose peer can no longer decode it at all -- precisely the
+    /// scenario this canary exists to catch -- could keep publishing a stale `0`
+    /// indefinitely. `check_arq_retransmits` (the 500 ms poll `drive_cp_negotiation`
+    /// itself runs on) must publish it too, with no decode involved anywhere in
+    /// this test.
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn check_arq_retransmits_publishes_desync_episodes_without_a_decode() {
+        let mut a = EventLoop::new(cp_enabled_config()).unwrap();
+        let status = Arc::new(Mutex::new(coppa_host::websocket::WsStatus::default()));
+        a.set_ws_status(status.clone());
+        let t0 = Instant::now();
+
+        desync_negotiator_only(&mut a, CpMode::ShortCp, t0);
+        assert_eq!(
+            status.lock().await.cp_desync_episodes,
+            0,
+            "test setup: nothing observed yet"
+        );
+
+        // No decode anywhere in this test -- only the poll path.
+        a.check_arq_retransmits().await;
+
+        assert_eq!(
+            a.cp_desync_episodes, 1,
+            "test setup: the internal counter did increment"
+        );
+        assert_eq!(
+            status.lock().await.cp_desync_episodes,
+            1,
+            "the WebSocket snapshot must see it too, without waiting on a decode"
+        );
     }
 
     // ── COP-1 Phase 4: end-to-end loss injection ──────────────────────────
