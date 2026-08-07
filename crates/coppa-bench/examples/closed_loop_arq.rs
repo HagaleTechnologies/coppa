@@ -1191,14 +1191,31 @@ fn main() {
         "  x1: B > A on {}/{} seeds; B > C on {}/{} seeds.",
         pos_ba_x1, n_seeds_run, pos_bc_x1, n_seeds_run
     );
-    println!(
-        "  Sign-consistent (all {} seeds one way) => a DIRECTIONAL result. Mixed signs => no result,\n\
-         and the write-up must say the delta is inside this bench's own run-to-run band rather than\n\
-         reporting the mean as if it were an effect. Pairing is exact only at the CHANNEL level: once\n\
-         delivery outcomes diverge, RateLoop's trajectory diverges too, so the arms do not transmit\n\
-         the same levels on the same frames.",
-        n_seeds_run
-    );
+    // Review finding: the D9 pre-committed rule this verdict implements is defined
+    // over all SEEDS.len() (5) independent seeds. COPPA_CL_SEEDS lets an operator
+    // run a smaller smoke test (module doc: `COPPA_CL_SEEDS=1` wiring check) — a
+    // single favorable run there is not "sign-consistent across all seeds" in the
+    // D9 sense, and printing it as a DIRECTIONAL result turns a wiring smoke test
+    // into an apparently valid experimental conclusion. Only emit the D9 verdict
+    // language for a full run; label anything smaller as non-decisional.
+    if n_seeds_run == SEEDS.len() {
+        println!(
+            "  Sign-consistent (all {} seeds one way) => a DIRECTIONAL result. Mixed signs => no result,\n\
+             and the write-up must say the delta is inside this bench's own run-to-run band rather than\n\
+             reporting the mean as if it were an effect. Pairing is exact only at the CHANNEL level: once\n\
+             delivery outcomes diverge, RateLoop's trajectory diverges too, so the arms do not transmit\n\
+             the same levels on the same frames.",
+            n_seeds_run
+        );
+    } else {
+        println!(
+            "  NON-DECISIONAL: only {n_seeds_run}/{} seeds run (COPPA_CL_SEEDS override) -- the D9\n\
+             sign-consistency rule requires all {} pre-committed seeds. This run is a wiring/smoke\n\
+             check only; it is not evidence of a directional result either way.",
+            SEEDS.len(),
+            SEEDS.len()
+        );
+    }
 
     println!(
         "\nREBUILD PLACEBO -- arm A {:.1} bps vs arm P {:.1} bps ({:+.2}%)",

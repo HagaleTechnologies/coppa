@@ -278,10 +278,20 @@ pub struct EngineSection {
     /// *and* this flag are on; that is the condition under which the canary's own
     /// cost note should be read.
     ///
-    /// Both stations must set all three locally: there is no peer-capability
-    /// negotiation (see the design doc's "disjoint subsystems" finding for
-    /// why), and a station with `cp_negotiation_enabled` off simply never
-    /// proposes or acts on `TransportType::CpControl` PDUs.
+    /// Both stations must set `arq_enabled` and this flag locally: there is no
+    /// peer-capability negotiation (see the design doc's "disjoint subsystems"
+    /// finding for why), and a station with `cp_negotiation_enabled` off simply
+    /// never proposes or acts on `TransportType::CpControl` PDUs.
+    ///
+    /// Review finding: `cp_gate_enabled` is NOT part of that "both stations"
+    /// requirement — it is what makes a station INITIATE a proposal (its
+    /// recommendation drives the propose decision). A station with only
+    /// `arq_enabled` + this flag on (`cp_gate_enabled` off) still correctly
+    /// RESPONDS to a peer's proposal and completes the handshake — see
+    /// `cp_negotiation_enabled_alone_never_initiates_without_cp_gate`, which
+    /// proves exactly that "alone" case. So an asymmetric deployment is valid:
+    /// only the station that should ever initiate needs `cp_gate_enabled` too;
+    /// a responder-only station should leave it off.
     pub cp_negotiation_enabled: bool,
 }
 

@@ -56,8 +56,13 @@ Anyone reaching for short CP to improve a goodput *ratio* should read
 `coppa_protocol::modem::airtime`'s
 `short_cp_scales_frame_airtime_by_one_constant_at_every_level` first. A uniform
 CP change is one constant airtime divisor — the same `1104/1260` at every speed
-level — so it cancels out of `adaptive/best-fixed`, `adaptive/oracle`, or any
-other ratio of two goodputs measured under it. It is a real absolute-goodput
-lever and a provably invisible one to a ratio bar; COP-2 measured both facts
-(see `BENCHMARKS.md`'s COP-2 section and `docs/adr/008-phase3-system-layer.md`'s
-COP-2 update).
+level — so that airtime factor alone cancels out of `adaptive/best-fixed`,
+`adaptive/oracle`, or any other ratio of two goodputs measured under it. It is
+a real absolute-goodput lever, and the airtime saving by itself provably
+cannot move a ratio bar; COP-2 measured both facts (see `BENCHMARKS.md`'s
+COP-2 section and `docs/adr/008-phase3-system-layer.md`'s COP-2 update).
+Review finding: this is about the airtime component specifically, not short
+CP overall — on a channel where the shorter CP changes decode success (FER),
+that effect is NOT constant-factor and can move the ratio through the
+resulting RateLoop trajectory. "Provably invisible to any ratio" overstates
+what was measured; only the shared airtime factor is provably ratio-invisible.
