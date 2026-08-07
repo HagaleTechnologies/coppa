@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-08-04T23:46:19Z",
-  "head_commit": "2e49e50",
+  "generated_at": "2026-08-07T18:12:31Z",
+  "head_commit": "15b48d5",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -289,12 +289,36 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:54b9682dc09c9d2d9dfd79eb25cc946cafee4ac2ca869c76bf06023499a9bf6d",
+      "hash": "sha256:59cf1a80826adea8e77243f9da3703c3ff4a2451601d498a71613e0126c0af87",
+      "id": "cp-negotiation-flags",
+      "kind": "gotcha",
+      "links": [
+        "cp-negotiation-gotchas",
+        "adr-008-phase3-system-layer"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/cp-negotiation-flags.md",
+      "sources": [
+        "crates/coppa-daemon/src/config.rs",
+        "crates/coppa-daemon/src/event_loop.rs",
+        "crates/coppa-protocol/src/modem/airtime.rs",
+        "docs/adr/008-phase3-system-layer.md"
+      ],
+      "status": "current",
+      "title": "Which flags actually turn CP-switch negotiation on, and what does short CP buy?",
+      "verified_commit": "2efc1c1",
+      "verified_date": "2026-08-05",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:e8b1c43b57c538fd73c2d00ba0c52076493a24aa08954da907c7800ff86a43fd",
       "id": "cp-negotiation-gotchas",
       "kind": "gotcha",
       "links": [
         "adr-008-phase3-system-layer",
-        "coppa-protocol"
+        "coppa-protocol",
+        "cp-negotiation-flags"
       ],
       "locked": false,
       "maintainer": "agent",
@@ -307,8 +331,8 @@
       ],
       "status": "current",
       "title": "What will bite you about the CP-switch negotiation handshake?",
-      "verified_commit": "01f0ecb",
-      "verified_date": "2026-08-01",
+      "verified_commit": "2efc1c1",
+      "verified_date": "2026-08-05",
       "visibility": "public"
     },
     {

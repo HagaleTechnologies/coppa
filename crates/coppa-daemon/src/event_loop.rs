@@ -106,6 +106,24 @@ pub struct EventLoop {
     /// concern (the negotiator has no `ArqTx`). `None` when no Propose is
     /// outstanding.
     cp_propose_seq: Option<u8>,
+    /// COP-2 desync canary latch: `true` while the CP-mode invariant is currently
+    /// violated (see `drive_cp_negotiation`'s canary block for both conditions).
+    ///
+    /// Exists so the canary logs **once per episode** rather than once per 500 ms
+    /// poll. Without it a single divergence emits the identical warning twice a
+    /// second — ~7,200 lines/hour — for as long as the link stays broken, which is
+    /// indefinitely: every COP-1 give-up trigger reads state a *completed* handshake
+    /// has already cleared, so nothing can rescue the condition, and burying the
+    /// operator in duplicates of the one line that matters is the opposite of a
+    /// tripwire. Cleared when the invariant holds again, so a second, later episode
+    /// warns again.
+    cp_desync_warned: bool,
+    /// Number of distinct CP-mode desync episodes observed since daemon start
+    /// (rising edges of `cp_desync_warned`). Surfaced in the WebSocket `status`
+    /// snapshot so the condition is visible to a monitoring client and not only to
+    /// whoever is reading logs -- the canary otherwise reported a healthy station
+    /// through every operator-facing channel while the link was undecodable.
+    cp_desync_episodes: u32,
     /// Next TX sequence number for transport PDUs.
     #[allow(dead_code)] // used when ARQ TX path sends segmented frames
     arq_next_seq: u8,
@@ -317,6 +335,8 @@ impl EventLoop {
             cp_gate,
             cp_negotiator,
             cp_propose_seq: None,
+            cp_desync_warned: false,
+            cp_desync_episodes: 0,
             cp_control_arq_tx,
             cp_control_arq_rx,
             arq_next_seq: 0,
@@ -461,6 +481,37 @@ impl EventLoop {
     pub fn set_ws_status(&mut self, status: Arc<Mutex<coppa_host::websocket::WsStatus>>) {
         self.ws_status = Some(status);
     }
+
+    /// Publish `cp_desync_episodes` to the WebSocket status snapshot, independent
+    /// of the decode event loop.
+    ///
+    /// Review finding (COP-2): the snapshot used to update `cp_desync_episodes`
+    /// only at the same point as `connected`/`snr`/`level`/`cfo` -- i.e. only on a
+    /// successful decode. That is fine for those fields (they describe the current
+    /// decode), but wrong for this one: the VHF-profile desync this canary exists
+    /// to catch is precisely the case where the peer can no longer decode this
+    /// station's frames, which on a duplex-ish link commonly means this station
+    /// stops decoding the peer too. The counter incremented internally in
+    /// `check_cp_desync` regardless, but the WebSocket-facing snapshot stayed at
+    /// its last decode-time value -- `0` if the desync's first episode ever -- for
+    /// as long as the outage lasted, i.e. the snapshot could read "healthy"
+    /// throughout the exact outage it exists to surface.
+    ///
+    /// `check_cp_desync` itself stays synchronous (see its doc: it runs off the
+    /// 500 ms retransmit poll and cannot take this `async` lock without making
+    /// that whole poll path async for one `u32` field). Called from
+    /// `check_arq_retransmits` instead, right after `drive_cp_negotiation`, which
+    /// already runs on that same poll independent of decode activity.
+    #[cfg(feature = "websocket")]
+    async fn publish_desync_episodes(&self) {
+        if let Some(ref status) = self.ws_status {
+            let mut snap = status.lock().await;
+            snap.cp_desync_episodes = self.cp_desync_episodes;
+        }
+    }
+
+    #[cfg(not(feature = "websocket"))]
+    async fn publish_desync_episodes(&self) {}
 
     /// Set the map of connected VARA command-port clients' response senders, for
     /// broadcasting `VaraResponse` telemetry (`VaraServer::response_senders()`).
@@ -1201,6 +1252,16 @@ impl EventLoop {
                         } else {
                             None
                         };
+                        // COP-2: surface the desync canary where an operator can see
+                        // it. `check_cp_desync` runs off the 500 ms retransmit poll and
+                        // is not `async`, so it cannot take this lock itself; it
+                        // increments a plain counter on `EventLoop` and this
+                        // already-async snapshot point publishes it. That inherits the
+                        // snapshot's existing "only refreshed on a decode event"
+                        // limitation, which is acceptable here for the same reason it is
+                        // for `connected`: the counter is monotonic, so a stale read
+                        // under-reports a live problem but can never invent one.
+                        snap.cp_desync_episodes = self.cp_desync_episodes;
                     }
 
                     let decoded_bytes = payload.as_slice();
@@ -1871,6 +1932,9 @@ impl EventLoop {
         // `is_failed` is consulted. Returns immediately when
         // `cp_negotiation_enabled` is false (the default).
         self.drive_cp_negotiation(Instant::now());
+        // COP-2 review finding: publish the desync counter here too, not only on
+        // the next successful decode -- see `publish_desync_episodes`'s doc.
+        self.publish_desync_episodes().await;
     }
 
     // ── CP-switch peer negotiation (COP-1) ────────────────────────────
@@ -2267,7 +2331,7 @@ impl EventLoop {
     /// time" section, and the re-entrancy guard that now enforces the
     /// invariant the claim assumed). Treating them separately had a concrete
     /// cost even so: G4's `abort()` clears `pending_confirm`, so a co-pending
-    /// Confirm seq was dropped before the G2 block below could read and
+    /// Confirm seq was dropped before the G2 block could read and
     /// abandon it -- leaking the very window slot G2 exists to reclaim.
     ///
     /// So: read every tracked leg first, decide, then abandon them all,
@@ -2275,12 +2339,134 @@ impl EventLoop {
     /// together is also what makes the window really come back to
     /// `in_flight() == 0` -- `ArqTx::abandon` only advances `send_base` over a
     /// fully-resolved prefix, so abandoning a subset frees no room (see its
-    /// doc).
+    /// doc). That block lives in [`EventLoop::resolve_cp_giveups`], split out
+    /// only so COP-2's desync canary can carry its own doc without burying
+    /// this one; the order and the semantics are unchanged.
     fn drive_cp_negotiation(&mut self, now: Instant) {
         if !self.config.engine.cp_negotiation_enabled {
             return;
         }
 
+        self.check_cp_desync();
+        self.resolve_cp_giveups(now);
+    }
+
+    /// COP-2 CP-mode desync canary: a regression tripwire, latched, covering both
+    /// desyncs that can leave this station transmitting a waveform its peer cannot
+    /// decode.
+    ///
+    /// # The two conditions, and why one is not enough
+    ///
+    /// 1. **Bookkeeping desync** -- `engine.cp_mode() != cp_negotiator.current()`.
+    ///    After `set_speed_level` stopped rewriting `cp_mode` no production path can
+    ///    diverge these (every `set_cp_profile` caller passes the mode the
+    ///    negotiator just moved to), so this is future-regression cost only.
+    /// 2. **Profile desync at VHF** -- `speed_level() >= 5 &&
+    ///    cp_negotiator.current() != LongCp`. This one is REACHABLE TODAY, and
+    ///    condition 1 is structurally blind to it. COP-2 redefined `cp_mode()` to
+    ///    report the retained, *dormant* negotiated mode above level 5 (see
+    ///    `CoppaCore::cp_mode`'s doc) while `select_ofdm_profile` builds `vhf_wide`
+    ///    regardless -- so a station that climbed to VHF with `ShortCp` negotiated
+    ///    is on air as `vhf_wide` while its peer listens on
+    ///    `hf_standard_short_cp`, mutually undecodable, and condition 1 reads
+    ///    perfectly consistent. That HF/VHF profile desync is the residual gap this
+    ///    branch documents as still open
+    ///    (`crates/coppa-engine/src/config.rs:44-46`); the canary would have been a
+    ///    detector that could not see the only desync still live in the field.
+    ///
+    /// # Condition 2's known false-positive, and why it stays as-is
+    ///
+    /// Review finding (COP-2): if the PEER *also* independently climbs to level 5
+    /// or above with `ShortCp` negotiated, its engine builds `vhf_wide` too --
+    /// both waveforms match, nothing is actually desynced, yet this station still
+    /// flags itself because the check is entirely local: `speed_level()` here is
+    /// this station's own RateLoop-driven estimate of ITS receive conditions, and
+    /// this daemon has no channel carrying the peer's speed level or on-air
+    /// profile. Distinguishing "peer independently reached VHF too" from "peer is
+    /// still on HF and can no longer decode me" needs peer-profile telemetry that
+    /// does not exist on the wire today -- adding it is a protocol change, not a
+    /// canary fix, and out of COP-2's scope.
+    ///
+    /// Left in place anyway, deliberately: condition 2 is the only branch that
+    /// fires in practice (condition 1 is future-regression cost only, see above),
+    /// so removing or gating it away would leave this canary permanently silent on
+    /// its one real job. `check_cp_desync`'s log line reflects the asymmetry --
+    /// worded as a confirmed violation only when condition 1 also holds, and as a
+    /// local-evidence-only "possible" desync when condition 2 fired alone -- but
+    /// `cp_desync_episodes` still counts either, since a local-only signal that
+    /// sometimes over-reports remains more useful to an operator than no signal at
+    /// all for the case that dominates in the field.
+    ///
+    /// # It does not self-heal, and it does not panic
+    ///
+    /// Repairing here would mask the regression and, on a 500 ms poll, could rebuild
+    /// the transceiver twice a second against whatever kept rewriting it. Not a
+    /// `debug_assert!` either: a desync is a recoverable link condition, and
+    /// panicking inside the daemon's poll loop is a worse failure than warning.
+    ///
+    /// # Cost
+    ///
+    /// Three field reads per tick -- but only once `arq_enabled` is on, since
+    /// `check_arq_retransmits` returns before `drive_cp_negotiation` is ever reached
+    /// without it. On the shipped default this runs zero times (see
+    /// `DaemonConfig`'s `cp_negotiation_enabled` doc).
+    fn check_cp_desync(&mut self) {
+        let engine_cp_mode = self.engine.cp_mode();
+        let negotiator_cp_mode = self.cp_negotiator.current();
+        let speed_level = self.engine.speed_level();
+        // Below level 5 `cp_mode()` is the profile on air; at or above it,
+        // `select_ofdm_profile` ignores the mode and builds `vhf_wide`.
+        let cp_mode_in_effect = speed_level < 5;
+
+        let bookkeeping_desync = engine_cp_mode != negotiator_cp_mode;
+        let vhf_profile_desync = !cp_mode_in_effect && negotiator_cp_mode != CpMode::LongCp;
+        let desynced = bookkeeping_desync || vhf_profile_desync;
+
+        if desynced && !self.cp_desync_warned {
+            self.cp_desync_warned = true;
+            self.cp_desync_episodes = self.cp_desync_episodes.saturating_add(1);
+            // Condition 1 (bookkeeping_desync) is confirmed by construction --
+            // both sides of the comparison are this station's own state. Condition
+            // 2 alone (vhf_profile_desync) is local evidence only: it cannot rule
+            // out the peer having independently reached VHF too, in which case
+            // both waveforms already match and nothing is actually desynced (see
+            // this fn's doc, "Condition 2's known false-positive").
+            let message = if bookkeeping_desync {
+                "CP mode desync (COP-2 invariant violated); logged ONCE per episode, \
+                 not repaired -- see check_cp_desync"
+            } else {
+                "Possible CP mode desync (VHF profile risk, local evidence only -- \
+                 cannot confirm without peer-profile telemetry); logged ONCE per \
+                 episode, not repaired -- see check_cp_desync"
+            };
+            tracing::warn!(
+                // Named `engine_cp_mode`, but above level 5 it is the DORMANT
+                // negotiated mode, not the live waveform -- hence `cp_mode_in_effect`
+                // beside it, so a log reader cannot mistake the two.
+                ?engine_cp_mode,
+                ?negotiator_cp_mode,
+                speed_level,
+                cp_mode_in_effect,
+                bookkeeping_desync,
+                vhf_profile_desync,
+                episode = self.cp_desync_episodes,
+                "{message}"
+            );
+        } else if !desynced && self.cp_desync_warned {
+            self.cp_desync_warned = false;
+            tracing::info!(
+                ?negotiator_cp_mode,
+                speed_level,
+                episodes = self.cp_desync_episodes,
+                "CP mode desync cleared"
+            );
+        }
+    }
+
+    /// COP-1's G1-G4 give-up triggers, resolved as one pass. Split out of
+    /// `drive_cp_negotiation` only so the desync canary above can carry its own doc;
+    /// the ordering (canary first, then give-ups) and the semantics are unchanged.
+    fn resolve_cp_giveups(&mut self, now: Instant) {
         // Snapshot the ARQ-tracked legs BEFORE anything clears them.
         let confirm_seq = self.cp_negotiator.pending_confirm_seq();
         let switched_seq = self.cp_negotiator.pending_switched_seq();
@@ -3306,8 +3492,16 @@ mod tests {
 
     #[tokio::test]
     async fn drive_cp_negotiation_is_inert_when_cp_negotiation_is_disabled() {
-        // Default config: cp_negotiation_enabled = false.
-        let mut a = EventLoop::new(DaemonConfig::default()).unwrap();
+        // Set the flag off EXPLICITLY (COP-2). This used to rely on a bare
+        // `DaemonConfig::default()` and a comment asserting what that default
+        // is -- so the day someone flips the default this test would silently
+        // stop testing the disabled path and start testing the enabled one,
+        // under a name that still says "disabled". The default itself is
+        // pinned separately, by `config.rs`'s
+        // `test_cp_negotiation_requires_two_more_flags_by_default`.
+        let mut config = DaemonConfig::default();
+        config.engine.cp_negotiation_enabled = false;
+        let mut a = EventLoop::new(config).unwrap();
         let t0 = Instant::now();
         // Set up state that WOULD trigger every give-up path if enabled.
         a.cp_negotiator.apply_as_confirmer(CpMode::ShortCp, t0);
@@ -3342,6 +3536,196 @@ mod tests {
         assert_eq!(a.cp_propose_seq, None);
     }
 
+    // ── COP-2: the desync canary's TRUE branch ────────────────────────────
+    //
+    // The canary (`EventLoop::check_cp_desync`) is the only production code
+    // this branch adds to the daemon, and until these tests nothing took its
+    // true branch: every other test in this file that moves `cp_negotiator`
+    // also calls `engine.set_cp_profile` with the same mode, so the invariant
+    // holds at every `drive_cp_negotiation` call, and the one test that leaves
+    // negotiator state armed without syncing the engine returns at the
+    // `cp_negotiation_enabled` guard before reaching the canary. A regression
+    // detector installed for a FUTURE writer was itself unpinned -- an inverted
+    // comparison, a swapped field pair, or the whole block vanishing in a
+    // refactor would all have left the suite green.
+    //
+    // These are STATE-based, not log-based, deliberately: there is no
+    // log-capture harness anywhere in the workspace (no `tracing-test`
+    // dependency in any Cargo.toml; the only `tracing_subscriber` use is
+    // `main.rs:21`), and the latch/counter the canary now carries make its
+    // behaviour observable without adding one.
+
+    /// Put a station in the post-success desync state: negotiator settled on
+    /// `mode`, engine never told. `on_peer_switched` is what makes it
+    /// *post-success* -- it disarms probation and clears `revert_to`, so no
+    /// COP-1 give-up trigger is armed and `drive_cp_negotiation` has nothing to
+    /// do except run the canary. That is precisely the hole COP-2 exists to
+    /// detect: every G1-G4 trigger reads state a completed handshake has
+    /// already cleared.
+    fn desync_negotiator_only(station: &mut EventLoop, mode: CpMode, now: Instant) {
+        station.cp_negotiator.apply_as_confirmer(mode, now);
+        assert!(
+            station.cp_negotiator.on_peer_switched(mode),
+            "test setup: the third leg must be accepted, leaving no armed trigger"
+        );
+        assert!(
+            !station.cp_negotiator.negotiation_in_flight(),
+            "test setup: this must be the POST-SUCCESS state, not an in-flight one"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cp_desync_canary_fires_once_per_episode_and_never_repairs() {
+        let mut a = EventLoop::new(cp_enabled_config()).unwrap();
+        let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
+        a.set_audio_out(producer);
+        let t0 = Instant::now();
+
+        desync_negotiator_only(&mut a, CpMode::ShortCp, t0);
+        assert_eq!(
+            a.engine.cp_mode(),
+            CpMode::LongCp,
+            "test setup: the engine was deliberately NOT told"
+        );
+        assert_eq!(a.cp_desync_episodes, 0, "test setup: nothing observed yet");
+
+        a.drive_cp_negotiation(t0);
+
+        assert_eq!(
+            a.cp_desync_episodes, 1,
+            "the canary must see the divergence"
+        );
+        assert!(a.cp_desync_warned, "and latch it");
+
+        // The documented no-self-heal contract. Repairing here would mask the
+        // regression and, on a 500 ms poll, rebuild the transceiver twice a second.
+        assert_eq!(
+            a.engine.cp_mode(),
+            CpMode::LongCp,
+            "the canary must NOT repair the engine"
+        );
+        assert_eq!(
+            a.cp_negotiator.current(),
+            CpMode::ShortCp,
+            "nor rewind the negotiator"
+        );
+        let mut buf = vec![0.0f32; 4096];
+        assert_eq!(
+            consumer.read(&mut buf),
+            0,
+            "a give-up is silent by design and the canary transmits nothing at all"
+        );
+
+        // The latch: 500 ms polls do not each emit a fresh episode. Without it a
+        // single divergence logs ~7,200 identical lines an hour, indefinitely,
+        // because nothing can clear the condition on its own.
+        for _ in 0..10 {
+            a.drive_cp_negotiation(t0 + Duration::from_secs(SWITCH_PROBATION_SECS * 10));
+        }
+        assert_eq!(
+            a.cp_desync_episodes, 1,
+            "one episode, however many polls observe it"
+        );
+
+        // Cleared when the invariant holds again...
+        a.engine.set_cp_profile(CpMode::ShortCp);
+        a.drive_cp_negotiation(t0);
+        assert!(!a.cp_desync_warned, "the latch must clear");
+        assert_eq!(a.cp_desync_episodes, 1, "clearing is not a new episode");
+
+        // ...and a LATER divergence is a genuinely new episode, not swallowed by a
+        // stuck latch.
+        a.engine.set_cp_profile(CpMode::LongCp);
+        a.drive_cp_negotiation(t0);
+        assert_eq!(a.cp_desync_episodes, 2);
+        assert!(a.cp_desync_warned);
+    }
+
+    /// The level-aware clause, and the reason it is not redundant with the
+    /// bookkeeping comparison: here engine and negotiator AGREE (both `ShortCp`),
+    /// so `engine.cp_mode() != cp_negotiator.current()` is false — yet the station
+    /// is on air as `vhf_wide` while its peer listens on `hf_standard_short_cp`.
+    ///
+    /// This is the HF/VHF profile desync the branch documents as still open, and it
+    /// is the one CP-profile desync still REACHABLE in the field. A canary that
+    /// checked only the bookkeeping pair would have been a detector blind to the
+    /// only live failure.
+    #[tokio::test]
+    async fn the_cp_desync_canary_sees_a_vhf_profile_desync_that_bookkeeping_cannot() {
+        let mut a = EventLoop::new(cp_enabled_config()).unwrap();
+        let t0 = Instant::now();
+
+        desync_negotiator_only(&mut a, CpMode::ShortCp, t0);
+        a.engine.set_cp_profile(CpMode::ShortCp);
+        a.engine
+            .set_speed_level(5)
+            .expect("5 is a valid wire speed level");
+
+        assert_eq!(
+            a.engine.cp_mode(),
+            a.cp_negotiator.current(),
+            "test premise: bookkeeping AGREES here, so only the level-aware clause \
+             can detect this"
+        );
+        assert_eq!(a.engine.speed_level(), 5, "test premise: at VHF");
+
+        a.drive_cp_negotiation(t0);
+
+        assert_eq!(
+            a.cp_desync_episodes, 1,
+            "on air as vhf_wide while the peer believes short-CP HF must be seen"
+        );
+
+        // Dropping back into the HF range makes the negotiated mode live again, and
+        // the condition clears -- so this clause cannot fire on a station that is
+        // simply using short CP correctly.
+        a.engine
+            .set_speed_level(4)
+            .expect("4 is a valid wire speed level");
+        a.drive_cp_negotiation(t0);
+        assert!(
+            !a.cp_desync_warned,
+            "back below level 5 the negotiated mode is in effect again"
+        );
+        assert_eq!(a.cp_desync_episodes, 1);
+    }
+
+    /// Review finding (COP-2): the WebSocket snapshot's `cp_desync_episodes` used
+    /// to update only inside `decode_and_dispatch_audio`'s decode-event handling,
+    /// so a station whose peer can no longer decode it at all -- precisely the
+    /// scenario this canary exists to catch -- could keep publishing a stale `0`
+    /// indefinitely. `check_arq_retransmits` (the 500 ms poll `drive_cp_negotiation`
+    /// itself runs on) must publish it too, with no decode involved anywhere in
+    /// this test.
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn check_arq_retransmits_publishes_desync_episodes_without_a_decode() {
+        let mut a = EventLoop::new(cp_enabled_config()).unwrap();
+        let status = Arc::new(Mutex::new(coppa_host::websocket::WsStatus::default()));
+        a.set_ws_status(status.clone());
+        let t0 = Instant::now();
+
+        desync_negotiator_only(&mut a, CpMode::ShortCp, t0);
+        assert_eq!(
+            status.lock().await.cp_desync_episodes,
+            0,
+            "test setup: nothing observed yet"
+        );
+
+        // No decode anywhere in this test -- only the poll path.
+        a.check_arq_retransmits().await;
+
+        assert_eq!(
+            a.cp_desync_episodes, 1,
+            "test setup: the internal counter did increment"
+        );
+        assert_eq!(
+            status.lock().await.cp_desync_episodes,
+            1,
+            "the WebSocket snapshot must see it too, without waiting on a decode"
+        );
+    }
+
     // ── COP-1 Phase 4: end-to-end loss injection ──────────────────────────
     //
     // Two real `EventLoop`s, real audio rings, real `decode_and_dispatch_audio`
@@ -3368,6 +3752,31 @@ mod tests {
             "expected the station to have really transmitted {what}"
         );
         with_lead_and_trail(&buf[..read])
+    }
+
+    /// COP-2's invariant, as one assertion: this station's engine and its negotiator
+    /// agree on the CP mode in effect. Nothing compared these two before COP-2 --
+    /// every test asserted each against a literal separately, which is exactly why a
+    /// `set_speed_level`-driven divergence was invisible to all of them.
+    ///
+    /// Deliberately NOT folded into `assert_converged` as a claimed detection gain:
+    /// `assert_converged` already asserts both engines' `cp_mode()` and both
+    /// negotiators against the *same* literal, so `engine == negotiator` is already
+    /// implied for every one of its callers, and advertising the fold as new coverage
+    /// would be a detection claim the code cannot support. (Verified rather than
+    /// assumed: the fold was temporarily applied and the whole `cp_` suite stayed
+    /// green, confirming COP-1's own convergence paths already satisfy this invariant
+    /// and that COP-2 is not papering over a second, pre-existing violation.) If a
+    /// genuinely additional assertion is ever wanted there, the reachable one is
+    /// `!(engine.speed_level() >= 5 && cp_negotiator.current() != CpMode::LongCp)` --
+    /// "on air as `vhf_wide` while the peer believes short-CP HF" -- which is a
+    /// different, real condition; add it on its own merits or not at all.
+    fn assert_engine_matches_negotiator(station: &EventLoop, whose: &str) {
+        assert_eq!(
+            station.engine.cp_mode(),
+            station.cp_negotiator.current(),
+            "{whose}: engine.cp_mode() must equal cp_negotiator.current()"
+        );
     }
 
     /// The ticket's acceptance criterion, as one assertion: engine and
@@ -3404,6 +3813,42 @@ mod tests {
             .drive_cp_negotiation(Instant::now() + Duration::from_secs(SWITCH_PROBATION_SECS + 1));
     }
 
+    /// One real, decodable clean-channel frame carrying a payload that is
+    /// deliberately INERT to every dispatch path except the CpGate block:
+    /// the first byte's low nibble `0x0F` is an unrecognized `TransportType`,
+    /// and at 10 bytes it is shorter than `MacPdu::HEADER_SIZE` (14), so
+    /// neither `handle_mac_pdu` nor any `TransportPdu` arm can run -- and
+    /// therefore nothing here can transmit and confound a
+    /// "was anything sent?" assertion. `i` just makes each frame's content
+    /// distinct.
+    ///
+    /// Extracted from `trip_cp_gate` so the COP-2 flip-gate test below can
+    /// feed the SAME frames to a station whose `cp_gate_enabled` is off; two
+    /// copies of this builder would let the two tests silently drift apart on
+    /// exactly the payload property both of them depend on.
+    fn inert_peer_frame(i: u8) -> Vec<f32> {
+        let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(
+            coppa_codec::ofdm::CoppaProfile::hf_standard(),
+            1,
+        );
+        let payload: Vec<u8> = vec![0xFF, i, 0, 0, 0, 0, 0, 1, 2, 3];
+        let header = coppa_codec::ofdm::frame::CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: coppa_codec::ofdm::frame::CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: payload.len() as u16,
+            codewords: 1,
+        };
+        let samples = peer_tx
+            .transmit(&header, &payload)
+            .expect("peer transmit should succeed");
+        with_lead_and_trail(&samples)
+    }
+
     /// Drive `station` through a real `LongCp -> ShortCp` `CpGate` transition
     /// by decoding 4 real clean-channel frames, which is what trips
     /// `CpGate::default_coppa`'s real hysteresis (`consecutive_needed = 4`).
@@ -3413,29 +3858,9 @@ mod tests {
     /// inside that function and is the production path. See
     /// `cp_negotiation_full_handshake_converges_both_sides`'s doc.
     async fn trip_cp_gate(station: &mut EventLoop) {
-        let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
-        let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
         for i in 0..4u8 {
-            // First byte's low nibble 0x0F is an unrecognized TransportType,
-            // so these are inert: they exercise only the real
-            // CpGate-observe-and-maybe-propose block, with no ARQ side effects.
-            let warmup_payload: Vec<u8> = vec![0xFF, i, 0, 0, 0, 0, 0, 1, 2, 3];
-            let header = coppa_codec::ofdm::frame::CoppaHeader {
-                version: 1,
-                phy_mode: 0,
-                frame_type: coppa_codec::ofdm::frame::CoppaFrameType::Data,
-                bandwidth: 1,
-                fec_type: 0,
-                speed_level: 2,
-                seq_num: 0,
-                payload_len: warmup_payload.len() as u16,
-                codewords: 1,
-            };
-            let samples = peer_tx
-                .transmit(&header, &warmup_payload)
-                .expect("peer transmit should succeed");
             station
-                .decode_and_dispatch_audio(&with_lead_and_trail(&samples))
+                .decode_and_dispatch_audio(&inert_peer_frame(i))
                 .await;
         }
         assert_eq!(
@@ -4331,6 +4756,508 @@ mod tests {
             "the real poll must retransmit, exhaust the budget, and then fire G1"
         );
         assert_eq!(b.cp_control_arq_tx.in_flight(), 0);
+    }
+
+    // ── COP-2 Phase 5: the `set_speed_level` / `cp_negotiator` desync ──────
+    //
+    // COP-1 closed every CP desync reachable *while a negotiation is in
+    // flight* (G1-G4). These two close the one reachable *after* a negotiation
+    // has fully succeeded, which is precisely why none of COP-1's machinery
+    // could see it: `pending_confirm`, `pending_switched`, `revert_to`,
+    // `probation` and `cp_propose_seq` were all cleared by the handshake's own
+    // success paths, so `drive_cp_negotiation` is a provable no-op (see
+    // `drive_cp_negotiation_is_a_no_op_when_no_negotiation_is_in_flight`) and
+    // a fresh `Propose` would need a `CpGate` transition, which needs decoded
+    // frames, which a dead link cannot produce.
+    //
+    // The trajectory: `RateLoop` drives `CoppaCore::set_speed_level` across
+    // the HF/VHF speed-level boundary and back. `set_speed_level` used to
+    // permanently rewrite `config.cp_mode` to `LongCp` on the way up, and
+    // nothing restored it on the way down -- so dropping back below level 5
+    // rebuilt onto `hf_standard` (CP 300) while the peer, never told anything,
+    // stayed on `hf_standard_short_cp` (CP 144). Mutually undecodable, both
+    // stations back inside the HF range where each believes the link should
+    // work, and no give-up trigger armed anywhere.
+    //
+    // Both directions are covered deliberately: `a` is the confirmer (the
+    // station that sends `Confirm`) and `b` the proposer (the station that
+    // sends `Propose`) -- see `cp_negotiator`'s module doc for why plain
+    // English and the code's own labels collide here. Nothing makes a station
+    // intrinsically an A or a B, and `RateLoop` runs identically on both.
+
+    #[tokio::test]
+    async fn a_rate_loop_vhf_excursion_does_not_desync_a_negotiated_short_cp() {
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = cp_pair();
+        negotiate(
+            &mut a,
+            &mut b,
+            &mut a_consumer,
+            &mut b_consumer,
+            CpMode::ShortCp,
+        )
+        .await;
+
+        // Seed the confirmer's `RateLoop` at level 4 -- one step below the
+        // HF/VHF boundary -- so the very next raise crosses it. Direct
+        // assignment matches how every other `rate_loop` test in this file
+        // seeds a non-default starting level. `raise_dwell = 5` is
+        // `RateLoop::default_coppa`'s own swept value, so five consecutive
+        // higher recommendations is exactly what a real climb costs.
+        a.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 4);
+
+        // Five real ACKs, encoded under `hf_standard_short_cp` -- `a`'s REAL
+        // post-negotiation profile, which is the whole point of driving this
+        // through `decode_and_dispatch_audio` rather than calling
+        // `set_speed_level` directly: a frame built under any other profile
+        // would not decode here at all.
+        //
+        // These carry no `0xFF` first-byte marker (this file's convention for
+        // inert filler frames, see `trip_cp_gate`): a real ACK's first byte IS
+        // its session_id/type nibble pair, so an 0xFF prefix would stop it
+        // being an ACK. It is not needed either -- an 8-byte ACK PDU is
+        // shorter than `MacPdu::HEADER_SIZE` (14), so `MacPdu::from_bytes`
+        // rejects it and `handle_mac_pdu` never runs, exactly as
+        // `incoming_ack_with_rate_updates_rate_loop_and_encoder` already
+        // relies on. The `Ack` arm itself transmits nothing.
+        for _ in 0..5 {
+            let ack = TransportPdu::new_ack_with_rate(a.arq_session_id, 0, 0, 10);
+            unstick_decoder(&mut a);
+            a.decode_and_dispatch_audio(&peer_frame(
+                &ack,
+                coppa_codec::ofdm::CoppaProfile::hf_standard_short_cp(),
+            ))
+            .await;
+        }
+
+        assert_eq!(
+            a.rate_loop.current_level(),
+            5,
+            "test setup: five consecutive higher recommendations must really \
+             have raised RateLoop across the HF/VHF boundary"
+        );
+        assert_eq!(
+            a.engine.speed_level(),
+            5,
+            "test setup: and the ACK arm must really have applied it to the engine"
+        );
+        assert_eq!(
+            a.engine.cp_mode(),
+            CpMode::ShortCp,
+            "the negotiated CP mode must be RETAINED (dormant) across the VHF \
+             excursion, not discarded -- the peer still believes it is in force"
+        );
+
+        // Drop back below the boundary through the REAL timeout path, not a
+        // direct `set_speed_level` call: one expired segment in one poll is
+        // one `on_timeout`, which steps 5 -> 4 and rebuilds the engine. This
+        // is the step that used to land on `hf_standard` and kill the link.
+        let arq_config = ArqConfig::new(8, 5, Duration::from_millis(20))
+            .expect("window_size=8 is within 1..=MAX_WINDOW_SIZE");
+        let mut arq_tx = ArqTx::new(arq_config);
+        arq_tx
+            .send(
+                b"expired segment".to_vec(),
+                Instant::now() - Duration::from_millis(100),
+            )
+            .expect("a fresh ARQ window should have room");
+        a.arq_tx = Some(arq_tx);
+
+        a.check_arq_retransmits().await;
+
+        assert_eq!(
+            a.rate_loop.current_level(),
+            4,
+            "test setup: the retransmit timeout must really have stepped 5 -> 4"
+        );
+        assert_eq!(a.engine.speed_level(), 4, "test setup: and been applied");
+
+        assert_engine_matches_negotiator(&a, "a");
+        assert_converged(&a, &b, CpMode::ShortCp);
+
+        // And the link is genuinely ALIVE, not merely consistent -- the
+        // assertion that fails loudest pre-fix, since `a` would be back on
+        // `hf_standard` while `b` listens on `hf_standard_short_cp`.
+        let samples = a.engine.encode_bytes(b"link alive").unwrap();
+        assert_eq!(
+            b.engine
+                .decode_bytes(&samples)
+                .expect("b must decode a's frame after a's VHF excursion and return"),
+            b"link alive".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rate_loop_probe_into_vhf_does_not_desync_a_negotiated_short_cp() {
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = cp_pair();
+        negotiate(
+            &mut a,
+            &mut b,
+            &mut a_consumer,
+            &mut b_consumer,
+            CpMode::ShortCp,
+        )
+        .await;
+
+        // The one-frame variant, on the PROPOSER this time: a single active
+        // overshoot probe reaches level 5, and `try_drain_tx_queue` reverts to
+        // level 4 immediately afterwards. No ARQ timeout and no VHF dwell at
+        // all -- pre-fix, `hf_standard_short_cp` was already lost by the time
+        // the revert landed on `hf_standard`.
+        b.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 4).with_probing(1, 1);
+
+        // A REAL ARQ window holding the seq the queued frame names, rather than a
+        // bare `Some(0)` with no segment behind it. That is what makes the
+        // probe-success half below reachable: `resolve_probe_if_acked` fires only
+        // from inside `if let Some(ref mut arq_tx)`, off a seq that
+        // `ArqTx::process_ack` really reports as newly acked.
+        let mut probe_arq_tx = ArqTx::new(ArqConfig::default());
+        let probe_seq = probe_arq_tx
+            .send(b"probe me".to_vec(), Instant::now())
+            .expect("a fresh ARQ window should have room");
+        b.arq_tx = Some(probe_arq_tx);
+        b.tx_queue
+            .push_back((Some(probe_seq), b"probe me".to_vec()));
+
+        // MANDATORY, not hygiene. `negotiate` made `b` transmit, so
+        // `is_transmitting` is still true: PTT release arrives only as a
+        // `DaemonEvent::PttChange(false)` from a spawned timer through the
+        // event channel, which a unit test never drains. Without this line
+        // `try_drain_tx_queue` early-returns, no probe is taken,
+        // `set_speed_level` is never called, and this test would pass
+        // IDENTICALLY before and after the fix -- proving nothing. Poking this
+        // field directly has existing precedent in this file (see
+        // `enqueue_tx_carries_optional_arq_seq_through_the_queue`).
+        b.is_transmitting = false;
+        b.try_drain_tx_queue().await;
+
+        assert_eq!(
+            b.probe_state,
+            Some((probe_seq, 5)),
+            "test setup: the probe must really have gone out at VHF level 5"
+        );
+        assert_eq!(
+            b.engine.speed_level(),
+            4,
+            "test setup: and the engine must have been reverted to RateLoop's \
+             steady-state level afterwards"
+        );
+
+        assert_engine_matches_negotiator(&b, "b");
+        assert_converged(&a, &b, CpMode::ShortCp);
+
+        let samples = b.engine.encode_bytes(b"link alive").unwrap();
+        assert_eq!(
+            a.engine
+                .decode_bytes(&samples)
+                .expect("a must decode b's frame after b's one-frame VHF probe"),
+            b"link alive".to_vec()
+        );
+
+        // ── The probe SUCCEEDS: the longest-lived form of the state ──────────
+        //
+        // `resolve_probe_if_acked` (`:1722`) is the fifth and last daemon call site
+        // that drives `set_speed_level` across the HF/VHF boundary, and it was the
+        // one no test exercised across that boundary -- on this branch or on main.
+        // It matters more than the other four, not less: `on_probe_result` on a
+        // SUCCESSFUL probe PROMOTES rather than reverts, so this is the only path
+        // that crosses into VHF and leaves `RateLoop`'s steady-state level up there.
+        // That is the longest-lived form of the retained-`ShortCp`-at-VHF state, and
+        // the state that used to be the point of no return: pre-fix the mode was
+        // already gone, and every later frame -- for the whole VHF dwell and after
+        // it -- went out on the wrong profile.
+        let ack = TransportPdu::new_ack_with_rate(
+            b.arq_session_id,
+            probe_seq.wrapping_add(1), // cumulative: "next expected"
+            0,
+            10,
+        );
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&peer_frame(
+            &ack,
+            coppa_codec::ofdm::CoppaProfile::hf_standard_short_cp(),
+        ))
+        .await;
+
+        assert_eq!(
+            b.probe_state, None,
+            "test setup: the ACK must really have resolved the probe"
+        );
+        assert_eq!(
+            b.rate_loop.current_level(),
+            5,
+            "a SUCCESSFUL probe promotes RateLoop's steady state to the probed \
+             level, so `b` now DWELLS at VHF rather than passing through it"
+        );
+        assert_eq!(b.engine.speed_level(), 5, "test setup: and been applied");
+        assert_eq!(
+            b.engine.cp_mode(),
+            CpMode::ShortCp,
+            "the negotiated mode must survive a promotion into VHF, not just a \
+             one-frame excursion"
+        );
+        assert_engine_matches_negotiator(&b, "b");
+
+        // Now come back down through the REAL timeout path and prove the link still
+        // works -- the assertion that fails loudest pre-fix.
+        let arq_config = ArqConfig::new(8, 5, Duration::from_millis(20))
+            .expect("window_size=8 is within 1..=MAX_WINDOW_SIZE");
+        let mut arq_tx = ArqTx::new(arq_config);
+        arq_tx
+            .send(
+                b"expired segment".to_vec(),
+                Instant::now() - Duration::from_millis(100),
+            )
+            .expect("a fresh ARQ window should have room");
+        b.arq_tx = Some(arq_tx);
+
+        b.check_arq_retransmits().await;
+
+        assert_eq!(
+            b.rate_loop.current_level(),
+            4,
+            "test setup: the retransmit timeout must really have stepped 5 -> 4"
+        );
+        assert_eq!(b.engine.speed_level(), 4, "test setup: and been applied");
+
+        assert_engine_matches_negotiator(&b, "b");
+        assert_converged(&a, &b, CpMode::ShortCp);
+
+        let samples = b.engine.encode_bytes(b"still alive").unwrap();
+        assert_eq!(
+            a.engine
+                .decode_bytes(&samples)
+                .expect("a must decode b's frame after b dwelt at VHF and returned"),
+            b"still alive".to_vec()
+        );
+    }
+
+    /// The third trajectory: a `RateLoop` excursion across the HF/VHF boundary
+    /// **while a negotiation is still armed**.
+    ///
+    /// Both Phase 5 tests above run `negotiate(...)` to completion first, and their
+    /// section comment scopes them deliberately to the window *after* a handshake
+    /// fully succeeded. That leaves the in-flight window uncovered, and it is not
+    /// the same window: it terminates somewhere neither of them reaches — COP-1's
+    /// give-up block, where `abort()` + `set_cp_profile(reverted)` re-applies the
+    /// **pre-negotiation** mode. Nothing pinned that the mode `set_speed_level`
+    /// retained and the mode the give-up reverts to still agree once a VHF excursion
+    /// has happened in between.
+    ///
+    /// Pre-fix this fails at the mid-excursion assertion, not at the give-up: the
+    /// climb to level 5 rewrote `cp_mode` to `LongCp` while the negotiator sat on
+    /// `ShortCp`, so engine and negotiator diverged *during* the handshake and every
+    /// later decision — including the give-up's own `set_cp_profile` — was taken
+    /// against a state that had already drifted.
+    ///
+    /// Direction note, stated rather than implied: this drives `LongCp -> ShortCp`,
+    /// which is the direction `apply_as_confirmer` + probation naturally produces
+    /// and the one where the retained mode is a *non-default*. The
+    /// `ShortCp -> LongCp` direction — where "pre-negotiation mode" and a hardcoded
+    /// `LongCp` genuinely differ, the distinction `cp_negotiator`'s module doc says
+    /// got it wrong once — is already covered by COP-1's
+    /// `lost_confirm_in_the_short_to_long_direction_*` tests; this one is about the
+    /// `set_speed_level` interaction, which those do not exercise.
+    #[tokio::test]
+    async fn a_rate_loop_vhf_excursion_mid_handshake_still_gives_up_consistently() {
+        let (a, mut b, _a_consumer, _b_consumer) = cp_pair();
+        let t0 = Instant::now();
+
+        // A real in-flight state, not a simulated one: `b` has switched to ShortCp
+        // as the confirmer (probation armed, `revert_to` = LongCp) and has a real
+        // CP-control segment outstanding for its third leg. `a` was never told
+        // anything and stays on LongCp — which is what makes the convergence
+        // assertion at the end meaningful.
+        b.cp_negotiator.apply_as_confirmer(CpMode::ShortCp, t0);
+        b.engine.set_cp_profile(CpMode::ShortCp);
+        let switched_seq = b
+            .cp_control_arq_tx
+            .send(CpNegotiator::switched_payload(CpMode::ShortCp), t0)
+            .expect("the CP-control window must have room");
+        b.cp_negotiator.track_pending_switched(switched_seq);
+        assert!(
+            b.cp_negotiator.negotiation_in_flight(),
+            "test setup: this must be an IN-FLIGHT negotiation, unlike the two \
+             post-success tests above"
+        );
+
+        // Climb across the boundary through the real ACK path, exactly as
+        // `a_rate_loop_vhf_excursion_does_not_desync_a_negotiated_short_cp` does —
+        // ACKs encoded under `hf_standard_short_cp`, `b`'s real current profile.
+        b.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 4);
+        for _ in 0..5 {
+            let ack = TransportPdu::new_ack_with_rate(b.arq_session_id, 0, 0, 10);
+            unstick_decoder(&mut b);
+            b.decode_and_dispatch_audio(&peer_frame(
+                &ack,
+                coppa_codec::ofdm::CoppaProfile::hf_standard_short_cp(),
+            ))
+            .await;
+        }
+        assert_eq!(
+            b.engine.speed_level(),
+            5,
+            "test setup: really crossed to VHF"
+        );
+
+        // THE assertion this test exists for: mid-handshake, at VHF, the engine's
+        // retained mode and the negotiator's must still agree. Pre-fix they do not.
+        assert_engine_matches_negotiator(&b, "b (mid-handshake, dwelling at VHF)");
+
+        // Back down through the real timeout path.
+        let arq_config = ArqConfig::new(8, 5, Duration::from_millis(20))
+            .expect("window_size=8 is within 1..=MAX_WINDOW_SIZE");
+        let mut arq_tx = ArqTx::new(arq_config);
+        arq_tx
+            .send(
+                b"expired segment".to_vec(),
+                Instant::now() - Duration::from_millis(100),
+            )
+            .expect("a fresh ARQ window should have room");
+        b.arq_tx = Some(arq_tx);
+        b.check_arq_retransmits().await;
+        assert_eq!(b.engine.speed_level(), 4, "test setup: stepped back 5 -> 4");
+        assert_engine_matches_negotiator(&b, "b (mid-handshake, back in HF)");
+
+        // G3: probation expires with no proof `a` ever switched. The give-up must
+        // walk BOTH the negotiator and the engine back to the pre-negotiation mode,
+        // which is the mode `a` -- never told anything -- is still listening on.
+        b.drive_cp_negotiation(t0 + Duration::from_secs(SWITCH_PROBATION_SECS + 1));
+
+        assert_engine_matches_negotiator(&b, "b (after the give-up)");
+        assert_converged(&a, &b, CpMode::LongCp);
+        assert_eq!(
+            b.cp_negotiator.pending_switched_seq(),
+            None,
+            "the give-up must release the tracked leg, not just the mode"
+        );
+
+        // Alive, not merely consistent.
+        let samples = b.engine.encode_bytes(b"link alive").unwrap();
+        assert_eq!(
+            a.engine
+                .decode_bytes(&samples)
+                .expect("a must decode b's frame after a mid-handshake VHF excursion"),
+            b"link alive".to_vec()
+        );
+    }
+
+    // ── COP-2 Phase 6: what `cp_negotiation_enabled = true` alone actually
+    //    does ────────────────────────────────────────────────────────────────
+
+    /// Enabling CP negotiation is **three flags, not one** -- and this pins the
+    /// half of that finding the flip decision turns on: with only
+    /// `cp_negotiation_enabled` set, a station **never initiates**. It is not
+    /// named "inert", because it is not: see the responder half at the bottom.
+    ///
+    /// The trace, re-verified against the branch tip: the ONLY code that can
+    /// send a `Propose` sits inside `if self.config.engine.cp_gate_enabled`
+    /// (`event_loop.rs:1093`) -- so with the gate off, `CpGate::observe` is
+    /// never called, its recommendation can never transition, and the block
+    /// that would propose is unreachable. Even if it were reached, the propose
+    /// itself additionally requires `&& self.config.engine.arq_enabled`
+    /// (`:1104`), since CP-control traffic rides an ARQ pair. Both flags
+    /// default `false` (`config.rs:345/348`), so on a default daemon flipping
+    /// `cp_negotiation_enabled` alone changes nothing an operator could
+    /// observe -- which is exactly why COP-2 does not flip it (D8): a default
+    /// that reads "negotiation: on" while nothing negotiates is worse than an
+    /// honest `false`.
+    #[tokio::test]
+    async fn cp_negotiation_enabled_alone_never_initiates_without_cp_gate() {
+        let mut config = DaemonConfig::default();
+        config.engine.cp_negotiation_enabled = true;
+        // ONLY that one. Asserted, not assumed -- if a future change flips
+        // either of these defaults this test must stop claiming to prove
+        // anything about "alone".
+        assert!(
+            !config.engine.cp_gate_enabled,
+            "test premise: cp_gate_enabled must be off"
+        );
+        assert!(
+            !config.engine.arq_enabled,
+            "test premise: arq_enabled must be off"
+        );
+
+        let mut station = EventLoop::new(config).unwrap();
+        let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
+        station.set_audio_out(producer);
+
+        // Four consecutive real clean-loopback decodes through the real
+        // `decode_and_dispatch_audio` -- `CpGate::default_coppa`'s
+        // `consecutive_needed` is 4, so this is exactly what DOES trip it when
+        // the gate is fed (see `trip_cp_gate`, which uses these same frames).
+        for i in 0..4u8 {
+            station
+                .decode_and_dispatch_audio(&inert_peer_frame(i))
+                .await;
+        }
+
+        let mut buf = vec![0.0f32; 1_000_000];
+        assert_eq!(
+            consumer.read(&mut buf),
+            0,
+            "cp_negotiation_enabled alone must never put a Propose (or anything \
+             else) on the air"
+        );
+        assert!(
+            station.cp_propose_seq.is_none(),
+            "and must never consume a CP-control window slot for a negotiation \
+             it cannot start"
+        );
+        assert_eq!(
+            station.cp_gate.current(),
+            CpRecommendation::LongCp,
+            "with cp_gate_enabled off the gate is never even OBSERVED, so its \
+             recommendation cannot transition -- this is the structural reason \
+             no Propose is reachable, not a coincidence of thresholds"
+        );
+        assert_eq!(
+            station.engine.cp_mode(),
+            CpMode::LongCp,
+            "and the engine's CP profile is untouched"
+        );
+
+        // ── The responder half: the flag is NOT inert in general. ──
+        //
+        // Turn `arq_enabled` on -- still NO `cp_gate_enabled` -- and the same
+        // single flag makes this station a full RESPONDER to a peer that does
+        // propose: `handle_cp_control` gates only on `cp_negotiation_enabled`
+        // (`event_loop.rs:1903-1905`), and the one route to it (the inbound
+        // `TransportPdu` parse, `:1215`) gates only on `arq_enabled`. That is a
+        // second, independent reason Phase 5's desync fix gates this flip
+        // rather than a footnote: a responder can be talked onto short CP by
+        // its peer and then desync itself on its own `RateLoop`.
+        let mut responder = EventLoop::new(cp_enabled_config()).unwrap();
+        assert!(
+            !responder.config.engine.cp_gate_enabled,
+            "test premise: the responder still has no CpGate"
+        );
+        let (r_producer, mut r_consumer) = coppa_audio::audio_ring(1_000_000);
+        responder.set_audio_out(r_producer);
+
+        let propose = TransportPdu::new_cp_control_content(
+            responder.arq_session_id,
+            0,
+            0,
+            0,
+            CpNegotiator::propose_payload(CpMode::ShortCp),
+        );
+        responder
+            .decode_and_dispatch_audio(&peer_frame(
+                &propose,
+                coppa_codec::ofdm::CoppaProfile::hf_standard(),
+            ))
+            .await;
+
+        assert!(
+            responder.cp_negotiator.pending_confirm_seq().is_some(),
+            "with arq_enabled on, cp_negotiation_enabled ALONE still makes this \
+             station answer a peer's Propose -- the flag is never inert in \
+             general, only never an INITIATOR without cp_gate_enabled"
+        );
+        assert!(
+            r_consumer.read(&mut buf) > 0,
+            "and it really puts the Confirm on the air"
+        );
     }
 
     #[test]

@@ -108,4 +108,50 @@ mod tests {
         let profile = CoppaProfile::hf_standard();
         assert!(frame_airtime_s(255, &profile).is_none());
     }
+
+    /// COP-2: `hf_standard` and `hf_standard_short_cp` differ in exactly one field
+    /// that airtime depends on (`cp_samples`), and `total_syms` depends on the
+    /// profile only through `data_carriers_per_symbol` -- identical for both (44
+    /// data / 4 pilot). So the short-CP airtime is the long-CP airtime scaled by
+    /// `(960+144)/(960+300) = 1104/1260`, THE SAME CONSTANT AT EVERY LEVEL.
+    ///
+    /// This is what makes an airtime-normalized *ratio* (adaptive/best-fixed,
+    /// adaptive/oracle -- ADR-008's bar) invariant to a uniform CP change: the
+    /// constant cancels. Any movement in those ratios under short CP is therefore a
+    /// FER or rate-trajectory effect, never the airtime saving itself.
+    #[test]
+    fn short_cp_scales_frame_airtime_by_one_constant_at_every_level() {
+        let long = CoppaProfile::hf_standard();
+        let short = CoppaProfile::hf_standard_short_cp();
+        let expected = 1104.0 / 1260.0;
+        for level in [1u8, 2, 3, 4, 5, 6, 7, 9, 10] {
+            let l = frame_airtime_s(level, &long).expect("valid level");
+            let s = frame_airtime_s(level, &short).expect("valid level");
+            assert!(
+                ((s / l) - expected).abs() < 1e-12,
+                "level {level}: short/long = {}, expected {expected}",
+                s / l
+            );
+        }
+    }
+
+    /// The factorization the test above rests on: airtime is
+    /// `total_syms(level, profile) * symbol_len(profile) / sample_rate`, and the two
+    /// profiles share `total_syms`. Pinned separately so a future change to
+    /// `data_carriers`/`pilot_carriers` on either profile fails HERE, with a clear
+    /// message, rather than silently invalidating the invariance argument.
+    #[test]
+    fn short_cp_and_long_cp_share_the_same_symbol_count_per_level() {
+        let long = CoppaProfile::hf_standard();
+        let short = CoppaProfile::hf_standard_short_cp();
+        assert_eq!(
+            data_carriers_per_symbol(&long),
+            data_carriers_per_symbol(&short)
+        );
+        for level in [1u8, 2, 3, 4, 5, 6, 7, 9, 10] {
+            let syms_long = frame_airtime_s(level, &long).unwrap() * 48_000.0 / 1260.0;
+            let syms_short = frame_airtime_s(level, &short).unwrap() * 48_000.0 / 1104.0;
+            assert!((syms_long - syms_short).abs() < 1e-9, "level {level}");
+        }
+    }
 }

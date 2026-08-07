@@ -97,13 +97,24 @@ pub fn select_profile(level: u8) -> CoppaProfile {
 }
 
 /// Resolve a named override profile for benchmarking. `"default"` means "use the per-level
-/// `select_profile` rule"; `"standard"`/`"robust"` force that profile for every level.
+/// `select_profile` rule"; `"standard"`/`"standard-short-cp"`/`"robust"` force that profile for
+/// every level.
+///
+/// `"standard-short-cp"` is `hf_standard`'s cyclic-prefix variant (`cp_samples: 144` vs. `300`,
+/// every other PHY field identical). It is the ONLY pair in this workspace that isolates CP
+/// length from carrier layout, which is why a CP contrast has to be based on `"standard"` and
+/// not on `"robust"` (36 data / 12 pilot, no short-CP twin anywhere) -- see COP-2's plan, D1.
+/// Named for the base profile it varies rather than a bare `"short-cp"` so it stays unambiguous
+/// if a second short-CP profile is ever added.
 pub fn profile_by_name(name: &str) -> Option<CoppaProfile> {
     match name {
         "default" => None,
         "standard" => Some(CoppaProfile::hf_standard()),
+        "standard-short-cp" => Some(CoppaProfile::hf_standard_short_cp()),
         "robust" => Some(CoppaProfile::hf_robust()),
-        other => panic!("unknown profile '{other}' (expected: default|standard|robust)"),
+        other => panic!(
+            "unknown profile '{other}' (expected: default|standard|standard-short-cp|robust)"
+        ),
     }
 }
 
@@ -165,5 +176,86 @@ mod tests {
             select_profile(4).data_carriers,
             select_profile(5).data_carriers
         );
+    }
+
+    /// Pins COP-2's D1: `"standard-short-cp"` must stay the CP-only variant of
+    /// `"standard"`. If a future edit re-points the name at a differently-shaped
+    /// profile (different carrier layout, FFT size, or phy_mode), the CP contrast
+    /// it exists to serve stops being a CP contrast, and this test fails.
+    #[test]
+    fn standard_short_cp_resolves_and_differs_from_standard_only_in_cp_length() {
+        let long = profile_by_name("standard").expect("standard is an override, not the default");
+        let short = profile_by_name("standard-short-cp")
+            .expect("standard-short-cp is an override, not the default");
+
+        // The two fields that differ, and only these two.
+        assert_eq!(long.cp_samples, 300);
+        assert_eq!(short.cp_samples, 144);
+        assert_eq!(long.bandwidth_id, 1);
+        assert_eq!(short.bandwidth_id, 4);
+
+        // Everything the carrier layout / waveform geometry depends on is identical.
+        assert_eq!(short.fft_size, long.fft_size);
+        assert_eq!(short.sample_rate, long.sample_rate);
+        assert_eq!(short.data_carriers, long.data_carriers);
+        assert_eq!(short.pilot_carriers, long.pilot_carriers);
+        assert_eq!(short.phy_mode, long.phy_mode);
+        assert_eq!(short.carrier_offset, long.carrier_offset);
+    }
+
+    /// The airtime saving is an exact constant factor, because `frame_airtime_s`
+    /// factorizes as `total_syms(level) * (fft_size + cp_samples) / sample_rate`
+    /// and `total_syms` depends on the profile only through
+    /// `data_carriers_per_symbol` -- identical for these two profiles. So the CP
+    /// enters as one divisor: 1104/1260 exactly, at every level.
+    #[test]
+    fn standard_short_cp_costs_less_airtime_at_identical_carrier_layout() {
+        let long = profile_by_name("standard").expect("standard is an override");
+        let short = profile_by_name("standard-short-cp").expect("standard-short-cp is an override");
+
+        let t_long = coppa_protocol::modem::frame_airtime_s(2, &long).expect("level 2 is valid");
+        let t_short = coppa_protocol::modem::frame_airtime_s(2, &short).expect("level 2 is valid");
+
+        assert!(
+            t_short < t_long,
+            "short CP must cost less airtime: {t_short} vs {t_long}"
+        );
+        assert!(
+            ((t_short / t_long) - 1104.0 / 1260.0).abs() < 1e-12,
+            "expected the exact (960+144)/(960+300) symbol-length ratio, got {}",
+            t_short / t_long
+        );
+    }
+
+    /// A near-miss name must still be refused, with the *full* list of valid
+    /// names -- so a typo cannot silently fall back to a plausible-looking wrong
+    /// profile. `"hf_standard_short_cp"` is the plausible wrong guess (the Rust
+    /// constructor's name rather than the kebab-case CLI name).
+    #[test]
+    #[should_panic(expected = "default|standard|standard-short-cp|robust")]
+    fn unknown_profile_name_panic_lists_the_short_cp_name() {
+        let _ = profile_by_name("hf_standard_short_cp");
+    }
+
+    /// Regression lock for the ten existing `profile_by_name("robust")` call
+    /// sites (and `"standard"`/`"default"`): adding a name must not perturb the
+    /// ones already calibrated against. Passes before the short-CP arm is added
+    /// too -- it is a lock, not a Red test.
+    #[test]
+    fn existing_profile_names_are_unchanged() {
+        assert!(
+            profile_by_name("default").is_none(),
+            "\"default\" means per-level select_profile, i.e. no override"
+        );
+
+        let standard = profile_by_name("standard").expect("standard is an override");
+        assert_eq!(standard.cp_samples, 300);
+        assert_eq!(standard.data_carriers, 44);
+        assert_eq!(standard.bandwidth_id, 1);
+
+        let robust = profile_by_name("robust").expect("robust is an override");
+        assert_eq!(robust.pilot_carriers, 12);
+        assert_eq!(robust.bandwidth_id, 3);
+        assert_eq!(robust.cp_samples, 300);
     }
 }

@@ -9,15 +9,17 @@ use crate::metrics::{aggregate, bit_errors, FailureMode, MeasurementPoint, Trial
 use crate::scenario::{mode_for_level, select_profile, ChannelSpec, Scenario};
 use coppa_channel::watterson::WattersonPreset;
 
-fn make_header(level: u8, payload_len: u16) -> CoppaHeader {
-    // phy_mode/bandwidth are fixed here to mirror CoppaCore::encode_bytes, which also
-    // hardcodes them regardless of speed level; the modem selects its OFDM profile from
+fn make_header(level: u8, payload_len: u16, bandwidth: u8) -> CoppaHeader {
+    // phy_mode is fixed here to mirror CoppaCore::encode_bytes, which also hardcodes
+    // it regardless of speed level; the modem selects its OFDM profile from
     // construction, not from these header fields, so the measurement stays representative.
+    // bandwidth, unlike phy_mode, DOES come from the active profile — CoppaCore::encode_bytes
+    // reads it as `self.transceiver.profile().bandwidth_id`, so this must match.
     CoppaHeader {
         version: 1,
         phy_mode: 0,
         frame_type: CoppaFrameType::Data,
-        bandwidth: 1,
+        bandwidth,
         fec_type: 0,
         speed_level: level,
         seq_num: 0,
@@ -43,7 +45,7 @@ fn run_trial(
     let mut rng = StdRng::seed_from_u64(seed);
     let payload: Vec<u8> = (0..payload_bytes).map(|_| rng.random::<u8>()).collect();
 
-    let header = make_header(level, payload_bytes as u16);
+    let header = make_header(level, payload_bytes as u16, tx.profile().bandwidth_id);
     let clean = tx
         .transmit(&header, &payload)
         .expect("payload within this level's capacity");

@@ -225,23 +225,73 @@ pub struct EngineSection {
     /// `cp_negotiation_enabled` (see that field's own doc). See
     /// `docs/superpowers/specs/2026-07-25-cpgate-daemon-wiring-design.md`
     /// for the full reasoning behind this module's own telemetry-only scope.
+    ///
+    /// Reverse cross-reference (COP-2): `cp_negotiation_enabled` has no
+    /// **proposer** without this flag. The only code that can send a `Propose`
+    /// lives inside this gate, so with this off a negotiation-enabled station
+    /// can only ever *answer* a peer -- never start one.
     pub cp_gate_enabled: bool,
     /// Enable the CP-switch peer-negotiation handshake (see
     /// `coppa_protocol::cp_negotiator` and `docs/superpowers/specs/
     /// 2026-07-29-cp-switch-peer-negotiation-design.md`). `false` (the
     /// default) is an explicit opt-in, matching `cp_gate_enabled`'s and
-    /// `rate_loop_probe_interval`'s convention exactly. Both stations must
-    /// set this locally -- there is no peer-capability negotiation (see the
-    /// design doc's "disjoint subsystems" finding for why); a station with
-    /// this off simply never proposes or acts on `TransportType::CpControl`
-    /// PDUs. Independent of `cp_gate_enabled`: this can be on with
-    /// `cp_gate_enabled` off (nothing to propose, ever) or vice versa
-    /// (telemetry-only, as PR #60 shipped). Also requires `arq_enabled =
-    /// true` to actually transmit or act on anything -- CP-control traffic
-    /// rides its own dedicated ArqTx/ArqRx pair, but that pair's
-    /// propose/retransmit/dispatch code paths are all additionally gated on
-    /// `arq_enabled` for consistency with the rest of this daemon's
-    /// reliable-delivery machinery.
+    /// `rate_loop_probe_interval`'s convention exactly.
+    ///
+    /// **Turning live CP negotiation on is a conjunction of THREE flags, not
+    /// this one** (COP-2 -- promoted from a parenthetical, because reading it
+    /// as one flag is the mistake this doc exists to prevent):
+    ///
+    /// - `cp_negotiation_enabled` gates *acting on* the handshake at all: the
+    ///   inbound `TransportType::CpControl` dispatch (`handle_cp_control`), the
+    ///   CP-control retransmit loop, and `drive_cp_negotiation`'s give-up
+    ///   triggers (COP-1's G1-G4).
+    /// - `cp_gate_enabled` gates the only code that can *initiate* one. With it
+    ///   off, `CpGate::observe` is never called, so its recommendation can
+    ///   never transition and the propose block is structurally unreachable.
+    /// - `arq_enabled` gates both the inbound `TransportPdu` parse (the sole
+    ///   route to any CpControl PDU) and, redundantly, the propose itself.
+    ///   CP-control traffic rides its own dedicated `ArqTx`/`ArqRx` pair, but
+    ///   those paths are gated on `arq_enabled` for consistency with the rest
+    ///   of this daemon's reliable-delivery machinery.
+    ///
+    /// So: **this flag alone is never a proposer** without `cp_gate_enabled`,
+    /// and **only ever a responder** once `arq_enabled` is on -- a real,
+    /// asymmetric behavior change worth deliberate thought, since a peer can
+    /// then talk this station onto short CP without it ever asking. Enforced,
+    /// not merely documented, by `coppa-daemon/src/event_loop.rs`'s
+    /// `cp_negotiation_enabled_alone_never_initiates_without_cp_gate` (which
+    /// asserts both halves) and by `test_cp_negotiation_requires_two_more_flags_by_default`
+    /// below.
+    ///
+    /// With all three off (the shipped default) this subsystem is **structurally
+    /// unreachable**, and the flag that makes it so is `arq_enabled` -- not this
+    /// one. `check_arq_retransmits` returns at
+    /// `crates/coppa-daemon/src/event_loop.rs:1715-1717` on `!arq_enabled`, which is
+    /// *before* both the CP-control retransmit block (`:1814`) and the sole
+    /// production call to `drive_cp_negotiation` (`:1873`). So on the shipped
+    /// default neither COP-1's G1-G4 give-up triggers nor COP-2's desync canary run
+    /// at all -- not "run on empty state and return immediately", which is what this
+    /// paragraph used to claim. The whole residual cost is the one `bool` read in
+    /// `check_arq_retransmits`, and nothing reaches the air.
+    ///
+    /// The per-tick cost only becomes "a couple of field reads" once `arq_enabled`
+    /// *and* this flag are on; that is the condition under which the canary's own
+    /// cost note should be read.
+    ///
+    /// Both stations must set `arq_enabled` and this flag locally: there is no
+    /// peer-capability negotiation (see the design doc's "disjoint subsystems"
+    /// finding for why), and a station with `cp_negotiation_enabled` off simply
+    /// never proposes or acts on `TransportType::CpControl` PDUs.
+    ///
+    /// Review finding: `cp_gate_enabled` is NOT part of that "both stations"
+    /// requirement — it is what makes a station INITIATE a proposal (its
+    /// recommendation drives the propose decision). A station with only
+    /// `arq_enabled` + this flag on (`cp_gate_enabled` off) still correctly
+    /// RESPONDS to a peer's proposal and completes the handshake — see
+    /// `cp_negotiation_enabled_alone_never_initiates_without_cp_gate`, which
+    /// proves exactly that "alone" case. So an asymmetric deployment is valid:
+    /// only the station that should ever initiate needs `cp_gate_enabled` too;
+    /// a responder-only station should leave it off.
     pub cp_negotiation_enabled: bool,
 }
 
@@ -479,7 +529,36 @@ cp_gate_enabled = true
         let config = DaemonConfig::default();
         assert!(
             !config.engine.cp_negotiation_enabled,
-            "CP-switch peer negotiation must be off by default"
+            "CP negotiation must stay off by default -- the flag alone never initiates \
+             (needs `cp_gate_enabled` to propose and `arq_enabled` to receive), so \
+             flipping it would mislead operators without changing behavior. See COP-2."
+        );
+    }
+
+    /// The tripwire that makes a future *partial* flip impossible to land
+    /// silently: enabling CP negotiation for real is a **conjunction of three
+    /// flags**, so a change that flips one of them and calls the feature
+    /// "enabled" is wrong, and must break here rather than in the field.
+    /// Asserted on a single `DaemonConfig::default()` deliberately -- three
+    /// separate one-flag tests can all pass while the conjunction is broken.
+    /// See `cp_negotiation_enabled`'s field doc for what each of the three
+    /// gates, and `coppa-daemon/src/event_loop.rs`'s
+    /// `cp_negotiation_enabled_alone_never_initiates_without_cp_gate` for the
+    /// enforcing behavioral test.
+    #[test]
+    fn test_cp_negotiation_requires_two_more_flags_by_default() {
+        let config = DaemonConfig::default();
+        assert!(
+            !config.engine.arq_enabled
+                && !config.engine.cp_gate_enabled
+                && !config.engine.cp_negotiation_enabled,
+            "live CP negotiation is the CONJUNCTION arq_enabled && cp_gate_enabled && \
+             cp_negotiation_enabled; all three must default off, and no partial flip \
+             may land without revisiting COP-2's flip gate (arq_enabled={}, \
+             cp_gate_enabled={}, cp_negotiation_enabled={})",
+            config.engine.arq_enabled,
+            config.engine.cp_gate_enabled,
+            config.engine.cp_negotiation_enabled
         );
     }
 

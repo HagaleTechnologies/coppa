@@ -10,17 +10,19 @@ sources:
   - crates/coppa-daemon/src/event_loop.rs
   - docs/adr/008-phase3-system-layer.md
 verified:
-  commit: 01f0ecb
-  date: 2026-08-01
+  commit: 2efc1c1
+  date: 2026-08-05
 links:
   - adr-008-phase3-system-layer
   - coppa-protocol
+  - cp-negotiation-flags
 ---
-Three things about `coppa_protocol::cp_negotiator` have each already cost real
-debugging time, and none of them is visible from a casual read of the code.
-The handshake itself is documented in `cp_negotiator.rs`'s module doc and in
+Four things about `coppa_protocol::cp_negotiator` have each already cost real
+debugging time, and none of them is visible from a casual read of the code. The
+handshake itself is documented in `cp_negotiator.rs`'s module doc and in
 `docs/adr/008-phase3-system-layer.md` (section 7) — this page only records the
-traps.
+traps. The config flags that gate the handshake, and what a CP change can move
+on a benchmark, are one level up on [[cp-negotiation-flags]].
 
 ## 1. The A/B role names are a genuine collision, and prose has inverted them twice
 

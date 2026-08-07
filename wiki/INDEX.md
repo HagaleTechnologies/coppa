@@ -12,11 +12,12 @@
 - [What did Phase 2's channel-estimation work fix, break, and leave open?](pages/adr-006-phase2-estimation.md) — Phase 2 replaced the linear-interpolation channel estimator with a delay-domain
 - [Why do multi-codeword frames retransmit whole, not per codeword?](pages/adr-007-multi-codeword-frames.md) — Phase 3 added multi-codeword frames (up to `MAX_CODEWORDS=8` per frame, with
 - [What did Phase 3's system layer ship, and which targets did it miss?](pages/adr-008-phase3-system-layer.md) — Phase 3 shipped the system layer: payload CRC-32, half-duplex ARQ discipline
+- [Which flags actually turn CP-switch negotiation on, and what does short CP buy?](pages/cp-negotiation-flags.md) — Two traps live one level up from the handshake itself — in the config flags that
+- [What will bite you about the CP-switch negotiation handshake?](pages/cp-negotiation-gotchas.md) — Four things about `coppa_protocol::cp_negotiator` have each already cost real
 - [What will bite you about the cpal-backend feature flag?](pages/cpal-feature-gate.md) — The daemon (`coppad`) compiles and runs without the `cpal-backend` feature flag,
 - [What will bite you about LDPC at speed levels 9 and 10?](pages/ldpc-non-convergence.md) — The original gotcha this page described — levels 9/10 (64-QAM) failing to
-- [What will bite you about Watterson fading at speed level 4?](pages/watterson-level-4-gap.md) — Speed level 4 (QPSK 3/4 with sparse-pilot `hf_standard`/`hf_wide`/`hf_narrow`
 - [What will bite you in the daemon's real-radio TX/RX path?](pages/phase4-field-readiness.md) — Phase 4 made the daemon field-ready: real serial (DTR/RTS) and Linux GPIO PTT,
+- [What will bite you about Watterson fading at speed level 4?](pages/watterson-level-4-gap.md) — Speed level 4 (QPSK 3/4 with sparse-pilot `hf_standard`/`hf_wide`/`hf_narrow`
 - [What will bite you about waveform compatibility with pre-Phase-1 code?](pages/waveform-wire-break.md) — The Phase 1 waveform is a hard wire-format break from all earlier coppa revisions.
-- [What will bite you about the CP-switch negotiation handshake?](pages/cp-negotiation-gotchas.md) — Three things about `coppa_protocol::cp_negotiator` have each already cost real
 - [What band and sample-rate conventions does coppa use?](pages/band-conventions.md) — Coppa operates at a fixed 48 kHz sample rate across all profiles and speed
 - [What contract does coppa-dsp expose to skimmer?](pages/coppa-dsp-skimmer-interface.md) — `coppa-dsp` is consumed by the skimmer repo as a pure-DSP library — it provides

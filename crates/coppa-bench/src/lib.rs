@@ -1,5 +1,7 @@
 //! Measurement harness for Coppa's PHY modes: BER / frame-error-rate / goodput vs SNR.
 
+pub mod adaptive_goodput;
+pub mod cp_arm;
 pub mod ground_truth;
 pub mod metrics;
 pub mod per_frame_link;
