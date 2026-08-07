@@ -440,7 +440,7 @@ enum ArmKind {
     /// One fixed level and one fixed CP mode: a comparator cell.
     Fixed { level: u8, mode: CpMode },
     /// Adaptive rate, one fixed CP mode for the whole run. `LongCp` is arm A (the control);
-    /// `ShortCp` is not run as an arm -- arm C is derived from the fixed short-CP cells.
+    /// `ShortCp` is arm C, B's CP-isolation control -- see `SeedResult::arm_c`'s doc.
     FixedCpAdaptiveRate { mode: CpMode },
     /// Arm P: identical to arm A, but rebuilds the transceiver on exactly the frames arm B
     /// switched on, with the SAME profile. Isolates the rebuild from the CP change.
@@ -660,6 +660,10 @@ struct SeedAgg {
     arm_b: f64,
     /// Arm B at cost x1 -- the loss-free nominal, with one handshake's air charged per switch.
     arm_b_x1: f64,
+    /// Arm B's CP-isolation control: `FixedCpAdaptiveRate{ShortCp}`, adaptive rate + fixed CP.
+    /// See `SeedResult::arm_c`'s doc for why this replaced `best_arm(short_cells())` as the
+    /// B-vs-C isolation comparator.
+    arm_c: f64,
     bf_long: f64,
     bf_joint: f64,
     orc_long: f64,
@@ -674,12 +678,18 @@ fn total_airtime(slots: &[FrameSlot]) -> f64 {
     slots.iter().map(|s| s.airtime_s).sum()
 }
 
-/// One seed's full 22-run measurement.
+/// One seed's full measurement.
 struct SeedResult {
     arm_a: ArmResult,
     arm_p: ArmResult,
     arm_b: ArmResult,
     arm_b0: ArmResult,
+    /// Review finding: `FixedCpAdaptiveRate { mode: ShortCp }` -- adaptive rate, FIXED short CP.
+    /// This is arm B's CP-isolation control: both run RateLoop, so a B-vs-C delta can only come
+    /// from CP policy, not from B also being rate-adaptive while C is a hindsight-picked single
+    /// fixed level. The old comparator (`best_arm(short_cells())`, fixed rate AND fixed CP) is
+    /// kept below as a separate upper-bound reference, never as the isolation claim's C.
+    arm_c: ArmResult,
     /// The 18 comparator cells, `[LongCp 9 levels..., ShortCp 9 levels...]`.
     cells: Vec<Vec<FrameSlot>>,
 }
@@ -729,6 +739,19 @@ fn run_seed(pair: &CpProfilePair, seed: u64, n: usize) -> SeedResult {
         goodput_bps(&arm_a.slots)
     );
 
+    let arm_c = run_arm(
+        &ArmKind::FixedCpAdaptiveRate {
+            mode: CpMode::ShortCp,
+        },
+        pair,
+        seed,
+        n,
+    );
+    eprintln!(
+        "  seed {seed} arm C  : {:.1} bps (adaptive rate, fixed short CP -- B's CP-isolation control)",
+        goodput_bps(&arm_c.slots)
+    );
+
     let arm_b = run_arm(
         &ArmKind::CpAdaptive {
             latency: SWITCH_LATENCY_FRAMES,
@@ -776,6 +799,7 @@ fn run_seed(pair: &CpProfilePair, seed: u64, n: usize) -> SeedResult {
         arm_p,
         arm_b,
         arm_b0,
+        arm_c,
         cells,
     }
 }
@@ -823,7 +847,7 @@ fn main() {
     println!("base pair    : {}", pair.label);
     println!(
         "frames/run   : {n}   seeds: {seeds:?}   runs: {}",
-        n_seeds * 22
+        n_seeds * 23
     );
     if pair.synthetic {
         println!(
@@ -851,11 +875,12 @@ fn main() {
         "seed", "arm", "deliv", "bits", "airtime(s)", "goodput", "FER", "delivery 95% CI"
     );
     for (si, r) in results.iter().enumerate() {
-        let arms: [(&str, &ArmResult); 4] = [
+        let arms: [(&str, &ArmResult); 5] = [
             ("A", &r.arm_a),
             ("P", &r.arm_p),
             ("B", &r.arm_b),
             ("B0", &r.arm_b0),
+            ("C", &r.arm_c),
         ];
         for (name, a) in arms {
             let d = delivered_count(&a.slots);
@@ -875,7 +900,9 @@ fn main() {
                 hi
             );
         }
-        // Arm C: best fixed arm over the short-CP half.
+        // C(fix): best hindsight-picked FIXED cell over the short-CP half. Upper-bound reference
+        // only (fixed rate AND fixed CP) -- NOT the arm C isolation control printed above, which
+        // is `r.arm_c` (adaptive rate, fixed short CP). See `SeedResult::arm_c`'s doc.
         if let Some((ci, cg)) = best_arm(r.short_cells()) {
             let c = &r.short_cells()[ci];
             let d = delivered_count(c);
@@ -883,7 +910,7 @@ fn main() {
             println!(
                 "{:<6} {:<5} {:>4}/{:<4} {:>10} {:>11.2} {:>10.1} {:>6.1}% {:>7.3}-{:<7.3}  (L{})",
                 seeds[si],
-                "C",
+                "C(fix)",
                 d,
                 c.len(),
                 delivered_bits(c),
@@ -937,6 +964,7 @@ fn main() {
                 r.arm_b.switch_air_s,
                 1.0,
             ),
+            arm_c: goodput_bps(&r.arm_c.slots),
             bf_long: lg,
             bf_joint: jg,
             orc_long: ol,
@@ -1127,19 +1155,27 @@ fn main() {
     );
 
     println!("\nSECONDARY -- does CP *adaptivity* add anything over fixed short CP?");
-    let m_c: f64 = results
+    // Review finding: comparing B (adaptive rate + adaptive CP) against a hindsight-picked best
+    // FIXED cell (fixed rate, fixed CP) conflates rate-adaptivity's own contribution with CP
+    // adaptivity's -- a negative delta could come entirely from RateLoop underperforming the best
+    // fixed level, not from CP adaptivity adding nothing. `m_c` is now arm C
+    // (`FixedCpAdaptiveRate{ShortCp}`, adaptive rate + FIXED short CP), which holds rate-adaptivity
+    // constant against B so the delta isolates CP policy alone. The old hindsight-best-fixed-cell
+    // number is kept as `m_c_upper_bound`, printed separately, never used for this claim.
+    let m_c = mean(&|s| s.arm_c);
+    let m_c_upper_bound: f64 = results
         .iter()
         .filter_map(|r| best_arm(r.short_cells()).map(|(_, g)| g))
         .sum::<f64>()
         / results.len() as f64;
     println!(
-        "  arm B (CP-adaptive) {:>9.1} bps   vs   arm C (fixed short CP) {:>9.1} bps  ({:+.2}%)   [x0]",
+        "  arm B (CP-adaptive) {:>9.1} bps   vs   arm C (adaptive rate, fixed short CP) {:>9.1} bps  ({:+.2}%)   [x0]",
         m_b,
         m_c,
         100.0 * (m_b / m_c.max(1e-9) - 1.0)
     );
     println!(
-        "  arm B (CP-adaptive) {:>9.1} bps   vs   arm C (fixed short CP) {:>9.1} bps  ({:+.2}%)   [x1]",
+        "  arm B (CP-adaptive) {:>9.1} bps   vs   arm C (adaptive rate, fixed short CP) {:>9.1} bps  ({:+.2}%)   [x1]",
         m_b_x1,
         m_c,
         100.0 * (m_b_x1 / m_c.max(1e-9) - 1.0)
@@ -1155,6 +1191,12 @@ fn main() {
     println!(
         "  x0 = arm B's data airtime only; x1 = its handshake air charged once per switch. Arm C\n\
          has no handshake air at all, so only arm B's side of each comparison moves."
+    );
+    println!(
+        "  upper bound (NOT a CP-isolation control): best hindsight-picked FIXED short-CP cell\n  \
+         {:>9.1} bps -- fixed rate AND fixed CP, so B/this delta still conflates both adaptive\n  \
+         dimensions; kept for reference only, per-frame in the seed table above as row \"C\".",
+        m_c_upper_bound
     );
 
     // D9's pre-committed decision rule: sign consistency across every seed, NOT a mean crossing a
@@ -1173,9 +1215,12 @@ fn main() {
     let mut pos_bc = 0usize;
     let mut pos_ba_x1 = 0usize;
     let mut pos_bc_x1 = 0usize;
-    for (si, r) in results.iter().enumerate() {
+    for si in 0..results.len() {
         let s = &agg[si];
-        let c = best_arm(r.short_cells()).map(|(_, g)| g).unwrap_or(0.0);
+        // Review finding: was `best_arm(r.short_cells())` (fixed rate + fixed CP), which conflates
+        // rate-adaptivity with CP-adaptivity in this pre-committed sign-consistency rule. `s.arm_c`
+        // (adaptive rate, fixed short CP) holds rate-adaptivity constant so B-C isolates CP policy.
+        let c = s.arm_c;
         let d_ba = s.arm_b - s.arm_a;
         let d_bc = s.arm_b - c;
         let d_ba_x1 = s.arm_b_x1 - s.arm_a;
