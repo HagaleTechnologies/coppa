@@ -275,9 +275,15 @@ short-CP-twin control on `hf_robust` (zero base-profile confound, but a bench-lo
 unallocated `bandwidth_id`, so it measures the lever's magnitude and not a shippable feature)
 reproduces the same shape: +16.52% / +19.23% denominator, 0.842 / 0.586 against the joint comparator.
 A rebuild placebo arm was bit-identical to the long-CP arm (+0.00%) on all 5 seeds on both bases, so
-the transceiver rebuild is empirically inert. **CP *adaptivity* itself added nothing**: against the
-best fixed short-CP cell the adaptive arm is −5.21% (standard) / −15.76% (robust), winning on 1 of 5
-and 0 of 5 seeds — and the schedule produced exactly **one** `CpGate` transition per run
+the transceiver rebuild is empirically inert. **CP *adaptivity* itself added nothing**: against arm
+C — `FixedCpAdaptiveRate{ShortCp}`, adaptive rate held constant so the delta isolates CP policy alone
+(a review finding corrected an earlier version of this comparator that used a hindsight-picked fixed
+cell, conflating rate-adaptivity with CP-adaptivity) — the adaptive arm is −0.83% on BOTH bases,
+winning on 0 of 5 seeds on both. A second review finding measured a header-codeword confound (the
+long/short arms' headers carry different `bandwidth_id`s): on `robust` that confound (+0.94%) is
+LARGER than the −0.83% delta it confounds, so only the directional result (never beats the isolation
+control) is load-bearing there, not the magnitude — see `BENCHMARKS.md`'s Table 3. The schedule
+produced exactly **one** `CpGate` transition per run
 (`LongCp → ShortCp` decided at frame 3, effective at frame 9, never dropping across the remaining
 291), so ~94% of that arm's airtime was short CP and it is honestly *fixed short CP with a 9-frame
 long-CP prologue*, not adaptive control. **Routed lever: short CP as a STATIC (negotiated)

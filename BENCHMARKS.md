@@ -2779,10 +2779,14 @@ harness behaving as expected, not a coherence-time result."
 
 ### Table 2 — the bar on both conventions, and the false pass
 
-5 seeds × 300 frames, 22 runs per seed per base. `standard` is the production-faithful pair (D1);
+5 seeds × 300 frames, 24 runs per seed per base. `standard` is the production-faithful pair (D1);
 `robust` pairs `hf_robust` against a bench-local **synthetic** short-CP twin with an unallocated
-`bandwidth_id` (D1c) — it answers the ticket's literal question with zero base-profile confound but
-measures the lever's *magnitude*, not a shippable feature.
+`bandwidth_id` (D1c) — it answers the ticket's literal question with zero base-profile-*family*
+confound (same carrier layout) but measures the lever's *magnitude*, not a shippable feature.
+**"Zero base-profile confound" is narrower than it reads**: it means no carrier-count/family
+mismatch between the long and short arms, not a clean isolation from every other per-profile
+field — the header `bandwidth_id` codeword still differs between them (Table 3's header-codeword
+isolation, added after a review finding, measures that separately).
 
 | Quantity | Required | Old (bits/slot) | `standard` joint | `robust` joint |
 |---|---|---|---|---|
@@ -2817,16 +2821,37 @@ important number in this section.
 
 ### Table 3 — arms, comparators, and the denominator delta (D4a's primary answer)
 
+**Re-run after two review findings corrected arm C's construction (below).** The original arm C
+was `best_arm(short_cells())` — a hindsight-picked FIXED level, fixed CP — while arm B is BOTH
+rate-adaptive (`RateLoop`) and CP-adaptive. That conflated CP adaptivity's contribution with rate
+adaptivity's: a negative B-vs-C delta could come entirely from `RateLoop` underperforming the best
+fixed level, never from CP adaptivity itself. Arm C is now `FixedCpAdaptiveRate{ShortCp}` — adaptive
+rate, FIXED short CP — holding rate-adaptivity constant against B so the delta isolates CP policy
+alone, mirroring arm A's existing long-CP control. The old hindsight-best-fixed-cell number is kept
+below as `C(fix)`, an upper-bound reference, never the isolation claim.
+
 | Quantity | `standard` | `robust` |
 |---|---|---|
 | arm A (long-CP control) | 1838.3 bps | 1506.2 bps |
 | arm P (rebuild placebo) | 1838.3 bps (**+0.00%**) | 1506.2 bps (**+0.00%**) |
 | arm B (CP-adaptive) — *data airtime only, = ×0* | 2399.8 bps | 1912.4 bps |
-| arm C (fixed short CP) | 2531.6 bps | 2270.1 bps |
+| arm C (adaptive rate, fixed short CP — B's isolation control) | 2419.9 bps | 1928.3 bps |
+| arm C' (arm C, header `bandwidth` pinned to the long-CP ID) | 2405.8 bps | 1946.5 bps |
+| C(fix) — hindsight best-fixed short-CP cell (upper bound, NOT isolation) | 2531.6 bps | 2270.1 bps |
 | best-fixed(long) → best-fixed(joint) | 2179.1 → 2531.6 (**+16.18%**) | 1948.3 → 2270.1 (**+16.52%**) |
 | oracle(long) → oracle(joint) | 3066.6 → 3670.5 (**+19.69%**) | 2736.5 → 3262.6 (**+19.23%**) |
-| arm B vs arm C | −5.21% (B>C on 1/5) | −15.76% (B>C on 0/5) |
+| arm B vs arm C (isolated CP-adaptivity delta) | −0.83% (B>C on **0/5**) | −0.83% (B>C on **0/5**) |
+| arm C vs arm C' (header-codeword effect at constant short CP) | −0.58% | **+0.94%** |
 | arm B vs arm A | +30.5% (B>A on **5/5**) | +27.0% (B>A on **5/5**) |
+
+**The header-codeword confound is not negligible relative to the effect it confounds.** On
+`standard`, the isolated B-vs-C delta (−0.83%) is larger than the header-codeword effect alone
+(−0.58%), same sign — the CP-adaptivity conclusion likely still holds but a meaningful share of the
+−0.83% could be header-driven. On `robust`, the header-codeword effect (**+0.94%**) is LARGER than
+the entire B-vs-C delta (−0.83%) and opposite-signed — the measured delta there is smaller than a
+confound this bench can already name, so no CP-specific magnitude can be drawn from `robust`'s
+B-vs-C number alone. What survives on both bases is the DIRECTIONAL result (B never beats isolated
+C, 0/5 seeds, both bases) — see the D9 sign-consistency table below and its own caveat.
 
 **The denominator delta is the ticket's primary answer, and it is real:** +16–17% on best-fixed,
 +19–20% on the oracle, consistent across both bases. Both exceed the pure +14.130% CP constant
@@ -2858,7 +2883,8 @@ either**, since both are accounting, not measurement:
   the bar ratios, the aggregate mean, or the per-seed deltas, and with no label saying so. Charging it
   at ×1 moves arm B by roughly −3.3 to −4.5% (`standard` seed 0: 2301.4 → 2207.8 bps), which
   **deepens every already-negative arm-B result** rather than changing its sign: `B/bf(joint)` 0.948 →
-  ~0.910, `arm B vs arm C` −5.21% → more negative. The bench now prints every one of those quantities
+  ~0.910, `arm B vs arm C` −0.83% (x0) → −4.97% (x1) on `standard`, same pattern on `robust`
+  (−0.83% → −5.00%). The bench now prints every one of those quantities
   at both ×0 and ×1 so the band is visible at the point of use; it deliberately does *not* silently
   adopt ×1 as the primary, because this bench cannot measure which multiplier is right.
 
@@ -2914,9 +2940,11 @@ never dropped across the remaining 291 frames.
 
 Per the **pre-committed transition-count gate**: with ≤ 1 transition this schedule does **not**
 exercise CP *adaptivity*. Arm B is therefore fixed short CP with a nine-frame long-CP prologue, and
-must not be described as adaptive control. That also explains arm B ≈ arm C, and it means the
-`arm B vs arm C` row above measures adaptive *rate* against best fixed *rate* on a common short CP —
-not adaptive CP against fixed CP.
+must not be described as adaptive control. That also explains why arm B and arm C are so close: both
+now run the same `RateLoop` (arm C is `FixedCpAdaptiveRate{ShortCp}`, not a fixed-rate cell), so
+`arm B vs arm C` genuinely isolates CP policy alone — and the small delta is exactly what this gate's
+never-dropping behavior predicts, since arm B spends 291 of 300 frames at the same fixed short CP arm
+C runs the whole time.
 
 For cross-checking: `cp_gate.rs`'s own "2.55–3.2 ms" array is **deliberately synthetic** and says so
 in its doc comment — it is not a measurement, and the 2.083 ms figure here is the first real per-frame
@@ -2930,7 +2958,7 @@ The ticket's literal ask was to enable short-CP negotiation by default. It reads
 | # | Criterion | Verdict | Evidence |
 |---|---|---|---|
 | F1 | The `set_speed_level` / `cp_negotiator` desync pre-condition is closed | **Yes** | The `level >= 5` `cp_mode` reset is deleted; the invariant is asserted across a real `RateLoop` VHF excursion in *both* roles through the real `decode_and_dispatch_audio` path; a non-self-healing tracing canary tripwires any future divergence. Pre-fix the daemon test failed with "preamble synchronization failed" — the link was dead. |
-| F2 | The lever is real (ratios move favourably, outside the run-to-run band, sign-consistent across all 5 seeds) | **Partly — and not as a ratio** | The *denominator delta* is real and sign-consistent (+16–17% / +19–20%, both bases), and arm B delivered more bits than arm A on 5/5 seeds (+3.73% mean) while using 20.44% less airtime. But the *ratios* do not clear the bar, and per Table 1 they cannot move on airtime at all. CP **adaptivity** specifically added nothing (arm B < arm C on 4/5 and 5/5). |
+| F2 | The lever is real (ratios move favourably, outside the run-to-run band, sign-consistent across all 5 seeds) | **Partly — and not as a ratio** | The *denominator delta* is real and sign-consistent (+16–17% / +19–20%, both bases), and arm B delivered more bits than arm A on 5/5 seeds (+3.73% mean) while using 20.44% less airtime. But the *ratios* do not clear the bar, and per Table 1 they cannot move on airtime at all. CP **adaptivity** specifically added nothing (arm B < arm C, the isolated adaptive-rate/fixed-short-CP control, on 5/5 seeds on both bases) — though on `robust` the header-codeword confound (Table 3) is larger than the delta itself, so only the directional (never-beats) result is load-bearing there, not the magnitude. |
 | F3 | The flip changes observable behaviour | **No** | The propose site is nested inside `if self.config.engine.cp_gate_enabled`; the inbound `CpControl` arm is nested inside `arq_enabled`; all three flags default `false`. Proved by `cp_negotiation_enabled_alone_never_initiates_without_cp_gate`. |
 
 **F3's sharper form, which argues for more caution rather than less:** on a *default* daemon the flag
@@ -2958,8 +2986,9 @@ parenthetical, and `test_cp_negotiation_requires_two_more_flags_by_default` is t
 a future *partial* flip impossible to land silently.
 
 Reproduce: `cargo run -p coppa-bench --release --example closed_loop_arq` (robust base) and
-`... --example closed_loop_arq -- standard` (production pair) — ~75 min wall clock each for the full
-5-seed / 22-run sweep on a 10-core Apple Silicon machine, run concurrently.
+`... --example closed_loop_arq -- standard` (production pair) — measured ~18-20 min wall clock each
+for the full 5-seed / 24-run sweep (release build, `1 seed × 300 frames` timed at 3m31s and scaled
+linearly), run concurrently.
 `COPPA_CL_FRAMES` / `COPPA_CL_SEEDS` shrink it to seconds for a wiring check. **CI compiles bench
 examples but never runs them, so these figures carry no regression protection** — the arithmetic they
 rest on is unit-tested in `coppa_bench::adaptive_goodput` (14 tests) and `coppa_bench::cp_arm`
@@ -2980,8 +3009,12 @@ short-CP cell on 5/5 seeds on both bases; the denominator delta is +16–17% (be
 (oracle); and arm B delivered more bits than arm A on 5/5 seeds while using 20.44% less airtime, so
 the FER channel contributes and is sign-consistent. Fade-diversity interleaving stays available but
 is not the next lever: short CP demonstrably delivers and is far cheaper. What the evidence does
-**not** support is CP *adaptivity* — arm B lost to fixed short CP on 4/5 and 5/5 seeds, and per
-Table 4 the gate never dropped, so adaptivity was never actually exercised here.
+**not** support is CP *adaptivity* — arm B lost to the isolated adaptive-rate/fixed-short-CP control
+(arm C) on 5/5 seeds on both bases (Table 3), and per Table 4 the gate never dropped, so adaptivity
+was never actually exercised here. The isolated delta itself is small (−0.83% on both bases, x0) and
+on `robust` is smaller than a header-codeword confound this bench separately measured (+0.94%,
+Table 3) — so it is the DIRECTION (never beats the isolation control) that is load-bearing, not the
+magnitude.
 
 **A separate, real defect surfaced and is filed rather than folded in:** `CpGate`'s 2.5 ms threshold
 is mis-set relative to what `DelayDomainEstimator` actually produces (Watterson-Poor = 2.083 ms), so

@@ -449,12 +449,16 @@ long-CP-only 9-cell comparator, the one denied short CP, reads 1.101 and clears 
 that is pure denominator arithmetic (the gaps to the bar are +9.41% and +4.99% against a +14.130%
 constant). Where the win is real is the denominator: best-fixed goodput 2179.1 → 2531.6 bps
 (+16.18%), oracle 3066.6 → 3670.5 bps (+19.69%), with best-fixed(joint) selecting a short-CP cell on
-5/5 seeds. CP *adaptivity* added nothing over simply always running short CP (−5.21% against the
-best fixed short-CP cell) and the schedule produced exactly one `CpGate` transition per run, so the
+5/5 seeds. CP *adaptivity* added nothing over simply always running short CP (−0.83% against arm C,
+`FixedCpAdaptiveRate{ShortCp}` — adaptive rate held constant so the delta isolates CP policy alone,
+correcting an earlier version of this comparator that conflated rate-adaptivity with CP-adaptivity;
+0/5 seeds on both bases) and the schedule produced exactly one `CpGate` transition per run, so the
 evidence routes to short CP as a **static (negotiated) configuration for HF levels 1-4** — not an
-adaptive control, and not fade-diversity interleaving, which stays available but unrouted. Like
-COP-5 above, this redefines what the metric can honestly be asked and records it, rather than
-forcing the number.
+adaptive control, and not fade-diversity interleaving, which stays available but unrouted. On
+`robust`, a separately-measured header-codeword confound (+0.94%) is larger than this delta, so only
+the direction (never beats the isolation control) is load-bearing, not the magnitude — see
+`BENCHMARKS.md`'s Table 3. Like COP-5 above, this redefines what the metric can honestly be asked
+and records it, rather than forcing the number.
 
 ### A real, undocumented-until-now plan deviation
 
