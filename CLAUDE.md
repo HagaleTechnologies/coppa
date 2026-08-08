@@ -346,3 +346,13 @@ perfect-CSI bound admits 91.6% of Watterson-Good frames at 30 dB (95% CI 88.84�
 15.0% real decode success (95% CI 11.40–19.48%). This proves implementation headroom in
 fade-diversity/FEC coverage; it does not justify a profile-routing change. See BENCHMARKS.md's
 "Level 9 Watterson fading diagnosis (COP-4)" section.
+
+
+## Code review convergence
+
+Every review round fixes P1 findings inline. From round 2 onward, P2-and-
+lower findings are not fixed inline — they're captured verbatim into a
+follow-up ticket instead, so the PR converges instead of chasing
+progressively finer findings across rounds. Round 1 is unrestricted (fix
+everything reasonable). Full policy:
+docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md.
