@@ -223,6 +223,54 @@ mod tests {
         }
     }
 
+    /// COP-7 regression: the exact input from GitHub Actions run 30815658799
+    /// (macos-latest, 2026-08-03), which failed the sweep test at
+    /// dev=3.2174587e-4 vs the then-current tol=2.4728547e-4.
+    ///
+    /// This is not a platform quirk — these inputs reproduce the same deviation
+    /// on every architecture. The oracle (`demap_soft_bruteforce`) forms the full
+    /// 2-D squared distance `dr*dr + di*di` and subtracts two of them, so when the
+    /// *other* axis sits far outside the constellation its large term is rounded
+    /// into both operands and its low-order bits are lost to cancellation; `/ nv`
+    /// at small noise variance then amplifies the residual. The closed-form path
+    /// never forms that term at all, which is why it is the *more* accurate side.
+    ///
+    /// Guards the `K * eps * Dmax / nv` term in `oracle_tol`. Delete this test only
+    /// alongside a replacement that pins the same mechanism.
+    #[test]
+    fn oracle_tolerance_covers_the_cop7_ci_failure() {
+        let mapper = Qam64Mapper;
+        let re = 0.011_131_763_f32;
+        let im = 6.847_466_5_f32;
+        let nv = 0.010_598_836_5_f32;
+        let sym = Complex32::new(re, im);
+
+        let fast = mapper.demap_soft(sym, nv);
+        let oracle = mapper.demap_soft_bruteforce(sym, nv);
+        let dmax = crate::qam_oracle_tol::worst_case_dmax(sym, 7.0 * NORM);
+
+        assert!(
+            (dmax - 64.037_52).abs() < 1e-3,
+            "expected Dmax ~= 64.03752, got {dmax}"
+        );
+
+        for (i, (f, o)) in fast.iter().zip(oracle.iter()).enumerate() {
+            let dev = (f - o).abs();
+            let tol = crate::qam_oracle_tol::oracle_tol(*o, dmax, nv);
+            assert!(
+                dev <= tol,
+                "bit {i}: fast={f} oracle={o} dev={dev:e} tol={tol:e}"
+            );
+        }
+
+        for i in 3..6 {
+            assert_eq!(
+                fast[i], oracle[i],
+                "bit {i} sits on the far-out axis and must agree exactly"
+            );
+        }
+    }
+
     /// Step 1 (Task 6): exhaustive equivalence oracle. The closed-form
     /// `demap_soft` must reproduce the old 64-point enumeration
     /// (`demap_soft_bruteforce`) on every LLR, over random `(symbol,
@@ -231,15 +279,9 @@ mod tests {
     /// outermost ones, get exercised) and down to small noise variances
     /// (so LLR magnitudes span several orders of magnitude).
     ///
-    /// Tolerance is `1.5e-4` absolute *or* `1.5e-4` relative, combined
-    /// (`dev <= 1.5e-4 + 1.5e-4 * |oracle|`) — see the identical rationale on
-    /// `qam16::tests::soft_demap_matches_bruteforce_oracle`: at small
-    /// noise variance, f32 rounding differences between the closed-form
-    /// and enumeration code paths occasionally exceed a flat 1e-4 once
-    /// LLR magnitudes reach the hundreds, even though the formula is
-    /// exact (observed relative error ~1e-6). Bumped from 1e-4 2026-07-11
-    /// after CI (unseeded RNG, 10k trials/run) hit a real excursion
-    /// (dev=1.18e-4 vs the old tol=1.14e-4) with no code change involved.
+    /// The condition-aware tolerance is derived in `qam_oracle_tol`. It retains
+    /// the absolute-plus-relative bound bumped from 1e-4 on 2026-07-11, and
+    /// COP-7 adds the `Dmax / nv` term required by the oracle's cancellation.
     #[test]
     fn soft_demap_matches_bruteforce_oracle() {
         let mapper = Qam64Mapper;
@@ -255,23 +297,19 @@ mod tests {
 
             let fast = mapper.demap_soft(sym, nv);
             let oracle = mapper.demap_soft_bruteforce(sym, nv);
+            let dmax = crate::qam_oracle_tol::worst_case_dmax(sym, 7.0 * NORM);
 
             assert_eq!(fast.len(), oracle.len());
             for (f, o) in fast.iter().zip(oracle.iter()) {
                 let dev = (f - o).abs();
                 max_dev = max_dev.max(dev);
                 max_rel_dev = max_rel_dev.max(dev / o.abs().max(1.0));
-                let tol = 1.5e-4 + 1.5e-4 * o.abs();
+                let tol = crate::qam_oracle_tol::oracle_tol(*o, dmax, nv);
                 assert!(
                     dev <= tol,
-                    "LLR mismatch: fast={} oracle={} dev={} tol={} sym=({},{}) nv={}",
-                    f,
-                    o,
-                    dev,
-                    tol,
-                    re,
-                    im,
-                    nv
+                    "LLR mismatch: fast={f} oracle={o} dev={dev:e} tol={tol:e} \
+                     sym=({re},{im}) nv={nv} dmax={dmax} eps*dmax/nv={:e}",
+                    crate::qam_oracle_tol::EPS * dmax / nv
                 );
             }
         }
