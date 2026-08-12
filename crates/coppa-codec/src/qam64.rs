@@ -164,7 +164,8 @@ impl ConstellationMapper for Qam64Mapper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::RngExt;
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
 
     #[test]
     fn test_64qam_roundtrip() {
@@ -285,7 +286,12 @@ mod tests {
     #[test]
     fn soft_demap_matches_bruteforce_oracle() {
         let mapper = Qam64Mapper;
-        let mut rng = rand::rng();
+        let seed: u64 = std::env::var("QAM_ORACLE_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| rand::rng().random());
+        eprintln!("64QAM soft-demap oracle: seed={seed} (re-run with QAM_ORACLE_SEED={seed})");
+        let mut rng = StdRng::seed_from_u64(seed);
         let mut max_dev = 0.0f32;
         let mut max_rel_dev = 0.0f32;
 
@@ -308,7 +314,7 @@ mod tests {
                 assert!(
                     dev <= tol,
                     "LLR mismatch: fast={f} oracle={o} dev={dev:e} tol={tol:e} \
-                     sym=({re},{im}) nv={nv} dmax={dmax} eps*dmax/nv={:e}",
+                     sym=({re},{im}) nv={nv} dmax={dmax} eps*dmax/nv={:e} seed={seed}",
                     crate::qam_oracle_tol::EPS * dmax / nv
                 );
             }

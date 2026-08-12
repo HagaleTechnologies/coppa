@@ -59,4 +59,19 @@ mod tests {
         let tol = oracle_tol(1000.0, 64.0, 4.0);
         assert!(tol < 0.2, "benign-region tolerance drifted loose: {tol}");
     }
+
+    #[test]
+    fn sweep_seed_is_reproducible() {
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+
+        let draw = |seed: u64| {
+            let mut rng = StdRng::seed_from_u64(seed);
+            (0..8)
+                .map(|_| rng.random_range(-7.0..7.0f32))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(draw(0xC0F7), draw(0xC0F7), "same seed must replay exactly");
+        assert_ne!(draw(1), draw(2), "different seeds must diverge");
+    }
 }
