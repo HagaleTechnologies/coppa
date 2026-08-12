@@ -50,7 +50,10 @@ mod tests {
     fn tolerance_grows_as_conditioning_worsens() {
         let loose = oracle_tol(0.5, 64.0, 0.01);
         let tight = oracle_tol(0.5, 64.0, 4.0);
-        assert!(loose > tight, "tol must scale with 1/nv: {loose} vs {tight}");
+        assert!(
+            loose > tight,
+            "tol must scale with 1/nv: {loose} vs {tight}"
+        );
         assert!(loose > EPS * 64.0 / 0.01);
     }
 
