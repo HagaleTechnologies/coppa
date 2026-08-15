@@ -147,7 +147,8 @@ impl ConstellationMapper for Qam16Mapper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::RngExt;
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
 
     #[test]
     fn test_16qam_roundtrip() {
@@ -193,6 +194,29 @@ mod tests {
         }
     }
 
+    /// COP-7: QAM-16 has the same cancellation mechanism as QAM-64 (see
+    /// `qam_oracle_tol`), just 6x more headroom because its draw range caps Dmax at
+    /// ~31.18 rather than ~64. It has never failed in CI (0 in 80M comparisons), but
+    /// its theoretical worst case already exceeds the pre-COP-7 flat term.
+    #[test]
+    fn oracle_tolerance_covers_worst_case_conditioning() {
+        let lmax = 3.0 * NORM;
+        let sym = Complex32::new(3.0, 3.0);
+        let nv = 0.01_f32;
+        let dmax = crate::qam_oracle_tol::worst_case_dmax(sym, lmax);
+
+        assert!(
+            (dmax - 31.18).abs() < 0.01,
+            "expected worst-case Dmax ~= 31.18, got {dmax}"
+        );
+
+        let tol = crate::qam_oracle_tol::oracle_tol(0.0, dmax, nv);
+        assert!(
+            tol > 1.8 * crate::qam_oracle_tol::EPS * dmax / nv,
+            "tolerance {tol:e} does not cover the measured error bound"
+        );
+    }
+
     /// Step 1 (Task 6): exhaustive equivalence oracle. The closed-form
     /// `demap_soft` must reproduce the old 16-point enumeration
     /// (`demap_soft_bruteforce`) on every LLR, over random `(symbol,
@@ -201,21 +225,18 @@ mod tests {
     /// get exercised) and down to small noise variances (so LLR
     /// magnitudes span several orders of magnitude).
     ///
-    /// Tolerance is `1.5e-4` absolute *or* `1.5e-4` relative, combined
-    /// (`dev <= 1.5e-4 + 1.5e-4 * |oracle|`): at small noise variance the two
-    /// code paths (closed-form multiply-add vs. squared-distance
-    /// enumeration) accumulate f32 rounding differently, so a flat 1e-4
-    /// absolute bound is occasionally tripped by pure f32 rounding noise
-    /// once LLR magnitudes reach the hundreds (observed relative error is
-    /// ~1e-6, i.e. a few ULPs) even though the formula is exact. A relative
-    /// component absorbs that while still being tight enough (1.5e-4 = 0.015%)
-    /// to catch a real derivation error, which would show up as an O(1)
-    /// relative mismatch, not O(1e-6). Bumped from 1e-4 2026-07-11 alongside
-    /// the identical qam64 test, which hit a real tail excursion in CI.
+    /// The condition-aware tolerance is derived in `qam_oracle_tol`. It retains
+    /// the absolute-plus-relative bound bumped from 1e-4 on 2026-07-11, and
+    /// COP-7 adds the `Dmax / nv` term required by the oracle's cancellation.
     #[test]
     fn soft_demap_matches_bruteforce_oracle() {
         let mapper = Qam16Mapper;
-        let mut rng = rand::rng();
+        let seed: u64 = std::env::var("QAM_ORACLE_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| rand::rng().random());
+        eprintln!("16QAM soft-demap oracle: seed={seed} (re-run with QAM_ORACLE_SEED={seed})");
+        let mut rng = StdRng::seed_from_u64(seed);
         let mut max_dev = 0.0f32;
         let mut max_rel_dev = 0.0f32;
 
@@ -227,23 +248,19 @@ mod tests {
 
             let fast = mapper.demap_soft(sym, nv);
             let oracle = mapper.demap_soft_bruteforce(sym, nv);
+            let dmax = crate::qam_oracle_tol::worst_case_dmax(sym, 3.0 * NORM);
 
             assert_eq!(fast.len(), oracle.len());
             for (f, o) in fast.iter().zip(oracle.iter()) {
                 let dev = (f - o).abs();
                 max_dev = max_dev.max(dev);
                 max_rel_dev = max_rel_dev.max(dev / o.abs().max(1.0));
-                let tol = 1.5e-4 + 1.5e-4 * o.abs();
+                let tol = crate::qam_oracle_tol::oracle_tol(*o, dmax, nv);
                 assert!(
                     dev <= tol,
-                    "LLR mismatch: fast={} oracle={} dev={} tol={} sym=({},{}) nv={}",
-                    f,
-                    o,
-                    dev,
-                    tol,
-                    re,
-                    im,
-                    nv
+                    "LLR mismatch: fast={f} oracle={o} dev={dev:e} tol={tol:e} \
+                     sym=({re},{im}) nv={nv} dmax={dmax} eps*dmax/nv={:e} seed={seed}",
+                    crate::qam_oracle_tol::EPS * dmax / nv
                 );
             }
         }

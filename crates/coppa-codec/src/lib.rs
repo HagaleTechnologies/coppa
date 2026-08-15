@@ -13,5 +13,8 @@ pub mod qam64;
 pub mod qpsk;
 pub mod traits;
 
+#[cfg(test)]
+mod qam_oracle_tol;
+
 pub use bpsk::BpskModem;
 pub use traits::{ConstellationMapper, Modem};
