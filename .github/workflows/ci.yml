@@ -56,7 +56,13 @@ jobs:
     # mean "proceed" -- only `failure`/`cancelled` mean "stop." Getting
     # this wrong would fail every draft/dependabot PR outright, since
     # codex-clean never reports bare `success` for them.
-    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    # !head.repo.fork, matching wiki-lint's own established idiom below:
+    # this repo is public, so any pull_request can come from a fork with
+    # attacker-controlled build.rs/test code -- codex-clean is not a
+    # security sandbox (an AI code review completing is not proof the
+    # code is safe to execute), so a fork PR must never reach the
+    # persistent self-hosted rigel pool regardless of the gate's result.
+    if: (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped') && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
     runs-on: [self-hosted, linux, rigel]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -69,7 +75,13 @@ jobs:
   bench-fuzz:
     name: Bench & Fuzz Compilation
     needs: [codex-clean]
-    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    # !head.repo.fork, matching wiki-lint's own established idiom below:
+    # this repo is public, so any pull_request can come from a fork with
+    # attacker-controlled build.rs/test code -- codex-clean is not a
+    # security sandbox (an AI code review completing is not proof the
+    # code is safe to execute), so a fork PR must never reach the
+    # persistent self-hosted rigel pool regardless of the gate's result.
+    if: (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped') && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
     runs-on: [self-hosted, linux, rigel]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -85,7 +97,13 @@ jobs:
   clippy:
     name: Clippy
     needs: [codex-clean]
-    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    # !head.repo.fork, matching wiki-lint's own established idiom below:
+    # this repo is public, so any pull_request can come from a fork with
+    # attacker-controlled build.rs/test code -- codex-clean is not a
+    # security sandbox (an AI code review completing is not proof the
+    # code is safe to execute), so a fork PR must never reach the
+    # persistent self-hosted rigel pool regardless of the gate's result.
+    if: (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped') && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
     runs-on: [self-hosted, linux, rigel]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -110,7 +128,13 @@ jobs:
   msrv:
     name: MSRV Check
     needs: [codex-clean]
-    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    # !head.repo.fork, matching wiki-lint's own established idiom below:
+    # this repo is public, so any pull_request can come from a fork with
+    # attacker-controlled build.rs/test code -- codex-clean is not a
+    # security sandbox (an AI code review completing is not proof the
+    # code is safe to execute), so a fork PR must never reach the
+    # persistent self-hosted rigel pool regardless of the gate's result.
+    if: (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped') && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
     runs-on: [self-hosted, linux, rigel]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -239,7 +263,12 @@ jobs:
   # -- it must not compete for the pool it's watching.
   rigel-jobs-queue-watchdog:
     needs: [codex-clean]
-    if: needs.codex-clean.result == 'success'
+    # Must tolerate `skipped` the same as the six jobs it watches: for a
+    # Dependabot PR or a non-pull_request event, codex-clean legitimately
+    # skips and those jobs still proceed via their own skip-tolerant
+    # `if:` -- watching only `success` would leave exactly those pushes
+    # with no queue-stall diagnostic, the one case this job exists for.
+    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
@@ -281,7 +310,13 @@ jobs:
   deny:
     name: Supply-chain check (cargo-deny)
     needs: [codex-clean]
-    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    # !head.repo.fork, matching wiki-lint's own established idiom below:
+    # this repo is public, so any pull_request can come from a fork with
+    # attacker-controlled build.rs/test code -- codex-clean is not a
+    # security sandbox (an AI code review completing is not proof the
+    # code is safe to execute), so a fork PR must never reach the
+    # persistent self-hosted rigel pool regardless of the gate's result.
+    if: (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped') && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
     runs-on: [self-hosted, linux, rigel]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -290,7 +325,13 @@ jobs:
   audit:
     name: Security Audit
     needs: [codex-clean]
-    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    # !head.repo.fork, matching wiki-lint's own established idiom below:
+    # this repo is public, so any pull_request can come from a fork with
+    # attacker-controlled build.rs/test code -- codex-clean is not a
+    # security sandbox (an AI code review completing is not proof the
+    # code is safe to execute), so a fork PR must never reach the
+    # persistent self-hosted rigel pool regardless of the gate's result.
+    if: (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped') && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
     runs-on: [self-hosted, linux, rigel]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
