@@ -56,14 +56,17 @@ jobs:
     # mean "proceed" -- only `failure`/`cancelled` mean "stop." Getting
     # this wrong would fail every draft/dependabot PR outright, since
     # codex-clean never reports bare `success` for them.
-    # !head.repo.fork, matching wiki-lint's own established idiom below:
+    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    # A fork PR must never reach the persistent self-hosted rigel pool --
     # this repo is public, so any pull_request can come from a fork with
-    # attacker-controlled build.rs/test code -- codex-clean is not a
+    # attacker-controlled build.rs/test code, and codex-clean is not a
     # security sandbox (an AI code review completing is not proof the
-    # code is safe to execute), so a fork PR must never reach the
-    # persistent self-hosted rigel pool regardless of the gate's result.
-    if: (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped') && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
-    runs-on: [self-hosted, linux, rigel]
+    # code is safe to execute). Route fork PRs to a hosted runner instead
+    # of skipping the job entirely -- skipping would drop test/clippy/
+    # msrv/deny/audit coverage for every external contributor's PR while
+    # `ci`'s own fan-in treats that skip as a pass, letting Mergify queue
+    # a fork PR with zero coverage. Non-fork events still get rigel.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && fromJson('"ubuntu-latest"') || fromJson('["self-hosted","linux","rigel"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -75,14 +78,17 @@ jobs:
   bench-fuzz:
     name: Bench & Fuzz Compilation
     needs: [codex-clean]
-    # !head.repo.fork, matching wiki-lint's own established idiom below:
+    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    # A fork PR must never reach the persistent self-hosted rigel pool --
     # this repo is public, so any pull_request can come from a fork with
-    # attacker-controlled build.rs/test code -- codex-clean is not a
+    # attacker-controlled build.rs/test code, and codex-clean is not a
     # security sandbox (an AI code review completing is not proof the
-    # code is safe to execute), so a fork PR must never reach the
-    # persistent self-hosted rigel pool regardless of the gate's result.
-    if: (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped') && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
-    runs-on: [self-hosted, linux, rigel]
+    # code is safe to execute). Route fork PRs to a hosted runner instead
+    # of skipping the job entirely -- skipping would drop test/clippy/
+    # msrv/deny/audit coverage for every external contributor's PR while
+    # `ci`'s own fan-in treats that skip as a pass, letting Mergify queue
+    # a fork PR with zero coverage. Non-fork events still get rigel.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && fromJson('"ubuntu-latest"') || fromJson('["self-hosted","linux","rigel"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -97,14 +103,17 @@ jobs:
   clippy:
     name: Clippy
     needs: [codex-clean]
-    # !head.repo.fork, matching wiki-lint's own established idiom below:
+    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    # A fork PR must never reach the persistent self-hosted rigel pool --
     # this repo is public, so any pull_request can come from a fork with
-    # attacker-controlled build.rs/test code -- codex-clean is not a
+    # attacker-controlled build.rs/test code, and codex-clean is not a
     # security sandbox (an AI code review completing is not proof the
-    # code is safe to execute), so a fork PR must never reach the
-    # persistent self-hosted rigel pool regardless of the gate's result.
-    if: (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped') && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
-    runs-on: [self-hosted, linux, rigel]
+    # code is safe to execute). Route fork PRs to a hosted runner instead
+    # of skipping the job entirely -- skipping would drop test/clippy/
+    # msrv/deny/audit coverage for every external contributor's PR while
+    # `ci`'s own fan-in treats that skip as a pass, letting Mergify queue
+    # a fork PR with zero coverage. Non-fork events still get rigel.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && fromJson('"ubuntu-latest"') || fromJson('["self-hosted","linux","rigel"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -128,14 +137,17 @@ jobs:
   msrv:
     name: MSRV Check
     needs: [codex-clean]
-    # !head.repo.fork, matching wiki-lint's own established idiom below:
+    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    # A fork PR must never reach the persistent self-hosted rigel pool --
     # this repo is public, so any pull_request can come from a fork with
-    # attacker-controlled build.rs/test code -- codex-clean is not a
+    # attacker-controlled build.rs/test code, and codex-clean is not a
     # security sandbox (an AI code review completing is not proof the
-    # code is safe to execute), so a fork PR must never reach the
-    # persistent self-hosted rigel pool regardless of the gate's result.
-    if: (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped') && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
-    runs-on: [self-hosted, linux, rigel]
+    # code is safe to execute). Route fork PRs to a hosted runner instead
+    # of skipping the job entirely -- skipping would drop test/clippy/
+    # msrv/deny/audit coverage for every external contributor's PR while
+    # `ci`'s own fan-in treats that skip as a pass, letting Mergify queue
+    # a fork PR with zero coverage. Non-fork events still get rigel.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && fromJson('"ubuntu-latest"') || fromJson('["self-hosted","linux","rigel"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 1.85.0
@@ -310,14 +322,17 @@ jobs:
   deny:
     name: Supply-chain check (cargo-deny)
     needs: [codex-clean]
-    # !head.repo.fork, matching wiki-lint's own established idiom below:
+    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    # A fork PR must never reach the persistent self-hosted rigel pool --
     # this repo is public, so any pull_request can come from a fork with
-    # attacker-controlled build.rs/test code -- codex-clean is not a
+    # attacker-controlled build.rs/test code, and codex-clean is not a
     # security sandbox (an AI code review completing is not proof the
-    # code is safe to execute), so a fork PR must never reach the
-    # persistent self-hosted rigel pool regardless of the gate's result.
-    if: (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped') && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
-    runs-on: [self-hosted, linux, rigel]
+    # code is safe to execute). Route fork PRs to a hosted runner instead
+    # of skipping the job entirely -- skipping would drop test/clippy/
+    # msrv/deny/audit coverage for every external contributor's PR while
+    # `ci`'s own fan-in treats that skip as a pass, letting Mergify queue
+    # a fork PR with zero coverage. Non-fork events still get rigel.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && fromJson('"ubuntu-latest"') || fromJson('["self-hosted","linux","rigel"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
@@ -325,14 +340,17 @@ jobs:
   audit:
     name: Security Audit
     needs: [codex-clean]
-    # !head.repo.fork, matching wiki-lint's own established idiom below:
+    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    # A fork PR must never reach the persistent self-hosted rigel pool --
     # this repo is public, so any pull_request can come from a fork with
-    # attacker-controlled build.rs/test code -- codex-clean is not a
+    # attacker-controlled build.rs/test code, and codex-clean is not a
     # security sandbox (an AI code review completing is not proof the
-    # code is safe to execute), so a fork PR must never reach the
-    # persistent self-hosted rigel pool regardless of the gate's result.
-    if: (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped') && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
-    runs-on: [self-hosted, linux, rigel]
+    # code is safe to execute). Route fork PRs to a hosted runner instead
+    # of skipping the job entirely -- skipping would drop test/clippy/
+    # msrv/deny/audit coverage for every external contributor's PR while
+    # `ci`'s own fan-in treats that skip as a pass, letting Mergify queue
+    # a fork PR with zero coverage. Non-fork events still get rigel.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && fromJson('"ubuntu-latest"') || fromJson('["self-hosted","linux","rigel"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
