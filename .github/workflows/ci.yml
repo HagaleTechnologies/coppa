@@ -5,6 +5,16 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # ready_for_review explicit (not just GitHub's default opened/
+    # synchronize/reopened): a draft PR promoted to ready needs a fresh
+    # CI run so the newly-added codex-clean gate and its six downstream
+    # jobs actually execute before the PR becomes merge-eligible --
+    # wait-for-codex.yml already handles this event (its own on: block
+    # includes ready_for_review), so without this, promoting a draft
+    # reruns only the Codex check while ci.yml stays silent, leaving
+    # Mergify able to queue the PR on a stale CI result from before the
+    # gated jobs ever ran.
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
