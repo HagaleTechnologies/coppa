@@ -38,7 +38,17 @@ jobs:
 
   test-full:
     name: Full test suite
-    runs-on: ubuntu-latest
+    needs: [codex-clean]
+    # codex-clean can legitimately report `skipped` (a draft PR,
+    # dependabot[bot] PR, or non-pull_request event -- credenza's
+    # codex-clean-gate.yml's own eligibility `if:`), which is a DIFFERENT
+    # case from "ran and found the round not clean yet" (that produces
+    # `failure`, never `skipped`). Both `success` and `skipped` mean
+    # "proceed" -- only `failure`/`cancelled` mean "stop." Built in from
+    # round 1, not as a same-day emergency follow-up (see cqdx#400 /
+    # reference_codex_clean_gate_skip_vs_success_semantics.md).
+    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    runs-on: [self-hosted, linux, rigel]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -49,7 +59,9 @@ jobs:
 
   bench-fuzz:
     name: Bench & Fuzz Compilation
-    runs-on: ubuntu-latest
+    needs: [codex-clean]
+    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    runs-on: [self-hosted, linux, rigel]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -63,7 +75,9 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    needs: [codex-clean]
+    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    runs-on: [self-hosted, linux, rigel]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -86,7 +100,9 @@ jobs:
 
   msrv:
     name: MSRV Check
-    runs-on: ubuntu-latest
+    needs: [codex-clean]
+    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    runs-on: [self-hosted, linux, rigel]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 1.85.0
@@ -114,16 +130,40 @@ jobs:
         if: runner.os != 'Linux'
         run: cargo test -p coppa-audio --lib --features cpal-backend
 
+  # codex-clean gate: defers test-full/bench-fuzz/clippy/msrv/deny/audit
+  # (Task 2 also moves all six to the self-hosted rigel pool) until wait-for-codex.yml (Task 1,
+  # now a caller stub around credenza's reusable wait-for-codex-review.yml)
+  # signals this exact revision's Codex round raised nothing new.
+  # gate_timeout_minutes: 95 is derived from THIS repo's own wait-for-codex
+  # job timeout (75min, see wait-for-codex.yml) -- not copied from another
+  # repo. producer_workflow_path points at THIS repo's own wait-for-codex.yml
+  # (Task 1's stub), which credenza's bootstrap check reads at the base
+  # branch's SHA to distinguish "not bootstrapped yet" (a clean 404) from
+  # "genuinely not clean yet" (the file exists, poll normally).
+  codex-clean:
+    uses: HagaleTechnologies/credenza/.github/workflows/codex-clean-gate.yml@3ee4adf4944a5c5645a3c5ce248fd4e77a6f10da
+    permissions:
+      contents: read
+      pull-requests: read
+    with:
+      exclude_dependabot: true
+      gate_timeout_minutes: 95
+      producer_workflow_path: .github/workflows/wait-for-codex.yml
+
   deny:
     name: Supply-chain check (cargo-deny)
-    runs-on: ubuntu-latest
+    needs: [codex-clean]
+    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    runs-on: [self-hosted, linux, rigel]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
 
   audit:
     name: Security Audit
-    runs-on: ubuntu-latest
+    needs: [codex-clean]
+    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    runs-on: [self-hosted, linux, rigel]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
@@ -148,7 +188,18 @@ jobs:
   # job that duplicates linux coverage already in test-full/test-features.
   ci:
     name: CI
-    needs: [check, test-features, test-full, clippy, fmt, msrv, deny, audit, wiki-lint]
+    needs:
+      [
+        check,
+        test-features,
+        test-full,
+        clippy,
+        fmt,
+        msrv,
+        deny,
+        audit,
+        wiki-lint,
+      ]
     runs-on: ubuntu-latest
     if: always()
     steps:
