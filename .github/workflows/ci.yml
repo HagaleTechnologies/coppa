@@ -150,6 +150,55 @@ jobs:
       gate_timeout_minutes: 95
       producer_workflow_path: .github/workflows/wait-for-codex.yml
 
+  # New job (coppa had no prior queue-stall watchdog of any kind). Watches
+  # whether ANY of the six codex-clean-gated jobs below is still queued
+  # (never assigned a runner) 20 minutes after codex-clean opened the gate --
+  # GitHub Actions has no built-in timeout for a job stuck in `queued`
+  # (timeout-minutes only starts once a runner picks it up), so a
+  # rigel pool outage/saturation would otherwise block this PR
+  # indefinitely with no clear diagnostic. Never runs on rigel itself
+  # -- it must not compete for the pool it's watching.
+  rigel-jobs-queue-watchdog:
+    needs: [codex-clean]
+    if: needs.codex-clean.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      actions: read
+    steps:
+      - name: Fail fast if any gated job never leaves the queue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Retry-on-transient-failure: a rate-limit/transient API failure
+          # here must not abort the whole watchdog under bash -e's default
+          # behavior before it ever checks status.
+          check_statuses() {
+            local attempt out
+            for attempt in 1 2 3; do
+              if out="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --jq '[.jobs[] | select(.name=="Full test suite" or .name=="Bench & Fuzz Compilation" or .name=="Clippy" or .name=="MSRV Check" or .name=="Supply-chain check (cargo-deny)" or .name=="Security Audit") | {name, status}]' 2>&1)"; then
+                printf '%s' "$out"
+                return 0
+              fi
+              sleep 2
+            done
+            echo "::warning::transient gh api failure fetching job statuses (3 attempts) -- treating this poll as inconclusive" >&2
+          }
+          deadline=1200
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            statuses="$(check_statuses)"
+            still_queued="$(echo "$statuses" | jq '[.[] | select(.status == "queued")] | length' 2>/dev/null || echo "0")"
+            if [ "$still_queued" -eq 0 ]; then
+              echo "All six gated jobs have left the queue (running, completed, or correctly skipped) -- watchdog stands down."
+              exit 0
+            fi
+            sleep 20
+          done
+          statuses="$(check_statuses)"
+          still_queued_names="$(echo "$statuses" | jq -r '[.[] | select(.status == "queued") | .name] | join(", ")' 2>/dev/null || echo "unknown")"
+          echo "::error::Still queued after 20 minutes with no runner assigned: $still_queued_names -- rigel pool likely saturated or down. See reference_rigel_ci_resource_contention_timeout.md for the diagnostic pattern (ssh rigel \"uptime; ...\")."
+          exit 1
+
   deny:
     name: Supply-chain check (cargo-deny)
     needs: [codex-clean]
