@@ -25,6 +25,25 @@ pull_request_rules:
       - base = main
       - -draft
       - -closed
+      # coppa is public and its ruleset requires zero approving reviews
+      # (required_approving_review_count: 0), so this Mergify rule is the
+      # only gate standing between a green CI run and an auto-merge. With
+      # no author condition, ANY outside contributor's PR that goes green
+      # gets auto-queued and merged with zero human review. `author` is a
+      # real, documented Mergify condition (exact match on the PR's GitHub
+      # login) -- it is NOT the same trust boundary as ruleset
+      # bypass_actors, which only governs who may bypass branch-protection
+      # checks entirely, not who can trigger this auto-merge rule. Two
+      # authors are trusted to auto-queue: thagale (today's sole human
+      # collaborator), and dependabot[bot] -- but only for the non-breaking
+      # bumps dependabot-auto-merge.yml has already vetted, since that
+      # workflow labels major/breaking bumps "needs-review" and the
+      # -label = needs-review condition below excludes those regardless of
+      # author. Widen the author list (or replace it with an org/team
+      # check) only when other human collaborators are added.
+      - or:
+          - author = thagale
+          - author = dependabot[bot]
       - -label = needs-review
       - "#review-threads-unresolved = 0"
       - check-success = CI
