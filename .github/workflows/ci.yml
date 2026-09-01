@@ -18,15 +18,13 @@ on:
 
 permissions:
   contents: read
-  # pull-requests: read and actions: read are narrowed further at the job
-  # level below (codex-clean, rigel-jobs-queue-watchdog) -- a job's own
-  # permissions: block can only be a SUBSET of what's granted here, never
-  # wider. Without these two scopes present at this top level, GitHub
-  # rejects the whole workflow file at parse time (zero jobs created, no
-  # per-job error) the moment either job below requests a scope this block
-  # doesn't grant -- confirmed live on coppa PR #90.
+  # pull-requests: read is narrowed further at the job level below
+  # (codex-clean) -- a job's own permissions: block can only be a SUBSET
+  # of what's granted here, never wider. Without this scope present at
+  # this top level, GitHub rejects the whole workflow file at parse time
+  # (zero jobs created, no per-job error) the moment that job requests a
+  # scope this block doesn't grant -- confirmed live on coppa PR #90.
   pull-requests: read
-  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -67,16 +65,7 @@ jobs:
     # this wrong would fail every draft/dependabot PR outright, since
     # codex-clean never reports bare `success` for them.
     if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
-    # A fork PR must never reach the persistent self-hosted rigel pool --
-    # this repo is public, so any pull_request can come from a fork with
-    # attacker-controlled build.rs/test code, and codex-clean is not a
-    # security sandbox (an AI code review completing is not proof the
-    # code is safe to execute). Route fork PRs to a hosted runner instead
-    # of skipping the job entirely -- skipping would drop test/clippy/
-    # msrv/deny/audit coverage for every external contributor's PR while
-    # `ci`'s own fan-in treats that skip as a pass, letting Mergify queue
-    # a fork PR with zero coverage. Non-fork events still get rigel.
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && fromJson('"ubuntu-latest"') || fromJson('["self-hosted","linux","rigel"]') }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -89,16 +78,7 @@ jobs:
     name: Bench & Fuzz Compilation
     needs: [codex-clean]
     if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
-    # A fork PR must never reach the persistent self-hosted rigel pool --
-    # this repo is public, so any pull_request can come from a fork with
-    # attacker-controlled build.rs/test code, and codex-clean is not a
-    # security sandbox (an AI code review completing is not proof the
-    # code is safe to execute). Route fork PRs to a hosted runner instead
-    # of skipping the job entirely -- skipping would drop test/clippy/
-    # msrv/deny/audit coverage for every external contributor's PR while
-    # `ci`'s own fan-in treats that skip as a pass, letting Mergify queue
-    # a fork PR with zero coverage. Non-fork events still get rigel.
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && fromJson('"ubuntu-latest"') || fromJson('["self-hosted","linux","rigel"]') }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -114,16 +94,7 @@ jobs:
     name: Clippy
     needs: [codex-clean]
     if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
-    # A fork PR must never reach the persistent self-hosted rigel pool --
-    # this repo is public, so any pull_request can come from a fork with
-    # attacker-controlled build.rs/test code, and codex-clean is not a
-    # security sandbox (an AI code review completing is not proof the
-    # code is safe to execute). Route fork PRs to a hosted runner instead
-    # of skipping the job entirely -- skipping would drop test/clippy/
-    # msrv/deny/audit coverage for every external contributor's PR while
-    # `ci`'s own fan-in treats that skip as a pass, letting Mergify queue
-    # a fork PR with zero coverage. Non-fork events still get rigel.
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && fromJson('"ubuntu-latest"') || fromJson('["self-hosted","linux","rigel"]') }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -148,16 +119,7 @@ jobs:
     name: MSRV Check
     needs: [codex-clean]
     if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
-    # A fork PR must never reach the persistent self-hosted rigel pool --
-    # this repo is public, so any pull_request can come from a fork with
-    # attacker-controlled build.rs/test code, and codex-clean is not a
-    # security sandbox (an AI code review completing is not proof the
-    # code is safe to execute). Route fork PRs to a hosted runner instead
-    # of skipping the job entirely -- skipping would drop test/clippy/
-    # msrv/deny/audit coverage for every external contributor's PR while
-    # `ci`'s own fan-in treats that skip as a pass, letting Mergify queue
-    # a fork PR with zero coverage. Non-fork events still get rigel.
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && fromJson('"ubuntu-latest"') || fromJson('["self-hosted","linux","rigel"]') }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 1.85.0
@@ -186,12 +148,13 @@ jobs:
         run: cargo test -p coppa-audio --lib --features cpal-backend
 
   # codex-clean gate: defers test-full/bench-fuzz/clippy/msrv/deny/audit
-  # (also moved to the self-hosted rigel pool) until wait-for-codex.yml
-  # signals this exact revision's Codex round raised nothing new. The
-  # 95-minute timeout budget is derived from THIS repo's own wait-for-codex
-  # job timeout (75min, see wait-for-codex.yml) -- not copied from another
-  # repo; it must exceed that bound with margin so a legitimately-still-
-  # working Codex round never times out here first.
+  # until wait-for-codex.yml signals this exact revision's Codex round
+  # raised nothing new -- avoids burning CI wall-clock time on premature
+  # runs while a review is still in flight. The 95-minute timeout budget
+  # is derived from THIS repo's own wait-for-codex job timeout (75min,
+  # see wait-for-codex.yml) -- not copied from another repo; it must
+  # exceed that bound with margin so a legitimately-still-working Codex
+  # round never times out here first.
   codex-clean:
     name: Codex review clean (gate before expensive downstream jobs)
     runs-on: ubuntu-latest
@@ -275,74 +238,11 @@ jobs:
           echo "::error::$target never appeared within the gate's timeout budget -- this revision's Codex round either hasn't converged or the label failed to apply. See wait-for-codex.yml's own run for this SHA."
           exit 1
 
-  # New job (coppa had no prior queue-stall watchdog of any kind). Watches
-  # whether ANY of the six codex-clean-gated jobs below is still queued
-  # (never assigned a runner) 20 minutes after codex-clean opened the gate --
-  # GitHub Actions has no built-in timeout for a job stuck in `queued`
-  # (timeout-minutes only starts once a runner picks it up), so a
-  # rigel pool outage/saturation would otherwise block this PR
-  # indefinitely with no clear diagnostic. Never runs on rigel itself
-  # -- it must not compete for the pool it's watching.
-  rigel-jobs-queue-watchdog:
-    needs: [codex-clean]
-    # Must tolerate `skipped` the same as the six jobs it watches: for a
-    # Dependabot PR or a non-pull_request event, codex-clean legitimately
-    # skips and those jobs still proceed via their own skip-tolerant
-    # `if:` -- watching only `success` would leave exactly those pushes
-    # with no queue-stall diagnostic, the one case this job exists for.
-    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    permissions:
-      actions: read
-    steps:
-      - name: Fail fast if any gated job never leaves the queue
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # Retry-on-transient-failure: a rate-limit/transient API failure
-          # here must not abort the whole watchdog under bash -e's default
-          # behavior before it ever checks status.
-          check_statuses() {
-            local attempt out
-            for attempt in 1 2 3; do
-              if out="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --jq '[.jobs[] | select(.name=="Full test suite" or .name=="Bench & Fuzz Compilation" or .name=="Clippy" or .name=="MSRV Check" or .name=="Supply-chain check (cargo-deny)" or .name=="Security Audit") | {name, status}]' 2>&1)"; then
-                printf '%s' "$out"
-                return 0
-              fi
-              sleep 2
-            done
-            echo "::warning::transient gh api failure fetching job statuses (3 attempts) -- treating this poll as inconclusive" >&2
-          }
-          deadline=1200
-          while [ "$SECONDS" -lt "$deadline" ]; do
-            statuses="$(check_statuses)"
-            still_queued="$(echo "$statuses" | jq '[.[] | select(.status == "queued")] | length' 2>/dev/null || echo "0")"
-            if [ "$still_queued" -eq 0 ]; then
-              echo "All six gated jobs have left the queue (running, completed, or correctly skipped) -- watchdog stands down."
-              exit 0
-            fi
-            sleep 20
-          done
-          statuses="$(check_statuses)"
-          still_queued_names="$(echo "$statuses" | jq -r '[.[] | select(.status == "queued") | .name] | join(", ")' 2>/dev/null || echo "unknown")"
-          echo "::error::Still queued after 20 minutes with no runner assigned: $still_queued_names -- rigel pool likely saturated or down."
-          exit 1
-
   deny:
     name: Supply-chain check (cargo-deny)
     needs: [codex-clean]
     if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
-    # A fork PR must never reach the persistent self-hosted rigel pool --
-    # this repo is public, so any pull_request can come from a fork with
-    # attacker-controlled build.rs/test code, and codex-clean is not a
-    # security sandbox (an AI code review completing is not proof the
-    # code is safe to execute). Route fork PRs to a hosted runner instead
-    # of skipping the job entirely -- skipping would drop test/clippy/
-    # msrv/deny/audit coverage for every external contributor's PR while
-    # `ci`'s own fan-in treats that skip as a pass, letting Mergify queue
-    # a fork PR with zero coverage. Non-fork events still get rigel.
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && fromJson('"ubuntu-latest"') || fromJson('["self-hosted","linux","rigel"]') }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
@@ -351,16 +251,7 @@ jobs:
     name: Security Audit
     needs: [codex-clean]
     if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
-    # A fork PR must never reach the persistent self-hosted rigel pool --
-    # this repo is public, so any pull_request can come from a fork with
-    # attacker-controlled build.rs/test code, and codex-clean is not a
-    # security sandbox (an AI code review completing is not proof the
-    # code is safe to execute). Route fork PRs to a hosted runner instead
-    # of skipping the job entirely -- skipping would drop test/clippy/
-    # msrv/deny/audit coverage for every external contributor's PR while
-    # `ci`'s own fan-in treats that skip as a pass, letting Mergify queue
-    # a fork PR with zero coverage. Non-fork events still get rigel.
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && fromJson('"ubuntu-latest"') || fromJson('["self-hosted","linux","rigel"]') }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
