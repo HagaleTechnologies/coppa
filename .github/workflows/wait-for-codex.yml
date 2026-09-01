@@ -33,13 +33,6 @@ permissions:
   # label-add call is written fail-open (`|| true`), so a read-only grant
   # would make the whole codex-clean signal silently never fire.
   issues: write
-  # write: wait-for-codex-queue-watchdog cancels its own run via the
-  # Actions API. A job's own permissions: block can only be a SUBSET of
-  # what's granted here, never wider -- omitting this scope at the
-  # top level makes GitHub reject the entire workflow file at parse
-  # time (zero jobs created, no per-job error) the moment that job's
-  # own `actions: write` request has no top-level grant to narrow from.
-  actions: write
 
 # A newer push must supersede an older run outright rather than let the old
 # run finish and mutate review threads based on a stale head -- cancelling
@@ -57,83 +50,19 @@ concurrency:
   cancel-in-progress: ${{ github.run_attempt == 1 }}
 
 jobs:
-  # Separate ubuntu-latest job (never the self-hosted pool it's watching --
-  # this watchdog exists specifically to detect pool saturation/outage).
-  # No `needs:`. Two phases: does the main job get a runner at all (it can
-  # queue even briefly under normal load), and if it's still queued 15+
-  # minutes with no runner picking it up, cancel the whole run so the
-  # required check fails fast with a clear reason instead of blocking the
-  # PR indefinitely.
-  wait-for-codex-queue-watchdog:
-    if: github.event_name == 'merge_group' || (github.event.pull_request.draft == false && github.actor != 'dependabot[bot]')
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      actions: write
-    steps:
-      - name: Cancel the run if wait-for-codex never starts
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # Retry-on-transient-failure, not a bare unguarded call: a
-          # rate-limit or transient API failure here must not abort the
-          # whole watchdog before it ever reaches the cancellation check.
-          check_status() {
-            local attempt out
-            for attempt in 1 2 3; do
-              if out="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --jq '.jobs[] | select(.name=="Wait for Codex Review") | .status' 2>&1)"; then
-                printf '%s' "$out"
-                return 0
-              fi
-              sleep 2
-            done
-            echo "::warning::transient gh api failure fetching job status (3 attempts) -- treating this poll as inconclusive" >&2
-          }
-          deadline=900
-          while [ "$SECONDS" -lt "$deadline" ]; do
-            status="$(check_status)"
-            case "$status" in
-              in_progress|completed) echo "Wait for Codex Review is $status -- watchdog stands down"; exit 0 ;;
-            esac
-            sleep 20
-          done
-          status="$(check_status)"
-          case "$status" in
-            in_progress|completed) echo "Wait for Codex Review is $status -- watchdog stands down"; exit 0 ;;
-          esac
-          echo "::error::Wait for Codex Review has been queued for 15+ minutes with no runner picking it up (pool down or saturated) -- cancelling this run so the required check fails fast with a clear reason instead of blocking the PR indefinitely."
-          for attempt in 1 2 3; do
-            gh api -X POST "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/cancel" && exit 1
-            sleep 2
-          done
-          echo "::error::cancel request itself failed after 3 attempts -- Wait for Codex Review may still be left queued with no bound." >&2
-          exit 1
-
   # ONE job with event-gated steps, not two same-named jobs: two check-runs
   # sharing this exact check name would rely on undocumented same-name
   # multi-run matching semantics for a REQUIRED check.
   wait-for-codex:
     name: Wait for Codex Review
     if: github.event_name == 'merge_group' || (github.event.pull_request.draft == false && github.actor != 'dependabot[bot]')
-    runs-on: [self-hosted, linux, rigel-light]
+    runs-on: ubuntu-latest
     timeout-minutes: 75
     permissions:
       contents: read
       pull-requests: write
       issues: write
     steps:
-      # runs-on above is a shared self-hosted pool -- GitHub does NOT clean
-      # /tmp between jobs on a self-hosted runner the way it does on a
-      # fresh hosted VM, so an `opened`-event run for PR A landing on a
-      # runner that most recently ran a `synchronize` job for a DIFFERENT
-      # PR B could otherwise read PR B's leftover /tmp state as if it were
-      # its own -- e.g. a stale /tmp/codex-review-comment-id.json letting
-      # an unrelated reaction satisfy this run's poll with no real review
-      # of THIS PR's head ever having happened. Unconditional and first,
-      # so every code path below starts from a clean slate.
-      - name: Clear stale /tmp state from a prior job on this runner
-        run: rm -f /tmp/codex-review-comment-id.json /tmp/codex-baseline-threads.json /tmp/codex-baseline-initiated.json /tmp/codex-run-started.txt
-
       - name: Pass through for merge-queue evaluation
         if: github.event_name == 'merge_group'
         run: |
