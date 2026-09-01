@@ -49,13 +49,13 @@ jobs:
     name: Full test suite
     needs: [codex-clean]
     # codex-clean can legitimately report `skipped` (a draft PR,
-    # dependabot[bot] PR, or non-pull_request event -- credenza's
-    # codex-clean-gate.yml's own eligibility `if:`), which is a DIFFERENT
-    # case from "ran and found the round not clean yet" (that produces
-    # `failure`, never `skipped`). Both `success` and `skipped` mean
-    # "proceed" -- only `failure`/`cancelled` mean "stop." Built in from
-    # round 1, not as a same-day emergency follow-up (see cqdx#400 /
-    # reference_codex_clean_gate_skip_vs_success_semantics.md).
+    # dependabot[bot] PR, or non-pull_request event -- see the
+    # codex-clean job's own eligibility `if:` above), which is a
+    # DIFFERENT case from "ran and found the round not clean yet" (that
+    # produces `failure`, never `skipped`). Both `success` and `skipped`
+    # mean "proceed" -- only `failure`/`cancelled` mean "stop." Getting
+    # this wrong would fail every draft/dependabot PR outright, since
+    # codex-clean never reports bare `success` for them.
     if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
     runs-on: [self-hosted, linux, rigel]
     steps:
@@ -140,24 +140,94 @@ jobs:
         run: cargo test -p coppa-audio --lib --features cpal-backend
 
   # codex-clean gate: defers test-full/bench-fuzz/clippy/msrv/deny/audit
-  # (Task 2 also moves all six to the self-hosted rigel pool) until wait-for-codex.yml (Task 1,
-  # now a caller stub around credenza's reusable wait-for-codex-review.yml)
-  # signals this exact revision's Codex round raised nothing new.
-  # gate_timeout_minutes: 95 is derived from THIS repo's own wait-for-codex
+  # (also moved to the self-hosted rigel pool) until wait-for-codex.yml
+  # signals this exact revision's Codex round raised nothing new. The
+  # 95-minute timeout budget is derived from THIS repo's own wait-for-codex
   # job timeout (75min, see wait-for-codex.yml) -- not copied from another
-  # repo. producer_workflow_path points at THIS repo's own wait-for-codex.yml
-  # (Task 1's stub), which credenza's bootstrap check reads at the base
-  # branch's SHA to distinguish "not bootstrapped yet" (a clean 404) from
-  # "genuinely not clean yet" (the file exists, poll normally).
+  # repo; it must exceed that bound with margin so a legitimately-still-
+  # working Codex round never times out here first.
   codex-clean:
-    uses: HagaleTechnologies/credenza/.github/workflows/codex-clean-gate.yml@3ee4adf4944a5c5645a3c5ce248fd4e77a6f10da
+    name: Codex review clean (gate before expensive downstream jobs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
     permissions:
       contents: read
       pull-requests: read
-    with:
-      exclude_dependabot: true
-      gate_timeout_minutes: 95
-      producer_workflow_path: .github/workflows/wait-for-codex.yml
+    # exclude_dependabot + draft-PR skip, mirroring wait-for-codex.yml's own
+    # eligibility check -- belt-and-suspenders against that producer-side
+    # skip logic ever drifting from this consumer-side one.
+    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false
+    steps:
+      - name: "Bootstrap check: does the base branch have wait-for-codex.yml's label mechanism yet?"
+        id: bootstrap-check
+        if: github.event.action == 'synchronize'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # wait-for-codex.yml is pull_request_target, which ALWAYS
+          # executes the BASE branch's copy, never the PR's own -- so the
+          # PR that first wires this mechanism up can never produce a
+          # label for its own pushes until it merges. Pinned to base.sha
+          # (the event-fixed commit), not base.ref (a moving branch tip).
+          #
+          # A clean HTTP 404 (the file genuinely doesn't exist at this
+          # SHA -- this IS the bootstrap PR) is the ONLY fetch-side
+          # outcome allowed to pass through; every OTHER fetch failure
+          # (transient network error, 403, 5xx) fails the gate closed
+          # rather than silently treating a real API problem as "not
+          # live yet, skip."
+          err_file="$(mktemp)"
+          if gh api "repos/$REPO/contents/.github/workflows/wait-for-codex.yml?ref=$BASE_SHA" --jq '.sha' >/dev/null 2>"$err_file"; then
+            echo "bootstrap_status=ready" >> "$GITHUB_OUTPUT"
+          else
+            err="$(cat "$err_file")"
+            if echo "$err" | grep -qiE "HTTP 404|not found"; then
+              echo "::warning::Base branch has no wait-for-codex.yml at $BASE_SHA (clean 404) -- this is the bootstrap PR itself. Passing through unconditionally."
+              echo "bootstrap_status=absent" >> "$GITHUB_OUTPUT"
+            else
+              echo "bootstrap_status=fetch-failed" >> "$GITHUB_OUTPUT"
+              echo "::error::Could not determine whether base branch has wait-for-codex.yml (non-404 failure fetching $BASE_SHA, failing closed): $err"
+              exit 1
+            fi
+          fi
+
+      - name: Pass through -- not a synchronize event, or bootstrap not yet live on the base branch
+        if: github.event.action != 'synchronize' || steps.bootstrap-check.outputs.bootstrap_status == 'absent'
+        run: echo "Passing through (event action=${{ github.event.action }}, bootstrap_status=${{ steps.bootstrap-check.outputs.bootstrap_status }}) -- no prior round to converge on, or this is the bootstrap PR itself."
+
+      - name: Poll for the codex-clean label on this exact revision
+        if: github.event.action == 'synchronize' && steps.bootstrap-check.outputs.bootstrap_status == 'ready'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          target="codex-clean:${HEAD_SHA:0:12}"
+          # In-script deadline runs a fixed 7-minute margin under this
+          # job's own 95-minute timeout-minutes, leaving slack for the
+          # loop to notice and error out cleanly before GitHub kills the
+          # job outright.
+          END=$((SECONDS + 95 * 60 - 420))
+          while [ $SECONDS -lt $END ]; do
+            # per_page=100: labels accumulate one per round with no
+            # cleanup (deleting a stale label is itself a race that can
+            # delete a newer revision's already-valid one), so a long
+            # review loop can push the current label past the REST
+            # default page size of 30.
+            if labels=$(gh api "repos/$REPO/issues/$PR/labels?per_page=100" --jq '[.[].name]' 2>/dev/null); then
+              if echo "$labels" | jq -e --arg l "$target" 'index($l) != null' >/dev/null 2>&1; then
+                echo "Found $target -- this round raised nothing new, safe to run the jobs gated behind this one."
+                exit 0
+              fi
+            fi
+            echo "Still waiting for $target..."
+            sleep 20
+          done
+          echo "::error::$target never appeared within the gate's timeout budget -- this revision's Codex round either hasn't converged or the label failed to apply. See wait-for-codex.yml's own run for this SHA."
+          exit 1
 
   # New job (coppa had no prior queue-stall watchdog of any kind). Watches
   # whether ANY of the six codex-clean-gated jobs below is still queued
@@ -205,7 +275,7 @@ jobs:
           done
           statuses="$(check_statuses)"
           still_queued_names="$(echo "$statuses" | jq -r '[.[] | select(.status == "queued") | .name] | join(", ")' 2>/dev/null || echo "unknown")"
-          echo "::error::Still queued after 20 minutes with no runner assigned: $still_queued_names -- rigel pool likely saturated or down. See reference_rigel_ci_resource_contention_timeout.md for the diagnostic pattern (ssh rigel \"uptime; ...\")."
+          echo "::error::Still queued after 20 minutes with no runner assigned: $still_queued_names -- rigel pool likely saturated or down."
           exit 1
 
   deny:
