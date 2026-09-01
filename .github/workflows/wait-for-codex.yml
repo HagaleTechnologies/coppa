@@ -122,6 +122,18 @@ jobs:
       pull-requests: write
       issues: write
     steps:
+      # runs-on above is a shared self-hosted pool -- GitHub does NOT clean
+      # /tmp between jobs on a self-hosted runner the way it does on a
+      # fresh hosted VM, so an `opened`-event run for PR A landing on a
+      # runner that most recently ran a `synchronize` job for a DIFFERENT
+      # PR B could otherwise read PR B's leftover /tmp state as if it were
+      # its own -- e.g. a stale /tmp/codex-review-comment-id.json letting
+      # an unrelated reaction satisfy this run's poll with no real review
+      # of THIS PR's head ever having happened. Unconditional and first,
+      # so every code path below starts from a clean slate.
+      - name: Clear stale /tmp state from a prior job on this runner
+        run: rm -f /tmp/codex-review-comment-id.json /tmp/codex-baseline-threads.json /tmp/codex-baseline-initiated.json /tmp/codex-run-started.txt
+
       - name: Pass through for merge-queue evaluation
         if: github.event_name == 'merge_group'
         run: |
