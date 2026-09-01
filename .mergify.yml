@@ -1,0 +1,36 @@
+# Coppa's own ruleset (gh api repos/HagaleTechnologies/coppa/rulesets/18627140)
+# requires only "CI" and "Wait for Codex Review" -- NOT "Supply Chain".
+# Mergify's rule-action only re-fires when a condition transitions from
+# unmatched to matched, so a static condition list (base=main, -draft,
+# -closed alone) that's already true the instant a PR opens fires once,
+# immediately, and never gets a second chance once checks later go green.
+# check-success/#review-threads-unresolved conditions give the rule
+# something stateful to re-trigger on. The check-skipped OR-clause is
+# needed because wait-for-codex.yml excludes dependabot[bot] pushes, so
+# "Wait for Codex Review" reports `skipped`, not `success`, for those PRs
+# -- without it, Dependabot PRs would never auto-queue. The needs-review
+# label exclusion matters because dependabot-auto-merge.yml labels major-
+# version dependency bumps "needs-review" and deliberately never enables
+# auto-merge for them -- a queue tool with no concept of that label would
+# silently defeat that policy.
+queue_rules:
+  - name: default
+    merge_method: squash
+    batch_size: 1
+    update_method: rebase
+
+pull_request_rules:
+  - name: queue on green + threads resolved
+    conditions:
+      - base = main
+      - -draft
+      - -closed
+      - -label = needs-review
+      - "#review-threads-unresolved = 0"
+      - check-success = CI
+      - or:
+          - check-success = Wait for Codex Review
+          - check-skipped = Wait for Codex Review
+    actions:
+      queue:
+        name: default
