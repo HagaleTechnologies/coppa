@@ -56,17 +56,28 @@ jobs:
   test-full:
     name: Full test suite
     needs: [codex-clean]
-    # codex-clean can legitimately report `skipped` (a draft PR,
-    # dependabot[bot] PR, or non-pull_request event -- see the
-    # codex-clean job's own eligibility `if:` above), which is a
-    # DIFFERENT case from "ran and found the round not clean yet" (that
-    # produces `failure`, never `skipped`). Both `success` and `skipped`
-    # mean "proceed" -- only `failure`/`cancelled` mean "stop." Getting
-    # this wrong would fail every draft/dependabot PR outright, since
-    # codex-clean never reports bare `success` for them.
-    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    # Job-level if: is unconditional (always()), not a bare success/skipped
+    # check: GitHub Actions auto-skips a job whenever any of its `needs`
+    # jobs was itself skipped, REGARDLESS of a custom if: expression,
+    # unless that if: includes a status-check function -- without
+    # always() here, codex-clean reporting `skipped` (the draft/
+    # dependabot[bot] case this whole tolerance exists to handle) would
+    # silently skip this job too, never actually running it. The first
+    # step below then does the real success/skipped/failure decision
+    # explicitly: a genuine codex-clean FAILURE must produce a real
+    # `failure` conclusion here, not `skipped` -- Mergify's own
+    # check-skipped tolerance in .mergify.yml would otherwise treat a
+    # non-converged review as a legitimate skip and auto-merge anyway.
+    if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Fail explicitly (not silently skip) if codex-clean did not pass
+        run: |
+          result="${{ needs.codex-clean.result }}"
+          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing explicitly so Mergify's check-skipped tolerance can't mistake this for a legitimate skip."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -77,9 +88,16 @@ jobs:
   bench-fuzz:
     name: Bench & Fuzz Compilation
     needs: [codex-clean]
-    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Fail explicitly (not silently skip) if codex-clean did not pass
+        run: |
+          result="${{ needs.codex-clean.result }}"
+          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing explicitly so Mergify's check-skipped tolerance can't mistake this for a legitimate skip."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -93,9 +111,16 @@ jobs:
   clippy:
     name: Clippy
     needs: [codex-clean]
-    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Fail explicitly (not silently skip) if codex-clean did not pass
+        run: |
+          result="${{ needs.codex-clean.result }}"
+          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing explicitly so Mergify's check-skipped tolerance can't mistake this for a legitimate skip."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
@@ -118,9 +143,16 @@ jobs:
   msrv:
     name: MSRV Check
     needs: [codex-clean]
-    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Fail explicitly (not silently skip) if codex-clean did not pass
+        run: |
+          result="${{ needs.codex-clean.result }}"
+          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing explicitly so Mergify's check-skipped tolerance can't mistake this for a legitimate skip."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 1.85.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -187,9 +219,23 @@ jobs:
           # (transient network error, 403, 5xx) fails the gate closed
           # rather than silently treating a real API problem as "not
           # live yet, skip."
+          #
+          # Content, not mere existence: coppa's wait-for-codex.yml
+          # pre-dated this codex-clean gate, so it always existed at every
+          # reachable base SHA even before the label mechanism was added
+          # -- an existence-only check would have been a structural
+          # no-op, always resolving "ready" regardless of whether
+          # apply_clean_label() was actually there yet (this exact gap
+          # bit watchfinder's own migration; fixed here from round 1).
+          # Grep the raw content for the function name itself.
           err_file="$(mktemp)"
-          if gh api "repos/$REPO/contents/.github/workflows/wait-for-codex.yml?ref=$BASE_SHA" --jq '.sha' >/dev/null 2>"$err_file"; then
-            echo "bootstrap_status=ready" >> "$GITHUB_OUTPUT"
+          if content="$(gh api "repos/$REPO/contents/.github/workflows/wait-for-codex.yml?ref=$BASE_SHA" -H "Accept: application/vnd.github.raw" 2>"$err_file")"; then
+            if echo "$content" | grep -q "apply_clean_label"; then
+              echo "bootstrap_status=ready" >> "$GITHUB_OUTPUT"
+            else
+              echo "::warning::Base branch's wait-for-codex.yml at $BASE_SHA has no apply_clean_label() yet -- this is the bootstrap PR itself. Passing through unconditionally."
+              echo "bootstrap_status=absent" >> "$GITHUB_OUTPUT"
+            fi
           else
             err="$(cat "$err_file")"
             if echo "$err" | grep -qiE "HTTP 404|not found"; then
@@ -241,18 +287,32 @@ jobs:
   deny:
     name: Supply-chain check (cargo-deny)
     needs: [codex-clean]
-    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Fail explicitly (not silently skip) if codex-clean did not pass
+        run: |
+          result="${{ needs.codex-clean.result }}"
+          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing explicitly so Mergify's check-skipped tolerance can't mistake this for a legitimate skip."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
 
   audit:
     name: Security Audit
     needs: [codex-clean]
-    if: needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped'
+    if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Fail explicitly (not silently skip) if codex-clean did not pass
+        run: |
+          result="${{ needs.codex-clean.result }}"
+          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing explicitly so Mergify's check-skipped tolerance can't mistake this for a legitimate skip."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
         with:

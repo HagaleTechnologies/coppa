@@ -224,7 +224,15 @@ jobs:
           # toggle -- a bare toggle needs cross-run add/remove
           # coordination that is itself a race), 3-attempt retry with 5s
           # backoff, `gh label create` (idempotent, `|| true`) before the
-          # attach POST.
+          # attach POST. Every call site below uses `apply_clean_label ||
+          # true`, not a bare call: this whole step runs under `bash -e`
+          # (GitHub Actions' default for `run:` blocks), so a bare call to
+          # a function whose own final-failure path `return`s non-zero
+          # would abort the step under errexit -- turning this function's
+          # deliberately fail-open design (warn, don't block) into
+          # fail-closed, failing the REQUIRED "Wait for Codex Review"
+          # check red on a transient GitHub API blip during an otherwise
+          # genuinely clean round.
           apply_clean_label() {
             local label="codex-clean:${HEAD_SHA:0:12}"
             for _ in 1 2 3; do
@@ -382,7 +390,7 @@ jobs:
               echo "::error::Codex's initial review left $unresolved unresolved concern(s) open -- resolve them, then push a remediation commit to trigger a fresh re-review."
               exit 1
             fi
-            apply_clean_label
+            apply_clean_label || true
             exit 0
           fi
 
@@ -481,7 +489,7 @@ jobs:
           # round is a fresh synchronize or a rerun/reopened-rerun of the
           # same head. Apply the label now, before the IS_GENUINE_SYNC
           # gate below decides whether auto-resolving threads is safe.
-          apply_clean_label
+          apply_clean_label || true
 
           if [ "$IS_GENUINE_SYNC" != "true" ]; then
             echo "This round is a reopened/rerun, not a genuine synchronize -- the code hasn't changed, so not auto-resolving baseline threads that may still describe it (the label above still applies regardless -- this revision IS clean, just not safe to silently clear old findings against)."
