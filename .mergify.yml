@@ -13,6 +13,24 @@
 # version dependency bumps "needs-review" and deliberately never enables
 # auto-merge for them -- a queue tool with no concept of that label would
 # silently defeat that policy.
+#
+# max_parallel_checks: 1 (required -- confirmed live on PR #94, #95 and #96:
+# `@Mergifyio queue` rejected all three outright with "Configuration not
+# compatible with a branch protection setting"): this repo's classic branch
+# protection has `Require branches to be up to date before merging`
+# (`strict: true`), which Mergify refuses to pair with its default draft-PR
+# validation (a synthetic PR re-running checks against a merge-commit
+# preview) -- that mode is fundamentally incompatible with "checks must have
+# run against the exact up-to-date branch tip." max_parallel_checks: 1,
+# combined with batch_size: 1 (already set below) and no separate
+# merge_conditions (so queue admission and the final merge check are the
+# same condition set), is what makes Mergify reuse the PR's own already-green
+# checks in place instead of creating a draft PR -- see
+# docs.mergify.com/merge-queue/rules, "in-place checks." Same fix already
+# applied to manta's .mergify.yml, where it was confirmed live the same way.
+merge_queue:
+  max_parallel_checks: 1
+
 queue_rules:
   - name: default
     merge_method: squash
