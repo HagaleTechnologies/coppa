@@ -26,6 +26,12 @@ pub(crate) fn worst_case_dmax(symbol: Complex32, lmax: f32) -> f32 {
 
 /// Permitted deviation between the closed-form and enumeration demappers.
 pub(crate) fn oracle_tol(oracle: f32, dmax: f32, nv: f32) -> f32 {
+    debug_assert!(
+        nv > 0.0,
+        "oracle_tol: nv must be positive; a zero noise variance collapses the \
+         clamp to a huge tolerance that silently disables the comparison \
+         instead of failing it"
+    );
     1.5e-4 + 1.5e-4 * oracle.abs() + K * EPS * dmax / nv.max(1e-10)
 }
 
@@ -63,6 +69,10 @@ mod tests {
         assert!(tol < 0.2, "benign-region tolerance drifted loose: {tol}");
     }
 
+    /// Pins the actual replay guarantee the QAM-16/QAM-64 oracle sweep tests
+    /// document ("re-run with QAM_ORACLE_SEED=..."): the same seed must
+    /// reproduce the identical `(re, im, nv)` draw sequence those tests pull
+    /// per iteration, not merely some generic property of `StdRng`.
     #[test]
     fn sweep_seed_is_reproducible() {
         use rand::rngs::StdRng;
@@ -71,7 +81,12 @@ mod tests {
         let draw = |seed: u64| {
             let mut rng = StdRng::seed_from_u64(seed);
             (0..8)
-                .map(|_| rng.random_range(-7.0..7.0f32))
+                .map(|_| {
+                    let re: f32 = rng.random_range(-7.0..7.0);
+                    let im: f32 = rng.random_range(-7.0..7.0);
+                    let nv: f32 = rng.random_range(0.01..4.0);
+                    (re, im, nv)
+                })
                 .collect::<Vec<_>>()
         };
         assert_eq!(draw(0xC0F7), draw(0xC0F7), "same seed must replay exactly");

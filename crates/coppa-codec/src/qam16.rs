@@ -194,13 +194,21 @@ mod tests {
         }
     }
 
+    /// Largest unnormalized level magnitude in [`LEVEL`], derived from the
+    /// mapper's own table rather than duplicated as a literal so a future
+    /// constellation change can't silently desync the oracle tolerance model.
+    fn level_lmax() -> f32 {
+        LEVEL.iter().copied().fold(f32::MIN, f32::max) * NORM
+    }
+
     /// COP-7: QAM-16 has the same cancellation mechanism as QAM-64 (see
     /// `qam_oracle_tol`), just 6x more headroom because its draw range caps Dmax at
     /// ~31.18 rather than ~64. It has never failed in CI (0 in 80M comparisons), but
     /// its theoretical worst case already exceeds the pre-COP-7 flat term.
     #[test]
     fn oracle_tolerance_covers_worst_case_conditioning() {
-        let lmax = 3.0 * NORM;
+        let mapper = Qam16Mapper;
+        let lmax = level_lmax();
         let sym = Complex32::new(3.0, 3.0);
         let nv = 0.01_f32;
         let dmax = crate::qam_oracle_tol::worst_case_dmax(sym, lmax);
@@ -210,11 +218,22 @@ mod tests {
             "expected worst-case Dmax ~= 31.18, got {dmax}"
         );
 
-        let tol = crate::qam_oracle_tol::oracle_tol(0.0, dmax, nv);
-        assert!(
-            tol > 1.8 * crate::qam_oracle_tol::EPS * dmax / nv,
-            "tolerance {tol:e} does not cover the measured error bound"
-        );
+        // Measured deviation at this worst-case-conditioning input, not a
+        // restatement of the margin constant: this fails if the codebase's
+        // own demapper or tolerance model regresses, not just if K < 1.8.
+        let fast = mapper.demap_soft(sym, nv);
+        let oracle = mapper.demap_soft_bruteforce(sym, nv);
+        for (f, o) in fast.iter().zip(oracle.iter()) {
+            let dev = (f - o).abs();
+            let tol = crate::qam_oracle_tol::oracle_tol(*o, dmax, nv);
+            assert!(
+                dev <= tol,
+                "worst-case-conditioning deviation {dev:e} exceeds tolerance \
+                 {tol:e} at sym=({},{}) nv={nv}",
+                sym.re,
+                sym.im
+            );
+        }
     }
 
     /// Step 1 (Task 6): exhaustive equivalence oracle. The closed-form
@@ -248,7 +267,7 @@ mod tests {
 
             let fast = mapper.demap_soft(sym, nv);
             let oracle = mapper.demap_soft_bruteforce(sym, nv);
-            let dmax = crate::qam_oracle_tol::worst_case_dmax(sym, 3.0 * NORM);
+            let dmax = crate::qam_oracle_tol::worst_case_dmax(sym, level_lmax());
 
             assert_eq!(fast.len(), oracle.len());
             for (f, o) in fast.iter().zip(oracle.iter()) {

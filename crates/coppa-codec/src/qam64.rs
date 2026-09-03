@@ -167,6 +167,13 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
 
+    /// Largest unnormalized level magnitude in [`LEVEL`], derived from the
+    /// mapper's own table rather than duplicated as a literal so a future
+    /// constellation change can't silently desync the oracle tolerance model.
+    fn level_lmax() -> f32 {
+        LEVEL.iter().copied().fold(f32::MIN, f32::max) * NORM
+    }
+
     #[test]
     fn test_64qam_roundtrip() {
         let mapper = Qam64Mapper;
@@ -248,7 +255,7 @@ mod tests {
 
         let fast = mapper.demap_soft(sym, nv);
         let oracle = mapper.demap_soft_bruteforce(sym, nv);
-        let dmax = crate::qam_oracle_tol::worst_case_dmax(sym, 7.0 * NORM);
+        let dmax = crate::qam_oracle_tol::worst_case_dmax(sym, level_lmax());
 
         assert!(
             (dmax - 64.037_52).abs() < 1e-3,
@@ -303,7 +310,7 @@ mod tests {
 
             let fast = mapper.demap_soft(sym, nv);
             let oracle = mapper.demap_soft_bruteforce(sym, nv);
-            let dmax = crate::qam_oracle_tol::worst_case_dmax(sym, 7.0 * NORM);
+            let dmax = crate::qam_oracle_tol::worst_case_dmax(sym, level_lmax());
 
             assert_eq!(fast.len(), oracle.len());
             for (f, o) in fast.iter().zip(oracle.iter()) {
