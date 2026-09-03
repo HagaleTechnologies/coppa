@@ -1,0 +1,15 @@
+[toolchain]
+# Pinned to the exact stable release CI resolved on 2026-09-01 (GitHub
+# Actions run 33541639586: "stable-x86_64-unknown-linux-gnu ... rustc
+# 1.98.0"), per COP-9. rustup picks this up automatically for any `cargo`/
+# `rustc` invocation in this tree; CI's dtolnay/rust-toolchain steps pass
+# the same version explicitly (see .github/workflows/ci.yml) since that
+# action does not itself read this file.
+channel = "1.98.0"
+# clippy/rustfmt explicit: on a contributor machine using rustup's "minimal"
+# profile, an install with no components listed here would omit both, silently
+# breaking the `cargo clippy`/`cargo fmt` commands AGENTS.md documents as
+# required. CI's own dtolnay/rust-toolchain steps already request these via
+# `with: components:` for their own jobs -- this covers the local/contributor
+# path those steps don't. (Codex review, PR #96)
+components = ["clippy", "rustfmt"]
