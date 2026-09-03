@@ -194,26 +194,73 @@ mod tests {
         }
     }
 
+    /// Largest unnormalized level magnitude in [`LEVEL`], derived from the
+    /// mapper's own table rather than duplicated as a literal so a future
+    /// constellation change can't silently desync the oracle tolerance model.
+    fn level_lmax() -> f32 {
+        LEVEL.iter().copied().fold(f32::MIN, f32::max) * NORM
+    }
+
     /// COP-7: QAM-16 has the same cancellation mechanism as QAM-64 (see
     /// `qam_oracle_tol`), just 6x more headroom because its draw range caps Dmax at
-    /// ~31.18 rather than ~64. It has never failed in CI (0 in 80M comparisons), but
-    /// its theoretical worst case already exceeds the pre-COP-7 flat term.
+    /// ~31.18 rather than ~64.
     #[test]
     fn oracle_tolerance_covers_worst_case_conditioning() {
-        let lmax = 3.0 * NORM;
+        let lmax = level_lmax();
         let sym = Complex32::new(3.0, 3.0);
-        let nv = 0.01_f32;
         let dmax = crate::qam_oracle_tol::worst_case_dmax(sym, lmax);
 
         assert!(
             (dmax - 31.18).abs() < 0.01,
             "expected worst-case Dmax ~= 31.18, got {dmax}"
         );
+    }
 
-        let tol = crate::qam_oracle_tol::oracle_tol(0.0, dmax, nv);
+    /// COP-8 round 2 (Codex, PR #95): round 1's fixture here proved only
+    /// `dev != 0`, not that the `K * EPS * Dmax / nv` term is load-bearing
+    /// -- at that input the flat-plus-relative terms alone (`1.5e-4 +
+    /// 1.5e-4 * oracle.abs()`) already covered the measured deviation with
+    /// room to spare, so the assertion would still have passed with `K`
+    /// deleted entirely. This input was found by a targeted search
+    /// (`scratch_search_conditioning_dominant_residual`, not committed,
+    /// seed `0xC0FFEE`) maximizing `dev - (flat-plus-relative baseline)`:
+    /// one axis extreme (inflates the shared corner Dmax) while the other
+    /// sits near a PAM-4 decision boundary (keeps this bit's own oracle LLR
+    /// -- and so the relative term -- small). At bit 3 here, dev
+    /// (2.1341443e-4) genuinely exceeds the flat-plus-relative baseline
+    /// (1.8187253e-4) by 3.1541902e-5, so this assertion fails if the
+    /// conditioning term is removed or shrunk materially below its current
+    /// margin.
+    #[test]
+    fn oracle_tolerance_covers_a_conditioning_dominant_residual() {
+        let mapper = Qam16Mapper;
+        let re = 3.034_350_4_f32;
+        let im = 0.632_098_2_f32;
+        let nv = 0.002_129_664_4_f32;
+        let sym = Complex32::new(re, im);
+        let dmax = crate::qam_oracle_tol::worst_case_dmax(sym, level_lmax());
+
+        let fast = mapper.demap_soft(sym, nv);
+        let oracle = mapper.demap_soft_bruteforce(sym, nv);
+        let mut max_margin_over_baseline = f32::MIN;
+        for (f, o) in fast.iter().zip(oracle.iter()) {
+            let dev = (f - o).abs();
+            let baseline = 1.5e-4 + 1.5e-4 * o.abs();
+            max_margin_over_baseline = max_margin_over_baseline.max(dev - baseline);
+            let tol = crate::qam_oracle_tol::oracle_tol(*o, dmax, nv);
+            assert!(
+                dev <= tol,
+                "measured deviation {dev:e} exceeds tolerance {tol:e} at \
+                 sym=({re},{im}) nv={nv}"
+            );
+        }
         assert!(
-            tol > 1.8 * crate::qam_oracle_tol::EPS * dmax / nv,
-            "tolerance {tol:e} does not cover the measured error bound"
+            max_margin_over_baseline > 0.0,
+            "expected at least one bit's measured deviation to exceed the \
+             flat-plus-relative baseline (proving the K*EPS*Dmax/nv term is \
+             load-bearing, not merely that dev != 0); if this now reads <= 0, \
+             the demapper implementation changed and this fixture needs \
+             replacing with a fresh conditioning-dominant input"
         );
     }
 
@@ -248,7 +295,7 @@ mod tests {
 
             let fast = mapper.demap_soft(sym, nv);
             let oracle = mapper.demap_soft_bruteforce(sym, nv);
-            let dmax = crate::qam_oracle_tol::worst_case_dmax(sym, 3.0 * NORM);
+            let dmax = crate::qam_oracle_tol::worst_case_dmax(sym, level_lmax());
 
             assert_eq!(fast.len(), oracle.len());
             for (f, o) in fast.iter().zip(oracle.iter()) {
