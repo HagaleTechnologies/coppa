@@ -203,37 +203,59 @@ mod tests {
 
     /// COP-7: QAM-16 has the same cancellation mechanism as QAM-64 (see
     /// `qam_oracle_tol`), just 6x more headroom because its draw range caps Dmax at
-    /// ~31.18 rather than ~64. It has never failed in CI (0 in 80M comparisons), but
-    /// its theoretical worst case already exceeds the pre-COP-7 flat term.
+    /// ~31.18 rather than ~64.
     #[test]
     fn oracle_tolerance_covers_worst_case_conditioning() {
-        let mapper = Qam16Mapper;
         let lmax = level_lmax();
         let sym = Complex32::new(3.0, 3.0);
-        let nv = 0.01_f32;
         let dmax = crate::qam_oracle_tol::worst_case_dmax(sym, lmax);
 
         assert!(
             (dmax - 31.18).abs() < 0.01,
             "expected worst-case Dmax ~= 31.18, got {dmax}"
         );
+    }
 
-        // Measured deviation at this worst-case-conditioning input, not a
-        // restatement of the margin constant: this fails if the codebase's
-        // own demapper or tolerance model regresses, not just if K < 1.8.
+    /// COP-8 round 1: the symmetric corner `(3.0, 3.0)` above turns out to
+    /// produce bit-identical closed-form/oracle LLRs (Codex-confirmed on
+    /// PR #95) -- both paths round identically for that input, so a
+    /// deviation check pinned there is vacuous and would pass even with the
+    /// `K * EPS * Dmax / nv` term deleted entirely. This uses a concrete
+    /// input found by a targeted search near the same worst-case-
+    /// conditioning corner (re/im in `2.0..3.5`, nv in `0.005..0.05`,
+    /// scratch search not committed, seed `0xC0FFEE`) that DOES exhibit
+    /// nonzero f32 cancellation residual, so the coverage assertion below
+    /// genuinely depends on the codebase's own tolerance model rather than
+    /// restating a margin constant.
+    #[test]
+    fn oracle_tolerance_covers_a_measured_worst_case_residual() {
+        let mapper = Qam16Mapper;
+        let re = 3.166_981_7_f32;
+        let im = 3.493_435_1_f32;
+        let nv = 0.005_015_685_f32;
+        let sym = Complex32::new(re, im);
+        let dmax = crate::qam_oracle_tol::worst_case_dmax(sym, level_lmax());
+
         let fast = mapper.demap_soft(sym, nv);
         let oracle = mapper.demap_soft_bruteforce(sym, nv);
+        let mut max_dev = 0.0f32;
         for (f, o) in fast.iter().zip(oracle.iter()) {
             let dev = (f - o).abs();
+            max_dev = max_dev.max(dev);
             let tol = crate::qam_oracle_tol::oracle_tol(*o, dmax, nv);
             assert!(
                 dev <= tol,
-                "worst-case-conditioning deviation {dev:e} exceeds tolerance \
-                 {tol:e} at sym=({},{}) nv={nv}",
-                sym.re,
-                sym.im
+                "measured deviation {dev:e} exceeds tolerance {tol:e} at \
+                 sym=({re},{im}) nv={nv}"
             );
         }
+        assert!(
+            max_dev > 0.0,
+            "expected this fixture to exercise real f32 cancellation \
+             (nonzero deviation); if it now reads zero, the demapper \
+             implementation changed and this fixture needs replacing with a \
+             fresh nonzero-residual input"
+        );
     }
 
     /// Step 1 (Task 6): exhaustive equivalence oracle. The closed-form
