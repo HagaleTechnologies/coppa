@@ -6,3 +6,10 @@
 # the same version explicitly (see .github/workflows/ci.yml) since that
 # action does not itself read this file.
 channel = "1.98.0"
+# clippy/rustfmt explicit: on a contributor machine using rustup's "minimal"
+# profile, an install with no components listed here would omit both, silently
+# breaking the `cargo clippy`/`cargo fmt` commands AGENTS.md documents as
+# required. CI's own dtolnay/rust-toolchain steps already request these via
+# `with: components:` for their own jobs -- this covers the local/contributor
+# path those steps don't. (Codex review, PR #96)
+components = ["clippy", "rustfmt"]
