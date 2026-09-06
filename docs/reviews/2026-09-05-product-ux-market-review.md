@@ -159,6 +159,7 @@ across the eight reports (they total roughly 380 raw items).
 | H-022 | P1 | FFI tutorial calls `coppa_engine_destroy(engine)` against a `T**` signature (UB/segfault for anyone who follows it); no `#include`, no link line. | S | C#38 |
 | H-023 | P1 | No config validation: `deny_unknown_fields` absent (typos in sections/keys accepted), unknown profile silently defaults yet logs the bogus name as valid, `buffer_size = 0` accepted (WARN storm), `sample_rate` is a knob on a fixed-48 kHz engine, example file documents a nonexistent `[session]` block. | S | B#7, B#8, B#28–30, F#17 |
 | H-024 | P1 | Callsign optional and only WARNed; invalid callsign still allows TX. Require a valid callsign to enable any TX path (Part 97). Same in the CLI: `--callsign` is accepted, unvalidated, and unused. | S | B#31, A#5, A#39 |
+| H-025 | P1 | **Connected-session data has no selective-repeat retransmission.** The established-session TX branch sends a `MacPdu` directly via `encode_bytes`/`transmit_samples`, returning before reaching `ArqTx::send`; `handle_session_data` (RX) forwards the payload straight to `DataOut` without going through `ArqRx`. `ArqTx`/`ArqRx` exist and are real for the unconnected/raw data-port path and for CP-negotiation control PDUs -- only the connected-session data path bypasses them. Fixing H-004--H-009 (VARA line discipline, `CONNECTED`/`BUFFER`) still leaves a connected Pat/Winlink-style session with an unreliable link on any dropped frame; wire connected-session data through `ArqTx`/`ArqRx` before claiming session support. | M | new finding, verified against `event_loop.rs:830-848,2683-2694`; D#ADR-008-row |
 
 ### 3.2 VARA-style TCP compatibility (beyond the blockers)
 
@@ -299,7 +300,7 @@ across the eight reports (they total roughly 380 raw items).
 |---|---|---|---|---|
 | H-150 | P0 | Gate `vhf_wide` (350–5900 Hz) off below 29.7 MHz in the daemon, not by convention: 47 CFR 97.307(f)(3) caps HF data at 2.8 kHz since 2024-01-08. Same fix as H-002. | S | E#13 |
 | H-151 | P2 | Document band-plan compliance per profile: FCC 2.8 kHz OK; IARU Region 1 digimode segments are 2700 Hz so `hf_wide` (2800 Hz) is non-R1; Canada allows 6 kHz on HF. Compression is fine because the SPEC publicly documents it (§97.309(a)(4)); ship a Message-Viewer-style offline decoder (`coppa rx --decompress --dump`) to close the loop. | S | E#14, E#16 |
-| H-152 | P2 | Station ID: an idle connected session never IDs; a disconnect frame should carry ID; CWID option (H-038). | S | F#34 |
+| H-152 | P2 | Station ID: a completely silent session (never transmits) never IDs -- but this is by design, not a bug, since `transmit_samples` (the single TX chokepoint) already prepends the ID/beacon whenever `id_due()` is true, so any real transmission including a DISCONNECT frame already carries ID if the interval has elapsed. Remaining work: a CWID option (H-038). | S | F#34 |
 
 ## 4. Sequenced roadmap
 
@@ -313,7 +314,7 @@ After this a visitor reads an accurate README, follows a tutorial that works,
 and CI is green.
 
 **Phase 1 — Make it work (two to three weeks).** H-001, H-002/H-150,
-H-003, H-004–H-009, H-014, H-015, H-018–H-024, H-070, H-090 (cable test),
+H-003, H-004–H-009, H-014, H-015, H-018–H-025, H-070, H-090 (cable test),
 H-035 (Pat for real), H-050–H-054, H-056, H-130, H-131. Cut `v0.1.0` with
 binaries at the end. After this a Pat user on a Raspberry Pi can install a
 binary, point Pat at 8300, and complete a session over an audio cable, and
