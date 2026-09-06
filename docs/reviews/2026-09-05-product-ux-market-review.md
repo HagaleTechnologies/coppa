@@ -306,7 +306,7 @@ across the eight reports (they total roughly 380 raw items).
 |---|---|---|---|---|
 | H-150 | P0 | Gate `vhf_wide` (350–5900 Hz) off below 29.7 MHz in the daemon, not by convention: 47 CFR 97.307(f)(3) caps HF data at 2.8 kHz since 2024-01-08. H-002 alone does not satisfy this -- it fixes the *configured* profile to persist, but the daemon has no frequency source to gate against at all; see H-027 for the actual frequency-awareness gap this bullet depends on. | S | E#13; H-027 |
 | H-151 | P2 | Document band-plan compliance per profile: FCC 2.8 kHz occupied-bandwidth cap OK for all HF profiles including `hf_wide` (2450 Hz occupied width, under the FCC and IARU R1 2700 Hz bandwidth caps -- an earlier draft of this review wrongly flagged `hf_wide` as non-R1 by comparing its 2800 Hz upper edge against the 2700 Hz bandwidth figure); still verify `hf_wide`'s specific frequency placement against IARU R1 segment boundaries (not checked in this review); Canada allows 6 kHz on HF. Correction: `docs/SPEC.md` today has NO compression section at all (zero mentions of Huffman/LZ4/compression), so "compression is publicly documented" is not yet true -- the fixed Huffman table, transform order, and `0xFE` envelope need to be added to the normative spec before this satisfies Section 97.309(a)(4); an offline decoder (`coppa rx --decompress --dump`) is a good addition but does not substitute for public technical documentation. | S | E#14, E#16; SPEC.md has no compression section (verified) |
-| H-152 | P2 | Station ID: a completely silent session (never transmits) never IDs -- but this is by design, not a bug, since `transmit_samples` (the single TX chokepoint) already prepends the ID/beacon whenever `id_due()` is true, so any real transmission including a DISCONNECT frame already carries ID if the interval has elapsed. Remaining work: a CWID option (H-038). | S | F#34 |
+| H-152 | P1 | **Station ID has a real gap, not just a design choice.** `transmit_samples` correctly prepends the ID/beacon whenever `id_due()` is true, and a completely silent session (never transmits) correctly never IDs -- that part is by design and fine. But `last_id_time` initializes to `Instant::now()` at daemon startup and `id_due()` stays false until the full interval elapses (`event_loop.rs:180,358,1644-1658`), so ANY real transmission in the first ~9 minutes after startup -- a short raw/ARQ send, a `TUNE`, anything -- goes out with zero identification. Part 97.119 requires ID at the end of a transmission (and every 10 min during one); a transmission with no ID anywhere in it is a compliance gap for that specific transmission, not a documentation nuance. Fix: force an ID on the daemon's first transmission regardless of the interval timer (e.g. seed `last_id_time` far enough in the past, or add an explicit first-TX flag), then keep the existing periodic timer for everything after. Remaining work after that: a CWID option (H-038). | S | F#34 |
 
 ## 4. Sequenced roadmap
 
@@ -320,7 +320,7 @@ After this a visitor reads an accurate README, follows a tutorial that works,
 and CI is green.
 
 **Phase 1 — Make it work (two to three weeks).** H-001, H-002/H-150,
-H-003, H-004–H-009, H-014, H-015, H-018–H-027, H-030, H-034, H-062 (WebSocket auth), H-070, H-090 (cable test), H-104 (turnaround delay -- a real-RF correctness bug, not a Phase-2 measurement task),
+H-003, H-004–H-009, H-014, H-015, H-018–H-027, H-030, H-034, H-062 (WebSocket auth), H-070, H-090 (cable test), H-104 (turnaround delay -- a real-RF correctness bug, not a Phase-2 measurement task), H-152 (first-transmission station ID -- reclassified P1, a compliance gap),
 H-035 (Pat for real), H-050–H-054, H-056, H-130, H-131. Cut `v0.1.0` with
 binaries at the end. After this a Pat user on a Raspberry Pi can install a
 binary, point Pat at 8300, and complete a session over an audio cable, and
@@ -385,15 +385,14 @@ decide them.
 
 Raw CSVs for the fresh sweeps are under `results/review-2026-09-05/`.
 
-## 7. Deferred round-15 Codex findings (owner-review checkpoint)
+## 7. Round-15 Codex findings (fixed by owner decision after the round-15 stop)
 
-Codex's review reached 15 rounds fixing findings inline (rounds 1-14: every
-finding verified and fixed in a follow-up commit, resolving the thread). Per
-the owner's explicit round-15 stop, these two final-round findings are
-recorded here rather than pushed as a 16th round. Both are verified accurate
-and are refinements of existing items, not new severity classes; neither is
-a security vulnerability. They stay as open (unresolved) review threads on
-the PR for the owner to close by fixing, deferring, or overriding.
+Codex's review reached 15 rounds fixing findings inline; per an explicit
+round-15 stop these two were initially deferred as owner-review items, then
+fixed on request rather than left open. Both turned out to matter more than
+"refinement of an existing item" on reflection -- the H-090 fix without item 1
+would let a broken H-104 pass its own acceptance test, and H-152's gap is an
+actual over-the-air compliance defect (item 2 was reclassified P2 -> P1).
 
 1. **The H-090 cable-loop protocol's turnaround check validates the wrong
    direction.** Step (d) only sets a *maximum* latency target (`<= 250 ms`
