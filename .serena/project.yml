@@ -1,0 +1,69 @@
+# Serena project definition for coppa (COP-11).
+#
+# Committed so the catalyst-dev codebase-analyzer / codebase-locator /
+# codebase-pattern-finder subagents get real symbol search here instead of
+# silently falling back to grep. The machine-local halves (the index cache and
+# an optional project.local.yml override) are gitignored -- see
+# .serena/.gitignore. Shape guarded by tests/serena_project_config.rs.
+project_name: "coppa"
+languages:
+- rust
+encoding: "utf-8"
+ignore_all_files_in_gitignore: true
+ignored_paths:
+# Serena's own index cache.
+- ".serena/cache"
+# Catalyst / agent tooling directories. All are also in .gitignore; listed
+# explicitly so this file still reads correctly if
+# ignore_all_files_in_gitignore is ever flipped off -- the same belt-and-braces
+# the catalyst-cloud reference config uses.
+- ".catalyst"
+- ".trunk"
+- ".worktrees"
+- "thoughts"
+- "docs/superpowers"
+# Build and measurement output.
+- "target"
+- "results"
+# ~1.5 MB of frozen binary WAV decode-regression vectors. .gitignore
+# deliberately UN-ignores these (`!testdata/golden/*.wav`), so
+# ignore_all_files_in_gitignore does NOT cover them. They hold no symbols and
+# no prose. testdata/golden/manifest.toml is excluded with them; the tests that
+# read it (crates/coppa-protocol/tests/golden_vectors.rs,
+# crates/coppa-cli/tests/rx_golden.rs) are unaffected -- this list only scopes
+# Serena's index.
+- "testdata/golden"
+# `[workspace] exclude = ["fuzz"]` (Cargo.toml:18): a cargo-fuzz harness with
+# its own Cargo.toml and a libfuzzer-sys dependency that needs nightly. Pointing
+# a stable rust-analyzer at it invites backend errors for 36 KB of test
+# scaffolding. Every consuming subagent also holds Grep/Glob, so the fuzz
+# targets stay reachable by plain text search.
+- "fuzz"
+read_only: true
+initial_prompt: |
+  coppa: open-source OFDM digital modem for amateur radio, in Rust, published as
+  a reference implementation of an HF modem's DSP/FEC/protocol stack. One Cargo
+  workspace: 12 crates under crates/ (coppa-dsp, coppa-codec, coppa-protocol,
+  coppa-channel, coppa-audio, coppa-radio, coppa-ml, coppa-engine, coppa-host,
+  coppa-ffi, coppa-cli, coppa-daemon) plus crates/coppa-bench and
+  tools/gen_nr_bg2, with a root `coppa` package holding workspace-level
+  integration tests. CoppaTransceiver (coppa-protocol) is the main encode/decode
+  pipeline; CoppaCore (coppa-engine) is a thin wrapper around it.
+  Read CLAUDE.md first -- its Known Limitations section is long, current, and
+  authoritative about what is measured, unproven, or deliberately unfixed -- then
+  wiki/INDEX.md for the page map (overview, per-crate deep-dives, 8 numbered
+  ADRs, and several "what will bite you" gotcha pages). Prefer Serena's
+  get_symbols_overview / find_symbol / find_referencing_symbols over raw grep for
+  symbol-level questions; call read_memory("codebase_map") for the directory map.
+default_modes:
+added_modes:
+excluded_tools: []
+included_optional_tools: []
+fixed_tools: []
+symbol_info_budget:
+language_backend:
+line_ending:
+read_only_memory_patterns: []
+ignored_memory_patterns: []
+ls_specific_settings: {}
+additional_workspace_folders: []
