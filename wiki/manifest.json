@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-08-07T18:12:31Z",
-  "head_commit": "15b48d5",
+  "generated_at": "2026-09-06T12:17:42Z",
+  "head_commit": "3779efd",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -178,6 +178,25 @@
       "title": "What did Phase 3's system layer ship, and which targets did it miss?",
       "verified_commit": "59b0b63",
       "verified_date": "2026-07-14",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:13a7fb2e979343d94243578e036c469e63abad53334d10e485f801fcfcf9f102",
+      "id": "agent-tooling",
+      "kind": "gotcha",
+      "links": [],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/agent-tooling.md",
+      "sources": [
+        ".serena/project.yml",
+        "tests/serena_project_config.rs",
+        ".catalyst/config.json"
+      ],
+      "status": "current",
+      "title": "What will bite you about this repo's agent tooling (Serena and humanlayer thoughts)?",
+      "verified_commit": "7d1590d",
+      "verified_date": "2026-09-06",
       "visibility": "public"
     },
     {
