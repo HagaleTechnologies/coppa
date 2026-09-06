@@ -14,7 +14,7 @@ Reviewer scope: read-only pass over `/Users/thagale/Code/coppa` @ `1c2ffc5` (mai
 - **`coppad.toml.example`** is well-commented and explains regulatory intent (FCC 97.119 ID timer), busy-defer semantics, and the PTT hard-error policy.
 - **`docs/OPERATING.md`** TUNE procedure is exactly what a ham needs, written in ham vocabulary (ALC, two-tone, splatter).
 - **`wiki/`** pages have a good question-titled format ("What will bite you about…"), sources and verified-commit frontmatter.
-- **CLI help** for `coppa` is clean, clap-generated, with sensible defaults (`--ptt rigctld`, `--rigctld 127.0.0.1:4532`, lead/tail ms).
+- **CLI help** for `coppa` is clean, clap-generated, with sensible defaults (`--ptt` defaults to `none`, `--rigctld` defaults to `127.0.0.1:4532` for when `rigctld` is selected, lead/tail ms).
 - `examples/ofdm_roundtrip.rs` is a well-commented, honest demo (two speed levels through AWGN). `coppa-ffi` has a 66-line crate doc and a shipped `coppa.h`.
 - MSRV declared, pinned toolchain with a rationale comment, dependabot, cross-platform CI matrix, 1,137 test functions, 0 markdown-relative-link breakage across all `.md` files (checked).
 
