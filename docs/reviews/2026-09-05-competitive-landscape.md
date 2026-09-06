@@ -237,8 +237,8 @@ Legend: coppa cells cite `[repo:file]`; "?" = no evidence found; "n/a" = not app
    costs < USD 200 and is what the Winlink team used).
 2. Two contradictory AWGN tables in BENCHMARKS.md (0 dB vs 12 dB FER≤10% for BPSK) because the SNR reference
    bandwidth changed mid-project; only the 3 kHz-referenced numbers are comparable to VARA/Mercury/MIL-STD.
-3. No bytes/minute-under-ARQ number, which is the unit every ham comparison uses (IONOS, Mercury both report it).
-4. README status table is stale (says OFDM "Partial", QPSK+ "not wired", 9 speed levels vs SPEC's 10) — a
+3. No IONOS-comparable bytes/minute-under-ARQ sweep at fixed SNR points across WGN/MPG/MPP. A simulated session-bench bytes/min number does exist (dimension-F report; BENCHMARKS.md), but it is not run at the IONOS study's fixed-SNR grid, so it cannot be plotted directly against the VARA/ARDOP/PACTOR curves in this table.
+4. README status table is stale (says OFDM "Partial", QPSK+ "not wired") — a
    competitor reading it would conclude coppa is a BPSK toy.
 
 ---

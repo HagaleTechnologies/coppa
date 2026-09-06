@@ -94,7 +94,7 @@ Also: `coppad --help` starts the daemon with default config instead of printing 
 
 **MVP:** `crates/coppa-wasm` (wasm-bindgen, `encode(text, level) -> Float32Array`, `Decoder.push(Float32Array) -> frames[]`), a GitHub Pages site: type text → pick speed level → play through speakers (WebAudio) → decode from mic via `AudioWorklet` at 48 kHz → show waterfall + SNR + decoded text. Second-screen mode: "open on two phones and talk acoustically" (ggwave-style) — that is the demo people will share. Also doubles as the interop/education page for `docs/SPEC.md`.
 
-**Effort:** S–M — 3–5 days for the crate + page; a further 2–3 days if `push_samples` needs a resampler for 44.1 kHz devices (coppa-dsp has one).
+**Effort:** S–M — 3–5 days for the crate + page; a further 2–3 days if `push_samples` needs a resampler for 44.1 kHz devices. Note: `coppa-dsp` does not have a resampler — the only implementation is `coppa-audio/src/resampler.rs`, which is not a `pub mod` of that crate today, so a browser build needs it either moved/exported for wasm or reimplemented; verified via `crates/coppa-audio/src/lib.rs`.
 
 ### 4. Mobile / tablet — **DEFER**; the answer is the responsive web dashboard, not an app
 
