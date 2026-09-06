@@ -266,7 +266,7 @@ Legend: coppa cells cite `[repo:file]`; "?" = no evidence found; "n/a" = not app
   none. coppa already has the harness, Watterson presets and committed, reproducible FER tables (though not currently regenerated or checked in CI -- `ci.yml` only compile-checks benches). Publishing a **standing scoreboard
   page** (bytes/min vs SNR for WGN/MPG/MPP in the exact IONOS format, with CIs, plus a Teensy-IONOS hardware run)
   would make coppa the reference everyone else is measured against — including when coppa loses. Requires: fix the
-  SNR-convention ambiguity, add bytes/min-under-ARQ to `coppa-bench`, buy/build an IONOS simulator, publish.
+  SNR-convention ambiguity, run the existing `session` bench's bytes/min-under-ARQ metric at the IONOS study's fixed WGN/MPG/MPP SNR grid (the metric already exists; it just isn't run at comparable SNR points), buy/build an IONOS simulator, publish.
 
 ### W3. "The Rust DSP/modem library" (unique, small effort, compounding)
 - No competitor is a library. codec2 is C; Mercury is a C daemon; VARA is a binary. coppa's 13-crate split, C FFI,

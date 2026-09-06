@@ -14,6 +14,7 @@ FER/goodput are deterministic; wall-clock was not recorded (shared host).
 | `mod-ssb-std` | Watterson CCIR Moderate (1 ms / 0.5 Hz) | 300-2700 Hz | 6..30 dB step 6 | 50 |
 
 Headline: level 10 (64-QAM 5/6) on `hf_standard` fails to meet FER <= 10% at
-any SNR through the SSB filter, up to 60 dB: 90% FER (9/10 `ldpc_not_converged`)
-at 30 dB, 100% FER at 40/50/60 dB, while decoding cleanly unfiltered. See
+every tested SNR point through the SSB filter (0-27 dB step 3, and 30/40/50/60
+dB -- not a continuous sweep): 90% FER (9/10 `ldpc_not_converged`) at 30 dB,
+100% FER at 40/50/60 dB, while decoding cleanly unfiltered. See
 `docs/reviews/2026-09-05-dim-F-modem-fitness.md`.
