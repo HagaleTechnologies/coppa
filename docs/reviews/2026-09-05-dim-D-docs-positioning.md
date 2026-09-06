@@ -93,7 +93,7 @@ Dead links: 0 broken markdown links in the repo. But ~35 backtick-quoted file re
 | 1 | Rewrite README Status/Features tables to describe the OFDM/NR-BG2/9-level system; delete every BPSK/Costas/Viterbi/EWMA/stub claim | stale-doc | H | M | table above (README:12-40) |
 | 2 | Make `coppa rx -i file.wav` print text when payload is valid UTF-8 (or add `--text`/`--hex`), and fix tutorial expected outputs | onboarding | H | S | observed hex output; `main.rs:725-730` |
 | 3 | Give `coppad` a real clap CLI: `--help`, `-V`, `--config <path>`, `--tnc`, `--print-default-config` | onboarding | H | S | `coppa-daemon/src/main.rs:34-49` |
-| 4 | Set GitHub repo description ("Open-source OFDM HF data modem for amateur radio, in Rust — VARA-style TCP API, Winlink-ready daemon, C FFI"), topics (`ham-radio`, `amateur-radio`, `hf`, `ofdm`, `ldpc`, `modem`, `winlink`, `rust`, `dsp`, `sdr`, `tnc`, `ax25`), homepage, social-preview image | positioning | H | S | `gh api repos/...` → topics `[]`, homepage null |
+| 4 | Set GitHub repo description ("Open-source OFDM HF data modem for amateur radio, in Rust — VARA-style TCP API, C FFI"; add "Winlink-ready" only after H-001/H-004--H-009/H-025/H-035 land and Pat has actually been driven against coppa, not at initial setup), topics (`ham-radio`, `amateur-radio`, `hf`, `ofdm`, `ldpc`, `modem`, `winlink`, `rust`, `dsp`, `sdr`, `tnc`, `ax25`), homepage, social-preview image | positioning | H | S | `gh api repos/...` → topics `[]`, homepage null |
 | 5 | Cut a `v0.1.0` (or `v0.2.0`) tag + GitHub Release with prebuilt `coppa`/`coppad` for linux-x86_64, linux-aarch64 (Pi), macOS, Windows, built with `cpal-backend,websocket` | packaging | H | M | 0 releases, 0 tags |
 | 6 | Rewrite ARCHITECTURE.md: real TX/RX pipeline diagram (from SPEC §1-10), correct LOC/test/crate counts, drop the stale Dependencies block (or generate it), delete the "Not implemented" list that is all implemented | stale-doc | H | M | ARCHITECTURE:100-243 |
 | 7 | Delete `PLAN-hardening.md` (all items done/obsolete) and the README link to it; move any residue to a `ROADMAP.md` | stale-doc | M | S | PLAN-hardening.md:95-102, README:89 |
@@ -159,7 +159,7 @@ Dead links: 0 broken markdown links in the repo. But ~35 backtick-quoted file re
 7. **Install** — prebuilt binaries per OS; `cargo install`; build-from-source with the feature table and OS prerequisites.
 8. **Quick start (5 min)** — loopback → tx to WAV → rx from WAV → `coppa tune` → `coppad` with the example config → point Pat at 8300.
 9. **How it compares** — table vs VARA HF / ARDOP / Mercury / PACTOR.
-10. **Status & roadmap** — honest one-paragraph status ("field-ready daemon, no two-radio OTA validation yet"), link ROADMAP.md, wire-format versioning policy.
+10. **Status & roadmap** — honest one-paragraph status ("daemon under active development, not yet interoperable with Pat/VARA-family clients, no two-radio OTA validation yet"), link ROADMAP.md, wire-format versioning policy.
 11. **Documentation map** — user guide, operating guide, API docs, SPEC, ADRs, benchmarks, rustdoc.
 12. **Crates** — table (keep current one, fix `coppa-ml` and `coppa-radio` rows).
 13. **Community** — Discussions, field-report template, groups.io, how to cite.
@@ -172,7 +172,7 @@ Dead links: 0 broken markdown links in the repo. But ~35 backtick-quoted file re
 ### Tagline options
 
 - "An open OFDM HF modem for amateur radio, in Rust."
-- "Winlink-ready HF data modem — open waveform, open spec, open source."
+- "Winlink-ready HF data modem — open waveform, open spec, open source." (defer this tagline until H-001, H-004--H-009, H-025 land and H-035's real Pat test passes -- premature today, since Pat cannot currently complete its startup/session flow and daemon TX truncates frames)
 - "The HF modem you can read: OFDM + LDPC + ARQ, specified and tested, in Rust."
 - "Modern HF digital data for Linux, Pi and everything else — no licence key, no Windows."
 
