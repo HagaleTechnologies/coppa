@@ -151,7 +151,7 @@ Dead links: 0 broken markdown links in the repo. But ~35 backtick-quoted file re
 ## Proposed README skeleton
 
 1. **Title + tagline + badges** — one line that says OFDM / HF / amateur radio / Rust; CI, licence, MSRV, crates.io, docs.rs.
-2. **What it is (3 sentences) + call-out box** — "Coppa is its own open waveform; it is *not* RF-compatible with VARA. Both stations run Coppa. The TCP API is VARA-shaped so existing hosts (Pat, Winlink Express-style) work unchanged."
+2. **What it is (3 sentences) + call-out box** — "Coppa is its own open waveform; it is *not* RF-compatible with VARA. Both stations run Coppa. The TCP API is VARA-style, but Pat/Winlink-client interoperability is unverified and blocked on known gaps (bare-`\r` line discipline, dropped session status, `BUFFER` semantics, `IAMALIVE`) -- do not claim existing hosts work unchanged until that gate passes." (Update this call-out once H-004-H-009/H-035 land and Pat has actually been driven against coppa.)
 3. **Who it's for / Start here** — three links: Ham operator (install → tune → first QSO), Pat/Winlink integrator (daemon + API), Rust DSP developer (crates + SPEC).
 4. **What it sounds/looks like** — waterfall GIF, link to a golden WAV.
 5. **Features** — grouped: Waveform (OFDM 48 kHz, 300–2700 Hz, 9 speed levels BPSK→64-QAM, NR BG2 LDPC, IR-HARQ, ±50 Hz CFO); Link layer (ARQ, compression, closed-loop rate, CP negotiation); Station (PTT rigctld/serial/GPIO, TUNE, busy gate, ID timer, beacon); Interfaces (VARA-style TCP, WebSocket + spectrum, KISS/AX.25 TNC, C FFI); Tooling (bench harness, Watterson model, golden vectors).
@@ -167,7 +167,7 @@ Dead links: 0 broken markdown links in the repo. But ~35 backtick-quoted file re
 
 ### Positioning statement (proposed)
 
-> **Coppa** is an open-source, dual-licensed (MIT/Apache-2.0) OFDM data modem for HF amateur radio, written in Rust. It gives Linux, macOS, Windows and Raspberry Pi stations a modern sound-card waveform — 9 adaptive speed levels from BPSK to 64-QAM, 5G-style LDPC with incremental-redundancy ARQ, ±50 Hz frequency tolerance in a standard 2.4 kHz SSB channel — behind a VARA-compatible TCP API, so existing Winlink/Pat clients work without modification. Coppa is its own waveform (it does not interoperate with VARA over the air), fully specified in a public conformance spec with golden test vectors, so anyone can build a compatible implementation. Use it as a daemon on an EmComm gateway, as a library in your own Rust or C application, or as a readable reference for how a modern HF modem actually works.
+> **Coppa** is an open-source, dual-licensed (MIT/Apache-2.0) OFDM data modem for HF amateur radio, written in Rust. It gives Linux, macOS, Windows and Raspberry Pi stations a modern sound-card waveform — 9 adaptive speed levels from BPSK to 64-QAM, 5G-style LDPC with incremental-redundancy ARQ, ±50 Hz frequency tolerance in a standard 2.4 kHz SSB channel — behind a VARA-style TCP API intended to let Winlink/Pat-style clients connect without modification once known interop gaps are closed (unverified as of this review). Coppa is its own waveform (it does not interoperate with VARA over the air), fully specified in a public conformance spec with golden test vectors, so anyone can build a compatible implementation. Use it as a daemon on an EmComm gateway, as a library in your own Rust or C application, or as a readable reference for how a modern HF modem actually works.
 
 ### Tagline options
 

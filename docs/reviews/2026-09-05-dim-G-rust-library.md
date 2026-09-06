@@ -37,7 +37,7 @@ Doctests that actually run: `coppa_codec` 4, `coppa_dsp` 1, `coppa_engine` 1, `c
 
 ## What's already good
 
-- `unsafe` is confined to `coppa-ffi` (115 lines, every `extern "C"` wrapped in `catch_unwind`, 15 `# Safety` sections, poison/handle-lifetime semantics documented in crate docs) and 5 `unsafe impl Send` in `coppa-audio` with `// Safety:` comments. Everything else is 100% safe Rust with no arch intrinsics (`grep core::arch|target_feature|_mm_` → nothing).
+- `unsafe` is confined to `coppa-ffi` (115 lines; 11 of 17 exported `extern "C"` functions -- the fallible engine operations -- are wrapped in `catch_unwind`, while simple accessors/frees (`coppa_engine_destroy`, `coppa_version`, `coppa_free_samples`, `coppa_free_string`, `coppa_free_frame_payload`, `coppa_stop_stream`) are not, 15 `# Safety` sections, poison/handle-lifetime semantics documented in crate docs) and 5 `unsafe impl Send` in `coppa-audio` with `// Safety:` comments. Everything else is 100% safe Rust with no arch intrinsics (`grep core::arch|target_feature|_mm_` → nothing).
 - `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`; `deny.toml` is thoughtful (per-ignore rationale, registry pinning, license allowlist).
 - `cargo clippy --workspace --all-targets` (default features) → zero warnings; CI runs it with `-D warnings`. `cargo fmt` gated.
 - **`wasm32-unknown-unknown` builds for coppa-dsp, coppa-codec, coppa-ml, coppa-protocol, coppa-engine with no changes** — a browser demo is one `wasm-bindgen` shim away.

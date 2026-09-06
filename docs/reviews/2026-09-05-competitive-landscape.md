@@ -20,7 +20,7 @@ published head-to-head numbers* and no GUI. The FCC removed the HF symbol-rate c
 a 2.8 kHz bandwidth cap; coppa's HF profiles (350–2800 Hz occupied, ≤2850 Hz TX filter) are inside it, but the
 `vhf_wide` profile (350–5900 Hz) must never be used below 29.7 MHz in the US (it is legal in Canada's 6 kHz HF
 allowance). coppa's honest position today: an unusually well-instrumented, well-specified Rust PHY/protocol stack
-with a VARA-style TCP interface, 10 speed levels, NR-BG2 LDPC + IR-HARQ, AFSK/KISS, C FFI and WebSocket API — but
+with a VARA-style TCP interface, 9 speed levels, NR-BG2 LDPC + IR-HARQ, AFSK/KISS, C FFI and WebSocket API — but
 **zero over-the-air evidence, no release artifacts, no GUI, no Pat/Winlink integration path that has ever been
 exercised, a README that still describes a BPSK-only prototype, and simulator numbers (BPSK-1/4 FER≤10% at 6 dB
 AWGN, 3 kHz-referenced) that currently trail Mercury/FreeDV's published DATAC3 (0 dB MPP) and VARA's IONOS curves by
@@ -320,7 +320,7 @@ Impact H/M/L = effect on end-user adoption; Effort S/M/L = < 1 week / 1–4 week
 | 9 | Buy/build a Teensy IONOS simulator (< USD 200) and run the exact IONOS matrix (WGN/MPG/MPP, 0–30 dB, bytes/min) | evidence-gap | H | M | winlink.org IONOS study methodology, pp. 23–25 |
 | 10 | Add bytes/min-under-ARQ (net of retries) to `coppa-bench` and publish in IONOS format with CIs | evidence-gap | H | S | Every ham comparison uses B/min (IONOS; Mercury MODES.md goodput) |
 | 11 | Resolve the SNR-reference ambiguity in BENCHMARKS.md: strike or relabel every pre-3 kHz-ref table; state "SNR in 3 kHz" on every published number | evidence-gap | H | S | BENCHMARKS.md has both a 0 dB and a 12 dB BPSK-1/2 FER≤10% table; coppa-channel lib.rs:98 |
-| 12 | Rewrite README status table to match SPEC (OFDM working, 10 levels, LDPC NR BG2, IR-HARQ, VARA-TCP, KISS/AFSK, WebSocket); add a 30-second "what it is / isn't" | positioning | H | S | README says OFDM "Partial", QPSK+ "not wired", 9 levels; SPEC.md §5 lists 10 |
+| 12 | Rewrite README status table to match SPEC (OFDM working, 9 levels [1-7,9,10; level 8 reserved], LDPC NR BG2, IR-HARQ, VARA-TCP, KISS/AFSK, WebSocket); add a 30-second "what it is / isn't" | positioning | H | S | README says OFDM "Partial", QPSK+ "not wired"; `SPEED_LEVELS`/`VALID_SPEED_LEVELS` both have 9 entries |
 | 13 | Gate `vhf_wide` (350–5900 Hz) off for any HF frequency in the daemon; make speed levels 5–10 use an HF-legal profile on HF | regulatory | H | S–M | 47 CFR 97.307(f)(3) 2.8 kHz; CLAUDE.md: `select_ofdm_profile` routes levels ≥5 to `vhf_wide()` |
 | 14 | Document band-plan compliance per profile: FCC 2.8 kHz occupied-bandwidth cap OK for all HF profiles (`hf_wide`'s 2450 Hz width is under both the FCC 2.8 kHz and IARU R1's 2700 Hz bandwidth caps -- an earlier draft of this report wrongly flagged `hf_wide` as non-R1 by comparing its 2800 Hz upper edge against the 2700 Hz bandwidth figure); still verify `hf_wide`'s specific frequency placement against IARU R1 segment boundaries (not checked here); Canada 6 kHz allows `vhf_wide` on HF | regulatory | M | S | 97.307(f); IARU R1 HF band plan; RBR-4 |
 | 15 | Implement CWID (Morse ID at session end / 10-min timer) and expose `CWID ON/OFF`; document in-band ID as §97.119(b)(3)-compliant | regulatory | M | S | 47 CFR 97.119; VARA has CWID; Mercury lacks it |
