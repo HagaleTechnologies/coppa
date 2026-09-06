@@ -194,7 +194,7 @@ across the eight reports (they total roughly 380 raw items).
 | H-061 | P2 | Hot reload (SIGHUP) and runtime reconfiguration of callsign/PTT/devices; second Ctrl-C should force-exit. | M | B#24, B#38 |
 | H-062 | P2 | Control-plane auth for LAN use: a shared-secret token on the command port and WebSocket (Pat on a different host than the radio Pi is common). Loopback-only is the only mitigation today. | M | B#34, C#30, H#8 |
 | H-063 | P2 | `apt` repo (Debian/RPi OS), Homebrew tap, Windows signed installer; Docker image; DigiPi integration PR. | M | E#2, E#33, E#34, H#34 |
-| H-064 | P2 | Windows daemon is unverified: CI's platform matrix only tests `coppa-audio --lib`; `serial-ptt` never built on Windows. | M | B#37 |
+| H-064 | P2 | Windows daemon build/test coverage is partial: CI's platform matrix does compile-check and lib-test the whole workspace on Windows (`cargo check --workspace`, `cargo test --workspace --lib`), plus an extra `coppa-audio --features cpal-backend` test, but there is no release build, no `serial-ptt`-feature build, and no functional runtime test of `coppad` on Windows. | M | B#37 |
 | H-065 | P3 | Multi-instance: instance name in logs, non-colliding default config path, systemd template guidance. | S | B#35 |
 | H-066 | P3 | TNC mode is not a Direwolf alternative: no digipeat, no beacon, single port, no AGW, no config, VOX is a no-op, blocks RX during TX, ignores TXDELAY/P/SLOTTIME. Either invest (see H-120) or reposition it as "KISS bring-up only". | L | B#14, B#40–42, C#34, C#35 |
 
