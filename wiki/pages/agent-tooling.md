@@ -119,7 +119,7 @@ machine has no thoughts config at all, and `humanlayer thoughts init` is the
 right response there.)
 
 **Upstream issue.** Not yet filed as of this writing — this container has no
-credential to file one. See [[COP-11]] for the drafted issue text (title,
+credential to file one. See COP-11 for the drafted issue text (title,
 symptom, cause with exact `dist/index.js` line numbers, repro steps, and a
 suggested two-part fix: add the missing `?? config.*` fallback, and validate
 at the config-resolution boundary so a resolved non-string `thoughtsRepo`

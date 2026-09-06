@@ -13,15 +13,24 @@ ignore_all_files_in_gitignore: true
 ignored_paths:
 # Serena's own index cache.
 - ".serena/cache"
-# Catalyst / agent tooling directories. All are also in .gitignore; listed
-# explicitly so this file still reads correctly if
-# ignore_all_files_in_gitignore is ever flipped off -- the same belt-and-braces
-# the catalyst-cloud reference config uses.
+# Catalyst / agent tooling directories. ".trunk", ".worktrees", "thoughts", and
+# "docs/superpowers" are also in .gitignore -- listed explicitly anyway so this
+# file still reads correctly if ignore_all_files_in_gitignore is ever flipped
+# off, the same belt-and-braces the catalyst-cloud reference config uses.
+# ".catalyst" is NOT fully gitignored (.gitignore excludes only three specific
+# files under it, not the directory -- .catalyst/config.json is tracked), so
+# this entry has real, non-redundant effect rather than just belt-and-braces.
 - ".catalyst"
 - ".trunk"
 - ".worktrees"
 - "thoughts"
 - "docs/superpowers"
+# The catalyst runner's redirected CARGO_HOME: a vendored crates.io registry
+# checkout (500+ MB, 10k+ .rs files in runner containers). Excluded only via
+# the machine-local .git/info/exclude, which ignore_all_files_in_gitignore
+# does not read -- omitting this entry means a runner-container Serena
+# activation indexes the entire vendored dependency tree.
+- ".catalyst-cache"
 # Build and measurement output.
 - "target"
 - "results"

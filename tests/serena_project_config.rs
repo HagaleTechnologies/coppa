@@ -155,6 +155,12 @@ fn serena_project_config_ignores_the_noise_that_would_pollute_an_index() {
     // .gitignore deliberately UN-ignores (`!testdata/golden/*.wav`), so
     // ignore_all_files_in_gitignore does not cover them. No symbols, no prose.
     assert!(ignored.iter().any(|p| p == "testdata/golden"));
+    // .catalyst-cache (the catalyst runner's redirected CARGO_HOME) is excluded
+    // only via the machine-local .git/info/exclude, which
+    // ignore_all_files_in_gitignore does not read -- so it must be listed here
+    // explicitly, or a runner-container activation indexes the whole vendored
+    // crates.io registry (500+ MB, 10k+ .rs files).
+    assert!(ignored.iter().any(|p| p == ".catalyst-cache"));
 }
 
 #[test]
@@ -216,11 +222,37 @@ fn the_codebase_map_names_every_workspace_member() {
     // Adding a crate without adding it to the map should fail here rather than
     // quietly leaving agents with a stale directory map.
     let map = read(".serena/memories/codebase_map.md");
-    for member in workspace_members(&read("Cargo.toml")) {
-        let name = member.rsplit('/').next().unwrap_or(&member).to_string();
+    let members = workspace_members(&read("Cargo.toml"));
+    assert!(
+        members.iter().any(|m| m == "crates/coppa-protocol"),
+        "member parsing failed -- expected crates/coppa-protocol in {members:?}"
+    );
+    for member in &members {
+        let name = member.rsplit('/').next().unwrap_or(member).to_string();
         assert!(
             map.contains(&name),
             "workspace member {name} is missing from the codebase_map memory"
+        );
+    }
+}
+
+#[test]
+fn the_initial_prompt_names_every_workspace_member() {
+    // initial_prompt restates the same crate list in prose for a
+    // human/agent reading it at activation time; guard it the same way as
+    // the codebase_map memory above so a new workspace member can't go
+    // stale in one while the other test stays green.
+    let raw = read(".serena/project.yml");
+    let members = workspace_members(&read("Cargo.toml"));
+    assert!(
+        members.iter().any(|m| m == "crates/coppa-protocol"),
+        "member parsing failed -- expected crates/coppa-protocol in {members:?}"
+    );
+    for member in &members {
+        let name = member.rsplit('/').next().unwrap_or(member).to_string();
+        assert!(
+            raw.contains(&name),
+            "workspace member {name} is missing from initial_prompt's crate enumeration"
         );
     }
 }
