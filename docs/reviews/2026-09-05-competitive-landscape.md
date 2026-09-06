@@ -180,11 +180,15 @@ None of those is winnable without first shipping binaries, an OTA test, and a Pa
   boundaries is a separate question this review did not check. `vhf_wide` (350–5900 Hz) is illegal on US HF and must be
   gated off below 29.7 MHz by the daemon, not just by convention; `select_ofdm_profile` currently routes *every*
   speed level ≥ 5 to `vhf_wide()` (CLAUDE.md, Bug A note) — **that is a regulatory-facing defect if any user runs
-  levels 5–10 on HF**. coppa's Huffman+LZ4 compression is "publicly documented" by the SPEC, which is exactly what
-  §97.309(a)(4) and Winlink's Open Letter ask for; a Message-Viewer-style decoder tool would close the loop.
-  Station-ID is present as a "forced-level frame (station ID / beacon)" in `coppa-engine` [repo] but there is no
-  CWID and no documented 10-minute timer in the daemon config beyond a `[station]`-style stanza — needs verifying
-  and documenting.
+  levels 5–10 on HF**. Correction: `docs/SPEC.md` today has NO compression section at all (zero mentions of Huffman/LZ4/
+  compression, verified by direct grep) -- coppa's Huffman+LZ4 compression is NOT yet publicly documented in the
+  normative sense §97.309(a)(4) and Winlink's Open Letter ask for. The fixed Huffman table, transform order, and
+  `0xFE` envelope need to be added to the spec; a Message-Viewer-style decoder tool is a good complement but does not
+  substitute for that documentation.
+  Station-ID is present and real: `coppad.toml.example` documents `[station_id] id_interval_secs = 540` (9 min,
+  under the 10-min FCC margin), `StationIdConfig` defaults to the same value, and `transmit_samples` (the single TX
+  chokepoint) verifiably prepends the ID/beacon whenever due (see H-152). What is genuinely missing is CWID (a Morse
+  ID option, which VARA has and Mercury lacks).
 
 ---
 
@@ -324,7 +328,7 @@ Impact H/M/L = effect on end-user adoption; Effort S/M/L = < 1 week / 1–4 week
 | 13 | Gate `vhf_wide` (350–5900 Hz) off for any HF frequency in the daemon; make speed levels 5–10 use an HF-legal profile on HF | regulatory | H | S–M | 47 CFR 97.307(f)(3) 2.8 kHz; CLAUDE.md: `select_ofdm_profile` routes levels ≥5 to `vhf_wide()` |
 | 14 | Document band-plan compliance per profile: FCC 2.8 kHz occupied-bandwidth cap OK for all HF profiles (`hf_wide`'s 2450 Hz width is under both the FCC 2.8 kHz and IARU R1's 2700 Hz bandwidth caps -- an earlier draft of this report wrongly flagged `hf_wide` as non-R1 by comparing its 2800 Hz upper edge against the 2700 Hz bandwidth figure); still verify `hf_wide`'s specific frequency placement against IARU R1 segment boundaries (not checked here); Canada 6 kHz allows `vhf_wide` on HF | regulatory | M | S | 97.307(f); IARU R1 HF band plan; RBR-4 |
 | 15 | Implement CWID (Morse ID at session end / 10-min timer) and expose `CWID ON/OFF`; document in-band ID as §97.119(b)(3)-compliant | regulatory | M | S | 47 CFR 97.119; VARA has CWID; Mercury lacks it |
-| 16 | Ship a "Message Viewer"-style offline decoder (`coppa rx --decompress --dump`) and document compression as a publicly specified code | regulatory | M | S | 97.309(a)(4); Winlink Open Letter on compression ≠ encryption |
+| 16 | Add compression's wire format (fixed Huffman table, transform order, `0xFE` envelope) to the normative `docs/SPEC.md` -- it has none today -- and ship a "Message Viewer"-style offline decoder (`coppa rx --decompress --dump`) as a complement, not a substitute | regulatory | M | S | 97.309(a)(4); Winlink Open Letter on compression ≠ encryption; SPEC.md verified to have zero compression references |
 | 17 | Web GUI served by `coppad`: waterfall, constellation, SNR/level/BUFFER, connect/listen buttons, TUNE, log | missing-feature | H | M–L | ardopcf webgui; VARA gauges; Mercury's stated gap ("no user interface") |
 | 18 | `coppad --setup` wizard (sound device, PTT method, rigctld, callsign, BW) writing `coppad.toml` | missing-feature | M | S | VARA's single settings dialog; Direwolf commented config |
 | 19 | Serial DTR/RTS and Linux GPIO PTT are real, working implementations (`coppa-radio/src/ptt_serial.rs`, `ptt_gpio.rs`) that just need packaging/default-feature and README fixes (see H-056); the genuinely missing PTT backend is CM108/CM119 HID (Digirig/AIOC/DRA -- the most common USB ham interface). Add CM108 support and document Digirig-Lite/AIOC cables. | missing-feature | H | M | `crates/coppa-radio/src/ptt_serial.rs`, `ptt_gpio.rs` (real implementations, feature-gated); README: "Serial/GPIO PTT: Stub" is itself stale; Direwolf PTT matrix; RadioMail's Digirig-Lite/AIOC support |
