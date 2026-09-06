@@ -44,11 +44,14 @@ numbers at all.
 But nothing an end user touches is finished, and several things are broken in
 ways that make the headline claims false today:
 
-- **The daemon cannot transmit a frame through a sound card.** Every TX
-  writes a 65,520-sample frame into an 8,192-sample non-blocking ring and
-  drops the remaining 87 %. Three reviewers observed this independently
-  (`dropped=57328 total=65520`, `dropped=39808 total=48000` for `TUNE 1`).
-  PTT is held for the full frame duration while 170 ms of audio plays.
+- **Neither the daemon nor the CLI can transmit a frame through a sound
+  card.** Every TX writes a 65,520-sample frame into an 8,192-sample
+  ring and drops the remaining 87 %. Three reviewers observed the
+  daemon case independently (`dropped=57328 total=65520`,
+  `dropped=39808 total=48000` for `TUNE 1`); the CLI's live `coppa tx`/
+  `coppa tune` build the identical fixed-size ring and silently discard
+  the same fraction. PTT is held for the full frame duration while only
+  170 ms of audio plays.
 - **The VARA-style TCP interface, which the README calls "Working", cannot
   process a single command from a real VARA client.** The command port
   requires `\n`; VARA and Pat send bare `\r`. Pat's entire startup sequence
@@ -135,7 +138,7 @@ across the eight reports (they total roughly 380 raw items).
 
 | ID | P | Item | Effort | Src |
 |---|---|---|---|---|
-| H-001 | P0 | Daemon TX truncation: `handle_audio_out` and `CpalSink::write` are drop-on-full into an 8,192-sample ring; a 65,520-sample frame loses 87 %. Chunk/pace the write at the sample rate (or size the ring ≥ max frame + guard) and derive PTT release from samples actually delivered. | M | B#1, H#9, C#48 |
+| H-001 | P0 | TX truncation, both daemon and CLI: `handle_audio_out`/`CpalSink::write` are drop-on-full into an 8,192-sample ring; a 65,520-sample frame loses 87 %. This is not daemon-only -- `coppa-cli/src/main.rs:377-408`'s live `coppa tx`/`coppa tune` build the same fixed-8,192-sample `CpalSink`, call `sink.write(samples)` once, and discard the returned partial-write count via `?`, so live CLI transmission also silently sends only the first 8,192 samples of a normal frame while reporting success. Chunk/pace the write at the sample rate (or size the ring >= max frame + guard) in both the daemon and the CLI, and derive PTT release from samples actually delivered. | M | B#1, H#9, C#48; CLI path new finding, `coppa-cli/src/main.rs:377-408` |
 | H-002 | P0 | Stop routing speed levels ≥ 5 to `vhf_wide` on HF. `Profile.ofdm_profile` is read at initial construction (`CoppaCore::from_profile`) but ignored by `select_ofdm_profile` on a later `set_speed_level` reconfiguration -- fix that reconfiguration path to honour it (not delete the field, which is active) so every level has an HF-legal, SSB-passband profile. Levels 5–9 on `hf_standard` decode at 9/9/15/18 dB. | S | F#2, E#13, D#55 |
 | H-003 | P0 | Level 10 (64-QAM 5/6) on `hf_standard` fails to clear FER <= 10% at any SNR through a 300–2700 Hz SSB filter to 60 dB (90-100% FER, LDPC non-convergence). Drop it from the HF ladder, narrow the top edge to ≤ 2600 Hz, or add edge-carrier erasure. Never characterised before this review. | S | F#2b; `results/review-2026-09-05/` |
 | H-004 | P0 | VARA command port must accept bare `\r` (and `\n`, `\r\n`) as terminator; today `read_line` blocks until `\n`. | S | C#1 |
@@ -231,7 +234,7 @@ across the eight reports (they total roughly 380 raw items).
 | H-096 | P1 | Daemon↔daemon session integration test through Watterson + SSB filter + CFO + SCO on the real audio-dispatch path (the only fading-exercising integration test today bypasses the daemon). | M | F#8 |
 | H-097 | P1 | Publish an honest headline table: SSB-filtered, `hf_standard` at every level, AWGN + Good/Moderate/Poor, ARQ user bps and drop rate, side by side with IONOS VARA/PACTOR curves, with "simulation only, no OTA" stated. Resolve the SNR-reference ambiguity in BENCHMARKS.md (two contradictory BPSK tables) by relabeling every pre-3 kHz table. Run the existing session-bench bytes/min metric at the IONOS study's fixed WGN/MPG/MPP SNR grid so it plots directly against VARA/ARDOP/PACTOR (a bytes/min number already exists; it just isn't at IONOS-comparable SNR points). | S | F#11, E#10, E#11, E#28, D#34 |
 | H-098 | P2 | Rate loop misses its own bar (0.914/0.762 vs > 1.0/≥ 0.8). Active probing (`with_probing`) IS wired into the daemon (`event_loop.rs:289-293,569-587`). The project's own committed diagnostics falsified an oscillation/hysteresis-shape fix (a bounded-drop/leaky-raise sweep reproduced the mechanism working as designed but not moving the aggregate metric) and traced the real remaining lever to the underlying per-frame speed-level recommendation signal's volatility/low readings during fast fading, not hysteresis tuning. Fix that signal's quality/stability instead. | M | F#10; CLAUDE.md RateLoop diagnostic |
-| H-099 | P2 | Dead config: `turnaround_ms` and `Profile.arq_window/max_payload` are never read; the daemon uses `ArqConfig::default()` regardless. (`Profile.ofdm_profile` IS read, at initial construction via `CoppaCore::from_profile` -- see the narrower gap in H-002/dim-F.) Wire or delete the genuinely-dead fields. | S | F#17, B#30 |
+| H-099 | P2 | `turnaround_ms` and `Profile.arq_window/max_payload` are unenforced, not unread: `Profile.max_payload`/`arq_window` ARE read and printed to the user by the CLI's `cmd_config` (`coppa-cli/src/main.rs:935-936`) as if they were the profile's real limits, but the engine and daemon ARQ configuration ignore them entirely and use `ArqConfig::default()` regardless -- so the CLI is actively showing users stale, presentation-only numbers. Either wire these values into the engine/daemon or fix `cmd_config` to stop displaying limits that aren't enforced. (`Profile.ofdm_profile` IS read, at initial construction via `CoppaCore::from_profile` -- see the narrower gap in H-002/dim-F.) | S | F#17, B#30; CLI display, `coppa-cli/src/main.rs:935-936` |
 | H-100 | P2 | Channel-model gaps: no impulsive noise, clipping/ALC, AGC, frequency tilt, or group-delay ripple; PAPR clip schedule (up to 14 dB at 64-QAM) is unverified against any ALC model. | M | F#14, F#29 |
 | H-101 | P2 | CFO envelope ±50 Hz is one subcarrier spacing; add an integer-bin ambiguity search or wider acquisition (ARDOP does ±100 Hz). The stale `#[ignore = "OFDM sync has no CFO correction yet"]` test misleads. | M | F#15, F#31 |
 | H-102 | P2 | Sync detector runs on unfiltered samples (−9 dB detection margin by design); sync is the dominant failure below 12 dB only at the two most robust levels (1–2) — from level 3 up, LDPC non-convergence already dominates at 6 dB. A cheap decimated pre-filter recovers the margin for the robust levels. | S | F#20; addendum tables |
