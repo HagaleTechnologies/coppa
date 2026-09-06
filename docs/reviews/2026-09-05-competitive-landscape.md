@@ -22,7 +22,7 @@ a 2.8 kHz bandwidth cap; coppa's HF profiles (350–2800 Hz occupied, ≤2850 Hz
 allowance). coppa's honest position today: an unusually well-instrumented, well-specified Rust PHY/protocol stack
 with a VARA-style TCP interface, 10 speed levels, NR-BG2 LDPC + IR-HARQ, AFSK/KISS, C FFI and WebSocket API — but
 **zero over-the-air evidence, no release artifacts, no GUI, no Pat/Winlink integration path that has ever been
-exercised, a README that still describes a BPSK-only prototype, and simulator numbers (BPSK-1/2 FER≤10% at 12 dB
+exercised, a README that still describes a BPSK-only prototype, and simulator numbers (BPSK-1/4 FER≤10% at 6 dB
 AWGN, 3 kHz-referenced) that currently trail Mercury/FreeDV's published DATAC3 (0 dB MPP) and VARA's IONOS curves by
 a wide margin.** The biggest competitive openings are (1) the Linux/RPi Winlink gateway and Pat-user segment that
 VARA-under-Wine serves badly and ardopcf just abandoned, (2) the "first open modem with credible public benchmarks"
@@ -197,7 +197,7 @@ None of those is winnable without first shipping binaries, an OTA test, and a Pa
 | Beacons/spotting | Everyone doing propagation checks | JS8Call heartbeats, VarAC beacons → PSKReporter, FreeDATA statistics site | A map that shows coppa activity | Forced-level beacon frame exists [repo]; add a PSKReporter/own-map reporter and a decoder that spots *other* stations' beacons. |
 | Maritime / SailMail | Cruising sailors (a paying segment: USD 275/yr) | PACTOR-4 hardware (required by SailMail), Winlink for licensed hams | Not switchable: SailMail mandates PACTOR; Winlink-at-sea users need a *gateway* that runs coppa | Long-term only; requires Winlink acceptance first. |
 | Off-grid / preppers / community networks | Reticulum, Meshtastic, HERMES/Rhizomatica deployments | Mercury (HERMES), LoRa/RNode, Meshtastic | KISS-over-TCP so Reticulum can use it; broadcast mode | coppa already has a KISS TCP server for AFSK [repo: `coppa-daemon/src/tnc.rs`, port 8001]; expose the OFDM HF modem behind KISS too. |
-| Developer / researcher | DSP students, SDR hackers, modem authors, MIL-STD/STANAG people | GNU Radio, codec2 (C), MATLAB; no Rust option | A clean, tested, documented library with channel models and a bench harness | This is coppa's strongest existing asset (12 crates, SPEC.md, Watterson models, `coppa-bench`, C FFI, WebSocket JSON). Needs crates.io publication, docs.rs, examples, and Python bindings. |
+| Developer / researcher | DSP students, SDR hackers, modem authors, MIL-STD/STANAG people | GNU Radio, codec2 (C), MATLAB; no Rust option | A clean, tested, documented library with channel models and a bench harness | This is coppa's strongest existing asset (13 crates, SPEC.md, Watterson models, `coppa-bench`, C FFI, WebSocket JSON). Needs crates.io publication, docs.rs, examples, and Python bindings. |
 | Education | Clubs, universities | fldigi, WSJT-X, codec2 | Visualisation | Waterfall/constellation/LLR visualiser in a web GUI; the WebSocket API is the right substrate. |
 
 **The chicken-and-egg problem, concretely**: VARA broke in because (a) EA5HVK shipped a TCP TNC interface that BPQ32
@@ -260,13 +260,13 @@ Legend: coppa cells cite `[repo:file]`; "?" = no evidence found; "n/a" = not app
 
 ### W2. "The only open HF modem with credible public benchmarks" (positioning, small-to-medium effort)
 - Mercury claims VARA parity with zero numbers; ARDOP's only numbers are third-party and unflattering; FreeDATA has
-  none. coppa already has the harness, Watterson presets and CI-driven FER tables. Publishing a **standing scoreboard
+  none. coppa already has the harness, Watterson presets and committed, reproducible FER tables (though not currently regenerated or checked in CI -- `ci.yml` only compile-checks benches). Publishing a **standing scoreboard
   page** (bytes/min vs SNR for WGN/MPG/MPP in the exact IONOS format, with CIs, plus a Teensy-IONOS hardware run)
   would make coppa the reference everyone else is measured against — including when coppa loses. Requires: fix the
   SNR-convention ambiguity, add bytes/min-under-ARQ to `coppa-bench`, buy/build an IONOS simulator, publish.
 
 ### W3. "The Rust DSP/modem library" (unique, small effort, compounding)
-- No competitor is a library. codec2 is C; Mercury is a C daemon; VARA is a binary. coppa's 12-crate split, C FFI,
+- No competitor is a library. codec2 is C; Mercury is a C daemon; VARA is a binary. coppa's 13-crate split, C FFI,
   channel models and SPEC.md are already library-shaped. Required: publish crates to crates.io with docs.rs,
   semver, `no_std`-friendly `coppa-dsp`/`coppa-codec` where feasible, PyO3 bindings, 5 runnable examples
   (WAV encode/decode, channel sim, custom profile, FFI from C, WebSocket client). This wedge earns contributors,
