@@ -384,3 +384,35 @@ decide them.
 | `2026-09-05-dim-H-missing-surfaces.md` | Telemetry inventory, per-surface build/defer verdicts, dashboard wireframe, WS and wasm captures | 36 |
 
 Raw CSVs for the fresh sweeps are under `results/review-2026-09-05/`.
+
+## 7. Deferred round-15 Codex findings (owner-review checkpoint)
+
+Codex's review reached 15 rounds fixing findings inline (rounds 1-14: every
+finding verified and fixed in a follow-up commit, resolving the thread). Per
+the owner's explicit round-15 stop, these two final-round findings are
+recorded here rather than pushed as a 16th round. Both are verified accurate
+and are refinements of existing items, not new severity classes; neither is
+a security vulnerability. They stay as open (unresolved) review threads on
+the PR for the owner to close by fixing, deferring, or overriding.
+
+1. **The H-090 cable-loop protocol's turnaround check validates the wrong
+   direction.** Step (d) only sets a *maximum* latency target (`<= 250 ms`
+   RX-last-sample to PTT-assert); H-104's actual defect is that the ACK can
+   fire *before* the peer's PTT has released (no *minimum* guard relative to
+   the peer's real PTT-off edge, `drain_ms + tail_delay_ms` after its last
+   sample). A result under 250 ms can pass this gate while still exhibiting
+   H-104's exact half-duplex collision. Fix: add a minimum-turnaround
+   assertion measured against the peer's actual PTT-off edge (via a scope or
+   a GPIO tap on both stations), not just an upper latency bound, before
+   treating this stage as validating H-104's fix.
+2. **H-152 (station ID) still closes too much.** `last_id_time` initializes
+   to `Instant::now()` at daemon startup and `id_due()` stays false until
+   the full interval elapses (`event_loop.rs:180,358,1644-1658`), so any
+   real transmission in the first ~9 minutes after startup -- including a
+   short raw/ARQ send or a `TUNE` -- goes out with no ID at all, not just a
+   "completely silent session." H-152's current text limits remaining work
+   to an optional CWID; it should instead keep first/final-transmission
+   identification (including non-session, non-beacon TX) as active,
+   verified work, not treat "any real transmission carries ID" as already
+   true.
+
