@@ -76,7 +76,7 @@ Precondition for the whole table: today none of the host→modem rows are reacha
 |---|---|---|---|
 | Framing | raw byte stream, no framing, only meaningful when `CONNECTED` | raw stream **at all times** — every `read()` chunk becomes one `DataReceived` → one over-the-air frame, transmitted even with no session (`event_loop.rs:819-884`) | capture 2: 5 bytes → `PTT ON` while merely "connecting" |
 | Segmentation | modem re-blocks stream into its own frames | one TCP `read` (≤ 4096 B, `data.rs:33`) = one frame; a 20 KB Winlink message arriving in 5 segments becomes 5 uncoalesced frames; a 100-byte write becomes a full frame | |
-| Flow control | `BUFFER` bytes; host stops writing when large | `BUFFER` counts frames (see above); mpsc 64-deep with `try_send` → silent drops under load (`main.rs:248`) | |
+| Flow control | `BUFFER` bytes; host stops writing when large | `BUFFER` counts frames (see above). Host-to-modem writes ARE backpressured (`VaraDataPort`'s read loop and the daemon bridge both use awaited `send`, not `try_send`). But `main.rs:248` -- the daemon-to-data-client `DataOut` bridge, i.e. **decoded RX payloads going out to the host**, not host writes coming in -- uses `try_send` on a bounded channel and silently drops a payload if a client is slow to read. This is a more serious finding than a TX flow-control gap: a host can lose received data with no indication. | |
 | RX delivery | decoded payload written to data port | **impl** (`DataOut` broadcast to all data clients, `main.rs:243-252`) | |
 | Client pairing | one host = one cmd + one data socket | cmd and data clients are unrelated ID spaces (`server.rs:38-41`); telemetry and RX data broadcast to *every* client; two apps attached simultaneously would both transmit and both receive | |
 

@@ -171,10 +171,13 @@ None of those is winnable without first shipping binaries, an OTA test, and a Pa
 - **Canada**: RBR-4 allows 6 kHz below 28 MHz (2.8 kHz on 5 MHz). **IARU Region 1** band plan: segments of max
   200/500/2700 Hz (6000 Hz on 10 m); unattended EmComm stations limited to 2700 Hz; digimodes are *preferred* in
   labelled segments but any mode may use any segment within its bandwidth cap.
-- **Alignment check for coppa** [repo: `docs/SPEC.md` §1.2, §11]: `hf_standard`/`hf_robust` occupy 350–2700 Hz,
-  `hf_wide` 350–2800 Hz, `hf_narrow` 350–800 Hz, TX bandpass 250–2850 Hz — inside the FCC 2.8 kHz audio-bandwidth
-  cap and the IARU 2700 Hz segment cap (**`hf_wide` at 2800 Hz would exceed IARU R1's 2700 Hz digimode segments
-  and should be flagged as "US/Canada only" in docs**). `vhf_wide` (350–5900 Hz) is illegal on US HF and must be
+- **Alignment check for coppa** [repo: `docs/SPEC.md` §1.2, §11]: `hf_standard`/`hf_robust` occupy 350–2700 Hz
+  (2350 Hz wide), `hf_wide` 350–2800 Hz (2450 Hz wide), `hf_narrow` 350–800 Hz, TX bandpass 250–2850 Hz (2600 Hz
+  wide) — inside both the FCC 2.8 kHz audio-*bandwidth* cap and IARU Region 1's 2700 Hz max-*bandwidth* digimode
+  limit (IARU's figure caps occupied width, not an upper frequency edge, so `hf_wide`'s 2450 Hz occupied width does
+  not exceed it; withdrawn from an earlier draft of this report, which mistakenly compared the 2800 Hz upper edge
+  against the 2700 Hz bandwidth figure). Whether `hf_wide` sits inside any IARU R1 segment's own frequency
+  boundaries is a separate question this review did not check. `vhf_wide` (350–5900 Hz) is illegal on US HF and must be
   gated off below 29.7 MHz by the daemon, not just by convention; `select_ofdm_profile` currently routes *every*
   speed level ≥ 5 to `vhf_wide()` (CLAUDE.md, Bug A note) — **that is a regulatory-facing defect if any user runs
   levels 5–10 on HF**. coppa's Huffman+LZ4 compression is "publicly documented" by the SPEC, which is exactly what
@@ -319,7 +322,7 @@ Impact H/M/L = effect on end-user adoption; Effort S/M/L = < 1 week / 1–4 week
 | 11 | Resolve the SNR-reference ambiguity in BENCHMARKS.md: strike or relabel every pre-3 kHz-ref table; state "SNR in 3 kHz" on every published number | evidence-gap | H | S | BENCHMARKS.md has both a 0 dB and a 12 dB BPSK-1/2 FER≤10% table; coppa-channel lib.rs:98 |
 | 12 | Rewrite README status table to match SPEC (OFDM working, 10 levels, LDPC NR BG2, IR-HARQ, VARA-TCP, KISS/AFSK, WebSocket); add a 30-second "what it is / isn't" | positioning | H | S | README says OFDM "Partial", QPSK+ "not wired", 9 levels; SPEC.md §5 lists 10 |
 | 13 | Gate `vhf_wide` (350–5900 Hz) off for any HF frequency in the daemon; make speed levels 5–10 use an HF-legal profile on HF | regulatory | H | S–M | 47 CFR 97.307(f)(3) 2.8 kHz; CLAUDE.md: `select_ofdm_profile` routes levels ≥5 to `vhf_wide()` |
-| 14 | Document band-plan compliance per profile: FCC 2.8 kHz OK; IARU R1 2700 Hz segments → `hf_wide` (2800 Hz) flagged non-R1; Canada 6 kHz allows `vhf_wide` on HF | regulatory | M | S | 97.307(f); IARU R1 HF band plan; RBR-4 |
+| 14 | Document band-plan compliance per profile: FCC 2.8 kHz occupied-bandwidth cap OK for all HF profiles (`hf_wide`'s 2450 Hz width is under both the FCC 2.8 kHz and IARU R1's 2700 Hz bandwidth caps -- an earlier draft of this report wrongly flagged `hf_wide` as non-R1 by comparing its 2800 Hz upper edge against the 2700 Hz bandwidth figure); still verify `hf_wide`'s specific frequency placement against IARU R1 segment boundaries (not checked here); Canada 6 kHz allows `vhf_wide` on HF | regulatory | M | S | 97.307(f); IARU R1 HF band plan; RBR-4 |
 | 15 | Implement CWID (Morse ID at session end / 10-min timer) and expose `CWID ON/OFF`; document in-band ID as §97.119(b)(3)-compliant | regulatory | M | S | 47 CFR 97.119; VARA has CWID; Mercury lacks it |
 | 16 | Ship a "Message Viewer"-style offline decoder (`coppa rx --decompress --dump`) and document compression as a publicly specified code | regulatory | M | S | 97.309(a)(4); Winlink Open Letter on compression ≠ encryption |
 | 17 | Web GUI served by `coppad`: waterfall, constellation, SNR/level/BUFFER, connect/listen buttons, TUNE, log | missing-feature | H | M–L | ardopcf webgui; VARA gauges; Mercury's stated gap ("no user interface") |

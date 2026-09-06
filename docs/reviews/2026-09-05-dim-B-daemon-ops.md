@@ -40,11 +40,14 @@ The three biggest problems:
    deaf, mute, or PTT-less short of reading logs line by line.
 3. **The VARA-style control port does not answer.** Only `LISTEN ON/OFF` and
    `TUNE` are handled in the daemon; `MYCALL`, `COMPRESSION`, `BW*`, `VERSION`,
-   `ABORT` and unknown commands get no `OK`/`WRONG` at all. Pat/Winlink-style
-   clients wait for `OK` after every command, so the headline "VARA-style TCP
-   interface: Working" claim in the README will not survive a first contact.
-   (Protocol detail belongs to the host-API reviewer; the ops consequence —
-   "Pat cannot use this modem" — is squarely a first-run problem.)
+   `ABORT` and unknown commands get no `OK`/`WRONG` at all -- a real VARA
+   compatibility gap, though the host-API reviewer's walkthrough finds the
+   command that actually blocks Pat first is the bare-`\r` line terminator,
+   not a missing `OK` (Pat's own startup sequence does not wait for one). Either
+   way, the headline "VARA-style TCP interface: Working" claim in the README
+   will not survive a first contact. (Protocol detail belongs to the host-API
+   reviewer; the ops consequence — "Pat cannot use this modem" — is squarely
+   a first-run problem.)
 
 Secondary: the AFSK/KISS TNC path is not shippable — `coppa tnc` does not
 compile (`E0560: TncConfig has no field named audio_device`), `coppad --tnc`
@@ -84,7 +87,7 @@ is not in the built binary, and CI never builds the `kiss-tnc` feature.
 | # | Item | Category | Impact | Effort | Evidence |
 |---|------|----------|--------|--------|----------|
 | 1 | Daemon TX truncated to `buffer_size` samples: `handle_audio_out` writes the whole frame into a non-blocking ring that drops on full; `CpalSink::write` is also drop-on-full into its own 8192 ring. Need a blocking/chunked writer that paces at the sample rate (or a ring sized >= max frame + guard), and the PTT-release timer must be derived from samples actually delivered. | bug / safety | H | M | `event_loop.rs:1483-1502`, `ringbuf.rs:42-50`, `cpal_backend.rs:262-264,268`; observed `WARN Audio output buffer overflow dropped=39808 total=48000` on `TUNE 1`, PTT TX 02:36:11.601 -> RX 02:36:13.023 |
-| 2 | VARA command port never replies `OK`/`WRONG`; `MYCALL`, `COMPRESSION`, `BW*`, `VERSION`, `ABORT` are parsed but ignored by the daemon. Pat/Winlink-style clients block on the missing `OK`. Overlaps host-API reviewer; listed here because it blocks first-run with any real client. | bug | H | M | `event_loop.rs:886-912` handles only `LISTEN ON/OFF`/`TUNE`; observed `printf 'VERSION\r\nMYCALL W5AU\r\n...' | nc` returned only the greeting `VERSION Coppa 0.1.0` |
+| 2 | VARA command port never replies `OK`/`WRONG`; `MYCALL`, `COMPRESSION`, `BW*`, `VERSION`, `ABORT` are parsed but ignored by the daemon. This is a real VARA compatibility gap, though Pat's own startup sequence does not wait for `OK` -- the host-API reviewer's walkthrough identifies the actual Pat-blocking sequence as the bare-`\r` line terminator, dropped session `StatusUpdate`s, `BUFFER` semantics, `\r\n` vs `\r` responses, and missing `IAMALIVE`. Overlaps host-API reviewer; listed here because the missing `OK`/`WRONG` still blocks first-run with any client that does wait for it. | bug | H | M | `event_loop.rs:886-912` handles only `LISTEN ON/OFF`/`TUNE`; observed `printf 'VERSION\r\nMYCALL W5AU\r\n...' | nc` returned only the greeting `VERSION Coppa 0.1.0`; dim-C walkthrough |
 | 3 | No CLI argument parsing: `--help`, `--version`, `-c`, `--config`, `--check`, `--log-level` all absent. `args().nth(1)` is taken as the config path; `--help` therefore starts the daemon and opens the default mic/speaker. | bug / polish | H | S | `main.rs:46-49`; observed `coppad --help` ran until SIGTERM with `Daemon ready` |
 | 4 | Host server bind failure is not fatal: `eprintln!("VARA server error: ...")` from a spawned task, then `Daemon ready`, exit 0, and the daemon keeps running with no control plane. Same for WebSocket. | bug / safety | H | S | `main.rs:262-266,308-312`; observed `VARA server error: Address already in use (os error 48)` followed by `INFO coppad: Daemon ready` |
 | 5 | Audio stream failure is not fatal and is reported via `eprintln!` rather than the logger: `Failed to start audio input: ... Sample rate 44100 Hz is not supported` then `Daemon ready`. A daemon with no RX audio is indistinguishable from a healthy one at INFO. | bug / safety | H | S | `main.rs:120-122,137,178-180,195`; observed with `sample_rate = 44100` |
@@ -119,7 +122,7 @@ is not in the built binary, and CI never builds the `kiss-tnc` feature.
 | 34 | No authentication or allow-list option at all for the control plane; the only mitigation is "leave it on loopback". Even a shared-secret line on the command port, a per-client `AUTH` command, or a Unix-socket option would allow safe LAN use (Pat on a different host than the radio Pi is a very common topology). | safety / missing-feature | M | M | `SECURITY.md` "no authentication"; `config.rs:159-164` |
 | 35 | Single-instance design: no per-instance names in logs, no way to run two radios except two configs on different ports; `coppad.toml` default path collides. No `instance`/`name` field, no `%i`-friendly systemd template guidance. | polish | L | S | `main.rs:46-49`; `config.rs` |
 | 36 | No frequency/mode control surfaced to hosts: `RigctldClient` implements `get/set_frequency`/`set_mode` but the daemon uses it only as `PttControl`; the VARA/WS APIs expose no `FREQ`/QSY, so gateways (RMS, scanning) cannot QSY through the modem. | missing-feature | M | M | `rigctld.rs:89-148`, `event_loop.rs:380-400` boxes as `dyn PttControl` |
-| 37 | Windows support is unverified for the daemon: CI's platform matrix only tests `coppa-audio --lib`; `serial-ptt` (COM ports) and the daemon binary are never built on Windows; no Windows service/tray story. `docs/tutorials/getting-started.md` claims "No additional dependencies on macOS or Windows". | docs / packaging | M | M | `ci.yml:183-201`; `getting-started.md:7` |
+| 37 | Windows daemon coverage is partial: CI's `windows-latest` leg does `cargo check --workspace` (compiles the default `coppad` binary) and `cargo test --workspace --lib`, plus an extra `coppa-audio --features cpal-backend` test -- but there is no release build, `serial-ptt` (COM ports) is never built on Windows, and there is no functional runtime test of `coppad` or a Windows service/tray story. `docs/tutorials/getting-started.md` claims "No additional dependencies on macOS or Windows". | docs / packaging | M | M | `ci.yml:183-201`; `getting-started.md:7` |
 | 38 | Second Ctrl-C does not force-exit: tokio's `ctrl_c()` handler replaces the default; if the event loop is blocked (e.g. in `wait_for_clear_channel`'s sleep loop) shutdown is deferred and a second SIGINT is swallowed. | polish | L | S | `main.rs:289-294`; `event_loop.rs:1590-1610` sleeps on the same task that handles `Shutdown` |
 | 39 | Shutdown does not stop/drain audio streams or flush TX; `shutdown_flag` is set and `run()` returns, then `main` exits while audio threads may still be mid-callback. Fine in practice, but a TX in flight is cut without unkeying (see #15). | polish | L | S | `event_loop.rs:660-664`, `main.rs:327-331` |
 | 40 | TNC mode blocks its whole select loop with `tokio::time::sleep` for the duration of each TX, so RX frames decoded during TX are not forwarded until TX ends, and KISS `TXDELAY`/`P`/`SLOTTIME` are parsed but ignored (no p-persistence CSMA, no DCD). | missing-feature | M | M | `tnc.rs:215-224`; `kiss.rs:24-26,151-167` parsed only |
