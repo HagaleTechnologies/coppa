@@ -68,7 +68,8 @@ ways that make the headline claims false today:
   unfiltered), a failure nobody had characterised because the SSB sweep only
   ever ran with VHF routing.
 - **The modem has never been on the air**, and the simulated ARQ session
-  bench drops the link on 0/5 CCIR-Moderate and 0/5 CCIR-Poor sessions.
+  bench survives the link on 0/5 CCIR-Moderate and 0/5 CCIR-Poor sessions
+  (5/5 drop in both).
   Link drops under fading are exactly what the 2020 Winlink IONOS study used
   to separate ARDOP-class from VARA/PACTOR-class modems.
 - **The README describes a different, older program** (BPSK + Costas loop +
@@ -319,7 +320,7 @@ After this a visitor reads an accurate README, follows a tutorial that works,
 and CI is green.
 
 **Phase 1 — Make it work (two to three weeks).** H-001, H-002/H-150,
-H-003, H-004–H-009, H-014, H-015, H-018–H-027, H-062 (WebSocket auth), H-070, H-090 (cable test),
+H-003, H-004–H-009, H-014, H-015, H-018–H-027, H-030, H-034, H-062 (WebSocket auth), H-070, H-090 (cable test),
 H-035 (Pat for real), H-050–H-054, H-056, H-130, H-131. Cut `v0.1.0` with
 binaries at the end. After this a Pat user on a Raspberry Pi can install a
 binary, point Pat at 8300, and complete a session over an audio cable, and
