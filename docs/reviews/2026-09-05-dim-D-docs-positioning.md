@@ -1,0 +1,213 @@
+# Coppa review — dimension D: documentation, onboarding, positioning, naming, go-to-market
+
+Reviewer scope: read-only pass over `/Users/thagale/Code/coppa` @ `1c2ffc5` (main, 2026-09-05), the GitHub repo metadata, crates.io, and a literal walk-through of the README / getting-started commands with the release binaries.
+
+## Summary
+
+**Overall grade: C-.** The engineering underneath is far better than the front door suggests. The README (last touched 2026-07-14, but its Status table dates from the June "Initial public release") describes a BPSK/Costas-loop/Viterbi modem with "OFDM partial", "LDPC 6 rates", "PTT stubs", "EWMA channel prediction" — none of which is what ships. The real product is a 48 kHz OFDM waveform with 9 speed levels (BPSK→64-QAM), a 5G-NR BG2 LDPC with IR-HARQ, a normative wire-format spec with 20 committed golden WAV vectors, real serial/GPIO PTT, station-ID/beacon/busy-gate, a WebSocket spectrum stream, an AFSK/KISS TNC mode, and an FFI v2. A ham landing on the repo today reads "Partial / Stub / not wired" and leaves; a Rust DSP person reads the ARCHITECTURE.md TX/RX pipeline (Costas loop, RRC, Gardner) and gets a description of code the engine no longer calls. The three biggest problems: **(1) the README and ARCHITECTURE.md are actively false about the system's capabilities** (12+ contradicted claims, evidence below); **(2) the first-five-minutes path is broken** — `coppa rx -i cq.wav` prints `435120435120...` (hex) where the tutorial promises `Decoded: "CQ CQ CQ DE VK2ABC K"`, `coppad --help` starts the daemon instead of printing help, and the loopback sample count in the tutorial is wrong; **(3) there is no go-to-market surface at all** — zero releases, zero tags, zero crates.io publications, no GitHub topics/homepage, no Discussions, no CHANGELOG, no issue templates, one star, and the GitHub description "Ham Radio Software Modem Reference" says nothing about OFDM/HF/Rust/Winlink. Secondary: the project's real institutional knowledge lives in an 81 KB CLAUDE.md (single paragraphs 5–15 KB long) and a `wiki/` aimed at agents, while the human-facing docs went stale; `docs/` has no index; and the name "coppa" is search-invisible (page 1 of "coppa" is the US children's-privacy law, a GCP CLI, and a packaging consortium). None of this is hard to fix — most of it is a README rewrite plus 30 minutes of GitHub settings — but until it is done the project will read as an abandoned BPSK toy.
+
+## What's already good
+
+- **`docs/SPEC.md` is a genuinely credible standard document**: RFC-2119 language, wire-format version 1 declared, every constant cited to a Rust symbol, a break history (§0.1), a conformance checklist (§13), and 20 frozen golden vectors with a CI-enforced test (§14, `crates/coppa-protocol/tests/golden_vectors.rs`). Better than most amateur-radio "specs".
+- **Honesty culture**: CONTRIBUTING.md's "stay honest" ethos, the VARA non-compatibility caveat is present in README (twice), ARCHITECTURE, CLAUDE.md, SPEC, and `coppad.toml.example`. BENCHMARKS.md records gates NOT met, falsified hypotheses, and reward-hacks "observed live". ADR-003..008 are real decision records with deviations from plan.
+- **Security posture** for a 0.x hobby project is above average: SECURITY.md, private vulnerability reporting actually enabled (`gh api .../private-vulnerability-reporting` → `enabled: true`), `deny.toml`, semgrep + rustsec in CI, `bind_address` warning text in the example config.
+- **`coppad.toml.example`** is well-commented and explains regulatory intent (FCC 97.119 ID timer), busy-defer semantics, and the PTT hard-error policy.
+- **`docs/OPERATING.md`** TUNE procedure is exactly what a ham needs, written in ham vocabulary (ALC, two-tone, splatter).
+- **`wiki/`** pages have a good question-titled format ("What will bite you about…"), sources and verified-commit frontmatter.
+- **CLI help** for `coppa` is clean, clap-generated, with sensible defaults (`--ptt rigctld`, `--rigctld 127.0.0.1:4532`, lead/tail ms).
+- `examples/ofdm_roundtrip.rs` is a well-commented, honest demo (two speed levels through AWGN). `coppa-ffi` has a 66-line crate doc and a shipped `coppa.h`.
+- MSRV declared, pinned toolchain with a rationale comment, dependabot, cross-platform CI matrix, 1,137 test functions, 0 markdown-relative-link breakage across all `.md` files (checked).
+
+## Stale / contradictory statements
+
+| Doc:line | Claim | Reality | Evidence |
+|---|---|---|---|
+| README:3, Cargo.toml root `description` | "Open-source ham radio digital communications system" | It is an OFDM HF modem + protocol stack; the tagline says nothing a searcher would type | CLAUDE.md:5 already has the better sentence ("open-source OFDM digital modem for amateur radio…") |
+| README:12 | "BPSK modem (loopback) — Working — Full DSP chain: AGC, Costas loop, RRC, timing recovery" | Engine is OFDM-only. `coppa_engine` never references `BpskModem`/Costas; `BpskModem` has zero users outside its own file and bench examples | `grep -rn BpskModem crates` → only `coppa-codec/src/lib.rs:19` re-export + `BpskMapper` (a constellation mapper) in transceiver; `engine.rs:1` "thin wrapper around CoppaTransceiver" |
+| README:14, README:34, ARCHITECTURE:48, :106 | "Convolutional FEC — Working — K=7 rate-1/2 with soft Viterbi"; TX pipeline "FEC encode payload (rate-1/2 K=7 convolutional code)" | `ConvolutionalCodec` has **zero callers** outside `fec/convolutional.rs`; payload FEC is NR BG2 LDPC, header FEC is Golay(24,12) | `grep -rn 'ConvolutionalCodec\|convolutional::' crates` excluding its own module → empty; `crates/coppa-codec/src/ofdm/header_fec.rs`; SPEC §4.3, §5.1 |
+| README:16, :33; ARCHITECTURE:42 | "QPSK/8PSK/QAM mappers … not wired to engine"; "BPSK is wired end-to-end; QPSK…64QAM… not wired into the engine pipeline" | All of BPSK/QPSK/8PSK/16-QAM/64-QAM are wired as speed levels 1–10 through `CoppaTransceiver` | `crates/coppa-codec/src/ofdm/coppa_modem.rs:90-153` `SPEED_LEVELS` (bits_per_symbol 1,1,2,2,3,4,4,6,6); `coppa config -p HF_STANDARD` → "Speed level: 2" |
+| README:17; ARCHITECTURE:56, :139, :226 | "OFDM — Partial — sync has CFO limitations"; "OFDM decode not wired"; "CFO correction — not implemented" | OFDM is the *only* decode path; two-stage CFO gives ±50 Hz pull-in; golden vector `L*_ssbcfo` (+15 Hz CFO) decodes in CI | CLAUDE.md:73; ADR-003; SPEC §14; `testdata/golden/manifest.toml` |
+| README:18; ARCHITECTURE:48, :213 | "LDPC codes — 6 rates (1/4…7/8)"; "QC-LDPC codes at 6 rates" | Single 5G-NR BG2 mother code (Zc=176) with circular-buffer rate matching per level; the 802.11 per-rate codes are legacy | `crates/coppa-protocol/src/fec/ldpc/{nr_bg2,rate_match}.rs`; ADR-005; SPEC §5.1–5.2 |
+| README:24 | "Operating profiles — Partial — only HF modes use BPSK; no runtime modulation switching" | Profiles map to speed levels; `RateLoop` performs closed-loop runtime speed-level switching; `coppa_engine_set_speed_level` in FFI | `crates/coppa-ml/src/rate_loop.rs`; `crates/coppa-ffi/src/lib.rs` `coppa_engine_set_speed_level`; `crates/coppa-engine/src/profiles.rs:28-66` |
+| README:25, :40; ARCHITECTURE:27, :195, :222; models/README.md (whole file) | "Channel prediction — EWMA predictor + static MCS lookup table"; "ML channel predictor (EWMA)"; "`coppa-ml` contains an optional registry that scans this directory" | EWMA predictor and model registry were **deleted** as dead code in Phase 3. `coppa-ml` = `RateLoop`, `CpGate`, `BusyGate`, `mcs.rs`, `spectrum_sensor.rs`. Nothing references `models/` | `ls crates/coppa-ml/src`; `grep -rn 'models/' crates` → empty; ARCHITECTURE:75 itself says "removed in Phase 3" (self-contradiction within the same file) |
+| README:26; ARCHITECTURE:66-67, :141, :229 | "Serial/GPIO PTT — Stub — no hardware access" | Real DTR/RTS via `serialport` (`serial-ptt` feature) and Linux sysfs GPIO (`gpio-ptt`); README's own crate table (line 77) says so — the Status table contradicts the crate table 50 lines later | `crates/coppa-radio/src/ptt_serial.rs:22-26`, `ptt_gpio.rs:1-5`; `coppad.toml.example` `serial:/dev/ttyUSB0:dtr` |
+| README (absent), ARCHITECTURE (absent), getting-started (absent) | — | The AFSK-1200/AX.25/KISS TNC mode (`coppad --tnc`, `kiss-tnc` feature) is not mentioned in any human-facing doc; only CLAUDE.md:5 | `crates/coppa-codec/src/afsk.rs`, `coppa-protocol/src/ax25.rs`, `coppa-host/src/kiss.rs`, `coppa-daemon/src/tnc.rs` |
+| README (absent) | — | `coppa tune`, station-ID timer, beacon, busy-channel gate, WebSocket spectrum stream, live `coppa rx` — none appear in README Features | `coppa --help`; `coppad.toml.example` `[station_id]`; `coppa-daemon/src/spectrum.rs` |
+| ARCHITECTURE:5, CONTRIBUTING:7 | "not a finished on-air product" / "reference implementation" only | Fine as a hedge, but Phase 4 explicitly shipped "field readiness"; the positioning is now internally inconsistent (wiki/overview says daemon is field-ready) | `wiki/pages/phase4-field-readiness.md:19-21` |
+| ARCHITECTURE:100-123 | TX/RX pipeline: "Baseband NRZ → RRC → 1 kHz carrier"; "Costas loop… RRC matched filter… Eye-opening timing… Viterbi" | Real pipeline: payload → CRC-32 → NR BG2 LDPC → rate-match → scramble → interleave → QAM map → OFDM (Hermitian) + CP → Newman preamble/probe → PAPR clip → bandpass; RX: `SyncDetector` (Schmidl-Cox + Moose CFO) → Golay header → delay-domain/Kalman channel est → MMSE → LLR → LDPC (+turbo re-est, IR-HARQ) | SPEC §1-§10; `coppa_modem.rs`; `transceiver.rs` |
+| ARCHITECTURE:127 | "12-crate workspace, ~26,000 lines of code, 600+ tests" | 13 crates + `tools/gen_nr_bg2`; ~65,200 lines of `.rs`; 1,137 `#[test]`/`#[tokio::test]` functions | `ls crates | wc -l` → 13; `find crates src tests -name '*.rs' | xargs cat | wc -l` → 65222; grep count → 1137 |
+| ARCHITECTURE:140 | "LDPC/ARQ/session/compression implemented but not wired" | All wired: `CoppaCore` applies Huffman+LZ4 (`COMPRESSION_MARKER`), daemon runs `ArqTx/ArqRx`, sessions, CP negotiation | `engine.rs:8-20`; `event_loop.rs`; ADR-008 |
+| ARCHITECTURE:143 | "binary payloads need `encode_bytes/decode_bytes` (not yet implemented)" | Both exist and are used by the shipped example | `examples/ofdm_roundtrip.rs:24,31`; FFI `coppa_encode_bytes` |
+| ARCHITECTURE:147-176 | Dependency versions: `rand 0.9`, `cpal 0.15`, `rtrb 0.3`, `lz4_flex 0.11`, `toml 0.8`, `criterion 0.5` | Workspace: `rand 0.10`, `cpal 0.18`, `rtrb 0.4`, `lz4_flex 0.14`, `toml 1.1`, `criterion 0.8`; `tracing`, `serialport`, `tokio-tungstenite` missing from the list | `Cargo.toml:27-46` |
+| ARCHITECTURE:92 | CLI subcommands: `tx, rx, loopback, listen, devices, config` | Also `tune` (and `--tnc` on daemon) | `coppa --help` |
+| ARCHITECTURE:83-84 | "WebSocket: … (types defined, server scaffolded)" | Real `tokio-tungstenite` server with `MyCall/Connect/Disconnect/Send/Status/Spectrum` messages | `crates/coppa-host/src/websocket.rs:246-321` |
+| ARCHITECTURE:225-231 "Not implemented (out of scope)" | CFO correction; Watterson model; runtime modulation switching; speed negotiation in ARQ | All four are implemented (two-stage CFO; `coppa_channel::watterson`; `RateLoop`; recommended-level fed back on ACK) | CLAUDE.md:73, :306; `engine.rs:75-80` `recommended_level` |
+| ARCHITECTURE:235-237, "Goals" | "no measured … standardized-channel (e.g. Watterson) performance data, and makes no throughput or BER claims" | BENCHMARKS.md is 219 KB of Watterson Good/Moderate/Poor FER/goodput tables with CIs, MIL-STD-188-110 ladder, session-robustness bench | `BENCHMARKS.md` §"Watterson HF fading channels", §"Phase 3 Task 8" |
+| PLAN-hardening.md:1-117 (whole file) | Six "known gaps": WebSocket integration test, CPAL→daemon wiring, sliding-buffer `listen`, OFDM noisy tests, LDPC near-threshold tests, ML no-op | Items 1-5 are done (WS server real; daemon CPAL wired behind `cpal-backend`; streaming `push_samples`; Watterson benches; `test_snr_fer_monte_carlo`); item 6 marked obsolete in-file. README:89 still links it as "the hardening roadmap" | `event_loop.rs`, `streaming.rs`, `tests/phase_c_loopback.rs`; PLAN-hardening.md:95-102 |
+| getting-started:27-30 | "WAV file operations require the `file-backend` feature: `cargo run --bin coppa --features file-backend -- loopback`" | `file-backend` is a default feature of `coppa-cli`; the flag is noise. Also `--features` must be passed with `-p coppa-cli` from workspace root or cargo errors on feature resolution for the root package | `crates/coppa-cli/Cargo.toml:32` `default = ["file-backend"]` |
+| getting-started:35-41, :49-53 | Expected output "Encoded: 46080 samples", "Written 46080 samples to cq.wav" | Actual: "Encoded: 65520 samples" / "Generated 65520 audio samples / Written to cq.wav" | ran `target/release/coppa loopback "Hello from Coppa"` and `tx … -o cq.wav` |
+| getting-started:61-65, README:58 | `coppa rx -i cq.wav` → `Decoded: "CQ CQ CQ DE VK2ABC K"` | Actual: `Decoded: 435120435120435120444520564b32414243204b  (SNR: 25.7 dB)` — hex, by design since Phase 4 raw-bytes change; no `--text` flag exists | ran it; `crates/coppa-cli/src/main.rs:725-730` doc comment "printed as lowercase hex" |
+| getting-started:5 | "Rust 1.85.0 or later" | `rust-toolchain.toml` pins 1.98.0; rustup silently downloads a second toolchain on first `cargo` — surprising if unstated | `rust-toolchain.toml:8` |
+| getting-started:6-7 | Linux needs `libasound2-dev`; "No additional dependencies on macOS or Windows" | True only for default features; also not stated that live audio requires `--features cpal-backend` on **both** `coppa` and `coppad` (mentioned only for `devices`), nor that `rigctld` (hamlib) is a runtime prerequisite for CAT PTT | `coppa-cli/Cargo.toml:34`, `coppa-daemon/Cargo.toml:45` |
+| getting-started:89-95 | `cargo run --bin coppad` / `-- my_config.toml` | Works, but `coppad --help` / `-V` are not implemented — daemon starts and blocks (observed: had to kill it). Also `--tnc` mode undocumented | `crates/coppa-daemon/src/main.rs:34-49` (no clap; `args().nth(1)` is the config path) |
+| getting-started:98-118 | Example `coppad.toml` has `vara_enabled = true` | Shipped `coppad.toml.example` defaults `vara_enabled = false`, `websocket_enabled = false`; tutorial doesn't mention `bind_address`, `[station_id]`, `websocket_port` | `coppad.toml.example:41-48` |
+| getting-started:124-134 | Hand-typed `extern` prototypes in the C example | A generated `crates/coppa-ffi/coppa.h` exists (cbindgen) and covers v2 (`coppa_engine_new_with`, `coppa_encode_bytes`, `coppa_engine_feed_samples`, `coppa_next_frame`) — tutorial shows only v1 text API | `find . -name '*.h'` → `crates/coppa-ffi/coppa.h` |
+| CLAUDE.md:59 | "**9 speed levels** replace old mcs_index…" | Elsewhere in the same file: "every level (1-10)", "levels 9/10". Truth: 9 entries numbered 1,2,3,4,5,6,7,9,10 — **level 8 does not exist** | `coppa_modem.rs:90` `[SpeedLevel; 9]`, `level: 9` follows `level: 7` |
+| CLAUDE.md:150 (`SPEED_LEVELS`), SPEC §12 | Level 10 `ldpc_rate 7/8` in the table | Real rate is 5/6 after NR BG2 (SPEC §12 documents `CodeRate::Rate7_8` as stale; the `SPEED_LEVELS` const still says `7/8` too) | `coppa_modem.rs:146-148` |
+| SPEC.md:3-5 | "Status: … commit range ending at `f725f7c` on `feature/field-readiness`" | Commit `f725f7c` is not reachable from any branch in the clone (`git branch --contains` → "malformed object name"); branch is gone. Spec has been amended since (COP-4, 2026-08-06) with no version/date stamp change | `git -C coppa branch -a --contains f725f7c` |
+| CLAUDE.md (≈20 refs), wiki/pages/adr-00{4,5,6}.md, watterson-level-4-gap.md, `coppa_modem.rs:183-190` doc comments | Cite `.superpowers/sdd/p2-task-*-report.md`, `docs/superpowers/specs/2026-07-*-design.md` | Those paths are gitignored (`.gitignore:84`) and absent from the clone except one file; every public reader hits a dead reference | `ls docs/superpowers` → no such dir; `.superpowers/sdd/` contains only `vhf-timing-backoff-fix-report.md` |
+| wiki/pages/band-conventions.md, coppa-dsp-skimmer-interface.md | Link `adr/0006-band-frequency-conventions.md`, `questions/0028-skimmer-spot-stream-contract.md` | Not in this repo (they are `dispensa` paths) — unresolvable for GitHub readers | grep of backtick refs |
+| wiki/pages/*.md frontmatter | `verified: commit 59b0b63, date 2026-07-14` (9 pages), 2026-07-07 (8 pages) | 55 commits behind HEAD; the "current" status flag is unverified | `git rev-list --count 59b0b63..HEAD` → 55 |
+| GitHub community profile | `documentation: …/tree/master/docs` | Default branch is `main`; `docs/` has no index | `gh api repos/…/community/profile` |
+| README:5 badges | CI + license only | GitHub auto-detects licence as **Apache-2.0 only** (dual-licence not detected); no crates.io/docs.rs/MSRV badges — because nothing is published | `gh repo view --json licenseInfo` → "Apache License 2.0" |
+| README:110 | "**MSRV**: 1.85.0" (tacked under the License section) | Correct value, wrong place; also unmentioned that the pinned dev toolchain is 1.98 | — |
+| `examples/bpsk_loopback.rs` | Filename says BPSK | It uses `CoppaCore::new()` = OFDM speed level 1 (BPSK *constellation* on OFDM carriers). Misleading name for a first example | file header |
+| `coppa-codec/src/lib.rs:1-5` crate doc | "the `Modem` trait for complete modulation/demodulation, and implementations for BPSK, QPSK, 8PSK, 16QAM, and 64QAM" | The crate's real centrepiece is `ofdm::{CoppaModem, SyncDetector, DelayDomainEstimator…}` — not mentioned in the crate doc at all | `crates/coppa-codec/src/lib.rs` |
+
+## Onboarding walk-through (what a new user actually experiences)
+
+Minute 0–5 (GitHub landing): description "Ham Radio Software Modem Reference", no topics, no homepage, 1 star, no releases. README Status table: "Partial", "Stub", "not wired", "Not implemented". Verdict most hams will reach: *unfinished BPSK experiment*. No screenshot, no audio sample, no waterfall image, no "what is this for".
+
+Minute 5–30 (build): `git clone && cargo build --workspace` works (rustup silently pulls 1.98.0 due to `rust-toolchain.toml`; Linux users without `libasound2-dev` fail at `alsa-sys` because `coppa-audio` defaults to `cpal-backend` — getting-started covers this, README does not). Build is heavy (`cpal`, `tokio`, `tokio-tungstenite` when features on).
+
+Minute 30–40 (first run):
+- `coppa loopback "Hello from Coppa"` → PASS, but "65520 samples" not the documented 46080. Minor, but the first thing a careful reader checks.
+- `coppa tx … -o cq.wav` → fine.
+- `coppa rx -i cq.wav` → **prints hex**. The tutorial promises text. There is no flag to get text back; `--raw` gives *more* hex. A new user concludes decode is broken.
+- `coppa devices` prints devices in the release binary here, but a stock `cargo build` of `coppa-cli` (default features = `file-backend` only) prints "(compile with cpal-backend feature)". The tutorial/README don't tell you to build with `--features cpal-backend` for tx/rx/listen live audio; they mention it only for `devices`.
+- `coppa listen` and `coppa rx` (no `-i`) both do live receive — overlapping commands, no doc explains which to use.
+- `coppad --help` → starts the daemon and blocks; must Ctrl-C. `coppad -V` same. There is no usage line at all.
+- `coppad` without a config file "load_or_default" silently uses defaults with `vara_enabled=false`, `websocket_enabled=false`, no callsign → the daemon does nothing observable; the log warns "No callsign configured" and that's it. No "next step" hint.
+- The daemon compiled from the tutorial's `cargo run --bin coppad` has **no** `cpal-backend` → moves no audio (CLAUDE.md:76 admits this; tutorial does not).
+
+Hour 1–2 (trying to do something real): nothing tells a Pat/Winlink user how to point Pat at `127.0.0.1:8300`, which VARA commands are honoured (`CONNECT`, `LISTEN`, `MYCALL`, `BW500/2300/2750`, `COMPRESSION`, `VERSION`, `ABORT`, `DISCONNECT`, `TUNE` — found only by grepping `crates/coppa-host/src/vara/`), and crucially that **both ends need coppa** (not RF-compatible with VARA) — the caveat is present but never turned into "so here's how you set up two stations". The WebSocket JSON schema (`MyCall/Connect/Disconnect/Send/Status/Spectrum`) is documented nowhere outside serde derives. The TNC/KISS mode (`coppad --tnc`) is completely undocumented, including its port.
+
+Weekend (developer): `cargo doc --workspace --no-deps` → **47 warnings** (21 in `coppa-codec`, mostly `[k]`/`[i]` bracket math in doc comments being parsed as intra-doc links, plus ~15 public-docs-link-to-private-item, 3 unclosed HTML tags `<callsign>`, `<dest>`, `<digi>` in `vara/protocol.rs`, and an output filename collision between the root `coppa` package and… itself). `coppa-protocol`'s crate doc is one line. To understand the system you must read CLAUDE.md, an 81 KB file with individual bullet points exceeding 10 KB (line 77 alone is ~8 KB; line 88 ~12 KB), then the wiki, then eight ADRs, then BENCHMARKS.md (219 KB, reverse-chronological, with a "read before older sections" corrections section in the middle). The gap analysis at `docs/analysis/` is the clearest statement of what the project is trying to be, and nothing links to it.
+
+Dead links: 0 broken markdown links in the repo. But ~35 backtick-quoted file references in CLAUDE.md, wiki pages and rustdoc point to gitignored `.superpowers/`/`docs/superpowers/` paths or to `dispensa` paths that public readers cannot follow.
+
+## Hit list
+
+| # | Item | Category | Impact | Effort | Evidence |
+|---|---|---|---|---|---|
+| 1 | Rewrite README Status/Features tables to describe the OFDM/NR-BG2/9-level system; delete every BPSK/Costas/Viterbi/EWMA/stub claim | stale-doc | H | M | table above (README:12-40) |
+| 2 | Make `coppa rx -i file.wav` print text when payload is valid UTF-8 (or add `--text`/`--hex`), and fix tutorial expected outputs | onboarding | H | S | observed hex output; `main.rs:725-730` |
+| 3 | Give `coppad` a real clap CLI: `--help`, `-V`, `--config <path>`, `--tnc`, `--print-default-config` | onboarding | H | S | `coppa-daemon/src/main.rs:34-49` |
+| 4 | Set GitHub repo description ("Open-source OFDM HF data modem for amateur radio, in Rust — VARA-style TCP API, Winlink-ready daemon, C FFI"), topics (`ham-radio`, `amateur-radio`, `hf`, `ofdm`, `ldpc`, `modem`, `winlink`, `rust`, `dsp`, `sdr`, `tnc`, `ax25`), homepage, social-preview image | positioning | H | S | `gh api repos/...` → topics `[]`, homepage null |
+| 5 | Cut a `v0.1.0` (or `v0.2.0`) tag + GitHub Release with prebuilt `coppa`/`coppad` for linux-x86_64, linux-aarch64 (Pi), macOS, Windows, built with `cpal-backend,websocket` | packaging | H | M | 0 releases, 0 tags |
+| 6 | Rewrite ARCHITECTURE.md: real TX/RX pipeline diagram (from SPEC §1-10), correct LOC/test/crate counts, drop the stale Dependencies block (or generate it), delete the "Not implemented" list that is all implemented | stale-doc | H | M | ARCHITECTURE:100-243 |
+| 7 | Delete `PLAN-hardening.md` (all items done/obsolete) and the README link to it; move any residue to a `ROADMAP.md` | stale-doc | M | S | PLAN-hardening.md:95-102, README:89 |
+| 8 | Delete or rewrite `models/README.md` (describes a deleted registry); consider deleting `models/` entirely | stale-doc | M | S | `grep -rn 'models/' crates` → empty |
+| 9 | Fix the "level 8 doesn't exist" wart: renumber 1–9 with a wire-format note, or document "levels 1-7, 9, 10 (8 reserved)" in README/SPEC/CLI (`coppa config` should list levels) | polish | M | S/M | `coppa_modem.rs:90-153` |
+| 10 | Add a "Who is this for / what problem it solves" paragraph and a comparison table (VARA HF, ARDOP, Mercury/FreeDV data, PACTOR, Coppa) covering licence, OS, RF-compat, bandwidth, ARQ, API, cost | positioning | H | S | none exists |
+| 11 | Move the "not RF-compatible with VARA — both ends run coppa" caveat into a call-out box directly under the tagline, phrased as a *feature* ("your own open waveform") rather than a disclaimer buried in a table cell | positioning | H | S | README:22, :27 |
+| 12 | Add a Pat/Winlink integration guide (`docs/PAT.md`): `pat configure` `varahf` block → `127.0.0.1:8300/8301`, which VARA commands are honoured, what's ignored, two-station setup | onboarding | H | M | no Winlink/Pat mention in any doc; VARA command set only in source |
+| 13 | Document the WebSocket JSON API (request/response schema, `Spectrum` stream) in `docs/API-websocket.md`; document VARA-style command set in `docs/API-vara.md` | docs-arch | H | M | `websocket.rs:10-40`, `vara/command.rs` |
+| 14 | Document `coppad --tnc` (AFSK-1200/AX.25/KISS) — ports, config, how to point Direwolf-style clients at it; add to README Features | stale-doc | M | S | `tnc.rs:1-2`; zero docs |
+| 15 | Fix getting-started: drop `--features file-backend`; say live audio needs `--features cpal-backend` on both binaries; add rigctld/hamlib prerequisite; add `coppa tune`; align the `coppad.toml` sample with `coppad.toml.example`; use `#include "coppa.h"` and show the v2 bytes API | onboarding | H | S | getting-started:27-134 |
+| 16 | Add `--features` guidance table (which feature for which command) to README | onboarding | M | S | CLI/daemon `[features]` |
+| 17 | Add a `docs/README.md` index (user guide → operator guide → API → spec → ADRs → benchmarks → analysis) and link it from README | docs-arch | H | S | `docs/` has no index; community profile points at `tree/master/docs` |
+| 18 | Split CLAUDE.md: keep a ≤100-line agent brief; move the Known Limitations narrative (lines 71-316, ~75 KB) into `docs/LIMITATIONS.md` or per-topic ADR/BENCHMARKS sections | docs-arch | H | M | `CLAUDE.md` 81 KB, single bullets >10 KB; Tony's global rule says ≤100 lines |
+| 19 | Purge references to gitignored `.superpowers/` and `docs/superpowers/` paths from CLAUDE.md, wiki pages and rustdoc, or commit the referenced docs | stale-doc | M | S | ~35 dead backtick refs |
+| 20 | Fix wiki cross-repo links (`adr/0006-…`, `questions/0028-…`) to full `dispensa` URLs; re-verify wiki pages (55 commits stale) | stale-doc | L | S | `git rev-list --count 59b0b63..HEAD` → 55 |
+| 21 | Add `CHANGELOG.md` (Keep-a-Changelog, with the three wire-format breaks called out) | packaging | M | S | none exists |
+| 22 | Publish `coppa-dsp`, `coppa-codec`, `coppa-protocol`, `coppa-channel`, `coppa-engine` to crates.io (names are free: all 404); add `repository`, `readme`, `keywords`, `categories`, `homepage`, `documentation` to every `Cargo.toml`; then add crates.io + docs.rs badges | packaging | M | M | crates.io 404 for all `coppa*`; Cargo.toml has only `description/version/license` |
+| 23 | Rename the root package (`coppa`, "root package for integration tests") or mark `publish = false`; its `src/lib.rs` facade re-exports only 4 crates and shadows the CLI's name | packaging | L | S | `Cargo.toml:49-56`, `src/lib.rs` |
+| 24 | Fix 47 rustdoc warnings (escape `[k]` math as `\[k\]` or backticks; `--document-private-items` links; close `<callsign>` tags) and add `RUSTDOCFLAGS=-Dwarnings cargo doc` to CI | docs-arch | M | S | `cargo doc --workspace --no-deps` → 47 |
+| 25 | Write crate-level docs with a runnable example for `coppa-protocol` (1 line today), `coppa-codec` (mentions no OFDM), `coppa-dsp`, `coppa-channel`; add `#![doc = include_str!("../README.md")]` where a per-crate README exists | docs-arch | M | M | `crates/*/src/lib.rs` `//!` line counts 1-10 |
+| 26 | Rename `examples/bpsk_loopback.rs` → `text_loopback.rs`; add `examples/daemon_client.py` (VARA TCP) and `examples/ws_client.html` (spectrum) | polish | L | S | file header uses `CoppaCore` (OFDM) |
+| 27 | Enable GitHub Discussions (Q&A, Show-and-tell, Ideas) and mention it in README "Community"; optionally a groups.io list for the ham audience | community | M | S | `has_discussions: false` |
+| 28 | Add `.github/ISSUE_TEMPLATE/{bug,feature,field-report}.yml` and `PULL_REQUEST_TEMPLATE.md`; a "Field report" template (rig, soundcard, band, SNR, speed level reached) doubles as a "who is using this" feed | community | M | S | community profile `issue_template: null` |
+| 29 | Add a repo-local `CODE_OF_CONDUCT.md` (org-level one exists but README doesn't link it) | community | L | S | community profile points at `HagaleTechnologies/.github` |
+| 30 | Add SPEC front-matter: spec version (e.g. `SPEC-1.2`), date, wire-format version, changelog table; replace the dead `f725f7c`/`feature/field-readiness` reference with tag/commit on `main` | positioning | M | S | SPEC.md:3-5 |
+| 31 | Publish SPEC as a citable artifact: `CITATION.cff` + Zenodo DOI on the first release; add a "How to cite" section | positioning | L | S | none |
+| 32 | Fix `SPEED_LEVELS` level-10 `ldpc_rate 7/8` and `CodeRate::Rate7_8` stale label (SPEC §12 already documents the discrepancy) so the code, SPEC and any table agree on 5/6 | stale-doc | M | S | `coppa_modem.rs:146-148`; SPEC §12 |
+| 33 | README needs a screenshot/GIF (WebSocket waterfall) and a 5-second audio sample (`testdata/golden/L2_clean.wav` already exists — link it as "what it sounds like") | positioning | M | S | golden WAVs exist |
+| 34 | Add a "Performance at a glance" table to README: FER≤10% SNR per level on AWGN and Watterson Good/Moderate/Poor, sourced from BENCHMARKS "Current performance" section, with the caveat that it's simulation, no OTA | positioning | H | S | BENCHMARKS.md:1999-2100 |
+| 35 | Reorganise BENCHMARKS.md: a short current-state summary at the top, then move the 20+ dated investigation logs to `docs/benchmarks/<date>-<topic>.md` | docs-arch | M | M | 219 KB single file, corrections section mid-file |
+| 36 | Wiki: decide whether it's for humans or agents. Either render it (mdBook/GitHub Pages: `wiki/` + `docs/` + rustdoc) or move it under `docs/notes/` and stop pretending "wiki" | docs-arch | M | M | `wiki/wiki.toml` `visibility = "public"`, `maintainer: agent` |
+| 37 | Set up GitHub Pages / mdBook site: Home, Install, Quick start, Operating, Pat/Winlink, API, SPEC, Benchmarks, ADRs, rustdoc | docs-arch | M | M | `has_pages: false` |
+| 38 | Roadmap visibility: Linear COP tickets are private; publish a `ROADMAP.md` (or GitHub Project) with the open items from the gap analysis + CLAUDE.md "still open" list (fade-diversity interleaving, block-ACK, level-9 fading, HF↔VHF profile desync, live two-radio test) | community | M | S | `gh issue list` empty; roadmap only in Linear/CLAUDE.md |
+| 39 | Versioning story: state in README that 0.x = wire format may break; tie wire-format v1 to a `v0.x` tag; adopt "bump minor on wire break" policy | packaging | M | S | SECURITY.md "0.x", `version = "0.1.0"` since June |
+| 40 | Naming/discoverability: keep "Coppa" but always write "Coppa HF modem" / "coppa-modem" in titles, topics, crates keywords; register `coppa-modem` on crates.io as a facade or use `coppa-*` crates only; add a pronunciation/etymology line ("KOH-pah", Italian *coppa*, the cup/cured shoulder — not the privacy law) | positioning | M | S | WebSearch: "coppa" page 1 = COPPA law / `rametta/coppa` / COPPA-CCP; "coppa modem ham radio rust" finds nothing |
+| 41 | Elevator pitch in README first screen (proposed below), with three audience-specific "Start here" links (Ham operator / Pat-Winlink dev / Rust DSP dev) | positioning | H | S | README:1-8 |
+| 42 | Add "Hardware tested / known-good rigs & interfaces" section (even if "none yet — send a field report") — honesty + a call to action | community | M | S | CLAUDE.md: "no live two-radio field test" |
+| 43 | Add an EmComm/Linux-gateway use-case section: Raspberry Pi 4 target, `coppad` as a systemd unit (ship `contrib/coppad.service`), `RUST_LOG` docs | onboarding | M | S | ARCHITECTURE "Goals: Raspberry Pi 4" but no Pi instructions |
+| 44 | README license section: mention GitHub shows Apache-2.0 only; consider a top-level `LICENSE` pointer file, or `COPYRIGHT`, so the dual licence is detected | polish | L | S | `licenseInfo` → Apache-2.0 |
+| 45 | Move MSRV line out of the License section into a "Requirements" section together with the pinned toolchain note | polish | L | S | README:110 |
+| 46 | `coppa config` should print speed levels (modulation/rate/nominal bps/airtime), not only 4 named profiles; `--profile` help should list valid values | onboarding | M | S | `coppa config` output |
+| 47 | Unify `coppa listen` and `coppa rx` (live) or document the difference; `listen --raw` says "decoded text", `rx --raw` says "hex" — inconsistent | polish | L | S | `coppa listen --help` vs `coppa rx --help` |
+| 48 | `coppad` with no config and no callsign should print a one-line "nothing enabled; copy coppad.toml.example" hint | onboarding | M | S | `main.rs:52-54` |
+| 49 | CONTRIBUTING: add "how to add a speed level / profile", "how to regenerate golden vectors", "how to run benches", "bench examples are not in CI" (CLAUDE.md admits it) | docs-arch | M | S | CONTRIBUTING.md is 46 lines |
+| 50 | CONTRIBUTING:31 says "CI runs only `--lib` tests" — contradicted by CLAUDE.md:65 (`test-full` job exists) | stale-doc | L | S | `ci.yml:60-92` |
+| 51 | ADR index (`docs/adr/README.md`) with status/date table; ADR-002 "FEC strategy" (convolutional+LDPC) is superseded by ADR-005 but still says "Accepted" | docs-arch | M | S | `docs/adr/002-fec-strategy.md` |
+| 52 | Remove the `wiki/pages/adr-00x-*.md` mirrors of `docs/adr/` or make them pure pointers (they currently restate content; CLAUDE.md:323 says "the wiki points, it never restates") | docs-arch | L | S | 7 `adr-*` wiki pages |
+| 53 | Clean stale `codex-clean:<sha>` labels (10+) from the repo — visible noise for anyone filing an issue | polish | L | S | `gh label list` |
+| 54 | README: `coppa tx "CQ CQ CQ DE VK2ABC K"` — use a neutral example callsign (`N0CALL`) as `examples/` already does | polish | L | S | README:56 |
+| 55 | `coppad.toml.example` `[engine] profile` comment lists `HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY` but nothing explains what VHF_FAST means on an HF modem (speed level ≥5 routes to `vhf_wide`) — document the profile↔level↔bandwidth mapping | onboarding | M | S | `profiles.rs`; CLAUDE.md "select_ofdm_profile routes every level >= 5 to vhf_wide" |
+| 56 | Add `--version` output that includes wire-format version and enabled features (`coppa --version` → "coppa 0.1.0"; `coppa_version()` FFI exists) | polish | L | S | `coppa --version` |
+| 57 | Fix `getting-started` "Next Steps" to link OPERATING.md, SPEC.md, examples, and the gap analysis | polish | L | S | getting-started:153-156 |
+
+## Proposed README skeleton
+
+1. **Title + tagline + badges** — one line that says OFDM / HF / amateur radio / Rust; CI, licence, MSRV, crates.io, docs.rs.
+2. **What it is (3 sentences) + call-out box** — "Coppa is its own open waveform; it is *not* RF-compatible with VARA. Both stations run Coppa. The TCP API is VARA-shaped so existing hosts (Pat, Winlink Express-style) work unchanged."
+3. **Who it's for / Start here** — three links: Ham operator (install → tune → first QSO), Pat/Winlink integrator (daemon + API), Rust DSP developer (crates + SPEC).
+4. **What it sounds/looks like** — waterfall GIF, link to a golden WAV.
+5. **Features** — grouped: Waveform (OFDM 48 kHz, 300–2700 Hz, 9 speed levels BPSK→64-QAM, NR BG2 LDPC, IR-HARQ, ±50 Hz CFO); Link layer (ARQ, compression, closed-loop rate, CP negotiation); Station (PTT rigctld/serial/GPIO, TUNE, busy gate, ID timer, beacon); Interfaces (VARA-style TCP, WebSocket + spectrum, KISS/AX.25 TNC, C FFI); Tooling (bench harness, Watterson model, golden vectors).
+6. **Performance at a glance** — small table from BENCHMARKS with "simulation only, no OTA yet" caveat.
+7. **Install** — prebuilt binaries per OS; `cargo install`; build-from-source with the feature table and OS prerequisites.
+8. **Quick start (5 min)** — loopback → tx to WAV → rx from WAV → `coppa tune` → `coppad` with the example config → point Pat at 8300.
+9. **How it compares** — table vs VARA HF / ARDOP / Mercury / PACTOR.
+10. **Status & roadmap** — honest one-paragraph status ("field-ready daemon, no two-radio OTA validation yet"), link ROADMAP.md, wire-format versioning policy.
+11. **Documentation map** — user guide, operating guide, API docs, SPEC, ADRs, benchmarks, rustdoc.
+12. **Crates** — table (keep current one, fix `coppa-ml` and `coppa-radio` rows).
+13. **Community** — Discussions, field-report template, groups.io, how to cite.
+14. **Contributing / Security / Licence** — pointers only.
+
+### Positioning statement (proposed)
+
+> **Coppa** is an open-source, dual-licensed (MIT/Apache-2.0) OFDM data modem for HF amateur radio, written in Rust. It gives Linux, macOS, Windows and Raspberry Pi stations a modern sound-card waveform — 9 adaptive speed levels from BPSK to 64-QAM, 5G-style LDPC with incremental-redundancy ARQ, ±50 Hz frequency tolerance in a standard 2.4 kHz SSB channel — behind a VARA-compatible TCP API, so existing Winlink/Pat clients work without modification. Coppa is its own waveform (it does not interoperate with VARA over the air), fully specified in a public conformance spec with golden test vectors, so anyone can build a compatible implementation. Use it as a daemon on an EmComm gateway, as a library in your own Rust or C application, or as a readable reference for how a modern HF modem actually works.
+
+### Tagline options
+
+- "An open OFDM HF modem for amateur radio, in Rust."
+- "Winlink-ready HF data modem — open waveform, open spec, open source."
+- "The HF modem you can read: OFDM + LDPC + ARQ, specified and tested, in Rust."
+- "Modern HF digital data for Linux, Pi and everything else — no licence key, no Windows."
+
+## Gap-analysis (2026-07-03) status
+
+| Rec. | Status | Evidence |
+|---|---|---|
+| §1 `BlockInterleaver` 35-bit self-puncture hotfix | **Done** | BENCHMARKS "Interleaver puncture + LDPC clamp hotfix"; SPEC §7.1 documents the bijection |
+| §2 #1 First-path timing + window back-off | **Done (variant)** | ADR-004 chose strongest-path-with-guard instead; `TIMING_BACKOFF` in `SyncDetector` |
+| §2 #2 Delay-domain parametric estimation | **Done, with unresolved regression** | `crates/coppa-codec/src/ofdm/delay_domain.rs`; ADR-006; CLAUDE.md:312 Watterson-Moderate 18→24→18 dB |
+| §2 #3 Kalman / fixed-lag smoother tracker | **Partial** | `kalman_tracker.rs` shipped as default payload path; `DriftTracker`/cascade built and **disabled** (`coppa_modem.rs:169-202`, gates not met) |
+| §2 #4 One-round LDPC-aided turbo re-estimation | **Done** | `reequalize_with_virtual_pilots` (`coppa_modem.rs:1074`); rescue rates in CLAUDE.md:313 |
+| §2 #5 NR BG2 mother code + IR-HARQ | **Done** | `fec/ldpc/{nr_bg2,rate_match}.rs`; `harq_evict`/`HarqRxBuffers` in transceiver; ADR-005; SPEC §5.3 |
+| §2 #6 Soft-ML Golay + CRC-assisted list | **Done** | `ofdm/header_fec.rs`; CLAUDE.md:309 (4096-codeword ML + list-2) |
+| §2 #7 Two-stage CFO (lag-480 Moose) | **Done** | CLAUDE.md:73 ±50 Hz; ADR-003; golden `*_ssbcfo` vectors |
+| §2 #8 Newman-phase in-band preamble | **Done** | SPEC §3.1; ADR-003 |
+| §2 #9 Layered LDPC + message clamp | **Done** | ADR-005 title "layered NMS decoder"; hotfix section for clamp |
+| §2 #10 Short-CP profile gated on delay spread | **Done, shipped off by default; adaptivity measured null** | `hf_standard_short_cp`, `CpGate`, `cp_negotiator`; COP-2 in BENCHMARKS; `cp_gate_enabled`/`cp_negotiation_enabled` default false; CpGate 2.5 ms threshold flagged mis-set |
+| §3 Sync-scan CPU (O(1) sliding metric + stride) | **Done** | CLAUDE.md:307 "streaming O(1) preamble sync detector, ~0.0015-0.0035x realtime" |
+| §3 Cache `LdpcCodec::new` per level | **Done (by redesign)** | one `NrLdpc::new()` in `CoppaTransceiver::new` (`transceiver.rs:540`), not per receive |
+| §3 Per-symbol allocation elimination (`forward_into`, workspaces) | **Partial** | `LastFrameWorkspace` and scratch buffers exist (`coppa_modem.rs`), but CLAUDE.md:308 says "reusable decoder scratch buffers remain an untried follow-up"; LDPC CPU 1.5–4.3× old codec |
+| §3 Closed-form Gray-QAM demappers | **Done** | CLAUDE.md:314 (Task 6; 64-QAM 28-34×, 16-QAM 4.2× allocation-bound) |
+| §4.1 Telemetry to clients (SNR/BUSY/PTT/BUFFER, WS `status`) | **Done** | `StreamFrame{snr_db,cfo_hz,speed_level}` `engine.rs:47-80`; `BusyGate`; WS `Status{level…}` |
+| §4.2 TX level calibration (TUNE) | **Done** | `coppa tune`, VARA `TUNE`, `docs/OPERATING.md` |
+| §4.3 Real PTT + CLI rigctld flags | **Done** | `ptt_serial.rs`, `ptt_gpio.rs`; `coppa tx --ptt/--rigctld/--ptt-lead-ms` |
+| §4.4 Busy detect, station-ID timer, beacon, waterfall, live `coppa rx` | **Done** | `coppad.toml.example` `[station_id]`; `coppa-daemon/src/spectrum.rs`; `coppa rx` live capture |
+| §4.5 Golden vectors + conformance spec + OTA methodology | **Done ×2 / Open ×1** | 20 WAVs + manifest + CI test; SPEC.md; **no OTA/two-radio methodology or result anywhere** (CLAUDE.md: "still no live two-radio field test") |
+| §4.6 FFI v2 (binary payloads, config, metadata, 48 kHz constants) | **Done** | `coppa_engine_new_with`, `coppa_encode_bytes`, `coppa_engine_feed_samples`, `coppa_next_frame`; `coppa.h` |
+| §4.7 Multi-codeword frames + block-ACK | **Partial** | Multi-codeword done (ADR-007); **block-ACK never implemented** (CLAUDE.md:304; `grep block_ack` → empty) |
+| §5 Probabilistic amplitude shaping; NB-LDPC control channel; SBL/SAGE tracker; FT8-style ALE/beacon waveform | **Open** | no code |
+| §6.1 MIL-STD-188-110D Table XVI scenarios with Wilson CIs | **Done (0/27 pass)** | `coppa-bench/examples/milstd.rs` (has Wilson CI); CLAUDE.md:305 |
+| §6.2 IONOS-style session-robustness bench | **Done (target not met)** | `examples/session.rs`; Good 2-3/5 drop-free, Moderate/Poor 0/5 |
+| §6.3 Golden test-vector corpus, CI-checked | **Done** | `testdata/golden/`, `golden_vectors.rs` |
+| §6.4 Waveform conformance spec | **Done** | `docs/SPEC.md` |
+| §7 "Phase 4 field readiness" | **Done (in simulation)** | wiki `phase4-field-readiness`; PR #39 |
+| Cross-audit: fade-diversity (cross-frame) interleaving | **Open / falsified once** | BENCHMARKS "Transfer-level cross-frame interleaving: a falsified diversity hypothesis"; CLAUDE.md:312 "the one genuinely untried lever" |
+
+Net: ~22 of 27 recommendations landed in code; the open items are OTA validation, block-ACK, fade-diversity interleaving, allocation cleanup, and the §5 research bets — and **none of this progress is visible from the README**, which is the whole problem.
