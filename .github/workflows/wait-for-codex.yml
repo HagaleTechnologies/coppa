@@ -308,7 +308,15 @@ jobs:
               }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" -F hasComment="$HAS_COMMENT" -f commentId="${COMMENT_ID:-placeholder}" \
               2>/tmp/poll-err.log \
               | jq --arg since "$RUN_STARTED" --arg sha "$HEAD_SHA" '
-                def is_error_shaped: test("(quota exceeded|rate.?limit exceeded|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start)|create a codex account and connect)"; "i");
+                # "something went wrong"/"you exceeded your current quota" added
+                # (HAG-36, ported from the manta/credenza template): this file
+                # predated those phrasings, so error_head_tied below would
+                # silently stay 0 forever for the ref-not-found error ("Codex
+                # Review: Something went wrong... Provided git ref <sha> does
+                # not exist") -- flagged reviewing this PR (coppa#106) by
+                # Codex itself, catching that the new fail-fast check was
+                # inert against the exact failure it was meant to fix.
+                def is_error_shaped: test("(you exceeded your current quota|quota exceeded|rate limit reached|rate.?limit exceeded|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start)|create a codex account and connect|something went wrong)"; "i");
                 # Codex'"'"'s clean-pass response on a re-push can ALSO
                 # land as a plain issue comment (not a formal review, not
                 # a reaction) whose body embeds "**Reviewed commit:**
