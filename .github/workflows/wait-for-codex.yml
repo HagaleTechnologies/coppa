@@ -334,23 +334,33 @@ jobs:
             if [ "$reviews" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ] || [ "$comment_head_tied" -gt 0 ]; then
               reviewed_head=1
             fi
-            # Deliberately does NOT also require COMMENT_ID to be non-empty
-            # here (a fix briefly applied and then reverted, this exact PR
-            # #102 -- Codex review of the identical patch propagated to
-            # manta#156 caught the regression it introduced): when
-            # CODEX_REVIEW_PAT is unset, a missing COMMENT_ID does not
-            # actually strand this branch -- `reviews` and `comment_head_tied`
-            # are both computed independent of any specific comment id, and
-            # `comment_thumbsup` alone degrades to 0 via this step's own
-            # `@include(if: $hasComment)` GraphQL guard (see HAS_COMMENT
-            # above) rather than erroring. Routing a no-COMMENT_ID re-push
-            # into the loose branch instead (as the reverted fix did)
-            # reintroduces exactly the stale-signal hole this strict branch
-            # exists to close: a response to the PREVIOUS head can land
-            # after the new push's own cutoff and satisfy the loose
-            # branch's untied comment/thumbsup checks with no signal ever
-            # tied to the new HEAD_SHA.
-            if [ "$IS_SYNC" = "true" ]; then
+            # A no-COMMENT_ID run (CODEX_REVIEW_PAT unset, so the "Request a
+            # review" step above skipped) only falls through to the loose
+            # branch when it's ALSO not a remediation-risk event
+            # (IS_REMEDIATION = synchronize || reopened -- see above). Two
+            # rounds of Codex review on this exact predicate, each catching
+            # what the previous one missed:
+            #   1. coppa#102 (P2): the original strict-only condition
+            #      stranded a genuine bare-thumbsup clean-pass on a
+            #      no-PAT opened/ready_for_review run -- nothing PROVES a
+            #      stale prior-head signal could exist there, so loosening
+            #      is safe.
+            #   2. manta#156 (P1): naively loosening on EVERY IS_SYNC-true
+            #      no-COMMENT_ID case (this PR's own briefly-reverted
+            #      commit) ALSO loosened synchronize/reopened -- where a
+            #      response to the PREVIOUS head landing after the new
+            #      push's own cutoff CAN satisfy the loose branch's untied
+            #      comment/thumbsup checks with no signal ever tied to the
+            #      new HEAD_SHA.
+            #   3. coppa#104 (P2, re-raised once the above was reverted
+            #      back to strict-only): reverting all the way back
+            #      restranded the SAME opened/ready_for_review case #1
+            #      found in the first place.
+            # IS_REMEDIATION is exactly "this event carries stale-prior-head
+            # risk" (already computed above for a different purpose) --
+            # reused here as the one case that must stay strict regardless
+            # of COMMENT_ID; every other no-COMMENT_ID case is safe to loosen.
+            if [ "$IS_SYNC" = "true" ] && { [ -n "$COMMENT_ID" ] || [ "$IS_REMEDIATION" = "true" ]; }; then
               # On a re-push specifically, a bare new issue comment or a
               # generic issue-level thumbsup is NOT proof Codex looked at
               # THIS head -- only accept signals provably tied to this
