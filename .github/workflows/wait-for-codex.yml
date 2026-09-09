@@ -227,6 +227,21 @@ jobs:
           # restated_count/unresolved_baseline_count computation
           # (synchronize/reopened).
           IS_REMEDIATION: ${{ github.event.action == 'synchronize' || github.event.action == 'reopened' }}
+          # A SEPARATE concern from IS_REMEDIATION above (deliberately not
+          # reused -- that variable also gates auto-resolve post-poll branch
+          # selection, a different question): whether this event carries
+          # stale-prior-head risk for the no-COMMENT_ID fallback below. A
+          # response to a PREVIOUS head can land after THIS run's own cutoff
+          # and satisfy an untied loose-branch signal with nothing ever tied
+          # to the new HEAD_SHA. True for synchronize/reopened (obviously),
+          # AND for ready_for_review -- a draft PR can accumulate its own
+          # commits/comments/thumbsups before ever going ready, so
+          # ready_for_review does NOT guarantee no prior head exists to be
+          # confused with, unlike a genuine first-ever `opened` (Codex P1,
+          # pancetta#364, extending manta#156's original finding). Only
+          # `opened` (and any rerun of it, since a rerun replays the
+          # original action unchanged) is actually risk-free.
+          IS_REMEDIATION_RISK: ${{ github.event.action == 'synchronize' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' }}
         run: |
           set -o pipefail
           # apply_clean_label(): SHA-scoped label name (never a bare
@@ -334,19 +349,37 @@ jobs:
             if [ "$reviews" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ] || [ "$comment_head_tied" -gt 0 ]; then
               reviewed_head=1
             fi
-            # Also require COMMENT_ID to be non-empty, not just IS_SYNC (Codex
-            # P2, this exact fix, self-caught live on coppa#102 -- the widened
-            # IS_SYNC above is true for opened/ready_for_review purely by
-            # event action, but the "Request a review" step it depends on
-            # skips entirely when CODEX_REVIEW_PAT is unset, in which case NO
-            # request comment (and no COMMENT_ID) was ever created. Without
-            # this guard, that combination forced the strict branch below --
-            # which requires a comment_thumbsup/comment_head_tied signal tied
-            # to a request comment that structurally cannot exist -- so a
-            # genuine native/manual clean response landing only as a bare PR-
-            # level thumbsup (the loose branch's own signal) would be ignored
-            # and this check would wait out its full timeout for nothing.
-            if [ "$IS_SYNC" = "true" ] && [ -n "$COMMENT_ID" ]; then
+            # A no-COMMENT_ID run (CODEX_REVIEW_PAT unset, so the "Request a
+            # review" step above skipped) only falls through to the loose
+            # branch when it's ALSO not a remediation-risk event
+            # (IS_REMEDIATION_RISK above). Three rounds of Codex review on
+            # this exact predicate, each catching what the previous one
+            # missed:
+            #   1. coppa#102 (P2): the original strict-only condition
+            #      stranded a genuine bare-thumbsup clean-pass on a
+            #      no-PAT opened/ready_for_review run -- nothing PROVES a
+            #      stale prior-head signal could exist there, so loosening
+            #      is safe.
+            #   2. manta#156 (P1): naively loosening on EVERY IS_SYNC-true
+            #      no-COMMENT_ID case (this PR's own briefly-reverted
+            #      commit) ALSO loosened synchronize/reopened -- where a
+            #      response to the PREVIOUS head landing after the new
+            #      push's own cutoff CAN satisfy the loose branch's untied
+            #      comment/thumbsup checks with no signal ever tied to the
+            #      new HEAD_SHA.
+            #   3. coppa#104 (P2, re-raised once the above was reverted
+            #      back to strict-only): reverting all the way back
+            #      restranded the SAME opened/ready_for_review case #1
+            #      found in the first place.
+            #   4. pancetta#364 (P1): a fix scoped to only synchronize/
+            #      reopened still wrongly loosened ready_for_review -- a
+            #      draft PR can accumulate its own commits/comments/
+            #      thumbsups before ever going ready, so a delayed signal
+            #      from THAT history can satisfy this run's window even
+            #      though ready_for_review's own head never got a fresh
+            #      one. Only a genuine first-ever `opened` (nothing could
+            #      predate a PR's own creation) is actually risk-free.
+            if [ "$IS_SYNC" = "true" ] && { [ -n "$COMMENT_ID" ] || [ "$IS_REMEDIATION_RISK" = "true" ]; }; then
               # On a re-push specifically, a bare new issue comment or a
               # generic issue-level thumbsup is NOT proof Codex looked at
               # THIS head -- only accept signals provably tied to this
