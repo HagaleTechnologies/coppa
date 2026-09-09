@@ -18,14 +18,19 @@ on:
 
 permissions:
   contents: read
-  # pull-requests: read and checks: write are narrowed further at the job
-  # level below (codex-clean; audit) -- a job's own permissions: block can
-  # only be a SUBSET of what's granted here, never wider. Without a scope
-  # present at this top level, GitHub rejects the whole workflow file at
-  # parse time (zero jobs created, no per-job error) the moment a job
-  # requests a scope this block doesn't grant -- confirmed live on coppa
-  # PR #90 (pull-requests) and again on every push-triggered run since
-  # 2026-09-01 (checks -- see the `audit` job's own comment below).
+  # pull-requests: read and checks: write exist here ONLY because a job's
+  # own permissions: block may narrow this top-level grant but can never
+  # request a scope this block doesn't already declare -- confirmed live
+  # on coppa PR #90 (pull-requests) and again on every push-triggered run
+  # since 2026-09-01 (checks, see the `audit` job's own comment below).
+  # EVERY job below now carries its own explicit permissions: block
+  # narrowing back to what it actually needs (contents: read only, except
+  # codex-clean which also needs pull-requests: read, and audit which
+  # also needs checks: write) -- Codex review, coppa#103 P1/P2: without
+  # this, every job lacking its own block silently inherited checks:
+  # write too, including jobs that execute PR-controlled Cargo build
+  # scripts (build.rs, proc-macros, tests) -- unnecessarily letting
+  # compromised build code forge or modify check runs.
   pull-requests: read
   checks: write
 
@@ -35,6 +40,8 @@ env:
 jobs:
   check:
     name: Check
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -48,6 +55,8 @@ jobs:
 
   test-features:
     name: Test with Features (fast, lib-only)
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -62,6 +71,8 @@ jobs:
 
   test-full:
     name: Full test suite
+    permissions:
+      contents: read
     needs: [codex-clean]
     # Job-level if: is unconditional (always()), not a bare success/skipped
     # check: GitHub Actions auto-skips a job whenever any of its `needs`
@@ -96,6 +107,8 @@ jobs:
 
   bench-fuzz:
     name: Bench & Fuzz Compilation
+    permissions:
+      contents: read
     needs: [codex-clean]
     if: always()
     runs-on: ubuntu-latest
@@ -121,6 +134,8 @@ jobs:
 
   clippy:
     name: Clippy
+    permissions:
+      contents: read
     needs: [codex-clean]
     if: always()
     runs-on: ubuntu-latest
@@ -144,6 +159,8 @@ jobs:
 
   fmt:
     name: Format
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -155,6 +172,8 @@ jobs:
 
   msrv:
     name: MSRV Check
+    permissions:
+      contents: read
     needs: [codex-clean]
     if: always()
     runs-on: ubuntu-latest
@@ -184,6 +203,8 @@ jobs:
 
   platform:
     name: Platform Check (${{ matrix.os }})
+    permissions:
+      contents: read
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -310,6 +331,8 @@ jobs:
 
   deny:
     name: Supply-chain check (cargo-deny)
+    permissions:
+      contents: read
     needs: [codex-clean]
     if: always()
     runs-on: ubuntu-latest
@@ -347,12 +370,34 @@ jobs:
             exit 1
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+      # Codex review, coppa#103 P1: for a fork PR or a Dependabot PR,
+      # GitHub silently downgrades ANY requested write permission back to
+      # read on the pull_request event, regardless of what this job's own
+      # permissions: block above declares -- rustsec/audit-check always
+      # tries to create a check-run to report its findings, so it would
+      # reproduce the exact "Resource not accessible by integration"
+      # failure this job exists to fix, permanently blocking CI on every
+      # external contribution and every Dependabot bump. Two mutually
+      # exclusive steps: the check-run-reporting action only where a
+      # write token is actually available (push, or a same-repo PR); a
+      # plain cargo-audit CLI run (same tool, no check-run, pass/fail via
+      # exit code alone) everywhere else -- coverage is identical either
+      # way, only the reporting mechanism differs.
+      - name: Security Audit (check-run reporting)
+        if: github.event_name != 'pull_request' || (github.actor != 'dependabot[bot]' && !github.event.pull_request.head.repo.fork)
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Security Audit (read-only token -- fork or Dependabot PR, no check-run)
+        if: github.event_name == 'pull_request' && (github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.fork)
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
 
   wiki-lint:
     name: Wiki lint
+    permissions:
+      contents: read
     if: ${{ github.actor != 'dependabot[bot]' && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) }}
     runs-on: ubuntu-latest
     steps:
@@ -369,6 +414,8 @@ jobs:
   # job that duplicates linux coverage already in test-full/test-features.
   ci:
     name: CI
+    permissions:
+      contents: read
     needs:
       [
         check,
