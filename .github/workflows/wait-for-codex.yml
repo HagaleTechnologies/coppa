@@ -227,6 +227,21 @@ jobs:
           # restated_count/unresolved_baseline_count computation
           # (synchronize/reopened).
           IS_REMEDIATION: ${{ github.event.action == 'synchronize' || github.event.action == 'reopened' }}
+          # A SEPARATE concern from IS_REMEDIATION above (deliberately not
+          # reused -- that variable also gates auto-resolve post-poll branch
+          # selection, a different question): whether this event carries
+          # stale-prior-head risk for the no-COMMENT_ID fallback below. A
+          # response to a PREVIOUS head can land after THIS run's own cutoff
+          # and satisfy an untied loose-branch signal with nothing ever tied
+          # to the new HEAD_SHA. True for synchronize/reopened (obviously),
+          # AND for ready_for_review -- a draft PR can accumulate its own
+          # commits/comments/thumbsups before ever going ready, so
+          # ready_for_review does NOT guarantee no prior head exists to be
+          # confused with, unlike a genuine first-ever `opened` (Codex P1,
+          # pancetta#364, extending manta#156's original finding). Only
+          # `opened` (and any rerun of it, since a rerun replays the
+          # original action unchanged) is actually risk-free.
+          IS_REMEDIATION_RISK: ${{ github.event.action == 'synchronize' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' }}
         run: |
           set -o pipefail
           # apply_clean_label(): SHA-scoped label name (never a bare
@@ -337,9 +352,9 @@ jobs:
             # A no-COMMENT_ID run (CODEX_REVIEW_PAT unset, so the "Request a
             # review" step above skipped) only falls through to the loose
             # branch when it's ALSO not a remediation-risk event
-            # (IS_REMEDIATION = synchronize || reopened -- see above). Two
-            # rounds of Codex review on this exact predicate, each catching
-            # what the previous one missed:
+            # (IS_REMEDIATION_RISK above). Three rounds of Codex review on
+            # this exact predicate, each catching what the previous one
+            # missed:
             #   1. coppa#102 (P2): the original strict-only condition
             #      stranded a genuine bare-thumbsup clean-pass on a
             #      no-PAT opened/ready_for_review run -- nothing PROVES a
@@ -356,11 +371,15 @@ jobs:
             #      back to strict-only): reverting all the way back
             #      restranded the SAME opened/ready_for_review case #1
             #      found in the first place.
-            # IS_REMEDIATION is exactly "this event carries stale-prior-head
-            # risk" (already computed above for a different purpose) --
-            # reused here as the one case that must stay strict regardless
-            # of COMMENT_ID; every other no-COMMENT_ID case is safe to loosen.
-            if [ "$IS_SYNC" = "true" ] && { [ -n "$COMMENT_ID" ] || [ "$IS_REMEDIATION" = "true" ]; }; then
+            #   4. pancetta#364 (P1): a fix scoped to only synchronize/
+            #      reopened still wrongly loosened ready_for_review -- a
+            #      draft PR can accumulate its own commits/comments/
+            #      thumbsups before ever going ready, so a delayed signal
+            #      from THAT history can satisfy this run's window even
+            #      though ready_for_review's own head never got a fresh
+            #      one. Only a genuine first-ever `opened` (nothing could
+            #      predate a PR's own creation) is actually risk-free.
+            if [ "$IS_SYNC" = "true" ] && { [ -n "$COMMENT_ID" ] || [ "$IS_REMEDIATION_RISK" = "true" ]; }; then
               # On a re-push specifically, a bare new issue comment or a
               # generic issue-level thumbsup is NOT proof Codex looked at
               # THIS head -- only accept signals provably tied to this
