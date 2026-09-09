@@ -308,7 +308,15 @@ jobs:
               }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" -F hasComment="$HAS_COMMENT" -f commentId="${COMMENT_ID:-placeholder}" \
               2>/tmp/poll-err.log \
               | jq --arg since "$RUN_STARTED" --arg sha "$HEAD_SHA" '
-                def is_error_shaped: test("(quota exceeded|rate.?limit exceeded|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start)|create a codex account and connect)"; "i");
+                # "something went wrong"/"you exceeded your current quota" added
+                # (HAG-36, ported from the manta/credenza template): this file
+                # predated those phrasings, so error_head_tied below would
+                # silently stay 0 forever for the ref-not-found error ("Codex
+                # Review: Something went wrong... Provided git ref <sha> does
+                # not exist") -- flagged reviewing this PR (coppa#106) by
+                # Codex itself, catching that the new fail-fast check was
+                # inert against the exact failure it was meant to fix.
+                def is_error_shaped: test("(you exceeded your current quota|quota exceeded|rate limit reached|rate.?limit exceeded|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start)|create a codex account and connect|something went wrong)"; "i");
                 # Codex'"'"'s clean-pass response on a re-push can ALSO
                 # land as a plain issue comment (not a formal review, not
                 # a reaction) whose body embeds "**Reviewed commit:**
@@ -329,6 +337,7 @@ jobs:
                       | select((reviewed_commit_prefix // "") as $c | $c != "" and ($sha | startswith($c)))
                     ] | length),
                     error_comments: ([$fresh_comments[] | select(.body | is_error_shaped)] | length),
+                    error_head_tied: ([$fresh_comments[] | select(.body | is_error_shaped) | select(.body | contains($sha))] | length),
                     reviews: ([$p.reviews.nodes[] | select(.author.login=="chatgpt-codex-connector" and .commit.oid==$sha and .submittedAt >= $since)] | length),
                     thumbsup: ([$p.reactions.nodes[] | select(.user.login | is_codex_bot) | select(.createdAt >= $since)] | length),
                     comment_thumbsup: ([(.data.commentNode.reactions.nodes // [])[] | select(.user.login | is_codex_bot) | select(.createdAt >= $since)] | length)
@@ -343,6 +352,7 @@ jobs:
             fi
             comment_head_tied=$(echo "$poll" | jq '.comment_head_tied')
             error_comments=$(echo "$poll" | jq '.error_comments')
+            error_head_tied=$(echo "$poll" | jq '.error_head_tied')
             reviews=$(echo "$poll" | jq '.reviews')
             thumbsup=$(echo "$poll" | jq '.thumbsup')
             comment_thumbsup=$(echo "$poll" | jq '.comment_thumbsup')
@@ -383,14 +393,27 @@ jobs:
               # On a re-push specifically, a bare new issue comment or a
               # generic issue-level thumbsup is NOT proof Codex looked at
               # THIS head -- only accept signals provably tied to this
-              # exact request. error_comments is deliberately NOT checked
-              # on this branch, so an unscoped error from some earlier,
-              # unrelated request can't fail the current push's still-
-              # pending signal.
+              # exact request. Plain error_comments is deliberately NOT
+              # checked on this branch, so an unscoped error from some
+              # earlier, unrelated request can't fail the current push's
+              # still-pending signal. error_head_tied IS checked (added
+              # HAG-36, 2026-09-09): an error-shaped comment whose own body
+              # contains this exact HEAD_SHA is as tightly scoped to "this
+              # request" as comment_head_tied is for a success -- Codex's
+              # ref-not-found error embeds the full SHA verbatim ("Provided
+              # git ref <sha> does not exist"), so this can't be a stale
+              # unrelated error. Confirmed live on HagaleTechnologies/
+              # pancetta#362: this exact error repeated twice 71 minutes
+              # apart for the same SHA and this branch silently waited out
+              # the full 70-minute timeout instead of failing fast on it.
               if [ "$reviews" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ] || [ "$comment_head_tied" -gt 0 ]; then
                 echo "Codex responded on this revision: reviews=$reviews comment_thumbsup=$comment_thumbsup comment_head_tied=$comment_head_tied"
                 responded=1
                 break
+              fi
+              if [ "$error_head_tied" -gt 0 ]; then
+                echo "::error::Codex reported an error for this exact revision ($HEAD_SHA) instead of reviewing it -- failing now rather than waiting out the remaining timeout. Re-run this check once the underlying Codex issue is resolved."
+                exit 1
               fi
             else
               # Check for a genuine success FIRST, error fail-fast
