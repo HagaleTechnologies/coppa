@@ -18,13 +18,16 @@ on:
 
 permissions:
   contents: read
-  # pull-requests: read is narrowed further at the job level below
-  # (codex-clean) -- a job's own permissions: block can only be a SUBSET
-  # of what's granted here, never wider. Without this scope present at
-  # this top level, GitHub rejects the whole workflow file at parse time
-  # (zero jobs created, no per-job error) the moment that job requests a
-  # scope this block doesn't grant -- confirmed live on coppa PR #90.
+  # pull-requests: read and checks: write are narrowed further at the job
+  # level below (codex-clean; audit) -- a job's own permissions: block can
+  # only be a SUBSET of what's granted here, never wider. Without a scope
+  # present at this top level, GitHub rejects the whole workflow file at
+  # parse time (zero jobs created, no per-job error) the moment a job
+  # requests a scope this block doesn't grant -- confirmed live on coppa
+  # PR #90 (pull-requests) and again on every push-triggered run since
+  # 2026-09-01 (checks -- see the `audit` job's own comment below).
   pull-requests: read
+  checks: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -326,6 +329,15 @@ jobs:
     needs: [codex-clean]
     if: always()
     runs-on: ubuntu-latest
+    # `rustsec/audit-check` creates a check-run to report its findings
+    # (vulnerabilities AND informational warnings like a yanked crate) --
+    # without `checks: write` the default GITHUB_TOKEN can't do that, and
+    # the action fails the whole job with "Resource not accessible by
+    # integration" even when cargo-audit itself found zero vulnerabilities.
+    # Failing on every push since 2026-09-01 for exactly this reason.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - name: Fail explicitly (not silently skip) if codex-clean did not pass
         run: |
