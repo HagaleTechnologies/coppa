@@ -86,7 +86,9 @@ fn parse_flat_yaml(src: &str) -> (BTreeMap<String, String>, BTreeMap<String, Vec
         current = Some(key.to_string());
         lists.entry(key.to_string()).or_default();
         let value = value.trim();
-        if value == "|" || value == ">" {
+        // Same header set `block_scalar_body` accepts: literal or folded, with
+        // or without a chomping/indentation indicator (`|-`, `>-`, `|2`).
+        if value.starts_with('|') || value.starts_with('>') {
             in_block_scalar = true;
             scalars.insert(key.to_string(), String::new());
             continue;
@@ -96,19 +98,46 @@ fn parse_flat_yaml(src: &str) -> (BTreeMap<String, String>, BTreeMap<String, Vec
     (scalars, lists)
 }
 
-/// Extracts a block-scalar (`key: |`) body -- the indented lines that follow,
+/// Extracts a block-scalar (`key: |` or the equally valid `key: >`) body -- the indented lines that follow,
 /// stopping at the first non-indented, non-empty line. `parse_flat_yaml`
 /// deliberately does not capture this (see its own doc); a test that needs to
 /// check a block scalar's actual prose uses this rather than searching the
 /// whole file, which would collateral-match unrelated comments or lists that
 /// happen to share a substring.
 fn block_scalar_body(src: &str, key: &str) -> String {
-    let marker = format!("{key}: |");
-    let start = src
-        .find(&marker)
-        .unwrap_or_else(|| panic!("{key} block scalar not found"));
+    // Accepts every block-scalar header YAML allows here -- literal (`|`) and
+    // folded (`>`), with or without a chomping/indentation indicator (`|-`,
+    // `>-`, `|+`, `>2`) -- rather than only the literal `key: |` the committed
+    // file happens to use today (COP-11 code-review finding F2). Hardcoding
+    // `"{key}: |"` meant rewriting `initial_prompt: |` as the equally valid
+    // `initial_prompt: >` made every caller panic with "block scalar not
+    // found" instead of asserting on the prose it was handed.
+    let prefix = format!("{key}:");
+    let mut lines = src.lines();
+    let mut saw_key = false;
+    let mut found_block = false;
+    for line in lines.by_ref() {
+        let Some(rest) = line.strip_prefix(&prefix) else {
+            continue;
+        };
+        saw_key = true;
+        let indicator = rest.split('#').next().unwrap_or(rest).trim();
+        if indicator.starts_with('|') || indicator.starts_with('>') {
+            found_block = true;
+            break;
+        }
+    }
+    assert!(
+        found_block,
+        "{key} block scalar not found{}",
+        if saw_key {
+            " -- the key is present but is not a `|`/`>` block scalar"
+        } else {
+            ""
+        }
+    );
     let mut body = String::new();
-    for line in src[start..].lines().skip(1) {
+    for line in lines {
         if line.is_empty() || line.starts_with(char::is_whitespace) {
             body.push_str(line);
             body.push('\n');
@@ -243,6 +272,32 @@ fn segments_match(pattern_segs: &[&str], segs: &[&str]) -> bool {
     }
 }
 
+/// Whether an `ls_workspace_folders` entry covers a workspace member -- i.e.
+/// the entry is the project root (`.`) or an ancestor of (or equal to) the
+/// member's path.
+///
+/// `ls_workspace_folders` is Serena's OTHER index-scoping knob, independent of
+/// `ignored_paths`: narrowing it (e.g. to `["crates/coppa-dsp"]`, a documented
+/// monorepo pattern) hides every other member from symbol search while leaving
+/// `ignored_paths` untouched -- reintroducing the silent grep-fallback COP-11
+/// exists to prevent, by a route the `ignored_paths`-only guard cannot see
+/// (COP-11 code-review finding F1).
+fn workspace_folder_covers(folder: &str, member: &str) -> bool {
+    let normalise = |p: &str| {
+        p.trim()
+            .trim_start_matches("./")
+            .trim_matches('/')
+            .to_string()
+    };
+    let folder = normalise(folder);
+    let member = normalise(member);
+    // "." (or "") is the project root and covers every member.
+    if folder.is_empty() || folder == "." {
+        return true;
+    }
+    member == folder || member.starts_with(&format!("{folder}/"))
+}
+
 /// Guards against `workspace_members` regressing to zero matches (e.g. a
 /// `Cargo.toml` reformat past its quote-splitting), which would otherwise let
 /// every `for member in workspace_members(...)` loop below iterate zero times
@@ -264,6 +319,33 @@ fn workspace_members_ignores_a_bracket_inside_a_comment() {
     // truncating every member declared after that comment.
     let toml = "[workspace]\nmembers = [\n    \"crates/a\", # see target]\n    \"crates/b\",\n]\n";
     assert_eq!(workspace_members(toml), vec!["crates/a", "crates/b"]);
+}
+
+#[test]
+fn block_scalar_body_accepts_every_valid_block_header() {
+    // Regression for COP-11 code-review finding F2: the marker used to be the
+    // hardcoded string `"{key}: |"`, so rewriting the config's
+    // `initial_prompt: |` as the equally valid `initial_prompt: >` (or adding a
+    // chomping indicator) made every caller panic with "block scalar not found"
+    // instead of asserting on the prose.
+    for header in ["|", ">", "|-", ">-", "|+", "|2"] {
+        let src = format!("other: x\ninitial_prompt: {header}\n  hello\n  world\nnext: y\n");
+        let body = block_scalar_body(&src, "initial_prompt");
+        assert!(
+            body.contains("hello") && body.contains("world"),
+            "header {header:?} produced {body:?}"
+        );
+        assert!(
+            !body.contains("next: y"),
+            "header {header:?} overran the block"
+        );
+    }
+    // `parse_flat_yaml` must recognise the same headers, or the body's indented
+    // lines leak into the surrounding scalar/list maps.
+    let (scalars, lists) = parse_flat_yaml("initial_prompt: >-\n  hello\nafter: y\n");
+    assert_eq!(scalars.get("after").map(String::as_str), Some("y"));
+    assert!(scalars.contains_key("initial_prompt"));
+    assert!(!lists.contains_key("hello"));
 }
 
 #[test]
@@ -324,6 +406,25 @@ fn serena_project_config_ignores_the_noise_that_would_pollute_an_index() {
 fn serena_project_config_leaves_every_workspace_member_visible_to_the_indexer() {
     let (_, lists) = parse_flat_yaml(&read(".serena/project.yml"));
     let ignored = lists.get("ignored_paths").cloned().unwrap_or_default();
+    // Both scoping knobs, not just `ignored_paths`: see
+    // `workspace_folder_covers`. `ls_workspace_folders` is asserted for
+    // presence elsewhere (FIELDS_THAT_MUST_BE_PRESENT_TO_AVOID_A_REWRITE);
+    // here its VALUE has to actually keep the whole workspace in scope.
+    let folders = lists
+        .get("ls_workspace_folders")
+        .cloned()
+        .unwrap_or_default();
+    let additional = lists
+        .get("ls_additional_workspace_folders")
+        .cloned()
+        .unwrap_or_default();
+    let scoped: Vec<String> = folders.into_iter().chain(additional).collect();
+    assert!(
+        !scoped.is_empty(),
+        "ls_workspace_folders must declare at least one folder (the committed \
+         config declares `.`) -- an empty list leaves this guard with nothing \
+         to check that the language server is actually pointed at the workspace"
+    );
     let members = workspace_members(&read("Cargo.toml"));
     assert_members_parsed(&members);
     for member in &members {
@@ -338,7 +439,39 @@ fn serena_project_config_leaves_every_workspace_member_visible_to_the_indexer() 
                  from Serena's indexer"
             );
         }
+        assert!(
+            scoped.iter().any(|f| workspace_folder_covers(f, member)),
+            "no ls_workspace_folders entry covers workspace member {member:?} \
+             (declared: {scoped:?}) -- narrowing that list scopes the language \
+             server away from the member, so symbol lookups there silently fall \
+             back to grep even though ignored_paths is clean"
+        );
     }
+}
+
+#[test]
+fn workspace_folder_coverage_catches_a_narrowed_ls_workspace_folders() {
+    // The committed value: the project root covers every member.
+    assert!(workspace_folder_covers(".", "crates/coppa-dsp"));
+    assert!(workspace_folder_covers("./", "crates/coppa-dsp"));
+    // A subtree entry covers itself and what is under it, nothing else.
+    assert!(workspace_folder_covers("crates", "crates/coppa-dsp"));
+    assert!(workspace_folder_covers(
+        "crates/coppa-dsp",
+        "crates/coppa-dsp"
+    ));
+    assert!(workspace_folder_covers("./crates/", "crates/coppa-dsp"));
+    // The narrowing that F1 describes: scoping to one crate must NOT be
+    // reported as covering its siblings.
+    assert!(!workspace_folder_covers(
+        "crates/coppa-dsp",
+        "crates/coppa-ml"
+    ));
+    // A prefix that is not a path-segment ancestor must not match.
+    assert!(!workspace_folder_covers(
+        "crates/coppa-d",
+        "crates/coppa-dsp"
+    ));
 }
 
 #[test]
