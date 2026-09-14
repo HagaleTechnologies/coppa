@@ -158,8 +158,12 @@ jobs:
           # on the SAME `opened` event this job also reacts to -- the job-level `if:`'s
           # `github.event.pull_request.labels` is a webhook-delivery-time snapshot that can't see
           # a label attached by a workflow racing against this one, so it must be re-checked live.
-          if [ "${{ github.event.pull_request.user.login }}" = "dependabot[bot]" ] && grep -qxF "needs-review" <<< "$current_labels"; then
-            echo "::notice::PR #$PR is a Dependabot major-version bump (needs-review attached) -- standing down without arming auto-merge; dependabot-auto-merge.yml deliberately never auto-merges these."
+          # Codex P1, round 2: checked for every admitted author, not just dependabot[bot] --
+          # .mergify.yml:68 excluded `-label = needs-review` for every author, and this
+          # workflow's own header comment already treats needs-review as a general pause label
+          # (see the `unlabeled`/`labeled` handling above), not a Dependabot-only signal.
+          if grep -qxF "needs-review" <<< "$current_labels"; then
+            echo "::notice::PR #$PR has needs-review attached -- standing down without arming auto-merge until a maintainer resolves it."
             exit 0
           fi
           if grep -qxF "needs-human" <<< "$current_labels"; then
