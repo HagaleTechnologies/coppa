@@ -254,7 +254,18 @@ jobs:
               gh pr comment "$PR" --repo "${{ github.repository }}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`) -- automatically re-armed auto-merge for one retry. If this fails again for the same commit, it will NOT retry again; it needs a human to look." || true
             fi
           else
-            echo "::error::Failed to re-arm auto-merge for PR #$PR (commit $HEAD_SHA12) -- --match-head-commit rejected the call (head moved) or the merge API call itself failed for another reason."
+            # Codex P1, this PR's own round 1: must fail the step, not just log -- this `elif`'s
+            # own condition is the merge call's exit status, so reaching this branch at all means
+            # NOTHING was written (no retry-used label, no handoff) -- falling through with exit
+            # 0 would let "Mark this merge-group attempt as handled" mark this attempt processed
+            # despite nothing having actually happened, permanently losing this head's one retry.
+            # A bare failure here (not a full handoff) is correct, not just minimal: no label was
+            # ever attached, so a redelivered workflow_run event naturally retries fresh via
+            # check-retried's own already_retried=false read -- exactly the safe behavior for a
+            # transient merge-API failure (--match-head-commit rejecting a moved head, a rate
+            # limit, etc.), without prematurely spending the human-handoff path on it.
+            echo "::error::Failed to re-arm auto-merge for PR #$PR (commit $HEAD_SHA12) -- --match-head-commit rejected the call (head moved) or the merge API call itself failed for another reason. Not marking this attempt handled -- a redelivered event will retry."
+            exit 1
           fi
 
       - name: Second failure -- hand off to a human
