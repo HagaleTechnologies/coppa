@@ -253,7 +253,20 @@ jobs:
                   if [ "$already_present" = "true" ]; then
                     gh pr comment "$PR" --repo "${{ github.repository }}" --body "needs-human was already attached before this fail-closed path ran (from another source) -- not claiming provenance over it; the existing pause stands as-is." >/dev/null 2>&1 || true
                   else
-                    gh pr comment "$PR" --repo "${{ github.repository }}" --body "<!-- queue-retry-handler:needs-human sha=$HEAD_SHA12 -->" >/dev/null 2>&1 || true
+                    # Verified, not `|| true`-and-forget like the sibling comment above (Codex
+                    # P1, this PR's own round 2): this specific comment carries the SHA marker
+                    # `needs_human_is_stale()` (auto-merge-trigger.yml) depends on to ever clear
+                    # the label again -- a transient failure here that goes unnoticed leaves the
+                    # PR permanently stuck with needs-human even after a genuine fix lands, since
+                    # the staleness check fails closed with no marker to confirm provenance.
+                    local marker="<!-- queue-retry-handler:needs-human sha=$HEAD_SHA12 -->"
+                    gh pr comment "$PR" --repo "${{ github.repository }}" --body "$marker" >/dev/null 2>&1 || true
+                    local bodies
+                    bodies=$(gh api --paginate "repos/${{ github.repository }}/issues/${PR}/comments" --jq '.[] | select(.user.login == "github-actions[bot]") | .body')
+                    if [[ "$bodies" != *"$marker"* ]]; then
+                      echo "::error::Could not confirm the needs-human provenance marker was recorded for PR #$PR -- this is load-bearing staleness state, not just a notification."
+                      return 1
+                    fi
                   fi
                   return 0
                 fi
