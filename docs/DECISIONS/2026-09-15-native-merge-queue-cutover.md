@@ -49,6 +49,18 @@ own convergence policy's "critical correctness bug" exception)
    `dependabot/fetch-metadata`), so the decision no longer depends on a cross-workflow event
    that structurally cannot reach back.
 
+## Known post-merge gap: `push: main` doesn't fire for a queue-merged commit
+
+`auto-merge-trigger.yml` uses `secrets.GITHUB_TOKEN`, not a dedicated PAT (coppa has no
+`CODEX_REVIEW_PAT`/`AUTOMERGE_PAT`-equivalent secret provisioned) — a merge performed here is
+attributed to `GITHUB_TOKEN`, which suppresses GitHub's own `push`-triggered events on the
+resulting `main` commit (the platform's anti-recursion guard). `ci.yml`'s and `semgrep.yml`'s
+own `push: branches: [main]` triggers will **not** fire for a queue-merged commit. Lower-risk
+here than on vanity/cqdx (no `deploy.yml` depends on that push), but still a real gap: this PR
+being a genuine live-fire test doesn't mean post-merge CI/Semgrep-on-main ran automatically
+for it — don't read this PR's own merge as verifying that. Provisioning a real-user PAT is a
+follow-up, not blocking this cutover.
+
 ## This PR: live-fire verification
 
 This PR is the first real merge-group completion against the native `merge_queue` rule and
