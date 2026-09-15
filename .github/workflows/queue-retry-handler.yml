@@ -224,13 +224,6 @@ jobs:
                   }' -f owner="$REPO_OWNER" -f name="$REPO_NAME_ONLY" -F pr="$PR" 2>/dev/null | jq -r '.data.repository.pullRequest.isInMergeQueue')
               fi
               NO_MORE_RETRIES_MARKER="<!-- queue-retry-handler:no-more-retries sha=$HEAD_SHA12 -->"
-              if [ "$still_armed" = "true" ] || [ "$in_queue" = "true" ]; then
-                echo "::error::Auto-merge is STILL ARMED and/or PR #$PR is still in the merge queue (armed: $still_armed, queued: $in_queue) despite the disable-auto/dequeue calls -- the one-retry bound cannot be relied on until this is fixed by hand."
-                gh pr comment "$PR" --repo "${{ github.repository }}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`), and the retry-tracking label could not be recorded. Attempted to disarm auto-merge and dequeue, but could NOT confirm it's actually clear -- this needs urgent human attention: run \`gh pr merge --disable-auto\` yourself and verify (and check whether it's still in the merge queue), or close/reopen the PR. $NO_MORE_RETRIES_MARKER" || true
-                exit 1
-              else
-                gh pr comment "$PR" --repo "${{ github.repository }}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`), and the retry-tracking label could not be recorded. Disarmed auto-merge rather than risk retrying unboundedly -- this needs a human: push a fix, or manually run \`gh pr merge --auto --squash\` once the labeling problem is resolved. $NO_MORE_RETRIES_MARKER" || true
-              fi
               verify_marker_or_fail() {
                 local marker="$1" bodies
                 bodies=$(gh api --paginate "repos/${{ github.repository }}/issues/${PR}/comments" --jq '.[] | select(.user.login == "github-actions[bot]") | .body')
@@ -238,7 +231,6 @@ jobs:
                 echo "::error::Could not confirm the no-more-retries marker was recorded for PR #$PR -- this is load-bearing retry state, not just a notification."
                 return 1
               }
-              verify_marker_or_fail "$NO_MORE_RETRIES_MARKER" || exit 1
               attach_needs_human_or_fail() {
                 gh label create needs-human --color d73a4a \
                   --description "Needs a human decision -- an automated handler could not safely proceed" \
@@ -273,6 +265,22 @@ jobs:
                 echo "::error::Could not attach needs-human to PR #$PR -- the handoff comment posted, but the label signal did not land."
                 return 1
               }
+              if [ "$still_armed" = "true" ] || [ "$in_queue" = "true" ]; then
+                echo "::error::Auto-merge is STILL ARMED and/or PR #$PR is still in the merge queue (armed: $still_armed, queued: $in_queue) despite the disable-auto/dequeue calls -- the one-retry bound cannot be relied on until this is fixed by hand."
+                gh pr comment "$PR" --repo "${{ github.repository }}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`), and the retry-tracking label could not be recorded. Attempted to disarm auto-merge and dequeue, but could NOT confirm it's actually clear -- this needs urgent human attention: run \`gh pr merge --disable-auto\` yourself and verify (and check whether it's still in the merge queue), or close/reopen the PR. $NO_MORE_RETRIES_MARKER" || true
+                # Codex P1 (this fix's own review): attach needs-human here too, not just on the
+                # cleanly-disarmed path below. Without this, the worst case (retry-used label AND
+                # the disarm/dequeue attempt both failed) leaves no persistent handoff signal --
+                # the NO_MORE_RETRIES_MARKER comment above is never consulted by the retry logic
+                # itself, so a future run's already_retried/needs-human checks would see neither
+                # and silently re-queue the same revision, defeating the one-retry bound. Failure
+                # to attach it here is logged by the function itself; we're already failing this
+                # step regardless, so don't let a secondary failure mask the primary error.
+                attach_needs_human_or_fail || true
+                exit 1
+              fi
+              gh pr comment "$PR" --repo "${{ github.repository }}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`), and the retry-tracking label could not be recorded. Disarmed auto-merge rather than risk retrying unboundedly -- this needs a human: push a fix, or manually run \`gh pr merge --auto --squash\` once the labeling problem is resolved. $NO_MORE_RETRIES_MARKER" || true
+              verify_marker_or_fail "$NO_MORE_RETRIES_MARKER" || exit 1
               attach_needs_human_or_fail || exit 1
             else
               gh pr comment "$PR" --repo "${{ github.repository }}" --body "Merge-group CI failed for this revision (commit \`$HEAD_SHA12\`) -- automatically re-armed auto-merge for one retry. If this fails again for the same commit, it will NOT retry again; it needs a human to look." || true
