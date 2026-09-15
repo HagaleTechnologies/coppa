@@ -60,6 +60,23 @@ jobs:
       # (no deploy.yml depends on that push), but still a real gap: post-merge CI/semgrep-on-main
       # won't run automatically. Flagged in the decision doc; provisioning a real-user PAT is a
       # follow-up, not blocking this cutover.
+      #
+      # Codex P1 (this PR's own round 6): dependabot-auto-merge.yml attaches `needs-review` to a
+      # Dependabot major bump using secrets.GITHUB_TOKEN -- GitHub's anti-recursion rule means a
+      # `labeled` event authored by the default GITHUB_TOKEN never triggers ANY workflow run,
+      # this one included, so the disarm-on-`labeled` branch above structurally cannot ever fire
+      # for it. If this job's own `opened` run reads labels before that separate job's metadata
+      # fetch completes, nothing later disarms a major bump that raced ahead. Classifying the
+      # update inline here (same job, same run, no cross-workflow event dependency) closes the
+      # gap at its root rather than trying to win the race.
+      - name: Classify Dependabot update
+        id: dep-metadata
+        if: |
+          github.event.pull_request.user.login == 'dependabot[bot]' &&
+          github.event.action != 'labeled' && github.event.action != 'unlabeled'
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Enable auto-merge
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
@@ -68,6 +85,7 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           EVENT_ACTION: ${{ github.event.action }}
           EVENT_LABEL: ${{ github.event.label.name }}
+          IS_DEPENDABOT_MAJOR: ${{ steps.dep-metadata.outputs.update-type == 'version-update:semver-major' }}
         run: |
           # A maintainer (or dependabot-auto-merge.yml, for `needs-review`) can attach either
           # pause label at any time, including on a PR already armed by an earlier event that
@@ -173,6 +191,15 @@ jobs:
           # branch above ever called the disarm helper. Every branch that observes a live pause
           # label now actively disarms too, so the pause is enforced regardless of which event
           # actually got to run.
+          # Checked before the needs-review label itself: for a Dependabot major bump, this
+          # job's OWN run already knows the classification (from the step above) without needing
+          # to wait for dependabot-auto-merge.yml's separate GITHUB_TOKEN-authored label, which
+          # (per the header comment above) can never trigger a fresh run to disarm here anyway.
+          if [ "$IS_DEPENDABOT_MAJOR" = "true" ]; then
+            echo "::notice::PR #$PR is a Dependabot semver-major update -- disarming any auto-merge that was already armed and standing down without re-arming, regardless of whether needs-review has landed as a label yet."
+            disarm_and_dequeue_or_fail "needs-review" || exit 1
+            exit 0
+          fi
           if grep -qxF "needs-review" <<< "$current_labels"; then
             echo "::notice::PR #$PR has needs-review attached -- disarming any auto-merge that was already armed (possibly by a run that raced ahead of this label, or whose own labeled event was evicted from the concurrency group), then standing down."
             disarm_and_dequeue_or_fail "needs-review" || exit 1
