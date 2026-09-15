@@ -3,6 +3,18 @@ name: CI
 on:
   push:
     branches: [main]
+  # Fleet CI redesign, native merge-queue cutover: a merge_group entry needs this required
+  # check ("CI") to report on its own synthetic SHA, or it sits pending until
+  # check_response_timeout_minutes and gets dequeued. No job-level `if:` changes needed --
+  # every job this file's own `ci` fan-in job needs (check, test-features, test-full, clippy,
+  # fmt, msrv, deny, audit, wiki-lint) already runs unconditionally except where explicitly
+  # scoped to `pull_request` (codex-clean, already excluded from `ci`'s own `needs:`), so a
+  # merge_group entry re-runs the real Rust test/lint/audit suite against the actual merge
+  # state rather than skip-passing -- more rigorous than a synthetic pass-through, at the cost
+  # of a full CI run per queue entry (group size 1, matching the rest of this fleet's cutover,
+  # keeps that serial rather than parallel-multiplied).
+  merge_group:
+    types: [checks_requested]
   pull_request:
     branches: [main]
     # ready_for_review explicit (not just GitHub's default opened/

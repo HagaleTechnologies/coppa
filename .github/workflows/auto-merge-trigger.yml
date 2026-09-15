@@ -1,0 +1,225 @@
+name: Auto-Merge Trigger
+
+# Native merge-queue cutover (fleet CI redesign, wave 3): retires .mergify.yml. Mergify's own
+# pull_request_rules already scoped admission to an author allowlist (thagale,
+# catalyst-cloud-connector[bot], dependabot[bot] for non-major bumps only, via the
+# `-label = needs-review` exclusion dependabot-auto-merge.yml applies) -- this job reproduces
+# that exact allowlist against GitHub's native `merge_queue` ruleset rule instead, which has no
+# author-based admission control of its own.
+on:
+  pull_request_target:
+    branches: [main]
+    # unlabeled/labeled: react to attaching/removing either pause label -- `needs-human` (see
+    # queue-retry-handler.yml's own handoff step) or `needs-review` (dependabot-auto-merge.yml's
+    # own major-bump gate) -- even outside a push. Without this: removing a label to acknowledge
+    # a pause produces no event here, leaving the PR permanently unarmed until an unrelated
+    # push/edit comes along; and attaching a label while auto-merge is already armed needs to
+    # actually disarm it (Codex P1, this PR's own round 1, for needs-review specifically -- a
+    # race between this job's own admission run and dependabot-auto-merge.yml's separate
+    # metadata-fetch step on the same `opened` event), not just sit there as a cosmetic signal.
+    # Scoped to exactly these two labels in the job's own `if:` below.
+    types: [opened, reopened, ready_for_review, synchronize, edited, unlabeled, labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+
+jobs:
+  auto-merge:
+    # `edited` scoped to a real base retarget only: `edited` fires on ANY PR edit (title, body,
+    # labels, base), but this job calls `gh pr merge --auto` unconditionally for it -- scoping to
+    # `changes.base != null` (only present when the base branch itself changed) avoids re-arming
+    # an unchanged head that just failed merge-group CI for unrelated reasons.
+    if: |
+      github.event.pull_request.draft == false &&
+      (github.event.action != 'edited' || github.event.changes.base != null) &&
+      (github.event.action != 'unlabeled' || github.event.label.name == 'needs-human' || github.event.label.name == 'needs-review') &&
+      (
+        (github.event.action == 'labeled' && (github.event.label.name == 'needs-human' || github.event.label.name == 'needs-review')) ||
+        (
+          github.event.pull_request.user.login == 'thagale' ||
+          github.event.pull_request.user.login == 'catalyst-cloud-connector[bot]' ||
+          github.event.pull_request.user.login == 'dependabot[bot]'
+        )
+      )
+    runs-on: ubuntu-latest
+    # Shared with queue-retry-handler.yml's own mutating job: closes a TOCTOU race where this
+    # job could read needs-human as absent and merge moments after queue-retry-handler.yml
+    # handed the PR off to a human. `cancel-in-progress: false`: a shared mutual-exclusion lock
+    # must let a queued run WAIT for the current holder to finish, never cancel it mid-mutation.
+    concurrency:
+      group: admission-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    steps:
+      # GITHUB_TOKEN, not a dedicated PAT: coppa has no CODEX_REVIEW_PAT/AUTOMERGE_PAT-equivalent
+      # secret provisioned. This means a merge performed here is attributed to GITHUB_TOKEN,
+      # which suppresses GitHub's own push-triggered events on the resulting main commit
+      # (anti-recursion guard) -- ci.yml's and semgrep.yml's own `push: branches: [main]`
+      # triggers will NOT fire for a queue-merged commit. Lower-risk here than on vanity/cqdx
+      # (no deploy.yml depends on that push), but still a real gap: post-merge CI/semgrep-on-main
+      # won't run automatically. Flagged in the decision doc; provisioning a real-user PAT is a
+      # follow-up, not blocking this cutover.
+      #
+      # Codex P1 (this PR's own round 6): dependabot-auto-merge.yml attaches `needs-review` to a
+      # Dependabot major bump using secrets.GITHUB_TOKEN -- GitHub's anti-recursion rule means a
+      # `labeled` event authored by the default GITHUB_TOKEN never triggers ANY workflow run,
+      # this one included, so the disarm-on-`labeled` branch above structurally cannot ever fire
+      # for it. If this job's own `opened` run reads labels before that separate job's metadata
+      # fetch completes, nothing later disarms a major bump that raced ahead. Classifying the
+      # update inline here (same job, same run, no cross-workflow event dependency) closes the
+      # gap at its root rather than trying to win the race.
+      - name: Classify Dependabot update
+        id: dep-metadata
+        if: |
+          github.event.pull_request.user.login == 'dependabot[bot]' &&
+          github.event.action != 'labeled' && github.event.action != 'unlabeled'
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Enable auto-merge
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_LABEL: ${{ github.event.label.name }}
+          IS_DEPENDABOT_MAJOR: ${{ steps.dep-metadata.outputs.update-type == 'version-update:semver-major' }}
+        run: |
+          # A maintainer (or dependabot-auto-merge.yml, for `needs-review`) can attach either
+          # pause label at any time, including on a PR already armed by an earlier event that
+          # won a race against the labeling itself (Codex P1, this PR's own round 1: an `opened`
+          # run here can arm auto-merge for a Dependabot major bump BEFORE dependabot-auto-
+          # merge.yml's separate `opened` handler attaches `needs-review`, since the two are
+          # independently triggered by the same event with no ordering guarantee -- confirmed
+          # via `gh pr merge --help`: once required checks pass, an armed PR enters the actual
+          # merge queue, not just a pending auto-merge request, so the race has a real merge as
+          # its outcome, not just a cosmetic label mismatch). Disarm unconditionally and stop,
+          # without running the staleness/re-arm logic below (which only applies to deciding
+          # whether to ARM, not to a fresh pause). Bypasses the author allowlist above
+          # deliberately: queue-retry-handler.yml's own needs-human handoff can label a PR from
+          # ANY author (it retries whatever PR's merge-group failed, regardless of admission
+          # author), so the disarm path must reach those PRs too, not just allowlisted ones.
+          disarm_and_dequeue_or_fail() {
+            local label="$1"
+            gh pr merge "$PR_URL" --disable-auto >/dev/null 2>&1 || true
+
+            OWNER_PART="${REPO%%/*}"; NAME_PART="${REPO##*/}"
+            local queue_state pr_node_id in_queue
+            queue_state=$(gh api graphql -f query='
+              query($owner: String!, $name: String!, $pr: Int!) {
+                repository(owner: $owner, name: $name) { pullRequest(number: $pr) { id isInMergeQueue } }
+              }' -f owner="$OWNER_PART" -f name="$NAME_PART" -F pr="$PR" 2>/dev/null)
+            pr_node_id=$(printf '%s' "$queue_state" | jq -r '.data.repository.pullRequest.id')
+            in_queue=$(printf '%s' "$queue_state" | jq -r '.data.repository.pullRequest.isInMergeQueue')
+            # isInMergeQueue/dequeuePullRequest, not just autoMergeRequest: once required checks
+            # have already passed, `gh pr merge --auto` puts a PR straight into the native queue
+            # rather than merely arming auto-merge -- a distinct state `--disable-auto` does not
+            # affect (confirmed via `gh pr merge --help` and the GraphQL schema).
+            if [ "$in_queue" = "true" ] && [ -n "$pr_node_id" ] && [ "$pr_node_id" != "null" ]; then
+              gh api graphql -f query='mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }' -f id="$pr_node_id" >/dev/null 2>&1 || true
+              in_queue=$(gh api graphql -f query='
+                query($owner: String!, $name: String!, $pr: Int!) {
+                  repository(owner: $owner, name: $name) { pullRequest(number: $pr) { isInMergeQueue } }
+                }' -f owner="$OWNER_PART" -f name="$NAME_PART" -F pr="$PR" 2>/dev/null | jq -r '.data.repository.pullRequest.isInMergeQueue')
+            fi
+
+            local still_armed
+            still_armed=$(gh pr view "$PR" --repo "$REPO" --json autoMergeRequest --jq '.autoMergeRequest != null')
+            if [ "$still_armed" = "true" ] || [ "$in_queue" = "true" ]; then
+              echo "::error::Could not fully disarm PR #$PR after $label was attached (armed: $still_armed, queued: $in_queue) -- refusing to report success. Disarm by hand and confirm." >&2
+              return 1
+            fi
+            return 0
+          }
+
+          if [ "$EVENT_ACTION" = "labeled" ] && { [ "$EVENT_LABEL" = "needs-human" ] || [ "$EVENT_LABEL" = "needs-review" ]; }; then
+            echo "::notice::$EVENT_LABEL was just attached to PR #$PR -- disarming any auto-merge that was already armed."
+            disarm_and_dequeue_or_fail "$EVENT_LABEL" || exit 1
+            exit 0
+          fi
+
+          # Staleness check: needs-human is applied by TWO independent producers -- a human
+          # manually (no marker, cleared only by a human removing the label -- see the labeled
+          # branch above) and queue-retry-handler.yml (posts a
+          # `queue-retry-handler:needs-human sha=<sha12>` marker after its one automatic retry
+          # also fails). Only a queue-retry-handler-provenanced instance is ever auto-cleared
+          # here; a manually-applied instance has no marker of this format, so this fails closed
+          # (leaves it attached).
+          needs_human_is_stale() {
+            local current_head_sha12="$1"
+            local last_labeled_at marker_info marker_created_at recorded_sha12 raw
+            if raw=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/timeline" 2>/dev/null); then
+              last_labeled_at=$(printf '%s' "$raw" | jq -r '(add // []) | [.[] | select(.event == "labeled" and .label.name == "needs-human")] | if length > 0 then (last | .created_at) else "" end' 2>/dev/null)
+            else
+              last_labeled_at=""
+            fi
+            [ -z "$last_labeled_at" ] && return 1
+            if raw=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR}/comments" 2>/dev/null); then
+              marker_info=$(printf '%s' "$raw" | jq -r '(add // []) | [.[] | select(.user.login == "github-actions[bot]") | select(.body | test("queue-retry-handler:needs-human sha=[0-9a-f]{12}")) | [.created_at, (.body | capture("queue-retry-handler:needs-human sha=(?<s>[0-9a-f]{12})").s)] | @tsv] | if length > 0 then last else "" end' 2>/dev/null)
+            else
+              marker_info=""
+            fi
+            [ -z "$marker_info" ] && return 1
+            marker_created_at=$(cut -f1 <<< "$marker_info")
+            recorded_sha12=$(cut -f2 <<< "$marker_info")
+            [ -z "$recorded_sha12" ] && return 1
+            [[ "$marker_created_at" < "$last_labeled_at" ]] && return 1
+            [ "$recorded_sha12" = "$current_head_sha12" ] && return 1
+            return 0
+          }
+
+          current_labels=$(gh api --paginate "repos/${REPO}/issues/${PR}/labels" --jq '.[].name')
+          # needs-review checked live here, not in the job-level `if:` above: dependabot-
+          # auto-merge.yml attaches it (for a semver-major bump) via its own metadata-fetch step
+          # on the SAME `opened` event this job also reacts to -- the job-level `if:`'s
+          # `github.event.pull_request.labels` is a webhook-delivery-time snapshot that can't see
+          # a label attached by a workflow racing against this one, so it must be re-checked live.
+          # Codex P1, round 2: checked for every admitted author, not just dependabot[bot] --
+          # .mergify.yml:68 excluded `-label = needs-review` for every author, and this
+          # workflow's own header comment already treats needs-review as a general pause label
+          # (see the `unlabeled`/`labeled` handling above), not a Dependabot-only signal.
+          # Codex P1 (this PR's own review round): a pending `labeled` run for either pause
+          # label can itself be evicted before it executes -- Actions retains only ONE pending
+          # run per concurrency group, and `cancel-in-progress: false` only stops an
+          # IN-PROGRESS run from being cancelled, not a still-pending one from being replaced.
+          # If a later event (synchronize/reopened/an allowlisted edit) replaces that pending
+          # `labeled` run, it reaches this same live label check, correctly declines to ARM, but
+          # would previously just stand down -- leaving an already-armed/already-queued PR from
+          # BEFORE the label was attached still armed/queued, since only the dedicated `labeled`
+          # branch above ever called the disarm helper. Every branch that observes a live pause
+          # label now actively disarms too, so the pause is enforced regardless of which event
+          # actually got to run.
+          # Checked before the needs-review label itself: for a Dependabot major bump, this
+          # job's OWN run already knows the classification (from the step above) without needing
+          # to wait for dependabot-auto-merge.yml's separate GITHUB_TOKEN-authored label, which
+          # (per the header comment above) can never trigger a fresh run to disarm here anyway.
+          if [ "$IS_DEPENDABOT_MAJOR" = "true" ]; then
+            echo "::notice::PR #$PR is a Dependabot semver-major update -- disarming any auto-merge that was already armed and standing down without re-arming, regardless of whether needs-review has landed as a label yet."
+            disarm_and_dequeue_or_fail "needs-review" || exit 1
+            exit 0
+          fi
+          if grep -qxF "needs-review" <<< "$current_labels"; then
+            echo "::notice::PR #$PR has needs-review attached -- disarming any auto-merge that was already armed (possibly by a run that raced ahead of this label, or whose own labeled event was evicted from the concurrency group), then standing down."
+            disarm_and_dequeue_or_fail "needs-review" || exit 1
+            exit 0
+          fi
+          if grep -qxF "needs-human" <<< "$current_labels"; then
+            current_head_sha12=$(gh pr view "$PR" --repo "${REPO}" --json headRefOid --jq '.headRefOid[0:12]')
+            if needs_human_is_stale "$current_head_sha12"; then
+              echo "::notice::needs-human on PR #$PR is stale (tied to an earlier revision's queue-retry-handler pause, not the current head $current_head_sha12) -- clearing it and proceeding to arm auto-merge."
+              gh api --method DELETE "repos/${REPO}/issues/${PR}/labels/needs-human" >/dev/null 2>&1 || true
+              labels_after_delete=$(gh api --paginate "repos/${REPO}/issues/${PR}/labels" --jq '.[].name')
+              if grep -qxF "needs-human" <<< "$labels_after_delete"; then
+                echo "::error::Could not remove the stale needs-human label from PR #$PR -- refusing to arm auto-merge while it remains attached. Remove it by hand, then rerun this job." >&2
+                exit 1
+              fi
+              gh pr merge "$PR_URL" --auto --squash
+            else
+              echo "::notice::PR #$PR has needs-human covering its current head (or its provenance could not be confirmed) -- disarming any auto-merge that was already armed (possibly by a run that raced ahead of this label, or whose own labeled event was evicted from the concurrency group), then standing down."
+              disarm_and_dequeue_or_fail "needs-human" || exit 1
+            fi
+          else
+            gh pr merge "$PR_URL" --auto --squash
+          fi
