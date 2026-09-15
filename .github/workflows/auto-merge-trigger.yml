@@ -162,8 +162,20 @@ jobs:
           # .mergify.yml:68 excluded `-label = needs-review` for every author, and this
           # workflow's own header comment already treats needs-review as a general pause label
           # (see the `unlabeled`/`labeled` handling above), not a Dependabot-only signal.
+          # Codex P1 (this PR's own review round): a pending `labeled` run for either pause
+          # label can itself be evicted before it executes -- Actions retains only ONE pending
+          # run per concurrency group, and `cancel-in-progress: false` only stops an
+          # IN-PROGRESS run from being cancelled, not a still-pending one from being replaced.
+          # If a later event (synchronize/reopened/an allowlisted edit) replaces that pending
+          # `labeled` run, it reaches this same live label check, correctly declines to ARM, but
+          # would previously just stand down -- leaving an already-armed/already-queued PR from
+          # BEFORE the label was attached still armed/queued, since only the dedicated `labeled`
+          # branch above ever called the disarm helper. Every branch that observes a live pause
+          # label now actively disarms too, so the pause is enforced regardless of which event
+          # actually got to run.
           if grep -qxF "needs-review" <<< "$current_labels"; then
-            echo "::notice::PR #$PR has needs-review attached -- standing down without arming auto-merge until a maintainer resolves it."
+            echo "::notice::PR #$PR has needs-review attached -- disarming any auto-merge that was already armed (possibly by a run that raced ahead of this label, or whose own labeled event was evicted from the concurrency group), then standing down."
+            disarm_and_dequeue_or_fail "needs-review" || exit 1
             exit 0
           fi
           if grep -qxF "needs-human" <<< "$current_labels"; then
@@ -178,7 +190,8 @@ jobs:
               fi
               gh pr merge "$PR_URL" --auto --squash
             else
-              echo "::notice::PR #$PR has needs-human covering its current head (or its provenance could not be confirmed) -- standing down without re-arming auto-merge."
+              echo "::notice::PR #$PR has needs-human covering its current head (or its provenance could not be confirmed) -- disarming any auto-merge that was already armed (possibly by a run that raced ahead of this label, or whose own labeled event was evicted from the concurrency group), then standing down."
+              disarm_and_dequeue_or_fail "needs-human" || exit 1
             fi
           else
             gh pr merge "$PR_URL" --auto --squash
