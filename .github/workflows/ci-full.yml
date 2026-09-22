@@ -62,10 +62,28 @@ jobs:
     outputs:
       check_run_id: ${{ steps.create.outputs.check_run_id }}
     steps:
+      - name: Mint a hagale-agent installation token for check-run writes
+        id: app-token
+        # Codex P1, this PR's own round-7 review: the stale-check cleanup below concludes a
+        # check-run that a DIFFERENT (cancelled, earlier) workflow run created -- github.token
+        # can create a check-run within its OWN run but is rejected outright for updating one a
+        # different run created ("Check run status and conclusions can only be updated
+        # internally by GitHub Actions", HTTP 403), same restriction wait-for-codex.yml's own
+        # upsert_check_run already documents. The prior version of this step used github.token
+        # and silently swallowed that 403 via `|| echo "::warning::..."`, leaving the superseded
+        # run's "CI" check-run stuck in_progress forever. hagale-agent (App ID 4696353) is not
+        # subject to this restriction and is already used fleet-wide for the identical purpose.
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
       - name: Create in_progress "CI" check-run on head_sha
         id: create
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ inputs.head_sha || github.sha }}
           RUN_ID: ${{ github.run_id }}

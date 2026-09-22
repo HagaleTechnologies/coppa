@@ -384,9 +384,31 @@ jobs:
     permissions:
       checks: write
     steps:
+      # Codex P1, this PR's own round-7 review: creating this check-run with github.token means
+      # only a GitHub-Actions-identity token can ever update it again -- codex-review-request's
+      # OWN upsert_check_run always authenticates as hagale-agent, so a rerun's attempt to PATCH
+      # this exact check-run 403s outright (Checks API only permits the CREATING app to update
+      # a check-run), silently leaving the terminal failure stuck even though the job log
+      # promises "re-run the failed job and let it retry" as a recovery path. Minted
+      # INDEPENDENTLY here (this job's own step, not a dependency on codex-review-request's own
+      # mint, which may itself be what failed) -- most transient failures (an API blip, a
+      # cancelled run) leave the App itself healthy, so this mint typically succeeds even when
+      # the original one didn't. continue-on-error: true keeps github.token as a last-resort
+      # fallback for the genuine case where the App itself is unavailable -- at that point only
+      # a brand-new commit (a fresh head_sha, no PATCH involved) can unblock the PR anyway.
+      - name: Mint a hagale-agent installation token for check-run writes
+        id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
       - name: Publish a failed check-run since request setup itself failed
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           RUN_ID: ${{ github.run_id }}
