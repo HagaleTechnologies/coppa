@@ -75,8 +75,15 @@ jobs:
           # cancel-in-progress kills a run's watchdog before it can conclude anything, with no
           # way for any in-run script to intercept that cancellation (HAG-81 PR #164 review,
           # round 3 lesson, applied here from the start rather than rediscovered).
-          stale_ids=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" \
-            --jq '[.check_runs[] | select(.name=="CI" and .status!="completed") | .id][]')
+          # --paginate --slurp: a SHA with enough review rounds can push its check-run count
+          # past the REST default page size (confirmed live on cqdx#470 at 41 check-runs for
+          # one SHA). --paginate alone would run this jq filter once PER PAGE, printing
+          # multiple separate results instead of one combined one (Codex P1, this PR's own
+          # review, caught on the fan-in's analogous query below) -- --slurp wraps every page's
+          # response object into one outer array first, so `.[].check_runs[]` flattens across
+          # all of them before filtering.
+          stale_ids=$(gh api --paginate --slurp "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+            --jq '[.[].check_runs[] | select(.name=="CI" and .status!="completed") | .id][]')
           for stale_id in $stale_ids; do
             gh api -X PATCH "repos/$REPO/check-runs/$stale_id" -f status="completed" -f conclusion="cancelled" \
               -f "output[title]=Superseded" \
@@ -227,7 +234,7 @@ jobs:
           conclude_check_failure() {
             [ "$EVENT_NAME" = workflow_dispatch ] || return 0
             local reason="$1" check_run_id
-            check_run_id="$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "[.check_runs[] | select(.name == \"CI\" and .external_id == \"$RUN_ID\")][0].id // empty")"
+            check_run_id="$(gh api --paginate --slurp "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "[.[].check_runs[] | select(.name == \"CI\" and .external_id == \"$RUN_ID\")][0].id // empty")"
             if [ -z "$check_run_id" ]; then
               # create-ci-check itself may never have run (still queued when this watchdog gave
               # up) -- there is no existing check-run to PATCH, so create the required "CI"
@@ -363,9 +370,16 @@ jobs:
           # cross-checked here rather than duplicated, so "CI" reflects both tiers combined.
           # ci.yml runs on push/pull_request/merge_group; for workflow_dispatch specifically,
           # its results already exist on the SAME head_sha from when the PR was actually open.
+          # Codex P1, this PR's own review: `gh api --paginate` alone runs the jq filter once
+          # PER PAGE, printing multiple separate JSON arrays rather than one combined array
+          # once this SHA has more than a page of check-runs -- the `jq 'length'` calls below
+          # would then see multiple values, and the shell `-gt` test errors and silently falls
+          # through, letting a later page's missing/failed check slip past undetected. `--slurp`
+          # wraps every page's response object into one outer array first, so `.[].check_runs[]`
+          # flattens across all of them before filtering.
           fast_tier_names='["Check","Test with Features (fast, lib-only)","Format","Platform Check (ubuntu-latest)","Platform Check (macos-latest)","Platform Check (windows-latest)"]'
-          fast_tier_results=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
-            --jq --argjson names "$fast_tier_names" '[.check_runs[] | select(.name as $n | $names | index($n))] | group_by(.name) | map(max_by(.started_at))')
+          fast_tier_results=$(gh api --paginate --slurp "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+            --jq --argjson names "$fast_tier_names" '[.[].check_runs[] | select(.name as $n | $names | index($n))] | group_by(.name) | map(max_by(.started_at))')
           missing=$(echo "$fast_tier_results" | jq --argjson names "$fast_tier_names" '$names - [.[].name]')
           if [ "$(echo "$missing" | jq 'length')" -gt 0 ]; then
             echo "::error::Missing fast-tier check-run(s) for $HEAD_SHA: $missing -- ci.yml may not have run yet, or ran against a different SHA."

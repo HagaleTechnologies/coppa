@@ -194,13 +194,17 @@ jobs:
           # this run's own RUN_ID when one is present (HAG-81 PR #164 review, round 2): a
           # head_sha with multiple dispatches/reruns can have more than one check-run with the
           # same name -- without this, the wrong run's check-run could be matched and mutated.
-          # `--paginate`: a PR with enough review rounds can push this commit's check-run count
-          # past the REST default page size (confirmed live on cqdx#470 at 41 check-runs for one
-          # SHA).
+          # `--paginate --slurp`: a PR with enough review rounds can push this commit's
+          # check-run count past the REST default page size (confirmed live on cqdx#470 at 41
+          # check-runs for one SHA). `--paginate` alone runs this jq filter once PER PAGE,
+          # printing multiple separate results instead of one combined one (Codex P1, HAG-78 PR
+          # #113 review, caught on a different check-run lookup in this same migration) --
+          # `--slurp` wraps every page's response object into one outer array first, so
+          # `.[].check_runs[]` flattens across all of them before filtering.
           upsert_check_run() {
             local name="$1" status="$2" conclusion="$3" existing_id
-            existing_id=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq \
-              ".check_runs | map(select(.name == \"$name\")) | sort_by(.started_at) | last | .id // empty")
+            existing_id=$(gh api --paginate --slurp "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq \
+              "[.[].check_runs[] | select(.name == \"$name\")] | sort_by(.started_at) | last | .id // empty")
             if [ -n "$existing_id" ]; then
               if [ -n "$conclusion" ]; then
                 gh api -X PATCH "repos/$REPO/check-runs/$existing_id" \
@@ -244,7 +248,21 @@ jobs:
             echo "Upserted completed check-run ($conclusion) for $HEAD_SHA -- no wait needed."
           else
             check_id=$(upsert_check_run "Codex review clean (gate before expensive downstream jobs)" "in_progress" "")
-            echo "Upserted in_progress check-run for $HEAD_SHA -- codex-review-response will complete it once Codex responds."
+            # Codex P1, this PR's own review: this workflow has no LOCAL timeout of its own for
+            # the case where the request comment fails to post, Codex is unavailable, or no
+            # supported response event ever fires -- without one, this check would sit
+            # in_progress forever. It doesn't need one: credenza's own codex-review-timeout-scan.yml
+            # (~/Code/credenza/.github/workflows/codex-review-timeout-scan.yml) is a
+            # CENTRALIZED, ORG-WIDE cron (every 15min) that scans every open PR across
+            # HagaleTechnologies for any check-run named EXACTLY "Codex review clean (gate
+            # before expensive downstream jobs)" still in_progress past 90 minutes, regardless
+            # of which repo or mechanism created it -- it re-requests a review at 90min and
+            # fails the check outright at 120min if still stuck. This is the same backstop
+            # every credenza-`uses:`-based migration in this fleet (panino, banco, harbor,
+            # etc.) also relies on with no local timeout of their own; this hand-port matches
+            # that same accepted pattern rather than duplicating it locally, PROVIDED the check
+            # name above stays byte-identical to what the scanner greps for.
+            echo "Upserted in_progress check-run for $HEAD_SHA -- codex-review-response will complete it once Codex responds, or credenza's org-wide timeout-scan backstop will within 120 minutes."
           fi
           {
             echo "check_run_id=$check_id"
@@ -704,8 +722,10 @@ jobs:
           # through end to end.
           OUTCOME: ${{ steps.verdict.outputs.codex_errored == 'true' && 'failure' || steps.compute-verdict.outputs.outcome }}
         run: |
-          check_id=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
-            --jq '[.check_runs[] | select(.name == "Codex review clean (gate before expensive downstream jobs)")] | sort_by(.started_at) | last | .id // empty')
+          # --slurp alongside --paginate: see upsert_check_run's own comment above -- without
+          # it, this filter runs once per page and can silently miss a later page's entry.
+          check_id=$(gh api --paginate --slurp "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+            --jq '[.[].check_runs[] | select(.name == "Codex review clean (gate before expensive downstream jobs)")] | sort_by(.started_at) | last | .id // empty')
 
           conclude_check() {
             local conclusion="$1"
