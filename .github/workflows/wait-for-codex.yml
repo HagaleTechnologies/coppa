@@ -329,6 +329,49 @@ jobs:
             -f ref="$default_branch" -f "inputs[head_sha]=$HEAD_SHA" -f "inputs[is_dependabot]=$IS_DEPENDABOT"
 
   # ============================================================================================
+  # Failsafe: codex-review-request's own steps run BEFORE create-check can ever run (app-token
+  # mint, head-check, bootstrap-check, existing-label) -- if any of those fails, the job stops
+  # and no check-run is ever created for this head_sha at all. Codex P1, this PR's own round-5
+  # review: credenza's org-wide timeout-scan backstop only scans check-runs that ALREADY exist
+  # and are stuck in_progress -- it has nothing to find here, since none was ever posted, and a
+  # pull_request_target run provides no native required check either. A transient setup failure
+  # (an expired/misconfigured App key, a GitHub API blip) would otherwise leave the required
+  # gate permanently absent rather than failing, silently blocking the PR forever. Deliberately
+  # uses github.token, not the App token -- the App token mint step is itself one of the
+  # failure modes this guards against, so it cannot be a dependency here. Only ever CREATES a
+  # brand-new check-run (never updates one), which github.token can do within its own run.
+  # ============================================================================================
+  codex-review-request-failsafe:
+    name: Codex review request setup failsafe
+    needs: codex-review-request
+    if: always() && needs.codex-review-request.result == 'failure' && github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      checks: write
+    steps:
+      - name: Publish a failed check-run since request setup itself failed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          cat <<JSON | gh api "repos/$REPO/check-runs" --input -
+          {
+            "name": "Codex review clean (gate before expensive downstream jobs)",
+            "head_sha": "$HEAD_SHA",
+            "status": "completed",
+            "conclusion": "failure",
+            "details_url": "https://github.com/$REPO/actions/runs/$RUN_ID",
+            "output": {
+              "title": "Codex review request setup failed",
+              "summary": "The codex-review-request job failed before it could create the managed check-run (run $RUN_ID). Push a new commit, or re-run the failed job and let it retry, to unblock this PR."
+            }
+          }
+          JSON
+
+  # ============================================================================================
   # Consumer half: fires once per Codex reply (pull_request_review or issue_comment from Codex's
   # own actor), never on a poll interval. Re-derives everything it needs from live GitHub data
   # using timestamp comparison against the request comment's own creation time -- no
