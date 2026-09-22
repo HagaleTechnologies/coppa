@@ -394,8 +394,11 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ steps.pr-context.outputs.pr }}
         run: |
-          comment=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" \
-            --jq '[.[] | select(.body == "@codex review")] | sort_by(.created_at) | last')
+          # --paginate, piped into a separate `jq -s`: a heavily-discussed PR can push comment
+          # count past 100 (same class of gap as the request-marker query's own fix below),
+          # silently missing the truly most-recent "@codex review" comment.
+          comment=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
+            | jq -s '[.[][] | select(.body == "@codex review")] | sort_by(.created_at) | last')
           if [ "$comment" = "null" ] || [ -z "$comment" ]; then
             echo "::warning::No '@codex review' request comment found on PR #$PR -- falling back to 30 minutes ago as RUN_STARTED."
             echo "run_started=$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
@@ -558,8 +561,14 @@ jobs:
           # HEAD_SHA is a git SHA (safe hex characters only) -- interpolated directly into the
           # filter string rather than via --arg, since `gh api --jq` (distinct from real jq)
           # has no --arg companion flag at all (confirmed live: "accepts 1 arg(s), received 4").
-          marker_count=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" \
-            --jq "[.[] | select(.body == \"<!-- codex-review-request head_sha=$HEAD_SHA -->\")] | length")
+          # --paginate, piped into a separate `jq -s`, not gh api's own --jq: a PR with more
+          # than 100 comments would otherwise only see the first page, silently undercounting
+          # markers and misclassifying a repeated request as genuine (Codex P1, this PR's own
+          # round 3 review) -- and --paginate alone runs a --jq filter once PER PAGE anyway
+          # (the same class of bug fixed elsewhere in this file), so combining pages via a
+          # separate `jq -s` is required regardless.
+          marker_count=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
+            | jq -s "[.[][] | select(.body == \"<!-- codex-review-request head_sha=$HEAD_SHA -->\")] | length")
           IS_GENUINE_SYNC=true
           [ "$marker_count" -gt 1 ] && IS_GENUINE_SYNC=false
           echo "Found $marker_count request marker(s) for $HEAD_SHA -- IS_GENUINE_SYNC=$IS_GENUINE_SYNC"
