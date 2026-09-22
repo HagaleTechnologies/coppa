@@ -350,17 +350,36 @@ jobs:
           # authenticated with the built-in GITHUB_TOKEN outright ("Resource not accessible by
           # integration"), regardless of the calling job's own declared actions:write permission.
           GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           IS_DEPENDABOT: ${{ steps.create-check.outputs.is_dependabot }}
+          CHECK_ID: ${{ steps.create-check.outputs.check_run_id }}
         run: |
+          # Codex P1, this PR's own round-8 review (same class of bug fixed in
+          # codex-review-response's "Update the check-run" step): create-check above already
+          # marked this check-run "success" as a SEPARATE, earlier step -- a dispatch failure
+          # here would otherwise leave it stuck at a false success with CI never queued and
+          # nothing to notice or retry. Flip it to failure rather than leaving that stand.
+          fail_check() {
+            GH_TOKEN="$APP_TOKEN" gh api -X PATCH "repos/$REPO/check-runs/$CHECK_ID" \
+              -f status="completed" -f conclusion="failure" \
+              -f output[title]="Could not dispatch CI" \
+              -f output[summary]="$1" \
+              || echo "::warning::failed to flip check-run $CHECK_ID to failure" >&2
+          }
           if [ -z "$GH_TOKEN" ]; then
-            echo "::error::CODEX_REVIEW_PAT not set -- cannot dispatch ci-full.yml (github.token is rejected outright for workflow_dispatch). The check-run above is already marked success, but CI will never run for $HEAD_SHA without a manual dispatch."
+            echo "::error::CODEX_REVIEW_PAT not set -- cannot dispatch ci-full.yml (github.token is rejected outright for workflow_dispatch)."
+            fail_check "CODEX_REVIEW_PAT was not set so ci-full.yml could not be dispatched. Push a new commit or manually dispatch ci-full.yml for $HEAD_SHA."
             exit 1
           fi
           default_branch=$(gh api "repos/$REPO" --jq '.default_branch')
-          gh api -X POST "repos/$REPO/actions/workflows/ci-full.yml/dispatches" \
-            -f ref="$default_branch" -f "inputs[head_sha]=$HEAD_SHA" -f "inputs[is_dependabot]=$IS_DEPENDABOT"
+          if ! gh api -X POST "repos/$REPO/actions/workflows/ci-full.yml/dispatches" \
+                -f ref="$default_branch" -f "inputs[head_sha]=$HEAD_SHA" -f "inputs[is_dependabot]=$IS_DEPENDABOT"; then
+            echo "::error::Failed to dispatch ci-full.yml for $HEAD_SHA."
+            fail_check "Dispatching ci-full.yml failed. Push a new commit or manually dispatch ci-full.yml for $HEAD_SHA."
+            exit 1
+          fi
 
   # ============================================================================================
   # Failsafe: codex-review-request's own steps run BEFORE create-check can ever run (app-token
@@ -563,20 +582,38 @@ jobs:
           SINCE: ${{ steps.request-comment.outputs.run_started }}
         run: |
           owner="${REPO%%/*}"; name="${REPO##*/}"
-          response=$(gh api graphql -f query='
-            query($owner: String!, $name: String!, $pr: Int!) {
-              repository(owner: $owner, name: $name) {
-                pullRequest(number: $pr) {
-                  reviewThreads(first: 100) {
-                    nodes {
-                      id
-                      isResolved
-                      comments(first: 50) { nodes { author { login } createdAt } }
+          # Codex P1, this PR's own round-8 review: a single unpaginated reviewThreads(first: 100)
+          # page silently drops any thread beyond the 100th on a heavily-discussed PR (this PR
+          # itself, after 8 rounds, is a live example of exactly that scale) -- a dropped thread
+          # can never enter baseline_pure/baseline_initiated, so it's neither correctly ignored
+          # nor correctly treated as new; it just vanishes from every downstream count. `-F
+          # after="$cursor"`, not `-f`: only `-F`'s typed-value conversion turns the literal
+          # string "null" into a real JSON null for the first page -- GraphQL's $after: String
+          # rejects the literal text "null" as an invalid cursor.
+          all_nodes="[]"
+          cursor="null"
+          while true; do
+            page=$(gh api graphql -f query='
+              query($owner: String!, $name: String!, $pr: Int!, $after: String) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $pr) {
+                    reviewThreads(first: 100, after: $after) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes {
+                        id
+                        isResolved
+                        comments(first: 50) { nodes { author { login } createdAt } }
+                      }
                     }
                   }
                 }
-              }
-            }' -f owner="$owner" -f name="$name" -F pr="$PR")
+              }' -f owner="$owner" -f name="$name" -F pr="$PR" -F after="$cursor")
+            all_nodes=$(jq -n --argjson acc "$all_nodes" --argjson new "$(echo "$page" | jq '.data.repository.pullRequest.reviewThreads.nodes')" '$acc + $new')
+            has_next=$(echo "$page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage')
+            cursor=$(echo "$page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor')
+            [ "$has_next" = "true" ] || break
+          done
+          response=$(jq -n --argjson nodes "$all_nodes" '{data:{repository:{pullRequest:{reviewThreads:{nodes:$nodes}}}}}')
           # Strict-pure baseline: unresolved threads that existed (first comment predates SINCE)
           # with EVERY comment authored by Codex or this workflow's own auto-resolve reply.
           echo "$response" | jq --arg since "$SINCE" '
@@ -747,21 +784,34 @@ jobs:
           [ -z "$baseline" ] && baseline='[]'
           [ -z "$baseline_initiated" ] && baseline_initiated='[]'
 
-          result=$(gh api graphql -f query='
-            query($owner: String!, $name: String!, $pr: Int!) {
-              repository(owner: $owner, name: $name) {
-                pullRequest(number: $pr) {
-                  reviewThreads(first: 100) {
-                    nodes {
-                      id
-                      isResolved
-                      path
-                      comments(first: 50) { nodes { author { login } createdAt originalCommit { oid } } }
+          # Codex P1, this PR's own round-8 review: same fixed-page gap as the baseline query
+          # above -- a thread past the 100th is invisible to new_count/restated_count, so a real
+          # new or still-live finding on a heavily-discussed PR can silently read as clean.
+          all_nodes="[]"
+          cursor="null"
+          while true; do
+            page=$(gh api graphql -f query='
+              query($owner: String!, $name: String!, $pr: Int!, $after: String) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $pr) {
+                    reviewThreads(first: 100, after: $after) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes {
+                        id
+                        isResolved
+                        path
+                        comments(first: 50) { nodes { author { login } createdAt originalCommit { oid } } }
+                      }
                     }
                   }
                 }
-              }
-            }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" \
+              }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" -F after="$cursor")
+            all_nodes=$(jq -n --argjson acc "$all_nodes" --argjson new "$(echo "$page" | jq '.data.repository.pullRequest.reviewThreads.nodes')" '$acc + $new')
+            has_next=$(echo "$page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage')
+            cursor=$(echo "$page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor')
+            [ "$has_next" = "true" ] || break
+          done
+          result=$(jq -n --argjson nodes "$all_nodes" '{data:{repository:{pullRequest:{reviewThreads:{nodes:$nodes}}}}}' \
             | jq --argjson baseline "$baseline" --argjson baselineInitiated "$baseline_initiated" --arg since "$RUN_STARTED" '
               def ignorable_author: . == "chatgpt-codex-connector" or . == "github-actions";
               def codex_initiated: (.comments.nodes[0].author.login == "chatgpt-codex-connector");
@@ -919,6 +969,8 @@ jobs:
 
           conclude_check() {
             local conclusion="$1"
+            local title="${2:-Codex raised new concerns}"
+            local summary="${3:-See this job's log for details -- resolve or ticket them, then push a remediation commit to trigger a fresh re-review.}"
             if [ -n "$check_id" ]; then
               for attempt in 1 2 3; do
                 if [ "$conclusion" = "success" ]; then
@@ -926,8 +978,8 @@ jobs:
                 else
                   gh api -X PATCH "repos/$REPO/check-runs/$check_id" \
                     -f status="completed" -f conclusion="failure" \
-                    -f output[title]="Codex raised new concerns" \
-                    -f output[summary]="See this job's log for details -- resolve or ticket them, then push a remediation commit to trigger a fresh re-review." && return 0
+                    -f output[title]="$title" \
+                    -f output[summary]="$summary" && return 0
                 fi
                 sleep 2
               done
@@ -947,17 +999,29 @@ jobs:
               || { echo "::warning::failed to publish a fallback check-run for $HEAD_SHA" >&2; return 1; }
           }
 
-          conclude_check "$OUTCOME"
-
+          # Codex P1, this PR's own round-8 review: dispatch BEFORE concluding the check as
+          # success -- the old order concluded the check first, so a transient dispatch failure
+          # left a check-run permanently marked "success" with CI never actually queued, and
+          # nothing (not even the timeout scanner, which only watches in_progress checks) would
+          # ever notice or retry. Only conclude success once the dispatch itself is confirmed.
           if [ "$OUTCOME" = "success" ]; then
             # Dispatch against the repo's DEFAULT branch, never the PR's own head branch -- a
             # same-repo PR could otherwise replace ci-full.yml with an immediate-success "CI"
             # job the moment Codex responds clean.
             if [ -z "$DISPATCH_TOKEN" ]; then
-              echo "::error::CODEX_REVIEW_PAT not set -- cannot dispatch ci-full.yml. The check-run above is already marked success, but CI will never run for $HEAD_SHA without a manual dispatch."
+              echo "::error::CODEX_REVIEW_PAT not set -- cannot dispatch ci-full.yml."
+              conclude_check "failure" "Could not dispatch CI" "Codex approved this revision, but CODEX_REVIEW_PAT was not set so ci-full.yml could not be dispatched. Push a new commit or manually dispatch ci-full.yml for $HEAD_SHA."
               exit 1
             fi
             default_branch=$(GH_TOKEN="$DISPATCH_TOKEN" gh api "repos/$REPO" --jq '.default_branch')
-            GH_TOKEN="$DISPATCH_TOKEN" gh api -X POST "repos/$REPO/actions/workflows/ci-full.yml/dispatches" \
-              -f ref="$default_branch" -f "inputs[head_sha]=$HEAD_SHA"
+            if GH_TOKEN="$DISPATCH_TOKEN" gh api -X POST "repos/$REPO/actions/workflows/ci-full.yml/dispatches" \
+                 -f ref="$default_branch" -f "inputs[head_sha]=$HEAD_SHA"; then
+              conclude_check "success"
+            else
+              echo "::error::Failed to dispatch ci-full.yml for $HEAD_SHA -- marking the check failed rather than leaving a false success."
+              conclude_check "failure" "Could not dispatch CI" "Codex approved this revision, but dispatching ci-full.yml failed. Push a new commit or manually dispatch ci-full.yml for $HEAD_SHA."
+              exit 1
+            fi
+          else
+            conclude_check "$OUTCOME"
           fi

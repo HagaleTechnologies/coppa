@@ -237,9 +237,29 @@ jobs:
       actions: write
       checks: write
     steps:
+      # Codex P1, this PR's own round-8 review: create-ci-check now creates the "CI" check-run
+      # with a hagale-agent token (round-7 fix, for the same reason this job needs one too) --
+      # github.token can never PATCH a check-run a different run/identity created, so the PATCH
+      # below was silently failing every time it had a real check-run to conclude.
+      - name: Mint a hagale-agent installation token for check-run writes
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
       - name: Cancel the run if any downstream job never starts
         env:
+          # GITHUB_TOKEN for the actions:write calls below (job listing, run cancellation) --
+          # only the two check-run writes in conclude_check_failure use APP_TOKEN instead. Not
+          # swapping GH_TOKEN globally to the App token here: hagale-agent's installation is
+          # provisioned for Checks-API writes fleet-wide, not verified to also carry Actions
+          # scope, and this step's own actions:write JOB permission already covers github.token
+          # for those calls regardless.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
           EVENT_NAME: ${{ github.event_name }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
@@ -250,6 +270,10 @@ jobs:
           # this it stays "in_progress" forever, blocking the PR indefinitely instead of failing
           # fast. Filtered by external_id == this run's own RUN_ID: a head_sha with multiple
           # dispatches or stale duplicate checks can have more than one check-run named "CI".
+          # Codex P1, this PR's own round-8 review: create-ci-check now creates "CI" with a
+          # hagale-agent token (round-7 fix) -- github.token can never PATCH a check-run a
+          # different run/identity created, so the PATCH below was silently failing every time
+          # it had a real check-run to conclude. Both writes use APP_TOKEN now.
           conclude_check_failure() {
             [ "$EVENT_NAME" = workflow_dispatch ] || return 0
             local reason="$1" check_run_id
@@ -258,13 +282,13 @@ jobs:
               # create-ci-check itself may never have run (still queued when this watchdog gave
               # up) -- there is no existing check-run to PATCH, so create the required "CI"
               # check directly as a failure instead of leaving it permanently absent.
-              gh api -X POST "repos/$REPO/check-runs" \
+              GH_TOKEN="$APP_TOKEN" gh api -X POST "repos/$REPO/check-runs" \
                 -f name="CI" -f head_sha="$HEAD_SHA" -f status="completed" -f conclusion="failure" \
                 -f external_id="$RUN_ID" -f "output[title]=CI cancelled by watchdog" -f "output[summary]=$reason" \
                 || echo "::warning::failed to create a failed CI check-run for $HEAD_SHA" >&2
               return 0
             fi
-            gh api -X PATCH "repos/$REPO/check-runs/$check_run_id" -f status="completed" -f conclusion="failure" \
+            GH_TOKEN="$APP_TOKEN" gh api -X PATCH "repos/$REPO/check-runs/$check_run_id" -f status="completed" -f conclusion="failure" \
               || echo "::warning::failed to conclude check-run $check_run_id before cancelling -- it may stay in_progress" >&2
           }
           jobs_json() {
@@ -353,6 +377,20 @@ jobs:
     permissions:
       checks: write
     steps:
+      # Codex P1, this PR's own round-8 review: the relay step below PATCHes the "CI" check-run
+      # create-ci-check made with a hagale-agent token (round-7 fix) -- github.token can never
+      # update a check-run a different run/identity created, so that PATCH was silently failing
+      # on every normal workflow_dispatch. This step only reads check-runs, so github.token
+      # stays fine for it.
+      - name: Mint a hagale-agent installation token for check-run writes
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
       - name: Check all jobs (including the fast tier's own native results)
         id: check
         env:
@@ -443,7 +481,7 @@ jobs:
       - name: Relay this result onto the reviewed SHA's CI check-run (workflow_dispatch only)
         if: always() && github.event_name == 'workflow_dispatch'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ inputs.head_sha || github.sha }}
           RUN_ID: ${{ github.run_id }}
