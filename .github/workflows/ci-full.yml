@@ -1,0 +1,411 @@
+name: ci
+
+# HAG-78: this file replaces the old ci.yml's own codex-clean-gated jobs (test-full, bench-fuzz,
+# clippy, msrv, deny, audit, wiki-lint). It runs ONLY via workflow_dispatch (once
+# wait-for-codex.yml's event-driven gate confirms a revision clean), plus push/merge_group for
+# the non-PR paths -- there is no mid-review-loop skip state to guard against here, since this
+# whole workflow only ever runs once a revision is already confirmed clean or has no PR review
+# context at all (mirroring HagaleTechnologies/panino's own HAG-81 migration; this file follows
+# that same pattern, hardened from round 1 with everything that migration's own review process
+# found the hard way -- see catalyst memory project_hag81_panino_migration_review_marathon).
+#
+# `pull_request` is dropped as a trigger (workflow_dispatch is the new "validate this specific
+# revision" entry point) but `push`/`merge_group` are kept for the non-PR paths, which carry no
+# review context and need no deferring behind a Codex round.
+#
+# ci.yml (the fast, always-on tier: check/test-features/fmt/platform) is a SEPARATE file and
+# keeps its own native per-job check-run attribution -- it isn't gated behind Codex at all. The
+# `ci` fan-in job below cross-checks ITS native check-run results for the same SHA before
+# declaring the required "CI" check successful, so this file owns that name without needing to
+# duplicate those jobs.
+on:
+  workflow_dispatch:
+    inputs:
+      head_sha:
+        description: "The PR revision Codex confirmed clean. Every job below checks this SHA out explicitly instead of defaulting to github.sha, which for a workflow_dispatch run is the default branch tip, not the reviewed commit."
+        type: string
+        required: false
+      is_dependabot:
+        description: "Set by wait-for-codex.yml's excluded-dependabot[bot] pass-through dispatch. A workflow_dispatch run always gets normal repository secrets regardless of who or what caused the dispatch -- unlike a Dependabot-authored pull_request, which GitHub itself redacts secrets from. Declared for forward compatibility even though none of the jobs below currently consume a PR-controlled-code-adjacent secret (SUNTO_RO_TOKEN in wiki-lint is fetched into its OWN isolated job with no PR-controlled command sharing that job -- see wiki-lint's own comment)."
+        type: boolean
+        required: false
+        default: false
+  push:
+    branches: [main]
+  # A merge-queue entry needs "CI" to report on its own synthetic SHA, or it sits pending until
+  # check_response_timeout_minutes and gets dequeued.
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.run_attempt == 1 && (github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.run_id) || github.run_id) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && github.run_attempt == 1 }}
+
+jobs:
+  # A workflow_dispatch run's own native check-runs always attach to the DISPATCHED REF's tip
+  # (the default branch), never to an arbitrary head_sha input passed alongside it. Branch
+  # protection needs a check literally named "CI" on the PR's OWN head commit, so this job (and
+  # the fan-in job's own relay step, below) manage that check-run explicitly via the Checks API
+  # instead -- the same pattern wait-for-codex.yml already uses for "Codex review clean...".
+  # push/merge_group need none of this: github.sha there already names the real commit under
+  # test, so this job is skipped entirely for them.
+  create-ci-check:
+    name: Create CI check-run on the reviewed SHA
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      checks: write
+    outputs:
+      check_run_id: ${{ steps.create.outputs.check_run_id }}
+    steps:
+      - name: Create in_progress "CI" check-run on head_sha
+        id: create
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ inputs.head_sha || github.sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          # Conclude any not-yet-completed "CI" check-run already on this head_sha (as
+          # cancelled) before creating a new one -- this repo's own concurrency:
+          # cancel-in-progress kills a run's watchdog before it can conclude anything, with no
+          # way for any in-run script to intercept that cancellation (HAG-81 PR #164 review,
+          # round 3 lesson, applied here from the start rather than rediscovered).
+          stale_ids=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+            --jq '[.check_runs[] | select(.name=="CI" and .status!="completed") | .id][]')
+          for stale_id in $stale_ids; do
+            gh api -X PATCH "repos/$REPO/check-runs/$stale_id" -f status="completed" -f conclusion="cancelled" \
+              -f "output[title]=Superseded" \
+              -f "output[summary]=Superseded by a newer dispatch (run $RUN_ID) for the same revision." \
+              || echo "::warning::failed to conclude stale check-run $stale_id" >&2
+          done
+          check_id=$(gh api -X POST "repos/$REPO/check-runs" \
+            -f name="CI" -f head_sha="$HEAD_SHA" -f status="in_progress" -f external_id="$RUN_ID" --jq '.id')
+          echo "check_run_id=$check_id" >> "$GITHUB_OUTPUT"
+
+  test-full:
+    name: Full test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install ALSA dev headers (for cpal)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: cargo test --workspace --features cpal-backend,websocket
+
+  bench-fuzz:
+    name: Bench & Fuzz Compilation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install ALSA dev headers (for cpal)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Check benchmarks compile
+        run: cargo bench --no-run --workspace
+      - name: Check fuzz targets compile
+        run: cd fuzz && cargo check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.98.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install ALSA dev headers (for cpal)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  msrv:
+    name: MSRV Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.85.0" # matches Cargo.toml rust-version -- this job is the MSRV gate
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install ALSA dev headers (for cpal)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      # +1.85.0, not plain `cargo check`: the repo's own rust-toolchain.toml (pinned to 1.98.0)
+      # overrides `rustup default` for any bare cargo/rustc invocation in this directory tree.
+      - run: cargo +1.85.0 check --workspace
+
+  deny:
+    name: Supply-chain check (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # rustsec/audit-check creates a check-run to report its findings (vulnerabilities AND
+      # informational warnings like a yanked crate) -- without checks: write the default
+      # GITHUB_TOKEN can't do that. Safe to grant unconditionally here (unlike the old
+      # pull_request-triggered version, which had to split into a fork/Dependabot-safe branch):
+      # this job only ever runs via workflow_dispatch/push/merge_group, none of which is a
+      # PR-controlled-secret context GitHub itself would silently downgrade.
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # HAG-81 PR #164 review lesson applied from the start: GHA step boundaries within one job do
+  # NOT isolate a secret from PR-controlled code -- only job boundaries do (a PR-controlled step
+  # earlier in the same job can persist a BASH_ENV/PATH-shadowing payload via
+  # $GITHUB_ENV/$GITHUB_PATH into every later step of that job). This job never executes
+  # anything from the checked-out revision -- checkout is present only so the clone below lands
+  # in a real git worktree context, not because anything here runs code from it -- and the
+  # comparison tool itself (sunto's wiki-lint) is fetched fresh via the token, not read from the
+  # PR's own tree, so SUNTO_RO_TOKEN never shares a job with any PR-controlled command.
+  wiki-lint:
+    name: Wiki lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+      - name: Clone sunto
+        env:
+          SUNTO_TOKEN: ${{ secrets.SUNTO_RO_TOKEN }}
+        run: git clone "https://x-access-token:${SUNTO_TOKEN}@github.com/HagaleTechnologies/sunto.git" /tmp/sunto
+      - name: Lint wiki
+        run: python3 /tmp/sunto/bin/wiki-lint wiki/
+
+  checks-queue-watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 270
+    permissions:
+      actions: write
+      checks: write
+    steps:
+      - name: Cancel the run if any downstream job never starts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          HEAD_SHA: ${{ inputs.head_sha || github.sha }}
+        run: |
+          # The required "CI" check-run is created via the Checks API (create-ci-check), not
+          # tied to a native job -- cancelling this run does NOT auto-conclude it, so without
+          # this it stays "in_progress" forever, blocking the PR indefinitely instead of failing
+          # fast. Filtered by external_id == this run's own RUN_ID: a head_sha with multiple
+          # dispatches or stale duplicate checks can have more than one check-run named "CI".
+          conclude_check_failure() {
+            [ "$EVENT_NAME" = workflow_dispatch ] || return 0
+            local reason="$1" check_run_id
+            check_run_id="$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq "[.check_runs[] | select(.name == \"CI\" and .external_id == \"$RUN_ID\")][0].id // empty")"
+            if [ -z "$check_run_id" ]; then
+              # create-ci-check itself may never have run (still queued when this watchdog gave
+              # up) -- there is no existing check-run to PATCH, so create the required "CI"
+              # check directly as a failure instead of leaving it permanently absent.
+              gh api -X POST "repos/$REPO/check-runs" \
+                -f name="CI" -f head_sha="$HEAD_SHA" -f status="completed" -f conclusion="failure" \
+                -f external_id="$RUN_ID" -f "output[title]=CI cancelled by watchdog" -f "output[summary]=$reason" \
+                || echo "::warning::failed to create a failed CI check-run for $HEAD_SHA" >&2
+              return 0
+            fi
+            gh api -X PATCH "repos/$REPO/check-runs/$check_run_id" -f status="completed" -f conclusion="failure" \
+              || echo "::warning::failed to conclude check-run $check_run_id before cancelling -- it may stay in_progress" >&2
+          }
+          jobs_json() {
+            local attempt out
+            for attempt in 1 2 3; do
+              if out="$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" 2>&1)"; then
+                printf '%s' "$out"
+                return 0
+              fi
+              sleep 2
+            done
+            echo "::warning::transient gh api failure fetching job statuses (3 attempts) -- treating this poll as inconclusive" >&2
+            echo '{"jobs":[]}'
+          }
+          status_in() {
+            jq -r --arg j "$2" '.jobs[] | select(.name==$j or (.name | endswith("/ " + $j))) | .status' <<<"$1"
+          }
+          started_in() {
+            case "$(status_in "$1" "$2")" in
+              in_progress|completed) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          wait_for_all() {
+            local deadline=2700 blob all_ok j
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              blob="$(jobs_json)"
+              all_ok=true
+              for j in "$@"; do
+                started_in "$blob" "$j" || { all_ok=false; break; }
+              done
+              $all_ok && { echo "all of [$*] started -- watchdog moving on"; return 0; }
+              sleep 10
+            done
+            blob="$(jobs_json)"
+            stuck=""
+            for j in "$@"; do
+              started_in "$blob" "$j" || { stuck="$j"; break; }
+            done
+            if [ -z "$stuck" ]; then
+              echo "all of [$*] started -- watchdog moving on"
+              return 0
+            fi
+            echo "::error::$stuck has been queued for 45+ minutes with no hosted runner picking it up -- cancelling this run so the required CI check fails fast with a clear reason instead of blocking the PR indefinitely."
+            conclude_check_failure "Cancelled by checks-queue-watchdog: $stuck queued 45+ minutes with no runner pickup."
+            for attempt in 1 2 3; do
+              gh api -X POST "repos/$REPO/actions/runs/$RUN_ID/cancel" && exit 1
+              sleep 2
+            done
+            echo "::error::cancel request itself failed after 3 attempts -- this run may still be left queued with no bound." >&2
+            exit 1
+          }
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            wait_for_all "Create CI check-run on the reviewed SHA"
+          fi
+          SECONDS=0
+          wait_for_all "Full test suite" "Bench & Fuzz Compilation" Clippy "MSRV Check" "Supply-chain check (cargo-deny)" "Security Audit" "Wiki lint"
+
+  # Required branch-protection status check for push/merge_group -- the check-run name comes
+  # from this `name:` field (NOT the job id `ci`, and NOT this workflow's own lowercase
+  # top-level name), and the ruleset requires the literal context "CI".
+  #
+  # Named DIFFERENTLY for workflow_dispatch specifically: this job's own native check-run always
+  # attaches to the DISPATCHED REF's tip (main's own current commit) for a workflow_dispatch
+  # run, regardless of which commit its steps actually checked out internally. Left named plain
+  # "CI" for workflow_dispatch too, this job would report a SPURIOUS "CI: success" for main's
+  # tip on every PR-validation dispatch, even though main itself was never tested. Renaming this
+  # job's OWN native check-run out of the way for that one event type leaves "CI" meaning
+  # exactly one thing per SHA, regardless of event.
+  ci:
+    name: ${{ github.event_name == 'workflow_dispatch' && 'CI (native, workflow_dispatch)' || 'CI' }}
+    if: always()
+    needs:
+      [
+        create-ci-check,
+        test-full,
+        bench-fuzz,
+        clippy,
+        msrv,
+        deny,
+        audit,
+        wiki-lint,
+        checks-queue-watchdog,
+      ]
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+    steps:
+      - name: Check all jobs (including the fast tier's own native results)
+        id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ inputs.head_sha || github.sha }}
+          TEST_FULL: ${{ needs.test-full.result }}
+          BENCH_FUZZ: ${{ needs.bench-fuzz.result }}
+          CLIPPY: ${{ needs.clippy.result }}
+          MSRV: ${{ needs.msrv.result }}
+          DENY: ${{ needs.deny.result }}
+          AUDIT: ${{ needs.audit.result }}
+          WIKI_LINT: ${{ needs.wiki-lint.result }}
+          CHECKS_QUEUE_WATCHDOG: ${{ needs.checks-queue-watchdog.result }}
+        run: |
+          echo "test-full=$TEST_FULL bench-fuzz=$BENCH_FUZZ clippy=$CLIPPY msrv=$MSRV deny=$DENY audit=$AUDIT wiki-lint=$WIKI_LINT checks-queue-watchdog=$CHECKS_QUEUE_WATCHDOG"
+          # create-ci-check legitimately reports "skipped" on every event but workflow_dispatch
+          # (its own `if:` only runs for workflow_dispatch) -- excluded from the generic loop
+          # below via an explicit re-check instead, so a real create-ci-check FAILURE (which is
+          # not "skipped") still trips this.
+          if [ "${{ needs.create-ci-check.result }}" = "failure" ] || [ "${{ needs.create-ci-check.result }}" = "cancelled" ]; then
+            echo "outcome=failure" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          for r in "$TEST_FULL" "$BENCH_FUZZ" "$CLIPPY" "$MSRV" "$DENY" "$AUDIT" "$WIKI_LINT" "$CHECKS_QUEUE_WATCHDOG"; do
+            if [ "$r" != success ]; then
+              echo "outcome=failure" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+          done
+          # ci.yml's own fast tier (check/test-features/fmt/platform) is a SEPARATE workflow
+          # file with its own native per-job check-run attribution on this SAME head_sha --
+          # cross-checked here rather than duplicated, so "CI" reflects both tiers combined.
+          # ci.yml runs on push/pull_request/merge_group; for workflow_dispatch specifically,
+          # its results already exist on the SAME head_sha from when the PR was actually open.
+          fast_tier_names='["Check","Test with Features (fast, lib-only)","Format","Platform Check (ubuntu-latest)","Platform Check (macos-latest)","Platform Check (windows-latest)"]'
+          fast_tier_results=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+            --jq --argjson names "$fast_tier_names" '[.check_runs[] | select(.name as $n | $names | index($n))] | group_by(.name) | map(max_by(.started_at))')
+          missing=$(echo "$fast_tier_results" | jq --argjson names "$fast_tier_names" '$names - [.[].name]')
+          if [ "$(echo "$missing" | jq 'length')" -gt 0 ]; then
+            echo "::error::Missing fast-tier check-run(s) for $HEAD_SHA: $missing -- ci.yml may not have run yet, or ran against a different SHA."
+            echo "outcome=failure" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          not_success=$(echo "$fast_tier_results" | jq '[.[] | select(.conclusion != "success")]')
+          if [ "$(echo "$not_success" | jq 'length')" -gt 0 ]; then
+            echo "::error::One or more fast-tier checks did not succeed on $HEAD_SHA: $(echo "$not_success" | jq -c '[.[] | {name, conclusion}]')"
+            echo "outcome=failure" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "outcome=success" >> "$GITHUB_OUTPUT"
+
+      - name: Relay this result onto the reviewed SHA's CI check-run (workflow_dispatch only)
+        if: always() && github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ inputs.head_sha || github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          CHECK_RUN_ID: ${{ needs.create-ci-check.outputs.check_run_id }}
+          OUTCOME: ${{ steps.check.outputs.outcome }}
+        run: |
+          conclusion="failure"
+          [ "$OUTCOME" = "success" ] && conclusion="success"
+          if [ -z "$CHECK_RUN_ID" ]; then
+            # create-ci-check can fail FAST (a `gh api` error), not just never start -- the
+            # watchdog's own create-if-missing fallback only covers the queue-stall case.
+            echo "::warning::No CI check-run id to relay to -- create-ci-check must have failed before creating one. Publishing a $conclusion CI check-run directly."
+            gh api -X POST "repos/$REPO/check-runs" \
+              -f name="CI" -f head_sha="$HEAD_SHA" -f status="completed" -f conclusion="$conclusion" \
+              -f external_id="$RUN_ID" -f "output[title]=create-ci-check failed" \
+              -f "output[summary]=create-ci-check did not produce a check-run id for this run; see its own job logs." \
+              || echo "::warning::failed to publish a fallback CI check-run for $HEAD_SHA" >&2
+            exit 0
+          fi
+          for attempt in 1 2 3; do
+            gh api -X PATCH "repos/$REPO/check-runs/$CHECK_RUN_ID" -f status="completed" -f conclusion="$conclusion" && exit 0
+            sleep 2
+          done
+          echo "::error::failed to conclude check-run $CHECK_RUN_ID after 3 attempts -- it may stay in_progress" >&2
+          exit 1

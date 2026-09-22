@@ -16,10 +16,16 @@ name: Queue Retry Handler
 # suite Actions itself created (anti-recursion) -- every check in this repo is Actions-created.
 on:
   workflow_run:
-    # "CI" is coppa's only required PR-triggered check besides "Wait for Codex Review" (which is
-    # a deliberate merge_group pass-through -- it never re-reviews a synthetic integration
-    # commit, so it structurally can't fail there, matching vanity/cqdx/widdershins precedent).
-    workflows: ['CI']
+    # HAG-78: "CI" (the fast, always-on tier -- check/test-features/fmt/platform, ci.yml) and
+    # "ci" (the heavy tier gated behind Codex, ci-full.yml, lowercase top-level `name:`
+    # deliberately -- matches HagaleTechnologies/panino's own HAG-81 convention, distinguishing
+    # the WORKFLOW's own name from the "CI" job/check name its fan-in job publishes) both run on
+    # merge_group and both must be watched here -- either one failing on the synthetic
+    # integration commit needs the same one-retry-then-hand-off treatment. "Wait for Codex
+    # Review"/"Codex review clean..." is a deliberate merge_group pass-through (it never
+    # re-reviews a synthetic integration commit, so it structurally can't fail there, matching
+    # vanity/cqdx/widdershins precedent) and is not subscribed here.
+    workflows: ['CI', 'ci']
     types: [completed]
 
 permissions:
