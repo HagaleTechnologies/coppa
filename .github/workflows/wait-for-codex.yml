@@ -194,17 +194,18 @@ jobs:
           # this run's own RUN_ID when one is present (HAG-81 PR #164 review, round 2): a
           # head_sha with multiple dispatches/reruns can have more than one check-run with the
           # same name -- without this, the wrong run's check-run could be matched and mutated.
-          # `--paginate --slurp`: a PR with enough review rounds can push this commit's
-          # check-run count past the REST default page size (confirmed live on cqdx#470 at 41
-          # check-runs for one SHA). `--paginate` alone runs this jq filter once PER PAGE,
-          # printing multiple separate results instead of one combined one (Codex P1, HAG-78 PR
-          # #113 review, caught on a different check-run lookup in this same migration) --
-          # `--slurp` wraps every page's response object into one outer array first, so
-          # `.[].check_runs[]` flattens across all of them before filtering.
+          # `--paginate`: a PR with enough review rounds can push this commit's check-run count
+          # past the REST default page size (confirmed live on cqdx#470 at 41 check-runs for one
+          # SHA). `--paginate` alone runs a filter once PER PAGE, printing multiple separate
+          # results instead of one combined one -- `gh api`'s own --slurp is REJECTED outright
+          # when combined with --jq ("the --slurp option is not supported with --jq or
+          # --template", confirmed live on this PR's own round-2 review, a real Codex response
+          # event failing this exact command). Piping the raw --paginate output into a SEPARATE
+          # `jq -s` (jq's own slurp flag) is the only way to combine pages before filtering.
           upsert_check_run() {
             local name="$1" status="$2" conclusion="$3" existing_id
-            existing_id=$(gh api --paginate --slurp "repos/$REPO/commits/$HEAD_SHA/check-runs" --jq \
-              "[.[].check_runs[] | select(.name == \"$name\")] | sort_by(.started_at) | last | .id // empty")
+            existing_id=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+              | jq -s "[.[].check_runs[] | select(.name == \"$name\")] | sort_by(.started_at) | last | .id // empty")
             if [ -n "$existing_id" ]; then
               if [ -n "$conclusion" ]; then
                 gh api -X PATCH "repos/$REPO/check-runs/$existing_id" \
@@ -279,12 +280,23 @@ jobs:
           GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "CODEX_REVIEW_PAT not available -- skipping the request comment. A formal Codex review tied to this head still resolves the check normally via codex-review-response, once one lands."
             exit 0
           fi
           gh api "repos/$REPO/issues/$PR/comments" -f body="@codex review" >/dev/null
+          # Codex P1, HAG-78 PR #113 review round 2: request and response are now DIFFERENT
+          # workflow runs (decoupled, event-driven), so github.run_attempt in the response job
+          # is ALWAYS 1 for a genuinely-fired response event -- it can never distinguish a real
+          # new commit from a bare re-request of an UNCHANGED head_sha the way the old single
+          # polling job's own run_attempt could. That distinction has to be recorded somewhere
+          # durable the response job can independently read back: a marker comment counting how
+          # many times THIS EXACT head_sha has been requested. Posted as its OWN comment, not
+          # appended to the "@codex review" trigger text above, to avoid any risk of interfering
+          # with Codex's own trigger-phrase matching.
+          gh api "repos/$REPO/issues/$PR/comments" -f body="<!-- codex-review-request head_sha=$HEAD_SHA -->" >/dev/null
 
       - name: Dispatch full CI (pass-through success -- no Codex round to wait on)
         if: steps.create-check.outputs.check_run_id != '' && steps.create-check.outputs.conclusion == 'success'
@@ -531,9 +543,26 @@ jobs:
           PR: ${{ steps.pr-context.outputs.pr }}
           HEAD_SHA: ${{ steps.pr-context.outputs.head_sha }}
           RUN_STARTED: ${{ steps.request-comment.outputs.run_started }}
-          IS_GENUINE_SYNC: ${{ github.run_attempt == 1 }}
         run: |
           set -o pipefail
+          # Codex P1, HAG-78 PR #113 review round 2: request and response are DIFFERENT
+          # workflow runs (decoupled, event-driven) -- github.run_attempt in THIS job is always
+          # 1 for a genuinely-fired response event, so it can never distinguish a real new
+          # commit from a bare re-request of an unchanged head_sha the way the old single
+          # polling job's own run_attempt could (that bug would have silently disabled the
+          # unresolved_baseline_count safety gate below on every single round, always treating
+          # it as genuine). Read back the durable marker the request job posts instead: if more
+          # than one "<!-- codex-review-request head_sha=$HEAD_SHA -->" comment exists for this
+          # EXACT head_sha, this round is a re-request of unchanged code, not a genuine new
+          # commit.
+          # HEAD_SHA is a git SHA (safe hex characters only) -- interpolated directly into the
+          # filter string rather than via --arg, since `gh api --jq` (distinct from real jq)
+          # has no --arg companion flag at all (confirmed live: "accepts 1 arg(s), received 4").
+          marker_count=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" \
+            --jq "[.[] | select(.body == \"<!-- codex-review-request head_sha=$HEAD_SHA -->\")] | length")
+          IS_GENUINE_SYNC=true
+          [ "$marker_count" -gt 1 ] && IS_GENUINE_SYNC=false
+          echo "Found $marker_count request marker(s) for $HEAD_SHA -- IS_GENUINE_SYNC=$IS_GENUINE_SYNC"
           apply_clean_label() {
             local label="codex-clean:${HEAD_SHA:0:12}"
             for _ in 1 2 3; do
@@ -722,10 +751,10 @@ jobs:
           # through end to end.
           OUTCOME: ${{ steps.verdict.outputs.codex_errored == 'true' && 'failure' || steps.compute-verdict.outputs.outcome }}
         run: |
-          # --slurp alongside --paginate: see upsert_check_run's own comment above -- without
-          # it, this filter runs once per page and can silently miss a later page's entry.
-          check_id=$(gh api --paginate --slurp "repos/$REPO/commits/$HEAD_SHA/check-runs" \
-            --jq '[.[].check_runs[] | select(.name == "Codex review clean (gate before expensive downstream jobs)")] | sort_by(.started_at) | last | .id // empty')
+          # See upsert_check_run's own comment above: piped into a separate `jq -s`, not
+          # `gh api`'s own --slurp (rejected outright when combined with --jq).
+          check_id=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+            | jq -s '[.[].check_runs[] | select(.name == "Codex review clean (gate before expensive downstream jobs)")] | sort_by(.started_at) | last | .id // empty')
 
           conclude_check() {
             local conclusion="$1"
