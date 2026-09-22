@@ -398,6 +398,25 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
 
+      # Codex P1, this PR's own round-10 review: publishing a FRESH check-run when the mint
+      # above fails does NOT actually recover anything -- create-ci-check's own hagale-agent-
+      # owned "CI" check-run is left stuck in_progress alongside the new one, so the SAME
+      # required-check name now has a stuck check AND a concluded one, and the PR stays
+      # blocked regardless. A single retry (most mint failures are a transient API blip)
+      # covers the ordinary case; if it ALSO fails, the Relay step below now fails loudly
+      # instead of masking the problem with a duplicate (see HAG-90, which already scopes
+      # this exact residual gap for ci-full.yml).
+      - name: Retry minting a hagale-agent installation token if that failed
+        id: app-token-retry
+        if: steps.app-token.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
       - name: Check all jobs (including the fast tier's own native results)
         id: check
         env:
@@ -488,7 +507,7 @@ jobs:
       - name: Relay this result onto the reviewed SHA's CI check-run (workflow_dispatch only)
         if: always() && github.event_name == 'workflow_dispatch'
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || steps.app-token-retry.outputs.token }}
           FALLBACK_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ inputs.head_sha || github.sha }}
@@ -498,24 +517,26 @@ jobs:
         run: |
           conclusion="failure"
           [ "$OUTCOME" = "success" ] && conclusion="success"
-          # Codex P1, this PR's own round-9 review: a PATCH attempted with no usable hagale-agent
-          # token would just fail outright (empty/expired GH_TOKEN) -- publish a FRESH check-run
-          # with github.token instead of trying (and silently failing) to update the existing
-          # one. Same fallback already covers the "create-ci-check never produced an id" case.
-          if [ -z "$CHECK_RUN_ID" ] || [ -z "$GH_TOKEN" ]; then
-            if [ -z "$GH_TOKEN" ]; then
-              echo "::warning::hagale-agent token unavailable (mint failed) -- cannot update the existing CI check-run even though create-ci-check produced one. Publishing a fresh $conclusion CI check-run instead."
-              summary="create-ci-check created the managed CI check-run, but minting a hagale-agent token failed in this later step, so it could not be updated. See this run's own logs."
-            else
-              echo "::warning::No CI check-run id to relay to -- create-ci-check must have failed before creating one. Publishing a $conclusion CI check-run directly."
-              summary="create-ci-check did not produce a check-run id for this run; see its own job logs."
-            fi
-            GH_TOKEN="$FALLBACK_TOKEN" gh api -X POST "repos/$REPO/check-runs" \
+          # No existing check-run to worry about (create-ci-check itself never produced one) --
+          # safe to publish fresh with whatever token is available, App or github.token.
+          if [ -z "$CHECK_RUN_ID" ]; then
+            echo "::warning::No CI check-run id to relay to -- create-ci-check must have failed before creating one. Publishing a $conclusion CI check-run directly."
+            GH_TOKEN="${GH_TOKEN:-$FALLBACK_TOKEN}" gh api -X POST "repos/$REPO/check-runs" \
               -f name="CI" -f head_sha="$HEAD_SHA" -f status="completed" -f conclusion="$conclusion" \
-              -f external_id="$RUN_ID" -f "output[title]=Could not update the managed CI check-run" \
-              -f "output[summary]=$summary" \
+              -f external_id="$RUN_ID" -f "output[title]=create-ci-check failed" \
+              -f "output[summary]=create-ci-check did not produce a check-run id for this run; see its own job logs." \
               || echo "::warning::failed to publish a fallback CI check-run for $HEAD_SHA" >&2
             exit 0
+          fi
+          # Codex P1, this PR's own round-10 review: create-ci-check's hagale-agent-owned check
+          # ALREADY exists here -- posting a fresh one with github.token when both App-token
+          # mints (this step's own, plus the retry) fail would leave TWO same-named checks, the
+          # original stuck in_progress forever, and the PR still blocked regardless. Failing
+          # loudly is more honest than masking that with a duplicate; HAG-90 tracks this exact
+          # residual gap (recovering a check-run when no App token is available at all).
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::hagale-agent token unavailable after two mint attempts -- cannot update check-run $CHECK_RUN_ID, and will NOT publish a duplicate (see HAG-90). Push a new commit, or manually dispatch ci-full.yml once the App is healthy, to unblock $HEAD_SHA."
+            exit 1
           fi
           for attempt in 1 2 3; do
             gh api -X PATCH "repos/$REPO/check-runs/$CHECK_RUN_ID" -f status="completed" -f conclusion="$conclusion" && exit 0
