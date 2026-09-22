@@ -428,6 +428,16 @@ jobs:
       - name: Publish a failed check-run since request setup itself failed
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          # Codex P1, this PR's own round-9 review: when even THIS job's own independent mint
+          # fails, this check-run is created with github.token -- a later rerun's hagale-agent
+          # token can never PATCH a check-run a different App identity created (confirmed live
+          # previously, see catalyst memory reference_github_checks_api_cross_app_identity_
+          # update_rejected.md), so "re-run the failed job" is NOT a real recovery path for this
+          # specific fallback. USED_GITHUB_TOKEN distinguishes it so the published message
+          # doesn't promise a recovery path that won't work. HAG-90 tracks the deeper gap (safely
+          # detecting and recovering a foreign-App-owned stuck check via automation); a brand-new
+          # commit always works regardless; not solved further here.
+          USED_GITHUB_TOKEN: ${{ steps.app-token.outcome == 'failure' && 'true' || 'false' }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           RUN_ID: ${{ github.run_id }}
@@ -445,6 +455,11 @@ jobs:
             echo "A check-run already exists for $HEAD_SHA -- create-check ran successfully before a later step failed. Nothing to do here."
             exit 0
           fi
+          if [ "$USED_GITHUB_TOKEN" = "true" ]; then
+            summary="The codex-review-request job failed before it could create the managed check-run (run $RUN_ID), and hagale-agent could not be minted here either. Only a NEW COMMIT can unblock this PR -- a rerun will create this check-run with github.token again, which a future hagale-agent-authenticated run can never update."
+          else
+            summary="The codex-review-request job failed before it could create the managed check-run (run $RUN_ID). Push a new commit, or re-run the failed job and let it retry, to unblock this PR."
+          fi
           cat <<JSON | gh api "repos/$REPO/check-runs" --input -
           {
             "name": "Codex review clean (gate before expensive downstream jobs)",
@@ -454,7 +469,7 @@ jobs:
             "details_url": "https://github.com/$REPO/actions/runs/$RUN_ID",
             "output": {
               "title": "Codex review request setup failed",
-              "summary": "The codex-review-request job failed before it could create the managed check-run (run $RUN_ID). Push a new commit, or re-run the failed job and let it retry, to unblock this PR."
+              "summary": "$summary"
             }
           }
           JSON

@@ -382,8 +382,15 @@ jobs:
       # update a check-run a different run/identity created, so that PATCH was silently failing
       # on every normal workflow_dispatch. This step only reads check-runs, so github.token
       # stays fine for it.
+      # Codex P1, this PR's own round-9 review: create-ci-check can succeed (the managed "CI"
+      # check-run exists, hagale-agent-owned) while THIS mint fails transiently -- the watchdog
+      # only watches for jobs that never start and has already finished by the time this step
+      # runs, so nothing else would ever notice or retry. continue-on-error keeps the job going;
+      # the Relay step below falls back to publishing a FRESH check-run with github.token when
+      # this token is unavailable, rather than attempting (and silently failing) a PATCH.
       - name: Mint a hagale-agent installation token for check-run writes
         id: app-token
+        continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: 4696353
@@ -482,6 +489,7 @@ jobs:
         if: always() && github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          FALLBACK_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ inputs.head_sha || github.sha }}
           RUN_ID: ${{ github.run_id }}
@@ -490,14 +498,22 @@ jobs:
         run: |
           conclusion="failure"
           [ "$OUTCOME" = "success" ] && conclusion="success"
-          if [ -z "$CHECK_RUN_ID" ]; then
-            # create-ci-check can fail FAST (a `gh api` error), not just never start -- the
-            # watchdog's own create-if-missing fallback only covers the queue-stall case.
-            echo "::warning::No CI check-run id to relay to -- create-ci-check must have failed before creating one. Publishing a $conclusion CI check-run directly."
-            gh api -X POST "repos/$REPO/check-runs" \
+          # Codex P1, this PR's own round-9 review: a PATCH attempted with no usable hagale-agent
+          # token would just fail outright (empty/expired GH_TOKEN) -- publish a FRESH check-run
+          # with github.token instead of trying (and silently failing) to update the existing
+          # one. Same fallback already covers the "create-ci-check never produced an id" case.
+          if [ -z "$CHECK_RUN_ID" ] || [ -z "$GH_TOKEN" ]; then
+            if [ -z "$GH_TOKEN" ]; then
+              echo "::warning::hagale-agent token unavailable (mint failed) -- cannot update the existing CI check-run even though create-ci-check produced one. Publishing a fresh $conclusion CI check-run instead."
+              summary="create-ci-check created the managed CI check-run, but minting a hagale-agent token failed in this later step, so it could not be updated. See this run's own logs."
+            else
+              echo "::warning::No CI check-run id to relay to -- create-ci-check must have failed before creating one. Publishing a $conclusion CI check-run directly."
+              summary="create-ci-check did not produce a check-run id for this run; see its own job logs."
+            fi
+            GH_TOKEN="$FALLBACK_TOKEN" gh api -X POST "repos/$REPO/check-runs" \
               -f name="CI" -f head_sha="$HEAD_SHA" -f status="completed" -f conclusion="$conclusion" \
-              -f external_id="$RUN_ID" -f "output[title]=create-ci-check failed" \
-              -f "output[summary]=create-ci-check did not produce a check-run id for this run; see its own job logs." \
+              -f external_id="$RUN_ID" -f "output[title]=Could not update the managed CI check-run" \
+              -f "output[summary]=$summary" \
               || echo "::warning::failed to publish a fallback CI check-run for $HEAD_SHA" >&2
             exit 0
           fi
