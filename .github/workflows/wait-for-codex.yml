@@ -14,6 +14,17 @@ name: Wait for Codex Review
 # and creates/upserts a Checks-API-managed check-run) and `codex-review-response` (fires once
 # per Codex reply, evaluates it, and either dispatches ci-full.yml or fails the check). No
 # poll loop anywhere -- each job runs exactly once per real event and returns.
+#
+# Known accepted gap (HAG-87, confirmed live on this PR's own round-4 review): if Codex's ONLY
+# terminal signal for a round is a bare thumbs-up reaction (no formal review, no comment), no
+# event below fires to trigger codex-review-response -- GitHub Actions has no native trigger
+# for "reaction added." credenza's shared codex-review-request.yml/codex-review-response.yml
+# pair has this identical gap (it's not something coppa's hand-port introduced), and every
+# credenza-`uses:`-based migration in this fleet already relies on the SAME org-wide backstop
+# for it: credenza's codex-review-timeout-scan.yml (15min cron) re-requests a review at 90min
+# and fails the check at 120min if still stuck, regardless of which repo or mechanism produced
+# the check-run. Not fixed locally here -- HAG-87 tracks a single shared fix in credenza itself
+# rather than N one-off patches (one per hand-port repo) with their own untested edge cases.
 
 on:
   # pull_request_target (not pull_request): a same-repo PR that edits THIS file could, under
@@ -393,12 +404,28 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ steps.pr-context.outputs.pr }}
+          HEAD_SHA: ${{ steps.pr-context.outputs.head_sha }}
         run: |
           # --paginate, piped into a separate `jq -s`: a heavily-discussed PR can push comment
           # count past 100 (same class of gap as the request-marker query's own fix below),
           # silently missing the truly most-recent "@codex review" comment.
-          comment=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
-            | jq -s '[.[][] | select(.body == "@codex review")] | sort_by(.created_at) | last')
+          all_comments=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" | jq -s '[.[][]]')
+          comment=$(echo "$all_comments" | jq '[.[] | select(.body == "@codex review")] | sort_by(.created_at) | last')
+          # Codex P1, this PR's own round 4 review: a maintainer can manually type "@codex
+          # review" as a bare comment, bypassing this workflow's own request job entirely --
+          # that comment has no accompanying marker (only the automated request job posts one),
+          # so counting markers alone still (wrongly) classifies it as the sole/genuine request.
+          # Pair the SELECTED comment with a marker landing within 10s after it (posted
+          # back-to-back by the same automated step) -- an unmarked selected comment is
+          # conservatively NOT genuine, matching a bare manual re-request of unchanged code.
+          if [ "$comment" != "null" ] && [ -n "$comment" ]; then
+            comment_epoch=$(date -u -d "$(echo "$comment" | jq -r '.created_at')" +%s)
+            is_marked=$(echo "$all_comments" | jq --arg sha "$HEAD_SHA" --argjson after "$comment_epoch" '
+              [.[] | select(.body == "<!-- codex-review-request head_sha=\($sha) -->")
+                   | select((.created_at | fromdateiso8601) >= $after and (.created_at | fromdateiso8601) <= ($after + 10))
+              ] | length > 0')
+            echo "is_marked=$is_marked" >> "$GITHUB_OUTPUT"
+          fi
           if [ "$comment" = "null" ] || [ -z "$comment" ]; then
             echo "::warning::No '@codex review' request comment found on PR #$PR -- falling back to 30 minutes ago as RUN_STARTED."
             echo "run_started=$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
@@ -411,6 +438,12 @@ jobs:
       - name: Compute baseline threads as of the request comment
         id: baseline
         if: steps.head-check.outputs.stale != 'true'
+        # HAG-89 (Codex P2, this PR's own round-4 review, deferred per the round-4 convergence
+        # policy): this reads LIVE isResolved state at RESPONSE time, not as it stood when the
+        # request was posted -- a thread resolved at request time but reopened by a human before
+        # Codex actually replies gets folded into baseline as "already known," rather than
+        # recognized as a genuinely NEW event. Narrow window, doesn't affect the core
+        # new_count/restated_count gate, only the auto-resolve convenience path.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -546,6 +579,7 @@ jobs:
           PR: ${{ steps.pr-context.outputs.pr }}
           HEAD_SHA: ${{ steps.pr-context.outputs.head_sha }}
           RUN_STARTED: ${{ steps.request-comment.outputs.run_started }}
+          IS_MARKED: ${{ steps.request-comment.outputs.is_marked }}
         run: |
           set -o pipefail
           # Codex P1, HAG-78 PR #113 review round 2: request and response are DIFFERENT
@@ -569,9 +603,15 @@ jobs:
           # separate `jq -s` is required regardless.
           marker_count=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
             | jq -s "[.[][] | select(.body == \"<!-- codex-review-request head_sha=$HEAD_SHA -->\")] | length")
+          # Codex P1, this PR's own round 4 review: IS_MARKED (computed by the
+          # "Find the most recent request comment" step above) additionally requires the
+          # SELECTED "@codex review" comment itself to be paired with a marker -- a bare manual
+          # re-request (a maintainer typing "@codex review" by hand) has no marker at all, so
+          # marker_count alone would still read "1" and wrongly classify it as genuine.
           IS_GENUINE_SYNC=true
           [ "$marker_count" -gt 1 ] && IS_GENUINE_SYNC=false
-          echo "Found $marker_count request marker(s) for $HEAD_SHA -- IS_GENUINE_SYNC=$IS_GENUINE_SYNC"
+          [ "$IS_MARKED" != "true" ] && IS_GENUINE_SYNC=false
+          echo "Found $marker_count request marker(s) for $HEAD_SHA, selected request is_marked=$IS_MARKED -- IS_GENUINE_SYNC=$IS_GENUINE_SYNC"
           apply_clean_label() {
             local label="codex-clean:${HEAD_SHA:0:12}"
             for _ in 1 2 3; do
