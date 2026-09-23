@@ -1,0 +1,546 @@
+name: ci
+
+# HAG-78: this file replaces the old ci.yml's own codex-clean-gated jobs (test-full, bench-fuzz,
+# clippy, msrv, deny, audit, wiki-lint). It runs ONLY via workflow_dispatch (once
+# wait-for-codex.yml's event-driven gate confirms a revision clean), plus push/merge_group for
+# the non-PR paths -- there is no mid-review-loop skip state to guard against here, since this
+# whole workflow only ever runs once a revision is already confirmed clean or has no PR review
+# context at all (mirroring HagaleTechnologies/panino's own HAG-81 migration; this file follows
+# that same pattern, hardened from round 1 with everything that migration's own review process
+# found the hard way -- see catalyst memory project_hag81_panino_migration_review_marathon).
+#
+# `pull_request` is dropped as a trigger (workflow_dispatch is the new "validate this specific
+# revision" entry point) but `push`/`merge_group` are kept for the non-PR paths, which carry no
+# review context and need no deferring behind a Codex round.
+#
+# ci.yml (the fast, always-on tier: check/test-features/fmt/platform) is a SEPARATE file and
+# keeps its own native per-job check-run attribution -- it isn't gated behind Codex at all. The
+# `ci` fan-in job below cross-checks ITS native check-run results for the same SHA before
+# declaring the required "CI" check successful, so this file owns that name without needing to
+# duplicate those jobs.
+on:
+  workflow_dispatch:
+    inputs:
+      head_sha:
+        description: "The PR revision Codex confirmed clean. Every job below checks this SHA out explicitly instead of defaulting to github.sha, which for a workflow_dispatch run is the default branch tip, not the reviewed commit."
+        type: string
+        required: false
+      is_dependabot:
+        description: "Set by wait-for-codex.yml's excluded-dependabot[bot] pass-through dispatch. A workflow_dispatch run always gets normal repository secrets regardless of who or what caused the dispatch -- unlike a Dependabot-authored pull_request, which GitHub itself redacts secrets from. Declared for forward compatibility even though none of the jobs below currently consume a PR-controlled-code-adjacent secret (SUNTO_RO_TOKEN in wiki-lint is fetched into its OWN isolated job with no PR-controlled command sharing that job -- see wiki-lint's own comment)."
+        type: boolean
+        required: false
+        default: false
+  push:
+    branches: [main]
+  # A merge-queue entry needs "CI" to report on its own synthetic SHA, or it sits pending until
+  # check_response_timeout_minutes and gets dequeued.
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.run_attempt == 1 && (github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.run_id) || github.run_id) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && github.run_attempt == 1 }}
+
+jobs:
+  # A workflow_dispatch run's own native check-runs always attach to the DISPATCHED REF's tip
+  # (the default branch), never to an arbitrary head_sha input passed alongside it. Branch
+  # protection needs a check literally named "CI" on the PR's OWN head commit, so this job (and
+  # the fan-in job's own relay step, below) manage that check-run explicitly via the Checks API
+  # instead -- the same pattern wait-for-codex.yml already uses for "Codex review clean...".
+  # push/merge_group need none of this: github.sha there already names the real commit under
+  # test, so this job is skipped entirely for them.
+  create-ci-check:
+    name: Create CI check-run on the reviewed SHA
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      checks: write
+    outputs:
+      check_run_id: ${{ steps.create.outputs.check_run_id }}
+    steps:
+      - name: Mint a hagale-agent installation token for check-run writes
+        id: app-token
+        # Codex P1, this PR's own round-7 review: the stale-check cleanup below concludes a
+        # check-run that a DIFFERENT (cancelled, earlier) workflow run created -- github.token
+        # can create a check-run within its OWN run but is rejected outright for updating one a
+        # different run created ("Check run status and conclusions can only be updated
+        # internally by GitHub Actions", HTTP 403), same restriction wait-for-codex.yml's own
+        # upsert_check_run already documents. The prior version of this step used github.token
+        # and silently swallowed that 403 via `|| echo "::warning::..."`, leaving the superseded
+        # run's "CI" check-run stuck in_progress forever. hagale-agent (App ID 4696353) is not
+        # subject to this restriction and is already used fleet-wide for the identical purpose.
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Create in_progress "CI" check-run on head_sha
+        id: create
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ inputs.head_sha || github.sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          # Conclude any not-yet-completed "CI" check-run already on this head_sha (as
+          # cancelled) before creating a new one -- this repo's own concurrency:
+          # cancel-in-progress kills a run's watchdog before it can conclude anything, with no
+          # way for any in-run script to intercept that cancellation (HAG-81 PR #164 review,
+          # round 3 lesson, applied here from the start rather than rediscovered).
+          # --paginate: a SHA with enough review rounds can push its check-run count past the
+          # REST default page size (confirmed live on cqdx#470 at 41 check-runs for one SHA).
+          # `gh api`'s own --slurp flag is REJECTED outright when combined with --jq ("the
+          # --slurp option is not supported with --jq or --template", confirmed live on this
+          # PR's own round-2 review -- --paginate alone runs a --jq filter once PER PAGE,
+          # printing multiple separate results instead of one combined one, so piping the raw
+          # (unfiltered) --paginate output into a SEPARATE `jq -s` (jq's own, unrelated slurp
+          # flag) is the only way to combine pages before filtering).
+          stale_ids=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+            | jq -s '[.[].check_runs[] | select(.name=="CI" and .status!="completed") | .id][]')
+          for stale_id in $stale_ids; do
+            gh api -X PATCH "repos/$REPO/check-runs/$stale_id" -f status="completed" -f conclusion="cancelled" \
+              -f "output[title]=Superseded" \
+              -f "output[summary]=Superseded by a newer dispatch (run $RUN_ID) for the same revision." \
+              || echo "::warning::failed to conclude stale check-run $stale_id" >&2
+          done
+          check_id=$(gh api -X POST "repos/$REPO/check-runs" \
+            -f name="CI" -f head_sha="$HEAD_SHA" -f status="in_progress" -f external_id="$RUN_ID" --jq '.id')
+          echo "check_run_id=$check_id" >> "$GITHUB_OUTPUT"
+
+  test-full:
+    name: Full test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install ALSA dev headers (for cpal)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: cargo test --workspace --features cpal-backend,websocket
+
+  bench-fuzz:
+    name: Bench & Fuzz Compilation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install ALSA dev headers (for cpal)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Check benchmarks compile
+        run: cargo bench --no-run --workspace
+      - name: Check fuzz targets compile
+        run: cd fuzz && cargo check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.98.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install ALSA dev headers (for cpal)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  msrv:
+    name: MSRV Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.85.0" # matches Cargo.toml rust-version -- this job is the MSRV gate
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install ALSA dev headers (for cpal)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      # +1.85.0, not plain `cargo check`: the repo's own rust-toolchain.toml (pinned to 1.98.0)
+      # overrides `rustup default` for any bare cargo/rustc invocation in this directory tree.
+      - run: cargo +1.85.0 check --workspace
+
+  deny:
+    name: Supply-chain check (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # rustsec/audit-check creates a check-run to report its findings (vulnerabilities AND
+      # informational warnings like a yanked crate) -- without checks: write the default
+      # GITHUB_TOKEN can't do that. Safe to grant unconditionally here (unlike the old
+      # pull_request-triggered version, which had to split into a fork/Dependabot-safe branch):
+      # this job only ever runs via workflow_dispatch/push/merge_group, none of which is a
+      # PR-controlled-secret context GitHub itself would silently downgrade.
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # HAG-81 PR #164 review lesson applied from the start: GHA step boundaries within one job do
+  # NOT isolate a secret from PR-controlled code -- only job boundaries do (a PR-controlled step
+  # earlier in the same job can persist a BASH_ENV/PATH-shadowing payload via
+  # $GITHUB_ENV/$GITHUB_PATH into every later step of that job). This job never executes
+  # anything from the checked-out revision -- checkout is present only so the clone below lands
+  # in a real git worktree context, not because anything here runs code from it -- and the
+  # comparison tool itself (sunto's wiki-lint) is fetched fresh via the token, not read from the
+  # PR's own tree, so SUNTO_RO_TOKEN never shares a job with any PR-controlled command.
+  wiki-lint:
+    name: Wiki lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+      - name: Clone sunto
+        env:
+          SUNTO_TOKEN: ${{ secrets.SUNTO_RO_TOKEN }}
+        run: git clone "https://x-access-token:${SUNTO_TOKEN}@github.com/HagaleTechnologies/sunto.git" /tmp/sunto
+      - name: Lint wiki
+        run: python3 /tmp/sunto/bin/wiki-lint wiki/
+
+  checks-queue-watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 270
+    permissions:
+      actions: write
+      checks: write
+    steps:
+      # Codex P1, this PR's own round-8 review: create-ci-check now creates the "CI" check-run
+      # with a hagale-agent token (round-7 fix, for the same reason this job needs one too) --
+      # github.token can never PATCH a check-run a different run/identity created, so the PATCH
+      # below was silently failing every time it had a real check-run to conclude.
+      - name: Mint a hagale-agent installation token for check-run writes
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Cancel the run if any downstream job never starts
+        env:
+          # GITHUB_TOKEN for the actions:write calls below (job listing, run cancellation) --
+          # only the two check-run writes in conclude_check_failure use APP_TOKEN instead. Not
+          # swapping GH_TOKEN globally to the App token here: hagale-agent's installation is
+          # provisioned for Checks-API writes fleet-wide, not verified to also carry Actions
+          # scope, and this step's own actions:write JOB permission already covers github.token
+          # for those calls regardless.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          HEAD_SHA: ${{ inputs.head_sha || github.sha }}
+        run: |
+          # The required "CI" check-run is created via the Checks API (create-ci-check), not
+          # tied to a native job -- cancelling this run does NOT auto-conclude it, so without
+          # this it stays "in_progress" forever, blocking the PR indefinitely instead of failing
+          # fast. Filtered by external_id == this run's own RUN_ID: a head_sha with multiple
+          # dispatches or stale duplicate checks can have more than one check-run named "CI".
+          # Codex P1, this PR's own round-8 review: create-ci-check now creates "CI" with a
+          # hagale-agent token (round-7 fix) -- github.token can never PATCH a check-run a
+          # different run/identity created, so the PATCH below was silently failing every time
+          # it had a real check-run to conclude. Both writes use APP_TOKEN now.
+          conclude_check_failure() {
+            [ "$EVENT_NAME" = workflow_dispatch ] || return 0
+            local reason="$1" check_run_id
+            check_run_id="$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" | jq -s "[.[].check_runs[] | select(.name == \"CI\" and .external_id == \"$RUN_ID\")][0].id // empty")"
+            if [ -z "$check_run_id" ]; then
+              # create-ci-check itself may never have run (still queued when this watchdog gave
+              # up) -- there is no existing check-run to PATCH, so create the required "CI"
+              # check directly as a failure instead of leaving it permanently absent.
+              GH_TOKEN="$APP_TOKEN" gh api -X POST "repos/$REPO/check-runs" \
+                -f name="CI" -f head_sha="$HEAD_SHA" -f status="completed" -f conclusion="failure" \
+                -f external_id="$RUN_ID" -f "output[title]=CI cancelled by watchdog" -f "output[summary]=$reason" \
+                || echo "::warning::failed to create a failed CI check-run for $HEAD_SHA" >&2
+              return 0
+            fi
+            GH_TOKEN="$APP_TOKEN" gh api -X PATCH "repos/$REPO/check-runs/$check_run_id" -f status="completed" -f conclusion="failure" \
+              || echo "::warning::failed to conclude check-run $check_run_id before cancelling -- it may stay in_progress" >&2
+          }
+          jobs_json() {
+            local attempt out
+            for attempt in 1 2 3; do
+              if out="$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" 2>&1)"; then
+                printf '%s' "$out"
+                return 0
+              fi
+              sleep 2
+            done
+            echo "::warning::transient gh api failure fetching job statuses (3 attempts) -- treating this poll as inconclusive" >&2
+            echo '{"jobs":[]}'
+          }
+          status_in() {
+            jq -r --arg j "$2" '.jobs[] | select(.name==$j or (.name | endswith("/ " + $j))) | .status' <<<"$1"
+          }
+          started_in() {
+            case "$(status_in "$1" "$2")" in
+              in_progress|completed) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          wait_for_all() {
+            local deadline=2700 blob all_ok j
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              blob="$(jobs_json)"
+              all_ok=true
+              for j in "$@"; do
+                started_in "$blob" "$j" || { all_ok=false; break; }
+              done
+              $all_ok && { echo "all of [$*] started -- watchdog moving on"; return 0; }
+              sleep 10
+            done
+            blob="$(jobs_json)"
+            stuck=""
+            for j in "$@"; do
+              started_in "$blob" "$j" || { stuck="$j"; break; }
+            done
+            if [ -z "$stuck" ]; then
+              echo "all of [$*] started -- watchdog moving on"
+              return 0
+            fi
+            echo "::error::$stuck has been queued for 45+ minutes with no hosted runner picking it up -- cancelling this run so the required CI check fails fast with a clear reason instead of blocking the PR indefinitely."
+            conclude_check_failure "Cancelled by checks-queue-watchdog: $stuck queued 45+ minutes with no runner pickup."
+            for attempt in 1 2 3; do
+              gh api -X POST "repos/$REPO/actions/runs/$RUN_ID/cancel" && exit 1
+              sleep 2
+            done
+            echo "::error::cancel request itself failed after 3 attempts -- this run may still be left queued with no bound." >&2
+            exit 1
+          }
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            wait_for_all "Create CI check-run on the reviewed SHA"
+          fi
+          SECONDS=0
+          wait_for_all "Full test suite" "Bench & Fuzz Compilation" Clippy "MSRV Check" "Supply-chain check (cargo-deny)" "Security Audit" "Wiki lint"
+
+  # Required branch-protection status check for push/merge_group -- the check-run name comes
+  # from this `name:` field (NOT the job id `ci`, and NOT this workflow's own lowercase
+  # top-level name), and the ruleset requires the literal context "CI".
+  #
+  # Named DIFFERENTLY for workflow_dispatch specifically: this job's own native check-run always
+  # attaches to the DISPATCHED REF's tip (main's own current commit) for a workflow_dispatch
+  # run, regardless of which commit its steps actually checked out internally. Left named plain
+  # "CI" for workflow_dispatch too, this job would report a SPURIOUS "CI: success" for main's
+  # tip on every PR-validation dispatch, even though main itself was never tested. Renaming this
+  # job's OWN native check-run out of the way for that one event type leaves "CI" meaning
+  # exactly one thing per SHA, regardless of event.
+  ci:
+    name: ${{ github.event_name == 'workflow_dispatch' && 'CI (native, workflow_dispatch)' || 'CI' }}
+    if: always()
+    needs:
+      [
+        create-ci-check,
+        test-full,
+        bench-fuzz,
+        clippy,
+        msrv,
+        deny,
+        audit,
+        wiki-lint,
+        checks-queue-watchdog,
+      ]
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+    steps:
+      # Codex P1, this PR's own round-8 review: the relay step below PATCHes the "CI" check-run
+      # create-ci-check made with a hagale-agent token (round-7 fix) -- github.token can never
+      # update a check-run a different run/identity created, so that PATCH was silently failing
+      # on every normal workflow_dispatch. This step only reads check-runs, so github.token
+      # stays fine for it.
+      # Codex P1, this PR's own round-9 review: create-ci-check can succeed (the managed "CI"
+      # check-run exists, hagale-agent-owned) while THIS mint fails transiently -- the watchdog
+      # only watches for jobs that never start and has already finished by the time this step
+      # runs, so nothing else would ever notice or retry. continue-on-error keeps the job going;
+      # the Relay step below falls back to publishing a FRESH check-run with github.token when
+      # this token is unavailable, rather than attempting (and silently failing) a PATCH.
+      - name: Mint a hagale-agent installation token for check-run writes
+        id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      # Codex P1, this PR's own round-10 review: publishing a FRESH check-run when the mint
+      # above fails does NOT actually recover anything -- create-ci-check's own hagale-agent-
+      # owned "CI" check-run is left stuck in_progress alongside the new one, so the SAME
+      # required-check name now has a stuck check AND a concluded one, and the PR stays
+      # blocked regardless. A single retry (most mint failures are a transient API blip)
+      # covers the ordinary case; if it ALSO fails, the Relay step below now fails loudly
+      # instead of masking the problem with a duplicate (see HAG-90, which already scopes
+      # this exact residual gap for ci-full.yml).
+      - name: Retry minting a hagale-agent installation token if that failed
+        id: app-token-retry
+        if: steps.app-token.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Check all jobs (including the fast tier's own native results)
+        id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ inputs.head_sha || github.sha }}
+          TEST_FULL: ${{ needs.test-full.result }}
+          BENCH_FUZZ: ${{ needs.bench-fuzz.result }}
+          CLIPPY: ${{ needs.clippy.result }}
+          MSRV: ${{ needs.msrv.result }}
+          DENY: ${{ needs.deny.result }}
+          AUDIT: ${{ needs.audit.result }}
+          WIKI_LINT: ${{ needs.wiki-lint.result }}
+          CHECKS_QUEUE_WATCHDOG: ${{ needs.checks-queue-watchdog.result }}
+        run: |
+          echo "test-full=$TEST_FULL bench-fuzz=$BENCH_FUZZ clippy=$CLIPPY msrv=$MSRV deny=$DENY audit=$AUDIT wiki-lint=$WIKI_LINT checks-queue-watchdog=$CHECKS_QUEUE_WATCHDOG"
+          # create-ci-check legitimately reports "skipped" on every event but workflow_dispatch
+          # (its own `if:` only runs for workflow_dispatch) -- excluded from the generic loop
+          # below via an explicit re-check instead, so a real create-ci-check FAILURE (which is
+          # not "skipped") still trips this.
+          if [ "${{ needs.create-ci-check.result }}" = "failure" ] || [ "${{ needs.create-ci-check.result }}" = "cancelled" ]; then
+            echo "outcome=failure" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          for r in "$TEST_FULL" "$BENCH_FUZZ" "$CLIPPY" "$MSRV" "$DENY" "$AUDIT" "$WIKI_LINT" "$CHECKS_QUEUE_WATCHDOG"; do
+            if [ "$r" != success ]; then
+              echo "outcome=failure" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+          done
+          # ci.yml's own fast tier (check/test-features/fmt/platform) is a SEPARATE workflow
+          # file with its own native per-job check-run attribution on this SAME head_sha --
+          # cross-checked here rather than duplicated, so "CI" reflects both tiers combined.
+          # ci.yml runs on push/pull_request/merge_group; for workflow_dispatch specifically,
+          # its results already exist on the SAME head_sha from when the PR was actually open.
+          # Codex P1, round 1: `gh api --paginate` alone runs a --jq filter once PER PAGE,
+          # printing multiple separate JSON arrays rather than one combined array once this SHA
+          # has more than a page of check-runs -- the `jq 'length'` calls below would then see
+          # multiple values, and the shell `-gt` test errors and silently falls through, letting
+          # a later page's missing/failed check slip past undetected.
+          # Codex P1, round 2 (this PR's own review): `gh api`'s own --slurp is REJECTED
+          # outright when combined with --jq ("the --slurp option is not supported with --jq or
+          # --template") -- confirmed live when this exact combination made the "Update the
+          # check-run" step below fail with exit code 1 on a real Codex response event. Piping
+          # the raw --paginate output into a SEPARATE `jq -s` (jq's own slurp flag) is the only
+          # way to combine pages before filtering.
+          fast_tier_names='["Check","Test with Features (fast, lib-only)","Format","Platform Check (ubuntu-latest)","Platform Check (macos-latest)","Platform Check (windows-latest)"]'
+          fetch_fast_tier() {
+            gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+              | jq -s --argjson names "$fast_tier_names" '[.[].check_runs[] | select(.name as $n | $names | index($n))] | group_by(.name) | map(max_by(.started_at))'
+          }
+          # Codex P1, round 3 (this PR's own review): ci.yml and ci-full.yml are two SEPARATE
+          # workflow files triggered by the SAME event (push/merge_group) with NO ordering
+          # guarantee between them -- a one-shot snapshot here can catch ci.yml's jobs still
+          # queued/running (especially macOS/Windows platform runners lagging the heavy Ubuntu
+          # jobs), missing or null-conclusion, and fail this required check even though the fast
+          # tier succeeds moments later, with no later event ever re-evaluating it. Poll with a
+          # bounded timeout instead of a single read; this also naturally covers
+          # workflow_dispatch (the fast tier's checks already completed when the PR was open, so
+          # this returns on its first iteration there).
+          fast_tier_deadline=$((SECONDS + 1800))
+          fast_tier_results='[]'
+          while [ "$SECONDS" -lt "$fast_tier_deadline" ]; do
+            fast_tier_results=$(fetch_fast_tier)
+            still_pending=$(echo "$fast_tier_results" | jq '[.[] | select(.status != "completed")] | length')
+            found=$(echo "$fast_tier_results" | jq 'length')
+            if [ "$found" -eq 6 ] && [ "$still_pending" -eq 0 ]; then
+              break
+            fi
+            echo "Waiting for ci.yml's fast tier to finish on $HEAD_SHA ($found/6 found, $still_pending still running)..."
+            sleep 15
+          done
+          missing=$(echo "$fast_tier_results" | jq --argjson names "$fast_tier_names" '$names - [.[].name]')
+          if [ "$(echo "$missing" | jq 'length')" -gt 0 ]; then
+            echo "::error::Missing or still-incomplete fast-tier check-run(s) for $HEAD_SHA after 30 minutes: $missing -- ci.yml may not have run at all, ran against a different SHA, or is still queued/running."
+            echo "outcome=failure" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          not_success=$(echo "$fast_tier_results" | jq '[.[] | select(.conclusion != "success")]')
+          if [ "$(echo "$not_success" | jq 'length')" -gt 0 ]; then
+            echo "::error::One or more fast-tier checks did not succeed on $HEAD_SHA: $(echo "$not_success" | jq -c '[.[] | {name, conclusion}]')"
+            echo "outcome=failure" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "outcome=success" >> "$GITHUB_OUTPUT"
+
+      - name: Relay this result onto the reviewed SHA's CI check-run (workflow_dispatch only)
+        if: always() && github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || steps.app-token-retry.outputs.token }}
+          FALLBACK_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ inputs.head_sha || github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          CHECK_RUN_ID: ${{ needs.create-ci-check.outputs.check_run_id }}
+          OUTCOME: ${{ steps.check.outputs.outcome }}
+        run: |
+          conclusion="failure"
+          [ "$OUTCOME" = "success" ] && conclusion="success"
+          # No existing check-run to worry about (create-ci-check itself never produced one) --
+          # safe to publish fresh with whatever token is available, App or github.token.
+          if [ -z "$CHECK_RUN_ID" ]; then
+            echo "::warning::No CI check-run id to relay to -- create-ci-check must have failed before creating one. Publishing a $conclusion CI check-run directly."
+            GH_TOKEN="${GH_TOKEN:-$FALLBACK_TOKEN}" gh api -X POST "repos/$REPO/check-runs" \
+              -f name="CI" -f head_sha="$HEAD_SHA" -f status="completed" -f conclusion="$conclusion" \
+              -f external_id="$RUN_ID" -f "output[title]=create-ci-check failed" \
+              -f "output[summary]=create-ci-check did not produce a check-run id for this run; see its own job logs." \
+              || echo "::warning::failed to publish a fallback CI check-run for $HEAD_SHA" >&2
+            exit 0
+          fi
+          # Codex P1, this PR's own round-10 review: create-ci-check's hagale-agent-owned check
+          # ALREADY exists here -- posting a fresh one with github.token when both App-token
+          # mints (this step's own, plus the retry) fail would leave TWO same-named checks, the
+          # original stuck in_progress forever, and the PR still blocked regardless. Failing
+          # loudly is more honest than masking that with a duplicate; HAG-90 tracks this exact
+          # residual gap (recovering a check-run when no App token is available at all).
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::hagale-agent token unavailable after two mint attempts -- cannot update check-run $CHECK_RUN_ID, and will NOT publish a duplicate (see HAG-90). Push a new commit, or manually dispatch ci-full.yml once the App is healthy, to unblock $HEAD_SHA."
+            exit 1
+          fi
+          for attempt in 1 2 3; do
+            gh api -X PATCH "repos/$REPO/check-runs/$CHECK_RUN_ID" -f status="completed" -f conclusion="$conclusion" && exit 0
+            sleep 2
+          done
+          echo "::error::failed to conclude check-run $CHECK_RUN_ID after 3 attempts -- it may stay in_progress" >&2
+          exit 1

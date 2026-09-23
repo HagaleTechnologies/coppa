@@ -1,50 +1,34 @@
 name: CI
 
+# HAG-78: fast, ALWAYS-ON checks only -- unrelated to the Codex gate, never blocked behind it.
+# check/test-features/fmt/platform have no PR-controlled-secret exposure and are cheap, so they
+# still run immediately on every push, exactly as before this migration.
+#
+# The former codex-clean-gated jobs (test-full, bench-fuzz, clippy, msrv, deny, audit,
+# wiki-lint) moved to ci-full.yml, which only runs via workflow_dispatch once
+# wait-for-codex.yml's event-driven gate confirms a revision clean -- see that file's own
+# header for the full architecture. This file no longer produces the required "CI" check at
+# all: ci-full.yml's own fan-in job owns that name now (Checks-API-managed, attached explicitly
+# to the reviewed head_sha), and its own verdict computation cross-checks these fast jobs'
+# native check-run results for that same SHA before declaring success -- see its "Check all
+# jobs" step for why. This file's own jobs stay individually visible (fast human feedback on
+# any PR) but are not themselves a required status check.
+
 on:
   push:
     branches: [main]
-  # Fleet CI redesign, native merge-queue cutover: a merge_group entry needs this required
-  # check ("CI") to report on its own synthetic SHA, or it sits pending until
-  # check_response_timeout_minutes and gets dequeued. No job-level `if:` changes needed --
-  # every job this file's own `ci` fan-in job needs (check, test-features, test-full, clippy,
-  # fmt, msrv, deny, audit, wiki-lint) already runs unconditionally except where explicitly
-  # scoped to `pull_request` (codex-clean, already excluded from `ci`'s own `needs:`), so a
-  # merge_group entry re-runs the real Rust test/lint/audit suite against the actual merge
-  # state rather than skip-passing -- more rigorous than a synthetic pass-through, at the cost
-  # of a full CI run per queue entry (group size 1, matching the rest of this fleet's cutover,
-  # keeps that serial rather than parallel-multiplied).
-  merge_group:
-    types: [checks_requested]
   pull_request:
     branches: [main]
-    # ready_for_review explicit (not just GitHub's default opened/
-    # synchronize/reopened): a draft PR promoted to ready needs a fresh
-    # CI run so the newly-added codex-clean gate and its six downstream
-    # jobs actually execute before the PR becomes merge-eligible --
-    # wait-for-codex.yml already handles this event (its own on: block
-    # includes ready_for_review), so without this, promoting a draft
-    # reruns only the Codex check while ci.yml stays silent, leaving
-    # Mergify able to queue the PR on a stale CI result from before the
-    # gated jobs ever ran.
     types: [opened, synchronize, reopened, ready_for_review]
+  # A merge-queue entry needs these fast checks validated against its own synthetic SHA too --
+  # ci-full.yml's own fan-in cross-checks this file's native check-run results for the same SHA
+  # before declaring the required "CI" check successful (see that file's own comment), so this
+  # file must actually run there or that cross-check finds nothing and fails closed.
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
-  # pull-requests: read and checks: write exist here ONLY because a job's
-  # own permissions: block may narrow this top-level grant but can never
-  # request a scope this block doesn't already declare -- confirmed live
-  # on coppa PR #90 (pull-requests) and again on every push-triggered run
-  # since 2026-09-01 (checks, see the `audit` job's own comment below).
-  # EVERY job below now carries its own explicit permissions: block
-  # narrowing back to what it actually needs (contents: read only, except
-  # codex-clean which also needs pull-requests: read, and audit which
-  # also needs checks: write) -- Codex review, coppa#103 P1/P2: without
-  # this, every job lacking its own block silently inherited checks:
-  # write too, including jobs that execute PR-controlled Cargo build
-  # scripts (build.rs, proc-macros, tests) -- unnecessarily letting
-  # compromised build code forge or modify check runs.
-  pull-requests: read
-  checks: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -52,8 +36,6 @@ env:
 jobs:
   check:
     name: Check
-    permissions:
-      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -67,8 +49,6 @@ jobs:
 
   test-features:
     name: Test with Features (fast, lib-only)
-    permissions:
-      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -81,98 +61,8 @@ jobs:
       - run: cargo test --workspace --features cpal-backend,websocket --lib
       - run: cargo check --workspace --no-default-features
 
-  test-full:
-    name: Full test suite
-    permissions:
-      contents: read
-    needs: [codex-clean]
-    # Job-level if: is unconditional (always()), not a bare success/skipped
-    # check: GitHub Actions auto-skips a job whenever any of its `needs`
-    # jobs was itself skipped, REGARDLESS of a custom if: expression,
-    # unless that if: includes a status-check function -- without
-    # always() here, codex-clean reporting `skipped` (the draft/
-    # dependabot[bot] case this whole tolerance exists to handle) would
-    # silently skip this job too, never actually running it. The first
-    # step below then does the real success/skipped/failure decision
-    # explicitly: a genuine codex-clean FAILURE must produce a real
-    # `failure` conclusion here, not `skipped` -- Mergify's own
-    # check-skipped tolerance in .mergify.yml would otherwise treat a
-    # non-converged review as a legitimate skip and auto-merge anyway.
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fail explicitly (not silently skip) if codex-clean did not pass
-        run: |
-          result="${{ needs.codex-clean.result }}"
-          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
-            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing explicitly so Mergify's check-skipped tolerance can't mistake this for a legitimate skip."
-            exit 1
-          fi
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
-        with:
-          toolchain: "1.98.0"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: Install ALSA dev headers (for cpal)
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - run: cargo test --workspace --features cpal-backend,websocket
-
-  bench-fuzz:
-    name: Bench & Fuzz Compilation
-    permissions:
-      contents: read
-    needs: [codex-clean]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fail explicitly (not silently skip) if codex-clean did not pass
-        run: |
-          result="${{ needs.codex-clean.result }}"
-          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
-            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing explicitly so Mergify's check-skipped tolerance can't mistake this for a legitimate skip."
-            exit 1
-          fi
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
-        with:
-          toolchain: "1.98.0"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: Install ALSA dev headers (for cpal)
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - name: Check benchmarks compile
-        run: cargo bench --no-run --workspace
-      - name: Check fuzz targets compile
-        run: cd fuzz && cargo check
-
-  clippy:
-    name: Clippy
-    permissions:
-      contents: read
-    needs: [codex-clean]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fail explicitly (not silently skip) if codex-clean did not pass
-        run: |
-          result="${{ needs.codex-clean.result }}"
-          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
-            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing explicitly so Mergify's check-skipped tolerance can't mistake this for a legitimate skip."
-            exit 1
-          fi
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
-        with:
-          toolchain: "1.98.0"
-          components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: Install ALSA dev headers (for cpal)
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-
   fmt:
     name: Format
-    permissions:
-      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -182,41 +72,8 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  msrv:
-    name: MSRV Check
-    permissions:
-      contents: read
-    needs: [codex-clean]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fail explicitly (not silently skip) if codex-clean did not pass
-        run: |
-          result="${{ needs.codex-clean.result }}"
-          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
-            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing explicitly so Mergify's check-skipped tolerance can't mistake this for a legitimate skip."
-            exit 1
-          fi
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
-        with:
-          toolchain: "1.85.0"  # matches Cargo.toml rust-version -- this job is the MSRV gate
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: Install ALSA dev headers (for cpal)
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      # +1.85.0, not plain `cargo check`: the repo's own rust-toolchain.toml
-      # (pinned to 1.98.0) overrides `rustup default` for any bare cargo/
-      # rustc invocation in this directory tree -- rustup applies directory
-      # overrides ahead of the default toolchain regardless of what the
-      # action above installed, so without the explicit `+1.85.0` this job
-      # would silently check against 1.98.0 and never enforce the declared
-      # MSRV. (Codex review, PR #96)
-      - run: cargo +1.85.0 check --workspace
-
   platform:
     name: Platform Check (${{ matrix.os }})
-    permissions:
-      contents: read
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -235,219 +92,3 @@ jobs:
       - name: Test cpal-backend on macOS/Windows
         if: runner.os != 'Linux'
         run: cargo test -p coppa-audio --lib --features cpal-backend
-
-  # codex-clean gate: defers test-full/bench-fuzz/clippy/msrv/deny/audit
-  # until wait-for-codex.yml signals this exact revision's Codex round
-  # raised nothing new -- avoids burning CI wall-clock time on premature
-  # runs while a review is still in flight. The 95-minute timeout budget
-  # is derived from THIS repo's own wait-for-codex job timeout (75min,
-  # see wait-for-codex.yml) -- not copied from another repo; it must
-  # exceed that bound with margin so a legitimately-still-working Codex
-  # round never times out here first.
-  codex-clean:
-    name: Codex review clean (gate before expensive downstream jobs)
-    runs-on: ubuntu-latest
-    timeout-minutes: 95
-    permissions:
-      contents: read
-      pull-requests: read
-    # exclude_dependabot + draft-PR skip, mirroring wait-for-codex.yml's own
-    # eligibility check -- belt-and-suspenders against that producer-side
-    # skip logic ever drifting from this consumer-side one.
-    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false
-    steps:
-      - name: "Bootstrap check: does the base branch have wait-for-codex.yml's label mechanism yet?"
-        id: bootstrap-check
-        if: github.event.action == 'synchronize'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          # wait-for-codex.yml is pull_request_target, which ALWAYS
-          # executes the BASE branch's copy, never the PR's own -- so the
-          # PR that first wires this mechanism up can never produce a
-          # label for its own pushes until it merges. Pinned to base.sha
-          # (the event-fixed commit), not base.ref (a moving branch tip).
-          #
-          # A clean HTTP 404 (the file genuinely doesn't exist at this
-          # SHA -- this IS the bootstrap PR) is the ONLY fetch-side
-          # outcome allowed to pass through; every OTHER fetch failure
-          # (transient network error, 403, 5xx) fails the gate closed
-          # rather than silently treating a real API problem as "not
-          # live yet, skip."
-          #
-          # Content, not mere existence: coppa's wait-for-codex.yml
-          # pre-dated this codex-clean gate, so it always existed at every
-          # reachable base SHA even before the label mechanism was added
-          # -- an existence-only check would have been a structural
-          # no-op, always resolving "ready" regardless of whether
-          # apply_clean_label() was actually there yet (this exact gap
-          # bit watchfinder's own migration; fixed here from round 1).
-          # Grep the raw content for the function name itself.
-          err_file="$(mktemp)"
-          if content="$(gh api "repos/$REPO/contents/.github/workflows/wait-for-codex.yml?ref=$BASE_SHA" -H "Accept: application/vnd.github.raw" 2>"$err_file")"; then
-            if echo "$content" | grep -q "apply_clean_label"; then
-              echo "bootstrap_status=ready" >> "$GITHUB_OUTPUT"
-            else
-              echo "::warning::Base branch's wait-for-codex.yml at $BASE_SHA has no apply_clean_label() yet -- this is the bootstrap PR itself. Passing through unconditionally."
-              echo "bootstrap_status=absent" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            err="$(cat "$err_file")"
-            if echo "$err" | grep -qiE "HTTP 404|not found"; then
-              echo "::warning::Base branch has no wait-for-codex.yml at $BASE_SHA (clean 404) -- this is the bootstrap PR itself. Passing through unconditionally."
-              echo "bootstrap_status=absent" >> "$GITHUB_OUTPUT"
-            else
-              echo "bootstrap_status=fetch-failed" >> "$GITHUB_OUTPUT"
-              echo "::error::Could not determine whether base branch has wait-for-codex.yml (non-404 failure fetching $BASE_SHA, failing closed): $err"
-              exit 1
-            fi
-          fi
-
-      - name: Pass through -- not a synchronize event, or bootstrap not yet live on the base branch
-        if: github.event.action != 'synchronize' || steps.bootstrap-check.outputs.bootstrap_status == 'absent'
-        run: echo "Passing through (event action=${{ github.event.action }}, bootstrap_status=${{ steps.bootstrap-check.outputs.bootstrap_status }}) -- no prior round to converge on, or this is the bootstrap PR itself."
-
-      - name: Poll for the codex-clean label on this exact revision
-        if: github.event.action == 'synchronize' && steps.bootstrap-check.outputs.bootstrap_status == 'ready'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          target="codex-clean:${HEAD_SHA:0:12}"
-          # In-script deadline runs a fixed 7-minute margin under this
-          # job's own 95-minute timeout-minutes, leaving slack for the
-          # loop to notice and error out cleanly before GitHub kills the
-          # job outright.
-          END=$((SECONDS + 95 * 60 - 420))
-          while [ $SECONDS -lt $END ]; do
-            # per_page=100: labels accumulate one per round with no
-            # cleanup (deleting a stale label is itself a race that can
-            # delete a newer revision's already-valid one), so a long
-            # review loop can push the current label past the REST
-            # default page size of 30.
-            if labels=$(gh api "repos/$REPO/issues/$PR/labels?per_page=100" --jq '[.[].name]' 2>/dev/null); then
-              if echo "$labels" | jq -e --arg l "$target" 'index($l) != null' >/dev/null 2>&1; then
-                echo "Found $target -- this round raised nothing new, safe to run the jobs gated behind this one."
-                exit 0
-              fi
-            fi
-            echo "Still waiting for $target..."
-            sleep 20
-          done
-          echo "::error::$target never appeared within the gate's timeout budget -- this revision's Codex round either hasn't converged or the label failed to apply. See wait-for-codex.yml's own run for this SHA."
-          exit 1
-
-  deny:
-    name: Supply-chain check (cargo-deny)
-    permissions:
-      contents: read
-    needs: [codex-clean]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fail explicitly (not silently skip) if codex-clean did not pass
-        run: |
-          result="${{ needs.codex-clean.result }}"
-          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
-            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing explicitly so Mergify's check-skipped tolerance can't mistake this for a legitimate skip."
-            exit 1
-          fi
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
-
-  audit:
-    name: Security Audit
-    needs: [codex-clean]
-    if: always()
-    runs-on: ubuntu-latest
-    # `rustsec/audit-check` creates a check-run to report its findings
-    # (vulnerabilities AND informational warnings like a yanked crate) --
-    # without `checks: write` the default GITHUB_TOKEN can't do that, and
-    # the action fails the whole job with "Resource not accessible by
-    # integration" even when cargo-audit itself found zero vulnerabilities.
-    # Failing on every push since 2026-09-01 for exactly this reason.
-    permissions:
-      contents: read
-      checks: write
-    steps:
-      - name: Fail explicitly (not silently skip) if codex-clean did not pass
-        run: |
-          result="${{ needs.codex-clean.result }}"
-          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
-            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing explicitly so Mergify's check-skipped tolerance can't mistake this for a legitimate skip."
-            exit 1
-          fi
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # Codex review, coppa#103 P1: for a fork PR or a Dependabot PR,
-      # GitHub silently downgrades ANY requested write permission back to
-      # read on the pull_request event, regardless of what this job's own
-      # permissions: block above declares -- rustsec/audit-check always
-      # tries to create a check-run to report its findings, so it would
-      # reproduce the exact "Resource not accessible by integration"
-      # failure this job exists to fix, permanently blocking CI on every
-      # external contribution and every Dependabot bump. Two mutually
-      # exclusive steps: the check-run-reporting action only where a
-      # write token is actually available (push, or a same-repo PR); a
-      # plain cargo-audit CLI run (same tool, no check-run, pass/fail via
-      # exit code alone) everywhere else -- coverage is identical either
-      # way, only the reporting mechanism differs.
-      - name: Security Audit (check-run reporting)
-        if: github.event_name != 'pull_request' || (github.actor != 'dependabot[bot]' && !github.event.pull_request.head.repo.fork)
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Security Audit (read-only token -- fork or Dependabot PR, no check-run)
-        if: github.event_name == 'pull_request' && (github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.fork)
-        run: |
-          cargo install cargo-audit --locked
-          cargo audit
-
-  wiki-lint:
-    name: Wiki lint
-    permissions:
-      contents: read
-    if: ${{ github.actor != 'dependabot[bot]' && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Clone sunto
-        env:
-          SUNTO_TOKEN: ${{ secrets.SUNTO_RO_TOKEN }}
-        run: git clone "https://x-access-token:${SUNTO_TOKEN}@github.com/HagaleTechnologies/sunto.git" /tmp/sunto
-      - name: Lint wiki
-        run: python3 /tmp/sunto/bin/wiki-lint wiki/
-
-  # Summary gate for branch protection. bench-fuzz and platform are excluded:
-  # bench-fuzz is compile-only (slow, no test signal) and platform is a matrix
-  # job that duplicates linux coverage already in test-full/test-features.
-  ci:
-    name: CI
-    permissions:
-      contents: read
-    needs:
-      [
-        check,
-        test-features,
-        test-full,
-        clippy,
-        fmt,
-        msrv,
-        deny,
-        audit,
-        wiki-lint,
-      ]
-    runs-on: ubuntu-latest
-    if: always()
-    steps:
-      - name: All CI checks passed
-        run: |
-          results='${{ toJSON(needs.*.result) }}'
-          if echo "$results" | grep -q '"failure"\|"cancelled"'; then
-            echo "One or more required CI jobs failed"
-            exit 1
-          fi
-          echo "All required CI jobs passed"
