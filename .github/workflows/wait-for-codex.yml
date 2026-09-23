@@ -59,7 +59,23 @@ jobs:
   # codex-review-response below to complete once Codex actually replies.
   # ============================================================================================
   codex-review-request:
-    name: Codex review clean (gate before expensive downstream jobs)
+    # HAG-93 (live-discovered on pancetta PR #399's own round-5 real Codex review event):
+    # naming this JOB the same as the Checks-API-managed check it upserts (the fleet-
+    # standard gate name) works fine as long as this job's own steps always end up calling
+    # upsert_check_run -- but this workflow is also subscribed to pull_request_review/
+    # issue_comment (for codex-review-response below), and this job's own `if:` correctly
+    # excludes those event types, so it job-level-SKIPS (not just skips its steps) whenever
+    # the workflow fires for one of those events. GitHub creates a check-run for a job with
+    # `if: false` too, reported "skipped", under the JOB's own name -- with
+    # app.slug=github-actions and a GitHub-generated external_id, NOT the custom one
+    # upsert_check_run sets. That freshly-created "skipped" native check-run becomes the
+    # MOST RECENT check-run sharing this name, poisoning codex-review-response's own
+    # `sort_by(.started_at) | last` lookup -- its subsequent hagale-agent-authenticated
+    # PATCH then 403s with "Invalid app_id 15368 - check run can only be modified by the
+    # GitHub App that created it." Renamed this job's DISPLAY name only -- its id (used by
+    # codex-review-request-failsafe's `needs:`) and every managed-check-run string literal
+    # in the bash logic below are unchanged, since neither depends on this field.
+    name: Codex review request (producer)
     if: github.event_name == 'merge_group' || github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     timeout-minutes: 5
