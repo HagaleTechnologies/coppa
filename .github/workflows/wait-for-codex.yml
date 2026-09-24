@@ -59,23 +59,20 @@ jobs:
   # codex-review-response below to complete once Codex actually replies.
   # ============================================================================================
   codex-review-request:
-    # HAG-93 (live-discovered on pancetta PR #399's own round-5 real Codex review event):
-    # naming this JOB the same as the Checks-API-managed check it upserts (the fleet-
-    # standard gate name) works fine as long as this job's own steps always end up calling
-    # upsert_check_run -- but this workflow is also subscribed to pull_request_review/
-    # issue_comment (for codex-review-response below), and this job's own `if:` correctly
-    # excludes those event types, so it job-level-SKIPS (not just skips its steps) whenever
-    # the workflow fires for one of those events. GitHub creates a check-run for a job with
-    # `if: false` too, reported "skipped", under the JOB's own name -- with
-    # app.slug=github-actions and a GitHub-generated external_id, NOT the custom one
-    # upsert_check_run sets. That freshly-created "skipped" native check-run becomes the
-    # MOST RECENT check-run sharing this name, poisoning codex-review-response's own
-    # `sort_by(.started_at) | last` lookup -- its subsequent hagale-agent-authenticated
-    # PATCH then 403s with "Invalid app_id 15368 - check run can only be modified by the
-    # GitHub App that created it." Renamed this job's DISPLAY name only -- its id (used by
-    # codex-review-request-failsafe's `needs:`) and every managed-check-run string literal
-    # in the bash logic below are unchanged, since neither depends on this field.
-    name: Codex review request (producer)
+    # HAG-93 (live-discovered on pancetta PR #399's own round-5 real Codex review event,
+    # then round-7's own follow-up correction, independently repeated on this PR too): this
+    # job job-level-skips (not just skips its steps) for pull_request_review/issue_comment
+    # events -- GitHub creates a check-run for a skipped job too, under the JOB's own name,
+    # with app.slug=github-actions and a GitHub-generated (UUID) external_id, NOT the custom
+    # numeric one upsert_check_run sets. An EARLIER fix here (renaming this job's display
+    # name) was ITSELF wrong: this job's merge_group pass-through relies ENTIRELY on this
+    # NATIVE attribution to publish the required "Codex review clean..." check (no explicit
+    # upsert_check_run call happens on that path) -- renaming the job broke it. Reverted;
+    # the actual fix is at the LOOKUP sites below, which now exclude any check-run whose
+    # external_id isn't the purely-numeric run-id format upsert_check_run always sets --
+    # GitHub's own native attribution never produces a numeric external_id, so it can never
+    # again be selected as "the" managed check-run to PATCH, regardless of this job's name.
+    name: Codex review clean (gate before expensive downstream jobs)
     if: github.event_name == 'merge_group' || github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -238,10 +235,16 @@ jobs:
           # this matters (Codex P1, this PR's own round-6 review).
           UPSERT_ID=""
           UPSERT_PRE_STATUS=""
+          # HAG-93 round-7 correction: filtered to external_id looking like a numeric
+          # run-id -- excludes GitHub's own native per-job check-run attribution (a
+          # "skipped" check-run for any job whose if: evaluates false, published under that
+          # job's current name, with a GitHub-generated UUID external_id), which would
+          # otherwise be selected as "the" existing check-run to PATCH whenever it happens
+          # to be the most recent entry sharing this exact name.
           upsert_check_run() {
             local name="$1" status="$2" conclusion="$3" existing_id existing_status lookup
             lookup=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
-              | jq -s "[.[].check_runs[] | select(.name == \"$name\")] | sort_by(.started_at) | last")
+              | jq -s "[.[].check_runs[] | select(.name == \"$name\") | select((.external_id // \"\") | test(\"^[0-9]+\$\"))] | sort_by(.started_at) | last")
             existing_id=$(echo "$lookup" | jq -r '.id // empty')
             existing_status=$(echo "$lookup" | jq -r '.status // empty')
             UPSERT_PRE_STATUS="$existing_status"
@@ -465,8 +468,12 @@ jobs:
           # next to the real one create-check already published -- exactly the multi-check-run
           # bug upsert_check_run exists to prevent, just from a different job. Only proceed when
           # no check-run for this head_sha exists yet at all.
+          # HAG-93 round-7 correction: same numeric-external_id filter as elsewhere in this
+          # file -- a GitHub-native "skipped" check-run from an EARLIER pull_request_review/
+          # issue_comment-triggered run of codex-review-request (UUID external_id) must not
+          # count as "the real check already exists" here.
           existing=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
-            | jq -s '[.[].check_runs[] | select(.name == "Codex review clean (gate before expensive downstream jobs)")] | length')
+            | jq -s '[.[].check_runs[] | select(.name == "Codex review clean (gate before expensive downstream jobs)") | select((.external_id // "") | test("^[0-9]+$"))] | length')
           if [ "$existing" -gt 0 ]; then
             echo "A check-run already exists for $HEAD_SHA -- create-check ran successfully before a later step failed. Nothing to do here."
             exit 0
@@ -994,9 +1001,11 @@ jobs:
           OUTCOME: ${{ steps.verdict.outputs.codex_errored == 'true' && 'failure' || steps.compute-verdict.outputs.outcome }}
         run: |
           # See upsert_check_run's own comment above: piped into a separate `jq -s`, not
-          # `gh api`'s own --slurp (rejected outright when combined with --jq).
+          # `gh api`'s own --slurp (rejected outright when combined with --jq). HAG-93
+          # round-7 correction: same numeric-external_id filter, excluding GitHub's native
+          # "skipped" check-run (UUID external_id) from ever being selected here.
           check_id=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
-            | jq -s '[.[].check_runs[] | select(.name == "Codex review clean (gate before expensive downstream jobs)")] | sort_by(.started_at) | last | .id // empty')
+            | jq -s '[.[].check_runs[] | select(.name == "Codex review clean (gate before expensive downstream jobs)") | select((.external_id // "") | test("^[0-9]+$"))] | sort_by(.started_at) | last | .id // empty')
 
           conclude_check() {
             local conclusion="$1"
