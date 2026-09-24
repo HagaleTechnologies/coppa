@@ -59,20 +59,28 @@ jobs:
   # codex-review-response below to complete once Codex actually replies.
   # ============================================================================================
   codex-review-request:
-    # HAG-93 (live-discovered on pancetta PR #399's own round-5 real Codex review event,
-    # then round-7's own follow-up correction, independently repeated on this PR too): this
-    # job job-level-skips (not just skips its steps) for pull_request_review/issue_comment
-    # events -- GitHub creates a check-run for a skipped job too, under the JOB's own name,
-    # with app.slug=github-actions and a GitHub-generated (UUID) external_id, NOT the custom
-    # numeric one upsert_check_run sets. An EARLIER fix here (renaming this job's display
-    # name) was ITSELF wrong: this job's merge_group pass-through relies ENTIRELY on this
-    # NATIVE attribution to publish the required "Codex review clean..." check (no explicit
-    # upsert_check_run call happens on that path) -- renaming the job broke it. Reverted;
-    # the actual fix is at the LOOKUP sites below, which now exclude any check-run whose
-    # external_id isn't the purely-numeric run-id format upsert_check_run always sets --
-    # GitHub's own native attribution never produces a numeric external_id, so it can never
-    # again be selected as "the" managed check-run to PATCH, regardless of this job's name.
-    name: Codex review clean (gate before expensive downstream jobs)
+    # HAG-93 round 2 (redesign after the naming/lookup patches each fixed one symptom but
+    # broke or missed another -- same pattern independently hit on pancetta PR #399 rounds
+    # 6/7/8): this job's display name must NEVER equal the Checks-API-managed check's name.
+    # Two previously-tried patches both failed:
+    #   - Naming it identically (original design) and relying on native per-job attribution
+    #     for the merge_group pass-through meant this job's OWN quick completion (posting
+    #     "@codex review" and exiting, seconds after creating the managed check as
+    #     in_progress) ALSO published a native SUCCESS under that same name for a REAL round
+    #     too -- two check-runs sharing one name, one settling immediately (native), one
+    #     correctly staying in_progress until Codex actually responds (managed) -- an
+    #     ambiguous, possibly premature-merge-enabling state for GitHub's own
+    #     required-status-check evaluation.
+    #   - Renaming it (this PR's own round 1) fixed that ambiguity but broke the merge_group
+    #     pass-through outright, since it relied ENTIRELY on native attribution under the
+    #     managed name with no explicit Checks-API call at all.
+    # The actual fix: keep this job's name DISTINCT (so its own native attribution, whatever
+    # its outcome, never coincides with the managed check under any circumstance), and
+    # publish the managed check EXPLICITLY via upsert_check_run for merge_group too
+    # (mirroring the real-round path below) rather than depending on native job-success
+    # attribution for it. Also still filtered to a numeric external_id at every lookup site
+    # (this PR's own round 1 fix) -- that part of the earlier fix was correct and stays.
+    name: Codex review request (producer)
     if: github.event_name == 'merge_group' || github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -94,11 +102,6 @@ jobs:
     outputs:
       check_run_id: ${{ steps.create-check.outputs.check_run_id }}
     steps:
-      - name: Pass through for merge-queue evaluation
-        if: github.event_name == 'merge_group'
-        run: |
-          echo "Merge-group evaluation -- the constituent PR already passed a real Codex review during its own PR phase; nothing further to review on this synthetic integration commit."
-
       - name: Mint a hagale-agent installation token for check-run writes
         id: app-token
         # Checks API create/update endpoints only accept a GitHub App token -- github.token
@@ -109,8 +112,9 @@ jobs:
         # 403). hagale-agent (App ID 4696353) mints a genuine installation token here, scoped to
         # just this repo, which is not subject to either restriction. Same App already used
         # fleet-wide (HAG-44/74/75) -- HAGALE_AGENT_APP_PRIVATE_KEY is an org secret, already
-        # available to coppa with no new provisioning needed.
-        if: github.event_name == 'pull_request_target'
+        # available to coppa with no new provisioning needed. Also minted for merge_group now
+        # (HAG-93 round 2) -- that path explicitly upserts the managed check too.
+        if: github.event_name == 'merge_group' || github.event_name == 'pull_request_target'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: 4696353
@@ -190,18 +194,22 @@ jobs:
 
       - name: Create/upsert the codex-clean check-run
         id: create-check
-        if: github.event_name == 'pull_request_target' && steps.head-check.outputs.stale != 'true'
+        # HAG-93 round 2: also runs for merge_group now, explicitly upserting the managed
+        # check to completed/success there instead of relying on a standalone pass-through
+        # step's mere existence -- that step is removed; this one now covers both paths.
+        if: github.event_name == 'merge_group' || (github.event_name == 'pull_request_target' && steps.head-check.outputs.stale != 'true')
         env:
           # hagale-agent's minted installation token for every check-run write, both create and
           # update -- github.token cannot update a check-run a different run created, and no PAT
           # can write to the Checks API at all, ever (create or update).
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           RUN_ID: ${{ github.run_id }}
           ALREADY_CLEAN: ${{ steps.existing-label.outputs.already_clean || 'false' }}
           BOOTSTRAP_STATUS: ${{ steps.bootstrap-check.outputs.bootstrap_status || 'absent' }}
           IS_DEPENDABOT: ${{ github.actor == 'dependabot[bot]' }}
+          IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
         run: |
           set -o pipefail
@@ -269,12 +277,18 @@ jobs:
             fi
           }
 
-          # Bootstrap not live yet, OR the label already exists, OR a dependabot[bot] PR, OR a
-          # draft PR: pass through immediately with a completed, successful check-run -- no
-          # prior round to converge on yet. Every pass-through branch here is also a dispatch
-          # trigger below, since this split design has no inline fallback for the expensive jobs
-          # the way the old single-workflow design did.
-          if [ "$IS_DRAFT" = "true" ]; then
+          # merge_group (the constituent PR already passed a real Codex review during its own
+          # PR phase -- nothing further to review on this synthetic integration commit; its
+          # own ci-full.yml run is native, NOT dispatched from here, see the Dispatch step's
+          # own guard), OR bootstrap not live yet, OR the label already exists, OR a
+          # dependabot[bot] PR, OR a draft PR: pass through immediately with a completed,
+          # successful check-run -- no prior round to converge on yet. Every OTHER
+          # pass-through branch here is also a dispatch trigger below, since this split
+          # design has no inline fallback for the expensive jobs the way the old
+          # single-workflow design did.
+          if [ "$IS_MERGE_GROUP" = "true" ]; then
+            conclusion="success"
+          elif [ "$IS_DRAFT" = "true" ]; then
             conclusion="success"
           elif [ "$IS_DEPENDABOT" = "true" ]; then
             conclusion="success"
@@ -363,7 +377,11 @@ jobs:
           fi
 
       - name: Dispatch full CI (pass-through success -- no Codex round to wait on)
-        if: steps.create-check.outputs.check_run_id != '' && steps.create-check.outputs.conclusion == 'success'
+        # HAG-93 round 2: explicitly excludes merge_group -- that event's own ci-full.yml
+        # already runs natively via ITS OWN merge_group trigger; without this guard, the new
+        # IS_MERGE_GROUP pass-through above (conclusion=success, a real check_run_id) would
+        # ALSO dispatch a second, redundant ci-full.yml run for every merge-queue evaluation.
+        if: github.event_name == 'pull_request_target' && steps.create-check.outputs.check_run_id != '' && steps.create-check.outputs.conclusion == 'success'
         env:
           # GH_TOKEN must be a PAT, not github.token: GitHub rejects a workflow_dispatch POST
           # authenticated with the built-in GITHUB_TOKEN outright ("Resource not accessible by
@@ -483,12 +501,19 @@ jobs:
           else
             summary="The codex-review-request job failed before it could create the managed check-run (run $RUN_ID). Push a new commit, or re-run the failed job and let it retry, to unblock this PR."
           fi
+          # Codex P2, this PR's own round 1 review: without a numeric external_id, this
+          # check-run can never be found by the new numeric-external_id lookup filter on a
+          # future rerun -- a failed rerun would stack ANOTHER failure instead of recognizing
+          # this one already exists (matching the pattern the "no duplicate" guard above
+          # exists to prevent), and a successful rerun would create a separate managed check
+          # rather than patching this one, breaking the recovery path the summary promises.
           cat <<JSON | gh api "repos/$REPO/check-runs" --input -
           {
             "name": "Codex review clean (gate before expensive downstream jobs)",
             "head_sha": "$HEAD_SHA",
             "status": "completed",
             "conclusion": "failure",
+            "external_id": "$RUN_ID",
             "details_url": "https://github.com/$REPO/actions/runs/$RUN_ID",
             "output": {
               "title": "Codex review request setup failed",
