@@ -434,7 +434,14 @@ jobs:
   codex-review-request-failsafe:
     name: Codex review request setup failsafe
     needs: codex-review-request
-    if: always() && needs.codex-review-request.result == 'failure' && github.event_name == 'pull_request_target'
+    # Codex P2, this PR's own round-3 review: round-2's redesign made merge_group depend on
+    # the SAME app-token mint + create-check machinery as pull_request_target to publish the
+    # required check (no more native-attribution fallback for that event either) -- this
+    # failsafe was still restricted to pull_request_target only, so a transient App/API
+    # failure on a merge_group run left that required check permanently absent with no
+    # automatic recovery (queue-retry-handler.yml only watches the CI/ci workflows, not
+    # this one).
+    if: always() && needs.codex-review-request.result == 'failure' && (github.event_name == 'pull_request_target' || github.event_name == 'merge_group')
     runs-on: ubuntu-latest
     timeout-minutes: 2
     permissions:
@@ -476,7 +483,7 @@ jobs:
           # commit always works regardless; not solved further here.
           USED_GITHUB_TOKEN: ${{ steps.app-token.outcome == 'failure' && 'true' || 'false' }}
           REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           RUN_ID: ${{ github.run_id }}
         run: |
           # Codex P1, this PR's own round-6 review: codex-review-request's own job result is
