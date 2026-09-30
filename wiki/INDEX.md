@@ -21,3 +21,4 @@
 - [What will bite you about waveform compatibility with pre-Phase-1 code?](pages/waveform-wire-break.md) — The Phase 1 waveform is a hard wire-format break from all earlier coppa revisions.
 - [What band and sample-rate conventions does coppa use?](pages/band-conventions.md) — Coppa operates at a fixed 48 kHz sample rate across all profiles and speed
 - [What contract does coppa-dsp expose to skimmer?](pages/coppa-dsp-skimmer-interface.md) — `coppa-dsp` is consumed by the skimmer repo as a pure-DSP library — it provides
+- [What will bite you about this repo's agent tooling (Serena and humanlayer thoughts)?](pages/agent-tooling.md) — COP-11 filed two unrelated developer-tooling defects together: catalyst-dev's
