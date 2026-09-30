@@ -1,0 +1,30 @@
+#:schema https://staging.catalystcloud.dev/schemas/catalyst.schema.json
+
+[project]
+linear_team = "COP"
+
+# Mirrors .github/workflows/ci.yml and rust-toolchain.toml. CI builds and tests
+# with no environment variables, so none are declared; runtime configuration
+# lives in coppad.toml (see coppad.toml.example), not in the environment.
+
+[[environment.toolchains]]
+name = "rust"
+version = "1.98.0"
+
+[[environment.system_packages]]
+name = "libasound2-dev"
+
+[[environment.setup]]
+name = "fetch-dependencies"
+run = ["cargo", "fetch", "--locked"]
+cache_key_files = ["Cargo.lock"]
+
+[[environment.verify]]
+name = "check-workspace"
+run = ["cargo", "check", "--workspace"]
+timeout_seconds = 1800
+
+[[environment.verify]]
+name = "test-workspace-lib"
+run = ["cargo", "test", "--workspace", "--lib"]
+timeout_seconds = 3000
