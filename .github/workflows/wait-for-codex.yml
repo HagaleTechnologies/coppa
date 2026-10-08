@@ -1042,7 +1042,7 @@ jobs:
           conclude_check() {
             local conclusion="$1"
             local title="${2:-Codex raised new concerns}"
-            local summary="${3:-See this job's log for details -- resolve or ticket them, then push a remediation commit to trigger a fresh re-review.}"
+            local summary="${3:-See this job log for details -- resolve or ticket them, then push a remediation commit to trigger a fresh re-review.}"
             if [ -n "$check_id" ]; then
               for attempt in 1 2 3; do
                 if [ "$conclusion" = "success" ]; then
