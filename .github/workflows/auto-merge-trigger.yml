@@ -52,14 +52,14 @@ jobs:
       group: admission-${{ github.event.pull_request.number }}
       cancel-in-progress: false
     steps:
-      # GITHUB_TOKEN, not a dedicated PAT: coppa has no CODEX_REVIEW_PAT/AUTOMERGE_PAT-equivalent
-      # secret provisioned. This means a merge performed here is attributed to GITHUB_TOKEN,
-      # which suppresses GitHub's own push-triggered events on the resulting main commit
-      # (anti-recursion guard) -- ci.yml's and semgrep.yml's own `push: branches: [main]`
-      # triggers will NOT fire for a queue-merged commit. Lower-risk here than on vanity/cqdx
-      # (no deploy.yml depends on that push), but still a real gap: post-merge CI/semgrep-on-main
-      # won't run automatically. Flagged in the decision doc; provisioning a real-user PAT is a
-      # follow-up, not blocking this cutover.
+      # ARM_TOKEN arms auto-merge; everything else in this step stays on GITHUB_TOKEN.
+      # CODEX_REVIEW_PAT (org secret, visibility all), not GITHUB_TOKEN: auto-merge armed by
+      # app/github-actions never enqueues itself into the native merge queue (HAG-108: every
+      # GITHUB_TOKEN-armed coppa PR from #110 to #117 needed a manual enqueue, 5 min to 6.6 days
+      # after its checks went green; PAT-armed PRs in the other ci-full repos enqueue in seconds).
+      # A PAT-armed merge is also attributed to a real user, so main's push-triggered
+      # ci.yml/semgrep.yml runs fire. Falls back to GITHUB_TOKEN on dependabot[bot]-actor runs,
+      # which GitHub withholds Actions secrets from.
       #
       # Codex P1 (this PR's own round 6): dependabot-auto-merge.yml attaches `needs-review` to a
       # Dependabot major bump using secrets.GITHUB_TOKEN -- GitHub's anti-recursion rule means a
@@ -81,6 +81,7 @@ jobs:
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARM_TOKEN: ${{ secrets.CODEX_REVIEW_PAT || secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           EVENT_ACTION: ${{ github.event.action }}
@@ -215,11 +216,11 @@ jobs:
                 echo "::error::Could not remove the stale needs-human label from PR #$PR -- refusing to arm auto-merge while it remains attached. Remove it by hand, then rerun this job." >&2
                 exit 1
               fi
-              gh pr merge "$PR_URL" --auto --squash
+              GH_TOKEN="$ARM_TOKEN" gh pr merge "$PR_URL" --auto --squash
             else
               echo "::notice::PR #$PR has needs-human covering its current head (or its provenance could not be confirmed) -- disarming any auto-merge that was already armed (possibly by a run that raced ahead of this label, or whose own labeled event was evicted from the concurrency group), then standing down."
               disarm_and_dequeue_or_fail "needs-human" || exit 1
             fi
           else
-            gh pr merge "$PR_URL" --auto --squash
+            GH_TOKEN="$ARM_TOKEN" gh pr merge "$PR_URL" --auto --squash
           fi

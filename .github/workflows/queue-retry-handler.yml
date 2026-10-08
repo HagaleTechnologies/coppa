@@ -178,6 +178,9 @@ jobs:
         if: steps.dedup.outputs.already_handled == 'false' && steps.check-retried.outputs.already_retried == 'false'
         env:
           LABEL: queue-retry-used:${{ needs.check-pr-state.outputs.head_sha12 }}
+          # Re-arms with the PAT for the same reason as auto-merge-trigger.yml's ARM_TOKEN
+          # (HAG-108): GITHUB_TOKEN-armed auto-merge never enqueues itself.
+          ARM_TOKEN: ${{ secrets.CODEX_REVIEW_PAT || github.token }}
         run: |
           current_head_sha=$(gh pr view "$PR" --repo "${{ github.repository }}" --json headRefOid --jq .headRefOid)
           if [ "$current_head_sha" != "$HEAD_SHA" ]; then
@@ -199,7 +202,7 @@ jobs:
             echo "::notice::PR #$PR has a pause label (needs-human/needs-review) attached as of this retry attempt -- standing down without retrying; whatever attached it is responsible for disarming/dequeuing."
             exit 0
           fi
-          if gh pr merge "$PR" --repo "${{ github.repository }}" --auto --squash --match-head-commit "$HEAD_SHA"; then
+          if GH_TOKEN="$ARM_TOKEN" gh pr merge "$PR" --repo "${{ github.repository }}" --auto --squash --match-head-commit "$HEAD_SHA"; then
             gh label create "$LABEL" --color d4c5f9 \
               --description "This revision already used its one automatic queue retry" \
               --repo "${{ github.repository }}" >/dev/null 2>&1 || true
