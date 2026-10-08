@@ -341,8 +341,12 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           HEAD_SHA: ${{ inputs.head_sha || github.sha }}
         run: |
-          if [ "$EVENT_NAME" = workflow_dispatch ]; then
-            check_run_id="$(GH_TOKEN="$APP_TOKEN" gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs?app_id=4696353" | jq -s "[.[].check_runs[] | select(.name == \"CI\" and .external_id == \"$RUN_ID\")][0].id // empty")"
+          # Nothing below may abort the step (bash -e) before the cancel loop runs: no App token
+          # means the check-run is left for the stuck-check backstops, never an uncancelled run.
+          if [ "$EVENT_NAME" = workflow_dispatch ] && [ -z "$APP_TOKEN" ]; then
+            echo "::warning::no hagale-agent token, so the CI check-run on $HEAD_SHA cannot be failed; cancelling anyway" >&2
+          elif [ "$EVENT_NAME" = workflow_dispatch ]; then
+            check_run_id="$(GH_TOKEN="$APP_TOKEN" gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs?app_id=4696353" | jq -s "[.[].check_runs[] | select(.name == \"CI\" and .external_id == \"$RUN_ID\")][0].id // empty")" || check_run_id=""
             if [ -z "$check_run_id" ]; then
               # create-ci-check itself may never have run (still queued when this watchdog gave
               # up) -- there is no existing check-run to PATCH, so create the required "CI"
