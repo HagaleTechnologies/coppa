@@ -55,6 +55,10 @@ jobs:
   create-ci-check:
     name: Create CI check-run on the reviewed SHA
     if: github.event_name == 'workflow_dispatch'
+    # Q-0068: the app key lives in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -231,6 +235,12 @@ jobs:
         run: python3 /tmp/sunto/bin/wiki-lint wiki/
 
   checks-queue-watchdog:
+    # Q-0068: the app key lives in the main-only codex-review environment. Only the
+    # workflow_dispatch run (dispatched at main) reads it; merge_group/push runs declare no
+    # environment (an empty name is none), since a merge_group ref would be rejected.
+    environment:
+      name: ${{ github.event_name == 'workflow_dispatch' && 'codex-review' || '' }}
+      deployment: false
     runs-on: ubuntu-latest
     timeout-minutes: 270
     permissions:
@@ -385,6 +395,12 @@ jobs:
   ci:
     name: ${{ github.event_name == 'workflow_dispatch' && 'CI (native, workflow_dispatch)' || 'CI' }}
     if: always()
+    # Q-0068: the app key lives in the main-only codex-review environment. Only the
+    # workflow_dispatch run (dispatched at main) reads it; merge_group/push runs declare no
+    # environment (an empty name is none), since a merge_group ref would be rejected.
+    environment:
+      name: ${{ github.event_name == 'workflow_dispatch' && 'codex-review' || '' }}
+      deployment: false
     needs:
       [
         create-ci-check,
@@ -414,6 +430,8 @@ jobs:
       # this token is unavailable, rather than attempting (and silently failing) a PATCH.
       - name: Mint a hagale-agent installation token for check-run writes
         id: app-token
+        # Q-0068: only the workflow_dispatch relay below consumes this token.
+        if: github.event_name == 'workflow_dispatch'
         continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -432,7 +450,7 @@ jobs:
       # this exact residual gap for ci-full.yml).
       - name: Retry minting a hagale-agent installation token if that failed
         id: app-token-retry
-        if: steps.app-token.outcome == 'failure'
+        if: github.event_name == 'workflow_dispatch' && steps.app-token.outcome == 'failure'
         continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:

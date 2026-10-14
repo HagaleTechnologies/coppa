@@ -43,6 +43,10 @@ jobs:
           github.event.pull_request.user.login == 'dependabot[bot]'
         )
       )
+    # Q-0068: the PAT lives in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
     runs-on: ubuntu-latest
     # Shared with queue-retry-handler.yml's own mutating job: closes a TOCTOU race where this
     # job could read needs-human as absent and merge moments after queue-retry-handler.yml
