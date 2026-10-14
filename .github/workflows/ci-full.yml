@@ -55,6 +55,10 @@ jobs:
   create-ci-check:
     name: Create CI check-run on the reviewed SHA
     if: github.event_name == 'workflow_dispatch'
+    # Q-0068: the app key lives in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -231,6 +235,12 @@ jobs:
         run: python3 /tmp/sunto/bin/wiki-lint wiki/
 
   checks-queue-watchdog:
+    # Q-0068: the app key lives in the main-only codex-review environment. Only the
+    # workflow_dispatch run (dispatched at main) reads it; merge_group/push runs declare no
+    # environment (an empty name is none), since a merge_group ref would be rejected.
+    environment:
+      name: ${{ github.event_name == 'workflow_dispatch' && 'codex-review' || '' }}
+      deployment: false
     runs-on: ubuntu-latest
     timeout-minutes: 270
     permissions:

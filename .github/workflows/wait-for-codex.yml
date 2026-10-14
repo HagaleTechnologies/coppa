@@ -25,6 +25,12 @@ name: Wait for Codex Review
 # and fails the check at 120min if still stuck, regardless of which repo or mechanism produced
 # the check-run. Not fixed locally here -- HAG-87 tracks a single shared fix in credenza itself
 # rather than N one-off patches (one per hand-port repo) with their own untested edge cases.
+#
+# dispensa Q-0068: CODEX_REVIEW_PAT and HAGALE_AGENT_APP_PRIVATE_KEY live in the codex-review
+# environment (deployment branches: main only). pull_request_review is dropped: it runs a
+# PR-derived copy of this file, which that environment rejects. A Codex findings review now
+# leaves the gate pending (still blocks merge) instead of red; Catalyst remediates on the
+# non-clean review itself, and the clean verdict arrives on issue_comment.
 
 on:
   # pull_request_target (not pull_request): a same-repo PR that edits THIS file could, under
@@ -36,8 +42,6 @@ on:
   # only `gh api` calls against metadata (PR number, head SHA) from the event payload.
   pull_request_target:
     types: [opened, ready_for_review, synchronize, reopened]
-  pull_request_review:
-    types: [submitted]
   issue_comment:
     types: [created]
   # merge_group: coppa's native merge-queue ruleset re-evaluates every required check against a
@@ -530,8 +534,8 @@ jobs:
           JSON
 
   # ============================================================================================
-  # Consumer half: fires once per Codex reply (pull_request_review or issue_comment from Codex's
-  # own actor), never on a poll interval. Re-derives everything it needs from live GitHub data
+  # Consumer half: fires once per Codex reply (issue_comment from Codex's own actor; Q-0068
+  # dropped pull_request_review), never on a poll interval. Re-derives everything it needs from live GitHub data
   # using timestamp comparison against the request comment's own creation time -- no
   # cross-invocation state.
   # ============================================================================================
@@ -541,8 +545,11 @@ jobs:
     # these two APIs disagree on bot-actor login formatting (the webhook payload reports the
     # [bot]-suffixed form).
     if: |
-      (github.event_name == 'pull_request_review' && (github.event.review.user.login == 'chatgpt-codex-connector' || github.event.review.user.login == 'chatgpt-codex-connector[bot]')) ||
-      (github.event_name == 'issue_comment' && (github.event.comment.user.login == 'chatgpt-codex-connector' || github.event.comment.user.login == 'chatgpt-codex-connector[bot]') && github.event.issue.pull_request != null)
+      github.event_name == 'issue_comment' && (github.event.comment.user.login == 'chatgpt-codex-connector' || github.event.comment.user.login == 'chatgpt-codex-connector[bot]') && github.event.issue.pull_request != null
+    # Q-0068: the PAT and app key live in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
