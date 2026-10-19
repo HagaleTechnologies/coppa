@@ -124,7 +124,7 @@ jobs:
         # fleet-wide (HAG-44/74/75) -- HAGALE_AGENT_APP_PRIVATE_KEY is an org secret, already
         # available to coppa with no new provisioning needed.
         if: github.event_name == 'pull_request_target'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: 4696353
           private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
@@ -459,7 +459,7 @@ jobs:
       - name: Mint a hagale-agent installation token for check-run writes
         id: app-token
         continue-on-error: true
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: 4696353
           private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
@@ -591,7 +591,7 @@ jobs:
     steps:
       - name: Mint a hagale-agent installation token for check-run writes
         id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: 4696353
           private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}

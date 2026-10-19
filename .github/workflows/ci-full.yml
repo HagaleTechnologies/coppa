@@ -77,7 +77,7 @@ jobs:
         # and silently swallowed that 403 via `|| echo "::warning::..."`, leaving the superseded
         # run's "CI" check-run stuck in_progress forever. hagale-agent (App ID 4696353) is not
         # subject to this restriction and is already used fleet-wide for the identical purpose.
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: 4696353
           private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
@@ -333,7 +333,7 @@ jobs:
       - name: Mint a hagale-agent installation token for the CI check-run
         id: app-token
         if: failure() && steps.watch.outputs.reason != '' && github.event_name == 'workflow_dispatch'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: 4696353
           private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
@@ -433,7 +433,7 @@ jobs:
         # Q-0068: only the workflow_dispatch relay below consumes this token.
         if: github.event_name == 'workflow_dispatch'
         continue-on-error: true
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: 4696353
           private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
@@ -452,7 +452,7 @@ jobs:
         id: app-token-retry
         if: github.event_name == 'workflow_dispatch' && steps.app-token.outcome == 'failure'
         continue-on-error: true
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: 4696353
           private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
