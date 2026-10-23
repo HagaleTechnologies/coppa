@@ -43,9 +43,10 @@ jobs:
         with:
           toolchain: "1.98.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: Install ALSA dev headers (for cpal)
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Install ALSA and libudev dev headers (for cpal and serialport)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
       - run: cargo check --workspace
+      - run: cargo check --workspace --all-features
 
   test-features:
     name: Test with Features (fast, lib-only)

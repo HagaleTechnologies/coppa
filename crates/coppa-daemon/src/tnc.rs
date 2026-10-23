@@ -18,6 +18,8 @@ pub struct TncConfig {
     pub rig_address: Option<String>,
     pub vox_mode: bool,
     pub sample_rate: u32,
+    /// Input/output device name substring. None uses the default devices.
+    pub audio_device: Option<String>,
 }
 
 impl Default for TncConfig {
@@ -28,6 +30,7 @@ impl Default for TncConfig {
             rig_address: None,
             vox_mode: false,
             sample_rate: 48000,
+            audio_device: None,
         }
     }
 }
@@ -138,11 +141,25 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
 
         let sample_rate = config.sample_rate;
         let buf_size = 8192usize;
+        let device_name = config.audio_device.clone();
 
         // Input: CPAL mic → audio_in ring buffer
         let mut mic_prod = audio_in_prod;
         let input_shutdown = shutdown.clone();
-        match coppa_audio::CpalSource::new(sample_rate, buf_size) {
+        let input_result = match device_name.as_deref() {
+            Some(name) => match coppa_audio::find_input_device_by_name(name) {
+                Some(device) => coppa_audio::CpalSource::from_device(device, sample_rate, buf_size),
+                None => {
+                    eprintln!(
+                        "WARNING: No input device matching '{}', using default",
+                        name
+                    );
+                    coppa_audio::CpalSource::new(sample_rate, buf_size)
+                }
+            },
+            None => coppa_audio::CpalSource::new(sample_rate, buf_size),
+        };
+        match input_result {
             Ok(mut source) => {
                 if let Err(e) = source.start() {
                     eprintln!("Failed to start audio input: {}", e);
@@ -172,7 +189,20 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
         // Output: audio_out ring buffer → CPAL speaker
         let mut spk_cons = audio_out_cons;
         let output_shutdown = shutdown.clone();
-        match coppa_audio::CpalSink::new(sample_rate, buf_size) {
+        let output_result = match device_name.as_deref() {
+            Some(name) => match coppa_audio::find_output_device_by_name(name) {
+                Some(device) => coppa_audio::CpalSink::from_device(device, sample_rate, buf_size),
+                None => {
+                    eprintln!(
+                        "WARNING: No output device matching '{}', using default",
+                        name
+                    );
+                    coppa_audio::CpalSink::new(sample_rate, buf_size)
+                }
+            },
+            None => coppa_audio::CpalSink::new(sample_rate, buf_size),
+        };
+        match output_result {
             Ok(mut sink) => {
                 if let Err(e) = sink.start() {
                     eprintln!("Failed to start audio output: {}", e);

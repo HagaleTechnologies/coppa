@@ -993,6 +993,7 @@ fn cmd_tnc(port: u16, device: Option<String>, rig: Option<String>, vox: bool) ->
             rig_address: rig,
             vox_mode: vox,
             sample_rate: 48000,
+            ..Default::default()
         };
         coppa_daemon::tnc::run_tnc(config).await
     })
