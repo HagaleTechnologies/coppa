@@ -60,9 +60,11 @@ cargo run --bin coppa --features file-backend -- rx -i cq.wav
 
 Expected output:
 ```
-Reading from cq.wav
-Decoded: "CQ CQ CQ DE VK2ABC K"
+Reading 65520 samples from cq.wav
+Decoded: "CQ CQ CQ DE VK2ABC K"  (SNR: 25.7 dB)
 ```
+
+Payloads that aren't valid UTF-8 print as `Decoded (hex): …`; `--hex` forces hex, and `--raw` prints only the hex for scripts.
 
 ## Listing Audio Devices
 
