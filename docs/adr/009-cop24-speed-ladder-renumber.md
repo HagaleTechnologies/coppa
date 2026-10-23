@@ -40,8 +40,10 @@ reserved gaps. `VHF_FAST` retains 64-QAM 2/3, now level 8. VHF and
 level-derived engines retain level 9; the latter select VHF at levels
 5 and above. HF engines expose levels 1-8 through
 `CoppaCore::available_speed_levels()`. Both `set_speed_level` and
-`encode_bytes_at_level` reject level 9 on an HF-band engine. The daemon
-constructs its rate controller from the engine's available levels.
+`encode_bytes_at_level` reject level 9 on an HF-band engine.
+`encode_bytes_at_level` never rebuilds the profile, so it also rejects
+level 9 while a level-derived engine is still on HF (below level 5). The
+daemon constructs its rate controller from the engine's available levels.
 
 The workspace and root package versions become 0.2.0. Header protocol
 `version: 1` stays unchanged, following ADR-003 and ADR-005. The VARA TCP

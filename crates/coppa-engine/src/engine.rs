@@ -255,8 +255,12 @@ impl CoppaCore {
     /// No compression is applied (unlike `encode_bytes`): callers needing a
     /// forced-level frame (station ID / beacon, Phase 4 Task 3) send small,
     /// simple payloads where compression overhead isn't worth the complexity.
+    ///
+    /// Because the profile is never rebuilt here, the HF ceiling is checked
+    /// against the profile already in use: level 9 is rejected whenever this
+    /// engine is on an HF profile, including a level-derived engine below level 5.
     pub fn encode_bytes_at_level(&self, data: &[u8], level: u8) -> Result<Vec<f32>> {
-        self.check_level(level)?;
+        self.check_level(level, self.on_vhf_profile())?;
         if data.len() > u16::MAX as usize {
             anyhow::bail!("Payload too large ({} bytes, max {})", data.len(), u16::MAX);
         }
@@ -466,26 +470,30 @@ impl CoppaCore {
     /// truth for valid levels that this deliberately defers to rather than
     /// duplicating.
     pub fn set_speed_level(&mut self, level: u8) -> Result<()> {
-        self.check_level(level)?;
+        self.check_level(level, Self::resolves_to_vhf(level, self.config.ofdm_band))?;
         let mut config = self.config.clone();
         config.speed_level = level;
         self.reconfigure(config);
         Ok(())
     }
 
-    fn check_level(&self, level: u8) -> Result<()> {
+    /// Validate `level` for a frame sent on the VHF profile (`on_vhf_profile`)
+    /// or on an HF profile, which carries levels 1-8 only.
+    fn check_level(&self, level: u8, on_vhf_profile: bool) -> Result<()> {
         coppa_protocol::modem::speed_level_components(level)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        if !Self::level_allowed_on_band(level, self.config.ofdm_band) {
+        if !on_vhf_profile && level > HF_MAX_SPEED_LEVEL {
             anyhow::bail!(
-                "speed level {level} is not available on an HF-band engine: HF profiles carry levels 1-8 (COP-24)"
+                "speed level {level} is not available on an HF profile: HF profiles carry levels 1-8 (COP-24)"
             );
         }
         Ok(())
     }
 
-    /// Wire speed levels this engine can transmit on its configured band.
+    /// Wire speed levels `set_speed_level` accepts on this engine's configured band.
     /// HF profiles carry levels 1-8; VHF and level-derived engines carry 1-9.
+    /// `encode_bytes_at_level` also rejects 9 while a level-derived engine is
+    /// still on HF (below level 5), because it never rebuilds the profile.
     pub fn available_speed_levels(&self) -> Vec<u8> {
         SPEED_LEVELS
             .iter()
@@ -998,6 +1006,21 @@ mod tests {
             assert!(core.encode_bytes_at_level(b"HF beacon", 9).is_err());
             core.set_speed_level(8).expect("HF accepts its top level");
         }
+    }
+
+    /// `encode_bytes_at_level` never rebuilds the transceiver, so a level-derived
+    /// engine still on `hf_standard` (level < 5) must not emit level 9 on HF.
+    #[test]
+    fn level_derived_engine_on_hf_profile_rejects_forced_level_9() {
+        let mut core = CoppaCore::new();
+        assert!(!core.on_vhf_profile());
+        assert!(core.encode_bytes_at_level(b"HF beacon", 9).is_err());
+        core.encode_bytes_at_level(b"HF beacon", 8)
+            .expect("HF accepts its top level");
+        core.set_speed_level(5).unwrap();
+        assert!(core.on_vhf_profile());
+        core.encode_bytes_at_level(b"VHF beacon", 9)
+            .expect("level 9 is allowed once the transceiver is on vhf_wide");
     }
 
     #[test]
