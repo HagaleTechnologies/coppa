@@ -2,7 +2,7 @@
 //! recommendation (fed back on the ACK) with hysteresis, plus an ARQ-failure safety override:
 //! **raise slow** (step up one level only after `raise_dwell` consecutive higher recommendations),
 //! **drop fast** (a lower recommendation, or a delivery failure, applies immediately). Steps through
-//! the ordered set of valid speed levels, so reserved level 8 is skipped.
+//! the ordered set of valid speed levels.
 //!
 //! Optional **active overshoot probing** (`with_probing`/`level_for_next_transmission`/
 //! `on_probe_result`) periodically transmits above the current level on purpose, trading an
@@ -12,8 +12,8 @@
 //! `docs/superpowers/specs/2026-07-25-rateloop-active-overshoot-probing-design.md` for the full
 //! measured rationale.
 
-/// Ordered ascending valid coppa speed levels (level 8 is reserved / excluded).
-pub const VALID_SPEED_LEVELS: [u8; 9] = [1, 2, 3, 4, 5, 6, 7, 9, 10];
+/// Ordered ascending valid coppa speed levels (1-9).
+pub const VALID_SPEED_LEVELS: [u8; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 
 /// Sender-side adaptive rate controller. Holds an index into an ascending level set.
 pub struct RateLoop {
@@ -191,13 +191,13 @@ mod tests {
     #[test]
     fn raise_is_slow_and_one_step() {
         let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 1);
-        r.on_ack(10, true); // higher recommendation, run=1
+        r.on_ack(9, true); // higher recommendation, run=1
         assert_eq!(r.current_level(), 1);
-        r.on_ack(10, true); // run=2
+        r.on_ack(9, true); // run=2
         assert_eq!(r.current_level(), 1);
-        r.on_ack(10, true); // run=3 -> step up ONE level
+        r.on_ack(9, true); // run=3 -> step up ONE level
         assert_eq!(r.current_level(), 2);
-        r.on_ack(10, true); // run=1 again after reset
+        r.on_ack(9, true); // run=1 again after reset
         assert_eq!(r.current_level(), 2);
     }
 
@@ -211,17 +211,17 @@ mod tests {
     #[test]
     fn failure_drops_one_step() {
         let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 6);
-        r.on_ack(10, false); // not delivered -> drop one step (6 -> 5)
+        r.on_ack(9, false); // not delivered -> drop one step (6 -> 5)
         assert_eq!(r.current_level(), 5);
         r.on_timeout(); // 5 -> 4
         assert_eq!(r.current_level(), 4);
     }
 
     #[test]
-    fn skips_reserved_level_8() {
+    fn raises_from_7_to_8() {
         let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 1, 7);
-        r.on_ack(10, true); // dwell 1 -> step up from 7; next valid level is 9, NOT 8
-        assert_eq!(r.current_level(), 9);
+        r.on_ack(9, true); // dwell 1 -> step up from 7; next valid level is 8
+        assert_eq!(r.current_level(), 8);
     }
 
     #[test]
@@ -229,9 +229,9 @@ mod tests {
         let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 1, 1);
         r.on_ack(1, false); // already at floor
         assert_eq!(r.current_level(), 1);
-        let mut r2 = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 1, 10);
-        r2.on_ack(10, true); // already at ceiling
-        assert_eq!(r2.current_level(), 10);
+        let mut r2 = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 1, 9);
+        r2.on_ack(9, true); // already at ceiling
+        assert_eq!(r2.current_level(), 9);
     }
 
     #[test]
@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn probe_is_stall_gated_and_skipped_while_passively_climbing() {
         let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 1).with_probing(2, 2);
-        r.on_ack(10, true); // raise_run: 0 -> 1, passive signal already making progress
+        r.on_ack(9, true); // raise_run: 0 -> 1, passive signal already making progress
         assert_eq!(r.level_for_next_transmission(), (1, false)); // interval frame 1
                                                                  // Interval elapses here (frame 2), but raise_run != 0 -> gated, falls back to non-probe.
         assert_eq!(r.level_for_next_transmission(), (1, false));
@@ -270,11 +270,11 @@ mod tests {
 
     #[test]
     fn probe_offset_clamps_at_ceiling_and_falls_back_to_non_probe() {
-        // idx already at the last valid level (10); offset would overflow, clamps to idx itself,
+        // idx already at the last valid level (9); offset would overflow, clamps to idx itself,
         // which is treated as "nothing to probe" -- not a same-level probe.
-        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 10).with_probing(1, 5);
-        assert_eq!(r.level_for_next_transmission(), (10, false));
-        assert_eq!(r.level_for_next_transmission(), (10, false));
+        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 9).with_probing(1, 5);
+        assert_eq!(r.level_for_next_transmission(), (9, false));
+        assert_eq!(r.level_for_next_transmission(), (9, false));
     }
 
     #[test]
@@ -288,14 +288,14 @@ mod tests {
     #[test]
     fn probe_failure_leaves_idx_and_raise_run_untouched() {
         let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 5, 1);
-        r.on_ack(10, true); // raise_run: 0 -> 1 (real passive evidence, untouched by the probe below)
+        r.on_ack(9, true); // raise_run: 0 -> 1 (real passive evidence, untouched by the probe below)
         assert_eq!(r.current_level(), 1);
-        r.on_probe_result(9, false); // failed probe -- must not touch idx or raise_run
+        r.on_probe_result(8, false); // failed probe -- must not touch idx or raise_run
         assert_eq!(r.current_level(), 1);
-        r.on_ack(10, true); // raise_run: 1 -> 2, proving it wasn't reset by the failed probe
-        r.on_ack(10, true); // raise_run: 2 -> 3
-        r.on_ack(10, true); // raise_run: 3 -> 4
-        r.on_ack(10, true); // raise_run: 4 -> 5 -> steps up
+        r.on_ack(9, true); // raise_run: 1 -> 2, proving it wasn't reset by the failed probe
+        r.on_ack(9, true); // raise_run: 2 -> 3
+        r.on_ack(9, true); // raise_run: 3 -> 4
+        r.on_ack(9, true); // raise_run: 4 -> 5 -> steps up
         assert_eq!(r.current_level(), 2);
     }
 }

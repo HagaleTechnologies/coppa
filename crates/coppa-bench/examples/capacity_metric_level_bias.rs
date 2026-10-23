@@ -159,7 +159,7 @@ fn main() {
             "within noise"
         };
         println!(
-            "  {cname}: level1->level10 mean capacity gap = {mean_gap:+.3} bits/s/Hz \
+            "  {cname}: level1->level9 mean capacity gap = {mean_gap:+.3} bits/s/Hz \
              (2*SE bound = {mean_se_bound:.3}) -> {verdict}"
         );
     }

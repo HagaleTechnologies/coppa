@@ -49,8 +49,8 @@ pub const SPEED_LEVEL_EFFICIENCY: [(u8, f32); 9] = [
     (5, 2.00), // 8PSK 2/3 (tie with 16QAM 1/2; lower order first)
     (6, 2.00), // 16QAM 1/2
     (7, 3.00),
-    (9, 4.00),
-    (10, 5.25),
+    (8, 4.00),
+    (9, 5.25),
 ];
 
 /// Highest speed level whose spectral efficiency fits `capacity - margin` (Shannon-to-practical
@@ -80,6 +80,7 @@ pub fn select_speed_level(capacity: f32, margin: f32) -> u8 {
 /// original 2026-07 table (`(6,4.0),(7,6.5),(9,7.2),(10,8.0)`) was calibrated against those
 /// pre-fix, HARQ-poisoned FER readings.
 ///
+/// Historical measurements below use pre-COP-24 numbers: old 9 is now 8, old 10 is now 9.
 /// Directly data-anchored (lowest tested C at which the level is the unambiguous
 /// `eta * (1 - fer)` goodput-proxy argmax across the clean AWGN/Good regions):
 /// AWGN→16QAM 3/4 (L7) @ C=4.5 (AWGN's waterfall is steep enough that every level 1-7 already
@@ -111,8 +112,8 @@ pub const SPEED_LEVEL_MIN_CAPACITY: [(u8, f32); 9] = [
     (5, 2.1),
     (6, 2.8),
     (7, 4.5),
-    (9, 6.4),
-    (10, 7.6),
+    (8, 6.4),
+    (9, 7.6),
 ];
 
 /// Selectivity reference (≈ the selectivity the per-level thresholds were calibrated at, i.e. the
@@ -152,9 +153,8 @@ pub fn select_speed_level_calibrated(capacity: f32) -> u8 {
 /// run this table was generated from.
 const CORRECTION_SNR_GRID: [f32; 5] = [6.0, 12.0, 18.0, 24.0, 30.0];
 
-/// Levels in the same order as `SPEED_LEVEL_EFFICIENCY`/`SPEED_LEVEL_MIN_CAPACITY` (level 8 is
-/// reserved and excluded).
-const CORRECTION_LEVELS: [u8; 9] = [1, 2, 3, 4, 5, 6, 7, 9, 10];
+/// Levels in the same order as `SPEED_LEVEL_EFFICIENCY`/`SPEED_LEVEL_MIN_CAPACITY`.
+const CORRECTION_LEVELS: [u8; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 
 /// `CAPACITY_LEVEL_CORRECTION[level_idx][snr_idx]` = mean AWGN `channel_capacity` at that level and
 /// SNR, minus the same at level 2 (the probe `SPEED_LEVEL_MIN_CAPACITY` was itself calibrated
@@ -170,8 +170,8 @@ const CAPACITY_LEVEL_CORRECTION: [[f32; 5]; 9] = [
     [0.5117, 0.7046, 1.3565, 2.3573, 3.1329], // level 5
     [0.6852, 0.8296, 1.4354, 2.3614, 3.0481], // level 6
     [0.7263, 0.8348, 1.4593, 2.4551, 3.2263], // level 7
-    [0.8057, 0.9124, 1.5354, 2.5364, 3.3269], // level 9
-    [0.8784, 0.9243, 1.5268, 2.5208, 3.3047], // level 10
+    [0.8057, 0.9124, 1.5354, 2.5364, 3.3269], // level 8
+    [0.8784, 0.9243, 1.5268, 2.5208, 3.3047], // level 9
 ];
 
 /// Same as `CAPACITY_LEVEL_CORRECTION` but for `channel_selectivity` -- the same clip-induced bias
@@ -186,8 +186,8 @@ const SELECTIVITY_LEVEL_CORRECTION: [[f32; 5]; 9] = [
     [-0.0752, -0.0970, -0.1038, -0.1057, -0.1063], // level 5
     [-0.0806, -0.1022, -0.1077, -0.1090, -0.1093], // level 6
     [-0.0878, -0.1150, -0.1229, -0.1249, -0.1254], // level 7
-    [-0.0953, -0.1236, -0.1321, -0.1343, -0.1348], // level 9
-    [-0.1051, -0.1453, -0.1649, -0.1743, -0.1780], // level 10
+    [-0.0953, -0.1236, -0.1321, -0.1343, -0.1348], // level 8
+    [-0.1051, -0.1453, -0.1649, -0.1743, -0.1780], // level 9
 ];
 
 /// SNR estimate (dB) from per-carrier noise variances -- same formula
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn select_speed_level_is_capacity_aware() {
-        assert_eq!(select_speed_level(10.0, 1.0), 10);
+        assert_eq!(select_speed_level(10.0, 1.0), 9);
         assert_eq!(select_speed_level(2.5, 1.0), 4);
         assert_eq!(select_speed_level(2.0, 0.0), 5); // eta=2.0 tie -> lower-order 8PSK (level 5)
         assert_eq!(select_speed_level(0.1, 1.0), 1);
@@ -324,8 +324,8 @@ mod tests {
                                                            // L7 threshold -- the untested
                                                            // C=2.25-4.5 gap is conservatively kept
                                                            // at L6 rather than assumed to jump early
-        assert_eq!(select_speed_level_calibrated(7.0), 9); // >=6.4 (L9), <7.6 (L10)
-        assert_eq!(select_speed_level_calibrated(8.5), 10);
+        assert_eq!(select_speed_level_calibrated(7.0), 8); // >=6.4 (L8), <7.6 (L9)
+        assert_eq!(select_speed_level_calibrated(8.5), 9);
     }
 
     #[test]
@@ -384,7 +384,7 @@ mod tests {
 
     #[test]
     fn recommend_speed_level_corrects_high_level_readings_downward() {
-        // A borderline channel whose RAW level-10 reading would recommend level 10, but whose
+        // A borderline channel whose RAW level-9 reading would recommend level 9, but whose
         // level-2-equivalent (corrected) reading is lower -- reproduces the self-reinforcing bias
         // PR #51/#52 diagnosed: measuring via a high level should no longer read artificially
         // better than measuring the same real channel via level 2.
@@ -392,13 +392,13 @@ mod tests {
         let raw_capacity = channel_capacity(&nv);
         let raw_selectivity = channel_selectivity(&nv);
         let uncorrected = select_speed_level_2d(raw_capacity, raw_selectivity);
-        let corrected_via_level10 = recommend_speed_level(&nv, 10);
-        // Level 10's correction at ~24 dB is a ~2.5 bits/s/Hz downward shift plus a selectivity
+        let corrected_via_level9 = recommend_speed_level(&nv, 9);
+        // Level 9's correction at ~24 dB is a ~2.5 bits/s/Hz downward shift plus a selectivity
         // correction that ALSO reduces the effective-capacity boost -- the corrected
         // recommendation must not exceed the uncorrected one.
         assert!(
-            corrected_via_level10 <= uncorrected,
-            "corrected {corrected_via_level10} should not exceed uncorrected {uncorrected}"
+            corrected_via_level9 <= uncorrected,
+            "corrected {corrected_via_level9} should not exceed uncorrected {uncorrected}"
         );
     }
 
@@ -418,11 +418,11 @@ mod tests {
 
     #[test]
     fn level_bias_correction_interpolates_between_grid_points() {
-        // Level 10's capacity correction row: [0.8784, 0.9243, 1.5268, 2.5208, 3.3047] at
+        // Level 9's capacity correction row: [0.8784, 0.9243, 1.5268, 2.5208, 3.3047] at
         // SNR grid [6, 12, 18, 24, 30]. At 15 dB (halfway between 12 and 18), the interpolated
         // value should be the midpoint of 0.9243 and 1.5268.
         let expected = 0.9243 + 0.5 * (1.5268 - 0.9243);
-        let got = interpolate_correction(&CAPACITY_LEVEL_CORRECTION, 10, 15.0);
+        let got = interpolate_correction(&CAPACITY_LEVEL_CORRECTION, 9, 15.0);
         assert!(
             (got - expected).abs() < 1e-3,
             "got {got}, expected {expected}"
@@ -431,25 +431,23 @@ mod tests {
 
     #[test]
     fn level_bias_correction_clamps_outside_grid() {
-        // Level 10's capacity row's first/last entries: 0.8784 (6 dB), 3.3047 (30 dB). Below 6 dB
+        // Level 9's capacity row's first/last entries: 0.8784 (6 dB), 3.3047 (30 dB). Below 6 dB
         // or above 30 dB must clamp to the nearest grid endpoint, not extrapolate.
+        assert!((interpolate_correction(&CAPACITY_LEVEL_CORRECTION, 9, 0.0) - 0.8784).abs() < 1e-3);
         assert!(
-            (interpolate_correction(&CAPACITY_LEVEL_CORRECTION, 10, 0.0) - 0.8784).abs() < 1e-3
-        );
-        assert!(
-            (interpolate_correction(&CAPACITY_LEVEL_CORRECTION, 10, 50.0) - 3.3047).abs() < 1e-3
+            (interpolate_correction(&CAPACITY_LEVEL_CORRECTION, 9, 50.0) - 3.3047).abs() < 1e-3
         );
     }
 
     #[test]
     fn level_bias_correction_falls_back_to_zero_for_unknown_level() {
-        // Level 8 is reserved and never appears in CORRECTION_LEVELS.
+        // Level 10 is invalid and never appears in CORRECTION_LEVELS.
         assert_eq!(
-            interpolate_correction(&CAPACITY_LEVEL_CORRECTION, 8, 18.0),
+            interpolate_correction(&CAPACITY_LEVEL_CORRECTION, 10, 18.0),
             0.0
         );
         assert_eq!(
-            interpolate_correction(&SELECTIVITY_LEVEL_CORRECTION, 8, 18.0),
+            interpolate_correction(&SELECTIVITY_LEVEL_CORRECTION, 10, 18.0),
             0.0
         );
     }
@@ -458,16 +456,16 @@ mod tests {
     fn capacity_correction_matches_calibration_bench_raw_data() {
         // Independent spot-check against `capacity_level_correction_calibration.rs`'s own raw
         // DATA output (not the RUST_TABLE block this const was transcribed from): "DATA 24 10
-        // 10.7188 ..." and "DATA 24 2 8.1981 ...". Level 10's correction at 24 dB must equal
+        // 10.7188 ..." and "DATA 24 2 8.1981 ...". Level 9's correction at 24 dB must equal
         // their difference -- catches a transcription slip in either copy.
-        let level10_raw_24db = 10.7188_f32;
+        let level9_raw_24db = 10.7188_f32;
         let level2_raw_24db = 8.1981_f32;
-        let expected = level10_raw_24db - level2_raw_24db;
-        // Level 10 is CORRECTION_LEVELS' last entry (index 8); 24 dB is CORRECTION_SNR_GRID's
+        let expected = level9_raw_24db - level2_raw_24db;
+        // Level 9 is CORRECTION_LEVELS' last entry (index 8); 24 dB is CORRECTION_SNR_GRID's
         // index 3.
         assert!(
             (CAPACITY_LEVEL_CORRECTION[8][3] - expected).abs() < 0.001,
-            "level 10 @ 24dB correction {} != raw diff {}",
+            "level 9 @ 24dB correction {} != raw diff {}",
             CAPACITY_LEVEL_CORRECTION[8][3],
             expected
         );
@@ -477,12 +475,12 @@ mod tests {
     fn selectivity_correction_matches_calibration_bench_raw_data() {
         // Same independent spot-check for selectivity: "DATA 24 10 ... 0.0170" and
         // "DATA 24 2 ... 0.1913".
-        let level10_raw_24db = 0.0170_f32;
+        let level9_raw_24db = 0.0170_f32;
         let level2_raw_24db = 0.1913_f32;
-        let expected = level10_raw_24db - level2_raw_24db;
+        let expected = level9_raw_24db - level2_raw_24db;
         assert!(
             (SELECTIVITY_LEVEL_CORRECTION[8][3] - expected).abs() < 0.001,
-            "level 10 @ 24dB correction {} != raw diff {}",
+            "level 9 @ 24dB correction {} != raw diff {}",
             SELECTIVITY_LEVEL_CORRECTION[8][3],
             expected
         );

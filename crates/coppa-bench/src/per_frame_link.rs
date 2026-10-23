@@ -90,7 +90,7 @@ mod tests {
 
     #[test]
     fn hard_decide_roundtrips_every_ladder_level() {
-        for level in [1u8, 2, 3, 4, 5, 6, 7, 9, 10] {
+        for level in [1u8, 2, 3, 4, 5, 6, 7, 8, 9] {
             let (mapper, _) = speed_level_components(level).unwrap();
             let bits = pseudorandom_bits(mapper.bits_per_symbol() * 64);
             let symbols = mapper.map_bits(&bits);
@@ -108,17 +108,17 @@ mod tests {
     fn reconstructed_tx_bits_match_the_real_transmit_path() {
         let profile = CoppaProfile::vhf_wide();
         let payload = vec![0xA5; 64];
-        let frame = build_diagnostic_frame(&profile, 9, &payload);
+        let frame = build_diagnostic_frame(&profile, 8, &payload);
         let tx = CoppaTransceiver::new(profile, 1);
         let (_, decoded, _) = tx.receive(&frame.signal).expect("self-built frame decodes");
         assert_eq!(decoded, payload);
     }
 
     #[test]
-    fn raw_pre_fec_ber_is_near_zero_on_a_clean_channel_at_level_9() {
+    fn raw_pre_fec_ber_is_near_zero_on_a_clean_channel_at_level_8() {
         let profile = CoppaProfile::vhf_wide();
         let modem = CoppaModem::new(profile.clone(), 1);
-        let (mapper, _) = speed_level_components(9).unwrap();
+        let (mapper, _) = speed_level_components(8).unwrap();
         let mut errors = 0;
         let mut compared_total = 0;
         for trial in 0..8u64 {
@@ -126,7 +126,7 @@ mod tests {
             let payload: Vec<u8> = (0..64)
                 .map(|i| ((seed + i).wrapping_mul(2_654_435_761) >> 24) as u8)
                 .collect();
-            let frame = build_diagnostic_frame(&profile, 9, &payload);
+            let frame = build_diagnostic_frame(&profile, 8, &payload);
             let (_, equalized, _, _) = modem.demodulate_frame(&frame.signal).expect("demodulates");
             let decided = hard_decide(&*mapper, &equalized[..symbols_needed(6)]);
             let compared = decided.len().min(frame.interleaved_bits.len());

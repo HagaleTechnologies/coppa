@@ -36,7 +36,7 @@ preamble-correlation stage, but this codec does not implement multi-version
 interop — a `CoppaTransceiver` instance decodes exactly the version it was
 constructed with.
 
-This codebase has already broken its own wire format twice before reaching
+This codebase has already broken its own wire format three times before reaching
 version 1's current shape; a future implementer should not assume any wire
 compatibility across these boundaries:
 
@@ -47,6 +47,19 @@ compatibility across these boundaries:
   rate matching replacing nine separate per-rate 802.11 QC-LDPC codes;
   speed level 10's nominal rate changed from 7/8 to 5/6) — see
   `docs/adr/005-nr-bg2-ldpc.md`.
+
+- **COP-24 ladder renumber (0.2.0)** closes the gap and restricts 64-QAM
+  5/6 to VHF. See `docs/adr/009-cop24-speed-ladder-renumber.md`.
+
+  | Modulation / rate | 0.1.0 wire level | 0.2.0 wire level | Allowed band |
+  |---|---|---|---|
+  | BPSK 1/4 through 16-QAM 3/4 | 1-7 | 1-7 | HF and VHF |
+  | 64-QAM 2/3 | 9 | 8 | HF and VHF |
+  | 64-QAM 5/6 | 10 | 9 | VHF only |
+
+  Levels 0 and 10-15 are invalid in 0.2.0. There are no old-number aliases
+  or reserved gaps. Header protocol `version: 1` stays unchanged, following
+  ADR-003/005. Both stations must run 0.2.0 to use levels above 7.
 
 Two further ADRs describe additions layered on top of the same wire format
 (no further breaks): `docs/adr/007-multi-codeword-frames.md` (multi-codeword
@@ -360,8 +373,8 @@ Field semantics:
   `crates/coppa-protocol/src/modem/transceiver.rs:243`) are the IR-HARQ
   redundancy version `rv` (0–3, §5.3); high 2 bits are reserved, always `0`
   in this codec (`crates/coppa-codec/src/ofdm/frame.rs:249-258`).
-- `speed_level` (4 bits): wire-encoded MCS/speed level, 1–10 (0, 8, 11–15
-  invalid/reserved — level 8 is reserved for a future 32-QAM mode; see §6).
+- `speed_level` (4 bits): wire-encoded MCS/speed level, 1-9. Values 0 and 10-15
+  are invalid; see §6 for the HF restriction.
 - `seq_num` (8 bits): sequence number, 0–255.
 - `payload_len` (12 bits, max 4095): **total** application-payload length in
   bytes, summed across **all** codewords for a multi-codeword frame (§9) —
@@ -513,9 +526,8 @@ systematic info bits actually carry payload+padding; the remaining
 | 5 | 8PSK | 1296 | 2/3 | |
 | 6 | 16QAM | 972 | 1/2 | |
 | 7 | 16QAM | 1458 | 3/4 | |
-| 8 | (32QAM) | — | — | **reserved**, `k_used_for_level(8) = None` |
-| 9 | 64QAM | 1296 | 2/3 | |
-| 10 | 64QAM | 1620 | **5/6** | wire-format-breaking change from a pre-Task-4 7/8 (1701) — see §0.1 |
+| 8 | 64QAM | 1296 | 2/3 | |
+| 9 | 64QAM | 1620 | **5/6** | wire-format-breaking change from a pre-Task-4 7/8 (1701) — see §0.1 |
 
 (`k_used_for_level` match arms, `crates/coppa-protocol/src/modem/speed_levels.rs:62-74`;
 audited-ladder round-trip test at `crates/coppa-protocol/src/fec/ldpc/mod.rs:245-255`.)
@@ -624,13 +636,17 @@ together define, per wire level:
 | 5 | 8PSK | 3 | 8.0 |
 | 6 | 16QAM | 4 | 9.5 |
 | 7 | 16QAM | 4 | 11.0 |
-| 8 | — | — | — (reserved, 32-QAM) |
-| 9 | 64QAM | 6 | 11.0 |
-| 10 | 64QAM | 6 | 14.0 |
+| 8 | 64QAM | 6 | 11.0 |
+| 9 | 64QAM | 6 | 14.0 |
 
 (`SPEED_LEVELS` array, `crates/coppa-codec/src/ofdm/coppa_modem.rs:37-101`;
 mapper selection, `crates/coppa-protocol/src/modem/speed_levels.rs:15-27`).
 PAPR targets are consumed by `papr_clip` (§7) at TX.
+
+A transmitter on an HF profile (`phy_mode` 0) **MUST NOT** send level 9;
+it is defined for `vhf_wide` only. HF engines expose levels 1-8 through
+`CoppaCore::available_speed_levels`, and reject level 9 in both
+`set_speed_level` and `encode_bytes_at_level`.
 
 ### 6.1 Per-mapper bit conventions (`coppa-codec`)
 
@@ -896,13 +912,13 @@ structure.
 
 ---
 
-## 12. Discrepancy note: stale `CodeRate` label for speed level 10
+## 12. Discrepancy note: stale `CodeRate` label for speed level 9
 
-`speed_level_components(10)` returns `CodeRate::Rate7_8`
+`speed_level_components(9)` returns `CodeRate::Rate7_8`
 (`crates/coppa-protocol/src/modem/speed_levels.rs:24`, confirmed by test
 `crates/coppa-protocol/src/modem/speed_levels.rs:249`), a legacy-codec
-label (§5.1) that no longer matches level 10's *real* rate. Per §5.2,
-level 10's actual `k_used = 1620` is rate **5/6**, not 7/8 — the 7/8→5/6
+label (§5.1) that no longer matches level 9's *real* rate. Per §5.2,
+level 9's actual `k_used = 1620` is rate **5/6**, not 7/8 — the 7/8→5/6
 change was a deliberate wire-format break (§0.1, §5.2). Tracing the call
 site (`CoppaTransceiver::new`,
 `crates/coppa-protocol/src/modem/transceiver.rs:547-560`) confirms this
@@ -910,7 +926,7 @@ site (`CoppaTransceiver::new`,
 it has no effect on the actual rate-matching pipeline (which uses only
 `k_used_for_level`, §5.2). This is dead/stale metadata, not a wire-format
 bug: it affects no transmitted bit. An implementer should use §5.2's
-`k_used` table as the source of truth for level 10's rate, not this enum
+`k_used` table as the source of truth for level 9's rate, not this enum
 label.
 
 ---
@@ -991,7 +1007,7 @@ A conforming implementation MAY:
 ## 14. Executable conformance vectors
 
 `testdata/golden/manifest.toml` (20 entries: the cross product of levels
-`{1, 2, 5, 6, 9}` × channel conditions `{clean, awgn12, poor25, ssbcfo}`,
+`{1, 2, 5, 6, 8}` × channel conditions `{clean, awgn12, poor25, ssbcfo}`,
 enforced by `golden_manifest_covers_the_full_grid`,
 `crates/coppa-protocol/tests/golden_vectors.rs:205-232`) is a set of
 **frozen, committed reference vectors** for exactly this spec's wire
@@ -1009,7 +1025,7 @@ of `cargo test --workspace`) is the executable check: for every manifest
 entry it constructs a `CoppaTransceiver` for that level's profile, calls
 `receive()` on the WAV samples, and asserts the recovered `speed_level` and
 payload bytes exactly match the manifest (`crates/coppa-protocol/tests/golden_vectors.rs:144-190`).
-All 20 entries, including `L9_poor25`, have `expected_decode_ok = true`.
+All 20 entries, including `L8_poor25`, have `expected_decode_ok = true`.
 The test requires every vector to decode to its exact manifest payload.
 
 An independent implementer **SHOULD** treat this manifest + WAV set as the

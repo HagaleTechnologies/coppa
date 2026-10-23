@@ -540,7 +540,7 @@ impl CoppaTransceiver {
         let ldpc = NrLdpc::new();
 
         // Eagerly build every speed level's interleaver/mapper/k_used (see
-        // `LevelComponents`'s doc). Reserved/invalid levels (e.g. 8) simply have no
+        // `LevelComponents`'s doc). Invalid levels (e.g. 10) simply have no
         // entry in the map; `transmit`/`receive` treat a missing entry the same way
         // the old per-call `speed_level_components` lookup treated an `Err`.
         let mut codecs = HashMap::with_capacity(SPEED_LEVELS.len());
@@ -1523,7 +1523,7 @@ mod tests {
         // agrees with each mapper's own bits_per_symbol for every currently
         // defined speed level (guards the "bits_per_symbol uniquely identifies
         // modulation in this ladder" assumption `soft_symbol`'s doc relies on).
-        for level in [1u8, 2, 3, 4, 5, 6, 7, 9, 10] {
+        for level in [1u8, 2, 3, 4, 5, 6, 7, 8, 9] {
             let (mapper, _) = crate::modem::speed_levels::speed_level_components(level).unwrap();
             let bps = mapper.bits_per_symbol();
             let llrs = vec![1.0f32; bps];
@@ -1628,7 +1628,7 @@ mod tests {
         );
     }
 
-    /// Regression test: VHF-routed speed levels (5,6,7,9,10 via `select_profile` in
+    /// Regression test: VHF-routed speed levels (5,6,7,8,9 via `select_profile` in
     /// coppa-bench, which chooses `vhf_wide` for level >= 5) previously fell back to
     /// an unconditioned TX path that never leveled the preamble against the much
     /// quieter header/payload body, leaving the transmitted peak above full scale
@@ -1694,7 +1694,7 @@ mod tests {
     /// backed-off timing anchor and its linear phase ramp -- a ramp
     /// `calibrated_bias` was never actually calibrated against for VHF. Simulate
     /// that here by prepending a realistic leading offset before the frame, for
-    /// every VHF-routed speed level (5, 6, 7, 9, 10 -- 8 is reserved), not just
+    /// every VHF-routed speed level (5, 6, 7, 8, 9), not just
     /// one -- this is exactly the kind of single-operating-point validation gap
     /// CLAUDE.md's Phase 2 Task 4 cautionary tale warns about.
     #[test]
@@ -1713,7 +1713,7 @@ mod tests {
         // large, clearly-non-saturating realistic margin.
         const LEADING_OFFSETS: [usize; 4] = [0, 1, 30, 500];
 
-        for level in [5u8, 6, 7, 9, 10] {
+        for level in [5u8, 6, 7, 8, 9] {
             for &leading_offset in &LEADING_OFFSETS {
                 let profile = CoppaProfile::vhf_wide();
                 let tx = CoppaTransceiver::new(profile, 1);
@@ -1957,7 +1957,7 @@ mod tests {
         assert_eq!(rx_header.payload_len, header.payload_len);
         assert_eq!(&rx_payload[..payload.len()], payload.as_slice());
         assert!(
-            (1..=10).contains(&rec_level),
+            (1..=9).contains(&rec_level),
             "recommended level in range: {rec_level}"
         );
     }
@@ -2239,20 +2239,20 @@ mod tests {
     /// entirely (same bypass style as
     /// `known_pad_pinning_recovers_below_no_pinning_threshold` above).
     ///
-    /// Uses level 10 (64-QAM, rate 5/6 -- this ladder's LEAST redundant code,
+    /// Uses level 9 (64-QAM, rate 5/6 -- this ladder's LEAST redundant code,
     /// see `speed_levels::k_used_for_level`'s doc) with a near-max payload,
     /// not level 2's BPSK 1/2. A quick empirical margin sweep (see this
     /// task's report) found that level 2's heavy rate-1/2 redundancy plus
     /// known-pad pinning is robust enough to correctly decode through 60-70%
     /// random coded-bit erasure on a single transmission -- there's no
     /// erasure fraction near the brief's illustrative "30%" that reliably
-    /// fails alone for that code. Level 10's much thinner redundancy margin
+    /// fails alone for that code. Level 9's much thinner redundancy margin
     /// is where 30% erasure lands exactly on a clean, reliably-separated
     /// single-fails/combined-succeeds operating point (see
     /// `erased_coded_llrs`'s doc for the corruption model itself).
     fn harq_test_fixture(payload: &[u8]) -> (CoppaTransceiver, Vec<u8>, usize, usize) {
         let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
-        let comp = tx.codecs.get(&10).expect("level 10 must exist"); // 64-QAM, rate 5/6
+        let comp = tx.codecs.get(&9).expect("level 9 must exist"); // 64-QAM, rate 5/6
         let k_used = comp.k_used;
 
         let checksum = PAYLOAD_CRC32.checksum(payload);
@@ -2339,7 +2339,7 @@ mod tests {
     /// IR-HARQ combining, even though neither decodes alone.
     #[test]
     fn harq_ir_combines_two_half_corrupted_transmissions() {
-        let payload = vec![0x42u8; 198]; // level 10's near-max payload capacity
+        let payload = vec![0x42u8; 198]; // level 9's near-max payload capacity
         let (tx, mother, k_used, payload_bits) = harq_test_fixture(&payload);
 
         let llrs_rv0 = erased_coded_llrs(&mother, k_used, 0, 0.30, 8.0, 0xA11CE);
@@ -2393,7 +2393,7 @@ mod tests {
     /// LLRs at the same mother-domain positions both times.
     #[test]
     fn harq_ir_chase_combines_same_rv_sent_twice() {
-        let payload = vec![0x7Bu8; 198]; // level 10's near-max payload capacity
+        let payload = vec![0x7Bu8; 198]; // level 9's near-max payload capacity
         let (tx, mother, k_used, payload_bits) = harq_test_fixture(&payload);
 
         // Same RV (0) both times, but independent erasure patterns -- a

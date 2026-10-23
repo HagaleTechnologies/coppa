@@ -13,7 +13,7 @@ use rand::{RngExt, SeedableRng};
 /// 4-byte CRC-32 trailer `CoppaTransceiver::transmit` appends (Phase 3 Task 1) --
 /// see `max_payload_for_level`'s doc. Was `code_rate.info_bits()/8` pre-Task-4
 /// (the old per-rate 802.11 QC-LDPC codec's info width, which for level 10 was
-/// 1701 bits/7/8 rate; the new mother code's level 10 is 1620 bits/5/6 rate -- a
+/// 1701 bits/7/8 rate; the new mother code's level 9 is 1620 bits/5/6 rate -- a
 /// wire-format break, see `CLAUDE.md`'s Known Limitations and this task's ADR).
 fn max_payload_bytes(wire_level: u8) -> usize {
     max_payload_for_level(wire_level).unwrap()
@@ -114,23 +114,23 @@ fn test_level_7_16qam_rate_3_4() {
 }
 
 #[test]
-fn test_level_9_64qam_rate_2_3() {
+fn test_level_8_64qam_rate_2_3() {
     // The #[ignore] this test used to carry (routing around the old
     // per-rate LDPC codec's level-9/10 non-convergence) is removed: Task 4's
     // NR BG2 mother code fixes this — verified via a fresh
-    // test_snr_fer_monte_carlo run showing FER=0.00 at every level 1-10.
-    loopback_test(9, &[0x56; 80]);
+    // test_snr_fer_monte_carlo run showing FER=0.00 at every level 1-9.
+    loopback_test(8, &[0x56; 80]);
 }
 
 #[test]
-fn test_level_10_64qam_rate_5_6() {
+fn test_level_9_64qam_rate_5_6() {
     // Renamed from `rate_7_8`: Task 4's k_used table moved level 10 from
     // 7/8 to 5/6 (wire-format break, see CLAUDE.md's Known Limitations).
     // The #[ignore] main previously had here (routing around the old
     // per-rate LDPC codec's level-9/10 non-convergence) is removed: Task 4's
     // NR BG2 mother code fixes this — verified via a fresh
-    // test_snr_fer_monte_carlo run showing FER=0.00 at every level 1-10.
-    loopback_test(10, &[0x78; 150]);
+    // test_snr_fer_monte_carlo run showing FER=0.00 at every level 1-9.
+    loopback_test(9, &[0x78; 150]);
 }
 
 #[test]
@@ -138,7 +138,7 @@ fn test_all_levels_max_payload() {
     // The levels-9/10 skip this loop used to have (routing around the old
     // per-rate LDPC codec's non-convergence) is removed: Task 4's NR BG2
     // mother code fixes this — verified via a fresh test_snr_fer_monte_carlo
-    // run showing FER=0.00 at every level 1-10.
+    // run showing FER=0.00 at every level 1-9.
     for sl in &SPEED_LEVELS {
         let max_bytes = max_payload_bytes(sl.level);
         let payload: Vec<u8> = (0..max_bytes).map(|i| (i & 0xFF) as u8).collect();
@@ -151,7 +151,7 @@ fn test_all_levels_min_payload() {
     // The levels-9/10 skip this loop used to have (routing around the old
     // per-rate LDPC codec's non-convergence) is removed: Task 4's NR BG2
     // mother code fixes this — verified via a fresh test_snr_fer_monte_carlo
-    // run showing FER=0.00 at every level 1-10.
+    // run showing FER=0.00 at every level 1-9.
     for sl in &SPEED_LEVELS {
         loopback_test(sl.level, &[0x42]);
     }
@@ -217,8 +217,8 @@ fn required_snr(wire_level: u8) -> f32 {
         5 => 9.0,
         6 => 9.0,
         7 => 13.0,
-        9 => 18.0,
-        10 => 22.0,
+        8 => 18.0,
+        9 => 22.0,
         _ => 30.0,
     }
 }
@@ -309,21 +309,21 @@ fn test_awgn_level_7_above_threshold() {
 }
 
 #[test]
+fn test_awgn_level_8_above_threshold() {
+    // The #[ignore] this test used to carry (routing around the old
+    // per-rate LDPC codec's level-9/10 non-convergence) is removed: Task 4's
+    // NR BG2 mother code fixes this — verified via a fresh
+    // test_snr_fer_monte_carlo run showing FER=0.00 at every level 1-9.
+    awgn_above_threshold(8);
+}
+
+#[test]
 fn test_awgn_level_9_above_threshold() {
     // The #[ignore] this test used to carry (routing around the old
     // per-rate LDPC codec's level-9/10 non-convergence) is removed: Task 4's
     // NR BG2 mother code fixes this — verified via a fresh
-    // test_snr_fer_monte_carlo run showing FER=0.00 at every level 1-10.
+    // test_snr_fer_monte_carlo run showing FER=0.00 at every level 1-9.
     awgn_above_threshold(9);
-}
-
-#[test]
-fn test_awgn_level_10_above_threshold() {
-    // The #[ignore] this test used to carry (routing around the old
-    // per-rate LDPC codec's level-9/10 non-convergence) is removed: Task 4's
-    // NR BG2 mother code fixes this — verified via a fresh
-    // test_snr_fer_monte_carlo run showing FER=0.00 at every level 1-10.
-    awgn_above_threshold(10);
 }
 
 #[test]

@@ -34,7 +34,8 @@ impl VaraCommandPort {
         let mut reader = BufReader::new(reader);
 
         // Send initial version
-        let version_resp = VaraResponse::Version("Coppa 0.1.0".to_string());
+        let version_resp =
+            VaraResponse::Version(concat!("Coppa ", env!("CARGO_PKG_VERSION")).to_string());
         writer.write_all(version_resp.format().as_bytes()).await?;
 
         // Notify connection
@@ -161,6 +162,42 @@ async fn read_command<R: AsyncBufRead + Unpin>(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn greeting_reports_package_version() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(4);
+        let (_response_tx, response_rx) = mpsc::channel(4);
+        let handler = tokio::spawn(VaraCommandPort::handle_client(
+            server,
+            1,
+            event_tx,
+            response_rx,
+        ));
+        let mut reader = BufReader::new(client);
+        let mut greeting = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut greeting),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            greeting,
+            format!("VERSION Coppa {}\r\n", env!("CARGO_PKG_VERSION"))
+        );
+        drop(reader);
+        tokio::time::timeout(std::time::Duration::from_secs(5), handler)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn test_command_port_new() {

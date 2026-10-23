@@ -39,7 +39,7 @@ pub const HF_ROBUST: Profile = Profile {
 /// Fast VHF profile for strong-signal conditions.
 pub const VHF_FAST: Profile = Profile {
     name: "VHF_FAST",
-    speed_level: 9,
+    speed_level: 8,
     max_payload: 255,
     arq_window: 16,
     compression: true,
@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn test_vhf_fast_profile() {
         assert_eq!(VHF_FAST.name, "VHF_FAST");
-        assert_eq!(VHF_FAST.speed_level, 9);
+        assert_eq!(VHF_FAST.speed_level, 8);
         assert_eq!(VHF_FAST.sample_rate, 48000);
         assert_eq!(VHF_FAST.ofdm_profile, "vhf");
     }
