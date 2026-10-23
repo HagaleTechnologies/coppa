@@ -1476,7 +1476,13 @@ mod tests {
         let cfg = null_config();
         let mut handle = unsafe { coppa_engine_new_with(&cfg) };
         assert!(!handle.is_null());
-        let speed_level = unsafe { (*handle).engine.lock().unwrap().config().speed_level };
+        let speed_level = unsafe { handle.as_ref() }
+            .unwrap()
+            .engine
+            .lock()
+            .unwrap()
+            .config()
+            .speed_level;
         assert_eq!(
             speed_level, 1,
             "empty config should match EngineConfig::default()"
@@ -1495,7 +1501,13 @@ mod tests {
         };
         let mut handle = unsafe { coppa_engine_new_with(&cfg) };
         assert!(!handle.is_null());
-        let speed_level = unsafe { (*handle).engine.lock().unwrap().config().speed_level };
+        let speed_level = unsafe { handle.as_ref() }
+            .unwrap()
+            .engine
+            .lock()
+            .unwrap()
+            .config()
+            .speed_level;
         assert_eq!(speed_level, coppa_engine::HF_ROBUST.speed_level);
         unsafe { coppa_engine_destroy(&mut handle) };
     }
@@ -1511,7 +1523,13 @@ mod tests {
         };
         let mut handle = unsafe { coppa_engine_new_with(&cfg) };
         assert!(!handle.is_null());
-        let speed_level = unsafe { (*handle).engine.lock().unwrap().config().speed_level };
+        let speed_level = unsafe { handle.as_ref() }
+            .unwrap()
+            .engine
+            .lock()
+            .unwrap()
+            .config()
+            .speed_level;
         assert_eq!(
             speed_level, 3,
             "explicit speed_level should override the profile's own"
@@ -1605,7 +1623,15 @@ mod tests {
         };
         assert!(!hf.is_null());
         assert_eq!(unsafe { coppa_engine_set_speed_level(hf, 9) }, -6);
-        assert_eq!(unsafe { (*hf).engine.lock().unwrap().speed_level() }, 8);
+        assert_eq!(
+            unsafe { hf.as_ref() }
+                .unwrap()
+                .engine
+                .lock()
+                .unwrap()
+                .speed_level(),
+            8
+        );
         unsafe { coppa_engine_destroy(&mut hf) };
 
         let mut vhf = unsafe {
@@ -1685,7 +1711,13 @@ mod tests {
         };
         let mut handle = unsafe { coppa_engine_new_with(&cfg) };
         assert!(!handle.is_null());
-        let sample_rate = unsafe { (*handle).engine.lock().unwrap().config().sample_rate };
+        let sample_rate = unsafe { handle.as_ref() }
+            .unwrap()
+            .engine
+            .lock()
+            .unwrap()
+            .config()
+            .sample_rate;
         assert_eq!(sample_rate, 48_000);
         unsafe { coppa_engine_destroy(&mut handle) };
     }
@@ -1730,7 +1762,13 @@ mod tests {
         let mut handle = coppa_engine_create();
         let result = unsafe { coppa_engine_set_speed_level(handle, 4) };
         assert_eq!(result, 0);
-        let speed_level = unsafe { (*handle).engine.lock().unwrap().config().speed_level };
+        let speed_level = unsafe { handle.as_ref() }
+            .unwrap()
+            .engine
+            .lock()
+            .unwrap()
+            .config()
+            .speed_level;
         assert_eq!(speed_level, 4);
         unsafe { coppa_engine_destroy(&mut handle) };
     }
@@ -1742,7 +1780,13 @@ mod tests {
         assert_eq!(unsafe { coppa_engine_set_speed_level(handle, 0) }, -6);
         assert_eq!(unsafe { coppa_engine_set_speed_level(handle, 255) }, -6);
         // A rejected level must not have mutated the config.
-        let speed_level = unsafe { (*handle).engine.lock().unwrap().config().speed_level };
+        let speed_level = unsafe { handle.as_ref() }
+            .unwrap()
+            .engine
+            .lock()
+            .unwrap()
+            .config()
+            .speed_level;
         assert_eq!(speed_level, 1, "default engine config is speed_level 1");
         unsafe { coppa_engine_destroy(&mut handle) };
     }
