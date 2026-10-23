@@ -164,8 +164,10 @@ fn samples_to_nanos_ceil(samples: usize, sample_rate: u32) -> u128 {
 /// `entry` is a monotonic instant sampled at callback entry and
 /// `playback_delay` is the device's predicted callback-to-playback delay
 /// (`None` when the backend's timestamp is invalid, which fails the stream
-/// rather than assuming zero latency). Silence-only callbacks publish nothing,
-/// so the last real deadline survives them. Returns the real-sample count.
+/// rather than assuming zero latency, and silences this buffer so its samples
+/// cannot play after the caller releases PTT). Silence-only callbacks publish
+/// nothing, so the last real deadline survives them. Returns the real-sample
+/// count handed to the device.
 pub(crate) fn fill_output(
     consumer: &mut AudioRingConsumer,
     data: &mut [f32],
@@ -189,7 +191,8 @@ pub(crate) fn fill_output(
         Some(d) if d <= MAX_PLAYBACK_DELAY => d,
         _ => {
             shared.fail();
-            return read;
+            data[..read].fill(0.0);
+            return 0;
         }
     };
     state.consumed += read as u64;
@@ -379,6 +382,24 @@ mod tests {
             0
         );
         assert!(buf.iter().all(|&s| s == 0.0));
+    }
+
+    /// A rejected timestamp fails the stream before the buffer reaches the
+    /// device, so the samples already copied into it must not play.
+    #[test]
+    fn rejected_timestamp_hands_the_device_silence() {
+        for delay in [None, Some(Duration::from_secs(60))] {
+            let (mut prod, mut cons) = audio_ring(64);
+            let base = Instant::now();
+            let shared = ProgressShared::new(base);
+            let mut state = CallbackState::new(SR);
+            prod.write(&[0.2; 10]);
+            let mut buf = vec![1.0; 16];
+            let read = fill_output(&mut cons, &mut buf, &shared, &mut state, base, delay);
+            assert!(shared.is_failed(), "{delay:?}");
+            assert_eq!(read, 0, "{delay:?}");
+            assert!(buf.iter().all(|&s| s == 0.0), "{delay:?}: {buf:?}");
+        }
     }
 
     #[test]

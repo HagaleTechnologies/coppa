@@ -86,6 +86,11 @@ pub struct EventLoop {
     /// Generation of the newest keyed transmission; only its completion may
     /// release PTT automatically.
     tx_generation: u64,
+    /// When automatic TX keyed the radio for the current continuous keyed
+    /// interval. `max_tx_duration_s` is measured from here rather than from
+    /// each job's start, so transmissions queued behind an active one cannot
+    /// push the forced unkey back. Cleared whenever PTT is released.
+    tx_keyed_since: Option<tokio::time::Instant>,
     /// Last-seen value of the audio input ring's overflow counter (see
     /// `AudioRingConsumer::overflow_count`); `poll_audio_input` compares against
     /// this each poll and logs a warning when it grows (silent RX sample loss was
@@ -351,6 +356,7 @@ impl EventLoop {
             response_tx: None,
             output_feedback: None,
             tx_generation: 0,
+            tx_keyed_since: None,
             audio_in_overflow_count: 0,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             arq_tx,
@@ -1652,6 +1658,9 @@ impl EventLoop {
 
         // Assert PTT before transmitting
         self.handle_ptt_change(true).await;
+        let keyed_since = *self
+            .tx_keyed_since
+            .get_or_insert_with(tokio::time::Instant::now);
         // Enforce PTT pre-delay before writing audio
         let pre_delay_ms = self.config.radio.ptt_pre_delay_ms;
         if pre_delay_ms > 0 {
@@ -1667,7 +1676,12 @@ impl EventLoop {
         let generation = self.tx_generation;
         let target = self.tx_output().submitted();
         let tail = std::time::Duration::from_millis(self.config.radio.ptt_tail_delay_ms);
-        let max_tx = std::time::Duration::from_secs(self.config.radio.max_tx_duration_s);
+        // What is left of `max_tx_duration_s` for the continuous keyed
+        // interval this job joins. A job queued behind an active one gets
+        // only the remainder, so its watchdog fires no later than the active
+        // job's would have.
+        let max_tx = std::time::Duration::from_secs(self.config.radio.max_tx_duration_s)
+            .saturating_sub(keyed_since.elapsed());
         // Whenever an output worker is wired, completion comes only from its
         // feedback -- even if its end of the ring is gone, so a failed or
         // dead output cancels the transmission instead of reporting success.
@@ -1703,8 +1717,8 @@ impl EventLoop {
                     if nominal > max_tx {
                         tracing::warn!(
                             tx_duration_ms = nominal.as_millis() as u64,
-                            max_tx_ms = max_tx.as_millis() as u64,
-                            "TX duration exceeds max; capping PTT release delay"
+                            remaining_max_tx_ms = max_tx.as_millis() as u64,
+                            "TX duration exceeds what is left of max TX; capping PTT release delay"
                         );
                     }
                     tokio::time::sleep(capped).await;
@@ -2867,6 +2881,7 @@ impl EventLoop {
             self.is_transmitting = true;
         } else {
             self.is_transmitting = false;
+            self.tx_keyed_since = None;
             // PTT just released: continue draining the TX queue if more is queued.
             self.try_drain_tx_queue().await;
         }
@@ -5872,6 +5887,38 @@ mod tests {
             .await;
         assert!(!rig.event_loop.is_transmitting);
         assert_eq!(rig.event_loop.tx_output().pending_len(), 0);
+    }
+
+    /// A transmission queued behind an active one cannot restart the
+    /// watchdog: `max_tx_duration_s` bounds the continuous keyed interval
+    /// from the first key-up, so the newest job is cancelled (and PTT
+    /// released) when that interval runs out, not `max_tx` after it queued.
+    #[tokio::test(start_paused = true)]
+    async fn queued_transmission_cannot_extend_the_watchdog() {
+        let mut config = DaemonConfig::default();
+        config.radio.max_tx_duration_s = 2;
+        let mut rig = TxRig::new(config);
+        let keyed = tokio::time::Instant::now();
+        rig.event_loop
+            .transmit_samples(&[0.5f32; 48_000 * 10])
+            .await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        rig.event_loop.transmit_samples(&[0.5f32; 48_000]).await;
+        loop {
+            let (generation, completed) = rig.next_completion().await;
+            if generation == 2 {
+                assert!(!completed, "the watchdog aborts, it does not complete");
+                break;
+            }
+        }
+        assert!(
+            keyed.elapsed() < Duration::from_millis(2500),
+            "forced unkey after {:?}, past the 2 s keyed-interval bound",
+            keyed.elapsed()
+        );
+        rig.event_loop.handle_tx_complete(2, false).await;
+        assert!(!rig.event_loop.is_transmitting);
+        assert_eq!(rig.event_loop.tx_keyed_since, None);
     }
 
     /// No downstream progress for five seconds fails the transmission.

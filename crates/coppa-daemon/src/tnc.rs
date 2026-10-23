@@ -19,6 +19,12 @@ use crate::audio_output::{
 /// PTT tail held after a TNC frame's last sample has played.
 const TNC_TAIL: Duration = Duration::from_millis(50);
 
+/// Modulated frames held behind the active one. `run_tnc` stops receiving
+/// KISS frames while this backlog is full, so a client sending faster than
+/// 1200 baud is backpressured by the KISS server's bounded channel instead
+/// of growing this queue without limit.
+const MAX_QUEUED_FRAMES: usize = 1;
+
 /// Where the active TNC transmission is.
 #[derive(Debug)]
 enum TncPhase {
@@ -31,10 +37,12 @@ enum TncPhase {
 }
 
 /// TNC transmit state: one keyed frame at a time, later frames queued
-/// behind it, every sample retained until the audio-out ring accepts it, and
-/// PTT released only after the frame's last sample is predicted to have
-/// played plus the 50 ms tail. Advanced from `run_tnc`'s select loop so
-/// receive forwarding and shutdown stay serviceable while TX is backpressured.
+/// behind it (`run_tnc` queues at most `MAX_QUEUED_FRAMES`, by receiving
+/// only while [`has_room`](Self::has_room)), every sample retained
+/// until the audio-out ring accepts it, and PTT released only after the
+/// frame's last sample is predicted to have played plus the 50 ms tail.
+/// Advanced from `run_tnc`'s select loop so receive forwarding and shutdown
+/// stay serviceable while TX is backpressured.
 pub struct TncTx {
     frames: VecDeque<Vec<f32>>,
     pending: PendingOutput,
@@ -56,11 +64,17 @@ impl TncTx {
         }
     }
 
-    /// Queue a modulated frame for transmission.
+    /// Queue a modulated frame for transmission. Callers check
+    /// [`has_room`](Self::has_room) first; `submit` itself does not drop.
     pub fn submit(&mut self, samples: Vec<f32>) {
         if !samples.is_empty() {
             self.frames.push_back(samples);
         }
+    }
+
+    /// True while another frame may be queued behind the active one.
+    pub fn has_room(&self) -> bool {
+        self.frames.len() < MAX_QUEUED_FRAMES
     }
 
     /// True while a frame is keyed or queued.
@@ -374,7 +388,9 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
 
             // TX path: KISS client sent a frame → modulate and queue it;
             // `tnc_tx` keys PTT, paces it out and unkeys after it played.
-            Some(ax25_data) = tx_receiver.recv() => {
+            // Not polled while the backlog is full, so later frames wait in
+            // the KISS server's bounded channel.
+            Some(ax25_data) = tx_receiver.recv(), if tnc_tx.has_room() => {
                 tnc_tx.submit(coppa_codec::afsk::modulate(&ax25_data));
                 tnc_tx.poll(Instant::now(), &mut audio_out_prod, ptt.as_mut());
             }
@@ -543,6 +559,36 @@ mod tests {
             *h.ptt.0.lock().unwrap(),
             vec![PttState::Tx, PttState::Rx, PttState::Tx, PttState::Rx]
         );
+    }
+
+    /// `run_tnc`'s TX arm (submit, then poll) is only polled while
+    /// `has_room`, so the TNC holds at most one modulated frame behind the
+    /// active one; a faster KISS client waits in the server's bounded
+    /// channel instead of growing the queue.
+    #[test]
+    fn backlog_behind_the_active_frame_is_bounded() {
+        let mut h = Harness::new();
+        let mut accepted = 0;
+        for _ in 0..10 {
+            if !h.tx.has_room() {
+                break;
+            }
+            h.tx.submit(frame(0x00));
+            h.tx.poll(h.now, &mut h.out, &mut h.ptt);
+            accepted += 1;
+        }
+        assert_eq!(accepted, 1 + MAX_QUEUED_FRAMES);
+        assert_eq!(h.tx.frames.len(), MAX_QUEUED_FRAMES);
+        // Once the active frame has played, the queued one is promoted and
+        // the TNC accepts again.
+        let mut ticks = 0;
+        while !h.tx.has_room() {
+            h.tick(4096);
+            ticks += 1;
+            assert!(ticks < 200_000, "queued frame never promoted");
+        }
+        assert!(h.tx.frames.is_empty());
+        assert!(h.tx.is_busy(), "the queued frame is now the active one");
     }
 
     /// A stalled output cancels the frame, releases PTT and discards the
