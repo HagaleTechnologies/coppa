@@ -16,8 +16,12 @@
 //! ## Profile coverage
 //!
 //! `CoppaCore`'s profile selection (`select_ofdm_profile` in
-//! `coppa-engine/src/engine.rs`) only depends on whether the resolved
-//! `EngineConfig::speed_level` is `>= 5` (vhf_wide) or not (hf_standard) --
+//! `coppa-engine/src/engine.rs`) depends on the resolved
+//! `EngineConfig::ofdm_band` (COP-23): a named profile pins its band
+//! (`--profile VHF_FAST` => vhf_wide at every level, any HF profile =>
+//! hf_standard at every level), and only the no-flag
+//! `EngineConfig::default()` (`OfdmBand::LevelDerived`) falls back to the
+//! level-only rule, `speed_level >= 5` (vhf_wide) or not (hf_standard) --
 //! unlike the golden-vector generator's own `profile_for` rule (mirrored in
 //! `crates/coppa-protocol/tests/golden_vectors.rs`), which additionally
 //! forces `hf_standard` for the `poor25`/`ssbcfo` channel conditions
