@@ -55,8 +55,11 @@ coppa loopback "Hello from Coppa"
 # Encode a message to a WAV file
 coppa tx "CQ CQ CQ DE VK2ABC K" -o cq.wav
 
-# Decode a WAV file
+# Decode a WAV file (prints the message text)
 coppa rx -i cq.wav
+
+# Show the decoded payload as hex bytes instead (--raw: hex only, for scripts)
+coppa rx -i cq.wav --hex
 
 # List audio devices (requires cpal-backend feature)
 coppa devices

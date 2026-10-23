@@ -1,4 +1,4 @@
-//! Profile constructors used by the level-9 geometry/CP diagnostic.
+//! Profile constructors used by the level-8 geometry/CP diagnostic.
 
 use coppa_codec::ofdm::CoppaProfile;
 
@@ -10,7 +10,7 @@ pub fn vhf_wide_long_cp() -> CoppaProfile {
     }
 }
 
-/// The five profile arms used by the level-9 A/B measurement.
+/// The five profile arms used by the level-8 A/B measurement.
 pub fn profile_arms() -> impl Iterator<Item = (&'static str, CoppaProfile)> {
     [
         ("vhf_wide", CoppaProfile::vhf_wide()),
@@ -50,12 +50,12 @@ mod tests {
     }
 
     #[test]
-    fn level_9_information_content_is_profile_independent() {
+    fn level_8_information_content_is_profile_independent() {
         use coppa_protocol::modem::speed_levels::{k_used_for_level, max_payload_for_level};
-        assert_eq!(k_used_for_level(9), Some(1296));
-        assert_eq!(max_payload_for_level(9), Some(158));
+        assert_eq!(k_used_for_level(8), Some(1296));
+        assert_eq!(max_payload_for_level(8), Some(158));
         for profile in profile_arms().map(|(_, profile)| profile) {
-            assert_eq!(coded_bits_for(9, &profile), 1944);
+            assert_eq!(coded_bits_for(8, &profile), 1944);
         }
     }
 

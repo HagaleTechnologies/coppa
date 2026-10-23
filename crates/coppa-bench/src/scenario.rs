@@ -28,7 +28,7 @@ impl ModeInfo {
     }
 }
 
-/// The measurable speed levels (level 8 is reserved/32-QAM and excluded).
+/// The nine measurable speed levels (1-9).
 pub const MODES: &[ModeInfo] = &[
     ModeInfo {
         level: 1,
@@ -66,13 +66,13 @@ pub const MODES: &[ModeInfo] = &[
         info_bits: 1458,
     },
     ModeInfo {
-        level: 9,
+        level: 8,
         name: "64QAM 2/3",
         info_bits: 1296,
     },
     ModeInfo {
-        level: 10,
-        // Task 4 (NR BG2 mother code) moved level 10's rate from 7/8 to 5/6
+        level: 9,
+        // Task 4 (NR BG2 mother code) moved the top level's rate from 7/8 to 5/6
         // (wire-format break -- see CLAUDE.md's Known Limitations and
         // docs/adr/005-nr-bg2-ldpc.md). k_used = 1620, not the pre-Task-4
         // 1701.
@@ -159,15 +159,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn level_8_is_excluded() {
-        assert!(mode_for_level(8).is_none());
+    fn contiguous_ladder_excludes_level_10() {
+        assert!(mode_for_level(8).is_some());
+        assert!(mode_for_level(10).is_none());
     }
 
     #[test]
     fn payload_bytes_match_info_bits_minus_crc_trailer() {
         // info_bits/8 - 4 (CRC-32 trailer, Phase 3 Task 1): 972/8=121-4=117; 1620/8=202-4=198.
         assert_eq!(mode_for_level(2).unwrap().payload_bytes(), 117);
-        assert_eq!(mode_for_level(10).unwrap().payload_bytes(), 198);
+        assert_eq!(mode_for_level(9).unwrap().payload_bytes(), 198);
     }
 
     #[test]

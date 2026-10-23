@@ -310,11 +310,7 @@ impl EventLoop {
         // current_level())`, even with probing disabled. `levels`/`raise_dwell`
         // still match `default_coppa()`'s own choices -- only the initial
         // level differs.
-        let rate_loop = RateLoop::new(
-            coppa_ml::VALID_SPEED_LEVELS.to_vec(),
-            5,
-            engine.speed_level(),
-        );
+        let rate_loop = RateLoop::new(engine.available_speed_levels(), 5, engine.speed_level());
         let rate_loop = if config.engine.rate_loop_probe_interval > 0 {
             rate_loop.with_probing(
                 config.engine.rate_loop_probe_interval,
@@ -2519,28 +2515,33 @@ impl EventLoop {
     ///    After `set_speed_level` stopped rewriting `cp_mode` no production path can
     ///    diverge these (every `set_cp_profile` caller passes the mode the
     ///    negotiator just moved to), so this is future-regression cost only.
-    /// 2. **Profile desync at VHF** -- `speed_level() >= 5 &&
-    ///    cp_negotiator.current() != LongCp`. This one is REACHABLE TODAY, and
-    ///    condition 1 is structurally blind to it. COP-2 redefined `cp_mode()` to
-    ///    report the retained, *dormant* negotiated mode above level 5 (see
+    /// 2. **Profile desync at VHF** -- `engine.on_vhf_profile() &&
+    ///    cp_negotiator.current() != LongCp`. Condition 1 is structurally blind to
+    ///    it. COP-2 redefined `cp_mode()` to report the retained, *dormant*
+    ///    negotiated mode while the engine is on the VHF profile (see
     ///    `CoppaCore::cp_mode`'s doc) while `select_ofdm_profile` builds `vhf_wide`
     ///    regardless -- so a station that climbed to VHF with `ShortCp` negotiated
     ///    is on air as `vhf_wide` while its peer listens on
     ///    `hf_standard_short_cp`, mutually undecodable, and condition 1 reads
-    ///    perfectly consistent. That HF/VHF profile desync is the residual gap this
-    ///    branch documents as still open
-    ///    (`crates/coppa-engine/src/config.rs:44-46`); the canary would have been a
-    ///    detector that could not see the only desync still live in the field.
+    ///    perfectly consistent. COP-23 made this unreachable for HF-configured
+    ///    engines (every named HF profile, the daemon's default included): their
+    ///    band is pinned, so a `RateLoop` climb past level 5 stays on an HF profile
+    ///    and the negotiated mode stays on air. It is still reachable for engines
+    ///    that genuinely resolve to VHF -- the `OfdmBand::LevelDerived` fallback
+    ///    `EventLoop::new` builds for an unrecognized `[engine] profile`, once it
+    ///    climbs past level 5, and `VHF_FAST`-configured stations -- which is why
+    ///    the check reads the engine's resolved band (`on_vhf_profile()`) rather than
+    ///    the raw speed level: the level alone would false-fire on every healthy
+    ///    HF-configured link above level 5.
     ///
     /// # Condition 2's known false-positive, and why it stays as-is
     ///
-    /// Review finding (COP-2): if the PEER *also* independently climbs to level 5
-    /// or above with `ShortCp` negotiated, its engine builds `vhf_wide` too --
+    /// Review finding (COP-2): if the PEER is *also* on the VHF profile with
+    /// `ShortCp` negotiated, its engine builds `vhf_wide` too --
     /// both waveforms match, nothing is actually desynced, yet this station still
-    /// flags itself because the check is entirely local: `speed_level()` here is
-    /// this station's own RateLoop-driven estimate of ITS receive conditions, and
-    /// this daemon has no channel carrying the peer's speed level or on-air
-    /// profile. Distinguishing "peer independently reached VHF too" from "peer is
+    /// flags itself because the check is entirely local: `on_vhf_profile()` here
+    /// reflects this station's own band and RateLoop-driven speed level, and this
+    /// daemon has no channel carrying the peer's speed level or on-air profile. Distinguishing "peer independently reached VHF too" from "peer is
     /// still on HF and can no longer decode me" needs peer-profile telemetry that
     /// does not exist on the wire today -- adding it is a protocol change, not a
     /// canary fix, and out of COP-2's scope.
@@ -2572,9 +2573,11 @@ impl EventLoop {
         let engine_cp_mode = self.engine.cp_mode();
         let negotiator_cp_mode = self.cp_negotiator.current();
         let speed_level = self.engine.speed_level();
-        // Below level 5 `cp_mode()` is the profile on air; at or above it,
-        // `select_ofdm_profile` ignores the mode and builds `vhf_wide`.
-        let cp_mode_in_effect = speed_level < 5;
+        // On an HF profile `cp_mode()` is the profile on air; on the VHF one,
+        // `select_ofdm_profile` ignores the mode and builds `vhf_wide`. Which
+        // profile is selected depends on the engine's band, not the level alone
+        // (COP-23: an HF-configured engine stays on HF above level 5).
+        let cp_mode_in_effect = !self.engine.on_vhf_profile();
 
         let bookkeeping_desync = engine_cp_mode != negotiator_cp_mode;
         let vhf_profile_desync = !cp_mode_in_effect && negotiator_cp_mode != CpMode::LongCp;
@@ -2598,7 +2601,7 @@ impl EventLoop {
                  episode, not repaired -- see check_cp_desync"
             };
             tracing::warn!(
-                // Named `engine_cp_mode`, but above level 5 it is the DORMANT
+                // Named `engine_cp_mode`, but on the VHF profile it is the DORMANT
                 // negotiated mode, not the live waveform -- hence `cp_mode_in_effect`
                 // beside it, so a log reader cannot mistake the two.
                 ?engine_cp_mode,
@@ -2897,6 +2900,19 @@ impl EventLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_loop_caps_peer_recommendations_at_the_engine_band_limit() {
+        for (profile, maximum) in [("HF_STANDARD", 8), ("VHF_FAST", 9)] {
+            let mut config = DaemonConfig::default();
+            config.engine.profile = profile.to_string();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            for _ in 0..60 {
+                event_loop.rate_loop.on_ack(9, true);
+            }
+            assert_eq!(event_loop.rate_loop.current_level(), maximum, "{profile}");
+        }
+    }
 
     // ── Task 2 (Phase 4): explicit PTT config, no silent NullPtt ─────────
 
@@ -3800,18 +3816,24 @@ mod tests {
         assert!(a.cp_desync_warned);
     }
 
-    /// The level-aware clause, and the reason it is not redundant with the
+    /// The band-aware clause, and the reason it is not redundant with the
     /// bookkeeping comparison: here engine and negotiator AGREE (both `ShortCp`),
     /// so `engine.cp_mode() != cp_negotiator.current()` is false — yet the station
     /// is on air as `vhf_wide` while its peer listens on `hf_standard_short_cp`.
     ///
-    /// This is the HF/VHF profile desync the branch documents as still open, and it
-    /// is the one CP-profile desync still REACHABLE in the field. A canary that
-    /// checked only the bookkeeping pair would have been a detector blind to the
-    /// only live failure.
+    /// COP-23 closed this for every engine built from a named profile (an
+    /// HF-configured engine no longer leaves HF at level 5 -- see
+    /// `the_cp_desync_canary_does_not_fire_when_an_hf_configured_engine_climbs_past_level_5`),
+    /// so the premise needs an engine with no band preference: `CoppaCore::new()`
+    /// is `OfdmBand::LevelDerived`, the daemon's own fallback for an unrecognized
+    /// `[engine] profile`, and still crosses to `vhf_wide` at level 5. A canary that
+    /// checked only the bookkeeping pair would be blind to it.
     #[tokio::test]
     async fn the_cp_desync_canary_sees_a_vhf_profile_desync_that_bookkeeping_cannot() {
         let mut a = EventLoop::new(cp_enabled_config()).unwrap();
+        // A LevelDerived engine (no band preference), so level 5 is genuinely
+        // `vhf_wide` on air.
+        a.engine = coppa_engine::CoppaCore::new();
         let t0 = Instant::now();
 
         desync_negotiator_only(&mut a, CpMode::ShortCp, t0);
@@ -3826,7 +3848,11 @@ mod tests {
             "test premise: bookkeeping AGREES here, so only the level-aware clause \
              can detect this"
         );
-        assert_eq!(a.engine.speed_level(), 5, "test premise: at VHF");
+        assert_eq!(a.engine.speed_level(), 5, "test premise: at level 5");
+        assert!(
+            a.engine.on_vhf_profile(),
+            "test premise: genuinely on vhf_wide"
+        );
 
         a.drive_cp_negotiation(t0);
 
@@ -3847,6 +3873,38 @@ mod tests {
             "back below level 5 the negotiated mode is in effect again"
         );
         assert_eq!(a.cp_desync_episodes, 1);
+    }
+
+    /// COP-23's inverse pin: the exact setup the VHF-profile test above used to
+    /// run on (an HF-configured `cp_enabled_config()` engine, `ShortCp`
+    /// negotiated, level 5) is now a HEALTHY link -- the engine stays on
+    /// `hf_standard_short_cp`, the negotiated mode is on air, and nothing is
+    /// desynced. A canary still keyed on `speed_level < 5` would false-fire here.
+    #[tokio::test]
+    async fn the_cp_desync_canary_does_not_fire_when_an_hf_configured_engine_climbs_past_level_5() {
+        let mut a = EventLoop::new(cp_enabled_config()).unwrap();
+        let t0 = Instant::now();
+
+        desync_negotiator_only(&mut a, CpMode::ShortCp, t0);
+        a.engine.set_cp_profile(CpMode::ShortCp);
+        a.engine
+            .set_speed_level(5)
+            .expect("5 is a valid wire speed level");
+
+        assert_eq!(a.engine.speed_level(), 5, "test premise: at level 5");
+        assert!(
+            !a.engine.on_vhf_profile(),
+            "test premise: an HF-configured engine stays on an HF profile"
+        );
+
+        a.drive_cp_negotiation(t0);
+
+        assert_eq!(
+            a.cp_desync_episodes, 0,
+            "an HF-configured engine at level 5 is still on hf_standard_short_cp, \
+             matching its peer -- the canary must not flag it"
+        );
+        assert!(!a.cp_desync_warned);
     }
 
     /// Review finding (COP-2): the WebSocket snapshot's `cp_desync_episodes` used
@@ -3927,7 +3985,7 @@ mod tests {
     /// green, confirming COP-1's own convergence paths already satisfy this invariant
     /// and that COP-2 is not papering over a second, pre-existing violation.) If a
     /// genuinely additional assertion is ever wanted there, the reachable one is
-    /// `!(engine.speed_level() >= 5 && cp_negotiator.current() != CpMode::LongCp)` --
+    /// `!(engine.on_vhf_profile() && cp_negotiator.current() != CpMode::LongCp)` --
     /// "on air as `vhf_wide` while the peer believes short-CP HF" -- which is a
     /// different, real condition; add it on its own merits or not at all.
     fn assert_engine_matches_negotiator(station: &EventLoop, whose: &str) {
@@ -4943,6 +5001,13 @@ mod tests {
     // sends `Propose`) -- see `cp_negotiator`'s module doc for why plain
     // English and the code's own labels collide here. Nothing makes a station
     // intrinsically an A or a B, and `RateLoop` runs identically on both.
+    //
+    // COP-23 note: these three tests keep their "VHF excursion" names, but
+    // `cp_pair()` builds HF_STANDARD-configured engines, whose band is pinned to
+    // HF -- so "VHF" below means "speed level >= 5", not the `vhf_wide` profile.
+    // Neither station leaves `hf_standard_short_cp` any more, and the negotiated
+    // mode stays on air throughout rather than going dormant; every assertion
+    // (level, `cp_mode`, decodability) holds a fortiori.
 
     #[tokio::test]
     async fn a_rate_loop_vhf_excursion_does_not_desync_a_negotiated_short_cp() {
@@ -4962,7 +5027,7 @@ mod tests {
         // seeds a non-default starting level. `raise_dwell = 5` is
         // `RateLoop::default_coppa`'s own swept value, so five consecutive
         // higher recommendations is exactly what a real climb costs.
-        a.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 4);
+        a.rate_loop = RateLoop::new(a.engine.available_speed_levels(), 5, 4);
 
         // Five real ACKs, encoded under `hf_standard_short_cp` -- `a`'s REAL
         // post-negotiation profile, which is the whole point of driving this
@@ -4979,7 +5044,7 @@ mod tests {
         // `incoming_ack_with_rate_updates_rate_loop_and_encoder` already
         // relies on. The `Ack` arm itself transmits nothing.
         for _ in 0..5 {
-            let ack = TransportPdu::new_ack_with_rate(a.arq_session_id, 0, 0, 10);
+            let ack = TransportPdu::new_ack_with_rate(a.arq_session_id, 0, 0, 9);
             unstick_decoder(&mut a);
             a.decode_and_dispatch_audio(&peer_frame(
                 &ack,
@@ -5002,7 +5067,7 @@ mod tests {
         assert_eq!(
             a.engine.cp_mode(),
             CpMode::ShortCp,
-            "the negotiated CP mode must be RETAINED (dormant) across the VHF \
+            "the negotiated CP mode must be RETAINED across the level-5 \
              excursion, not discarded -- the peer still believes it is in force"
         );
 
@@ -5062,7 +5127,7 @@ mod tests {
         // level 4 immediately afterwards. No ARQ timeout and no VHF dwell at
         // all -- pre-fix, `hf_standard_short_cp` was already lost by the time
         // the revert landed on `hf_standard`.
-        b.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 4).with_probing(1, 1);
+        b.rate_loop = RateLoop::new(b.engine.available_speed_levels(), 5, 4).with_probing(1, 1);
 
         // A REAL ARQ window holding the seq the queued frame names, rather than a
         // bare `Some(0)` with no segment behind it. That is what makes the
@@ -5128,7 +5193,7 @@ mod tests {
             b.arq_session_id,
             probe_seq.wrapping_add(1), // cumulative: "next expected"
             0,
-            10,
+            9,
         );
         unstick_decoder(&mut b);
         b.decode_and_dispatch_audio(&peer_frame(
@@ -5242,9 +5307,9 @@ mod tests {
         // Climb across the boundary through the real ACK path, exactly as
         // `a_rate_loop_vhf_excursion_does_not_desync_a_negotiated_short_cp` does —
         // ACKs encoded under `hf_standard_short_cp`, `b`'s real current profile.
-        b.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 4);
+        b.rate_loop = RateLoop::new(b.engine.available_speed_levels(), 5, 4);
         for _ in 0..5 {
-            let ack = TransportPdu::new_ack_with_rate(b.arq_session_id, 0, 0, 10);
+            let ack = TransportPdu::new_ack_with_rate(b.arq_session_id, 0, 0, 9);
             unstick_decoder(&mut b);
             b.decode_and_dispatch_audio(&peer_frame(
                 &ack,
@@ -5458,7 +5523,7 @@ mod tests {
         let mut event_loop = EventLoop::new(config).unwrap();
         event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
         event_loop.rate_loop =
-            RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 1).with_probing(1, 1);
+            RateLoop::new(event_loop.engine.available_speed_levels(), 5, 1).with_probing(1, 1);
 
         let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
         event_loop.set_audio_out(producer);
@@ -5497,7 +5562,7 @@ mod tests {
         // is only 158 -- a real dip in `max_payload_for_level`. A payload in
         // between fits at the current level but not at the probe level.
         event_loop.rate_loop =
-            RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 4).with_probing(1, 1);
+            RateLoop::new(event_loop.engine.available_speed_levels(), 5, 4).with_probing(1, 1);
 
         let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
         event_loop.set_audio_out(producer);
@@ -5518,7 +5583,7 @@ mod tests {
         let config = DaemonConfig::default(); // arq_enabled = false by default
         let mut event_loop = EventLoop::new(config).unwrap();
         event_loop.rate_loop =
-            RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 1).with_probing(1, 1);
+            RateLoop::new(event_loop.engine.available_speed_levels(), 5, 1).with_probing(1, 1);
 
         let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
         event_loop.set_audio_out(producer);
@@ -6390,7 +6455,7 @@ mod tests {
         let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
         let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
         for _ in 0..5 {
-            let ack_pdu = TransportPdu::new_ack_with_rate(0, 0, 0, 10);
+            let ack_pdu = TransportPdu::new_ack_with_rate(0, 0, 0, 9);
             let header = coppa_codec::ofdm::frame::CoppaHeader {
                 version: 1,
                 phy_mode: 0,
@@ -6431,7 +6496,7 @@ mod tests {
             .send(b"probed segment".to_vec(), Instant::now())
             .expect("a fresh ARQ window should have room");
         event_loop.arq_tx = Some(arq_tx);
-        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 1);
+        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 1);
         event_loop.probe_state = Some((seq, 6)); // pretend we probed up to level 6
 
         // One ACK event that BOTH cumulatively acks `seq` (resolving the probe)
@@ -6577,7 +6642,7 @@ mod tests {
             .expect("a fresh ARQ window should have room");
         event_loop.arq_tx = Some(arq_tx);
         event_loop.arq_rx = Some(ArqRx::new(8));
-        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 1);
+        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 1);
         event_loop.probe_state = Some((seq, 6)); // pretend we probed up to level 6
 
         let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
@@ -6643,7 +6708,7 @@ mod tests {
         config.engine.arq_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
 
-        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 5);
+        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 5);
         assert_eq!(event_loop.rate_loop.current_level(), 5);
 
         // Two segments, both already past a short RTO by the time
@@ -6678,7 +6743,7 @@ mod tests {
         config.engine.arq_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
 
-        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 5);
+        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 5);
         assert_eq!(event_loop.rate_loop.current_level(), 5);
 
         let arq_config = ArqConfig::new(8, 5, Duration::from_millis(20))
@@ -6689,7 +6754,7 @@ mod tests {
             .send(b"probed segment".to_vec(), send_time)
             .expect("a fresh ARQ window should have room");
         event_loop.arq_tx = Some(arq_tx);
-        event_loop.probe_state = Some((seq, 9)); // pretend we probed up to level 9
+        event_loop.probe_state = Some((seq, 8)); // pretend we probed up to the HF ceiling
 
         event_loop.check_arq_retransmits().await;
 
@@ -6712,7 +6777,7 @@ mod tests {
         config.engine.arq_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
 
-        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 5);
+        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 5);
         assert_eq!(event_loop.rate_loop.current_level(), 5);
 
         let arq_config = ArqConfig::new(8, 5, Duration::from_millis(20))
@@ -6726,7 +6791,7 @@ mod tests {
             .send(b"ordinary segment".to_vec(), send_time)
             .expect("a fresh ARQ window should have room for a second segment");
         event_loop.arq_tx = Some(arq_tx);
-        event_loop.probe_state = Some((probe_seq, 9));
+        event_loop.probe_state = Some((probe_seq, 8));
 
         event_loop.check_arq_retransmits().await;
 

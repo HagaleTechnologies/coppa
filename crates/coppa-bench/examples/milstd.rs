@@ -106,11 +106,11 @@ const LEVEL_MAPPINGS: &[LevelMapping] = &[
         rate_class_bps: 2400,
     },
     LevelMapping {
-        level: 9,
+        level: 8,
         rate_class_bps: 4800,
     },
     LevelMapping {
-        level: 10,
+        level: 9,
         rate_class_bps: 9600,
     },
 ];

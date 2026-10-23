@@ -71,9 +71,13 @@ enum Commands {
         /// Operational profile name.
         #[arg(long)]
         profile: Option<String>,
-        /// Print only the decoded payload (lowercase hex) with no labels.
+        /// Print only the decoded payload as lowercase hex, one line per frame,
+        /// with no labels (always hex, even for text).
         #[arg(long)]
         raw: bool,
+        /// Show the payload as lowercase hex even when it is valid UTF-8 text.
+        #[arg(long)]
+        hex: bool,
         /// Audio input device name (substring match, live capture only).
         #[arg(long)]
         device: Option<String>,
@@ -220,11 +224,13 @@ fn main() -> Result<()> {
             input,
             profile,
             raw,
+            hex,
             device,
         }) => cmd_rx(
             input.as_deref(),
             profile.as_deref(),
             raw,
+            hex,
             device.as_deref(),
             verbosity,
         )?,
@@ -663,12 +669,14 @@ fn cmd_tune(
 ///
 /// Unlike the old one-shot `core.decode(&samples)` batch call this replaces,
 /// `push_samples` never forces a UTF-8 conversion (Phase 4 Task 3.5) -- frame
-/// payloads are raw bytes, printed here as lowercase hex (see
-/// `print_stream_frame`'s doc for why hex, not text).
+/// payloads are raw bytes. Display valid UTF-8 as escaped, quoted text, and
+/// fall back to labeled hex otherwise. `--hex` forces hex; `--raw` prints
+/// only lowercase hex, one line per frame.
 fn cmd_rx(
     input: Option<&str>,
     profile: Option<&str>,
     raw: bool,
+    hex: bool,
     device: Option<&str>,
     verbosity: Verbosity,
 ) -> Result<()> {
@@ -689,7 +697,7 @@ fn cmd_rx(
                 println!("Reading {} samples from {}", total, path);
             }
             source.start()?;
-            stream_decode(&mut core, &mut source, Some(total), raw, verbosity)?;
+            stream_decode(&mut core, &mut source, Some(total), raw, hex, verbosity)?;
             source.stop()?;
         }
         #[cfg(not(feature = "file-backend"))]
@@ -727,7 +735,7 @@ fn cmd_rx(
             if verbosity != Verbosity::Quiet && !raw {
                 println!("Listening for live audio (Ctrl+C to stop)...");
             }
-            stream_decode(&mut core, &mut source, None, raw, verbosity)?;
+            stream_decode(&mut core, &mut source, None, raw, hex, verbosity)?;
             source.stop()?;
         }
         #[cfg(not(feature = "cpal-backend"))]
@@ -779,6 +787,7 @@ fn stream_decode(
     source: &mut dyn coppa_audio::AudioSource,
     total_samples: Option<usize>,
     raw: bool,
+    hex: bool,
     verbosity: Verbosity,
 ) -> Result<()> {
     let mut buf = vec![0.0f32; 4096];
@@ -788,7 +797,7 @@ fn stream_decode(
         if n > 0 {
             consumed += n;
             for frame in core.push_samples(&buf[..n]) {
-                print_stream_frame(&frame, raw, verbosity);
+                print_stream_frame(&frame, raw, hex, verbosity);
             }
         }
         match total_samples {
@@ -807,29 +816,51 @@ fn stream_decode(
     if total_samples.is_some() {
         let silence = vec![0.0f32; TRAILING_FLUSH_SAMPLES];
         for frame in core.push_samples(&silence) {
-            print_stream_frame(&frame, raw, verbosity);
+            print_stream_frame(&frame, raw, hex, verbosity);
         }
     }
 
     Ok(())
 }
 
+fn hex_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn format_decoded(bytes: &[u8], snr_db: f32, hex: bool) -> String {
+    if !hex {
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            // Debug formatting escapes controls in untrusted received text.
+            return format!("Decoded: {:?}  (SNR: {:.1} dB)", text, snr_db);
+        }
+    }
+    format!(
+        "Decoded (hex): {}  (SNR: {:.1} dB)",
+        hex_string(bytes),
+        snr_db
+    )
+}
+
 /// Print one decoded `StreamFrame` (`CoppaCore::push_samples`'s per-frame
 /// result). Payloads are raw bytes -- never UTF-8-forced, see
-/// `coppa_engine::StreamFrame::payload`'s doc -- so printed as lowercase hex,
-/// directly comparable to `testdata/golden/manifest.toml`'s `payload_hex`
-/// field. `raw` mirrors the flag's existing meaning ("print only the decoded
-/// content with no labels"): just the hex string, one per line, on stdout.
+/// `coppa_engine::StreamFrame::payload`'s doc. Valid UTF-8 is printed as
+/// escaped, quoted text; other payloads fall back to labeled lowercase hex.
+/// `hex` forces labeled hex. `raw` prints only the lowercase hex string,
+/// one per line, on stdout, even when `hex` is also set.
 /// Decode failures are reported on stderr (never stdout, so they never
 /// corrupt a `--raw` capture), suppressed entirely in `Verbosity::Quiet`.
-fn print_stream_frame(frame: &coppa_engine::StreamFrame, raw: bool, verbosity: Verbosity) {
+fn print_stream_frame(
+    frame: &coppa_engine::StreamFrame,
+    raw: bool,
+    hex: bool,
+    verbosity: Verbosity,
+) {
     match &frame.payload {
         Ok(bytes) => {
-            let hex: String = bytes.iter().map(|b: &u8| format!("{:02x}", b)).collect();
             if raw {
-                println!("{}", hex);
+                println!("{}", hex_string(bytes));
             } else {
-                println!("Decoded: {}  (SNR: {:.1} dB)", hex, frame.snr_db);
+                println!("{}", format_decoded(bytes, frame.snr_db, hex));
             }
             if verbosity == Verbosity::Verbose {
                 eprintln!(
@@ -1065,6 +1096,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn format_decoded_text() {
+        assert_eq!(
+            format_decoded(b"CQ CQ CQ DE VK2ABC K", 25.7, false),
+            "Decoded: \"CQ CQ CQ DE VK2ABC K\"  (SNR: 25.7 dB)"
+        );
+    }
+
+    #[test]
+    fn format_decoded_binary() {
+        assert_eq!(
+            format_decoded(&[0xfe, 0x41], 25.7, false),
+            "Decoded (hex): fe41  (SNR: 25.7 dB)"
+        );
+    }
+
+    #[test]
+    fn format_decoded_forced_hex() {
+        assert_eq!(
+            format_decoded(b"CQ CQ CQ DE VK2ABC K", 25.7, true),
+            "Decoded (hex): 435120435120435120444520564b32414243204b  (SNR: 25.7 dB)"
+        );
+    }
+
+    #[test]
+    fn format_decoded_escapes_terminal_controls() {
+        let output = format_decoded(b"a\x1b[31m", 25.7, false);
+        assert_eq!(output, "Decoded: \"a\\u{1b}[31m\"  (SNR: 25.7 dB)");
+        assert!(!output.as_bytes().contains(&0x1b));
+    }
+
+    #[test]
+    fn format_decoded_unicode_and_empty_text() {
+        assert_eq!(
+            format_decoded("73 de Zoë ✓".as_bytes(), 25.7, false),
+            "Decoded: \"73 de Zoë ✓\"  (SNR: 25.7 dB)"
+        );
+        assert_eq!(
+            format_decoded(b"", 25.7, false),
+            "Decoded: \"\"  (SNR: 25.7 dB)"
+        );
+    }
+
+    #[test]
     fn test_loopback_roundtrip() {
         cmd_loopback("Hello", None, Verbosity::Normal).expect("loopback should succeed");
     }
@@ -1196,6 +1270,7 @@ mod tests {
             let result = cmd_rx(
                 Some("/tmp/coppa_nonexistent_12345.wav"),
                 None,
+                false,
                 false,
                 None,
                 Verbosity::Normal,
@@ -1681,7 +1756,7 @@ mod tests {
             )
             .expect("tx to file should succeed");
 
-            let result = cmd_rx(Some(path_str), None, true, None, Verbosity::Quiet);
+            let result = cmd_rx(Some(path_str), None, true, false, None, Verbosity::Quiet);
             std::fs::remove_file(&path).ok();
             result.expect("streaming rx of a freshly-encoded WAV should succeed");
         }

@@ -146,9 +146,9 @@ mod tests {
     }
 
     #[test]
-    fn level_9_wire_constants_are_pinned() {
-        assert_eq!(k_used_for_level(9), Some(1296));
-        assert_eq!(max_payload_for_level(9), Some(158));
+    fn level_8_wire_constants_are_pinned() {
+        assert_eq!(k_used_for_level(8), Some(1296));
+        assert_eq!(max_payload_for_level(8), Some(158));
         assert_eq!(NrLdpc::INFO_LEN, 1760);
         assert_eq!(NrLdpc::MOTHER_LEN, 8800);
     }

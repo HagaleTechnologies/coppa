@@ -283,7 +283,7 @@ pub struct StationIdPayload {
     /// beyond what [`Self::to_bytes`]/[`Self::from_bytes`] need (this is an
     /// operator-supplied free-text field).
     pub grid: Option<String>,
-    /// Speed level (1-10) this frame was encoded at.
+    /// Speed level (1-9) this frame was encoded at.
     pub level: u8,
 }
 

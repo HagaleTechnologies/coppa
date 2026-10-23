@@ -262,7 +262,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:c66c3b32f04ff399f02f156bb8185ecaf41c4f18c8c6b525784792aca9b5adaa",
+      "hash": "sha256:19423413380b0dde1dcd15ed0edfc6a3af50378a0b9cc6406a85e2ae98b89d77",
       "id": "coppa-engine",
       "kind": "subsystem",
       "links": [

@@ -3,6 +3,29 @@
 use crate::profiles::Profile;
 use coppa_protocol::cp_negotiator::CpMode;
 
+/// Highest speed level permitted on HF (COP-24).
+/// The 2700 Hz carrier is attenuated by 6.02 dB through the SSB filter;
+/// 64-QAM 5/6 cannot reliably decode there. See BENCHMARKS.md's COP-24 section.
+pub const HF_MAX_SPEED_LEVEL: u8 = 8;
+
+/// Which OFDM band an engine's waveform is bound to.
+///
+/// COP-23: before this existed, `CoppaCore::select_ofdm_profile` derived the band
+/// from the speed level alone on every rebuild, so an engine built from an HF
+/// [`Profile`] silently went on air as `vhf_wide` the moment `RateLoop` raised it
+/// to level 5 (and a VHF engine silently dropped to HF below level 5). A named
+/// profile now pins its band here, and every rebuild honors it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfdmBand {
+    /// Historical rule: levels 1-4 HF, >= 5 VHF. The `EngineConfig::default()`
+    /// value -- an engine with no operator band preference keeps today's behavior.
+    LevelDerived,
+    /// Stay on HF profiles at every speed level.
+    Hf,
+    /// Stay on VHF profiles at every speed level.
+    Vhf,
+}
+
 /// Runtime configuration for [`CoppaCore`](crate::CoppaCore).
 ///
 /// The `speed_level` selects the constellation and LDPC code rate used by
@@ -19,12 +42,15 @@ pub struct EngineConfig {
     /// Squelch threshold in dBFS. Signals below this level are rejected.
     /// Set to `f32::NEG_INFINITY` to disable squelch.
     pub squelch_threshold_db: f32,
-    /// The **negotiated** CP profile, which is in effect within the HF range
-    /// (levels 1-4) and merely *dormant* at VHF levels (>=5, where no short-CP
-    /// variant exists and `CoppaCore::select_ofdm_profile` ignores this field
-    /// entirely). Crossing into VHF does not modify it, and dropping back below
-    /// level 5 therefore restores the negotiated profile automatically --
-    /// suspended, not lost.
+    /// The **negotiated** CP profile, which is in effect whenever the engine is
+    /// on an HF profile and merely *dormant* while it is on the VHF one (where no
+    /// short-CP variant exists and `CoppaCore::select_ofdm_profile` ignores this
+    /// field entirely). Which of the two applies is decided by `ofdm_band`: an
+    /// `OfdmBand::Hf` engine keeps this mode in effect at every speed level, an
+    /// `OfdmBand::Vhf` engine never uses it, and an `OfdmBand::LevelDerived`
+    /// engine uses it below level 5 only. Crossing into VHF does not modify it,
+    /// and returning to an HF profile therefore restores the negotiated profile
+    /// automatically -- suspended, not lost.
     ///
     /// COP-2 changed this. `CoppaCore::set_speed_level` used to actively reset
     /// this field to `CpMode::LongCp` on crossing the threshold, permanently:
@@ -37,15 +63,23 @@ pub struct EngineConfig {
     /// recovery path. That reset was also redundant with
     /// `select_ofdm_profile`'s own VHF branch, so deleting it cost nothing.
     ///
-    /// Consequence worth knowing: at `speed_level >= 5` this field describes
-    /// the peer agreement, NOT the waveform on air. See
+    /// Consequence worth knowing: while `CoppaCore::on_vhf_profile()` is true this
+    /// field describes the peer agreement, NOT the waveform on air. See
     /// `CoppaCore::set_speed_level`/`CoppaCore::cp_mode`'s docs,
     /// `coppa_protocol::cp_negotiator`, and
     /// `docs/superpowers/specs/2026-07-29-cp-switch-peer-negotiation-design.md`.
     /// The HF<->VHF *profile* desync (a `RateLoop` climb across the boundary
-    /// puts this station on `vhf_wide` while the peer is still on an HF
-    /// profile) is a separate, still-open gap this does not close.
+    /// put this station on `vhf_wide` while the peer was still on an HF profile)
+    /// is closed by COP-23 for every engine whose `ofdm_band` is `Hf` or `Vhf`,
+    /// which includes every engine built from a named [`Profile`]. The residual
+    /// is `OfdmBand::LevelDerived` engines (no band preference), and the absence
+    /// of any RF-frequency gate: an operator who configures a VHF profile while
+    /// physically on HF is still unprotected (H-027/H-150).
     pub cp_mode: CpMode,
+    /// The OFDM band this engine's waveform is bound to (COP-23). A named
+    /// [`Profile`] pins it (`EngineConfig::from_profile`); the default,
+    /// `OfdmBand::LevelDerived`, keeps the historical level-only rule.
+    pub ofdm_band: OfdmBand,
 }
 
 impl Default for EngineConfig {
@@ -56,19 +90,29 @@ impl Default for EngineConfig {
             compression_enabled: false,
             squelch_threshold_db: f32::NEG_INFINITY,
             cp_mode: CpMode::LongCp,
+            ofdm_band: OfdmBand::LevelDerived,
         }
     }
 }
 
 impl EngineConfig {
     /// Create a config from a named profile.
+    ///
+    /// The profile's `ofdm_profile` ("hf" or "vhf") pins `ofdm_band`, so the band
+    /// survives every later speed-level change; anything other than "vhf" is HF,
+    /// matching `CoppaCore::from_profile`'s historical fallback.
     pub fn from_profile(profile: &Profile) -> Self {
+        let ofdm_band = match profile.ofdm_profile {
+            "vhf" => OfdmBand::Vhf,
+            _ => OfdmBand::Hf,
+        };
         Self {
             speed_level: profile.speed_level,
             sample_rate: profile.sample_rate,
             compression_enabled: profile.compression,
             squelch_threshold_db: f32::NEG_INFINITY,
             cp_mode: CpMode::LongCp,
+            ofdm_band,
         }
     }
 }
@@ -99,7 +143,7 @@ mod tests {
     fn test_from_profile_vhf() {
         use crate::profiles::VHF_FAST;
         let config = EngineConfig::from_profile(&VHF_FAST);
-        assert_eq!(config.speed_level, 9);
+        assert_eq!(config.speed_level, 8);
         assert!(config.compression_enabled);
     }
 
@@ -109,6 +153,32 @@ mod tests {
         let config = EngineConfig::from_profile(&HF_STANDARD);
         assert_eq!(config.speed_level, 2);
         assert!(config.compression_enabled);
+    }
+
+    #[test]
+    fn engine_config_from_profile_carries_the_band() {
+        use crate::profiles::{EMERGENCY, HF_ROBUST, HF_STANDARD, VHF_FAST};
+        assert_eq!(
+            EngineConfig::from_profile(&HF_ROBUST).ofdm_band,
+            OfdmBand::Hf
+        );
+        assert_eq!(
+            EngineConfig::from_profile(&HF_STANDARD).ofdm_band,
+            OfdmBand::Hf
+        );
+        assert_eq!(
+            EngineConfig::from_profile(&EMERGENCY).ofdm_band,
+            OfdmBand::Hf
+        );
+        assert_eq!(
+            EngineConfig::from_profile(&VHF_FAST).ofdm_band,
+            OfdmBand::Vhf
+        );
+        assert_eq!(
+            EngineConfig::default().ofdm_band,
+            OfdmBand::LevelDerived,
+            "an engine with no operator band preference keeps the level-only rule"
+        );
     }
 
     #[test]

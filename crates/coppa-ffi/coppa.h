@@ -56,12 +56,15 @@ typedef struct CoppaStreamHandle CoppaStreamHandle;
  *   to start from `EngineConfig::default()` instead. An unrecognized
  *   non-empty profile name is a config-rejection error (see
  *   [`coppa_engine_new_with`]'s return value).
- * - `speed_level`: wire speed-level override (1-10; 8 is reserved),
- *   applied after `profile` resolution. `0` means "use the resolved
- *   profile's/default speed_level" (0 is never itself a valid wire speed
- *   level, so it unambiguously means "unset" here too). A non-zero,
- *   invalid level (out of 1-10, or the reserved 8) is a config-rejection
- *   error.
+ * - `speed_level`: wire speed-level override (1-9), applied after `profile`
+ *   resolution. `0` means "use the resolved profile's/default speed_level".
+ *   A non-zero level outside 1-9, or level 9 on a handle whose profile is
+ *   HF (HF carries levels 1-8; level 9 is VHF-only), is a config-rejection
+ *   error. The override changes the level, never the profile's OFDM band:
+ *   an `"HF_ROBUST"` handle at `speed_level = 8` stays on an HF profile, and
+ *   so does any later [`coppa_engine_set_speed_level`] call on it (COP-23).
+ *   Only a handle built with no `profile` keeps the historical level-only
+ *   rule (HF below level 5, VHF from level 5).
  * - `callsign`: optional pointer to a null-terminated station-callsign
  *   string, for the FFI caller's own bookkeeping convenience only —
  *   `CoppaCore`/`EngineConfig` have no callsign concept at all (callsign
@@ -213,7 +216,7 @@ int32_t coppa_decode(struct coppa_engine_t *handle,
  * [`resolve_engine_config`] and [`CoppaConfig`]'s field docs): invalid
  * UTF-8 in `profile` or `callsign`, an unrecognized non-empty `profile`
  * name, or a non-zero `speed_level` that isn't a valid wire speed level
- * (1-10; 8 is reserved).
+ * (1-9), or level 9 on an HF-profile handle.
  *
  * The returned handle is a plain [`CoppaHandle`] (`coppa_engine_t`) —
  * exactly what [`coppa_engine_create`] returns, just built from an
@@ -239,9 +242,8 @@ int32_t coppa_decode(struct coppa_engine_t *handle,
  * (fully decoded before this call) are **not** affected.
  *
  * Returns `0` on success, `-1` if `handle` is null, `-6` if `level` is not
- * a valid wire speed level (1-10; 8 is reserved — see
- * `coppa_protocol::modem::speed_level_components`), `-4` if the internal
- * lock is poisoned, or `-5` if an internal panic occurred. **After either
+ * a valid wire speed level (1-9) or is level 9 on an HF-profile handle,
+ * `-4` if the internal lock is poisoned, or `-5` if an internal panic occurred. **After either
  * of the latter two the handle is permanently broken** — destroy it with
  * `coppa_engine_destroy` and create a new one.
  *

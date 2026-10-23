@@ -1,6 +1,7 @@
 //! Root-cause isolation for the level-dependence PR #51 confirmed in AWGN
-//! (`capacity_metric_level_bias.rs`: +1.581 bits/s/Hz level1->level10, 13x its
-//! own noise bound, while all three Watterson fading channels read within
+//! (`capacity_metric_level_bias.rs`: +1.581 bits/s/Hz level1->level9, 13x its
+//! own noise bound (old wire level 10 before COP-24), while all three Watterson
+//! fading channels read within
 //! noise). That result redirected suspicion away from coherence-time/fading
 //! and toward "something in the per-level measurement path itself" -- this
 //! bench tests one concrete candidate: `SPEED_LEVELS[level].papr_target_db`
@@ -21,11 +22,11 @@
 //! If the differential `papr_target_db` per level is the mechanism, then
 //! forcing every level through the SAME clip target (holding modulation
 //! order, pilot pattern, and everything else exactly as production uses it)
-//! should collapse most of the level1->level10 capacity gap, in BOTH
+//! should collapse most of the level1->level9 capacity gap, in BOTH
 //! directions: giving low levels the loose 14.0 dB target production only
-//! gives level 10 should raise their capacity toward level 10's; forcing
-//! level 10 through the harsh 6.0 dB target production only gives levels
-//! 1-2 should pull level 10's capacity down toward theirs. If the gap
+//! gives level 9 should raise their capacity toward level 9's; forcing
+//! level 9 through the harsh 6.0 dB target production only gives levels
+//! 1-2 should pull level 9's capacity down toward theirs. If the gap
 //! persists similarly under a UNIFORM clip target, that falsifies this
 //! mechanism and points elsewhere (e.g. an equalization/noise-estimation
 //! effect intrinsic to modulation order, independent of clipping).
@@ -39,7 +40,7 @@
 //! modulate it three ways, varying ONLY `papr_target_db`:
 //!   - `natural`: this level's real `SPEED_LEVELS` target (what production
 //!     ships).
-//!   - `uniform_loose`: every level forced through 14.0 dB (level 10's real,
+//!   - `uniform_loose`: every level forced through 14.0 dB (level 9's real,
 //!     loosest target).
 //!   - `uniform_harsh`: every level forced through 6.0 dB (level 1/2's real,
 //!     harshest target).
@@ -50,7 +51,7 @@
 //! helper, same significance-check convention.
 //!
 //! Output: `DATA <condition> <snr> <level> <mean_capacity> <std_capacity>`
-//! followed by a per-condition SUMMARY line (level1->level10 mean capacity
+//! followed by a per-condition SUMMARY line (level1->level9 mean capacity
 //! gap, averaged across the SNR grid, with a 2*SE significance bound -- same
 //! convention as `capacity_metric_level_bias.rs`).
 //!
@@ -67,11 +68,11 @@ use num_complex::Complex32;
 const TRIALS: usize = 40;
 const CODED_BLOCK_LEN: usize = 1944;
 
-/// The real levels `SPEED_LEVELS`/`speed_level_components` support (8 is
-/// reserved), ascending -- same set `capacity_metric_level_bias.rs` sounds.
-const LEVELS: [u8; 9] = [1, 2, 3, 4, 5, 6, 7, 9, 10];
+/// The real levels `SPEED_LEVELS`/`speed_level_components` support, ascending
+/// -- same set `capacity_metric_level_bias.rs` sounds.
+const LEVELS: [u8; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 
-const UNIFORM_LOOSE_DB: f32 = 14.0; // level 10's real target
+const UNIFORM_LOOSE_DB: f32 = 14.0; // level 9's real target
 const UNIFORM_HARSH_DB: f32 = 6.0; // level 1/2's real target
 
 /// (condition name, per-level papr_target_db chooser).
@@ -232,7 +233,7 @@ fn main() {
             "within noise"
         };
         println!(
-            "  {cname}: level1->level10 mean capacity gap = {mean_gap:+.3} bits/s/Hz \
+            "  {cname}: level1->level9 mean capacity gap = {mean_gap:+.3} bits/s/Hz \
              (2*SE bound = {mean_se_bound:.3}) -> {verdict}"
         );
     }

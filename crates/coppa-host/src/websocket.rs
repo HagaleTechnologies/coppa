@@ -43,7 +43,7 @@ pub enum WsServerMessage {
         remote_call: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         snr: Option<i32>,
-        /// Current speed level (1-10) of the last decoded frame (decision 8).
+        /// Current speed level (1-9) of the last decoded frame (decision 8).
         #[serde(skip_serializing_if = "Option::is_none")]
         level: Option<u8>,
         /// Carrier frequency offset (Hz) estimated on the last decoded frame

@@ -2,7 +2,7 @@ use crate::fec::ldpc::codes::CodeRate;
 use coppa_codec::ofdm::coppa_modem::SPEED_LEVELS;
 use coppa_codec::traits::ConstellationMapper;
 
-/// Returns (ConstellationMapper, CodeRate) for a wire-encoded speed level (1-10, 8 reserved).
+/// Returns (ConstellationMapper, CodeRate) for a wire-encoded speed level (1-9).
 pub fn speed_level_components(
     wire_level: u8,
 ) -> Result<(Box<dyn ConstellationMapper>, CodeRate), String> {
@@ -20,9 +20,8 @@ pub fn speed_level_components(
         5 => Ok((Box::new(Psk8Mapper), CodeRate::Rate2_3)),
         6 => Ok((Box::new(Qam16Mapper), CodeRate::Rate1_2)),
         7 => Ok((Box::new(Qam16Mapper), CodeRate::Rate3_4)),
-        9 => Ok((Box::new(Qam64Mapper), CodeRate::Rate2_3)),
-        10 => Ok((Box::new(Qam64Mapper), CodeRate::Rate7_8)),
-        8 => Err("Speed level 8 (32-QAM) is reserved".into()),
+        8 => Ok((Box::new(Qam64Mapper), CodeRate::Rate2_3)),
+        9 => Ok((Box::new(Qam64Mapper), CodeRate::Rate7_8)),
         _ => Err(format!("Invalid speed level: {}", wire_level)),
     }
 }
@@ -49,7 +48,7 @@ pub fn speed_level_entry(
 /// codeword, matching this codec's fixed OFDM/interleaver block size.
 ///
 /// `k_used = round(rate * 1944)` for this ladder's existing rates, with one
-/// **wire-format-breaking exception**: level 10 (64-QAM) changes from rate
+/// **wire-format-breaking exception**: level 9 (64-QAM) changes from rate
 /// 7/8 (1701) to rate **5/6** (1620), per the Phase 2 decision audit ("k_used
 /// table" decision) -- 7/8 was found to hit LDPC non-convergence at high SNR
 /// (see `CLAUDE.md`'s Known Limitations), and 5/6 is both a real reduction
@@ -60,16 +59,15 @@ pub fn speed_level_entry(
 /// pattern, and this task's own ADR for this specific change).
 pub fn k_used_for_level(wire_level: u8) -> Option<usize> {
     match wire_level {
-        1 => Some(486),   // BPSK, rate 1/4
-        2 => Some(972),   // BPSK, rate 1/2
-        3 => Some(972),   // QPSK, rate 1/2
-        4 => Some(1458),  // QPSK, rate 3/4
-        5 => Some(1296),  // 8PSK, rate 2/3
-        6 => Some(972),   // 16QAM, rate 1/2
-        7 => Some(1458),  // 16QAM, rate 3/4
-        9 => Some(1296),  // 64QAM, rate 2/3
-        10 => Some(1620), // 64QAM, rate 5/6 (was 7/8 pre-Task-4 -- wire break, see doc above)
-        8 => None,        // reserved
+        1 => Some(486),  // BPSK, rate 1/4
+        2 => Some(972),  // BPSK, rate 1/2
+        3 => Some(972),  // QPSK, rate 1/2
+        4 => Some(1458), // QPSK, rate 3/4
+        5 => Some(1296), // 8PSK, rate 2/3
+        6 => Some(972),  // 16QAM, rate 1/2
+        7 => Some(1458), // 16QAM, rate 3/4
+        8 => Some(1296), // 64QAM, rate 2/3
+        9 => Some(1620), // 64QAM, rate 5/6 (was 7/8 pre-Task-4 -- wire break, see doc above)
         _ => None,
     }
 }
@@ -83,7 +81,7 @@ pub fn k_used_for_level(wire_level: u8) -> Option<usize> {
 /// (see `k_used_for_level`'s doc), so the real per-level payload budget is
 /// `PAYLOAD_CRC_LEN` (4) bytes less than the raw `k_used/8` byte capacity:
 /// `max_payload = k_used/8 - PAYLOAD_CRC_LEN` (integer division). Returns `None`
-/// for reserved/invalid levels, mirroring `k_used_for_level`.
+/// for invalid levels, mirroring `k_used_for_level`.
 pub fn max_payload_for_level(wire_level: u8) -> Option<usize> {
     use crate::modem::transceiver::PAYLOAD_CRC_LEN;
     k_used_for_level(wire_level).map(|k_used| k_used / 8 - PAYLOAD_CRC_LEN)
@@ -97,7 +95,7 @@ pub fn max_payload_for_level(wire_level: u8) -> Option<usize> {
 /// `crate::modem::transceiver::split_payload_across_codewords` for how a
 /// payload at or under this cap is guaranteed to split into per-codeword
 /// chunks that each individually fit `max_payload_for_level(level)` too.
-/// Returns `None` for reserved/invalid levels, mirroring `max_payload_for_level`.
+/// Returns `None` for invalid levels, mirroring `max_payload_for_level`.
 pub fn max_multi_payload_for_level(wire_level: u8, codewords: u8) -> Option<usize> {
     max_payload_for_level(wire_level).map(|per_cw| per_cw * codewords.max(1) as usize)
 }
@@ -116,8 +114,8 @@ mod tests {
             (5, 1296),
             (6, 972),
             (7, 1458),
-            (9, 1296),
-            (10, 1620),
+            (8, 1296),
+            (9, 1620),
         ];
         for (level, expected) in cases {
             assert_eq!(
@@ -132,15 +130,15 @@ mod tests {
     fn max_payload_matches_k_used_minus_crc_trailer() {
         // max_payload = k_used/8 - 4 (integer division), per this level's k_used.
         let cases = [
-            (1, 56),   // 486/8=60 (floor) - 4
-            (2, 117),  // 972/8=121 - 4
-            (3, 117),  // 972/8=121 - 4
-            (4, 178),  // 1458/8=182 - 4
-            (5, 158),  // 1296/8=162 - 4
-            (6, 117),  // 972/8=121 - 4
-            (7, 178),  // 1458/8=182 - 4
-            (9, 158),  // 1296/8=162 - 4
-            (10, 198), // 1620/8=202 - 4
+            (1, 56),  // 486/8=60 (floor) - 4
+            (2, 117), // 972/8=121 - 4
+            (3, 117), // 972/8=121 - 4
+            (4, 178), // 1458/8=182 - 4
+            (5, 158), // 1296/8=162 - 4
+            (6, 117), // 972/8=121 - 4
+            (7, 178), // 1458/8=182 - 4
+            (8, 158), // 1296/8=162 - 4
+            (9, 198), // 1620/8=202 - 4
         ];
         for (level, expected) in cases {
             assert_eq!(
@@ -152,8 +150,8 @@ mod tests {
     }
 
     #[test]
-    fn max_payload_reserved_and_invalid_levels_are_none() {
-        for level in [0, 8, 11, 255] {
+    fn max_payload_invalid_levels_are_none() {
+        for level in [0, 10, 11, 15, 255] {
             assert_eq!(
                 max_payload_for_level(level),
                 None,
@@ -163,8 +161,8 @@ mod tests {
     }
 
     #[test]
-    fn k_used_reserved_and_invalid_levels_are_none() {
-        for level in [0, 8, 11, 255] {
+    fn k_used_invalid_levels_are_none() {
+        for level in [0, 10, 11, 15, 255] {
             assert_eq!(
                 k_used_for_level(level),
                 None,
@@ -178,7 +176,7 @@ mod tests {
         // Every k_used must be >= 2*Zc (the punctured prefix) and <= KB*Zc
         // (the mother code's full info width) -- see rate_match.rs.
         use crate::fec::ldpc::nr_bg2::{KB, PUNCTURED_INFO_COLS, ZC};
-        for level in [1, 2, 3, 4, 5, 6, 7, 9, 10] {
+        for level in [1, 2, 3, 4, 5, 6, 7, 8, 9] {
             let k = k_used_for_level(level).unwrap();
             assert!(
                 k >= PUNCTURED_INFO_COLS * ZC,
@@ -190,23 +188,27 @@ mod tests {
 
     #[test]
     fn test_all_valid_levels_return_ok() {
-        for wire_level in [1, 2, 3, 4, 5, 6, 7, 9, 10] {
+        for wire_level in [1, 2, 3, 4, 5, 6, 7, 8, 9] {
             let result = speed_level_components(wire_level);
             assert!(result.is_ok(), "Level {} should be valid", wire_level);
         }
     }
 
     #[test]
-    fn test_reserved_level_8_returns_err() {
-        let result = speed_level_components(8);
-        assert!(result.is_err(), "Level 8 (32-QAM) should be reserved");
+    fn test_level_8_is_64qam_rate_2_3() {
+        let (mapper, rate) = speed_level_components(8).expect("level 8 must be valid");
+        assert_eq!(mapper.bits_per_symbol(), 6);
+        assert_eq!(rate, CodeRate::Rate2_3);
     }
 
     #[test]
     fn test_invalid_levels_return_err() {
-        for wire_level in [0, 11, 15, 255] {
+        for wire_level in [0, 10, 11, 15, 255] {
             let result = speed_level_components(wire_level);
-            assert!(result.is_err(), "Level {} should be invalid", wire_level);
+            assert_eq!(
+                result.err(),
+                Some(format!("Invalid speed level: {wire_level}"))
+            );
         }
     }
 
@@ -220,8 +222,8 @@ mod tests {
             (5, 3), // 8PSK
             (6, 4),
             (7, 4), // 16QAM
-            (9, 6),
-            (10, 6), // 64QAM
+            (8, 6),
+            (9, 6), // 64QAM
         ];
         for (wire_level, expected_bps) in cases {
             let (mapper, _) = speed_level_components(wire_level).unwrap();
@@ -245,8 +247,8 @@ mod tests {
             (5, CodeRate::Rate2_3),
             (6, CodeRate::Rate1_2),
             (7, CodeRate::Rate3_4),
-            (9, CodeRate::Rate2_3),
-            (10, CodeRate::Rate7_8),
+            (8, CodeRate::Rate2_3),
+            (9, CodeRate::Rate7_8),
         ];
         for (wire_level, expected_rate) in cases {
             let (_, rate) = speed_level_components(wire_level).unwrap();
