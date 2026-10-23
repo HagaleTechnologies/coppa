@@ -395,6 +395,13 @@ impl PlayoutWatch {
         self.target
     }
 
+    /// Continue an earlier no-progress window instead of starting a fresh
+    /// one: the last observed playback count and when it last advanced.
+    pub fn resume_progress(&mut self, last_played: u64, last_progress: Instant) {
+        self.last_played = last_played;
+        self.last_progress = last_progress;
+    }
+
     /// Advance with the latest feedback. Only downstream playback progress
     /// resets the stall timer; enqueueing does not.
     pub fn poll(&mut self, played: u64, failed: bool, now: Instant) -> PlayoutState {
@@ -420,19 +427,90 @@ impl PlayoutWatch {
     }
 }
 
+/// Playback-progress record shared by every transmission in one continuous
+/// keyed interval, so the [`STALL_TIMEOUT`] no-progress bound spans the
+/// interval rather than restarting with each queued job. Times are on the
+/// Tokio clock so watches started at different moments agree on them.
+#[derive(Debug)]
+pub struct StallClock {
+    state: std::sync::Mutex<(u64, tokio::time::Instant)>,
+}
+
+impl StallClock {
+    /// A fresh window: `played` samples so far, counted from `now`.
+    pub fn new(played: u64, now: tokio::time::Instant) -> Self {
+        Self {
+            state: std::sync::Mutex::new((played, now)),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, (u64, tokio::time::Instant)> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Last observed playback count and when it last advanced (or when
+    /// nothing was outstanding).
+    pub fn snapshot(&self) -> (u64, tokio::time::Instant) {
+        *self.lock()
+    }
+
+    /// Record an observation: the window restarts when playback advanced,
+    /// or when nothing is outstanding (`idle`), since waiting on nothing is
+    /// not a stall.
+    pub fn observe(&self, played: u64, idle: bool, now: tokio::time::Instant) {
+        let mut state = self.lock();
+        if played > state.0 || idle {
+            state.0 = state.0.max(played);
+            state.1 = now;
+        }
+    }
+}
+
+/// Where a watch's no-progress window continues from: the keyed interval's
+/// [`StallClock`], and the cumulative sample count queued before this
+/// watch's job. If earlier audio is still outstanding when the watch starts,
+/// it inherits the interval's window; otherwise it starts a fresh one.
+#[derive(Debug, Clone, Copy)]
+pub struct IntervalProgress<'a> {
+    pub clock: &'a StallClock,
+    pub prior_target: u64,
+}
+
 /// Wait (on the Tokio clock) until `watch` completes or fails, checking the
-/// feedback every [`PROGRESS_TICK`].
+/// feedback every [`PROGRESS_TICK`]. With `interval`, the no-progress bound
+/// is shared across the keyed interval's transmissions (see [`StallClock`]).
 pub async fn wait_for_playout(
     feedback: &OutputFeedback,
     mut watch: PlayoutWatch,
+    interval: Option<IntervalProgress<'_>>,
 ) -> std::result::Result<(), PlayoutFailure> {
     let start_tokio = tokio::time::Instant::now();
     let start_std = Instant::now();
+    if let Some(interval) = interval {
+        if feedback.played() < interval.prior_target {
+            let (played, at) = interval.clock.snapshot();
+            let since = start_tokio.saturating_duration_since(at);
+            let at_std = start_std.checked_sub(since).unwrap_or(start_std);
+            watch.resume_progress(played, at_std);
+        } else {
+            interval.clock.observe(feedback.played(), true, start_tokio);
+        }
+    }
     loop {
         // Map Tokio's (possibly paused) clock onto the watch's std clock so
         // tests can drive stalls and watchdogs deterministically.
-        let now = start_std + start_tokio.elapsed();
-        match watch.poll(feedback.played(), feedback.is_failed(), now) {
+        let now_tokio = tokio::time::Instant::now();
+        let now = start_std + now_tokio.saturating_duration_since(start_tokio);
+        let played = feedback.played();
+        let state = watch.poll(played, feedback.is_failed(), now);
+        if let Some(interval) = interval {
+            interval
+                .clock
+                .observe(played, state == PlayoutState::Played, now_tokio);
+        }
+        match state {
             PlayoutState::Played => return Ok(()),
             PlayoutState::Failed(why) => return Err(why),
             PlayoutState::Pending => tokio::time::sleep(PROGRESS_TICK).await,
@@ -751,7 +829,7 @@ mod tests {
         let watch = PlayoutWatch::new(10, Instant::now(), None);
         let started = tokio::time::Instant::now();
         assert_eq!(
-            wait_for_playout(&fb, watch).await,
+            wait_for_playout(&fb, watch, None).await,
             Err(PlayoutFailure::Stalled)
         );
         assert!(started.elapsed() >= STALL_TIMEOUT);

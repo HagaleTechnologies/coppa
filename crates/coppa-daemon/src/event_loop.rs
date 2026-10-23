@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::audio_output::{
-    wait_for_playout, OutputFeedback, PlayoutWatch, TxOutput, PROGRESS_TICK,
+    wait_for_playout, IntervalProgress, OutputFeedback, PlayoutWatch, StallClock, TxOutput,
+    PROGRESS_TICK,
 };
 use crate::config::DaemonConfig;
 
@@ -91,6 +92,10 @@ pub struct EventLoop {
     /// each job's start, so transmissions queued behind an active one cannot
     /// push the forced unkey back. Cleared whenever PTT is released.
     tx_keyed_since: Option<tokio::time::Instant>,
+    /// Playback-progress record for the current continuous keyed interval,
+    /// shared by every transmission queued in it so the no-progress bound is
+    /// not restarted by each newer job. Cleared whenever PTT is released.
+    tx_stall_clock: Option<Arc<StallClock>>,
     /// Last-seen value of the audio input ring's overflow counter (see
     /// `AudioRingConsumer::overflow_count`); `poll_audio_input` compares against
     /// this each poll and logs a warning when it grows (silent RX sample loss was
@@ -353,6 +358,7 @@ impl EventLoop {
             output_feedback: None,
             tx_generation: 0,
             tx_keyed_since: None,
+            tx_stall_clock: None,
             audio_in_overflow_count: 0,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             arq_tx,
@@ -1607,7 +1613,10 @@ impl EventLoop {
     /// tick, and a spawned task waits for the output worker to report that
     /// the last sample's predicted presentation time has passed (then the PTT
     /// tail), or cancels the transmission on output failure, five seconds
-    /// without playback progress, or `max_tx_duration_s`.
+    /// without playback progress, or `max_tx_duration_s`. Both bounds, and
+    /// the PTT tail, are measured across the continuous keyed interval rather
+    /// than per job, so transmissions queued behind an active one can neither
+    /// restart them nor stretch the keyed time past `max_tx_duration_s`.
     ///
     /// This is the single chokepoint every TX path in this event loop funnels
     /// through (host-driven encode, ARQ-adjacent session control frames
@@ -1657,11 +1666,17 @@ impl EventLoop {
         let keyed_since = *self
             .tx_keyed_since
             .get_or_insert_with(tokio::time::Instant::now);
+        let played_now = self.output_feedback.as_ref().map_or(0, |f| f.played());
+        let stall_clock = self
+            .tx_stall_clock
+            .get_or_insert_with(|| Arc::new(StallClock::new(played_now, keyed_since)))
+            .clone();
         // Enforce PTT pre-delay before writing audio
         let pre_delay_ms = self.config.radio.ptt_pre_delay_ms;
         if pre_delay_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(pre_delay_ms)).await;
         }
+        let prior_target = self.tx_output().submitted();
         let queued = self.handle_audio_out(samples);
         // Release PTT once this transmission's last sample has played (not
         // after its nominal duration): every sample stays queued until the
@@ -1676,8 +1691,9 @@ impl EventLoop {
         // interval this job joins. A job queued behind an active one gets
         // only the remainder, so its watchdog fires no later than the active
         // job's would have.
-        let max_tx = std::time::Duration::from_secs(self.config.radio.max_tx_duration_s)
-            .saturating_sub(keyed_since.elapsed());
+        let deadline =
+            keyed_since + std::time::Duration::from_secs(self.config.radio.max_tx_duration_s);
+        let max_tx = deadline.saturating_duration_since(tokio::time::Instant::now());
         // Whenever an output worker is wired, completion comes only from its
         // feedback -- even if its end of the ring is gone, so a failed or
         // dead output cancels the transmission instead of reporting success.
@@ -1700,7 +1716,11 @@ impl EventLoop {
                 }
                 Some(feedback) => {
                     let watch = PlayoutWatch::new(target, Instant::now(), Some(max_tx));
-                    match wait_for_playout(&feedback, watch).await {
+                    let interval = IntervalProgress {
+                        clock: &stall_clock,
+                        prior_target,
+                    };
+                    match wait_for_playout(&feedback, watch, Some(interval)).await {
                         Ok(()) => true,
                         Err(why) => {
                             tracing::error!(generation, reason = %why, "TX playback did not complete");
@@ -1722,7 +1742,18 @@ impl EventLoop {
                 }
             };
             if completed {
-                tokio::time::sleep(tail).await;
+                // The tail counts against the keyed interval's
+                // `max_tx_duration_s` bound too: a transmission that finished
+                // playing near the deadline must not stay keyed past it.
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if tail > remaining {
+                    tracing::warn!(
+                        tail_ms = tail.as_millis() as u64,
+                        remaining_max_tx_ms = remaining.as_millis() as u64,
+                        "PTT tail exceeds what is left of max TX; capping it"
+                    );
+                }
+                tokio::time::sleep(tail.min(remaining)).await;
             }
             if let Err(e) = ptt_event_tx
                 .send(DaemonEvent::TxComplete {
@@ -2885,6 +2916,7 @@ impl EventLoop {
         } else {
             self.is_transmitting = false;
             self.tx_keyed_since = None;
+            self.tx_stall_clock = None;
             // PTT just released: continue draining the TX queue if more is queued.
             self.try_drain_tx_queue().await;
         }
@@ -5994,6 +6026,83 @@ mod tests {
         let started = tokio::time::Instant::now();
         assert_eq!(rig.next_completion().await, (1, false));
         assert!(started.elapsed() >= crate::audio_output::STALL_TIMEOUT);
+    }
+
+    /// A transmission queued behind a stalled one inherits its no-progress
+    /// window: the newest job is failed five seconds after playback last
+    /// advanced, not five seconds after it was queued, so frequent ARQ/control
+    /// transmissions cannot hold a stalled output keyed until the max-TX
+    /// deadline.
+    #[tokio::test(start_paused = true)]
+    async fn stall_window_spans_queued_transmissions() {
+        let mut rig = TxRig::new(DaemonConfig::default());
+        let keyed = tokio::time::Instant::now();
+        rig.event_loop.transmit_samples(&[0.1f32; 20_000]).await;
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            rig.event_loop.transmit_samples(&[0.1f32; 4_800]).await;
+        }
+        loop {
+            let (generation, completed) = rig.next_completion().await;
+            if generation == 4 {
+                assert!(!completed, "a stalled output fails, it does not complete");
+                break;
+            }
+        }
+        let stall = crate::audio_output::STALL_TIMEOUT;
+        assert!(
+            keyed.elapsed() >= stall && keyed.elapsed() < stall + Duration::from_millis(100),
+            "stall failure after {:?}, not ~{stall:?} after playback last advanced",
+            keyed.elapsed()
+        );
+    }
+
+    /// A job queued while nothing is outstanding (here: during the previous
+    /// job's PTT tail) starts a fresh no-progress window rather than being
+    /// failed for the idle time before it.
+    #[tokio::test(start_paused = true)]
+    async fn idle_gap_does_not_count_as_a_stall() {
+        let mut rig = TxRig::new(DaemonConfig::default());
+        rig.event_loop.config.radio.ptt_tail_delay_ms = 8_000;
+        let first = vec![0.2f32; 4_800];
+        rig.event_loop.transmit_samples(&first).await;
+        rig.deliver(first.len(), &[4096]);
+        // Job 1 has played; it is now in its 8 s tail with nothing pending.
+        tokio::time::sleep(Duration::from_millis(6_000)).await;
+        let second = vec![0.3f32; 4_800];
+        rig.event_loop.transmit_samples(&second).await;
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        rig.deliver(first.len() + second.len(), &[4096]);
+        loop {
+            let (generation, completed) = rig.next_completion().await;
+            if generation == 2 {
+                assert!(completed, "idle time before a job is not a stall");
+                break;
+            }
+        }
+    }
+
+    /// The PTT tail is capped at the keyed interval's `max_tx_duration_s`
+    /// deadline: a transmission that finishes playing near the limit unkeys
+    /// at the limit, not up to `ptt_tail_delay_ms` past it.
+    #[tokio::test(start_paused = true)]
+    async fn ptt_tail_is_capped_at_the_max_tx_deadline() {
+        let mut config = DaemonConfig::default();
+        config.radio.max_tx_duration_s = 2;
+        let mut rig = TxRig::new(config);
+        rig.event_loop.config.radio.ptt_tail_delay_ms = 5_000;
+        let keyed = tokio::time::Instant::now();
+        let samples = vec![0.4f32; 9_600];
+        rig.event_loop.transmit_samples(&samples).await;
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        rig.deliver(samples.len(), &[4096]);
+        assert_eq!(rig.next_completion().await, (1, true));
+        let deadline = Duration::from_secs(2);
+        assert!(
+            keyed.elapsed() >= deadline && keyed.elapsed() < deadline + Duration::from_millis(50),
+            "PTT released after {:?}; the tail must end at the {deadline:?} max-TX deadline",
+            keyed.elapsed()
+        );
     }
 
     /// A due station-ID frame is prepended to the payload: both play whole,
