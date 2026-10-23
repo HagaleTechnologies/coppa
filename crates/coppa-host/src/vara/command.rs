@@ -162,11 +162,12 @@ async fn read_command<R: AsyncBufRead + Unpin>(
 mod tests {
     use super::*;
     use std::time::Duration;
+    use tokio::io::AsyncReadExt;
 
     #[tokio::test]
     async fn greeting_reports_package_version() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap())
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
             .await
             .unwrap();
         let (server, _) = listener.accept().await.unwrap();
@@ -178,20 +179,18 @@ mod tests {
             event_tx,
             response_rx,
         ));
-        let mut reader = BufReader::new(client);
-        let mut greeting = String::new();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            reader.read_line(&mut greeting),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        // Closing our write side ends the session, so the handler closes its
+        // end and read_to_end returns every byte it sent: the greeting alone.
+        client.shutdown().await.unwrap();
+        let mut sent = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut sent))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            greeting,
-            format!("VERSION Coppa {}\r\n", env!("CARGO_PKG_VERSION"))
+            String::from_utf8(sent).unwrap(),
+            format!("VERSION Coppa {}\r", env!("CARGO_PKG_VERSION"))
         );
-        drop(reader);
         tokio::time::timeout(std::time::Duration::from_secs(5), handler)
             .await
             .unwrap()
@@ -211,7 +210,7 @@ mod tests {
     struct CommandClient {
         stream: TcpStream,
         rx: mpsc::Receiver<HostEvent>,
-        _response_tx: mpsc::Sender<VaraResponse>,
+        response_tx: mpsc::Sender<VaraResponse>,
         handler: tokio::task::JoinHandle<Result<()>>,
     }
 
@@ -232,13 +231,13 @@ mod tests {
             response_rx,
         ));
 
-        // The greeting is `\n`-terminated, so read_line drains it exactly.
-        let mut greeting = String::new();
-        BufReader::new(&mut stream)
-            .read_line(&mut greeting)
-            .await
-            .unwrap();
-        assert!(!greeting.is_empty(), "no greeting received");
+        // The greeting is `\r`-terminated, so read_response drains it exactly.
+        let greeting = read_response(&mut BufReader::new(&mut stream)).await;
+        assert!(
+            greeting.starts_with("VERSION "),
+            "got greeting {:?}",
+            greeting
+        );
 
         let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
@@ -249,7 +248,7 @@ mod tests {
         CommandClient {
             stream,
             rx,
-            _response_tx: response_tx,
+            response_tx,
             handler,
         }
     }
@@ -264,6 +263,16 @@ mod tests {
             HostEvent::VaraCommand { command, .. } => command,
             other => panic!("expected VaraCommand, got {:?}", other),
         }
+    }
+
+    /// Read one response, up to and including its `\r`, waiting up to 5 s.
+    async fn read_response<R: AsyncBufRead + Unpin>(reader: &mut R) -> String {
+        let mut buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_until(b'\r', &mut buf))
+            .await
+            .expect("timed out waiting for a response")
+            .unwrap();
+        String::from_utf8(buf).unwrap()
     }
 
     #[tokio::test]
@@ -347,6 +356,18 @@ mod tests {
         assert!(matches!(event, HostEvent::Disconnected { client_id: 1 }));
         let result = c.handler.await.unwrap();
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn back_to_back_responses_each_end_in_a_bare_cr() {
+        let mut c = connect().await;
+        c.response_tx.send(VaraResponse::Busy(true)).await.unwrap();
+        c.response_tx.send(VaraResponse::Buffer(0)).await.unwrap();
+        // Pat splits on `\r`: a `\n` left after one response would arrive as
+        // the start of the next one ("\nBUFFER 0").
+        let mut reader = BufReader::new(&mut c.stream);
+        assert_eq!(read_response(&mut reader).await, "BUSY ON\r");
+        assert_eq!(read_response(&mut reader).await, "BUFFER 0\r");
     }
 
     #[tokio::test]
