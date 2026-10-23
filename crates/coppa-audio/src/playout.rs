@@ -73,6 +73,12 @@ pub(crate) struct ProgressShared {
     deadline_nanos: AtomicU64,
     failed: AtomicBool,
     base: Instant,
+    /// Ring-flush handshake: the owner bumps `flush_requested`; the callback
+    /// drops what the ring holds, adds the count to `flushed`, then publishes
+    /// the request it served in `flush_served`.
+    flush_requested: AtomicU64,
+    flush_served: AtomicU64,
+    flushed: AtomicU64,
 }
 
 impl ProgressShared {
@@ -83,7 +89,34 @@ impl ProgressShared {
             deadline_nanos: AtomicU64::new(0),
             failed: AtomicBool::new(false),
             base,
+            flush_requested: AtomicU64::new(0),
+            flush_served: AtomicU64::new(0),
+            flushed: AtomicU64::new(0),
         }
+    }
+
+    /// Ask the output callback to drop everything its ring holds on its next
+    /// run. Returns the request number to pass to [`Self::flush_result`].
+    pub(crate) fn request_flush(&self) -> u64 {
+        self.flush_requested.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Cumulative samples the callback has flushed, once request `request`
+    /// has been served; `None` while it is still pending.
+    pub(crate) fn flush_result(&self, request: u64) -> Option<u64> {
+        (self.flush_served.load(Ordering::Acquire) >= request)
+            .then(|| self.flushed.load(Ordering::Relaxed))
+    }
+
+    /// Callback side: serve a pending flush request by draining `consumer`.
+    fn serve_flush(&self, consumer: &mut AudioRingConsumer) {
+        let requested = self.flush_requested.load(Ordering::Acquire);
+        if requested == self.flush_served.load(Ordering::Relaxed) {
+            return;
+        }
+        let dropped = consumer.drain() as u64;
+        self.flushed.fetch_add(dropped, Ordering::Relaxed);
+        self.flush_served.store(requested, Ordering::Release);
     }
 
     /// Single-writer publish (only the output callback calls this).
@@ -176,6 +209,9 @@ pub(crate) fn fill_output(
     entry: Instant,
     playback_delay: Option<Duration>,
 ) -> usize {
+    // A pending flush drops the ring's contents before anything is read, so
+    // a cancelled transmission's buffered tail never reaches the device.
+    shared.serve_flush(consumer);
     if shared.is_failed() {
         data.fill(0.0);
         return 0;
@@ -382,6 +418,53 @@ mod tests {
             0
         );
         assert!(buf.iter().all(|&s| s == 0.0));
+    }
+
+    /// A flush request drops what the ring holds at the next callback,
+    /// before anything is handed to the device, reports the count only once
+    /// served, and does not count the dropped samples as consumed.
+    #[test]
+    fn flush_drops_ring_contents_at_next_callback() {
+        let (mut prod, mut cons) = audio_ring(8192);
+        let base = Instant::now();
+        let shared = ProgressShared::new(base);
+        let mut state = CallbackState::new(SR);
+        prod.write(&[0.7; 8192]);
+        let mut buf = vec![0.0; 480];
+        fill_output(
+            &mut cons,
+            &mut buf,
+            &shared,
+            &mut state,
+            base,
+            Some(Duration::ZERO),
+        );
+        let request = shared.request_flush();
+        assert_eq!(shared.flush_result(request), None, "not served yet");
+        let read = fill_output(
+            &mut cons,
+            &mut buf,
+            &shared,
+            &mut state,
+            base,
+            Some(Duration::ZERO),
+        );
+        assert_eq!(read, 0, "the flushed tail must not reach the device");
+        assert!(buf.iter().all(|&s| s == 0.0));
+        assert_eq!(shared.flush_result(request), Some(8192 - 480));
+        assert_eq!(shared.progress_at(base).unwrap().consumed_samples, 480);
+        // Audio written after the flush plays normally.
+        prod.write(&[0.3; 100]);
+        let read = fill_output(
+            &mut cons,
+            &mut buf,
+            &shared,
+            &mut state,
+            base,
+            Some(Duration::ZERO),
+        );
+        assert_eq!(read, 100);
+        assert_eq!(shared.flush_result(request), Some(8192 - 480));
     }
 
     /// A rejected timestamp fails the stream before the buffer reaches the

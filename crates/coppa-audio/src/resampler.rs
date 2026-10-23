@@ -195,6 +195,25 @@ impl<S: crate::AudioSink> crate::AudioSink for ResamplingSink<S> {
         self.flush()?;
         self.inner.stop()
     }
+
+    /// Drops the not-yet-resampled input and the inner sink's buffer. The
+    /// count is in input (target-rate) samples, matching what `write`
+    /// accepted.
+    fn discard_buffered(&mut self) -> Result<Option<u64>> {
+        // The caller does not write while the drop is pending, so the
+        // retained input is unchanged until the inner sink reports done.
+        let Some(inner) = self.inner.discard_buffered()? else {
+            return Ok(None);
+        };
+        let held = self.input_buf.len() as u64;
+        self.input_buf.clear();
+        let inner = if self.hw_rate == self.target_rate {
+            inner
+        } else {
+            inner * self.target_rate as u64 / self.hw_rate.max(1) as u64
+        };
+        Ok(Some(held + inner))
+    }
 }
 
 #[cfg(test)]

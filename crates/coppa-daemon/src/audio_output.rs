@@ -191,9 +191,13 @@ impl OutputFeedback {
     }
 
     /// Ask the output worker to drop every sample with a cumulative index
-    /// below `through` that it has not yet handed to the sink: the outer
-    /// ring's contents and its retained chunk. Used when a transmission is
-    /// cancelled so its audio cannot play after PTT is released.
+    /// below `through` that has not yet played: the outer ring's contents,
+    /// its retained chunk, and what the final sink still buffers (see
+    /// [`AudioSink::discard_buffered`]). Used when a transmission is
+    /// cancelled so its audio cannot play after PTT is released, nor at the
+    /// start of the next transmission. Once the drop has taken effect and
+    /// anything the device already held has played, `played()` reaches
+    /// `through` (see [`wait_for_discard`]).
     pub fn discard_through(&self, through: u64) {
         self.discard_through.fetch_max(through, Ordering::AcqRel);
     }
@@ -224,6 +228,11 @@ pub struct OutputWorker {
     read_total: u64,
     /// Cumulative samples dropped by `discard_through` requests.
     discarded: u64,
+    /// Highest `discard_through` request already acted on.
+    applied_through: u64,
+    /// The sink has been asked to drop its buffer and has not confirmed;
+    /// nothing more is written to it until it does.
+    sink_flush_pending: bool,
     feedback: Arc<OutputFeedback>,
     sample_rate: u32,
 }
@@ -237,6 +246,8 @@ impl OutputWorker {
             offset: 0,
             read_total: 0,
             discarded: 0,
+            applied_through: 0,
+            sink_flush_pending: false,
             feedback,
             sample_rate,
         }
@@ -270,6 +281,17 @@ impl OutputWorker {
         sink: &mut S,
     ) -> Result<usize> {
         self.apply_discard(outer);
+        if self.sink_flush_pending {
+            match sink.discard_buffered()? {
+                Some(dropped) => {
+                    self.discarded += dropped;
+                    self.sink_flush_pending = false;
+                }
+                // Writing now would put new audio behind the cancelled
+                // tail, where the deferred drop could take it too.
+                None => return Ok(0),
+            }
+        }
         if self.offset == self.len {
             self.len = outer.read(&mut self.buf);
             self.offset = 0;
@@ -283,12 +305,24 @@ impl OutputWorker {
         Ok(accepted)
     }
 
-    /// Drop not-yet-forwarded samples below the requested discard index.
+    /// Act on a new discard request: drop not-yet-forwarded samples below
+    /// the requested index, and ask the sink to drop what it still buffers.
     fn apply_discard(&mut self, outer: &mut AudioRingConsumer) {
         let through = self.feedback.discard_through.load(Ordering::Acquire);
+        if through <= self.applied_through {
+            return;
+        }
+        self.applied_through = through;
         // Index of the next sample that would be handed to the sink.
         let next = self.read_total - (self.len - self.offset) as u64;
-        if through <= next {
+        if through < next {
+            // Samples past the cancelled range already reached the sink, so
+            // its buffer is not all cancelled audio: leave it alone.
+            return;
+        }
+        // Everything handed to the sink so far is cancelled audio.
+        self.sink_flush_pending = true;
+        if through == next {
             return;
         }
         self.discarded += (self.len - self.offset) as u64;
@@ -478,6 +512,36 @@ pub struct IntervalProgress<'a> {
     pub prior_target: u64,
 }
 
+/// Longest wait, after a cancel, for the cancelled audio to be dropped from
+/// every buffer (or finish playing from the device's own) before the next
+/// transmission may key. Far beyond a healthy device's latency; reached only
+/// when the device has stopped consuming, in which case the output worker
+/// still holds new audio back until the sink confirms the drop.
+pub const DISCARD_SETTLE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// After `feedback.discard_through(through)`, wait (on the Tokio clock)
+/// until every sample below `through` has been dropped or has played, the
+/// output has failed, or [`DISCARD_SETTLE_TIMEOUT`] passes. Returns true
+/// when the cancelled audio is gone.
+pub async fn wait_for_discard(feedback: &OutputFeedback, through: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + DISCARD_SETTLE_TIMEOUT;
+    loop {
+        if discard_settled(feedback, through) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(PROGRESS_TICK).await;
+    }
+}
+
+/// Non-blocking form of [`wait_for_discard`]'s condition, for the TNC's
+/// polled state machine.
+pub fn discard_settled(feedback: &OutputFeedback, through: u64) -> bool {
+    feedback.played() >= through || feedback.is_failed()
+}
+
 /// Wait (on the Tokio clock) until `watch` completes or fails, checking the
 /// feedback every [`PROGRESS_TICK`]. With `interval`, the no-progress bound
 /// is shared across the keyed interval's transmissions (see [`StallClock`]).
@@ -535,6 +599,9 @@ pub(crate) mod test_support {
         pub fail_writes: bool,
         /// Remaining presentation time reported for the last consumed sample.
         pub remaining: Duration,
+        /// Like `CpalSink`, a drop request is served by the next callback.
+        flush_requested: bool,
+        flush_served: Option<u64>,
     }
 
     impl SimSink {
@@ -548,11 +615,17 @@ pub(crate) mod test_support {
                 calls: 0,
                 fail_writes: false,
                 remaining: Duration::ZERO,
+                flush_requested: false,
+                flush_served: None,
             }
         }
 
-        /// Simulated device callback consuming up to `n` real samples.
+        /// Simulated device callback consuming up to `n` real samples,
+        /// after serving any pending drop request.
         pub fn callback(&mut self, n: usize) -> usize {
+            if std::mem::take(&mut self.flush_requested) {
+                self.flush_served = Some(self.consumer.drain() as u64);
+            }
             let mut buf = vec![0.0; n];
             let read = self.consumer.read(&mut buf);
             self.captured.extend_from_slice(&buf[..read]);
@@ -588,6 +661,13 @@ pub(crate) mod test_support {
         }
         fn stop(&mut self) -> Result<()> {
             Ok(())
+        }
+        fn discard_buffered(&mut self) -> Result<Option<u64>> {
+            if let Some(dropped) = self.flush_served.take() {
+                return Ok(Some(dropped));
+            }
+            self.flush_requested = true;
+            Ok(None)
         }
     }
 
@@ -710,11 +790,11 @@ mod tests {
         assert_eq!(fb.played(), 6);
     }
 
-    /// A cancel discards the outer ring's contents and the retained chunk
-    /// (never the sink's own ring), and later audio still completes against
-    /// its cumulative target.
+    /// A cancel discards the outer ring's contents, the retained chunk and
+    /// the sink's own buffered tail, and later audio still completes against
+    /// its cumulative target: none of the cancelled audio plays ahead of it.
     #[test]
-    fn discard_drops_unforwarded_samples_and_keeps_targets_aligned() {
+    fn discard_drops_unplayed_samples_and_keeps_targets_aligned() {
         let (mut prod, mut cons) = audio_ring(8192);
         let feedback = Arc::new(OutputFeedback::default());
         let mut worker = OutputWorker::new(1024, 48_000, feedback.clone());
@@ -726,24 +806,28 @@ mod tests {
         for _ in 0..4 {
             worker.step(&mut cons, &mut sink, sim_progress).unwrap();
         }
+        assert_eq!(sink.callback(0), 0);
         // Cancel: the owner drops its FIFO and asks the worker to discard.
         pending.clear();
-        feedback.discard_through(pending.submitted());
+        let through = pending.submitted();
+        feedback.discard_through(through);
         let next: Vec<f32> = (0..5_000).map(|i| i as f32 + 2.0).collect();
         let target = pending.push(&next);
+        let mut settled_before_next = false;
         while feedback.played() < target {
             pending.flush(&mut prod);
             worker.step(&mut cons, &mut sink, sim_progress).unwrap();
+            if sink.captured.is_empty() && discard_settled(&feedback, through) {
+                settled_before_next = true;
+            }
             sink.callback(700);
         }
-        let captured = &sink.captured;
-        // Only what was already inside the sink's ring of the cancelled job
-        // can still play; then the next job, whole and in order.
-        assert!(captured.len() <= 2048 + next.len());
-        assert_eq!(&captured[captured.len() - next.len()..], &next[..]);
-        assert!(captured[..captured.len() - next.len()]
-            .iter()
-            .all(|&s| s == 1.0));
+        assert!(
+            settled_before_next,
+            "the discard settles before new audio plays"
+        );
+        assert_eq!(sink.captured, next, "no cancelled sample may play");
+        assert_eq!(feedback.played(), target);
     }
 
     /// Without a live consumer (none wired, or its end dropped), nothing is

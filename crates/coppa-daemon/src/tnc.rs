@@ -13,7 +13,8 @@ use coppa_audio::AudioRingProducer;
 use coppa_radio::{NullPtt, PttControl, PttState, VoxPtt};
 
 use crate::audio_output::{
-    OutputFeedback, PendingOutput, PlayoutState, PlayoutWatch, PROGRESS_TICK,
+    discard_settled, OutputFeedback, PendingOutput, PlayoutState, PlayoutWatch,
+    DISCARD_SETTLE_TIMEOUT, PROGRESS_TICK,
 };
 
 /// PTT tail held after a TNC frame's last sample has played.
@@ -34,6 +35,11 @@ enum TncPhase {
     Nominal(Instant),
     /// Last sample played; holding PTT for the tail.
     Tail(Instant),
+    /// Cancelled with PTT released: holding the next frame until every
+    /// cancelled sample below `through` is dropped (including the final
+    /// sink's buffered tail) or `until` passes, so the stale tail cannot
+    /// play at the start of the next keyed frame.
+    Discarding { through: u64, until: Instant },
 }
 
 /// TNC transmit state: one keyed frame at a time, later frames queued
@@ -118,15 +124,23 @@ impl TncTx {
                     PlayoutState::Played => self.active = Some(TncPhase::Tail(now + TNC_TAIL)),
                     PlayoutState::Failed(why) => {
                         let discarded = self.pending.clear();
+                        let through = self.pending.submitted();
                         if let Some(fb) = self.feedback.as_ref() {
-                            fb.discard_through(self.pending.submitted());
+                            fb.discard_through(through);
                         }
                         eprintln!(
                             "TNC transmission cancelled ({}); {} samples discarded",
                             why, discarded
                         );
                         let _ = ptt.set_ptt(PttState::Rx);
-                        self.active = None;
+                        let settled = self
+                            .feedback
+                            .as_ref()
+                            .is_none_or(|fb| discard_settled(fb, through));
+                        self.active = (!settled).then(|| TncPhase::Discarding {
+                            through,
+                            until: now + DISCARD_SETTLE_TIMEOUT,
+                        });
                     }
                 }
             }
@@ -138,6 +152,20 @@ impl TncTx {
             Some(TncPhase::Tail(until)) => {
                 if now >= *until {
                     let _ = ptt.set_ptt(PttState::Rx);
+                    self.active = None;
+                }
+            }
+            Some(TncPhase::Discarding { through, until }) => {
+                let settled = self
+                    .feedback
+                    .as_ref()
+                    .is_none_or(|fb| discard_settled(fb, *through));
+                if !settled && now >= *until {
+                    // The output worker still holds new audio back until
+                    // the sink confirms the drop.
+                    eprintln!("TNC: cancelled audio not yet dropped by the output");
+                }
+                if settled || now >= *until {
                     self.active = None;
                 }
             }
@@ -614,13 +642,49 @@ mod tests {
             h.now += PROGRESS_TICK;
             h.tx.poll(h.now, &mut h.out, &mut h.ptt);
         }
-        assert!(!h.tx.is_busy());
+        assert_eq!(*h.ptt.0.lock().unwrap(), vec![PttState::Tx, PttState::Rx]);
+        // The output never confirms the drop (no worker runs here), so the
+        // TNC stays unkeyed and idle for at most the settle bound.
+        let settle_by = h.now + DISCARD_SETTLE_TIMEOUT;
+        while h.tx.is_busy() {
+            assert!(h.now <= settle_by, "discard hold exceeded its bound");
+            h.now += PROGRESS_TICK;
+            h.tx.poll(h.now, &mut h.out, &mut h.ptt);
+        }
         assert_eq!(*h.ptt.0.lock().unwrap(), vec![PttState::Tx, PttState::Rx]);
         assert!(h.tx.pending.is_empty());
         assert_eq!(
             h.tx.pending.submitted(),
             65_536,
             "only ring-held samples remain counted"
+        );
+    }
+
+    /// A frame cancelled with its tail already buffered in the final sink's
+    /// ring must not play that tail at the start of the next frame: the sink
+    /// is flushed before the next frame's audio reaches it.
+    #[test]
+    fn cancelled_tail_in_sink_does_not_open_next_frame() {
+        let mut h = Harness::new();
+        let next = coppa_codec::afsk::modulate(b"next frame");
+        h.tx.submit(frame(0xff));
+        h.tx.submit(next.clone());
+        // The device consumes nothing until the stall fires, while the
+        // worker fills the sink's 8,192-sample ring with the doomed frame.
+        let deadline = h.now + STALL_TIMEOUT + PROGRESS_TICK;
+        while h.now < deadline {
+            h.tick(0);
+        }
+        assert!(h.sink.captured.is_empty());
+        assert_eq!(*h.ptt.0.lock().unwrap(), vec![PttState::Tx, PttState::Rx]);
+        h.run_until_idle(1024);
+        assert_eq!(
+            h.sink.captured, next,
+            "the cancelled frame's buffered tail played ahead of the next frame"
+        );
+        assert_eq!(
+            *h.ptt.0.lock().unwrap(),
+            vec![PttState::Tx, PttState::Rx, PttState::Tx, PttState::Rx]
         );
     }
 

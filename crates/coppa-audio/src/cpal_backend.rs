@@ -122,6 +122,10 @@ pub struct CpalSink {
     /// Progress published by the current stream's output callback; replaced
     /// on every `start()` so counts never carry across streams.
     progress: Option<Arc<ProgressShared>>,
+    /// Outstanding `discard_buffered` request on the current stream.
+    flush_request: Option<u64>,
+    /// Cumulative flushed count already reported on the current stream.
+    flushed_reported: u64,
     device: cpal::Device,
     config: StreamConfig,
 }
@@ -247,6 +251,8 @@ impl CpalSink {
             sample_rate,
             stream: None,
             progress: None,
+            flush_request: None,
+            flushed_reported: 0,
             device,
             config,
         })
@@ -271,6 +277,8 @@ impl CpalSink {
             sample_rate,
             stream: None,
             progress: None,
+            flush_request: None,
+            flushed_reported: 0,
             device,
             config,
         })
@@ -389,12 +397,37 @@ impl AudioSink for CpalSink {
             .map_err(|e| anyhow!("Failed to start output stream: {}", e))?;
         self.producer = producer;
         self.progress = Some(progress);
+        self.flush_request = None;
+        self.flushed_reported = 0;
         self.stream = Some(SendStream::new(stream));
         Ok(())
     }
 
+    /// The TX ring's consumer lives in the output callback, so the drop is
+    /// served there on its next run (see `fill_output`). A stopped or failed
+    /// stream will never play what its ring holds: nothing to wait for.
+    fn discard_buffered(&mut self) -> Result<Option<u64>> {
+        let progress = match self.progress.as_deref() {
+            Some(progress) if self.stream.is_some() && !progress.is_failed() => progress,
+            _ => {
+                self.flush_request = None;
+                return Ok(Some(0));
+            }
+        };
+        let request = *self
+            .flush_request
+            .get_or_insert_with(|| progress.request_flush());
+        Ok(progress.flush_result(request).map(|total| {
+            self.flush_request = None;
+            let dropped = total - self.flushed_reported;
+            self.flushed_reported = total;
+            dropped
+        }))
+    }
+
     fn stop(&mut self) -> Result<()> {
         self.progress = None;
+        self.flush_request = None;
         if let Some(stream) = self.stream.take() {
             stream
                 .pause()

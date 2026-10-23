@@ -54,6 +54,20 @@ pub trait AudioSink: Send {
     fn sample_rate(&self) -> u32;
     fn start(&mut self) -> Result<()>;
     fn stop(&mut self) -> Result<()>;
+
+    /// Drop every sample `write` has accepted that the device has not yet
+    /// consumed, so a cancelled transmission's buffered tail cannot play
+    /// ahead of the next one.
+    ///
+    /// Nonblocking and possibly deferred (a device callback may own the
+    /// buffer): the first call requests the drop, and each call returns
+    /// `Some(n)` once it has taken effect (`n` samples dropped; they are
+    /// never reported as consumed) or `None` while it is still pending. A
+    /// caller must not `write` until it has seen `Some`. The default suits a
+    /// sink that keeps no buffer of its own: nothing to drop.
+    fn discard_buffered(&mut self) -> Result<Option<u64>> {
+        Ok(Some(0))
+    }
 }
 
 /// Enumerate available audio devices.

@@ -87,9 +87,13 @@ impl AudioRingConsumer {
         self.inner.slots()
     }
 
-    /// Discard all buffered samples.
-    pub fn drain(&mut self) {
-        while self.inner.pop().is_ok() {}
+    /// Discard all buffered samples; returns how many were dropped.
+    pub fn drain(&mut self) -> usize {
+        let mut dropped = 0;
+        while self.inner.pop().is_ok() {
+            dropped += 1;
+        }
+        dropped
     }
 
     /// Returns true if the producer has been dropped.
@@ -171,7 +175,7 @@ mod tests {
     fn test_ring_drain() {
         let (mut tx, mut rx) = audio_ring(1024);
         tx.write(&[1.0, 2.0, 3.0]);
-        rx.drain();
+        assert_eq!(rx.drain(), 3);
         assert_eq!(rx.available(), 0);
     }
 

@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::audio_output::{
-    wait_for_playout, IntervalProgress, OutputFeedback, PlayoutWatch, StallClock, TxOutput,
-    PROGRESS_TICK,
+    wait_for_discard, wait_for_playout, IntervalProgress, OutputFeedback, PlayoutWatch, StallClock,
+    TxOutput, PROGRESS_TICK,
 };
 use crate::config::DaemonConfig;
 
@@ -1575,8 +1575,10 @@ impl EventLoop {
     /// Handle the automatic end of a keyed transmission (see
     /// `DaemonEvent::TxComplete`). Stale generations are ignored so an
     /// earlier job's completion can never unkey a later one. A cancelled job
-    /// discards its still-pending samples so they cannot play after PTT is
-    /// released.
+    /// discards its still-pending samples -- including the tail already
+    /// buffered in the final sink -- so they cannot play after PTT is
+    /// released, and the next queued transmission keys only once that
+    /// discard has taken effect, so the stale tail cannot open its frame.
     async fn handle_tx_complete(&mut self, generation: u64, completed: bool) {
         if generation != self.tx_generation {
             tracing::debug!(
@@ -1591,16 +1593,29 @@ impl EventLoop {
                 let mut tx_output = self.tx_output();
                 (tx_output.cancel(), tx_output.submitted())
             };
-            if let Some(ref feedback) = self.output_feedback {
-                // Also drop what the output worker has not yet handed to
-                // the device, so none of it plays after PTT is released.
-                feedback.discard_through(submitted);
-            }
             tracing::error!(
                 generation,
                 discarded,
                 "Transmission cancelled before it finished playing; releasing PTT"
             );
+            if let Some(feedback) = self.output_feedback.clone() {
+                // Also drop what the output worker and the final sink have
+                // not yet played, so none of it plays after PTT is released.
+                feedback.discard_through(submitted);
+                self.set_ptt(false).await;
+                // Hold the next transmission until the cancelled audio is
+                // gone; otherwise draining the TX queue rekeys at once and
+                // the sink's buffered tail plays at the start of that frame.
+                if !wait_for_discard(&feedback, submitted).await {
+                    tracing::warn!(
+                        generation,
+                        "Cancelled TX audio not yet dropped by the output; \
+                         new audio stays held behind the drop"
+                    );
+                }
+                self.try_drain_tx_queue().await;
+                return;
+            }
         }
         self.handle_ptt_change(false).await;
     }
@@ -2903,6 +2918,16 @@ impl EventLoop {
     }
 
     async fn handle_ptt_change(&mut self, tx: bool) {
+        self.set_ptt(tx).await;
+        if !tx {
+            // PTT just released: continue draining the TX queue if more is queued.
+            self.try_drain_tx_queue().await;
+        }
+    }
+
+    /// Change physical PTT and the keyed-interval bookkeeping, without
+    /// draining the TX queue on release (see `handle_ptt_change`).
+    async fn set_ptt(&mut self, tx: bool) {
         let state = if tx { PttState::Tx } else { PttState::Rx };
         if let Err(e) = self.ptt.set_ptt(state) {
             tracing::warn!(error = %e, "PTT control error");
@@ -2917,8 +2942,6 @@ impl EventLoop {
             self.is_transmitting = false;
             self.tx_keyed_since = None;
             self.tx_stall_clock = None;
-            // PTT just released: continue draining the TX queue if more is queued.
-            self.try_drain_tx_queue().await;
         }
     }
 
@@ -5984,6 +6007,42 @@ mod tests {
             .await;
         assert!(!rig.event_loop.is_transmitting);
         assert_eq!(rig.event_loop.tx_output().pending_len(), 0);
+    }
+
+    /// A watchdog-cancelled transmission whose tail is already buffered in
+    /// the final sink's ring must not play that tail at the start of the
+    /// next transmission: the sink is flushed before new audio reaches it.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_tail_in_sink_does_not_open_next_frame() {
+        let mut config = DaemonConfig::default();
+        config.radio.max_tx_duration_s = 1;
+        let mut rig = TxRig::new(config);
+        let stale = vec![0.5f32; 48_000 * 3];
+        rig.event_loop.transmit_samples(&stale).await;
+        // Fill the device ring with the doomed transmission, but let the
+        // device consume none of it before the watchdog fires.
+        for _ in 0..16 {
+            rig.pump(0);
+        }
+        assert!(rig.sink.captured.is_empty());
+        let (generation, completed) = rig.next_completion().await;
+        assert_eq!((generation, completed), (1, false));
+        rig.event_loop
+            .handle_tx_complete(generation, completed)
+            .await;
+        assert!(!rig.event_loop.is_transmitting);
+
+        let next: Vec<f32> = (0..20_000).map(|i| -(i as f32) - 1.0).collect();
+        rig.event_loop.transmit_samples(&next).await;
+        rig.deliver(next.len(), &[480, 1000]);
+        for _ in 0..4 {
+            rig.pump(8192);
+        }
+        assert_eq!(
+            rig.sink.captured, next,
+            "the cancelled transmission's buffered tail played ahead of the next frame"
+        );
+        assert_eq!(rig.next_completion().await, (2, true));
     }
 
     /// A transmission queued behind an active one cannot restart the
