@@ -7,6 +7,7 @@
 use anyhow::Result;
 
 pub mod loopback;
+pub mod playout;
 pub mod ringbuf;
 pub mod vox;
 
@@ -17,6 +18,7 @@ pub mod cpal_backend;
 pub mod file_backend;
 
 pub use loopback::{LoopbackBackend, LoopbackSink, LoopbackSource};
+pub use playout::PlaybackProgress;
 pub use ringbuf::{audio_ring, AudioRingConsumer, AudioRingProducer};
 pub use vox::VoxDetector;
 

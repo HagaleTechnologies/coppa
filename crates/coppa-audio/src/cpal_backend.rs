@@ -4,6 +4,10 @@ use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::StreamConfig;
 
+use std::sync::Arc;
+use std::time::Instant;
+
+use crate::playout::{fill_output, CallbackState, PlaybackProgress, ProgressShared};
 use crate::ringbuf::{audio_ring, AudioRingConsumer, AudioRingProducer};
 use crate::{AudioDevice, AudioSink, AudioSource};
 
@@ -105,10 +109,19 @@ pub struct CpalSource {
 }
 
 /// CPAL-based audio sink for playing audio through hardware.
+///
+/// `write` is nonblocking and lossless from the caller's point of view: it
+/// accepts at most the TX ring's free space and returns that count, so a
+/// caller retains and retries the unwritten suffix. Use
+/// [`CpalSink::playback_progress`] to learn when accepted samples have been
+/// consumed by the device callback and are predicted to have finished playing.
 pub struct CpalSink {
     producer: AudioRingProducer,
     sample_rate: u32,
     stream: Option<SendStream>,
+    /// Progress published by the current stream's output callback; replaced
+    /// on every `start()` so counts never carry across streams.
+    progress: Option<Arc<ProgressShared>>,
     device: cpal::Device,
     config: StreamConfig,
 }
@@ -233,6 +246,7 @@ impl CpalSink {
             producer,
             sample_rate,
             stream: None,
+            progress: None,
             device,
             config,
         })
@@ -256,15 +270,44 @@ impl CpalSink {
             producer,
             sample_rate,
             stream: None,
+            progress: None,
             device,
             config,
         })
+    }
+
+    /// Return a coherent progress snapshot without blocking for playback.
+    /// Fails when the stream is not running, has failed, or its playback
+    /// timing cannot be established. start() begins a new count at zero.
+    ///
+    /// A caller that has had `target` samples accepted by `write` on this
+    /// started stream knows they have played once
+    /// `consumed_samples >= target && remaining.is_zero()`
+    /// ([`PlaybackProgress::has_played`]).
+    pub fn playback_progress(&self) -> Result<PlaybackProgress> {
+        match (&self.stream, &self.progress) {
+            (Some(_), Some(progress)) => progress.progress_at(Instant::now()),
+            _ => Err(anyhow!("output stream is not running")),
+        }
     }
 }
 
 impl AudioSink for CpalSink {
     fn write(&mut self, samples: &[f32]) -> Result<usize> {
-        Ok(self.producer.write(samples))
+        let progress = match (&self.stream, &self.progress) {
+            (Some(_), Some(progress)) => progress,
+            _ => return Err(anyhow!("output stream is not running")),
+        };
+        if progress.is_failed() {
+            return Err(anyhow!("output stream failed"));
+        }
+        if self.producer.is_abandoned() {
+            return Err(anyhow!("output stream callback is gone"));
+        }
+        // Offer only what fits, so retained backpressure is a short count
+        // for the caller to retry, not a drop counted as overflow.
+        let take = samples.len().min(self.producer.available());
+        Ok(self.producer.write(&samples[..take]))
     }
 
     fn sample_rate(&self) -> u32 {
@@ -272,21 +315,34 @@ impl AudioSink for CpalSink {
     }
 
     fn start(&mut self) -> Result<()> {
+        // Drop any previous stream first so its callback can no longer
+        // publish into a progress state a caller might still read.
+        self.stop()?;
         let (producer, mut consumer) = audio_ring(8192);
-        self.producer = producer;
+        let progress = Arc::new(ProgressShared::new(Instant::now()));
+        let callback_progress = progress.clone();
+        let error_progress = progress.clone();
+        let mut callback_state = CallbackState::new(self.sample_rate);
 
         let stream = self
             .device
             .build_output_stream(
                 self.config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let read = consumer.read(data);
-                    // Fill remaining with silence
-                    for sample in &mut data[read..] {
-                        *sample = 0.0;
-                    }
+                move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                    let entry = Instant::now();
+                    let ts = info.timestamp();
+                    let delay = ts.playback.checked_duration_since(ts.callback);
+                    fill_output(
+                        &mut consumer,
+                        data,
+                        &callback_progress,
+                        &mut callback_state,
+                        entry,
+                        delay,
+                    );
                 },
-                |err| {
+                move |err| {
+                    error_progress.fail();
                     eprintln!("CPAL output error: {}", err);
                 },
                 None,
@@ -296,11 +352,14 @@ impl AudioSink for CpalSink {
         stream
             .play()
             .map_err(|e| anyhow!("Failed to start output stream: {}", e))?;
+        self.producer = producer;
+        self.progress = Some(progress);
         self.stream = Some(SendStream::new(stream));
         Ok(())
     }
 
     fn stop(&mut self) -> Result<()> {
+        self.progress = None;
         if let Some(stream) = self.stream.take() {
             stream
                 .pause()

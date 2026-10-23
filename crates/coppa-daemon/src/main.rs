@@ -3,6 +3,10 @@
 //! Manages the engine lifecycle, host interfaces, and radio control in a
 //! persistent background process.
 
+// Shared with the library target; the binary uses only part of its API
+// (and none of the output worker without `cpal-backend`).
+#[allow(dead_code)]
+mod audio_output;
 mod config;
 mod event_loop;
 #[cfg(feature = "websocket")]
@@ -145,54 +149,58 @@ async fn main() -> Result<()> {
             Err(e) => eprintln!("No audio input device: {}", e),
         }
 
-        // Spawn audio output: event loop writes to ring buffer -> CPAL speaker
-        let mut audio_out_cons = audio_out_consumer;
+        // Spawn audio output: event loop writes to ring buffer -> CPAL speaker.
+        // The sink is created, started, stopped and dropped on this one
+        // worker thread (CPAL streams are thread-affine), and the worker
+        // retains each chunk until the sink has accepted all of it, feeding
+        // playback progress back so PTT is released from samples played.
         let output_shutdown = shutdown_flag.clone();
         let output_device_name = config.audio.output_device.clone();
-        let sink_result = if output_device_name.is_empty() {
-            coppa_audio::CpalSink::new(sample_rate, buf_size)
-        } else {
-            match coppa_audio::find_output_device_by_name(&output_device_name) {
-                Some(device) => {
-                    tracing::info!(device = %output_device_name, "Audio output: using named device");
-                    coppa_audio::cpal_backend::CpalSink::from_device(device, sample_rate, buf_size)
+        let output_feedback = std::sync::Arc::new(audio_output::OutputFeedback::default());
+        event_loop.set_output_feedback(output_feedback.clone());
+        tokio::task::spawn_blocking(move || {
+            let sink_result = if output_device_name.is_empty() {
+                coppa_audio::CpalSink::new(sample_rate, buf_size)
+            } else {
+                match coppa_audio::find_output_device_by_name(&output_device_name) {
+                    Some(device) => {
+                        tracing::info!(device = %output_device_name, "Audio output: using named device");
+                        coppa_audio::cpal_backend::CpalSink::from_device(
+                            device,
+                            sample_rate,
+                            buf_size,
+                        )
+                    }
+                    None => {
+                        tracing::warn!(
+                            device = %output_device_name,
+                            "Audio output device not found, falling back to default"
+                        );
+                        coppa_audio::CpalSink::new(sample_rate, buf_size)
+                    }
                 }
-                None => {
-                    tracing::warn!(
-                        device = %output_device_name,
-                        "Audio output device not found, falling back to default"
-                    );
-                    coppa_audio::CpalSink::new(sample_rate, buf_size)
+            };
+            let mut sink = match sink_result {
+                Ok(sink) => sink,
+                Err(e) => {
+                    eprintln!("No audio output device: {}", e);
+                    output_feedback.fail();
+                    return;
                 }
+            };
+            if let Err(e) = sink.start() {
+                eprintln!("Failed to start audio output: {}", e);
+                output_feedback.fail();
+                return;
             }
-        };
-        match sink_result {
-            Ok(mut sink) => {
-                if let Err(e) = sink.start() {
-                    eprintln!("Failed to start audio output: {}", e);
-                } else {
-                    tracing::info!(sample_rate, "Audio output started");
-                    tokio::task::spawn_blocking(move || {
-                        let mut buf = vec![0.0f32; 1024];
-                        loop {
-                            // E5: Check shutdown flag in addition to is_abandoned
-                            if audio_out_cons.is_abandoned()
-                                || output_shutdown.load(std::sync::atomic::Ordering::Acquire)
-                            {
-                                break;
-                            }
-                            let n = audio_out_cons.read(&mut buf);
-                            if n > 0 {
-                                let _ = sink.write(&buf[..n]);
-                            } else {
-                                std::thread::sleep(std::time::Duration::from_millis(10));
-                            }
-                        }
-                    });
-                }
-            }
-            Err(e) => eprintln!("No audio output device: {}", e),
-        }
+            tracing::info!(sample_rate, "Audio output started");
+            audio_output::OutputWorker::new(1024, sample_rate, output_feedback).run(
+                audio_out_consumer,
+                sink,
+                |sink| sink.playback_progress(),
+                output_shutdown,
+            );
+        });
     }
 
     // Suppress unused variable warnings when cpal-backend is not enabled
