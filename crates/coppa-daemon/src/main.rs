@@ -80,7 +80,6 @@ async fn main() -> Result<()> {
     let (audio_out_producer, audio_out_consumer) =
         coppa_audio::audio_ring(config.audio.buffer_size);
     let (audio_in_producer, audio_in_consumer) = coppa_audio::audio_ring(config.audio.buffer_size);
-    event_loop.set_audio_out(audio_out_producer);
     event_loop.set_audio_in(audio_in_consumer);
 
     // E5: Get shutdown flag for audio threads
@@ -157,6 +156,12 @@ async fn main() -> Result<()> {
         let output_shutdown = shutdown_flag.clone();
         let output_device_name = config.audio.output_device.clone();
         let output_feedback = std::sync::Arc::new(audio_output::OutputFeedback::default());
+        // Only wire the audio-out ring when this worker drains it: TX audio
+        // is retained until the ring accepts it, so an undrained ring would
+        // accumulate every transmission. If the device fails to open, the
+        // worker drops its end, the ring reads as abandoned and nothing more
+        // is queued.
+        event_loop.set_audio_out(audio_out_producer);
         event_loop.set_output_feedback(output_feedback.clone());
         tokio::task::spawn_blocking(move || {
             let sink_result = if output_device_name.is_empty() {
@@ -206,8 +211,11 @@ async fn main() -> Result<()> {
     // Suppress unused variable warnings when cpal-backend is not enabled
     #[cfg(not(feature = "cpal-backend"))]
     {
+        // No hardware output: leave the audio-out ring unwired so TX audio is
+        // not queued for a consumer that never drains it.
+        drop(audio_out_producer);
+        drop(audio_out_consumer);
         let _ = audio_in_producer;
-        let _ = audio_out_consumer;
         let _ = shutdown_flag;
     }
 

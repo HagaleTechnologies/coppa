@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::audio_output::{
-    wait_for_playout, OutputFeedback, PendingOutput, PlayoutWatch, PROGRESS_TICK,
+    wait_for_playout, OutputFeedback, PlayoutWatch, TxOutput, PROGRESS_TICK,
 };
 use crate::config::DaemonConfig;
 
@@ -54,6 +54,14 @@ pub enum DaemonEvent {
     Shutdown,
 }
 
+/// Lock the shared TX output, recovering from poisoning (its state is
+/// always consistent between calls; nothing panics while holding it).
+fn lock_tx_output(tx_output: &std::sync::Mutex<TxOutput>) -> std::sync::MutexGuard<'_, TxOutput> {
+    tx_output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// The main daemon event loop.
 pub struct EventLoop {
     config: DaemonConfig,
@@ -61,18 +69,16 @@ pub struct EventLoop {
     event_rx: mpsc::Receiver<DaemonEvent>,
     event_tx: mpsc::Sender<DaemonEvent>,
     running: bool,
-    /// Optional audio output ring buffer producer for writing TX samples.
-    audio_out: Option<AudioRingProducer>,
+    /// The audio-out ring and the TX samples retained ahead of it until it
+    /// has room, shared with the feeder task `run` spawns so a frame larger
+    /// than the ring is delivered whole instead of truncated.
+    tx_output: Arc<std::sync::Mutex<TxOutput>>,
     /// Optional audio input ring buffer consumer for reading RX samples.
     audio_in: Option<AudioRingConsumer>,
     /// PTT controller (defaults to NullPtt if unconfigured).
     ptt: Box<dyn PttControl>,
     /// Optional sender for host responses (decoded data, status updates).
     response_tx: Option<mpsc::Sender<coppa_host::HostResponse>>,
-    /// TX samples retained ahead of `audio_out` until the ring has room;
-    /// flushed on every `run` TX tick so a frame larger than the ring is
-    /// delivered whole instead of truncated.
-    pending_audio_out: PendingOutput,
     /// Playback progress from the audio output worker. `None` when no
     /// hardware output is wired (tests, headless builds), in which case PTT
     /// release falls back to the nominal audio duration.
@@ -339,11 +345,10 @@ impl EventLoop {
             event_rx,
             event_tx,
             running: false,
-            audio_out: None,
+            tx_output: Arc::new(std::sync::Mutex::new(TxOutput::default())),
             audio_in: None,
             ptt,
             response_tx: None,
-            pending_audio_out: PendingOutput::default(),
             output_feedback: None,
             tx_generation: 0,
             audio_in_overflow_count: 0,
@@ -482,8 +487,9 @@ impl EventLoop {
         self.output_feedback = Some(feedback);
     }
 
+    #[cfg_attr(not(feature = "cpal-backend"), allow(dead_code))] // coppad wires it only with CPAL output
     pub fn set_audio_out(&mut self, producer: AudioRingProducer) {
-        self.audio_out = Some(producer);
+        self.tx_output().set_producer(producer);
     }
 
     /// Set the audio input ring buffer for RX sample capture.
@@ -679,10 +685,21 @@ impl EventLoop {
         // Beacon-mode check interval (Phase 4 Task 3): cheap no-op tick when
         // beacon mode is disabled (the default); see `maybe_send_beacon`.
         let mut beacon_poll = tokio::time::interval(tokio::time::Duration::from_secs(1));
-        // TX delivery tick: moves retained TX samples into the audio-out ring
-        // as it drains (see `pending_audio_out`).
-        let mut tx_tick = tokio::time::interval(PROGRESS_TICK);
-        tx_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // TX feeder: moves retained TX samples into the audio-out ring as it
+        // drains, every PROGRESS_TICK, independently of whatever this loop is
+        // awaiting (busy-channel holdoff, decode), so audio already playing
+        // is never starved mid-frame.
+        let feeder = {
+            let tx_output = self.tx_output.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(PROGRESS_TICK);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    lock_tx_output(&tx_output).flush();
+                }
+            })
+        };
 
         while self.running {
             tokio::select! {
@@ -710,9 +727,6 @@ impl EventLoop {
                             self.handle_tx_complete(generation, completed).await;
                         }
                     }
-                }
-                _ = tx_tick.tick() => {
-                    self.flush_pending_audio_out();
                 }
                 _ = audio_poll.tick() => {
                     self.poll_audio_input().await;
@@ -754,6 +768,7 @@ impl EventLoop {
             }
         }
 
+        feeder.abort();
         Ok(())
     }
 
@@ -1518,27 +1533,35 @@ impl EventLoop {
     /// a future real caller of that event should route through
     /// `transmit_samples` instead if it represents an actual transmission.
     ///
-    /// Samples the ring has no room for are retained in `pending_audio_out`
+    /// Samples the ring has no room for are retained in `tx_output`
     /// (in order, behind anything already pending) and moved on later TX
     /// ticks; nothing is dropped. Raw samples share that FIFO and its
     /// cumulative count, so they cannot corrupt a keyed job's playback target.
-    fn handle_audio_out(&mut self, samples: &[f32]) {
+    ///
+    /// Returns false when the samples could not be queued because no live
+    /// output ring is wired.
+    fn handle_audio_out(&mut self, samples: &[f32]) -> bool {
         if samples.is_empty() {
-            return;
+            return true;
         }
-        if self.audio_out.is_none() {
+        if self.tx_output().submit(samples).is_none() {
             tracing::debug!(samples = samples.len(), "Audio out: no output device wired");
-            return;
+            return false;
         }
-        self.pending_audio_out.push(samples);
-        self.flush_pending_audio_out();
+        true
     }
 
-    /// Move retained TX samples into the audio-out ring as far as it has room.
-    fn flush_pending_audio_out(&mut self) {
-        if let Some(ref mut producer) = self.audio_out {
-            self.pending_audio_out.flush(producer);
-        }
+    /// The shared TX output state (see `tx_output`).
+    fn tx_output(&self) -> std::sync::MutexGuard<'_, TxOutput> {
+        lock_tx_output(&self.tx_output)
+    }
+
+    /// Move retained TX samples into the audio-out ring as far as it has
+    /// room (the feeder task's step, also used by tests that drive delivery
+    /// without `run`).
+    #[cfg(test)]
+    fn flush_pending_audio_out(&self) {
+        self.tx_output().flush();
     }
 
     /// Handle the automatic end of a keyed transmission (see
@@ -1556,11 +1579,14 @@ impl EventLoop {
             return;
         }
         if !completed {
-            let discarded = self.pending_audio_out.clear();
+            let (discarded, submitted) = {
+                let mut tx_output = self.tx_output();
+                (tx_output.cancel(), tx_output.submitted())
+            };
             if let Some(ref feedback) = self.output_feedback {
                 // Also drop what the output worker has not yet handed to
                 // the device, so none of it plays after PTT is released.
-                feedback.discard_through(self.pending_audio_out.submitted());
+                feedback.discard_through(submitted);
             }
             tracing::error!(
                 generation,
@@ -1631,7 +1657,7 @@ impl EventLoop {
         if pre_delay_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(pre_delay_ms)).await;
         }
-        self.handle_audio_out(samples);
+        let queued = self.handle_audio_out(samples);
         // Release PTT once this transmission's last sample has played (not
         // after its nominal duration): every sample stays queued until the
         // rings accept it, so the cumulative submitted count is this job's
@@ -1639,14 +1665,13 @@ impl EventLoop {
         // `TxComplete`, so only the newest keyed transmission can unkey.
         self.tx_generation += 1;
         let generation = self.tx_generation;
-        let target = self.pending_audio_out.submitted();
+        let target = self.tx_output().submitted();
         let tail = std::time::Duration::from_millis(self.config.radio.ptt_tail_delay_ms);
         let max_tx = std::time::Duration::from_secs(self.config.radio.max_tx_duration_s);
-        let feedback = if self.audio_out.is_some() {
-            self.output_feedback.clone()
-        } else {
-            None
-        };
+        // Whenever an output worker is wired, completion comes only from its
+        // feedback -- even if its end of the ring is gone, so a failed or
+        // dead output cancels the transmission instead of reporting success.
+        let feedback = self.output_feedback.clone();
         // Headless fallback (no output worker reporting progress): the
         // nominal audio duration plus the ring drain time, as before.
         let sample_rate = self.config.audio.sample_rate.max(1) as u64;
@@ -1657,6 +1682,12 @@ impl EventLoop {
         let ptt_event_tx = self.event_tx.clone();
         tokio::spawn(async move {
             let completed = match feedback {
+                // An output worker is wired but its ring is gone: nothing
+                // can play, so cancel at once rather than report success.
+                Some(_) if !queued => {
+                    tracing::error!(generation, "TX audio could not be queued; output is down");
+                    false
+                }
                 Some(feedback) => {
                     let watch = PlayoutWatch::new(target, Instant::now(), Some(max_tx));
                     match wait_for_playout(&feedback, watch).await {
@@ -5735,15 +5766,12 @@ mod tests {
         rig.event_loop.transmit_samples(&frame).await;
         assert!(rig.event_loop.is_transmitting);
         assert!(
-            !rig.event_loop.pending_audio_out.is_empty(),
+            rig.event_loop.tx_output().pending_len() > 0,
             "the unwritten suffix is retained, not dropped"
         );
         rig.deliver(frame.len(), &[480, 0, 4096, 64, 0, 0, 1000]);
         assert_eq!(rig.sink.captured, frame);
-        assert_eq!(
-            rig.event_loop.audio_out.as_ref().unwrap().overflow_count(),
-            0
-        );
+        assert_eq!(rig.event_loop.tx_output().overflow_count(), 0);
 
         let (generation, completed) = rig.next_completion().await;
         assert_eq!((generation, completed), (1, true));
@@ -5816,7 +5844,7 @@ mod tests {
             .handle_tx_complete(generation, completed)
             .await;
         assert!(!rig.event_loop.is_transmitting);
-        assert!(rig.event_loop.pending_audio_out.is_empty());
+        assert_eq!(rig.event_loop.tx_output().pending_len(), 0);
         rig.event_loop.flush_pending_audio_out();
         rig.pump(8192);
         rig.pump(8192);
@@ -5843,7 +5871,7 @@ mod tests {
             .handle_tx_complete(generation, completed)
             .await;
         assert!(!rig.event_loop.is_transmitting);
-        assert!(rig.event_loop.pending_audio_out.is_empty());
+        assert_eq!(rig.event_loop.tx_output().pending_len(), 0);
     }
 
     /// No downstream progress for five seconds fails the transmission.
@@ -5854,6 +5882,111 @@ mod tests {
         let started = tokio::time::Instant::now();
         assert_eq!(rig.next_completion().await, (1, false));
         assert!(started.elapsed() >= crate::audio_output::STALL_TIMEOUT);
+    }
+
+    /// A due station-ID frame is prepended to the payload: both play whole,
+    /// ID first, under one keyed transmission larger than both rings.
+    #[tokio::test]
+    async fn station_id_prefix_and_payload_both_play_whole() {
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = "N0CALL".to_string();
+        config.station_id.id_interval_secs = 600;
+        let mut rig = TxRig::new(config);
+        rig.event_loop.last_id_time = Instant::now() - Duration::from_secs(601);
+        let id_frame = rig
+            .event_loop
+            .encode_id_beacon_frame()
+            .expect("a configured callsign builds an ID frame");
+        let payload = rig.event_loop.engine.encode_bytes(b"payload").unwrap();
+        rig.event_loop.transmit_samples(&payload).await;
+        let mut expected = id_frame;
+        expected.extend_from_slice(&payload);
+        assert!(expected.len() > 2 * 8192);
+        rig.deliver(expected.len(), &[1024, 0, 3000]);
+        assert_eq!(rig.sink.captured, expected);
+        assert_eq!(rig.next_completion().await, (1, true));
+    }
+
+    /// PTT lead elapses before any sample is queued, and the PTT tail is
+    /// measured from the last sample's playback, not from the enqueue.
+    #[tokio::test(start_paused = true)]
+    async fn lead_precedes_audio_and_tail_follows_final_playback() {
+        let mut rig = TxRig::new(DaemonConfig::default());
+        rig.event_loop.config.radio.ptt_pre_delay_ms = 50;
+        rig.event_loop.config.radio.ptt_tail_delay_ms = 200;
+        let samples = vec![0.3f32; 30_000];
+        let started = tokio::time::Instant::now();
+        rig.event_loop.transmit_samples(&samples).await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "lead before audio"
+        );
+        // Hold playback for a while: no completion may arrive meanwhile.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(rig.event_loop.event_rx.try_recv().is_err());
+        rig.deliver(samples.len(), &[4096]);
+        let played_at = tokio::time::Instant::now();
+        assert_eq!(rig.next_completion().await, (1, true));
+        assert!(
+            played_at.elapsed() >= Duration::from_millis(200),
+            "tail after playback"
+        );
+    }
+
+    /// If the output worker's end of the ring disappears, the transmission
+    /// still ends (as a failure) within the stall bound instead of holding
+    /// PTT forever.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_output_consumer_ends_transmission_bounded() {
+        let TxRig {
+            mut event_loop,
+            outer,
+            ..
+        } = TxRig::new(DaemonConfig::default());
+        drop(outer);
+        event_loop.transmit_samples(&[0.2f32; 20_000]).await;
+        let event = tokio::time::timeout(Duration::from_secs(10), event_loop.event_rx.recv())
+            .await
+            .expect("completion within the stall bound")
+            .unwrap();
+        assert!(matches!(
+            event,
+            DaemonEvent::TxComplete {
+                generation: 1,
+                completed: false
+            }
+        ));
+    }
+
+    /// `run`'s feeder task keeps moving retained TX samples into a small
+    /// audio-out ring as a consumer drains it, until the whole transmission
+    /// has been delivered in order.
+    #[tokio::test]
+    async fn run_feeder_delivers_backpressured_audio_whole() {
+        let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        let tx = event_loop.event_sender();
+        let (producer, mut consumer) = coppa_audio::audio_ring(1024);
+        event_loop.set_audio_out(producer);
+        let samples: Vec<f32> = (0..20_000).map(|i| i as f32).collect();
+        let expected = samples.clone();
+        let driver = async move {
+            tx.send(DaemonEvent::AudioOut(samples)).await.unwrap();
+            let mut captured = Vec::new();
+            let mut buf = vec![0.0f32; 700];
+            while captured.len() < expected.len() {
+                let n = consumer.read(&mut buf);
+                captured.extend_from_slice(&buf[..n]);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            tx.send(DaemonEvent::Shutdown).await.unwrap();
+            assert_eq!(captured, expected);
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(event_loop.run(), driver)
+        })
+        .await
+        .expect("feeder must deliver the whole transmission");
+        result.unwrap();
     }
 
     /// Shutdown is still handled while TX output is backpressured.
@@ -5872,7 +6005,7 @@ mod tests {
             .await
             .expect("run() must exit on shutdown while output is full")
             .unwrap();
-        assert_eq!(event_loop.pending_audio_out.len(), 10_000 - 1024);
+        assert_eq!(event_loop.tx_output().pending_len(), 10_000 - 1024);
     }
 
     #[tokio::test]

@@ -489,6 +489,8 @@ mod tests {
             let samples = frame(fill);
             assert!(samples.len() > 65_536);
             let mut h = Harness::new();
+            // Delayed, partial downstream writes must not truncate either.
+            h.sink.write_limits = vec![Some(300), Some(0), None, Some(7), Some(0)];
             h.tx.submit(samples.clone());
             h.run_until_idle(240);
             assert_eq!(h.sink.captured, samples, "fill {fill:#x}");

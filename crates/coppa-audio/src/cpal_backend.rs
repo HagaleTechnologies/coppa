@@ -285,29 +285,60 @@ impl CpalSink {
     /// `consumed_samples >= target && remaining.is_zero()`
     /// ([`PlaybackProgress::has_played`]).
     pub fn playback_progress(&self) -> Result<PlaybackProgress> {
-        match (&self.stream, &self.progress) {
-            (Some(_), Some(progress)) => progress.progress_at(Instant::now()),
-            _ => Err(anyhow!("output stream is not running")),
-        }
+        running_progress(self.stream.is_some(), self.progress.as_deref())?
+            .progress_at(Instant::now())
     }
+}
+
+/// Whether an output error callback ends the stream. CPAL reports an xrun
+/// through the error callback and then recovers the stream itself, so an
+/// underrun is not terminal; every other error fails the stream.
+fn is_terminal_output_error(kind: cpal::ErrorKind) -> bool {
+    kind != cpal::ErrorKind::Xrun
+}
+
+/// The current stream's progress state, or an error when no stream is
+/// running (before `start`, after `stop`).
+fn running_progress(
+    stream_running: bool,
+    progress: Option<&ProgressShared>,
+) -> Result<&ProgressShared> {
+    match progress {
+        Some(progress) if stream_running => Ok(progress),
+        _ => Err(anyhow!("output stream is not running")),
+    }
+}
+
+/// Nonblocking, capped write into a running stream's TX ring: fails for a
+/// stopped, failed, or callback-less stream, and otherwise accepts at most
+/// the ring's free space so the caller retains the rest.
+fn write_capped(
+    producer: &mut AudioRingProducer,
+    stream_running: bool,
+    progress: Option<&ProgressShared>,
+    samples: &[f32],
+) -> Result<usize> {
+    let progress = running_progress(stream_running, progress)?;
+    if progress.is_failed() {
+        return Err(anyhow!("output stream failed"));
+    }
+    if producer.is_abandoned() {
+        return Err(anyhow!("output stream callback is gone"));
+    }
+    // Offer only what fits, so retained backpressure is a short count for
+    // the caller to retry, not a drop counted as overflow.
+    let take = samples.len().min(producer.available());
+    Ok(producer.write(&samples[..take]))
 }
 
 impl AudioSink for CpalSink {
     fn write(&mut self, samples: &[f32]) -> Result<usize> {
-        let progress = match (&self.stream, &self.progress) {
-            (Some(_), Some(progress)) => progress,
-            _ => return Err(anyhow!("output stream is not running")),
-        };
-        if progress.is_failed() {
-            return Err(anyhow!("output stream failed"));
-        }
-        if self.producer.is_abandoned() {
-            return Err(anyhow!("output stream callback is gone"));
-        }
-        // Offer only what fits, so retained backpressure is a short count
-        // for the caller to retry, not a drop counted as overflow.
-        let take = samples.len().min(self.producer.available());
-        Ok(self.producer.write(&samples[..take]))
+        write_capped(
+            &mut self.producer,
+            self.stream.is_some(),
+            self.progress.as_deref(),
+            samples,
+        )
     }
 
     fn sample_rate(&self) -> u32 {
@@ -341,9 +372,13 @@ impl AudioSink for CpalSink {
                         delay,
                     );
                 },
-                move |err| {
-                    error_progress.fail();
-                    eprintln!("CPAL output error: {}", err);
+                move |err: cpal::Error| {
+                    if is_terminal_output_error(err.kind()) {
+                        error_progress.fail();
+                        eprintln!("CPAL output error: {}", err);
+                    } else {
+                        eprintln!("CPAL output underrun (stream recovered): {}", err);
+                    }
                 },
                 None,
             )
@@ -411,6 +446,59 @@ pub fn find_output_device_by_name(name: &str) -> Option<cpal::Device> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Before start / after stop there is no running stream: writes and
+    /// progress both fail instead of feeding a disconnected ring.
+    #[test]
+    fn not_running_stream_rejects_writes_and_progress() {
+        let (mut producer, _consumer) = audio_ring(64);
+        assert!(write_capped(&mut producer, false, None, &[0.1; 4]).is_err());
+        let progress = ProgressShared::new(Instant::now());
+        assert!(write_capped(&mut producer, false, Some(&progress), &[0.1; 4]).is_err());
+        assert!(running_progress(false, Some(&progress)).is_err());
+        assert!(running_progress(true, None).is_err());
+        assert_eq!(producer.overflow_count(), 0);
+    }
+
+    /// A running stream accepts at most its free space (a short count, not
+    /// overflow); a failed stream or a dropped callback consumer fails.
+    #[test]
+    fn running_stream_caps_writes_and_fails_when_broken() {
+        let (mut producer, consumer) = audio_ring(8);
+        let progress = ProgressShared::new(Instant::now());
+        assert_eq!(
+            write_capped(&mut producer, true, Some(&progress), &[0.1; 20]).unwrap(),
+            8
+        );
+        assert_eq!(
+            write_capped(&mut producer, true, Some(&progress), &[0.1; 20]).unwrap(),
+            0
+        );
+        assert_eq!(producer.overflow_count(), 0);
+        progress.fail();
+        assert!(write_capped(&mut producer, true, Some(&progress), &[0.1; 1]).is_err());
+        let fresh = ProgressShared::new(Instant::now());
+        assert_eq!(
+            running_progress(true, Some(&fresh))
+                .unwrap()
+                .progress_at(Instant::now())
+                .unwrap()
+                .consumed_samples,
+            0,
+            "a new start's progress begins at zero"
+        );
+        drop(consumer);
+        assert!(write_capped(&mut producer, true, Some(&fresh), &[0.1; 1]).is_err());
+    }
+
+    #[test]
+    fn underruns_are_recoverable_other_errors_terminal() {
+        assert!(!is_terminal_output_error(cpal::ErrorKind::Xrun));
+        assert!(is_terminal_output_error(
+            cpal::ErrorKind::DeviceNotAvailable
+        ));
+        assert!(is_terminal_output_error(cpal::ErrorKind::DeviceChanged));
+    }
 
     #[test]
     fn test_find_input_device_returns_none_for_nonexistent() {

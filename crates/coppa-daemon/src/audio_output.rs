@@ -99,6 +99,69 @@ impl PendingOutput {
     }
 }
 
+/// Retained TX samples plus the outer ring they feed. Shared (behind a
+/// mutex held only briefly, never across an await) between the daemon event
+/// loop, which queues and cancels transmissions, and a feeder task that moves
+/// samples into the ring every [`PROGRESS_TICK`] whatever the event loop is
+/// awaiting, so a frame still playing is never starved mid-transmission.
+#[derive(Default)]
+pub struct TxOutput {
+    pending: PendingOutput,
+    producer: Option<AudioRingProducer>,
+}
+
+impl TxOutput {
+    /// Wire the outer audio-out ring.
+    pub fn set_producer(&mut self, producer: AudioRingProducer) {
+        self.producer = Some(producer);
+    }
+
+    /// True when a ring is wired and something still consumes it.
+    pub fn is_live(&self) -> bool {
+        self.producer.as_ref().is_some_and(|p| !p.is_abandoned())
+    }
+
+    /// Queue `samples` behind everything pending and move what fits. Returns
+    /// the cumulative playback target, or `None` (nothing queued) when no
+    /// live ring is wired, so undeliverable audio cannot accumulate.
+    pub fn submit(&mut self, samples: &[f32]) -> Option<u64> {
+        if !self.is_live() {
+            return None;
+        }
+        let target = self.pending.push(samples);
+        self.flush();
+        Some(target)
+    }
+
+    /// Move retained samples into the ring as far as it has room.
+    pub fn flush(&mut self) -> usize {
+        match self.producer.as_mut() {
+            Some(producer) => self.pending.flush(producer),
+            None => 0,
+        }
+    }
+
+    /// Discard every retained sample; returns how many were dropped.
+    pub fn cancel(&mut self) -> usize {
+        self.pending.clear()
+    }
+
+    /// Cumulative samples submitted that can still reach the ring.
+    pub fn submitted(&self) -> u64 {
+        self.pending.submitted()
+    }
+
+    /// Samples not yet accepted by the ring.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// The ring's overflow counter (always zero for paced TX).
+    pub fn overflow_count(&self) -> u64 {
+        self.producer.as_ref().map_or(0, |p| p.overflow_count())
+    }
+}
+
 /// Playback progress published by the output worker for the TX owner.
 #[derive(Debug, Default)]
 pub struct OutputFeedback {
@@ -603,6 +666,23 @@ mod tests {
         assert!(captured[..captured.len() - next.len()]
             .iter()
             .all(|&s| s == 1.0));
+    }
+
+    /// Without a live consumer (none wired, or its end dropped), nothing is
+    /// queued, so undeliverable TX audio cannot accumulate.
+    #[test]
+    fn tx_output_queues_nothing_without_a_live_ring() {
+        let mut out = TxOutput::default();
+        assert_eq!(out.submit(&[0.5; 10_000]), None);
+        let (prod, cons) = audio_ring(1024);
+        out.set_producer(prod);
+        assert_eq!(out.submit(&[0.5; 3_000]), Some(3_000));
+        assert_eq!(out.pending_len(), 3_000 - 1024);
+        drop(cons);
+        assert_eq!(out.submit(&[0.5; 10_000]), None);
+        assert_eq!(out.pending_len(), 3_000 - 1024);
+        assert_eq!(out.cancel(), 3_000 - 1024);
+        assert_eq!(out.submitted(), 1024);
     }
 
     #[test]
