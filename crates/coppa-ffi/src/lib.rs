@@ -335,7 +335,11 @@ pub unsafe extern "C" fn coppa_free_string(s: *mut c_char) {
 ///   profile's/default speed_level" (0 is never itself a valid wire speed
 ///   level, so it unambiguously means "unset" here too). A non-zero,
 ///   invalid level (out of 1-10, or the reserved 8) is a config-rejection
-///   error.
+///   error. The override changes the level, never the profile's OFDM band:
+///   an `"HF_ROBUST"` handle at `speed_level = 9` stays on an HF profile, and
+///   so does any later [`coppa_engine_set_speed_level`] call on it (COP-23).
+///   Only a handle built with no `profile` keeps the historical level-only
+///   rule (HF below level 5, VHF from level 5).
 /// - `callsign`: optional pointer to a null-terminated station-callsign
 ///   string, for the FFI caller's own bookkeeping convenience only —
 ///   `CoppaCore`/`EngineConfig` have no callsign concept at all (callsign
@@ -1515,6 +1519,60 @@ mod tests {
             "explicit speed_level should override the profile's own"
         );
         unsafe { coppa_engine_destroy(&mut handle) };
+    }
+
+    /// COP-23: the `speed_level` override changes the level, never the profile's
+    /// band. Pre-fix an `HF_ROBUST` handle built at level 9 went on air as
+    /// `vhf_wide`, which a level-1 `HF_ROBUST` handle (`hf_standard`) cannot even
+    /// sync to -- so a successful cross-handle decode is the wire-level proof,
+    /// using only the C API.
+    #[test]
+    fn new_with_hf_profile_and_high_speed_level_stays_hf() {
+        let profile_name = c"HF_ROBUST";
+        let high = CoppaConfig {
+            sample_rate: 0,
+            profile: profile_name.as_ptr(),
+            speed_level: 9,
+            callsign: std::ptr::null(),
+        };
+        let low = CoppaConfig {
+            speed_level: 0,
+            ..high
+        };
+        let mut h1 = unsafe { coppa_engine_new_with(&high) };
+        let mut h2 = unsafe { coppa_engine_new_with(&low) };
+        assert!(!h1.is_null() && !h2.is_null());
+
+        let data = b"HF at level nine";
+        let mut out_samples: *mut f32 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let result = unsafe {
+            coppa_encode_bytes(
+                h1,
+                data.as_ptr(),
+                data.len(),
+                &mut out_samples,
+                &mut out_len,
+            )
+        };
+        assert_eq!(result, 0);
+
+        let mut out_message: *mut c_char = std::ptr::null_mut();
+        let result = unsafe { coppa_decode(h2, out_samples, out_len, &mut out_message) };
+        assert_eq!(
+            result, 0,
+            "a level-1 HF_ROBUST handle must decode a level-9 HF_ROBUST handle's \
+             frame -- both must be on hf_standard"
+        );
+        let decoded = unsafe { CStr::from_ptr(out_message) }.to_str().unwrap();
+        assert_eq!(decoded.as_bytes(), data);
+
+        unsafe {
+            coppa_free_samples(out_samples, out_len);
+            coppa_free_string(out_message);
+            coppa_engine_destroy(&mut h1);
+            coppa_engine_destroy(&mut h2);
+        }
     }
 
     #[test]

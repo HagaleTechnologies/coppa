@@ -11,7 +11,7 @@ use coppa_protocol::cp_negotiator::CpMode;
 use coppa_protocol::modem::streaming::StreamingReceiver;
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 
-use crate::config::EngineConfig;
+use crate::config::{EngineConfig, OfdmBand};
 use crate::profiles::Profile;
 
 /// Marker byte prepended to frames to indicate compression.
@@ -114,26 +114,18 @@ impl CoppaCore {
 
     /// Create a new engine from a named [`Profile`].
     ///
-    /// Uses the profile's `ofdm_profile` field ("hf" or "vhf") to select the
-    /// OFDM profile, overriding the speed-level-based threshold.
+    /// The profile's `ofdm_profile` field ("hf" or "vhf") pins the engine's OFDM
+    /// band via [`EngineConfig::from_profile`], so the band holds across every
+    /// later `set_speed_level`/`set_cp_profile` rebuild instead of being
+    /// re-derived from the speed level (COP-23).
     pub fn from_profile(profile: &Profile) -> Self {
-        let config = EngineConfig::from_profile(profile);
-        let ofdm_profile = match profile.ofdm_profile {
-            "vhf" => CoppaProfile::vhf_wide(),
-            _ => CoppaProfile::hf_standard(),
-        };
-        let transceiver = CoppaTransceiver::new(ofdm_profile.clone(), 1);
-        let streaming = StreamingReceiver::new(ofdm_profile, 1);
-        Self {
-            transceiver,
-            config,
-            streaming,
-        }
+        Self::build(EngineConfig::from_profile(profile))
     }
 
     /// Build the engine from a config, selecting the appropriate OFDM profile.
     fn build(config: EngineConfig) -> Self {
-        let ofdm_profile = Self::select_ofdm_profile(config.speed_level, config.cp_mode);
+        let ofdm_profile =
+            Self::select_ofdm_profile(config.speed_level, config.cp_mode, config.ofdm_band);
         let transceiver = CoppaTransceiver::new(ofdm_profile.clone(), 1);
         let streaming = StreamingReceiver::new(ofdm_profile, 1);
         Self {
@@ -143,12 +135,31 @@ impl CoppaCore {
         }
     }
 
-    /// Select OFDM profile based on speed level and negotiated CP mode.
-    /// Speed levels 1-4 use HF standard (long or short CP per `cp_mode`);
-    /// 5+ use VHF wide regardless of `cp_mode` (no VHF short-CP variant
-    /// exists).
-    pub(crate) fn select_ofdm_profile(speed_level: u8, cp_mode: CpMode) -> CoppaProfile {
-        if speed_level >= 5 {
+    /// Whether `speed_level` on an engine bound to `band` resolves to the VHF
+    /// profile. The one place the HF/VHF decision is made, shared by
+    /// `select_ofdm_profile` and `on_vhf_profile` so the two cannot disagree.
+    pub(crate) fn resolves_to_vhf(speed_level: u8, band: OfdmBand) -> bool {
+        match band {
+            OfdmBand::Vhf => true,
+            OfdmBand::Hf => false,
+            OfdmBand::LevelDerived => speed_level >= 5,
+        }
+    }
+
+    /// Select the OFDM profile for a speed level, negotiated CP mode, and band.
+    ///
+    /// The band decides HF vs VHF (see `resolves_to_vhf`): an `OfdmBand::Hf`
+    /// engine stays on HF at every level, an `OfdmBand::Vhf` engine stays on
+    /// VHF at every level, and an `OfdmBand::LevelDerived` engine uses HF for
+    /// levels 1-4 and VHF for 5+. On HF the profile is HF standard, long or
+    /// short CP per `cp_mode`; on VHF it is VHF wide regardless of `cp_mode`
+    /// (no VHF short-CP variant exists).
+    pub(crate) fn select_ofdm_profile(
+        speed_level: u8,
+        cp_mode: CpMode,
+        ofdm_band: OfdmBand,
+    ) -> CoppaProfile {
+        if Self::resolves_to_vhf(speed_level, ofdm_band) {
             CoppaProfile::vhf_wide()
         } else {
             match cp_mode {
@@ -156,6 +167,16 @@ impl CoppaCore {
                 CpMode::ShortCp => CoppaProfile::hf_standard_short_cp(),
             }
         }
+    }
+
+    /// Whether the currently selected OFDM profile is the VHF one -- i.e. whether
+    /// the negotiated HF CP mode (`cp_mode()`) is dormant rather than on air.
+    ///
+    /// Always `false` for an `OfdmBand::Hf` engine and always `true` for an
+    /// `OfdmBand::Vhf` one, whatever the speed level; only an
+    /// `OfdmBand::LevelDerived` engine (no band preference) crosses at level 5.
+    pub fn on_vhf_profile(&self) -> bool {
+        Self::resolves_to_vhf(self.config.speed_level, self.config.ofdm_band)
     }
 
     /// Encode a text message to audio samples.
@@ -408,19 +429,27 @@ impl CoppaCore {
     /// Change this engine's configured speed level in place (Phase 4 Task 6,
     /// added for FFI v2's `coppa_engine_set_speed_level`).
     ///
-    /// This is not a cheap field mutation: `level` also selects the HF/VHF
-    /// OFDM profile threshold (see `select_ofdm_profile`), so this rebuilds
-    /// the transceiver and streaming receiver exactly like `reconfigure`
-    /// does -- any samples already buffered in the streaming receiver (not
-    /// yet resolved into a completed frame) are discarded as a result.
+    /// This is not a cheap field mutation: it rebuilds the transceiver and
+    /// streaming receiver exactly like `reconfigure` does -- any samples already
+    /// buffered in the streaming receiver (not yet resolved into a completed
+    /// frame) are discarded as a result.
     ///
-    /// Crossing the HF/VHF threshold (level >= 5) does NOT touch `cp_mode`. It does
-    /// not need to: `select_ofdm_profile` already ignores `cp_mode` entirely at VHF
-    /// (see `test_select_ofdm_profile_ignores_cp_mode_in_vhf_range`), so a retained
+    /// The level does NOT change the OFDM band of an engine whose `ofdm_band` is
+    /// `OfdmBand::Hf` or `OfdmBand::Vhf` -- which includes every engine built from
+    /// a named [`Profile`] -- so an HF-configured engine stays HF-legal at every
+    /// level (COP-23; before that, `select_ofdm_profile` re-derived the band from
+    /// the level alone and an HF engine went on air as `vhf_wide` at level 5).
+    /// Only an `OfdmBand::LevelDerived` engine (the `EngineConfig::default()`, no
+    /// band preference) still crosses to VHF at level 5.
+    ///
+    /// Crossing into VHF does NOT touch `cp_mode`. It does not need to:
+    /// `select_ofdm_profile` already ignores `cp_mode` entirely at VHF (see
+    /// `test_select_ofdm_profile_ignores_cp_mode_in_vhf_range`), so a retained
     /// `ShortCp` cannot select a nonexistent VHF short-CP profile. `cp_mode` is the
-    /// *negotiated HF CP mode*: in effect while `speed_level < 5`, retained (dormant)
-    /// above it -- so a `RateLoop` excursion into VHF and back cannot silently
-    /// discard a mode the peer still believes is in force. Before COP-2 this reset
+    /// *negotiated HF CP mode*: in effect while the engine is on an HF profile,
+    /// retained (dormant) while `on_vhf_profile()` -- so a `RateLoop` excursion
+    /// into VHF and back cannot silently discard a mode the peer still believes is
+    /// in force. Before COP-2 this reset
     /// was permanent, and dropping back below level 5 rebuilt onto `hf_standard`
     /// while the peer stayed on `hf_standard_short_cp`: a mutually-undecodable link
     /// with no give-up trigger armed anywhere (the negotiation had already
@@ -449,7 +478,8 @@ impl CoppaCore {
     }
 
     /// Change this engine's configured CP mode in place. Only affects HF
-    /// range (speed level < 5) profile selection -- see `select_ofdm_profile`.
+    /// profile selection (has no on-air effect while `on_vhf_profile()`) -- see
+    /// `select_ofdm_profile`.
     /// Unlike `set_speed_level`, there's no invalid `CpMode` value to
     /// reject, so this is infallible.
     ///
@@ -464,12 +494,15 @@ impl CoppaCore {
 
     /// The CP mode currently configured for outgoing `encode_bytes` calls.
     ///
-    /// At `speed_level() >= 5` this reports the *retained negotiated HF mode*, NOT
-    /// the profile actually on air -- `select_ofdm_profile` builds `vhf_wide` there
-    /// regardless (see `set_speed_level`'s doc for why the mode is retained rather
-    /// than reset). A caller reading this to infer the live waveform would be wrong
-    /// above level 5; it answers "what CP mode did this station and its peer agree
-    /// on", which is what COP-2's engine/negotiator invariant is about.
+    /// While `on_vhf_profile()` is true this reports the *retained negotiated HF
+    /// mode*, NOT the profile actually on air -- `select_ofdm_profile` builds
+    /// `vhf_wide` there regardless (see `set_speed_level`'s doc for why the mode is
+    /// retained rather than reset). That happens at `speed_level() >= 5` only for
+    /// an `OfdmBand::LevelDerived` engine; an `OfdmBand::Hf` engine keeps this
+    /// mode on air at every level (COP-23). A caller reading this to infer the live
+    /// waveform must check `on_vhf_profile()` first; it answers "what CP mode did
+    /// this station and its peer agree on", which is what COP-2's
+    /// engine/negotiator invariant is about.
     pub fn cp_mode(&self) -> CpMode {
         self.config.cp_mode
     }
@@ -1063,23 +1096,43 @@ mod tests {
     #[test]
     fn test_select_ofdm_profile_respects_cp_mode_within_hf_range() {
         use coppa_protocol::cp_negotiator::CpMode;
-        let long_cp = CoppaCore::select_ofdm_profile(2, CpMode::LongCp);
-        let short_cp = CoppaCore::select_ofdm_profile(2, CpMode::ShortCp);
+        let long_cp = CoppaCore::select_ofdm_profile(2, CpMode::LongCp, OfdmBand::LevelDerived);
+        let short_cp = CoppaCore::select_ofdm_profile(2, CpMode::ShortCp, OfdmBand::LevelDerived);
         assert_eq!(long_cp.cp_samples, CoppaProfile::hf_standard().cp_samples);
         assert_eq!(
             short_cp.cp_samples,
             CoppaProfile::hf_standard_short_cp().cp_samples
         );
         assert_ne!(long_cp.cp_samples, short_cp.cp_samples);
+
+        // COP-23: an HF-banded engine is in the HF range at EVERY level, so the
+        // negotiated CP mode is respected at level 7 too, not ignored.
+        let hf_long_cp = CoppaCore::select_ofdm_profile(7, CpMode::LongCp, OfdmBand::Hf);
+        let hf_short_cp = CoppaCore::select_ofdm_profile(7, CpMode::ShortCp, OfdmBand::Hf);
+        assert_eq!(
+            hf_long_cp.cp_samples,
+            CoppaProfile::hf_standard().cp_samples
+        );
+        assert_eq!(
+            hf_short_cp.cp_samples,
+            CoppaProfile::hf_standard_short_cp().cp_samples
+        );
     }
 
     #[test]
     fn test_select_ofdm_profile_ignores_cp_mode_in_vhf_range() {
         use coppa_protocol::cp_negotiator::CpMode;
-        let long_cp = CoppaCore::select_ofdm_profile(5, CpMode::LongCp);
-        let short_cp = CoppaCore::select_ofdm_profile(5, CpMode::ShortCp);
+        let long_cp = CoppaCore::select_ofdm_profile(5, CpMode::LongCp, OfdmBand::LevelDerived);
+        let short_cp = CoppaCore::select_ofdm_profile(5, CpMode::ShortCp, OfdmBand::LevelDerived);
         assert_eq!(long_cp.cp_samples, CoppaProfile::vhf_wide().cp_samples);
         assert_eq!(short_cp.cp_samples, CoppaProfile::vhf_wide().cp_samples);
+
+        // COP-23: a VHF-banded engine is in the VHF range at EVERY level, so a
+        // retained ShortCp is ignored at level 1 too.
+        let vhf_long_cp = CoppaCore::select_ofdm_profile(1, CpMode::LongCp, OfdmBand::Vhf);
+        let vhf_short_cp = CoppaCore::select_ofdm_profile(1, CpMode::ShortCp, OfdmBand::Vhf);
+        assert_eq!(vhf_long_cp.cp_samples, CoppaProfile::vhf_wide().cp_samples);
+        assert_eq!(vhf_short_cp.cp_samples, CoppaProfile::vhf_wide().cp_samples);
     }
 
     #[test]
@@ -1183,6 +1236,111 @@ mod tests {
             header.bandwidth,
             CoppaProfile::hf_standard_short_cp().bandwidth_id,
             "returning below level 5 must rebuild onto hf_standard_short_cp, not hf_standard"
+        );
+    }
+
+    /// Decode `samples` through a receiver built for `profile` and return the wire
+    /// `bandwidth` id, panicking with `context` if it does not decode. The
+    /// waveform-level check every COP-23 test below uses: a frame encoded under a
+    /// different OFDM profile (e.g. `vhf_wide` vs `hf_standard`) cannot sync here.
+    fn decode_under(profile: CoppaProfile, samples: &[f32], context: &str) -> u8 {
+        use coppa_protocol::modem::transceiver::CoppaTransceiver;
+        let rx = CoppaTransceiver::new(profile, 1);
+        let (header, _payload, _recommended_level) = rx
+            .receive(samples)
+            .unwrap_or_else(|e| panic!("{context}: {e}"));
+        header.bandwidth
+    }
+
+    /// COP-23, the ticket's Gherkin scenario, executable: given an engine built
+    /// from an HF profile, when `RateLoop` raises the speed level to 5 or above,
+    /// then the OFDM profile stays HF-legal. Before the fix `select_ofdm_profile`
+    /// re-derived the band from the level alone and built `vhf_wide` here.
+    #[test]
+    fn hf_configured_engine_stays_hf_across_a_speed_level_raise() {
+        let mut core = CoppaCore::from_profile(&crate::profiles::HF_STANDARD);
+        for level in [5u8, 6, 7, 9, 10] {
+            core.set_speed_level(level).unwrap();
+            let samples = core.encode_bytes(b"stay on HF").unwrap();
+            let bandwidth = decode_under(
+                CoppaProfile::hf_standard(),
+                &samples,
+                &format!("an HF-configured engine at level {level} must still be on hf_standard"),
+            );
+            assert_eq!(bandwidth, CoppaProfile::hf_standard().bandwidth_id);
+        }
+    }
+
+    #[test]
+    fn vhf_configured_engine_stays_vhf_across_a_speed_level_drop() {
+        let mut core = CoppaCore::from_profile(&crate::profiles::VHF_FAST);
+        core.set_speed_level(2).unwrap();
+        let samples = core.encode_bytes(b"stay on VHF").unwrap();
+        let bandwidth = decode_under(
+            CoppaProfile::vhf_wide(),
+            &samples,
+            "a VHF-configured engine dropped to level 2 must still be on vhf_wide",
+        );
+        assert_eq!(bandwidth, CoppaProfile::vhf_wide().bandwidth_id);
+    }
+
+    /// The FFI/CLI construction path: they never call `CoppaCore::from_profile`,
+    /// they build `EngineConfig::from_profile` and hand it to `with_config`. Before
+    /// COP-23 that path lost the band at construction, so this was `vhf_wide`.
+    #[test]
+    fn with_config_from_hf_profile_stays_hf_at_level_9() {
+        let mut core =
+            CoppaCore::with_config(EngineConfig::from_profile(&crate::profiles::HF_ROBUST));
+        core.set_speed_level(9).unwrap();
+        let samples = core.encode_bytes(b"level nine on HF").unwrap();
+        let bandwidth = decode_under(
+            CoppaProfile::hf_standard(),
+            &samples,
+            "an HF_ROBUST-configured engine at level 9 must still be on hf_standard",
+        );
+        assert_eq!(bandwidth, CoppaProfile::hf_standard().bandwidth_id);
+    }
+
+    /// COP-23: on an HF-configured engine the negotiated short CP is no longer
+    /// dormant above level 5 -- the engine never leaves HF, so the mode stays on air.
+    #[test]
+    fn hf_configured_engine_keeps_negotiated_short_cp_in_effect_at_high_levels() {
+        let mut core = CoppaCore::from_profile(&crate::profiles::HF_ROBUST);
+        core.set_cp_profile(CpMode::ShortCp);
+        core.set_speed_level(5).unwrap();
+        assert!(
+            !core.on_vhf_profile(),
+            "an HF-configured engine at level 5 must not report the VHF profile"
+        );
+        let samples = core.encode_bytes(b"short CP at level 5").unwrap();
+        let bandwidth = decode_under(
+            CoppaProfile::hf_standard_short_cp(),
+            &samples,
+            "an HF-configured engine with ShortCp negotiated must stay on \
+             hf_standard_short_cp at level 5",
+        );
+        assert_eq!(bandwidth, CoppaProfile::hf_standard_short_cp().bandwidth_id);
+    }
+
+    #[test]
+    fn on_vhf_profile_truth_table() {
+        let at = |speed_level: u8, ofdm_band: OfdmBand| {
+            CoppaCore::with_config(EngineConfig {
+                speed_level,
+                ofdm_band,
+                ..Default::default()
+            })
+            .on_vhf_profile()
+        };
+        assert!(!at(4, OfdmBand::LevelDerived), "LevelDerived below 5 is HF");
+        assert!(at(5, OfdmBand::LevelDerived), "LevelDerived at 5 is VHF");
+        assert!(
+            !at(10, OfdmBand::Hf),
+            "Hf stays HF at the top of the ladder"
+        );
+        assert!(
+            at(1, OfdmBand::Vhf),
+            "Vhf stays VHF at the bottom of the ladder"
         );
     }
 

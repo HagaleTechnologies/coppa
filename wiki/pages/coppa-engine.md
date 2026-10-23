@@ -36,8 +36,12 @@ FFI). The main encode/decode logic is in `coppa-protocol`, not here.
   any decode path (see [[phase4-field-readiness]]).
 - **Speed levels 1–10 (8 reserved)** replace the old mcs_index/fec_rate/modulation
   triple; constants live in `SPEED_LEVELS` in this crate. `set_speed_level`
-  switches level at runtime (used by the rate loop and FFI v2); the profile
-  itself is still set at construction time.
+  switches level at runtime (used by the rate loop and FFI v2); the OFDM band
+  is set at construction time and kept across every level change (COP-23:
+  `EngineConfig::ofdm_band`, pinned by a named profile, so an HF-configured
+  engine stays HF at levels 5-10). Only `EngineConfig::default()`
+  (`OfdmBand::LevelDerived`, no band preference) still crosses to `vhf_wide` at
+  level 5; `CoppaCore::on_vhf_profile()` reports which band is actually selected.
 - **Operating profiles:** HF_ROBUST, HF_STANDARD, HF_WIDE, HF_NARROW, VHF_FAST,
   plus a spread-gated short-CP HF profile (Phase 3). Profile selection affects
   carrier count, CP length, pilot density. `hf_robust` uses dense pilots;
