@@ -34,12 +34,16 @@ FFI). The main encode/decode logic is in `coppa-protocol`, not here.
   silently dropped every binary/compressed MAC PDU (i.e. all real session/ARQ
   traffic) at UTF-8 validation. Do not reintroduce `String`-typed payloads on
   any decode path (see [[phase4-field-readiness]]).
-- **Speed levels 1–10 (8 reserved)** replace the old mcs_index/fec_rate/modulation
-  triple; constants live in `SPEED_LEVELS` in this crate. `set_speed_level`
+- **Speed levels 1-9** replace the old mcs_index/fec_rate/modulation
+  triple; constants live in `coppa_codec::ofdm::coppa_modem::SPEED_LEVELS`. `set_speed_level`
   switches level at runtime (used by the rate loop and FFI v2); the OFDM band
   is set at construction time and kept across every level change (COP-23:
   `EngineConfig::ofdm_band`, pinned by a named profile, so an HF-configured
-  engine stays HF at levels 5-10). Only `EngineConfig::default()`
+  engine stays HF at levels 5-8). COP-24 caps HF at level 8, 64-QAM 2/3.
+  Level 9, 64-QAM 5/6, is VHF-only. `available_speed_levels()` supplies the
+  daemon rate loop with the band-specific ladder; both `set_speed_level` and
+  `encode_bytes_at_level` reject level 9 on HF. Old wire levels 9 and 10 became
+  8 and 9 in 0.2.0. See `docs/adr/009-cop24-speed-ladder-renumber.md`. Only `EngineConfig::default()`
   (`OfdmBand::LevelDerived`, no band preference) still crosses to `vhf_wide` at
   level 5; `CoppaCore::on_vhf_profile()` reports which band is actually selected.
 - **Operating profiles:** HF_ROBUST, HF_STANDARD, HF_WIDE, HF_NARROW, VHF_FAST,

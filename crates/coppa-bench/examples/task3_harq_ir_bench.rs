@@ -29,7 +29,7 @@
 //!
 //! ## Level/channel choice
 //!
-//! Uses [`LEVEL`] 10 (64-QAM, rate 5/6 -- this ladder's least redundant code)
+//! Uses [`LEVEL`] 9 (64-QAM, rate 5/6 -- this ladder's least redundant code)
 //! with AWGN only (see [`USE_FADING`]'s doc). Two earlier attempts at this
 //! bench are worth recording (see the Task 3 report for the full data):
 //! level 2 (BPSK, rate 1/2) under Watterson-Moderate fading gave a real,
@@ -39,7 +39,7 @@
 //! attempt adds much less *directly useful* new information than Chase's
 //! literal repeat of the one window that actually contains the payload bits,
 //! at a code rate already redundant enough per single shot that the marginal
-//! benefit of IR's extra parity is small. Level 10 under Watterson-Moderate
+//! benefit of IR's extra parity is small. Level 9 under Watterson-Moderate
 //! fading hits its OWN irreducible outage floor (100% FER even at +18 dB,
 //! deep multipath fades knocking out 64-QAM's dense constellation regardless
 //! of SNR -- the same phenomenon as level 2's Watterson-Poor floor, just at a
@@ -60,7 +60,7 @@ use coppa_protocol::modem::transceiver::CoppaTransceiver;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-const LEVEL: u8 = 10; // 64-QAM, rate 5/6 (least redundant code -- see task-3-report)
+const LEVEL: u8 = 9; // 64-QAM, rate 5/6 (least redundant code -- see task-3-report)
 const SAMPLE_RATE: f32 = 48_000.0;
 const CALIBRATION_TRIALS: usize = 150;
 const MAIN_TRIALS: usize = 300;
@@ -120,11 +120,11 @@ fn corrupt(clean: &[f32], snr_db: f32, trial: u64, attempt: u32) -> Vec<f32> {
 }
 
 /// Whether [`corrupt`] applies Watterson fading on top of AWGN. `false` for
-/// level 10 (64-QAM, rate 5/6): an early sweep found level 10 hits its own
+/// level 9 (64-QAM, rate 5/6): an early sweep found level 9 hits its own
 /// irreducible Watterson-fading outage floor (100% FER even at +18 dB --
 /// deep multipath fades knock out 64-QAM's dense constellation regardless of
 /// AWGN SNR, the same phenomenon as level 2's Watterson-Poor floor, just at a
-/// higher-order modulation), so this bench uses AWGN alone at level 10 to get
+/// higher-order modulation), so this bench uses AWGN alone at level 9 to get
 /// a calibratable ~50% first-TX operating point at all (still a "poor
 /// channel" in the sense the brief needs: low SNR, substantial first-TX
 /// failure -- just without fading specifically).

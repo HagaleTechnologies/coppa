@@ -362,7 +362,7 @@ impl CpPolicy {
 /// [`profile_for`] remains the standard-pair constructor only. Pinned by
 /// `switch_airtime_scales_with_the_pair_the_caller_passes`.
 ///
-/// `None` for a reserved/unknown level, mirroring `frame_airtime_s`'s own contract
+/// `None` for an unknown level, mirroring `frame_airtime_s`'s own contract
 /// (`airtime.rs:101-104`) instead of substituting a zero that would inflate the
 /// arm's goodput.
 ///
@@ -892,15 +892,16 @@ mod tests {
     }
 
     #[test]
-    fn switch_airtime_is_none_for_reserved_level_8() {
+    fn switch_airtime_is_none_for_invalid_level_10() {
         let sw = CpSwitch {
             from: CpMode::LongCp,
             to: CpMode::ShortCp,
             decided_at: 0,
             effective_from: 1,
-            level: 8,
+            level: 10,
         };
         assert!(standard_pair_airtime(&sw).is_none());
+        assert!(standard_pair_airtime(&CpSwitch { level: 8, ..sw }).is_some());
     }
 
     #[test]

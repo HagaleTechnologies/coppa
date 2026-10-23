@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use coppa_codec::ofdm::coppa_modem::TX_PEAK;
+use coppa_codec::ofdm::coppa_modem::{SPEED_LEVELS, TX_PEAK};
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::compression::huffman::HuffmanCodec;
@@ -11,7 +11,7 @@ use coppa_protocol::cp_negotiator::CpMode;
 use coppa_protocol::modem::streaming::StreamingReceiver;
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 
-use crate::config::{EngineConfig, OfdmBand};
+use crate::config::{EngineConfig, OfdmBand, HF_MAX_SPEED_LEVEL};
 use crate::profiles::Profile;
 
 /// Marker byte prepended to frames to indicate compression.
@@ -52,7 +52,7 @@ pub struct StreamFrame {
     pub snr_db: f32,
     pub cfo_hz: f32,
     pub frame_start: u64,
-    /// Speed level (1-10) the transmitting station encoded this frame at, from the
+    /// Speed level (1-9) the transmitting station encoded this frame at, from the
     /// decoded protected header (`DecodedFrame::header.speed_level`). Added for
     /// Phase 3 Task 7 so daemon/host telemetry (WebSocket `status`'s `level` field)
     /// can report the link's real current speed level rather than a placeholder.
@@ -146,6 +146,10 @@ impl CoppaCore {
         }
     }
 
+    pub(crate) fn level_allowed_on_band(level: u8, band: OfdmBand) -> bool {
+        Self::resolves_to_vhf(level, band) || level <= HF_MAX_SPEED_LEVEL
+    }
+
     /// Select the OFDM profile for a speed level, negotiated CP mode, and band.
     ///
     /// The band decides HF vs VHF (see `resolves_to_vhf`): an `OfdmBand::Hf`
@@ -231,7 +235,7 @@ impl CoppaCore {
     }
 
     /// Encode arbitrary binary data to audio samples at an explicit `level`
-    /// (1-10), overriding `self.config.speed_level` for this one call.
+    /// (1-9), overriding `self.config.speed_level` for this one call.
     ///
     /// Reuses `self.transceiver` directly rather than constructing a second
     /// transceiver/engine instance: `CoppaTransceiver::new` eagerly builds
@@ -251,7 +255,12 @@ impl CoppaCore {
     /// No compression is applied (unlike `encode_bytes`): callers needing a
     /// forced-level frame (station ID / beacon, Phase 4 Task 3) send small,
     /// simple payloads where compression overhead isn't worth the complexity.
+    ///
+    /// Because the profile is never rebuilt here, the HF ceiling is checked
+    /// against the profile already in use: level 9 is rejected whenever this
+    /// engine is on an HF profile, including a level-derived engine below level 5.
     pub fn encode_bytes_at_level(&self, data: &[u8], level: u8) -> Result<Vec<f32>> {
+        self.check_level(level, self.on_vhf_profile())?;
         if data.len() > u16::MAX as usize {
             anyhow::bail!("Payload too large ({} bytes, max {})", data.len(), u16::MAX);
         }
@@ -456,17 +465,41 @@ impl CoppaCore {
     /// succeeded) and no reachable recovery path.
     ///
     /// Returns an error, leaving this engine's current config untouched, if
-    /// `level` is not a valid wire speed level (1-10; 8 is reserved) -- see
+    /// `level` is not a valid wire speed level (1-9) or is unavailable on this band -- see
     /// `coppa_protocol::modem::speed_level_components`, the single source of
     /// truth for valid levels that this deliberately defers to rather than
     /// duplicating.
     pub fn set_speed_level(&mut self, level: u8) -> Result<()> {
-        coppa_protocol::modem::speed_level_components(level)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        self.check_level(level, Self::resolves_to_vhf(level, self.config.ofdm_band))?;
         let mut config = self.config.clone();
         config.speed_level = level;
         self.reconfigure(config);
         Ok(())
+    }
+
+    /// Validate `level` for a frame sent on the VHF profile (`on_vhf_profile`)
+    /// or on an HF profile, which carries levels 1-8 only.
+    fn check_level(&self, level: u8, on_vhf_profile: bool) -> Result<()> {
+        coppa_protocol::modem::speed_level_components(level)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        if !on_vhf_profile && level > HF_MAX_SPEED_LEVEL {
+            anyhow::bail!(
+                "speed level {level} is not available on an HF profile: HF profiles carry levels 1-8 (COP-24)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Wire speed levels `set_speed_level` accepts on this engine's configured band.
+    /// HF profiles carry levels 1-8; VHF and level-derived engines carry 1-9.
+    /// `encode_bytes_at_level` also rejects 9 while a level-derived engine is
+    /// still on HF (below level 5), because it never rebuilds the profile.
+    pub fn available_speed_levels(&self) -> Vec<u8> {
+        SPEED_LEVELS
+            .iter()
+            .filter(|speed| Self::level_allowed_on_band(speed.level, self.config.ofdm_band))
+            .map(|speed| speed.level)
+            .collect()
     }
 
     /// The speed level currently configured for outgoing `encode_bytes` calls.
@@ -918,11 +951,11 @@ mod tests {
         let samples = with_lead_and_trail(&samples);
         let frames = core.push_samples(&samples);
         assert_eq!(frames.len(), 1);
-        // A clean loopback should recommend a real level in the valid 1-10 range
-        // (excluding reserved 8), not a placeholder/zero value.
+        // A clean loopback should recommend a real level in the valid 1-9 range,
+        // not a placeholder/zero value.
         let level = frames[0].recommended_level;
         assert!(
-            (1..=10).contains(&level) && level != 8,
+            (1..=9).contains(&level),
             "expected a valid recommended level, got {level}"
         );
     }
@@ -937,6 +970,60 @@ mod tests {
     // ── Task 6 (Phase 4): `set_speed_level` mutator for FFI v2 ────────────
 
     #[test]
+    fn available_speed_levels_follow_the_configured_band() {
+        for profile in [&crate::HF_STANDARD, &crate::HF_ROBUST, &crate::EMERGENCY] {
+            let mut core = CoppaCore::from_profile(profile);
+            assert_eq!(core.available_speed_levels(), (1..=8).collect::<Vec<_>>());
+            core.set_speed_level(8).expect("HF accepts 64-QAM 2/3");
+        }
+        for mut core in [CoppaCore::from_profile(&crate::VHF_FAST), CoppaCore::new()] {
+            assert_eq!(core.available_speed_levels(), (1..=9).collect::<Vec<_>>());
+            core.set_speed_level(9).expect("VHF accepts 64-QAM 5/6");
+        }
+        for name in crate::profiles::list_profiles() {
+            let profile = crate::profiles::get_profile(name).unwrap();
+            assert!(CoppaCore::from_profile(profile)
+                .available_speed_levels()
+                .contains(&profile.speed_level));
+        }
+    }
+
+    #[test]
+    fn explicit_level_encoding_rejects_invalid_wire_levels() {
+        let core = CoppaCore::new();
+        for level in [0, 10, 255] {
+            assert!(core.encode_bytes_at_level(b"beacon", level).is_err());
+        }
+    }
+
+    #[test]
+    fn hf_engine_rejects_vhf_only_level_without_mutating_config() {
+        for profile in [&crate::HF_STANDARD, &crate::HF_ROBUST, &crate::EMERGENCY] {
+            let mut core = CoppaCore::from_profile(profile);
+            let before = core.speed_level();
+            assert!(core.set_speed_level(9).is_err());
+            assert_eq!(core.speed_level(), before);
+            assert!(core.encode_bytes_at_level(b"HF beacon", 9).is_err());
+            core.set_speed_level(8).expect("HF accepts its top level");
+        }
+    }
+
+    /// `encode_bytes_at_level` never rebuilds the transceiver, so a level-derived
+    /// engine still on `hf_standard` (level < 5) must not emit level 9 on HF.
+    #[test]
+    fn level_derived_engine_on_hf_profile_rejects_forced_level_9() {
+        let mut core = CoppaCore::new();
+        assert!(!core.on_vhf_profile());
+        assert!(core.encode_bytes_at_level(b"HF beacon", 9).is_err());
+        core.encode_bytes_at_level(b"HF beacon", 8)
+            .expect("HF accepts its top level");
+        core.set_speed_level(5).unwrap();
+        assert!(core.on_vhf_profile());
+        core.encode_bytes_at_level(b"VHF beacon", 9)
+            .expect("level 9 is allowed once the transceiver is on vhf_wide");
+    }
+
+    #[test]
     fn test_set_speed_level_valid_updates_config_and_roundtrips() {
         let mut core = CoppaCore::new(); // default speed_level 1
         core.set_speed_level(3).expect("level 3 is valid");
@@ -949,10 +1036,10 @@ mod tests {
     }
 
     #[test]
-    fn test_set_speed_level_rejects_reserved_level_8() {
+    fn test_set_speed_level_rejects_removed_level_10() {
         let mut core = CoppaCore::new();
         let before = core.config().speed_level;
-        assert!(core.set_speed_level(8).is_err(), "level 8 is reserved");
+        assert!(core.set_speed_level(10).is_err(), "level 10 is invalid");
         assert_eq!(
             core.config().speed_level,
             before,
@@ -1259,7 +1346,7 @@ mod tests {
     #[test]
     fn hf_configured_engine_stays_hf_across_a_speed_level_raise() {
         let mut core = CoppaCore::from_profile(&crate::profiles::HF_STANDARD);
-        for level in [5u8, 6, 7, 9, 10] {
+        for level in [5u8, 6, 7, 8] {
             core.set_speed_level(level).unwrap();
             let samples = core.encode_bytes(b"stay on HF").unwrap();
             let bandwidth = decode_under(
@@ -1269,6 +1356,7 @@ mod tests {
             );
             assert_eq!(bandwidth, CoppaProfile::hf_standard().bandwidth_id);
         }
+        assert!(core.set_speed_level(9).is_err());
     }
 
     #[test]
@@ -1288,15 +1376,15 @@ mod tests {
     /// they build `EngineConfig::from_profile` and hand it to `with_config`. Before
     /// COP-23 that path lost the band at construction, so this was `vhf_wide`.
     #[test]
-    fn with_config_from_hf_profile_stays_hf_at_level_9() {
+    fn with_config_from_hf_profile_stays_hf_at_level_8() {
         let mut core =
             CoppaCore::with_config(EngineConfig::from_profile(&crate::profiles::HF_ROBUST));
-        core.set_speed_level(9).unwrap();
-        let samples = core.encode_bytes(b"level nine on HF").unwrap();
+        core.set_speed_level(8).unwrap();
+        let samples = core.encode_bytes(b"level eight on HF").unwrap();
         let bandwidth = decode_under(
             CoppaProfile::hf_standard(),
             &samples,
-            "an HF_ROBUST-configured engine at level 9 must still be on hf_standard",
+            "an HF_ROBUST-configured engine at level 8 must still be on hf_standard",
         );
         assert_eq!(bandwidth, CoppaProfile::hf_standard().bandwidth_id);
     }
@@ -1334,10 +1422,7 @@ mod tests {
         };
         assert!(!at(4, OfdmBand::LevelDerived), "LevelDerived below 5 is HF");
         assert!(at(5, OfdmBand::LevelDerived), "LevelDerived at 5 is VHF");
-        assert!(
-            !at(10, OfdmBand::Hf),
-            "Hf stays HF at the top of the ladder"
-        );
+        assert!(!at(8, OfdmBand::Hf), "Hf stays HF at the top of the ladder");
         assert!(
             at(1, OfdmBand::Vhf),
             "Vhf stays VHF at the bottom of the ladder"

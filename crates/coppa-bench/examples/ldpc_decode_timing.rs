@@ -21,7 +21,7 @@ const CAPS: [usize; 7] = [1, 2, 3, 5, 10, 20, 30];
 const REPEATS: usize = 5;
 const CALLS: usize = 300;
 const WARMUP: usize = 50;
-const LEVELS: [u8; 9] = [1, 2, 3, 4, 5, 6, 7, 9, 10];
+const LEVELS: [u8; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 const TIMING_SNR: [(u8, f32); 9] = [
     (1, 3.0),
     (2, 5.0),
@@ -30,8 +30,8 @@ const TIMING_SNR: [(u8, f32); 9] = [
     (5, 13.5),
     (6, 14.5),
     (7, 18.0),
-    (9, 20.5),
-    (10, 25.0),
+    (8, 20.5),
+    (9, 25.0),
 ];
 const CODED_LEN: usize = 1944;
 
@@ -52,8 +52,8 @@ fn old_code_rate(level: u8) -> CodeRate {
         1 => CodeRate::Rate1_4,
         2 | 3 | 6 => CodeRate::Rate1_2,
         4 | 7 => CodeRate::Rate3_4,
-        5 | 9 => CodeRate::Rate2_3,
-        10 => CodeRate::Rate7_8,
+        5 | 8 => CodeRate::Rate2_3,
+        9 => CodeRate::Rate7_8,
         _ => unreachable!(),
     }
 }

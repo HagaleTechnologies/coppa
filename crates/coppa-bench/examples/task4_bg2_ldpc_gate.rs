@@ -46,7 +46,7 @@ use rand::{RngExt, SeedableRng};
 use std::time::Instant;
 
 const CODED_LEN: usize = 1944;
-const LEVELS: [u8; 9] = [1, 2, 3, 4, 5, 6, 7, 9, 10];
+const LEVELS: [u8; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 
 fn old_code_rate(level: u8) -> CodeRate {
     match level {
@@ -57,8 +57,8 @@ fn old_code_rate(level: u8) -> CodeRate {
         5 => CodeRate::Rate2_3,
         6 => CodeRate::Rate1_2,
         7 => CodeRate::Rate3_4,
-        9 => CodeRate::Rate2_3,
-        10 => CodeRate::Rate7_8,
+        8 => CodeRate::Rate2_3,
+        9 => CodeRate::Rate7_8,
         _ => panic!("no old code rate for level {level}"),
     }
 }
@@ -520,8 +520,8 @@ fn main() {
             5 => 18.0,
             6 => 18.0,
             7 => 22.0,
-            9 => 26.0,
-            10 => 30.0,
+            8 => 26.0,
+            9 => 30.0,
             _ => 20.0,
         };
         for &delta in &[-4.0f32, 0.0, 4.0, 8.0] {

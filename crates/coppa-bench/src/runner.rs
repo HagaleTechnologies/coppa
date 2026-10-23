@@ -244,7 +244,7 @@ mod tests {
         assert!(points[0].goodput_bps > 0.0);
     }
 
-    /// Regression test for a real bug found investigating level 9's documented
+    /// Regression test for a real bug found investigating level 8's documented
     /// "anomalous, seed-dependent AWGN waterfall" (BENCHMARKS.md's `milstd`
     /// section): `run_trial` hardcodes every synthetic trial's `seq_num` to
     /// `0` and reuses one `CoppaTransceiver` across a whole SNR sweep.
@@ -257,7 +257,7 @@ mod tests {
     /// including ones at much higher SNR that should trivially decode.
     ///
     /// A real ascending sweep (`snr_points`, used by every CLI/example caller)
-    /// hits this immediately: level 9's (64-QAM 2/3) genuine AWGN threshold is
+    /// hits this immediately: level 8's (64-QAM 2/3) genuine AWGN threshold is
     /// ~18 dB, so any sweep starting below that poisons the buffer before the
     /// sweep ever reaches a point that should succeed. Ordering the points
     /// high-then-low (as `awgn_sweep_decodes_at_high_snr_and_fails_at_low_snr`
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn ascending_sweep_low_snr_failure_does_not_poison_later_high_snr_trials() {
         let scenario = Scenario {
-            level: 9,
+            level: 8,
             channel: ChannelSpec::Awgn,
             snr_db_points: vec![15.0, 60.0],
             trials: 20,
@@ -280,7 +280,7 @@ mod tests {
         assert_eq!(points.len(), 2);
         assert!(
             points[0].fer >= 0.5,
-            "15 dB is genuinely below level 9's threshold, should mostly fail (fer={})",
+            "15 dB is genuinely below level 8's threshold, should mostly fail (fer={})",
             points[0].fer
         );
         assert!(

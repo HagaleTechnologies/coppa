@@ -200,7 +200,7 @@ fn golden_vectors_decode_to_expected_payloads() {
 }
 
 /// Sanity check: the manifest itself covers the full 5 levels x 4 channels = 20
-/// grid the brief specifies (levels {1,2,5,6,9} x channels {clean, awgn12,
+/// grid the brief specifies (levels {1,2,5,6,8} x channels {clean, awgn12,
 /// poor25, ssbcfo}), not a partial set some generator run happened to produce.
 #[test]
 fn golden_manifest_covers_the_full_grid() {
@@ -210,7 +210,7 @@ fn golden_manifest_covers_the_full_grid() {
     let manifest: ManifestFile =
         toml::from_str(&manifest_text).expect("failed to parse golden manifest.toml");
 
-    let levels = [1u8, 2, 5, 6, 9];
+    let levels = [1u8, 2, 5, 6, 8];
     let channels = ["clean", "awgn12", "poor25", "ssbcfo"];
 
     for &level in &levels {

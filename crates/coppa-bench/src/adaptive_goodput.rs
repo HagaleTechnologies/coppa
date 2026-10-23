@@ -40,7 +40,7 @@ pub struct FrameSlot {
 }
 
 impl FrameSlot {
-    /// `None` for a reserved/invalid level (8, or anything outside
+    /// `None` for an invalid level (anything outside
     /// `SPEED_LEVELS`), or a degenerate zero-data-carrier profile -- propagated
     /// rather than defaulted, so a bad level can never contribute 0.0 airtime
     /// and blow the denominator up.
@@ -374,16 +374,13 @@ mod tests {
     fn frame_slot_info_bits_are_application_payload_bits_not_k_used() {
         let profile = CoppaProfile::hf_robust();
         let l2 = FrameSlot::for_level(2, &profile, true).expect("level 2 is valid");
-        let l10 = FrameSlot::for_level(10, &profile, true).expect("level 10 is valid");
+        let l9 = FrameSlot::for_level(9, &profile, true).expect("level 9 is valid");
 
         // max_payload_for_level: 972/8 - 4 = 117 bytes; 1620/8 - 4 = 198 bytes.
         assert_eq!(l2.info_bits, 936);
-        assert_eq!(l10.info_bits, 1584);
+        assert_eq!(l9.info_bits, 1584);
         assert_ne!(l2.info_bits, 972, "972 is k_used, not the payload budget");
-        assert_ne!(
-            l10.info_bits, 1620,
-            "1620 is k_used, not the payload budget"
-        );
+        assert_ne!(l9.info_bits, 1620, "1620 is k_used, not the payload budget");
     }
 
     /// Test 5. Pins the airtime numbers every other test's expected value is
@@ -399,9 +396,9 @@ mod tests {
         //       payload_syms = ceil(1944/36) = 54  => 61 syms => 61*1260/48000 = 1.60125 s
         //   L4  (QPSK,  2): 972 => 27 => 34 syms => 34*1260/48000 = 0.89250 s
         //   L7  (16QAM, 4): 486 => ceil(486/36) = 14 => 21 syms => 21*1260/48000 = 0.55125 s
-        //   L10 (64QAM, 6): 324 => 9 => 16 syms => 16*1260/48000 = 0.42000 s
+        //   L9 (64QAM, 6): 324 => 9 => 16 syms => 16*1260/48000 = 0.42000 s
         let profile = CoppaProfile::hf_robust();
-        for (level, expected) in [(2u8, 1.60125), (4, 0.89250), (7, 0.55125), (10, 0.42000)] {
+        for (level, expected) in [(2u8, 1.60125), (4, 0.89250), (7, 0.55125), (9, 0.42000)] {
             let slot = FrameSlot::for_level(level, &profile, true).expect("valid level");
             assert!(
                 (slot.airtime_s - expected).abs() < 1e-9,
@@ -411,15 +408,16 @@ mod tests {
         }
     }
 
-    /// Test 6. A reserved or out-of-range level must propagate `None`, never a
+    /// Test 6. An out-of-range level must propagate `None`, never a
     /// 0.0-airtime slot: one such slot in an arm makes that arm's goodput
     /// infinite (or, worse, plausible) instead of failing loudly.
     #[test]
-    fn frame_slot_rejects_reserved_level_8() {
+    fn frame_slot_rejects_invalid_levels() {
         let profile = CoppaProfile::hf_robust();
+        assert!(FrameSlot::for_level(8, &profile, true).is_some());
         assert!(
-            FrameSlot::for_level(8, &profile, true).is_none(),
-            "level 8 is reserved (32-QAM) and absent from SPEED_LEVELS"
+            FrameSlot::for_level(10, &profile, true).is_none(),
+            "level 10 is outside SPEED_LEVELS"
         );
         assert!(FrameSlot::for_level(255, &profile, true).is_none());
     }
@@ -437,7 +435,7 @@ mod tests {
         let long = CoppaProfile::hf_standard();
         let short = CoppaProfile::hf_standard_short_cp();
         let expected = 1104.0 / 1260.0;
-        for level in [2u8, 4, 7, 10] {
+        for level in [2u8, 4, 7, 9] {
             let l = FrameSlot::for_level(level, &long, true).expect("valid level");
             let s = FrameSlot::for_level(level, &short, true).expect("valid level");
             let ratio = s.airtime_s / l.airtime_s;
@@ -499,7 +497,7 @@ mod tests {
                     delivered: true,
                 },
                 FrameSlot {
-                    level: 10,
+                    level: 9,
                     info_bits: 100,
                     airtime_s: 0.01,
                     delivered: true,
@@ -513,7 +511,7 @@ mod tests {
                     delivered: false,
                 },
                 FrameSlot {
-                    level: 10,
+                    level: 9,
                     info_bits: 100,
                     airtime_s: 10.0,
                     delivered: false,
@@ -545,15 +543,15 @@ mod tests {
     /// `lambda` becomes positive -- at `lambda = 0` every dead candidate scores
     /// 0.0 and the tie-break picks index 0 (see `oracle_goodput_bps`'s doc).
     ///
-    /// COP-2's plan predicted the L10 index (8) here; the real `hf_robust`
+    /// COP-2's plan predicted the top-level index (8) here; the real `hf_robust`
     /// airtime table makes that **arithmetically impossible** and the prediction
-    /// is corrected rather than forced. L9 and L10 are both 64-QAM (6 bits per
+    /// is corrected rather than forced. L8 and L9 are both 64-QAM (6 bits per
     /// constellation symbol), so both need `ceil(1944/6) = 324` coded symbols =
     /// `ceil(324/36) = 9` payload OFDM symbols and cost the *identical* 0.42 s
     /// (verified against `frame_airtime_s` directly). The minimum-airtime cell is
     /// therefore not unique, and `oracle_goodput_bps`'s own documented
     /// ties-to-lowest-index rule -- the thing that makes the reported choice
-    /// reproducible -- must select L9 (index 7). The property under test is
+    /// reproducible -- must select L8 (index 7). The property under test is
     /// "cheapest air, not most bits", so it is asserted as exactly that, plus the
     /// tie-break's index: an `argmax(nominal bits)` oracle picks index 8 and an
     /// `argmax(delivered bits)` one ties at index 0 (L1, 1.60125 s), so both
@@ -576,7 +574,7 @@ mod tests {
             .fold(f64::INFINITY, f64::min);
         assert!(
             (cheapest_airtime - 0.42).abs() < 1e-9,
-            "the cheapest hf_robust cell is L9/L10's 0.42s, got {cheapest_airtime}"
+            "the cheapest hf_robust cell is L8/L9's 0.42s, got {cheapest_airtime}"
         );
 
         let frames = vec![live, dead.clone()];
@@ -591,9 +589,9 @@ mod tests {
         );
         assert_eq!(
             choice[1], 7,
-            "L9 and L10 tie at 0.42s, so the documented lowest-index tie-break picks L9"
+            "L8 and L9 tie at 0.42s, so the documented lowest-index tie-break picks L8"
         );
-        assert_eq!(VALID_SPEED_LEVELS[7], 9);
+        assert_eq!(VALID_SPEED_LEVELS[7], 8);
     }
 
     /// Test 11. The structural guarantee: every constant-level policy is in the
@@ -644,7 +642,7 @@ mod tests {
             delivered: true,
         }];
         let fast = vec![FrameSlot {
-            level: 10,
+            level: 9,
             info_bits: 1000,
             airtime_s: 1.0,
             delivered: true,
@@ -669,7 +667,7 @@ mod tests {
         // are 14 (r=0: 0,3,..,39), 13 (r=1: 1,4,..,37) and 13 (r=2: 2,5,..,38),
         // so li % 3 == 0 loses 14 frames and every other li loses 13.
         // info_bits per level = max_payload_for_level*8: L1 448, L2 936, L3 936,
-        // L4 1424, L5 1264, L6 936, L7 1424, L9 1264, L10 1584.
+        // L4 1424, L5 1264, L6 936, L7 1424, L8 1264, L9 1584.
         let expected_bits = [
             26 * 448,  // L1  = 11648
             27 * 936,  // L2  = 25272
@@ -678,8 +676,8 @@ mod tests {
             27 * 1264, // L5  = 34128
             27 * 936,  // L6  = 25272
             26 * 1424, // L7  = 37024
-            27 * 1264, // L9  = 34128
-            27 * 1584, // L10 = 42768
+            27 * 1264, // L8  = 34128
+            27 * 1584, // L9  = 42768
         ];
         for (li, arm) in arms.iter().enumerate() {
             assert_eq!(
@@ -690,7 +688,7 @@ mod tests {
             );
         }
 
-        // Per-frame max over DELIVERED cells. L10 (1584, li=8) is undelivered
+        // Per-frame max over DELIVERED cells. L9 (1584, li=8) is undelivered
         // exactly when (f + 8) % 3 == 0, i.e. f % 3 == 1 (13 of the 40 frames);
         // on those the undelivered set is li in {2,5,8}, leaving L4/L7 (1424) as
         // the best surviving cell. So 27*1584 + 13*1424 = 42768 + 18512 = 61280.
@@ -709,18 +707,18 @@ mod tests {
     #[test]
     fn best_arm_by_bits_is_the_legacy_argmax_and_can_differ_from_the_goodput_argmax() {
         let (arms, _frames) = deterministic_matrix();
-        // From test 13's totals, L10 (li 8) wins on bits (42768) -- and on this
+        // From test 13's totals, L9 (li 8) wins on bits (42768) -- and on this
         // particular matrix it also wins on goodput, which is why the divergence
         // needs its own hand-built case below.
         assert_eq!(best_arm_by_bits(&arms), Some((8, 42768)));
 
         // Arm 0: two delivered L2 frames -- 1872 bits, but 2 * 1.60125 = 3.2025 s
-        // of air (584.5 bps). Arm 1: one delivered L10 frame -- fewer bits
+        // of air (584.5 bps). Arm 1: one delivered L9 frame -- fewer bits
         // (1584) in 0.42 s (3771.4 bps). Bits pick arm 0; goodput picks arm 1.
         let profile = CoppaProfile::hf_robust();
         let bits_heavy =
             vec![FrameSlot::for_level(2, &profile, true).expect("level 2 is valid"); 2];
-        let air_cheap = vec![FrameSlot::for_level(10, &profile, true).expect("level 10 is valid")];
+        let air_cheap = vec![FrameSlot::for_level(9, &profile, true).expect("level 9 is valid")];
         let two = [bits_heavy, air_cheap];
 
         assert_eq!(best_arm_by_bits(&two), Some((0, 1872)));

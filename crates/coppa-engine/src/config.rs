@@ -3,6 +3,11 @@
 use crate::profiles::Profile;
 use coppa_protocol::cp_negotiator::CpMode;
 
+/// Highest speed level permitted on HF (COP-24).
+/// The 2700 Hz carrier is attenuated by 6.02 dB through the SSB filter;
+/// 64-QAM 5/6 cannot reliably decode there. See BENCHMARKS.md's COP-24 section.
+pub const HF_MAX_SPEED_LEVEL: u8 = 8;
+
 /// Which OFDM band an engine's waveform is bound to.
 ///
 /// COP-23: before this existed, `CoppaCore::select_ofdm_profile` derived the band
@@ -138,7 +143,7 @@ mod tests {
     fn test_from_profile_vhf() {
         use crate::profiles::VHF_FAST;
         let config = EngineConfig::from_profile(&VHF_FAST);
-        assert_eq!(config.speed_level, 9);
+        assert_eq!(config.speed_level, 8);
         assert!(config.compression_enabled);
     }
 
