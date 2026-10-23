@@ -61,7 +61,11 @@ typedef struct CoppaStreamHandle CoppaStreamHandle;
  *   profile's/default speed_level" (0 is never itself a valid wire speed
  *   level, so it unambiguously means "unset" here too). A non-zero,
  *   invalid level (out of 1-10, or the reserved 8) is a config-rejection
- *   error.
+ *   error. The override changes the level, never the profile's OFDM band:
+ *   an `"HF_ROBUST"` handle at `speed_level = 9` stays on an HF profile, and
+ *   so does any later [`coppa_engine_set_speed_level`] call on it (COP-23).
+ *   Only a handle built with no `profile` keeps the historical level-only
+ *   rule (HF below level 5, VHF from level 5).
  * - `callsign`: optional pointer to a null-terminated station-callsign
  *   string, for the FFI caller's own bookkeeping convenience only —
  *   `CoppaCore`/`EngineConfig` have no callsign concept at all (callsign
