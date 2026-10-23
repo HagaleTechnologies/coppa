@@ -29,6 +29,18 @@ use crate::config::DaemonConfig;
 /// (`VaraServer::response_senders()`), used to broadcast `VaraResponse` telemetry.
 type VaraResponseSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<VaraResponse>>>>;
 
+/// A session-state change broadcast to attached hosts by `notify_session`.
+enum SessionNotice {
+    /// Handshake complete. VARA names the calling station first.
+    Connected {
+        local: Callsign,
+        remote: Callsign,
+        we_called: bool,
+    },
+    /// A session ended or a connect attempt failed.
+    Disconnected,
+}
+
 /// Event types flowing through the daemon event loop.
 #[derive(Debug)]
 #[allow(dead_code)] // AudioIn/AudioOut wired in future AFSK TX/RX path
@@ -138,7 +150,8 @@ pub struct EventLoop {
     ws_broadcast: Option<tokio::sync::broadcast::Sender<String>>,
     /// Optional shared live-status snapshot for the WebSocket `status` reply
     /// (decision 8: "WebSocket `status` reply carries real values"). Updated
-    /// alongside VARA telemetry whenever a frame decodes.
+    /// alongside VARA telemetry whenever a frame decodes and at every session
+    /// transition (`notify_session`).
     #[cfg(feature = "websocket")]
     ws_status: Option<Arc<Mutex<coppa_host::websocket::WsStatus>>>,
     /// Optional map of connected VARA command-port clients' response senders, for
@@ -529,6 +542,87 @@ impl EventLoop {
         }
     }
 
+    #[cfg(feature = "websocket")]
+    fn established_remote(&self) -> Option<Callsign> {
+        self.session_mgr.active_sessions().iter().find_map(|&id| {
+            self.session_mgr
+                .get(id)
+                .filter(|session| session.is_established())
+                .map(|session| session.remote.clone())
+        })
+    }
+
+    /// Call after `session_mgr` reflects the change. Broadcast to all hosts
+    /// rather than addressing `client_id`: the servers' ID namespaces overlap.
+    async fn notify_session(&self, client_id: u32, notice: SessionNotice) {
+        let (status, vara) = match &notice {
+            SessionNotice::Connected {
+                local,
+                remote,
+                we_called,
+            } => {
+                let (source, destination) = if *we_called {
+                    (local, remote)
+                } else {
+                    (remote, local)
+                };
+                (
+                    format!("CONNECTED {}", remote),
+                    VaraResponse::Connected(source.to_string(), destination.to_string()),
+                )
+            }
+            SessionNotice::Disconnected => ("DISCONNECTED".to_string(), VaraResponse::Disconnected),
+        };
+        if let Some(ref tx) = self.response_tx {
+            let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate { client_id, status });
+        }
+        // A dropped state line leaves the host waiting out its own connect or
+        // disconnect timer, so log it. Closed channels belong to departed clients.
+        if let Some(ref senders) = self.vara_responses {
+            for (id, tx) in senders.lock().await.iter() {
+                if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(vara.clone()) {
+                    tracing::warn!(
+                        client_id = id,
+                        line = vara.format().trim_end(),
+                        "VARA command-port queue full; session-state line dropped"
+                    );
+                }
+            }
+        }
+        #[cfg(feature = "websocket")]
+        {
+            let remote = self.established_remote();
+            if let Some(ref status) = self.ws_status {
+                let mut snap = status.lock().await;
+                snap.connected = remote.is_some();
+                snap.remote_call = remote.map(|cs| cs.to_string());
+            }
+            if let Some(ref ws_tx) = self.ws_broadcast {
+                let msg = match notice {
+                    SessionNotice::Connected { remote, .. } => {
+                        coppa_host::websocket::WsServerMessage::Connected {
+                            remote_call: remote.to_string(),
+                        }
+                    }
+                    SessionNotice::Disconnected => {
+                        coppa_host::websocket::WsServerMessage::Disconnected
+                    }
+                };
+                if let Ok(json) = serde_json::to_string(&msg) {
+                    let _ = ws_tx.send(json); // An error means no client is subscribed.
+                }
+            }
+        }
+    }
+
+    async fn reap_timed_out_sessions(&mut self) {
+        let removed = self.session_mgr.cleanup_timed_out();
+        for id in removed {
+            tracing::warn!(session_id = id, "Session timed out");
+            self.notify_session(0, SessionNotice::Disconnected).await;
+        }
+    }
+
     /// Push one raw payload onto the outbound TX queue, emit the resulting
     /// `BUFFER` telemetry, and attempt to start transmitting immediately if the
     /// link is currently idle. See `tx_queue`'s field doc and `try_drain_tx_queue`.
@@ -684,16 +778,7 @@ impl EventLoop {
                     self.maybe_send_beacon().await;
                 }
                 _ = session_cleanup.tick() => {
-                    let removed = self.session_mgr.cleanup_timed_out();
-                    for id in removed {
-                        tracing::warn!(session_id = id, "Session timed out");
-                        if let Some(ref tx) = self.response_tx {
-                            let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
-                                client_id: 0,
-                                status: "DISCONNECTED".to_string(),
-                            });
-                        }
-                    }
+                    self.reap_timed_out_sessions().await;
                     // Send keepalives for active sessions
                     let active = self.session_mgr.active_sessions();
                     for id in active {
@@ -917,12 +1002,8 @@ impl EventLoop {
                     Some(ref cs) => cs.clone(),
                     None => {
                         tracing::warn!("Connect request but no local callsign configured");
-                        if let Some(ref tx) = self.response_tx {
-                            let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
-                                client_id,
-                                status: "DISCONNECTED".to_string(),
-                            });
-                        }
+                        self.notify_session(client_id, SessionNotice::Disconnected)
+                            .await;
                         return;
                     }
                 };
@@ -931,12 +1012,8 @@ impl EventLoop {
                     Ok(cs) => cs,
                     Err(e) => {
                         tracing::warn!(error = %e, "Invalid destination callsign");
-                        if let Some(ref tx) = self.response_tx {
-                            let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
-                                client_id,
-                                status: "DISCONNECTED".to_string(),
-                            });
-                        }
+                        self.notify_session(client_id, SessionNotice::Disconnected)
+                            .await;
                         return;
                     }
                 };
@@ -965,18 +1042,16 @@ impl EventLoop {
                                 Err(e) => {
                                     tracing::warn!(error = %e, "Failed to initiate session");
                                     self.session_mgr.remove(id);
+                                    self.notify_session(client_id, SessionNotice::Disconnected)
+                                        .await;
                                 }
                             }
                         }
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "Failed to create session");
-                        if let Some(ref tx) = self.response_tx {
-                            let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
-                                client_id,
-                                status: "DISCONNECTED".to_string(),
-                            });
-                        }
+                        self.notify_session(client_id, SessionNotice::Disconnected)
+                            .await;
                     }
                 }
             }
@@ -1014,12 +1089,8 @@ impl EventLoop {
                         }
                     }
                     self.session_mgr.remove(id);
-                    if let Some(ref tx) = self.response_tx {
-                        let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
-                            client_id,
-                            status: "DISCONNECTED".to_string(),
-                        });
-                    }
+                    self.notify_session(client_id, SessionNotice::Disconnected)
+                        .await;
                 } else {
                     tracing::debug!("Disconnect request but no active session");
                 }
@@ -1228,18 +1299,14 @@ impl EventLoop {
                     // silent -- a monitoring client would misread a dead link as
                     // live). Recomputed from `session_mgr`'s real established-session
                     // state instead, at the same point the rest of the snapshot
-                    // updates. Still only refreshed on a decode event (this whole
-                    // snapshot has no independent tick), so a session that drops
-                    // WITHOUT any further decode won't flip this back to false until
-                    // the next decoded frame -- an accepted, smaller residual gap,
-                    // not the same "stays true forever, unconditionally" bug.
+                    // updates. `notify_session` also refreshes connected/remote_call
+                    // at every transition, without waiting for another decode.
                     #[cfg(feature = "websocket")]
                     if let Some(ref status) = self.ws_status {
-                        let established = self.session_mgr.active_sessions().iter().any(|&id| {
-                            self.session_mgr.get(id).is_some_and(|s| s.is_established())
-                        });
+                        let remote = self.established_remote();
                         let mut snap = status.lock().await;
-                        snap.connected = established;
+                        snap.connected = remote.is_some();
+                        snap.remote_call = remote.map(|cs| cs.to_string());
                         snap.snr = Some(snr_db.round() as i32);
                         snap.level = Some(speed_level);
                         snap.cfo = Some(cfo_hz);
@@ -2532,8 +2599,8 @@ impl EventLoop {
         match pdu.frame_type {
             MacFrameType::ConnectReq => self.handle_incoming_connect(pdu).await,
             MacFrameType::ConnectAck => self.handle_connect_ack_rx(pdu).await,
-            MacFrameType::ConnectCfm => self.handle_connect_cfm_rx(pdu),
-            MacFrameType::Disconnect => self.handle_incoming_disconnect(pdu),
+            MacFrameType::ConnectCfm => self.handle_connect_cfm_rx(pdu).await,
+            MacFrameType::Disconnect => self.handle_incoming_disconnect(pdu).await,
             MacFrameType::Data => self.handle_session_data(pdu),
             MacFrameType::Keepalive => self.handle_keepalive_rx(pdu),
             MacFrameType::Beacon => self.handle_beacon_rx(pdu),
@@ -2618,16 +2685,18 @@ impl EventLoop {
         if let Some(session) = self.session_mgr.find_by_remote_mut(&remote) {
             match session.handle_connect_ack(&pdu.payload) {
                 Ok(cfm_pdu) => {
+                    let notice = SessionNotice::Connected {
+                        local: session.local.clone(),
+                        remote,
+                        we_called: true,
+                    };
+                    // The session is established now; the busy-channel courtesy
+                    // wait in transmit_samples can delay the CFM by seconds.
+                    self.notify_session(0, notice).await;
                     let cfm_bytes = cfm_pdu.to_bytes();
                     match self.engine.encode_bytes(&cfm_bytes) {
                         Ok(samples) => self.transmit_samples(&samples).await,
                         Err(e) => tracing::warn!(error = %e, "Failed to encode CONNECT_CFM"),
-                    }
-                    if let Some(ref tx) = self.response_tx {
-                        let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
-                            client_id: 0,
-                            status: format!("CONNECTED {}", remote),
-                        });
                     }
                 }
                 Err(e) => {
@@ -2639,19 +2708,19 @@ impl EventLoop {
         }
     }
 
-    fn handle_connect_cfm_rx(&mut self, pdu: MacPdu) {
+    async fn handle_connect_cfm_rx(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
         if let Some(session) = self.session_mgr.find_by_remote_mut(&remote) {
             match session.handle_connect_cfm(&pdu.payload) {
                 Ok(()) => {
                     session.confirm_established();
                     tracing::info!(remote = %remote, "Session fully established (responder)");
-                    if let Some(ref tx) = self.response_tx {
-                        let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
-                            client_id: 0,
-                            status: format!("CONNECTED {}", remote),
-                        });
-                    }
+                    let notice = SessionNotice::Connected {
+                        local: session.local.clone(),
+                        remote,
+                        we_called: false,
+                    };
+                    self.notify_session(0, notice).await;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to handle CONNECT_CFM");
@@ -2662,7 +2731,7 @@ impl EventLoop {
         }
     }
 
-    fn handle_incoming_disconnect(&mut self, pdu: MacPdu) {
+    async fn handle_incoming_disconnect(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
         // Find session ID first to avoid borrow issues
         let session_id = self.session_mgr.find_by_remote(&remote).map(|s| s.id);
@@ -2672,12 +2741,7 @@ impl EventLoop {
             }
             self.session_mgr.remove(id);
             tracing::info!(remote = %remote, "Session disconnected by remote");
-            if let Some(ref tx) = self.response_tx {
-                let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
-                    client_id: 0,
-                    status: "DISCONNECTED".to_string(),
-                });
-            }
+            self.notify_session(0, SessionNotice::Disconnected).await;
         } else {
             tracing::debug!(remote = %remote, "DISCONNECT from unknown remote");
         }
@@ -4155,6 +4219,63 @@ mod tests {
     // propose-on-transition block turns that into a real `Propose(LongCp)`, so
     // the untested direction is a production path -- and the one that runs
     // exactly when the channel is degrading and legs get lost.
+
+    #[tokio::test]
+    async fn real_handshake_pushes_connected_to_both_stations() {
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = "VK3ABC".into();
+        config.radio.ptt_pre_delay_ms = 0;
+        config.radio.ptt_tail_delay_ms = 0;
+        let mut a = EventLoop::new(config.clone()).unwrap();
+        config.engine.callsign = "W1AW".into();
+        let mut b = EventLoop::new(config).unwrap();
+        a.listening = true;
+        b.listening = true;
+        let (a_producer, mut a_consumer) = coppa_audio::audio_ring(1_000_000);
+        let (b_producer, mut b_consumer) = coppa_audio::audio_ring(1_000_000);
+        a.set_audio_out(a_producer);
+        b.set_audio_out(b_producer);
+        let (a_tx, mut a_rx) = mpsc::channel(64);
+        let (b_tx, mut b_rx) = mpsc::channel(64);
+        a.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, a_tx)]))));
+        b.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, b_tx)]))));
+        fn session_lines(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<String> {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|response| {
+                    matches!(
+                        response,
+                        VaraResponse::Connected(..)
+                            | VaraResponse::Disconnected
+                            | VaraResponse::Pending
+                    )
+                })
+                .map(|response| response.format())
+                .collect()
+        }
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "VK3ABC".into(),
+            destination: "W1AW".into(),
+        })
+        .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_REQ"))
+            .await;
+        assert!(
+            session_lines(&mut b_rx).is_empty(),
+            "REQ is not established"
+        );
+        a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "CONNECT_ACK"))
+            .await;
+        assert_eq!(session_lines(&mut a_rx), ["CONNECTED VK3ABC W1AW\r\n"]);
+        assert!(
+            session_lines(&mut b_rx).is_empty(),
+            "responder waits for CFM"
+        );
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_CFM"))
+            .await;
+        assert_eq!(session_lines(&mut b_rx), ["CONNECTED VK3ABC W1AW\r\n"]);
+        assert!(session_lines(&mut a_rx).is_empty());
+    }
 
     /// Two real stations with real audio rings and CP negotiation enabled,
     /// with `cp_gate` left OFF: these tests drive proposals explicitly, so the
@@ -6393,6 +6514,163 @@ mod tests {
                 }
             }
             lines
+        }
+
+        fn session_config() -> DaemonConfig {
+            let mut config = fast_ptt_config();
+            config.engine.callsign = "VK3ABC".into();
+            config
+        }
+
+        fn peer() -> coppa_protocol::session::Session {
+            coppa_protocol::session::Session::new(
+                0,
+                Callsign::new("W1AW").unwrap(),
+                Callsign::new("VK3ABC").unwrap(),
+                0,
+                LinkCapabilities::default(),
+            )
+        }
+
+        fn seed_established(event_loop: &mut EventLoop) -> u8 {
+            let id = event_loop
+                .session_mgr
+                .create(
+                    Callsign::new("VK3ABC").unwrap(),
+                    Callsign::new("W1AW").unwrap(),
+                    0,
+                    LinkCapabilities::default(),
+                )
+                .unwrap();
+            let session = event_loop.session_mgr.get_mut(id).unwrap();
+            let req = session.initiate().unwrap();
+            let ack = peer().handle_connect_req(&req.payload).unwrap();
+            session.handle_connect_ack(&ack.payload).unwrap();
+            id
+        }
+
+        fn is_session_line(line: &str) -> bool {
+            ["CONNECTED", "DISCONNECTED", "CONNECTING", "PENDING"]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        }
+
+        async fn next_session_line(reader: &mut BufReader<OwnedReadHalf>) -> String {
+            loop {
+                let line = read_line(reader).await;
+                if is_session_line(&line) {
+                    return line;
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn initiator_hears_connected_then_remote_disconnect() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19440, 19441).await;
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "VK3ABC".into(),
+                    destination: "W1AW".into(),
+                })
+                .await;
+            let mut remote = peer();
+            let ack = remote
+                .handle_connect_req(&LinkCapabilities::default().to_bytes())
+                .unwrap();
+            station.handle_mac_pdu(ack).await;
+            assert_eq!(
+                next_session_line(&mut reader).await,
+                "CONNECTED VK3ABC W1AW\r\n"
+            );
+            station.handle_mac_pdu(remote.disconnect().unwrap()).await;
+            assert_eq!(next_session_line(&mut reader).await, "DISCONNECTED\r\n");
+        }
+
+        #[tokio::test]
+        async fn responder_hears_connected_only_after_cfm() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            station.listening = true;
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19442, 19443).await;
+            let mut remote = peer();
+            station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            assert!(read_available_lines(&mut reader)
+                .await
+                .iter()
+                .all(|line| !is_session_line(line)));
+            let cfm = remote
+                .handle_connect_ack(&LinkCapabilities::default().to_bytes())
+                .unwrap();
+            station.handle_mac_pdu(cfm).await;
+            assert_eq!(
+                next_session_line(&mut reader).await,
+                "CONNECTED W1AW VK3ABC\r\n"
+            );
+        }
+
+        #[tokio::test]
+        async fn local_disconnect_timeout_and_failed_connect_push_disconnected() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19444, 19445).await;
+            seed_established(&mut station);
+            station
+                .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+                .await;
+            assert_eq!(next_session_line(&mut reader).await, "DISCONNECTED\r\n");
+            let id = seed_established(&mut station);
+            station.session_mgr.get_mut(id).unwrap().session_timeout = Duration::ZERO;
+            station.reap_timed_out_sessions().await;
+            assert_eq!(next_session_line(&mut reader).await, "DISCONNECTED\r\n");
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "VK3ABC".into(),
+                    destination: "NOT/A/CALL".into(),
+                })
+                .await;
+            assert_eq!(next_session_line(&mut reader).await, "DISCONNECTED\r\n");
+        }
+
+        #[cfg(feature = "websocket")]
+        #[tokio::test]
+        async fn websocket_hears_connected_and_disconnected_and_status_follows() {
+            use coppa_host::websocket::{WsServerMessage, WsStatus};
+            let mut station = EventLoop::new(session_config()).unwrap();
+            let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+            let status = Arc::new(Mutex::new(WsStatus::default()));
+            station.set_ws_broadcast(tx);
+            station.set_ws_status(status.clone());
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "VK3ABC".into(),
+                    destination: "W1AW".into(),
+                })
+                .await;
+            let mut remote = peer();
+            let ack = remote
+                .handle_connect_req(&LinkCapabilities::default().to_bytes())
+                .unwrap();
+            station.handle_mac_pdu(ack).await;
+            let msg: WsServerMessage =
+                serde_json::from_str(&rx.try_recv().expect("connected push")).unwrap();
+            assert!(
+                matches!(msg, WsServerMessage::Connected { remote_call } if remote_call == "W1AW")
+            );
+            {
+                let snap = status.lock().await;
+                assert!(snap.connected);
+                assert_eq!(snap.remote_call.as_deref(), Some("W1AW"));
+            }
+            station.handle_mac_pdu(remote.disconnect().unwrap()).await;
+            let msg: WsServerMessage =
+                serde_json::from_str(&rx.try_recv().expect("disconnected push")).unwrap();
+            assert!(matches!(msg, WsServerMessage::Disconnected));
+            let snap = status.lock().await;
+            assert!(!snap.connected);
+            assert_eq!(snap.remote_call, None);
+            assert!(rx.try_recv().is_err(), "exactly one push per transition");
         }
 
         /// Zero-lead/trail-padded encode, mirroring `coppa-engine`'s own streaming

@@ -240,6 +240,8 @@ async fn main() -> Result<()> {
         let vara_data_senders = vara_server.data_senders();
         tokio::spawn(async move {
             while let Some(response) = response_rx.recv().await {
+                // StatusUpdate is deliberately not forwarded: EventLoop::notify_session
+                // pushes session state directly to the command port and WebSocket.
                 if let coppa_host::HostResponse::DataOut { client_id, data } = &response {
                     let senders = vara_data_senders.lock().await;
                     if *client_id == 0 {
