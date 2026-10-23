@@ -1,7 +1,7 @@
 //! VARA command port handler (TCP port 8300).
 
 use anyhow::Result;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -10,7 +10,7 @@ use crate::HostEvent;
 
 /// Maximum length of a single command line, in bytes. Lines longer than this
 /// cause the connection to be closed, bounding per-client memory use.
-const MAX_LINE: u64 = 4096;
+const MAX_LINE: usize = 4096;
 
 /// VARA command port TCP listener.
 pub struct VaraCommandPort {
@@ -46,22 +46,25 @@ impl VaraCommandPort {
         // which signals the write task to stop.
         let (read_done_tx, mut read_done_rx) = mpsc::channel::<()>(1);
         let read_task = tokio::spawn(async move {
-            let mut line = String::new();
+            let mut line = Vec::new();
             loop {
                 line.clear();
-                // Bounded read: cap each line at MAX_LINE bytes so a client cannot
-                // force unbounded buffer growth by never sending a newline.
-                let mut limited = (&mut reader).take(MAX_LINE);
-                match limited.read_line(&mut line).await {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        // If we hit the cap without a trailing newline, the line was
-                        // over-long (or truncated mid-line): close the connection.
-                        if n as u64 == MAX_LINE && !line.ends_with('\n') {
-                            eprintln!("Command client {} sent over-long line, closing", client_id);
+                match read_command(&mut reader, &mut line).await {
+                    Ok(false) => break, // EOF with nothing buffered
+                    Ok(true) => {
+                        // Invalid UTF-8 closes the connection, as read_line's
+                        // InvalidData error did before.
+                        let Ok(text) = std::str::from_utf8(&line) else {
                             break;
+                        };
+                        let text = text.trim();
+                        // A `\r\n` pair ends its line at the `\r`, leaving an
+                        // empty line at the `\n`; drop empty (and
+                        // whitespace-only) lines instead of dispatching them.
+                        if text.is_empty() {
+                            continue;
                         }
-                        let cmd = VaraCommand::parse(&line);
+                        let cmd = VaraCommand::parse(text);
                         let event = match &cmd {
                             VaraCommand::Connect {
                                 source,
@@ -74,14 +77,19 @@ impl VaraCommandPort {
                             VaraCommand::Disconnect => HostEvent::DisconnectRequest { client_id },
                             _ => HostEvent::VaraCommand {
                                 client_id,
-                                command: line.trim().to_string(),
+                                command: text.to_string(),
                             },
                         };
                         if event_tx_clone.send(event).await.is_err() {
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::InvalidData {
+                            eprintln!("Command client {} sent over-long line, closing", client_id);
+                        }
+                        break;
+                    }
                 }
             }
             drop(read_done_tx); // signal write task
@@ -117,12 +125,204 @@ impl VaraCommandPort {
     }
 }
 
+/// Read one command line into `line`, without its terminator.
+///
+/// VARA clients (Pat among them) end each command with a bare `\r`, so `\r`,
+/// `\n` and `\r\n` all end a line. Returns `Ok(false)` at EOF with nothing
+/// buffered. A line longer than `MAX_LINE` bytes is an `InvalidData` error.
+async fn read_command<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+) -> std::io::Result<bool> {
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(!line.is_empty());
+        }
+        let (chunk, used, done) = match available.iter().position(|&b| b == b'\r' || b == b'\n') {
+            Some(i) => (&available[..i], i + 1, true),
+            None => (available, available.len(), false),
+        };
+        if line.len() + chunk.len() > MAX_LINE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "command line too long",
+            ));
+        }
+        line.extend_from_slice(chunk);
+        reader.consume(used);
+        if done {
+            return Ok(true);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_command_port_new() {
         let _port = VaraCommandPort::new(8300);
+    }
+
+    /// A command-port client under test: its socket, the event stream
+    /// `handle_client` dispatches to, the response sender (kept alive for the
+    /// whole test so the write task does not wind down early), and the spawned
+    /// handler's join handle.
+    struct CommandClient {
+        stream: TcpStream,
+        rx: mpsc::Receiver<HostEvent>,
+        _response_tx: mpsc::Sender<VaraResponse>,
+        handler: tokio::task::JoinHandle<Result<()>>,
+    }
+
+    /// Connect a client to a real `handle_client` over a loopback socket,
+    /// read the greeting, and drain the `Connected` event.
+    async fn connect() -> CommandClient {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let (event_tx, mut rx) = mpsc::channel(16);
+        let (response_tx, response_rx) = mpsc::channel(16);
+        let handler = tokio::spawn(VaraCommandPort::handle_client(
+            server,
+            1,
+            event_tx,
+            response_rx,
+        ));
+
+        // The greeting is `\n`-terminated, so read_line drains it exactly.
+        let mut greeting = String::new();
+        BufReader::new(&mut stream)
+            .read_line(&mut greeting)
+            .await
+            .unwrap();
+        assert!(!greeting.is_empty(), "no greeting received");
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for Connected")
+            .expect("event channel closed");
+        assert!(matches!(event, HostEvent::Connected { client_id: 1 }));
+
+        CommandClient {
+            stream,
+            rx,
+            _response_tx: response_tx,
+            handler,
+        }
+    }
+
+    /// Wait up to 5 s for the next dispatched `VaraCommand` and return its text.
+    async fn next_command(rx: &mut mpsc::Receiver<HostEvent>) -> String {
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for a command")
+            .expect("event channel closed");
+        match event {
+            HostEvent::VaraCommand { command, .. } => command,
+            other => panic!("expected VaraCommand, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_cr_terminated_command_is_dispatched() {
+        let mut c = connect().await;
+        c.stream.write_all(b"VERSION\r").await.unwrap();
+        // The socket stays open: the bare \r alone must terminate the command.
+        assert_eq!(next_command(&mut c.rx).await, "VERSION");
+    }
+
+    #[tokio::test]
+    async fn pat_startup_sequence_dispatches_each_command() {
+        let mut c = connect().await;
+        c.stream
+            .write_all(b"PUBLIC ON\rCWID ON\rCOMPRESSION TEXT\rMYCALL W5AU\rLISTEN OFF\r")
+            .await
+            .unwrap();
+        for expected in [
+            "PUBLIC ON",
+            "CWID ON",
+            "COMPRESSION TEXT",
+            "MYCALL W5AU",
+            "LISTEN OFF",
+        ] {
+            assert_eq!(next_command(&mut c.rx).await, expected);
+        }
+
+        c.stream.write_all(b"CONNECT W5AU K7XYZ\r").await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), c.rx.recv())
+            .await
+            .expect("timed out waiting for ConnectRequest")
+            .expect("event channel closed");
+        match event {
+            HostEvent::ConnectRequest {
+                client_id: 1,
+                source,
+                destination,
+            } => {
+                assert_eq!(source, "W5AU");
+                assert_eq!(destination, "K7XYZ");
+            }
+            other => panic!("expected ConnectRequest, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn lf_and_crlf_terminators_dispatch_once_each() {
+        let mut c = connect().await;
+        c.stream.write_all(b"VERSION\r").await.unwrap();
+        assert_eq!(next_command(&mut c.rx).await, "VERSION");
+
+        // The leading \n completes the \r\n pair across the two writes and is
+        // dropped as an empty line, not dispatched.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        c.stream
+            .write_all(b"\nMYCALL W5AU\nLISTEN ON\r\n")
+            .await
+            .unwrap();
+        assert_eq!(next_command(&mut c.rx).await, "MYCALL W5AU");
+        assert_eq!(next_command(&mut c.rx).await, "LISTEN ON");
+
+        // The empty line the \r\n pair leaves at its \n must not dispatch.
+        let extra = tokio::time::timeout(Duration::from_millis(200), c.rx.recv()).await;
+        assert!(
+            extra.is_err(),
+            "unexpected extra event: {:?}",
+            extra.ok().flatten()
+        );
+    }
+
+    #[tokio::test]
+    async fn over_long_line_closes_the_connection() {
+        let mut c = connect().await;
+        let buf = vec![b'A'; MAX_LINE + 1];
+        c.stream.write_all(&buf).await.unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(5), c.rx.recv())
+            .await
+            .expect("timed out waiting for Disconnected")
+            .expect("event channel closed");
+        assert!(matches!(event, HostEvent::Disconnected { client_id: 1 }));
+        let result = c.handler.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn read_command_handles_terminators_split_across_reads() {
+        let mut reader = BufReader::with_capacity(1, &b"A\r\nB\rC\n"[..]);
+        let mut line = Vec::new();
+
+        for expected in ["A", "", "B", "C"] {
+            line.clear();
+            assert!(read_command(&mut reader, &mut line).await.unwrap());
+            assert_eq!(line.as_slice(), expected.as_bytes());
+        }
+        line.clear();
+        assert!(!read_command(&mut reader, &mut line).await.unwrap());
     }
 }
