@@ -1,5 +1,6 @@
 //! Coppa daemon library — exposes TNC and daemon components for use by other crates.
 
+pub mod audio_output;
 pub mod config;
 pub mod event_loop;
 #[cfg(feature = "websocket")]

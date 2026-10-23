@@ -23,6 +23,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 
+use crate::audio_output::{
+    wait_for_discard, wait_for_playout, IntervalProgress, OutputFeedback, PlayoutWatch, StallClock,
+    TxOutput, PROGRESS_TICK,
+};
 use crate::config::DaemonConfig;
 
 /// Map of connected VARA command-port clients' response senders
@@ -53,8 +57,22 @@ pub enum DaemonEvent {
     AudioOut(Vec<f32>),
     /// PTT state change.
     PttChange(bool),
+    /// Automatic end of the keyed transmission tagged `generation`:
+    /// `completed` is true once its last sample is predicted to have played
+    /// and the PTT tail has elapsed, false when it was cancelled (output
+    /// failure, no playback progress, or `max_tx_duration_s`). Feedback for
+    /// any generation but the newest is stale and ignored.
+    TxComplete { generation: u64, completed: bool },
     /// Shutdown signal received.
     Shutdown,
+}
+
+/// Lock the shared TX output, recovering from poisoning (its state is
+/// always consistent between calls; nothing panics while holding it).
+fn lock_tx_output(tx_output: &std::sync::Mutex<TxOutput>) -> std::sync::MutexGuard<'_, TxOutput> {
+    tx_output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The main daemon event loop.
@@ -64,16 +82,32 @@ pub struct EventLoop {
     event_rx: mpsc::Receiver<DaemonEvent>,
     event_tx: mpsc::Sender<DaemonEvent>,
     running: bool,
-    /// Optional audio output ring buffer producer for writing TX samples.
-    audio_out: Option<AudioRingProducer>,
+    /// The audio-out ring and the TX samples retained ahead of it until it
+    /// has room, shared with the feeder task `run` spawns so a frame larger
+    /// than the ring is delivered whole instead of truncated.
+    tx_output: Arc<std::sync::Mutex<TxOutput>>,
     /// Optional audio input ring buffer consumer for reading RX samples.
     audio_in: Option<AudioRingConsumer>,
     /// PTT controller (defaults to NullPtt if unconfigured).
     ptt: Box<dyn PttControl>,
     /// Optional sender for host responses (decoded data, status updates).
     response_tx: Option<mpsc::Sender<coppa_host::HostResponse>>,
-    /// Counter for audio output ring buffer overflow (dropped samples).
-    audio_out_overflow_count: u64,
+    /// Playback progress from the audio output worker. `None` when no
+    /// hardware output is wired (tests, headless builds), in which case PTT
+    /// release falls back to the nominal audio duration.
+    output_feedback: Option<Arc<OutputFeedback>>,
+    /// Generation of the newest keyed transmission; only its completion may
+    /// release PTT automatically.
+    tx_generation: u64,
+    /// When automatic TX keyed the radio for the current continuous keyed
+    /// interval. `max_tx_duration_s` is measured from here rather than from
+    /// each job's start, so transmissions queued behind an active one cannot
+    /// push the forced unkey back. Cleared whenever PTT is released.
+    tx_keyed_since: Option<tokio::time::Instant>,
+    /// Playback-progress record for the current continuous keyed interval,
+    /// shared by every transmission queued in it so the no-progress bound is
+    /// not restarted by each newer job. Cleared whenever PTT is released.
+    tx_stall_clock: Option<Arc<StallClock>>,
     /// Last-seen value of the audio input ring's overflow counter (see
     /// `AudioRingConsumer::overflow_count`); `poll_audio_input` compares against
     /// this each poll and logs a warning when it grows (silent RX sample loss was
@@ -330,11 +364,14 @@ impl EventLoop {
             event_rx,
             event_tx,
             running: false,
-            audio_out: None,
+            tx_output: Arc::new(std::sync::Mutex::new(TxOutput::default())),
             audio_in: None,
             ptt,
             response_tx: None,
-            audio_out_overflow_count: 0,
+            output_feedback: None,
+            tx_generation: 0,
+            tx_keyed_since: None,
+            tx_stall_clock: None,
             audio_in_overflow_count: 0,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             arq_tx,
@@ -464,8 +501,16 @@ impl EventLoop {
     }
 
     /// Set the audio output ring buffer for TX sample playback.
+    /// Wire playback progress from the audio output worker, so automatic PTT
+    /// release follows samples actually played.
+    #[cfg_attr(not(feature = "cpal-backend"), allow(dead_code))] // used by coppad's CPAL output wiring
+    pub fn set_output_feedback(&mut self, feedback: Arc<OutputFeedback>) {
+        self.output_feedback = Some(feedback);
+    }
+
+    #[cfg_attr(not(feature = "cpal-backend"), allow(dead_code))] // coppad wires it only with CPAL output
     pub fn set_audio_out(&mut self, producer: AudioRingProducer) {
-        self.audio_out = Some(producer);
+        self.tx_output().set_producer(producer);
     }
 
     /// Set the audio input ring buffer for RX sample capture.
@@ -742,6 +787,21 @@ impl EventLoop {
         // Beacon-mode check interval (Phase 4 Task 3): cheap no-op tick when
         // beacon mode is disabled (the default); see `maybe_send_beacon`.
         let mut beacon_poll = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        // TX feeder: moves retained TX samples into the audio-out ring as it
+        // drains, every PROGRESS_TICK, independently of whatever this loop is
+        // awaiting (busy-channel holdoff, decode), so audio already playing
+        // is never starved mid-frame.
+        let feeder = {
+            let tx_output = self.tx_output.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(PROGRESS_TICK);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    lock_tx_output(&tx_output).flush();
+                }
+            })
+        };
 
         while self.running {
             tokio::select! {
@@ -764,6 +824,9 @@ impl EventLoop {
                         }
                         Some(DaemonEvent::PttChange(tx)) => {
                             self.handle_ptt_change(tx).await;
+                        }
+                        Some(DaemonEvent::TxComplete { generation, completed }) => {
+                            self.handle_tx_complete(generation, completed).await;
                         }
                     }
                 }
@@ -798,6 +861,7 @@ impl EventLoop {
             }
         }
 
+        feeder.abort();
         Ok(())
     }
 
@@ -1533,42 +1597,108 @@ impl EventLoop {
         }
     }
 
-    /// Low-level write of raw samples to the audio-out ring. Does NOT assert
-    /// PTT, does NOT apply busy-channel-courtesy deferral, and does NOT
-    /// trigger the station-ID timer -- callers that are actually keying a
-    /// transmitter must go through `transmit_samples` (the real PTT
+    /// Low-level, lossless queueing of raw samples for the audio-out ring.
+    /// Does NOT assert PTT, does NOT apply busy-channel-courtesy deferral,
+    /// and does NOT trigger the station-ID timer -- callers that are actually
+    /// keying a transmitter must go through `transmit_samples` (the real PTT
     /// chokepoint) instead, which itself calls this as its last step. The
     /// only other direct caller today is the `DaemonEvent::AudioOut` arm in
     /// `run()`, a raw pass-through hook (unused by any in-tree production TX
     /// path as of this writing; exercised only by this file's own tests) --
     /// a future real caller of that event should route through
     /// `transmit_samples` instead if it represents an actual transmission.
-    fn handle_audio_out(&mut self, samples: &[f32]) {
+    ///
+    /// Samples the ring has no room for are retained in `tx_output`
+    /// (in order, behind anything already pending) and moved on later TX
+    /// ticks; nothing is dropped. Raw samples share that FIFO and its
+    /// cumulative count, so they cannot corrupt a keyed job's playback target.
+    ///
+    /// Returns false when the samples could not be queued because no live
+    /// output ring is wired.
+    fn handle_audio_out(&mut self, samples: &[f32]) -> bool {
         if samples.is_empty() {
-            return;
+            return true;
         }
-        match self.audio_out {
-            Some(ref mut producer) => {
-                let written = producer.write(samples);
-                if written < samples.len() {
-                    // E1: Track cumulative overflow with a counter
-                    let dropped = samples.len() - written;
-                    self.audio_out_overflow_count += dropped as u64;
-                    tracing::warn!(
-                        dropped,
-                        total = samples.len(),
-                        cumulative_dropped = self.audio_out_overflow_count,
-                        "Audio output buffer overflow"
-                    );
-                }
-            }
-            None => {
-                tracing::debug!(samples = samples.len(), "Audio out: no output device wired");
-            }
+        if self.tx_output().submit(samples).is_none() {
+            tracing::debug!(samples = samples.len(), "Audio out: no output device wired");
+            return false;
         }
+        true
     }
 
-    /// Transmit encoded audio samples: assert PTT, write to ring buffer, schedule PTT release.
+    /// The shared TX output state (see `tx_output`).
+    fn tx_output(&self) -> std::sync::MutexGuard<'_, TxOutput> {
+        lock_tx_output(&self.tx_output)
+    }
+
+    /// Move retained TX samples into the audio-out ring as far as it has
+    /// room (the feeder task's step, also used by tests that drive delivery
+    /// without `run`).
+    #[cfg(test)]
+    fn flush_pending_audio_out(&self) {
+        self.tx_output().flush();
+    }
+
+    /// Handle the automatic end of a keyed transmission (see
+    /// `DaemonEvent::TxComplete`). Stale generations are ignored so an
+    /// earlier job's completion can never unkey a later one. A cancelled job
+    /// discards its still-pending samples -- including the tail already
+    /// buffered in the final sink -- so they cannot play after PTT is
+    /// released, and the next queued transmission keys only once that
+    /// discard has taken effect, so the stale tail cannot open its frame.
+    async fn handle_tx_complete(&mut self, generation: u64, completed: bool) {
+        if generation != self.tx_generation {
+            tracing::debug!(
+                generation,
+                current = self.tx_generation,
+                "Ignoring stale TX completion"
+            );
+            return;
+        }
+        if !completed {
+            let (discarded, submitted) = {
+                let mut tx_output = self.tx_output();
+                (tx_output.cancel(), tx_output.submitted())
+            };
+            tracing::error!(
+                generation,
+                discarded,
+                "Transmission cancelled before it finished playing; releasing PTT"
+            );
+            if let Some(feedback) = self.output_feedback.clone() {
+                // Also drop what the output worker and the final sink have
+                // not yet played, so none of it plays after PTT is released.
+                feedback.discard_through(submitted);
+                self.set_ptt(false).await;
+                // Hold the next transmission until the cancelled audio is
+                // gone; otherwise draining the TX queue rekeys at once and
+                // the sink's buffered tail plays at the start of that frame.
+                if !wait_for_discard(&feedback, submitted).await {
+                    tracing::warn!(
+                        generation,
+                        "Cancelled TX audio not yet dropped by the output; \
+                         new audio stays held behind the drop"
+                    );
+                }
+                self.try_drain_tx_queue().await;
+                return;
+            }
+        }
+        self.handle_ptt_change(false).await;
+    }
+
+    /// Transmit encoded audio samples: assert PTT, queue every sample for the
+    /// audio-out ring, and release PTT once the last one has played.
+    ///
+    /// Returning from this function does NOT mean the audio has played: the
+    /// samples are retained and paced into the bounded rings by `run`'s TX
+    /// tick, and a spawned task waits for the output worker to report that
+    /// the last sample's predicted presentation time has passed (then the PTT
+    /// tail), or cancels the transmission on output failure, five seconds
+    /// without playback progress, or `max_tx_duration_s`. Both bounds, and
+    /// the PTT tail, are measured across the continuous keyed interval rather
+    /// than per job, so transmissions queued behind an active one can neither
+    /// restart them nor stretch the keyed time past `max_tx_duration_s`.
     ///
     /// This is the single chokepoint every TX path in this event loop funnels
     /// through (host-driven encode, ARQ-adjacent session control frames
@@ -1615,34 +1745,105 @@ impl EventLoop {
 
         // Assert PTT before transmitting
         self.handle_ptt_change(true).await;
+        let keyed_since = *self
+            .tx_keyed_since
+            .get_or_insert_with(tokio::time::Instant::now);
+        let played_now = self.output_feedback.as_ref().map_or(0, |f| f.played());
+        let stall_clock = self
+            .tx_stall_clock
+            .get_or_insert_with(|| Arc::new(StallClock::new(played_now, keyed_since)))
+            .clone();
         // Enforce PTT pre-delay before writing audio
         let pre_delay_ms = self.config.radio.ptt_pre_delay_ms;
         if pre_delay_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(pre_delay_ms)).await;
         }
-        self.handle_audio_out(samples);
-        // Schedule delayed PTT release based on audio duration + ring buffer drain time
-        let sample_count = samples.len();
-        let sample_rate = self.config.audio.sample_rate;
-        let audio_duration_ms = (sample_count as u64 * 1000) / sample_rate as u64;
-        let drain_ms =
-            (self.config.audio.buffer_size as u64 * 1000) / self.config.audio.sample_rate as u64;
-        let tail_delay_ms = self.config.radio.ptt_tail_delay_ms;
-        let total_delay_ms = audio_duration_ms + drain_ms + tail_delay_ms;
-        let max_tx_ms = self.config.radio.max_tx_duration_s * 1000;
-        let capped_delay_ms = total_delay_ms.min(max_tx_ms);
-        if total_delay_ms > max_tx_ms {
-            tracing::warn!(
-                tx_duration_ms = total_delay_ms,
-                max_tx_ms,
-                "TX duration exceeds max; capping PTT release delay"
-            );
-        }
-        let total_delay = std::time::Duration::from_millis(capped_delay_ms);
+        let prior_target = self.tx_output().submitted();
+        let queued = self.handle_audio_out(samples);
+        // Release PTT once this transmission's last sample has played (not
+        // after its nominal duration): every sample stays queued until the
+        // rings accept it, so the cumulative submitted count is this job's
+        // playback target. Completion arrives as a generation-tagged
+        // `TxComplete`, so only the newest keyed transmission can unkey.
+        self.tx_generation += 1;
+        let generation = self.tx_generation;
+        let target = self.tx_output().submitted();
+        let tail = std::time::Duration::from_millis(self.config.radio.ptt_tail_delay_ms);
+        // What is left of `max_tx_duration_s` for the continuous keyed
+        // interval this job joins. A job queued behind an active one gets
+        // only the remainder, so its watchdog fires no later than the active
+        // job's would have.
+        let deadline =
+            keyed_since + std::time::Duration::from_secs(self.config.radio.max_tx_duration_s);
+        let max_tx = deadline.saturating_duration_since(tokio::time::Instant::now());
+        // Whenever an output worker is wired, completion comes only from its
+        // feedback -- even if its end of the ring is gone, so a failed or
+        // dead output cancels the transmission instead of reporting success.
+        let feedback = self.output_feedback.clone();
+        // Headless fallback (no output worker reporting progress): the
+        // nominal audio duration plus the ring drain time, as before.
+        let sample_rate = self.config.audio.sample_rate.max(1) as u64;
+        let nominal = std::time::Duration::from_millis(
+            (samples.len() as u64 * 1000) / sample_rate
+                + (self.config.audio.buffer_size as u64 * 1000) / sample_rate,
+        );
         let ptt_event_tx = self.event_tx.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(total_delay).await;
-            if let Err(e) = ptt_event_tx.send(DaemonEvent::PttChange(false)).await {
+            let completed = match feedback {
+                // An output worker is wired but its ring is gone: nothing
+                // can play, so cancel at once rather than report success.
+                Some(_) if !queued => {
+                    tracing::error!(generation, "TX audio could not be queued; output is down");
+                    false
+                }
+                Some(feedback) => {
+                    let watch = PlayoutWatch::new(target, Instant::now(), Some(max_tx));
+                    let interval = IntervalProgress {
+                        clock: &stall_clock,
+                        prior_target,
+                    };
+                    match wait_for_playout(&feedback, watch, Some(interval)).await {
+                        Ok(()) => true,
+                        Err(why) => {
+                            tracing::error!(generation, reason = %why, "TX playback did not complete");
+                            false
+                        }
+                    }
+                }
+                None => {
+                    let capped = nominal.min(max_tx);
+                    if nominal > max_tx {
+                        tracing::warn!(
+                            tx_duration_ms = nominal.as_millis() as u64,
+                            remaining_max_tx_ms = max_tx.as_millis() as u64,
+                            "TX duration exceeds what is left of max TX; capping PTT release delay"
+                        );
+                    }
+                    tokio::time::sleep(capped).await;
+                    true
+                }
+            };
+            if completed {
+                // The tail counts against the keyed interval's
+                // `max_tx_duration_s` bound too: a transmission that finished
+                // playing near the deadline must not stay keyed past it.
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if tail > remaining {
+                    tracing::warn!(
+                        tail_ms = tail.as_millis() as u64,
+                        remaining_max_tx_ms = remaining.as_millis() as u64,
+                        "PTT tail exceeds what is left of max TX; capping it"
+                    );
+                }
+                tokio::time::sleep(tail.min(remaining)).await;
+            }
+            if let Err(e) = ptt_event_tx
+                .send(DaemonEvent::TxComplete {
+                    generation,
+                    completed,
+                })
+                .await
+            {
                 tracing::warn!(error = %e, "Failed to deassert PTT after TX");
             }
         });
@@ -1831,8 +2032,11 @@ impl EventLoop {
     ///
     /// Each retransmitted PDU is routed through `transmit_samples` (the PTT
     /// chokepoint) one at a time, matching `try_drain_tx_queue`'s existing
-    /// one-frame-at-a-time pattern: `transmit_samples` schedules its own PTT
-    /// release asynchronously per call, so sending retransmit N+1 only after
+    /// one-frame-at-a-time pattern: `transmit_samples` tracks its own
+    /// playback completion asynchronously per call (a generation-tagged
+    /// `TxComplete`, so only the newest call can release PTT), and every
+    /// call's samples join one FIFO behind the previous call's, so sending
+    /// retransmit N+1 only after
     /// awaiting retransmit N's `transmit_samples` call keeps each one's PTT
     /// assert/busy-wait/station-ID-prepend logic correctly scoped to that one
     /// frame, rather than batching multiple PDUs under a single PTT key-up.
@@ -2778,6 +2982,16 @@ impl EventLoop {
     }
 
     async fn handle_ptt_change(&mut self, tx: bool) {
+        self.set_ptt(tx).await;
+        if !tx {
+            // PTT just released: continue draining the TX queue if more is queued.
+            self.try_drain_tx_queue().await;
+        }
+    }
+
+    /// Change physical PTT and the keyed-interval bookkeeping, without
+    /// draining the TX queue on release (see `handle_ptt_change`).
+    async fn set_ptt(&mut self, tx: bool) {
         let state = if tx { PttState::Tx } else { PttState::Rx };
         if let Err(e) = self.ptt.set_ptt(state) {
             tracing::warn!(error = %e, "PTT control error");
@@ -2790,8 +3004,8 @@ impl EventLoop {
             self.is_transmitting = true;
         } else {
             self.is_transmitting = false;
-            // PTT just released: continue draining the TX queue if more is queued.
-            self.try_drain_tx_queue().await;
+            self.tx_keyed_since = None;
+            self.tx_stall_clock = None;
         }
     }
 
@@ -5106,8 +5320,8 @@ mod tests {
 
         // MANDATORY, not hygiene. `negotiate` made `b` transmit, so
         // `is_transmitting` is still true: PTT release arrives only as a
-        // `DaemonEvent::PttChange(false)` from a spawned timer through the
-        // event channel, which a unit test never drains. Without this line
+        // `DaemonEvent::TxComplete` from the spawned playback-completion task
+        // through the event channel, which a unit test never drains. Without this line
         // `try_drain_tx_queue` early-returns, no probe is taken,
         // `set_speed_level` is never called, and this test would pass
         // IDENTICALLY before and after the fix -- proving nothing. Poking this
@@ -5721,6 +5935,478 @@ mod tests {
         let read = consumer.read(&mut buf);
         assert_eq!(read, 100);
         assert_eq!(buf[0], 1.0);
+    }
+
+    /// Shared fixture for COP-22's TX delivery tests: an event loop wired to
+    /// a production-size (8,192) audio-out ring, the production output
+    /// worker, and a simulated 8,192-sample device ring.
+    struct TxRig {
+        event_loop: EventLoop,
+        outer: AudioRingConsumer,
+        worker: crate::audio_output::OutputWorker,
+        sink: crate::audio_output::test_support::SimSink,
+        feedback: Arc<OutputFeedback>,
+    }
+
+    impl TxRig {
+        fn new(mut config: DaemonConfig) -> Self {
+            config.radio.ptt_pre_delay_ms = 0;
+            config.radio.ptt_tail_delay_ms = 0;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (producer, outer) = coppa_audio::audio_ring(8192);
+            event_loop.set_audio_out(producer);
+            let feedback = Arc::new(OutputFeedback::default());
+            event_loop.set_output_feedback(feedback.clone());
+            Self {
+                event_loop,
+                outer,
+                worker: crate::audio_output::OutputWorker::new(1024, 48_000, feedback.clone()),
+                sink: crate::audio_output::test_support::SimSink::new(8192),
+                feedback,
+            }
+        }
+
+        /// One delivery round: the `run` TX tick, worker forwarding, and a
+        /// simulated device callback of `callback` samples.
+        fn pump(&mut self, callback: usize) {
+            self.event_loop.flush_pending_audio_out();
+            for _ in 0..4 {
+                self.worker
+                    .step(
+                        &mut self.outer,
+                        &mut self.sink,
+                        crate::audio_output::test_support::sim_progress,
+                    )
+                    .unwrap();
+            }
+            self.sink.callback(callback);
+        }
+
+        fn deliver(&mut self, total: usize, callbacks: &[usize]) {
+            let mut i = 0;
+            while self.sink.captured.len() < total {
+                self.pump(callbacks[i % callbacks.len()]);
+                i += 1;
+                assert!(i < 1_000_000, "TX delivery did not converge");
+            }
+            // The worker publishes progress on its next step, as the
+            // production worker loop does continuously.
+            self.pump(0);
+        }
+
+        async fn next_completion(&mut self) -> (u64, bool) {
+            let event =
+                tokio::time::timeout(Duration::from_secs(10), self.event_loop.event_rx.recv())
+                    .await
+                    .expect("TX completion should arrive")
+                    .expect("event channel open");
+            match event {
+                DaemonEvent::TxComplete {
+                    generation,
+                    completed,
+                } => (generation, completed),
+                other => panic!("expected TxComplete, got {other:?}"),
+            }
+        }
+    }
+
+    /// COP-22 AC1: a real 65,520-sample encoded frame, transmitted through
+    /// an 8,192-sample audio-out ring and an 8,192-sample device ring with
+    /// delayed, uneven consumption, reaches the final sink whole and in
+    /// order; PTT is released only by that transmission's completion.
+    #[tokio::test]
+    async fn full_frame_reaches_sink_through_both_rings() {
+        let mut rig = TxRig::new(DaemonConfig::default());
+        let frame = rig.event_loop.engine.encode_bytes(b"COP-22").unwrap();
+        assert_eq!(frame.len(), 65_520);
+        rig.event_loop.transmit_samples(&frame).await;
+        assert!(rig.event_loop.is_transmitting);
+        assert!(
+            rig.event_loop.tx_output().pending_len() > 0,
+            "the unwritten suffix is retained, not dropped"
+        );
+        rig.deliver(frame.len(), &[480, 0, 4096, 64, 0, 0, 1000]);
+        assert_eq!(rig.sink.captured, frame);
+        assert_eq!(rig.event_loop.tx_output().overflow_count(), 0);
+
+        let (generation, completed) = rig.next_completion().await;
+        assert_eq!((generation, completed), (1, true));
+        rig.event_loop
+            .handle_tx_complete(generation, completed)
+            .await;
+        assert!(!rig.event_loop.is_transmitting);
+    }
+
+    /// PTT stays keyed while presentation is pending after both rings have
+    /// drained, and is released only once playback is predicted complete.
+    #[tokio::test]
+    async fn ptt_held_until_predicted_presentation_ends() {
+        let mut rig = TxRig::new(DaemonConfig::default());
+        let samples: Vec<f32> = (0..20_000).map(|i| i as f32).collect();
+        rig.sink.remaining = Duration::from_secs(3600);
+        rig.event_loop.transmit_samples(&samples).await;
+        rig.deliver(samples.len(), &[2048]);
+        assert_eq!(rig.outer.available(), 0, "both rings drained");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rig.event_loop.event_rx.recv())
+                .await
+                .is_err(),
+            "no completion while the last sample is still ahead of the DAC"
+        );
+        rig.sink.remaining = Duration::ZERO;
+        rig.pump(0);
+        assert_eq!(rig.next_completion().await, (1, true));
+    }
+
+    /// Consecutive transmissions (e.g. a control frame queued behind an
+    /// active one) play in FIFO order, and the earlier job's completion is
+    /// stale: it cannot unkey the newer transmission.
+    #[tokio::test]
+    async fn stale_completion_cannot_unkey_newer_transmission() {
+        let mut rig = TxRig::new(DaemonConfig::default());
+        let a: Vec<f32> = (0..30_000).map(|i| i as f32).collect();
+        let b: Vec<f32> = (0..12_345).map(|i| -(i as f32) - 1.0).collect();
+        rig.event_loop.transmit_samples(&a).await;
+        rig.event_loop.transmit_samples(&b).await;
+        rig.deliver(a.len() + b.len(), &[1000, 333]);
+        let mut expected = a.clone();
+        expected.extend_from_slice(&b);
+        assert_eq!(rig.sink.captured, expected);
+
+        let mut completions = vec![rig.next_completion().await, rig.next_completion().await];
+        completions.sort();
+        assert_eq!(completions, vec![(1, true), (2, true)]);
+        rig.event_loop.handle_tx_complete(1, true).await;
+        assert!(
+            rig.event_loop.is_transmitting,
+            "stale generation must not release PTT"
+        );
+        rig.event_loop.handle_tx_complete(2, true).await;
+        assert!(!rig.event_loop.is_transmitting);
+    }
+
+    /// An output failure cancels the transmission: PTT is released, the
+    /// completion is not a success, and the retained suffix is discarded so
+    /// it cannot play after the radio is unkeyed.
+    #[tokio::test]
+    async fn output_failure_cancels_and_discards_pending() {
+        let mut rig = TxRig::new(DaemonConfig::default());
+        let samples = vec![0.25f32; 50_000];
+        rig.event_loop.transmit_samples(&samples).await;
+        rig.feedback.fail();
+        let (generation, completed) = rig.next_completion().await;
+        assert_eq!((generation, completed), (1, false));
+        rig.event_loop
+            .handle_tx_complete(generation, completed)
+            .await;
+        assert!(!rig.event_loop.is_transmitting);
+        assert_eq!(rig.event_loop.tx_output().pending_len(), 0);
+        rig.event_loop.flush_pending_audio_out();
+        rig.pump(8192);
+        rig.pump(8192);
+        assert!(
+            rig.sink.captured.is_empty(),
+            "nothing had reached the device yet, so nothing may play after the cancel"
+        );
+    }
+
+    /// A tune longer than `max_tx_duration_s` (and larger than both rings)
+    /// is aborted by the watchdog, not reported as a completed TX.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_aborts_overlong_tune() {
+        let mut config = DaemonConfig::default();
+        config.radio.max_tx_duration_s = 1;
+        let mut rig = TxRig::new(config);
+        let tune = vec![0.5f32; 48_000 * 3];
+        rig.event_loop.transmit_samples(&tune).await;
+        // Keep the device consuming slowly so only the watchdog can end it.
+        rig.pump(480);
+        let (generation, completed) = rig.next_completion().await;
+        assert_eq!((generation, completed), (1, false));
+        rig.event_loop
+            .handle_tx_complete(generation, completed)
+            .await;
+        assert!(!rig.event_loop.is_transmitting);
+        assert_eq!(rig.event_loop.tx_output().pending_len(), 0);
+    }
+
+    /// A watchdog-cancelled transmission whose tail is already buffered in
+    /// the final sink's ring must not play that tail at the start of the
+    /// next transmission: the sink is flushed before new audio reaches it.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_tail_in_sink_does_not_open_next_frame() {
+        let mut config = DaemonConfig::default();
+        config.radio.max_tx_duration_s = 1;
+        let mut rig = TxRig::new(config);
+        let stale = vec![0.5f32; 48_000 * 3];
+        rig.event_loop.transmit_samples(&stale).await;
+        // Fill the device ring with the doomed transmission, but let the
+        // device consume none of it before the watchdog fires.
+        for _ in 0..16 {
+            rig.pump(0);
+        }
+        assert!(rig.sink.captured.is_empty());
+        let (generation, completed) = rig.next_completion().await;
+        assert_eq!((generation, completed), (1, false));
+        rig.event_loop
+            .handle_tx_complete(generation, completed)
+            .await;
+        assert!(!rig.event_loop.is_transmitting);
+
+        let next: Vec<f32> = (0..20_000).map(|i| -(i as f32) - 1.0).collect();
+        rig.event_loop.transmit_samples(&next).await;
+        rig.deliver(next.len(), &[480, 1000]);
+        for _ in 0..4 {
+            rig.pump(8192);
+        }
+        assert_eq!(
+            rig.sink.captured, next,
+            "the cancelled transmission's buffered tail played ahead of the next frame"
+        );
+        assert_eq!(rig.next_completion().await, (2, true));
+    }
+
+    /// A transmission queued behind an active one cannot restart the
+    /// watchdog: `max_tx_duration_s` bounds the continuous keyed interval
+    /// from the first key-up, so the newest job is cancelled (and PTT
+    /// released) when that interval runs out, not `max_tx` after it queued.
+    #[tokio::test(start_paused = true)]
+    async fn queued_transmission_cannot_extend_the_watchdog() {
+        let mut config = DaemonConfig::default();
+        config.radio.max_tx_duration_s = 2;
+        let mut rig = TxRig::new(config);
+        let keyed = tokio::time::Instant::now();
+        rig.event_loop
+            .transmit_samples(&[0.5f32; 48_000 * 10])
+            .await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        rig.event_loop.transmit_samples(&[0.5f32; 48_000]).await;
+        loop {
+            let (generation, completed) = rig.next_completion().await;
+            if generation == 2 {
+                assert!(!completed, "the watchdog aborts, it does not complete");
+                break;
+            }
+        }
+        assert!(
+            keyed.elapsed() < Duration::from_millis(2500),
+            "forced unkey after {:?}, past the 2 s keyed-interval bound",
+            keyed.elapsed()
+        );
+        rig.event_loop.handle_tx_complete(2, false).await;
+        assert!(!rig.event_loop.is_transmitting);
+        assert_eq!(rig.event_loop.tx_keyed_since, None);
+    }
+
+    /// No downstream progress for five seconds fails the transmission.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_output_fails_transmission() {
+        let mut rig = TxRig::new(DaemonConfig::default());
+        rig.event_loop.transmit_samples(&[0.1f32; 20_000]).await;
+        let started = tokio::time::Instant::now();
+        assert_eq!(rig.next_completion().await, (1, false));
+        assert!(started.elapsed() >= crate::audio_output::STALL_TIMEOUT);
+    }
+
+    /// A transmission queued behind a stalled one inherits its no-progress
+    /// window: the newest job is failed five seconds after playback last
+    /// advanced, not five seconds after it was queued, so frequent ARQ/control
+    /// transmissions cannot hold a stalled output keyed until the max-TX
+    /// deadline.
+    #[tokio::test(start_paused = true)]
+    async fn stall_window_spans_queued_transmissions() {
+        let mut rig = TxRig::new(DaemonConfig::default());
+        let keyed = tokio::time::Instant::now();
+        rig.event_loop.transmit_samples(&[0.1f32; 20_000]).await;
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            rig.event_loop.transmit_samples(&[0.1f32; 4_800]).await;
+        }
+        loop {
+            let (generation, completed) = rig.next_completion().await;
+            if generation == 4 {
+                assert!(!completed, "a stalled output fails, it does not complete");
+                break;
+            }
+        }
+        let stall = crate::audio_output::STALL_TIMEOUT;
+        assert!(
+            keyed.elapsed() >= stall && keyed.elapsed() < stall + Duration::from_millis(100),
+            "stall failure after {:?}, not ~{stall:?} after playback last advanced",
+            keyed.elapsed()
+        );
+    }
+
+    /// A job queued while nothing is outstanding (here: during the previous
+    /// job's PTT tail) starts a fresh no-progress window rather than being
+    /// failed for the idle time before it.
+    #[tokio::test(start_paused = true)]
+    async fn idle_gap_does_not_count_as_a_stall() {
+        let mut rig = TxRig::new(DaemonConfig::default());
+        rig.event_loop.config.radio.ptt_tail_delay_ms = 8_000;
+        let first = vec![0.2f32; 4_800];
+        rig.event_loop.transmit_samples(&first).await;
+        rig.deliver(first.len(), &[4096]);
+        // Job 1 has played; it is now in its 8 s tail with nothing pending.
+        tokio::time::sleep(Duration::from_millis(6_000)).await;
+        let second = vec![0.3f32; 4_800];
+        rig.event_loop.transmit_samples(&second).await;
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        rig.deliver(first.len() + second.len(), &[4096]);
+        loop {
+            let (generation, completed) = rig.next_completion().await;
+            if generation == 2 {
+                assert!(completed, "idle time before a job is not a stall");
+                break;
+            }
+        }
+    }
+
+    /// The PTT tail is capped at the keyed interval's `max_tx_duration_s`
+    /// deadline: a transmission that finishes playing near the limit unkeys
+    /// at the limit, not up to `ptt_tail_delay_ms` past it.
+    #[tokio::test(start_paused = true)]
+    async fn ptt_tail_is_capped_at_the_max_tx_deadline() {
+        let mut config = DaemonConfig::default();
+        config.radio.max_tx_duration_s = 2;
+        let mut rig = TxRig::new(config);
+        rig.event_loop.config.radio.ptt_tail_delay_ms = 5_000;
+        let keyed = tokio::time::Instant::now();
+        let samples = vec![0.4f32; 9_600];
+        rig.event_loop.transmit_samples(&samples).await;
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        rig.deliver(samples.len(), &[4096]);
+        assert_eq!(rig.next_completion().await, (1, true));
+        let deadline = Duration::from_secs(2);
+        assert!(
+            keyed.elapsed() >= deadline && keyed.elapsed() < deadline + Duration::from_millis(50),
+            "PTT released after {:?}; the tail must end at the {deadline:?} max-TX deadline",
+            keyed.elapsed()
+        );
+    }
+
+    /// A due station-ID frame is prepended to the payload: both play whole,
+    /// ID first, under one keyed transmission larger than both rings.
+    #[tokio::test]
+    async fn station_id_prefix_and_payload_both_play_whole() {
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = "N0CALL".to_string();
+        config.station_id.id_interval_secs = 600;
+        let mut rig = TxRig::new(config);
+        rig.event_loop.last_id_time = Instant::now() - Duration::from_secs(601);
+        let id_frame = rig
+            .event_loop
+            .encode_id_beacon_frame()
+            .expect("a configured callsign builds an ID frame");
+        let payload = rig.event_loop.engine.encode_bytes(b"payload").unwrap();
+        rig.event_loop.transmit_samples(&payload).await;
+        let mut expected = id_frame;
+        expected.extend_from_slice(&payload);
+        assert!(expected.len() > 2 * 8192);
+        rig.deliver(expected.len(), &[1024, 0, 3000]);
+        assert_eq!(rig.sink.captured, expected);
+        assert_eq!(rig.next_completion().await, (1, true));
+    }
+
+    /// PTT lead elapses before any sample is queued, and the PTT tail is
+    /// measured from the last sample's playback, not from the enqueue.
+    #[tokio::test(start_paused = true)]
+    async fn lead_precedes_audio_and_tail_follows_final_playback() {
+        let mut rig = TxRig::new(DaemonConfig::default());
+        rig.event_loop.config.radio.ptt_pre_delay_ms = 50;
+        rig.event_loop.config.radio.ptt_tail_delay_ms = 200;
+        let samples = vec![0.3f32; 30_000];
+        let started = tokio::time::Instant::now();
+        rig.event_loop.transmit_samples(&samples).await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "lead before audio"
+        );
+        // Hold playback for a while: no completion may arrive meanwhile.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(rig.event_loop.event_rx.try_recv().is_err());
+        rig.deliver(samples.len(), &[4096]);
+        let played_at = tokio::time::Instant::now();
+        assert_eq!(rig.next_completion().await, (1, true));
+        assert!(
+            played_at.elapsed() >= Duration::from_millis(200),
+            "tail after playback"
+        );
+    }
+
+    /// If the output worker's end of the ring disappears, the transmission
+    /// still ends (as a failure) within the stall bound instead of holding
+    /// PTT forever.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_output_consumer_ends_transmission_bounded() {
+        let TxRig {
+            mut event_loop,
+            outer,
+            ..
+        } = TxRig::new(DaemonConfig::default());
+        drop(outer);
+        event_loop.transmit_samples(&[0.2f32; 20_000]).await;
+        let event = tokio::time::timeout(Duration::from_secs(10), event_loop.event_rx.recv())
+            .await
+            .expect("completion within the stall bound")
+            .unwrap();
+        assert!(matches!(
+            event,
+            DaemonEvent::TxComplete {
+                generation: 1,
+                completed: false
+            }
+        ));
+    }
+
+    /// `run`'s feeder task keeps moving retained TX samples into a small
+    /// audio-out ring as a consumer drains it, until the whole transmission
+    /// has been delivered in order.
+    #[tokio::test]
+    async fn run_feeder_delivers_backpressured_audio_whole() {
+        let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        let tx = event_loop.event_sender();
+        let (producer, mut consumer) = coppa_audio::audio_ring(1024);
+        event_loop.set_audio_out(producer);
+        let samples: Vec<f32> = (0..20_000).map(|i| i as f32).collect();
+        let expected = samples.clone();
+        let driver = async move {
+            tx.send(DaemonEvent::AudioOut(samples)).await.unwrap();
+            let mut captured = Vec::new();
+            let mut buf = vec![0.0f32; 700];
+            while captured.len() < expected.len() {
+                let n = consumer.read(&mut buf);
+                captured.extend_from_slice(&buf[..n]);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            tx.send(DaemonEvent::Shutdown).await.unwrap();
+            assert_eq!(captured, expected);
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(event_loop.run(), driver)
+        })
+        .await
+        .expect("feeder must deliver the whole transmission");
+        result.unwrap();
+    }
+
+    /// Shutdown is still handled while TX output is backpressured.
+    #[tokio::test]
+    async fn shutdown_is_serviced_while_tx_backpressured() {
+        let config = DaemonConfig::default();
+        let mut event_loop = EventLoop::new(config).unwrap();
+        let tx = event_loop.event_sender();
+        let (producer, _consumer) = coppa_audio::audio_ring(1024);
+        event_loop.set_audio_out(producer);
+        tx.send(DaemonEvent::AudioOut(vec![0.5; 10_000]))
+            .await
+            .unwrap();
+        tx.send(DaemonEvent::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), event_loop.run())
+            .await
+            .expect("run() must exit on shutdown while output is full")
+            .unwrap();
+        assert_eq!(event_loop.tx_output().pending_len(), 10_000 - 1024);
     }
 
     #[tokio::test]
@@ -6875,7 +7561,7 @@ mod tests {
             );
 
             // Simulate the scheduled PTT release completing -- exactly what
-            // `run()`'s event-channel dispatch of the `DaemonEvent::PttChange(false)`
+            // `run()`'s event-channel dispatch of the `DaemonEvent::TxComplete`
             // `transmit_samples` spawns would do, called directly for the
             // same determinism reason as above (mirrors
             // `test_buffer_telemetry_progression_3_to_0`'s established
