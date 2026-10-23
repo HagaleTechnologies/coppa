@@ -38,7 +38,7 @@ fn data_carriers_per_symbol(profile: &CoppaProfile) -> usize {
 }
 
 /// Airtime, in seconds, to transmit ONE full OFDM frame at wire-encoded speed
-/// `level` using `profile`. Returns `None` for a reserved/invalid level (e.g. 8,
+/// `level` using `profile`. Returns `None` for an invalid level (e.g. 10,
 /// or anything not present in `SPEED_LEVELS`), or if `profile` has zero data
 /// carriers (degenerate profile).
 ///
@@ -90,22 +90,23 @@ mod tests {
         // Same LDPC block, more bits/symbol -> fewer OFDM symbols -> less airtime.
         let profile = CoppaProfile::hf_standard();
         let t2 = frame_airtime_s(2, &profile).unwrap(); // BPSK
-        let t10 = frame_airtime_s(10, &profile).unwrap(); // 64-QAM
+        let t9 = frame_airtime_s(9, &profile).unwrap(); // 64-QAM
         assert!(
-            t10 < t2,
-            "64-QAM frame ({t10}s) should be shorter than BPSK ({t2}s)"
+            t9 < t2,
+            "64-QAM frame ({t9}s) should be shorter than BPSK ({t2}s)"
         );
     }
 
     #[test]
-    fn frame_airtime_reserved_level_is_none() {
+    fn frame_airtime_level_8_is_valid() {
         let profile = CoppaProfile::hf_standard();
-        assert!(frame_airtime_s(8, &profile).is_none());
+        assert!(frame_airtime_s(8, &profile).is_some());
     }
 
     #[test]
     fn frame_airtime_invalid_level_is_none() {
         let profile = CoppaProfile::hf_standard();
+        assert!(frame_airtime_s(10, &profile).is_none());
         assert!(frame_airtime_s(255, &profile).is_none());
     }
 
@@ -124,7 +125,7 @@ mod tests {
         let long = CoppaProfile::hf_standard();
         let short = CoppaProfile::hf_standard_short_cp();
         let expected = 1104.0 / 1260.0;
-        for level in [1u8, 2, 3, 4, 5, 6, 7, 9, 10] {
+        for level in [1u8, 2, 3, 4, 5, 6, 7, 8, 9] {
             let l = frame_airtime_s(level, &long).expect("valid level");
             let s = frame_airtime_s(level, &short).expect("valid level");
             assert!(
@@ -148,7 +149,7 @@ mod tests {
             data_carriers_per_symbol(&long),
             data_carriers_per_symbol(&short)
         );
-        for level in [1u8, 2, 3, 4, 5, 6, 7, 9, 10] {
+        for level in [1u8, 2, 3, 4, 5, 6, 7, 8, 9] {
             let syms_long = frame_airtime_s(level, &long).unwrap() * 48_000.0 / 1260.0;
             let syms_short = frame_airtime_s(level, &short).unwrap() * 48_000.0 / 1104.0;
             assert!((syms_long - syms_short).abs() < 1e-9, "level {level}");

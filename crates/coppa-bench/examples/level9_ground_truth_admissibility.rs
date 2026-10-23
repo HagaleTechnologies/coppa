@@ -1,4 +1,5 @@
 //! Decode-independent level-9 admissibility oracle.
+//! COP-24: this mode is now wire level 8.
 //!
 //! `H(f,t) = sum sqrt(tap.power) * g_tap[t] * exp(-i 2 pi f tap.delay)` is taken
 //! directly from the Watterson generator. Symbols are passed through that exact channel and decoded
@@ -32,7 +33,7 @@ use coppa_protocol::fec::{
 use num_complex::Complex32;
 use rand::{rngs::StdRng, Rng, RngExt, SeedableRng};
 
-const LEVEL: u8 = 9;
+const LEVEL: u8 = 8;
 const K_USED: usize = 1296;
 const CODED_LEN: usize = 1944;
 const PAYLOAD_BITS: usize = 158 * 8;

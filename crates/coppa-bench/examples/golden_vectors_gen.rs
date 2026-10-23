@@ -16,7 +16,7 @@
 //!
 //! ## Combinations
 //!
-//! levels {1, 2, 5, 6, 9} x channels {clean, awgn@12dB, poor@25dB, ssb+cfo} = 20
+//! levels {1, 2, 5, 6, 8} x channels {clean, awgn@12dB, poor@25dB, ssb+cfo} = 20
 //! WAVs, each 48 kHz / 16-bit PCM mono (`hound`, matching
 //! `coppa_audio::file_backend`'s read/write conventions but 16-bit int rather
 //! than that module's `WavSink`'s 32-bit float, per this task's brief).
@@ -34,10 +34,10 @@
 //! have no multipath or out-of-band filtering, so they keep each level's
 //! normal profile routing.
 //!
-//! ## Level 9's exception -- CORRECTED 2026-07-26 (was a bench bug, not a codec limitation)
+//! ## Level 8's exception -- CORRECTED 2026-07-26 (was a bench bug, not a codec limitation)
 //!
-//! Level 9 (64QAM 2/3) previously needed non-literal operating points here,
-//! and `L9_poor25` was committed with `expected_decode_ok = false` as a
+//! Level 8 (64QAM 2/3) previously needed non-literal operating points here,
+//! (old wire level 9 before COP-24) and `L9_poor25` was committed with `expected_decode_ok = false` as a
 //! documented "structurally undecodable at any SNR" case. **Both were wrong.**
 //! Root cause: this generator's seed-search loop reused one `CoppaTransceiver`
 //! (and hardcoded `seq_num: 0`) across up to `MAX_SEED_ATTEMPTS` attempts.
@@ -54,18 +54,18 @@
 //! and just hadn't been checked.
 //!
 //! Fixed by evicting the HARQ buffer unconditionally after every attempt
-//! (regardless of outcome), then re-measured level 9 directly (100-300
+//! (regardless of outcome), then re-measured level 8 directly (100-300
 //! trials/point, fresh transceiver + eviction per trial, bypassing this
 //! generator's seed-search framing entirely):
 //!
 //! - **AWGN** (`vhf_wide`, this level's default profile): a completely
 //!   ordinary waterfall -- 100% FER at 12/15 dB (genuinely below threshold),
 //!   6% at 18 dB, then a clean 0% from 21-27 dB, 1% at 30 dB. Real threshold
-//!   is ~18-21 dB, not "30 dB and still mostly failing." `LEVEL9_AWGN_SNR_DB`
+//!   is ~18-21 dB, not "30 dB and still mostly failing." `LEVEL8_AWGN_SNR_DB`
 //!   is corrected to 24 dB (comfortably clear, matching the margin other
 //!   levels' reference SNRs use).
 //! - **ssb+cfo** (`hf_standard` forced, 15 Hz CFO): even cleaner -- 0% FER
-//!   at every tested point from 18-33 dB. `LEVEL9_SSBCFO_SNR_DB` corrected
+//!   at every tested point from 18-33 dB. `LEVEL8_SSBCFO_SNR_DB` corrected
 //!   to 24 dB.
 //! - **Watterson Poor** (`hf_standard` forced, matching this combination's
 //!   profile override): genuinely bad, but NOT zero -- 86-91% FER at 25 dB
@@ -75,11 +75,11 @@
 //!   gap for 64QAM under deep HF fading -- consistent with CLAUDE.md's
 //!   "Phase 2 channel estimation" and "Turbo re-estimation... concentrated
 //!   on low-order modulation" limitations -- just not the literal "0% at any
-//!   SNR" this doc previously claimed. `L9_poor25` is now generated like
+//!   SNR" this doc previously claimed. `L8_poor25` is now generated like
 //!   every other combination (searched, decoded, `expected_decode_ok = true`)
 //!   rather than hand-classified as an unconditional failure.
 //!
-//! Root-causing *why* level 9 specifically (vs. levels 1/2/5/6 here) is worse
+//! Root-causing *why* level 8 specifically (vs. levels 1/2/5/6 here) is worse
 //! under Watterson Poor is still out of scope for this generator -- that part
 //! of the original diagnosis stands, just corrected from "impossible" to
 //! "real but not universal."
@@ -89,7 +89,7 @@
 //! This generator searches a small, deterministic sequence of payload seeds
 //! (see `MAX_SEED_ATTEMPTS`) for one that this commit's codec actually
 //! decodes correctly at that operating point, for every combination
-//! (including `L9_poor25` as of the correction above) -- this is meant to be
+//! (including `L8_poor25` as of the correction above) -- this is meant to be
 //! a KNOWN-GOOD regression corpus (a future regression is "this exact frame
 //! no longer decodes", not "we rolled dice and got unlucky at generation
 //! time"). The manifest records which seed (and how many attempts) each
@@ -108,7 +108,7 @@ use coppa_protocol::modem::transceiver::CoppaTransceiver;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-const LEVELS: &[u8] = &[1, 2, 5, 6, 9];
+const LEVELS: &[u8] = &[1, 2, 5, 6, 8];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Channel {
@@ -147,16 +147,16 @@ const DEFAULT_SSBCFO_SNR_DB: f32 = 20.0;
 /// +-50 Hz two-stage-acquisition tolerance (CLAUDE.md Known Limitations).
 const SSB_CFO_HZ: f32 = 15.0;
 
-/// Level 9's AWGN/ssb+cfo operating points. Corrected 2026-07-26 (see module
-/// doc's "Level 9's exception" section): the literal 12/20 dB grid values
+/// Level 8's AWGN/ssb+cfo operating points. Corrected 2026-07-26 (see module
+/// doc's "Level 8's exception" section): the literal 12/20 dB grid values
 /// are still too low for 64QAM 2/3, but the level's real threshold is an
 /// ordinary ~18-21 dB AWGN / ~18 dB ssb+cfo -- NOT the ~30 dB "late, steep,
 /// seed-dependent waterfall" this generator previously (incorrectly)
 /// characterized. These values are comfortably above that real threshold
 /// (verified 0% FER over 100 trials at both), not marginal seed-search
 /// anchors.
-const LEVEL9_AWGN_SNR_DB: f32 = 24.0;
-const LEVEL9_SSBCFO_SNR_DB: f32 = 24.0;
+const LEVEL8_AWGN_SNR_DB: f32 = 24.0;
+const LEVEL8_SSBCFO_SNR_DB: f32 = 24.0;
 
 /// Deterministic payload seeds to try per combination before giving up.
 const MAX_SEED_ATTEMPTS: u64 = 500;
@@ -185,11 +185,11 @@ fn profile_for(level: u8, channel: Channel) -> CoppaProfile {
 }
 
 /// AWGN SNR (dB) to use for `level`/`channel`'s AWGN component. See module
-/// doc: level 9 needs a documented, verified exception for `awgn12`/`ssbcfo`.
+/// doc: level 8 needs a documented, verified exception for `awgn12`/`ssbcfo`.
 fn awgn_snr_for(level: u8, channel: Channel) -> f32 {
     match (level, channel) {
-        (9, Channel::Awgn12) => LEVEL9_AWGN_SNR_DB,
-        (9, Channel::SsbCfo) => LEVEL9_SSBCFO_SNR_DB,
+        (8, Channel::Awgn12) => LEVEL8_AWGN_SNR_DB,
+        (8, Channel::SsbCfo) => LEVEL8_SSBCFO_SNR_DB,
         (_, Channel::Awgn12) => DEFAULT_AWGN_SNR_DB,
         (_, Channel::Poor25) => DEFAULT_POOR_SNR_DB,
         (_, Channel::SsbCfo) => DEFAULT_SSBCFO_SNR_DB,
@@ -360,7 +360,7 @@ fn main() {
                 // Always true: `found` above only sets when a seed actually
                 // decoded correctly (there is no longer a deliberately-failing
                 // combination -- see this generator's 2026-07-26 correction in
-                // the module doc's "Level 9's exception" section).
+                // the module doc's "Level 8's exception" section).
                 expected_decode_ok: true,
             });
         }

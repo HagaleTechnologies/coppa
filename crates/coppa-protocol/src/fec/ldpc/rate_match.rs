@@ -162,9 +162,9 @@ pub fn rate_dematch(llrs: &[f32], k_used: usize, e: usize, rv: u8, mother_len: u
 mod tests {
     use super::*;
 
-    /// `k_used` for wire speed levels 1..10 (level 8 reserved), per the
+    /// `k_used` for wire speed levels 1..9, per the
     /// audited ladder (Task 4 Step 4): `{486, 972, 972, 1458, 1296, 972,
-    /// 1458, 1296, 1620}` for levels `{1,2,3,4,5,6,7,9,10}`.
+    /// 1458, 1296, 1620}` for levels `{1,2,3,4,5,6,7,8,9}`.
     const ALL_K_USED: [usize; 9] = [486, 972, 972, 1458, 1296, 972, 1458, 1296, 1620];
 
     const E: usize = 1944;

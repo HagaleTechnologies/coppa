@@ -281,11 +281,7 @@ impl EventLoop {
         // current_level())`, even with probing disabled. `levels`/`raise_dwell`
         // still match `default_coppa()`'s own choices -- only the initial
         // level differs.
-        let rate_loop = RateLoop::new(
-            coppa_ml::VALID_SPEED_LEVELS.to_vec(),
-            5,
-            engine.speed_level(),
-        );
+        let rate_loop = RateLoop::new(engine.available_speed_levels(), 5, engine.speed_level());
         let rate_loop = if config.engine.rate_loop_probe_interval > 0 {
             rate_loop.with_probing(
                 config.engine.rate_loop_probe_interval,
@@ -2746,6 +2742,19 @@ impl EventLoop {
 mod tests {
     use super::*;
 
+    #[test]
+    fn rate_loop_caps_peer_recommendations_at_the_engine_band_limit() {
+        for (profile, maximum) in [("HF_STANDARD", 8), ("VHF_FAST", 9)] {
+            let mut config = DaemonConfig::default();
+            config.engine.profile = profile.to_string();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            for _ in 0..60 {
+                event_loop.rate_loop.on_ack(9, true);
+            }
+            assert_eq!(event_loop.rate_loop.current_level(), maximum, "{profile}");
+        }
+    }
+
     // ── Task 2 (Phase 4): explicit PTT config, no silent NullPtt ─────────
 
     #[test]
@@ -4859,7 +4868,7 @@ mod tests {
         // seeds a non-default starting level. `raise_dwell = 5` is
         // `RateLoop::default_coppa`'s own swept value, so five consecutive
         // higher recommendations is exactly what a real climb costs.
-        a.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 4);
+        a.rate_loop = RateLoop::new(a.engine.available_speed_levels(), 5, 4);
 
         // Five real ACKs, encoded under `hf_standard_short_cp` -- `a`'s REAL
         // post-negotiation profile, which is the whole point of driving this
@@ -4876,7 +4885,7 @@ mod tests {
         // `incoming_ack_with_rate_updates_rate_loop_and_encoder` already
         // relies on. The `Ack` arm itself transmits nothing.
         for _ in 0..5 {
-            let ack = TransportPdu::new_ack_with_rate(a.arq_session_id, 0, 0, 10);
+            let ack = TransportPdu::new_ack_with_rate(a.arq_session_id, 0, 0, 9);
             unstick_decoder(&mut a);
             a.decode_and_dispatch_audio(&peer_frame(
                 &ack,
@@ -4959,7 +4968,7 @@ mod tests {
         // level 4 immediately afterwards. No ARQ timeout and no VHF dwell at
         // all -- pre-fix, `hf_standard_short_cp` was already lost by the time
         // the revert landed on `hf_standard`.
-        b.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 4).with_probing(1, 1);
+        b.rate_loop = RateLoop::new(b.engine.available_speed_levels(), 5, 4).with_probing(1, 1);
 
         // A REAL ARQ window holding the seq the queued frame names, rather than a
         // bare `Some(0)` with no segment behind it. That is what makes the
@@ -5025,7 +5034,7 @@ mod tests {
             b.arq_session_id,
             probe_seq.wrapping_add(1), // cumulative: "next expected"
             0,
-            10,
+            9,
         );
         unstick_decoder(&mut b);
         b.decode_and_dispatch_audio(&peer_frame(
@@ -5139,9 +5148,9 @@ mod tests {
         // Climb across the boundary through the real ACK path, exactly as
         // `a_rate_loop_vhf_excursion_does_not_desync_a_negotiated_short_cp` does —
         // ACKs encoded under `hf_standard_short_cp`, `b`'s real current profile.
-        b.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 4);
+        b.rate_loop = RateLoop::new(b.engine.available_speed_levels(), 5, 4);
         for _ in 0..5 {
-            let ack = TransportPdu::new_ack_with_rate(b.arq_session_id, 0, 0, 10);
+            let ack = TransportPdu::new_ack_with_rate(b.arq_session_id, 0, 0, 9);
             unstick_decoder(&mut b);
             b.decode_and_dispatch_audio(&peer_frame(
                 &ack,
@@ -5355,7 +5364,7 @@ mod tests {
         let mut event_loop = EventLoop::new(config).unwrap();
         event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
         event_loop.rate_loop =
-            RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 1).with_probing(1, 1);
+            RateLoop::new(event_loop.engine.available_speed_levels(), 5, 1).with_probing(1, 1);
 
         let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
         event_loop.set_audio_out(producer);
@@ -5394,7 +5403,7 @@ mod tests {
         // is only 158 -- a real dip in `max_payload_for_level`. A payload in
         // between fits at the current level but not at the probe level.
         event_loop.rate_loop =
-            RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 4).with_probing(1, 1);
+            RateLoop::new(event_loop.engine.available_speed_levels(), 5, 4).with_probing(1, 1);
 
         let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
         event_loop.set_audio_out(producer);
@@ -5415,7 +5424,7 @@ mod tests {
         let config = DaemonConfig::default(); // arq_enabled = false by default
         let mut event_loop = EventLoop::new(config).unwrap();
         event_loop.rate_loop =
-            RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 1).with_probing(1, 1);
+            RateLoop::new(event_loop.engine.available_speed_levels(), 5, 1).with_probing(1, 1);
 
         let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
         event_loop.set_audio_out(producer);
@@ -5928,7 +5937,7 @@ mod tests {
         let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
         let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
         for _ in 0..5 {
-            let ack_pdu = TransportPdu::new_ack_with_rate(0, 0, 0, 10);
+            let ack_pdu = TransportPdu::new_ack_with_rate(0, 0, 0, 9);
             let header = coppa_codec::ofdm::frame::CoppaHeader {
                 version: 1,
                 phy_mode: 0,
@@ -5969,7 +5978,7 @@ mod tests {
             .send(b"probed segment".to_vec(), Instant::now())
             .expect("a fresh ARQ window should have room");
         event_loop.arq_tx = Some(arq_tx);
-        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 1);
+        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 1);
         event_loop.probe_state = Some((seq, 6)); // pretend we probed up to level 6
 
         // One ACK event that BOTH cumulatively acks `seq` (resolving the probe)
@@ -6115,7 +6124,7 @@ mod tests {
             .expect("a fresh ARQ window should have room");
         event_loop.arq_tx = Some(arq_tx);
         event_loop.arq_rx = Some(ArqRx::new(8));
-        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 1);
+        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 1);
         event_loop.probe_state = Some((seq, 6)); // pretend we probed up to level 6
 
         let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
@@ -6181,7 +6190,7 @@ mod tests {
         config.engine.arq_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
 
-        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 5);
+        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 5);
         assert_eq!(event_loop.rate_loop.current_level(), 5);
 
         // Two segments, both already past a short RTO by the time
@@ -6216,7 +6225,7 @@ mod tests {
         config.engine.arq_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
 
-        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 5);
+        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 5);
         assert_eq!(event_loop.rate_loop.current_level(), 5);
 
         let arq_config = ArqConfig::new(8, 5, Duration::from_millis(20))
@@ -6227,7 +6236,7 @@ mod tests {
             .send(b"probed segment".to_vec(), send_time)
             .expect("a fresh ARQ window should have room");
         event_loop.arq_tx = Some(arq_tx);
-        event_loop.probe_state = Some((seq, 9)); // pretend we probed up to level 9
+        event_loop.probe_state = Some((seq, 8)); // pretend we probed up to the HF ceiling
 
         event_loop.check_arq_retransmits().await;
 
@@ -6250,7 +6259,7 @@ mod tests {
         config.engine.arq_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
 
-        event_loop.rate_loop = RateLoop::new(coppa_ml::VALID_SPEED_LEVELS.to_vec(), 5, 5);
+        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 5);
         assert_eq!(event_loop.rate_loop.current_level(), 5);
 
         let arq_config = ArqConfig::new(8, 5, Duration::from_millis(20))
@@ -6264,7 +6273,7 @@ mod tests {
             .send(b"ordinary segment".to_vec(), send_time)
             .expect("a fresh ARQ window should have room for a second segment");
         event_loop.arq_tx = Some(arq_tx);
-        event_loop.probe_state = Some((probe_seq, 9));
+        event_loop.probe_state = Some((probe_seq, 8));
 
         event_loop.check_arq_retransmits().await;
 

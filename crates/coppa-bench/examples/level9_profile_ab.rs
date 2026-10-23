@@ -1,4 +1,5 @@
 //! Level-9 profile × CP A/B measurement.
+//! COP-24: this mode is now wire level 8.
 //!
 //! Reports FER and goodput because the profiles have materially different airtime. The
 //! `vhf_wide_long_cp` arm changes only the cyclic prefix, isolating CP from carrier geometry.
@@ -13,7 +14,7 @@ use coppa_bench::{
 };
 use coppa_channel::watterson::WattersonPreset;
 
-const LEVELS: [u8; 2] = [9, 7];
+const LEVELS: [u8; 2] = [8, 7];
 const DEFAULT_TRIALS: usize = 300;
 const SEED: u64 = 0x00C0_0004;
 

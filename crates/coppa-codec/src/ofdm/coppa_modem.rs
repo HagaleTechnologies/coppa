@@ -138,14 +138,14 @@ pub const SPEED_LEVELS: [SpeedLevel; 9] = [
         papr_target_db: 11.0,
     },
     SpeedLevel {
-        level: 9,
+        level: 8,
         bits_per_symbol: 6,
         ldpc_rate_num: 2,
         ldpc_rate_den: 3,
         papr_target_db: 11.0,
     },
     SpeedLevel {
-        level: 10,
+        level: 9,
         bits_per_symbol: 6,
         ldpc_rate_num: 7,
         ldpc_rate_den: 8,
@@ -2070,18 +2070,18 @@ mod tests {
         assert_eq!(SPEED_LEVELS[0].ldpc_rate_num, 1);
         assert_eq!(SPEED_LEVELS[0].ldpc_rate_den, 4);
 
-        // Level 7: 16QAM 3/4 (last before gap)
+        // Level 7: 16QAM 3/4
         assert_eq!(SPEED_LEVELS[6].level, 7);
         assert_eq!(SPEED_LEVELS[6].bits_per_symbol, 4);
 
-        // Level 9 on wire → index 7 in array
-        assert_eq!(SPEED_LEVELS[7].level, 9);
+        // Level 8 on wire → index 7 in array
+        assert_eq!(SPEED_LEVELS[7].level, 8);
         assert_eq!(SPEED_LEVELS[7].bits_per_symbol, 6);
         assert_eq!(SPEED_LEVELS[7].ldpc_rate_num, 2);
         assert_eq!(SPEED_LEVELS[7].ldpc_rate_den, 3);
 
-        // Level 10 on wire → index 8 in array
-        assert_eq!(SPEED_LEVELS[8].level, 10);
+        // Level 9 on wire → index 8 in array
+        assert_eq!(SPEED_LEVELS[8].level, 9);
         assert_eq!(SPEED_LEVELS[8].bits_per_symbol, 6);
         assert_eq!(SPEED_LEVELS[8].ldpc_rate_num, 7);
         assert_eq!(SPEED_LEVELS[8].ldpc_rate_den, 8);
@@ -2359,7 +2359,7 @@ mod tests {
         use super::SPEED_LEVELS;
         // BPSK levels should have lower PAPR targets than 64-QAM levels
         let bpsk = SPEED_LEVELS.iter().find(|s| s.level == 1).unwrap();
-        let qam64 = SPEED_LEVELS.iter().find(|s| s.level == 9).unwrap();
+        let qam64 = SPEED_LEVELS.iter().find(|s| s.level == 8).unwrap();
         assert!(
             bpsk.papr_target_db < qam64.papr_target_db,
             "BPSK target ({}) should be less than 64-QAM target ({})",

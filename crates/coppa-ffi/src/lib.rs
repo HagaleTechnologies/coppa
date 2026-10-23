@@ -18,7 +18,7 @@
 //! | `-3` | Encode/decode failed |
 //! | `-4` | Lock poisoned — **handle is permanently broken** (see below) |
 //! | `-5` | Internal panic — **handle is permanently broken** (see below) |
-//! | `-6` | Invalid parameter value (e.g. out-of-range/reserved speed level, unresolvable profile name) — added in FFI v2, see below |
+//! | `-6` | Invalid parameter value (e.g. out-of-range or band-unavailable speed level, unresolvable profile name) — added in FFI v2, see below |
 //!
 //! [`coppa_next_frame`] is a deliberate, documented exception to the `0` =
 //! success convention above: it additionally uses `1` for the non-error
@@ -330,13 +330,12 @@ pub unsafe extern "C" fn coppa_free_string(s: *mut c_char) {
 ///   to start from `EngineConfig::default()` instead. An unrecognized
 ///   non-empty profile name is a config-rejection error (see
 ///   [`coppa_engine_new_with`]'s return value).
-/// - `speed_level`: wire speed-level override (1-10; 8 is reserved),
-///   applied after `profile` resolution. `0` means "use the resolved
-///   profile's/default speed_level" (0 is never itself a valid wire speed
-///   level, so it unambiguously means "unset" here too). A non-zero,
-///   invalid level (out of 1-10, or the reserved 8) is a config-rejection
+/// - `speed_level`: wire speed-level override (1-9), applied after `profile`
+///   resolution. `0` means "use the resolved profile's/default speed_level".
+///   A non-zero level outside 1-9, or level 9 on a handle whose profile is
+///   HF (HF carries levels 1-8; level 9 is VHF-only), is a config-rejection
 ///   error. The override changes the level, never the profile's OFDM band:
-///   an `"HF_ROBUST"` handle at `speed_level = 9` stays on an HF profile, and
+///   an `"HF_ROBUST"` handle at `speed_level = 8` stays on an HF profile, and
 ///   so does any later [`coppa_engine_set_speed_level`] call on it (COP-23).
 ///   Only a handle built with no `profile` keeps the historical level-only
 ///   rule (HF below level 5, VHF from level 5).
@@ -427,7 +426,7 @@ unsafe fn resolve_engine_config(cfg: *const CoppaConfig) -> Option<coppa_engine:
 /// [`resolve_engine_config`] and [`CoppaConfig`]'s field docs): invalid
 /// UTF-8 in `profile` or `callsign`, an unrecognized non-empty `profile`
 /// name, or a non-zero `speed_level` that isn't a valid wire speed level
-/// (1-10; 8 is reserved).
+/// (1-9), or level 9 on an HF-profile handle.
 ///
 /// The returned handle is a plain [`CoppaHandle`] (`coppa_engine_t`) —
 /// exactly what [`coppa_engine_create`] returns, just built from an
@@ -474,9 +473,8 @@ pub unsafe extern "C" fn coppa_engine_new_with(cfg: *const CoppaConfig) -> *mut 
 /// (fully decoded before this call) are **not** affected.
 ///
 /// Returns `0` on success, `-1` if `handle` is null, `-6` if `level` is not
-/// a valid wire speed level (1-10; 8 is reserved — see
-/// `coppa_protocol::modem::speed_level_components`), `-4` if the internal
-/// lock is poisoned, or `-5` if an internal panic occurred. **After either
+/// a valid wire speed level (1-9) or is level 9 on an HF-profile handle,
+/// `-4` if the internal lock is poisoned, or `-5` if an internal panic occurred. **After either
 /// of the latter two the handle is permanently broken** — destroy it with
 /// `coppa_engine_destroy` and create a new one.
 ///
@@ -1522,7 +1520,7 @@ mod tests {
     }
 
     /// COP-23: the `speed_level` override changes the level, never the profile's
-    /// band. Pre-fix an `HF_ROBUST` handle built at level 9 went on air as
+    /// band. Pre-fix an `HF_ROBUST` handle using 64-QAM 2/3 (now level 8) went on air as
     /// `vhf_wide`, which a level-1 `HF_ROBUST` handle (`hf_standard`) cannot even
     /// sync to -- so a successful cross-handle decode is the wire-level proof,
     /// using only the C API.
@@ -1532,7 +1530,7 @@ mod tests {
         let high = CoppaConfig {
             sample_rate: 0,
             profile: profile_name.as_ptr(),
-            speed_level: 9,
+            speed_level: 8,
             callsign: std::ptr::null(),
         };
         let low = CoppaConfig {
@@ -1543,7 +1541,7 @@ mod tests {
         let mut h2 = unsafe { coppa_engine_new_with(&low) };
         assert!(!h1.is_null() && !h2.is_null());
 
-        let data = b"HF at level nine";
+        let data = b"HF at level eight";
         let mut out_samples: *mut f32 = std::ptr::null_mut();
         let mut out_len: usize = 0;
         let result = unsafe {
@@ -1561,7 +1559,7 @@ mod tests {
         let result = unsafe { coppa_decode(h2, out_samples, out_len, &mut out_message) };
         assert_eq!(
             result, 0,
-            "a level-1 HF_ROBUST handle must decode a level-9 HF_ROBUST handle's \
+            "a level-1 HF_ROBUST handle must decode a level-8 HF_ROBUST handle's \
              frame -- both must be on hf_standard"
         );
         let decoded = unsafe { CStr::from_ptr(out_message) }.to_str().unwrap();
@@ -1592,15 +1590,46 @@ mod tests {
     }
 
     #[test]
-    fn test_new_with_rejects_reserved_speed_level_8() {
+    fn hf_handles_reject_vhf_only_level_in_constructor_and_setter() {
         let cfg = CoppaConfig {
-            speed_level: 8,
+            profile: c"HF_ROBUST".as_ptr(),
+            speed_level: 9,
+            ..null_config()
+        };
+        assert!(unsafe { coppa_engine_new_with(&cfg) }.is_null());
+        let mut hf = unsafe {
+            coppa_engine_new_with(&CoppaConfig {
+                speed_level: 8,
+                ..cfg
+            })
+        };
+        assert!(!hf.is_null());
+        assert_eq!(unsafe { coppa_engine_set_speed_level(hf, 9) }, -6);
+        assert_eq!(unsafe { (*hf).engine.lock().unwrap().speed_level() }, 8);
+        unsafe { coppa_engine_destroy(&mut hf) };
+
+        let mut vhf = unsafe {
+            coppa_engine_new_with(&CoppaConfig {
+                profile: c"VHF_FAST".as_ptr(),
+                speed_level: 0,
+                ..null_config()
+            })
+        };
+        assert!(!vhf.is_null());
+        assert_eq!(unsafe { coppa_engine_set_speed_level(vhf, 9) }, 0);
+        unsafe { coppa_engine_destroy(&mut vhf) };
+    }
+
+    #[test]
+    fn test_new_with_rejects_removed_speed_level_10() {
+        let cfg = CoppaConfig {
+            speed_level: 10,
             ..null_config()
         };
         let handle = unsafe { coppa_engine_new_with(&cfg) };
         assert!(
             handle.is_null(),
-            "speed level 8 is reserved and must be rejected"
+            "speed level 10 is invalid and must be rejected"
         );
     }
 
@@ -1707,9 +1736,9 @@ mod tests {
     }
 
     #[test]
-    fn test_set_speed_level_rejects_reserved_and_out_of_range() {
+    fn test_set_speed_level_rejects_out_of_range() {
         let mut handle = coppa_engine_create();
-        assert_eq!(unsafe { coppa_engine_set_speed_level(handle, 8) }, -6);
+        assert_eq!(unsafe { coppa_engine_set_speed_level(handle, 10) }, -6);
         assert_eq!(unsafe { coppa_engine_set_speed_level(handle, 0) }, -6);
         assert_eq!(unsafe { coppa_engine_set_speed_level(handle, 255) }, -6);
         // A rejected level must not have mutated the config.

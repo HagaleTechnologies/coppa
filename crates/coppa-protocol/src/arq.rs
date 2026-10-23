@@ -120,7 +120,7 @@ const RTTVAR_BETA: f64 = 0.25;
 ///   the burst, and RX->TX after the peer's ACK comes back.
 ///
 /// Returns the fallback `MIN_RTO_SECS` (1s, the old fixed floor) if `level` or
-/// `level_ack` isn't a valid, non-reserved speed level, or `profile` is
+/// `level_ack` isn't a valid speed level, or `profile` is
 /// degenerate (e.g. zero data carriers) -- a computed floor isn't available
 /// then, and falling back to the old constant is safer than panicking.
 ///
@@ -176,7 +176,7 @@ pub struct ArqConfig {
     /// Initial retransmit timeout (used as-is, unclamped, until the first real
     /// RTT sample arrives -- see [`RttEstimator`]'s doc).
     pub initial_rto: Duration,
-    /// Wire-encoded speed level (1-10) this session's data frames are sent at,
+    /// Wire-encoded speed level (1-9) this session's data frames are sent at,
     /// used for the [`rto_floor`] airtime calculation. See [`DEFAULT_SPEED_LEVEL`]'s
     /// doc: not yet wired to a real negotiated rate.
     pub speed_level: u8,
@@ -1267,7 +1267,7 @@ mod tests {
         let profile = CoppaProfile::hf_standard();
         let floor = rto_floor(
             8,
-            8, /* reserved */
+            10, /* invalid */
             8,
             Duration::from_millis(150),
             &profile,
