@@ -665,6 +665,26 @@ impl ArqTx {
     pub fn can_send(&self) -> bool {
         self.in_flight() < self.config.window_size
     }
+
+    /// Payload bytes of every segment still awaiting acknowledgement.
+    ///
+    /// A selectively-acked segment whose slot `process_ack` has not yet
+    /// cleared is not counted; a segment that has used up its retransmit
+    /// budget (`is_failed`) still is, since nothing has acked it.
+    pub fn unacked_bytes(&self) -> usize {
+        let mut total = 0;
+        let mut seq = self.send_base;
+        while seq != self.next_seq {
+            let idx = seq as usize % MAX_WINDOW_SIZE as usize;
+            if let Some(seg) = &self.tx_buf[idx] {
+                if seg.seq_num == seq && !seg.acked {
+                    total += seg.data.len();
+                }
+            }
+            seq = seq.wrapping_add(1);
+        }
+        total
+    }
 }
 
 /// Receiver-side selective repeat ARQ state machine.
@@ -754,6 +774,34 @@ impl ArqRx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// COP-30: `unacked_bytes` sums the payload of every un-acked segment,
+    /// and a byte leaves the sum the moment its segment is acked
+    /// (cumulatively or selectively) or abandoned.
+    #[test]
+    fn unacked_bytes_tracks_cumulative_selective_ack_and_abandon() {
+        let mut tx = ArqTx::new(ArqConfig::default());
+        let now = Instant::now();
+        assert_eq!(tx.unacked_bytes(), 0);
+        tx.send(vec![0; 3], now).unwrap();
+        tx.send(vec![0; 10], now).unwrap();
+        tx.send(vec![0; 20], now).unwrap();
+        assert_eq!(tx.unacked_bytes(), 33);
+
+        // Cumulative ACK of seq 0.
+        tx.process_ack(1, 0, now);
+        assert_eq!(tx.unacked_bytes(), 30);
+
+        // Selective ACK of seq 2 (bit 0 = ack_num + 1): acked, but its slot
+        // stays occupied until seq 1 resolves.
+        tx.process_ack(1, 0b1, now);
+        assert_eq!(tx.in_flight(), 2);
+        assert_eq!(tx.unacked_bytes(), 10);
+
+        tx.abandon(1);
+        assert_eq!(tx.in_flight(), 0);
+        assert_eq!(tx.unacked_bytes(), 0);
+    }
 
     // ── IR-HARQ RV cycling (Phase 3 Task 3) ──────────────────────────
 

@@ -264,9 +264,17 @@ pub struct EventLoop {
     /// raw/ARQ `HostEvent::DataReceived` TX path), tagged with the ARQ seq
     /// number assigned by `ArqTx::send` when this entry came from the
     /// ARQ-enabled path (`None` otherwise -- non-ARQ sends are never probe
-    /// candidates). `VaraResponse::Buffer` telemetry reports this queue's
-    /// length on every push/pop.
+    /// candidates). Its `None`-tagged entries count toward `BUFFER`
+    /// telemetry; see `buffered_tx_bytes`.
     tx_queue: VecDeque<(Option<u8>, Vec<u8>)>,
+    /// Host payload bytes handed to `transmit_samples` on a path with no ACK
+    /// to wait for (the non-ARQ raw path and established-session data).
+    /// Cleared at PTT release (`set_ptt(false)`): by then every frame handed
+    /// over earlier has played or been discarded. See `buffered_tx_bytes`.
+    tx_on_air_bytes: usize,
+    /// The last value sent as `BUFFER`, so `report_buffer` emits only on
+    /// change.
+    last_reported_buffer: usize,
     /// Spectral-occupancy busy gate (decision 8: `BUSY ON`/`OFF` telemetry), fed
     /// raw incoming audio in `handle_audio_in`.
     busy_gate: BusyGate,
@@ -466,6 +474,8 @@ impl EventLoop {
             ws_status: None,
             vara_responses: None,
             tx_queue: VecDeque::new(),
+            tx_on_air_bytes: 0,
+            last_reported_buffer: 0,
             busy_gate,
             session_mgr: SessionManager::new(),
             local_callsign,
@@ -768,28 +778,62 @@ impl EventLoop {
         }
     }
 
-    /// Push one raw payload onto the outbound TX queue, emit the resulting
+    /// Push one raw payload onto the outbound TX queue, report the resulting
     /// `BUFFER` telemetry, and attempt to start transmitting immediately if the
     /// link is currently idle. See `tx_queue`'s field doc and `try_drain_tx_queue`.
     async fn enqueue_tx(&mut self, seq: Option<u8>, data: Vec<u8>) {
         self.tx_queue.push_back((seq, data));
-        self.emit_vara(VaraResponse::Buffer(self.tx_queue.len()))
-            .await;
+        self.report_buffer().await;
         self.try_drain_tx_queue().await;
     }
 
+    /// Host payload bytes this modem still holds (COP-30): what `BUFFER`
+    /// reports. The sum of
+    /// - every un-acked ARQ segment's payload (`ArqTx::unacked_bytes`),
+    ///   which leaves the sum only when the peer ACKs it or a `Reset`
+    ///   rebuilds `arq_tx` -- a segment with its retransmit budget spent
+    ///   stays counted, since nothing has acked it;
+    /// - `None`-tagged (non-ARQ) `tx_queue` entries not yet popped. A
+    ///   `Some`-tagged entry is the `TransportPdu`-wrapped copy of a payload
+    ///   `ArqTx` already counts, so it adds nothing;
+    /// - `tx_on_air_bytes`: payloads with no ACK to wait for, counted until
+    ///   PTT releases after they play.
+    ///
+    /// MAC, transport and FEC framing are not counted: this is the unit the
+    /// host wrote.
+    fn buffered_tx_bytes(&self) -> usize {
+        let queued: usize = self
+            .tx_queue
+            .iter()
+            .filter(|(seq, _)| seq.is_none())
+            .map(|(_, data)| data.len())
+            .sum();
+        let unacked = self.arq_tx.as_ref().map_or(0, ArqTx::unacked_bytes);
+        queued + self.tx_on_air_bytes + unacked
+    }
+
+    /// Emit `BUFFER` with `buffered_tx_bytes` if it differs from the last
+    /// value sent. The only place `VaraResponse::Buffer` is built; called
+    /// wherever the sum can change.
+    async fn report_buffer(&mut self) {
+        let bytes = self.buffered_tx_bytes();
+        if bytes != self.last_reported_buffer {
+            self.last_reported_buffer = bytes;
+            self.emit_vara(VaraResponse::Buffer(bytes)).await;
+        }
+    }
+
     /// If the link isn't currently mid-transmission, pop the next queued payload
-    /// (if any), emit the resulting `BUFFER` count, and encode+transmit it. Called
-    /// after every enqueue and after every PTT release, so the queue drains one
-    /// frame at a time as each transmission completes.
+    /// (if any) and encode+transmit it. Called after every enqueue and after
+    /// every PTT release, so the queue drains one frame at a time as each
+    /// transmission completes. The pop itself never changes `BUFFER`: a
+    /// non-ARQ payload moves to `tx_on_air_bytes`, and an ARQ one stays in
+    /// `ArqTx` until acked.
     async fn try_drain_tx_queue(&mut self) {
         if self.is_transmitting {
             return;
         }
         if let Some((seq_opt, data)) = self.tx_queue.pop_front() {
-            self.emit_vara(VaraResponse::Buffer(self.tx_queue.len()))
-                .await;
-
             // Active overshoot probing (see `docs/superpowers/specs/
             // 2026-07-25-rateloop-daemon-probe-wiring-design.md`) only applies
             // to a fresh ARQ-tracked segment's first transmission (never a
@@ -853,9 +897,16 @@ impl EventLoop {
                         self.probe_state =
                             Some((seq_opt.expect("is_probe implies Some(seq)"), level));
                     }
+                    if seq_opt.is_none() {
+                        self.tx_on_air_bytes += data.len();
+                    }
                     Box::pin(self.transmit_samples(&samples)).await;
                 }
-                Err(e) => tracing::warn!(error = %e, "Encode failed for queued TX frame"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Encode failed for queued TX frame");
+                    // A dropped non-ARQ payload leaves the count here.
+                    self.report_buffer().await;
+                }
             }
 
             if is_probe {
@@ -1094,6 +1145,10 @@ impl EventLoop {
                     let pdu_bytes = mac_pdu.to_bytes();
                     match self.engine.encode_bytes(&pdu_bytes) {
                         Ok(samples) => {
+                            // No MAC-level ACK exists for session data, so
+                            // its bytes stay in `BUFFER` until PTT releases.
+                            self.tx_on_air_bytes += data.len();
+                            self.report_buffer().await;
                             self.transmit_samples(&samples).await;
                             self.tx_frame_count += 1;
                             tracing::debug!(
@@ -1136,8 +1191,8 @@ impl EventLoop {
                     (None, data.clone())
                 };
 
-                // Queue for encode+transmit (Task 7: BUFFER telemetry tracks this
-                // queue's depth; see `enqueue_tx`/`try_drain_tx_queue`). `seq_opt`
+                // Queue for encode+transmit (`BUFFER` telemetry counts the
+                // host bytes still held; see `buffered_tx_bytes`). `seq_opt`
                 // is `Some` only for a fresh ARQ-tracked segment -- used by active
                 // overshoot probing (`RateLoop::level_for_next_transmission`) to
                 // attribute a probe's later outcome back to its ACK/timeout.
@@ -1585,6 +1640,7 @@ impl EventLoop {
                                                 );
                                                 self.resolve_probe_if_acked(&newly_acked);
                                             }
+                                            self.report_buffer().await;
                                         }
                                         // Acknowledge every successfully-processed
                                         // incoming data PDU (one ACK per frame, per
@@ -1623,6 +1679,7 @@ impl EventLoop {
                                             probe_resolved =
                                                 self.resolve_probe_if_acked(&newly_acked);
                                         }
+                                        self.report_buffer().await;
                                         // Closed-loop rate adaptation: apply the
                                         // peer's recommendation (if this ACK carries
                                         // one) and push the resulting level into the
@@ -1682,6 +1739,9 @@ impl EventLoop {
                                         // prevent, just reached by a different
                                         // route.
                                         self.engine.set_cp_profile(CpMode::LongCp);
+                                        // The rebuilt `arq_tx` holds nothing,
+                                        // so its old segments leave `BUFFER`.
+                                        self.report_buffer().await;
                                         Vec::new()
                                     }
                                     TransportType::CpControl => {
@@ -3146,6 +3206,10 @@ impl EventLoop {
             self.is_transmitting = false;
             self.tx_keyed_since = None;
             self.tx_stall_clock = None;
+            // Every frame handed to `transmit_samples` before this release has
+            // played or been discarded (only the newest generation unkeys).
+            self.tx_on_air_bytes = 0;
+            self.report_buffer().await;
         }
     }
 
@@ -8606,46 +8670,201 @@ mod tests {
             );
         }
 
-        /// Required scenario: "queue 3 frames -> BUFFER 3…0 progression."
-        ///
-        /// Forces `is_transmitting = true` before enqueuing so all three frames
-        /// stack up in the queue instead of draining immediately (simulating a
-        /// client bursting frames faster than the half-duplex link can send them),
-        /// then drains deterministically (bypassing the real scheduled-PTT-release
-        /// timer, which `test_ptt_telemetry_brackets_transmission` already covers)
-        /// by calling the same internal hooks `handle_ptt_change(false)` would
-        /// trigger on each real transmission's completion.
-        #[tokio::test]
-        async fn test_buffer_telemetry_progression_3_to_0() {
-            let config = fast_ptt_config();
-            let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19420, 19421).await;
-
-            event_loop.is_transmitting = true;
-            event_loop.enqueue_tx(None, b"frame1".to_vec()).await;
-            event_loop.enqueue_tx(None, b"frame2".to_vec()).await;
-            event_loop.enqueue_tx(None, b"frame3".to_vec()).await;
-            assert_eq!(event_loop.tx_queue.len(), 3);
-
-            event_loop.is_transmitting = false;
-            event_loop.try_drain_tx_queue().await; // starts draining frame1 -> len 2
-            event_loop.handle_ptt_change(false).await; // frame1 "done" -> drains frame2 -> len 1
-            event_loop.handle_ptt_change(false).await; // frame2 "done" -> drains frame3 -> len 0
-            event_loop.handle_ptt_change(false).await; // frame3 "done" -> queue empty, no more drains
-            assert_eq!(event_loop.tx_queue.len(), 0);
-
-            let lines = read_available_lines(&mut reader).await;
-            let buffer_values: Vec<&str> = lines
+        /// The `BUFFER n` values among `lines`, terminator stripped.
+        fn buffer_values(lines: &[String]) -> Vec<&str> {
+            lines
                 .iter()
                 .map(|s| s.trim_end())
                 .filter(|s| s.starts_with("BUFFER"))
-                .collect();
+                .collect()
+        }
+
+        /// COP-30: on the non-ARQ raw path, `BUFFER` counts host payload
+        /// bytes (not frames), and a frame's bytes leave the count only when
+        /// PTT releases after it has played -- not when it is popped for TX.
+        ///
+        /// Forces `is_transmitting = true` before enqueuing so all three
+        /// payloads stack up in the queue instead of draining immediately
+        /// (simulating a client bursting data faster than the half-duplex link
+        /// can send it), then drains deterministically (bypassing the real
+        /// scheduled-PTT-release timer, which
+        /// `test_ptt_telemetry_brackets_transmission` already covers) by
+        /// calling the same internal hooks each real transmission's completion
+        /// would trigger.
+        #[tokio::test]
+        async fn test_buffer_telemetry_counts_bytes_and_drains_on_ptt_release() {
+            let config = fast_ptt_config();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19490, 19491).await;
+
+            event_loop.is_transmitting = true;
+            event_loop.enqueue_tx(None, vec![0x11; 5]).await;
+            event_loop.enqueue_tx(None, vec![0x22; 5000]).await;
+            event_loop.enqueue_tx(None, vec![0x33; 6]).await;
+            assert_eq!(event_loop.tx_queue.len(), 3);
+
+            event_loop.is_transmitting = false;
+            event_loop.try_drain_tx_queue().await; // pops the 5 bytes: still counted
+            event_loop.handle_ptt_change(false).await; // 5 played -> drains the 5000
+            event_loop.handle_ptt_change(false).await; // 5000 played -> drains the 6
+            event_loop.handle_ptt_change(false).await; // 6 played -> queue empty
+            assert_eq!(event_loop.tx_queue.len(), 0);
+
+            let lines = read_available_lines(&mut reader).await;
             assert_eq!(
-                buffer_values,
-                vec!["BUFFER 1", "BUFFER 2", "BUFFER 3", "BUFFER 2", "BUFFER 1", "BUFFER 0"],
-                "expected the queue to build 1,2,3 then drain 2,1,0"
+                buffer_values(&lines),
+                vec![
+                    "BUFFER 5",
+                    "BUFFER 5005",
+                    "BUFFER 5011",
+                    "BUFFER 5006",
+                    "BUFFER 6",
+                    "BUFFER 0"
+                ],
+                "expected byte counts that drop only as each frame's PTT releases, got: {:?}",
+                lines
             );
+        }
+
+        /// COP-30: with ARQ on, a segment's bytes stay in `BUFFER` after its
+        /// frame has played, until the peer's ACK for it is decoded.
+        #[tokio::test]
+        async fn test_buffer_held_until_arq_ack() {
+            let mut config = fast_ptt_config();
+            config.engine.arq_enabled = true;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19492, 19493).await;
+
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x44; 5],
+                })
+                .await;
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x55; 40],
+                })
+                .await;
+            // Both frames finish playing; neither is acked yet.
+            event_loop.handle_ptt_change(false).await;
+            event_loop.handle_ptt_change(false).await;
+            assert_eq!(event_loop.arq_tx.as_ref().unwrap().in_flight(), 2);
+            let lines = read_available_lines(&mut reader).await;
+            assert_eq!(
+                buffer_values(&lines).last(),
+                Some(&"BUFFER 45"),
+                "played but un-acked bytes must stay counted, got: {:?}",
+                lines
+            );
+
+            // The peer cumulatively ACKs seq 0 (the 5 bytes).
+            let session_id = event_loop.arq_session_id;
+            event_loop
+                .decode_and_dispatch_audio(&super::peer_frame(
+                    &TransportPdu::new_ack_with_rate(session_id, 1, 0, 2),
+                    coppa_codec::ofdm::CoppaProfile::hf_standard(),
+                ))
+                .await;
+            let lines = read_available_lines(&mut reader).await;
+            assert_eq!(
+                buffer_values(&lines),
+                vec!["BUFFER 40"],
+                "the ACK for seq 0 must remove its 5 bytes, got: {:?}",
+                lines
+            );
+
+            // Then seq 1 (the 40 bytes).
+            super::unstick_decoder(&mut event_loop);
+            event_loop
+                .decode_and_dispatch_audio(&super::peer_frame(
+                    &TransportPdu::new_ack_with_rate(session_id, 2, 0, 2),
+                    coppa_codec::ofdm::CoppaProfile::hf_standard(),
+                ))
+                .await;
+            let lines = read_available_lines(&mut reader).await;
+            assert_eq!(
+                buffer_values(&lines),
+                vec!["BUFFER 0"],
+                "the ACK for seq 1 must empty the buffer, got: {:?}",
+                lines
+            );
+            assert_eq!(event_loop.arq_tx.as_ref().unwrap().in_flight(), 0);
+        }
+
+        /// COP-30: established-session data, which goes straight to
+        /// `transmit_samples` rather than through `tx_queue`, reports `BUFFER`
+        /// too -- before its PTT keys -- and drains at PTT release.
+        #[tokio::test]
+        async fn test_session_path_emits_buffer_and_drains_on_ptt_release() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19494, 19495).await;
+            seed_established(&mut event_loop);
+
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x66; 12],
+                })
+                .await;
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x77; 4],
+                })
+                .await;
+            event_loop.handle_ptt_change(false).await;
+
+            let lines = read_available_lines(&mut reader).await;
+            assert_eq!(
+                buffer_values(&lines),
+                vec!["BUFFER 12", "BUFFER 16", "BUFFER 0"],
+                "session data must be counted in bytes and drain at PTT release, got: {:?}",
+                lines
+            );
+            let first_buffer = lines.iter().position(|l| l.trim_end() == "BUFFER 12");
+            let first_ptt_on = lines.iter().position(|l| l.trim_end() == "PTT ON");
+            assert!(
+                first_buffer.is_some() && first_ptt_on.is_some() && first_buffer < first_ptt_on,
+                "BUFFER 12 must reach the host before the first PTT ON, got: {:?}",
+                lines
+            );
+        }
+
+        /// COP-30: a payload the full ARQ window drops was never tracked or
+        /// queued, so it never reaches `BUFFER`.
+        #[tokio::test]
+        async fn test_arq_window_full_drop_is_not_counted() {
+            let mut config = fast_ptt_config();
+            config.engine.arq_enabled = true;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19496, 19497).await;
+
+            event_loop.is_transmitting = true;
+            for i in 0..9u8 {
+                event_loop
+                    .handle_host_event(HostEvent::DataReceived {
+                        client_id: 1,
+                        data: vec![i; 10],
+                    })
+                    .await;
+            }
+            assert_eq!(event_loop.arq_tx.as_ref().unwrap().in_flight(), 8);
+
+            let lines = read_available_lines(&mut reader).await;
+            let values = buffer_values(&lines);
+            assert_eq!(
+                values.len(),
+                8,
+                "one BUFFER line per accepted segment, got: {:?}",
+                lines
+            );
+            assert_eq!(values.last(), Some(&"BUFFER 80"));
         }
 
         /// Required scenario: "injected band-limited noise burst -> BUSY ON then
