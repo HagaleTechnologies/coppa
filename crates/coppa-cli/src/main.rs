@@ -341,22 +341,119 @@ fn build_ptt(ptt: &str, rigctld_addr: &str) -> Box<dyn coppa_radio::PttControl> 
     }
 }
 
-/// Compute the PTT lead-in delay (before audio starts) and the post-audio
-/// tail delay (audio playout duration + configured tail) that
-/// `transmit_live` sleeps for around the actual audio write. Split out so
-/// the CLI's `--ptt-lead-ms`/`--ptt-tail-ms` flags' effect on the real
-/// playback sequencing can be verified by a fast, deterministic unit test.
+/// Time without downstream playback progress after which live TX gives up
+/// rather than holding PTT keyed indefinitely.
 #[cfg(feature = "cpal-backend")]
-fn ptt_timings(
-    sample_count: usize,
-    sample_rate: u32,
-    lead_ms: u64,
-    tail_ms: u64,
-) -> (std::time::Duration, std::time::Duration) {
-    let lead = std::time::Duration::from_millis(lead_ms);
-    let duration_ms = (sample_count as f64 / sample_rate as f64 * 1000.0) as u64;
-    let tail = std::time::Duration::from_millis(duration_ms + tail_ms);
-    (lead, tail)
+const PLAYBACK_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Longest wait between playback polls while feeding and draining.
+#[cfg(feature = "cpal-backend")]
+const PLAYBACK_POLL: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Clock and sleep used by [`play_keyed`], injected so its sequencing can be
+/// tested against a simulated device without real multi-second sleeps.
+#[cfg(feature = "cpal-backend")]
+trait PlaybackClock {
+    fn now(&self) -> std::time::Instant;
+    fn sleep(&mut self, duration: std::time::Duration);
+}
+
+/// The wall clock and a real thread sleep.
+#[cfg(feature = "cpal-backend")]
+struct SystemClock;
+
+#[cfg(feature = "cpal-backend")]
+impl PlaybackClock for SystemClock {
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+    fn sleep(&mut self, duration: std::time::Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+/// Key PTT, wait `lead`, feed every sample of `samples` into `sink`
+/// (retaining the unwritten suffix on short writes and yielding while the
+/// sink is full), wait until the last accepted sample is predicted to have
+/// finished playing, wait `tail`, then unkey PTT and stop the sink.
+///
+/// Returns the number of samples delivered. Errors from the sink, from
+/// `progress`, or five seconds without downstream progress still unkey PTT
+/// and stop the sink before being returned; PTT and stop failures during
+/// that cleanup do not skip each other.
+#[cfg(feature = "cpal-backend")]
+fn play_keyed<S: coppa_audio::AudioSink>(
+    sink: &mut S,
+    progress: impl Fn(&S) -> Result<coppa_audio::PlaybackProgress>,
+    ptt: &mut dyn coppa_radio::PttControl,
+    samples: &[f32],
+    lead: std::time::Duration,
+    tail: std::time::Duration,
+    clock: &mut dyn PlaybackClock,
+) -> Result<u64> {
+    use coppa_radio::PttState;
+
+    if let Err(e) = ptt.set_ptt(PttState::Tx) {
+        eprintln!("WARNING: PTT key failed: {}", e);
+    }
+    clock.sleep(lead);
+
+    let result = feed_until_played(sink, &progress, samples, clock).inspect(|_| clock.sleep(tail));
+
+    if let Err(e) = ptt.set_ptt(PttState::Rx) {
+        eprintln!("WARNING: PTT unkey failed: {}", e);
+    }
+    let stopped = sink.stop();
+    let delivered = result?;
+    stopped?;
+    Ok(delivered)
+}
+
+/// The feeding/draining half of [`play_keyed`].
+#[cfg(feature = "cpal-backend")]
+fn feed_until_played<S: coppa_audio::AudioSink>(
+    sink: &mut S,
+    progress: &impl Fn(&S) -> Result<coppa_audio::PlaybackProgress>,
+    samples: &[f32],
+    clock: &mut dyn PlaybackClock,
+) -> Result<u64> {
+    let mut offset = 0usize;
+    let mut accepted = 0u64;
+    let mut last_consumed = progress(sink)?.consumed_samples;
+    let mut last_progress_at = clock.now();
+    loop {
+        if offset < samples.len() {
+            let written = sink.write(&samples[offset..])?;
+            let written = written.min(samples.len() - offset);
+            offset += written;
+            accepted += written as u64;
+        }
+        let snapshot = progress(sink)?;
+        if offset == samples.len() && snapshot.has_played(accepted) {
+            return Ok(accepted);
+        }
+        let now = clock.now();
+        if snapshot.consumed_samples > last_consumed {
+            last_consumed = snapshot.consumed_samples;
+            last_progress_at = now;
+        } else if snapshot.consumed_samples < accepted
+            && now.saturating_duration_since(last_progress_at) >= PLAYBACK_STALL_TIMEOUT
+        {
+            anyhow::bail!(
+                "audio output made no progress for {}s ({} of {} samples played)",
+                PLAYBACK_STALL_TIMEOUT.as_secs(),
+                snapshot.consumed_samples,
+                samples.len()
+            );
+        }
+        let wait = if snapshot.consumed_samples >= accepted && offset == samples.len() {
+            // Everything is in the device; wait out its presentation delay.
+            snapshot.remaining.min(PLAYBACK_POLL)
+        } else {
+            PLAYBACK_POLL
+        };
+        clock.sleep(wait.max(std::time::Duration::from_micros(100)));
+    }
 }
 
 /// Key PTT, stream `samples` out through the resolved audio device, then
@@ -374,7 +471,6 @@ fn transmit_live(
     verbosity: Verbosity,
 ) -> Result<()> {
     use coppa_audio::AudioSink;
-    use coppa_radio::PttState;
 
     // Create PTT controller
     let mut ptt_ctrl = build_ptt(ptt, rigctld_addr);
@@ -400,26 +496,22 @@ fn transmit_live(
     };
     sink.start()?;
 
-    let (lead_delay, tail_delay) =
-        ptt_timings(samples.len(), sample_rate, ptt_lead_ms, ptt_tail_ms);
-
-    // Key PTT
-    let _ = ptt_ctrl.set_ptt(PttState::Tx);
-    std::thread::sleep(lead_delay);
-
-    // Write audio
-    sink.write(samples)?;
-
-    // Wait for audio to play out
-    std::thread::sleep(tail_delay);
-
-    // Unkey PTT
-    let _ = ptt_ctrl.set_ptt(PttState::Rx);
-    sink.stop()?;
+    // Key, pace every sample through the sink's bounded ring, and unkey only
+    // after the last one is predicted to have played plus the tail. Any
+    // failure unkeys and stops before returning, and skips the success line.
+    let delivered = play_keyed(
+        &mut sink,
+        |sink| sink.playback_progress(),
+        ptt_ctrl.as_mut(),
+        samples,
+        std::time::Duration::from_millis(ptt_lead_ms),
+        std::time::Duration::from_millis(ptt_tail_ms),
+        &mut SystemClock,
+    )?;
 
     if verbosity != Verbosity::Quiet {
-        let duration_s = samples.len() as f64 / sample_rate as f64;
-        eprintln!("Transmitted {} samples ({:.2}s)", samples.len(), duration_s);
+        let duration_s = delivered as f64 / sample_rate as f64;
+        eprintln!("Transmitted {} samples ({:.2}s)", delivered, duration_s);
     }
 
     Ok(())
@@ -1299,23 +1391,307 @@ mod tests {
         }
     }
 
+    /// Simulated output device for `play_keyed`: a bounded 8,192-sample
+    /// ring (like `CpalSink`'s) drained at the sample rate as the injected
+    /// clock advances, with a fixed presentation latency, recording every
+    /// PTT/sleep/stop event with its simulated time.
     #[cfg(feature = "cpal-backend")]
-    #[test]
-    fn test_ptt_timings_uses_configured_lead_and_tail() {
-        // 48000 samples at 48kHz = exactly 1s of audio.
-        let (lead, tail) = ptt_timings(48_000, 48_000, 1_000, 3_000);
-        assert_eq!(lead, std::time::Duration::from_millis(1_000));
-        assert_eq!(tail, std::time::Duration::from_millis(1_000 + 3_000));
+    mod sim {
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        pub struct Device {
+            pub buffer: VecDeque<f32>,
+            pub capacity: usize,
+            pub captured: Vec<f32>,
+            pub now: Instant,
+            pub start: Instant,
+            pub deadline: Instant,
+            pub latency: Duration,
+            /// Device callbacks are delayed (consume nothing) until then.
+            pub paused_until: Instant,
+            pub write_limits: Vec<Option<usize>>,
+            pub writes: usize,
+            pub fail_write_after: Option<usize>,
+            pub fail_progress: bool,
+            pub fail_stop: bool,
+            pub events: Vec<(Duration, String)>,
+            fractional: f64,
+        }
+
+        impl Device {
+            pub fn new(latency: Duration) -> Arc<Mutex<Device>> {
+                let now = Instant::now();
+                Arc::new(Mutex::new(Device {
+                    buffer: VecDeque::new(),
+                    capacity: 8192,
+                    captured: Vec::new(),
+                    now,
+                    start: now,
+                    deadline: now,
+                    latency,
+                    paused_until: now,
+                    write_limits: vec![None],
+                    writes: 0,
+                    fail_write_after: None,
+                    fail_progress: false,
+                    fail_stop: false,
+                    events: Vec::new(),
+                    fractional: 0.0,
+                }))
+            }
+
+            pub fn log(&mut self, what: impl Into<String>) {
+                let at = self.now - self.start;
+                self.events.push((at, what.into()));
+            }
+
+            fn advance(&mut self, by: Duration) {
+                self.now += by;
+                if self.now <= self.paused_until {
+                    return;
+                }
+                self.fractional += by.as_secs_f64() * 48_000.0;
+                let n = (self.fractional as usize).min(self.buffer.len());
+                self.fractional -= self.fractional.floor();
+                if n > 0 {
+                    self.captured.extend(self.buffer.drain(..n));
+                    self.deadline = self.now + self.latency;
+                }
+            }
+        }
+
+        pub struct Sink(pub Arc<Mutex<Device>>);
+
+        impl coppa_audio::AudioSink for Sink {
+            fn write(&mut self, samples: &[f32]) -> anyhow::Result<usize> {
+                let mut d = self.0.lock().unwrap();
+                if d.fail_write_after.is_some_and(|n| d.writes >= n) {
+                    anyhow::bail!("simulated device write failure");
+                }
+                let limit = d.write_limits[d.writes % d.write_limits.len()];
+                d.writes += 1;
+                let room = d.capacity - d.buffer.len();
+                let take = samples.len().min(room).min(limit.unwrap_or(usize::MAX));
+                d.buffer.extend(samples[..take].iter().copied());
+                Ok(take)
+            }
+            fn sample_rate(&self) -> u32 {
+                48_000
+            }
+            fn start(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn stop(&mut self) -> anyhow::Result<()> {
+                let mut d = self.0.lock().unwrap();
+                d.log("stop");
+                if d.fail_stop {
+                    anyhow::bail!("simulated stop failure");
+                }
+                Ok(())
+            }
+        }
+
+        pub fn progress(sink: &Sink) -> anyhow::Result<coppa_audio::PlaybackProgress> {
+            let d = sink.0.lock().unwrap();
+            if d.fail_progress {
+                anyhow::bail!("simulated progress failure");
+            }
+            Ok(coppa_audio::PlaybackProgress {
+                consumed_samples: d.captured.len() as u64,
+                remaining: d.deadline.saturating_duration_since(d.now),
+            })
+        }
+
+        pub struct Clock(pub Arc<Mutex<Device>>);
+
+        impl super::super::PlaybackClock for Clock {
+            fn now(&self) -> Instant {
+                self.0.lock().unwrap().now
+            }
+            fn sleep(&mut self, duration: Duration) {
+                let mut d = self.0.lock().unwrap();
+                if duration >= Duration::from_millis(20) {
+                    d.log(format!("sleep {}ms", duration.as_millis()));
+                }
+                d.advance(duration);
+            }
+        }
+
+        pub struct Ptt(pub Arc<Mutex<Device>>);
+
+        impl coppa_radio::PttControl for Ptt {
+            fn set_ptt(&mut self, state: coppa_radio::PttState) -> anyhow::Result<()> {
+                let mut d = self.0.lock().unwrap();
+                let what = match state {
+                    coppa_radio::PttState::Tx => "ptt TX",
+                    coppa_radio::PttState::Rx => "ptt RX",
+                };
+                d.log(what);
+                Ok(())
+            }
+            fn get_ptt(&mut self) -> anyhow::Result<coppa_radio::PttState> {
+                Ok(coppa_radio::PttState::Rx)
+            }
+        }
     }
 
     #[cfg(feature = "cpal-backend")]
+    fn run_play_keyed(
+        device: &std::sync::Arc<std::sync::Mutex<sim::Device>>,
+        samples: &[f32],
+        lead_ms: u64,
+        tail_ms: u64,
+    ) -> Result<u64> {
+        let mut sink = sim::Sink(device.clone());
+        let mut ptt = sim::Ptt(device.clone());
+        let mut clock = sim::Clock(device.clone());
+        play_keyed(
+            &mut sink,
+            sim::progress,
+            &mut ptt,
+            samples,
+            std::time::Duration::from_millis(lead_ms),
+            std::time::Duration::from_millis(tail_ms),
+            &mut clock,
+        )
+    }
+
+    #[cfg(feature = "cpal-backend")]
+    fn event_names(device: &std::sync::Arc<std::sync::Mutex<sim::Device>>) -> Vec<String> {
+        let d = device.lock().unwrap();
+        d.events.iter().map(|(_, e)| e.clone()).collect()
+    }
+
+    #[cfg(feature = "cpal-backend")]
+    fn event_time(
+        device: &std::sync::Arc<std::sync::Mutex<sim::Device>>,
+        name: &str,
+    ) -> std::time::Duration {
+        let d = device.lock().unwrap();
+        d.events
+            .iter()
+            .find(|(_, e)| e == name)
+            .map(|(t, _)| *t)
+            .unwrap()
+    }
+
+    /// COP-22 AC1 (CLI): a real 65,520-sample encoded frame fed into a
+    /// short-writing sink with zero-write intervals arrives whole and in
+    /// order, and the delivered count is the full frame.
+    #[cfg(feature = "cpal-backend")]
     #[test]
-    fn test_ptt_timings_default_matches_old_hardcoded_values() {
-        // Guards against silently changing the pre-flag defaults (50ms
-        // lead-in, duration + 200ms tail) this function replaced.
-        let (lead, tail) = ptt_timings(24_000, 48_000, 50, 200);
-        assert_eq!(lead, std::time::Duration::from_millis(50));
-        assert_eq!(tail, std::time::Duration::from_millis(500 + 200));
+    fn play_keyed_delivers_full_frame_through_short_writes() {
+        let frame = CoppaCore::new().encode_bytes(b"COP-22").unwrap();
+        assert_eq!(frame.len(), 65_520);
+        let device = sim::Device::new(std::time::Duration::from_millis(30));
+        device.lock().unwrap().write_limits = vec![Some(700), Some(0), Some(0), None, Some(1)];
+        let delivered = run_play_keyed(&device, &frame, 50, 200).unwrap();
+        assert_eq!(delivered, 65_520);
+        assert_eq!(device.lock().unwrap().captured, frame);
+    }
+
+    /// Order is key, lead, paced writes, final presentation, tail, unkey,
+    /// stop -- and with device callbacks delayed by a second, unkey still
+    /// waits for real playback instead of nominal-duration arithmetic.
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn play_keyed_unkeys_after_final_presentation_and_tail() {
+        let samples: Vec<f32> = (0..48_000).map(|i| (i as f32).sin()).collect();
+        let device = sim::Device::new(std::time::Duration::from_millis(40));
+        {
+            let mut d = device.lock().unwrap();
+            // Callbacks stay silent for one second after the 1 s lead.
+            d.paused_until = d.now + std::time::Duration::from_secs(2);
+        }
+        run_play_keyed(&device, &samples, 1_000, 3_000).unwrap();
+        let names = event_names(&device);
+        assert_eq!(names.first().map(String::as_str), Some("ptt TX"));
+        assert_eq!(names[1], "sleep 1000ms", "lead follows key");
+        assert_eq!(
+            &names[names.len() - 3..],
+            ["sleep 3000ms", "ptt RX", "stop"]
+        );
+        // 1 s lead + 1 s delayed callbacks + 1 s of audio + 40 ms latency +
+        // 3 s tail. Nominal arithmetic (lead + duration + tail) would unkey
+        // at 5 s, before the audio had finished playing.
+        let unkey = event_time(&device, "ptt RX");
+        assert!(
+            unkey >= std::time::Duration::from_millis(6_040),
+            "unkeyed at {unkey:?}"
+        );
+        assert!(
+            unkey < std::time::Duration::from_millis(6_100),
+            "unkeyed at {unkey:?}"
+        );
+        assert_eq!(device.lock().unwrap().captured, samples);
+    }
+
+    /// TX and tune share the live path: a tune longer than the sink ring,
+    /// custom lead/tail, an empty input, and a final fractional-millisecond
+    /// sample period all deliver exactly.
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn play_keyed_handles_tune_empty_and_fractional_lengths() {
+        let tune = CoppaCore::new().tune_tone(0.5, None);
+        assert!(tune.len() > 8192);
+        let device = sim::Device::new(std::time::Duration::from_millis(5));
+        assert_eq!(
+            run_play_keyed(&device, &tune, 20, 30).unwrap(),
+            tune.len() as u64
+        );
+        assert_eq!(device.lock().unwrap().captured, tune);
+
+        let device = sim::Device::new(std::time::Duration::ZERO);
+        assert_eq!(run_play_keyed(&device, &[], 50, 200).unwrap(), 0);
+        assert_eq!(
+            event_names(&device),
+            ["ptt TX", "sleep 50ms", "sleep 200ms", "ptt RX", "stop"]
+        );
+
+        // 7 samples = 145.8 us: the final partial sample period still counts.
+        let device = sim::Device::new(std::time::Duration::ZERO);
+        assert_eq!(run_play_keyed(&device, &[0.5; 7], 0, 0).unwrap(), 7);
+        assert_eq!(device.lock().unwrap().captured, vec![0.5; 7]);
+    }
+
+    /// Write failure, progress failure and a five-second stall each unkey
+    /// and stop before returning an error (so no success line is printed),
+    /// and a failing stop does not skip the unkey.
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn play_keyed_failures_still_clean_up() {
+        let samples = vec![0.25f32; 30_000];
+
+        let device = sim::Device::new(std::time::Duration::ZERO);
+        device.lock().unwrap().fail_write_after = Some(3);
+        assert!(run_play_keyed(&device, &samples, 0, 200).is_err());
+        assert_eq!(event_names(&device), ["ptt TX", "ptt RX", "stop"]);
+
+        let device = sim::Device::new(std::time::Duration::ZERO);
+        device.lock().unwrap().fail_progress = true;
+        assert!(run_play_keyed(&device, &samples, 0, 200).is_err());
+        assert_eq!(event_names(&device), ["ptt TX", "ptt RX", "stop"]);
+
+        let device = sim::Device::new(std::time::Duration::ZERO);
+        {
+            let mut d = device.lock().unwrap();
+            d.paused_until = d.now + std::time::Duration::from_secs(3600);
+        }
+        let err = run_play_keyed(&device, &samples, 0, 200).unwrap_err();
+        assert!(err.to_string().contains("no progress"), "{err}");
+        assert_eq!(event_names(&device), ["ptt TX", "ptt RX", "stop"]);
+        assert!(event_time(&device, "ptt RX") >= PLAYBACK_STALL_TIMEOUT);
+
+        let device = sim::Device::new(std::time::Duration::ZERO);
+        {
+            let mut d = device.lock().unwrap();
+            d.fail_write_after = Some(0);
+            d.fail_stop = true;
+        }
+        assert!(run_play_keyed(&device, &samples, 0, 0).is_err());
+        assert_eq!(event_names(&device), ["ptt TX", "ptt RX", "stop"]);
     }
 
     /// "CLI flags reach the engine": `--rigctld` must actually be the address
