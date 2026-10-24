@@ -5,7 +5,7 @@
 use anyhow::Result;
 use coppa_audio::{AudioRingConsumer, AudioRingProducer};
 use coppa_engine::CoppaCore;
-use coppa_host::vara::VaraResponse;
+use coppa_host::vara::{VaraCommand, VaraResponse};
 use coppa_host::HostEvent;
 use coppa_ml::CpRecommendation;
 use coppa_ml::{BusyGate, CpGate, RateLoop};
@@ -23,11 +23,95 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 
+use crate::audio_output::{
+    wait_for_discard, wait_for_playout, IntervalProgress, OutputFeedback, PlayoutWatch, StallClock,
+    TxOutput, PROGRESS_TICK,
+};
 use crate::config::DaemonConfig;
 
 /// Map of connected VARA command-port clients' response senders
 /// (`VaraServer::response_senders()`), used to broadcast `VaraResponse` telemetry.
 type VaraResponseSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<VaraResponse>>>>;
+
+/// How often every command-port client hears `IAMALIVE`. VARA sends it every
+/// 60 s; Pat closes the modem after 2 minutes without a line, and vARIM after
+/// 300 s.
+const VARA_KEEPALIVE_PERIOD: Duration = Duration::from_secs(60);
+
+/// The reply a VARA command-port client gets for one command, decided before
+/// the command takes effect. `WRONG` is only for lines coppa does not
+/// recognise or cannot apply: Pat's dial waits only for
+/// `CONNECTED`/`DISCONNECTED`, so `WRONG` to a well-formed `CONNECT` would
+/// hang it, and Pat's `Version()` waits only for `VERSION`/`WRONG`.
+///
+/// The reply rule, one row per command the parser can produce:
+///
+/// - `MYCALL <call>` valid → `OK` (the daemon applies it as the runtime
+///   callsign); invalid or missing → `WRONG`.
+/// - `LISTEN ON`/`LISTEN OFF` → `OK`; any other argument → `WRONG`.
+/// - `TUNE [seconds]` (coppa extension) → `OK`.
+/// - `CONNECT <src> <dst>` → `OK` (then the eventual `CONNECTED`/`DISCONNECTED`
+///   outcome); fewer than two callsigns → `WRONG`.
+/// - `DISCONNECT` → `OK` (then `DISCONNECTED` if a session existed).
+/// - `VERSION` → a `VERSION Coppa <pkg version>` line, never `OK`.
+/// - `COMPRESSION …`, `BW500`, `BW2300`, `BW2750`, `ABORT` → `OK`: accepted,
+///   not implemented (matches VARA's own replies to commands Pat sends every
+///   session).
+/// - anything else (`PUBLIC`, `CWID`, `CHAT`, `WINLINK SESSION`,
+///   `P2P SESSION`, `CLEANTXBUFFER`, `FOOBAR`, WebSocket JSON, …) → `WRONG`.
+fn vara_reply(command: &VaraCommand) -> VaraResponse {
+    match command {
+        VaraCommand::Version => VaraResponse::coppa_version(),
+        VaraCommand::MyCall(call) if Callsign::new(call).is_ok() => VaraResponse::Ok,
+        VaraCommand::MyCall(_) | VaraCommand::Unknown(_) => VaraResponse::Wrong,
+        // COMPRESSION, BW* and ABORT are accepted but not implemented.
+        VaraCommand::Listen(_)
+        | VaraCommand::Tune(_)
+        | VaraCommand::Connect { .. }
+        | VaraCommand::Disconnect
+        | VaraCommand::Compression(_)
+        | VaraCommand::Bandwidth(_)
+        | VaraCommand::Abort => VaraResponse::Ok,
+    }
+}
+
+/// Send `response` to every client in `senders`, dropping it for any whose
+/// queue is full.
+async fn broadcast_vara(senders: &VaraResponseSenders, response: VaraResponse) {
+    for tx in senders.lock().await.values() {
+        let _ = tx.try_send(response.clone());
+    }
+}
+
+/// Send `IAMALIVE` to every command-port client each `period`, the first one
+/// `period` from now. It is a task of its own because the event loop can wait
+/// for a long time (the busy-channel holdoff in `wait_for_clear_channel` has
+/// no upper bound), and a client must keep hearing from the daemon meanwhile.
+fn spawn_vara_keepalive(
+    senders: VaraResponseSenders,
+    period: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            broadcast_vara(&senders, VaraResponse::IAmAlive).await;
+        }
+    })
+}
+
+/// A session-state change broadcast to attached hosts by `notify_session`.
+enum SessionNotice {
+    /// Handshake complete. VARA names the calling station first.
+    Connected {
+        local: Callsign,
+        remote: Callsign,
+        we_called: bool,
+    },
+    /// A session ended or a connect attempt failed.
+    Disconnected,
+}
 
 /// Event types flowing through the daemon event loop.
 #[derive(Debug)]
@@ -41,8 +125,22 @@ pub enum DaemonEvent {
     AudioOut(Vec<f32>),
     /// PTT state change.
     PttChange(bool),
+    /// Automatic end of the keyed transmission tagged `generation`:
+    /// `completed` is true once its last sample is predicted to have played
+    /// and the PTT tail has elapsed, false when it was cancelled (output
+    /// failure, no playback progress, or `max_tx_duration_s`). Feedback for
+    /// any generation but the newest is stale and ignored.
+    TxComplete { generation: u64, completed: bool },
     /// Shutdown signal received.
     Shutdown,
+}
+
+/// Lock the shared TX output, recovering from poisoning (its state is
+/// always consistent between calls; nothing panics while holding it).
+fn lock_tx_output(tx_output: &std::sync::Mutex<TxOutput>) -> std::sync::MutexGuard<'_, TxOutput> {
+    tx_output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The main daemon event loop.
@@ -52,16 +150,32 @@ pub struct EventLoop {
     event_rx: mpsc::Receiver<DaemonEvent>,
     event_tx: mpsc::Sender<DaemonEvent>,
     running: bool,
-    /// Optional audio output ring buffer producer for writing TX samples.
-    audio_out: Option<AudioRingProducer>,
+    /// The audio-out ring and the TX samples retained ahead of it until it
+    /// has room, shared with the feeder task `run` spawns so a frame larger
+    /// than the ring is delivered whole instead of truncated.
+    tx_output: Arc<std::sync::Mutex<TxOutput>>,
     /// Optional audio input ring buffer consumer for reading RX samples.
     audio_in: Option<AudioRingConsumer>,
     /// PTT controller (defaults to NullPtt if unconfigured).
     ptt: Box<dyn PttControl>,
     /// Optional sender for host responses (decoded data, status updates).
     response_tx: Option<mpsc::Sender<coppa_host::HostResponse>>,
-    /// Counter for audio output ring buffer overflow (dropped samples).
-    audio_out_overflow_count: u64,
+    /// Playback progress from the audio output worker. `None` when no
+    /// hardware output is wired (tests, headless builds), in which case PTT
+    /// release falls back to the nominal audio duration.
+    output_feedback: Option<Arc<OutputFeedback>>,
+    /// Generation of the newest keyed transmission; only its completion may
+    /// release PTT automatically.
+    tx_generation: u64,
+    /// When automatic TX keyed the radio for the current continuous keyed
+    /// interval. `max_tx_duration_s` is measured from here rather than from
+    /// each job's start, so transmissions queued behind an active one cannot
+    /// push the forced unkey back. Cleared whenever PTT is released.
+    tx_keyed_since: Option<tokio::time::Instant>,
+    /// Playback-progress record for the current continuous keyed interval,
+    /// shared by every transmission queued in it so the no-progress bound is
+    /// not restarted by each newer job. Cleared whenever PTT is released.
+    tx_stall_clock: Option<Arc<StallClock>>,
     /// Last-seen value of the audio input ring's overflow counter (see
     /// `AudioRingConsumer::overflow_count`); `poll_audio_input` compares against
     /// this each poll and logs a warning when it grows (silent RX sample loss was
@@ -138,7 +252,8 @@ pub struct EventLoop {
     ws_broadcast: Option<tokio::sync::broadcast::Sender<String>>,
     /// Optional shared live-status snapshot for the WebSocket `status` reply
     /// (decision 8: "WebSocket `status` reply carries real values"). Updated
-    /// alongside VARA telemetry whenever a frame decodes.
+    /// alongside VARA telemetry whenever a frame decodes and at every session
+    /// transition (`notify_session`).
     #[cfg(feature = "websocket")]
     ws_status: Option<Arc<Mutex<coppa_host::websocket::WsStatus>>>,
     /// Optional map of connected VARA command-port clients' response senders, for
@@ -157,8 +272,13 @@ pub struct EventLoop {
     busy_gate: BusyGate,
     /// Session manager for connected-mode operation.
     session_mgr: SessionManager,
-    /// Local station callsign (parsed from config).
+    /// Local station callsign: `[engine] callsign` at startup, replaced by a
+    /// valid command-port `MYCALL`. New sessions, station ID and beacons read
+    /// it. A session keeps the callsign it was set up with.
     local_callsign: Option<Callsign>,
+    /// How often `run()` sends `IAMALIVE` to every command-port client;
+    /// `VARA_KEEPALIVE_PERIOD` outside tests.
+    vara_keepalive_period: Duration,
     /// Whether we are listening for incoming connections.
     listening: bool,
     /// Whether the link is currently mid-transmission (PTT asserted). Gates
@@ -317,11 +437,14 @@ impl EventLoop {
             event_rx,
             event_tx,
             running: false,
-            audio_out: None,
+            tx_output: Arc::new(std::sync::Mutex::new(TxOutput::default())),
             audio_in: None,
             ptt,
             response_tx: None,
-            audio_out_overflow_count: 0,
+            output_feedback: None,
+            tx_generation: 0,
+            tx_keyed_since: None,
+            tx_stall_clock: None,
             audio_in_overflow_count: 0,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             arq_tx,
@@ -346,6 +469,7 @@ impl EventLoop {
             busy_gate,
             session_mgr: SessionManager::new(),
             local_callsign,
+            vara_keepalive_period: VARA_KEEPALIVE_PERIOD,
             listening: false,
             is_transmitting: false,
             tx_frame_count: 0,
@@ -451,8 +575,16 @@ impl EventLoop {
     }
 
     /// Set the audio output ring buffer for TX sample playback.
+    /// Wire playback progress from the audio output worker, so automatic PTT
+    /// release follows samples actually played.
+    #[cfg_attr(not(feature = "cpal-backend"), allow(dead_code))] // used by coppad's CPAL output wiring
+    pub fn set_output_feedback(&mut self, feedback: Arc<OutputFeedback>) {
+        self.output_feedback = Some(feedback);
+    }
+
+    #[cfg_attr(not(feature = "cpal-backend"), allow(dead_code))] // coppad wires it only with CPAL output
     pub fn set_audio_out(&mut self, producer: AudioRingProducer) {
-        self.audio_out = Some(producer);
+        self.tx_output().set_producer(producer);
     }
 
     /// Set the audio input ring buffer for RX sample capture.
@@ -522,10 +654,117 @@ impl EventLoop {
     /// — telemetry is best-effort and must never block or fail the caller.
     async fn emit_vara(&self, response: VaraResponse) {
         if let Some(ref senders) = self.vara_responses {
-            let senders = senders.lock().await;
-            for tx in senders.values() {
-                let _ = tx.try_send(response.clone());
+            broadcast_vara(senders, response).await;
+        }
+    }
+
+    /// Send `response` to the command-port client that sent the command it
+    /// answers. Telemetry and session state go to every client (`emit_vara`,
+    /// `notify_session`); a reply does not. WebSocket IDs start at
+    /// `coppa_host::websocket::FIRST_CLIENT_ID`, so a reply to a
+    /// WebSocket-originated event finds no sender here and is dropped.
+    ///
+    /// Uses `try_send`, never `send().await`: a client that stops reading must
+    /// not stall the modem's event loop (same choice as `notify_session`).
+    async fn reply_vara(&self, client_id: u32, response: VaraResponse) {
+        let Some(ref senders) = self.vara_responses else {
+            return;
+        };
+        let senders = senders.lock().await;
+        let Some(tx) = senders.get(&client_id) else {
+            return;
+        };
+        if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(response.clone()) {
+            tracing::warn!(
+                client_id,
+                line = response.format().trim_end(),
+                "VARA command-port queue full; reply dropped"
+            );
+        }
+    }
+
+    #[cfg(feature = "websocket")]
+    fn established_remote(&self) -> Option<Callsign> {
+        self.session_mgr.active_sessions().iter().find_map(|&id| {
+            self.session_mgr
+                .get(id)
+                .filter(|session| session.is_established())
+                .map(|session| session.remote.clone())
+        })
+    }
+
+    /// Call after `session_mgr` reflects the change. Broadcasts to all hosts:
+    /// session state is link-wide; every attached host wants it.
+    async fn notify_session(&self, client_id: u32, notice: SessionNotice) {
+        let (status, vara) = match &notice {
+            SessionNotice::Connected {
+                local,
+                remote,
+                we_called,
+            } => {
+                let (source, destination) = if *we_called {
+                    (local, remote)
+                } else {
+                    (remote, local)
+                };
+                (
+                    format!("CONNECTED {}", remote),
+                    VaraResponse::Connected(
+                        source.to_string(),
+                        destination.to_string(),
+                        self.engine.occupied_bandwidth_hz(),
+                    ),
+                )
             }
+            SessionNotice::Disconnected => ("DISCONNECTED".to_string(), VaraResponse::Disconnected),
+        };
+        if let Some(ref tx) = self.response_tx {
+            let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate { client_id, status });
+        }
+        // A dropped state line leaves the host waiting out its own connect or
+        // disconnect timer, so log it. Closed channels belong to departed clients.
+        if let Some(ref senders) = self.vara_responses {
+            for (id, tx) in senders.lock().await.iter() {
+                if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(vara.clone()) {
+                    tracing::warn!(
+                        client_id = id,
+                        line = vara.format().trim_end(),
+                        "VARA command-port queue full; session-state line dropped"
+                    );
+                }
+            }
+        }
+        #[cfg(feature = "websocket")]
+        {
+            let remote = self.established_remote();
+            if let Some(ref status) = self.ws_status {
+                let mut snap = status.lock().await;
+                snap.connected = remote.is_some();
+                snap.remote_call = remote.map(|cs| cs.to_string());
+            }
+            if let Some(ref ws_tx) = self.ws_broadcast {
+                let msg = match notice {
+                    SessionNotice::Connected { remote, .. } => {
+                        coppa_host::websocket::WsServerMessage::Connected {
+                            remote_call: remote.to_string(),
+                        }
+                    }
+                    SessionNotice::Disconnected => {
+                        coppa_host::websocket::WsServerMessage::Disconnected
+                    }
+                };
+                if let Ok(json) = serde_json::to_string(&msg) {
+                    let _ = ws_tx.send(json); // An error means no client is subscribed.
+                }
+            }
+        }
+    }
+
+    async fn reap_timed_out_sessions(&mut self) {
+        let removed = self.session_mgr.cleanup_timed_out();
+        for id in removed {
+            tracing::warn!(session_id = id, "Session timed out");
+            self.notify_session(0, SessionNotice::Disconnected).await;
         }
     }
 
@@ -648,6 +887,30 @@ impl EventLoop {
         // Beacon-mode check interval (Phase 4 Task 3): cheap no-op tick when
         // beacon mode is disabled (the default); see `maybe_send_beacon`.
         let mut beacon_poll = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        // TX feeder: moves retained TX samples into the audio-out ring as it
+        // drains, every PROGRESS_TICK, independently of whatever this loop is
+        // awaiting (busy-channel holdoff, decode), so audio already playing
+        // is never starved mid-frame.
+        let feeder = {
+            let tx_output = self.tx_output.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(PROGRESS_TICK);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    lock_tx_output(&tx_output).flush();
+                }
+            })
+        };
+        // VARA command-port keepalive: `IAMALIVE` to every client every
+        // `vara_keepalive_period`, from a task of its own so a stalled event
+        // loop (see `wait_for_clear_channel`) cannot block it.
+        // `set_vara_responses` is always called before `run()` (main.rs,
+        // tests), so a wired daemon always gets the keepalive.
+        let keepalive = self
+            .vara_responses
+            .clone()
+            .map(|senders| spawn_vara_keepalive(senders, self.vara_keepalive_period));
 
         while self.running {
             tokio::select! {
@@ -671,6 +934,9 @@ impl EventLoop {
                         Some(DaemonEvent::PttChange(tx)) => {
                             self.handle_ptt_change(tx).await;
                         }
+                        Some(DaemonEvent::TxComplete { generation, completed }) => {
+                            self.handle_tx_complete(generation, completed).await;
+                        }
                     }
                 }
                 _ = audio_poll.tick() => {
@@ -684,16 +950,7 @@ impl EventLoop {
                     self.maybe_send_beacon().await;
                 }
                 _ = session_cleanup.tick() => {
-                    let removed = self.session_mgr.cleanup_timed_out();
-                    for id in removed {
-                        tracing::warn!(session_id = id, "Session timed out");
-                        if let Some(ref tx) = self.response_tx {
-                            let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
-                                client_id: 0,
-                                status: "DISCONNECTED".to_string(),
-                            });
-                        }
-                    }
+                    self.reap_timed_out_sessions().await;
                     // Send keepalives for active sessions
                     let active = self.session_mgr.active_sessions();
                     for id in active {
@@ -713,6 +970,10 @@ impl EventLoop {
             }
         }
 
+        feeder.abort();
+        if let Some(keepalive) = keepalive {
+            keepalive.abort();
+        }
         Ok(())
     }
 
@@ -815,34 +1076,37 @@ impl EventLoop {
             HostEvent::DataReceived { client_id, data } => {
                 tracing::debug!(client_id, bytes = data.len(), "Data received from client");
 
-                // If there's an established session, wrap data in a MAC PDU
+                // If there's an established session, wrap data in a MAC PDU.
+                // The frame's source is the SESSION's own local callsign (not
+                // `self.local_callsign`, which a mid-session `MYCALL` can
+                // change): the peer looks the session up by `pdu.src`, so a
+                // runtime callsign change must not make it silently drop
+                // every later data frame.
                 let session_info = self.session_mgr.active_sessions().iter().find_map(|&id| {
                     self.session_mgr
                         .get(id)
                         .filter(|s| s.is_established())
-                        .map(|s| (s.remote.clone(), s.ssid))
+                        .map(|s| (s.remote.clone(), s.local.clone(), s.ssid))
                 });
 
-                if let Some((remote, ssid)) = session_info {
-                    if let Some(ref local) = self.local_callsign {
-                        let mac_pdu = MacPdu::new_data(remote, local.clone(), ssid, data.clone());
-                        let pdu_bytes = mac_pdu.to_bytes();
-                        match self.engine.encode_bytes(&pdu_bytes) {
-                            Ok(samples) => {
-                                self.transmit_samples(&samples).await;
-                                self.tx_frame_count += 1;
-                                tracing::debug!(
-                                    frame = self.tx_frame_count,
-                                    max = self.max_frames_per_turn,
-                                    "Session data frame transmitted"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(client_id, error = %e, "Failed to encode session data")
-                            }
+                if let Some((remote, local, ssid)) = session_info {
+                    let mac_pdu = MacPdu::new_data(remote, local, ssid, data.clone());
+                    let pdu_bytes = mac_pdu.to_bytes();
+                    match self.engine.encode_bytes(&pdu_bytes) {
+                        Ok(samples) => {
+                            self.transmit_samples(&samples).await;
+                            self.tx_frame_count += 1;
+                            tracing::debug!(
+                                frame = self.tx_frame_count,
+                                max = self.max_frames_per_turn,
+                                "Session data frame transmitted"
+                            );
                         }
-                        return;
+                        Err(e) => {
+                            tracing::warn!(client_id, error = %e, "Failed to encode session data")
+                        }
                     }
+                    return;
                 }
 
                 // Fall through: no session — use raw/ARQ encode path
@@ -881,29 +1145,49 @@ impl EventLoop {
             }
             HostEvent::VaraCommand { client_id, command } => {
                 tracing::debug!(client_id, command = %command, "VARA command received");
-                let cmd = command.trim().to_uppercase();
-                if cmd == "LISTEN ON" {
-                    self.listening = true;
-                    tracing::info!("Listening for incoming connections");
-                } else if cmd == "LISTEN OFF" {
-                    self.listening = false;
-                    tracing::info!("Stopped listening for incoming connections");
-                } else if cmd == "TUNE" || cmd.starts_with("TUNE ") {
-                    // Task 1 (Phase 4): TX level calibration. `TUNE` (or `TUNE
-                    // <seconds>`) generates the standard SSB two-tone
-                    // calibration signal and sends it through the same
-                    // PTT-key/stream/PTT-unkey path real frames use
-                    // (`transmit_samples`), so an operator can set their
-                    // radio's audio drive level via ALC exactly as they would
-                    // for real traffic.
-                    let seconds = cmd
-                        .strip_prefix("TUNE ")
-                        .and_then(|s| s.trim().parse::<f32>().ok())
-                        .filter(|s| *s > 0.0)
-                        .unwrap_or(10.0);
-                    tracing::info!(seconds, "TUNE: transmitting TX-level calibration tone");
-                    let samples = self.engine.tune_tone(seconds, None);
-                    self.transmit_samples(&samples).await;
+                let command = VaraCommand::parse(&command);
+                // Reply first: it answers the command itself, so it reaches
+                // the client before anything the command causes (TUNE's PTT
+                // lines).
+                self.reply_vara(client_id, vara_reply(&command)).await;
+                match command {
+                    VaraCommand::Listen(on) => {
+                        self.listening = on;
+                        if on {
+                            tracing::info!("Listening for incoming connections");
+                        } else {
+                            tracing::info!("Stopped listening for incoming connections");
+                        }
+                    }
+                    VaraCommand::Tune(seconds) => {
+                        // Task 1 (Phase 4): TX level calibration. `TUNE` (or
+                        // `TUNE <seconds>`) generates the standard SSB
+                        // two-tone calibration signal and sends it through
+                        // the same PTT-key/stream/PTT-unkey path real frames
+                        // use (`transmit_samples`), so an operator can set
+                        // their radio's audio drive level via ALC exactly as
+                        // they would for real traffic.
+                        let seconds = seconds.unwrap_or(10.0);
+                        tracing::info!(seconds, "TUNE: transmitting TX-level calibration tone");
+                        let samples = self.engine.tune_tone(seconds, None);
+                        self.transmit_samples(&samples).await;
+                    }
+                    VaraCommand::MyCall(call) => match Callsign::new(&call) {
+                        Ok(callsign) => {
+                            tracing::info!(callsign = %callsign, "Local callsign set by MYCALL");
+                            self.local_callsign = Some(callsign);
+                        }
+                        // Already answered WRONG by `vara_reply`; keep the
+                        // callsign in force.
+                        Err(e) => {
+                            tracing::warn!(callsign = %call, error = %e, "MYCALL rejected")
+                        }
+                    },
+                    // VERSION is answered by the reply itself. COMPRESSION,
+                    // BW* and ABORT are accepted but not implemented.
+                    // CONNECT/DISCONNECT arrive as
+                    // ConnectRequest/DisconnectRequest.
+                    _ => {}
                 }
             }
             HostEvent::ConnectRequest {
@@ -912,17 +1196,17 @@ impl EventLoop {
                 destination,
             } => {
                 tracing::info!(client_id, destination = %destination, "Connect request");
+                // Reply first (never WRONG: Pat's dial waits only on
+                // CONNECTED/DISCONNECTED), before every early-return
+                // DISCONNECTED and before the CONNECT_REQ goes on air.
+                self.reply_vara(client_id, VaraResponse::Ok).await;
 
                 let local = match self.local_callsign {
                     Some(ref cs) => cs.clone(),
                     None => {
                         tracing::warn!("Connect request but no local callsign configured");
-                        if let Some(ref tx) = self.response_tx {
-                            let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
-                                client_id,
-                                status: "DISCONNECTED".to_string(),
-                            });
-                        }
+                        self.notify_session(client_id, SessionNotice::Disconnected)
+                            .await;
                         return;
                     }
                 };
@@ -931,12 +1215,8 @@ impl EventLoop {
                     Ok(cs) => cs,
                     Err(e) => {
                         tracing::warn!(error = %e, "Invalid destination callsign");
-                        if let Some(ref tx) = self.response_tx {
-                            let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
-                                client_id,
-                                status: "DISCONNECTED".to_string(),
-                            });
-                        }
+                        self.notify_session(client_id, SessionNotice::Disconnected)
+                            .await;
                         return;
                     }
                 };
@@ -965,23 +1245,22 @@ impl EventLoop {
                                 Err(e) => {
                                     tracing::warn!(error = %e, "Failed to initiate session");
                                     self.session_mgr.remove(id);
+                                    self.notify_session(client_id, SessionNotice::Disconnected)
+                                        .await;
                                 }
                             }
                         }
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "Failed to create session");
-                        if let Some(ref tx) = self.response_tx {
-                            let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
-                                client_id,
-                                status: "DISCONNECTED".to_string(),
-                            });
-                        }
+                        self.notify_session(client_id, SessionNotice::Disconnected)
+                            .await;
                     }
                 }
             }
             HostEvent::DisconnectRequest { client_id } => {
                 tracing::info!(client_id, "Disconnect request");
+                self.reply_vara(client_id, VaraResponse::Ok).await;
 
                 // Find first active established session
                 let session_id = self
@@ -1014,12 +1293,8 @@ impl EventLoop {
                         }
                     }
                     self.session_mgr.remove(id);
-                    if let Some(ref tx) = self.response_tx {
-                        let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
-                            client_id,
-                            status: "DISCONNECTED".to_string(),
-                        });
-                    }
+                    self.notify_session(client_id, SessionNotice::Disconnected)
+                        .await;
                 } else {
                     tracing::debug!("Disconnect request but no active session");
                 }
@@ -1228,18 +1503,14 @@ impl EventLoop {
                     // silent -- a monitoring client would misread a dead link as
                     // live). Recomputed from `session_mgr`'s real established-session
                     // state instead, at the same point the rest of the snapshot
-                    // updates. Still only refreshed on a decode event (this whole
-                    // snapshot has no independent tick), so a session that drops
-                    // WITHOUT any further decode won't flip this back to false until
-                    // the next decoded frame -- an accepted, smaller residual gap,
-                    // not the same "stays true forever, unconditionally" bug.
+                    // updates. `notify_session` also refreshes connected/remote_call
+                    // at every transition, without waiting for another decode.
                     #[cfg(feature = "websocket")]
                     if let Some(ref status) = self.ws_status {
-                        let established = self.session_mgr.active_sessions().iter().any(|&id| {
-                            self.session_mgr.get(id).is_some_and(|s| s.is_established())
-                        });
+                        let remote = self.established_remote();
                         let mut snap = status.lock().await;
-                        snap.connected = established;
+                        snap.connected = remote.is_some();
+                        snap.remote_call = remote.map(|cs| cs.to_string());
                         snap.snr = Some(snr_db.round() as i32);
                         snap.level = Some(speed_level);
                         snap.cfo = Some(cfo_hz);
@@ -1466,42 +1737,108 @@ impl EventLoop {
         }
     }
 
-    /// Low-level write of raw samples to the audio-out ring. Does NOT assert
-    /// PTT, does NOT apply busy-channel-courtesy deferral, and does NOT
-    /// trigger the station-ID timer -- callers that are actually keying a
-    /// transmitter must go through `transmit_samples` (the real PTT
+    /// Low-level, lossless queueing of raw samples for the audio-out ring.
+    /// Does NOT assert PTT, does NOT apply busy-channel-courtesy deferral,
+    /// and does NOT trigger the station-ID timer -- callers that are actually
+    /// keying a transmitter must go through `transmit_samples` (the real PTT
     /// chokepoint) instead, which itself calls this as its last step. The
     /// only other direct caller today is the `DaemonEvent::AudioOut` arm in
     /// `run()`, a raw pass-through hook (unused by any in-tree production TX
     /// path as of this writing; exercised only by this file's own tests) --
     /// a future real caller of that event should route through
     /// `transmit_samples` instead if it represents an actual transmission.
-    fn handle_audio_out(&mut self, samples: &[f32]) {
+    ///
+    /// Samples the ring has no room for are retained in `tx_output`
+    /// (in order, behind anything already pending) and moved on later TX
+    /// ticks; nothing is dropped. Raw samples share that FIFO and its
+    /// cumulative count, so they cannot corrupt a keyed job's playback target.
+    ///
+    /// Returns false when the samples could not be queued because no live
+    /// output ring is wired.
+    fn handle_audio_out(&mut self, samples: &[f32]) -> bool {
         if samples.is_empty() {
-            return;
+            return true;
         }
-        match self.audio_out {
-            Some(ref mut producer) => {
-                let written = producer.write(samples);
-                if written < samples.len() {
-                    // E1: Track cumulative overflow with a counter
-                    let dropped = samples.len() - written;
-                    self.audio_out_overflow_count += dropped as u64;
-                    tracing::warn!(
-                        dropped,
-                        total = samples.len(),
-                        cumulative_dropped = self.audio_out_overflow_count,
-                        "Audio output buffer overflow"
-                    );
-                }
-            }
-            None => {
-                tracing::debug!(samples = samples.len(), "Audio out: no output device wired");
-            }
+        if self.tx_output().submit(samples).is_none() {
+            tracing::debug!(samples = samples.len(), "Audio out: no output device wired");
+            return false;
         }
+        true
     }
 
-    /// Transmit encoded audio samples: assert PTT, write to ring buffer, schedule PTT release.
+    /// The shared TX output state (see `tx_output`).
+    fn tx_output(&self) -> std::sync::MutexGuard<'_, TxOutput> {
+        lock_tx_output(&self.tx_output)
+    }
+
+    /// Move retained TX samples into the audio-out ring as far as it has
+    /// room (the feeder task's step, also used by tests that drive delivery
+    /// without `run`).
+    #[cfg(test)]
+    fn flush_pending_audio_out(&self) {
+        self.tx_output().flush();
+    }
+
+    /// Handle the automatic end of a keyed transmission (see
+    /// `DaemonEvent::TxComplete`). Stale generations are ignored so an
+    /// earlier job's completion can never unkey a later one. A cancelled job
+    /// discards its still-pending samples -- including the tail already
+    /// buffered in the final sink -- so they cannot play after PTT is
+    /// released, and the next queued transmission keys only once that
+    /// discard has taken effect, so the stale tail cannot open its frame.
+    async fn handle_tx_complete(&mut self, generation: u64, completed: bool) {
+        if generation != self.tx_generation {
+            tracing::debug!(
+                generation,
+                current = self.tx_generation,
+                "Ignoring stale TX completion"
+            );
+            return;
+        }
+        if !completed {
+            let (discarded, submitted) = {
+                let mut tx_output = self.tx_output();
+                (tx_output.cancel(), tx_output.submitted())
+            };
+            tracing::error!(
+                generation,
+                discarded,
+                "Transmission cancelled before it finished playing; releasing PTT"
+            );
+            if let Some(feedback) = self.output_feedback.clone() {
+                // Also drop what the output worker and the final sink have
+                // not yet played, so none of it plays after PTT is released.
+                feedback.discard_through(submitted);
+                self.set_ptt(false).await;
+                // Hold the next transmission until the cancelled audio is
+                // gone; otherwise draining the TX queue rekeys at once and
+                // the sink's buffered tail plays at the start of that frame.
+                if !wait_for_discard(&feedback, submitted).await {
+                    tracing::warn!(
+                        generation,
+                        "Cancelled TX audio not yet dropped by the output; \
+                         new audio stays held behind the drop"
+                    );
+                }
+                self.try_drain_tx_queue().await;
+                return;
+            }
+        }
+        self.handle_ptt_change(false).await;
+    }
+
+    /// Transmit encoded audio samples: assert PTT, queue every sample for the
+    /// audio-out ring, and release PTT once the last one has played.
+    ///
+    /// Returning from this function does NOT mean the audio has played: the
+    /// samples are retained and paced into the bounded rings by `run`'s TX
+    /// tick, and a spawned task waits for the output worker to report that
+    /// the last sample's predicted presentation time has passed (then the PTT
+    /// tail), or cancels the transmission on output failure, five seconds
+    /// without playback progress, or `max_tx_duration_s`. Both bounds, and
+    /// the PTT tail, are measured across the continuous keyed interval rather
+    /// than per job, so transmissions queued behind an active one can neither
+    /// restart them nor stretch the keyed time past `max_tx_duration_s`.
     ///
     /// This is the single chokepoint every TX path in this event loop funnels
     /// through (host-driven encode, ARQ-adjacent session control frames
@@ -1548,34 +1885,105 @@ impl EventLoop {
 
         // Assert PTT before transmitting
         self.handle_ptt_change(true).await;
+        let keyed_since = *self
+            .tx_keyed_since
+            .get_or_insert_with(tokio::time::Instant::now);
+        let played_now = self.output_feedback.as_ref().map_or(0, |f| f.played());
+        let stall_clock = self
+            .tx_stall_clock
+            .get_or_insert_with(|| Arc::new(StallClock::new(played_now, keyed_since)))
+            .clone();
         // Enforce PTT pre-delay before writing audio
         let pre_delay_ms = self.config.radio.ptt_pre_delay_ms;
         if pre_delay_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(pre_delay_ms)).await;
         }
-        self.handle_audio_out(samples);
-        // Schedule delayed PTT release based on audio duration + ring buffer drain time
-        let sample_count = samples.len();
-        let sample_rate = self.config.audio.sample_rate;
-        let audio_duration_ms = (sample_count as u64 * 1000) / sample_rate as u64;
-        let drain_ms =
-            (self.config.audio.buffer_size as u64 * 1000) / self.config.audio.sample_rate as u64;
-        let tail_delay_ms = self.config.radio.ptt_tail_delay_ms;
-        let total_delay_ms = audio_duration_ms + drain_ms + tail_delay_ms;
-        let max_tx_ms = self.config.radio.max_tx_duration_s * 1000;
-        let capped_delay_ms = total_delay_ms.min(max_tx_ms);
-        if total_delay_ms > max_tx_ms {
-            tracing::warn!(
-                tx_duration_ms = total_delay_ms,
-                max_tx_ms,
-                "TX duration exceeds max; capping PTT release delay"
-            );
-        }
-        let total_delay = std::time::Duration::from_millis(capped_delay_ms);
+        let prior_target = self.tx_output().submitted();
+        let queued = self.handle_audio_out(samples);
+        // Release PTT once this transmission's last sample has played (not
+        // after its nominal duration): every sample stays queued until the
+        // rings accept it, so the cumulative submitted count is this job's
+        // playback target. Completion arrives as a generation-tagged
+        // `TxComplete`, so only the newest keyed transmission can unkey.
+        self.tx_generation += 1;
+        let generation = self.tx_generation;
+        let target = self.tx_output().submitted();
+        let tail = std::time::Duration::from_millis(self.config.radio.ptt_tail_delay_ms);
+        // What is left of `max_tx_duration_s` for the continuous keyed
+        // interval this job joins. A job queued behind an active one gets
+        // only the remainder, so its watchdog fires no later than the active
+        // job's would have.
+        let deadline =
+            keyed_since + std::time::Duration::from_secs(self.config.radio.max_tx_duration_s);
+        let max_tx = deadline.saturating_duration_since(tokio::time::Instant::now());
+        // Whenever an output worker is wired, completion comes only from its
+        // feedback -- even if its end of the ring is gone, so a failed or
+        // dead output cancels the transmission instead of reporting success.
+        let feedback = self.output_feedback.clone();
+        // Headless fallback (no output worker reporting progress): the
+        // nominal audio duration plus the ring drain time, as before.
+        let sample_rate = self.config.audio.sample_rate.max(1) as u64;
+        let nominal = std::time::Duration::from_millis(
+            (samples.len() as u64 * 1000) / sample_rate
+                + (self.config.audio.buffer_size as u64 * 1000) / sample_rate,
+        );
         let ptt_event_tx = self.event_tx.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(total_delay).await;
-            if let Err(e) = ptt_event_tx.send(DaemonEvent::PttChange(false)).await {
+            let completed = match feedback {
+                // An output worker is wired but its ring is gone: nothing
+                // can play, so cancel at once rather than report success.
+                Some(_) if !queued => {
+                    tracing::error!(generation, "TX audio could not be queued; output is down");
+                    false
+                }
+                Some(feedback) => {
+                    let watch = PlayoutWatch::new(target, Instant::now(), Some(max_tx));
+                    let interval = IntervalProgress {
+                        clock: &stall_clock,
+                        prior_target,
+                    };
+                    match wait_for_playout(&feedback, watch, Some(interval)).await {
+                        Ok(()) => true,
+                        Err(why) => {
+                            tracing::error!(generation, reason = %why, "TX playback did not complete");
+                            false
+                        }
+                    }
+                }
+                None => {
+                    let capped = nominal.min(max_tx);
+                    if nominal > max_tx {
+                        tracing::warn!(
+                            tx_duration_ms = nominal.as_millis() as u64,
+                            remaining_max_tx_ms = max_tx.as_millis() as u64,
+                            "TX duration exceeds what is left of max TX; capping PTT release delay"
+                        );
+                    }
+                    tokio::time::sleep(capped).await;
+                    true
+                }
+            };
+            if completed {
+                // The tail counts against the keyed interval's
+                // `max_tx_duration_s` bound too: a transmission that finished
+                // playing near the deadline must not stay keyed past it.
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if tail > remaining {
+                    tracing::warn!(
+                        tail_ms = tail.as_millis() as u64,
+                        remaining_max_tx_ms = remaining.as_millis() as u64,
+                        "PTT tail exceeds what is left of max TX; capping it"
+                    );
+                }
+                tokio::time::sleep(tail.min(remaining)).await;
+            }
+            if let Err(e) = ptt_event_tx
+                .send(DaemonEvent::TxComplete {
+                    generation,
+                    completed,
+                })
+                .await
+            {
                 tracing::warn!(error = %e, "Failed to deassert PTT after TX");
             }
         });
@@ -1764,8 +2172,11 @@ impl EventLoop {
     ///
     /// Each retransmitted PDU is routed through `transmit_samples` (the PTT
     /// chokepoint) one at a time, matching `try_drain_tx_queue`'s existing
-    /// one-frame-at-a-time pattern: `transmit_samples` schedules its own PTT
-    /// release asynchronously per call, so sending retransmit N+1 only after
+    /// one-frame-at-a-time pattern: `transmit_samples` tracks its own
+    /// playback completion asynchronously per call (a generation-tagged
+    /// `TxComplete`, so only the newest call can release PTT), and every
+    /// call's samples join one FIFO behind the previous call's, so sending
+    /// retransmit N+1 only after
     /// awaiting retransmit N's `transmit_samples` call keeps each one's PTT
     /// assert/busy-wait/station-ID-prepend logic correctly scoped to that one
     /// frame, rather than batching multiple PDUs under a single PTT key-up.
@@ -2532,8 +2943,8 @@ impl EventLoop {
         match pdu.frame_type {
             MacFrameType::ConnectReq => self.handle_incoming_connect(pdu).await,
             MacFrameType::ConnectAck => self.handle_connect_ack_rx(pdu).await,
-            MacFrameType::ConnectCfm => self.handle_connect_cfm_rx(pdu),
-            MacFrameType::Disconnect => self.handle_incoming_disconnect(pdu),
+            MacFrameType::ConnectCfm => self.handle_connect_cfm_rx(pdu).await,
+            MacFrameType::Disconnect => self.handle_incoming_disconnect(pdu).await,
             MacFrameType::Data => self.handle_session_data(pdu),
             MacFrameType::Keepalive => self.handle_keepalive_rx(pdu),
             MacFrameType::Beacon => self.handle_beacon_rx(pdu),
@@ -2618,16 +3029,18 @@ impl EventLoop {
         if let Some(session) = self.session_mgr.find_by_remote_mut(&remote) {
             match session.handle_connect_ack(&pdu.payload) {
                 Ok(cfm_pdu) => {
+                    let notice = SessionNotice::Connected {
+                        local: session.local.clone(),
+                        remote,
+                        we_called: true,
+                    };
+                    // The session is established now; the busy-channel courtesy
+                    // wait in transmit_samples can delay the CFM by seconds.
+                    self.notify_session(0, notice).await;
                     let cfm_bytes = cfm_pdu.to_bytes();
                     match self.engine.encode_bytes(&cfm_bytes) {
                         Ok(samples) => self.transmit_samples(&samples).await,
                         Err(e) => tracing::warn!(error = %e, "Failed to encode CONNECT_CFM"),
-                    }
-                    if let Some(ref tx) = self.response_tx {
-                        let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
-                            client_id: 0,
-                            status: format!("CONNECTED {}", remote),
-                        });
                     }
                 }
                 Err(e) => {
@@ -2639,19 +3052,19 @@ impl EventLoop {
         }
     }
 
-    fn handle_connect_cfm_rx(&mut self, pdu: MacPdu) {
+    async fn handle_connect_cfm_rx(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
         if let Some(session) = self.session_mgr.find_by_remote_mut(&remote) {
             match session.handle_connect_cfm(&pdu.payload) {
                 Ok(()) => {
                     session.confirm_established();
                     tracing::info!(remote = %remote, "Session fully established (responder)");
-                    if let Some(ref tx) = self.response_tx {
-                        let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
-                            client_id: 0,
-                            status: format!("CONNECTED {}", remote),
-                        });
-                    }
+                    let notice = SessionNotice::Connected {
+                        local: session.local.clone(),
+                        remote,
+                        we_called: false,
+                    };
+                    self.notify_session(0, notice).await;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to handle CONNECT_CFM");
@@ -2662,7 +3075,7 @@ impl EventLoop {
         }
     }
 
-    fn handle_incoming_disconnect(&mut self, pdu: MacPdu) {
+    async fn handle_incoming_disconnect(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
         // Find session ID first to avoid borrow issues
         let session_id = self.session_mgr.find_by_remote(&remote).map(|s| s.id);
@@ -2672,12 +3085,7 @@ impl EventLoop {
             }
             self.session_mgr.remove(id);
             tracing::info!(remote = %remote, "Session disconnected by remote");
-            if let Some(ref tx) = self.response_tx {
-                let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
-                    client_id: 0,
-                    status: "DISCONNECTED".to_string(),
-                });
-            }
+            self.notify_session(0, SessionNotice::Disconnected).await;
         } else {
             tracing::debug!(remote = %remote, "DISCONNECT from unknown remote");
         }
@@ -2714,6 +3122,16 @@ impl EventLoop {
     }
 
     async fn handle_ptt_change(&mut self, tx: bool) {
+        self.set_ptt(tx).await;
+        if !tx {
+            // PTT just released: continue draining the TX queue if more is queued.
+            self.try_drain_tx_queue().await;
+        }
+    }
+
+    /// Change physical PTT and the keyed-interval bookkeeping, without
+    /// draining the TX queue on release (see `handle_ptt_change`).
+    async fn set_ptt(&mut self, tx: bool) {
         let state = if tx { PttState::Tx } else { PttState::Rx };
         if let Err(e) = self.ptt.set_ptt(state) {
             tracing::warn!(error = %e, "PTT control error");
@@ -2726,8 +3144,8 @@ impl EventLoop {
             self.is_transmitting = true;
         } else {
             self.is_transmitting = false;
-            // PTT just released: continue draining the TX queue if more is queued.
-            self.try_drain_tx_queue().await;
+            self.tx_keyed_since = None;
+            self.tx_stall_clock = None;
         }
     }
 
@@ -4156,6 +4574,218 @@ mod tests {
     // the untested direction is a production path -- and the one that runs
     // exactly when the channel is degrading and legs get lost.
 
+    #[tokio::test]
+    async fn real_handshake_pushes_connected_to_both_stations() {
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = "VK3ABC".into();
+        config.radio.ptt_pre_delay_ms = 0;
+        config.radio.ptt_tail_delay_ms = 0;
+        let mut a = EventLoop::new(config.clone()).unwrap();
+        config.engine.callsign = "W1AW".into();
+        let mut b = EventLoop::new(config).unwrap();
+        a.listening = true;
+        b.listening = true;
+        let (a_producer, mut a_consumer) = coppa_audio::audio_ring(1_000_000);
+        let (b_producer, mut b_consumer) = coppa_audio::audio_ring(1_000_000);
+        a.set_audio_out(a_producer);
+        b.set_audio_out(b_producer);
+        let (a_tx, mut a_rx) = mpsc::channel(64);
+        let (b_tx, mut b_rx) = mpsc::channel(64);
+        a.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, a_tx)]))));
+        b.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, b_tx)]))));
+        fn session_lines(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<VaraResponse> {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|response| {
+                    matches!(
+                        response,
+                        VaraResponse::Connected(..)
+                            | VaraResponse::Disconnected
+                            | VaraResponse::Pending
+                    )
+                })
+                .collect()
+        }
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "VK3ABC".into(),
+            destination: "W1AW".into(),
+        })
+        .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_REQ"))
+            .await;
+        assert!(
+            session_lines(&mut b_rx).is_empty(),
+            "REQ is not established"
+        );
+        a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "CONNECT_ACK"))
+            .await;
+        assert_eq!(
+            session_lines(&mut a_rx),
+            [VaraResponse::Connected(
+                "VK3ABC".into(),
+                "W1AW".into(),
+                2400
+            )]
+        );
+        assert!(
+            session_lines(&mut b_rx).is_empty(),
+            "responder waits for CFM"
+        );
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_CFM"))
+            .await;
+        assert_eq!(
+            session_lines(&mut b_rx),
+            [VaraResponse::Connected(
+                "VK3ABC".into(),
+                "W1AW".into(),
+                2400
+            )]
+        );
+        assert!(session_lines(&mut a_rx).is_empty());
+    }
+
+    /// COP-28: a `MYCALL` on each station replaces the configured callsign
+    /// before the session starts, and both stations' `CONNECTED` lines name
+    /// the MYCALL callsigns (caller first). This covers both of Pat's
+    /// `handleConnected` arms — the initiator's `src == myCall` and the
+    /// responder's `dst == myCall` — which are what keep Pat from panicking
+    /// with `unhandled CONNECTED cmd`.
+    #[tokio::test]
+    async fn mycall_names_both_stations_in_connected() {
+        fn session_lines(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<VaraResponse> {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|response| {
+                    matches!(
+                        response,
+                        VaraResponse::Connected(..)
+                            | VaraResponse::Disconnected
+                            | VaraResponse::Pending
+                    )
+                })
+                .collect()
+        }
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = "VK3ABC".into();
+        config.radio.ptt_pre_delay_ms = 0;
+        config.radio.ptt_tail_delay_ms = 0;
+        let mut a = EventLoop::new(config.clone()).unwrap();
+        config.engine.callsign = "W1AW".into();
+        let mut b = EventLoop::new(config).unwrap();
+        a.listening = true;
+        b.listening = true;
+        let (a_producer, mut a_consumer) = coppa_audio::audio_ring(1_000_000);
+        let (b_producer, mut b_consumer) = coppa_audio::audio_ring(1_000_000);
+        a.set_audio_out(a_producer);
+        b.set_audio_out(b_producer);
+        let (a_tx, mut a_rx) = mpsc::channel(64);
+        let (b_tx, mut b_rx) = mpsc::channel(64);
+        a.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, a_tx)]))));
+        b.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, b_tx)]))));
+
+        a.handle_host_event(HostEvent::VaraCommand {
+            client_id: 1,
+            command: "MYCALL W5AU".into(),
+        })
+        .await;
+        b.handle_host_event(HostEvent::VaraCommand {
+            client_id: 1,
+            command: "MYCALL K7XYZ".into(),
+        })
+        .await;
+        assert_eq!(a.local_callsign, Some(Callsign::new("W5AU").unwrap()));
+        assert_eq!(b.local_callsign, Some(Callsign::new("K7XYZ").unwrap()));
+
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "W5AU".into(),
+            destination: "K7XYZ".into(),
+        })
+        .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_REQ"))
+            .await;
+        a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "CONNECT_ACK"))
+            .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_CFM"))
+            .await;
+
+        let expected = [VaraResponse::Connected("W5AU".into(), "K7XYZ".into(), 2400)];
+        assert_eq!(session_lines(&mut a_rx), expected);
+        assert_eq!(session_lines(&mut b_rx), expected);
+    }
+
+    /// COP-28: a `MYCALL` that arrives mid-session must not break the
+    /// session. In-session data frames carry the session's OWN local
+    /// callsign, not the current `local_callsign`, so the peer's lookup by
+    /// `pdu.src` still finds the session and delivers the data.
+    #[tokio::test]
+    async fn mycall_mid_session_keeps_the_session_callsign() {
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = "VK3ABC".into();
+        config.radio.ptt_pre_delay_ms = 0;
+        config.radio.ptt_tail_delay_ms = 0;
+        let mut a = EventLoop::new(config.clone()).unwrap();
+        config.engine.callsign = "W1AW".into();
+        let mut b = EventLoop::new(config).unwrap();
+        a.listening = true;
+        b.listening = true;
+        let (a_producer, mut a_consumer) = coppa_audio::audio_ring(1_000_000);
+        let (b_producer, mut b_consumer) = coppa_audio::audio_ring(1_000_000);
+        a.set_audio_out(a_producer);
+        b.set_audio_out(b_producer);
+
+        // Establish the session as the configured callsigns.
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "VK3ABC".into(),
+            destination: "W1AW".into(),
+        })
+        .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_REQ"))
+            .await;
+        a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "CONNECT_ACK"))
+            .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_CFM"))
+            .await;
+        assert!(a.session_mgr.active_sessions().iter().any(|&id| {
+            a.session_mgr
+                .get(id)
+                .map(|s| s.is_established())
+                .unwrap_or(false)
+        }));
+
+        // Only now wire b's response channel, so the handshake's
+        // StatusUpdate lines are dropped and the next delivery is the data
+        // frame's DataOut.
+        let (data_tx, mut data_rx) = mpsc::channel(64);
+        b.set_response_tx(data_tx);
+
+        // Mid-session MYCALL on the sender, then a data frame.
+        a.handle_host_event(HostEvent::VaraCommand {
+            client_id: 1,
+            command: "MYCALL W5AU".into(),
+        })
+        .await;
+        assert_eq!(a.local_callsign, Some(Callsign::new("W5AU").unwrap()));
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"hello".to_vec(),
+        })
+        .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "data frame"))
+            .await;
+
+        let got = tokio::time::timeout(Duration::from_secs(2), data_rx.recv())
+            .await
+            .expect("b must deliver the data frame's payload")
+            .expect("response channel closed");
+        match got {
+            coppa_host::HostResponse::DataOut { client_id: _, data } => {
+                assert_eq!(data, b"hello");
+            }
+            other => panic!("expected DataOut, got {:?}", other),
+        }
+    }
+
     /// Two real stations with real audio rings and CP negotiation enabled,
     /// with `cp_gate` left OFF: these tests drive proposals explicitly, so the
     /// gate must not inject transitions of its own.
@@ -4985,8 +5615,8 @@ mod tests {
 
         // MANDATORY, not hygiene. `negotiate` made `b` transmit, so
         // `is_transmitting` is still true: PTT release arrives only as a
-        // `DaemonEvent::PttChange(false)` from a spawned timer through the
-        // event channel, which a unit test never drains. Without this line
+        // `DaemonEvent::TxComplete` from the spawned playback-completion task
+        // through the event channel, which a unit test never drains. Without this line
         // `try_drain_tx_queue` early-returns, no probe is taken,
         // `set_speed_level` is never called, and this test would pass
         // IDENTICALLY before and after the fix -- proving nothing. Poking this
@@ -5602,6 +6232,478 @@ mod tests {
         assert_eq!(buf[0], 1.0);
     }
 
+    /// Shared fixture for COP-22's TX delivery tests: an event loop wired to
+    /// a production-size (8,192) audio-out ring, the production output
+    /// worker, and a simulated 8,192-sample device ring.
+    struct TxRig {
+        event_loop: EventLoop,
+        outer: AudioRingConsumer,
+        worker: crate::audio_output::OutputWorker,
+        sink: crate::audio_output::test_support::SimSink,
+        feedback: Arc<OutputFeedback>,
+    }
+
+    impl TxRig {
+        fn new(mut config: DaemonConfig) -> Self {
+            config.radio.ptt_pre_delay_ms = 0;
+            config.radio.ptt_tail_delay_ms = 0;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (producer, outer) = coppa_audio::audio_ring(8192);
+            event_loop.set_audio_out(producer);
+            let feedback = Arc::new(OutputFeedback::default());
+            event_loop.set_output_feedback(feedback.clone());
+            Self {
+                event_loop,
+                outer,
+                worker: crate::audio_output::OutputWorker::new(1024, 48_000, feedback.clone()),
+                sink: crate::audio_output::test_support::SimSink::new(8192),
+                feedback,
+            }
+        }
+
+        /// One delivery round: the `run` TX tick, worker forwarding, and a
+        /// simulated device callback of `callback` samples.
+        fn pump(&mut self, callback: usize) {
+            self.event_loop.flush_pending_audio_out();
+            for _ in 0..4 {
+                self.worker
+                    .step(
+                        &mut self.outer,
+                        &mut self.sink,
+                        crate::audio_output::test_support::sim_progress,
+                    )
+                    .unwrap();
+            }
+            self.sink.callback(callback);
+        }
+
+        fn deliver(&mut self, total: usize, callbacks: &[usize]) {
+            let mut i = 0;
+            while self.sink.captured.len() < total {
+                self.pump(callbacks[i % callbacks.len()]);
+                i += 1;
+                assert!(i < 1_000_000, "TX delivery did not converge");
+            }
+            // The worker publishes progress on its next step, as the
+            // production worker loop does continuously.
+            self.pump(0);
+        }
+
+        async fn next_completion(&mut self) -> (u64, bool) {
+            let event =
+                tokio::time::timeout(Duration::from_secs(10), self.event_loop.event_rx.recv())
+                    .await
+                    .expect("TX completion should arrive")
+                    .expect("event channel open");
+            match event {
+                DaemonEvent::TxComplete {
+                    generation,
+                    completed,
+                } => (generation, completed),
+                other => panic!("expected TxComplete, got {other:?}"),
+            }
+        }
+    }
+
+    /// COP-22 AC1: a real 65,520-sample encoded frame, transmitted through
+    /// an 8,192-sample audio-out ring and an 8,192-sample device ring with
+    /// delayed, uneven consumption, reaches the final sink whole and in
+    /// order; PTT is released only by that transmission's completion.
+    #[tokio::test]
+    async fn full_frame_reaches_sink_through_both_rings() {
+        let mut rig = TxRig::new(DaemonConfig::default());
+        let frame = rig.event_loop.engine.encode_bytes(b"COP-22").unwrap();
+        assert_eq!(frame.len(), 65_520);
+        rig.event_loop.transmit_samples(&frame).await;
+        assert!(rig.event_loop.is_transmitting);
+        assert!(
+            rig.event_loop.tx_output().pending_len() > 0,
+            "the unwritten suffix is retained, not dropped"
+        );
+        rig.deliver(frame.len(), &[480, 0, 4096, 64, 0, 0, 1000]);
+        assert_eq!(rig.sink.captured, frame);
+        assert_eq!(rig.event_loop.tx_output().overflow_count(), 0);
+
+        let (generation, completed) = rig.next_completion().await;
+        assert_eq!((generation, completed), (1, true));
+        rig.event_loop
+            .handle_tx_complete(generation, completed)
+            .await;
+        assert!(!rig.event_loop.is_transmitting);
+    }
+
+    /// PTT stays keyed while presentation is pending after both rings have
+    /// drained, and is released only once playback is predicted complete.
+    #[tokio::test]
+    async fn ptt_held_until_predicted_presentation_ends() {
+        let mut rig = TxRig::new(DaemonConfig::default());
+        let samples: Vec<f32> = (0..20_000).map(|i| i as f32).collect();
+        rig.sink.remaining = Duration::from_secs(3600);
+        rig.event_loop.transmit_samples(&samples).await;
+        rig.deliver(samples.len(), &[2048]);
+        assert_eq!(rig.outer.available(), 0, "both rings drained");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rig.event_loop.event_rx.recv())
+                .await
+                .is_err(),
+            "no completion while the last sample is still ahead of the DAC"
+        );
+        rig.sink.remaining = Duration::ZERO;
+        rig.pump(0);
+        assert_eq!(rig.next_completion().await, (1, true));
+    }
+
+    /// Consecutive transmissions (e.g. a control frame queued behind an
+    /// active one) play in FIFO order, and the earlier job's completion is
+    /// stale: it cannot unkey the newer transmission.
+    #[tokio::test]
+    async fn stale_completion_cannot_unkey_newer_transmission() {
+        let mut rig = TxRig::new(DaemonConfig::default());
+        let a: Vec<f32> = (0..30_000).map(|i| i as f32).collect();
+        let b: Vec<f32> = (0..12_345).map(|i| -(i as f32) - 1.0).collect();
+        rig.event_loop.transmit_samples(&a).await;
+        rig.event_loop.transmit_samples(&b).await;
+        rig.deliver(a.len() + b.len(), &[1000, 333]);
+        let mut expected = a.clone();
+        expected.extend_from_slice(&b);
+        assert_eq!(rig.sink.captured, expected);
+
+        let mut completions = vec![rig.next_completion().await, rig.next_completion().await];
+        completions.sort();
+        assert_eq!(completions, vec![(1, true), (2, true)]);
+        rig.event_loop.handle_tx_complete(1, true).await;
+        assert!(
+            rig.event_loop.is_transmitting,
+            "stale generation must not release PTT"
+        );
+        rig.event_loop.handle_tx_complete(2, true).await;
+        assert!(!rig.event_loop.is_transmitting);
+    }
+
+    /// An output failure cancels the transmission: PTT is released, the
+    /// completion is not a success, and the retained suffix is discarded so
+    /// it cannot play after the radio is unkeyed.
+    #[tokio::test]
+    async fn output_failure_cancels_and_discards_pending() {
+        let mut rig = TxRig::new(DaemonConfig::default());
+        let samples = vec![0.25f32; 50_000];
+        rig.event_loop.transmit_samples(&samples).await;
+        rig.feedback.fail();
+        let (generation, completed) = rig.next_completion().await;
+        assert_eq!((generation, completed), (1, false));
+        rig.event_loop
+            .handle_tx_complete(generation, completed)
+            .await;
+        assert!(!rig.event_loop.is_transmitting);
+        assert_eq!(rig.event_loop.tx_output().pending_len(), 0);
+        rig.event_loop.flush_pending_audio_out();
+        rig.pump(8192);
+        rig.pump(8192);
+        assert!(
+            rig.sink.captured.is_empty(),
+            "nothing had reached the device yet, so nothing may play after the cancel"
+        );
+    }
+
+    /// A tune longer than `max_tx_duration_s` (and larger than both rings)
+    /// is aborted by the watchdog, not reported as a completed TX.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_aborts_overlong_tune() {
+        let mut config = DaemonConfig::default();
+        config.radio.max_tx_duration_s = 1;
+        let mut rig = TxRig::new(config);
+        let tune = vec![0.5f32; 48_000 * 3];
+        rig.event_loop.transmit_samples(&tune).await;
+        // Keep the device consuming slowly so only the watchdog can end it.
+        rig.pump(480);
+        let (generation, completed) = rig.next_completion().await;
+        assert_eq!((generation, completed), (1, false));
+        rig.event_loop
+            .handle_tx_complete(generation, completed)
+            .await;
+        assert!(!rig.event_loop.is_transmitting);
+        assert_eq!(rig.event_loop.tx_output().pending_len(), 0);
+    }
+
+    /// A watchdog-cancelled transmission whose tail is already buffered in
+    /// the final sink's ring must not play that tail at the start of the
+    /// next transmission: the sink is flushed before new audio reaches it.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_tail_in_sink_does_not_open_next_frame() {
+        let mut config = DaemonConfig::default();
+        config.radio.max_tx_duration_s = 1;
+        let mut rig = TxRig::new(config);
+        let stale = vec![0.5f32; 48_000 * 3];
+        rig.event_loop.transmit_samples(&stale).await;
+        // Fill the device ring with the doomed transmission, but let the
+        // device consume none of it before the watchdog fires.
+        for _ in 0..16 {
+            rig.pump(0);
+        }
+        assert!(rig.sink.captured.is_empty());
+        let (generation, completed) = rig.next_completion().await;
+        assert_eq!((generation, completed), (1, false));
+        rig.event_loop
+            .handle_tx_complete(generation, completed)
+            .await;
+        assert!(!rig.event_loop.is_transmitting);
+
+        let next: Vec<f32> = (0..20_000).map(|i| -(i as f32) - 1.0).collect();
+        rig.event_loop.transmit_samples(&next).await;
+        rig.deliver(next.len(), &[480, 1000]);
+        for _ in 0..4 {
+            rig.pump(8192);
+        }
+        assert_eq!(
+            rig.sink.captured, next,
+            "the cancelled transmission's buffered tail played ahead of the next frame"
+        );
+        assert_eq!(rig.next_completion().await, (2, true));
+    }
+
+    /// A transmission queued behind an active one cannot restart the
+    /// watchdog: `max_tx_duration_s` bounds the continuous keyed interval
+    /// from the first key-up, so the newest job is cancelled (and PTT
+    /// released) when that interval runs out, not `max_tx` after it queued.
+    #[tokio::test(start_paused = true)]
+    async fn queued_transmission_cannot_extend_the_watchdog() {
+        let mut config = DaemonConfig::default();
+        config.radio.max_tx_duration_s = 2;
+        let mut rig = TxRig::new(config);
+        let keyed = tokio::time::Instant::now();
+        rig.event_loop
+            .transmit_samples(&[0.5f32; 48_000 * 10])
+            .await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        rig.event_loop.transmit_samples(&[0.5f32; 48_000]).await;
+        loop {
+            let (generation, completed) = rig.next_completion().await;
+            if generation == 2 {
+                assert!(!completed, "the watchdog aborts, it does not complete");
+                break;
+            }
+        }
+        assert!(
+            keyed.elapsed() < Duration::from_millis(2500),
+            "forced unkey after {:?}, past the 2 s keyed-interval bound",
+            keyed.elapsed()
+        );
+        rig.event_loop.handle_tx_complete(2, false).await;
+        assert!(!rig.event_loop.is_transmitting);
+        assert_eq!(rig.event_loop.tx_keyed_since, None);
+    }
+
+    /// No downstream progress for five seconds fails the transmission.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_output_fails_transmission() {
+        let mut rig = TxRig::new(DaemonConfig::default());
+        rig.event_loop.transmit_samples(&[0.1f32; 20_000]).await;
+        let started = tokio::time::Instant::now();
+        assert_eq!(rig.next_completion().await, (1, false));
+        assert!(started.elapsed() >= crate::audio_output::STALL_TIMEOUT);
+    }
+
+    /// A transmission queued behind a stalled one inherits its no-progress
+    /// window: the newest job is failed five seconds after playback last
+    /// advanced, not five seconds after it was queued, so frequent ARQ/control
+    /// transmissions cannot hold a stalled output keyed until the max-TX
+    /// deadline.
+    #[tokio::test(start_paused = true)]
+    async fn stall_window_spans_queued_transmissions() {
+        let mut rig = TxRig::new(DaemonConfig::default());
+        let keyed = tokio::time::Instant::now();
+        rig.event_loop.transmit_samples(&[0.1f32; 20_000]).await;
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            rig.event_loop.transmit_samples(&[0.1f32; 4_800]).await;
+        }
+        loop {
+            let (generation, completed) = rig.next_completion().await;
+            if generation == 4 {
+                assert!(!completed, "a stalled output fails, it does not complete");
+                break;
+            }
+        }
+        let stall = crate::audio_output::STALL_TIMEOUT;
+        assert!(
+            keyed.elapsed() >= stall && keyed.elapsed() < stall + Duration::from_millis(100),
+            "stall failure after {:?}, not ~{stall:?} after playback last advanced",
+            keyed.elapsed()
+        );
+    }
+
+    /// A job queued while nothing is outstanding (here: during the previous
+    /// job's PTT tail) starts a fresh no-progress window rather than being
+    /// failed for the idle time before it.
+    #[tokio::test(start_paused = true)]
+    async fn idle_gap_does_not_count_as_a_stall() {
+        let mut rig = TxRig::new(DaemonConfig::default());
+        rig.event_loop.config.radio.ptt_tail_delay_ms = 8_000;
+        let first = vec![0.2f32; 4_800];
+        rig.event_loop.transmit_samples(&first).await;
+        rig.deliver(first.len(), &[4096]);
+        // Job 1 has played; it is now in its 8 s tail with nothing pending.
+        tokio::time::sleep(Duration::from_millis(6_000)).await;
+        let second = vec![0.3f32; 4_800];
+        rig.event_loop.transmit_samples(&second).await;
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        rig.deliver(first.len() + second.len(), &[4096]);
+        loop {
+            let (generation, completed) = rig.next_completion().await;
+            if generation == 2 {
+                assert!(completed, "idle time before a job is not a stall");
+                break;
+            }
+        }
+    }
+
+    /// The PTT tail is capped at the keyed interval's `max_tx_duration_s`
+    /// deadline: a transmission that finishes playing near the limit unkeys
+    /// at the limit, not up to `ptt_tail_delay_ms` past it.
+    #[tokio::test(start_paused = true)]
+    async fn ptt_tail_is_capped_at_the_max_tx_deadline() {
+        let mut config = DaemonConfig::default();
+        config.radio.max_tx_duration_s = 2;
+        let mut rig = TxRig::new(config);
+        rig.event_loop.config.radio.ptt_tail_delay_ms = 5_000;
+        let keyed = tokio::time::Instant::now();
+        let samples = vec![0.4f32; 9_600];
+        rig.event_loop.transmit_samples(&samples).await;
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        rig.deliver(samples.len(), &[4096]);
+        assert_eq!(rig.next_completion().await, (1, true));
+        let deadline = Duration::from_secs(2);
+        assert!(
+            keyed.elapsed() >= deadline && keyed.elapsed() < deadline + Duration::from_millis(50),
+            "PTT released after {:?}; the tail must end at the {deadline:?} max-TX deadline",
+            keyed.elapsed()
+        );
+    }
+
+    /// A due station-ID frame is prepended to the payload: both play whole,
+    /// ID first, under one keyed transmission larger than both rings.
+    #[tokio::test]
+    async fn station_id_prefix_and_payload_both_play_whole() {
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = "N0CALL".to_string();
+        config.station_id.id_interval_secs = 600;
+        let mut rig = TxRig::new(config);
+        rig.event_loop.last_id_time = Instant::now() - Duration::from_secs(601);
+        let id_frame = rig
+            .event_loop
+            .encode_id_beacon_frame()
+            .expect("a configured callsign builds an ID frame");
+        let payload = rig.event_loop.engine.encode_bytes(b"payload").unwrap();
+        rig.event_loop.transmit_samples(&payload).await;
+        let mut expected = id_frame;
+        expected.extend_from_slice(&payload);
+        assert!(expected.len() > 2 * 8192);
+        rig.deliver(expected.len(), &[1024, 0, 3000]);
+        assert_eq!(rig.sink.captured, expected);
+        assert_eq!(rig.next_completion().await, (1, true));
+    }
+
+    /// PTT lead elapses before any sample is queued, and the PTT tail is
+    /// measured from the last sample's playback, not from the enqueue.
+    #[tokio::test(start_paused = true)]
+    async fn lead_precedes_audio_and_tail_follows_final_playback() {
+        let mut rig = TxRig::new(DaemonConfig::default());
+        rig.event_loop.config.radio.ptt_pre_delay_ms = 50;
+        rig.event_loop.config.radio.ptt_tail_delay_ms = 200;
+        let samples = vec![0.3f32; 30_000];
+        let started = tokio::time::Instant::now();
+        rig.event_loop.transmit_samples(&samples).await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "lead before audio"
+        );
+        // Hold playback for a while: no completion may arrive meanwhile.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(rig.event_loop.event_rx.try_recv().is_err());
+        rig.deliver(samples.len(), &[4096]);
+        let played_at = tokio::time::Instant::now();
+        assert_eq!(rig.next_completion().await, (1, true));
+        assert!(
+            played_at.elapsed() >= Duration::from_millis(200),
+            "tail after playback"
+        );
+    }
+
+    /// If the output worker's end of the ring disappears, the transmission
+    /// still ends (as a failure) within the stall bound instead of holding
+    /// PTT forever.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_output_consumer_ends_transmission_bounded() {
+        let TxRig {
+            mut event_loop,
+            outer,
+            ..
+        } = TxRig::new(DaemonConfig::default());
+        drop(outer);
+        event_loop.transmit_samples(&[0.2f32; 20_000]).await;
+        let event = tokio::time::timeout(Duration::from_secs(10), event_loop.event_rx.recv())
+            .await
+            .expect("completion within the stall bound")
+            .unwrap();
+        assert!(matches!(
+            event,
+            DaemonEvent::TxComplete {
+                generation: 1,
+                completed: false
+            }
+        ));
+    }
+
+    /// `run`'s feeder task keeps moving retained TX samples into a small
+    /// audio-out ring as a consumer drains it, until the whole transmission
+    /// has been delivered in order.
+    #[tokio::test]
+    async fn run_feeder_delivers_backpressured_audio_whole() {
+        let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        let tx = event_loop.event_sender();
+        let (producer, mut consumer) = coppa_audio::audio_ring(1024);
+        event_loop.set_audio_out(producer);
+        let samples: Vec<f32> = (0..20_000).map(|i| i as f32).collect();
+        let expected = samples.clone();
+        let driver = async move {
+            tx.send(DaemonEvent::AudioOut(samples)).await.unwrap();
+            let mut captured = Vec::new();
+            let mut buf = vec![0.0f32; 700];
+            while captured.len() < expected.len() {
+                let n = consumer.read(&mut buf);
+                captured.extend_from_slice(&buf[..n]);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            tx.send(DaemonEvent::Shutdown).await.unwrap();
+            assert_eq!(captured, expected);
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(event_loop.run(), driver)
+        })
+        .await
+        .expect("feeder must deliver the whole transmission");
+        result.unwrap();
+    }
+
+    /// Shutdown is still handled while TX output is backpressured.
+    #[tokio::test]
+    async fn shutdown_is_serviced_while_tx_backpressured() {
+        let config = DaemonConfig::default();
+        let mut event_loop = EventLoop::new(config).unwrap();
+        let tx = event_loop.event_sender();
+        let (producer, _consumer) = coppa_audio::audio_ring(1024);
+        event_loop.set_audio_out(producer);
+        tx.send(DaemonEvent::AudioOut(vec![0.5; 10_000]))
+            .await
+            .unwrap();
+        tx.send(DaemonEvent::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), event_loop.run())
+            .await
+            .expect("run() must exit on shutdown while output is full")
+            .unwrap();
+        assert_eq!(event_loop.tx_output().pending_len(), 10_000 - 1024);
+    }
+
     #[tokio::test]
     async fn test_audio_in_with_ring_buffer() {
         let config = DaemonConfig::default();
@@ -5810,6 +6912,156 @@ mod tests {
 
         event_loop.run().await.unwrap();
         assert!(!event_loop.listening);
+    }
+
+    // ── COP-28: OK/WRONG/VERSION replies, runtime MYCALL, IAMALIVE ──────────
+
+    /// The reply rule for every command kind the parser can produce, as one
+    /// table driven through the pure `vara_reply` function. See `vara_reply`'s
+    /// rustdoc for the reasoning behind each row.
+    #[test]
+    fn vara_reply_answers_every_command_kind() {
+        let ok = vec![
+            "MYCALL W5AU",
+            "mycall w5au-10",
+            "LISTEN ON",
+            "LISTEN OFF",
+            "TUNE",
+            "TUNE 1",
+            "CONNECT W5AU K7XYZ",
+            "DISCONNECT",
+            "COMPRESSION TEXT",
+            "BW2300",
+            "BW500",
+            "ABORT",
+        ];
+        let wrong = vec![
+            "MYCALL VE3ABCD-15", // 10 chars
+            "MYCALL W5AU!",
+            "MYCALL",
+            "LISTEN",
+            "LISTEN MAYBE",
+            "CONNECT W5AU",
+            "PUBLIC ON",
+            "CWID ON",
+            "WINLINK SESSION",
+            "P2P SESSION",
+            "CLEANTXBUFFER",
+            "FOOBAR",
+            r#"{"type":"mycall","callsign":"W5AU"}"#,
+        ];
+        for line in ok {
+            assert_eq!(
+                vara_reply(&VaraCommand::parse(line)),
+                VaraResponse::Ok,
+                "{line:?} should be answered OK"
+            );
+        }
+        for line in wrong {
+            assert_eq!(
+                vara_reply(&VaraCommand::parse(line)),
+                VaraResponse::Wrong,
+                "{line:?} should be answered WRONG"
+            );
+        }
+        assert_eq!(
+            vara_reply(&VaraCommand::parse("VERSION")),
+            VaraResponse::coppa_version(),
+            "VERSION is answered with the version line, never OK"
+        );
+    }
+
+    /// COP-28: a valid `MYCALL` replaces the configured callsign (upper-cased
+    /// by `Callsign::new`); invalid ones leave it untouched.
+    #[tokio::test]
+    async fn mycall_replaces_the_configured_callsign() {
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = "VK3ABC".into();
+        let mut station = EventLoop::new(config).unwrap();
+
+        station
+            .handle_host_event(HostEvent::VaraCommand {
+                client_id: 1,
+                command: "MYCALL w5au".into(),
+            })
+            .await;
+        assert_eq!(station.local_callsign, Some(Callsign::new("W5AU").unwrap()));
+
+        for rejected in ["MYCALL W5AU!", "MYCALL VE3ABCD-15"] {
+            station
+                .handle_host_event(HostEvent::VaraCommand {
+                    client_id: 1,
+                    command: rejected.into(),
+                })
+                .await;
+        }
+        assert_eq!(
+            station.local_callsign,
+            Some(Callsign::new("W5AU").unwrap()),
+            "an invalid MYCALL must keep the callsign in force"
+        );
+    }
+
+    /// COP-28: a station with no configured callsign gets one from `MYCALL`,
+    /// which arms the station-ID/beacon path that `local_callsign: None`
+    /// silently disables.
+    #[tokio::test]
+    async fn mycall_gives_an_unconfigured_station_a_callsign() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        assert_eq!(station.local_callsign, None);
+        assert!(station.build_beacon_mac_pdu().is_none());
+
+        station
+            .handle_host_event(HostEvent::VaraCommand {
+                client_id: 1,
+                command: "MYCALL W5AU".into(),
+            })
+            .await;
+        assert_eq!(station.local_callsign, Some(Callsign::new("W5AU").unwrap()));
+
+        let pdu = station
+            .build_beacon_mac_pdu()
+            .expect("MYCALL should arm the station-ID/beacon path");
+        assert_eq!(pdu.src.as_str(), "W5AU");
+    }
+
+    /// COP-28: the keepalive sends `IAMALIVE` to every wired client exactly
+    /// once per 60 s period, with the first one a full period after start
+    /// (nothing at t=0).
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_sends_iamalive_every_sixty_seconds() {
+        let (tx1, mut rx1) = mpsc::channel(4);
+        let (tx2, mut rx2) = mpsc::channel(4);
+        let senders: VaraResponseSenders =
+            Arc::new(Mutex::new(HashMap::from([(1, tx1), (2, tx2)])));
+        let task = spawn_vara_keepalive(senders, VARA_KEEPALIVE_PERIOD);
+
+        tokio::time::advance(Duration::from_secs(59)).await;
+        for rx in [&mut rx1, &mut rx2] {
+            let got = tokio::time::timeout(Duration::from_millis(1), rx.recv()).await;
+            assert!(got.is_err(), "nothing may be sent before the first tick");
+        }
+
+        for _ in 0..2 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            for rx in [&mut rx1, &mut rx2] {
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                        .await
+                        .expect("both clients must hear each IAMALIVE")
+                        .expect("channel closed"),
+                    VaraResponse::IAmAlive
+                );
+            }
+        }
+
+        task.abort();
+    }
+
+    #[test]
+    fn event_loop_default_keepalive_period_is_sixty_seconds() {
+        let event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        assert_eq!(event_loop.vara_keepalive_period, Duration::from_secs(60));
     }
 
     // ── Task 5: real wire-level round-trip integration tests ─────────────────
@@ -6299,7 +7551,7 @@ mod tests {
         use super::*;
         use coppa_host::vara::VaraServer;
         use std::time::Duration;
-        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
         use tokio::net::TcpStream;
 
@@ -6361,8 +7613,63 @@ mod tests {
             (reader, write_half)
         }
 
+<<<<<<< HEAD
         /// Read one `\r`-terminated VARA response line, timing out (rather than
         /// hanging forever) if the client never receives one.
+=======
+        /// `connect_mock_vara_client`'s socket/server wiring plus the event
+        /// bridge `main.rs` installs: the server's `HostEvent`s are forwarded
+        /// into the loop's own channel, so commands written on the socket
+        /// reach `handle_host_event` for real and get their reply. Tests that
+        /// drive commands through the socket (rather than injecting
+        /// `DaemonEvent::Host` by hand) need this helper AND a running
+        /// `run()` (in a `LocalSet`), or nothing consumes the forwarded
+        /// events.
+        async fn connect_bridged_vara_client(
+            event_loop: &mut EventLoop,
+            cmd_port: u16,
+            data_port: u16,
+        ) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
+            let mut server = VaraServer::new(cmd_port, data_port);
+            event_loop.set_vara_responses(server.response_senders());
+            let mut events = server.take_event_rx().expect("fresh server");
+            let to_loop = event_loop.event_sender();
+            tokio::spawn(async move {
+                while let Some(event) = events.recv().await {
+                    if to_loop.send(DaemonEvent::Host(event)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                let _ = server.run().await;
+            });
+            // Give the server a moment to bind before connecting.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let stream = TcpStream::connect(("127.0.0.1", cmd_port))
+                .await
+                .expect("mock client should connect to the VARA command port");
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+
+            let mut greeting = String::new();
+            reader
+                .read_line(&mut greeting)
+                .await
+                .expect("should read the initial VERSION greeting");
+            assert!(
+                greeting.starts_with("VERSION"),
+                "expected a VERSION greeting first, got: {}",
+                greeting
+            );
+
+            (reader, write_half)
+        }
+
+        /// Read one `\r\n`-terminated line, timing out (rather than hanging
+        /// forever) if the client never receives one.
+>>>>>>> 61477ee30f698aa9fa7e9cd388e071659359bfdc
         async fn read_line(reader: &mut BufReader<OwnedReadHalf>) -> String {
             let mut line = Vec::new();
             let n =
@@ -6395,6 +7702,450 @@ mod tests {
                 }
             }
             lines
+        }
+
+        fn session_config() -> DaemonConfig {
+            let mut config = fast_ptt_config();
+            config.engine.callsign = "VK3ABC".into();
+            config
+        }
+
+        fn peer() -> coppa_protocol::session::Session {
+            coppa_protocol::session::Session::new(
+                0,
+                Callsign::new("W1AW").unwrap(),
+                Callsign::new("VK3ABC").unwrap(),
+                0,
+                LinkCapabilities::default(),
+            )
+        }
+
+        fn seed_established(event_loop: &mut EventLoop) -> u8 {
+            let id = event_loop
+                .session_mgr
+                .create(
+                    Callsign::new("VK3ABC").unwrap(),
+                    Callsign::new("W1AW").unwrap(),
+                    0,
+                    LinkCapabilities::default(),
+                )
+                .unwrap();
+            let session = event_loop.session_mgr.get_mut(id).unwrap();
+            let req = session.initiate().unwrap();
+            let ack = peer().handle_connect_req(&req.payload).unwrap();
+            session.handle_connect_ack(&ack.payload).unwrap();
+            id
+        }
+
+        fn is_session_line(line: &str) -> bool {
+            ["CONNECTED", "DISCONNECTED", "CONNECTING", "PENDING"]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        }
+
+        async fn next_session_line(reader: &mut BufReader<OwnedReadHalf>) -> String {
+            loop {
+                let line = read_line(reader).await;
+                if is_session_line(&line) {
+                    return line;
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn initiator_hears_connected_then_remote_disconnect() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19440, 19441).await;
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "VK3ABC".into(),
+                    destination: "W1AW".into(),
+                })
+                .await;
+            let mut remote = peer();
+            let ack = remote
+                .handle_connect_req(&LinkCapabilities::default().to_bytes())
+                .unwrap();
+            station.handle_mac_pdu(ack).await;
+            assert_eq!(
+                next_session_line(&mut reader).await.trim_end(),
+                "CONNECTED VK3ABC W1AW 2400"
+            );
+            station.handle_mac_pdu(remote.disconnect().unwrap()).await;
+            assert_eq!(
+                next_session_line(&mut reader).await.trim_end(),
+                "DISCONNECTED"
+            );
+        }
+
+        #[tokio::test]
+        async fn responder_hears_connected_only_after_cfm() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            station.listening = true;
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19442, 19443).await;
+            let mut remote = peer();
+            station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            assert!(read_available_lines(&mut reader)
+                .await
+                .iter()
+                .all(|line| !is_session_line(line)));
+            let cfm = remote
+                .handle_connect_ack(&LinkCapabilities::default().to_bytes())
+                .unwrap();
+            station.handle_mac_pdu(cfm).await;
+            assert_eq!(
+                next_session_line(&mut reader).await.trim_end(),
+                "CONNECTED W1AW VK3ABC 2400"
+            );
+        }
+
+        /// COP-28: the `CONNECTED` bandwidth token follows the live profile
+        /// rather than being a constant — a VHF station reports its wider
+        /// 112-carrier x 50 Hz = 5600 Hz occupancy.
+        #[tokio::test]
+        async fn vhf_station_reports_its_wider_bandwidth() {
+            let mut config = session_config();
+            config.engine.profile = "VHF_FAST".into();
+            let mut station = EventLoop::new(config).unwrap();
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19446, 19447).await;
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "VK3ABC".into(),
+                    destination: "W1AW".into(),
+                })
+                .await;
+            let mut remote = peer();
+            let ack = remote
+                .handle_connect_req(&LinkCapabilities::default().to_bytes())
+                .unwrap();
+            station.handle_mac_pdu(ack).await;
+            assert_eq!(
+                next_session_line(&mut reader).await.trim_end(),
+                "CONNECTED VK3ABC W1AW 5600"
+            );
+        }
+
+        #[tokio::test]
+        async fn local_disconnect_timeout_and_failed_connect_push_disconnected() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19444, 19445).await;
+            seed_established(&mut station);
+            station
+                .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+                .await;
+            assert_eq!(
+                next_session_line(&mut reader).await.trim_end(),
+                "DISCONNECTED"
+            );
+            let id = seed_established(&mut station);
+            station.session_mgr.get_mut(id).unwrap().session_timeout = Duration::ZERO;
+            station.reap_timed_out_sessions().await;
+            assert_eq!(
+                next_session_line(&mut reader).await.trim_end(),
+                "DISCONNECTED"
+            );
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "VK3ABC".into(),
+                    destination: "NOT/A/CALL".into(),
+                })
+                .await;
+            assert_eq!(
+                next_session_line(&mut reader).await.trim_end(),
+                "DISCONNECTED"
+            );
+        }
+
+        /// COP-28: Pat's startup burst — commands the parser does not know
+        /// (`PUBLIC`, `CWID`), commands it accepts-but-ignores
+        /// (`COMPRESSION`, `LISTEN`), `MYCALL`, `VERSION` and garbage — each
+        /// gets exactly one reply, in order, and no reply is doubled.
+        #[tokio::test]
+        async fn pat_startup_commands_each_get_their_reply() {
+            let config = fast_ptt_config();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, mut write_half) =
+                connect_bridged_vara_client(&mut event_loop, 19448, 19449).await;
+
+            let local = tokio::task::LocalSet::new();
+            local.spawn_local(async move {
+                let _ = event_loop.run().await;
+            });
+
+            local
+                .run_until(async move {
+                    write_half
+                        .write_all(
+                            b"PUBLIC ON\rCWID ON\rCOMPRESSION TEXT\rMYCALL W5AU\rLISTEN OFF\r\
+                              VERSION\rFOOBAR\r",
+                        )
+                        .await
+                        .unwrap();
+                    let mut replies = Vec::new();
+                    for _ in 0..7 {
+                        replies.push(read_line(&mut reader).await.trim_end().to_string());
+                    }
+                    let version = VaraResponse::coppa_version().format();
+                    assert_eq!(
+                        replies,
+                        vec![
+                            "WRONG",
+                            "WRONG",
+                            "OK",
+                            "OK",
+                            "OK",
+                            version.trim_end(),
+                            "WRONG",
+                        ],
+                        "each command gets exactly the reply the table promises"
+                    );
+                    assert!(
+                        read_available_lines(&mut reader).await.is_empty(),
+                        "no reply may be doubled"
+                    );
+                })
+                .await;
+        }
+
+        /// COP-28: a well-formed `CONNECT` is answered `OK` before its
+        /// outcome (`DISCONNECTED` on failure, PTT lines once the CONNECT_REQ
+        /// goes on air) — never `WRONG`, which would hang Pat's dial. Also
+        /// covers `DISCONNECT`'s `OK` on this port.
+        #[tokio::test]
+        async fn connect_gets_ok_before_its_outcome() {
+            let config = session_config();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, mut write_half) =
+                connect_bridged_vara_client(&mut event_loop, 19450, 19451).await;
+
+            let local = tokio::task::LocalSet::new();
+            local.spawn_local(async move {
+                let _ = event_loop.run().await;
+            });
+
+            local
+                .run_until(async move {
+                    // DISCONNECT with no session: exactly one line, its OK.
+                    write_half.write_all(b"DISCONNECT\r").await.unwrap();
+                    assert_eq!(read_line(&mut reader).await.trim_end(), "OK");
+                    assert!(
+                        read_available_lines(&mut reader).await.is_empty(),
+                        "a session-less DISCONNECT produces nothing but its OK"
+                    );
+
+                    // A failed CONNECT: OK first, then the DISCONNECTED outcome.
+                    write_half
+                        .write_all(b"CONNECT VK3ABC NOT/A/CALL\r")
+                        .await
+                        .unwrap();
+                    assert_eq!(read_line(&mut reader).await.trim_end(), "OK");
+                    assert_eq!(read_line(&mut reader).await.trim_end(), "DISCONNECTED");
+
+                    // A well-formed CONNECT: OK first, the CONNECT_REQ on air
+                    // (PTT ON among the later lines), and no WRONG anywhere.
+                    write_half
+                        .write_all(b"CONNECT VK3ABC W1AW\r")
+                        .await
+                        .unwrap();
+                    assert_eq!(read_line(&mut reader).await.trim_end(), "OK");
+                    let mut saw_ptt_on = false;
+                    for line in read_available_lines(&mut reader).await {
+                        let line = line.trim_end();
+                        if line == "PTT ON" {
+                            saw_ptt_on = true;
+                        }
+                        assert_ne!(
+                            line, "WRONG",
+                            "a well-formed CONNECT is never answered WRONG"
+                        );
+                    }
+                    assert!(
+                        saw_ptt_on,
+                        "the CONNECT_REQ must go on air after the OK (PTT ON)"
+                    );
+                })
+                .await;
+        }
+
+        /// COP-28: `DISCONNECT` gets its `OK` on the socket, whether or not a
+        /// session existed (the session-existence cases are covered by
+        /// `local_disconnect_timeout_and_failed_connect_push_disconnected`).
+        #[tokio::test]
+        async fn disconnect_gets_ok() {
+            let config = fast_ptt_config();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, mut write_half) =
+                connect_bridged_vara_client(&mut event_loop, 19458, 19459).await;
+
+            let local = tokio::task::LocalSet::new();
+            local.spawn_local(async move {
+                let _ = event_loop.run().await;
+            });
+
+            local
+                .run_until(async move {
+                    write_half.write_all(b"DISCONNECT\r").await.unwrap();
+                    assert_eq!(read_line(&mut reader).await.trim_end(), "OK");
+                    assert!(
+                        read_available_lines(&mut reader).await.is_empty(),
+                        "a session-less DISCONNECT produces nothing but its OK"
+                    );
+                })
+                .await;
+        }
+
+        /// COP-28: a reply goes only to the client that asked, never to every
+        /// attached command-port client.
+        #[tokio::test]
+        async fn replies_go_only_to_the_client_that_asked() {
+            let config = fast_ptt_config();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader_a, mut write_a) =
+                connect_bridged_vara_client(&mut event_loop, 19452, 19453).await;
+
+            // A second raw client on the same server: greeting, then silence.
+            let stream_b = TcpStream::connect(("127.0.0.1", 19452)).await.unwrap();
+            let (read_b, _write_b) = stream_b.into_split();
+            let mut reader_b = BufReader::new(read_b);
+            let mut greeting_b = String::new();
+            reader_b
+                .read_line(&mut greeting_b)
+                .await
+                .expect("client B should also get the greeting");
+
+            let local = tokio::task::LocalSet::new();
+            local.spawn_local(async move {
+                let _ = event_loop.run().await;
+            });
+
+            local
+                .run_until(async move {
+                    write_a.write_all(b"FOOBAR\r").await.unwrap();
+                    assert_eq!(read_line(&mut reader_a).await.trim_end(), "WRONG");
+                    let b_lines = read_available_lines(&mut reader_b).await;
+                    assert!(
+                        b_lines.iter().all(|l| l.trim_end() != "WRONG"),
+                        "client B must not see client A's reply: {:?}",
+                        b_lines
+                    );
+                })
+                .await;
+        }
+
+        /// COP-28: a WebSocket-originated event (whose client ID is from
+        /// `coppa_host::websocket::FIRST_CLIENT_ID`'s range) must never draw
+        /// an OK/WRONG reply on a VARA command-port socket, and the WS
+        /// `mycall` message stays a no-op.
+        #[cfg(feature = "websocket")]
+        #[tokio::test]
+        async fn websocket_ids_never_draw_a_vara_reply() {
+            use coppa_host::websocket::FIRST_CLIENT_ID;
+            let config = session_config();
+            let mut station = EventLoop::new(config).unwrap();
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19454, 19455).await;
+
+            station
+                .handle_host_event(HostEvent::VaraCommand {
+                    client_id: FIRST_CLIENT_ID,
+                    command: r#"{"type":"mycall","callsign":"W5AU"}"#.to_string(),
+                })
+                .await;
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: FIRST_CLIENT_ID,
+                    source: "VK3ABC".to_string(),
+                    destination: "NOT/A/CALL".to_string(),
+                })
+                .await;
+
+            assert_eq!(
+                station.local_callsign,
+                Some(Callsign::new("VK3ABC").unwrap()),
+                "the WS mycall message must stay a no-op"
+            );
+            let lines = read_available_lines(&mut reader).await;
+            assert!(
+                lines
+                    .iter()
+                    .all(|l| l.trim_end() != "OK" && l.trim_end() != "WRONG"),
+                "a WebSocket-originated event must not draw a command-port reply: {:?}",
+                lines
+            );
+        }
+
+        /// COP-28: `IAMALIVE` reaches the command port while `run()` is
+        /// running, the first one a full period after start (nothing at t=0).
+        /// Uses a shortened `vara_keepalive_period` so the test runs in
+        /// milliseconds; the real 60 s constant is pinned by
+        /// `keepalive_sends_iamalive_every_sixty_seconds`.
+        #[tokio::test]
+        async fn iamalive_reaches_the_command_port_while_running() {
+            let config = fast_ptt_config();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            event_loop.vara_keepalive_period = Duration::from_millis(250);
+            let (mut reader, _write_half) =
+                connect_bridged_vara_client(&mut event_loop, 19456, 19457).await;
+            let started = Instant::now();
+
+            let local = tokio::task::LocalSet::new();
+            local.spawn_local(async move {
+                let _ = event_loop.run().await;
+            });
+
+            local
+                .run_until(async move {
+                    assert_eq!(read_line(&mut reader).await.trim_end(), "IAMALIVE");
+                    assert!(
+                        started.elapsed() >= Duration::from_millis(200),
+                        "the first IAMALIVE must arrive a full period after start, not at t=0"
+                    );
+                    assert_eq!(read_line(&mut reader).await.trim_end(), "IAMALIVE");
+                })
+                .await;
+        }
+
+        #[cfg(feature = "websocket")]
+        #[tokio::test]
+        async fn websocket_hears_connected_and_disconnected_and_status_follows() {
+            use coppa_host::websocket::{WsServerMessage, WsStatus};
+            let mut station = EventLoop::new(session_config()).unwrap();
+            let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+            let status = Arc::new(Mutex::new(WsStatus::default()));
+            station.set_ws_broadcast(tx);
+            station.set_ws_status(status.clone());
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "VK3ABC".into(),
+                    destination: "W1AW".into(),
+                })
+                .await;
+            let mut remote = peer();
+            let ack = remote
+                .handle_connect_req(&LinkCapabilities::default().to_bytes())
+                .unwrap();
+            station.handle_mac_pdu(ack).await;
+            let msg: WsServerMessage =
+                serde_json::from_str(&rx.try_recv().expect("connected push")).unwrap();
+            assert!(
+                matches!(msg, WsServerMessage::Connected { remote_call } if remote_call == "W1AW")
+            );
+            {
+                let snap = status.lock().await;
+                assert!(snap.connected);
+                assert_eq!(snap.remote_call.as_deref(), Some("W1AW"));
+            }
+            station.handle_mac_pdu(remote.disconnect().unwrap()).await;
+            let msg: WsServerMessage =
+                serde_json::from_str(&rx.try_recv().expect("disconnected push")).unwrap();
+            assert!(matches!(msg, WsServerMessage::Disconnected));
+            let snap = status.lock().await;
+            assert!(!snap.connected);
+            assert_eq!(snap.remote_call, None);
+            assert!(rx.try_recv().is_err(), "exactly one push per transition");
         }
 
         /// Zero-lead/trail-padded encode, mirroring `coppa-engine`'s own streaming
@@ -6599,7 +8350,7 @@ mod tests {
             );
 
             // Simulate the scheduled PTT release completing -- exactly what
-            // `run()`'s event-channel dispatch of the `DaemonEvent::PttChange(false)`
+            // `run()`'s event-channel dispatch of the `DaemonEvent::TxComplete`
             // `transmit_samples` spawns would do, called directly for the
             // same determinism reason as above (mirrors
             // `test_buffer_telemetry_progression_3_to_0`'s established
@@ -6817,8 +8568,16 @@ mod tests {
                     .await
                     .unwrap();
 
+                    // COP-28: the OK reply comes first, before the PTT
+                    // bracket the command causes.
                     let mut lines = Vec::new();
-                    for _ in 0..8 {
+                    lines.push(read_line(&mut reader).await);
+                    assert_eq!(
+                        lines[0].trim_end(),
+                        "OK",
+                        "TUNE must be answered OK before its PTT bracket"
+                    );
+                    for _ in 0..7 {
                         lines.push(read_line(&mut reader).await);
                         let ptt_so_far: Vec<&str> = lines
                             .iter()
