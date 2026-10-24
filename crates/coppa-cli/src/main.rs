@@ -60,6 +60,13 @@ enum Commands {
         /// Milliseconds to hold PTT keyed after audio finishes playing.
         #[arg(long, default_value = "200")]
         ptt_tail_ms: u64,
+        /// Explicit operating frequency in Hz for the wideband gate (a
+        /// wideband profile only transmits live at or above 29.7 MHz).
+        #[arg(long)]
+        frequency_hz: Option<u64>,
+        /// Operating band label ("160m".."23cm") for the wideband gate.
+        #[arg(long)]
+        band: Option<String>,
     },
     /// Receive and decode audio (streaming: WAV file if --input is given,
     /// otherwise live capture from an audio input device until Ctrl+C).
@@ -142,6 +149,13 @@ enum Commands {
         /// Milliseconds to hold PTT keyed after audio finishes playing.
         #[arg(long, default_value = "200")]
         ptt_tail_ms: u64,
+        /// Explicit operating frequency in Hz for the wideband gate (a
+        /// wideband profile only transmits live at or above 29.7 MHz).
+        #[arg(long)]
+        frequency_hz: Option<u64>,
+        /// Operating band label ("160m".."23cm") for the wideband gate.
+        #[arg(long)]
+        band: Option<String>,
     },
     /// List available audio devices.
     Devices,
@@ -208,6 +222,8 @@ fn main() -> Result<()> {
             rigctld,
             ptt_lead_ms,
             ptt_tail_ms,
+            frequency_hz,
+            band,
         }) => cmd_tx(
             &message,
             output.as_deref(),
@@ -218,6 +234,8 @@ fn main() -> Result<()> {
             &rigctld,
             ptt_lead_ms,
             ptt_tail_ms,
+            frequency_hz,
+            band.as_deref(),
             verbosity,
         )?,
         Some(Commands::Rx {
@@ -261,6 +279,8 @@ fn main() -> Result<()> {
             rigctld,
             ptt_lead_ms,
             ptt_tail_ms,
+            frequency_hz,
+            band,
         }) => cmd_tune(
             seconds,
             single,
@@ -271,6 +291,8 @@ fn main() -> Result<()> {
             &rigctld,
             ptt_lead_ms,
             ptt_tail_ms,
+            frequency_hz,
+            band.as_deref(),
             verbosity,
         )?,
         Some(Commands::Devices) => cmd_devices()?,
@@ -326,18 +348,70 @@ fn write_wav_output(
 /// `method` is `"rigctld"`. Split out from `transmit_live` so the
 /// `--rigctld`/CLI-flag plumbing can be unit-tested without a real audio
 /// device.
+///
+/// A connected rigctld client is retained as `PttBackend::Rigctld` so the
+/// wideband gate can read the rig's dial frequency (COP-40). An
+/// unrecognized `--ptt` value is a hard error, matching the daemon's policy,
+/// rather than silently keying nothing.
 #[cfg(feature = "cpal-backend")]
-fn build_ptt(ptt: &str, rigctld_addr: &str) -> Box<dyn coppa_radio::PttControl> {
+fn build_ptt(ptt: &str, rigctld_addr: &str) -> Result<coppa_radio::PttBackend> {
+    use coppa_radio::PttBackend;
     match ptt {
         "rigctld" => match coppa_radio::RigctldClient::connect(rigctld_addr) {
-            Ok(client) => Box::new(client),
+            Ok(client) => Ok(PttBackend::Rigctld(client)),
             Err(e) => {
                 eprintln!("WARNING: rigctld connect failed ({}), using no PTT", e);
-                Box::new(coppa_radio::NullPtt::new())
+                Ok(PttBackend::Other(Box::new(coppa_radio::NullPtt::new())))
             }
         },
-        "vox" => Box::new(coppa_radio::VoxPtt::new()),
-        _ => Box::new(coppa_radio::NullPtt::new()),
+        "vox" => Ok(PttBackend::Other(Box::new(coppa_radio::VoxPtt::new()))),
+        "none" => Ok(PttBackend::Other(Box::new(coppa_radio::NullPtt::new()))),
+        other => anyhow::bail!(
+            "unrecognized --ptt value {other:?}: expected \"none\", \"vox\", or \"rigctld\""
+        ),
+    }
+}
+
+/// Validate `--frequency-hz`/`--band` into the stated frequency evidence the
+/// wideband gate falls back on (an explicit frequency over a band label).
+/// A typo'd band, an implausible frequency, or a frequency outside the
+/// stated band is an error.
+fn cli_frequency_evidence(
+    frequency_hz: Option<u64>,
+    band: Option<&str>,
+) -> Result<Option<coppa_radio::band::FrequencyEvidence>> {
+    let stated =
+        coppa_radio::band::FrequencyConfig::parse(frequency_hz, band, "--frequency-hz", "--band")
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(stated.static_evidence())
+}
+
+/// The wideband regulatory gate for live transmission (COP-40): the same
+/// `coppa_radio::band::gate` the daemon applies. Evidence precedence is a
+/// live rig answer over the stated flags. Errors (refuses) when a wideband
+/// profile has no evidence at or above 29.7 MHz.
+fn cli_gate_decision(
+    profile: &str,
+    occupied_hz: u32,
+    live_hz: Option<u64>,
+    stated: Option<coppa_radio::band::FrequencyEvidence>,
+) -> Result<()> {
+    use coppa_radio::band::{gate, FrequencyEvidence, GateRefusal};
+    let evidence = live_hz.map(FrequencyEvidence::Live).or(stated);
+    match gate(occupied_hz, evidence.as_ref()) {
+        Ok(()) => Ok(()),
+        Err(GateRefusal::NoSource) => anyhow::bail!(
+            "refusing to transmit: profile {profile} emits {occupied_hz} Hz occupied bandwidth, \
+             which 47 CFR 97.307(f)(3) caps below 29.7 MHz — pass --frequency-hz (>= {}) or \
+             --band (6m and up), or point --ptt rigctld at a rig on a VHF+ band",
+            coppa_radio::band::US_WIDEBAND_MIN_HZ
+        ),
+        Err(GateRefusal::BelowThreshold { evidence_hz, .. }) => anyhow::bail!(
+            "refusing to transmit: profile {profile} emits {occupied_hz} Hz occupied bandwidth \
+             but {}, below 29.7 MHz — 47 CFR 97.307(f)(3) caps emissions below 29.7 MHz at \
+             2.8 kHz; use an HF profile or a VHF+ frequency/band",
+            evidence.map_or_else(|| format!("{evidence_hz} Hz"), |e| e.describe())
+        ),
     }
 }
 
@@ -456,6 +530,14 @@ fn feed_until_played<S: coppa_audio::AudioSink>(
     }
 }
 
+/// What the wideband gate needs to know about a live transmission: the
+/// profile's label and occupied bandwidth, and the stated frequency flags.
+struct LiveTxGate<'a> {
+    profile: &'a str,
+    occupied_hz: u32,
+    stated: Option<coppa_radio::band::FrequencyEvidence>,
+}
+
 /// Key PTT, stream `samples` out through the resolved audio device, then
 /// unkey — the live-playback sequencing shared by `cmd_tx` and `cmd_tune`.
 #[cfg(feature = "cpal-backend")]
@@ -468,12 +550,22 @@ fn transmit_live(
     rigctld_addr: &str,
     ptt_lead_ms: u64,
     ptt_tail_ms: u64,
+    gate: LiveTxGate<'_>,
     verbosity: Verbosity,
 ) -> Result<()> {
     use coppa_audio::AudioSink;
 
     // Create PTT controller
-    let mut ptt_ctrl = build_ptt(ptt, rigctld_addr);
+    let mut ptt_ctrl = build_ptt(ptt, rigctld_addr)?;
+
+    // COP-40: refuse a wideband emission below 29.7 MHz before any audio
+    // device is opened or PTT keyed.
+    let live_hz = if gate.occupied_hz > coppa_radio::band::HF_OCCUPIED_BANDWIDTH_CAP_HZ {
+        ptt_ctrl.poll_frequency()
+    } else {
+        None
+    };
+    cli_gate_decision(gate.profile, gate.occupied_hz, live_hz, gate.stated)?;
 
     // Create audio sink
     let mut sink = match device {
@@ -502,7 +594,7 @@ fn transmit_live(
     let delivered = play_keyed(
         &mut sink,
         |sink| sink.playback_progress(),
-        ptt_ctrl.as_mut(),
+        &mut ptt_ctrl,
         samples,
         std::time::Duration::from_millis(ptt_lead_ms),
         std::time::Duration::from_millis(ptt_tail_ms),
@@ -528,6 +620,8 @@ fn cmd_tx(
     rigctld: &str,
     ptt_lead_ms: u64,
     ptt_tail_ms: u64,
+    frequency_hz: Option<u64>,
+    band: Option<&str>,
     verbosity: Verbosity,
 ) -> Result<()> {
     let config = resolve_config(profile)?;
@@ -559,6 +653,13 @@ fn cmd_tx(
     match output {
         Some(path) => write_wav_output(path, &samples, core.config().sample_rate, verbosity)?,
         None => {
+            // Offline WAV rendering (the `Some` arm) emits no RF and is never
+            // gated; live transmission is (COP-40).
+            let gate = LiveTxGate {
+                profile: profile.unwrap_or("default"),
+                occupied_hz: core.occupied_bandwidth_hz(),
+                stated: cli_frequency_evidence(frequency_hz, band)?,
+            };
             #[cfg(feature = "cpal-backend")]
             {
                 transmit_live(
@@ -569,11 +670,16 @@ fn cmd_tx(
                     rigctld,
                     ptt_lead_ms,
                     ptt_tail_ms,
+                    gate,
                     verbosity,
                 )?;
             }
             #[cfg(not(feature = "cpal-backend"))]
             {
+                // No live audio in this build, so nothing reaches the air,
+                // but a wideband request is still refused, not silently
+                // accepted.
+                cli_gate_decision(gate.profile, gate.occupied_hz, None, gate.stated)?;
                 let _ = device;
                 let _ = ptt;
                 let _ = rigctld;
@@ -604,6 +710,8 @@ fn cmd_tune(
     rigctld: &str,
     ptt_lead_ms: u64,
     ptt_tail_ms: u64,
+    frequency_hz: Option<u64>,
+    band: Option<&str>,
     verbosity: Verbosity,
 ) -> Result<()> {
     let config = resolve_config(profile)?;
@@ -632,6 +740,13 @@ fn cmd_tune(
     match output {
         Some(path) => write_wav_output(path, &samples, core.config().sample_rate, verbosity)?,
         None => {
+            // Offline WAV rendering (the `Some` arm) emits no RF and is never
+            // gated; live transmission is (COP-40).
+            let gate = LiveTxGate {
+                profile: profile.unwrap_or("default"),
+                occupied_hz: core.occupied_bandwidth_hz(),
+                stated: cli_frequency_evidence(frequency_hz, band)?,
+            };
             #[cfg(feature = "cpal-backend")]
             {
                 transmit_live(
@@ -642,11 +757,16 @@ fn cmd_tune(
                     rigctld,
                     ptt_lead_ms,
                     ptt_tail_ms,
+                    gate,
                     verbosity,
                 )?;
             }
             #[cfg(not(feature = "cpal-backend"))]
             {
+                // No live audio in this build, so nothing reaches the air,
+                // but a wideband request is still refused, not silently
+                // accepted.
+                cli_gate_decision(gate.profile, gate.occupied_hz, None, gate.stated)?;
                 let _ = device;
                 let _ = ptt;
                 let _ = rigctld;
@@ -1179,6 +1299,8 @@ mod tests {
             "127.0.0.1:4532",
             50,
             200,
+            None,
+            None,
             Verbosity::Normal,
         )
         .expect("tx to file should succeed");
@@ -1204,6 +1326,8 @@ mod tests {
             "127.0.0.1:4532",
             50,
             200,
+            None,
+            None,
             Verbosity::Normal,
         )
         .expect("tune to file should succeed");
@@ -1229,6 +1353,8 @@ mod tests {
             "127.0.0.1:4532",
             50,
             200,
+            None,
+            None,
             Verbosity::Quiet,
         )
         .expect("single-tone tune to file should succeed");
@@ -1254,6 +1380,8 @@ mod tests {
             "127.0.0.1:4532",
             50,
             200,
+            None,
+            None,
             Verbosity::Verbose,
         )
         .expect("tx with callsign should succeed");
@@ -1725,8 +1853,137 @@ mod tests {
     #[test]
     fn test_build_ptt_none_and_vox_do_not_touch_network() {
         // Sanity check that non-rigctld methods don't try to connect anywhere.
-        let _ = build_ptt("none", "127.0.0.1:1");
-        let _ = build_ptt("vox", "127.0.0.1:1");
+        let none = build_ptt("none", "127.0.0.1:1").unwrap();
+        let vox = build_ptt("vox", "127.0.0.1:1").unwrap();
+        assert!(!none.is_rigctld());
+        assert!(!vox.is_rigctld());
+    }
+
+    // ── COP-40: wideband HF/VHF gate for live transmission ───────────────
+
+    /// The CLI applies the same rules as the daemon: narrowband always
+    /// transmits; wideband needs evidence at or above 29.7 MHz, and a live
+    /// rig answer outranks the stated flags.
+    #[test]
+    fn cli_gate_decision_matches_daemon_rules() {
+        let vhf = coppa_radio::band::FrequencyEvidence::Stated(144_500_000);
+        let ten_m = cli_frequency_evidence(None, Some("10m")).unwrap();
+        let two_m = cli_frequency_evidence(None, Some("2m")).unwrap();
+
+        let err = cli_gate_decision("VHF_FAST", 5600, None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("refusing to transmit"), "{msg}");
+        assert!(msg.contains("97.307(f)(3)"), "{msg}");
+        assert!(msg.contains("--frequency-hz"), "{msg}");
+
+        assert!(cli_gate_decision("VHF_FAST", 5600, None, Some(vhf)).is_ok());
+        assert!(cli_gate_decision("VHF_FAST", 5600, None, two_m).is_ok());
+        assert!(cli_gate_decision("HF_STANDARD", 2400, None, None).is_ok());
+        assert!(cli_gate_decision("VHF_FAST", 5600, None, ten_m).is_err());
+        assert!(cli_gate_decision("VHF_FAST", 5600, Some(144_500_000), None).is_ok());
+        let err = cli_gate_decision("VHF_FAST", 5600, Some(14_074_000), Some(vhf)).unwrap_err();
+        assert!(
+            err.to_string().contains("rigctld reports 14074000 Hz"),
+            "{err}"
+        );
+    }
+
+    /// The gate reads the profile's real occupied bandwidth: every HF
+    /// profile transmits with no flags, `VHF_FAST` does not.
+    #[test]
+    fn cli_gate_uses_the_profile_occupied_bandwidth() {
+        let hf = CoppaCore::with_config(resolve_config(Some("HF_STANDARD")).unwrap());
+        assert!(cli_gate_decision("HF_STANDARD", hf.occupied_bandwidth_hz(), None, None).is_ok());
+        let vhf = CoppaCore::with_config(resolve_config(Some("VHF_FAST")).unwrap());
+        assert!(cli_gate_decision("VHF_FAST", vhf.occupied_bandwidth_hz(), None, None).is_err());
+    }
+
+    #[test]
+    fn cli_band_flag_typo_is_a_hard_error() {
+        let err = cli_frequency_evidence(None, Some("21m")).unwrap_err();
+        assert!(
+            err.to_string().contains("expected an amateur band label"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("--band"), "{err}");
+    }
+
+    #[test]
+    fn cli_frequency_band_contradiction_is_a_hard_error() {
+        let err = cli_frequency_evidence(Some(14_074_000), Some("2m")).unwrap_err();
+        assert!(err.to_string().contains("lies outside band"), "{err}");
+        assert!(cli_frequency_evidence(Some(144_500_000), Some("2m")).is_ok());
+    }
+
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn cli_unknown_ptt_value_is_a_hard_error() {
+        let err = build_ptt("rigctld-typo", "127.0.0.1:1").err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("expected \"none\", \"vox\", or \"rigctld\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_cli_parses_frequency_flags_on_tx_and_tune() {
+        let cli = Cli::parse_from(["coppa", "tx", "hi", "--frequency-hz", "144500000"]);
+        match cli.command {
+            Some(Commands::Tx {
+                frequency_hz, band, ..
+            }) => {
+                assert_eq!(frequency_hz, Some(144_500_000));
+                assert_eq!(band, None);
+            }
+            _ => panic!("expected Tx command"),
+        }
+        let cli = Cli::parse_from(["coppa", "tune", "--band", "2m"]);
+        match cli.command {
+            Some(Commands::Tune { band, .. }) => assert_eq!(band.as_deref(), Some("2m")),
+            _ => panic!("expected Tune command"),
+        }
+    }
+
+    /// A live wideband `tx` with no frequency source is refused before any
+    /// audio device is opened; the same request rendered to a WAV file
+    /// (no RF) is never gated.
+    #[test]
+    fn cmd_tx_refuses_live_wideband_but_renders_wav() {
+        let err = cmd_tx(
+            "hi",
+            None,
+            Some("VHF_FAST"),
+            None,
+            None,
+            "none",
+            "127.0.0.1:1",
+            0,
+            0,
+            None,
+            None,
+            Verbosity::Quiet,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("refusing to transmit"), "{err}");
+
+        let path = std::env::temp_dir().join(format!("cop40_{}.wav", std::process::id()));
+        cmd_tx(
+            "hi",
+            Some(path.to_str().unwrap()),
+            Some("VHF_FAST"),
+            None,
+            None,
+            "none",
+            "127.0.0.1:1",
+            0,
+            0,
+            None,
+            None,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        std::fs::remove_file(&path).ok();
     }
 
     /// Task 4 (Phase 4): `cmd_rx`'s `--input` path now streams through
@@ -1752,6 +2009,8 @@ mod tests {
                 "127.0.0.1:4532",
                 50,
                 200,
+                None,
+                None,
                 Verbosity::Quiet,
             )
             .expect("tx to file should succeed");

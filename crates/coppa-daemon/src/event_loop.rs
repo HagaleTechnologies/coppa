@@ -15,7 +15,8 @@ use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu, StationIdPayload};
 use coppa_protocol::modem::max_payload_for_level;
 use coppa_protocol::session::{LinkCapabilities, SessionManager, SessionState};
 use coppa_protocol::transport::{TransportPdu, TransportType};
-use coppa_radio::{NullPtt, PttControl, PttState};
+use coppa_radio::band::{self, FrequencyConfig, FrequencyEvidence, GateRefusal};
+use coppa_radio::{NullPtt, PttBackend, PttControl, PttState};
 use rand::RngExt;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -156,8 +157,15 @@ pub struct EventLoop {
     tx_output: Arc<std::sync::Mutex<TxOutput>>,
     /// Optional audio input ring buffer consumer for reading RX samples.
     audio_in: Option<AudioRingConsumer>,
-    /// PTT controller (defaults to NullPtt if unconfigured).
-    ptt: Box<dyn PttControl>,
+    /// PTT controller (defaults to NullPtt if unconfigured). Retains a
+    /// connected rigctld client so the wideband gate can read the rig's dial
+    /// frequency (COP-40).
+    ptt: PttBackend,
+    /// COP-40: the operator-stated frequency source (`[radio] frequency_hz`
+    /// / `band`), validated at startup -- the fallback evidence the
+    /// wideband gate in `transmit_samples` uses when no live rigctld answer
+    /// is available.
+    radio_frequency: FrequencyConfig,
     /// Optional sender for host responses (decoded data, status updates).
     response_tx: Option<mpsc::Sender<coppa_host::HostResponse>>,
     /// Playback progress from the audio output worker. `None` when no
@@ -344,10 +352,17 @@ impl EventLoop {
     /// Create a new event loop with the given configuration.
     ///
     /// Fails if `[radio] ptt_method` doesn't parse or names an
-    /// unrecognized/unbuilt PTT backend -- see `create_ptt`.
+    /// unrecognized/unbuilt PTT backend -- see `create_ptt` -- if
+    /// `[radio] frequency_hz`/`band` don't validate, or if a wideband
+    /// profile has no frequency source at or above 29.7 MHz -- see
+    /// `check_frequency_gate_at_startup`.
     pub fn new(config: DaemonConfig) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::channel(256);
-        let ptt = Self::create_ptt(&config)?;
+        let radio_frequency = config
+            .radio
+            .frequency_config()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut ptt = Self::create_ptt(&config)?;
 
         // Create engine from profile; all profiles use 48kHz internally
         let engine =
@@ -356,6 +371,7 @@ impl EventLoop {
             } else {
                 CoppaCore::with_config(coppa_engine::EngineConfig::default())
             };
+        Self::check_frequency_gate_at_startup(&config, &engine, &radio_frequency, &mut ptt)?;
 
         // E6: Initialize ARQ state if enabled
         let (arq_tx, arq_rx) = if config.engine.arq_enabled {
@@ -448,6 +464,7 @@ impl EventLoop {
             tx_output: Arc::new(std::sync::Mutex::new(TxOutput::default())),
             audio_in: None,
             ptt,
+            radio_frequency,
             response_tx: None,
             output_feedback: None,
             tx_generation: 0,
@@ -507,25 +524,33 @@ impl EventLoop {
     /// correctly, but nothing answering it right now): that already-existing
     /// behavior -- warn and fall back to `NullPtt` -- is unchanged, since
     /// it's a live/transient condition rather than an unrecognized config.
-    fn create_ptt(config: &DaemonConfig) -> Result<Box<dyn PttControl>> {
+    /// A wideband profile that relies on that rigctld as its only frequency
+    /// source still refuses to start -- `check_frequency_gate_at_startup`
+    /// sees the fallback as "no source answering".
+    ///
+    /// A connected rigctld client is returned as `PttBackend::Rigctld`, not
+    /// boxed as `dyn PttControl`, so its dial frequency stays reachable.
+    fn create_ptt(config: &DaemonConfig) -> Result<PttBackend> {
         let parsed = config
             .radio
             .ptt_config()
             .map_err(|e| anyhow::anyhow!("invalid [radio] ptt_method: {e}"))?;
 
         match parsed {
-            crate::config::PttConfig::None => Ok(Box::new(NullPtt::new())),
-            crate::config::PttConfig::Vox => Ok(Box::new(coppa_radio::VoxPtt::new())),
+            crate::config::PttConfig::None => Ok(PttBackend::Other(Box::new(NullPtt::new()))),
+            crate::config::PttConfig::Vox => {
+                Ok(PttBackend::Other(Box::new(coppa_radio::VoxPtt::new())))
+            }
             crate::config::PttConfig::Rigctld => {
                 match coppa_radio::rigctld::RigctldClient::connect(&config.radio.rigctld_address) {
-                    Ok(client) => Ok(Box::new(client)),
+                    Ok(client) => Ok(PttBackend::Rigctld(client)),
                     Err(e) => {
                         tracing::warn!(
                             address = %config.radio.rigctld_address,
                             error = %e,
                             "Failed to connect to rigctld; falling back to no PTT"
                         );
-                        Ok(Box::new(NullPtt::new()))
+                        Ok(PttBackend::Other(Box::new(NullPtt::new())))
                     }
                 }
             }
@@ -544,7 +569,7 @@ impl EventLoop {
                         .map_err(|e| {
                         anyhow::anyhow!("failed to open serial PTT port {port}: {e}")
                     })?;
-                    Ok(Box::new(ptt))
+                    Ok(PttBackend::Other(Box::new(ptt)))
                 }
                 #[cfg(not(feature = "serial-ptt"))]
                 {
@@ -565,7 +590,7 @@ impl EventLoop {
                     })?;
                     let ptt = coppa_radio::ptt_gpio::GpioPtt::open(pin_num, false)
                         .map_err(|e| anyhow::anyhow!("failed to open GPIO PTT pin {pin}: {e}"))?;
-                    Ok(Box::new(ptt))
+                    Ok(PttBackend::Other(Box::new(ptt)))
                 }
                 #[cfg(not(all(feature = "gpio-ptt", target_os = "linux")))]
                 {
@@ -577,6 +602,133 @@ impl EventLoop {
                 }
             }
         }
+    }
+
+    /// COP-40: refuse to start a wideband profile that can never legally
+    /// transmit.
+    ///
+    /// 47 CFR 97.307(f)(3) caps emissions below 29.7 MHz at 2.8 kHz occupied
+    /// bandwidth. A narrowband engine (every HF profile, 2400 Hz) is legal on
+    /// any band and skips this entirely. A wideband engine (`vhf_wide`,
+    /// 5600 Hz) must have frequency evidence at or above 29.7 MHz: a live
+    /// rigctld answer, else `[radio] frequency_hz`, else `[radio] band`.
+    /// No evidence, or evidence below 29.7 MHz, is a hard startup error.
+    ///
+    /// Only the constructed engine is checked: a `LevelDerived` engine that
+    /// starts narrowband and later climbs into `vhf_wide` is gated per
+    /// transmission by `wideband_frequency_check` instead.
+    fn check_frequency_gate_at_startup(
+        config: &DaemonConfig,
+        engine: &CoppaCore,
+        radio_frequency: &FrequencyConfig,
+        ptt: &mut PttBackend,
+    ) -> Result<()> {
+        let occupied_hz = engine.occupied_bandwidth_hz();
+        if band::gate(occupied_hz, None).is_ok() {
+            return Ok(());
+        }
+        let profile = &config.engine.profile;
+        let live_hz = ptt.poll_frequency();
+        if let Some(live) = live_hz {
+            if radio_frequency.contradicts(live) {
+                tracing::warn!(
+                    live_hz = live,
+                    stated = ?radio_frequency.static_evidence(),
+                    "rigctld's dial frequency contradicts [radio] frequency_hz/band; \
+                     using the live value"
+                );
+            }
+        }
+        let evidence = band::resolve_evidence(live_hz, radio_frequency);
+        match band::gate(occupied_hz, evidence.as_ref()) {
+            Ok(()) => {
+                let evidence = evidence.expect("a wideband gate pass implies evidence");
+                tracing::info!(
+                    profile = %profile,
+                    occupied_hz,
+                    evidence = %evidence.describe(),
+                    "wideband profile cleared the 29.7 MHz regulatory gate"
+                );
+                Ok(())
+            }
+            Err(GateRefusal::BelowThreshold { .. }) => match evidence {
+                Some(FrequencyEvidence::Live(hz)) => Err(anyhow::anyhow!(
+                    "rigctld reports an operating frequency of {hz} Hz, below 29.7 MHz, but \
+                     profile '{profile}' emits {occupied_hz} Hz occupied bandwidth — a \
+                     wideband emission below 29.7 MHz violates 47 CFR 97.307(f)(3); use an \
+                     HF profile (levels 1-8) or tune the rig to a VHF+ band"
+                )),
+                _ => Err(anyhow::anyhow!(
+                    "[radio] states an operating frequency below 29.7 MHz, but profile \
+                     '{profile}' emits {occupied_hz} Hz occupied bandwidth — a wideband \
+                     emission below 29.7 MHz violates 47 CFR 97.307(f)(3); use an HF \
+                     profile (levels 1-8) or a VHF+ frequency/band"
+                )),
+            },
+            Err(GateRefusal::NoSource) => {
+                if config.radio.ptt_config() == Ok(crate::config::PttConfig::Rigctld) {
+                    Err(anyhow::anyhow!(
+                        "profile '{profile}' emits {occupied_hz} Hz occupied bandwidth, which \
+                         47 CFR 97.307(f)(3) caps at 2.8 kHz below 29.7 MHz, and its only \
+                         frequency source (rigctld at {}) is not answering: start rigctld, or \
+                         set [radio] frequency_hz or [radio] band as a fallback frequency source",
+                        config.radio.rigctld_address
+                    ))
+                } else {
+                    Err(anyhow::anyhow!(
+                        "profile '{profile}' emits {occupied_hz} Hz occupied bandwidth, which \
+                         47 CFR 97.307(f)(3) caps at 2.8 kHz below 29.7 MHz: set [radio] \
+                         frequency_hz or [radio] band, or set ptt_method = \"rigctld\" so the \
+                         gate can read the dial frequency"
+                    ))
+                }
+            }
+        }
+    }
+
+    /// COP-40: the per-transmission half of the wideband regulatory gate.
+    ///
+    /// Narrowband engines return `Ok` with no I/O. A wideband engine
+    /// re-resolves its frequency evidence on every call -- one rigctld `f`
+    /// round trip, falling back to the stated `[radio] frequency_hz`/`band`
+    /// -- so a rig retuned below 29.7 MHz, or a rigctld that stopped
+    /// answering with no stated fallback, is refused on the very next frame.
+    /// Logs the refusal; the caller only has to not transmit.
+    fn wideband_frequency_check(&mut self) -> Result<(), GateRefusal> {
+        let occupied_hz = self.engine.occupied_bandwidth_hz();
+        if band::gate(occupied_hz, None).is_ok() {
+            return Ok(());
+        }
+        let live_hz = self.ptt.poll_frequency();
+        if let Some(live) = live_hz {
+            if self.radio_frequency.contradicts(live) {
+                tracing::warn!(
+                    live_hz = live,
+                    stated = ?self.radio_frequency.static_evidence(),
+                    "rigctld's dial frequency contradicts [radio] frequency_hz/band; \
+                     using the live value"
+                );
+            }
+        }
+        let evidence = band::resolve_evidence(live_hz, &self.radio_frequency);
+        band::gate(occupied_hz, evidence.as_ref()).inspect_err(|refusal| match refusal {
+            GateRefusal::BelowThreshold { evidence_hz, .. } => tracing::error!(
+                "refusing wideband transmission: {occupied_hz} Hz occupied bandwidth but {} \
+                 (< {}) — 47 CFR 97.307(f)(3) caps HF emissions at 2.8 kHz",
+                evidence.map_or_else(|| format!("{evidence_hz} Hz"), |e| e.describe()),
+                band::US_WIDEBAND_MIN_HZ
+            ),
+            GateRefusal::NoSource => tracing::error!(
+                "refusing wideband transmission: {occupied_hz} Hz occupied bandwidth and no \
+                 frequency source is answering{} — 47 CFR 97.307(f)(3); set [radio] \
+                 frequency_hz or [radio] band as a fallback source",
+                if self.config.radio.ptt_config() == Ok(crate::config::PttConfig::Rigctld) {
+                    " (rigctld unreachable)"
+                } else {
+                    ""
+                }
+            ),
+        })
     }
 
     /// Get a sender for injecting events into the loop.
@@ -1919,7 +2071,22 @@ impl EventLoop {
     /// on-air-silence bug once PTT became real hardware control (Task 2).
     /// Both are now routed through this function like every other TX path,
     /// making the "none of them are exempted" claim above actually true.
+    ///
+    /// COP-40: the wideband regulatory gate runs first, before the busy
+    /// wait, the station-ID prepend, PTT, or any audio -- a refused
+    /// transmission keys nothing and queues nothing. Callers see "the
+    /// transmission didn't happen", which ARQ already retransmits/times out
+    /// on like any other loss.
     async fn transmit_samples(&mut self, samples: &[f32]) {
+        if self.wideband_frequency_check().is_err() {
+            if !self.is_transmitting {
+                // The refused payload never reaches the air, so no PTT
+                // release will ever drop it from `BUFFER`.
+                self.tx_on_air_bytes = 0;
+                self.report_buffer().await;
+            }
+            return;
+        }
         self.wait_for_clear_channel().await;
 
         // Station-ID timer (Phase 4 Task 3): prepend an ID/beacon frame to
@@ -3229,6 +3396,8 @@ mod tests {
         for (profile, maximum) in [("HF_STANDARD", 8), ("VHF_FAST", 9)] {
             let mut config = DaemonConfig::default();
             config.engine.profile = profile.to_string();
+            // COP-40: a wideband (VHF) profile needs a frequency source.
+            config.radio.band = Some("2m".into());
             let mut event_loop = EventLoop::new(config).unwrap();
             for _ in 0..60 {
                 event_loop.rate_loop.on_ack(9, true);
@@ -7864,6 +8033,8 @@ mod tests {
         async fn vhf_station_reports_its_wider_bandwidth() {
             let mut config = session_config();
             config.engine.profile = "VHF_FAST".into();
+            // COP-40: a wideband station declares its band honestly.
+            config.radio.band = Some("2m".into());
             let mut station = EventLoop::new(config).unwrap();
             let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19446, 19447).await;
             station
@@ -9471,6 +9642,298 @@ mod tests {
             // doc for why this alone doesn't mean the feature is "on" -- callsign
             // being unset by default still keeps it inactive).
             assert_eq!(config.station_id.id_interval_secs, 540);
+        }
+    }
+
+    // ── COP-40: operating-frequency source and the wideband HF/VHF gate ──
+
+    mod cop40_frequency_gate {
+        use super::*;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::Mutex;
+
+        /// A fake rigctld serving one client: answers `f` with whatever the
+        /// shared answer holds, `T <n>` with `RPRT 0`, `t` with the keyed
+        /// state. Setting the shared `alive` flag to false makes it hang up
+        /// on the next command, like a rigctld that died mid-session.
+        struct FakeRig {
+            addr: String,
+            answer: Arc<Mutex<String>>,
+            alive: Arc<AtomicBool>,
+        }
+
+        fn fake_rigctld(answer: &str) -> FakeRig {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let answer = Arc::new(Mutex::new(answer.to_string()));
+            let alive = Arc::new(AtomicBool::new(true));
+            let (shared, live) = (Arc::clone(&answer), Arc::clone(&alive));
+            std::thread::spawn(move || {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut writer = stream.try_clone().unwrap();
+                let mut ptt = "0".to_string();
+                for line in BufReader::new(stream).lines() {
+                    let Ok(line) = line else { break };
+                    if !live.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let reply = match line.trim() {
+                        "f" => shared.lock().unwrap().clone(),
+                        "t" => ptt.clone(),
+                        cmd if cmd.starts_with("T ") => {
+                            ptt = cmd[2..].to_string();
+                            "RPRT 0".to_string()
+                        }
+                        _ => "RPRT -1".to_string(),
+                    };
+                    if writeln!(writer, "{reply}").is_err() {
+                        break;
+                    }
+                }
+            });
+            FakeRig {
+                addr,
+                answer,
+                alive,
+            }
+        }
+
+        fn wideband_config() -> DaemonConfig {
+            let mut config = DaemonConfig::default();
+            config.engine.profile = "VHF_FAST".into();
+            config.audio.sample_rate = 100_000_000;
+            config.audio.buffer_size = 0;
+            config.radio.ptt_pre_delay_ms = 0;
+            config.radio.ptt_tail_delay_ms = 0;
+            config
+        }
+
+        fn rigctld_config(rig: &FakeRig) -> DaemonConfig {
+            let mut config = wideband_config();
+            config.radio.ptt_method = "rigctld".into();
+            config.radio.rigctld_address = rig.addr.clone();
+            config
+        }
+
+        fn startup_error(config: DaemonConfig) -> String {
+            EventLoop::new(config)
+                .err()
+                .expect("startup must be refused")
+                .to_string()
+        }
+
+        // ── Phase 3: startup gate ─────────────────────────────────────────
+
+        #[test]
+        fn wideband_profile_without_any_frequency_source_is_a_startup_error() {
+            let err = startup_error(wideband_config());
+            assert!(err.contains("97.307"), "{err}");
+            assert!(err.contains("frequency_hz"), "{err}");
+            assert!(err.contains("VHF_FAST"), "{err}");
+            assert!(err.contains("5600 Hz"), "{err}");
+        }
+
+        #[test]
+        fn wideband_profile_with_a_vhf_band_label_starts() {
+            let mut config = wideband_config();
+            config.radio.band = Some("2m".into());
+            assert!(EventLoop::new(config).is_ok());
+        }
+
+        #[test]
+        fn wideband_profile_with_a_stated_vhf_frequency_starts() {
+            let mut config = wideband_config();
+            config.radio.frequency_hz = Some(144_500_000);
+            assert!(EventLoop::new(config).is_ok());
+        }
+
+        #[test]
+        fn wideband_profile_with_a_stated_hf_frequency_is_a_startup_error() {
+            let mut config = wideband_config();
+            config.radio.frequency_hz = Some(14_074_000);
+            let err = startup_error(config);
+            assert!(err.contains("below 29.7 MHz"), "{err}");
+            assert!(err.contains("97.307"), "{err}");
+        }
+
+        #[test]
+        fn wideband_profile_with_band_10m_is_a_startup_error() {
+            let mut config = wideband_config();
+            config.radio.band = Some("10m".into());
+            let err = startup_error(config);
+            assert!(err.contains("97.307"), "{err}");
+        }
+
+        #[test]
+        fn a_typod_band_is_a_startup_error_even_for_narrowband() {
+            let mut config = DaemonConfig::default();
+            config.radio.band = Some("21m".into());
+            let err = startup_error(config);
+            assert!(err.contains("invalid [radio] band \"21m\""), "{err}");
+        }
+
+        #[test]
+        fn wideband_profile_with_dead_rigctld_and_no_static_source_is_a_startup_error() {
+            let mut config = wideband_config();
+            config.radio.ptt_method = "rigctld".into();
+            config.radio.rigctld_address = "127.0.0.1:1".into();
+            let err = startup_error(config);
+            assert!(err.contains("frequency source"), "{err}");
+            assert!(err.contains("127.0.0.1:1"), "{err}");
+        }
+
+        #[test]
+        fn wideband_profile_with_rigctld_not_answering_f_is_a_startup_error() {
+            let rig = fake_rigctld("CHKVFO?");
+            let err = startup_error(rigctld_config(&rig));
+            assert!(err.contains("frequency source"), "{err}");
+        }
+
+        #[test]
+        fn wideband_profile_with_answering_rigctld_starts() {
+            let rig = fake_rigctld("144500000");
+            let event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            assert!(event_loop.ptt.is_rigctld());
+        }
+
+        #[test]
+        fn wideband_profile_with_rigctld_on_hf_is_a_startup_error() {
+            let rig = fake_rigctld("14074000");
+            let err = startup_error(rigctld_config(&rig));
+            assert!(err.contains("14074000"), "{err}");
+            assert!(err.contains("97.307"), "{err}");
+        }
+
+        #[test]
+        fn narrowband_default_config_still_starts() {
+            let event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+            assert!(event_loop.engine.occupied_bandwidth_hz() <= 2_800);
+        }
+
+        #[test]
+        fn narrowband_keeps_the_soft_rigctld_fallback() {
+            let mut config = DaemonConfig::default();
+            config.radio.ptt_method = "rigctld".into();
+            config.radio.rigctld_address = "127.0.0.1:1".into();
+            let event_loop = EventLoop::new(config).unwrap();
+            assert!(!event_loop.ptt.is_rigctld());
+        }
+
+        // ── Phase 4: per-transmission gate ────────────────────────────────
+
+        const SAMPLES: [f32; 64] = [0.0; 64];
+
+        #[tokio::test]
+        async fn wideband_tx_with_answering_vhf_rigctld_transmits() {
+            let rig = fake_rigctld("144500000");
+            let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert_eq!(event_loop.tx_generation, 1, "audio was queued");
+            assert!(event_loop.is_transmitting);
+            assert_eq!(
+                PttControl::get_ptt(&mut event_loop.ptt).unwrap(),
+                PttState::Tx
+            );
+        }
+
+        #[tokio::test]
+        async fn wideband_tx_refused_after_retune_below_29m7() {
+            let rig = fake_rigctld("144500000");
+            let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert_eq!(event_loop.tx_generation, 1);
+            event_loop.handle_ptt_change(false).await;
+            let submitted = event_loop.tx_output().submitted();
+
+            *rig.answer.lock().unwrap() = "14074000".into();
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert_eq!(event_loop.tx_generation, 1, "no new transmission");
+            assert_eq!(
+                event_loop.tx_output().submitted(),
+                submitted,
+                "no new audio"
+            );
+            assert!(!event_loop.is_transmitting, "PTT stays unkeyed");
+        }
+
+        #[tokio::test]
+        async fn wideband_tx_refused_when_rigctld_dies_mid_session() {
+            let rig = fake_rigctld("144500000");
+            let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            rig.alive.store(false, Ordering::SeqCst);
+            assert_eq!(
+                event_loop.wideband_frequency_check(),
+                Err(GateRefusal::NoSource)
+            );
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert_eq!(event_loop.tx_generation, 0);
+            assert!(!event_loop.is_transmitting);
+        }
+
+        #[tokio::test]
+        async fn a_stated_vhf_source_backs_a_rigctld_that_dies() {
+            let rig = fake_rigctld("144500000");
+            let mut config = rigctld_config(&rig);
+            config.radio.band = Some("2m".into());
+            let mut event_loop = EventLoop::new(config).unwrap();
+            rig.alive.store(false, Ordering::SeqCst);
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert_eq!(event_loop.tx_generation, 1, "stated band is the fallback");
+        }
+
+        #[tokio::test]
+        async fn a_live_hf_answer_overrides_a_stated_vhf_band() {
+            let rig = fake_rigctld("144500000");
+            let mut config = rigctld_config(&rig);
+            config.radio.band = Some("2m".into());
+            let mut event_loop = EventLoop::new(config).unwrap();
+            *rig.answer.lock().unwrap() = "14074000".into();
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert_eq!(event_loop.tx_generation, 0, "the live answer wins");
+        }
+
+        #[tokio::test]
+        async fn narrowband_tx_with_no_source_still_transmits() {
+            let mut config = wideband_config();
+            config.engine.profile = "HF_STANDARD".into();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert_eq!(event_loop.tx_generation, 1);
+            assert!(event_loop.is_transmitting);
+        }
+
+        #[tokio::test]
+        async fn refused_wideband_tx_does_not_key_ptt() {
+            let rig = fake_rigctld("144500000");
+            let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            *rig.answer.lock().unwrap() = "7074000".into();
+            event_loop.tx_on_air_bytes = 5;
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert!(!event_loop.is_transmitting);
+            assert_eq!(event_loop.tx_on_air_bytes, 0, "refused bytes leave BUFFER");
+            *rig.answer.lock().unwrap() = "144500000".into();
+            assert_eq!(
+                PttControl::get_ptt(&mut event_loop.ptt).unwrap(),
+                PttState::Rx,
+                "the rig was never keyed"
+            );
+        }
+
+        /// A `LevelDerived` engine starts narrowband (no startup check
+        /// applies) but is gated the moment it climbs into `vhf_wide`.
+        #[tokio::test]
+        async fn a_level_derived_engine_is_gated_when_it_climbs_to_vhf() {
+            let mut config = wideband_config();
+            config.engine.profile = "HF_STANDARD".into();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            event_loop.engine = coppa_engine::CoppaCore::new();
+            event_loop.engine.set_speed_level(5).unwrap();
+            assert!(event_loop.engine.occupied_bandwidth_hz() > 2_800);
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert_eq!(event_loop.tx_generation, 0);
         }
     }
 }

@@ -36,6 +36,17 @@ impl RigctldClient {
         })
     }
 
+    /// Ask the rig for its dial frequency (`f`), honestly: `Some(hz)` only on
+    /// a clean numeric answer (which also refreshes the cache), `None` on any
+    /// transport or parse failure. Unlike `RadioControl::get_frequency`, this
+    /// never falls back to the cached or construction-default value, so a
+    /// regulatory check can tell "the rig says X" from "nobody answered".
+    pub fn poll_frequency(&mut self) -> Option<u64> {
+        let freq = self.command("f").ok()?.trim().parse::<u64>().ok()?;
+        self.frequency = freq;
+        Some(freq)
+    }
+
     /// Send a command and read one line of response.
     fn command(&mut self, cmd: &str) -> Result<String> {
         writeln!(self.stream, "{}", cmd).map_err(|e| anyhow!("Failed to send command: {}", e))?;

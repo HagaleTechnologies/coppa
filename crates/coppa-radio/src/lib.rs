@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 
+pub mod band;
 pub mod null_ptt;
 pub mod rigctld;
 pub mod vox_ptt;
@@ -53,9 +54,63 @@ pub trait PttControl: Send {
     fn get_ptt(&mut self) -> Result<PttState>;
 }
 
+/// A PTT backend that keeps its concrete type when it can do more than key
+/// the transmitter.
+///
+/// Boxing every backend as `dyn PttControl` erased `RigctldClient`'s
+/// `RadioControl` impl, leaving the rig's dial frequency unreachable. The
+/// `Rigctld` arm retains the client so [`PttBackend::poll_frequency`] can ask
+/// the rig; every other backend has no frequency source and answers `None`.
+pub enum PttBackend {
+    Rigctld(RigctldClient),
+    Other(Box<dyn PttControl>),
+}
+
+impl PttBackend {
+    /// The rig's current dial frequency, or `None` when this backend has no
+    /// frequency source or the rig did not answer. Never a cached or default
+    /// value -- see [`RigctldClient::poll_frequency`].
+    pub fn poll_frequency(&mut self) -> Option<u64> {
+        match self {
+            PttBackend::Rigctld(client) => client.poll_frequency(),
+            PttBackend::Other(_) => None,
+        }
+    }
+
+    /// Whether this backend is a connected rigctld client.
+    pub fn is_rigctld(&self) -> bool {
+        matches!(self, PttBackend::Rigctld(_))
+    }
+}
+
+impl PttControl for PttBackend {
+    fn set_ptt(&mut self, state: PttState) -> Result<()> {
+        match self {
+            PttBackend::Rigctld(client) => PttControl::set_ptt(client, state),
+            PttBackend::Other(ptt) => ptt.set_ptt(state),
+        }
+    }
+
+    fn get_ptt(&mut self) -> Result<PttState> {
+        match self {
+            PttBackend::Rigctld(client) => PttControl::get_ptt(client),
+            PttBackend::Other(ptt) => ptt.get_ptt(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ptt_backend_other_has_no_frequency() {
+        let mut backend = PttBackend::Other(Box::new(NullPtt::new()));
+        assert!(!backend.is_rigctld());
+        assert_eq!(backend.poll_frequency(), None);
+        backend.set_ptt(PttState::Tx).unwrap();
+        assert_eq!(backend.get_ptt().unwrap(), PttState::Tx);
+    }
 
     #[test]
     fn test_radio_mode_equality() {
