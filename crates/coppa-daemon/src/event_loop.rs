@@ -904,9 +904,9 @@ impl EventLoop {
         };
         // VARA command-port keepalive: `IAMALIVE` to every client every
         // `vara_keepalive_period`, from a task of its own so a stalled event
-        // loop (see `wait_for_clear_channel`) cannot block it. `set_vara_
-        // responses` is always called before `run()` (main.rs, tests), so a
-        // wired daemon always gets the keepalive.
+        // loop (see `wait_for_clear_channel`) cannot block it.
+        // `set_vara_responses` is always called before `run()` (main.rs,
+        // tests), so a wired daemon always gets the keepalive.
         let keepalive = self
             .vara_responses
             .clone()
@@ -7958,6 +7958,33 @@ mod tests {
                     assert!(
                         saw_ptt_on,
                         "the CONNECT_REQ must go on air after the OK (PTT ON)"
+                    );
+                })
+                .await;
+        }
+
+        /// COP-28: `DISCONNECT` gets its `OK` on the socket, whether or not a
+        /// session existed (the session-existence cases are covered by
+        /// `local_disconnect_timeout_and_failed_connect_push_disconnected`).
+        #[tokio::test]
+        async fn disconnect_gets_ok() {
+            let config = fast_ptt_config();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, mut write_half) =
+                connect_bridged_vara_client(&mut event_loop, 19458, 19459).await;
+
+            let local = tokio::task::LocalSet::new();
+            local.spawn_local(async move {
+                let _ = event_loop.run().await;
+            });
+
+            local
+                .run_until(async move {
+                    write_half.write_all(b"DISCONNECT\r").await.unwrap();
+                    assert_eq!(read_line(&mut reader).await.trim_end(), "OK");
+                    assert!(
+                        read_available_lines(&mut reader).await.is_empty(),
+                        "a session-less DISCONNECT produces nothing but its OK"
                     );
                 })
                 .await;
