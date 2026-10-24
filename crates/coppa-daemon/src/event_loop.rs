@@ -5,7 +5,7 @@
 use anyhow::Result;
 use coppa_audio::{AudioRingConsumer, AudioRingProducer};
 use coppa_engine::CoppaCore;
-use coppa_host::vara::VaraResponse;
+use coppa_host::vara::{VaraCommand, VaraResponse};
 use coppa_host::HostEvent;
 use coppa_ml::CpRecommendation;
 use coppa_ml::{BusyGate, CpGate, RateLoop};
@@ -32,6 +32,74 @@ use crate::config::DaemonConfig;
 /// Map of connected VARA command-port clients' response senders
 /// (`VaraServer::response_senders()`), used to broadcast `VaraResponse` telemetry.
 type VaraResponseSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<VaraResponse>>>>;
+
+/// How often every command-port client hears `IAMALIVE`. VARA sends it every
+/// 60 s; Pat closes the modem after 2 minutes without a line, and vARIM after
+/// 300 s.
+const VARA_KEEPALIVE_PERIOD: Duration = Duration::from_secs(60);
+
+/// The reply a VARA command-port client gets for one command, decided before
+/// the command takes effect. `WRONG` is only for lines coppa does not
+/// recognise or cannot apply: Pat's dial waits only for
+/// `CONNECTED`/`DISCONNECTED`, so `WRONG` to a well-formed `CONNECT` would
+/// hang it, and Pat's `Version()` waits only for `VERSION`/`WRONG`.
+///
+/// The reply rule, one row per command the parser can produce:
+///
+/// - `MYCALL <call>` valid → `OK` (the daemon applies it as the runtime
+///   callsign); invalid or missing → `WRONG`.
+/// - `LISTEN ON`/`LISTEN OFF` → `OK`; any other argument → `WRONG`.
+/// - `TUNE [seconds]` (coppa extension) → `OK`.
+/// - `CONNECT <src> <dst>` → `OK` (then the eventual `CONNECTED`/`DISCONNECTED`
+///   outcome); fewer than two callsigns → `WRONG`.
+/// - `DISCONNECT` → `OK` (then `DISCONNECTED` if a session existed).
+/// - `VERSION` → a `VERSION Coppa <pkg version>` line, never `OK`.
+/// - `COMPRESSION …`, `BW500`, `BW2300`, `BW2750`, `ABORT` → `OK`: accepted,
+///   not implemented (matches VARA's own replies to commands Pat sends every
+///   session).
+/// - anything else (`PUBLIC`, `CWID`, `CHAT`, `WINLINK SESSION`,
+///   `P2P SESSION`, `CLEANTXBUFFER`, `FOOBAR`, WebSocket JSON, …) → `WRONG`.
+fn vara_reply(command: &VaraCommand) -> VaraResponse {
+    match command {
+        VaraCommand::Version => VaraResponse::coppa_version(),
+        VaraCommand::MyCall(call) if Callsign::new(call).is_ok() => VaraResponse::Ok,
+        VaraCommand::MyCall(_) | VaraCommand::Unknown(_) => VaraResponse::Wrong,
+        // COMPRESSION, BW* and ABORT are accepted but not implemented.
+        VaraCommand::Listen(_)
+        | VaraCommand::Tune(_)
+        | VaraCommand::Connect { .. }
+        | VaraCommand::Disconnect
+        | VaraCommand::Compression(_)
+        | VaraCommand::Bandwidth(_)
+        | VaraCommand::Abort => VaraResponse::Ok,
+    }
+}
+
+/// Send `response` to every client in `senders`, dropping it for any whose
+/// queue is full.
+async fn broadcast_vara(senders: &VaraResponseSenders, response: VaraResponse) {
+    for tx in senders.lock().await.values() {
+        let _ = tx.try_send(response.clone());
+    }
+}
+
+/// Send `IAMALIVE` to every command-port client each `period`, the first one
+/// `period` from now. It is a task of its own because the event loop can wait
+/// for a long time (the busy-channel holdoff in `wait_for_clear_channel` has
+/// no upper bound), and a client must keep hearing from the daemon meanwhile.
+fn spawn_vara_keepalive(
+    senders: VaraResponseSenders,
+    period: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            broadcast_vara(&senders, VaraResponse::IAmAlive).await;
+        }
+    })
+}
 
 /// A session-state change broadcast to attached hosts by `notify_session`.
 enum SessionNotice {
@@ -204,8 +272,13 @@ pub struct EventLoop {
     busy_gate: BusyGate,
     /// Session manager for connected-mode operation.
     session_mgr: SessionManager,
-    /// Local station callsign (parsed from config).
+    /// Local station callsign: `[engine] callsign` at startup, replaced by a
+    /// valid command-port `MYCALL`. New sessions, station ID and beacons read
+    /// it. A session keeps the callsign it was set up with.
     local_callsign: Option<Callsign>,
+    /// How often `run()` sends `IAMALIVE` to every command-port client;
+    /// `VARA_KEEPALIVE_PERIOD` outside tests.
+    vara_keepalive_period: Duration,
     /// Whether we are listening for incoming connections.
     listening: bool,
     /// Whether the link is currently mid-transmission (PTT asserted). Gates
@@ -396,6 +469,7 @@ impl EventLoop {
             busy_gate,
             session_mgr: SessionManager::new(),
             local_callsign,
+            vara_keepalive_period: VARA_KEEPALIVE_PERIOD,
             listening: false,
             is_transmitting: false,
             tx_frame_count: 0,
@@ -580,10 +654,32 @@ impl EventLoop {
     /// — telemetry is best-effort and must never block or fail the caller.
     async fn emit_vara(&self, response: VaraResponse) {
         if let Some(ref senders) = self.vara_responses {
-            let senders = senders.lock().await;
-            for tx in senders.values() {
-                let _ = tx.try_send(response.clone());
-            }
+            broadcast_vara(senders, response).await;
+        }
+    }
+
+    /// Send `response` to the command-port client that sent the command it
+    /// answers. Telemetry and session state go to every client (`emit_vara`,
+    /// `notify_session`); a reply does not. WebSocket IDs start at
+    /// `coppa_host::websocket::FIRST_CLIENT_ID`, so a reply to a
+    /// WebSocket-originated event finds no sender here and is dropped.
+    ///
+    /// Uses `try_send`, never `send().await`: a client that stops reading must
+    /// not stall the modem's event loop (same choice as `notify_session`).
+    async fn reply_vara(&self, client_id: u32, response: VaraResponse) {
+        let Some(ref senders) = self.vara_responses else {
+            return;
+        };
+        let senders = senders.lock().await;
+        let Some(tx) = senders.get(&client_id) else {
+            return;
+        };
+        if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(response.clone()) {
+            tracing::warn!(
+                client_id,
+                line = response.format().trim_end(),
+                "VARA command-port queue full; reply dropped"
+            );
         }
     }
 
@@ -597,8 +693,8 @@ impl EventLoop {
         })
     }
 
-    /// Call after `session_mgr` reflects the change. Broadcast to all hosts
-    /// rather than addressing `client_id`: the servers' ID namespaces overlap.
+    /// Call after `session_mgr` reflects the change. Broadcasts to all hosts:
+    /// session state is link-wide; every attached host wants it.
     async fn notify_session(&self, client_id: u32, notice: SessionNotice) {
         let (status, vara) = match &notice {
             SessionNotice::Connected {
@@ -613,7 +709,11 @@ impl EventLoop {
                 };
                 (
                     format!("CONNECTED {}", remote),
-                    VaraResponse::Connected(source.to_string(), destination.to_string()),
+                    VaraResponse::Connected(
+                        source.to_string(),
+                        destination.to_string(),
+                        self.engine.occupied_bandwidth_hz(),
+                    ),
                 )
             }
             SessionNotice::Disconnected => ("DISCONNECTED".to_string(), VaraResponse::Disconnected),
@@ -802,6 +902,15 @@ impl EventLoop {
                 }
             })
         };
+        // VARA command-port keepalive: `IAMALIVE` to every client every
+        // `vara_keepalive_period`, from a task of its own so a stalled event
+        // loop (see `wait_for_clear_channel`) cannot block it. `set_vara_
+        // responses` is always called before `run()` (main.rs, tests), so a
+        // wired daemon always gets the keepalive.
+        let keepalive = self
+            .vara_responses
+            .clone()
+            .map(|senders| spawn_vara_keepalive(senders, self.vara_keepalive_period));
 
         while self.running {
             tokio::select! {
@@ -862,6 +971,9 @@ impl EventLoop {
         }
 
         feeder.abort();
+        if let Some(keepalive) = keepalive {
+            keepalive.abort();
+        }
         Ok(())
     }
 
@@ -964,34 +1076,37 @@ impl EventLoop {
             HostEvent::DataReceived { client_id, data } => {
                 tracing::debug!(client_id, bytes = data.len(), "Data received from client");
 
-                // If there's an established session, wrap data in a MAC PDU
+                // If there's an established session, wrap data in a MAC PDU.
+                // The frame's source is the SESSION's own local callsign (not
+                // `self.local_callsign`, which a mid-session `MYCALL` can
+                // change): the peer looks the session up by `pdu.src`, so a
+                // runtime callsign change must not make it silently drop
+                // every later data frame.
                 let session_info = self.session_mgr.active_sessions().iter().find_map(|&id| {
                     self.session_mgr
                         .get(id)
                         .filter(|s| s.is_established())
-                        .map(|s| (s.remote.clone(), s.ssid))
+                        .map(|s| (s.remote.clone(), s.local.clone(), s.ssid))
                 });
 
-                if let Some((remote, ssid)) = session_info {
-                    if let Some(ref local) = self.local_callsign {
-                        let mac_pdu = MacPdu::new_data(remote, local.clone(), ssid, data.clone());
-                        let pdu_bytes = mac_pdu.to_bytes();
-                        match self.engine.encode_bytes(&pdu_bytes) {
-                            Ok(samples) => {
-                                self.transmit_samples(&samples).await;
-                                self.tx_frame_count += 1;
-                                tracing::debug!(
-                                    frame = self.tx_frame_count,
-                                    max = self.max_frames_per_turn,
-                                    "Session data frame transmitted"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(client_id, error = %e, "Failed to encode session data")
-                            }
+                if let Some((remote, local, ssid)) = session_info {
+                    let mac_pdu = MacPdu::new_data(remote, local, ssid, data.clone());
+                    let pdu_bytes = mac_pdu.to_bytes();
+                    match self.engine.encode_bytes(&pdu_bytes) {
+                        Ok(samples) => {
+                            self.transmit_samples(&samples).await;
+                            self.tx_frame_count += 1;
+                            tracing::debug!(
+                                frame = self.tx_frame_count,
+                                max = self.max_frames_per_turn,
+                                "Session data frame transmitted"
+                            );
                         }
-                        return;
+                        Err(e) => {
+                            tracing::warn!(client_id, error = %e, "Failed to encode session data")
+                        }
                     }
+                    return;
                 }
 
                 // Fall through: no session — use raw/ARQ encode path
@@ -1030,29 +1145,49 @@ impl EventLoop {
             }
             HostEvent::VaraCommand { client_id, command } => {
                 tracing::debug!(client_id, command = %command, "VARA command received");
-                let cmd = command.trim().to_uppercase();
-                if cmd == "LISTEN ON" {
-                    self.listening = true;
-                    tracing::info!("Listening for incoming connections");
-                } else if cmd == "LISTEN OFF" {
-                    self.listening = false;
-                    tracing::info!("Stopped listening for incoming connections");
-                } else if cmd == "TUNE" || cmd.starts_with("TUNE ") {
-                    // Task 1 (Phase 4): TX level calibration. `TUNE` (or `TUNE
-                    // <seconds>`) generates the standard SSB two-tone
-                    // calibration signal and sends it through the same
-                    // PTT-key/stream/PTT-unkey path real frames use
-                    // (`transmit_samples`), so an operator can set their
-                    // radio's audio drive level via ALC exactly as they would
-                    // for real traffic.
-                    let seconds = cmd
-                        .strip_prefix("TUNE ")
-                        .and_then(|s| s.trim().parse::<f32>().ok())
-                        .filter(|s| *s > 0.0)
-                        .unwrap_or(10.0);
-                    tracing::info!(seconds, "TUNE: transmitting TX-level calibration tone");
-                    let samples = self.engine.tune_tone(seconds, None);
-                    self.transmit_samples(&samples).await;
+                let command = VaraCommand::parse(&command);
+                // Reply first: it answers the command itself, so it reaches
+                // the client before anything the command causes (TUNE's PTT
+                // lines).
+                self.reply_vara(client_id, vara_reply(&command)).await;
+                match command {
+                    VaraCommand::Listen(on) => {
+                        self.listening = on;
+                        if on {
+                            tracing::info!("Listening for incoming connections");
+                        } else {
+                            tracing::info!("Stopped listening for incoming connections");
+                        }
+                    }
+                    VaraCommand::Tune(seconds) => {
+                        // Task 1 (Phase 4): TX level calibration. `TUNE` (or
+                        // `TUNE <seconds>`) generates the standard SSB
+                        // two-tone calibration signal and sends it through
+                        // the same PTT-key/stream/PTT-unkey path real frames
+                        // use (`transmit_samples`), so an operator can set
+                        // their radio's audio drive level via ALC exactly as
+                        // they would for real traffic.
+                        let seconds = seconds.unwrap_or(10.0);
+                        tracing::info!(seconds, "TUNE: transmitting TX-level calibration tone");
+                        let samples = self.engine.tune_tone(seconds, None);
+                        self.transmit_samples(&samples).await;
+                    }
+                    VaraCommand::MyCall(call) => match Callsign::new(&call) {
+                        Ok(callsign) => {
+                            tracing::info!(callsign = %callsign, "Local callsign set by MYCALL");
+                            self.local_callsign = Some(callsign);
+                        }
+                        // Already answered WRONG by `vara_reply`; keep the
+                        // callsign in force.
+                        Err(e) => {
+                            tracing::warn!(callsign = %call, error = %e, "MYCALL rejected")
+                        }
+                    },
+                    // VERSION is answered by the reply itself. COMPRESSION,
+                    // BW* and ABORT are accepted but not implemented.
+                    // CONNECT/DISCONNECT arrive as
+                    // ConnectRequest/DisconnectRequest.
+                    _ => {}
                 }
             }
             HostEvent::ConnectRequest {
@@ -1061,6 +1196,10 @@ impl EventLoop {
                 destination,
             } => {
                 tracing::info!(client_id, destination = %destination, "Connect request");
+                // Reply first (never WRONG: Pat's dial waits only on
+                // CONNECTED/DISCONNECTED), before every early-return
+                // DISCONNECTED and before the CONNECT_REQ goes on air.
+                self.reply_vara(client_id, VaraResponse::Ok).await;
 
                 let local = match self.local_callsign {
                     Some(ref cs) => cs.clone(),
@@ -1121,6 +1260,7 @@ impl EventLoop {
             }
             HostEvent::DisconnectRequest { client_id } => {
                 tracing::info!(client_id, "Disconnect request");
+                self.reply_vara(client_id, VaraResponse::Ok).await;
 
                 // Find first active established session
                 let session_id = self
@@ -4453,7 +4593,7 @@ mod tests {
         let (b_tx, mut b_rx) = mpsc::channel(64);
         a.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, a_tx)]))));
         b.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, b_tx)]))));
-        fn session_lines(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<String> {
+        fn session_lines(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<VaraResponse> {
             std::iter::from_fn(|| rx.try_recv().ok())
                 .filter(|response| {
                     matches!(
@@ -4463,7 +4603,6 @@ mod tests {
                             | VaraResponse::Pending
                     )
                 })
-                .map(|response| response.format())
                 .collect()
         }
         a.handle_host_event(HostEvent::ConnectRequest {
@@ -4480,15 +4619,171 @@ mod tests {
         );
         a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "CONNECT_ACK"))
             .await;
-        assert_eq!(session_lines(&mut a_rx), ["CONNECTED VK3ABC W1AW\r\n"]);
+        assert_eq!(
+            session_lines(&mut a_rx),
+            [VaraResponse::Connected(
+                "VK3ABC".into(),
+                "W1AW".into(),
+                2400
+            )]
+        );
         assert!(
             session_lines(&mut b_rx).is_empty(),
             "responder waits for CFM"
         );
         b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_CFM"))
             .await;
-        assert_eq!(session_lines(&mut b_rx), ["CONNECTED VK3ABC W1AW\r\n"]);
+        assert_eq!(
+            session_lines(&mut b_rx),
+            [VaraResponse::Connected(
+                "VK3ABC".into(),
+                "W1AW".into(),
+                2400
+            )]
+        );
         assert!(session_lines(&mut a_rx).is_empty());
+    }
+
+    /// COP-28: a `MYCALL` on each station replaces the configured callsign
+    /// before the session starts, and both stations' `CONNECTED` lines name
+    /// the MYCALL callsigns (caller first). This covers both of Pat's
+    /// `handleConnected` arms — the initiator's `src == myCall` and the
+    /// responder's `dst == myCall` — which are what keep Pat from panicking
+    /// with `unhandled CONNECTED cmd`.
+    #[tokio::test]
+    async fn mycall_names_both_stations_in_connected() {
+        fn session_lines(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<VaraResponse> {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|response| {
+                    matches!(
+                        response,
+                        VaraResponse::Connected(..)
+                            | VaraResponse::Disconnected
+                            | VaraResponse::Pending
+                    )
+                })
+                .collect()
+        }
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = "VK3ABC".into();
+        config.radio.ptt_pre_delay_ms = 0;
+        config.radio.ptt_tail_delay_ms = 0;
+        let mut a = EventLoop::new(config.clone()).unwrap();
+        config.engine.callsign = "W1AW".into();
+        let mut b = EventLoop::new(config).unwrap();
+        a.listening = true;
+        b.listening = true;
+        let (a_producer, mut a_consumer) = coppa_audio::audio_ring(1_000_000);
+        let (b_producer, mut b_consumer) = coppa_audio::audio_ring(1_000_000);
+        a.set_audio_out(a_producer);
+        b.set_audio_out(b_producer);
+        let (a_tx, mut a_rx) = mpsc::channel(64);
+        let (b_tx, mut b_rx) = mpsc::channel(64);
+        a.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, a_tx)]))));
+        b.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, b_tx)]))));
+
+        a.handle_host_event(HostEvent::VaraCommand {
+            client_id: 1,
+            command: "MYCALL W5AU".into(),
+        })
+        .await;
+        b.handle_host_event(HostEvent::VaraCommand {
+            client_id: 1,
+            command: "MYCALL K7XYZ".into(),
+        })
+        .await;
+        assert_eq!(a.local_callsign, Some(Callsign::new("W5AU").unwrap()));
+        assert_eq!(b.local_callsign, Some(Callsign::new("K7XYZ").unwrap()));
+
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "W5AU".into(),
+            destination: "K7XYZ".into(),
+        })
+        .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_REQ"))
+            .await;
+        a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "CONNECT_ACK"))
+            .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_CFM"))
+            .await;
+
+        let expected = [VaraResponse::Connected("W5AU".into(), "K7XYZ".into(), 2400)];
+        assert_eq!(session_lines(&mut a_rx), expected);
+        assert_eq!(session_lines(&mut b_rx), expected);
+    }
+
+    /// COP-28: a `MYCALL` that arrives mid-session must not break the
+    /// session. In-session data frames carry the session's OWN local
+    /// callsign, not the current `local_callsign`, so the peer's lookup by
+    /// `pdu.src` still finds the session and delivers the data.
+    #[tokio::test]
+    async fn mycall_mid_session_keeps_the_session_callsign() {
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = "VK3ABC".into();
+        config.radio.ptt_pre_delay_ms = 0;
+        config.radio.ptt_tail_delay_ms = 0;
+        let mut a = EventLoop::new(config.clone()).unwrap();
+        config.engine.callsign = "W1AW".into();
+        let mut b = EventLoop::new(config).unwrap();
+        a.listening = true;
+        b.listening = true;
+        let (a_producer, mut a_consumer) = coppa_audio::audio_ring(1_000_000);
+        let (b_producer, mut b_consumer) = coppa_audio::audio_ring(1_000_000);
+        a.set_audio_out(a_producer);
+        b.set_audio_out(b_producer);
+
+        // Establish the session as the configured callsigns.
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "VK3ABC".into(),
+            destination: "W1AW".into(),
+        })
+        .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_REQ"))
+            .await;
+        a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "CONNECT_ACK"))
+            .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_CFM"))
+            .await;
+        assert!(a.session_mgr.active_sessions().iter().any(|&id| {
+            a.session_mgr
+                .get(id)
+                .map(|s| s.is_established())
+                .unwrap_or(false)
+        }));
+
+        // Only now wire b's response channel, so the handshake's
+        // StatusUpdate lines are dropped and the next delivery is the data
+        // frame's DataOut.
+        let (data_tx, mut data_rx) = mpsc::channel(64);
+        b.set_response_tx(data_tx);
+
+        // Mid-session MYCALL on the sender, then a data frame.
+        a.handle_host_event(HostEvent::VaraCommand {
+            client_id: 1,
+            command: "MYCALL W5AU".into(),
+        })
+        .await;
+        assert_eq!(a.local_callsign, Some(Callsign::new("W5AU").unwrap()));
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"hello".to_vec(),
+        })
+        .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "data frame"))
+            .await;
+
+        let got = tokio::time::timeout(Duration::from_secs(2), data_rx.recv())
+            .await
+            .expect("b must deliver the data frame's payload")
+            .expect("response channel closed");
+        match got {
+            coppa_host::HostResponse::DataOut { client_id: _, data } => {
+                assert_eq!(data, b"hello");
+            }
+            other => panic!("expected DataOut, got {:?}", other),
+        }
     }
 
     /// Two real stations with real audio rings and CP negotiation enabled,
@@ -6619,6 +6914,156 @@ mod tests {
         assert!(!event_loop.listening);
     }
 
+    // ── COP-28: OK/WRONG/VERSION replies, runtime MYCALL, IAMALIVE ──────────
+
+    /// The reply rule for every command kind the parser can produce, as one
+    /// table driven through the pure `vara_reply` function. See `vara_reply`'s
+    /// rustdoc for the reasoning behind each row.
+    #[test]
+    fn vara_reply_answers_every_command_kind() {
+        let ok = vec![
+            "MYCALL W5AU",
+            "mycall w5au-10",
+            "LISTEN ON",
+            "LISTEN OFF",
+            "TUNE",
+            "TUNE 1",
+            "CONNECT W5AU K7XYZ",
+            "DISCONNECT",
+            "COMPRESSION TEXT",
+            "BW2300",
+            "BW500",
+            "ABORT",
+        ];
+        let wrong = vec![
+            "MYCALL VE3ABCD-15", // 10 chars
+            "MYCALL W5AU!",
+            "MYCALL",
+            "LISTEN",
+            "LISTEN MAYBE",
+            "CONNECT W5AU",
+            "PUBLIC ON",
+            "CWID ON",
+            "WINLINK SESSION",
+            "P2P SESSION",
+            "CLEANTXBUFFER",
+            "FOOBAR",
+            r#"{"type":"mycall","callsign":"W5AU"}"#,
+        ];
+        for line in ok {
+            assert_eq!(
+                vara_reply(&VaraCommand::parse(line)),
+                VaraResponse::Ok,
+                "{line:?} should be answered OK"
+            );
+        }
+        for line in wrong {
+            assert_eq!(
+                vara_reply(&VaraCommand::parse(line)),
+                VaraResponse::Wrong,
+                "{line:?} should be answered WRONG"
+            );
+        }
+        assert_eq!(
+            vara_reply(&VaraCommand::parse("VERSION")),
+            VaraResponse::coppa_version(),
+            "VERSION is answered with the version line, never OK"
+        );
+    }
+
+    /// COP-28: a valid `MYCALL` replaces the configured callsign (upper-cased
+    /// by `Callsign::new`); invalid ones leave it untouched.
+    #[tokio::test]
+    async fn mycall_replaces_the_configured_callsign() {
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = "VK3ABC".into();
+        let mut station = EventLoop::new(config).unwrap();
+
+        station
+            .handle_host_event(HostEvent::VaraCommand {
+                client_id: 1,
+                command: "MYCALL w5au".into(),
+            })
+            .await;
+        assert_eq!(station.local_callsign, Some(Callsign::new("W5AU").unwrap()));
+
+        for rejected in ["MYCALL W5AU!", "MYCALL VE3ABCD-15"] {
+            station
+                .handle_host_event(HostEvent::VaraCommand {
+                    client_id: 1,
+                    command: rejected.into(),
+                })
+                .await;
+        }
+        assert_eq!(
+            station.local_callsign,
+            Some(Callsign::new("W5AU").unwrap()),
+            "an invalid MYCALL must keep the callsign in force"
+        );
+    }
+
+    /// COP-28: a station with no configured callsign gets one from `MYCALL`,
+    /// which arms the station-ID/beacon path that `local_callsign: None`
+    /// silently disables.
+    #[tokio::test]
+    async fn mycall_gives_an_unconfigured_station_a_callsign() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        assert_eq!(station.local_callsign, None);
+        assert!(station.build_beacon_mac_pdu().is_none());
+
+        station
+            .handle_host_event(HostEvent::VaraCommand {
+                client_id: 1,
+                command: "MYCALL W5AU".into(),
+            })
+            .await;
+        assert_eq!(station.local_callsign, Some(Callsign::new("W5AU").unwrap()));
+
+        let pdu = station
+            .build_beacon_mac_pdu()
+            .expect("MYCALL should arm the station-ID/beacon path");
+        assert_eq!(pdu.src.as_str(), "W5AU");
+    }
+
+    /// COP-28: the keepalive sends `IAMALIVE` to every wired client exactly
+    /// once per 60 s period, with the first one a full period after start
+    /// (nothing at t=0).
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_sends_iamalive_every_sixty_seconds() {
+        let (tx1, mut rx1) = mpsc::channel(4);
+        let (tx2, mut rx2) = mpsc::channel(4);
+        let senders: VaraResponseSenders =
+            Arc::new(Mutex::new(HashMap::from([(1, tx1), (2, tx2)])));
+        let task = spawn_vara_keepalive(senders, VARA_KEEPALIVE_PERIOD);
+
+        tokio::time::advance(Duration::from_secs(59)).await;
+        for rx in [&mut rx1, &mut rx2] {
+            let got = tokio::time::timeout(Duration::from_millis(1), rx.recv()).await;
+            assert!(got.is_err(), "nothing may be sent before the first tick");
+        }
+
+        for _ in 0..2 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            for rx in [&mut rx1, &mut rx2] {
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                        .await
+                        .expect("both clients must hear each IAMALIVE")
+                        .expect("channel closed"),
+                    VaraResponse::IAmAlive
+                );
+            }
+        }
+
+        task.abort();
+    }
+
+    #[test]
+    fn event_loop_default_keepalive_period_is_sixty_seconds() {
+        let event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        assert_eq!(event_loop.vara_keepalive_period, Duration::from_secs(60));
+    }
+
     // ── Task 5: real wire-level round-trip integration tests ─────────────────
     //
     // Unlike `crates/coppa-bench/examples/closed_loop_arq.rs` (which drives
@@ -7106,7 +7551,7 @@ mod tests {
         use super::*;
         use coppa_host::vara::VaraServer;
         use std::time::Duration;
-        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
         use tokio::net::TcpStream;
 
@@ -7146,6 +7591,56 @@ mod tests {
             let server = VaraServer::new(cmd_port, data_port);
             event_loop.set_vara_responses(server.response_senders());
 
+            tokio::spawn(async move {
+                let _ = server.run().await;
+            });
+            // Give the server a moment to bind before connecting.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let stream = TcpStream::connect(("127.0.0.1", cmd_port))
+                .await
+                .expect("mock client should connect to the VARA command port");
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+
+            let mut greeting = String::new();
+            reader
+                .read_line(&mut greeting)
+                .await
+                .expect("should read the initial VERSION greeting");
+            assert!(
+                greeting.starts_with("VERSION"),
+                "expected a VERSION greeting first, got: {}",
+                greeting
+            );
+
+            (reader, write_half)
+        }
+
+        /// `connect_mock_vara_client`'s socket/server wiring plus the event
+        /// bridge `main.rs` installs: the server's `HostEvent`s are forwarded
+        /// into the loop's own channel, so commands written on the socket
+        /// reach `handle_host_event` for real and get their reply. Tests that
+        /// drive commands through the socket (rather than injecting
+        /// `DaemonEvent::Host` by hand) need this helper AND a running
+        /// `run()` (in a `LocalSet`), or nothing consumes the forwarded
+        /// events.
+        async fn connect_bridged_vara_client(
+            event_loop: &mut EventLoop,
+            cmd_port: u16,
+            data_port: u16,
+        ) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
+            let mut server = VaraServer::new(cmd_port, data_port);
+            event_loop.set_vara_responses(server.response_senders());
+            let mut events = server.take_event_rx().expect("fresh server");
+            let to_loop = event_loop.event_sender();
+            tokio::spawn(async move {
+                while let Some(event) = events.recv().await {
+                    if to_loop.send(DaemonEvent::Host(event)).await.is_err() {
+                        break;
+                    }
+                }
+            });
             tokio::spawn(async move {
                 let _ = server.run().await;
             });
@@ -7267,11 +7762,14 @@ mod tests {
                 .unwrap();
             station.handle_mac_pdu(ack).await;
             assert_eq!(
-                next_session_line(&mut reader).await,
-                "CONNECTED VK3ABC W1AW\r\n"
+                next_session_line(&mut reader).await.trim_end(),
+                "CONNECTED VK3ABC W1AW 2400"
             );
             station.handle_mac_pdu(remote.disconnect().unwrap()).await;
-            assert_eq!(next_session_line(&mut reader).await, "DISCONNECTED\r\n");
+            assert_eq!(
+                next_session_line(&mut reader).await.trim_end(),
+                "DISCONNECTED"
+            );
         }
 
         #[tokio::test]
@@ -7290,8 +7788,35 @@ mod tests {
                 .unwrap();
             station.handle_mac_pdu(cfm).await;
             assert_eq!(
-                next_session_line(&mut reader).await,
-                "CONNECTED W1AW VK3ABC\r\n"
+                next_session_line(&mut reader).await.trim_end(),
+                "CONNECTED W1AW VK3ABC 2400"
+            );
+        }
+
+        /// COP-28: the `CONNECTED` bandwidth token follows the live profile
+        /// rather than being a constant — a VHF station reports its wider
+        /// 112-carrier x 50 Hz = 5600 Hz occupancy.
+        #[tokio::test]
+        async fn vhf_station_reports_its_wider_bandwidth() {
+            let mut config = session_config();
+            config.engine.profile = "VHF_FAST".into();
+            let mut station = EventLoop::new(config).unwrap();
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19446, 19447).await;
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "VK3ABC".into(),
+                    destination: "W1AW".into(),
+                })
+                .await;
+            let mut remote = peer();
+            let ack = remote
+                .handle_connect_req(&LinkCapabilities::default().to_bytes())
+                .unwrap();
+            station.handle_mac_pdu(ack).await;
+            assert_eq!(
+                next_session_line(&mut reader).await.trim_end(),
+                "CONNECTED VK3ABC W1AW 5600"
             );
         }
 
@@ -7303,11 +7828,17 @@ mod tests {
             station
                 .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
                 .await;
-            assert_eq!(next_session_line(&mut reader).await, "DISCONNECTED\r\n");
+            assert_eq!(
+                next_session_line(&mut reader).await.trim_end(),
+                "DISCONNECTED"
+            );
             let id = seed_established(&mut station);
             station.session_mgr.get_mut(id).unwrap().session_timeout = Duration::ZERO;
             station.reap_timed_out_sessions().await;
-            assert_eq!(next_session_line(&mut reader).await, "DISCONNECTED\r\n");
+            assert_eq!(
+                next_session_line(&mut reader).await.trim_end(),
+                "DISCONNECTED"
+            );
             station
                 .handle_host_event(HostEvent::ConnectRequest {
                     client_id: 1,
@@ -7315,7 +7846,231 @@ mod tests {
                     destination: "NOT/A/CALL".into(),
                 })
                 .await;
-            assert_eq!(next_session_line(&mut reader).await, "DISCONNECTED\r\n");
+            assert_eq!(
+                next_session_line(&mut reader).await.trim_end(),
+                "DISCONNECTED"
+            );
+        }
+
+        /// COP-28: Pat's startup burst — commands the parser does not know
+        /// (`PUBLIC`, `CWID`), commands it accepts-but-ignores
+        /// (`COMPRESSION`, `LISTEN`), `MYCALL`, `VERSION` and garbage — each
+        /// gets exactly one reply, in order, and no reply is doubled.
+        #[tokio::test]
+        async fn pat_startup_commands_each_get_their_reply() {
+            let config = fast_ptt_config();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, mut write_half) =
+                connect_bridged_vara_client(&mut event_loop, 19448, 19449).await;
+
+            let local = tokio::task::LocalSet::new();
+            local.spawn_local(async move {
+                let _ = event_loop.run().await;
+            });
+
+            local
+                .run_until(async move {
+                    write_half
+                        .write_all(
+                            b"PUBLIC ON\rCWID ON\rCOMPRESSION TEXT\rMYCALL W5AU\rLISTEN OFF\r\
+                              VERSION\rFOOBAR\r",
+                        )
+                        .await
+                        .unwrap();
+                    let mut replies = Vec::new();
+                    for _ in 0..7 {
+                        replies.push(read_line(&mut reader).await.trim_end().to_string());
+                    }
+                    let version = VaraResponse::coppa_version().format();
+                    assert_eq!(
+                        replies,
+                        vec![
+                            "WRONG",
+                            "WRONG",
+                            "OK",
+                            "OK",
+                            "OK",
+                            version.trim_end(),
+                            "WRONG",
+                        ],
+                        "each command gets exactly the reply the table promises"
+                    );
+                    assert!(
+                        read_available_lines(&mut reader).await.is_empty(),
+                        "no reply may be doubled"
+                    );
+                })
+                .await;
+        }
+
+        /// COP-28: a well-formed `CONNECT` is answered `OK` before its
+        /// outcome (`DISCONNECTED` on failure, PTT lines once the CONNECT_REQ
+        /// goes on air) — never `WRONG`, which would hang Pat's dial. Also
+        /// covers `DISCONNECT`'s `OK` on this port.
+        #[tokio::test]
+        async fn connect_gets_ok_before_its_outcome() {
+            let config = session_config();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, mut write_half) =
+                connect_bridged_vara_client(&mut event_loop, 19450, 19451).await;
+
+            let local = tokio::task::LocalSet::new();
+            local.spawn_local(async move {
+                let _ = event_loop.run().await;
+            });
+
+            local
+                .run_until(async move {
+                    // DISCONNECT with no session: exactly one line, its OK.
+                    write_half.write_all(b"DISCONNECT\r").await.unwrap();
+                    assert_eq!(read_line(&mut reader).await.trim_end(), "OK");
+                    assert!(
+                        read_available_lines(&mut reader).await.is_empty(),
+                        "a session-less DISCONNECT produces nothing but its OK"
+                    );
+
+                    // A failed CONNECT: OK first, then the DISCONNECTED outcome.
+                    write_half
+                        .write_all(b"CONNECT VK3ABC NOT/A/CALL\r")
+                        .await
+                        .unwrap();
+                    assert_eq!(read_line(&mut reader).await.trim_end(), "OK");
+                    assert_eq!(read_line(&mut reader).await.trim_end(), "DISCONNECTED");
+
+                    // A well-formed CONNECT: OK first, the CONNECT_REQ on air
+                    // (PTT ON among the later lines), and no WRONG anywhere.
+                    write_half
+                        .write_all(b"CONNECT VK3ABC W1AW\r")
+                        .await
+                        .unwrap();
+                    assert_eq!(read_line(&mut reader).await.trim_end(), "OK");
+                    let mut saw_ptt_on = false;
+                    for line in read_available_lines(&mut reader).await {
+                        let line = line.trim_end();
+                        if line == "PTT ON" {
+                            saw_ptt_on = true;
+                        }
+                        assert_ne!(
+                            line, "WRONG",
+                            "a well-formed CONNECT is never answered WRONG"
+                        );
+                    }
+                    assert!(
+                        saw_ptt_on,
+                        "the CONNECT_REQ must go on air after the OK (PTT ON)"
+                    );
+                })
+                .await;
+        }
+
+        /// COP-28: a reply goes only to the client that asked, never to every
+        /// attached command-port client.
+        #[tokio::test]
+        async fn replies_go_only_to_the_client_that_asked() {
+            let config = fast_ptt_config();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader_a, mut write_a) =
+                connect_bridged_vara_client(&mut event_loop, 19452, 19453).await;
+
+            // A second raw client on the same server: greeting, then silence.
+            let stream_b = TcpStream::connect(("127.0.0.1", 19452)).await.unwrap();
+            let (read_b, _write_b) = stream_b.into_split();
+            let mut reader_b = BufReader::new(read_b);
+            let mut greeting_b = String::new();
+            reader_b
+                .read_line(&mut greeting_b)
+                .await
+                .expect("client B should also get the greeting");
+
+            let local = tokio::task::LocalSet::new();
+            local.spawn_local(async move {
+                let _ = event_loop.run().await;
+            });
+
+            local
+                .run_until(async move {
+                    write_a.write_all(b"FOOBAR\r").await.unwrap();
+                    assert_eq!(read_line(&mut reader_a).await.trim_end(), "WRONG");
+                    let b_lines = read_available_lines(&mut reader_b).await;
+                    assert!(
+                        b_lines.iter().all(|l| l.trim_end() != "WRONG"),
+                        "client B must not see client A's reply: {:?}",
+                        b_lines
+                    );
+                })
+                .await;
+        }
+
+        /// COP-28: a WebSocket-originated event (whose client ID is from
+        /// `coppa_host::websocket::FIRST_CLIENT_ID`'s range) must never draw
+        /// an OK/WRONG reply on a VARA command-port socket, and the WS
+        /// `mycall` message stays a no-op.
+        #[cfg(feature = "websocket")]
+        #[tokio::test]
+        async fn websocket_ids_never_draw_a_vara_reply() {
+            use coppa_host::websocket::FIRST_CLIENT_ID;
+            let config = session_config();
+            let mut station = EventLoop::new(config).unwrap();
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19454, 19455).await;
+
+            station
+                .handle_host_event(HostEvent::VaraCommand {
+                    client_id: FIRST_CLIENT_ID,
+                    command: r#"{"type":"mycall","callsign":"W5AU"}"#.to_string(),
+                })
+                .await;
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: FIRST_CLIENT_ID,
+                    source: "VK3ABC".to_string(),
+                    destination: "NOT/A/CALL".to_string(),
+                })
+                .await;
+
+            assert_eq!(
+                station.local_callsign,
+                Some(Callsign::new("VK3ABC").unwrap()),
+                "the WS mycall message must stay a no-op"
+            );
+            let lines = read_available_lines(&mut reader).await;
+            assert!(
+                lines
+                    .iter()
+                    .all(|l| l.trim_end() != "OK" && l.trim_end() != "WRONG"),
+                "a WebSocket-originated event must not draw a command-port reply: {:?}",
+                lines
+            );
+        }
+
+        /// COP-28: `IAMALIVE` reaches the command port while `run()` is
+        /// running, the first one a full period after start (nothing at t=0).
+        /// Uses a shortened `vara_keepalive_period` so the test runs in
+        /// milliseconds; the real 60 s constant is pinned by
+        /// `keepalive_sends_iamalive_every_sixty_seconds`.
+        #[tokio::test]
+        async fn iamalive_reaches_the_command_port_while_running() {
+            let config = fast_ptt_config();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            event_loop.vara_keepalive_period = Duration::from_millis(250);
+            let (mut reader, _write_half) =
+                connect_bridged_vara_client(&mut event_loop, 19456, 19457).await;
+            let started = Instant::now();
+
+            let local = tokio::task::LocalSet::new();
+            local.spawn_local(async move {
+                let _ = event_loop.run().await;
+            });
+
+            local
+                .run_until(async move {
+                    assert_eq!(read_line(&mut reader).await.trim_end(), "IAMALIVE");
+                    assert!(
+                        started.elapsed() >= Duration::from_millis(200),
+                        "the first IAMALIVE must arrive a full period after start, not at t=0"
+                    );
+                    assert_eq!(read_line(&mut reader).await.trim_end(), "IAMALIVE");
+                })
+                .await;
         }
 
         #[cfg(feature = "websocket")]
@@ -7779,8 +8534,16 @@ mod tests {
                     .await
                     .unwrap();
 
+                    // COP-28: the OK reply comes first, before the PTT
+                    // bracket the command causes.
                     let mut lines = Vec::new();
-                    for _ in 0..8 {
+                    lines.push(read_line(&mut reader).await);
+                    assert_eq!(
+                        lines[0].trim_end(),
+                        "OK",
+                        "TUNE must be answered OK before its PTT bracket"
+                    );
+                    for _ in 0..7 {
                         lines.push(read_line(&mut reader).await);
                         let ptt_so_far: Vec<&str> = lines
                             .iter()

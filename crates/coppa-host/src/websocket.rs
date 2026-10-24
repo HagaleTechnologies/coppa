@@ -118,6 +118,12 @@ pub enum WsServerMessage {
 /// Maximum number of concurrent WebSocket client connections.
 const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 
+/// First WebSocket client ID. VARA command-port IDs count from 1 and data-port
+/// IDs from `0x8000_0001`; starting here keeps the three ranges apart, so the
+/// daemon's reply to one command-port client can never be addressed by a
+/// WebSocket client's ID.
+pub const FIRST_CLIENT_ID: u32 = 0x4000_0001;
+
 /// Maximum size (bytes) of a complete WebSocket message we will buffer.
 const MAX_WS_MESSAGE_SIZE: usize = 1 << 20; // 1 MiB
 
@@ -261,7 +267,7 @@ impl WebSocketServer {
             .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
             .max_frame_size(Some(MAX_WS_FRAME_SIZE));
 
-        let next_id = AtomicU32::new(1);
+        let next_id = AtomicU32::new(FIRST_CLIENT_ID);
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
         loop {
@@ -524,6 +530,18 @@ mod tests {
     fn test_ws_server_default() {
         let server = WebSocketServer::default_port();
         assert_eq!(server.port(), 8400);
+    }
+
+    /// COP-28: the WebSocket ID range must sit well above any realistic
+    /// command-port ID (which counts from 1) and below the data-port range
+    /// (`0x8000_0001`), so an ID-keyed VARA reply can never land on a
+    /// WebSocket client's number or vice versa.
+    #[test]
+    fn first_client_id_is_outside_the_vara_id_ranges() {
+        const {
+            assert!(FIRST_CLIENT_ID > 0xFFFF); // above any u16-sized id
+            assert!(FIRST_CLIENT_ID < 0x8000_0001);
+        }
     }
 
     #[test]
@@ -878,6 +896,41 @@ mod integration_tests {
         }
 
         ws.close(None).await.ok();
+    }
+
+    /// COP-28: the real `run()` numbers WebSocket clients from
+    /// `FIRST_CLIENT_ID` (`0x4000_0001`), outside both the VARA command-port
+    /// range (from 1) and the data-port range (from `0x8000_0001`), so an
+    /// ID-keyed VARA reply can never be addressed by a WebSocket client's ID.
+    #[tokio::test]
+    async fn real_server_numbers_clients_from_first_client_id() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut server = WebSocketServer::with_bind_addr(port, "127.0.0.1".to_string());
+        let mut event_rx = server.take_event_rx().expect("fresh server");
+
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timed out waiting for the first client's Connected event")
+            .expect("event channel closed");
+        assert!(matches!(
+            event,
+            HostEvent::Connected {
+                client_id: FIRST_CLIENT_ID
+            }
+        ));
+
+        drop(ws);
     }
 
     #[tokio::test]
