@@ -2125,6 +2125,15 @@ impl EventLoop {
                 // release will ever drop it from `BUFFER`.
                 self.tx_on_air_bytes = 0;
                 self.report_buffer().await;
+                // The drain that popped this payload passed its own gate
+                // check and therefore cleared `tx_held_by_frequency_gate`,
+                // but the rig can retune below 29.7 MHz during the
+                // unbounded courtesy wait above, and this refusal then
+                // creates no TxComplete/PTT-release event that would ever
+                // re-trigger a drain. Re-arm the held flag while payloads
+                // remain queued so the 500 ms `retry_held_tx_drain` poll
+                // resumes the queue once the gate reopens.
+                self.tx_held_by_frequency_gate = !self.tx_queue.is_empty();
             }
             return;
         }
@@ -10044,6 +10053,86 @@ mod tests {
             assert!(event_loop.tx_queue.is_empty());
             assert!(!event_loop.tx_held_by_frequency_gate);
             assert_eq!(event_loop.tx_generation, 1, "the held payload went out");
+        }
+
+        /// The post-wait refusal must re-arm the held-queue retry: the drain
+        /// that popped the refused payload had cleared the flag after its own
+        /// check passed, and a refused transmission creates no TxComplete or
+        /// PTT-release event that would ever re-trigger a drain. Without the
+        /// re-arm, every payload still queued behind the refused one stalls
+        /// until an unrelated host enqueue.
+        #[tokio::test(start_paused = true)]
+        async fn a_post_wait_refusal_leaves_the_remaining_queue_retryable() {
+            let rig = fake_rigctld("144500000");
+            let mut config = rigctld_config(&rig);
+            config.audio.sample_rate = 48_000;
+            config.station_id.busy_hold_ms = 10;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut audio_in_tx, audio_in_rx) = coppa_audio::audio_ring(32_768);
+            let (audio_out_tx, _audio_out_rx) = coppa_audio::audio_ring(32_768);
+            event_loop.set_audio_in(audio_in_rx);
+            event_loop.set_audio_out(audio_out_tx);
+            let mut counter = 1u32;
+            let mut noise = |amplitude: f32| -> Vec<f32> {
+                (0..1024)
+                    .map(|_| {
+                        counter = counter.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                        amplitude * ((counter >> 8) as f32 / (1u32 << 24) as f32 - 0.5)
+                    })
+                    .collect()
+            };
+            for _ in 0..10 {
+                event_loop.busy_gate.observe(&noise(0.01));
+            }
+            for _ in 0..5 {
+                event_loop.busy_gate.observe(&noise(0.5));
+            }
+            assert!(event_loop.busy_gate.current());
+            // Two queued non-ARQ payloads: the drain passes its gate check
+            // on 2m, pops the first, and blocks in the courtesy wait.
+            event_loop.tx_queue.push_back((None, b"first".to_vec()));
+            event_loop.tx_queue.push_back((None, b"second".to_vec()));
+            {
+                let drain = event_loop.try_drain_tx_queue();
+                tokio::pin!(drain);
+                tokio::select! {
+                    biased;
+                    _ = &mut drain => panic!("drain must wait for the busy channel"),
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+                // The rig retunes to HF during the wait, then the channel
+                // goes quiet and the courtesy wait releases into a refusal.
+                *rig.answer.lock().unwrap() = "14074000".into();
+                audio_in_tx.write(&noise(0.01));
+                tokio::time::timeout(Duration::from_secs(5), drain)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                event_loop.tx_generation, 0,
+                "the popped payload was refused"
+            );
+            assert_eq!(
+                event_loop.tx_queue.len(),
+                1,
+                "the second payload stays queued"
+            );
+            assert_eq!(event_loop.tx_on_air_bytes, 0, "refused bytes leave BUFFER");
+            assert!(
+                event_loop.tx_held_by_frequency_gate,
+                "the remaining queue is re-armed for the retry poll"
+            );
+
+            // Back on 2m, the ordinary retry poll (no new enqueue, no other
+            // drain trigger) resumes the remaining payload.
+            *rig.answer.lock().unwrap() = "144500000".into();
+            event_loop.retry_held_tx_drain().await;
+            assert!(event_loop.tx_queue.is_empty());
+            assert!(!event_loop.tx_held_by_frequency_gate);
+            assert_eq!(
+                event_loop.tx_generation, 1,
+                "the remaining payload went out"
+            );
         }
 
         /// A `LevelDerived` engine starts narrowband (no startup check

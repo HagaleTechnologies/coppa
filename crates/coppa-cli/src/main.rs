@@ -344,6 +344,19 @@ fn write_wav_output(
     Ok(())
 }
 
+/// Validate the `--ptt <method>` value (COP-40): an unrecognized value is a
+/// hard error in every build, not only where `build_ptt` exists -- a
+/// default (no-audio) build must reject a value the audio build would
+/// reject, rather than silently accept it.
+fn validate_ptt_method(ptt: &str) -> Result<()> {
+    match ptt {
+        "none" | "vox" | "rigctld" => Ok(()),
+        other => anyhow::bail!(
+            "unrecognized --ptt value {other:?}: expected \"none\", \"vox\", or \"rigctld\""
+        ),
+    }
+}
+
 /// Build the PTT controller for `--ptt <method>`, using `rigctld_addr` when
 /// `method` is `"rigctld"`. Split out from `transmit_live` so the
 /// `--rigctld`/CLI-flag plumbing can be unit-tested without a real audio
@@ -356,6 +369,7 @@ fn write_wav_output(
 #[cfg(feature = "cpal-backend")]
 fn build_ptt(ptt: &str, rigctld_addr: &str) -> Result<coppa_radio::PttBackend> {
     use coppa_radio::PttBackend;
+    validate_ptt_method(ptt)?;
     match ptt {
         "rigctld" => match coppa_radio::RigctldClient::connect(rigctld_addr) {
             Ok(client) => Ok(PttBackend::Rigctld(client)),
@@ -365,10 +379,8 @@ fn build_ptt(ptt: &str, rigctld_addr: &str) -> Result<coppa_radio::PttBackend> {
             }
         },
         "vox" => Ok(PttBackend::Other(Box::new(coppa_radio::VoxPtt::new()))),
-        "none" => Ok(PttBackend::Other(Box::new(coppa_radio::NullPtt::new()))),
-        other => anyhow::bail!(
-            "unrecognized --ptt value {other:?}: expected \"none\", \"vox\", or \"rigctld\""
-        ),
+        // Only "none" remains once `validate_ptt_method` has passed.
+        _ => Ok(PttBackend::Other(Box::new(coppa_radio::NullPtt::new()))),
     }
 }
 
@@ -677,11 +689,12 @@ fn cmd_tx(
             #[cfg(not(feature = "cpal-backend"))]
             {
                 // No live audio in this build, so nothing reaches the air,
-                // but a wideband request is still refused, not silently
-                // accepted.
+                // but the same arguments are validated: a typo'd --ptt is
+                // rejected exactly as the audio build rejects it, and a
+                // wideband request is still refused, not silently accepted.
+                validate_ptt_method(ptt)?;
                 cli_gate_decision(gate.profile, gate.occupied_hz, None, gate.stated)?;
                 let _ = device;
-                let _ = ptt;
                 let _ = rigctld;
                 let _ = ptt_lead_ms;
                 let _ = ptt_tail_ms;
@@ -774,11 +787,12 @@ fn cmd_tune(
             #[cfg(not(feature = "cpal-backend"))]
             {
                 // No live audio in this build, so nothing reaches the air,
-                // but a wideband request is still refused, not silently
-                // accepted.
+                // but the same arguments are validated: a typo'd --ptt is
+                // rejected exactly as the audio build rejects it, and a
+                // wideband request is still refused, not silently accepted.
+                validate_ptt_method(ptt)?;
                 cli_gate_decision(gate.profile, gate.occupied_hz, None, gate.stated)?;
                 let _ = device;
-                let _ = ptt;
                 let _ = rigctld;
                 let _ = ptt_lead_ms;
                 let _ = ptt_tail_ms;
@@ -1956,6 +1970,44 @@ mod tests {
     #[test]
     fn cli_unknown_ptt_value_is_a_hard_error() {
         let err = build_ptt("rigctld-typo", "127.0.0.1:1").err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("expected \"none\", \"vox\", or \"rigctld\""),
+            "{err}"
+        );
+    }
+
+    /// The acceptance command `coppa tx --ptt rigctld-typo` must fail in
+    /// every build, not only where audio exists (COP-40 plan, Phase 5
+    /// manual check 3). In the audio build `transmit_live` -> `build_ptt`
+    /// rejects it before any device is opened; in the default build the
+    /// no-audio arm validates it directly.
+    #[test]
+    fn cli_unknown_ptt_value_is_a_hard_error_without_audio_too() {
+        assert!(validate_ptt_method("none").is_ok());
+        assert!(validate_ptt_method("vox").is_ok());
+        assert!(validate_ptt_method("rigctld").is_ok());
+        let err = validate_ptt_method("rigctld-typo").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expected \"none\", \"vox\", or \"rigctld\""),
+            "{err}"
+        );
+        let err = cmd_tx(
+            "hi",
+            None,
+            None,
+            None,
+            None,
+            "rigctld-typo",
+            "127.0.0.1:1",
+            0,
+            0,
+            None,
+            None,
+            Verbosity::Quiet,
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("expected \"none\", \"vox\", or \"rigctld\""),
