@@ -695,6 +695,16 @@ fn cmd_tx(
     Ok(())
 }
 
+/// Occupied bandwidth (Hz) of the calibration signal `cmd_tune` emits: the
+/// two-tone spacing, or zero for a single tone. The tune signal is not an
+/// OFDM frame, so the profile's bandwidth does not apply to it.
+fn tune_occupied_hz(single: Option<f32>) -> u32 {
+    match single {
+        Some(_) => 0,
+        None => (coppa_engine::TUNE_TONE_HIGH_HZ - coppa_engine::TUNE_TONE_LOW_HZ).round() as u32,
+    }
+}
+
 /// TX level calibration ("TUNE"): generate the standard SSB two-tone signal
 /// (or a single tone via `single`), key PTT, stream it out, then unkey —
 /// mirroring `cmd_tx`'s live-playback path. See `docs/OPERATING.md` for the
@@ -744,7 +754,7 @@ fn cmd_tune(
             // gated; live transmission is (COP-40).
             let gate = LiveTxGate {
                 profile: profile.unwrap_or("default"),
-                occupied_hz: core.occupied_bandwidth_hz(),
+                occupied_hz: tune_occupied_hz(single),
                 stated: cli_frequency_evidence(frequency_hz, band)?,
             };
             #[cfg(feature = "cpal-backend")]
@@ -1896,6 +1906,33 @@ mod tests {
         assert!(cli_gate_decision("HF_STANDARD", hf.occupied_bandwidth_hz(), None, None).is_ok());
         let vhf = CoppaCore::with_config(resolve_config(Some("VHF_FAST")).unwrap());
         assert!(cli_gate_decision("VHF_FAST", vhf.occupied_bandwidth_hz(), None, None).is_err());
+    }
+
+    /// `coppa tune` emits a one- or two-tone signal well under 2.8 kHz on
+    /// any profile, so it is never refused for lack of a frequency source;
+    /// the flags are still validated.
+    #[test]
+    fn cli_tune_is_gated_on_the_tone_not_the_profile() {
+        assert_eq!(tune_occupied_hz(None), 1200);
+        assert_eq!(tune_occupied_hz(Some(1500.0)), 0);
+        assert!(cli_gate_decision("VHF_FAST", tune_occupied_hz(None), None, None).is_ok());
+        assert!(cmd_tune(
+            0.1,
+            None,
+            None,
+            Some("VHF_FAST"),
+            None,
+            "none",
+            "127.0.0.1:1",
+            0,
+            0,
+            None,
+            Some("21m"),
+            Verbosity::Quiet,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("expected an amateur band label"));
     }
 
     #[test]

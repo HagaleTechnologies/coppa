@@ -11,6 +11,7 @@ use crate::{PttControl, PttState, RadioControl, RadioMode};
 
 /// rigctld client for CAT control via hamlib.
 pub struct RigctldClient {
+    addr: String,
     stream: TcpStream,
     reader: BufReader<TcpStream>,
     frequency: u64,
@@ -28,6 +29,7 @@ impl RigctldClient {
         let reader = BufReader::new(stream.try_clone()?);
 
         Ok(Self {
+            addr: addr.to_string(),
             stream,
             reader,
             frequency: 14_074_000,
@@ -41,10 +43,48 @@ impl RigctldClient {
     /// transport or parse failure. Unlike `RadioControl::get_frequency`, this
     /// never falls back to the cached or construction-default value, so a
     /// regulatory check can tell "the rig says X" from "nobody answered".
+    ///
+    /// Any failure also replaces the connection: a timed-out read can leave
+    /// the late reply buffered on the old socket, where the next poll would
+    /// read it as the current frequency. A fresh connection cannot return a
+    /// stale answer.
     pub fn poll_frequency(&mut self) -> Option<u64> {
-        let freq = self.command("f").ok()?.trim().parse::<u64>().ok()?;
-        self.frequency = freq;
-        Some(freq)
+        let answer = self
+            .command("f")
+            .ok()
+            .and_then(|resp| resp.trim().parse::<u64>().ok());
+        match answer {
+            Some(freq) => {
+                self.frequency = freq;
+                Some(freq)
+            }
+            None => {
+                let _ = self.reconnect();
+                None
+            }
+        }
+    }
+
+    /// Replace the connection with a fresh one to the same address, dropping
+    /// anything still buffered on the old socket. Bounded by a 2 s connect
+    /// timeout per resolved address.
+    fn reconnect(&mut self) -> Result<()> {
+        use std::net::ToSocketAddrs;
+        let timeout = std::time::Duration::from_secs(2);
+        let mut last_err = anyhow!("rigctld address {} did not resolve", self.addr);
+        for sock in self.addr.to_socket_addrs()? {
+            match TcpStream::connect_timeout(&sock, timeout) {
+                Ok(stream) => {
+                    stream.set_read_timeout(Some(timeout))?;
+                    stream.set_write_timeout(Some(timeout))?;
+                    self.reader = BufReader::new(stream.try_clone()?);
+                    self.stream = stream;
+                    return Ok(());
+                }
+                Err(e) => last_err = anyhow!("Failed to reconnect to rigctld at {}: {}", sock, e),
+            }
+        }
+        Err(last_err)
     }
 
     /// Send a command and read one line of response.

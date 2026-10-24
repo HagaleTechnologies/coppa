@@ -107,3 +107,53 @@ fn ptt_backend_rigctld_delegates_ptt_and_polls_frequency() {
         })
     );
 }
+
+/// A poll whose reply arrives after the 2 s read timeout must not leave that
+/// late reply to be read by the next poll as the current frequency: the rig
+/// answered "on 2m" late, was then retuned to 20m, and the next poll must
+/// see 20m (or nothing), never the stale 2m.
+#[test]
+fn a_late_reply_is_never_read_as_the_next_polls_answer() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let polls = Arc::new(Mutex::new(0u32));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            let polls = Arc::clone(&polls);
+            std::thread::spawn(move || {
+                let mut writer = stream.try_clone().unwrap();
+                for line in BufReader::new(stream).lines() {
+                    let Ok(line) = line else { break };
+                    if line.trim() != "f" {
+                        continue;
+                    }
+                    let first = {
+                        let mut n = polls.lock().unwrap();
+                        *n += 1;
+                        *n == 1
+                    };
+                    let reply = if first {
+                        // Answer "2m", but only after the client gave up.
+                        std::thread::sleep(std::time::Duration::from_millis(2500));
+                        "144500000"
+                    } else {
+                        "14074000"
+                    };
+                    if writeln!(writer, "{reply}").is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let mut client = RigctldClient::connect(&addr).unwrap();
+    assert_eq!(client.poll_frequency(), None, "the first poll timed out");
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    assert_eq!(
+        client.poll_frequency(),
+        Some(14_074_000),
+        "the next poll reads the rig's current answer, not the stale late one"
+    );
+}

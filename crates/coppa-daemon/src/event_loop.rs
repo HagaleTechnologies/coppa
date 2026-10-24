@@ -166,6 +166,11 @@ pub struct EventLoop {
     /// wideband gate in `transmit_samples` uses when no live rigctld answer
     /// is available.
     radio_frequency: FrequencyConfig,
+    /// COP-40: set when `try_drain_tx_queue` left the queue intact because
+    /// the wideband gate refused; `run()`'s 500 ms poll retries the drain
+    /// while it is set, so held payloads go out once the rig is back on a
+    /// legal frequency instead of waiting for the next host enqueue.
+    tx_held_by_frequency_gate: bool,
     /// Optional sender for host responses (decoded data, status updates).
     response_tx: Option<mpsc::Sender<coppa_host::HostResponse>>,
     /// Playback progress from the audio output worker. `None` when no
@@ -465,6 +470,7 @@ impl EventLoop {
             audio_in: None,
             ptt,
             radio_frequency,
+            tx_held_by_frequency_gate: false,
             response_tx: None,
             output_feedback: None,
             tx_generation: 0,
@@ -667,11 +673,18 @@ impl EventLoop {
             },
             Err(GateRefusal::NoSource) => {
                 if config.radio.ptt_config() == Ok(crate::config::PttConfig::Rigctld) {
+                    // Connected but not answering `f`, or never connected
+                    // (`create_ptt`'s soft fallback to no PTT).
+                    let state = if ptt.is_rigctld() {
+                        "is not answering the frequency query"
+                    } else {
+                        "is unreachable"
+                    };
                     Err(anyhow::anyhow!(
                         "profile '{profile}' emits {occupied_hz} Hz occupied bandwidth, which \
                          47 CFR 97.307(f)(3) caps at 2.8 kHz below 29.7 MHz, and its only \
-                         frequency source (rigctld at {}) is not answering: start rigctld, or \
-                         set [radio] frequency_hz or [radio] band as a fallback frequency source",
+                         frequency source (rigctld at {}) {state}: start rigctld, or set \
+                         [radio] frequency_hz or [radio] band as a fallback frequency source",
                         config.radio.rigctld_address
                     ))
                 } else {
@@ -722,7 +735,9 @@ impl EventLoop {
                 "refusing wideband transmission: {occupied_hz} Hz occupied bandwidth and no \
                  frequency source is answering{} — 47 CFR 97.307(f)(3); set [radio] \
                  frequency_hz or [radio] band as a fallback source",
-                if self.config.radio.ptt_config() == Ok(crate::config::PttConfig::Rigctld) {
+                if self.ptt.is_rigctld() {
+                    " (rigctld not answering)"
+                } else if self.config.radio.ptt_config() == Ok(crate::config::PttConfig::Rigctld) {
                     " (rigctld unreachable)"
                 } else {
                     ""
@@ -930,6 +945,15 @@ impl EventLoop {
         }
     }
 
+    /// COP-40: retry a TX-queue drain the wideband gate held back. A no-op
+    /// unless the last drain attempt was refused, so it never changes when
+    /// an ordinary queue drains.
+    async fn retry_held_tx_drain(&mut self) {
+        if self.tx_held_by_frequency_gate {
+            self.try_drain_tx_queue().await;
+        }
+    }
+
     /// Push one raw payload onto the outbound TX queue, report the resulting
     /// `BUFFER` telemetry, and attempt to start transmitting immediately if the
     /// link is currently idle. See `tx_queue`'s field doc and `try_drain_tx_queue`.
@@ -983,6 +1007,14 @@ impl EventLoop {
     /// `ArqTx` until acked.
     async fn try_drain_tx_queue(&mut self) {
         if self.is_transmitting {
+            return;
+        }
+        // COP-40: hold queued payloads (rather than pop one and have
+        // `transmit_samples` refuse it) while the wideband gate refuses;
+        // `retry_held_tx_drain` tries again on the next poll.
+        self.tx_held_by_frequency_gate =
+            !self.tx_queue.is_empty() && self.wideband_frequency_check().is_err();
+        if self.tx_held_by_frequency_gate {
             return;
         }
         if let Some((seq_opt, data)) = self.tx_queue.pop_front() {
@@ -1148,6 +1180,7 @@ impl EventLoop {
                 _ = retransmit_poll.tick() => {
                     // E6: Check for ARQ retransmits
                     self.check_arq_retransmits().await;
+                    self.retry_held_tx_drain().await;
                 }
                 _ = beacon_poll.tick() => {
                     self.maybe_send_beacon().await;
@@ -9783,6 +9816,7 @@ mod tests {
             let err = startup_error(config);
             assert!(err.contains("frequency source"), "{err}");
             assert!(err.contains("127.0.0.1:1"), "{err}");
+            assert!(err.contains("is unreachable"), "{err}");
         }
 
         #[test]
@@ -9790,6 +9824,10 @@ mod tests {
             let rig = fake_rigctld("CHKVFO?");
             let err = startup_error(rigctld_config(&rig));
             assert!(err.contains("frequency source"), "{err}");
+            assert!(
+                err.contains("is not answering the frequency query"),
+                "{err}"
+            );
         }
 
         #[test]
@@ -9920,6 +9958,28 @@ mod tests {
                 PttState::Rx,
                 "the rig was never keyed"
             );
+        }
+
+        /// A queued payload is held, not dropped, while the gate refuses,
+        /// and goes out on the next poll once the rig is back on 2m.
+        #[tokio::test]
+        async fn a_held_tx_queue_drains_once_the_rig_is_back_on_vhf() {
+            let rig = fake_rigctld("144500000");
+            let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            *rig.answer.lock().unwrap() = "14074000".into();
+            event_loop.enqueue_tx(None, b"hello".to_vec()).await;
+            assert_eq!(event_loop.tx_queue.len(), 1, "held, not dropped");
+            assert!(event_loop.tx_held_by_frequency_gate);
+            assert_eq!(event_loop.tx_generation, 0);
+
+            event_loop.retry_held_tx_drain().await;
+            assert_eq!(event_loop.tx_queue.len(), 1, "still on HF: still held");
+
+            *rig.answer.lock().unwrap() = "144500000".into();
+            event_loop.retry_held_tx_drain().await;
+            assert!(event_loop.tx_queue.is_empty());
+            assert!(!event_loop.tx_held_by_frequency_gate);
+            assert_eq!(event_loop.tx_generation, 1, "the held payload went out");
         }
 
         /// A `LevelDerived` engine starts narrowband (no startup check
