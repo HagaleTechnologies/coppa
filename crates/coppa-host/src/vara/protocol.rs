@@ -115,32 +115,19 @@ impl VaraResponse {
     /// response.
     pub fn format(&self) -> String {
         match self {
-<<<<<<< HEAD
             VaraResponse::Ok => "OK\r".to_string(),
             VaraResponse::Wrong => "WRONG\r".to_string(),
             VaraResponse::Version(v) => format!("VERSION {}\r", v),
             VaraResponse::Pending => "PENDING\r".to_string(),
-            VaraResponse::Connected(src, dst) => format!("CONNECTED {} {}\r", src, dst),
+            VaraResponse::Connected(src, dst, bw) => {
+                format!("CONNECTED {} {} {}\r", src, dst, bw)
+            }
             VaraResponse::Disconnected => "DISCONNECTED\r".to_string(),
             VaraResponse::Ptt(on) => format!("PTT {}\r", if *on { "ON" } else { "OFF" }),
             VaraResponse::Buffer(n) => format!("BUFFER {}\r", n),
             VaraResponse::Busy(b) => format!("BUSY {}\r", if *b { "ON" } else { "OFF" }),
             VaraResponse::Snr(snr) => format!("SNR {}\r", snr),
-=======
-            VaraResponse::Ok => "OK\r\n".to_string(),
-            VaraResponse::Wrong => "WRONG\r\n".to_string(),
-            VaraResponse::Version(v) => format!("VERSION {}\r\n", v),
-            VaraResponse::Pending => "PENDING\r\n".to_string(),
-            VaraResponse::Connected(src, dst, bw) => {
-                format!("CONNECTED {} {} {}\r\n", src, dst, bw)
-            }
-            VaraResponse::Disconnected => "DISCONNECTED\r\n".to_string(),
-            VaraResponse::Ptt(on) => format!("PTT {}\r\n", if *on { "ON" } else { "OFF" }),
-            VaraResponse::Buffer(n) => format!("BUFFER {}\r\n", n),
-            VaraResponse::Busy(b) => format!("BUSY {}\r\n", if *b { "ON" } else { "OFF" }),
-            VaraResponse::Snr(snr) => format!("SNR {}\r\n", snr),
-            VaraResponse::IAmAlive => "IAMALIVE\r\n".to_string(),
->>>>>>> 61477ee30f698aa9fa7e9cd388e071659359bfdc
+            VaraResponse::IAmAlive => "IAMALIVE\r".to_string(),
         }
     }
 
@@ -222,25 +209,15 @@ mod tests {
         );
         assert_eq!(VaraResponse::Pending.format(), "PENDING\r");
         assert_eq!(
-<<<<<<< HEAD
-            VaraResponse::Connected("VK2ABC".to_string(), "VK3DEF".to_string()).format(),
-            "CONNECTED VK2ABC VK3DEF\r"
+            VaraResponse::Connected("VK2ABC".to_string(), "VK3DEF".to_string(), 2400).format(),
+            "CONNECTED VK2ABC VK3DEF 2400\r"
         );
         assert_eq!(VaraResponse::Disconnected.format(), "DISCONNECTED\r");
         assert_eq!(VaraResponse::Ptt(true).format(), "PTT ON\r");
         assert_eq!(VaraResponse::Buffer(42).format(), "BUFFER 42\r");
         assert_eq!(VaraResponse::Busy(false).format(), "BUSY OFF\r");
         assert_eq!(VaraResponse::Snr(15).format(), "SNR 15\r");
-=======
-            VaraResponse::Connected("VK2ABC".to_string(), "VK3DEF".to_string(), 2400).format(),
-            "CONNECTED VK2ABC VK3DEF 2400\r\n"
-        );
-        assert_eq!(VaraResponse::Disconnected.format(), "DISCONNECTED\r\n");
-        assert_eq!(VaraResponse::Ptt(true).format(), "PTT ON\r\n");
-        assert_eq!(VaraResponse::Buffer(42).format(), "BUFFER 42\r\n");
-        assert_eq!(VaraResponse::Busy(false).format(), "BUSY OFF\r\n");
-        assert_eq!(VaraResponse::Snr(15).format(), "SNR 15\r\n");
-        assert_eq!(VaraResponse::IAmAlive.format(), "IAMALIVE\r\n");
+        assert_eq!(VaraResponse::IAmAlive.format(), "IAMALIVE\r");
     }
 
     #[test]
@@ -290,7 +267,6 @@ mod tests {
             VaraResponse::coppa_version(),
             VaraResponse::Version(format!("Coppa {}", env!("CARGO_PKG_VERSION")))
         );
->>>>>>> 61477ee30f698aa9fa7e9cd388e071659359bfdc
     }
 
     #[test]

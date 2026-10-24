@@ -7613,10 +7613,6 @@ mod tests {
             (reader, write_half)
         }
 
-<<<<<<< HEAD
-        /// Read one `\r`-terminated VARA response line, timing out (rather than
-        /// hanging forever) if the client never receives one.
-=======
         /// `connect_mock_vara_client`'s socket/server wiring plus the event
         /// bridge `main.rs` installs: the server's `HostEvent`s are forwarded
         /// into the loop's own channel, so commands written on the socket
@@ -7653,11 +7649,7 @@ mod tests {
             let (read_half, write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);
 
-            let mut greeting = String::new();
-            reader
-                .read_line(&mut greeting)
-                .await
-                .expect("should read the initial VERSION greeting");
+            let greeting = read_line(&mut reader).await;
             assert!(
                 greeting.starts_with("VERSION"),
                 "expected a VERSION greeting first, got: {}",
@@ -7667,9 +7659,8 @@ mod tests {
             (reader, write_half)
         }
 
-        /// Read one `\r\n`-terminated line, timing out (rather than hanging
-        /// forever) if the client never receives one.
->>>>>>> 61477ee30f698aa9fa7e9cd388e071659359bfdc
+        /// Read one `\r`-terminated VARA response line, timing out (rather than
+        /// hanging forever) if the client never receives one.
         async fn read_line(reader: &mut BufReader<OwnedReadHalf>) -> String {
             let mut line = Vec::new();
             let n =
