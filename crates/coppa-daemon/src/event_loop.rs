@@ -2106,12 +2106,20 @@ impl EventLoop {
     /// making the "none of them are exempted" claim above actually true.
     ///
     /// COP-40: the wideband regulatory gate runs first, before the busy
-    /// wait, the station-ID prepend, PTT, or any audio -- a refused
-    /// transmission keys nothing and queues nothing. Callers see "the
-    /// transmission didn't happen", which ARQ already retransmits/times out
-    /// on like any other loss.
+    /// wait, and again after the wait before the station-ID prepend, PTT,
+    /// or any audio. A refused transmission keys nothing and queues
+    /// nothing. Callers observe a lost transmission, which ARQ already
+    /// retransmits or times out on like any other loss.
     async fn transmit_samples(&mut self, samples: &[f32]) {
-        if self.wideband_frequency_check().is_err() {
+        let allowed = if self.wideband_frequency_check().is_ok() {
+            self.wait_for_clear_channel().await;
+            // The rig can retune during the unbounded courtesy wait and
+            // its backoff. Resolve fresh evidence before committing to TX.
+            self.wideband_frequency_check().is_ok()
+        } else {
+            false
+        };
+        if !allowed {
             if !self.is_transmitting {
                 // The refused payload never reaches the air, so no PTT
                 // release will ever drop it from `BUFFER`.
@@ -2120,8 +2128,6 @@ impl EventLoop {
             }
             return;
         }
-        self.wait_for_clear_channel().await;
-
         // Station-ID timer (Phase 4 Task 3): prepend an ID/beacon frame to
         // this transmission if due. Deliberately only checked here, at an
         // actual TX opportunity -- an idle station that never transmits never
@@ -9909,6 +9915,64 @@ mod tests {
             event_loop.transmit_samples(&SAMPLES).await;
             assert_eq!(event_loop.tx_generation, 0);
             assert!(!event_loop.is_transmitting);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn wideband_tx_refused_after_retune_during_busy_wait() {
+            let rig = fake_rigctld("144500000");
+            let mut config = rigctld_config(&rig);
+            config.audio.sample_rate = 48_000;
+            config.station_id.busy_hold_ms = 10;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut audio_in_tx, audio_in_rx) = coppa_audio::audio_ring(32_768);
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(32_768);
+            event_loop.set_audio_in(audio_in_rx);
+            event_loop.set_audio_out(audio_out_tx);
+            let mut counter = 1u32;
+            let mut noise = |amplitude: f32| -> Vec<f32> {
+                (0..1024)
+                    .map(|_| {
+                        counter = counter.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                        amplitude * ((counter >> 8) as f32 / (1u32 << 24) as f32 - 0.5)
+                    })
+                    .collect()
+            };
+            for _ in 0..10 {
+                event_loop.busy_gate.observe(&noise(0.01));
+            }
+            for _ in 0..5 {
+                event_loop.busy_gate.observe(&noise(0.5));
+            }
+            assert!(event_loop.busy_gate.current());
+            event_loop.tx_on_air_bytes = 5;
+            {
+                let tx = event_loop.transmit_samples(&SAMPLES);
+                tokio::pin!(tx);
+                tokio::select! {
+                    biased;
+                    _ = &mut tx => panic!("transmission must wait for the busy channel"),
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+                // The initial frequency check passed. Retune while held,
+                // then feed quiet audio to release the courtesy wait.
+                *rig.answer.lock().unwrap() = "14074000".into();
+                audio_in_tx.write(&noise(0.01));
+                tokio::time::timeout(Duration::from_secs(5), tx)
+                    .await
+                    .unwrap();
+            }
+            assert!(!event_loop.busy_gate.current());
+            assert_eq!(
+                event_loop.tx_generation, 0,
+                "no transmission after the retune"
+            );
+            assert_eq!(audio_out_rx.available(), 0, "no audio queued");
+            assert_eq!(event_loop.tx_on_air_bytes, 0, "refused bytes leave BUFFER");
+            assert!(!event_loop.is_transmitting);
+            assert_eq!(
+                PttControl::get_ptt(&mut event_loop.ptt).unwrap(),
+                PttState::Rx
+            );
         }
 
         #[tokio::test]

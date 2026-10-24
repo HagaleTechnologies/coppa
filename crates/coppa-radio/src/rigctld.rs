@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, Result};
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 
 use crate::{PttControl, PttState, RadioControl, RadioMode};
 
@@ -14,6 +14,7 @@ pub struct RigctldClient {
     addr: String,
     stream: TcpStream,
     reader: BufReader<TcpStream>,
+    connected: bool,
     frequency: u64,
     mode: RadioMode,
     ptt: PttState,
@@ -32,6 +33,7 @@ impl RigctldClient {
             addr: addr.to_string(),
             stream,
             reader,
+            connected: true,
             frequency: 14_074_000,
             mode: RadioMode::Usb,
             ptt: PttState::Rx,
@@ -44,10 +46,10 @@ impl RigctldClient {
     /// never falls back to the cached or construction-default value, so a
     /// regulatory check can tell "the rig says X" from "nobody answered".
     ///
-    /// Any failure also replaces the connection: a timed-out read can leave
-    /// the late reply buffered on the old socket, where the next poll would
-    /// read it as the current frequency. A fresh connection cannot return a
-    /// stale answer.
+    /// Any failure invalidates the connection: a timed-out read can leave
+    /// the late reply buffered on the old socket. The next command must
+    /// reconnect successfully before sending or reading anything, even if
+    /// earlier reconnect attempts failed.
     pub fn poll_frequency(&mut self) -> Option<u64> {
         let answer = self
             .command("f")
@@ -59,7 +61,8 @@ impl RigctldClient {
                 Some(freq)
             }
             None => {
-                let _ = self.reconnect();
+                self.connected = false;
+                let _ = self.stream.shutdown(Shutdown::Both);
                 None
             }
         }
@@ -79,6 +82,7 @@ impl RigctldClient {
                     stream.set_write_timeout(Some(timeout))?;
                     self.reader = BufReader::new(stream.try_clone()?);
                     self.stream = stream;
+                    self.connected = true;
                     return Ok(());
                 }
                 Err(e) => last_err = anyhow!("Failed to reconnect to rigctld at {}: {}", sock, e),
@@ -89,6 +93,9 @@ impl RigctldClient {
 
     /// Send a command and read one line of response.
     fn command(&mut self, cmd: &str) -> Result<String> {
+        if !self.connected {
+            self.reconnect()?;
+        }
         writeln!(self.stream, "{}", cmd).map_err(|e| anyhow!("Failed to send command: {}", e))?;
         self.stream.flush()?;
 
@@ -101,6 +108,9 @@ impl RigctldClient {
 
     /// Send a command and read two lines of response (e.g., mode + passband).
     fn command_two_lines(&mut self, cmd: &str) -> Result<(String, String)> {
+        if !self.connected {
+            self.reconnect()?;
+        }
         writeln!(self.stream, "{}", cmd).map_err(|e| anyhow!("Failed to send command: {}", e))?;
         self.stream.flush()?;
 
@@ -252,6 +262,57 @@ impl PttControl for RigctldClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_reconnect_cannot_reuse_a_late_frequency_reply() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Keep the existing connection alive but refuse reconnections.
+            drop(listener);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            ready_tx.send(()).unwrap();
+            let mut command = String::new();
+            reader.read_line(&mut command).unwrap();
+            assert_eq!(command.trim(), "f");
+            reply_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // The reply belonged to the timed-out query, before a retune.
+            let _ = writeln!(stream, "144500000");
+            sent_tx.send(()).unwrap();
+            command.clear();
+            if reader.read_line(&mut command).unwrap_or(0) > 0 {
+                assert_eq!(command.trim(), "f");
+                let _ = writeln!(stream, "14074000");
+            }
+        });
+        let mut client = RigctldClient::connect(&addr).unwrap();
+        client
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(client.poll_frequency(), None, "the first query times out");
+        reply_tx.send(()).unwrap();
+        sent_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let next = client.poll_frequency();
+        drop(client);
+        server.join().unwrap();
+        assert_eq!(
+            next, None,
+            "a failed reconnect must not reuse the old socket"
+        );
+    }
 
     #[test]
     fn test_parse_mode() {
