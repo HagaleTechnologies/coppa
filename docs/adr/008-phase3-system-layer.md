@@ -361,6 +361,16 @@ and never reset — judged a real semantic bug (a monitoring client would misrea
 live); fixed to recompute from `session_mgr`'s real established-session state at the same update
 point, with an honestly-disclosed smaller residual gap (only refreshes on a decode event).
 
+**COP-30 update (2026-10-24):** `BUFFER` no longer reports the TX queue's length. It reports host
+payload bytes the modem still holds (MAC, transport and FEC framing are not counted), computed in
+one place (`EventLoop::buffered_tx_bytes`) and emitted only when the value changes. With ARQ on, a
+segment's bytes stay counted until the peer's ACK for it is decoded (`ArqTx::unacked_bytes`), not
+until its frame starts transmitting; with ARQ off, and for established-session data, which has no
+ACK, they stay counted until PTT releases after the frame has played. The established-session TX
+path, which never emitted `BUFFER` before, now does. A segment that has used up its retransmit
+budget stays counted, since nothing ever acks or evicts it; evicting it is separate work. The
+3,2,1,0 frame-count progression above is superseded.
+
 ### 9. Benchmark program (Task 8)
 
 **Plan**: (a) a `milstd` bench at MIL-STD-188-110 Table XVI-style operating points, mapping
