@@ -113,6 +113,11 @@ ptt_method = "none"
 vara_enabled = true
 vara_command_port = 8300
 vara_data_port = 8301
+# Off by default: data-port and WebSocket `send` bytes are transmitted only
+# inside a connected session. `true` restores sessionless TX (raw frames, or
+# ARQ segments with [engine] arq_enabled) for two-station bench rigs; any
+# host that can reach the data port can then key the transmitter.
+sessionless_tx_enabled = false
 
 [engine]
 profile = "HF_STANDARD"

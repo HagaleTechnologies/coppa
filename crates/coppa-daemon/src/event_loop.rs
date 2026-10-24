@@ -260,8 +260,9 @@ pub struct EventLoop {
     /// broadcasting `VaraResponse` telemetry (SNR/PTT/BUFFER/BUSY — decision 8).
     /// Wired by `main.rs` from `VaraServer::response_senders()`.
     vara_responses: Option<VaraResponseSenders>,
-    /// Outbound raw payload bytes queued for encode+transmit (the primary
-    /// raw/ARQ `HostEvent::DataReceived` TX path), tagged with the ARQ seq
+    /// Outbound raw payload bytes queued for encode+transmit (the sessionless
+    /// raw/ARQ `HostEvent::DataReceived` TX path, enabled by
+    /// `[host] sessionless_tx_enabled`), tagged with the ARQ seq
     /// number assigned by `ArqTx::send` when this entry came from the
     /// ARQ-enabled path (`None` otherwise -- non-ARQ sends are never probe
     /// candidates). `VaraResponse::Buffer` telemetry reports this queue's
@@ -1109,7 +1110,19 @@ impl EventLoop {
                     return;
                 }
 
-                // Fall through: no session — use raw/ARQ encode path
+                // No established session (none at all, or one still
+                // connecting): drop rather than key the transmitter for
+                // nobody, unless the operator opted into sessionless TX.
+                if !self.config.host.sessionless_tx_enabled {
+                    tracing::warn!(
+                        client_id,
+                        bytes = data.len(),
+                        "No established session; host data dropped, not transmitted"
+                    );
+                    return;
+                }
+
+                // Sessionless TX: raw/ARQ encode path
                 // E6: If ARQ is enabled, wrap data in a TransportPdu before encoding
                 let (seq_opt, tx_bytes) = if self.config.engine.arq_enabled {
                     if let Some(ref mut arq_tx) = self.arq_tx {
@@ -6741,6 +6754,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn arq_host_data_without_a_session_creates_no_segment() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
+        event_loop.set_audio_out(producer);
+
+        event_loop
+            .handle_host_event(HostEvent::DataReceived {
+                client_id: 42,
+                data: b"hello".to_vec(),
+            })
+            .await;
+
+        assert_eq!(event_loop.arq_tx.as_ref().unwrap().in_flight(), 0);
+        assert!(event_loop.tx_queue.is_empty());
+        assert_eq!(consumer.read(&mut [0.0; 1024]), 0);
+    }
+
+    #[tokio::test]
     async fn test_multiple_events_sequence() {
         let config = DaemonConfig::default();
         let mut event_loop = EventLoop::new(config).unwrap();
@@ -8234,6 +8267,89 @@ mod tests {
             );
         }
 
+        /// Collect lines until a full window passes without another line.
+        async fn lines_within(
+            reader: &mut BufReader<OwnedReadHalf>,
+            window: Duration,
+        ) -> Vec<String> {
+            let mut lines = Vec::new();
+            loop {
+                let mut line = String::new();
+                match tokio::time::timeout(window, reader.read_line(&mut line)).await {
+                    Ok(Ok(0)) | Err(_) => break,
+                    Ok(Ok(_)) => lines.push(line.trim_end().to_string()),
+                    Ok(Err(error)) => panic!("reading VARA response failed: {error}"),
+                }
+            }
+            lines
+        }
+
+        #[tokio::test]
+        async fn host_data_without_a_session_is_not_transmitted() {
+            let mut event_loop = EventLoop::new(fast_ptt_config()).unwrap();
+            let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(producer);
+            let (mut reader, _write_half) =
+                connect_bridged_vara_client(&mut event_loop, 19460, 19461).await;
+            let mut data = TcpStream::connect(("127.0.0.1", 19461)).await.unwrap();
+            let tx = event_loop.event_sender();
+            let local = tokio::task::LocalSet::new();
+            let running = local.spawn_local(async move { event_loop.run().await });
+
+            local
+                .run_until(async move {
+                    data.write_all(b"hello").await.unwrap();
+                    let lines = lines_within(&mut reader, Duration::from_millis(1500)).await;
+                    assert!(
+                        !lines
+                            .iter()
+                            .any(|s| s.starts_with("PTT") || s.starts_with("BUFFER")),
+                        "host data without a session must not transmit, got {lines:?}"
+                    );
+                    tx.send(DaemonEvent::Shutdown).await.unwrap();
+                    running.await.unwrap().unwrap();
+                })
+                .await;
+            assert_eq!(consumer.read(&mut [0.0; 1024]), 0);
+        }
+
+        #[tokio::test]
+        async fn host_data_while_connecting_is_not_transmitted() {
+            let mut config = fast_ptt_config();
+            config.engine.callsign = "N0CALL".into();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, mut writer) =
+                connect_bridged_vara_client(&mut event_loop, 19462, 19463).await;
+            let mut data = TcpStream::connect(("127.0.0.1", 19463)).await.unwrap();
+            let tx = event_loop.event_sender();
+            let local = tokio::task::LocalSet::new();
+            let running = local.spawn_local(async move { event_loop.run().await });
+
+            local
+                .run_until(async move {
+                    writer.write_all(b"CONNECT N0CALL W1AW\r").await.unwrap();
+                    let lines = lines_within(&mut reader, Duration::from_millis(1500)).await;
+                    let ptt: Vec<&str> = lines
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|s| s.starts_with("PTT"))
+                        .collect();
+                    assert_eq!(ptt, ["PTT ON", "PTT OFF"], "CONNECT_REQ must transmit");
+
+                    data.write_all(b"hello").await.unwrap();
+                    let lines = lines_within(&mut reader, Duration::from_millis(1500)).await;
+                    assert!(
+                        !lines
+                            .iter()
+                            .any(|s| s.starts_with("PTT") || s.starts_with("BUFFER")),
+                        "host data while connecting must not transmit, got {lines:?}"
+                    );
+                    tx.send(DaemonEvent::Shutdown).await.unwrap();
+                    running.await.unwrap().unwrap();
+                })
+                .await;
+        }
+
         /// Required scenario: "transmit -> PTT ON/OFF bracket."
         ///
         /// `EventLoop` isn't `Send` (its engine holds trait objects/raw-pointer
@@ -8242,7 +8358,9 @@ mod tests {
         /// the rest of this test on the same thread instead, with no `Send` bound.
         #[tokio::test]
         async fn test_ptt_telemetry_brackets_transmission() {
-            let config = fast_ptt_config();
+            let mut config = fast_ptt_config();
+            // Sessionless TX on: the simplest way to make host data key PTT.
+            config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
             let (mut reader, _write_half) =
                 connect_mock_vara_client(&mut event_loop, 19410, 19411).await;
