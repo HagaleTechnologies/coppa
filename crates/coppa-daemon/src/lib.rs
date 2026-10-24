@@ -7,3 +7,4 @@ pub mod event_loop;
 pub mod spectrum;
 #[cfg(feature = "kiss-tnc")]
 pub mod tnc;
+pub mod tx_chunker;

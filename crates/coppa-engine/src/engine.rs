@@ -196,14 +196,13 @@ impl CoppaCore {
         self.encode_bytes(message.as_bytes())
     }
 
-    /// Encode arbitrary binary data to audio samples.
-    ///
-    /// Pipeline:
-    /// 1. Optionally compress (Huffman + LZ4) with a marker byte
-    /// 2. Build CoppaHeader
-    /// 3. Transmit via CoppaTransceiver
-    pub fn encode_bytes(&self, data: &[u8]) -> Result<Vec<f32>> {
-        let payload = if self.config.compression_enabled {
+    /// The exact payload `encode_bytes` would hand the transceiver for
+    /// `data`: optionally Huffman+LZ4-compressed with the marker byte
+    /// prepended, otherwise `data` unchanged (COP-41 refactor out of
+    /// `encode_bytes`, which calls this — the two can never measure and send
+    /// different bytes).
+    fn compress_payload(&self, data: &[u8]) -> Vec<u8> {
+        if self.config.compression_enabled {
             let huffman = HuffmanCodec::new();
             let huffman_bytes = huffman.encode(data);
             let lz4_bytes = lz4_compress(&huffman_bytes);
@@ -213,7 +212,27 @@ impl CoppaCore {
             out
         } else {
             data.to_vec()
-        };
+        }
+    }
+
+    /// Exact length of the payload `encode_bytes` would hand the transceiver
+    /// for `data` (post-compression, marker included) — without building a
+    /// header or synthesizing samples. Callers use this to size writes that
+    /// must fit a speed level's payload budget (COP-41): a chunk whose
+    /// `encoded_payload_len` is at most `max_payload_for_level(level)` is
+    /// exactly a chunk `encode_bytes` will accept at that level.
+    pub fn encoded_payload_len(&self, data: &[u8]) -> usize {
+        self.compress_payload(data).len()
+    }
+
+    /// Encode arbitrary binary data to audio samples.
+    ///
+    /// Pipeline:
+    /// 1. Optionally compress (Huffman + LZ4) with a marker byte
+    /// 2. Build CoppaHeader
+    /// 3. Transmit via CoppaTransceiver
+    pub fn encode_bytes(&self, data: &[u8]) -> Result<Vec<f32>> {
+        let payload = self.compress_payload(data);
 
         if payload.len() > u16::MAX as usize {
             anyhow::bail!(
@@ -579,6 +598,59 @@ mod tests {
     fn test_engine_default_trait() {
         let core = CoppaCore::default();
         assert_eq!(core.config.sample_rate, 48000);
+    }
+
+    /// COP-41: `encoded_payload_len` is exact — for a matrix of input
+    /// flavors × levels {1, 2, 9} × compression on/off,
+    /// `encoded_payload_len(p) <= max_payload_for_level(l)` holds iff
+    /// `set_speed_level(l)` + `encode_bytes(p)` succeeds. This is the
+    /// invariant the daemon's TX chunker is built on, and it pins the
+    /// `compress_payload` extraction (`encode_bytes` must measure and send
+    /// the same bytes). Input lengths are swept across every budget on the
+    /// ladder (56/117/198) so both directions of the iff are exercised.
+    #[test]
+    fn encoded_payload_len_predicts_encode_bytes_acceptance() {
+        use coppa_protocol::modem::max_payload_for_level;
+
+        // Deterministic input flavors spanning the compression pipeline's
+        // behavior space (see COP-41's research probes): ham text compresses
+        // well, LCG-random bytes are incompressible, all-unknown-high-bytes
+        // are escape-heavy, and empty is the degenerate case.
+        let mut seed: u32 = 0xC0_FF_EE;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            seed
+        };
+        let base_flavors: Vec<Vec<u8>> = vec![
+            b"cq de vk3abc qth melbourne winlink b2f chunk counter 000123456789 abcdefg"
+                .to_vec(),
+            (0..220).map(|_| (next() >> 8) as u8).collect(),
+            (0..220).map(|i| 0x80 | (i % 0x40) as u8).collect(),
+            Vec::new(),
+        ];
+        for compression in [false, true] {
+            for level in [1u8, 2, 9] {
+                let budget = max_payload_for_level(level).unwrap();
+                let mut core = CoppaCore::with_config(EngineConfig {
+                    compression_enabled: compression,
+                    ..Default::default()
+                });
+                core.set_speed_level(level)
+                    .expect("levels 1/2/9 are valid on a level-derived engine");
+                for flavor in &base_flavors {
+                    for len in [0usize, 20, 40, 56, 80, 117, 150, 200, 220] {
+                        let input = &flavor[..len.min(flavor.len())];
+                        let predicted_fits = core.encoded_payload_len(input) <= budget;
+                        let encoded_ok = core.encode_bytes(input).is_ok();
+                        assert_eq!(
+                            predicted_fits, encoded_ok,
+                            "compression={compression} level={level} len={len}: \
+                             encoded_payload_len must predict encode_bytes acceptance"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
