@@ -1021,9 +1021,7 @@ impl EventLoop {
     /// measured PDU is byte-identical to the one that gets queued and the
     /// exact-fit guarantee survives compression's content dependence.
     async fn pump_arq_backlog(&mut self) {
-        while !self.arq_tx_backlog.is_empty()
-            && self.arq_tx.as_ref().is_some_and(ArqTx::can_send)
-        {
+        while !self.arq_tx_backlog.is_empty() && self.arq_tx.as_ref().is_some_and(ArqTx::can_send) {
             let chunk: Vec<u8> = {
                 let arq_tx = self.arq_tx.as_ref().expect("can_send checked above");
                 let next_seq = arq_tx.send_base().wrapping_add(arq_tx.in_flight());
@@ -1046,7 +1044,8 @@ impl EventLoop {
                 .send(chunk.clone(), Instant::now())
             {
                 Ok(seq) => {
-                    let pdu = TransportPdu::new_reliable(self.arq_session_id, seq, 0, chunk.clone());
+                    let pdu =
+                        TransportPdu::new_reliable(self.arq_session_id, seq, 0, chunk.clone());
                     let tx_bytes = pdu.to_bytes();
                     self.arq_tx_backlog.drain(..chunk.len());
                     // `seq` is `Some` for the fresh ARQ-tracked segment --
@@ -1329,11 +1328,9 @@ impl EventLoop {
                 } else {
                     let budget = max_payload_for_level(self.engine.speed_level())
                         .expect("the engine's speed level is always a valid wire level");
-                    for chunk in
-                        chunk_to_fit(&data, 0, budget, |c| {
-                            self.engine.encoded_payload_len(c) <= budget
-                        })
-                    {
+                    for chunk in chunk_to_fit(&data, 0, budget, |c| {
+                        self.engine.encoded_payload_len(c) <= budget
+                    }) {
                         // Queue for encode+transmit (`BUFFER` telemetry counts
                         // the host bytes still held; see `buffered_tx_bytes`).
                         // Chunks partition the event, so the byte totals
@@ -5053,9 +5050,8 @@ mod tests {
 
         // Patterned, reproducible payload (compressible enough to exercise
         // the measurement path, not degenerate like a constant fill).
-        let pattern = |size: usize| -> Vec<u8> {
-            (0..size).map(|i| ((i * 31 + 7) % 251) as u8).collect()
-        };
+        let pattern =
+            |size: usize| -> Vec<u8> { (0..size).map(|i| ((i * 31 + 7) % 251) as u8).collect() };
         for size in [1000usize, 8000] {
             let payload = pattern(size);
             // Fresh response channel per transfer so the collected bytes are
@@ -9354,10 +9350,7 @@ mod tests {
                 })
                 .collect();
             event_loop
-                .handle_host_event(HostEvent::DataReceived {
-                    client_id: 1,
-                    data,
-                })
+                .handle_host_event(HostEvent::DataReceived { client_id: 1, data })
                 .await;
 
             assert_eq!(
@@ -9395,12 +9388,7 @@ mod tests {
                 let base = event_loop.arq_tx.as_ref().unwrap().send_base();
                 for i in 0..in_flight {
                     let seq = base.wrapping_add(i);
-                    if let Some(seg) = event_loop
-                        .arq_tx
-                        .as_ref()
-                        .unwrap()
-                        .get_segment_data(seq)
-                    {
+                    if let Some(seg) = event_loop.arq_tx.as_ref().unwrap().get_segment_data(seq) {
                         segmented_total += seg.len();
                     }
                 }
@@ -9448,10 +9436,7 @@ mod tests {
                 })
                 .collect();
             event_loop
-                .handle_host_event(HostEvent::DataReceived {
-                    client_id: 1,
-                    data,
-                })
+                .handle_host_event(HostEvent::DataReceived { client_id: 1, data })
                 .await;
 
             let entries: Vec<Vec<u8>> = event_loop
@@ -9501,10 +9486,7 @@ mod tests {
 
             let data: Vec<u8> = (0..8000).map(|i| ((i * 31 + 7) % 251) as u8).collect();
             event_loop
-                .handle_host_event(HostEvent::DataReceived {
-                    client_id: 1,
-                    data,
-                })
+                .handle_host_event(HostEvent::DataReceived { client_id: 1, data })
                 .await;
 
             assert!(
@@ -9524,7 +9506,9 @@ mod tests {
             }
             assert_eq!(
                 joined,
-                (0..8000).map(|i| ((i * 31 + 7) % 251) as u8).collect::<Vec<u8>>()
+                (0..8000)
+                    .map(|i| ((i * 31 + 7) % 251) as u8)
+                    .collect::<Vec<u8>>()
             );
 
             event_loop.is_transmitting = false;
@@ -9560,10 +9544,7 @@ mod tests {
                 })
                 .collect();
             event_loop
-                .handle_host_event(HostEvent::DataReceived {
-                    client_id: 1,
-                    data,
-                })
+                .handle_host_event(HostEvent::DataReceived { client_id: 1, data })
                 .await;
 
             let mut buf = vec![0.0f32; 4_000_000];

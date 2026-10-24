@@ -622,8 +622,7 @@ mod tests {
             seed
         };
         let base_flavors: Vec<Vec<u8>> = vec![
-            b"cq de vk3abc qth melbourne winlink b2f chunk counter 000123456789 abcdefg"
-                .to_vec(),
+            b"cq de vk3abc qth melbourne winlink b2f chunk counter 000123456789 abcdefg".to_vec(),
             (0..220).map(|_| (next() >> 8) as u8).collect(),
             (0..220).map(|i| 0x80 | (i % 0x40) as u8).collect(),
             Vec::new(),
