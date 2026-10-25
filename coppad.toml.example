@@ -31,6 +31,20 @@ ptt_tail_delay_ms = 200
 # Safety: max TX duration in seconds before forced unkey
 max_tx_duration_s = 30
 
+# COP-40: operating-frequency source for the HF/VHF regulatory gate.
+# Required ONLY for wideband (VHF) profiles, whose 5600 Hz occupied
+# bandwidth exceeds the 2.8 kHz cap 47 CFR 97.307(f)(3) places on
+# emissions below 29.7 MHz (US). HF profiles (2400 Hz) never need these.
+# Source precedence when several exist: live rigctld query >
+# frequency_hz > band. A wideband profile with no source, or with a
+# source below 29.7 MHz, is a startup ERROR; a rig retuned below
+# 29.7 MHz mid-session has each wideband transmission refused.
+# Explicit dial frequency in Hz, e.g. 144500000 for 2m FM:
+# frequency_hz = 144500000
+# Amateur band label ("160m".."23cm"); a band whose lowest edge is
+# above 29.7 MHz (6m, 2m, 70cm, ...) satisfies the gate:
+# band = "2m"
+
 [host]
 # Address all host servers (VARA-style TCP, WebSocket) bind to.
 # Default "127.0.0.1" restricts access to this machine only.
