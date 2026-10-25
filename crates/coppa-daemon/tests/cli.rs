@@ -78,6 +78,9 @@ impl Daemon {
             .args(args)
             .current_dir(cwd)
             .env_remove("RUST_LOG")
+            // anyhow appends a backtrace to `main`'s error when either is set.
+            .env_remove("RUST_BACKTRACE")
+            .env_remove("RUST_LIB_BACKTRACE")
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr);

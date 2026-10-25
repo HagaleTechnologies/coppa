@@ -27,7 +27,7 @@ The simplest way to verify everything works is the loopback test, which encodes 
 **Note:** WAV file operations require the `file-backend` feature:
 
 ```bash
-cargo run --bin coppa --features file-backend -- loopback "Hello from Coppa"
+cargo run -p coppa-cli --bin coppa --features file-backend -- loopback "Hello from Coppa"
 ```
 
 Expected output:
@@ -43,7 +43,7 @@ PASS: Loopback test successful!
 ## Encoding to a WAV File
 
 ```bash
-cargo run --bin coppa --features file-backend -- tx "CQ CQ CQ DE VK2ABC K" -o cq.wav
+cargo run -p coppa-cli --bin coppa --features file-backend -- tx "CQ CQ CQ DE VK2ABC K" -o cq.wav
 ```
 
 Expected output:
@@ -55,7 +55,7 @@ Written 46080 samples to cq.wav
 ## Decoding a WAV File
 
 ```bash
-cargo run --bin coppa --features file-backend -- rx -i cq.wav
+cargo run -p coppa-cli --bin coppa --features file-backend -- rx -i cq.wav
 ```
 
 Expected output:
@@ -71,17 +71,17 @@ Payloads that aren't valid UTF-8 print as `Decoded (hex): …`; `--hex` forces h
 Requires the `cpal-backend` feature for real hardware access:
 
 ```bash
-cargo run --bin coppa --features cpal-backend -- devices
+cargo run -p coppa-cli --bin coppa --features cpal-backend -- devices
 ```
 
 ## Viewing Operating Profiles
 
 ```bash
 # List all profiles
-cargo run --bin coppa -- config
+cargo run -p coppa-cli --bin coppa -- config
 
 # Show details for a specific profile
-cargo run --bin coppa -- config -p HF_STANDARD
+cargo run -p coppa-cli --bin coppa -- config -p HF_STANDARD
 ```
 
 ## Running the Daemon
@@ -90,14 +90,14 @@ The daemon (`coppad`) runs as a long-lived process with an optional VARA-style T
 
 ```bash
 # Show usage, or the version, and exit
-cargo run --bin coppad -- --help
-cargo run --bin coppad -- --version
+cargo run -p coppa-daemon --bin coppad -- --help
+cargo run -p coppa-daemon --bin coppad -- --version
 
 # Run with default settings
-cargo run --bin coppad
+cargo run -p coppa-daemon --bin coppad
 
 # Run with a custom config file
-cargo run --bin coppad -- --config my_config.toml
+cargo run -p coppa-daemon --bin coppad -- --config my_config.toml
 ```
 
 Without a config argument, `coppad` loads `./coppad.toml` if it exists and
@@ -111,8 +111,8 @@ To start from the built-in defaults, print them as TOML, edit the copy, and
 check it before running:
 
 ```bash
-cargo run --bin coppad -- --print-default-config > my_config.toml
-cargo run --bin coppad -- --config my_config.toml --check
+cargo run -p coppa-daemon --bin coppad -- --print-default-config > my_config.toml
+cargo run -p coppa-daemon --bin coppad -- --config my_config.toml --check
 ```
 
 `--check` prints `Configuration syntax and field types OK.` only after it has
@@ -130,8 +130,9 @@ applies (it accepts full tracing filter expressions), and an absent or invalid
 `RUST_LOG` means `info`:
 
 ```bash
-cargo run --bin coppad -- --config my_config.toml --log-level debug
-RUST_LOG=coppa_daemon=debug cargo run --bin coppad
+cargo run -p coppa-daemon --bin coppad -- --config my_config.toml --log-level debug
+# info everywhere, debug for the daemon's own log target (coppad)
+RUST_LOG=info,coppad=debug cargo run -p coppa-daemon --bin coppad
 ```
 
 `--tnc` runs the AFSK 1200/AX.25 KISS TNC instead of the OFDM daemon, with its
@@ -141,7 +142,7 @@ config file and cannot be combined with `--config`, `--check` or
 `cpal-backend` feature for real audio:
 
 ```bash
-cargo run --bin coppad --features kiss-tnc,cpal-backend -- --tnc
+cargo run -p coppa-daemon --bin coppad --features kiss-tnc,cpal-backend -- --tnc
 ```
 
 A build without `kiss-tnc` exits with `Error: TNC mode requires the kiss-tnc
