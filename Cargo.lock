@@ -436,6 +436,7 @@ name = "coppa-daemon"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "clap",
  "coppa-audio",
  "coppa-codec",
  "coppa-dsp",
