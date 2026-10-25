@@ -1,10 +1,11 @@
 //! Daemon configuration from TOML file.
 
-use serde::Deserialize;
+pub use coppa_radio::band::FrequencyConfig;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Top-level daemon configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DaemonConfig {
     /// Audio subsystem configuration.
@@ -21,7 +22,7 @@ pub struct DaemonConfig {
 }
 
 /// Audio configuration section.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioConfig {
     /// Input device name (empty = default).
@@ -35,7 +36,7 @@ pub struct AudioConfig {
 }
 
 /// Radio control configuration section.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RadioConfig {
     /// PTT method/config string. Either a simple backend name --
@@ -52,6 +53,14 @@ pub struct RadioConfig {
     pub ptt_tail_delay_ms: u64,
     /// Maximum TX duration in seconds before forced PTT unkey (safety).
     pub max_tx_duration_s: u64,
+    /// COP-40: explicit operating (dial) frequency in Hz, a frequency source
+    /// for the HF/VHF wideband gate. Only wideband (VHF) profiles need one;
+    /// see [`RadioConfig::frequency_config`].
+    pub frequency_hz: Option<u64>,
+    /// COP-40: amateur band label (`"160m"`..`"23cm"`), a frequency source
+    /// for the HF/VHF wideband gate when the exact dial frequency is not
+    /// stated.
+    pub band: Option<String>,
 }
 
 /// Which serial control line a `PttConfig::Serial` should drive.
@@ -161,10 +170,23 @@ impl RadioConfig {
     pub fn ptt_config(&self) -> Result<PttConfig, PttConfigError> {
         PttConfig::parse(&self.ptt_method)
     }
+
+    /// Validate [`Self::frequency_hz`] and [`Self::band`] into the stated
+    /// frequency source the wideband gate reads. A typo'd band label, a zero
+    /// or implausible frequency, or a frequency outside the stated band is an
+    /// error (a typo never silently falls back to "no source").
+    pub fn frequency_config(&self) -> Result<FrequencyConfig, String> {
+        FrequencyConfig::parse(
+            self.frequency_hz,
+            self.band.as_deref(),
+            "[radio] frequency_hz",
+            "[radio] band",
+        )
+    }
 }
 
 /// Host interface configuration section.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HostConfig {
     /// Address all host servers bind to. Defaults to "127.0.0.1" (loopback only).
@@ -186,7 +208,7 @@ pub struct HostConfig {
 }
 
 /// Engine configuration section.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EngineSection {
     /// Operational profile name.
@@ -300,7 +322,7 @@ pub struct EngineSection {
 /// field's doc); the station-ID timer and beacon mode additionally require
 /// `[engine] callsign` to be set (see `EngineSection::callsign`'s doc) --
 /// there is no meaningful "identify" or "beacon" transmission without one.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StationIdConfig {
     /// Busy-channel gate: once a TX request finds the channel busy (via
@@ -369,6 +391,8 @@ impl Default for RadioConfig {
             ptt_pre_delay_ms: 50,
             ptt_tail_delay_ms: 200,
             max_tx_duration_s: 30,
+            frequency_hz: None,
+            band: None,
         }
     }
 }
@@ -456,6 +480,29 @@ mod tests {
         assert_eq!(config.radio.ptt_method, "none");
         assert_eq!(config.radio.ptt_tail_delay_ms, 200);
         assert_eq!(config.radio.max_tx_duration_s, 30);
+    }
+
+    #[test]
+    fn test_default_config_serializes_and_roundtrips() {
+        // `coppad --print-default-config` prints exactly this serialization.
+        let printed = toml::to_string_pretty(&DaemonConfig::default()).unwrap();
+        assert!(
+            !printed.contains("grid"),
+            "an unset grid is omitted: {printed}"
+        );
+        let mut grid_set = DaemonConfig::default();
+        grid_set.engine.grid = Some("FN20".to_string());
+        assert!(toml::to_string_pretty(&grid_set)
+            .unwrap()
+            .contains("grid = \"FN20\""));
+
+        let parsed: DaemonConfig = toml::from_str(&printed).unwrap();
+        assert_eq!(toml::to_string_pretty(&parsed).unwrap(), printed);
+        assert_eq!(parsed.audio.sample_rate, 48_000);
+        assert_eq!(parsed.radio.ptt_method, "none");
+        assert_eq!(parsed.engine.profile, "HF_STANDARD");
+        assert_eq!(parsed.engine.grid, None);
+        assert_eq!(parsed.station_id.id_interval_secs, 540);
     }
 
     #[test]
@@ -706,6 +753,109 @@ beacon_interval_secs = 600
                 pin: "4".to_string()
             }
         );
+    }
+
+    // ── COP-40: [radio] frequency_hz / band ─────────────────────────────
+
+    #[test]
+    fn radio_defaults_carry_no_frequency_source() {
+        let radio = RadioConfig::default();
+        assert!(radio.frequency_hz.is_none());
+        assert!(radio.band.is_none());
+        assert_eq!(
+            radio.frequency_config().unwrap(),
+            FrequencyConfig::default()
+        );
+    }
+
+    #[test]
+    fn frequency_hz_parses_from_toml() {
+        let config: DaemonConfig = toml::from_str("[radio]\nfrequency_hz = 144500000\n").unwrap();
+        assert_eq!(config.radio.frequency_hz, Some(144_500_000));
+        assert_eq!(
+            config.radio.frequency_config().unwrap().stated_hz,
+            Some(144_500_000)
+        );
+    }
+
+    #[test]
+    fn band_label_parses_from_toml_case_insensitively() {
+        let config: DaemonConfig = toml::from_str("[radio]\nband = \"2M\"\n").unwrap();
+        assert_eq!(config.radio.band.as_deref(), Some("2M"));
+        let parsed = config.radio.frequency_config().unwrap();
+        assert_eq!(parsed.band.unwrap().label, "2m");
+    }
+
+    #[test]
+    fn band_typo_is_a_hard_error() {
+        let radio = RadioConfig {
+            band: Some("21m".into()),
+            ..RadioConfig::default()
+        };
+        let err = radio.frequency_config().unwrap_err();
+        assert!(err.contains("invalid [radio] band \"21m\""), "{err}");
+        assert!(err.contains("expected an amateur band label"), "{err}");
+    }
+
+    #[test]
+    fn frequency_zero_is_a_hard_error() {
+        let radio = RadioConfig {
+            frequency_hz: Some(0),
+            ..RadioConfig::default()
+        };
+        let err = radio.frequency_config().unwrap_err();
+        assert!(
+            err.contains("must be a positive dial frequency in Hz"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn frequency_above_30_ghz_is_a_hard_error() {
+        let radio = RadioConfig {
+            frequency_hz: Some(30_000_000_001),
+            ..RadioConfig::default()
+        };
+        let err = radio.frequency_config().unwrap_err();
+        assert!(err.contains("[radio] frequency_hz"), "{err}");
+    }
+
+    #[test]
+    fn contradictory_frequency_and_band_is_a_hard_error() {
+        let radio = RadioConfig {
+            frequency_hz: Some(14_074_000),
+            band: Some("2m".into()),
+            ..RadioConfig::default()
+        };
+        let err = radio.frequency_config().unwrap_err();
+        assert!(
+            err.contains("[radio] frequency_hz = 14074000 lies outside band \"2m\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn consistent_frequency_and_band_is_accepted() {
+        let radio = RadioConfig {
+            frequency_hz: Some(144_500_000),
+            band: Some("2m".into()),
+            ..RadioConfig::default()
+        };
+        let parsed = radio.frequency_config().unwrap();
+        assert_eq!(parsed.stated_hz, Some(144_500_000));
+        assert_eq!(parsed.band.unwrap().label, "2m");
+    }
+
+    #[test]
+    fn frequency_config_defaults_to_absent_toml_override() {
+        let config: DaemonConfig = toml::from_str("[radio]\nptt_method = \"none\"\n").unwrap();
+        assert!(config.radio.frequency_hz.is_none());
+        assert!(config.radio.band.is_none());
+        let config: DaemonConfig =
+            toml::from_str("[radio]\nfrequency_hz = 50313000\nband = \"6m\"\n").unwrap();
+        let parsed = config.radio.frequency_config().unwrap();
+        assert_eq!(parsed.stated_hz, Some(50_313_000));
+        assert_eq!(parsed.band.unwrap().label, "6m");
     }
 
     #[test]

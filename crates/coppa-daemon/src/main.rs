@@ -7,6 +7,7 @@
 // (and none of the output worker without `cpal-backend`).
 #[allow(dead_code)]
 mod audio_output;
+mod cli;
 mod config;
 mod event_loop;
 #[cfg(feature = "websocket")]
@@ -16,45 +17,94 @@ mod spectrum;
 mod tnc;
 mod tx_chunker;
 
-use anyhow::Result;
+use std::io::Write;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use cli::{Cli, ConfigSource, LogLevel, Mode};
 use config::DaemonConfig;
 use event_loop::{DaemonEvent, EventLoop};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize structured logging; RUST_LOG controls verbosity (default: info)
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Parse first: help, version and usage errors exit here, before any
+    // logging, config loading or service startup.
+    let cli = Cli::parse();
 
+    match cli.mode() {
+        Mode::PrintDefaultConfig => print_default_config(),
+        Mode::Check(source) => check_config(&source),
+        Mode::Tnc => run_tnc(cli.log_level).await,
+        Mode::Run(source) => {
+            // Load before logging so a config error is the only output.
+            let config = load_config(&source)?;
+            init_tracing(cli.log_level);
+            log_banner();
+            run_daemon(config).await
+        }
+    }
+}
+
+/// Load the configuration a command selected. An explicit path must exist;
+/// the implicit `./coppad.toml` falls back to defaults only when absent.
+fn load_config(source: &ConfigSource) -> Result<DaemonConfig> {
+    match source {
+        ConfigSource::Explicit(path) => DaemonConfig::load(path)
+            .with_context(|| format!("Failed to load config {}", path.display())),
+        ConfigSource::Implicit => DaemonConfig::load_or_default(cli::DEFAULT_CONFIG_PATH),
+    }
+}
+
+/// `--check`: read and deserialize the configuration only. Deliberately
+/// returns before PTT parsing or `EventLoop::new`, which can touch hardware.
+fn check_config(source: &ConfigSource) -> Result<()> {
+    load_config(source)?;
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "Configuration syntax and field types OK.")?;
+    writeln!(stdout, "Hardware and runtime settings were not checked.")?;
+    Ok(())
+}
+
+/// `--print-default-config`: the built-in configuration as TOML, read from
+/// `DaemonConfig::default()` so it tracks future defaults.
+fn print_default_config() -> Result<()> {
+    let toml = toml::to_string_pretty(&DaemonConfig::default())
+        .context("Failed to serialize the default config")?;
+    writeln!(std::io::stdout().lock(), "{}", toml.trim_end())?;
+    Ok(())
+}
+
+/// Structured logging for the run modes: `--log-level` overrides `RUST_LOG`,
+/// which falls back to `info` when absent or invalid.
+fn init_tracing(level: Option<LogLevel>) {
+    let rust_log = std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).ok();
+    tracing_subscriber::fmt()
+        .with_env_filter(cli::log_filter(level, rust_log.as_deref()))
+        .init();
+}
+
+fn log_banner() {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         "coppad - Coppa Daemon starting"
     );
+}
 
-    // Check for --tnc flag early and branch to TNC daemon mode if present
-    if std::env::args().any(|a| a == "--tnc") {
-        #[cfg(feature = "kiss-tnc")]
-        {
-            let tnc_config = tnc::TncConfig::default();
-            return tnc::run_tnc(tnc_config).await;
-        }
-        #[cfg(not(feature = "kiss-tnc"))]
-        {
-            anyhow::bail!("TNC mode requires the kiss-tnc feature");
-        }
-    }
+/// `--tnc`: the KISS TNC with its own defaults (no daemon config file).
+#[cfg(feature = "kiss-tnc")]
+async fn run_tnc(level: Option<LogLevel>) -> Result<()> {
+    init_tracing(level);
+    log_banner();
+    tnc::run_tnc(tnc::TncConfig::default()).await
+}
 
-    // Load configuration
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "coppad.toml".to_string());
+/// `--tnc` in a build without the TNC: fail before logging anything.
+#[cfg(not(feature = "kiss-tnc"))]
+async fn run_tnc(_level: Option<LogLevel>) -> Result<()> {
+    anyhow::bail!("TNC mode requires the kiss-tnc feature")
+}
 
-    let config = DaemonConfig::load_or_default(&config_path)?;
-
+async fn run_daemon(config: DaemonConfig) -> Result<()> {
     if config.engine.callsign.is_empty() {
         tracing::warn!("No callsign configured. Set [engine] callsign in config.");
     }
