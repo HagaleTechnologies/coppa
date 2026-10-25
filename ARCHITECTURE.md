@@ -158,7 +158,8 @@ payload bytes
 f32 audio samples
   → squelch gate (off unless squelch_threshold_db is set)           CoppaCore::push_samples
   → streaming preamble detection with two-stage CFO estimate
-    (coarse Moose, fine Schmidl-Cox; ±50 Hz)                        SyncDetector, SPEC §3.1
+    (coarse half-symbol lag resolves the wrap of a fine
+    full-symbol Moose lag; ±50 Hz)                                  SyncDetector, SPEC §3.1
   → header peek: CFO removal → header LLRs → soft Golay(24,12)
     decode with CRC-16-assisted list search                         SPEC §4.3
   → full frame: RX bandpass (HF only) → OFDM demodulation with
@@ -201,8 +202,8 @@ These components still compile and have tests, but no production TX or RX path c
 - **`coppa_codec::BpskModem`**: a single-carrier BPSK modem with AGC, RRC pulse shaping, a Costas-loop carrier recovery, Gardner timing recovery and a 1 kHz carrier. Its only caller outside its own file is `benches/throughput.rs`. The `coppa-dsp` carrier recovery (`CostasLoop`), timing recovery (`GardnerTimingRecovery`), `RrcFilter` and `AdaptiveAgc` are used only by `BpskModem` and that benchmark. `examples/bpsk_loopback.rs` does not use it: it runs `CoppaCore` at level 1, which is BPSK on OFDM carriers.
 - **`coppa_protocol::fec::convolutional`**: a rate-1/2 K=7 convolutional code with a soft Viterbi decoder. Callers: `benches/throughput.rs` and `fuzz/fuzz_targets/fuzz_viterbi.rs`.
 - **`coppa_protocol::fec::ldpc::codes`**: the six-rate IEEE 802.11 QC-LDPC codes (Z = 81, N = 1944), with `LdpcCodec`, `LdpcEncoder` and `LdpcDecoder`. They are used only by `coppa-protocol` examples, `coppa-bench` examples and the harness's `transfer` module, and by unit tests. The module's `CodeRate` enum survives as a label returned by `speed_level_components`; `CoppaTransceiver` ignores it (SPEC §12).
-- **`coppa_protocol::frame`**: the pre-OFDM frame (`[Preamble][Sync][Length][MAC PDU][CRC-16]`). Only its own tests and `tests/proptest_roundtrip.rs` call it.
-- **The generic OFDM stack** in `coppa-codec/src/ofdm/mod.rs` (`OfdmProfile`, `OfdmModulator`, `OfdmDemodulator`, `equalizer::LinearInterpolationEstimator`): a single-symbol teaching example. Only `tests/integration_test.rs` uses it (SPEC §0.2).
+- **`coppa_protocol::frame`**: the pre-OFDM frame (`[Preamble][Sync][Length][MAC PDU][CRC-16]`), re-exported as `coppa_protocol::Frame`. Callers: its own tests, `tests/proptest_roundtrip.rs` and `fuzz/fuzz_targets/fuzz_frame_parse.rs`.
+- **The generic OFDM stack** in `coppa-codec/src/ofdm/mod.rs` (`OfdmProfile`, `OfdmModulator`, `OfdmDemodulator`, `equalizer::LinearInterpolationEstimator`): a single-symbol teaching example. Only `tests/integration_test.rs` uses it (SPEC §0.2). Its training symbols in `ofdm/frame.rs` (`SignalField`, `generate_sts`, `generate_lts`) are called only by that file's tests; the same file's `CoppaHeader` is on the production path.
 
 ## Current Status
 
