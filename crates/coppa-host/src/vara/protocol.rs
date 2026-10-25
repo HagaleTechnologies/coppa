@@ -109,21 +109,25 @@ impl VaraCommand {
 
 impl VaraResponse {
     /// Format response as a string to send to the client.
+    ///
+    /// Each response ends in a bare `\r`, as VARA's own responses do. Pat
+    /// splits what it reads on `\r`, so a trailing `\n` would prefix the next
+    /// response.
     pub fn format(&self) -> String {
         match self {
-            VaraResponse::Ok => "OK\r\n".to_string(),
-            VaraResponse::Wrong => "WRONG\r\n".to_string(),
-            VaraResponse::Version(v) => format!("VERSION {}\r\n", v),
-            VaraResponse::Pending => "PENDING\r\n".to_string(),
+            VaraResponse::Ok => "OK\r".to_string(),
+            VaraResponse::Wrong => "WRONG\r".to_string(),
+            VaraResponse::Version(v) => format!("VERSION {}\r", v),
+            VaraResponse::Pending => "PENDING\r".to_string(),
             VaraResponse::Connected(src, dst, bw) => {
-                format!("CONNECTED {} {} {}\r\n", src, dst, bw)
+                format!("CONNECTED {} {} {}\r", src, dst, bw)
             }
-            VaraResponse::Disconnected => "DISCONNECTED\r\n".to_string(),
-            VaraResponse::Ptt(on) => format!("PTT {}\r\n", if *on { "ON" } else { "OFF" }),
-            VaraResponse::Buffer(n) => format!("BUFFER {}\r\n", n),
-            VaraResponse::Busy(b) => format!("BUSY {}\r\n", if *b { "ON" } else { "OFF" }),
-            VaraResponse::Snr(snr) => format!("SNR {}\r\n", snr),
-            VaraResponse::IAmAlive => "IAMALIVE\r\n".to_string(),
+            VaraResponse::Disconnected => "DISCONNECTED\r".to_string(),
+            VaraResponse::Ptt(on) => format!("PTT {}\r", if *on { "ON" } else { "OFF" }),
+            VaraResponse::Buffer(n) => format!("BUFFER {}\r", n),
+            VaraResponse::Busy(b) => format!("BUSY {}\r", if *b { "ON" } else { "OFF" }),
+            VaraResponse::Snr(snr) => format!("SNR {}\r", snr),
+            VaraResponse::IAmAlive => "IAMALIVE\r".to_string(),
         }
     }
 
@@ -197,22 +201,23 @@ mod tests {
 
     #[test]
     fn test_format_responses() {
-        assert_eq!(VaraResponse::Ok.format(), "OK\r\n");
-        assert_eq!(VaraResponse::Wrong.format(), "WRONG\r\n");
+        assert_eq!(VaraResponse::Ok.format(), "OK\r");
+        assert_eq!(VaraResponse::Wrong.format(), "WRONG\r");
         assert_eq!(
             VaraResponse::Version("Coppa 0.1.0".to_string()).format(),
-            "VERSION Coppa 0.1.0\r\n"
+            "VERSION Coppa 0.1.0\r"
         );
+        assert_eq!(VaraResponse::Pending.format(), "PENDING\r");
         assert_eq!(
             VaraResponse::Connected("VK2ABC".to_string(), "VK3DEF".to_string(), 2400).format(),
-            "CONNECTED VK2ABC VK3DEF 2400\r\n"
+            "CONNECTED VK2ABC VK3DEF 2400\r"
         );
-        assert_eq!(VaraResponse::Disconnected.format(), "DISCONNECTED\r\n");
-        assert_eq!(VaraResponse::Ptt(true).format(), "PTT ON\r\n");
-        assert_eq!(VaraResponse::Buffer(42).format(), "BUFFER 42\r\n");
-        assert_eq!(VaraResponse::Busy(false).format(), "BUSY OFF\r\n");
-        assert_eq!(VaraResponse::Snr(15).format(), "SNR 15\r\n");
-        assert_eq!(VaraResponse::IAmAlive.format(), "IAMALIVE\r\n");
+        assert_eq!(VaraResponse::Disconnected.format(), "DISCONNECTED\r");
+        assert_eq!(VaraResponse::Ptt(true).format(), "PTT ON\r");
+        assert_eq!(VaraResponse::Buffer(42).format(), "BUFFER 42\r");
+        assert_eq!(VaraResponse::Busy(false).format(), "BUSY OFF\r");
+        assert_eq!(VaraResponse::Snr(15).format(), "SNR 15\r");
+        assert_eq!(VaraResponse::IAmAlive.format(), "IAMALIVE\r");
     }
 
     #[test]
