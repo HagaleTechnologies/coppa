@@ -1,11 +1,7 @@
 //! Daemon configuration from TOML file.
 
-<<<<<<< HEAD
 pub use coppa_radio::band::FrequencyConfig;
-use serde::Deserialize;
-=======
 use serde::{Deserialize, Serialize};
->>>>>>> 928cb125c9ce25944fd8563cb6b9e5d375bbf7cf
 use std::path::Path;
 
 /// Top-level daemon configuration.
