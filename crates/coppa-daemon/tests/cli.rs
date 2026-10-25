@@ -1,0 +1,705 @@
+//! Drive the real `coppad` binary through its command-line interface.
+//!
+//! Every informational command (`--help`, `--version`, `--check`,
+//! `--print-default-config`, argument errors) must exit on its own. Each child
+//! runs under a hard deadline; a timeout is a test failure, never a stand-in
+//! for the expected exit. Output goes to temporary files rather than pipes, so
+//! a full pipe cannot hide the process finishing.
+
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use coppa_daemon::config::DaemonConfig;
+
+/// How long an informational command may take before the test fails.
+const DEADLINE: Duration = Duration::from_secs(5);
+
+const CHECK_OK: &str =
+    "Configuration syntax and field types OK.\nHardware and runtime settings were not checked.\n";
+
+/// Startup log lines that no informational command may print.
+const STARTUP_MARKERS: [&str; 3] = [
+    "Coppa Daemon starting",
+    "Daemon ready",
+    "Event loop started",
+];
+
+/// A uniquely named directory under the system temp dir, removed on drop.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "coppad-cli-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create temporary directory");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn write(&self, name: &str, contents: &str) -> PathBuf {
+        let path = self.0.join(name);
+        std::fs::write(&path, contents).expect("write temporary file");
+        path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A `coppad` child whose stdout/stderr go to files in its own capture dir.
+struct Daemon {
+    child: Child,
+    capture: TempDir,
+    started: Instant,
+    reaped: bool,
+}
+
+impl Daemon {
+    fn spawn(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Self {
+        let capture = TempDir::new("capture");
+        let stdout = File::create(capture.0.join("stdout")).expect("create stdout capture");
+        let stderr = File::create(capture.0.join("stderr")).expect("create stderr capture");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_coppad"));
+        command
+            .args(args)
+            .current_dir(cwd)
+            .env_remove("RUST_LOG")
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr);
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let child = command.spawn().expect("failed to spawn coppad");
+        Self {
+            child,
+            capture,
+            started: Instant::now(),
+            reaped: false,
+        }
+    }
+
+    fn stdout(&self) -> String {
+        std::fs::read_to_string(self.capture.0.join("stdout")).expect("read stdout capture")
+    }
+
+    fn stderr(&self) -> String {
+        std::fs::read_to_string(self.capture.0.join("stderr")).expect("read stderr capture")
+    }
+
+    fn try_exit(&mut self) -> Option<ExitStatus> {
+        let status = self.child.try_wait().expect("poll coppad");
+        if status.is_some() {
+            self.reaped = true;
+        }
+        status
+    }
+
+    /// Kill and reap the child, then return what it printed.
+    fn kill(&mut self) -> (String, String) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.reaped = true;
+        (self.stdout(), self.stderr())
+    }
+
+    /// Wait for the child to exit by itself within [`DEADLINE`].
+    fn finish(mut self, args: &[&str]) -> Finished {
+        loop {
+            if let Some(status) = self.try_exit() {
+                return Finished {
+                    status,
+                    stdout: self.stdout(),
+                    stderr: self.stderr(),
+                };
+            }
+            if self.started.elapsed() >= DEADLINE {
+                let (stdout, stderr) = self.kill();
+                panic!(
+                    "coppad {args:?} did not exit within {DEADLINE:?}\n\
+                     --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+struct Finished {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+impl Finished {
+    fn assert_code(&self, code: i32, args: &[&str]) {
+        assert_eq!(
+            self.status.code(),
+            Some(code),
+            "coppad {args:?} exit status\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            self.stdout,
+            self.stderr
+        );
+    }
+
+    fn assert_no_startup(&self) {
+        for marker in STARTUP_MARKERS {
+            assert!(
+                !self.stdout.contains(marker) && !self.stderr.contains(marker),
+                "unexpected startup output {marker:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                self.stdout,
+                self.stderr
+            );
+        }
+    }
+}
+
+fn run_with_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Finished {
+    Daemon::spawn(cwd, args, envs).finish(args)
+}
+
+fn run(cwd: &Path, args: &[&str]) -> Finished {
+    run_with_env(cwd, args, &[])
+}
+
+/// Run an informational command and require exit 0, empty stderr and no
+/// startup output. Returns stdout.
+fn run_ok(cwd: &Path, args: &[&str]) -> String {
+    let out = run(cwd, args);
+    out.assert_code(0, args);
+    assert_eq!(out.stderr, "", "coppad {args:?} stderr");
+    out.assert_no_startup();
+    out.stdout
+}
+
+/// Run a command that must fail with exit 1, empty stdout, and an error on
+/// stderr. Returns stderr.
+fn run_config_error(cwd: &Path, args: &[&str]) -> String {
+    let out = run(cwd, args);
+    out.assert_code(1, args);
+    assert_eq!(out.stdout, "", "coppad {args:?} stdout");
+    out.assert_no_startup();
+    assert!(out.stderr.starts_with("Error: "), "{}", out.stderr);
+    out.stderr
+}
+
+/// Run a command that clap must reject as a usage error (exit 2).
+fn run_usage_error(cwd: &Path, args: &[&str]) -> String {
+    let out = run(cwd, args);
+    out.assert_code(2, args);
+    assert_eq!(out.stdout, "", "coppad {args:?} stdout");
+    out.assert_no_startup();
+    assert!(out.stderr.starts_with("error: "), "{}", out.stderr);
+    assert!(
+        out.stderr
+            .ends_with("For more information, try '--help'.\n"),
+        "{}",
+        out.stderr
+    );
+    out.stderr
+}
+
+/// A working directory whose `coppad.toml` would fail to parse, proving a
+/// command never read it.
+fn dir_with_malformed_default() -> TempDir {
+    let dir = TempDir::new("malformed");
+    dir.write("coppad.toml", "[audio\nsample_rate = = 1\n");
+    dir
+}
+
+fn version_line() -> String {
+    format!("coppad {}\n", env!("CARGO_PKG_VERSION"))
+}
+
+// --- help and version -------------------------------------------------------
+
+fn assert_full_help(help: &str) {
+    for expected in [
+        "Coppa digital modem daemon",
+        "Usage: coppad [OPTIONS] [CONFIG]",
+        "[CONFIG]  Configuration file; legacy alternative to --config",
+        "-c, --config <PATH>",
+        "Load configuration from PATH",
+        "--check",
+        "Check TOML syntax and field types, then exit",
+        "--log-level <LEVEL>",
+        "Override RUST_LOG [possible values: off, error, warn, info, debug, trace]",
+        "--print-default-config",
+        "Print built-in configuration as TOML, then exit",
+        "--tnc",
+        "Run KISS TNC mode with its own defaults; requires kiss-tnc",
+        "-h, --help",
+        "Print help",
+        "-V, --version",
+        "Print version",
+        "Without CONFIG or --config, load ./coppad.toml if present; otherwise use built-in defaults.",
+        "Explicit config paths must exist. --check does not verify hardware or runtime settings.",
+    ] {
+        assert!(help.contains(expected), "help lacks {expected:?}:\n{help}");
+    }
+}
+
+#[test]
+fn help_prints_usage_and_exits_without_reading_config() {
+    let dir = dir_with_malformed_default();
+    let help = run_ok(dir.path(), &["--help"]);
+    assert_full_help(&help);
+}
+
+#[test]
+fn short_help_prints_the_same_usage() {
+    let dir = dir_with_malformed_default();
+    assert_eq!(run_ok(dir.path(), &["-h"]), run_ok(dir.path(), &["--help"]));
+}
+
+#[test]
+fn tnc_help_prints_the_same_usage() {
+    let dir = dir_with_malformed_default();
+    assert_eq!(
+        run_ok(dir.path(), &["--tnc", "--help"]),
+        run_ok(dir.path(), &["--help"])
+    );
+}
+
+#[test]
+fn version_prints_package_version_and_exits() {
+    let dir = dir_with_malformed_default();
+    for args in [&["--version"][..], &["-V"], &["--tnc", "--version"]] {
+        assert_eq!(run_ok(dir.path(), args), version_line(), "coppad {args:?}");
+    }
+}
+
+// --- argument errors --------------------------------------------------------
+
+#[test]
+fn unknown_option_is_a_usage_error() {
+    let dir = TempDir::new("unknown");
+    let stderr = run_usage_error(dir.path(), &["--wat"]);
+    // Clap's own diagnostic; between these lines it may add a tip about `--`.
+    assert!(
+        stderr.starts_with("error: unexpected argument '--wat' found\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("\nUsage: coppad [OPTIONS] [CONFIG]\n"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn missing_option_value_is_a_usage_error() {
+    let dir = TempDir::new("missing-value");
+    run_usage_error(dir.path(), &["--config"]);
+    run_usage_error(dir.path(), &["--log-level"]);
+}
+
+#[test]
+fn extra_positional_argument_is_a_usage_error() {
+    let dir = TempDir::new("extra");
+    dir.write("a.toml", "");
+    dir.write("b.toml", "");
+    run_usage_error(dir.path(), &["a.toml", "b.toml", "--check"]);
+}
+
+#[test]
+fn invalid_log_level_is_a_usage_error() {
+    let dir = TempDir::new("bad-level");
+    for level in ["loud", "INFO2", "coppa_daemon=debug"] {
+        let stderr = run_usage_error(dir.path(), &["--check", "--log-level", level]);
+        assert!(stderr.contains("invalid value"), "{stderr}");
+    }
+}
+
+#[test]
+fn conflicting_options_are_usage_errors() {
+    let dir = TempDir::new("conflicts");
+    dir.write("station.toml", "");
+    for args in [
+        &["station.toml", "--config", "station.toml"][..],
+        &["--check", "--print-default-config"],
+        &["--print-default-config", "--config", "station.toml"],
+        &["--print-default-config", "station.toml"],
+        &["--tnc", "--config", "station.toml"],
+        &["--tnc", "station.toml"],
+        &["--tnc", "--check"],
+        &["--tnc", "--print-default-config"],
+    ] {
+        let stderr = run_usage_error(dir.path(), args);
+        assert!(stderr.contains("cannot be used with"), "{args:?}: {stderr}");
+    }
+}
+
+// --- --check ----------------------------------------------------------------
+
+#[test]
+fn check_without_a_config_file_checks_the_defaults() {
+    let dir = TempDir::new("check-defaults");
+    assert_eq!(run_ok(dir.path(), &["--check"]), CHECK_OK);
+}
+
+#[test]
+fn check_loads_the_implicit_default_file() {
+    let dir = TempDir::new("check-implicit");
+    dir.write("coppad.toml", "[audio]\nsample_rate = 48000\n");
+    assert_eq!(run_ok(dir.path(), &["--check"]), CHECK_OK);
+}
+
+#[test]
+fn check_accepts_an_empty_file() {
+    let dir = TempDir::new("check-empty");
+    dir.write("station.toml", "");
+    assert_eq!(
+        run_ok(dir.path(), &["--config", "station.toml", "--check"]),
+        CHECK_OK
+    );
+}
+
+#[test]
+fn check_accepts_every_explicit_config_form_and_order() {
+    let dir = dir_with_malformed_default();
+    dir.write(
+        "station.toml",
+        "[engine]\nprofile = \"HF_ROBUST\"\ncallsign = \"VK2ABC\"\n",
+    );
+    for args in [
+        &["--config", "station.toml", "--check"][..],
+        &["-c", "station.toml", "--check"],
+        &["--config=station.toml", "--check"],
+        &["station.toml", "--check"],
+        &["--check", "station.toml"],
+        &[
+            "--check",
+            "--config",
+            "station.toml",
+            "--log-level",
+            "debug",
+        ],
+        &["--log-level", "trace", "station.toml", "--check"],
+    ] {
+        assert_eq!(run_ok(dir.path(), args), CHECK_OK, "coppad {args:?}");
+    }
+}
+
+#[test]
+fn check_with_log_level_off_ignores_rust_log() {
+    let dir = TempDir::new("check-quiet");
+    let args = ["--check", "--log-level", "off"];
+    let out = run_with_env(dir.path(), &args, &[("RUST_LOG", "trace")]);
+    out.assert_code(0, &args);
+    assert_eq!(out.stdout, CHECK_OK);
+    assert_eq!(out.stderr, "");
+}
+
+#[test]
+fn check_with_rust_log_trace_prints_no_tracing() {
+    let dir = TempDir::new("check-trace");
+    let out = run_with_env(dir.path(), &["--check"], &[("RUST_LOG", "trace")]);
+    out.assert_code(0, &["--check"]);
+    assert_eq!(out.stdout, CHECK_OK);
+    assert_eq!(out.stderr, "");
+}
+
+#[test]
+fn check_rejects_malformed_toml_with_the_path() {
+    let dir = TempDir::new("check-malformed");
+    dir.write("station.toml", "[audio\nsample_rate = 48000\n");
+    let stderr = run_config_error(dir.path(), &["--config", "station.toml", "--check"]);
+    assert!(
+        stderr.starts_with("Error: Failed to load config station.toml"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Caused by:"), "{stderr}");
+}
+
+#[test]
+fn check_rejects_a_wrong_field_type_with_the_path() {
+    let dir = TempDir::new("check-type");
+    dir.write("station.toml", "[audio]\nsample_rate = \"bad\"\n");
+    for args in [
+        &["--config", "station.toml", "--check"][..],
+        &["station.toml", "--check"],
+    ] {
+        let stderr = run_config_error(dir.path(), args);
+        assert!(
+            stderr.starts_with("Error: Failed to load config station.toml"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("sample_rate"), "{stderr}");
+    }
+}
+
+#[test]
+fn explicit_missing_config_fails_in_check_and_run_modes() {
+    let dir = TempDir::new("missing");
+    for args in [
+        &["--config", "missing.toml", "--check"][..],
+        &["missing.toml", "--check"],
+        &["--config", "missing.toml"],
+        &["missing.toml"],
+        &["-c", "missing.toml", "--log-level", "info"],
+    ] {
+        let stderr = run_config_error(dir.path(), args);
+        assert!(
+            stderr.starts_with("Error: Failed to load config missing.toml"),
+            "coppad {args:?}: {stderr}"
+        );
+        assert!(stderr.contains("Caused by:"), "{stderr}");
+    }
+}
+
+#[test]
+fn explicit_coppad_toml_must_exist_too() {
+    // Naming the default file explicitly opts into the strict rule.
+    let dir = TempDir::new("explicit-default");
+    let stderr = run_config_error(dir.path(), &["--config", "coppad.toml", "--check"]);
+    assert!(
+        stderr.starts_with("Error: Failed to load config coppad.toml"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn invalid_implicit_config_fails_in_check_and_run_modes() {
+    let dir = dir_with_malformed_default();
+    for args in [&["--check"][..], &[], &["--log-level", "info"]] {
+        let stderr = run_config_error(dir.path(), args);
+        assert!(stderr.contains("coppad.toml"), "coppad {args:?}: {stderr}");
+    }
+}
+
+#[test]
+fn explicit_config_is_used_instead_of_the_local_default() {
+    // A malformed local coppad.toml is ignored when a path is given...
+    let dir = dir_with_malformed_default();
+    dir.write("station.toml", "");
+    for args in [
+        &["--config", "station.toml", "--check"][..],
+        &["station.toml", "--check"],
+    ] {
+        assert_eq!(run_ok(dir.path(), args), CHECK_OK, "coppad {args:?}");
+    }
+
+    // ...and a valid local coppad.toml does not mask a bad explicit file.
+    let dir = TempDir::new("explicit-bad");
+    dir.write("coppad.toml", "");
+    dir.write("station.toml", "[audio]\nsample_rate = \"bad\"\n");
+    for args in [
+        &["--config", "station.toml", "--check"][..],
+        &["station.toml", "--check"],
+    ] {
+        let stderr = run_config_error(dir.path(), args);
+        assert!(stderr.contains("station.toml"), "coppad {args:?}: {stderr}");
+    }
+}
+
+#[test]
+fn check_only_deserializes_and_never_touches_hardware_or_listeners() {
+    // Every value here would fail or block at runtime: an unreachable
+    // rigctld, an unknown PTT method, nonexistent audio devices, an unknown
+    // profile and enabled listeners. --check reads and deserializes only.
+    let dir = TempDir::new("check-runtime");
+    dir.write(
+        "station.toml",
+        r#"
+[audio]
+input_device = "no such input device"
+output_device = "no such output device"
+sample_rate = 44100
+
+[radio]
+ptt_method = "definitely-not-a-ptt-backend"
+rigctld_address = "127.0.0.1:1"
+
+[host]
+bind_address = "203.0.113.1"
+vara_enabled = true
+websocket_enabled = true
+
+[engine]
+profile = "NOT_A_PROFILE"
+"#,
+    );
+    assert_eq!(
+        run_ok(dir.path(), &["--config", "station.toml", "--check"]),
+        CHECK_OK
+    );
+}
+
+#[test]
+fn check_keeps_accepting_unknown_keys() {
+    let dir = TempDir::new("check-unknown");
+    dir.write(
+        "station.toml",
+        "top_level_extra = 1\n[engine]\nnot_a_real_key = true\n[mystery]\nvalue = 2\n",
+    );
+    assert_eq!(run_ok(dir.path(), &["station.toml", "--check"]), CHECK_OK);
+}
+
+// --- --print-default-config ---------------------------------------------------
+
+#[test]
+fn print_default_config_prints_only_the_default_toml() {
+    let dir = dir_with_malformed_default();
+    let args = ["--print-default-config"];
+    let out = run_with_env(dir.path(), &args, &[("RUST_LOG", "trace")]);
+    out.assert_code(0, &args);
+    assert_eq!(out.stderr, "");
+    out.assert_no_startup();
+    let printed = out.stdout;
+
+    assert!(printed.ends_with("\n") && !printed.ends_with("\n\n"));
+    for section in ["[audio]", "[radio]", "[host]", "[engine]", "[station_id]"] {
+        assert!(printed.contains(section), "missing {section}:\n{printed}");
+    }
+    for line in [
+        "vara_enabled = false",
+        "websocket_enabled = false",
+        "rate_loop_probe_interval = 0",
+        "cp_gate_enabled = false",
+        "cp_negotiation_enabled = false",
+        "id_interval_secs = 540",
+    ] {
+        assert!(printed.contains(line), "missing {line:?}:\n{printed}");
+    }
+    assert!(!printed.contains("grid"), "{printed}");
+
+    let parsed: DaemonConfig = toml::from_str(&printed).expect("printed TOML parses");
+    assert_eq!(
+        toml::to_string_pretty(&parsed).unwrap(),
+        toml::to_string_pretty(&DaemonConfig::default()).unwrap()
+    );
+}
+
+#[test]
+fn printed_default_config_passes_check() {
+    let dir = TempDir::new("print-roundtrip");
+    let printed = run_ok(
+        dir.path(),
+        &["--print-default-config", "--log-level", "debug"],
+    );
+    dir.write("station.toml", &printed);
+    assert_eq!(
+        run_ok(dir.path(), &["--config", "station.toml", "--check"]),
+        CHECK_OK
+    );
+}
+
+// --- --tnc --------------------------------------------------------------------
+
+#[cfg(not(feature = "kiss-tnc"))]
+#[test]
+fn tnc_without_the_feature_fails_without_a_banner() {
+    let dir = TempDir::new("tnc");
+    for args in [&["--tnc"][..], &["--tnc", "--log-level", "debug"]] {
+        let out = run(dir.path(), args);
+        out.assert_code(1, args);
+        assert_eq!(out.stdout, "");
+        assert_eq!(
+            out.stderr,
+            "Error: TNC mode requires the kiss-tnc feature\n"
+        );
+    }
+}
+
+// --- normal startup ---------------------------------------------------------
+//
+// These deliberately start the long-running daemon, so they only run in the
+// default build, where it opens no audio hardware. The daemon is killed as
+// cleanup once it has proven its state.
+
+/// Start the daemon and wait until it logs `Daemon ready`. Returns the child
+/// and the time readiness took.
+#[cfg(not(feature = "cpal-backend"))]
+fn start_until_ready(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> (Daemon, Duration) {
+    let mut daemon = Daemon::spawn(cwd, args, envs);
+    loop {
+        if daemon.stdout().contains("Daemon ready") {
+            let elapsed = daemon.started.elapsed();
+            return (daemon, elapsed);
+        }
+        if let Some(status) = daemon.try_exit() {
+            panic!(
+                "coppad {args:?} exited with {status} before becoming ready\n\
+                 --- stdout ---\n{}\n--- stderr ---\n{}",
+                daemon.stdout(),
+                daemon.stderr()
+            );
+        }
+        if daemon.started.elapsed() >= DEADLINE {
+            let (stdout, stderr) = daemon.kill();
+            panic!(
+                "coppad {args:?} not ready within {DEADLINE:?}\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn explicit_config_starts_the_daemon() {
+    let dir = TempDir::new("run-explicit");
+    dir.write("station.toml", "[engine]\ncallsign = \"VK2ABC\"\n");
+    for args in [&["--config", "station.toml"][..], &["station.toml"]] {
+        let (mut daemon, _) = start_until_ready(dir.path(), args, &[]);
+        let (stdout, _) = daemon.kill();
+        assert!(stdout.contains("Coppa Daemon starting"), "{stdout}");
+        // The file was used: its callsign silences the missing-callsign warning.
+        assert!(!stdout.contains("No callsign configured"), "{stdout}");
+    }
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn log_level_overrides_rust_log_on_a_running_daemon() {
+    let dir = TempDir::new("run-level");
+
+    // --log-level info wins over RUST_LOG=off: the daemon logs readiness.
+    let (mut loud, ready_after) =
+        start_until_ready(dir.path(), &["--log-level", "info"], &[("RUST_LOG", "off")]);
+    let (stdout, _) = loud.kill();
+    assert!(stdout.contains("Coppa Daemon starting"), "{stdout}");
+
+    // --log-level off wins over RUST_LOG=info: the same daemon runs silently.
+    // Give it well past the time the loud run needed to become ready, then
+    // require it to still be running and to have printed nothing.
+    let mut quiet = Daemon::spawn(dir.path(), &["--log-level", "off"], &[("RUST_LOG", "info")]);
+    let settle = (ready_after * 3).max(Duration::from_millis(1500));
+    while quiet.started.elapsed() < settle {
+        if let Some(status) = quiet.try_exit() {
+            panic!(
+                "silent daemon exited with {status}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                quiet.stdout(),
+                quiet.stderr()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (stdout, stderr) = quiet.kill();
+    assert_eq!(stdout, "", "--log-level off must silence tracing");
+    assert_eq!(stderr, "");
+}
