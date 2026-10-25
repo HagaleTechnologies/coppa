@@ -7945,7 +7945,7 @@ mod tests {
                     for _ in 0..7 {
                         replies.push(read_line(&mut reader).await.trim_end().to_string());
                     }
-                    let version = VaraResponse::coppa_version().format();
+                    let version = format!("VERSION Coppa {}", env!("CARGO_PKG_VERSION"));
                     assert_eq!(
                         replies,
                         vec![
@@ -7963,6 +7963,17 @@ mod tests {
                         read_available_lines(&mut reader).await.is_empty(),
                         "no reply may be doubled"
                     );
+
+                    // COP-45: the greeting and earlier query replies have been consumed,
+                    // so each subsequent VERSION query must produce a fresh reply.
+                    for _ in 0..2 {
+                        write_half.write_all(b"VERSION\r").await.unwrap();
+                        assert_eq!(read_line(&mut reader).await.trim_end(), version);
+                        assert!(
+                            read_available_lines(&mut reader).await.is_empty(),
+                            "each VERSION query must produce exactly one reply"
+                        );
+                    }
                 })
                 .await;
         }
