@@ -2034,6 +2034,7 @@ impl EventLoop {
                     );
                 }
                 self.try_drain_tx_queue().await;
+                self.drain_session_tx_queue().await;
                 return;
             }
         }
@@ -9328,6 +9329,95 @@ mod tests {
                 "the release must start the queued chunk's own keyed interval"
             );
             assert!(event_loop.session_tx_queue.is_empty());
+        }
+
+        /// Unsent session chunks resume after canceled playback, once the
+        /// output worker has discarded the canceled frame's buffered audio.
+        #[tokio::test(start_paused = true)]
+        async fn cancelled_output_resumes_session_chunks_after_discard() {
+            let mut rig = TxRig::new(session_config());
+            seed_established(&mut rig.event_loop);
+            rig.event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: (0..300).map(|i| (i % 251) as u8).collect(),
+                })
+                .await;
+            let remaining: Vec<_> = rig
+                .event_loop
+                .session_tx_queue
+                .iter()
+                .map(|chunk| {
+                    rig.event_loop
+                        .engine
+                        .encode_bytes(&chunk.pdu_bytes)
+                        .unwrap()
+                })
+                .collect();
+            assert!(remaining.len() > 1);
+            let held_bytes = rig.event_loop.buffered_tx_bytes() - rig.event_loop.tx_on_air_bytes;
+
+            // Stall with canceled audio in both rings and the retained suffix.
+            for _ in 0..16 {
+                rig.pump(0);
+            }
+            let (generation, completed) = rig.next_completion().await;
+            assert_eq!((generation, completed), (1, false));
+            let submitted = {
+                let output = rig.event_loop.tx_output();
+                output.submitted() - output.pending_len() as u64
+            };
+            let tx_output = rig.event_loop.tx_output.clone();
+            tokio::join!(
+                rig.event_loop.handle_tx_complete(generation, completed),
+                async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    assert_eq!(
+                        lock_tx_output(&tx_output).submitted(),
+                        submitted,
+                        "the next frame must wait for the discard barrier"
+                    );
+                    for _ in 0..100 {
+                        if rig.feedback.played() >= submitted {
+                            break;
+                        }
+                        rig.worker
+                            .step(
+                                &mut rig.outer,
+                                &mut rig.sink,
+                                crate::audio_output::test_support::sim_progress,
+                            )
+                            .unwrap();
+                        rig.sink.callback(0);
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    assert!(rig.feedback.played() >= submitted, "discard must settle");
+                }
+            );
+            assert!(
+                rig.event_loop.is_transmitting,
+                "the unsent tail must resume"
+            );
+            assert_eq!(rig.event_loop.buffered_tx_bytes(), held_bytes);
+            assert_eq!(rig.event_loop.session_tx_queue.len(), remaining.len() - 1);
+
+            let mut expected = Vec::new();
+            for frame in remaining {
+                expected.extend(frame);
+                rig.deliver(expected.len(), &[480, 1000]);
+                assert_eq!(
+                    rig.sink.captured, expected,
+                    "only unsent chunks should play"
+                );
+                let (generation, completed) = rig.next_completion().await;
+                assert!(completed);
+                rig.event_loop
+                    .handle_tx_complete(generation, completed)
+                    .await;
+            }
+            assert!(!rig.event_loop.is_transmitting);
+            assert!(rig.event_loop.session_tx_queue.is_empty());
+            assert_eq!(rig.event_loop.buffered_tx_bytes(), 0);
         }
 
         /// COP-41 (D5): the ARQ window's overflow is HELD in a backlog and
