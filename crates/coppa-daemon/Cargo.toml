@@ -24,6 +24,7 @@ coppa-codec = { path = "../coppa-codec" }
 coppa-dsp = { path = "../coppa-dsp" }
 coppa-ml = { path = "../coppa-ml" }
 anyhow = { workspace = true }
+clap = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

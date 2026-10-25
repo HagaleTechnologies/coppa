@@ -7884,11 +7884,7 @@ mod tests {
             let (read_half, write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);
 
-            let mut greeting = String::new();
-            reader
-                .read_line(&mut greeting)
-                .await
-                .expect("should read the initial VERSION greeting");
+            let greeting = read_line(&mut reader).await;
             assert!(
                 greeting.starts_with("VERSION"),
                 "expected a VERSION greeting first, got: {}",
@@ -7934,11 +7930,7 @@ mod tests {
             let (read_half, write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);
 
-            let mut greeting = String::new();
-            reader
-                .read_line(&mut greeting)
-                .await
-                .expect("should read the initial VERSION greeting");
+            let greeting = read_line(&mut reader).await;
             assert!(
                 greeting.starts_with("VERSION"),
                 "expected a VERSION greeting first, got: {}",
@@ -7948,16 +7940,17 @@ mod tests {
             (reader, write_half)
         }
 
-        /// Read one `\r\n`-terminated line, timing out (rather than hanging
-        /// forever) if the client never receives one.
+        /// Read one `\r`-terminated VARA response line, timing out (rather than
+        /// hanging forever) if the client never receives one.
         async fn read_line(reader: &mut BufReader<OwnedReadHalf>) -> String {
-            let mut line = String::new();
-            let n = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
-                .await
-                .expect("timed out waiting for a VARA response line")
-                .expect("reading a VARA response line should not error");
+            let mut line = Vec::new();
+            let n =
+                tokio::time::timeout(Duration::from_secs(2), reader.read_until(b'\r', &mut line))
+                    .await
+                    .expect("timed out waiting for a VARA response line")
+                    .expect("reading a VARA response line should not error");
             assert!(n > 0, "connection closed before a response line arrived");
-            line
+            String::from_utf8(line).expect("VARA response lines are UTF-8")
         }
 
         /// Drain every line currently available within a short per-line window,
@@ -7967,11 +7960,16 @@ mod tests {
         async fn read_available_lines(reader: &mut BufReader<OwnedReadHalf>) -> Vec<String> {
             let mut lines = Vec::new();
             loop {
-                let mut line = String::new();
-                match tokio::time::timeout(Duration::from_millis(300), reader.read_line(&mut line))
-                    .await
+                let mut line = Vec::new();
+                match tokio::time::timeout(
+                    Duration::from_millis(300),
+                    reader.read_until(b'\r', &mut line),
+                )
+                .await
                 {
-                    Ok(Ok(n)) if n > 0 => lines.push(line),
+                    Ok(Ok(n)) if n > 0 => {
+                        lines.push(String::from_utf8(line).expect("VARA response lines are UTF-8"))
+                    }
                     _ => break,
                 }
             }
@@ -8164,7 +8162,7 @@ mod tests {
                     for _ in 0..7 {
                         replies.push(read_line(&mut reader).await.trim_end().to_string());
                     }
-                    let version = VaraResponse::coppa_version().format();
+                    let version = format!("VERSION Coppa {}", env!("CARGO_PKG_VERSION"));
                     assert_eq!(
                         replies,
                         vec![
@@ -8182,6 +8180,17 @@ mod tests {
                         read_available_lines(&mut reader).await.is_empty(),
                         "no reply may be doubled"
                     );
+
+                    // COP-45: the greeting and earlier query replies have been consumed,
+                    // so each subsequent VERSION query must produce a fresh reply.
+                    for _ in 0..2 {
+                        write_half.write_all(b"VERSION\r").await.unwrap();
+                        assert_eq!(read_line(&mut reader).await.trim_end(), version);
+                        assert!(
+                            read_available_lines(&mut reader).await.is_empty(),
+                            "each VERSION query must produce exactly one reply"
+                        );
+                    }
                 })
                 .await;
         }
@@ -8286,11 +8295,10 @@ mod tests {
             let stream_b = TcpStream::connect(("127.0.0.1", 19452)).await.unwrap();
             let (read_b, _write_b) = stream_b.into_split();
             let mut reader_b = BufReader::new(read_b);
-            let mut greeting_b = String::new();
-            reader_b
-                .read_line(&mut greeting_b)
-                .await
-                .expect("client B should also get the greeting");
+            assert!(
+                read_line(&mut reader_b).await.starts_with("VERSION"),
+                "client B should also get the greeting"
+            );
 
             let local = tokio::task::LocalSet::new();
             local.spawn_local(async move {

@@ -9,35 +9,31 @@ Open-source ham radio digital communications system written in Rust.
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| BPSK modem (loopback) | **Working** | Full DSP chain: AGC, Costas loop, RRC, timing recovery |
-| BPSK modem (live audio) | **Working** | Requires `--features cpal-backend` |
-| Convolutional FEC | **Working** | K=7 rate-1/2 with soft Viterbi decoder |
-| Frame sync + CRC | **Working** | Handles 180-degree phase ambiguity |
-| QPSK/8PSK/QAM mappers | **Working** | Constellation mapping/demapping only (not wired to engine) |
-| OFDM mod/demod | **Partial** | Round-trip works in isolation; sync has CFO limitations |
-| LDPC codes | **Working** | 6 rates; encode/decode verified |
-| ARQ + protocol stack | **Working** | Selective repeat, session management, compression |
-| CLI (loopback, tx, rx) | **Working** | File-based I/O; live audio requires feature flag |
-| Daemon event loop | **Working** | Processes audio and host events |
-| VARA-style TCP interface | **Working** | Control/data server on ports 8300/8301; VARA-style protocol, not RF-compatible with VARA |
-| C FFI | **Working** | One-shot and streaming encode/decode with panic safety |
-| Operating profiles | **Partial** | Defined but only HF modes use BPSK; no runtime modulation switching |
-| Channel prediction | **Working** | EWMA predictor + static MCS lookup table (no machine learning / model inference) |
-| Serial/GPIO PTT | **Stub** | Feature flags exist but no hardware access |
-| VARA RF/waveform compat | **Not implemented** | The TCP control interface is VARA-style, but the modem is not RF-compatible with VARA and does not interoperate with it |
+| OFDM modem | Implemented | Engine encode/decode and streaming receive use the OFDM transceiver; carrier-frequency-offset tolerance is ±50 Hz |
+| Modulation and speed levels | Implemented | Nine levels, 1–9, using BPSK, QPSK, 8PSK, 16-QAM and 64-QAM on OFDM carriers; HF supports 1–8, and level 9 is VHF-only |
+| Payload FEC | Implemented | One NR BG2 LDPC mother code with per-level shortening and rate matching |
+| Frame protection | Implemented | Golay-protected header with CRC-16; CRC-32 for each payload codeword |
+| ARQ and protocol stack | Implemented, opt-in ARQ | Selective-repeat ARQ, session management and optional Huffman + LZ4 compression; daemon ARQ defaults off |
+| CLI | Implemented | Loopback and WAV transmit/receive; live audio requires `cpal-backend` |
+| Daemon event loop | Implemented | Processes audio and host events; live audio requires `cpal-backend` |
+| VARA-style TCP interface | Implemented, opt-in | Control/data ports default to 8300/8301; server disabled by default; not RF-compatible with VARA |
+| C FFI | Implemented | Shared/static library with one-shot encode/decode and streaming decode |
+| Operating profiles | Implemented | 48 kHz OFDM profiles with runtime speed-level selection within the configured band |
+| Link adaptation | Implemented, limited calibration | Measurement-driven speed selection and ACK-driven RateLoop with ARQ enabled; no model inference; performance targets remain unmet, see [BENCHMARKS.md](BENCHMARKS.md) |
+| Serial/GPIO PTT | Implemented, feature-gated | Daemon serial DTR/RTS uses `serial-ptt`; Linux sysfs GPIO uses `gpio-ptt` |
+| IR-HARQ | Unwired codec primitive | Redundancy-version and combining support exists in the codec; engine/daemon retransmissions do not wire it into an operational IR-HARQ feature |
+| VARA RF/waveform compatibility | Not supported | The TCP control interface is VARA-style; Coppa does not interoperate with VARA over RF |
 
 ## Features
 
-- **Full DSP chain**: AGC, Costas loop carrier recovery, RRC pulse shaping, Gardner timing recovery
-- **BPSK modem**: end-to-end encode/decode with convolutional FEC
-- **Modulation**: BPSK is wired end-to-end; QPSK, 8PSK, 16QAM, 64QAM, and OFDM constellation math is implemented and tested but not wired into the engine pipeline
-- **Forward error correction**: rate-1/2 K=7 convolutional codes with soft Viterbi, QC-LDPC (6 rates)
-- **OFDM PHY**: configurable profiles, pilot-based channel estimation, MMSE equalization
-- **Protocol layer**: ARQ with selective repeat, Huffman + LZ4 compression, CRC-16 framing
-- **Audio I/O**: real-time via CPAL (feature-gated), WAV file read/write
-- **VARA-style TCP interface**: command/data port server for host application integration (not RF-compatible with VARA)
-- **C FFI**: shared/static library with streaming decode API
-- **Channel prediction**: EWMA-based with MCS selection table
+- OFDM encode/decode with pilot-based channel estimation, channel equalization and streaming receive.
+- Nine speed levels using OFDM carrier constellations from BPSK through 64-QAM; levels 1–8 on HF and 1–9 on VHF.
+- NR BG2 LDPC payload coding with shortening, rate matching and interleaving; Golay and CRC-16 header protection, plus per-codeword CRC-32 payload checks.
+- Selective-repeat ARQ and session management, with optional Huffman + LZ4 compression. Daemon ARQ is disabled by default.
+- WAV file I/O and live CPAL audio with `cpal-backend`; daemon serial and Linux GPIO PTT with their respective feature flags.
+- VARA-style TCP command/data interface for host applications, disabled by default and not RF-compatible with VARA.
+- C FFI shared/static library with one-shot encode/decode and streaming decode.
+- Deterministic link adaptation and spectrum sensing. Short-CP recommendation and negotiation are opt-in; IR-HARQ remains an unwired codec primitive.
 
 ## Quick Start
 
@@ -74,12 +70,12 @@ coppa config
 |-------|-------------|
 | `coppa-dsp` | Pure DSP primitives: FFT/IFFT, FIR/IIR filters, AGC, resampling |
 | `coppa-codec` | Modulation/demodulation: BPSK, QPSK, 8PSK, QAM, OFDM |
-| `coppa-protocol` | Framing, FEC (convolutional + LDPC), ARQ, compression, session management |
+| `coppa-protocol` | OFDM transceiver, NR BG2 LDPC payload coding, framing, ARQ, compression and session management |
 | `coppa-channel` | Channel models for testing: AWGN, sinusoidal fading, frequency offset |
 | `coppa-audio` | Audio backends: CPAL real-time I/O, WAV file read/write |
 | `coppa-radio` | Radio control: rigctld CAT, serial PTT (DTR/RTS, `serial-ptt` feature), GPIO PTT (Linux sysfs, `gpio-ptt` feature) |
-| `coppa-ml` | Channel prediction: EWMA predictor, MCS selection, spectrum sensing |
-| `coppa-engine` | Core engine orchestrating modem, FEC, and framing pipelines |
+| `coppa-ml` | Measurement-driven speed selection, RateLoop, CpGate, BusyGate and spectrum sensing |
+| `coppa-engine` | CoppaTransceiver wrapper with compression, squelch and streaming receive |
 | `coppa-host` | Host interfaces: VARA-style TCP control server, WebSocket JSON API |
 | `coppa-ffi` | C FFI bindings (cdylib + staticlib) with streaming decode API |
 | `coppa-cli` | CLI binary (`coppa`) for transmit, receive, loopback, device listing |

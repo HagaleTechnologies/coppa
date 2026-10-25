@@ -1,11 +1,15 @@
 //! Daemon configuration from TOML file.
 
+<<<<<<< HEAD
 pub use coppa_radio::band::FrequencyConfig;
 use serde::Deserialize;
+=======
+use serde::{Deserialize, Serialize};
+>>>>>>> 928cb125c9ce25944fd8563cb6b9e5d375bbf7cf
 use std::path::Path;
 
 /// Top-level daemon configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DaemonConfig {
     /// Audio subsystem configuration.
@@ -22,7 +26,7 @@ pub struct DaemonConfig {
 }
 
 /// Audio configuration section.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioConfig {
     /// Input device name (empty = default).
@@ -36,7 +40,7 @@ pub struct AudioConfig {
 }
 
 /// Radio control configuration section.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RadioConfig {
     /// PTT method/config string. Either a simple backend name --
@@ -186,7 +190,7 @@ impl RadioConfig {
 }
 
 /// Host interface configuration section.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HostConfig {
     /// Address all host servers bind to. Defaults to "127.0.0.1" (loopback only).
@@ -208,7 +212,7 @@ pub struct HostConfig {
 }
 
 /// Engine configuration section.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EngineSection {
     /// Operational profile name.
@@ -322,7 +326,7 @@ pub struct EngineSection {
 /// field's doc); the station-ID timer and beacon mode additionally require
 /// `[engine] callsign` to be set (see `EngineSection::callsign`'s doc) --
 /// there is no meaningful "identify" or "beacon" transmission without one.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StationIdConfig {
     /// Busy-channel gate: once a TX request finds the channel busy (via
@@ -480,6 +484,29 @@ mod tests {
         assert_eq!(config.radio.ptt_method, "none");
         assert_eq!(config.radio.ptt_tail_delay_ms, 200);
         assert_eq!(config.radio.max_tx_duration_s, 30);
+    }
+
+    #[test]
+    fn test_default_config_serializes_and_roundtrips() {
+        // `coppad --print-default-config` prints exactly this serialization.
+        let printed = toml::to_string_pretty(&DaemonConfig::default()).unwrap();
+        assert!(
+            !printed.contains("grid"),
+            "an unset grid is omitted: {printed}"
+        );
+        let mut grid_set = DaemonConfig::default();
+        grid_set.engine.grid = Some("FN20".to_string());
+        assert!(toml::to_string_pretty(&grid_set)
+            .unwrap()
+            .contains("grid = \"FN20\""));
+
+        let parsed: DaemonConfig = toml::from_str(&printed).unwrap();
+        assert_eq!(toml::to_string_pretty(&parsed).unwrap(), printed);
+        assert_eq!(parsed.audio.sample_rate, 48_000);
+        assert_eq!(parsed.radio.ptt_method, "none");
+        assert_eq!(parsed.engine.profile, "HF_STANDARD");
+        assert_eq!(parsed.engine.grid, None);
+        assert_eq!(parsed.station_id.id_interval_secs, 540);
     }
 
     #[test]
