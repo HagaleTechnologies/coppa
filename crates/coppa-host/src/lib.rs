@@ -28,7 +28,8 @@ pub enum HostEvent {
     Disconnected { client_id: u32 },
     /// Data received from a client.
     DataReceived { client_id: u32, data: Vec<u8> },
-    /// A VARA command was received.
+    /// A command-port line other than CONNECT/DISCONNECT. The daemon answers
+    /// it on the sending client's own response channel.
     VaraCommand { client_id: u32, command: String },
     /// Connection request (CONNECT callsign1 callsign2).
     ConnectRequest {

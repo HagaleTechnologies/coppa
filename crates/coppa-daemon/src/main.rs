@@ -3,6 +3,11 @@
 //! Manages the engine lifecycle, host interfaces, and radio control in a
 //! persistent background process.
 
+// Shared with the library target; the binary uses only part of its API
+// (and none of the output worker without `cpal-backend`).
+#[allow(dead_code)]
+mod audio_output;
+mod cli;
 mod config;
 mod event_loop;
 #[cfg(feature = "websocket")]
@@ -11,45 +16,94 @@ mod spectrum;
 #[cfg(feature = "kiss-tnc")]
 mod tnc;
 
-use anyhow::Result;
+use std::io::Write;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use cli::{Cli, ConfigSource, LogLevel, Mode};
 use config::DaemonConfig;
 use event_loop::{DaemonEvent, EventLoop};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize structured logging; RUST_LOG controls verbosity (default: info)
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Parse first: help, version and usage errors exit here, before any
+    // logging, config loading or service startup.
+    let cli = Cli::parse();
 
+    match cli.mode() {
+        Mode::PrintDefaultConfig => print_default_config(),
+        Mode::Check(source) => check_config(&source),
+        Mode::Tnc => run_tnc(cli.log_level).await,
+        Mode::Run(source) => {
+            // Load before logging so a config error is the only output.
+            let config = load_config(&source)?;
+            init_tracing(cli.log_level);
+            log_banner();
+            run_daemon(config).await
+        }
+    }
+}
+
+/// Load the configuration a command selected. An explicit path must exist;
+/// the implicit `./coppad.toml` falls back to defaults only when absent.
+fn load_config(source: &ConfigSource) -> Result<DaemonConfig> {
+    match source {
+        ConfigSource::Explicit(path) => DaemonConfig::load(path)
+            .with_context(|| format!("Failed to load config {}", path.display())),
+        ConfigSource::Implicit => DaemonConfig::load_or_default(cli::DEFAULT_CONFIG_PATH),
+    }
+}
+
+/// `--check`: read and deserialize the configuration only. Deliberately
+/// returns before PTT parsing or `EventLoop::new`, which can touch hardware.
+fn check_config(source: &ConfigSource) -> Result<()> {
+    load_config(source)?;
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "Configuration syntax and field types OK.")?;
+    writeln!(stdout, "Hardware and runtime settings were not checked.")?;
+    Ok(())
+}
+
+/// `--print-default-config`: the built-in configuration as TOML, read from
+/// `DaemonConfig::default()` so it tracks future defaults.
+fn print_default_config() -> Result<()> {
+    let toml = toml::to_string_pretty(&DaemonConfig::default())
+        .context("Failed to serialize the default config")?;
+    writeln!(std::io::stdout().lock(), "{}", toml.trim_end())?;
+    Ok(())
+}
+
+/// Structured logging for the run modes: `--log-level` overrides `RUST_LOG`,
+/// which falls back to `info` when absent or invalid.
+fn init_tracing(level: Option<LogLevel>) {
+    let rust_log = std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).ok();
+    tracing_subscriber::fmt()
+        .with_env_filter(cli::log_filter(level, rust_log.as_deref()))
+        .init();
+}
+
+fn log_banner() {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         "coppad - Coppa Daemon starting"
     );
+}
 
-    // Check for --tnc flag early and branch to TNC daemon mode if present
-    if std::env::args().any(|a| a == "--tnc") {
-        #[cfg(feature = "kiss-tnc")]
-        {
-            let tnc_config = tnc::TncConfig::default();
-            return tnc::run_tnc(tnc_config).await;
-        }
-        #[cfg(not(feature = "kiss-tnc"))]
-        {
-            anyhow::bail!("TNC mode requires the kiss-tnc feature");
-        }
-    }
+/// `--tnc`: the KISS TNC with its own defaults (no daemon config file).
+#[cfg(feature = "kiss-tnc")]
+async fn run_tnc(level: Option<LogLevel>) -> Result<()> {
+    init_tracing(level);
+    log_banner();
+    tnc::run_tnc(tnc::TncConfig::default()).await
+}
 
-    // Load configuration
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "coppad.toml".to_string());
+/// `--tnc` in a build without the TNC: fail before logging anything.
+#[cfg(not(feature = "kiss-tnc"))]
+async fn run_tnc(_level: Option<LogLevel>) -> Result<()> {
+    anyhow::bail!("TNC mode requires the kiss-tnc feature")
+}
 
-    let config = DaemonConfig::load_or_default(&config_path)?;
-
+async fn run_daemon(config: DaemonConfig) -> Result<()> {
     if config.engine.callsign.is_empty() {
         tracing::warn!("No callsign configured. Set [engine] callsign in config.");
     }
@@ -76,7 +130,6 @@ async fn main() -> Result<()> {
     let (audio_out_producer, audio_out_consumer) =
         coppa_audio::audio_ring(config.audio.buffer_size);
     let (audio_in_producer, audio_in_consumer) = coppa_audio::audio_ring(config.audio.buffer_size);
-    event_loop.set_audio_out(audio_out_producer);
     event_loop.set_audio_in(audio_in_consumer);
 
     // E5: Get shutdown flag for audio threads
@@ -145,61 +198,74 @@ async fn main() -> Result<()> {
             Err(e) => eprintln!("No audio input device: {}", e),
         }
 
-        // Spawn audio output: event loop writes to ring buffer -> CPAL speaker
-        let mut audio_out_cons = audio_out_consumer;
+        // Spawn audio output: event loop writes to ring buffer -> CPAL speaker.
+        // The sink is created, started, stopped and dropped on this one
+        // worker thread (CPAL streams are thread-affine), and the worker
+        // retains each chunk until the sink has accepted all of it, feeding
+        // playback progress back so PTT is released from samples played.
         let output_shutdown = shutdown_flag.clone();
         let output_device_name = config.audio.output_device.clone();
-        let sink_result = if output_device_name.is_empty() {
-            coppa_audio::CpalSink::new(sample_rate, buf_size)
-        } else {
-            match coppa_audio::find_output_device_by_name(&output_device_name) {
-                Some(device) => {
-                    tracing::info!(device = %output_device_name, "Audio output: using named device");
-                    coppa_audio::cpal_backend::CpalSink::from_device(device, sample_rate, buf_size)
+        let output_feedback = std::sync::Arc::new(audio_output::OutputFeedback::default());
+        // Only wire the audio-out ring when this worker drains it: TX audio
+        // is retained until the ring accepts it, so an undrained ring would
+        // accumulate every transmission. If the device fails to open, the
+        // worker drops its end, the ring reads as abandoned and nothing more
+        // is queued.
+        event_loop.set_audio_out(audio_out_producer);
+        event_loop.set_output_feedback(output_feedback.clone());
+        tokio::task::spawn_blocking(move || {
+            let sink_result = if output_device_name.is_empty() {
+                coppa_audio::CpalSink::new(sample_rate, buf_size)
+            } else {
+                match coppa_audio::find_output_device_by_name(&output_device_name) {
+                    Some(device) => {
+                        tracing::info!(device = %output_device_name, "Audio output: using named device");
+                        coppa_audio::cpal_backend::CpalSink::from_device(
+                            device,
+                            sample_rate,
+                            buf_size,
+                        )
+                    }
+                    None => {
+                        tracing::warn!(
+                            device = %output_device_name,
+                            "Audio output device not found, falling back to default"
+                        );
+                        coppa_audio::CpalSink::new(sample_rate, buf_size)
+                    }
                 }
-                None => {
-                    tracing::warn!(
-                        device = %output_device_name,
-                        "Audio output device not found, falling back to default"
-                    );
-                    coppa_audio::CpalSink::new(sample_rate, buf_size)
+            };
+            let mut sink = match sink_result {
+                Ok(sink) => sink,
+                Err(e) => {
+                    eprintln!("No audio output device: {}", e);
+                    output_feedback.fail();
+                    return;
                 }
+            };
+            if let Err(e) = sink.start() {
+                eprintln!("Failed to start audio output: {}", e);
+                output_feedback.fail();
+                return;
             }
-        };
-        match sink_result {
-            Ok(mut sink) => {
-                if let Err(e) = sink.start() {
-                    eprintln!("Failed to start audio output: {}", e);
-                } else {
-                    tracing::info!(sample_rate, "Audio output started");
-                    tokio::task::spawn_blocking(move || {
-                        let mut buf = vec![0.0f32; 1024];
-                        loop {
-                            // E5: Check shutdown flag in addition to is_abandoned
-                            if audio_out_cons.is_abandoned()
-                                || output_shutdown.load(std::sync::atomic::Ordering::Acquire)
-                            {
-                                break;
-                            }
-                            let n = audio_out_cons.read(&mut buf);
-                            if n > 0 {
-                                let _ = sink.write(&buf[..n]);
-                            } else {
-                                std::thread::sleep(std::time::Duration::from_millis(10));
-                            }
-                        }
-                    });
-                }
-            }
-            Err(e) => eprintln!("No audio output device: {}", e),
-        }
+            tracing::info!(sample_rate, "Audio output started");
+            audio_output::OutputWorker::new(1024, sample_rate, output_feedback).run(
+                audio_out_consumer,
+                sink,
+                |sink| sink.playback_progress(),
+                output_shutdown,
+            );
+        });
     }
 
     // Suppress unused variable warnings when cpal-backend is not enabled
     #[cfg(not(feature = "cpal-backend"))]
     {
+        // No hardware output: leave the audio-out ring unwired so TX audio is
+        // not queued for a consumer that never drains it.
+        drop(audio_out_producer);
+        drop(audio_out_consumer);
         let _ = audio_in_producer;
-        let _ = audio_out_consumer;
         let _ = shutdown_flag;
     }
 
@@ -240,6 +306,8 @@ async fn main() -> Result<()> {
         let vara_data_senders = vara_server.data_senders();
         tokio::spawn(async move {
             while let Some(response) = response_rx.recv().await {
+                // StatusUpdate is deliberately not forwarded: EventLoop::notify_session
+                // pushes session state directly to the command port and WebSocket.
                 if let coppa_host::HostResponse::DataOut { client_id, data } = &response {
                     let senders = vara_data_senders.lock().await;
                     if *client_id == 0 {

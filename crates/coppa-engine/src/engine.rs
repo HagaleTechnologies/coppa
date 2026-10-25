@@ -183,6 +183,14 @@ impl CoppaCore {
         Self::resolves_to_vhf(self.config.speed_level, self.config.ofdm_band)
     }
 
+    /// Occupied bandwidth of the OFDM profile in use, in Hz: active carriers
+    /// times carrier spacing (2400 on the HF profiles, long or short CP; 5600
+    /// on VHF wide). The VARA `CONNECTED` line reports it.
+    pub fn occupied_bandwidth_hz(&self) -> u32 {
+        let profile = self.transceiver.profile();
+        (profile.total_active_carriers() as f32 * profile.carrier_spacing_hz()).round() as u32
+    }
+
     /// Encode a text message to audio samples.
     pub fn encode(&self, message: &str) -> Result<Vec<f32>> {
         self.encode_bytes(message.as_bytes())
@@ -1220,6 +1228,19 @@ mod tests {
         let vhf_short_cp = CoppaCore::select_ofdm_profile(1, CpMode::ShortCp, OfdmBand::Vhf);
         assert_eq!(vhf_long_cp.cp_samples, CoppaProfile::vhf_wide().cp_samples);
         assert_eq!(vhf_short_cp.cp_samples, CoppaProfile::vhf_wide().cp_samples);
+    }
+
+    #[test]
+    fn occupied_bandwidth_hz_matches_the_profile_on_air() {
+        use coppa_protocol::cp_negotiator::CpMode;
+        let mut hf = CoppaCore::from_profile(&crate::profiles::HF_STANDARD);
+        assert_eq!(hf.occupied_bandwidth_hz(), 2400); // 48 carriers x 50 Hz
+        hf.set_cp_profile(CpMode::ShortCp);
+        assert_eq!(hf.occupied_bandwidth_hz(), 2400); // short CP: same carriers
+        assert_eq!(
+            CoppaCore::from_profile(&crate::profiles::VHF_FAST).occupied_bandwidth_hz(),
+            5600 // 112 x 50 Hz
+        );
     }
 
     #[test]

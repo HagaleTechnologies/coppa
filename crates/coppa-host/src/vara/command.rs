@@ -34,8 +34,7 @@ impl VaraCommandPort {
         let mut reader = BufReader::new(reader);
 
         // Send initial version
-        let version_resp =
-            VaraResponse::Version(concat!("Coppa ", env!("CARGO_PKG_VERSION")).to_string());
+        let version_resp = VaraResponse::coppa_version();
         writer.write_all(version_resp.format().as_bytes()).await?;
 
         // Notify connection

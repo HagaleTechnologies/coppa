@@ -32,6 +32,17 @@ a real bug — breaking them will reintroduce that bug.
   ARQ retransmits and session keepalives once bypassed it via a direct
   `handle_audio_out` call; harmless with stub PTT, but with real PTT they would
   silently never key the radio. Any new TX call site must route through it.
+- **TX audio is paced, never dropped, and PTT follows playback (COP-22).**
+  Frames are larger than every ring on the path (65,520-sample OFDM frame vs.
+  the 8,192-sample audio-out and `CpalSink` rings; 94k-110k-sample AFSK frames
+  vs. the TNC's 65,536), so each producer retains its unwritten suffix
+  (`audio_output::PendingOutput`, `OutputWorker`, the CLI's `play_keyed`) —
+  a one-shot `write` once silently dropped ~87% of every frame. PTT is
+  released from `CpalSink::playback_progress` (consumed count plus CPAL's
+  predicted presentation time), not from a nominal duration, and only by the
+  newest transmission's generation-tagged `TxComplete`. Output failure, 5 s
+  without playback progress, or `max_tx_duration_s` cancels and unkeys; no
+  hardware/on-air test has validated the timing yet.
 - **Every ARQ retransmission must call `ArqTx::mark_retransmitted`.** Before
   this was wired, `get_retransmits`'s expiry check never advanced: every
   unacked segment retransmitted every 500 ms forever, and the `max_retransmit`
