@@ -1844,6 +1844,8 @@ mod tests {
     /// `Err(TransmitError::InvalidSpeedLevel { level })` for every such value
     /// instead of panicking. The invalid set comes from `speed_level_components`
     /// itself, so this test follows the next ladder change without edits.
+    /// Level 8, the ticket's example, was the reserved gap in the ladder before
+    /// COP-24 renumbered it; it is valid now and must still transmit.
     #[test]
     fn transmit_rejects_invalid_speed_level() {
         let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
@@ -1868,8 +1870,11 @@ mod tests {
             );
         }
 
-        // Level 8 was the reserved gap in the ladder before COP-24 renumbered
-        // it (the ticket's example). It is a valid level now and must transmit.
+        assert_eq!(
+            TransmitError::InvalidSpeedLevel { level: 0 }.to_string(),
+            "invalid speed level 0 in header"
+        );
+
         let header = make_header(8, payload.len() as u16);
         assert!(
             tx.transmit(&header, &payload).is_ok(),
