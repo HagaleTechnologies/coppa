@@ -47,8 +47,8 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 #### DSP Primitives (`coppa-dsp`)
 - FFT/IFFT via rustfft (`FftProcessor`)
 - FIR design and filtering: the windowed-sinc bandpass the OFDM TX/RX conditioning uses (`design_bandpass`), a Hilbert design, and a streaming FIR
-- Older single-carrier primitives (AGC, a matched pulse-shaping filter, carrier and symbol-timing recovery) that only the legacy `BpskModem` uses. See [Legacy code not on the data path](#legacy-code-not-on-the-data-path)
-- Sample-rate conversion is not here. It lives in `coppa-audio`'s resampler
+- Older single-carrier primitives (AGC, a matched pulse-shaping filter, carrier and symbol-timing recovery) that only the legacy `BpskModem` uses; `benches/throughput.rs` also uses the AGC and the pulse-shaping filter directly. See [Legacy code not on the data path](#legacy-code-not-on-the-data-path)
+- There is no sample-rate converter on the audio path, and nothing checks the rate. Every `CoppaProfile` runs at 48 kHz. The daemon hands its `[audio] sample_rate` (default 48000) to the sound card unchanged, and `coppa rx --input` does not compare a WAV file's rate with the engine's. `crates/coppa-audio/src/resampler.rs` is not compiled: `coppa-audio`'s `lib.rs` does not declare it, and the `rubato` crate it imports is in no `Cargo.toml`
 
 #### Codec Layer (`coppa-codec`)
 - **Constellation mappers** with hard and soft (LLR) demapping: `BpskMapper`, `QpskMapper`, `Psk8Mapper`, `Qam16Mapper`, `Qam64Mapper` (SPEC §6.1). These map bits to OFDM carrier values. None of them is a standalone modem
@@ -70,13 +70,13 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 - Two-tap Watterson / ITU-R F.1487 HF channel (Rayleigh taps, Gaussian Doppler) with Good/Moderate/Poor presets
 - `ssb_filter`, emulating a 300–2700 Hz SSB rig audio passband
 - Carrier-frequency offset, timing offset and sample-clock offset impairments
-- A sinusoidal amplitude fade used only by AGC tests
+- `fading`, a deterministic sinusoidal amplitude fade (periodic AM, not a fading model). Outside its own crate, its only callers are `CoppaCore` loopback tests in `tests/integration_test.rs`
 - Used by tests and `coppa-bench` only; nothing shipped depends on it
 
 #### Audio I/O (`coppa-audio`)
 - **CPAL backend** (`cpal-backend`): real-time capture and playback through lock-free `rtrb` ring buffers
 - **File backend** (`file-backend`): WAV read and write via hound
-- A loopback backend, sample-rate conversion, playback-progress bookkeeping and a VOX detector
+- A loopback backend, playback-progress bookkeeping and a VOX detector
 - Device enumeration and selection
 
 #### Radio Control (`coppa-radio`)
@@ -203,7 +203,7 @@ These components still compile and have tests, but no production TX or RX path c
 - **`coppa_protocol::fec::convolutional`**: a rate-1/2 K=7 convolutional code with a soft Viterbi decoder. Callers: `benches/throughput.rs` and `fuzz/fuzz_targets/fuzz_viterbi.rs`.
 - **`coppa_protocol::fec::ldpc::codes`**: the six-rate IEEE 802.11 QC-LDPC codes (Z = 81, N = 1944), with `LdpcCodec`, `LdpcEncoder` and `LdpcDecoder`. They are used only by `coppa-protocol` examples, `coppa-bench` examples and the harness's `transfer` module, and by unit tests. The module's `CodeRate` enum survives as a label returned by `speed_level_components`; `CoppaTransceiver` ignores it (SPEC §12).
 - **`coppa_protocol::frame`**: the pre-OFDM frame (`[Preamble][Sync][Length][MAC PDU][CRC-16]`), re-exported as `coppa_protocol::Frame`. Callers: its own tests, `tests/proptest_roundtrip.rs` and `fuzz/fuzz_targets/fuzz_frame_parse.rs`.
-- **The generic OFDM stack** in `coppa-codec/src/ofdm/mod.rs` (`OfdmProfile`, `OfdmModulator`, `OfdmDemodulator`, `equalizer::LinearInterpolationEstimator`): a single-symbol teaching example. Only `tests/integration_test.rs` uses it (SPEC §0.2). Its training symbols in `ofdm/frame.rs` (`SignalField`, `generate_sts`, `generate_lts`) are called only by that file's tests; the same file's `CoppaHeader` is on the production path.
+- **The generic OFDM stack** in `coppa-codec/src/ofdm/mod.rs` (`OfdmProfile`, `OfdmModulator`, `OfdmDemodulator`, `equalizer::LinearInterpolationEstimator`): a single-symbol teaching example (SPEC §0.2). Outside `coppa-codec`, only `tests/integration_test.rs` uses it, and only `OfdmProfile`, `OfdmModulator` and `OfdmDemodulator`; `LinearInterpolationEstimator` is called only by `equalizer.rs`'s own tests. Its training symbols in `ofdm/frame.rs` (`SignalField`, `generate_sts`, `generate_lts`) are called only by that file's tests; the same file's `CoppaHeader` is on the production path.
 
 ## Current Status
 
@@ -295,7 +295,7 @@ coppa/
 │   │   ├── src/modem/            # CoppaTransceiver, StreamingReceiver, speed levels, airtime
 │   │   └── src/fec/              # NR BG2 LDPC, scrambler, legacy codecs
 │   ├── coppa-channel/            # AWGN, Watterson, SSB filter, CFO/SCO impairments (test and bench only)
-│   ├── coppa-audio/              # CPAL and WAV backends, ring buffers, resampler, VOX
+│   ├── coppa-audio/              # CPAL and WAV backends, ring buffers, loopback, VOX
 │   ├── coppa-radio/              # rigctld CAT, serial/GPIO/VOX PTT
 │   ├── coppa-ml/                 # RateLoop, CpGate, BusyGate, MCS selection, spectrum sensing
 │   ├── coppa-engine/             # CoppaCore, EngineConfig, named profiles
