@@ -8743,6 +8743,20 @@ mod tests {
         #[tokio::test]
         async fn websocket_hears_connected_and_disconnected_and_status_follows() {
             use coppa_host::websocket::{WsServerMessage, WsStatus};
+            // The same channel carries COP-65 `audio_level` messages (one per
+            // transmission the connect/disconnect handshake makes); only the
+            // session pushes count here.
+            fn next_session_push(
+                rx: &mut tokio::sync::broadcast::Receiver<String>,
+            ) -> Option<WsServerMessage> {
+                while let Ok(json) = rx.try_recv() {
+                    let msg: WsServerMessage = serde_json::from_str(&json).unwrap();
+                    if !matches!(msg, WsServerMessage::AudioLevel { .. }) {
+                        return Some(msg);
+                    }
+                }
+                None
+            }
             let mut station = EventLoop::new(session_config()).unwrap();
             let (tx, mut rx) = tokio::sync::broadcast::channel(16);
             let status = Arc::new(Mutex::new(WsStatus::default()));
@@ -8760,8 +8774,7 @@ mod tests {
                 .handle_connect_req(&LinkCapabilities::default().to_bytes())
                 .unwrap();
             station.handle_mac_pdu(ack).await;
-            let msg: WsServerMessage =
-                serde_json::from_str(&rx.try_recv().expect("connected push")).unwrap();
+            let msg = next_session_push(&mut rx).expect("connected push");
             assert!(
                 matches!(msg, WsServerMessage::Connected { remote_call } if remote_call == "W1AW")
             );
@@ -8771,13 +8784,15 @@ mod tests {
                 assert_eq!(snap.remote_call.as_deref(), Some("W1AW"));
             }
             station.handle_mac_pdu(remote.disconnect().unwrap()).await;
-            let msg: WsServerMessage =
-                serde_json::from_str(&rx.try_recv().expect("disconnected push")).unwrap();
+            let msg = next_session_push(&mut rx).expect("disconnected push");
             assert!(matches!(msg, WsServerMessage::Disconnected));
             let snap = status.lock().await;
             assert!(!snap.connected);
             assert_eq!(snap.remote_call, None);
-            assert!(rx.try_recv().is_err(), "exactly one push per transition");
+            assert!(
+                next_session_push(&mut rx).is_none(),
+                "exactly one push per transition"
+            );
         }
 
         /// Zero-lead/trail-padded encode, mirroring `coppa-engine`'s own streaming
