@@ -7663,7 +7663,45 @@ mod tests {
             cmd_port: u16,
             data_port: u16,
         ) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
-            let mut server = VaraServer::new(cmd_port, data_port);
+            let cmd_listener = tokio::net::TcpListener::bind(("127.0.0.1", cmd_port))
+                .await
+                .expect("bind VARA command port");
+            let data_listener = tokio::net::TcpListener::bind(("127.0.0.1", data_port))
+                .await
+                .expect("bind VARA data port");
+            connect_bridged_vara_client_on(event_loop, cmd_listener, data_listener).await
+        }
+
+        /// `connect_bridged_vara_client` on OS-assigned ports: binds both
+        /// listeners to `127.0.0.1:0` and returns the data port's actual
+        /// address alongside the command-port client, so concurrent test runs
+        /// (separate worktrees, parallel CI slots) can never cross-attach.
+        async fn connect_bridged_vara_client_ephemeral(
+            event_loop: &mut EventLoop,
+        ) -> (
+            BufReader<OwnedReadHalf>,
+            OwnedWriteHalf,
+            std::net::SocketAddr,
+        ) {
+            let cmd_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind VARA command port");
+            let data_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind VARA data port");
+            let data_addr = data_listener.local_addr().expect("data listener address");
+            let (reader, writer) =
+                connect_bridged_vara_client_on(event_loop, cmd_listener, data_listener).await;
+            (reader, writer, data_addr)
+        }
+
+        async fn connect_bridged_vara_client_on(
+            event_loop: &mut EventLoop,
+            cmd_listener: tokio::net::TcpListener,
+            data_listener: tokio::net::TcpListener,
+        ) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
+            let cmd_addr = cmd_listener.local_addr().expect("command listener address");
+            let mut server = VaraServer::new(cmd_addr.port(), 0);
             event_loop.set_vara_responses(server.response_senders());
             let mut events = server.take_event_rx().expect("fresh server");
             let to_loop = event_loop.event_sender();
@@ -7675,12 +7713,14 @@ mod tests {
                 }
             });
             tokio::spawn(async move {
-                let _ = server.run().await;
+                server
+                    .run_with_listeners(cmd_listener, data_listener)
+                    .await
+                    .expect("VARA server accept loops");
             });
-            // Give the server a moment to bind before connecting.
-            tokio::time::sleep(Duration::from_millis(50)).await;
 
-            let stream = TcpStream::connect(("127.0.0.1", cmd_port))
+            // Listeners are already bound, so the connect cannot race the bind.
+            let stream = TcpStream::connect(cmd_addr)
                 .await
                 .expect("mock client should connect to the VARA command port");
             let (read_half, write_half) = stream.into_split();
@@ -8289,9 +8329,9 @@ mod tests {
             let mut event_loop = EventLoop::new(fast_ptt_config()).unwrap();
             let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
             event_loop.set_audio_out(producer);
-            let (mut reader, _write_half) =
-                connect_bridged_vara_client(&mut event_loop, 19460, 19461).await;
-            let mut data = TcpStream::connect(("127.0.0.1", 19461)).await.unwrap();
+            let (mut reader, _write_half, data_addr) =
+                connect_bridged_vara_client_ephemeral(&mut event_loop).await;
+            let mut data = TcpStream::connect(data_addr).await.unwrap();
             let tx = event_loop.event_sender();
             let local = tokio::task::LocalSet::new();
             let running = local.spawn_local(async move { event_loop.run().await });
@@ -8318,9 +8358,9 @@ mod tests {
             let mut config = fast_ptt_config();
             config.engine.callsign = "N0CALL".into();
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, mut writer) =
-                connect_bridged_vara_client(&mut event_loop, 19462, 19463).await;
-            let mut data = TcpStream::connect(("127.0.0.1", 19463)).await.unwrap();
+            let (mut reader, mut writer, data_addr) =
+                connect_bridged_vara_client_ephemeral(&mut event_loop).await;
+            let mut data = TcpStream::connect(data_addr).await.unwrap();
             let tx = event_loop.event_sender();
             let local = tokio::task::LocalSet::new();
             let running = local.spawn_local(async move { event_loop.run().await });
