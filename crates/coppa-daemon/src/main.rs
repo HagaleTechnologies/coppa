@@ -15,6 +15,7 @@ mod spectrum;
 
 #[cfg(feature = "kiss-tnc")]
 mod tnc;
+mod tx_chunker;
 
 use std::io::Write;
 
@@ -39,7 +40,11 @@ async fn main() -> Result<()> {
             let config = load_config(&source)?;
             init_tracing(cli.log_level);
             log_banner();
-            run_daemon(config).await
+            // COP-32: a fatal error after logging starts is logged at ERROR,
+            // then returned so `main` prints `Error: ...` and exits 1.
+            run_daemon(config)
+                .await
+                .inspect_err(|e| tracing::error!("{e:#}"))
         }
     }
 }
@@ -107,17 +112,28 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     if config.engine.callsign.is_empty() {
         tracing::warn!("No callsign configured. Set [engine] callsign in config.");
     }
+    if let Some(warning) = config.radio.turnaround_warning() {
+        tracing::warn!("{warning}");
+    }
 
     tracing::info!(
         profile = %config.engine.profile,
         sample_rate = config.audio.sample_rate,
         ptt_method = %config.radio.ptt_method,
+        turnaround_ms = config.radio.turnaround_ms,
         "Daemon configuration loaded"
     );
 
+    // COP-32: config checks first, before any hardware or socket is touched.
+    config.check_sample_rate().map_err(anyhow::Error::msg)?;
+    #[cfg(not(feature = "cpal-backend"))]
+    check_no_named_devices(&config.audio)?;
+
     // Create event loop. Fails loudly (rather than silently falling back to
     // NullPtt) if [radio] ptt_method doesn't parse or names an
-    // unrecognized/unbuilt PTT backend -- see EventLoop::create_ptt.
+    // unrecognized/unbuilt PTT backend -- see EventLoop::create_ptt. An
+    // unreachable rigctld still falls back to NullPtt, but is recorded in
+    // startup_problems so the daemon reports itself degraded (COP-32).
     let mut event_loop = EventLoop::new(config.clone())
         .map_err(|e| anyhow::anyhow!("failed to start daemon event loop: {e}"))?;
     let event_tx = event_loop.event_sender();
@@ -134,69 +150,100 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
 
     // E5: Get shutdown flag for audio threads
     let shutdown_flag = event_loop.shutdown_flag();
+    // COP-32: stop any audio worker already started if startup fails later.
+    let _stop_audio = StopAudioOnExit(shutdown_flag.clone());
+
+    // COP-32: bind host listeners on this path, before audio, so a port that
+    // is already taken is a startup error instead of a spawned task's log.
+    let vara_listeners = if config.host.vara_enabled {
+        let cmd = bind_host_port(
+            "VARA command port",
+            &config.host.bind_address,
+            config.host.vara_command_port,
+            "vara_command_port",
+        )
+        .await?;
+        let data = bind_host_port(
+            "VARA data port",
+            &config.host.bind_address,
+            config.host.vara_data_port,
+            "vara_data_port",
+        )
+        .await?;
+        Some((cmd, data))
+    } else {
+        None
+    };
+    #[cfg(feature = "websocket")]
+    let ws_listener = if config.host.websocket_enabled {
+        Some(
+            bind_host_port(
+                "WebSocket port",
+                &config.host.bind_address,
+                config.host.websocket_port,
+                "websocket_port",
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
 
     // Connect CPAL audio streams to ring buffers
     #[cfg(feature = "cpal-backend")]
     {
-        use coppa_audio::{AudioSink, AudioSource};
+        use coppa_audio::AudioSource;
 
         let sample_rate = config.audio.sample_rate;
         let buf_size = config.audio.buffer_size;
 
-        // Spawn audio input: CPAL mic -> ring buffer -> event loop polls it
+        // COP-32: a named device that is not there is a startup error, not a
+        // silent fallback to the system default. Both names are checked
+        // before either stream opens.
+        check_named_device(AudioDirection::Input, &config.audio.input_device)?;
+        check_named_device(AudioDirection::Output, &config.audio.output_device)?;
+
+        // Spawn audio input: CPAL mic -> ring buffer -> event loop polls it.
+        // The source is opened, read and dropped on this one worker thread
+        // (CPAL streams are thread-affine); the worker reports the open
+        // result before the daemon may call itself ready.
         let mut audio_in_prod = audio_in_producer;
         let input_shutdown = shutdown_flag.clone();
         let input_device_name = config.audio.input_device.clone();
-        let source_result = if input_device_name.is_empty() {
-            coppa_audio::CpalSource::new(sample_rate, buf_size)
-        } else {
-            match coppa_audio::find_input_device_by_name(&input_device_name) {
-                Some(device) => {
-                    tracing::info!(device = %input_device_name, "Audio input: using named device");
-                    coppa_audio::cpal_backend::CpalSource::from_device(
-                        device,
-                        sample_rate,
-                        buf_size,
-                    )
+        let (input_opened_tx, input_opened_rx) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            let mut source = match open_input(&input_device_name, sample_rate, buf_size) {
+                Ok(source) => {
+                    let _ = input_opened_tx.send(Ok(()));
+                    source
                 }
-                None => {
-                    tracing::warn!(
-                        device = %input_device_name,
-                        "Audio input device not found, falling back to default"
-                    );
-                    coppa_audio::CpalSource::new(sample_rate, buf_size)
+                Err(e) => {
+                    let _ = input_opened_tx.send(Err(e));
+                    return;
                 }
-            }
-        };
-        match source_result {
-            Ok(mut source) => {
-                if let Err(e) = source.start() {
-                    eprintln!("Failed to start audio input: {}", e);
-                } else {
-                    tracing::info!(sample_rate, "Audio input started");
-                    tokio::task::spawn_blocking(move || {
-                        let mut buf = vec![0.0f32; 1024];
-                        loop {
-                            // E5: Check shutdown flag in addition to is_abandoned
-                            if audio_in_prod.is_abandoned()
-                                || input_shutdown.load(std::sync::atomic::Ordering::Acquire)
-                            {
-                                break;
-                            }
-                            match source.read(&mut buf) {
-                                Ok(n) if n > 0 => {
-                                    audio_in_prod.write(&buf[..n]);
-                                }
-                                _ => {
-                                    std::thread::sleep(std::time::Duration::from_millis(10));
-                                }
-                            }
-                        }
-                    });
+            };
+            let mut buf = vec![0.0f32; 1024];
+            loop {
+                // E5: Check shutdown flag in addition to is_abandoned
+                if audio_in_prod.is_abandoned()
+                    || input_shutdown.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    break;
+                }
+                match source.read(&mut buf) {
+                    Ok(n) if n > 0 => {
+                        audio_in_prod.write(&buf[..n]);
+                    }
+                    _ => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
                 }
             }
-            Err(e) => eprintln!("No audio input device: {}", e),
-        }
+        });
+        input_opened_rx
+            .await
+            .context("audio input worker stopped before opening its device")??;
+        tracing::info!(sample_rate, "Audio input started");
 
         // Spawn audio output: event loop writes to ring buffer -> CPAL speaker.
         // The sink is created, started, stopped and dropped on this one
@@ -208,47 +255,22 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         let output_feedback = std::sync::Arc::new(audio_output::OutputFeedback::default());
         // Only wire the audio-out ring when this worker drains it: TX audio
         // is retained until the ring accepts it, so an undrained ring would
-        // accumulate every transmission. If the device fails to open, the
-        // worker drops its end, the ring reads as abandoned and nothing more
-        // is queued.
+        // accumulate every transmission.
         event_loop.set_audio_out(audio_out_producer);
         event_loop.set_output_feedback(output_feedback.clone());
+        let (output_opened_tx, output_opened_rx) = tokio::sync::oneshot::channel();
         tokio::task::spawn_blocking(move || {
-            let sink_result = if output_device_name.is_empty() {
-                coppa_audio::CpalSink::new(sample_rate, buf_size)
-            } else {
-                match coppa_audio::find_output_device_by_name(&output_device_name) {
-                    Some(device) => {
-                        tracing::info!(device = %output_device_name, "Audio output: using named device");
-                        coppa_audio::cpal_backend::CpalSink::from_device(
-                            device,
-                            sample_rate,
-                            buf_size,
-                        )
-                    }
-                    None => {
-                        tracing::warn!(
-                            device = %output_device_name,
-                            "Audio output device not found, falling back to default"
-                        );
-                        coppa_audio::CpalSink::new(sample_rate, buf_size)
-                    }
+            let sink = match open_output(&output_device_name, sample_rate, buf_size) {
+                Ok(sink) => {
+                    let _ = output_opened_tx.send(Ok(()));
+                    sink
                 }
-            };
-            let mut sink = match sink_result {
-                Ok(sink) => sink,
                 Err(e) => {
-                    eprintln!("No audio output device: {}", e);
                     output_feedback.fail();
+                    let _ = output_opened_tx.send(Err(e));
                     return;
                 }
             };
-            if let Err(e) = sink.start() {
-                eprintln!("Failed to start audio output: {}", e);
-                output_feedback.fail();
-                return;
-            }
-            tracing::info!(sample_rate, "Audio output started");
             audio_output::OutputWorker::new(1024, sample_rate, output_feedback).run(
                 audio_out_consumer,
                 sink,
@@ -256,6 +278,10 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
                 output_shutdown,
             );
         });
+        output_opened_rx
+            .await
+            .context("audio output worker stopped before opening its device")??;
+        tracing::info!(sample_rate, "Audio output started");
     }
 
     // Suppress unused variable warnings when cpal-backend is not enabled
@@ -270,16 +296,16 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     }
 
     // Start VARA TCP server
-    if config.host.vara_enabled {
+    if let Some((cmd_listener, data_listener)) = vara_listeners {
         let mut vara_server = coppa_host::vara::VaraServer::with_bind_addr(
             config.host.vara_command_port,
             config.host.vara_data_port,
             config.host.bind_address.clone(),
         );
         tracing::info!(
-            command_port = config.host.vara_command_port,
-            data_port = config.host.vara_data_port,
-            "VARA TCP server starting"
+            command_addr = %listen_addr(&cmd_listener),
+            data_addr = %listen_addr(&data_listener),
+            "VARA TCP server listening"
         );
 
         // Pipe VARA events into the daemon event loop
@@ -322,21 +348,23 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
             }
         });
 
-        // Actually start the TCP listeners
+        // Serve the listeners bound above
         tokio::spawn(async move {
-            if let Err(e) = vara_server.run().await {
-                eprintln!("VARA server error: {}", e);
+            if let Err(e) = vara_server
+                .run_with_listeners(cmd_listener, data_listener)
+                .await
+            {
+                tracing::error!("VARA server stopped: {e:#}");
             }
         });
     }
 
     // Start WebSocket server if enabled
     #[cfg(feature = "websocket")]
-    if config.host.websocket_enabled {
-        let ws_port = config.host.websocket_port;
-        tracing::info!(port = ws_port, "WebSocket server starting");
+    if let Some(ws_listener) = ws_listener {
+        tracing::info!(addr = %listen_addr(&ws_listener), "WebSocket server listening");
         let mut ws_server = coppa_host::websocket::WebSocketServer::with_bind_addr(
-            ws_port,
+            config.host.websocket_port,
             config.host.bind_address.clone(),
         );
 
@@ -363,8 +391,8 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         event_loop.set_ws_status(ws_server.status());
 
         tokio::spawn(async move {
-            if let Err(e) = ws_server.run().await {
-                eprintln!("WebSocket server error: {}", e);
+            if let Err(e) = ws_server.run_with_listener(ws_listener).await {
+                tracing::error!("WebSocket server stopped: {e:#}");
             }
         });
     }
@@ -390,11 +418,184 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         });
     }
 
-    tracing::info!("Daemon ready");
+    // COP-32: "Daemon ready" only when nothing degraded the startup.
+    let problems = event_loop.startup_problems();
+    if problems.is_empty() {
+        tracing::info!("Daemon ready");
+    } else {
+        tracing::error!(problems = %problems.join("; "), "Daemon running degraded");
+    }
 
     // Run the event loop
     event_loop.run().await?;
 
     tracing::info!("Daemon stopped");
     Ok(())
+}
+
+/// COP-32: a build without `cpal-backend` opens no audio device, so a named
+/// one can never be found.
+#[cfg(not(feature = "cpal-backend"))]
+fn check_no_named_devices(audio: &config::AudioConfig) -> Result<()> {
+    for (key, name) in [
+        ("input_device", &audio.input_device),
+        ("output_device", &audio.output_device),
+    ] {
+        if !name.is_empty() {
+            anyhow::bail!(
+                "[audio] {key} = {name:?} is set, but this coppad was built without the \
+                 cpal-backend feature and opens no audio devices; rebuild with \
+                 --features cpal-backend, or clear [audio] {key}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// COP-32: bind one host listener on `run_daemon`'s own path, so a taken
+/// port fails startup.
+async fn bind_host_port(
+    what: &str,
+    bind_address: &str,
+    port: u16,
+    key: &str,
+) -> Result<tokio::net::TcpListener> {
+    let addr = format!("{bind_address}:{port}");
+    tokio::net::TcpListener::bind(&addr).await.with_context(|| {
+        format!("failed to bind the {what} to {addr} ([host] bind_address, {key})")
+    })
+}
+
+fn listen_addr(listener: &tokio::net::TcpListener) -> String {
+    listener
+        .local_addr()
+        .map_or_else(|e| format!("unknown ({e})"), |addr| addr.to_string())
+}
+
+/// COP-32: sets the audio workers' shutdown flag when `run_daemon` returns,
+/// including on a startup error after a worker has started.
+struct StopAudioOnExit(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopAudioOnExit {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(feature = "cpal-backend")]
+#[derive(Clone, Copy)]
+enum AudioDirection {
+    Input,
+    Output,
+}
+
+#[cfg(feature = "cpal-backend")]
+impl AudioDirection {
+    fn label(self) -> &'static str {
+        match self {
+            AudioDirection::Input => "input",
+            AudioDirection::Output => "output",
+        }
+    }
+}
+
+/// COP-32: the error for a configured device name that matches nothing,
+/// listing the devices that do exist in that direction.
+#[cfg(feature = "cpal-backend")]
+fn missing_device_error(direction: AudioDirection, name: &str) -> anyhow::Error {
+    let label = direction.label();
+    let available: Vec<String> = coppa_audio::list_devices()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| match direction {
+            AudioDirection::Input => d.input_channels > 0,
+            AudioDirection::Output => d.output_channels > 0,
+        })
+        .map(|d| format!("{:?}", d.name))
+        .collect();
+    let available = if available.is_empty() {
+        "none".to_string()
+    } else {
+        available.join(", ")
+    };
+    anyhow::anyhow!(
+        "audio {label} device {name:?} not found ([audio] {label}_device); \
+         available {label} devices: {available}"
+    )
+}
+
+/// COP-32: a configured device name must match a device that exists now.
+#[cfg(feature = "cpal-backend")]
+fn check_named_device(direction: AudioDirection, name: &str) -> Result<()> {
+    let found = name.is_empty()
+        || match direction {
+            AudioDirection::Input => coppa_audio::find_input_device_by_name(name).is_some(),
+            AudioDirection::Output => coppa_audio::find_output_device_by_name(name).is_some(),
+        };
+    if found {
+        Ok(())
+    } else {
+        Err(missing_device_error(direction, name))
+    }
+}
+
+#[cfg(feature = "cpal-backend")]
+fn device_label(direction: AudioDirection, name: &str) -> String {
+    if name.is_empty() {
+        format!("the default {} device", direction.label())
+    } else {
+        format!("{} device {name:?}", direction.label())
+    }
+}
+
+/// Open and start the capture stream on the calling (worker) thread.
+#[cfg(feature = "cpal-backend")]
+fn open_input(name: &str, sample_rate: u32, buf_size: usize) -> Result<coppa_audio::CpalSource> {
+    use coppa_audio::AudioSource;
+    let opened = if name.is_empty() {
+        coppa_audio::CpalSource::new(sample_rate, buf_size)
+    } else {
+        match coppa_audio::find_input_device_by_name(name) {
+            Some(device) => {
+                tracing::info!(device = %name, "Audio input: using named device");
+                coppa_audio::CpalSource::from_device(device, sample_rate, buf_size)
+            }
+            // Unplugged between `check_named_device` and here.
+            None => Err(missing_device_error(AudioDirection::Input, name)),
+        }
+    };
+    opened
+        .and_then(|mut source| source.start().map(|()| source))
+        .with_context(|| {
+            format!(
+                "failed to open {} at {sample_rate} Hz",
+                device_label(AudioDirection::Input, name)
+            )
+        })
+}
+
+/// Open and start the playback stream on the calling (worker) thread.
+#[cfg(feature = "cpal-backend")]
+fn open_output(name: &str, sample_rate: u32, buf_size: usize) -> Result<coppa_audio::CpalSink> {
+    use coppa_audio::AudioSink;
+    let opened = if name.is_empty() {
+        coppa_audio::CpalSink::new(sample_rate, buf_size)
+    } else {
+        match coppa_audio::find_output_device_by_name(name) {
+            Some(device) => {
+                tracing::info!(device = %name, "Audio output: using named device");
+                coppa_audio::CpalSink::from_device(device, sample_rate, buf_size)
+            }
+            // Unplugged between `check_named_device` and here.
+            None => Err(missing_device_error(AudioDirection::Output, name)),
+        }
+    };
+    opened
+        .and_then(|mut sink| sink.start().map(|()| sink))
+        .with_context(|| {
+            format!(
+                "failed to open {} at {sample_rate} Hz",
+                device_label(AudioDirection::Output, name)
+            )
+        })
 }
