@@ -72,6 +72,11 @@ a real bug — breaking them will reintroduce that bug.
   (accumulating traffic for later dispatch); feeding full dispatch from inside
   the wait once allowed a decoded CONNECT_REQ to trigger a nested transmit,
   bypassing the single-in-flight guard.
+- **One TCP read is not one over-the-air frame (COP-41).** Every
+  `DataReceived` is chunked to pieces that encode at their target level
+  (session/raw: current level; ARQ: the ladder-minimum budget, so segments
+  survive rate drops); the ARQ window's overflow waits in a backlog counted by
+  `BUFFER`. Don't re-introduce a whole-event send on any TX path.
 
 ## Configuration gotchas
 

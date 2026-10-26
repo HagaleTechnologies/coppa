@@ -164,7 +164,7 @@ A conforming receiver **MUST** already know which `CoppaProfile` (i.e.
 it can locate the preamble at all — the whole sync/demod pipeline is
 parameterized by a `CoppaProfile` supplied at construction
 (`CoppaModem::new`, `crates/coppa-codec/src/ofdm/coppa_modem.rs:293-318`;
-`CoppaTransceiver::new`, `crates/coppa-protocol/src/modem/transceiver.rs:526-575`).
+`CoppaTransceiver::new`, `crates/coppa-protocol/src/modem/transceiver.rs:533-582`).
 The header's `phy_mode`/`bandwidth` fields (§4) **MUST** be treated as
 self-describing metadata only: this reference implementation does not
 contain a `(phy_mode, bandwidth_id) → CoppaProfile` lookup that a receiver
@@ -374,7 +374,8 @@ Field semantics:
   redundancy version `rv` (0–3, §5.3); high 2 bits are reserved, always `0`
   in this codec (`crates/coppa-codec/src/ofdm/frame.rs:249-258`).
 - `speed_level` (4 bits): wire-encoded MCS/speed level, 1-9. Values 0 and 10-15
-  are invalid; see §6 for the HF restriction.
+  are invalid; see §6 for the HF restriction. `CoppaTransceiver::transmit`
+  rejects them with `TransmitError::InvalidSpeedLevel`.
 - `seq_num` (8 bits): sequence number, 0–255.
 - `payload_len` (12 bits, max 4095): **total** application-payload length in
   bytes, summed across **all** codewords for a multi-codeword frame (§9) —
@@ -389,7 +390,7 @@ Field semantics:
   `crates/coppa-protocol/src/modem/transceiver.rs:205`); `9..=16` round-trip
   on the wire but are rejected by `transmit`
   (`TransmitError::TooManyCodewords`,
-  `crates/coppa-protocol/src/modem/transceiver.rs:654-660`) — see §9.
+  `crates/coppa-protocol/src/modem/transceiver.rs:662-668`) — see §9.
 
 Round-trip and boundary behavior verified by tests at
 `crates/coppa-codec/src/ofdm/frame.rs:427-588` (all header fields, all
@@ -600,7 +601,7 @@ leading `2*ZC` region untouched.
 Each codeword's payload chunk gets its own 4-byte trailer:
 `CRC_32_ISO_HDLC` checksum, appended **big-endian**
 (`checksum.to_be_bytes()`), before LDPC info-bit packing
-(`crates/coppa-protocol/src/modem/transceiver.rs:4,185,689-692`).
+(`crates/coppa-protocol/src/modem/transceiver.rs:4,185,700-703`).
 `PAYLOAD_CRC_LEN = 4` (`transceiver.rs:192`). A receiver **MUST** verify
 this CRC-32 after LDPC decoding and descrambling and **MUST** reject the
 codeword's payload on mismatch.
@@ -714,8 +715,8 @@ the role of "`N` frame-blocks" and 1 frame's `codewords` codewords playing
 the role of "`N` codewords", i.e. the *same permutation math* is
 reinterpreted as "N codeword time-slots within one frame" instead of its
 originally-described cross-frame use
-(`crates/coppa-protocol/src/modem/transceiver.rs:709-727`, explicit comment
-at `:710-717`). See §9 for the gating condition.
+(`crates/coppa-protocol/src/modem/transceiver.rs:720-739`, explicit comment
+at `:721-728`). See §9 for the gating condition.
 
 For `num_frames = N` (here, `codewords`) and `coded_bits_per_codeword = C`
 (= 1944), with `Cn = C / N` (even stripe size):
@@ -763,7 +764,7 @@ back-to-back in its payload, each with its own CRC-32 trailer (§5.5).
 `MAX_CODEWORDS = 8` (`crates/coppa-protocol/src/modem/transceiver.rs:205`);
 `CoppaTransceiver::transmit` **MUST** reject `header.codewords >
 MAX_CODEWORDS` with `TransmitError::TooManyCodewords`
-(`crates/coppa-protocol/src/modem/transceiver.rs:654-660`).
+(`crates/coppa-protocol/src/modem/transceiver.rs:662-668`).
 
 ### 9.1 Payload splitting
 
@@ -777,12 +778,12 @@ remainder = total_len % codewords
 chunk[k].len = base + 1  if k < remainder else base
 ```
 
-(`crates/coppa-protocol/src/modem/transceiver.rs:508-523`) — the `+1` goes
+(`crates/coppa-protocol/src/modem/transceiver.rs:515-530`) — the `+1` goes
 to the **first** `remainder` chunks, guaranteeing (given the caller's
 oversize check) no single chunk ever exceeds
 `max_payload_for_level(level)`. TX (`transmit`,
-`crates/coppa-protocol/src/modem/transceiver.rs:676`) and RX
-(`receive_core`, `crates/coppa-protocol/src/modem/transceiver.rs:1173`)
+`crates/coppa-protocol/src/modem/transceiver.rs:687`) and RX
+(`receive_core`, `crates/coppa-protocol/src/modem/transceiver.rs:1204`)
 **MUST** use this identical algorithm — they must never diverge, or a
 receiver would slice a sender's codewords at the wrong byte boundaries.
 
@@ -797,7 +798,7 @@ For each codeword `k` in order: append CRC-32 trailer → pack into a
 1760-bit NR BG2 info block (payload+CRC bits, zero-padded to `k_used`, then
 to 1760) → scramble → LDPC-encode → rate-match to 1944 coded bits at the
 frame's `rv` (§5.2–§5.4)
-(`crates/coppa-protocol/src/modem/transceiver.rs:685-707`). All `codewords`
+(`crates/coppa-protocol/src/modem/transceiver.rs:696-718`). All `codewords`
 codewords' 1944-bit blocks are concatenated codeword-major
 (`all_coded`, length `codewords * 1944`).
 
@@ -807,7 +808,7 @@ codewords' 1944-bit blocks are concatenated codeword-major
 (`crates/coppa-protocol/src/modem/transceiver.rs:26`). The §7.2 interleave
 is applied **iff** `codewords > 1 && speed_level >= 5`
 (`cross_codeword_interleave_enabled`,
-`crates/coppa-protocol/src/modem/transceiver.rs:607-609,722`); otherwise
+`crates/coppa-protocol/src/modem/transceiver.rs:614-616,734`); otherwise
 each codeword's 1944 bits are transmitted as their own contiguous
 time-slot, unpermuted. A single-codeword frame always skips this stage.
 
@@ -819,7 +820,7 @@ speed level's constellation mapper (§6); the resulting per-slot symbol
 streams are concatenated in slot order into one flat payload-symbol stream
 for `modulate_mapped`, which has no notion of codewords — it just packs
 symbols into consecutive OFDM symbols
-(`crates/coppa-protocol/src/modem/transceiver.rs:729-743`).
+(`crates/coppa-protocol/src/modem/transceiver.rs:741-755`).
 
 ### 9.5 Known scope cuts (not implemented)
 
@@ -883,7 +884,7 @@ profile, and step 4 for HF profiles only. A conforming receiver is not
 required to replicate any specific TX-side conditioning internally, only to
 correctly demodulate its result — an RX-side bandpass filter matching step
 4's passband is used by the reference receiver
-(`crates/coppa-protocol/src/modem/transceiver.rs:528-535`) but this is a
+(`crates/coppa-protocol/src/modem/transceiver.rs:535-542`) but this is a
 receiver strategy choice (**SHOULD**, not **MUST**).
 
 ---
@@ -896,8 +897,8 @@ receiver strategy choice (**SHOULD**, not **MUST**).
 | Header CRC-16 (`CRC_16_IBM_SDLC`) | appended MSB-first as 16 info bits | `crates/coppa-codec/src/ofdm/header_fec.rs:79,88-90` |
 | Header FEC info-bit packing (bytes → bits) | MSB-first (`(byte >> shift) & 1`, `shift` from 7 down to 0) | `crates/coppa-codec/src/ofdm/header_fec.rs:83-86` |
 | Golay(24,12) codeword packing | MSB-first (bit 23 down to 0) | `crates/coppa-codec/src/ofdm/header_fec.rs:101-104` |
-| Payload CRC-32 (`CRC_32_ISO_HDLC`) trailer | appended **big-endian** (`to_be_bytes()`) | `crates/coppa-protocol/src/modem/transceiver.rs:689-692` |
-| Payload info-bit packing (bytes → bits, pre-LDPC) | MSB-first | `crates/coppa-protocol/src/modem/transceiver.rs:695-699` |
+| Payload CRC-32 (`CRC_32_ISO_HDLC`) trailer | appended **big-endian** (`to_be_bytes()`) | `crates/coppa-protocol/src/modem/transceiver.rs:700-703` |
+| Payload info-bit packing (bytes → bits, pre-LDPC) | MSB-first | `crates/coppa-protocol/src/modem/transceiver.rs:706-710` |
 | `Callsign::encode` (8 chars × 6 bits → 6 bytes) | packed MSB-first, 6-bit codes concatenated big-endian across byte boundaries | `crates/coppa-protocol/src/mac.rs:100-123` (explicit bit-layout diagram at `:108-114`) |
 | `MacPdu::to_bytes` | byte 0 = `[version:4][frame_type:4]` (MSB-first), then dest (6B), src (6B), ssid (1B, low nibble), payload | `crates/coppa-protocol/src/mac.rs:210-229` |
 | PRBS scrambler LFSR | `x^15 + x^14 + 1`, seed `0x4A80`, self-inverse XOR | `crates/coppa-protocol/src/fec/scrambler.rs:6-16` |
@@ -921,7 +922,7 @@ label (§5.1) that no longer matches level 9's *real* rate. Per §5.2,
 level 9's actual `k_used = 1620` is rate **5/6**, not 7/8 — the 7/8→5/6
 change was a deliberate wire-format break (§0.1, §5.2). Tracing the call
 site (`CoppaTransceiver::new`,
-`crates/coppa-protocol/src/modem/transceiver.rs:547-560`) confirms this
+`crates/coppa-protocol/src/modem/transceiver.rs:554-567`) confirms this
 `CodeRate` return value is destructured as `_code_rate` and **discarded** —
 it has no effect on the actual rate-matching pipeline (which uses only
 `k_used_for_level`, §5.2). This is dead/stale metadata, not a wire-format
