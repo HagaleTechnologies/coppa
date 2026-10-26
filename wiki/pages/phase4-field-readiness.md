@@ -27,6 +27,12 @@ a real bug — breaking them will reintroduce that bug.
 
 ## Invariants to preserve
 
+- **Host data keys TX only inside an established session (COP-29).** The
+  `DataReceived` arm drops data-port/WebSocket bytes when no session is
+  established, unless `[host] sessionless_tx_enabled` is set. The key defaults
+  to off; a `Connecting` session does not count. The sessionless raw/ARQ path
+  behind that key is the daemon's only path for ARQ-tracked host data
+  (RateLoop/probing feedback), so don't delete it as dead code.
 - **Every transmission goes through `transmit_samples`** — it is the single
   chokepoint applying PTT lead/tail, busy-defer, and station-ID accounting.
   ARQ retransmits and session keepalives once bypassed it via a direct

@@ -303,8 +303,9 @@ pub struct EventLoop {
     /// broadcasting `VaraResponse` telemetry (SNR/PTT/BUFFER/BUSY — decision 8).
     /// Wired by `main.rs` from `VaraServer::response_senders()`.
     vara_responses: Option<VaraResponseSenders>,
-    /// Outbound raw payload bytes queued for encode+transmit (the primary
-    /// raw/ARQ `HostEvent::DataReceived` TX path), tagged with the ARQ seq
+    /// Outbound raw payload bytes queued for encode+transmit (the sessionless
+    /// raw/ARQ `HostEvent::DataReceived` TX path, enabled by
+    /// `[host] sessionless_tx_enabled`), tagged with the ARQ seq
     /// number assigned by `ArqTx::send` when this entry came from the
     /// ARQ-enabled path (`None` otherwise -- non-ARQ sends are never probe
     /// candidates). Its `None`-tagged entries count toward `BUFFER`
@@ -1526,6 +1527,7 @@ impl EventLoop {
                     return;
                 }
 
+<<<<<<< HEAD
                 // Fall through: no session — use raw/ARQ encode path.
                 // COP-41: this path chunks the event too. With ARQ enabled,
                 // the whole event's bytes go to `arq_tx_backlog` and
@@ -1537,6 +1539,43 @@ impl EventLoop {
                     self.arq_tx_backlog.extend(data.iter().copied());
                     self.report_buffer().await;
                     self.pump_arq_backlog().await;
+=======
+                // No established session (none at all, or one still
+                // connecting): drop rather than key the transmitter for
+                // nobody, unless the operator opted into sessionless TX.
+                if !self.config.host.sessionless_tx_enabled {
+                    tracing::warn!(
+                        client_id,
+                        bytes = data.len(),
+                        "No established session; host data dropped, not transmitted"
+                    );
+                    return;
+                }
+
+                // Sessionless TX: raw/ARQ encode path
+                // E6: If ARQ is enabled, wrap data in a TransportPdu before encoding
+                let (seq_opt, tx_bytes) = if self.config.engine.arq_enabled {
+                    if let Some(ref mut arq_tx) = self.arq_tx {
+                        let now = Instant::now();
+                        match arq_tx.send(data.clone(), now) {
+                            Ok(seq) => {
+                                let pdu = TransportPdu::new_reliable(
+                                    self.arq_session_id,
+                                    seq,
+                                    0, // ack_num filled by ARQ layer
+                                    data.clone(),
+                                );
+                                (Some(seq), pdu.to_bytes())
+                            }
+                            Err(e) => {
+                                tracing::warn!(client_id, error = %e, "ARQ window full; dropping TX");
+                                return;
+                            }
+                        }
+                    } else {
+                        (None, data.clone())
+                    }
+>>>>>>> af9c3256dc472ce3cf9fd03666d6d651c553ec96
                 } else {
                     let budget = max_payload_for_level(self.engine.speed_level())
                         .expect("the engine's speed level is always a valid wire level");
@@ -7332,6 +7371,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn arq_host_data_without_a_session_creates_no_segment() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
+        event_loop.set_audio_out(producer);
+
+        event_loop
+            .handle_host_event(HostEvent::DataReceived {
+                client_id: 42,
+                data: b"hello".to_vec(),
+            })
+            .await;
+
+        assert_eq!(event_loop.arq_tx.as_ref().unwrap().in_flight(), 0);
+        assert!(event_loop.tx_queue.is_empty());
+        assert_eq!(consumer.read(&mut [0.0; 1024]), 0);
+    }
+
+    #[tokio::test]
     async fn test_multiple_events_sequence() {
         let config = DaemonConfig::default();
         let mut event_loop = EventLoop::new(config).unwrap();
@@ -8217,7 +8276,45 @@ mod tests {
             cmd_port: u16,
             data_port: u16,
         ) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
-            let mut server = VaraServer::new(cmd_port, data_port);
+            let cmd_listener = tokio::net::TcpListener::bind(("127.0.0.1", cmd_port))
+                .await
+                .expect("bind VARA command port");
+            let data_listener = tokio::net::TcpListener::bind(("127.0.0.1", data_port))
+                .await
+                .expect("bind VARA data port");
+            connect_bridged_vara_client_on(event_loop, cmd_listener, data_listener).await
+        }
+
+        /// `connect_bridged_vara_client` on OS-assigned ports: binds both
+        /// listeners to `127.0.0.1:0` and returns the data port's actual
+        /// address alongside the command-port client, so concurrent test runs
+        /// (separate worktrees, parallel CI slots) can never cross-attach.
+        async fn connect_bridged_vara_client_ephemeral(
+            event_loop: &mut EventLoop,
+        ) -> (
+            BufReader<OwnedReadHalf>,
+            OwnedWriteHalf,
+            std::net::SocketAddr,
+        ) {
+            let cmd_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind VARA command port");
+            let data_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind VARA data port");
+            let data_addr = data_listener.local_addr().expect("data listener address");
+            let (reader, writer) =
+                connect_bridged_vara_client_on(event_loop, cmd_listener, data_listener).await;
+            (reader, writer, data_addr)
+        }
+
+        async fn connect_bridged_vara_client_on(
+            event_loop: &mut EventLoop,
+            cmd_listener: tokio::net::TcpListener,
+            data_listener: tokio::net::TcpListener,
+        ) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
+            let cmd_addr = cmd_listener.local_addr().expect("command listener address");
+            let mut server = VaraServer::new(cmd_addr.port(), 0);
             event_loop.set_vara_responses(server.response_senders());
             let mut events = server.take_event_rx().expect("fresh server");
             let to_loop = event_loop.event_sender();
@@ -8229,12 +8326,14 @@ mod tests {
                 }
             });
             tokio::spawn(async move {
-                let _ = server.run().await;
+                server
+                    .run_with_listeners(cmd_listener, data_listener)
+                    .await
+                    .expect("VARA server accept loops");
             });
-            // Give the server a moment to bind before connecting.
-            tokio::time::sleep(Duration::from_millis(50)).await;
 
-            let stream = TcpStream::connect(("127.0.0.1", cmd_port))
+            // Listeners are already bound, so the connect cannot race the bind.
+            let stream = TcpStream::connect(cmd_addr)
                 .await
                 .expect("mock client should connect to the VARA command port");
             let (read_half, write_half) = stream.into_split();
@@ -8835,6 +8934,95 @@ mod tests {
             );
         }
 
+        /// Collect lines until a full window passes without another line.
+        /// Command-port responses end in a bare CR (COP-27), so split on `\r`.
+        async fn lines_within(
+            reader: &mut BufReader<OwnedReadHalf>,
+            window: Duration,
+        ) -> Vec<String> {
+            let mut lines = Vec::new();
+            loop {
+                let mut line = Vec::new();
+                match tokio::time::timeout(window, reader.read_until(b'\r', &mut line)).await {
+                    Ok(Ok(0)) | Err(_) => break,
+                    Ok(Ok(_)) => lines.push(
+                        String::from_utf8(line)
+                            .expect("VARA response lines are UTF-8")
+                            .trim()
+                            .to_string(),
+                    ),
+                    Ok(Err(error)) => panic!("reading VARA response failed: {error}"),
+                }
+            }
+            lines
+        }
+
+        #[tokio::test]
+        async fn host_data_without_a_session_is_not_transmitted() {
+            let mut event_loop = EventLoop::new(fast_ptt_config()).unwrap();
+            let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(producer);
+            let (mut reader, _write_half, data_addr) =
+                connect_bridged_vara_client_ephemeral(&mut event_loop).await;
+            let mut data = TcpStream::connect(data_addr).await.unwrap();
+            let tx = event_loop.event_sender();
+            let local = tokio::task::LocalSet::new();
+            let running = local.spawn_local(async move { event_loop.run().await });
+
+            local
+                .run_until(async move {
+                    data.write_all(b"hello").await.unwrap();
+                    let lines = lines_within(&mut reader, Duration::from_millis(1500)).await;
+                    assert!(
+                        !lines
+                            .iter()
+                            .any(|s| s.starts_with("PTT") || s.starts_with("BUFFER")),
+                        "host data without a session must not transmit, got {lines:?}"
+                    );
+                    tx.send(DaemonEvent::Shutdown).await.unwrap();
+                    running.await.unwrap().unwrap();
+                })
+                .await;
+            assert_eq!(consumer.read(&mut [0.0; 1024]), 0);
+        }
+
+        #[tokio::test]
+        async fn host_data_while_connecting_is_not_transmitted() {
+            let mut config = fast_ptt_config();
+            config.engine.callsign = "N0CALL".into();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, mut writer, data_addr) =
+                connect_bridged_vara_client_ephemeral(&mut event_loop).await;
+            let mut data = TcpStream::connect(data_addr).await.unwrap();
+            let tx = event_loop.event_sender();
+            let local = tokio::task::LocalSet::new();
+            let running = local.spawn_local(async move { event_loop.run().await });
+
+            local
+                .run_until(async move {
+                    writer.write_all(b"CONNECT N0CALL W1AW\r").await.unwrap();
+                    let lines = lines_within(&mut reader, Duration::from_millis(1500)).await;
+                    let ptt: Vec<&str> = lines
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|s| s.starts_with("PTT"))
+                        .collect();
+                    assert_eq!(ptt, ["PTT ON", "PTT OFF"], "CONNECT_REQ must transmit");
+
+                    data.write_all(b"hello").await.unwrap();
+                    let lines = lines_within(&mut reader, Duration::from_millis(1500)).await;
+                    assert!(
+                        !lines
+                            .iter()
+                            .any(|s| s.starts_with("PTT") || s.starts_with("BUFFER")),
+                        "host data while connecting must not transmit, got {lines:?}"
+                    );
+                    tx.send(DaemonEvent::Shutdown).await.unwrap();
+                    running.await.unwrap().unwrap();
+                })
+                .await;
+        }
+
         /// Required scenario: "transmit -> PTT ON/OFF bracket."
         ///
         /// `EventLoop` isn't `Send` (its engine holds trait objects/raw-pointer
@@ -8843,7 +9031,9 @@ mod tests {
         /// the rest of this test on the same thread instead, with no `Send` bound.
         #[tokio::test]
         async fn test_ptt_telemetry_brackets_transmission() {
-            let config = fast_ptt_config();
+            let mut config = fast_ptt_config();
+            // Sessionless TX on: the simplest way to make host data key PTT.
+            config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
             let (mut reader, _write_half) =
                 connect_mock_vara_client(&mut event_loop, 19410, 19411).await;
@@ -9308,6 +9498,8 @@ mod tests {
         async fn test_buffer_held_until_arq_ack() {
             let mut config = fast_ptt_config();
             config.engine.arq_enabled = true;
+            // COP-29: these exercise the sessionless raw/ARQ path, now opt-in.
+            config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
             let (mut reader, _write_half) =
                 connect_mock_vara_client(&mut event_loop, 19492, 19493).await;
@@ -9450,6 +9642,8 @@ mod tests {
         async fn test_arq_window_full_holds_in_backlog() {
             let mut config = fast_ptt_config();
             config.engine.arq_enabled = true;
+            // COP-29: these exercise the sessionless raw/ARQ path, now opt-in.
+            config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
             let (mut reader, _write_half) =
                 connect_mock_vara_client(&mut event_loop, 19496, 19497).await;

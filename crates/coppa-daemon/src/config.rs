@@ -205,6 +205,10 @@ pub struct HostConfig {
     pub websocket_enabled: bool,
     /// WebSocket port.
     pub websocket_port: u16,
+    /// Allow data-port and WebSocket host data to transmit without an established
+    /// session. Off by default; intended for sessionless bench rigs. Enabling it
+    /// lets any data-port client key the transmitter.
+    pub sessionless_tx_enabled: bool,
 }
 
 /// Engine configuration section.
@@ -406,6 +410,7 @@ impl Default for HostConfig {
             vara_data_port: 8301,
             websocket_enabled: false,
             websocket_port: 8400,
+            sessionless_tx_enabled: false,
         }
     }
 }
@@ -550,6 +555,19 @@ rate_loop_probe_offset = 1
         let config: DaemonConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.engine.rate_loop_probe_interval, 2);
         assert_eq!(config.engine.rate_loop_probe_offset, 1);
+    }
+
+    #[test]
+    fn test_sessionless_tx_defaults_to_disabled() {
+        assert!(!DaemonConfig::default().host.sessionless_tx_enabled);
+        let config: DaemonConfig = toml::from_str("[host]\nvara_enabled = true").unwrap();
+        assert!(!config.host.sessionless_tx_enabled);
+    }
+
+    #[test]
+    fn test_sessionless_tx_toml_override() {
+        let config: DaemonConfig = toml::from_str("[host]\nsessionless_tx_enabled = true").unwrap();
+        assert!(config.host.sessionless_tx_enabled);
     }
 
     #[test]
