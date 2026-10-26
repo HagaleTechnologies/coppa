@@ -120,7 +120,7 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 - Ctrl-C graceful shutdown
 
 #### AFSK 1200 / AX.25 TNC mode
-- `coppad --tnc` or `coppa tnc`, both built with `kiss-tnc`, runs a separate mode: AFSK 1200 audio ↔ KISS TCP server (port 8001 by default) ↔ PTT. The KISS client supplies the AX.25 frames, and the TNC forwards them without parsing
+- `coppad --tnc` or `coppa tnc`, both built with `kiss-tnc`, runs a separate mode: AFSK 1200 audio ↔ KISS TCP server (port 8001 by default) ↔ PTT. The KISS client supplies the AX.25 frames without an FCS, as KISS specifies. The TNC does not parse them, but it adds the FCS on transmit and checks and strips it on receive
 - This mode does not use the OFDM pipeline below
 
 ## TX Pipeline

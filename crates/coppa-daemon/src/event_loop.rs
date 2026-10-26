@@ -198,12 +198,18 @@ pub struct EventLoop {
     /// connected rigctld client so the wideband gate can read the rig's dial
     /// frequency (COP-40).
     ptt: PttBackend,
+<<<<<<< HEAD
     /// COP-31: the out-of-process PTT guardian, told about every PTT
     /// transition from `set_ptt` (rigctld/GPIO PTT only; `None` otherwise).
     /// Declared immediately after `ptt` on purpose: fields drop in
     /// declaration order, so the backend's own `Drop` release runs first and
     /// only then does the guardian see EOF on its stdin.
     ptt_guardian: Option<crate::ptt_guardian::PttGuardian>,
+=======
+    /// COP-32: degraded-startup conditions `coppad` reports in place of
+    /// "Daemon ready". See [`EventLoop::startup_problems`].
+    startup_problems: Vec<String>,
+>>>>>>> 81ce18a1ba5b7135ed382780a863e8d624027268
     /// COP-40: the operator-stated frequency source (`[radio] frequency_hz`
     /// / `band`), validated at startup -- the fallback evidence the
     /// wideband gate in `transmit_samples` uses when no live rigctld answer
@@ -439,6 +445,7 @@ impl EventLoop {
             .frequency_config()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut ptt = Self::create_ptt(&config)?;
+<<<<<<< HEAD
         // COP-31: every backend assumes RX at construction; make the rig match, so
         // a restart un-keys a transmitter an earlier run left keyed (and a Linux
         // serial open's DTR assertion is undone). Before the frequency gate: even a
@@ -448,6 +455,15 @@ impl EventLoop {
                 error = %e,
                 "Could not release PTT at startup; a transmitter left keyed by an earlier run may still be keyed"
             );
+=======
+        // COP-32: conditions the daemon runs through but must not call ready.
+        let mut startup_problems = Vec::new();
+        if config.radio.ptt_config() == Ok(crate::config::PttConfig::Rigctld) && !ptt.is_rigctld() {
+            startup_problems.push(format!(
+                "no PTT: rigctld at {} is unreachable",
+                config.radio.rigctld_address
+            ));
+>>>>>>> 81ce18a1ba5b7135ed382780a863e8d624027268
         }
 
         // Create engine from profile; all profiles use 48kHz internally
@@ -550,7 +566,11 @@ impl EventLoop {
             tx_output: Arc::new(std::sync::Mutex::new(TxOutput::default())),
             audio_in: None,
             ptt,
+<<<<<<< HEAD
             ptt_guardian: None,
+=======
+            startup_problems,
+>>>>>>> 81ce18a1ba5b7135ed382780a863e8d624027268
             radio_frequency,
             tx_held_by_frequency_gate: false,
             session_tx_held_by_frequency_gate: false,
@@ -615,8 +635,10 @@ impl EventLoop {
     /// typo'd or unbuilt backend. The one deliberate exception is
     /// `rigctld`'s *runtime connection* failure (address configured
     /// correctly, but nothing answering it right now): that already-existing
-    /// behavior -- warn and fall back to `NullPtt` -- is unchanged, since
-    /// it's a live/transient condition rather than an unrecognized config.
+    /// behavior -- log an ERROR, fall back to `NullPtt`, and record a
+    /// startup problem so coppad reports itself degraded rather than ready
+    /// (COP-32) -- is kept, since it's a live/transient condition rather
+    /// than an unrecognized config.
     /// A wideband profile that relies on that rigctld as its only frequency
     /// source still refuses to start -- `check_frequency_gate_at_startup`
     /// sees the fallback as "no source answering".
@@ -644,10 +666,11 @@ impl EventLoop {
                 match coppa_radio::rigctld::RigctldClient::connect(&config.radio.rigctld_address) {
                     Ok(client) => Ok(PttBackend::Rigctld(client)),
                     Err(e) => {
-                        tracing::warn!(
+                        tracing::error!(
                             address = %config.radio.rigctld_address,
                             error = %e,
-                            "Failed to connect to rigctld; falling back to no PTT"
+                            "Failed to connect to rigctld; PTT is disabled and \
+                             transmissions will not key the radio"
                         );
                         Ok(PttBackend::Other(Box::new(NullPtt::new())))
                     }
@@ -837,6 +860,13 @@ impl EventLoop {
                 }
             ),
         })
+    }
+
+    /// COP-32: conditions found while starting that leave the daemon running
+    /// but unable to do part of its job (today: rigctld unreachable, so no
+    /// PTT). Empty when startup was clean.
+    pub fn startup_problems(&self) -> &[String] {
+        &self.startup_problems
     }
 
     /// Get a sender for injecting events into the loop.
@@ -11207,6 +11237,24 @@ mod tests {
             config.radio.rigctld_address = "127.0.0.1:1".into();
             let event_loop = EventLoop::new(config).unwrap();
             assert!(!event_loop.ptt.is_rigctld());
+            // COP-32: the fallback is reported, so coppad does not say ready.
+            assert_eq!(
+                event_loop.startup_problems(),
+                ["no PTT: rigctld at 127.0.0.1:1 is unreachable"]
+            );
+        }
+
+        #[test]
+        fn a_clean_startup_reports_no_problems() {
+            assert!(EventLoop::new(DaemonConfig::default())
+                .unwrap()
+                .startup_problems()
+                .is_empty());
+            let rig = fake_rigctld("144500000");
+            assert!(EventLoop::new(rigctld_config(&rig))
+                .unwrap()
+                .startup_problems()
+                .is_empty());
         }
 
         // ── Phase 4: per-transmission gate ────────────────────────────────

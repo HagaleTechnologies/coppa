@@ -17,7 +17,7 @@ cargo test --workspace --lib
 cargo test --workspace
 
 # With feature flags
-cargo test --workspace --features cpal-backend,websocket --lib
+cargo test --workspace --features cpal-backend,websocket,kiss-tnc --lib
 
 # Clippy (CI runs with -D warnings)
 cargo clippy --workspace --all-targets -- -D warnings
