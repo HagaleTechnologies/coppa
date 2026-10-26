@@ -15,7 +15,8 @@ use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu, StationIdPayload};
 use coppa_protocol::modem::max_payload_for_level;
 use coppa_protocol::session::{LinkCapabilities, SessionManager, SessionState};
 use coppa_protocol::transport::{TransportPdu, TransportType};
-use coppa_radio::{NullPtt, PttControl, PttState};
+use coppa_radio::band::{self, FrequencyConfig, FrequencyEvidence, GateRefusal};
+use coppa_radio::{NullPtt, PttBackend, PttControl, PttState};
 use rand::RngExt;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -156,8 +157,20 @@ pub struct EventLoop {
     tx_output: Arc<std::sync::Mutex<TxOutput>>,
     /// Optional audio input ring buffer consumer for reading RX samples.
     audio_in: Option<AudioRingConsumer>,
-    /// PTT controller (defaults to NullPtt if unconfigured).
-    ptt: Box<dyn PttControl>,
+    /// PTT controller (defaults to NullPtt if unconfigured). Retains a
+    /// connected rigctld client so the wideband gate can read the rig's dial
+    /// frequency (COP-40).
+    ptt: PttBackend,
+    /// COP-40: the operator-stated frequency source (`[radio] frequency_hz`
+    /// / `band`), validated at startup -- the fallback evidence the
+    /// wideband gate in `transmit_samples` uses when no live rigctld answer
+    /// is available.
+    radio_frequency: FrequencyConfig,
+    /// COP-40: set when `try_drain_tx_queue` left the queue intact because
+    /// the wideband gate refused; `run()`'s 500 ms poll retries the drain
+    /// while it is set, so held payloads go out once the rig is back on a
+    /// legal frequency instead of waiting for the next host enqueue.
+    tx_held_by_frequency_gate: bool,
     /// Optional sender for host responses (decoded data, status updates).
     response_tx: Option<mpsc::Sender<coppa_host::HostResponse>>,
     /// Playback progress from the audio output worker. `None` when no
@@ -265,9 +278,17 @@ pub struct EventLoop {
     /// `[host] sessionless_tx_enabled`), tagged with the ARQ seq
     /// number assigned by `ArqTx::send` when this entry came from the
     /// ARQ-enabled path (`None` otherwise -- non-ARQ sends are never probe
-    /// candidates). `VaraResponse::Buffer` telemetry reports this queue's
-    /// length on every push/pop.
+    /// candidates). Its `None`-tagged entries count toward `BUFFER`
+    /// telemetry; see `buffered_tx_bytes`.
     tx_queue: VecDeque<(Option<u8>, Vec<u8>)>,
+    /// Host payload bytes handed to `transmit_samples` on a path with no ACK
+    /// to wait for (the non-ARQ raw path and established-session data).
+    /// Cleared at PTT release (`set_ptt(false)`): by then every frame handed
+    /// over earlier has played or been discarded. See `buffered_tx_bytes`.
+    tx_on_air_bytes: usize,
+    /// The last value sent as `BUFFER`, so `report_buffer` emits only on
+    /// change.
+    last_reported_buffer: usize,
     /// Spectral-occupancy busy gate (decision 8: `BUSY ON`/`OFF` telemetry), fed
     /// raw incoming audio in `handle_audio_in`.
     busy_gate: BusyGate,
@@ -337,10 +358,17 @@ impl EventLoop {
     /// Create a new event loop with the given configuration.
     ///
     /// Fails if `[radio] ptt_method` doesn't parse or names an
-    /// unrecognized/unbuilt PTT backend -- see `create_ptt`.
+    /// unrecognized/unbuilt PTT backend -- see `create_ptt` -- if
+    /// `[radio] frequency_hz`/`band` don't validate, or if a wideband
+    /// profile has no frequency source at or above 29.7 MHz -- see
+    /// `check_frequency_gate_at_startup`.
     pub fn new(config: DaemonConfig) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::channel(256);
-        let ptt = Self::create_ptt(&config)?;
+        let radio_frequency = config
+            .radio
+            .frequency_config()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut ptt = Self::create_ptt(&config)?;
 
         // Create engine from profile; all profiles use 48kHz internally
         let engine =
@@ -349,6 +377,7 @@ impl EventLoop {
             } else {
                 CoppaCore::with_config(coppa_engine::EngineConfig::default())
             };
+        Self::check_frequency_gate_at_startup(&config, &engine, &radio_frequency, &mut ptt)?;
 
         // E6: Initialize ARQ state if enabled
         let (arq_tx, arq_rx) = if config.engine.arq_enabled {
@@ -441,6 +470,8 @@ impl EventLoop {
             tx_output: Arc::new(std::sync::Mutex::new(TxOutput::default())),
             audio_in: None,
             ptt,
+            radio_frequency,
+            tx_held_by_frequency_gate: false,
             response_tx: None,
             output_feedback: None,
             tx_generation: 0,
@@ -467,6 +498,8 @@ impl EventLoop {
             ws_status: None,
             vara_responses: None,
             tx_queue: VecDeque::new(),
+            tx_on_air_bytes: 0,
+            last_reported_buffer: 0,
             busy_gate,
             session_mgr: SessionManager::new(),
             local_callsign,
@@ -498,25 +531,33 @@ impl EventLoop {
     /// correctly, but nothing answering it right now): that already-existing
     /// behavior -- warn and fall back to `NullPtt` -- is unchanged, since
     /// it's a live/transient condition rather than an unrecognized config.
-    fn create_ptt(config: &DaemonConfig) -> Result<Box<dyn PttControl>> {
+    /// A wideband profile that relies on that rigctld as its only frequency
+    /// source still refuses to start -- `check_frequency_gate_at_startup`
+    /// sees the fallback as "no source answering".
+    ///
+    /// A connected rigctld client is returned as `PttBackend::Rigctld`, not
+    /// boxed as `dyn PttControl`, so its dial frequency stays reachable.
+    fn create_ptt(config: &DaemonConfig) -> Result<PttBackend> {
         let parsed = config
             .radio
             .ptt_config()
             .map_err(|e| anyhow::anyhow!("invalid [radio] ptt_method: {e}"))?;
 
         match parsed {
-            crate::config::PttConfig::None => Ok(Box::new(NullPtt::new())),
-            crate::config::PttConfig::Vox => Ok(Box::new(coppa_radio::VoxPtt::new())),
+            crate::config::PttConfig::None => Ok(PttBackend::Other(Box::new(NullPtt::new()))),
+            crate::config::PttConfig::Vox => {
+                Ok(PttBackend::Other(Box::new(coppa_radio::VoxPtt::new())))
+            }
             crate::config::PttConfig::Rigctld => {
                 match coppa_radio::rigctld::RigctldClient::connect(&config.radio.rigctld_address) {
-                    Ok(client) => Ok(Box::new(client)),
+                    Ok(client) => Ok(PttBackend::Rigctld(client)),
                     Err(e) => {
                         tracing::warn!(
                             address = %config.radio.rigctld_address,
                             error = %e,
                             "Failed to connect to rigctld; falling back to no PTT"
                         );
-                        Ok(Box::new(NullPtt::new()))
+                        Ok(PttBackend::Other(Box::new(NullPtt::new())))
                     }
                 }
             }
@@ -535,7 +576,7 @@ impl EventLoop {
                         .map_err(|e| {
                         anyhow::anyhow!("failed to open serial PTT port {port}: {e}")
                     })?;
-                    Ok(Box::new(ptt))
+                    Ok(PttBackend::Other(Box::new(ptt)))
                 }
                 #[cfg(not(feature = "serial-ptt"))]
                 {
@@ -556,7 +597,7 @@ impl EventLoop {
                     })?;
                     let ptt = coppa_radio::ptt_gpio::GpioPtt::open(pin_num, false)
                         .map_err(|e| anyhow::anyhow!("failed to open GPIO PTT pin {pin}: {e}"))?;
-                    Ok(Box::new(ptt))
+                    Ok(PttBackend::Other(Box::new(ptt)))
                 }
                 #[cfg(not(all(feature = "gpio-ptt", target_os = "linux")))]
                 {
@@ -568,6 +609,142 @@ impl EventLoop {
                 }
             }
         }
+    }
+
+    /// COP-40: refuse to start a wideband profile that can never legally
+    /// transmit.
+    ///
+    /// 47 CFR 97.307(f)(3) caps emissions below 29.7 MHz at 2.8 kHz occupied
+    /// bandwidth. A narrowband engine (every HF profile, 2400 Hz) is legal on
+    /// any band and skips this entirely. A wideband engine (`vhf_wide`,
+    /// 5600 Hz) must have frequency evidence at or above 29.7 MHz: a live
+    /// rigctld answer, else `[radio] frequency_hz`, else `[radio] band`.
+    /// No evidence, or evidence below 29.7 MHz, is a hard startup error.
+    ///
+    /// Only the constructed engine is checked: a `LevelDerived` engine that
+    /// starts narrowband and later climbs into `vhf_wide` is gated per
+    /// transmission by `wideband_frequency_check` instead.
+    fn check_frequency_gate_at_startup(
+        config: &DaemonConfig,
+        engine: &CoppaCore,
+        radio_frequency: &FrequencyConfig,
+        ptt: &mut PttBackend,
+    ) -> Result<()> {
+        let occupied_hz = engine.occupied_bandwidth_hz();
+        if band::gate(occupied_hz, None).is_ok() {
+            return Ok(());
+        }
+        let profile = &config.engine.profile;
+        let live_hz = ptt.poll_frequency();
+        if let Some(live) = live_hz {
+            if radio_frequency.contradicts(live) {
+                tracing::warn!(
+                    live_hz = live,
+                    stated = ?radio_frequency.static_evidence(),
+                    "rigctld's dial frequency contradicts [radio] frequency_hz/band; \
+                     using the live value"
+                );
+            }
+        }
+        let evidence = band::resolve_evidence(live_hz, radio_frequency);
+        match band::gate(occupied_hz, evidence.as_ref()) {
+            Ok(()) => {
+                let evidence = evidence.expect("a wideband gate pass implies evidence");
+                tracing::info!(
+                    profile = %profile,
+                    occupied_hz,
+                    evidence = %evidence.describe(),
+                    "wideband profile cleared the 29.7 MHz regulatory gate"
+                );
+                Ok(())
+            }
+            Err(GateRefusal::BelowThreshold { .. }) => match evidence {
+                Some(FrequencyEvidence::Live(hz)) => Err(anyhow::anyhow!(
+                    "rigctld reports an operating frequency of {hz} Hz, below 29.7 MHz, but \
+                     profile '{profile}' emits {occupied_hz} Hz occupied bandwidth — a \
+                     wideband emission below 29.7 MHz violates 47 CFR 97.307(f)(3); use an \
+                     HF profile (levels 1-8) or tune the rig to a VHF+ band"
+                )),
+                _ => Err(anyhow::anyhow!(
+                    "[radio] states an operating frequency below 29.7 MHz, but profile \
+                     '{profile}' emits {occupied_hz} Hz occupied bandwidth — a wideband \
+                     emission below 29.7 MHz violates 47 CFR 97.307(f)(3); use an HF \
+                     profile (levels 1-8) or a VHF+ frequency/band"
+                )),
+            },
+            Err(GateRefusal::NoSource) => {
+                if config.radio.ptt_config() == Ok(crate::config::PttConfig::Rigctld) {
+                    // Connected but not answering `f`, or never connected
+                    // (`create_ptt`'s soft fallback to no PTT).
+                    let state = if ptt.is_rigctld() {
+                        "is not answering the frequency query"
+                    } else {
+                        "is unreachable"
+                    };
+                    Err(anyhow::anyhow!(
+                        "profile '{profile}' emits {occupied_hz} Hz occupied bandwidth, which \
+                         47 CFR 97.307(f)(3) caps at 2.8 kHz below 29.7 MHz, and its only \
+                         frequency source (rigctld at {}) {state}: start rigctld, or set \
+                         [radio] frequency_hz or [radio] band as a fallback frequency source",
+                        config.radio.rigctld_address
+                    ))
+                } else {
+                    Err(anyhow::anyhow!(
+                        "profile '{profile}' emits {occupied_hz} Hz occupied bandwidth, which \
+                         47 CFR 97.307(f)(3) caps at 2.8 kHz below 29.7 MHz: set [radio] \
+                         frequency_hz or [radio] band, or set ptt_method = \"rigctld\" so the \
+                         gate can read the dial frequency"
+                    ))
+                }
+            }
+        }
+    }
+
+    /// COP-40: the per-transmission half of the wideband regulatory gate.
+    ///
+    /// Narrowband engines return `Ok` with no I/O. A wideband engine
+    /// re-resolves its frequency evidence on every call -- one rigctld `f`
+    /// round trip, falling back to the stated `[radio] frequency_hz`/`band`
+    /// -- so a rig retuned below 29.7 MHz, or a rigctld that stopped
+    /// answering with no stated fallback, is refused on the very next frame.
+    /// Logs the refusal; the caller only has to not transmit.
+    fn wideband_frequency_check(&mut self) -> Result<(), GateRefusal> {
+        let occupied_hz = self.engine.occupied_bandwidth_hz();
+        if band::gate(occupied_hz, None).is_ok() {
+            return Ok(());
+        }
+        let live_hz = self.ptt.poll_frequency();
+        if let Some(live) = live_hz {
+            if self.radio_frequency.contradicts(live) {
+                tracing::warn!(
+                    live_hz = live,
+                    stated = ?self.radio_frequency.static_evidence(),
+                    "rigctld's dial frequency contradicts [radio] frequency_hz/band; \
+                     using the live value"
+                );
+            }
+        }
+        let evidence = band::resolve_evidence(live_hz, &self.radio_frequency);
+        band::gate(occupied_hz, evidence.as_ref()).inspect_err(|refusal| match refusal {
+            GateRefusal::BelowThreshold { evidence_hz, .. } => tracing::error!(
+                "refusing wideband transmission: {occupied_hz} Hz occupied bandwidth but {} \
+                 (< {}) — 47 CFR 97.307(f)(3) caps HF emissions at 2.8 kHz",
+                evidence.map_or_else(|| format!("{evidence_hz} Hz"), |e| e.describe()),
+                band::US_WIDEBAND_MIN_HZ
+            ),
+            GateRefusal::NoSource => tracing::error!(
+                "refusing wideband transmission: {occupied_hz} Hz occupied bandwidth and no \
+                 frequency source is answering{} — 47 CFR 97.307(f)(3); set [radio] \
+                 frequency_hz or [radio] band as a fallback source",
+                if self.ptt.is_rigctld() {
+                    " (rigctld not answering)"
+                } else if self.config.radio.ptt_config() == Ok(crate::config::PttConfig::Rigctld) {
+                    " (rigctld unreachable)"
+                } else {
+                    ""
+                }
+            ),
+        })
     }
 
     /// Get a sender for injecting events into the loop.
@@ -769,28 +946,79 @@ impl EventLoop {
         }
     }
 
-    /// Push one raw payload onto the outbound TX queue, emit the resulting
+    /// COP-40: retry a TX-queue drain the wideband gate held back. A no-op
+    /// unless the last drain attempt was refused, so it never changes when
+    /// an ordinary queue drains.
+    async fn retry_held_tx_drain(&mut self) {
+        if self.tx_held_by_frequency_gate {
+            self.try_drain_tx_queue().await;
+        }
+    }
+
+    /// Push one raw payload onto the outbound TX queue, report the resulting
     /// `BUFFER` telemetry, and attempt to start transmitting immediately if the
     /// link is currently idle. See `tx_queue`'s field doc and `try_drain_tx_queue`.
     async fn enqueue_tx(&mut self, seq: Option<u8>, data: Vec<u8>) {
         self.tx_queue.push_back((seq, data));
-        self.emit_vara(VaraResponse::Buffer(self.tx_queue.len()))
-            .await;
+        self.report_buffer().await;
         self.try_drain_tx_queue().await;
     }
 
+    /// Host payload bytes this modem still holds (COP-30): what `BUFFER`
+    /// reports. The sum of
+    /// - every un-acked ARQ segment's payload (`ArqTx::unacked_bytes`),
+    ///   which leaves the sum only when the peer ACKs it or a `Reset`
+    ///   rebuilds `arq_tx` -- a segment with its retransmit budget spent
+    ///   stays counted, since nothing has acked it;
+    /// - `None`-tagged (non-ARQ) `tx_queue` entries not yet popped. A
+    ///   `Some`-tagged entry is the `TransportPdu`-wrapped copy of a payload
+    ///   `ArqTx` already counts, so it adds nothing;
+    /// - `tx_on_air_bytes`: payloads with no ACK to wait for, counted until
+    ///   PTT releases after they play.
+    ///
+    /// MAC, transport and FEC framing are not counted: this is the unit the
+    /// host wrote.
+    fn buffered_tx_bytes(&self) -> usize {
+        let queued: usize = self
+            .tx_queue
+            .iter()
+            .filter(|(seq, _)| seq.is_none())
+            .map(|(_, data)| data.len())
+            .sum();
+        let unacked = self.arq_tx.as_ref().map_or(0, ArqTx::unacked_bytes);
+        queued + self.tx_on_air_bytes + unacked
+    }
+
+    /// Emit `BUFFER` with `buffered_tx_bytes` if it differs from the last
+    /// value sent. The only place `VaraResponse::Buffer` is built; called
+    /// wherever the sum can change.
+    async fn report_buffer(&mut self) {
+        let bytes = self.buffered_tx_bytes();
+        if bytes != self.last_reported_buffer {
+            self.last_reported_buffer = bytes;
+            self.emit_vara(VaraResponse::Buffer(bytes)).await;
+        }
+    }
+
     /// If the link isn't currently mid-transmission, pop the next queued payload
-    /// (if any), emit the resulting `BUFFER` count, and encode+transmit it. Called
-    /// after every enqueue and after every PTT release, so the queue drains one
-    /// frame at a time as each transmission completes.
+    /// (if any) and encode+transmit it. Called after every enqueue and after
+    /// every PTT release, so the queue drains one frame at a time as each
+    /// transmission completes. The pop itself never changes `BUFFER`: a
+    /// non-ARQ payload moves to `tx_on_air_bytes`, and an ARQ one stays in
+    /// `ArqTx` until acked.
     async fn try_drain_tx_queue(&mut self) {
         if self.is_transmitting {
             return;
         }
+        // COP-40: hold queued payloads (rather than pop one and have
+        // `transmit_samples` refuse it) while the wideband gate refuses;
+        // `retry_held_tx_drain` tries again on the next poll.
+        self.tx_held_by_frequency_gate =
+            !self.tx_queue.is_empty() && self.wideband_frequency_check().is_err();
+        if self.tx_held_by_frequency_gate {
+            return;
+        }
         if let Some((seq_opt, data)) = self.tx_queue.pop_front() {
-            self.emit_vara(VaraResponse::Buffer(self.tx_queue.len()))
-                .await;
-
             // Active overshoot probing (see `docs/superpowers/specs/
             // 2026-07-25-rateloop-daemon-probe-wiring-design.md`) only applies
             // to a fresh ARQ-tracked segment's first transmission (never a
@@ -854,9 +1082,16 @@ impl EventLoop {
                         self.probe_state =
                             Some((seq_opt.expect("is_probe implies Some(seq)"), level));
                     }
+                    if seq_opt.is_none() {
+                        self.tx_on_air_bytes += data.len();
+                    }
                     Box::pin(self.transmit_samples(&samples)).await;
                 }
-                Err(e) => tracing::warn!(error = %e, "Encode failed for queued TX frame"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Encode failed for queued TX frame");
+                    // A dropped non-ARQ payload leaves the count here.
+                    self.report_buffer().await;
+                }
             }
 
             if is_probe {
@@ -946,6 +1181,7 @@ impl EventLoop {
                 _ = retransmit_poll.tick() => {
                     // E6: Check for ARQ retransmits
                     self.check_arq_retransmits().await;
+                    self.retry_held_tx_drain().await;
                 }
                 _ = beacon_poll.tick() => {
                     self.maybe_send_beacon().await;
@@ -1095,6 +1331,10 @@ impl EventLoop {
                     let pdu_bytes = mac_pdu.to_bytes();
                     match self.engine.encode_bytes(&pdu_bytes) {
                         Ok(samples) => {
+                            // No MAC-level ACK exists for session data, so
+                            // its bytes stay in `BUFFER` until PTT releases.
+                            self.tx_on_air_bytes += data.len();
+                            self.report_buffer().await;
                             self.transmit_samples(&samples).await;
                             self.tx_frame_count += 1;
                             tracing::debug!(
@@ -1149,8 +1389,8 @@ impl EventLoop {
                     (None, data.clone())
                 };
 
-                // Queue for encode+transmit (Task 7: BUFFER telemetry tracks this
-                // queue's depth; see `enqueue_tx`/`try_drain_tx_queue`). `seq_opt`
+                // Queue for encode+transmit (`BUFFER` telemetry counts the
+                // host bytes still held; see `buffered_tx_bytes`). `seq_opt`
                 // is `Some` only for a fresh ARQ-tracked segment -- used by active
                 // overshoot probing (`RateLoop::level_for_next_transmission`) to
                 // attribute a probe's later outcome back to its ACK/timeout.
@@ -1598,6 +1838,7 @@ impl EventLoop {
                                                 );
                                                 self.resolve_probe_if_acked(&newly_acked);
                                             }
+                                            self.report_buffer().await;
                                         }
                                         // Acknowledge every successfully-processed
                                         // incoming data PDU (one ACK per frame, per
@@ -1636,6 +1877,7 @@ impl EventLoop {
                                             probe_resolved =
                                                 self.resolve_probe_if_acked(&newly_acked);
                                         }
+                                        self.report_buffer().await;
                                         // Closed-loop rate adaptation: apply the
                                         // peer's recommendation (if this ACK carries
                                         // one) and push the resulting level into the
@@ -1695,6 +1937,9 @@ impl EventLoop {
                                         // prevent, just reached by a different
                                         // route.
                                         self.engine.set_cp_profile(CpMode::LongCp);
+                                        // The rebuilt `arq_tx` holds nothing,
+                                        // so its old segments leave `BUFFER`.
+                                        self.report_buffer().await;
                                         Vec::new()
                                     }
                                     TransportType::CpControl => {
@@ -1872,9 +2117,39 @@ impl EventLoop {
     /// on-air-silence bug once PTT became real hardware control (Task 2).
     /// Both are now routed through this function like every other TX path,
     /// making the "none of them are exempted" claim above actually true.
+    ///
+    /// COP-40: the wideband regulatory gate runs first, before the busy
+    /// wait, and again after the wait before the station-ID prepend, PTT,
+    /// or any audio. A refused transmission keys nothing and queues
+    /// nothing. Callers observe a lost transmission, which ARQ already
+    /// retransmits or times out on like any other loss.
     async fn transmit_samples(&mut self, samples: &[f32]) {
-        self.wait_for_clear_channel().await;
-
+        let allowed = if self.wideband_frequency_check().is_ok() {
+            self.wait_for_clear_channel().await;
+            // The rig can retune during the unbounded courtesy wait and
+            // its backoff. Resolve fresh evidence before committing to TX.
+            self.wideband_frequency_check().is_ok()
+        } else {
+            false
+        };
+        if !allowed {
+            if !self.is_transmitting {
+                // The refused payload never reaches the air, so no PTT
+                // release will ever drop it from `BUFFER`.
+                self.tx_on_air_bytes = 0;
+                self.report_buffer().await;
+                // The drain that popped this payload passed its own gate
+                // check and therefore cleared `tx_held_by_frequency_gate`,
+                // but the rig can retune below 29.7 MHz during the
+                // unbounded courtesy wait above, and this refusal then
+                // creates no TxComplete/PTT-release event that would ever
+                // re-trigger a drain. Re-arm the held flag while payloads
+                // remain queued so the 500 ms `retry_held_tx_drain` poll
+                // resumes the queue once the gate reopens.
+                self.tx_held_by_frequency_gate = !self.tx_queue.is_empty();
+            }
+            return;
+        }
         // Station-ID timer (Phase 4 Task 3): prepend an ID/beacon frame to
         // this transmission if due. Deliberately only checked here, at an
         // actual TX opportunity -- an idle station that never transmits never
@@ -3159,6 +3434,10 @@ impl EventLoop {
             self.is_transmitting = false;
             self.tx_keyed_since = None;
             self.tx_stall_clock = None;
+            // Every frame handed to `transmit_samples` before this release has
+            // played or been discarded (only the newest generation unkeys).
+            self.tx_on_air_bytes = 0;
+            self.report_buffer().await;
         }
     }
 
@@ -3178,6 +3457,8 @@ mod tests {
         for (profile, maximum) in [("HF_STANDARD", 8), ("VHF_FAST", 9)] {
             let mut config = DaemonConfig::default();
             config.engine.profile = profile.to_string();
+            // COP-40: a wideband (VHF) profile needs a frequency source.
+            config.radio.band = Some("2m".into());
             let mut event_loop = EventLoop::new(config).unwrap();
             for _ in 0..60 {
                 event_loop.rate_loop.on_ack(9, true);
@@ -7636,11 +7917,7 @@ mod tests {
             let (read_half, write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);
 
-            let mut greeting = String::new();
-            reader
-                .read_line(&mut greeting)
-                .await
-                .expect("should read the initial VERSION greeting");
+            let greeting = read_line(&mut reader).await;
             assert!(
                 greeting.starts_with("VERSION"),
                 "expected a VERSION greeting first, got: {}",
@@ -7726,11 +8003,7 @@ mod tests {
             let (read_half, write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);
 
-            let mut greeting = String::new();
-            reader
-                .read_line(&mut greeting)
-                .await
-                .expect("should read the initial VERSION greeting");
+            let greeting = read_line(&mut reader).await;
             assert!(
                 greeting.starts_with("VERSION"),
                 "expected a VERSION greeting first, got: {}",
@@ -7740,16 +8013,17 @@ mod tests {
             (reader, write_half)
         }
 
-        /// Read one `\r\n`-terminated line, timing out (rather than hanging
-        /// forever) if the client never receives one.
+        /// Read one `\r`-terminated VARA response line, timing out (rather than
+        /// hanging forever) if the client never receives one.
         async fn read_line(reader: &mut BufReader<OwnedReadHalf>) -> String {
-            let mut line = String::new();
-            let n = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
-                .await
-                .expect("timed out waiting for a VARA response line")
-                .expect("reading a VARA response line should not error");
+            let mut line = Vec::new();
+            let n =
+                tokio::time::timeout(Duration::from_secs(2), reader.read_until(b'\r', &mut line))
+                    .await
+                    .expect("timed out waiting for a VARA response line")
+                    .expect("reading a VARA response line should not error");
             assert!(n > 0, "connection closed before a response line arrived");
-            line
+            String::from_utf8(line).expect("VARA response lines are UTF-8")
         }
 
         /// Drain every line currently available within a short per-line window,
@@ -7759,11 +8033,16 @@ mod tests {
         async fn read_available_lines(reader: &mut BufReader<OwnedReadHalf>) -> Vec<String> {
             let mut lines = Vec::new();
             loop {
-                let mut line = String::new();
-                match tokio::time::timeout(Duration::from_millis(300), reader.read_line(&mut line))
-                    .await
+                let mut line = Vec::new();
+                match tokio::time::timeout(
+                    Duration::from_millis(300),
+                    reader.read_until(b'\r', &mut line),
+                )
+                .await
                 {
-                    Ok(Ok(n)) if n > 0 => lines.push(line),
+                    Ok(Ok(n)) if n > 0 => {
+                        lines.push(String::from_utf8(line).expect("VARA response lines are UTF-8"))
+                    }
                     _ => break,
                 }
             }
@@ -7873,6 +8152,8 @@ mod tests {
         async fn vhf_station_reports_its_wider_bandwidth() {
             let mut config = session_config();
             config.engine.profile = "VHF_FAST".into();
+            // COP-40: a wideband station declares its band honestly.
+            config.radio.band = Some("2m".into());
             let mut station = EventLoop::new(config).unwrap();
             let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19446, 19447).await;
             station
@@ -7954,7 +8235,7 @@ mod tests {
                     for _ in 0..7 {
                         replies.push(read_line(&mut reader).await.trim_end().to_string());
                     }
-                    let version = VaraResponse::coppa_version().format();
+                    let version = format!("VERSION Coppa {}", env!("CARGO_PKG_VERSION"));
                     assert_eq!(
                         replies,
                         vec![
@@ -7972,6 +8253,17 @@ mod tests {
                         read_available_lines(&mut reader).await.is_empty(),
                         "no reply may be doubled"
                     );
+
+                    // COP-45: the greeting and earlier query replies have been consumed,
+                    // so each subsequent VERSION query must produce a fresh reply.
+                    for _ in 0..2 {
+                        write_half.write_all(b"VERSION\r").await.unwrap();
+                        assert_eq!(read_line(&mut reader).await.trim_end(), version);
+                        assert!(
+                            read_available_lines(&mut reader).await.is_empty(),
+                            "each VERSION query must produce exactly one reply"
+                        );
+                    }
                 })
                 .await;
         }
@@ -8076,11 +8368,10 @@ mod tests {
             let stream_b = TcpStream::connect(("127.0.0.1", 19452)).await.unwrap();
             let (read_b, _write_b) = stream_b.into_split();
             let mut reader_b = BufReader::new(read_b);
-            let mut greeting_b = String::new();
-            reader_b
-                .read_line(&mut greeting_b)
-                .await
-                .expect("client B should also get the greeting");
+            assert!(
+                read_line(&mut reader_b).await.starts_with("VERSION"),
+                "client B should also get the greeting"
+            );
 
             let local = tokio::task::LocalSet::new();
             local.spawn_local(async move {
@@ -8764,46 +9055,201 @@ mod tests {
             );
         }
 
-        /// Required scenario: "queue 3 frames -> BUFFER 3…0 progression."
-        ///
-        /// Forces `is_transmitting = true` before enqueuing so all three frames
-        /// stack up in the queue instead of draining immediately (simulating a
-        /// client bursting frames faster than the half-duplex link can send them),
-        /// then drains deterministically (bypassing the real scheduled-PTT-release
-        /// timer, which `test_ptt_telemetry_brackets_transmission` already covers)
-        /// by calling the same internal hooks `handle_ptt_change(false)` would
-        /// trigger on each real transmission's completion.
-        #[tokio::test]
-        async fn test_buffer_telemetry_progression_3_to_0() {
-            let config = fast_ptt_config();
-            let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19420, 19421).await;
-
-            event_loop.is_transmitting = true;
-            event_loop.enqueue_tx(None, b"frame1".to_vec()).await;
-            event_loop.enqueue_tx(None, b"frame2".to_vec()).await;
-            event_loop.enqueue_tx(None, b"frame3".to_vec()).await;
-            assert_eq!(event_loop.tx_queue.len(), 3);
-
-            event_loop.is_transmitting = false;
-            event_loop.try_drain_tx_queue().await; // starts draining frame1 -> len 2
-            event_loop.handle_ptt_change(false).await; // frame1 "done" -> drains frame2 -> len 1
-            event_loop.handle_ptt_change(false).await; // frame2 "done" -> drains frame3 -> len 0
-            event_loop.handle_ptt_change(false).await; // frame3 "done" -> queue empty, no more drains
-            assert_eq!(event_loop.tx_queue.len(), 0);
-
-            let lines = read_available_lines(&mut reader).await;
-            let buffer_values: Vec<&str> = lines
+        /// The `BUFFER n` values among `lines`, terminator stripped.
+        fn buffer_values(lines: &[String]) -> Vec<&str> {
+            lines
                 .iter()
                 .map(|s| s.trim_end())
                 .filter(|s| s.starts_with("BUFFER"))
-                .collect();
+                .collect()
+        }
+
+        /// COP-30: on the non-ARQ raw path, `BUFFER` counts host payload
+        /// bytes (not frames), and a frame's bytes leave the count only when
+        /// PTT releases after it has played -- not when it is popped for TX.
+        ///
+        /// Forces `is_transmitting = true` before enqueuing so all three
+        /// payloads stack up in the queue instead of draining immediately
+        /// (simulating a client bursting data faster than the half-duplex link
+        /// can send it), then drains deterministically (bypassing the real
+        /// scheduled-PTT-release timer, which
+        /// `test_ptt_telemetry_brackets_transmission` already covers) by
+        /// calling the same internal hooks each real transmission's completion
+        /// would trigger.
+        #[tokio::test]
+        async fn test_buffer_telemetry_counts_bytes_and_drains_on_ptt_release() {
+            let config = fast_ptt_config();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19490, 19491).await;
+
+            event_loop.is_transmitting = true;
+            event_loop.enqueue_tx(None, vec![0x11; 5]).await;
+            event_loop.enqueue_tx(None, vec![0x22; 5000]).await;
+            event_loop.enqueue_tx(None, vec![0x33; 6]).await;
+            assert_eq!(event_loop.tx_queue.len(), 3);
+
+            event_loop.is_transmitting = false;
+            event_loop.try_drain_tx_queue().await; // pops the 5 bytes: still counted
+            event_loop.handle_ptt_change(false).await; // 5 played -> drains the 5000
+            event_loop.handle_ptt_change(false).await; // 5000 played -> drains the 6
+            event_loop.handle_ptt_change(false).await; // 6 played -> queue empty
+            assert_eq!(event_loop.tx_queue.len(), 0);
+
+            let lines = read_available_lines(&mut reader).await;
             assert_eq!(
-                buffer_values,
-                vec!["BUFFER 1", "BUFFER 2", "BUFFER 3", "BUFFER 2", "BUFFER 1", "BUFFER 0"],
-                "expected the queue to build 1,2,3 then drain 2,1,0"
+                buffer_values(&lines),
+                vec![
+                    "BUFFER 5",
+                    "BUFFER 5005",
+                    "BUFFER 5011",
+                    "BUFFER 5006",
+                    "BUFFER 6",
+                    "BUFFER 0"
+                ],
+                "expected byte counts that drop only as each frame's PTT releases, got: {:?}",
+                lines
             );
+        }
+
+        /// COP-30: with ARQ on, a segment's bytes stay in `BUFFER` after its
+        /// frame has played, until the peer's ACK for it is decoded.
+        #[tokio::test]
+        async fn test_buffer_held_until_arq_ack() {
+            let mut config = fast_ptt_config();
+            config.engine.arq_enabled = true;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19492, 19493).await;
+
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x44; 5],
+                })
+                .await;
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x55; 40],
+                })
+                .await;
+            // Both frames finish playing; neither is acked yet.
+            event_loop.handle_ptt_change(false).await;
+            event_loop.handle_ptt_change(false).await;
+            assert_eq!(event_loop.arq_tx.as_ref().unwrap().in_flight(), 2);
+            let lines = read_available_lines(&mut reader).await;
+            assert_eq!(
+                buffer_values(&lines).last(),
+                Some(&"BUFFER 45"),
+                "played but un-acked bytes must stay counted, got: {:?}",
+                lines
+            );
+
+            // The peer cumulatively ACKs seq 0 (the 5 bytes).
+            let session_id = event_loop.arq_session_id;
+            event_loop
+                .decode_and_dispatch_audio(&super::peer_frame(
+                    &TransportPdu::new_ack_with_rate(session_id, 1, 0, 2),
+                    coppa_codec::ofdm::CoppaProfile::hf_standard(),
+                ))
+                .await;
+            let lines = read_available_lines(&mut reader).await;
+            assert_eq!(
+                buffer_values(&lines),
+                vec!["BUFFER 40"],
+                "the ACK for seq 0 must remove its 5 bytes, got: {:?}",
+                lines
+            );
+
+            // Then seq 1 (the 40 bytes).
+            super::unstick_decoder(&mut event_loop);
+            event_loop
+                .decode_and_dispatch_audio(&super::peer_frame(
+                    &TransportPdu::new_ack_with_rate(session_id, 2, 0, 2),
+                    coppa_codec::ofdm::CoppaProfile::hf_standard(),
+                ))
+                .await;
+            let lines = read_available_lines(&mut reader).await;
+            assert_eq!(
+                buffer_values(&lines),
+                vec!["BUFFER 0"],
+                "the ACK for seq 1 must empty the buffer, got: {:?}",
+                lines
+            );
+            assert_eq!(event_loop.arq_tx.as_ref().unwrap().in_flight(), 0);
+        }
+
+        /// COP-30: established-session data, which goes straight to
+        /// `transmit_samples` rather than through `tx_queue`, reports `BUFFER`
+        /// too -- before its PTT keys -- and drains at PTT release.
+        #[tokio::test]
+        async fn test_session_path_emits_buffer_and_drains_on_ptt_release() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19494, 19495).await;
+            seed_established(&mut event_loop);
+
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x66; 12],
+                })
+                .await;
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x77; 4],
+                })
+                .await;
+            event_loop.handle_ptt_change(false).await;
+
+            let lines = read_available_lines(&mut reader).await;
+            assert_eq!(
+                buffer_values(&lines),
+                vec!["BUFFER 12", "BUFFER 16", "BUFFER 0"],
+                "session data must be counted in bytes and drain at PTT release, got: {:?}",
+                lines
+            );
+            let first_buffer = lines.iter().position(|l| l.trim_end() == "BUFFER 12");
+            let first_ptt_on = lines.iter().position(|l| l.trim_end() == "PTT ON");
+            assert!(
+                first_buffer.is_some() && first_ptt_on.is_some() && first_buffer < first_ptt_on,
+                "BUFFER 12 must reach the host before the first PTT ON, got: {:?}",
+                lines
+            );
+        }
+
+        /// COP-30: a payload the full ARQ window drops was never tracked or
+        /// queued, so it never reaches `BUFFER`.
+        #[tokio::test]
+        async fn test_arq_window_full_drop_is_not_counted() {
+            let mut config = fast_ptt_config();
+            config.engine.arq_enabled = true;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19496, 19497).await;
+
+            event_loop.is_transmitting = true;
+            for i in 0..9u8 {
+                event_loop
+                    .handle_host_event(HostEvent::DataReceived {
+                        client_id: 1,
+                        data: vec![i; 10],
+                    })
+                    .await;
+            }
+            assert_eq!(event_loop.arq_tx.as_ref().unwrap().in_flight(), 8);
+
+            let lines = read_available_lines(&mut reader).await;
+            let values = buffer_values(&lines);
+            assert_eq!(
+                values.len(),
+                8,
+                "one BUFFER line per accepted segment, got: {:?}",
+                lines
+            );
+            assert_eq!(values.last(), Some(&"BUFFER 80"));
         }
 
         /// Required scenario: "injected band-limited noise burst -> BUSY ON then
@@ -9410,6 +9856,463 @@ mod tests {
             // doc for why this alone doesn't mean the feature is "on" -- callsign
             // being unset by default still keeps it inactive).
             assert_eq!(config.station_id.id_interval_secs, 540);
+        }
+    }
+
+    // ── COP-40: operating-frequency source and the wideband HF/VHF gate ──
+
+    mod cop40_frequency_gate {
+        use super::*;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::Mutex;
+
+        /// A fake rigctld serving one client: answers `f` with whatever the
+        /// shared answer holds, `T <n>` with `RPRT 0`, `t` with the keyed
+        /// state. Setting the shared `alive` flag to false makes it hang up
+        /// on the next command, like a rigctld that died mid-session.
+        struct FakeRig {
+            addr: String,
+            answer: Arc<Mutex<String>>,
+            alive: Arc<AtomicBool>,
+        }
+
+        fn fake_rigctld(answer: &str) -> FakeRig {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let answer = Arc::new(Mutex::new(answer.to_string()));
+            let alive = Arc::new(AtomicBool::new(true));
+            let (shared, live) = (Arc::clone(&answer), Arc::clone(&alive));
+            std::thread::spawn(move || {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut writer = stream.try_clone().unwrap();
+                let mut ptt = "0".to_string();
+                for line in BufReader::new(stream).lines() {
+                    let Ok(line) = line else { break };
+                    if !live.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let reply = match line.trim() {
+                        "f" => shared.lock().unwrap().clone(),
+                        "t" => ptt.clone(),
+                        cmd if cmd.starts_with("T ") => {
+                            ptt = cmd[2..].to_string();
+                            "RPRT 0".to_string()
+                        }
+                        _ => "RPRT -1".to_string(),
+                    };
+                    if writeln!(writer, "{reply}").is_err() {
+                        break;
+                    }
+                }
+            });
+            FakeRig {
+                addr,
+                answer,
+                alive,
+            }
+        }
+
+        fn wideband_config() -> DaemonConfig {
+            let mut config = DaemonConfig::default();
+            config.engine.profile = "VHF_FAST".into();
+            config.audio.sample_rate = 100_000_000;
+            config.audio.buffer_size = 0;
+            config.radio.ptt_pre_delay_ms = 0;
+            config.radio.ptt_tail_delay_ms = 0;
+            config
+        }
+
+        fn rigctld_config(rig: &FakeRig) -> DaemonConfig {
+            let mut config = wideband_config();
+            config.radio.ptt_method = "rigctld".into();
+            config.radio.rigctld_address = rig.addr.clone();
+            config
+        }
+
+        fn startup_error(config: DaemonConfig) -> String {
+            EventLoop::new(config)
+                .err()
+                .expect("startup must be refused")
+                .to_string()
+        }
+
+        // ── Phase 3: startup gate ─────────────────────────────────────────
+
+        #[test]
+        fn wideband_profile_without_any_frequency_source_is_a_startup_error() {
+            let err = startup_error(wideband_config());
+            assert!(err.contains("97.307"), "{err}");
+            assert!(err.contains("frequency_hz"), "{err}");
+            assert!(err.contains("VHF_FAST"), "{err}");
+            assert!(err.contains("5600 Hz"), "{err}");
+        }
+
+        #[test]
+        fn wideband_profile_with_a_vhf_band_label_starts() {
+            let mut config = wideband_config();
+            config.radio.band = Some("2m".into());
+            assert!(EventLoop::new(config).is_ok());
+        }
+
+        #[test]
+        fn wideband_profile_with_a_stated_vhf_frequency_starts() {
+            let mut config = wideband_config();
+            config.radio.frequency_hz = Some(144_500_000);
+            assert!(EventLoop::new(config).is_ok());
+        }
+
+        #[test]
+        fn wideband_profile_with_a_stated_hf_frequency_is_a_startup_error() {
+            let mut config = wideband_config();
+            config.radio.frequency_hz = Some(14_074_000);
+            let err = startup_error(config);
+            assert!(err.contains("below 29.7 MHz"), "{err}");
+            assert!(err.contains("97.307"), "{err}");
+        }
+
+        #[test]
+        fn wideband_profile_with_band_10m_is_a_startup_error() {
+            let mut config = wideband_config();
+            config.radio.band = Some("10m".into());
+            let err = startup_error(config);
+            assert!(err.contains("97.307"), "{err}");
+        }
+
+        #[test]
+        fn a_typod_band_is_a_startup_error_even_for_narrowband() {
+            let mut config = DaemonConfig::default();
+            config.radio.band = Some("21m".into());
+            let err = startup_error(config);
+            assert!(err.contains("invalid [radio] band \"21m\""), "{err}");
+        }
+
+        #[test]
+        fn wideband_profile_with_dead_rigctld_and_no_static_source_is_a_startup_error() {
+            let mut config = wideband_config();
+            config.radio.ptt_method = "rigctld".into();
+            config.radio.rigctld_address = "127.0.0.1:1".into();
+            let err = startup_error(config);
+            assert!(err.contains("frequency source"), "{err}");
+            assert!(err.contains("127.0.0.1:1"), "{err}");
+            assert!(err.contains("is unreachable"), "{err}");
+        }
+
+        #[test]
+        fn wideband_profile_with_rigctld_not_answering_f_is_a_startup_error() {
+            let rig = fake_rigctld("CHKVFO?");
+            let err = startup_error(rigctld_config(&rig));
+            assert!(err.contains("frequency source"), "{err}");
+            assert!(
+                err.contains("is not answering the frequency query"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn wideband_profile_with_answering_rigctld_starts() {
+            let rig = fake_rigctld("144500000");
+            let event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            assert!(event_loop.ptt.is_rigctld());
+        }
+
+        #[test]
+        fn wideband_profile_with_rigctld_on_hf_is_a_startup_error() {
+            let rig = fake_rigctld("14074000");
+            let err = startup_error(rigctld_config(&rig));
+            assert!(err.contains("14074000"), "{err}");
+            assert!(err.contains("97.307"), "{err}");
+        }
+
+        #[test]
+        fn narrowband_default_config_still_starts() {
+            let event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+            assert!(event_loop.engine.occupied_bandwidth_hz() <= 2_800);
+        }
+
+        #[test]
+        fn narrowband_keeps_the_soft_rigctld_fallback() {
+            let mut config = DaemonConfig::default();
+            config.radio.ptt_method = "rigctld".into();
+            config.radio.rigctld_address = "127.0.0.1:1".into();
+            let event_loop = EventLoop::new(config).unwrap();
+            assert!(!event_loop.ptt.is_rigctld());
+        }
+
+        // ── Phase 4: per-transmission gate ────────────────────────────────
+
+        const SAMPLES: [f32; 64] = [0.0; 64];
+
+        #[tokio::test]
+        async fn wideband_tx_with_answering_vhf_rigctld_transmits() {
+            let rig = fake_rigctld("144500000");
+            let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert_eq!(event_loop.tx_generation, 1, "audio was queued");
+            assert!(event_loop.is_transmitting);
+            assert_eq!(
+                PttControl::get_ptt(&mut event_loop.ptt).unwrap(),
+                PttState::Tx
+            );
+        }
+
+        #[tokio::test]
+        async fn wideband_tx_refused_after_retune_below_29m7() {
+            let rig = fake_rigctld("144500000");
+            let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert_eq!(event_loop.tx_generation, 1);
+            event_loop.handle_ptt_change(false).await;
+            let submitted = event_loop.tx_output().submitted();
+
+            *rig.answer.lock().unwrap() = "14074000".into();
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert_eq!(event_loop.tx_generation, 1, "no new transmission");
+            assert_eq!(
+                event_loop.tx_output().submitted(),
+                submitted,
+                "no new audio"
+            );
+            assert!(!event_loop.is_transmitting, "PTT stays unkeyed");
+        }
+
+        #[tokio::test]
+        async fn wideband_tx_refused_when_rigctld_dies_mid_session() {
+            let rig = fake_rigctld("144500000");
+            let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            rig.alive.store(false, Ordering::SeqCst);
+            assert_eq!(
+                event_loop.wideband_frequency_check(),
+                Err(GateRefusal::NoSource)
+            );
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert_eq!(event_loop.tx_generation, 0);
+            assert!(!event_loop.is_transmitting);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn wideband_tx_refused_after_retune_during_busy_wait() {
+            let rig = fake_rigctld("144500000");
+            let mut config = rigctld_config(&rig);
+            config.audio.sample_rate = 48_000;
+            config.station_id.busy_hold_ms = 10;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut audio_in_tx, audio_in_rx) = coppa_audio::audio_ring(32_768);
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(32_768);
+            event_loop.set_audio_in(audio_in_rx);
+            event_loop.set_audio_out(audio_out_tx);
+            let mut counter = 1u32;
+            let mut noise = |amplitude: f32| -> Vec<f32> {
+                (0..1024)
+                    .map(|_| {
+                        counter = counter.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                        amplitude * ((counter >> 8) as f32 / (1u32 << 24) as f32 - 0.5)
+                    })
+                    .collect()
+            };
+            for _ in 0..10 {
+                event_loop.busy_gate.observe(&noise(0.01));
+            }
+            for _ in 0..5 {
+                event_loop.busy_gate.observe(&noise(0.5));
+            }
+            assert!(event_loop.busy_gate.current());
+            event_loop.tx_on_air_bytes = 5;
+            {
+                let tx = event_loop.transmit_samples(&SAMPLES);
+                tokio::pin!(tx);
+                tokio::select! {
+                    biased;
+                    _ = &mut tx => panic!("transmission must wait for the busy channel"),
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+                // The initial frequency check passed. Retune while held,
+                // then feed quiet audio to release the courtesy wait.
+                *rig.answer.lock().unwrap() = "14074000".into();
+                audio_in_tx.write(&noise(0.01));
+                tokio::time::timeout(Duration::from_secs(5), tx)
+                    .await
+                    .unwrap();
+            }
+            assert!(!event_loop.busy_gate.current());
+            assert_eq!(
+                event_loop.tx_generation, 0,
+                "no transmission after the retune"
+            );
+            assert_eq!(audio_out_rx.available(), 0, "no audio queued");
+            assert_eq!(event_loop.tx_on_air_bytes, 0, "refused bytes leave BUFFER");
+            assert!(!event_loop.is_transmitting);
+            assert_eq!(
+                PttControl::get_ptt(&mut event_loop.ptt).unwrap(),
+                PttState::Rx
+            );
+        }
+
+        #[tokio::test]
+        async fn a_stated_vhf_source_backs_a_rigctld_that_dies() {
+            let rig = fake_rigctld("144500000");
+            let mut config = rigctld_config(&rig);
+            config.radio.band = Some("2m".into());
+            let mut event_loop = EventLoop::new(config).unwrap();
+            rig.alive.store(false, Ordering::SeqCst);
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert_eq!(event_loop.tx_generation, 1, "stated band is the fallback");
+        }
+
+        #[tokio::test]
+        async fn a_live_hf_answer_overrides_a_stated_vhf_band() {
+            let rig = fake_rigctld("144500000");
+            let mut config = rigctld_config(&rig);
+            config.radio.band = Some("2m".into());
+            let mut event_loop = EventLoop::new(config).unwrap();
+            *rig.answer.lock().unwrap() = "14074000".into();
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert_eq!(event_loop.tx_generation, 0, "the live answer wins");
+        }
+
+        #[tokio::test]
+        async fn narrowband_tx_with_no_source_still_transmits() {
+            let mut config = wideband_config();
+            config.engine.profile = "HF_STANDARD".into();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert_eq!(event_loop.tx_generation, 1);
+            assert!(event_loop.is_transmitting);
+        }
+
+        #[tokio::test]
+        async fn refused_wideband_tx_does_not_key_ptt() {
+            let rig = fake_rigctld("144500000");
+            let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            *rig.answer.lock().unwrap() = "7074000".into();
+            event_loop.tx_on_air_bytes = 5;
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert!(!event_loop.is_transmitting);
+            assert_eq!(event_loop.tx_on_air_bytes, 0, "refused bytes leave BUFFER");
+            *rig.answer.lock().unwrap() = "144500000".into();
+            assert_eq!(
+                PttControl::get_ptt(&mut event_loop.ptt).unwrap(),
+                PttState::Rx,
+                "the rig was never keyed"
+            );
+        }
+
+        /// A queued payload is held, not dropped, while the gate refuses,
+        /// and goes out on the next poll once the rig is back on 2m.
+        #[tokio::test]
+        async fn a_held_tx_queue_drains_once_the_rig_is_back_on_vhf() {
+            let rig = fake_rigctld("144500000");
+            let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            *rig.answer.lock().unwrap() = "14074000".into();
+            event_loop.enqueue_tx(None, b"hello".to_vec()).await;
+            assert_eq!(event_loop.tx_queue.len(), 1, "held, not dropped");
+            assert!(event_loop.tx_held_by_frequency_gate);
+            assert_eq!(event_loop.tx_generation, 0);
+
+            event_loop.retry_held_tx_drain().await;
+            assert_eq!(event_loop.tx_queue.len(), 1, "still on HF: still held");
+
+            *rig.answer.lock().unwrap() = "144500000".into();
+            event_loop.retry_held_tx_drain().await;
+            assert!(event_loop.tx_queue.is_empty());
+            assert!(!event_loop.tx_held_by_frequency_gate);
+            assert_eq!(event_loop.tx_generation, 1, "the held payload went out");
+        }
+
+        /// The post-wait refusal must re-arm the held-queue retry: the drain
+        /// that popped the refused payload had cleared the flag after its own
+        /// check passed, and a refused transmission creates no TxComplete or
+        /// PTT-release event that would ever re-trigger a drain. Without the
+        /// re-arm, every payload still queued behind the refused one stalls
+        /// until an unrelated host enqueue.
+        #[tokio::test(start_paused = true)]
+        async fn a_post_wait_refusal_leaves_the_remaining_queue_retryable() {
+            let rig = fake_rigctld("144500000");
+            let mut config = rigctld_config(&rig);
+            config.audio.sample_rate = 48_000;
+            config.station_id.busy_hold_ms = 10;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut audio_in_tx, audio_in_rx) = coppa_audio::audio_ring(32_768);
+            let (audio_out_tx, _audio_out_rx) = coppa_audio::audio_ring(32_768);
+            event_loop.set_audio_in(audio_in_rx);
+            event_loop.set_audio_out(audio_out_tx);
+            let mut counter = 1u32;
+            let mut noise = |amplitude: f32| -> Vec<f32> {
+                (0..1024)
+                    .map(|_| {
+                        counter = counter.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                        amplitude * ((counter >> 8) as f32 / (1u32 << 24) as f32 - 0.5)
+                    })
+                    .collect()
+            };
+            for _ in 0..10 {
+                event_loop.busy_gate.observe(&noise(0.01));
+            }
+            for _ in 0..5 {
+                event_loop.busy_gate.observe(&noise(0.5));
+            }
+            assert!(event_loop.busy_gate.current());
+            // Two queued non-ARQ payloads: the drain passes its gate check
+            // on 2m, pops the first, and blocks in the courtesy wait.
+            event_loop.tx_queue.push_back((None, b"first".to_vec()));
+            event_loop.tx_queue.push_back((None, b"second".to_vec()));
+            {
+                let drain = event_loop.try_drain_tx_queue();
+                tokio::pin!(drain);
+                tokio::select! {
+                    biased;
+                    _ = &mut drain => panic!("drain must wait for the busy channel"),
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+                // The rig retunes to HF during the wait, then the channel
+                // goes quiet and the courtesy wait releases into a refusal.
+                *rig.answer.lock().unwrap() = "14074000".into();
+                audio_in_tx.write(&noise(0.01));
+                tokio::time::timeout(Duration::from_secs(5), drain)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                event_loop.tx_generation, 0,
+                "the popped payload was refused"
+            );
+            assert_eq!(
+                event_loop.tx_queue.len(),
+                1,
+                "the second payload stays queued"
+            );
+            assert_eq!(event_loop.tx_on_air_bytes, 0, "refused bytes leave BUFFER");
+            assert!(
+                event_loop.tx_held_by_frequency_gate,
+                "the remaining queue is re-armed for the retry poll"
+            );
+
+            // Back on 2m, the ordinary retry poll (no new enqueue, no other
+            // drain trigger) resumes the remaining payload.
+            *rig.answer.lock().unwrap() = "144500000".into();
+            event_loop.retry_held_tx_drain().await;
+            assert!(event_loop.tx_queue.is_empty());
+            assert!(!event_loop.tx_held_by_frequency_gate);
+            assert_eq!(
+                event_loop.tx_generation, 1,
+                "the remaining payload went out"
+            );
+        }
+
+        /// A `LevelDerived` engine starts narrowband (no startup check
+        /// applies) but is gated the moment it climbs into `vhf_wide`.
+        #[tokio::test]
+        async fn a_level_derived_engine_is_gated_when_it_climbs_to_vhf() {
+            let mut config = wideband_config();
+            config.engine.profile = "HF_STANDARD".into();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            event_loop.engine = coppa_engine::CoppaCore::new();
+            event_loop.engine.set_speed_level(5).unwrap();
+            assert!(event_loop.engine.occupied_bandwidth_hz() > 2_800);
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert_eq!(event_loop.tx_generation, 0);
         }
     }
 }

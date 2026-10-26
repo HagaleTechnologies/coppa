@@ -200,7 +200,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:1e8cc90c7f275ce69fd4c89e93f1cc924b86c12dc632b990ee5fe31751fa5737",
+      "hash": "sha256:998da387d75cbaabc88f9281b233f7d19f2599b24d220d7640e752f25ddf6410",
       "id": "band-conventions",
       "kind": "interface",
       "links": [

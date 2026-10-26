@@ -28,11 +28,24 @@ caller's responsibility via `coppa-dsp`'s resampling utilities.
   band table at `contracts/bands/bands.v1.json`. The canonical label form is
   lowercase (e.g. `"20m"`); the table gives `rangeLowHz`/`rangeHighHz` and
   standard FT8 dial frequencies.
-- Coppa does not itself parse band labels or filter by band. The coppa-dsp
-  crate operates on raw sample streams; interpretation of which HF band is
-  in use is the host application's responsibility.
+- Coppa parses band labels in one place: the HF/VHF wideband regulatory
+  gate (COP-40, `coppa_radio::band`). The coppa-dsp crate still operates on
+  raw sample streams with no band awareness.
 - The waveform passband (300–2700 Hz audio) is independent of RF frequency.
   Coppa modulates audio for injection into any SSB rig audio chain; the rig
   is tuned by the host via `coppa-radio` (rigctld CAT). The RF band conventions
   in dispensa ADR-0006 apply to the rigctld frequency argument, not to
   coppa's audio pipeline.
+
+## The wideband regulatory gate (COP-40)
+
+47 CFR 97.307(f)(3) caps US amateur data emissions below 29.7 MHz at 2.8 kHz
+occupied bandwidth. `vhf_wide` occupies 5600 Hz, so `coppad`
+(`EventLoop::transmit_samples`, plus a startup check) and `coppa tx`/`coppa tune`
+refuse a wideband transmission unless frequency evidence places the station at
+or above 29.7 MHz. Evidence, in precedence order: a live rigctld `f` answer,
+then `[radio] frequency_hz` (`--frequency-hz`), then `[radio] band` (`--band`).
+Narrowband HF profiles need no source. The band table in
+`crates/coppa-radio/src/band.rs` is a minimal US subset (160m-23cm); dispensa
+ADR-0006 remains the tenant-wide convention. See `coppad.toml.example` and the
+COP-40 note in `CLAUDE.md`'s Known Limitations for what stays ungated.
