@@ -450,6 +450,10 @@ pub enum TransmitError {
     PayloadTooLarge { max: usize },
     /// `header.codewords` exceeded [`MAX_CODEWORDS`] (Phase 3 Task 5).
     TooManyCodewords { max: u8 },
+    /// `header.speed_level` is not a wire speed level this transceiver knows
+    /// (see `speed_level_components`). `CoppaHeader`'s fields are all `pub`, so
+    /// a caller can build such a header; `transmit` used to panic on it (COP-19).
+    InvalidSpeedLevel { level: u8 },
 }
 
 impl std::fmt::Display for TransmitError {
@@ -463,6 +467,9 @@ impl std::fmt::Display for TransmitError {
             }
             Self::TooManyCodewords { max } => {
                 write!(f, "too many codewords requested (max {max})")
+            }
+            Self::InvalidSpeedLevel { level } => {
+                write!(f, "invalid speed level {level} in header")
             }
         }
     }
@@ -540,9 +547,9 @@ impl CoppaTransceiver {
         let ldpc = NrLdpc::new();
 
         // Eagerly build every speed level's interleaver/mapper/k_used (see
-        // `LevelComponents`'s doc). Invalid levels (e.g. 10) simply have no
-        // entry in the map; `transmit`/`receive` treat a missing entry the same way
-        // the old per-call `speed_level_components` lookup treated an `Err`.
+        // `LevelComponents`'s doc). Invalid levels (e.g. 0, 10) simply have no
+        // entry in the map: `transmit` returns `TransmitError::InvalidSpeedLevel`
+        // for one, and `receive` returns `ReceiveError::HeaderCorrupt`.
         let mut codecs = HashMap::with_capacity(SPEED_LEVELS.len());
         for sl in SPEED_LEVELS.iter() {
             if let (Ok((mapper, _code_rate)), Some(k_used)) =
@@ -644,10 +651,11 @@ impl CoppaTransceiver {
         header: &CoppaHeader,
         payload: &[u8],
     ) -> Result<Vec<f32>, TransmitError> {
-        let comp = self
-            .codecs
-            .get(&header.speed_level)
-            .expect("invalid speed level in header");
+        let Some(comp) = self.codecs.get(&header.speed_level) else {
+            return Err(TransmitError::InvalidSpeedLevel {
+                level: header.speed_level,
+            });
+        };
         let k_used = comp.k_used;
         let codewords = header.codewords.max(1) as usize;
 
@@ -666,8 +674,11 @@ impl CoppaTransceiver {
         //    codeword below) -- see `split_payload_across_codewords`'s doc for why
         //    this total bound also guarantees no single codeword's chunk overflows
         //    its own budget.
-        let max = max_multi_payload_for_level(header.speed_level, header.codewords)
-            .expect("invalid speed level in header");
+        let Some(max) = max_multi_payload_for_level(header.speed_level, header.codewords) else {
+            return Err(TransmitError::InvalidSpeedLevel {
+                level: header.speed_level,
+            });
+        };
         if payload.len() > max {
             return Err(TransmitError::PayloadTooLarge { max });
         }
@@ -715,10 +726,11 @@ impl CoppaTransceiver {
         //    time-slots in one frame". A single-codeword frame, or any frame below
         //    the gate level, skips this (a 1-codeword `CrossFrameInterleaver` would
         //    be an identity permutation anyway, but skipping avoids the allocation).
-        let sl = SPEED_LEVELS
-            .iter()
-            .find(|s| s.level == header.speed_level)
-            .expect("invalid speed level in header");
+        let Some(sl) = SPEED_LEVELS.iter().find(|s| s.level == header.speed_level) else {
+            return Err(TransmitError::InvalidSpeedLevel {
+                level: header.speed_level,
+            });
+        };
         let slotted = if self.cross_codeword_interleave_enabled(sl.level, codewords) {
             let cross = CrossFrameInterleaver::new(codewords, CODED_BLOCK_LEN);
             cross.interleave(&all_coded)
@@ -1824,6 +1836,44 @@ mod tests {
             result,
             Err(TransmitError::PayloadTooLarge { max }),
             "expected Err(PayloadTooLarge {{ max: {max} }}) for an oversized payload"
+        );
+    }
+
+    /// COP-19: `CoppaHeader`'s fields are all `pub`, so a caller can build a
+    /// header whose `speed_level` is not on the ladder. `transmit` must return
+    /// `Err(TransmitError::InvalidSpeedLevel { level })` for every such value
+    /// instead of panicking. The invalid set comes from `speed_level_components`
+    /// itself, so this test follows the next ladder change without edits.
+    #[test]
+    fn transmit_rejects_invalid_speed_level() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let payload = b"hi".to_vec();
+
+        let invalid: Vec<u8> = (0..=u8::MAX)
+            .filter(|&level| speed_level_components(level).is_err())
+            .collect();
+        for expected in [0u8, 10, 15] {
+            assert!(
+                invalid.contains(&expected),
+                "level {expected} must be outside the wire ladder"
+            );
+        }
+
+        for level in invalid {
+            let header = make_header(level, payload.len() as u16);
+            assert_eq!(
+                tx.transmit(&header, &payload),
+                Err(TransmitError::InvalidSpeedLevel { level }),
+                "expected Err(InvalidSpeedLevel {{ level: {level} }})"
+            );
+        }
+
+        // Level 8 was the reserved gap in the ladder before COP-24 renumbered
+        // it (the ticket's example). It is a valid level now and must transmit.
+        let header = make_header(8, payload.len() as u16);
+        assert!(
+            tx.transmit(&header, &payload).is_ok(),
+            "level 8 is a valid speed level since COP-24"
         );
     }
 
