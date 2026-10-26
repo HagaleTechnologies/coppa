@@ -795,3 +795,24 @@ fn a_taken_websocket_port_is_a_startup_error() {
         &format!("failed to bind the WebSocket port to 127.0.0.1:{port}"),
     );
 }
+
+#[cfg(feature = "cpal-backend")]
+#[test]
+fn a_missing_named_input_device_is_a_startup_error() {
+    run_startup_error(
+        "[audio]\ninput_device = \"COP-32 no such input device\"\n",
+        "audio input device \"COP-32 no such input device\" not found",
+    );
+}
+
+#[cfg(feature = "cpal-backend")]
+#[test]
+fn a_missing_named_output_device_is_a_startup_error() {
+    // No input name: the output name must be checked before the default
+    // input device is opened, or a host without audio would report that
+    // failure instead.
+    run_startup_error(
+        "[audio]\noutput_device = \"COP-32 no such output device\"\n",
+        "audio output device \"COP-32 no such output device\" not found",
+    );
+}
