@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-09-06T12:17:42Z",
-  "head_commit": "3779efd",
+  "generated_at": "2026-10-26T08:02:02Z",
+  "head_commit": "8857be8",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -355,7 +355,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:4c050d6d7a647fae7d4c6c50a7f88b27bb6c062f05317af61a6e419702923cb7",
+      "hash": "sha256:b8afd3bae50ea8f4ba058e6a60987ce447d071d232b7ad7e8d0a78dfe15c9329",
       "id": "cpal-feature-gate",
       "kind": "gotcha",
       "links": [
@@ -418,7 +418,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:d3c771ec6a549e176b9d879791ebec3ab801cdaad03234812be182e8c9d9053d",
+      "hash": "sha256:041014904f3191260bcaad76e39c3cac7d375d599b427fa63e83a7b7ca6de775",
       "id": "phase4-field-readiness",
       "kind": "gotcha",
       "links": [

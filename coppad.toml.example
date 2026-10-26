@@ -2,15 +2,18 @@
 # Copy to coppad.toml and edit as needed.
 
 [audio]
-# Sample rate in Hz. Must match engine (48000 for OFDM).
+# Sample rate in Hz. Must be 48000, the engine's rate (coppad has no
+# resampler); any other value stops the daemon at startup.
 sample_rate = 48000
 # Ring buffer size in samples.
 buffer_size = 8192
 # Audio input device name (substring match, case-insensitive).
-# Empty string = system default.
+# Empty string = system default. A name that matches no device stops the
+# daemon at startup; it never falls back to the default device.
 input_device = ""
 # Audio output device name (substring match, case-insensitive).
-# Empty string = system default.
+# Empty string = system default. A name that matches no device stops the
+# daemon at startup; it never falls back to the default device.
 output_device = ""
 
 [radio]
@@ -37,6 +40,13 @@ max_tx_duration_s = 30
 # for "none", "vox" and serial PTT; for serial, the OS drops DTR/RTS when the
 # port closes. Set to false to disable.
 ptt_guardian = true
+# Half-duplex RX->TX turnaround: after decoding a frame, wait this many ms
+# before keying PTT for any transmission (ACKs, CONNECT_ACK, replies). The
+# OTHER station stays keyed for its own ptt_tail_delay_ms (or its rig's VOX
+# hang time) after its last audio sample, and cannot hear you until it
+# unkeys. Set this above the peer's tail/VOX delay plus its radio's TX->RX
+# switching time. 0 disables the guard (replies key at once).
+turnaround_ms = 500
 
 # COP-40: operating-frequency source for the HF/VHF regulatory gate.
 # Required ONLY for wideband (VHF) profiles, whose 5600 Hz occupied
@@ -64,6 +74,7 @@ vara_enabled = false
 vara_command_port = 8300
 vara_data_port = 8301
 # WebSocket JSON API
+# Clients can opt into periodic "spectrum" and "audio_level" streams; see docs/OPERATING.md.
 websocket_enabled = false
 websocket_port = 8400
 
@@ -108,8 +119,6 @@ beacon_interval_secs = 0
 # arq_window = 8
 # Max retransmit attempts per frame (default 5)
 # max_retries = 5
-# Turnaround delay in ms between RX/TX switching (default 500)
-# turnaround_ms = 500
 # Connection timeout in seconds (default 30)
 # connect_timeout_s = 30
 # Idle timeout in seconds before session drops (default 120)
