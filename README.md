@@ -52,10 +52,13 @@ coppa loopback "Hello from Coppa"
 coppa tx "CQ CQ CQ DE VK2ABC K" -o cq.wav
 
 # Decode a WAV file (prints the message text)
-coppa rx -i cq.wav
+coppa rx cq.wav
 
 # Show the decoded payload as hex bytes instead (--raw: hex only, for scripts)
-coppa rx -i cq.wav --hex
+coppa rx cq.wav --hex
+
+# Receive live from the default input device for 60 seconds (requires cpal-backend)
+coppa rx --duration 60
 
 # List audio devices (requires cpal-backend feature)
 coppa devices

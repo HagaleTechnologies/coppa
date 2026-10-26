@@ -74,6 +74,20 @@ Requires the `cpal-backend` feature for real hardware access:
 cargo run -p coppa-cli --bin coppa --features cpal-backend -- devices
 ```
 
+## Receiving Live Audio
+
+Requires the `cpal-backend` feature:
+
+```bash
+cargo run -p coppa-cli --bin coppa --features cpal-backend -- rx --duration 60
+```
+
+With no file, `coppa rx` captures from the default input device (`--device <name>` picks
+another by substring) and prints each frame as it decodes, in the same format as a WAV
+decode. `--duration` stops after that many seconds; without it, `coppa rx` runs until
+Ctrl+C. `coppa listen` is a deprecated alias for `coppa rx` and will be removed in the
+next release.
+
 ## Viewing Operating Profiles
 
 ```bash
