@@ -2624,20 +2624,16 @@ impl EventLoop {
     /// wait, and again after the wait before the station-ID prepend, PTT,
     /// or any audio. A refused transmission keys nothing and queues
     /// nothing. Callers observe a lost transmission, which ARQ already
-<<<<<<< HEAD
     /// retransmits or times out on like any other loss. COP-21: a refusal
     /// also rebinds a level-derived engine to HF, so the next frame it
     /// encodes is HF-legal; the refused samples themselves are never
     /// re-encoded.
-=======
-    /// retransmits or times out on like any other loss.
     ///
     /// COP-37: before either, no valid local callsign (`local_callsign` is
     /// `None`: `[engine] callsign` empty or invalid and no valid `MYCALL`
     /// since) refuses the transmission outright, logging
     /// `NO_CALLSIGN_TX_REFUSAL` at `ERROR` for each attempt. This covers
     /// every caller, including `TUNE`, which no upstream feature gate sees.
->>>>>>> af7712e23e02222bf6db1e6e23da05aa8795fe2c
     async fn transmit_samples(&mut self, samples: &[f32]) {
         if self.local_callsign.is_none() {
             tracing::error!("{NO_CALLSIGN_TX_REFUSAL}");
