@@ -199,6 +199,24 @@ impl Default for TncConfig {
     }
 }
 
+/// Modulate a KISS data payload for the air.
+///
+/// KISS frames carry no FCS: the TNC adds it on transmit and checks and
+/// strips it on receive (see [`air_to_kiss`]).
+fn kiss_to_air(payload: &[u8]) -> Vec<f32> {
+    coppa_codec::afsk::modulate(&coppa_codec::afsk::append_fcs(payload))
+}
+
+/// Turn a decoded on-air frame into a KISS data payload.
+///
+/// KISS frames carry no FCS: the TNC adds it on transmit (see
+/// [`kiss_to_air`]) and checks and strips it on receive. The demodulator
+/// only emits frames whose FCS verified, so this only drops the 2 FCS bytes.
+fn air_to_kiss(mut frame: Vec<u8>) -> Vec<u8> {
+    frame.truncate(frame.len().saturating_sub(2));
+    frame
+}
+
 /// Run the TNC daemon.
 ///
 /// Wires together:
@@ -401,9 +419,13 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
         });
     }
 
-    // Suppress unused variable warnings when cpal-backend is not enabled.
+    // Without cpal-backend nothing moves audio: say so at startup, and
+    // suppress the unused variable warnings.
     #[cfg(not(feature = "cpal-backend"))]
     {
+        println!(
+            "Audio: none (built without the cpal-backend feature; nothing will be sent or received)"
+        );
         let _ = audio_in_prod;
         let _ = audio_out_cons;
     }
@@ -421,7 +443,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
         tokio::select! {
             // RX path: demod thread produced a frame → forward to KISS clients
             Some(frame) = demod_rx.recv() => {
-                let _ = rx_sender.send(frame);
+                let _ = rx_sender.send(air_to_kiss(frame));
             }
 
             // TX path: KISS client sent a frame → modulate and queue it;
@@ -429,7 +451,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
             // Not polled while the backlog is full, so later frames wait in
             // the KISS server's bounded channel.
             Some(ax25_data) = tx_receiver.recv(), if tnc_tx.has_room() => {
-                tnc_tx.submit(coppa_codec::afsk::modulate(&ax25_data));
+                tnc_tx.submit(kiss_to_air(&ax25_data));
                 tnc_tx.poll(Instant::now(), &mut audio_out_prod, ptt.as_mut());
             }
 
@@ -686,6 +708,44 @@ mod tests {
             *h.ptt.0.lock().unwrap(),
             vec![PttState::Tx, PttState::Rx, PttState::Tx, PttState::Rx]
         );
+    }
+
+    /// An APRS-style UI frame with a full 256-byte info field, as AX.25
+    /// bytes with the FCS on.
+    fn max_info_ax25_frame() -> Vec<u8> {
+        use coppa_protocol::ax25::{Ax25Address, Ax25Frame, MAX_INFO_LEN};
+        let address = |callsign: &str| Ax25Address {
+            callsign: callsign.to_string(),
+            ssid: 0,
+        };
+        Ax25Frame {
+            dest: address("APRS"),
+            src: address("N0CALL"),
+            digipeaters: Vec::new(),
+            info: (0..MAX_INFO_LEN).map(|i| b'0' + (i % 10) as u8).collect(),
+        }
+        .to_bytes()
+    }
+
+    /// A standard KISS payload (AX.25 without the FCS) survives the TX and
+    /// RX boundary unchanged at the largest AX.25 info field.
+    #[test]
+    fn standard_kiss_payload_round_trips_at_max_info_len() {
+        let frame = max_info_ax25_frame();
+        let payload = &frame[..frame.len() - 2];
+        let mut demod = coppa_codec::afsk::Demodulator::new();
+        demod.process(&kiss_to_air(payload));
+        let decoded: Vec<Vec<u8>> = demod.take_frames().into_iter().map(air_to_kiss).collect();
+        assert_eq!(decoded, vec![payload.to_vec()]);
+    }
+
+    /// The FCS the TNC adds to a KISS payload matches `coppa-protocol`'s
+    /// separate AX.25 encoder.
+    #[test]
+    fn on_air_frame_matches_the_ax25_encoder() {
+        let frame = max_info_ax25_frame();
+        let payload = &frame[..frame.len() - 2];
+        assert_eq!(coppa_codec::afsk::append_fcs(payload), frame);
     }
 
     /// Output failure cancels immediately.

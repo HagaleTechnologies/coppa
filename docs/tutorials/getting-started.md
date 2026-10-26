@@ -148,6 +148,10 @@ cargo run -p coppa-daemon --bin coppad --features kiss-tnc,cpal-backend -- --tnc
 A build without `kiss-tnc` exits with `Error: TNC mode requires the kiss-tnc
 feature`.
 
+[docs/TNC.md](../TNC.md) says what the TNC mode is for (KISS bring-up and
+testing), covers `coppa tnc`, which takes its own `--port` and `--device` so
+several TNCs can run on one machine, and walks through a demo with two of them.
+
 Example `coppad.toml`:
 ```toml
 [audio]
