@@ -374,8 +374,7 @@ impl EventLoop {
         let mut ptt = Self::create_ptt(&config)?;
         // COP-32: conditions the daemon runs through but must not call ready.
         let mut startup_problems = Vec::new();
-        if config.radio.ptt_config() == Ok(crate::config::PttConfig::Rigctld) && !ptt.is_rigctld()
-        {
+        if config.radio.ptt_config() == Ok(crate::config::PttConfig::Rigctld) && !ptt.is_rigctld() {
             startup_problems.push(format!(
                 "no PTT: rigctld at {} is unreachable",
                 config.radio.rigctld_address

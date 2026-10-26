@@ -456,9 +456,9 @@ async fn bind_host_port(
     key: &str,
 ) -> Result<tokio::net::TcpListener> {
     let addr = format!("{bind_address}:{port}");
-    tokio::net::TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("failed to bind the {what} to {addr} ([host] bind_address, {key})"))
+    tokio::net::TcpListener::bind(&addr).await.with_context(|| {
+        format!("failed to bind the {what} to {addr} ([host] bind_address, {key})")
+    })
 }
 
 fn listen_addr(listener: &tokio::net::TcpListener) -> String {

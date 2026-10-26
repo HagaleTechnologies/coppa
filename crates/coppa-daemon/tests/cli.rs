@@ -841,7 +841,10 @@ fn an_unreachable_rigctld_is_reported_degraded_not_ready() {
     );
     let args = ["--config", "station.toml"];
     let (mut daemon, _) = start_until(dir.path(), &args, &[], "Daemon running degraded");
-    assert!(daemon.try_exit().is_none(), "a degraded daemon keeps running");
+    assert!(
+        daemon.try_exit().is_none(),
+        "a degraded daemon keeps running"
+    );
     let (stdout, _) = daemon.kill();
     assert!(!stdout.contains("Daemon ready"), "{stdout}");
     for marker in [
