@@ -30,6 +30,13 @@ ptt_pre_delay_ms = 50
 ptt_tail_delay_ms = 200
 # Safety: max TX duration in seconds before forced unkey
 max_tx_duration_s = 30
+# Half-duplex RX->TX turnaround: after decoding a frame, wait this many ms
+# before keying PTT for any transmission (ACKs, CONNECT_ACK, replies). The
+# OTHER station stays keyed for its own ptt_tail_delay_ms (or its rig's VOX
+# hang time) after its last audio sample, and cannot hear you until it
+# unkeys. Set this above the peer's tail/VOX delay plus its radio's TX->RX
+# switching time. 0 disables the guard (replies key at once).
+turnaround_ms = 500
 
 # COP-40: operating-frequency source for the HF/VHF regulatory gate.
 # Required ONLY for wideband (VHF) profiles, whose 5600 Hz occupied
@@ -101,8 +108,6 @@ beacon_interval_secs = 0
 # arq_window = 8
 # Max retransmit attempts per frame (default 5)
 # max_retries = 5
-# Turnaround delay in ms between RX/TX switching (default 500)
-# turnaround_ms = 500
 # Connection timeout in seconds (default 30)
 # connect_timeout_s = 30
 # Idle timeout in seconds before session drops (default 120)

@@ -39,6 +39,10 @@ type VaraResponseSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<VaraResponse>>>>;
 /// 300 s.
 const VARA_KEEPALIVE_PERIOD: Duration = Duration::from_secs(60);
 
+/// How often `wait_for_rx_turnaround` drains the input ring: `run()`'s
+/// `audio_poll` cadence, so the ring never fills during the hold.
+const TURNAROUND_POLL: Duration = Duration::from_millis(20);
+
 /// The reply a VARA command-port client gets for one command, decided before
 /// the command takes effect. `WRONG` is only for lines coppa does not
 /// recognise or cannot apply: Pat's dial waits only for
@@ -311,9 +315,12 @@ pub struct EventLoop {
     tx_frame_count: usize,
     /// Maximum data frames per TX turn before yielding.
     max_frames_per_turn: usize,
-    /// Turnaround delay in ms between RX/TX switching.
-    #[allow(dead_code)] // enforcement deferred to real-world testing
-    turnaround_ms: u64,
+    /// COP-60: earliest instant this station may key PTT after the last frame
+    /// it decoded (`[radio] turnaround_ms` after that decode). The sender is
+    /// still keyed for its PTT tail after its last sample, so a reply keyed
+    /// sooner goes out while the peer is deaf. `None` until the first decode;
+    /// enforced by `wait_for_rx_turnaround`.
+    rx_turnaround_until: Option<tokio::time::Instant>,
     /// Time of the last station-ID frame actually sent (or `EventLoop`
     /// construction, if none yet). Compared against `[station_id]
     /// id_interval_secs` in `id_due` -- see `transmit_samples`'s doc for why
@@ -326,8 +333,8 @@ pub struct EventLoop {
     /// Task 3).
     last_beacon_time: Instant,
     /// Raw audio samples read from the input ring by
-    /// `observe_busy_gate_from_audio_input` while `wait_for_clear_channel`
-    /// was blocked, already fed to `busy_gate.observe` there but not yet
+    /// `observe_busy_gate_from_audio_input` while `wait_for_clear_channel` or
+    /// `wait_for_rx_turnaround` was blocked, already fed to `busy_gate.observe` there but not yet
     /// decoded/dispatched. Flushed (decode-and-dispatch only, no repeat
     /// busy-gate observation) by the next `poll_audio_input` call from
     /// `run`'s main select loop -- see `observe_busy_gate_from_audio_input`'s
@@ -508,7 +515,7 @@ impl EventLoop {
             is_transmitting: false,
             tx_frame_count: 0,
             max_frames_per_turn: 4,
-            turnaround_ms: 500,
+            rx_turnaround_until: None,
             last_id_time: Instant::now(),
             last_beacon_time: Instant::now(),
             pending_busy_wait_audio: Vec::new(),
@@ -1273,7 +1280,8 @@ impl EventLoop {
     /// `busy_gate.observe` only -- no frame decode, no `MacPdu` dispatch.
     ///
     /// Used exclusively by `wait_for_clear_channel`'s poll loop (Finding 1,
-    /// Phase 4 Task 3 review) so real RX audio keeps updating busy-gate
+    /// Phase 4 Task 3 review) and `wait_for_rx_turnaround`'s (COP-60, which
+    /// needs only the drain) so real RX audio keeps updating busy-gate
     /// occupancy while that call is blocked waiting for the channel to
     /// clear, without also running `handle_audio_in`'s full protocol
     /// dispatch on this call stack. That dispatch (frame decode ->
@@ -1651,6 +1659,14 @@ impl EventLoop {
             let speed_level = frame.speed_level;
             match frame.payload {
                 Ok(payload) => {
+                    // COP-60: whoever sent this frame is still keyed for its PTT tail.
+                    // Anchored at decode, which is never earlier than the frame's last
+                    // sample arriving.
+                    self.rx_turnaround_until = Some(
+                        tokio::time::Instant::now()
+                            + Duration::from_millis(self.config.radio.turnaround_ms),
+                    );
+
                     // Telemetry: SNR (decision 8) after every decoded frame,
                     // regardless of what the frame's payload turns out to be —
                     // `DecodedFrame::snr_db` is known as soon as decode succeeds.
@@ -2102,8 +2118,9 @@ impl EventLoop {
     /// through (host-driven encode, ARQ-adjacent session control frames
     /// including session keepalives, the raw/ARQ TX-queue drain, ARQ
     /// retransmits, `TUNE`), so busy-channel courtesy (Phase 4 Task 3,
-    /// decision: gate here rather than duplicate at each call site) and the
-    /// station-ID timer's prepend both live here and apply uniformly to
+    /// decision: gate here rather than duplicate at each call site), the
+    /// RX->TX turnaround guard (COP-60, `wait_for_rx_turnaround`) and the
+    /// station-ID timer's prepend all live here and apply uniformly to
     /// every caller -- none of them are exempted; deferring a
     /// CONNECT_ACK/CFM by a fraction of a second for channel courtesy is
     /// judged better than bulldozing over real QRM, and none of this event
@@ -2126,6 +2143,7 @@ impl EventLoop {
     async fn transmit_samples(&mut self, samples: &[f32]) {
         let allowed = if self.wideband_frequency_check().is_ok() {
             self.wait_for_clear_channel().await;
+            self.wait_for_rx_turnaround().await;
             // The rig can retune during the unbounded courtesy wait and
             // its backoff. Resolve fresh evidence before committing to TX.
             self.wideband_frequency_check().is_ok()
@@ -2325,6 +2343,37 @@ impl EventLoop {
                 return;
             }
             // Busy again during the holdoff -- loop back and wait again.
+        }
+    }
+
+    /// COP-60 RX->TX turnaround: hold this key-up until `rx_turnaround_until`.
+    /// A no-op when no frame was decoded within `turnaround_ms`, or when PTT
+    /// is already asserted (no key-up edge to protect). Drains the input ring
+    /// while it waits, via the same no-dispatch helper `wait_for_clear_channel`
+    /// uses: the 8,192-sample production ring holds 170 ms, so a plain sleep
+    /// drops RX audio.
+    async fn wait_for_rx_turnaround(&mut self) {
+        if self.is_transmitting {
+            return;
+        }
+        let Some(until) = self.rx_turnaround_until else {
+            return;
+        };
+        let remaining = until.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        tracing::debug!(
+            wait_ms = remaining.as_millis() as u64,
+            "Holding TX for RX->TX turnaround"
+        );
+        loop {
+            self.observe_busy_gate_from_audio_input().await;
+            let remaining = until.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            tokio::time::sleep(remaining.min(TURNAROUND_POLL)).await;
         }
     }
 
@@ -10323,6 +10372,438 @@ mod tests {
             assert!(event_loop.engine.occupied_bandwidth_hz() > 2_800);
             event_loop.transmit_samples(&SAMPLES).await;
             assert_eq!(event_loop.tx_generation, 0);
+        }
+    }
+
+    // ── COP-60: replies wait out the peer's PTT tail before keying ───────
+
+    mod cop60_turnaround {
+        use super::*;
+        use coppa_engine::profiles::get_profile;
+
+        type Edge = (tokio::time::Instant, PttState);
+        type Edges = Arc<std::sync::Mutex<Vec<Edge>>>;
+
+        /// PTT backend recording every edge with its (virtual) time.
+        #[derive(Clone, Default)]
+        struct PttLog(Edges);
+
+        impl PttControl for PttLog {
+            fn set_ptt(&mut self, state: PttState) -> anyhow::Result<()> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((tokio::time::Instant::now(), state));
+                Ok(())
+            }
+
+            fn get_ptt(&mut self) -> anyhow::Result<PttState> {
+                Ok(self.0.lock().unwrap().last().map_or(PttState::Rx, |e| e.1))
+            }
+        }
+
+        impl PttLog {
+            fn edges(&self) -> Vec<Edge> {
+                self.0.lock().unwrap().clone()
+            }
+
+            /// Time of the first edge into `state`, if any.
+            fn first(&self, state: PttState) -> Option<tokio::time::Instant> {
+                self.edges()
+                    .into_iter()
+                    .find(|edge| edge.1 == state)
+                    .map(|edge| edge.0)
+            }
+
+            fn keyed(&self) -> bool {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .is_some_and(|edge| edge.1 == PttState::Tx)
+            }
+        }
+
+        fn install_ptt_log(station: &mut EventLoop) -> PttLog {
+            let log = PttLog::default();
+            station.ptt = PttBackend::Other(Box::new(log.clone()));
+            log
+        }
+
+        /// A real ARQ data frame from a peer `CoppaCore`, padded for the
+        /// streaming receiver.
+        fn peer_data_frame() -> Vec<f32> {
+            let peer = CoppaCore::from_profile(get_profile("HF_STANDARD").unwrap());
+            let pdu = TransportPdu::new_reliable(5, 0, 0, b"hello coppa".to_vec());
+            with_lead_and_trail(&peer.encode_bytes(&pdu.to_bytes()).unwrap())
+        }
+
+        fn arq_config() -> DaemonConfig {
+            let mut config = DaemonConfig::default();
+            config.engine.arq_enabled = true;
+            config
+        }
+
+        const TURNAROUND: Duration = Duration::from_millis(500);
+
+        #[tokio::test(start_paused = true)]
+        async fn ack_keys_no_sooner_than_turnaround_after_the_decoded_frame() {
+            let mut station = EventLoop::new(arq_config()).unwrap();
+            assert_eq!(station.config.radio.turnaround_ms, 500);
+            let ptt = install_ptt_log(&mut station);
+            let frame = peer_data_frame();
+
+            let t0 = tokio::time::Instant::now();
+            station.decode_and_dispatch_audio(&frame).await;
+
+            let keyed = ptt
+                .first(PttState::Tx)
+                .expect("the decoded data frame must be ACKed");
+            assert!(
+                keyed - t0 >= TURNAROUND,
+                "ACK keyed {:?} after decode, before the {TURNAROUND:?} turnaround",
+                keyed - t0
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn connect_ack_also_waits_out_the_turnaround() {
+            let mut config = DaemonConfig::default();
+            config.engine.callsign = "VK3ABC".into();
+            let mut a = EventLoop::new(config.clone()).unwrap();
+            config.engine.callsign = "W1AW".into();
+            let mut b = EventLoop::new(config).unwrap();
+            b.listening = true;
+            let (a_producer, mut a_consumer) = coppa_audio::audio_ring(1_000_000);
+            let (b_producer, _b_consumer) = coppa_audio::audio_ring(1_000_000);
+            a.set_audio_out(a_producer);
+            b.set_audio_out(b_producer);
+            let b_ptt = install_ptt_log(&mut b);
+
+            a.handle_host_event(HostEvent::ConnectRequest {
+                client_id: 1,
+                source: "VK3ABC".into(),
+                destination: "W1AW".into(),
+            })
+            .await;
+            let connect_req = take_leg(&mut a_consumer, "CONNECT_REQ");
+
+            let t0 = tokio::time::Instant::now();
+            b.decode_and_dispatch_audio(&connect_req).await;
+
+            let keyed = b_ptt
+                .first(PttState::Tx)
+                .expect("b must answer the CONNECT_REQ with a CONNECT_ACK");
+            assert!(
+                keyed - t0 >= TURNAROUND,
+                "CONNECT_ACK keyed {:?} after decode, before the {TURNAROUND:?} turnaround",
+                keyed - t0
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn transmit_with_no_recent_decode_keys_at_once() {
+            // (a) No frame ever decoded: no hold.
+            let mut idle = EventLoop::new(DaemonConfig::default()).unwrap();
+            let idle_ptt = install_ptt_log(&mut idle);
+            let t0 = tokio::time::Instant::now();
+            idle.transmit_samples(&[0.1; 4800]).await;
+            assert_eq!(idle_ptt.first(PttState::Tx), Some(t0));
+
+            // (b) The last decode is older than the turnaround: no hold. ARQ is
+            // off, so the decode itself transmits nothing.
+            let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+            let ptt = install_ptt_log(&mut station);
+            station.decode_and_dispatch_audio(&peer_data_frame()).await;
+            assert!(
+                station.rx_turnaround_until.is_some(),
+                "the peer frame must decode, or this case proves nothing"
+            );
+            assert_eq!(ptt.first(PttState::Tx), None, "ARQ off: no reply");
+            tokio::time::advance(Duration::from_millis(600)).await;
+            let t1 = tokio::time::Instant::now();
+            station.transmit_samples(&[0.1; 4800]).await;
+            assert_eq!(ptt.first(PttState::Tx), Some(t1));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn zero_turnaround_keys_at_once() {
+            let mut config = arq_config();
+            config.radio.turnaround_ms = 0;
+            let mut station = EventLoop::new(config).unwrap();
+            let ptt = install_ptt_log(&mut station);
+            let frame = peer_data_frame();
+
+            let t0 = tokio::time::Instant::now();
+            station.decode_and_dispatch_audio(&frame).await;
+
+            assert_eq!(
+                ptt.first(PttState::Tx),
+                Some(t0),
+                "turnaround_ms = 0 disables the guard"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn already_keyed_transmission_is_not_held() {
+            let mut station = EventLoop::new(arq_config()).unwrap();
+            let ptt = install_ptt_log(&mut station);
+            // Mid-transmission: a job queued behind the active one makes no
+            // key-up edge, so there is nothing to protect.
+            station.is_transmitting = true;
+            let frame = peer_data_frame();
+
+            let t0 = tokio::time::Instant::now();
+            station.decode_and_dispatch_audio(&frame).await;
+            let elapsed = t0.elapsed();
+
+            assert_eq!(station.tx_generation, 1, "the ACK must still be sent");
+            assert!(ptt.first(PttState::Tx).is_some());
+            let pre_delay = Duration::from_millis(station.config.radio.ptt_pre_delay_ms);
+            assert!(
+                elapsed <= pre_delay,
+                "an already-keyed station waited {elapsed:?}, more than its {pre_delay:?} pre-delay"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn turnaround_wait_keeps_draining_the_input_ring() {
+            const CHUNK: usize = 960; // 20 ms at 48 kHz
+            const CHUNKS: usize = 27; // 540 ms, more than 3x the ring
+            let mut config = arq_config();
+            config.radio.ptt_pre_delay_ms = 0;
+            let ring = config.audio.buffer_size;
+            assert_eq!(ring, 8192, "the production input ring size");
+            let mut station = EventLoop::new(config).unwrap();
+            install_ptt_log(&mut station);
+            let (mut producer, consumer) = coppa_audio::audio_ring(ring);
+            station.set_audio_in(consumer);
+            let frame = peer_data_frame();
+
+            let writer = async {
+                for _ in 0..CHUNKS {
+                    producer.write(&[0.0; CHUNK]);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            tokio::join!(station.decode_and_dispatch_audio(&frame), writer);
+
+            assert_eq!(station.tx_generation, 1, "the ACK must have been sent");
+            let audio_in = station.audio_in.as_ref().unwrap();
+            assert_eq!(
+                audio_in.overflow_count(),
+                0,
+                "the input ring overflowed while the ACK was held"
+            );
+            assert_eq!(
+                station.pending_busy_wait_audio.len() + audio_in.available(),
+                CHUNKS * CHUNK,
+                "every written sample is held for decode or still in the ring"
+            );
+        }
+
+        // ── Simulated H-090 stage (d): a half-duplex cable loop ──────────
+
+        /// One cable tick: 960 samples at 48 kHz, `run()`'s `audio_poll`
+        /// cadence.
+        const CABLE_TICK: Duration = Duration::from_millis(20);
+        /// The ACK must key at least this long after the peer's PTT-off.
+        const MIN_GUARD_MARGIN: Duration = Duration::from_millis(50);
+        /// Virtual time costs no decode CPU, so one cable tick plus one poll
+        /// covers the simulator's processing latency.
+        const SIM_CEILING_SLACK: Duration = Duration::from_millis(100);
+        /// Virtual time each cable run lasts.
+        const CABLE_RUN: Duration = Duration::from_secs(5);
+
+        struct CableRun {
+            a_edges: Vec<Edge>,
+            b_edges: Vec<Edge>,
+            /// Tick at which the last chunk of `a`'s TX audio was delivered
+            /// to `b`.
+            a_last_sample_at_b: Option<tokio::time::Instant>,
+            a_unacked_bytes: usize,
+            a_in_overflow: u64,
+            b_in_overflow: u64,
+        }
+
+        /// Station `a` sends one ARQ data frame to `b` over the real host path
+        /// (`HostEvent::DataReceived` with `[host] sessionless_tx_enabled`),
+        /// and both real `run()` loops plus the cable are joined in one task.
+        ///
+        /// The cable models half-duplex RF: each tick it moves up to 960
+        /// samples each way, zero-padded (a sound card delivers silence, not
+        /// nothing), and zeroes the samples bound for a station whose PTT is
+        /// keyed, since a keyed rig hears nothing. Input rings are
+        /// `config.audio.buffer_size` (8,192), as `main.rs` sizes them, so a
+        /// hold that stops draining them overflows here too. After
+        /// `CABLE_RUN` of virtual time both loops get `Shutdown`.
+        ///
+        /// With no output worker wired, `transmit_samples`'s headless release
+        /// path holds the sender keyed for its last sample plus a
+        /// `buffer_size` drain (~170 ms) plus `ptt_tail_delay_ms`, so the
+        /// simulated peer releases PTT later than real hardware does (presented
+        /// last sample plus tail). The simulator's minimum guard is therefore
+        /// the stricter one. `docs/testing/cable-loop-turnaround.md` holds the
+        /// hardware counterpart COP-20 runs.
+        async fn run_cable_loop(config: DaemonConfig) -> CableRun {
+            let mut a = EventLoop::new(config.clone()).unwrap();
+            let mut b = EventLoop::new(config.clone()).unwrap();
+            // ARQ timers run on real `std::time::Instant`s with a 5 s initial
+            // RTO; a slow runner must not add a retransmit key-up mid-test.
+            a.arq_tx = Some(ArqTx::new(ArqConfig {
+                initial_rto: Duration::from_secs(60),
+                ..ArqConfig::default()
+            }));
+            let a_ptt = install_ptt_log(&mut a);
+            let b_ptt = install_ptt_log(&mut b);
+            let (a_out_producer, mut a_out) = coppa_audio::audio_ring(1_000_000);
+            let (b_out_producer, mut b_out) = coppa_audio::audio_ring(1_000_000);
+            a.set_audio_out(a_out_producer);
+            b.set_audio_out(b_out_producer);
+            let ring = config.audio.buffer_size;
+            let (mut a_in, a_in_consumer) = coppa_audio::audio_ring(ring);
+            let (mut b_in, b_in_consumer) = coppa_audio::audio_ring(ring);
+            a.set_audio_in(a_in_consumer);
+            b.set_audio_in(b_in_consumer);
+            let (a_events, b_events) = (a.event_sender(), b.event_sender());
+            a_events
+                .send(DaemonEvent::Host(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: b"hello coppa".to_vec(),
+                }))
+                .await
+                .unwrap();
+
+            let mut a_last_sample_at_b = None;
+            let cable = async {
+                let start = tokio::time::Instant::now();
+                let mut tick = tokio::time::interval(CABLE_TICK);
+                let mut chunk = vec![0.0f32; 960];
+                while start.elapsed() < CABLE_RUN {
+                    tick.tick().await;
+                    chunk.fill(0.0);
+                    if a_out.read(&mut chunk) > 0 {
+                        a_last_sample_at_b = Some(tokio::time::Instant::now());
+                    }
+                    if b_ptt.keyed() {
+                        chunk.fill(0.0);
+                    }
+                    b_in.write(&chunk);
+
+                    chunk.fill(0.0);
+                    b_out.read(&mut chunk);
+                    if a_ptt.keyed() {
+                        chunk.fill(0.0);
+                    }
+                    a_in.write(&chunk);
+                }
+                a_events.send(DaemonEvent::Shutdown).await.unwrap();
+                b_events.send(DaemonEvent::Shutdown).await.unwrap();
+            };
+            let (a_result, b_result, ()) = tokio::join!(a.run(), b.run(), cable);
+            a_result.unwrap();
+            b_result.unwrap();
+
+            CableRun {
+                a_edges: a_ptt.edges(),
+                b_edges: b_ptt.edges(),
+                a_last_sample_at_b,
+                a_unacked_bytes: a.arq_tx.as_ref().unwrap().unacked_bytes(),
+                a_in_overflow: a.audio_in.as_ref().unwrap().overflow_count(),
+                b_in_overflow: b.audio_in.as_ref().unwrap().overflow_count(),
+            }
+        }
+
+        struct TurnaroundCheck {
+            /// `b`'s first PTT-on minus `a`'s first PTT-off, required
+            /// `>= MIN_GUARD_MARGIN`.
+            min_guard: Result<Duration, String>,
+            /// `b`'s first PTT-on minus `a_last_sample_at_b`, required
+            /// `<= turnaround + SIM_CEILING_SLACK`.
+            ceiling: Result<Duration, String>,
+        }
+
+        fn check_turnaround(run: &CableRun, turnaround: Duration) -> TurnaroundCheck {
+            let first = |edges: &[Edge], state: PttState, after: Option<tokio::time::Instant>| {
+                edges
+                    .iter()
+                    .find(|edge| edge.1 == state && after.is_none_or(|t| edge.0 >= t))
+                    .map(|edge| edge.0)
+            };
+            let a_on = first(&run.a_edges, PttState::Tx, None);
+            let a_off = a_on.and_then(|on| first(&run.a_edges, PttState::Rx, Some(on)));
+            let b_on = first(&run.b_edges, PttState::Tx, None);
+
+            let min_guard = match (a_off, b_on) {
+                (None, _) => Err("a never released PTT".to_string()),
+                (_, None) => Err("b never keyed an ACK".to_string()),
+                (Some(a_off), Some(b_on)) if b_on < a_off => {
+                    Err(format!("b keyed {:?} before a's PTT-off", a_off - b_on))
+                }
+                (Some(a_off), Some(b_on)) if b_on - a_off < MIN_GUARD_MARGIN => Err(format!(
+                    "b keyed only {:?} after a's PTT-off, need >= {MIN_GUARD_MARGIN:?}",
+                    b_on - a_off
+                )),
+                (Some(a_off), Some(b_on)) => Ok(b_on - a_off),
+            };
+            let limit = turnaround + SIM_CEILING_SLACK;
+            let ceiling = match (run.a_last_sample_at_b, b_on) {
+                (None, _) => Err("a's audio never reached b".to_string()),
+                (_, None) => Err("b never keyed an ACK".to_string()),
+                (Some(last), Some(b_on)) if b_on < last => Err(format!(
+                    "b keyed {:?} before a's last sample arrived",
+                    last - b_on
+                )),
+                (Some(last), Some(b_on)) if b_on - last > limit => Err(format!(
+                    "b keyed {:?} after a's last sample, over the {limit:?} ceiling",
+                    b_on - last
+                )),
+                (Some(last), Some(b_on)) => Ok(b_on - last),
+            };
+            TurnaroundCheck { min_guard, ceiling }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn cable_loop_ack_keys_after_the_peers_real_ptt_off_edge() {
+            let mut config = arq_config();
+            config.host.sessionless_tx_enabled = true;
+            let turnaround = Duration::from_millis(config.radio.turnaround_ms);
+            let run = run_cable_loop(config).await;
+            let check = check_turnaround(&run, turnaround);
+
+            let margin = check.min_guard.expect("minimum guard");
+            let latency = check.ceiling.expect("ceiling");
+            assert!(margin >= MIN_GUARD_MARGIN, "{margin:?}");
+            assert!(latency <= turnaround + SIM_CEILING_SLACK, "{latency:?}");
+            assert_eq!(
+                run.a_unacked_bytes, 0,
+                "the ACK must reach a through the half-duplex cable"
+            );
+            assert_eq!(run.a_in_overflow, 0, "a's input ring overflowed");
+            assert_eq!(run.b_in_overflow, 0, "b's input ring overflowed");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn cable_loop_zero_turnaround_passes_the_ceiling_but_fails_the_minimum_guard() {
+            let mut config = arq_config();
+            config.host.sessionless_tx_enabled = true;
+            config.radio.turnaround_ms = 0;
+            let run = run_cable_loop(config).await;
+            let check = check_turnaround(&run, Duration::ZERO);
+
+            assert!(
+                check.ceiling.is_ok(),
+                "a zero-turnaround station answers fast: {:?}",
+                check.ceiling
+            );
+            let violation = check
+                .min_guard
+                .expect_err("a zero-turnaround station keys while the peer is still keyed");
+            assert!(violation.contains("before a's PTT-off"), "{violation}");
+            assert!(
+                run.a_unacked_bytes > 0,
+                "an ACK sent into a keyed peer is lost"
+            );
         }
     }
 }
