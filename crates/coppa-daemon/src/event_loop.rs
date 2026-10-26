@@ -8599,16 +8599,22 @@ mod tests {
         }
 
         /// Collect lines until a full window passes without another line.
+        /// Command-port responses end in a bare CR (COP-27), so split on `\r`.
         async fn lines_within(
             reader: &mut BufReader<OwnedReadHalf>,
             window: Duration,
         ) -> Vec<String> {
             let mut lines = Vec::new();
             loop {
-                let mut line = String::new();
-                match tokio::time::timeout(window, reader.read_line(&mut line)).await {
+                let mut line = Vec::new();
+                match tokio::time::timeout(window, reader.read_until(b'\r', &mut line)).await {
                     Ok(Ok(0)) | Err(_) => break,
-                    Ok(Ok(_)) => lines.push(line.trim_end().to_string()),
+                    Ok(Ok(_)) => lines.push(
+                        String::from_utf8(line)
+                            .expect("VARA response lines are UTF-8")
+                            .trim()
+                            .to_string(),
+                    ),
                     Ok(Err(error)) => panic!("reading VARA response failed: {error}"),
                 }
             }
@@ -9118,6 +9124,8 @@ mod tests {
         async fn test_buffer_held_until_arq_ack() {
             let mut config = fast_ptt_config();
             config.engine.arq_enabled = true;
+            // COP-29: these exercise the sessionless raw/ARQ path, now opt-in.
+            config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
             let (mut reader, _write_half) =
                 connect_mock_vara_client(&mut event_loop, 19492, 19493).await;
@@ -9226,6 +9234,8 @@ mod tests {
         async fn test_arq_window_full_drop_is_not_counted() {
             let mut config = fast_ptt_config();
             config.engine.arq_enabled = true;
+            // COP-29: these exercise the sessionless raw/ARQ path, now opt-in.
+            config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
             let (mut reader, _write_half) =
                 connect_mock_vara_client(&mut event_loop, 19496, 19497).await;
