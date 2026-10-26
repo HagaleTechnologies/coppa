@@ -14,14 +14,9 @@ use coppa_protocol::cp_negotiator::{ContentAction, CpMode, CpNegotiator};
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu, StationIdPayload};
 use coppa_protocol::modem::max_payload_for_level;
 use coppa_protocol::session::{LinkCapabilities, SessionManager, SessionState};
-<<<<<<< HEAD
 use coppa_protocol::transport::{TransportPdu, TransportType, TRANSPORT_HEADER_SIZE};
-use coppa_radio::{NullPtt, PttControl, PttState};
-=======
-use coppa_protocol::transport::{TransportPdu, TransportType};
 use coppa_radio::band::{self, FrequencyConfig, FrequencyEvidence, GateRefusal};
 use coppa_radio::{NullPtt, PttBackend, PttControl, PttState};
->>>>>>> a81145aa20b841fdaac1e08a29cfd2072a7b2006
 use rand::RngExt;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,6 +61,10 @@ fn min_level_budget() -> usize {
 /// payload bytes it carries -- `BUFFER` counts the unit the host wrote, not
 /// framing (COP-30).
 struct SessionTxChunk {
+    /// The `SessionManager` slot the chunk was framed for. Slots are reused,
+    /// so a session's end must discard its chunks (`discard_session_tx`)
+    /// rather than leave them for whichever session takes the slot next.
+    session_id: u8,
     pdu_bytes: Vec<u8>,
     host_len: usize,
 }
@@ -992,6 +991,7 @@ impl EventLoop {
         let removed = self.session_mgr.cleanup_timed_out();
         for id in removed {
             tracing::warn!(session_id = id, "Session timed out");
+            self.discard_session_tx(id).await;
             self.notify_session(0, SessionNotice::Disconnected).await;
         }
     }
@@ -1194,6 +1194,27 @@ impl EventLoop {
                     tracing::warn!(error = %e, "Failed to encode session data");
                 }
             }
+        }
+    }
+
+    /// Drop the unsent `session_tx_queue` chunks of a session that has ended
+    /// (local or remote DISCONNECT, or timeout), and report the `BUFFER`
+    /// change. Without this the queue keeps transmitting a dead session's
+    /// data on every PTT release, and a reconnect to the same peer could
+    /// deliver those stale bytes into the new session. A chunk already on
+    /// the air stays in `tx_on_air_bytes` until its PTT release, as usual.
+    async fn discard_session_tx(&mut self, session_id: u8) {
+        let before = self.session_tx_queue.len();
+        self.session_tx_queue
+            .retain(|chunk| chunk.session_id != session_id);
+        let dropped = before - self.session_tx_queue.len();
+        if dropped > 0 {
+            tracing::info!(
+                session_id,
+                chunks = dropped,
+                "Session ended; discarding its unsent data"
+            );
+            self.report_buffer().await;
         }
     }
 
@@ -1475,10 +1496,10 @@ impl EventLoop {
                     self.session_mgr
                         .get(id)
                         .filter(|s| s.is_established())
-                        .map(|s| (s.remote.clone(), s.local.clone(), s.ssid))
+                        .map(|s| (id, s.remote.clone(), s.local.clone(), s.ssid))
                 });
 
-                if let Some((remote, local, ssid)) = session_info {
+                if let Some((session_id, remote, local, ssid)) = session_info {
                     // COP-41: one host event is NOT one over-the-air frame.
                     // Split the event into chunks that each encode at the
                     // engine's current speed level (D2: measured via
@@ -1495,6 +1516,7 @@ impl EventLoop {
                         let host_len = chunk.len();
                         let pdu = MacPdu::new_data(remote.clone(), local.clone(), ssid, chunk);
                         self.session_tx_queue.push_back(SessionTxChunk {
+                            session_id,
                             pdu_bytes: pdu.to_bytes(),
                             host_len,
                         });
@@ -1662,6 +1684,9 @@ impl EventLoop {
                     .copied();
 
                 if let Some(id) = session_id {
+                    // The session's unsent chunks end with it; none may
+                    // play after the host is told DISCONNECTED.
+                    self.discard_session_tx(id).await;
                     if let Some(session) = self.session_mgr.get_mut(id) {
                         match session.disconnect() {
                             Ok(disc_pdu) => {
@@ -3519,6 +3544,7 @@ impl EventLoop {
             }
             self.session_mgr.remove(id);
             tracing::info!(remote = %remote, "Session disconnected by remote");
+            self.discard_session_tx(id).await;
             self.notify_session(0, SessionNotice::Disconnected).await;
         } else {
             tracing::debug!(remote = %remote, "DISCONNECT from unknown remote");
@@ -9238,6 +9264,10 @@ mod tests {
             event_loop.is_transmitting = false;
             while !event_loop.tx_queue.is_empty() {
                 event_loop.handle_ptt_change(false).await;
+                // `broadcast_vara` drops lines once the client's 64-line
+                // response channel is full, and nothing in the drain yields
+                // to the forwarder task: let it flush each frame's lines.
+                tokio::task::yield_now().await;
             }
             // Release the final frame's bytes too.
             event_loop.handle_ptt_change(false).await;
@@ -9563,6 +9593,78 @@ mod tests {
             assert!(event_loop.session_tx_queue.is_empty());
         }
 
+        /// A session's unsent chunks die with the session (COP-41 review):
+        /// after a local DISCONNECT, a remote DISCONNECT, or a timeout, the
+        /// queue holds none of its chunks, `BUFFER` stops counting them,
+        /// and the next PTT release keys nothing -- before this, the queue
+        /// kept transmitting the dead session's data on every release.
+        #[tokio::test]
+        async fn ended_session_discards_its_unsent_chunks() {
+            #[derive(Debug, Clone, Copy)]
+            enum End {
+                LocalDisconnect,
+                RemoteDisconnect,
+                Timeout,
+            }
+            for end in [End::LocalDisconnect, End::RemoteDisconnect, End::Timeout] {
+                let mut event_loop = EventLoop::new(session_config()).unwrap();
+                let (producer, mut consumer) = coppa_audio::audio_ring(4_000_000);
+                event_loop.set_audio_out(producer);
+                let id = seed_established(&mut event_loop);
+                // Hold the queue so the whole write stays unsent.
+                event_loop.is_transmitting = true;
+                event_loop
+                    .handle_host_event(HostEvent::DataReceived {
+                        client_id: 1,
+                        data: (0..1000).map(|i| (i % 251) as u8).collect(),
+                    })
+                    .await;
+                assert!(event_loop.session_tx_queue.len() > 1, "{end:?}");
+                assert_eq!(event_loop.buffered_tx_bytes(), 1000, "{end:?}");
+
+                match end {
+                    End::LocalDisconnect => {
+                        event_loop
+                            .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+                            .await;
+                    }
+                    End::RemoteDisconnect => {
+                        let disc = MacPdu::new(
+                            MacFrameType::Disconnect,
+                            Callsign::new("VK3ABC").unwrap(),
+                            Callsign::new("W1AW").unwrap(),
+                            0,
+                            Vec::new(),
+                        );
+                        event_loop.handle_incoming_disconnect(disc).await;
+                    }
+                    End::Timeout => {
+                        // A zero timeout, not a back-dated `Instant`: on
+                        // Windows `Instant` cannot go back past boot.
+                        event_loop.session_mgr.get_mut(id).unwrap().session_timeout =
+                            Duration::ZERO;
+                        event_loop.reap_timed_out_sessions().await;
+                    }
+                }
+                assert!(event_loop.session_mgr.get(id).is_none(), "{end:?}");
+                assert!(event_loop.session_tx_queue.is_empty(), "{end:?}");
+                assert_eq!(event_loop.buffered_tx_bytes(), 0, "{end:?}");
+
+                // Discard whatever the end itself keyed (the local
+                // DISCONNECT frame), then release: no stale chunk may play.
+                let mut buf = vec![0.0f32; 4_000_000];
+                while consumer.read(&mut buf) > 0 {}
+                let frames_before = event_loop.tx_frame_count;
+                event_loop.handle_ptt_change(false).await;
+                assert_eq!(
+                    consumer.read(&mut buf),
+                    0,
+                    "{end:?}: the release must not transmit the ended session's data"
+                );
+                assert_eq!(event_loop.tx_frame_count, frames_before, "{end:?}");
+            }
+        }
+
         /// Unsent session chunks resume after canceled playback, once the
         /// output worker has discarded the canceled frame's buffered audio.
         #[tokio::test(start_paused = true)]
@@ -9836,6 +9938,10 @@ mod tests {
             event_loop.is_transmitting = false;
             while !event_loop.tx_queue.is_empty() {
                 event_loop.handle_ptt_change(false).await;
+                // `broadcast_vara` drops lines once the client's 64-line
+                // response channel is full, and nothing in the drain yields
+                // to the forwarder task: let it flush each frame's lines.
+                tokio::task::yield_now().await;
             }
             event_loop.handle_ptt_change(false).await;
             let lines = read_available_lines(&mut reader).await;
