@@ -41,12 +41,11 @@ type VaraResponseSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<VaraResponse>>>>;
 /// 300 s.
 const VARA_KEEPALIVE_PERIOD: Duration = Duration::from_secs(60);
 
-<<<<<<< HEAD
 /// COP-37: what every transmit path logs, at `ERROR`, when it refuses
 /// because no valid local callsign is in force (`local_callsign` is `None`).
 const NO_CALLSIGN_TX_REFUSAL: &str = "Transmission refused: no valid local callsign; \
      set [engine] callsign or MYCALL before transmitting";
-=======
+
 /// How often `wait_for_rx_turnaround` drains the input ring: `run()`'s
 /// `audio_poll` cadence, so the ring never fills during the hold.
 const TURNAROUND_POLL: Duration = Duration::from_millis(20);
@@ -79,7 +78,6 @@ struct SessionTxChunk {
     pdu_bytes: Vec<u8>,
     host_len: usize,
 }
->>>>>>> 629d93ed6c3bcdb2af402bcd4f9343866ea5ab41
 
 /// The reply a VARA command-port client gets for one command, decided before
 /// the command takes effect. `WRONG` is only for lines coppa does not
@@ -1646,7 +1644,6 @@ impl EventLoop {
                     return;
                 }
 
-<<<<<<< HEAD
                 // COP-37: refuse here, before ARQ registration or queueing,
                 // so a refused payload leaves no outstanding ARQ segment or
                 // `BUFFER` count behind. (An established session above
@@ -1656,30 +1653,6 @@ impl EventLoop {
                     return;
                 }
 
-                // Sessionless TX: raw/ARQ encode path
-                // E6: If ARQ is enabled, wrap data in a TransportPdu before encoding
-                let (seq_opt, tx_bytes) = if self.config.engine.arq_enabled {
-                    if let Some(ref mut arq_tx) = self.arq_tx {
-                        let now = Instant::now();
-                        match arq_tx.send(data.clone(), now) {
-                            Ok(seq) => {
-                                let pdu = TransportPdu::new_reliable(
-                                    self.arq_session_id,
-                                    seq,
-                                    0, // ack_num filled by ARQ layer
-                                    data.clone(),
-                                );
-                                (Some(seq), pdu.to_bytes())
-                            }
-                            Err(e) => {
-                                tracing::warn!(client_id, error = %e, "ARQ window full; dropping TX");
-                                return;
-                            }
-                        }
-                    } else {
-                        (None, data.clone())
-                    }
-=======
                 // Sessionless TX: raw/ARQ encode path.
                 // COP-41: this path chunks the event too. With ARQ enabled,
                 // the whole event's bytes go to `arq_tx_backlog` and
@@ -1691,7 +1664,6 @@ impl EventLoop {
                     self.arq_tx_backlog.extend(data.iter().copied());
                     self.report_buffer().await;
                     self.pump_arq_backlog().await;
->>>>>>> 629d93ed6c3bcdb2af402bcd4f9343866ea5ab41
                 } else {
                     let budget = max_payload_for_level(self.engine.speed_level())
                         .expect("the engine's speed level is always a valid wire level");
@@ -7272,7 +7244,7 @@ mod tests {
     async fn each_transmission_reports_one_tx_audio_level() {
         use coppa_host::websocket::{AudioLevelDirection, AudioLevelState};
 
-        let mut config = DaemonConfig::default();
+        let mut config = tx_config();
         config.radio.ptt_pre_delay_ms = 0;
         let mut event_loop = EventLoop::new(config).unwrap();
         let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
@@ -7308,7 +7280,7 @@ mod tests {
     async fn tune_tone_tx_level_reads_minus_6_peak_minus_12_rms() {
         use coppa_host::websocket::AudioLevelDirection;
 
-        let mut config = DaemonConfig::default();
+        let mut config = tx_config();
         config.radio.ptt_pre_delay_ms = 0;
         let mut event_loop = EventLoop::new(config).unwrap();
         let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
@@ -12294,8 +12266,10 @@ mod tests {
             with_lead_and_trail(&peer.encode_bytes(&pdu.to_bytes()).unwrap())
         }
 
+        /// ARQ on, with `TEST_CALLSIGN` (COP-37) so the station may
+        /// transmit at all.
         fn arq_config() -> DaemonConfig {
-            let mut config = DaemonConfig::default();
+            let mut config = tx_config();
             config.engine.arq_enabled = true;
             config
         }
@@ -12360,7 +12334,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn transmit_with_no_recent_decode_keys_at_once() {
             // (a) No frame ever decoded: no hold.
-            let mut idle = EventLoop::new(DaemonConfig::default()).unwrap();
+            let mut idle = EventLoop::new(tx_config()).unwrap();
             let idle_ptt = install_ptt_log(&mut idle);
             let t0 = tokio::time::Instant::now();
             idle.transmit_samples(&[0.1; 4800]).await;
@@ -12368,7 +12342,7 @@ mod tests {
 
             // (b) The last decode is older than the turnaround: no hold. ARQ is
             // off, so the decode itself transmits nothing.
-            let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+            let mut station = EventLoop::new(tx_config()).unwrap();
             let ptt = install_ptt_log(&mut station);
             station.decode_and_dispatch_audio(&peer_data_frame()).await;
             assert!(
