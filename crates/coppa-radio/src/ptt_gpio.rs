@@ -44,7 +44,8 @@ pub trait GpioWriter: Send {
 
 /// Real sysfs-backed GPIO line: writes `"1"`/`"0"` to
 /// `/sys/class/gpio/gpio<N>/value`. See the module docs for the export/
-/// permissions setup this assumes. Unexports the pin on drop.
+/// permissions setup this assumes. Unexports the pin on drop; `GpioPtt::drop`
+/// lowers it first.
 #[cfg(target_os = "linux")]
 pub struct SysfsGpio {
     pin: u32,
@@ -94,6 +95,8 @@ impl Drop for SysfsGpio {
 ///
 /// Generic over `W: GpioWriter` so it can be driven by a real exported pin
 /// (`GpioPtt::open`, Linux only) or by a mock in tests (`GpioPtt::with_writer`).
+///
+/// Releases PTT on drop if keyed.
 pub struct GpioPtt<W: GpioWriter> {
     pin: u32,
     inverted: bool,
@@ -149,22 +152,79 @@ impl<W: GpioWriter> PttControl for GpioPtt<W> {
     }
 }
 
+impl<W: GpioWriter> Drop for GpioPtt<W> {
+    /// COP-31: drive the PTT line to its RX level if this handle left it
+    /// keyed (`state` only changes on a successful write).
+    fn drop(&mut self) {
+        // This runs before the writer's own `Drop` (fields drop after the
+        // containing struct's `drop`), so `SysfsGpio::drop` unexports an
+        // already-lowered pin.
+        if self.state == PttState::Tx {
+            if let Err(e) = PttControl::set_ptt(self, PttState::Rx) {
+                eprintln!(
+                    "GpioPtt: failed to release PTT on GPIO pin {} on drop: {e}",
+                    self.pin
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PttBackend;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
-    /// Loopback mock: records every GPIO level write instead of touching
-    /// real hardware.
+    /// Loopback mock: records every successful GPIO level write instead of
+    /// touching real hardware. Clones share the log, so writes made while the
+    /// owning `GpioPtt` drops stay observable.
     #[derive(Clone, Default)]
     struct MockGpio {
         writes: Arc<Mutex<Vec<bool>>>,
+        /// When set, the next write fails (and is not recorded).
+        fail_next_write: Arc<AtomicBool>,
     }
 
     impl GpioWriter for MockGpio {
         fn write_value(&mut self, high: bool) -> Result<()> {
+            if self.fail_next_write.swap(false, Ordering::SeqCst) {
+                anyhow::bail!("mock GPIO write failure");
+            }
             self.writes.lock().unwrap().push(high);
             Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum GpioEvent {
+        High,
+        Low,
+        Unexported,
+    }
+
+    /// Mock writer whose own `Drop` records an `Unexported` marker, standing
+    /// in for `SysfsGpio`'s unexport-on-drop.
+    struct UnexportingGpio {
+        log: Arc<Mutex<Vec<GpioEvent>>>,
+    }
+
+    impl GpioWriter for UnexportingGpio {
+        fn write_value(&mut self, high: bool) -> Result<()> {
+            let event = if high {
+                GpioEvent::High
+            } else {
+                GpioEvent::Low
+            };
+            self.log.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    impl Drop for UnexportingGpio {
+        fn drop(&mut self) {
+            self.log.lock().unwrap().push(GpioEvent::Unexported);
         }
     }
 
@@ -202,6 +262,71 @@ mod tests {
             vec![false, true],
             "inverted PTT should drive the line LOW on TX and HIGH on RX"
         );
+    }
+
+    #[test]
+    fn dropping_a_keyed_gpio_ptt_drives_the_line_to_rx() {
+        for (inverted, expected) in [(false, [true, false]), (true, [false, true])] {
+            let mock = MockGpio::default();
+            let mut ptt = GpioPtt::with_writer(17, inverted, mock.clone());
+            ptt.set_ptt(PttState::Tx).unwrap();
+            drop(ptt);
+            assert_eq!(
+                *mock.writes.lock().unwrap(),
+                expected,
+                "inverted = {inverted}"
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_an_unkeyed_gpio_ptt_writes_nothing() {
+        let mock = MockGpio::default();
+        drop(GpioPtt::with_writer(17, false, mock.clone()));
+        assert!(mock.writes.lock().unwrap().is_empty());
+
+        // Released explicitly before the drop: nothing more is written.
+        let mock = MockGpio::default();
+        let mut ptt = GpioPtt::with_writer(17, false, mock.clone());
+        ptt.set_ptt(PttState::Tx).unwrap();
+        ptt.set_ptt(PttState::Rx).unwrap();
+        drop(ptt);
+        assert_eq!(*mock.writes.lock().unwrap(), vec![true, false]);
+    }
+
+    #[test]
+    fn a_failed_gpio_release_is_retried_on_drop() {
+        let mock = MockGpio::default();
+        let mut ptt = GpioPtt::with_writer(17, false, mock.clone());
+        ptt.set_ptt(PttState::Tx).unwrap();
+        mock.fail_next_write.store(true, Ordering::SeqCst);
+        assert!(ptt.set_ptt(PttState::Rx).is_err());
+        assert_eq!(ptt.get_ptt().unwrap(), PttState::Tx, "still keyed");
+        drop(ptt);
+        assert_eq!(*mock.writes.lock().unwrap(), vec![true, false]);
+    }
+
+    #[test]
+    fn gpio_release_runs_before_the_writer_is_dropped() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let writer = UnexportingGpio { log: log.clone() };
+        let mut ptt = GpioPtt::with_writer(17, false, writer);
+        ptt.set_ptt(PttState::Tx).unwrap();
+        drop(ptt);
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![GpioEvent::High, GpioEvent::Low, GpioEvent::Unexported]
+        );
+    }
+
+    #[test]
+    fn dropping_a_boxed_backend_releases_through_ptt_backend() {
+        let mock = MockGpio::default();
+        let mut backend =
+            PttBackend::Other(Box::new(GpioPtt::with_writer(17, false, mock.clone())));
+        backend.set_ptt(PttState::Tx).unwrap();
+        drop(backend);
+        assert_eq!(*mock.writes.lock().unwrap(), vec![true, false]);
     }
 
     #[cfg(target_os = "linux")]

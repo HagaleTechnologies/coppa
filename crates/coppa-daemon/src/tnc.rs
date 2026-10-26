@@ -272,6 +272,11 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
         println!("PTT: null (no PTT configured)");
         Box::new(NullPtt::new())
     };
+    // COP-31: every backend assumes RX at construction; make the rig match,
+    // so a restart un-keys a transmitter an earlier run left keyed.
+    if let Err(e) = ptt.set_ptt(PttState::Rx) {
+        eprintln!("WARNING: could not release PTT at startup: {e}");
+    }
 
     // -------------------------------------------------------------------------
     // 3. Audio ring buffers
@@ -437,6 +442,20 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
     let mut tx_tick = tokio::time::interval(PROGRESS_TICK);
     tx_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // COP-31: SIGTERM (`systemctl stop`, `kill`) shuts down like Ctrl-C.
+    // `select!` branches cannot carry `#[cfg]`, so the platform difference
+    // lives in this future: it resolves on SIGTERM on Unix and never
+    // elsewhere.
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let terminate = async move {
+        #[cfg(unix)]
+        sigterm.recv().await;
+        #[cfg(not(unix))]
+        std::future::pending::<()>().await;
+    };
+    tokio::pin!(terminate);
+
     println!("TNC ready.");
 
     loop {
@@ -462,16 +481,30 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
             // Ctrl-C: graceful shutdown
             _ = tokio::signal::ctrl_c() => {
                 println!("\nTNC shutting down...");
-                shutdown.store(true, Ordering::Release);
-                if tnc_tx.is_busy() {
-                    let _ = ptt.set_ptt(PttState::Rx);
-                }
+                shut_down_tnc(&shutdown, &tnc_tx, ptt.as_mut());
+                break;
+            }
+
+            // SIGTERM: the same graceful shutdown (COP-31)
+            _ = &mut terminate => {
+                println!("\nTNC shutting down (SIGTERM)...");
+                shut_down_tnc(&shutdown, &tnc_tx, ptt.as_mut());
                 break;
             }
         }
     }
 
     Ok(())
+}
+
+/// Stop the TNC: tell the audio threads to stop and, if a frame is keyed or
+/// queued, release PTT. Shared by `run_tnc`'s Ctrl-C and SIGTERM branches so
+/// the two cannot drift.
+fn shut_down_tnc(shutdown: &AtomicBool, tnc_tx: &TncTx, ptt: &mut dyn PttControl) {
+    shutdown.store(true, Ordering::Release);
+    if tnc_tx.is_busy() {
+        let _ = ptt.set_ptt(PttState::Rx);
+    }
 }
 
 #[cfg(test)]

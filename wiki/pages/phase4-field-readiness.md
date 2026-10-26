@@ -55,6 +55,14 @@ a real bug — breaking them will reintroduce that bug.
   newest transmission's generation-tagged `TxComplete`. Output failure, 5 s
   without playback progress, or `max_tx_duration_s` cancels and unkeys; no
   hardware/on-air test has validated the timing yet.
+- **PTT is released on every exit path (COP-31).** Four layers: backend
+  `Drop` (rigctld, serial, GPIO), an explicit release at shutdown and at
+  startup, an in-loop backstop on the 500 ms tick, and an out-of-process
+  `coppad --ptt-guardian` for rigctld/GPIO that releases after a SIGKILL or
+  crash. `EventLoop::set_ptt` is the only place the guardian is told about PTT
+  state, so any new direct `self.ptt.set_ptt` call must report to it too, or
+  the guardian will miss a key or fire a duplicate release. Exit-path table
+  and residuals: `docs/OPERATING.md`, "PTT safety when coppad stops".
 - **Every ARQ retransmission must call `ArqTx::mark_retransmitted`.** Before
   this was wired, `get_retransmits`'s expiry check never advanced: every
   unacked segment retransmitted every 500 ms forever, and the `max_retransmit`

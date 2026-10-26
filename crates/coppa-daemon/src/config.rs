@@ -68,6 +68,10 @@ pub struct RadioConfig {
     /// for the HF/VHF wideband gate when the exact dial frequency is not
     /// stated.
     pub band: Option<String>,
+    /// COP-31: spawn the PTT guardian for rigctld/GPIO PTT (see
+    /// `ptt_guardian`): a helper process that releases PTT if coppad dies
+    /// while transmitting. Ignored for `none`, `vox` and serial PTT.
+    pub ptt_guardian: bool,
 }
 
 /// Which serial control line a `PttConfig::Serial` should drive.
@@ -424,6 +428,7 @@ impl Default for RadioConfig {
             turnaround_ms: 500,
             frequency_hz: None,
             band: None,
+            ptt_guardian: true,
         }
     }
 }
@@ -920,6 +925,15 @@ beacon_interval_secs = 600
         let parsed = config.radio.frequency_config().unwrap();
         assert_eq!(parsed.stated_hz, Some(50_313_000));
         assert_eq!(parsed.band.unwrap().label, "6m");
+    }
+
+    #[test]
+    fn ptt_guardian_defaults_on_and_can_be_disabled() {
+        assert!(RadioConfig::default().ptt_guardian);
+        let config: DaemonConfig = toml::from_str("[radio]\nptt_method = \"none\"\n").unwrap();
+        assert!(config.radio.ptt_guardian, "absent key keeps the default");
+        let config: DaemonConfig = toml::from_str("[radio]\nptt_guardian = false\n").unwrap();
+        assert!(!config.radio.ptt_guardian);
     }
 
     #[test]
