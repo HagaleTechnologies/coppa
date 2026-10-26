@@ -116,6 +116,12 @@ impl FakeRigctld {
                 while !stop.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            // BSD/macOS accepted sockets inherit the
+                            // listener's O_NONBLOCK; serve() needs blocking
+                            // reads or WouldBlock reads as EOF.
+                            stream
+                                .set_nonblocking(false)
+                                .expect("blocking fake rigctld stream");
                             let conn = {
                                 let mut s = state.lock().unwrap();
                                 let conn = s.connections;
