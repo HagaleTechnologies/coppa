@@ -40,11 +40,10 @@ type VaraResponseSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<VaraResponse>>>>;
 /// 300 s.
 const VARA_KEEPALIVE_PERIOD: Duration = Duration::from_secs(60);
 
-<<<<<<< HEAD
 /// How often `wait_for_rx_turnaround` drains the input ring: `run()`'s
 /// `audio_poll` cadence, so the ring never fills during the hold.
 const TURNAROUND_POLL: Duration = Duration::from_millis(20);
-=======
+
 /// Smallest one-codeword payload budget on the whole speed ladder (COP-41,
 /// D4), derived rather than hardcoded: `min(max_payload_for_level(l))` for
 /// `l` in 1..=9. ARQ chunks are sized against THIS, not the current level,
@@ -73,7 +72,6 @@ struct SessionTxChunk {
     pdu_bytes: Vec<u8>,
     host_len: usize,
 }
->>>>>>> 53a17e398a46b25d172e045b21e47d048fcfd2ec
 
 /// The reply a VARA command-port client gets for one command, decided before
 /// the command takes effect. `WRONG` is only for lines coppa does not
