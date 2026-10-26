@@ -187,7 +187,27 @@ impl CoppaCore {
     /// times carrier spacing (2400 on the HF profiles, long or short CP; 5600
     /// on VHF wide). The VARA `CONNECTED` line reports it.
     pub fn occupied_bandwidth_hz(&self) -> u32 {
-        let profile = self.transceiver.profile();
+        Self::profile_occupied_hz(self.transceiver.profile())
+    }
+
+    /// Occupied bandwidth, in Hz, of the profile `set_speed_level(level)` would
+    /// select on this engine's band and CP mode, without rebuilding anything
+    /// (COP-21). A caller that holds RF-frequency evidence asks this before
+    /// committing to a level: 5600 for a level-derived engine at level 5+, 2400
+    /// for any level on an HF-bound engine. `level` is not validated.
+    ///
+    /// It shares `select_ofdm_profile` with every rebuild, so the answer cannot
+    /// disagree with what `set_speed_level` would build.
+    pub fn occupied_bandwidth_hz_at(&self, level: u8) -> u32 {
+        Self::profile_occupied_hz(&Self::select_ofdm_profile(
+            level,
+            self.config.cp_mode,
+            self.config.ofdm_band,
+        ))
+    }
+
+    /// Active carriers times carrier spacing, rounded to whole Hz.
+    fn profile_occupied_hz(profile: &CoppaProfile) -> u32 {
         (profile.total_active_carriers() as f32 * profile.carrier_spacing_hz()).round() as u32
     }
 
@@ -500,6 +520,29 @@ impl CoppaCore {
         self.check_level(level, Self::resolves_to_vhf(level, self.config.ofdm_band))?;
         let mut config = self.config.clone();
         config.speed_level = level;
+        self.reconfigure(config);
+        Ok(())
+    }
+
+    /// Rebind this engine's OFDM band in place (COP-21), keeping its speed level
+    /// and negotiated CP mode.
+    ///
+    /// Like `set_speed_level`, this rebuilds the transceiver and streaming
+    /// receiver (any samples buffered mid-frame in the streaming receiver are
+    /// discarded). The engine itself stays frequency-blind: a caller that holds
+    /// RF-frequency evidence (`coppad` does) decides when to call this, typically
+    /// after `occupied_bandwidth_hz_at` shows a level would be wideband.
+    ///
+    /// Returns an error, leaving this engine's current config untouched, if the
+    /// current speed level is not available on `band` (level 9 on HF): lower the
+    /// level first.
+    pub fn set_ofdm_band(&mut self, band: OfdmBand) -> Result<()> {
+        self.check_level(
+            self.config.speed_level,
+            Self::resolves_to_vhf(self.config.speed_level, band),
+        )?;
+        let mut config = self.config.clone();
+        config.ofdm_band = band;
         self.reconfigure(config);
         Ok(())
     }
@@ -1541,5 +1584,76 @@ mod tests {
             header.bandwidth,
             CoppaProfile::hf_standard_short_cp().bandwidth_id
         );
+    }
+
+    // ── COP-21: band rebinding for frequency-aware callers ────────────────
+
+    #[test]
+    fn occupied_bandwidth_hz_at_reports_the_profile_a_level_would_select() {
+        let level_derived = CoppaCore::new();
+        assert_eq!(level_derived.occupied_bandwidth_hz_at(4), 2400);
+        assert_eq!(level_derived.occupied_bandwidth_hz_at(5), 5600);
+        assert_eq!(level_derived.occupied_bandwidth_hz_at(9), 5600);
+        let hf = CoppaCore::from_profile(&crate::HF_STANDARD);
+        assert_eq!(hf.occupied_bandwidth_hz_at(5), 2400);
+        assert_eq!(hf.occupied_bandwidth_hz_at(8), 2400);
+        let vhf = CoppaCore::from_profile(&crate::VHF_FAST);
+        assert_eq!(vhf.occupied_bandwidth_hz_at(1), 5600);
+        // A pure query: nothing was rebuilt.
+        assert_eq!(level_derived.speed_level(), 1);
+        assert_eq!(level_derived.occupied_bandwidth_hz(), 2400);
+    }
+
+    #[test]
+    fn set_ofdm_band_hf_moves_a_level_derived_engine_off_vhf_wide() {
+        let mut core = CoppaCore::new();
+        core.set_speed_level(5).unwrap();
+        assert!(
+            core.on_vhf_profile(),
+            "test premise: level-derived level 5 is vhf_wide"
+        );
+        core.set_ofdm_band(OfdmBand::Hf)
+            .expect("level 5 is available on HF");
+        assert_eq!(core.config().ofdm_band, OfdmBand::Hf);
+        assert_eq!(core.speed_level(), 5, "the level is kept");
+        assert!(!core.on_vhf_profile());
+        assert_eq!(core.occupied_bandwidth_hz(), 2400);
+        let samples = core.encode("cop21").unwrap();
+        assert_eq!(
+            core.decode(&samples).unwrap(),
+            "cop21",
+            "a real hf_standard level-5 frame"
+        );
+        assert_eq!(core.available_speed_levels(), (1..=8).collect::<Vec<_>>());
+        core.set_speed_level(8).unwrap();
+        assert_eq!(
+            core.occupied_bandwidth_hz(),
+            2400,
+            "later level changes stay on HF"
+        );
+    }
+
+    #[test]
+    fn set_ofdm_band_keeps_the_negotiated_cp_mode() {
+        let mut core = CoppaCore::new();
+        core.set_cp_profile(CpMode::ShortCp);
+        core.set_speed_level(5).unwrap(); // vhf_wide; ShortCp dormant
+        core.set_ofdm_band(OfdmBand::Hf).unwrap();
+        assert_eq!(core.cp_mode(), CpMode::ShortCp);
+        assert_eq!(
+            core.transceiver.profile().cp_samples,
+            CoppaProfile::hf_standard_short_cp().cp_samples
+        );
+    }
+
+    #[test]
+    fn set_ofdm_band_rejects_a_level_the_band_cannot_carry() {
+        let mut core = CoppaCore::new();
+        core.set_speed_level(9).unwrap();
+        let err = core.set_ofdm_band(OfdmBand::Hf).unwrap_err().to_string();
+        assert!(err.contains("not available on an HF profile"), "{err}");
+        assert_eq!(core.config().ofdm_band, OfdmBand::LevelDerived, "untouched");
+        assert_eq!(core.speed_level(), 9);
+        assert!(core.on_vhf_profile());
     }
 }

@@ -49,3 +49,10 @@ Narrowband HF profiles need no source. The band table in
 `crates/coppa-radio/src/band.rs` is a minimal US subset (160m-23cm); dispensa
 ADR-0006 remains the tenant-wide convention. See `coppad.toml.example` and the
 COP-40 note in `CLAUDE.md`'s Known Limitations for what stays ungated.
+
+For a level-derived engine (an unrecognized `[engine] profile`), `coppad`
+checks the same evidence when a speed level would select `vhf_wide` (COP-21).
+Below 29.7 MHz, or with no source, it rebinds the engine to HF for the rest of
+the session (levels 1-8 on `hf_standard`) instead of letting the gate silence
+it. An explicit `VHF_FAST` is refused, not rebound. See
+`EventLoop::apply_speed_level` in `crates/coppa-daemon/src/event_loop.rs`.
