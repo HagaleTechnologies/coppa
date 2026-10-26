@@ -39,7 +39,11 @@ async fn main() -> Result<()> {
             let config = load_config(&source)?;
             init_tracing(cli.log_level);
             log_banner();
-            run_daemon(config).await
+            // COP-32: a fatal error after logging starts is logged at ERROR,
+            // then returned so `main` prints `Error: ...` and exits 1.
+            run_daemon(config)
+                .await
+                .inspect_err(|e| tracing::error!("{e:#}"))
         }
     }
 }
@@ -114,6 +118,11 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         ptt_method = %config.radio.ptt_method,
         "Daemon configuration loaded"
     );
+
+    // COP-32: config checks first, before any hardware or socket is touched.
+    config.check_sample_rate().map_err(anyhow::Error::msg)?;
+    #[cfg(not(feature = "cpal-backend"))]
+    check_no_named_devices(&config.audio)?;
 
     // Create event loop. Fails loudly (rather than silently falling back to
     // NullPtt) if [radio] ptt_method doesn't parse or names an
@@ -396,5 +405,24 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     event_loop.run().await?;
 
     tracing::info!("Daemon stopped");
+    Ok(())
+}
+
+/// COP-32: a build without `cpal-backend` opens no audio device, so a named
+/// one can never be found.
+#[cfg(not(feature = "cpal-backend"))]
+fn check_no_named_devices(audio: &config::AudioConfig) -> Result<()> {
+    for (key, name) in [
+        ("input_device", &audio.input_device),
+        ("output_device", &audio.output_device),
+    ] {
+        if !name.is_empty() {
+            anyhow::bail!(
+                "[audio] {key} = {name:?} is set, but this coppad was built without the \
+                 cpal-backend feature and opens no audio devices; rebuild with \
+                 --features cpal-backend, or clear [audio] {key}"
+            );
+        }
+    }
     Ok(())
 }

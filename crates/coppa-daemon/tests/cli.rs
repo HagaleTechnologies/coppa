@@ -706,3 +706,60 @@ fn log_level_overrides_rust_log_on_a_running_daemon() {
     assert_eq!(stdout, "", "--log-level off must silence tracing");
     assert_eq!(stderr, "");
 }
+
+// --- startup failures (COP-32) ----------------------------------------------
+//
+// A condition that stops the daemon doing its job is an ERROR, never
+// `Daemon ready`. Config and bind failures also exit 1 with `Error: ...` on
+// stderr. Each fails before any audio device opens, so these run in every
+// build that compiles them.
+
+/// Run the daemon on `toml` and require a fatal startup error: exit 1, an
+/// ERROR log line, no readiness, and `Error: <stderr_prefix>` on stderr.
+/// Returns (stdout, stderr).
+fn run_startup_error(toml: &str, stderr_prefix: &str) -> (String, String) {
+    let dir = TempDir::new("startup-error");
+    dir.write("station.toml", toml);
+    let args = ["--config", "station.toml"];
+    let out = run(dir.path(), &args);
+    out.assert_code(1, &args);
+    assert!(out.stdout.contains("ERROR"), "{}", out.stdout);
+    assert!(
+        !out.stdout.contains("Daemon ready") && !out.stdout.contains("Event loop started"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stderr.starts_with(&format!("Error: {stderr_prefix}")),
+        "{}",
+        out.stderr
+    );
+    (out.stdout, out.stderr)
+}
+
+#[test]
+fn an_unknown_ptt_method_logs_an_error_and_exits_1() {
+    run_startup_error(
+        "[radio]\nptt_method = \"carrier-pigeon\"\n",
+        "failed to start daemon event loop: invalid [radio] ptt_method",
+    );
+}
+
+#[test]
+fn a_sample_rate_the_engine_does_not_run_at_is_a_startup_error() {
+    let (stdout, _) = run_startup_error(
+        "[audio]\nsample_rate = 44100\n",
+        "[audio] sample_rate = 44100 is not supported",
+    );
+    assert!(stdout.contains("set sample_rate = 48000"), "{stdout}");
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn a_named_audio_device_without_the_cpal_backend_is_a_startup_error() {
+    run_startup_error(
+        "[audio]\ninput_device = \"USB Audio CODEC\"\n",
+        "[audio] input_device = \"USB Audio CODEC\" is set, but this coppad was built \
+         without the cpal-backend feature",
+    );
+}
