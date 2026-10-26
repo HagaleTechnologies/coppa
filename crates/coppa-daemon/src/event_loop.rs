@@ -201,6 +201,10 @@ pub struct EventLoop {
     /// while it is set, so held payloads go out once the rig is back on a
     /// legal frequency instead of waiting for the next host enqueue.
     tx_held_by_frequency_gate: bool,
+    /// COP-41: `tx_held_by_frequency_gate`'s counterpart for
+    /// `session_tx_queue`, set by `drain_session_tx_queue` and retried by
+    /// the same poll.
+    session_tx_held_by_frequency_gate: bool,
     /// Optional sender for host responses (decoded data, status updates).
     response_tx: Option<mpsc::Sender<coppa_host::HostResponse>>,
     /// Playback progress from the audio output worker. `None` when no
@@ -520,6 +524,7 @@ impl EventLoop {
             ptt,
             radio_frequency,
             tx_held_by_frequency_gate: false,
+            session_tx_held_by_frequency_gate: false,
             response_tx: None,
             output_feedback: None,
             tx_generation: 0,
@@ -997,12 +1002,15 @@ impl EventLoop {
         }
     }
 
-    /// COP-40: retry a TX-queue drain the wideband gate held back. A no-op
-    /// unless the last drain attempt was refused, so it never changes when
-    /// an ordinary queue drains.
+    /// COP-40: retry a TX-queue (or, COP-41, session-queue) drain the
+    /// wideband gate held back. A no-op unless the last drain attempt was
+    /// refused, so it never changes when an ordinary queue drains.
     async fn retry_held_tx_drain(&mut self) {
         if self.tx_held_by_frequency_gate {
             self.try_drain_tx_queue().await;
+        }
+        if self.session_tx_held_by_frequency_gate {
+            self.drain_session_tx_queue().await;
         }
     }
 
@@ -1171,6 +1179,15 @@ impl EventLoop {
         if self.is_transmitting {
             return;
         }
+        // COP-40, as in `try_drain_tx_queue`: hold the chunks (rather than
+        // pop one and have `transmit_samples` refuse it -- session data has
+        // no MAC-level retry) while the wideband gate refuses;
+        // `retry_held_tx_drain` tries again on the next poll.
+        self.session_tx_held_by_frequency_gate =
+            !self.session_tx_queue.is_empty() && self.wideband_frequency_check().is_err();
+        if self.session_tx_held_by_frequency_gate {
+            return;
+        }
         if let Some(chunk) = self.session_tx_queue.pop_front() {
             match self.engine.encode_bytes(&chunk.pdu_bytes) {
                 Ok(samples) => {
@@ -1183,7 +1200,19 @@ impl EventLoop {
                     // 3-way async call cycle `try_drain_tx_queue` documents;
                     // one edge needs indirection to give the compiler a
                     // finite-sized future.
+                    let generation = self.tx_generation;
                     Box::pin(self.transmit_samples(&samples)).await;
+                    if self.tx_generation == generation {
+                        // The gate passed above but refused after the
+                        // courtesy wait (the one `transmit_samples` path
+                        // that keys nothing and leaves `tx_generation`
+                        // alone). Put the chunk back at the head, so the
+                        // retry poll resumes the stream without a hole.
+                        self.session_tx_queue.push_front(chunk);
+                        self.session_tx_held_by_frequency_gate = true;
+                        self.report_buffer().await;
+                        return;
+                    }
                     self.tx_frame_count += 1;
                     tracing::debug!(
                         frame = self.tx_frame_count,
@@ -1527,19 +1556,6 @@ impl EventLoop {
                     return;
                 }
 
-<<<<<<< HEAD
-                // Fall through: no session — use raw/ARQ encode path.
-                // COP-41: this path chunks the event too. With ARQ enabled,
-                // the whole event's bytes go to `arq_tx_backlog` and
-                // `pump_arq_backlog` segments them against the
-                // ladder-minimum budget as window space allows (D4/D5) --
-                // window-full is a normal pump stop (bytes are held, never
-                // dropped), not the drop-with-warning it used to be.
-                if self.config.engine.arq_enabled && self.arq_tx.is_some() {
-                    self.arq_tx_backlog.extend(data.iter().copied());
-                    self.report_buffer().await;
-                    self.pump_arq_backlog().await;
-=======
                 // No established session (none at all, or one still
                 // connecting): drop rather than key the transmitter for
                 // nobody, unless the operator opted into sessionless TX.
@@ -1552,30 +1568,17 @@ impl EventLoop {
                     return;
                 }
 
-                // Sessionless TX: raw/ARQ encode path
-                // E6: If ARQ is enabled, wrap data in a TransportPdu before encoding
-                let (seq_opt, tx_bytes) = if self.config.engine.arq_enabled {
-                    if let Some(ref mut arq_tx) = self.arq_tx {
-                        let now = Instant::now();
-                        match arq_tx.send(data.clone(), now) {
-                            Ok(seq) => {
-                                let pdu = TransportPdu::new_reliable(
-                                    self.arq_session_id,
-                                    seq,
-                                    0, // ack_num filled by ARQ layer
-                                    data.clone(),
-                                );
-                                (Some(seq), pdu.to_bytes())
-                            }
-                            Err(e) => {
-                                tracing::warn!(client_id, error = %e, "ARQ window full; dropping TX");
-                                return;
-                            }
-                        }
-                    } else {
-                        (None, data.clone())
-                    }
->>>>>>> af9c3256dc472ce3cf9fd03666d6d651c553ec96
+                // Sessionless TX: raw/ARQ encode path.
+                // COP-41: this path chunks the event too. With ARQ enabled,
+                // the whole event's bytes go to `arq_tx_backlog` and
+                // `pump_arq_backlog` segments them against the
+                // ladder-minimum budget as window space allows (D4/D5) --
+                // window-full is a normal pump stop (bytes are held, never
+                // dropped), not the drop-with-warning it used to be.
+                if self.config.engine.arq_enabled && self.arq_tx.is_some() {
+                    self.arq_tx_backlog.extend(data.iter().copied());
+                    self.report_buffer().await;
+                    self.pump_arq_backlog().await;
                 } else {
                     let budget = max_payload_for_level(self.engine.speed_level())
                         .expect("the engine's speed level is always a valid wire level");
@@ -2357,6 +2360,7 @@ impl EventLoop {
                 // remain queued so the 500 ms `retry_held_tx_drain` poll
                 // resumes the queue once the gate reopens.
                 self.tx_held_by_frequency_gate = !self.tx_queue.is_empty();
+                self.session_tx_held_by_frequency_gate = !self.session_tx_queue.is_empty();
             }
             return;
         }
@@ -9425,7 +9429,9 @@ mod tests {
         /// completion would trigger.
         #[tokio::test]
         async fn test_buffer_telemetry_counts_bytes_and_drains_on_ptt_release() {
-            let config = fast_ptt_config();
+            let mut config = fast_ptt_config();
+            // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
+            config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
             let (mut reader, _write_half) =
                 connect_mock_vara_client(&mut event_loop, 19490, 19491).await;
@@ -9956,6 +9962,8 @@ mod tests {
         async fn large_arq_write_fills_window_then_pumps_on_ack() {
             let mut config = fast_ptt_config();
             config.engine.arq_enabled = true;
+            // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
+            config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
             let (mut reader, _write_half) =
                 connect_mock_vara_client(&mut event_loop, 19500, 19501).await;
@@ -10042,6 +10050,8 @@ mod tests {
         async fn arq_chunks_encode_at_every_level() {
             let mut config = fast_ptt_config();
             config.engine.arq_enabled = true;
+            // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
+            config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
             // Hold the queue so the window's segments stay inspectable.
             event_loop.is_transmitting = true;
@@ -10096,7 +10106,9 @@ mod tests {
         /// draining one frame per PTT release down to `BUFFER 0`.
         #[tokio::test]
         async fn large_raw_write_chunks_into_modem_sized_frames() {
-            let config = fast_ptt_config();
+            let mut config = fast_ptt_config();
+            // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
+            config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
             let (mut reader, _write_half) =
                 connect_mock_vara_client(&mut event_loop, 19502, 19503).await;
@@ -10153,7 +10165,9 @@ mod tests {
         /// random bytes -> 182 encoded > the 117-byte level-2 budget).
         #[tokio::test]
         async fn incompressible_oversize_write_is_split_not_dropped() {
-            let config = fast_ptt_config();
+            let mut config = fast_ptt_config();
+            // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
+            config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
             let (producer, mut consumer) = coppa_audio::audio_ring(4_000_000);
             event_loop.set_audio_out(producer);
@@ -10194,7 +10208,10 @@ mod tests {
         /// transmit it).
         #[tokio::test]
         async fn empty_write_produces_no_frame_or_buffer_line() {
-            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            let mut config = session_config();
+            // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
+            config.host.sessionless_tx_enabled = true;
+            let mut event_loop = EventLoop::new(config).unwrap();
             let (mut reader, _write_half) =
                 connect_mock_vara_client(&mut event_loop, 19504, 19505).await;
             let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
@@ -11280,6 +11297,134 @@ mod tests {
                 event_loop.tx_generation, 1,
                 "the remaining payload went out"
             );
+        }
+
+        /// One established-session chunk carrying `payload`, as the
+        /// `DataReceived` session arm queues it.
+        fn session_chunk(payload: &[u8]) -> SessionTxChunk {
+            let pdu = MacPdu::new_data(
+                Callsign::new("W1AW").unwrap(),
+                Callsign::new("VK3ABC").unwrap(),
+                0,
+                payload.to_vec(),
+            );
+            SessionTxChunk {
+                session_id: 0,
+                pdu_bytes: pdu.to_bytes(),
+                host_len: payload.len(),
+            }
+        }
+
+        /// COP-41 review: established-session chunks are held, not popped
+        /// into a refusal and lost, while the gate refuses between chunks
+        /// (session data has no MAC-level retry), and the ordinary retry
+        /// poll resumes them once the rig is back on 2m -- no PTT release
+        /// or host write is needed to restart the stream.
+        #[tokio::test]
+        async fn held_session_chunks_drain_once_the_rig_is_back_on_vhf() {
+            let rig = fake_rigctld("144500000");
+            let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            for payload in [&b"first"[..], b"second"] {
+                event_loop
+                    .session_tx_queue
+                    .push_back(session_chunk(payload));
+            }
+            *rig.answer.lock().unwrap() = "14074000".into();
+            event_loop.drain_session_tx_queue().await;
+            assert_eq!(event_loop.session_tx_queue.len(), 2, "held, not dropped");
+            assert!(event_loop.session_tx_held_by_frequency_gate);
+            assert_eq!(event_loop.tx_generation, 0);
+            assert_eq!(
+                event_loop.buffered_tx_bytes(),
+                11,
+                "BUFFER still counts them"
+            );
+
+            event_loop.retry_held_tx_drain().await;
+            assert_eq!(
+                event_loop.session_tx_queue.len(),
+                2,
+                "still on HF: still held"
+            );
+
+            *rig.answer.lock().unwrap() = "144500000".into();
+            event_loop.retry_held_tx_drain().await;
+            assert_eq!(event_loop.session_tx_queue.len(), 1);
+            assert!(!event_loop.session_tx_held_by_frequency_gate);
+            assert_eq!(event_loop.tx_generation, 1, "the first chunk went out");
+        }
+
+        /// COP-41 review: a session chunk that passes the pre-pop check but
+        /// is refused after the courtesy wait goes back at the head of the
+        /// queue rather than leaving a hole in the host's byte stream
+        /// (session data has no MAC-level retry), and the retry poll sends
+        /// it once the rig is back on 2m.
+        #[tokio::test(start_paused = true)]
+        async fn a_post_wait_refusal_requeues_the_session_chunk() {
+            let rig = fake_rigctld("144500000");
+            let mut config = rigctld_config(&rig);
+            config.audio.sample_rate = 48_000;
+            config.station_id.busy_hold_ms = 10;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut audio_in_tx, audio_in_rx) = coppa_audio::audio_ring(32_768);
+            let (audio_out_tx, _audio_out_rx) = coppa_audio::audio_ring(32_768);
+            event_loop.set_audio_in(audio_in_rx);
+            event_loop.set_audio_out(audio_out_tx);
+            let mut counter = 1u32;
+            let mut noise = |amplitude: f32| -> Vec<f32> {
+                (0..1024)
+                    .map(|_| {
+                        counter = counter.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                        amplitude * ((counter >> 8) as f32 / (1u32 << 24) as f32 - 0.5)
+                    })
+                    .collect()
+            };
+            for _ in 0..10 {
+                event_loop.busy_gate.observe(&noise(0.01));
+            }
+            for _ in 0..5 {
+                event_loop.busy_gate.observe(&noise(0.5));
+            }
+            assert!(event_loop.busy_gate.current());
+            event_loop
+                .session_tx_queue
+                .push_back(session_chunk(b"first"));
+            event_loop
+                .session_tx_queue
+                .push_back(session_chunk(b"second"));
+            {
+                let drain = event_loop.drain_session_tx_queue();
+                tokio::pin!(drain);
+                tokio::select! {
+                    biased;
+                    _ = &mut drain => panic!("drain must wait for the busy channel"),
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+                *rig.answer.lock().unwrap() = "14074000".into();
+                audio_in_tx.write(&noise(0.01));
+                tokio::time::timeout(Duration::from_secs(5), drain)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(event_loop.tx_generation, 0, "the popped chunk was refused");
+            assert_eq!(
+                event_loop.session_tx_queue.len(),
+                2,
+                "the refused chunk is back in the queue"
+            );
+            assert_eq!(
+                event_loop.session_tx_queue.front().unwrap().host_len,
+                5,
+                "at the head, ahead of the chunk behind it"
+            );
+            assert_eq!(event_loop.buffered_tx_bytes(), 11, "BUFFER still counts it");
+            assert!(event_loop.session_tx_held_by_frequency_gate);
+
+            *rig.answer.lock().unwrap() = "144500000".into();
+            event_loop.retry_held_tx_drain().await;
+            assert_eq!(event_loop.tx_generation, 1, "the refused chunk went out");
+            assert_eq!(event_loop.session_tx_queue.len(), 1);
+            assert_eq!(event_loop.session_tx_queue.front().unwrap().host_len, 6);
         }
 
         /// A `LevelDerived` engine starts narrowband (no startup check

@@ -418,11 +418,7 @@
       "visibility": "public"
     },
     {
-<<<<<<< HEAD
-      "hash": "sha256:40a1cc138df078946a4c325f90c25765e21ffa57771b8c7a9e04eb99bca9934c",
-=======
-      "hash": "sha256:d94453fd26d0bcd412480b0f27a0319f3d6aad25e63b99f2c2cf7caaa5d44ea9",
->>>>>>> af9c3256dc472ce3cf9fd03666d6d651c553ec96
+      "hash": "sha256:927aa15b093b0b8d602fb61b70cd71b001c4d1fd3d95f7a89d953b284e063eb8",
       "id": "phase4-field-readiness",
       "kind": "gotcha",
       "links": [
