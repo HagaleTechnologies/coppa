@@ -1271,6 +1271,12 @@ impl EventLoop {
             let pending = std::mem::take(&mut self.pending_busy_wait_audio);
             self.decode_and_dispatch_audio(&pending).await;
         }
+        // A reply to a frame in that audio may have held TX (COP-60) and
+        // parked newer audio again. The ring is newer still, so leave it for
+        // the next poll, which decodes the parked audio first.
+        if !self.pending_busy_wait_audio.is_empty() {
+            return;
+        }
         if let Some(buf) = self.drain_audio_input_ring() {
             self.handle_audio_in(&buf).await;
         }
@@ -10599,6 +10605,38 @@ mod tests {
                 station.pending_busy_wait_audio.len() + audio_in.available(),
                 CHUNKS * CHUNK,
                 "every written sample is held for decode or still in the ring"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn audio_parked_during_a_hold_is_decoded_before_newer_ring_audio() {
+            const CHUNK: usize = 960;
+            const CHUNKS: usize = 30; // 600 ms
+            let mut station = EventLoop::new(arq_config()).unwrap();
+            install_ptt_log(&mut station);
+            let (mut producer, consumer) = coppa_audio::audio_ring(8192);
+            station.set_audio_in(consumer);
+            // Audio parked by an earlier hold, holding a frame whose ACK
+            // holds TX again (and parks more audio) while it is decoded.
+            station.pending_busy_wait_audio = peer_data_frame();
+
+            let writer = async {
+                for _ in 0..CHUNKS {
+                    producer.write(&[0.0; CHUNK]);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            tokio::join!(station.poll_audio_input(), writer);
+
+            assert_eq!(station.tx_generation, 1, "the parked frame must be ACKed");
+            assert!(!station.pending_busy_wait_audio.is_empty());
+            // Ring audio written during the ACK's pre-delay is newer than the
+            // audio the hold parked, so this poll must not have consumed it.
+            assert_eq!(
+                station.pending_busy_wait_audio.len()
+                    + station.audio_in.as_ref().unwrap().available(),
+                CHUNKS * CHUNK,
+                "newer ring audio was decoded ahead of older parked audio"
             );
         }
 
