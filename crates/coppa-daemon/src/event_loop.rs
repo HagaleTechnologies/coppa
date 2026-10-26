@@ -29,11 +29,8 @@ use crate::audio_output::{
     TxOutput, PROGRESS_TICK,
 };
 use crate::config::DaemonConfig;
-<<<<<<< HEAD
 use crate::level_meter::{self, LevelReading, LevelState, RxLevelMeter};
-=======
 use crate::tx_chunker::chunk_to_fit;
->>>>>>> 53a17e398a46b25d172e045b21e47d048fcfd2ec
 
 /// Map of connected VARA command-port clients' response senders
 /// (`VaraServer::response_senders()`), used to broadcast `VaraResponse` telemetry.
