@@ -807,7 +807,6 @@ impl EventLoop {
         })
     }
 
-<<<<<<< HEAD
     /// This station's frequency evidence right now: one rigctld `f` round
     /// trip, falling back to the stated `[radio] frequency_hz`/`band`. Warns
     /// when the live dial contradicts the stated source. Shared by the COP-40
@@ -923,13 +922,13 @@ impl EventLoop {
             .last()
             .map_or(level, |&max| level.min(max));
         self.engine.set_speed_level(level)
-=======
+    }
+
     /// COP-32: conditions found while starting that leave the daemon running
     /// but unable to do part of its job (today: rigctld unreachable, so no
     /// PTT). Empty when startup was clean.
     pub fn startup_problems(&self) -> &[String] {
         &self.startup_problems
->>>>>>> 664116ae5536704a5cbcb601eccd03cc39f48eff
     }
 
     /// Get a sender for injecting events into the loop.
