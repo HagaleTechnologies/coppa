@@ -33,6 +33,12 @@ a real bug — breaking them will reintroduce that bug.
   to off; a `Connecting` session does not count. The sessionless raw/ARQ path
   behind that key is the daemon's only path for ARQ-tracked host data
   (RateLoop/probing feedback), so don't delete it as dead code.
+- **Replies wait out the peer's PTT tail (COP-60).** `transmit_samples` holds
+  any key-up until `[radio] turnaround_ms` after the last decoded frame and
+  drains the input ring while it waits, since a plain sleep overflowed the
+  8,192-sample ring. Don't move the wait out of the chokepoint or replace the
+  drain with a sleep. See `docs/OPERATING.md` and
+  `docs/testing/cable-loop-turnaround.md`.
 - **Every transmission goes through `transmit_samples`** — it is the single
   chokepoint applying PTT lead/tail, busy-defer, and station-ID accounting.
   ARQ retransmits and session keepalives once bypassed it via a direct
