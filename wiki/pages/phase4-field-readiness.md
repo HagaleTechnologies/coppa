@@ -69,9 +69,10 @@ a real bug — breaking them will reintroduce that bug.
 
 - PTT config uses extended syntax: `serial:/dev/ttyUSB0:dtr`, `gpio:17`, or
   the flat `none`/`vox`/`rigctld`. Unrecognized values hard-error at startup —
-  bare `"serial"` is NOT valid. Known residual gap: `rigctld` with an
-  unreachable rig at startup falls back to NullPtt with only a warning
-  (a daemon that runs with silently-broken PTT).
+  bare `"serial"` is NOT valid. `rigctld` unreachable at startup still falls
+  back to NullPtt, but since COP-32 it logs at ERROR and the daemon logs
+  `Daemon running degraded` instead of `Daemon ready`. There is still no
+  reconnect, so PTT stays lost for that run.
 - Busy-defer is deliberately independent of callsign (channel courtesy ≠
   identification); station-ID and beacon do gate on callsign.
 - Hardware audio still needs `cpal-backend` (see [[cpal-feature-gate]]), and
