@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, Result};
 use std::io::{BufRead, BufReader, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 
 use crate::{PttControl, PttState, RadioControl, RadioMode};
 
@@ -30,9 +30,27 @@ pub struct RigctldClient {
 
 impl RigctldClient {
     /// Connect to rigctld at the given address (e.g., "127.0.0.1:4532").
+    /// TCP establishment times out after 2 s per resolved address.
     pub fn connect(addr: &str) -> Result<Self> {
-        let stream = TcpStream::connect(addr)
-            .map_err(|e| anyhow!("Failed to connect to rigctld at {}: {}", addr, e))?;
+        Self::connect_timeout(addr, std::time::Duration::from_secs(2))
+    }
+
+    /// Connect with an explicit TCP establishment timeout per resolved address.
+    /// Hostname resolution is synchronous and is not covered by this timeout.
+    /// Read and write timeouts remain 2 s each.
+    pub fn connect_timeout(addr: &str, timeout: std::time::Duration) -> Result<Self> {
+        let mut last_err = anyhow!("rigctld address {} did not resolve", addr);
+        let mut connected = None;
+        for sock in addr.to_socket_addrs()? {
+            match TcpStream::connect_timeout(&sock, timeout) {
+                Ok(stream) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(e) => last_err = anyhow!("Failed to connect to rigctld at {}: {}", sock, e),
+            }
+        }
+        let stream = connected.ok_or(last_err)?;
         stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
         stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
         let reader = BufReader::new(stream.try_clone()?);
@@ -81,7 +99,6 @@ impl RigctldClient {
     /// anything still buffered on the old socket. Bounded by a 2 s connect
     /// timeout per resolved address.
     fn reconnect(&mut self) -> Result<()> {
-        use std::net::ToSocketAddrs;
         let timeout = std::time::Duration::from_secs(2);
         let mut last_err = anyhow!("rigctld address {} did not resolve", self.addr);
         for sock in self.addr.to_socket_addrs()? {

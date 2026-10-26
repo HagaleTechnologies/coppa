@@ -40,14 +40,13 @@ type VaraResponseSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<VaraResponse>>>>;
 /// 300 s.
 const VARA_KEEPALIVE_PERIOD: Duration = Duration::from_secs(60);
 
-<<<<<<< HEAD
 /// COP-31: how far past `max_tx_duration_s` a keyed interval may run before
 /// the main loop forces PTT off itself. The normal release path ends every
 /// keyed interval by `max_tx_duration_s` (its tail is capped to what remains),
 /// so this only fires when that path has failed, e.g. the completion task
 /// in `transmit_samples` panicked before reporting.
 const PTT_BACKSTOP_GRACE: Duration = Duration::from_secs(2);
-=======
+
 /// Smallest one-codeword payload budget on the whole speed ladder (COP-41,
 /// D4), derived rather than hardcoded: `min(max_payload_for_level(l))` for
 /// `l` in 1..=9. ARQ chunks are sized against THIS, not the current level,
@@ -76,7 +75,6 @@ struct SessionTxChunk {
     pdu_bytes: Vec<u8>,
     host_len: usize,
 }
->>>>>>> 4db4130ed766b3e54504f6e5500df2fc6c56ca45
 
 /// The reply a VARA command-port client gets for one command, decided before
 /// the command takes effect. `WRONG` is only for lines coppa does not

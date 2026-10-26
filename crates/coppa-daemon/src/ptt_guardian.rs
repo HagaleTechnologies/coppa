@@ -93,7 +93,12 @@ pub fn watch(
 pub fn release_once(ptt: &PttConfig, rigctld_address: &str) -> anyhow::Result<()> {
     match ptt {
         PttConfig::Rigctld => {
-            let mut client = coppa_radio::rigctld::RigctldClient::connect(rigctld_address)?;
+            // Bound TCP establishment per resolved address, as reconnect does.
+            // Hostname resolution itself still uses the system resolver.
+            let mut client = coppa_radio::rigctld::RigctldClient::connect_timeout(
+                rigctld_address,
+                Duration::from_secs(2),
+            )?;
             PttControl::set_ptt(&mut client, PttState::Rx)
         }
         PttConfig::Gpio { pin } => {
@@ -367,5 +372,47 @@ mod tests {
         assert!(release_once(&PttConfig::None, "127.0.0.1:1").is_err());
         let serial = PttConfig::parse("serial:/dev/ttyUSB0:dtr").unwrap();
         assert!(release_once(&serial, "127.0.0.1:1").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rigctld_release_bounds_connection_establishment() {
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+
+        // A full Linux accept queue drops new SYNs, exercising a stalled
+        // connect without relying on an external host or firewall rules.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut pending = Vec::new();
+        let mut saturated = false;
+        for _ in 0..1024 {
+            match TcpStream::connect_timeout(&addr, Duration::from_millis(50)) {
+                Ok(stream) => pending.push(stream),
+                Err(e) => {
+                    assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+                    saturated = true;
+                    break;
+                }
+            }
+        }
+        assert!(saturated, "failed to fill the listener's accept queue");
+
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(release_once(&PttConfig::Rigctld, &addr.to_string()))
+                .unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_secs(3));
+        // Unblock even the old, unbounded connect before joining the worker.
+        drop(listener);
+        drop(pending);
+        worker.join().unwrap();
+        assert!(
+            result
+                .expect("guardian connect exceeded its two-second timeout")
+                .is_err(),
+            "a saturated listener cannot accept the release connection"
+        );
     }
 }
