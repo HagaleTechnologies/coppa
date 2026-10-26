@@ -119,6 +119,23 @@ fn rx_duration_decodes_only_the_first_seconds_of_a_file() {
     assert_eq!(raw.trim(), FIRST_HEX);
 }
 
+/// `--duration` counts seconds at the WAV's own rate, not the engine's
+/// 48 kHz: `WavSource` does not resample.
+#[test]
+fn rx_duration_counts_seconds_at_the_files_own_sample_rate() {
+    use coppa_audio::AudioSink;
+    let wav = TempWav::new("rate");
+    let mut sink = coppa_audio::file_backend::WavSink::new(&wav.0, 8_000);
+    sink.start().unwrap();
+    sink.write(&vec![0.0f32; 40_000]).unwrap();
+    sink.stop().unwrap();
+    let (out, _) = ok(&["rx", "<path>", "-d", "2"], &wav.0);
+    assert!(
+        out.contains("Reading the first 2 s (16000 of 40000 samples) from"),
+        "{out}"
+    );
+}
+
 #[test]
 fn rx_callsign_is_echoed_only_under_verbose() {
     let cq = write_cq_wav("callsign");

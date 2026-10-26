@@ -828,7 +828,9 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
             use coppa_audio::{file_backend::WavSource, AudioSource};
             let mut source = WavSource::open(path)?;
             let total = source.total_samples();
-            let limit = file_sample_limit(total, args.duration, core.config().sample_rate);
+            // The file's own rate: WavSource does not resample, so "the
+            // first N seconds" is N times the rate the samples were written at.
+            let limit = file_sample_limit(total, args.duration, source.sample_rate());
             if verbosity != Verbosity::Quiet && !args.raw {
                 if limit < total {
                     println!(
@@ -2130,9 +2132,26 @@ mod tests {
         }
     }
 
-    /// A source that always fills the buffer with silence and counts the
-    /// samples it hands out (stands in for both a busy live device and an
-    /// endless file).
+    /// A busy live source: every read fills the whole buffer with silence.
+    struct Endless;
+
+    impl coppa_audio::AudioSource for Endless {
+        fn read(&mut self, buf: &mut [f32]) -> Result<usize> {
+            buf.fill(0.0);
+            Ok(buf.len())
+        }
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Like `Endless`, but counts the samples it hands out.
     #[derive(Default)]
     struct Counting {
         handed_out: usize,
@@ -2179,12 +2198,11 @@ mod tests {
 
     #[test]
     fn stream_decode_stops_a_streaming_live_source_at_its_deadline() {
-        let mut source = Counting::default();
         let start = std::time::Instant::now();
         let deadline = Some(start + std::time::Duration::from_millis(100));
         stream_decode(
             &mut CoppaCore::new(),
-            &mut source,
+            &mut Endless,
             None,
             deadline,
             false,
@@ -2192,8 +2210,12 @@ mod tests {
             Verbosity::Quiet,
         )
         .unwrap();
-        assert!(start.elapsed() < std::time::Duration::from_secs(5));
-        assert!(source.handed_out > 0, "the source was never read");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(100),
+            "{elapsed:?}"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
     }
 
     #[test]
