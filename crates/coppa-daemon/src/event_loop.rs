@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use coppa_audio::{AudioRingConsumer, AudioRingProducer};
-use coppa_engine::CoppaCore;
+use coppa_engine::{CoppaCore, OfdmBand};
 use coppa_host::vara::{VaraCommand, VaraResponse};
 use coppa_host::HostEvent;
 use coppa_ml::CpRecommendation;
@@ -431,15 +431,7 @@ impl EventLoop {
         // current_level())`, even with probing disabled. `levels`/`raise_dwell`
         // still match `default_coppa()`'s own choices -- only the initial
         // level differs.
-        let rate_loop = RateLoop::new(engine.available_speed_levels(), 5, engine.speed_level());
-        let rate_loop = if config.engine.rate_loop_probe_interval > 0 {
-            rate_loop.with_probing(
-                config.engine.rate_loop_probe_interval,
-                config.engine.rate_loop_probe_offset,
-            )
-        } else {
-            rate_loop
-        };
+        let rate_loop = Self::build_rate_loop(&config, &engine, engine.speed_level());
 
         // Always constructed (cheap; mirrors RateLoop's own "hardcode the
         // hysteresis constants, only expose the interval/offset-equivalent
@@ -622,8 +614,10 @@ impl EventLoop {
     /// No evidence, or evidence below 29.7 MHz, is a hard startup error.
     ///
     /// Only the constructed engine is checked: a `LevelDerived` engine that
-    /// starts narrowband and later climbs into `vhf_wide` is gated per
-    /// transmission by `wideband_frequency_check` instead.
+    /// starts narrowband and later climbs toward `vhf_wide` is rebound to HF by
+    /// `apply_speed_level` (COP-21) unless its frequency evidence permits the
+    /// wideband profile, and is gated per transmission by
+    /// `wideband_frequency_check` otherwise.
     fn check_frequency_gate_at_startup(
         config: &DaemonConfig,
         engine: &CoppaCore,
@@ -713,18 +707,7 @@ impl EventLoop {
         if band::gate(occupied_hz, None).is_ok() {
             return Ok(());
         }
-        let live_hz = self.ptt.poll_frequency();
-        if let Some(live) = live_hz {
-            if self.radio_frequency.contradicts(live) {
-                tracing::warn!(
-                    live_hz = live,
-                    stated = ?self.radio_frequency.static_evidence(),
-                    "rigctld's dial frequency contradicts [radio] frequency_hz/band; \
-                     using the live value"
-                );
-            }
-        }
-        let evidence = band::resolve_evidence(live_hz, &self.radio_frequency);
+        let evidence = self.frequency_evidence();
         band::gate(occupied_hz, evidence.as_ref()).inspect_err(|refusal| match refusal {
             GateRefusal::BelowThreshold { evidence_hz, .. } => tracing::error!(
                 "refusing wideband transmission: {occupied_hz} Hz occupied bandwidth but {} \
@@ -745,6 +728,123 @@ impl EventLoop {
                 }
             ),
         })
+    }
+
+    /// This station's frequency evidence right now: one rigctld `f` round
+    /// trip, falling back to the stated `[radio] frequency_hz`/`band`. Warns
+    /// when the live dial contradicts the stated source. Shared by the COP-40
+    /// per-transmission gate and the COP-21 HF rebind.
+    fn frequency_evidence(&mut self) -> Option<FrequencyEvidence> {
+        let live_hz = self.ptt.poll_frequency();
+        if let Some(live) = live_hz {
+            if self.radio_frequency.contradicts(live) {
+                tracing::warn!(
+                    live_hz = live,
+                    stated = ?self.radio_frequency.static_evidence(),
+                    "rigctld's dial frequency contradicts [radio] frequency_hz/band; \
+                     using the live value"
+                );
+            }
+        }
+        band::resolve_evidence(live_hz, &self.radio_frequency)
+    }
+
+    /// The daemon's `RateLoop` over `engine`'s ladder (`available_speed_levels`),
+    /// starting at `initial_level` (clamped into that ladder). Shared by `new`
+    /// and the COP-21 HF rebind so both get the same `raise_dwell` and probing
+    /// setup.
+    fn build_rate_loop(config: &DaemonConfig, engine: &CoppaCore, initial_level: u8) -> RateLoop {
+        let rate_loop = RateLoop::new(engine.available_speed_levels(), 5, initial_level);
+        if config.engine.rate_loop_probe_interval > 0 {
+            rate_loop.with_probing(
+                config.engine.rate_loop_probe_interval,
+                config.engine.rate_loop_probe_offset,
+            )
+        } else {
+            rate_loop
+        }
+    }
+
+    /// COP-21: keep a level-derived engine off `vhf_wide` unless the station
+    /// can show it is at or above 29.7 MHz.
+    ///
+    /// `coppad` only builds an `OfdmBand::LevelDerived` engine when `[engine]
+    /// profile` is not a built-in name (`EventLoop::new` falls back to
+    /// `EngineConfig::default()`). On such an engine the speed level picks the
+    /// band, so a `RateLoop` climb to level 5+ would select `vhf_wide`
+    /// (5600 Hz), which 47 CFR 97.307(f)(3) forbids below 29.7 MHz. Rather than
+    /// let COP-40's gate refuse every such frame, this rebinds the engine to
+    /// `OfdmBand::Hf` (`CoppaCore::set_ofdm_band`) so the level goes on air as
+    /// `hf_standard` (2400 Hz): the station keeps transmitting on an HF-legal
+    /// profile instead of going silent. A level above HF's ceiling is lowered
+    /// to `HF_MAX_SPEED_LEVEL` first, and `RateLoop` is rebuilt over the HF
+    /// ladder from its own current level.
+    ///
+    /// Only `LevelDerived` engines are touched: an explicitly configured
+    /// `VHF_FAST` engine keeps COP-40's startup error and per-transmission
+    /// refusal and is never rewritten. The binding is one-way for the session:
+    /// evidence that later returns above 29.7 MHz does not undo it. Wideband
+    /// is decided by `band::gate` on the width `level` would actually produce
+    /// (`occupied_bandwidth_hz_at`), never a hard-coded level, and no rig I/O
+    /// happens unless `level` would be wideband on a level-derived engine. No
+    /// evidence at all binds to HF (fail closed, matching COP-40).
+    fn keep_level_derived_engine_hf_legal(&mut self, level: u8) {
+        if self.engine.config().ofdm_band != OfdmBand::LevelDerived {
+            return;
+        }
+        let occupied_hz = self.engine.occupied_bandwidth_hz_at(level);
+        if band::gate(occupied_hz, None).is_ok() {
+            return;
+        }
+        let evidence = self.frequency_evidence();
+        if band::gate(occupied_hz, evidence.as_ref()).is_ok() {
+            return;
+        }
+        if self.engine.speed_level() > coppa_engine::HF_MAX_SPEED_LEVEL {
+            if let Err(e) = self
+                .engine
+                .set_speed_level(coppa_engine::HF_MAX_SPEED_LEVEL)
+            {
+                tracing::warn!(error = %e, "Failed to lower the speed level for the HF profile");
+                return;
+            }
+        }
+        if let Err(e) = self.engine.set_ofdm_band(OfdmBand::Hf) {
+            tracing::warn!(error = %e, "Failed to rebind the engine to the HF profile");
+            return;
+        }
+        self.rate_loop =
+            Self::build_rate_loop(&self.config, &self.engine, self.rate_loop.current_level());
+        tracing::warn!(
+            "speed level {level} selects vhf_wide ({occupied_hz} Hz occupied bandwidth) on this \
+             engine because [engine] profile \"{}\" is not a built-in profile, but {}; using \
+             the HF profile ({} Hz, levels 1-{}) for the rest of this session -- 47 CFR \
+             97.307(f)(3) caps emissions below 29.7 MHz at 2.8 kHz",
+            self.config.engine.profile,
+            evidence.map_or_else(
+                || "no frequency source is answering".to_string(),
+                |e| e.describe()
+            ),
+            self.engine.occupied_bandwidth_hz(),
+            coppa_engine::HF_MAX_SPEED_LEVEL,
+        );
+    }
+
+    /// COP-21: the one place the daemon changes the engine's speed level.
+    ///
+    /// Runs `keep_level_derived_engine_hf_legal` first, so a level-derived
+    /// engine is rebound to HF *before* a wideband level can take effect (and
+    /// before anything is encoded at it), then clamps `level` to the engine's
+    /// ladder -- a no-op unless that rebind just happened while `level` was 9
+    /// -- and applies it. Errors are `CoppaCore::set_speed_level`'s.
+    fn apply_speed_level(&mut self, level: u8) -> Result<()> {
+        self.keep_level_derived_engine_hf_legal(level);
+        let level = self
+            .engine
+            .available_speed_levels()
+            .last()
+            .map_or(level, |&max| level.min(max));
+        self.engine.set_speed_level(level)
     }
 
     /// Get a sender for injecting events into the loop.
@@ -1010,9 +1110,16 @@ impl EventLoop {
         if self.is_transmitting {
             return;
         }
+        // COP-21: a level-derived engine left on vhf_wide by a retune moves to HF
+        // rather than holding the queue.
+        if !self.tx_queue.is_empty() {
+            self.keep_level_derived_engine_hf_legal(self.engine.speed_level());
+        }
         // COP-40: hold queued payloads (rather than pop one and have
         // `transmit_samples` refuse it) while the wideband gate refuses;
-        // `retry_held_tx_drain` tries again on the next poll.
+        // `retry_held_tx_drain` tries again on the next poll. COP-21 above has
+        // already rebound a level-derived engine to HF, so only an explicitly
+        // wideband (`VHF_FAST`) engine is still held here.
         self.tx_held_by_frequency_gate =
             !self.tx_queue.is_empty() && self.wideband_frequency_check().is_err();
         if self.tx_held_by_frequency_gate {
@@ -1062,7 +1169,7 @@ impl EventLoop {
             // is real, avoidable per-frame cost whenever the level hasn't
             // actually changed.
             if self.engine.speed_level() != level {
-                if let Err(e) = self.engine.set_speed_level(level) {
+                if let Err(e) = self.apply_speed_level(level) {
                     tracing::warn!(error = %e, "Failed to apply speed level for queued TX frame");
                 }
             }
@@ -1095,7 +1202,7 @@ impl EventLoop {
             }
 
             if is_probe {
-                if let Err(e) = self.engine.set_speed_level(self.rate_loop.current_level()) {
+                if let Err(e) = self.apply_speed_level(self.rate_loop.current_level()) {
                     tracing::warn!(error = %e, "Failed to revert speed level after probe");
                 }
             }
@@ -1893,10 +2000,9 @@ impl EventLoop {
                                         if !probe_resolved {
                                             if let Some(rate) = pdu.suggested_rate() {
                                                 self.rate_loop.on_ack(rate, true);
-                                                if let Err(e) = self
-                                                    .engine
-                                                    .set_speed_level(self.rate_loop.current_level())
-                                                {
+                                                if let Err(e) = self.apply_speed_level(
+                                                    self.rate_loop.current_level(),
+                                                ) {
                                                     tracing::warn!(error = %e, "Failed to apply RateLoop's recommended speed level");
                                                 }
                                             }
@@ -2122,7 +2228,10 @@ impl EventLoop {
     /// wait, and again after the wait before the station-ID prepend, PTT,
     /// or any audio. A refused transmission keys nothing and queues
     /// nothing. Callers observe a lost transmission, which ARQ already
-    /// retransmits or times out on like any other loss.
+    /// retransmits or times out on like any other loss. COP-21: a refusal
+    /// also rebinds a level-derived engine to HF, so the next frame it
+    /// encodes is HF-legal; the refused samples themselves are never
+    /// re-encoded.
     async fn transmit_samples(&mut self, samples: &[f32]) {
         let allowed = if self.wideband_frequency_check().is_ok() {
             self.wait_for_clear_channel().await;
@@ -2133,6 +2242,9 @@ impl EventLoop {
             false
         };
         if !allowed {
+            // COP-21: the refused samples were encoded on vhf_wide; make the next
+            // frame a level-derived engine encodes HF-legal.
+            self.keep_level_derived_engine_hf_legal(self.engine.speed_level());
             if !self.is_transmitting {
                 // The refused payload never reaches the air, so no PTT
                 // release will ever drop it from `BUFFER`.
@@ -2446,7 +2558,7 @@ impl EventLoop {
         if let Some((seq, level)) = self.probe_state {
             if newly_acked.contains(&seq) {
                 self.rate_loop.on_probe_result(level, true);
-                if let Err(e) = self.engine.set_speed_level(self.rate_loop.current_level()) {
+                if let Err(e) = self.apply_speed_level(self.rate_loop.current_level()) {
                     tracing::warn!(error = %e, "Failed to apply speed level after probe success");
                 }
                 self.probe_state = None;
@@ -2483,6 +2595,7 @@ impl EventLoop {
         // (an unbounded retransmit storm) and never reaches
         // `config.max_retransmit` to give up.
         let mut retransmit_pdus: Vec<(u8, Vec<u8>)> = Vec::new();
+        let mut timed_out = false;
         if let Some(ref mut arq_tx) = self.arq_tx {
             let retransmit_seqs = arq_tx.get_retransmits(now);
 
@@ -2517,9 +2630,7 @@ impl EventLoop {
                 .count();
             if other_timeouts > 0 {
                 self.rate_loop.on_timeout();
-                if let Err(e) = self.engine.set_speed_level(self.rate_loop.current_level()) {
-                    tracing::warn!(error = %e, "Failed to apply RateLoop's recommended speed level after timeout");
-                }
+                timed_out = true;
             }
 
             for seq in retransmit_seqs {
@@ -2528,6 +2639,13 @@ impl EventLoop {
                         TransportPdu::new_reliable(self.arq_session_id, seq, 0, data.to_vec());
                     retransmit_pdus.push((seq, pdu.to_bytes()));
                 }
+            }
+        }
+        // Applied after the `arq_tx` borrow ends: `apply_speed_level` needs all of
+        // `self` (COP-21), and must still run before the encode below.
+        if timed_out {
+            if let Err(e) = self.apply_speed_level(self.rate_loop.current_level()) {
+                tracing::warn!(error = %e, "Failed to apply RateLoop's recommended speed level after timeout");
             }
         }
         // Now encode and transmit (no more borrow on arq_tx)
@@ -7488,6 +7606,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cop21_a_peer_ack_that_raises_a_level_derived_engine_to_5_lands_on_hf() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        config.engine.profile = "HF-STANDARD-TYPO".into();
+        config.radio.frequency_hz = Some(14_074_000);
+        let mut event_loop = EventLoop::new(config).unwrap();
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+        event_loop.engine.set_speed_level(4).unwrap();
+        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 4);
+        for _ in 0..5 {
+            let ack = TransportPdu::new_ack_with_rate(0, 0, 0, 9);
+            event_loop
+                .decode_and_dispatch_audio(&peer_frame(
+                    &ack,
+                    coppa_codec::ofdm::CoppaProfile::hf_standard(),
+                ))
+                .await;
+        }
+        assert_eq!(
+            event_loop.rate_loop.current_level(),
+            5,
+            "premise: RateLoop crossed 4 -> 5"
+        );
+        assert_eq!(event_loop.engine.speed_level(), 5);
+        assert_eq!(event_loop.engine.occupied_bandwidth_hz(), 2400);
+        assert_eq!(event_loop.engine.config().ofdm_band, OfdmBand::Hf);
+    }
+
+    #[tokio::test]
     async fn incoming_ack_with_rate_updates_rate_loop_and_encoder() {
         let mut config = DaemonConfig::default();
         config.engine.arq_enabled = true;
@@ -9885,6 +10032,8 @@ mod tests {
             addr: String,
             answer: Arc<Mutex<String>>,
             alive: Arc<AtomicBool>,
+            /// How many `f` (frequency) queries the rig has answered (COP-21).
+            f_queries: Arc<std::sync::atomic::AtomicUsize>,
         }
 
         fn fake_rigctld(answer: &str) -> FakeRig {
@@ -9892,7 +10041,12 @@ mod tests {
             let addr = listener.local_addr().unwrap().to_string();
             let answer = Arc::new(Mutex::new(answer.to_string()));
             let alive = Arc::new(AtomicBool::new(true));
-            let (shared, live) = (Arc::clone(&answer), Arc::clone(&alive));
+            let f_queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (shared, live, queries) = (
+                Arc::clone(&answer),
+                Arc::clone(&alive),
+                Arc::clone(&f_queries),
+            );
             std::thread::spawn(move || {
                 let Ok((stream, _)) = listener.accept() else {
                     return;
@@ -9905,7 +10059,12 @@ mod tests {
                         break;
                     }
                     let reply = match line.trim() {
-                        "f" => shared.lock().unwrap().clone(),
+                        "f" => {
+                            // Counted before the reply is written, so a read
+                            // after the client has its answer is race-free.
+                            queries.fetch_add(1, Ordering::SeqCst);
+                            shared.lock().unwrap().clone()
+                        }
                         "t" => ptt.clone(),
                         cmd if cmd.starts_with("T ") => {
                             ptt = cmd[2..].to_string();
@@ -9922,6 +10081,7 @@ mod tests {
                 addr,
                 answer,
                 alive,
+                f_queries,
             }
         }
 
@@ -10323,6 +10483,200 @@ mod tests {
             assert!(event_loop.engine.occupied_bandwidth_hz() > 2_800);
             event_loop.transmit_samples(&SAMPLES).await;
             assert_eq!(event_loop.tx_generation, 0);
+        }
+
+        // ── COP-21: a level-derived engine uses HF, not vhf_wide, below 29.7 MHz ──
+        mod cop21_hf_legal_profile {
+            use super::*;
+
+            /// `EventLoop::new` falls back to `EngineConfig::default()`
+            /// (`OfdmBand::LevelDerived`) for any name `get_profile` does not know.
+            const UNKNOWN_PROFILE: &str = "HF-STANDARD-TYPO";
+
+            fn level_derived(mut config: DaemonConfig) -> DaemonConfig {
+                config.engine.profile = UNKNOWN_PROFILE.into();
+                config
+            }
+
+            /// Raise `RateLoop` the way peer ACKs do (raise_dwell = 5).
+            fn climb_to(event_loop: &mut EventLoop, level: u8) {
+                while event_loop.rate_loop.current_level() < level {
+                    event_loop.rate_loop.on_ack(9, true);
+                }
+            }
+
+            /// Given the daemon knows (or cannot show) it is below 29.7 MHz,
+            /// when RateLoop selects level 5, then the frame goes out on HF.
+            async fn level_5_goes_out_on_hf(config: DaemonConfig) {
+                let mut event_loop = EventLoop::new(level_derived(config)).unwrap();
+                assert_eq!(
+                    event_loop.engine.config().ofdm_band,
+                    OfdmBand::LevelDerived,
+                    "premise"
+                );
+                climb_to(&mut event_loop, 5);
+                event_loop.enqueue_tx(None, b"hello".to_vec()).await;
+                assert_eq!(event_loop.engine.speed_level(), 5);
+                assert!(!event_loop.engine.on_vhf_profile(), "not vhf_wide");
+                assert_eq!(event_loop.engine.occupied_bandwidth_hz(), 2400);
+                assert_eq!(event_loop.engine.config().ofdm_band, OfdmBand::Hf);
+                assert_eq!(event_loop.tx_generation, 1, "the frame went on air");
+                assert!(event_loop.tx_queue.is_empty());
+                assert!(!event_loop.tx_held_by_frequency_gate);
+            }
+
+            #[tokio::test]
+            async fn level_5_on_a_stated_hf_frequency_uses_the_hf_profile() {
+                let mut config = wideband_config();
+                config.radio.frequency_hz = Some(14_074_000);
+                level_5_goes_out_on_hf(config).await;
+            }
+
+            #[tokio::test]
+            async fn level_5_with_rigctld_on_hf_uses_the_hf_profile() {
+                let rig = fake_rigctld("7074000");
+                level_5_goes_out_on_hf(rigctld_config(&rig)).await;
+            }
+
+            #[tokio::test]
+            async fn level_5_with_a_stated_10m_band_uses_the_hf_profile() {
+                let mut config = wideband_config();
+                config.radio.band = Some("10m".into()); // lower edge 28.0 MHz
+                level_5_goes_out_on_hf(config).await;
+            }
+
+            #[tokio::test]
+            async fn level_5_with_no_frequency_source_uses_the_hf_profile() {
+                level_5_goes_out_on_hf(wideband_config()).await;
+            }
+
+            #[tokio::test]
+            async fn level_5_on_2m_still_uses_vhf_wide() {
+                let mut config = wideband_config();
+                config.radio.band = Some("2m".into());
+                let mut event_loop = EventLoop::new(level_derived(config)).unwrap();
+                climb_to(&mut event_loop, 5);
+                event_loop.enqueue_tx(None, b"hello".to_vec()).await;
+                assert!(event_loop.engine.on_vhf_profile());
+                assert_eq!(event_loop.engine.occupied_bandwidth_hz(), 5600);
+                assert_eq!(event_loop.engine.config().ofdm_band, OfdmBand::LevelDerived);
+                assert_eq!(event_loop.tx_generation, 1);
+            }
+
+            #[tokio::test]
+            async fn apply_speed_level_rebinds_before_the_level_takes_effect() {
+                let mut config = wideband_config();
+                config.radio.frequency_hz = Some(14_074_000);
+                let mut event_loop = EventLoop::new(level_derived(config)).unwrap();
+                event_loop.apply_speed_level(5).unwrap();
+                assert_eq!(event_loop.engine.speed_level(), 5);
+                assert_eq!(event_loop.engine.occupied_bandwidth_hz(), 2400);
+                // RateLoop's ladder now tops out at HF's level 8.
+                for _ in 0..60 {
+                    event_loop.rate_loop.on_ack(9, true);
+                }
+                assert_eq!(event_loop.rate_loop.current_level(), 8);
+            }
+
+            #[tokio::test]
+            async fn hf_engines_and_level_derived_engines_below_5_never_query_the_rig() {
+                for (profile, climb_to_level) in [("HF_STANDARD", 8), (UNKNOWN_PROFILE, 4)] {
+                    let rig = fake_rigctld("7074000");
+                    let mut config = rigctld_config(&rig);
+                    config.engine.profile = profile.into();
+                    let mut event_loop = EventLoop::new(config).unwrap();
+                    climb_to(&mut event_loop, climb_to_level);
+                    for i in 0..3u8 {
+                        event_loop.enqueue_tx(None, vec![i]).await;
+                        event_loop.handle_ptt_change(false).await;
+                    }
+                    event_loop.apply_speed_level(climb_to_level).unwrap();
+                    assert_eq!(rig.f_queries.load(Ordering::SeqCst), 0, "{profile}");
+                }
+            }
+
+            /// On 2m at `level`, one frame sent on vhf_wide, then the rig is
+            /// retuned to 20m.
+            async fn on_vhf_wide_then_retuned(level: u8) -> (FakeRig, EventLoop) {
+                let rig = fake_rigctld("144500000");
+                let mut event_loop = EventLoop::new(level_derived(rigctld_config(&rig))).unwrap();
+                climb_to(&mut event_loop, level);
+                event_loop.enqueue_tx(None, b"one".to_vec()).await;
+                assert_eq!(event_loop.engine.occupied_bandwidth_hz(), 5600, "premise");
+                assert_eq!(event_loop.tx_generation, 1, "premise: legal on 2m");
+                event_loop.handle_ptt_change(false).await;
+                *rig.answer.lock().unwrap() = "14074000".into();
+                (rig, event_loop)
+            }
+
+            #[tokio::test]
+            async fn a_retune_below_29m7_sends_the_next_payload_on_hf() {
+                let (_rig, mut event_loop) = on_vhf_wide_then_retuned(6).await;
+                event_loop.enqueue_tx(None, b"two".to_vec()).await;
+                assert_eq!(event_loop.tx_generation, 2, "sent, not held");
+                assert!(!event_loop.tx_held_by_frequency_gate);
+                assert_eq!(event_loop.engine.speed_level(), 6);
+                assert_eq!(event_loop.engine.occupied_bandwidth_hz(), 2400);
+            }
+
+            #[tokio::test]
+            async fn a_retune_from_level_9_lands_on_hf_level_8() {
+                let (_rig, mut event_loop) = on_vhf_wide_then_retuned(9).await;
+                event_loop.enqueue_tx(None, b"two".to_vec()).await;
+                assert_eq!(event_loop.tx_generation, 2);
+                assert_eq!(event_loop.engine.speed_level(), 8);
+                assert_eq!(event_loop.rate_loop.current_level(), 8);
+                assert_eq!(
+                    event_loop.engine.available_speed_levels(),
+                    (1..=8).collect::<Vec<_>>()
+                );
+            }
+
+            /// Samples already encoded on vhf_wide are still refused (D8); the
+            /// engine is HF before anything else is encoded.
+            #[tokio::test]
+            async fn a_refused_pre_encoded_wideband_frame_is_still_refused_but_the_next_goes_out() {
+                let (_rig, mut event_loop) = on_vhf_wide_then_retuned(6).await;
+                event_loop.transmit_samples(&SAMPLES).await;
+                assert_eq!(event_loop.tx_generation, 1, "the vhf_wide frame is refused");
+                assert_eq!(event_loop.engine.config().ofdm_band, OfdmBand::Hf);
+                assert_eq!(event_loop.engine.occupied_bandwidth_hz(), 2400);
+                event_loop.transmit_samples(&SAMPLES).await;
+                assert_eq!(event_loop.tx_generation, 2, "the next frame goes out");
+            }
+
+            #[tokio::test]
+            async fn the_hf_binding_holds_after_the_rig_returns_to_vhf() {
+                let (rig, mut event_loop) = on_vhf_wide_then_retuned(6).await;
+                event_loop.enqueue_tx(None, b"two".to_vec()).await;
+                event_loop.handle_ptt_change(false).await;
+                *rig.answer.lock().unwrap() = "144500000".into();
+                for _ in 0..60 {
+                    event_loop.rate_loop.on_ack(9, true);
+                }
+                event_loop.enqueue_tx(None, b"three".to_vec()).await;
+                assert_eq!(
+                    event_loop.engine.config().ofdm_band,
+                    OfdmBand::Hf,
+                    "one-way (D5)"
+                );
+                assert_eq!(event_loop.engine.speed_level(), 8);
+                assert_eq!(event_loop.engine.occupied_bandwidth_hz(), 2400);
+            }
+
+            /// D2: an explicit VHF_FAST engine is refused, never rebound.
+            #[tokio::test]
+            async fn a_vhf_fast_engine_is_refused_not_rebound() {
+                let rig = fake_rigctld("144500000");
+                let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+                *rig.answer.lock().unwrap() = "14074000".into();
+                event_loop.transmit_samples(&SAMPLES).await;
+                event_loop.enqueue_tx(None, b"held".to_vec()).await;
+                assert_eq!(event_loop.tx_generation, 0);
+                assert!(event_loop.tx_held_by_frequency_gate);
+                assert_eq!(event_loop.engine.config().ofdm_band, OfdmBand::Vhf);
+                assert_eq!(event_loop.engine.occupied_bandwidth_hz(), 5600);
+            }
         }
     }
 }

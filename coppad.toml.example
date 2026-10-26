@@ -44,6 +44,10 @@ max_tx_duration_s = 30
 # Amateur band label ("160m".."23cm"); a band whose lowest edge is
 # above 29.7 MHz (6m, 2m, 70cm, ...) satisfies the gate:
 # band = "2m"
+# An [engine] profile that is not one of the four built-in names leaves
+# the band to the speed level, so levels 5+ would be wideband. Without a
+# source at or above 29.7 MHz, coppad keeps such an engine on the HF
+# profile (levels 1-8, 2400 Hz) instead, and logs a warning (COP-21).
 
 [host]
 # Address all host servers (VARA-style TCP, WebSocket) bind to.
