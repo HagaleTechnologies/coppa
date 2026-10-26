@@ -763,3 +763,35 @@ fn a_named_audio_device_without_the_cpal_backend_is_a_startup_error() {
          without the cpal-backend feature",
     );
 }
+
+#[test]
+fn a_taken_vara_command_port_is_a_startup_error() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+    let port = taken.local_addr().unwrap().port();
+    run_startup_error(
+        &format!("[host]\nvara_enabled = true\nvara_command_port = {port}\nvara_data_port = 0\n"),
+        &format!("failed to bind the VARA command port to 127.0.0.1:{port}"),
+    );
+}
+
+#[test]
+fn a_taken_vara_data_port_is_a_startup_error() {
+    // Port 0 lets the OS pick a free command port, so only the data port can fail.
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+    let port = taken.local_addr().unwrap().port();
+    run_startup_error(
+        &format!("[host]\nvara_enabled = true\nvara_command_port = 0\nvara_data_port = {port}\n"),
+        &format!("failed to bind the VARA data port to 127.0.0.1:{port}"),
+    );
+}
+
+#[cfg(feature = "websocket")]
+#[test]
+fn a_taken_websocket_port_is_a_startup_error() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+    let port = taken.local_addr().unwrap().port();
+    run_startup_error(
+        &format!("[host]\nwebsocket_enabled = true\nwebsocket_port = {port}\n"),
+        &format!("failed to bind the WebSocket port to 127.0.0.1:{port}"),
+    );
+}

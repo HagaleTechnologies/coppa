@@ -144,6 +144,42 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     // E5: Get shutdown flag for audio threads
     let shutdown_flag = event_loop.shutdown_flag();
 
+    // COP-32: bind host listeners on this path, before audio, so a port that
+    // is already taken is a startup error instead of a spawned task's log.
+    let vara_listeners = if config.host.vara_enabled {
+        let cmd = bind_host_port(
+            "VARA command port",
+            &config.host.bind_address,
+            config.host.vara_command_port,
+            "vara_command_port",
+        )
+        .await?;
+        let data = bind_host_port(
+            "VARA data port",
+            &config.host.bind_address,
+            config.host.vara_data_port,
+            "vara_data_port",
+        )
+        .await?;
+        Some((cmd, data))
+    } else {
+        None
+    };
+    #[cfg(feature = "websocket")]
+    let ws_listener = if config.host.websocket_enabled {
+        Some(
+            bind_host_port(
+                "WebSocket port",
+                &config.host.bind_address,
+                config.host.websocket_port,
+                "websocket_port",
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
     // Connect CPAL audio streams to ring buffers
     #[cfg(feature = "cpal-backend")]
     {
@@ -279,16 +315,16 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     }
 
     // Start VARA TCP server
-    if config.host.vara_enabled {
+    if let Some((cmd_listener, data_listener)) = vara_listeners {
         let mut vara_server = coppa_host::vara::VaraServer::with_bind_addr(
             config.host.vara_command_port,
             config.host.vara_data_port,
             config.host.bind_address.clone(),
         );
         tracing::info!(
-            command_port = config.host.vara_command_port,
-            data_port = config.host.vara_data_port,
-            "VARA TCP server starting"
+            command_addr = %listen_addr(&cmd_listener),
+            data_addr = %listen_addr(&data_listener),
+            "VARA TCP server listening"
         );
 
         // Pipe VARA events into the daemon event loop
@@ -331,21 +367,23 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
             }
         });
 
-        // Actually start the TCP listeners
+        // Serve the listeners bound above
         tokio::spawn(async move {
-            if let Err(e) = vara_server.run().await {
-                eprintln!("VARA server error: {}", e);
+            if let Err(e) = vara_server
+                .run_with_listeners(cmd_listener, data_listener)
+                .await
+            {
+                tracing::error!("VARA server stopped: {e:#}");
             }
         });
     }
 
     // Start WebSocket server if enabled
     #[cfg(feature = "websocket")]
-    if config.host.websocket_enabled {
-        let ws_port = config.host.websocket_port;
-        tracing::info!(port = ws_port, "WebSocket server starting");
+    if let Some(ws_listener) = ws_listener {
+        tracing::info!(addr = %listen_addr(&ws_listener), "WebSocket server listening");
         let mut ws_server = coppa_host::websocket::WebSocketServer::with_bind_addr(
-            ws_port,
+            config.host.websocket_port,
             config.host.bind_address.clone(),
         );
 
@@ -372,8 +410,8 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         event_loop.set_ws_status(ws_server.status());
 
         tokio::spawn(async move {
-            if let Err(e) = ws_server.run().await {
-                eprintln!("WebSocket server error: {}", e);
+            if let Err(e) = ws_server.run_with_listener(ws_listener).await {
+                tracing::error!("WebSocket server stopped: {e:#}");
             }
         });
     }
@@ -425,4 +463,24 @@ fn check_no_named_devices(audio: &config::AudioConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// COP-32: bind one host listener on `run_daemon`'s own path, so a taken
+/// port fails startup.
+async fn bind_host_port(
+    what: &str,
+    bind_address: &str,
+    port: u16,
+    key: &str,
+) -> Result<tokio::net::TcpListener> {
+    let addr = format!("{bind_address}:{port}");
+    tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("failed to bind the {what} to {addr} ([host] bind_address, {key})"))
+}
+
+fn listen_addr(listener: &tokio::net::TcpListener) -> String {
+    listener
+        .local_addr()
+        .map_or_else(|e| format!("unknown ({e})"), |addr| addr.to_string())
 }
