@@ -10,6 +10,7 @@ mod audio_output;
 mod cli;
 mod config;
 mod event_loop;
+mod ptt_guardian;
 #[cfg(feature = "websocket")]
 mod spectrum;
 
@@ -34,6 +35,10 @@ async fn main() -> Result<()> {
         Mode::PrintDefaultConfig => print_default_config(),
         Mode::Check(source) => check_config(&source),
         Mode::Tnc => run_tnc(cli.log_level).await,
+        Mode::PttGuardian {
+            ptt_method,
+            rigctld_address,
+        } => run_ptt_guardian(cli.log_level, ptt_method, rigctld_address).await,
         Mode::Run(source) => {
             // Load before logging so a config error is the only output.
             let config = load_config(&source)?;
@@ -103,6 +108,77 @@ async fn run_tnc(_level: Option<LogLevel>) -> Result<()> {
     anyhow::bail!("TNC mode requires the kiss-tnc feature")
 }
 
+/// `--ptt-guardian` (internal, COP-31): read the daemon's PTT reports on
+/// stdin until it exits, then release PTT if it exited keyed. Exits 1 if the
+/// release fails after its bounded retries.
+async fn run_ptt_guardian(
+    level: Option<LogLevel>,
+    ptt_method: String,
+    rigctld_address: String,
+) -> Result<()> {
+    init_tracing(level);
+
+    // Replace the default actions of SIGINT, SIGTERM and SIGHUP for the
+    // guardian's whole life: it must outlive the daemon, and only stdin EOF
+    // ends it. The guardian runs in its own process group, but a signal sent
+    // to it directly (or a terminal hang-up) must not stop it either. The
+    // streams are never polled; holding them keeps the handlers installed.
+    #[cfg(unix)]
+    let (_sigint, _sigterm, _sighup) = {
+        use tokio::signal::unix::{signal, SignalKind};
+        (
+            signal(SignalKind::interrupt()).context("failed to register SIGINT handler")?,
+            signal(SignalKind::terminate()).context("failed to register SIGTERM handler")?,
+            signal(SignalKind::hangup()).context("failed to register SIGHUP handler")?,
+        )
+    };
+
+    let ptt = config::RadioConfig {
+        ptt_method: ptt_method.clone(),
+        rigctld_address: rigctld_address.clone(),
+        ..Default::default()
+    }
+    .ptt_config()?;
+
+    let outcome = tokio::task::spawn_blocking(move || {
+        let mut first_attempt = true;
+        ptt_guardian::watch(std::io::stdin().lock(), ptt_guardian::RELEASE_RETRY, || {
+            if std::mem::take(&mut first_attempt) {
+                tracing::warn!(
+                    target: "coppad::ptt_guardian",
+                    ptt_method = %ptt_method,
+                    "coppad exited while PTT was keyed; releasing it"
+                );
+            }
+            ptt_guardian::release_once(&ptt, &rigctld_address)
+        })
+    })
+    .await
+    .context("PTT guardian task failed")?;
+
+    match outcome {
+        ptt_guardian::Outcome::ExitedUnkeyed => {
+            tracing::debug!(
+                target: "coppad::ptt_guardian",
+                "coppad exited with PTT released; nothing to do"
+            );
+            Ok(())
+        }
+        ptt_guardian::Outcome::Released => {
+            tracing::info!(target: "coppad::ptt_guardian", "PTT released");
+            Ok(())
+        }
+        ptt_guardian::Outcome::ReleaseFailed(e) => {
+            tracing::error!(
+                target: "coppad::ptt_guardian",
+                error = %e,
+                "Could not release PTT after coppad exited; the transmitter may still be keyed"
+            );
+            Err(e)
+        }
+    }
+}
+
 async fn run_daemon(config: DaemonConfig) -> Result<()> {
     if config.engine.callsign.is_empty() {
         tracing::warn!("No callsign configured. Set [engine] callsign in config.");
@@ -120,6 +196,27 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     // unrecognized/unbuilt PTT backend -- see EventLoop::create_ptt.
     let mut event_loop = EventLoop::new(config.clone())
         .map_err(|e| anyhow::anyhow!("failed to start daemon event loop: {e}"))?;
+
+    // COP-31: for rigctld or GPIO PTT, start the out-of-process guardian
+    // that releases PTT if this process dies keyed (SIGKILL, OOM, crash).
+    // Failing to start it is logged, not fatal.
+    if event_loop.ptt_guardian_eligible() {
+        match ptt_guardian::PttGuardian::spawn(&config.radio) {
+            Ok(guardian) => {
+                tracing::info!(
+                    pid = guardian.pid().unwrap_or_default(),
+                    "PTT guardian started"
+                );
+                event_loop.set_ptt_guardian(guardian);
+            }
+            Err(e) => tracing::error!(
+                error = %e,
+                "Could not start the PTT guardian; if coppad is killed while transmitting, \
+                 PTT may stay keyed"
+            ),
+        }
+    }
+
     let event_tx = event_loop.event_sender();
 
     // Create response channel and wire it to the event loop

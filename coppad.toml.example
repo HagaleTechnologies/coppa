@@ -30,6 +30,13 @@ ptt_pre_delay_ms = 50
 ptt_tail_delay_ms = 200
 # Safety: max TX duration in seconds before forced unkey
 max_tx_duration_s = 30
+# COP-31: PTT guardian. With rigctld or GPIO PTT, coppad starts a small
+# helper process ("coppad --ptt-guardian ...") that releases PTT if coppad
+# dies while transmitting (kill -9, out-of-memory kill, crash). It does
+# nothing while coppad runs normally, and exits when coppad exits. Ignored
+# for "none", "vox" and serial PTT; for serial, the OS drops DTR/RTS when the
+# port closes. Set to false to disable.
+ptt_guardian = true
 
 # COP-40: operating-frequency source for the HF/VHF regulatory gate.
 # Required ONLY for wideband (VHF) profiles, whose 5600 Hz occupied

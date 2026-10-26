@@ -288,6 +288,14 @@ fn tnc_help_prints_the_same_usage() {
 }
 
 #[test]
+fn help_does_not_advertise_the_internal_guardian_mode() {
+    let dir = dir_with_malformed_default();
+    let help = run_ok(dir.path(), &["--help"]);
+    assert!(!help.contains("ptt-guardian"), "{help}");
+    assert!(!help.contains("guardian-rigctld-address"), "{help}");
+}
+
+#[test]
 fn version_prints_package_version_and_exits() {
     let dir = dir_with_malformed_default();
     for args in [&["--version"][..], &["-V"], &["--tnc", "--version"]] {
@@ -584,6 +592,7 @@ fn print_default_config_prints_only_the_default_toml() {
         "cp_gate_enabled = false",
         "cp_negotiation_enabled = false",
         "id_interval_secs = 540",
+        "ptt_guardian = true",
     ] {
         assert!(printed.contains(line), "missing {line:?}:\n{printed}");
     }

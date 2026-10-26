@@ -39,6 +39,13 @@ type VaraResponseSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<VaraResponse>>>>;
 /// 300 s.
 const VARA_KEEPALIVE_PERIOD: Duration = Duration::from_secs(60);
 
+/// COP-31: how far past `max_tx_duration_s` a keyed interval may run before
+/// the main loop forces PTT off itself. The normal release path ends every
+/// keyed interval by `max_tx_duration_s` (its tail is capped to what remains),
+/// so this only fires when that path has failed, e.g. the completion task
+/// in `transmit_samples` panicked before reporting.
+const PTT_BACKSTOP_GRACE: Duration = Duration::from_secs(2);
+
 /// The reply a VARA command-port client gets for one command, decided before
 /// the command takes effect. `WRONG` is only for lines coppa does not
 /// recognise or cannot apply: Pat's dial waits only for
@@ -161,6 +168,12 @@ pub struct EventLoop {
     /// connected rigctld client so the wideband gate can read the rig's dial
     /// frequency (COP-40).
     ptt: PttBackend,
+    /// COP-31: the out-of-process PTT guardian, told about every PTT
+    /// transition from `set_ptt` (rigctld/GPIO PTT only; `None` otherwise).
+    /// Declared immediately after `ptt` on purpose: fields drop in
+    /// declaration order, so the backend's own `Drop` release runs first and
+    /// only then does the guardian see EOF on its stdin.
+    ptt_guardian: Option<crate::ptt_guardian::PttGuardian>,
     /// COP-40: the operator-stated frequency source (`[radio] frequency_hz`
     /// / `band`), validated at startup -- the fallback evidence the
     /// wideband gate in `transmit_samples` uses when no live rigctld answer
@@ -189,6 +202,11 @@ pub struct EventLoop {
     /// shared by every transmission queued in it so the no-progress bound is
     /// not restarted by each newer job. Cleared whenever PTT is released.
     tx_stall_clock: Option<Arc<StallClock>>,
+    /// COP-31 test seam: when set, the completion task `transmit_samples`
+    /// spawns panics before sending its `TxComplete`, so the PTT backstop is
+    /// the only thing left that can release PTT.
+    #[cfg(test)]
+    panic_in_completion_task: bool,
     /// Last-seen value of the audio input ring's overflow counter (see
     /// `AudioRingConsumer::overflow_count`); `poll_audio_input` compares against
     /// this each poll and logs a warning when it grows (silent RX sample loss was
@@ -369,6 +387,16 @@ impl EventLoop {
             .frequency_config()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut ptt = Self::create_ptt(&config)?;
+        // COP-31: every backend assumes RX at construction; make the rig match, so
+        // a restart un-keys a transmitter an earlier run left keyed (and a Linux
+        // serial open's DTR assertion is undone). Before the frequency gate: even a
+        // refused start releases.
+        if let Err(e) = ptt.set_ptt(PttState::Rx) {
+            tracing::warn!(
+                error = %e,
+                "Could not release PTT at startup; a transmitter left keyed by an earlier run may still be keyed"
+            );
+        }
 
         // Create engine from profile; all profiles use 48kHz internally
         let engine =
@@ -470,6 +498,7 @@ impl EventLoop {
             tx_output: Arc::new(std::sync::Mutex::new(TxOutput::default())),
             audio_in: None,
             ptt,
+            ptt_guardian: None,
             radio_frequency,
             tx_held_by_frequency_gate: false,
             response_tx: None,
@@ -477,6 +506,8 @@ impl EventLoop {
             tx_generation: 0,
             tx_keyed_since: None,
             tx_stall_clock: None,
+            #[cfg(test)]
+            panic_in_completion_task: false,
             audio_in_overflow_count: 0,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             arq_tx,
@@ -537,6 +568,12 @@ impl EventLoop {
     ///
     /// A connected rigctld client is returned as `PttBackend::Rigctld`, not
     /// boxed as `dyn PttControl`, so its dial frequency stays reachable.
+    ///
+    /// COP-31: creating a backend does not touch the line; `EventLoop::new`
+    /// drives it to RX right after this returns (a failure there is a
+    /// warning, not a startup error). The rigctld, serial and GPIO backends
+    /// also release PTT on drop if they may have left it keyed, so an error
+    /// return or a panic after this point still un-keys the rig.
     fn create_ptt(config: &DaemonConfig) -> Result<PttBackend> {
         let parsed = config
             .radio
@@ -750,6 +787,19 @@ impl EventLoop {
     /// Get a sender for injecting events into the loop.
     pub fn event_sender(&self) -> mpsc::Sender<DaemonEvent> {
         self.event_tx.clone()
+    }
+
+    /// COP-31: hand the loop a running PTT guardian. From here on `set_ptt`
+    /// reports `K` before every keying and `R` after every successful unkey.
+    pub fn set_ptt_guardian(&mut self, guardian: crate::ptt_guardian::PttGuardian) {
+        self.ptt_guardian = Some(guardian);
+    }
+
+    /// COP-31: whether this daemon should run a PTT guardian: `[radio]
+    /// ptt_guardian` is on and the PTT backend is a connected rigctld client
+    /// or GPIO (see `ptt_guardian::ptt_guardian_eligible`).
+    pub fn ptt_guardian_eligible(&self) -> bool {
+        crate::ptt_guardian::ptt_guardian_eligible(&self.config.radio, self.ptt.is_rigctld())
     }
 
     /// Set the audio output ring buffer for TX sample playback.
@@ -1111,6 +1161,12 @@ impl EventLoop {
     ///
     /// Polls the event channel and optionally reads audio input samples
     /// from the ring buffer on a periodic interval.
+    ///
+    /// COP-31: a shutdown that arrives while PTT is keyed releases it (and
+    /// reports `PTT OFF`) before returning; an idle shutdown touches nothing.
+    /// Every 500 ms tick also runs the PTT backstop, which forces PTT off if
+    /// a keyed interval has outlived `max_tx_duration_s` plus
+    /// `PTT_BACKSTOP_GRACE` without the normal release path ending it.
     pub async fn run(&mut self) -> Result<()> {
         self.running = true;
         tracing::info!(profile = %self.config.engine.profile, "Event loop started");
@@ -1154,6 +1210,10 @@ impl EventLoop {
                     match event {
                         Some(DaemonEvent::Shutdown) | None => {
                             tracing::info!("Shutdown signal received");
+                            if self.is_transmitting {
+                                tracing::info!("Releasing PTT before shutdown");
+                                self.force_release_ptt().await;
+                            }
                             // E5: Signal audio threads to stop
                             self.shutdown_flag.store(true, Ordering::Release);
                             self.running = false;
@@ -1179,6 +1239,9 @@ impl EventLoop {
                     self.poll_audio_input().await;
                 }
                 _ = retransmit_poll.tick() => {
+                    // COP-31: first, so a stuck keyed interval is released
+                    // before anything else on this tick can extend it.
+                    self.enforce_ptt_backstop().await;
                     // E6: Check for ARQ retransmits
                     self.check_arq_retransmits().await;
                     self.retry_held_tx_drain().await;
@@ -2054,19 +2117,15 @@ impl EventLoop {
             return;
         }
         if !completed {
-            let (discarded, submitted) = {
-                let mut tx_output = self.tx_output();
-                (tx_output.cancel(), tx_output.submitted())
-            };
+            // Also drops what the output worker and the final sink have not
+            // yet played, so none of it plays after PTT is released.
+            let (discarded, submitted) = self.cancel_pending_tx_audio();
             tracing::error!(
                 generation,
                 discarded,
                 "Transmission cancelled before it finished playing; releasing PTT"
             );
             if let Some(feedback) = self.output_feedback.clone() {
-                // Also drop what the output worker and the final sink have
-                // not yet played, so none of it plays after PTT is released.
-                feedback.discard_through(submitted);
                 self.set_ptt(false).await;
                 // Hold the next transmission until the cancelled audio is
                 // gone; otherwise draining the TX queue rekeys at once and
@@ -2083,6 +2142,75 @@ impl EventLoop {
             }
         }
         self.handle_ptt_change(false).await;
+    }
+
+    /// Cancel the TX audio still retained ahead of the ring and, when an
+    /// output worker is wired, tell it to drop everything submitted so far
+    /// that it has not played (including the final sink's buffered tail).
+    /// Returns `(discarded, submitted)`: the samples cancelled here, and the
+    /// cumulative submitted count the output discards through. Shared by
+    /// `handle_tx_complete`'s cancel arm and `force_release_ptt`.
+    fn cancel_pending_tx_audio(&self) -> (usize, u64) {
+        let (discarded, submitted) = {
+            let mut tx_output = self.tx_output();
+            (tx_output.cancel(), tx_output.submitted())
+        };
+        if let Some(feedback) = &self.output_feedback {
+            feedback.discard_through(submitted);
+        }
+        (discarded, submitted)
+    }
+
+    /// COP-31: release PTT now and abandon the keyed interval: bump the
+    /// generation so a late `TxComplete` is stale, cancel pending TX audio, tell
+    /// the output to drop what it has not played, then `set_ptt(false)`
+    /// (hardware, `PTT OFF`, keyed-interval bookkeeping). Never drains the TX
+    /// queue: `wait_for_clear_channel` calls this, and draining from there would
+    /// recurse into `transmit_samples`.
+    async fn force_release_ptt(&mut self) {
+        self.tx_generation += 1;
+        self.cancel_pending_tx_audio();
+        self.set_ptt(false).await;
+    }
+
+    /// COP-31: how long PTT has been keyed, if that is already past
+    /// `max_tx_duration_s` plus `PTT_BACKSTOP_GRACE` (`None` when not keyed,
+    /// or not yet overdue).
+    fn ptt_backstop_overdue(&self) -> Option<Duration> {
+        if !self.is_transmitting {
+            return None;
+        }
+        let keyed_since = self.tx_keyed_since?;
+        let limit = Duration::from_secs(self.config.radio.max_tx_duration_s) + PTT_BACKSTOP_GRACE;
+        let now = tokio::time::Instant::now();
+        (keyed_since + limit <= now).then(|| now.duration_since(keyed_since))
+    }
+
+    /// COP-31: log that the PTT backstop is forcing PTT off after `keyed`.
+    fn log_ptt_backstop(&self, keyed: Duration) {
+        tracing::error!(
+            keyed_ms = keyed.as_millis() as u64,
+            max_tx_duration_s = self.config.radio.max_tx_duration_s,
+            grace_ms = PTT_BACKSTOP_GRACE.as_millis() as u64,
+            "PTT backstop: keyed past max_tx_duration_s plus grace with no release; \
+             forcing PTT off"
+        );
+    }
+
+    /// COP-31: the in-loop PTT backstop, run first on `run()`'s 500 ms tick.
+    /// If the keyed interval is overdue (see `ptt_backstop_overdue`), cancel
+    /// it through the same path a failed transmission takes: bump the
+    /// generation so the stuck job's late `TxComplete` is stale, then
+    /// `handle_tx_complete` with the new generation (cancel, discard, release,
+    /// wait for the discard, drain the queue).
+    async fn enforce_ptt_backstop(&mut self) {
+        let Some(keyed) = self.ptt_backstop_overdue() else {
+            return;
+        };
+        self.log_ptt_backstop(keyed);
+        self.tx_generation += 1;
+        let generation = self.tx_generation;
+        self.handle_tx_complete(generation, false).await;
     }
 
     /// Transmit encoded audio samples: assert PTT, queue every sample for the
@@ -2216,6 +2344,8 @@ impl EventLoop {
                 + (self.config.audio.buffer_size as u64 * 1000) / sample_rate,
         );
         let ptt_event_tx = self.event_tx.clone();
+        #[cfg(test)]
+        let panic_in_completion_task = self.panic_in_completion_task;
         tokio::spawn(async move {
             let completed = match feedback {
                 // An output worker is wired but its ring is gone: nothing
@@ -2264,6 +2394,10 @@ impl EventLoop {
                     );
                 }
                 tokio::time::sleep(tail.min(remaining)).await;
+            }
+            #[cfg(test)]
+            if panic_in_completion_task {
+                panic!("COP-31 test seam: completion task dies before reporting");
             }
             if let Err(e) = ptt_event_tx
                 .send(DaemonEvent::TxComplete {
@@ -2315,16 +2449,30 @@ impl EventLoop {
             while self.busy_gate.current() {
                 self.observe_busy_gate_from_audio_input().await;
                 tokio::time::sleep(Duration::from_millis(hold_ms)).await;
+                self.release_overdue_ptt_while_waiting().await;
             }
 
             let holdoff_secs: f32 = rand::rng().random_range(0.5f32..2.0f32);
             tokio::time::sleep(Duration::from_secs_f32(holdoff_secs)).await;
+            self.release_overdue_ptt_while_waiting().await;
             self.observe_busy_gate_from_audio_input().await; // pick up anything that arrived during the holdoff
 
             if !self.busy_gate.current() {
                 return;
             }
             // Busy again during the holdoff -- loop back and wait again.
+        }
+    }
+
+    /// COP-31: the PTT backstop inside `wait_for_clear_channel`, which can
+    /// hold `run()` (and with it the 500 ms backstop tick and the keyed
+    /// interval's own `TxComplete`) for as long as the channel reads busy.
+    /// Releases without draining the TX queue: draining would recurse into
+    /// `transmit_samples`, which called the wait this runs in.
+    async fn release_overdue_ptt_while_waiting(&mut self) {
+        if let Some(keyed) = self.ptt_backstop_overdue() {
+            self.log_ptt_backstop(keyed);
+            self.force_release_ptt().await;
         }
     }
 
@@ -3419,10 +3567,28 @@ impl EventLoop {
 
     /// Change physical PTT and the keyed-interval bookkeeping, without
     /// draining the TX queue on release (see `handle_ptt_change`).
+    ///
+    /// COP-31: this is the only place the daemon drives its PTT backend, and
+    /// so the only place the PTT guardian hears about it: `K` before keying
+    /// (a keying whose reply is lost may still have keyed the rig) and `R`
+    /// only after an unkey that succeeded, so a failed unkey leaves the
+    /// guardian armed. A new direct `self.ptt.set_ptt` call must report too.
     async fn set_ptt(&mut self, tx: bool) {
         let state = if tx { PttState::Tx } else { PttState::Rx };
-        if let Err(e) = self.ptt.set_ptt(state) {
-            tracing::warn!(error = %e, "PTT control error");
+        if tx {
+            if let Some(guardian) = self.ptt_guardian.as_mut() {
+                guardian.report(true);
+            }
+        }
+        match self.ptt.set_ptt(state) {
+            Ok(()) => {
+                if !tx {
+                    if let Some(guardian) = self.ptt_guardian.as_mut() {
+                        guardian.report(false);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "PTT control error"),
         }
         tracing::info!(state = if tx { "TX" } else { "RX" }, "PTT state change");
         // Telemetry: VaraResponse::Ptt at the same moment physical PTT changes
@@ -3430,6 +3596,10 @@ impl EventLoop {
         self.emit_vara(VaraResponse::Ptt(tx)).await;
         if tx {
             self.is_transmitting = true;
+            // COP-31: every keying path starts the keyed-interval clock the
+            // PTT backstop measures (`transmit_samples` then just reads it).
+            self.tx_keyed_since
+                .get_or_insert_with(tokio::time::Instant::now);
         } else {
             self.is_transmitting = false;
             self.tx_keyed_since = None;
@@ -10323,6 +10493,490 @@ mod tests {
             assert!(event_loop.engine.occupied_bandwidth_hz() > 2_800);
             event_loop.transmit_samples(&SAMPLES).await;
             assert_eq!(event_loop.tx_generation, 0);
+        }
+    }
+
+    // ── COP-31: PTT is released on every exit path ──
+
+    mod cop31_ptt_release {
+        use super::*;
+        use crate::ptt_guardian::PttGuardian;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        /// PTT backend recording every state change, with the Tokio time it
+        /// happened, into a shared ordered log (the same shape as `tnc.rs`'s
+        /// `RecordingPtt`).
+        #[derive(Clone, Default)]
+        struct RecordingPtt {
+            log: Arc<std::sync::Mutex<Vec<(PttState, tokio::time::Instant)>>>,
+        }
+
+        impl RecordingPtt {
+            fn states(&self) -> Vec<PttState> {
+                self.log.lock().unwrap().iter().map(|(s, _)| *s).collect()
+            }
+        }
+
+        impl PttControl for RecordingPtt {
+            fn set_ptt(&mut self, state: PttState) -> Result<()> {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push((state, tokio::time::Instant::now()));
+                Ok(())
+            }
+
+            fn get_ptt(&mut self) -> Result<PttState> {
+                Ok(self
+                    .log
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .map_or(PttState::Rx, |(s, _)| *s))
+            }
+        }
+
+        /// One ordered log shared by a PTT backend (`ptt:Tx`/`ptt:Rx`) and a
+        /// guardian link (`guardian:K`/`guardian:R`), so a test can see which
+        /// came first.
+        type SharedLog = Arc<std::sync::Mutex<Vec<String>>>;
+
+        /// PTT backend writing into a [`SharedLog`]. With `fail_rx`, an
+        /// unkey fails (and logs nothing), like a rigctld answering
+        /// `RPRT -1`.
+        struct LoggingPtt {
+            log: SharedLog,
+            fail_rx: bool,
+        }
+
+        impl PttControl for LoggingPtt {
+            fn set_ptt(&mut self, state: PttState) -> Result<()> {
+                if state == PttState::Rx && self.fail_rx {
+                    anyhow::bail!("unkey refused");
+                }
+                self.log.lock().unwrap().push(format!("ptt:{state:?}"));
+                Ok(())
+            }
+
+            fn get_ptt(&mut self) -> Result<PttState> {
+                Ok(PttState::Rx)
+            }
+        }
+
+        /// The guardian's end of the link: each report byte becomes a
+        /// `guardian:<byte>` entry in the [`SharedLog`].
+        struct GuardianLink(SharedLog);
+
+        impl Write for GuardianLink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let mut log = self.0.lock().unwrap();
+                for &byte in buf {
+                    log.push(format!("guardian:{}", byte as char));
+                }
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// An event loop whose PTT and guardian both write into one
+        /// [`SharedLog`].
+        fn guarded_event_loop(fail_rx: bool) -> (EventLoop, SharedLog) {
+            let mut config = DaemonConfig::default();
+            config.radio.ptt_pre_delay_ms = 0;
+            config.radio.ptt_tail_delay_ms = 0;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let log = SharedLog::default();
+            event_loop.ptt = PttBackend::Other(Box::new(LoggingPtt {
+                log: log.clone(),
+                fail_rx,
+            }));
+            event_loop.set_ptt_guardian(PttGuardian::from_writer(Box::new(GuardianLink(
+                log.clone(),
+            ))));
+            (event_loop, log)
+        }
+
+        /// Capture the VARA telemetry an event loop broadcasts.
+        fn capture_vara(event_loop: &mut EventLoop) -> mpsc::Receiver<VaraResponse> {
+            let (tx, rx) = mpsc::channel(256);
+            event_loop.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, tx)]))));
+            rx
+        }
+
+        /// The `PTT ON`/`PTT OFF` lines received so far, in order.
+        fn ptt_lines(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<bool> {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|response| match response {
+                    VaraResponse::Ptt(on) => Some(on),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// A recording fake rigctld (COP-31's own; `cop40_frequency_gate`'s
+        /// `FakeRig` is left alone). Accepts any number of connections and
+        /// logs every command line, in order, before answering it: `f` with
+        /// `freq`, `t` with the PTT state, `T <n>` with `RPRT 0` (or, with
+        /// `refuse_ptt`, `RPRT -1` and the state unchanged).
+        struct RecordingRig {
+            addr: String,
+            commands: Arc<std::sync::Mutex<Vec<String>>>,
+            ptt: Arc<std::sync::Mutex<String>>,
+        }
+
+        impl RecordingRig {
+            fn commands(&self) -> Vec<String> {
+                self.commands.lock().unwrap().clone()
+            }
+
+            fn ptt(&self) -> String {
+                self.ptt.lock().unwrap().clone()
+            }
+        }
+
+        fn recording_rigctld(initial_ptt: &str, freq: &str, refuse_ptt: bool) -> RecordingRig {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let ptt = Arc::new(std::sync::Mutex::new(initial_ptt.to_string()));
+            let (log, state, freq) = (Arc::clone(&commands), Arc::clone(&ptt), freq.to_string());
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { return };
+                    let (log, state, freq) = (Arc::clone(&log), Arc::clone(&state), freq.clone());
+                    std::thread::spawn(move || {
+                        let mut writer = stream.try_clone().unwrap();
+                        for line in BufReader::new(stream).lines() {
+                            let Ok(line) = line else { break };
+                            let cmd = line.trim().to_string();
+                            log.lock().unwrap().push(cmd.clone());
+                            let reply = match cmd.as_str() {
+                                "f" => freq.clone(),
+                                "t" => state.lock().unwrap().clone(),
+                                c if c.starts_with("T ") => {
+                                    if refuse_ptt {
+                                        "RPRT -1".to_string()
+                                    } else {
+                                        *state.lock().unwrap() = c[2..].to_string();
+                                        "RPRT 0".to_string()
+                                    }
+                                }
+                                _ => "RPRT -1".to_string(),
+                            };
+                            if writeln!(writer, "{reply}").is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+            RecordingRig {
+                addr,
+                commands,
+                ptt,
+            }
+        }
+
+        /// The default (narrowband HF) config with rigctld PTT at `rig`.
+        fn rigctld_config(rig: &RecordingRig) -> DaemonConfig {
+            let mut config = DaemonConfig::default();
+            config.radio.ptt_method = "rigctld".into();
+            config.radio.rigctld_address = rig.addr.clone();
+            config.radio.ptt_pre_delay_ms = 0;
+            config.radio.ptt_tail_delay_ms = 0;
+            config
+        }
+
+        // ── Phase 2: shutdown and startup release ──
+
+        #[tokio::test]
+        async fn shutdown_mid_transmission_releases_ptt_and_reports_ptt_off() {
+            let mut rig = TxRig::new(DaemonConfig::default());
+            let rec = RecordingPtt::default();
+            rig.event_loop.ptt = PttBackend::Other(Box::new(rec.clone()));
+            let mut vara = capture_vara(&mut rig.event_loop);
+            // Nothing pumps the output, so this stays keyed until shutdown.
+            rig.event_loop
+                .transmit_samples(&vec![0.25f32; 48_000 * 5])
+                .await;
+            assert!(rig.event_loop.is_transmitting);
+
+            rig.event_loop
+                .event_sender()
+                .send(DaemonEvent::Shutdown)
+                .await
+                .unwrap();
+            rig.event_loop.run().await.unwrap();
+
+            assert_eq!(rec.states(), [PttState::Tx, PttState::Rx]);
+            assert_eq!(ptt_lines(&mut vara), [true, false]);
+            assert!(!rig.event_loop.is_transmitting);
+            assert_eq!(rig.event_loop.tx_output().pending_len(), 0);
+        }
+
+        #[tokio::test]
+        async fn shutdown_while_idle_does_not_touch_ptt() {
+            let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+            let rec = RecordingPtt::default();
+            event_loop.ptt = PttBackend::Other(Box::new(rec.clone()));
+            event_loop
+                .event_sender()
+                .send(DaemonEvent::Shutdown)
+                .await
+                .unwrap();
+            event_loop.run().await.unwrap();
+            assert!(rec.states().is_empty(), "{:?}", rec.states());
+        }
+
+        #[test]
+        fn startup_releases_ptt_left_keyed_by_an_earlier_run() {
+            let rig = recording_rigctld("1", "14074000", false);
+            let event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            assert_eq!(rig.commands(), ["T 0"]);
+            assert_eq!(rig.ptt(), "0");
+            drop(event_loop);
+        }
+
+        #[test]
+        fn a_failed_startup_release_does_not_stop_the_daemon() {
+            let rig = recording_rigctld("1", "14074000", true);
+            assert!(EventLoop::new(rigctld_config(&rig)).is_ok());
+            assert_eq!(rig.commands(), ["T 0"], "the release was attempted");
+        }
+
+        #[test]
+        fn startup_release_happens_even_when_the_frequency_gate_refuses() {
+            let rig = recording_rigctld("1", "14074000", false);
+            let mut config = rigctld_config(&rig);
+            config.engine.profile = "VHF_FAST".into();
+            let err = EventLoop::new(config)
+                .err()
+                .expect("a wideband profile on 20 m must be refused")
+                .to_string();
+            assert!(err.contains("97.307"), "{err}");
+            let commands = rig.commands();
+            assert_eq!(
+                commands.first().map(String::as_str),
+                Some("T 0"),
+                "PTT is released before the gate asks for the frequency: {commands:?}"
+            );
+            assert!(commands.iter().any(|c| c == "f"), "{commands:?}");
+            assert_eq!(rig.ptt(), "0");
+        }
+
+        #[tokio::test]
+        async fn dropping_a_keyed_event_loop_releases_ptt() {
+            let rig = recording_rigctld("0", "14074000", false);
+            let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            event_loop
+                .transmit_samples(&vec![0.25f32; 48_000 * 5])
+                .await;
+            assert!(event_loop.is_transmitting);
+            assert_eq!(rig.commands(), ["T 0", "T 1"]);
+            drop(event_loop);
+            assert_eq!(rig.commands(), ["T 0", "T 1", "T 0"]);
+            assert_eq!(rig.ptt(), "0");
+        }
+
+        // ── Phase 3: the in-loop PTT backstop ──
+
+        /// `TxRig` with `max_tx_duration_s = 1`, so the backstop deadline is
+        /// 1 s + `PTT_BACKSTOP_GRACE` after keying.
+        fn backstop_rig() -> TxRig {
+            let mut config = DaemonConfig::default();
+            config.radio.max_tx_duration_s = 1;
+            TxRig::new(config)
+        }
+
+        fn backstop_deadline() -> Duration {
+            Duration::from_secs(1) + PTT_BACKSTOP_GRACE
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn backstop_releases_ptt_when_no_completion_arrives() {
+            let mut rig = backstop_rig();
+            rig.event_loop
+                .transmit_samples(&vec![0.5f32; 48_000 * 10])
+                .await;
+            assert!(rig.event_loop.is_transmitting);
+
+            tokio::time::sleep(backstop_deadline() - Duration::from_millis(100)).await;
+            rig.event_loop.enforce_ptt_backstop().await;
+            assert!(rig.event_loop.is_transmitting, "not overdue yet");
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            rig.event_loop.enforce_ptt_backstop().await;
+            assert!(!rig.event_loop.is_transmitting);
+            assert_eq!(rig.event_loop.tx_keyed_since, None);
+            assert_eq!(rig.event_loop.ptt.get_ptt().unwrap(), PttState::Rx);
+            assert_eq!(rig.event_loop.tx_output().pending_len(), 0);
+            assert_eq!(rig.event_loop.tx_generation, 2);
+
+            // The stuck job's completion, arriving late, is stale.
+            rig.event_loop.handle_tx_complete(1, false).await;
+            assert!(!rig.event_loop.is_transmitting);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn backstop_is_silent_while_the_completion_path_works() {
+            let mut rig = backstop_rig();
+            let rec = RecordingPtt::default();
+            rig.event_loop.ptt = PttBackend::Other(Box::new(rec.clone()));
+            let samples = vec![0.25f32; 4_800];
+
+            rig.event_loop.enforce_ptt_backstop().await;
+            assert!(rec.states().is_empty(), "idle: nothing to release");
+
+            rig.event_loop.transmit_samples(&samples).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            rig.event_loop.enforce_ptt_backstop().await;
+            assert!(rig.event_loop.is_transmitting, "inside the deadline");
+
+            rig.deliver(samples.len(), &[480]);
+            let (generation, completed) = rig.next_completion().await;
+            assert_eq!((generation, completed), (1, true));
+            rig.event_loop
+                .handle_tx_complete(generation, completed)
+                .await;
+            assert!(!rig.event_loop.is_transmitting);
+
+            tokio::time::sleep(backstop_deadline() * 2).await;
+            rig.event_loop.enforce_ptt_backstop().await;
+            assert_eq!(rec.states(), [PttState::Tx, PttState::Rx], "no second RX");
+            assert_eq!(rig.event_loop.tx_generation, 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn run_loop_backstop_recovers_from_a_panicked_completion_task() {
+            let mut rig = backstop_rig();
+            rig.event_loop.panic_in_completion_task = true;
+            let rec = RecordingPtt::default();
+            rig.event_loop.ptt = PttBackend::Other(Box::new(rec.clone()));
+
+            let keyed = tokio::time::Instant::now();
+            rig.event_loop
+                .transmit_samples(&vec![0.5f32; 48_000 * 10])
+                .await;
+            let shutdown_at = keyed + Duration::from_secs(10);
+            let events = rig.event_loop.event_sender();
+            tokio::spawn(async move {
+                tokio::time::sleep_until(shutdown_at).await;
+                events.send(DaemonEvent::Shutdown).await.unwrap();
+            });
+            rig.event_loop.run().await.unwrap();
+
+            let log = rec.log.lock().unwrap().clone();
+            assert_eq!(
+                log.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+                [PttState::Tx, PttState::Rx],
+                "the backstop released PTT once, and shutdown found nothing keyed"
+            );
+            let released = log[1].1 - keyed;
+            assert!(
+                released >= backstop_deadline()
+                    && released <= backstop_deadline() + Duration::from_millis(600),
+                "PTT released {released:?} after keying; expected within one 500 ms tick \
+                 of {:?}",
+                backstop_deadline()
+            );
+            assert!(log[1].1 < shutdown_at, "released before shutdown");
+        }
+
+        /// Same busy-burst injection as `station_id`'s
+        /// `test_transmit_deferred_while_busy_then_holdoff_applied`.
+        fn noise_block(amplitude: f32, counter: &mut u32) -> Vec<f32> {
+            (0..1024)
+                .map(|_| {
+                    *counter = counter.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    amplitude * ((*counter >> 8) as f32 / (1u32 << 24) as f32 - 0.5)
+                })
+                .collect()
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn backstop_fires_inside_a_busy_channel_wait() {
+            let mut config = DaemonConfig::default();
+            config.radio.max_tx_duration_s = 1;
+            config.station_id.busy_hold_ms = 10;
+            let mut rig = TxRig::new(config);
+            let mut vara = capture_vara(&mut rig.event_loop);
+
+            // Key a first transmission while the channel is still clear.
+            rig.event_loop
+                .transmit_samples(&vec![0.5f32; 48_000 * 10])
+                .await;
+            assert!(rig.event_loop.is_transmitting);
+
+            // Then the channel goes busy, and nothing ever feeds the gate
+            // quiet audio, so the next transmission's courtesy wait never
+            // ends on its own.
+            let mut counter = 1u32;
+            for _ in 0..10 {
+                rig.event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.01, &mut counter));
+            }
+            for _ in 0..5 {
+                rig.event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.5, &mut counter));
+            }
+            assert!(rig.event_loop.busy_gate.current());
+
+            let second = vec![0.25f32; 500];
+            let waited = tokio::time::timeout(
+                Duration::from_secs(5),
+                rig.event_loop.transmit_samples(&second),
+            )
+            .await;
+            assert!(waited.is_err(), "the channel never cleared");
+            assert!(!rig.event_loop.is_transmitting);
+            assert_eq!(rig.event_loop.ptt.get_ptt().unwrap(), PttState::Rx);
+            assert_eq!(ptt_lines(&mut vara), [true, false]);
+        }
+
+        // ── Phase 4: the PTT guardian hears every transition ──
+
+        #[tokio::test]
+        async fn guardian_hears_keyed_before_keying_and_released_after_unkeying() {
+            let (mut event_loop, log) = guarded_event_loop(false);
+            event_loop.transmit_samples(&[0.25f32; 480]).await;
+            event_loop.handle_tx_complete(1, true).await;
+            assert_eq!(
+                *log.lock().unwrap(),
+                ["guardian:K", "ptt:Tx", "ptt:Rx", "guardian:R"]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_failed_unkey_leaves_the_guardian_armed() {
+            let (mut event_loop, log) = guarded_event_loop(true);
+            event_loop.transmit_samples(&[0.25f32; 480]).await;
+            event_loop.handle_tx_complete(1, true).await;
+            let log = log.lock().unwrap().clone();
+            assert_eq!(log, ["guardian:K", "ptt:Tx"]);
+            assert!(!log.iter().any(|entry| entry == "guardian:R"), "{log:?}");
+        }
+
+        #[tokio::test]
+        async fn shutdown_release_tells_the_guardian() {
+            let (mut event_loop, log) = guarded_event_loop(false);
+            event_loop
+                .transmit_samples(&vec![0.25f32; 48_000 * 5])
+                .await;
+            event_loop
+                .event_sender()
+                .send(DaemonEvent::Shutdown)
+                .await
+                .unwrap();
+            event_loop.run().await.unwrap();
+            let log = log.lock().unwrap().clone();
+            assert_eq!(log, ["guardian:K", "ptt:Tx", "ptt:Rx", "guardian:R"]);
+            assert_eq!(log.last().map(String::as_str), Some("guardian:R"));
         }
     }
 }
