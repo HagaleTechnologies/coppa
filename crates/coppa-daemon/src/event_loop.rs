@@ -29,6 +29,7 @@ use crate::audio_output::{
     TxOutput, PROGRESS_TICK,
 };
 use crate::config::DaemonConfig;
+use crate::level_meter::{self, LevelReading, LevelState, RxLevelMeter};
 use crate::tx_chunker::chunk_to_fit;
 
 /// Map of connected VARA command-port clients' response senders
@@ -39,6 +40,11 @@ type VaraResponseSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<VaraResponse>>>>;
 /// 60 s; Pat closes the modem after 2 minutes without a line, and vARIM after
 /// 300 s.
 const VARA_KEEPALIVE_PERIOD: Duration = Duration::from_secs(60);
+
+/// COP-37: what every transmit path logs, at `ERROR`, when it refuses
+/// because no valid local callsign is in force (`local_callsign` is `None`).
+const NO_CALLSIGN_TX_REFUSAL: &str = "Transmission refused: no valid local callsign; \
+     set [engine] callsign or MYCALL before transmitting";
 
 /// How often `wait_for_rx_turnaround` drains the input ring: `run()`'s
 /// `audio_poll` cadence, so the ring never fills during the hold.
@@ -84,7 +90,8 @@ struct SessionTxChunk {
 /// - `MYCALL <call>` valid → `OK` (the daemon applies it as the runtime
 ///   callsign); invalid or missing → `WRONG`.
 /// - `LISTEN ON`/`LISTEN OFF` → `OK`; any other argument → `WRONG`.
-/// - `TUNE [seconds]` (coppa extension) → `OK`.
+/// - `TUNE [seconds]` (coppa extension) → `OK`, even when the tone itself is
+///   then refused for want of a callsign (`transmit_samples` logs why).
 /// - `CONNECT <src> <dst>` → `OK` (then the eventual `CONNECTED`/`DISCONNECTED`
 ///   outcome); fewer than two callsigns → `WRONG`.
 /// - `DISCONNECT` → `OK` (then `DISCONNECTED` if a session existed).
@@ -176,6 +183,33 @@ fn lock_tx_output(tx_output: &std::sync::Mutex<TxOutput>) -> std::sync::MutexGua
     tx_output
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Log an RX level state change (COP-65): a WARN naming the fix on entering
+/// `Clipping` or `Underdrive`, an INFO on recovery. dB fields go through
+/// `level_meter::round_db`, as the WebSocket message does, so logs and wire
+/// always show the same number.
+fn log_rx_level_transition(state: LevelState, reading: &LevelReading) {
+    let msg = level_meter::rx_transition_message(state, reading);
+    let peak_dbfs = level_meter::round_db(reading.peak_dbfs);
+    let rms_dbfs = level_meter::round_db(reading.rms_dbfs);
+    match state {
+        LevelState::Clipping => tracing::warn!(
+            peak_dbfs,
+            rms_dbfs,
+            clipped_percent = level_meter::round_db(reading.clip_fraction * 100.0),
+            "{msg}"
+        ),
+        LevelState::Underdrive if reading.rms_dbfs <= level_meter::SILENCE_FLOOR_DBFS => {
+            tracing::warn!(rms_dbfs, "{msg}")
+        }
+        LevelState::Underdrive => tracing::warn!(
+            rms_dbfs,
+            threshold_dbfs = level_meter::UNDERDRIVE_RMS_DBFS,
+            "{msg}"
+        ),
+        LevelState::Ok => tracing::info!(peak_dbfs, rms_dbfs, "{msg}"),
+    }
 }
 
 /// The main daemon event loop.
@@ -351,11 +385,17 @@ pub struct EventLoop {
     /// Spectral-occupancy busy gate (decision 8: `BUSY ON`/`OFF` telemetry), fed
     /// raw incoming audio in `handle_audio_in`.
     busy_gate: BusyGate,
+    /// RX audio level meter (COP-65), fed raw incoming audio by
+    /// `observe_rx_level` from both raw RX taps; see that method's doc.
+    rx_level_meter: RxLevelMeter,
     /// Session manager for connected-mode operation.
     session_mgr: SessionManager,
     /// Local station callsign: `[engine] callsign` at startup, replaced by a
     /// valid command-port `MYCALL`. New sessions, station ID and beacons read
-    /// it. A session keeps the callsign it was set up with.
+    /// it. A session keeps the callsign it was set up with. COP-37: `None`
+    /// (empty or invalid config, no valid `MYCALL` yet) refuses every
+    /// transmission -- see `transmit_samples`. Nothing ever sets it back to
+    /// `None`, so a payload accepted for TX keeps its callsign.
     local_callsign: Option<Callsign>,
     /// How often `run()` sends `IAMALIVE` to every command-port client;
     /// `VARA_KEEPALIVE_PERIOD` outside tests.
@@ -464,17 +504,17 @@ impl EventLoop {
                 Ok(cs) => Some(cs),
                 Err(e) => {
                     // A non-empty but unparseable callsign string leaves
-                    // `local_callsign` at `None`, which silently disables the
-                    // station-ID timer and beacon mode (both check
-                    // `local_callsign.is_some()`, not the raw config string --
-                    // see `id_due`/`maybe_send_beacon`). Warn once at startup
-                    // so this doesn't look like the feature is "on" per config
-                    // but never actually fires.
+                    // `local_callsign` at `None`, exactly like an empty one:
+                    // the daemon still starts and receives, but every
+                    // transmission is refused (COP-37, `transmit_samples`),
+                    // and with it station ID, beacons and connects. Warn
+                    // once at startup so the operator learns why before the
+                    // first refusal.
                     tracing::warn!(
                         callsign = %config.engine.callsign,
                         error = %e,
-                        "Invalid [engine] callsign; station ID/beacon and \
-                         connect handling will be unavailable"
+                        "Invalid [engine] callsign; transmission disabled until a \
+                         valid MYCALL is set"
                     );
                     None
                 }
@@ -482,6 +522,7 @@ impl EventLoop {
         };
 
         let busy_gate = BusyGate::new(config.audio.sample_rate as f32);
+        let rx_level_meter = RxLevelMeter::new(config.audio.sample_rate);
         #[cfg(feature = "websocket")]
         let spectrum_sensor = coppa_ml::SpectrumSensor::new(
             crate::spectrum::SPECTRUM_FFT_SIZE,
@@ -567,6 +608,7 @@ impl EventLoop {
             tx_on_air_bytes: 0,
             last_reported_buffer: 0,
             busy_gate,
+            rx_level_meter,
             session_mgr: SessionManager::new(),
             local_callsign,
             vara_keepalive_period: VARA_KEEPALIVE_PERIOD,
@@ -1641,9 +1683,7 @@ impl EventLoop {
     /// to run full dispatch again.
     async fn observe_busy_gate_from_audio_input(&mut self) {
         if let Some(buf) = self.drain_audio_input_ring() {
-            if let Some(new_state) = self.busy_gate.observe(&buf) {
-                self.emit_vara(VaraResponse::Busy(new_state)).await;
-            }
+            self.observe_raw_rx(&buf).await;
             self.pending_busy_wait_audio.extend_from_slice(&buf);
         }
     }
@@ -1708,6 +1748,15 @@ impl EventLoop {
                         bytes = data.len(),
                         "No established session; host data dropped, not transmitted"
                     );
+                    return;
+                }
+
+                // COP-37: refuse here, before ARQ registration or queueing,
+                // so a refused payload leaves no outstanding ARQ segment or
+                // `BUFFER` count behind. (An established session above
+                // implies a callsign: both connect paths require one.)
+                if self.local_callsign.is_none() {
+                    tracing::error!(client_id, bytes = data.len(), "{NO_CALLSIGN_TX_REFUSAL}");
                     return;
                 }
 
@@ -1899,15 +1948,104 @@ impl EventLoop {
     }
 
     async fn handle_audio_in(&mut self, samples: &[f32]) {
+        self.observe_raw_rx(samples).await;
+        #[cfg(feature = "websocket")]
+        self.maybe_broadcast_spectrum(samples);
+        self.decode_and_dispatch_audio(samples).await;
+    }
+
+    /// The observation prelude shared by both raw RX taps (`handle_audio_in`
+    /// and `observe_busy_gate_from_audio_input`). Each raw sample passes
+    /// through exactly one of them, so everything here sees every sample
+    /// exactly once; decode stays split out (Finding 1) and is not part of
+    /// this.
+    async fn observe_raw_rx(&mut self, samples: &[f32]) {
         // Spectral-occupancy busy gate (decision 8): fed every incoming audio
         // block, regardless of whether it ends up containing a decodable frame.
         // Only emits telemetry on an actual BUSY ON/OFF transition.
         if let Some(new_state) = self.busy_gate.observe(samples) {
             self.emit_vara(VaraResponse::Busy(new_state)).await;
         }
+        self.observe_rx_level(samples);
+    }
+
+    /// COP-65: meter raw RX audio (both raw taps call this through
+    /// `observe_raw_rx`, so every sample is metered exactly once). Logs a
+    /// WARN/INFO line only when the RX level state changes, never per window,
+    /// and broadcasts one `audio_level` message per 100 ms window when a
+    /// WebSocket host is attached.
+    ///
+    /// Paused while transmitting: the input then carries the radio's muted
+    /// output or its own TX monitor, not the channel. The in-progress window
+    /// is discarded rather than merged with post-TX audio.
+    fn observe_rx_level(&mut self, samples: &[f32]) {
+        if self.is_transmitting {
+            self.rx_level_meter.discard_partial_window();
+            return;
+        }
+        for update in self.rx_level_meter.observe(samples) {
+            if update.transition.is_some() {
+                log_rx_level_transition(update.state, &update.reading);
+            }
+            #[cfg(feature = "websocket")]
+            self.broadcast_audio_level(
+                coppa_host::websocket::AudioLevelDirection::Rx,
+                &update.reading,
+                update.state,
+            );
+        }
+    }
+
+    /// COP-65: measure one whole transmission as it will play (station-ID
+    /// prepend included), log one `TX audio level` INFO line, warn if any
+    /// sample is digitally clipped, and broadcast a `tx` `audio_level`
+    /// message when a WebSocket host is attached.
+    fn report_tx_level(&self, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
+        let reading = level_meter::measure(samples);
+        let state = level_meter::tx_state(&reading);
+        tracing::info!(
+            peak_dbfs = level_meter::round_db(reading.peak_dbfs),
+            rms_dbfs = level_meter::round_db(reading.rms_dbfs),
+            duration_ms = level_meter::duration_ms(&reading, self.config.audio.sample_rate),
+            "TX audio level"
+        );
+        if state == LevelState::Clipping {
+            tracing::warn!(
+                peak_dbfs = level_meter::round_db(reading.peak_dbfs),
+                clipped_percent = level_meter::round_db(reading.clip_fraction * 100.0),
+                "{}",
+                level_meter::TX_CLIPPING_MESSAGE
+            );
+        }
         #[cfg(feature = "websocket")]
-        self.maybe_broadcast_spectrum(samples);
-        self.decode_and_dispatch_audio(samples).await;
+        self.broadcast_audio_level(
+            coppa_host::websocket::AudioLevelDirection::Tx,
+            &reading,
+            state,
+        );
+    }
+
+    /// Broadcast one `audio_level` message over `ws_broadcast` (COP-65). A
+    /// no-op when no host is attached, like `maybe_broadcast_spectrum`;
+    /// per-client opt-in filtering happens on the `coppa-host::websocket`
+    /// side.
+    #[cfg(feature = "websocket")]
+    fn broadcast_audio_level(
+        &self,
+        direction: coppa_host::websocket::AudioLevelDirection,
+        reading: &LevelReading,
+        state: LevelState,
+    ) {
+        let Some(ref ws_tx) = self.ws_broadcast else {
+            return;
+        };
+        let msg = level_meter::ws_message(direction, reading, state, self.config.audio.sample_rate);
+        if let Ok(json) = serde_json::to_string(&msg) {
+            let _ = ws_tx.send(json);
+        }
     }
 
     /// Waterfall spectrum production (Phase 4 Task 4): accumulate `samples`
@@ -2486,11 +2624,34 @@ impl EventLoop {
     /// wait, and again after the wait before the station-ID prepend, PTT,
     /// or any audio. A refused transmission keys nothing and queues
     /// nothing. Callers observe a lost transmission, which ARQ already
+<<<<<<< HEAD
     /// retransmits or times out on like any other loss. COP-21: a refusal
     /// also rebinds a level-derived engine to HF, so the next frame it
     /// encodes is HF-legal; the refused samples themselves are never
     /// re-encoded.
+=======
+    /// retransmits or times out on like any other loss.
+    ///
+    /// COP-37: before either, no valid local callsign (`local_callsign` is
+    /// `None`: `[engine] callsign` empty or invalid and no valid `MYCALL`
+    /// since) refuses the transmission outright, logging
+    /// `NO_CALLSIGN_TX_REFUSAL` at `ERROR` for each attempt. This covers
+    /// every caller, including `TUNE`, which no upstream feature gate sees.
+>>>>>>> af7712e23e02222bf6db1e6e23da05aa8795fe2c
     async fn transmit_samples(&mut self, samples: &[f32]) {
+        if self.local_callsign.is_none() {
+            tracing::error!("{NO_CALLSIGN_TX_REFUSAL}");
+            if !self.is_transmitting {
+                // As for the wideband refusal below, the refused payload
+                // never reaches the air, so no PTT release will drop it from
+                // `BUFFER`. Nothing is held for a retry: a payload is only
+                // queued with a callsign in force (see the sessionless
+                // `DataReceived` path), and nothing clears it once set.
+                self.tx_on_air_bytes = 0;
+                self.report_buffer().await;
+            }
+            return;
+        }
         let allowed = if self.wideband_frequency_check().is_ok() {
             self.wait_for_clear_channel().await;
             self.wait_for_rx_turnaround().await;
@@ -2542,6 +2703,10 @@ impl EventLoop {
         } else {
             samples
         };
+
+        // COP-65: the complete waveform about to play, after the gate (a
+        // refused transmission returned above and reports nothing).
+        self.report_tx_level(samples);
 
         // Assert PTT before transmitting
         self.handle_ptt_change(true).await;
@@ -2662,10 +2827,11 @@ impl EventLoop {
     /// Deliberately independent of `callsign`/station-ID configuration
     /// (unlike `id_due`/`maybe_send_beacon`, which both require
     /// `local_callsign.is_some()`): channel courtesy is basic good operating
-    /// practice, not a regulatory identification requirement, so it applies
-    /// even when no callsign is configured. Confirmed with Tony (project
-    /// owner) as a deliberate design decision, not an oversight against the
-    /// brief's literal "all three features off when callsign unset" text.
+    /// practice, not a regulatory identification requirement. Confirmed with
+    /// Tony (project owner) as a deliberate design decision, not an oversight
+    /// against the brief's literal "all three features off when callsign
+    /// unset" text. Since COP-37 `transmit_samples` refuses a transmission
+    /// with no callsign before it ever reaches this wait.
     ///
     /// `BusyGate` only updates when fed fresh audio, which this event loop
     /// otherwise only reads from `run`'s own `audio_poll` tick -- a
@@ -3865,6 +4031,18 @@ impl EventLoop {
 mod tests {
     use super::*;
 
+    /// COP-37: a valid callsign for stations that must transmit. A daemon
+    /// with no valid callsign refuses every transmission, so receive-only
+    /// and refusal tests keep `DaemonConfig::default()`'s empty one.
+    const TEST_CALLSIGN: &str = "N0CALL";
+
+    /// `DaemonConfig::default()` with `TEST_CALLSIGN` configured.
+    fn tx_config() -> DaemonConfig {
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = TEST_CALLSIGN.to_string();
+        config
+    }
+
     #[test]
     fn rate_loop_caps_peer_recommendations_at_the_engine_band_limit() {
         for (profile, maximum) in [("HF_STANDARD", 8), ("VHF_FAST", 9)] {
@@ -4181,7 +4359,7 @@ mod tests {
     /// chased down here.
     #[tokio::test]
     async fn cp_negotiation_full_handshake_converges_both_sides() {
-        let mut config = DaemonConfig::default();
+        let mut config = tx_config();
         config.engine.arq_enabled = true;
         config.engine.cp_gate_enabled = true;
         config.engine.cp_negotiation_enabled = true;
@@ -4388,7 +4566,7 @@ mod tests {
     }
 
     fn cp_enabled_config() -> DaemonConfig {
-        let mut config = DaemonConfig::default();
+        let mut config = tx_config();
         config.engine.arq_enabled = true;
         config.engine.cp_negotiation_enabled = true;
         config
@@ -7001,9 +7179,20 @@ mod tests {
         // Immediately push more audio (no backdating this time): real
         // wall-clock elapsed since the broadcast above is far under the
         // rate-limit period, so this must NOT produce a second broadcast.
+        // (The same channel also carries COP-65 `audio_level` messages: these
+        // two pushes complete one 100 ms level window, so only `spectrum`
+        // messages count here.)
         event_loop.handle_audio_in(&samples).await;
+        let mut rebroadcast = false;
+        while let Ok(json) = ws_rx.try_recv() {
+            if let Ok(coppa_host::websocket::WsServerMessage::Spectrum { .. }) =
+                serde_json::from_str(&json)
+            {
+                rebroadcast = true;
+            }
+        }
         assert!(
-            ws_rx.try_recv().is_err(),
+            !rebroadcast,
             "a second push within the rate-limit period must not re-broadcast"
         );
 
@@ -7022,6 +7211,219 @@ mod tests {
         assert!(
             second_spectrum.is_some(),
             "the rate gate should re-open once its period has (mock-)elapsed"
+        );
+    }
+
+    // ── COP-65: RX/TX audio level metering ────────────────────────────────
+
+    /// One `audio_level` message, as the broadcast channel carried it.
+    #[cfg(feature = "websocket")]
+    #[derive(Debug, Clone, Copy)]
+    struct AudioLevelMsg {
+        direction: coppa_host::websocket::AudioLevelDirection,
+        peak_dbfs: f32,
+        rms_dbfs: f32,
+        clip_fraction: f32,
+        state: coppa_host::websocket::AudioLevelState,
+        duration_ms: u32,
+    }
+
+    /// Drain every pending broadcast and keep only the `audio_level` messages,
+    /// in order, optionally only one direction.
+    #[cfg(feature = "websocket")]
+    fn drain_audio_levels(
+        ws_rx: &mut tokio::sync::broadcast::Receiver<String>,
+        direction: Option<coppa_host::websocket::AudioLevelDirection>,
+    ) -> Vec<AudioLevelMsg> {
+        let mut out = Vec::new();
+        while let Ok(json) = ws_rx.try_recv() {
+            if let Ok(coppa_host::websocket::WsServerMessage::AudioLevel {
+                direction: d,
+                peak_dbfs,
+                rms_dbfs,
+                clip_fraction,
+                state,
+                duration_ms,
+                ..
+            }) = serde_json::from_str(&json)
+            {
+                if direction.is_none_or(|want| want == d) {
+                    out.push(AudioLevelMsg {
+                        direction: d,
+                        peak_dbfs,
+                        rms_dbfs,
+                        clip_fraction,
+                        state,
+                        duration_ms,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Alternating full-scale samples: every sample is clipped.
+    fn full_scale_square(len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect()
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn rx_audio_level_is_broadcast_ten_times_per_second_of_audio() {
+        use coppa_host::websocket::{AudioLevelDirection, AudioLevelState};
+
+        let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+        event_loop.set_ws_broadcast(ws_tx);
+
+        event_loop.handle_audio_in(&vec![0.01f32; 48_000]).await;
+
+        let all = drain_audio_levels(&mut ws_rx, None);
+        assert_eq!(all.len(), 10, "one rx message per 100 ms window");
+        for m in &all {
+            assert_eq!(m.direction, AudioLevelDirection::Rx);
+            assert_eq!(m.peak_dbfs, -40.0);
+            assert_eq!(m.rms_dbfs, -40.0);
+            assert_eq!(m.clip_fraction, 0.0);
+            assert_eq!(m.state, AudioLevelState::Ok);
+            assert_eq!(m.duration_ms, 100);
+        }
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn clipped_rx_audio_is_reported_as_clipping() {
+        use coppa_host::websocket::{AudioLevelDirection, AudioLevelState};
+
+        let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+        event_loop.set_ws_broadcast(ws_tx);
+
+        event_loop.handle_audio_in(&full_scale_square(14_400)).await;
+
+        let rx = drain_audio_levels(&mut ws_rx, Some(AudioLevelDirection::Rx));
+        assert_eq!(rx.len(), 3);
+        assert_eq!(rx[0].clip_fraction, 1.0);
+        assert_eq!(
+            rx[0].state,
+            AudioLevelState::Ok,
+            "one clipped window is not yet clipping"
+        );
+        assert_eq!(rx[1].state, AudioLevelState::Clipping);
+        assert_eq!(rx[2].state, AudioLevelState::Clipping);
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn rx_audio_is_not_metered_while_transmitting() {
+        let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+        event_loop.set_ws_broadcast(ws_tx);
+
+        // Half a window of clipped audio before keying.
+        event_loop.handle_audio_in(&vec![1.0f32; 2400]).await;
+        event_loop.is_transmitting = true;
+        event_loop.handle_audio_in(&vec![1.0f32; 48_000]).await;
+        assert!(
+            drain_audio_levels(&mut ws_rx, None).is_empty(),
+            "no audio_level while transmitting"
+        );
+        event_loop.is_transmitting = false;
+
+        event_loop.handle_audio_in(&vec![0.01f32; 4800]).await;
+        let rx = drain_audio_levels(&mut ws_rx, None);
+        assert_eq!(rx.len(), 1);
+        assert_eq!(
+            rx[0].clip_fraction, 0.0,
+            "the pre-TX partial window was discarded, not merged"
+        );
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test(start_paused = true)]
+    async fn busy_wait_audio_is_metered_exactly_once() {
+        let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+        event_loop.set_ws_broadcast(ws_tx);
+        let (mut audio_in_tx, audio_in_rx) = coppa_audio::audio_ring(1_000_000);
+        event_loop.set_audio_in(audio_in_rx);
+
+        audio_in_tx.write(&vec![0.01f32; 9600]);
+        event_loop.observe_busy_gate_from_audio_input().await;
+        assert_eq!(drain_audio_levels(&mut ws_rx, None).len(), 2);
+        assert!(!event_loop.pending_busy_wait_audio.is_empty());
+
+        // The deferred decode of that same audio must not meter it again.
+        event_loop.poll_audio_input().await;
+        assert!(event_loop.pending_busy_wait_audio.is_empty());
+        assert!(drain_audio_levels(&mut ws_rx, None).is_empty());
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn each_transmission_reports_one_tx_audio_level() {
+        use coppa_host::websocket::{AudioLevelDirection, AudioLevelState};
+
+        let mut config = tx_config();
+        config.radio.ptt_pre_delay_ms = 0;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+        event_loop.set_ws_broadcast(ws_tx);
+
+        let samples = event_loop.engine.encode_bytes(b"COP-65").unwrap();
+        event_loop.transmit_samples(&samples).await;
+
+        let all = drain_audio_levels(&mut ws_rx, None);
+        assert_eq!(all.len(), 1, "exactly one message per transmission");
+        let tx = all[0];
+        assert_eq!(tx.direction, AudioLevelDirection::Tx);
+        assert_eq!(
+            tx.peak_dbfs, -6.0,
+            "every frame is normalized to -6.02 dBFS"
+        );
+        assert_eq!(tx.state, AudioLevelState::Ok);
+        assert_eq!(tx.clip_fraction, 0.0);
+        assert!(
+            (-22.0..=-16.0).contains(&tx.rms_dbfs),
+            "rms {}",
+            tx.rms_dbfs
+        );
+        assert_eq!(
+            tx.duration_ms as usize,
+            samples.len() * 1000 / 48_000,
+            "no station ID was prepended, so the span is the frame itself"
+        );
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn tune_tone_tx_level_reads_minus_6_peak_minus_12_rms() {
+        use coppa_host::websocket::AudioLevelDirection;
+
+        let mut config = tx_config();
+        config.radio.ptt_pre_delay_ms = 0;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+        event_loop.set_ws_broadcast(ws_tx);
+
+        let tone = event_loop.engine.tune_tone(1.0, None);
+        event_loop.transmit_samples(&tone).await;
+
+        let tx = drain_audio_levels(&mut ws_rx, Some(AudioLevelDirection::Tx));
+        assert_eq!(tx.len(), 1);
+        assert_eq!(tx[0].peak_dbfs, -6.0);
+        assert_eq!(tx[0].rms_dbfs, -12.0);
+    }
+
+    #[tokio::test]
+    async fn rx_level_state_tracks_clipping_without_a_websocket_host() {
+        let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        event_loop.handle_audio_in(&full_scale_square(9600)).await;
+        assert_eq!(
+            event_loop.rx_level_meter.state(),
+            crate::level_meter::LevelState::Clipping
         );
     }
 
@@ -7076,6 +7478,8 @@ mod tests {
         fn new(mut config: DaemonConfig) -> Self {
             config.radio.ptt_pre_delay_ms = 0;
             config.radio.ptt_tail_delay_ms = 0;
+            // COP-37: a TX rig transmits, so it needs a callsign.
+            config.engine.callsign = TEST_CALLSIGN.to_string();
             let mut event_loop = EventLoop::new(config).unwrap();
             let (producer, outer) = coppa_audio::audio_ring(8192);
             event_loop.set_audio_out(producer);
@@ -7874,6 +8278,217 @@ mod tests {
         assert_eq!(pdu.src.as_str(), "W5AU");
     }
 
+    // ── COP-37: no valid callsign, no transmission ───────────────────────
+
+    /// This thread's `tracing` output, captured so a test can assert what a
+    /// refusal logged. `install` scopes the capture to the returned guard;
+    /// `#[tokio::test]`'s current-thread runtime runs the event loop, and
+    /// every task it spawns, on the test's own thread.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log capture lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogCapture {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(move || writer.clone())
+                    .with_ansi(false)
+                    .finish(),
+            )
+        }
+
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log capture lock")).into_owned()
+        }
+
+        /// How many captured `ERROR` lines carry the callsign refusal.
+        fn refusals(&self) -> usize {
+            self.contents()
+                .lines()
+                .filter(|line| line.contains("ERROR") && line.contains(NO_CALLSIGN_TX_REFUSAL))
+                .count()
+        }
+    }
+
+    /// A station wired to an audio-out ring and a VARA command-port client
+    /// (`client_id` 1) whose replies and telemetry the test reads back.
+    fn wired_station(
+        config: DaemonConfig,
+    ) -> (
+        EventLoop,
+        coppa_audio::AudioRingConsumer,
+        mpsc::Receiver<VaraResponse>,
+    ) {
+        let mut station = EventLoop::new(config).unwrap();
+        let (audio_tx, audio_rx) = coppa_audio::audio_ring(1_000_000);
+        station.set_audio_out(audio_tx);
+        let (vara_tx, vara_rx) = mpsc::channel(64);
+        station.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, vara_tx)]))));
+        (station, audio_rx, vara_rx)
+    }
+
+    async fn send_vara_command(station: &mut EventLoop, command: &str) {
+        station
+            .handle_host_event(HostEvent::VaraCommand {
+                client_id: 1,
+                command: command.into(),
+            })
+            .await;
+    }
+
+    fn drain_vara(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<VaraResponse> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// The audio the station has written for transmission, once the `run`
+    /// TX tick would have moved it into the audio-out ring.
+    fn transmitted_samples(
+        station: &EventLoop,
+        audio_rx: &mut coppa_audio::AudioRingConsumer,
+    ) -> usize {
+        station.flush_pending_audio_out();
+        audio_rx.available()
+    }
+
+    /// The ticket's scenario: with no callsign or an invalid one configured,
+    /// `TUNE` keys nothing and writes no audio, and the daemon logs why. The
+    /// daemon still starts (receive-only) and still answers `OK`, which only
+    /// says the command parsed.
+    #[tokio::test]
+    async fn tune_is_refused_and_logged_without_a_valid_callsign() {
+        for callsign in ["", "W5AU!"] {
+            let logs = LogCapture::default();
+            let _guard = logs.install();
+            let mut config = DaemonConfig::default();
+            config.engine.callsign = callsign.to_string();
+            let (mut station, mut audio_rx, mut vara_rx) = wired_station(config);
+            assert_eq!(station.local_callsign, None, "{callsign:?}");
+            if !callsign.is_empty() {
+                assert!(
+                    logs.contents()
+                        .contains("transmission disabled until a valid MYCALL is set"),
+                    "an invalid callsign must warn at startup that TX is disabled, got: {}",
+                    logs.contents()
+                );
+            }
+
+            send_vara_command(&mut station, "TUNE 1").await;
+
+            assert_eq!(
+                drain_vara(&mut vara_rx),
+                vec![VaraResponse::Ok],
+                "{callsign:?}: TUNE must be answered OK with no PTT bracket"
+            );
+            assert!(!station.is_transmitting, "{callsign:?}");
+            assert_eq!(
+                transmitted_samples(&station, &mut audio_rx),
+                0,
+                "{callsign:?}: no tone may reach the audio sink"
+            );
+            assert_eq!(
+                logs.refusals(),
+                1,
+                "{callsign:?}: the refusal must be logged once, got: {}",
+                logs.contents()
+            );
+        }
+    }
+
+    /// Sessionless host data with no callsign is refused before ARQ
+    /// registration or queueing, so it leaves no outstanding ARQ segment, no
+    /// queued payload and no `BUFFER` count behind -- with ARQ off and on.
+    #[tokio::test]
+    async fn sessionless_host_data_is_refused_without_a_callsign_and_leaves_nothing_buffered() {
+        for arq_enabled in [false, true] {
+            let logs = LogCapture::default();
+            let _guard = logs.install();
+            let mut config = DaemonConfig::default();
+            config.host.sessionless_tx_enabled = true;
+            config.engine.arq_enabled = arq_enabled;
+            let (mut station, mut audio_rx, mut vara_rx) = wired_station(config);
+
+            station
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x42; 40],
+                })
+                .await;
+
+            assert_eq!(
+                drain_vara(&mut vara_rx),
+                Vec::<VaraResponse>::new(),
+                "arq={arq_enabled}: no BUFFER or PTT telemetry for a refused payload"
+            );
+            assert!(station.tx_queue.is_empty(), "arq={arq_enabled}");
+            assert_eq!(station.buffered_tx_bytes(), 0, "arq={arq_enabled}");
+            if let Some(arq_tx) = station.arq_tx.as_ref() {
+                assert_eq!(arq_tx.in_flight(), 0, "no ARQ segment may be registered");
+                assert_eq!(arq_tx.unacked_bytes(), 0);
+            }
+            assert!(!station.is_transmitting, "arq={arq_enabled}");
+            assert_eq!(transmitted_samples(&station, &mut audio_rx), 0);
+            assert_eq!(
+                logs.refusals(),
+                1,
+                "arq={arq_enabled}: the refusal must be logged once, got: {}",
+                logs.contents()
+            );
+        }
+    }
+
+    /// The same `TUNE` transmits once a valid callsign is in force, whether
+    /// configured or given later by `MYCALL`.
+    #[tokio::test]
+    async fn tune_transmits_once_a_valid_callsign_is_in_force() {
+        let logs = LogCapture::default();
+        let _guard = logs.install();
+
+        let (mut configured, mut audio_rx, mut vara_rx) = wired_station(tx_config());
+        send_vara_command(&mut configured, "TUNE 1").await;
+        assert_eq!(
+            drain_vara(&mut vara_rx),
+            vec![VaraResponse::Ok, VaraResponse::Ptt(true)],
+            "a configured callsign must let TUNE key PTT"
+        );
+        assert!(transmitted_samples(&configured, &mut audio_rx) > 0);
+
+        let (mut unconfigured, mut audio_rx, mut vara_rx) = wired_station(DaemonConfig::default());
+        send_vara_command(&mut unconfigured, "TUNE 1").await;
+        assert_eq!(drain_vara(&mut vara_rx), vec![VaraResponse::Ok]);
+        assert_eq!(transmitted_samples(&unconfigured, &mut audio_rx), 0);
+        assert_eq!(logs.refusals(), 1, "got: {}", logs.contents());
+
+        send_vara_command(&mut unconfigured, "MYCALL W5AU").await;
+        send_vara_command(&mut unconfigured, "TUNE 1").await;
+        assert_eq!(
+            drain_vara(&mut vara_rx),
+            vec![VaraResponse::Ok, VaraResponse::Ok, VaraResponse::Ptt(true)],
+            "a valid MYCALL must let the next TUNE key PTT"
+        );
+        assert!(transmitted_samples(&unconfigured, &mut audio_rx) > 0);
+        assert_eq!(
+            logs.refusals(),
+            1,
+            "only the TUNE before MYCALL may be refused, got: {}",
+            logs.contents()
+        );
+    }
+
     /// COP-28: the keepalive sends `IAMALIVE` to every wired client exactly
     /// once per 60 s period, with the first one a full period after start
     /// (nothing at t=0).
@@ -7949,7 +8564,7 @@ mod tests {
 
     #[tokio::test]
     async fn arq_receive_transmits_a_real_ack_with_rate() {
-        let mut config = DaemonConfig::default();
+        let mut config = tx_config();
         config.engine.arq_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
         event_loop.arq_rx = Some(ArqRx::new(8));
@@ -8439,9 +9054,10 @@ mod tests {
         /// pre/tail delays are zeroed. This only affects the *scheduling* math in
         /// `transmit_samples` — the engine's own internal encode rate is fixed at
         /// 48 kHz regardless (see `CLAUDE.md`), so encoding real payloads is
-        /// unaffected.
+        /// unaffected. It carries `TEST_CALLSIGN` (COP-37) so the station may
+        /// transmit at all.
         fn fast_ptt_config() -> DaemonConfig {
-            let mut config = DaemonConfig::default();
+            let mut config = tx_config();
             config.audio.sample_rate = 100_000_000;
             config.audio.buffer_size = 0;
             config.radio.ptt_pre_delay_ms = 0;
@@ -9032,6 +9648,20 @@ mod tests {
         #[tokio::test]
         async fn websocket_hears_connected_and_disconnected_and_status_follows() {
             use coppa_host::websocket::{WsServerMessage, WsStatus};
+            // The same channel carries COP-65 `audio_level` messages (one per
+            // transmission the connect/disconnect handshake makes); only the
+            // session pushes count here.
+            fn next_session_push(
+                rx: &mut tokio::sync::broadcast::Receiver<String>,
+            ) -> Option<WsServerMessage> {
+                while let Ok(json) = rx.try_recv() {
+                    let msg: WsServerMessage = serde_json::from_str(&json).unwrap();
+                    if !matches!(msg, WsServerMessage::AudioLevel { .. }) {
+                        return Some(msg);
+                    }
+                }
+                None
+            }
             let mut station = EventLoop::new(session_config()).unwrap();
             let (tx, mut rx) = tokio::sync::broadcast::channel(16);
             let status = Arc::new(Mutex::new(WsStatus::default()));
@@ -9049,8 +9679,7 @@ mod tests {
                 .handle_connect_req(&LinkCapabilities::default().to_bytes())
                 .unwrap();
             station.handle_mac_pdu(ack).await;
-            let msg: WsServerMessage =
-                serde_json::from_str(&rx.try_recv().expect("connected push")).unwrap();
+            let msg = next_session_push(&mut rx).expect("connected push");
             assert!(
                 matches!(msg, WsServerMessage::Connected { remote_call } if remote_call == "W1AW")
             );
@@ -9060,13 +9689,15 @@ mod tests {
                 assert_eq!(snap.remote_call.as_deref(), Some("W1AW"));
             }
             station.handle_mac_pdu(remote.disconnect().unwrap()).await;
-            let msg: WsServerMessage =
-                serde_json::from_str(&rx.try_recv().expect("disconnected push")).unwrap();
+            let msg = next_session_push(&mut rx).expect("disconnected push");
             assert!(matches!(msg, WsServerMessage::Disconnected));
             let snap = status.lock().await;
             assert!(!snap.connected);
             assert_eq!(snap.remote_call, None);
-            assert!(rx.try_recv().is_err(), "exactly one push per transition");
+            assert!(
+                next_session_push(&mut rx).is_none(),
+                "exactly one push per transition"
+            );
         }
 
         /// Zero-lead/trail-padded encode, mirroring `coppa-engine`'s own streaming
@@ -10563,7 +11194,7 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn test_transmit_deferred_while_busy_then_holdoff_applied() {
-            let mut config = DaemonConfig::default();
+            let mut config = tx_config();
             config.station_id.busy_hold_ms = 10;
             let mut event_loop = EventLoop::new(config).unwrap();
 
@@ -10797,7 +11428,7 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn test_transmit_not_deferred_when_channel_already_clear() {
-            let mut config = DaemonConfig::default();
+            let mut config = tx_config();
             config.station_id.busy_hold_ms = 10;
             let mut event_loop = EventLoop::new(config).unwrap();
             let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
@@ -10821,7 +11452,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn test_busy_gate_disabled_by_default_does_not_defer_tx() {
             // (d) busy-channel gate OFF by default: busy_hold_ms == 0.
-            let config = DaemonConfig::default();
+            let config = tx_config();
             assert_eq!(config.station_id.busy_hold_ms, 0);
             let mut event_loop = EventLoop::new(config).unwrap();
             let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
@@ -11043,13 +11674,17 @@ mod tests {
 
             let core = coppa_engine::CoppaCore::new();
             let payload_samples = core.encode_bytes(b"hello").expect("encode should succeed");
-            let payload_len = payload_samples.len();
 
+            assert!(
+                !event_loop.id_due(),
+                "no ID should be due without a configured callsign"
+            );
             event_loop.transmit_samples(&payload_samples).await;
+            // COP-37: the transmission itself is refused, ID and all.
             assert_eq!(
                 audio_out_rx.available(),
-                payload_len,
-                "no ID should be prepended without a configured callsign"
+                0,
+                "nothing, ID or payload, should be sent without a configured callsign"
             );
 
             let (audio_out_tx2, audio_out_rx2) = coppa_audio::audio_ring(1_000_000);
@@ -11151,7 +11786,7 @@ mod tests {
         }
 
         fn wideband_config() -> DaemonConfig {
-            let mut config = DaemonConfig::default();
+            let mut config = tx_config();
             config.engine.profile = "VHF_FAST".into();
             config.audio.sample_rate = 100_000_000;
             config.audio.buffer_size = 0;
@@ -11449,6 +12084,41 @@ mod tests {
                 PttControl::get_ptt(&mut event_loop.ptt).unwrap(),
                 PttState::Rx,
                 "the rig was never keyed"
+            );
+        }
+
+        /// COP-65: a transmission the gate refuses never reaches the air, so
+        /// it reports no TX level; the same call allowed reports exactly one.
+        #[cfg(feature = "websocket")]
+        #[tokio::test]
+        async fn refused_wideband_transmission_reports_no_tx_audio_level() {
+            use coppa_host::websocket::AudioLevelDirection;
+
+            let rig = fake_rigctld("144500000");
+            let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+            event_loop.set_ws_broadcast(ws_tx);
+
+            *rig.answer.lock().unwrap() = "7074000".into();
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert!(!event_loop.is_transmitting);
+            assert!(
+                drain_audio_levels(&mut ws_rx, Some(AudioLevelDirection::Tx)).is_empty(),
+                "a refused transmission reports no TX level"
+            );
+            *rig.answer.lock().unwrap() = "144500000".into();
+            assert_eq!(
+                PttControl::get_ptt(&mut event_loop.ptt).unwrap(),
+                PttState::Rx,
+                "the rig was never keyed"
+            );
+
+            // Control: back on 2m, the same call transmits and reports once.
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert!(event_loop.is_transmitting);
+            assert_eq!(
+                drain_audio_levels(&mut ws_rx, Some(AudioLevelDirection::Tx)).len(),
+                1
             );
         }
 
@@ -11954,8 +12624,10 @@ mod tests {
             with_lead_and_trail(&peer.encode_bytes(&pdu.to_bytes()).unwrap())
         }
 
+        /// ARQ on, with `TEST_CALLSIGN` (COP-37) so the station may
+        /// transmit at all.
         fn arq_config() -> DaemonConfig {
-            let mut config = DaemonConfig::default();
+            let mut config = tx_config();
             config.engine.arq_enabled = true;
             config
         }
@@ -12020,7 +12692,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn transmit_with_no_recent_decode_keys_at_once() {
             // (a) No frame ever decoded: no hold.
-            let mut idle = EventLoop::new(DaemonConfig::default()).unwrap();
+            let mut idle = EventLoop::new(tx_config()).unwrap();
             let idle_ptt = install_ptt_log(&mut idle);
             let t0 = tokio::time::Instant::now();
             idle.transmit_samples(&[0.1; 4800]).await;
@@ -12028,7 +12700,7 @@ mod tests {
 
             // (b) The last decode is older than the turnaround: no hold. ARQ is
             // off, so the decode itself transmits nothing.
-            let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+            let mut station = EventLoop::new(tx_config()).unwrap();
             let ptt = install_ptt_log(&mut station);
             station.decode_and_dispatch_audio(&peer_data_frame()).await;
             assert!(

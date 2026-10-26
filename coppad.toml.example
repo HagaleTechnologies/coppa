@@ -71,6 +71,7 @@ vara_enabled = false
 vara_command_port = 8300
 vara_data_port = 8301
 # WebSocket JSON API
+# Clients can opt into periodic "spectrum" and "audio_level" streams; see docs/OPERATING.md.
 websocket_enabled = false
 websocket_port = 8400
 

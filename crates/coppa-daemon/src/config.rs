@@ -240,9 +240,12 @@ pub struct HostConfig {
 pub struct EngineSection {
     /// Operational profile name.
     pub profile: String,
-    /// Station callsign. Required (non-empty) for the station-ID timer and
-    /// beacon mode (Phase 4 Task 3) to activate; empty (the default) keeps
-    /// both off regardless of their interval settings.
+    /// Station callsign. Required to transmit at all (COP-37): while it is
+    /// empty (the default) or invalid, the daemon still starts and receives,
+    /// but refuses every transmission, logging why, until a valid callsign
+    /// is set here or by a command-port `MYCALL`. The station-ID timer and
+    /// beacon mode (Phase 4 Task 3) also stay off without one, regardless of
+    /// their interval settings.
     pub callsign: String,
     /// Optional free-text Maidenhead grid locator (e.g. "FN20"), included in
     /// the station-ID/beacon payload alongside the callsign when set. No
