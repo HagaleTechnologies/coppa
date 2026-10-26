@@ -355,7 +355,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:4c050d6d7a647fae7d4c6c50a7f88b27bb6c062f05317af61a6e419702923cb7",
+      "hash": "sha256:b8afd3bae50ea8f4ba058e6a60987ce447d071d232b7ad7e8d0a78dfe15c9329",
       "id": "cpal-feature-gate",
       "kind": "gotcha",
       "links": [
@@ -418,7 +418,11 @@
       "visibility": "public"
     },
     {
+<<<<<<< HEAD
       "hash": "sha256:3d71918fc0d9976ad992088ab52e48ef1d19cce4aa6f2424750ba14337651948",
+=======
+      "hash": "sha256:d6329dbd642a6509d96f33e028fa37cb572d40915758af4b13d4d11e5b76fb3d",
+>>>>>>> 53a17e398a46b25d172e045b21e47d048fcfd2ec
       "id": "phase4-field-readiness",
       "kind": "gotcha",
       "links": [

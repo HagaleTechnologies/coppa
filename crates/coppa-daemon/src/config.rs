@@ -493,6 +493,25 @@ impl DaemonConfig {
             }
         }
     }
+
+    /// COP-32: `[audio] sample_rate` must equal the configured profile's
+    /// engine rate. coppad has no resampler, so any other rate plays and
+    /// captures audio at the wrong speed. Checked by run mode before any
+    /// hardware is touched; `--check` does not call it.
+    pub fn check_sample_rate(&self) -> Result<(), String> {
+        let engine_rate = coppa_engine::profiles::get_profile(&self.engine.profile).map_or_else(
+            || coppa_engine::EngineConfig::default().sample_rate,
+            |profile| profile.sample_rate,
+        );
+        if self.audio.sample_rate == engine_rate {
+            return Ok(());
+        }
+        Err(format!(
+            "[audio] sample_rate = {} is not supported: coppad has no resampler and \
+             profile {} runs at {engine_rate} Hz; set sample_rate = {engine_rate}",
+            self.audio.sample_rate, self.engine.profile
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -994,5 +1013,29 @@ beacon_interval_secs = 600
             "Parse error on existing file should be fatal"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn check_sample_rate_accepts_the_engine_rate() {
+        assert_eq!(DaemonConfig::default().check_sample_rate(), Ok(()));
+    }
+
+    #[test]
+    fn check_sample_rate_rejects_any_other_rate() {
+        let mut config = DaemonConfig::default();
+        config.audio.sample_rate = 44_100;
+        let err = config.check_sample_rate().unwrap_err();
+        assert!(err.contains("sample_rate = 44100"), "{err}");
+        assert!(err.contains("48000 Hz"), "{err}");
+        assert!(err.contains("HF_STANDARD"), "{err}");
+    }
+
+    #[test]
+    fn check_sample_rate_uses_the_default_engine_rate_for_an_unknown_profile() {
+        let mut config = DaemonConfig::default();
+        config.engine.profile = "NOT_A_PROFILE".into();
+        assert_eq!(config.check_sample_rate(), Ok(()));
+        config.audio.sample_rate = 96_000;
+        assert!(config.check_sample_rate().is_err());
     }
 }

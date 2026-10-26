@@ -371,6 +371,13 @@ path, which never emitted `BUFFER` before, now does. A segment that has used up 
 budget stays counted, since nothing ever acks or evicts it; evicting it is separate work. The
 3,2,1,0 frame-count progression above is superseded.
 
+**COP-41 update (2026-10-24):** `BUFFER` now also counts chunked session-queue and ARQ-backlog
+bytes. One host `DataReceived` event is no longer one over-the-air frame: every event is chunked
+into pieces that provably encode at their target level (session/raw: the current level; ARQ: the
+ladder-minimum budget, so segments survive rate drops), and the ARQ window's overflow waits in a
+backlog counted by `BUFFER` and pumped into segments as ACKs free window space — held, never
+dropped.
+
 ### 9. Benchmark program (Task 8)
 
 **Plan**: (a) a `milstd` bench at MIL-STD-188-110 Table XVI-style operating points, mapping

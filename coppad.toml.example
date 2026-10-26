@@ -2,15 +2,18 @@
 # Copy to coppad.toml and edit as needed.
 
 [audio]
-# Sample rate in Hz. Must match engine (48000 for OFDM).
+# Sample rate in Hz. Must be 48000, the engine's rate (coppad has no
+# resampler); any other value stops the daemon at startup.
 sample_rate = 48000
 # Ring buffer size in samples.
 buffer_size = 8192
 # Audio input device name (substring match, case-insensitive).
-# Empty string = system default.
+# Empty string = system default. A name that matches no device stops the
+# daemon at startup; it never falls back to the default device.
 input_device = ""
 # Audio output device name (substring match, case-insensitive).
-# Empty string = system default.
+# Empty string = system default. A name that matches no device stops the
+# daemon at startup; it never falls back to the default device.
 output_device = ""
 
 [radio]
