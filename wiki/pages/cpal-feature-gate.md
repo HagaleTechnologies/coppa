@@ -23,7 +23,9 @@ the command compiles but finds nothing.
 
 You build and run `coppad` and it starts cleanly, but no audio is captured or
 played, and no transmit/receive activity occurs even with correct config. No
-warning is printed by default.
+warning is printed by default. Since COP-32, setting `[audio]
+input_device`/`output_device` in such a build is a startup error, because the
+build can never open a named device.
 
 ## Cause and workaround
 
