@@ -321,17 +321,26 @@ impl WebSocketServer {
     /// via the `broadcast_sender()` channel.
     #[cfg(feature = "websocket")]
     pub async fn run(&self) -> anyhow::Result<()> {
+        let addr = format!("{}:{}", self.bind_addr, self.port);
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        println!("WebSocket server listening on ws://{}", addr);
+        self.run_with_listener(listener).await
+    }
+
+    /// Run the accept loop on a listener the caller already bound.
+    ///
+    /// `run` binds `bind_addr:port` and delegates here. A caller that must
+    /// see a bind failure before it reports itself ready (coppad) binds
+    /// first and passes the listener in. The configured `port` is ignored on
+    /// this path.
+    #[cfg(feature = "websocket")]
+    pub async fn run_with_listener(&self, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
         use futures_util::{SinkExt, StreamExt};
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
-        use tokio::net::TcpListener;
         use tokio::sync::Semaphore;
         use tokio_tungstenite::accept_async_with_config;
         use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-
-        let addr = format!("{}:{}", self.bind_addr, self.port);
-        let listener = TcpListener::bind(&addr).await?;
-        println!("WebSocket server listening on ws://{}", addr);
 
         // Bound per-connection memory: cap WebSocket message/frame sizes.
         let ws_config = WebSocketConfig::default()
@@ -1090,6 +1099,31 @@ mod integration_tests {
         }
 
         ws.close(None).await.ok();
+    }
+
+    /// COP-32: `run_with_listener` serves the listener its caller bound, so
+    /// coppad can bind (and fail) before it reports itself ready.
+    #[tokio::test]
+    async fn run_with_listener_serves_the_callers_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // The configured port is ignored on this path.
+        let mut server = WebSocketServer::with_bind_addr(0, "127.0.0.1".to_string());
+        let mut event_rx = server.take_event_rx().expect("fresh server");
+        tokio::spawn(async move {
+            let _ = server.run_with_listener(listener).await;
+        });
+
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timed out waiting for the Connected event")
+            .expect("event channel closed");
+        assert!(matches!(event, HostEvent::Connected { .. }), "{event:?}");
+        drop(ws);
     }
 
     /// COP-28: the real `run()` numbers WebSocket clients from

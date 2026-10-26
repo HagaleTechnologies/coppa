@@ -8,3 +8,4 @@ pub mod level_meter;
 pub mod spectrum;
 #[cfg(feature = "kiss-tnc")]
 pub mod tnc;
+pub mod tx_chunker;

@@ -115,6 +115,22 @@ impl VaraServer {
         let cmd_listener = TcpListener::bind(&cmd_addr).await?;
         let data_listener = TcpListener::bind(&data_addr).await?;
 
+        self.run_with_listeners(cmd_listener, data_listener).await
+    }
+
+    /// Run the server's accept loops on listeners the caller already bound.
+    ///
+    /// `run` binds `bind_addr:command_port` / `bind_addr:data_port` and
+    /// delegates here. Callers that need OS-assigned ports (tests binding
+    /// `127.0.0.1:0`) bind first, read `local_addr()`, and pass the listeners
+    /// in, so the addresses they connect to are the ones actually served and
+    /// a bind failure surfaces at the caller instead of inside a spawned task.
+    /// The configured `command_port`/`data_port` are ignored on this path.
+    pub async fn run_with_listeners(
+        &self,
+        cmd_listener: TcpListener,
+        data_listener: TcpListener,
+    ) -> anyhow::Result<()> {
         let event_tx = self.event_tx.clone();
         let next_cmd_id = &self.next_cmd_client_id;
         let next_data_id = &self.next_data_client_id;
