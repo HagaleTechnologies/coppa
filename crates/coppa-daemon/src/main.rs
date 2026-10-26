@@ -15,6 +15,7 @@ mod spectrum;
 
 #[cfg(feature = "kiss-tnc")]
 mod tnc;
+mod tx_chunker;
 
 use std::io::Write;
 
