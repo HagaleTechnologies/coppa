@@ -29,6 +29,10 @@ pub enum WsClientMessage {
     /// than broadcast to every client unconditionally.
     #[serde(rename = "spectrum")]
     Spectrum { enabled: bool },
+    /// Opt in/out of periodic `audio_level` broadcast messages (COP-65). See
+    /// [`WsServerMessage::AudioLevel`].
+    #[serde(rename = "audio_level")]
+    AudioLevel { enabled: bool },
 }
 
 /// JSON message sent to a WebSocket client.
@@ -113,6 +117,61 @@ pub enum WsServerMessage {
         /// Wall-clock time this spectrum was computed (Unix epoch, ms).
         timestamp_ms: u64,
     },
+    /// RX/TX audio level (COP-65): `rx` once per 100 ms of received audio (not
+    /// while transmitting), `tx` once per transmission. Opt-in per client
+    /// (`WsClientMessage::AudioLevel { enabled: true }`), like `spectrum`,
+    /// because it is periodic. Named `audio_level`, not `level`, because
+    /// `status`'s `level` is the speed level.
+    ///
+    /// Full scale is sample value 1.0 for every dBFS field. The daemon computes
+    /// these in `crates/coppa-daemon/src/level_meter.rs`.
+    #[serde(rename = "audio_level")]
+    AudioLevel {
+        /// `rx`: one 100 ms window of raw received audio. `tx`: one whole
+        /// transmission as queued for the sound card, including any prepended
+        /// station-ID frame.
+        direction: AudioLevelDirection,
+        /// `20·log10(max |s|)` over the span, floored at -120.0, rounded to
+        /// 0.1 dB.
+        peak_dbfs: f32,
+        /// `20·log10(sqrt(mean(s²)))` over the span, floored at -120.0, rounded
+        /// to 0.1 dB. A full-scale sine reads -3.0 (no AES17 +3 dB correction).
+        rms_dbfs: f32,
+        /// Fraction (0.0-1.0) of samples in the span with `|s| >= 0.99`.
+        /// Non-finite samples count as clipped.
+        clip_fraction: f32,
+        /// `rx`: the daemon's hysteresis state after this window. `tx`:
+        /// `clipping` if any sample of the transmission is clipped, else `ok`
+        /// (never `underdrive`).
+        state: AudioLevelState,
+        /// Audio span this reading covers: 100 for `rx`, the transmission's
+        /// length for `tx`.
+        duration_ms: u32,
+        /// Wall-clock time this message was produced (Unix epoch, ms).
+        timestamp_ms: u64,
+    },
+}
+
+/// Which audio stream an [`WsServerMessage::AudioLevel`] reading measures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioLevelDirection {
+    /// Received audio (sound-card input).
+    Rx,
+    /// Transmitted audio (as Coppa queues it for the sound-card output).
+    Tx,
+}
+
+/// Level state carried by [`WsServerMessage::AudioLevel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioLevelState {
+    /// Level is usable.
+    Ok,
+    /// Samples are reaching full scale.
+    Clipping,
+    /// RX input is too quiet (RX only).
+    Underdrive,
 }
 
 /// Maximum number of concurrent WebSocket client connections.
@@ -148,10 +207,20 @@ pub struct WsStatus {
     pub cp_desync_episodes: u32,
 }
 
-/// Whether a pre-serialized broadcast JSON string is a `spectrum` message
-/// (`WsServerMessage::Spectrum`), used by each connection's forwarding loop
-/// in [`WebSocketServer::run`] to gate delivery on that connection's own
-/// opt-in state.
+/// Periodic broadcast streams a connection must opt into before
+/// [`WebSocketServer::run`]'s forwarding loop delivers them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptInStream {
+    /// `WsServerMessage::Spectrum`.
+    Spectrum,
+    /// `WsServerMessage::AudioLevel`.
+    AudioLevel,
+}
+
+/// Which opt-in stream, if any, a pre-serialized broadcast JSON string
+/// belongs to, used by each connection's forwarding loop in
+/// [`WebSocketServer::run`] to gate delivery on that connection's own opt-in
+/// state. `None` means the message is delivered unconditionally.
 ///
 /// The shared broadcast channel (`WebSocketServer::broadcast_tx`) carries
 /// pre-serialized JSON `String`s, not a typed enum -- by the time a message
@@ -164,14 +233,16 @@ pub struct WsStatus {
 /// an implementation detail of serde's internal tagging, not a stability
 /// guarantee this code should quietly depend on. This runs once per
 /// broadcast message per connected client, at a message rate (status/data
-/// events, plus at most a 4 Hz spectrum stream, across up to
-/// `MAX_CONCURRENT_CONNECTIONS` clients) far too low for the parse cost to
-/// matter.
-fn is_spectrum_broadcast(json: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(json)
-        .ok()
-        .and_then(|v| v.get("type")?.as_str().map(|s| s == "spectrum"))
-        .unwrap_or(false)
+/// events, plus at most a 4 Hz spectrum stream and a 10 Hz audio-level
+/// stream, across up to `MAX_CONCURRENT_CONNECTIONS` clients) far too low for
+/// the parse cost to matter.
+fn opt_in_stream(json: &str) -> Option<OptInStream> {
+    let value = serde_json::from_str::<serde_json::Value>(json).ok()?;
+    match value.get("type")?.as_str()? {
+        "spectrum" => Some(OptInStream::Spectrum),
+        "audio_level" => Some(OptInStream::AudioLevel),
+        _ => None,
+    }
 }
 
 /// WebSocket server configuration.
@@ -318,6 +389,9 @@ impl WebSocketServer {
                 // (Phase 4 Task 4) -- see `WsServerMessage::Spectrum`'s doc for why
                 // this defaults to off and must be explicitly requested.
                 let mut spectrum_enabled = false;
+                // Same, for the `audio_level` stream (COP-65). Independent of
+                // `spectrum_enabled`: a client can want one without the other.
+                let mut audio_level_enabled = false;
 
                 // Main select loop: handle both client messages and engine broadcasts
                 loop {
@@ -326,12 +400,14 @@ impl WebSocketServer {
                         result = broadcast_rx.recv() => {
                             match result {
                                 Ok(json) => {
-                                    if is_spectrum_broadcast(&json) && !spectrum_enabled {
-                                        // This client hasn't opted in; every other
-                                        // broadcast message type is delivered
-                                        // unconditionally, matching this channel's
-                                        // pre-existing behavior.
-                                        continue;
+                                    // Drop an opt-in stream this client hasn't
+                                    // asked for; every other broadcast message
+                                    // type is delivered unconditionally, matching
+                                    // this channel's pre-existing behavior.
+                                    match opt_in_stream(&json) {
+                                        Some(OptInStream::Spectrum) if !spectrum_enabled => continue,
+                                        Some(OptInStream::AudioLevel) if !audio_level_enabled => continue,
+                                        _ => {}
                                     }
                                     if sink.send(tokio_tungstenite::tungstenite::Message::Text(json.into())).await.is_err() {
                                         break;
@@ -399,6 +475,10 @@ impl WebSocketServer {
                                             }
                                             WsClientMessage::Spectrum { enabled } => {
                                                 spectrum_enabled = enabled;
+                                                continue;
+                                            }
+                                            WsClientMessage::AudioLevel { enabled } => {
+                                                audio_level_enabled = enabled;
                                                 continue;
                                             }
                                         };
@@ -490,19 +570,34 @@ mod tests {
     }
 
     #[test]
-    fn test_is_spectrum_broadcast_identifies_spectrum_messages_only() {
+    fn test_opt_in_stream_classifies_spectrum_and_audio_level_only() {
         let spectrum_json = serde_json::to_string(&WsServerMessage::Spectrum {
             bins: vec![0.0; 128],
             timestamp_ms: 0,
         })
         .unwrap();
-        assert!(is_spectrum_broadcast(&spectrum_json));
+        assert_eq!(opt_in_stream(&spectrum_json), Some(OptInStream::Spectrum));
+
+        let audio_level_json = serde_json::to_string(&WsServerMessage::AudioLevel {
+            direction: AudioLevelDirection::Rx,
+            peak_dbfs: -12.1,
+            rms_dbfs: -31.4,
+            clip_fraction: 0.0,
+            state: AudioLevelState::Ok,
+            duration_ms: 100,
+            timestamp_ms: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            opt_in_stream(&audio_level_json),
+            Some(OptInStream::AudioLevel)
+        );
 
         let data_json = serde_json::to_string(&WsServerMessage::Data {
             data: "hello".to_string(),
         })
         .unwrap();
-        assert!(!is_spectrum_broadcast(&data_json));
+        assert_eq!(opt_in_stream(&data_json), None);
 
         let status_json = serde_json::to_string(&WsServerMessage::Status {
             connected: false,
@@ -514,9 +609,107 @@ mod tests {
             cp_desync_episodes: 0,
         })
         .unwrap();
-        assert!(!is_spectrum_broadcast(&status_json));
+        assert_eq!(opt_in_stream(&status_json), None);
 
-        assert!(!is_spectrum_broadcast("not valid json"));
+        assert_eq!(opt_in_stream("not valid json"), None);
+    }
+
+    #[test]
+    fn test_ws_audio_level_client_message_parse() {
+        let msg: WsClientMessage =
+            serde_json::from_str(r#"{"type":"audio_level","enabled":true}"#).unwrap();
+        match msg {
+            WsClientMessage::AudioLevel { enabled } => assert!(enabled),
+            other => panic!("Wrong variant: {:?}", other),
+        }
+
+        let msg: WsClientMessage =
+            serde_json::from_str(r#"{"type":"audio_level","enabled":false}"#).unwrap();
+        match msg {
+            WsClientMessage::AudioLevel { enabled } => assert!(!enabled),
+            other => panic!("Wrong variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_ws_audio_level_server_message_format() {
+        let msg = WsServerMessage::AudioLevel {
+            direction: AudioLevelDirection::Rx,
+            peak_dbfs: -12.1,
+            rms_dbfs: -31.4,
+            clip_fraction: 0.0,
+            state: AudioLevelState::Clipping,
+            duration_ms: 100,
+            timestamp_ms: 7,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = parsed.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "clip_fraction",
+                "direction",
+                "duration_ms",
+                "peak_dbfs",
+                "rms_dbfs",
+                "state",
+                "timestamp_ms",
+                "type",
+            ]
+        );
+        assert_eq!(parsed["type"], "audio_level");
+        assert_eq!(parsed["direction"], "rx");
+        assert_eq!(parsed["state"], "clipping");
+        assert_eq!(parsed["duration_ms"], 100);
+        assert_eq!(parsed["timestamp_ms"], 7);
+
+        match serde_json::from_str::<WsServerMessage>(&json).unwrap() {
+            WsServerMessage::AudioLevel {
+                direction,
+                peak_dbfs,
+                rms_dbfs,
+                clip_fraction,
+                state,
+                duration_ms,
+                timestamp_ms,
+            } => {
+                assert_eq!(direction, AudioLevelDirection::Rx);
+                assert_eq!(peak_dbfs, -12.1);
+                assert_eq!(rms_dbfs, -31.4);
+                assert_eq!(clip_fraction, 0.0);
+                assert_eq!(state, AudioLevelState::Clipping);
+                assert_eq!(duration_ms, 100);
+                assert_eq!(timestamp_ms, 7);
+            }
+            other => panic!("expected AudioLevel, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_audio_level_enums_serialize_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&AudioLevelDirection::Rx).unwrap(),
+            r#""rx""#
+        );
+        assert_eq!(
+            serde_json::to_string(&AudioLevelDirection::Tx).unwrap(),
+            r#""tx""#
+        );
+        assert_eq!(
+            serde_json::to_string(&AudioLevelState::Ok).unwrap(),
+            r#""ok""#
+        );
+        assert_eq!(
+            serde_json::to_string(&AudioLevelState::Clipping).unwrap(),
+            r#""clipping""#
+        );
+        assert_eq!(
+            serde_json::to_string(&AudioLevelState::Underdrive).unwrap(),
+            r#""underdrive""#
+        );
     }
 
     #[test]
@@ -745,7 +938,8 @@ mod integration_tests {
                                             client_id,
                                             command: text.to_string(),
                                         },
-                                        WsClientMessage::Spectrum { .. } => {
+                                        WsClientMessage::Spectrum { .. }
+                                        | WsClientMessage::AudioLevel { .. } => {
                                             // This test-only helper doesn't exercise
                                             // broadcast forwarding at all (see its own
                                             // doc), so there's no per-connection
@@ -1100,6 +1294,115 @@ mod integration_tests {
                 );
             }
             other => panic!("expected the canary Data message, got {:?}", other),
+        }
+
+        ws_a.close(None).await.ok();
+        ws_b.close(None).await.ok();
+    }
+
+    /// Receive one text message within 2 s and parse it as a `WsServerMessage`.
+    async fn next_server_message<S>(ws: &mut S, who: &str) -> WsServerMessage
+    where
+        S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("{who} should receive a message"))
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(resp.to_text().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_ws_audio_level_and_spectrum_opt_ins_are_independent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let server = WebSocketServer::with_bind_addr(port, "127.0.0.1".to_string());
+        let broadcast_tx = server.broadcast_sender();
+
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+
+        // Client A opts into audio_level only; client B into spectrum only.
+        let (mut ws_a, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws_a.send(Message::Text(
+            r#"{"type":"audio_level","enabled":true}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let (mut ws_b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws_b.send(Message::Text(
+            r#"{"type":"spectrum","enabled":true}"#.into(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let audio_level_json = serde_json::to_string(&WsServerMessage::AudioLevel {
+            direction: AudioLevelDirection::Rx,
+            peak_dbfs: -12.1,
+            rms_dbfs: -31.4,
+            clip_fraction: 0.0,
+            state: AudioLevelState::Ok,
+            duration_ms: 100,
+            timestamp_ms: 1,
+        })
+        .unwrap();
+        let spectrum_json = serde_json::to_string(&WsServerMessage::Spectrum {
+            bins: vec![-90.0; 128],
+            timestamp_ms: 2,
+        })
+        .unwrap();
+        let canary = |data: &str| {
+            serde_json::to_string(&WsServerMessage::Data {
+                data: data.to_string(),
+            })
+            .unwrap()
+        };
+
+        broadcast_tx.send(audio_level_json.clone()).unwrap();
+        broadcast_tx.send(spectrum_json).unwrap();
+        broadcast_tx.send(canary("canary")).unwrap();
+
+        // A: audio_level, then the canary -- never the spectrum.
+        match next_server_message(&mut ws_a, "client A").await {
+            WsServerMessage::AudioLevel { timestamp_ms, .. } => assert_eq!(timestamp_ms, 1),
+            other => panic!("client A expected AudioLevel, got {:?}", other),
+        }
+        match next_server_message(&mut ws_a, "client A").await {
+            WsServerMessage::Data { data } => assert_eq!(data, "canary"),
+            other => panic!("client A expected the canary, got {:?}", other),
+        }
+
+        // B: spectrum, then the canary -- never the audio_level.
+        match next_server_message(&mut ws_b, "client B").await {
+            WsServerMessage::Spectrum { timestamp_ms, .. } => assert_eq!(timestamp_ms, 2),
+            other => panic!("client B expected Spectrum, got {:?}", other),
+        }
+        match next_server_message(&mut ws_b, "client B").await {
+            WsServerMessage::Data { data } => assert_eq!(data, "canary"),
+            other => panic!("client B expected the canary, got {:?}", other),
+        }
+
+        // A opts back out: the next audio_level is dropped for it.
+        ws_a.send(Message::Text(
+            r#"{"type":"audio_level","enabled":false}"#.into(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        broadcast_tx.send(audio_level_json).unwrap();
+        broadcast_tx.send(canary("canary2")).unwrap();
+        match next_server_message(&mut ws_a, "client A").await {
+            WsServerMessage::Data { data } => assert_eq!(data, "canary2"),
+            other => panic!("opted-out client A expected canary2, got {:?}", other),
         }
 
         ws_a.close(None).await.ok();
