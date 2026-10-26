@@ -29,6 +29,7 @@ use crate::audio_output::{
     TxOutput, PROGRESS_TICK,
 };
 use crate::config::DaemonConfig;
+use crate::level_meter::{self, LevelReading, LevelState, RxLevelMeter};
 
 /// Map of connected VARA command-port clients' response senders
 /// (`VaraServer::response_senders()`), used to broadcast `VaraResponse` telemetry.
@@ -142,6 +143,33 @@ fn lock_tx_output(tx_output: &std::sync::Mutex<TxOutput>) -> std::sync::MutexGua
     tx_output
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Log an RX level state change (COP-65): a WARN naming the fix on entering
+/// `Clipping` or `Underdrive`, an INFO on recovery. dB fields go through
+/// `level_meter::round_db`, as the WebSocket message does, so logs and wire
+/// always show the same number.
+fn log_rx_level_transition(state: LevelState, reading: &LevelReading) {
+    let msg = level_meter::rx_transition_message(state, reading);
+    let peak_dbfs = level_meter::round_db(reading.peak_dbfs);
+    let rms_dbfs = level_meter::round_db(reading.rms_dbfs);
+    match state {
+        LevelState::Clipping => tracing::warn!(
+            peak_dbfs,
+            rms_dbfs,
+            clipped_percent = level_meter::round_db(reading.clip_fraction * 100.0),
+            "{msg}"
+        ),
+        LevelState::Underdrive if reading.rms_dbfs <= level_meter::SILENCE_FLOOR_DBFS => {
+            tracing::warn!(rms_dbfs, "{msg}")
+        }
+        LevelState::Underdrive => tracing::warn!(
+            rms_dbfs,
+            threshold_dbfs = level_meter::UNDERDRIVE_RMS_DBFS,
+            "{msg}"
+        ),
+        LevelState::Ok => tracing::info!(peak_dbfs, rms_dbfs, "{msg}"),
+    }
 }
 
 /// The main daemon event loop.
@@ -291,6 +319,9 @@ pub struct EventLoop {
     /// Spectral-occupancy busy gate (decision 8: `BUSY ON`/`OFF` telemetry), fed
     /// raw incoming audio in `handle_audio_in`.
     busy_gate: BusyGate,
+    /// RX audio level meter (COP-65), fed raw incoming audio by
+    /// `observe_rx_level` from both raw RX taps; see that method's doc.
+    rx_level_meter: RxLevelMeter,
     /// Session manager for connected-mode operation.
     session_mgr: SessionManager,
     /// Local station callsign: `[engine] callsign` at startup, replaced by a
@@ -411,6 +442,7 @@ impl EventLoop {
         };
 
         let busy_gate = BusyGate::new(config.audio.sample_rate as f32);
+        let rx_level_meter = RxLevelMeter::new(config.audio.sample_rate);
         #[cfg(feature = "websocket")]
         let spectrum_sensor = coppa_ml::SpectrumSensor::new(
             crate::spectrum::SPECTRUM_FFT_SIZE,
@@ -500,6 +532,7 @@ impl EventLoop {
             tx_on_air_bytes: 0,
             last_reported_buffer: 0,
             busy_gate,
+            rx_level_meter,
             session_mgr: SessionManager::new(),
             local_callsign,
             vara_keepalive_period: VARA_KEEPALIVE_PERIOD,
@@ -1294,9 +1327,7 @@ impl EventLoop {
     /// to run full dispatch again.
     async fn observe_busy_gate_from_audio_input(&mut self) {
         if let Some(buf) = self.drain_audio_input_ring() {
-            if let Some(new_state) = self.busy_gate.observe(&buf) {
-                self.emit_vara(VaraResponse::Busy(new_state)).await;
-            }
+            self.observe_raw_rx(&buf).await;
             self.pending_busy_wait_audio.extend_from_slice(&buf);
         }
     }
@@ -1543,15 +1574,104 @@ impl EventLoop {
     }
 
     async fn handle_audio_in(&mut self, samples: &[f32]) {
+        self.observe_raw_rx(samples).await;
+        #[cfg(feature = "websocket")]
+        self.maybe_broadcast_spectrum(samples);
+        self.decode_and_dispatch_audio(samples).await;
+    }
+
+    /// The observation prelude shared by both raw RX taps (`handle_audio_in`
+    /// and `observe_busy_gate_from_audio_input`). Each raw sample passes
+    /// through exactly one of them, so everything here sees every sample
+    /// exactly once; decode stays split out (Finding 1) and is not part of
+    /// this.
+    async fn observe_raw_rx(&mut self, samples: &[f32]) {
         // Spectral-occupancy busy gate (decision 8): fed every incoming audio
         // block, regardless of whether it ends up containing a decodable frame.
         // Only emits telemetry on an actual BUSY ON/OFF transition.
         if let Some(new_state) = self.busy_gate.observe(samples) {
             self.emit_vara(VaraResponse::Busy(new_state)).await;
         }
+        self.observe_rx_level(samples);
+    }
+
+    /// COP-65: meter raw RX audio (both raw taps call this through
+    /// `observe_raw_rx`, so every sample is metered exactly once). Logs a
+    /// WARN/INFO line only when the RX level state changes, never per window,
+    /// and broadcasts one `audio_level` message per 100 ms window when a
+    /// WebSocket host is attached.
+    ///
+    /// Paused while transmitting: the input then carries the radio's muted
+    /// output or its own TX monitor, not the channel. The in-progress window
+    /// is discarded rather than merged with post-TX audio.
+    fn observe_rx_level(&mut self, samples: &[f32]) {
+        if self.is_transmitting {
+            self.rx_level_meter.discard_partial_window();
+            return;
+        }
+        for update in self.rx_level_meter.observe(samples) {
+            if update.transition.is_some() {
+                log_rx_level_transition(update.state, &update.reading);
+            }
+            #[cfg(feature = "websocket")]
+            self.broadcast_audio_level(
+                coppa_host::websocket::AudioLevelDirection::Rx,
+                &update.reading,
+                update.state,
+            );
+        }
+    }
+
+    /// COP-65: measure one whole transmission as it will play (station-ID
+    /// prepend included), log one `TX audio level` INFO line, warn if any
+    /// sample is digitally clipped, and broadcast a `tx` `audio_level`
+    /// message when a WebSocket host is attached.
+    fn report_tx_level(&self, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
+        let reading = level_meter::measure(samples);
+        let state = level_meter::tx_state(&reading);
+        tracing::info!(
+            peak_dbfs = level_meter::round_db(reading.peak_dbfs),
+            rms_dbfs = level_meter::round_db(reading.rms_dbfs),
+            duration_ms = level_meter::duration_ms(&reading, self.config.audio.sample_rate),
+            "TX audio level"
+        );
+        if state == LevelState::Clipping {
+            tracing::warn!(
+                peak_dbfs = level_meter::round_db(reading.peak_dbfs),
+                clipped_percent = level_meter::round_db(reading.clip_fraction * 100.0),
+                "{}",
+                level_meter::TX_CLIPPING_MESSAGE
+            );
+        }
         #[cfg(feature = "websocket")]
-        self.maybe_broadcast_spectrum(samples);
-        self.decode_and_dispatch_audio(samples).await;
+        self.broadcast_audio_level(
+            coppa_host::websocket::AudioLevelDirection::Tx,
+            &reading,
+            state,
+        );
+    }
+
+    /// Broadcast one `audio_level` message over `ws_broadcast` (COP-65). A
+    /// no-op when no host is attached, like `maybe_broadcast_spectrum`;
+    /// per-client opt-in filtering happens on the `coppa-host::websocket`
+    /// side.
+    #[cfg(feature = "websocket")]
+    fn broadcast_audio_level(
+        &self,
+        direction: coppa_host::websocket::AudioLevelDirection,
+        reading: &LevelReading,
+        state: LevelState,
+    ) {
+        let Some(ref ws_tx) = self.ws_broadcast else {
+            return;
+        };
+        let msg = level_meter::ws_message(direction, reading, state, self.config.audio.sample_rate);
+        if let Ok(json) = serde_json::to_string(&msg) {
+            let _ = ws_tx.send(json);
+        }
     }
 
     /// Waterfall spectrum production (Phase 4 Task 4): accumulate `samples`
@@ -2157,6 +2277,10 @@ impl EventLoop {
         } else {
             samples
         };
+
+        // COP-65: the complete waveform about to play, after the gate (a
+        // refused transmission returned above and reports nothing).
+        self.report_tx_level(samples);
 
         // Assert PTT before transmitting
         self.handle_ptt_change(true).await;
@@ -6453,9 +6577,20 @@ mod tests {
         // Immediately push more audio (no backdating this time): real
         // wall-clock elapsed since the broadcast above is far under the
         // rate-limit period, so this must NOT produce a second broadcast.
+        // (The same channel also carries COP-65 `audio_level` messages: these
+        // two pushes complete one 100 ms level window, so only `spectrum`
+        // messages count here.)
         event_loop.handle_audio_in(&samples).await;
+        let mut rebroadcast = false;
+        while let Ok(json) = ws_rx.try_recv() {
+            if let Ok(coppa_host::websocket::WsServerMessage::Spectrum { .. }) =
+                serde_json::from_str(&json)
+            {
+                rebroadcast = true;
+            }
+        }
         assert!(
-            ws_rx.try_recv().is_err(),
+            !rebroadcast,
             "a second push within the rate-limit period must not re-broadcast"
         );
 
@@ -6474,6 +6609,219 @@ mod tests {
         assert!(
             second_spectrum.is_some(),
             "the rate gate should re-open once its period has (mock-)elapsed"
+        );
+    }
+
+    // ── COP-65: RX/TX audio level metering ────────────────────────────────
+
+    /// One `audio_level` message, as the broadcast channel carried it.
+    #[cfg(feature = "websocket")]
+    #[derive(Debug, Clone, Copy)]
+    struct AudioLevelMsg {
+        direction: coppa_host::websocket::AudioLevelDirection,
+        peak_dbfs: f32,
+        rms_dbfs: f32,
+        clip_fraction: f32,
+        state: coppa_host::websocket::AudioLevelState,
+        duration_ms: u32,
+    }
+
+    /// Drain every pending broadcast and keep only the `audio_level` messages,
+    /// in order, optionally only one direction.
+    #[cfg(feature = "websocket")]
+    fn drain_audio_levels(
+        ws_rx: &mut tokio::sync::broadcast::Receiver<String>,
+        direction: Option<coppa_host::websocket::AudioLevelDirection>,
+    ) -> Vec<AudioLevelMsg> {
+        let mut out = Vec::new();
+        while let Ok(json) = ws_rx.try_recv() {
+            if let Ok(coppa_host::websocket::WsServerMessage::AudioLevel {
+                direction: d,
+                peak_dbfs,
+                rms_dbfs,
+                clip_fraction,
+                state,
+                duration_ms,
+                ..
+            }) = serde_json::from_str(&json)
+            {
+                if direction.is_none_or(|want| want == d) {
+                    out.push(AudioLevelMsg {
+                        direction: d,
+                        peak_dbfs,
+                        rms_dbfs,
+                        clip_fraction,
+                        state,
+                        duration_ms,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Alternating full-scale samples: every sample is clipped.
+    fn full_scale_square(len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect()
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn rx_audio_level_is_broadcast_ten_times_per_second_of_audio() {
+        use coppa_host::websocket::{AudioLevelDirection, AudioLevelState};
+
+        let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+        event_loop.set_ws_broadcast(ws_tx);
+
+        event_loop.handle_audio_in(&vec![0.01f32; 48_000]).await;
+
+        let all = drain_audio_levels(&mut ws_rx, None);
+        assert_eq!(all.len(), 10, "one rx message per 100 ms window");
+        for m in &all {
+            assert_eq!(m.direction, AudioLevelDirection::Rx);
+            assert_eq!(m.peak_dbfs, -40.0);
+            assert_eq!(m.rms_dbfs, -40.0);
+            assert_eq!(m.clip_fraction, 0.0);
+            assert_eq!(m.state, AudioLevelState::Ok);
+            assert_eq!(m.duration_ms, 100);
+        }
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn clipped_rx_audio_is_reported_as_clipping() {
+        use coppa_host::websocket::{AudioLevelDirection, AudioLevelState};
+
+        let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+        event_loop.set_ws_broadcast(ws_tx);
+
+        event_loop.handle_audio_in(&full_scale_square(14_400)).await;
+
+        let rx = drain_audio_levels(&mut ws_rx, Some(AudioLevelDirection::Rx));
+        assert_eq!(rx.len(), 3);
+        assert_eq!(rx[0].clip_fraction, 1.0);
+        assert_eq!(
+            rx[0].state,
+            AudioLevelState::Ok,
+            "one clipped window is not yet clipping"
+        );
+        assert_eq!(rx[1].state, AudioLevelState::Clipping);
+        assert_eq!(rx[2].state, AudioLevelState::Clipping);
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn rx_audio_is_not_metered_while_transmitting() {
+        let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+        event_loop.set_ws_broadcast(ws_tx);
+
+        // Half a window of clipped audio before keying.
+        event_loop.handle_audio_in(&vec![1.0f32; 2400]).await;
+        event_loop.is_transmitting = true;
+        event_loop.handle_audio_in(&vec![1.0f32; 48_000]).await;
+        assert!(
+            drain_audio_levels(&mut ws_rx, None).is_empty(),
+            "no audio_level while transmitting"
+        );
+        event_loop.is_transmitting = false;
+
+        event_loop.handle_audio_in(&vec![0.01f32; 4800]).await;
+        let rx = drain_audio_levels(&mut ws_rx, None);
+        assert_eq!(rx.len(), 1);
+        assert_eq!(
+            rx[0].clip_fraction, 0.0,
+            "the pre-TX partial window was discarded, not merged"
+        );
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test(start_paused = true)]
+    async fn busy_wait_audio_is_metered_exactly_once() {
+        let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+        event_loop.set_ws_broadcast(ws_tx);
+        let (mut audio_in_tx, audio_in_rx) = coppa_audio::audio_ring(1_000_000);
+        event_loop.set_audio_in(audio_in_rx);
+
+        audio_in_tx.write(&vec![0.01f32; 9600]);
+        event_loop.observe_busy_gate_from_audio_input().await;
+        assert_eq!(drain_audio_levels(&mut ws_rx, None).len(), 2);
+        assert!(!event_loop.pending_busy_wait_audio.is_empty());
+
+        // The deferred decode of that same audio must not meter it again.
+        event_loop.poll_audio_input().await;
+        assert!(event_loop.pending_busy_wait_audio.is_empty());
+        assert!(drain_audio_levels(&mut ws_rx, None).is_empty());
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn each_transmission_reports_one_tx_audio_level() {
+        use coppa_host::websocket::{AudioLevelDirection, AudioLevelState};
+
+        let mut config = DaemonConfig::default();
+        config.radio.ptt_pre_delay_ms = 0;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+        event_loop.set_ws_broadcast(ws_tx);
+
+        let samples = event_loop.engine.encode_bytes(b"COP-65").unwrap();
+        event_loop.transmit_samples(&samples).await;
+
+        let all = drain_audio_levels(&mut ws_rx, None);
+        assert_eq!(all.len(), 1, "exactly one message per transmission");
+        let tx = all[0];
+        assert_eq!(tx.direction, AudioLevelDirection::Tx);
+        assert_eq!(
+            tx.peak_dbfs, -6.0,
+            "every frame is normalized to -6.02 dBFS"
+        );
+        assert_eq!(tx.state, AudioLevelState::Ok);
+        assert_eq!(tx.clip_fraction, 0.0);
+        assert!(
+            (-22.0..=-16.0).contains(&tx.rms_dbfs),
+            "rms {}",
+            tx.rms_dbfs
+        );
+        assert_eq!(
+            tx.duration_ms as usize,
+            samples.len() * 1000 / 48_000,
+            "no station ID was prepended, so the span is the frame itself"
+        );
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn tune_tone_tx_level_reads_minus_6_peak_minus_12_rms() {
+        use coppa_host::websocket::AudioLevelDirection;
+
+        let mut config = DaemonConfig::default();
+        config.radio.ptt_pre_delay_ms = 0;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+        event_loop.set_ws_broadcast(ws_tx);
+
+        let tone = event_loop.engine.tune_tone(1.0, None);
+        event_loop.transmit_samples(&tone).await;
+
+        let tx = drain_audio_levels(&mut ws_rx, Some(AudioLevelDirection::Tx));
+        assert_eq!(tx.len(), 1);
+        assert_eq!(tx[0].peak_dbfs, -6.0);
+        assert_eq!(tx[0].rms_dbfs, -12.0);
+    }
+
+    #[tokio::test]
+    async fn rx_level_state_tracks_clipping_without_a_websocket_host() {
+        let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        event_loop.handle_audio_in(&full_scale_square(9600)).await;
+        assert_eq!(
+            event_loop.rx_level_meter.state(),
+            crate::level_meter::LevelState::Clipping
         );
     }
 
@@ -10038,6 +10386,41 @@ mod tests {
                 PttControl::get_ptt(&mut event_loop.ptt).unwrap(),
                 PttState::Rx,
                 "the rig was never keyed"
+            );
+        }
+
+        /// COP-65: a transmission the gate refuses never reaches the air, so
+        /// it reports no TX level; the same call allowed reports exactly one.
+        #[cfg(feature = "websocket")]
+        #[tokio::test]
+        async fn refused_wideband_transmission_reports_no_tx_audio_level() {
+            use coppa_host::websocket::AudioLevelDirection;
+
+            let rig = fake_rigctld("144500000");
+            let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+            event_loop.set_ws_broadcast(ws_tx);
+
+            *rig.answer.lock().unwrap() = "7074000".into();
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert!(!event_loop.is_transmitting);
+            assert!(
+                drain_audio_levels(&mut ws_rx, Some(AudioLevelDirection::Tx)).is_empty(),
+                "a refused transmission reports no TX level"
+            );
+            *rig.answer.lock().unwrap() = "144500000".into();
+            assert_eq!(
+                PttControl::get_ptt(&mut event_loop.ptt).unwrap(),
+                PttState::Rx,
+                "the rig was never keyed"
+            );
+
+            // Control: back on 2m, the same call transmits and reports once.
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert!(event_loop.is_transmitting);
+            assert_eq!(
+                drain_audio_levels(&mut ws_rx, Some(AudioLevelDirection::Tx)).len(),
+                1
             );
         }
 

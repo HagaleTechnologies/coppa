@@ -96,6 +96,7 @@ Test Infrastructure  → Channel models (AWGN, fading), fuzzing
 - Tokio-based event loop multiplexing audio, host, and radio events
 - Configuration via TOML file
 - Ctrl-C graceful shutdown
+- RX/TX audio level meter with clipping/underdrive warnings (logs + opt-in WebSocket `audio_level` stream)
 
 ## TX Pipeline
 

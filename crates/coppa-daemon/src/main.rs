@@ -10,6 +10,7 @@ mod audio_output;
 mod cli;
 mod config;
 mod event_loop;
+mod level_meter;
 #[cfg(feature = "websocket")]
 mod spectrum;
 
