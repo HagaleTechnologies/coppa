@@ -637,15 +637,27 @@ fn tnc_without_the_feature_fails_without_a_banner() {
 /// and the time readiness took.
 #[cfg(not(feature = "cpal-backend"))]
 fn start_until_ready(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> (Daemon, Duration) {
+    start_until(cwd, args, envs, "Daemon ready")
+}
+
+/// Start the daemon and wait until its stdout contains `marker`. Returns the
+/// child and the time that took.
+#[cfg(not(feature = "cpal-backend"))]
+fn start_until(
+    cwd: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    marker: &str,
+) -> (Daemon, Duration) {
     let mut daemon = Daemon::spawn(cwd, args, envs);
     loop {
-        if daemon.stdout().contains("Daemon ready") {
+        if daemon.stdout().contains(marker) {
             let elapsed = daemon.started.elapsed();
             return (daemon, elapsed);
         }
         if let Some(status) = daemon.try_exit() {
             panic!(
-                "coppad {args:?} exited with {status} before becoming ready\n\
+                "coppad {args:?} exited with {status} before logging {marker:?}\n\
                  --- stdout ---\n{}\n--- stderr ---\n{}",
                 daemon.stdout(),
                 daemon.stderr()
@@ -654,7 +666,7 @@ fn start_until_ready(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> (Daemo
         if daemon.started.elapsed() >= DEADLINE {
             let (stdout, stderr) = daemon.kill();
             panic!(
-                "coppad {args:?} not ready within {DEADLINE:?}\n\
+                "coppad {args:?} did not log {marker:?} within {DEADLINE:?}\n\
                  --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
             );
         }
@@ -815,4 +827,32 @@ fn a_missing_named_output_device_is_a_startup_error() {
         "[audio]\noutput_device = \"COP-32 no such output device\"\n",
         "audio output device \"COP-32 no such output device\" not found",
     );
+}
+
+/// An unreachable rigctld leaves the daemon running without PTT: it logs
+/// ERROR and reports itself degraded instead of ready, and keeps running.
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn an_unreachable_rigctld_is_reported_degraded_not_ready() {
+    let dir = TempDir::new("run-rigctld");
+    dir.write(
+        "station.toml",
+        "[radio]\nptt_method = \"rigctld\"\nrigctld_address = \"127.0.0.1:1\"\n",
+    );
+    let args = ["--config", "station.toml"];
+    let (mut daemon, _) = start_until(dir.path(), &args, &[], "Daemon running degraded");
+    assert!(daemon.try_exit().is_none(), "a degraded daemon keeps running");
+    let (stdout, _) = daemon.kill();
+    assert!(!stdout.contains("Daemon ready"), "{stdout}");
+    for marker in [
+        "Failed to connect to rigctld",
+        "Daemon running degraded",
+        "no PTT: rigctld at 127.0.0.1:1 is unreachable",
+    ] {
+        let line = stdout
+            .lines()
+            .find(|l| l.contains(marker))
+            .unwrap_or_else(|| panic!("no {marker:?} line\n{stdout}"));
+        assert!(line.contains("ERROR"), "{line}");
+    }
 }

@@ -126,7 +126,9 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
 
     // Create event loop. Fails loudly (rather than silently falling back to
     // NullPtt) if [radio] ptt_method doesn't parse or names an
-    // unrecognized/unbuilt PTT backend -- see EventLoop::create_ptt.
+    // unrecognized/unbuilt PTT backend -- see EventLoop::create_ptt. An
+    // unreachable rigctld still falls back to NullPtt, but is recorded in
+    // startup_problems so the daemon reports itself degraded (COP-32).
     let mut event_loop = EventLoop::new(config.clone())
         .map_err(|e| anyhow::anyhow!("failed to start daemon event loop: {e}"))?;
     let event_tx = event_loop.event_sender();
@@ -411,7 +413,13 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         });
     }
 
-    tracing::info!("Daemon ready");
+    // COP-32: "Daemon ready" only when nothing degraded the startup.
+    let problems = event_loop.startup_problems();
+    if problems.is_empty() {
+        tracing::info!("Daemon ready");
+    } else {
+        tracing::error!(problems = %problems.join("; "), "Daemon running degraded");
+    }
 
     // Run the event loop
     event_loop.run().await?;
