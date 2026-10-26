@@ -53,6 +53,13 @@ pub struct RadioConfig {
     pub ptt_tail_delay_ms: u64,
     /// Maximum TX duration in seconds before forced PTT unkey (safety).
     pub max_tx_duration_s: u64,
+    /// Minimum time in ms between the end of a frame this station decodes and
+    /// this station keying PTT (half-duplex RX->TX turnaround, COP-60). The
+    /// sender stays keyed for its own `ptt_tail_delay_ms` (or its rig's VOX
+    /// hang time) after its last sample and cannot hear a reply sent sooner,
+    /// so this must exceed that plus the peer rig's TX->RX switching time.
+    /// `0` disables the guard.
+    pub turnaround_ms: u64,
     /// COP-40: explicit operating (dial) frequency in Hz, a frequency source
     /// for the HF/VHF wideband gate. Only wideband (VHF) profiles need one;
     /// see [`RadioConfig::frequency_config`].
@@ -182,6 +189,22 @@ impl RadioConfig {
             "[radio] frequency_hz",
             "[radio] band",
         )
+    }
+
+    /// COP-60: the startup warning for a turnaround that cannot outlast a
+    /// peer configured like this station. The peer's tail is unknown here,
+    /// so this station's own `ptt_tail_delay_ms` stands in for it, and a
+    /// short value only warns: asymmetric setups are legitimate. A long
+    /// turnaround costs throughput but never collides, so it never warns.
+    pub fn turnaround_warning(&self) -> Option<String> {
+        (self.turnaround_ms <= self.ptt_tail_delay_ms).then(|| {
+            format!(
+                "[radio] turnaround_ms ({}) does not exceed ptt_tail_delay_ms ({}); \
+                 a peer configured like this station will still be keyed when \
+                 this station answers",
+                self.turnaround_ms, self.ptt_tail_delay_ms
+            )
+        })
     }
 }
 
@@ -395,6 +418,7 @@ impl Default for RadioConfig {
             ptt_pre_delay_ms: 50,
             ptt_tail_delay_ms: 200,
             max_tx_duration_s: 30,
+            turnaround_ms: 500,
             frequency_hz: None,
             band: None,
         }
@@ -893,6 +917,85 @@ beacon_interval_secs = 600
         let parsed = config.radio.frequency_config().unwrap();
         assert_eq!(parsed.stated_hz, Some(50_313_000));
         assert_eq!(parsed.band.unwrap().label, "6m");
+    }
+
+    #[test]
+    fn test_turnaround_defaults_to_500_ms() {
+        assert_eq!(DaemonConfig::default().radio.turnaround_ms, 500);
+    }
+
+    #[test]
+    fn test_turnaround_toml_override() {
+        let config: DaemonConfig = toml::from_str("[radio]\nturnaround_ms = 750").unwrap();
+        assert_eq!(config.radio.turnaround_ms, 750);
+    }
+
+    #[test]
+    fn test_turnaround_warning_when_not_above_the_tail() {
+        let short = RadioConfig {
+            turnaround_ms: 100,
+            ..Default::default()
+        };
+        let warning = short
+            .turnaround_warning()
+            .expect("100 ms <= 200 ms tail warns");
+        assert!(warning.contains("turnaround_ms (100)"), "{warning}");
+        assert!(warning.contains("ptt_tail_delay_ms (200)"), "{warning}");
+
+        let disabled = RadioConfig {
+            turnaround_ms: 0,
+            ..Default::default()
+        };
+        assert!(disabled.turnaround_warning().is_some());
+
+        let equal = RadioConfig {
+            turnaround_ms: 200,
+            ptt_tail_delay_ms: 200,
+            ..Default::default()
+        };
+        assert!(
+            equal.turnaround_warning().is_some(),
+            "a turnaround equal to the tail leaves no margin"
+        );
+    }
+
+    #[test]
+    fn test_turnaround_warning_absent_at_defaults() {
+        assert_eq!(RadioConfig::default().turnaround_warning(), None);
+    }
+
+    #[test]
+    fn test_example_config_documents_turnaround_under_radio() {
+        // Read at runtime rather than `include_str!`, which would make the
+        // crate unpackable without the workspace-root example file.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../coppad.toml.example");
+        let text = std::fs::read_to_string(path).unwrap();
+
+        let value: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(
+            value["radio"]["turnaround_ms"].as_integer(),
+            Some(500),
+            "coppad.toml.example must set [radio] turnaround_ms = 500"
+        );
+
+        // The key lives only in [radio]: no stray (dead) copy anywhere else,
+        // commented or not.
+        let mut table = String::new();
+        for line in text.lines() {
+            let trimmed = line.trim_start_matches('#').trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.contains(' ') {
+                table = trimmed.to_string();
+            }
+            if trimmed.starts_with("turnaround_ms") {
+                assert_eq!(
+                    table, "[radio]",
+                    "turnaround_ms line outside [radio]: {line:?}"
+                );
+            }
+        }
+
+        let config: DaemonConfig = toml::from_str(&text).unwrap();
+        assert_eq!(config.radio.turnaround_ms, 500);
     }
 
     #[test]

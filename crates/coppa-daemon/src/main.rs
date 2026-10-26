@@ -113,11 +113,15 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     if config.engine.callsign.is_empty() {
         tracing::warn!("No callsign configured. Set [engine] callsign in config.");
     }
+    if let Some(warning) = config.radio.turnaround_warning() {
+        tracing::warn!("{warning}");
+    }
 
     tracing::info!(
         profile = %config.engine.profile,
         sample_rate = config.audio.sample_rate,
         ptt_method = %config.radio.ptt_method,
+        turnaround_ms = config.radio.turnaround_ms,
         "Daemon configuration loaded"
     );
 

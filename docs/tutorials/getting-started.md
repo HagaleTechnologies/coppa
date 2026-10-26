@@ -174,6 +174,9 @@ buffer_size = 8192
 # serial-ptt / gpio-ptt respectively). An unrecognized value is a hard
 # startup error, not a silent fallback to no PTT.
 ptt_method = "none"
+# Wait this long after decoding a frame before keying (default 500 ms);
+# must exceed the other station's PTT tail / VOX hang time.
+# turnaround_ms = 500
 
 [host]
 vara_enabled = true
