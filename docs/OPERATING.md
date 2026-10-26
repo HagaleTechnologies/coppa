@@ -30,7 +30,6 @@ across all carriers at once and wrecks decode on every one of them.
 
 Re-run this any time you change antennas, radios, or soundcard levels.
 
-<<<<<<< HEAD
 ### What Coppa sends
 
 Every transmission leaves Coppa at a fixed **-6.02 dBFS** digital peak: the
@@ -115,7 +114,7 @@ independent of the `spectrum` stream.
 | `state` | `ok`, `clipping` or `underdrive` (RX, after this window, using the thresholds above). TX is only ever `ok` or `clipping` |
 | `duration_ms` | Audio span the reading covers |
 | `timestamp_ms` | Wall-clock time the message was sent (Unix epoch, ms) |
-=======
+
 ## Half-duplex turnaround
 
 A half-duplex rig cannot receive while it is keyed, and a station that has just
@@ -158,4 +157,3 @@ queued re-keys for the next one the moment its own PTT releases, so the
 other station's ACK can still collide with that next frame. Sender-side turn
 discipline is a separate follow-up. The hardware acceptance test for this
 behaviour is `docs/testing/cable-loop-turnaround.md`.
->>>>>>> 664116ae5536704a5cbcb601eccd03cc39f48eff
