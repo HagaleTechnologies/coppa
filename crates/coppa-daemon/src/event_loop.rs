@@ -198,18 +198,15 @@ pub struct EventLoop {
     /// connected rigctld client so the wideband gate can read the rig's dial
     /// frequency (COP-40).
     ptt: PttBackend,
-<<<<<<< HEAD
     /// COP-31: the out-of-process PTT guardian, told about every PTT
     /// transition from `set_ptt` (rigctld/GPIO PTT only; `None` otherwise).
     /// Declared immediately after `ptt` on purpose: fields drop in
     /// declaration order, so the backend's own `Drop` release runs first and
     /// only then does the guardian see EOF on its stdin.
     ptt_guardian: Option<crate::ptt_guardian::PttGuardian>,
-=======
     /// COP-32: degraded-startup conditions `coppad` reports in place of
     /// "Daemon ready". See [`EventLoop::startup_problems`].
     startup_problems: Vec<String>,
->>>>>>> 81ce18a1ba5b7135ed382780a863e8d624027268
     /// COP-40: the operator-stated frequency source (`[radio] frequency_hz`
     /// / `band`), validated at startup -- the fallback evidence the
     /// wideband gate in `transmit_samples` uses when no live rigctld answer
@@ -445,7 +442,6 @@ impl EventLoop {
             .frequency_config()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut ptt = Self::create_ptt(&config)?;
-<<<<<<< HEAD
         // COP-31: every backend assumes RX at construction; make the rig match, so
         // a restart un-keys a transmitter an earlier run left keyed (and a Linux
         // serial open's DTR assertion is undone). Before the frequency gate: even a
@@ -455,7 +451,8 @@ impl EventLoop {
                 error = %e,
                 "Could not release PTT at startup; a transmitter left keyed by an earlier run may still be keyed"
             );
-=======
+        }
+
         // COP-32: conditions the daemon runs through but must not call ready.
         let mut startup_problems = Vec::new();
         if config.radio.ptt_config() == Ok(crate::config::PttConfig::Rigctld) && !ptt.is_rigctld() {
@@ -463,7 +460,6 @@ impl EventLoop {
                 "no PTT: rigctld at {} is unreachable",
                 config.radio.rigctld_address
             ));
->>>>>>> 81ce18a1ba5b7135ed382780a863e8d624027268
         }
 
         // Create engine from profile; all profiles use 48kHz internally
@@ -566,11 +562,8 @@ impl EventLoop {
             tx_output: Arc::new(std::sync::Mutex::new(TxOutput::default())),
             audio_in: None,
             ptt,
-<<<<<<< HEAD
             ptt_guardian: None,
-=======
             startup_problems,
->>>>>>> 81ce18a1ba5b7135ed382780a863e8d624027268
             radio_frequency,
             tx_held_by_frequency_gate: false,
             session_tx_held_by_frequency_gate: false,
