@@ -47,6 +47,12 @@ const VARA_KEEPALIVE_PERIOD: Duration = Duration::from_secs(60);
 /// so this only fires when that path has failed, e.g. the completion task
 /// in `transmit_samples` panicked before reporting.
 const PTT_BACKSTOP_GRACE: Duration = Duration::from_secs(2);
+
+/// COP-37: what every transmit path logs, at `ERROR`, when it refuses
+/// because no valid local callsign is in force (`local_callsign` is `None`).
+const NO_CALLSIGN_TX_REFUSAL: &str = "Transmission refused: no valid local callsign; \
+     set [engine] callsign or MYCALL before transmitting";
+
 /// How often `wait_for_rx_turnaround` drains the input ring: `run()`'s
 /// `audio_poll` cadence, so the ring never fills during the hold.
 const TURNAROUND_POLL: Duration = Duration::from_millis(20);
@@ -91,7 +97,8 @@ struct SessionTxChunk {
 /// - `MYCALL <call>` valid → `OK` (the daemon applies it as the runtime
 ///   callsign); invalid or missing → `WRONG`.
 /// - `LISTEN ON`/`LISTEN OFF` → `OK`; any other argument → `WRONG`.
-/// - `TUNE [seconds]` (coppa extension) → `OK`.
+/// - `TUNE [seconds]` (coppa extension) → `OK`, even when the tone itself is
+///   then refused for want of a callsign (`transmit_samples` logs why).
 /// - `CONNECT <src> <dst>` → `OK` (then the eventual `CONNECTED`/`DISCONNECTED`
 ///   outcome); fewer than two callsigns → `WRONG`.
 /// - `DISCONNECT` → `OK` (then `DISCONNECTED` if a session existed).
@@ -403,7 +410,10 @@ pub struct EventLoop {
     session_mgr: SessionManager,
     /// Local station callsign: `[engine] callsign` at startup, replaced by a
     /// valid command-port `MYCALL`. New sessions, station ID and beacons read
-    /// it. A session keeps the callsign it was set up with.
+    /// it. A session keeps the callsign it was set up with. COP-37: `None`
+    /// (empty or invalid config, no valid `MYCALL` yet) refuses every
+    /// transmission -- see `transmit_samples`. Nothing ever sets it back to
+    /// `None`, so a payload accepted for TX keeps its callsign.
     local_callsign: Option<Callsign>,
     /// How often `run()` sends `IAMALIVE` to every command-port client;
     /// `VARA_KEEPALIVE_PERIOD` outside tests.
@@ -522,17 +532,17 @@ impl EventLoop {
                 Ok(cs) => Some(cs),
                 Err(e) => {
                     // A non-empty but unparseable callsign string leaves
-                    // `local_callsign` at `None`, which silently disables the
-                    // station-ID timer and beacon mode (both check
-                    // `local_callsign.is_some()`, not the raw config string --
-                    // see `id_due`/`maybe_send_beacon`). Warn once at startup
-                    // so this doesn't look like the feature is "on" per config
-                    // but never actually fires.
+                    // `local_callsign` at `None`, exactly like an empty one:
+                    // the daemon still starts and receives, but every
+                    // transmission is refused (COP-37, `transmit_samples`),
+                    // and with it station ID, beacons and connects. Warn
+                    // once at startup so the operator learns why before the
+                    // first refusal.
                     tracing::warn!(
                         callsign = %config.engine.callsign,
                         error = %e,
-                        "Invalid [engine] callsign; station ID/beacon and \
-                         connect handling will be unavailable"
+                        "Invalid [engine] callsign; transmission disabled until a \
+                         valid MYCALL is set"
                     );
                     None
                 }
@@ -1697,6 +1707,15 @@ impl EventLoop {
                     return;
                 }
 
+                // COP-37: refuse here, before ARQ registration or queueing,
+                // so a refused payload leaves no outstanding ARQ segment or
+                // `BUFFER` count behind. (An established session above
+                // implies a callsign: both connect paths require one.)
+                if self.local_callsign.is_none() {
+                    tracing::error!(client_id, bytes = data.len(), "{NO_CALLSIGN_TX_REFUSAL}");
+                    return;
+                }
+
                 // Sessionless TX: raw/ARQ encode path.
                 // COP-41: this path chunks the event too. With ARQ enabled,
                 // the whole event's bytes go to `arq_tx_backlog` and
@@ -2628,7 +2647,26 @@ impl EventLoop {
     /// or any audio. A refused transmission keys nothing and queues
     /// nothing. Callers observe a lost transmission, which ARQ already
     /// retransmits or times out on like any other loss.
+    ///
+    /// COP-37: before either, no valid local callsign (`local_callsign` is
+    /// `None`: `[engine] callsign` empty or invalid and no valid `MYCALL`
+    /// since) refuses the transmission outright, logging
+    /// `NO_CALLSIGN_TX_REFUSAL` at `ERROR` for each attempt. This covers
+    /// every caller, including `TUNE`, which no upstream feature gate sees.
     async fn transmit_samples(&mut self, samples: &[f32]) {
+        if self.local_callsign.is_none() {
+            tracing::error!("{NO_CALLSIGN_TX_REFUSAL}");
+            if !self.is_transmitting {
+                // As for the wideband refusal below, the refused payload
+                // never reaches the air, so no PTT release will drop it from
+                // `BUFFER`. Nothing is held for a retry: a payload is only
+                // queued with a callsign in force (see the sessionless
+                // `DataReceived` path), and nothing clears it once set.
+                self.tx_on_air_bytes = 0;
+                self.report_buffer().await;
+            }
+            return;
+        }
         let allowed = if self.wideband_frequency_check().is_ok() {
             self.wait_for_clear_channel().await;
             self.wait_for_rx_turnaround().await;
@@ -2807,10 +2845,11 @@ impl EventLoop {
     /// Deliberately independent of `callsign`/station-ID configuration
     /// (unlike `id_due`/`maybe_send_beacon`, which both require
     /// `local_callsign.is_some()`): channel courtesy is basic good operating
-    /// practice, not a regulatory identification requirement, so it applies
-    /// even when no callsign is configured. Confirmed with Tony (project
-    /// owner) as a deliberate design decision, not an oversight against the
-    /// brief's literal "all three features off when callsign unset" text.
+    /// practice, not a regulatory identification requirement. Confirmed with
+    /// Tony (project owner) as a deliberate design decision, not an oversight
+    /// against the brief's literal "all three features off when callsign
+    /// unset" text. Since COP-37 `transmit_samples` refuses a transmission
+    /// with no callsign before it ever reaches this wait.
     ///
     /// `BusyGate` only updates when fed fresh audio, which this event loop
     /// otherwise only reads from `run`'s own `audio_poll` tick -- a
@@ -4040,6 +4079,18 @@ impl EventLoop {
 mod tests {
     use super::*;
 
+    /// COP-37: a valid callsign for stations that must transmit. A daemon
+    /// with no valid callsign refuses every transmission, so receive-only
+    /// and refusal tests keep `DaemonConfig::default()`'s empty one.
+    const TEST_CALLSIGN: &str = "N0CALL";
+
+    /// `DaemonConfig::default()` with `TEST_CALLSIGN` configured.
+    fn tx_config() -> DaemonConfig {
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = TEST_CALLSIGN.to_string();
+        config
+    }
+
     #[test]
     fn rate_loop_caps_peer_recommendations_at_the_engine_band_limit() {
         for (profile, maximum) in [("HF_STANDARD", 8), ("VHF_FAST", 9)] {
@@ -4356,7 +4407,7 @@ mod tests {
     /// chased down here.
     #[tokio::test]
     async fn cp_negotiation_full_handshake_converges_both_sides() {
-        let mut config = DaemonConfig::default();
+        let mut config = tx_config();
         config.engine.arq_enabled = true;
         config.engine.cp_gate_enabled = true;
         config.engine.cp_negotiation_enabled = true;
@@ -4563,7 +4614,7 @@ mod tests {
     }
 
     fn cp_enabled_config() -> DaemonConfig {
-        let mut config = DaemonConfig::default();
+        let mut config = tx_config();
         config.engine.arq_enabled = true;
         config.engine.cp_negotiation_enabled = true;
         config
@@ -7363,7 +7414,7 @@ mod tests {
     async fn each_transmission_reports_one_tx_audio_level() {
         use coppa_host::websocket::{AudioLevelDirection, AudioLevelState};
 
-        let mut config = DaemonConfig::default();
+        let mut config = tx_config();
         config.radio.ptt_pre_delay_ms = 0;
         let mut event_loop = EventLoop::new(config).unwrap();
         let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
@@ -7399,7 +7450,7 @@ mod tests {
     async fn tune_tone_tx_level_reads_minus_6_peak_minus_12_rms() {
         use coppa_host::websocket::AudioLevelDirection;
 
-        let mut config = DaemonConfig::default();
+        let mut config = tx_config();
         config.radio.ptt_pre_delay_ms = 0;
         let mut event_loop = EventLoop::new(config).unwrap();
         let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
@@ -7475,6 +7526,8 @@ mod tests {
         fn new(mut config: DaemonConfig) -> Self {
             config.radio.ptt_pre_delay_ms = 0;
             config.radio.ptt_tail_delay_ms = 0;
+            // COP-37: a TX rig transmits, so it needs a callsign.
+            config.engine.callsign = TEST_CALLSIGN.to_string();
             let mut event_loop = EventLoop::new(config).unwrap();
             let (producer, outer) = coppa_audio::audio_ring(8192);
             event_loop.set_audio_out(producer);
@@ -8273,6 +8326,217 @@ mod tests {
         assert_eq!(pdu.src.as_str(), "W5AU");
     }
 
+    // ── COP-37: no valid callsign, no transmission ───────────────────────
+
+    /// This thread's `tracing` output, captured so a test can assert what a
+    /// refusal logged. `install` scopes the capture to the returned guard;
+    /// `#[tokio::test]`'s current-thread runtime runs the event loop, and
+    /// every task it spawns, on the test's own thread.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log capture lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogCapture {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(move || writer.clone())
+                    .with_ansi(false)
+                    .finish(),
+            )
+        }
+
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log capture lock")).into_owned()
+        }
+
+        /// How many captured `ERROR` lines carry the callsign refusal.
+        fn refusals(&self) -> usize {
+            self.contents()
+                .lines()
+                .filter(|line| line.contains("ERROR") && line.contains(NO_CALLSIGN_TX_REFUSAL))
+                .count()
+        }
+    }
+
+    /// A station wired to an audio-out ring and a VARA command-port client
+    /// (`client_id` 1) whose replies and telemetry the test reads back.
+    fn wired_station(
+        config: DaemonConfig,
+    ) -> (
+        EventLoop,
+        coppa_audio::AudioRingConsumer,
+        mpsc::Receiver<VaraResponse>,
+    ) {
+        let mut station = EventLoop::new(config).unwrap();
+        let (audio_tx, audio_rx) = coppa_audio::audio_ring(1_000_000);
+        station.set_audio_out(audio_tx);
+        let (vara_tx, vara_rx) = mpsc::channel(64);
+        station.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, vara_tx)]))));
+        (station, audio_rx, vara_rx)
+    }
+
+    async fn send_vara_command(station: &mut EventLoop, command: &str) {
+        station
+            .handle_host_event(HostEvent::VaraCommand {
+                client_id: 1,
+                command: command.into(),
+            })
+            .await;
+    }
+
+    fn drain_vara(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<VaraResponse> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// The audio the station has written for transmission, once the `run`
+    /// TX tick would have moved it into the audio-out ring.
+    fn transmitted_samples(
+        station: &EventLoop,
+        audio_rx: &mut coppa_audio::AudioRingConsumer,
+    ) -> usize {
+        station.flush_pending_audio_out();
+        audio_rx.available()
+    }
+
+    /// The ticket's scenario: with no callsign or an invalid one configured,
+    /// `TUNE` keys nothing and writes no audio, and the daemon logs why. The
+    /// daemon still starts (receive-only) and still answers `OK`, which only
+    /// says the command parsed.
+    #[tokio::test]
+    async fn tune_is_refused_and_logged_without_a_valid_callsign() {
+        for callsign in ["", "W5AU!"] {
+            let logs = LogCapture::default();
+            let _guard = logs.install();
+            let mut config = DaemonConfig::default();
+            config.engine.callsign = callsign.to_string();
+            let (mut station, mut audio_rx, mut vara_rx) = wired_station(config);
+            assert_eq!(station.local_callsign, None, "{callsign:?}");
+            if !callsign.is_empty() {
+                assert!(
+                    logs.contents()
+                        .contains("transmission disabled until a valid MYCALL is set"),
+                    "an invalid callsign must warn at startup that TX is disabled, got: {}",
+                    logs.contents()
+                );
+            }
+
+            send_vara_command(&mut station, "TUNE 1").await;
+
+            assert_eq!(
+                drain_vara(&mut vara_rx),
+                vec![VaraResponse::Ok],
+                "{callsign:?}: TUNE must be answered OK with no PTT bracket"
+            );
+            assert!(!station.is_transmitting, "{callsign:?}");
+            assert_eq!(
+                transmitted_samples(&station, &mut audio_rx),
+                0,
+                "{callsign:?}: no tone may reach the audio sink"
+            );
+            assert_eq!(
+                logs.refusals(),
+                1,
+                "{callsign:?}: the refusal must be logged once, got: {}",
+                logs.contents()
+            );
+        }
+    }
+
+    /// Sessionless host data with no callsign is refused before ARQ
+    /// registration or queueing, so it leaves no outstanding ARQ segment, no
+    /// queued payload and no `BUFFER` count behind -- with ARQ off and on.
+    #[tokio::test]
+    async fn sessionless_host_data_is_refused_without_a_callsign_and_leaves_nothing_buffered() {
+        for arq_enabled in [false, true] {
+            let logs = LogCapture::default();
+            let _guard = logs.install();
+            let mut config = DaemonConfig::default();
+            config.host.sessionless_tx_enabled = true;
+            config.engine.arq_enabled = arq_enabled;
+            let (mut station, mut audio_rx, mut vara_rx) = wired_station(config);
+
+            station
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x42; 40],
+                })
+                .await;
+
+            assert_eq!(
+                drain_vara(&mut vara_rx),
+                Vec::<VaraResponse>::new(),
+                "arq={arq_enabled}: no BUFFER or PTT telemetry for a refused payload"
+            );
+            assert!(station.tx_queue.is_empty(), "arq={arq_enabled}");
+            assert_eq!(station.buffered_tx_bytes(), 0, "arq={arq_enabled}");
+            if let Some(arq_tx) = station.arq_tx.as_ref() {
+                assert_eq!(arq_tx.in_flight(), 0, "no ARQ segment may be registered");
+                assert_eq!(arq_tx.unacked_bytes(), 0);
+            }
+            assert!(!station.is_transmitting, "arq={arq_enabled}");
+            assert_eq!(transmitted_samples(&station, &mut audio_rx), 0);
+            assert_eq!(
+                logs.refusals(),
+                1,
+                "arq={arq_enabled}: the refusal must be logged once, got: {}",
+                logs.contents()
+            );
+        }
+    }
+
+    /// The same `TUNE` transmits once a valid callsign is in force, whether
+    /// configured or given later by `MYCALL`.
+    #[tokio::test]
+    async fn tune_transmits_once_a_valid_callsign_is_in_force() {
+        let logs = LogCapture::default();
+        let _guard = logs.install();
+
+        let (mut configured, mut audio_rx, mut vara_rx) = wired_station(tx_config());
+        send_vara_command(&mut configured, "TUNE 1").await;
+        assert_eq!(
+            drain_vara(&mut vara_rx),
+            vec![VaraResponse::Ok, VaraResponse::Ptt(true)],
+            "a configured callsign must let TUNE key PTT"
+        );
+        assert!(transmitted_samples(&configured, &mut audio_rx) > 0);
+
+        let (mut unconfigured, mut audio_rx, mut vara_rx) = wired_station(DaemonConfig::default());
+        send_vara_command(&mut unconfigured, "TUNE 1").await;
+        assert_eq!(drain_vara(&mut vara_rx), vec![VaraResponse::Ok]);
+        assert_eq!(transmitted_samples(&unconfigured, &mut audio_rx), 0);
+        assert_eq!(logs.refusals(), 1, "got: {}", logs.contents());
+
+        send_vara_command(&mut unconfigured, "MYCALL W5AU").await;
+        send_vara_command(&mut unconfigured, "TUNE 1").await;
+        assert_eq!(
+            drain_vara(&mut vara_rx),
+            vec![VaraResponse::Ok, VaraResponse::Ok, VaraResponse::Ptt(true)],
+            "a valid MYCALL must let the next TUNE key PTT"
+        );
+        assert!(transmitted_samples(&unconfigured, &mut audio_rx) > 0);
+        assert_eq!(
+            logs.refusals(),
+            1,
+            "only the TUNE before MYCALL may be refused, got: {}",
+            logs.contents()
+        );
+    }
+
     /// COP-28: the keepalive sends `IAMALIVE` to every wired client exactly
     /// once per 60 s period, with the first one a full period after start
     /// (nothing at t=0).
@@ -8348,7 +8612,7 @@ mod tests {
 
     #[tokio::test]
     async fn arq_receive_transmits_a_real_ack_with_rate() {
-        let mut config = DaemonConfig::default();
+        let mut config = tx_config();
         config.engine.arq_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
         event_loop.arq_rx = Some(ArqRx::new(8));
@@ -8809,9 +9073,10 @@ mod tests {
         /// pre/tail delays are zeroed. This only affects the *scheduling* math in
         /// `transmit_samples` — the engine's own internal encode rate is fixed at
         /// 48 kHz regardless (see `CLAUDE.md`), so encoding real payloads is
-        /// unaffected.
+        /// unaffected. It carries `TEST_CALLSIGN` (COP-37) so the station may
+        /// transmit at all.
         fn fast_ptt_config() -> DaemonConfig {
-            let mut config = DaemonConfig::default();
+            let mut config = tx_config();
             config.audio.sample_rate = 100_000_000;
             config.audio.buffer_size = 0;
             config.radio.ptt_pre_delay_ms = 0;
@@ -10948,7 +11213,7 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn test_transmit_deferred_while_busy_then_holdoff_applied() {
-            let mut config = DaemonConfig::default();
+            let mut config = tx_config();
             config.station_id.busy_hold_ms = 10;
             let mut event_loop = EventLoop::new(config).unwrap();
 
@@ -11182,7 +11447,7 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn test_transmit_not_deferred_when_channel_already_clear() {
-            let mut config = DaemonConfig::default();
+            let mut config = tx_config();
             config.station_id.busy_hold_ms = 10;
             let mut event_loop = EventLoop::new(config).unwrap();
             let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
@@ -11206,7 +11471,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn test_busy_gate_disabled_by_default_does_not_defer_tx() {
             // (d) busy-channel gate OFF by default: busy_hold_ms == 0.
-            let config = DaemonConfig::default();
+            let config = tx_config();
             assert_eq!(config.station_id.busy_hold_ms, 0);
             let mut event_loop = EventLoop::new(config).unwrap();
             let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
@@ -11428,13 +11693,17 @@ mod tests {
 
             let core = coppa_engine::CoppaCore::new();
             let payload_samples = core.encode_bytes(b"hello").expect("encode should succeed");
-            let payload_len = payload_samples.len();
 
+            assert!(
+                !event_loop.id_due(),
+                "no ID should be due without a configured callsign"
+            );
             event_loop.transmit_samples(&payload_samples).await;
+            // COP-37: the transmission itself is refused, ID and all.
             assert_eq!(
                 audio_out_rx.available(),
-                payload_len,
-                "no ID should be prepended without a configured callsign"
+                0,
+                "nothing, ID or payload, should be sent without a configured callsign"
             );
 
             let (audio_out_tx2, audio_out_rx2) = coppa_audio::audio_ring(1_000_000);
@@ -11523,7 +11792,7 @@ mod tests {
         }
 
         fn wideband_config() -> DaemonConfig {
-            let mut config = DaemonConfig::default();
+            let mut config = tx_config();
             config.engine.profile = "VHF_FAST".into();
             config.audio.sample_rate = 100_000_000;
             config.audio.buffer_size = 0;
@@ -12193,7 +12462,7 @@ mod tests {
         /// An event loop whose PTT and guardian both write into one
         /// [`SharedLog`].
         fn guarded_event_loop(fail_rx: bool) -> (EventLoop, SharedLog) {
-            let mut config = DaemonConfig::default();
+            let mut config = tx_config();
             config.radio.ptt_pre_delay_ms = 0;
             config.radio.ptt_tail_delay_ms = 0;
             let mut event_loop = EventLoop::new(config).unwrap();
@@ -12291,7 +12560,7 @@ mod tests {
 
         /// The default (narrowband HF) config with rigctld PTT at `rig`.
         fn rigctld_config(rig: &RecordingRig) -> DaemonConfig {
-            let mut config = DaemonConfig::default();
+            let mut config = tx_config();
             config.radio.ptt_method = "rigctld".into();
             config.radio.rigctld_address = rig.addr.clone();
             config.radio.ptt_pre_delay_ms = 0;
@@ -12303,7 +12572,7 @@ mod tests {
 
         #[tokio::test]
         async fn shutdown_mid_transmission_releases_ptt_and_reports_ptt_off() {
-            let mut rig = TxRig::new(DaemonConfig::default());
+            let mut rig = TxRig::new(tx_config());
             let rec = RecordingPtt::default();
             rig.event_loop.ptt = PttBackend::Other(Box::new(rec.clone()));
             let mut vara = capture_vara(&mut rig.event_loop);
@@ -12328,7 +12597,7 @@ mod tests {
 
         #[tokio::test]
         async fn shutdown_while_idle_does_not_touch_ptt() {
-            let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+            let mut event_loop = EventLoop::new(tx_config()).unwrap();
             let rec = RecordingPtt::default();
             event_loop.ptt = PttBackend::Other(Box::new(rec.clone()));
             event_loop
@@ -12395,7 +12664,7 @@ mod tests {
         /// `TxRig` with `max_tx_duration_s = 1`, so the backstop deadline is
         /// 1 s + `PTT_BACKSTOP_GRACE` after keying.
         fn backstop_rig() -> TxRig {
-            let mut config = DaemonConfig::default();
+            let mut config = tx_config();
             config.radio.max_tx_duration_s = 1;
             TxRig::new(config)
         }
@@ -12507,7 +12776,7 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn backstop_fires_inside_a_busy_channel_wait() {
-            let mut config = DaemonConfig::default();
+            let mut config = tx_config();
             config.radio.max_tx_duration_s = 1;
             config.station_id.busy_hold_ms = 10;
             let mut rig = TxRig::new(config);
@@ -12651,8 +12920,10 @@ mod tests {
             with_lead_and_trail(&peer.encode_bytes(&pdu.to_bytes()).unwrap())
         }
 
+        /// ARQ on, with `TEST_CALLSIGN` (COP-37) so the station may
+        /// transmit at all.
         fn arq_config() -> DaemonConfig {
-            let mut config = DaemonConfig::default();
+            let mut config = tx_config();
             config.engine.arq_enabled = true;
             config
         }
@@ -12717,7 +12988,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn transmit_with_no_recent_decode_keys_at_once() {
             // (a) No frame ever decoded: no hold.
-            let mut idle = EventLoop::new(DaemonConfig::default()).unwrap();
+            let mut idle = EventLoop::new(tx_config()).unwrap();
             let idle_ptt = install_ptt_log(&mut idle);
             let t0 = tokio::time::Instant::now();
             idle.transmit_samples(&[0.1; 4800]).await;
@@ -12725,7 +12996,7 @@ mod tests {
 
             // (b) The last decode is older than the turnaround: no hold. ARQ is
             // off, so the decode itself transmits nothing.
-            let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+            let mut station = EventLoop::new(tx_config()).unwrap();
             let ptt = install_ptt_log(&mut station);
             station.decode_and_dispatch_audio(&peer_data_frame()).await;
             assert!(

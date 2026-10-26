@@ -374,7 +374,11 @@ impl Coppad {
              [host]\n\
              vara_enabled = true\n\
              vara_command_port = {command_port}\n\
-             vara_data_port = {data_port}\n",
+             vara_data_port = {data_port}\n\
+             \n\
+             [engine]\n\
+             # COP-37: no transmission without a valid callsign.\n\
+             callsign = \"N0CALL\"\n",
             fake.address()
         );
         let config_path = dir.path().join("coppad.toml");
