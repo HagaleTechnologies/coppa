@@ -39,6 +39,11 @@ a real bug — breaking them will reintroduce that bug.
   8,192-sample ring. Don't move the wait out of the chokepoint or replace the
   drain with a sleep. See `docs/OPERATING.md` and
   `docs/testing/cable-loop-turnaround.md`.
+- **The first transmission after startup identifies (COP-61).**
+  `last_id_time` is `None` until the first ID, and `id_due` treats `None` as
+  due. Seeding it with `Instant::now()` sent every transmission in the first
+  `id_interval_secs` without an ID. Tests about something else call
+  `mark_identified`.
 - **Every transmission goes through `transmit_samples`** — it is the single
   chokepoint applying PTT lead/tail, busy-defer, and station-ID accounting.
   ARQ retransmits and session keepalives once bypassed it via a direct

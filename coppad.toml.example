@@ -106,7 +106,9 @@ busy_hold_ms = 0
 # identification. Defaults to 540 (9 minutes) for margin under FCC Part
 # 97.119's 10-minute requirement. An ID is only ever prepended to a real
 # outgoing transmission (never sent standalone), and only while [engine]
-# callsign above is set.
+# callsign above is set. The first transmission after startup always carries
+# an ID; later ones carry one once this interval has passed. 0 turns automatic
+# ID off.
 id_interval_secs = 540
 # Beacon mode: interval in seconds between standalone beacon transmissions,
 # sent only when the channel reads clear (skipped, not deferred, if busy --

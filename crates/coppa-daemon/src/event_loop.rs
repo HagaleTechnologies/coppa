@@ -434,12 +434,13 @@ pub struct EventLoop {
     /// sooner goes out while the peer is deaf. `None` until the first decode;
     /// enforced by `wait_for_rx_turnaround`.
     rx_turnaround_until: Option<tokio::time::Instant>,
-    /// Time of the last station-ID frame actually sent (or `EventLoop`
-    /// construction, if none yet). Compared against `[station_id]
-    /// id_interval_secs` in `id_due` -- see `transmit_samples`'s doc for why
-    /// an ID is only ever prepended to a real outgoing transmission, never
-    /// sent standalone on a bare timer (Phase 4 Task 3).
-    last_id_time: Instant,
+    /// Time of the last station-ID frame actually sent, or `None` if none
+    /// has been sent yet. Compared against `[station_id] id_interval_secs`
+    /// in `id_due`; `None` makes an ID due, so the first transmission after
+    /// startup identifies (COP-61). See `transmit_samples`'s doc for why an
+    /// ID is only ever prepended to a real outgoing transmission, never sent
+    /// standalone on a bare timer (Phase 4 Task 3).
+    last_id_time: Option<Instant>,
     /// Time of the last standalone beacon frame actually sent (or
     /// `EventLoop` construction, if none yet). Compared against
     /// `[station_id] beacon_interval_secs` in `maybe_send_beacon` (Phase 4
@@ -648,7 +649,7 @@ impl EventLoop {
             tx_frame_count: 0,
             max_frames_per_turn: 4,
             rx_turnaround_until: None,
-            last_id_time: Instant::now(),
+            last_id_time: None,
             last_beacon_time: Instant::now(),
             pending_busy_wait_audio: Vec::new(),
             #[cfg(feature = "websocket")]
@@ -2816,7 +2817,7 @@ impl EventLoop {
         let samples: &[f32] = if self.id_due() {
             match self.encode_id_beacon_frame() {
                 Some(id_samples) => {
-                    self.last_id_time = Instant::now();
+                    self.last_id_time = Some(Instant::now());
                     let mut buf = id_samples;
                     buf.extend_from_slice(samples);
                     combined = buf;
@@ -3043,9 +3044,9 @@ impl EventLoop {
 
     /// Whether a station-ID frame is due to be prepended to the next
     /// transmission (Phase 4 Task 3): requires a configured callsign, a
-    /// non-zero `[station_id] id_interval_secs`, and at least that many
-    /// seconds since the last ID actually sent (or since `EventLoop`
-    /// construction, if none yet).
+    /// non-zero `[station_id] id_interval_secs`, and either no ID sent yet
+    /// (COP-61: the first transmission after startup identifies) or at least
+    /// that many seconds since the last one.
     fn id_due(&self) -> bool {
         // Check `local_callsign` (the parsed form), not the raw config
         // string -- an invalid-but-non-empty `callsign` string parses to
@@ -3060,7 +3061,8 @@ impl EventLoop {
         if interval == 0 {
             return false;
         }
-        self.last_id_time.elapsed() >= Duration::from_secs(interval)
+        self.last_id_time
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(interval))
     }
 
     /// Build the `Beacon`-type `MacPdu` carrying this station's
@@ -3142,8 +3144,15 @@ impl EventLoop {
             self.last_beacon_time = Instant::now();
             // A beacon already fully identifies the station; avoid also
             // prepending a redundant separate ID frame to it.
-            self.last_id_time = Instant::now();
+            let id_before = self.last_id_time.replace(Instant::now());
+            let generation = self.tx_generation;
             self.transmit_samples(&samples).await;
+            if self.tx_generation == generation {
+                // Refused (the wideband gate keys nothing and leaves
+                // `tx_generation` alone): no ID went out, so an ID still
+                // owed -- the first one included (COP-61) -- stays owed.
+                self.last_id_time = id_before;
+            }
         }
     }
 
@@ -4209,6 +4218,13 @@ mod tests {
         config
     }
 
+    /// COP-61: a fresh `EventLoop` prepends a station-ID frame to its first
+    /// transmission. Tests about something else call this first, so that
+    /// transmission is their payload alone.
+    fn mark_identified(event_loop: &mut EventLoop) {
+        event_loop.last_id_time = Some(Instant::now());
+    }
+
     #[test]
     fn rate_loop_caps_peer_recommendations_at_the_engine_band_limit() {
         for (profile, maximum) in [("HF_STANDARD", 8), ("VHF_FAST", 9)] {
@@ -4759,6 +4775,7 @@ mod tests {
     #[tokio::test]
     async fn confirmer_emits_cp_switched_under_the_new_profile_when_its_confirm_is_acked() {
         let mut a = EventLoop::new(cp_enabled_config()).unwrap();
+        mark_identified(&mut a);
         let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
         a.set_audio_out(producer);
 
@@ -7303,8 +7320,8 @@ mod tests {
     ///
     /// "Mock time" here follows this file's own existing convention for
     /// `Instant`-gated periodic behavior (see `last_id_time`/`last_beacon_time`'s
-    /// tests below, e.g. `event_loop.last_id_time = Instant::now() -
-    /// Duration::from_secs(600)`): directly backdate the `Instant` field a
+    /// tests below, e.g. `event_loop.last_beacon_time = Instant::now() -
+    /// Duration::from_secs(10)`): directly backdate the `Instant` field a
     /// rate gate compares against, rather than `tokio::time::advance` (which
     /// only affects `tokio::time::Instant`, not the `std::time::Instant`
     /// these fields actually use, so it wouldn't do anything here).
@@ -7535,6 +7552,7 @@ mod tests {
         let mut config = tx_config();
         config.radio.ptt_pre_delay_ms = 0;
         let mut event_loop = EventLoop::new(config).unwrap();
+        mark_identified(&mut event_loop);
         let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
         event_loop.set_ws_broadcast(ws_tx);
 
@@ -7571,6 +7589,7 @@ mod tests {
         let mut config = tx_config();
         config.radio.ptt_pre_delay_ms = 0;
         let mut event_loop = EventLoop::new(config).unwrap();
+        mark_identified(&mut event_loop);
         let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
         event_loop.set_ws_broadcast(ws_tx);
 
@@ -7647,6 +7666,7 @@ mod tests {
             // COP-37: a TX rig transmits, so it needs a callsign.
             config.engine.callsign = TEST_CALLSIGN.to_string();
             let mut event_loop = EventLoop::new(config).unwrap();
+            mark_identified(&mut event_loop);
             let (producer, outer) = coppa_audio::audio_ring(8192);
             event_loop.set_audio_out(producer);
             let feedback = Arc::new(OutputFeedback::default());
@@ -7987,7 +8007,7 @@ mod tests {
         config.engine.callsign = "N0CALL".to_string();
         config.station_id.id_interval_secs = 600;
         let mut rig = TxRig::new(config);
-        rig.event_loop.last_id_time = Instant::now() - Duration::from_secs(601);
+        rig.event_loop.last_id_time = Some(Instant::now() - Duration::from_secs(601));
         let id_frame = rig
             .event_loop
             .encode_id_beacon_frame()
@@ -8655,6 +8675,52 @@ mod tests {
         );
     }
 
+    /// COP-61, the ticket's scenario: a just-started station's first
+    /// transmission carries station ID on every host TX path -- a raw send,
+    /// an ARQ frame and a `TUNE` -- well within `id_interval_secs`.
+    #[tokio::test]
+    async fn first_transmission_after_startup_carries_station_id_on_every_host_path() {
+        for path in ["raw", "arq", "tune"] {
+            let mut config = tx_config();
+            config.host.sessionless_tx_enabled = true;
+            config.engine.arq_enabled = path == "arq";
+            let (mut station, mut audio_rx, _vara_rx) = wired_station(config);
+
+            if path == "tune" {
+                send_vara_command(&mut station, "TUNE 1").await;
+            } else {
+                station
+                    .handle_host_event(HostEvent::DataReceived {
+                        client_id: 1,
+                        data: b"hello coppa".to_vec(),
+                    })
+                    .await;
+            }
+
+            let available = transmitted_samples(&station, &mut audio_rx);
+            assert!(available > 0, "{path}: the station must transmit");
+            let mut captured = vec![0.0f32; available];
+            audio_rx.read(&mut captured);
+            let mut decoder = coppa_engine::CoppaCore::new();
+            let frames = decoder.push_samples(&with_lead_and_trail(&captured));
+            let first = frames
+                .first()
+                .unwrap_or_else(|| panic!("{path}: the transmission must decode"));
+            let payload = first
+                .payload
+                .as_deref()
+                .unwrap_or_else(|e| panic!("{path}: the first frame must decode: {e}"));
+            let id = MacPdu::from_bytes(payload)
+                .unwrap_or_else(|e| panic!("{path}: the first frame must be a MacPdu: {e}"));
+            assert_eq!(
+                id.frame_type,
+                MacFrameType::Beacon,
+                "{path}: the first frame must be the station ID"
+            );
+            assert_eq!(id.src.as_str(), TEST_CALLSIGN, "{path}");
+        }
+    }
+
     /// COP-28: the keepalive sends `IAMALIVE` to every wired client exactly
     /// once per 60 s period, with the first one a full period after start
     /// (nothing at t=0).
@@ -8733,6 +8799,7 @@ mod tests {
         let mut config = tx_config();
         config.engine.arq_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
+        mark_identified(&mut event_loop);
         event_loop.arq_rx = Some(ArqRx::new(8));
         event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
 
@@ -11450,6 +11517,7 @@ mod tests {
             let mut config = config_with_callsign(); // local callsign "VK3ABC"
             config.station_id.busy_hold_ms = 10;
             let mut event_loop = EventLoop::new(config).unwrap();
+            mark_identified(&mut event_loop);
             event_loop.listening = true;
 
             let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
@@ -11597,6 +11665,7 @@ mod tests {
             let mut config = tx_config();
             config.station_id.busy_hold_ms = 10;
             let mut event_loop = EventLoop::new(config).unwrap();
+            mark_identified(&mut event_loop);
             let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
             event_loop.set_audio_out(audio_out_tx);
 
@@ -11621,6 +11690,7 @@ mod tests {
             let config = tx_config();
             assert_eq!(config.station_id.busy_hold_ms, 0);
             let mut event_loop = EventLoop::new(config).unwrap();
+            mark_identified(&mut event_loop);
             let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
             event_loop.set_audio_out(audio_out_tx);
 
@@ -11658,7 +11728,7 @@ mod tests {
             assert_eq!(event_loop.config.station_id.id_interval_secs, 540);
             // Simulate 10 minutes of elapsed time since the last ID (or, here,
             // since construction) without any real sleep.
-            event_loop.last_id_time = Instant::now() - Duration::from_secs(600);
+            event_loop.last_id_time = Some(Instant::now() - Duration::from_secs(600));
 
             let (audio_out_tx, mut audio_out_rx) = coppa_audio::audio_ring(1_000_000);
             event_loop.set_audio_out(audio_out_tx);
@@ -11678,7 +11748,9 @@ mod tests {
                 available
             );
             assert!(
-                event_loop.last_id_time.elapsed() < Duration::from_secs(1),
+                event_loop
+                    .last_id_time
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(1)),
                 "last_id_time should be refreshed after sending an ID"
             );
 
@@ -11705,8 +11777,9 @@ mod tests {
         #[tokio::test]
         async fn test_id_timer_no_prepend_when_interval_not_elapsed() {
             let mut event_loop = EventLoop::new(config_with_callsign()).unwrap();
-            // `last_id_time` defaults to construction time -- far less than
-            // `id_interval_secs` (540s) has "elapsed".
+            // Identified just now -- far less than `id_interval_secs` (540s)
+            // has elapsed.
+            mark_identified(&mut event_loop);
             let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
             event_loop.set_audio_out(audio_out_tx);
 
@@ -11723,6 +11796,72 @@ mod tests {
             );
         }
 
+        /// COP-61: a just-started daemon has sent no ID yet, so its first
+        /// transmission carries one regardless of `id_interval_secs`; the
+        /// interval then governs every ID after it.
+        #[tokio::test]
+        async fn test_first_transmission_after_startup_carries_station_id() {
+            let mut event_loop = EventLoop::new(config_with_callsign()).unwrap();
+            assert_eq!(event_loop.last_id_time, None, "no ID sent yet");
+            let (audio_out_tx, mut audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+
+            let core = coppa_engine::CoppaCore::new();
+            let payload_samples = core.encode_bytes(b"hello").expect("encode should succeed");
+            let payload_len = payload_samples.len();
+
+            event_loop.transmit_samples(&payload_samples).await;
+
+            let available = audio_out_rx.available();
+            let mut captured = vec![0.0f32; available];
+            audio_out_rx.read(&mut captured);
+            let mut decoder = coppa_engine::CoppaCore::new();
+            let frames = decoder.push_samples(&with_lead_and_trail(&captured));
+            assert_eq!(
+                frames.len(),
+                2,
+                "the first transmission must be the ID frame plus the payload frame"
+            );
+            let id = MacPdu::from_bytes(frames[0].payload.as_deref().unwrap())
+                .expect("the first frame must be a station-ID MacPdu");
+            assert_eq!(id.frame_type, MacFrameType::Beacon);
+            assert_eq!(id.src.as_str(), "VK3ABC");
+            assert!(
+                event_loop.last_id_time.is_some(),
+                "sending the ID must stamp last_id_time"
+            );
+
+            event_loop.transmit_samples(&payload_samples).await;
+            assert_eq!(
+                audio_out_rx.available(),
+                payload_len,
+                "the interval governs later IDs, so the next transmission is the payload alone"
+            );
+        }
+
+        /// COP-61: `id_interval_secs = 0` still turns automatic ID off, the
+        /// first transmission included.
+        #[tokio::test]
+        async fn test_zero_id_interval_sends_no_id_even_on_the_first_transmission() {
+            let mut config = config_with_callsign();
+            config.station_id.id_interval_secs = 0;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+
+            let core = coppa_engine::CoppaCore::new();
+            let payload_samples = core.encode_bytes(b"hello").expect("encode should succeed");
+
+            event_loop.transmit_samples(&payload_samples).await;
+
+            assert_eq!(
+                audio_out_rx.available(),
+                payload_samples.len(),
+                "automatic ID is off, so the first transmission is the payload alone"
+            );
+            assert_eq!(event_loop.last_id_time, None);
+        }
+
         #[tokio::test]
         async fn test_id_timer_no_activity_means_no_id_ever_sent() {
             // "no activity -> no ID": an ID is only ever prepended to a real
@@ -11730,7 +11869,7 @@ mod tests {
             // never transmits must never emit one either, no matter how much
             // (simulated) time has passed.
             let mut event_loop = EventLoop::new(config_with_callsign()).unwrap();
-            event_loop.last_id_time = Instant::now() - Duration::from_secs(3600);
+            event_loop.last_id_time = Some(Instant::now() - Duration::from_secs(3600));
             let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
             event_loop.set_audio_out(audio_out_tx);
 
@@ -11833,7 +11972,7 @@ mod tests {
             config.station_id.id_interval_secs = 1; // would otherwise fire immediately
             config.station_id.beacon_interval_secs = 1;
             let mut event_loop = EventLoop::new(config).unwrap();
-            event_loop.last_id_time = Instant::now() - Duration::from_secs(3600);
+            event_loop.last_id_time = Some(Instant::now() - Duration::from_secs(3600));
             event_loop.last_beacon_time = Instant::now() - Duration::from_secs(3600);
             let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
             event_loop.set_audio_out(audio_out_tx);
@@ -12245,11 +12384,42 @@ mod tests {
             event_loop.transmit_samples(&SAMPLES).await;
             assert!(!event_loop.is_transmitting);
             assert_eq!(event_loop.tx_on_air_bytes, 0, "refused bytes leave BUFFER");
+            assert_eq!(
+                event_loop.last_id_time, None,
+                "a refused transmission sent no ID, so the first one is still owed"
+            );
             *rig.answer.lock().unwrap() = "144500000".into();
             assert_eq!(
                 PttControl::get_ptt(&mut event_loop.ptt).unwrap(),
                 PttState::Rx,
                 "the rig was never keyed"
+            );
+        }
+
+        /// COP-61: a beacon the gate refuses sent no ID, so it must not use up
+        /// the first ID the next allowed transmission owes.
+        #[tokio::test]
+        async fn refused_wideband_beacon_leaves_the_first_id_owed() {
+            let rig = fake_rigctld("144500000");
+            let mut config = rigctld_config(&rig);
+            config.station_id.beacon_interval_secs = 5;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            event_loop.last_beacon_time = Instant::now() - Duration::from_secs(10);
+            *rig.answer.lock().unwrap() = "7074000".into();
+            event_loop.maybe_send_beacon().await;
+            assert_eq!(event_loop.tx_generation, 0, "the beacon was refused");
+            assert_eq!(
+                event_loop.last_id_time, None,
+                "a refused beacon sent no ID, so the first one is still owed"
+            );
+
+            *rig.answer.lock().unwrap() = "144500000".into();
+            event_loop.last_beacon_time = Instant::now() - Duration::from_secs(10);
+            event_loop.maybe_send_beacon().await;
+            assert_eq!(event_loop.tx_generation, 1, "the beacon went out");
+            assert!(
+                event_loop.last_id_time.is_some(),
+                "an allowed beacon is an ID"
             );
         }
 
@@ -13518,6 +13688,10 @@ mod tests {
         async fn run_cable_loop(config: DaemonConfig) -> CableRun {
             let mut a = EventLoop::new(config.clone()).unwrap();
             let mut b = EventLoop::new(config.clone()).unwrap();
+            // An ID prefix would add a frame to each leg; these tests time the
+            // ACK itself.
+            mark_identified(&mut a);
+            mark_identified(&mut b);
             // ARQ timers run on real `std::time::Instant`s with a 5 s initial
             // RTO; a slow runner must not add a retransmit key-up mid-test.
             a.arq_tx = Some(ArqTx::new(ArqConfig {
