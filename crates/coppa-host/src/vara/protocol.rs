@@ -136,6 +136,13 @@ impl VaraResponse {
     pub fn coppa_version() -> Self {
         VaraResponse::Version(concat!("Coppa ", env!("CARGO_PKG_VERSION")).to_string())
     }
+
+    /// True for the telemetry lines a client may miss: `BUSY` and `SNR`. The
+    /// next change sends a fresh value. Every other line is a state change or
+    /// a reply, and must reach the client or end its connection.
+    pub fn is_disposable(&self) -> bool {
+        matches!(self, VaraResponse::Busy(_) | VaraResponse::Snr(_))
+    }
 }
 
 #[cfg(test)]
