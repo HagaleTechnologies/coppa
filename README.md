@@ -51,6 +51,9 @@ coppa loopback "Hello from Coppa"
 # Encode a message to a WAV file
 coppa tx "CQ CQ CQ DE VK2ABC K" -o cq.wav
 
+# Encode at a chosen speed level (HF carries 1-8; see coppa profiles)
+coppa tx "CQ CQ CQ DE VK2ABC K" --level 4 -o cq.wav
+
 # Decode a WAV file (prints the message text)
 coppa rx -i cq.wav
 
@@ -60,8 +63,8 @@ coppa rx -i cq.wav --hex
 # List audio devices (requires cpal-backend feature)
 coppa devices
 
-# Show available operating profiles
-coppa config
+# Show the speed levels and named profiles
+coppa profiles
 ```
 
 ## Workspace Crates

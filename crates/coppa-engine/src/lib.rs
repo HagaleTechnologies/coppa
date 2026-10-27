@@ -3,9 +3,12 @@
 //! This crate provides:
 //! - [`CoppaCore`] - the main encode/decode engine integrating modem, FEC, and framing
 //! - [`EngineConfig`] - runtime configuration types
+//! - [`ladder`] - the real per-level facts (modulation, code rate, max bytes,
+//!   air time, bandwidth) that `coppa profiles` shows
 
 pub mod config;
 pub mod engine;
+pub mod ladder;
 
 pub mod profiles;
 

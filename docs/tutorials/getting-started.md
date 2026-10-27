@@ -74,15 +74,20 @@ Requires the `cpal-backend` feature for real hardware access:
 cargo run -p coppa-cli --bin coppa --features cpal-backend -- devices
 ```
 
-## Viewing Operating Profiles
+## Viewing Speed Levels and Profiles
 
 ```bash
-# List all profiles
-cargo run -p coppa-cli --bin coppa -- config
+# List every speed level and named profile
+cargo run -p coppa-cli --bin coppa -- profiles
+
+# Show one speed level
+cargo run -p coppa-cli --bin coppa -- profiles --level 4
 
 # Show details for a specific profile
-cargo run -p coppa-cli --bin coppa -- config -p HF_STANDARD
+cargo run -p coppa-cli --bin coppa -- profiles -p HF_STANDARD
 ```
+
+`coppa config` is a deprecated alias for `coppa profiles` and will be removed in the next release.
 
 ## Running the Daemon
 

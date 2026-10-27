@@ -187,7 +187,12 @@ impl CoppaCore {
     /// times carrier spacing (2400 on the HF profiles, long or short CP; 5600
     /// on VHF wide). The VARA `CONNECTED` line reports it.
     pub fn occupied_bandwidth_hz(&self) -> u32 {
-        let profile = self.transceiver.profile();
+        Self::profile_occupied_hz(self.transceiver.profile())
+    }
+
+    /// Occupied bandwidth of `profile` in Hz: active carriers times carrier
+    /// spacing. Shared by `occupied_bandwidth_hz` and `crate::ladder`.
+    pub(crate) fn profile_occupied_hz(profile: &CoppaProfile) -> u32 {
         (profile.total_active_carriers() as f32 * profile.carrier_spacing_hz()).round() as u32
     }
 
