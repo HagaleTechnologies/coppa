@@ -373,11 +373,13 @@ pub struct StationIdConfig {
     /// Station-ID timer: minimum interval (seconds) between automatic ID
     /// transmissions. Defaults to 540 (9 minutes) -- FCC Part 97.119 requires
     /// identification at least every 10 minutes; 9 minutes leaves margin
-    /// against clock/scheduling jitter. Only actually fires if `[engine]
-    /// callsign` is set AND at least one real transmission has happened
-    /// since the last ID (an ID is prepended to the next outgoing frame, not
-    /// sent standalone on a bare timer -- an idle station never needs to
-    /// identify). Note this default alone does NOT enable the feature: with
+    /// against clock/scheduling jitter. Only fires if `[engine] callsign` is
+    /// set. The first transmission after startup always carries an ID
+    /// (COP-61); after that, one is prepended to the next outgoing
+    /// transmission once this interval has passed. An ID is never sent
+    /// standalone on a bare timer -- an idle station never needs to
+    /// identify. `0` turns automatic ID off, first transmission included.
+    /// Note this default alone does NOT enable the feature: with
     /// the default empty callsign, no ID is ever sent regardless of this
     /// value (see `EngineSection::callsign`'s doc) -- this is why "ID timer
     /// off by default" and "id_interval_secs defaults to the FCC-safe 540"
