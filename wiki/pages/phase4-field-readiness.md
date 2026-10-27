@@ -33,6 +33,17 @@ a real bug — breaking them will reintroduce that bug.
   to off; a `Connecting` session does not count. The sessionless raw/ARQ path
   behind that key is the daemon's only path for ARQ-tracked host data
   (RateLoop/probing feedback), so don't delete it as dead code.
+- **Replies wait out the peer's PTT tail (COP-60).** `transmit_samples` holds
+  any key-up until `[radio] turnaround_ms` after the last decoded frame and
+  drains the input ring while it waits, since a plain sleep overflowed the
+  8,192-sample ring. Don't move the wait out of the chokepoint or replace the
+  drain with a sleep. See `docs/OPERATING.md` and
+  `docs/testing/cable-loop-turnaround.md`.
+- **The first transmission after startup identifies (COP-61).**
+  `last_id_time` is `None` until the first ID, and `id_due` treats `None` as
+  due. Seeding it with `Instant::now()` sent every transmission in the first
+  `id_interval_secs` without an ID. Tests about something else call
+  `mark_identified`.
 - **Every transmission goes through `transmit_samples`** — it is the single
   chokepoint applying PTT lead/tail, busy-defer, and station-ID accounting.
   ARQ retransmits and session keepalives once bypassed it via a direct
@@ -49,6 +60,14 @@ a real bug — breaking them will reintroduce that bug.
   newest transmission's generation-tagged `TxComplete`. Output failure, 5 s
   without playback progress, or `max_tx_duration_s` cancels and unkeys; no
   hardware/on-air test has validated the timing yet.
+- **PTT is released on every exit path (COP-31).** Four layers: backend
+  `Drop` (rigctld, serial, GPIO), an explicit release at shutdown and at
+  startup, an in-loop backstop on the 500 ms tick, and an out-of-process
+  `coppad --ptt-guardian` for rigctld/GPIO that releases after a SIGKILL or
+  crash. `EventLoop::set_ptt` is the only place the guardian is told about PTT
+  state, so any new direct `self.ptt.set_ptt` call must report to it too, or
+  the guardian will miss a key or fire a duplicate release. Exit-path table
+  and residuals: `docs/OPERATING.md`, "PTT safety when coppad stops".
 - **Every ARQ retransmission must call `ArqTx::mark_retransmitted`.** Before
   this was wired, `get_retransmits`'s expiry check never advanced: every
   unacked segment retransmitted every 500 ms forever, and the `max_retransmit`
@@ -64,14 +83,20 @@ a real bug — breaking them will reintroduce that bug.
   (accumulating traffic for later dispatch); feeding full dispatch from inside
   the wait once allowed a decoded CONNECT_REQ to trigger a nested transmit,
   bypassing the single-in-flight guard.
+- **One TCP read is not one over-the-air frame (COP-41).** Every
+  `DataReceived` is chunked to pieces that encode at their target level
+  (session/raw: current level; ARQ: the ladder-minimum budget, so segments
+  survive rate drops); the ARQ window's overflow waits in a backlog counted by
+  `BUFFER`. Don't re-introduce a whole-event send on any TX path.
 
 ## Configuration gotchas
 
 - PTT config uses extended syntax: `serial:/dev/ttyUSB0:dtr`, `gpio:17`, or
   the flat `none`/`vox`/`rigctld`. Unrecognized values hard-error at startup —
-  bare `"serial"` is NOT valid. Known residual gap: `rigctld` with an
-  unreachable rig at startup falls back to NullPtt with only a warning
-  (a daemon that runs with silently-broken PTT).
+  bare `"serial"` is NOT valid. `rigctld` unreachable at startup still falls
+  back to NullPtt, but since COP-32 it logs at ERROR and the daemon logs
+  `Daemon running degraded` instead of `Daemon ready`. There is still no
+  reconnect, so PTT stays lost for that run.
 - Busy-defer is deliberately independent of callsign (channel courtesy ≠
   identification); station-ID and beacon do gate on callsign.
 - Hardware audio still needs `cpal-backend` (see [[cpal-feature-gate]]), and

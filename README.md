@@ -21,6 +21,7 @@ Open-source ham radio digital communications system written in Rust.
 | Operating profiles | Implemented | 48 kHz OFDM profiles with runtime speed-level selection within the configured band |
 | Link adaptation | Implemented, limited calibration | Measurement-driven speed selection and ACK-driven RateLoop with ARQ enabled; no model inference; performance targets remain unmet, see [BENCHMARKS.md](BENCHMARKS.md) |
 | Serial/GPIO PTT | Implemented, feature-gated | Daemon serial DTR/RTS uses `serial-ptt`; Linux sysfs GPIO uses `gpio-ptt` |
+| KISS TNC (AFSK 1200) | Implemented, bring-up and testing only | Needs the kiss-tnc and cpal-backend features; not a Direwolf replacement; see [docs/TNC.md](docs/TNC.md) |
 | IR-HARQ | Unwired codec primitive | Redundancy-version and combining support exists in the codec; engine/daemon retransmissions do not wire it into an operational IR-HARQ feature |
 | VARA RF/waveform compatibility | Not supported | The TCP control interface is VARA-style; Coppa does not interoperate with VARA over RF |
 
@@ -55,10 +56,13 @@ coppa tx "CQ CQ CQ DE VK2ABC K" -o cq.wav
 coppa tx "CQ CQ CQ DE VK2ABC K" --level 4 -o cq.wav
 
 # Decode a WAV file (prints the message text)
-coppa rx -i cq.wav
+coppa rx cq.wav
 
 # Show the decoded payload as hex bytes instead (--raw: hex only, for scripts)
-coppa rx -i cq.wav --hex
+coppa rx cq.wav --hex
+
+# Receive live from the default input device for 60 seconds (requires cpal-backend)
+coppa rx --duration 60
 
 # List audio devices (requires cpal-backend feature)
 coppa devices
@@ -66,6 +70,17 @@ coppa devices
 # Show the speed levels and named profiles
 coppa profiles
 ```
+
+## KISS TNC (AFSK 1200)
+
+`coppa tnc` runs a 1200-baud AFSK (Bell 202) AX.25 TNC behind a KISS TCP port. Use it for
+KISS bring-up and testing: checking that a KISS client, your audio routing and your PTT reach
+coppa. It is not a Direwolf replacement. It has no AGWPE interface, no channel-busy check (it
+ignores KISS TXDELAY, persistence and slot time), no digipeating or beaconing, and runs only at
+1200 baud. That parity work is planned as H-122 in the
+[2026-09-05 product review](docs/reviews/2026-09-05-product-ux-market-review.md).
+
+[docs/TNC.md](docs/TNC.md) covers building it and a demo that runs two TNCs on one Linux machine.
 
 ## Workspace Crates
 
