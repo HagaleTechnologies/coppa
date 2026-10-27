@@ -74,7 +74,25 @@ Requires the `cpal-backend` feature for real hardware access:
 cargo run -p coppa-cli --bin coppa --features cpal-backend -- devices
 ```
 
+<<<<<<< HEAD
 ## Viewing Speed Levels and Profiles
+=======
+## Receiving Live Audio
+
+Requires the `cpal-backend` feature:
+
+```bash
+cargo run -p coppa-cli --bin coppa --features cpal-backend -- rx --duration 60
+```
+
+With no file, `coppa rx` captures from the default input device (`--device <name>` picks
+another by substring) and prints each frame as it decodes, in the same format as a WAV
+decode. `--duration` stops after that many seconds; without it, `coppa rx` runs until
+Ctrl+C. `coppa listen` is a deprecated alias for `coppa rx` and will be removed in the
+next release.
+
+## Viewing Operating Profiles
+>>>>>>> 65d1a3bf78ccfc3b80ae90042ace16b14541aca3
 
 ```bash
 # List every speed level and named profile
@@ -129,6 +147,16 @@ devices exist, that rigctld answers, that the host ports are free, or that the
 setup suits your radio. Those surface when the daemon starts. `--check` opens no
 hardware and starts no listeners.
 
+When the daemon starts, a condition that stops it doing its job is logged at
+`ERROR`, never as `Daemon ready`. A sample rate other than 48000, a named
+`[audio]` device that does not exist (or any named device in a build without
+`cpal-backend`), an audio device that will not open, a host port that is
+already taken, an unknown PTT method, or a wideband profile with no frequency
+source stops the daemon: it logs the reason at `ERROR`, prints `Error: ...` on
+stderr and exits with status 1. An unreachable rigctld does not stop it. The
+daemon keeps running without PTT, logs the failed connection at `ERROR`, and
+logs `Daemon running degraded` with the reason in place of `Daemon ready`.
+
 Logging goes to stdout. `--log-level` takes one of `off`, `error`, `warn`,
 `info`, `debug` or `trace` and overrides `RUST_LOG`. Without it, `RUST_LOG`
 applies (it accepts full tracing filter expressions), and an absent or invalid
@@ -153,6 +181,10 @@ cargo run -p coppa-daemon --bin coppad --features kiss-tnc,cpal-backend -- --tnc
 A build without `kiss-tnc` exits with `Error: TNC mode requires the kiss-tnc
 feature`.
 
+[docs/TNC.md](../TNC.md) says what the TNC mode is for (KISS bring-up and
+testing), covers `coppa tnc`, which takes its own `--port` and `--device` so
+several TNCs can run on one machine, and walks through a demo with two of them.
+
 Example `coppad.toml`:
 ```toml
 [audio]
@@ -165,6 +197,9 @@ buffer_size = 8192
 # serial-ptt / gpio-ptt respectively). An unrecognized value is a hard
 # startup error, not a silent fallback to no PTT.
 ptt_method = "none"
+# Wait this long after decoding a frame before keying (default 500 ms);
+# must exceed the other station's PTT tail / VOX hang time.
+# turnaround_ms = 500
 
 [host]
 vara_enabled = true

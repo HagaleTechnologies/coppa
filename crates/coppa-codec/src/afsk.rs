@@ -122,7 +122,20 @@ fn nrzi_decode(symbols: &[bool]) -> Vec<u8> {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Modulate raw AX.25 frame bytes (CRC already appended) into 48 kHz audio.
+/// Append the AX.25 FCS (CRC-16/X.25, low byte first) to `frame`.
+///
+/// This is the same check [`Demodulator`] verifies, so
+/// `modulate(&append_fcs(frame))` decodes back to `append_fcs(frame)`.
+pub fn append_fcs(frame: &[u8]) -> Vec<u8> {
+    let fcs = Crc::<u16>::new(&CRC_16_IBM_SDLC).checksum(frame);
+    let mut out = Vec::with_capacity(frame.len() + 2);
+    out.extend_from_slice(frame);
+    out.extend_from_slice(&fcs.to_le_bytes());
+    out
+}
+
+/// Modulate raw AX.25 frame bytes (CRC already appended, e.g. by [`append_fcs`])
+/// into 48 kHz audio.
 ///
 /// Frame structure produced:
 ///   [preamble flags] [bit-stuffed frame body] [postamble flags]
@@ -562,6 +575,23 @@ mod tests {
 
         assert_eq!(frames.len(), 1, "Expected 1 frame, got {}", frames.len());
         assert_eq!(frames[0], frame);
+    }
+
+    #[test]
+    fn test_append_fcs_known_answer() {
+        // CRC-16/X.25 check value: FCS("123456789") = 0x906E, sent low byte first.
+        let framed = append_fcs(b"123456789");
+        assert_eq!(&framed[..9], b"123456789");
+        assert_eq!(&framed[9..], &[0x6E, 0x90]);
+    }
+
+    #[test]
+    fn test_append_fcs_round_trips_through_demodulator() {
+        let data = b"N0CALL>APRS:>append_fcs round trip";
+        let framed = append_fcs(data);
+        let mut demod = Demodulator::new();
+        demod.process(&modulate(&framed));
+        assert_eq!(demod.take_frames(), vec![framed]);
     }
 
     #[test]

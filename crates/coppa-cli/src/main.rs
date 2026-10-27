@@ -30,6 +30,7 @@ struct Cli {
     command: Option<Commands>,
 }
 
+<<<<<<< HEAD
 /// Flags shared by `coppa profiles` and its deprecated alias `coppa config`, so
 /// the two can never disagree about what they accept.
 #[derive(clap::Args, Debug, Default, PartialEq, Eq)]
@@ -45,6 +46,53 @@ struct ProfilesArgs {
 /// Printed on stderr whenever the deprecated `coppa config` alias runs, even
 /// under `--quiet`: a script still using it must hear that it is going away.
 const CONFIG_DEPRECATED: &str = "WARNING: 'coppa config' is deprecated and will be removed in the next release. Use 'coppa profiles' instead; it takes the same flags.";
+=======
+/// Flags for `coppa rx`, shared with its deprecated hidden alias
+/// `coppa listen` (COP-56) so the two cannot drift apart.
+#[derive(clap::Args, Debug, Default, PartialEq, Eq)]
+struct RxArgs {
+    /// WAV file to decode. Without one, captures live audio from an input device.
+    #[arg(value_name = "FILE")]
+    file: Option<String>,
+    /// WAV file to decode (same as FILE).
+    #[arg(short, long, value_name = "FILE", conflicts_with = "file")]
+    input: Option<String>,
+    /// Stop after this many seconds of audio: the first N seconds of a file,
+    /// or N seconds of live capture (0 = no limit).
+    #[arg(short, long, value_name = "SECONDS", default_value_t = 0)]
+    duration: u64,
+    /// Operational profile name.
+    #[arg(long)]
+    profile: Option<String>,
+    /// Your callsign. Printed under --verbose; nothing else uses it yet.
+    #[arg(long)]
+    callsign: Option<String>,
+    /// Print only the decoded payload as lowercase hex, one line per frame,
+    /// with no labels (always hex, even for text).
+    #[arg(long)]
+    raw: bool,
+    /// Show the payload as lowercase hex even when it is valid UTF-8 text.
+    #[arg(long)]
+    hex: bool,
+    /// Audio input device name (substring match, live capture only).
+    #[arg(long)]
+    device: Option<String>,
+}
+
+impl RxArgs {
+    /// The WAV file to decode, from FILE or -i/--input (clap rejects both).
+    fn path(&self) -> Option<&str> {
+        self.file.as_deref().or(self.input.as_deref())
+    }
+}
+
+/// Printed on stderr every time the hidden `listen` alias runs (COP-56).
+/// Unconditional, like this file's other `WARNING:` lines, so `--quiet`
+/// scripts still see it; stderr keeps stdout captures clean.
+const LISTEN_DEPRECATED: &str = "WARNING: 'coppa listen' is deprecated and will be \
+    removed in the next release. Use 'coppa rx' instead; it takes the same flags, \
+    and --raw prints hex.";
+>>>>>>> 65d1a3bf78ccfc3b80ae90042ace16b14541aca3
 
 #[derive(Subcommand)]
 enum Commands {
@@ -87,27 +135,8 @@ enum Commands {
         #[arg(long)]
         band: Option<String>,
     },
-    /// Receive and decode audio (streaming: WAV file if --input is given,
-    /// otherwise live capture from an audio input device until Ctrl+C).
-    Rx {
-        /// Input file containing audio samples (WAV format). If omitted,
-        /// captures live audio from an input device instead.
-        #[arg(short, long)]
-        input: Option<String>,
-        /// Operational profile name.
-        #[arg(long)]
-        profile: Option<String>,
-        /// Print only the decoded payload as lowercase hex, one line per frame,
-        /// with no labels (always hex, even for text).
-        #[arg(long)]
-        raw: bool,
-        /// Show the payload as lowercase hex even when it is valid UTF-8 text.
-        #[arg(long)]
-        hex: bool,
-        /// Audio input device name (substring match, live capture only).
-        #[arg(long)]
-        device: Option<String>,
-    },
+    /// Receive and decode audio from a WAV file, or live from an audio input device.
+    Rx(RxArgs),
     /// Run a loopback test (encode -> decode).
     Loopback {
         /// Message to test.
@@ -119,24 +148,11 @@ enum Commands {
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
         level: Option<u8>,
     },
-    /// Listen for incoming transmissions.
-    Listen {
-        /// Duration in seconds (0 = indefinite).
-        #[arg(short, long, default_value = "0")]
-        duration: u64,
-        /// Operational profile name.
-        #[arg(long)]
-        profile: Option<String>,
-        /// Callsign for station identification.
-        #[arg(long)]
-        callsign: Option<String>,
-        /// Print only the decoded text with no labels.
-        #[arg(long)]
-        raw: bool,
-        /// Audio input device name (substring match).
-        #[arg(long)]
-        device: Option<String>,
-    },
+    /// Deprecated: use 'coppa rx'. Removed in the next release.
+    // COP-56: kept for one release. Delete this variant, LISTEN_DEPRECATED
+    // and the Listen dispatch arm in the release after it ships.
+    #[command(hide = true)]
+    Listen(RxArgs),
     /// Transmit a TX-level calibration ("TUNE") tone: standard SSB two-tone
     /// (700 Hz + 1900 Hz) by default, or a single tone via `--single`. Key
     /// this while advancing your radio's audio drive level until ALC just
@@ -297,6 +313,7 @@ fn main() -> Result<()> {
             band.as_deref(),
             verbosity,
         )?,
+<<<<<<< HEAD
         Some(Commands::Rx {
             input,
             profile,
@@ -330,6 +347,16 @@ fn main() -> Result<()> {
             device.as_deref(),
             verbosity,
         )?,
+=======
+        Some(Commands::Rx(args)) => cmd_rx(&args, verbosity)?,
+        Some(Commands::Loopback { message, profile }) => {
+            cmd_loopback(&message, profile.as_deref(), verbosity)?
+        }
+        Some(Commands::Listen(args)) => {
+            eprintln!("{LISTEN_DEPRECATED}");
+            cmd_rx(&args, verbosity)?
+        }
+>>>>>>> 65d1a3bf78ccfc3b80ae90042ace16b14541aca3
         Some(Commands::Tune {
             seconds,
             single,
@@ -871,42 +898,60 @@ fn cmd_tune(
     Ok(())
 }
 
-/// `coppa rx`: stream audio (a WAV file via `--input`, or a live capture
-/// device otherwise) through `CoppaCore::push_samples` (the same
-/// `StreamingReceiver`-based path the daemon uses), printing each decoded
-/// frame's payload + SNR as it completes.
+/// `coppa rx`: the one receiver (COP-56). Streams audio -- a WAV file named
+/// by FILE or `-i/--input`, or a live capture device when neither is given --
+/// through `CoppaCore::push_samples` (the same `StreamingReceiver`-based path
+/// the daemon uses), printing each decoded frame's payload + SNR as it
+/// completes. The deprecated `coppa listen` alias runs this too.
 ///
-/// Unlike the old one-shot `core.decode(&samples)` batch call this replaces,
-/// `push_samples` never forces a UTF-8 conversion (Phase 4 Task 3.5) -- frame
-/// payloads are raw bytes. Display valid UTF-8 as escaped, quoted text, and
-/// fall back to labeled hex otherwise. `--hex` forces hex; `--raw` prints
-/// only lowercase hex, one line per frame.
-fn cmd_rx(
-    input: Option<&str>,
-    profile: Option<&str>,
-    raw: bool,
-    hex: bool,
-    device: Option<&str>,
-    verbosity: Verbosity,
-) -> Result<()> {
-    let config = resolve_config(profile)?;
+/// `--duration <SECONDS>` (0 = no limit) decodes only the first N seconds of a
+/// file, or stops a live capture after N seconds of wall clock; without it a
+/// live capture runs until Ctrl+C.
+///
+/// Output is COP-13's grammar: `push_samples` never forces a UTF-8
+/// conversion (Phase 4 Task 3.5), so frame payloads are raw bytes. Valid
+/// UTF-8 is displayed as escaped, quoted text, anything else as labeled hex.
+/// `--hex` forces hex; `--raw` prints only lowercase hex, one line per frame.
+fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
+    let config = resolve_config(args.profile.as_deref())?;
     let mut core = CoppaCore::with_config(config);
 
     if verbosity == Verbosity::Verbose {
+        if let Some(cs) = &args.callsign {
+            eprintln!("[verbose] Callsign: {}", cs);
+        }
         eprintln!("[verbose] sample_rate: {}", core.config().sample_rate);
     }
 
-    if let Some(path) = input {
+    if let Some(path) = args.path() {
         #[cfg(feature = "file-backend")]
         {
             use coppa_audio::{file_backend::WavSource, AudioSource};
             let mut source = WavSource::open(path)?;
             let total = source.total_samples();
-            if verbosity != Verbosity::Quiet && !raw {
-                println!("Reading {} samples from {}", total, path);
+            // The file's own rate: WavSource does not resample, so "the
+            // first N seconds" is N times the rate the samples were written at.
+            let limit = file_sample_limit(total, args.duration, source.sample_rate());
+            if verbosity != Verbosity::Quiet && !args.raw {
+                if limit < total {
+                    println!(
+                        "Reading the first {} s ({} of {} samples) from {}",
+                        args.duration, limit, total, path
+                    );
+                } else {
+                    println!("Reading {} samples from {}", total, path);
+                }
             }
             source.start()?;
-            stream_decode(&mut core, &mut source, Some(total), raw, hex, verbosity)?;
+            stream_decode(
+                &mut core,
+                &mut source,
+                Some(limit),
+                None,
+                args.raw,
+                args.hex,
+                verbosity,
+            )?;
             source.stop()?;
         }
         #[cfg(not(feature = "file-backend"))]
@@ -922,7 +967,7 @@ fn cmd_rx(
         {
             use coppa_audio::AudioSource;
             let engine_rate = core.config().sample_rate;
-            let mut source = match device {
+            let mut source = match args.device.as_deref() {
                 Some(name) => match coppa_audio::find_input_device_by_name(name) {
                     Some(dev) => {
                         if verbosity != Verbosity::Quiet {
@@ -941,15 +986,35 @@ fn cmd_rx(
                 None => coppa_audio::cpal_backend::CpalSource::new(engine_rate, 8192)?,
             };
             source.start()?;
-            if verbosity != Verbosity::Quiet && !raw {
-                println!("Listening for live audio (Ctrl+C to stop)...");
+            let chatty = verbosity != Verbosity::Quiet && !args.raw;
+            if chatty {
+                if args.duration > 0 {
+                    println!(
+                        "Listening for live audio for {} s (Ctrl+C to stop)...",
+                        args.duration
+                    );
+                } else {
+                    println!("Listening for live audio (Ctrl+C to stop)...");
+                }
             }
-            stream_decode(&mut core, &mut source, None, raw, hex, verbosity)?;
+            let deadline = live_deadline(std::time::Instant::now(), args.duration);
+            stream_decode(
+                &mut core,
+                &mut source,
+                None,
+                deadline,
+                args.raw,
+                args.hex,
+                verbosity,
+            )?;
             source.stop()?;
+            if chatty && args.duration > 0 {
+                println!("Stopped listening after {} s.", args.duration);
+            }
         }
         #[cfg(not(feature = "cpal-backend"))]
         {
-            let _ = device;
+            let _ = (&args.device, args.duration);
             let _ = &mut core;
             if verbosity != Verbosity::Quiet {
                 println!("Live audio input not available (compile with cpal-backend feature)");
@@ -960,9 +1025,30 @@ fn cmd_rx(
     Ok(())
 }
 
-/// Trailing silence (samples) fed to `core` after a finite (`--input <wav>`)
-/// source is exhausted, so a frame whose nominal end coincides with (or is
-/// close to) the file's own end can still complete.
+/// How many samples of a `total`-sample file `--duration <seconds>` lets
+/// `coppa rx` decode: all of them when `seconds` is 0 or covers the file.
+#[cfg_attr(not(feature = "file-backend"), allow(dead_code))]
+fn file_sample_limit(total: usize, seconds: u64, sample_rate: u32) -> usize {
+    if seconds == 0 {
+        return total;
+    }
+    let cap = seconds.saturating_mul(u64::from(sample_rate));
+    usize::try_from(cap).map_or(total, |cap| cap.min(total))
+}
+
+/// When a live `coppa rx --duration <seconds>` stops. `None` means no limit:
+/// 0, or a duration too large for `Instant` (effectively forever).
+#[cfg_attr(not(feature = "cpal-backend"), allow(dead_code))]
+fn live_deadline(now: std::time::Instant, seconds: u64) -> Option<std::time::Instant> {
+    if seconds == 0 {
+        return None;
+    }
+    now.checked_add(std::time::Duration::from_secs(seconds))
+}
+
+/// Trailing silence (samples) fed to `core` once `stream_decode` stops (end
+/// of a WAV file, its `--duration` cap, or a live deadline), so a frame whose
+/// nominal end coincides with (or is close to) that stop can still complete.
 ///
 /// `StreamingReceiver` needs `rx_group_delay` samples past a candidate's
 /// nominal end before it will emit that frame -- the RX bandpass filter's
@@ -981,52 +1067,52 @@ const TRAILING_FLUSH_SAMPLES: usize = 8192;
 /// (`CoppaCore::push_samples`) in fixed-size chunks, printing each decoded
 /// frame as it completes (see `print_stream_frame`).
 ///
-/// `total_samples`, when known (the `--input <wav>` case), bounds the loop to
-/// exactly that many samples so it terminates at end-of-file without relying
-/// on a `read() == 0` EOF signal (live sources also return 0 whenever no new
-/// audio has arrived yet, which is not EOF -- see the `None` branch below).
-/// Once exhausted, `TRAILING_FLUSH_SAMPLES` of silence are pushed so a frame
-/// right at the file's end can still complete (see that constant's doc).
+/// It stops on the first of three conditions:
+/// - `total_samples`, when known (a WAV file, already capped by
+///   `--duration`): exactly that many samples are read -- never more, since
+///   each read is sized to what the limit leaves -- so the loop terminates
+///   without relying on a `read() == 0` EOF signal (live sources also return
+///   0 whenever no new audio has arrived yet, which is not EOF).
+/// - `deadline` (a live `--duration`): checked after every read, including
+///   empty ones, so a stalled device still stops on time.
+/// - Neither (a live capture with no `--duration`): runs until the process
+///   is interrupted (Ctrl+C), briefly sleeping on an empty read to avoid a
+///   busy-spin against the non-blocking device source.
 ///
-/// When `total_samples` is `None` (live capture), this runs until the
-/// process is interrupted (Ctrl+C), briefly sleeping on an empty read to
-/// avoid a busy-spin against the non-blocking device source.
+/// Every normal return then pushes `TRAILING_FLUSH_SAMPLES` of silence so a
+/// frame that ends right at the file's end (or just before a live deadline)
+/// can still complete (see that constant's doc).
 fn stream_decode(
     core: &mut CoppaCore,
     source: &mut dyn coppa_audio::AudioSource,
     total_samples: Option<usize>,
+    deadline: Option<std::time::Instant>,
     raw: bool,
     hex: bool,
     verbosity: Verbosity,
 ) -> Result<()> {
     let mut buf = vec![0.0f32; 4096];
     let mut consumed = 0usize;
-    loop {
-        let n = source.read(&mut buf)?;
+    while total_samples.is_none_or(|total| consumed < total) {
+        let want = total_samples.map_or(buf.len(), |total| buf.len().min(total - consumed));
+        let n = source.read(&mut buf[..want])?;
         if n > 0 {
             consumed += n;
             for frame in core.push_samples(&buf[..n]) {
                 print_stream_frame(&frame, raw, hex, verbosity);
             }
         }
-        match total_samples {
-            Some(total) => {
-                if consumed >= total {
-                    break;
-                }
-            }
-            None if n == 0 => {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            None => {}
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        if n == 0 && total_samples.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
-    if total_samples.is_some() {
-        let silence = vec![0.0f32; TRAILING_FLUSH_SAMPLES];
-        for frame in core.push_samples(&silence) {
-            print_stream_frame(&frame, raw, hex, verbosity);
-        }
+    let silence = vec![0.0f32; TRAILING_FLUSH_SAMPLES];
+    for frame in core.push_samples(&silence) {
+        print_stream_frame(&frame, raw, hex, verbosity);
     }
 
     Ok(())
@@ -1127,120 +1213,6 @@ fn cmd_loopback(
         println!("  Expected: \"{}\"", message);
         println!("  Got:      \"{}\"", decoded);
         std::process::exit(1);
-    }
-
-    Ok(())
-}
-
-fn cmd_listen(
-    duration: u64,
-    profile: Option<&str>,
-    callsign: Option<&str>,
-    raw: bool,
-    device: Option<&str>,
-    verbosity: Verbosity,
-) -> Result<()> {
-    if verbosity != Verbosity::Quiet && !raw {
-        if duration == 0 {
-            println!("Listening indefinitely (Ctrl+C to stop)...");
-        } else {
-            println!("Listening for {} seconds...", duration);
-        }
-    }
-
-    if verbosity == Verbosity::Verbose {
-        if let Some(cs) = callsign {
-            eprintln!("[verbose] Callsign: {}", cs);
-        }
-    }
-
-    #[cfg(feature = "cpal-backend")]
-    {
-        use coppa_audio::AudioSource;
-
-        let config = resolve_config(profile)?;
-        let engine_rate = config.sample_rate;
-        let mut source = match device {
-            Some(name) => match coppa_audio::find_input_device_by_name(name) {
-                Some(dev) => {
-                    if verbosity != Verbosity::Quiet {
-                        eprintln!("Using input device matching '{}'", name);
-                    }
-                    coppa_audio::cpal_backend::CpalSource::from_device(dev, engine_rate, 8192)?
-                }
-                None => {
-                    eprintln!(
-                        "WARNING: No input device matching '{}', using default",
-                        name
-                    );
-                    coppa_audio::cpal_backend::CpalSource::new(engine_rate, 8192)?
-                }
-            },
-            None => coppa_audio::cpal_backend::CpalSource::new(engine_rate, 8192)?,
-        };
-        source.start()?;
-
-        let core = CoppaCore::with_config(config);
-        let mut read_buf = vec![0.0f32; 4000];
-        let mut window: Vec<f32> = Vec::with_capacity(65536);
-        let max_window = 64000;
-        let start = std::time::Instant::now();
-        let mut last_liveness = std::time::Instant::now();
-
-        loop {
-            if duration > 0 && start.elapsed().as_secs() >= duration {
-                break;
-            }
-
-            // F5: Liveness indicator -- print "." to stderr every 5 seconds
-            if verbosity != Verbosity::Quiet && last_liveness.elapsed().as_secs() >= 5 {
-                eprint!(".");
-                last_liveness = std::time::Instant::now();
-            }
-
-            let n = source.read(&mut read_buf)?;
-            if n > 0 {
-                window.extend_from_slice(&read_buf[..n]);
-
-                if verbosity == Verbosity::Verbose {
-                    eprintln!("[verbose] Buffer: {} samples", window.len());
-                }
-
-                match core.decode(&window) {
-                    Ok(message) => {
-                        if raw {
-                            print!("{}", message);
-                        } else {
-                            println!("Decoded: \"{}\"", message);
-                        }
-                        window.clear();
-                    }
-                    Err(_) => {
-                        if window.len() > max_window {
-                            let drain = window.len() / 2;
-                            window.drain(..drain);
-                        }
-                    }
-                }
-            }
-        }
-
-        source.stop()?;
-        if verbosity != Verbosity::Quiet && !raw {
-            println!("\nStopped listening.");
-        }
-    }
-
-    #[cfg(not(feature = "cpal-backend"))]
-    {
-        let _ = duration;
-        let _ = profile;
-        let _ = callsign;
-        let _ = raw;
-        let _ = device;
-        if verbosity != Verbosity::Quiet {
-            println!("(Live audio capture not available -- compile with cpal-backend feature)");
-        }
     }
 
     Ok(())
@@ -1734,14 +1706,11 @@ mod tests {
     fn test_rx_nonexistent_file() {
         #[cfg(feature = "file-backend")]
         {
-            let result = cmd_rx(
-                Some("/tmp/coppa_nonexistent_12345.wav"),
-                None,
-                false,
-                false,
-                None,
-                Verbosity::Normal,
-            );
+            let args = RxArgs {
+                file: Some("/tmp/coppa_nonexistent_12345.wav".into()),
+                ..Default::default()
+            };
+            let result = cmd_rx(&args, Verbosity::Normal);
             assert!(result.is_err(), "rx of nonexistent file should error");
         }
     }
@@ -2619,12 +2588,13 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// Task 4 (Phase 4): `cmd_rx`'s `--input` path now streams through
-    /// `CoppaCore::push_samples` in chunks (rather than a single batch
-    /// `core.decode()` call) -- a round-trip smoke test that this still
-    /// decodes cleanly end-to-end (content is checked separately by the
-    /// dedicated `tests/rx_golden.rs` integration test, which asserts on
-    /// actual printed hex; this just proves `cmd_rx` doesn't error).
+    /// `cmd_rx`'s `--input` path streams through `CoppaCore::push_samples`
+    /// in chunks (not a batch `core.decode()` call). This only proves that a
+    /// freshly encoded WAV runs through `cmd_rx` without an error; what it
+    /// prints is asserted by the integration tests, which run the real
+    /// binary: `tests/rx_golden.rs` (`--raw` hex per golden vector),
+    /// `tests/rx_text.rs` (text vs. hex) and `tests/rx_one_receiver.rs`
+    /// (FILE, `--duration`, `--callsign` and the `listen` alias).
     #[test]
     fn test_rx_streams_encoded_wav_file() {
         #[cfg(feature = "file-backend")]
@@ -2649,9 +2619,238 @@ mod tests {
             )
             .expect("tx to file should succeed");
 
-            let result = cmd_rx(Some(path_str), None, true, false, None, Verbosity::Quiet);
+            let args = RxArgs {
+                input: Some(path_str.into()),
+                raw: true,
+                ..Default::default()
+            };
+            let result = cmd_rx(&args, Verbosity::Quiet);
             std::fs::remove_file(&path).ok();
             result.expect("streaming rx of a freshly-encoded WAV should succeed");
         }
+    }
+
+    // COP-56: one receiver. `rx` takes a bare path, `--duration` and
+    // `--callsign`; `listen` is a hidden alias parsing the same `RxArgs`.
+
+    #[test]
+    fn rx_parses_bare_path_duration_and_callsign() {
+        let cli = Cli::parse_from([
+            "coppa",
+            "rx",
+            "x.wav",
+            "-d",
+            "5",
+            "--callsign",
+            "VK2ABC",
+            "--raw",
+            "--hex",
+            "--profile",
+            "HF_ROBUST",
+            "--device",
+            "Mic",
+        ]);
+        let Some(Commands::Rx(args)) = cli.command else {
+            panic!("expected Rx")
+        };
+        assert_eq!(args.path(), Some("x.wav"));
+        assert_eq!(args.duration, 5);
+        assert_eq!(args.callsign.as_deref(), Some("VK2ABC"));
+        assert!(args.raw && args.hex);
+        assert_eq!(args.profile.as_deref(), Some("HF_ROBUST"));
+        assert_eq!(args.device.as_deref(), Some("Mic"));
+
+        let cli = Cli::parse_from(["coppa", "rx", "-i", "y.wav"]);
+        let Some(Commands::Rx(args)) = cli.command else {
+            panic!("expected Rx")
+        };
+        assert_eq!(args.path(), Some("y.wav"));
+        assert_eq!(args.duration, 0);
+    }
+
+    #[test]
+    fn rx_rejects_a_path_and_input_together() {
+        let err = Cli::try_parse_from(["coppa", "rx", "a.wav", "-i", "b.wav"])
+            .err()
+            .expect("FILE and -i together must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn file_sample_limit_honours_duration() {
+        assert_eq!(file_sample_limit(179_040, 0, 48_000), 179_040);
+        assert_eq!(file_sample_limit(179_040, 2, 48_000), 96_000);
+        assert_eq!(file_sample_limit(179_040, 60, 48_000), 179_040);
+        assert_eq!(file_sample_limit(100, u64::MAX, 48_000), 100);
+    }
+
+    #[test]
+    fn live_deadline_is_none_for_zero_and_overflow() {
+        let now = std::time::Instant::now();
+        assert_eq!(live_deadline(now, 0), None);
+        assert_eq!(live_deadline(now, u64::MAX), None);
+        assert_eq!(
+            live_deadline(now, 5),
+            Some(now + std::time::Duration::from_secs(5))
+        );
+    }
+
+    /// A live source with no audio yet: every read returns 0 samples.
+    struct Stalled;
+
+    impl coppa_audio::AudioSource for Stalled {
+        fn read(&mut self, _buf: &mut [f32]) -> Result<usize> {
+            Ok(0)
+        }
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A busy live source: every read fills the whole buffer with silence.
+    struct Endless;
+
+    impl coppa_audio::AudioSource for Endless {
+        fn read(&mut self, buf: &mut [f32]) -> Result<usize> {
+            buf.fill(0.0);
+            Ok(buf.len())
+        }
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Like `Endless`, but counts the samples it hands out.
+    #[derive(Default)]
+    struct Counting {
+        handed_out: usize,
+    }
+
+    impl coppa_audio::AudioSource for Counting {
+        fn read(&mut self, buf: &mut [f32]) -> Result<usize> {
+            buf.fill(0.0);
+            self.handed_out += buf.len();
+            Ok(buf.len())
+        }
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stream_decode_stops_a_stalled_live_source_at_its_deadline() {
+        let start = std::time::Instant::now();
+        let deadline = Some(start + std::time::Duration::from_millis(100));
+        stream_decode(
+            &mut CoppaCore::new(),
+            &mut Stalled,
+            None,
+            deadline,
+            false,
+            false,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(100),
+            "{elapsed:?}"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    #[test]
+    fn stream_decode_stops_a_streaming_live_source_at_its_deadline() {
+        let start = std::time::Instant::now();
+        let deadline = Some(start + std::time::Duration::from_millis(100));
+        stream_decode(
+            &mut CoppaCore::new(),
+            &mut Endless,
+            None,
+            deadline,
+            false,
+            false,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(100),
+            "{elapsed:?}"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    #[test]
+    fn stream_decode_reads_no_further_than_its_sample_limit() {
+        let mut source = Counting::default();
+        stream_decode(
+            &mut CoppaCore::new(),
+            &mut source,
+            Some(10_000),
+            None,
+            true,
+            false,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        assert_eq!(source.handed_out, 10_000);
+    }
+
+    #[test]
+    fn listen_parses_into_the_same_args_as_rx() {
+        let flags = [
+            "x.wav",
+            "-d",
+            "5",
+            "--callsign",
+            "VK2ABC",
+            "--raw",
+            "--hex",
+            "--profile",
+            "HF_ROBUST",
+            "--device",
+            "Mic",
+        ];
+        let parse = |sub: &str| Cli::parse_from(["coppa", sub].into_iter().chain(flags)).command;
+        let Some(Commands::Rx(rx)) = parse("rx") else {
+            panic!("expected Rx")
+        };
+        let Some(Commands::Listen(listen)) = parse("listen") else {
+            panic!("expected Listen")
+        };
+        assert_eq!(rx, listen);
+    }
+
+    #[test]
+    fn top_level_help_hides_listen() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_help().to_string();
+        assert!(
+            !help.lines().any(|l| l.trim_start().starts_with("listen")),
+            "{help}"
+        );
+        assert!(
+            help.lines().any(|l| l.trim_start().starts_with("rx ")),
+            "{help}"
+        );
     }
 }

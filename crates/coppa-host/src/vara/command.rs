@@ -4,6 +4,7 @@ use anyhow::Result;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 use super::protocol::{VaraCommand, VaraResponse};
 use crate::HostEvent;
@@ -11,6 +12,55 @@ use crate::HostEvent;
 /// Maximum length of a single command line, in bytes. Lines longer than this
 /// cause the connection to be closed, bounding per-client memory use.
 const MAX_LINE: usize = 4096;
+
+/// Lines each command-port client's response queue holds. A state line that
+/// finds the queue full means the client has stopped reading, and the caller
+/// disconnects it rather than skip the line.
+pub const COMMAND_QUEUE_DEPTH: usize = 1024;
+
+/// Queued lines past which [`queue_response`] drops `BUSY` and `SNR`
+/// ([`VaraResponse::is_disposable`]), keeping the rest of the queue for state
+/// lines and replies.
+pub const TELEMETRY_QUEUE_DEPTH: usize = 64;
+
+/// A command-port client's response channel, [`COMMAND_QUEUE_DEPTH`] lines
+/// deep.
+pub fn response_channel() -> (mpsc::Sender<VaraResponse>, mpsc::Receiver<VaraResponse>) {
+    mpsc::channel(COMMAND_QUEUE_DEPTH)
+}
+
+/// What [`queue_response`] did with a line.
+#[derive(Debug, PartialEq)]
+pub enum Queued {
+    /// The line is queued for the client.
+    Sent,
+    /// A disposable line (`BUSY`/`SNR`) was dropped: at least
+    /// [`TELEMETRY_QUEUE_DEPTH`] lines were already waiting.
+    Dropped,
+    /// The queue is full and the line, returned here, is not disposable. The
+    /// client has stopped reading; disconnect it by dropping its sender.
+    Overflow(VaraResponse),
+    /// The client's connection has already ended.
+    Closed,
+}
+
+/// Queue `response` for one command-port client without waiting.
+///
+/// `BUSY` and `SNR` are dropped once [`TELEMETRY_QUEUE_DEPTH`] lines are
+/// waiting. Every other line is queued in order, or returned as
+/// [`Queued::Overflow`] when the queue is full, so a client never misses a
+/// state line while its connection stays open.
+pub fn queue_response(tx: &mpsc::Sender<VaraResponse>, response: VaraResponse) -> Queued {
+    if response.is_disposable() && tx.max_capacity() - tx.capacity() >= TELEMETRY_QUEUE_DEPTH {
+        return Queued::Dropped;
+    }
+    match tx.try_send(response) {
+        Ok(()) => Queued::Sent,
+        Err(TrySendError::Full(line)) if line.is_disposable() => Queued::Dropped,
+        Err(TrySendError::Full(line)) => Queued::Overflow(line),
+        Err(TrySendError::Closed(_)) => Queued::Closed,
+    }
+}
 
 /// VARA command port TCP listener.
 pub struct VaraCommandPort {
@@ -94,6 +144,7 @@ impl VaraCommandPort {
             }
             drop(read_done_tx); // signal write task
         });
+        let read_abort = read_task.abort_handle();
 
         // Write responses — exits when response_rx closes OR read task signals done
         let write_task = tokio::spawn(async move {
@@ -115,9 +166,12 @@ impl VaraCommandPort {
                     }
                 }
             }
+            // Writing has stopped, so stop reading too: the socket closes and
+            // the daemon stops acting on commands whose replies go nowhere.
+            read_abort.abort();
         });
 
-        let _ = tokio::try_join!(read_task, write_task);
+        let _ = tokio::join!(read_task, write_task);
 
         let _ = event_tx.send(HostEvent::Disconnected { client_id }).await;
 
@@ -367,6 +421,144 @@ mod tests {
         let mut reader = BufReader::new(&mut c.stream);
         assert_eq!(read_response(&mut reader).await, "BUSY ON\r");
         assert_eq!(read_response(&mut reader).await, "BUFFER 0\r");
+    }
+
+    #[test]
+    fn only_busy_and_snr_are_disposable() {
+        assert!(VaraResponse::Busy(true).is_disposable());
+        assert!(VaraResponse::Busy(false).is_disposable());
+        assert!(VaraResponse::Snr(-3).is_disposable());
+        assert!(!VaraResponse::Ok.is_disposable());
+        assert!(!VaraResponse::Wrong.is_disposable());
+        assert!(!VaraResponse::coppa_version().is_disposable());
+        assert!(!VaraResponse::Pending.is_disposable());
+        assert!(!VaraResponse::Connected("W5AU".into(), "K7XYZ".into(), 2300).is_disposable());
+        assert!(!VaraResponse::Disconnected.is_disposable());
+        assert!(!VaraResponse::Ptt(true).is_disposable());
+        assert!(!VaraResponse::Ptt(false).is_disposable());
+        assert!(!VaraResponse::Buffer(0).is_disposable());
+        assert!(!VaraResponse::IAmAlive.is_disposable());
+    }
+
+    /// A response channel with `TELEMETRY_QUEUE_DEPTH` `PTT` lines waiting.
+    fn channel_at_telemetry_depth() -> (mpsc::Sender<VaraResponse>, mpsc::Receiver<VaraResponse>) {
+        let (tx, rx) = response_channel();
+        for i in 0..TELEMETRY_QUEUE_DEPTH {
+            assert_eq!(
+                queue_response(&tx, VaraResponse::Ptt(i % 2 == 0)),
+                Queued::Sent
+            );
+        }
+        (tx, rx)
+    }
+
+    #[test]
+    fn queue_response_drops_only_busy_and_snr_past_telemetry_depth() {
+        let (tx, _rx) = channel_at_telemetry_depth();
+        assert_eq!(
+            queue_response(&tx, VaraResponse::Busy(true)),
+            Queued::Dropped
+        );
+        assert_eq!(queue_response(&tx, VaraResponse::Snr(12)), Queued::Dropped);
+        for line in [
+            VaraResponse::Ptt(false),
+            VaraResponse::Connected("W5AU".into(), "K7XYZ".into(), 2300),
+            VaraResponse::Disconnected,
+            VaraResponse::Buffer(0),
+            VaraResponse::IAmAlive,
+            VaraResponse::Ok,
+            VaraResponse::Wrong,
+            VaraResponse::coppa_version(),
+        ] {
+            assert_eq!(
+                queue_response(&tx, line.clone()),
+                Queued::Sent,
+                "{:?}",
+                line
+            );
+        }
+        assert_eq!(tx.max_capacity() - tx.capacity(), TELEMETRY_QUEUE_DEPTH + 8);
+    }
+
+    #[test]
+    fn busy_and_snr_are_queued_below_telemetry_depth() {
+        let (tx, mut rx) = response_channel();
+        assert_eq!(queue_response(&tx, VaraResponse::Busy(true)), Queued::Sent);
+        assert_eq!(queue_response(&tx, VaraResponse::Snr(7)), Queued::Sent);
+        assert_eq!(rx.try_recv().unwrap(), VaraResponse::Busy(true));
+        assert_eq!(rx.try_recv().unwrap(), VaraResponse::Snr(7));
+    }
+
+    #[test]
+    fn queue_response_reports_overflow_when_a_state_line_does_not_fit() {
+        let (tx, mut rx) = response_channel();
+        for _ in 0..COMMAND_QUEUE_DEPTH {
+            assert_eq!(queue_response(&tx, VaraResponse::Ptt(true)), Queued::Sent);
+        }
+        assert_eq!(
+            queue_response(&tx, VaraResponse::Disconnected),
+            Queued::Overflow(VaraResponse::Disconnected)
+        );
+        // The rejected line is not queued: the queue holds only what fitted.
+        let mut queued = 0;
+        while let Ok(line) = rx.try_recv() {
+            assert_eq!(line, VaraResponse::Ptt(true));
+            queued += 1;
+        }
+        assert_eq!(queued, COMMAND_QUEUE_DEPTH);
+
+        drop(rx);
+        assert_eq!(
+            queue_response(&tx, VaraResponse::Disconnected),
+            Queued::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_response_sender_closes_the_connection() {
+        let c = connect().await;
+        let CommandClient {
+            stream,
+            mut rx,
+            response_tx,
+            handler,
+        } = c;
+        assert_eq!(
+            queue_response(&response_tx, VaraResponse::Ptt(true)),
+            Queued::Sent
+        );
+        assert_eq!(
+            queue_response(&response_tx, VaraResponse::Ptt(false)),
+            Queued::Sent
+        );
+        drop(response_tx);
+
+        // The client keeps its write half open: only the server can end this.
+        let (read_half, _write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        assert_eq!(read_response(&mut reader).await, "PTT ON\r");
+        assert_eq!(read_response(&mut reader).await, "PTT OFF\r");
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_to_end(&mut rest))
+            .await
+            .expect("timed out waiting for EOF")
+            .unwrap();
+        assert!(
+            rest.is_empty(),
+            "unexpected bytes after the queue: {:?}",
+            rest
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .expect("handle_client did not return after its sender was dropped")
+            .unwrap()
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for Disconnected")
+            .expect("event channel closed");
+        assert!(matches!(event, HostEvent::Disconnected { client_id: 1 }));
     }
 
     #[tokio::test]
