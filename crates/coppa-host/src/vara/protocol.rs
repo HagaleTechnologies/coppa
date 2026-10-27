@@ -138,8 +138,9 @@ impl VaraResponse {
     }
 
     /// True for the telemetry lines a client may miss: `BUSY` and `SNR`. The
-    /// next change sends a fresh value. Every other line is a state change or
-    /// a reply, and must reach the client or end its connection.
+    /// next change sends a fresh value; until one does, a client that missed a
+    /// line holds the stale one. Every other line is a state change or a
+    /// reply, and must reach the client or end its connection.
     pub fn is_disposable(&self) -> bool {
         matches!(self, VaraResponse::Busy(_) | VaraResponse::Snr(_))
     }
