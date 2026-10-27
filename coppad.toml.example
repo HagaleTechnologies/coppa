@@ -2,15 +2,18 @@
 # Copy to coppad.toml and edit as needed.
 
 [audio]
-# Sample rate in Hz. Must match engine (48000 for OFDM).
+# Sample rate in Hz. Must be 48000, the engine's rate (coppad has no
+# resampler); any other value stops the daemon at startup.
 sample_rate = 48000
 # Ring buffer size in samples.
 buffer_size = 8192
 # Audio input device name (substring match, case-insensitive).
-# Empty string = system default.
+# Empty string = system default. A name that matches no device stops the
+# daemon at startup; it never falls back to the default device.
 input_device = ""
 # Audio output device name (substring match, case-insensitive).
-# Empty string = system default.
+# Empty string = system default. A name that matches no device stops the
+# daemon at startup; it never falls back to the default device.
 output_device = ""
 
 [radio]
@@ -30,6 +33,20 @@ ptt_pre_delay_ms = 50
 ptt_tail_delay_ms = 200
 # Safety: max TX duration in seconds before forced unkey
 max_tx_duration_s = 30
+# COP-31: PTT guardian. With rigctld or GPIO PTT, coppad starts a small
+# helper process ("coppad --ptt-guardian ...") that releases PTT if coppad
+# dies while transmitting (kill -9, out-of-memory kill, crash). It does
+# nothing while coppad runs normally, and exits when coppad exits. Ignored
+# for "none", "vox" and serial PTT; for serial, the OS drops DTR/RTS when the
+# port closes. Set to false to disable.
+ptt_guardian = true
+# Half-duplex RX->TX turnaround: after decoding a frame, wait this many ms
+# before keying PTT for any transmission (ACKs, CONNECT_ACK, replies). The
+# OTHER station stays keyed for its own ptt_tail_delay_ms (or its rig's VOX
+# hang time) after its last audio sample, and cannot hear you until it
+# unkeys. Set this above the peer's tail/VOX delay plus its radio's TX->RX
+# switching time. 0 disables the guard (replies key at once).
+turnaround_ms = 500
 
 # COP-40: operating-frequency source for the HF/VHF regulatory gate.
 # Required ONLY for wideband (VHF) profiles, whose 5600 Hz occupied
@@ -44,6 +61,10 @@ max_tx_duration_s = 30
 # Amateur band label ("160m".."23cm"); a band whose lowest edge is
 # above 29.7 MHz (6m, 2m, 70cm, ...) satisfies the gate:
 # band = "2m"
+# An [engine] profile that is not one of the four built-in names leaves
+# the band to the speed level, so levels 5+ would be wideband. Without a
+# source at or above 29.7 MHz, coppad keeps such an engine on the HF
+# profile (levels 1-8, 2400 Hz) instead, and logs a warning (COP-21).
 
 [host]
 # Address all host servers (VARA-style TCP, WebSocket) bind to.
@@ -57,6 +78,7 @@ vara_enabled = false
 vara_command_port = 8300
 vara_data_port = 8301
 # WebSocket JSON API
+# Clients can opt into periodic "spectrum" and "audio_level" streams; see docs/OPERATING.md.
 websocket_enabled = false
 websocket_port = 8400
 
@@ -84,7 +106,9 @@ busy_hold_ms = 0
 # identification. Defaults to 540 (9 minutes) for margin under FCC Part
 # 97.119's 10-minute requirement. An ID is only ever prepended to a real
 # outgoing transmission (never sent standalone), and only while [engine]
-# callsign above is set.
+# callsign above is set. The first transmission after startup always carries
+# an ID; later ones carry one once this interval has passed. 0 turns automatic
+# ID off.
 id_interval_secs = 540
 # Beacon mode: interval in seconds between standalone beacon transmissions,
 # sent only when the channel reads clear (skipped, not deferred, if busy --
@@ -101,8 +125,6 @@ beacon_interval_secs = 0
 # arq_window = 8
 # Max retransmit attempts per frame (default 5)
 # max_retries = 5
-# Turnaround delay in ms between RX/TX switching (default 500)
-# turnaround_ms = 500
 # Connection timeout in seconds (default 30)
 # connect_timeout_s = 30
 # Idle timeout in seconds before session drops (default 120)

@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-09-06T12:17:42Z",
-  "head_commit": "3779efd",
+  "generated_at": "2026-10-26T08:02:02Z",
+  "head_commit": "8857be8",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -200,7 +200,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:998da387d75cbaabc88f9281b233f7d19f2599b24d220d7640e752f25ddf6410",
+      "hash": "sha256:fcab594b487860ea400a85abfe93ac0f1d968c783d8e4cc5012b8f9d6e93458b",
       "id": "band-conventions",
       "kind": "interface",
       "links": [
@@ -262,7 +262,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:19423413380b0dde1dcd15ed0edfc6a3af50378a0b9cc6406a85e2ae98b89d77",
+      "hash": "sha256:90e4061ee52405b3ff069c3d84d44124db924bef912065c530ff18da17087371",
       "id": "coppa-engine",
       "kind": "subsystem",
       "links": [
@@ -355,7 +355,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:4c050d6d7a647fae7d4c6c50a7f88b27bb6c062f05317af61a6e419702923cb7",
+      "hash": "sha256:b8afd3bae50ea8f4ba058e6a60987ce447d071d232b7ad7e8d0a78dfe15c9329",
       "id": "cpal-feature-gate",
       "kind": "gotcha",
       "links": [
@@ -418,7 +418,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:d94453fd26d0bcd412480b0f27a0319f3d6aad25e63b99f2c2cf7caaa5d44ea9",
+      "hash": "sha256:ece8378df1627dd56e8d8c10c4a995d5474ccc0993b6d4a7c2760fb7fefe9ec0",
       "id": "phase4-field-readiness",
       "kind": "gotcha",
       "links": [
