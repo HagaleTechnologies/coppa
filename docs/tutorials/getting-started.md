@@ -4,6 +4,7 @@
 
 - Rust 1.85.0 or later
 - ALSA development headers (Linux): `sudo apt-get install libasound2-dev`
+- udev development headers (Linux), only to build coppad with `--features serial-ptt`: `sudo apt-get install libudev-dev`
 - No additional dependencies on macOS or Windows
 
 ## Building
@@ -244,3 +245,4 @@ int main() {
 
 - Read [ARCHITECTURE.md](../../ARCHITECTURE.md) for system design details
 - Browse the crate documentation: `cargo doc --workspace --no-deps --open`
+- Run coppad as a service on a Raspberry Pi 4: [raspberry-pi-install.md](raspberry-pi-install.md)
