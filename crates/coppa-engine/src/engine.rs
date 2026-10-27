@@ -190,11 +190,6 @@ impl CoppaCore {
         Self::profile_occupied_hz(self.transceiver.profile())
     }
 
-<<<<<<< HEAD
-    /// Occupied bandwidth of `profile` in Hz: active carriers times carrier
-    /// spacing. Shared by `occupied_bandwidth_hz` and `crate::ladder`.
-    pub(crate) fn profile_occupied_hz(profile: &CoppaProfile) -> u32 {
-=======
     /// Occupied bandwidth, in Hz, of the profile `set_speed_level(level)` would
     /// select on this engine's band and CP mode, without rebuilding anything
     /// (COP-21). A caller that holds RF-frequency evidence asks this before
@@ -211,9 +206,10 @@ impl CoppaCore {
         ))
     }
 
-    /// Active carriers times carrier spacing, rounded to whole Hz.
-    fn profile_occupied_hz(profile: &CoppaProfile) -> u32 {
->>>>>>> 65d1a3bf78ccfc3b80ae90042ace16b14541aca3
+    /// Occupied bandwidth of `profile` in Hz: active carriers times carrier
+    /// spacing, rounded to whole Hz. Shared by `occupied_bandwidth_hz`,
+    /// `occupied_bandwidth_hz_at` and `crate::ladder`.
+    pub(crate) fn profile_occupied_hz(profile: &CoppaProfile) -> u32 {
         (profile.total_active_carriers() as f32 * profile.carrier_spacing_hz()).round() as u32
     }
 
