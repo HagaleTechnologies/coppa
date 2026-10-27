@@ -47,6 +47,21 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
       - run: cargo check --workspace
       - run: cargo check --workspace --all-features
+      # COP-35: compile and run the getting-started tutorial's C FFI example,
+      # as written, against the committed coppa.h, as C and as C++.
+      - name: Compile the tutorial's C FFI example against coppa.h
+        run: |
+          cargo build -p coppa-ffi
+          # build.rs regenerates coppa.h; a diff means the committed header is stale.
+          git diff --exit-code -- crates/coppa-ffi/coppa.h
+          dir="$RUNNER_TEMP/ffi-tutorial"
+          mkdir -p "$dir"
+          awk '/^## Using the C FFI/{s=1} s&&/^```c$/{p=1;next} p&&/^```$/{exit} p' docs/tutorials/getting-started.md > "$dir/hello.c"
+          grep -q 'coppa_engine_destroy(&engine)' "$dir/hello.c"
+          cc -std=c11 -Wall -Wextra -Wpedantic -Werror -Icrates/coppa-ffi "$dir/hello.c" -Ltarget/debug -lcoppa_ffi -o "$dir/hello"
+          c++ -x c++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -Icrates/coppa-ffi "$dir/hello.c" -Ltarget/debug -lcoppa_ffi -o "$dir/hello_cpp"
+          LD_LIBRARY_PATH=target/debug "$dir/hello"
+          LD_LIBRARY_PATH=target/debug "$dir/hello_cpp"
 
   test-features:
     name: Test with Features (fast, lib-only)
