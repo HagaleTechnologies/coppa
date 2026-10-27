@@ -229,3 +229,15 @@ queued re-keys for the next one the moment its own PTT releases, so the
 other station's ACK can still collide with that next frame. Sender-side turn
 discipline is a separate follow-up. The hardware acceptance test for this
 behaviour is `docs/testing/cable-loop-turnaround.md`.
+
+## Host clients that stop reading
+
+coppad queues every command-port line for each connected host. If a host
+stops reading and its socket buffers fill, coppad drops `BUSY` and `SNR`
+lines once 64 lines are waiting; the next change sends a fresh value. It
+keeps every other line (`PTT`, `CONNECTED`, `DISCONNECTED`, `BUFFER`,
+`IAMALIVE` and command replies). If 1024 lines are waiting, coppad writes
+what is queued, closes the connection and logs `VARA command-port client is
+not reading; disconnecting it`. A host never misses a state line while its
+connection stays open. Find out why the host stopped reading, then reconnect
+it.

@@ -5,7 +5,7 @@
 use anyhow::Result;
 use coppa_audio::{AudioRingConsumer, AudioRingProducer};
 use coppa_engine::{CoppaCore, OfdmBand};
-use coppa_host::vara::{VaraCommand, VaraResponse};
+use coppa_host::vara::{queue_response, Queued, VaraCommand, VaraResponse, COMMAND_QUEUE_DEPTH};
 use coppa_host::HostEvent;
 use coppa_ml::CpRecommendation;
 use coppa_ml::{BusyGate, CpGate, RateLoop};
@@ -124,12 +124,39 @@ fn vara_reply(command: &VaraCommand) -> VaraResponse {
     }
 }
 
-/// Send `response` to every client in `senders`, dropping it for any whose
-/// queue is full.
-async fn broadcast_vara(senders: &VaraResponseSenders, response: VaraResponse) {
-    for tx in senders.lock().await.values() {
-        let _ = tx.try_send(response.clone());
+/// Queue `response` for one command-port client without waiting
+/// (`queue_response`). Returns `false` when a line that must not be dropped
+/// finds the client's queue full: the client has stopped reading, and the
+/// caller removes its sender, which closes its connection once the queued
+/// lines are written. The client gets every line up to that point, then EOF,
+/// never a gap on an open connection.
+fn queue_for_client(
+    client_id: u32,
+    tx: &mpsc::Sender<VaraResponse>,
+    response: VaraResponse,
+) -> bool {
+    match queue_response(tx, response) {
+        Queued::Overflow(line) => {
+            tracing::warn!(
+                client_id,
+                line = line.format().trim_end(),
+                depth = COMMAND_QUEUE_DEPTH,
+                "VARA command-port client is not reading; disconnecting it"
+            );
+            false
+        }
+        Queued::Sent | Queued::Dropped | Queued::Closed => true,
     }
+}
+
+/// Queue `response` for every client in `senders` without waiting. `BUSY` and
+/// `SNR` may be dropped for a client that is falling behind; any other line
+/// that does not fit disconnects that client (`queue_for_client`).
+async fn broadcast_vara(senders: &VaraResponseSenders, response: VaraResponse) {
+    senders
+        .lock()
+        .await
+        .retain(|&id, tx| queue_for_client(id, tx, response.clone()));
 }
 
 /// Send `IAMALIVE` to every command-port client each `period`, the first one
@@ -1104,9 +1131,10 @@ impl EventLoop {
     }
 
     /// Broadcast one `VaraResponse` to every connected VARA command-port client, if
-    /// any are wired up (`set_vara_responses`). A no-op (silently) if telemetry
-    /// hasn't been wired, or if a given client's channel happens to be full/closed
-    /// — telemetry is best-effort and must never block or fail the caller.
+    /// any are wired up (`set_vara_responses`). A no-op if telemetry hasn't been
+    /// wired. Never waits: a client that falls behind may miss `BUSY`/`SNR`, and
+    /// one that stops reading is disconnected rather than skipped
+    /// (`broadcast_vara`), so a state line is never lost on an open connection.
     async fn emit_vara(&self, response: VaraResponse) {
         if let Some(ref senders) = self.vara_responses {
             broadcast_vara(senders, response).await;
@@ -1119,22 +1147,20 @@ impl EventLoop {
     /// `coppa_host::websocket::FIRST_CLIENT_ID`, so a reply to a
     /// WebSocket-originated event finds no sender here and is dropped.
     ///
-    /// Uses `try_send`, never `send().await`: a client that stops reading must
-    /// not stall the modem's event loop (same choice as `notify_session`).
+    /// Never waits, never `send().await`: a client that stops reading must
+    /// not stall the modem's event loop. A reply that finds the client's queue
+    /// full disconnects that client instead of being dropped
+    /// (`queue_for_client`).
     async fn reply_vara(&self, client_id: u32, response: VaraResponse) {
         let Some(ref senders) = self.vara_responses else {
             return;
         };
-        let senders = senders.lock().await;
+        let mut senders = senders.lock().await;
         let Some(tx) = senders.get(&client_id) else {
             return;
         };
-        if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(response.clone()) {
-            tracing::warn!(
-                client_id,
-                line = response.format().trim_end(),
-                "VARA command-port queue full; reply dropped"
-            );
+        if !queue_for_client(client_id, tx, response) {
+            senders.remove(&client_id);
         }
     }
 
@@ -1176,19 +1202,10 @@ impl EventLoop {
         if let Some(ref tx) = self.response_tx {
             let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate { client_id, status });
         }
-        // A dropped state line leaves the host waiting out its own connect or
-        // disconnect timer, so log it. Closed channels belong to departed clients.
-        if let Some(ref senders) = self.vara_responses {
-            for (id, tx) in senders.lock().await.iter() {
-                if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(vara.clone()) {
-                    tracing::warn!(
-                        client_id = id,
-                        line = vara.format().trim_end(),
-                        "VARA command-port queue full; session-state line dropped"
-                    );
-                }
-            }
-        }
+        // A dropped state line would leave the host waiting out its own
+        // connect or disconnect timer, so a host that cannot take it is
+        // disconnected instead (`broadcast_vara`).
+        self.emit_vara(vara).await;
         #[cfg(feature = "websocket")]
         {
             let remote = self.established_remote();
@@ -9281,6 +9298,104 @@ mod tests {
         use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
         use tokio::net::TcpStream;
 
+        // COP-34: a host that reads slowly never loses a state line. Each of
+        // these wires one in-process client whose queue the test drains only
+        // at the end, as a host that has stopped reading would.
+
+        /// An `EventLoop` with one command-port client (`client_id` 1) on a
+        /// real `response_channel`, plus the shared sender map.
+        fn slow_host() -> (EventLoop, VaraResponseSenders, mpsc::Receiver<VaraResponse>) {
+            let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+            let (tx, rx) = coppa_host::vara::response_channel();
+            let senders: VaraResponseSenders = Arc::new(Mutex::new(HashMap::from([(1, tx)])));
+            event_loop.set_vara_responses(senders.clone());
+            (event_loop, senders, rx)
+        }
+
+        fn drain(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<VaraResponse> {
+            std::iter::from_fn(|| rx.try_recv().ok()).collect()
+        }
+
+        #[tokio::test]
+        async fn slow_host_receives_every_ptt_transition() {
+            let (mut event_loop, _senders, mut rx) = slow_host();
+            for _ in 0..coppa_host::vara::TELEMETRY_QUEUE_DEPTH {
+                event_loop.emit_vara(VaraResponse::Busy(true)).await;
+            }
+            let sent: Vec<bool> = (0..70).map(|i| i % 2 == 0).collect();
+            for &on in &sent {
+                event_loop.handle_ptt_change(on).await;
+            }
+            event_loop.emit_vara(VaraResponse::Busy(false)).await;
+
+            let lines = drain(&mut rx);
+            let ptt: Vec<bool> = lines
+                .iter()
+                .filter_map(|line| match line {
+                    VaraResponse::Ptt(on) => Some(*on),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(ptt, sent, "every PTT transition must arrive, in order");
+            assert_eq!(lines.last(), Some(&VaraResponse::Ptt(false)));
+            assert!(
+                !lines.contains(&VaraResponse::Busy(false)),
+                "BUSY past the telemetry depth must be dropped"
+            );
+        }
+
+        #[tokio::test]
+        async fn slow_host_receives_disconnected_behind_a_busy_backlog() {
+            let (event_loop, _senders, mut rx) = slow_host();
+            for _ in 0..coppa_host::vara::TELEMETRY_QUEUE_DEPTH {
+                event_loop.emit_vara(VaraResponse::Busy(true)).await;
+            }
+            event_loop
+                .notify_session(1, SessionNotice::Disconnected)
+                .await;
+
+            let lines = drain(&mut rx);
+            assert_eq!(lines.len(), coppa_host::vara::TELEMETRY_QUEUE_DEPTH + 1);
+            assert_eq!(lines.last(), Some(&VaraResponse::Disconnected));
+        }
+
+        #[tokio::test]
+        async fn host_that_stops_reading_is_disconnected_not_skipped() {
+            let (event_loop, senders, mut rx) = slow_host();
+            for i in 0..COMMAND_QUEUE_DEPTH {
+                event_loop.emit_vara(VaraResponse::Ptt(i % 2 == 0)).await;
+            }
+            assert!(senders.lock().await.contains_key(&1));
+            event_loop.emit_vara(VaraResponse::Ptt(false)).await;
+            assert!(
+                !senders.lock().await.contains_key(&1),
+                "a client that cannot take a state line must be disconnected"
+            );
+
+            for i in 0..COMMAND_QUEUE_DEPTH {
+                assert_eq!(rx.recv().await, Some(VaraResponse::Ptt(i % 2 == 0)));
+            }
+            assert_eq!(rx.recv().await, None, "the queue must end, not skip");
+        }
+
+        #[tokio::test]
+        async fn reply_to_a_full_queue_disconnects_the_client() {
+            let (event_loop, senders, mut rx) = slow_host();
+            for _ in 0..COMMAND_QUEUE_DEPTH {
+                event_loop.emit_vara(VaraResponse::Buffer(0)).await;
+            }
+            event_loop.reply_vara(1, VaraResponse::Ok).await;
+            assert!(
+                !senders.lock().await.contains_key(&1),
+                "a reply that does not fit must disconnect the client"
+            );
+
+            for _ in 0..COMMAND_QUEUE_DEPTH {
+                assert_eq!(rx.recv().await, Some(VaraResponse::Buffer(0)));
+            }
+            assert_eq!(rx.recv().await, None);
+        }
+
         /// Config tuned so a real `transmit_samples` call's scheduled PTT-release
         /// delay resolves in ~0ms: a very high nominal sample rate makes
         /// `audio_duration_ms`/`drain_ms` truncate to 0 (integer ms math), and the
@@ -10548,9 +10663,10 @@ mod tests {
             event_loop.is_transmitting = false;
             while !event_loop.tx_queue.is_empty() {
                 event_loop.handle_ptt_change(false).await;
-                // `broadcast_vara` drops lines once the client's 64-line
-                // response channel is full, and nothing in the drain yields
-                // to the forwarder task: let it flush each frame's lines.
+                // The client's response queue is bounded (`broadcast_vara`
+                // drops BUSY/SNR past 64 waiting lines and disconnects a client
+                // whose queue is full), and nothing in the drain yields to its
+                // write task: let it flush each frame's lines.
                 tokio::task::yield_now().await;
             }
             // Release the final frame's bytes too.
@@ -11232,9 +11348,10 @@ mod tests {
             event_loop.is_transmitting = false;
             while !event_loop.tx_queue.is_empty() {
                 event_loop.handle_ptt_change(false).await;
-                // `broadcast_vara` drops lines once the client's 64-line
-                // response channel is full, and nothing in the drain yields
-                // to the forwarder task: let it flush each frame's lines.
+                // The client's response queue is bounded (`broadcast_vara`
+                // drops BUSY/SNR past 64 waiting lines and disconnects a client
+                // whose queue is full), and nothing in the drain yields to its
+                // write task: let it flush each frame's lines.
                 tokio::task::yield_now().await;
             }
             event_loop.handle_ptt_change(false).await;
