@@ -205,6 +205,14 @@ station's host gets every byte once, in order.
   session: coppad sends DISCONNECT to the other station, reports `BUFFER 0`
   and then `DISCONNECTED`. On a link that has gone completely silent this
   takes about 3 minutes.
+- coppad holds one session at a time. While a session exists (connecting or
+  connected), every `CONNECT_REQ`, including a repeat from the station already
+  in the session, gets no answer, so that station's connect attempt times out.
+  A host `CONNECT` is answered `DISCONNECTED`, to the dialling host only. Send
+  `DISCONNECT` to end the current session before dialling again. A session
+  nobody ends blocks every caller: an idle connected session does not time
+  out, so a listening station whose peer vanished refuses callers until its
+  host sends `DISCONNECT`.
 - `[engine] arq_enabled` does not affect connected sessions; it only enables
   ARQ for sessionless traffic (`[host] sessionless_tx_enabled`).
 - Both stations must run coppad 0.3.0 or later. An older station cannot

@@ -1617,6 +1617,35 @@ impl EventLoop {
         self.ensure_session_link(session_id);
     }
 
+    /// COP-38: the session a session-layer frame belongs to: sent by the
+    /// session's peer (`src`), addressed to the session's own callsign
+    /// (`dest`), on its SSID. Matching `src` alone would let a frame the
+    /// peer addressed to another station on the shared channel (after it
+    /// reconnected elsewhere, say) acknowledge, deliver into or end this
+    /// session.
+    fn session_id_for_frame(&self, pdu: &MacPdu) -> Option<u8> {
+        self.session_mgr.active_sessions().into_iter().find(|&id| {
+            self.session_mgr.get(id).is_some_and(|s| {
+                s.remote == pdu.src && s.local == pdu.dest && s.ssid & 0x0F == pdu.ssid
+            })
+        })
+    }
+
+    /// COP-38: the remote of a session that keeps this daemon from starting
+    /// another one. `session_link` is singular (D2): a second session
+    /// established beside the first would rebuild the link and drop the
+    /// first session's backlog, in-flight segment and receive position
+    /// without disconnecting it. That includes a second slot for the same
+    /// peer (a repeat CONNECT_REQ, or one on another SSID).
+    fn active_session_remote(&self) -> Option<Callsign> {
+        self.session_mgr
+            .active_sessions()
+            .into_iter()
+            .filter_map(|id| self.session_mgr.get(id))
+            .find(|s| s.state != SessionState::Idle)
+            .map(|s| s.remote.clone())
+    }
+
     /// COP-38 (D7): the connected-session retransmit pass. Runs on `run()`'s
     /// 500 ms retransmit tick whatever `arq_enabled` says (D1). A frame is
     /// rebuilt from its segment data, byte-identical to the original; once
@@ -2176,6 +2205,26 @@ impl EventLoop {
                         return;
                     }
                 };
+
+                // COP-38: one session at a time (`active_session_remote`).
+                // The host ends the current session with DISCONNECT before
+                // dialling again. Only the dialling client hears the
+                // refusal: the session that caused it is still up, and
+                // `notify_session` would tell every host it had ended.
+                if let Some(active) = self.active_session_remote() {
+                    tracing::warn!(
+                        destination = %remote, active = %active,
+                        "Connect request refused: another session is active"
+                    );
+                    if let Some(ref tx) = self.response_tx {
+                        let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
+                            client_id,
+                            status: "DISCONNECTED".to_string(),
+                        });
+                    }
+                    self.reply_vara(client_id, VaraResponse::Disconnected).await;
+                    return;
+                }
 
                 let caps = LinkCapabilities::default();
                 match self.session_mgr.create(local, remote.clone(), 0, caps) {
@@ -4242,6 +4291,17 @@ impl EventLoop {
             return;
         }
 
+        // COP-38: one session at a time (`active_session_remote`). While a
+        // session exists, a CONNECT_REQ, the current peer's included, gets
+        // no answer, so the caller's handshake times out.
+        if let Some(active) = self.active_session_remote() {
+            tracing::info!(
+                remote = %pdu.src, active = %active,
+                "CONNECT_REQ refused: another session is active"
+            );
+            return;
+        }
+
         let remote = pdu.src.clone();
         let caps = LinkCapabilities::default();
         match self
@@ -4277,7 +4337,8 @@ impl EventLoop {
 
     async fn handle_connect_ack_rx(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
-        if let Some(session) = self.session_mgr.find_by_remote_mut(&remote) {
+        let session_id = self.session_id_for_frame(&pdu);
+        if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
             match session.handle_connect_ack(&pdu.payload) {
                 Ok(cfm_pdu) => {
                     let notice = SessionNotice::Connected {
@@ -4308,7 +4369,8 @@ impl EventLoop {
 
     async fn handle_connect_cfm_rx(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
-        if let Some(session) = self.session_mgr.find_by_remote_mut(&remote) {
+        let session_id = self.session_id_for_frame(&pdu);
+        if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
             match session.handle_connect_cfm(&pdu.payload) {
                 Ok(()) => {
                     session.confirm_established();
@@ -4335,7 +4397,7 @@ impl EventLoop {
     async fn handle_incoming_disconnect(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
         // Find session ID first to avoid borrow issues
-        let session_id = self.session_mgr.find_by_remote(&remote).map(|s| s.id);
+        let session_id = self.session_id_for_frame(&pdu);
         if let Some(id) = session_id {
             if let Some(session) = self.session_mgr.get_mut(id) {
                 session.handle_disconnect();
@@ -4357,8 +4419,12 @@ impl EventLoop {
     /// without `DataOut` and without an ACK.
     async fn handle_session_data(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
-        let Some(session) = self.session_mgr.find_by_remote_mut(&remote) else {
-            tracing::debug!(remote = %remote, "Data from unknown remote");
+        let session_id = self.session_id_for_frame(&pdu);
+        let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) else {
+            tracing::debug!(
+                remote = %remote, dest = %pdu.dest,
+                "Data from unknown remote or not addressed to a session of ours"
+            );
             return;
         };
         if !session.is_established() {
@@ -4404,8 +4470,12 @@ impl EventLoop {
     /// window, lowers `BUFFER` by the acknowledged bytes and sends the next
     /// frame. An ACK from an unknown or unestablished peer changes nothing.
     async fn handle_session_ack(&mut self, pdu: MacPdu) {
-        let Some(session) = self.session_mgr.find_by_remote_mut(&pdu.src) else {
-            tracing::debug!(remote = %pdu.src, "Session ACK from unknown remote");
+        let session_id = self.session_id_for_frame(&pdu);
+        let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) else {
+            tracing::debug!(
+                remote = %pdu.src, dest = %pdu.dest,
+                "Session ACK from unknown remote or not addressed to a session of ours"
+            );
             return;
         };
         if !session.is_established() {
@@ -4452,8 +4522,8 @@ impl EventLoop {
     }
 
     fn handle_keepalive_rx(&mut self, pdu: MacPdu) {
-        let remote = pdu.src.clone();
-        if let Some(session) = self.session_mgr.find_by_remote_mut(&remote) {
+        let session_id = self.session_id_for_frame(&pdu);
+        if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
             session.touch();
         }
     }
@@ -11600,6 +11670,185 @@ mod tests {
             ack_in_flight(&mut event_loop).await;
             assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 0);
             assert_eq!(event_loop.buffered_tx_bytes(), 0);
+        }
+
+        /// COP-38: a frame from the session's peer that is addressed to
+        /// another station, or sent on another SSID (the peer reconnected
+        /// elsewhere and its DISCONNECT to us was lost), is not this
+        /// session's: its ACK frees nothing, its data is neither delivered
+        /// nor taken into the receive window, and its DISCONNECT ends nothing.
+        #[tokio::test]
+        async fn a_session_frame_addressed_to_another_station_changes_nothing() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            let (data_tx, mut data_rx) = mpsc::channel(64);
+            event_loop.set_response_tx(data_tx);
+            let id = seed_established(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x43; 20],
+                })
+                .await;
+            for (dest, ssid) in [("K1ABC", 0), ("VK3ABC", 3)] {
+                let frame = |frame_type: MacFrameType, payload: Vec<u8>| {
+                    MacPdu::new(
+                        frame_type,
+                        Callsign::new(dest).unwrap(),
+                        Callsign::new("W1AW").unwrap(),
+                        ssid,
+                        payload,
+                    )
+                };
+                let ack = TransportPdu::new_ack(0, 1, 0).to_bytes();
+                let data = TransportPdu::new_reliable(0, 0, 0, b"not ours".to_vec()).to_bytes();
+                event_loop
+                    .handle_mac_pdu(frame(MacFrameType::Ack, ack))
+                    .await;
+                event_loop
+                    .handle_mac_pdu(frame(MacFrameType::Data, data))
+                    .await;
+                event_loop
+                    .handle_mac_pdu(frame(MacFrameType::Disconnect, Vec::new()))
+                    .await;
+                let link = event_loop.session_link.as_ref().unwrap();
+                assert_eq!(
+                    (link.session_id, link.tx.in_flight(), link.rx.recv_base()),
+                    (id, 1, 0),
+                    "{dest}/{ssid}"
+                );
+                assert_eq!(event_loop.buffered_tx_bytes(), 20, "{dest}/{ssid}");
+                assert!(
+                    event_loop
+                        .session_mgr
+                        .get(id)
+                        .is_some_and(|s| s.is_established()),
+                    "{dest}/{ssid}"
+                );
+            }
+            assert!(drain_data_out(&mut data_rx).is_empty());
+
+            ack_in_flight(&mut event_loop).await;
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 0);
+            assert_eq!(event_loop.buffered_tx_bytes(), 0);
+        }
+
+        /// COP-38: a dial refused because a session is up is answered to the
+        /// dialling client alone. The session is still up, so the other
+        /// hosts must not hear `DISCONNECTED`.
+        #[tokio::test]
+        async fn a_refused_dial_is_answered_only_to_the_dialling_client() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            let cmd_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let data_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let cmd_addr = cmd_listener.local_addr().unwrap();
+            let mut server = VaraServer::new(cmd_addr.port(), 0);
+            station.set_vara_responses(server.response_senders());
+            let mut events = server.take_event_rx().unwrap();
+            tokio::spawn(async move {
+                let _ = server.run_with_listeners(cmd_listener, data_listener).await;
+            });
+            let mut clients = Vec::new();
+            for _ in 0..2 {
+                let (read_half, write_half) =
+                    TcpStream::connect(cmd_addr).await.unwrap().into_split();
+                let mut reader = BufReader::new(read_half);
+                assert!(read_line(&mut reader).await.starts_with("VERSION"));
+                let client_id = loop {
+                    if let Some(HostEvent::Connected { client_id }) = events.recv().await {
+                        break client_id;
+                    }
+                };
+                clients.push((client_id, reader, write_half));
+            }
+            seed_established(&mut station);
+
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: clients[0].0,
+                    source: "VK3ABC".into(),
+                    destination: "K2XYZ".into(),
+                })
+                .await;
+            let dialler = read_available_lines(&mut clients[0].1).await;
+            let other = read_available_lines(&mut clients[1].1).await;
+            assert!(
+                dialler.iter().any(|l| l.trim_end() == "DISCONNECTED"),
+                "{dialler:?}"
+            );
+            assert!(
+                other.iter().all(|l| l.trim_end() != "DISCONNECTED"),
+                "{other:?}"
+            );
+        }
+
+        /// COP-38: one session at a time. A CONNECT_REQ while a session is
+        /// established (from another station, from the same peer on another
+        /// SSID, or a repeat from the peer itself) gets no session, so its
+        /// CFM cannot rebuild the established session's link (backlog,
+        /// in-flight segment, seq); a host dial is refused with
+        /// `DISCONNECTED`.
+        #[tokio::test]
+        async fn a_second_session_is_refused_while_one_is_active() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            station.listening = true;
+            let (resp_tx, mut resp_rx) = mpsc::channel(64);
+            station.set_response_tx(resp_tx);
+            let id = seed_established(&mut station);
+            station
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x44; 20],
+                })
+                .await;
+
+            for (caller, ssid) in [("K1ABC", 0), ("W1AW", 5), ("W1AW", 0)] {
+                let mut other = coppa_protocol::session::Session::new(
+                    0,
+                    Callsign::new(caller).unwrap(),
+                    Callsign::new("VK3ABC").unwrap(),
+                    ssid,
+                    LinkCapabilities::default(),
+                );
+                station.handle_mac_pdu(other.initiate().unwrap()).await;
+                let cfm = other
+                    .handle_connect_ack(&LinkCapabilities::default().to_bytes())
+                    .unwrap();
+                station.handle_mac_pdu(cfm).await;
+                assert_eq!(
+                    station.session_mgr.active_sessions(),
+                    vec![id],
+                    "{caller}/{ssid}"
+                );
+                let link = station.session_link.as_ref().unwrap();
+                assert_eq!(
+                    (link.session_id, link.tx.in_flight()),
+                    (id, 1),
+                    "{caller}/{ssid}"
+                );
+                assert_eq!(station.buffered_tx_bytes(), 20, "{caller}/{ssid}");
+            }
+
+            while resp_rx.try_recv().is_ok() {}
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "VK3ABC".into(),
+                    destination: "K2XYZ".into(),
+                })
+                .await;
+            let statuses: Vec<String> = std::iter::from_fn(|| resp_rx.try_recv().ok())
+                .filter_map(|response| match response {
+                    coppa_host::HostResponse::StatusUpdate { status, .. } => Some(status),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(statuses, ["DISCONNECTED"]);
+            assert_eq!(station.session_mgr.active_sessions(), vec![id]);
+            assert_eq!(station.session_link.as_ref().unwrap().session_id, id);
         }
 
         /// COP-38 (D3): a session data frame is a `Reliable` `TransportPdu`

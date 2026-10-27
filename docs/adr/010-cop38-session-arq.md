@@ -33,7 +33,13 @@ by the CP-control pair.
 2. **One session link per daemon (D2).** `EventLoop::session_link` holds the
    established session's `ArqTx`/`ArqRx`, a byte backlog and a give-up
    deadline. It is rebuilt at establishment on both sides, so a new session
-   starts at seq 0, and dropped when the session ends.
+   starts at seq 0, and dropped when the session ends. Because a rebuild
+   would drop another session's backlog and in-flight segment, the daemon
+   holds one session at a time: while a session exists, every CONNECT_REQ
+   (the current peer's included) gets no answer, and a host CONNECT is
+   answered `DISCONNECTED` to the dialling client alone.
+   A session frame (data, ACK, CONNECT_ACK/CFM, DISCONNECT, KEEPALIVE)
+   belongs to a session only when its `src`, `dest` and SSID all match it.
 3. **Wire shape (D3).** See the table below. ACK fields in data frames are
    zero, so a retransmission is byte-identical to the first send.
 4. **Window 1, stop-and-wait (D4).** With one ACK per frame and a
@@ -90,7 +96,13 @@ The MAC header `version` stays 1.
   flight.
 - A lost CONNECT_CFM is still unhandled (`Session::maybe_retry_cfm` is
   unwired).
-- One session link per daemon. Session ACKs do not feed `RateLoop`.
+- One session at a time, and nothing ends a session nobody closes: an idle
+  Established session never times out (above), so a station whose peer
+  vanished refuses every caller until its host sends DISCONNECT, and a peer
+  that restarted cannot reconnect until then. A host that lost track of a
+  session must send DISCONNECT before it can dial. VARA `ABORT` does nothing,
+  so a host that gave up on a dial is refused for up to the 30 s handshake
+  timeout if it dials again. Session ACKs do not feed `RateLoop`.
 - `DataOut` is still `try_send`: a full host channel drops bytes that were
   already ACKed (COP-39).
 - A speed-level change mid-flight can leave a retransmission that no longer
