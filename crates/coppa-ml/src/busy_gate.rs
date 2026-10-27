@@ -46,12 +46,17 @@
 //! `FFT_SIZE` samples and measures every one, so a long call is judged across its
 //! whole length rather than by its first `FFT_SIZE` samples (the hold credits every
 //! sample, so every sample must also be measured). It returns the *net* change
-//! across the call.
+//! across the call. A change is reported when the call returns, even if the flip
+//! happened early in it, so the hold for the next change restarts at that report:
+//! disagreeing audio in the rest of the reporting call is not counted, which can
+//! delay the next change, in [`BusyGate::current`] as well as in the report, by up
+//! to that call's length.
 //!
 //! What a client watching the `BUSY ON`/`BUSY OFF` lines can rely on:
 //! - two consecutive transitions are separated by at least 250 ms of received audio;
 //! - a state is reported only after it has held for 250 ms, so a real occupant is
-//!   reported about 250 ms after it keys up and after it stops;
+//!   reported about 250 ms after it keys up and after it stops (later, by up to one
+//!   call's length, when the change follows one reported for a long call);
 //! - a busy pulse shorter than 250 ms is never reported.
 use crate::spectrum_sensor::SpectrumSensor;
 
@@ -98,7 +103,8 @@ pub struct BusyGate {
     /// gate's sample rate).
     hold_samples: usize,
     /// Length, in samples, of the current unbroken run of audio whose reading
-    /// disagrees with `busy`.
+    /// disagrees with `busy`, counted from no earlier than the last reported
+    /// transition.
     pending_samples: usize,
 }
 
@@ -121,7 +127,7 @@ impl BusyGate {
     /// before the call (the net change); returns `None` on every other call,
     /// including empty input, the first `CALIBRATION_BLOCKS` segments (see that
     /// constant's doc), and any call whose disagreeing audio has not yet lasted
-    /// `HOLD_SECS`.
+    /// `HOLD_SECS` since the last reported transition.
     pub fn observe(&mut self, samples: &[f32]) -> Option<bool> {
         if samples.is_empty() {
             return None;
@@ -135,7 +141,14 @@ impl BusyGate {
         for segment in samples.chunks(samples.len().div_ceil(segments)) {
             self.observe_segment(segment);
         }
-        (self.busy != before).then_some(self.busy)
+        if self.busy == before {
+            return None;
+        }
+        // The transition is reported now, at the end of the call, though the flip
+        // may have landed early in it. Restart the hold here so the next report is
+        // at least `hold_samples` after this one, not after the flip.
+        self.pending_samples = 0;
+        Some(self.busy)
     }
 
     /// Measure one segment of at most `FFT_SIZE` samples and advance the hold.
@@ -375,5 +388,47 @@ mod tests {
         }
         assert_eq!(gate.observe(&call), Some(true));
         assert!(gate.current());
+    }
+
+    /// The daemon drains its whole input ring (up to 8192 samples) in one call after
+    /// a stall, so a flip can land early in a long call while the rest of that call
+    /// already disagrees with the new state. The next transition must still be
+    /// reported at least one hold after this one was reported (when the call
+    /// returned), not one hold after the flip inside it.
+    #[test]
+    fn reported_transitions_are_one_hold_apart_across_a_long_call() {
+        let mut counter = 0u32;
+        let mut gate = BusyGate::new(48_000.0);
+        for _ in 0..10 {
+            assert_eq!(gate.observe(&quiet_block(&mut counter)), None);
+        }
+        // 11 burst blocks: 11264 disagreeing samples, short of the 12000-sample hold.
+        for _ in 0..11 {
+            assert_eq!(gate.observe(&band_limited_noise_burst(&mut counter)), None);
+        }
+        // One drain-sized call: the hold completes in its first segment, and the
+        // seven quiet segments after it already disagree with BUSY ON.
+        let mut call = band_limited_noise_burst(&mut counter);
+        for _ in 0..7 {
+            call.extend(quiet_block(&mut counter));
+        }
+        assert_eq!(gate.observe(&call), Some(true));
+
+        let mut since_report = 0;
+        let mut reported_off = false;
+        for _ in 0..40 {
+            let block = quiet_block(&mut counter);
+            since_report += block.len();
+            if gate.observe(&block) == Some(false) {
+                reported_off = true;
+                break;
+            }
+        }
+        assert!(reported_off, "the channel clearing must still be reported");
+        assert!(
+            since_report >= gate.hold_samples(),
+            "BUSY OFF reported {since_report} samples after BUSY ON, closer than the {}-sample hold",
+            gate.hold_samples()
+        );
     }
 }

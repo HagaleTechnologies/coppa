@@ -239,7 +239,11 @@ so:
 
 - two consecutive `BUSY` lines are at least 250 ms of audio apart;
 - a station that keys up is reported about 250 ms later, and its end is
-  reported about 250 ms after it stops;
+  reported about 250 ms after it stops. When coppad reads a long stretch of
+  buffered audio at once (after a stall, or while it waits to transmit) and
+  reports a change for it, the next change can be reported up to that
+  stretch's length later: at most about 170 ms, the size of coppad's input
+  buffer;
 - a burst shorter than 250 ms is never reported.
 
 Detection always runs. `[station_id] busy_hold_ms` does not change it: that
