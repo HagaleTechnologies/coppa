@@ -61,6 +61,13 @@ compatibility across these boundaries:
   or reserved gaps. Header protocol `version: 1` stays unchanged, following
   ADR-003/005. Both stations must run 0.2.0 to use levels above 7.
 
+- **COP-38 connected-session ARQ (0.3.0)** changes the payload of session
+  `Data` frames and adds session `Ack` frames, so connected-session data is
+  acknowledged and retransmitted. See `docs/adr/010-cop38-session-arq.md`
+  and the session-framing note in §11. Header protocol `version: 1` and the
+  MAC `version` stay unchanged, following ADR-003/005; there is no
+  negotiation. Both stations must run 0.3.0 to exchange session data.
+
 Two further ADRs describe additions layered on top of the same wire format
 (no further breaks): `docs/adr/007-multi-codeword-frames.md` (multi-codeword
 framing + intra-frame cross-codeword interleaving, §9 below) and
@@ -910,6 +917,19 @@ included here only because the brief's "byte/bit orders everywhere"
 requirement extends to it — `MacPdu` is Coppa's link-layer PDU, carried as
 the OFDM payload's application bytes (§5.5's "payload"), not a PHY-layer
 structure.
+
+**Session framing (COP-38, 0.3.0).** Inside an established session, a MAC
+`Data` frame's payload is a `TransportPdu` (`crates/coppa-protocol/src/transport.rs`)
+of type `Reliable`: a 7-byte header `[session_id:4 | type:4][seq][ack][bitmap:4]`
+followed by the host bytes. The transport `session_id` is 0 and ignored on
+receipt (session ids are local slot numbers), and the ACK fields are zero, so
+a retransmission is byte-identical to the first send. The receiver answers
+every such frame, duplicates included, with a MAC `Ack` frame (type 1)
+whose payload is `TransportPdu::new_ack(0, ack_num, bitmap)` from its
+`ArqRx`. The window is 1 (stop-and-wait) on both sides. A `Data` payload
+that does not parse as a `Reliable` `TransportPdu` (a pre-0.3.0 sender) is
+dropped without delivery and without an ACK. Handshake, `Disconnect`,
+`Keepalive` and `Beacon` frames are unchanged.
 
 ---
 

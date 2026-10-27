@@ -110,6 +110,10 @@ typedef struct coppa_frame_t {
   uint64_t seq;
 } coppa_frame_t;
 
+#ifdef __cplusplus
+extern "C" {
+#endif // __cplusplus
+
 /**
  * Create a new Coppa engine instance.
  *
@@ -427,5 +431,9 @@ int32_t coppa_feed_samples(struct CoppaStreamHandle *handle,
  * [`coppa_engine_create`].
  */
  void coppa_stop_stream(struct CoppaStreamHandle *handle);
+
+#ifdef __cplusplus
+}  // extern "C"
+#endif  // __cplusplus
 
 #endif  /* COPPA_H */
