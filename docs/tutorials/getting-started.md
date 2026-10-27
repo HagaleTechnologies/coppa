@@ -74,9 +74,6 @@ Requires the `cpal-backend` feature for real hardware access:
 cargo run -p coppa-cli --bin coppa --features cpal-backend -- devices
 ```
 
-<<<<<<< HEAD
-## Viewing Speed Levels and Profiles
-=======
 ## Receiving Live Audio
 
 Requires the `cpal-backend` feature:
@@ -91,8 +88,7 @@ decode. `--duration` stops after that many seconds; without it, `coppa rx` runs 
 Ctrl+C. `coppa listen` is a deprecated alias for `coppa rx` and will be removed in the
 next release.
 
-## Viewing Operating Profiles
->>>>>>> 65d1a3bf78ccfc3b80ae90042ace16b14541aca3
+## Viewing Speed Levels and Profiles
 
 ```bash
 # List every speed level and named profile

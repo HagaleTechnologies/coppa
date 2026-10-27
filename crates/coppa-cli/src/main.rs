@@ -30,7 +30,6 @@ struct Cli {
     command: Option<Commands>,
 }
 
-<<<<<<< HEAD
 /// Flags shared by `coppa profiles` and its deprecated alias `coppa config`, so
 /// the two can never disagree about what they accept.
 #[derive(clap::Args, Debug, Default, PartialEq, Eq)]
@@ -46,7 +45,7 @@ struct ProfilesArgs {
 /// Printed on stderr whenever the deprecated `coppa config` alias runs, even
 /// under `--quiet`: a script still using it must hear that it is going away.
 const CONFIG_DEPRECATED: &str = "WARNING: 'coppa config' is deprecated and will be removed in the next release. Use 'coppa profiles' instead; it takes the same flags.";
-=======
+
 /// Flags for `coppa rx`, shared with its deprecated hidden alias
 /// `coppa listen` (COP-56) so the two cannot drift apart.
 #[derive(clap::Args, Debug, Default, PartialEq, Eq)]
@@ -92,7 +91,6 @@ impl RxArgs {
 const LISTEN_DEPRECATED: &str = "WARNING: 'coppa listen' is deprecated and will be \
     removed in the next release. Use 'coppa rx' instead; it takes the same flags, \
     and --raw prints hex.";
->>>>>>> 65d1a3bf78ccfc3b80ae90042ace16b14541aca3
 
 #[derive(Subcommand)]
 enum Commands {
@@ -313,50 +311,16 @@ fn main() -> Result<()> {
             band.as_deref(),
             verbosity,
         )?,
-<<<<<<< HEAD
-        Some(Commands::Rx {
-            input,
-            profile,
-            raw,
-            hex,
-            device,
-        }) => cmd_rx(
-            input.as_deref(),
-            profile.as_deref(),
-            raw,
-            hex,
-            device.as_deref(),
-            verbosity,
-        )?,
+        Some(Commands::Rx(args)) => cmd_rx(&args, verbosity)?,
         Some(Commands::Loopback {
             message,
             profile,
             level,
         }) => cmd_loopback(&message, profile.as_deref(), level, verbosity)?,
-        Some(Commands::Listen {
-            duration,
-            profile,
-            callsign,
-            raw,
-            device,
-        }) => cmd_listen(
-            duration,
-            profile.as_deref(),
-            callsign.as_deref(),
-            raw,
-            device.as_deref(),
-            verbosity,
-        )?,
-=======
-        Some(Commands::Rx(args)) => cmd_rx(&args, verbosity)?,
-        Some(Commands::Loopback { message, profile }) => {
-            cmd_loopback(&message, profile.as_deref(), verbosity)?
-        }
         Some(Commands::Listen(args)) => {
             eprintln!("{LISTEN_DEPRECATED}");
             cmd_rx(&args, verbosity)?
         }
->>>>>>> 65d1a3bf78ccfc3b80ae90042ace16b14541aca3
         Some(Commands::Tune {
             seconds,
             single,
