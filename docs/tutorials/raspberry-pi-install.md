@@ -245,12 +245,13 @@ rigctld if a future kernel drops it. coppad must be built with the
 
 ```toml
 [radio]
-ptt_method = "serial:/dev/serial/by-id/usb-...-if00-port0:rts"
+ptt_method = "serial:/dev/ttyUSB0:rts"
 ```
 
-Use the port's `/dev/serial/by-id/...` path (`ls /dev/serial/by-id/`) rather
-than `/dev/ttyUSB0`: the by-id path stays the same when USB devices are
-re-enumerated. The `coppa` user needs the `dialout` group, and coppad must be
+Use `dtr` instead of `rts` if your interface keys on DTR. Prefer the port's
+`/dev/serial/by-id/...` path (`ls /dev/serial/by-id/`) to `/dev/ttyUSB0`, for
+example `serial:/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A1B2C3-if00-port0:rts`:
+the by-id path stays the same when USB devices are re-enumerated. The `coppa` user needs the `dialout` group, and coppad must be
 built with `serial-ptt`.
 
 There is no PTT guardian for serial PTT: if coppad crashes while keyed,
@@ -303,9 +304,12 @@ sudo systemctl restart coppad
 
 - **Failure:** `Restart=on-failure` with `RestartSec=10` and
   `StartLimitIntervalSec=0`. If coppad exits with an error (for example, the
-  USB sound card is unplugged), systemd starts it again every 10 s and never
-  gives up, so it comes back by itself when the card returns. The cost is
-  that a config error logs one failure every 10 s until you fix it.
+  USB sound card is missing when it starts), systemd starts it again every
+  10 s and never gives up, so it comes up by itself once the card appears.
+  The cost is that a config error logs one failure every 10 s until you fix
+  it. Unplugging the card while coppad is running does **not** make it exit:
+  it keeps running without audio (and may log `RX audio input is silent`), so
+  run `sudo systemctl restart coppad` after plugging the card back in.
 - **Stop:** `systemctl stop` sends SIGTERM to coppad, which releases PTT, logs
   `Releasing PTT before shutdown`, and exits.
 - **A stop that hangs:** after `TimeoutStopSec=20`, systemd SIGKILLs coppad.
@@ -317,7 +321,11 @@ sudo systemctl restart coppad
   the guardian does and does not cover.
 - **A quick restart:** a guardian from the previous run can still be exiting
   when the new coppad starts. systemd then logs `Found left-over process ...
-  Ignoring.`, which is expected and harmless.
+  Ignoring.`, which is expected. With GPIO PTT, a guardian that is releasing
+  the pin also unexports it, which could pull the pin away from a coppad that
+  has just started. So if a stop had to end in a SIGKILL while transmitting,
+  use `sudo systemctl stop coppad`, wait a few seconds, then
+  `sudo systemctl start coppad`, rather than `systemctl restart`.
 - **Hardening:** the unit sets `NoNewPrivileges`, `ProtectSystem=strict`,
   `ProtectHome`, `PrivateTmp`, `ProtectControlGroups`, `ProtectKernelModules`,
   `ProtectKernelLogs`, `ProtectHostname` and `RestrictSUIDSGID`. It

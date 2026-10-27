@@ -6,8 +6,9 @@
 //! The directive checks each close a specific failure found while writing the
 //! unit; every assertion message says which one.
 //!
-//! Repo files are read at runtime (never `include_str!`), so the crate stays
-//! packageable without `contrib/` or `docs/`.
+//! Repo files are read at runtime (never `include_str!`), so the crate still
+//! builds when packaged without `contrib/` or `docs/`; these tests need a
+//! full checkout to run, like `config.rs`'s example-config test.
 
 use std::collections::BTreeSet;
 use std::fs::File;
