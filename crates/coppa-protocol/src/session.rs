@@ -154,6 +154,11 @@ pub struct Session {
     pub keepalive_interval: Duration,
     /// Session timeout (disconnect if no activity for this long).
     pub session_timeout: Duration,
+    /// How long a `Disconnecting` session may go without activity before it
+    /// times out. coppad touches a draining session each time one of its
+    /// queued chunks keys (COP-43), so this bounds a stalled drain, not a
+    /// long one.
+    pub disconnect_timeout: Duration,
     /// Number of CONNECT_CFM retransmissions sent (initiator side).
     pub cfm_retries: u8,
     /// Cached CONNECT_CFM PDU for retransmission (initiator side).
@@ -203,6 +208,7 @@ impl Session {
             last_activity: now,
             keepalive_interval: Duration::from_secs(DEFAULT_KEEPALIVE_SECS),
             session_timeout: Duration::from_secs(DEFAULT_SESSION_TIMEOUT_SECS),
+            disconnect_timeout: Duration::from_secs(DEFAULT_DISCONNECT_TIMEOUT_SECS),
             cfm_retries: 0,
             last_cfm: None,
         }
@@ -419,7 +425,7 @@ impl Session {
     /// Check if the session has timed out.
     ///
     /// Uses shorter timeouts for transient states:
-    /// - Disconnecting: `DEFAULT_DISCONNECT_TIMEOUT_SECS` (10s)
+    /// - Disconnecting: `disconnect_timeout` (`DEFAULT_DISCONNECT_TIMEOUT_SECS`, 10s)
     /// - Connecting/Accepting (handshake): `HANDSHAKE_TIMEOUT_SECS` (30s)
     /// - Established: full `session_timeout` (120s)
     pub fn is_timed_out(&self) -> bool {
@@ -427,8 +433,7 @@ impl Session {
             return false;
         }
         if self.state == SessionState::Disconnecting {
-            return self.last_activity.elapsed()
-                >= Duration::from_secs(DEFAULT_DISCONNECT_TIMEOUT_SECS);
+            return self.last_activity.elapsed() >= self.disconnect_timeout;
         }
         // Handshake states use a shorter timeout to avoid lingering half-open sessions
         if self.state == SessionState::Connecting || self.state == SessionState::Accepting {
@@ -740,6 +745,27 @@ mod tests {
         let disc_pdu = s.disconnect().unwrap();
         assert_eq!(disc_pdu.frame_type, MacFrameType::Disconnect);
         assert_eq!(s.state, SessionState::Disconnecting);
+    }
+
+    #[test]
+    fn test_disconnecting_session_times_out_after_disconnect_timeout() {
+        let mut s = Session::new(
+            0,
+            make_callsign("AA1AA"),
+            make_callsign("BB2BB"),
+            0,
+            LinkCapabilities::default(),
+        );
+        s.initiate().unwrap();
+        s.disconnect().unwrap();
+        assert_eq!(
+            s.disconnect_timeout,
+            Duration::from_secs(DEFAULT_DISCONNECT_TIMEOUT_SECS)
+        );
+        assert!(!s.is_timed_out(), "the default 10 s has not elapsed");
+
+        s.disconnect_timeout = Duration::ZERO;
+        assert!(s.is_timed_out());
     }
 
     #[test]

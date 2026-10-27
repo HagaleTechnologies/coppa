@@ -86,6 +86,18 @@ struct SessionTxChunk {
     host_len: usize,
 }
 
+/// A host `DISCONNECT` waiting for its session's queued chunks to play
+/// (COP-43). The session sits in `SessionState::Disconnecting` meanwhile;
+/// `finish_drained_disconnect` sends the DISCONNECT frame once the queue is
+/// drained and PTT has released.
+struct PendingDisconnect {
+    session_id: u8,
+    /// The VARA client that asked; it gets the `DISCONNECTED`.
+    client_id: u32,
+    /// The DISCONNECT `MacPdu` bytes, built when the host asked.
+    pdu_bytes: Vec<u8>,
+}
+
 /// The reply a VARA command-port client gets for one command, decided before
 /// the command takes effect. `WRONG` is only for lines coppa does not
 /// recognise or cannot apply: Pat's dial waits only for
@@ -411,6 +423,9 @@ pub struct EventLoop {
     /// `host_len` terms count toward `BUFFER` telemetry; see
     /// `buffered_tx_bytes`.
     session_tx_queue: VecDeque<SessionTxChunk>,
+    /// A host `DISCONNECT` waiting for `session_tx_queue` to drain (COP-43).
+    /// See `finish_drained_disconnect`.
+    pending_disconnect: Option<PendingDisconnect>,
     /// Host bytes waiting for ARQ window space (COP-41, D5): an event too
     /// large for the 8-segment window is held here -- never dropped -- and
     /// `pump_arq_backlog` moves it into window segments as ACKs free space.
@@ -663,6 +678,7 @@ impl EventLoop {
             vara_responses: None,
             tx_queue: VecDeque::new(),
             session_tx_queue: VecDeque::new(),
+            pending_disconnect: None,
             arq_tx_backlog: VecDeque::new(),
             tx_on_air_bytes: 0,
             last_reported_buffer: 0,
@@ -1235,6 +1251,16 @@ impl EventLoop {
     async fn reap_timed_out_sessions(&mut self) {
         let removed = self.session_mgr.cleanup_timed_out();
         for id in removed {
+            // COP-43: a drain that keyed nothing for `disconnect_timeout`
+            // ends the way a drained one does, minus the unsent chunks.
+            if let Some(pending) = self.pending_disconnect.take_if(|p| p.session_id == id) {
+                tracing::warn!(
+                    session_id = id,
+                    "DISCONNECT drain made no progress; discarding the rest and disconnecting"
+                );
+                self.end_local_disconnect(pending).await;
+                continue;
+            }
             tracing::warn!(session_id = id, "Session timed out");
             self.discard_session_tx(id).await;
             self.notify_session(0, SessionNotice::Disconnected).await;
@@ -1460,6 +1486,14 @@ impl EventLoop {
                         return;
                     }
                     self.tx_frame_count += 1;
+                    // COP-43: a draining session's drain is progress, so its
+                    // `disconnect_timeout` bounds a stall, not a long queue.
+                    // Established sessions keep their timeout semantics.
+                    if let Some(session) = self.session_mgr.get_mut(chunk.session_id) {
+                        if session.state == SessionState::Disconnecting {
+                            session.touch();
+                        }
+                    }
                     tracing::debug!(
                         frame = self.tx_frame_count,
                         max = self.max_frames_per_turn,
@@ -1492,6 +1526,42 @@ impl EventLoop {
             );
             self.report_buffer().await;
         }
+    }
+
+    /// COP-43: end a pending host `DISCONNECT` once its session's chunks
+    /// have all left `session_tx_queue` and the last one's PTT release has
+    /// run (`!is_transmitting`), so `BUFFER 0` comes before `DISCONNECTED`.
+    /// A no-op while anything of that session is still queued or keyed.
+    async fn finish_drained_disconnect(&mut self) {
+        let drained = !self.is_transmitting
+            && self.pending_disconnect.as_ref().is_some_and(|p| {
+                !self
+                    .session_tx_queue
+                    .iter()
+                    .any(|chunk| chunk.session_id == p.session_id)
+            });
+        if let Some(pending) = self.pending_disconnect.take_if(|_| drained) {
+            self.end_local_disconnect(pending).await;
+        }
+    }
+
+    /// COP-43: send a local DISCONNECT's frame, remove the session and tell
+    /// the requesting client `DISCONNECTED`. Called once the drain finishes,
+    /// or when it stalls (the reaper), in which case the unsent rest is
+    /// dropped first. The record is already taken, so re-entry through
+    /// `transmit_samples` cannot send the frame twice.
+    async fn end_local_disconnect(&mut self, pending: PendingDisconnect) {
+        self.discard_session_tx(pending.session_id).await; // A no-op after a full drain.
+        match self.engine.encode_bytes(&pending.pdu_bytes) {
+            // Boxed: `handle_ptt_change` -> `finish_drained_disconnect` ->
+            // `transmit_samples` -> `handle_ptt_change` is the same async
+            // call cycle `drain_session_tx_queue` documents.
+            Ok(samples) => Box::pin(self.transmit_samples(&samples)).await,
+            Err(e) => tracing::warn!(error = %e, "Failed to encode DISCONNECT"),
+        }
+        self.session_mgr.remove(pending.session_id);
+        self.notify_session(pending.client_id, SessionNotice::Disconnected)
+            .await;
     }
 
     /// COP-41 (D4/D5): move `arq_tx_backlog` bytes into ARQ window segments
@@ -1644,6 +1714,9 @@ impl EventLoop {
                     // E6: Check for ARQ retransmits
                     self.check_arq_retransmits().await;
                     self.retry_held_tx_drain().await;
+                    // COP-43: covers a PTT release that ran no drain (e.g.
+                    // `force_release_ptt`).
+                    self.finish_drained_disconnect().await;
                 }
                 _ = beacon_poll.tick() => {
                     self.maybe_send_beacon().await;
@@ -1985,7 +2058,9 @@ impl EventLoop {
                 tracing::info!(client_id, "Disconnect request");
                 self.reply_vara(client_id, VaraResponse::Ok).await;
 
-                // Find first active established session
+                // Find the first active session. One already `Disconnecting`
+                // is skipped, so a repeated DISCONNECT changes nothing: the
+                // host gets `OK` now and one `DISCONNECTED` later (COP-43).
                 let session_id = self
                     .session_mgr
                     .active_sessions()
@@ -1993,34 +2068,46 @@ impl EventLoop {
                     .find(|&&id| {
                         self.session_mgr
                             .get(id)
-                            .map(|s| s.state != SessionState::Idle)
+                            .map(|s| {
+                                !matches!(s.state, SessionState::Idle | SessionState::Disconnecting)
+                            })
                             .unwrap_or(false)
                     })
                     .copied();
 
                 if let Some(id) = session_id {
-                    // The session's unsent chunks end with it; none may
-                    // play after the host is told DISCONNECTED.
-                    self.discard_session_tx(id).await;
-                    if let Some(session) = self.session_mgr.get_mut(id) {
-                        match session.disconnect() {
-                            Ok(disc_pdu) => {
-                                let pdu_bytes = disc_pdu.to_bytes();
-                                match self.engine.encode_bytes(&pdu_bytes) {
-                                    Ok(samples) => self.transmit_samples(&samples).await,
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "Failed to encode DISCONNECT")
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "Failed to disconnect session");
+                    let disconnect = self.session_mgr.get_mut(id).map(|s| s.disconnect());
+                    match disconnect {
+                        Some(Ok(disc_pdu)) => {
+                            // COP-43: VARA's `DISCONNECT` disconnects "once
+                            // the TX buffer is empty", so the session's
+                            // queued chunks play first. It now sits in
+                            // `Disconnecting`, which stops new host data and
+                            // keepalives for it; `finish_drained_disconnect`
+                            // sends the frame once the drain finishes, and
+                            // the reaper ends a drain that stops moving.
+                            self.pending_disconnect = Some(PendingDisconnect {
+                                session_id: id,
+                                client_id,
+                                pdu_bytes: disc_pdu.to_bytes(),
+                            });
+                            self.finish_drained_disconnect().await;
+                            if self.pending_disconnect.is_some() {
+                                tracing::info!(
+                                    session_id = id,
+                                    "DISCONNECT waits for the session's queued data to play"
+                                );
                             }
                         }
+                        Some(Err(e)) => {
+                            tracing::warn!(error = %e, "Failed to disconnect session");
+                            self.discard_session_tx(id).await;
+                            self.session_mgr.remove(id);
+                            self.notify_session(client_id, SessionNotice::Disconnected)
+                                .await;
+                        }
+                        None => {}
                     }
-                    self.session_mgr.remove(id);
-                    self.notify_session(client_id, SessionNotice::Disconnected)
-                        .await;
                 } else {
                     tracing::debug!("Disconnect request but no active session");
                 }
@@ -2657,6 +2744,7 @@ impl EventLoop {
                 }
                 self.try_drain_tx_queue().await;
                 self.drain_session_tx_queue().await;
+                self.finish_drained_disconnect().await;
                 return;
             }
         }
@@ -4117,6 +4205,8 @@ impl EventLoop {
                 session.handle_disconnect();
             }
             self.session_mgr.remove(id);
+            // The peer has left: a pending local DISCONNECT sends no frame.
+            self.pending_disconnect.take_if(|p| p.session_id == id);
             tracing::info!(remote = %remote, "Session disconnected by remote");
             self.discard_session_tx(id).await;
             self.notify_session(0, SessionNotice::Disconnected).await;
@@ -4163,6 +4253,7 @@ impl EventLoop {
             // chunks the same way `try_drain_tx_queue` paces raw/ARQ ones).
             self.try_drain_tx_queue().await;
             self.drain_session_tx_queue().await;
+            self.finish_drained_disconnect().await;
         }
     }
 
@@ -10998,19 +11089,20 @@ mod tests {
         }
 
         /// A session's unsent chunks die with the session (COP-41 review):
-        /// after a local DISCONNECT, a remote DISCONNECT, or a timeout, the
-        /// queue holds none of its chunks, `BUFFER` stops counting them,
-        /// and the next PTT release keys nothing -- before this, the queue
-        /// kept transmitting the dead session's data on every release.
+        /// after a remote DISCONNECT or a timeout, the queue holds none of
+        /// its chunks, `BUFFER` stops counting them, and the next PTT
+        /// release keys nothing -- before this, the queue kept transmitting
+        /// the dead session's data on every release. A local DISCONNECT
+        /// drains them first instead (COP-43, see
+        /// `local_disconnect_drains_queued_chunks_before_the_disconnect_frame`).
         #[tokio::test]
         async fn ended_session_discards_its_unsent_chunks() {
             #[derive(Debug, Clone, Copy)]
             enum End {
-                LocalDisconnect,
                 RemoteDisconnect,
                 Timeout,
             }
-            for end in [End::LocalDisconnect, End::RemoteDisconnect, End::Timeout] {
+            for end in [End::RemoteDisconnect, End::Timeout] {
                 let mut event_loop = EventLoop::new(session_config()).unwrap();
                 let (producer, mut consumer) = coppa_audio::audio_ring(4_000_000);
                 event_loop.set_audio_out(producer);
@@ -11027,11 +11119,6 @@ mod tests {
                 assert_eq!(event_loop.buffered_tx_bytes(), 1000, "{end:?}");
 
                 match end {
-                    End::LocalDisconnect => {
-                        event_loop
-                            .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
-                            .await;
-                    }
                     End::RemoteDisconnect => {
                         let disc = MacPdu::new(
                             MacFrameType::Disconnect,
@@ -11054,8 +11141,8 @@ mod tests {
                 assert!(event_loop.session_tx_queue.is_empty(), "{end:?}");
                 assert_eq!(event_loop.buffered_tx_bytes(), 0, "{end:?}");
 
-                // Discard whatever the end itself keyed (the local
-                // DISCONNECT frame), then release: no stale chunk may play.
+                // Discard whatever the end itself keyed, then release: no
+                // stale chunk may play.
                 let mut buf = vec![0.0f32; 4_000_000];
                 while consumer.read(&mut buf) > 0 {}
                 let frames_before = event_loop.tx_frame_count;
@@ -11066,6 +11153,212 @@ mod tests {
                     "{end:?}: the release must not transmit the ended session's data"
                 );
                 assert_eq!(event_loop.tx_frame_count, frames_before, "{end:?}");
+            }
+        }
+
+        /// The frame types `CoppaCore` decodes from one keyed interval's
+        /// audio, in order. HF_STANDARD, the daemon's default profile:
+        /// `CoppaCore::new()` would decode only a station-ID beacon.
+        fn decoded_frame_types(audio: &[f32]) -> Vec<MacFrameType> {
+            let mut decoder = coppa_engine::CoppaCore::from_profile(
+                coppa_engine::profiles::get_profile("HF_STANDARD").unwrap(),
+            );
+            decoder
+                .push_samples(&with_lead_and_trail(audio))
+                .iter()
+                .filter_map(|frame| frame.payload.as_deref().ok())
+                .filter_map(|payload| MacPdu::from_bytes(payload).ok())
+                .map(|pdu| pdu.frame_type)
+                .collect()
+        }
+
+        /// `seed_established` plus a 300-byte host write held unsent (more
+        /// than one chunk), with a mock VARA client on the given ports.
+        async fn draining_station(
+            cmd_port: u16,
+            data_port: u16,
+        ) -> (
+            EventLoop,
+            coppa_audio::AudioRingConsumer,
+            BufReader<OwnedReadHalf>,
+            OwnedWriteHalf,
+            u8,
+        ) {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            let (producer, consumer) = coppa_audio::audio_ring(4_000_000);
+            station.set_audio_out(producer);
+            let (reader, writer) =
+                connect_mock_vara_client(&mut station, cmd_port, data_port).await;
+            let id = seed_established(&mut station);
+            // Hold the queue, as if a frame were on the air.
+            station.is_transmitting = true;
+            station
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: (0..300).map(|i| (i % 251) as u8).collect(),
+                })
+                .await;
+            assert!(station.session_tx_queue.len() > 1);
+            assert_eq!(station.buffered_tx_bytes(), 300);
+            (station, consumer, reader, writer, id)
+        }
+
+        /// COP-43: a local DISCONNECT sends what the host already queued
+        /// first ("once the TX buffer is empty", as VARA documents it), one
+        /// chunk per keyed interval, then keys the DISCONNECT frame in its
+        /// own interval and pushes one `DISCONNECTED`, after `BUFFER 0`. A
+        /// repeated DISCONNECT changes nothing.
+        #[tokio::test]
+        async fn local_disconnect_drains_queued_chunks_before_the_disconnect_frame() {
+            let (mut station, mut consumer, mut reader, _writer, id) =
+                draining_station(19510, 19511).await;
+            let chunks = station.session_tx_queue.len();
+
+            for _ in 0..2 {
+                station
+                    .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+                    .await;
+            }
+            assert_eq!(
+                station.session_mgr.get(id).map(|s| s.state),
+                Some(SessionState::Disconnecting),
+                "the session must wait for its queued data"
+            );
+            assert_eq!(station.session_tx_queue.len(), chunks);
+            assert_eq!(station.buffered_tx_bytes(), 300);
+            station.flush_pending_audio_out();
+            let mut buf = vec![0.0f32; 4_000_000];
+            assert_eq!(consumer.read(&mut buf), 0, "nothing may key yet");
+
+            let frames_before = station.tx_frame_count;
+            let mut last_interval = Vec::new();
+            for _ in 0..=chunks {
+                if station.session_mgr.get(id).is_none() {
+                    break;
+                }
+                station.handle_ptt_change(false).await;
+                station.flush_pending_audio_out();
+                let n = consumer.read(&mut buf);
+                if n > 0 {
+                    last_interval = buf[..n].to_vec();
+                }
+            }
+            assert!(
+                station.session_mgr.get(id).is_none(),
+                "the drained session must end"
+            );
+            assert!(station.pending_disconnect.is_none());
+            assert_eq!(
+                station.tx_frame_count - frames_before,
+                chunks,
+                "every queued chunk must play"
+            );
+            assert_eq!(
+                decoded_frame_types(&last_interval).last(),
+                Some(&MacFrameType::Disconnect),
+                "the last keyed interval must carry the DISCONNECT frame"
+            );
+
+            let lines: Vec<String> = read_available_lines(&mut reader)
+                .await
+                .iter()
+                .map(|line| line.trim_end().to_string())
+                .collect();
+            let disconnected: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| line.as_str() == "DISCONNECTED")
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(disconnected.len(), 1, "{lines:?}");
+            let last_buffer_zero = lines
+                .iter()
+                .rposition(|line| line.as_str() == "BUFFER 0")
+                .unwrap_or_else(|| panic!("the drain must reach BUFFER 0: {lines:?}"));
+            assert!(
+                last_buffer_zero < disconnected[0],
+                "DISCONNECTED must follow BUFFER 0: {lines:?}"
+            );
+        }
+
+        /// COP-43: a pending DISCONNECT ends exactly once when its drain
+        /// stalls for `disconnect_timeout` (the rest is dropped and the
+        /// DISCONNECT frame still keys) or the peer disconnects first (no
+        /// frame to a peer that has left). Either way the next PTT release
+        /// keys nothing and the host hears one `DISCONNECTED`.
+        #[tokio::test]
+        async fn a_pending_disconnect_ends_once_on_stall_or_remote_disconnect() {
+            #[derive(Debug, Clone, Copy)]
+            enum End {
+                Stall,
+                Remote,
+            }
+            for (end, cmd_port, data_port) in
+                [(End::Stall, 19512, 19513), (End::Remote, 19514, 19515)]
+            {
+                let (mut station, mut consumer, mut reader, _writer, id) =
+                    draining_station(cmd_port, data_port).await;
+                station
+                    .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+                    .await;
+                assert!(station.pending_disconnect.is_some(), "{end:?}");
+
+                match end {
+                    End::Stall => {
+                        // A zero timeout, not a back-dated `Instant`: on
+                        // Windows `Instant` cannot go back past boot.
+                        station.session_mgr.get_mut(id).unwrap().disconnect_timeout =
+                            Duration::ZERO;
+                        station.reap_timed_out_sessions().await;
+                    }
+                    End::Remote => {
+                        let disc = MacPdu::new(
+                            MacFrameType::Disconnect,
+                            Callsign::new("VK3ABC").unwrap(),
+                            Callsign::new("W1AW").unwrap(),
+                            0,
+                            Vec::new(),
+                        );
+                        station.handle_incoming_disconnect(disc).await;
+                    }
+                }
+                assert!(station.pending_disconnect.is_none(), "{end:?}");
+                assert!(station.session_mgr.get(id).is_none(), "{end:?}");
+                assert!(station.session_tx_queue.is_empty(), "{end:?}");
+                assert_eq!(station.buffered_tx_bytes(), 0, "{end:?}");
+
+                station.flush_pending_audio_out();
+                let mut buf = vec![0.0f32; 4_000_000];
+                let n = consumer.read(&mut buf);
+                let disconnect_frames = decoded_frame_types(&buf[..n])
+                    .into_iter()
+                    .filter(|frame_type| *frame_type == MacFrameType::Disconnect)
+                    .count();
+                let expected = match end {
+                    End::Stall => 1,
+                    End::Remote => 0,
+                };
+                assert_eq!(disconnect_frames, expected, "{end:?}");
+
+                let frames_before = station.tx_frame_count;
+                station.handle_ptt_change(false).await;
+                station.flush_pending_audio_out();
+                assert_eq!(
+                    consumer.read(&mut buf),
+                    0,
+                    "{end:?}: the release must key nothing"
+                );
+                assert_eq!(station.tx_frame_count, frames_before, "{end:?}");
+
+                let lines = read_available_lines(&mut reader).await;
+                assert_eq!(
+                    lines
+                        .iter()
+                        .filter(|line| line.trim_end() == "DISCONNECTED")
+                        .count(),
+                    1,
+                    "{end:?}: {lines:?}"
+                );
             }
         }
 

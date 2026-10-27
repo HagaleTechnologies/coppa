@@ -230,6 +230,25 @@ other station's ACK can still collide with that next frame. Sender-side turn
 discipline is a separate follow-up. The hardware acceptance test for this
 behaviour is `docs/testing/cable-loop-turnaround.md`.
 
+## Ending a session (DISCONNECT)
+
+A host `DISCONNECT` gets `OK` at once. coppad then sends the data the host
+already queued for the session, one frame per keyed interval, and only after
+that keys the DISCONNECT frame on its own. The host sees `BUFFER` fall to
+`BUFFER 0`, then one `DISCONNECTED`. With nothing queued, `DISCONNECTED`
+follows at once, as before.
+
+- A repeated `DISCONNECT` changes nothing: the host still gets one
+  `DISCONNECTED`.
+- If no queued frame keys for 10 s, for example because the frequency gate
+  holds wideband TX or there is no valid callsign, coppad drops the rest,
+  sends the DISCONNECT frame anyway and pushes `DISCONNECTED`. A long queue
+  that keeps moving drains in full, so allow for its airtime: at levels 1-2
+  each frame is about 1.4 s on air.
+- Host data written after `DISCONNECT` is not sent on that session.
+- `ABORT` does not yet tear the link down (COP-42).
+- A remote DISCONNECT or a session timeout still drops unsent data at once.
+
 ## Host clients that stop reading
 
 coppad queues every command-port line for each connected host. If a host
