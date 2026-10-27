@@ -16,7 +16,7 @@ Open-source ham radio digital communications system written in Rust.
 | ARQ and protocol stack | Implemented, opt-in ARQ | Selective-repeat ARQ, session management and optional Huffman + LZ4 compression; daemon ARQ defaults off |
 | CLI | Implemented | Loopback and WAV transmit/receive; live audio requires `cpal-backend` |
 | Daemon event loop | Implemented | Processes audio and host events; live audio requires `cpal-backend` |
-| VARA-style TCP interface | Implemented, opt-in | Control/data ports default to 8300/8301; server disabled by default; not RF-compatible with VARA |
+| VARA-style TCP interface | Implemented, opt-in | Control/data ports default to 8300/8301; server disabled by default; not RF-compatible with VARA; verified with Pat (Winlink) — see [docs/PAT.md](docs/PAT.md) |
 | C FFI | Implemented | Shared/static library with one-shot encode/decode and streaming decode |
 | Operating profiles | Implemented | 48 kHz OFDM profiles with runtime speed-level selection within the configured band |
 | Link adaptation | Implemented, limited calibration | Measurement-driven speed selection and ACK-driven RateLoop with ARQ enabled; no model inference; performance targets remain unmet, see [BENCHMARKS.md](BENCHMARKS.md) |
