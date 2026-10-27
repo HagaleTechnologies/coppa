@@ -256,7 +256,10 @@ pub struct EngineSection {
     /// validation beyond being a plain string -- this is an operator-supplied
     /// field, not a parsed/validated grid square.
     pub grid: Option<String>,
-    /// Enable ARQ (Automatic Repeat reQuest) transport layer.
+    /// Enable selective-repeat ARQ for sessionless traffic (raw data-port or
+    /// WebSocket bytes sent with `[host] sessionless_tx_enabled`). Data inside a
+    /// connected session is always acknowledged and retransmitted (COP-38),
+    /// whatever this is set to.
     pub arq_enabled: bool,
     /// Frames between `coppa_ml::RateLoop` active overshoot probes (see
     /// `RateLoop::with_probing`). `0` (the default) disables probing entirely --
