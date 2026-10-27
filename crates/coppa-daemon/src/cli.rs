@@ -51,6 +51,21 @@ pub struct Cli {
         conflicts_with_all = ["config_path", "config", "check", "print_default_config"]
     )]
     pub tnc: bool,
+
+    // COP-31: internal. The daemon re-spawns itself with this flag to run the
+    // PTT guardian (see `ptt_guardian`); hidden from `--help`. Plain comments,
+    // not doc comments, so nothing leaks into the help text.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "PTT_METHOD",
+        conflicts_with_all = ["config_path", "config", "check", "print_default_config", "tnc"]
+    )]
+    pub ptt_guardian: Option<String>,
+
+    // COP-31: internal. The rigctld address the guardian releases PTT through.
+    #[arg(long, hide = true, value_name = "ADDR", requires = "ptt_guardian")]
+    pub guardian_rigctld_address: Option<String>,
 }
 
 // Variants carry no doc comments so `--help` keeps the possible values inline.
@@ -97,6 +112,12 @@ pub enum Mode {
     Tnc,
     /// Run the daemon.
     Run(ConfigSource),
+    /// Internal (COP-31): watch a running daemon's PTT reports on stdin and
+    /// release PTT if it exits keyed.
+    PttGuardian {
+        ptt_method: String,
+        rigctld_address: String,
+    },
 }
 
 impl Cli {
@@ -110,7 +131,15 @@ impl Cli {
 
     /// Select the mode. Clap has already rejected conflicting combinations.
     pub fn mode(&self) -> Mode {
-        if self.print_default_config {
+        if let Some(ptt_method) = &self.ptt_guardian {
+            Mode::PttGuardian {
+                ptt_method: ptt_method.clone(),
+                rigctld_address: self
+                    .guardian_rigctld_address
+                    .clone()
+                    .unwrap_or_else(|| crate::config::RadioConfig::default().rigctld_address),
+            }
+        } else if self.print_default_config {
             Mode::PrintDefaultConfig
         } else if self.check {
             Mode::Check(self.config_source())
@@ -211,6 +240,51 @@ mod tests {
         );
         assert_eq!(mode(&["--tnc"]), Mode::Tnc);
         assert_eq!(mode(&["--tnc", "--log-level", "warn"]), Mode::Tnc);
+    }
+
+    #[test]
+    fn ptt_guardian_mode_parses() {
+        assert_eq!(
+            mode(&[
+                "--ptt-guardian",
+                "rigctld",
+                "--guardian-rigctld-address",
+                "127.0.0.1:1"
+            ]),
+            Mode::PttGuardian {
+                ptt_method: "rigctld".to_string(),
+                rigctld_address: "127.0.0.1:1".to_string(),
+            }
+        );
+        assert_eq!(
+            mode(&["--ptt-guardian", "gpio:17", "--log-level", "debug"]),
+            Mode::PttGuardian {
+                ptt_method: "gpio:17".to_string(),
+                rigctld_address: crate::config::RadioConfig::default().rigctld_address,
+            },
+            "the address falls back to the [radio] default"
+        );
+    }
+
+    #[test]
+    fn ptt_guardian_conflicts_with_run_modes() {
+        for args in [
+            &["--ptt-guardian", "rigctld", "--config", "station.toml"][..],
+            &["--ptt-guardian", "rigctld", "station.toml"],
+            &["--ptt-guardian", "rigctld", "--check"],
+            &["--ptt-guardian", "rigctld", "--tnc"],
+            &["--ptt-guardian", "rigctld", "--print-default-config"],
+        ] {
+            assert_eq!(error_kind(args), ErrorKind::ArgumentConflict, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn guardian_address_requires_guardian_mode() {
+        assert_eq!(
+            error_kind(&["--guardian-rigctld-address", "127.0.0.1:1"]),
+            ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]

@@ -19,6 +19,8 @@ pub const HF_MAX_SPEED_LEVEL: u8 = 8;
 pub enum OfdmBand {
     /// Historical rule: levels 1-4 HF, >= 5 VHF. The `EngineConfig::default()`
     /// value -- an engine with no operator band preference keeps today's behavior.
+    /// `coppad` rebinds such an engine to `Hf` (`CoppaCore::set_ofdm_band`)
+    /// unless frequency evidence permits the wideband profile (COP-21).
     LevelDerived,
     /// Stay on HF profiles at every speed level.
     Hf,
@@ -72,9 +74,10 @@ pub struct EngineConfig {
     /// put this station on `vhf_wide` while the peer was still on an HF profile)
     /// is closed by COP-23 for every engine whose `ofdm_band` is `Hf` or `Vhf`,
     /// which includes every engine built from a named [`Profile`]. The residual
-    /// is `OfdmBand::LevelDerived` engines (no band preference), and the absence
-    /// of any RF-frequency gate: an operator who configures a VHF profile while
-    /// physically on HF is still unprotected (H-027/H-150).
+    /// is `OfdmBand::LevelDerived` engines (no band preference). COP-40 refuses
+    /// wideband emission below 29.7 MHz in `coppad` and the CLI, and COP-21 keeps
+    /// a level-derived `coppad` engine on HF there; library/FFI callers of
+    /// `EngineConfig::default()` still carry the level-only rule.
     pub cp_mode: CpMode,
     /// The OFDM band this engine's waveform is bound to (COP-23). A named
     /// [`Profile`] pins it (`EngineConfig::from_profile`); the default,

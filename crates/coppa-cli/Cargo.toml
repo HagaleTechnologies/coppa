@@ -31,5 +31,5 @@ toml = { workspace = true }
 [features]
 default = ["file-backend"]
 file-backend = ["coppa-audio/file-backend"]
-cpal-backend = ["coppa-audio/cpal-backend"]
+cpal-backend = ["coppa-audio/cpal-backend", "coppa-daemon/cpal-backend"]
 kiss-tnc = ["coppa-host/kiss-tnc", "coppa-daemon/kiss-tnc"]

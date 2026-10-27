@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 
-use super::command::VaraCommandPort;
+use super::command::{response_channel, VaraCommandPort};
 use super::data::VaraDataPort;
 use super::protocol::VaraResponse;
 use crate::HostEvent;
@@ -156,7 +156,7 @@ impl VaraServer {
                         let client_id = next_cmd_id.fetch_add(1, Ordering::Relaxed);
                         let ev_tx = cmd_event_tx.clone();
                         // Create a response channel for this client
-                        let (resp_tx, resp_rx) = mpsc::channel::<VaraResponse>(64);
+                        let (resp_tx, resp_rx) = response_channel();
                         let resp_senders = response_senders.clone();
                         resp_senders.lock().await.insert(client_id, resp_tx);
                         let resp_senders_cleanup = resp_senders.clone();
