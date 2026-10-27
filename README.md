@@ -13,7 +13,7 @@ Open-source ham radio digital communications system written in Rust.
 | Modulation and speed levels | Implemented | Nine levels, 1–9, using BPSK, QPSK, 8PSK, 16-QAM and 64-QAM on OFDM carriers; HF supports 1–8, and level 9 is VHF-only |
 | Payload FEC | Implemented | One NR BG2 LDPC mother code with per-level shortening and rate matching |
 | Frame protection | Implemented | Golay-protected header with CRC-16; CRC-32 for each payload codeword |
-| ARQ and protocol stack | Implemented, opt-in ARQ | Selective-repeat ARQ, session management and optional Huffman + LZ4 compression; daemon ARQ defaults off |
+| ARQ and protocol stack | Implemented | Selective-repeat ARQ, session management and optional Huffman + LZ4 compression; connected-session data is always acknowledged and retransmitted (stop-and-wait); sessionless ARQ (`arq_enabled`) defaults off |
 | CLI | Implemented | Loopback and WAV transmit/receive; live audio requires `cpal-backend` |
 | Daemon event loop | Implemented | Processes audio and host events; live audio requires `cpal-backend` |
 | VARA-style TCP interface | Implemented, opt-in | Control/data ports default to 8300/8301; server disabled by default; not RF-compatible with VARA |
@@ -30,7 +30,7 @@ Open-source ham radio digital communications system written in Rust.
 - OFDM encode/decode with pilot-based channel estimation, channel equalization and streaming receive.
 - Nine speed levels using OFDM carrier constellations from BPSK through 64-QAM; levels 1–8 on HF and 1–9 on VHF.
 - NR BG2 LDPC payload coding with shortening, rate matching and interleaving; Golay and CRC-16 header protection, plus per-codeword CRC-32 payload checks.
-- Selective-repeat ARQ and session management, with optional Huffman + LZ4 compression. Daemon ARQ is disabled by default.
+- Selective-repeat ARQ and session management, with optional Huffman + LZ4 compression. Connected-session data is always acknowledged and retransmitted; sessionless ARQ is disabled by default.
 - WAV file I/O and live CPAL audio with `cpal-backend`; daemon serial and Linux GPIO PTT with their respective feature flags.
 - VARA-style TCP command/data interface for host applications, disabled by default and not RF-compatible with VARA.
 - C FFI shared/static library with one-shot encode/decode and streaming decode.

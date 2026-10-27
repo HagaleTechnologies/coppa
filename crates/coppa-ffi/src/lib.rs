@@ -1821,4 +1821,25 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_checked_in_header_has_extern_c_guard() {
+        // Without an `extern "C"` block a C++ translation unit including
+        // coppa.h name-mangles every declaration and fails to link against
+        // the Rust library's plain C symbols (COP-35). The two strings are
+        // checked separately so CRLF checkouts don't matter.
+        let header_path = concat!(env!("CARGO_MANIFEST_DIR"), "/coppa.h");
+        let header = std::fs::read_to_string(header_path)
+            .expect("checked-in coppa.h must exist and be readable");
+
+        for guard in ["#ifdef __cplusplus", "extern \"C\" {"] {
+            assert!(
+                header.contains(guard),
+                "checked-in coppa.h is missing `{}` -- set `cpp_compat = true` in \
+                 cbindgen.toml, run `cargo build -p coppa-ffi`, and commit the \
+                 regenerated coppa.h",
+                guard
+            );
+        }
+    }
 }

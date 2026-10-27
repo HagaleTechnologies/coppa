@@ -560,13 +560,55 @@ profile = "NOT_A_PROFILE"
 }
 
 #[test]
-fn check_keeps_accepting_unknown_keys() {
+fn check_rejects_unknown_keys_naming_them() {
+    // COP-36: a misspelled or unknown key or table is a parse error, not a
+    // silently ignored line.
     let dir = TempDir::new("check-unknown");
     dir.write(
         "station.toml",
         "top_level_extra = 1\n[engine]\nnot_a_real_key = true\n[mystery]\nvalue = 2\n",
     );
-    assert_eq!(run_ok(dir.path(), &["station.toml", "--check"]), CHECK_OK);
+    let stderr = run_config_error(dir.path(), &["station.toml", "--check"]);
+    assert!(stderr.contains("station.toml"), "{stderr}");
+    assert!(stderr.contains("unknown field `"), "{stderr}");
+}
+
+#[test]
+fn a_misspelled_key_stops_check_and_run_modes_naming_it() {
+    // COP-36's scenario: `calsign` for `callsign` fails to start, naming the
+    // bad key, in --check, in run mode, and through the implicit ./coppad.toml.
+    let dir = TempDir::new("typo-key");
+    dir.write("station.toml", "[engine]\ncalsign = \"W5AU\"\n");
+    for args in [
+        &["--config", "station.toml", "--check"][..],
+        &["station.toml", "--check"],
+        &["--config", "station.toml"],
+        &["station.toml"],
+    ] {
+        let stderr = run_config_error(dir.path(), args);
+        assert!(
+            stderr.starts_with("Error: Failed to load config station.toml"),
+            "coppad {args:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("unknown field `calsign`"),
+            "coppad {args:?}: {stderr}"
+        );
+    }
+
+    let implicit = TempDir::new("typo-key-implicit");
+    implicit.write("coppad.toml", "[engine]\ncalsign = \"W5AU\"\n");
+    for args in [&["--check"][..], &[]] {
+        let stderr = run_config_error(implicit.path(), args);
+        assert!(
+            stderr.starts_with("Error: Failed to parse config coppad.toml"),
+            "coppad {args:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("unknown field `calsign`"),
+            "coppad {args:?}: {stderr}"
+        );
+    }
 }
 
 // --- --print-default-config ---------------------------------------------------
@@ -773,6 +815,30 @@ fn a_sample_rate_the_engine_does_not_run_at_is_a_startup_error() {
         "[audio] sample_rate = 44100 is not supported",
     );
     assert!(stdout.contains("set sample_rate = 48000"), "{stdout}");
+}
+
+#[test]
+fn an_unknown_profile_name_is_a_startup_error() {
+    // COP-36: run mode rejects the name instead of building a level-derived
+    // engine from it. --check still accepts it (see
+    // check_only_deserializes_and_never_touches_hardware_or_listeners).
+    let (stdout, _) = run_startup_error(
+        "[engine]\nprofile = \"HF_STANDRD\"\n",
+        "[engine] profile = \"HF_STANDRD\" is not a known profile",
+    );
+    assert!(
+        stdout.contains("HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_zero_buffer_size_is_a_startup_error() {
+    let (stdout, _) = run_startup_error(
+        "[audio]\nbuffer_size = 0\n",
+        "[audio] buffer_size = 0 is not supported",
+    );
+    assert!(stdout.contains("set buffer_size = 8192"), "{stdout}");
 }
 
 #[cfg(not(feature = "cpal-backend"))]
