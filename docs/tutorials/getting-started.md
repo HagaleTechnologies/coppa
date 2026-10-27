@@ -131,19 +131,22 @@ cargo run -p coppa-daemon --bin coppad -- --config my_config.toml --check
 
 `--check` prints `Configuration syntax and field types OK.` only after it has
 read the file and parsed it into the daemon's configuration. That is all it
-proves: the TOML is well formed and every known field has the right type.
-Unknown keys are still accepted. It does not check that the PTT method or
-profile name is valid, that the sample rate suits the profile, that the audio
+proves: the TOML is well formed, every field has the right type, and there is
+no unknown or misspelled key or table (such as `calsign` for `callsign`); an
+unknown key is an error that names it, in `--check` and when the daemon starts.
+It does not check that the PTT method or profile name is valid, that
+`buffer_size` is above 0, that the sample rate suits the profile, that the audio
 devices exist, that rigctld answers, that the host ports are free, or that the
 setup suits your radio. Those surface when the daemon starts. `--check` opens no
 hardware and starts no listeners.
 
 When the daemon starts, a condition that stops it doing its job is logged at
-`ERROR`, never as `Daemon ready`. A sample rate other than 48000, a named
-`[audio]` device that does not exist (or any named device in a build without
-`cpal-backend`), an audio device that will not open, a host port that is
-already taken, an unknown PTT method, or a wideband profile with no frequency
-source stops the daemon: it logs the reason at `ERROR`, prints `Error: ...` on
+`ERROR`, never as `Daemon ready`. An `[engine] profile` that is not one of the
+four built-in names, `[audio] buffer_size = 0`, a sample rate other than
+48000, a named `[audio]` device that does not exist (or any named device in a
+build without `cpal-backend`), an audio device that will not open, a host port
+that is already taken, an unknown PTT method, or a wideband profile with no
+frequency source stops the daemon: it logs the reason at `ERROR`, prints `Error: ...` on
 stderr and exits with status 1. An unreachable rigctld does not stop it. The
 daemon keeps running without PTT, logs the failed connection at `ERROR`, and
 logs `Daemon running degraded` with the reason in place of `Daemon ready`.
