@@ -5,8 +5,11 @@
 use anyhow::Result;
 use coppa_audio::{AudioRingConsumer, AudioRingProducer};
 use coppa_engine::{CoppaCore, OfdmBand};
-use coppa_host::vara::{queue_response, Queued, VaraCommand, VaraResponse, COMMAND_QUEUE_DEPTH};
-use coppa_host::HostEvent;
+use coppa_host::vara::{
+    queue_data, queue_response, DataQueued, Queued, VaraCommand, VaraResponse, COMMAND_QUEUE_DEPTH,
+    DATA_QUEUE_DEPTH,
+};
+use coppa_host::{HostEvent, HostResponse};
 use coppa_ml::CpRecommendation;
 use coppa_ml::{BusyGate, CpGate, RateLoop};
 use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx};
@@ -35,6 +38,10 @@ use crate::tx_chunker::chunk_to_fit;
 /// Map of connected VARA command-port clients' response senders
 /// (`VaraServer::response_senders()`), used to broadcast `VaraResponse` telemetry.
 type VaraResponseSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<VaraResponse>>>>;
+
+/// Map of connected VARA data-port clients' data senders
+/// (`VaraServer::data_senders()`), used by [`forward_data_out`].
+pub type VaraDataSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>;
 
 /// How often every command-port client hears `IAMALIVE`. VARA sends it every
 /// 60 s; Pat closes the modem after 2 minutes without a line, and vARIM after
@@ -157,6 +164,52 @@ async fn broadcast_vara(senders: &VaraResponseSenders, response: VaraResponse) {
         .lock()
         .await
         .retain(|&id, tx| queue_for_client(id, tx, response.clone()));
+}
+
+/// Queue `data` for one data-port client without waiting (`queue_data`).
+/// Returns `false` when the payload finds the client's queue full: the client
+/// has stopped reading, and the caller removes its sender, which closes its
+/// connection once the queued payloads are written. The client gets every
+/// payload up to that point, then EOF, never a gap on an open connection.
+fn queue_data_for_client(client_id: u32, tx: &mpsc::Sender<Vec<u8>>, data: Vec<u8>) -> bool {
+    match queue_data(tx, data) {
+        DataQueued::Overflow(data) => {
+            tracing::warn!(
+                client_id,
+                bytes = data.len(),
+                depth = DATA_QUEUE_DEPTH,
+                "VARA data-port client is not reading; disconnecting it"
+            );
+            false
+        }
+        DataQueued::Sent | DataQueued::Closed => true,
+    }
+}
+
+/// Forward every decoded payload the event loop sends on `responses` to the
+/// data-port clients in `senders`: a `client_id` of 0 goes to every client,
+/// any other to that client alone. It never waits on a client, so one host
+/// that stops reading holds up neither the other clients nor the event
+/// loop's queue; that host is disconnected instead (`queue_data_for_client`).
+/// Returns when every sender for `responses` is dropped.
+pub async fn forward_data_out(
+    mut responses: mpsc::UnboundedReceiver<HostResponse>,
+    senders: VaraDataSenders,
+) {
+    while let Some(response) = responses.recv().await {
+        // StatusUpdate is deliberately not forwarded: EventLoop::notify_session
+        // pushes session state directly to the command port and WebSocket.
+        if let HostResponse::DataOut { client_id, data } = response {
+            let mut senders = senders.lock().await;
+            if client_id == 0 {
+                senders.retain(|&id, tx| queue_data_for_client(id, tx, data.clone()));
+            } else if let Some(tx) = senders.get(&client_id) {
+                if !queue_data_for_client(client_id, tx, data) {
+                    senders.remove(&client_id);
+                }
+            }
+        }
+    }
 }
 
 /// Send `IAMALIVE` to every command-port client each `period`, the first one
@@ -287,7 +340,10 @@ pub struct EventLoop {
     /// the same poll.
     session_tx_held_by_frequency_gate: bool,
     /// Optional sender for host responses (decoded data, status updates).
-    response_tx: Option<mpsc::Sender<coppa_host::HostResponse>>,
+    /// Unbounded so the event loop never waits on it and never drops a
+    /// decoded payload; its consumer (`forward_data_out`) never waits on a
+    /// client, so it holds only what was decoded since that consumer last ran.
+    response_tx: Option<mpsc::UnboundedSender<HostResponse>>,
     /// Playback progress from the audio output worker. `None` when no
     /// hardware output is wired (tests, headless builds), in which case PTT
     /// release falls back to the nominal audio duration.
@@ -1075,7 +1131,9 @@ impl EventLoop {
     }
 
     /// Set the response sender for sending decoded data back to host clients.
-    pub fn set_response_tx(&mut self, tx: mpsc::Sender<coppa_host::HostResponse>) {
+    /// The queue is unbounded, so whoever holds its receiver must keep
+    /// draining it (`forward_data_out`).
+    pub fn set_response_tx(&mut self, tx: mpsc::UnboundedSender<HostResponse>) {
         self.response_tx = Some(tx);
     }
 
@@ -1200,7 +1258,7 @@ impl EventLoop {
             SessionNotice::Disconnected => ("DISCONNECTED".to_string(), VaraResponse::Disconnected),
         };
         if let Some(ref tx) = self.response_tx {
-            let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate { client_id, status });
+            let _ = tx.send(HostResponse::StatusUpdate { client_id, status });
         }
         // A dropped state line would leave the host waiting out its own
         // connect or disconnect timer, so a host that cannot take it is
@@ -1958,11 +2016,10 @@ impl EventLoop {
                                         }
                                     }
                                     if let Some(ref tx) = self.response_tx {
-                                        let _ =
-                                            tx.try_send(coppa_host::HostResponse::StatusUpdate {
-                                                client_id,
-                                                status: format!("CONNECTING {}", remote),
-                                            });
+                                        let _ = tx.send(HostResponse::StatusUpdate {
+                                            client_id,
+                                            status: format!("CONNECTING {}", remote),
+                                        });
                                     }
                                 }
                                 Err(e) => {
@@ -2540,16 +2597,7 @@ impl EventLoop {
 
                     if !output_data.is_empty() {
                         tracing::info!(bytes = output_data.len(), "Frame decoded successfully");
-                        // Send decoded data back to host clients
-                        if let Some(ref tx) = self.response_tx {
-                            let response = coppa_host::HostResponse::DataOut {
-                                client_id: 0, // broadcast to all clients
-                                data: output_data.clone(),
-                            };
-                            if let Err(e) = tx.try_send(response) {
-                                tracing::warn!(error = %e, "Failed to send decoded response to host");
-                            }
-                        }
+                        self.deliver_to_host(output_data.clone());
                         // Forward to WebSocket broadcast channel
                         #[cfg(feature = "websocket")]
                         if let Some(ref ws_tx) = self.ws_broadcast {
@@ -4125,18 +4173,28 @@ impl EventLoop {
         }
     }
 
+    /// Send a decoded payload to every data-port client (`client_id` 0) through
+    /// `response_tx`. The queue is unbounded, so this never waits and never
+    /// drops; with no queue wired (no VARA server) it does nothing. It fails
+    /// only when the bridge draining the queue has stopped.
+    fn deliver_to_host(&self, data: Vec<u8>) {
+        if let Some(ref tx) = self.response_tx {
+            if tx
+                .send(HostResponse::DataOut { client_id: 0, data })
+                .is_err()
+            {
+                tracing::warn!("Data-port bridge has stopped; decoded payload not delivered");
+            }
+        }
+    }
+
     fn handle_session_data(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
         if let Some(session) = self.session_mgr.find_by_remote_mut(&remote) {
             if session.is_established() {
                 self.tx_frame_count = 0; // Our turn to transmit starts fresh
                 session.touch();
-                if let Some(ref tx) = self.response_tx {
-                    let _ = tx.try_send(coppa_host::HostResponse::DataOut {
-                        client_id: 0,
-                        data: pdu.payload,
-                    });
-                }
+                self.deliver_to_host(pdu.payload);
             } else {
                 tracing::debug!(
                     remote = %remote, state = ?session.state,
@@ -5841,7 +5899,7 @@ mod tests {
         // Only now wire b's response channel, so the handshake's
         // StatusUpdate lines are dropped and the next delivery is the data
         // frame's DataOut.
-        let (data_tx, mut data_rx) = mpsc::channel(64);
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
         b.set_response_tx(data_tx);
 
         // Mid-session MYCALL on the sender, then a data frame.
@@ -5869,7 +5927,7 @@ mod tests {
             .expect("b must deliver the data frame's payload")
             .expect("response channel closed");
         match got {
-            coppa_host::HostResponse::DataOut { client_id: _, data } => {
+            HostResponse::DataOut { client_id: _, data } => {
                 assert_eq!(data, b"hello");
             }
             other => panic!("expected DataOut, got {:?}", other),
@@ -5921,7 +5979,7 @@ mod tests {
             let payload = pattern(size);
             // Fresh response channel per transfer so the collected bytes are
             // exactly this transfer's DataOut stream.
-            let (data_tx, mut data_rx) = mpsc::channel(4096);
+            let (data_tx, mut data_rx) = mpsc::unbounded_channel();
             b.set_response_tx(data_tx);
             let frames_before = a.tx_frame_count;
 
@@ -5945,7 +6003,7 @@ mod tests {
                     b.decode_and_dispatch_audio(&with_lead_and_trail(&buf[..read]))
                         .await;
                     while let Ok(resp) = data_rx.try_recv() {
-                        if let coppa_host::HostResponse::DataOut { data, .. } = resp {
+                        if let HostResponse::DataOut { data, .. } = resp {
                             collected.extend_from_slice(&data);
                         }
                     }
@@ -8248,7 +8306,7 @@ mod tests {
     async fn test_connect_requires_callsign() {
         let config = DaemonConfig::default(); // callsign is empty
         let mut event_loop = EventLoop::new(config).unwrap();
-        let (resp_tx, mut resp_rx) = mpsc::channel(16);
+        let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
         event_loop.set_response_tx(resp_tx);
         let tx = event_loop.event_sender();
 
@@ -8266,7 +8324,7 @@ mod tests {
         // Should have sent DISCONNECTED status since no callsign
         let resp = resp_rx.try_recv().unwrap();
         match resp {
-            coppa_host::HostResponse::StatusUpdate { status, .. } => {
+            HostResponse::StatusUpdate { status, .. } => {
                 assert_eq!(status, "DISCONNECTED");
             }
             _ => panic!("Expected StatusUpdate"),
@@ -8278,7 +8336,7 @@ mod tests {
         let mut config = DaemonConfig::default();
         config.engine.callsign = "VK3ABC".to_string();
         let mut event_loop = EventLoop::new(config).unwrap();
-        let (resp_tx, mut resp_rx) = mpsc::channel(16);
+        let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
         event_loop.set_response_tx(resp_tx);
         let tx = event_loop.event_sender();
 
@@ -8296,7 +8354,7 @@ mod tests {
         // Should have sent CONNECTING status
         let resp = resp_rx.try_recv().unwrap();
         match resp {
-            coppa_host::HostResponse::StatusUpdate { status, .. } => {
+            HostResponse::StatusUpdate { status, .. } => {
                 assert!(
                     status.starts_with("CONNECTING"),
                     "Expected CONNECTING, got: {}",
@@ -13965,6 +14023,209 @@ mod tests {
                 run.a_unacked_bytes > 0,
                 "an ACK sent into a keyed peer is lost"
             );
+        }
+    }
+
+    /// COP-39: every decoded payload reaches the data-port bridge, and the
+    /// bridge delivers it to each data-port client or disconnects a client
+    /// that has stopped reading -- never a gap on an open connection.
+    mod data_delivery {
+        use super::*;
+        use coppa_host::vara::{data_channel, DATA_QUEUE_DEPTH};
+
+        /// The `DataOut` payloads waiting on `rx`, each addressed to every
+        /// client (`client_id` 0). Other responses are skipped.
+        fn data_out(rx: &mut mpsc::UnboundedReceiver<HostResponse>) -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            while let Ok(response) = rx.try_recv() {
+                if let HostResponse::DataOut { client_id, data } = response {
+                    assert_eq!(client_id, 0, "decoded data goes to every client");
+                    out.push(data);
+                }
+            }
+            out
+        }
+
+        /// The payloads waiting on one data-port client's queue.
+        fn drain(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            while let Ok(data) = rx.try_recv() {
+                out.push(data);
+            }
+            out
+        }
+
+        /// `n` distinct payloads.
+        fn numbered(n: usize) -> Vec<Vec<u8>> {
+            (0..n).map(|i| (i as u32).to_be_bytes().to_vec()).collect()
+        }
+
+        fn data_out_for_all(data: Vec<u8>) -> HostResponse {
+            HostResponse::DataOut { client_id: 0, data }
+        }
+
+        #[tokio::test]
+        async fn raw_decoded_frame_reaches_the_data_port_bridge() {
+            let mut event_loop = EventLoop::new(tx_config()).unwrap();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            event_loop.set_response_tx(tx);
+
+            event_loop
+                .decode_and_dispatch_audio(&inert_peer_frame(7))
+                .await;
+
+            assert_eq!(
+                data_out(&mut rx),
+                vec![vec![0xFF, 7, 0, 0, 0, 0, 0, 1, 2, 3]]
+            );
+        }
+
+        #[tokio::test]
+        async fn arq_delivered_payload_reaches_the_data_port_bridge() {
+            let mut config = tx_config();
+            config.engine.arq_enabled = true;
+            let mut b = EventLoop::new(config).unwrap();
+            mark_identified(&mut b);
+            // The ACK is transmitted, so it needs somewhere to go.
+            let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
+            b.set_audio_out(producer);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            b.set_response_tx(tx);
+
+            let pdu = TransportPdu::new_reliable(b.arq_session_id, 0, 0, b"reliable".to_vec());
+            b.decode_and_dispatch_audio(&peer_frame(
+                &pdu,
+                coppa_codec::ofdm::CoppaProfile::hf_standard(),
+            ))
+            .await;
+
+            assert_eq!(data_out(&mut rx), vec![b"reliable".to_vec()]);
+        }
+
+        #[tokio::test]
+        async fn session_data_survives_a_host_that_is_not_reading() {
+            let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+            let local = Callsign::new("VK3ABC").unwrap();
+            let remote = Callsign::new("W1AW").unwrap();
+            let id = event_loop
+                .session_mgr
+                .create(
+                    local.clone(),
+                    remote.clone(),
+                    0,
+                    LinkCapabilities::default(),
+                )
+                .expect("a fresh SessionManager should have a free slot");
+            event_loop
+                .session_mgr
+                .get_mut(id)
+                .expect("just-created session should exist")
+                .state = SessionState::Established;
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            event_loop.set_response_tx(tx);
+
+            // More payloads than the old 64-slot queue held, with nothing
+            // draining the queue meanwhile.
+            let payloads = numbered(200);
+            for payload in &payloads {
+                event_loop
+                    .handle_mac_pdu(MacPdu::new_data(
+                        local.clone(),
+                        remote.clone(),
+                        0,
+                        payload.clone(),
+                    ))
+                    .await;
+            }
+
+            assert_eq!(data_out(&mut rx), payloads);
+        }
+
+        #[tokio::test]
+        async fn bridge_delivers_every_payload_to_a_host_that_catches_up() {
+            const CLIENT: u32 = 0x8000_0001;
+            let (client_tx, mut client_rx) = data_channel();
+            let senders: VaraDataSenders =
+                Arc::new(Mutex::new(HashMap::from([(CLIENT, client_tx)])));
+            let (tx, rx) = mpsc::unbounded_channel();
+            let bridge = tokio::spawn(forward_data_out(rx, senders.clone()));
+
+            let payloads = numbered(DATA_QUEUE_DEPTH);
+            for (i, payload) in payloads.iter().enumerate() {
+                tx.send(data_out_for_all(payload.clone())).unwrap();
+                if i % 100 == 99 {
+                    tx.send(HostResponse::StatusUpdate {
+                        client_id: 0,
+                        status: "CONNECTED W1AW".to_string(),
+                    })
+                    .unwrap();
+                }
+            }
+            drop(tx);
+            bridge.await.unwrap();
+
+            assert_eq!(drain(&mut client_rx), payloads);
+            assert!(senders.lock().await.contains_key(&CLIENT));
+        }
+
+        #[tokio::test]
+        async fn bridge_disconnects_a_host_that_stops_reading_and_serves_the_rest() {
+            const READING: u32 = 0x8000_0001;
+            const STUCK: u32 = 0x8000_0002;
+            // Deep enough never to overflow in this test.
+            let (reading_tx, mut reading_rx) = mpsc::channel(4 * DATA_QUEUE_DEPTH);
+            let (stuck_tx, mut stuck_rx) = data_channel();
+            let senders: VaraDataSenders = Arc::new(Mutex::new(HashMap::from([
+                (READING, reading_tx),
+                (STUCK, stuck_tx),
+            ])));
+            let (tx, rx) = mpsc::unbounded_channel();
+            let bridge = tokio::spawn(forward_data_out(rx, senders.clone()));
+
+            let payloads = numbered(DATA_QUEUE_DEPTH + 10);
+            for payload in &payloads {
+                tx.send(data_out_for_all(payload.clone())).unwrap();
+            }
+            drop(tx);
+            bridge.await.unwrap();
+
+            assert_eq!(drain(&mut reading_rx), payloads);
+            let map = senders.lock().await;
+            assert!(map.contains_key(&READING));
+            assert!(
+                !map.contains_key(&STUCK),
+                "a host whose queue overflowed must be disconnected"
+            );
+            drop(map);
+            assert_eq!(
+                drain(&mut stuck_rx),
+                payloads[..DATA_QUEUE_DEPTH].to_vec(),
+                "the stuck host gets every payload up to the overflow, with no gap"
+            );
+            assert_eq!(stuck_rx.recv().await, None, "then EOF");
+        }
+
+        #[tokio::test]
+        async fn bridge_delivers_a_unicast_payload_only_to_its_client() {
+            const A: u32 = 0x8000_0001;
+            const B: u32 = 0x8000_0002;
+            let (a_tx, mut a_rx) = data_channel();
+            let (b_tx, mut b_rx) = data_channel();
+            let senders: VaraDataSenders =
+                Arc::new(Mutex::new(HashMap::from([(A, a_tx), (B, b_tx)])));
+            let (tx, rx) = mpsc::unbounded_channel();
+            let bridge = tokio::spawn(forward_data_out(rx, senders.clone()));
+
+            tx.send(HostResponse::DataOut {
+                client_id: B,
+                data: b"only b".to_vec(),
+            })
+            .unwrap();
+            drop(tx);
+            bridge.await.unwrap();
+
+            assert!(drain(&mut a_rx).is_empty());
+            assert_eq!(drain(&mut b_rx), vec![b"only b".to_vec()]);
         }
     }
 }

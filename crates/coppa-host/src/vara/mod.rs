@@ -12,5 +12,6 @@ pub mod server;
 pub use command::{
     queue_response, response_channel, Queued, COMMAND_QUEUE_DEPTH, TELEMETRY_QUEUE_DEPTH,
 };
+pub use data::{data_channel, queue_data, DataQueued, DATA_QUEUE_DEPTH};
 pub use protocol::{VaraCommand, VaraResponse};
 pub use server::VaraServer;
