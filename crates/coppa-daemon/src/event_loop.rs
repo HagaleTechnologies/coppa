@@ -536,7 +536,10 @@ impl EventLoop {
             ));
         }
 
-        // Create engine from profile; all profiles use 48kHz internally
+        // Create engine from profile; all profiles use 48kHz internally.
+        // coppad's run mode rejects an unknown profile name before this point
+        // (COP-36); the level-derived fallback is kept for direct constructors
+        // and tests.
         let engine =
             if let Some(profile) = coppa_engine::profiles::get_profile(&config.engine.profile) {
                 CoppaCore::from_profile(profile)
