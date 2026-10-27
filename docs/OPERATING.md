@@ -240,11 +240,16 @@ follows at once, as before.
 
 - A repeated `DISCONNECT` changes nothing: the host still gets one
   `DISCONNECTED`.
-- If no queued frame keys for 10 s, for example because the frequency gate
-  holds wideband TX or there is no valid callsign, coppad drops the rest,
-  sends the DISCONNECT frame anyway and pushes `DISCONNECTED`. A long queue
-  that keeps moving drains in full, so allow for its airtime: at levels 1-2
-  each frame is about 1.4 s on air.
+- If none of the session's queued frames keys for 10 s, for example because
+  the frequency gate holds wideband TX or there is no valid callsign, coppad
+  drops the rest, tries to send the DISCONNECT frame and pushes
+  `DISCONNECTED`. A block that held the data also refuses that frame, and
+  the peer then ends the session on its own timeout. A long queue that keeps
+  moving drains in full, so allow for its airtime: at levels 1-2 each frame
+  is about 1.4 s on air.
+- A `CONNECT` sent before `DISCONNECTED` arrives ends the drain at once: the
+  rest is dropped and the DISCONNECT frame goes out before the new
+  `CONNECT`.
 - Host data written after `DISCONNECT` is not sent on that session.
 - `ABORT` does not yet tear the link down (COP-42).
 - A remote DISCONNECT or a session timeout still drops unsent data at once.

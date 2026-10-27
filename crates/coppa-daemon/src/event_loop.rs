@@ -2017,6 +2017,19 @@ impl EventLoop {
                     }
                 };
 
+                // COP-43: a CONNECT during a DISCONNECT drain ends that
+                // drain first. Its session would otherwise still match the
+                // peer's callsign (`find_by_remote`) and catch the new
+                // session's CONNECT_ACK, and its DISCONNECT frame, keyed
+                // later, would tear down the new link on the peer's side.
+                if let Some(pending) = self.pending_disconnect.take() {
+                    tracing::info!(
+                        session_id = pending.session_id,
+                        "CONNECT during a DISCONNECT drain; ending the drain first"
+                    );
+                    self.end_local_disconnect(pending).await;
+                }
+
                 let caps = LinkCapabilities::default();
                 match self.session_mgr.create(local, remote.clone(), 0, caps) {
                     Ok(id) => {
@@ -2086,6 +2099,13 @@ impl EventLoop {
                             // keepalives for it; `finish_drained_disconnect`
                             // sends the frame once the drain finishes, and
                             // the reaper ends a drain that stops moving.
+                            // One record is kept: an earlier session still
+                            // draining (e.g. a peer connected meanwhile and
+                            // the host disconnects that one too) ends now
+                            // rather than being orphaned without its frame.
+                            if let Some(earlier) = self.pending_disconnect.take() {
+                                self.end_local_disconnect(earlier).await;
+                            }
                             self.pending_disconnect = Some(PendingDisconnect {
                                 session_id: id,
                                 client_id,
@@ -11360,6 +11380,59 @@ mod tests {
                     "{end:?}: {lines:?}"
                 );
             }
+        }
+
+        /// COP-43: a CONNECT before `DISCONNECTED` ends the drain first, so
+        /// the old `Disconnecting` session cannot catch the new session's
+        /// frames and its DISCONNECT frame keys before the CONNECT_REQ, not
+        /// after it (where it would tear down the new link at the peer).
+        #[tokio::test]
+        async fn connect_during_a_disconnect_drain_ends_the_drain_first() {
+            let (mut station, mut consumer, mut reader, _writer, id) =
+                draining_station(19516, 19517).await;
+            station
+                .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+                .await;
+            assert!(station.pending_disconnect.is_some());
+
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "VK3ABC".into(),
+                    destination: "W1AW".into(),
+                })
+                .await;
+            assert!(station.pending_disconnect.is_none());
+            assert!(station.session_tx_queue.is_empty());
+            let sessions: Vec<SessionState> = station
+                .session_mgr
+                .active_sessions()
+                .iter()
+                .filter_map(|&sid| station.session_mgr.get(sid).map(|s| s.state))
+                .collect();
+            assert_eq!(sessions, vec![SessionState::Connecting], "slot {id}");
+
+            station.flush_pending_audio_out();
+            let mut buf = vec![0.0f32; 4_000_000];
+            let n = consumer.read(&mut buf);
+            let frames: Vec<MacFrameType> = decoded_frame_types(&buf[..n])
+                .into_iter()
+                .filter(|t| matches!(t, MacFrameType::Disconnect | MacFrameType::ConnectReq))
+                .collect();
+            assert_eq!(
+                frames,
+                vec![MacFrameType::Disconnect, MacFrameType::ConnectReq]
+            );
+
+            let lines = read_available_lines(&mut reader).await;
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.trim_end() == "DISCONNECTED")
+                    .count(),
+                1,
+                "{lines:?}"
+            );
         }
 
         /// Unsent session chunks resume after canceled playback, once the
