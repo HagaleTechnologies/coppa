@@ -230,6 +230,26 @@ other station's ACK can still collide with that next frame. Sender-side turn
 discipline is a separate follow-up. The hardware acceptance test for this
 behaviour is `docs/testing/cable-loop-turnaround.md`.
 
+## BUSY lines on the command port
+
+coppad watches the 300-2800 Hz band of the received audio and sends `BUSY ON`
+or `BUSY OFF` to every connected host when the channel's occupancy changes.
+A new state is reported only after it has held for 250 ms of received audio,
+so:
+
+- two consecutive `BUSY` lines are at least 250 ms of audio apart;
+- a station that keys up is reported about 250 ms later, and its end is
+  reported about 250 ms after it stops;
+- a burst shorter than 250 ms is never reported.
+
+Detection always runs. `[station_id] busy_hold_ms` does not change it: that
+key only enables coppad's own courtesy wait before it transmits.
+
+Known gap: the noise floor is estimated across the whole audio spectrum, not
+only the 300-2800 Hz band. A receiver whose audio is much quieter outside
+that band, which is typical of an SSB rig, can read as one long `BUSY ON` on
+a quiet band.
+
 ## Host clients that stop reading
 
 coppad queues every command-port line for each connected host. If a host
