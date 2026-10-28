@@ -432,6 +432,7 @@ mod tests {
         assert!(!VaraResponse::Wrong.is_disposable());
         assert!(!VaraResponse::coppa_version().is_disposable());
         assert!(!VaraResponse::Pending.is_disposable());
+        assert!(!VaraResponse::CancelPending.is_disposable());
         assert!(!VaraResponse::Connected("W5AU".into(), "K7XYZ".into(), 2300).is_disposable());
         assert!(!VaraResponse::Disconnected.is_disposable());
         assert!(!VaraResponse::Ptt(true).is_disposable());

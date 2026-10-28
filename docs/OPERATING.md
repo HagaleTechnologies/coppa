@@ -208,6 +208,9 @@ station's host gets every byte once, in order.
 - coppad holds one session at a time. While a session exists (connecting or
   connected), every `CONNECT_REQ`, including a repeat from the station already
   in the session, gets no answer, so that station's connect attempt times out.
+  The one exception is a repeat from a caller whose inbound attempt is still
+  pending (it did not hear the first answer): coppad answers it again (see
+  "Inbound connect attempts" below).
   A host `CONNECT` is answered `DISCONNECTED`, to the dialling host only. Send
   `DISCONNECT` to end the current session before dialling again. A session
   nobody ends blocks every caller: an idle connected session does not time
@@ -266,13 +269,26 @@ the moment its own PTT releases, so the other station's ACK can still collide
 with that next frame. Sender-side turn discipline is a separate follow-up. The hardware acceptance test for this
 behaviour is `docs/testing/cable-loop-turnaround.md`.
 
+## Inbound connect attempts
+
+A listening coppad (`LISTEN ON`) pushes `PENDING` to every host when it
+answers another station's `CONNECT_REQ`. The attempt then ends in `CONNECTED`
+when the caller confirms, or in `CANCELPENDING` when the handshake does not
+complete: no confirmation within 30-35 s, the caller sent `DISCONNECT`, or its
+confirmation was rejected. `CANCELPENDING` is not followed by `DISCONNECTED`,
+except when the host itself sends `DISCONNECT` during the attempt: it then
+gets `CANCELPENDING` and then `DISCONNECTED`. A repeat `CONNECT_REQ` from the
+same caller while its attempt is pending is answered again, without a second
+`PENDING`. A `CONNECT_REQ` coppad ignores (not listening, addressed to another
+callsign, or unreadable) produces no line.
+
 ## Host clients that stop reading
 
 coppad queues every command-port line for each connected host. If a host
 stops reading and its socket buffers fill, coppad drops `BUSY` and `SNR`
 lines once 64 lines are waiting; the next change sends a fresh value. It
-keeps every other line (`PTT`, `CONNECTED`, `DISCONNECTED`, `BUFFER`,
-`IAMALIVE` and command replies). If 1024 lines are waiting, coppad writes
+keeps every other line (`PTT`, `PENDING`, `CANCELPENDING`, `CONNECTED`,
+`DISCONNECTED`, `BUFFER`, `IAMALIVE` and command replies). If 1024 lines are waiting, coppad writes
 what is queued, closes the connection and logs `VARA command-port client is
 not reading; disconnecting it`. A host never misses a state line while its
 connection stays open. Find out why the host stopped reading, then reconnect
