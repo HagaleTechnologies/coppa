@@ -1018,6 +1018,7 @@ struct DecodeSummary {
     failed_frames: usize,
     first_error: Option<String>,
     consumed_samples: usize,
+    report_live_errors: bool,
 }
 
 impl DecodeSummary {
@@ -1040,7 +1041,10 @@ fn stream_decode(
 ) -> Result<DecodeSummary> {
     let (raw, hex) = output;
     let mut buf = vec![0.0f32; 4096];
-    let mut summary = DecodeSummary::default();
+    let mut summary = DecodeSummary {
+        report_live_errors: total_samples.is_none(),
+        ..DecodeSummary::default()
+    };
     while total_samples.is_none_or(|total| summary.consumed_samples < total) {
         let want = total_samples.map_or(buf.len(), |total| {
             buf.len().min(total - summary.consumed_samples)
@@ -1092,7 +1096,8 @@ fn format_decoded(bytes: &[u8], snr_db: f32, hex: bool) -> String {
 /// escaped, quoted text; other payloads fall back to labeled lowercase hex.
 /// `hex` forces labeled hex. `raw` prints only the lowercase hex string,
 /// one per line, on stdout, even when `hex` is also set.
-/// Decode failures are retained for a final nonzero exit even under --quiet.
+/// Live decode failures are printed immediately, including under --quiet.
+/// All decode failures are retained for a final nonzero exit.
 fn handle_stream_frame(
     core: &CoppaCore,
     frame: &coppa_engine::StreamFrame,
@@ -1106,9 +1111,13 @@ fn handle_stream_frame(
         Ok(bytes) => {
             if core.appears_compressed_with_wrong_profile(bytes) {
                 summary.failed_frames += 1;
-                summary.first_error.get_or_insert_with(|| format!(
+                let error = format!(
                     "decoded payload appears compressed but profile {profile} does not enable compression; try --profile HF_STANDARD for HF audio"
-                ));
+                );
+                if summary.report_live_errors {
+                    eprintln!("{error}");
+                }
+                summary.first_error.get_or_insert(error);
                 return;
             }
             summary.good_frames += 1;
@@ -1126,9 +1135,11 @@ fn handle_stream_frame(
         }
         Err(e) => {
             summary.failed_frames += 1;
-            summary
-                .first_error
-                .get_or_insert_with(|| format!("payload decode failed: {e}"));
+            let error = format!("payload decode failed: {e}");
+            if summary.report_live_errors {
+                eprintln!("{error}");
+            }
+            summary.first_error.get_or_insert(error);
         }
     }
 }
@@ -2366,6 +2377,80 @@ mod tests {
         fn stop(&mut self) -> Result<()> {
             Ok(())
         }
+    }
+
+    /// A live-like source whose read fails after the frames have arrived,
+    /// so stream_decode exits without ever returning a summary.
+    struct InterruptedSamples(FiniteSamples);
+
+    impl coppa_audio::AudioSource for InterruptedSamples {
+        fn read(&mut self, buf: &mut [f32]) -> Result<usize> {
+            if self.0.cursor == self.0.samples.len() {
+                anyhow::bail!("synthetic capture stopped");
+            }
+            self.0.read(buf)
+        }
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn unbounded_live_receive_reports_errors_before_return() {
+        const CHILD: &str = "COPPA_TEST_LIVE_DECODE_DIAGNOSTICS";
+        if std::env::var_os(CHILD).is_some() {
+            let compressed_profile = coppa_engine::profiles::get_profile("HF_STANDARD").unwrap();
+            let compressed = CoppaCore::with_config(EngineConfig::from_profile(compressed_profile))
+                .encode("BAD")
+                .unwrap();
+            let raw = CoppaCore::new()
+                .encode_bytes(&[0xfe, 1, 2, 3, 4, 5])
+                .unwrap();
+            for (mut core, mut samples, profile) in [
+                (CoppaCore::new(), compressed, "default"),
+                (
+                    CoppaCore::with_config(EngineConfig::from_profile(compressed_profile)),
+                    raw,
+                    "HF_STANDARD",
+                ),
+            ] {
+                samples.extend(std::iter::repeat_n(0.0, TRAILING_FLUSH_SAMPLES));
+                let mut source = InterruptedSamples(FiniteSamples { samples, cursor: 0 });
+                let error = stream_decode(
+                    &mut core,
+                    &mut source,
+                    None,
+                    None,
+                    (false, false),
+                    profile,
+                    Verbosity::Quiet,
+                )
+                .err()
+                .expect("synthetic live source should stop the decoder");
+                assert!(error.to_string().contains("synthetic capture stopped"));
+            }
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::unbounded_live_receive_reports_errors_before_return",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("appears compressed"), "{stderr}");
+        assert!(stderr.contains("payload decode failed"), "{stderr}");
     }
 
     #[test]
