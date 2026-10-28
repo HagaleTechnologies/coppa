@@ -131,10 +131,10 @@ fn session_ack_frame(link: &SessionLink) -> Vec<u8> {
     .to_bytes()
 }
 
-/// A host `DISCONNECT` waiting for its session's queued chunks to play
-/// (COP-43). The session sits in `SessionState::Disconnecting` meanwhile;
-/// `finish_drained_disconnect` sends the DISCONNECT frame once the queue is
-/// drained and PTT has released.
+/// A host `DISCONNECT` waiting for its session's link to drain (COP-43).
+/// The session sits in `SessionState::Disconnecting` meanwhile;
+/// `finish_drained_disconnect` sends the DISCONNECT frame once the link's
+/// backlog is sent, every frame is ACKed and PTT has released.
 struct PendingDisconnect {
     session_id: u8,
     /// The VARA client that asked; it gets the `DISCONNECTED`.
@@ -467,14 +467,10 @@ pub struct EventLoop {
     /// 30 s `max_tx_duration_s` watchdog would cancel mid-message. Backlog
     /// and unacknowledged bytes count toward `BUFFER`; see
     /// `buffered_tx_bytes`.
-<<<<<<< HEAD
-    session_tx_queue: VecDeque<SessionTxChunk>,
-    /// A host `DISCONNECT` waiting for `session_tx_queue` to drain (COP-43).
+    session_link: Option<SessionLink>,
+    /// A host `DISCONNECT` waiting for its session's link to drain (COP-43).
     /// See `finish_drained_disconnect`.
     pending_disconnect: Option<PendingDisconnect>,
-=======
-    session_link: Option<SessionLink>,
->>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
     /// Host bytes waiting for ARQ window space (COP-41, D5): an event too
     /// large for the 8-segment window is held here -- never dropped -- and
     /// `pump_arq_backlog` moves it into window segments as ACKs free space.
@@ -730,12 +726,8 @@ impl EventLoop {
             ws_status: None,
             vara_responses: None,
             tx_queue: VecDeque::new(),
-<<<<<<< HEAD
-            session_tx_queue: VecDeque::new(),
-            pending_disconnect: None,
-=======
             session_link: None,
->>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
+            pending_disconnect: None,
             arq_tx_backlog: VecDeque::new(),
             tx_on_air_bytes: 0,
             last_reported_buffer: 0,
@@ -1576,6 +1568,8 @@ impl EventLoop {
                 // Unreachable: `can_send` was checked before transmitting.
                 Err(e) => tracing::error!(error = %e, seq, "Session ARQ window full"),
             }
+            let session_id = link.session_id;
+            self.touch_draining_session(session_id);
         }
         self.tx_frame_count += 1;
         tracing::debug!(
@@ -1673,7 +1667,9 @@ impl EventLoop {
     /// established beside the first would rebuild the link and drop the
     /// first session's backlog, in-flight segment and receive position
     /// without disconnecting it. That includes a second slot for the same
-    /// peer (a repeat CONNECT_REQ, or one on another SSID).
+    /// peer (a repeat CONNECT_REQ, or one on another SSID). A session
+    /// draining before a host DISCONNECT (COP-43) counts too: its link is
+    /// still sending, so an inbound CONNECT_REQ gets no answer during it.
     fn active_session_remote(&self) -> Option<Callsign> {
         self.session_mgr
             .active_sessions()
@@ -1709,6 +1705,19 @@ impl EventLoop {
         {
             return;
         }
+        // COP-43: a frame still within its retry budget keeps a draining
+        // session alive, so the RTO backoff (which outgrows the 10 s
+        // `disconnect_timeout`) cannot reap a drain the link would recover;
+        // `give_up_at` above bounds it instead. Not while the gate holds
+        // the retransmission (the early return above): nothing can key then.
+        if let Some(session_id) = self
+            .session_link
+            .as_ref()
+            .filter(|l| l.tx.in_flight() > 0)
+            .map(|l| l.session_id)
+        {
+            self.touch_draining_session(session_id);
+        }
         let Some(link) = self.session_link.as_mut() else {
             return;
         };
@@ -1732,34 +1741,6 @@ impl EventLoop {
                 Ok(samples) => {
                     tracing::debug!(seq, attempt, "Retransmitting session frame");
                     Box::pin(self.transmit_samples(&samples)).await;
-<<<<<<< HEAD
-                    if self.tx_generation == generation {
-                        // The gate passed above but refused after the
-                        // courtesy wait (the one `transmit_samples` path
-                        // that keys nothing and leaves `tx_generation`
-                        // alone). Put the chunk back at the head, so the
-                        // retry poll resumes the stream without a hole.
-                        self.session_tx_queue.push_front(chunk);
-                        self.session_tx_held_by_frequency_gate = true;
-                        self.report_buffer().await;
-                        return;
-                    }
-                    self.tx_frame_count += 1;
-                    // COP-43: a draining session's drain is progress, so its
-                    // `disconnect_timeout` bounds a stall, not a long queue.
-                    // Established sessions keep their timeout semantics.
-                    if let Some(session) = self.session_mgr.get_mut(chunk.session_id) {
-                        if session.state == SessionState::Disconnecting {
-                            session.touch();
-                        }
-                    }
-                    tracing::debug!(
-                        frame = self.tx_frame_count,
-                        max = self.max_frames_per_turn,
-                        "Session data frame transmitted"
-                    );
-=======
->>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
                 }
                 Err(e) => tracing::warn!(
                     error = %e,
@@ -1797,6 +1778,15 @@ impl EventLoop {
                 "Session link failed: no ACK after the retry budget; disconnecting"
             );
         }
+        // COP-43: a draining session already has its DISCONNECT frame and
+        // the client that asked for it.
+        if let Some(pending) = self
+            .pending_disconnect
+            .take_if(|p| p.session_id == session_id)
+        {
+            self.end_local_disconnect(pending).await;
+            return;
+        }
         self.end_session(session_id, 0).await;
     }
 
@@ -1828,17 +1818,18 @@ impl EventLoop {
             .await;
     }
 
-    /// COP-43: end a pending host `DISCONNECT` once its session's chunks
-    /// have all left `session_tx_queue` and the last one's PTT release has
-    /// run (`!is_transmitting`), so `BUFFER 0` comes before `DISCONNECTED`.
-    /// A no-op while anything of that session is still queued or keyed.
+    /// COP-43: end a pending host `DISCONNECT` once its session's link has
+    /// sent its whole backlog and the peer has ACKed every frame (COP-38),
+    /// and nothing is keyed (`!is_transmitting`), so `BUFFER 0` comes before
+    /// `DISCONNECTED`. A no-op while any of that session's data is unsent,
+    /// un-acked or on the air.
     async fn finish_drained_disconnect(&mut self) {
         let drained = !self.is_transmitting
             && self.pending_disconnect.as_ref().is_some_and(|p| {
-                !self
-                    .session_tx_queue
-                    .iter()
-                    .any(|chunk| chunk.session_id == p.session_id)
+                self.session_link
+                    .as_ref()
+                    .filter(|l| l.session_id == p.session_id)
+                    .is_none_or(|l| l.backlog.is_empty() && l.tx.in_flight() == 0)
             });
         if let Some(pending) = self.pending_disconnect.take_if(|_| drained) {
             self.end_local_disconnect(pending).await;
@@ -1847,21 +1838,34 @@ impl EventLoop {
 
     /// COP-43: send a local DISCONNECT's frame, remove the session and tell
     /// the requesting client `DISCONNECTED`. Called once the drain finishes,
-    /// or when it stalls (the reaper), in which case the unsent rest is
-    /// dropped first. The record is already taken, so re-entry through
-    /// `transmit_samples` cannot send the frame twice.
+    /// or when it stalls (the reaper) or the link fails (COP-38's retry
+    /// budget), in which case the unsent and un-acked rest is dropped first.
+    /// The record is already taken, so re-entry through `transmit_samples`
+    /// cannot send the frame twice.
     async fn end_local_disconnect(&mut self, pending: PendingDisconnect) {
-        self.discard_session_tx(pending.session_id).await; // A no-op after a full drain.
+        self.discard_session_tx(pending.session_id).await; // Drops the drained link.
         match self.engine.encode_bytes(&pending.pdu_bytes) {
             // Boxed: `handle_ptt_change` -> `finish_drained_disconnect` ->
             // `transmit_samples` -> `handle_ptt_change` is the same async
-            // call cycle `drain_session_tx_queue` documents.
+            // call cycle `drain_session_link` documents.
             Ok(samples) => Box::pin(self.transmit_samples(&samples)).await,
             Err(e) => tracing::warn!(error = %e, "Failed to encode DISCONNECT"),
         }
         self.session_mgr.remove(pending.session_id);
         self.notify_session(pending.client_id, SessionNotice::Disconnected)
             .await;
+    }
+
+    /// COP-43: a draining session's frame keyed, or one is still within its
+    /// retry budget, so its drain is moving and `disconnect_timeout` bounds
+    /// a stall, not a long backlog. Established sessions keep their timeout
+    /// semantics.
+    fn touch_draining_session(&mut self, session_id: u8) {
+        if let Some(session) = self.session_mgr.get_mut(session_id) {
+            if session.state == SessionState::Disconnecting {
+                session.touch();
+            }
+        }
     }
 
     /// COP-41 (D4/D5): move `arq_tx_backlog` bytes into ARQ window segments
@@ -2310,19 +2314,19 @@ impl EventLoop {
                     }
                 };
 
-<<<<<<< HEAD
                 // COP-43: a CONNECT during a DISCONNECT drain ends that
-                // drain first. Its session would otherwise still match the
-                // peer's callsign (`find_by_remote`) and catch the new
-                // session's CONNECT_ACK, and its DISCONNECT frame, keyed
-                // later, would tear down the new link on the peer's side.
+                // drain first. The host has already ended that session, so
+                // it must not count as the active session COP-38 refuses a
+                // CONNECT for, and its DISCONNECT frame, keyed later, would
+                // tear down the new link on the peer's side.
                 if let Some(pending) = self.pending_disconnect.take() {
                     tracing::info!(
                         session_id = pending.session_id,
                         "CONNECT during a DISCONNECT drain; ending the drain first"
                     );
                     self.end_local_disconnect(pending).await;
-=======
+                }
+
                 // COP-38: one session at a time (`active_session_remote`).
                 // The host ends the current session with DISCONNECT before
                 // dialling again. Only the dialling client hears the
@@ -2341,7 +2345,6 @@ impl EventLoop {
                     }
                     self.reply_vara(client_id, VaraResponse::Disconnected).await;
                     return;
->>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
                 }
 
                 let caps = LinkCapabilities::default();
@@ -2403,21 +2406,20 @@ impl EventLoop {
                     .copied();
 
                 if let Some(id) = session_id {
-<<<<<<< HEAD
                     let disconnect = self.session_mgr.get_mut(id).map(|s| s.disconnect());
                     match disconnect {
                         Some(Ok(disc_pdu)) => {
                             // COP-43: VARA's `DISCONNECT` disconnects "once
-                            // the TX buffer is empty", so the session's
-                            // queued chunks play first. It now sits in
+                            // the TX buffer is empty", so the session link's
+                            // backlog plays and its frames are ACKed first. It now sits in
                             // `Disconnecting`, which stops new host data and
                             // keepalives for it; `finish_drained_disconnect`
                             // sends the frame once the drain finishes, and
                             // the reaper ends a drain that stops moving.
-                            // One record is kept: an earlier session still
-                            // draining (e.g. a peer connected meanwhile and
-                            // the host disconnects that one too) ends now
-                            // rather than being orphaned without its frame.
+                            // One record is kept. COP-38's one-session rule
+                            // means no other session should still be
+                            // draining; if one is, it ends now rather than
+                            // being orphaned without its frame.
                             if let Some(earlier) = self.pending_disconnect.take() {
                                 self.end_local_disconnect(earlier).await;
                             }
@@ -2430,7 +2432,7 @@ impl EventLoop {
                             if self.pending_disconnect.is_some() {
                                 tracing::info!(
                                     session_id = id,
-                                    "DISCONNECT waits for the session's queued data to play"
+                                    "DISCONNECT waits for the session's data to be acknowledged"
                                 );
                             }
                         }
@@ -2443,11 +2445,6 @@ impl EventLoop {
                         }
                         None => {}
                     }
-=======
-                    // The session's link ends with it; none of its data may
-                    // play after the host is told DISCONNECTED.
-                    self.end_session(id, client_id).await;
->>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
                 } else {
                     tracing::debug!("Disconnect request but no active session");
                 }
@@ -3083,12 +3080,8 @@ impl EventLoop {
                     );
                 }
                 self.try_drain_tx_queue().await;
-<<<<<<< HEAD
-                self.drain_session_tx_queue().await;
-                self.finish_drained_disconnect().await;
-=======
                 self.drain_session_link().await;
->>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
+                self.finish_drained_disconnect().await;
                 return;
             }
         }
@@ -4639,7 +4632,10 @@ impl EventLoop {
 
     /// COP-38 (D7): the peer's ACK for session data. Frees the stop-and-wait
     /// window, lowers `BUFFER` by the acknowledged bytes and sends the next
-    /// frame. An ACK from an unknown or unestablished peer changes nothing.
+    /// frame; for the session a pending host DISCONNECT is draining (COP-43),
+    /// the last ACK ends the drain. An ACK from an unknown peer, or one whose
+    /// session is neither established nor that draining one, changes
+    /// nothing.
     async fn handle_session_ack(&mut self, pdu: MacPdu) {
         let session_id = self.session_id_for_frame(&pdu);
         let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) else {
@@ -4649,7 +4645,12 @@ impl EventLoop {
             );
             return;
         };
-        if !session.is_established() {
+        let draining = session.state == SessionState::Disconnecting
+            && self
+                .pending_disconnect
+                .as_ref()
+                .is_some_and(|p| p.session_id == session.id);
+        if !session.is_established() && !draining {
             return;
         }
         session.touch();
@@ -4689,6 +4690,7 @@ impl EventLoop {
         if !acked.is_empty() {
             self.report_buffer().await;
             Box::pin(self.drain_session_link()).await;
+            Box::pin(self.finish_drained_disconnect()).await;
         }
     }
 
@@ -4707,12 +4709,8 @@ impl EventLoop {
             // sends only once its in-flight frame is ACKed, so this release
             // only resumes a frame a busy transmitter held back.
             self.try_drain_tx_queue().await;
-<<<<<<< HEAD
-            self.drain_session_tx_queue().await;
-            self.finish_drained_disconnect().await;
-=======
             self.drain_session_link().await;
->>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
+            self.finish_drained_disconnect().await;
         }
     }
 
@@ -12304,22 +12302,14 @@ mod tests {
             assert_eq!((link.backlog.len(), link.tx.in_flight()), (0, 1));
         }
 
-<<<<<<< HEAD
-        /// A session's unsent chunks die with the session (COP-41 review):
-        /// after a remote DISCONNECT or a timeout, the queue holds none of
-        /// its chunks, `BUFFER` stops counting them, and the next PTT
-        /// release keys nothing -- before this, the queue kept transmitting
-        /// the dead session's data on every release. A local DISCONNECT
-        /// drains them first instead (COP-43, see
-        /// `local_disconnect_drains_queued_chunks_before_the_disconnect_frame`).
-=======
         /// A session's unsent data dies with the session (COP-41 review):
-        /// after a local DISCONNECT, a remote DISCONNECT, or a timeout, the
-        /// session link is gone (COP-38: its backlog and its un-acked frame
-        /// both), `BUFFER` stops counting them, and neither the next PTT
-        /// release nor an elapsed RTO keys anything -- before this, the queue
-        /// kept transmitting the dead session's data on every release.
->>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
+        /// after a remote DISCONNECT or a timeout, the session link is gone
+        /// (COP-38: its backlog and its un-acked frame both), `BUFFER` stops
+        /// counting them, and neither the next PTT release nor an elapsed RTO
+        /// keys anything -- before this, the queue kept transmitting the dead
+        /// session's data on every release. A local DISCONNECT drains the
+        /// link first instead (COP-43, see
+        /// `local_disconnect_drains_queued_data_before_the_disconnect_frame`).
         #[tokio::test]
         async fn ended_session_discards_its_unsent_chunks() {
             #[derive(Debug, Clone, Copy)]
@@ -12368,14 +12358,9 @@ mod tests {
                 assert!(event_loop.session_link.is_none(), "{end:?}");
                 assert_eq!(event_loop.buffered_tx_bytes(), 0, "{end:?}");
 
-<<<<<<< HEAD
-                // Discard whatever the end itself keyed, then release: no
-                // stale chunk may play.
-=======
-                // Discard whatever the end itself keyed (the data frame and
-                // the local DISCONNECT frame), then release: no stale frame
-                // may play, and no retransmission either.
->>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
+                // Discard whatever was keyed (the first data frame), then
+                // release: no stale frame may play, and no retransmission
+                // either.
                 let mut buf = vec![0.0f32; 4_000_000];
                 while consumer.read(&mut buf) > 0 {}
                 let frames_before = event_loop.tx_frame_count;
@@ -12393,7 +12378,6 @@ mod tests {
             }
         }
 
-<<<<<<< HEAD
         /// The frame types `CoppaCore` decodes from one keyed interval's
         /// audio, in order. HF_STANDARD, the daemon's default profile:
         /// `CoppaCore::new()` would decode only a station-ID beacon.
@@ -12410,12 +12394,48 @@ mod tests {
                 .collect()
         }
 
-        /// `seed_established` plus a 300-byte host write held unsent (more
-        /// than one chunk), with a mock VARA client on the given ports.
-        async fn draining_station(
-            cmd_port: u16,
-            data_port: u16,
-        ) -> (
+        /// `connect_mock_vara_client` on OS-assigned ports: both listeners
+        /// are bound to `127.0.0.1:0` before the server runs, so concurrent
+        /// test runs (separate checkouts, parallel CI slots) can never
+        /// collide on a port or attach to another run's server.
+        async fn connect_mock_vara_client_ephemeral(
+            event_loop: &mut EventLoop,
+        ) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
+            let cmd_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind VARA command port");
+            let data_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind VARA data port");
+            let cmd_addr = cmd_listener.local_addr().expect("command listener address");
+            let server = VaraServer::new(cmd_addr.port(), 0);
+            event_loop.set_vara_responses(server.response_senders());
+            tokio::spawn(async move {
+                server
+                    .run_with_listeners(cmd_listener, data_listener)
+                    .await
+                    .expect("VARA server accept loops");
+            });
+
+            // Listeners are already bound, so the connect cannot race the bind.
+            let stream = TcpStream::connect(cmd_addr)
+                .await
+                .expect("mock client should connect to the VARA command port");
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let greeting = read_line(&mut reader).await;
+            assert!(
+                greeting.starts_with("VERSION"),
+                "expected a VERSION greeting first, got: {}",
+                greeting
+            );
+            (reader, write_half)
+        }
+
+        /// `seed_established` plus a 300-byte host write held unsent in the
+        /// session link's backlog (more than one frame), with a mock VARA
+        /// client on OS-assigned ports.
+        async fn draining_station() -> (
             EventLoop,
             coppa_audio::AudioRingConsumer,
             BufReader<OwnedReadHalf>,
@@ -12425,10 +12445,10 @@ mod tests {
             let mut station = EventLoop::new(session_config()).unwrap();
             let (producer, consumer) = coppa_audio::audio_ring(4_000_000);
             station.set_audio_out(producer);
-            let (reader, writer) =
-                connect_mock_vara_client(&mut station, cmd_port, data_port).await;
+            let (reader, writer) = connect_mock_vara_client_ephemeral(&mut station).await;
             let id = seed_established(&mut station);
-            // Hold the queue, as if a frame were on the air.
+            station.ensure_session_link(id);
+            // Hold the link, as if a frame were on the air.
             station.is_transmitting = true;
             station
                 .handle_host_event(HostEvent::DataReceived {
@@ -12436,21 +12456,21 @@ mod tests {
                     data: (0..300).map(|i| (i % 251) as u8).collect(),
                 })
                 .await;
-            assert!(station.session_tx_queue.len() > 1);
+            let link = station.session_link.as_ref().unwrap();
+            assert_eq!((link.backlog.len(), link.tx.in_flight()), (300, 0));
             assert_eq!(station.buffered_tx_bytes(), 300);
             (station, consumer, reader, writer, id)
         }
 
         /// COP-43: a local DISCONNECT sends what the host already queued
-        /// first ("once the TX buffer is empty", as VARA documents it), one
-        /// chunk per keyed interval, then keys the DISCONNECT frame in its
-        /// own interval and pushes one `DISCONNECTED`, after `BUFFER 0`. A
-        /// repeated DISCONNECT changes nothing.
+        /// first ("once the TX buffer is empty", as VARA documents it). With
+        /// COP-38's stop-and-wait link that means every frame is sent and
+        /// ACKed; only then does the DISCONNECT frame key, in its own
+        /// interval, and the host hear one `DISCONNECTED`, after `BUFFER 0`.
+        /// A repeated DISCONNECT changes nothing.
         #[tokio::test]
-        async fn local_disconnect_drains_queued_chunks_before_the_disconnect_frame() {
-            let (mut station, mut consumer, mut reader, _writer, id) =
-                draining_station(19510, 19511).await;
-            let chunks = station.session_tx_queue.len();
+        async fn local_disconnect_drains_queued_data_before_the_disconnect_frame() {
+            let (mut station, mut consumer, mut reader, _writer, id) = draining_station().await;
 
             for _ in 0..2 {
                 station
@@ -12462,7 +12482,6 @@ mod tests {
                 Some(SessionState::Disconnecting),
                 "the session must wait for its queued data"
             );
-            assert_eq!(station.session_tx_queue.len(), chunks);
             assert_eq!(station.buffered_tx_bytes(), 300);
             station.flush_pending_audio_out();
             let mut buf = vec![0.0f32; 4_000_000];
@@ -12470,15 +12489,29 @@ mod tests {
 
             let frames_before = station.tx_frame_count;
             let mut last_interval = Vec::new();
-            for _ in 0..=chunks {
+            for _ in 0..64 {
                 if station.session_mgr.get(id).is_none() {
                     break;
                 }
+                // Release whatever is keyed: the link sends its next frame,
+                // or, once everything is ACKed, the DISCONNECT frame keys.
                 station.handle_ptt_change(false).await;
                 station.flush_pending_audio_out();
                 let n = consumer.read(&mut buf);
                 if n > 0 {
                     last_interval = buf[..n].to_vec();
+                }
+                if station
+                    .session_link
+                    .as_ref()
+                    .is_some_and(|l| l.tx.in_flight() > 0)
+                {
+                    assert_eq!(
+                        station.session_mgr.get(id).map(|s| s.state),
+                        Some(SessionState::Disconnecting),
+                        "an un-acked frame must hold the DISCONNECT"
+                    );
+                    ack_in_flight(&mut station).await;
                 }
             }
             assert!(
@@ -12486,10 +12519,10 @@ mod tests {
                 "the drained session must end"
             );
             assert!(station.pending_disconnect.is_none());
-            assert_eq!(
-                station.tx_frame_count - frames_before,
-                chunks,
-                "every queued chunk must play"
+            assert!(station.session_link.is_none());
+            assert!(
+                station.tx_frame_count - frames_before >= 2,
+                "300 bytes take more than one frame, and every one must play"
             );
             assert_eq!(
                 decoded_frame_types(&last_interval).last(),
@@ -12520,22 +12553,21 @@ mod tests {
         }
 
         /// COP-43: a pending DISCONNECT ends exactly once when its drain
-        /// stalls for `disconnect_timeout` (the rest is dropped and the
-        /// DISCONNECT frame still keys) or the peer disconnects first (no
-        /// frame to a peer that has left). Either way the next PTT release
-        /// keys nothing and the host hears one `DISCONNECTED`.
+        /// stalls for `disconnect_timeout` or its link spends COP-38's retry
+        /// budget (the rest is dropped and the DISCONNECT frame still keys),
+        /// or when the peer disconnects first (no frame to a peer that has
+        /// left). Either way the next PTT release keys nothing and the host
+        /// hears one `DISCONNECTED`.
         #[tokio::test]
-        async fn a_pending_disconnect_ends_once_on_stall_or_remote_disconnect() {
+        async fn a_pending_disconnect_ends_once_on_stall_link_failure_or_remote_disconnect() {
             #[derive(Debug, Clone, Copy)]
             enum End {
                 Stall,
+                LinkFailed,
                 Remote,
             }
-            for (end, cmd_port, data_port) in
-                [(End::Stall, 19512, 19513), (End::Remote, 19514, 19515)]
-            {
-                let (mut station, mut consumer, mut reader, _writer, id) =
-                    draining_station(cmd_port, data_port).await;
+            for end in [End::Stall, End::LinkFailed, End::Remote] {
+                let (mut station, mut consumer, mut reader, _writer, id) = draining_station().await;
                 station
                     .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
                     .await;
@@ -12549,6 +12581,7 @@ mod tests {
                             Duration::ZERO;
                         station.reap_timed_out_sessions().await;
                     }
+                    End::LinkFailed => station.fail_session_link(id).await,
                     End::Remote => {
                         let disc = MacPdu::new(
                             MacFrameType::Disconnect,
@@ -12562,7 +12595,7 @@ mod tests {
                 }
                 assert!(station.pending_disconnect.is_none(), "{end:?}");
                 assert!(station.session_mgr.get(id).is_none(), "{end:?}");
-                assert!(station.session_tx_queue.is_empty(), "{end:?}");
+                assert!(station.session_link.is_none(), "{end:?}");
                 assert_eq!(station.buffered_tx_bytes(), 0, "{end:?}");
 
                 station.flush_pending_audio_out();
@@ -12573,7 +12606,7 @@ mod tests {
                     .filter(|frame_type| *frame_type == MacFrameType::Disconnect)
                     .count();
                 let expected = match end {
-                    End::Stall => 1,
+                    End::Stall | End::LinkFailed => 1,
                     End::Remote => 0,
                 };
                 assert_eq!(disconnect_frames, expected, "{end:?}");
@@ -12600,14 +12633,40 @@ mod tests {
             }
         }
 
-        /// COP-43: a CONNECT before `DISCONNECTED` ends the drain first, so
-        /// the old `Disconnecting` session cannot catch the new session's
-        /// frames and its DISCONNECT frame keys before the CONNECT_REQ, not
-        /// after it (where it would tear down the new link at the peer).
+        /// COP-43: a frame still within its retry budget keeps a draining
+        /// session alive past `disconnect_timeout`, so an RTO backoff longer
+        /// than that timeout cannot reap a drain the link would recover; the
+        /// retry budget (`give_up_at`) bounds it instead.
+        #[tokio::test]
+        async fn an_in_flight_frame_keeps_a_disconnect_drain_alive_between_retransmissions() {
+            let (mut station, _consumer, _reader, _writer, id) = draining_station().await;
+            station
+                .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+                .await;
+            station.handle_ptt_change(false).await;
+            assert_eq!(station.session_link.as_ref().unwrap().tx.in_flight(), 1);
+
+            // Shorter than the link's 5 s RTO, so no retransmission is due.
+            station.session_mgr.get_mut(id).unwrap().disconnect_timeout = Duration::from_millis(50);
+            std::thread::sleep(Duration::from_millis(60));
+            station.check_session_retransmits().await;
+            station.reap_timed_out_sessions().await;
+            assert_eq!(
+                station.session_mgr.get(id).map(|s| s.state),
+                Some(SessionState::Disconnecting),
+                "a frame awaiting its ACK must keep the drain alive"
+            );
+            assert!(station.pending_disconnect.is_some());
+        }
+
+        /// COP-43: a host CONNECT before `DISCONNECTED` ends the drain first,
+        /// so the old `Disconnecting` session neither blocks the dial as
+        /// COP-38's active session nor catches the new session's frames, and
+        /// its DISCONNECT frame keys before the CONNECT_REQ, not after it
+        /// (where it would tear down the new link at the peer).
         #[tokio::test]
         async fn connect_during_a_disconnect_drain_ends_the_drain_first() {
-            let (mut station, mut consumer, mut reader, _writer, id) =
-                draining_station(19516, 19517).await;
+            let (mut station, mut consumer, mut reader, _writer, id) = draining_station().await;
             station
                 .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
                 .await;
@@ -12621,7 +12680,7 @@ mod tests {
                 })
                 .await;
             assert!(station.pending_disconnect.is_none());
-            assert!(station.session_tx_queue.is_empty());
+            assert!(station.session_link.is_none());
             let sessions: Vec<SessionState> = station
                 .session_mgr
                 .active_sessions()
@@ -12653,16 +12712,52 @@ mod tests {
             );
         }
 
-        /// Unsent session chunks resume after canceled playback, once the
-        /// output worker has discarded the canceled frame's buffered audio.
-=======
+        /// COP-43 (PR #158 review): the draining peer's own CONNECT_REQ
+        /// during the drain gets no session (COP-38's one-session rule
+        /// counts the `Disconnecting` session), so no second slot for the
+        /// same callsign can shadow the draining one, and the drain still
+        /// ends on the last ACK with its DISCONNECT frame.
+        #[tokio::test]
+        async fn an_inbound_connect_req_during_a_disconnect_drain_waits_for_the_drain() {
+            let (mut station, _consumer, _reader, _writer, id) = draining_station().await;
+            station.listening = true;
+            station
+                .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+                .await;
+            assert!(station.pending_disconnect.is_some());
+
+            let mut caller = peer();
+            station.handle_mac_pdu(caller.initiate().unwrap()).await;
+            assert_eq!(station.session_mgr.active_sessions(), vec![id]);
+            assert_eq!(
+                station.session_mgr.get(id).map(|s| s.state),
+                Some(SessionState::Disconnecting)
+            );
+
+            for _ in 0..64 {
+                if station.session_mgr.get(id).is_none() {
+                    break;
+                }
+                station.handle_ptt_change(false).await;
+                if station
+                    .session_link
+                    .as_ref()
+                    .is_some_and(|l| l.tx.in_flight() > 0)
+                {
+                    ack_in_flight(&mut station).await;
+                }
+            }
+            assert!(station.session_mgr.get(id).is_none());
+            assert!(station.session_mgr.active_sessions().is_empty());
+            assert!(station.pending_disconnect.is_none());
+        }
+
         /// Canceled playback of a session frame (COP-41 resumed the unsent
         /// chunks once the output worker discarded the canceled audio).
         /// COP-38 is stop-and-wait: after the discard barrier the canceled
         /// frame is still in flight (nothing else may key, and `BUFFER` still
         /// counts all 300 bytes); its retransmission plays alone (none of the
         /// canceled tail), and the peer's ACK then sends the next chunk.
->>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
         #[tokio::test(start_paused = true)]
         async fn cancelled_session_frame_stays_in_flight_after_discard() {
             let mut rig = TxRig::new(session_config());
