@@ -4,13 +4,25 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use coppa_engine::config::EngineConfig;
 use coppa_engine::CoppaCore;
+use serde::Serialize;
+use std::io::Write;
 
 /// Output verbosity level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verbosity {
     Quiet,
     Normal,
-    Verbose,
+    Verbose(u8),
+}
+
+impl Verbosity {
+    fn is_verbose(self) -> bool {
+        matches!(self, Self::Verbose(_))
+    }
+
+    fn is_extended(self) -> bool {
+        matches!(self, Self::Verbose(count) if count >= 2)
+    }
 }
 
 #[derive(Parser)]
@@ -20,11 +32,11 @@ enum Verbosity {
     version
 )]
 struct Cli {
-    /// Enable verbose output (SNR, sample counts, DSP diagnostics).
-    #[arg(long, global = true)]
-    verbose: bool,
+    /// Increase diagnostic output; repeat for frame metrics.
+    #[arg(short, long, global = true, action = clap::ArgAction::Count, conflicts_with = "quiet")]
+    verbose: u8,
     /// Suppress all output except decoded messages.
-    #[arg(long, global = true)]
+    #[arg(short, long, global = true, conflicts_with = "verbose")]
     quiet: bool,
     #[command(subcommand)]
     command: Option<Commands>,
@@ -57,6 +69,9 @@ struct RxArgs {
     /// Show the payload as lowercase hex even when it is valid UTF-8 text.
     #[arg(long)]
     hex: bool,
+    /// Emit one JSON object per decoded frame.
+    #[arg(long, conflicts_with_all = ["raw", "hex"])]
+    json: bool,
     /// Audio input device name (substring match, live capture only).
     #[arg(long)]
     device: Option<String>,
@@ -67,6 +82,117 @@ impl RxArgs {
     fn path(&self) -> Option<&str> {
         self.file.as_deref().or(self.input.as_deref())
     }
+}
+
+#[derive(clap::Args)]
+struct ProfilesArgs {
+    /// Profile name to show.
+    #[arg(short, long)]
+    profile: Option<String>,
+    /// Emit JSON output.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Serialize)]
+struct DeviceOutput {
+    name: String,
+    max_sample_rate_hz: u32,
+    input_channels: u16,
+    output_channels: u16,
+}
+
+impl From<&coppa_audio::AudioDevice> for DeviceOutput {
+    fn from(device: &coppa_audio::AudioDevice) -> Self {
+        Self {
+            name: device.name.clone(),
+            max_sample_rate_hz: device.max_sample_rate,
+            input_channels: device.input_channels,
+            output_channels: device.output_channels,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ProfileOutput {
+    name: &'static str,
+    description: &'static str,
+    speed_level: u8,
+    max_payload_bytes: usize,
+    compression: bool,
+    sample_rate_hz: u32,
+    ofdm_profile: &'static str,
+}
+
+#[derive(Clone, Copy)]
+enum RxOutputMode {
+    Text { hex: bool },
+    Raw,
+    Json,
+}
+
+impl From<&RxArgs> for RxOutputMode {
+    fn from(args: &RxArgs) -> Self {
+        if args.json {
+            Self::Json
+        } else if args.raw {
+            Self::Raw
+        } else {
+            Self::Text { hex: args.hex }
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RxFrameOutput<'a> {
+    payload_text: Option<&'a str>,
+    payload_hex: String,
+    snr_db: Option<f32>,
+    cfo_hz: Option<f32>,
+    frame_start: u64,
+    speed_level: u8,
+}
+
+fn finite(value: f32) -> Option<f32> {
+    value.is_finite().then_some(value)
+}
+
+impl<'a> RxFrameOutput<'a> {
+    fn from_frame(frame: &coppa_engine::StreamFrame, bytes: &'a [u8]) -> Self {
+        Self {
+            payload_text: std::str::from_utf8(bytes).ok(),
+            payload_hex: hex_string(bytes),
+            snr_db: finite(frame.snr_db),
+            cfo_hz: finite(frame.cfo_hz),
+            frame_start: frame.frame_start,
+            speed_level: frame.speed_level,
+        }
+    }
+}
+
+impl ProfileOutput {
+    fn from_profile(profile: &coppa_engine::profiles::Profile) -> Result<Self> {
+        let max_payload_bytes =
+            coppa_protocol::modem::max_payload_for_level(profile.speed_level)
+                .ok_or_else(|| anyhow::anyhow!("Invalid speed level for {}", profile.name))?;
+        Ok(Self {
+            name: profile.name,
+            description: profile.description,
+            speed_level: profile.speed_level,
+            max_payload_bytes,
+            compression: profile.compression,
+            sample_rate_hz: profile.sample_rate,
+            ofdm_profile: profile.ofdm_profile,
+        })
+    }
+}
+
+fn write_json<T: Serialize>(value: &T) -> Result<()> {
+    let line = serde_json::to_string(value)?;
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{line}")?;
+    stdout.flush()?;
+    Ok(())
 }
 
 /// Printed on stderr every time the hidden `listen` alias runs (COP-56).
@@ -172,7 +298,13 @@ enum Commands {
         band: Option<String>,
     },
     /// List available audio devices.
-    Devices,
+    Devices {
+        /// Emit a JSON array of audio devices.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List operating profiles or show one profile.
+    Profiles(ProfilesArgs),
     /// Show current configuration.
     Config {
         /// Profile name to show.
@@ -239,8 +371,8 @@ fn main() -> Result<()> {
 
     let verbosity = if cli.quiet {
         Verbosity::Quiet
-    } else if cli.verbose {
-        Verbosity::Verbose
+    } else if cli.verbose > 0 {
+        Verbosity::Verbose(cli.verbose)
     } else {
         Verbosity::Normal
     };
@@ -306,7 +438,8 @@ fn main() -> Result<()> {
             band.as_deref(),
             verbosity,
         )?,
-        Some(Commands::Devices) => cmd_devices()?,
+        Some(Commands::Devices { json }) => cmd_devices(json)?,
+        Some(Commands::Profiles(args)) => cmd_profiles(args.profile.as_deref(), args.json)?,
         Some(Commands::Config { profile }) => cmd_config(profile.as_deref())?,
         #[cfg(feature = "kiss-tnc")]
         Some(Commands::Tnc {
@@ -650,7 +783,7 @@ fn cmd_tx(
     let config = resolve_config(profile)?;
     let core = CoppaCore::with_config(config);
 
-    if verbosity == Verbosity::Verbose {
+    if verbosity.is_verbose() {
         if let Some(cs) = callsign {
             eprintln!("[verbose] Callsign: {}", cs);
         }
@@ -668,7 +801,7 @@ fn cmd_tx(
     if verbosity != Verbosity::Quiet {
         println!("Generated {} audio samples", samples.len());
     }
-    if verbosity == Verbosity::Verbose {
+    if verbosity.is_verbose() {
         let duration_s = samples.len() as f64 / core.config().sample_rate as f64;
         eprintln!("[verbose] Audio duration: {:.3} s", duration_s);
     }
@@ -834,8 +967,9 @@ fn cmd_tune(
 fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
     let config = resolve_config(args.profile.as_deref())?;
     let mut core = CoppaCore::with_config(config);
+    let output_mode = RxOutputMode::from(args);
 
-    if verbosity == Verbosity::Verbose {
+    if verbosity.is_verbose() {
         if let Some(cs) = &args.callsign {
             eprintln!("[verbose] Callsign: {}", cs);
         }
@@ -851,7 +985,7 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
             // The file's own rate: WavSource does not resample, so "the
             // first N seconds" is N times the rate the samples were written at.
             let limit = file_sample_limit(total, args.duration, source.sample_rate());
-            if verbosity != Verbosity::Quiet && !args.raw {
+            if verbosity != Verbosity::Quiet && !args.raw && !args.json {
                 if limit < total {
                     println!(
                         "Reading the first {} s ({} of {} samples) from {}",
@@ -867,8 +1001,7 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 &mut source,
                 Some(limit),
                 None,
-                args.raw,
-                args.hex,
+                output_mode,
                 verbosity,
             )?;
             source.stop()?;
@@ -877,6 +1010,9 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
         {
             let _ = path;
             let _ = &mut core;
+            if args.json {
+                anyhow::bail!("File input not available (compile with file-backend feature)");
+            }
             if verbosity != Verbosity::Quiet {
                 println!("File input not available (compile with file-backend feature)");
             }
@@ -905,7 +1041,7 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 None => coppa_audio::cpal_backend::CpalSource::new(engine_rate, 8192)?,
             };
             source.start()?;
-            let chatty = verbosity != Verbosity::Quiet && !args.raw;
+            let chatty = verbosity != Verbosity::Quiet && !args.raw && !args.json;
             if chatty {
                 if args.duration > 0 {
                     println!(
@@ -922,8 +1058,7 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 &mut source,
                 None,
                 deadline,
-                args.raw,
-                args.hex,
+                output_mode,
                 verbosity,
             )?;
             source.stop()?;
@@ -935,6 +1070,9 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
         {
             let _ = (&args.device, args.duration);
             let _ = &mut core;
+            if args.json {
+                anyhow::bail!("Live audio input not available (compile with cpal-backend feature)");
+            }
             if verbosity != Verbosity::Quiet {
                 println!("Live audio input not available (compile with cpal-backend feature)");
             }
@@ -1006,8 +1144,7 @@ fn stream_decode(
     source: &mut dyn coppa_audio::AudioSource,
     total_samples: Option<usize>,
     deadline: Option<std::time::Instant>,
-    raw: bool,
-    hex: bool,
+    output_mode: RxOutputMode,
     verbosity: Verbosity,
 ) -> Result<()> {
     let mut buf = vec![0.0f32; 4096];
@@ -1018,7 +1155,7 @@ fn stream_decode(
         if n > 0 {
             consumed += n;
             for frame in core.push_samples(&buf[..n]) {
-                print_stream_frame(&frame, raw, hex, verbosity);
+                print_stream_frame(&frame, output_mode, verbosity)?;
             }
         }
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
@@ -1031,7 +1168,7 @@ fn stream_decode(
 
     let silence = vec![0.0f32; TRAILING_FLUSH_SAMPLES];
     for frame in core.push_samples(&silence) {
-        print_stream_frame(&frame, raw, hex, verbosity);
+        print_stream_frame(&frame, output_mode, verbosity)?;
     }
 
     Ok(())
@@ -1065,21 +1202,28 @@ fn format_decoded(bytes: &[u8], snr_db: f32, hex: bool) -> String {
 /// corrupt a `--raw` capture), suppressed entirely in `Verbosity::Quiet`.
 fn print_stream_frame(
     frame: &coppa_engine::StreamFrame,
-    raw: bool,
-    hex: bool,
+    output_mode: RxOutputMode,
     verbosity: Verbosity,
-) {
+) -> Result<()> {
     match &frame.payload {
         Ok(bytes) => {
-            if raw {
-                println!("{}", hex_string(bytes));
-            } else {
-                println!("{}", format_decoded(bytes, frame.snr_db, hex));
+            match output_mode {
+                RxOutputMode::Raw => println!("{}", hex_string(bytes)),
+                RxOutputMode::Text { hex } => {
+                    println!("{}", format_decoded(bytes, frame.snr_db, hex));
+                }
+                RxOutputMode::Json => write_json(&RxFrameOutput::from_frame(frame, bytes))?,
             }
-            if verbosity == Verbosity::Verbose {
+            if verbosity.is_verbose() {
                 eprintln!(
                     "[verbose] level={} cfo_hz={:.1} frame_start={}",
                     frame.speed_level, frame.cfo_hz, frame.frame_start
+                );
+            }
+            if verbosity.is_extended() {
+                eprintln!(
+                    "[verbose] recommended_level={} delay_spread_ms={:.1}",
+                    frame.recommended_level, frame.delay_spread_ms
                 );
             }
         }
@@ -1089,6 +1233,7 @@ fn print_stream_frame(
             }
         }
     }
+    Ok(())
 }
 
 fn cmd_loopback(message: &str, profile: Option<&str>, verbosity: Verbosity) -> Result<()> {
@@ -1101,7 +1246,7 @@ fn cmd_loopback(message: &str, profile: Option<&str>, verbosity: Verbosity) -> R
     let config = resolve_config(profile)?;
     let core = CoppaCore::with_config(config);
 
-    if verbosity == Verbosity::Verbose {
+    if verbosity.is_verbose() {
         eprintln!(
             "[verbose] Config: sample_rate={}, speed_level={}",
             core.config().sample_rate,
@@ -1133,9 +1278,13 @@ fn cmd_loopback(message: &str, profile: Option<&str>, verbosity: Verbosity) -> R
     Ok(())
 }
 
-fn cmd_devices() -> Result<()> {
-    println!("Available audio devices:");
+fn cmd_devices(json: bool) -> Result<()> {
     let devices = coppa_audio::list_devices()?;
+    if json {
+        let output: Vec<_> = devices.iter().map(DeviceOutput::from).collect();
+        return write_json(&output);
+    }
+    println!("Available audio devices:");
     if devices.is_empty() {
         println!("  (none found - CPAL backend may not be available)");
     } else {
@@ -1145,6 +1294,47 @@ fn cmd_devices() -> Result<()> {
                 dev.name, dev.input_channels, dev.output_channels, dev.max_sample_rate
             );
         }
+    }
+    Ok(())
+}
+
+fn cmd_profiles(profile: Option<&str>, json: bool) -> Result<()> {
+    if let Some(name) = profile {
+        let resolved = coppa_engine::profiles::get_profile(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unknown profile: {}. Available: {}",
+                name,
+                coppa_engine::profiles::list_profiles().join(", ")
+            )
+        })?;
+        let output = ProfileOutput::from_profile(resolved)?;
+        if json {
+            return write_json(&output);
+        }
+        println!("Profile: {}", output.name);
+        println!("  Description: {}", output.description);
+        println!("  Speed level: {}", output.speed_level);
+        println!("  Max bytes per frame: {}", output.max_payload_bytes);
+        println!("  Compression: {}", output.compression);
+        println!("  Sample rate: {} Hz", output.sample_rate_hz);
+        println!("  OFDM band: {}", output.ofdm_profile);
+        return Ok(());
+    }
+
+    let profiles: Vec<_> = coppa_engine::profiles::list_profiles()
+        .iter()
+        .map(|name| {
+            let resolved = coppa_engine::profiles::get_profile(name)
+                .ok_or_else(|| anyhow::anyhow!("Profile not found: {name}"))?;
+            ProfileOutput::from_profile(resolved)
+        })
+        .collect::<Result<_>>()?;
+    if json {
+        return write_json(&profiles);
+    }
+    println!("Available profiles:");
+    for profile in profiles {
+        println!("  {} - {}", profile.name, profile.description);
     }
     Ok(())
 }
@@ -1194,6 +1384,40 @@ fn cmd_tnc(port: u16, device: Option<String>, rig: Option<String>, vox: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_json_escapes_names_and_empty_lists() {
+        let empty: Vec<DeviceOutput> = Vec::new();
+        assert_eq!(serde_json::to_string(&empty).unwrap(), "[]");
+        let device = coppa_audio::AudioDevice {
+            name: "USB \"mic\"\nline".into(),
+            max_sample_rate: 48_000,
+            input_channels: 1,
+            output_channels: 2,
+        };
+        let value = serde_json::to_value(DeviceOutput::from(&device)).unwrap();
+        assert_eq!(value["name"], device.name);
+        assert_eq!(value["max_sample_rate_hz"], 48_000);
+        assert_eq!(value.as_object().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn rx_json_non_finite_measurements_are_null() {
+        let frame = coppa_engine::StreamFrame {
+            payload: Ok(vec![0xff, 0x00]),
+            snr_db: f32::NAN,
+            cfo_hz: f32::INFINITY,
+            frame_start: 270,
+            speed_level: 1,
+            recommended_level: 1,
+            delay_spread_ms: 0.0,
+        };
+        let value = serde_json::to_value(RxFrameOutput::from_frame(&frame, &[0xff, 0x00])).unwrap();
+        assert!(value["payload_text"].is_null());
+        assert_eq!(value["payload_hex"], "ff00");
+        assert!(value["snr_db"].is_null());
+        assert!(value["cfo_hz"].is_null());
+    }
 
     #[test]
     fn format_decoded_text() {
@@ -1261,7 +1485,8 @@ mod tests {
 
     #[test]
     fn test_loopback_verbose() {
-        cmd_loopback("Verbose", None, Verbosity::Verbose).expect("verbose loopback should succeed");
+        cmd_loopback("Verbose", None, Verbosity::Verbose(1))
+            .expect("verbose loopback should succeed");
     }
 
     #[test]
@@ -1362,7 +1587,7 @@ mod tests {
             200,
             None,
             None,
-            Verbosity::Verbose,
+            Verbosity::Verbose(1),
         )
         .expect("tx with callsign should succeed");
         #[cfg(feature = "file-backend")]
@@ -2116,6 +2341,51 @@ mod tests {
     }
 
     #[test]
+    fn global_verbosity_flags_count_and_conflict() {
+        for (flags, count) in [
+            (vec!["-v"], 1),
+            (vec!["-vv"], 2),
+            (vec!["-vvv"], 3),
+            (vec!["--verbose", "--verbose"], 2),
+            (vec!["-v", "--verbose"], 2),
+        ] {
+            for before_command in [true, false] {
+                let mut argv = vec!["coppa"];
+                if before_command {
+                    argv.extend(&flags);
+                }
+                argv.push("devices");
+                if !before_command {
+                    argv.extend(&flags);
+                }
+                assert_eq!(Cli::try_parse_from(argv).unwrap().verbose, count);
+            }
+        }
+        for flag in ["-q", "--quiet"] {
+            assert!(
+                Cli::try_parse_from(["coppa", flag, "devices"])
+                    .unwrap()
+                    .quiet
+            );
+            assert!(
+                Cli::try_parse_from(["coppa", "devices", flag])
+                    .unwrap()
+                    .quiet
+            );
+        }
+        for args in [
+            vec!["coppa", "-q", "-v", "devices"],
+            vec!["coppa", "--quiet", "--verbose", "devices"],
+            vec!["coppa", "--verbose", "--quiet", "devices"],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(args).err().unwrap().kind(),
+                clap::error::ErrorKind::ArgumentConflict
+            );
+        }
+    }
+
+    #[test]
     fn file_sample_limit_honours_duration() {
         assert_eq!(file_sample_limit(179_040, 0, 48_000), 179_040);
         assert_eq!(file_sample_limit(179_040, 2, 48_000), 96_000);
@@ -2203,8 +2473,7 @@ mod tests {
             &mut Stalled,
             None,
             deadline,
-            false,
-            false,
+            RxOutputMode::Text { hex: false },
             Verbosity::Quiet,
         )
         .unwrap();
@@ -2225,8 +2494,7 @@ mod tests {
             &mut Endless,
             None,
             deadline,
-            false,
-            false,
+            RxOutputMode::Text { hex: false },
             Verbosity::Quiet,
         )
         .unwrap();
@@ -2246,8 +2514,7 @@ mod tests {
             &mut source,
             Some(10_000),
             None,
-            true,
-            false,
+            RxOutputMode::Raw,
             Verbosity::Quiet,
         )
         .unwrap();
