@@ -162,7 +162,9 @@ log states the host listeners, the audio devices that were opened, and the PTT
 backend in control; see
 [What coppad reports at startup](../OPERATING.md#what-coppad-reports-at-startup).
 
-Logging goes to stdout. `--log-level` takes one of `off`, `error`, `warn`,
+Logging goes to stdout. Colour codes are written only when stdout is a
+terminal and `NO_COLOR` is unset or empty, so a log file or the systemd
+journal gets plain text. `--log-level` takes one of `off`, `error`, `warn`,
 `info`, `debug` or `trace` and overrides `RUST_LOG`. Without it, `RUST_LOG`
 applies (it accepts full tracing filter expressions), and an absent or invalid
 `RUST_LOG` means `info`:

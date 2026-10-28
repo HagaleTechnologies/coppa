@@ -247,7 +247,7 @@ impl KissServer {
             let permit = match semaphore.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    eprintln!("KISS connection limit reached, dropping client {}", peer);
+                    tracing::warn!(%peer, "KISS connection limit reached, dropping client");
                     drop(stream);
                     continue;
                 }
@@ -319,10 +319,10 @@ async fn handle_kiss_client(
                         // MAX_KISS_FRAME_LEN without a delimiter, the peer is misbehaving
                         // (or hostile) — close the connection rather than buffer unboundedly.
                         if accum.len() > MAX_KISS_FRAME_LEN {
-                            eprintln!(
-                                "KISS client {} exceeded max frame size ({} bytes), closing",
-                                peer,
-                                accum.len()
+                            tracing::warn!(
+                                %peer,
+                                len = accum.len(),
+                                "KISS client exceeded max frame size, closing"
                             );
                             break;
                         }

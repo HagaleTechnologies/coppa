@@ -147,7 +147,9 @@ impl VaraServer {
                         let permit = match cmd_semaphore.clone().try_acquire_owned() {
                             Ok(p) => p,
                             Err(_) => {
-                                eprintln!("Command port connection limit reached, dropping client");
+                                tracing::warn!(
+                                    "Command port connection limit reached, dropping client"
+                                );
                                 drop(stream);
                                 continue;
                             }
@@ -167,13 +169,13 @@ impl VaraServer {
                                 VaraCommandPort::handle_client(stream, client_id, ev_tx, resp_rx)
                                     .await
                             {
-                                eprintln!("Command client {} error: {}", client_id, e);
+                                tracing::warn!(client_id, error = %e, "Command client error");
                             }
                             resp_senders_cleanup.lock().await.remove(&cleanup_id);
                         });
                     }
                     Err(e) => {
-                        eprintln!("Command port accept error: {}", e);
+                        tracing::error!(error = %e, "Command port accept error");
                     }
                 }
             }
@@ -191,7 +193,9 @@ impl VaraServer {
                         let permit = match data_semaphore.clone().try_acquire_owned() {
                             Ok(p) => p,
                             Err(_) => {
-                                eprintln!("Data port connection limit reached, dropping client");
+                                tracing::warn!(
+                                    "Data port connection limit reached, dropping client"
+                                );
                                 drop(stream);
                                 continue;
                             }
@@ -208,13 +212,13 @@ impl VaraServer {
                             if let Err(e) =
                                 VaraDataPort::handle_client(stream, client_id, ev_tx, data_rx).await
                             {
-                                eprintln!("Data client {} error: {}", client_id, e);
+                                tracing::warn!(client_id, error = %e, "Data client error");
                             }
                             ds_cleanup.lock().await.remove(&client_id);
                         });
                     }
                     Err(e) => {
-                        eprintln!("Data port accept error: {}", e);
+                        tracing::error!(error = %e, "Data port accept error");
                     }
                 }
             }

@@ -3,6 +3,9 @@
 //! Provides traits and implementations for controlling amateur radio
 //! transceivers and PTT (Push-To-Talk) devices.
 
+// Library diagnostics go through `tracing`, never straight to stdout/stderr.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 use anyhow::Result;
 
 pub mod band;

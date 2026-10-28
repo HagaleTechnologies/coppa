@@ -3,6 +3,9 @@
 //! Provides a VARA-style TCP control protocol (not RF/waveform-compatible with VARA)
 //! command/data port interface and optional WebSocket JSON API for web clients.
 
+// Library diagnostics go through `tracing`, never straight to stdout/stderr.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 #[cfg(feature = "vara-tcp")]
 pub mod vara;
 

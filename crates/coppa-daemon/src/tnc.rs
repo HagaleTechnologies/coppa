@@ -98,7 +98,7 @@ impl TncTx {
                     return;
                 };
                 if let Err(e) = ptt.set_ptt(PttState::Tx) {
-                    eprintln!("PTT error: {}", e);
+                    tracing::error!(error = %e, "PTT error");
                 }
                 self.active = Some(match self.feedback {
                     Some(_) => {
@@ -128,9 +128,10 @@ impl TncTx {
                         if let Some(fb) = self.feedback.as_ref() {
                             fb.discard_through(through);
                         }
-                        eprintln!(
-                            "TNC transmission cancelled ({}); {} samples discarded",
-                            why, discarded
+                        tracing::warn!(
+                            reason = %why,
+                            discarded,
+                            "TNC transmission cancelled; samples discarded"
                         );
                         let _ = ptt.set_ptt(PttState::Rx);
                         let settled = self
@@ -163,7 +164,7 @@ impl TncTx {
                 if !settled && now >= *until {
                     // The output worker still holds new audio back until
                     // the sink confirms the drop.
-                    eprintln!("TNC: cancelled audio not yet dropped by the output");
+                    tracing::warn!("TNC: cancelled audio not yet dropped by the output");
                 }
                 if settled || now >= *until {
                     self.active = None;
@@ -226,9 +227,10 @@ fn air_to_kiss(mut frame: Vec<u8>) -> Vec<u8> {
 /// - PTT control (keys the radio during TX)
 /// - CPAL audio I/O (optional, enabled with `cpal-backend` feature)
 pub async fn run_tnc(config: TncConfig) -> Result<()> {
-    println!(
-        "TNC mode: KISS port {}, sample rate {} Hz",
-        config.kiss_port, config.sample_rate
+    tracing::info!(
+        kiss_port = config.kiss_port,
+        sample_rate = config.sample_rate,
+        "TNC mode"
     );
 
     // -------------------------------------------------------------------------
@@ -244,38 +246,38 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
     // Spawn the KISS TCP accept loop
     tokio::spawn(async move {
         if let Err(e) = kiss_server.start().await {
-            eprintln!("KISS server error: {}", e);
+            tracing::error!(error = %e, "KISS server error");
         }
     });
 
-    println!("KISS server listening on port {}", config.kiss_port);
+    tracing::info!(port = config.kiss_port, "KISS server listening");
 
     // -------------------------------------------------------------------------
     // 2. PTT
     // -------------------------------------------------------------------------
     let mut ptt: Box<dyn PttControl> = if config.vox_mode {
-        println!("PTT: VOX mode");
+        tracing::info!("PTT: VOX mode");
         Box::new(VoxPtt::new())
     } else if let Some(ref addr) = config.rig_address {
-        println!("PTT: rigctld at {}", addr);
+        tracing::info!(%addr, "PTT: rigctld");
         match coppa_radio::rigctld::RigctldClient::connect(addr) {
             Ok(client) => Box::new(client),
             Err(e) => {
-                eprintln!(
-                    "Failed to connect to rigctld ({}), falling back to NullPtt",
-                    e
+                tracing::error!(
+                    error = %e,
+                    "Failed to connect to rigctld, falling back to NullPtt"
                 );
                 Box::new(NullPtt::new())
             }
         }
     } else {
-        println!("PTT: null (no PTT configured)");
+        tracing::info!("PTT: null (no PTT configured)");
         Box::new(NullPtt::new())
     };
     // COP-31: every backend assumes RX at construction; make the rig match,
     // so a restart un-keys a transmitter an earlier run left keyed.
     if let Err(e) = ptt.set_ptt(PttState::Rx) {
-        eprintln!("WARNING: could not release PTT at startup: {e}");
+        tracing::warn!(error = %e, "Could not release PTT at startup");
     }
 
     // -------------------------------------------------------------------------
@@ -342,10 +344,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
             Some(name) => match coppa_audio::find_input_device_by_name(name) {
                 Some(device) => coppa_audio::CpalSource::from_device(device, sample_rate, buf_size),
                 None => {
-                    eprintln!(
-                        "WARNING: No input device matching '{}', using default",
-                        name
-                    );
+                    tracing::warn!(device = name, "No input device matching, using default");
                     coppa_audio::CpalSource::new(sample_rate, buf_size)
                 }
             },
@@ -354,9 +353,9 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
         match input_result {
             Ok(mut source) => {
                 if let Err(e) = source.start() {
-                    eprintln!("Failed to start audio input: {}", e);
+                    tracing::error!(error = %e, "Failed to start audio input");
                 } else {
-                    println!("Audio input started ({}Hz)", sample_rate);
+                    tracing::info!(sample_rate, "Audio input started");
                     tokio::task::spawn_blocking(move || {
                         let mut buf = vec![0.0f32; 1024];
                         loop {
@@ -375,7 +374,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
                     });
                 }
             }
-            Err(e) => eprintln!("No audio input device: {}", e),
+            Err(e) => tracing::error!(error = %e, "No audio input device"),
         }
 
         // Output: audio_out ring buffer → CPAL speaker. The sink lives on
@@ -392,10 +391,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
                         coppa_audio::CpalSink::from_device(device, sample_rate, buf_size)
                     }
                     None => {
-                        eprintln!(
-                            "WARNING: No output device matching '{}', using default",
-                            name
-                        );
+                        tracing::warn!(device = name, "No output device matching, using default");
                         coppa_audio::CpalSink::new(sample_rate, buf_size)
                     }
                 },
@@ -404,17 +400,17 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
             let mut sink = match sink_result {
                 Ok(sink) => sink,
                 Err(e) => {
-                    eprintln!("No audio output device: {}", e);
+                    tracing::error!(error = %e, "No audio output device");
                     feedback.fail();
                     return;
                 }
             };
             if let Err(e) = sink.start() {
-                eprintln!("Failed to start audio output: {}", e);
+                tracing::error!(error = %e, "Failed to start audio output");
                 feedback.fail();
                 return;
             }
-            println!("Audio output started ({}Hz)", sample_rate);
+            tracing::info!(sample_rate, "Audio output started");
             crate::audio_output::OutputWorker::new(1024, sample_rate, feedback).run(
                 audio_out_cons,
                 sink,
@@ -428,7 +424,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
     // suppress the unused variable warnings.
     #[cfg(not(feature = "cpal-backend"))]
     {
-        println!(
+        tracing::warn!(
             "Audio: none (built without the cpal-backend feature; nothing will be sent or received)"
         );
         let _ = audio_in_prod;
@@ -456,7 +452,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
     };
     tokio::pin!(terminate);
 
-    println!("TNC ready.");
+    tracing::info!("TNC ready.");
 
     loop {
         tokio::select! {
@@ -480,14 +476,14 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
 
             // Ctrl-C: graceful shutdown
             _ = tokio::signal::ctrl_c() => {
-                println!("\nTNC shutting down...");
+                tracing::info!("TNC shutting down");
                 shut_down_tnc(&shutdown, &tnc_tx, ptt.as_mut());
                 break;
             }
 
             // SIGTERM: the same graceful shutdown (COP-31)
             _ = &mut terminate => {
-                println!("\nTNC shutting down (SIGTERM)...");
+                tracing::info!("TNC shutting down (SIGTERM)");
                 shut_down_tnc(&shutdown, &tnc_tx, ptt.as_mut());
                 break;
             }
