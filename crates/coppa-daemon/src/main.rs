@@ -596,7 +596,6 @@ async fn bind_host_port(
     })
 }
 
-<<<<<<< HEAD
 /// COP-50: a bound listener's state, with the address the OS assigned.
 fn listener_state(listener: &tokio::net::TcpListener) -> Result<startup_report::Listener> {
     let addr = listener
@@ -605,14 +604,6 @@ fn listener_state(listener: &tokio::net::TcpListener) -> Result<startup_report::
     Ok(startup_report::Listener::Listening(addr))
 }
 
-fn listen_addr(listener: &tokio::net::TcpListener) -> String {
-    listener
-        .local_addr()
-        .map_or_else(|e| format!("unknown ({e})"), |addr| addr.to_string())
-}
-
-=======
->>>>>>> 8c14fb9136bef7271f81d8c94f5a9c317e0f5867
 /// COP-32: sets the audio workers' shutdown flag when `run_daemon` returns,
 /// including on a startup error after a worker has started.
 struct StopAudioOnExit(std::sync::Arc<std::sync::atomic::AtomicBool>);
