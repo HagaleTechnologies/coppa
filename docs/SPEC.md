@@ -1245,9 +1245,13 @@ plus lz4_flex's one addition, a **4-byte little-endian u32 of the
 decompressed size prepended to the block** (the N of §15.1).
 Decompression (`lz4_decompress`, `lz4.rs:19-32`) rejects any input whose
 claimed decompressed size exceeds `MAX_DECOMPRESS_SIZE = 16_384` bytes
-(`lz4.rs:8`) and surfaces corrupt or truncated blocks as an error; on the
-RX path that error propagates out of `CoppaCore::decode_bytes` /
-`push_samples` and the frame is dropped.
+(`lz4.rs:8`) and surfaces corrupt or truncated blocks as an error. On the
+RX path that error surfaces to the caller — as the `Err` return of
+`CoppaCore::decode_bytes` (`crates/coppa-engine/src/engine.rs:386-401`)
+or as the per-frame `Err` in `StreamFrame::payload` of `push_samples`
+(`engine.rs:417-434`, field at `:47-48`) — and consumers drop the frame
+(the FFI drops it without consuming a `seq`,
+`crates/coppa-ffi/src/lib.rs:98-105`).
 
 ### 15.5 Signaling and gating (asymmetric, by design)
 
