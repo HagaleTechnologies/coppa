@@ -92,6 +92,7 @@ vara_command_port = 8300
 vara_data_port = 8301
 # WebSocket JSON API
 # Clients can opt into periodic "spectrum" and "audio_level" streams; see docs/OPERATING.md.
+# Needs a coppad built with --features websocket; set in a build without it, coppad stops at startup.
 # Enabling it requires websocket_token, on every bind_address (loopback too: a
 # web page in your own browser can reach 127.0.0.1). Every client presents the
 # token as "Authorization: Bearer <token>" or as "?token=<token>" in the URL.

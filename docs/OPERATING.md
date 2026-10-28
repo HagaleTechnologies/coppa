@@ -1,5 +1,52 @@
 # Operating Coppa
 
+## What coppad reports at startup
+
+`coppad`'s first log line names the build, and just before `Daemon ready` (or
+`Daemon running degraded`) it states what startup actually did: the host
+listeners, the audio devices it opened, and the PTT backend in control. A
+build without `cpal-backend`, with the default config, logs:
+
+```
+INFO coppad: coppad - Coppa Daemon starting version="0.3.0" git_sha="f1dcac4a6ac6" features=none
+INFO coppad: Daemon configuration loaded profile=HF_STANDARD sample_rate=48000 ptt_method=none turnaround_ms=500
+INFO coppad: Host listeners bind_address=127.0.0.1 vara_command=disabled vara_data=disabled websocket=not-built
+WARN coppad: Audio devices: none; this coppad was built without the cpal-backend feature, so it can neither receive nor transmit
+INFO coppad: PTT method="none" active=none state="not controlled" guardian="not used"
+INFO coppad: Daemon ready
+```
+
+A `cpal-backend,websocket` build with rigctld PTT and the VARA and WebSocket
+servers on logs, before `Daemon ready`:
+
+```
+INFO coppad: Audio input started device="Default Audio Device (alsa:default)" sample_rate=48000
+INFO coppad: Audio output started device="Default Audio Device (alsa:default)" sample_rate=48000
+INFO coppad: Host listeners bind_address=127.0.0.1 vara_command=127.0.0.1:8300 vara_data=127.0.0.1:8301 websocket=127.0.0.1:8400
+INFO coppad: Audio devices input="Default Audio Device (alsa:default)" output="Default Audio Device (alsa:default)" sample_rate=48000
+INFO coppad: PTT method="rigctld 127.0.0.1:4532" active=rigctld state="released" guardian="running, pid 28849"
+```
+
+| Line | Field | Values |
+|---|---|---|
+| `Coppa Daemon starting` | `version` | The `coppad` version. |
+| | `git_sha` | The commit HEAD pointed at when `coppad` was built (12 hex digits), or `unknown` for a build from a tree without `.git`. Packagers building from a tarball set `COPPA_GIT_SHA` (7-40 hex digits) at build time. It does not flag uncommitted changes. |
+| | `features` | `coppa-daemon`'s cargo features in this build (`cpal-backend`, `gpio-ptt`, `kiss-tnc`, `serial-ptt`, `websocket`), comma-separated, or `none`. |
+| `Host listeners` | `bind_address` | `[host] bind_address`. |
+| | `vara_command`, `vara_data`, `websocket` | The bound `ip:port` (the real port when 0 is configured), `disabled`, or, for `websocket` only, `not-built` in a build without the `websocket` feature. |
+| `Host listeners accept connections from other hosts; ...` (WARN) | `bind_address` | Logged when a listener is bound to a non-loopback address such as `0.0.0.0`: anyone who can reach it can key the transmitter. |
+| `Audio devices` | `input`, `output` | The device cpal opened, as its name and cpal id, for example `Default Audio Device (alsa:default)`. On ALSA, `default` is whatever PulseAudio, PipeWire or `.asoundrc` route it to; coppad cannot see further. A named device shows its own description and id. |
+| `Audio devices: none; ...` (WARN) | | A build without `cpal-backend`: the daemon runs but moves no audio. |
+| `PTT` | `method` | The configured method: `none`, `vox`, `rigctld <address>`, `serial <port> <dtr\|rts>` or `gpio <pin>`. |
+| | `active` | The backend actually in control: `none`, `vox`, `rigctld`, `serial` or `gpio`. An unreachable rigctld shows `active=none`. |
+| | `state` | `released` (the startup release succeeded), `release failed: <error>`, or `not controlled` (none, VOX, or an unreachable rigctld, where coppad drives no PTT line). |
+| | `guardian` | `running, pid <n>`, `failed to start: <error>`, `off ([radio] ptt_guardian = false)`, or `not used`. See [The PTT guardian](#the-ptt-guardian). |
+
+The `PTT` line is a WARN when PTT keeps the daemon from calling itself ready.
+`--log-level warn` hides the INFO summary lines but not the WARN ones. Set
+`NO_COLOR=1` when the log goes to a file or the journal, so each key stays next
+to its `=`.
+
 ## TX level calibration (TUNE)
 
 Before transmitting real traffic, calibrate your radio's audio drive level so it
@@ -43,7 +90,7 @@ transmission. What does the release depends on how it stops:
 | coppad keeps running, but the task that ends a transmission has died | A check that runs every 500 ms. Once PTT has been keyed for `max_tx_duration_s` plus 2 s, it forces PTT off and logs `PTT backstop: keyed past max_tx_duration_s plus grace with no release; forcing PTT off`. |
 | `kill -9`, an out-of-memory kill or a crash, with rigctld or GPIO PTT | The PTT guardian (below). |
 | The same, with serial PTT | The operating system, which drops DTR/RTS when it closes the port. This has not been checked on real hardware. |
-| Restart after any of the above | coppad releases PTT at startup (rigctld `T 0`, or the serial/GPIO line lowered). If that fails, it logs `Could not release PTT at startup; ...` and starts anyway. |
+| Restart after any of the above | coppad releases PTT at startup (rigctld `T 0`, or the serial/GPIO line lowered). If that fails, it logs `Could not release PTT at startup; ...`, keeps running, and logs `Daemon running degraded` with `PTT release at startup failed: ...` in place of `Daemon ready`. |
 
 The KISS TNC (`coppad --tnc`, `coppa tnc`) also releases PTT on SIGTERM and
 Ctrl-C.

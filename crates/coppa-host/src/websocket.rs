@@ -520,7 +520,7 @@ impl WebSocketServer {
     pub async fn run(&self) -> anyhow::Result<()> {
         let addr = format!("{}:{}", self.bind_addr, self.port);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        println!("WebSocket server listening on ws://{}", addr);
+        tracing::info!(%addr, "WebSocket server listening");
         self.run_with_listener(listener).await
     }
 
@@ -553,10 +553,7 @@ impl WebSocketServer {
             let permit = match semaphore.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    eprintln!(
-                        "WebSocket connection limit reached, dropping client {}",
-                        peer
-                    );
+                    tracing::warn!(%peer, "WebSocket connection limit reached, dropping client");
                     drop(stream);
                     continue;
                 }
@@ -581,18 +578,18 @@ impl WebSocketServer {
                     Err(e) => {
                         // Never log the token, `Authorization` or the URI.
                         match rejection {
-                            Some((r @ WsRejection::OriginNotAllowed, origin)) => eprintln!(
-                                "WebSocket handshake from {} rejected ({}): origin {:?} is not allowed",
-                                peer,
-                                r.status().as_u16(),
-                                origin.unwrap_or_default()
+                            Some((r @ WsRejection::OriginNotAllowed, origin)) => tracing::warn!(
+                                %peer,
+                                status = r.status().as_u16(),
+                                origin = ?origin.unwrap_or_default(),
+                                "WebSocket handshake rejected: origin is not allowed"
                             ),
-                            Some((r @ WsRejection::TokenMissingOrInvalid, _)) => eprintln!(
-                                "WebSocket handshake from {} rejected ({}): token missing or invalid",
-                                peer,
-                                r.status().as_u16()
+                            Some((r @ WsRejection::TokenMissingOrInvalid, _)) => tracing::warn!(
+                                %peer,
+                                status = r.status().as_u16(),
+                                "WebSocket handshake rejected: token missing or invalid"
                             ),
-                            None => eprintln!("WebSocket handshake failed for {}: {}", peer, e),
+                            None => tracing::warn!(%peer, error = %e, "WebSocket handshake failed"),
                         }
                         return;
                     }
@@ -602,7 +599,7 @@ impl WebSocketServer {
                 // Subscribe before announcing the client, so no broadcast sent
                 // after `Connected` can be missed.
                 let mut broadcast_rx = broadcast_tx.subscribe();
-                println!("WebSocket client {} connected from {}", client_id, peer);
+                tracing::info!(client_id, %peer, "WebSocket client connected");
 
                 let _ = event_tx.send(HostEvent::Connected { client_id }).await;
 
@@ -724,7 +721,7 @@ impl WebSocketServer {
                 }
 
                 let _ = event_tx.send(HostEvent::Disconnected { client_id }).await;
-                println!("WebSocket client {} disconnected", client_id);
+                tracing::info!(client_id, "WebSocket client disconnected");
             });
         }
     }
