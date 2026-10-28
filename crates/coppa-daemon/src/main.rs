@@ -214,13 +214,10 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     config.check_profile().map_err(anyhow::Error::msg)?;
     config.check_buffer_size().map_err(anyhow::Error::msg)?;
     config.check_sample_rate().map_err(anyhow::Error::msg)?;
-<<<<<<< HEAD
+    config.check_websocket_auth().map_err(anyhow::Error::msg)?;
     config
         .check_websocket_built(cfg!(feature = "websocket"))
         .map_err(anyhow::Error::msg)?;
-=======
-    config.check_websocket_auth().map_err(anyhow::Error::msg)?;
->>>>>>> 638ee1aeaaea6cc768747857e5021d7f2491f7ad
     #[cfg(not(feature = "cpal-backend"))]
     check_no_named_devices(&config.audio)?;
 

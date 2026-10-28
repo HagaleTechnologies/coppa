@@ -1254,7 +1254,7 @@ fn a_non_loopback_bind_address_is_warned_about() {
 #[test]
 fn websocket_enabled_without_the_websocket_feature_is_a_startup_error() {
     run_startup_error(
-        "[host]\nwebsocket_enabled = true\n",
+        &format!("[host]\nwebsocket_enabled = true\nwebsocket_token = \"{WS_TOKEN}\"\n"),
         "[host] websocket_enabled = true is set, but this coppad was built without the \
          websocket feature",
     );
