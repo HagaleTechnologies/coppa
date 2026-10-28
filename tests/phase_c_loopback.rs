@@ -130,10 +130,11 @@ fn test_level_9_64qam_rate_5_6() {
     // 7/8 to 5/6 (wire-format break, see CLAUDE.md's Known Limitations).
     // The #[ignore] main previously had here (routing around the old
     // per-rate LDPC codec's level-9/10 non-convergence) is removed: Task 4's
-    // NR BG2 mother code fixes this. The measured evidence is COP-24's
-    // SSB-filtered AWGN sweep (BENCHMARKS.md), guarded on every push by
-    // coppa-bench's `waterfall_bracket_level_*` tests -- not the old
-    // `test_snr_fer_monte_carlo`, which could not fail (see its doc).
+    // NR BG2 mother code fixes this on the unfiltered AWGN channel, guarded
+    // on every push by coppa-bench's `waterfall_bracket_level_9` -- not the
+    // old `test_snr_fer_monte_carlo`, which could not fail (see its doc).
+    // Through the SSB filter level 9 still never clears 10% FER
+    // (BENCHMARKS.md's COP-24 section), which is why it is VHF-only.
     loopback_test(9, &[0x78; 150]);
 }
 
@@ -246,7 +247,8 @@ fn test_snr_fer_monte_carlo() {
                         channel: ChannelSpec::Awgn,
                         snr_db_points: (0..=steps).map(|i| low_db + 2.0 * i as f32).collect(),
                         trials: TRIALS,
-                        seed: 0x2710 + u64::from(level),
+                        // Spaced so no two levels share a per-trial seed.
+                        seed: 0x2710 + 10_000 * u64::from(level),
                         profile_override: Some(CoppaProfile::hf_standard()),
                         cfo_hz: 0.0,
                         sco_ppm: 0.0,

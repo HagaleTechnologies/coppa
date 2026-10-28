@@ -21,10 +21,13 @@ links:
 The original gotcha this page described — levels 9/10 (64-QAM) failing to
 converge even at high SNR in loopback — is **FIXED** by Phase 2's NR BG2 mother
 code plus level 10's rate change from 7/8 to 5/6 (see [[adr-005-nr-bg2-ldpc]]).
-The evidence is COP-24's SSB-filtered AWGN sweep in `BENCHMARKS.md` (every
-shipped HF level 0/50 from 18 to 60 dB), and `coppa-bench`'s
-`waterfall_bracket_level_*` tests in `crates/coppa-bench/src/runner.rs` guard
-each level's AWGN waterfall on every push. This page used to cite a
+For old level 9 (now level 8) the evidence is COP-24's SSB-filtered AWGN sweep
+in `BENCHMARKS.md` (every shipped HF level 0/50 from 18 to 60 dB). Old level 10
+(now level 9, VHF-only) decodes on `hf_standard` without the SSB filter but
+never clears 10% FER through it (COP-24: band-edge attenuation).
+`coppa-bench`'s `waterfall_bracket_level_*` tests in
+`crates/coppa-bench/src/runner.rs` guard each level's unfiltered AWGN waterfall
+on every push. This page used to cite a
 `test_snr_fer_monte_carlo` run with zero errors at every level; that run could
 not fail (COP-70), because its full-band noise was ~9 dB optimistic against
 the 3 kHz convention, its sweep sat above every waterfall, and it asserted
