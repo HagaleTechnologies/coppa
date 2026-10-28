@@ -88,6 +88,20 @@ decode. `--duration` stops after that many seconds; without it, `coppa rx` runs 
 Ctrl+C. `coppa listen` is a deprecated alias for `coppa rx` and will be removed in the
 next release.
 
+## Persisting your CLI settings
+
+`coppa tx`, `tune`, `rx`, and `loopback` read the same `coppad.toml` as the daemon.
+They search the current directory, your Coppa user config directory, then the
+system config path in the order listed in [Running the Daemon](#running-the-daemon).
+Use `coppa --config PATH` or `COPPA_CONFIG=PATH` to select one file explicitly.
+A flag wins over its `COPPA_*` environment variable, which wins over the file;
+`--verbose` shows each selected value and where it came from. See
+`coppa tx --help` for the variable and TOML key names.
+
+A copied `coppad.toml.example` sets `profile = "HF_STANDARD"`. That changes the
+CLI's waveform from its built-in no-file default. Set the same profile on the
+peer, including when decoding a WAV file, or the payload may not decode.
+
 ## Viewing Operating Profiles
 
 ```bash

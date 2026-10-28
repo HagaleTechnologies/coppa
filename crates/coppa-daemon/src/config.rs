@@ -561,11 +561,79 @@ fn parse_error(path: &Path, e: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("Failed to parse config {}: {}", path.display(), e)
 }
 
+/// Keys shared with the CLI, preserving whether a key was written in TOML.
+/// Typed daemon defaults cannot distinguish an omitted key from an explicit one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SharedSettings {
+    pub callsign: Option<String>,
+    pub profile: Option<String>,
+    pub input_device: Option<String>,
+    pub output_device: Option<String>,
+    pub ptt_method: Option<String>,
+    pub rigctld_address: Option<String>,
+    pub ptt_pre_delay_ms: Option<u64>,
+    pub ptt_tail_delay_ms: Option<u64>,
+    pub frequency_hz: Option<u64>,
+    pub band: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SharedToml {
+    engine: SharedEngine,
+    audio: SharedAudio,
+    radio: SharedRadio,
+}
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SharedEngine {
+    callsign: Option<String>,
+    profile: Option<String>,
+}
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SharedAudio {
+    input_device: Option<String>,
+    output_device: Option<String>,
+}
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SharedRadio {
+    ptt_method: Option<String>,
+    rigctld_address: Option<String>,
+    ptt_pre_delay_ms: Option<u64>,
+    ptt_tail_delay_ms: Option<u64>,
+    frequency_hz: Option<u64>,
+    band: Option<String>,
+}
+impl SharedSettings {
+    fn from_validated_toml(text: &str) -> anyhow::Result<Self> {
+        let view: SharedToml = toml::from_str(text)?;
+        let nonempty = |v: Option<String>| v.filter(|s| !s.is_empty());
+        Ok(Self {
+            callsign: nonempty(view.engine.callsign),
+            profile: view.engine.profile,
+            input_device: nonempty(view.audio.input_device),
+            output_device: nonempty(view.audio.output_device),
+            ptt_method: view.radio.ptt_method,
+            rigctld_address: view.radio.rigctld_address,
+            ptt_pre_delay_ms: view.radio.ptt_pre_delay_ms,
+            ptt_tail_delay_ms: view.radio.ptt_tail_delay_ms,
+            frequency_hz: view.radio.frequency_hz,
+            band: view.radio.band,
+        })
+    }
+}
+
 /// The result of [`DaemonConfig::discover`].
 #[derive(Debug, Clone)]
 pub struct Discovered {
     /// The loaded file's configuration, or the defaults if none was found.
     pub config: DaemonConfig,
+    /// Explicitly written CLI-shared keys from the same file.
+    #[allow(dead_code)]
+    // coppad compiles this module too; the CLI consumes this field through the library.
+    pub shared: SharedSettings,
     /// The file that was loaded, if any.
     pub source: Option<PathBuf>,
     /// Every candidate examined, in order, up to and including `source`.
@@ -595,9 +663,15 @@ impl Discovered {
 impl DaemonConfig {
     /// Load configuration from a TOML file.
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        Ok(Self::load_with_shared(path)?.0)
+    }
+
+    /// Load the strict daemon config and the presence-aware CLI view in one read.
+    pub fn load_with_shared<P: AsRef<Path>>(path: P) -> anyhow::Result<(Self, SharedSettings)> {
         let contents = std::fs::read_to_string(path.as_ref())?;
         let config: Self = toml::from_str(&contents)?;
-        Ok(config)
+        let shared = SharedSettings::from_validated_toml(&contents)?;
+        Ok((config, shared))
     }
 
     /// COP-49: load the first of `candidates` that exists, or the built-in
@@ -627,9 +701,11 @@ impl DaemonConfig {
                 }
                 Err(e) => return Err(parse_error(path, e)),
             }
-            let config = Self::load(path).map_err(|e| parse_error(path, e))?;
+            let (config, shared) =
+                Self::load_with_shared(path).map_err(|e| parse_error(path, e))?;
             return Ok(Discovered {
                 config,
+                shared,
                 source: Some(path.clone()),
                 searched,
                 permission_denied,
@@ -637,6 +713,7 @@ impl DaemonConfig {
         }
         Ok(Discovered {
             config: Self::default(),
+            shared: SharedSettings::default(),
             source: None,
             searched,
             permission_denied,
@@ -1336,6 +1413,8 @@ beacon_interval_secs = 600
         let found = DaemonConfig::discover(&candidates).unwrap();
         assert_eq!(found.source.as_ref(), Some(&first));
         assert_eq!(found.config.engine.callsign, "W5AU");
+        assert_eq!(found.shared.callsign.as_deref(), Some("W5AU"));
+        assert_eq!(found.shared.profile, None);
         assert_eq!(found.searched, candidates[..2]);
         assert!(found.permission_denied.is_empty());
     }
@@ -1351,6 +1430,7 @@ beacon_interval_secs = 600
         assert_eq!(found.source, None);
         assert_eq!(found.searched, candidates);
         assert_eq!(found.config.engine.callsign, "");
+        assert_eq!(found.shared, SharedSettings::default());
         assert_eq!(found.config.audio.sample_rate, 48_000);
         assert_eq!(
             found.search_summary(),
@@ -1411,9 +1491,64 @@ beacon_interval_secs = 600
     }
 
     #[test]
+    fn shared_settings_preserve_presence_and_empty_values() {
+        let defaults = SharedSettings::from_validated_toml("").unwrap();
+        assert_eq!(defaults.profile, None);
+        assert_eq!(DaemonConfig::default().engine.profile, "HF_STANDARD");
+        let explicit = SharedSettings::from_validated_toml(
+            "[engine]\nprofile = \"HF_STANDARD\"\ncallsign = \"\"\n[audio]\ninput_device = \"\"\noutput_device = \"\"\n[radio]\nband = \"\"\n"
+        ).unwrap();
+        assert_eq!(explicit.profile.as_deref(), Some("HF_STANDARD"));
+        assert_eq!(explicit.callsign, None);
+        assert_eq!(explicit.input_device, None);
+        assert_eq!(explicit.output_device, None);
+        assert_eq!(explicit.band.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn shared_view_covers_every_cli_key_in_a_full_config() {
+        let config = DaemonConfig::default();
+        let text = toml::to_string(&config).unwrap();
+        let shared = SharedSettings::from_validated_toml(&text).unwrap();
+        assert!(shared.profile.is_some());
+        assert!(shared.ptt_method.is_some());
+        assert!(shared.rigctld_address.is_some());
+        assert!(shared.ptt_pre_delay_ms.is_some());
+        assert!(shared.ptt_tail_delay_ms.is_some());
+        // Optional frequency and band are absent in the daemon default;
+        // writing them makes the presence view report them too.
+        let mut config = config;
+        config.engine.callsign = "W5AU".into();
+        config.audio.input_device = "in".into();
+        config.audio.output_device = "out".into();
+        config.radio.frequency_hz = Some(14_074_000);
+        config.radio.band = Some("20m".into());
+        let full = SharedSettings::from_validated_toml(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(full.callsign.as_deref(), Some("W5AU"));
+        assert_eq!(full.input_device.as_deref(), Some("in"));
+        assert_eq!(full.output_device.as_deref(), Some("out"));
+        assert_eq!(full.frequency_hz, Some(14_074_000));
+        assert_eq!(full.band.as_deref(), Some("20m"));
+    }
+
+    #[test]
+    fn strict_config_rejects_typo_before_shared_view() {
+        let path = std::env::temp_dir().join(format!("cop57_typo_{}.toml", std::process::id()));
+        std::fs::write(&path, "[engine]\ncalsign = \"W5AU\"\n").unwrap();
+        let error = DaemonConfig::load_with_shared(&path)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, DaemonConfig::load(&path).unwrap_err().to_string());
+        std::fs::remove_file(path).unwrap();
+        assert!(error.contains("unknown field `calsign`"), "{error}");
+        assert!(error.contains("line 2, column 1"), "{error}");
+    }
+
+    #[test]
     fn search_summary_marks_permission_denied_candidates() {
         let found = Discovered {
             config: DaemonConfig::default(),
+            shared: SharedSettings::default(),
             source: None,
             searched: vec![
                 PathBuf::from("coppad.toml"),

@@ -111,6 +111,7 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 
 #### CLI (`coppa-cli`)
 - Binary `coppa`. Subcommands: `tx`, `rx`, `loopback`, `tune`, `devices`, `config`, plus `tnc` when built with `kiss-tnc`. `listen` survives one release as a hidden, deprecated alias of `rx` (COP-56)
+- `--config` (or `COPPA_CONFIG`) and other `COPPA_*` variables let `tx`, `tune`, `rx` and `loopback` share `coppad.toml` settings with the daemon
 - WAV file I/O via `file-backend` (default); live audio capture and playback need `cpal-backend`
 
 #### Daemon (`coppad`, crate `coppa-daemon`)

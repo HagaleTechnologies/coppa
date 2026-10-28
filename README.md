@@ -68,6 +68,8 @@ coppa devices
 coppa config
 ```
 
+`coppa` can keep callsign, profile, audio device and rig settings in the same `coppad.toml` as the daemon, with `COPPA_*` environment and flag overrides; see [CLI settings](docs/tutorials/getting-started.md#persisting-your-cli-settings).
+
 ## KISS TNC (AFSK 1200)
 
 `coppa tnc` runs a 1200-baud AFSK (Bell 202) AX.25 TNC behind a KISS TCP port. Use it for

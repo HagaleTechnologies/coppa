@@ -4,6 +4,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use coppa_engine::config::EngineConfig;
 use coppa_engine::CoppaCore;
+use std::path::PathBuf;
+mod settings;
+use settings::{CliEnv, Direction, Layers, RigSettings, SETTINGS_HELP};
 
 /// Output verbosity level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +29,9 @@ struct Cli {
     /// Suppress all output except decoded messages.
     #[arg(long, global = true)]
     quiet: bool,
+    /// Read settings from this file instead of searching for coppad.toml (also COPPA_CONFIG). The file must exist.
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -76,9 +82,35 @@ const LISTEN_DEPRECATED: &str = "WARNING: 'coppa listen' is deprecated and will 
     removed in the next release. Use 'coppa rx' instead; it takes the same flags, \
     and --raw prints hex.";
 
+#[derive(clap::Args, Debug, Default, PartialEq, Eq)]
+struct RigArgs {
+    /// Audio output device name (substring match).
+    #[arg(long)]
+    device: Option<String>,
+    /// PTT method: "rigctld", "vox" or "none" [default: none].
+    #[arg(long)]
+    ptt: Option<String>,
+    /// rigctld address for CAT PTT [default: 127.0.0.1:4532].
+    #[arg(long)]
+    rigctld: Option<String>,
+    /// Milliseconds to key PTT before audio starts playing [default: 50].
+    #[arg(long)]
+    ptt_lead_ms: Option<u64>,
+    /// Milliseconds to hold PTT keyed after audio finishes playing [default: 200].
+    #[arg(long)]
+    ptt_tail_ms: Option<u64>,
+    /// Explicit operating frequency in Hz for the wideband gate.
+    #[arg(long)]
+    frequency_hz: Option<u64>,
+    /// Operating band label ("160m".."23cm") for the wideband gate.
+    #[arg(long)]
+    band: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Encode and transmit a message.
+    #[command(after_help = SETTINGS_HELP)]
     Tx {
         /// Message to transmit.
         message: String,
@@ -91,32 +123,14 @@ enum Commands {
         /// Callsign for station identification.
         #[arg(long)]
         callsign: Option<String>,
-        /// Audio output device name (substring match).
-        #[arg(long)]
-        device: Option<String>,
-        /// PTT method: "rigctld", "vox", "none" (default: "none")
-        #[arg(long, default_value = "none")]
-        ptt: String,
-        /// rigctld address for CAT PTT (only used when --ptt rigctld).
-        #[arg(long, default_value = "127.0.0.1:4532")]
-        rigctld: String,
-        /// Milliseconds to key PTT before audio starts playing.
-        #[arg(long, default_value = "50")]
-        ptt_lead_ms: u64,
-        /// Milliseconds to hold PTT keyed after audio finishes playing.
-        #[arg(long, default_value = "200")]
-        ptt_tail_ms: u64,
-        /// Explicit operating frequency in Hz for the wideband gate (a
-        /// wideband profile only transmits live at or above 29.7 MHz).
-        #[arg(long)]
-        frequency_hz: Option<u64>,
-        /// Operating band label ("160m".."23cm") for the wideband gate.
-        #[arg(long)]
-        band: Option<String>,
+        #[command(flatten)]
+        rig: RigArgs,
     },
     /// Receive and decode audio from a WAV file, or live from an audio input device.
+    #[command(after_help = SETTINGS_HELP)]
     Rx(RxArgs),
     /// Run a loopback test (encode -> decode).
+    #[command(after_help = SETTINGS_HELP)]
     Loopback {
         /// Message to test.
         message: String,
@@ -128,11 +142,13 @@ enum Commands {
     // COP-56: kept for one release. Delete this variant, LISTEN_DEPRECATED
     // and the Listen dispatch arm in the release after it ships.
     #[command(hide = true)]
+    #[command(after_help = SETTINGS_HELP)]
     Listen(RxArgs),
     /// Transmit a TX-level calibration ("TUNE") tone: standard SSB two-tone
     /// (700 Hz + 1900 Hz) by default, or a single tone via `--single`. Key
     /// this while advancing your radio's audio drive level until ALC just
     /// registers, then back off. See `docs/OPERATING.md`.
+    #[command(after_help = SETTINGS_HELP)]
     Tune {
         /// Duration to key the tone, in seconds.
         #[arg(long, default_value = "10")]
@@ -148,28 +164,8 @@ enum Commands {
         /// Operational profile name (e.g., HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY).
         #[arg(long)]
         profile: Option<String>,
-        /// Audio output device name (substring match).
-        #[arg(long)]
-        device: Option<String>,
-        /// PTT method: "rigctld", "vox", "none" (default: "none")
-        #[arg(long, default_value = "none")]
-        ptt: String,
-        /// rigctld address for CAT PTT (only used when --ptt rigctld).
-        #[arg(long, default_value = "127.0.0.1:4532")]
-        rigctld: String,
-        /// Milliseconds to key PTT before audio starts playing.
-        #[arg(long, default_value = "50")]
-        ptt_lead_ms: u64,
-        /// Milliseconds to hold PTT keyed after audio finishes playing.
-        #[arg(long, default_value = "200")]
-        ptt_tail_ms: u64,
-        /// Explicit operating frequency in Hz for the wideband gate (a
-        /// wideband profile only transmits live at or above 29.7 MHz).
-        #[arg(long)]
-        frequency_hz: Option<u64>,
-        /// Operating band label ("160m".."23cm") for the wideband gate.
-        #[arg(long)]
-        band: Option<String>,
+        #[command(flatten)]
+        rig: RigArgs,
     },
     /// List available audio devices.
     Devices,
@@ -225,67 +221,82 @@ fn main() -> Result<()> {
         Verbosity::Normal
     };
 
+    let config_flag = cli.config;
+    let env = CliEnv::from_process();
     match cli.command {
         Some(Commands::Tx {
             message,
             output,
             profile,
             callsign,
-            device,
-            ptt,
-            rigctld,
-            ptt_lead_ms,
-            ptt_tail_ms,
-            frequency_hz,
-            band,
-        }) => cmd_tx(
-            &message,
-            output.as_deref(),
-            profile.as_deref(),
-            callsign.as_deref(),
-            device.as_deref(),
-            &ptt,
-            &rigctld,
-            ptt_lead_ms,
-            ptt_tail_ms,
-            frequency_hz,
-            band.as_deref(),
-            verbosity,
-        )?,
-        Some(Commands::Rx(args)) => cmd_rx(&args, verbosity)?,
-        Some(Commands::Loopback { message, profile }) => {
-            cmd_loopback(&message, profile.as_deref(), verbosity)?
+            rig,
+        }) => {
+            let layers = Layers::load(config_flag.as_deref(), env)?;
+            let profile = layers.profile(profile.as_deref())?;
+            let callsign = layers.callsign(callsign.as_deref())?;
+            let rig = layers.rig(&rig)?;
+            if verbosity == Verbosity::Verbose {
+                layers.print_verbose_source();
+                settings::print_setting("Callsign", &callsign);
+                settings::print_setting("Profile", &profile);
+                if output.is_none() {
+                    rig.print_verbose();
+                }
+            }
+            cmd_tx(
+                &message,
+                output.as_deref(),
+                profile.as_ref().map(|v| v.value.as_str()),
+                &rig,
+                verbosity,
+            )?;
+        }
+        Some(Commands::Rx(args)) => {
+            resolve_rx_and_run(args, config_flag.as_deref(), env, verbosity)?
         }
         Some(Commands::Listen(args)) => {
             eprintln!("{LISTEN_DEPRECATED}");
-            cmd_rx(&args, verbosity)?
+            resolve_rx_and_run(args, config_flag.as_deref(), env, verbosity)?;
+        }
+        Some(Commands::Loopback { message, profile }) => {
+            let layers = Layers::load(config_flag.as_deref(), env)?;
+            let profile = layers.profile(profile.as_deref())?;
+            if verbosity == Verbosity::Verbose {
+                layers.print_verbose_source();
+                settings::print_setting("Profile", &profile);
+            }
+            cmd_loopback(
+                &message,
+                profile.as_ref().map(|v| v.value.as_str()),
+                verbosity,
+            )?;
         }
         Some(Commands::Tune {
             seconds,
             single,
             output,
             profile,
-            device,
-            ptt,
-            rigctld,
-            ptt_lead_ms,
-            ptt_tail_ms,
-            frequency_hz,
-            band,
-        }) => cmd_tune(
-            seconds,
-            single,
-            output.as_deref(),
-            profile.as_deref(),
-            device.as_deref(),
-            &ptt,
-            &rigctld,
-            ptt_lead_ms,
-            ptt_tail_ms,
-            frequency_hz,
-            band.as_deref(),
-            verbosity,
-        )?,
+            rig,
+        }) => {
+            let layers = Layers::load(config_flag.as_deref(), env)?;
+            let profile = layers.profile(profile.as_deref())?;
+            let rig = layers.rig(&rig)?;
+            if verbosity == Verbosity::Verbose {
+                layers.print_verbose_source();
+                settings::print_setting("Profile", &profile);
+                if output.is_none() {
+                    rig.print_verbose();
+                }
+            }
+            cmd_tune(
+                seconds,
+                single,
+                output.as_deref(),
+                profile.as_ref().map(|v| v.value.as_str()),
+                &rig,
+                verbosity,
+            )?;
+        }
         Some(Commands::Devices) => cmd_devices()?,
         Some(Commands::Config { profile }) => cmd_config(profile.as_deref())?,
         #[cfg(feature = "kiss-tnc")]
@@ -301,6 +312,32 @@ fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn resolve_rx_and_run(
+    mut args: RxArgs,
+    config_flag: Option<&std::path::Path>,
+    env: CliEnv,
+    verbosity: Verbosity,
+) -> Result<()> {
+    // The deprecated alias shares the same resolver and receiver.
+    let layers = Layers::load(config_flag, env)?;
+    let profile = layers.profile(args.profile.as_deref())?;
+    let callsign = layers.callsign(args.callsign.as_deref())?;
+    let device = layers.device(args.device.as_deref(), Direction::Input)?;
+    if verbosity == Verbosity::Verbose {
+        layers.print_verbose_source();
+        settings::print_setting("Callsign", &callsign);
+        settings::print_setting("Profile", &profile);
+        if args.path().is_none() {
+            settings::print_setting("Device", &device);
+        }
+    }
+    args.profile = profile.map(|v| v.value);
+    args.callsign = callsign.map(|v| v.value);
+    args.device = device.map(|v| v.value);
+    cmd_rx(&args, verbosity)?;
     Ok(())
 }
 
@@ -382,10 +419,11 @@ fn build_ptt(ptt: &str, rigctld_addr: &str) -> Result<coppa_radio::PttBackend> {
 fn cli_frequency_evidence(
     frequency_hz: Option<u64>,
     band: Option<&str>,
+    freq_key: &str,
+    band_key: &str,
 ) -> Result<Option<coppa_radio::band::FrequencyEvidence>> {
-    let stated =
-        coppa_radio::band::FrequencyConfig::parse(frequency_hz, band, "--frequency-hz", "--band")
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stated = coppa_radio::band::FrequencyConfig::parse(frequency_hz, band, freq_key, band_key)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(stated.static_evidence())
 }
 
@@ -612,28 +650,17 @@ fn transmit_live(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cmd_tx(
     message: &str,
     output: Option<&str>,
     profile: Option<&str>,
-    callsign: Option<&str>,
-    device: Option<&str>,
-    ptt: &str,
-    rigctld: &str,
-    ptt_lead_ms: u64,
-    ptt_tail_ms: u64,
-    frequency_hz: Option<u64>,
-    band: Option<&str>,
+    rig: &RigSettings,
     verbosity: Verbosity,
 ) -> Result<()> {
     let config = resolve_config(profile)?;
     let core = CoppaCore::with_config(config);
 
     if verbosity == Verbosity::Verbose {
-        if let Some(cs) = callsign {
-            eprintln!("[verbose] Callsign: {}", cs);
-        }
         eprintln!(
             "[verbose] Config: sample_rate={}, speed_level={}",
             core.config().sample_rate,
@@ -661,18 +688,19 @@ fn cmd_tx(
             let gate = LiveTxGate {
                 profile: profile.unwrap_or("default"),
                 occupied_hz: core.occupied_bandwidth_hz(),
-                stated: cli_frequency_evidence(frequency_hz, band)?,
+                stated: rig.frequency_evidence()?,
             };
             #[cfg(feature = "cpal-backend")]
             {
+                let ptt = rig.ptt_method()?;
                 transmit_live(
                     &samples,
                     core.config().sample_rate,
-                    device,
+                    rig.device.as_ref().map(|v| v.value.as_str()),
                     ptt,
-                    rigctld,
-                    ptt_lead_ms,
-                    ptt_tail_ms,
+                    &rig.rigctld.value,
+                    rig.lead.value,
+                    rig.tail.value,
                     gate,
                     verbosity,
                 )?;
@@ -683,12 +711,9 @@ fn cmd_tx(
                 // but the same arguments are validated: a typo'd --ptt is
                 // rejected exactly as the audio build rejects it, and a
                 // wideband request is still refused, not silently accepted.
-                validate_ptt_method(ptt)?;
+                rig.ptt_method()?;
                 cli_gate_decision(gate.profile, gate.occupied_hz, None, gate.stated)?;
-                let _ = device;
-                let _ = rigctld;
-                let _ = ptt_lead_ms;
-                let _ = ptt_tail_ms;
+                let _ = rig;
                 if verbosity != Verbosity::Quiet {
                     println!("Live audio output not available (compile with cpal-backend feature)");
                 }
@@ -713,19 +738,12 @@ fn tune_occupied_hz(single: Option<f32>) -> u32 {
 /// (or a single tone via `single`), key PTT, stream it out, then unkey —
 /// mirroring `cmd_tx`'s live-playback path. See `docs/OPERATING.md` for the
 /// calibration procedure this is meant to support.
-#[allow(clippy::too_many_arguments)]
 fn cmd_tune(
     seconds: f32,
     single: Option<f32>,
     output: Option<&str>,
     profile: Option<&str>,
-    device: Option<&str>,
-    ptt: &str,
-    rigctld: &str,
-    ptt_lead_ms: u64,
-    ptt_tail_ms: u64,
-    frequency_hz: Option<u64>,
-    band: Option<&str>,
+    rig: &RigSettings,
     verbosity: Verbosity,
 ) -> Result<()> {
     let config = resolve_config(profile)?;
@@ -759,18 +777,19 @@ fn cmd_tune(
             let gate = LiveTxGate {
                 profile: profile.unwrap_or("default"),
                 occupied_hz: tune_occupied_hz(single),
-                stated: cli_frequency_evidence(frequency_hz, band)?,
+                stated: rig.frequency_evidence()?,
             };
             #[cfg(feature = "cpal-backend")]
             {
+                let ptt = rig.ptt_method()?;
                 transmit_live(
                     &samples,
                     core.config().sample_rate,
-                    device,
+                    rig.device.as_ref().map(|v| v.value.as_str()),
                     ptt,
-                    rigctld,
-                    ptt_lead_ms,
-                    ptt_tail_ms,
+                    &rig.rigctld.value,
+                    rig.lead.value,
+                    rig.tail.value,
                     gate,
                     verbosity,
                 )?;
@@ -781,12 +800,9 @@ fn cmd_tune(
                 // but the same arguments are validated: a typo'd --ptt is
                 // rejected exactly as the audio build rejects it, and a
                 // wideband request is still refused, not silently accepted.
-                validate_ptt_method(ptt)?;
+                rig.ptt_method()?;
                 cli_gate_decision(gate.profile, gate.occupied_hz, None, gate.stated)?;
-                let _ = device;
-                let _ = rigctld;
-                let _ = ptt_lead_ms;
-                let _ = ptt_tail_ms;
+                let _ = rig;
                 if verbosity != Verbosity::Quiet {
                     println!("Live audio output not available (compile with cpal-backend feature)");
                 }
@@ -816,9 +832,6 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
     let mut core = CoppaCore::with_config(config);
 
     if verbosity == Verbosity::Verbose {
-        if let Some(cs) = &args.callsign {
-            eprintln!("[verbose] Callsign: {}", cs);
-        }
         eprintln!("[verbose] sample_rate: {}", core.config().sample_rate);
     }
 
@@ -1253,14 +1266,7 @@ mod tests {
             "test message",
             Some(path_str),
             None,
-            None,
-            None,
-            "none",
-            "127.0.0.1:4532",
-            50,
-            200,
-            None,
-            None,
+            &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
             Verbosity::Normal,
         )
         .expect("tx to file should succeed");
@@ -1281,13 +1287,7 @@ mod tests {
             None,
             Some(path_str),
             None,
-            None,
-            "none",
-            "127.0.0.1:4532",
-            50,
-            200,
-            None,
-            None,
+            &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
             Verbosity::Normal,
         )
         .expect("tune to file should succeed");
@@ -1308,13 +1308,7 @@ mod tests {
             Some(1500.0),
             Some(path_str),
             None,
-            None,
-            "none",
-            "127.0.0.1:4532",
-            50,
-            200,
-            None,
-            None,
+            &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
             Verbosity::Quiet,
         )
         .expect("single-tone tune to file should succeed");
@@ -1326,7 +1320,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tx_with_callsign() {
+    fn test_tx_verbose_to_file() {
         let dir = std::env::temp_dir();
         let path = dir.join("coppa_test_tx_cs.wav");
         let path_str = path.to_str().unwrap();
@@ -1334,14 +1328,7 @@ mod tests {
             "CQ CQ",
             Some(path_str),
             None,
-            Some("VK2ABC"),
-            None,
-            "none",
-            "127.0.0.1:4532",
-            50,
-            200,
-            None,
-            None,
+            &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
             Verbosity::Verbose,
         )
         .expect("tx with callsign should succeed");
@@ -1417,15 +1404,10 @@ mod tests {
             "500",
         ]);
         match cli.command {
-            Some(Commands::Tx {
-                rigctld,
-                ptt_lead_ms,
-                ptt_tail_ms,
-                ..
-            }) => {
-                assert_eq!(rigctld, "192.168.1.50:4532");
-                assert_eq!(ptt_lead_ms, 75);
-                assert_eq!(ptt_tail_ms, 500);
+            Some(Commands::Tx { rig, .. }) => {
+                assert_eq!(rig.rigctld.as_deref(), Some("192.168.1.50:4532"));
+                assert_eq!(rig.ptt_lead_ms, Some(75));
+                assert_eq!(rig.ptt_tail_ms, Some(500));
             }
             _ => panic!("expected Tx command"),
         }
@@ -1435,15 +1417,11 @@ mod tests {
     fn test_cli_tx_ptt_flags_default() {
         let cli = Cli::parse_from(["coppa", "tx", "hello"]);
         match cli.command {
-            Some(Commands::Tx {
-                rigctld,
-                ptt_lead_ms,
-                ptt_tail_ms,
-                ..
-            }) => {
-                assert_eq!(rigctld, "127.0.0.1:4532");
-                assert_eq!(ptt_lead_ms, 50);
-                assert_eq!(ptt_tail_ms, 200);
+            Some(Commands::Tx { rig, .. }) => {
+                assert_eq!(rig.ptt, None);
+                assert_eq!(rig.rigctld, None);
+                assert_eq!(rig.ptt_lead_ms, None);
+                assert_eq!(rig.ptt_tail_ms, None);
             }
             _ => panic!("expected Tx command"),
         }
@@ -1462,15 +1440,24 @@ mod tests {
             "20",
         ]);
         match cli.command {
-            Some(Commands::Tune {
-                rigctld,
-                ptt_lead_ms,
-                ptt_tail_ms,
-                ..
-            }) => {
-                assert_eq!(rigctld, "10.0.0.5:4532");
-                assert_eq!(ptt_lead_ms, 10);
-                assert_eq!(ptt_tail_ms, 20);
+            Some(Commands::Tune { rig, .. }) => {
+                assert_eq!(rig.rigctld.as_deref(), Some("10.0.0.5:4532"));
+                assert_eq!(rig.ptt_lead_ms, Some(10));
+                assert_eq!(rig.ptt_tail_ms, Some(20));
+            }
+            _ => panic!("expected Tune command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_tune_ptt_flags_default() {
+        let cli = Cli::parse_from(["coppa", "tune"]);
+        match cli.command {
+            Some(Commands::Tune { rig, .. }) => {
+                assert_eq!(rig.ptt, None);
+                assert_eq!(rig.rigctld, None);
+                assert_eq!(rig.ptt_lead_ms, None);
+                assert_eq!(rig.ptt_tail_ms, None);
             }
             _ => panic!("expected Tune command"),
         }
@@ -1824,8 +1811,8 @@ mod tests {
     #[test]
     fn cli_gate_decision_matches_daemon_rules() {
         let vhf = coppa_radio::band::FrequencyEvidence::Stated(144_500_000);
-        let ten_m = cli_frequency_evidence(None, Some("10m")).unwrap();
-        let two_m = cli_frequency_evidence(None, Some("2m")).unwrap();
+        let ten_m = cli_frequency_evidence(None, Some("10m"), "--frequency-hz", "--band").unwrap();
+        let two_m = cli_frequency_evidence(None, Some("2m"), "--frequency-hz", "--band").unwrap();
 
         let err = cli_gate_decision("VHF_FAST", 5600, None, None).unwrap_err();
         let msg = err.to_string();
@@ -1868,14 +1855,8 @@ mod tests {
             None,
             None,
             Some("VHF_FAST"),
-            None,
-            "none",
-            "127.0.0.1:1",
-            0,
-            0,
-            None,
-            Some("21m"),
-            Verbosity::Quiet,
+            &RigSettings::test_values(None, "none", "127.0.0.1:1", 0, 0, None, Some("21m")),
+            Verbosity::Quiet
         )
         .unwrap_err()
         .to_string()
@@ -1884,7 +1865,8 @@ mod tests {
 
     #[test]
     fn cli_band_flag_typo_is_a_hard_error() {
-        let err = cli_frequency_evidence(None, Some("21m")).unwrap_err();
+        let err =
+            cli_frequency_evidence(None, Some("21m"), "--frequency-hz", "--band").unwrap_err();
         assert!(
             err.to_string().contains("expected an amateur band label"),
             "{err}"
@@ -1894,9 +1876,13 @@ mod tests {
 
     #[test]
     fn cli_frequency_band_contradiction_is_a_hard_error() {
-        let err = cli_frequency_evidence(Some(14_074_000), Some("2m")).unwrap_err();
+        let err = cli_frequency_evidence(Some(14_074_000), Some("2m"), "--frequency-hz", "--band")
+            .unwrap_err();
         assert!(err.to_string().contains("lies outside band"), "{err}");
-        assert!(cli_frequency_evidence(Some(144_500_000), Some("2m")).is_ok());
+        assert!(
+            cli_frequency_evidence(Some(144_500_000), Some("2m"), "--frequency-hz", "--band")
+                .is_ok()
+        );
     }
 
     #[cfg(feature = "cpal-backend")]
@@ -1930,14 +1916,7 @@ mod tests {
             "hi",
             None,
             None,
-            None,
-            None,
-            "rigctld-typo",
-            "127.0.0.1:1",
-            0,
-            0,
-            None,
-            None,
+            &RigSettings::test_values(None, "rigctld-typo", "127.0.0.1:1", 0, 0, None, None),
             Verbosity::Quiet,
         )
         .unwrap_err();
@@ -1952,17 +1931,15 @@ mod tests {
     fn test_cli_parses_frequency_flags_on_tx_and_tune() {
         let cli = Cli::parse_from(["coppa", "tx", "hi", "--frequency-hz", "144500000"]);
         match cli.command {
-            Some(Commands::Tx {
-                frequency_hz, band, ..
-            }) => {
-                assert_eq!(frequency_hz, Some(144_500_000));
-                assert_eq!(band, None);
+            Some(Commands::Tx { rig, .. }) => {
+                assert_eq!(rig.frequency_hz, Some(144_500_000));
+                assert_eq!(rig.band, None);
             }
             _ => panic!("expected Tx command"),
         }
         let cli = Cli::parse_from(["coppa", "tune", "--band", "2m"]);
         match cli.command {
-            Some(Commands::Tune { band, .. }) => assert_eq!(band.as_deref(), Some("2m")),
+            Some(Commands::Tune { rig, .. }) => assert_eq!(rig.band.as_deref(), Some("2m")),
             _ => panic!("expected Tune command"),
         }
     }
@@ -1976,14 +1953,7 @@ mod tests {
             "hi",
             None,
             Some("VHF_FAST"),
-            None,
-            None,
-            "none",
-            "127.0.0.1:1",
-            0,
-            0,
-            None,
-            None,
+            &RigSettings::test_values(None, "none", "127.0.0.1:1", 0, 0, None, None),
             Verbosity::Quiet,
         )
         .unwrap_err();
@@ -1994,14 +1964,7 @@ mod tests {
             "hi",
             Some(path.to_str().unwrap()),
             Some("VHF_FAST"),
-            None,
-            None,
-            "none",
-            "127.0.0.1:1",
-            0,
-            0,
-            None,
-            None,
+            &RigSettings::test_values(None, "none", "127.0.0.1:1", 0, 0, None, None),
             Verbosity::Quiet,
         )
         .unwrap();
@@ -2026,14 +1989,7 @@ mod tests {
                 "streaming rx roundtrip",
                 Some(path_str),
                 None,
-                None,
-                None,
-                "none",
-                "127.0.0.1:4532",
-                50,
-                200,
-                None,
-                None,
+                &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
                 Verbosity::Quiet,
             )
             .expect("tx to file should succeed");
