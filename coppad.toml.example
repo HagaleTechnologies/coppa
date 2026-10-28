@@ -76,6 +76,9 @@ bind_address = "127.0.0.1"
 # VARA-style TCP control interface (not RF/waveform-compatible with VARA)
 vara_enabled = false
 vara_command_port = 8300
+# Pat (Winlink) with its current `addr` config uses the command port + 1 for
+# data; keep them adjacent.
+# See docs/PAT.md.
 vara_data_port = 8301
 # WebSocket JSON API
 # Clients can opt into periodic "spectrum" and "audio_level" streams; see docs/OPERATING.md.

@@ -1641,6 +1641,19 @@ impl EventLoop {
             }
         }
         self.tx_frame_count += 1;
+        // COP-46: a sent session PDU is activity (`Session::touch`'s
+        // contract). The peer's ACK touches the session too, but only once
+        // it arrives: without this, the first frame after 30 s of quiet
+        // leaves `session_cleanup` free to key a KEEPALIVE on top of the
+        // peer's ACK, which then costs a retransmission.
+        if let Some(session) = self
+            .session_link
+            .as_ref()
+            .map(|l| l.session_id)
+            .and_then(|id| self.session_mgr.get_mut(id))
+        {
+            session.touch();
+        }
         tracing::debug!(
             seq,
             frame = self.tx_frame_count,
@@ -2039,6 +2052,8 @@ impl EventLoop {
                                 if let Ok(ka_pdu) = session.keepalive() {
                                     let ka_bytes = ka_pdu.to_bytes();
                                     if let Ok(samples) = self.engine.encode_bytes(&ka_bytes) {
+                                        // COP-46: `tools/pat-loop` counts these.
+                                        tracing::info!(session = id, "Sending session KEEPALIVE");
                                         self.transmit_samples(&samples).await;
                                     }
                                 }
@@ -12009,6 +12024,54 @@ mod tests {
                 first_buffer.is_some() && first_ptt_on.is_some() && first_buffer < first_ptt_on,
                 "BUFFER 12 must reach the host before the first PTT ON, got: {:?}",
                 lines
+            );
+        }
+
+        /// COP-46: keying a session data frame is session activity, so a
+        /// station that is busy sending its own message never keys a
+        /// KEEPALIVE in the middle of it. Before the fix only the receive
+        /// paths called `Session::touch` (`handle_session_data`,
+        /// `handle_keepalive_rx`), so ~30 s into a long transfer
+        /// `session_cleanup` keyed a KEEPALIVE right after the sender's own
+        /// last data frame -- on top of the peer's `FF` reply. Session data
+        /// has no ARQ (H-025), so that reply was lost for good, keepalives
+        /// then held the dead session open, and real Pat's `pat connect`
+        /// sat until its 900 s timeout (COP-46 plan, two-process run).
+        /// COP-38 has since made session data ARQ-protected, and the peer's
+        /// ACK touches the session as well; this checks the window between
+        /// keying a frame and that ACK arriving.
+        #[tokio::test]
+        async fn session_send_counts_as_activity() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            let (mut reader, _write_half, _data_addr) =
+                connect_bridged_vara_client_ephemeral(&mut event_loop).await;
+            let id = seed_established(&mut event_loop);
+
+            // Idle long enough that `session_cleanup` would key a KEEPALIVE.
+            event_loop.session_mgr.get_mut(id).unwrap().last_activity = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(40))
+                .unwrap();
+            assert!(
+                event_loop.session_mgr.get(id).unwrap().needs_keepalive(),
+                "precondition: a 40 s idle session needs a keepalive"
+            );
+
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x66; 12],
+                })
+                .await;
+
+            let lines = read_available_lines(&mut reader).await;
+            assert!(
+                lines.iter().any(|l| l.trim_end() == "PTT ON"),
+                "the session chunk must really key a frame, got: {:?}",
+                lines
+            );
+            assert!(
+                !event_loop.session_mgr.get(id).unwrap().needs_keepalive(),
+                "a keyed session data frame must reset the keepalive timer"
             );
         }
 

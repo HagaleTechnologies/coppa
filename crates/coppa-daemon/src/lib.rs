@@ -10,3 +10,4 @@ pub mod spectrum;
 #[cfg(feature = "kiss-tnc")]
 pub mod tnc;
 pub mod tx_chunker;
+pub mod vara_wiring;
