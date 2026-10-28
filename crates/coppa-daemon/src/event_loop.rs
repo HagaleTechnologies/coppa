@@ -5,8 +5,11 @@
 use anyhow::Result;
 use coppa_audio::{AudioRingConsumer, AudioRingProducer};
 use coppa_engine::{CoppaCore, OfdmBand};
-use coppa_host::vara::{queue_response, Queued, VaraCommand, VaraResponse, COMMAND_QUEUE_DEPTH};
-use coppa_host::HostEvent;
+use coppa_host::vara::{
+    queue_data, queue_response, DataQueued, Queued, VaraCommand, VaraResponse, COMMAND_QUEUE_DEPTH,
+    DATA_QUEUE_DEPTH,
+};
+use coppa_host::{HostEvent, HostResponse};
 use coppa_ml::CpRecommendation;
 use coppa_ml::{BusyGate, CpGate, RateLoop};
 use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx};
@@ -35,6 +38,10 @@ use crate::tx_chunker::{chunk_to_fit, next_chunk_len};
 /// Map of connected VARA command-port clients' response senders
 /// (`VaraServer::response_senders()`), used to broadcast `VaraResponse` telemetry.
 type VaraResponseSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<VaraResponse>>>>;
+
+/// Map of connected VARA data-port clients' data senders
+/// (`VaraServer::data_senders()`), used by [`forward_data_out`].
+pub type VaraDataSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>;
 
 /// How often every command-port client hears `IAMALIVE`. VARA sends it every
 /// 60 s; Pat closes the modem after 2 minutes without a line, and vARIM after
@@ -141,12 +148,15 @@ fn session_ack_frame(link: &SessionLink) -> Vec<u8> {
 ///
 /// - `MYCALL <call>` valid → `OK` (the daemon applies it as the runtime
 ///   callsign); invalid or missing → `WRONG`.
-/// - `LISTEN ON`/`LISTEN OFF` → `OK`; any other argument → `WRONG`.
+/// - `LISTEN ON`/`LISTEN OFF` → `OK`; any other argument → `WRONG`. While
+///   listening, an inbound connect attempt the daemon answers then pushes
+///   `PENDING`, and the attempt ends in `CONNECTED` or `CANCELPENDING`.
 /// - `TUNE [seconds]` (coppa extension) → `OK`, even when the tone itself is
 ///   then refused for want of a callsign (`transmit_samples` logs why).
 /// - `CONNECT <src> <dst>` → `OK` (then the eventual `CONNECTED`/`DISCONNECTED`
 ///   outcome); fewer than two callsigns → `WRONG`.
-/// - `DISCONNECT` → `OK` (then `DISCONNECTED` if a session existed).
+/// - `DISCONNECT` → `OK` (then `DISCONNECTED` if a session existed,
+///   preceded by `CANCELPENDING` when it was a pending inbound one).
 /// - `VERSION` → a `VERSION Coppa <pkg version>` line, never `OK`.
 /// - `COMPRESSION …`, `BW500`, `BW2300`, `BW2750`, `ABORT` → `OK`: accepted,
 ///   not implemented (matches VARA's own replies to commands Pat sends every
@@ -204,6 +214,52 @@ async fn broadcast_vara(senders: &VaraResponseSenders, response: VaraResponse) {
         .retain(|&id, tx| queue_for_client(id, tx, response.clone()));
 }
 
+/// Queue `data` for one data-port client without waiting (`queue_data`).
+/// Returns `false` when the payload finds the client's queue full: the client
+/// has stopped reading, and the caller removes its sender, which closes its
+/// connection once the queued payloads are written. The client gets every
+/// payload up to that point, then EOF, never a gap on an open connection.
+fn queue_data_for_client(client_id: u32, tx: &mpsc::Sender<Vec<u8>>, data: Vec<u8>) -> bool {
+    match queue_data(tx, data) {
+        DataQueued::Overflow(data) => {
+            tracing::warn!(
+                client_id,
+                bytes = data.len(),
+                depth = DATA_QUEUE_DEPTH,
+                "VARA data-port client is not reading; disconnecting it"
+            );
+            false
+        }
+        DataQueued::Sent | DataQueued::Closed => true,
+    }
+}
+
+/// Forward every decoded payload the event loop sends on `responses` to the
+/// data-port clients in `senders`: a `client_id` of 0 goes to every client,
+/// any other to that client alone. It never waits on a client, so one host
+/// that stops reading holds up neither the other clients nor the event
+/// loop's queue; that host is disconnected instead (`queue_data_for_client`).
+/// Returns when every sender for `responses` is dropped.
+pub async fn forward_data_out(
+    mut responses: mpsc::UnboundedReceiver<HostResponse>,
+    senders: VaraDataSenders,
+) {
+    while let Some(response) = responses.recv().await {
+        // StatusUpdate is deliberately not forwarded: EventLoop::notify_session
+        // pushes session state directly to the command port and WebSocket.
+        if let HostResponse::DataOut { client_id, data } = response {
+            let mut senders = senders.lock().await;
+            if client_id == 0 {
+                senders.retain(|&id, tx| queue_data_for_client(id, tx, data.clone()));
+            } else if let Some(tx) = senders.get(&client_id) {
+                if !queue_data_for_client(client_id, tx, data) {
+                    senders.remove(&client_id);
+                }
+            }
+        }
+    }
+}
+
 /// Send `IAMALIVE` to every command-port client each `period`, the first one
 /// `period` from now. It is a task of its own because the event loop can wait
 /// for a long time (the busy-channel holdoff in `wait_for_clear_channel` has
@@ -232,6 +288,12 @@ enum SessionNotice {
     },
     /// A session ended or a connect attempt failed.
     Disconnected,
+    /// COP-44: a remote station's CONNECT_REQ was accepted; the handshake
+    /// waits for its CONNECT_CFM.
+    Pending,
+    /// COP-44: the inbound handshake `Pending` announced ended without
+    /// `Connected`.
+    PendingCancelled,
 }
 
 /// Event types flowing through the daemon event loop.
@@ -332,7 +394,10 @@ pub struct EventLoop {
     /// the same poll.
     session_tx_held_by_frequency_gate: bool,
     /// Optional sender for host responses (decoded data, status updates).
-    response_tx: Option<mpsc::Sender<coppa_host::HostResponse>>,
+    /// Unbounded so the event loop never waits on it and never drops a
+    /// decoded payload; its consumer (`forward_data_out`) never waits on a
+    /// client, so it holds only what was decoded since that consumer last ran.
+    response_tx: Option<mpsc::UnboundedSender<HostResponse>>,
     /// Playback progress from the audio output worker. `None` when no
     /// hardware output is wired (tests, headless builds), in which case PTT
     /// release falls back to the nominal audio duration.
@@ -1124,7 +1189,9 @@ impl EventLoop {
     }
 
     /// Set the response sender for sending decoded data back to host clients.
-    pub fn set_response_tx(&mut self, tx: mpsc::Sender<coppa_host::HostResponse>) {
+    /// The queue is unbounded, so whoever holds its receiver must keep
+    /// draining it (`forward_data_out`).
+    pub fn set_response_tx(&mut self, tx: mpsc::UnboundedSender<HostResponse>) {
         self.response_tx = Some(tx);
     }
 
@@ -1247,9 +1314,13 @@ impl EventLoop {
                 )
             }
             SessionNotice::Disconnected => ("DISCONNECTED".to_string(), VaraResponse::Disconnected),
+            SessionNotice::Pending => ("PENDING".to_string(), VaraResponse::Pending),
+            SessionNotice::PendingCancelled => {
+                ("CANCELPENDING".to_string(), VaraResponse::CancelPending)
+            }
         };
         if let Some(ref tx) = self.response_tx {
-            let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate { client_id, status });
+            let _ = tx.send(HostResponse::StatusUpdate { client_id, status });
         }
         // A dropped state line would leave the host waiting out its own
         // connect or disconnect timer, so a host that cannot take it is
@@ -1257,6 +1328,17 @@ impl EventLoop {
         self.emit_vara(vara).await;
         #[cfg(feature = "websocket")]
         {
+            let msg = match notice {
+                SessionNotice::Connected { remote, .. } => {
+                    coppa_host::websocket::WsServerMessage::Connected {
+                        remote_call: remote.to_string(),
+                    }
+                }
+                SessionNotice::Disconnected => coppa_host::websocket::WsServerMessage::Disconnected,
+                // The WebSocket API has no LISTEN, so it never takes part in
+                // an inbound attempt.
+                SessionNotice::Pending | SessionNotice::PendingCancelled => return,
+            };
             let remote = self.established_remote();
             if let Some(ref status) = self.ws_status {
                 let mut snap = status.lock().await;
@@ -1264,16 +1346,6 @@ impl EventLoop {
                 snap.remote_call = remote.map(|cs| cs.to_string());
             }
             if let Some(ref ws_tx) = self.ws_broadcast {
-                let msg = match notice {
-                    SessionNotice::Connected { remote, .. } => {
-                        coppa_host::websocket::WsServerMessage::Connected {
-                            remote_call: remote.to_string(),
-                        }
-                    }
-                    SessionNotice::Disconnected => {
-                        coppa_host::websocket::WsServerMessage::Disconnected
-                    }
-                };
                 if let Ok(json) = serde_json::to_string(&msg) {
                     let _ = ws_tx.send(json); // An error means no client is subscribed.
                 }
@@ -1282,12 +1354,37 @@ impl EventLoop {
     }
 
     async fn reap_timed_out_sessions(&mut self) {
+        // `cleanup_timed_out` returns only IDs, so note which sessions were
+        // pending inbound handshakes first (COP-44: those end in
+        // CANCELPENDING, not DISCONNECTED).
+        let pending = self.accepting_sessions();
         let removed = self.session_mgr.cleanup_timed_out();
         for id in removed {
             tracing::warn!(session_id = id, "Session timed out");
             self.discard_session_tx(id).await;
-            self.notify_session(0, SessionNotice::Disconnected).await;
+            let notice = if pending.contains(&id) {
+                SessionNotice::PendingCancelled
+            } else {
+                SessionNotice::Disconnected
+            };
+            self.notify_session(0, notice).await;
         }
+    }
+
+    /// COP-44: the sessions in `Accepting`, the inbound handshakes a host
+    /// was told were `PENDING`.
+    fn accepting_sessions(&self) -> Vec<u8> {
+        self.session_mgr
+            .active_sessions()
+            .into_iter()
+            .filter(|&id| self.is_accepting(id))
+            .collect()
+    }
+
+    fn is_accepting(&self, session_id: u8) -> bool {
+        self.session_mgr
+            .get(session_id)
+            .is_some_and(|s| s.state == SessionState::Accepting)
     }
 
     /// COP-40: retry a TX-queue (or, COP-41, session-queue) drain the
@@ -1544,6 +1641,19 @@ impl EventLoop {
             }
         }
         self.tx_frame_count += 1;
+        // COP-46: a sent session PDU is activity (`Session::touch`'s
+        // contract). The peer's ACK touches the session too, but only once
+        // it arrives: without this, the first frame after 30 s of quiet
+        // leaves `session_cleanup` free to key a KEEPALIVE on top of the
+        // peer's ACK, which then costs a retransmission.
+        if let Some(session) = self
+            .session_link
+            .as_ref()
+            .map(|l| l.session_id)
+            .and_then(|id| self.session_mgr.get_mut(id))
+        {
+            session.touch();
+        }
         tracing::debug!(
             seq,
             frame = self.tx_frame_count,
@@ -1740,10 +1850,12 @@ impl EventLoop {
 
     /// Tear down `session_id` at once: drop its link (`BUFFER` reports the
     /// change), send a best-effort DISCONNECT to the peer, remove the
-    /// session and tell the host `DISCONNECTED`. Shared by the host's
+    /// session and tell the host `DISCONNECTED` (after `CANCELPENDING` when
+    /// it was a pending inbound handshake). Shared by the host's
     /// `DISCONNECT` and COP-38's link failure, so no session data plays after
     /// the host hears `DISCONNECTED`.
     async fn end_session(&mut self, session_id: u8, client_id: u32) {
+        let was_pending = self.is_accepting(session_id);
         self.discard_session_tx(session_id).await;
         if let Some(session) = self.session_mgr.get_mut(session_id) {
             match session.disconnect() {
@@ -1762,6 +1874,12 @@ impl EventLoop {
             }
         }
         self.session_mgr.remove(session_id);
+        // COP-44: close the host's PENDING first; DISCONNECTED still answers
+        // its DISCONNECT.
+        if was_pending {
+            self.notify_session(client_id, SessionNotice::PendingCancelled)
+                .await;
+        }
         self.notify_session(client_id, SessionNotice::Disconnected)
             .await;
     }
@@ -1934,6 +2052,8 @@ impl EventLoop {
                                 if let Ok(ka_pdu) = session.keepalive() {
                                     let ka_bytes = ka_pdu.to_bytes();
                                     if let Ok(samples) = self.engine.encode_bytes(&ka_bytes) {
+                                        // COP-46: `tools/pat-loop` counts these.
+                                        tracing::info!(session = id, "Sending session KEEPALIVE");
                                         self.transmit_samples(&samples).await;
                                     }
                                 }
@@ -2220,7 +2340,7 @@ impl EventLoop {
                         "Connect request refused: another session is active"
                     );
                     if let Some(ref tx) = self.response_tx {
-                        let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
+                        let _ = tx.send(HostResponse::StatusUpdate {
                             client_id,
                             status: "DISCONNECTED".to_string(),
                         });
@@ -2243,11 +2363,10 @@ impl EventLoop {
                                         }
                                     }
                                     if let Some(ref tx) = self.response_tx {
-                                        let _ =
-                                            tx.try_send(coppa_host::HostResponse::StatusUpdate {
-                                                client_id,
-                                                status: format!("CONNECTING {}", remote),
-                                            });
+                                        let _ = tx.send(HostResponse::StatusUpdate {
+                                            client_id,
+                                            status: format!("CONNECTING {}", remote),
+                                        });
                                     }
                                 }
                                 Err(e) => {
@@ -2806,16 +2925,7 @@ impl EventLoop {
 
                     if !output_data.is_empty() {
                         tracing::info!(bytes = output_data.len(), "Frame decoded successfully");
-                        // Send decoded data back to host clients
-                        if let Some(ref tx) = self.response_tx {
-                            let response = coppa_host::HostResponse::DataOut {
-                                client_id: 0, // broadcast to all clients
-                                data: output_data.clone(),
-                            };
-                            if let Err(e) = tx.try_send(response) {
-                                tracing::warn!(error = %e, "Failed to send decoded response to host");
-                            }
-                        }
+                        self.deliver_to_host(output_data.clone());
                         // Forward to WebSocket broadcast channel
                         #[cfg(feature = "websocket")]
                         if let Some(ref ws_tx) = self.ws_broadcast {
@@ -4294,6 +4404,33 @@ impl EventLoop {
             return;
         }
 
+        // COP-44: a repeat CONNECT_REQ from a caller whose handshake is
+        // still half-open (it did not hear our CONNECT_ACK) replaces that
+        // session, so the caller gets a fresh ACK and the daemon keeps one
+        // session. The host was told PENDING once and is not told again. The
+        // match is the one its CFM will use (`session_id_for_frame`), so a
+        // REQ on another SSID is still refused below. A repeat whose
+        // capabilities do not parse is ignored and the pending handshake
+        // stands.
+        let pending_id = self
+            .session_id_for_frame(&pdu)
+            .filter(|&id| self.is_accepting(id));
+        let replaced = match pending_id {
+            Some(_) if LinkCapabilities::from_bytes(&pdu.payload).is_err() => {
+                tracing::debug!(remote = %pdu.src, "Unreadable repeat CONNECT_REQ; ignoring");
+                return;
+            }
+            Some(id) => {
+                tracing::info!(
+                    remote = %pdu.src, session_id = id,
+                    "Repeat CONNECT_REQ; restarting the handshake"
+                );
+                self.session_mgr.remove(id);
+                true
+            }
+            None => false,
+        };
+
         // COP-38: one session at a time (`active_session_remote`). While a
         // session exists, a CONNECT_REQ, the current peer's included, gets
         // no answer, so the caller's handshake times out.
@@ -4315,6 +4452,11 @@ impl EventLoop {
                 if let Some(session) = self.session_mgr.get_mut(id) {
                     match session.handle_connect_req(&pdu.payload) {
                         Ok(ack_pdu) => {
+                            // COP-44: announce the attempt before the ACK,
+                            // whose busy-channel wait can last seconds.
+                            if !replaced {
+                                self.notify_session(0, SessionNotice::Pending).await;
+                            }
                             let ack_bytes = ack_pdu.to_bytes();
                             match self.engine.encode_bytes(&ack_bytes) {
                                 Ok(samples) => self.transmit_samples(&samples).await,
@@ -4328,6 +4470,11 @@ impl EventLoop {
                         Err(e) => {
                             tracing::warn!(error = %e, "Failed to handle CONNECT_REQ");
                             self.session_mgr.remove(id);
+                            // The session this REQ replaced is gone too.
+                            if replaced {
+                                self.notify_session(0, SessionNotice::PendingCancelled)
+                                    .await;
+                            }
                         }
                     }
                 }
@@ -4390,6 +4537,16 @@ impl EventLoop {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to handle CONNECT_CFM");
+                    // COP-44: a rejected CFM ends a pending inbound handshake
+                    // now, not 30 s later in the reaper. A stray CFM for an
+                    // established session changes nothing.
+                    if session.state == SessionState::Accepting {
+                        let session_id = session.id;
+                        self.session_mgr.remove(session_id);
+                        self.discard_session_tx(session_id).await;
+                        self.notify_session(0, SessionNotice::PendingCancelled)
+                            .await;
+                    }
                 }
             }
         } else {
@@ -4402,15 +4559,39 @@ impl EventLoop {
         // Find session ID first to avoid borrow issues
         let session_id = self.session_id_for_frame(&pdu);
         if let Some(id) = session_id {
+            // Read before `handle_disconnect` sets the session `Idle`.
+            let was_pending = self.is_accepting(id);
             if let Some(session) = self.session_mgr.get_mut(id) {
                 session.handle_disconnect();
             }
             self.session_mgr.remove(id);
             tracing::info!(remote = %remote, "Session disconnected by remote");
             self.discard_session_tx(id).await;
-            self.notify_session(0, SessionNotice::Disconnected).await;
+            // COP-44: a caller that gives up mid-handshake cancels the
+            // host's PENDING; the host never heard CONNECTED.
+            let notice = if was_pending {
+                SessionNotice::PendingCancelled
+            } else {
+                SessionNotice::Disconnected
+            };
+            self.notify_session(0, notice).await;
         } else {
             tracing::debug!(remote = %remote, "DISCONNECT from unknown remote");
+        }
+    }
+
+    /// Send a decoded payload to every data-port client (`client_id` 0) through
+    /// `response_tx`. The queue is unbounded, so this never waits and never
+    /// drops; with no queue wired (no VARA server) it does nothing. It fails
+    /// only when the bridge draining the queue has stopped.
+    fn deliver_to_host(&self, data: Vec<u8>) {
+        if let Some(ref tx) = self.response_tx {
+            if tx
+                .send(HostResponse::DataOut { client_id: 0, data })
+                .is_err()
+            {
+                tracing::warn!("Data-port bridge has stopped; decoded payload not delivered");
+            }
         }
     }
 
@@ -4457,12 +4638,11 @@ impl EventLoop {
             }
             return;
         };
-        for (_seq, data) in link.rx.receive(segment.seq_num, segment.payload) {
-            if let Some(ref tx) = self.response_tx {
-                let _ = tx.try_send(coppa_host::HostResponse::DataOut { client_id: 0, data });
-            }
-        }
+        let delivered = link.rx.receive(segment.seq_num, segment.payload);
         let ack = session_ack_frame(link);
+        for (_seq, data) in delivered {
+            self.deliver_to_host(data);
+        }
         match self.engine.encode_bytes(&ack) {
             Ok(samples) => Box::pin(self.transmit_samples(&samples)).await,
             Err(e) => tracing::warn!(error = %e, "Failed to encode session ACK"),
@@ -6063,6 +6243,7 @@ mod tests {
                         VaraResponse::Connected(..)
                             | VaraResponse::Disconnected
                             | VaraResponse::Pending
+                            | VaraResponse::CancelPending
                     )
                 })
                 .collect()
@@ -6075,9 +6256,11 @@ mod tests {
         .await;
         b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_REQ"))
             .await;
-        assert!(
-            session_lines(&mut b_rx).is_empty(),
-            "REQ is not established"
+        // COP-44: the responder announces the attempt, not a connection.
+        assert_eq!(
+            session_lines(&mut b_rx),
+            [VaraResponse::Pending],
+            "REQ is pending, not established"
         );
         a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "CONNECT_ACK"))
             .await;
@@ -6122,6 +6305,7 @@ mod tests {
                         VaraResponse::Connected(..)
                             | VaraResponse::Disconnected
                             | VaraResponse::Pending
+                            | VaraResponse::CancelPending
                     )
                 })
                 .collect()
@@ -6170,9 +6354,71 @@ mod tests {
         b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_CFM"))
             .await;
 
-        let expected = [VaraResponse::Connected("W5AU".into(), "K7XYZ".into(), 2400)];
-        assert_eq!(session_lines(&mut a_rx), expected);
-        assert_eq!(session_lines(&mut b_rx), expected);
+        let connected = VaraResponse::Connected("W5AU".into(), "K7XYZ".into(), 2400);
+        assert_eq!(session_lines(&mut a_rx), std::slice::from_ref(&connected));
+        // COP-44: the responder heard PENDING at the REQ.
+        assert_eq!(session_lines(&mut b_rx), [VaraResponse::Pending, connected]);
+    }
+
+    /// COP-44: the caller's CONNECT_CFM is lost on air (COP-1 loss
+    /// injection), so the responder's half-open handshake times out. Its host
+    /// was told `PENDING`, so the reaper ends the attempt with
+    /// `CANCELPENDING`, never `DISCONNECTED` for a link it never heard of.
+    #[tokio::test]
+    async fn lost_cfm_cancels_the_pending_inbound_connect() {
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = "VK3ABC".into();
+        config.radio.ptt_pre_delay_ms = 0;
+        config.radio.ptt_tail_delay_ms = 0;
+        let mut a = EventLoop::new(config.clone()).unwrap();
+        config.engine.callsign = "W1AW".into();
+        let mut b = EventLoop::new(config).unwrap();
+        b.listening = true;
+        let (a_producer, mut a_consumer) = coppa_audio::audio_ring(1_000_000);
+        let (b_producer, mut b_consumer) = coppa_audio::audio_ring(1_000_000);
+        a.set_audio_out(a_producer);
+        b.set_audio_out(b_producer);
+        let (b_tx, mut b_rx) = mpsc::channel(64);
+        b.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, b_tx)]))));
+        fn session_lines(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<VaraResponse> {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|response| {
+                    matches!(
+                        response,
+                        VaraResponse::Connected(..)
+                            | VaraResponse::Disconnected
+                            | VaraResponse::Pending
+                            | VaraResponse::CancelPending
+                    )
+                })
+                .collect()
+        }
+
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "VK3ABC".into(),
+            destination: "W1AW".into(),
+        })
+        .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_REQ"))
+            .await;
+        assert_eq!(session_lines(&mut b_rx), [VaraResponse::Pending]);
+        a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "CONNECT_ACK"))
+            .await;
+        let _lost = take_leg(&mut a_consumer, "CONNECT_CFM");
+
+        let ids = b.session_mgr.active_sessions();
+        assert_eq!(ids.len(), 1, "{ids:?}");
+        let session = b.session_mgr.get_mut(ids[0]).unwrap();
+        assert_eq!(session.state, SessionState::Accepting);
+        session.last_activity = Instant::now()
+            .checked_sub(Duration::from_secs(
+                coppa_protocol::session::HANDSHAKE_TIMEOUT_SECS + 1,
+            ))
+            .expect("host uptime exceeds the handshake timeout");
+        b.reap_timed_out_sessions().await;
+        assert_eq!(session_lines(&mut b_rx), [VaraResponse::CancelPending]);
+        assert!(b.session_mgr.active_sessions().is_empty());
     }
 
     /// COP-28: a `MYCALL` that arrives mid-session must not break the
@@ -6218,7 +6464,7 @@ mod tests {
         // Only now wire b's response channel, so the handshake's
         // StatusUpdate lines are dropped and the next delivery is the data
         // frame's DataOut.
-        let (data_tx, mut data_rx) = mpsc::channel(64);
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
         b.set_response_tx(data_tx);
 
         // Mid-session MYCALL on the sender, then a data frame.
@@ -6246,7 +6492,7 @@ mod tests {
             .expect("b must deliver the data frame's payload")
             .expect("response channel closed");
         match got {
-            coppa_host::HostResponse::DataOut { client_id: _, data } => {
+            HostResponse::DataOut { client_id: _, data } => {
                 assert_eq!(data, b"hello");
             }
             other => panic!("expected DataOut, got {:?}", other),
@@ -6343,7 +6589,7 @@ mod tests {
     }
 
     /// Every `DataOut` payload queued on `rx`, in order.
-    fn drain_data_out(rx: &mut mpsc::Receiver<coppa_host::HostResponse>) -> Vec<Vec<u8>> {
+    fn drain_data_out(rx: &mut mpsc::UnboundedReceiver<coppa_host::HostResponse>) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         while let Ok(resp) = rx.try_recv() {
             if let coppa_host::HostResponse::DataOut { data, .. } = resp {
@@ -6389,7 +6635,7 @@ mod tests {
     #[tokio::test]
     async fn connected_session_write_is_delivered_and_acked_with_arq_disabled() {
         let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
-        let (data_tx, mut data_rx) = mpsc::channel(64);
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
         b.set_response_tx(data_tx);
         let payload = b"twenty-eight bytes of B2F!!!".to_vec();
         assert_eq!(payload.len(), 28);
@@ -6420,7 +6666,7 @@ mod tests {
     #[tokio::test]
     async fn a_duplicate_session_frame_is_acked_but_delivered_once() {
         let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
-        let (data_tx, mut data_rx) = mpsc::channel(64);
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
         b.set_response_tx(data_tx);
         a.handle_host_event(HostEvent::DataReceived {
             client_id: 1,
@@ -6444,7 +6690,7 @@ mod tests {
     #[tokio::test]
     async fn a_non_reliable_session_payload_is_dropped_without_dataout_or_ack() {
         let (_a, mut b, _a_consumer, mut b_consumer) = connected_pair(0).await;
-        let (data_tx, mut data_rx) = mpsc::channel(64);
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
         b.set_response_tx(data_tx);
         let legacy = MacPdu::new_data(
             Callsign::new("W1AW").unwrap(),
@@ -6517,7 +6763,7 @@ mod tests {
     #[tokio::test]
     async fn lost_session_data_frame_is_retransmitted_and_delivered_once() {
         let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
-        let (data_tx, mut data_rx) = mpsc::channel(64);
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
         b.set_response_tx(data_tx);
         let mut status_rx = vara_lines(&mut a);
         fast_session_rto(&mut a);
@@ -6550,7 +6796,7 @@ mod tests {
     #[tokio::test]
     async fn lost_session_ack_is_recovered_without_a_duplicate_delivery() {
         let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
-        let (data_tx, mut data_rx) = mpsc::channel(64);
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
         b.set_response_tx(data_tx);
         fast_session_rto(&mut a);
         a.handle_host_event(HostEvent::DataReceived {
@@ -6641,7 +6887,7 @@ mod tests {
     #[tokio::test]
     async fn session_write_of_8000_bytes_is_chunked_acked_and_reassembled() {
         let (mut a, mut b, _a_consumer, _b_consumer) = connected_pair(0).await;
-        let (data_tx, mut data_rx) = mpsc::channel(4096);
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
         b.set_response_tx(data_tx);
         let payload: Vec<u8> = (0..8000).map(|i| ((i * 31 + 7) % 251) as u8).collect();
         let frames_before = a.tx_frame_count;
@@ -8958,7 +9204,7 @@ mod tests {
     async fn test_connect_requires_callsign() {
         let config = DaemonConfig::default(); // callsign is empty
         let mut event_loop = EventLoop::new(config).unwrap();
-        let (resp_tx, mut resp_rx) = mpsc::channel(16);
+        let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
         event_loop.set_response_tx(resp_tx);
         let tx = event_loop.event_sender();
 
@@ -8976,7 +9222,7 @@ mod tests {
         // Should have sent DISCONNECTED status since no callsign
         let resp = resp_rx.try_recv().unwrap();
         match resp {
-            coppa_host::HostResponse::StatusUpdate { status, .. } => {
+            HostResponse::StatusUpdate { status, .. } => {
                 assert_eq!(status, "DISCONNECTED");
             }
             _ => panic!("Expected StatusUpdate"),
@@ -8988,7 +9234,7 @@ mod tests {
         let mut config = DaemonConfig::default();
         config.engine.callsign = "VK3ABC".to_string();
         let mut event_loop = EventLoop::new(config).unwrap();
-        let (resp_tx, mut resp_rx) = mpsc::channel(16);
+        let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
         event_loop.set_response_tx(resp_tx);
         let tx = event_loop.event_sender();
 
@@ -9006,7 +9252,7 @@ mod tests {
         // Should have sent CONNECTING status
         let resp = resp_rx.try_recv().unwrap();
         match resp {
-            coppa_host::HostResponse::StatusUpdate { status, .. } => {
+            HostResponse::StatusUpdate { status, .. } => {
                 assert!(
                     status.starts_with("CONNECTING"),
                     "Expected CONNECTING, got: {}",
@@ -10321,9 +10567,15 @@ mod tests {
         }
 
         fn is_session_line(line: &str) -> bool {
-            ["CONNECTED", "DISCONNECTED", "CONNECTING", "PENDING"]
-                .iter()
-                .any(|prefix| line.starts_with(prefix))
+            [
+                "CONNECTED",
+                "DISCONNECTED",
+                "CONNECTING",
+                "PENDING",
+                "CANCELPENDING",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
         }
 
         async fn next_session_line(reader: &mut BufReader<OwnedReadHalf>) -> String {
@@ -10362,13 +10614,17 @@ mod tests {
             );
         }
 
+        /// COP-44: over the real command port, a listening responder hears
+        /// `PENDING` when it answers the caller's CONNECT_REQ, and
+        /// `CONNECTED` only after the CFM.
         #[tokio::test]
-        async fn responder_hears_connected_only_after_cfm() {
+        async fn responder_hears_pending_then_connected() {
             let mut station = EventLoop::new(session_config()).unwrap();
             station.listening = true;
             let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19442, 19443).await;
             let mut remote = peer();
             station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            assert_eq!(next_session_line(&mut reader).await.trim_end(), "PENDING");
             assert!(read_available_lines(&mut reader)
                 .await
                 .iter()
@@ -10442,6 +10698,233 @@ mod tests {
                 next_session_line(&mut reader).await.trim_end(),
                 "DISCONNECTED"
             );
+        }
+
+        // COP-44: inbound connect attempts. Each test drives one listening
+        // responder (VK3ABC) with `peer()` (W1AW) as the caller and reads
+        // the command-port client's queue.
+
+        /// A listening responder with one in-process command-port client
+        /// (`client_id` 1) and that client's queue.
+        fn listening_responder() -> (EventLoop, mpsc::Receiver<VaraResponse>) {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            station.listening = true;
+            let (tx, rx) = mpsc::channel(64);
+            station.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, tx)]))));
+            (station, rx)
+        }
+
+        fn is_session_notice(line: &VaraResponse) -> bool {
+            matches!(
+                line,
+                VaraResponse::Pending
+                    | VaraResponse::CancelPending
+                    | VaraResponse::Connected(..)
+                    | VaraResponse::Disconnected
+            )
+        }
+
+        fn session_notices(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<VaraResponse> {
+            drain(rx).into_iter().filter(is_session_notice).collect()
+        }
+
+        /// A CFM whose negotiated capabilities exceed what both sides
+        /// advertised, so `handle_connect_cfm` rejects it.
+        fn oversized_cfm() -> MacPdu {
+            MacPdu::new(
+                MacFrameType::ConnectCfm,
+                Callsign::new("VK3ABC").unwrap(),
+                Callsign::new("W1AW").unwrap(),
+                0,
+                LinkCapabilities {
+                    max_payload_size: 9999,
+                    ..Default::default()
+                }
+                .to_bytes(),
+            )
+        }
+
+        #[tokio::test]
+        async fn peer_disconnect_during_inbound_handshake_sends_cancelpending() {
+            let (mut station, mut rx) = listening_responder();
+            let mut remote = peer();
+            station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            assert_eq!(session_notices(&mut rx), [VaraResponse::Pending]);
+            station.handle_mac_pdu(remote.disconnect().unwrap()).await;
+            assert_eq!(session_notices(&mut rx), [VaraResponse::CancelPending]);
+            assert!(station.session_mgr.active_sessions().is_empty());
+        }
+
+        #[tokio::test]
+        async fn rejected_cfm_cancels_pending_at_once() {
+            let (mut station, mut rx) = listening_responder();
+            let mut remote = peer();
+            station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            station.handle_mac_pdu(oversized_cfm()).await;
+            // No reaper call: the session ends with the rejected CFM.
+            assert_eq!(
+                session_notices(&mut rx),
+                [VaraResponse::Pending, VaraResponse::CancelPending]
+            );
+            assert!(station.session_mgr.active_sessions().is_empty());
+        }
+
+        /// A rejected CFM for an established session is a stray, not the end
+        /// of a pending handshake: it changes nothing.
+        #[tokio::test]
+        async fn rejected_cfm_for_an_established_session_changes_nothing() {
+            let (mut station, mut rx) = listening_responder();
+            let id = seed_established(&mut station);
+            station.handle_mac_pdu(oversized_cfm()).await;
+            assert!(session_notices(&mut rx).is_empty());
+            assert_eq!(station.session_mgr.active_sessions(), vec![id]);
+        }
+
+        #[tokio::test]
+        async fn host_disconnect_during_inbound_handshake_sends_cancelpending_then_disconnected() {
+            let (mut station, mut rx) = listening_responder();
+            station.handle_mac_pdu(peer().initiate().unwrap()).await;
+            station
+                .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+                .await;
+            assert_eq!(
+                session_notices(&mut rx),
+                [
+                    VaraResponse::Pending,
+                    VaraResponse::CancelPending,
+                    VaraResponse::Disconnected
+                ]
+            );
+            assert!(station.session_mgr.active_sessions().is_empty());
+        }
+
+        #[tokio::test]
+        async fn repeat_connect_req_keeps_one_session_and_one_pending() {
+            let (mut station, mut rx) = listening_responder();
+            let mut remote = peer();
+            let req = remote.initiate().unwrap();
+            station.handle_mac_pdu(req.clone()).await;
+            station.handle_mac_pdu(req).await;
+            let lines = drain(&mut rx);
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|l| is_session_notice(l))
+                    .collect::<Vec<_>>(),
+                [&VaraResponse::Pending],
+                "{lines:?}"
+            );
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|l| **l == VaraResponse::Ptt(true))
+                    .count(),
+                2,
+                "each REQ is answered with its own CONNECT_ACK: {lines:?}"
+            );
+            let ids = station.session_mgr.active_sessions();
+            assert_eq!(ids.len(), 1, "{ids:?}");
+            assert_eq!(
+                station.session_mgr.get(ids[0]).unwrap().state,
+                SessionState::Accepting
+            );
+
+            let cfm = remote
+                .handle_connect_ack(&LinkCapabilities::default().to_bytes())
+                .unwrap();
+            station.handle_mac_pdu(cfm).await;
+            assert_eq!(
+                session_notices(&mut rx),
+                [VaraResponse::Connected(
+                    "W1AW".into(),
+                    "VK3ABC".into(),
+                    2400
+                )]
+            );
+            station.reap_timed_out_sessions().await;
+            assert!(session_notices(&mut rx).is_empty());
+        }
+
+        /// A REQ from the pending caller that cannot restart its handshake
+        /// (unreadable capabilities, or another SSID) leaves the pending
+        /// handshake as it was: no line, and the original CFM still connects.
+        #[tokio::test]
+        async fn unmatched_repeat_connect_req_keeps_the_pending_handshake() {
+            let (mut station, mut rx) = listening_responder();
+            let mut remote = peer();
+            station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            assert_eq!(session_notices(&mut rx), [VaraResponse::Pending]);
+            let unreadable = MacPdu::new(
+                MacFrameType::ConnectReq,
+                Callsign::new("VK3ABC").unwrap(),
+                Callsign::new("W1AW").unwrap(),
+                0,
+                vec![0; 6],
+            );
+            let other_ssid = coppa_protocol::session::Session::new(
+                0,
+                Callsign::new("W1AW").unwrap(),
+                Callsign::new("VK3ABC").unwrap(),
+                3,
+                LinkCapabilities::default(),
+            )
+            .initiate()
+            .unwrap();
+            for (what, req) in [("unreadable", unreadable), ("SSID 3", other_ssid)] {
+                station.handle_mac_pdu(req).await;
+                assert!(session_notices(&mut rx).is_empty(), "{what}");
+                let ids = station.session_mgr.active_sessions();
+                assert_eq!(ids.len(), 1, "{what}: {ids:?}");
+                let session = station.session_mgr.get(ids[0]).unwrap();
+                assert_eq!(
+                    (session.state, session.ssid),
+                    (SessionState::Accepting, 0),
+                    "{what}"
+                );
+            }
+            let cfm = remote
+                .handle_connect_ack(&LinkCapabilities::default().to_bytes())
+                .unwrap();
+            station.handle_mac_pdu(cfm).await;
+            assert_eq!(
+                session_notices(&mut rx),
+                [VaraResponse::Connected(
+                    "W1AW".into(),
+                    "VK3ABC".into(),
+                    2400
+                )]
+            );
+        }
+
+        #[tokio::test]
+        async fn ignored_connect_req_emits_no_pending() {
+            let other_station = coppa_protocol::session::Session::new(
+                0,
+                Callsign::new("W1AW").unwrap(),
+                Callsign::new("K7XYZ").unwrap(),
+                0,
+                LinkCapabilities::default(),
+            )
+            .initiate()
+            .unwrap();
+            let short_payload = MacPdu::new(
+                MacFrameType::ConnectReq,
+                Callsign::new("VK3ABC").unwrap(),
+                Callsign::new("W1AW").unwrap(),
+                0,
+                vec![0; 6],
+            );
+            for (what, listening, req) in [
+                ("not listening", false, peer().initiate().unwrap()),
+                ("addressed to K7XYZ", true, other_station),
+                ("payload shorter than 7 bytes", true, short_payload),
+            ] {
+                let (mut station, mut rx) = listening_responder();
+                station.listening = listening;
+                station.handle_mac_pdu(req).await;
+                assert!(station.session_mgr.active_sessions().is_empty(), "{what}");
+                assert!(session_notices(&mut rx).is_empty(), "{what}");
+            }
         }
 
         /// COP-28: Pat's startup burst — commands the parser does not know
@@ -11544,6 +12027,54 @@ mod tests {
             );
         }
 
+        /// COP-46: keying a session data frame is session activity, so a
+        /// station that is busy sending its own message never keys a
+        /// KEEPALIVE in the middle of it. Before the fix only the receive
+        /// paths called `Session::touch` (`handle_session_data`,
+        /// `handle_keepalive_rx`), so ~30 s into a long transfer
+        /// `session_cleanup` keyed a KEEPALIVE right after the sender's own
+        /// last data frame -- on top of the peer's `FF` reply. Session data
+        /// has no ARQ (H-025), so that reply was lost for good, keepalives
+        /// then held the dead session open, and real Pat's `pat connect`
+        /// sat until its 900 s timeout (COP-46 plan, two-process run).
+        /// COP-38 has since made session data ARQ-protected, and the peer's
+        /// ACK touches the session as well; this checks the window between
+        /// keying a frame and that ACK arriving.
+        #[tokio::test]
+        async fn session_send_counts_as_activity() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            let (mut reader, _write_half, _data_addr) =
+                connect_bridged_vara_client_ephemeral(&mut event_loop).await;
+            let id = seed_established(&mut event_loop);
+
+            // Idle long enough that `session_cleanup` would key a KEEPALIVE.
+            event_loop.session_mgr.get_mut(id).unwrap().last_activity = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(40))
+                .unwrap();
+            assert!(
+                event_loop.session_mgr.get(id).unwrap().needs_keepalive(),
+                "precondition: a 40 s idle session needs a keepalive"
+            );
+
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x66; 12],
+                })
+                .await;
+
+            let lines = read_available_lines(&mut reader).await;
+            assert!(
+                lines.iter().any(|l| l.trim_end() == "PTT ON"),
+                "the session chunk must really key a frame, got: {:?}",
+                lines
+            );
+            assert!(
+                !event_loop.session_mgr.get(id).unwrap().needs_keepalive(),
+                "a keyed session data frame must reset the keepalive timer"
+            );
+        }
+
         /// COP-38 (D6): session `BUFFER` counts bytes the peer has not yet
         /// acknowledged, so a PTT release alone (the frame played, but may
         /// have been lost) never reports `BUFFER 0`; the peer's ACK does.
@@ -11683,7 +12214,7 @@ mod tests {
         #[tokio::test]
         async fn a_session_frame_addressed_to_another_station_changes_nothing() {
             let mut event_loop = EventLoop::new(session_config()).unwrap();
-            let (data_tx, mut data_rx) = mpsc::channel(64);
+            let (data_tx, mut data_rx) = mpsc::unbounded_channel();
             event_loop.set_response_tx(data_tx);
             let id = seed_established(&mut event_loop);
             event_loop
@@ -11798,7 +12329,7 @@ mod tests {
         async fn a_second_session_is_refused_while_one_is_active() {
             let mut station = EventLoop::new(session_config()).unwrap();
             station.listening = true;
-            let (resp_tx, mut resp_rx) = mpsc::channel(64);
+            let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
             station.set_response_tx(resp_tx);
             let id = seed_established(&mut station);
             station
@@ -15209,8 +15740,8 @@ mod tests {
             let (mut b_in, b_in_consumer) = coppa_audio::audio_ring(ring);
             a.set_audio_in(a_in_consumer);
             b.set_audio_in(b_in_consumer);
-            let (a_resp_tx, mut a_resp) = mpsc::channel(4096);
-            let (b_resp_tx, mut b_resp) = mpsc::channel(4096);
+            let (a_resp_tx, mut a_resp) = mpsc::unbounded_channel();
+            let (b_resp_tx, mut b_resp) = mpsc::unbounded_channel();
             a.set_response_tx(a_resp_tx);
             b.set_response_tx(b_resp_tx);
             let mut a_vara = super::vara_lines(&mut a);
@@ -15445,6 +15976,211 @@ mod tests {
                     run.b_keyups_after_write,
                 );
             }
+        }
+    }
+
+    /// COP-39: every decoded payload reaches the data-port bridge, and the
+    /// bridge delivers it to each data-port client or disconnects a client
+    /// that has stopped reading -- never a gap on an open connection.
+    mod data_delivery {
+        use super::*;
+        use coppa_host::vara::{data_channel, DATA_QUEUE_DEPTH};
+
+        /// The `DataOut` payloads waiting on `rx`, each addressed to every
+        /// client (`client_id` 0). Other responses are skipped.
+        fn data_out(rx: &mut mpsc::UnboundedReceiver<HostResponse>) -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            while let Ok(response) = rx.try_recv() {
+                if let HostResponse::DataOut { client_id, data } = response {
+                    assert_eq!(client_id, 0, "decoded data goes to every client");
+                    out.push(data);
+                }
+            }
+            out
+        }
+
+        /// The payloads waiting on one data-port client's queue.
+        fn drain(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            while let Ok(data) = rx.try_recv() {
+                out.push(data);
+            }
+            out
+        }
+
+        /// `n` distinct payloads.
+        fn numbered(n: usize) -> Vec<Vec<u8>> {
+            (0..n).map(|i| (i as u32).to_be_bytes().to_vec()).collect()
+        }
+
+        fn data_out_for_all(data: Vec<u8>) -> HostResponse {
+            HostResponse::DataOut { client_id: 0, data }
+        }
+
+        #[tokio::test]
+        async fn raw_decoded_frame_reaches_the_data_port_bridge() {
+            let mut event_loop = EventLoop::new(tx_config()).unwrap();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            event_loop.set_response_tx(tx);
+
+            event_loop
+                .decode_and_dispatch_audio(&inert_peer_frame(7))
+                .await;
+
+            assert_eq!(
+                data_out(&mut rx),
+                vec![vec![0xFF, 7, 0, 0, 0, 0, 0, 1, 2, 3]]
+            );
+        }
+
+        #[tokio::test]
+        async fn arq_delivered_payload_reaches_the_data_port_bridge() {
+            let mut config = tx_config();
+            config.engine.arq_enabled = true;
+            let mut b = EventLoop::new(config).unwrap();
+            mark_identified(&mut b);
+            // The ACK is transmitted, so it needs somewhere to go.
+            let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
+            b.set_audio_out(producer);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            b.set_response_tx(tx);
+
+            let pdu = TransportPdu::new_reliable(b.arq_session_id, 0, 0, b"reliable".to_vec());
+            b.decode_and_dispatch_audio(&peer_frame(
+                &pdu,
+                coppa_codec::ofdm::CoppaProfile::hf_standard(),
+            ))
+            .await;
+
+            assert_eq!(data_out(&mut rx), vec![b"reliable".to_vec()]);
+        }
+
+        #[tokio::test]
+        async fn session_data_survives_a_host_that_is_not_reading() {
+            let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+            let local = Callsign::new("VK3ABC").unwrap();
+            let remote = Callsign::new("W1AW").unwrap();
+            let id = event_loop
+                .session_mgr
+                .create(
+                    local.clone(),
+                    remote.clone(),
+                    0,
+                    LinkCapabilities::default(),
+                )
+                .expect("a fresh SessionManager should have a free slot");
+            event_loop
+                .session_mgr
+                .get_mut(id)
+                .expect("just-created session should exist")
+                .state = SessionState::Established;
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            event_loop.set_response_tx(tx);
+
+            // More payloads than the old 64-slot queue held, with nothing
+            // draining the queue meanwhile. COP-38: each one is the next
+            // in-order reliable segment.
+            let payloads = numbered(200);
+            for (seq, payload) in payloads.iter().enumerate() {
+                let segment = TransportPdu::new_reliable(0, seq as u8, 0, payload.clone());
+                event_loop
+                    .handle_mac_pdu(MacPdu::new_data(
+                        local.clone(),
+                        remote.clone(),
+                        0,
+                        segment.to_bytes(),
+                    ))
+                    .await;
+            }
+
+            assert_eq!(data_out(&mut rx), payloads);
+        }
+
+        #[tokio::test]
+        async fn bridge_delivers_every_payload_to_a_host_that_catches_up() {
+            const CLIENT: u32 = 0x8000_0001;
+            let (client_tx, mut client_rx) = data_channel();
+            let senders: VaraDataSenders =
+                Arc::new(Mutex::new(HashMap::from([(CLIENT, client_tx)])));
+            let (tx, rx) = mpsc::unbounded_channel();
+            let bridge = tokio::spawn(forward_data_out(rx, senders.clone()));
+
+            let payloads = numbered(DATA_QUEUE_DEPTH);
+            for (i, payload) in payloads.iter().enumerate() {
+                tx.send(data_out_for_all(payload.clone())).unwrap();
+                if i % 100 == 99 {
+                    tx.send(HostResponse::StatusUpdate {
+                        client_id: 0,
+                        status: "CONNECTED W1AW".to_string(),
+                    })
+                    .unwrap();
+                }
+            }
+            drop(tx);
+            bridge.await.unwrap();
+
+            assert_eq!(drain(&mut client_rx), payloads);
+            assert!(senders.lock().await.contains_key(&CLIENT));
+        }
+
+        #[tokio::test]
+        async fn bridge_disconnects_a_host_that_stops_reading_and_serves_the_rest() {
+            const READING: u32 = 0x8000_0001;
+            const STUCK: u32 = 0x8000_0002;
+            // Deep enough never to overflow in this test.
+            let (reading_tx, mut reading_rx) = mpsc::channel(4 * DATA_QUEUE_DEPTH);
+            let (stuck_tx, mut stuck_rx) = data_channel();
+            let senders: VaraDataSenders = Arc::new(Mutex::new(HashMap::from([
+                (READING, reading_tx),
+                (STUCK, stuck_tx),
+            ])));
+            let (tx, rx) = mpsc::unbounded_channel();
+            let bridge = tokio::spawn(forward_data_out(rx, senders.clone()));
+
+            let payloads = numbered(DATA_QUEUE_DEPTH + 10);
+            for payload in &payloads {
+                tx.send(data_out_for_all(payload.clone())).unwrap();
+            }
+            drop(tx);
+            bridge.await.unwrap();
+
+            assert_eq!(drain(&mut reading_rx), payloads);
+            let map = senders.lock().await;
+            assert!(map.contains_key(&READING));
+            assert!(
+                !map.contains_key(&STUCK),
+                "a host whose queue overflowed must be disconnected"
+            );
+            drop(map);
+            assert_eq!(
+                drain(&mut stuck_rx),
+                payloads[..DATA_QUEUE_DEPTH].to_vec(),
+                "the stuck host gets every payload up to the overflow, with no gap"
+            );
+            assert_eq!(stuck_rx.recv().await, None, "then EOF");
+        }
+
+        #[tokio::test]
+        async fn bridge_delivers_a_unicast_payload_only_to_its_client() {
+            const A: u32 = 0x8000_0001;
+            const B: u32 = 0x8000_0002;
+            let (a_tx, mut a_rx) = data_channel();
+            let (b_tx, mut b_rx) = data_channel();
+            let senders: VaraDataSenders =
+                Arc::new(Mutex::new(HashMap::from([(A, a_tx), (B, b_tx)])));
+            let (tx, rx) = mpsc::unbounded_channel();
+            let bridge = tokio::spawn(forward_data_out(rx, senders.clone()));
+
+            tx.send(HostResponse::DataOut {
+                client_id: B,
+                data: b"only b".to_vec(),
+            })
+            .unwrap();
+            drop(tx);
+            bridge.await.unwrap();
+
+            assert!(drain(&mut a_rx).is_empty());
+            assert_eq!(drain(&mut b_rx), vec![b"only b".to_vec()]);
         }
     }
 }
