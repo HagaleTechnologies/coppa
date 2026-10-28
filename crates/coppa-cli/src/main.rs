@@ -69,16 +69,11 @@ struct RxArgs {
     /// Show the payload as lowercase hex even when it is valid UTF-8 text.
     #[arg(long)]
     hex: bool,
-<<<<<<< HEAD
-    /// Audio input device name (unique substring, live capture only).
-    #[arg(long, conflicts_with = "device_id")]
-=======
     /// Emit one JSON object per decoded frame.
     #[arg(long, conflicts_with_all = ["raw", "hex"])]
     json: bool,
-    /// Audio input device name (substring match, live capture only).
-    #[arg(long)]
->>>>>>> 5525bb62613a9205daa10e963538bb720e800563
+    /// Audio input device name (unique substring, live capture only).
+    #[arg(long, conflicts_with = "device_id")]
     device: Option<String>,
     /// Exact audio input device ID from `coppa devices`.
     #[arg(long, conflicts_with = "device")]
@@ -777,7 +772,7 @@ fn resolve_cli_output_device(
                 Ok(None)
             }
             Some(coppa_audio::DeviceSelectionError::AmbiguousName { .. }) => {
-                eprintln!("WARNING: {error}");
+                eprintln!("WARNING: {error} Use --device-id with an ID from `coppa devices`.");
                 anyhow::bail!("ambiguous output audio device")
             }
             _ => Err(error),
@@ -801,7 +796,7 @@ fn resolve_cli_input_device(
                 Ok(None)
             }
             Some(coppa_audio::DeviceSelectionError::AmbiguousName { .. }) => {
-                eprintln!("WARNING: {error}");
+                eprintln!("WARNING: {error} Use --device-id with an ID from `coppa devices`.");
                 anyhow::bail!("ambiguous input audio device")
             }
             _ => Err(error),
@@ -862,7 +857,7 @@ fn transmit_live(
             sink.device_name(), sink.hardware_rate(), sample_rate, sample_rate
         );
     }
-    if verbosity == Verbosity::Verbose {
+    if verbosity.is_verbose() {
         eprintln!(
             "[verbose] Output audio: {} (hardware {} Hz, engine {} Hz)",
             sink.device_name(),
@@ -1236,7 +1231,7 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                     source.device_name(), source.hardware_rate(), engine_rate, engine_rate
                 );
             }
-            if verbosity == Verbosity::Verbose {
+            if verbosity.is_verbose() {
                 eprintln!(
                     "[verbose] Input audio: {} (hardware {} Hz, engine {} Hz)",
                     source.device_name(),
@@ -1487,18 +1482,8 @@ fn cmd_loopback(message: &str, profile: Option<&str>, verbosity: Verbosity) -> R
     Ok(())
 }
 
-<<<<<<< HEAD
 fn device_lines(devices: &[coppa_audio::AudioDevice]) -> Vec<String> {
     let mut lines = vec!["Available audio devices:".to_string()];
-=======
-fn cmd_devices(json: bool) -> Result<()> {
-    let devices = coppa_audio::list_devices()?;
-    if json {
-        let output: Vec<_> = devices.iter().map(DeviceOutput::from).collect();
-        return write_json(&output);
-    }
-    println!("Available audio devices:");
->>>>>>> 5525bb62613a9205daa10e963538bb720e800563
     if devices.is_empty() {
         lines.push("  (none found - CPAL backend may not be available)".to_string());
     } else {
@@ -1516,8 +1501,13 @@ fn cmd_devices(json: bool) -> Result<()> {
     lines
 }
 
-fn cmd_devices() -> Result<()> {
-    for line in device_lines(&coppa_audio::list_devices()?) {
+fn cmd_devices(json: bool) -> Result<()> {
+    let devices = coppa_audio::list_devices()?;
+    if json {
+        let output: Vec<_> = devices.iter().map(DeviceOutput::from).collect();
+        return write_json(&output);
+    }
+    for line in device_lines(&devices) {
         println!("{line}");
     }
     Ok(())
@@ -1630,6 +1620,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&empty).unwrap(), "[]");
         let device = coppa_audio::AudioDevice {
             name: "USB \"mic\"\nline".into(),
+            id: None,
             max_sample_rate: 48_000,
             input_channels: 1,
             output_channels: 2,

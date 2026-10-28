@@ -705,6 +705,10 @@ fn selection_error(direction: AudioDirection, id: &str, error: anyhow::Error) ->
             "audio {} device {name:?} not found ([audio] {}_{}); run `coppa devices` to list available names and IDs",
             direction.label(), direction.label(), key
         ),
+        Some(coppa_audio::DeviceSelectionError::AmbiguousName { .. }) => anyhow::anyhow!(
+            "audio {} device selection failed ([audio] {}_{}): {error:#} Set [audio] {}_device_id to an ID from `coppa devices`.",
+            direction.label(), direction.label(), key, direction.label()
+        ),
         _ => anyhow::anyhow!(
             "audio {} device selection failed ([audio] {}_{}): {error:#}",
             direction.label(), direction.label(), key
@@ -797,4 +801,33 @@ fn open_output(
                 device_label(AudioDirection::Output, name, id)
             )
         })
+}
+
+#[cfg(all(test, feature = "cpal-backend"))]
+mod device_selection_tests {
+    use super::*;
+
+    #[test]
+    fn ambiguous_daemon_device_names_point_to_the_config_key() {
+        for direction in [AudioDirection::Input, AudioDirection::Output] {
+            let error = coppa_audio::DeviceSelectionError::AmbiguousName {
+                direction: direction.label(),
+                name: "USB".into(),
+                candidates: vec![
+                    "USB Audio [id: alsa:a]".into(),
+                    "USB Audio [id: alsa:b]".into(),
+                ],
+            };
+            let message = selection_error(direction, "", error.into()).to_string();
+            assert!(
+                message.contains(&format!("[audio] {}_device_id", direction.label())),
+                "{message}"
+            );
+            assert!(
+                message.contains("alsa:a") && message.contains("alsa:b"),
+                "{message}"
+            );
+            assert!(!message.contains("Use --device-id"), "{message}");
+        }
+    }
 }

@@ -234,6 +234,16 @@ fn air_to_kiss(mut frame: Vec<u8>) -> Vec<u8> {
     frame
 }
 
+#[cfg(feature = "cpal-backend")]
+fn tnc_device_selection_error(direction: &str, error: anyhow::Error) -> anyhow::Error {
+    match error.downcast_ref::<coppa_audio::DeviceSelectionError>() {
+        Some(coppa_audio::DeviceSelectionError::AmbiguousName { .. }) => anyhow::anyhow!(
+            "TNC {direction} audio device selection failed: {error} Use --{direction}-device-id with an ID from `coppa devices`."
+        ),
+        _ => anyhow::anyhow!("TNC {direction} audio device selection failed: {error}"),
+    }
+}
+
 /// Run the TNC daemon.
 ///
 /// Wires together:
@@ -383,9 +393,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
                 tracing::warn!(device = ?config.audio_device, "No input device matching, using default");
                 Ok(None)
             }
-            Err(error) => Err(anyhow::anyhow!(
-                "TNC input audio device selection failed: {error}"
-            )),
+            Err(error) => Err(tnc_device_selection_error("input", error)),
         };
         let resolve_output = || match coppa_audio::resolve_output_device(
             config
@@ -405,9 +413,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
                 tracing::warn!(device = ?config.audio_device, "No output device matching, using default");
                 Ok(None)
             }
-            Err(error) => Err(anyhow::anyhow!(
-                "TNC output audio device selection failed: {error}"
-            )),
+            Err(error) => Err(tnc_device_selection_error("output", error)),
         };
         // Check both selectors before either stream opens.
         let input_default = resolve_input()?.is_none();
@@ -426,7 +432,8 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
                     .as_deref()
                     .filter(|_| input_id.is_none() && !input_default),
                 input_id.as_deref(),
-            );
+            )
+            .map_err(|error| tnc_device_selection_error("input", error));
             let opened = device.and_then(|device| {
                 let mut source = coppa_audio::LiveSource::new(
                     device,
@@ -487,6 +494,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
                     .filter(|_| output_id.is_none() && !output_default),
                 output_id.as_deref(),
             )
+            .map_err(|error| tnc_device_selection_error("output", error))
             .and_then(|device| {
                 let mut sink = coppa_audio::LiveSink::new(
                     device,
@@ -610,6 +618,31 @@ mod tests {
     use crate::audio_output::{OutputWorker, STALL_TIMEOUT};
     use coppa_radio::PttState;
     use std::sync::Mutex;
+
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn ambiguous_tnc_devices_name_direction_specific_flags() {
+        for direction in ["input", "output"] {
+            let error = coppa_audio::DeviceSelectionError::AmbiguousName {
+                direction,
+                name: "USB".into(),
+                candidates: vec![
+                    "USB Audio [id: alsa:a]".into(),
+                    "USB Audio [id: alsa:b]".into(),
+                ],
+            };
+            let message = tnc_device_selection_error(direction, error.into()).to_string();
+            assert!(
+                message.contains(&format!("--{direction}-device-id")),
+                "{message}"
+            );
+            assert!(
+                message.contains("alsa:a") && message.contains("alsa:b"),
+                "{message}"
+            );
+            assert!(!message.contains("Use --device-id"), "{message}");
+        }
+    }
 
     #[cfg(not(feature = "cpal-backend"))]
     #[tokio::test]

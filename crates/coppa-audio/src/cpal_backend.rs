@@ -597,7 +597,7 @@ impl std::fmt::Display for DeviceSelectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingName { direction, name } => write!(f, "{direction} audio device name {name:?} not found; run `coppa devices` to list available devices"),
-            Self::AmbiguousName { direction, name, candidates } => write!(f, "{direction} device name {name:?} matches {} devices: {}. Use --device-id with an ID from `coppa devices`.", candidates.len(), candidates.join("; ")),
+            Self::AmbiguousName { direction, name, candidates } => write!(f, "{direction} device name {name:?} matches {} devices: {}.", candidates.len(), candidates.join("; ")),
             Self::MissingId { direction, id } => write!(f, "{direction} audio device ID {id:?} not found; run `coppa devices` to list available IDs"),
             Self::WrongDirection { direction, id } => write!(f, "{direction} audio device ID {id:?} has no {direction} channels; run `coppa devices` to check directions"),
         }
@@ -1077,6 +1077,21 @@ mod tests {
                 ]
             }
         );
+    }
+
+    #[test]
+    fn ambiguous_name_error_is_usable_by_every_caller() {
+        let error = DeviceSelectionError::AmbiguousName {
+            direction: "input",
+            name: "USB".into(),
+            candidates: vec![
+                "USB Audio [id: alsa:radio-a]".into(),
+                "USB Audio [id: alsa:radio-b]".into(),
+            ],
+        };
+        let message = error.to_string();
+        assert!(message.contains("alsa:radio-a") && message.contains("alsa:radio-b"));
+        assert!(!message.contains("--device-id"), "{message}");
     }
 
     #[test]

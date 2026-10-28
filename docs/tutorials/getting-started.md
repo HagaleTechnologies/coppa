@@ -98,7 +98,6 @@ Requires the `cpal-backend` feature:
 cargo run -p coppa-cli --bin coppa --features cpal-backend -- rx --duration 60
 ```
 
-<<<<<<< HEAD
 With no file, `coppa rx` captures from the default input device. Use
 `coppa devices` to list each device and its host-specific ID, then pass
 `--device-id <id>` for exact input selection or `--device <name>` for a unique
@@ -107,18 +106,12 @@ name substring. An ambiguous name reports all matching IDs and fails.
 stereo input. Live output commands use `--device-id` and `--output-channel`.
 IDs may change when the audio host reconfigures the device. Decoded frames
 print in the same format as a WAV decode. `--duration` stops after that
-many seconds; without it, `coppa rx` runs until Ctrl+C. `coppa listen` is a deprecated alias for `coppa rx` and will be removed in the
-next release.
-=======
-With no file, `coppa rx` captures from the default input device (`--device <name>` picks
-another by substring) and prints each frame as it decodes, in the same format as a WAV
-decode. `--duration` stops after that many seconds; without it, `coppa rx` runs until
-Ctrl+C. `coppa listen` is a deprecated alias for `coppa rx` and will be removed in the
-next release. It accepts `--json` too and prints its deprecation warning on
+many seconds; without it, `coppa rx` runs until Ctrl+C. `coppa listen` is a
+deprecated alias for `coppa rx` and will be removed in the next release.
+It accepts `--json` too and prints its deprecation warning on
 stderr. Use `-q` to suppress status output, or `-v` for diagnostics. Repeat
 `-v` as `-vv` for recommended speed level and delay spread per decoded frame;
 quiet and verbose flags conflict.
->>>>>>> 5525bb62613a9205daa10e963538bb720e800563
 
 ## Viewing Operating Profiles
 
