@@ -509,7 +509,7 @@ fn main() {
         let payload_bytes = old_payload_bytes.min(new_payload_bytes);
         let payload: Vec<u8> = (0..payload_bytes).map(|i| (i * 37 + 5) as u8).collect();
 
-        // Informed base SNR per level (coarse, from the existing
+        // Informed base SNR per level (coarse, from the since-removed
         // `tests/phase_c_loopback.rs::required_snr` heuristic) + a fading
         // margin, then a handful of points around it.
         let base = match level {

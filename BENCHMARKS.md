@@ -528,6 +528,9 @@ No regression observed on `tests/phase_c_loopback.rs`'s full-ladder AWGN/Watters
 `channel_capacity`/`channel_selectivity`'s other callers or the LDPC-facing noise-variance path.
 `test_snr_fer_monte_carlo` was re-run in full and still shows FER=0.00/100 for every level (1, 3-7,
 9-10) across its whole swept SNR range, unchanged from CLAUDE.md's documented baseline.
+(COP-70 correction: that sweep could not fail, since its full-band noise was ~9 dB optimistic
+against the 3 kHz convention, its window sat above every level's waterfall, and it asserted
+nothing, so this sentence is not evidence of the absence of a regression.)
 
 Reproduce: `cargo run -p coppa-bench --release --example capacity_level_correction_calibration`
 (calibration table) and `cargo run -p coppa-bench --release --example closed_loop_arq` (impact
