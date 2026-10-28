@@ -21,11 +21,12 @@ coppa-daemon = { path = "../coppa-daemon" }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # Golden-vector manifest parsing (tests/rx_golden.rs), matching
 # crates/coppa-protocol/tests/golden_vectors.rs's approach.
-serde = { workspace = true }
 toml = { workspace = true }
 
 [features]
