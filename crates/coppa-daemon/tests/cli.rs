@@ -12,7 +12,11 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use coppa_daemon::config::{DaemonConfig, CONFIG_FILE_NAME, SYSTEM_CONFIG_PATH};
+use coppa_daemon::config::DaemonConfig;
+// COP-49: the discovery tests drive the Unix search order (HOME,
+// XDG_CONFIG_HOME, /etc); Windows searches only the cwd and %APPDATA%.
+#[cfg(unix)]
+use coppa_daemon::config::{CONFIG_FILE_NAME, SYSTEM_CONFIG_PATH};
 
 /// How long an informational command may take before the test fails.
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -252,6 +256,7 @@ fn version_line() -> String {
 }
 
 /// COP-49: `HOME`'s config file, `$HOME/.config/coppa/coppad.toml`.
+#[cfg(unix)]
 fn home_config_path(home: &Path) -> PathBuf {
     home.join(".config").join("coppa").join(CONFIG_FILE_NAME)
 }
@@ -259,6 +264,7 @@ fn home_config_path(home: &Path) -> PathBuf {
 /// COP-49: `/etc/coppa/coppad.toml` cannot be redirected, so a test that
 /// expects the search to find nothing at all runs only when it is provably
 /// absent. Prints why when it is not.
+#[cfg(unix)]
 fn system_config_absent() -> bool {
     match Path::new(SYSTEM_CONFIG_PATH).symlink_metadata() {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
@@ -410,6 +416,7 @@ fn conflicting_options_are_usage_errors() {
 
 // --- --check ----------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn check_without_a_config_file_checks_the_defaults() {
     if !system_config_absent() {
@@ -447,6 +454,7 @@ fn check_loads_the_implicit_default_file() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn check_reports_which_discovered_file_it_used() {
     // COP-49: the first line names the file the implicit search chose.
@@ -502,6 +510,7 @@ fn check_reports_which_discovered_file_it_used() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_broken_discovered_config_stops_check_and_run_naming_it() {
     // COP-49 with COP-36: a discovered file is parsed as strictly as a local
@@ -892,7 +901,7 @@ fn explicit_config_starts_the_daemon() {
     }
 }
 
-#[cfg(not(feature = "cpal-backend"))]
+#[cfg(all(unix, not(feature = "cpal-backend")))]
 #[test]
 fn a_config_in_the_user_config_dir_is_used_without_arguments() {
     // COP-49's scenario: ~/.config/coppa/coppad.toml is loaded by a bare
@@ -920,7 +929,7 @@ fn a_config_in_the_user_config_dir_is_used_without_arguments() {
     );
 }
 
-#[cfg(not(feature = "cpal-backend"))]
+#[cfg(all(unix, not(feature = "cpal-backend")))]
 #[test]
 fn with_no_config_anywhere_the_daemon_warns_listing_the_search() {
     if !system_config_absent() {

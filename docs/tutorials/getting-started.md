@@ -119,7 +119,8 @@ exists, and otherwise runs on built-in defaults:
 
 1. `coppad.toml` in the current directory;
 2. `$XDG_CONFIG_HOME/coppa/coppad.toml`, or `~/.config/coppa/coppad.toml` when
-   `XDG_CONFIG_HOME` is unset (`%APPDATA%\coppa\coppad.toml` on Windows);
+   `XDG_CONFIG_HOME` is unset or not an absolute path (an empty or relative
+   `HOME` skips this entry; `%APPDATA%\coppa\coppad.toml` on Windows);
 3. `/etc/coppa/coppad.toml` (not on Windows).
 
 It never merges files. At startup it logs `Using configuration file` with the
