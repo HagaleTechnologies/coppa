@@ -69,9 +69,11 @@ turnaround_ms = 500
 [host]
 # Address all host servers (VARA-style TCP, WebSocket) bind to.
 # Default "127.0.0.1" restricts access to this machine only.
-# WARNING: setting this to "0.0.0.0" (or any non-loopback address) exposes an
-# UNAUTHENTICATED control plane to the network. Anyone who can reach this host
-# could key your transmitter. Only change this on a trusted, firewalled network.
+# WARNING: setting this to "0.0.0.0" (or any non-loopback address) exposes the
+# VARA-style ports, which have NO authentication, to the network. Anyone who can
+# reach this host could key your transmitter. The WebSocket port needs
+# websocket_token (below), but over plain ws:// the token crosses the network
+# in clear text. Only change this on a trusted, firewalled network.
 bind_address = "127.0.0.1"
 # VARA-style TCP control interface (not RF/waveform-compatible with VARA)
 vara_enabled = false
@@ -82,9 +84,23 @@ vara_command_port = 8300
 vara_data_port = 8301
 # WebSocket JSON API
 # Clients can opt into periodic "spectrum" and "audio_level" streams; see docs/OPERATING.md.
+<<<<<<< HEAD
 # Needs a coppad built with --features websocket; set in a build without it, coppad stops at startup.
+=======
+# Enabling it requires websocket_token, on every bind_address (loopback too: a
+# web page in your own browser can reach 127.0.0.1). Every client presents the
+# token as "Authorization: Bearer <token>" or as "?token=<token>" in the URL.
+# Use at least 16 characters from A-Z a-z 0-9 - . _ ~ ; generate one with
+#   openssl rand -hex 32
+# and keep this file readable only by the account coppad runs as.
+>>>>>>> 638ee1aeaaea6cc768747857e5021d7f2491f7ad
 websocket_enabled = false
 websocket_port = 8400
+# websocket_token = "paste the output of openssl rand -hex 32 here"
+# Browser pages allowed to connect, as exact origins: scheme://host[:port].
+# Empty (the default) refuses every web page. Scripts that send no Origin
+# header need only the token.
+# websocket_allowed_origins = ["http://localhost:3000"]
 
 [engine]
 # Profile: HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY (case-insensitive).

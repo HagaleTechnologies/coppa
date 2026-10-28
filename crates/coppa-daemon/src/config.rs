@@ -212,15 +212,36 @@ impl RadioConfig {
     }
 }
 
+/// A shared secret read from the config file. Never log the value; `Debug`
+/// redacts it (COP-53).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretToken(String);
+
+impl SecretToken {
+    /// The secret itself, for the one place that must compare it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretToken(<redacted>)")
+    }
+}
+
 /// Host interface configuration section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HostConfig {
     /// Address all host servers bind to. Defaults to "127.0.0.1" (loopback only).
     ///
-    /// WARNING: binding to a non-loopback address (e.g. "0.0.0.0") exposes an
-    /// unauthenticated control plane that can key a transmitter to anyone who can
-    /// reach this host. Only change this on a trusted, firewalled network.
+    /// WARNING: binding to a non-loopback address (e.g. "0.0.0.0") exposes the
+    /// VARA-style ports, which have no authentication and can key a transmitter,
+    /// to anyone who can reach this host. The WebSocket port needs
+    /// `websocket_token`, but over `ws://` the token crosses the network in
+    /// clear text. Only change this on a trusted, firewalled network.
     pub bind_address: String,
     /// Enable VARA-style TCP control interface (not RF/waveform-compatible with VARA).
     pub vara_enabled: bool,
@@ -232,6 +253,16 @@ pub struct HostConfig {
     pub websocket_enabled: bool,
     /// WebSocket port.
     pub websocket_port: u16,
+    /// COP-53: shared secret every WebSocket handshake must present, as
+    /// `Authorization: Bearer <token>` or a `token` query parameter. Required
+    /// when `websocket_enabled` is true, whatever `bind_address` is: 16 or
+    /// more characters from `A-Z a-z 0-9 - . _ ~`. Keep the config file
+    /// readable only by the account running `coppad`.
+    pub websocket_token: Option<SecretToken>,
+    /// COP-53: exact browser origins (`scheme://host[:port]`) allowed to open
+    /// the WebSocket. Empty (the default) refuses every web page; scripts that
+    /// send no `Origin` header need only the token.
+    pub websocket_allowed_origins: Vec<String>,
     /// Allow data-port and WebSocket host data to transmit without an established
     /// session. Off by default; intended for sessionless bench rigs. Enabling it
     /// lets any data-port client key the transmitter.
@@ -447,6 +478,8 @@ impl Default for HostConfig {
             vara_data_port: 8301,
             websocket_enabled: false,
             websocket_port: 8400,
+            websocket_token: None,
+            websocket_allowed_origins: Vec::new(),
             sessionless_tx_enabled: false,
         }
     }
@@ -569,6 +602,148 @@ impl DaemonConfig {
             self.audio.sample_rate, self.engine.profile
         ))
     }
+
+    /// COP-53: a WebSocket-enabled daemon needs a usable `[host]
+    /// websocket_token` and a well-formed `[host] websocket_allowed_origins`,
+    /// whatever `bind_address` is: a web page in the operator's own browser
+    /// reaches a loopback port too. Checked by run mode before any socket is
+    /// bound; `--check` does not call it.
+    pub fn check_websocket_auth(&self) -> Result<(), String> {
+        if !self.host.websocket_enabled {
+            return Ok(());
+        }
+        let Some(token) = &self.host.websocket_token else {
+            return Err(format!(
+                "[host] websocket_enabled = true requires [host] websocket_token: set it to \
+                 a random value of at least {MIN_WEBSOCKET_TOKEN_CHARS} characters, for \
+                 example the output of `openssl rand -hex 32`"
+            ));
+        };
+        let token = token.expose();
+        let length = token.chars().count();
+        if length < MIN_WEBSOCKET_TOKEN_CHARS {
+            return Err(format!(
+                "[host] websocket_token is {length} characters long; it must be at least \
+                 {MIN_WEBSOCKET_TOKEN_CHARS}, for example the output of `openssl rand -hex 32`"
+            ));
+        }
+        if !token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~'))
+        {
+            return Err(
+                "[host] websocket_token may contain only letters, digits, '-', '.', \
+                 '_' and '~'"
+                    .to_string(),
+            );
+        }
+        for entry in &self.host.websocket_allowed_origins {
+            check_origin_entry(entry).map_err(|reason| {
+                format!("[host] websocket_allowed_origins entry {entry:?} {reason}")
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// COP-53: the shortest `[host] websocket_token` run mode accepts.
+const MIN_WEBSOCKET_TOKEN_CHARS: usize = 16;
+
+/// COP-53: why `entry` is not a browser origin (`scheme "://" host [":"
+/// port]`), or `Ok`. The caller prefixes the key and the entry. The first
+/// matching rule decides the message.
+fn check_origin_entry(entry: &str) -> Result<(), String> {
+    const SHAPE: &str =
+        "is not an origin: write scheme://host[:port], for example \"http://localhost:3000\"";
+    if entry.contains('*') {
+        return Err(
+            "is not an origin: wildcards are not supported; list each scheme://host[:port]"
+                .to_string(),
+        );
+    }
+    if entry.eq_ignore_ascii_case("null") {
+        return Err(
+            "is never allowed: it is the origin of sandboxed frames and file:// pages".to_string(),
+        );
+    }
+    let Some((scheme, rest)) = entry.split_once("://") else {
+        return Err(SHAPE.to_string());
+    };
+    if rest.is_empty() {
+        return Err(SHAPE.to_string());
+    }
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err("is not an origin: only http and https origins are supported".to_string());
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    if let Some((_, host_port)) = authority.rsplit_once('@') {
+        return Err(format!(
+            "is not an origin: an origin has no user name; write \"{scheme}://{host_port}\""
+        ));
+    }
+    if !tail.is_empty() {
+        return Err(format!(
+            "is not an origin: an origin has no path, query or fragment; write \
+             \"{scheme}://{authority}\""
+        ));
+    }
+    let (host, port) = split_host_port(authority)?;
+    let Some(port) = port else {
+        return Ok(());
+    };
+    let port: u16 = match port.parse() {
+        Ok(p) if p > 0 && port.bytes().all(|b| b.is_ascii_digit()) => p,
+        _ => return Err("is not an origin: it has an invalid port".to_string()),
+    };
+    let default_port = if scheme == "http" { 80 } else { 443 };
+    if port == default_port {
+        return Err(format!(
+            "names the default port, which browsers omit: write \"{scheme}://{host}\""
+        ));
+    }
+    Ok(())
+}
+
+/// Split an origin's authority into a validated host and an optional raw
+/// port string, for [`check_origin_entry`].
+fn split_host_port(authority: &str) -> Result<(&str, Option<&str>), String> {
+    const HOST: &str = "is not an origin: its host may contain only letters, digits, '-' and \
+                        '.' (write internationalized names in their xn-- form)";
+    if authority.starts_with('[') {
+        let Some(close) = authority.find(']') else {
+            return Err(HOST.to_string());
+        };
+        let (host, after) = authority.split_at(close + 1);
+        let inner = &host[1..host.len() - 1];
+        if inner.is_empty()
+            || !inner
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+        {
+            return Err(HOST.to_string());
+        }
+        return match after {
+            "" => Ok((host, None)),
+            _ => match after.strip_prefix(':') {
+                Some(port) => Ok((host, Some(port))),
+                None => Err(HOST.to_string()),
+            },
+        };
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    {
+        return Err(HOST.to_string());
+    }
+    Ok((host, port))
 }
 
 #[cfg(test)]
@@ -600,6 +775,13 @@ mod tests {
         assert!(toml::to_string_pretty(&grid_set)
             .unwrap()
             .contains("grid = \"FN20\""));
+
+        // COP-53: an unset token is omitted; the empty allowlist is printed.
+        assert!(
+            printed.contains("websocket_allowed_origins = []"),
+            "{printed}"
+        );
+        assert!(!printed.contains("websocket_token"), "{printed}");
 
         let parsed: DaemonConfig = toml::from_str(&printed).unwrap();
         assert_eq!(toml::to_string_pretty(&parsed).unwrap(), printed);
@@ -1062,6 +1244,165 @@ beacon_interval_secs = 600
 
         let config: DaemonConfig = toml::from_str(&text).unwrap();
         assert_eq!(config.radio.turnaround_ms, 500);
+    }
+
+    const GOOD: &str = "0123456789abcdef0123456789abcdef";
+
+    /// A config with `[host] websocket_enabled = true` and the given token
+    /// and allowlist (COP-53).
+    fn ws(token: Option<&str>, origins: &[&str]) -> DaemonConfig {
+        let mut config = DaemonConfig::default();
+        config.host.websocket_enabled = true;
+        config.host.websocket_token = token.map(|t| SecretToken(t.to_string()));
+        config.host.websocket_allowed_origins = origins.iter().map(|o| o.to_string()).collect();
+        config
+    }
+
+    #[test]
+    fn websocket_auth_defaults_to_no_token_and_no_origins() {
+        let host = HostConfig::default();
+        assert_eq!(host.websocket_token, None);
+        assert!(host.websocket_allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn secret_token_debug_never_shows_the_value() {
+        let config = ws(Some(GOOD), &[]);
+        let debug = format!("{:?}", config.host);
+        assert!(!debug.contains(GOOD), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+    }
+
+    #[test]
+    fn check_websocket_auth_skips_a_disabled_websocket() {
+        let mut config = ws(None, &["*"]);
+        config.host.websocket_enabled = false;
+        assert_eq!(config.check_websocket_auth(), Ok(()));
+    }
+
+    #[test]
+    fn check_websocket_auth_requires_a_token_when_enabled() {
+        let err = ws(None, &[]).check_websocket_auth().unwrap_err();
+        assert!(
+            err.starts_with("[host] websocket_enabled = true requires [host] websocket_token"),
+            "{err}"
+        );
+        assert!(err.contains("openssl rand -hex 32"), "{err}");
+    }
+
+    #[test]
+    fn check_websocket_auth_rejects_a_short_token() {
+        let err = ws(Some("0123456789abcde"), &[])
+            .check_websocket_auth()
+            .unwrap_err();
+        assert!(
+            err.starts_with("[host] websocket_token is 15 characters long"),
+            "{err}"
+        );
+        assert!(err.contains("at least 16"), "{err}");
+        assert_eq!(
+            ws(Some("0123456789abcdef"), &[]).check_websocket_auth(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn check_websocket_auth_rejects_token_characters_outside_unreserved() {
+        for bad in ['\u{20}', '&', '#', '%', '+', '/', 'é'] {
+            let token: String = std::iter::once(bad)
+                .chain(std::iter::repeat_n('a', 19))
+                .collect();
+            let err = ws(Some(&token), &[]).check_websocket_auth().unwrap_err();
+            assert!(
+                err.starts_with("[host] websocket_token may contain only"),
+                "{bad:?}: {err}"
+            );
+            assert!(!err.contains(&token), "the error must not echo the token");
+        }
+        assert_eq!(ws(Some(GOOD), &[]).check_websocket_auth(), Ok(()));
+        assert_eq!(
+            ws(Some("abc-def.ghi_jkl~mno"), &[]).check_websocket_auth(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn check_websocket_auth_accepts_a_valid_token_and_origins() {
+        let origins = [
+            "http://localhost:3000",
+            "https://dash.example.org",
+            "http://127.0.0.1:8080",
+            "http://[::1]:3000",
+            "HTTP://LOCALHOST:3000",
+            "http://localhost",
+        ];
+        assert_eq!(ws(Some(GOOD), &origins).check_websocket_auth(), Ok(()));
+    }
+
+    #[test]
+    fn check_websocket_auth_rejects_malformed_origin_entries() {
+        let cases = [
+            ("*", "wildcards are not supported"),
+            ("null", "never allowed"),
+            ("localhost:3000", "write scheme://host[:port]"),
+            ("http://localhost:3000/", "write \"http://localhost:3000\""),
+            ("http://localhost:3000/app", "no path, query or fragment"),
+            ("http://localhost:3000?x=1", "no path, query or fragment"),
+            ("http://user@localhost:3000", "no user name"),
+            ("http://localhost:80", "write \"http://localhost\""),
+            ("https://example.org:443", "write \"https://example.org\""),
+            ("ftp://example.org", "only http and https"),
+            ("http://", "write scheme://host[:port]"),
+            ("http://local host", "host may contain only"),
+            ("http://localhost:0", "port"),
+            ("http://localhost:65536", "port"),
+            ("http://localhost:30x0", "port"),
+            ("", "write scheme://host[:port]"),
+        ];
+        for (entry, fragment) in cases {
+            let err = ws(Some(GOOD), &[entry]).check_websocket_auth().unwrap_err();
+            let prefix = format!("[host] websocket_allowed_origins entry {entry:?}");
+            assert!(err.starts_with(&prefix), "{entry:?}: {err}");
+            assert!(err.contains(fragment), "{entry:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_example_config_documents_websocket_auth_keys() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../coppad.toml.example");
+        let text = std::fs::read_to_string(path).unwrap();
+
+        // Both keys appear as commented `key = value` lines inside [host].
+        let mut table = String::new();
+        let mut token_line = false;
+        let mut origins_line = false;
+        for line in text.lines() {
+            let trimmed = line.trim_start_matches('#').trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.contains(' ') {
+                table = trimmed.to_string();
+            }
+            let commented = line.trim_start().starts_with('#');
+            if commented && trimmed.starts_with("websocket_token = ") {
+                assert_eq!(table, "[host]", "websocket_token outside [host]: {line:?}");
+                token_line = true;
+            }
+            if commented && trimmed.starts_with("websocket_allowed_origins = ") {
+                assert_eq!(
+                    table, "[host]",
+                    "websocket_allowed_origins outside [host]: {line:?}"
+                );
+                origins_line = true;
+            }
+        }
+        assert!(token_line, "no commented websocket_token line in [host]");
+        assert!(
+            origins_line,
+            "no commented websocket_allowed_origins line in [host]"
+        );
+        assert!(text.contains("openssl rand -hex 32"));
+
+        let config: DaemonConfig = toml::from_str(&text).unwrap();
+        assert!(!config.host.websocket_enabled);
     }
 
     #[test]
