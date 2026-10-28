@@ -103,18 +103,19 @@ ignores KISS TXDELAY, persistence and slot time), no digipeating or beaconing, a
 
 | Crate | Description |
 |-------|-------------|
-| `coppa-dsp` | Pure DSP primitives: FFT/IFFT, FIR/IIR filters, AGC, resampling |
-| `coppa-codec` | Modulation/demodulation: BPSK, QPSK, 8PSK, QAM, OFDM |
+| `coppa-dsp` | Pure DSP primitives: FFT/IFFT, FIR design and filtering (windowed-sinc bandpass, Hilbert, root-raised-cosine), AGC, Costas carrier recovery, Gardner timing recovery |
+| `coppa-codec` | Modulation/demodulation: BPSK, QPSK, 8PSK, QAM, OFDM, AFSK 1200 |
 | `coppa-protocol` | OFDM transceiver, NR BG2 LDPC payload coding, framing, ARQ, compression and session management |
-| `coppa-channel` | Channel models for testing: AWGN, sinusoidal fading, frequency offset |
+| `coppa-channel` | Channel models for testing: AWGN, Watterson HF fading, SSB passband filter, frequency, timing and sample-clock offsets, sinusoidal fading |
 | `coppa-audio` | Audio backends: CPAL real-time I/O, WAV file read/write |
 | `coppa-radio` | Radio control: rigctld CAT, serial PTT (DTR/RTS, `serial-ptt` feature), GPIO PTT (Linux sysfs, `gpio-ptt` feature) |
 | `coppa-ml` | Measurement-driven speed selection, RateLoop, CpGate, BusyGate and spectrum sensing |
 | `coppa-engine` | CoppaTransceiver wrapper with compression, squelch and streaming receive |
-| `coppa-host` | Host interfaces: VARA-style TCP control server, WebSocket JSON API |
+| `coppa-host` | Host interfaces: VARA-style TCP control server, WebSocket JSON API, KISS TNC TCP server (`kiss-tnc` feature) |
 | `coppa-ffi` | C FFI bindings (cdylib + staticlib) with streaming decode API |
-| `coppa-cli` | CLI binary (`coppa`) for transmit, receive, loopback, device listing |
+| `coppa-cli` | CLI binary (`coppa`): `tx`, `rx`, `loopback`, `tune`, `devices`, `profiles`, `config`, and `tnc` (`kiss-tnc` feature) |
 | `coppa-daemon` | Long-running daemon (`coppad`) with event loop, audio, and host integration |
+| `coppa-bench` | Measurement harness, not a product crate: BER/FER/goodput-vs-SNR scenarios, benchmark examples, and the lib tests that guard each speed level's AWGN waterfall on every push |
 
 ## Architecture
 

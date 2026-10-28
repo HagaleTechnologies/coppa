@@ -1,7 +1,10 @@
 //! Channel models for testing signal impairments.
 //!
-//! Provides AWGN, single-sideband frequency offset, fractional timing offset,
-//! and a deterministic sinusoidal amplitude fade.
+//! Provides AWGN (`awgn`, `awgn_seeded`, and the 3 kHz-referenced
+//! `awgn_ref_seeded`), a two-tap Watterson/ITU-R F.1487 HF fading model
+//! (`watterson`), a 300-2700 Hz SSB passband filter (`ssb_filter`), wideband
+//! and single-sideband frequency offsets, fractional timing offset,
+//! sample-clock offset, and a deterministic sinusoidal amplitude fade.
 //!
 //! Note: the [`fading`] function is a simple deterministic sinusoidal amplitude
 //! fade (periodic AM), NOT a statistical HF/VHF channel model. It is intended

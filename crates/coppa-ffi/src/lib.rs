@@ -18,7 +18,7 @@
 //! | `-3` | Encode/decode failed |
 //! | `-4` | Lock poisoned — **handle is permanently broken** (see below) |
 //! | `-5` | Internal panic — **handle is permanently broken** (see below) |
-//! | `-6` | Invalid parameter value (e.g. out-of-range or band-unavailable speed level, unresolvable profile name) — added in FFI v2, see below |
+//! | `-6` | Invalid parameter value (an out-of-range or band-unavailable speed level passed to `coppa_engine_set_speed_level`; `coppa_engine_new_with` instead returns null for a rejected config, including an unrecognized profile name) — added in FFI v2, see below |
 //!
 //! [`coppa_next_frame`] is a deliberate, documented exception to the `0` =
 //! success convention above: it additionally uses `1` for the non-error
