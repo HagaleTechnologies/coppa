@@ -246,7 +246,9 @@ pub struct TxSegment {
     pub seq_num: u8,
     /// Payload data.
     pub data: Vec<u8>,
-    /// Number of times this segment has been transmitted.
+    /// Number of times this segment has been transmitted, saturating at
+    /// `u8::MAX` (COP-68: adaptive re-grants can sustain retries past 255
+    /// transmissions on a long hold; the count pins instead of wrapping).
     pub transmit_count: u8,
     /// Time of last transmission.
     pub last_sent: Option<Instant>,
@@ -528,7 +530,14 @@ impl ArqTx {
         let idx = seq as usize % MAX_WINDOW_SIZE as usize;
         match self.tx_buf[idx] {
             Some(ref mut seg) if seg.seq_num == seq && !seg.acked => {
-                seg.transmit_count += 1;
+                // Saturating: COP-68's adaptive re-grant can keep a segment
+                // retrying far past 255 transmissions on a long one-way hold,
+                // where an unsaturated += 1 would overflow (debug panic /
+                // release wrap corrupting the grant and attempt math). A
+                // pinned count keeps `is_failed`/`get_retransmits` retrying
+                // on the existing schedule; the hold's bound is the caller's
+                // no-evidence clock, not this counter.
+                seg.transmit_count = seg.transmit_count.saturating_add(1);
                 seg.last_sent = Some(now);
                 Ok(())
             }
@@ -1686,5 +1695,45 @@ mod tests {
         );
         tx.mark_retransmitted(seq, now).unwrap();
         assert_eq!(tx.transmit_count(seq), Some(4));
+    }
+
+    /// COP-68 remediate: the daemon's evidence re-grant can sustain a
+    /// segment's retries far past the normal 5-attempt budget (it repeatedly
+    /// grants `transmit_count + GRANT`, saturating at `u8::MAX`), and
+    /// `transmit_count` itself is a `u8` -- so its increment must saturate
+    /// too. Unsaturated, the 256th retransmission of a multi-hour one-way
+    /// hold overflows: panic in debug/overflow-checked builds, wrap to 0 in
+    /// the default release profile, silently corrupting the grant and
+    /// `attempt` arithmetic the hold rests on.
+    #[test]
+    fn transmit_count_saturates_past_u8_max_on_a_long_hold() {
+        let mut tx = ArqTx::new(ArqConfig::new(1, 2, Duration::from_millis(50)).unwrap());
+        let mut now = Instant::now();
+        let seq = tx.send(vec![0xA5], now).unwrap();
+
+        // A one-way hold with peer evidence flowing: the budget stays ahead
+        // of the count all the way to u8::MAX, so every RTO expiry retries.
+        tx.set_max_retransmit(u8::MAX);
+        for _ in 0..(u8::MAX as u32 + 8) {
+            now += tx.rto() + Duration::from_millis(1);
+            assert_eq!(tx.get_retransmits(now), vec![seq]);
+            tx.mark_retransmitted(seq, now).unwrap();
+        }
+        assert_eq!(
+            tx.transmit_count(seq),
+            Some(u8::MAX),
+            "the count must pin at u8::MAX, never wrap"
+        );
+        assert!(
+            !tx.is_failed(seq),
+            "saturation must not un-grant the hold: is_failed reads per call"
+        );
+        now += tx.rto() + Duration::from_millis(1);
+        assert_eq!(
+            tx.get_retransmits(now),
+            vec![seq],
+            "a saturated count must keep the hold retrying: the no-evidence \
+             clock bounds the hold, not the counter"
+        );
     }
 }
