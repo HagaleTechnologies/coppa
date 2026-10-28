@@ -350,6 +350,7 @@ name = "coppa"
 version = "0.3.0"
 dependencies = [
  "coppa-audio",
+ "coppa-bench",
  "coppa-channel",
  "coppa-codec",
  "coppa-dsp",

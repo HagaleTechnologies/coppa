@@ -185,6 +185,7 @@ pub fn run_scenario(scenario: &Scenario) -> Vec<MeasurementPoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::wilson_ci95;
     use crate::scenario::ChannelSpec;
 
     /// Regression test: `select_profile` routes speed level >= 5 to `vhf_wide`. A
@@ -434,5 +435,119 @@ mod tests {
         let failures = &points[0].failures;
         assert!(failures.frame_errors() > 0, "expected failures at -6 dB");
         assert_eq!(failures.frame_errors(), points[0].frame_errors);
+    }
+
+    /// Per-level AWGN waterfall bracket: one 20-trial cell below `level`'s
+    /// measured waterfall that must fail (`>= 15/20` frame errors) and one
+    /// above it that must decode every frame (`0/20`). This is the per-push CI
+    /// guard for the speed ladder's FER figures (COP-70); it replaces
+    /// `tests/phase_c_loopback.rs`'s old Monte Carlo sweep, which used a
+    /// full-band noise convention ~9 dB optimistic against `awgn_ref_seeded`'s
+    /// 3 kHz one, swept only above every level's waterfall, asserted nothing,
+    /// and ran only on demand -- so it could not fail.
+    ///
+    /// Anchors were measured 2026-10-28 at `3cbfd1e` through `run_scenario`
+    /// (3 kHz noise bandwidth, clean-power referencing, fresh payload per
+    /// trial, unconditional `harq_evict`), 40 trials/point. FER<=10%
+    /// waterfalls in dB: L1 4-6, L2/L3 ~4, L4 4-6, L5 8-10, L6 ~8, L7 10-12,
+    /// L8 14-16, L9 18-22. Every anchor sits at least 2 dB clear of its cliff,
+    /// and every bracket cell measured 20/20 below and 0/20 above.
+    ///
+    /// Every level is pinned to `hf_standard`, which is deliberately not the
+    /// production routing (`select_profile` sends level >= 5 to `vhf_wide`),
+    /// so the anchors are the measurements above. Below-cells at the low
+    /// levels sit in the sync-limited band, so that side checks detection,
+    /// not FEC.
+    ///
+    /// A bracket, not a pass-only check: a regression fails the above-cell and
+    /// an improvement of roughly 4 dB or more fails the below-cell. Either
+    /// failure means the anchors are stale: re-measure the waterfall and
+    /// re-record both points, do not just loosen the assertion. Both are
+    /// point-estimate assertions; `wilson_ci95(0, 20)` has an upper bound of
+    /// 0.161, so 20 trials cannot gate FER<=10% on a Wilson bound. The stricter
+    /// upgrade is 40 trials per cell asserting `fer_hi <= 0.10` (0/40 gives
+    /// 0.088). The Wilson bounds are printed in every failure message.
+    fn bracket(level: u8, below_db: f32, above_db: f32) {
+        const TRIALS: usize = 20;
+        let scenario = Scenario {
+            level,
+            channel: ChannelSpec::Awgn,
+            snr_db_points: vec![below_db, above_db],
+            trials: TRIALS,
+            seed: 0x2710 + level as u64,
+            profile_override: Some(coppa_codec::ofdm::CoppaProfile::hf_standard()),
+            cfo_hz: 0.0,
+            sco_ppm: 0.0,
+            ssb: false,
+        };
+        let points = run_scenario(&scenario);
+        assert_eq!(points.len(), 2);
+
+        let below = &points[0];
+        let (below_lo, below_hi) = wilson_ci95(below.frame_errors, below.trials);
+        assert!(
+            below.frame_errors >= 15,
+            "level {level} at {below_db} dB (below its waterfall) must mostly fail: \
+             {}/{} frame errors, FER Wilson 95% [{below_lo:.3}, {below_hi:.3}], \
+             failures {:?}. The waterfall moved down; re-measure and re-record the anchors.",
+            below.frame_errors,
+            below.trials,
+            below.failures,
+        );
+
+        let above = &points[1];
+        let (above_lo, above_hi) = wilson_ci95(above.frame_errors, above.trials);
+        assert_eq!(
+            above.frame_errors, 0,
+            "level {level} at {above_db} dB (above its waterfall) must decode every frame: \
+             {}/{} frame errors, FER Wilson 95% [{above_lo:.3}, {above_hi:.3}], \
+             failures {:?}. The waterfall moved up; this is a regression.",
+            above.frame_errors, above.trials, above.failures,
+        );
+    }
+
+    #[test]
+    fn waterfall_bracket_level_1() {
+        bracket(1, 0.0, 8.0);
+    }
+
+    #[test]
+    fn waterfall_bracket_level_2() {
+        bracket(2, 0.0, 8.0);
+    }
+
+    #[test]
+    fn waterfall_bracket_level_3() {
+        bracket(3, 0.0, 8.0);
+    }
+
+    #[test]
+    fn waterfall_bracket_level_4() {
+        bracket(4, 0.0, 8.0);
+    }
+
+    #[test]
+    fn waterfall_bracket_level_5() {
+        bracket(5, 4.0, 12.0);
+    }
+
+    #[test]
+    fn waterfall_bracket_level_6() {
+        bracket(6, 2.0, 12.0);
+    }
+
+    #[test]
+    fn waterfall_bracket_level_7() {
+        bracket(7, 6.0, 14.0);
+    }
+
+    #[test]
+    fn waterfall_bracket_level_8() {
+        bracket(8, 10.0, 18.0);
+    }
+
+    #[test]
+    fn waterfall_bracket_level_9() {
+        bracket(9, 14.0, 24.0);
     }
 }

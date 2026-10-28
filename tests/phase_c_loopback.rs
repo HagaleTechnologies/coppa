@@ -1,12 +1,12 @@
 //! Phase C integration tests: CoppaTransceiver loopback at all speed levels.
 
+use coppa_bench::runner::run_scenario;
+use coppa_bench::scenario::{ChannelSpec, Scenario};
 use coppa_codec::ofdm::coppa_modem::SPEED_LEVELS;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::modem::speed_levels::max_payload_for_level;
 use coppa_protocol::modem::CoppaTransceiver;
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
 
 /// Max application-payload capacity for a speed level: the NR BG2 mother code's
 /// shortened `k_used` info width for that level (Task 4), in bytes, minus the
@@ -117,8 +117,10 @@ fn test_level_7_16qam_rate_3_4() {
 fn test_level_8_64qam_rate_2_3() {
     // The #[ignore] this test used to carry (routing around the old
     // per-rate LDPC codec's level-9/10 non-convergence) is removed: Task 4's
-    // NR BG2 mother code fixes this — verified via a fresh
-    // test_snr_fer_monte_carlo run showing FER=0.00 at every level 1-9.
+    // NR BG2 mother code fixes this. The measured evidence is COP-24's
+    // SSB-filtered AWGN sweep (BENCHMARKS.md), guarded on every push by
+    // coppa-bench's `waterfall_bracket_level_*` tests -- not the old
+    // `test_snr_fer_monte_carlo`, which could not fail (see its doc).
     loopback_test(8, &[0x56; 80]);
 }
 
@@ -128,8 +130,10 @@ fn test_level_9_64qam_rate_5_6() {
     // 7/8 to 5/6 (wire-format break, see CLAUDE.md's Known Limitations).
     // The #[ignore] main previously had here (routing around the old
     // per-rate LDPC codec's level-9/10 non-convergence) is removed: Task 4's
-    // NR BG2 mother code fixes this — verified via a fresh
-    // test_snr_fer_monte_carlo run showing FER=0.00 at every level 1-9.
+    // NR BG2 mother code fixes this. The measured evidence is COP-24's
+    // SSB-filtered AWGN sweep (BENCHMARKS.md), guarded on every push by
+    // coppa-bench's `waterfall_bracket_level_*` tests -- not the old
+    // `test_snr_fer_monte_carlo`, which could not fail (see its doc).
     loopback_test(9, &[0x78; 150]);
 }
 
@@ -137,8 +141,8 @@ fn test_level_9_64qam_rate_5_6() {
 fn test_all_levels_max_payload() {
     // The levels-9/10 skip this loop used to have (routing around the old
     // per-rate LDPC codec's non-convergence) is removed: Task 4's NR BG2
-    // mother code fixes this — verified via a fresh test_snr_fer_monte_carlo
-    // run showing FER=0.00 at every level 1-9.
+    // mother code fixes this, per COP-24's SSB-filtered AWGN sweep
+    // (BENCHMARKS.md) and coppa-bench's `waterfall_bracket_level_*` tests.
     for sl in &SPEED_LEVELS {
         let max_bytes = max_payload_bytes(sl.level);
         let payload: Vec<u8> = (0..max_bytes).map(|i| (i & 0xFF) as u8).collect();
@@ -150,8 +154,8 @@ fn test_all_levels_max_payload() {
 fn test_all_levels_min_payload() {
     // The levels-9/10 skip this loop used to have (routing around the old
     // per-rate LDPC codec's non-convergence) is removed: Task 4's NR BG2
-    // mother code fixes this — verified via a fresh test_snr_fer_monte_carlo
-    // run showing FER=0.00 at every level 1-9.
+    // mother code fixes this, per COP-24's SSB-filtered AWGN sweep
+    // (BENCHMARKS.md) and coppa-bench's `waterfall_bracket_level_*` tests.
     for sl in &SPEED_LEVELS {
         loopback_test(sl.level, &[0x42]);
     }
@@ -188,201 +192,122 @@ fn test_header_fields_roundtrip() {
     assert_eq!(rx_header.payload_len, 10);
 }
 
-/// Add AWGN noise to samples at a given SNR (dB).
-fn add_awgn(samples: &[f32], snr_db: f32, seed: u64) -> Vec<f32> {
-    let signal_power: f32 = samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32;
-    let noise_power = signal_power / 10.0f32.powf(snr_db / 10.0);
-    let noise_std = noise_power.sqrt();
-
-    let mut rng = StdRng::seed_from_u64(seed);
-    samples
-        .iter()
-        .map(|&s| {
-            let u1: f32 = rng.random::<f32>().max(1e-10);
-            let u2: f32 = rng.random();
-            let noise =
-                noise_std * (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
-            s + noise
-        })
-        .collect()
-}
-
-/// Required SNR (dB) for each wire-encoded speed level.
-fn required_snr(wire_level: u8) -> f32 {
-    match wire_level {
-        1 => 0.0,
-        2 => 2.0,
-        3 => 4.0,
-        4 => 7.0,
-        5 => 9.0,
-        6 => 9.0,
-        7 => 13.0,
-        8 => 18.0,
-        9 => 22.0,
-        _ => 30.0,
-    }
-}
-
-/// Test that a speed level decodes reliably well above threshold.
-fn awgn_above_threshold(wire_level: u8) {
-    let transceiver = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
-    let max_bytes = max_payload_bytes(wire_level).min(50);
-    let payload: Vec<u8> = (0..max_bytes).map(|i| (i & 0xFF) as u8).collect();
-    let header = make_header(wire_level, payload.len() as u16);
-
-    let snr = required_snr(wire_level) + 6.0;
-    let num_frames = 20;
-    let mut failures = 0;
-
-    for seed in 0..num_frames {
-        let samples = transceiver
-            .transmit(&header, &payload)
-            .expect("payload within this level's capacity");
-        let noisy = add_awgn(&samples, snr, seed);
-        match transceiver.receive(&noisy) {
-            Ok((_, rx_payload, _)) => {
-                if rx_payload[..payload.len()] != payload[..] {
-                    failures += 1;
-                }
-            }
-            Err(_) => failures += 1,
-        }
-    }
-
-    assert_eq!(
-        failures, 0,
-        "Level {} at SNR={:.0}dB: {}/{} frames failed (expected 0)",
-        wire_level, snr, failures, num_frames
-    );
-}
-
-/// Test that a speed level fails gracefully below threshold.
-fn awgn_below_threshold(wire_level: u8) {
-    let transceiver = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
-    let payload = vec![0x42u8; 20];
-    let header = make_header(wire_level, payload.len() as u16);
-
-    let snr = required_snr(wire_level) - 6.0;
-    let samples = transceiver
-        .transmit(&header, &payload)
-        .expect("payload within this level's capacity");
-    let noisy = add_awgn(&samples, snr, 999);
-
-    // Should either fail to decode or produce wrong payload — both acceptable.
-    // Key assertion: doesn't panic.
-    let _ = transceiver.receive(&noisy);
-}
-
+/// Manual full AWGN FER/goodput sweep over every speed level (COP-70).
+///
+/// Drives `coppa_bench::runner::run_scenario`, the harness behind every
+/// BENCHMARKS.md figure: 3 kHz-referenced noise (`awgn_ref_seeded`) against
+/// the clean signal's power, a fresh random payload per trial, and the
+/// IR-HARQ buffer evicted after every trial. Each level's window straddles
+/// its measured waterfall, so the printed rows show the cliff with Wilson
+/// bounds and goodput in the same convention as BENCHMARKS.md.
+///
+/// This replaces a sweep that could not fail: it added full-band noise
+/// (~9 dB optimistic against the 3 kHz convention), swept only above every
+/// level's waterfall, re-sent one fixed frame without evicting its HARQ
+/// buffer, and asserted nothing, so it read zero errors everywhere regardless
+/// of real performance. The per-push guard is coppa-bench's
+/// `waterfall_bracket_level_*` tests (`crates/coppa-bench/src/runner.rs`);
+/// this is the human-run version that catches drift a 20-trial bracket
+/// cannot. Every level is pinned to `hf_standard` to match those anchors,
+/// which is not production routing for levels 5-9.
+///
+/// Each window's low edge must fail (FER Wilson lower bound >= 0.5) and its
+/// high edge must clear FER<=10% on the Wilson upper bound. When a level
+/// fails here, its waterfall has moved: re-measure it and re-record both
+/// this window and the bracket anchors.
 #[test]
-fn test_awgn_level_1_above_threshold() {
-    awgn_above_threshold(1);
-}
-
-#[test]
-fn test_awgn_level_2_above_threshold() {
-    awgn_above_threshold(2);
-}
-
-#[test]
-fn test_awgn_level_3_above_threshold() {
-    awgn_above_threshold(3);
-}
-
-#[test]
-fn test_awgn_level_4_above_threshold() {
-    awgn_above_threshold(4);
-}
-
-#[test]
-fn test_awgn_level_5_above_threshold() {
-    awgn_above_threshold(5);
-}
-
-#[test]
-fn test_awgn_level_6_above_threshold() {
-    awgn_above_threshold(6);
-}
-
-#[test]
-fn test_awgn_level_7_above_threshold() {
-    awgn_above_threshold(7);
-}
-
-#[test]
-fn test_awgn_level_8_above_threshold() {
-    // The #[ignore] this test used to carry (routing around the old
-    // per-rate LDPC codec's level-9/10 non-convergence) is removed: Task 4's
-    // NR BG2 mother code fixes this — verified via a fresh
-    // test_snr_fer_monte_carlo run showing FER=0.00 at every level 1-9.
-    awgn_above_threshold(8);
-}
-
-#[test]
-fn test_awgn_level_9_above_threshold() {
-    // The #[ignore] this test used to carry (routing around the old
-    // per-rate LDPC codec's level-9/10 non-convergence) is removed: Task 4's
-    // NR BG2 mother code fixes this — verified via a fresh
-    // test_snr_fer_monte_carlo run showing FER=0.00 at every level 1-9.
-    awgn_above_threshold(9);
-}
-
-#[test]
-fn test_awgn_below_threshold_no_panic() {
-    for sl in &SPEED_LEVELS {
-        awgn_below_threshold(sl.level);
-    }
-}
-
-#[test]
-#[ignore = "Monte Carlo FER sweep: ~7200 frames, run manually with --ignored --nocapture"]
+#[ignore = "manual full AWGN FER sweep: 6000 frames, run with --release -- --ignored --nocapture"]
 fn test_snr_fer_monte_carlo() {
-    let transceiver = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
-    let num_frames: u64 = 100;
+    const TRIALS: usize = 100;
+    // (level, window low edge dB, window high edge dB), 3 kHz convention.
+    // Measured waterfalls: L1 4-6, L2/L3 ~4, L4 4-6, L5 8-10, L6 ~8,
+    // L7 10-12, L8 14-16, L9 18-22 dB.
+    const WINDOWS: [(u8, f32, f32); 9] = [
+        (1, -2.0, 8.0),
+        (2, -2.0, 8.0),
+        (3, -2.0, 8.0),
+        (4, -2.0, 8.0),
+        (5, 0.0, 12.0),
+        (6, 0.0, 12.0),
+        (7, 2.0, 14.0),
+        (8, 6.0, 18.0),
+        (9, 10.0, 24.0),
+    ];
+
+    // Levels are independent, so run them concurrently and print in order.
+    let sweeps: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = WINDOWS
+            .iter()
+            .map(|&(level, low_db, high_db)| {
+                scope.spawn(move || {
+                    let steps = ((high_db - low_db) / 2.0).round() as usize;
+                    let scenario = Scenario {
+                        level,
+                        channel: ChannelSpec::Awgn,
+                        snr_db_points: (0..=steps).map(|i| low_db + 2.0 * i as f32).collect(),
+                        trials: TRIALS,
+                        seed: 0x2710 + u64::from(level),
+                        profile_override: Some(CoppaProfile::hf_standard()),
+                        cfo_hz: 0.0,
+                        sco_ppm: 0.0,
+                        ssb: false,
+                    };
+                    run_scenario(&scenario)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("sweep thread panicked"))
+            .collect()
+    });
 
     println!(
-        "\n=== SNR vs FER Monte Carlo ({} frames/point) ===\n",
-        num_frames
+        "\n=== AWGN FER sweep, hf_standard, 3 kHz noise bandwidth, {TRIALS} frames/point ===\n"
     );
-
-    for sl in &SPEED_LEVELS {
-        let max_bytes = max_payload_bytes(sl.level).min(50);
-        let payload: Vec<u8> = (0..max_bytes).map(|i| (i & 0xFF) as u8).collect();
-        let header = make_header(sl.level, payload.len() as u16);
-
-        let base_snr = required_snr(sl.level);
-        let snr_start = (base_snr - 4.0).max(-2.0);
-        let snr_end = base_snr + 10.0;
-        let snr_step = 2.0f32;
-
-        println!(
-            "Level {:>2} (bps={}, rate={}/{}):",
-            sl.level, sl.bits_per_symbol, sl.ldpc_rate_num, sl.ldpc_rate_den
-        );
-
-        let mut snr = snr_start;
-        while snr <= snr_end + 0.01 {
-            let mut errors = 0u64;
-            for seed in 0..num_frames {
-                let samples = transceiver
-                    .transmit(&header, &payload)
-                    .expect("payload within this level's capacity");
-                let noisy = add_awgn(&samples, snr, seed);
-                match transceiver.receive(&noisy) {
-                    Ok((_, rx_payload, _)) => {
-                        if rx_payload[..payload.len()] != payload[..] {
-                            errors += 1;
-                        }
-                    }
-                    Err(_) => errors += 1,
-                }
-            }
-            let fer = errors as f64 / num_frames as f64;
+    let mut misplaced = Vec::new();
+    for points in &sweeps {
+        let first = &points[0];
+        println!("Level {} ({}):", first.level, first.mode_name);
+        for p in points {
+            let f = p.failures;
             println!(
-                "  SNR={:6.1}dB  FER={:.2} ({}/{})",
-                snr, fer, errors, num_frames
+                "  SNR={:6.1}dB  FER={:.3} ({:>3}/{}) Wilson95=[{:.3}, {:.3}]  goodput={:7.1} bps  \
+                 sync={} header={} ldpc={} crc={} wrong={}",
+                p.snr_db,
+                p.fer,
+                p.frame_errors,
+                p.trials,
+                p.fer_lo,
+                p.fer_hi,
+                p.goodput_bps,
+                f.sync_failed,
+                f.header_corrupt,
+                f.ldpc_not_converged,
+                f.crc_mismatch,
+                f.wrong_payload,
             );
-            snr += snr_step;
         }
         println!();
+
+        let last = points.last().expect("every window has at least one point");
+        if first.fer_lo < 0.5 {
+            misplaced.push(format!(
+                "level {} low edge {} dB: FER Wilson lower bound {:.3} < 0.5",
+                first.level, first.snr_db, first.fer_lo
+            ));
+        }
+        if last.fer_hi > 0.10 {
+            misplaced.push(format!(
+                "level {} high edge {} dB: FER Wilson upper bound {:.3} > 0.10",
+                last.level, last.snr_db, last.fer_hi
+            ));
+        }
     }
+    assert!(
+        misplaced.is_empty(),
+        "sweep windows no longer straddle the measured waterfalls; re-measure \
+         and re-record them and the coppa-bench bracket anchors:\n{}",
+        misplaced.join("\n")
+    );
 }

@@ -31,7 +31,7 @@ cargo bench --workspace
 
 ## Testing Policy
 
-**Run `cargo test --workspace` locally before pushing for fast feedback.** The full test suite (integration tests, proptest roundtrips) now runs in CI on every push/PR (`test-full` job, Linux, `--features cpal-backend,websocket`). Local full-suite runs are still recommended before pushing — CI catches it, but local runs are faster feedback. At minimum, run `cargo test --workspace --lib` for a quick sanity check.
+**Run `cargo test --workspace` locally before pushing.** Push/PR CI (`ci.yml`) runs lib tests only (`cargo test --workspace --lib` on Linux/macOS/Windows, plus `--features cpal-backend,websocket,kiss-tnc --lib` on Linux), so root `tests/` integration tests and proptest roundtrips do not run on a push. The full suite (`ci-full.yml`'s `test-full` job, Linux, `--features cpal-backend,websocket`) runs only when `wait-for-codex.yml` dispatches it for a Codex-clean revision, on merge-queue entries, and on pushes to `main`. A check that must guard every push belongs in a crate's lib tests: the speed ladder's FER waterfalls are guarded by `coppa-bench`'s `waterfall_bracket_level_*` tests (COP-70). At minimum, run `cargo test --workspace --lib` for a quick sanity check.
 
 ## Workspace Structure
 
@@ -61,8 +61,9 @@ cargo bench --workspace
 
 ## CI
 
-Single workflow at `.github/workflows/ci.yml` runs on push/PR to main:
-- `cargo check`, `cargo test --lib` (fast signal, with features), **full test suite** (`cargo test --workspace --features cpal-backend,websocket`, Linux), clippy, fmt, MSRV (1.85.0), platform checks (Linux/macOS/Windows, `--lib` only on non-Linux to save runner minutes), **cargo-deny** supply-chain check, security audit (rustsec/audit-check).
+Two workflows:
+- `.github/workflows/ci.yml` runs on every push/PR to main: `cargo check`, `cargo test --lib` (with features, Linux), fmt, and platform checks (Linux/macOS/Windows, `cargo test --workspace --lib`). Lib tests only.
+- `.github/workflows/ci-full.yml` runs when `wait-for-codex.yml` dispatches it for a Codex-clean revision, on merge-queue entries, and on pushes to `main`: the **full test suite** (`test-full`, `cargo test --workspace --features cpal-backend,websocket`, Linux), bench and fuzz compilation, clippy, MSRV (1.85.0), **cargo-deny** supply-chain check, security audit (rustsec/audit-check), and wiki lint.
 
 ## MSRV
 
@@ -73,7 +74,7 @@ Older measurements in the Known Limitations below, BENCHMARKS.md and ADR-002 thr
 ## Known Limitations
 
 - CFO (carrier frequency offset) tolerance is ±50 Hz via two-stage acquisition (coarse Moose + fine Schmidl-Cox, resolved through their ambiguity periods), not unlimited — beyond that the ambiguity resolution itself wraps, and sample-clock offset is still uncorrected
-- PAPR clipping uses per-speed-level targets (6.0 dB at BPSK up to 14.0 dB at 64QAM, tuned in `SPEED_LEVELS`); the old flat/too-aggressive clipping this line used to describe was fixed well before Phase 1. **The levels 9/10 (64-QAM) LDPC-non-convergence-at-high-SNR issue this bullet used to describe is FIXED** by Task 4's NR BG2 mother code + level 10's rate-7/8→5/6 change: `tests/phase_c_loopback.rs`'s `test_snr_fer_monte_carlo` now shows FER=0.00/100 for every level (1-10) across its whole swept SNR range, confirmed by a fresh run, not carried over from an old measurement
+- PAPR clipping uses per-speed-level targets (6.0 dB at BPSK up to 14.0 dB at 64QAM, tuned in `SPEED_LEVELS`); the old flat/too-aggressive clipping this line used to describe was fixed well before Phase 1. **The levels 9/10 (64-QAM) LDPC-non-convergence-at-high-SNR issue this bullet used to describe is FIXED** by Task 4's NR BG2 mother code + level 10's rate-7/8→5/6 change. The evidence is COP-24's SSB-filtered AWGN sweep (`BENCHMARKS.md`'s "COP-24" section: every shipped HF level 0/50 from 18 to 60 dB), and `coppa-bench`'s `waterfall_bracket_level_*` tests guard each level's AWGN waterfall on every push. This bullet used to cite a `test_snr_fer_monte_carlo` run showing zero frame errors at every level; that run could not fail (COP-70): it used a full-band noise convention ~9 dB optimistic against the 3 kHz one, swept only above every level's waterfall, asserted nothing, and never ran in CI. That test is now an `#[ignore]`d manual sweep through `run_scenario` that straddles each waterfall and asserts on Wilson bounds
 - The Phase 2 Task 4 alpha-calibration process itself is a cautionary tale worth keeping in mind for future LDPC-parameter tuning: a normalized-min-sum scale picked from a sweep at **one** speed level (level 2) measurably improved that level's isolated FER but broke real convergence (100% frame loss, even on a clean channel) for level 10's very different operating point (highest rate, least redundancy, heaviest known-pad pinning at small payloads) — caught by `tests/phase_c_loopback.rs`'s existing tests, not by the new codec's own unit tests, which didn't happen to exercise that combination. Any future alpha/decoder-parameter change should be validated across the *whole* speed ladder (and payload-size extremes), not a single representative level, before being adopted as the shipped default
 - Daemon hardware audio requires the `cpal-backend` feature; without it the daemon runs but moves no audio
 - **PTT release on exit (COP-31) covers graceful exits, unwinds and restarts, plus an in-loop backstop (`max_tx_duration_s` + 2 s) and, for rigctld/GPIO PTT, an out-of-process guardian (`[radio] ptt_guardian`) that releases PTT if `coppad` dies keyed.** Not covered: a cgroup-wide SIGKILL or `pkill -9 coppad` (both kill the guardian too), power loss, serial PTT (relies on the OS dropping DTR/RTS on close; not hardware-verified), a fully wedged event loop, and Ctrl-C in `coppa tx`/`coppa tune`. See `docs/OPERATING.md`'s "PTT safety when coppad stops".

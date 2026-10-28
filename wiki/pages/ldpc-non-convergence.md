@@ -6,12 +6,13 @@ status: current
 maintainer: agent
 sources:
   - tests/phase_c_loopback.rs
+  - crates/coppa-bench/src/runner.rs
   - crates/coppa-protocol/src/fec/ldpc/**
   - docs/adr/005-nr-bg2-ldpc.md
   - BENCHMARKS.md
 verified:
-  commit: be2141b
-  date: 2026-08-05
+  commit: 3cbfd1e
+  date: 2026-10-28
 links:
   - coppa-protocol
   - adr-002-fec-strategy
@@ -20,9 +21,15 @@ links:
 The original gotcha this page described — levels 9/10 (64-QAM) failing to
 converge even at high SNR in loopback — is **FIXED** by Phase 2's NR BG2 mother
 code plus level 10's rate change from 7/8 to 5/6 (see [[adr-005-nr-bg2-ldpc]]).
-`tests/phase_c_loopback.rs`'s `test_snr_fer_monte_carlo` now shows FER=0.00/100
-for every level 1–10 across its whole swept SNR range. What remains is a
-narrower, real, still-open level-9 problem under fading.
+The evidence is COP-24's SSB-filtered AWGN sweep in `BENCHMARKS.md` (every
+shipped HF level 0/50 from 18 to 60 dB), and `coppa-bench`'s
+`waterfall_bracket_level_*` tests in `crates/coppa-bench/src/runner.rs` guard
+each level's AWGN waterfall on every push. This page used to cite a
+`test_snr_fer_monte_carlo` run with zero errors at every level; that run could
+not fail (COP-70), because its full-band noise was ~9 dB optimistic against
+the 3 kHz convention, its sweep sat above every waterfall, and it asserted
+nothing. What remains is a narrower, real, still-open level-9 problem under
+fading.
 
 ## What is fixed
 
