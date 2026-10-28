@@ -114,12 +114,23 @@ cargo run -p coppa-daemon --bin coppad
 cargo run -p coppa-daemon --bin coppad -- --config my_config.toml
 ```
 
-Without a config argument, `coppad` loads `./coppad.toml` if it exists and
-otherwise runs on built-in defaults. A path you name with `--config` (or with
-the older positional form, `coppad my_config.toml`, which still works) must
-exist: a missing or unreadable file is an error that names the path, not a
-silent fallback to defaults. An existing `./coppad.toml` that fails to parse
-is an error too.
+Without a config argument, `coppad` uses the first of these files that
+exists, and otherwise runs on built-in defaults:
+
+1. `coppad.toml` in the current directory;
+2. `$XDG_CONFIG_HOME/coppa/coppad.toml`, or `~/.config/coppa/coppad.toml` when
+   `XDG_CONFIG_HOME` is unset (`%APPDATA%\coppa\coppad.toml` on Windows);
+3. `/etc/coppa/coppad.toml` (not on Windows).
+
+It never merges files. At startup it logs `Using configuration file` with the
+path it chose, or a warning listing every path it searched when it found none;
+without a config argument, `coppad --check` prints the same information as its
+first line. A path you
+name with `--config` (or with the older positional form,
+`coppad my_config.toml`, which still works) must exist and is the only file
+read: a missing or unreadable file is an error that names the path, not a
+silent fallback to defaults. A file the search finds that fails to parse is an
+error too, naming that file.
 
 To start from the built-in defaults, print them as TOML, edit the copy, and
 check it before running:

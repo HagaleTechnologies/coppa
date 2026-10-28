@@ -12,7 +12,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use coppa_daemon::config::DaemonConfig;
+use coppa_daemon::config::{DaemonConfig, CONFIG_FILE_NAME, SYSTEM_CONFIG_PATH};
 
 /// How long an informational command may take before the test fails.
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -47,8 +47,11 @@ impl TempDir {
         &self.0
     }
 
+    /// Write `contents` to `name`, which may contain subdirectories.
     fn write(&self, name: &str, contents: &str) -> PathBuf {
         let path = self.0.join(name);
+        std::fs::create_dir_all(path.parent().expect("a parent directory"))
+            .expect("create parent directory");
         std::fs::write(&path, contents).expect("write temporary file");
         path
     }
@@ -69,6 +72,9 @@ struct Daemon {
 }
 
 impl Daemon {
+    /// Spawn `coppad` in `cwd`. COP-49: the child's `HOME` is its own empty
+    /// capture dir and `XDG_CONFIG_HOME`/`APPDATA` are removed, so the config
+    /// search never reaches the real user's files; `envs` override this.
     fn spawn(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Self {
         let capture = TempDir::new("capture");
         let stdout = File::create(capture.0.join("stdout")).expect("create stdout capture");
@@ -81,6 +87,9 @@ impl Daemon {
             // anyhow appends a backtrace to `main`'s error when either is set.
             .env_remove("RUST_BACKTRACE")
             .env_remove("RUST_LIB_BACKTRACE")
+            .env("HOME", capture.path())
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("APPDATA")
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr);
@@ -201,7 +210,12 @@ fn run_ok(cwd: &Path, args: &[&str]) -> String {
 /// Run a command that must fail with exit 1, empty stdout, and an error on
 /// stderr. Returns stderr.
 fn run_config_error(cwd: &Path, args: &[&str]) -> String {
-    let out = run(cwd, args);
+    run_config_error_with_env(cwd, args, &[])
+}
+
+/// [`run_config_error`] with extra environment variables.
+fn run_config_error_with_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> String {
+    let out = run_with_env(cwd, args, envs);
     out.assert_code(1, args);
     assert_eq!(out.stdout, "", "coppad {args:?} stdout");
     out.assert_no_startup();
@@ -237,7 +251,38 @@ fn version_line() -> String {
     format!("coppad {}\n", env!("CARGO_PKG_VERSION"))
 }
 
+/// COP-49: `HOME`'s config file, `$HOME/.config/coppa/coppad.toml`.
+fn home_config_path(home: &Path) -> PathBuf {
+    home.join(".config").join("coppa").join(CONFIG_FILE_NAME)
+}
+
+/// COP-49: `/etc/coppa/coppad.toml` cannot be redirected, so a test that
+/// expects the search to find nothing at all runs only when it is provably
+/// absent. Prints why when it is not.
+fn system_config_absent() -> bool {
+    match Path::new(SYSTEM_CONFIG_PATH).symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        other => {
+            eprintln!("skipping: {SYSTEM_CONFIG_PATH} is present or unreadable here ({other:?})");
+            false
+        }
+    }
+}
+
 // --- help and version -------------------------------------------------------
+
+/// COP-49: the help's lines on the implicit config search, per platform.
+#[cfg(not(windows))]
+const HELP_SEARCH_ORDER: &str = "\
+Without CONFIG or --config, use the first file found of ./coppad.toml,
+$XDG_CONFIG_HOME/coppa/coppad.toml (default ~/.config/coppa/coppad.toml) and
+/etc/coppa/coppad.toml; otherwise use built-in defaults.
+";
+#[cfg(windows)]
+const HELP_SEARCH_ORDER: &str = "\
+Without CONFIG or --config, use the first file found of ./coppad.toml and
+%APPDATA%\\coppa\\coppad.toml; otherwise use built-in defaults.
+";
 
 fn assert_full_help(help: &str) {
     for expected in [
@@ -258,7 +303,7 @@ fn assert_full_help(help: &str) {
         "Print help",
         "-V, --version",
         "Print version",
-        "Without CONFIG or --config, load ./coppad.toml if present; otherwise use built-in defaults.",
+        HELP_SEARCH_ORDER,
         "Explicit config paths must exist. --check does not verify hardware or runtime settings.",
     ] {
         assert!(help.contains(expected), "help lacks {expected:?}:\n{help}");
@@ -367,15 +412,121 @@ fn conflicting_options_are_usage_errors() {
 
 #[test]
 fn check_without_a_config_file_checks_the_defaults() {
+    if !system_config_absent() {
+        return;
+    }
     let dir = TempDir::new("check-defaults");
-    assert_eq!(run_ok(dir.path(), &["--check"]), CHECK_OK);
+    let home = TempDir::new("check-defaults-home");
+    let home_str = home.path().to_str().expect("UTF-8 temp path");
+    let args = ["--check"];
+    let out = run_with_env(dir.path(), &args, &[("HOME", home_str)]);
+    out.assert_code(0, &args);
+    assert_eq!(out.stderr, "");
+    assert_eq!(
+        out.stdout,
+        format!(
+            "No configuration file found; checking the built-in defaults (searched: \
+             coppad.toml, {}, /etc/coppa/coppad.toml).\n{CHECK_OK}",
+            home_config_path(home.path()).display()
+        )
+    );
+}
+
+/// What `--check` prints for an implicit source that found `./coppad.toml`.
+fn check_ok_using_the_local_file() -> String {
+    format!("Using configuration file coppad.toml\n{CHECK_OK}")
 }
 
 #[test]
 fn check_loads_the_implicit_default_file() {
     let dir = TempDir::new("check-implicit");
     dir.write("coppad.toml", "[audio]\nsample_rate = 48000\n");
-    assert_eq!(run_ok(dir.path(), &["--check"]), CHECK_OK);
+    assert_eq!(
+        run_ok(dir.path(), &["--check"]),
+        check_ok_using_the_local_file()
+    );
+}
+
+#[test]
+fn check_reports_which_discovered_file_it_used() {
+    // COP-49: the first line names the file the implicit search chose.
+    let home = TempDir::new("discover-home");
+    let home_file = home.write(".config/coppa/coppad.toml", "");
+    let xdg = TempDir::new("discover-xdg");
+    let xdg_file = xdg.write("coppa/coppad.toml", "");
+    let home_str = home.path().to_str().expect("UTF-8 temp path");
+    let xdg_str = xdg.path().to_str().expect("UTF-8 temp path");
+
+    let empty_cwd = TempDir::new("discover-cwd-empty");
+    let local_cwd = TempDir::new("discover-cwd-local");
+    local_cwd.write("coppad.toml", "");
+    // A relative XDG_CONFIG_HOME is ignored even where it would resolve.
+    let relative_cwd = TempDir::new("discover-cwd-relative");
+    relative_cwd.write("xdg/coppa/coppad.toml", "");
+
+    for (what, cwd, envs, expected) in [
+        (
+            "only the HOME file",
+            &empty_cwd,
+            vec![("HOME", home_str)],
+            home_file.display().to_string(),
+        ),
+        (
+            "an absolute XDG_CONFIG_HOME and the HOME file",
+            &empty_cwd,
+            vec![("HOME", home_str), ("XDG_CONFIG_HOME", xdg_str)],
+            xdg_file.display().to_string(),
+        ),
+        (
+            "a local file, XDG_CONFIG_HOME and the HOME file",
+            &local_cwd,
+            vec![("HOME", home_str), ("XDG_CONFIG_HOME", xdg_str)],
+            "coppad.toml".to_string(),
+        ),
+        (
+            "a relative XDG_CONFIG_HOME",
+            &relative_cwd,
+            vec![("HOME", home_str), ("XDG_CONFIG_HOME", "xdg")],
+            home_file.display().to_string(),
+        ),
+    ] {
+        let args = ["--check"];
+        let out = run_with_env(cwd.path(), &args, &envs);
+        out.assert_code(0, &args);
+        assert_eq!(out.stderr, "", "{what}");
+        assert_eq!(
+            out.stdout,
+            format!("Using configuration file {expected}\n{CHECK_OK}"),
+            "{what}"
+        );
+    }
+}
+
+#[test]
+fn a_broken_discovered_config_stops_check_and_run_naming_it() {
+    // COP-49 with COP-36: a discovered file is parsed as strictly as a local
+    // one, so a typo in ~/.config/coppa/coppad.toml stops startup naming it.
+    let cwd = TempDir::new("discover-broken-cwd");
+    let home = TempDir::new("discover-broken-home");
+    let broken = home.write(
+        ".config/coppa/coppad.toml",
+        "[engine]\ncalsign = \"W5AU\"\n",
+    );
+    let home_str = home.path().to_str().expect("UTF-8 temp path");
+    for args in [&["--check"][..], &[]] {
+        let stderr = run_config_error_with_env(cwd.path(), args, &[("HOME", home_str)]);
+        assert!(
+            stderr.starts_with(&format!(
+                "Error: Failed to parse config {}",
+                broken.display()
+            )),
+            "coppad {args:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("unknown field `calsign`"),
+            "coppad {args:?}: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -417,19 +568,21 @@ fn check_accepts_every_explicit_config_form_and_order() {
 #[test]
 fn check_with_log_level_off_ignores_rust_log() {
     let dir = TempDir::new("check-quiet");
+    dir.write("coppad.toml", "");
     let args = ["--check", "--log-level", "off"];
     let out = run_with_env(dir.path(), &args, &[("RUST_LOG", "trace")]);
     out.assert_code(0, &args);
-    assert_eq!(out.stdout, CHECK_OK);
+    assert_eq!(out.stdout, check_ok_using_the_local_file());
     assert_eq!(out.stderr, "");
 }
 
 #[test]
 fn check_with_rust_log_trace_prints_no_tracing() {
     let dir = TempDir::new("check-trace");
+    dir.write("coppad.toml", "");
     let out = run_with_env(dir.path(), &["--check"], &[("RUST_LOG", "trace")]);
     out.assert_code(0, &["--check"]);
-    assert_eq!(out.stdout, CHECK_OK);
+    assert_eq!(out.stdout, check_ok_using_the_local_file());
     assert_eq!(out.stderr, "");
 }
 
@@ -741,8 +894,66 @@ fn explicit_config_starts_the_daemon() {
 
 #[cfg(not(feature = "cpal-backend"))]
 #[test]
+fn a_config_in_the_user_config_dir_is_used_without_arguments() {
+    // COP-49's scenario: ~/.config/coppa/coppad.toml is loaded by a bare
+    // `coppad` started from an unrelated working directory.
+    let cwd = TempDir::new("run-discover-cwd");
+    let home = TempDir::new("run-discover-home");
+    let config = home.write(
+        ".config/coppa/coppad.toml",
+        "[engine]\ncallsign = \"W5AU\"\n",
+    );
+    let home_str = home.path().to_str().expect("UTF-8 temp path");
+    let (mut daemon, _) = start_until_ready(cwd.path(), &[], &[("HOME", home_str)]);
+    let (stdout, _) = daemon.kill();
+    // The file was used: its callsign silences the missing-callsign warning.
+    assert!(!stdout.contains("No callsign configured"), "{stdout}");
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("Using configuration file"))
+        .unwrap_or_else(|| panic!("no \"Using configuration file\" line\n{stdout}"));
+    assert!(line.contains("INFO"), "{line}");
+    assert!(
+        line.contains(&config.display().to_string()),
+        "{line} does not name {}",
+        config.display()
+    );
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn with_no_config_anywhere_the_daemon_warns_listing_the_search() {
+    if !system_config_absent() {
+        return;
+    }
+    let cwd = TempDir::new("run-no-config-cwd");
+    let home = TempDir::new("run-no-config-home");
+    let home_str = home.path().to_str().expect("UTF-8 temp path");
+    let (mut daemon, _) = start_until_ready(cwd.path(), &[], &[("HOME", home_str)]);
+    let (stdout, _) = daemon.kill();
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("No configuration file found"))
+        .unwrap_or_else(|| panic!("no \"No configuration file found\" line\n{stdout}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(
+        line.contains(&format!(
+            "using built-in defaults (searched: coppad.toml, {}, {SYSTEM_CONFIG_PATH})",
+            home_config_path(home.path()).display()
+        )),
+        "{line}"
+    );
+    assert!(line.contains("coppad.toml.example"), "{line}");
+    assert!(!stdout.contains("Using configuration file"), "{stdout}");
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
 fn log_level_overrides_rust_log_on_a_running_daemon() {
     let dir = TempDir::new("run-level");
+    // A local config file, so the run does not depend on this machine's
+    // /etc/coppa/coppad.toml.
+    dir.write("coppad.toml", "");
 
     // --log-level info wins over RUST_LOG=off: the daemon logs readiness.
     let (mut loud, ready_after) =

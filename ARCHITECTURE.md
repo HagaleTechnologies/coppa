@@ -115,7 +115,7 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 
 #### Daemon (`coppad`, crate `coppa-daemon`)
 - Tokio event loop multiplexing audio, host clients (VARA-style TCP, WebSocket), radio control, ARQ timers, `RateLoop`, `CpGate`/CP negotiation and `BusyGate`
-- Options: `--config <PATH>` (or a positional config path), `--check`, `--log-level`, `--print-default-config`, `--tnc`. Without a config path it loads `./coppad.toml` if present, otherwise built-in defaults
+- Options: `--config <PATH>` (or a positional config path), `--check`, `--log-level`, `--print-default-config`, `--tnc`. Without a config path it uses the first file found of `./coppad.toml`, `$XDG_CONFIG_HOME/coppa/coppad.toml` (default `~/.config/coppa/coppad.toml`; `%APPDATA%\coppa\coppad.toml` on Windows) and `/etc/coppa/coppad.toml`, otherwise built-in defaults, and logs which one it used (COP-49)
 - Hardware audio requires the `cpal-backend` feature; without it the daemon runs but moves no audio
 - Ctrl-C graceful shutdown
 - RX/TX audio level meter with clipping/underdrive warnings (logs + opt-in WebSocket `audio_level` stream)
