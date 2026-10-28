@@ -3,6 +3,8 @@
 //! This crate provides:
 //! - [`CoppaCore`] - the main encode/decode engine integrating modem, FEC, and framing
 //! - [`EngineConfig`] - runtime configuration types
+//! - [`profiles`] - the named operating profiles (`HF_ROBUST`, `HF_STANDARD`,
+//!   `VHF_FAST`, `EMERGENCY`) that `EngineConfig::from_profile` builds from
 //! - [`ladder`] - the real per-level facts (modulation, code rate, max bytes,
 //!   air time, bandwidth) that `coppa profiles` shows
 

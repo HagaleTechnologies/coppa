@@ -35,22 +35,23 @@ cargo bench --workspace
 
 ## Workspace Structure
 
-12 crates under `crates/`:
+13 crates under `crates/` (12 product crates plus the `coppa-bench` measurement harness):
 
 | Crate | Role |
 |-------|------|
-| `coppa-dsp` | Pure DSP: FFT, filters, AGC, resampling |
-| `coppa-codec` | Modulation: BPSK, QPSK, 8PSK, QAM, OFDM |
-| `coppa-protocol` | Framing, FEC (convolutional + LDPC), ARQ, compression, sessions |
-| `coppa-channel` | Channel models for testing (AWGN, fading, CFO) |
+| `coppa-dsp` | Pure DSP: FFT, FIR filters, AGC, carrier and timing recovery |
+| `coppa-codec` | Modulation: BPSK, QPSK, 8PSK, QAM, OFDM, AFSK 1200 |
+| `coppa-protocol` | CoppaTransceiver pipeline, NR BG2 LDPC, framing, ARQ, compression, sessions |
+| `coppa-channel` | Channel models for testing (AWGN, Watterson fading, SSB filter, CFO, sinusoidal fade) |
 | `coppa-audio` | Audio backends: CPAL (feature-gated), WAV file I/O |
-| `coppa-radio` | Radio control via rigctld CAT |
+| `coppa-radio` | Radio control via rigctld CAT; serial and GPIO PTT (feature-gated) |
 | `coppa-ml` | Adaptive link control: capacity-based MCS selection, closed-loop rate control, spread-gated short-CP, spectrum sensing |
 | `coppa-engine` | Core engine: thin wrapper around CoppaTransceiver |
-| `coppa-host` | VARA-style TCP control server, WebSocket JSON API |
+| `coppa-host` | VARA-style TCP control server, WebSocket JSON API, KISS TNC server (feature-gated) |
 | `coppa-ffi` | C FFI (cdylib + staticlib) with streaming decode |
 | `coppa-cli` | CLI binary (`coppa`) |
 | `coppa-daemon` | Daemon binary (`coppad`) |
+| `coppa-bench` | Measurement harness (not a product crate); its lib tests guard each level's FER waterfall |
 
 ## Key Architecture
 

@@ -8,8 +8,8 @@ sources:
   - crates/coppa-engine/**
   - crates/coppa-protocol/src/**
 verified:
-  commit: 59b0b63
-  date: 2026-07-14
+  commit: 56361d6
+  date: 2026-10-28
 links:
   - overview
   - coppa-protocol
@@ -55,7 +55,9 @@ FFI). The main encode/decode logic is in `coppa-protocol`, not here.
   two build identical engines, and `coppa profiles` says so. Every HF profile
   runs the `hf_standard` OFDM profile (or its negotiated short-CP twin), and
   `VHF_FAST` runs `vhf_wide`; the `hf_robust`/`hf_wide`/`hf_narrow`
-  `CoppaProfile` constructors are not reachable from a named profile. Pilot
+  `CoppaProfile` constructors (codec-level, in
+  `crates/coppa-codec/src/ofdm/mod.rs`, with `hf_standard_short_cp()`) are not
+  reachable from a named profile. Pilot
   density still matters for fading: `hf_robust` uses dense pilots, the others
   sparse (see [[adr-004-strongest-path-timing]]).
 - **`coppa_engine::ladder`** assembles each speed level's modulation, code rate,
