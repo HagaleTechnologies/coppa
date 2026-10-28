@@ -142,8 +142,10 @@ fn test_level_9_64qam_rate_5_6() {
 fn test_all_levels_max_payload() {
     // The levels-9/10 skip this loop used to have (routing around the old
     // per-rate LDPC codec's non-convergence) is removed: Task 4's NR BG2
-    // mother code fixes this, per COP-24's SSB-filtered AWGN sweep
-    // (BENCHMARKS.md) and coppa-bench's `waterfall_bracket_level_*` tests.
+    // mother code lets this clean-channel loopback cover every level. The
+    // unfiltered AWGN brackets guard each level at its bench payload;
+    // COP-24's SSB sweep supports level 8, but level 9 still fails through
+    // that filter (BENCHMARKS.md).
     for sl in &SPEED_LEVELS {
         let max_bytes = max_payload_bytes(sl.level);
         let payload: Vec<u8> = (0..max_bytes).map(|i| (i & 0xFF) as u8).collect();
@@ -155,8 +157,10 @@ fn test_all_levels_max_payload() {
 fn test_all_levels_min_payload() {
     // The levels-9/10 skip this loop used to have (routing around the old
     // per-rate LDPC codec's non-convergence) is removed: Task 4's NR BG2
-    // mother code fixes this, per COP-24's SSB-filtered AWGN sweep
-    // (BENCHMARKS.md) and coppa-bench's `waterfall_bracket_level_*` tests.
+    // mother code lets this clean-channel loopback cover every level. The
+    // unfiltered AWGN brackets guard each level at its bench payload;
+    // COP-24's SSB sweep supports level 8, but level 9 still fails through
+    // that filter (BENCHMARKS.md).
     for sl in &SPEED_LEVELS {
         loopback_test(sl.level, &[0x42]);
     }

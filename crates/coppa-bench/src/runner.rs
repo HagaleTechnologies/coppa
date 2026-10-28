@@ -477,7 +477,10 @@ mod tests {
     /// gate FER<=10% on a Wilson bound. The stricter upgrade is 40 trials per
     /// cell asserting `fer_hi <= 0.10` (0/40 gives 0.088). The Wilson bounds
     /// are printed in every failure message.
-    fn bracket(level: u8, below_db: f32, above_db: f32) {
+    /// High-side goodput floors are rounded about 10% below the measured
+    /// 20-trial baselines (L1-L9: 328, 651, 1189, 1808, 2189, 1877, 2855,
+    /// 3210, 4023 bps). They catch airtime regressions even when FER holds.
+    fn bracket(level: u8, below_db: f32, above_db: f32, min_goodput_bps: f64) {
         const TRIALS: usize = 20;
         let scenario = Scenario {
             level,
@@ -518,50 +521,59 @@ mod tests {
             above.trials,
             above.failures,
         );
+        assert!(
+            above.goodput_bps >= min_goodput_bps,
+            "level {level} at {above_db} dB: goodput {:.1} bps is below the \
+             measured floor {min_goodput_bps:.1} bps; FER is {}/{}. \
+             Re-measure frame airtime and goodput before changing the floor.",
+            above.goodput_bps,
+            above.frame_errors,
+            above.trials,
+        );
     }
 
     #[test]
     fn waterfall_bracket_level_1() {
-        bracket(1, 0.0, 8.0);
+        bracket(1, 0.0, 8.0, 290.0);
     }
 
     #[test]
     fn waterfall_bracket_level_2() {
-        bracket(2, 0.0, 8.0);
+        bracket(2, 0.0, 8.0, 580.0);
     }
 
     #[test]
     fn waterfall_bracket_level_3() {
-        bracket(3, 0.0, 8.0);
+        bracket(3, 0.0, 8.0, 1050.0);
     }
 
     #[test]
     fn waterfall_bracket_level_4() {
-        bracket(4, 0.0, 8.0);
+        bracket(4, 0.0, 8.0, 1600.0);
     }
 
     #[test]
     fn waterfall_bracket_level_5() {
-        bracket(5, 4.0, 12.0);
+        bracket(5, 4.0, 12.0, 1950.0);
     }
 
     #[test]
     fn waterfall_bracket_level_6() {
-        bracket(6, 2.0, 12.0);
+        bracket(6, 2.0, 12.0, 1650.0);
     }
 
     #[test]
     fn waterfall_bracket_level_7() {
-        bracket(7, 6.0, 14.0);
+        bracket(7, 6.0, 14.0, 2550.0);
     }
 
     #[test]
     fn waterfall_bracket_level_8() {
-        bracket(8, 10.0, 18.0);
+        bracket(8, 10.0, 18.0, 2850.0);
     }
 
     #[test]
     fn waterfall_bracket_level_9() {
-        bracket(9, 14.0, 24.0);
+        bracket(9, 14.0, 24.0, 3600.0);
     }
 }
