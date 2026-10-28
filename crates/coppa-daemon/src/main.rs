@@ -215,9 +215,12 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     // COP-32/COP-36: config checks first, before any hardware or socket is
     // touched. The profile check comes first so a typo'd name is reported as
     // an unknown profile, not through check_sample_rate's fallback rate.
+    // COP-53: a WebSocket-enabled config needs a valid token and origin list,
+    // checked in every build (the keys deserialize in every build).
     config.check_profile().map_err(anyhow::Error::msg)?;
     config.check_buffer_size().map_err(anyhow::Error::msg)?;
     config.check_sample_rate().map_err(anyhow::Error::msg)?;
+    config.check_websocket_auth().map_err(anyhow::Error::msg)?;
     #[cfg(not(feature = "cpal-backend"))]
     check_no_named_devices(&config.audio)?;
 
@@ -424,11 +427,27 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     // Start WebSocket server if enabled
     #[cfg(feature = "websocket")]
     if let Some(ws_listener) = ws_listener {
-        tracing::info!(addr = %vara_wiring::listen_addr(&ws_listener), "WebSocket server listening");
+        tracing::info!(
+            addr = %vara_wiring::listen_addr(&ws_listener),
+            allowed_origins = config.host.websocket_allowed_origins.len(),
+            "WebSocket server listening"
+        );
+        // COP-53: every handshake must present the token and, from a browser,
+        // an allowlisted Origin. check_websocket_auth already refused a missing
+        // token; an empty one here would make the server refuse everything.
+        let auth = coppa_host::websocket::WsAuth::new(
+            config
+                .host
+                .websocket_token
+                .as_ref()
+                .map_or("", config::SecretToken::expose),
+            &config.host.websocket_allowed_origins,
+        );
         let mut ws_server = coppa_host::websocket::WebSocketServer::with_bind_addr(
             config.host.websocket_port,
             config.host.bind_address.clone(),
-        );
+        )
+        .with_auth(auth);
 
         // Pipe WebSocket events into the daemon event loop
         if let Some(mut ws_rx) = ws_server.take_event_rx() {
