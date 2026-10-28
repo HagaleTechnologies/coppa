@@ -317,6 +317,8 @@ pub struct EventLoop {
     /// COP-32: degraded-startup conditions `coppad` reports in place of
     /// "Daemon ready". See [`EventLoop::startup_problems`].
     startup_problems: Vec<String>,
+    /// COP-50: PTT as startup left it, for the startup log.
+    ptt_startup: crate::startup_report::PttStartup,
     /// COP-40: the operator-stated frequency source (`[radio] frequency_hz`
     /// / `band`), validated at startup -- the fallback evidence the
     /// wideband gate in `transmit_samples` uses when no live rigctld answer
@@ -567,20 +569,27 @@ impl EventLoop {
         // a restart un-keys a transmitter an earlier run left keyed (and a Linux
         // serial open's DTR assertion is undone). Before the frequency gate: even a
         // refused start releases.
-        if let Err(e) = ptt.set_ptt(PttState::Rx) {
+        let release = ptt.set_ptt(PttState::Rx).map_err(|e| e.to_string());
+        if let Err(e) = &release {
             tracing::warn!(
                 error = %e,
                 "Could not release PTT at startup; a transmitter left keyed by an earlier run may still be keyed"
             );
         }
+        // create_ptt has already parsed this; same error text if it ever fails.
+        let configured = config
+            .radio
+            .ptt_config()
+            .map_err(|e| anyhow::anyhow!("invalid [radio] ptt_method: {e}"))?;
+        let ptt_startup = crate::startup_report::PttStartup::new(
+            configured,
+            &config.radio.rigctld_address,
+            ptt.is_rigctld(),
+            release,
+        );
         // COP-32: conditions the daemon runs through but must not call ready.
-        let mut startup_problems = Vec::new();
-        if config.radio.ptt_config() == Ok(crate::config::PttConfig::Rigctld) && !ptt.is_rigctld() {
-            startup_problems.push(format!(
-                "no PTT: rigctld at {} is unreachable",
-                config.radio.rigctld_address
-            ));
-        }
+        // COP-50: a backend that refused the release is one of them.
+        let startup_problems: Vec<String> = ptt_startup.problem().into_iter().collect();
 
         // Create engine from profile; all profiles use 48kHz internally.
         // coppad's run mode rejects an unknown profile name before this point
@@ -680,6 +689,7 @@ impl EventLoop {
             ptt,
             ptt_guardian: None,
             startup_problems,
+            ptt_startup,
             radio_frequency,
             tx_held_by_frequency_gate: false,
             session_tx_held_by_frequency_gate: false,
@@ -1081,10 +1091,15 @@ impl EventLoop {
     }
 
     /// COP-32: conditions found while starting that leave the daemon running
-    /// but unable to do part of its job (today: rigctld unreachable, so no
-    /// PTT). Empty when startup was clean.
+    /// but unable to do part of its job (today: rigctld unreachable, or a
+    /// refused startup PTT release). Empty when startup was clean.
     pub fn startup_problems(&self) -> &[String] {
         &self.startup_problems
+    }
+
+    /// COP-50: the configured and active PTT backend and the startup release's outcome.
+    pub fn ptt_startup(&self) -> &crate::startup_report::PttStartup {
+        &self.ptt_startup
     }
 
     /// Get a sender for injecting events into the loop.
@@ -14442,6 +14457,34 @@ mod tests {
             let rig = recording_rigctld("1", "14074000", true);
             assert!(EventLoop::new(rigctld_config(&rig)).is_ok());
             assert_eq!(rig.commands(), ["T 0"], "the release was attempted");
+        }
+
+        #[test]
+        fn a_failed_startup_release_is_a_startup_problem() {
+            let rig = recording_rigctld("1", "14074000", true);
+            let event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            assert_eq!(
+                event_loop.startup_problems(),
+                ["PTT release at startup failed: rigctld set_ptt failed: RPRT -1"]
+            );
+            let ptt = event_loop.ptt_startup();
+            assert_eq!(ptt.active(), "rigctld");
+            assert_eq!(
+                ptt.state(),
+                "release failed: rigctld set_ptt failed: RPRT -1"
+            );
+        }
+
+        #[test]
+        fn a_clean_startup_release_is_reported_released() {
+            let rig = recording_rigctld("1", "14074000", false);
+            let event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            assert!(event_loop.startup_problems().is_empty());
+            assert_eq!(event_loop.ptt_startup().state(), "released");
+            assert_eq!(
+                event_loop.ptt_startup().method(),
+                format!("rigctld {}", rig.addr)
+            );
         }
 
         #[test]

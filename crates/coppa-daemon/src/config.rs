@@ -536,6 +536,21 @@ impl DaemonConfig {
         ))
     }
 
+    /// COP-50: `[host] websocket_enabled = true` needs a build with the
+    /// `websocket` feature (`built`); without it no listener would start and
+    /// nothing would say so. Checked by run mode before any hardware is touched.
+    pub fn check_websocket_built(&self, built: bool) -> Result<(), String> {
+        if built || !self.host.websocket_enabled {
+            return Ok(());
+        }
+        Err(
+            "[host] websocket_enabled = true is set, but this coppad was built without the \
+             websocket feature and starts no WebSocket server; rebuild with --features \
+             websocket, or set websocket_enabled = false"
+                .to_string(),
+        )
+    }
+
     /// COP-32: `[audio] sample_rate` must equal the configured profile's
     /// engine rate. coppad has no resampler, so any other rate plays and
     /// captures audio at the wrong speed. Checked by run mode before any
@@ -1149,6 +1164,17 @@ beacon_interval_secs = 600
         for name in ["HF_ROBUST", "HF_STANDARD", "VHF_FAST", "EMERGENCY"] {
             assert!(err.contains(name), "{name} missing: {err}");
         }
+    }
+
+    #[test]
+    fn websocket_enabled_needs_a_websocket_build() {
+        let mut config = DaemonConfig::default();
+        assert!(config.check_websocket_built(false).is_ok());
+        config.host.websocket_enabled = true;
+        assert!(config.check_websocket_built(true).is_ok());
+        let err = config.check_websocket_built(false).unwrap_err();
+        assert!(err.contains("--features websocket"), "{err}");
+        assert!(err.contains("websocket_enabled = false"), "{err}");
     }
 
     #[test]

@@ -355,7 +355,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:b8afd3bae50ea8f4ba058e6a60987ce447d071d232b7ad7e8d0a78dfe15c9329",
+      "hash": "sha256:07d383ad2f7b85424b2638dd222bb99c61cf8da91a30f419ef3e80caed6228b0",
       "id": "cpal-feature-gate",
       "kind": "gotcha",
       "links": [
@@ -370,8 +370,8 @@
       ],
       "status": "current",
       "title": "What will bite you about the cpal-backend feature flag?",
-      "verified_commit": "c1d2676",
-      "verified_date": "2026-07-07",
+      "verified_commit": "f1dcac4",
+      "verified_date": "2026-10-28",
       "visibility": "public"
     },
     {
