@@ -10,7 +10,17 @@ use coppa_engine::CoppaCore;
 enum Verbosity {
     Quiet,
     Normal,
-    Verbose,
+    Verbose(u8),
+}
+
+impl Verbosity {
+    fn is_verbose(self) -> bool {
+        matches!(self, Self::Verbose(_))
+    }
+
+    fn is_extended(self) -> bool {
+        matches!(self, Self::Verbose(count) if count >= 2)
+    }
 }
 
 #[derive(Parser)]
@@ -20,11 +30,11 @@ enum Verbosity {
     version
 )]
 struct Cli {
-    /// Enable verbose output (SNR, sample counts, DSP diagnostics).
-    #[arg(long, global = true)]
-    verbose: bool,
+    /// Increase diagnostic output; repeat for frame metrics.
+    #[arg(short, long, global = true, action = clap::ArgAction::Count, conflicts_with = "quiet")]
+    verbose: u8,
     /// Suppress all output except decoded messages.
-    #[arg(long, global = true)]
+    #[arg(short, long, global = true, conflicts_with = "verbose")]
     quiet: bool,
     #[command(subcommand)]
     command: Option<Commands>,
@@ -219,8 +229,8 @@ fn main() -> Result<()> {
 
     let verbosity = if cli.quiet {
         Verbosity::Quiet
-    } else if cli.verbose {
-        Verbosity::Verbose
+    } else if cli.verbose > 0 {
+        Verbosity::Verbose(cli.verbose)
     } else {
         Verbosity::Normal
     };
@@ -630,7 +640,7 @@ fn cmd_tx(
     let config = resolve_config(profile)?;
     let core = CoppaCore::with_config(config);
 
-    if verbosity == Verbosity::Verbose {
+    if verbosity.is_verbose() {
         if let Some(cs) = callsign {
             eprintln!("[verbose] Callsign: {}", cs);
         }
@@ -648,7 +658,7 @@ fn cmd_tx(
     if verbosity != Verbosity::Quiet {
         println!("Generated {} audio samples", samples.len());
     }
-    if verbosity == Verbosity::Verbose {
+    if verbosity.is_verbose() {
         let duration_s = samples.len() as f64 / core.config().sample_rate as f64;
         eprintln!("[verbose] Audio duration: {:.3} s", duration_s);
     }
@@ -815,7 +825,7 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
     let config = resolve_config(args.profile.as_deref())?;
     let mut core = CoppaCore::with_config(config);
 
-    if verbosity == Verbosity::Verbose {
+    if verbosity.is_verbose() {
         if let Some(cs) = &args.callsign {
             eprintln!("[verbose] Callsign: {}", cs);
         }
@@ -1056,10 +1066,16 @@ fn print_stream_frame(
             } else {
                 println!("{}", format_decoded(bytes, frame.snr_db, hex));
             }
-            if verbosity == Verbosity::Verbose {
+            if verbosity.is_verbose() {
                 eprintln!(
                     "[verbose] level={} cfo_hz={:.1} frame_start={}",
                     frame.speed_level, frame.cfo_hz, frame.frame_start
+                );
+            }
+            if verbosity.is_extended() {
+                eprintln!(
+                    "[verbose] recommended_level={} delay_spread_ms={:.1}",
+                    frame.recommended_level, frame.delay_spread_ms
                 );
             }
         }
@@ -1081,7 +1097,7 @@ fn cmd_loopback(message: &str, profile: Option<&str>, verbosity: Verbosity) -> R
     let config = resolve_config(profile)?;
     let core = CoppaCore::with_config(config);
 
-    if verbosity == Verbosity::Verbose {
+    if verbosity.is_verbose() {
         eprintln!(
             "[verbose] Config: sample_rate={}, speed_level={}",
             core.config().sample_rate,
@@ -1241,7 +1257,7 @@ mod tests {
 
     #[test]
     fn test_loopback_verbose() {
-        cmd_loopback("Verbose", None, Verbosity::Verbose).expect("verbose loopback should succeed");
+        cmd_loopback("Verbose", None, Verbosity::Verbose(1)).expect("verbose loopback should succeed");
     }
 
     #[test]
@@ -1342,7 +1358,7 @@ mod tests {
             200,
             None,
             None,
-            Verbosity::Verbose,
+            Verbosity::Verbose(1),
         )
         .expect("tx with callsign should succeed");
         #[cfg(feature = "file-backend")]
@@ -2093,6 +2109,36 @@ mod tests {
             .err()
             .expect("FILE and -i together must be rejected");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn global_verbosity_flags_count_and_conflict() {
+        for (flags, count) in [
+            (vec!["-v"], 1),
+            (vec!["-vv"], 2),
+            (vec!["-vvv"], 3),
+            (vec!["--verbose", "--verbose"], 2),
+            (vec!["-v", "--verbose"], 2),
+        ] {
+            for before_command in [true, false] {
+                let mut argv = vec!["coppa"];
+                if before_command { argv.extend(&flags); }
+                argv.push("devices");
+                if !before_command { argv.extend(&flags); }
+                assert_eq!(Cli::try_parse_from(argv).unwrap().verbose, count);
+            }
+        }
+        for flag in ["-q", "--quiet"] {
+            assert!(Cli::try_parse_from(["coppa", flag, "devices"]).unwrap().quiet);
+            assert!(Cli::try_parse_from(["coppa", "devices", flag]).unwrap().quiet);
+        }
+        for args in [
+            vec!["coppa", "-q", "-v", "devices"],
+            vec!["coppa", "--quiet", "--verbose", "devices"],
+            vec!["coppa", "--verbose", "--quiet", "devices"],
+        ] {
+            assert_eq!(Cli::try_parse_from(args).err().unwrap().kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
     }
 
     #[test]
