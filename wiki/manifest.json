@@ -397,7 +397,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:7c7ad23fa09f0c3845b4f4ab8c9ada3aace5892ac60a4107f275af6c995de901",
+      "hash": "sha256:7163a3fc6b088923b3e2d9392c8d2f4215b3f120c2b85a81327a1019f8afa56f",
       "id": "ldpc-non-convergence",
       "kind": "gotcha",
       "links": [
@@ -410,14 +410,15 @@
       "path": "pages/ldpc-non-convergence.md",
       "sources": [
         "tests/phase_c_loopback.rs",
+        "crates/coppa-bench/src/runner.rs",
         "crates/coppa-protocol/src/fec/ldpc/**",
         "docs/adr/005-nr-bg2-ldpc.md",
         "BENCHMARKS.md"
       ],
       "status": "current",
       "title": "What will bite you about LDPC at speed levels 9 and 10?",
-      "verified_commit": "be2141b",
-      "verified_date": "2026-08-05",
+      "verified_commit": "3cbfd1e",
+      "verified_date": "2026-10-28",
       "visibility": "public"
     },
     {
