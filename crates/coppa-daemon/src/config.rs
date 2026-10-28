@@ -1437,7 +1437,6 @@ beacon_interval_secs = 600
         assert_eq!(config.radio.turnaround_ms, 500);
     }
 
-<<<<<<< HEAD
     // ── COP-49: config discovery ─────────────────────────────────────
 
     /// A uniquely named directory under the system temp dir, removed on drop.
@@ -1499,7 +1498,8 @@ beacon_interval_secs = 600
 
     fn user_candidate(dir: &str) -> PathBuf {
         Path::new(dir).join("coppa").join(CONFIG_FILE_NAME)
-=======
+    }
+
     const GOOD: &str = "0123456789abcdef0123456789abcdef";
 
     /// A config with `[host] websocket_enabled = true` and the given token
@@ -1657,7 +1657,6 @@ beacon_interval_secs = 600
 
         let config: DaemonConfig = toml::from_str(&text).unwrap();
         assert!(!config.host.websocket_enabled);
->>>>>>> 638ee1aeaaea6cc768747857e5021d7f2491f7ad
     }
 
     #[test]
