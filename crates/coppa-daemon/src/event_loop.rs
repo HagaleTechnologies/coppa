@@ -1780,7 +1780,8 @@ impl EventLoop {
 
     /// COP-42: `ABORT`, VARA's dirty disconnect ("Disconnect the link
     /// immediately"), where `DISCONNECT` is the graceful one. Ends the live
-    /// session now: drops its unsent chunks, releases PTT if keyed (the frame
+    /// session now: drops its link (backlog and un-acked frame, COP-38),
+    /// releases PTT if keyed (the frame
     /// on the air is abandoned), removes the session and pushes
     /// `DISCONNECTED`. Sends no DISCONNECT frame: keying one would wait out
     /// the busy-channel courtesy gate. With no live session it does nothing
@@ -1816,7 +1817,7 @@ impl EventLoop {
                 }
             }
             self.try_drain_tx_queue().await;
-            self.drain_session_tx_queue().await;
+            self.drain_session_link().await;
         }
     }
 
@@ -2325,26 +2326,8 @@ impl EventLoop {
                 tracing::info!(client_id, "Disconnect request");
                 self.reply_vara(client_id, VaraResponse::Ok).await;
 
-<<<<<<< HEAD
                 if let Some(id) = self.live_session_id() {
-                    // The session's unsent chunks end with it; none may
-=======
-                // Find first active established session
-                let session_id = self
-                    .session_mgr
-                    .active_sessions()
-                    .iter()
-                    .find(|&&id| {
-                        self.session_mgr
-                            .get(id)
-                            .map(|s| s.state != SessionState::Idle)
-                            .unwrap_or(false)
-                    })
-                    .copied();
-
-                if let Some(id) = session_id {
                     // The session's link ends with it; none of its data may
->>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
                     // play after the host is told DISCONNECTED.
                     self.end_session(id, client_id).await;
                 } else {
@@ -10186,9 +10169,10 @@ mod tests {
             config
         }
 
-        /// Spin up a real `VaraServer` on the given (distinct per test, to avoid
-        /// cross-test port collisions) command/data ports, wire its response
-        /// senders into `event_loop` (mirroring `main.rs`'s
+        /// Spin up a real `VaraServer` on OS-assigned command/data ports
+        /// (`127.0.0.1:0`, so concurrent test runs in separate worktrees can
+        /// never cross-attach), wire its response senders into `event_loop`
+        /// (mirroring `main.rs`'s
         /// `set_vara_responses(vara_server.response_senders())`), start the
         /// server, connect a raw `TcpStream` "mock client" to the command port,
         /// and consume its initial `VERSION ...` greeting. Returns a line reader
@@ -10200,19 +10184,23 @@ mod tests {
         /// response arrives.
         async fn connect_mock_vara_client(
             event_loop: &mut EventLoop,
-            cmd_port: u16,
-            data_port: u16,
         ) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
-            let server = VaraServer::new(cmd_port, data_port);
+            let cmd_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind VARA command port");
+            let data_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind VARA data port");
+            let cmd_addr = cmd_listener.local_addr().expect("command listener address");
+            let server = VaraServer::new(cmd_addr.port(), 0);
             event_loop.set_vara_responses(server.response_senders());
 
             tokio::spawn(async move {
-                let _ = server.run().await;
+                let _ = server.run_with_listeners(cmd_listener, data_listener).await;
             });
-            // Give the server a moment to bind before connecting.
-            tokio::time::sleep(Duration::from_millis(50)).await;
 
-            let stream = TcpStream::connect(("127.0.0.1", cmd_port))
+            // Listeners are already bound, so the connect cannot race the bind.
+            let stream = TcpStream::connect(cmd_addr)
                 .await
                 .expect("mock client should connect to the VARA command port");
             let (read_half, write_half) = stream.into_split();
@@ -10401,7 +10389,7 @@ mod tests {
         #[tokio::test]
         async fn initiator_hears_connected_then_remote_disconnect() {
             let mut station = EventLoop::new(session_config()).unwrap();
-            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19440, 19441).await;
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station).await;
             station
                 .handle_host_event(HostEvent::ConnectRequest {
                     client_id: 1,
@@ -10429,7 +10417,7 @@ mod tests {
         async fn responder_hears_connected_only_after_cfm() {
             let mut station = EventLoop::new(session_config()).unwrap();
             station.listening = true;
-            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19442, 19443).await;
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station).await;
             let mut remote = peer();
             station.handle_mac_pdu(remote.initiate().unwrap()).await;
             assert!(read_available_lines(&mut reader)
@@ -10456,7 +10444,7 @@ mod tests {
             // COP-40: a wideband station declares its band honestly.
             config.radio.band = Some("2m".into());
             let mut station = EventLoop::new(config).unwrap();
-            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19446, 19447).await;
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station).await;
             station
                 .handle_host_event(HostEvent::ConnectRequest {
                     client_id: 1,
@@ -10478,7 +10466,7 @@ mod tests {
         #[tokio::test]
         async fn local_disconnect_timeout_and_failed_connect_push_disconnected() {
             let mut station = EventLoop::new(session_config()).unwrap();
-            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19444, 19445).await;
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station).await;
             seed_established(&mut station);
             station
                 .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
@@ -10523,7 +10511,7 @@ mod tests {
         #[tokio::test]
         async fn abort_ends_an_established_session_with_disconnected_last() {
             let mut station = EventLoop::new(session_config()).unwrap();
-            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19464, 19465).await;
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station).await;
             let id = seed_established(&mut station);
             station
                 .handle_host_event(HostEvent::DataReceived {
@@ -10533,7 +10521,10 @@ mod tests {
                 .await;
             assert!(station.is_transmitting, "the first chunk must be keyed");
             assert!(
-                !station.session_tx_queue.is_empty(),
+                station
+                    .session_link
+                    .as_ref()
+                    .is_some_and(|l| !l.backlog.is_empty()),
                 "the rest of the write must be queued"
             );
             read_available_lines(&mut reader).await;
@@ -10548,12 +10539,15 @@ mod tests {
 
             let lines = trimmed_lines(&mut reader).await;
             assert_eq!(lines.first().map(String::as_str), Some("OK"), "{lines:?}");
+            // COP-38: the keyed frame's bytes are the link's un-acked
+            // segment, so dropping the link reports `BUFFER 0` before the
+            // cut releases PTT.
             assert!(
-                lines.ends_with(&["PTT OFF".into(), "BUFFER 0".into(), "DISCONNECTED".into()]),
+                lines.ends_with(&["BUFFER 0".into(), "PTT OFF".into(), "DISCONNECTED".into()]),
                 "{lines:?}"
             );
             assert!(station.session_mgr.get(id).is_none());
-            assert!(station.session_tx_queue.is_empty());
+            assert!(station.session_link.is_none());
             assert_eq!(station.buffered_tx_bytes(), 0);
             assert!(!station.is_transmitting);
             assert_eq!(station.tx_generation, generation + 1);
@@ -10565,7 +10559,7 @@ mod tests {
         #[tokio::test]
         async fn abort_cuts_the_keyed_frame_and_pushes_disconnected_at_once() {
             let mut station = EventLoop::new(session_config()).unwrap();
-            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19460, 19461).await;
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station).await;
             station
                 .handle_host_event(HostEvent::ConnectRequest {
                     client_id: 1,
@@ -10597,7 +10591,7 @@ mod tests {
         #[tokio::test]
         async fn abort_without_a_session_only_answers_ok() {
             let mut station = EventLoop::new(session_config()).unwrap();
-            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19462, 19463).await;
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station).await;
             station
                 .handle_host_event(HostEvent::VaraCommand {
                     client_id: 1,
@@ -10613,7 +10607,7 @@ mod tests {
         #[tokio::test]
         async fn abort_resumes_traffic_queued_behind_the_cut_frame() {
             let mut station = EventLoop::new(session_config()).unwrap();
-            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19466, 19467).await;
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station).await;
             station
                 .handle_host_event(HostEvent::ConnectRequest {
                     client_id: 1,
@@ -10842,7 +10836,7 @@ mod tests {
             use coppa_host::websocket::FIRST_CLIENT_ID;
             let config = session_config();
             let mut station = EventLoop::new(config).unwrap();
-            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19454, 19455).await;
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station).await;
 
             station
                 .handle_host_event(HostEvent::VaraCommand {
@@ -11034,8 +11028,7 @@ mod tests {
         async fn test_snr_telemetry_emitted_on_decoded_frame() {
             let config = DaemonConfig::default();
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19400, 19401).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
 
             let core = coppa_engine::CoppaCore::new();
             let samples = core
@@ -11154,8 +11147,7 @@ mod tests {
             // Sessionless TX on: the simplest way to make host data key PTT.
             config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19410, 19411).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
             let tx = event_loop.event_sender();
 
             let local = tokio::task::LocalSet::new();
@@ -11228,8 +11220,7 @@ mod tests {
             let mut config = fast_ptt_config();
             config.engine.arq_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19414, 19415).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
 
             // Seed one ARQ segment "sent" long enough ago that its RTO has
             // already elapsed by the time `check_arq_retransmits` runs.
@@ -11289,8 +11280,7 @@ mod tests {
             let mut config = fast_ptt_config();
             config.engine.arq_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19418, 19419).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
 
             // Small max_retransmit(2) and a short initial_rto(20ms) so the
             // whole round trip (seed -> expire -> retransmit -> re-expire ->
@@ -11383,8 +11373,7 @@ mod tests {
         async fn test_session_keepalive_asserts_ptt() {
             let config = fast_ptt_config();
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19416, 19417).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
 
             let local_cs = Callsign::new("VK3ABC").unwrap();
             let remote_cs = Callsign::new("W1AW").unwrap();
@@ -11453,8 +11442,7 @@ mod tests {
             let mut event_loop = EventLoop::new(config).unwrap();
             let (audio_tx, mut audio_rx) = coppa_audio::audio_ring(10_000_000);
             event_loop.set_audio_out(audio_tx);
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19412, 19413).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
             let tx = event_loop.event_sender();
 
             let local = tokio::task::LocalSet::new();
@@ -11548,8 +11536,7 @@ mod tests {
             // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
             config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19490, 19491).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
 
             event_loop.is_transmitting = true;
             event_loop
@@ -11623,8 +11610,7 @@ mod tests {
             // COP-29: these exercise the sessionless raw/ARQ path, now opt-in.
             config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19492, 19493).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
 
             event_loop
                 .handle_host_event(HostEvent::DataReceived {
@@ -11693,8 +11679,7 @@ mod tests {
         #[tokio::test]
         async fn test_session_path_emits_buffer_and_drains_on_peer_ack() {
             let mut event_loop = EventLoop::new(session_config()).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19494, 19495).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
             seed_established(&mut event_loop);
 
             event_loop
@@ -11752,8 +11737,7 @@ mod tests {
         #[tokio::test]
         async fn session_buffer_falls_on_peer_ack_not_on_ptt_release() {
             let mut event_loop = EventLoop::new(session_config()).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19560, 19561).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
             seed_established(&mut event_loop);
             event_loop
                 .handle_host_event(HostEvent::DataReceived {
@@ -12185,8 +12169,7 @@ mod tests {
             // COP-29: these exercise the sessionless raw/ARQ path, now opt-in.
             config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19496, 19497).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
 
             event_loop.is_transmitting = true;
             for i in 0..9u8 {
@@ -12333,21 +12316,13 @@ mod tests {
             assert_eq!((link.backlog.len(), link.tx.in_flight()), (0, 1));
         }
 
-<<<<<<< HEAD
-        /// A session's unsent chunks die with the session (COP-41 review):
-        /// after a local DISCONNECT, an ABORT (COP-42), a remote DISCONNECT,
-        /// or a timeout, the queue holds none of its chunks, `BUFFER` stops
-        /// counting them, and the next PTT release keys nothing -- before
-        /// this, the queue kept transmitting the dead session's data on
-        /// every release.
-=======
         /// A session's unsent data dies with the session (COP-41 review):
-        /// after a local DISCONNECT, a remote DISCONNECT, or a timeout, the
-        /// session link is gone (COP-38: its backlog and its un-acked frame
-        /// both), `BUFFER` stops counting them, and neither the next PTT
-        /// release nor an elapsed RTO keys anything -- before this, the queue
-        /// kept transmitting the dead session's data on every release.
->>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
+        /// after a local DISCONNECT, an ABORT (COP-42), a remote DISCONNECT,
+        /// or a timeout, the session link is gone (COP-38: its backlog and
+        /// its un-acked frame both), `BUFFER` stops counting them, and
+        /// neither the next PTT release nor an elapsed RTO keys anything --
+        /// before this, the queue kept transmitting the dead session's data
+        /// on every release.
         #[tokio::test]
         async fn ended_session_discards_its_unsent_chunks() {
             #[derive(Debug, Clone, Copy)]
@@ -12548,8 +12523,7 @@ mod tests {
             // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
             config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19500, 19501).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
 
             let mut seed: u32 = 0xB2_F2_00_2D;
             let data: Vec<u8> = (0..2000)
@@ -12693,8 +12667,7 @@ mod tests {
             // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
             config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19502, 19503).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
             event_loop.is_transmitting = true;
 
             let data: Vec<u8> = (0..8000).map(|i| ((i * 31 + 7) % 251) as u8).collect();
@@ -12796,8 +12769,7 @@ mod tests {
             // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
             config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19504, 19505).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
             let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
             event_loop.set_audio_out(producer);
 
@@ -12843,8 +12815,7 @@ mod tests {
         async fn test_busy_telemetry_on_then_off_from_noise_burst() {
             let config = DaemonConfig::default();
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19430, 19431).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
 
             // Deterministic PRNG (no external `rand` dependency needed here).
             let mut seed: u32 = 12345;
