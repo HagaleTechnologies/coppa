@@ -11,6 +11,21 @@ use crate::playout::{fill_output, CallbackState, PlaybackProgress, ProgressShare
 use crate::ringbuf::{audio_ring, AudioRingConsumer, AudioRingProducer};
 use crate::{AudioDevice, AudioSink, AudioSource};
 
+/// A device's own name and cpal id as the host reports them, e.g.
+/// `Default Audio Device (alsa:default)`; either part is `unknown` when the
+/// host cannot say.
+fn name_of(device: &cpal::Device) -> String {
+    let name = device
+        .description()
+        .map(|d| d.name().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let id = device
+        .id()
+        .map(|id| id.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    format!("{name} ({id})")
+}
+
 /// List audio devices via CPAL.
 pub fn list_cpal_devices() -> Result<Vec<AudioDevice>> {
     let host = cpal::default_host();
@@ -131,6 +146,12 @@ pub struct CpalSink {
 }
 
 impl CpalSource {
+    /// The opened device's name and cpal id (see `name_of`), also for the
+    /// default device, e.g. `Default Audio Device (alsa:default)`.
+    pub fn device_name(&self) -> String {
+        name_of(&self.device)
+    }
+
     /// Create a new CPAL source using the default input device.
     ///
     /// You must call `start()` before `read()` will return any data.
@@ -228,6 +249,12 @@ impl AudioSource for CpalSource {
 }
 
 impl CpalSink {
+    /// The opened device's name and cpal id (see `name_of`), also for the
+    /// default device, e.g. `Default Audio Device (alsa:default)`.
+    pub fn device_name(&self) -> String {
+        name_of(&self.device)
+    }
+
     /// Create a new CPAL sink using the default output device.
     ///
     /// You must call `start()` before `write()` will output audio.
