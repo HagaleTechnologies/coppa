@@ -87,7 +87,9 @@ cargo run -p coppa-cli --bin coppa --features cpal-backend -- devices
 cargo run -p coppa-cli --bin coppa --features cpal-backend -- devices --json
 ```
 
-<<<<<<< HEAD
+`devices --json` writes a single array, including `[]` when no devices are
+listed.
+
 ## Checking Your Station (coppa doctor)
 
 Build with live audio support, then run the station check before transmitting:
@@ -118,10 +120,6 @@ never keyed.
 **What doctor does not check:** audio levels or ALC, whether audio reaches the
 radio, whether PTT actually keys, VOX/serial/GPIO PTT, or `coppad.toml`
 settings. Follow [the operating guide](../OPERATING.md) for those checks.
-=======
-`devices --json` writes a single array, including `[]` when no devices are
-listed.
->>>>>>> 5525bb62613a9205daa10e963538bb720e800563
 
 ## Receiving Live Audio
 

@@ -300,19 +300,15 @@ enum Commands {
         band: Option<String>,
     },
     /// List available audio devices.
-<<<<<<< HEAD
-    Devices,
-    /// Check audio devices and rig control without transmitting.
-    Doctor(doctor::DoctorArgs),
-=======
     Devices {
         /// Emit a JSON array of audio devices.
         #[arg(long)]
         json: bool,
     },
+    /// Check audio devices and rig control without transmitting.
+    Doctor(doctor::DoctorArgs),
     /// List operating profiles or show one profile.
     Profiles(ProfilesArgs),
->>>>>>> 5525bb62613a9205daa10e963538bb720e800563
     /// Show current configuration.
     Config {
         /// Profile name to show.
@@ -446,13 +442,9 @@ fn main() -> Result<()> {
             band.as_deref(),
             verbosity,
         )?,
-<<<<<<< HEAD
-        Some(Commands::Devices) => cmd_devices()?,
-        Some(Commands::Doctor(args)) => doctor::cmd_doctor(&args)?,
-=======
         Some(Commands::Devices { json }) => cmd_devices(json)?,
+        Some(Commands::Doctor(args)) => doctor::cmd_doctor(&args)?,
         Some(Commands::Profiles(args)) => cmd_profiles(args.profile.as_deref(), args.json)?,
->>>>>>> 5525bb62613a9205daa10e963538bb720e800563
         Some(Commands::Config { profile }) => cmd_config(profile.as_deref())?,
         #[cfg(feature = "kiss-tnc")]
         Some(Commands::Tnc {
