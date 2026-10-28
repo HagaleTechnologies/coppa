@@ -114,6 +114,11 @@ cargo run -p coppa-daemon --bin coppad
 cargo run -p coppa-daemon --bin coppad -- --config my_config.toml
 ```
 
+For live audio (a radio, or Winlink with Pat), build `coppad` with `--release`
+and `--features cpal-backend`: a debug build decodes too slowly to keep up
+with real-time audio. [docs/PAT.md](../PAT.md) walks through a Winlink
+session with Pat.
+
 Without a config argument, `coppad` loads `./coppad.toml` if it exists and
 otherwise runs on built-in defaults. A path you name with `--config` (or with
 the older positional form, `coppad my_config.toml`, which still works) must
