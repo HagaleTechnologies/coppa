@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-26T08:02:02Z",
-  "head_commit": "8857be8",
+  "generated_at": "2026-10-28T09:42:11Z",
+  "head_commit": "b5144e3",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -219,6 +219,28 @@
       "title": "What band and sample-rate conventions does coppa use?",
       "verified_commit": "c1d2676",
       "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:9bd2a246313cba83361f290f438daa8cd882616d0cec880bf0be39aff794efea",
+      "id": "cli-settings",
+      "kind": "gotcha",
+      "links": [],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/cli-settings.md",
+      "sources": [
+        "crates/coppa-cli/src/settings.rs",
+        "crates/coppa-cli/src/main.rs",
+        "crates/coppa-daemon/src/config.rs",
+        "crates/coppa-radio/src/band.rs",
+        "coppad.toml.example",
+        "docs/tutorials/getting-started.md"
+      ],
+      "status": "current",
+      "title": "What will bite you when persisting coppa CLI settings?",
+      "verified_commit": "b5144e3",
+      "verified_date": "2026-10-28",
       "visibility": "public"
     },
     {
