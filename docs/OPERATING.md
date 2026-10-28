@@ -61,7 +61,8 @@ across all carriers at once and wrecks decode on every one of them.
 2. Set your radio's ALC display or meter where you can see it, and back your
    transmit audio (your sound card's output level in the OS mixer; Coppa
    itself has no TX gain setting) all the way down.
-3. Key the calibration tone: `coppa tune` from the CLI (default 10 seconds,
+3. Key the calibration tone: `coppa tune` from the CLI (device and PTT settings
+   come from the same `coppad.toml`; default 10 seconds,
    `--seconds N` to change it), or `TUNE` (or `TUNE <seconds>`) on the daemon's
    VARA command port. This transmits a standard two-tone signal (700 Hz +
    1900 Hz, equal amplitude) — the same drive-level convention hams use for

@@ -78,6 +78,8 @@ coppa -q rx cq.wav
 coppa -vv rx cq.wav
 ```
 
+`coppa` can keep callsign, profile, audio device and rig settings in the same `coppad.toml` as the daemon, with `COPPA_*` environment and flag overrides; see [CLI settings](docs/tutorials/getting-started.md#persisting-your-cli-settings).
+
 `rx --json` writes newline-delimited objects with `payload_text` and exact
 `payload_hex` bytes. `payload_text` is `null` for binary payloads. Diagnostics
 go to stderr. `--json` conflicts with `--raw` and `--hex`; `-q`/`--quiet`

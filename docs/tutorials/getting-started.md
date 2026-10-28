@@ -107,6 +107,20 @@ stderr. Use `-q` to suppress status output, or `-v` for diagnostics. Repeat
 `-v` as `-vv` for recommended speed level and delay spread per decoded frame;
 quiet and verbose flags conflict.
 
+## Persisting your CLI settings
+
+`coppa tx`, `tune`, `rx`, and `loopback` read the same `coppad.toml` as the daemon.
+They search the current directory, your Coppa user config directory, then the
+system config path in the order listed in [Running the Daemon](#running-the-daemon).
+Use `coppa --config PATH` or `COPPA_CONFIG=PATH` to select one file explicitly.
+A flag wins over its `COPPA_*` environment variable, which wins over the file;
+`--verbose` shows each selected value and where it came from. See
+`coppa tx --help` for the variable and TOML key names.
+
+A copied `coppad.toml.example` sets `profile = "HF_STANDARD"`. That changes the
+CLI's waveform from its built-in no-file default. Set the same profile on the
+peer, including when decoding a WAV file, or the payload may not decode.
+
 ## Viewing Operating Profiles
 
 ```bash
@@ -143,12 +157,24 @@ and `--features cpal-backend`: a debug build decodes too slowly to keep up
 with real-time audio. [docs/PAT.md](../PAT.md) walks through a Winlink
 session with Pat.
 
-Without a config argument, `coppad` loads `./coppad.toml` if it exists and
-otherwise runs on built-in defaults. A path you name with `--config` (or with
-the older positional form, `coppad my_config.toml`, which still works) must
-exist: a missing or unreadable file is an error that names the path, not a
-silent fallback to defaults. An existing `./coppad.toml` that fails to parse
-is an error too.
+Without a config argument, `coppad` uses the first of these files that
+exists, and otherwise runs on built-in defaults:
+
+1. `coppad.toml` in the current directory;
+2. `$XDG_CONFIG_HOME/coppa/coppad.toml`, or `~/.config/coppa/coppad.toml` when
+   `XDG_CONFIG_HOME` is unset or not an absolute path (an empty or relative
+   `HOME` skips this entry; `%APPDATA%\coppa\coppad.toml` on Windows);
+3. `/etc/coppa/coppad.toml` (not on Windows).
+
+It never merges files. At startup it logs `Using configuration file` with the
+path it chose, or a warning listing every path it searched when it found none;
+without a config argument, `coppad --check` prints the same information as its
+first line. A path you
+name with `--config` (or with the older positional form,
+`coppad my_config.toml`, which still works) must exist and is the only file
+read: a missing or unreadable file is an error that names the path, not a
+silent fallback to defaults. A file the search finds that fails to parse is an
+error too, naming that file.
 
 To start from the built-in defaults, print them as TOML, edit the copy, and
 check it before running:
