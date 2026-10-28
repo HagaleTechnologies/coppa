@@ -187,6 +187,40 @@ independent of the `spectrum` stream.
 | `duration_ms` | Audio span the reading covers |
 | `timestamp_ms` | Wall-clock time the message was sent (Unix epoch, ms) |
 
+## Connected sessions: delivery and BUFFER
+
+Data a host writes during a connected session (`CONNECT` from a VARA-style
+host such as Pat) is acknowledged and, if lost, sent again. The other
+station's host gets every byte once, in order.
+
+- `BUFFER` counts bytes the other station has not yet acknowledged. It falls
+  when the other station's ACK arrives, not when PTT releases.
+- The receiving station keys briefly after each data frame to send its ACK,
+  so its host sees `PTT ON` / `PTT OFF` for every frame it receives.
+- One frame is in flight at a time: the sender waits for the ACK before it
+  sends the next frame. On a clean HF link this carries about 60% of what an
+  unacknowledged stream did; on a link that loses frames it is the only mode
+  that delivers the data intact.
+- A frame that is still unacknowledged after 5 retransmissions ends the
+  session: coppad sends DISCONNECT to the other station, reports `BUFFER 0`
+  and then `DISCONNECTED`. On a link that has gone completely silent this
+  takes about 3 minutes.
+- coppad holds one session at a time. While a session exists (connecting or
+  connected), every `CONNECT_REQ`, including a repeat from the station already
+  in the session, gets no answer, so that station's connect attempt times out.
+  A host `CONNECT` is answered `DISCONNECTED`, to the dialling host only. Send
+  `DISCONNECT` to end the current session before dialling again. A session
+  nobody ends blocks every caller: an idle connected session does not time
+  out, so a listening station whose peer vanished refuses callers until its
+  host sends `DISCONNECT`.
+- `[engine] arq_enabled` does not affect connected sessions; it only enables
+  ARQ for sessionless traffic (`[host] sessionless_tx_enabled`).
+- Both stations must run coppad 0.3.0 or later. An older station cannot
+  decode this session format: its host receives extra header bytes in the
+  data, it never acknowledges, and the newer station disconnects after the
+  retry budget. coppad logs `Session data frame is not a reliable transport
+  PDU` when an older station sends to it.
+
 ## Half-duplex turnaround
 
 A half-duplex rig cannot receive while it is keyed, and a station that has just
@@ -224,10 +258,12 @@ time:
 The key lives in `[radio]`. A `turnaround_ms` under `[session]` (from older
 example configs) has never been read.
 
-Known gap: the hold is receive-side. A station with several ARQ segments
-queued re-keys for the next one the moment its own PTT releases, so the
-other station's ACK can still collide with that next frame. Sender-side turn
-discipline is a separate follow-up. The hardware acceptance test for this
+Known gap: the hold is receive-side. Connected sessions avoid the collision
+by running one frame at a time: the sender waits for the ACK before it keys
+the next frame (COP-38). Sessionless ARQ (`arq_enabled`, window 8) still has
+the gap: a station with several ARQ segments queued re-keys for the next one
+the moment its own PTT releases, so the other station's ACK can still collide
+with that next frame. Sender-side turn discipline is a separate follow-up. The hardware acceptance test for this
 behaviour is `docs/testing/cable-loop-turnaround.md`.
 
 ## Ending a session (DISCONNECT)

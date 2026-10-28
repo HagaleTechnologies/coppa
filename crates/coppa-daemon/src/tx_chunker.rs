@@ -18,7 +18,9 @@
 
 /// Split `data` into chunks that each satisfy `fits` when framed with
 /// `header_len` overhead against `budget`. Optimistic target first
-/// (`budget - header_len - 1`), halved while the framed chunk doesn't fit.
+/// (`budget - header_len - 1`), halved while the framed chunk doesn't fit,
+/// then bisected between the last rejected and the accepted length so each
+/// chunk is the largest prefix `fits` accepts (COP-38, [`next_chunk_len`]).
 /// A one-byte chunk that still doesn't fit is returned as-is (callers'
 /// encode-failure warn covers it); unreachable for the current ladder, where
 /// a 1-host-byte PDU fits even the ladder-minimum budget. Empty input yields
@@ -33,21 +35,55 @@ pub fn chunk_to_fit(
     if data.is_empty() {
         return chunks;
     }
-    // Optimistic target: leave room for `header_len` framing bytes plus one
-    // byte of margin, never less than 1 (a 1-byte chunk terminates the
-    // halving loop; see the doc above).
-    let optimistic = budget.saturating_sub(header_len + 1).max(1);
     let mut rest = data;
     while !rest.is_empty() {
-        let mut target = optimistic.min(rest.len());
-        while target > 1 && !fits(&rest[..target]) {
-            target /= 2;
-        }
-        let take = target.max(1);
+        let take = next_chunk_len(rest, header_len, budget, &fits);
         chunks.push(rest[..take].to_vec());
         rest = &rest[take..];
     }
     chunks
+}
+
+/// Length of the first chunk [`chunk_to_fit`] would cut from `rest` (`rest`
+/// non-empty): the optimistic target, halved while `fits` rejects it, then
+/// bisected between the last rejected and the accepted length so the chunk is
+/// the largest prefix `fits` accepts (for a monotone `fits`; COP-38). Never a
+/// length `fits` rejected, except the 1-byte fallback. The COP-38 session
+/// drain uses it to cut one chunk from its backlog without chunking the rest.
+pub fn next_chunk_len(
+    rest: &[u8],
+    header_len: usize,
+    budget: usize,
+    fits: impl Fn(&[u8]) -> bool,
+) -> usize {
+    // Optimistic target: leave room for `header_len` framing bytes plus one
+    // byte of margin, never less than 1 (a 1-byte chunk terminates the
+    // halving loop; see `chunk_to_fit`'s doc).
+    let optimistic = budget.saturating_sub(header_len + 1).max(1);
+    let mut target = optimistic.min(rest.len());
+    let mut rejected = None;
+    while target > 1 && !fits(&rest[..target]) {
+        rejected = Some(target);
+        target /= 2;
+    }
+    if let Some(mut hi) = rejected {
+        // Halving stopped at `target`; one rejection can waste nearly half a
+        // frame, so search (target, hi) for the largest accepted prefix. A
+        // 1-byte `target` that `fits` rejects is the fallback: keep it.
+        let mut lo = target;
+        if lo > 1 || fits(&rest[..lo]) {
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                if fits(&rest[..mid]) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            target = lo;
+        }
+    }
+    target.max(1)
 }
 
 #[cfg(test)]
@@ -116,6 +152,43 @@ mod tests {
         let data = vec![3u8; 99];
         let chunks = chunk_to_fit(&data, 0, 100, fits_up_to(100));
         assert_eq!(chunks, vec![data]);
+    }
+
+    #[test]
+    fn a_rejected_target_is_refined_to_the_largest_fitting_prefix() {
+        // budget 100, header 0 -> optimistic 99 is rejected; halving alone stops
+        // at 49 (accepted). Bisection between 49 and 99 finds 70, the largest
+        // prefix `fits` accepts. Halving only gave [49, 49, 49, 49, 49, 49, 6].
+        let data = vec![4u8; 300];
+        let lens: Vec<usize> = chunk_to_fit(&data, 0, 100, fits_up_to(70))
+            .iter()
+            .map(Vec::len)
+            .collect();
+        assert_eq!(lens, vec![70, 70, 70, 70, 20]);
+    }
+
+    #[test]
+    fn next_chunk_len_is_the_first_chunk_of_chunk_to_fit() {
+        let data: Vec<u8> = (0..300).map(|i| i as u8).collect();
+        for max in [1usize, 10, 49, 50, 70, 99, 200] {
+            let first = chunk_to_fit(&data, 0, 100, fits_up_to(max))[0].len();
+            assert_eq!(
+                next_chunk_len(&data, 0, 100, fits_up_to(max)),
+                first,
+                "max={max}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_monotone_fits_still_only_yields_accepted_chunks() {
+        // Compression can make `fits` non-monotone in prefix length. Bisection
+        // may then miss the true maximum (here 64) but must never return a
+        // length `fits` rejected.
+        let fits = |c: &[u8]| c.len() <= 30 || (60..=64).contains(&c.len());
+        for chunk in chunk_to_fit(&[0u8; 500], 0, 100, fits) {
+            assert!(fits(&chunk), "{} bytes", chunk.len());
+        }
     }
 
     /// Property-style check across sizes and header lengths: concatenating

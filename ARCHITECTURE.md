@@ -212,7 +212,7 @@ These components still compile and have tests, but no production TX or RX path c
 - The OFDM transceiver runs end to end through `CoppaCore`, `coppad`, the C FFI and the CLI, at nine speed levels (1–8 on HF, 1–9 on VHF), with runtime speed-level changes through `set_speed_level`
 - Payload FEC is one shared NR BG2 LDPC mother code, rate-matched per speed level; the frame header is soft-decoded Golay(24,12) + CRC-16
 - The streaming receiver corrects carrier-frequency offset up to ±50 Hz, tracks sample-clock offset within each frame, and runs one turbo re-estimation round when LDPC does not converge
-- Selective-repeat ARQ for no-session data (`arq_enabled`), closed-loop rate control from ACK-carried recommendations, and a CP negotiation handshake (off by default)
+- Selective-repeat ARQ for connected-session data (always, stop-and-wait; COP-38) and for no-session data (`arq_enabled`), closed-loop rate control from ACK-carried recommendations, and a CP negotiation handshake (off by default)
 - Huffman + LZ4 compression; binary payloads through `encode_bytes`/`decode_bytes`
 - Host interfaces: VARA-style TCP, a WebSocket JSON server, and KISS over TCP for the AFSK 1200 TNC mode
 - Radio control: rigctld CAT, plus serial, GPIO and VOX PTT
@@ -223,7 +223,7 @@ These components still compile and have tests, but no production TX or RX path c
 
 - Carrier-frequency-offset pull-in is ±50 Hz; sample-clock offset is tracked within each frame only.
 - IR-HARQ is an unwired codec primitive: `CoppaTransceiver` supports redundancy versions and LLR combining, but `CoppaCore` always sends rv 0 and seq 0, and no engine or daemon path calls `rv_for_attempt`. The receive side still combines: a single-codeword frame's LLRs are added into the accumulator for its header `seq_num`, and only a CRC-verified decode, LRU overflow or a transceiver rebuild clears it. Because every `CoppaCore` frame carries seq 0, the LLRs of a frame whose LDPC decode or CRC check fails are added into the next frame's decode.
-- Data inside an established session is sent as a `MacPdu` without ARQ: selective-repeat `ArqTx`/`ArqRx` covers the no-session data path (when `arq_enabled`) and CP-control PDUs only.
+- Connected-session data runs stop-and-wait (one frame in flight, one ACK per frame) because the turnaround hold is receive-side only; a burst/block-ACK design is not implemented.
 - No peer speed negotiation: the receiver's recommended level rides on each ACK, and the sender's `RateLoop` applies it on its own; `RateLoop` misses its own benchmark bar ([BENCHMARKS.md](BENCHMARKS.md)). Session connect exchanges `LinkCapabilities`, which include an `mcs_index`, but nothing applies the negotiated result.
 - One ACK per decoded frame (block-ACK batching was considered and not chosen); multi-codeword frames retransmit whole, with no per-codeword ACK (ADR-007).
 - Short-CP recommendation (`cp_gate_enabled`) and CP negotiation (`cp_negotiation_enabled`) default off.

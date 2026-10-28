@@ -6,7 +6,7 @@ use std::path::Path;
 
 /// Top-level daemon configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
     /// Audio subsystem configuration.
     pub audio: AudioConfig,
@@ -23,7 +23,7 @@ pub struct DaemonConfig {
 
 /// Audio configuration section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AudioConfig {
     /// Input device name (empty = default).
     pub input_device: String,
@@ -31,13 +31,13 @@ pub struct AudioConfig {
     pub output_device: String,
     /// Sample rate in Hz.
     pub sample_rate: u32,
-    /// Ring buffer size in samples.
+    /// Ring buffer size in samples; must be greater than 0.
     pub buffer_size: usize,
 }
 
 /// Radio control configuration section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RadioConfig {
     /// PTT method/config string. Either a simple backend name --
     /// `"none"`, `"vox"`, `"rigctld"` -- for backward compatibility, or an
@@ -214,7 +214,7 @@ impl RadioConfig {
 
 /// Host interface configuration section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct HostConfig {
     /// Address all host servers bind to. Defaults to "127.0.0.1" (loopback only).
     ///
@@ -240,7 +240,7 @@ pub struct HostConfig {
 
 /// Engine configuration section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct EngineSection {
     /// Operational profile name.
     pub profile: String,
@@ -256,7 +256,10 @@ pub struct EngineSection {
     /// validation beyond being a plain string -- this is an operator-supplied
     /// field, not a parsed/validated grid square.
     pub grid: Option<String>,
-    /// Enable ARQ (Automatic Repeat reQuest) transport layer.
+    /// Enable selective-repeat ARQ for sessionless traffic (raw data-port or
+    /// WebSocket bytes sent with `[host] sessionless_tx_enabled`). Data inside a
+    /// connected session is always acknowledged and retransmitted (COP-38),
+    /// whatever this is set to.
     pub arq_enabled: bool,
     /// Frames between `coppa_ml::RateLoop` active overshoot probes (see
     /// `RateLoop::with_probing`). `0` (the default) disables probing entirely --
@@ -357,7 +360,7 @@ pub struct EngineSection {
 /// `[engine] callsign` to be set (see `EngineSection::callsign`'s doc) --
 /// there is no meaningful "identify" or "beacon" transmission without one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StationIdConfig {
     /// Busy-channel gate: once a TX request finds the channel busy (via
     /// `coppa_ml::BusyGate`), the poll interval (ms) used while waiting for
@@ -502,6 +505,35 @@ impl DaemonConfig {
                 }
             }
         }
+    }
+
+    /// COP-36: `[engine] profile` must name a built-in profile
+    /// (case-insensitive). `EventLoop::new` would otherwise build a
+    /// level-derived engine from the typo with no warning. Checked by run mode
+    /// before any hardware is touched; `--check` does not call it.
+    pub fn check_profile(&self) -> Result<(), String> {
+        if coppa_engine::profiles::get_profile(&self.engine.profile).is_some() {
+            return Ok(());
+        }
+        Err(format!(
+            "[engine] profile = \"{}\" is not a known profile; use one of: {}",
+            self.engine.profile,
+            coppa_engine::profiles::list_profiles().join(", ")
+        ))
+    }
+
+    /// COP-36: `[audio] buffer_size` sizes the RX and TX audio rings, and a
+    /// zero-capacity ring silently drops every sample. Checked by run mode
+    /// before any hardware is touched; `--check` does not call it.
+    pub fn check_buffer_size(&self) -> Result<(), String> {
+        if self.audio.buffer_size > 0 {
+            return Ok(());
+        }
+        Err(format!(
+            "[audio] buffer_size = 0 is not supported: a zero-sample ring buffer drops \
+             all audio; set buffer_size = {}",
+            AudioConfig::default().buffer_size
+        ))
     }
 
     /// COP-32: `[audio] sample_rate` must equal the configured profile's
@@ -1056,5 +1088,79 @@ beacon_interval_secs = 600
         assert_eq!(config.check_sample_rate(), Ok(()));
         config.audio.sample_rate = 96_000;
         assert!(config.check_sample_rate().is_err());
+    }
+
+    #[test]
+    fn an_unknown_key_in_a_section_is_a_parse_error_naming_it() {
+        let err = toml::from_str::<DaemonConfig>("[engine]\ncalsign = \"W5AU\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field `calsign`"), "{err}");
+        assert!(err.contains("`callsign`"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_table_or_top_level_key_is_a_parse_error_naming_it() {
+        let err = toml::from_str::<DaemonConfig>("[radoi]\nptt_method = \"rigctld\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field `radoi`"), "{err}");
+        assert!(err.contains("`radio`"), "{err}");
+
+        let err = toml::from_str::<DaemonConfig>("top_level_extra = 1\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field `top_level_extra`"), "{err}");
+    }
+
+    #[test]
+    fn every_section_rejects_unknown_keys() {
+        for section in ["audio", "radio", "host", "engine", "station_id"] {
+            let err = toml::from_str::<DaemonConfig>(&format!("[{section}]\nnot_a_key = 1\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("unknown field `not_a_key`"),
+                "[{section}]: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_profile_accepts_every_built_in_name_case_insensitively() {
+        let mut config = DaemonConfig::default();
+        for name in coppa_engine::profiles::list_profiles() {
+            config.engine.profile = (*name).to_string();
+            assert_eq!(config.check_profile(), Ok(()), "{name}");
+        }
+        config.engine.profile = "hf_standard".into();
+        assert_eq!(config.check_profile(), Ok(()));
+    }
+
+    #[test]
+    fn check_profile_rejects_an_unknown_name_listing_the_valid_ones() {
+        let mut config = DaemonConfig::default();
+        config.engine.profile = "HF_STANDRD".into();
+        let err = config.check_profile().unwrap_err();
+        assert!(
+            err.starts_with("[engine] profile = \"HF_STANDRD\" is not a known profile"),
+            "{err}"
+        );
+        for name in ["HF_ROBUST", "HF_STANDARD", "VHF_FAST", "EMERGENCY"] {
+            assert!(err.contains(name), "{name} missing: {err}");
+        }
+    }
+
+    #[test]
+    fn check_buffer_size_rejects_zero_and_accepts_the_default() {
+        let mut config = DaemonConfig::default();
+        assert_eq!(config.check_buffer_size(), Ok(()));
+        config.audio.buffer_size = 0;
+        let err = config.check_buffer_size().unwrap_err();
+        assert!(
+            err.starts_with("[audio] buffer_size = 0 is not supported"),
+            "{err}"
+        );
+        assert!(err.contains("set buffer_size = 8192"), "{err}");
     }
 }

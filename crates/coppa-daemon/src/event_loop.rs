@@ -30,7 +30,7 @@ use crate::audio_output::{
 };
 use crate::config::DaemonConfig;
 use crate::level_meter::{self, LevelReading, LevelState, RxLevelMeter};
-use crate::tx_chunker::chunk_to_fit;
+use crate::tx_chunker::{chunk_to_fit, next_chunk_len};
 
 /// Map of connected VARA command-port clients' response senders
 /// (`VaraServer::response_senders()`), used to broadcast `VaraResponse` telemetry.
@@ -73,17 +73,62 @@ fn min_level_budget() -> usize {
         .expect("every wire level 1..=9 has a payload budget (speed_levels.rs)")
 }
 
-/// One chunked piece of an established-session host write (COP-41): the
-/// fully-framed `MacPdu` bytes ready for `encode_bytes`, plus the host
-/// payload bytes it carries -- `BUFFER` counts the unit the host wrote, not
-/// framing (COP-30).
-struct SessionTxChunk {
-    /// The `SessionManager` slot the chunk was framed for. Slots are reused,
-    /// so a session's end must discard its chunks (`discard_session_tx`)
-    /// rather than leave them for whichever session takes the slot next.
+/// COP-38 (D4): connected-session data runs stop-and-wait. One ACK per frame
+/// and a receive-side-only turnaround hold (docs/OPERATING.md, "Half-duplex
+/// turnaround") make a second in-flight frame collide with the peer's ACK.
+const SESSION_ARQ_WINDOW: u8 = 1;
+
+/// COP-38 (D2): the established session's reliable-delivery state. One per
+/// `EventLoop`: every daemon caller treats the session link as singular.
+struct SessionLink {
+    /// The `SessionManager` slot the link belongs to. Slots are reused, so a
+    /// session's end drops its link (`discard_session_tx`) rather than leave
+    /// it for whichever session takes the slot next.
     session_id: u8,
-    pdu_bytes: Vec<u8>,
-    host_len: usize,
+    remote: Callsign,
+    local: Callsign,
+    ssid: u8,
+    tx: ArqTx,
+    rx: ArqRx,
+    /// Host bytes not yet cut into a segment. Chunked at drain time with the
+    /// exact seq that will carry them (D5).
+    backlog: VecDeque<u8>,
+    /// Armed once the in-flight segment has used its last retransmission;
+    /// the link fails if no ACK arrives by then (D7).
+    give_up_at: Option<Instant>,
+    /// One warning per link for a payload that is not a reliable
+    /// `TransportPdu`, i.e. a pre-0.3.0 peer (D3).
+    warned_legacy_payload: bool,
+}
+
+/// COP-38 (D3): one session data frame. The ACK fields stay zero so a
+/// retransmission is byte-identical and keeps the size `next_chunk_len`
+/// measured; the transport `session_id` is 0 because session ids are local
+/// slot numbers that differ between the two stations.
+fn session_data_frame(link: &SessionLink, seq: u8, data: &[u8]) -> Vec<u8> {
+    let segment = TransportPdu::new_reliable(0, seq, 0, data.to_vec());
+    MacPdu::new_data(
+        link.remote.clone(),
+        link.local.clone(),
+        link.ssid,
+        segment.to_bytes(),
+    )
+    .to_bytes()
+}
+
+/// COP-38 (D3): the session ACK frame for everything `link.rx` holds, a MAC
+/// `Ack` frame carrying a transport ACK.
+fn session_ack_frame(link: &SessionLink) -> Vec<u8> {
+    let (ack_num, bitmap) = link.rx.ack_info();
+    let ack = TransportPdu::new_ack(0, ack_num, bitmap);
+    MacPdu::new(
+        MacFrameType::Ack,
+        link.remote.clone(),
+        link.local.clone(),
+        link.ssid,
+        ack.to_bytes(),
+    )
+    .to_bytes()
 }
 
 /// A host `DISCONNECT` waiting for its session's queued chunks to play
@@ -294,8 +339,8 @@ pub struct EventLoop {
     /// while it is set, so held payloads go out once the rig is back on a
     /// legal frequency instead of waiting for the next host enqueue.
     tx_held_by_frequency_gate: bool,
-    /// COP-41: `tx_held_by_frequency_gate`'s counterpart for
-    /// `session_tx_queue`, set by `drain_session_tx_queue` and retried by
+    /// COP-41: `tx_held_by_frequency_gate`'s counterpart for the session
+    /// link's backlog (COP-38), set by `drain_session_link` and retried by
     /// the same poll.
     session_tx_held_by_frequency_gate: bool,
     /// Optional sender for host responses (decoded data, status updates).
@@ -413,19 +458,23 @@ pub struct EventLoop {
     /// candidates). Its `None`-tagged entries count toward `BUFFER`
     /// telemetry; see `buffered_tx_bytes`.
     tx_queue: VecDeque<(Option<u8>, Vec<u8>)>,
-    /// Established-session data chunks waiting for their keyed interval
-    /// (COP-41): every `HostEvent::DataReceived` on a live session is split
-    /// into pieces that each encode at the engine's current speed level, and
-    /// this queue paces them ONE FRAME PER KEYED INTERVAL -- drained by a
-    /// single pop in `drain_session_tx_queue` from PTT release (the same
-    /// convention as `try_drain_tx_queue`), never as one long keyed blast,
-    /// which the 30 s `max_tx_duration_s` watchdog would cancel mid-message.
-    /// `host_len` terms count toward `BUFFER` telemetry; see
+    /// The established session's reliable link (COP-38): host bytes waiting
+    /// to be cut into frames, the stop-and-wait `ArqTx`/`ArqRx` pair, and the
+    /// give-up deadline. `None` with no established session. Every
+    /// `HostEvent::DataReceived` on a live session appends to its backlog;
+    /// `drain_session_link` sends one frame at a time, and only after the
+    /// previous one is ACKed, so frames never form one long keyed blast the
+    /// 30 s `max_tx_duration_s` watchdog would cancel mid-message. Backlog
+    /// and unacknowledged bytes count toward `BUFFER`; see
     /// `buffered_tx_bytes`.
+<<<<<<< HEAD
     session_tx_queue: VecDeque<SessionTxChunk>,
     /// A host `DISCONNECT` waiting for `session_tx_queue` to drain (COP-43).
     /// See `finish_drained_disconnect`.
     pending_disconnect: Option<PendingDisconnect>,
+=======
+    session_link: Option<SessionLink>,
+>>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
     /// Host bytes waiting for ARQ window space (COP-41, D5): an event too
     /// large for the 8-segment window is held here -- never dropped -- and
     /// `pump_arq_backlog` moves it into window segments as ACKs free space.
@@ -435,7 +484,8 @@ pub struct EventLoop {
     /// line.
     arq_tx_backlog: VecDeque<u8>,
     /// Host payload bytes handed to `transmit_samples` on a path with no ACK
-    /// to wait for (the non-ARQ raw path and established-session data).
+    /// to wait for (the non-ARQ raw path; COP-38: established-session data
+    /// waits for its ACK instead and is never counted here).
     /// Cleared at PTT release (`set_ptt(false)`): by then every frame handed
     /// over earlier has played or been discarded. See `buffered_tx_bytes`.
     tx_on_air_bytes: usize,
@@ -551,7 +601,10 @@ impl EventLoop {
             ));
         }
 
-        // Create engine from profile; all profiles use 48kHz internally
+        // Create engine from profile; all profiles use 48kHz internally.
+        // coppad's run mode rejects an unknown profile name before this point
+        // (COP-36); the level-derived fallback is kept for direct constructors
+        // and tests.
         let engine =
             if let Some(profile) = coppa_engine::profiles::get_profile(&config.engine.profile) {
                 CoppaCore::from_profile(profile)
@@ -677,8 +730,12 @@ impl EventLoop {
             ws_status: None,
             vara_responses: None,
             tx_queue: VecDeque::new(),
+<<<<<<< HEAD
             session_tx_queue: VecDeque::new(),
             pending_disconnect: None,
+=======
+            session_link: None,
+>>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
             arq_tx_backlog: VecDeque::new(),
             tx_on_air_bytes: 0,
             last_reported_buffer: 0,
@@ -1275,7 +1332,7 @@ impl EventLoop {
             self.try_drain_tx_queue().await;
         }
         if self.session_tx_held_by_frequency_gate {
-            self.drain_session_tx_queue().await;
+            self.drain_session_link().await;
         }
     }
 
@@ -1297,9 +1354,10 @@ impl EventLoop {
     /// - `None`-tagged (non-ARQ) `tx_queue` entries not yet popped. A
     ///   `Some`-tagged entry is the `TransportPdu`-wrapped copy of a payload
     ///   `ArqTx` already counts, so it adds nothing;
-    /// - queued established-session chunks (`session_tx_queue`, COP-41):
-    ///   each chunk's `host_len`, the bytes the host wrote that the chunk
-    ///   carries;
+    /// - the established session's link (COP-38): its backlog plus its
+    ///   un-acked segments' payloads. A backlog byte that becomes a segment
+    ///   moves between counted terms, so the sum falls only on the peer's
+    ///   ACK or the link's end;
     /// - `arq_tx_backlog` bytes (COP-41, D5): host bytes waiting for ARQ
     ///   window space. A backlog byte that becomes an ARQ segment moves
     ///   between counted terms, leaving the sum unchanged;
@@ -1315,9 +1373,12 @@ impl EventLoop {
             .filter(|(seq, _)| seq.is_none())
             .map(|(_, data)| data.len())
             .sum();
-        let session_queued: usize = self.session_tx_queue.iter().map(|c| c.host_len).sum();
+        let session = self
+            .session_link
+            .as_ref()
+            .map_or(0, |l| l.backlog.len() + l.tx.unacked_bytes());
         let unacked = self.arq_tx.as_ref().map_or(0, ArqTx::unacked_bytes);
-        queued + session_queued + self.arq_tx_backlog.len() + self.tx_on_air_bytes + unacked
+        queued + session + self.arq_tx_backlog.len() + self.tx_on_air_bytes + unacked
     }
 
     /// Emit `BUFFER` with `buffered_tx_bytes` if it differs from the last
@@ -1440,40 +1501,238 @@ impl EventLoop {
         }
     }
 
-    /// COP-41: pace established-session chunks one frame per keyed interval.
-    /// Mirrors `try_drain_tx_queue`'s guard-and-single-pop convention: while
-    /// a transmission is keyed nothing new starts, and each PTT release pops
-    /// at most one chunk. Session chunks deliberately take none of
-    /// `rate_loop`'s or the probe machinery's levels (D3): a session link
-    /// has no ACK feedback, so its level is static and the engine's current
-    /// level -- the one the chunks were sized against -- is the right one.
-    async fn drain_session_tx_queue(&mut self) {
+    /// COP-38 (D5): send the session link's next frame. Stop-and-wait: a
+    /// frame goes out only when nothing is keyed and the previous frame has
+    /// been ACKed (`ArqTx::can_send` with window 1), so each ACK, not each
+    /// PTT release, paces the stream. One chunk is cut from the backlog at
+    /// a time, framed exactly as it will be sent (with the real seq), and
+    /// handed to `ArqTx::send` only once `transmit_samples` has keyed it:
+    /// the RTO clock starts at real transmission, and a gate refusal leaves
+    /// the bytes in the backlog with nothing to undo. Session frames take
+    /// none of `rate_loop`'s or the probe machinery's levels: the engine's
+    /// current level is the one the chunk is sized against.
+    async fn drain_session_link(&mut self) {
         if self.is_transmitting {
             return;
         }
-        // COP-40, as in `try_drain_tx_queue`: hold the chunks (rather than
-        // pop one and have `transmit_samples` refuse it -- session data has
-        // no MAC-level retry) while the wideband gate refuses;
-        // `retry_held_tx_drain` tries again on the next poll.
-        self.session_tx_held_by_frequency_gate =
-            !self.session_tx_queue.is_empty() && self.wideband_frequency_check().is_err();
-        if self.session_tx_held_by_frequency_gate {
+        let ready = self
+            .session_link
+            .as_ref()
+            .is_some_and(|l| !l.backlog.is_empty() && l.tx.can_send());
+        // COP-40, as in `try_drain_tx_queue`: hold the backlog (rather than
+        // cut a frame and have `transmit_samples` refuse it) while the
+        // wideband gate refuses; `retry_held_tx_drain` tries again on the
+        // next poll.
+        self.session_tx_held_by_frequency_gate = ready && self.wideband_frequency_check().is_err();
+        if !ready || self.session_tx_held_by_frequency_gate {
             return;
         }
-        if let Some(chunk) = self.session_tx_queue.pop_front() {
-            match self.engine.encode_bytes(&chunk.pdu_bytes) {
+        let budget = max_payload_for_level(self.engine.speed_level())
+            .expect("the engine's speed level is always a valid wire level");
+        let (seq, take, frame) = {
+            let Some(link) = self.session_link.as_mut() else {
+                return;
+            };
+            link.backlog.make_contiguous();
+            let link = &*link;
+            let seq = link.tx.next_seq();
+            let engine = &self.engine;
+            let take = next_chunk_len(
+                link.backlog.as_slices().0,
+                MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE,
+                budget,
+                |c| engine.encoded_payload_len(&session_data_frame(link, seq, c)) <= budget,
+            );
+            let chunk: Vec<u8> = link.backlog.iter().take(take).copied().collect();
+            (seq, take, session_data_frame(link, seq, &chunk))
+        };
+        let samples = match self.engine.encode_bytes(&frame) {
+            Ok(samples) => samples,
+            Err(e) => {
+                // Unreachable for a chunk `next_chunk_len` sized; the bytes
+                // stay in the backlog.
+                tracing::error!(error = %e, seq, "Failed to encode session data");
+                return;
+            }
+        };
+        // Boxed: `transmit_samples` -> `handle_ptt_change` -> (on PTT
+        // release) `drain_session_link` forms the same 3-way async call
+        // cycle `try_drain_tx_queue` documents; one edge needs indirection
+        // to give the compiler a finite-sized future.
+        let generation = self.tx_generation;
+        Box::pin(self.transmit_samples(&samples)).await;
+        if self.tx_generation == generation {
+            // The gate passed above but refused after the courtesy wait (the
+            // one `transmit_samples` path that keys nothing and leaves
+            // `tx_generation` alone). Nothing was consumed, so the retry
+            // poll resumes the stream without a hole.
+            self.session_tx_held_by_frequency_gate = true;
+            return;
+        }
+        if let Some(link) = self.session_link.as_mut() {
+            let chunk: Vec<u8> = link.backlog.drain(..take).collect();
+            match link.tx.send(chunk, Instant::now()) {
+                Ok(sent) => debug_assert_eq!(sent, seq),
+                // Unreachable: `can_send` was checked before transmitting.
+                Err(e) => tracing::error!(error = %e, seq, "Session ARQ window full"),
+            }
+        }
+        self.tx_frame_count += 1;
+        tracing::debug!(
+            seq,
+            frame = self.tx_frame_count,
+            max = self.max_frames_per_turn,
+            "Session data frame transmitted"
+        );
+    }
+
+    /// Drop the link of a session that has ended (local or remote
+    /// DISCONNECT, timeout, or COP-38 link failure) -- its backlog and its
+    /// un-acked segments -- and report the `BUFFER` change. Without this the
+    /// link keeps sending (and retransmitting) a dead session's data, and a
+    /// reconnect to the same peer could deliver those stale bytes into the
+    /// new session.
+    async fn discard_session_tx(&mut self, session_id: u8) {
+        let Some(link) = self.session_link.take_if(|l| l.session_id == session_id) else {
+            return;
+        };
+        tracing::info!(
+            session_id,
+            backlog = link.backlog.len(),
+            in_flight = link.tx.in_flight(),
+            "Session ended; discarding its unsent data"
+        );
+        self.report_buffer().await;
+    }
+
+    /// COP-38 (D2): the reliable link for `session_id`, created on first use
+    /// if it is missing or belongs to another session. Session establishment
+    /// itself rebuilds it (`reset_session_link`); this covers any path that
+    /// reaches an established session without those handlers.
+    fn ensure_session_link(&mut self, session_id: u8) {
+        if self
+            .session_link
+            .as_ref()
+            .is_some_and(|l| l.session_id == session_id)
+        {
+            return;
+        }
+        let Some(session) = self.session_mgr.get(session_id) else {
+            return;
+        };
+        let level = self.engine.speed_level();
+        let radio = &self.config.radio;
+        let config = ArqConfig {
+            window_size: SESSION_ARQ_WINDOW,
+            speed_level: level,
+            ack_speed_level: level,
+            // D7: the peer's hold plus key-up latency, with our own tail as
+            // decode-latency margin; a spurious retransmit only costs a
+            // cycle, a late one only delays recovery from a real loss.
+            turnaround: Duration::from_millis(
+                radio.turnaround_ms + radio.ptt_pre_delay_ms + radio.ptt_tail_delay_ms,
+            ),
+            ..ArqConfig::default()
+        };
+        self.session_link = Some(SessionLink {
+            session_id,
+            remote: session.remote.clone(),
+            local: session.local.clone(),
+            ssid: session.ssid,
+            tx: ArqTx::new(config),
+            rx: ArqRx::new(SESSION_ARQ_WINDOW),
+            backlog: VecDeque::new(),
+            give_up_at: None,
+            warned_legacy_payload: false,
+        });
+    }
+
+    /// COP-38 (D2): a newly established session starts at seq 0 on both
+    /// ends, whatever link an earlier session left behind.
+    fn reset_session_link(&mut self, session_id: u8) {
+        self.session_link = None;
+        self.ensure_session_link(session_id);
+    }
+
+    /// COP-38: the session a session-layer frame belongs to: sent by the
+    /// session's peer (`src`), addressed to the session's own callsign
+    /// (`dest`), on its SSID. Matching `src` alone would let a frame the
+    /// peer addressed to another station on the shared channel (after it
+    /// reconnected elsewhere, say) acknowledge, deliver into or end this
+    /// session.
+    fn session_id_for_frame(&self, pdu: &MacPdu) -> Option<u8> {
+        self.session_mgr.active_sessions().into_iter().find(|&id| {
+            self.session_mgr.get(id).is_some_and(|s| {
+                s.remote == pdu.src && s.local == pdu.dest && s.ssid & 0x0F == pdu.ssid
+            })
+        })
+    }
+
+    /// COP-38: the remote of a session that keeps this daemon from starting
+    /// another one. `session_link` is singular (D2): a second session
+    /// established beside the first would rebuild the link and drop the
+    /// first session's backlog, in-flight segment and receive position
+    /// without disconnecting it. That includes a second slot for the same
+    /// peer (a repeat CONNECT_REQ, or one on another SSID).
+    fn active_session_remote(&self) -> Option<Callsign> {
+        self.session_mgr
+            .active_sessions()
+            .into_iter()
+            .filter_map(|id| self.session_mgr.get(id))
+            .find(|s| s.state != SessionState::Idle)
+            .map(|s| s.remote.clone())
+    }
+
+    /// COP-38 (D7): the connected-session retransmit pass. Runs on `run()`'s
+    /// 500 ms retransmit tick whatever `arq_enabled` says (D1). A frame is
+    /// rebuilt from its segment data, byte-identical to the original; once
+    /// it has used its last retransmission the link gets one more RTO for a
+    /// late ACK and then fails (`fail_session_link`).
+    async fn check_session_retransmits(&mut self) {
+        let now = Instant::now();
+        let Some(link) = self.session_link.as_ref() else {
+            return;
+        };
+        if link.give_up_at.is_some_and(|t| now >= t) && link.tx.in_flight() > 0 {
+            let session_id = link.session_id;
+            self.fail_session_link(session_id).await;
+            return;
+        }
+        // COP-40: `get_retransmits` backs the RTO off whenever it returns a
+        // segment, so asking while the gate refuses would spend backoff and
+        // budget on a refusal the first-send path holds without loss.
+        if self
+            .session_link
+            .as_ref()
+            .is_some_and(|l| l.tx.in_flight() > 0)
+            && self.wideband_frequency_check().is_err()
+        {
+            return;
+        }
+        let Some(link) = self.session_link.as_mut() else {
+            return;
+        };
+        let seqs = link.tx.get_retransmits(now);
+        let link = &*link;
+        let frames: Vec<(u8, Vec<u8>)> = seqs
+            .into_iter()
+            .filter_map(|seq| {
+                link.tx
+                    .get_segment_data(seq)
+                    .map(|data| (seq, session_data_frame(link, seq, data)))
+            })
+            .collect();
+        for (seq, frame) in frames {
+            let attempt = self
+                .session_link
+                .as_ref()
+                .and_then(|l| l.tx.transmit_count(seq))
+                .map_or(0, |count| count + 1);
+            match self.engine.encode_bytes(&frame) {
                 Ok(samples) => {
-                    // No MAC-level ACK exists for session data, so
-                    // its bytes stay in `BUFFER` until PTT releases.
-                    self.tx_on_air_bytes += chunk.host_len;
-                    self.report_buffer().await;
-                    // Boxed: `transmit_samples` -> `handle_ptt_change` -> (on
-                    // PTT release) `drain_session_tx_queue` forms the same
-                    // 3-way async call cycle `try_drain_tx_queue` documents;
-                    // one edge needs indirection to give the compiler a
-                    // finite-sized future.
-                    let generation = self.tx_generation;
+                    tracing::debug!(seq, attempt, "Retransmitting session frame");
                     Box::pin(self.transmit_samples(&samples)).await;
+<<<<<<< HEAD
                     if self.tx_generation == generation {
                         // The gate passed above but refused after the
                         // courtesy wait (the one `transmit_samples` path
@@ -1499,33 +1758,74 @@ impl EventLoop {
                         max = self.max_frames_per_turn,
                         "Session data frame transmitted"
                     );
+=======
+>>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to encode session data");
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    seq,
+                    "Failed to encode session retransmission; counting the attempt anyway"
+                ),
+            }
+            // Counted even when the encode or the post-wait gate refused
+            // (COP-1 (d)): a budget only successful sends advance can never
+            // run out.
+            if let Some(link) = self.session_link.as_mut() {
+                let _ = link.tx.mark_retransmitted(seq, Instant::now());
+                if link.tx.is_failed(seq) && link.give_up_at.is_none() {
+                    link.give_up_at = Some(Instant::now() + link.tx.rto());
                 }
             }
         }
     }
 
-    /// Drop the unsent `session_tx_queue` chunks of a session that has ended
-    /// (local or remote DISCONNECT, or timeout), and report the `BUFFER`
-    /// change. Without this the queue keeps transmitting a dead session's
-    /// data on every PTT release, and a reconnect to the same peer could
-    /// deliver those stale bytes into the new session. A chunk already on
-    /// the air stays in `tx_on_air_bytes` until its PTT release, as usual.
-    async fn discard_session_tx(&mut self, session_id: u8) {
-        let before = self.session_tx_queue.len();
-        self.session_tx_queue
-            .retain(|chunk| chunk.session_id != session_id);
-        let dropped = before - self.session_tx_queue.len();
-        if dropped > 0 {
-            tracing::info!(
+    /// COP-38 (D7): no ACK after the retry budget. Ends the session the way
+    /// the host's DISCONNECT does: drop the link (`BUFFER 0`), tell the peer,
+    /// then the host.
+    async fn fail_session_link(&mut self, session_id: u8) {
+        if let Some(link) = self
+            .session_link
+            .as_ref()
+            .filter(|l| l.session_id == session_id)
+        {
+            let seq = link.tx.send_base();
+            tracing::warn!(
                 session_id,
-                chunks = dropped,
-                "Session ended; discarding its unsent data"
+                remote = %link.remote,
+                seq,
+                attempts = link.tx.transmit_count(seq).unwrap_or(0),
+                "Session link failed: no ACK after the retry budget; disconnecting"
             );
-            self.report_buffer().await;
         }
+        self.end_session(session_id, 0).await;
+    }
+
+    /// Tear down `session_id` at once: drop its link (`BUFFER` reports the
+    /// change), send a best-effort DISCONNECT to the peer, remove the
+    /// session and tell the host `DISCONNECTED`. Shared by the host's
+    /// `DISCONNECT` and COP-38's link failure, so no session data plays after
+    /// the host hears `DISCONNECTED`.
+    async fn end_session(&mut self, session_id: u8, client_id: u32) {
+        self.discard_session_tx(session_id).await;
+        if let Some(session) = self.session_mgr.get_mut(session_id) {
+            match session.disconnect() {
+                Ok(disc_pdu) => {
+                    let pdu_bytes = disc_pdu.to_bytes();
+                    match self.engine.encode_bytes(&pdu_bytes) {
+                        Ok(samples) => Box::pin(self.transmit_samples(&samples)).await,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to encode DISCONNECT")
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to disconnect session");
+                }
+            }
+        }
+        self.session_mgr.remove(session_id);
+        self.notify_session(client_id, SessionNotice::Disconnected)
+            .await;
     }
 
     /// COP-43: end a pending host `DISCONNECT` once its session's chunks
@@ -1713,6 +2013,9 @@ impl EventLoop {
                     self.enforce_ptt_backstop().await;
                     // E6: Check for ARQ retransmits
                     self.check_arq_retransmits().await;
+                    // COP-38 (D1): connected-session data retransmits
+                    // whatever `arq_enabled` says.
+                    self.check_session_retransmits().await;
                     self.retry_held_tx_drain().await;
                     // COP-43: covers a PTT release that ran no drain (e.g.
                     // `force_release_ptt`).
@@ -1859,37 +2162,27 @@ impl EventLoop {
                 // change): the peer looks the session up by `pdu.src`, so a
                 // runtime callsign change must not make it silently drop
                 // every later data frame.
-                let session_info = self.session_mgr.active_sessions().iter().find_map(|&id| {
+                let session_id = self.session_mgr.active_sessions().iter().find_map(|&id| {
                     self.session_mgr
                         .get(id)
                         .filter(|s| s.is_established())
-                        .map(|s| (id, s.remote.clone(), s.local.clone(), s.ssid))
+                        .map(|s| s.id)
                 });
 
-                if let Some((session_id, remote, local, ssid)) = session_info {
-                    // COP-41: one host event is NOT one over-the-air frame.
-                    // Split the event into chunks that each encode at the
-                    // engine's current speed level (D2: measured via
-                    // `encoded_payload_len`, never predicted -- compression
-                    // is content-dependent by ~2x), then pace them one frame
-                    // per keyed interval through `session_tx_queue` (D3).
-                    let budget = max_payload_for_level(self.engine.speed_level())
-                        .expect("the engine's speed level is always a valid wire level");
-                    let chunks = chunk_to_fit(&data, MacPdu::HEADER_SIZE, budget, |c| {
-                        let pdu = MacPdu::new_data(remote.clone(), local.clone(), ssid, c.to_vec());
-                        self.engine.encoded_payload_len(&pdu.to_bytes()) <= budget
-                    });
-                    for chunk in chunks {
-                        let host_len = chunk.len();
-                        let pdu = MacPdu::new_data(remote.clone(), local.clone(), ssid, chunk);
-                        self.session_tx_queue.push_back(SessionTxChunk {
-                            session_id,
-                            pdu_bytes: pdu.to_bytes(),
-                            host_len,
-                        });
+                if let Some(session_id) = session_id {
+                    // COP-41/COP-38: one host event is NOT one over-the-air
+                    // frame. The bytes join the session link's backlog, and
+                    // `drain_session_link` cuts one frame at a time that
+                    // encodes at the engine's current speed level (measured
+                    // via `encoded_payload_len`, never predicted --
+                    // compression is content-dependent by ~2x), sending the
+                    // next only once the peer has ACKed the last.
+                    self.ensure_session_link(session_id);
+                    if let Some(link) = self.session_link.as_mut() {
+                        link.backlog.extend(data.iter().copied());
                     }
                     self.report_buffer().await;
-                    self.drain_session_tx_queue().await;
+                    self.drain_session_link().await;
                     return;
                 }
 
@@ -2017,6 +2310,7 @@ impl EventLoop {
                     }
                 };
 
+<<<<<<< HEAD
                 // COP-43: a CONNECT during a DISCONNECT drain ends that
                 // drain first. Its session would otherwise still match the
                 // peer's callsign (`find_by_remote`) and catch the new
@@ -2028,6 +2322,26 @@ impl EventLoop {
                         "CONNECT during a DISCONNECT drain; ending the drain first"
                     );
                     self.end_local_disconnect(pending).await;
+=======
+                // COP-38: one session at a time (`active_session_remote`).
+                // The host ends the current session with DISCONNECT before
+                // dialling again. Only the dialling client hears the
+                // refusal: the session that caused it is still up, and
+                // `notify_session` would tell every host it had ended.
+                if let Some(active) = self.active_session_remote() {
+                    tracing::warn!(
+                        destination = %remote, active = %active,
+                        "Connect request refused: another session is active"
+                    );
+                    if let Some(ref tx) = self.response_tx {
+                        let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
+                            client_id,
+                            status: "DISCONNECTED".to_string(),
+                        });
+                    }
+                    self.reply_vara(client_id, VaraResponse::Disconnected).await;
+                    return;
+>>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
                 }
 
                 let caps = LinkCapabilities::default();
@@ -2089,6 +2403,7 @@ impl EventLoop {
                     .copied();
 
                 if let Some(id) = session_id {
+<<<<<<< HEAD
                     let disconnect = self.session_mgr.get_mut(id).map(|s| s.disconnect());
                     match disconnect {
                         Some(Ok(disc_pdu)) => {
@@ -2128,6 +2443,11 @@ impl EventLoop {
                         }
                         None => {}
                     }
+=======
+                    // The session's link ends with it; none of its data may
+                    // play after the host is told DISCONNECTED.
+                    self.end_session(id, client_id).await;
+>>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
                 } else {
                     tracing::debug!("Disconnect request but no active session");
                 }
@@ -2763,8 +3083,12 @@ impl EventLoop {
                     );
                 }
                 self.try_drain_tx_queue().await;
+<<<<<<< HEAD
                 self.drain_session_tx_queue().await;
                 self.finish_drained_disconnect().await;
+=======
+                self.drain_session_link().await;
+>>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
                 return;
             }
         }
@@ -2929,7 +3253,10 @@ impl EventLoop {
                 // remain queued so the 500 ms `retry_held_tx_drain` poll
                 // resumes the queue once the gate reopens.
                 self.tx_held_by_frequency_gate = !self.tx_queue.is_empty();
-                self.session_tx_held_by_frequency_gate = !self.session_tx_queue.is_empty();
+                self.session_tx_held_by_frequency_gate = self
+                    .session_link
+                    .as_ref()
+                    .is_some_and(|l| !l.backlog.is_empty());
             }
             return;
         }
@@ -4086,7 +4413,8 @@ impl EventLoop {
             MacFrameType::ConnectAck => self.handle_connect_ack_rx(pdu).await,
             MacFrameType::ConnectCfm => self.handle_connect_cfm_rx(pdu).await,
             MacFrameType::Disconnect => self.handle_incoming_disconnect(pdu).await,
-            MacFrameType::Data => self.handle_session_data(pdu),
+            MacFrameType::Data => self.handle_session_data(pdu).await,
+            MacFrameType::Ack => self.handle_session_ack(pdu).await,
             MacFrameType::Keepalive => self.handle_keepalive_rx(pdu),
             MacFrameType::Beacon => self.handle_beacon_rx(pdu),
             _ => {
@@ -4132,6 +4460,17 @@ impl EventLoop {
             return;
         }
 
+        // COP-38: one session at a time (`active_session_remote`). While a
+        // session exists, a CONNECT_REQ, the current peer's included, gets
+        // no answer, so the caller's handshake times out.
+        if let Some(active) = self.active_session_remote() {
+            tracing::info!(
+                remote = %pdu.src, active = %active,
+                "CONNECT_REQ refused: another session is active"
+            );
+            return;
+        }
+
         let remote = pdu.src.clone();
         let caps = LinkCapabilities::default();
         match self
@@ -4167,7 +4506,8 @@ impl EventLoop {
 
     async fn handle_connect_ack_rx(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
-        if let Some(session) = self.session_mgr.find_by_remote_mut(&remote) {
+        let session_id = self.session_id_for_frame(&pdu);
+        if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
             match session.handle_connect_ack(&pdu.payload) {
                 Ok(cfm_pdu) => {
                     let notice = SessionNotice::Connected {
@@ -4175,6 +4515,9 @@ impl EventLoop {
                         remote,
                         we_called: true,
                     };
+                    // COP-38 (D2): the new session starts at seq 0.
+                    let session_id = session.id;
+                    self.reset_session_link(session_id);
                     // The session is established now; the busy-channel courtesy
                     // wait in transmit_samples can delay the CFM by seconds.
                     self.notify_session(0, notice).await;
@@ -4195,7 +4538,8 @@ impl EventLoop {
 
     async fn handle_connect_cfm_rx(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
-        if let Some(session) = self.session_mgr.find_by_remote_mut(&remote) {
+        let session_id = self.session_id_for_frame(&pdu);
+        if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
             match session.handle_connect_cfm(&pdu.payload) {
                 Ok(()) => {
                     session.confirm_established();
@@ -4205,6 +4549,9 @@ impl EventLoop {
                         remote,
                         we_called: false,
                     };
+                    // COP-38 (D2): the new session starts at seq 0.
+                    let session_id = session.id;
+                    self.reset_session_link(session_id);
                     self.notify_session(0, notice).await;
                 }
                 Err(e) => {
@@ -4219,7 +4566,7 @@ impl EventLoop {
     async fn handle_incoming_disconnect(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
         // Find session ID first to avoid borrow issues
-        let session_id = self.session_mgr.find_by_remote(&remote).map(|s| s.id);
+        let session_id = self.session_id_for_frame(&pdu);
         if let Some(id) = session_id {
             if let Some(session) = self.session_mgr.get_mut(id) {
                 session.handle_disconnect();
@@ -4235,32 +4582,119 @@ impl EventLoop {
         }
     }
 
-    fn handle_session_data(&mut self, pdu: MacPdu) {
+    /// COP-38 (D8): a session data frame. Its `Reliable` segment goes
+    /// through the link's `ArqRx`, which delivers each new segment to the
+    /// host once and in order; every reliable frame, a duplicate included,
+    /// is ACKed, because a duplicate means our last ACK was lost. A payload
+    /// that is not a reliable `TransportPdu` (a pre-0.3.0 peer) is dropped
+    /// without `DataOut` and without an ACK.
+    async fn handle_session_data(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
-        if let Some(session) = self.session_mgr.find_by_remote_mut(&remote) {
-            if session.is_established() {
-                self.tx_frame_count = 0; // Our turn to transmit starts fresh
-                session.touch();
-                if let Some(ref tx) = self.response_tx {
-                    let _ = tx.try_send(coppa_host::HostResponse::DataOut {
-                        client_id: 0,
-                        data: pdu.payload,
-                    });
-                }
-            } else {
-                tracing::debug!(
-                    remote = %remote, state = ?session.state,
-                    "Data received but session not established"
+        let session_id = self.session_id_for_frame(&pdu);
+        let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) else {
+            tracing::debug!(
+                remote = %remote, dest = %pdu.dest,
+                "Data from unknown remote or not addressed to a session of ours"
+            );
+            return;
+        };
+        if !session.is_established() {
+            tracing::debug!(
+                remote = %remote, state = ?session.state,
+                "Data received but session not established"
+            );
+            return;
+        }
+        self.tx_frame_count = 0; // Our turn to transmit starts fresh
+        session.touch();
+        let session_id = session.id;
+        self.ensure_session_link(session_id);
+        let Some(link) = self.session_link.as_mut() else {
+            return;
+        };
+        let segment = TransportPdu::from_bytes(&pdu.payload)
+            .ok()
+            .filter(|t| t.transport_type == TransportType::Reliable);
+        let Some(segment) = segment else {
+            if !std::mem::replace(&mut link.warned_legacy_payload, true) {
+                tracing::warn!(
+                    remote = %remote,
+                    "Session data frame is not a reliable transport PDU; \
+                     is the peer running coppad older than 0.3.0? Dropping it"
                 );
             }
-        } else {
-            tracing::debug!(remote = %remote, "Data from unknown remote");
+            return;
+        };
+        for (_seq, data) in link.rx.receive(segment.seq_num, segment.payload) {
+            if let Some(ref tx) = self.response_tx {
+                let _ = tx.try_send(coppa_host::HostResponse::DataOut { client_id: 0, data });
+            }
+        }
+        let ack = session_ack_frame(link);
+        match self.engine.encode_bytes(&ack) {
+            Ok(samples) => Box::pin(self.transmit_samples(&samples)).await,
+            Err(e) => tracing::warn!(error = %e, "Failed to encode session ACK"),
+        }
+    }
+
+    /// COP-38 (D7): the peer's ACK for session data. Frees the stop-and-wait
+    /// window, lowers `BUFFER` by the acknowledged bytes and sends the next
+    /// frame. An ACK from an unknown or unestablished peer changes nothing.
+    async fn handle_session_ack(&mut self, pdu: MacPdu) {
+        let session_id = self.session_id_for_frame(&pdu);
+        let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) else {
+            tracing::debug!(
+                remote = %pdu.src, dest = %pdu.dest,
+                "Session ACK from unknown remote or not addressed to a session of ours"
+            );
+            return;
+        };
+        if !session.is_established() {
+            return;
+        }
+        session.touch();
+        let session_id = session.id;
+        let Ok(ack) = TransportPdu::from_bytes(&pdu.payload) else {
+            return;
+        };
+        if ack.transport_type != TransportType::Ack {
+            return;
+        }
+        let Some(link) = self
+            .session_link
+            .as_mut()
+            .filter(|l| l.session_id == session_id)
+        else {
+            return;
+        };
+        // An ACK can only cover what is in flight. One ahead of `next_seq`
+        // (a stale ACK from an earlier session with this peer, or a desynced
+        // peer) would push `send_base` past `next_seq`: the window would read
+        // as full forever, with nothing left to retransmit or give up on.
+        if ack.ack_num.wrapping_sub(link.tx.send_base()) > link.tx.in_flight() {
+            tracing::debug!(
+                ack_num = ack.ack_num,
+                send_base = link.tx.send_base(),
+                next_seq = link.tx.next_seq(),
+                "Session ACK beyond what is in flight; ignoring it"
+            );
+            return;
+        }
+        let acked = link
+            .tx
+            .process_ack(ack.ack_num, ack.ack_bitmap, Instant::now());
+        if link.tx.in_flight() == 0 {
+            link.give_up_at = None;
+        }
+        if !acked.is_empty() {
+            self.report_buffer().await;
+            Box::pin(self.drain_session_link()).await;
         }
     }
 
     fn handle_keepalive_rx(&mut self, pdu: MacPdu) {
-        let remote = pdu.src.clone();
-        if let Some(session) = self.session_mgr.find_by_remote_mut(&remote) {
+        let session_id = self.session_id_for_frame(&pdu);
+        if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
             session.touch();
         }
     }
@@ -4269,11 +4703,16 @@ impl EventLoop {
         self.set_ptt(tx).await;
         if !tx {
             // PTT just released: continue draining the TX queues if more is
-            // queued (one frame per keyed interval -- COP-41 paces session
-            // chunks the same way `try_drain_tx_queue` paces raw/ARQ ones).
+            // queued (one frame per keyed interval). COP-38: the session link
+            // sends only once its in-flight frame is ACKed, so this release
+            // only resumes a frame a busy transmitter held back.
             self.try_drain_tx_queue().await;
+<<<<<<< HEAD
             self.drain_session_tx_queue().await;
             self.finish_drained_disconnect().await;
+=======
+            self.drain_session_link().await;
+>>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
         }
     }
 
@@ -5987,30 +6426,37 @@ mod tests {
         }
     }
 
-    /// COP-41: a large session write is chunked into frames that each
-    /// encode at the current level, paced one per keyed interval, and the
-    /// far end reassembles the byte stream exactly -- each chunk is an
-    /// ordinary independent MAC data frame, `handle_session_data` forwards
-    /// payloads in arrival order, and B2F framing reassembles at the host.
-    /// Drives both a 1000-byte write (fast variant) and the ticket's
-    /// 8000-byte number through the real encode/audio/decode path.
-    #[tokio::test]
-    async fn large_session_write_is_chunked_and_delivered_in_order() {
+    /// COP-38: two stations with a session established through the real
+    /// three-leg handshake (`decode_and_dispatch_audio` both ways), with
+    /// `arq_enabled` left at its default `false`, zero PTT delays, and both
+    /// stations' PTT released afterwards so the next write keys at once.
+    async fn connected_pair(
+        turnaround_ms: u64,
+    ) -> (
+        EventLoop,
+        EventLoop,
+        coppa_audio::AudioRingConsumer,
+        coppa_audio::AudioRingConsumer,
+    ) {
         let mut config = DaemonConfig::default();
+        assert!(
+            !config.engine.arq_enabled,
+            "session ARQ must not need the flag"
+        );
         config.engine.callsign = "VK3ABC".into();
         config.radio.ptt_pre_delay_ms = 0;
         config.radio.ptt_tail_delay_ms = 0;
+        config.radio.turnaround_ms = turnaround_ms;
         let mut a = EventLoop::new(config.clone()).unwrap();
         config.engine.callsign = "W1AW".into();
         let mut b = EventLoop::new(config).unwrap();
         a.listening = true;
         b.listening = true;
         let (a_producer, mut a_consumer) = coppa_audio::audio_ring(4_000_000);
-        let (b_producer, mut b_consumer) = coppa_audio::audio_ring(1_000_000);
+        let (b_producer, mut b_consumer) = coppa_audio::audio_ring(4_000_000);
         a.set_audio_out(a_producer);
         b.set_audio_out(b_producer);
 
-        // Establish the session with the real three-leg handshake.
         a.handle_host_event(HostEvent::ConnectRequest {
             client_id: 1,
             source: "VK3ABC".into(),
@@ -6021,70 +6467,396 @@ mod tests {
             .await;
         a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "CONNECT_ACK"))
             .await;
+        unstick_decoder(&mut b);
         b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_CFM"))
             .await;
+        a.handle_ptt_change(false).await;
+        b.handle_ptt_change(false).await;
+        assert!(a.session_link.is_some() && b.session_link.is_some());
+        (a, b, a_consumer, b_consumer)
+    }
 
-        // Patterned, reproducible payload (compressible enough to exercise
-        // the measurement path, not degenerate like a constant fill).
-        let pattern =
-            |size: usize| -> Vec<u8> { (0..size).map(|i| ((i * 31 + 7) % 251) as u8).collect() };
-        for size in [1000usize, 8000] {
-            let payload = pattern(size);
-            // Fresh response channel per transfer so the collected bytes are
-            // exactly this transfer's DataOut stream.
-            let (data_tx, mut data_rx) = mpsc::channel(4096);
-            b.set_response_tx(data_tx);
-            let frames_before = a.tx_frame_count;
+    /// COP-38: give `station`'s session link a 20 ms initial RTO, so a test
+    /// can elapse it with a real sleep (the `test_arq_retransmit_marks_
+    /// retransmitted_and_caps` precedent). Only before anything is in flight.
+    fn fast_session_rto(station: &mut EventLoop) {
+        let link = station.session_link.as_mut().expect("a session link");
+        assert_eq!(link.tx.in_flight(), 0, "swap the RTO before sending");
+        link.tx =
+            ArqTx::new(ArqConfig::new(SESSION_ARQ_WINDOW, 5, Duration::from_millis(20)).unwrap());
+    }
 
-            a.handle_host_event(HostEvent::DataReceived {
-                client_id: 1,
-                data: payload.clone(),
-            })
-            .await;
-
-            // Drive one chunk per keyed interval: deliver whatever `a` has
-            // transmitted, then release PTT to start the next chunk. The
-            // first chunk transmits immediately from the `DataReceived`
-            // drain when the link is idle (and from the first release when
-            // the previous transfer's last frame is still keyed).
-            let mut collected: Vec<u8> = Vec::with_capacity(size);
-            loop {
-                let mut buf = vec![0.0f32; 4_000_000];
-                let read = a_consumer.read(&mut buf);
-                if read > 0 {
-                    unstick_decoder(&mut b);
-                    b.decode_and_dispatch_audio(&with_lead_and_trail(&buf[..read]))
-                        .await;
-                    while let Ok(resp) = data_rx.try_recv() {
-                        if let coppa_host::HostResponse::DataOut { data, .. } = resp {
-                            collected.extend_from_slice(&data);
-                        }
-                    }
-                }
-                if a.session_tx_queue.is_empty() && read == 0 {
-                    break;
-                }
-                if !a.session_tx_queue.is_empty() {
-                    a.handle_ptt_change(false).await;
-                }
-            }
-
-            assert_eq!(
-                collected, payload,
-                "{size}-byte session write must arrive as the same byte stream"
-            );
-            // Chunks are at most 102 host bytes at level 2 (budget 117 minus
-            // the 14-byte MAC header minus one), so this many bytes cannot
-            // fit in fewer frames.
-            let min_frames = size.div_ceil(103);
-            let frames = a.tx_frame_count - frames_before;
-            assert!(
-                frames >= min_frames,
-                "{size} bytes need >= {min_frames} frames (<= 102 host bytes \
-                 each), got {frames}"
-            );
-            assert!(a.session_tx_queue.is_empty());
+    /// COP-38: feed `station` its peer's ACK for every segment it has sent, as
+    /// a real MAC `Ack` frame through `handle_mac_pdu`.
+    async fn ack_in_flight(station: &mut EventLoop) {
+        let link = station.session_link.as_ref().expect("a session link");
+        let mut peer = ArqRx::new(SESSION_ARQ_WINDOW);
+        for seq in 0..link.tx.next_seq() {
+            peer.receive(seq, Vec::new());
         }
+        let (ack_num, bitmap) = peer.ack_info();
+        let pdu = MacPdu::new(
+            MacFrameType::Ack,
+            link.local.clone(),
+            link.remote.clone(),
+            link.ssid,
+            TransportPdu::new_ack(0, ack_num, bitmap).to_bytes(),
+        );
+        station.handle_mac_pdu(pdu).await;
+    }
+
+    /// Sleep past `station`'s current session RTO (real time: ARQ timers are
+    /// `std::time::Instant`s).
+    fn sleep_past_session_rto(station: &EventLoop) {
+        let rto = station
+            .session_link
+            .as_ref()
+            .map_or(Duration::ZERO, |l| l.tx.rto());
+        std::thread::sleep(rto + Duration::from_millis(5));
+    }
+
+    /// Every `DataOut` payload queued on `rx`, in order.
+    fn drain_data_out(rx: &mut mpsc::Receiver<coppa_host::HostResponse>) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Ok(resp) = rx.try_recv() {
+            if let coppa_host::HostResponse::DataOut { data, .. } = resp {
+                out.push(data);
+            }
+        }
+        out
+    }
+
+    /// Wire a VARA command-port channel to `station`, for its `BUFFER`,
+    /// `PTT` and session lines.
+    fn vara_lines(station: &mut EventLoop) -> mpsc::Receiver<VaraResponse> {
+        let (tx, rx) = mpsc::channel(1024);
+        station.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, tx)]))));
+        rx
+    }
+
+    /// Every `BUFFER`/`DISCONNECTED` line queued on `rx`, in order, as the
+    /// host reads them.
+    fn drain_status(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<String> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|response| match response {
+                VaraResponse::Buffer(n) => Some(format!("BUFFER {n}")),
+                VaraResponse::Disconnected => Some("DISCONNECTED".to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Read whatever `consumer` holds, without asserting it is non-empty.
+    fn read_all(consumer: &mut coppa_audio::AudioRingConsumer) -> Vec<f32> {
+        let mut buf = vec![0.0f32; 4_000_000];
+        let read = consumer.read(&mut buf);
+        buf.truncate(read);
+        buf
+    }
+
+    /// COP-38, the ticket's scenario at the dispatch level: with
+    /// `arq_enabled = false` (the default), a connected-session write is
+    /// delivered to the peer's host, the peer keys an ACK, and that ACK
+    /// clears the sender's in-flight segment and `BUFFER` -- none of it
+    /// through the raw `arq_tx` path.
+    #[tokio::test]
+    async fn connected_session_write_is_delivered_and_acked_with_arq_disabled() {
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
+        let (data_tx, mut data_rx) = mpsc::channel(64);
+        b.set_response_tx(data_tx);
+        let payload = b"twenty-eight bytes of B2F!!!".to_vec();
+        assert_eq!(payload.len(), 28);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: payload.clone(),
+        })
+        .await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "the data frame"))
+            .await;
+        assert_eq!(drain_data_out(&mut data_rx), vec![payload]);
+        let ack = take_leg(&mut b_consumer, "b's ACK");
+        assert_eq!(a.session_link.as_ref().unwrap().tx.in_flight(), 1);
+        unstick_decoder(&mut a);
+        a.decode_and_dispatch_audio(&ack).await;
+        assert_eq!(a.session_link.as_ref().unwrap().tx.in_flight(), 0);
+        assert_eq!(a.buffered_tx_bytes(), 0);
+        assert!(!a.config.engine.arq_enabled);
+        assert!(
+            a.arq_tx.is_none(),
+            "session data never needs the raw ARQ pair"
+        );
+    }
+
+    /// COP-38 (D8): a duplicate data frame (our ACK was lost, so the peer
+    /// sent it again) is ACKed again but delivered to the host only once.
+    #[tokio::test]
+    async fn a_duplicate_session_frame_is_acked_but_delivered_once() {
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
+        let (data_tx, mut data_rx) = mpsc::channel(64);
+        b.set_response_tx(data_tx);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"once".to_vec(),
+        })
+        .await;
+        let frame = take_leg(&mut a_consumer, "the data frame");
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&frame).await;
+        take_leg(&mut b_consumer, "b's first ACK");
+        b.handle_ptt_change(false).await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&frame).await;
+        take_leg(&mut b_consumer, "b's ACK for the duplicate");
+        assert_eq!(drain_data_out(&mut data_rx), vec![b"once".to_vec()]);
+    }
+
+    /// COP-38 (D3): a session data frame whose payload is not a reliable
+    /// `TransportPdu` (what a pre-0.3.0 peer sends) reaches neither the host
+    /// nor the ACK path, and is warned about once per link.
+    #[tokio::test]
+    async fn a_non_reliable_session_payload_is_dropped_without_dataout_or_ack() {
+        let (_a, mut b, _a_consumer, mut b_consumer) = connected_pair(0).await;
+        let (data_tx, mut data_rx) = mpsc::channel(64);
+        b.set_response_tx(data_tx);
+        let legacy = MacPdu::new_data(
+            Callsign::new("W1AW").unwrap(),
+            Callsign::new("VK3ABC").unwrap(),
+            0,
+            b"plain old payload".to_vec(),
+        );
+        b.handle_mac_pdu(legacy).await;
+        assert!(drain_data_out(&mut data_rx).is_empty());
+        assert!(read_all(&mut b_consumer).is_empty(), "no ACK may key");
+        assert!(b.session_link.as_ref().unwrap().warned_legacy_payload);
+    }
+
+    /// COP-38 (D2): a new session starts at seq 0 on both ends, whatever the
+    /// previous session's link had reached.
+    #[tokio::test]
+    async fn session_link_restarts_at_seq_zero_on_reestablishment() {
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"first session".to_vec(),
+        })
+        .await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "the data frame"))
+            .await;
+        unstick_decoder(&mut a);
+        a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "b's ACK"))
+            .await;
+        assert_eq!(a.session_link.as_ref().unwrap().tx.next_seq(), 1);
+        assert_eq!(b.session_link.as_ref().unwrap().rx.recv_base(), 1);
+
+        a.handle_ptt_change(false).await;
+        b.handle_ptt_change(false).await;
+        a.handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+            .await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "DISCONNECT"))
+            .await;
+        assert!(a.session_link.is_none() && b.session_link.is_none());
+        a.handle_ptt_change(false).await;
+
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "VK3ABC".into(),
+            destination: "W1AW".into(),
+        })
+        .await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_REQ"))
+            .await;
+        unstick_decoder(&mut a);
+        a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "CONNECT_ACK"))
+            .await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_CFM"))
+            .await;
+        let (a_link, b_link) = (
+            a.session_link.as_ref().unwrap(),
+            b.session_link.as_ref().unwrap(),
+        );
+        assert_eq!((a_link.tx.next_seq(), a_link.rx.recv_base()), (0, 0));
+        assert_eq!((b_link.tx.next_seq(), b_link.rx.recv_base()), (0, 0));
+    }
+
+    /// COP-38, the ticket's Gherkin at the dispatch level: a data frame lost
+    /// in transit is detected by `ArqTx` (no ACK within the RTO),
+    /// retransmitted by `check_session_retransmits`, and delivered to the
+    /// peer's host exactly once; the peer's ACK then clears it.
+    #[tokio::test]
+    async fn lost_session_data_frame_is_retransmitted_and_delivered_once() {
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
+        let (data_tx, mut data_rx) = mpsc::channel(64);
+        b.set_response_tx(data_tx);
+        let mut status_rx = vara_lines(&mut a);
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"lost then found".to_vec(),
+        })
+        .await;
+        take_leg(&mut a_consumer, "the data frame that is lost");
+        a.handle_ptt_change(false).await;
+        sleep_past_session_rto(&a);
+        a.check_session_retransmits().await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "the retransmission"))
+            .await;
+        assert_eq!(
+            drain_data_out(&mut data_rx),
+            vec![b"lost then found".to_vec()]
+        );
+        unstick_decoder(&mut a);
+        a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "b's ACK"))
+            .await;
+        assert_eq!(a.session_link.as_ref().unwrap().tx.in_flight(), 0);
+        assert_eq!(a.buffered_tx_bytes(), 0);
+        assert!(drain_status(&mut status_rx).iter().any(|s| s == "BUFFER 0"));
+    }
+
+    /// COP-38: a lost ACK makes the sender retransmit; the receiver drops the
+    /// duplicate (no second `DataOut`) and re-ACKs, which clears the sender.
+    #[tokio::test]
+    async fn lost_session_ack_is_recovered_without_a_duplicate_delivery() {
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
+        let (data_tx, mut data_rx) = mpsc::channel(64);
+        b.set_response_tx(data_tx);
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"acked twice".to_vec(),
+        })
+        .await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "the data frame"))
+            .await;
+        take_leg(&mut b_consumer, "b's ACK, which is lost");
+        b.handle_ptt_change(false).await;
+        a.handle_ptt_change(false).await;
+        sleep_past_session_rto(&a);
+        a.check_session_retransmits().await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "the retransmission"))
+            .await;
+        assert_eq!(drain_data_out(&mut data_rx), vec![b"acked twice".to_vec()]);
+        unstick_decoder(&mut a);
+        a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "b's re-ACK"))
+            .await;
+        assert_eq!(a.session_link.as_ref().unwrap().tx.in_flight(), 0);
+    }
+
+    /// COP-38 (D7): a link whose every frame is lost ends cleanly once the
+    /// retry budget is spent: the host hears `BUFFER 0` then `DISCONNECTED`,
+    /// the session is gone, and the last frame keyed is a DISCONNECT the
+    /// peer acts on.
+    #[tokio::test]
+    async fn exhausted_session_link_sends_disconnect_and_reports_disconnected() {
+        let (mut a, mut b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        let mut status_rx = vara_lines(&mut a);
+        let mut b_status_rx = vara_lines(&mut b);
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"nobody hears this".to_vec(),
+        })
+        .await;
+        let mut last_leg = Vec::new();
+        for _ in 0..40 {
+            if a.session_link.is_none() {
+                break;
+            }
+            let leg = read_all(&mut a_consumer);
+            if !leg.is_empty() {
+                last_leg = leg;
+            }
+            a.handle_ptt_change(false).await;
+            sleep_past_session_rto(&a);
+            a.check_session_retransmits().await;
+        }
+        assert!(
+            a.session_link.is_none(),
+            "the link must fail within the budget"
+        );
+        let leg = read_all(&mut a_consumer);
+        if !leg.is_empty() {
+            last_leg = leg;
+        }
+        assert!(a.session_mgr.active_sessions().is_empty());
+        assert_eq!(a.buffered_tx_bytes(), 0);
+        let lines = drain_status(&mut status_rx);
+        let buffer_0 = lines.iter().position(|l| l == "BUFFER 0");
+        let disconnected = lines.iter().position(|l| l == "DISCONNECTED");
+        assert!(
+            buffer_0.is_some() && disconnected.is_some() && buffer_0 < disconnected,
+            "BUFFER 0 must precede DISCONNECTED, got {lines:?}"
+        );
+
+        assert!(!last_leg.is_empty(), "a must key its DISCONNECT");
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&with_lead_and_trail(&last_leg))
+            .await;
+        assert!(b.session_mgr.active_sessions().is_empty());
+        assert!(drain_status(&mut b_status_rx)
+            .iter()
+            .any(|l| l == "DISCONNECTED"));
+    }
+
+    /// COP-38 (D9a): the 8000-byte write the old large-write test carried,
+    /// at the MAC layer: every frame `a` sends is a real `encode_bytes`, `b`
+    /// receives each one rebuilt from `a`'s segment data through
+    /// `handle_mac_pdu`, and `a` gets `b`'s real ACK the same way. The byte
+    /// stream reassembles exactly, one stop-and-wait frame at a time. (The
+    /// real-audio half is `cop60_turnaround`'s 1000-byte cable test.)
+    #[tokio::test]
+    async fn session_write_of_8000_bytes_is_chunked_acked_and_reassembled() {
+        let (mut a, mut b, _a_consumer, _b_consumer) = connected_pair(0).await;
+        let (data_tx, mut data_rx) = mpsc::channel(4096);
+        b.set_response_tx(data_tx);
+        let payload: Vec<u8> = (0..8000).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+        let frames_before = a.tx_frame_count;
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: payload.clone(),
+        })
+        .await;
+        let mut collected = Vec::new();
+        for _ in 0..1000 {
+            let Some(link) = a.session_link.as_ref() else {
+                break;
+            };
+            if link.tx.in_flight() == 0 {
+                break;
+            }
+            let seq = link.tx.send_base();
+            let frame = session_data_frame(link, seq, link.tx.get_segment_data(seq).unwrap());
+            b.handle_mac_pdu(MacPdu::from_bytes(&frame).unwrap()).await;
+            for data in drain_data_out(&mut data_rx) {
+                collected.extend(data);
+            }
+            b.handle_ptt_change(false).await;
+            let ack = session_ack_frame(b.session_link.as_ref().unwrap());
+            a.handle_ptt_change(false).await;
+            a.handle_mac_pdu(MacPdu::from_bytes(&ack).unwrap()).await;
+        }
+        assert_eq!(
+            collected, payload,
+            "the byte stream must reassemble exactly"
+        );
+        let link = a.session_link.as_ref().unwrap();
+        assert!(link.backlog.is_empty() && link.tx.in_flight() == 0);
+        // At most 95 host bytes fit a level-2 frame (budget 117 minus the
+        // 14-byte MAC and 7-byte transport headers minus one).
+        let min_frames = payload.len().div_ceil(95);
+        let frames = a.tx_frame_count - frames_before;
+        assert!(
+            frames >= min_frames,
+            "need >= {min_frames} frames, got {frames}"
+        );
+        assert_eq!(a.buffered_tx_bytes(), 0);
     }
 
     /// COP-41 (D4): `min_level_budget` is derived from the ladder, not a
@@ -9704,7 +10476,7 @@ mod tests {
             )
         }
 
-        fn seed_established(event_loop: &mut EventLoop) -> u8 {
+        pub(super) fn seed_established(event_loop: &mut EventLoop) -> u8 {
             let id = event_loop
                 .session_mgr
                 .create(
@@ -10884,14 +11656,13 @@ mod tests {
         }
 
         /// COP-30: established-session data reports `BUFFER` too -- before
-        /// its PTT keys -- and drains at PTT release. COP-41 paces session
-        /// chunks one frame per keyed interval, so the second write's bytes
-        /// are held in the session queue while the first frame plays: the
-        /// exact old line sequence no longer holds, and the assertions check
-        /// the BUFFER values' first/contains plus the PTT alternation
-        /// instead.
+        /// its PTT keys. COP-41 paced session chunks one frame per keyed
+        /// interval and drained `BUFFER` at PTT release; COP-38 keeps the
+        /// pacing (every `PTT ON` after the first follows a release) but
+        /// makes it stop-and-wait, so the second frame keys only after the
+        /// peer's ACK, and `BUFFER` falls on each ACK instead of on release.
         #[tokio::test]
-        async fn test_session_path_emits_buffer_and_drains_on_ptt_release() {
+        async fn test_session_path_emits_buffer_and_drains_on_peer_ack() {
             let mut event_loop = EventLoop::new(session_config()).unwrap();
             let (mut reader, _write_half) =
                 connect_mock_vara_client(&mut event_loop, 19494, 19495).await;
@@ -10909,31 +11680,23 @@ mod tests {
                     data: vec![0x77; 4],
                 })
                 .await;
+            let generation = event_loop.tx_generation;
             event_loop.handle_ptt_change(false).await;
+            assert_eq!(
+                event_loop.tx_generation, generation,
+                "the release must not key the second frame before the ACK"
+            );
+            ack_in_flight(&mut event_loop).await;
+            event_loop.handle_ptt_change(false).await;
+            ack_in_flight(&mut event_loop).await;
 
             let lines = read_available_lines(&mut reader).await;
-            let values = buffer_values(&lines);
             assert_eq!(
-                values.first(),
-                Some(&"BUFFER 12"),
-                "the first write's bytes must be counted before they key, got: {:?}",
+                buffer_values(&lines),
+                vec!["BUFFER 12", "BUFFER 16", "BUFFER 4", "BUFFER 0"],
+                "BUFFER must count unacknowledged bytes and fall on each ACK, got: {:?}",
                 lines
             );
-            assert!(
-                values.contains(&"BUFFER 16"),
-                "the second write's bytes must be counted while the first frame \
-                 is keyed, got: {:?}",
-                lines
-            );
-            assert!(
-                values.contains(&"BUFFER 4"),
-                "the held second frame must replace the released first frame's \
-                 bytes, got: {:?}",
-                lines
-            );
-            // Pacing (COP-41 D3): every PTT ON after the first must follow a
-            // release -- one frame per keyed interval, never two frames in
-            // one keyed blast.
             let ptt: Vec<&str> = lines
                 .iter()
                 .map(|s| s.trim_end())
@@ -10941,7 +11704,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 ptt,
-                ["PTT ON", "PTT OFF", "PTT ON"],
+                ["PTT ON", "PTT OFF", "PTT ON", "PTT OFF"],
                 "two writes must key two separate intervals, got: {:?}",
                 lines
             );
@@ -10951,6 +11714,433 @@ mod tests {
                 first_buffer.is_some() && first_ptt_on.is_some() && first_buffer < first_ptt_on,
                 "BUFFER 12 must reach the host before the first PTT ON, got: {:?}",
                 lines
+            );
+        }
+
+        /// COP-38 (D6): session `BUFFER` counts bytes the peer has not yet
+        /// acknowledged, so a PTT release alone (the frame played, but may
+        /// have been lost) never reports `BUFFER 0`; the peer's ACK does.
+        #[tokio::test]
+        async fn session_buffer_falls_on_peer_ack_not_on_ptt_release() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19560, 19561).await;
+            seed_established(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x12; 12],
+                })
+                .await;
+            event_loop.handle_ptt_change(false).await;
+            let lines = read_available_lines(&mut reader).await;
+            assert_eq!(buffer_values(&lines), vec!["BUFFER 12"], "got: {:?}", lines);
+
+            ack_in_flight(&mut event_loop).await;
+            let lines = read_available_lines(&mut reader).await;
+            assert_eq!(buffer_values(&lines), vec!["BUFFER 0"], "got: {:?}", lines);
+        }
+
+        /// COP-38 (D4): one frame in flight at a time. A release with the
+        /// first frame un-ACKed keys nothing; the ACK keys the next frame.
+        #[tokio::test]
+        async fn stop_and_wait_sends_the_next_chunk_only_after_the_ack() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            seed_established(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: (0..300).map(|i| (i % 251) as u8).collect(),
+                })
+                .await;
+            let generation = event_loop.tx_generation;
+            assert_eq!(generation, 1, "the first frame keys at once");
+            event_loop.handle_ptt_change(false).await;
+            assert_eq!(event_loop.tx_generation, generation);
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 1);
+            ack_in_flight(&mut event_loop).await;
+            assert_eq!(event_loop.tx_generation, generation + 1);
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 1);
+        }
+
+        /// COP-38 (D1): session data uses its own link, never the raw
+        /// `arq_tx` window, even with `arq_enabled = true`.
+        #[tokio::test]
+        async fn session_data_never_enters_the_raw_arq_window() {
+            let mut config = session_config();
+            config.engine.arq_enabled = true;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            seed_established(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x40; 40],
+                })
+                .await;
+            assert_eq!(event_loop.arq_tx.as_ref().unwrap().in_flight(), 0);
+            assert!(event_loop.arq_tx_backlog.is_empty());
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 1);
+        }
+
+        /// COP-38: a session ACK from a station we have no session with, or
+        /// whose session is not established, changes nothing.
+        #[tokio::test]
+        async fn an_ack_from_an_unknown_or_unestablished_peer_changes_nothing() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            let id = seed_established(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x41; 20],
+                })
+                .await;
+            let ack = TransportPdu::new_ack(0, 1, 0).to_bytes();
+            let stranger = MacPdu::new(
+                MacFrameType::Ack,
+                Callsign::new("VK3ABC").unwrap(),
+                Callsign::new("N0CALL").unwrap(),
+                0,
+                ack.clone(),
+            );
+            event_loop.handle_mac_pdu(stranger).await;
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 1);
+
+            event_loop.session_mgr.get_mut(id).unwrap().state = SessionState::Disconnecting;
+            let peer = MacPdu::new(
+                MacFrameType::Ack,
+                Callsign::new("VK3ABC").unwrap(),
+                Callsign::new("W1AW").unwrap(),
+                0,
+                ack,
+            );
+            event_loop.handle_mac_pdu(peer).await;
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 1);
+            assert_eq!(event_loop.buffered_tx_bytes(), 20);
+        }
+
+        /// COP-38: an ACK for more than was sent (a stale ACK from an earlier
+        /// session with this peer) is ignored rather than pushing `send_base`
+        /// past `next_seq`, which would leave the window full forever.
+        #[tokio::test]
+        async fn a_session_ack_beyond_what_is_in_flight_is_ignored() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            seed_established(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x42; 20],
+                })
+                .await;
+            let stale = MacPdu::new(
+                MacFrameType::Ack,
+                Callsign::new("VK3ABC").unwrap(),
+                Callsign::new("W1AW").unwrap(),
+                0,
+                TransportPdu::new_ack(0, 5, 0).to_bytes(),
+            );
+            event_loop.handle_mac_pdu(stale).await;
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!((link.tx.send_base(), link.tx.next_seq()), (0, 1));
+            assert_eq!(event_loop.buffered_tx_bytes(), 20);
+
+            ack_in_flight(&mut event_loop).await;
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 0);
+            assert_eq!(event_loop.buffered_tx_bytes(), 0);
+        }
+
+        /// COP-38: a frame from the session's peer that is addressed to
+        /// another station, or sent on another SSID (the peer reconnected
+        /// elsewhere and its DISCONNECT to us was lost), is not this
+        /// session's: its ACK frees nothing, its data is neither delivered
+        /// nor taken into the receive window, and its DISCONNECT ends nothing.
+        #[tokio::test]
+        async fn a_session_frame_addressed_to_another_station_changes_nothing() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            let (data_tx, mut data_rx) = mpsc::channel(64);
+            event_loop.set_response_tx(data_tx);
+            let id = seed_established(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x43; 20],
+                })
+                .await;
+            for (dest, ssid) in [("K1ABC", 0), ("VK3ABC", 3)] {
+                let frame = |frame_type: MacFrameType, payload: Vec<u8>| {
+                    MacPdu::new(
+                        frame_type,
+                        Callsign::new(dest).unwrap(),
+                        Callsign::new("W1AW").unwrap(),
+                        ssid,
+                        payload,
+                    )
+                };
+                let ack = TransportPdu::new_ack(0, 1, 0).to_bytes();
+                let data = TransportPdu::new_reliable(0, 0, 0, b"not ours".to_vec()).to_bytes();
+                event_loop
+                    .handle_mac_pdu(frame(MacFrameType::Ack, ack))
+                    .await;
+                event_loop
+                    .handle_mac_pdu(frame(MacFrameType::Data, data))
+                    .await;
+                event_loop
+                    .handle_mac_pdu(frame(MacFrameType::Disconnect, Vec::new()))
+                    .await;
+                let link = event_loop.session_link.as_ref().unwrap();
+                assert_eq!(
+                    (link.session_id, link.tx.in_flight(), link.rx.recv_base()),
+                    (id, 1, 0),
+                    "{dest}/{ssid}"
+                );
+                assert_eq!(event_loop.buffered_tx_bytes(), 20, "{dest}/{ssid}");
+                assert!(
+                    event_loop
+                        .session_mgr
+                        .get(id)
+                        .is_some_and(|s| s.is_established()),
+                    "{dest}/{ssid}"
+                );
+            }
+            assert!(drain_data_out(&mut data_rx).is_empty());
+
+            ack_in_flight(&mut event_loop).await;
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 0);
+            assert_eq!(event_loop.buffered_tx_bytes(), 0);
+        }
+
+        /// COP-38: a dial refused because a session is up is answered to the
+        /// dialling client alone. The session is still up, so the other
+        /// hosts must not hear `DISCONNECTED`.
+        #[tokio::test]
+        async fn a_refused_dial_is_answered_only_to_the_dialling_client() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            let cmd_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let data_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let cmd_addr = cmd_listener.local_addr().unwrap();
+            let mut server = VaraServer::new(cmd_addr.port(), 0);
+            station.set_vara_responses(server.response_senders());
+            let mut events = server.take_event_rx().unwrap();
+            tokio::spawn(async move {
+                let _ = server.run_with_listeners(cmd_listener, data_listener).await;
+            });
+            let mut clients = Vec::new();
+            for _ in 0..2 {
+                let (read_half, write_half) =
+                    TcpStream::connect(cmd_addr).await.unwrap().into_split();
+                let mut reader = BufReader::new(read_half);
+                assert!(read_line(&mut reader).await.starts_with("VERSION"));
+                let client_id = loop {
+                    if let Some(HostEvent::Connected { client_id }) = events.recv().await {
+                        break client_id;
+                    }
+                };
+                clients.push((client_id, reader, write_half));
+            }
+            seed_established(&mut station);
+
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: clients[0].0,
+                    source: "VK3ABC".into(),
+                    destination: "K2XYZ".into(),
+                })
+                .await;
+            let dialler = read_available_lines(&mut clients[0].1).await;
+            let other = read_available_lines(&mut clients[1].1).await;
+            assert!(
+                dialler.iter().any(|l| l.trim_end() == "DISCONNECTED"),
+                "{dialler:?}"
+            );
+            assert!(
+                other.iter().all(|l| l.trim_end() != "DISCONNECTED"),
+                "{other:?}"
+            );
+        }
+
+        /// COP-38: one session at a time. A CONNECT_REQ while a session is
+        /// established (from another station, from the same peer on another
+        /// SSID, or a repeat from the peer itself) gets no session, so its
+        /// CFM cannot rebuild the established session's link (backlog,
+        /// in-flight segment, seq); a host dial is refused with
+        /// `DISCONNECTED`.
+        #[tokio::test]
+        async fn a_second_session_is_refused_while_one_is_active() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            station.listening = true;
+            let (resp_tx, mut resp_rx) = mpsc::channel(64);
+            station.set_response_tx(resp_tx);
+            let id = seed_established(&mut station);
+            station
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x44; 20],
+                })
+                .await;
+
+            for (caller, ssid) in [("K1ABC", 0), ("W1AW", 5), ("W1AW", 0)] {
+                let mut other = coppa_protocol::session::Session::new(
+                    0,
+                    Callsign::new(caller).unwrap(),
+                    Callsign::new("VK3ABC").unwrap(),
+                    ssid,
+                    LinkCapabilities::default(),
+                );
+                station.handle_mac_pdu(other.initiate().unwrap()).await;
+                let cfm = other
+                    .handle_connect_ack(&LinkCapabilities::default().to_bytes())
+                    .unwrap();
+                station.handle_mac_pdu(cfm).await;
+                assert_eq!(
+                    station.session_mgr.active_sessions(),
+                    vec![id],
+                    "{caller}/{ssid}"
+                );
+                let link = station.session_link.as_ref().unwrap();
+                assert_eq!(
+                    (link.session_id, link.tx.in_flight()),
+                    (id, 1),
+                    "{caller}/{ssid}"
+                );
+                assert_eq!(station.buffered_tx_bytes(), 20, "{caller}/{ssid}");
+            }
+
+            while resp_rx.try_recv().is_ok() {}
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "VK3ABC".into(),
+                    destination: "K2XYZ".into(),
+                })
+                .await;
+            let statuses: Vec<String> = std::iter::from_fn(|| resp_rx.try_recv().ok())
+                .filter_map(|response| match response {
+                    coppa_host::HostResponse::StatusUpdate { status, .. } => Some(status),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(statuses, ["DISCONNECTED"]);
+            assert_eq!(station.session_mgr.active_sessions(), vec![id]);
+            assert_eq!(station.session_link.as_ref().unwrap().session_id, id);
+        }
+
+        /// COP-38 (D3): a session data frame is a `Reliable` `TransportPdu`
+        /// inside a MAC `Data` frame from the session's local callsign to its
+        /// remote, with the transport ACK fields zero.
+        #[test]
+        fn session_data_frame_is_a_reliable_transport_pdu_in_a_mac_data_frame() {
+            let link = test_link();
+            let mac = MacPdu::from_bytes(&session_data_frame(&link, 3, b"abc")).unwrap();
+            assert_eq!(mac.frame_type, MacFrameType::Data);
+            assert_eq!(mac.src, link.local);
+            assert_eq!(mac.dest, link.remote);
+            let segment = TransportPdu::from_bytes(&mac.payload).unwrap();
+            assert_eq!(segment.transport_type, TransportType::Reliable);
+            assert_eq!(
+                (segment.seq_num, segment.ack_num, segment.ack_bitmap),
+                (3, 0, 0)
+            );
+            assert_eq!(segment.payload, b"abc");
+        }
+
+        /// COP-38 (D3): a session ACK is a MAC `Ack` frame carrying a
+        /// transport ACK for what the link's `ArqRx` holds.
+        #[test]
+        fn session_ack_frame_is_a_mac_ack_carrying_a_transport_ack() {
+            let mut link = test_link();
+            link.rx.receive(0, b"x".to_vec());
+            let mac = MacPdu::from_bytes(&session_ack_frame(&link)).unwrap();
+            assert_eq!(mac.frame_type, MacFrameType::Ack);
+            assert_eq!(mac.src, link.local);
+            assert_eq!(mac.dest, link.remote);
+            let ack = TransportPdu::from_bytes(&mac.payload).unwrap();
+            assert_eq!(ack.transport_type, TransportType::Ack);
+            assert_eq!((ack.ack_num, ack.ack_bitmap), (1, 0));
+        }
+
+        /// COP-38 (D7): a retransmission rebuilt from the segment data is
+        /// byte-identical to the frame first sent.
+        #[test]
+        fn retransmitted_frame_is_rebuilt_byte_identical() {
+            let mut link = test_link();
+            let first = session_data_frame(&link, 0, b"identical");
+            let seq = link.tx.send(b"identical".to_vec(), Instant::now()).unwrap();
+            let rebuilt = session_data_frame(&link, seq, link.tx.get_segment_data(seq).unwrap());
+            assert_eq!(first, rebuilt);
+        }
+
+        fn test_link() -> SessionLink {
+            SessionLink {
+                session_id: 0,
+                remote: Callsign::new("W1AW").unwrap(),
+                local: Callsign::new("VK3ABC").unwrap(),
+                ssid: 0,
+                tx: ArqTx::new(
+                    ArqConfig::new(SESSION_ARQ_WINDOW, 5, Duration::from_secs(5)).unwrap(),
+                ),
+                rx: ArqRx::new(SESSION_ARQ_WINDOW),
+                backlog: VecDeque::new(),
+                give_up_at: None,
+                warned_legacy_payload: false,
+            }
+        }
+
+        /// COP-38 (D7): a retransmission that no longer encodes (the speed
+        /// level dropped under a chunk sized for the old one) still spends
+        /// the retry budget, so the link fails rather than retrying forever
+        /// in silence.
+        #[tokio::test]
+        async fn a_retransmission_that_no_longer_encodes_still_spends_the_budget() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            let (producer, mut consumer) = coppa_audio::audio_ring(4_000_000);
+            event_loop.set_audio_out(producer);
+            let id = seed_established(&mut event_loop);
+            event_loop.ensure_session_link(id);
+            fast_session_rto(&mut event_loop);
+            let mut seed: u32 = 0x38_38_38_38;
+            let data: Vec<u8> = (0..90)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    (seed >> 16) as u8
+                })
+                .collect();
+            event_loop
+                .handle_host_event(HostEvent::DataReceived { client_id: 1, data })
+                .await;
+            let seq = event_loop.session_link.as_ref().unwrap().tx.send_base();
+            let link = event_loop.session_link.as_ref().unwrap();
+            let frame = session_data_frame(link, seq, link.tx.get_segment_data(seq).unwrap());
+            event_loop.engine.set_speed_level(1).unwrap();
+            assert!(
+                event_loop.engine.encode_bytes(&frame).is_err(),
+                "the level-2 frame must not encode at level 1"
+            );
+            event_loop.handle_ptt_change(false).await;
+            read_all(&mut consumer);
+            let mut counts = Vec::new();
+            for _ in 0..20 {
+                if event_loop.session_link.is_none() {
+                    break;
+                }
+                sleep_past_session_rto(&event_loop);
+                event_loop.check_session_retransmits().await;
+                if let Some(link) = event_loop.session_link.as_ref() {
+                    counts.push(link.tx.transmit_count(seq).unwrap());
+                    assert!(
+                        read_all(&mut consumer).is_empty(),
+                        "a frame that does not encode plays nothing"
+                    );
+                }
+            }
+            assert!(event_loop.session_link.is_none(), "the link must fail");
+            assert!(event_loop.session_mgr.get(id).is_none());
+            assert_eq!(
+                &counts[..5],
+                &[2, 3, 4, 5, 6],
+                "every pass counts: {counts:?}"
             );
         }
 
@@ -10994,15 +12184,16 @@ mod tests {
 
         /// COP-41: session chunks are sized by MEASURING the framed PDU
         /// (`encoded_payload_len`), never predicted -- 2000 incompressible
-        /// bytes split into chunks that each fit the level-2 budget (117),
-        /// pinning the halving path for binary content. Without chunking
-        /// this write produced zero samples (the research probe).
+        /// bytes split into chunks that each fit the level-2 budget (117).
+        /// COP-38 cuts one chunk per send from the link's backlog, framed with
+        /// the transport header and its real seq, so the check walks the
+        /// stop-and-wait stream: each in-flight segment's frame must fit, and
+        /// the segments must reassemble the input. Without chunking this
+        /// write produced zero samples (the research probe).
         #[tokio::test]
         async fn session_chunks_respect_the_encoded_budget() {
             let mut event_loop = EventLoop::new(session_config()).unwrap();
             seed_established(&mut event_loop);
-            // Hold the queue so every chunk stays inspectable.
-            event_loop.is_transmitting = true;
 
             let mut seed: u32 = 0xC0_41_C0_41;
             let data: Vec<u8> = (0..2000)
@@ -11018,34 +12209,36 @@ mod tests {
                 })
                 .await;
 
+            let budget = max_payload_for_level(event_loop.engine.speed_level()).unwrap();
+            let mut segments: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..1000 {
+                let link = event_loop.session_link.as_ref().unwrap();
+                if link.tx.in_flight() == 0 {
+                    break;
+                }
+                let seq = link.tx.send_base();
+                let segment = link.tx.get_segment_data(seq).unwrap();
+                assert!(
+                    event_loop
+                        .engine
+                        .encoded_payload_len(&session_data_frame(link, seq, segment))
+                        <= budget,
+                    "every frame must fit the level budget"
+                );
+                segments.push(segment.to_vec());
+                event_loop.handle_ptt_change(false).await;
+                ack_in_flight(&mut event_loop).await;
+            }
             assert!(
-                !event_loop.session_tx_queue.is_empty(),
+                segments.len() > 1,
                 "2000 incompressible bytes must chunk, not vanish"
             );
-            let budget = max_payload_for_level(event_loop.engine.speed_level()).unwrap();
-            let mut host_bytes = 0usize;
-            let mut host_chunks: Vec<Vec<u8>> = Vec::new();
-            for chunk in &event_loop.session_tx_queue {
-                assert!(
-                    event_loop.engine.encoded_payload_len(&chunk.pdu_bytes) <= budget,
-                    "every chunk's framed PDU must fit the level budget"
-                );
-                host_bytes += chunk.host_len;
-                host_chunks.push(chunk.pdu_bytes[MacPdu::HEADER_SIZE..].to_vec());
-            }
-            assert_eq!(host_bytes, 2000, "chunks must partition the write");
             assert_eq!(
-                host_chunks.concat(),
+                segments.concat(),
                 data,
-                "chunk payloads must reassemble the input in order"
+                "segment payloads must reassemble the input in order"
             );
-
-            // And the first chunk really encodes once released.
-            event_loop.is_transmitting = false;
-            let first_len = event_loop.session_tx_queue.front().unwrap().host_len;
-            event_loop.drain_session_tx_queue().await;
-            assert_eq!(event_loop.tx_on_air_bytes, first_len);
-            assert_eq!(event_loop.session_tx_queue.len() + 1, host_chunks.len());
+            assert_eq!(event_loop.buffered_tx_bytes(), 0);
         }
 
         /// COP-41: no pacing regression for the common case -- a small
@@ -11071,7 +12264,8 @@ mod tests {
                 "a 5-byte write on an idle link must transmit without waiting \
                  for a PTT release"
             );
-            assert!(event_loop.session_tx_queue.is_empty());
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert!(link.backlog.is_empty() && link.tx.in_flight() == 1);
         }
 
         /// COP-41 (D3): a write that arrives while the link is keyed waits
@@ -11098,16 +12292,19 @@ mod tests {
                 0,
                 "nothing may join an already-keyed interval"
             );
-            assert_eq!(event_loop.session_tx_queue.len(), 1);
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!((link.backlog.len(), link.tx.in_flight()), (5, 0));
 
             event_loop.handle_ptt_change(false).await;
             assert!(
                 consumer.read(&mut buf) > 0,
-                "the release must start the queued chunk's own keyed interval"
+                "the release must start the held frame's own keyed interval"
             );
-            assert!(event_loop.session_tx_queue.is_empty());
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!((link.backlog.len(), link.tx.in_flight()), (0, 1));
         }
 
+<<<<<<< HEAD
         /// A session's unsent chunks die with the session (COP-41 review):
         /// after a remote DISCONNECT or a timeout, the queue holds none of
         /// its chunks, `BUFFER` stops counting them, and the next PTT
@@ -11115,6 +12312,14 @@ mod tests {
         /// the dead session's data on every release. A local DISCONNECT
         /// drains them first instead (COP-43, see
         /// `local_disconnect_drains_queued_chunks_before_the_disconnect_frame`).
+=======
+        /// A session's unsent data dies with the session (COP-41 review):
+        /// after a local DISCONNECT, a remote DISCONNECT, or a timeout, the
+        /// session link is gone (COP-38: its backlog and its un-acked frame
+        /// both), `BUFFER` stops counting them, and neither the next PTT
+        /// release nor an elapsed RTO keys anything -- before this, the queue
+        /// kept transmitting the dead session's data on every release.
+>>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
         #[tokio::test]
         async fn ended_session_discards_its_unsent_chunks() {
             #[derive(Debug, Clone, Copy)]
@@ -11127,15 +12332,17 @@ mod tests {
                 let (producer, mut consumer) = coppa_audio::audio_ring(4_000_000);
                 event_loop.set_audio_out(producer);
                 let id = seed_established(&mut event_loop);
-                // Hold the queue so the whole write stays unsent.
-                event_loop.is_transmitting = true;
+                event_loop.ensure_session_link(id);
+                fast_session_rto(&mut event_loop);
                 event_loop
                     .handle_host_event(HostEvent::DataReceived {
                         client_id: 1,
                         data: (0..1000).map(|i| (i % 251) as u8).collect(),
                     })
                     .await;
-                assert!(event_loop.session_tx_queue.len() > 1, "{end:?}");
+                let link = event_loop.session_link.as_ref().unwrap();
+                assert_eq!(link.tx.in_flight(), 1, "{end:?}");
+                assert!(!link.backlog.is_empty(), "{end:?}");
                 assert_eq!(event_loop.buffered_tx_bytes(), 1000, "{end:?}");
 
                 match end {
@@ -11158,24 +12365,35 @@ mod tests {
                     }
                 }
                 assert!(event_loop.session_mgr.get(id).is_none(), "{end:?}");
-                assert!(event_loop.session_tx_queue.is_empty(), "{end:?}");
+                assert!(event_loop.session_link.is_none(), "{end:?}");
                 assert_eq!(event_loop.buffered_tx_bytes(), 0, "{end:?}");
 
+<<<<<<< HEAD
                 // Discard whatever the end itself keyed, then release: no
                 // stale chunk may play.
+=======
+                // Discard whatever the end itself keyed (the data frame and
+                // the local DISCONNECT frame), then release: no stale frame
+                // may play, and no retransmission either.
+>>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
                 let mut buf = vec![0.0f32; 4_000_000];
                 while consumer.read(&mut buf) > 0 {}
                 let frames_before = event_loop.tx_frame_count;
+                let generation = event_loop.tx_generation;
                 event_loop.handle_ptt_change(false).await;
+                std::thread::sleep(Duration::from_millis(30));
+                event_loop.check_session_retransmits().await;
                 assert_eq!(
                     consumer.read(&mut buf),
                     0,
-                    "{end:?}: the release must not transmit the ended session's data"
+                    "{end:?}: neither the release nor the RTO may transmit the ended session's data"
                 );
                 assert_eq!(event_loop.tx_frame_count, frames_before, "{end:?}");
+                assert_eq!(event_loop.tx_generation, generation, "{end:?}");
             }
         }
 
+<<<<<<< HEAD
         /// The frame types `CoppaCore` decodes from one keyed interval's
         /// audio, in order. HF_STANDARD, the daemon's default profile:
         /// `CoppaCore::new()` would decode only a station-ID beacon.
@@ -11437,29 +12655,27 @@ mod tests {
 
         /// Unsent session chunks resume after canceled playback, once the
         /// output worker has discarded the canceled frame's buffered audio.
+=======
+        /// Canceled playback of a session frame (COP-41 resumed the unsent
+        /// chunks once the output worker discarded the canceled audio).
+        /// COP-38 is stop-and-wait: after the discard barrier the canceled
+        /// frame is still in flight (nothing else may key, and `BUFFER` still
+        /// counts all 300 bytes); its retransmission plays alone (none of the
+        /// canceled tail), and the peer's ACK then sends the next chunk.
+>>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
         #[tokio::test(start_paused = true)]
-        async fn cancelled_output_resumes_session_chunks_after_discard() {
+        async fn cancelled_session_frame_stays_in_flight_after_discard() {
             let mut rig = TxRig::new(session_config());
-            seed_established(&mut rig.event_loop);
+            let id = seed_established(&mut rig.event_loop);
+            rig.event_loop.ensure_session_link(id);
+            fast_session_rto(&mut rig.event_loop);
             rig.event_loop
                 .handle_host_event(HostEvent::DataReceived {
                     client_id: 1,
                     data: (0..300).map(|i| (i % 251) as u8).collect(),
                 })
                 .await;
-            let remaining: Vec<_> = rig
-                .event_loop
-                .session_tx_queue
-                .iter()
-                .map(|chunk| {
-                    rig.event_loop
-                        .engine
-                        .encode_bytes(&chunk.pdu_bytes)
-                        .unwrap()
-                })
-                .collect();
-            assert!(remaining.len() > 1);
-            let held_bytes = rig.event_loop.buffered_tx_bytes() - rig.event_loop.tx_on_air_bytes;
+            assert_eq!(rig.event_loop.buffered_tx_bytes(), 300);
 
             // Stall with canceled audio in both rings and the retained suffix.
             for _ in 0..16 {
@@ -11479,7 +12695,7 @@ mod tests {
                     assert_eq!(
                         lock_tx_output(&tx_output).submitted(),
                         submitted,
-                        "the next frame must wait for the discard barrier"
+                        "nothing may key before the discard barrier"
                     );
                     for _ in 0..100 {
                         if rig.feedback.played() >= submitted {
@@ -11499,29 +12715,47 @@ mod tests {
                 }
             );
             assert!(
-                rig.event_loop.is_transmitting,
-                "the unsent tail must resume"
+                !rig.event_loop.is_transmitting,
+                "stop-and-wait: the canceled frame is still in flight"
             );
-            assert_eq!(rig.event_loop.buffered_tx_bytes(), held_bytes);
-            assert_eq!(rig.event_loop.session_tx_queue.len(), remaining.len() - 1);
+            assert_eq!(rig.event_loop.buffered_tx_bytes(), 300);
+            let link = rig.event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx.in_flight(), 1);
+            let seq = link.tx.send_base();
+            let retransmission = rig
+                .event_loop
+                .engine
+                .encode_bytes(&session_data_frame(
+                    link,
+                    seq,
+                    link.tx.get_segment_data(seq).unwrap(),
+                ))
+                .unwrap();
 
-            let mut expected = Vec::new();
-            for frame in remaining {
-                expected.extend(frame);
-                rig.deliver(expected.len(), &[480, 1000]);
-                assert_eq!(
-                    rig.sink.captured, expected,
-                    "only unsent chunks should play"
-                );
-                let (generation, completed) = rig.next_completion().await;
-                assert!(completed);
-                rig.event_loop
-                    .handle_tx_complete(generation, completed)
-                    .await;
-            }
+            // ARQ timers are real `std::time::Instant`s.
+            std::thread::sleep(Duration::from_millis(30));
+            rig.event_loop.check_session_retransmits().await;
+            assert!(rig.event_loop.is_transmitting, "the retransmission keys");
+            rig.deliver(retransmission.len(), &[480, 1000]);
+            assert_eq!(
+                rig.sink.captured, retransmission,
+                "only the retransmitted frame should play"
+            );
+            let (generation, completed) = rig.next_completion().await;
+            assert!(completed);
+            rig.event_loop
+                .handle_tx_complete(generation, completed)
+                .await;
             assert!(!rig.event_loop.is_transmitting);
-            assert!(rig.event_loop.session_tx_queue.is_empty());
-            assert_eq!(rig.event_loop.buffered_tx_bytes(), 0);
+
+            ack_in_flight(&mut rig.event_loop).await;
+            assert!(
+                rig.event_loop.is_transmitting,
+                "the ACK sends the next chunk"
+            );
+            let link = rig.event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx.in_flight(), 1);
+            assert_eq!(link.tx.send_base(), seq.wrapping_add(1));
         }
 
         /// COP-41 (D5): the ARQ window's overflow is HELD in a backlog and
@@ -11805,7 +13039,10 @@ mod tests {
                 .await;
 
             assert!(event_loop.tx_queue.is_empty());
-            assert!(event_loop.session_tx_queue.is_empty());
+            assert!(event_loop
+                .session_link
+                .as_ref()
+                .is_none_or(|l| l.backlog.is_empty() && l.tx.in_flight() == 0));
             assert!(event_loop.arq_tx_backlog.is_empty());
             let mut buf = vec![0.0f32; 1_000_000];
             assert_eq!(
@@ -13043,39 +14280,34 @@ mod tests {
             );
         }
 
-        /// One established-session chunk carrying `payload`, as the
-        /// `DataReceived` session arm queues it.
-        fn session_chunk(payload: &[u8]) -> SessionTxChunk {
-            let pdu = MacPdu::new_data(
-                Callsign::new("W1AW").unwrap(),
-                Callsign::new("VK3ABC").unwrap(),
-                0,
-                payload.to_vec(),
-            );
-            SessionTxChunk {
-                session_id: 0,
-                pdu_bytes: pdu.to_bytes(),
-                host_len: payload.len(),
-            }
+        /// Write `payload` to `event_loop`'s established session, the way a
+        /// host does.
+        async fn session_write(event_loop: &mut EventLoop, payload: &[u8]) {
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: payload.to_vec(),
+                })
+                .await;
         }
 
-        /// COP-41 review: established-session chunks are held, not popped
-        /// into a refusal and lost, while the gate refuses between chunks
-        /// (session data has no MAC-level retry), and the ordinary retry
-        /// poll resumes them once the rig is back on 2m -- no PTT release
-        /// or host write is needed to restart the stream.
+        /// COP-41 review: established-session data is held, not cut into a
+        /// frame that the gate then refuses, while the gate refuses, and the
+        /// ordinary retry poll resumes it once the rig is back on 2m -- no
+        /// PTT release or host write is needed to restart the stream.
+        /// COP-38: the held bytes stay in the session link's backlog, and
+        /// nothing is in flight until the frame really keys.
         #[tokio::test]
         async fn held_session_chunks_drain_once_the_rig_is_back_on_vhf() {
             let rig = fake_rigctld("144500000");
             let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
-            for payload in [&b"first"[..], b"second"] {
-                event_loop
-                    .session_tx_queue
-                    .push_back(session_chunk(payload));
-            }
+            super::telemetry::seed_established(&mut event_loop);
             *rig.answer.lock().unwrap() = "14074000".into();
-            event_loop.drain_session_tx_queue().await;
-            assert_eq!(event_loop.session_tx_queue.len(), 2, "held, not dropped");
+            session_write(&mut event_loop, b"first").await;
+            session_write(&mut event_loop, b"second").await;
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.backlog.len(), 11, "held, not dropped");
+            assert_eq!(link.tx.in_flight(), 0);
             assert!(event_loop.session_tx_held_by_frequency_gate);
             assert_eq!(event_loop.tx_generation, 0);
             assert_eq!(
@@ -13086,25 +14318,26 @@ mod tests {
 
             event_loop.retry_held_tx_drain().await;
             assert_eq!(
-                event_loop.session_tx_queue.len(),
-                2,
+                event_loop.session_link.as_ref().unwrap().backlog.len(),
+                11,
                 "still on HF: still held"
             );
 
             *rig.answer.lock().unwrap() = "144500000".into();
             event_loop.retry_held_tx_drain().await;
-            assert_eq!(event_loop.session_tx_queue.len(), 1);
             assert!(!event_loop.session_tx_held_by_frequency_gate);
-            assert_eq!(event_loop.tx_generation, 1, "the first chunk went out");
+            assert_eq!(event_loop.tx_generation, 1, "the first frame went out");
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 1);
         }
 
-        /// COP-41 review: a session chunk that passes the pre-pop check but
-        /// is refused after the courtesy wait goes back at the head of the
-        /// queue rather than leaving a hole in the host's byte stream
-        /// (session data has no MAC-level retry), and the retry poll sends
-        /// it once the rig is back on 2m.
+        /// COP-41 review: a session frame that passes the pre-send check but
+        /// is refused after the courtesy wait leaves no hole in the host's
+        /// byte stream, and the retry poll sends it once the rig is back on
+        /// 2m. COP-38: `ArqTx::send` runs only after a real key-up, so the
+        /// refused bytes simply stay in the backlog, and `BUFFER` counts them
+        /// until the peer ACKs.
         #[tokio::test(start_paused = true)]
-        async fn a_post_wait_refusal_requeues_the_session_chunk() {
+        async fn a_post_wait_refusal_leaves_the_session_bytes_in_the_backlog() {
             let rig = fake_rigctld("144500000");
             let mut config = rigctld_config(&rig);
             config.audio.sample_rate = 48_000;
@@ -13114,6 +14347,7 @@ mod tests {
             let (audio_out_tx, _audio_out_rx) = coppa_audio::audio_ring(32_768);
             event_loop.set_audio_in(audio_in_rx);
             event_loop.set_audio_out(audio_out_tx);
+            super::telemetry::seed_established(&mut event_loop);
             let mut counter = 1u32;
             let mut noise = |amplitude: f32| -> Vec<f32> {
                 (0..1024)
@@ -13130,45 +14364,69 @@ mod tests {
                 event_loop.busy_gate.observe(&noise(0.5));
             }
             assert!(event_loop.busy_gate.current());
-            event_loop
-                .session_tx_queue
-                .push_back(session_chunk(b"first"));
-            event_loop
-                .session_tx_queue
-                .push_back(session_chunk(b"second"));
             {
-                let drain = event_loop.drain_session_tx_queue();
-                tokio::pin!(drain);
+                let write = session_write(&mut event_loop, b"first second");
+                tokio::pin!(write);
                 tokio::select! {
                     biased;
-                    _ = &mut drain => panic!("drain must wait for the busy channel"),
+                    _ = &mut write => panic!("the send must wait for the busy channel"),
                     _ = tokio::time::sleep(Duration::from_millis(100)) => {}
                 }
                 *rig.answer.lock().unwrap() = "14074000".into();
                 audio_in_tx.write(&noise(0.01));
-                tokio::time::timeout(Duration::from_secs(5), drain)
+                tokio::time::timeout(Duration::from_secs(5), write)
                     .await
                     .unwrap();
             }
-            assert_eq!(event_loop.tx_generation, 0, "the popped chunk was refused");
-            assert_eq!(
-                event_loop.session_tx_queue.len(),
-                2,
-                "the refused chunk is back in the queue"
-            );
-            assert_eq!(
-                event_loop.session_tx_queue.front().unwrap().host_len,
-                5,
-                "at the head, ahead of the chunk behind it"
-            );
-            assert_eq!(event_loop.buffered_tx_bytes(), 11, "BUFFER still counts it");
+            assert_eq!(event_loop.tx_generation, 0, "the frame was refused");
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx.in_flight(), 0, "ArqTx::send never ran");
+            assert_eq!(link.backlog.len(), 12, "every byte stays in the backlog");
+            assert_eq!(event_loop.buffered_tx_bytes(), 12, "BUFFER still counts it");
             assert!(event_loop.session_tx_held_by_frequency_gate);
 
             *rig.answer.lock().unwrap() = "144500000".into();
             event_loop.retry_held_tx_drain().await;
-            assert_eq!(event_loop.tx_generation, 1, "the refused chunk went out");
-            assert_eq!(event_loop.session_tx_queue.len(), 1);
-            assert_eq!(event_loop.session_tx_queue.front().unwrap().host_len, 6);
+            assert_eq!(event_loop.tx_generation, 1, "the refused frame went out");
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 1);
+            assert_eq!(
+                event_loop.buffered_tx_bytes(),
+                12,
+                "BUFFER counts it until the ACK"
+            );
+        }
+
+        /// COP-38 (D7) with COP-40: while the wideband gate refuses, the
+        /// session retransmit pass keys nothing and spends neither backoff
+        /// nor budget (the first-send path holds without loss, so the
+        /// retransmit path must too); once evidence is back, it retransmits.
+        #[tokio::test]
+        async fn wideband_gate_holds_session_retransmits_without_spending_the_budget() {
+            let rig = fake_rigctld("144500000");
+            let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            let id = super::telemetry::seed_established(&mut event_loop);
+            event_loop.ensure_session_link(id);
+            fast_session_rto(&mut event_loop);
+            session_write(&mut event_loop, b"held retransmit").await;
+            assert_eq!(event_loop.tx_generation, 1);
+            event_loop.handle_ptt_change(false).await;
+            let link = event_loop.session_link.as_ref().unwrap();
+            let seq = link.tx.send_base();
+            let rto = link.tx.rto();
+
+            *rig.answer.lock().unwrap() = "14074000".into();
+            sleep_past_session_rto(&event_loop);
+            event_loop.check_session_retransmits().await;
+            assert_eq!(event_loop.tx_generation, 1, "nothing keys while refused");
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx.transmit_count(seq), Some(1), "no budget spent");
+            assert_eq!(link.tx.rto(), rto, "no backoff spent");
+
+            *rig.answer.lock().unwrap() = "144500000".into();
+            event_loop.check_session_retransmits().await;
+            assert_eq!(event_loop.tx_generation, 2, "the retransmission keys");
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx.transmit_count(seq), Some(2));
         }
 
         /// A `LevelDerived` engine starts narrowband (no startup check
@@ -14331,6 +15589,308 @@ mod tests {
                 run.a_unacked_bytes > 0,
                 "an ACK sent into a keyed peer is lost"
             );
+        }
+
+        // ── COP-38: connected-session ARQ through the real run loops ──
+
+        /// Which keyed interval the session cable zeroes once the host write
+        /// is sent.
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum CableFault {
+            /// Nothing is lost.
+            None,
+            /// `a`'s first keyed interval after the write: the data frame.
+            DropFirstData,
+            /// `b`'s first keyed interval after the write: its ACK.
+            DropFirstAck,
+        }
+
+        struct SessionCableRun {
+            /// `b`'s `DataOut` payloads, in order.
+            delivered: Vec<Vec<u8>>,
+            a_in_flight: u8,
+            a_buffered: usize,
+            /// PTT-on edges after the host write was sent.
+            a_keyups_after_write: usize,
+            b_keyups_after_write: usize,
+            /// `a`'s `BUFFER`/`DISCONNECTED` lines after the write.
+            a_status: Vec<String>,
+            /// Virtual time from the write to the last delivered byte.
+            transfer_time: Option<Duration>,
+        }
+
+        /// Virtual-time cap for one session cable run.
+        const SESSION_CABLE_CAP: Duration = Duration::from_secs(1_200);
+
+        /// COP-38: two stations (`VK3ABC` calls `W1AW`) with
+        /// `DaemonConfig::default()` -- default PTT/turnaround timing and
+        /// `arq_enabled = false` -- run their real `run()` loops over the
+        /// same half-duplex cable as `run_cable_loop`. The host's `CONNECT`
+        /// goes to `a`; once both hosts have `CONNECTED` and neither station
+        /// is keyed, `payload` is written to `a`'s data port and `fault` is
+        /// armed: the faulted station's next keyed interval reaches the
+        /// other station as silence. The run ends 10 virtual seconds after
+        /// every byte has reached `b`'s host and `a` has reported `BUFFER 0`
+        /// (its last ACK decoded), or at `SESSION_CABLE_CAP`. No test-side
+        /// retransmit call is made: any retransmission comes from `run()`.
+        async fn run_session_cable(payload: Vec<u8>, fault: CableFault) -> SessionCableRun {
+            let mut config = DaemonConfig::default();
+            assert!(!config.engine.arq_enabled);
+            config.engine.callsign = "VK3ABC".into();
+            let mut a = EventLoop::new(config.clone()).unwrap();
+            config.engine.callsign = "W1AW".into();
+            let mut b = EventLoop::new(config.clone()).unwrap();
+            a.listening = true;
+            b.listening = true;
+            mark_identified(&mut a);
+            mark_identified(&mut b);
+            let a_ptt = install_ptt_log(&mut a);
+            let b_ptt = install_ptt_log(&mut b);
+            let (a_out_producer, mut a_out) = coppa_audio::audio_ring(1_000_000);
+            let (b_out_producer, mut b_out) = coppa_audio::audio_ring(1_000_000);
+            a.set_audio_out(a_out_producer);
+            b.set_audio_out(b_out_producer);
+            let ring = config.audio.buffer_size;
+            let (mut a_in, a_in_consumer) = coppa_audio::audio_ring(ring);
+            let (mut b_in, b_in_consumer) = coppa_audio::audio_ring(ring);
+            a.set_audio_in(a_in_consumer);
+            b.set_audio_in(b_in_consumer);
+            let (a_resp_tx, mut a_resp) = mpsc::channel(4096);
+            let (b_resp_tx, mut b_resp) = mpsc::channel(4096);
+            a.set_response_tx(a_resp_tx);
+            b.set_response_tx(b_resp_tx);
+            let mut a_vara = super::vara_lines(&mut a);
+            let (a_events, b_events) = (a.event_sender(), b.event_sender());
+            a_events
+                .send(DaemonEvent::Host(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "VK3ABC".into(),
+                    destination: "W1AW".into(),
+                }))
+                .await
+                .unwrap();
+
+            let mut delivered: Vec<Vec<u8>> = Vec::new();
+            let mut a_status = Vec::new();
+            let mut written_at = None;
+            let mut keyups_at_write = (0, 0);
+            let mut transfer_time = None;
+            let cable = async {
+                let start = tokio::time::Instant::now();
+                let mut tick = tokio::time::interval(CABLE_TICK);
+                let mut chunk = vec![0.0f32; 960];
+                let (mut a_connected, mut b_connected) = (false, false);
+                // Armed -> dropping (the faulted station keyed) -> spent.
+                let (mut armed, mut dropping) = (false, false);
+                let mut delivered_bytes = 0usize;
+                let mut done_at: Option<tokio::time::Instant> = None;
+                while start.elapsed() < SESSION_CABLE_CAP
+                    && done_at.is_none_or(|t| t.elapsed() < Duration::from_secs(10))
+                {
+                    tick.tick().await;
+                    while let Ok(resp) = a_resp.try_recv() {
+                        if let coppa_host::HostResponse::StatusUpdate { status, .. } = resp {
+                            a_connected |= status.starts_with("CONNECTED");
+                        }
+                    }
+                    while let Ok(resp) = b_resp.try_recv() {
+                        match resp {
+                            coppa_host::HostResponse::StatusUpdate { status, .. } => {
+                                b_connected |= status.starts_with("CONNECTED");
+                            }
+                            coppa_host::HostResponse::DataOut { data, .. } => {
+                                delivered_bytes += data.len();
+                                delivered.push(data);
+                                if delivered_bytes >= payload.len() {
+                                    transfer_time =
+                                        written_at.map(|t: tokio::time::Instant| t.elapsed());
+                                }
+                            }
+                        }
+                    }
+                    let lines = super::drain_status(&mut a_vara);
+                    if written_at.is_some() {
+                        a_status.extend(lines);
+                    }
+                    if written_at.is_none()
+                        && a_connected
+                        && b_connected
+                        && !a_ptt.keyed()
+                        && !b_ptt.keyed()
+                    {
+                        a_events
+                            .send(DaemonEvent::Host(HostEvent::DataReceived {
+                                client_id: 1,
+                                data: payload.clone(),
+                            }))
+                            .await
+                            .unwrap();
+                        written_at = Some(tokio::time::Instant::now());
+                        keyups_at_write = (
+                            a_ptt.edges().iter().filter(|e| e.1 == PttState::Tx).count(),
+                            b_ptt.edges().iter().filter(|e| e.1 == PttState::Tx).count(),
+                        );
+                        armed = fault != CableFault::None;
+                    }
+                    if done_at.is_none()
+                        && delivered_bytes >= payload.len()
+                        && a_status.last().is_some_and(|l| l == "BUFFER 0")
+                    {
+                        done_at = Some(tokio::time::Instant::now());
+                    }
+
+                    let faulted_keyed = match fault {
+                        CableFault::DropFirstData => a_ptt.keyed(),
+                        CableFault::DropFirstAck => b_ptt.keyed(),
+                        CableFault::None => false,
+                    };
+                    if armed && faulted_keyed {
+                        armed = false;
+                        dropping = true;
+                    }
+
+                    chunk.fill(0.0);
+                    let a_read = a_out.read(&mut chunk);
+                    if b_ptt.keyed() || (dropping && fault == CableFault::DropFirstData) {
+                        chunk.fill(0.0);
+                    }
+                    if dropping
+                        && fault == CableFault::DropFirstData
+                        && a_read == 0
+                        && !a_ptt.keyed()
+                    {
+                        dropping = false;
+                    }
+                    b_in.write(&chunk);
+
+                    chunk.fill(0.0);
+                    let b_read = b_out.read(&mut chunk);
+                    if a_ptt.keyed() || (dropping && fault == CableFault::DropFirstAck) {
+                        chunk.fill(0.0);
+                    }
+                    if dropping
+                        && fault == CableFault::DropFirstAck
+                        && b_read == 0
+                        && !b_ptt.keyed()
+                    {
+                        dropping = false;
+                    }
+                    a_in.write(&chunk);
+                }
+                a_events.send(DaemonEvent::Shutdown).await.unwrap();
+                b_events.send(DaemonEvent::Shutdown).await.unwrap();
+            };
+            let (a_result, b_result, ()) = tokio::join!(a.run(), b.run(), cable);
+            a_result.unwrap();
+            b_result.unwrap();
+
+            let keyups = |log: &PttLog| log.edges().iter().filter(|e| e.1 == PttState::Tx).count();
+            SessionCableRun {
+                delivered,
+                a_in_flight: a.session_link.as_ref().map_or(0, |l| l.tx.in_flight()),
+                a_buffered: a.buffered_tx_bytes(),
+                a_keyups_after_write: keyups(&a_ptt) - keyups_at_write.0,
+                b_keyups_after_write: keyups(&b_ptt) - keyups_at_write.1,
+                a_status,
+                transfer_time,
+            }
+        }
+
+        /// COP-38, the ticket's Gherkin end to end: in an established
+        /// session, a data frame lost in transit (zeroed on the cable) is
+        /// detected by `ArqTx`, retransmitted by `run()`'s own retransmit
+        /// tick -- no test-side call -- and delivered to the peer's host
+        /// exactly once; the peer's ACK then clears `BUFFER`.
+        #[tokio::test(start_paused = true)]
+        async fn cable_loop_lost_session_frame_is_retransmitted_by_the_run_loop() {
+            let payload = b"FC EM 12345_W1AW 1234 567 0\r".to_vec();
+            let run = run_session_cable(payload.clone(), CableFault::DropFirstData).await;
+            assert_eq!(run.delivered, vec![payload], "status: {:?}", run.a_status);
+            assert_eq!(run.a_in_flight, 0, "the retransmission must be ACKed");
+            assert_eq!(run.a_buffered, 0);
+            assert!(
+                run.a_keyups_after_write >= 2,
+                "the lost frame plus its retransmission, got {}",
+                run.a_keyups_after_write
+            );
+            assert_eq!(run.a_status.last().map(String::as_str), Some("BUFFER 0"));
+        }
+
+        /// COP-38: a lost ACK, end to end. `a` retransmits from `run()`, `b`
+        /// drops the duplicate (one `DataOut`) and ACKs again.
+        #[tokio::test(start_paused = true)]
+        async fn cable_loop_lost_session_ack_is_recovered_without_a_duplicate_delivery() {
+            let payload = b"acked, lost, acked again".to_vec();
+            let run = run_session_cable(payload.clone(), CableFault::DropFirstAck).await;
+            assert_eq!(run.delivered, vec![payload], "status: {:?}", run.a_status);
+            assert!(
+                run.b_keyups_after_write >= 2,
+                "the lost ACK plus the re-ACK, got {}",
+                run.b_keyups_after_write
+            );
+            assert_eq!(run.a_in_flight, 0);
+        }
+
+        /// COP-38 (D9b): the real-audio half of the old large-write test. A
+        /// 1000-byte write arrives intact and in order through both real run
+        /// loops, one stop-and-wait frame at a time.
+        #[tokio::test(start_paused = true)]
+        async fn cable_loop_session_write_of_1000_bytes_arrives_intact_in_order() {
+            let payload: Vec<u8> = (0..1000).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+            let run = run_session_cable(payload.clone(), CableFault::None).await;
+            assert_eq!(
+                run.delivered.concat(),
+                payload,
+                "status: {:?}",
+                run.a_status
+            );
+            // At most 95 host bytes fit a level-2 frame (budget 117 minus the
+            // 14-byte MAC and 7-byte transport headers minus one).
+            assert!(
+                run.delivered.len() >= payload.len().div_ceil(95),
+                "{} frames",
+                run.delivered.len()
+            );
+            assert_eq!(run.a_in_flight, 0);
+            assert_eq!(run.a_buffered, 0);
+        }
+
+        /// COP-38: virtual-time throughput of a 2000-byte connected-session
+        /// write for random and B2F-like text payloads -- the source of
+        /// BENCHMARKS.md's COP-38 entry. Run with `cargo test -p coppa-daemon
+        /// --lib --features websocket,cpal-backend -- --ignored
+        /// cable_loop_session_throughput_report --nocapture`.
+        #[tokio::test(start_paused = true)]
+        #[ignore = "throughput report, minutes of real time"]
+        async fn cable_loop_session_throughput_report() {
+            let mut seed: u32 = 0x38_38_38_38;
+            let random: Vec<u8> = (0..2000)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    (seed >> 16) as u8
+                })
+                .collect();
+            let text: Vec<u8> = b"FC EM 12345ABCDE_W1AW 1234 567 0\rSubject: Weekly net report\r\n\
+                Body: Check-ins from the district were steady this week.\r\n"
+                .iter()
+                .copied()
+                .cycle()
+                .take(2000)
+                .collect();
+            for (name, payload) in [("random", random), ("text", text)] {
+                let run = run_session_cable(payload.clone(), CableFault::None).await;
+                assert_eq!(run.delivered.concat(), payload, "{name}");
+                let secs = run.transfer_time.expect("transfer completed").as_secs_f64();
+                println!(
+                    "COP-38 {name}: {} bytes in {secs:.2}s virtual = {:.1} B/s, \
+                     {} data frames, a keyed {} times, b keyed {} times",
+                    payload.len(),
+                    payload.len() as f64 / secs,
+                    run.delivered.len(),
+                    run.a_keyups_after_write,
+                    run.b_keyups_after_write,
+                );
+            }
         }
     }
 }
