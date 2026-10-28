@@ -700,12 +700,12 @@ impl EventLoop {
             }
         };
 
-        let busy_gate = BusyGate::new(config.audio.sample_rate as f32);
-        let rx_level_meter = RxLevelMeter::new(config.audio.sample_rate);
+        let busy_gate = BusyGate::new(engine.config().sample_rate as f32);
+        let rx_level_meter = RxLevelMeter::new(engine.config().sample_rate);
         #[cfg(feature = "websocket")]
         let spectrum_sensor = coppa_ml::SpectrumSensor::new(
             crate::spectrum::SPECTRUM_FFT_SIZE,
-            config.audio.sample_rate as f32,
+            engine.config().sample_rate as f32,
         );
 
         // Active overshoot probing (see `docs/superpowers/specs/
@@ -2490,7 +2490,7 @@ impl EventLoop {
         tracing::info!(
             peak_dbfs = level_meter::round_db(reading.peak_dbfs),
             rms_dbfs = level_meter::round_db(reading.rms_dbfs),
-            duration_ms = level_meter::duration_ms(&reading, self.config.audio.sample_rate),
+            duration_ms = level_meter::duration_ms(&reading, self.engine.config().sample_rate),
             "TX audio level"
         );
         if state == LevelState::Clipping {
@@ -2523,7 +2523,8 @@ impl EventLoop {
         let Some(ref ws_tx) = self.ws_broadcast else {
             return;
         };
-        let msg = level_meter::ws_message(direction, reading, state, self.config.audio.sample_rate);
+        let msg =
+            level_meter::ws_message(direction, reading, state, self.engine.config().sample_rate);
         if let Ok(json) = serde_json::to_string(&msg) {
             let _ = ws_tx.send(json);
         }
@@ -2569,7 +2570,7 @@ impl EventLoop {
         let bins = crate::spectrum::compute_spectrum_bins(
             &self.spectrum_sensor,
             &self.spectrum_buffer,
-            self.config.audio.sample_rate as f32,
+            self.engine.config().sample_rate as f32,
         );
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3260,7 +3261,14 @@ impl EventLoop {
             tokio::time::sleep(std::time::Duration::from_millis(pre_delay_ms)).await;
         }
         let prior_target = self.tx_output().submitted();
-        let queued = self.handle_audio_out(samples);
+        let feedback_for_submission = self.output_feedback.clone();
+        let queued = if let Some(feedback) = feedback_for_submission.as_deref() {
+            self.tx_output()
+                .submit_with_finish(samples, feedback)
+                .is_some()
+        } else {
+            self.handle_audio_out(samples)
+        };
         // Release PTT once this transmission's last sample has played (not
         // after its nominal duration): every sample stays queued until the
         // rings accept it, so the cumulative submitted count is this job's
@@ -3283,6 +3291,8 @@ impl EventLoop {
         let feedback = self.output_feedback.clone();
         // Headless fallback (no output worker reporting progress): the
         // nominal audio duration plus the ring drain time, as before.
+        // Without an output worker there is no hardware playback to measure.
+        // Keep the existing configurable nominal timer as a headless test seam.
         let sample_rate = self.config.audio.sample_rate.max(1) as u64;
         let nominal = std::time::Duration::from_millis(
             (samples.len() as u64 * 1000) / sample_rate

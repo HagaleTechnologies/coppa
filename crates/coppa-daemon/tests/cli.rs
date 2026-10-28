@@ -894,13 +894,14 @@ fn an_unknown_ptt_method_logs_an_error_and_exits_1() {
     );
 }
 
+#[cfg(not(feature = "cpal-backend"))]
 #[test]
-fn a_sample_rate_the_engine_does_not_run_at_is_a_startup_error() {
-    let (stdout, _) = run_startup_error(
-        "[audio]\nsample_rate = 44100\n",
-        "[audio] sample_rate = 44100 is not supported",
-    );
-    assert!(stdout.contains("set sample_rate = 48000"), "{stdout}");
+fn a_positive_preferred_hardware_rate_does_not_change_daemon_readiness() {
+    let dir = TempDir::new("preferred-rate");
+    dir.write("station.toml", "[audio]\nsample_rate = 44100\n");
+    let (mut daemon, _) = start_until_ready(dir.path(), &["--config", "station.toml"], &[]);
+    let (stdout, _) = daemon.kill();
+    assert!(stdout.contains("Daemon ready"), "{stdout}");
 }
 
 #[test]
@@ -934,6 +935,31 @@ fn a_named_audio_device_without_the_cpal_backend_is_a_startup_error() {
         "[audio]\ninput_device = \"USB Audio CODEC\"\n",
         "[audio] input_device = \"USB Audio CODEC\" is set, but this coppad was built \
          without the cpal-backend feature",
+    );
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn an_audio_device_id_without_the_cpal_backend_is_a_startup_error() {
+    run_startup_error(
+        "[audio]\ninput_device_id = \"alsa:missing\"\n",
+        "[audio] input_device_id = \"alsa:missing\" is set, but this coppad was built without the cpal-backend feature",
+    );
+}
+
+#[test]
+fn a_name_and_id_for_one_audio_direction_is_a_startup_error() {
+    run_startup_error(
+        "[audio]\ninput_device = \"USB\"\ninput_device_id = \"alsa:radio\"\n",
+        "[audio] input_device and input_device_id cannot both be set",
+    );
+}
+
+#[test]
+fn a_zero_preferred_hardware_rate_is_a_startup_error() {
+    run_startup_error(
+        "[audio]\nsample_rate = 0\n",
+        "[audio] sample_rate = 0 is not supported",
     );
 }
 
@@ -1139,6 +1165,18 @@ fn a_missing_named_output_device_is_a_startup_error() {
         "[audio]\noutput_device = \"COP-32 no such output device\"\n",
         "audio output device \"COP-32 no such output device\" not found",
     );
+}
+
+#[cfg(feature = "cpal-backend")]
+#[test]
+fn a_missing_explicit_input_id_is_a_startup_error_before_ready() {
+    let (stdout, stderr) = run_startup_error(
+        "[audio]\ninput_device_id = \"alsa:cop-64-missing\"\n",
+        "audio input device selection failed",
+    );
+    assert!(stdout.contains("input_device_id") || stderr.contains("input_device_id"));
+    assert!(stdout.contains("alsa:cop-64-missing") || stderr.contains("alsa:cop-64-missing"));
+    assert!(!stdout.contains("Daemon ready"));
 }
 
 /// An unreachable rigctld leaves the daemon running without PTT: it logs
@@ -1425,6 +1463,13 @@ fn startup_names_the_audio_devices_it_opened() {
         audio.contains("output=\"Default Audio Device (alsa:default)\""),
         "{audio}"
     );
+    assert!(audio.contains("input_hardware_rate="), "{audio}");
+    assert!(audio.contains("output_hardware_rate="), "{audio}");
+    assert!(audio.contains("engine_rate=48000"), "{audio}");
     let (_, input) = line_with(&stdout, "Audio input started");
     assert!(input.contains("Discard all samples (alsa:null)"), "{input}");
+    assert!(
+        input.contains("hardware_rate=") && input.contains("engine_rate=48000"),
+        "{input}"
+    );
 }

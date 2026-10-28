@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "cpal-backend")]
+use anyhow::Context;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
@@ -103,6 +105,9 @@ impl TncTx {
                 self.active = Some(match self.feedback {
                     Some(_) => {
                         let target = self.pending.push(&frame);
+                        if let Some(feedback) = &self.feedback {
+                            feedback.finish_through(target);
+                        }
                         self.pending.flush(out);
                         TncPhase::Playing(PlayoutWatch::new(target, now, None))
                     }
@@ -181,10 +186,17 @@ pub struct TncConfig {
     pub bind_address: String,
     pub rig_address: Option<String>,
     pub vox_mode: bool,
+    /// Preferred hardware rate; AFSK modem audio remains at 48 kHz.
     pub sample_rate: u32,
     /// Audio device name substring (case-insensitive) for both input and
     /// output; `None` uses the default devices.
     pub audio_device: Option<String>,
+    /// Exact input device identity, overriding `audio_device` for this direction.
+    pub input_device_id: Option<String>,
+    /// Exact output device identity, overriding `audio_device` for this direction.
+    pub output_device_id: Option<String>,
+    pub input_channel: u16,
+    pub output_channel: u16,
 }
 
 impl Default for TncConfig {
@@ -196,6 +208,10 @@ impl Default for TncConfig {
             vox_mode: false,
             sample_rate: 48000,
             audio_device: None,
+            input_device_id: None,
+            output_device_id: None,
+            input_channel: 0,
+            output_channel: 0,
         }
     }
 }
@@ -227,9 +243,22 @@ fn air_to_kiss(mut frame: Vec<u8>) -> Vec<u8> {
 /// - PTT control (keys the radio during TX)
 /// - CPAL audio I/O (optional, enabled with `cpal-backend` feature)
 pub async fn run_tnc(config: TncConfig) -> Result<()> {
+    #[cfg(not(feature = "cpal-backend"))]
+    for (key, value) in [
+        ("audio_device", config.audio_device.as_deref()),
+        ("input_device_id", config.input_device_id.as_deref()),
+        ("output_device_id", config.output_device_id.as_deref()),
+    ] {
+        if let Some(value) = value.filter(|v| !v.is_empty()) {
+            anyhow::bail!(
+                "TNC {key} = {value:?} requires the cpal-backend feature to select an audio device"
+            );
+        }
+    }
     tracing::info!(
         kiss_port = config.kiss_port,
-        sample_rate = config.sample_rate,
+        preferred_hardware_rate = config.sample_rate,
+        engine_rate = 48_000,
         "TNC mode"
     );
 
@@ -289,7 +318,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
     let output_feedback = Some(Arc::new(OutputFeedback::default()));
     #[cfg(not(feature = "cpal-backend"))]
     let output_feedback: Option<Arc<OutputFeedback>> = None;
-    let mut tnc_tx = TncTx::new(output_feedback.clone(), config.sample_rate);
+    let mut tnc_tx = TncTx::new(output_feedback.clone(), 48_000);
 
     // -------------------------------------------------------------------------
     // 4. Shutdown flag
@@ -333,49 +362,112 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
     {
         use coppa_audio::{AudioSink, AudioSource};
 
-        let sample_rate = config.sample_rate;
+        let engine_rate = 48_000;
+        let preferred_rate = config.sample_rate;
         let buf_size = 8192usize;
-        let device_name = config.audio_device.clone();
+        let resolve_input = || match coppa_audio::resolve_input_device(
+            config
+                .audio_device
+                .as_deref()
+                .filter(|_| config.input_device_id.is_none()),
+            config.input_device_id.as_deref(),
+        ) {
+            Ok(device) => Ok(device),
+            Err(error)
+                if config.input_device_id.is_none()
+                    && matches!(
+                        error.downcast_ref::<coppa_audio::DeviceSelectionError>(),
+                        Some(coppa_audio::DeviceSelectionError::MissingName { .. })
+                    ) =>
+            {
+                tracing::warn!(device = ?config.audio_device, "No input device matching, using default");
+                Ok(None)
+            }
+            Err(error) => Err(anyhow::anyhow!(
+                "TNC input audio device selection failed: {error}"
+            )),
+        };
+        let resolve_output = || match coppa_audio::resolve_output_device(
+            config
+                .audio_device
+                .as_deref()
+                .filter(|_| config.output_device_id.is_none()),
+            config.output_device_id.as_deref(),
+        ) {
+            Ok(device) => Ok(device),
+            Err(error)
+                if config.output_device_id.is_none()
+                    && matches!(
+                        error.downcast_ref::<coppa_audio::DeviceSelectionError>(),
+                        Some(coppa_audio::DeviceSelectionError::MissingName { .. })
+                    ) =>
+            {
+                tracing::warn!(device = ?config.audio_device, "No output device matching, using default");
+                Ok(None)
+            }
+            Err(error) => Err(anyhow::anyhow!(
+                "TNC output audio device selection failed: {error}"
+            )),
+        };
+        // Check both selectors before either stream opens.
+        let input_default = resolve_input()?.is_none();
+        let output_default = resolve_output()?.is_none();
 
         // Input: CPAL mic → audio_in ring buffer
         let mut mic_prod = audio_in_prod;
         let input_shutdown = shutdown.clone();
-        let input_result = match device_name.as_deref() {
-            Some(name) => match coppa_audio::find_input_device_by_name(name) {
-                Some(device) => coppa_audio::CpalSource::from_device(device, sample_rate, buf_size),
-                None => {
-                    tracing::warn!(device = name, "No input device matching, using default");
-                    coppa_audio::CpalSource::new(sample_rate, buf_size)
+        let input_name = config.audio_device.clone();
+        let input_id = config.input_device_id.clone();
+        let input_channel = config.input_channel;
+        let (input_open_tx, input_open_rx) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            let device = coppa_audio::resolve_input_device(
+                input_name
+                    .as_deref()
+                    .filter(|_| input_id.is_none() && !input_default),
+                input_id.as_deref(),
+            );
+            let opened = device.and_then(|device| {
+                let mut source = coppa_audio::LiveSource::new(
+                    device,
+                    engine_rate,
+                    preferred_rate,
+                    buf_size,
+                    input_channel,
+                )?;
+                source.start()?;
+                Ok(source)
+            });
+            let mut source = match opened {
+                Ok(source) => {
+                    let _ = input_open_tx.send(Ok((
+                        source.device_name().to_string(),
+                        source.hardware_rate(),
+                    )));
+                    source
                 }
-            },
-            None => coppa_audio::CpalSource::new(sample_rate, buf_size),
-        };
-        match input_result {
-            Ok(mut source) => {
-                if let Err(e) = source.start() {
-                    tracing::error!(error = %e, "Failed to start audio input");
-                } else {
-                    tracing::info!(sample_rate, "Audio input started");
-                    tokio::task::spawn_blocking(move || {
-                        let mut buf = vec![0.0f32; 1024];
-                        loop {
-                            if mic_prod.is_abandoned() || input_shutdown.load(Ordering::Acquire) {
-                                break;
-                            }
-                            match source.read(&mut buf) {
-                                Ok(n) if n > 0 => {
-                                    mic_prod.write(&buf[..n]);
-                                }
-                                _ => {
-                                    std::thread::sleep(std::time::Duration::from_millis(10));
-                                }
-                            }
-                        }
-                    });
+                Err(error) => {
+                    let _ = input_open_tx.send(Err(error));
+                    return;
+                }
+            };
+            let mut buf = vec![0.0f32; 1024];
+            loop {
+                if mic_prod.is_abandoned() || input_shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                match source.read(&mut buf) {
+                    Ok(n) if n > 0 => {
+                        mic_prod.write(&buf[..n]);
+                    }
+                    _ => std::thread::sleep(std::time::Duration::from_millis(10)),
                 }
             }
-            Err(e) => tracing::error!(error = %e, "No audio input device"),
-        }
+        });
+        let (input_name, input_hardware_rate) = input_open_rx
+            .await
+            .context("TNC audio input worker stopped during startup")??;
+        tracing::info!(device = ?input_name, input_hardware_rate, engine_rate, "Audio input started");
 
         // Output: audio_out ring buffer → CPAL speaker. The sink lives on
         // its worker thread, and the worker retains each chunk until the sink
@@ -384,40 +476,48 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
         let feedback = output_feedback
             .clone()
             .expect("cpal-backend always wires output feedback");
+        let output_name = config.audio_device.clone();
+        let output_id = config.output_device_id.clone();
+        let output_channel = config.output_channel;
+        let (output_open_tx, output_open_rx) = tokio::sync::oneshot::channel();
         tokio::task::spawn_blocking(move || {
-            let sink_result = match device_name.as_deref() {
-                Some(name) => match coppa_audio::find_output_device_by_name(name) {
-                    Some(device) => {
-                        coppa_audio::CpalSink::from_device(device, sample_rate, buf_size)
-                    }
-                    None => {
-                        tracing::warn!(device = name, "No output device matching, using default");
-                        coppa_audio::CpalSink::new(sample_rate, buf_size)
-                    }
-                },
-                None => coppa_audio::CpalSink::new(sample_rate, buf_size),
-            };
-            let mut sink = match sink_result {
+            let sink_result = coppa_audio::resolve_output_device(
+                output_name
+                    .as_deref()
+                    .filter(|_| output_id.is_none() && !output_default),
+                output_id.as_deref(),
+            )
+            .and_then(|device| {
+                let mut sink = coppa_audio::LiveSink::new(
+                    device,
+                    engine_rate,
+                    preferred_rate,
+                    buf_size,
+                    output_channel,
+                )?;
+                sink.start()?;
+                Ok(sink)
+            });
+            let sink = match sink_result {
                 Ok(sink) => sink,
                 Err(e) => {
-                    tracing::error!(error = %e, "No audio output device");
+                    let _ = output_open_tx.send(Err(e));
                     feedback.fail();
                     return;
                 }
             };
-            if let Err(e) = sink.start() {
-                tracing::error!(error = %e, "Failed to start audio output");
-                feedback.fail();
-                return;
-            }
-            tracing::info!(sample_rate, "Audio output started");
-            crate::audio_output::OutputWorker::new(1024, sample_rate, feedback).run(
+            let _ = output_open_tx.send(Ok((sink.device_name().to_string(), sink.hardware_rate())));
+            crate::audio_output::OutputWorker::new(1024, engine_rate, feedback).run(
                 audio_out_cons,
                 sink,
                 |sink| sink.playback_progress(),
                 output_shutdown,
             );
         });
+        let (output_name, output_hardware_rate) = output_open_rx
+            .await
+            .context("TNC audio output worker stopped during startup")??;
+        tracing::info!(device = ?output_name, output_hardware_rate, engine_rate, "Audio output started");
     }
 
     // Without cpal-backend nothing moves audio: say so at startup, and
@@ -510,6 +610,20 @@ mod tests {
     use crate::audio_output::{OutputWorker, STALL_TIMEOUT};
     use coppa_radio::PttState;
     use std::sync::Mutex;
+
+    #[cfg(not(feature = "cpal-backend"))]
+    #[tokio::test]
+    async fn explicit_audio_id_requires_a_cpal_build_before_tnc_starts() {
+        let config = TncConfig {
+            input_device_id: Some("alsa:radio".into()),
+            ..TncConfig::default()
+        };
+        let error = run_tnc(config).await.unwrap_err().to_string();
+        assert!(
+            error.contains("input_device_id") && error.contains("cpal-backend"),
+            "{error}"
+        );
+    }
 
     /// PTT controller recording every state change.
     #[derive(Default, Clone)]

@@ -57,9 +57,15 @@ struct RxArgs {
     /// Show the payload as lowercase hex even when it is valid UTF-8 text.
     #[arg(long)]
     hex: bool,
-    /// Audio input device name (substring match, live capture only).
-    #[arg(long)]
+    /// Audio input device name (unique substring, live capture only).
+    #[arg(long, conflicts_with = "device_id")]
     device: Option<String>,
+    /// Exact audio input device ID from `coppa devices`.
+    #[arg(long, conflicts_with = "device")]
+    device_id: Option<String>,
+    /// Zero-based input channel on the selected device.
+    #[arg(long, default_value_t = 0)]
+    input_channel: u16,
 }
 
 impl RxArgs {
@@ -91,9 +97,15 @@ enum Commands {
         /// Callsign for station identification.
         #[arg(long)]
         callsign: Option<String>,
-        /// Audio output device name (substring match).
-        #[arg(long)]
+        /// Audio output device name (unique substring).
+        #[arg(long, conflicts_with = "device_id")]
         device: Option<String>,
+        /// Exact audio output device ID from `coppa devices`.
+        #[arg(long, conflicts_with = "device")]
+        device_id: Option<String>,
+        /// Zero-based output channel on the selected device.
+        #[arg(long, default_value_t = 0)]
+        output_channel: u16,
         /// PTT method: "rigctld", "vox", "none" (default: "none")
         #[arg(long, default_value = "none")]
         ptt: String,
@@ -148,9 +160,15 @@ enum Commands {
         /// Operational profile name (e.g., HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY).
         #[arg(long)]
         profile: Option<String>,
-        /// Audio output device name (substring match).
-        #[arg(long)]
+        /// Audio output device name (unique substring).
+        #[arg(long, conflicts_with = "device_id")]
         device: Option<String>,
+        /// Exact audio output device ID from `coppa devices`.
+        #[arg(long, conflicts_with = "device")]
+        device_id: Option<String>,
+        /// Zero-based output channel on the selected device.
+        #[arg(long, default_value_t = 0)]
+        output_channel: u16,
         /// PTT method: "rigctld", "vox", "none" (default: "none")
         #[arg(long, default_value = "none")]
         ptt: String,
@@ -185,9 +203,21 @@ enum Commands {
         /// KISS TCP port.
         #[arg(long, default_value = "8001")]
         port: u16,
-        /// Audio device name (substring match).
-        #[arg(long)]
+        /// Input and output device name (unique substring).
+        #[arg(long, conflicts_with_all = ["input_device_id", "output_device_id"])]
         device: Option<String>,
+        /// Exact input device ID from `coppa devices`.
+        #[arg(long, conflicts_with = "device")]
+        input_device_id: Option<String>,
+        /// Exact output device ID from `coppa devices`.
+        #[arg(long, conflicts_with = "device")]
+        output_device_id: Option<String>,
+        /// Zero-based input channel.
+        #[arg(long, default_value_t = 0)]
+        input_channel: u16,
+        /// Zero-based output channel.
+        #[arg(long, default_value_t = 0)]
+        output_channel: u16,
         /// rigctld address for PTT (e.g., localhost:4532).
         #[arg(long)]
         rig: Option<String>,
@@ -252,18 +282,24 @@ fn main() -> Result<()> {
             profile,
             callsign,
             device,
+            device_id,
+            output_channel,
             ptt,
             rigctld,
             ptt_lead_ms,
             ptt_tail_ms,
             frequency_hz,
             band,
-        }) => cmd_tx(
+        }) => cmd_tx_selected(
             &message,
             output.as_deref(),
             profile.as_deref(),
             callsign.as_deref(),
-            device.as_deref(),
+            AudioOutputSelection {
+                name: device.as_deref(),
+                id: device_id.as_deref(),
+                channel: output_channel,
+            },
             &ptt,
             &rigctld,
             ptt_lead_ms,
@@ -286,18 +322,24 @@ fn main() -> Result<()> {
             output,
             profile,
             device,
+            device_id,
+            output_channel,
             ptt,
             rigctld,
             ptt_lead_ms,
             ptt_tail_ms,
             frequency_hz,
             band,
-        }) => cmd_tune(
+        }) => cmd_tune_selected(
             seconds,
             single,
             output.as_deref(),
             profile.as_deref(),
-            device.as_deref(),
+            AudioOutputSelection {
+                name: device.as_deref(),
+                id: device_id.as_deref(),
+                channel: output_channel,
+            },
             &ptt,
             &rigctld,
             ptt_lead_ms,
@@ -312,9 +354,22 @@ fn main() -> Result<()> {
         Some(Commands::Tnc {
             port,
             device,
+            input_device_id,
+            output_device_id,
+            input_channel,
+            output_channel,
             rig,
             vox,
-        }) => cmd_tnc(port, device, rig, vox)?,
+        }) => cmd_tnc(
+            port,
+            device,
+            input_device_id,
+            output_device_id,
+            input_channel,
+            output_channel,
+            rig,
+            vox,
+        )?,
         None => {
             println!("Coppa - Ham Radio Digital Communications System");
             println!("Use --help for available commands");
@@ -482,6 +537,7 @@ impl PlaybackClock for SystemClock {
 fn play_keyed<S: coppa_audio::AudioSink>(
     sink: &mut S,
     progress: impl Fn(&S) -> Result<coppa_audio::PlaybackProgress>,
+    finish: impl Fn(&mut S) -> Result<()>,
     ptt: &mut dyn coppa_radio::PttControl,
     samples: &[f32],
     lead: std::time::Duration,
@@ -495,7 +551,8 @@ fn play_keyed<S: coppa_audio::AudioSink>(
     }
     clock.sleep(lead);
 
-    let result = feed_until_played(sink, &progress, samples, clock).inspect(|_| clock.sleep(tail));
+    let result =
+        feed_until_played(sink, &progress, &finish, samples, clock).inspect(|_| clock.sleep(tail));
 
     if let Err(e) = ptt.set_ptt(PttState::Rx) {
         eprintln!("WARNING: PTT unkey failed: {}", e);
@@ -511,6 +568,7 @@ fn play_keyed<S: coppa_audio::AudioSink>(
 fn feed_until_played<S: coppa_audio::AudioSink>(
     sink: &mut S,
     progress: &impl Fn(&S) -> Result<coppa_audio::PlaybackProgress>,
+    finish: &impl Fn(&mut S) -> Result<()>,
     samples: &[f32],
     clock: &mut dyn PlaybackClock,
 ) -> Result<u64> {
@@ -518,6 +576,7 @@ fn feed_until_played<S: coppa_audio::AudioSink>(
     let mut accepted = 0u64;
     let mut last_consumed = progress(sink)?.consumed_samples;
     let mut last_progress_at = clock.now();
+    let mut finished = false;
     loop {
         if offset < samples.len() {
             let written = sink.write(&samples[offset..])?;
@@ -525,8 +584,12 @@ fn feed_until_played<S: coppa_audio::AudioSink>(
             offset += written;
             accepted += written as u64;
         }
+        if offset == samples.len() && !finished {
+            finish(sink)?;
+            finished = true;
+        }
         let snapshot = progress(sink)?;
-        if offset == samples.len() && snapshot.has_played(accepted) {
+        if finished && snapshot.has_played(accepted) {
             return Ok(accepted);
         }
         let now = clock.now();
@@ -553,6 +616,61 @@ fn feed_until_played<S: coppa_audio::AudioSink>(
     }
 }
 
+#[derive(Clone, Copy, Default)]
+#[cfg_attr(not(feature = "cpal-backend"), allow(dead_code))]
+struct AudioOutputSelection<'a> {
+    name: Option<&'a str>,
+    id: Option<&'a str>,
+    channel: u16,
+}
+
+#[cfg(feature = "cpal-backend")]
+fn resolve_cli_output_device(
+    selection: AudioOutputSelection<'_>,
+) -> Result<Option<coppa_audio::LiveDevice>> {
+    match coppa_audio::resolve_output_device(selection.name, selection.id) {
+        Ok(device) => Ok(device),
+        Err(error) => match error.downcast_ref::<coppa_audio::DeviceSelectionError>() {
+            Some(coppa_audio::DeviceSelectionError::MissingName { .. }) => {
+                eprintln!(
+                    "WARNING: No output device matching '{}', using default",
+                    selection.name.unwrap_or_default()
+                );
+                Ok(None)
+            }
+            Some(coppa_audio::DeviceSelectionError::AmbiguousName { .. }) => {
+                eprintln!("WARNING: {error}");
+                anyhow::bail!("ambiguous output audio device")
+            }
+            _ => Err(error),
+        },
+    }
+}
+
+#[cfg(feature = "cpal-backend")]
+fn resolve_cli_input_device(
+    name: Option<&str>,
+    id: Option<&str>,
+) -> Result<Option<coppa_audio::LiveDevice>> {
+    match coppa_audio::resolve_input_device(name, id) {
+        Ok(device) => Ok(device),
+        Err(error) => match error.downcast_ref::<coppa_audio::DeviceSelectionError>() {
+            Some(coppa_audio::DeviceSelectionError::MissingName { .. }) => {
+                eprintln!(
+                    "WARNING: No input device matching '{}', using default",
+                    name.unwrap_or_default()
+                );
+                Ok(None)
+            }
+            Some(coppa_audio::DeviceSelectionError::AmbiguousName { .. }) => {
+                eprintln!("WARNING: {error}");
+                anyhow::bail!("ambiguous input audio device")
+            }
+            _ => Err(error),
+        },
+    }
+}
+
 /// What the wideband gate needs to know about a live transmission: the
 /// profile's label and occupied bandwidth, and the stated frequency flags.
 struct LiveTxGate<'a> {
@@ -568,7 +686,7 @@ struct LiveTxGate<'a> {
 fn transmit_live(
     samples: &[f32],
     sample_rate: u32,
-    device: Option<&str>,
+    selection: AudioOutputSelection<'_>,
     ptt: &str,
     rigctld_addr: &str,
     ptt_lead_ms: u64,
@@ -590,25 +708,30 @@ fn transmit_live(
     };
     cli_gate_decision(gate.profile, gate.occupied_hz, live_hz, gate.stated)?;
 
-    // Create audio sink
-    let mut sink = match device {
-        Some(name) => match coppa_audio::find_output_device_by_name(name) {
-            Some(dev) => {
-                if verbosity != Verbosity::Quiet {
-                    eprintln!("Using output device matching '{}'", name);
-                }
-                coppa_audio::cpal_backend::CpalSink::from_device(dev, sample_rate, 8192)?
-            }
-            None => {
-                eprintln!(
-                    "WARNING: No output device matching '{}', using default",
-                    name
-                );
-                coppa_audio::cpal_backend::CpalSink::new(sample_rate, 8192)?
-            }
-        },
-        None => coppa_audio::cpal_backend::CpalSink::new(sample_rate, 8192)?,
-    };
+    // Select and open audio before keying PTT. A missing explicit ID or
+    // invalid channel is fatal; a missing legacy name retains its fallback.
+    let selected_device = resolve_cli_output_device(selection)?;
+    let mut sink = coppa_audio::LiveSink::new(
+        selected_device,
+        sample_rate,
+        sample_rate,
+        8192,
+        selection.channel,
+    )?;
+    if sink.hardware_rate() != sample_rate {
+        eprintln!(
+            "WARNING: output audio device {} uses {} Hz hardware rate (requested {} Hz, engine {} Hz)",
+            sink.device_name(), sink.hardware_rate(), sample_rate, sample_rate
+        );
+    }
+    if verbosity == Verbosity::Verbose {
+        eprintln!(
+            "[verbose] Output audio: {} (hardware {} Hz, engine {} Hz)",
+            sink.device_name(),
+            sink.hardware_rate(),
+            sample_rate
+        );
+    }
     sink.start()?;
 
     // Key, pace every sample through the sink's bounded ring, and unkey only
@@ -617,6 +740,7 @@ fn transmit_live(
     let delivered = play_keyed(
         &mut sink,
         |sink| sink.playback_progress(),
+        |sink| sink.finish_input(),
         &mut ptt_ctrl,
         samples,
         std::time::Duration::from_millis(ptt_lead_ms),
@@ -633,12 +757,12 @@ fn transmit_live(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cmd_tx(
+fn cmd_tx_selected(
     message: &str,
     output: Option<&str>,
     profile: Option<&str>,
     callsign: Option<&str>,
-    device: Option<&str>,
+    selection: AudioOutputSelection<'_>,
     ptt: &str,
     rigctld: &str,
     ptt_lead_ms: u64,
@@ -688,7 +812,7 @@ fn cmd_tx(
                 transmit_live(
                     &samples,
                     core.config().sample_rate,
-                    device,
+                    selection,
                     ptt,
                     rigctld,
                     ptt_lead_ms,
@@ -705,7 +829,7 @@ fn cmd_tx(
                 // wideband request is still refused, not silently accepted.
                 validate_ptt_method(ptt)?;
                 cli_gate_decision(gate.profile, gate.occupied_hz, None, gate.stated)?;
-                let _ = device;
+                let _ = selection;
                 let _ = rigctld;
                 let _ = ptt_lead_ms;
                 let _ = ptt_tail_ms;
@@ -717,6 +841,41 @@ fn cmd_tx(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn cmd_tx(
+    message: &str,
+    output: Option<&str>,
+    profile: Option<&str>,
+    callsign: Option<&str>,
+    device: Option<&str>,
+    ptt: &str,
+    rigctld: &str,
+    ptt_lead_ms: u64,
+    ptt_tail_ms: u64,
+    frequency_hz: Option<u64>,
+    band: Option<&str>,
+    verbosity: Verbosity,
+) -> Result<()> {
+    cmd_tx_selected(
+        message,
+        output,
+        profile,
+        callsign,
+        AudioOutputSelection {
+            name: device,
+            ..Default::default()
+        },
+        ptt,
+        rigctld,
+        ptt_lead_ms,
+        ptt_tail_ms,
+        frequency_hz,
+        band,
+        verbosity,
+    )
 }
 
 /// Occupied bandwidth (Hz) of the calibration signal `cmd_tune` emits: the
@@ -734,12 +893,12 @@ fn tune_occupied_hz(single: Option<f32>) -> u32 {
 /// mirroring `cmd_tx`'s live-playback path. See `docs/OPERATING.md` for the
 /// calibration procedure this is meant to support.
 #[allow(clippy::too_many_arguments)]
-fn cmd_tune(
+fn cmd_tune_selected(
     seconds: f32,
     single: Option<f32>,
     output: Option<&str>,
     profile: Option<&str>,
-    device: Option<&str>,
+    selection: AudioOutputSelection<'_>,
     ptt: &str,
     rigctld: &str,
     ptt_lead_ms: u64,
@@ -786,7 +945,7 @@ fn cmd_tune(
                 transmit_live(
                     &samples,
                     core.config().sample_rate,
-                    device,
+                    selection,
                     ptt,
                     rigctld,
                     ptt_lead_ms,
@@ -803,7 +962,7 @@ fn cmd_tune(
                 // wideband request is still refused, not silently accepted.
                 validate_ptt_method(ptt)?;
                 cli_gate_decision(gate.profile, gate.occupied_hz, None, gate.stated)?;
-                let _ = device;
+                let _ = selection;
                 let _ = rigctld;
                 let _ = ptt_lead_ms;
                 let _ = ptt_tail_ms;
@@ -815,6 +974,41 @@ fn cmd_tune(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn cmd_tune(
+    seconds: f32,
+    single: Option<f32>,
+    output: Option<&str>,
+    profile: Option<&str>,
+    device: Option<&str>,
+    ptt: &str,
+    rigctld: &str,
+    ptt_lead_ms: u64,
+    ptt_tail_ms: u64,
+    frequency_hz: Option<u64>,
+    band: Option<&str>,
+    verbosity: Verbosity,
+) -> Result<()> {
+    cmd_tune_selected(
+        seconds,
+        single,
+        output,
+        profile,
+        AudioOutputSelection {
+            name: device,
+            ..Default::default()
+        },
+        ptt,
+        rigctld,
+        ptt_lead_ms,
+        ptt_tail_ms,
+        frequency_hz,
+        band,
+        verbosity,
+    )
 }
 
 /// `coppa rx`: the one receiver (COP-56). Streams audio -- a WAV file named
@@ -886,24 +1080,29 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
         {
             use coppa_audio::AudioSource;
             let engine_rate = core.config().sample_rate;
-            let mut source = match args.device.as_deref() {
-                Some(name) => match coppa_audio::find_input_device_by_name(name) {
-                    Some(dev) => {
-                        if verbosity != Verbosity::Quiet {
-                            eprintln!("Using input device matching '{}'", name);
-                        }
-                        coppa_audio::cpal_backend::CpalSource::from_device(dev, engine_rate, 8192)?
-                    }
-                    None => {
-                        eprintln!(
-                            "WARNING: No input device matching '{}', using default",
-                            name
-                        );
-                        coppa_audio::cpal_backend::CpalSource::new(engine_rate, 8192)?
-                    }
-                },
-                None => coppa_audio::cpal_backend::CpalSource::new(engine_rate, 8192)?,
-            };
+            let selected_device =
+                resolve_cli_input_device(args.device.as_deref(), args.device_id.as_deref())?;
+            let mut source = coppa_audio::LiveSource::new(
+                selected_device,
+                engine_rate,
+                engine_rate,
+                8192,
+                args.input_channel,
+            )?;
+            if source.hardware_rate() != engine_rate {
+                eprintln!(
+                    "WARNING: input audio device {} uses {} Hz hardware rate (requested {} Hz, engine {} Hz)",
+                    source.device_name(), source.hardware_rate(), engine_rate, engine_rate
+                );
+            }
+            if verbosity == Verbosity::Verbose {
+                eprintln!(
+                    "[verbose] Input audio: {} (hardware {} Hz, engine {} Hz)",
+                    source.device_name(),
+                    source.hardware_rate(),
+                    engine_rate
+                );
+            }
             source.start()?;
             let chatty = verbosity != Verbosity::Quiet && !args.raw;
             if chatty {
@@ -933,7 +1132,12 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
         }
         #[cfg(not(feature = "cpal-backend"))]
         {
-            let _ = (&args.device, args.duration);
+            let _ = (
+                &args.device,
+                &args.device_id,
+                args.input_channel,
+                args.duration,
+            );
             let _ = &mut core;
             if verbosity != Verbosity::Quiet {
                 println!("Live audio input not available (compile with cpal-backend feature)");
@@ -1133,18 +1337,28 @@ fn cmd_loopback(message: &str, profile: Option<&str>, verbosity: Verbosity) -> R
     Ok(())
 }
 
-fn cmd_devices() -> Result<()> {
-    println!("Available audio devices:");
-    let devices = coppa_audio::list_devices()?;
+fn device_lines(devices: &[coppa_audio::AudioDevice]) -> Vec<String> {
+    let mut lines = vec!["Available audio devices:".to_string()];
     if devices.is_empty() {
-        println!("  (none found - CPAL backend may not be available)");
+        lines.push("  (none found - CPAL backend may not be available)".to_string());
     } else {
-        for dev in &devices {
-            println!(
-                "  {} (in: {}ch, out: {}ch, max: {} Hz)",
-                dev.name, dev.input_channels, dev.output_channels, dev.max_sample_rate
-            );
-        }
+        lines.extend(devices.iter().map(|dev| {
+            format!(
+                "  {} [id: {}] (in: {}ch, out: {}ch, max: {} Hz)",
+                dev.name,
+                dev.id.as_deref().unwrap_or("unavailable"),
+                dev.input_channels,
+                dev.output_channels,
+                dev.max_sample_rate,
+            )
+        }));
+    }
+    lines
+}
+
+fn cmd_devices() -> Result<()> {
+    for line in device_lines(&coppa_audio::list_devices()?) {
+        println!("{line}");
     }
     Ok(())
 }
@@ -1176,12 +1390,26 @@ fn cmd_config(profile: Option<&str>) -> Result<()> {
 }
 
 #[cfg(feature = "kiss-tnc")]
-fn cmd_tnc(port: u16, device: Option<String>, rig: Option<String>, vox: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn cmd_tnc(
+    port: u16,
+    device: Option<String>,
+    input_device_id: Option<String>,
+    output_device_id: Option<String>,
+    input_channel: u16,
+    output_channel: u16,
+    rig: Option<String>,
+    vox: bool,
+) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let config = coppa_daemon::tnc::TncConfig {
             kiss_port: port,
             audio_device: device,
+            input_device_id,
+            output_device_id,
+            input_channel,
+            output_channel,
             rig_address: rig,
             vox_mode: vox,
             sample_rate: 48000,
@@ -1655,6 +1883,7 @@ mod tests {
         play_keyed(
             &mut sink,
             sim::progress,
+            |_| Ok(()),
             &mut ptt,
             samples,
             std::time::Duration::from_millis(lead_ms),
@@ -1731,6 +1960,70 @@ mod tests {
             "unkeyed at {unkey:?}"
         );
         assert_eq!(device.lock().unwrap().captured, samples);
+    }
+
+    /// A non-block-aligned final transmission asks the resampling sink to
+    /// finalize its partial block before waiting for playback and unkeying.
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn play_keyed_finishes_partial_tail_before_ptt_release() {
+        let device = sim::Device::new(std::time::Duration::from_millis(10));
+        let samples = vec![0.25; 1025];
+        let mut sink = sim::Sink(device.clone());
+        let mut ptt = sim::Ptt(device.clone());
+        let mut clock = sim::Clock(device.clone());
+        let finish_device = device.clone();
+        let delivered = play_keyed(
+            &mut sink,
+            sim::progress,
+            move |_| {
+                finish_device.lock().unwrap().log("finish input");
+                Ok(())
+            },
+            &mut ptt,
+            &samples,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(delivered, samples.len() as u64);
+        assert_eq!(device.lock().unwrap().captured, samples);
+        let names = event_names(&device);
+        assert_eq!(
+            names.iter().filter(|name| *name == "finish input").count(),
+            1
+        );
+        assert!(
+            names
+                .iter()
+                .position(|name| name == "finish input")
+                .unwrap()
+                < names.iter().position(|name| name == "ptt RX").unwrap()
+        );
+        assert!(event_time(&device, "ptt RX") >= std::time::Duration::from_millis(30));
+    }
+
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn play_keyed_unkeys_and_stops_when_finishing_tail_fails() {
+        let device = sim::Device::new(std::time::Duration::ZERO);
+        let mut sink = sim::Sink(device.clone());
+        let mut ptt = sim::Ptt(device.clone());
+        let mut clock = sim::Clock(device.clone());
+        let error = play_keyed(
+            &mut sink,
+            sim::progress,
+            |_| anyhow::bail!("tail conversion failed"),
+            &mut ptt,
+            &[0.5; 7],
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            &mut clock,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("tail conversion failed"));
+        assert_eq!(event_names(&device), ["ptt TX", "ptt RX", "stop"]);
     }
 
     /// TX and tune share the live path: a tune longer than the sink ring,
@@ -2105,6 +2398,240 @@ mod tests {
         };
         assert_eq!(args.path(), Some("y.wav"));
         assert_eq!(args.duration, 0);
+    }
+
+    #[test]
+    fn exact_device_and_channel_flags_parse_and_conflict() {
+        let Some(Commands::Rx(rx)) = Cli::parse_from([
+            "coppa",
+            "rx",
+            "--device-id",
+            "alsa:input",
+            "--input-channel",
+            "1",
+        ])
+        .command
+        else {
+            panic!("expected Rx")
+        };
+        assert_eq!(rx.device_id.as_deref(), Some("alsa:input"));
+        assert_eq!(rx.input_channel, 1);
+        assert_eq!(
+            Cli::try_parse_from([
+                "coppa",
+                "rx",
+                "--device",
+                "USB",
+                "--device-id",
+                "alsa:input"
+            ])
+            .err()
+            .expect("conflict")
+            .kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+        );
+        let Some(Commands::Listen(listen)) = Cli::parse_from([
+            "coppa",
+            "listen",
+            "--device-id",
+            "alsa:input",
+            "--input-channel",
+            "1",
+        ])
+        .command
+        else {
+            panic!("expected Listen")
+        };
+        assert_eq!(rx, listen);
+
+        let Some(Commands::Tx {
+            device_id,
+            output_channel,
+            ..
+        }) = Cli::parse_from([
+            "coppa",
+            "tx",
+            "hi",
+            "--device-id",
+            "alsa:output",
+            "--output-channel",
+            "1",
+        ])
+        .command
+        else {
+            panic!("expected Tx")
+        };
+        assert_eq!(device_id.as_deref(), Some("alsa:output"));
+        assert_eq!(output_channel, 1);
+        let Some(Commands::Tune {
+            device_id,
+            output_channel,
+            ..
+        }) = Cli::parse_from([
+            "coppa",
+            "tune",
+            "--device-id",
+            "alsa:output",
+            "--output-channel",
+            "1",
+        ])
+        .command
+        else {
+            panic!("expected Tune")
+        };
+        assert_eq!(device_id.as_deref(), Some("alsa:output"));
+        assert_eq!(output_channel, 1);
+        for command in ["tx", "tune"] {
+            let args: Vec<_> = if command == "tx" {
+                vec![
+                    "coppa",
+                    "tx",
+                    "hi",
+                    "--device",
+                    "USB",
+                    "--device-id",
+                    "alsa:output",
+                ]
+            } else {
+                vec![
+                    "coppa",
+                    "tune",
+                    "--device",
+                    "USB",
+                    "--device-id",
+                    "alsa:output",
+                ]
+            };
+            assert_eq!(
+                Cli::try_parse_from(args).err().expect("conflict").kind(),
+                clap::error::ErrorKind::ArgumentConflict
+            );
+        }
+    }
+
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn explicit_missing_device_id_fails_without_default_fallback() {
+        let id = "coppa:no-such-audio-device";
+        let input = resolve_cli_input_device(None, Some(id))
+            .err()
+            .expect("input ID must fail");
+        assert!(
+            input.to_string().contains("input audio device ID"),
+            "{input}"
+        );
+        assert!(input.to_string().contains(id), "{input}");
+        let output = resolve_cli_output_device(AudioOutputSelection {
+            id: Some(id),
+            ..Default::default()
+        })
+        .err()
+        .expect("output ID must fail");
+        assert!(
+            output.to_string().contains("output audio device ID"),
+            "{output}"
+        );
+        assert!(output.to_string().contains(id), "{output}");
+    }
+
+    #[cfg(feature = "kiss-tnc")]
+    #[test]
+    fn tnc_directional_device_and_channel_flags_parse() {
+        let Some(Commands::Tnc {
+            input_device_id,
+            output_device_id,
+            input_channel,
+            output_channel,
+            ..
+        }) = Cli::parse_from([
+            "coppa",
+            "tnc",
+            "--input-device-id",
+            "alsa:in",
+            "--output-device-id",
+            "alsa:out",
+            "--input-channel",
+            "0",
+            "--output-channel",
+            "1",
+        ])
+        .command
+        else {
+            panic!("expected Tnc")
+        };
+        assert_eq!(input_device_id.as_deref(), Some("alsa:in"));
+        assert_eq!(output_device_id.as_deref(), Some("alsa:out"));
+        assert_eq!((input_channel, output_channel), (0, 1));
+        assert_eq!(
+            Cli::try_parse_from([
+                "coppa",
+                "tnc",
+                "--device",
+                "USB",
+                "--input-device-id",
+                "alsa:in"
+            ])
+            .err()
+            .expect("conflict")
+            .kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+        );
+    }
+
+    #[test]
+    fn device_inventory_shows_ids_and_clean_empty_state() {
+        assert_eq!(
+            device_lines(&[]),
+            [
+                "Available audio devices:",
+                "  (none found - CPAL backend may not be available)",
+            ]
+        );
+        let devices = [
+            coppa_audio::AudioDevice {
+                name: "USB Audio".into(),
+                id: Some("alsa:radio-a".into()),
+                max_sample_rate: 48000,
+                input_channels: 2,
+                output_channels: 2,
+            },
+            coppa_audio::AudioDevice {
+                name: "USB Audio".into(),
+                id: None,
+                max_sample_rate: 44100,
+                input_channels: 2,
+                output_channels: 0,
+            },
+        ];
+        assert_eq!(
+            device_lines(&devices),
+            [
+                "Available audio devices:",
+                "  USB Audio [id: alsa:radio-a] (in: 2ch, out: 2ch, max: 48000 Hz)",
+                "  USB Audio [id: unavailable] (in: 2ch, out: 0ch, max: 44100 Hz)",
+            ]
+        );
+    }
+
+    #[test]
+    fn device_help_explains_exact_ids_and_zero_based_channels() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        for (command, id, channel) in [
+            ("rx", "--device-id", "--input-channel"),
+            ("tx", "--device-id", "--output-channel"),
+            ("tune", "--device-id", "--output-channel"),
+        ] {
+            let help = cli
+                .find_subcommand_mut(command)
+                .unwrap()
+                .render_long_help()
+                .to_string();
+            assert!(
+                help.contains(id) && help.contains(channel) && help.contains("Zero-based"),
+                "{help}"
+            );
+        }
     }
 
     #[test]

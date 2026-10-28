@@ -29,7 +29,15 @@ pub struct AudioConfig {
     pub input_device: String,
     /// Output device name (empty = default).
     pub output_device: String,
-    /// Sample rate in Hz.
+    /// Exact host-specific CPAL input device ID (empty = use name or default).
+    pub input_device_id: String,
+    /// Exact host-specific CPAL output device ID (empty = use name or default).
+    pub output_device_id: String,
+    /// Zero-based input lane of a multichannel device.
+    pub input_channel: u16,
+    /// Zero-based output lane; all other output lanes are silent.
+    pub output_channel: u16,
+    /// Preferred hardware sample rate in Hz; the engine retains its profile rate.
     pub sample_rate: u32,
     /// Ring buffer size in samples; must be greater than 0.
     pub buffer_size: usize,
@@ -447,6 +455,10 @@ impl Default for AudioConfig {
         Self {
             input_device: String::new(),
             output_device: String::new(),
+            input_device_id: String::new(),
+            output_device_id: String::new(),
+            input_channel: 0,
+            output_channel: 0,
             sample_rate: 48_000,
             buffer_size: 8192,
         }
@@ -584,23 +596,39 @@ impl DaemonConfig {
         )
     }
 
-    /// COP-32: `[audio] sample_rate` must equal the configured profile's
-    /// engine rate. coppad has no resampler, so any other rate plays and
-    /// captures audio at the wrong speed. Checked by run mode before any
-    /// hardware is touched; `--check` does not call it.
+    /// A positive preferred hardware rate is required before opening audio.
+    /// The live backend picks a supported rate and converts to the engine rate.
     pub fn check_sample_rate(&self) -> Result<(), String> {
-        let engine_rate = coppa_engine::profiles::get_profile(&self.engine.profile).map_or_else(
-            || coppa_engine::EngineConfig::default().sample_rate,
-            |profile| profile.sample_rate,
-        );
-        if self.audio.sample_rate == engine_rate {
+        if self.audio.sample_rate > 0 {
             return Ok(());
         }
-        Err(format!(
-            "[audio] sample_rate = {} is not supported: coppad has no resampler and \
-             profile {} runs at {engine_rate} Hz; set sample_rate = {engine_rate}",
-            self.audio.sample_rate, self.engine.profile
-        ))
+        Err(
+            "[audio] sample_rate = 0 is not supported: set a positive preferred hardware rate"
+                .into(),
+        )
+    }
+
+    /// A name and ID for the same direction would make selection ambiguous.
+    pub fn check_audio_selectors(&self) -> Result<(), String> {
+        for (direction, name, id) in [
+            (
+                "input",
+                &self.audio.input_device,
+                &self.audio.input_device_id,
+            ),
+            (
+                "output",
+                &self.audio.output_device,
+                &self.audio.output_device_id,
+            ),
+        ] {
+            if !name.is_empty() && !id.is_empty() {
+                return Err(format!(
+                    "[audio] {direction}_device and {direction}_device_id cannot both be set"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// COP-53: a WebSocket-enabled daemon needs a usable `[host]
@@ -754,6 +782,10 @@ mod tests {
     fn test_default_config() {
         let config = DaemonConfig::default();
         assert_eq!(config.audio.sample_rate, 48_000);
+        assert_eq!(config.audio.input_channel, 0);
+        assert_eq!(config.audio.output_channel, 0);
+        assert!(config.audio.input_device_id.is_empty());
+        assert!(config.audio.output_device_id.is_empty());
         assert_eq!(config.host.vara_command_port, 8300);
         assert!(!config.host.vara_enabled);
         assert!(!config.host.websocket_enabled);
@@ -786,6 +818,8 @@ mod tests {
         let parsed: DaemonConfig = toml::from_str(&printed).unwrap();
         assert_eq!(toml::to_string_pretty(&parsed).unwrap(), printed);
         assert_eq!(parsed.audio.sample_rate, 48_000);
+        assert_eq!(parsed.audio.input_channel, 0);
+        assert_eq!(parsed.audio.output_channel, 0);
         assert_eq!(parsed.radio.ptt_method, "none");
         assert_eq!(parsed.engine.profile, "HF_STANDARD");
         assert_eq!(parsed.engine.grid, None);
@@ -1428,22 +1462,61 @@ beacon_interval_secs = 600
     }
 
     #[test]
-    fn check_sample_rate_rejects_any_other_rate() {
+    fn check_sample_rate_accepts_another_positive_hardware_rate() {
         let mut config = DaemonConfig::default();
         config.audio.sample_rate = 44_100;
-        let err = config.check_sample_rate().unwrap_err();
-        assert!(err.contains("sample_rate = 44100"), "{err}");
-        assert!(err.contains("48000 Hz"), "{err}");
-        assert!(err.contains("HF_STANDARD"), "{err}");
+        assert_eq!(config.check_sample_rate(), Ok(()));
+        assert_eq!(
+            coppa_engine::profiles::get_profile(&config.engine.profile)
+                .unwrap()
+                .sample_rate,
+            48_000
+        );
     }
 
     #[test]
-    fn check_sample_rate_uses_the_default_engine_rate_for_an_unknown_profile() {
+    fn check_sample_rate_rejects_zero() {
         let mut config = DaemonConfig::default();
-        config.engine.profile = "NOT_A_PROFILE".into();
-        assert_eq!(config.check_sample_rate(), Ok(()));
-        config.audio.sample_rate = 96_000;
-        assert!(config.check_sample_rate().is_err());
+        config.audio.sample_rate = 0;
+        assert!(config
+            .check_sample_rate()
+            .unwrap_err()
+            .contains("sample_rate = 0"));
+    }
+
+    #[test]
+    fn audio_ids_channels_roundtrip_and_conflicting_selectors_fail() {
+        let config: DaemonConfig = toml::from_str(
+            "[audio]\ninput_device_id = \"alsa:rx\"\noutput_device_id = \"alsa:tx\"\ninput_channel = 1\noutput_channel = 2\nsample_rate = 44100\n"
+        ).unwrap();
+        assert_eq!(config.audio.input_device_id, "alsa:rx");
+        assert_eq!(config.audio.output_device_id, "alsa:tx");
+        assert_eq!(config.audio.input_channel, 1);
+        assert_eq!(config.audio.output_channel, 2);
+        assert_eq!(config.check_audio_selectors(), Ok(()));
+        let printed = toml::to_string(&config).unwrap();
+        assert_eq!(
+            toml::from_str::<DaemonConfig>(&printed)
+                .unwrap()
+                .audio
+                .output_channel,
+            2
+        );
+
+        let conflict: DaemonConfig =
+            toml::from_str("[audio]\ninput_device = \"USB\"\ninput_device_id = \"alsa:rx\"\n")
+                .unwrap();
+        assert!(conflict
+            .check_audio_selectors()
+            .unwrap_err()
+            .contains("input_device and input_device_id"));
+        let conflict: DaemonConfig =
+            toml::from_str("[audio]\noutput_device = \"USB\"\noutput_device_id = \"alsa:tx\"\n")
+                .unwrap();
+        assert!(conflict
+            .check_audio_selectors()
+            .unwrap_err()
+            .contains("output_device and output_device_id"));
     }
 
     #[test]
