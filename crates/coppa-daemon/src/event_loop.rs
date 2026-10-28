@@ -6676,6 +6676,172 @@ mod tests {
         );
     }
 
+    /// Bench channel order, with noise referenced to clean power so a fade
+    /// reduces SNR. Padding belongs after the channel, at the RX boundary.
+    fn impair_hf_audio(raw: &[f32], leg_seed: u64) -> Vec<f32> {
+        let sample_rate = 48_000.0;
+        let filtered = coppa_channel::ssb_filter(raw, sample_rate);
+        let clean_power = coppa_channel::mean_power(&filtered);
+        let faded = coppa_channel::watterson::watterson_preset(
+            &filtered,
+            sample_rate,
+            coppa_channel::watterson::WattersonPreset::Good,
+            leg_seed ^ 0x3333_3333_3333_3333,
+        );
+        let noisy = coppa_channel::awgn_ref_seeded(
+            &faded,
+            24.0,
+            clean_power,
+            sample_rate,
+            leg_seed ^ 0x5555_5555_5555_5555,
+        );
+        let shifted = coppa_channel::frequency_shift(&noisy, 20.0, sample_rate);
+        let clocked = coppa_channel::sample_clock_offset(&shifted, 50.0)
+            .expect("50 ppm is a valid sampling clock offset");
+        with_lead_and_trail(&clocked)
+    }
+
+    async fn deliver_impaired_leg(
+        audio: &mut coppa_audio::AudioRingConsumer,
+        peer: &mut EventLoop,
+        seed: u64,
+        stage: &str,
+        unstick: bool,
+    ) -> Result<(), String> {
+        let raw = read_all(audio);
+        if raw.is_empty() {
+            return Err(format!("{stage}: no transmitted audio"));
+        }
+        if unstick {
+            unstick_decoder(peer);
+        }
+        peer.decode_and_dispatch_audio(&impair_hf_audio(&raw, seed))
+            .await;
+        Ok(())
+    }
+
+    fn session_notices_for_impaired_trial(
+        rx: &mut mpsc::Receiver<VaraResponse>,
+    ) -> Vec<VaraResponse> {
+        drain_vara(rx)
+            .into_iter()
+            .filter(|response| {
+                matches!(
+                    response,
+                    VaraResponse::Pending
+                        | VaraResponse::CancelPending
+                        | VaraResponse::Connected(..)
+                        | VaraResponse::Disconnected
+                )
+            })
+            .collect()
+    }
+
+    /// COP-71: every session leg crosses a realistic HF channel before the
+    /// peer's persistent streaming decoder and normal MAC/session dispatch.
+    #[tokio::test]
+    async fn impaired_hf_session_delivers_data_and_audio_ack() {
+        async fn trial(seed: u64) -> Result<(), String> {
+            let mut config = DaemonConfig::default();
+            config.engine.profile = "HF_STANDARD".into();
+            config.engine.callsign = "VK3ABC".into();
+            config.radio.ptt_pre_delay_ms = 0;
+            config.radio.ptt_tail_delay_ms = 0;
+            let (mut a, mut a_audio, mut a_vara) = wired_station(config.clone());
+            config.engine.callsign = "W1AW".into();
+            let (mut b, mut b_audio, mut b_vara) = wired_station(config);
+            a.listening = true;
+            b.listening = true;
+            assert_eq!(a.engine.speed_level(), 2);
+            assert_eq!(b.engine.speed_level(), 2);
+            // A separate two-frame streaming bug affects the first station-ID
+            // prepend under fading; this test isolates the session path.
+            mark_identified(&mut a);
+            mark_identified(&mut b);
+            let (host_tx, mut host_rx) = mpsc::unbounded_channel();
+            b.set_response_tx(host_tx);
+
+            a.handle_host_event(HostEvent::ConnectRequest {
+                client_id: 1,
+                source: "VK3ABC".into(),
+                destination: "W1AW".into(),
+            })
+            .await;
+            deliver_impaired_leg(&mut a_audio, &mut b, seed, "CONNECT_REQ", false).await?;
+            let notices = session_notices_for_impaired_trial(&mut b_vara);
+            if notices != [VaraResponse::Pending] {
+                return Err(format!("CONNECT_REQ: expected PENDING, got {notices:?}"));
+            }
+
+            deliver_impaired_leg(&mut b_audio, &mut a, seed + 0x100, "CONNECT_ACK", false).await?;
+            let notices = session_notices_for_impaired_trial(&mut a_vara);
+            if notices
+                != [VaraResponse::Connected(
+                    "VK3ABC".into(),
+                    "W1AW".into(),
+                    2400,
+                )]
+                || a.session_link.is_none()
+            {
+                return Err(format!("CONNECT_ACK: caller not established: {notices:?}"));
+            }
+
+            deliver_impaired_leg(&mut a_audio, &mut b, seed + 0x200, "CONNECT_CFM", true).await?;
+            let notices = session_notices_for_impaired_trial(&mut b_vara);
+            if notices
+                != [VaraResponse::Connected(
+                    "VK3ABC".into(),
+                    "W1AW".into(),
+                    2400,
+                )]
+                || b.session_link.is_none()
+            {
+                return Err(format!(
+                    "CONNECT_CFM: responder not established: {notices:?}"
+                ));
+            }
+            a.handle_ptt_change(false).await;
+            b.handle_ptt_change(false).await;
+
+            let payload = b"twenty-eight bytes of B2F!!!".to_vec();
+            a.handle_host_event(HostEvent::DataReceived {
+                client_id: 1,
+                data: payload.clone(),
+            })
+            .await;
+            if a.session_link.as_ref().unwrap().tx.in_flight() != 1 {
+                return Err("data: sender did not track the frame".into());
+            }
+            deliver_impaired_leg(&mut a_audio, &mut b, seed + 0x300, "data", true).await?;
+            let received = drain_data_out(&mut host_rx);
+            if received != [payload] {
+                return Err(format!("data: responder host received {received:?}"));
+            }
+
+            deliver_impaired_leg(&mut b_audio, &mut a, seed + 0x400, "data ACK", true).await?;
+            let in_flight = a.session_link.as_ref().unwrap().tx.in_flight();
+            if in_flight != 0 {
+                return Err(format!("data ACK: sender still has {in_flight} in flight"));
+            }
+            Ok(())
+        }
+
+        let seeds = [0x7100_u64, 0x8100, 0x9100];
+        let mut completed = 0;
+        let mut failures = Vec::new();
+        for seed in seeds {
+            match trial(seed).await {
+                Ok(()) => completed += 1,
+                Err(stage) => failures.push(format!("seed {seed:#x}: {stage}")),
+            }
+        }
+        assert!(
+            completed >= 2,
+            "only {completed}/3 complete impaired sessions; {}",
+            failures.join("; ")
+        );
+    }
+
     /// COP-38 (D8): a duplicate data frame (our ACK was lost, so the peer
     /// sent it again) is ACKed again but delivered to the host only once.
     #[tokio::test]

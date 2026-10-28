@@ -441,6 +441,7 @@ dependencies = [
  "anyhow",
  "clap",
  "coppa-audio",
+ "coppa-channel",
  "coppa-codec",
  "coppa-dsp",
  "coppa-engine",
