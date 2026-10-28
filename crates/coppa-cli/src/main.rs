@@ -346,8 +346,28 @@ fn resolve_config(profile: Option<&str>) -> Result<EngineConfig> {
     }
 }
 
+/// Library diagnostics (PTT release failures, audio errors, `coppa tnc`
+/// status) go through `tracing`; show them on stderr so stdout stays command
+/// output. `RUST_LOG` overrides the `info` default.
+fn init_logging() {
+    use std::io::IsTerminal;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .without_time()
+        .with_target(false)
+        .with_ansi(coppa_daemon::logging::ansi_enabled(
+            std::io::stderr().is_terminal(),
+            std::env::var_os("NO_COLOR").as_deref(),
+        ))
+        .init();
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    init_logging();
 
     let verbosity = if cli.quiet {
         Verbosity::Quiet

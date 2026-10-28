@@ -3,24 +3,31 @@
 //! Manages the engine lifecycle, host interfaces, and radio control in a
 //! persistent background process.
 
+// Diagnostics go through `tracing`; `--check` and `--print-default-config`
+// write their output with `writeln!`.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 // Shared with the library target; the binary uses only part of its API
 // (and none of the output worker without `cpal-backend`).
 #[allow(dead_code)]
 mod audio_output;
+mod build_info;
 mod cli;
 mod config;
 mod event_loop;
 mod level_meter;
+mod logging;
 mod ptt_guardian;
 #[cfg(feature = "websocket")]
 mod spectrum;
+mod startup_report;
 
 #[cfg(feature = "kiss-tnc")]
 mod tnc;
 mod tx_chunker;
 mod vara_wiring;
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -91,12 +98,19 @@ fn init_tracing(level: Option<LogLevel>) {
     let rust_log = std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).ok();
     tracing_subscriber::fmt()
         .with_env_filter(cli::log_filter(level, rust_log.as_deref()))
+        // The terminal check alone would override NO_COLOR; see `ansi_enabled`.
+        .with_ansi(logging::ansi_enabled(
+            std::io::stdout().is_terminal(),
+            std::env::var_os("NO_COLOR").as_deref(),
+        ))
         .init();
 }
 
 fn log_banner() {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
+        git_sha = build_info::GIT_SHA,
+        features = %build_info::features(),
         "coppad - Coppa Daemon starting"
     );
 }
@@ -205,9 +219,15 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     // COP-32/COP-36: config checks first, before any hardware or socket is
     // touched. The profile check comes first so a typo'd name is reported as
     // an unknown profile, not through check_sample_rate's fallback rate.
+    // COP-53: a WebSocket-enabled config needs a valid token and origin list,
+    // checked in every build (the keys deserialize in every build).
     config.check_profile().map_err(anyhow::Error::msg)?;
     config.check_buffer_size().map_err(anyhow::Error::msg)?;
     config.check_sample_rate().map_err(anyhow::Error::msg)?;
+    config.check_websocket_auth().map_err(anyhow::Error::msg)?;
+    config
+        .check_websocket_built(cfg!(feature = "websocket"))
+        .map_err(anyhow::Error::msg)?;
     #[cfg(not(feature = "cpal-backend"))]
     check_no_named_devices(&config.audio)?;
 
@@ -222,22 +242,29 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     // COP-31: for rigctld or GPIO PTT, start the out-of-process guardian
     // that releases PTT if this process dies keyed (SIGKILL, OOM, crash).
     // Failing to start it is logged, not fatal.
-    if event_loop.ptt_guardian_eligible() {
+    // COP-50: the guardian's state is kept for the startup summary.
+    let guardian = if event_loop.ptt_guardian_eligible() {
         match ptt_guardian::PttGuardian::spawn(&config.radio) {
             Ok(guardian) => {
-                tracing::info!(
-                    pid = guardian.pid().unwrap_or_default(),
-                    "PTT guardian started"
-                );
+                let pid = guardian.pid().unwrap_or_default();
+                tracing::info!(pid, "PTT guardian started");
                 event_loop.set_ptt_guardian(guardian);
+                startup_report::Guardian::Running { pid }
             }
-            Err(e) => tracing::error!(
-                error = %e,
-                "Could not start the PTT guardian; if coppad is killed while transmitting, \
-                 PTT may stay keyed"
-            ),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "Could not start the PTT guardian; if coppad is killed while transmitting, \
+                     PTT may stay keyed"
+                );
+                startup_report::Guardian::FailedToStart(format!("{e:#}"))
+            }
         }
-    }
+    } else {
+        event_loop
+            .ptt_startup()
+            .guardian_not_started(config.radio.ptt_guardian)
+    };
 
     let event_tx = event_loop.event_sender();
 
@@ -288,9 +315,25 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         None
     };
 
+    // COP-50: every host listener's state, for the startup summary.
+    let vara_state = match &vara_listeners {
+        Some((cmd, data)) => (listener_state(cmd)?, listener_state(data)?),
+        None => (
+            startup_report::Listener::Disabled,
+            startup_report::Listener::Disabled,
+        ),
+    };
+    #[cfg(feature = "websocket")]
+    let ws_state = match &ws_listener {
+        Some(listener) => listener_state(listener)?,
+        None => startup_report::Listener::Disabled,
+    };
+    #[cfg(not(feature = "websocket"))]
+    let ws_state = startup_report::Listener::NotBuilt;
+
     // Connect CPAL audio streams to ring buffers
     #[cfg(feature = "cpal-backend")]
-    {
+    let audio_devices = {
         use coppa_audio::AudioSource;
 
         let sample_rate = config.audio.sample_rate;
@@ -313,7 +356,7 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         tokio::task::spawn_blocking(move || {
             let mut source = match open_input(&input_device_name, sample_rate, buf_size) {
                 Ok(source) => {
-                    let _ = input_opened_tx.send(Ok(()));
+                    let _ = input_opened_tx.send(Ok(source.device_name()));
                     source
                 }
                 Err(e) => {
@@ -339,10 +382,10 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
                 }
             }
         });
-        input_opened_rx
+        let input_name = input_opened_rx
             .await
             .context("audio input worker stopped before opening its device")??;
-        tracing::info!(sample_rate, "Audio input started");
+        tracing::info!(device = ?input_name, sample_rate, "Audio input started");
 
         // Spawn audio output: event loop writes to ring buffer -> CPAL speaker.
         // The sink is created, started, stopped and dropped on this one
@@ -361,7 +404,7 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         tokio::task::spawn_blocking(move || {
             let sink = match open_output(&output_device_name, sample_rate, buf_size) {
                 Ok(sink) => {
-                    let _ = output_opened_tx.send(Ok(()));
+                    let _ = output_opened_tx.send(Ok(sink.device_name()));
                     sink
                 }
                 Err(e) => {
@@ -377,11 +420,12 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
                 output_shutdown,
             );
         });
-        output_opened_rx
+        let output_name = output_opened_rx
             .await
             .context("audio output worker stopped before opening its device")??;
-        tracing::info!(sample_rate, "Audio output started");
-    }
+        tracing::info!(device = ?output_name, sample_rate, "Audio output started");
+        (input_name, output_name)
+    };
 
     // Suppress unused variable warnings when cpal-backend is not enabled
     #[cfg(not(feature = "cpal-backend"))]
@@ -414,11 +458,27 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     // Start WebSocket server if enabled
     #[cfg(feature = "websocket")]
     if let Some(ws_listener) = ws_listener {
-        tracing::info!(addr = %vara_wiring::listen_addr(&ws_listener), "WebSocket server listening");
+        tracing::info!(
+            addr = %vara_wiring::listen_addr(&ws_listener),
+            allowed_origins = config.host.websocket_allowed_origins.len(),
+            "WebSocket server listening"
+        );
+        // COP-53: every handshake must present the token and, from a browser,
+        // an allowlisted Origin. check_websocket_auth already refused a missing
+        // token; an empty one here would make the server refuse everything.
+        let auth = coppa_host::websocket::WsAuth::new(
+            config
+                .host
+                .websocket_token
+                .as_ref()
+                .map_or("", config::SecretToken::expose),
+            &config.host.websocket_allowed_origins,
+        );
         let mut ws_server = coppa_host::websocket::WebSocketServer::with_bind_addr(
             config.host.websocket_port,
             config.host.bind_address.clone(),
-        );
+        )
+        .with_auth(auth);
 
         // Pipe WebSocket events into the daemon event loop
         if let Some(mut ws_rx) = ws_server.take_event_rx() {
@@ -470,6 +530,53 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         });
     }
 
+    // COP-50: state what startup actually did, then ready or degraded.
+    tracing::info!(
+        bind_address = %config.host.bind_address,
+        vara_command = %vara_state.0,
+        vara_data = %vara_state.1,
+        websocket = %ws_state,
+        "Host listeners"
+    );
+    if startup_report::exposed([&vara_state.0, &vara_state.1, &ws_state]) {
+        tracing::warn!(
+            bind_address = %config.host.bind_address,
+            "Host listeners accept connections from other hosts; anyone who can reach them \
+             can key the transmitter. Use bind_address = \"127.0.0.1\" unless this network \
+             is trusted and firewalled"
+        );
+    }
+    #[cfg(feature = "cpal-backend")]
+    tracing::info!(
+        input = ?audio_devices.0,
+        output = ?audio_devices.1,
+        sample_rate = config.audio.sample_rate,
+        "Audio devices"
+    );
+    #[cfg(not(feature = "cpal-backend"))]
+    tracing::warn!(
+        "Audio devices: none; this coppad was built without the cpal-backend feature, so it \
+         can neither receive nor transmit"
+    );
+    let ptt = event_loop.ptt_startup();
+    if ptt.problem().is_some() {
+        tracing::warn!(
+            method = ?ptt.method(),
+            active = %ptt.active(),
+            state = ?ptt.state(),
+            guardian = ?guardian.to_string(),
+            "PTT"
+        );
+    } else {
+        tracing::info!(
+            method = ?ptt.method(),
+            active = %ptt.active(),
+            state = ?ptt.state(),
+            guardian = ?guardian.to_string(),
+            "PTT"
+        );
+    }
+
     // COP-32: "Daemon ready" only when nothing degraded the startup.
     let problems = event_loop.startup_problems();
     if problems.is_empty() {
@@ -516,6 +623,14 @@ async fn bind_host_port(
     tokio::net::TcpListener::bind(&addr).await.with_context(|| {
         format!("failed to bind the {what} to {addr} ([host] bind_address, {key})")
     })
+}
+
+/// COP-50: a bound listener's state, with the address the OS assigned.
+fn listener_state(listener: &tokio::net::TcpListener) -> Result<startup_report::Listener> {
+    let addr = listener
+        .local_addr()
+        .context("failed to read a bound host listener's address")?;
+    Ok(startup_report::Listener::Listening(addr))
 }
 
 /// COP-32: sets the audio workers' shutdown flag when `run_daemon` returns,
@@ -603,7 +718,7 @@ fn open_input(name: &str, sample_rate: u32, buf_size: usize) -> Result<coppa_aud
     } else {
         match coppa_audio::find_input_device_by_name(name) {
             Some(device) => {
-                tracing::info!(device = %name, "Audio input: using named device");
+                tracing::info!(configured = ?name, "Audio input: using named device");
                 coppa_audio::CpalSource::from_device(device, sample_rate, buf_size)
             }
             // Unplugged between `check_named_device` and here.
@@ -629,7 +744,7 @@ fn open_output(name: &str, sample_rate: u32, buf_size: usize) -> Result<coppa_au
     } else {
         match coppa_audio::find_output_device_by_name(name) {
             Some(device) => {
-                tracing::info!(device = %name, "Audio output: using named device");
+                tracing::info!(configured = ?name, "Audio output: using named device");
                 coppa_audio::CpalSink::from_device(device, sample_rate, buf_size)
             }
             // Unplugged between `check_named_device` and here.

@@ -370,6 +370,7 @@ dependencies = [
  "cpal",
  "hound",
  "rtrb",
+ "tracing",
 ]
 
 [[package]]
@@ -416,6 +417,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -497,6 +499,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
+ "tracing",
 ]
 
 [[package]]
@@ -535,6 +538,7 @@ dependencies = [
  "anyhow",
  "serialport",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

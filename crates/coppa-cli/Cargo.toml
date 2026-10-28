@@ -21,8 +21,12 @@ coppa-daemon = { path = "../coppa-daemon" }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+<<<<<<< HEAD
 serde = { workspace = true }
 serde_json = { workspace = true }
+=======
+tracing-subscriber = { workspace = true }
+>>>>>>> 6f438bc5f575b06ad6b6049c2b04a1906ca53fdb
 
 [dev-dependencies]
 # Golden-vector manifest parsing (tests/rx_golden.rs), matching

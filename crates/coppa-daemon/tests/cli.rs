@@ -78,6 +78,8 @@ impl Daemon {
             .args(args)
             .current_dir(cwd)
             .env_remove("RUST_LOG")
+            // Every daemon gets the default colour decision (COP-51).
+            .env_remove("NO_COLOR")
             // anyhow appends a backtrace to `main`'s error when either is set.
             .env_remove("RUST_BACKTRACE")
             .env_remove("RUST_LIB_BACKTRACE")
@@ -630,6 +632,7 @@ fn print_default_config_prints_only_the_default_toml() {
     for line in [
         "vara_enabled = false",
         "websocket_enabled = false",
+        "websocket_allowed_origins = []",
         "rate_loop_probe_interval = 0",
         "cp_gate_enabled = false",
         "cp_negotiation_enabled = false",
@@ -639,6 +642,8 @@ fn print_default_config_prints_only_the_default_toml() {
         assert!(printed.contains(line), "missing {line:?}:\n{printed}");
     }
     assert!(!printed.contains("grid"), "{printed}");
+    // COP-53: an unset token is omitted, never printed as a placeholder.
+    assert!(!printed.contains("websocket_token"), "{printed}");
 
     let parsed: DaemonConfig = toml::from_str(&printed).expect("printed TOML parses");
     assert_eq!(
@@ -686,14 +691,14 @@ fn tnc_without_the_feature_fails_without_a_banner() {
 
 /// Start the daemon and wait until it logs `Daemon ready`. Returns the child
 /// and the time readiness took.
-#[cfg(not(feature = "cpal-backend"))]
+#[cfg(any(not(feature = "cpal-backend"), target_os = "linux"))]
 fn start_until_ready(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> (Daemon, Duration) {
     start_until(cwd, args, envs, "Daemon ready")
 }
 
 /// Start the daemon and wait until its stdout contains `marker`. Returns the
 /// child and the time that took.
-#[cfg(not(feature = "cpal-backend"))]
+#[cfg(any(not(feature = "cpal-backend"), target_os = "linux"))]
 fn start_until(
     cwd: &Path,
     args: &[&str],
@@ -770,6 +775,78 @@ fn log_level_overrides_rust_log_on_a_running_daemon() {
     assert_eq!(stderr, "");
 }
 
+// --- log output on a non-TTY (COP-51) ---------------------------------------
+//
+// The captures are files, as a log file or the journal would be: no colour
+// codes, and library messages arrive as levelled tracing lines on stdout.
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn a_daemon_logging_to_a_file_writes_no_colour_codes() {
+    let dir = TempDir::new("no-colour");
+    let (mut daemon, _) = start_until_ready(dir.path(), &[], &[]);
+    let (stdout, stderr) = daemon.kill();
+    assert!(stdout.contains("Coppa Daemon starting"), "{stdout}");
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "ANSI escape on stdout:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "ANSI escape on stderr:\n{stderr}"
+    );
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn a_library_message_is_a_tracing_line_not_a_bare_print() {
+    use std::io::Write;
+
+    let dir = TempDir::new("library-message");
+    dir.write(
+        "station.toml",
+        "[host]\nvara_enabled = true\nvara_command_port = 0\nvara_data_port = 0\n",
+    );
+    let (mut daemon, _) = start_until(
+        dir.path(),
+        &["station.toml"],
+        &[],
+        "VARA TCP server listening",
+    );
+    let stdout = daemon.stdout();
+    let addr = stdout
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("command_addr="))
+        .unwrap_or_else(|| panic!("no command_addr field:\n{stdout}"))
+        .to_string();
+
+    // One byte past the command port's 4096-byte line limit, no newline.
+    let mut client = std::net::TcpStream::connect(&addr).expect("connect to the command port");
+    client
+        .write_all(&[b'A'; 4097])
+        .expect("write the over-long line");
+    while !daemon.stdout().contains("over-long line") {
+        if daemon.started.elapsed() >= DEADLINE {
+            let (stdout, stderr) = daemon.kill();
+            panic!("no over-long line warning\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(client);
+    let (stdout, stderr) = daemon.kill();
+    assert_eq!(stderr, "", "library messages must not bypass tracing");
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("over-long line"))
+        .expect("the warning line");
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("coppa_host::vara::command"), "{line}");
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "ANSI escape on stdout:\n{stdout}"
+    );
+}
+
 // --- startup failures (COP-32) ----------------------------------------------
 //
 // A condition that stops the daemon doing its job is an ERROR, never
@@ -781,10 +858,19 @@ fn log_level_overrides_rust_log_on_a_running_daemon() {
 /// ERROR log line, no readiness, and `Error: <stderr_prefix>` on stderr.
 /// Returns (stdout, stderr).
 fn run_startup_error(toml: &str, stderr_prefix: &str) -> (String, String) {
+    run_startup_error_with_env(toml, stderr_prefix, &[])
+}
+
+/// [`run_startup_error`] with extra environment variables for the daemon.
+fn run_startup_error_with_env(
+    toml: &str,
+    stderr_prefix: &str,
+    envs: &[(&str, &str)],
+) -> (String, String) {
     let dir = TempDir::new("startup-error");
     dir.write("station.toml", toml);
     let args = ["--config", "station.toml"];
-    let out = run(dir.path(), &args);
+    let out = run_with_env(dir.path(), &args, envs);
     out.assert_code(1, &args);
     assert!(out.stdout.contains("ERROR"), "{}", out.stdout);
     assert!(
@@ -878,8 +964,159 @@ fn a_taken_websocket_port_is_a_startup_error() {
     let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
     let port = taken.local_addr().unwrap().port();
     run_startup_error(
-        &format!("[host]\nwebsocket_enabled = true\nwebsocket_port = {port}\n"),
+        &format!(
+            "[host]\nwebsocket_enabled = true\nwebsocket_port = {port}\n\
+             websocket_token = \"{WS_TOKEN}\"\n"
+        ),
         &format!("failed to bind the WebSocket port to 127.0.0.1:{port}"),
+    );
+}
+
+// --- WebSocket access (COP-53) ----------------------------------------------
+
+/// A valid `[host] websocket_token` for the tests below.
+const WS_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+#[test]
+fn websocket_without_a_token_is_a_startup_error() {
+    // COP-53: refused in every build, before any socket is bound. --check
+    // still accepts the same config (see
+    // check_only_deserializes_and_never_touches_hardware_or_listeners).
+    let (stdout, _) = run_startup_error(
+        "[host]\nwebsocket_enabled = true\n",
+        "[host] websocket_enabled = true requires [host] websocket_token",
+    );
+    assert!(!stdout.contains("WebSocket server listening"), "{stdout}");
+}
+
+#[test]
+fn a_short_websocket_token_is_a_startup_error() {
+    run_startup_error(
+        "[host]\nwebsocket_enabled = true\nwebsocket_token = \"short\"\n",
+        "[host] websocket_token is 5 characters long",
+    );
+}
+
+#[test]
+fn an_invalid_websocket_origin_is_a_startup_error() {
+    run_startup_error(
+        &format!(
+            "[host]\nwebsocket_enabled = true\nwebsocket_token = \"{WS_TOKEN}\"\n\
+             websocket_allowed_origins = [\"*\"]\n"
+        ),
+        "[host] websocket_allowed_origins entry \"*\"",
+    );
+}
+
+/// Send one WebSocket upgrade request for `target` with the given extra
+/// header lines, and return the response's status line.
+#[cfg(all(feature = "websocket", not(feature = "cpal-backend")))]
+fn upgrade_status(port: u16, target: &str, headers: &[String]) -> String {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(DEADLINE))
+        .expect("set read timeout");
+    let mut request = format!(
+        "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: Upgrade\r\n\
+         Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    );
+    for header in headers {
+        request.push_str(header);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).expect("send upgrade");
+    let mut status = String::new();
+    BufReader::new(stream)
+        .read_line(&mut status)
+        .expect("read status line");
+    status
+}
+
+/// COP-53, end to end through the real binary: the configured token and
+/// origin allowlist reach the WebSocket server. A wiring bug shows up either
+/// as the valid cases failing (fail closed) or the evil origin passing (fail
+/// open).
+///
+/// CI's full suite builds with `cpal-backend`, which compiles this test out
+/// (like every `start_until` test), so it runs only under
+/// `cargo test -p coppa-daemon --features websocket --test cli`.
+#[cfg(all(feature = "websocket", not(feature = "cpal-backend")))]
+#[test]
+fn websocket_handshake_requires_an_allowed_origin_and_the_token() {
+    let dir = TempDir::new("ws-auth");
+    dir.write(
+        "station.toml",
+        &format!(
+            "[host]\nwebsocket_enabled = true\nwebsocket_port = 0\n\
+             websocket_token = \"{WS_TOKEN}\"\n\
+             websocket_allowed_origins = [\"http://localhost:3000\"]\n"
+        ),
+    );
+    let args = ["--config", "station.toml"];
+    let (mut daemon, _) = start_until(dir.path(), &args, &[], "Daemon ready");
+    let stdout = daemon.stdout();
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("WebSocket server listening"))
+        .unwrap_or_else(|| panic!("no listening line:\n{stdout}"));
+    let after = &line[line.find("127.0.0.1:").expect("listen address") + "127.0.0.1:".len()..];
+    let port: u16 = after
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .expect("listen port");
+
+    let evil = "Origin: https://evil.example".to_string();
+    let bearer = format!("Authorization: Bearer {WS_TOKEN}");
+    let cases: [(String, Vec<String>, &str); 5] = [
+        ("/".to_string(), vec![evil.clone()], "HTTP/1.1 403"),
+        ("/".to_string(), vec![evil, bearer.clone()], "HTTP/1.1 403"),
+        ("/".to_string(), vec![], "HTTP/1.1 401"),
+        ("/".to_string(), vec![bearer], "HTTP/1.1 101"),
+        (
+            format!("/?token={WS_TOKEN}"),
+            vec!["Origin: http://localhost:3000".to_string()],
+            "HTTP/1.1 101",
+        ),
+    ];
+    for (target, headers, expected) in &cases {
+        let status = upgrade_status(port, target, headers);
+        assert!(
+            status.starts_with(expected),
+            "{headers:?}: expected {expected}, got {status:?}"
+        );
+    }
+
+    // Give the event loop time to log both accepted clients.
+    let deadline = Instant::now() + DEADLINE;
+    let connected = |stdout: &str| {
+        stdout
+            .lines()
+            .filter(|line| line.contains("event_loop") && line.contains("Client connected"))
+            .count()
+    };
+    while connected(&daemon.stdout()) < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let (stdout, stderr) = daemon.kill();
+    assert!(
+        !stdout.contains(WS_TOKEN),
+        "token leaked to stdout:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains(WS_TOKEN),
+        "token leaked to stderr:\n{stderr}"
+    );
+    assert_eq!(
+        connected(&stdout),
+        2,
+        "only the two authorized handshakes may reach the event loop:\n{stdout}"
     );
 }
 
@@ -933,4 +1170,261 @@ fn an_unreachable_rigctld_is_reported_degraded_not_ready() {
             .unwrap_or_else(|| panic!("no {marker:?} line\n{stdout}"));
         assert!(line.contains("ERROR"), "{line}");
     }
+}
+
+// --- startup summary (COP-50) ------------------------------------------------
+//
+// Just before `Daemon ready` (or `Daemon running degraded`), coppad states its
+// host listeners, audio devices and PTT; its first line names the build.
+// `NO_COLOR=1` keeps each field's key next to its `=`.
+
+/// The first stdout line containing `marker`, and its index.
+#[cfg(any(not(feature = "cpal-backend"), target_os = "linux"))]
+fn line_with<'a>(stdout: &'a str, marker: &str) -> (usize, &'a str) {
+    stdout
+        .lines()
+        .enumerate()
+        .find(|(_, l)| l.contains(marker))
+        .unwrap_or_else(|| panic!("no {marker:?} line\n{stdout}"))
+}
+
+/// COP-50: the first line names the build, even when startup then fails.
+#[test]
+fn startup_line_states_version_git_sha_and_features() {
+    let (stdout, _) = run_startup_error_with_env(
+        "[audio]\nbuffer_size = 0\n",
+        "[audio] buffer_size = 0 is not supported",
+        &[("NO_COLOR", "1")],
+    );
+    let starting = stdout
+        .lines()
+        .find(|l| l.contains("Coppa Daemon starting"))
+        .unwrap_or_else(|| panic!("no starting line\n{stdout}"));
+    assert!(
+        starting.contains(&format!("version=\"{}\"", env!("CARGO_PKG_VERSION"))),
+        "{starting}"
+    );
+    assert!(
+        starting.contains(&format!("git_sha=\"{}\"", env!("COPPA_GIT_SHA"))),
+        "{starting}"
+    );
+    let mut built = Vec::new();
+    for (name, on) in [
+        ("cpal-backend", cfg!(feature = "cpal-backend")),
+        ("gpio-ptt", cfg!(feature = "gpio-ptt")),
+        ("kiss-tnc", cfg!(feature = "kiss-tnc")),
+        ("serial-ptt", cfg!(feature = "serial-ptt")),
+        ("websocket", cfg!(feature = "websocket")),
+    ] {
+        if on {
+            built.push(name);
+        }
+    }
+    let features = if built.is_empty() {
+        "none".to_string()
+    } else {
+        built.join(",")
+    };
+    assert!(
+        starting.contains(&format!("features={features}")),
+        "{starting}"
+    );
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn startup_states_build_listeners_audio_and_ptt_before_ready() {
+    let dir = TempDir::new("summary");
+    dir.write(
+        "station.toml",
+        "[engine]\ncallsign = \"VK2ABC\"\n\
+         [host]\nvara_enabled = true\nvara_command_port = 0\nvara_data_port = 0\n",
+    );
+    let (mut daemon, _) = start_until_ready(
+        dir.path(),
+        &["--config", "station.toml"],
+        &[("NO_COLOR", "1")],
+    );
+    let (stdout, _) = daemon.kill();
+
+    let (_, vara) = line_with(&stdout, "VARA TCP server listening");
+    let command_addr = vara
+        .split_whitespace()
+        .find_map(|kv| kv.strip_prefix("command_addr="))
+        .unwrap();
+    let (host_at, host) = line_with(&stdout, "Host listeners");
+    assert!(host.contains(" INFO "), "{host}");
+    assert!(host.contains("bind_address=127.0.0.1"), "{host}");
+    assert!(
+        host.contains(&format!("vara_command={command_addr}")),
+        "{host}"
+    );
+    let websocket = if cfg!(feature = "websocket") {
+        "websocket=disabled"
+    } else {
+        "websocket=not-built"
+    };
+    assert!(host.contains(websocket), "{host}");
+    assert!(
+        !stdout.contains("accept connections from other hosts"),
+        "{stdout}"
+    );
+
+    let (audio_at, audio) = line_with(&stdout, "Audio devices");
+    assert!(
+        audio.contains(" WARN ") && audio.contains("cpal-backend"),
+        "{audio}"
+    );
+
+    let (ptt_at, ptt) = line_with(&stdout, "PTT method=");
+    assert!(ptt.contains(" INFO "), "{ptt}");
+    assert!(
+        ptt.contains("method=\"none\" active=none state=\"not controlled\" guardian=\"not used\""),
+        "{ptt}"
+    );
+
+    let (ready_at, _) = line_with(&stdout, "Daemon ready");
+    assert!(
+        host_at < audio_at && audio_at < ptt_at && ptt_at < ready_at,
+        "{stdout}"
+    );
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn the_default_config_states_that_nothing_is_listening() {
+    let dir = TempDir::new("summary-default");
+    let (mut daemon, _) = start_until_ready(dir.path(), &[], &[("NO_COLOR", "1")]);
+    let (stdout, _) = daemon.kill();
+    let (_, host) = line_with(&stdout, "Host listeners");
+    assert!(
+        host.contains("vara_command=disabled vara_data=disabled"),
+        "{host}"
+    );
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn a_non_loopback_bind_address_is_warned_about() {
+    let dir = TempDir::new("summary-exposed");
+    dir.write(
+        "station.toml",
+        "[host]\nbind_address = \"0.0.0.0\"\nvara_enabled = true\n\
+         vara_command_port = 0\nvara_data_port = 0\n",
+    );
+    let (mut daemon, _) = start_until_ready(
+        dir.path(),
+        &["--config", "station.toml"],
+        &[("NO_COLOR", "1")],
+    );
+    let (stdout, _) = daemon.kill();
+    let (_, host) = line_with(&stdout, "Host listeners");
+    assert!(host.contains("vara_command=0.0.0.0:"), "{host}");
+    let (_, warning) = line_with(&stdout, "accept connections from other hosts");
+    assert!(warning.contains(" WARN "), "{warning}");
+}
+
+#[cfg(not(feature = "websocket"))]
+#[test]
+fn websocket_enabled_without_the_websocket_feature_is_a_startup_error() {
+    run_startup_error(
+        &format!("[host]\nwebsocket_enabled = true\nwebsocket_token = \"{WS_TOKEN}\"\n"),
+        "[host] websocket_enabled = true is set, but this coppad was built without the \
+         websocket feature",
+    );
+}
+
+/// A fake rigctld that accepts connections and answers every command
+/// `RPRT -1`, like a rig that refuses CAT PTT.
+#[cfg(not(feature = "cpal-backend"))]
+fn refusing_rigctld() -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake rigctld");
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { return };
+            std::thread::spawn(move || {
+                let mut writer = stream.try_clone().unwrap();
+                for line in BufReader::new(stream).lines() {
+                    if line.is_err() || writeln!(writer, "RPRT -1").is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn a_rigctld_that_refuses_ptt_is_reported_degraded_not_ready() {
+    let dir = TempDir::new("summary-refused");
+    dir.write(
+        "station.toml",
+        &format!(
+            "[radio]\nptt_method = \"rigctld\"\nrigctld_address = \"{}\"\nptt_guardian = false\n",
+            refusing_rigctld()
+        ),
+    );
+    let (mut daemon, _) = start_until(
+        dir.path(),
+        &["--config", "station.toml"],
+        &[("NO_COLOR", "1")],
+        "Daemon running degraded",
+    );
+    let (stdout, _) = daemon.kill();
+    assert!(!stdout.contains("Daemon ready"), "{stdout}");
+    let (_, degraded) = line_with(&stdout, "Daemon running degraded");
+    assert!(
+        degraded.contains("PTT release at startup failed: rigctld set_ptt failed: RPRT -1"),
+        "{degraded}"
+    );
+    let (_, ptt) = line_with(&stdout, "PTT method=");
+    assert!(ptt.contains(" WARN "), "{ptt}");
+    assert!(ptt.contains("active=rigctld"), "{ptt}");
+    assert!(
+        ptt.contains("state=\"release failed: rigctld set_ptt failed: RPRT -1\""),
+        "{ptt}"
+    );
+    assert!(
+        ptt.contains("guardian=\"off ([radio] ptt_guardian = false)\""),
+        "{ptt}"
+    );
+}
+
+/// A cpal build reaches readiness on Linux with ALSA pointed at its `null`
+/// PCM, so this test runs where CI's full suite runs (`cpal-backend`).
+#[cfg(all(feature = "cpal-backend", target_os = "linux"))]
+#[test]
+fn startup_names_the_audio_devices_it_opened() {
+    let dir = TempDir::new("summary-cpal");
+    let conf = dir.write(
+        "asound.conf",
+        "pcm.!default { type null }\n\
+         pcm.null { type null hint { show on description \"Discard all samples\" } }\n",
+    );
+    dir.write("station.toml", "[audio]\ninput_device = \"discard\"\n");
+    let (mut daemon, _) = start_until_ready(
+        dir.path(),
+        &["--config", "station.toml"],
+        &[
+            ("NO_COLOR", "1"),
+            ("ALSA_CONFIG_PATH", conf.to_str().unwrap()),
+        ],
+    );
+    let (stdout, _) = daemon.kill();
+    let (_, audio) = line_with(&stdout, "Audio devices");
+    assert!(audio.contains(" INFO "), "{audio}");
+    assert!(
+        audio.contains("input=\"Discard all samples (alsa:null)\""),
+        "{audio}"
+    );
+    assert!(
+        audio.contains("output=\"Default Audio Device (alsa:default)\""),
+        "{audio}"
+    );
+    let (_, input) = line_with(&stdout, "Audio input started");
+    assert!(input.contains("Discard all samples (alsa:null)"), "{input}");
 }

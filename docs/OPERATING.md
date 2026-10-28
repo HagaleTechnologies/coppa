@@ -1,5 +1,52 @@
 # Operating Coppa
 
+## What coppad reports at startup
+
+`coppad`'s first log line names the build, and just before `Daemon ready` (or
+`Daemon running degraded`) it states what startup actually did: the host
+listeners, the audio devices it opened, and the PTT backend in control. A
+build without `cpal-backend`, with the default config, logs:
+
+```
+INFO coppad: coppad - Coppa Daemon starting version="0.3.0" git_sha="f1dcac4a6ac6" features=none
+INFO coppad: Daemon configuration loaded profile=HF_STANDARD sample_rate=48000 ptt_method=none turnaround_ms=500
+INFO coppad: Host listeners bind_address=127.0.0.1 vara_command=disabled vara_data=disabled websocket=not-built
+WARN coppad: Audio devices: none; this coppad was built without the cpal-backend feature, so it can neither receive nor transmit
+INFO coppad: PTT method="none" active=none state="not controlled" guardian="not used"
+INFO coppad: Daemon ready
+```
+
+A `cpal-backend,websocket` build with rigctld PTT and the VARA and WebSocket
+servers on logs, before `Daemon ready`:
+
+```
+INFO coppad: Audio input started device="Default Audio Device (alsa:default)" sample_rate=48000
+INFO coppad: Audio output started device="Default Audio Device (alsa:default)" sample_rate=48000
+INFO coppad: Host listeners bind_address=127.0.0.1 vara_command=127.0.0.1:8300 vara_data=127.0.0.1:8301 websocket=127.0.0.1:8400
+INFO coppad: Audio devices input="Default Audio Device (alsa:default)" output="Default Audio Device (alsa:default)" sample_rate=48000
+INFO coppad: PTT method="rigctld 127.0.0.1:4532" active=rigctld state="released" guardian="running, pid 28849"
+```
+
+| Line | Field | Values |
+|---|---|---|
+| `Coppa Daemon starting` | `version` | The `coppad` version. |
+| | `git_sha` | The commit HEAD pointed at when `coppad` was built (12 hex digits), or `unknown` for a build from a tree without `.git`. Packagers building from a tarball set `COPPA_GIT_SHA` (7-40 hex digits) at build time. It does not flag uncommitted changes. |
+| | `features` | `coppa-daemon`'s cargo features in this build (`cpal-backend`, `gpio-ptt`, `kiss-tnc`, `serial-ptt`, `websocket`), comma-separated, or `none`. |
+| `Host listeners` | `bind_address` | `[host] bind_address`. |
+| | `vara_command`, `vara_data`, `websocket` | The bound `ip:port` (the real port when 0 is configured), `disabled`, or, for `websocket` only, `not-built` in a build without the `websocket` feature. |
+| `Host listeners accept connections from other hosts; ...` (WARN) | `bind_address` | Logged when a listener is bound to a non-loopback address such as `0.0.0.0`: anyone who can reach it can key the transmitter. |
+| `Audio devices` | `input`, `output` | The device cpal opened, as its name and cpal id, for example `Default Audio Device (alsa:default)`. On ALSA, `default` is whatever PulseAudio, PipeWire or `.asoundrc` route it to; coppad cannot see further. A named device shows its own description and id. |
+| `Audio devices: none; ...` (WARN) | | A build without `cpal-backend`: the daemon runs but moves no audio. |
+| `PTT` | `method` | The configured method: `none`, `vox`, `rigctld <address>`, `serial <port> <dtr\|rts>` or `gpio <pin>`. |
+| | `active` | The backend actually in control: `none`, `vox`, `rigctld`, `serial` or `gpio`. An unreachable rigctld shows `active=none`. |
+| | `state` | `released` (the startup release succeeded), `release failed: <error>`, or `not controlled` (none, VOX, or an unreachable rigctld, where coppad drives no PTT line). |
+| | `guardian` | `running, pid <n>`, `failed to start: <error>`, `off ([radio] ptt_guardian = false)`, or `not used`. See [The PTT guardian](#the-ptt-guardian). |
+
+The `PTT` line is a WARN when PTT keeps the daemon from calling itself ready.
+`--log-level warn` hides the INFO summary lines but not the WARN ones. Set
+`NO_COLOR=1` when the log goes to a file or the journal, so each key stays next
+to its `=`.
+
 ## TX level calibration (TUNE)
 
 Before transmitting real traffic, calibrate your radio's audio drive level so it
@@ -42,7 +89,7 @@ transmission. What does the release depends on how it stops:
 | coppad keeps running, but the task that ends a transmission has died | A check that runs every 500 ms. Once PTT has been keyed for `max_tx_duration_s` plus 2 s, it forces PTT off and logs `PTT backstop: keyed past max_tx_duration_s plus grace with no release; forcing PTT off`. |
 | `kill -9`, an out-of-memory kill or a crash, with rigctld or GPIO PTT | The PTT guardian (below). |
 | The same, with serial PTT | The operating system, which drops DTR/RTS when it closes the port. This has not been checked on real hardware. |
-| Restart after any of the above | coppad releases PTT at startup (rigctld `T 0`, or the serial/GPIO line lowered). If that fails, it logs `Could not release PTT at startup; ...` and starts anyway. |
+| Restart after any of the above | coppad releases PTT at startup (rigctld `T 0`, or the serial/GPIO line lowered). If that fails, it logs `Could not release PTT at startup; ...`, keeps running, and logs `Daemon running degraded` with `PTT release at startup failed: ...` in place of `Daemon ready`. |
 
 The KISS TNC (`coppad --tnc`, `coppa tnc`) also releases PTT on SIGTERM and
 Ctrl-C.
@@ -158,8 +205,10 @@ the radio's muted output or its own monitor, not the band.
 ## Watching levels live
 
 On a daemon built with the `websocket` feature, set
-`websocket_enabled = true` under `[host]`, connect any WebSocket client (for
-example `websocat ws://127.0.0.1:8400`) and send:
+`websocket_enabled = true` and `websocket_token` under `[host]` (see
+[WebSocket access](#websocket-access)), connect any WebSocket client with the
+token (for example
+`websocat "ws://127.0.0.1:8400/?token=$COPPA_WS_TOKEN"`) and send:
 
 ```text
 {"type":"audio_level","enabled":true}
@@ -186,6 +235,113 @@ independent of the `spectrum` stream.
 | `state` | `ok`, `clipping` or `underdrive` (RX, after this window, using the thresholds above). TX is only ever `ok` or `clipping` |
 | `duration_ms` | Audio span the reading covers |
 | `timestamp_ms` | Wall-clock time the message was sent (Unix epoch, ms) |
+
+## WebSocket access
+
+The WebSocket port can key the transmitter, so `coppad` refuses a client
+unless it presents a shared-secret token. This applies on every
+`bind_address`, loopback included: a web page open in your own browser can
+reach `127.0.0.1` too.
+
+### Setting the token
+
+`websocket_enabled = true` needs `websocket_token` under `[host]`, or `coppad`
+exits at startup with an error naming the key. The token must be at least 16
+characters from `A-Z a-z 0-9 - . _ ~`. Generate one with:
+
+```text
+openssl rand -hex 32
+```
+
+```toml
+[host]
+websocket_enabled = true
+websocket_token = "3f9c0e5b7a2d4c1e8f6a0b9d2c7e4a1f5b8d0c3e6a9f2b5d8c1e4a7f0b3d6c9e"
+```
+
+Make the config file readable only by the account `coppad` runs as
+(`chmod 600`). `coppad --check` does not check the token; starting the daemon
+does.
+
+### Presenting the token
+
+A client presents the token in either of two ways:
+
+- `Authorization: Bearer <token>` on the upgrade request. Use this from
+  scripts and programs that can set headers.
+- A `token` query parameter: `ws://127.0.0.1:8400/?token=<token>`. Browser
+  JavaScript cannot set headers on `new WebSocket(...)`, so a browser page
+  must use this form.
+
+```text
+websocat -H "Authorization: Bearer $COPPA_WS_TOKEN" ws://127.0.0.1:8400/
+websocat "ws://127.0.0.1:8400/?token=$COPPA_WS_TOKEN"
+```
+
+### Allowing a browser page
+
+Browsers send an `Origin` header with every WebSocket handshake, naming the
+page that opened it. When a handshake carries an `Origin`, it must match an
+entry in `websocket_allowed_origins` exactly, even if the page also has the
+token. The default is empty, so no web page can connect until you list it.
+Scripts and programs that send no `Origin` header need only the token.
+
+```toml
+[host]
+websocket_allowed_origins = ["http://localhost:3000", "https://dash.example.org"]
+```
+
+Each entry is `scheme://host[:port]`, exactly as the browser's address bar
+shows the page's origin:
+
+- `http` or `https` only, with no path, query, fragment or user name
+  (`"http://localhost:3000/"` is refused; write `"http://localhost:3000"`).
+- No wildcards. List each origin; another web app on a different local port
+  is exactly the untrusted page this check keeps out.
+- No default port: write `"http://localhost"`, not `"http://localhost:80"`,
+  because browsers omit it.
+- `"null"` is never allowed. It is the origin of sandboxed frames and
+  `file://` pages.
+
+Case does not matter. `coppad` checks every entry at startup and exits with an
+error naming the bad one.
+
+From an allowed page:
+
+```js
+const ws = new WebSocket("ws://127.0.0.1:8400/?token=" + encodeURIComponent(token));
+ws.onopen = () => ws.send(JSON.stringify({ type: "status" }));
+```
+
+### What a refused client sees
+
+The daemon refuses at the HTTP upgrade, before the connection becomes a
+WebSocket, so a refused client never sends a command or receives a broadcast:
+
+- An `Origin` that is not allowed gets `HTTP/1.1 403 Forbidden`.
+- A missing or wrong token gets `HTTP/1.1 401 Unauthorized` with
+  `www-authenticate: Bearer`.
+
+A browser page sees only a failed connection: an `error` event, then close
+code 1006. The daemon prints one line per refusal on stderr, without the token
+or the request URI:
+
+```text
+WebSocket handshake from 127.0.0.1:50358 rejected (403): origin "https://evil.example" is not allowed
+WebSocket handshake from 127.0.0.1:50360 rejected (401): token missing or invalid
+```
+
+On a non-loopback `bind_address`, the token crosses the network in clear text
+over `ws://`. Anyone who can watch that traffic can reuse it.
+
+### What this does not cover
+
+The VARA-style command and data ports and the KISS TCP port have no
+authentication, so that Pat and other VARA clients keep working. A web page
+can still deliver a VARA command line to the command port inside an HTTP
+`POST` body, and the daemon executes it. Until that is fixed, if you enable
+`vara_enabled`, do not browse untrusted sites on the same machine, or run
+`coppad` on a host you do not browse from.
 
 ## Connected sessions: delivery and BUFFER
 

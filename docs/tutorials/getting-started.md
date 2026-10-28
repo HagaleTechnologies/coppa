@@ -174,13 +174,21 @@ When the daemon starts, a condition that stops it doing its job is logged at
 four built-in names, `[audio] buffer_size = 0`, a sample rate other than
 48000, a named `[audio]` device that does not exist (or any named device in a
 build without `cpal-backend`), an audio device that will not open, a host port
-that is already taken, an unknown PTT method, or a wideband profile with no
+that is already taken, an unknown PTT method, `[host] websocket_enabled = true`
+in a build without the `websocket` feature, or a wideband profile with no
 frequency source stops the daemon: it logs the reason at `ERROR`, prints `Error: ...` on
 stderr and exits with status 1. An unreachable rigctld does not stop it. The
 daemon keeps running without PTT, logs the failed connection at `ERROR`, and
-logs `Daemon running degraded` with the reason in place of `Daemon ready`.
+logs `Daemon running degraded` with the reason in place of `Daemon ready`. A
+PTT backend that refuses the startup release (for example a rigctld that
+answers `RPRT -1`) is reported the same way. Just before `Daemon ready`, the
+log states the host listeners, the audio devices that were opened, and the PTT
+backend in control; see
+[What coppad reports at startup](../OPERATING.md#what-coppad-reports-at-startup).
 
-Logging goes to stdout. `--log-level` takes one of `off`, `error`, `warn`,
+Logging goes to stdout. Colour codes are written only when stdout is a
+terminal and `NO_COLOR` is unset or empty, so a log file or the systemd
+journal gets plain text. `--log-level` takes one of `off`, `error`, `warn`,
 `info`, `debug` or `trace` and overrides `RUST_LOG`. Without it, `RUST_LOG`
 applies (it accepts full tracing filter expressions), and an absent or invalid
 `RUST_LOG` means `info`:
