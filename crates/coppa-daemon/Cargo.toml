@@ -16,7 +16,9 @@ path = "src/lib.rs"
 
 [dependencies]
 coppa-engine = { path = "../coppa-engine" }
-coppa-audio = { path = "../coppa-audio" }
+# default-features = false: coppa-audio's defaults turn on cpal-backend (ALSA on
+# Linux). This crate enables each backend only through its own features (COP-63).
+coppa-audio = { path = "../coppa-audio", default-features = false }
 coppa-radio = { path = "../coppa-radio" }
 coppa-host = { path = "../coppa-host" }
 coppa-protocol = { path = "../coppa-protocol" }
