@@ -874,7 +874,7 @@ impl EventLoop {
                     };
                     let ptt = coppa_radio::ptt_serial::SerialPtt::open(&port, serial_line, false)
                         .map_err(|e| {
-                        anyhow::anyhow!("failed to open serial PTT port {port}: {e}")
+                        anyhow::anyhow!("failed to open serial PTT port {port}: {e:#}")
                     })?;
                     Ok(PttBackend::Other(Box::new(ptt)))
                 }
@@ -892,11 +892,11 @@ impl EventLoop {
                 {
                     let pin_num: u32 = pin.parse().map_err(|_| {
                         anyhow::anyhow!(
-                            "invalid GPIO pin {pin:?}: expected a plain pin number, e.g. \"gpio:17\""
+                            "invalid GPIO pin {pin:?}: expected a plain pin number, e.g. \"gpio:529\""
                         )
                     })?;
                     let ptt = coppa_radio::ptt_gpio::GpioPtt::open(pin_num, false)
-                        .map_err(|e| anyhow::anyhow!("failed to open GPIO PTT pin {pin}: {e}"))?;
+                        .map_err(|e| anyhow::anyhow!("failed to open GPIO PTT pin {pin}: {e:#}"))?;
                     Ok(PttBackend::Other(Box::new(ptt)))
                 }
                 #[cfg(not(all(feature = "gpio-ptt", target_os = "linux")))]
@@ -4846,6 +4846,21 @@ mod tests {
             .err()
             .expect("unrecognized PTT method must be a hard error, not a silent NullPtt");
         assert!(err.to_string().contains("carrier-pigeon"));
+    }
+
+    #[cfg(all(feature = "gpio-ptt", target_os = "linux"))]
+    #[test]
+    fn test_create_ptt_gpio_open_failure_names_the_os_error() {
+        let mut config = DaemonConfig::default();
+        config.radio.ptt_method = "gpio:999999".to_string();
+        let err = EventLoop::create_ptt(&config)
+            .err()
+            .expect("an unexportable GPIO pin must be a startup error");
+        let msg = err.to_string();
+        assert!(msg.contains("failed to open GPIO PTT pin 999999"), "{msg}");
+        // EACCES (not in gpio group), EINVAL (wrong number) and EROFS/ENOENT
+        // (no writable sysfs GPIO) must be distinguishable in the log.
+        assert!(msg.contains("(os error "), "OS cause dropped: {msg}");
     }
 
     #[test]

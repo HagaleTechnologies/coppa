@@ -153,13 +153,20 @@ If the guardian cannot be started, coppad logs `Could not start the PTT
 guardian; ...` and runs without it. If the guardian stops while coppad is
 running, coppad logs `PTT guardian is no longer running; ...` once.
 
+To run coppad as a systemd service without breaking the guardian, use the
+shipped unit; see
+[tutorials/raspberry-pi-install.md](tutorials/raspberry-pi-install.md).
+
 ### What is not covered
 
 Nothing in coppad can release PTT in these cases:
 
 - A SIGKILL to every process in coppad's cgroup, which kills the guardian too.
-  systemd does this when a stop takes longer than `TimeoutStopSec`. `pkill -9
-  coppad` does the same.
+  `pkill -9 coppad` does this, because the guardian is also named `coppad`. So
+  does systemd when a stop takes longer than `TimeoutStopSec` under the default
+  `KillMode=control-group`. The shipped `contrib/coppad.service` sets
+  `KillMode=process`, so its timeout kills coppad alone and the guardian still
+  releases PTT.
 - Power loss.
 - Serial PTT, where release depends on the operating system dropping the line
   when the port closes. This has not been checked on real hardware.

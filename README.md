@@ -21,6 +21,7 @@ Open-source ham radio digital communications system written in Rust.
 | Operating profiles | Implemented | 48 kHz OFDM profiles with runtime speed-level selection within the configured band |
 | Link adaptation | Implemented, limited calibration | Measurement-driven speed selection and ACK-driven RateLoop with ARQ enabled; no model inference; performance targets remain unmet, see [BENCHMARKS.md](BENCHMARKS.md) |
 | Serial/GPIO PTT | Implemented, feature-gated | Daemon serial DTR/RTS uses `serial-ptt`; Linux sysfs GPIO uses `gpio-ptt` |
+| Service files | Provided, not hardware-verified | systemd unit and macOS launchd agent in `contrib/`; Raspberry Pi 4 install guide in [docs/tutorials/raspberry-pi-install.md](docs/tutorials/raspberry-pi-install.md) |
 | KISS TNC (AFSK 1200) | Implemented, bring-up and testing only | Needs the kiss-tnc and cpal-backend features; not a Direwolf replacement; see [docs/TNC.md](docs/TNC.md) |
 | IR-HARQ | Unwired codec primitive | Redundancy-version and combining support exists in the codec; engine/daemon retransmissions do not wire it into an operational IR-HARQ feature |
 | VARA RF/waveform compatibility | Not supported | The TCP control interface is VARA-style; Coppa does not interoperate with VARA over RF |
@@ -125,7 +126,7 @@ See [PLAN-hardening.md](PLAN-hardening.md) for known issues and the hardening ro
 
 See [docs/SPEC.md](docs/SPEC.md) for the normative waveform/FEC/protocol conformance specification — the reference for building an independent, interoperable implementation.
 
-See [docs/OPERATING.md](docs/OPERATING.md) for field-operation guidance, including TX level calibration (`coppa tune`).
+See [docs/OPERATING.md](docs/OPERATING.md) for field-operation guidance, including TX level calibration (`coppa tune`). To run coppad as a service (systemd or launchd), see [contrib/README.md](contrib/README.md); for a full Raspberry Pi 4 install, see [docs/tutorials/raspberry-pi-install.md](docs/tutorials/raspberry-pi-install.md).
 
 ## License
 

@@ -34,7 +34,12 @@ output_device = ""
 ptt_method = "none"
 # Example serial PTT via DTR: ptt_method = "serial:/dev/ttyUSB0:dtr"
 # Example serial PTT via RTS: ptt_method = "serial:/dev/ttyUSB0:rts"
-# Example Linux sysfs GPIO PTT: ptt_method = "gpio:17"
+# Example Linux sysfs GPIO PTT: ptt_method = "gpio:529"
+# The number is the kernel's sysfs GPIO number, not the BCM pin: the
+# GPIO chip's base plus the BCM pin. On Raspberry Pi OS with kernel 6.6
+# or later the Pi 4's chip (label pinctrl-bcm2711) has base 512, so
+# BCM 17 is 529. Find the base with:
+#   grep -H . /sys/class/gpio/gpiochip*/label /sys/class/gpio/gpiochip*/base
 # rigctld TCP address (hamlib)
 rigctld_address = "127.0.0.1:4532"
 # Delay in ms after keying PTT before sending audio
