@@ -1,11 +1,13 @@
 # Coppa Daemon Configuration
 # Copy to coppad.toml and edit as needed.
+# An unknown or misspelled key or table stops coppad at startup, naming the
+# key; `coppad --check` reports it too (COP-36).
 
 [audio]
 # Sample rate in Hz. Must be 48000, the engine's rate (coppad has no
 # resampler); any other value stops the daemon at startup.
 sample_rate = 48000
-# Ring buffer size in samples.
+# Ring buffer size in samples; must be greater than 0.
 buffer_size = 8192
 # Audio input device name (substring match, case-insensitive).
 # Empty string = system default. A name that matches no device stops the
@@ -61,10 +63,8 @@ turnaround_ms = 500
 # Amateur band label ("160m".."23cm"); a band whose lowest edge is
 # above 29.7 MHz (6m, 2m, 70cm, ...) satisfies the gate:
 # band = "2m"
-# An [engine] profile that is not one of the four built-in names leaves
-# the band to the speed level, so levels 5+ would be wideband. Without a
-# source at or above 29.7 MHz, coppad keeps such an engine on the HF
-# profile (levels 1-8, 2400 Hz) instead, and logs a warning (COP-21).
+# An [engine] profile that is not one of the four built-in names stops
+# coppad at startup (COP-36); `--check` does not check profile names.
 
 [host]
 # Address all host servers (VARA-style TCP, WebSocket) bind to.
@@ -86,7 +86,8 @@ websocket_enabled = false
 websocket_port = 8400
 
 [engine]
-# Profile: HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY
+# Profile: HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY (case-insensitive).
+# Any other name stops coppad at startup.
 profile = "HF_STANDARD"
 # Station callsign (required for connected sessions, and for the station-ID
 # timer / beacon mode below -- both stay off while this is empty).

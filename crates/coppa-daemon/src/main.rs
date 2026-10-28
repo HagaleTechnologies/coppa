@@ -202,7 +202,11 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         "Daemon configuration loaded"
     );
 
-    // COP-32: config checks first, before any hardware or socket is touched.
+    // COP-32/COP-36: config checks first, before any hardware or socket is
+    // touched. The profile check comes first so a typo'd name is reported as
+    // an unknown profile, not through check_sample_rate's fallback rate.
+    config.check_profile().map_err(anyhow::Error::msg)?;
+    config.check_buffer_size().map_err(anyhow::Error::msg)?;
     config.check_sample_rate().map_err(anyhow::Error::msg)?;
     #[cfg(not(feature = "cpal-backend"))]
     check_no_named_devices(&config.audio)?;
