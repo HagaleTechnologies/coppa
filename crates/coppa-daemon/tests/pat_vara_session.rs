@@ -83,7 +83,7 @@ async fn station(call: &'static str) -> (Station, StationAudio) {
     let (out_producer, out_consumer) = coppa_audio::audio_ring(config.audio.buffer_size);
 
     let mut event_loop = EventLoop::new(config).unwrap();
-    let (response_tx, response_rx) = tokio::sync::mpsc::channel(64);
+    let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
     event_loop.set_response_tx(response_tx);
     event_loop.set_audio_in(in_consumer);
     event_loop.set_audio_out(out_producer);

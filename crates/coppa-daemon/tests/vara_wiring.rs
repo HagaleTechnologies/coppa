@@ -37,7 +37,7 @@ async fn serve_vara_answers_commands_from_the_running_loop() {
     let host = config.host.clone();
 
     let mut event_loop = EventLoop::new(config).unwrap();
-    let (response_tx, response_rx) = tokio::sync::mpsc::channel(64);
+    let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
     event_loop.set_response_tx(response_tx);
 
     let local = tokio::task::LocalSet::new();

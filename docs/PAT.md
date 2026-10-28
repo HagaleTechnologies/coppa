@@ -179,7 +179,7 @@ not model a half-duplex radio, which is more forgiving than a real one.
 
 ## Details and limits
 
-Each of these was observed in the verification runs.
+Each of these was observed in the verification runs unless it says otherwise.
 
 - **`BW` and `COMPRESSION` are accepted and ignored.** Match `[engine] profile` on both
   stations yourself.
@@ -190,12 +190,16 @@ Each of these was observed in the verification runs.
   send `DISCONNECT` twice), and it logs harmless `got a vara command I wasn't expecting` lines
   for coppad's `WRONG`, `SNR` and `VERSION` replies. With the current config form, Pat 0.13.1 fails
   with `'varahf' is not a valid listen method`.
-- **Connected-session data has no ARQ** (H-025). On a lossy channel a lost frame is not resent,
-  and the session stalls until Pat's own timers give up.
+- **Connected-session data is stop-and-wait ARQ** (COP-38), whatever `arq_enabled` says. The
+  other station ACKs each frame and a lost frame is sent again; `BUFFER` falls on the ACK. A
+  frame still unacknowledged after 5 retransmissions ends the session (`DISCONNECTED`), about
+  3 minutes on a silent link. See [OPERATING.md](OPERATING.md#connected-sessions-delivery-and-buffer).
+  This entry comes from the code, not the runs: the verification runs predate COP-38.
 - **`DISCONNECT` discards data still queued in coppad** (H-032). Pat flushes (waits for
   `BUFFER 0`) before it closes, so a normal Pat session is not affected.
 - **Throughput is low.** At `HF_STANDARD`, a 6000-byte message (3940 bytes after Pat's
-  compression) took 225 s, about 17 B/s.
+  compression) took 225 s, about 17 B/s. That run predates COP-38; OPERATING.md puts
+  stop-and-wait at about 60% of the old stream on a clean link, so expect less.
 - **Station identification.** The first transmission, and every one after `id_interval_secs`,
   carries a station-ID frame, which adds about 1.4 s.
 - **PTT.** With `ptt_method = "none"` nothing keys a radio. For a real radio use rigctld, as in

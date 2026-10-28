@@ -4,19 +4,19 @@
 //! production without failing).
 
 use crate::config::HostConfig;
-use crate::event_loop::{DaemonEvent, EventLoop};
+use crate::event_loop::{forward_data_out, DaemonEvent, EventLoop};
 
 /// Start the VARA server on already-bound listeners and wire it to `event_loop`:
 /// host events in, command-port telemetry out, `DataOut` to the data port.
 ///
 /// `response_rx` is the receiving end of the channel handed to
-/// [`EventLoop::set_response_tx`]. The listeners are bound by the caller so a
-/// port that is already taken is a startup error (COP-32), not a log line from
-/// a spawned task. Must be called inside a Tokio runtime; the server and both
-/// bridges run as spawned tasks.
+/// [`EventLoop::set_response_tx`]; [`forward_data_out`] drains it. The
+/// listeners are bound by the caller so a port that is already taken is a
+/// startup error (COP-32), not a log line from a spawned task. Must be called
+/// inside a Tokio runtime; the server and both bridges run as spawned tasks.
 pub fn serve_vara(
     event_loop: &mut EventLoop,
-    mut response_rx: tokio::sync::mpsc::Receiver<coppa_host::HostResponse>,
+    response_rx: tokio::sync::mpsc::UnboundedReceiver<coppa_host::HostResponse>,
     cmd_listener: tokio::net::TcpListener,
     data_listener: tokio::net::TcpListener,
     host: &HostConfig,
@@ -52,25 +52,8 @@ pub fn serve_vara(
     // SNR/PTT/BUFFER/BUSY telemetry (decision 8, Phase 3 Task 7).
     event_loop.set_vara_responses(vara_server.response_senders());
 
-    // Bridge response_rx to VARA data_senders (decoded data goes via the data port)
-    let vara_data_senders = vara_server.data_senders();
-    tokio::spawn(async move {
-        while let Some(response) = response_rx.recv().await {
-            // StatusUpdate is deliberately not forwarded: EventLoop::notify_session
-            // pushes session state directly to the command port and WebSocket.
-            if let coppa_host::HostResponse::DataOut { client_id, data } = &response {
-                let senders = vara_data_senders.lock().await;
-                if *client_id == 0 {
-                    // Broadcast to all data-port clients
-                    for tx in senders.values() {
-                        let _ = tx.try_send(data.clone());
-                    }
-                } else if let Some(tx) = senders.get(client_id) {
-                    let _ = tx.try_send(data.clone());
-                }
-            }
-        }
-    });
+    // Decoded payloads reach the data-port clients through this bridge.
+    tokio::spawn(forward_data_out(response_rx, vara_server.data_senders()));
 
     // Serve the listeners bound above
     tokio::spawn(async move {
