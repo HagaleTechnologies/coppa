@@ -42,6 +42,19 @@
 //! quiet input (108 transitions in 32 s, H-020 in
 //! `docs/reviews/2026-09-05-dim-C-host-apis.md`).
 //!
+//! The noise floor keeps adapting while a change is pending, and a sustained
+//! occupant only moderately above the background would otherwise drag it up far
+//! enough to stop reading busy before the hold completes: a step to 3x the
+//! background amplitude (about +9.5 dB) was never reported, and one to 5x
+//! (+14 dB) in only one of four seeded runs. A pending
+//! run of busy readings is therefore judged against a floor that may rise at most
+//! `PENDING_FLOOR_RISE_DB` (3 dB) above the floor from before the run began. On
+//! synthetic white noise that reports a 3x step; a 2x step (+6 dB) is still
+//! missed. Once `BUSY ON` is reported the floor adapts freely again, so a steady
+//! broadband occupant still reads clear while it is on the air (`BUSY OFF` came
+//! 0.26-0.43 s after `BUSY ON` in one run each of steps to 3x-50x the background),
+//! a limit of the floor estimator rather than of the hold.
+//!
 //! [`BusyGate::observe`] splits each call into near-equal segments of at most
 //! `FFT_SIZE` samples and measures every one, so a long call is judged across its
 //! whole length rather than by its first `FFT_SIZE` samples (the hold credits every
@@ -56,7 +69,8 @@
 //! - two consecutive transitions are separated by at least 250 ms of received audio;
 //! - a state is reported only after it has held for 250 ms, so a real occupant is
 //!   reported about 250 ms after it keys up and after it stops (later, by up to one
-//!   call's length, when the change follows one reported for a long call);
+//!   call's length, when the change follows one reported for a long call; a steady
+//!   broadband occupant reads clear earlier, see above);
 //! - a busy pulse shorter than 250 ms is never reported.
 use crate::spectrum_sensor::SpectrumSensor;
 
@@ -94,6 +108,18 @@ const CALIBRATION_BLOCKS: u32 = 3;
 /// been swept against real recordings.
 const HOLD_SECS: f32 = 0.25;
 
+/// How far (dB) the noise floor a pending run of busy readings is judged against
+/// may rise above the floor from before the run began (see module doc's
+/// `# Hold`). Half of `MARGIN_DB`. Measured on this module's synthetic noise at
+/// 48 kHz: 1, 1.5, 2 and 3 dB left the quiet coloured-noise cases sampled at
+/// their uncapped transition counts (3 dB on all 36 cadence/tilt cases, five
+/// seeds each), while 0.5 dB made one case latch, 0.25 dB made the H-020 case
+/// flap, and freezing the floor outright (0 dB) gave 188 transitions across five
+/// 32 s runs of it. 3 dB is the value furthest from that edge that still reports
+/// a sustained step to 3x the background amplitude. Not swept against real
+/// recordings.
+const PENDING_FLOOR_RISE_DB: f32 = 3.0;
+
 /// Spectral-occupancy busy gate. See module doc for the threshold and the hold.
 pub struct BusyGate {
     sensor: SpectrumSensor,
@@ -106,6 +132,11 @@ pub struct BusyGate {
     /// disagrees with `busy`, counted from no earlier than the last reported
     /// transition.
     pending_samples: usize,
+    /// While `busy` is false and a run of busy readings is pending, the noise
+    /// floor (dB) from before the run's first segment; the run is judged against
+    /// a floor at most `PENDING_FLOOR_RISE_DB` above it (see module doc's
+    /// `# Hold`). `None` otherwise.
+    pending_floor_db: Option<f32>,
 }
 
 impl BusyGate {
@@ -117,6 +148,7 @@ impl BusyGate {
             calibrated_blocks: 0,
             hold_samples: (HOLD_SECS * sample_rate).round() as usize,
             pending_samples: 0,
+            pending_floor_db: None,
         }
     }
 
@@ -163,19 +195,39 @@ impl BusyGate {
         // blocks before folding this one in — gating a block against a statistic
         // partly derived from itself would make ordinary single-block spectral
         // estimation variance (not a real signal) look "occupied".
-        let occupancy = self
-            .sensor
-            .band_occupancy(samples, BAND_LOW_HZ, BAND_HIGH_HZ, MARGIN_DB);
+        // While a busy reading is pending, the floor may rise at most
+        // `PENDING_FLOOR_RISE_DB` above the one from before the run began: the
+        // live floor keeps folding the run's own segments in and, against it, an
+        // occupant only moderately above the background stops reading busy
+        // before the hold completes. `band_occupancy` compares against
+        // `noise_floor() + margin`, so the capped floor goes in through the
+        // margin (exactly `MARGIN_DB` when the cap does not bind).
+        let live_floor = self.sensor.noise_floor();
+        let floor = match self.pending_floor_db {
+            Some(start) => live_floor.min(start + PENDING_FLOOR_RISE_DB),
+            None => live_floor,
+        };
+        let occupancy = self.sensor.band_occupancy(
+            samples,
+            BAND_LOW_HZ,
+            BAND_HIGH_HZ,
+            MARGIN_DB + (floor - live_floor),
+        );
         self.sensor.update(samples);
 
         let reads_busy = occupancy >= MIN_OCCUPIED_FRACTION;
         if reads_busy == self.busy {
             self.pending_samples = 0;
+            self.pending_floor_db = None;
         } else {
+            if reads_busy && self.pending_floor_db.is_none() {
+                self.pending_floor_db = Some(live_floor);
+            }
             self.pending_samples += samples.len();
             if self.pending_samples >= self.hold_samples {
                 self.busy = reads_busy;
                 self.pending_samples = 0;
+                self.pending_floor_db = None;
             }
         }
     }
@@ -388,6 +440,34 @@ mod tests {
         }
         assert_eq!(gate.observe(&call), Some(true));
         assert!(gate.current());
+    }
+
+    /// A sustained occupant only moderately above the background (3x and 5x the
+    /// quiet amplitude, about +9.5 and +14 dB) must still be reported. The
+    /// noise-floor EWMA folds every segment in, and against that live floor such a
+    /// signal stops reading busy before the 250 ms hold completes; a pending run is
+    /// judged against a floor capped at `PENDING_FLOOR_RISE_DB` above the one from
+    /// before it began.
+    #[test]
+    fn a_sustained_moderate_signal_is_reported_busy() {
+        for amplitude in [0.03, 0.05] {
+            let mut counter = 0u32;
+            let mut gate = BusyGate::new(48_000.0);
+            for _ in 0..10 {
+                assert_eq!(gate.observe(&quiet_block(&mut counter)), None);
+            }
+            let mut reported_on = false;
+            for _ in 0..40 {
+                if gate.observe(&noise_block(amplitude, &mut counter)) == Some(true) {
+                    reported_on = true;
+                    break;
+                }
+            }
+            assert!(
+                reported_on,
+                "a sustained signal at amplitude {amplitude} must trigger BUSY ON"
+            );
+        }
     }
 
     /// The daemon drains its whole input ring (up to 8192 samples) in one call after

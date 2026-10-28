@@ -13959,17 +13959,8 @@ mod tests {
                 event_loop.busy_gate.observe(&noise(0.5));
             }
             assert!(event_loop.busy_gate.current());
-<<<<<<< HEAD
             // Releasing the courtesy wait takes the gate's hold of quiet audio.
             let release_blocks = busy_burst_blocks(&event_loop.busy_gate);
-            event_loop
-                .session_tx_queue
-                .push_back(session_chunk(b"first"));
-            event_loop
-                .session_tx_queue
-                .push_back(session_chunk(b"second"));
-=======
->>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
             {
                 let write = session_write(&mut event_loop, b"first second");
                 tokio::pin!(write);
@@ -13979,15 +13970,10 @@ mod tests {
                     _ = tokio::time::sleep(Duration::from_millis(100)) => {}
                 }
                 *rig.answer.lock().unwrap() = "14074000".into();
-<<<<<<< HEAD
                 for _ in 0..release_blocks {
                     audio_in_tx.write(&noise(0.01));
                 }
-                tokio::time::timeout(Duration::from_secs(5), drain)
-=======
-                audio_in_tx.write(&noise(0.01));
                 tokio::time::timeout(Duration::from_secs(5), write)
->>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
                     .await
                     .unwrap();
             }
