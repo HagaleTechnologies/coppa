@@ -43,6 +43,8 @@ impl SerialLines for Box<dyn serialport::SerialPort> {
 /// Generic over `P: SerialLines` so it can be driven by a real open serial
 /// port (`SerialPtt::open`, real hardware) or by a mock in tests
 /// (`SerialPtt::with_port`).
+///
+/// Releases PTT on drop if keyed.
 pub struct SerialPtt<P: SerialLines = Box<dyn serialport::SerialPort>> {
     port_name: String,
     line: SerialPttLine,
@@ -117,30 +119,74 @@ impl<P: SerialLines> PttControl for SerialPtt<P> {
     }
 }
 
+impl<P: SerialLines> Drop for SerialPtt<P> {
+    /// COP-31: drive the PTT line to its RX level if this handle left it
+    /// keyed (`state` only changes on a successful write).
+    fn drop(&mut self) {
+        if self.state == PttState::Tx {
+            if let Err(e) = PttControl::set_ptt(self, PttState::Rx) {
+                tracing::error!(
+                    port = %self.port_name,
+                    error = %e,
+                    "SerialPtt: failed to release PTT on drop"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PttBackend;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
-    /// Loopback mock: records every DTR/RTS level write instead of touching
-    /// real hardware.
+    /// Loopback mock: records every successful DTR/RTS level write instead
+    /// of touching real hardware. Clones share the logs, so writes made while
+    /// the owning `SerialPtt` drops stay observable.
     #[derive(Clone, Default)]
     struct MockPort {
         dtr_writes: Arc<Mutex<Vec<bool>>>,
         rts_writes: Arc<Mutex<Vec<bool>>>,
+        /// When set, the next write (either line) fails and is not recorded.
+        fail_next_write: Arc<AtomicBool>,
+    }
+
+    impl MockPort {
+        fn fail_if_armed(&self) -> Result<()> {
+            if self.fail_next_write.swap(false, Ordering::SeqCst) {
+                anyhow::bail!("mock serial line write failure");
+            }
+            Ok(())
+        }
     }
 
     impl SerialLines for MockPort {
         fn write_data_terminal_ready(&mut self, level: bool) -> Result<()> {
+            self.fail_if_armed()?;
             self.dtr_writes.lock().unwrap().push(level);
             Ok(())
         }
 
         fn write_request_to_send(&mut self, level: bool) -> Result<()> {
+            self.fail_if_armed()?;
             self.rts_writes.lock().unwrap().push(level);
             Ok(())
         }
     }
+
+    /// (the PTT line's writes, the other line's writes)
+    fn line_writes(mock: &MockPort, line: SerialPttLine) -> (Vec<bool>, Vec<bool>) {
+        let dtr = mock.dtr_writes.lock().unwrap().clone();
+        let rts = mock.rts_writes.lock().unwrap().clone();
+        match line {
+            SerialPttLine::Dtr => (dtr, rts),
+            SerialPttLine::Rts => (rts, dtr),
+        }
+    }
+
+    const LINES: [SerialPttLine; 2] = [SerialPttLine::Dtr, SerialPttLine::Rts];
 
     #[test]
     fn test_serial_ptt_create() {
@@ -203,6 +249,81 @@ mod tests {
             vec![false, true],
             "inverted PTT should drive the line LOW on TX and HIGH on RX"
         );
+    }
+
+    #[test]
+    fn dropping_a_keyed_serial_ptt_drives_the_line_to_rx() {
+        for line in LINES {
+            for (inverted, expected) in [(false, [true, false]), (true, [false, true])] {
+                let mock = MockPort::default();
+                let mut ptt = SerialPtt::with_port("/dev/ttyUSB0", line, inverted, mock.clone());
+                ptt.set_ptt(PttState::Tx).unwrap();
+                drop(ptt);
+                let (ptt_line, other) = line_writes(&mock, line);
+                assert_eq!(ptt_line, expected, "{line:?}, inverted = {inverted}");
+                assert!(other.is_empty(), "{line:?} must not touch the other line");
+            }
+        }
+    }
+
+    #[test]
+    fn dropping_an_unkeyed_serial_ptt_writes_nothing() {
+        for line in LINES {
+            let mock = MockPort::default();
+            drop(SerialPtt::with_port(
+                "/dev/ttyUSB0",
+                line,
+                false,
+                mock.clone(),
+            ));
+            assert_eq!(line_writes(&mock, line), (vec![], vec![]), "{line:?}");
+
+            // Released explicitly before the drop: nothing more is written.
+            let mock = MockPort::default();
+            let mut ptt = SerialPtt::with_port("/dev/ttyUSB0", line, false, mock.clone());
+            ptt.set_ptt(PttState::Tx).unwrap();
+            ptt.set_ptt(PttState::Rx).unwrap();
+            drop(ptt);
+            assert_eq!(
+                line_writes(&mock, line),
+                (vec![true, false], vec![]),
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_serial_release_is_retried_on_drop() {
+        for line in LINES {
+            let mock = MockPort::default();
+            let mut ptt = SerialPtt::with_port("/dev/ttyUSB0", line, false, mock.clone());
+            ptt.set_ptt(PttState::Tx).unwrap();
+            mock.fail_next_write.store(true, Ordering::SeqCst);
+            assert!(ptt.set_ptt(PttState::Rx).is_err());
+            assert_eq!(ptt.get_ptt().unwrap(), PttState::Tx, "still keyed");
+            drop(ptt);
+            assert_eq!(
+                line_writes(&mock, line),
+                (vec![true, false], vec![]),
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_a_boxed_serial_backend_releases_through_ptt_backend() {
+        for line in LINES {
+            let mock = MockPort::default();
+            let ptt = SerialPtt::with_port("/dev/ttyUSB0", line, false, mock.clone());
+            let mut backend = PttBackend::Other(Box::new(ptt));
+            backend.set_ptt(PttState::Tx).unwrap();
+            drop(backend);
+            assert_eq!(
+                line_writes(&mock, line),
+                (vec![true, false], vec![]),
+                "{line:?}"
+            );
+        }
     }
 
     #[test]

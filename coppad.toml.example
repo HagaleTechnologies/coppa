@@ -1,16 +1,29 @@
 # Coppa Daemon Configuration
-# Copy to coppad.toml and edit as needed.
+# Copy to ~/.config/coppa/coppad.toml (one user), /etc/coppa/coppad.toml (a system service) or ./coppad.toml, and edit as needed.
+# An unknown or misspelled key or table stops coppad at startup, naming the
+# key; `coppad --check` reports it too (COP-36).
+
+# The coppa CLI reads this file too for [engine] callsign/profile, [audio]
+# input_device/output_device, and [radio] ptt_method/rigctld_address/
+# ptt_pre_delay_ms/ptt_tail_delay_ms/frequency_hz/band. Each has a COPPA_*
+# environment override and a CLI flag; flags win over environment, then file.
+# The profile below changes what coppa tx sends and coppa rx expects: a peer
+# using the CLI's built-in no-file default may need the same profile.
+# Use coppa --config PATH or COPPA_CONFIG to select a specific file.
 
 [audio]
-# Sample rate in Hz. Must match engine (48000 for OFDM).
+# Sample rate in Hz. Must be 48000, the engine's rate (coppad has no
+# resampler); any other value stops the daemon at startup.
 sample_rate = 48000
-# Ring buffer size in samples.
+# Ring buffer size in samples; must be greater than 0.
 buffer_size = 8192
 # Audio input device name (substring match, case-insensitive).
-# Empty string = system default.
+# Empty string = system default. A name that matches no device stops the
+# daemon at startup; it never falls back to the default device.
 input_device = ""
 # Audio output device name (substring match, case-insensitive).
-# Empty string = system default.
+# Empty string = system default. A name that matches no device stops the
+# daemon at startup; it never falls back to the default device.
 output_device = ""
 
 [radio]
@@ -30,6 +43,20 @@ ptt_pre_delay_ms = 50
 ptt_tail_delay_ms = 200
 # Safety: max TX duration in seconds before forced unkey
 max_tx_duration_s = 30
+# COP-31: PTT guardian. With rigctld or GPIO PTT, coppad starts a small
+# helper process ("coppad --ptt-guardian ...") that releases PTT if coppad
+# dies while transmitting (kill -9, out-of-memory kill, crash). It does
+# nothing while coppad runs normally, and exits when coppad exits. Ignored
+# for "none", "vox" and serial PTT; for serial, the OS drops DTR/RTS when the
+# port closes. Set to false to disable.
+ptt_guardian = true
+# Half-duplex RX->TX turnaround: after decoding a frame, wait this many ms
+# before keying PTT for any transmission (ACKs, CONNECT_ACK, replies). The
+# OTHER station stays keyed for its own ptt_tail_delay_ms (or its rig's VOX
+# hang time) after its last audio sample, and cannot hear you until it
+# unkeys. Set this above the peer's tail/VOX delay plus its radio's TX->RX
+# switching time. 0 disables the guard (replies key at once).
+turnaround_ms = 500
 
 # COP-40: operating-frequency source for the HF/VHF regulatory gate.
 # Required ONLY for wideband (VHF) profiles, whose 5600 Hz occupied
@@ -44,24 +71,45 @@ max_tx_duration_s = 30
 # Amateur band label ("160m".."23cm"); a band whose lowest edge is
 # above 29.7 MHz (6m, 2m, 70cm, ...) satisfies the gate:
 # band = "2m"
+# An [engine] profile that is not one of the four built-in names stops
+# coppad at startup (COP-36); `--check` does not check profile names.
 
 [host]
 # Address all host servers (VARA-style TCP, WebSocket) bind to.
 # Default "127.0.0.1" restricts access to this machine only.
-# WARNING: setting this to "0.0.0.0" (or any non-loopback address) exposes an
-# UNAUTHENTICATED control plane to the network. Anyone who can reach this host
-# could key your transmitter. Only change this on a trusted, firewalled network.
+# WARNING: setting this to "0.0.0.0" (or any non-loopback address) exposes the
+# VARA-style ports, which have NO authentication, to the network. Anyone who can
+# reach this host could key your transmitter. The WebSocket port needs
+# websocket_token (below), but over plain ws:// the token crosses the network
+# in clear text. Only change this on a trusted, firewalled network.
 bind_address = "127.0.0.1"
 # VARA-style TCP control interface (not RF/waveform-compatible with VARA)
 vara_enabled = false
 vara_command_port = 8300
+# Pat (Winlink) with its current `addr` config uses the command port + 1 for
+# data; keep them adjacent.
+# See docs/PAT.md.
 vara_data_port = 8301
 # WebSocket JSON API
+# Clients can opt into periodic "spectrum" and "audio_level" streams; see docs/OPERATING.md.
+# Needs a coppad built with --features websocket; set in a build without it, coppad stops at startup.
+# Enabling it requires websocket_token, on every bind_address (loopback too: a
+# web page in your own browser can reach 127.0.0.1). Every client presents the
+# token as "Authorization: Bearer <token>" or as "?token=<token>" in the URL.
+# Use at least 16 characters from A-Z a-z 0-9 - . _ ~ ; generate one with
+#   openssl rand -hex 32
+# and keep this file readable only by the account coppad runs as.
 websocket_enabled = false
 websocket_port = 8400
+# websocket_token = "paste the output of openssl rand -hex 32 here"
+# Browser pages allowed to connect, as exact origins: scheme://host[:port].
+# Empty (the default) refuses every web page. Scripts that send no Origin
+# header need only the token.
+# websocket_allowed_origins = ["http://localhost:3000"]
 
 [engine]
-# Profile: HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY
+# Profile: HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY (case-insensitive).
+# Any other name stops coppad at startup.
 profile = "HF_STANDARD"
 # Station callsign (required for connected sessions, and for the station-ID
 # timer / beacon mode below -- both stay off while this is empty).
@@ -84,7 +132,9 @@ busy_hold_ms = 0
 # identification. Defaults to 540 (9 minutes) for margin under FCC Part
 # 97.119's 10-minute requirement. An ID is only ever prepended to a real
 # outgoing transmission (never sent standalone), and only while [engine]
-# callsign above is set.
+# callsign above is set. The first transmission after startup always carries
+# an ID; later ones carry one once this interval has passed. 0 turns automatic
+# ID off.
 id_interval_secs = 540
 # Beacon mode: interval in seconds between standalone beacon transmissions,
 # sent only when the channel reads clear (skipped, not deferred, if busy --
@@ -101,8 +151,6 @@ beacon_interval_secs = 0
 # arq_window = 8
 # Max retransmit attempts per frame (default 5)
 # max_retries = 5
-# Turnaround delay in ms between RX/TX switching (default 500)
-# turnaround_ms = 500
 # Connection timeout in seconds (default 30)
 # connect_timeout_s = 30
 # Idle timeout in seconds before session drops (default 120)

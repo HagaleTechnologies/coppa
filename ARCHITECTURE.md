@@ -101,7 +101,7 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 
 #### Host Interfaces (`coppa-host`)
 - **VARA-style TCP** (`vara-tcp`, default): command port 8300 and data port 8301, a VARA-inspired command set. The modem is not RF/waveform-compatible with VARA and does not interoperate with it over the air
-- **WebSocket** (`websocket`): a JSON API server built on `tokio-tungstenite`, carrying callsign, connect/disconnect, send, received-data, status and spectrum messages
+- **WebSocket** (`websocket`): a JSON API server built on `tokio-tungstenite`, carrying callsign, connect/disconnect, send, received-data, status and spectrum messages; every handshake must present the `[host] websocket_token` and, from a browser, an allowlisted `Origin` (COP-53)
 - **KISS over TCP** (`kiss-tnc`): the host side of the AFSK TNC mode
 
 #### C FFI (`coppa-ffi`)
@@ -111,17 +111,19 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 - cdylib + staticlib output; `build.rs` regenerates `coppa.h` with cbindgen
 
 #### CLI (`coppa-cli`)
-- Binary `coppa`. Subcommands: `tx`, `rx`, `loopback`, `listen`, `tune`, `devices`, `config`, plus `tnc` when built with `kiss-tnc`
+- Binary `coppa`. Subcommands: `tx`, `rx`, `loopback`, `tune`, `devices`, `config`, plus `tnc` when built with `kiss-tnc`. `listen` survives one release as a hidden, deprecated alias of `rx` (COP-56)
+- `--config` (or `COPPA_CONFIG`) and other `COPPA_*` variables let `tx`, `tune`, `rx` and `loopback` share `coppad.toml` settings with the daemon
 - WAV file I/O via `file-backend` (default); live audio capture and playback need `cpal-backend`
 
 #### Daemon (`coppad`, crate `coppa-daemon`)
 - Tokio event loop multiplexing audio, host clients (VARA-style TCP, WebSocket), radio control, ARQ timers, `RateLoop`, `CpGate`/CP negotiation and `BusyGate`
-- Options: `--config <PATH>` (or a positional config path), `--check`, `--log-level`, `--print-default-config`, `--tnc`. Without a config path it loads `./coppad.toml` if present, otherwise built-in defaults
+- Options: `--config <PATH>` (or a positional config path), `--check`, `--log-level`, `--print-default-config`, `--tnc`. Without a config path it uses the first file found of `./coppad.toml`, `$XDG_CONFIG_HOME/coppa/coppad.toml` (default `~/.config/coppa/coppad.toml`; `%APPDATA%\coppa\coppad.toml` on Windows) and `/etc/coppa/coppad.toml`, otherwise built-in defaults, and logs which one it used (COP-49)
 - Hardware audio requires the `cpal-backend` feature; without it the daemon runs but moves no audio
 - Ctrl-C graceful shutdown
+- RX/TX audio level meter with clipping/underdrive warnings (logs + opt-in WebSocket `audio_level` stream)
 
 #### AFSK 1200 / AX.25 TNC mode
-- `coppad --tnc` or `coppa tnc`, both built with `kiss-tnc`, runs a separate mode: AFSK 1200 audio ↔ KISS TCP server (port 8001 by default) ↔ PTT. The KISS client supplies the AX.25 frames, and the TNC forwards them without parsing
+- `coppad --tnc` or `coppa tnc`, both built with `kiss-tnc`, runs a separate mode: AFSK 1200 audio ↔ KISS TCP server (port 8001 by default) ↔ PTT. The KISS client supplies the AX.25 frames without an FCS, as KISS specifies. The TNC does not parse them, but it adds the FCS on transmit and checks and strips it on receive
 - This mode does not use the OFDM pipeline below
 
 ## TX Pipeline
@@ -212,7 +214,7 @@ These components still compile and have tests, but no production TX or RX path c
 - The OFDM transceiver runs end to end through `CoppaCore`, `coppad`, the C FFI and the CLI, at nine speed levels (1–8 on HF, 1–9 on VHF), with runtime speed-level changes through `set_speed_level`
 - Payload FEC is one shared NR BG2 LDPC mother code, rate-matched per speed level; the frame header is soft-decoded Golay(24,12) + CRC-16
 - The streaming receiver corrects carrier-frequency offset up to ±50 Hz, tracks sample-clock offset within each frame, and runs one turbo re-estimation round when LDPC does not converge
-- Selective-repeat ARQ for no-session data (`arq_enabled`), closed-loop rate control from ACK-carried recommendations, and a CP negotiation handshake (off by default)
+- Selective-repeat ARQ for connected-session data (always, stop-and-wait; COP-38) and for no-session data (`arq_enabled`), closed-loop rate control from ACK-carried recommendations, and a CP negotiation handshake (off by default)
 - Huffman + LZ4 compression; binary payloads through `encode_bytes`/`decode_bytes`
 - Host interfaces: VARA-style TCP, a WebSocket JSON server, and KISS over TCP for the AFSK 1200 TNC mode
 - Radio control: rigctld CAT, plus serial, GPIO and VOX PTT
@@ -223,7 +225,7 @@ These components still compile and have tests, but no production TX or RX path c
 
 - Carrier-frequency-offset pull-in is ±50 Hz; sample-clock offset is tracked within each frame only.
 - IR-HARQ is an unwired codec primitive: `CoppaTransceiver` supports redundancy versions and LLR combining, but `CoppaCore` always sends rv 0 and seq 0, and no engine or daemon path calls `rv_for_attempt`. The receive side still combines: a single-codeword frame's LLRs are added into the accumulator for its header `seq_num`, and only a CRC-verified decode, LRU overflow or a transceiver rebuild clears it. Because every `CoppaCore` frame carries seq 0, the LLRs of a frame whose LDPC decode or CRC check fails are added into the next frame's decode.
-- Data inside an established session is sent as a `MacPdu` without ARQ: selective-repeat `ArqTx`/`ArqRx` covers the no-session data path (when `arq_enabled`) and CP-control PDUs only.
+- Connected-session data runs stop-and-wait (one frame in flight, one ACK per frame) because the turnaround hold is receive-side only; a burst/block-ACK design is not implemented.
 - No peer speed negotiation: the receiver's recommended level rides on each ACK, and the sender's `RateLoop` applies it on its own; `RateLoop` misses its own benchmark bar ([BENCHMARKS.md](BENCHMARKS.md)). Session connect exchanges `LinkCapabilities`, which include an `mcs_index`, but nothing applies the negotiated result.
 - One ACK per decoded frame (block-ACK batching was considered and not chosen); multi-codeword frames retransmit whole, with no per-codeword ACK (ADR-007).
 - Short-CP recommendation (`cp_gate_enabled`) and CP negotiation (`cp_negotiation_enabled`) default off.

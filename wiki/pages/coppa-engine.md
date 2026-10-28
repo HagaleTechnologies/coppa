@@ -45,7 +45,10 @@ FFI). The main encode/decode logic is in `coppa-protocol`, not here.
   `encode_bytes_at_level` reject level 9 on HF. Old wire levels 9 and 10 became
   8 and 9 in 0.2.0. See `docs/adr/009-cop24-speed-ladder-renumber.md`. Only `EngineConfig::default()`
   (`OfdmBand::LevelDerived`, no band preference) still crosses to `vhf_wide` at
-  level 5; `CoppaCore::on_vhf_profile()` reports which band is actually selected.
+  level 5; `CoppaCore::set_ofdm_band` rebinds the band in place, and
+  `occupied_bandwidth_hz_at(level)` previews a level's width — `coppad` uses
+  both to keep a level-derived engine HF below 29.7 MHz (COP-21).
+  `CoppaCore::on_vhf_profile()` reports which band is actually selected.
 - **Named profiles:** `HF_ROBUST` (level 1), `HF_STANDARD` (level 2),
   `EMERGENCY` (level 1) and `VHF_FAST` (level 8). A named profile is a preset of
   band, speed level and compression. `EMERGENCY` is `HF_ROBUST` on the air: the

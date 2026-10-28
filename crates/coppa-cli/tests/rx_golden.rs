@@ -64,8 +64,9 @@
 //! improvement but out of [Task 7's] scope" -- equally out of Task 4's scope
 //! here, which is CLI/WebSocket completion, not sync-detector sensitivity).
 
+mod common;
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[derive(serde::Deserialize)]
 struct ManifestFile {
@@ -124,7 +125,7 @@ fn is_known_streaming_receiver_gap(level: u8, channel: &str) -> bool {
 /// Run `coppa rx --input <wav> --raw [--profile <name>]` and return its
 /// trimmed stdout (expected to be one lowercase-hex line per decoded frame).
 fn run_rx(wav_path: &Path, profile: Option<&str>) -> String {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_coppa"));
+    let mut cmd = common::coppa_command();
     cmd.args(["rx", "--input", wav_path.to_str().unwrap(), "--raw"]);
     if let Some(p) = profile {
         cmd.args(["--profile", p]);

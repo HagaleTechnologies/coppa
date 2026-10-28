@@ -99,8 +99,15 @@ fn config_is_a_deprecated_alias_for_profiles() {
 #[test]
 fn config_is_hidden_from_help_but_still_answers_it() {
     let help = stdout(&coppa(&["--help"]));
-    assert!(help.contains("profiles"), "{help}");
-    assert!(!help.contains("config"), "{help}");
+    // Subcommand names only: the global `--config PATH` flag (COP-57) is not
+    // the deprecated `config` subcommand.
+    let subcommands: Vec<&str> = help
+        .lines()
+        .filter_map(|line| line.strip_prefix("  "))
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    assert!(subcommands.contains(&"profiles"), "{help}");
+    assert!(!subcommands.contains(&"config"), "{help}");
 
     let output = coppa(&["config", "--help"]);
     assert!(output.status.success(), "{}", stderr(&output));

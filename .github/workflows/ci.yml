@@ -42,11 +42,38 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           toolchain: "1.98.0"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install ALSA and libudev dev headers (for cpal and serialport)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
       - run: cargo check --workspace
       - run: cargo check --workspace --all-features
+      # COP-63: a per-crate aarch64-linux build of the CLI or daemon must not
+      # reach alsa-sys unless the crate's own cpal-backend feature asks for it.
+      # The --workspace checks cannot see this, because they build coppa-audio
+      # with its own default features. cargo tree needs no aarch64 std.
+      - name: CLI and daemon do not pull in alsa-sys on aarch64-linux
+        run: |
+          tree=$(cargo tree --target aarch64-unknown-linux-gnu -p coppa-cli -p coppa-daemon --prefix none --format '{p}')
+          if grep -q '^alsa-sys ' <<<"$tree"; then
+            echo "::error::coppa-cli or coppa-daemon pulls in alsa-sys on aarch64-linux with its own cpal-backend feature off; depend on coppa-audio with default-features = false"
+            cargo tree --target aarch64-unknown-linux-gnu -p coppa-cli -p coppa-daemon -i alsa-sys
+            exit 1
+          fi
+      # COP-35: compile and run the getting-started tutorial's C FFI example,
+      # as written, against the committed coppa.h, as C and as C++.
+      - name: Compile the tutorial's C FFI example against coppa.h
+        run: |
+          cargo build -p coppa-ffi
+          # build.rs regenerates coppa.h; a diff means the committed header is stale.
+          git diff --exit-code -- crates/coppa-ffi/coppa.h
+          dir="$RUNNER_TEMP/ffi-tutorial"
+          mkdir -p "$dir"
+          awk '/^## Using the C FFI/{s=1} s&&/^```c$/{p=1;next} p&&/^```$/{exit} p' docs/tutorials/getting-started.md > "$dir/hello.c"
+          grep -q 'coppa_engine_destroy(&engine)' "$dir/hello.c"
+          cc -std=c11 -Wall -Wextra -Wpedantic -Werror -Icrates/coppa-ffi "$dir/hello.c" -Ltarget/debug -lcoppa_ffi -o "$dir/hello"
+          c++ -x c++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -Icrates/coppa-ffi "$dir/hello.c" -Ltarget/debug -lcoppa_ffi -o "$dir/hello_cpp"
+          LD_LIBRARY_PATH=target/debug "$dir/hello"
+          LD_LIBRARY_PATH=target/debug "$dir/hello_cpp"
 
   test-features:
     name: Test with Features (fast, lib-only)
@@ -56,10 +83,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           toolchain: "1.98.0"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install ALSA dev headers (for cpal)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - run: cargo test --workspace --features cpal-backend,websocket --lib
+      - run: cargo test --workspace --features cpal-backend,websocket,kiss-tnc --lib
       - run: cargo check --workspace --no-default-features
 
   fmt:
@@ -84,7 +111,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           toolchain: "1.98.0"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install ALSA dev headers (Linux only)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev

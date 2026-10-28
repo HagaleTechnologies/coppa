@@ -19,7 +19,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85.0"
@@ -50,7 +50,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Root package for workspace-level integration tests
 [package]
 name = "coppa"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Open-source ham radio digital communications system"
 license = "MIT OR Apache-2.0"
@@ -62,6 +62,7 @@ coppa-protocol = { path = "crates/coppa-protocol" }
 coppa-dsp = { path = "crates/coppa-dsp" }
 
 [dev-dependencies]
+coppa-bench = { path = "crates/coppa-bench" }
 coppa-channel = { path = "crates/coppa-channel" }
 coppa-audio = { path = "crates/coppa-audio" }
 num-complex = { workspace = true }

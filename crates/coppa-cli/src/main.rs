@@ -4,13 +4,28 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use coppa_engine::config::{EngineConfig, OfdmBand};
 use coppa_engine::CoppaCore;
+use std::path::PathBuf;
+mod settings;
+use serde::Serialize;
+use settings::{CliEnv, Direction, Layers, RigSettings, SETTINGS_HELP};
+use std::io::Write;
 
 /// Output verbosity level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verbosity {
     Quiet,
     Normal,
-    Verbose,
+    Verbose(u8),
+}
+
+impl Verbosity {
+    fn is_verbose(self) -> bool {
+        matches!(self, Self::Verbose(_))
+    }
+
+    fn is_extended(self) -> bool {
+        matches!(self, Self::Verbose(count) if count >= 2)
+    }
 }
 
 #[derive(Parser)]
@@ -20,14 +35,59 @@ enum Verbosity {
     version
 )]
 struct Cli {
-    /// Enable verbose output (SNR, sample counts, DSP diagnostics).
-    #[arg(long, global = true)]
-    verbose: bool,
+    /// Increase diagnostic output; repeat for frame metrics.
+    #[arg(short, long, global = true, action = clap::ArgAction::Count, conflicts_with = "quiet")]
+    verbose: u8,
     /// Suppress all output except decoded messages.
-    #[arg(long, global = true)]
+    #[arg(short, long, global = true, conflicts_with = "verbose")]
     quiet: bool,
+    /// Read settings from this file instead of searching for coppad.toml (also COPPA_CONFIG). The file must exist.
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+/// Flags for `coppa rx`, shared with its deprecated hidden alias
+/// `coppa listen` (COP-56) so the two cannot drift apart.
+#[derive(clap::Args, Debug, Default, PartialEq, Eq)]
+struct RxArgs {
+    /// WAV file to decode. Without one, captures live audio from an input device.
+    #[arg(value_name = "FILE")]
+    file: Option<String>,
+    /// WAV file to decode (same as FILE).
+    #[arg(short, long, value_name = "FILE", conflicts_with = "file")]
+    input: Option<String>,
+    /// Stop after this many seconds of audio: the first N seconds of a file,
+    /// or N seconds of live capture (0 = no limit).
+    #[arg(short, long, value_name = "SECONDS", default_value_t = 0)]
+    duration: u64,
+    /// Operational profile name.
+    #[arg(long)]
+    profile: Option<String>,
+    /// Your callsign. Printed under --verbose; nothing else uses it yet.
+    #[arg(long)]
+    callsign: Option<String>,
+    /// Print only the decoded payload as lowercase hex, one line per frame,
+    /// with no labels (always hex, even for text).
+    #[arg(long)]
+    raw: bool,
+    /// Show the payload as lowercase hex even when it is valid UTF-8 text.
+    #[arg(long)]
+    hex: bool,
+    /// Emit one JSON object per decoded frame.
+    #[arg(long, conflicts_with_all = ["raw", "hex"])]
+    json: bool,
+    /// Audio input device name (substring match, live capture only).
+    #[arg(long)]
+    device: Option<String>,
+}
+
+impl RxArgs {
+    /// The WAV file to decode, from FILE or -i/--input (clap rejects both).
+    fn path(&self) -> Option<&str> {
+        self.file.as_deref().or(self.input.as_deref())
+    }
 }
 
 /// Flags shared by `coppa profiles` and its deprecated alias `coppa config`, so
@@ -40,15 +100,182 @@ struct ProfilesArgs {
     /// Show one speed level (1-9).
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
     level: Option<u8>,
+    /// Emit JSON output.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Printed on stderr whenever the deprecated `coppa config` alias runs, even
 /// under `--quiet`: a script still using it must hear that it is going away.
 const CONFIG_DEPRECATED: &str = "WARNING: 'coppa config' is deprecated and will be removed in the next release. Use 'coppa profiles' instead; it takes the same flags.";
 
+#[derive(Serialize)]
+struct DeviceOutput {
+    name: String,
+    max_sample_rate_hz: u32,
+    input_channels: u16,
+    output_channels: u16,
+}
+
+impl From<&coppa_audio::AudioDevice> for DeviceOutput {
+    fn from(device: &coppa_audio::AudioDevice) -> Self {
+        Self {
+            name: device.name.clone(),
+            max_sample_rate_hz: device.max_sample_rate,
+            input_channels: device.input_channels,
+            output_channels: device.output_channels,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ProfileOutput {
+    name: &'static str,
+    description: &'static str,
+    speed_level: u8,
+    max_payload_bytes: usize,
+    compression: bool,
+    sample_rate_hz: u32,
+    ofdm_profile: &'static str,
+}
+
+/// One speed level of `coppa_engine::ladder`, for `profiles --level N --json`.
+/// `hf_*` are `null` on a VHF-only level.
+#[derive(Serialize)]
+struct LevelOutput {
+    level: u8,
+    modulation: &'static str,
+    code_rate: String,
+    max_payload_bytes: usize,
+    hf_bandwidth_hz: Option<u32>,
+    hf_airtime_ms: Option<u32>,
+    vhf_bandwidth_hz: u32,
+    vhf_airtime_ms: u32,
+}
+
+impl From<&coppa_engine::ladder::LevelInfo> for LevelOutput {
+    fn from(row: &coppa_engine::ladder::LevelInfo) -> Self {
+        let ms = |s: f64| (s * 1000.0).round() as u32;
+        Self {
+            level: row.level,
+            modulation: row.modulation,
+            code_rate: format!("{}/{}", row.code_rate.0, row.code_rate.1),
+            max_payload_bytes: row.max_payload_bytes,
+            hf_bandwidth_hz: row.hf.map(|hf| hf.bandwidth_hz),
+            hf_airtime_ms: row.hf.map(|hf| ms(hf.airtime_s)),
+            vhf_bandwidth_hz: row.vhf.bandwidth_hz,
+            vhf_airtime_ms: ms(row.vhf.airtime_s),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RxOutputMode {
+    Text { hex: bool },
+    Raw,
+    Json,
+}
+
+impl From<&RxArgs> for RxOutputMode {
+    fn from(args: &RxArgs) -> Self {
+        if args.json {
+            Self::Json
+        } else if args.raw {
+            Self::Raw
+        } else {
+            Self::Text { hex: args.hex }
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RxFrameOutput<'a> {
+    payload_text: Option<&'a str>,
+    payload_hex: String,
+    snr_db: Option<f32>,
+    cfo_hz: Option<f32>,
+    frame_start: u64,
+    speed_level: u8,
+}
+
+fn finite(value: f32) -> Option<f32> {
+    value.is_finite().then_some(value)
+}
+
+impl<'a> RxFrameOutput<'a> {
+    fn from_frame(frame: &coppa_engine::StreamFrame, bytes: &'a [u8]) -> Self {
+        Self {
+            payload_text: std::str::from_utf8(bytes).ok(),
+            payload_hex: hex_string(bytes),
+            snr_db: finite(frame.snr_db),
+            cfo_hz: finite(frame.cfo_hz),
+            frame_start: frame.frame_start,
+            speed_level: frame.speed_level,
+        }
+    }
+}
+
+impl ProfileOutput {
+    fn from_profile(profile: &coppa_engine::profiles::Profile) -> Result<Self> {
+        let max_payload_bytes =
+            coppa_protocol::modem::max_payload_for_level(profile.speed_level)
+                .ok_or_else(|| anyhow::anyhow!("Invalid speed level for {}", profile.name))?;
+        Ok(Self {
+            name: profile.name,
+            description: profile.description,
+            speed_level: profile.speed_level,
+            max_payload_bytes,
+            compression: profile.compression,
+            sample_rate_hz: profile.sample_rate,
+            ofdm_profile: profile.ofdm_profile,
+        })
+    }
+}
+
+fn write_json<T: Serialize>(value: &T) -> Result<()> {
+    let line = serde_json::to_string(value)?;
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{line}")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Printed on stderr every time the hidden `listen` alias runs (COP-56).
+/// Unconditional, like this file's other `WARNING:` lines, so `--quiet`
+/// scripts still see it; stderr keeps stdout captures clean.
+const LISTEN_DEPRECATED: &str = "WARNING: 'coppa listen' is deprecated and will be \
+    removed in the next release. Use 'coppa rx' instead; it takes the same flags, \
+    and --raw prints hex.";
+
+#[derive(clap::Args, Debug, Default, PartialEq, Eq)]
+struct RigArgs {
+    /// Audio output device name (substring match).
+    #[arg(long)]
+    device: Option<String>,
+    /// PTT method: "rigctld", "vox" or "none" [default: none].
+    #[arg(long)]
+    ptt: Option<String>,
+    /// rigctld address for CAT PTT [default: 127.0.0.1:4532].
+    #[arg(long)]
+    rigctld: Option<String>,
+    /// Milliseconds to key PTT before audio starts playing [default: 50].
+    #[arg(long)]
+    ptt_lead_ms: Option<u64>,
+    /// Milliseconds to hold PTT keyed after audio finishes playing [default: 200].
+    #[arg(long)]
+    ptt_tail_ms: Option<u64>,
+    /// Explicit operating frequency in Hz for the wideband gate.
+    #[arg(long)]
+    frequency_hz: Option<u64>,
+    /// Operating band label ("160m".."23cm") for the wideband gate.
+    #[arg(long)]
+    band: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Encode and transmit a message.
+    #[command(after_help = SETTINGS_HELP)]
     Tx {
         /// Message to transmit.
         message: String,
@@ -64,51 +291,14 @@ enum Commands {
         /// Callsign for station identification.
         #[arg(long)]
         callsign: Option<String>,
-        /// Audio output device name (substring match).
-        #[arg(long)]
-        device: Option<String>,
-        /// PTT method: "rigctld", "vox", "none" (default: "none")
-        #[arg(long, default_value = "none")]
-        ptt: String,
-        /// rigctld address for CAT PTT (only used when --ptt rigctld).
-        #[arg(long, default_value = "127.0.0.1:4532")]
-        rigctld: String,
-        /// Milliseconds to key PTT before audio starts playing.
-        #[arg(long, default_value = "50")]
-        ptt_lead_ms: u64,
-        /// Milliseconds to hold PTT keyed after audio finishes playing.
-        #[arg(long, default_value = "200")]
-        ptt_tail_ms: u64,
-        /// Explicit operating frequency in Hz for the wideband gate (a
-        /// wideband profile only transmits live at or above 29.7 MHz).
-        #[arg(long)]
-        frequency_hz: Option<u64>,
-        /// Operating band label ("160m".."23cm") for the wideband gate.
-        #[arg(long)]
-        band: Option<String>,
+        #[command(flatten)]
+        rig: RigArgs,
     },
-    /// Receive and decode audio (streaming: WAV file if --input is given,
-    /// otherwise live capture from an audio input device until Ctrl+C).
-    Rx {
-        /// Input file containing audio samples (WAV format). If omitted,
-        /// captures live audio from an input device instead.
-        #[arg(short, long)]
-        input: Option<String>,
-        /// Operational profile name.
-        #[arg(long)]
-        profile: Option<String>,
-        /// Print only the decoded payload as lowercase hex, one line per frame,
-        /// with no labels (always hex, even for text).
-        #[arg(long)]
-        raw: bool,
-        /// Show the payload as lowercase hex even when it is valid UTF-8 text.
-        #[arg(long)]
-        hex: bool,
-        /// Audio input device name (substring match, live capture only).
-        #[arg(long)]
-        device: Option<String>,
-    },
+    /// Receive and decode audio from a WAV file, or live from an audio input device.
+    #[command(after_help = SETTINGS_HELP)]
+    Rx(RxArgs),
     /// Run a loopback test (encode -> decode).
+    #[command(after_help = SETTINGS_HELP)]
     Loopback {
         /// Message to test.
         message: String,
@@ -119,28 +309,17 @@ enum Commands {
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
         level: Option<u8>,
     },
-    /// Listen for incoming transmissions.
-    Listen {
-        /// Duration in seconds (0 = indefinite).
-        #[arg(short, long, default_value = "0")]
-        duration: u64,
-        /// Operational profile name.
-        #[arg(long)]
-        profile: Option<String>,
-        /// Callsign for station identification.
-        #[arg(long)]
-        callsign: Option<String>,
-        /// Print only the decoded text with no labels.
-        #[arg(long)]
-        raw: bool,
-        /// Audio input device name (substring match).
-        #[arg(long)]
-        device: Option<String>,
-    },
+    /// Deprecated: use 'coppa rx'. Removed in the next release.
+    // COP-56: kept for one release. Delete this variant, LISTEN_DEPRECATED
+    // and the Listen dispatch arm in the release after it ships.
+    #[command(hide = true)]
+    #[command(after_help = SETTINGS_HELP)]
+    Listen(RxArgs),
     /// Transmit a TX-level calibration ("TUNE") tone: standard SSB two-tone
     /// (700 Hz + 1900 Hz) by default, or a single tone via `--single`. Key
     /// this while advancing your radio's audio drive level until ALC just
     /// registers, then back off. See `docs/OPERATING.md`.
+    #[command(after_help = SETTINGS_HELP)]
     Tune {
         /// Duration to key the tone, in seconds.
         #[arg(long, default_value = "10")]
@@ -156,31 +335,15 @@ enum Commands {
         /// Operational profile name (e.g., HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY).
         #[arg(long)]
         profile: Option<String>,
-        /// Audio output device name (substring match).
-        #[arg(long)]
-        device: Option<String>,
-        /// PTT method: "rigctld", "vox", "none" (default: "none")
-        #[arg(long, default_value = "none")]
-        ptt: String,
-        /// rigctld address for CAT PTT (only used when --ptt rigctld).
-        #[arg(long, default_value = "127.0.0.1:4532")]
-        rigctld: String,
-        /// Milliseconds to key PTT before audio starts playing.
-        #[arg(long, default_value = "50")]
-        ptt_lead_ms: u64,
-        /// Milliseconds to hold PTT keyed after audio finishes playing.
-        #[arg(long, default_value = "200")]
-        ptt_tail_ms: u64,
-        /// Explicit operating frequency in Hz for the wideband gate (a
-        /// wideband profile only transmits live at or above 29.7 MHz).
-        #[arg(long)]
-        frequency_hz: Option<u64>,
-        /// Operating band label ("160m".."23cm") for the wideband gate.
-        #[arg(long)]
-        band: Option<String>,
+        #[command(flatten)]
+        rig: RigArgs,
     },
     /// List available audio devices.
-    Devices,
+    Devices {
+        /// Emit a JSON array of audio devices.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show the speed levels (modulation, code rate, max bytes, air time, bandwidth) and the named profiles built on them.
     Profiles(ProfilesArgs),
     // COP-55: kept for one release. Delete this variant, CONFIG_DEPRECATED and
@@ -257,17 +420,39 @@ fn build_core(profile: Option<&str>, level: Option<u8>) -> Result<CoppaCore> {
     Ok(core)
 }
 
+/// Library diagnostics (PTT release failures, audio errors, `coppa tnc`
+/// status) go through `tracing`; show them on stderr so stdout stays command
+/// output. `RUST_LOG` overrides the `info` default.
+fn init_logging() {
+    use std::io::IsTerminal;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .without_time()
+        .with_target(false)
+        .with_ansi(coppa_daemon::logging::ansi_enabled(
+            std::io::stderr().is_terminal(),
+            std::env::var_os("NO_COLOR").as_deref(),
+        ))
+        .init();
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    init_logging();
 
     let verbosity = if cli.quiet {
         Verbosity::Quiet
-    } else if cli.verbose {
-        Verbosity::Verbose
+    } else if cli.verbose > 0 {
+        Verbosity::Verbose(cli.verbose)
     } else {
         Verbosity::Normal
     };
 
+    let config_flag = cli.config;
+    let env = CliEnv::from_process();
     match cli.command {
         Some(Commands::Tx {
             message,
@@ -275,88 +460,81 @@ fn main() -> Result<()> {
             profile,
             level,
             callsign,
-            device,
-            ptt,
-            rigctld,
-            ptt_lead_ms,
-            ptt_tail_ms,
-            frequency_hz,
-            band,
-        }) => cmd_tx(
-            &message,
-            output.as_deref(),
-            profile.as_deref(),
-            level,
-            callsign.as_deref(),
-            device.as_deref(),
-            &ptt,
-            &rigctld,
-            ptt_lead_ms,
-            ptt_tail_ms,
-            frequency_hz,
-            band.as_deref(),
-            verbosity,
-        )?,
-        Some(Commands::Rx {
-            input,
-            profile,
-            raw,
-            hex,
-            device,
-        }) => cmd_rx(
-            input.as_deref(),
-            profile.as_deref(),
-            raw,
-            hex,
-            device.as_deref(),
-            verbosity,
-        )?,
+            rig,
+        }) => {
+            let layers = Layers::load(config_flag.as_deref(), env)?;
+            let profile = layers.profile(profile.as_deref())?;
+            let callsign = layers.callsign(callsign.as_deref())?;
+            let rig = layers.rig(&rig)?;
+            if verbosity.is_verbose() {
+                layers.print_verbose_source();
+                settings::print_setting("Callsign", &callsign);
+                settings::print_setting("Profile", &profile);
+                if output.is_none() {
+                    rig.print_verbose();
+                }
+            }
+            cmd_tx(
+                &message,
+                output.as_deref(),
+                profile.as_ref().map(|v| v.value.as_str()),
+                level,
+                &rig,
+                verbosity,
+            )?;
+        }
+        Some(Commands::Rx(args)) => {
+            resolve_rx_and_run(args, config_flag.as_deref(), env, verbosity)?
+        }
+        Some(Commands::Listen(args)) => {
+            eprintln!("{LISTEN_DEPRECATED}");
+            resolve_rx_and_run(args, config_flag.as_deref(), env, verbosity)?;
+        }
         Some(Commands::Loopback {
             message,
             profile,
             level,
-        }) => cmd_loopback(&message, profile.as_deref(), level, verbosity)?,
-        Some(Commands::Listen {
-            duration,
-            profile,
-            callsign,
-            raw,
-            device,
-        }) => cmd_listen(
-            duration,
-            profile.as_deref(),
-            callsign.as_deref(),
-            raw,
-            device.as_deref(),
-            verbosity,
-        )?,
+        }) => {
+            let layers = Layers::load(config_flag.as_deref(), env)?;
+            let profile = layers.profile(profile.as_deref())?;
+            if verbosity.is_verbose() {
+                layers.print_verbose_source();
+                settings::print_setting("Profile", &profile);
+            }
+            cmd_loopback(
+                &message,
+                profile.as_ref().map(|v| v.value.as_str()),
+                level,
+                verbosity,
+            )?;
+        }
         Some(Commands::Tune {
             seconds,
             single,
             output,
             profile,
-            device,
-            ptt,
-            rigctld,
-            ptt_lead_ms,
-            ptt_tail_ms,
-            frequency_hz,
-            band,
-        }) => cmd_tune(
-            seconds,
-            single,
-            output.as_deref(),
-            profile.as_deref(),
-            device.as_deref(),
-            &ptt,
-            &rigctld,
-            ptt_lead_ms,
-            ptt_tail_ms,
-            frequency_hz,
-            band.as_deref(),
-            verbosity,
-        )?,
-        Some(Commands::Devices) => cmd_devices()?,
+            rig,
+        }) => {
+            let layers = Layers::load(config_flag.as_deref(), env)?;
+            let profile = layers.profile(profile.as_deref())?;
+            let rig = layers.rig(&rig)?;
+            if verbosity.is_verbose() {
+                layers.print_verbose_source();
+                settings::print_setting("Profile", &profile);
+                if output.is_none() {
+                    rig.print_verbose();
+                }
+            }
+            cmd_tune(
+                seconds,
+                single,
+                output.as_deref(),
+                profile.as_ref().map(|v| v.value.as_str()),
+                &rig,
+                verbosity,
+            )?;
+        }
+        Some(Commands::Devices { json }) => cmd_devices(json)?,
         Some(Commands::Profiles(args)) => cmd_profiles(&args)?,
         Some(Commands::Config(args)) => {
             eprintln!("{CONFIG_DEPRECATED}");
@@ -375,6 +553,32 @@ fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn resolve_rx_and_run(
+    mut args: RxArgs,
+    config_flag: Option<&std::path::Path>,
+    env: CliEnv,
+    verbosity: Verbosity,
+) -> Result<()> {
+    // The deprecated alias shares the same resolver and receiver.
+    let layers = Layers::load(config_flag, env)?;
+    let profile = layers.profile(args.profile.as_deref())?;
+    let callsign = layers.callsign(args.callsign.as_deref())?;
+    let device = layers.device(args.device.as_deref(), Direction::Input)?;
+    if verbosity.is_verbose() {
+        layers.print_verbose_source();
+        settings::print_setting("Callsign", &callsign);
+        settings::print_setting("Profile", &profile);
+        if args.path().is_none() {
+            settings::print_setting("Device", &device);
+        }
+    }
+    args.profile = profile.map(|v| v.value);
+    args.callsign = callsign.map(|v| v.value);
+    args.device = device.map(|v| v.value);
+    cmd_rx(&args, verbosity)?;
     Ok(())
 }
 
@@ -456,10 +660,11 @@ fn build_ptt(ptt: &str, rigctld_addr: &str) -> Result<coppa_radio::PttBackend> {
 fn cli_frequency_evidence(
     frequency_hz: Option<u64>,
     band: Option<&str>,
+    freq_key: &str,
+    band_key: &str,
 ) -> Result<Option<coppa_radio::band::FrequencyEvidence>> {
-    let stated =
-        coppa_radio::band::FrequencyConfig::parse(frequency_hz, band, "--frequency-hz", "--band")
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stated = coppa_radio::band::FrequencyConfig::parse(frequency_hz, band, freq_key, band_key)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(stated.static_evidence())
 }
 
@@ -686,28 +891,17 @@ fn transmit_live(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cmd_tx(
     message: &str,
     output: Option<&str>,
     profile: Option<&str>,
     level: Option<u8>,
-    callsign: Option<&str>,
-    device: Option<&str>,
-    ptt: &str,
-    rigctld: &str,
-    ptt_lead_ms: u64,
-    ptt_tail_ms: u64,
-    frequency_hz: Option<u64>,
-    band: Option<&str>,
+    rig: &RigSettings,
     verbosity: Verbosity,
 ) -> Result<()> {
     let core = build_core(profile, level)?;
 
-    if verbosity == Verbosity::Verbose {
-        if let Some(cs) = callsign {
-            eprintln!("[verbose] Callsign: {}", cs);
-        }
+    if verbosity.is_verbose() {
         eprintln!(
             "[verbose] Config: sample_rate={}, speed_level={}",
             core.config().sample_rate,
@@ -722,7 +916,7 @@ fn cmd_tx(
     if verbosity != Verbosity::Quiet {
         println!("Generated {} audio samples", samples.len());
     }
-    if verbosity == Verbosity::Verbose {
+    if verbosity.is_verbose() {
         let duration_s = samples.len() as f64 / core.config().sample_rate as f64;
         eprintln!("[verbose] Audio duration: {:.3} s", duration_s);
     }
@@ -735,18 +929,19 @@ fn cmd_tx(
             let gate = LiveTxGate {
                 profile: profile.unwrap_or("default"),
                 occupied_hz: core.occupied_bandwidth_hz(),
-                stated: cli_frequency_evidence(frequency_hz, band)?,
+                stated: rig.frequency_evidence()?,
             };
             #[cfg(feature = "cpal-backend")]
             {
+                let ptt = rig.ptt_method()?;
                 transmit_live(
                     &samples,
                     core.config().sample_rate,
-                    device,
+                    rig.device.as_ref().map(|v| v.value.as_str()),
                     ptt,
-                    rigctld,
-                    ptt_lead_ms,
-                    ptt_tail_ms,
+                    &rig.rigctld.value,
+                    rig.lead.value,
+                    rig.tail.value,
                     gate,
                     verbosity,
                 )?;
@@ -757,12 +952,9 @@ fn cmd_tx(
                 // but the same arguments are validated: a typo'd --ptt is
                 // rejected exactly as the audio build rejects it, and a
                 // wideband request is still refused, not silently accepted.
-                validate_ptt_method(ptt)?;
+                rig.ptt_method()?;
                 cli_gate_decision(gate.profile, gate.occupied_hz, None, gate.stated)?;
-                let _ = device;
-                let _ = rigctld;
-                let _ = ptt_lead_ms;
-                let _ = ptt_tail_ms;
+                let _ = rig;
                 if verbosity != Verbosity::Quiet {
                     println!("Live audio output not available (compile with cpal-backend feature)");
                 }
@@ -787,19 +979,12 @@ fn tune_occupied_hz(single: Option<f32>) -> u32 {
 /// (or a single tone via `single`), key PTT, stream it out, then unkey —
 /// mirroring `cmd_tx`'s live-playback path. See `docs/OPERATING.md` for the
 /// calibration procedure this is meant to support.
-#[allow(clippy::too_many_arguments)]
 fn cmd_tune(
     seconds: f32,
     single: Option<f32>,
     output: Option<&str>,
     profile: Option<&str>,
-    device: Option<&str>,
-    ptt: &str,
-    rigctld: &str,
-    ptt_lead_ms: u64,
-    ptt_tail_ms: u64,
-    frequency_hz: Option<u64>,
-    band: Option<&str>,
+    rig: &RigSettings,
     verbosity: Verbosity,
 ) -> Result<()> {
     let config = resolve_config(profile)?;
@@ -833,18 +1018,19 @@ fn cmd_tune(
             let gate = LiveTxGate {
                 profile: profile.unwrap_or("default"),
                 occupied_hz: tune_occupied_hz(single),
-                stated: cli_frequency_evidence(frequency_hz, band)?,
+                stated: rig.frequency_evidence()?,
             };
             #[cfg(feature = "cpal-backend")]
             {
+                let ptt = rig.ptt_method()?;
                 transmit_live(
                     &samples,
                     core.config().sample_rate,
-                    device,
+                    rig.device.as_ref().map(|v| v.value.as_str()),
                     ptt,
-                    rigctld,
-                    ptt_lead_ms,
-                    ptt_tail_ms,
+                    &rig.rigctld.value,
+                    rig.lead.value,
+                    rig.tail.value,
                     gate,
                     verbosity,
                 )?;
@@ -855,12 +1041,9 @@ fn cmd_tune(
                 // but the same arguments are validated: a typo'd --ptt is
                 // rejected exactly as the audio build rejects it, and a
                 // wideband request is still refused, not silently accepted.
-                validate_ptt_method(ptt)?;
+                rig.ptt_method()?;
                 cli_gate_decision(gate.profile, gate.occupied_hz, None, gate.stated)?;
-                let _ = device;
-                let _ = rigctld;
-                let _ = ptt_lead_ms;
-                let _ = ptt_tail_ms;
+                let _ = rig;
                 if verbosity != Verbosity::Quiet {
                     println!("Live audio output not available (compile with cpal-backend feature)");
                 }
@@ -871,48 +1054,66 @@ fn cmd_tune(
     Ok(())
 }
 
-/// `coppa rx`: stream audio (a WAV file via `--input`, or a live capture
-/// device otherwise) through `CoppaCore::push_samples` (the same
-/// `StreamingReceiver`-based path the daemon uses), printing each decoded
-/// frame's payload + SNR as it completes.
+/// `coppa rx`: the one receiver (COP-56). Streams audio -- a WAV file named
+/// by FILE or `-i/--input`, or a live capture device when neither is given --
+/// through `CoppaCore::push_samples` (the same `StreamingReceiver`-based path
+/// the daemon uses), printing each decoded frame's payload + SNR as it
+/// completes. The deprecated `coppa listen` alias runs this too.
 ///
-/// Unlike the old one-shot `core.decode(&samples)` batch call this replaces,
-/// `push_samples` never forces a UTF-8 conversion (Phase 4 Task 3.5) -- frame
-/// payloads are raw bytes. Display valid UTF-8 as escaped, quoted text, and
-/// fall back to labeled hex otherwise. `--hex` forces hex; `--raw` prints
-/// only lowercase hex, one line per frame.
-fn cmd_rx(
-    input: Option<&str>,
-    profile: Option<&str>,
-    raw: bool,
-    hex: bool,
-    device: Option<&str>,
-    verbosity: Verbosity,
-) -> Result<()> {
-    let config = resolve_config(profile)?;
+/// `--duration <SECONDS>` (0 = no limit) decodes only the first N seconds of a
+/// file, or stops a live capture after N seconds of wall clock; without it a
+/// live capture runs until Ctrl+C.
+///
+/// Output is COP-13's grammar: `push_samples` never forces a UTF-8
+/// conversion (Phase 4 Task 3.5), so frame payloads are raw bytes. Valid
+/// UTF-8 is displayed as escaped, quoted text, anything else as labeled hex.
+/// `--hex` forces hex; `--raw` prints only lowercase hex, one line per frame.
+fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
+    let config = resolve_config(args.profile.as_deref())?;
     let mut core = CoppaCore::with_config(config);
+    let output_mode = RxOutputMode::from(args);
 
-    if verbosity == Verbosity::Verbose {
+    if verbosity.is_verbose() {
         eprintln!("[verbose] sample_rate: {}", core.config().sample_rate);
     }
 
-    if let Some(path) = input {
+    if let Some(path) = args.path() {
         #[cfg(feature = "file-backend")]
         {
             use coppa_audio::{file_backend::WavSource, AudioSource};
             let mut source = WavSource::open(path)?;
             let total = source.total_samples();
-            if verbosity != Verbosity::Quiet && !raw {
-                println!("Reading {} samples from {}", total, path);
+            // The file's own rate: WavSource does not resample, so "the
+            // first N seconds" is N times the rate the samples were written at.
+            let limit = file_sample_limit(total, args.duration, source.sample_rate());
+            if verbosity != Verbosity::Quiet && !args.raw && !args.json {
+                if limit < total {
+                    println!(
+                        "Reading the first {} s ({} of {} samples) from {}",
+                        args.duration, limit, total, path
+                    );
+                } else {
+                    println!("Reading {} samples from {}", total, path);
+                }
             }
             source.start()?;
-            stream_decode(&mut core, &mut source, Some(total), raw, hex, verbosity)?;
+            stream_decode(
+                &mut core,
+                &mut source,
+                Some(limit),
+                None,
+                output_mode,
+                verbosity,
+            )?;
             source.stop()?;
         }
         #[cfg(not(feature = "file-backend"))]
         {
             let _ = path;
             let _ = &mut core;
+            if args.json {
+                anyhow::bail!("File input not available (compile with file-backend feature)");
+            }
             if verbosity != Verbosity::Quiet {
                 println!("File input not available (compile with file-backend feature)");
             }
@@ -922,7 +1123,7 @@ fn cmd_rx(
         {
             use coppa_audio::AudioSource;
             let engine_rate = core.config().sample_rate;
-            let mut source = match device {
+            let mut source = match args.device.as_deref() {
                 Some(name) => match coppa_audio::find_input_device_by_name(name) {
                     Some(dev) => {
                         if verbosity != Verbosity::Quiet {
@@ -941,16 +1142,38 @@ fn cmd_rx(
                 None => coppa_audio::cpal_backend::CpalSource::new(engine_rate, 8192)?,
             };
             source.start()?;
-            if verbosity != Verbosity::Quiet && !raw {
-                println!("Listening for live audio (Ctrl+C to stop)...");
+            let chatty = verbosity != Verbosity::Quiet && !args.raw && !args.json;
+            if chatty {
+                if args.duration > 0 {
+                    println!(
+                        "Listening for live audio for {} s (Ctrl+C to stop)...",
+                        args.duration
+                    );
+                } else {
+                    println!("Listening for live audio (Ctrl+C to stop)...");
+                }
             }
-            stream_decode(&mut core, &mut source, None, raw, hex, verbosity)?;
+            let deadline = live_deadline(std::time::Instant::now(), args.duration);
+            stream_decode(
+                &mut core,
+                &mut source,
+                None,
+                deadline,
+                output_mode,
+                verbosity,
+            )?;
             source.stop()?;
+            if chatty && args.duration > 0 {
+                println!("Stopped listening after {} s.", args.duration);
+            }
         }
         #[cfg(not(feature = "cpal-backend"))]
         {
-            let _ = device;
+            let _ = (&args.device, args.duration);
             let _ = &mut core;
+            if args.json {
+                anyhow::bail!("Live audio input not available (compile with cpal-backend feature)");
+            }
             if verbosity != Verbosity::Quiet {
                 println!("Live audio input not available (compile with cpal-backend feature)");
             }
@@ -960,9 +1183,30 @@ fn cmd_rx(
     Ok(())
 }
 
-/// Trailing silence (samples) fed to `core` after a finite (`--input <wav>`)
-/// source is exhausted, so a frame whose nominal end coincides with (or is
-/// close to) the file's own end can still complete.
+/// How many samples of a `total`-sample file `--duration <seconds>` lets
+/// `coppa rx` decode: all of them when `seconds` is 0 or covers the file.
+#[cfg_attr(not(feature = "file-backend"), allow(dead_code))]
+fn file_sample_limit(total: usize, seconds: u64, sample_rate: u32) -> usize {
+    if seconds == 0 {
+        return total;
+    }
+    let cap = seconds.saturating_mul(u64::from(sample_rate));
+    usize::try_from(cap).map_or(total, |cap| cap.min(total))
+}
+
+/// When a live `coppa rx --duration <seconds>` stops. `None` means no limit:
+/// 0, or a duration too large for `Instant` (effectively forever).
+#[cfg_attr(not(feature = "cpal-backend"), allow(dead_code))]
+fn live_deadline(now: std::time::Instant, seconds: u64) -> Option<std::time::Instant> {
+    if seconds == 0 {
+        return None;
+    }
+    now.checked_add(std::time::Duration::from_secs(seconds))
+}
+
+/// Trailing silence (samples) fed to `core` once `stream_decode` stops (end
+/// of a WAV file, its `--duration` cap, or a live deadline), so a frame whose
+/// nominal end coincides with (or is close to) that stop can still complete.
 ///
 /// `StreamingReceiver` needs `rx_group_delay` samples past a candidate's
 /// nominal end before it will emit that frame -- the RX bandpass filter's
@@ -981,52 +1225,51 @@ const TRAILING_FLUSH_SAMPLES: usize = 8192;
 /// (`CoppaCore::push_samples`) in fixed-size chunks, printing each decoded
 /// frame as it completes (see `print_stream_frame`).
 ///
-/// `total_samples`, when known (the `--input <wav>` case), bounds the loop to
-/// exactly that many samples so it terminates at end-of-file without relying
-/// on a `read() == 0` EOF signal (live sources also return 0 whenever no new
-/// audio has arrived yet, which is not EOF -- see the `None` branch below).
-/// Once exhausted, `TRAILING_FLUSH_SAMPLES` of silence are pushed so a frame
-/// right at the file's end can still complete (see that constant's doc).
+/// It stops on the first of three conditions:
+/// - `total_samples`, when known (a WAV file, already capped by
+///   `--duration`): exactly that many samples are read -- never more, since
+///   each read is sized to what the limit leaves -- so the loop terminates
+///   without relying on a `read() == 0` EOF signal (live sources also return
+///   0 whenever no new audio has arrived yet, which is not EOF).
+/// - `deadline` (a live `--duration`): checked after every read, including
+///   empty ones, so a stalled device still stops on time.
+/// - Neither (a live capture with no `--duration`): runs until the process
+///   is interrupted (Ctrl+C), briefly sleeping on an empty read to avoid a
+///   busy-spin against the non-blocking device source.
 ///
-/// When `total_samples` is `None` (live capture), this runs until the
-/// process is interrupted (Ctrl+C), briefly sleeping on an empty read to
-/// avoid a busy-spin against the non-blocking device source.
+/// Every normal return then pushes `TRAILING_FLUSH_SAMPLES` of silence so a
+/// frame that ends right at the file's end (or just before a live deadline)
+/// can still complete (see that constant's doc).
 fn stream_decode(
     core: &mut CoppaCore,
     source: &mut dyn coppa_audio::AudioSource,
     total_samples: Option<usize>,
-    raw: bool,
-    hex: bool,
+    deadline: Option<std::time::Instant>,
+    output_mode: RxOutputMode,
     verbosity: Verbosity,
 ) -> Result<()> {
     let mut buf = vec![0.0f32; 4096];
     let mut consumed = 0usize;
-    loop {
-        let n = source.read(&mut buf)?;
+    while total_samples.is_none_or(|total| consumed < total) {
+        let want = total_samples.map_or(buf.len(), |total| buf.len().min(total - consumed));
+        let n = source.read(&mut buf[..want])?;
         if n > 0 {
             consumed += n;
             for frame in core.push_samples(&buf[..n]) {
-                print_stream_frame(&frame, raw, hex, verbosity);
+                print_stream_frame(&frame, output_mode, verbosity)?;
             }
         }
-        match total_samples {
-            Some(total) => {
-                if consumed >= total {
-                    break;
-                }
-            }
-            None if n == 0 => {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            None => {}
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        if n == 0 && total_samples.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
-    if total_samples.is_some() {
-        let silence = vec![0.0f32; TRAILING_FLUSH_SAMPLES];
-        for frame in core.push_samples(&silence) {
-            print_stream_frame(&frame, raw, hex, verbosity);
-        }
+    let silence = vec![0.0f32; TRAILING_FLUSH_SAMPLES];
+    for frame in core.push_samples(&silence) {
+        print_stream_frame(&frame, output_mode, verbosity)?;
     }
 
     Ok(())
@@ -1060,21 +1303,28 @@ fn format_decoded(bytes: &[u8], snr_db: f32, hex: bool) -> String {
 /// corrupt a `--raw` capture), suppressed entirely in `Verbosity::Quiet`.
 fn print_stream_frame(
     frame: &coppa_engine::StreamFrame,
-    raw: bool,
-    hex: bool,
+    output_mode: RxOutputMode,
     verbosity: Verbosity,
-) {
+) -> Result<()> {
     match &frame.payload {
         Ok(bytes) => {
-            if raw {
-                println!("{}", hex_string(bytes));
-            } else {
-                println!("{}", format_decoded(bytes, frame.snr_db, hex));
+            match output_mode {
+                RxOutputMode::Raw => println!("{}", hex_string(bytes)),
+                RxOutputMode::Text { hex } => {
+                    println!("{}", format_decoded(bytes, frame.snr_db, hex));
+                }
+                RxOutputMode::Json => write_json(&RxFrameOutput::from_frame(frame, bytes))?,
             }
-            if verbosity == Verbosity::Verbose {
+            if verbosity.is_verbose() {
                 eprintln!(
                     "[verbose] level={} cfo_hz={:.1} frame_start={}",
                     frame.speed_level, frame.cfo_hz, frame.frame_start
+                );
+            }
+            if verbosity.is_extended() {
+                eprintln!(
+                    "[verbose] recommended_level={} delay_spread_ms={:.1}",
+                    frame.recommended_level, frame.delay_spread_ms
                 );
             }
         }
@@ -1084,6 +1334,7 @@ fn print_stream_frame(
             }
         }
     }
+    Ok(())
 }
 
 fn cmd_loopback(
@@ -1100,7 +1351,7 @@ fn cmd_loopback(
 
     let core = build_core(profile, level)?;
 
-    if verbosity == Verbosity::Verbose {
+    if verbosity.is_verbose() {
         eprintln!(
             "[verbose] Config: sample_rate={}, speed_level={}",
             core.config().sample_rate,
@@ -1132,123 +1383,13 @@ fn cmd_loopback(
     Ok(())
 }
 
-fn cmd_listen(
-    duration: u64,
-    profile: Option<&str>,
-    callsign: Option<&str>,
-    raw: bool,
-    device: Option<&str>,
-    verbosity: Verbosity,
-) -> Result<()> {
-    if verbosity != Verbosity::Quiet && !raw {
-        if duration == 0 {
-            println!("Listening indefinitely (Ctrl+C to stop)...");
-        } else {
-            println!("Listening for {} seconds...", duration);
-        }
-    }
-
-    if verbosity == Verbosity::Verbose {
-        if let Some(cs) = callsign {
-            eprintln!("[verbose] Callsign: {}", cs);
-        }
-    }
-
-    #[cfg(feature = "cpal-backend")]
-    {
-        use coppa_audio::AudioSource;
-
-        let config = resolve_config(profile)?;
-        let engine_rate = config.sample_rate;
-        let mut source = match device {
-            Some(name) => match coppa_audio::find_input_device_by_name(name) {
-                Some(dev) => {
-                    if verbosity != Verbosity::Quiet {
-                        eprintln!("Using input device matching '{}'", name);
-                    }
-                    coppa_audio::cpal_backend::CpalSource::from_device(dev, engine_rate, 8192)?
-                }
-                None => {
-                    eprintln!(
-                        "WARNING: No input device matching '{}', using default",
-                        name
-                    );
-                    coppa_audio::cpal_backend::CpalSource::new(engine_rate, 8192)?
-                }
-            },
-            None => coppa_audio::cpal_backend::CpalSource::new(engine_rate, 8192)?,
-        };
-        source.start()?;
-
-        let core = CoppaCore::with_config(config);
-        let mut read_buf = vec![0.0f32; 4000];
-        let mut window: Vec<f32> = Vec::with_capacity(65536);
-        let max_window = 64000;
-        let start = std::time::Instant::now();
-        let mut last_liveness = std::time::Instant::now();
-
-        loop {
-            if duration > 0 && start.elapsed().as_secs() >= duration {
-                break;
-            }
-
-            // F5: Liveness indicator -- print "." to stderr every 5 seconds
-            if verbosity != Verbosity::Quiet && last_liveness.elapsed().as_secs() >= 5 {
-                eprint!(".");
-                last_liveness = std::time::Instant::now();
-            }
-
-            let n = source.read(&mut read_buf)?;
-            if n > 0 {
-                window.extend_from_slice(&read_buf[..n]);
-
-                if verbosity == Verbosity::Verbose {
-                    eprintln!("[verbose] Buffer: {} samples", window.len());
-                }
-
-                match core.decode(&window) {
-                    Ok(message) => {
-                        if raw {
-                            print!("{}", message);
-                        } else {
-                            println!("Decoded: \"{}\"", message);
-                        }
-                        window.clear();
-                    }
-                    Err(_) => {
-                        if window.len() > max_window {
-                            let drain = window.len() / 2;
-                            window.drain(..drain);
-                        }
-                    }
-                }
-            }
-        }
-
-        source.stop()?;
-        if verbosity != Verbosity::Quiet && !raw {
-            println!("\nStopped listening.");
-        }
-    }
-
-    #[cfg(not(feature = "cpal-backend"))]
-    {
-        let _ = duration;
-        let _ = profile;
-        let _ = callsign;
-        let _ = raw;
-        let _ = device;
-        if verbosity != Verbosity::Quiet {
-            println!("(Live audio capture not available -- compile with cpal-backend feature)");
-        }
-    }
-
-    Ok(())
-}
-
-fn cmd_devices() -> Result<()> {
-    println!("Available audio devices:");
+fn cmd_devices(json: bool) -> Result<()> {
     let devices = coppa_audio::list_devices()?;
+    if json {
+        let output: Vec<_> = devices.iter().map(DeviceOutput::from).collect();
+        return write_json(&output);
+    }
+    println!("Available audio devices:");
     if devices.is_empty() {
         println!("  (none found - CPAL backend may not be available)");
     } else {
@@ -1263,10 +1404,35 @@ fn cmd_devices() -> Result<()> {
 }
 
 /// `coppa profiles` (and the deprecated `coppa config`): print the speed ladder
-/// and the named profiles, one speed level, or one profile's detail.
+/// and the named profiles, one speed level, or one profile's detail; `--json`
+/// emits the same selection as JSON.
 fn cmd_profiles(args: &ProfilesArgs) -> Result<()> {
+    if args.json {
+        return write_json_profiles(args);
+    }
     print!("{}", render_profiles(args)?);
     Ok(())
+}
+
+/// `profiles --json`: an array of every named profile, one profile object with
+/// `-p`, or one speed-level object with `--level`.
+fn write_json_profiles(args: &ProfilesArgs) -> Result<()> {
+    if let Some(name) = args.profile.as_deref() {
+        resolve_config(Some(name))?;
+        let resolved = coppa_engine::profiles::get_profile(name)
+            .ok_or_else(|| anyhow::anyhow!("Unknown profile: {name}"))?;
+        return write_json(&ProfileOutput::from_profile(resolved)?);
+    }
+    if let Some(level) = args.level {
+        let row = coppa_engine::ladder::level_info(level)
+            .ok_or_else(|| anyhow::anyhow!("no speed level {level}"))?;
+        return write_json(&LevelOutput::from(&row));
+    }
+    let profiles: Vec<_> = named_profiles()
+        .into_iter()
+        .map(ProfileOutput::from_profile)
+        .collect::<Result<_>>()?;
+    write_json(&profiles)
 }
 
 /// Render `coppa profiles`. Every number comes from `coppa_engine::ladder` or
@@ -1552,6 +1718,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn device_json_escapes_names_and_empty_lists() {
+        let empty: Vec<DeviceOutput> = Vec::new();
+        assert_eq!(serde_json::to_string(&empty).unwrap(), "[]");
+        let device = coppa_audio::AudioDevice {
+            name: "USB \"mic\"\nline".into(),
+            max_sample_rate: 48_000,
+            input_channels: 1,
+            output_channels: 2,
+        };
+        let value = serde_json::to_value(DeviceOutput::from(&device)).unwrap();
+        assert_eq!(value["name"], device.name);
+        assert_eq!(value["max_sample_rate_hz"], 48_000);
+        assert_eq!(value.as_object().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn rx_json_non_finite_measurements_are_null() {
+        let frame = coppa_engine::StreamFrame {
+            payload: Ok(vec![0xff, 0x00]),
+            snr_db: f32::NAN,
+            cfo_hz: f32::INFINITY,
+            frame_start: 270,
+            speed_level: 1,
+            recommended_level: 1,
+            delay_spread_ms: 0.0,
+        };
+        let value = serde_json::to_value(RxFrameOutput::from_frame(&frame, &[0xff, 0x00])).unwrap();
+        assert!(value["payload_text"].is_null());
+        assert_eq!(value["payload_hex"], "ff00");
+        assert!(value["snr_db"].is_null());
+        assert!(value["cfo_hz"].is_null());
+    }
+
+    #[test]
     fn format_decoded_text() {
         assert_eq!(
             format_decoded(b"CQ CQ CQ DE VK2ABC K", 25.7, false),
@@ -1617,7 +1817,7 @@ mod tests {
 
     #[test]
     fn test_loopback_verbose() {
-        cmd_loopback("Verbose", None, None, Verbosity::Verbose)
+        cmd_loopback("Verbose", None, None, Verbosity::Verbose(1))
             .expect("verbose loopback should succeed");
     }
 
@@ -1631,14 +1831,7 @@ mod tests {
             Some(path_str),
             None,
             None,
-            None,
-            None,
-            "none",
-            "127.0.0.1:4532",
-            50,
-            200,
-            None,
-            None,
+            &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
             Verbosity::Normal,
         )
         .expect("tx to file should succeed");
@@ -1659,13 +1852,7 @@ mod tests {
             None,
             Some(path_str),
             None,
-            None,
-            "none",
-            "127.0.0.1:4532",
-            50,
-            200,
-            None,
-            None,
+            &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
             Verbosity::Normal,
         )
         .expect("tune to file should succeed");
@@ -1686,13 +1873,7 @@ mod tests {
             Some(1500.0),
             Some(path_str),
             None,
-            None,
-            "none",
-            "127.0.0.1:4532",
-            50,
-            200,
-            None,
-            None,
+            &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
             Verbosity::Quiet,
         )
         .expect("single-tone tune to file should succeed");
@@ -1704,7 +1885,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tx_with_callsign() {
+    fn test_tx_verbose_to_file() {
         let dir = std::env::temp_dir();
         let path = dir.join("coppa_test_tx_cs.wav");
         let path_str = path.to_str().unwrap();
@@ -1713,15 +1894,8 @@ mod tests {
             Some(path_str),
             None,
             None,
-            Some("VK2ABC"),
-            None,
-            "none",
-            "127.0.0.1:4532",
-            50,
-            200,
-            None,
-            None,
-            Verbosity::Verbose,
+            &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
+            Verbosity::Verbose(1),
         )
         .expect("tx with callsign should succeed");
         #[cfg(feature = "file-backend")]
@@ -1734,14 +1908,11 @@ mod tests {
     fn test_rx_nonexistent_file() {
         #[cfg(feature = "file-backend")]
         {
-            let result = cmd_rx(
-                Some("/tmp/coppa_nonexistent_12345.wav"),
-                None,
-                false,
-                false,
-                None,
-                Verbosity::Normal,
-            );
+            let args = RxArgs {
+                file: Some("/tmp/coppa_nonexistent_12345.wav".into()),
+                ..Default::default()
+            };
+            let result = cmd_rx(&args, Verbosity::Normal);
             assert!(result.is_err(), "rx of nonexistent file should error");
         }
     }
@@ -1808,8 +1979,13 @@ mod tests {
     fn top_level_help_lists_profiles_and_hides_config() {
         use clap::CommandFactory;
         let help = Cli::command().render_help().to_string();
-        assert!(help.contains("profiles"), "{help}");
-        assert!(!help.contains("config"), "{help}");
+        let subcommands: Vec<&str> = help
+            .lines()
+            .filter_map(|line| line.strip_prefix("  "))
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        assert!(subcommands.contains(&"profiles"), "{help}");
+        assert!(!subcommands.contains(&"config"), "{help}");
     }
 
     fn rendered(args: &[&str]) -> String {
@@ -1906,7 +2082,7 @@ mod tests {
     fn profiles_unknown_profile_is_an_error() {
         let args = ProfilesArgs {
             profile: Some("BOGUS".to_string()),
-            level: None,
+            ..ProfilesArgs::default()
         };
         let err = render_profiles(&args).unwrap_err().to_string();
         assert!(err.contains("Unknown profile: BOGUS. Available:"), "{err}");
@@ -2025,15 +2201,10 @@ mod tests {
             "500",
         ]);
         match cli.command {
-            Some(Commands::Tx {
-                rigctld,
-                ptt_lead_ms,
-                ptt_tail_ms,
-                ..
-            }) => {
-                assert_eq!(rigctld, "192.168.1.50:4532");
-                assert_eq!(ptt_lead_ms, 75);
-                assert_eq!(ptt_tail_ms, 500);
+            Some(Commands::Tx { rig, .. }) => {
+                assert_eq!(rig.rigctld.as_deref(), Some("192.168.1.50:4532"));
+                assert_eq!(rig.ptt_lead_ms, Some(75));
+                assert_eq!(rig.ptt_tail_ms, Some(500));
             }
             _ => panic!("expected Tx command"),
         }
@@ -2043,15 +2214,11 @@ mod tests {
     fn test_cli_tx_ptt_flags_default() {
         let cli = Cli::parse_from(["coppa", "tx", "hello"]);
         match cli.command {
-            Some(Commands::Tx {
-                rigctld,
-                ptt_lead_ms,
-                ptt_tail_ms,
-                ..
-            }) => {
-                assert_eq!(rigctld, "127.0.0.1:4532");
-                assert_eq!(ptt_lead_ms, 50);
-                assert_eq!(ptt_tail_ms, 200);
+            Some(Commands::Tx { rig, .. }) => {
+                assert_eq!(rig.ptt, None);
+                assert_eq!(rig.rigctld, None);
+                assert_eq!(rig.ptt_lead_ms, None);
+                assert_eq!(rig.ptt_tail_ms, None);
             }
             _ => panic!("expected Tx command"),
         }
@@ -2070,15 +2237,24 @@ mod tests {
             "20",
         ]);
         match cli.command {
-            Some(Commands::Tune {
-                rigctld,
-                ptt_lead_ms,
-                ptt_tail_ms,
-                ..
-            }) => {
-                assert_eq!(rigctld, "10.0.0.5:4532");
-                assert_eq!(ptt_lead_ms, 10);
-                assert_eq!(ptt_tail_ms, 20);
+            Some(Commands::Tune { rig, .. }) => {
+                assert_eq!(rig.rigctld.as_deref(), Some("10.0.0.5:4532"));
+                assert_eq!(rig.ptt_lead_ms, Some(10));
+                assert_eq!(rig.ptt_tail_ms, Some(20));
+            }
+            _ => panic!("expected Tune command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_tune_ptt_flags_default() {
+        let cli = Cli::parse_from(["coppa", "tune"]);
+        match cli.command {
+            Some(Commands::Tune { rig, .. }) => {
+                assert_eq!(rig.ptt, None);
+                assert_eq!(rig.rigctld, None);
+                assert_eq!(rig.ptt_lead_ms, None);
+                assert_eq!(rig.ptt_tail_ms, None);
             }
             _ => panic!("expected Tune command"),
         }
@@ -2432,8 +2608,8 @@ mod tests {
     #[test]
     fn cli_gate_decision_matches_daemon_rules() {
         let vhf = coppa_radio::band::FrequencyEvidence::Stated(144_500_000);
-        let ten_m = cli_frequency_evidence(None, Some("10m")).unwrap();
-        let two_m = cli_frequency_evidence(None, Some("2m")).unwrap();
+        let ten_m = cli_frequency_evidence(None, Some("10m"), "--frequency-hz", "--band").unwrap();
+        let two_m = cli_frequency_evidence(None, Some("2m"), "--frequency-hz", "--band").unwrap();
 
         let err = cli_gate_decision("VHF_FAST", 5600, None, None).unwrap_err();
         let msg = err.to_string();
@@ -2476,14 +2652,8 @@ mod tests {
             None,
             None,
             Some("VHF_FAST"),
-            None,
-            "none",
-            "127.0.0.1:1",
-            0,
-            0,
-            None,
-            Some("21m"),
-            Verbosity::Quiet,
+            &RigSettings::test_values(None, "none", "127.0.0.1:1", 0, 0, None, Some("21m")),
+            Verbosity::Quiet
         )
         .unwrap_err()
         .to_string()
@@ -2492,7 +2662,8 @@ mod tests {
 
     #[test]
     fn cli_band_flag_typo_is_a_hard_error() {
-        let err = cli_frequency_evidence(None, Some("21m")).unwrap_err();
+        let err =
+            cli_frequency_evidence(None, Some("21m"), "--frequency-hz", "--band").unwrap_err();
         assert!(
             err.to_string().contains("expected an amateur band label"),
             "{err}"
@@ -2502,9 +2673,13 @@ mod tests {
 
     #[test]
     fn cli_frequency_band_contradiction_is_a_hard_error() {
-        let err = cli_frequency_evidence(Some(14_074_000), Some("2m")).unwrap_err();
+        let err = cli_frequency_evidence(Some(14_074_000), Some("2m"), "--frequency-hz", "--band")
+            .unwrap_err();
         assert!(err.to_string().contains("lies outside band"), "{err}");
-        assert!(cli_frequency_evidence(Some(144_500_000), Some("2m")).is_ok());
+        assert!(
+            cli_frequency_evidence(Some(144_500_000), Some("2m"), "--frequency-hz", "--band")
+                .is_ok()
+        );
     }
 
     #[cfg(feature = "cpal-backend")]
@@ -2539,14 +2714,7 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
-            "rigctld-typo",
-            "127.0.0.1:1",
-            0,
-            0,
-            None,
-            None,
+            &RigSettings::test_values(None, "rigctld-typo", "127.0.0.1:1", 0, 0, None, None),
             Verbosity::Quiet,
         )
         .unwrap_err();
@@ -2561,17 +2729,15 @@ mod tests {
     fn test_cli_parses_frequency_flags_on_tx_and_tune() {
         let cli = Cli::parse_from(["coppa", "tx", "hi", "--frequency-hz", "144500000"]);
         match cli.command {
-            Some(Commands::Tx {
-                frequency_hz, band, ..
-            }) => {
-                assert_eq!(frequency_hz, Some(144_500_000));
-                assert_eq!(band, None);
+            Some(Commands::Tx { rig, .. }) => {
+                assert_eq!(rig.frequency_hz, Some(144_500_000));
+                assert_eq!(rig.band, None);
             }
             _ => panic!("expected Tx command"),
         }
         let cli = Cli::parse_from(["coppa", "tune", "--band", "2m"]);
         match cli.command {
-            Some(Commands::Tune { band, .. }) => assert_eq!(band.as_deref(), Some("2m")),
+            Some(Commands::Tune { rig, .. }) => assert_eq!(rig.band.as_deref(), Some("2m")),
             _ => panic!("expected Tune command"),
         }
     }
@@ -2586,14 +2752,7 @@ mod tests {
             None,
             Some("VHF_FAST"),
             None,
-            None,
-            None,
-            "none",
-            "127.0.0.1:1",
-            0,
-            0,
-            None,
-            None,
+            &RigSettings::test_values(None, "none", "127.0.0.1:1", 0, 0, None, None),
             Verbosity::Quiet,
         )
         .unwrap_err();
@@ -2605,26 +2764,20 @@ mod tests {
             Some(path.to_str().unwrap()),
             Some("VHF_FAST"),
             None,
-            None,
-            None,
-            "none",
-            "127.0.0.1:1",
-            0,
-            0,
-            None,
-            None,
+            &RigSettings::test_values(None, "none", "127.0.0.1:1", 0, 0, None, None),
             Verbosity::Quiet,
         )
         .unwrap();
         std::fs::remove_file(&path).ok();
     }
 
-    /// Task 4 (Phase 4): `cmd_rx`'s `--input` path now streams through
-    /// `CoppaCore::push_samples` in chunks (rather than a single batch
-    /// `core.decode()` call) -- a round-trip smoke test that this still
-    /// decodes cleanly end-to-end (content is checked separately by the
-    /// dedicated `tests/rx_golden.rs` integration test, which asserts on
-    /// actual printed hex; this just proves `cmd_rx` doesn't error).
+    /// `cmd_rx`'s `--input` path streams through `CoppaCore::push_samples`
+    /// in chunks (not a batch `core.decode()` call). This only proves that a
+    /// freshly encoded WAV runs through `cmd_rx` without an error; what it
+    /// prints is asserted by the integration tests, which run the real
+    /// binary: `tests/rx_golden.rs` (`--raw` hex per golden vector),
+    /// `tests/rx_text.rs` (text vs. hex) and `tests/rx_one_receiver.rs`
+    /// (FILE, `--duration`, `--callsign` and the `listen` alias).
     #[test]
     fn test_rx_streams_encoded_wav_file() {
         #[cfg(feature = "file-backend")]
@@ -2637,21 +2790,285 @@ mod tests {
                 Some(path_str),
                 None,
                 None,
-                None,
-                None,
-                "none",
-                "127.0.0.1:4532",
-                50,
-                200,
-                None,
-                None,
+                &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
                 Verbosity::Quiet,
             )
             .expect("tx to file should succeed");
 
-            let result = cmd_rx(Some(path_str), None, true, false, None, Verbosity::Quiet);
+            let args = RxArgs {
+                input: Some(path_str.into()),
+                raw: true,
+                ..Default::default()
+            };
+            let result = cmd_rx(&args, Verbosity::Quiet);
             std::fs::remove_file(&path).ok();
             result.expect("streaming rx of a freshly-encoded WAV should succeed");
         }
+    }
+
+    // COP-56: one receiver. `rx` takes a bare path, `--duration` and
+    // `--callsign`; `listen` is a hidden alias parsing the same `RxArgs`.
+
+    #[test]
+    fn rx_parses_bare_path_duration_and_callsign() {
+        let cli = Cli::parse_from([
+            "coppa",
+            "rx",
+            "x.wav",
+            "-d",
+            "5",
+            "--callsign",
+            "VK2ABC",
+            "--raw",
+            "--hex",
+            "--profile",
+            "HF_ROBUST",
+            "--device",
+            "Mic",
+        ]);
+        let Some(Commands::Rx(args)) = cli.command else {
+            panic!("expected Rx")
+        };
+        assert_eq!(args.path(), Some("x.wav"));
+        assert_eq!(args.duration, 5);
+        assert_eq!(args.callsign.as_deref(), Some("VK2ABC"));
+        assert!(args.raw && args.hex);
+        assert_eq!(args.profile.as_deref(), Some("HF_ROBUST"));
+        assert_eq!(args.device.as_deref(), Some("Mic"));
+
+        let cli = Cli::parse_from(["coppa", "rx", "-i", "y.wav"]);
+        let Some(Commands::Rx(args)) = cli.command else {
+            panic!("expected Rx")
+        };
+        assert_eq!(args.path(), Some("y.wav"));
+        assert_eq!(args.duration, 0);
+    }
+
+    #[test]
+    fn rx_rejects_a_path_and_input_together() {
+        let err = Cli::try_parse_from(["coppa", "rx", "a.wav", "-i", "b.wav"])
+            .err()
+            .expect("FILE and -i together must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn global_verbosity_flags_count_and_conflict() {
+        for (flags, count) in [
+            (vec!["-v"], 1),
+            (vec!["-vv"], 2),
+            (vec!["-vvv"], 3),
+            (vec!["--verbose", "--verbose"], 2),
+            (vec!["-v", "--verbose"], 2),
+        ] {
+            for before_command in [true, false] {
+                let mut argv = vec!["coppa"];
+                if before_command {
+                    argv.extend(&flags);
+                }
+                argv.push("devices");
+                if !before_command {
+                    argv.extend(&flags);
+                }
+                assert_eq!(Cli::try_parse_from(argv).unwrap().verbose, count);
+            }
+        }
+        for flag in ["-q", "--quiet"] {
+            assert!(
+                Cli::try_parse_from(["coppa", flag, "devices"])
+                    .unwrap()
+                    .quiet
+            );
+            assert!(
+                Cli::try_parse_from(["coppa", "devices", flag])
+                    .unwrap()
+                    .quiet
+            );
+        }
+        for args in [
+            vec!["coppa", "-q", "-v", "devices"],
+            vec!["coppa", "--quiet", "--verbose", "devices"],
+            vec!["coppa", "--verbose", "--quiet", "devices"],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(args).err().unwrap().kind(),
+                clap::error::ErrorKind::ArgumentConflict
+            );
+        }
+    }
+
+    #[test]
+    fn file_sample_limit_honours_duration() {
+        assert_eq!(file_sample_limit(179_040, 0, 48_000), 179_040);
+        assert_eq!(file_sample_limit(179_040, 2, 48_000), 96_000);
+        assert_eq!(file_sample_limit(179_040, 60, 48_000), 179_040);
+        assert_eq!(file_sample_limit(100, u64::MAX, 48_000), 100);
+    }
+
+    #[test]
+    fn live_deadline_is_none_for_zero_and_overflow() {
+        let now = std::time::Instant::now();
+        assert_eq!(live_deadline(now, 0), None);
+        assert_eq!(live_deadline(now, u64::MAX), None);
+        assert_eq!(
+            live_deadline(now, 5),
+            Some(now + std::time::Duration::from_secs(5))
+        );
+    }
+
+    /// A live source with no audio yet: every read returns 0 samples.
+    struct Stalled;
+
+    impl coppa_audio::AudioSource for Stalled {
+        fn read(&mut self, _buf: &mut [f32]) -> Result<usize> {
+            Ok(0)
+        }
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A busy live source: every read fills the whole buffer with silence.
+    struct Endless;
+
+    impl coppa_audio::AudioSource for Endless {
+        fn read(&mut self, buf: &mut [f32]) -> Result<usize> {
+            buf.fill(0.0);
+            Ok(buf.len())
+        }
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Like `Endless`, but counts the samples it hands out.
+    #[derive(Default)]
+    struct Counting {
+        handed_out: usize,
+    }
+
+    impl coppa_audio::AudioSource for Counting {
+        fn read(&mut self, buf: &mut [f32]) -> Result<usize> {
+            buf.fill(0.0);
+            self.handed_out += buf.len();
+            Ok(buf.len())
+        }
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stream_decode_stops_a_stalled_live_source_at_its_deadline() {
+        let start = std::time::Instant::now();
+        let deadline = Some(start + std::time::Duration::from_millis(100));
+        stream_decode(
+            &mut CoppaCore::new(),
+            &mut Stalled,
+            None,
+            deadline,
+            RxOutputMode::Text { hex: false },
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(100),
+            "{elapsed:?}"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    #[test]
+    fn stream_decode_stops_a_streaming_live_source_at_its_deadline() {
+        let start = std::time::Instant::now();
+        let deadline = Some(start + std::time::Duration::from_millis(100));
+        stream_decode(
+            &mut CoppaCore::new(),
+            &mut Endless,
+            None,
+            deadline,
+            RxOutputMode::Text { hex: false },
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(100),
+            "{elapsed:?}"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    #[test]
+    fn stream_decode_reads_no_further_than_its_sample_limit() {
+        let mut source = Counting::default();
+        stream_decode(
+            &mut CoppaCore::new(),
+            &mut source,
+            Some(10_000),
+            None,
+            RxOutputMode::Raw,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        assert_eq!(source.handed_out, 10_000);
+    }
+
+    #[test]
+    fn listen_parses_into_the_same_args_as_rx() {
+        let flags = [
+            "x.wav",
+            "-d",
+            "5",
+            "--callsign",
+            "VK2ABC",
+            "--raw",
+            "--hex",
+            "--profile",
+            "HF_ROBUST",
+            "--device",
+            "Mic",
+        ];
+        let parse = |sub: &str| Cli::parse_from(["coppa", sub].into_iter().chain(flags)).command;
+        let Some(Commands::Rx(rx)) = parse("rx") else {
+            panic!("expected Rx")
+        };
+        let Some(Commands::Listen(listen)) = parse("listen") else {
+            panic!("expected Listen")
+        };
+        assert_eq!(rx, listen);
+    }
+
+    #[test]
+    fn top_level_help_hides_listen() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_help().to_string();
+        assert!(
+            !help.lines().any(|l| l.trim_start().starts_with("listen")),
+            "{help}"
+        );
+        assert!(
+            help.lines().any(|l| l.trim_start().starts_with("rx ")),
+            "{help}"
+        );
     }
 }

@@ -37,8 +37,13 @@ pub enum VaraResponse {
     Wrong,
     /// VARA version string.
     Version(String),
-    /// Connection pending.
+    /// A remote station's connect request was accepted and the handshake
+    /// is under way (pushed by a listening station, not a reply to an
+    /// outbound `CONNECT`). Followed by `CONNECTED` or `CANCELPENDING`.
     Pending,
+    /// The inbound handshake a `PENDING` announced ended without
+    /// `CONNECTED`.
+    CancelPending,
     /// Connected to remote station: the calling station, the called station,
     /// and the occupied bandwidth in Hz.
     Connected(String, String, u32),
@@ -119,6 +124,7 @@ impl VaraResponse {
             VaraResponse::Wrong => "WRONG\r".to_string(),
             VaraResponse::Version(v) => format!("VERSION {}\r", v),
             VaraResponse::Pending => "PENDING\r".to_string(),
+            VaraResponse::CancelPending => "CANCELPENDING\r".to_string(),
             VaraResponse::Connected(src, dst, bw) => {
                 format!("CONNECTED {} {} {}\r", src, dst, bw)
             }
@@ -135,6 +141,14 @@ impl VaraResponse {
     /// `VERSION` command.
     pub fn coppa_version() -> Self {
         VaraResponse::Version(concat!("Coppa ", env!("CARGO_PKG_VERSION")).to_string())
+    }
+
+    /// True for the telemetry lines a client may miss: `BUSY` and `SNR`. The
+    /// next change sends a fresh value; until one does, a client that missed a
+    /// line holds the stale one. Every other line is a state change or a
+    /// reply, and must reach the client or end its connection.
+    pub fn is_disposable(&self) -> bool {
+        matches!(self, VaraResponse::Busy(_) | VaraResponse::Snr(_))
     }
 }
 
@@ -208,6 +222,7 @@ mod tests {
             "VERSION Coppa 0.1.0\r"
         );
         assert_eq!(VaraResponse::Pending.format(), "PENDING\r");
+        assert_eq!(VaraResponse::CancelPending.format(), "CANCELPENDING\r");
         assert_eq!(
             VaraResponse::Connected("VK2ABC".to_string(), "VK3DEF".to_string(), 2400).format(),
             "CONNECTED VK2ABC VK3DEF 2400\r"

@@ -13,14 +13,15 @@ Open-source ham radio digital communications system written in Rust.
 | Modulation and speed levels | Implemented | Nine levels, 1–9, using BPSK, QPSK, 8PSK, 16-QAM and 64-QAM on OFDM carriers; HF supports 1–8, and level 9 is VHF-only |
 | Payload FEC | Implemented | One NR BG2 LDPC mother code with per-level shortening and rate matching |
 | Frame protection | Implemented | Golay-protected header with CRC-16; CRC-32 for each payload codeword |
-| ARQ and protocol stack | Implemented, opt-in ARQ | Selective-repeat ARQ, session management and optional Huffman + LZ4 compression; daemon ARQ defaults off |
+| ARQ and protocol stack | Implemented | Selective-repeat ARQ, session management and optional Huffman + LZ4 compression; connected-session data is always acknowledged and retransmitted (stop-and-wait); sessionless ARQ (`arq_enabled`) defaults off |
 | CLI | Implemented | Loopback and WAV transmit/receive; live audio requires `cpal-backend` |
 | Daemon event loop | Implemented | Processes audio and host events; live audio requires `cpal-backend` |
-| VARA-style TCP interface | Implemented, opt-in | Control/data ports default to 8300/8301; server disabled by default; not RF-compatible with VARA |
+| VARA-style TCP interface | Implemented, opt-in | Control/data ports default to 8300/8301; server disabled by default; not RF-compatible with VARA; verified with Pat (Winlink) — see [docs/PAT.md](docs/PAT.md) |
 | C FFI | Implemented | Shared/static library with one-shot encode/decode and streaming decode |
 | Operating profiles | Implemented | 48 kHz OFDM profiles with runtime speed-level selection within the configured band |
 | Link adaptation | Implemented, limited calibration | Measurement-driven speed selection and ACK-driven RateLoop with ARQ enabled; no model inference; performance targets remain unmet, see [BENCHMARKS.md](BENCHMARKS.md) |
 | Serial/GPIO PTT | Implemented, feature-gated | Daemon serial DTR/RTS uses `serial-ptt`; Linux sysfs GPIO uses `gpio-ptt` |
+| KISS TNC (AFSK 1200) | Implemented, bring-up and testing only | Needs the kiss-tnc and cpal-backend features; not a Direwolf replacement; see [docs/TNC.md](docs/TNC.md) |
 | IR-HARQ | Unwired codec primitive | Redundancy-version and combining support exists in the codec; engine/daemon retransmissions do not wire it into an operational IR-HARQ feature |
 | VARA RF/waveform compatibility | Not supported | The TCP control interface is VARA-style; Coppa does not interoperate with VARA over RF |
 
@@ -29,7 +30,7 @@ Open-source ham radio digital communications system written in Rust.
 - OFDM encode/decode with pilot-based channel estimation, channel equalization and streaming receive.
 - Nine speed levels using OFDM carrier constellations from BPSK through 64-QAM; levels 1–8 on HF and 1–9 on VHF.
 - NR BG2 LDPC payload coding with shortening, rate matching and interleaving; Golay and CRC-16 header protection, plus per-codeword CRC-32 payload checks.
-- Selective-repeat ARQ and session management, with optional Huffman + LZ4 compression. Daemon ARQ is disabled by default.
+- Selective-repeat ARQ and session management, with optional Huffman + LZ4 compression. Connected-session data is always acknowledged and retransmitted; sessionless ARQ is disabled by default.
 - WAV file I/O and live CPAL audio with `cpal-backend`; daemon serial and Linux GPIO PTT with their respective feature flags.
 - VARA-style TCP command/data interface for host applications, disabled by default and not RF-compatible with VARA.
 - C FFI shared/static library with one-shot encode/decode and streaming decode.
@@ -55,17 +56,52 @@ coppa tx "CQ CQ CQ DE VK2ABC K" -o cq.wav
 coppa tx "CQ CQ CQ DE VK2ABC K" --level 4 -o cq.wav
 
 # Decode a WAV file (prints the message text)
-coppa rx -i cq.wav
+coppa rx cq.wav
+
+# Stream one JSON object per decoded frame (pipe into a JSON-lines consumer)
+coppa rx cq.wav --json | jq -c .
 
 # Show the decoded payload as hex bytes instead (--raw: hex only, for scripts)
-coppa rx -i cq.wav --hex
+coppa rx cq.wav --hex
+
+# Receive live from the default input device for 60 seconds (requires cpal-backend)
+coppa rx --duration 60
 
 # List audio devices (requires cpal-backend feature)
 coppa devices
+coppa devices --json
 
-# Show the speed levels and named profiles
+# Show the speed levels and named profiles (add --json for machine-readable output)
 coppa profiles
+coppa profiles --level 4
+coppa profiles --json
+coppa profiles -p HF_STANDARD --json
+
+# Suppress status output, or repeat -v for frame metrics on stderr
+coppa -q rx cq.wav
+coppa -vv rx cq.wav
 ```
+
+`coppa` can keep callsign, profile, audio device and rig settings in the same `coppad.toml` as the daemon, with `COPPA_*` environment and flag overrides; see [CLI settings](docs/tutorials/getting-started.md#persisting-your-cli-settings).
+
+`rx --json` writes newline-delimited objects with `payload_text` and exact
+`payload_hex` bytes. `payload_text` is `null` for binary payloads. Diagnostics
+go to stderr. `--json` conflicts with `--raw` and `--hex`; `-q`/`--quiet`
+conflicts with `-v`/`--verbose`. `devices --json` and `profiles --json` write
+arrays; `profiles -p NAME --json` and `profiles --level N --json` write one
+object. `config` is a deprecated alias for `profiles` and accepts the same
+flags; `listen` is a deprecated alias for `rx` and accepts the same flags.
+
+## KISS TNC (AFSK 1200)
+
+`coppa tnc` runs a 1200-baud AFSK (Bell 202) AX.25 TNC behind a KISS TCP port. Use it for
+KISS bring-up and testing: checking that a KISS client, your audio routing and your PTT reach
+coppa. It is not a Direwolf replacement. It has no AGWPE interface, no channel-busy check (it
+ignores KISS TXDELAY, persistence and slot time), no digipeating or beaconing, and runs only at
+1200 baud. That parity work is planned as H-122 in the
+[2026-09-05 product review](docs/reviews/2026-09-05-product-ux-market-review.md).
+
+[docs/TNC.md](docs/TNC.md) covers building it and a demo that runs two TNCs on one Linux machine.
 
 ## Workspace Crates
 

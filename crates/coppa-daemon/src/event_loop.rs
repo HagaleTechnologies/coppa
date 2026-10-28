@@ -4,9 +4,12 @@
 
 use anyhow::Result;
 use coppa_audio::{AudioRingConsumer, AudioRingProducer};
-use coppa_engine::CoppaCore;
-use coppa_host::vara::{VaraCommand, VaraResponse};
-use coppa_host::HostEvent;
+use coppa_engine::{CoppaCore, OfdmBand};
+use coppa_host::vara::{
+    queue_data, queue_response, DataQueued, Queued, VaraCommand, VaraResponse, COMMAND_QUEUE_DEPTH,
+    DATA_QUEUE_DEPTH,
+};
+use coppa_host::{HostEvent, HostResponse};
 use coppa_ml::CpRecommendation;
 use coppa_ml::{BusyGate, CpGate, RateLoop};
 use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx};
@@ -14,7 +17,7 @@ use coppa_protocol::cp_negotiator::{ContentAction, CpMode, CpNegotiator};
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu, StationIdPayload};
 use coppa_protocol::modem::max_payload_for_level;
 use coppa_protocol::session::{LinkCapabilities, SessionManager, SessionState};
-use coppa_protocol::transport::{TransportPdu, TransportType};
+use coppa_protocol::transport::{TransportPdu, TransportType, TRANSPORT_HEADER_SIZE};
 use coppa_radio::band::{self, FrequencyConfig, FrequencyEvidence, GateRefusal};
 use coppa_radio::{NullPtt, PttBackend, PttControl, PttState};
 use rand::RngExt;
@@ -29,15 +32,111 @@ use crate::audio_output::{
     TxOutput, PROGRESS_TICK,
 };
 use crate::config::DaemonConfig;
+use crate::level_meter::{self, LevelReading, LevelState, RxLevelMeter};
+use crate::tx_chunker::{chunk_to_fit, next_chunk_len};
 
 /// Map of connected VARA command-port clients' response senders
 /// (`VaraServer::response_senders()`), used to broadcast `VaraResponse` telemetry.
 type VaraResponseSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<VaraResponse>>>>;
 
+/// Map of connected VARA data-port clients' data senders
+/// (`VaraServer::data_senders()`), used by [`forward_data_out`].
+pub type VaraDataSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>;
+
 /// How often every command-port client hears `IAMALIVE`. VARA sends it every
 /// 60 s; Pat closes the modem after 2 minutes without a line, and vARIM after
 /// 300 s.
 const VARA_KEEPALIVE_PERIOD: Duration = Duration::from_secs(60);
+
+/// COP-31: how far past `max_tx_duration_s` a keyed interval may run before
+/// the main loop forces PTT off itself. The normal release path ends every
+/// keyed interval by `max_tx_duration_s` (its tail is capped to what remains),
+/// so this only fires when that path has failed, e.g. the completion task
+/// in `transmit_samples` panicked before reporting.
+const PTT_BACKSTOP_GRACE: Duration = Duration::from_secs(2);
+
+/// COP-37: what every transmit path logs, at `ERROR`, when it refuses
+/// because no valid local callsign is in force (`local_callsign` is `None`).
+const NO_CALLSIGN_TX_REFUSAL: &str = "Transmission refused: no valid local callsign; \
+     set [engine] callsign or MYCALL before transmitting";
+
+/// How often `wait_for_rx_turnaround` drains the input ring: `run()`'s
+/// `audio_poll` cadence, so the ring never fills during the hold.
+const TURNAROUND_POLL: Duration = Duration::from_millis(20);
+
+/// Smallest one-codeword payload budget on the whole speed ladder (COP-41,
+/// D4), derived rather than hardcoded: `min(max_payload_for_level(l))` for
+/// `l` in 1..=9. ARQ chunks are sized against THIS, not the current level,
+/// because `check_arq_retransmits`/`try_drain_tx_queue` re-encode a segment
+/// at whatever level is current *later* -- `RateLoop`'s drop-fast hysteresis
+/// makes mid-stream rate drops ordinary, and a segment that no longer fits
+/// is permanently stuck (COP-30: spent segments are never evicted). Today
+/// this is level 1's 56 bytes (`k_used` 486/8 - 4); the derivation keeps
+/// that true by construction if the ladder ever changes.
+fn min_level_budget() -> usize {
+    (1..=9)
+        .filter_map(max_payload_for_level)
+        .min()
+        .expect("every wire level 1..=9 has a payload budget (speed_levels.rs)")
+}
+
+/// COP-38 (D4): connected-session data runs stop-and-wait. One ACK per frame
+/// and a receive-side-only turnaround hold (docs/OPERATING.md, "Half-duplex
+/// turnaround") make a second in-flight frame collide with the peer's ACK.
+const SESSION_ARQ_WINDOW: u8 = 1;
+
+/// COP-38 (D2): the established session's reliable-delivery state. One per
+/// `EventLoop`: every daemon caller treats the session link as singular.
+struct SessionLink {
+    /// The `SessionManager` slot the link belongs to. Slots are reused, so a
+    /// session's end drops its link (`discard_session_tx`) rather than leave
+    /// it for whichever session takes the slot next.
+    session_id: u8,
+    remote: Callsign,
+    local: Callsign,
+    ssid: u8,
+    tx: ArqTx,
+    rx: ArqRx,
+    /// Host bytes not yet cut into a segment. Chunked at drain time with the
+    /// exact seq that will carry them (D5).
+    backlog: VecDeque<u8>,
+    /// Armed once the in-flight segment has used its last retransmission;
+    /// the link fails if no ACK arrives by then (D7).
+    give_up_at: Option<Instant>,
+    /// One warning per link for a payload that is not a reliable
+    /// `TransportPdu`, i.e. a pre-0.3.0 peer (D3).
+    warned_legacy_payload: bool,
+}
+
+/// COP-38 (D3): one session data frame. The ACK fields stay zero so a
+/// retransmission is byte-identical and keeps the size `next_chunk_len`
+/// measured; the transport `session_id` is 0 because session ids are local
+/// slot numbers that differ between the two stations.
+fn session_data_frame(link: &SessionLink, seq: u8, data: &[u8]) -> Vec<u8> {
+    let segment = TransportPdu::new_reliable(0, seq, 0, data.to_vec());
+    MacPdu::new_data(
+        link.remote.clone(),
+        link.local.clone(),
+        link.ssid,
+        segment.to_bytes(),
+    )
+    .to_bytes()
+}
+
+/// COP-38 (D3): the session ACK frame for everything `link.rx` holds, a MAC
+/// `Ack` frame carrying a transport ACK.
+fn session_ack_frame(link: &SessionLink) -> Vec<u8> {
+    let (ack_num, bitmap) = link.rx.ack_info();
+    let ack = TransportPdu::new_ack(0, ack_num, bitmap);
+    MacPdu::new(
+        MacFrameType::Ack,
+        link.remote.clone(),
+        link.local.clone(),
+        link.ssid,
+        ack.to_bytes(),
+    )
+    .to_bytes()
+}
 
 /// The reply a VARA command-port client gets for one command, decided before
 /// the command takes effect. `WRONG` is only for lines coppa does not
@@ -49,11 +148,15 @@ const VARA_KEEPALIVE_PERIOD: Duration = Duration::from_secs(60);
 ///
 /// - `MYCALL <call>` valid → `OK` (the daemon applies it as the runtime
 ///   callsign); invalid or missing → `WRONG`.
-/// - `LISTEN ON`/`LISTEN OFF` → `OK`; any other argument → `WRONG`.
-/// - `TUNE [seconds]` (coppa extension) → `OK`.
+/// - `LISTEN ON`/`LISTEN OFF` → `OK`; any other argument → `WRONG`. While
+///   listening, an inbound connect attempt the daemon answers then pushes
+///   `PENDING`, and the attempt ends in `CONNECTED` or `CANCELPENDING`.
+/// - `TUNE [seconds]` (coppa extension) → `OK`, even when the tone itself is
+///   then refused for want of a callsign (`transmit_samples` logs why).
 /// - `CONNECT <src> <dst>` → `OK` (then the eventual `CONNECTED`/`DISCONNECTED`
 ///   outcome); fewer than two callsigns → `WRONG`.
-/// - `DISCONNECT` → `OK` (then `DISCONNECTED` if a session existed).
+/// - `DISCONNECT` → `OK` (then `DISCONNECTED` if a session existed,
+///   preceded by `CANCELPENDING` when it was a pending inbound one).
 /// - `VERSION` → a `VERSION Coppa <pkg version>` line, never `OK`.
 /// - `COMPRESSION …`, `BW500`, `BW2300`, `BW2750`, `ABORT` → `OK`: accepted,
 ///   not implemented (matches VARA's own replies to commands Pat sends every
@@ -76,11 +179,84 @@ fn vara_reply(command: &VaraCommand) -> VaraResponse {
     }
 }
 
-/// Send `response` to every client in `senders`, dropping it for any whose
-/// queue is full.
+/// Queue `response` for one command-port client without waiting
+/// (`queue_response`). Returns `false` when a line that must not be dropped
+/// finds the client's queue full: the client has stopped reading, and the
+/// caller removes its sender, which closes its connection once the queued
+/// lines are written. The client gets every line up to that point, then EOF,
+/// never a gap on an open connection.
+fn queue_for_client(
+    client_id: u32,
+    tx: &mpsc::Sender<VaraResponse>,
+    response: VaraResponse,
+) -> bool {
+    match queue_response(tx, response) {
+        Queued::Overflow(line) => {
+            tracing::warn!(
+                client_id,
+                line = line.format().trim_end(),
+                depth = COMMAND_QUEUE_DEPTH,
+                "VARA command-port client is not reading; disconnecting it"
+            );
+            false
+        }
+        Queued::Sent | Queued::Dropped | Queued::Closed => true,
+    }
+}
+
+/// Queue `response` for every client in `senders` without waiting. `BUSY` and
+/// `SNR` may be dropped for a client that is falling behind; any other line
+/// that does not fit disconnects that client (`queue_for_client`).
 async fn broadcast_vara(senders: &VaraResponseSenders, response: VaraResponse) {
-    for tx in senders.lock().await.values() {
-        let _ = tx.try_send(response.clone());
+    senders
+        .lock()
+        .await
+        .retain(|&id, tx| queue_for_client(id, tx, response.clone()));
+}
+
+/// Queue `data` for one data-port client without waiting (`queue_data`).
+/// Returns `false` when the payload finds the client's queue full: the client
+/// has stopped reading, and the caller removes its sender, which closes its
+/// connection once the queued payloads are written. The client gets every
+/// payload up to that point, then EOF, never a gap on an open connection.
+fn queue_data_for_client(client_id: u32, tx: &mpsc::Sender<Vec<u8>>, data: Vec<u8>) -> bool {
+    match queue_data(tx, data) {
+        DataQueued::Overflow(data) => {
+            tracing::warn!(
+                client_id,
+                bytes = data.len(),
+                depth = DATA_QUEUE_DEPTH,
+                "VARA data-port client is not reading; disconnecting it"
+            );
+            false
+        }
+        DataQueued::Sent | DataQueued::Closed => true,
+    }
+}
+
+/// Forward every decoded payload the event loop sends on `responses` to the
+/// data-port clients in `senders`: a `client_id` of 0 goes to every client,
+/// any other to that client alone. It never waits on a client, so one host
+/// that stops reading holds up neither the other clients nor the event
+/// loop's queue; that host is disconnected instead (`queue_data_for_client`).
+/// Returns when every sender for `responses` is dropped.
+pub async fn forward_data_out(
+    mut responses: mpsc::UnboundedReceiver<HostResponse>,
+    senders: VaraDataSenders,
+) {
+    while let Some(response) = responses.recv().await {
+        // StatusUpdate is deliberately not forwarded: EventLoop::notify_session
+        // pushes session state directly to the command port and WebSocket.
+        if let HostResponse::DataOut { client_id, data } = response {
+            let mut senders = senders.lock().await;
+            if client_id == 0 {
+                senders.retain(|&id, tx| queue_data_for_client(id, tx, data.clone()));
+            } else if let Some(tx) = senders.get(&client_id) {
+                if !queue_data_for_client(client_id, tx, data) {
+                    senders.remove(&client_id);
+                }
+            }
+        }
     }
 }
 
@@ -112,6 +288,12 @@ enum SessionNotice {
     },
     /// A session ended or a connect attempt failed.
     Disconnected,
+    /// COP-44: a remote station's CONNECT_REQ was accepted; the handshake
+    /// waits for its CONNECT_CFM.
+    Pending,
+    /// COP-44: the inbound handshake `Pending` announced ended without
+    /// `Connected`.
+    PendingCancelled,
 }
 
 /// Event types flowing through the daemon event loop.
@@ -144,6 +326,33 @@ fn lock_tx_output(tx_output: &std::sync::Mutex<TxOutput>) -> std::sync::MutexGua
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Log an RX level state change (COP-65): a WARN naming the fix on entering
+/// `Clipping` or `Underdrive`, an INFO on recovery. dB fields go through
+/// `level_meter::round_db`, as the WebSocket message does, so logs and wire
+/// always show the same number.
+fn log_rx_level_transition(state: LevelState, reading: &LevelReading) {
+    let msg = level_meter::rx_transition_message(state, reading);
+    let peak_dbfs = level_meter::round_db(reading.peak_dbfs);
+    let rms_dbfs = level_meter::round_db(reading.rms_dbfs);
+    match state {
+        LevelState::Clipping => tracing::warn!(
+            peak_dbfs,
+            rms_dbfs,
+            clipped_percent = level_meter::round_db(reading.clip_fraction * 100.0),
+            "{msg}"
+        ),
+        LevelState::Underdrive if reading.rms_dbfs <= level_meter::SILENCE_FLOOR_DBFS => {
+            tracing::warn!(rms_dbfs, "{msg}")
+        }
+        LevelState::Underdrive => tracing::warn!(
+            rms_dbfs,
+            threshold_dbfs = level_meter::UNDERDRIVE_RMS_DBFS,
+            "{msg}"
+        ),
+        LevelState::Ok => tracing::info!(peak_dbfs, rms_dbfs, "{msg}"),
+    }
+}
+
 /// The main daemon event loop.
 pub struct EventLoop {
     config: DaemonConfig,
@@ -161,6 +370,17 @@ pub struct EventLoop {
     /// connected rigctld client so the wideband gate can read the rig's dial
     /// frequency (COP-40).
     ptt: PttBackend,
+    /// COP-31: the out-of-process PTT guardian, told about every PTT
+    /// transition from `set_ptt` (rigctld/GPIO PTT only; `None` otherwise).
+    /// Declared immediately after `ptt` on purpose: fields drop in
+    /// declaration order, so the backend's own `Drop` release runs first and
+    /// only then does the guardian see EOF on its stdin.
+    ptt_guardian: Option<crate::ptt_guardian::PttGuardian>,
+    /// COP-32: degraded-startup conditions `coppad` reports in place of
+    /// "Daemon ready". See [`EventLoop::startup_problems`].
+    startup_problems: Vec<String>,
+    /// COP-50: PTT as startup left it, for the startup log.
+    ptt_startup: crate::startup_report::PttStartup,
     /// COP-40: the operator-stated frequency source (`[radio] frequency_hz`
     /// / `band`), validated at startup -- the fallback evidence the
     /// wideband gate in `transmit_samples` uses when no live rigctld answer
@@ -171,8 +391,15 @@ pub struct EventLoop {
     /// while it is set, so held payloads go out once the rig is back on a
     /// legal frequency instead of waiting for the next host enqueue.
     tx_held_by_frequency_gate: bool,
+    /// COP-41: `tx_held_by_frequency_gate`'s counterpart for the session
+    /// link's backlog (COP-38), set by `drain_session_link` and retried by
+    /// the same poll.
+    session_tx_held_by_frequency_gate: bool,
     /// Optional sender for host responses (decoded data, status updates).
-    response_tx: Option<mpsc::Sender<coppa_host::HostResponse>>,
+    /// Unbounded so the event loop never waits on it and never drops a
+    /// decoded payload; its consumer (`forward_data_out`) never waits on a
+    /// client, so it holds only what was decoded since that consumer last ran.
+    response_tx: Option<mpsc::UnboundedSender<HostResponse>>,
     /// Playback progress from the audio output worker. `None` when no
     /// hardware output is wired (tests, headless builds), in which case PTT
     /// release falls back to the nominal audio duration.
@@ -189,6 +416,11 @@ pub struct EventLoop {
     /// shared by every transmission queued in it so the no-progress bound is
     /// not restarted by each newer job. Cleared whenever PTT is released.
     tx_stall_clock: Option<Arc<StallClock>>,
+    /// COP-31 test seam: when set, the completion task `transmit_samples`
+    /// spawns panics before sending its `TxComplete`, so the PTT backstop is
+    /// the only thing left that can release PTT.
+    #[cfg(test)]
+    panic_in_completion_task: bool,
     /// Last-seen value of the audio input ring's overflow counter (see
     /// `AudioRingConsumer::overflow_count`); `poll_audio_input` compares against
     /// this each poll and logs a warning when it grows (silent RX sample loss was
@@ -281,8 +513,27 @@ pub struct EventLoop {
     /// candidates). Its `None`-tagged entries count toward `BUFFER`
     /// telemetry; see `buffered_tx_bytes`.
     tx_queue: VecDeque<(Option<u8>, Vec<u8>)>,
+    /// The established session's reliable link (COP-38): host bytes waiting
+    /// to be cut into frames, the stop-and-wait `ArqTx`/`ArqRx` pair, and the
+    /// give-up deadline. `None` with no established session. Every
+    /// `HostEvent::DataReceived` on a live session appends to its backlog;
+    /// `drain_session_link` sends one frame at a time, and only after the
+    /// previous one is ACKed, so frames never form one long keyed blast the
+    /// 30 s `max_tx_duration_s` watchdog would cancel mid-message. Backlog
+    /// and unacknowledged bytes count toward `BUFFER`; see
+    /// `buffered_tx_bytes`.
+    session_link: Option<SessionLink>,
+    /// Host bytes waiting for ARQ window space (COP-41, D5): an event too
+    /// large for the 8-segment window is held here -- never dropped -- and
+    /// `pump_arq_backlog` moves it into window segments as ACKs free space.
+    /// Counted by `BUFFER` in the unit the host wrote; a byte that becomes
+    /// an ARQ segment keeps the sum unchanged (it moves between counted
+    /// terms), so the backlog->segment transition fires no spurious `BUFFER`
+    /// line.
+    arq_tx_backlog: VecDeque<u8>,
     /// Host payload bytes handed to `transmit_samples` on a path with no ACK
-    /// to wait for (the non-ARQ raw path and established-session data).
+    /// to wait for (the non-ARQ raw path; COP-38: established-session data
+    /// waits for its ACK instead and is never counted here).
     /// Cleared at PTT release (`set_ptt(false)`): by then every frame handed
     /// over earlier has played or been discarded. See `buffered_tx_bytes`.
     tx_on_air_bytes: usize,
@@ -292,11 +543,17 @@ pub struct EventLoop {
     /// Spectral-occupancy busy gate (decision 8: `BUSY ON`/`OFF` telemetry), fed
     /// raw incoming audio in `handle_audio_in`.
     busy_gate: BusyGate,
+    /// RX audio level meter (COP-65), fed raw incoming audio by
+    /// `observe_rx_level` from both raw RX taps; see that method's doc.
+    rx_level_meter: RxLevelMeter,
     /// Session manager for connected-mode operation.
     session_mgr: SessionManager,
     /// Local station callsign: `[engine] callsign` at startup, replaced by a
     /// valid command-port `MYCALL`. New sessions, station ID and beacons read
-    /// it. A session keeps the callsign it was set up with.
+    /// it. A session keeps the callsign it was set up with. COP-37: `None`
+    /// (empty or invalid config, no valid `MYCALL` yet) refuses every
+    /// transmission -- see `transmit_samples`. Nothing ever sets it back to
+    /// `None`, so a payload accepted for TX keeps its callsign.
     local_callsign: Option<Callsign>,
     /// How often `run()` sends `IAMALIVE` to every command-port client;
     /// `VARA_KEEPALIVE_PERIOD` outside tests.
@@ -311,23 +568,27 @@ pub struct EventLoop {
     tx_frame_count: usize,
     /// Maximum data frames per TX turn before yielding.
     max_frames_per_turn: usize,
-    /// Turnaround delay in ms between RX/TX switching.
-    #[allow(dead_code)] // enforcement deferred to real-world testing
-    turnaround_ms: u64,
-    /// Time of the last station-ID frame actually sent (or `EventLoop`
-    /// construction, if none yet). Compared against `[station_id]
-    /// id_interval_secs` in `id_due` -- see `transmit_samples`'s doc for why
-    /// an ID is only ever prepended to a real outgoing transmission, never
-    /// sent standalone on a bare timer (Phase 4 Task 3).
-    last_id_time: Instant,
+    /// COP-60: earliest instant this station may key PTT after the last frame
+    /// it decoded (`[radio] turnaround_ms` after that decode). The sender is
+    /// still keyed for its PTT tail after its last sample, so a reply keyed
+    /// sooner goes out while the peer is deaf. `None` until the first decode;
+    /// enforced by `wait_for_rx_turnaround`.
+    rx_turnaround_until: Option<tokio::time::Instant>,
+    /// Time of the last station-ID frame actually sent, or `None` if none
+    /// has been sent yet. Compared against `[station_id] id_interval_secs`
+    /// in `id_due`; `None` makes an ID due, so the first transmission after
+    /// startup identifies (COP-61). See `transmit_samples`'s doc for why an
+    /// ID is only ever prepended to a real outgoing transmission, never sent
+    /// standalone on a bare timer (Phase 4 Task 3).
+    last_id_time: Option<Instant>,
     /// Time of the last standalone beacon frame actually sent (or
     /// `EventLoop` construction, if none yet). Compared against
     /// `[station_id] beacon_interval_secs` in `maybe_send_beacon` (Phase 4
     /// Task 3).
     last_beacon_time: Instant,
     /// Raw audio samples read from the input ring by
-    /// `observe_busy_gate_from_audio_input` while `wait_for_clear_channel`
-    /// was blocked, already fed to `busy_gate.observe` there but not yet
+    /// `observe_busy_gate_from_audio_input` while `wait_for_clear_channel` or
+    /// `wait_for_rx_turnaround` was blocked, already fed to `busy_gate.observe` there but not yet
     /// decoded/dispatched. Flushed (decode-and-dispatch only, no repeat
     /// busy-gate observation) by the next `poll_audio_input` call from
     /// `run`'s main select loop -- see `observe_busy_gate_from_audio_input`'s
@@ -369,8 +630,36 @@ impl EventLoop {
             .frequency_config()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut ptt = Self::create_ptt(&config)?;
+        // COP-31: every backend assumes RX at construction; make the rig match, so
+        // a restart un-keys a transmitter an earlier run left keyed (and a Linux
+        // serial open's DTR assertion is undone). Before the frequency gate: even a
+        // refused start releases.
+        let release = ptt.set_ptt(PttState::Rx).map_err(|e| e.to_string());
+        if let Err(e) = &release {
+            tracing::warn!(
+                error = %e,
+                "Could not release PTT at startup; a transmitter left keyed by an earlier run may still be keyed"
+            );
+        }
+        // create_ptt has already parsed this; same error text if it ever fails.
+        let configured = config
+            .radio
+            .ptt_config()
+            .map_err(|e| anyhow::anyhow!("invalid [radio] ptt_method: {e}"))?;
+        let ptt_startup = crate::startup_report::PttStartup::new(
+            configured,
+            &config.radio.rigctld_address,
+            ptt.is_rigctld(),
+            release,
+        );
+        // COP-32: conditions the daemon runs through but must not call ready.
+        // COP-50: a backend that refused the release is one of them.
+        let startup_problems: Vec<String> = ptt_startup.problem().into_iter().collect();
 
-        // Create engine from profile; all profiles use 48kHz internally
+        // Create engine from profile; all profiles use 48kHz internally.
+        // coppad's run mode rejects an unknown profile name before this point
+        // (COP-36); the level-derived fallback is kept for direct constructors
+        // and tests.
         let engine =
             if let Some(profile) = coppa_engine::profiles::get_profile(&config.engine.profile) {
                 CoppaCore::from_profile(profile)
@@ -394,17 +683,17 @@ impl EventLoop {
                 Ok(cs) => Some(cs),
                 Err(e) => {
                     // A non-empty but unparseable callsign string leaves
-                    // `local_callsign` at `None`, which silently disables the
-                    // station-ID timer and beacon mode (both check
-                    // `local_callsign.is_some()`, not the raw config string --
-                    // see `id_due`/`maybe_send_beacon`). Warn once at startup
-                    // so this doesn't look like the feature is "on" per config
-                    // but never actually fires.
+                    // `local_callsign` at `None`, exactly like an empty one:
+                    // the daemon still starts and receives, but every
+                    // transmission is refused (COP-37, `transmit_samples`),
+                    // and with it station ID, beacons and connects. Warn
+                    // once at startup so the operator learns why before the
+                    // first refusal.
                     tracing::warn!(
                         callsign = %config.engine.callsign,
                         error = %e,
-                        "Invalid [engine] callsign; station ID/beacon and \
-                         connect handling will be unavailable"
+                        "Invalid [engine] callsign; transmission disabled until a \
+                         valid MYCALL is set"
                     );
                     None
                 }
@@ -412,6 +701,7 @@ impl EventLoop {
         };
 
         let busy_gate = BusyGate::new(config.audio.sample_rate as f32);
+        let rx_level_meter = RxLevelMeter::new(config.audio.sample_rate);
         #[cfg(feature = "websocket")]
         let spectrum_sensor = coppa_ml::SpectrumSensor::new(
             crate::spectrum::SPECTRUM_FFT_SIZE,
@@ -431,15 +721,7 @@ impl EventLoop {
         // current_level())`, even with probing disabled. `levels`/`raise_dwell`
         // still match `default_coppa()`'s own choices -- only the initial
         // level differs.
-        let rate_loop = RateLoop::new(engine.available_speed_levels(), 5, engine.speed_level());
-        let rate_loop = if config.engine.rate_loop_probe_interval > 0 {
-            rate_loop.with_probing(
-                config.engine.rate_loop_probe_interval,
-                config.engine.rate_loop_probe_offset,
-            )
-        } else {
-            rate_loop
-        };
+        let rate_loop = Self::build_rate_loop(&config, &engine, engine.speed_level());
 
         // Always constructed (cheap; mirrors RateLoop's own "hardcode the
         // hysteresis constants, only expose the interval/offset-equivalent
@@ -470,13 +752,19 @@ impl EventLoop {
             tx_output: Arc::new(std::sync::Mutex::new(TxOutput::default())),
             audio_in: None,
             ptt,
+            ptt_guardian: None,
+            startup_problems,
+            ptt_startup,
             radio_frequency,
             tx_held_by_frequency_gate: false,
+            session_tx_held_by_frequency_gate: false,
             response_tx: None,
             output_feedback: None,
             tx_generation: 0,
             tx_keyed_since: None,
             tx_stall_clock: None,
+            #[cfg(test)]
+            panic_in_completion_task: false,
             audio_in_overflow_count: 0,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             arq_tx,
@@ -498,9 +786,12 @@ impl EventLoop {
             ws_status: None,
             vara_responses: None,
             tx_queue: VecDeque::new(),
+            session_link: None,
+            arq_tx_backlog: VecDeque::new(),
             tx_on_air_bytes: 0,
             last_reported_buffer: 0,
             busy_gate,
+            rx_level_meter,
             session_mgr: SessionManager::new(),
             local_callsign,
             vara_keepalive_period: VARA_KEEPALIVE_PERIOD,
@@ -508,8 +799,8 @@ impl EventLoop {
             is_transmitting: false,
             tx_frame_count: 0,
             max_frames_per_turn: 4,
-            turnaround_ms: 500,
-            last_id_time: Instant::now(),
+            rx_turnaround_until: None,
+            last_id_time: None,
             last_beacon_time: Instant::now(),
             pending_busy_wait_audio: Vec::new(),
             #[cfg(feature = "websocket")]
@@ -529,14 +820,22 @@ impl EventLoop {
     /// typo'd or unbuilt backend. The one deliberate exception is
     /// `rigctld`'s *runtime connection* failure (address configured
     /// correctly, but nothing answering it right now): that already-existing
-    /// behavior -- warn and fall back to `NullPtt` -- is unchanged, since
-    /// it's a live/transient condition rather than an unrecognized config.
+    /// behavior -- log an ERROR, fall back to `NullPtt`, and record a
+    /// startup problem so coppad reports itself degraded rather than ready
+    /// (COP-32) -- is kept, since it's a live/transient condition rather
+    /// than an unrecognized config.
     /// A wideband profile that relies on that rigctld as its only frequency
     /// source still refuses to start -- `check_frequency_gate_at_startup`
     /// sees the fallback as "no source answering".
     ///
     /// A connected rigctld client is returned as `PttBackend::Rigctld`, not
     /// boxed as `dyn PttControl`, so its dial frequency stays reachable.
+    ///
+    /// COP-31: creating a backend does not touch the line; `EventLoop::new`
+    /// drives it to RX right after this returns (a failure there is a
+    /// warning, not a startup error). The rigctld, serial and GPIO backends
+    /// also release PTT on drop if they may have left it keyed, so an error
+    /// return or a panic after this point still un-keys the rig.
     fn create_ptt(config: &DaemonConfig) -> Result<PttBackend> {
         let parsed = config
             .radio
@@ -552,10 +851,11 @@ impl EventLoop {
                 match coppa_radio::rigctld::RigctldClient::connect(&config.radio.rigctld_address) {
                     Ok(client) => Ok(PttBackend::Rigctld(client)),
                     Err(e) => {
-                        tracing::warn!(
+                        tracing::error!(
                             address = %config.radio.rigctld_address,
                             error = %e,
-                            "Failed to connect to rigctld; falling back to no PTT"
+                            "Failed to connect to rigctld; PTT is disabled and \
+                             transmissions will not key the radio"
                         );
                         Ok(PttBackend::Other(Box::new(NullPtt::new())))
                     }
@@ -622,8 +922,10 @@ impl EventLoop {
     /// No evidence, or evidence below 29.7 MHz, is a hard startup error.
     ///
     /// Only the constructed engine is checked: a `LevelDerived` engine that
-    /// starts narrowband and later climbs into `vhf_wide` is gated per
-    /// transmission by `wideband_frequency_check` instead.
+    /// starts narrowband and later climbs toward `vhf_wide` is rebound to HF by
+    /// `apply_speed_level` (COP-21) unless its frequency evidence permits the
+    /// wideband profile, and is gated per transmission by
+    /// `wideband_frequency_check` otherwise.
     fn check_frequency_gate_at_startup(
         config: &DaemonConfig,
         engine: &CoppaCore,
@@ -713,18 +1015,7 @@ impl EventLoop {
         if band::gate(occupied_hz, None).is_ok() {
             return Ok(());
         }
-        let live_hz = self.ptt.poll_frequency();
-        if let Some(live) = live_hz {
-            if self.radio_frequency.contradicts(live) {
-                tracing::warn!(
-                    live_hz = live,
-                    stated = ?self.radio_frequency.static_evidence(),
-                    "rigctld's dial frequency contradicts [radio] frequency_hz/band; \
-                     using the live value"
-                );
-            }
-        }
-        let evidence = band::resolve_evidence(live_hz, &self.radio_frequency);
+        let evidence = self.frequency_evidence();
         band::gate(occupied_hz, evidence.as_ref()).inspect_err(|refusal| match refusal {
             GateRefusal::BelowThreshold { evidence_hz, .. } => tracing::error!(
                 "refusing wideband transmission: {occupied_hz} Hz occupied bandwidth but {} \
@@ -747,9 +1038,151 @@ impl EventLoop {
         })
     }
 
+    /// This station's frequency evidence right now: one rigctld `f` round
+    /// trip, falling back to the stated `[radio] frequency_hz`/`band`. Warns
+    /// when the live dial contradicts the stated source. Shared by the COP-40
+    /// per-transmission gate and the COP-21 HF rebind.
+    fn frequency_evidence(&mut self) -> Option<FrequencyEvidence> {
+        let live_hz = self.ptt.poll_frequency();
+        if let Some(live) = live_hz {
+            if self.radio_frequency.contradicts(live) {
+                tracing::warn!(
+                    live_hz = live,
+                    stated = ?self.radio_frequency.static_evidence(),
+                    "rigctld's dial frequency contradicts [radio] frequency_hz/band; \
+                     using the live value"
+                );
+            }
+        }
+        band::resolve_evidence(live_hz, &self.radio_frequency)
+    }
+
+    /// The daemon's `RateLoop` over `engine`'s ladder (`available_speed_levels`),
+    /// starting at `initial_level` (clamped into that ladder). Shared by `new`
+    /// and the COP-21 HF rebind so both get the same `raise_dwell` and probing
+    /// setup.
+    fn build_rate_loop(config: &DaemonConfig, engine: &CoppaCore, initial_level: u8) -> RateLoop {
+        let rate_loop = RateLoop::new(engine.available_speed_levels(), 5, initial_level);
+        if config.engine.rate_loop_probe_interval > 0 {
+            rate_loop.with_probing(
+                config.engine.rate_loop_probe_interval,
+                config.engine.rate_loop_probe_offset,
+            )
+        } else {
+            rate_loop
+        }
+    }
+
+    /// COP-21: keep a level-derived engine off `vhf_wide` unless the station
+    /// can show it is at or above 29.7 MHz.
+    ///
+    /// `coppad` only builds an `OfdmBand::LevelDerived` engine when `[engine]
+    /// profile` is not a built-in name (`EventLoop::new` falls back to
+    /// `EngineConfig::default()`). On such an engine the speed level picks the
+    /// band, so a `RateLoop` climb to level 5+ would select `vhf_wide`
+    /// (5600 Hz), which 47 CFR 97.307(f)(3) forbids below 29.7 MHz. Rather than
+    /// let COP-40's gate refuse every such frame, this rebinds the engine to
+    /// `OfdmBand::Hf` (`CoppaCore::set_ofdm_band`) so the level goes on air as
+    /// `hf_standard` (2400 Hz): the station keeps transmitting on an HF-legal
+    /// profile instead of going silent. A level above HF's ceiling is lowered
+    /// to `HF_MAX_SPEED_LEVEL` first, and `RateLoop` is rebuilt over the HF
+    /// ladder from its own current level.
+    ///
+    /// Only `LevelDerived` engines are touched: an explicitly configured
+    /// `VHF_FAST` engine keeps COP-40's startup error and per-transmission
+    /// refusal and is never rewritten. The binding is one-way for the session:
+    /// evidence that later returns above 29.7 MHz does not undo it. Wideband
+    /// is decided by `band::gate` on the width `level` would actually produce
+    /// (`occupied_bandwidth_hz_at`), never a hard-coded level, and no rig I/O
+    /// happens unless `level` would be wideband on a level-derived engine. No
+    /// evidence at all binds to HF (fail closed, matching COP-40).
+    fn keep_level_derived_engine_hf_legal(&mut self, level: u8) {
+        if self.engine.config().ofdm_band != OfdmBand::LevelDerived {
+            return;
+        }
+        let occupied_hz = self.engine.occupied_bandwidth_hz_at(level);
+        if band::gate(occupied_hz, None).is_ok() {
+            return;
+        }
+        let evidence = self.frequency_evidence();
+        if band::gate(occupied_hz, evidence.as_ref()).is_ok() {
+            return;
+        }
+        if self.engine.speed_level() > coppa_engine::HF_MAX_SPEED_LEVEL {
+            if let Err(e) = self
+                .engine
+                .set_speed_level(coppa_engine::HF_MAX_SPEED_LEVEL)
+            {
+                tracing::warn!(error = %e, "Failed to lower the speed level for the HF profile");
+                return;
+            }
+        }
+        if let Err(e) = self.engine.set_ofdm_band(OfdmBand::Hf) {
+            tracing::warn!(error = %e, "Failed to rebind the engine to the HF profile");
+            return;
+        }
+        self.rate_loop =
+            Self::build_rate_loop(&self.config, &self.engine, self.rate_loop.current_level());
+        tracing::warn!(
+            "speed level {level} selects vhf_wide ({occupied_hz} Hz occupied bandwidth) on this \
+             engine because [engine] profile \"{}\" is not a built-in profile, but {}; using \
+             the HF profile ({} Hz, levels 1-{}) for the rest of this session -- 47 CFR \
+             97.307(f)(3) caps emissions below 29.7 MHz at 2.8 kHz",
+            self.config.engine.profile,
+            evidence.map_or_else(
+                || "no frequency source is answering".to_string(),
+                |e| e.describe()
+            ),
+            self.engine.occupied_bandwidth_hz(),
+            coppa_engine::HF_MAX_SPEED_LEVEL,
+        );
+    }
+
+    /// COP-21: the one place the daemon changes the engine's speed level.
+    ///
+    /// Runs `keep_level_derived_engine_hf_legal` first, so a level-derived
+    /// engine is rebound to HF *before* a wideband level can take effect (and
+    /// before anything is encoded at it), then clamps `level` to the engine's
+    /// ladder -- a no-op unless that rebind just happened while `level` was 9
+    /// -- and applies it. Errors are `CoppaCore::set_speed_level`'s.
+    fn apply_speed_level(&mut self, level: u8) -> Result<()> {
+        self.keep_level_derived_engine_hf_legal(level);
+        let level = self
+            .engine
+            .available_speed_levels()
+            .last()
+            .map_or(level, |&max| level.min(max));
+        self.engine.set_speed_level(level)
+    }
+
+    /// COP-32: conditions found while starting that leave the daemon running
+    /// but unable to do part of its job (today: rigctld unreachable, or a
+    /// refused startup PTT release). Empty when startup was clean.
+    pub fn startup_problems(&self) -> &[String] {
+        &self.startup_problems
+    }
+
+    /// COP-50: the configured and active PTT backend and the startup release's outcome.
+    pub fn ptt_startup(&self) -> &crate::startup_report::PttStartup {
+        &self.ptt_startup
+    }
+
     /// Get a sender for injecting events into the loop.
     pub fn event_sender(&self) -> mpsc::Sender<DaemonEvent> {
         self.event_tx.clone()
+    }
+
+    /// COP-31: hand the loop a running PTT guardian. From here on `set_ptt`
+    /// reports `K` before every keying and `R` after every successful unkey.
+    pub fn set_ptt_guardian(&mut self, guardian: crate::ptt_guardian::PttGuardian) {
+        self.ptt_guardian = Some(guardian);
+    }
+
+    /// COP-31: whether this daemon should run a PTT guardian: `[radio]
+    /// ptt_guardian` is on and the PTT backend is a connected rigctld client
+    /// or GPIO (see `ptt_guardian::ptt_guardian_eligible`).
+    pub fn ptt_guardian_eligible(&self) -> bool {
+        crate::ptt_guardian::ptt_guardian_eligible(&self.config.radio, self.ptt.is_rigctld())
     }
 
     /// Set the audio output ring buffer for TX sample playback.
@@ -771,7 +1204,9 @@ impl EventLoop {
     }
 
     /// Set the response sender for sending decoded data back to host clients.
-    pub fn set_response_tx(&mut self, tx: mpsc::Sender<coppa_host::HostResponse>) {
+    /// The queue is unbounded, so whoever holds its receiver must keep
+    /// draining it (`forward_data_out`).
+    pub fn set_response_tx(&mut self, tx: mpsc::UnboundedSender<HostResponse>) {
         self.response_tx = Some(tx);
     }
 
@@ -827,9 +1262,10 @@ impl EventLoop {
     }
 
     /// Broadcast one `VaraResponse` to every connected VARA command-port client, if
-    /// any are wired up (`set_vara_responses`). A no-op (silently) if telemetry
-    /// hasn't been wired, or if a given client's channel happens to be full/closed
-    /// — telemetry is best-effort and must never block or fail the caller.
+    /// any are wired up (`set_vara_responses`). A no-op if telemetry hasn't been
+    /// wired. Never waits: a client that falls behind may miss `BUSY`/`SNR`, and
+    /// one that stops reading is disconnected rather than skipped
+    /// (`broadcast_vara`), so a state line is never lost on an open connection.
     async fn emit_vara(&self, response: VaraResponse) {
         if let Some(ref senders) = self.vara_responses {
             broadcast_vara(senders, response).await;
@@ -842,22 +1278,20 @@ impl EventLoop {
     /// `coppa_host::websocket::FIRST_CLIENT_ID`, so a reply to a
     /// WebSocket-originated event finds no sender here and is dropped.
     ///
-    /// Uses `try_send`, never `send().await`: a client that stops reading must
-    /// not stall the modem's event loop (same choice as `notify_session`).
+    /// Never waits, never `send().await`: a client that stops reading must
+    /// not stall the modem's event loop. A reply that finds the client's queue
+    /// full disconnects that client instead of being dropped
+    /// (`queue_for_client`).
     async fn reply_vara(&self, client_id: u32, response: VaraResponse) {
         let Some(ref senders) = self.vara_responses else {
             return;
         };
-        let senders = senders.lock().await;
+        let mut senders = senders.lock().await;
         let Some(tx) = senders.get(&client_id) else {
             return;
         };
-        if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(response.clone()) {
-            tracing::warn!(
-                client_id,
-                line = response.format().trim_end(),
-                "VARA command-port queue full; reply dropped"
-            );
+        if !queue_for_client(client_id, tx, response) {
+            senders.remove(&client_id);
         }
     }
 
@@ -895,25 +1329,31 @@ impl EventLoop {
                 )
             }
             SessionNotice::Disconnected => ("DISCONNECTED".to_string(), VaraResponse::Disconnected),
+            SessionNotice::Pending => ("PENDING".to_string(), VaraResponse::Pending),
+            SessionNotice::PendingCancelled => {
+                ("CANCELPENDING".to_string(), VaraResponse::CancelPending)
+            }
         };
         if let Some(ref tx) = self.response_tx {
-            let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate { client_id, status });
+            let _ = tx.send(HostResponse::StatusUpdate { client_id, status });
         }
-        // A dropped state line leaves the host waiting out its own connect or
-        // disconnect timer, so log it. Closed channels belong to departed clients.
-        if let Some(ref senders) = self.vara_responses {
-            for (id, tx) in senders.lock().await.iter() {
-                if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(vara.clone()) {
-                    tracing::warn!(
-                        client_id = id,
-                        line = vara.format().trim_end(),
-                        "VARA command-port queue full; session-state line dropped"
-                    );
-                }
-            }
-        }
+        // A dropped state line would leave the host waiting out its own
+        // connect or disconnect timer, so a host that cannot take it is
+        // disconnected instead (`broadcast_vara`).
+        self.emit_vara(vara).await;
         #[cfg(feature = "websocket")]
         {
+            let msg = match notice {
+                SessionNotice::Connected { remote, .. } => {
+                    coppa_host::websocket::WsServerMessage::Connected {
+                        remote_call: remote.to_string(),
+                    }
+                }
+                SessionNotice::Disconnected => coppa_host::websocket::WsServerMessage::Disconnected,
+                // The WebSocket API has no LISTEN, so it never takes part in
+                // an inbound attempt.
+                SessionNotice::Pending | SessionNotice::PendingCancelled => return,
+            };
             let remote = self.established_remote();
             if let Some(ref status) = self.ws_status {
                 let mut snap = status.lock().await;
@@ -921,16 +1361,6 @@ impl EventLoop {
                 snap.remote_call = remote.map(|cs| cs.to_string());
             }
             if let Some(ref ws_tx) = self.ws_broadcast {
-                let msg = match notice {
-                    SessionNotice::Connected { remote, .. } => {
-                        coppa_host::websocket::WsServerMessage::Connected {
-                            remote_call: remote.to_string(),
-                        }
-                    }
-                    SessionNotice::Disconnected => {
-                        coppa_host::websocket::WsServerMessage::Disconnected
-                    }
-                };
                 if let Ok(json) = serde_json::to_string(&msg) {
                     let _ = ws_tx.send(json); // An error means no client is subscribed.
                 }
@@ -939,19 +1369,48 @@ impl EventLoop {
     }
 
     async fn reap_timed_out_sessions(&mut self) {
+        // `cleanup_timed_out` returns only IDs, so note which sessions were
+        // pending inbound handshakes first (COP-44: those end in
+        // CANCELPENDING, not DISCONNECTED).
+        let pending = self.accepting_sessions();
         let removed = self.session_mgr.cleanup_timed_out();
         for id in removed {
             tracing::warn!(session_id = id, "Session timed out");
-            self.notify_session(0, SessionNotice::Disconnected).await;
+            self.discard_session_tx(id).await;
+            let notice = if pending.contains(&id) {
+                SessionNotice::PendingCancelled
+            } else {
+                SessionNotice::Disconnected
+            };
+            self.notify_session(0, notice).await;
         }
     }
 
-    /// COP-40: retry a TX-queue drain the wideband gate held back. A no-op
-    /// unless the last drain attempt was refused, so it never changes when
-    /// an ordinary queue drains.
+    /// COP-44: the sessions in `Accepting`, the inbound handshakes a host
+    /// was told were `PENDING`.
+    fn accepting_sessions(&self) -> Vec<u8> {
+        self.session_mgr
+            .active_sessions()
+            .into_iter()
+            .filter(|&id| self.is_accepting(id))
+            .collect()
+    }
+
+    fn is_accepting(&self, session_id: u8) -> bool {
+        self.session_mgr
+            .get(session_id)
+            .is_some_and(|s| s.state == SessionState::Accepting)
+    }
+
+    /// COP-40: retry a TX-queue (or, COP-41, session-queue) drain the
+    /// wideband gate held back. A no-op unless the last drain attempt was
+    /// refused, so it never changes when an ordinary queue drains.
     async fn retry_held_tx_drain(&mut self) {
         if self.tx_held_by_frequency_gate {
             self.try_drain_tx_queue().await;
+        }
+        if self.session_tx_held_by_frequency_gate {
+            self.drain_session_link().await;
         }
     }
 
@@ -973,6 +1432,13 @@ impl EventLoop {
     /// - `None`-tagged (non-ARQ) `tx_queue` entries not yet popped. A
     ///   `Some`-tagged entry is the `TransportPdu`-wrapped copy of a payload
     ///   `ArqTx` already counts, so it adds nothing;
+    /// - the established session's link (COP-38): its backlog plus its
+    ///   un-acked segments' payloads. A backlog byte that becomes a segment
+    ///   moves between counted terms, so the sum falls only on the peer's
+    ///   ACK or the link's end;
+    /// - `arq_tx_backlog` bytes (COP-41, D5): host bytes waiting for ARQ
+    ///   window space. A backlog byte that becomes an ARQ segment moves
+    ///   between counted terms, leaving the sum unchanged;
     /// - `tx_on_air_bytes`: payloads with no ACK to wait for, counted until
     ///   PTT releases after they play.
     ///
@@ -985,8 +1451,12 @@ impl EventLoop {
             .filter(|(seq, _)| seq.is_none())
             .map(|(_, data)| data.len())
             .sum();
+        let session = self
+            .session_link
+            .as_ref()
+            .map_or(0, |l| l.backlog.len() + l.tx.unacked_bytes());
         let unacked = self.arq_tx.as_ref().map_or(0, ArqTx::unacked_bytes);
-        queued + self.tx_on_air_bytes + unacked
+        queued + session + self.arq_tx_backlog.len() + self.tx_on_air_bytes + unacked
     }
 
     /// Emit `BUFFER` with `buffered_tx_bytes` if it differs from the last
@@ -1010,9 +1480,16 @@ impl EventLoop {
         if self.is_transmitting {
             return;
         }
+        // COP-21: a level-derived engine left on vhf_wide by a retune moves to HF
+        // rather than holding the queue.
+        if !self.tx_queue.is_empty() {
+            self.keep_level_derived_engine_hf_legal(self.engine.speed_level());
+        }
         // COP-40: hold queued payloads (rather than pop one and have
         // `transmit_samples` refuse it) while the wideband gate refuses;
-        // `retry_held_tx_drain` tries again on the next poll.
+        // `retry_held_tx_drain` tries again on the next poll. COP-21 above has
+        // already rebound a level-derived engine to HF, so only an explicitly
+        // wideband (`VHF_FAST`) engine is still held here.
         self.tx_held_by_frequency_gate =
             !self.tx_queue.is_empty() && self.wideband_frequency_check().is_err();
         if self.tx_held_by_frequency_gate {
@@ -1062,7 +1539,7 @@ impl EventLoop {
             // is real, avoidable per-frame cost whenever the level hasn't
             // actually changed.
             if self.engine.speed_level() != level {
-                if let Err(e) = self.engine.set_speed_level(level) {
+                if let Err(e) = self.apply_speed_level(level) {
                     tracing::warn!(error = %e, "Failed to apply speed level for queued TX frame");
                 }
             }
@@ -1095,8 +1572,385 @@ impl EventLoop {
             }
 
             if is_probe {
-                if let Err(e) = self.engine.set_speed_level(self.rate_loop.current_level()) {
+                if let Err(e) = self.apply_speed_level(self.rate_loop.current_level()) {
                     tracing::warn!(error = %e, "Failed to revert speed level after probe");
+                }
+            }
+        }
+    }
+
+    /// COP-38 (D5): send the session link's next frame. Stop-and-wait: a
+    /// frame goes out only when nothing is keyed and the previous frame has
+    /// been ACKed (`ArqTx::can_send` with window 1), so each ACK, not each
+    /// PTT release, paces the stream. One chunk is cut from the backlog at
+    /// a time, framed exactly as it will be sent (with the real seq), and
+    /// handed to `ArqTx::send` only once `transmit_samples` has keyed it:
+    /// the RTO clock starts at real transmission, and a gate refusal leaves
+    /// the bytes in the backlog with nothing to undo. Session frames take
+    /// none of `rate_loop`'s or the probe machinery's levels: the engine's
+    /// current level is the one the chunk is sized against.
+    async fn drain_session_link(&mut self) {
+        if self.is_transmitting {
+            return;
+        }
+        let ready = self
+            .session_link
+            .as_ref()
+            .is_some_and(|l| !l.backlog.is_empty() && l.tx.can_send());
+        // COP-40, as in `try_drain_tx_queue`: hold the backlog (rather than
+        // cut a frame and have `transmit_samples` refuse it) while the
+        // wideband gate refuses; `retry_held_tx_drain` tries again on the
+        // next poll.
+        self.session_tx_held_by_frequency_gate = ready && self.wideband_frequency_check().is_err();
+        if !ready || self.session_tx_held_by_frequency_gate {
+            return;
+        }
+        let budget = max_payload_for_level(self.engine.speed_level())
+            .expect("the engine's speed level is always a valid wire level");
+        let (seq, take, frame) = {
+            let Some(link) = self.session_link.as_mut() else {
+                return;
+            };
+            link.backlog.make_contiguous();
+            let link = &*link;
+            let seq = link.tx.next_seq();
+            let engine = &self.engine;
+            let take = next_chunk_len(
+                link.backlog.as_slices().0,
+                MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE,
+                budget,
+                |c| engine.encoded_payload_len(&session_data_frame(link, seq, c)) <= budget,
+            );
+            let chunk: Vec<u8> = link.backlog.iter().take(take).copied().collect();
+            (seq, take, session_data_frame(link, seq, &chunk))
+        };
+        let samples = match self.engine.encode_bytes(&frame) {
+            Ok(samples) => samples,
+            Err(e) => {
+                // Unreachable for a chunk `next_chunk_len` sized; the bytes
+                // stay in the backlog.
+                tracing::error!(error = %e, seq, "Failed to encode session data");
+                return;
+            }
+        };
+        // Boxed: `transmit_samples` -> `handle_ptt_change` -> (on PTT
+        // release) `drain_session_link` forms the same 3-way async call
+        // cycle `try_drain_tx_queue` documents; one edge needs indirection
+        // to give the compiler a finite-sized future.
+        let generation = self.tx_generation;
+        Box::pin(self.transmit_samples(&samples)).await;
+        if self.tx_generation == generation {
+            // The gate passed above but refused after the courtesy wait (the
+            // one `transmit_samples` path that keys nothing and leaves
+            // `tx_generation` alone). Nothing was consumed, so the retry
+            // poll resumes the stream without a hole.
+            self.session_tx_held_by_frequency_gate = true;
+            return;
+        }
+        if let Some(link) = self.session_link.as_mut() {
+            let chunk: Vec<u8> = link.backlog.drain(..take).collect();
+            match link.tx.send(chunk, Instant::now()) {
+                Ok(sent) => debug_assert_eq!(sent, seq),
+                // Unreachable: `can_send` was checked before transmitting.
+                Err(e) => tracing::error!(error = %e, seq, "Session ARQ window full"),
+            }
+        }
+        self.tx_frame_count += 1;
+        // COP-46: a sent session PDU is activity (`Session::touch`'s
+        // contract). The peer's ACK touches the session too, but only once
+        // it arrives: without this, the first frame after 30 s of quiet
+        // leaves `session_cleanup` free to key a KEEPALIVE on top of the
+        // peer's ACK, which then costs a retransmission.
+        if let Some(session) = self
+            .session_link
+            .as_ref()
+            .map(|l| l.session_id)
+            .and_then(|id| self.session_mgr.get_mut(id))
+        {
+            session.touch();
+        }
+        tracing::debug!(
+            seq,
+            frame = self.tx_frame_count,
+            max = self.max_frames_per_turn,
+            "Session data frame transmitted"
+        );
+    }
+
+    /// Drop the link of a session that has ended (local or remote
+    /// DISCONNECT, timeout, or COP-38 link failure) -- its backlog and its
+    /// un-acked segments -- and report the `BUFFER` change. Without this the
+    /// link keeps sending (and retransmitting) a dead session's data, and a
+    /// reconnect to the same peer could deliver those stale bytes into the
+    /// new session.
+    async fn discard_session_tx(&mut self, session_id: u8) {
+        let Some(link) = self.session_link.take_if(|l| l.session_id == session_id) else {
+            return;
+        };
+        tracing::info!(
+            session_id,
+            backlog = link.backlog.len(),
+            in_flight = link.tx.in_flight(),
+            "Session ended; discarding its unsent data"
+        );
+        self.report_buffer().await;
+    }
+
+    /// COP-38 (D2): the reliable link for `session_id`, created on first use
+    /// if it is missing or belongs to another session. Session establishment
+    /// itself rebuilds it (`reset_session_link`); this covers any path that
+    /// reaches an established session without those handlers.
+    fn ensure_session_link(&mut self, session_id: u8) {
+        if self
+            .session_link
+            .as_ref()
+            .is_some_and(|l| l.session_id == session_id)
+        {
+            return;
+        }
+        let Some(session) = self.session_mgr.get(session_id) else {
+            return;
+        };
+        let level = self.engine.speed_level();
+        let radio = &self.config.radio;
+        let config = ArqConfig {
+            window_size: SESSION_ARQ_WINDOW,
+            speed_level: level,
+            ack_speed_level: level,
+            // D7: the peer's hold plus key-up latency, with our own tail as
+            // decode-latency margin; a spurious retransmit only costs a
+            // cycle, a late one only delays recovery from a real loss.
+            turnaround: Duration::from_millis(
+                radio.turnaround_ms + radio.ptt_pre_delay_ms + radio.ptt_tail_delay_ms,
+            ),
+            ..ArqConfig::default()
+        };
+        self.session_link = Some(SessionLink {
+            session_id,
+            remote: session.remote.clone(),
+            local: session.local.clone(),
+            ssid: session.ssid,
+            tx: ArqTx::new(config),
+            rx: ArqRx::new(SESSION_ARQ_WINDOW),
+            backlog: VecDeque::new(),
+            give_up_at: None,
+            warned_legacy_payload: false,
+        });
+    }
+
+    /// COP-38 (D2): a newly established session starts at seq 0 on both
+    /// ends, whatever link an earlier session left behind.
+    fn reset_session_link(&mut self, session_id: u8) {
+        self.session_link = None;
+        self.ensure_session_link(session_id);
+    }
+
+    /// COP-38: the session a session-layer frame belongs to: sent by the
+    /// session's peer (`src`), addressed to the session's own callsign
+    /// (`dest`), on its SSID. Matching `src` alone would let a frame the
+    /// peer addressed to another station on the shared channel (after it
+    /// reconnected elsewhere, say) acknowledge, deliver into or end this
+    /// session.
+    fn session_id_for_frame(&self, pdu: &MacPdu) -> Option<u8> {
+        self.session_mgr.active_sessions().into_iter().find(|&id| {
+            self.session_mgr.get(id).is_some_and(|s| {
+                s.remote == pdu.src && s.local == pdu.dest && s.ssid & 0x0F == pdu.ssid
+            })
+        })
+    }
+
+    /// COP-38: the remote of a session that keeps this daemon from starting
+    /// another one. `session_link` is singular (D2): a second session
+    /// established beside the first would rebuild the link and drop the
+    /// first session's backlog, in-flight segment and receive position
+    /// without disconnecting it. That includes a second slot for the same
+    /// peer (a repeat CONNECT_REQ, or one on another SSID).
+    fn active_session_remote(&self) -> Option<Callsign> {
+        self.session_mgr
+            .active_sessions()
+            .into_iter()
+            .filter_map(|id| self.session_mgr.get(id))
+            .find(|s| s.state != SessionState::Idle)
+            .map(|s| s.remote.clone())
+    }
+
+    /// COP-38 (D7): the connected-session retransmit pass. Runs on `run()`'s
+    /// 500 ms retransmit tick whatever `arq_enabled` says (D1). A frame is
+    /// rebuilt from its segment data, byte-identical to the original; once
+    /// it has used its last retransmission the link gets one more RTO for a
+    /// late ACK and then fails (`fail_session_link`).
+    async fn check_session_retransmits(&mut self) {
+        let now = Instant::now();
+        let Some(link) = self.session_link.as_ref() else {
+            return;
+        };
+        if link.give_up_at.is_some_and(|t| now >= t) && link.tx.in_flight() > 0 {
+            let session_id = link.session_id;
+            self.fail_session_link(session_id).await;
+            return;
+        }
+        // COP-40: `get_retransmits` backs the RTO off whenever it returns a
+        // segment, so asking while the gate refuses would spend backoff and
+        // budget on a refusal the first-send path holds without loss.
+        if self
+            .session_link
+            .as_ref()
+            .is_some_and(|l| l.tx.in_flight() > 0)
+            && self.wideband_frequency_check().is_err()
+        {
+            return;
+        }
+        let Some(link) = self.session_link.as_mut() else {
+            return;
+        };
+        let seqs = link.tx.get_retransmits(now);
+        let link = &*link;
+        let frames: Vec<(u8, Vec<u8>)> = seqs
+            .into_iter()
+            .filter_map(|seq| {
+                link.tx
+                    .get_segment_data(seq)
+                    .map(|data| (seq, session_data_frame(link, seq, data)))
+            })
+            .collect();
+        for (seq, frame) in frames {
+            let attempt = self
+                .session_link
+                .as_ref()
+                .and_then(|l| l.tx.transmit_count(seq))
+                .map_or(0, |count| count + 1);
+            match self.engine.encode_bytes(&frame) {
+                Ok(samples) => {
+                    tracing::debug!(seq, attempt, "Retransmitting session frame");
+                    Box::pin(self.transmit_samples(&samples)).await;
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    seq,
+                    "Failed to encode session retransmission; counting the attempt anyway"
+                ),
+            }
+            // Counted even when the encode or the post-wait gate refused
+            // (COP-1 (d)): a budget only successful sends advance can never
+            // run out.
+            if let Some(link) = self.session_link.as_mut() {
+                let _ = link.tx.mark_retransmitted(seq, Instant::now());
+                if link.tx.is_failed(seq) && link.give_up_at.is_none() {
+                    link.give_up_at = Some(Instant::now() + link.tx.rto());
+                }
+            }
+        }
+    }
+
+    /// COP-38 (D7): no ACK after the retry budget. Ends the session the way
+    /// the host's DISCONNECT does: drop the link (`BUFFER 0`), tell the peer,
+    /// then the host.
+    async fn fail_session_link(&mut self, session_id: u8) {
+        if let Some(link) = self
+            .session_link
+            .as_ref()
+            .filter(|l| l.session_id == session_id)
+        {
+            let seq = link.tx.send_base();
+            tracing::warn!(
+                session_id,
+                remote = %link.remote,
+                seq,
+                attempts = link.tx.transmit_count(seq).unwrap_or(0),
+                "Session link failed: no ACK after the retry budget; disconnecting"
+            );
+        }
+        self.end_session(session_id, 0).await;
+    }
+
+    /// Tear down `session_id` at once: drop its link (`BUFFER` reports the
+    /// change), send a best-effort DISCONNECT to the peer, remove the
+    /// session and tell the host `DISCONNECTED` (after `CANCELPENDING` when
+    /// it was a pending inbound handshake). Shared by the host's
+    /// `DISCONNECT` and COP-38's link failure, so no session data plays after
+    /// the host hears `DISCONNECTED`.
+    async fn end_session(&mut self, session_id: u8, client_id: u32) {
+        let was_pending = self.is_accepting(session_id);
+        self.discard_session_tx(session_id).await;
+        if let Some(session) = self.session_mgr.get_mut(session_id) {
+            match session.disconnect() {
+                Ok(disc_pdu) => {
+                    let pdu_bytes = disc_pdu.to_bytes();
+                    match self.engine.encode_bytes(&pdu_bytes) {
+                        Ok(samples) => Box::pin(self.transmit_samples(&samples)).await,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to encode DISCONNECT")
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to disconnect session");
+                }
+            }
+        }
+        self.session_mgr.remove(session_id);
+        // COP-44: close the host's PENDING first; DISCONNECTED still answers
+        // its DISCONNECT.
+        if was_pending {
+            self.notify_session(client_id, SessionNotice::PendingCancelled)
+                .await;
+        }
+        self.notify_session(client_id, SessionNotice::Disconnected)
+            .await;
+    }
+
+    /// COP-41 (D4/D5): move `arq_tx_backlog` bytes into ARQ window segments
+    /// as window space allows. Chunks are sized against the ladder-minimum
+    /// budget (`min_level_budget`) so every segment re-encodes at ANY speed
+    /// level a later retransmit or rate drop uses. Called after every
+    /// backlog append and wherever an ACK (or a Reset's fresh window) frees
+    /// window space; a full window is a normal stop, not a drop -- the bytes
+    /// stay held and `BUFFER` keeps counting them.
+    ///
+    /// Each chunk's `fits` probe is built with the seq `ArqTx::send` will
+    /// actually assign (computed from `send_base + in_flight`), so the
+    /// measured PDU is byte-identical to the one that gets queued and the
+    /// exact-fit guarantee survives compression's content dependence.
+    async fn pump_arq_backlog(&mut self) {
+        while !self.arq_tx_backlog.is_empty() && self.arq_tx.as_ref().is_some_and(ArqTx::can_send) {
+            let chunk: Vec<u8> = {
+                let arq_tx = self.arq_tx.as_ref().expect("can_send checked above");
+                let next_seq = arq_tx.send_base().wrapping_add(arq_tx.in_flight());
+                let fits = |c: &[u8]| {
+                    let pdu =
+                        TransportPdu::new_reliable(self.arq_session_id, next_seq, 0, c.to_vec());
+                    self.engine.encoded_payload_len(&pdu.to_bytes()) <= min_level_budget()
+                };
+                let budget = min_level_budget();
+                let backlog = self.arq_tx_backlog.make_contiguous();
+                chunk_to_fit(backlog, TRANSPORT_HEADER_SIZE, budget, fits)
+                    .into_iter()
+                    .next()
+                    .expect("a non-empty backlog always yields at least one chunk")
+            };
+            match self
+                .arq_tx
+                .as_mut()
+                .expect("can_send checked above")
+                .send(chunk.clone(), Instant::now())
+            {
+                Ok(seq) => {
+                    let pdu =
+                        TransportPdu::new_reliable(self.arq_session_id, seq, 0, chunk.clone());
+                    let tx_bytes = pdu.to_bytes();
+                    self.arq_tx_backlog.drain(..chunk.len());
+                    // `seq` is `Some` for the fresh ARQ-tracked segment --
+                    // used by active overshoot probing
+                    // (`RateLoop::level_for_next_transmission`) to attribute
+                    // a probe's later outcome back to its ACK/timeout.
+                    self.enqueue_tx(Some(seq), tx_bytes).await;
+                }
+                Err(e) => {
+                    // Unreachable while single-threaded (the `can_send` check
+                    // and the `send` cannot interleave), but stop and hold
+                    // rather than drop if it ever fires.
+                    tracing::debug!(error = %e, "ARQ window full; backlog holds the rest");
+                    break;
                 }
             }
         }
@@ -1111,6 +1965,12 @@ impl EventLoop {
     ///
     /// Polls the event channel and optionally reads audio input samples
     /// from the ring buffer on a periodic interval.
+    ///
+    /// COP-31: a shutdown that arrives while PTT is keyed releases it (and
+    /// reports `PTT OFF`) before returning; an idle shutdown touches nothing.
+    /// Every 500 ms tick also runs the PTT backstop, which forces PTT off if
+    /// a keyed interval has outlived `max_tx_duration_s` plus
+    /// `PTT_BACKSTOP_GRACE` without the normal release path ending it.
     pub async fn run(&mut self) -> Result<()> {
         self.running = true;
         tracing::info!(profile = %self.config.engine.profile, "Event loop started");
@@ -1154,6 +2014,10 @@ impl EventLoop {
                     match event {
                         Some(DaemonEvent::Shutdown) | None => {
                             tracing::info!("Shutdown signal received");
+                            if self.is_transmitting {
+                                tracing::info!("Releasing PTT before shutdown");
+                                self.force_release_ptt().await;
+                            }
                             // E5: Signal audio threads to stop
                             self.shutdown_flag.store(true, Ordering::Release);
                             self.running = false;
@@ -1179,8 +2043,14 @@ impl EventLoop {
                     self.poll_audio_input().await;
                 }
                 _ = retransmit_poll.tick() => {
+                    // COP-31: first, so a stuck keyed interval is released
+                    // before anything else on this tick can extend it.
+                    self.enforce_ptt_backstop().await;
                     // E6: Check for ARQ retransmits
                     self.check_arq_retransmits().await;
+                    // COP-38 (D1): connected-session data retransmits
+                    // whatever `arq_enabled` says.
+                    self.check_session_retransmits().await;
                     self.retry_held_tx_drain().await;
                 }
                 _ = beacon_poll.tick() => {
@@ -1197,6 +2067,8 @@ impl EventLoop {
                                 if let Ok(ka_pdu) = session.keepalive() {
                                     let ka_bytes = ka_pdu.to_bytes();
                                     if let Ok(samples) = self.engine.encode_bytes(&ka_bytes) {
+                                        // COP-46: `tools/pat-loop` counts these.
+                                        tracing::info!(session = id, "Sending session KEEPALIVE");
                                         self.transmit_samples(&samples).await;
                                     }
                                 }
@@ -1264,6 +2136,12 @@ impl EventLoop {
             let pending = std::mem::take(&mut self.pending_busy_wait_audio);
             self.decode_and_dispatch_audio(&pending).await;
         }
+        // A reply to a frame in that audio may have held TX (COP-60) and
+        // parked newer audio again. The ring is newer still, so leave it for
+        // the next poll, which decodes the parked audio first.
+        if !self.pending_busy_wait_audio.is_empty() {
+            return;
+        }
         if let Some(buf) = self.drain_audio_input_ring() {
             self.handle_audio_in(&buf).await;
         }
@@ -1273,7 +2151,8 @@ impl EventLoop {
     /// `busy_gate.observe` only -- no frame decode, no `MacPdu` dispatch.
     ///
     /// Used exclusively by `wait_for_clear_channel`'s poll loop (Finding 1,
-    /// Phase 4 Task 3 review) so real RX audio keeps updating busy-gate
+    /// Phase 4 Task 3 review) and `wait_for_rx_turnaround`'s (COP-60, which
+    /// needs only the drain) so real RX audio keeps updating busy-gate
     /// occupancy while that call is blocked waiting for the channel to
     /// clear, without also running `handle_audio_in`'s full protocol
     /// dispatch on this call stack. That dispatch (frame decode ->
@@ -1295,9 +2174,7 @@ impl EventLoop {
     /// to run full dispatch again.
     async fn observe_busy_gate_from_audio_input(&mut self) {
         if let Some(buf) = self.drain_audio_input_ring() {
-            if let Some(new_state) = self.busy_gate.observe(&buf) {
-                self.emit_vara(VaraResponse::Busy(new_state)).await;
-            }
+            self.observe_raw_rx(&buf).await;
             self.pending_busy_wait_audio.extend_from_slice(&buf);
         }
     }
@@ -1319,34 +2196,27 @@ impl EventLoop {
                 // change): the peer looks the session up by `pdu.src`, so a
                 // runtime callsign change must not make it silently drop
                 // every later data frame.
-                let session_info = self.session_mgr.active_sessions().iter().find_map(|&id| {
+                let session_id = self.session_mgr.active_sessions().iter().find_map(|&id| {
                     self.session_mgr
                         .get(id)
                         .filter(|s| s.is_established())
-                        .map(|s| (s.remote.clone(), s.local.clone(), s.ssid))
+                        .map(|s| s.id)
                 });
 
-                if let Some((remote, local, ssid)) = session_info {
-                    let mac_pdu = MacPdu::new_data(remote, local, ssid, data.clone());
-                    let pdu_bytes = mac_pdu.to_bytes();
-                    match self.engine.encode_bytes(&pdu_bytes) {
-                        Ok(samples) => {
-                            // No MAC-level ACK exists for session data, so
-                            // its bytes stay in `BUFFER` until PTT releases.
-                            self.tx_on_air_bytes += data.len();
-                            self.report_buffer().await;
-                            self.transmit_samples(&samples).await;
-                            self.tx_frame_count += 1;
-                            tracing::debug!(
-                                frame = self.tx_frame_count,
-                                max = self.max_frames_per_turn,
-                                "Session data frame transmitted"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(client_id, error = %e, "Failed to encode session data")
-                        }
+                if let Some(session_id) = session_id {
+                    // COP-41/COP-38: one host event is NOT one over-the-air
+                    // frame. The bytes join the session link's backlog, and
+                    // `drain_session_link` cuts one frame at a time that
+                    // encodes at the engine's current speed level (measured
+                    // via `encoded_payload_len`, never predicted --
+                    // compression is content-dependent by ~2x), sending the
+                    // next only once the peer has ACKed the last.
+                    self.ensure_session_link(session_id);
+                    if let Some(link) = self.session_link.as_mut() {
+                        link.backlog.extend(data.iter().copied());
                     }
+                    self.report_buffer().await;
+                    self.drain_session_link().await;
                     return;
                 }
 
@@ -1362,39 +2232,39 @@ impl EventLoop {
                     return;
                 }
 
-                // Sessionless TX: raw/ARQ encode path
-                // E6: If ARQ is enabled, wrap data in a TransportPdu before encoding
-                let (seq_opt, tx_bytes) = if self.config.engine.arq_enabled {
-                    if let Some(ref mut arq_tx) = self.arq_tx {
-                        let now = Instant::now();
-                        match arq_tx.send(data.clone(), now) {
-                            Ok(seq) => {
-                                let pdu = TransportPdu::new_reliable(
-                                    self.arq_session_id,
-                                    seq,
-                                    0, // ack_num filled by ARQ layer
-                                    data.clone(),
-                                );
-                                (Some(seq), pdu.to_bytes())
-                            }
-                            Err(e) => {
-                                tracing::warn!(client_id, error = %e, "ARQ window full; dropping TX");
-                                return;
-                            }
-                        }
-                    } else {
-                        (None, data.clone())
-                    }
-                } else {
-                    (None, data.clone())
-                };
+                // COP-37: refuse here, before ARQ registration or queueing,
+                // so a refused payload leaves no outstanding ARQ segment or
+                // `BUFFER` count behind. (An established session above
+                // implies a callsign: both connect paths require one.)
+                if self.local_callsign.is_none() {
+                    tracing::error!(client_id, bytes = data.len(), "{NO_CALLSIGN_TX_REFUSAL}");
+                    return;
+                }
 
-                // Queue for encode+transmit (`BUFFER` telemetry counts the
-                // host bytes still held; see `buffered_tx_bytes`). `seq_opt`
-                // is `Some` only for a fresh ARQ-tracked segment -- used by active
-                // overshoot probing (`RateLoop::level_for_next_transmission`) to
-                // attribute a probe's later outcome back to its ACK/timeout.
-                self.enqueue_tx(seq_opt, tx_bytes).await;
+                // Sessionless TX: raw/ARQ encode path.
+                // COP-41: this path chunks the event too. With ARQ enabled,
+                // the whole event's bytes go to `arq_tx_backlog` and
+                // `pump_arq_backlog` segments them against the
+                // ladder-minimum budget as window space allows (D4/D5) --
+                // window-full is a normal pump stop (bytes are held, never
+                // dropped), not the drop-with-warning it used to be.
+                if self.config.engine.arq_enabled && self.arq_tx.is_some() {
+                    self.arq_tx_backlog.extend(data.iter().copied());
+                    self.report_buffer().await;
+                    self.pump_arq_backlog().await;
+                } else {
+                    let budget = max_payload_for_level(self.engine.speed_level())
+                        .expect("the engine's speed level is always a valid wire level");
+                    for chunk in chunk_to_fit(&data, 0, budget, |c| {
+                        self.engine.encoded_payload_len(c) <= budget
+                    }) {
+                        // Queue for encode+transmit (`BUFFER` telemetry counts
+                        // the host bytes still held; see `buffered_tx_bytes`).
+                        // Chunks partition the event, so the byte totals
+                        // COP-30's tests pin still hold.
+                        self.enqueue_tx(None, chunk).await;
+                    }
+                }
             }
             HostEvent::VaraCommand { client_id, command } => {
                 tracing::debug!(client_id, command = %command, "VARA command received");
@@ -1474,6 +2344,26 @@ impl EventLoop {
                     }
                 };
 
+                // COP-38: one session at a time (`active_session_remote`).
+                // The host ends the current session with DISCONNECT before
+                // dialling again. Only the dialling client hears the
+                // refusal: the session that caused it is still up, and
+                // `notify_session` would tell every host it had ended.
+                if let Some(active) = self.active_session_remote() {
+                    tracing::warn!(
+                        destination = %remote, active = %active,
+                        "Connect request refused: another session is active"
+                    );
+                    if let Some(ref tx) = self.response_tx {
+                        let _ = tx.send(HostResponse::StatusUpdate {
+                            client_id,
+                            status: "DISCONNECTED".to_string(),
+                        });
+                    }
+                    self.reply_vara(client_id, VaraResponse::Disconnected).await;
+                    return;
+                }
+
                 let caps = LinkCapabilities::default();
                 match self.session_mgr.create(local, remote.clone(), 0, caps) {
                     Ok(id) => {
@@ -1488,11 +2378,10 @@ impl EventLoop {
                                         }
                                     }
                                     if let Some(ref tx) = self.response_tx {
-                                        let _ =
-                                            tx.try_send(coppa_host::HostResponse::StatusUpdate {
-                                                client_id,
-                                                status: format!("CONNECTING {}", remote),
-                                            });
+                                        let _ = tx.send(HostResponse::StatusUpdate {
+                                            client_id,
+                                            status: format!("CONNECTING {}", remote),
+                                        });
                                     }
                                 }
                                 Err(e) => {
@@ -1529,25 +2418,9 @@ impl EventLoop {
                     .copied();
 
                 if let Some(id) = session_id {
-                    if let Some(session) = self.session_mgr.get_mut(id) {
-                        match session.disconnect() {
-                            Ok(disc_pdu) => {
-                                let pdu_bytes = disc_pdu.to_bytes();
-                                match self.engine.encode_bytes(&pdu_bytes) {
-                                    Ok(samples) => self.transmit_samples(&samples).await,
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "Failed to encode DISCONNECT")
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "Failed to disconnect session");
-                            }
-                        }
-                    }
-                    self.session_mgr.remove(id);
-                    self.notify_session(client_id, SessionNotice::Disconnected)
-                        .await;
+                    // The session's link ends with it; none of its data may
+                    // play after the host is told DISCONNECTED.
+                    self.end_session(id, client_id).await;
                 } else {
                     tracing::debug!("Disconnect request but no active session");
                 }
@@ -1556,15 +2429,104 @@ impl EventLoop {
     }
 
     async fn handle_audio_in(&mut self, samples: &[f32]) {
+        self.observe_raw_rx(samples).await;
+        #[cfg(feature = "websocket")]
+        self.maybe_broadcast_spectrum(samples);
+        self.decode_and_dispatch_audio(samples).await;
+    }
+
+    /// The observation prelude shared by both raw RX taps (`handle_audio_in`
+    /// and `observe_busy_gate_from_audio_input`). Each raw sample passes
+    /// through exactly one of them, so everything here sees every sample
+    /// exactly once; decode stays split out (Finding 1) and is not part of
+    /// this.
+    async fn observe_raw_rx(&mut self, samples: &[f32]) {
         // Spectral-occupancy busy gate (decision 8): fed every incoming audio
         // block, regardless of whether it ends up containing a decodable frame.
         // Only emits telemetry on an actual BUSY ON/OFF transition.
         if let Some(new_state) = self.busy_gate.observe(samples) {
             self.emit_vara(VaraResponse::Busy(new_state)).await;
         }
+        self.observe_rx_level(samples);
+    }
+
+    /// COP-65: meter raw RX audio (both raw taps call this through
+    /// `observe_raw_rx`, so every sample is metered exactly once). Logs a
+    /// WARN/INFO line only when the RX level state changes, never per window,
+    /// and broadcasts one `audio_level` message per 100 ms window when a
+    /// WebSocket host is attached.
+    ///
+    /// Paused while transmitting: the input then carries the radio's muted
+    /// output or its own TX monitor, not the channel. The in-progress window
+    /// is discarded rather than merged with post-TX audio.
+    fn observe_rx_level(&mut self, samples: &[f32]) {
+        if self.is_transmitting {
+            self.rx_level_meter.discard_partial_window();
+            return;
+        }
+        for update in self.rx_level_meter.observe(samples) {
+            if update.transition.is_some() {
+                log_rx_level_transition(update.state, &update.reading);
+            }
+            #[cfg(feature = "websocket")]
+            self.broadcast_audio_level(
+                coppa_host::websocket::AudioLevelDirection::Rx,
+                &update.reading,
+                update.state,
+            );
+        }
+    }
+
+    /// COP-65: measure one whole transmission as it will play (station-ID
+    /// prepend included), log one `TX audio level` INFO line, warn if any
+    /// sample is digitally clipped, and broadcast a `tx` `audio_level`
+    /// message when a WebSocket host is attached.
+    fn report_tx_level(&self, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
+        let reading = level_meter::measure(samples);
+        let state = level_meter::tx_state(&reading);
+        tracing::info!(
+            peak_dbfs = level_meter::round_db(reading.peak_dbfs),
+            rms_dbfs = level_meter::round_db(reading.rms_dbfs),
+            duration_ms = level_meter::duration_ms(&reading, self.config.audio.sample_rate),
+            "TX audio level"
+        );
+        if state == LevelState::Clipping {
+            tracing::warn!(
+                peak_dbfs = level_meter::round_db(reading.peak_dbfs),
+                clipped_percent = level_meter::round_db(reading.clip_fraction * 100.0),
+                "{}",
+                level_meter::TX_CLIPPING_MESSAGE
+            );
+        }
         #[cfg(feature = "websocket")]
-        self.maybe_broadcast_spectrum(samples);
-        self.decode_and_dispatch_audio(samples).await;
+        self.broadcast_audio_level(
+            coppa_host::websocket::AudioLevelDirection::Tx,
+            &reading,
+            state,
+        );
+    }
+
+    /// Broadcast one `audio_level` message over `ws_broadcast` (COP-65). A
+    /// no-op when no host is attached, like `maybe_broadcast_spectrum`;
+    /// per-client opt-in filtering happens on the `coppa-host::websocket`
+    /// side.
+    #[cfg(feature = "websocket")]
+    fn broadcast_audio_level(
+        &self,
+        direction: coppa_host::websocket::AudioLevelDirection,
+        reading: &LevelReading,
+        state: LevelState,
+    ) {
+        let Some(ref ws_tx) = self.ws_broadcast else {
+            return;
+        };
+        let msg = level_meter::ws_message(direction, reading, state, self.config.audio.sample_rate);
+        if let Ok(json) = serde_json::to_string(&msg) {
+            let _ = ws_tx.send(json);
+        }
     }
 
     /// Waterfall spectrum production (Phase 4 Task 4): accumulate `samples`
@@ -1651,6 +2613,14 @@ impl EventLoop {
             let speed_level = frame.speed_level;
             match frame.payload {
                 Ok(payload) => {
+                    // COP-60: whoever sent this frame is still keyed for its PTT tail.
+                    // Anchored at decode, which is never earlier than the frame's last
+                    // sample arriving.
+                    self.rx_turnaround_until = Some(
+                        tokio::time::Instant::now()
+                            + Duration::from_millis(self.config.radio.turnaround_ms),
+                    );
+
                     // Telemetry: SNR (decision 8) after every decoded frame,
                     // regardless of what the frame's payload turns out to be —
                     // `DecodedFrame::snr_db` is known as soon as decode succeeds.
@@ -1839,6 +2809,10 @@ impl EventLoop {
                                                 self.resolve_probe_if_acked(&newly_acked);
                                             }
                                             self.report_buffer().await;
+                                            // COP-41: the ACK freed window
+                                            // space -- move backlog bytes
+                                            // into new segments.
+                                            self.pump_arq_backlog().await;
                                         }
                                         // Acknowledge every successfully-processed
                                         // incoming data PDU (one ACK per frame, per
@@ -1878,6 +2852,10 @@ impl EventLoop {
                                                 self.resolve_probe_if_acked(&newly_acked);
                                         }
                                         self.report_buffer().await;
+                                        // COP-41: the ACK freed window space
+                                        // -- move backlog bytes into new
+                                        // segments.
+                                        self.pump_arq_backlog().await;
                                         // Closed-loop rate adaptation: apply the
                                         // peer's recommendation (if this ACK carries
                                         // one) and push the resulting level into the
@@ -1893,10 +2871,9 @@ impl EventLoop {
                                         if !probe_resolved {
                                             if let Some(rate) = pdu.suggested_rate() {
                                                 self.rate_loop.on_ack(rate, true);
-                                                if let Err(e) = self
-                                                    .engine
-                                                    .set_speed_level(self.rate_loop.current_level())
-                                                {
+                                                if let Err(e) = self.apply_speed_level(
+                                                    self.rate_loop.current_level(),
+                                                ) {
                                                     tracing::warn!(error = %e, "Failed to apply RateLoop's recommended speed level");
                                                 }
                                             }
@@ -1940,6 +2917,10 @@ impl EventLoop {
                                         // The rebuilt `arq_tx` holds nothing,
                                         // so its old segments leave `BUFFER`.
                                         self.report_buffer().await;
+                                        // COP-41: the fresh (empty) window
+                                        // drains the backlog into new
+                                        // segments.
+                                        self.pump_arq_backlog().await;
                                         Vec::new()
                                     }
                                     TransportType::CpControl => {
@@ -1959,16 +2940,7 @@ impl EventLoop {
 
                     if !output_data.is_empty() {
                         tracing::info!(bytes = output_data.len(), "Frame decoded successfully");
-                        // Send decoded data back to host clients
-                        if let Some(ref tx) = self.response_tx {
-                            let response = coppa_host::HostResponse::DataOut {
-                                client_id: 0, // broadcast to all clients
-                                data: output_data.clone(),
-                            };
-                            if let Err(e) = tx.try_send(response) {
-                                tracing::warn!(error = %e, "Failed to send decoded response to host");
-                            }
-                        }
+                        self.deliver_to_host(output_data.clone());
                         // Forward to WebSocket broadcast channel
                         #[cfg(feature = "websocket")]
                         if let Some(ref ws_tx) = self.ws_broadcast {
@@ -2054,19 +3026,15 @@ impl EventLoop {
             return;
         }
         if !completed {
-            let (discarded, submitted) = {
-                let mut tx_output = self.tx_output();
-                (tx_output.cancel(), tx_output.submitted())
-            };
+            // Also drops what the output worker and the final sink have not
+            // yet played, so none of it plays after PTT is released.
+            let (discarded, submitted) = self.cancel_pending_tx_audio();
             tracing::error!(
                 generation,
                 discarded,
                 "Transmission cancelled before it finished playing; releasing PTT"
             );
             if let Some(feedback) = self.output_feedback.clone() {
-                // Also drop what the output worker and the final sink have
-                // not yet played, so none of it plays after PTT is released.
-                feedback.discard_through(submitted);
                 self.set_ptt(false).await;
                 // Hold the next transmission until the cancelled audio is
                 // gone; otherwise draining the TX queue rekeys at once and
@@ -2079,10 +3047,80 @@ impl EventLoop {
                     );
                 }
                 self.try_drain_tx_queue().await;
+                self.drain_session_link().await;
                 return;
             }
         }
         self.handle_ptt_change(false).await;
+    }
+
+    /// Cancel the TX audio still retained ahead of the ring and, when an
+    /// output worker is wired, tell it to drop everything submitted so far
+    /// that it has not played (including the final sink's buffered tail).
+    /// Returns `(discarded, submitted)`: the samples cancelled here, and the
+    /// cumulative submitted count the output discards through. Shared by
+    /// `handle_tx_complete`'s cancel arm and `force_release_ptt`.
+    fn cancel_pending_tx_audio(&self) -> (usize, u64) {
+        let (discarded, submitted) = {
+            let mut tx_output = self.tx_output();
+            (tx_output.cancel(), tx_output.submitted())
+        };
+        if let Some(feedback) = &self.output_feedback {
+            feedback.discard_through(submitted);
+        }
+        (discarded, submitted)
+    }
+
+    /// COP-31: release PTT now and abandon the keyed interval: bump the
+    /// generation so a late `TxComplete` is stale, cancel pending TX audio, tell
+    /// the output to drop what it has not played, then `set_ptt(false)`
+    /// (hardware, `PTT OFF`, keyed-interval bookkeeping). Never drains the TX
+    /// queue: `wait_for_clear_channel` calls this, and draining from there would
+    /// recurse into `transmit_samples`.
+    async fn force_release_ptt(&mut self) {
+        self.tx_generation += 1;
+        self.cancel_pending_tx_audio();
+        self.set_ptt(false).await;
+    }
+
+    /// COP-31: how long PTT has been keyed, if that is already past
+    /// `max_tx_duration_s` plus `PTT_BACKSTOP_GRACE` (`None` when not keyed,
+    /// or not yet overdue).
+    fn ptt_backstop_overdue(&self) -> Option<Duration> {
+        if !self.is_transmitting {
+            return None;
+        }
+        let keyed_since = self.tx_keyed_since?;
+        let limit = Duration::from_secs(self.config.radio.max_tx_duration_s) + PTT_BACKSTOP_GRACE;
+        let now = tokio::time::Instant::now();
+        (keyed_since + limit <= now).then(|| now.duration_since(keyed_since))
+    }
+
+    /// COP-31: log that the PTT backstop is forcing PTT off after `keyed`.
+    fn log_ptt_backstop(&self, keyed: Duration) {
+        tracing::error!(
+            keyed_ms = keyed.as_millis() as u64,
+            max_tx_duration_s = self.config.radio.max_tx_duration_s,
+            grace_ms = PTT_BACKSTOP_GRACE.as_millis() as u64,
+            "PTT backstop: keyed past max_tx_duration_s plus grace with no release; \
+             forcing PTT off"
+        );
+    }
+
+    /// COP-31: the in-loop PTT backstop, run first on `run()`'s 500 ms tick.
+    /// If the keyed interval is overdue (see `ptt_backstop_overdue`), cancel
+    /// it through the same path a failed transmission takes: bump the
+    /// generation so the stuck job's late `TxComplete` is stale, then
+    /// `handle_tx_complete` with the new generation (cancel, discard, release,
+    /// wait for the discard, drain the queue).
+    async fn enforce_ptt_backstop(&mut self) {
+        let Some(keyed) = self.ptt_backstop_overdue() else {
+            return;
+        };
+        self.log_ptt_backstop(keyed);
+        self.tx_generation += 1;
+        let generation = self.tx_generation;
+        self.handle_tx_complete(generation, false).await;
     }
 
     /// Transmit encoded audio samples: assert PTT, queue every sample for the
@@ -2102,8 +3140,9 @@ impl EventLoop {
     /// through (host-driven encode, ARQ-adjacent session control frames
     /// including session keepalives, the raw/ARQ TX-queue drain, ARQ
     /// retransmits, `TUNE`), so busy-channel courtesy (Phase 4 Task 3,
-    /// decision: gate here rather than duplicate at each call site) and the
-    /// station-ID timer's prepend both live here and apply uniformly to
+    /// decision: gate here rather than duplicate at each call site), the
+    /// RX->TX turnaround guard (COP-60, `wait_for_rx_turnaround`) and the
+    /// station-ID timer's prepend all live here and apply uniformly to
     /// every caller -- none of them are exempted; deferring a
     /// CONNECT_ACK/CFM by a fraction of a second for channel courtesy is
     /// judged better than bulldozing over real QRM, and none of this event
@@ -2122,10 +3161,33 @@ impl EventLoop {
     /// wait, and again after the wait before the station-ID prepend, PTT,
     /// or any audio. A refused transmission keys nothing and queues
     /// nothing. Callers observe a lost transmission, which ARQ already
-    /// retransmits or times out on like any other loss.
+    /// retransmits or times out on like any other loss. COP-21: a refusal
+    /// also rebinds a level-derived engine to HF, so the next frame it
+    /// encodes is HF-legal; the refused samples themselves are never
+    /// re-encoded.
+    ///
+    /// COP-37: before either, no valid local callsign (`local_callsign` is
+    /// `None`: `[engine] callsign` empty or invalid and no valid `MYCALL`
+    /// since) refuses the transmission outright, logging
+    /// `NO_CALLSIGN_TX_REFUSAL` at `ERROR` for each attempt. This covers
+    /// every caller, including `TUNE`, which no upstream feature gate sees.
     async fn transmit_samples(&mut self, samples: &[f32]) {
+        if self.local_callsign.is_none() {
+            tracing::error!("{NO_CALLSIGN_TX_REFUSAL}");
+            if !self.is_transmitting {
+                // As for the wideband refusal below, the refused payload
+                // never reaches the air, so no PTT release will drop it from
+                // `BUFFER`. Nothing is held for a retry: a payload is only
+                // queued with a callsign in force (see the sessionless
+                // `DataReceived` path), and nothing clears it once set.
+                self.tx_on_air_bytes = 0;
+                self.report_buffer().await;
+            }
+            return;
+        }
         let allowed = if self.wideband_frequency_check().is_ok() {
             self.wait_for_clear_channel().await;
+            self.wait_for_rx_turnaround().await;
             // The rig can retune during the unbounded courtesy wait and
             // its backoff. Resolve fresh evidence before committing to TX.
             self.wideband_frequency_check().is_ok()
@@ -2133,6 +3195,9 @@ impl EventLoop {
             false
         };
         if !allowed {
+            // COP-21: the refused samples were encoded on vhf_wide; make the next
+            // frame a level-derived engine encodes HF-legal.
+            self.keep_level_derived_engine_hf_legal(self.engine.speed_level());
             if !self.is_transmitting {
                 // The refused payload never reaches the air, so no PTT
                 // release will ever drop it from `BUFFER`.
@@ -2147,6 +3212,10 @@ impl EventLoop {
                 // remain queued so the 500 ms `retry_held_tx_drain` poll
                 // resumes the queue once the gate reopens.
                 self.tx_held_by_frequency_gate = !self.tx_queue.is_empty();
+                self.session_tx_held_by_frequency_gate = self
+                    .session_link
+                    .as_ref()
+                    .is_some_and(|l| !l.backlog.is_empty());
             }
             return;
         }
@@ -2159,7 +3228,7 @@ impl EventLoop {
         let samples: &[f32] = if self.id_due() {
             match self.encode_id_beacon_frame() {
                 Some(id_samples) => {
-                    self.last_id_time = Instant::now();
+                    self.last_id_time = Some(Instant::now());
                     let mut buf = id_samples;
                     buf.extend_from_slice(samples);
                     combined = buf;
@@ -2170,6 +3239,10 @@ impl EventLoop {
         } else {
             samples
         };
+
+        // COP-65: the complete waveform about to play, after the gate (a
+        // refused transmission returned above and reports nothing).
+        self.report_tx_level(samples);
 
         // Assert PTT before transmitting
         self.handle_ptt_change(true).await;
@@ -2216,6 +3289,8 @@ impl EventLoop {
                 + (self.config.audio.buffer_size as u64 * 1000) / sample_rate,
         );
         let ptt_event_tx = self.event_tx.clone();
+        #[cfg(test)]
+        let panic_in_completion_task = self.panic_in_completion_task;
         tokio::spawn(async move {
             let completed = match feedback {
                 // An output worker is wired but its ring is gone: nothing
@@ -2265,6 +3340,10 @@ impl EventLoop {
                 }
                 tokio::time::sleep(tail.min(remaining)).await;
             }
+            #[cfg(test)]
+            if panic_in_completion_task {
+                panic!("COP-31 test seam: completion task dies before reporting");
+            }
             if let Err(e) = ptt_event_tx
                 .send(DaemonEvent::TxComplete {
                     generation,
@@ -2290,10 +3369,11 @@ impl EventLoop {
     /// Deliberately independent of `callsign`/station-ID configuration
     /// (unlike `id_due`/`maybe_send_beacon`, which both require
     /// `local_callsign.is_some()`): channel courtesy is basic good operating
-    /// practice, not a regulatory identification requirement, so it applies
-    /// even when no callsign is configured. Confirmed with Tony (project
-    /// owner) as a deliberate design decision, not an oversight against the
-    /// brief's literal "all three features off when callsign unset" text.
+    /// practice, not a regulatory identification requirement. Confirmed with
+    /// Tony (project owner) as a deliberate design decision, not an oversight
+    /// against the brief's literal "all three features off when callsign
+    /// unset" text. Since COP-37 `transmit_samples` refuses a transmission
+    /// with no callsign before it ever reaches this wait.
     ///
     /// `BusyGate` only updates when fed fresh audio, which this event loop
     /// otherwise only reads from `run`'s own `audio_poll` tick -- a
@@ -2315,10 +3395,12 @@ impl EventLoop {
             while self.busy_gate.current() {
                 self.observe_busy_gate_from_audio_input().await;
                 tokio::time::sleep(Duration::from_millis(hold_ms)).await;
+                self.release_overdue_ptt_while_waiting().await;
             }
 
             let holdoff_secs: f32 = rand::rng().random_range(0.5f32..2.0f32);
             tokio::time::sleep(Duration::from_secs_f32(holdoff_secs)).await;
+            self.release_overdue_ptt_while_waiting().await;
             self.observe_busy_gate_from_audio_input().await; // pick up anything that arrived during the holdoff
 
             if !self.busy_gate.current() {
@@ -2328,11 +3410,54 @@ impl EventLoop {
         }
     }
 
+    /// COP-31: the PTT backstop inside `wait_for_clear_channel`, which can
+    /// hold `run()` (and with it the 500 ms backstop tick and the keyed
+    /// interval's own `TxComplete`) for as long as the channel reads busy.
+    /// Releases without draining the TX queue: draining would recurse into
+    /// `transmit_samples`, which called the wait this runs in.
+    async fn release_overdue_ptt_while_waiting(&mut self) {
+        if let Some(keyed) = self.ptt_backstop_overdue() {
+            self.log_ptt_backstop(keyed);
+            self.force_release_ptt().await;
+        }
+    }
+
+    /// COP-60 RX->TX turnaround: hold this key-up until `rx_turnaround_until`.
+    /// A no-op when no frame was decoded within `turnaround_ms`, or when PTT
+    /// is already asserted (no key-up edge to protect). Drains the input ring
+    /// while it waits, via the same no-dispatch helper `wait_for_clear_channel`
+    /// uses: the 8,192-sample production ring holds 170 ms, so a plain sleep
+    /// drops RX audio.
+    async fn wait_for_rx_turnaround(&mut self) {
+        if self.is_transmitting {
+            return;
+        }
+        let Some(until) = self.rx_turnaround_until else {
+            return;
+        };
+        let remaining = until.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        tracing::debug!(
+            wait_ms = remaining.as_millis() as u64,
+            "Holding TX for RX->TX turnaround"
+        );
+        loop {
+            self.observe_busy_gate_from_audio_input().await;
+            let remaining = until.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            tokio::time::sleep(remaining.min(TURNAROUND_POLL)).await;
+        }
+    }
+
     /// Whether a station-ID frame is due to be prepended to the next
     /// transmission (Phase 4 Task 3): requires a configured callsign, a
-    /// non-zero `[station_id] id_interval_secs`, and at least that many
-    /// seconds since the last ID actually sent (or since `EventLoop`
-    /// construction, if none yet).
+    /// non-zero `[station_id] id_interval_secs`, and either no ID sent yet
+    /// (COP-61: the first transmission after startup identifies) or at least
+    /// that many seconds since the last one.
     fn id_due(&self) -> bool {
         // Check `local_callsign` (the parsed form), not the raw config
         // string -- an invalid-but-non-empty `callsign` string parses to
@@ -2347,7 +3472,8 @@ impl EventLoop {
         if interval == 0 {
             return false;
         }
-        self.last_id_time.elapsed() >= Duration::from_secs(interval)
+        self.last_id_time
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(interval))
     }
 
     /// Build the `Beacon`-type `MacPdu` carrying this station's
@@ -2429,8 +3555,15 @@ impl EventLoop {
             self.last_beacon_time = Instant::now();
             // A beacon already fully identifies the station; avoid also
             // prepending a redundant separate ID frame to it.
-            self.last_id_time = Instant::now();
+            let id_before = self.last_id_time.replace(Instant::now());
+            let generation = self.tx_generation;
             self.transmit_samples(&samples).await;
+            if self.tx_generation == generation {
+                // Refused (the wideband gate keys nothing and leaves
+                // `tx_generation` alone): no ID went out, so an ID still
+                // owed -- the first one included (COP-61) -- stays owed.
+                self.last_id_time = id_before;
+            }
         }
     }
 
@@ -2446,7 +3579,7 @@ impl EventLoop {
         if let Some((seq, level)) = self.probe_state {
             if newly_acked.contains(&seq) {
                 self.rate_loop.on_probe_result(level, true);
-                if let Err(e) = self.engine.set_speed_level(self.rate_loop.current_level()) {
+                if let Err(e) = self.apply_speed_level(self.rate_loop.current_level()) {
                     tracing::warn!(error = %e, "Failed to apply speed level after probe success");
                 }
                 self.probe_state = None;
@@ -2483,6 +3616,7 @@ impl EventLoop {
         // (an unbounded retransmit storm) and never reaches
         // `config.max_retransmit` to give up.
         let mut retransmit_pdus: Vec<(u8, Vec<u8>)> = Vec::new();
+        let mut timed_out = false;
         if let Some(ref mut arq_tx) = self.arq_tx {
             let retransmit_seqs = arq_tx.get_retransmits(now);
 
@@ -2517,9 +3651,7 @@ impl EventLoop {
                 .count();
             if other_timeouts > 0 {
                 self.rate_loop.on_timeout();
-                if let Err(e) = self.engine.set_speed_level(self.rate_loop.current_level()) {
-                    tracing::warn!(error = %e, "Failed to apply RateLoop's recommended speed level after timeout");
-                }
+                timed_out = true;
             }
 
             for seq in retransmit_seqs {
@@ -2528,6 +3660,13 @@ impl EventLoop {
                         TransportPdu::new_reliable(self.arq_session_id, seq, 0, data.to_vec());
                     retransmit_pdus.push((seq, pdu.to_bytes()));
                 }
+            }
+        }
+        // Applied after the `arq_tx` borrow ends: `apply_speed_level` needs all of
+        // `self` (COP-21), and must still run before the encode below.
+        if timed_out {
+            if let Err(e) = self.apply_speed_level(self.rate_loop.current_level()) {
+                tracing::warn!(error = %e, "Failed to apply RateLoop's recommended speed level after timeout");
             }
         }
         // Now encode and transmit (no more borrow on arq_tx)
@@ -3233,7 +4372,8 @@ impl EventLoop {
             MacFrameType::ConnectAck => self.handle_connect_ack_rx(pdu).await,
             MacFrameType::ConnectCfm => self.handle_connect_cfm_rx(pdu).await,
             MacFrameType::Disconnect => self.handle_incoming_disconnect(pdu).await,
-            MacFrameType::Data => self.handle_session_data(pdu),
+            MacFrameType::Data => self.handle_session_data(pdu).await,
+            MacFrameType::Ack => self.handle_session_ack(pdu).await,
             MacFrameType::Keepalive => self.handle_keepalive_rx(pdu),
             MacFrameType::Beacon => self.handle_beacon_rx(pdu),
             _ => {
@@ -3279,6 +4419,44 @@ impl EventLoop {
             return;
         }
 
+        // COP-44: a repeat CONNECT_REQ from a caller whose handshake is
+        // still half-open (it did not hear our CONNECT_ACK) replaces that
+        // session, so the caller gets a fresh ACK and the daemon keeps one
+        // session. The host was told PENDING once and is not told again. The
+        // match is the one its CFM will use (`session_id_for_frame`), so a
+        // REQ on another SSID is still refused below. A repeat whose
+        // capabilities do not parse is ignored and the pending handshake
+        // stands.
+        let pending_id = self
+            .session_id_for_frame(&pdu)
+            .filter(|&id| self.is_accepting(id));
+        let replaced = match pending_id {
+            Some(_) if LinkCapabilities::from_bytes(&pdu.payload).is_err() => {
+                tracing::debug!(remote = %pdu.src, "Unreadable repeat CONNECT_REQ; ignoring");
+                return;
+            }
+            Some(id) => {
+                tracing::info!(
+                    remote = %pdu.src, session_id = id,
+                    "Repeat CONNECT_REQ; restarting the handshake"
+                );
+                self.session_mgr.remove(id);
+                true
+            }
+            None => false,
+        };
+
+        // COP-38: one session at a time (`active_session_remote`). While a
+        // session exists, a CONNECT_REQ, the current peer's included, gets
+        // no answer, so the caller's handshake times out.
+        if let Some(active) = self.active_session_remote() {
+            tracing::info!(
+                remote = %pdu.src, active = %active,
+                "CONNECT_REQ refused: another session is active"
+            );
+            return;
+        }
+
         let remote = pdu.src.clone();
         let caps = LinkCapabilities::default();
         match self
@@ -3289,6 +4467,11 @@ impl EventLoop {
                 if let Some(session) = self.session_mgr.get_mut(id) {
                     match session.handle_connect_req(&pdu.payload) {
                         Ok(ack_pdu) => {
+                            // COP-44: announce the attempt before the ACK,
+                            // whose busy-channel wait can last seconds.
+                            if !replaced {
+                                self.notify_session(0, SessionNotice::Pending).await;
+                            }
                             let ack_bytes = ack_pdu.to_bytes();
                             match self.engine.encode_bytes(&ack_bytes) {
                                 Ok(samples) => self.transmit_samples(&samples).await,
@@ -3302,6 +4485,11 @@ impl EventLoop {
                         Err(e) => {
                             tracing::warn!(error = %e, "Failed to handle CONNECT_REQ");
                             self.session_mgr.remove(id);
+                            // The session this REQ replaced is gone too.
+                            if replaced {
+                                self.notify_session(0, SessionNotice::PendingCancelled)
+                                    .await;
+                            }
                         }
                     }
                 }
@@ -3314,7 +4502,8 @@ impl EventLoop {
 
     async fn handle_connect_ack_rx(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
-        if let Some(session) = self.session_mgr.find_by_remote_mut(&remote) {
+        let session_id = self.session_id_for_frame(&pdu);
+        if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
             match session.handle_connect_ack(&pdu.payload) {
                 Ok(cfm_pdu) => {
                     let notice = SessionNotice::Connected {
@@ -3322,6 +4511,9 @@ impl EventLoop {
                         remote,
                         we_called: true,
                     };
+                    // COP-38 (D2): the new session starts at seq 0.
+                    let session_id = session.id;
+                    self.reset_session_link(session_id);
                     // The session is established now; the busy-channel courtesy
                     // wait in transmit_samples can delay the CFM by seconds.
                     self.notify_session(0, notice).await;
@@ -3342,7 +4534,8 @@ impl EventLoop {
 
     async fn handle_connect_cfm_rx(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
-        if let Some(session) = self.session_mgr.find_by_remote_mut(&remote) {
+        let session_id = self.session_id_for_frame(&pdu);
+        if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
             match session.handle_connect_cfm(&pdu.payload) {
                 Ok(()) => {
                     session.confirm_established();
@@ -3352,10 +4545,23 @@ impl EventLoop {
                         remote,
                         we_called: false,
                     };
+                    // COP-38 (D2): the new session starts at seq 0.
+                    let session_id = session.id;
+                    self.reset_session_link(session_id);
                     self.notify_session(0, notice).await;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to handle CONNECT_CFM");
+                    // COP-44: a rejected CFM ends a pending inbound handshake
+                    // now, not 30 s later in the reaper. A stray CFM for an
+                    // established session changes nothing.
+                    if session.state == SessionState::Accepting {
+                        let session_id = session.id;
+                        self.session_mgr.remove(session_id);
+                        self.discard_session_tx(session_id).await;
+                        self.notify_session(0, SessionNotice::PendingCancelled)
+                            .await;
+                    }
                 }
             }
         } else {
@@ -3366,45 +4572,156 @@ impl EventLoop {
     async fn handle_incoming_disconnect(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
         // Find session ID first to avoid borrow issues
-        let session_id = self.session_mgr.find_by_remote(&remote).map(|s| s.id);
+        let session_id = self.session_id_for_frame(&pdu);
         if let Some(id) = session_id {
+            // Read before `handle_disconnect` sets the session `Idle`.
+            let was_pending = self.is_accepting(id);
             if let Some(session) = self.session_mgr.get_mut(id) {
                 session.handle_disconnect();
             }
             self.session_mgr.remove(id);
             tracing::info!(remote = %remote, "Session disconnected by remote");
-            self.notify_session(0, SessionNotice::Disconnected).await;
+            self.discard_session_tx(id).await;
+            // COP-44: a caller that gives up mid-handshake cancels the
+            // host's PENDING; the host never heard CONNECTED.
+            let notice = if was_pending {
+                SessionNotice::PendingCancelled
+            } else {
+                SessionNotice::Disconnected
+            };
+            self.notify_session(0, notice).await;
         } else {
             tracing::debug!(remote = %remote, "DISCONNECT from unknown remote");
         }
     }
 
-    fn handle_session_data(&mut self, pdu: MacPdu) {
+    /// Send a decoded payload to every data-port client (`client_id` 0) through
+    /// `response_tx`. The queue is unbounded, so this never waits and never
+    /// drops; with no queue wired (no VARA server) it does nothing. It fails
+    /// only when the bridge draining the queue has stopped.
+    fn deliver_to_host(&self, data: Vec<u8>) {
+        if let Some(ref tx) = self.response_tx {
+            if tx
+                .send(HostResponse::DataOut { client_id: 0, data })
+                .is_err()
+            {
+                tracing::warn!("Data-port bridge has stopped; decoded payload not delivered");
+            }
+        }
+    }
+
+    /// COP-38 (D8): a session data frame. Its `Reliable` segment goes
+    /// through the link's `ArqRx`, which delivers each new segment to the
+    /// host once and in order; every reliable frame, a duplicate included,
+    /// is ACKed, because a duplicate means our last ACK was lost. A payload
+    /// that is not a reliable `TransportPdu` (a pre-0.3.0 peer) is dropped
+    /// without `DataOut` and without an ACK.
+    async fn handle_session_data(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
-        if let Some(session) = self.session_mgr.find_by_remote_mut(&remote) {
-            if session.is_established() {
-                self.tx_frame_count = 0; // Our turn to transmit starts fresh
-                session.touch();
-                if let Some(ref tx) = self.response_tx {
-                    let _ = tx.try_send(coppa_host::HostResponse::DataOut {
-                        client_id: 0,
-                        data: pdu.payload,
-                    });
-                }
-            } else {
-                tracing::debug!(
-                    remote = %remote, state = ?session.state,
-                    "Data received but session not established"
+        let session_id = self.session_id_for_frame(&pdu);
+        let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) else {
+            tracing::debug!(
+                remote = %remote, dest = %pdu.dest,
+                "Data from unknown remote or not addressed to a session of ours"
+            );
+            return;
+        };
+        if !session.is_established() {
+            tracing::debug!(
+                remote = %remote, state = ?session.state,
+                "Data received but session not established"
+            );
+            return;
+        }
+        self.tx_frame_count = 0; // Our turn to transmit starts fresh
+        session.touch();
+        let session_id = session.id;
+        self.ensure_session_link(session_id);
+        let Some(link) = self.session_link.as_mut() else {
+            return;
+        };
+        let segment = TransportPdu::from_bytes(&pdu.payload)
+            .ok()
+            .filter(|t| t.transport_type == TransportType::Reliable);
+        let Some(segment) = segment else {
+            if !std::mem::replace(&mut link.warned_legacy_payload, true) {
+                tracing::warn!(
+                    remote = %remote,
+                    "Session data frame is not a reliable transport PDU; \
+                     is the peer running coppad older than 0.3.0? Dropping it"
                 );
             }
-        } else {
-            tracing::debug!(remote = %remote, "Data from unknown remote");
+            return;
+        };
+        let delivered = link.rx.receive(segment.seq_num, segment.payload);
+        let ack = session_ack_frame(link);
+        for (_seq, data) in delivered {
+            self.deliver_to_host(data);
+        }
+        match self.engine.encode_bytes(&ack) {
+            Ok(samples) => Box::pin(self.transmit_samples(&samples)).await,
+            Err(e) => tracing::warn!(error = %e, "Failed to encode session ACK"),
+        }
+    }
+
+    /// COP-38 (D7): the peer's ACK for session data. Frees the stop-and-wait
+    /// window, lowers `BUFFER` by the acknowledged bytes and sends the next
+    /// frame. An ACK from an unknown or unestablished peer changes nothing.
+    async fn handle_session_ack(&mut self, pdu: MacPdu) {
+        let session_id = self.session_id_for_frame(&pdu);
+        let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) else {
+            tracing::debug!(
+                remote = %pdu.src, dest = %pdu.dest,
+                "Session ACK from unknown remote or not addressed to a session of ours"
+            );
+            return;
+        };
+        if !session.is_established() {
+            return;
+        }
+        session.touch();
+        let session_id = session.id;
+        let Ok(ack) = TransportPdu::from_bytes(&pdu.payload) else {
+            return;
+        };
+        if ack.transport_type != TransportType::Ack {
+            return;
+        }
+        let Some(link) = self
+            .session_link
+            .as_mut()
+            .filter(|l| l.session_id == session_id)
+        else {
+            return;
+        };
+        // An ACK can only cover what is in flight. One ahead of `next_seq`
+        // (a stale ACK from an earlier session with this peer, or a desynced
+        // peer) would push `send_base` past `next_seq`: the window would read
+        // as full forever, with nothing left to retransmit or give up on.
+        if ack.ack_num.wrapping_sub(link.tx.send_base()) > link.tx.in_flight() {
+            tracing::debug!(
+                ack_num = ack.ack_num,
+                send_base = link.tx.send_base(),
+                next_seq = link.tx.next_seq(),
+                "Session ACK beyond what is in flight; ignoring it"
+            );
+            return;
+        }
+        let acked = link
+            .tx
+            .process_ack(ack.ack_num, ack.ack_bitmap, Instant::now());
+        if link.tx.in_flight() == 0 {
+            link.give_up_at = None;
+        }
+        if !acked.is_empty() {
+            self.report_buffer().await;
+            Box::pin(self.drain_session_link()).await;
         }
     }
 
     fn handle_keepalive_rx(&mut self, pdu: MacPdu) {
-        let remote = pdu.src.clone();
-        if let Some(session) = self.session_mgr.find_by_remote_mut(&remote) {
+        let session_id = self.session_id_for_frame(&pdu);
+        if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
             session.touch();
         }
     }
@@ -3412,17 +4729,39 @@ impl EventLoop {
     async fn handle_ptt_change(&mut self, tx: bool) {
         self.set_ptt(tx).await;
         if !tx {
-            // PTT just released: continue draining the TX queue if more is queued.
+            // PTT just released: continue draining the TX queues if more is
+            // queued (one frame per keyed interval). COP-38: the session link
+            // sends only once its in-flight frame is ACKed, so this release
+            // only resumes a frame a busy transmitter held back.
             self.try_drain_tx_queue().await;
+            self.drain_session_link().await;
         }
     }
 
     /// Change physical PTT and the keyed-interval bookkeeping, without
     /// draining the TX queue on release (see `handle_ptt_change`).
+    ///
+    /// COP-31: this is the only place the daemon drives its PTT backend, and
+    /// so the only place the PTT guardian hears about it: `K` before keying
+    /// (a keying whose reply is lost may still have keyed the rig) and `R`
+    /// only after an unkey that succeeded, so a failed unkey leaves the
+    /// guardian armed. A new direct `self.ptt.set_ptt` call must report too.
     async fn set_ptt(&mut self, tx: bool) {
         let state = if tx { PttState::Tx } else { PttState::Rx };
-        if let Err(e) = self.ptt.set_ptt(state) {
-            tracing::warn!(error = %e, "PTT control error");
+        if tx {
+            if let Some(guardian) = self.ptt_guardian.as_mut() {
+                guardian.report(true);
+            }
+        }
+        match self.ptt.set_ptt(state) {
+            Ok(()) => {
+                if !tx {
+                    if let Some(guardian) = self.ptt_guardian.as_mut() {
+                        guardian.report(false);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "PTT control error"),
         }
         tracing::info!(state = if tx { "TX" } else { "RX" }, "PTT state change");
         // Telemetry: VaraResponse::Ptt at the same moment physical PTT changes
@@ -3430,6 +4769,10 @@ impl EventLoop {
         self.emit_vara(VaraResponse::Ptt(tx)).await;
         if tx {
             self.is_transmitting = true;
+            // COP-31: every keying path starts the keyed-interval clock the
+            // PTT backstop measures (`transmit_samples` then just reads it).
+            self.tx_keyed_since
+                .get_or_insert_with(tokio::time::Instant::now);
         } else {
             self.is_transmitting = false;
             self.tx_keyed_since = None;
@@ -3451,6 +4794,25 @@ impl EventLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// COP-37: a valid callsign for stations that must transmit. A daemon
+    /// with no valid callsign refuses every transmission, so receive-only
+    /// and refusal tests keep `DaemonConfig::default()`'s empty one.
+    const TEST_CALLSIGN: &str = "N0CALL";
+
+    /// `DaemonConfig::default()` with `TEST_CALLSIGN` configured.
+    fn tx_config() -> DaemonConfig {
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = TEST_CALLSIGN.to_string();
+        config
+    }
+
+    /// COP-61: a fresh `EventLoop` prepends a station-ID frame to its first
+    /// transmission. Tests about something else call this first, so that
+    /// transmission is their payload alone.
+    fn mark_identified(event_loop: &mut EventLoop) {
+        event_loop.last_id_time = Some(Instant::now());
+    }
 
     #[test]
     fn rate_loop_caps_peer_recommendations_at_the_engine_band_limit() {
@@ -3768,7 +5130,7 @@ mod tests {
     /// chased down here.
     #[tokio::test]
     async fn cp_negotiation_full_handshake_converges_both_sides() {
-        let mut config = DaemonConfig::default();
+        let mut config = tx_config();
         config.engine.arq_enabled = true;
         config.engine.cp_gate_enabled = true;
         config.engine.cp_negotiation_enabled = true;
@@ -3975,7 +5337,7 @@ mod tests {
     }
 
     fn cp_enabled_config() -> DaemonConfig {
-        let mut config = DaemonConfig::default();
+        let mut config = tx_config();
         config.engine.arq_enabled = true;
         config.engine.cp_negotiation_enabled = true;
         config
@@ -4002,6 +5364,7 @@ mod tests {
     #[tokio::test]
     async fn confirmer_emits_cp_switched_under_the_new_profile_when_its_confirm_is_acked() {
         let mut a = EventLoop::new(cp_enabled_config()).unwrap();
+        mark_identified(&mut a);
         let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
         a.set_audio_out(producer);
 
@@ -4895,6 +6258,7 @@ mod tests {
                         VaraResponse::Connected(..)
                             | VaraResponse::Disconnected
                             | VaraResponse::Pending
+                            | VaraResponse::CancelPending
                     )
                 })
                 .collect()
@@ -4907,9 +6271,11 @@ mod tests {
         .await;
         b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_REQ"))
             .await;
-        assert!(
-            session_lines(&mut b_rx).is_empty(),
-            "REQ is not established"
+        // COP-44: the responder announces the attempt, not a connection.
+        assert_eq!(
+            session_lines(&mut b_rx),
+            [VaraResponse::Pending],
+            "REQ is pending, not established"
         );
         a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "CONNECT_ACK"))
             .await;
@@ -4954,6 +6320,7 @@ mod tests {
                         VaraResponse::Connected(..)
                             | VaraResponse::Disconnected
                             | VaraResponse::Pending
+                            | VaraResponse::CancelPending
                     )
                 })
                 .collect()
@@ -5002,9 +6369,71 @@ mod tests {
         b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_CFM"))
             .await;
 
-        let expected = [VaraResponse::Connected("W5AU".into(), "K7XYZ".into(), 2400)];
-        assert_eq!(session_lines(&mut a_rx), expected);
-        assert_eq!(session_lines(&mut b_rx), expected);
+        let connected = VaraResponse::Connected("W5AU".into(), "K7XYZ".into(), 2400);
+        assert_eq!(session_lines(&mut a_rx), std::slice::from_ref(&connected));
+        // COP-44: the responder heard PENDING at the REQ.
+        assert_eq!(session_lines(&mut b_rx), [VaraResponse::Pending, connected]);
+    }
+
+    /// COP-44: the caller's CONNECT_CFM is lost on air (COP-1 loss
+    /// injection), so the responder's half-open handshake times out. Its host
+    /// was told `PENDING`, so the reaper ends the attempt with
+    /// `CANCELPENDING`, never `DISCONNECTED` for a link it never heard of.
+    #[tokio::test]
+    async fn lost_cfm_cancels_the_pending_inbound_connect() {
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = "VK3ABC".into();
+        config.radio.ptt_pre_delay_ms = 0;
+        config.radio.ptt_tail_delay_ms = 0;
+        let mut a = EventLoop::new(config.clone()).unwrap();
+        config.engine.callsign = "W1AW".into();
+        let mut b = EventLoop::new(config).unwrap();
+        b.listening = true;
+        let (a_producer, mut a_consumer) = coppa_audio::audio_ring(1_000_000);
+        let (b_producer, mut b_consumer) = coppa_audio::audio_ring(1_000_000);
+        a.set_audio_out(a_producer);
+        b.set_audio_out(b_producer);
+        let (b_tx, mut b_rx) = mpsc::channel(64);
+        b.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, b_tx)]))));
+        fn session_lines(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<VaraResponse> {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|response| {
+                    matches!(
+                        response,
+                        VaraResponse::Connected(..)
+                            | VaraResponse::Disconnected
+                            | VaraResponse::Pending
+                            | VaraResponse::CancelPending
+                    )
+                })
+                .collect()
+        }
+
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "VK3ABC".into(),
+            destination: "W1AW".into(),
+        })
+        .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_REQ"))
+            .await;
+        assert_eq!(session_lines(&mut b_rx), [VaraResponse::Pending]);
+        a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "CONNECT_ACK"))
+            .await;
+        let _lost = take_leg(&mut a_consumer, "CONNECT_CFM");
+
+        let ids = b.session_mgr.active_sessions();
+        assert_eq!(ids.len(), 1, "{ids:?}");
+        let session = b.session_mgr.get_mut(ids[0]).unwrap();
+        assert_eq!(session.state, SessionState::Accepting);
+        session.last_activity = Instant::now()
+            .checked_sub(Duration::from_secs(
+                coppa_protocol::session::HANDSHAKE_TIMEOUT_SECS + 1,
+            ))
+            .expect("host uptime exceeds the handshake timeout");
+        b.reap_timed_out_sessions().await;
+        assert_eq!(session_lines(&mut b_rx), [VaraResponse::CancelPending]);
+        assert!(b.session_mgr.active_sessions().is_empty());
     }
 
     /// COP-28: a `MYCALL` that arrives mid-session must not break the
@@ -5050,7 +6479,7 @@ mod tests {
         // Only now wire b's response channel, so the handshake's
         // StatusUpdate lines are dropped and the next delivery is the data
         // frame's DataOut.
-        let (data_tx, mut data_rx) = mpsc::channel(64);
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
         b.set_response_tx(data_tx);
 
         // Mid-session MYCALL on the sender, then a data frame.
@@ -5065,6 +6494,11 @@ mod tests {
             data: b"hello".to_vec(),
         })
         .await;
+        // COP-41: session data is paced one frame per keyed interval, and
+        // `a` is still keyed from its CONNECT_CFM playback (whose scheduled
+        // release never fires without a `run()` loop) -- release it so the
+        // queued chunk drains, exactly as the real release task would.
+        a.handle_ptt_change(false).await;
         b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "data frame"))
             .await;
 
@@ -5073,11 +6507,627 @@ mod tests {
             .expect("b must deliver the data frame's payload")
             .expect("response channel closed");
         match got {
-            coppa_host::HostResponse::DataOut { client_id: _, data } => {
+            HostResponse::DataOut { client_id: _, data } => {
                 assert_eq!(data, b"hello");
             }
             other => panic!("expected DataOut, got {:?}", other),
         }
+    }
+
+    /// COP-38: two stations with a session established through the real
+    /// three-leg handshake (`decode_and_dispatch_audio` both ways), with
+    /// `arq_enabled` left at its default `false`, zero PTT delays, and both
+    /// stations' PTT released afterwards so the next write keys at once.
+    async fn connected_pair(
+        turnaround_ms: u64,
+    ) -> (
+        EventLoop,
+        EventLoop,
+        coppa_audio::AudioRingConsumer,
+        coppa_audio::AudioRingConsumer,
+    ) {
+        let mut config = DaemonConfig::default();
+        assert!(
+            !config.engine.arq_enabled,
+            "session ARQ must not need the flag"
+        );
+        config.engine.callsign = "VK3ABC".into();
+        config.radio.ptt_pre_delay_ms = 0;
+        config.radio.ptt_tail_delay_ms = 0;
+        config.radio.turnaround_ms = turnaround_ms;
+        let mut a = EventLoop::new(config.clone()).unwrap();
+        config.engine.callsign = "W1AW".into();
+        let mut b = EventLoop::new(config).unwrap();
+        a.listening = true;
+        b.listening = true;
+        let (a_producer, mut a_consumer) = coppa_audio::audio_ring(4_000_000);
+        let (b_producer, mut b_consumer) = coppa_audio::audio_ring(4_000_000);
+        a.set_audio_out(a_producer);
+        b.set_audio_out(b_producer);
+
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "VK3ABC".into(),
+            destination: "W1AW".into(),
+        })
+        .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_REQ"))
+            .await;
+        a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "CONNECT_ACK"))
+            .await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_CFM"))
+            .await;
+        a.handle_ptt_change(false).await;
+        b.handle_ptt_change(false).await;
+        assert!(a.session_link.is_some() && b.session_link.is_some());
+        (a, b, a_consumer, b_consumer)
+    }
+
+    /// COP-38: give `station`'s session link a 20 ms initial RTO, so a test
+    /// can elapse it with a real sleep (the `test_arq_retransmit_marks_
+    /// retransmitted_and_caps` precedent). Only before anything is in flight.
+    fn fast_session_rto(station: &mut EventLoop) {
+        let link = station.session_link.as_mut().expect("a session link");
+        assert_eq!(link.tx.in_flight(), 0, "swap the RTO before sending");
+        link.tx =
+            ArqTx::new(ArqConfig::new(SESSION_ARQ_WINDOW, 5, Duration::from_millis(20)).unwrap());
+    }
+
+    /// COP-38: feed `station` its peer's ACK for every segment it has sent, as
+    /// a real MAC `Ack` frame through `handle_mac_pdu`.
+    async fn ack_in_flight(station: &mut EventLoop) {
+        let link = station.session_link.as_ref().expect("a session link");
+        let mut peer = ArqRx::new(SESSION_ARQ_WINDOW);
+        for seq in 0..link.tx.next_seq() {
+            peer.receive(seq, Vec::new());
+        }
+        let (ack_num, bitmap) = peer.ack_info();
+        let pdu = MacPdu::new(
+            MacFrameType::Ack,
+            link.local.clone(),
+            link.remote.clone(),
+            link.ssid,
+            TransportPdu::new_ack(0, ack_num, bitmap).to_bytes(),
+        );
+        station.handle_mac_pdu(pdu).await;
+    }
+
+    /// Sleep past `station`'s current session RTO (real time: ARQ timers are
+    /// `std::time::Instant`s).
+    fn sleep_past_session_rto(station: &EventLoop) {
+        let rto = station
+            .session_link
+            .as_ref()
+            .map_or(Duration::ZERO, |l| l.tx.rto());
+        std::thread::sleep(rto + Duration::from_millis(5));
+    }
+
+    /// Every `DataOut` payload queued on `rx`, in order.
+    fn drain_data_out(rx: &mut mpsc::UnboundedReceiver<coppa_host::HostResponse>) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Ok(resp) = rx.try_recv() {
+            if let coppa_host::HostResponse::DataOut { data, .. } = resp {
+                out.push(data);
+            }
+        }
+        out
+    }
+
+    /// Wire a VARA command-port channel to `station`, for its `BUFFER`,
+    /// `PTT` and session lines.
+    fn vara_lines(station: &mut EventLoop) -> mpsc::Receiver<VaraResponse> {
+        let (tx, rx) = mpsc::channel(1024);
+        station.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, tx)]))));
+        rx
+    }
+
+    /// Every `BUFFER`/`DISCONNECTED` line queued on `rx`, in order, as the
+    /// host reads them.
+    fn drain_status(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<String> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|response| match response {
+                VaraResponse::Buffer(n) => Some(format!("BUFFER {n}")),
+                VaraResponse::Disconnected => Some("DISCONNECTED".to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Read whatever `consumer` holds, without asserting it is non-empty.
+    fn read_all(consumer: &mut coppa_audio::AudioRingConsumer) -> Vec<f32> {
+        let mut buf = vec![0.0f32; 4_000_000];
+        let read = consumer.read(&mut buf);
+        buf.truncate(read);
+        buf
+    }
+
+    /// COP-38, the ticket's scenario at the dispatch level: with
+    /// `arq_enabled = false` (the default), a connected-session write is
+    /// delivered to the peer's host, the peer keys an ACK, and that ACK
+    /// clears the sender's in-flight segment and `BUFFER` -- none of it
+    /// through the raw `arq_tx` path.
+    #[tokio::test]
+    async fn connected_session_write_is_delivered_and_acked_with_arq_disabled() {
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
+        b.set_response_tx(data_tx);
+        let payload = b"twenty-eight bytes of B2F!!!".to_vec();
+        assert_eq!(payload.len(), 28);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: payload.clone(),
+        })
+        .await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "the data frame"))
+            .await;
+        assert_eq!(drain_data_out(&mut data_rx), vec![payload]);
+        let ack = take_leg(&mut b_consumer, "b's ACK");
+        assert_eq!(a.session_link.as_ref().unwrap().tx.in_flight(), 1);
+        unstick_decoder(&mut a);
+        a.decode_and_dispatch_audio(&ack).await;
+        assert_eq!(a.session_link.as_ref().unwrap().tx.in_flight(), 0);
+        assert_eq!(a.buffered_tx_bytes(), 0);
+        assert!(!a.config.engine.arq_enabled);
+        assert!(
+            a.arq_tx.is_none(),
+            "session data never needs the raw ARQ pair"
+        );
+    }
+
+    /// Bench channel order, with noise referenced to clean power so a fade
+    /// reduces SNR. Padding belongs after the channel, at the RX boundary.
+    fn impair_hf_audio(raw: &[f32], leg_seed: u64) -> Vec<f32> {
+        let sample_rate = 48_000.0;
+        let filtered = coppa_channel::ssb_filter(raw, sample_rate);
+        let clean_power = coppa_channel::mean_power(&filtered);
+        let faded = coppa_channel::watterson::watterson_preset(
+            &filtered,
+            sample_rate,
+            coppa_channel::watterson::WattersonPreset::Good,
+            leg_seed ^ 0x3333_3333_3333_3333,
+        );
+        let noisy = coppa_channel::awgn_ref_seeded(
+            &faded,
+            24.0,
+            clean_power,
+            sample_rate,
+            leg_seed ^ 0x5555_5555_5555_5555,
+        );
+        let shifted = coppa_channel::frequency_shift(&noisy, 20.0, sample_rate);
+        let clocked = coppa_channel::sample_clock_offset(&shifted, 50.0)
+            .expect("50 ppm is a valid sampling clock offset");
+        with_lead_and_trail(&clocked)
+    }
+
+    async fn deliver_impaired_leg(
+        audio: &mut coppa_audio::AudioRingConsumer,
+        peer: &mut EventLoop,
+        seed: u64,
+        stage: &str,
+        unstick: bool,
+    ) -> Result<(), String> {
+        let raw = read_all(audio);
+        if raw.is_empty() {
+            return Err(format!("{stage}: no transmitted audio"));
+        }
+        if unstick {
+            unstick_decoder(peer);
+        }
+        peer.decode_and_dispatch_audio(&impair_hf_audio(&raw, seed))
+            .await;
+        Ok(())
+    }
+
+    fn session_notices_for_impaired_trial(
+        rx: &mut mpsc::Receiver<VaraResponse>,
+    ) -> Vec<VaraResponse> {
+        drain_vara(rx)
+            .into_iter()
+            .filter(|response| {
+                matches!(
+                    response,
+                    VaraResponse::Pending
+                        | VaraResponse::CancelPending
+                        | VaraResponse::Connected(..)
+                        | VaraResponse::Disconnected
+                )
+            })
+            .collect()
+    }
+
+    /// COP-71: every session leg crosses a realistic HF channel before the
+    /// peer's persistent streaming decoder and normal MAC/session dispatch.
+    #[tokio::test]
+    async fn impaired_hf_session_delivers_data_and_audio_ack() {
+        async fn trial(seed: u64) -> Result<(), String> {
+            let mut config = DaemonConfig::default();
+            config.engine.profile = "HF_STANDARD".into();
+            config.engine.callsign = "VK3ABC".into();
+            config.radio.ptt_pre_delay_ms = 0;
+            config.radio.ptt_tail_delay_ms = 0;
+            let (mut a, mut a_audio, mut a_vara) = wired_station(config.clone());
+            config.engine.callsign = "W1AW".into();
+            let (mut b, mut b_audio, mut b_vara) = wired_station(config);
+            a.listening = true;
+            b.listening = true;
+            assert_eq!(a.engine.speed_level(), 2);
+            assert_eq!(b.engine.speed_level(), 2);
+            // A separate two-frame streaming bug affects the first station-ID
+            // prepend under fading; this test isolates the session path.
+            mark_identified(&mut a);
+            mark_identified(&mut b);
+            let (host_tx, mut host_rx) = mpsc::unbounded_channel();
+            b.set_response_tx(host_tx);
+
+            a.handle_host_event(HostEvent::ConnectRequest {
+                client_id: 1,
+                source: "VK3ABC".into(),
+                destination: "W1AW".into(),
+            })
+            .await;
+            deliver_impaired_leg(&mut a_audio, &mut b, seed, "CONNECT_REQ", false).await?;
+            let notices = session_notices_for_impaired_trial(&mut b_vara);
+            if notices != [VaraResponse::Pending] {
+                return Err(format!("CONNECT_REQ: expected PENDING, got {notices:?}"));
+            }
+
+            deliver_impaired_leg(&mut b_audio, &mut a, seed + 0x100, "CONNECT_ACK", false).await?;
+            let notices = session_notices_for_impaired_trial(&mut a_vara);
+            if notices
+                != [VaraResponse::Connected(
+                    "VK3ABC".into(),
+                    "W1AW".into(),
+                    2400,
+                )]
+                || a.session_link.is_none()
+            {
+                return Err(format!("CONNECT_ACK: caller not established: {notices:?}"));
+            }
+
+            deliver_impaired_leg(&mut a_audio, &mut b, seed + 0x200, "CONNECT_CFM", true).await?;
+            let notices = session_notices_for_impaired_trial(&mut b_vara);
+            if notices
+                != [VaraResponse::Connected(
+                    "VK3ABC".into(),
+                    "W1AW".into(),
+                    2400,
+                )]
+                || b.session_link.is_none()
+            {
+                return Err(format!(
+                    "CONNECT_CFM: responder not established: {notices:?}"
+                ));
+            }
+            a.handle_ptt_change(false).await;
+            b.handle_ptt_change(false).await;
+
+            let payload = b"twenty-eight bytes of B2F!!!".to_vec();
+            a.handle_host_event(HostEvent::DataReceived {
+                client_id: 1,
+                data: payload.clone(),
+            })
+            .await;
+            if a.session_link.as_ref().unwrap().tx.in_flight() != 1 {
+                return Err("data: sender did not track the frame".into());
+            }
+            deliver_impaired_leg(&mut a_audio, &mut b, seed + 0x300, "data", true).await?;
+            let received = drain_data_out(&mut host_rx);
+            if received != [payload] {
+                return Err(format!("data: responder host received {received:?}"));
+            }
+
+            deliver_impaired_leg(&mut b_audio, &mut a, seed + 0x400, "data ACK", true).await?;
+            let in_flight = a.session_link.as_ref().unwrap().tx.in_flight();
+            if in_flight != 0 {
+                return Err(format!("data ACK: sender still has {in_flight} in flight"));
+            }
+            Ok(())
+        }
+
+        let seeds = [0x7100_u64, 0x8100, 0x9100];
+        let mut completed = 0;
+        let mut failures = Vec::new();
+        for seed in seeds {
+            match trial(seed).await {
+                Ok(()) => completed += 1,
+                Err(stage) => failures.push(format!("seed {seed:#x}: {stage}")),
+            }
+        }
+        assert!(
+            completed >= 2,
+            "only {completed}/3 complete impaired sessions; {}",
+            failures.join("; ")
+        );
+    }
+
+    /// COP-38 (D8): a duplicate data frame (our ACK was lost, so the peer
+    /// sent it again) is ACKed again but delivered to the host only once.
+    #[tokio::test]
+    async fn a_duplicate_session_frame_is_acked_but_delivered_once() {
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
+        b.set_response_tx(data_tx);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"once".to_vec(),
+        })
+        .await;
+        let frame = take_leg(&mut a_consumer, "the data frame");
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&frame).await;
+        take_leg(&mut b_consumer, "b's first ACK");
+        b.handle_ptt_change(false).await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&frame).await;
+        take_leg(&mut b_consumer, "b's ACK for the duplicate");
+        assert_eq!(drain_data_out(&mut data_rx), vec![b"once".to_vec()]);
+    }
+
+    /// COP-38 (D3): a session data frame whose payload is not a reliable
+    /// `TransportPdu` (what a pre-0.3.0 peer sends) reaches neither the host
+    /// nor the ACK path, and is warned about once per link.
+    #[tokio::test]
+    async fn a_non_reliable_session_payload_is_dropped_without_dataout_or_ack() {
+        let (_a, mut b, _a_consumer, mut b_consumer) = connected_pair(0).await;
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
+        b.set_response_tx(data_tx);
+        let legacy = MacPdu::new_data(
+            Callsign::new("W1AW").unwrap(),
+            Callsign::new("VK3ABC").unwrap(),
+            0,
+            b"plain old payload".to_vec(),
+        );
+        b.handle_mac_pdu(legacy).await;
+        assert!(drain_data_out(&mut data_rx).is_empty());
+        assert!(read_all(&mut b_consumer).is_empty(), "no ACK may key");
+        assert!(b.session_link.as_ref().unwrap().warned_legacy_payload);
+    }
+
+    /// COP-38 (D2): a new session starts at seq 0 on both ends, whatever the
+    /// previous session's link had reached.
+    #[tokio::test]
+    async fn session_link_restarts_at_seq_zero_on_reestablishment() {
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"first session".to_vec(),
+        })
+        .await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "the data frame"))
+            .await;
+        unstick_decoder(&mut a);
+        a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "b's ACK"))
+            .await;
+        assert_eq!(a.session_link.as_ref().unwrap().tx.next_seq(), 1);
+        assert_eq!(b.session_link.as_ref().unwrap().rx.recv_base(), 1);
+
+        a.handle_ptt_change(false).await;
+        b.handle_ptt_change(false).await;
+        a.handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+            .await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "DISCONNECT"))
+            .await;
+        assert!(a.session_link.is_none() && b.session_link.is_none());
+        a.handle_ptt_change(false).await;
+
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "VK3ABC".into(),
+            destination: "W1AW".into(),
+        })
+        .await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_REQ"))
+            .await;
+        unstick_decoder(&mut a);
+        a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "CONNECT_ACK"))
+            .await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_CFM"))
+            .await;
+        let (a_link, b_link) = (
+            a.session_link.as_ref().unwrap(),
+            b.session_link.as_ref().unwrap(),
+        );
+        assert_eq!((a_link.tx.next_seq(), a_link.rx.recv_base()), (0, 0));
+        assert_eq!((b_link.tx.next_seq(), b_link.rx.recv_base()), (0, 0));
+    }
+
+    /// COP-38, the ticket's Gherkin at the dispatch level: a data frame lost
+    /// in transit is detected by `ArqTx` (no ACK within the RTO),
+    /// retransmitted by `check_session_retransmits`, and delivered to the
+    /// peer's host exactly once; the peer's ACK then clears it.
+    #[tokio::test]
+    async fn lost_session_data_frame_is_retransmitted_and_delivered_once() {
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
+        b.set_response_tx(data_tx);
+        let mut status_rx = vara_lines(&mut a);
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"lost then found".to_vec(),
+        })
+        .await;
+        take_leg(&mut a_consumer, "the data frame that is lost");
+        a.handle_ptt_change(false).await;
+        sleep_past_session_rto(&a);
+        a.check_session_retransmits().await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "the retransmission"))
+            .await;
+        assert_eq!(
+            drain_data_out(&mut data_rx),
+            vec![b"lost then found".to_vec()]
+        );
+        unstick_decoder(&mut a);
+        a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "b's ACK"))
+            .await;
+        assert_eq!(a.session_link.as_ref().unwrap().tx.in_flight(), 0);
+        assert_eq!(a.buffered_tx_bytes(), 0);
+        assert!(drain_status(&mut status_rx).iter().any(|s| s == "BUFFER 0"));
+    }
+
+    /// COP-38: a lost ACK makes the sender retransmit; the receiver drops the
+    /// duplicate (no second `DataOut`) and re-ACKs, which clears the sender.
+    #[tokio::test]
+    async fn lost_session_ack_is_recovered_without_a_duplicate_delivery() {
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
+        b.set_response_tx(data_tx);
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"acked twice".to_vec(),
+        })
+        .await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "the data frame"))
+            .await;
+        take_leg(&mut b_consumer, "b's ACK, which is lost");
+        b.handle_ptt_change(false).await;
+        a.handle_ptt_change(false).await;
+        sleep_past_session_rto(&a);
+        a.check_session_retransmits().await;
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "the retransmission"))
+            .await;
+        assert_eq!(drain_data_out(&mut data_rx), vec![b"acked twice".to_vec()]);
+        unstick_decoder(&mut a);
+        a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "b's re-ACK"))
+            .await;
+        assert_eq!(a.session_link.as_ref().unwrap().tx.in_flight(), 0);
+    }
+
+    /// COP-38 (D7): a link whose every frame is lost ends cleanly once the
+    /// retry budget is spent: the host hears `BUFFER 0` then `DISCONNECTED`,
+    /// the session is gone, and the last frame keyed is a DISCONNECT the
+    /// peer acts on.
+    #[tokio::test]
+    async fn exhausted_session_link_sends_disconnect_and_reports_disconnected() {
+        let (mut a, mut b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        let mut status_rx = vara_lines(&mut a);
+        let mut b_status_rx = vara_lines(&mut b);
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"nobody hears this".to_vec(),
+        })
+        .await;
+        let mut last_leg = Vec::new();
+        for _ in 0..40 {
+            if a.session_link.is_none() {
+                break;
+            }
+            let leg = read_all(&mut a_consumer);
+            if !leg.is_empty() {
+                last_leg = leg;
+            }
+            a.handle_ptt_change(false).await;
+            sleep_past_session_rto(&a);
+            a.check_session_retransmits().await;
+        }
+        assert!(
+            a.session_link.is_none(),
+            "the link must fail within the budget"
+        );
+        let leg = read_all(&mut a_consumer);
+        if !leg.is_empty() {
+            last_leg = leg;
+        }
+        assert!(a.session_mgr.active_sessions().is_empty());
+        assert_eq!(a.buffered_tx_bytes(), 0);
+        let lines = drain_status(&mut status_rx);
+        let buffer_0 = lines.iter().position(|l| l == "BUFFER 0");
+        let disconnected = lines.iter().position(|l| l == "DISCONNECTED");
+        assert!(
+            buffer_0.is_some() && disconnected.is_some() && buffer_0 < disconnected,
+            "BUFFER 0 must precede DISCONNECTED, got {lines:?}"
+        );
+
+        assert!(!last_leg.is_empty(), "a must key its DISCONNECT");
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&with_lead_and_trail(&last_leg))
+            .await;
+        assert!(b.session_mgr.active_sessions().is_empty());
+        assert!(drain_status(&mut b_status_rx)
+            .iter()
+            .any(|l| l == "DISCONNECTED"));
+    }
+
+    /// COP-38 (D9a): the 8000-byte write the old large-write test carried,
+    /// at the MAC layer: every frame `a` sends is a real `encode_bytes`, `b`
+    /// receives each one rebuilt from `a`'s segment data through
+    /// `handle_mac_pdu`, and `a` gets `b`'s real ACK the same way. The byte
+    /// stream reassembles exactly, one stop-and-wait frame at a time. (The
+    /// real-audio half is `cop60_turnaround`'s 1000-byte cable test.)
+    #[tokio::test]
+    async fn session_write_of_8000_bytes_is_chunked_acked_and_reassembled() {
+        let (mut a, mut b, _a_consumer, _b_consumer) = connected_pair(0).await;
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
+        b.set_response_tx(data_tx);
+        let payload: Vec<u8> = (0..8000).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+        let frames_before = a.tx_frame_count;
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: payload.clone(),
+        })
+        .await;
+        let mut collected = Vec::new();
+        for _ in 0..1000 {
+            let Some(link) = a.session_link.as_ref() else {
+                break;
+            };
+            if link.tx.in_flight() == 0 {
+                break;
+            }
+            let seq = link.tx.send_base();
+            let frame = session_data_frame(link, seq, link.tx.get_segment_data(seq).unwrap());
+            b.handle_mac_pdu(MacPdu::from_bytes(&frame).unwrap()).await;
+            for data in drain_data_out(&mut data_rx) {
+                collected.extend(data);
+            }
+            b.handle_ptt_change(false).await;
+            let ack = session_ack_frame(b.session_link.as_ref().unwrap());
+            a.handle_ptt_change(false).await;
+            a.handle_mac_pdu(MacPdu::from_bytes(&ack).unwrap()).await;
+        }
+        assert_eq!(
+            collected, payload,
+            "the byte stream must reassemble exactly"
+        );
+        let link = a.session_link.as_ref().unwrap();
+        assert!(link.backlog.is_empty() && link.tx.in_flight() == 0);
+        // At most 95 host bytes fit a level-2 frame (budget 117 minus the
+        // 14-byte MAC and 7-byte transport headers minus one).
+        let min_frames = payload.len().div_ceil(95);
+        let frames = a.tx_frame_count - frames_before;
+        assert!(
+            frames >= min_frames,
+            "need >= {min_frames} frames, got {frames}"
+        );
+        assert_eq!(a.buffered_tx_bytes(), 0);
+    }
+
+    /// COP-41 (D4): `min_level_budget` is derived from the ladder, not a
+    /// bare constant -- it must stay at or below every level's budget and
+    /// track the ladder minimum through any future renumbering.
+    #[test]
+    fn min_level_budget_is_the_ladder_minimum() {
+        for level in 1..=9u8 {
+            assert!(
+                min_level_budget() <= max_payload_for_level(level).unwrap(),
+                "min_level_budget must not exceed level {level}'s budget"
+            );
+        }
+        // The current ladder's minimum is level 1's 56 bytes (k_used 486:
+        // 486/8 - 4 -- see speed_levels.rs's own pinned table).
+        assert_eq!(min_level_budget(), 56);
+        assert_eq!(min_level_budget(), max_payload_for_level(1).unwrap());
     }
 
     /// Two real stations with real audio rings and CP negotiation enabled,
@@ -6424,8 +8474,8 @@ mod tests {
     ///
     /// "Mock time" here follows this file's own existing convention for
     /// `Instant`-gated periodic behavior (see `last_id_time`/`last_beacon_time`'s
-    /// tests below, e.g. `event_loop.last_id_time = Instant::now() -
-    /// Duration::from_secs(600)`): directly backdate the `Instant` field a
+    /// tests below, e.g. `event_loop.last_beacon_time = Instant::now() -
+    /// Duration::from_secs(10)`): directly backdate the `Instant` field a
     /// rate gate compares against, rather than `tokio::time::advance` (which
     /// only affects `tokio::time::Instant`, not the `std::time::Instant`
     /// these fields actually use, so it wouldn't do anything here).
@@ -6466,9 +8516,20 @@ mod tests {
         // Immediately push more audio (no backdating this time): real
         // wall-clock elapsed since the broadcast above is far under the
         // rate-limit period, so this must NOT produce a second broadcast.
+        // (The same channel also carries COP-65 `audio_level` messages: these
+        // two pushes complete one 100 ms level window, so only `spectrum`
+        // messages count here.)
         event_loop.handle_audio_in(&samples).await;
+        let mut rebroadcast = false;
+        while let Ok(json) = ws_rx.try_recv() {
+            if let Ok(coppa_host::websocket::WsServerMessage::Spectrum { .. }) =
+                serde_json::from_str(&json)
+            {
+                rebroadcast = true;
+            }
+        }
         assert!(
-            ws_rx.try_recv().is_err(),
+            !rebroadcast,
             "a second push within the rate-limit period must not re-broadcast"
         );
 
@@ -6487,6 +8548,221 @@ mod tests {
         assert!(
             second_spectrum.is_some(),
             "the rate gate should re-open once its period has (mock-)elapsed"
+        );
+    }
+
+    // ── COP-65: RX/TX audio level metering ────────────────────────────────
+
+    /// One `audio_level` message, as the broadcast channel carried it.
+    #[cfg(feature = "websocket")]
+    #[derive(Debug, Clone, Copy)]
+    struct AudioLevelMsg {
+        direction: coppa_host::websocket::AudioLevelDirection,
+        peak_dbfs: f32,
+        rms_dbfs: f32,
+        clip_fraction: f32,
+        state: coppa_host::websocket::AudioLevelState,
+        duration_ms: u32,
+    }
+
+    /// Drain every pending broadcast and keep only the `audio_level` messages,
+    /// in order, optionally only one direction.
+    #[cfg(feature = "websocket")]
+    fn drain_audio_levels(
+        ws_rx: &mut tokio::sync::broadcast::Receiver<String>,
+        direction: Option<coppa_host::websocket::AudioLevelDirection>,
+    ) -> Vec<AudioLevelMsg> {
+        let mut out = Vec::new();
+        while let Ok(json) = ws_rx.try_recv() {
+            if let Ok(coppa_host::websocket::WsServerMessage::AudioLevel {
+                direction: d,
+                peak_dbfs,
+                rms_dbfs,
+                clip_fraction,
+                state,
+                duration_ms,
+                ..
+            }) = serde_json::from_str(&json)
+            {
+                if direction.is_none_or(|want| want == d) {
+                    out.push(AudioLevelMsg {
+                        direction: d,
+                        peak_dbfs,
+                        rms_dbfs,
+                        clip_fraction,
+                        state,
+                        duration_ms,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Alternating full-scale samples: every sample is clipped.
+    fn full_scale_square(len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect()
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn rx_audio_level_is_broadcast_ten_times_per_second_of_audio() {
+        use coppa_host::websocket::{AudioLevelDirection, AudioLevelState};
+
+        let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+        event_loop.set_ws_broadcast(ws_tx);
+
+        event_loop.handle_audio_in(&vec![0.01f32; 48_000]).await;
+
+        let all = drain_audio_levels(&mut ws_rx, None);
+        assert_eq!(all.len(), 10, "one rx message per 100 ms window");
+        for m in &all {
+            assert_eq!(m.direction, AudioLevelDirection::Rx);
+            assert_eq!(m.peak_dbfs, -40.0);
+            assert_eq!(m.rms_dbfs, -40.0);
+            assert_eq!(m.clip_fraction, 0.0);
+            assert_eq!(m.state, AudioLevelState::Ok);
+            assert_eq!(m.duration_ms, 100);
+        }
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn clipped_rx_audio_is_reported_as_clipping() {
+        use coppa_host::websocket::{AudioLevelDirection, AudioLevelState};
+
+        let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+        event_loop.set_ws_broadcast(ws_tx);
+
+        event_loop.handle_audio_in(&full_scale_square(14_400)).await;
+
+        let rx = drain_audio_levels(&mut ws_rx, Some(AudioLevelDirection::Rx));
+        assert_eq!(rx.len(), 3);
+        assert_eq!(rx[0].clip_fraction, 1.0);
+        assert_eq!(
+            rx[0].state,
+            AudioLevelState::Ok,
+            "one clipped window is not yet clipping"
+        );
+        assert_eq!(rx[1].state, AudioLevelState::Clipping);
+        assert_eq!(rx[2].state, AudioLevelState::Clipping);
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn rx_audio_is_not_metered_while_transmitting() {
+        let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+        event_loop.set_ws_broadcast(ws_tx);
+
+        // Half a window of clipped audio before keying.
+        event_loop.handle_audio_in(&vec![1.0f32; 2400]).await;
+        event_loop.is_transmitting = true;
+        event_loop.handle_audio_in(&vec![1.0f32; 48_000]).await;
+        assert!(
+            drain_audio_levels(&mut ws_rx, None).is_empty(),
+            "no audio_level while transmitting"
+        );
+        event_loop.is_transmitting = false;
+
+        event_loop.handle_audio_in(&vec![0.01f32; 4800]).await;
+        let rx = drain_audio_levels(&mut ws_rx, None);
+        assert_eq!(rx.len(), 1);
+        assert_eq!(
+            rx[0].clip_fraction, 0.0,
+            "the pre-TX partial window was discarded, not merged"
+        );
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test(start_paused = true)]
+    async fn busy_wait_audio_is_metered_exactly_once() {
+        let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+        event_loop.set_ws_broadcast(ws_tx);
+        let (mut audio_in_tx, audio_in_rx) = coppa_audio::audio_ring(1_000_000);
+        event_loop.set_audio_in(audio_in_rx);
+
+        audio_in_tx.write(&vec![0.01f32; 9600]);
+        event_loop.observe_busy_gate_from_audio_input().await;
+        assert_eq!(drain_audio_levels(&mut ws_rx, None).len(), 2);
+        assert!(!event_loop.pending_busy_wait_audio.is_empty());
+
+        // The deferred decode of that same audio must not meter it again.
+        event_loop.poll_audio_input().await;
+        assert!(event_loop.pending_busy_wait_audio.is_empty());
+        assert!(drain_audio_levels(&mut ws_rx, None).is_empty());
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn each_transmission_reports_one_tx_audio_level() {
+        use coppa_host::websocket::{AudioLevelDirection, AudioLevelState};
+
+        let mut config = tx_config();
+        config.radio.ptt_pre_delay_ms = 0;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        mark_identified(&mut event_loop);
+        let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+        event_loop.set_ws_broadcast(ws_tx);
+
+        let samples = event_loop.engine.encode_bytes(b"COP-65").unwrap();
+        event_loop.transmit_samples(&samples).await;
+
+        let all = drain_audio_levels(&mut ws_rx, None);
+        assert_eq!(all.len(), 1, "exactly one message per transmission");
+        let tx = all[0];
+        assert_eq!(tx.direction, AudioLevelDirection::Tx);
+        assert_eq!(
+            tx.peak_dbfs, -6.0,
+            "every frame is normalized to -6.02 dBFS"
+        );
+        assert_eq!(tx.state, AudioLevelState::Ok);
+        assert_eq!(tx.clip_fraction, 0.0);
+        assert!(
+            (-22.0..=-16.0).contains(&tx.rms_dbfs),
+            "rms {}",
+            tx.rms_dbfs
+        );
+        assert_eq!(
+            tx.duration_ms as usize,
+            samples.len() * 1000 / 48_000,
+            "no station ID was prepended, so the span is the frame itself"
+        );
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn tune_tone_tx_level_reads_minus_6_peak_minus_12_rms() {
+        use coppa_host::websocket::AudioLevelDirection;
+
+        let mut config = tx_config();
+        config.radio.ptt_pre_delay_ms = 0;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        mark_identified(&mut event_loop);
+        let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+        event_loop.set_ws_broadcast(ws_tx);
+
+        let tone = event_loop.engine.tune_tone(1.0, None);
+        event_loop.transmit_samples(&tone).await;
+
+        let tx = drain_audio_levels(&mut ws_rx, Some(AudioLevelDirection::Tx));
+        assert_eq!(tx.len(), 1);
+        assert_eq!(tx[0].peak_dbfs, -6.0);
+        assert_eq!(tx[0].rms_dbfs, -12.0);
+    }
+
+    #[tokio::test]
+    async fn rx_level_state_tracks_clipping_without_a_websocket_host() {
+        let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+        event_loop.handle_audio_in(&full_scale_square(9600)).await;
+        assert_eq!(
+            event_loop.rx_level_meter.state(),
+            crate::level_meter::LevelState::Clipping
         );
     }
 
@@ -6541,7 +8817,10 @@ mod tests {
         fn new(mut config: DaemonConfig) -> Self {
             config.radio.ptt_pre_delay_ms = 0;
             config.radio.ptt_tail_delay_ms = 0;
+            // COP-37: a TX rig transmits, so it needs a callsign.
+            config.engine.callsign = TEST_CALLSIGN.to_string();
             let mut event_loop = EventLoop::new(config).unwrap();
+            mark_identified(&mut event_loop);
             let (producer, outer) = coppa_audio::audio_ring(8192);
             event_loop.set_audio_out(producer);
             let feedback = Arc::new(OutputFeedback::default());
@@ -6882,7 +9161,7 @@ mod tests {
         config.engine.callsign = "N0CALL".to_string();
         config.station_id.id_interval_secs = 600;
         let mut rig = TxRig::new(config);
-        rig.event_loop.last_id_time = Instant::now() - Duration::from_secs(601);
+        rig.event_loop.last_id_time = Some(Instant::now() - Duration::from_secs(601));
         let id_frame = rig
             .event_loop
             .encode_id_beacon_frame()
@@ -7106,7 +9385,7 @@ mod tests {
     async fn test_connect_requires_callsign() {
         let config = DaemonConfig::default(); // callsign is empty
         let mut event_loop = EventLoop::new(config).unwrap();
-        let (resp_tx, mut resp_rx) = mpsc::channel(16);
+        let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
         event_loop.set_response_tx(resp_tx);
         let tx = event_loop.event_sender();
 
@@ -7124,7 +9403,7 @@ mod tests {
         // Should have sent DISCONNECTED status since no callsign
         let resp = resp_rx.try_recv().unwrap();
         match resp {
-            coppa_host::HostResponse::StatusUpdate { status, .. } => {
+            HostResponse::StatusUpdate { status, .. } => {
                 assert_eq!(status, "DISCONNECTED");
             }
             _ => panic!("Expected StatusUpdate"),
@@ -7136,7 +9415,7 @@ mod tests {
         let mut config = DaemonConfig::default();
         config.engine.callsign = "VK3ABC".to_string();
         let mut event_loop = EventLoop::new(config).unwrap();
-        let (resp_tx, mut resp_rx) = mpsc::channel(16);
+        let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
         event_loop.set_response_tx(resp_tx);
         let tx = event_loop.event_sender();
 
@@ -7154,7 +9433,7 @@ mod tests {
         // Should have sent CONNECTING status
         let resp = resp_rx.try_recv().unwrap();
         match resp {
-            coppa_host::HostResponse::StatusUpdate { status, .. } => {
+            HostResponse::StatusUpdate { status, .. } => {
                 assert!(
                     status.starts_with("CONNECTING"),
                     "Expected CONNECTING, got: {}",
@@ -7339,6 +9618,263 @@ mod tests {
         assert_eq!(pdu.src.as_str(), "W5AU");
     }
 
+    // ── COP-37: no valid callsign, no transmission ───────────────────────
+
+    /// This thread's `tracing` output, captured so a test can assert what a
+    /// refusal logged. `install` scopes the capture to the returned guard;
+    /// `#[tokio::test]`'s current-thread runtime runs the event loop, and
+    /// every task it spawns, on the test's own thread.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log capture lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogCapture {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(move || writer.clone())
+                    .with_ansi(false)
+                    .finish(),
+            )
+        }
+
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log capture lock")).into_owned()
+        }
+
+        /// How many captured `ERROR` lines carry the callsign refusal.
+        fn refusals(&self) -> usize {
+            self.contents()
+                .lines()
+                .filter(|line| line.contains("ERROR") && line.contains(NO_CALLSIGN_TX_REFUSAL))
+                .count()
+        }
+    }
+
+    /// A station wired to an audio-out ring and a VARA command-port client
+    /// (`client_id` 1) whose replies and telemetry the test reads back.
+    fn wired_station(
+        config: DaemonConfig,
+    ) -> (
+        EventLoop,
+        coppa_audio::AudioRingConsumer,
+        mpsc::Receiver<VaraResponse>,
+    ) {
+        let mut station = EventLoop::new(config).unwrap();
+        let (audio_tx, audio_rx) = coppa_audio::audio_ring(1_000_000);
+        station.set_audio_out(audio_tx);
+        let (vara_tx, vara_rx) = mpsc::channel(64);
+        station.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, vara_tx)]))));
+        (station, audio_rx, vara_rx)
+    }
+
+    async fn send_vara_command(station: &mut EventLoop, command: &str) {
+        station
+            .handle_host_event(HostEvent::VaraCommand {
+                client_id: 1,
+                command: command.into(),
+            })
+            .await;
+    }
+
+    fn drain_vara(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<VaraResponse> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// The audio the station has written for transmission, once the `run`
+    /// TX tick would have moved it into the audio-out ring.
+    fn transmitted_samples(
+        station: &EventLoop,
+        audio_rx: &mut coppa_audio::AudioRingConsumer,
+    ) -> usize {
+        station.flush_pending_audio_out();
+        audio_rx.available()
+    }
+
+    /// The ticket's scenario: with no callsign or an invalid one configured,
+    /// `TUNE` keys nothing and writes no audio, and the daemon logs why. The
+    /// daemon still starts (receive-only) and still answers `OK`, which only
+    /// says the command parsed.
+    #[tokio::test]
+    async fn tune_is_refused_and_logged_without_a_valid_callsign() {
+        for callsign in ["", "W5AU!"] {
+            let logs = LogCapture::default();
+            let _guard = logs.install();
+            let mut config = DaemonConfig::default();
+            config.engine.callsign = callsign.to_string();
+            let (mut station, mut audio_rx, mut vara_rx) = wired_station(config);
+            assert_eq!(station.local_callsign, None, "{callsign:?}");
+            if !callsign.is_empty() {
+                assert!(
+                    logs.contents()
+                        .contains("transmission disabled until a valid MYCALL is set"),
+                    "an invalid callsign must warn at startup that TX is disabled, got: {}",
+                    logs.contents()
+                );
+            }
+
+            send_vara_command(&mut station, "TUNE 1").await;
+
+            assert_eq!(
+                drain_vara(&mut vara_rx),
+                vec![VaraResponse::Ok],
+                "{callsign:?}: TUNE must be answered OK with no PTT bracket"
+            );
+            assert!(!station.is_transmitting, "{callsign:?}");
+            assert_eq!(
+                transmitted_samples(&station, &mut audio_rx),
+                0,
+                "{callsign:?}: no tone may reach the audio sink"
+            );
+            assert_eq!(
+                logs.refusals(),
+                1,
+                "{callsign:?}: the refusal must be logged once, got: {}",
+                logs.contents()
+            );
+        }
+    }
+
+    /// Sessionless host data with no callsign is refused before ARQ
+    /// registration or queueing, so it leaves no outstanding ARQ segment, no
+    /// queued payload and no `BUFFER` count behind -- with ARQ off and on.
+    #[tokio::test]
+    async fn sessionless_host_data_is_refused_without_a_callsign_and_leaves_nothing_buffered() {
+        for arq_enabled in [false, true] {
+            let logs = LogCapture::default();
+            let _guard = logs.install();
+            let mut config = DaemonConfig::default();
+            config.host.sessionless_tx_enabled = true;
+            config.engine.arq_enabled = arq_enabled;
+            let (mut station, mut audio_rx, mut vara_rx) = wired_station(config);
+
+            station
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x42; 40],
+                })
+                .await;
+
+            assert_eq!(
+                drain_vara(&mut vara_rx),
+                Vec::<VaraResponse>::new(),
+                "arq={arq_enabled}: no BUFFER or PTT telemetry for a refused payload"
+            );
+            assert!(station.tx_queue.is_empty(), "arq={arq_enabled}");
+            assert_eq!(station.buffered_tx_bytes(), 0, "arq={arq_enabled}");
+            if let Some(arq_tx) = station.arq_tx.as_ref() {
+                assert_eq!(arq_tx.in_flight(), 0, "no ARQ segment may be registered");
+                assert_eq!(arq_tx.unacked_bytes(), 0);
+            }
+            assert!(!station.is_transmitting, "arq={arq_enabled}");
+            assert_eq!(transmitted_samples(&station, &mut audio_rx), 0);
+            assert_eq!(
+                logs.refusals(),
+                1,
+                "arq={arq_enabled}: the refusal must be logged once, got: {}",
+                logs.contents()
+            );
+        }
+    }
+
+    /// The same `TUNE` transmits once a valid callsign is in force, whether
+    /// configured or given later by `MYCALL`.
+    #[tokio::test]
+    async fn tune_transmits_once_a_valid_callsign_is_in_force() {
+        let logs = LogCapture::default();
+        let _guard = logs.install();
+
+        let (mut configured, mut audio_rx, mut vara_rx) = wired_station(tx_config());
+        send_vara_command(&mut configured, "TUNE 1").await;
+        assert_eq!(
+            drain_vara(&mut vara_rx),
+            vec![VaraResponse::Ok, VaraResponse::Ptt(true)],
+            "a configured callsign must let TUNE key PTT"
+        );
+        assert!(transmitted_samples(&configured, &mut audio_rx) > 0);
+
+        let (mut unconfigured, mut audio_rx, mut vara_rx) = wired_station(DaemonConfig::default());
+        send_vara_command(&mut unconfigured, "TUNE 1").await;
+        assert_eq!(drain_vara(&mut vara_rx), vec![VaraResponse::Ok]);
+        assert_eq!(transmitted_samples(&unconfigured, &mut audio_rx), 0);
+        assert_eq!(logs.refusals(), 1, "got: {}", logs.contents());
+
+        send_vara_command(&mut unconfigured, "MYCALL W5AU").await;
+        send_vara_command(&mut unconfigured, "TUNE 1").await;
+        assert_eq!(
+            drain_vara(&mut vara_rx),
+            vec![VaraResponse::Ok, VaraResponse::Ok, VaraResponse::Ptt(true)],
+            "a valid MYCALL must let the next TUNE key PTT"
+        );
+        assert!(transmitted_samples(&unconfigured, &mut audio_rx) > 0);
+        assert_eq!(
+            logs.refusals(),
+            1,
+            "only the TUNE before MYCALL may be refused, got: {}",
+            logs.contents()
+        );
+    }
+
+    /// COP-61, the ticket's scenario: a just-started station's first
+    /// transmission carries station ID on every host TX path -- a raw send,
+    /// an ARQ frame and a `TUNE` -- well within `id_interval_secs`.
+    #[tokio::test]
+    async fn first_transmission_after_startup_carries_station_id_on_every_host_path() {
+        for path in ["raw", "arq", "tune"] {
+            let mut config = tx_config();
+            config.host.sessionless_tx_enabled = true;
+            config.engine.arq_enabled = path == "arq";
+            let (mut station, mut audio_rx, _vara_rx) = wired_station(config);
+
+            if path == "tune" {
+                send_vara_command(&mut station, "TUNE 1").await;
+            } else {
+                station
+                    .handle_host_event(HostEvent::DataReceived {
+                        client_id: 1,
+                        data: b"hello coppa".to_vec(),
+                    })
+                    .await;
+            }
+
+            let available = transmitted_samples(&station, &mut audio_rx);
+            assert!(available > 0, "{path}: the station must transmit");
+            let mut captured = vec![0.0f32; available];
+            audio_rx.read(&mut captured);
+            let mut decoder = coppa_engine::CoppaCore::new();
+            let frames = decoder.push_samples(&with_lead_and_trail(&captured));
+            let first = frames
+                .first()
+                .unwrap_or_else(|| panic!("{path}: the transmission must decode"));
+            let payload = first
+                .payload
+                .as_deref()
+                .unwrap_or_else(|e| panic!("{path}: the first frame must decode: {e}"));
+            let id = MacPdu::from_bytes(payload)
+                .unwrap_or_else(|e| panic!("{path}: the first frame must be a MacPdu: {e}"));
+            assert_eq!(
+                id.frame_type,
+                MacFrameType::Beacon,
+                "{path}: the first frame must be the station ID"
+            );
+            assert_eq!(id.src.as_str(), TEST_CALLSIGN, "{path}");
+        }
+    }
+
     /// COP-28: the keepalive sends `IAMALIVE` to every wired client exactly
     /// once per 60 s period, with the first one a full period after start
     /// (nothing at t=0).
@@ -7414,9 +9950,10 @@ mod tests {
 
     #[tokio::test]
     async fn arq_receive_transmits_a_real_ack_with_rate() {
-        let mut config = DaemonConfig::default();
+        let mut config = tx_config();
         config.engine.arq_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
+        mark_identified(&mut event_loop);
         event_loop.arq_rx = Some(ArqRx::new(8));
         event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
 
@@ -7485,6 +10022,35 @@ mod tests {
             ack_pdu.suggested_rate().is_some(),
             "ACK should carry a rate recommendation"
         );
+    }
+
+    #[tokio::test]
+    async fn cop21_a_peer_ack_that_raises_a_level_derived_engine_to_5_lands_on_hf() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        config.engine.profile = "HF-STANDARD-TYPO".into();
+        config.radio.frequency_hz = Some(14_074_000);
+        let mut event_loop = EventLoop::new(config).unwrap();
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+        event_loop.engine.set_speed_level(4).unwrap();
+        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 4);
+        for _ in 0..5 {
+            let ack = TransportPdu::new_ack_with_rate(0, 0, 0, 9);
+            event_loop
+                .decode_and_dispatch_audio(&peer_frame(
+                    &ack,
+                    coppa_codec::ofdm::CoppaProfile::hf_standard(),
+                ))
+                .await;
+        }
+        assert_eq!(
+            event_loop.rate_loop.current_level(),
+            5,
+            "premise: RateLoop crossed 4 -> 5"
+        );
+        assert_eq!(event_loop.engine.speed_level(), 5);
+        assert_eq!(event_loop.engine.occupied_bandwidth_hz(), 2400);
+        assert_eq!(event_loop.engine.config().ofdm_band, OfdmBand::Hf);
     }
 
     #[tokio::test]
@@ -7869,15 +10435,114 @@ mod tests {
         use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
         use tokio::net::TcpStream;
 
+        // COP-34: a host that reads slowly never loses a state line. Each of
+        // these wires one in-process client whose queue the test drains only
+        // at the end, as a host that has stopped reading would.
+
+        /// An `EventLoop` with one command-port client (`client_id` 1) on a
+        /// real `response_channel`, plus the shared sender map.
+        fn slow_host() -> (EventLoop, VaraResponseSenders, mpsc::Receiver<VaraResponse>) {
+            let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+            let (tx, rx) = coppa_host::vara::response_channel();
+            let senders: VaraResponseSenders = Arc::new(Mutex::new(HashMap::from([(1, tx)])));
+            event_loop.set_vara_responses(senders.clone());
+            (event_loop, senders, rx)
+        }
+
+        fn drain(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<VaraResponse> {
+            std::iter::from_fn(|| rx.try_recv().ok()).collect()
+        }
+
+        #[tokio::test]
+        async fn slow_host_receives_every_ptt_transition() {
+            let (mut event_loop, _senders, mut rx) = slow_host();
+            for _ in 0..coppa_host::vara::TELEMETRY_QUEUE_DEPTH {
+                event_loop.emit_vara(VaraResponse::Busy(true)).await;
+            }
+            let sent: Vec<bool> = (0..70).map(|i| i % 2 == 0).collect();
+            for &on in &sent {
+                event_loop.handle_ptt_change(on).await;
+            }
+            event_loop.emit_vara(VaraResponse::Busy(false)).await;
+
+            let lines = drain(&mut rx);
+            let ptt: Vec<bool> = lines
+                .iter()
+                .filter_map(|line| match line {
+                    VaraResponse::Ptt(on) => Some(*on),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(ptt, sent, "every PTT transition must arrive, in order");
+            assert_eq!(lines.last(), Some(&VaraResponse::Ptt(false)));
+            assert!(
+                !lines.contains(&VaraResponse::Busy(false)),
+                "BUSY past the telemetry depth must be dropped"
+            );
+        }
+
+        #[tokio::test]
+        async fn slow_host_receives_disconnected_behind_a_busy_backlog() {
+            let (event_loop, _senders, mut rx) = slow_host();
+            for _ in 0..coppa_host::vara::TELEMETRY_QUEUE_DEPTH {
+                event_loop.emit_vara(VaraResponse::Busy(true)).await;
+            }
+            event_loop
+                .notify_session(1, SessionNotice::Disconnected)
+                .await;
+
+            let lines = drain(&mut rx);
+            assert_eq!(lines.len(), coppa_host::vara::TELEMETRY_QUEUE_DEPTH + 1);
+            assert_eq!(lines.last(), Some(&VaraResponse::Disconnected));
+        }
+
+        #[tokio::test]
+        async fn host_that_stops_reading_is_disconnected_not_skipped() {
+            let (event_loop, senders, mut rx) = slow_host();
+            for i in 0..COMMAND_QUEUE_DEPTH {
+                event_loop.emit_vara(VaraResponse::Ptt(i % 2 == 0)).await;
+            }
+            assert!(senders.lock().await.contains_key(&1));
+            event_loop.emit_vara(VaraResponse::Ptt(false)).await;
+            assert!(
+                !senders.lock().await.contains_key(&1),
+                "a client that cannot take a state line must be disconnected"
+            );
+
+            for i in 0..COMMAND_QUEUE_DEPTH {
+                assert_eq!(rx.recv().await, Some(VaraResponse::Ptt(i % 2 == 0)));
+            }
+            assert_eq!(rx.recv().await, None, "the queue must end, not skip");
+        }
+
+        #[tokio::test]
+        async fn reply_to_a_full_queue_disconnects_the_client() {
+            let (event_loop, senders, mut rx) = slow_host();
+            for _ in 0..COMMAND_QUEUE_DEPTH {
+                event_loop.emit_vara(VaraResponse::Buffer(0)).await;
+            }
+            event_loop.reply_vara(1, VaraResponse::Ok).await;
+            assert!(
+                !senders.lock().await.contains_key(&1),
+                "a reply that does not fit must disconnect the client"
+            );
+
+            for _ in 0..COMMAND_QUEUE_DEPTH {
+                assert_eq!(rx.recv().await, Some(VaraResponse::Buffer(0)));
+            }
+            assert_eq!(rx.recv().await, None);
+        }
+
         /// Config tuned so a real `transmit_samples` call's scheduled PTT-release
         /// delay resolves in ~0ms: a very high nominal sample rate makes
         /// `audio_duration_ms`/`drain_ms` truncate to 0 (integer ms math), and the
         /// pre/tail delays are zeroed. This only affects the *scheduling* math in
         /// `transmit_samples` — the engine's own internal encode rate is fixed at
         /// 48 kHz regardless (see `CLAUDE.md`), so encoding real payloads is
-        /// unaffected.
+        /// unaffected. It carries `TEST_CALLSIGN` (COP-37) so the station may
+        /// transmit at all.
         fn fast_ptt_config() -> DaemonConfig {
-            let mut config = DaemonConfig::default();
+            let mut config = tx_config();
             config.audio.sample_rate = 100_000_000;
             config.audio.buffer_size = 0;
             config.radio.ptt_pre_delay_ms = 0;
@@ -8065,7 +10730,7 @@ mod tests {
             )
         }
 
-        fn seed_established(event_loop: &mut EventLoop) -> u8 {
+        pub(super) fn seed_established(event_loop: &mut EventLoop) -> u8 {
             let id = event_loop
                 .session_mgr
                 .create(
@@ -8083,9 +10748,15 @@ mod tests {
         }
 
         fn is_session_line(line: &str) -> bool {
-            ["CONNECTED", "DISCONNECTED", "CONNECTING", "PENDING"]
-                .iter()
-                .any(|prefix| line.starts_with(prefix))
+            [
+                "CONNECTED",
+                "DISCONNECTED",
+                "CONNECTING",
+                "PENDING",
+                "CANCELPENDING",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
         }
 
         async fn next_session_line(reader: &mut BufReader<OwnedReadHalf>) -> String {
@@ -8124,13 +10795,17 @@ mod tests {
             );
         }
 
+        /// COP-44: over the real command port, a listening responder hears
+        /// `PENDING` when it answers the caller's CONNECT_REQ, and
+        /// `CONNECTED` only after the CFM.
         #[tokio::test]
-        async fn responder_hears_connected_only_after_cfm() {
+        async fn responder_hears_pending_then_connected() {
             let mut station = EventLoop::new(session_config()).unwrap();
             station.listening = true;
             let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19442, 19443).await;
             let mut remote = peer();
             station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            assert_eq!(next_session_line(&mut reader).await.trim_end(), "PENDING");
             assert!(read_available_lines(&mut reader)
                 .await
                 .iter()
@@ -8204,6 +10879,233 @@ mod tests {
                 next_session_line(&mut reader).await.trim_end(),
                 "DISCONNECTED"
             );
+        }
+
+        // COP-44: inbound connect attempts. Each test drives one listening
+        // responder (VK3ABC) with `peer()` (W1AW) as the caller and reads
+        // the command-port client's queue.
+
+        /// A listening responder with one in-process command-port client
+        /// (`client_id` 1) and that client's queue.
+        fn listening_responder() -> (EventLoop, mpsc::Receiver<VaraResponse>) {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            station.listening = true;
+            let (tx, rx) = mpsc::channel(64);
+            station.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, tx)]))));
+            (station, rx)
+        }
+
+        fn is_session_notice(line: &VaraResponse) -> bool {
+            matches!(
+                line,
+                VaraResponse::Pending
+                    | VaraResponse::CancelPending
+                    | VaraResponse::Connected(..)
+                    | VaraResponse::Disconnected
+            )
+        }
+
+        fn session_notices(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<VaraResponse> {
+            drain(rx).into_iter().filter(is_session_notice).collect()
+        }
+
+        /// A CFM whose negotiated capabilities exceed what both sides
+        /// advertised, so `handle_connect_cfm` rejects it.
+        fn oversized_cfm() -> MacPdu {
+            MacPdu::new(
+                MacFrameType::ConnectCfm,
+                Callsign::new("VK3ABC").unwrap(),
+                Callsign::new("W1AW").unwrap(),
+                0,
+                LinkCapabilities {
+                    max_payload_size: 9999,
+                    ..Default::default()
+                }
+                .to_bytes(),
+            )
+        }
+
+        #[tokio::test]
+        async fn peer_disconnect_during_inbound_handshake_sends_cancelpending() {
+            let (mut station, mut rx) = listening_responder();
+            let mut remote = peer();
+            station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            assert_eq!(session_notices(&mut rx), [VaraResponse::Pending]);
+            station.handle_mac_pdu(remote.disconnect().unwrap()).await;
+            assert_eq!(session_notices(&mut rx), [VaraResponse::CancelPending]);
+            assert!(station.session_mgr.active_sessions().is_empty());
+        }
+
+        #[tokio::test]
+        async fn rejected_cfm_cancels_pending_at_once() {
+            let (mut station, mut rx) = listening_responder();
+            let mut remote = peer();
+            station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            station.handle_mac_pdu(oversized_cfm()).await;
+            // No reaper call: the session ends with the rejected CFM.
+            assert_eq!(
+                session_notices(&mut rx),
+                [VaraResponse::Pending, VaraResponse::CancelPending]
+            );
+            assert!(station.session_mgr.active_sessions().is_empty());
+        }
+
+        /// A rejected CFM for an established session is a stray, not the end
+        /// of a pending handshake: it changes nothing.
+        #[tokio::test]
+        async fn rejected_cfm_for_an_established_session_changes_nothing() {
+            let (mut station, mut rx) = listening_responder();
+            let id = seed_established(&mut station);
+            station.handle_mac_pdu(oversized_cfm()).await;
+            assert!(session_notices(&mut rx).is_empty());
+            assert_eq!(station.session_mgr.active_sessions(), vec![id]);
+        }
+
+        #[tokio::test]
+        async fn host_disconnect_during_inbound_handshake_sends_cancelpending_then_disconnected() {
+            let (mut station, mut rx) = listening_responder();
+            station.handle_mac_pdu(peer().initiate().unwrap()).await;
+            station
+                .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+                .await;
+            assert_eq!(
+                session_notices(&mut rx),
+                [
+                    VaraResponse::Pending,
+                    VaraResponse::CancelPending,
+                    VaraResponse::Disconnected
+                ]
+            );
+            assert!(station.session_mgr.active_sessions().is_empty());
+        }
+
+        #[tokio::test]
+        async fn repeat_connect_req_keeps_one_session_and_one_pending() {
+            let (mut station, mut rx) = listening_responder();
+            let mut remote = peer();
+            let req = remote.initiate().unwrap();
+            station.handle_mac_pdu(req.clone()).await;
+            station.handle_mac_pdu(req).await;
+            let lines = drain(&mut rx);
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|l| is_session_notice(l))
+                    .collect::<Vec<_>>(),
+                [&VaraResponse::Pending],
+                "{lines:?}"
+            );
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|l| **l == VaraResponse::Ptt(true))
+                    .count(),
+                2,
+                "each REQ is answered with its own CONNECT_ACK: {lines:?}"
+            );
+            let ids = station.session_mgr.active_sessions();
+            assert_eq!(ids.len(), 1, "{ids:?}");
+            assert_eq!(
+                station.session_mgr.get(ids[0]).unwrap().state,
+                SessionState::Accepting
+            );
+
+            let cfm = remote
+                .handle_connect_ack(&LinkCapabilities::default().to_bytes())
+                .unwrap();
+            station.handle_mac_pdu(cfm).await;
+            assert_eq!(
+                session_notices(&mut rx),
+                [VaraResponse::Connected(
+                    "W1AW".into(),
+                    "VK3ABC".into(),
+                    2400
+                )]
+            );
+            station.reap_timed_out_sessions().await;
+            assert!(session_notices(&mut rx).is_empty());
+        }
+
+        /// A REQ from the pending caller that cannot restart its handshake
+        /// (unreadable capabilities, or another SSID) leaves the pending
+        /// handshake as it was: no line, and the original CFM still connects.
+        #[tokio::test]
+        async fn unmatched_repeat_connect_req_keeps_the_pending_handshake() {
+            let (mut station, mut rx) = listening_responder();
+            let mut remote = peer();
+            station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            assert_eq!(session_notices(&mut rx), [VaraResponse::Pending]);
+            let unreadable = MacPdu::new(
+                MacFrameType::ConnectReq,
+                Callsign::new("VK3ABC").unwrap(),
+                Callsign::new("W1AW").unwrap(),
+                0,
+                vec![0; 6],
+            );
+            let other_ssid = coppa_protocol::session::Session::new(
+                0,
+                Callsign::new("W1AW").unwrap(),
+                Callsign::new("VK3ABC").unwrap(),
+                3,
+                LinkCapabilities::default(),
+            )
+            .initiate()
+            .unwrap();
+            for (what, req) in [("unreadable", unreadable), ("SSID 3", other_ssid)] {
+                station.handle_mac_pdu(req).await;
+                assert!(session_notices(&mut rx).is_empty(), "{what}");
+                let ids = station.session_mgr.active_sessions();
+                assert_eq!(ids.len(), 1, "{what}: {ids:?}");
+                let session = station.session_mgr.get(ids[0]).unwrap();
+                assert_eq!(
+                    (session.state, session.ssid),
+                    (SessionState::Accepting, 0),
+                    "{what}"
+                );
+            }
+            let cfm = remote
+                .handle_connect_ack(&LinkCapabilities::default().to_bytes())
+                .unwrap();
+            station.handle_mac_pdu(cfm).await;
+            assert_eq!(
+                session_notices(&mut rx),
+                [VaraResponse::Connected(
+                    "W1AW".into(),
+                    "VK3ABC".into(),
+                    2400
+                )]
+            );
+        }
+
+        #[tokio::test]
+        async fn ignored_connect_req_emits_no_pending() {
+            let other_station = coppa_protocol::session::Session::new(
+                0,
+                Callsign::new("W1AW").unwrap(),
+                Callsign::new("K7XYZ").unwrap(),
+                0,
+                LinkCapabilities::default(),
+            )
+            .initiate()
+            .unwrap();
+            let short_payload = MacPdu::new(
+                MacFrameType::ConnectReq,
+                Callsign::new("VK3ABC").unwrap(),
+                Callsign::new("W1AW").unwrap(),
+                0,
+                vec![0; 6],
+            );
+            for (what, listening, req) in [
+                ("not listening", false, peer().initiate().unwrap()),
+                ("addressed to K7XYZ", true, other_station),
+                ("payload shorter than 7 bytes", true, short_payload),
+            ] {
+                let (mut station, mut rx) = listening_responder();
+                station.listening = listening;
+                station.handle_mac_pdu(req).await;
+                assert!(station.session_mgr.active_sessions().is_empty(), "{what}");
+                assert!(session_notices(&mut rx).is_empty(), "{what}");
+            }
         }
 
         /// COP-28: Pat's startup burst — commands the parser does not know
@@ -8468,6 +11370,20 @@ mod tests {
         #[tokio::test]
         async fn websocket_hears_connected_and_disconnected_and_status_follows() {
             use coppa_host::websocket::{WsServerMessage, WsStatus};
+            // The same channel carries COP-65 `audio_level` messages (one per
+            // transmission the connect/disconnect handshake makes); only the
+            // session pushes count here.
+            fn next_session_push(
+                rx: &mut tokio::sync::broadcast::Receiver<String>,
+            ) -> Option<WsServerMessage> {
+                while let Ok(json) = rx.try_recv() {
+                    let msg: WsServerMessage = serde_json::from_str(&json).unwrap();
+                    if !matches!(msg, WsServerMessage::AudioLevel { .. }) {
+                        return Some(msg);
+                    }
+                }
+                None
+            }
             let mut station = EventLoop::new(session_config()).unwrap();
             let (tx, mut rx) = tokio::sync::broadcast::channel(16);
             let status = Arc::new(Mutex::new(WsStatus::default()));
@@ -8485,8 +11401,7 @@ mod tests {
                 .handle_connect_req(&LinkCapabilities::default().to_bytes())
                 .unwrap();
             station.handle_mac_pdu(ack).await;
-            let msg: WsServerMessage =
-                serde_json::from_str(&rx.try_recv().expect("connected push")).unwrap();
+            let msg = next_session_push(&mut rx).expect("connected push");
             assert!(
                 matches!(msg, WsServerMessage::Connected { remote_call } if remote_call == "W1AW")
             );
@@ -8496,13 +11411,15 @@ mod tests {
                 assert_eq!(snap.remote_call.as_deref(), Some("W1AW"));
             }
             station.handle_mac_pdu(remote.disconnect().unwrap()).await;
-            let msg: WsServerMessage =
-                serde_json::from_str(&rx.try_recv().expect("disconnected push")).unwrap();
+            let msg = next_session_push(&mut rx).expect("disconnected push");
             assert!(matches!(msg, WsServerMessage::Disconnected));
             let snap = status.lock().await;
             assert!(!snap.connected);
             assert_eq!(snap.remote_call, None);
-            assert!(rx.try_recv().is_err(), "exactly one push per transition");
+            assert!(
+                next_session_push(&mut rx).is_none(),
+                "exactly one push per transition"
+            );
         }
 
         /// Zero-lead/trail-padded encode, mirroring `coppa-engine`'s own streaming
@@ -9073,47 +11990,88 @@ mod tests {
         /// COP-30: on the non-ARQ raw path, `BUFFER` counts host payload
         /// bytes (not frames), and a frame's bytes leave the count only when
         /// PTT releases after it has played -- not when it is popped for TX.
+        /// COP-41: the host writes now go through the chunker, so the
+        /// 5000-byte write becomes ~50 queue entries and intermediate
+        /// `BUFFER` lines appear both as it enqueues and as it drains one
+        /// frame per release -- the byte totals are asserted instead of the
+        /// old exact six-line sequence.
         ///
-        /// Forces `is_transmitting = true` before enqueuing so all three
-        /// payloads stack up in the queue instead of draining immediately
-        /// (simulating a client bursting data faster than the half-duplex link
-        /// can send it), then drains deterministically (bypassing the real
-        /// scheduled-PTT-release timer, which
+        /// Forces `is_transmitting = true` before writing so every byte
+        /// stacks up in the queue instead of draining immediately
+        /// (simulating a client bursting data faster than the half-duplex
+        /// link can send it), then drains deterministically (bypassing the
+        /// real scheduled-PTT-release timer, which
         /// `test_ptt_telemetry_brackets_transmission` already covers) by
-        /// calling the same internal hooks each real transmission's completion
-        /// would trigger.
+        /// calling the same internal hooks each real transmission's
+        /// completion would trigger.
         #[tokio::test]
         async fn test_buffer_telemetry_counts_bytes_and_drains_on_ptt_release() {
-            let config = fast_ptt_config();
+            let mut config = fast_ptt_config();
+            // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
+            config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
             let (mut reader, _write_half) =
                 connect_mock_vara_client(&mut event_loop, 19490, 19491).await;
 
             event_loop.is_transmitting = true;
-            event_loop.enqueue_tx(None, vec![0x11; 5]).await;
-            event_loop.enqueue_tx(None, vec![0x22; 5000]).await;
-            event_loop.enqueue_tx(None, vec![0x33; 6]).await;
-            assert_eq!(event_loop.tx_queue.len(), 3);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x11; 5],
+                })
+                .await;
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x22; 5000],
+                })
+                .await;
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x33; 6],
+                })
+                .await;
+            assert!(!event_loop.tx_queue.is_empty());
 
             event_loop.is_transmitting = false;
-            event_loop.try_drain_tx_queue().await; // pops the 5 bytes: still counted
-            event_loop.handle_ptt_change(false).await; // 5 played -> drains the 5000
-            event_loop.handle_ptt_change(false).await; // 5000 played -> drains the 6
-            event_loop.handle_ptt_change(false).await; // 6 played -> queue empty
+            while !event_loop.tx_queue.is_empty() {
+                event_loop.handle_ptt_change(false).await;
+                // The client's response queue is bounded (`broadcast_vara`
+                // drops BUSY/SNR past 64 waiting lines and disconnects a client
+                // whose queue is full), and nothing in the drain yields to its
+                // write task: let it flush each frame's lines.
+                tokio::task::yield_now().await;
+            }
+            // Release the final frame's bytes too.
+            event_loop.handle_ptt_change(false).await;
             assert_eq!(event_loop.tx_queue.len(), 0);
 
             let lines = read_available_lines(&mut reader).await;
+            let values = buffer_values(&lines);
+            let nums: Vec<usize> = values
+                .iter()
+                .filter_map(|l| l.strip_prefix("BUFFER ").and_then(|n| n.parse().ok()))
+                .collect();
+            assert_eq!(nums.first(), Some(&5), "got: {:?}", lines);
+            // Everything enqueues while keyed, so the running count peaks at
+            // exactly 5 + 5000 + 6 -- the byte totals COP-30 pinned.
+            let peak = nums.iter().position(|&n| n == 5011);
             assert_eq!(
-                buffer_values(&lines),
-                vec![
-                    "BUFFER 5",
-                    "BUFFER 5005",
-                    "BUFFER 5011",
-                    "BUFFER 5006",
-                    "BUFFER 6",
-                    "BUFFER 0"
-                ],
-                "expected byte counts that drop only as each frame's PTT releases, got: {:?}",
+                nums.last(),
+                Some(&0),
+                "the last BUFFER line must be zero, got: {:?}",
+                lines
+            );
+            let peak = peak.expect("BUFFER must peak at the full 5 + 5000 + 6 bytes");
+            assert!(
+                nums[..=peak].windows(2).all(|w| w[0] < w[1]),
+                "values must rise to the peak as chunks enqueue, got: {:?}",
+                lines
+            );
+            assert!(
+                nums[peak..].windows(2).all(|w| w[0] > w[1]),
+                "values must decline as each frame's PTT releases, got: {:?}",
                 lines
             );
         }
@@ -9188,11 +12146,14 @@ mod tests {
             assert_eq!(event_loop.arq_tx.as_ref().unwrap().in_flight(), 0);
         }
 
-        /// COP-30: established-session data, which goes straight to
-        /// `transmit_samples` rather than through `tx_queue`, reports `BUFFER`
-        /// too -- before its PTT keys -- and drains at PTT release.
+        /// COP-30: established-session data reports `BUFFER` too -- before
+        /// its PTT keys. COP-41 paced session chunks one frame per keyed
+        /// interval and drained `BUFFER` at PTT release; COP-38 keeps the
+        /// pacing (every `PTT ON` after the first follows a release) but
+        /// makes it stop-and-wait, so the second frame keys only after the
+        /// peer's ACK, and `BUFFER` falls on each ACK instead of on release.
         #[tokio::test]
-        async fn test_session_path_emits_buffer_and_drains_on_ptt_release() {
+        async fn test_session_path_emits_buffer_and_drains_on_peer_ack() {
             let mut event_loop = EventLoop::new(session_config()).unwrap();
             let (mut reader, _write_half) =
                 connect_mock_vara_client(&mut event_loop, 19494, 19495).await;
@@ -9210,13 +12171,32 @@ mod tests {
                     data: vec![0x77; 4],
                 })
                 .await;
+            let generation = event_loop.tx_generation;
             event_loop.handle_ptt_change(false).await;
+            assert_eq!(
+                event_loop.tx_generation, generation,
+                "the release must not key the second frame before the ACK"
+            );
+            ack_in_flight(&mut event_loop).await;
+            event_loop.handle_ptt_change(false).await;
+            ack_in_flight(&mut event_loop).await;
 
             let lines = read_available_lines(&mut reader).await;
             assert_eq!(
                 buffer_values(&lines),
-                vec!["BUFFER 12", "BUFFER 16", "BUFFER 0"],
-                "session data must be counted in bytes and drain at PTT release, got: {:?}",
+                vec!["BUFFER 12", "BUFFER 16", "BUFFER 4", "BUFFER 0"],
+                "BUFFER must count unacknowledged bytes and fall on each ACK, got: {:?}",
+                lines
+            );
+            let ptt: Vec<&str> = lines
+                .iter()
+                .map(|s| s.trim_end())
+                .filter(|s| s.starts_with("PTT"))
+                .collect();
+            assert_eq!(
+                ptt,
+                ["PTT ON", "PTT OFF", "PTT ON", "PTT OFF"],
+                "two writes must key two separate intervals, got: {:?}",
                 lines
             );
             let first_buffer = lines.iter().position(|l| l.trim_end() == "BUFFER 12");
@@ -9228,10 +12208,488 @@ mod tests {
             );
         }
 
-        /// COP-30: a payload the full ARQ window drops was never tracked or
-        /// queued, so it never reaches `BUFFER`.
+        /// COP-46: keying a session data frame is session activity, so a
+        /// station that is busy sending its own message never keys a
+        /// KEEPALIVE in the middle of it. Before the fix only the receive
+        /// paths called `Session::touch` (`handle_session_data`,
+        /// `handle_keepalive_rx`), so ~30 s into a long transfer
+        /// `session_cleanup` keyed a KEEPALIVE right after the sender's own
+        /// last data frame -- on top of the peer's `FF` reply. Session data
+        /// has no ARQ (H-025), so that reply was lost for good, keepalives
+        /// then held the dead session open, and real Pat's `pat connect`
+        /// sat until its 900 s timeout (COP-46 plan, two-process run).
+        /// COP-38 has since made session data ARQ-protected, and the peer's
+        /// ACK touches the session as well; this checks the window between
+        /// keying a frame and that ACK arriving.
         #[tokio::test]
-        async fn test_arq_window_full_drop_is_not_counted() {
+        async fn session_send_counts_as_activity() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            let (mut reader, _write_half, _data_addr) =
+                connect_bridged_vara_client_ephemeral(&mut event_loop).await;
+            let id = seed_established(&mut event_loop);
+
+            // Idle long enough that `session_cleanup` would key a KEEPALIVE.
+            event_loop.session_mgr.get_mut(id).unwrap().last_activity = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(40))
+                .unwrap();
+            assert!(
+                event_loop.session_mgr.get(id).unwrap().needs_keepalive(),
+                "precondition: a 40 s idle session needs a keepalive"
+            );
+
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x66; 12],
+                })
+                .await;
+
+            let lines = read_available_lines(&mut reader).await;
+            assert!(
+                lines.iter().any(|l| l.trim_end() == "PTT ON"),
+                "the session chunk must really key a frame, got: {:?}",
+                lines
+            );
+            assert!(
+                !event_loop.session_mgr.get(id).unwrap().needs_keepalive(),
+                "a keyed session data frame must reset the keepalive timer"
+            );
+        }
+
+        /// COP-38 (D6): session `BUFFER` counts bytes the peer has not yet
+        /// acknowledged, so a PTT release alone (the frame played, but may
+        /// have been lost) never reports `BUFFER 0`; the peer's ACK does.
+        #[tokio::test]
+        async fn session_buffer_falls_on_peer_ack_not_on_ptt_release() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19560, 19561).await;
+            seed_established(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x12; 12],
+                })
+                .await;
+            event_loop.handle_ptt_change(false).await;
+            let lines = read_available_lines(&mut reader).await;
+            assert_eq!(buffer_values(&lines), vec!["BUFFER 12"], "got: {:?}", lines);
+
+            ack_in_flight(&mut event_loop).await;
+            let lines = read_available_lines(&mut reader).await;
+            assert_eq!(buffer_values(&lines), vec!["BUFFER 0"], "got: {:?}", lines);
+        }
+
+        /// COP-38 (D4): one frame in flight at a time. A release with the
+        /// first frame un-ACKed keys nothing; the ACK keys the next frame.
+        #[tokio::test]
+        async fn stop_and_wait_sends_the_next_chunk_only_after_the_ack() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            seed_established(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: (0..300).map(|i| (i % 251) as u8).collect(),
+                })
+                .await;
+            let generation = event_loop.tx_generation;
+            assert_eq!(generation, 1, "the first frame keys at once");
+            event_loop.handle_ptt_change(false).await;
+            assert_eq!(event_loop.tx_generation, generation);
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 1);
+            ack_in_flight(&mut event_loop).await;
+            assert_eq!(event_loop.tx_generation, generation + 1);
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 1);
+        }
+
+        /// COP-38 (D1): session data uses its own link, never the raw
+        /// `arq_tx` window, even with `arq_enabled = true`.
+        #[tokio::test]
+        async fn session_data_never_enters_the_raw_arq_window() {
+            let mut config = session_config();
+            config.engine.arq_enabled = true;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            seed_established(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x40; 40],
+                })
+                .await;
+            assert_eq!(event_loop.arq_tx.as_ref().unwrap().in_flight(), 0);
+            assert!(event_loop.arq_tx_backlog.is_empty());
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 1);
+        }
+
+        /// COP-38: a session ACK from a station we have no session with, or
+        /// whose session is not established, changes nothing.
+        #[tokio::test]
+        async fn an_ack_from_an_unknown_or_unestablished_peer_changes_nothing() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            let id = seed_established(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x41; 20],
+                })
+                .await;
+            let ack = TransportPdu::new_ack(0, 1, 0).to_bytes();
+            let stranger = MacPdu::new(
+                MacFrameType::Ack,
+                Callsign::new("VK3ABC").unwrap(),
+                Callsign::new("N0CALL").unwrap(),
+                0,
+                ack.clone(),
+            );
+            event_loop.handle_mac_pdu(stranger).await;
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 1);
+
+            event_loop.session_mgr.get_mut(id).unwrap().state = SessionState::Disconnecting;
+            let peer = MacPdu::new(
+                MacFrameType::Ack,
+                Callsign::new("VK3ABC").unwrap(),
+                Callsign::new("W1AW").unwrap(),
+                0,
+                ack,
+            );
+            event_loop.handle_mac_pdu(peer).await;
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 1);
+            assert_eq!(event_loop.buffered_tx_bytes(), 20);
+        }
+
+        /// COP-38: an ACK for more than was sent (a stale ACK from an earlier
+        /// session with this peer) is ignored rather than pushing `send_base`
+        /// past `next_seq`, which would leave the window full forever.
+        #[tokio::test]
+        async fn a_session_ack_beyond_what_is_in_flight_is_ignored() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            seed_established(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x42; 20],
+                })
+                .await;
+            let stale = MacPdu::new(
+                MacFrameType::Ack,
+                Callsign::new("VK3ABC").unwrap(),
+                Callsign::new("W1AW").unwrap(),
+                0,
+                TransportPdu::new_ack(0, 5, 0).to_bytes(),
+            );
+            event_loop.handle_mac_pdu(stale).await;
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!((link.tx.send_base(), link.tx.next_seq()), (0, 1));
+            assert_eq!(event_loop.buffered_tx_bytes(), 20);
+
+            ack_in_flight(&mut event_loop).await;
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 0);
+            assert_eq!(event_loop.buffered_tx_bytes(), 0);
+        }
+
+        /// COP-38: a frame from the session's peer that is addressed to
+        /// another station, or sent on another SSID (the peer reconnected
+        /// elsewhere and its DISCONNECT to us was lost), is not this
+        /// session's: its ACK frees nothing, its data is neither delivered
+        /// nor taken into the receive window, and its DISCONNECT ends nothing.
+        #[tokio::test]
+        async fn a_session_frame_addressed_to_another_station_changes_nothing() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            let (data_tx, mut data_rx) = mpsc::unbounded_channel();
+            event_loop.set_response_tx(data_tx);
+            let id = seed_established(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x43; 20],
+                })
+                .await;
+            for (dest, ssid) in [("K1ABC", 0), ("VK3ABC", 3)] {
+                let frame = |frame_type: MacFrameType, payload: Vec<u8>| {
+                    MacPdu::new(
+                        frame_type,
+                        Callsign::new(dest).unwrap(),
+                        Callsign::new("W1AW").unwrap(),
+                        ssid,
+                        payload,
+                    )
+                };
+                let ack = TransportPdu::new_ack(0, 1, 0).to_bytes();
+                let data = TransportPdu::new_reliable(0, 0, 0, b"not ours".to_vec()).to_bytes();
+                event_loop
+                    .handle_mac_pdu(frame(MacFrameType::Ack, ack))
+                    .await;
+                event_loop
+                    .handle_mac_pdu(frame(MacFrameType::Data, data))
+                    .await;
+                event_loop
+                    .handle_mac_pdu(frame(MacFrameType::Disconnect, Vec::new()))
+                    .await;
+                let link = event_loop.session_link.as_ref().unwrap();
+                assert_eq!(
+                    (link.session_id, link.tx.in_flight(), link.rx.recv_base()),
+                    (id, 1, 0),
+                    "{dest}/{ssid}"
+                );
+                assert_eq!(event_loop.buffered_tx_bytes(), 20, "{dest}/{ssid}");
+                assert!(
+                    event_loop
+                        .session_mgr
+                        .get(id)
+                        .is_some_and(|s| s.is_established()),
+                    "{dest}/{ssid}"
+                );
+            }
+            assert!(drain_data_out(&mut data_rx).is_empty());
+
+            ack_in_flight(&mut event_loop).await;
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 0);
+            assert_eq!(event_loop.buffered_tx_bytes(), 0);
+        }
+
+        /// COP-38: a dial refused because a session is up is answered to the
+        /// dialling client alone. The session is still up, so the other
+        /// hosts must not hear `DISCONNECTED`.
+        #[tokio::test]
+        async fn a_refused_dial_is_answered_only_to_the_dialling_client() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            let cmd_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let data_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let cmd_addr = cmd_listener.local_addr().unwrap();
+            let mut server = VaraServer::new(cmd_addr.port(), 0);
+            station.set_vara_responses(server.response_senders());
+            let mut events = server.take_event_rx().unwrap();
+            tokio::spawn(async move {
+                let _ = server.run_with_listeners(cmd_listener, data_listener).await;
+            });
+            let mut clients = Vec::new();
+            for _ in 0..2 {
+                let (read_half, write_half) =
+                    TcpStream::connect(cmd_addr).await.unwrap().into_split();
+                let mut reader = BufReader::new(read_half);
+                assert!(read_line(&mut reader).await.starts_with("VERSION"));
+                let client_id = loop {
+                    if let Some(HostEvent::Connected { client_id }) = events.recv().await {
+                        break client_id;
+                    }
+                };
+                clients.push((client_id, reader, write_half));
+            }
+            seed_established(&mut station);
+
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: clients[0].0,
+                    source: "VK3ABC".into(),
+                    destination: "K2XYZ".into(),
+                })
+                .await;
+            let dialler = read_available_lines(&mut clients[0].1).await;
+            let other = read_available_lines(&mut clients[1].1).await;
+            assert!(
+                dialler.iter().any(|l| l.trim_end() == "DISCONNECTED"),
+                "{dialler:?}"
+            );
+            assert!(
+                other.iter().all(|l| l.trim_end() != "DISCONNECTED"),
+                "{other:?}"
+            );
+        }
+
+        /// COP-38: one session at a time. A CONNECT_REQ while a session is
+        /// established (from another station, from the same peer on another
+        /// SSID, or a repeat from the peer itself) gets no session, so its
+        /// CFM cannot rebuild the established session's link (backlog,
+        /// in-flight segment, seq); a host dial is refused with
+        /// `DISCONNECTED`.
+        #[tokio::test]
+        async fn a_second_session_is_refused_while_one_is_active() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            station.listening = true;
+            let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
+            station.set_response_tx(resp_tx);
+            let id = seed_established(&mut station);
+            station
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x44; 20],
+                })
+                .await;
+
+            for (caller, ssid) in [("K1ABC", 0), ("W1AW", 5), ("W1AW", 0)] {
+                let mut other = coppa_protocol::session::Session::new(
+                    0,
+                    Callsign::new(caller).unwrap(),
+                    Callsign::new("VK3ABC").unwrap(),
+                    ssid,
+                    LinkCapabilities::default(),
+                );
+                station.handle_mac_pdu(other.initiate().unwrap()).await;
+                let cfm = other
+                    .handle_connect_ack(&LinkCapabilities::default().to_bytes())
+                    .unwrap();
+                station.handle_mac_pdu(cfm).await;
+                assert_eq!(
+                    station.session_mgr.active_sessions(),
+                    vec![id],
+                    "{caller}/{ssid}"
+                );
+                let link = station.session_link.as_ref().unwrap();
+                assert_eq!(
+                    (link.session_id, link.tx.in_flight()),
+                    (id, 1),
+                    "{caller}/{ssid}"
+                );
+                assert_eq!(station.buffered_tx_bytes(), 20, "{caller}/{ssid}");
+            }
+
+            while resp_rx.try_recv().is_ok() {}
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "VK3ABC".into(),
+                    destination: "K2XYZ".into(),
+                })
+                .await;
+            let statuses: Vec<String> = std::iter::from_fn(|| resp_rx.try_recv().ok())
+                .filter_map(|response| match response {
+                    coppa_host::HostResponse::StatusUpdate { status, .. } => Some(status),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(statuses, ["DISCONNECTED"]);
+            assert_eq!(station.session_mgr.active_sessions(), vec![id]);
+            assert_eq!(station.session_link.as_ref().unwrap().session_id, id);
+        }
+
+        /// COP-38 (D3): a session data frame is a `Reliable` `TransportPdu`
+        /// inside a MAC `Data` frame from the session's local callsign to its
+        /// remote, with the transport ACK fields zero.
+        #[test]
+        fn session_data_frame_is_a_reliable_transport_pdu_in_a_mac_data_frame() {
+            let link = test_link();
+            let mac = MacPdu::from_bytes(&session_data_frame(&link, 3, b"abc")).unwrap();
+            assert_eq!(mac.frame_type, MacFrameType::Data);
+            assert_eq!(mac.src, link.local);
+            assert_eq!(mac.dest, link.remote);
+            let segment = TransportPdu::from_bytes(&mac.payload).unwrap();
+            assert_eq!(segment.transport_type, TransportType::Reliable);
+            assert_eq!(
+                (segment.seq_num, segment.ack_num, segment.ack_bitmap),
+                (3, 0, 0)
+            );
+            assert_eq!(segment.payload, b"abc");
+        }
+
+        /// COP-38 (D3): a session ACK is a MAC `Ack` frame carrying a
+        /// transport ACK for what the link's `ArqRx` holds.
+        #[test]
+        fn session_ack_frame_is_a_mac_ack_carrying_a_transport_ack() {
+            let mut link = test_link();
+            link.rx.receive(0, b"x".to_vec());
+            let mac = MacPdu::from_bytes(&session_ack_frame(&link)).unwrap();
+            assert_eq!(mac.frame_type, MacFrameType::Ack);
+            assert_eq!(mac.src, link.local);
+            assert_eq!(mac.dest, link.remote);
+            let ack = TransportPdu::from_bytes(&mac.payload).unwrap();
+            assert_eq!(ack.transport_type, TransportType::Ack);
+            assert_eq!((ack.ack_num, ack.ack_bitmap), (1, 0));
+        }
+
+        /// COP-38 (D7): a retransmission rebuilt from the segment data is
+        /// byte-identical to the frame first sent.
+        #[test]
+        fn retransmitted_frame_is_rebuilt_byte_identical() {
+            let mut link = test_link();
+            let first = session_data_frame(&link, 0, b"identical");
+            let seq = link.tx.send(b"identical".to_vec(), Instant::now()).unwrap();
+            let rebuilt = session_data_frame(&link, seq, link.tx.get_segment_data(seq).unwrap());
+            assert_eq!(first, rebuilt);
+        }
+
+        fn test_link() -> SessionLink {
+            SessionLink {
+                session_id: 0,
+                remote: Callsign::new("W1AW").unwrap(),
+                local: Callsign::new("VK3ABC").unwrap(),
+                ssid: 0,
+                tx: ArqTx::new(
+                    ArqConfig::new(SESSION_ARQ_WINDOW, 5, Duration::from_secs(5)).unwrap(),
+                ),
+                rx: ArqRx::new(SESSION_ARQ_WINDOW),
+                backlog: VecDeque::new(),
+                give_up_at: None,
+                warned_legacy_payload: false,
+            }
+        }
+
+        /// COP-38 (D7): a retransmission that no longer encodes (the speed
+        /// level dropped under a chunk sized for the old one) still spends
+        /// the retry budget, so the link fails rather than retrying forever
+        /// in silence.
+        #[tokio::test]
+        async fn a_retransmission_that_no_longer_encodes_still_spends_the_budget() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            let (producer, mut consumer) = coppa_audio::audio_ring(4_000_000);
+            event_loop.set_audio_out(producer);
+            let id = seed_established(&mut event_loop);
+            event_loop.ensure_session_link(id);
+            fast_session_rto(&mut event_loop);
+            let mut seed: u32 = 0x38_38_38_38;
+            let data: Vec<u8> = (0..90)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    (seed >> 16) as u8
+                })
+                .collect();
+            event_loop
+                .handle_host_event(HostEvent::DataReceived { client_id: 1, data })
+                .await;
+            let seq = event_loop.session_link.as_ref().unwrap().tx.send_base();
+            let link = event_loop.session_link.as_ref().unwrap();
+            let frame = session_data_frame(link, seq, link.tx.get_segment_data(seq).unwrap());
+            event_loop.engine.set_speed_level(1).unwrap();
+            assert!(
+                event_loop.engine.encode_bytes(&frame).is_err(),
+                "the level-2 frame must not encode at level 1"
+            );
+            event_loop.handle_ptt_change(false).await;
+            read_all(&mut consumer);
+            let mut counts = Vec::new();
+            for _ in 0..20 {
+                if event_loop.session_link.is_none() {
+                    break;
+                }
+                sleep_past_session_rto(&event_loop);
+                event_loop.check_session_retransmits().await;
+                if let Some(link) = event_loop.session_link.as_ref() {
+                    counts.push(link.tx.transmit_count(seq).unwrap());
+                    assert!(
+                        read_all(&mut consumer).is_empty(),
+                        "a frame that does not encode plays nothing"
+                    );
+                }
+            }
+            assert!(event_loop.session_link.is_none(), "the link must fail");
+            assert!(event_loop.session_mgr.get(id).is_none());
+            assert_eq!(
+                &counts[..5],
+                &[2, 3, 4, 5, 6],
+                "every pass counts: {counts:?}"
+            );
+        }
+
+        /// COP-30 asserted the old drop behavior: a payload the full ARQ
+        /// window rejected never reached `BUFFER`. COP-41 (D5) replaced the
+        /// window-full drop with a backlog hold, so the ninth write's bytes
+        /// ARE counted now -- held, not dropped, waiting for ACKs to free
+        /// window space.
+        #[tokio::test]
+        async fn test_arq_window_full_holds_in_backlog() {
             let mut config = fast_ptt_config();
             config.engine.arq_enabled = true;
             // COP-29: these exercise the sessionless raw/ARQ path, now opt-in.
@@ -9250,16 +12708,620 @@ mod tests {
                     .await;
             }
             assert_eq!(event_loop.arq_tx.as_ref().unwrap().in_flight(), 8);
+            assert_eq!(event_loop.arq_tx_backlog.len(), 10);
 
             let lines = read_available_lines(&mut reader).await;
             let values = buffer_values(&lines);
             assert_eq!(
                 values.len(),
-                8,
-                "one BUFFER line per accepted segment, got: {:?}",
+                9,
+                "one BUFFER line per write (every byte is held), got: {:?}",
                 lines
             );
-            assert_eq!(values.last(), Some(&"BUFFER 80"));
+            assert_eq!(values.last(), Some(&"BUFFER 90"));
+        }
+
+        /// COP-41: session chunks are sized by MEASURING the framed PDU
+        /// (`encoded_payload_len`), never predicted -- 2000 incompressible
+        /// bytes split into chunks that each fit the level-2 budget (117).
+        /// COP-38 cuts one chunk per send from the link's backlog, framed with
+        /// the transport header and its real seq, so the check walks the
+        /// stop-and-wait stream: each in-flight segment's frame must fit, and
+        /// the segments must reassemble the input. Without chunking this
+        /// write produced zero samples (the research probe).
+        #[tokio::test]
+        async fn session_chunks_respect_the_encoded_budget() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            seed_established(&mut event_loop);
+
+            let mut seed: u32 = 0xC0_41_C0_41;
+            let data: Vec<u8> = (0..2000)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    (seed >> 16) as u8
+                })
+                .collect();
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: data.clone(),
+                })
+                .await;
+
+            let budget = max_payload_for_level(event_loop.engine.speed_level()).unwrap();
+            let mut segments: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..1000 {
+                let link = event_loop.session_link.as_ref().unwrap();
+                if link.tx.in_flight() == 0 {
+                    break;
+                }
+                let seq = link.tx.send_base();
+                let segment = link.tx.get_segment_data(seq).unwrap();
+                assert!(
+                    event_loop
+                        .engine
+                        .encoded_payload_len(&session_data_frame(link, seq, segment))
+                        <= budget,
+                    "every frame must fit the level budget"
+                );
+                segments.push(segment.to_vec());
+                event_loop.handle_ptt_change(false).await;
+                ack_in_flight(&mut event_loop).await;
+            }
+            assert!(
+                segments.len() > 1,
+                "2000 incompressible bytes must chunk, not vanish"
+            );
+            assert_eq!(
+                segments.concat(),
+                data,
+                "segment payloads must reassemble the input in order"
+            );
+            assert_eq!(event_loop.buffered_tx_bytes(), 0);
+        }
+
+        /// COP-41: no pacing regression for the common case -- a small
+        /// write on an idle link still transmits immediately, before any
+        /// PTT release.
+        #[tokio::test]
+        async fn small_session_write_transmits_immediately_when_idle() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(producer);
+            seed_established(&mut event_loop);
+
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: b"hello".to_vec(),
+                })
+                .await;
+
+            let mut buf = vec![0.0f32; 1_000_000];
+            assert!(
+                consumer.read(&mut buf) > 0,
+                "a 5-byte write on an idle link must transmit without waiting \
+                 for a PTT release"
+            );
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert!(link.backlog.is_empty() && link.tx.in_flight() == 1);
+        }
+
+        /// COP-41 (D3): a write that arrives while the link is keyed waits
+        /// for the current frame's PTT release before its own keyed
+        /// interval -- it never silently joins the keyed interval as the
+        /// pre-COP-41 session path did.
+        #[tokio::test]
+        async fn session_write_while_transmitting_waits_for_release() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(producer);
+            seed_established(&mut event_loop);
+            event_loop.is_transmitting = true;
+
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: b"hello".to_vec(),
+                })
+                .await;
+            let mut buf = vec![0.0f32; 1_000_000];
+            assert_eq!(
+                consumer.read(&mut buf),
+                0,
+                "nothing may join an already-keyed interval"
+            );
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!((link.backlog.len(), link.tx.in_flight()), (5, 0));
+
+            event_loop.handle_ptt_change(false).await;
+            assert!(
+                consumer.read(&mut buf) > 0,
+                "the release must start the held frame's own keyed interval"
+            );
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!((link.backlog.len(), link.tx.in_flight()), (0, 1));
+        }
+
+        /// A session's unsent data dies with the session (COP-41 review):
+        /// after a local DISCONNECT, a remote DISCONNECT, or a timeout, the
+        /// session link is gone (COP-38: its backlog and its un-acked frame
+        /// both), `BUFFER` stops counting them, and neither the next PTT
+        /// release nor an elapsed RTO keys anything -- before this, the queue
+        /// kept transmitting the dead session's data on every release.
+        #[tokio::test]
+        async fn ended_session_discards_its_unsent_chunks() {
+            #[derive(Debug, Clone, Copy)]
+            enum End {
+                LocalDisconnect,
+                RemoteDisconnect,
+                Timeout,
+            }
+            for end in [End::LocalDisconnect, End::RemoteDisconnect, End::Timeout] {
+                let mut event_loop = EventLoop::new(session_config()).unwrap();
+                let (producer, mut consumer) = coppa_audio::audio_ring(4_000_000);
+                event_loop.set_audio_out(producer);
+                let id = seed_established(&mut event_loop);
+                event_loop.ensure_session_link(id);
+                fast_session_rto(&mut event_loop);
+                event_loop
+                    .handle_host_event(HostEvent::DataReceived {
+                        client_id: 1,
+                        data: (0..1000).map(|i| (i % 251) as u8).collect(),
+                    })
+                    .await;
+                let link = event_loop.session_link.as_ref().unwrap();
+                assert_eq!(link.tx.in_flight(), 1, "{end:?}");
+                assert!(!link.backlog.is_empty(), "{end:?}");
+                assert_eq!(event_loop.buffered_tx_bytes(), 1000, "{end:?}");
+
+                match end {
+                    End::LocalDisconnect => {
+                        event_loop
+                            .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+                            .await;
+                    }
+                    End::RemoteDisconnect => {
+                        let disc = MacPdu::new(
+                            MacFrameType::Disconnect,
+                            Callsign::new("VK3ABC").unwrap(),
+                            Callsign::new("W1AW").unwrap(),
+                            0,
+                            Vec::new(),
+                        );
+                        event_loop.handle_incoming_disconnect(disc).await;
+                    }
+                    End::Timeout => {
+                        // A zero timeout, not a back-dated `Instant`: on
+                        // Windows `Instant` cannot go back past boot.
+                        event_loop.session_mgr.get_mut(id).unwrap().session_timeout =
+                            Duration::ZERO;
+                        event_loop.reap_timed_out_sessions().await;
+                    }
+                }
+                assert!(event_loop.session_mgr.get(id).is_none(), "{end:?}");
+                assert!(event_loop.session_link.is_none(), "{end:?}");
+                assert_eq!(event_loop.buffered_tx_bytes(), 0, "{end:?}");
+
+                // Discard whatever the end itself keyed (the data frame and
+                // the local DISCONNECT frame), then release: no stale frame
+                // may play, and no retransmission either.
+                let mut buf = vec![0.0f32; 4_000_000];
+                while consumer.read(&mut buf) > 0 {}
+                let frames_before = event_loop.tx_frame_count;
+                let generation = event_loop.tx_generation;
+                event_loop.handle_ptt_change(false).await;
+                std::thread::sleep(Duration::from_millis(30));
+                event_loop.check_session_retransmits().await;
+                assert_eq!(
+                    consumer.read(&mut buf),
+                    0,
+                    "{end:?}: neither the release nor the RTO may transmit the ended session's data"
+                );
+                assert_eq!(event_loop.tx_frame_count, frames_before, "{end:?}");
+                assert_eq!(event_loop.tx_generation, generation, "{end:?}");
+            }
+        }
+
+        /// Canceled playback of a session frame (COP-41 resumed the unsent
+        /// chunks once the output worker discarded the canceled audio).
+        /// COP-38 is stop-and-wait: after the discard barrier the canceled
+        /// frame is still in flight (nothing else may key, and `BUFFER` still
+        /// counts all 300 bytes); its retransmission plays alone (none of the
+        /// canceled tail), and the peer's ACK then sends the next chunk.
+        #[tokio::test(start_paused = true)]
+        async fn cancelled_session_frame_stays_in_flight_after_discard() {
+            let mut rig = TxRig::new(session_config());
+            let id = seed_established(&mut rig.event_loop);
+            rig.event_loop.ensure_session_link(id);
+            fast_session_rto(&mut rig.event_loop);
+            rig.event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: (0..300).map(|i| (i % 251) as u8).collect(),
+                })
+                .await;
+            assert_eq!(rig.event_loop.buffered_tx_bytes(), 300);
+
+            // Stall with canceled audio in both rings and the retained suffix.
+            for _ in 0..16 {
+                rig.pump(0);
+            }
+            let (generation, completed) = rig.next_completion().await;
+            assert_eq!((generation, completed), (1, false));
+            let submitted = {
+                let output = rig.event_loop.tx_output();
+                output.submitted() - output.pending_len() as u64
+            };
+            let tx_output = rig.event_loop.tx_output.clone();
+            tokio::join!(
+                rig.event_loop.handle_tx_complete(generation, completed),
+                async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    assert_eq!(
+                        lock_tx_output(&tx_output).submitted(),
+                        submitted,
+                        "nothing may key before the discard barrier"
+                    );
+                    for _ in 0..100 {
+                        if rig.feedback.played() >= submitted {
+                            break;
+                        }
+                        rig.worker
+                            .step(
+                                &mut rig.outer,
+                                &mut rig.sink,
+                                crate::audio_output::test_support::sim_progress,
+                            )
+                            .unwrap();
+                        rig.sink.callback(0);
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    assert!(rig.feedback.played() >= submitted, "discard must settle");
+                }
+            );
+            assert!(
+                !rig.event_loop.is_transmitting,
+                "stop-and-wait: the canceled frame is still in flight"
+            );
+            assert_eq!(rig.event_loop.buffered_tx_bytes(), 300);
+            let link = rig.event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx.in_flight(), 1);
+            let seq = link.tx.send_base();
+            let retransmission = rig
+                .event_loop
+                .engine
+                .encode_bytes(&session_data_frame(
+                    link,
+                    seq,
+                    link.tx.get_segment_data(seq).unwrap(),
+                ))
+                .unwrap();
+
+            // ARQ timers are real `std::time::Instant`s.
+            std::thread::sleep(Duration::from_millis(30));
+            rig.event_loop.check_session_retransmits().await;
+            assert!(rig.event_loop.is_transmitting, "the retransmission keys");
+            rig.deliver(retransmission.len(), &[480, 1000]);
+            assert_eq!(
+                rig.sink.captured, retransmission,
+                "only the retransmitted frame should play"
+            );
+            let (generation, completed) = rig.next_completion().await;
+            assert!(completed);
+            rig.event_loop
+                .handle_tx_complete(generation, completed)
+                .await;
+            assert!(!rig.event_loop.is_transmitting);
+
+            ack_in_flight(&mut rig.event_loop).await;
+            assert!(
+                rig.event_loop.is_transmitting,
+                "the ACK sends the next chunk"
+            );
+            let link = rig.event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx.in_flight(), 1);
+            assert_eq!(link.tx.send_base(), seq.wrapping_add(1));
+        }
+
+        /// COP-41 (D5): the ARQ window's overflow is HELD in a backlog and
+        /// pumped into segments as ACKs free window space -- the no-silent-
+        /// loss test. Before COP-41 one oversized segment was tracked,
+        /// never encoded, and stayed in `BUFFER` forever.
+        #[tokio::test]
+        async fn large_arq_write_fills_window_then_pumps_on_ack() {
+            let mut config = fast_ptt_config();
+            config.engine.arq_enabled = true;
+            // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
+            config.host.sessionless_tx_enabled = true;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19500, 19501).await;
+
+            let mut seed: u32 = 0xB2_F2_00_2D;
+            let data: Vec<u8> = (0..2000)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    (seed >> 16) as u8
+                })
+                .collect();
+            event_loop
+                .handle_host_event(HostEvent::DataReceived { client_id: 1, data })
+                .await;
+
+            assert_eq!(
+                event_loop.arq_tx.as_ref().unwrap().in_flight(),
+                8,
+                "the 8-segment default window must be full"
+            );
+            assert!(
+                !event_loop.arq_tx_backlog.is_empty(),
+                "the window's overflow must be held in the backlog"
+            );
+            let lines = read_available_lines(&mut reader).await;
+            assert_eq!(
+                buffer_values(&lines).last(),
+                Some(&"BUFFER 2000"),
+                "every byte of the write must be counted, got: {:?}",
+                lines
+            );
+
+            // Cumulatively ACK each full window (real decoded ACK frames,
+            // the same `peer_frame` path COP-30's test uses) until every
+            // byte has been segmented and acked. Counting each segment's
+            // payload exactly once proves no byte was dropped.
+            let mut segmented_total = 0usize;
+            loop {
+                let in_flight = event_loop.arq_tx.as_ref().unwrap().in_flight();
+                if in_flight == 0 {
+                    assert!(
+                        event_loop.arq_tx_backlog.is_empty(),
+                        "an empty window with a non-empty backlog would strand \
+                         bytes: the ACK-side pump must have segmented them"
+                    );
+                    break;
+                }
+                let base = event_loop.arq_tx.as_ref().unwrap().send_base();
+                for i in 0..in_flight {
+                    let seq = base.wrapping_add(i);
+                    if let Some(seg) = event_loop.arq_tx.as_ref().unwrap().get_segment_data(seq) {
+                        segmented_total += seg.len();
+                    }
+                }
+                let ack_num = base.wrapping_add(in_flight);
+                let session_id = event_loop.arq_session_id;
+                super::unstick_decoder(&mut event_loop);
+                event_loop
+                    .decode_and_dispatch_audio(&super::peer_frame(
+                        &TransportPdu::new_ack_with_rate(session_id, ack_num, 0, 2),
+                        coppa_codec::ofdm::CoppaProfile::hf_standard(),
+                    ))
+                    .await;
+            }
+            assert_eq!(
+                segmented_total, 2000,
+                "every byte of the write must pass through an ARQ segment"
+            );
+            assert!(event_loop.arq_tx_backlog.is_empty());
+            assert_eq!(event_loop.arq_tx.as_ref().unwrap().in_flight(), 0);
+            let lines = read_available_lines(&mut reader).await;
+            assert_eq!(
+                buffer_values(&lines).last(),
+                Some(&"BUFFER 0"),
+                "BUFFER must reach 0 once everything is acked, got: {:?}",
+                lines
+            );
+        }
+
+        /// COP-41 (D4): ARQ segments are sized against the ladder-MINIMUM
+        /// budget (56), so every segment re-encodes at any speed level a
+        /// later retransmit or `RateLoop` drop uses.
+        #[tokio::test]
+        async fn arq_chunks_encode_at_every_level() {
+            let mut config = fast_ptt_config();
+            config.engine.arq_enabled = true;
+            // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
+            config.host.sessionless_tx_enabled = true;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            // Hold the queue so the window's segments stay inspectable.
+            event_loop.is_transmitting = true;
+
+            let mut seed: u32 = 0x4A_C1_00_2D;
+            let data: Vec<u8> = (0..2000)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    (seed >> 16) as u8
+                })
+                .collect();
+            event_loop
+                .handle_host_event(HostEvent::DataReceived { client_id: 1, data })
+                .await;
+
+            let entries: Vec<Vec<u8>> = event_loop
+                .tx_queue
+                .iter()
+                .filter(|(seq, _)| seq.is_some())
+                .map(|(_, bytes)| bytes.clone())
+                .collect();
+            assert!(
+                entries.len() == 8,
+                "the full window's worth of segments must be queued, got {}",
+                entries.len()
+            );
+            for bytes in &entries {
+                assert!(
+                    event_loop.engine.encoded_payload_len(bytes) <= 56,
+                    "every segment must fit the ladder-minimum budget"
+                );
+            }
+            let levels = event_loop.engine.available_speed_levels();
+            assert!(levels.len() >= 8, "the ladder has 8+ levels");
+            for level in levels {
+                event_loop
+                    .engine
+                    .set_speed_level(level)
+                    .expect("ladder level must apply");
+                for bytes in &entries {
+                    assert!(
+                        event_loop.engine.encode_bytes(bytes).is_ok(),
+                        "level {level} must re-encode every segment (a segment \
+                         that no longer fits after a rate drop is stuck forever)"
+                    );
+                }
+            }
+        }
+
+        /// COP-41: the raw non-ARQ path chunks too -- one 8000-byte event
+        /// becomes many modem-sized frames whose bytes reassemble exactly,
+        /// draining one frame per PTT release down to `BUFFER 0`.
+        #[tokio::test]
+        async fn large_raw_write_chunks_into_modem_sized_frames() {
+            let mut config = fast_ptt_config();
+            // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
+            config.host.sessionless_tx_enabled = true;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19502, 19503).await;
+            event_loop.is_transmitting = true;
+
+            let data: Vec<u8> = (0..8000).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+            event_loop
+                .handle_host_event(HostEvent::DataReceived { client_id: 1, data })
+                .await;
+
+            assert!(
+                event_loop.tx_queue.len() > 1,
+                "an 8000-byte write must become many frames, got {}",
+                event_loop.tx_queue.len()
+            );
+            let budget = max_payload_for_level(event_loop.engine.speed_level()).unwrap();
+            let mut joined = Vec::with_capacity(8000);
+            for (seq, bytes) in &event_loop.tx_queue {
+                assert!(seq.is_none(), "non-ARQ entries carry no seq");
+                assert!(
+                    event_loop.engine.encoded_payload_len(bytes) <= budget,
+                    "every entry must fit the level budget"
+                );
+                joined.extend_from_slice(bytes);
+            }
+            assert_eq!(
+                joined,
+                (0..8000)
+                    .map(|i| ((i * 31 + 7) % 251) as u8)
+                    .collect::<Vec<u8>>()
+            );
+
+            event_loop.is_transmitting = false;
+            while !event_loop.tx_queue.is_empty() {
+                event_loop.handle_ptt_change(false).await;
+                // The client's response queue is bounded (`broadcast_vara`
+                // drops BUSY/SNR past 64 waiting lines and disconnects a client
+                // whose queue is full), and nothing in the drain yields to its
+                // write task: let it flush each frame's lines.
+                tokio::task::yield_now().await;
+            }
+            event_loop.handle_ptt_change(false).await;
+            let lines = read_available_lines(&mut reader).await;
+            assert_eq!(
+                buffer_values(&lines).last(),
+                Some(&"BUFFER 0"),
+                "BUFFER must drain to 0, got: {:?}",
+                lines
+            );
+        }
+
+        /// COP-41: an incompressible write that cannot encode as one frame
+        /// is split, not dropped -- without chunking, 300 random bytes
+        /// failed to encode and produced zero audio (research probe: 102
+        /// random bytes -> 182 encoded > the 117-byte level-2 budget).
+        #[tokio::test]
+        async fn incompressible_oversize_write_is_split_not_dropped() {
+            let mut config = fast_ptt_config();
+            // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
+            config.host.sessionless_tx_enabled = true;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (producer, mut consumer) = coppa_audio::audio_ring(4_000_000);
+            event_loop.set_audio_out(producer);
+
+            let mut seed: u32 = 0x1C_0F_41;
+            let data: Vec<u8> = (0..300)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    (seed >> 16) as u8
+                })
+                .collect();
+            event_loop
+                .handle_host_event(HostEvent::DataReceived { client_id: 1, data })
+                .await;
+
+            let mut buf = vec![0.0f32; 4_000_000];
+            assert!(
+                consumer.read(&mut buf) > 0,
+                "the first chunk must transmit immediately on the idle link"
+            );
+            assert!(
+                event_loop.tx_queue.len() >= 2,
+                "300 incompressible bytes must be split into several frames"
+            );
+            while !event_loop.tx_queue.is_empty() {
+                event_loop.handle_ptt_change(false).await;
+            }
+            event_loop.handle_ptt_change(false).await;
+            assert_eq!(
+                event_loop.buffered_tx_bytes(),
+                0,
+                "every chunk must have played and left the count"
+            );
+        }
+
+        /// COP-41: an empty host write produces no queue entry, no frame,
+        /// and no `BUFFER` line (it used to encode a header-only PDU and
+        /// transmit it).
+        #[tokio::test]
+        async fn empty_write_produces_no_frame_or_buffer_line() {
+            let mut config = session_config();
+            // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
+            config.host.sessionless_tx_enabled = true;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut reader, _write_half) =
+                connect_mock_vara_client(&mut event_loop, 19504, 19505).await;
+            let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(producer);
+
+            // Sessionless (raw path)...
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![],
+                })
+                .await;
+            // ...and on an established session.
+            seed_established(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![],
+                })
+                .await;
+
+            assert!(event_loop.tx_queue.is_empty());
+            assert!(event_loop
+                .session_link
+                .as_ref()
+                .is_none_or(|l| l.backlog.is_empty() && l.tx.in_flight() == 0));
+            assert!(event_loop.arq_tx_backlog.is_empty());
+            let mut buf = vec![0.0f32; 1_000_000];
+            assert_eq!(
+                consumer.read(&mut buf),
+                0,
+                "no frame may be built from an empty write"
+            );
+            let lines = read_available_lines(&mut reader).await;
+            assert!(
+                buffer_values(&lines).is_empty(),
+                "an empty write must not move BUFFER, got: {:?}",
+                lines
+            );
         }
 
         /// Required scenario: "injected band-limited noise burst -> BUSY ON then
@@ -9351,7 +13413,7 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn test_transmit_deferred_while_busy_then_holdoff_applied() {
-            let mut config = DaemonConfig::default();
+            let mut config = tx_config();
             config.station_id.busy_hold_ms = 10;
             let mut event_loop = EventLoop::new(config).unwrap();
 
@@ -9441,6 +13503,7 @@ mod tests {
             let mut config = config_with_callsign(); // local callsign "VK3ABC"
             config.station_id.busy_hold_ms = 10;
             let mut event_loop = EventLoop::new(config).unwrap();
+            mark_identified(&mut event_loop);
             event_loop.listening = true;
 
             let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
@@ -9585,9 +13648,10 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn test_transmit_not_deferred_when_channel_already_clear() {
-            let mut config = DaemonConfig::default();
+            let mut config = tx_config();
             config.station_id.busy_hold_ms = 10;
             let mut event_loop = EventLoop::new(config).unwrap();
+            mark_identified(&mut event_loop);
             let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
             event_loop.set_audio_out(audio_out_tx);
 
@@ -9609,9 +13673,10 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn test_busy_gate_disabled_by_default_does_not_defer_tx() {
             // (d) busy-channel gate OFF by default: busy_hold_ms == 0.
-            let config = DaemonConfig::default();
+            let config = tx_config();
             assert_eq!(config.station_id.busy_hold_ms, 0);
             let mut event_loop = EventLoop::new(config).unwrap();
+            mark_identified(&mut event_loop);
             let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
             event_loop.set_audio_out(audio_out_tx);
 
@@ -9649,7 +13714,7 @@ mod tests {
             assert_eq!(event_loop.config.station_id.id_interval_secs, 540);
             // Simulate 10 minutes of elapsed time since the last ID (or, here,
             // since construction) without any real sleep.
-            event_loop.last_id_time = Instant::now() - Duration::from_secs(600);
+            event_loop.last_id_time = Some(Instant::now() - Duration::from_secs(600));
 
             let (audio_out_tx, mut audio_out_rx) = coppa_audio::audio_ring(1_000_000);
             event_loop.set_audio_out(audio_out_tx);
@@ -9669,7 +13734,9 @@ mod tests {
                 available
             );
             assert!(
-                event_loop.last_id_time.elapsed() < Duration::from_secs(1),
+                event_loop
+                    .last_id_time
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(1)),
                 "last_id_time should be refreshed after sending an ID"
             );
 
@@ -9696,8 +13763,9 @@ mod tests {
         #[tokio::test]
         async fn test_id_timer_no_prepend_when_interval_not_elapsed() {
             let mut event_loop = EventLoop::new(config_with_callsign()).unwrap();
-            // `last_id_time` defaults to construction time -- far less than
-            // `id_interval_secs` (540s) has "elapsed".
+            // Identified just now -- far less than `id_interval_secs` (540s)
+            // has elapsed.
+            mark_identified(&mut event_loop);
             let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
             event_loop.set_audio_out(audio_out_tx);
 
@@ -9714,6 +13782,72 @@ mod tests {
             );
         }
 
+        /// COP-61: a just-started daemon has sent no ID yet, so its first
+        /// transmission carries one regardless of `id_interval_secs`; the
+        /// interval then governs every ID after it.
+        #[tokio::test]
+        async fn test_first_transmission_after_startup_carries_station_id() {
+            let mut event_loop = EventLoop::new(config_with_callsign()).unwrap();
+            assert_eq!(event_loop.last_id_time, None, "no ID sent yet");
+            let (audio_out_tx, mut audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+
+            let core = coppa_engine::CoppaCore::new();
+            let payload_samples = core.encode_bytes(b"hello").expect("encode should succeed");
+            let payload_len = payload_samples.len();
+
+            event_loop.transmit_samples(&payload_samples).await;
+
+            let available = audio_out_rx.available();
+            let mut captured = vec![0.0f32; available];
+            audio_out_rx.read(&mut captured);
+            let mut decoder = coppa_engine::CoppaCore::new();
+            let frames = decoder.push_samples(&with_lead_and_trail(&captured));
+            assert_eq!(
+                frames.len(),
+                2,
+                "the first transmission must be the ID frame plus the payload frame"
+            );
+            let id = MacPdu::from_bytes(frames[0].payload.as_deref().unwrap())
+                .expect("the first frame must be a station-ID MacPdu");
+            assert_eq!(id.frame_type, MacFrameType::Beacon);
+            assert_eq!(id.src.as_str(), "VK3ABC");
+            assert!(
+                event_loop.last_id_time.is_some(),
+                "sending the ID must stamp last_id_time"
+            );
+
+            event_loop.transmit_samples(&payload_samples).await;
+            assert_eq!(
+                audio_out_rx.available(),
+                payload_len,
+                "the interval governs later IDs, so the next transmission is the payload alone"
+            );
+        }
+
+        /// COP-61: `id_interval_secs = 0` still turns automatic ID off, the
+        /// first transmission included.
+        #[tokio::test]
+        async fn test_zero_id_interval_sends_no_id_even_on_the_first_transmission() {
+            let mut config = config_with_callsign();
+            config.station_id.id_interval_secs = 0;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+
+            let core = coppa_engine::CoppaCore::new();
+            let payload_samples = core.encode_bytes(b"hello").expect("encode should succeed");
+
+            event_loop.transmit_samples(&payload_samples).await;
+
+            assert_eq!(
+                audio_out_rx.available(),
+                payload_samples.len(),
+                "automatic ID is off, so the first transmission is the payload alone"
+            );
+            assert_eq!(event_loop.last_id_time, None);
+        }
+
         #[tokio::test]
         async fn test_id_timer_no_activity_means_no_id_ever_sent() {
             // "no activity -> no ID": an ID is only ever prepended to a real
@@ -9721,7 +13855,7 @@ mod tests {
             // never transmits must never emit one either, no matter how much
             // (simulated) time has passed.
             let mut event_loop = EventLoop::new(config_with_callsign()).unwrap();
-            event_loop.last_id_time = Instant::now() - Duration::from_secs(3600);
+            event_loop.last_id_time = Some(Instant::now() - Duration::from_secs(3600));
             let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
             event_loop.set_audio_out(audio_out_tx);
 
@@ -9824,20 +13958,24 @@ mod tests {
             config.station_id.id_interval_secs = 1; // would otherwise fire immediately
             config.station_id.beacon_interval_secs = 1;
             let mut event_loop = EventLoop::new(config).unwrap();
-            event_loop.last_id_time = Instant::now() - Duration::from_secs(3600);
+            event_loop.last_id_time = Some(Instant::now() - Duration::from_secs(3600));
             event_loop.last_beacon_time = Instant::now() - Duration::from_secs(3600);
             let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
             event_loop.set_audio_out(audio_out_tx);
 
             let core = coppa_engine::CoppaCore::new();
             let payload_samples = core.encode_bytes(b"hello").expect("encode should succeed");
-            let payload_len = payload_samples.len();
 
+            assert!(
+                !event_loop.id_due(),
+                "no ID should be due without a configured callsign"
+            );
             event_loop.transmit_samples(&payload_samples).await;
+            // COP-37: the transmission itself is refused, ID and all.
             assert_eq!(
                 audio_out_rx.available(),
-                payload_len,
-                "no ID should be prepended without a configured callsign"
+                0,
+                "nothing, ID or payload, should be sent without a configured callsign"
             );
 
             let (audio_out_tx2, audio_out_rx2) = coppa_audio::audio_ring(1_000_000);
@@ -9885,6 +14023,8 @@ mod tests {
             addr: String,
             answer: Arc<Mutex<String>>,
             alive: Arc<AtomicBool>,
+            /// How many `f` (frequency) queries the rig has answered (COP-21).
+            f_queries: Arc<std::sync::atomic::AtomicUsize>,
         }
 
         fn fake_rigctld(answer: &str) -> FakeRig {
@@ -9892,7 +14032,12 @@ mod tests {
             let addr = listener.local_addr().unwrap().to_string();
             let answer = Arc::new(Mutex::new(answer.to_string()));
             let alive = Arc::new(AtomicBool::new(true));
-            let (shared, live) = (Arc::clone(&answer), Arc::clone(&alive));
+            let f_queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (shared, live, queries) = (
+                Arc::clone(&answer),
+                Arc::clone(&alive),
+                Arc::clone(&f_queries),
+            );
             std::thread::spawn(move || {
                 let Ok((stream, _)) = listener.accept() else {
                     return;
@@ -9905,7 +14050,12 @@ mod tests {
                         break;
                     }
                     let reply = match line.trim() {
-                        "f" => shared.lock().unwrap().clone(),
+                        "f" => {
+                            // Counted before the reply is written, so a read
+                            // after the client has its answer is race-free.
+                            queries.fetch_add(1, Ordering::SeqCst);
+                            shared.lock().unwrap().clone()
+                        }
                         "t" => ptt.clone(),
                         cmd if cmd.starts_with("T ") => {
                             ptt = cmd[2..].to_string();
@@ -9922,11 +14072,12 @@ mod tests {
                 addr,
                 answer,
                 alive,
+                f_queries,
             }
         }
 
         fn wideband_config() -> DaemonConfig {
-            let mut config = DaemonConfig::default();
+            let mut config = tx_config();
             config.engine.profile = "VHF_FAST".into();
             config.audio.sample_rate = 100_000_000;
             config.audio.buffer_size = 0;
@@ -10049,6 +14200,24 @@ mod tests {
             config.radio.rigctld_address = "127.0.0.1:1".into();
             let event_loop = EventLoop::new(config).unwrap();
             assert!(!event_loop.ptt.is_rigctld());
+            // COP-32: the fallback is reported, so coppad does not say ready.
+            assert_eq!(
+                event_loop.startup_problems(),
+                ["no PTT: rigctld at 127.0.0.1:1 is unreachable"]
+            );
+        }
+
+        #[test]
+        fn a_clean_startup_reports_no_problems() {
+            assert!(EventLoop::new(DaemonConfig::default())
+                .unwrap()
+                .startup_problems()
+                .is_empty());
+            let rig = fake_rigctld("144500000");
+            assert!(EventLoop::new(rigctld_config(&rig))
+                .unwrap()
+                .startup_problems()
+                .is_empty());
         }
 
         // ── Phase 4: per-transmission gate ────────────────────────────────
@@ -10201,11 +14370,77 @@ mod tests {
             event_loop.transmit_samples(&SAMPLES).await;
             assert!(!event_loop.is_transmitting);
             assert_eq!(event_loop.tx_on_air_bytes, 0, "refused bytes leave BUFFER");
+            assert_eq!(
+                event_loop.last_id_time, None,
+                "a refused transmission sent no ID, so the first one is still owed"
+            );
             *rig.answer.lock().unwrap() = "144500000".into();
             assert_eq!(
                 PttControl::get_ptt(&mut event_loop.ptt).unwrap(),
                 PttState::Rx,
                 "the rig was never keyed"
+            );
+        }
+
+        /// COP-61: a beacon the gate refuses sent no ID, so it must not use up
+        /// the first ID the next allowed transmission owes.
+        #[tokio::test]
+        async fn refused_wideband_beacon_leaves_the_first_id_owed() {
+            let rig = fake_rigctld("144500000");
+            let mut config = rigctld_config(&rig);
+            config.station_id.beacon_interval_secs = 5;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            event_loop.last_beacon_time = Instant::now() - Duration::from_secs(10);
+            *rig.answer.lock().unwrap() = "7074000".into();
+            event_loop.maybe_send_beacon().await;
+            assert_eq!(event_loop.tx_generation, 0, "the beacon was refused");
+            assert_eq!(
+                event_loop.last_id_time, None,
+                "a refused beacon sent no ID, so the first one is still owed"
+            );
+
+            *rig.answer.lock().unwrap() = "144500000".into();
+            event_loop.last_beacon_time = Instant::now() - Duration::from_secs(10);
+            event_loop.maybe_send_beacon().await;
+            assert_eq!(event_loop.tx_generation, 1, "the beacon went out");
+            assert!(
+                event_loop.last_id_time.is_some(),
+                "an allowed beacon is an ID"
+            );
+        }
+
+        /// COP-65: a transmission the gate refuses never reaches the air, so
+        /// it reports no TX level; the same call allowed reports exactly one.
+        #[cfg(feature = "websocket")]
+        #[tokio::test]
+        async fn refused_wideband_transmission_reports_no_tx_audio_level() {
+            use coppa_host::websocket::AudioLevelDirection;
+
+            let rig = fake_rigctld("144500000");
+            let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel::<String>(64);
+            event_loop.set_ws_broadcast(ws_tx);
+
+            *rig.answer.lock().unwrap() = "7074000".into();
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert!(!event_loop.is_transmitting);
+            assert!(
+                drain_audio_levels(&mut ws_rx, Some(AudioLevelDirection::Tx)).is_empty(),
+                "a refused transmission reports no TX level"
+            );
+            *rig.answer.lock().unwrap() = "144500000".into();
+            assert_eq!(
+                PttControl::get_ptt(&mut event_loop.ptt).unwrap(),
+                PttState::Rx,
+                "the rig was never keyed"
+            );
+
+            // Control: back on 2m, the same call transmits and reports once.
+            event_loop.transmit_samples(&SAMPLES).await;
+            assert!(event_loop.is_transmitting);
+            assert_eq!(
+                drain_audio_levels(&mut ws_rx, Some(AudioLevelDirection::Tx)).len(),
+                1
             );
         }
 
@@ -10311,6 +14546,155 @@ mod tests {
             );
         }
 
+        /// Write `payload` to `event_loop`'s established session, the way a
+        /// host does.
+        async fn session_write(event_loop: &mut EventLoop, payload: &[u8]) {
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: payload.to_vec(),
+                })
+                .await;
+        }
+
+        /// COP-41 review: established-session data is held, not cut into a
+        /// frame that the gate then refuses, while the gate refuses, and the
+        /// ordinary retry poll resumes it once the rig is back on 2m -- no
+        /// PTT release or host write is needed to restart the stream.
+        /// COP-38: the held bytes stay in the session link's backlog, and
+        /// nothing is in flight until the frame really keys.
+        #[tokio::test]
+        async fn held_session_chunks_drain_once_the_rig_is_back_on_vhf() {
+            let rig = fake_rigctld("144500000");
+            let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            super::telemetry::seed_established(&mut event_loop);
+            *rig.answer.lock().unwrap() = "14074000".into();
+            session_write(&mut event_loop, b"first").await;
+            session_write(&mut event_loop, b"second").await;
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.backlog.len(), 11, "held, not dropped");
+            assert_eq!(link.tx.in_flight(), 0);
+            assert!(event_loop.session_tx_held_by_frequency_gate);
+            assert_eq!(event_loop.tx_generation, 0);
+            assert_eq!(
+                event_loop.buffered_tx_bytes(),
+                11,
+                "BUFFER still counts them"
+            );
+
+            event_loop.retry_held_tx_drain().await;
+            assert_eq!(
+                event_loop.session_link.as_ref().unwrap().backlog.len(),
+                11,
+                "still on HF: still held"
+            );
+
+            *rig.answer.lock().unwrap() = "144500000".into();
+            event_loop.retry_held_tx_drain().await;
+            assert!(!event_loop.session_tx_held_by_frequency_gate);
+            assert_eq!(event_loop.tx_generation, 1, "the first frame went out");
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 1);
+        }
+
+        /// COP-41 review: a session frame that passes the pre-send check but
+        /// is refused after the courtesy wait leaves no hole in the host's
+        /// byte stream, and the retry poll sends it once the rig is back on
+        /// 2m. COP-38: `ArqTx::send` runs only after a real key-up, so the
+        /// refused bytes simply stay in the backlog, and `BUFFER` counts them
+        /// until the peer ACKs.
+        #[tokio::test(start_paused = true)]
+        async fn a_post_wait_refusal_leaves_the_session_bytes_in_the_backlog() {
+            let rig = fake_rigctld("144500000");
+            let mut config = rigctld_config(&rig);
+            config.audio.sample_rate = 48_000;
+            config.station_id.busy_hold_ms = 10;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (mut audio_in_tx, audio_in_rx) = coppa_audio::audio_ring(32_768);
+            let (audio_out_tx, _audio_out_rx) = coppa_audio::audio_ring(32_768);
+            event_loop.set_audio_in(audio_in_rx);
+            event_loop.set_audio_out(audio_out_tx);
+            super::telemetry::seed_established(&mut event_loop);
+            let mut counter = 1u32;
+            let mut noise = |amplitude: f32| -> Vec<f32> {
+                (0..1024)
+                    .map(|_| {
+                        counter = counter.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                        amplitude * ((counter >> 8) as f32 / (1u32 << 24) as f32 - 0.5)
+                    })
+                    .collect()
+            };
+            for _ in 0..10 {
+                event_loop.busy_gate.observe(&noise(0.01));
+            }
+            for _ in 0..5 {
+                event_loop.busy_gate.observe(&noise(0.5));
+            }
+            assert!(event_loop.busy_gate.current());
+            {
+                let write = session_write(&mut event_loop, b"first second");
+                tokio::pin!(write);
+                tokio::select! {
+                    biased;
+                    _ = &mut write => panic!("the send must wait for the busy channel"),
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+                *rig.answer.lock().unwrap() = "14074000".into();
+                audio_in_tx.write(&noise(0.01));
+                tokio::time::timeout(Duration::from_secs(5), write)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(event_loop.tx_generation, 0, "the frame was refused");
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx.in_flight(), 0, "ArqTx::send never ran");
+            assert_eq!(link.backlog.len(), 12, "every byte stays in the backlog");
+            assert_eq!(event_loop.buffered_tx_bytes(), 12, "BUFFER still counts it");
+            assert!(event_loop.session_tx_held_by_frequency_gate);
+
+            *rig.answer.lock().unwrap() = "144500000".into();
+            event_loop.retry_held_tx_drain().await;
+            assert_eq!(event_loop.tx_generation, 1, "the refused frame went out");
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx.in_flight(), 1);
+            assert_eq!(
+                event_loop.buffered_tx_bytes(),
+                12,
+                "BUFFER counts it until the ACK"
+            );
+        }
+
+        /// COP-38 (D7) with COP-40: while the wideband gate refuses, the
+        /// session retransmit pass keys nothing and spends neither backoff
+        /// nor budget (the first-send path holds without loss, so the
+        /// retransmit path must too); once evidence is back, it retransmits.
+        #[tokio::test]
+        async fn wideband_gate_holds_session_retransmits_without_spending_the_budget() {
+            let rig = fake_rigctld("144500000");
+            let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            let id = super::telemetry::seed_established(&mut event_loop);
+            event_loop.ensure_session_link(id);
+            fast_session_rto(&mut event_loop);
+            session_write(&mut event_loop, b"held retransmit").await;
+            assert_eq!(event_loop.tx_generation, 1);
+            event_loop.handle_ptt_change(false).await;
+            let link = event_loop.session_link.as_ref().unwrap();
+            let seq = link.tx.send_base();
+            let rto = link.tx.rto();
+
+            *rig.answer.lock().unwrap() = "14074000".into();
+            sleep_past_session_rto(&event_loop);
+            event_loop.check_session_retransmits().await;
+            assert_eq!(event_loop.tx_generation, 1, "nothing keys while refused");
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx.transmit_count(seq), Some(1), "no budget spent");
+            assert_eq!(link.tx.rto(), rto, "no backoff spent");
+
+            *rig.answer.lock().unwrap() = "144500000".into();
+            event_loop.check_session_retransmits().await;
+            assert_eq!(event_loop.tx_generation, 2, "the retransmission keys");
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx.transmit_count(seq), Some(2));
+        }
+
         /// A `LevelDerived` engine starts narrowband (no startup check
         /// applies) but is gated the moment it climbs into `vhf_wide`.
         #[tokio::test]
@@ -10323,6 +14707,1689 @@ mod tests {
             assert!(event_loop.engine.occupied_bandwidth_hz() > 2_800);
             event_loop.transmit_samples(&SAMPLES).await;
             assert_eq!(event_loop.tx_generation, 0);
+        }
+
+        // ── COP-21: a level-derived engine uses HF, not vhf_wide, below 29.7 MHz ──
+        mod cop21_hf_legal_profile {
+            use super::*;
+
+            /// `EventLoop::new` falls back to `EngineConfig::default()`
+            /// (`OfdmBand::LevelDerived`) for any name `get_profile` does not know.
+            const UNKNOWN_PROFILE: &str = "HF-STANDARD-TYPO";
+
+            fn level_derived(mut config: DaemonConfig) -> DaemonConfig {
+                config.engine.profile = UNKNOWN_PROFILE.into();
+                config
+            }
+
+            /// Raise `RateLoop` the way peer ACKs do (raise_dwell = 5).
+            fn climb_to(event_loop: &mut EventLoop, level: u8) {
+                while event_loop.rate_loop.current_level() < level {
+                    event_loop.rate_loop.on_ack(9, true);
+                }
+            }
+
+            /// Given the daemon knows (or cannot show) it is below 29.7 MHz,
+            /// when RateLoop selects level 5, then the frame goes out on HF.
+            async fn level_5_goes_out_on_hf(config: DaemonConfig) {
+                let mut event_loop = EventLoop::new(level_derived(config)).unwrap();
+                assert_eq!(
+                    event_loop.engine.config().ofdm_band,
+                    OfdmBand::LevelDerived,
+                    "premise"
+                );
+                climb_to(&mut event_loop, 5);
+                event_loop.enqueue_tx(None, b"hello".to_vec()).await;
+                assert_eq!(event_loop.engine.speed_level(), 5);
+                assert!(!event_loop.engine.on_vhf_profile(), "not vhf_wide");
+                assert_eq!(event_loop.engine.occupied_bandwidth_hz(), 2400);
+                assert_eq!(event_loop.engine.config().ofdm_band, OfdmBand::Hf);
+                assert_eq!(event_loop.tx_generation, 1, "the frame went on air");
+                assert!(event_loop.tx_queue.is_empty());
+                assert!(!event_loop.tx_held_by_frequency_gate);
+            }
+
+            #[tokio::test]
+            async fn level_5_on_a_stated_hf_frequency_uses_the_hf_profile() {
+                let mut config = wideband_config();
+                config.radio.frequency_hz = Some(14_074_000);
+                level_5_goes_out_on_hf(config).await;
+            }
+
+            #[tokio::test]
+            async fn level_5_with_rigctld_on_hf_uses_the_hf_profile() {
+                let rig = fake_rigctld("7074000");
+                level_5_goes_out_on_hf(rigctld_config(&rig)).await;
+            }
+
+            #[tokio::test]
+            async fn level_5_with_a_stated_10m_band_uses_the_hf_profile() {
+                let mut config = wideband_config();
+                config.radio.band = Some("10m".into()); // lower edge 28.0 MHz
+                level_5_goes_out_on_hf(config).await;
+            }
+
+            #[tokio::test]
+            async fn level_5_with_no_frequency_source_uses_the_hf_profile() {
+                level_5_goes_out_on_hf(wideband_config()).await;
+            }
+
+            #[tokio::test]
+            async fn level_5_on_2m_still_uses_vhf_wide() {
+                let mut config = wideband_config();
+                config.radio.band = Some("2m".into());
+                let mut event_loop = EventLoop::new(level_derived(config)).unwrap();
+                climb_to(&mut event_loop, 5);
+                event_loop.enqueue_tx(None, b"hello".to_vec()).await;
+                assert!(event_loop.engine.on_vhf_profile());
+                assert_eq!(event_loop.engine.occupied_bandwidth_hz(), 5600);
+                assert_eq!(event_loop.engine.config().ofdm_band, OfdmBand::LevelDerived);
+                assert_eq!(event_loop.tx_generation, 1);
+            }
+
+            #[tokio::test]
+            async fn apply_speed_level_rebinds_before_the_level_takes_effect() {
+                let mut config = wideband_config();
+                config.radio.frequency_hz = Some(14_074_000);
+                let mut event_loop = EventLoop::new(level_derived(config)).unwrap();
+                event_loop.apply_speed_level(5).unwrap();
+                assert_eq!(event_loop.engine.speed_level(), 5);
+                assert_eq!(event_loop.engine.occupied_bandwidth_hz(), 2400);
+                // RateLoop's ladder now tops out at HF's level 8.
+                for _ in 0..60 {
+                    event_loop.rate_loop.on_ack(9, true);
+                }
+                assert_eq!(event_loop.rate_loop.current_level(), 8);
+            }
+
+            #[tokio::test]
+            async fn hf_engines_and_level_derived_engines_below_5_never_query_the_rig() {
+                for (profile, climb_to_level) in [("HF_STANDARD", 8), (UNKNOWN_PROFILE, 4)] {
+                    let rig = fake_rigctld("7074000");
+                    let mut config = rigctld_config(&rig);
+                    config.engine.profile = profile.into();
+                    let mut event_loop = EventLoop::new(config).unwrap();
+                    climb_to(&mut event_loop, climb_to_level);
+                    for i in 0..3u8 {
+                        event_loop.enqueue_tx(None, vec![i]).await;
+                        event_loop.handle_ptt_change(false).await;
+                    }
+                    event_loop.apply_speed_level(climb_to_level).unwrap();
+                    assert_eq!(rig.f_queries.load(Ordering::SeqCst), 0, "{profile}");
+                }
+            }
+
+            /// On 2m at `level`, one frame sent on vhf_wide, then the rig is
+            /// retuned to 20m.
+            async fn on_vhf_wide_then_retuned(level: u8) -> (FakeRig, EventLoop) {
+                let rig = fake_rigctld("144500000");
+                let mut event_loop = EventLoop::new(level_derived(rigctld_config(&rig))).unwrap();
+                climb_to(&mut event_loop, level);
+                event_loop.enqueue_tx(None, b"one".to_vec()).await;
+                assert_eq!(event_loop.engine.occupied_bandwidth_hz(), 5600, "premise");
+                assert_eq!(event_loop.tx_generation, 1, "premise: legal on 2m");
+                event_loop.handle_ptt_change(false).await;
+                *rig.answer.lock().unwrap() = "14074000".into();
+                (rig, event_loop)
+            }
+
+            #[tokio::test]
+            async fn a_retune_below_29m7_sends_the_next_payload_on_hf() {
+                let (_rig, mut event_loop) = on_vhf_wide_then_retuned(6).await;
+                event_loop.enqueue_tx(None, b"two".to_vec()).await;
+                assert_eq!(event_loop.tx_generation, 2, "sent, not held");
+                assert!(!event_loop.tx_held_by_frequency_gate);
+                assert_eq!(event_loop.engine.speed_level(), 6);
+                assert_eq!(event_loop.engine.occupied_bandwidth_hz(), 2400);
+            }
+
+            #[tokio::test]
+            async fn a_retune_from_level_9_lands_on_hf_level_8() {
+                let (_rig, mut event_loop) = on_vhf_wide_then_retuned(9).await;
+                event_loop.enqueue_tx(None, b"two".to_vec()).await;
+                assert_eq!(event_loop.tx_generation, 2);
+                assert_eq!(event_loop.engine.speed_level(), 8);
+                assert_eq!(event_loop.rate_loop.current_level(), 8);
+                assert_eq!(
+                    event_loop.engine.available_speed_levels(),
+                    (1..=8).collect::<Vec<_>>()
+                );
+            }
+
+            /// Samples already encoded on vhf_wide are still refused (D8); the
+            /// engine is HF before anything else is encoded.
+            #[tokio::test]
+            async fn a_refused_pre_encoded_wideband_frame_is_still_refused_but_the_next_goes_out() {
+                let (_rig, mut event_loop) = on_vhf_wide_then_retuned(6).await;
+                event_loop.transmit_samples(&SAMPLES).await;
+                assert_eq!(event_loop.tx_generation, 1, "the vhf_wide frame is refused");
+                assert_eq!(event_loop.engine.config().ofdm_band, OfdmBand::Hf);
+                assert_eq!(event_loop.engine.occupied_bandwidth_hz(), 2400);
+                event_loop.transmit_samples(&SAMPLES).await;
+                assert_eq!(event_loop.tx_generation, 2, "the next frame goes out");
+            }
+
+            #[tokio::test]
+            async fn the_hf_binding_holds_after_the_rig_returns_to_vhf() {
+                let (rig, mut event_loop) = on_vhf_wide_then_retuned(6).await;
+                event_loop.enqueue_tx(None, b"two".to_vec()).await;
+                event_loop.handle_ptt_change(false).await;
+                *rig.answer.lock().unwrap() = "144500000".into();
+                for _ in 0..60 {
+                    event_loop.rate_loop.on_ack(9, true);
+                }
+                event_loop.enqueue_tx(None, b"three".to_vec()).await;
+                assert_eq!(
+                    event_loop.engine.config().ofdm_band,
+                    OfdmBand::Hf,
+                    "one-way (D5)"
+                );
+                assert_eq!(event_loop.engine.speed_level(), 8);
+                assert_eq!(event_loop.engine.occupied_bandwidth_hz(), 2400);
+            }
+
+            /// D2: an explicit VHF_FAST engine is refused, never rebound.
+            #[tokio::test]
+            async fn a_vhf_fast_engine_is_refused_not_rebound() {
+                let rig = fake_rigctld("144500000");
+                let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+                *rig.answer.lock().unwrap() = "14074000".into();
+                event_loop.transmit_samples(&SAMPLES).await;
+                event_loop.enqueue_tx(None, b"held".to_vec()).await;
+                assert_eq!(event_loop.tx_generation, 0);
+                assert!(event_loop.tx_held_by_frequency_gate);
+                assert_eq!(event_loop.engine.config().ofdm_band, OfdmBand::Vhf);
+                assert_eq!(event_loop.engine.occupied_bandwidth_hz(), 5600);
+            }
+        }
+    }
+
+    // ── COP-31: PTT is released on every exit path ──
+
+    mod cop31_ptt_release {
+        use super::*;
+        use crate::ptt_guardian::PttGuardian;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        /// PTT backend recording every state change, with the Tokio time it
+        /// happened, into a shared ordered log (the same shape as `tnc.rs`'s
+        /// `RecordingPtt`).
+        #[derive(Clone, Default)]
+        struct RecordingPtt {
+            log: Arc<std::sync::Mutex<Vec<(PttState, tokio::time::Instant)>>>,
+        }
+
+        impl RecordingPtt {
+            fn states(&self) -> Vec<PttState> {
+                self.log.lock().unwrap().iter().map(|(s, _)| *s).collect()
+            }
+        }
+
+        impl PttControl for RecordingPtt {
+            fn set_ptt(&mut self, state: PttState) -> Result<()> {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push((state, tokio::time::Instant::now()));
+                Ok(())
+            }
+
+            fn get_ptt(&mut self) -> Result<PttState> {
+                Ok(self
+                    .log
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .map_or(PttState::Rx, |(s, _)| *s))
+            }
+        }
+
+        /// One ordered log shared by a PTT backend (`ptt:Tx`/`ptt:Rx`) and a
+        /// guardian link (`guardian:K`/`guardian:R`), so a test can see which
+        /// came first.
+        type SharedLog = Arc<std::sync::Mutex<Vec<String>>>;
+
+        /// PTT backend writing into a [`SharedLog`]. With `fail_rx`, an
+        /// unkey fails (and logs nothing), like a rigctld answering
+        /// `RPRT -1`.
+        struct LoggingPtt {
+            log: SharedLog,
+            fail_rx: bool,
+        }
+
+        impl PttControl for LoggingPtt {
+            fn set_ptt(&mut self, state: PttState) -> Result<()> {
+                if state == PttState::Rx && self.fail_rx {
+                    anyhow::bail!("unkey refused");
+                }
+                self.log.lock().unwrap().push(format!("ptt:{state:?}"));
+                Ok(())
+            }
+
+            fn get_ptt(&mut self) -> Result<PttState> {
+                Ok(PttState::Rx)
+            }
+        }
+
+        /// The guardian's end of the link: each report byte becomes a
+        /// `guardian:<byte>` entry in the [`SharedLog`].
+        struct GuardianLink(SharedLog);
+
+        impl Write for GuardianLink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let mut log = self.0.lock().unwrap();
+                for &byte in buf {
+                    log.push(format!("guardian:{}", byte as char));
+                }
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// An event loop whose PTT and guardian both write into one
+        /// [`SharedLog`].
+        fn guarded_event_loop(fail_rx: bool) -> (EventLoop, SharedLog) {
+            let mut config = tx_config();
+            config.radio.ptt_pre_delay_ms = 0;
+            config.radio.ptt_tail_delay_ms = 0;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let log = SharedLog::default();
+            event_loop.ptt = PttBackend::Other(Box::new(LoggingPtt {
+                log: log.clone(),
+                fail_rx,
+            }));
+            event_loop.set_ptt_guardian(PttGuardian::from_writer(Box::new(GuardianLink(
+                log.clone(),
+            ))));
+            (event_loop, log)
+        }
+
+        /// Capture the VARA telemetry an event loop broadcasts.
+        fn capture_vara(event_loop: &mut EventLoop) -> mpsc::Receiver<VaraResponse> {
+            let (tx, rx) = mpsc::channel(256);
+            event_loop.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, tx)]))));
+            rx
+        }
+
+        /// The `PTT ON`/`PTT OFF` lines received so far, in order.
+        fn ptt_lines(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<bool> {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|response| match response {
+                    VaraResponse::Ptt(on) => Some(on),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// A recording fake rigctld (COP-31's own; `cop40_frequency_gate`'s
+        /// `FakeRig` is left alone). Accepts any number of connections and
+        /// logs every command line, in order, before answering it: `f` with
+        /// `freq`, `t` with the PTT state, `T <n>` with `RPRT 0` (or, with
+        /// `refuse_ptt`, `RPRT -1` and the state unchanged).
+        struct RecordingRig {
+            addr: String,
+            commands: Arc<std::sync::Mutex<Vec<String>>>,
+            ptt: Arc<std::sync::Mutex<String>>,
+        }
+
+        impl RecordingRig {
+            fn commands(&self) -> Vec<String> {
+                self.commands.lock().unwrap().clone()
+            }
+
+            fn ptt(&self) -> String {
+                self.ptt.lock().unwrap().clone()
+            }
+        }
+
+        fn recording_rigctld(initial_ptt: &str, freq: &str, refuse_ptt: bool) -> RecordingRig {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let ptt = Arc::new(std::sync::Mutex::new(initial_ptt.to_string()));
+            let (log, state, freq) = (Arc::clone(&commands), Arc::clone(&ptt), freq.to_string());
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { return };
+                    let (log, state, freq) = (Arc::clone(&log), Arc::clone(&state), freq.clone());
+                    std::thread::spawn(move || {
+                        let mut writer = stream.try_clone().unwrap();
+                        for line in BufReader::new(stream).lines() {
+                            let Ok(line) = line else { break };
+                            let cmd = line.trim().to_string();
+                            log.lock().unwrap().push(cmd.clone());
+                            let reply = match cmd.as_str() {
+                                "f" => freq.clone(),
+                                "t" => state.lock().unwrap().clone(),
+                                c if c.starts_with("T ") => {
+                                    if refuse_ptt {
+                                        "RPRT -1".to_string()
+                                    } else {
+                                        *state.lock().unwrap() = c[2..].to_string();
+                                        "RPRT 0".to_string()
+                                    }
+                                }
+                                _ => "RPRT -1".to_string(),
+                            };
+                            if writeln!(writer, "{reply}").is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+            RecordingRig {
+                addr,
+                commands,
+                ptt,
+            }
+        }
+
+        /// The default (narrowband HF) config with rigctld PTT at `rig`.
+        fn rigctld_config(rig: &RecordingRig) -> DaemonConfig {
+            let mut config = tx_config();
+            config.radio.ptt_method = "rigctld".into();
+            config.radio.rigctld_address = rig.addr.clone();
+            config.radio.ptt_pre_delay_ms = 0;
+            config.radio.ptt_tail_delay_ms = 0;
+            config
+        }
+
+        // ── Phase 2: shutdown and startup release ──
+
+        #[tokio::test]
+        async fn shutdown_mid_transmission_releases_ptt_and_reports_ptt_off() {
+            let mut rig = TxRig::new(tx_config());
+            let rec = RecordingPtt::default();
+            rig.event_loop.ptt = PttBackend::Other(Box::new(rec.clone()));
+            let mut vara = capture_vara(&mut rig.event_loop);
+            // Nothing pumps the output, so this stays keyed until shutdown.
+            rig.event_loop
+                .transmit_samples(&vec![0.25f32; 48_000 * 5])
+                .await;
+            assert!(rig.event_loop.is_transmitting);
+
+            rig.event_loop
+                .event_sender()
+                .send(DaemonEvent::Shutdown)
+                .await
+                .unwrap();
+            rig.event_loop.run().await.unwrap();
+
+            assert_eq!(rec.states(), [PttState::Tx, PttState::Rx]);
+            assert_eq!(ptt_lines(&mut vara), [true, false]);
+            assert!(!rig.event_loop.is_transmitting);
+            assert_eq!(rig.event_loop.tx_output().pending_len(), 0);
+        }
+
+        #[tokio::test]
+        async fn shutdown_while_idle_does_not_touch_ptt() {
+            let mut event_loop = EventLoop::new(tx_config()).unwrap();
+            let rec = RecordingPtt::default();
+            event_loop.ptt = PttBackend::Other(Box::new(rec.clone()));
+            event_loop
+                .event_sender()
+                .send(DaemonEvent::Shutdown)
+                .await
+                .unwrap();
+            event_loop.run().await.unwrap();
+            assert!(rec.states().is_empty(), "{:?}", rec.states());
+        }
+
+        #[test]
+        fn startup_releases_ptt_left_keyed_by_an_earlier_run() {
+            let rig = recording_rigctld("1", "14074000", false);
+            let event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            assert_eq!(rig.commands(), ["T 0"]);
+            assert_eq!(rig.ptt(), "0");
+            drop(event_loop);
+        }
+
+        #[test]
+        fn a_failed_startup_release_does_not_stop_the_daemon() {
+            let rig = recording_rigctld("1", "14074000", true);
+            assert!(EventLoop::new(rigctld_config(&rig)).is_ok());
+            assert_eq!(rig.commands(), ["T 0"], "the release was attempted");
+        }
+
+        #[test]
+        fn a_failed_startup_release_is_a_startup_problem() {
+            let rig = recording_rigctld("1", "14074000", true);
+            let event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            assert_eq!(
+                event_loop.startup_problems(),
+                ["PTT release at startup failed: rigctld set_ptt failed: RPRT -1"]
+            );
+            let ptt = event_loop.ptt_startup();
+            assert_eq!(ptt.active(), "rigctld");
+            assert_eq!(
+                ptt.state(),
+                "release failed: rigctld set_ptt failed: RPRT -1"
+            );
+        }
+
+        #[test]
+        fn a_clean_startup_release_is_reported_released() {
+            let rig = recording_rigctld("1", "14074000", false);
+            let event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            assert!(event_loop.startup_problems().is_empty());
+            assert_eq!(event_loop.ptt_startup().state(), "released");
+            assert_eq!(
+                event_loop.ptt_startup().method(),
+                format!("rigctld {}", rig.addr)
+            );
+        }
+
+        #[test]
+        fn startup_release_happens_even_when_the_frequency_gate_refuses() {
+            let rig = recording_rigctld("1", "14074000", false);
+            let mut config = rigctld_config(&rig);
+            config.engine.profile = "VHF_FAST".into();
+            let err = EventLoop::new(config)
+                .err()
+                .expect("a wideband profile on 20 m must be refused")
+                .to_string();
+            assert!(err.contains("97.307"), "{err}");
+            let commands = rig.commands();
+            assert_eq!(
+                commands.first().map(String::as_str),
+                Some("T 0"),
+                "PTT is released before the gate asks for the frequency: {commands:?}"
+            );
+            assert!(commands.iter().any(|c| c == "f"), "{commands:?}");
+            assert_eq!(rig.ptt(), "0");
+        }
+
+        #[tokio::test]
+        async fn dropping_a_keyed_event_loop_releases_ptt() {
+            let rig = recording_rigctld("0", "14074000", false);
+            let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            event_loop
+                .transmit_samples(&vec![0.25f32; 48_000 * 5])
+                .await;
+            assert!(event_loop.is_transmitting);
+            assert_eq!(rig.commands(), ["T 0", "T 1"]);
+            drop(event_loop);
+            assert_eq!(rig.commands(), ["T 0", "T 1", "T 0"]);
+            assert_eq!(rig.ptt(), "0");
+        }
+
+        // ── Phase 3: the in-loop PTT backstop ──
+
+        /// `TxRig` with `max_tx_duration_s = 1`, so the backstop deadline is
+        /// 1 s + `PTT_BACKSTOP_GRACE` after keying.
+        fn backstop_rig() -> TxRig {
+            let mut config = tx_config();
+            config.radio.max_tx_duration_s = 1;
+            TxRig::new(config)
+        }
+
+        fn backstop_deadline() -> Duration {
+            Duration::from_secs(1) + PTT_BACKSTOP_GRACE
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn backstop_releases_ptt_when_no_completion_arrives() {
+            let mut rig = backstop_rig();
+            rig.event_loop
+                .transmit_samples(&vec![0.5f32; 48_000 * 10])
+                .await;
+            assert!(rig.event_loop.is_transmitting);
+
+            tokio::time::sleep(backstop_deadline() - Duration::from_millis(100)).await;
+            rig.event_loop.enforce_ptt_backstop().await;
+            assert!(rig.event_loop.is_transmitting, "not overdue yet");
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            rig.event_loop.enforce_ptt_backstop().await;
+            assert!(!rig.event_loop.is_transmitting);
+            assert_eq!(rig.event_loop.tx_keyed_since, None);
+            assert_eq!(rig.event_loop.ptt.get_ptt().unwrap(), PttState::Rx);
+            assert_eq!(rig.event_loop.tx_output().pending_len(), 0);
+            assert_eq!(rig.event_loop.tx_generation, 2);
+
+            // The stuck job's completion, arriving late, is stale.
+            rig.event_loop.handle_tx_complete(1, false).await;
+            assert!(!rig.event_loop.is_transmitting);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn backstop_is_silent_while_the_completion_path_works() {
+            let mut rig = backstop_rig();
+            let rec = RecordingPtt::default();
+            rig.event_loop.ptt = PttBackend::Other(Box::new(rec.clone()));
+            let samples = vec![0.25f32; 4_800];
+
+            rig.event_loop.enforce_ptt_backstop().await;
+            assert!(rec.states().is_empty(), "idle: nothing to release");
+
+            rig.event_loop.transmit_samples(&samples).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            rig.event_loop.enforce_ptt_backstop().await;
+            assert!(rig.event_loop.is_transmitting, "inside the deadline");
+
+            rig.deliver(samples.len(), &[480]);
+            let (generation, completed) = rig.next_completion().await;
+            assert_eq!((generation, completed), (1, true));
+            rig.event_loop
+                .handle_tx_complete(generation, completed)
+                .await;
+            assert!(!rig.event_loop.is_transmitting);
+
+            tokio::time::sleep(backstop_deadline() * 2).await;
+            rig.event_loop.enforce_ptt_backstop().await;
+            assert_eq!(rec.states(), [PttState::Tx, PttState::Rx], "no second RX");
+            assert_eq!(rig.event_loop.tx_generation, 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn run_loop_backstop_recovers_from_a_panicked_completion_task() {
+            let mut rig = backstop_rig();
+            rig.event_loop.panic_in_completion_task = true;
+            let rec = RecordingPtt::default();
+            rig.event_loop.ptt = PttBackend::Other(Box::new(rec.clone()));
+
+            let keyed = tokio::time::Instant::now();
+            rig.event_loop
+                .transmit_samples(&vec![0.5f32; 48_000 * 10])
+                .await;
+            let shutdown_at = keyed + Duration::from_secs(10);
+            let events = rig.event_loop.event_sender();
+            tokio::spawn(async move {
+                tokio::time::sleep_until(shutdown_at).await;
+                events.send(DaemonEvent::Shutdown).await.unwrap();
+            });
+            rig.event_loop.run().await.unwrap();
+
+            let log = rec.log.lock().unwrap().clone();
+            assert_eq!(
+                log.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+                [PttState::Tx, PttState::Rx],
+                "the backstop released PTT once, and shutdown found nothing keyed"
+            );
+            let released = log[1].1 - keyed;
+            assert!(
+                released >= backstop_deadline()
+                    && released <= backstop_deadline() + Duration::from_millis(600),
+                "PTT released {released:?} after keying; expected within one 500 ms tick \
+                 of {:?}",
+                backstop_deadline()
+            );
+            assert!(log[1].1 < shutdown_at, "released before shutdown");
+        }
+
+        /// Same busy-burst injection as `station_id`'s
+        /// `test_transmit_deferred_while_busy_then_holdoff_applied`.
+        fn noise_block(amplitude: f32, counter: &mut u32) -> Vec<f32> {
+            (0..1024)
+                .map(|_| {
+                    *counter = counter.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    amplitude * ((*counter >> 8) as f32 / (1u32 << 24) as f32 - 0.5)
+                })
+                .collect()
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn backstop_fires_inside_a_busy_channel_wait() {
+            let mut config = tx_config();
+            config.radio.max_tx_duration_s = 1;
+            config.station_id.busy_hold_ms = 10;
+            let mut rig = TxRig::new(config);
+            let mut vara = capture_vara(&mut rig.event_loop);
+
+            // Key a first transmission while the channel is still clear.
+            rig.event_loop
+                .transmit_samples(&vec![0.5f32; 48_000 * 10])
+                .await;
+            assert!(rig.event_loop.is_transmitting);
+
+            // Then the channel goes busy, and nothing ever feeds the gate
+            // quiet audio, so the next transmission's courtesy wait never
+            // ends on its own.
+            let mut counter = 1u32;
+            for _ in 0..10 {
+                rig.event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.01, &mut counter));
+            }
+            for _ in 0..5 {
+                rig.event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.5, &mut counter));
+            }
+            assert!(rig.event_loop.busy_gate.current());
+
+            let second = vec![0.25f32; 500];
+            let waited = tokio::time::timeout(
+                Duration::from_secs(5),
+                rig.event_loop.transmit_samples(&second),
+            )
+            .await;
+            assert!(waited.is_err(), "the channel never cleared");
+            assert!(!rig.event_loop.is_transmitting);
+            assert_eq!(rig.event_loop.ptt.get_ptt().unwrap(), PttState::Rx);
+            assert_eq!(ptt_lines(&mut vara), [true, false]);
+        }
+
+        // ── Phase 4: the PTT guardian hears every transition ──
+
+        #[tokio::test]
+        async fn guardian_hears_keyed_before_keying_and_released_after_unkeying() {
+            let (mut event_loop, log) = guarded_event_loop(false);
+            event_loop.transmit_samples(&[0.25f32; 480]).await;
+            event_loop.handle_tx_complete(1, true).await;
+            assert_eq!(
+                *log.lock().unwrap(),
+                ["guardian:K", "ptt:Tx", "ptt:Rx", "guardian:R"]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_failed_unkey_leaves_the_guardian_armed() {
+            let (mut event_loop, log) = guarded_event_loop(true);
+            event_loop.transmit_samples(&[0.25f32; 480]).await;
+            event_loop.handle_tx_complete(1, true).await;
+            let log = log.lock().unwrap().clone();
+            assert_eq!(log, ["guardian:K", "ptt:Tx"]);
+            assert!(!log.iter().any(|entry| entry == "guardian:R"), "{log:?}");
+        }
+
+        #[tokio::test]
+        async fn shutdown_release_tells_the_guardian() {
+            let (mut event_loop, log) = guarded_event_loop(false);
+            event_loop
+                .transmit_samples(&vec![0.25f32; 48_000 * 5])
+                .await;
+            event_loop
+                .event_sender()
+                .send(DaemonEvent::Shutdown)
+                .await
+                .unwrap();
+            event_loop.run().await.unwrap();
+            let log = log.lock().unwrap().clone();
+            assert_eq!(log, ["guardian:K", "ptt:Tx", "ptt:Rx", "guardian:R"]);
+            assert_eq!(log.last().map(String::as_str), Some("guardian:R"));
+        }
+    }
+
+    // ── COP-60: replies wait out the peer's PTT tail before keying ───────
+
+    mod cop60_turnaround {
+        use super::*;
+        use coppa_engine::profiles::get_profile;
+
+        type Edge = (tokio::time::Instant, PttState);
+        type Edges = Arc<std::sync::Mutex<Vec<Edge>>>;
+
+        /// PTT backend recording every edge with its (virtual) time.
+        #[derive(Clone, Default)]
+        struct PttLog(Edges);
+
+        impl PttControl for PttLog {
+            fn set_ptt(&mut self, state: PttState) -> anyhow::Result<()> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((tokio::time::Instant::now(), state));
+                Ok(())
+            }
+
+            fn get_ptt(&mut self) -> anyhow::Result<PttState> {
+                Ok(self.0.lock().unwrap().last().map_or(PttState::Rx, |e| e.1))
+            }
+        }
+
+        impl PttLog {
+            fn edges(&self) -> Vec<Edge> {
+                self.0.lock().unwrap().clone()
+            }
+
+            /// Time of the first edge into `state`, if any.
+            fn first(&self, state: PttState) -> Option<tokio::time::Instant> {
+                self.edges()
+                    .into_iter()
+                    .find(|edge| edge.1 == state)
+                    .map(|edge| edge.0)
+            }
+
+            fn keyed(&self) -> bool {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .is_some_and(|edge| edge.1 == PttState::Tx)
+            }
+        }
+
+        fn install_ptt_log(station: &mut EventLoop) -> PttLog {
+            let log = PttLog::default();
+            station.ptt = PttBackend::Other(Box::new(log.clone()));
+            log
+        }
+
+        /// A real ARQ data frame from a peer `CoppaCore`, padded for the
+        /// streaming receiver.
+        fn peer_data_frame() -> Vec<f32> {
+            let peer = CoppaCore::from_profile(get_profile("HF_STANDARD").unwrap());
+            let pdu = TransportPdu::new_reliable(5, 0, 0, b"hello coppa".to_vec());
+            with_lead_and_trail(&peer.encode_bytes(&pdu.to_bytes()).unwrap())
+        }
+
+        /// ARQ on, with `TEST_CALLSIGN` (COP-37) so the station may
+        /// transmit at all.
+        fn arq_config() -> DaemonConfig {
+            let mut config = tx_config();
+            config.engine.arq_enabled = true;
+            config
+        }
+
+        const TURNAROUND: Duration = Duration::from_millis(500);
+
+        #[tokio::test(start_paused = true)]
+        async fn ack_keys_no_sooner_than_turnaround_after_the_decoded_frame() {
+            let mut station = EventLoop::new(arq_config()).unwrap();
+            assert_eq!(station.config.radio.turnaround_ms, 500);
+            let ptt = install_ptt_log(&mut station);
+            let frame = peer_data_frame();
+
+            let t0 = tokio::time::Instant::now();
+            station.decode_and_dispatch_audio(&frame).await;
+
+            let keyed = ptt
+                .first(PttState::Tx)
+                .expect("the decoded data frame must be ACKed");
+            assert!(
+                keyed - t0 >= TURNAROUND,
+                "ACK keyed {:?} after decode, before the {TURNAROUND:?} turnaround",
+                keyed - t0
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn connect_ack_also_waits_out_the_turnaround() {
+            let mut config = DaemonConfig::default();
+            config.engine.callsign = "VK3ABC".into();
+            let mut a = EventLoop::new(config.clone()).unwrap();
+            config.engine.callsign = "W1AW".into();
+            let mut b = EventLoop::new(config).unwrap();
+            b.listening = true;
+            let (a_producer, mut a_consumer) = coppa_audio::audio_ring(1_000_000);
+            let (b_producer, _b_consumer) = coppa_audio::audio_ring(1_000_000);
+            a.set_audio_out(a_producer);
+            b.set_audio_out(b_producer);
+            let b_ptt = install_ptt_log(&mut b);
+
+            a.handle_host_event(HostEvent::ConnectRequest {
+                client_id: 1,
+                source: "VK3ABC".into(),
+                destination: "W1AW".into(),
+            })
+            .await;
+            let connect_req = take_leg(&mut a_consumer, "CONNECT_REQ");
+
+            let t0 = tokio::time::Instant::now();
+            b.decode_and_dispatch_audio(&connect_req).await;
+
+            let keyed = b_ptt
+                .first(PttState::Tx)
+                .expect("b must answer the CONNECT_REQ with a CONNECT_ACK");
+            assert!(
+                keyed - t0 >= TURNAROUND,
+                "CONNECT_ACK keyed {:?} after decode, before the {TURNAROUND:?} turnaround",
+                keyed - t0
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn transmit_with_no_recent_decode_keys_at_once() {
+            // (a) No frame ever decoded: no hold.
+            let mut idle = EventLoop::new(tx_config()).unwrap();
+            let idle_ptt = install_ptt_log(&mut idle);
+            let t0 = tokio::time::Instant::now();
+            idle.transmit_samples(&[0.1; 4800]).await;
+            assert_eq!(idle_ptt.first(PttState::Tx), Some(t0));
+
+            // (b) The last decode is older than the turnaround: no hold. ARQ is
+            // off, so the decode itself transmits nothing.
+            let mut station = EventLoop::new(tx_config()).unwrap();
+            let ptt = install_ptt_log(&mut station);
+            station.decode_and_dispatch_audio(&peer_data_frame()).await;
+            assert!(
+                station.rx_turnaround_until.is_some(),
+                "the peer frame must decode, or this case proves nothing"
+            );
+            assert_eq!(ptt.first(PttState::Tx), None, "ARQ off: no reply");
+            tokio::time::advance(Duration::from_millis(600)).await;
+            let t1 = tokio::time::Instant::now();
+            station.transmit_samples(&[0.1; 4800]).await;
+            assert_eq!(ptt.first(PttState::Tx), Some(t1));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn zero_turnaround_keys_at_once() {
+            let mut config = arq_config();
+            config.radio.turnaround_ms = 0;
+            let mut station = EventLoop::new(config).unwrap();
+            let ptt = install_ptt_log(&mut station);
+            let frame = peer_data_frame();
+
+            let t0 = tokio::time::Instant::now();
+            station.decode_and_dispatch_audio(&frame).await;
+
+            assert_eq!(
+                ptt.first(PttState::Tx),
+                Some(t0),
+                "turnaround_ms = 0 disables the guard"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn already_keyed_transmission_is_not_held() {
+            let mut station = EventLoop::new(arq_config()).unwrap();
+            let ptt = install_ptt_log(&mut station);
+            // Mid-transmission: a job queued behind the active one makes no
+            // key-up edge, so there is nothing to protect.
+            station.is_transmitting = true;
+            let frame = peer_data_frame();
+
+            let t0 = tokio::time::Instant::now();
+            station.decode_and_dispatch_audio(&frame).await;
+            let elapsed = t0.elapsed();
+
+            assert_eq!(station.tx_generation, 1, "the ACK must still be sent");
+            assert!(ptt.first(PttState::Tx).is_some());
+            let pre_delay = Duration::from_millis(station.config.radio.ptt_pre_delay_ms);
+            assert!(
+                elapsed <= pre_delay,
+                "an already-keyed station waited {elapsed:?}, more than its {pre_delay:?} pre-delay"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn turnaround_wait_keeps_draining_the_input_ring() {
+            const CHUNK: usize = 960; // 20 ms at 48 kHz
+            const CHUNKS: usize = 27; // 540 ms, more than 3x the ring
+            let mut config = arq_config();
+            config.radio.ptt_pre_delay_ms = 0;
+            let ring = config.audio.buffer_size;
+            assert_eq!(ring, 8192, "the production input ring size");
+            let mut station = EventLoop::new(config).unwrap();
+            install_ptt_log(&mut station);
+            let (mut producer, consumer) = coppa_audio::audio_ring(ring);
+            station.set_audio_in(consumer);
+            let frame = peer_data_frame();
+
+            let writer = async {
+                for _ in 0..CHUNKS {
+                    producer.write(&[0.0; CHUNK]);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            tokio::join!(station.decode_and_dispatch_audio(&frame), writer);
+
+            assert_eq!(station.tx_generation, 1, "the ACK must have been sent");
+            let audio_in = station.audio_in.as_ref().unwrap();
+            assert_eq!(
+                audio_in.overflow_count(),
+                0,
+                "the input ring overflowed while the ACK was held"
+            );
+            assert_eq!(
+                station.pending_busy_wait_audio.len() + audio_in.available(),
+                CHUNKS * CHUNK,
+                "every written sample is held for decode or still in the ring"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn audio_parked_during_a_hold_is_decoded_before_newer_ring_audio() {
+            const CHUNK: usize = 960;
+            const CHUNKS: usize = 30; // 600 ms
+            let mut station = EventLoop::new(arq_config()).unwrap();
+            install_ptt_log(&mut station);
+            let (mut producer, consumer) = coppa_audio::audio_ring(8192);
+            station.set_audio_in(consumer);
+            // Audio parked by an earlier hold, holding a frame whose ACK
+            // holds TX again (and parks more audio) while it is decoded.
+            station.pending_busy_wait_audio = peer_data_frame();
+
+            let writer = async {
+                for _ in 0..CHUNKS {
+                    producer.write(&[0.0; CHUNK]);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            tokio::join!(station.poll_audio_input(), writer);
+
+            assert_eq!(station.tx_generation, 1, "the parked frame must be ACKed");
+            assert!(!station.pending_busy_wait_audio.is_empty());
+            // Ring audio written during the ACK's pre-delay is newer than the
+            // audio the hold parked, so this poll must not have consumed it.
+            assert_eq!(
+                station.pending_busy_wait_audio.len()
+                    + station.audio_in.as_ref().unwrap().available(),
+                CHUNKS * CHUNK,
+                "newer ring audio was decoded ahead of older parked audio"
+            );
+        }
+
+        // ── Simulated H-090 stage (d): a half-duplex cable loop ──────────
+
+        /// One cable tick: 960 samples at 48 kHz, `run()`'s `audio_poll`
+        /// cadence.
+        const CABLE_TICK: Duration = Duration::from_millis(20);
+        /// The ACK must key at least this long after the peer's PTT-off.
+        const MIN_GUARD_MARGIN: Duration = Duration::from_millis(50);
+        /// Virtual time costs no decode CPU, so one cable tick plus one poll
+        /// covers the simulator's processing latency.
+        const SIM_CEILING_SLACK: Duration = Duration::from_millis(100);
+        /// Virtual time each cable run lasts.
+        const CABLE_RUN: Duration = Duration::from_secs(5);
+
+        struct CableRun {
+            a_edges: Vec<Edge>,
+            b_edges: Vec<Edge>,
+            /// Tick at which the last chunk of `a`'s TX audio was delivered
+            /// to `b`.
+            a_last_sample_at_b: Option<tokio::time::Instant>,
+            a_unacked_bytes: usize,
+            a_in_overflow: u64,
+            b_in_overflow: u64,
+        }
+
+        /// Station `a` sends one ARQ data frame to `b` over the real host path
+        /// (`HostEvent::DataReceived` with `[host] sessionless_tx_enabled`),
+        /// and both real `run()` loops plus the cable are joined in one task.
+        ///
+        /// The cable models half-duplex RF: each tick it moves up to 960
+        /// samples each way, zero-padded (a sound card delivers silence, not
+        /// nothing), and zeroes the samples bound for a station whose PTT is
+        /// keyed, since a keyed rig hears nothing. Input rings are
+        /// `config.audio.buffer_size` (8,192), as `main.rs` sizes them, so a
+        /// hold that stops draining them overflows here too. After
+        /// `CABLE_RUN` of virtual time both loops get `Shutdown`.
+        ///
+        /// With no output worker wired, `transmit_samples`'s headless release
+        /// path holds the sender keyed for its last sample plus a
+        /// `buffer_size` drain (~170 ms) plus `ptt_tail_delay_ms`, so the
+        /// simulated peer releases PTT later than real hardware does (presented
+        /// last sample plus tail). The simulator's minimum guard is therefore
+        /// the stricter one. `docs/testing/cable-loop-turnaround.md` holds the
+        /// hardware counterpart COP-20 runs.
+        async fn run_cable_loop(config: DaemonConfig) -> CableRun {
+            let mut a = EventLoop::new(config.clone()).unwrap();
+            let mut b = EventLoop::new(config.clone()).unwrap();
+            // An ID prefix would add a frame to each leg; these tests time the
+            // ACK itself.
+            mark_identified(&mut a);
+            mark_identified(&mut b);
+            // ARQ timers run on real `std::time::Instant`s with a 5 s initial
+            // RTO; a slow runner must not add a retransmit key-up mid-test.
+            a.arq_tx = Some(ArqTx::new(ArqConfig {
+                initial_rto: Duration::from_secs(60),
+                ..ArqConfig::default()
+            }));
+            let a_ptt = install_ptt_log(&mut a);
+            let b_ptt = install_ptt_log(&mut b);
+            let (a_out_producer, mut a_out) = coppa_audio::audio_ring(1_000_000);
+            let (b_out_producer, mut b_out) = coppa_audio::audio_ring(1_000_000);
+            a.set_audio_out(a_out_producer);
+            b.set_audio_out(b_out_producer);
+            let ring = config.audio.buffer_size;
+            let (mut a_in, a_in_consumer) = coppa_audio::audio_ring(ring);
+            let (mut b_in, b_in_consumer) = coppa_audio::audio_ring(ring);
+            a.set_audio_in(a_in_consumer);
+            b.set_audio_in(b_in_consumer);
+            let (a_events, b_events) = (a.event_sender(), b.event_sender());
+            a_events
+                .send(DaemonEvent::Host(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: b"hello coppa".to_vec(),
+                }))
+                .await
+                .unwrap();
+
+            let mut a_last_sample_at_b = None;
+            let cable = async {
+                let start = tokio::time::Instant::now();
+                let mut tick = tokio::time::interval(CABLE_TICK);
+                let mut chunk = vec![0.0f32; 960];
+                while start.elapsed() < CABLE_RUN {
+                    tick.tick().await;
+                    chunk.fill(0.0);
+                    if a_out.read(&mut chunk) > 0 {
+                        a_last_sample_at_b = Some(tokio::time::Instant::now());
+                    }
+                    if b_ptt.keyed() {
+                        chunk.fill(0.0);
+                    }
+                    b_in.write(&chunk);
+
+                    chunk.fill(0.0);
+                    b_out.read(&mut chunk);
+                    if a_ptt.keyed() {
+                        chunk.fill(0.0);
+                    }
+                    a_in.write(&chunk);
+                }
+                a_events.send(DaemonEvent::Shutdown).await.unwrap();
+                b_events.send(DaemonEvent::Shutdown).await.unwrap();
+            };
+            let (a_result, b_result, ()) = tokio::join!(a.run(), b.run(), cable);
+            a_result.unwrap();
+            b_result.unwrap();
+
+            CableRun {
+                a_edges: a_ptt.edges(),
+                b_edges: b_ptt.edges(),
+                a_last_sample_at_b,
+                a_unacked_bytes: a.arq_tx.as_ref().unwrap().unacked_bytes(),
+                a_in_overflow: a.audio_in.as_ref().unwrap().overflow_count(),
+                b_in_overflow: b.audio_in.as_ref().unwrap().overflow_count(),
+            }
+        }
+
+        struct TurnaroundCheck {
+            /// `b`'s first PTT-on minus `a`'s first PTT-off, required
+            /// `>= MIN_GUARD_MARGIN`.
+            min_guard: Result<Duration, String>,
+            /// `b`'s first PTT-on minus `a_last_sample_at_b`, required
+            /// `<= turnaround + SIM_CEILING_SLACK`.
+            ceiling: Result<Duration, String>,
+        }
+
+        fn check_turnaround(run: &CableRun, turnaround: Duration) -> TurnaroundCheck {
+            let first = |edges: &[Edge], state: PttState, after: Option<tokio::time::Instant>| {
+                edges
+                    .iter()
+                    .find(|edge| edge.1 == state && after.is_none_or(|t| edge.0 >= t))
+                    .map(|edge| edge.0)
+            };
+            let a_on = first(&run.a_edges, PttState::Tx, None);
+            let a_off = a_on.and_then(|on| first(&run.a_edges, PttState::Rx, Some(on)));
+            let b_on = first(&run.b_edges, PttState::Tx, None);
+
+            let min_guard = match (a_off, b_on) {
+                (None, _) => Err("a never released PTT".to_string()),
+                (_, None) => Err("b never keyed an ACK".to_string()),
+                (Some(a_off), Some(b_on)) if b_on < a_off => {
+                    Err(format!("b keyed {:?} before a's PTT-off", a_off - b_on))
+                }
+                (Some(a_off), Some(b_on)) if b_on - a_off < MIN_GUARD_MARGIN => Err(format!(
+                    "b keyed only {:?} after a's PTT-off, need >= {MIN_GUARD_MARGIN:?}",
+                    b_on - a_off
+                )),
+                (Some(a_off), Some(b_on)) => Ok(b_on - a_off),
+            };
+            let limit = turnaround + SIM_CEILING_SLACK;
+            let ceiling = match (run.a_last_sample_at_b, b_on) {
+                (None, _) => Err("a's audio never reached b".to_string()),
+                (_, None) => Err("b never keyed an ACK".to_string()),
+                (Some(last), Some(b_on)) if b_on < last => Err(format!(
+                    "b keyed {:?} before a's last sample arrived",
+                    last - b_on
+                )),
+                (Some(last), Some(b_on)) if b_on - last > limit => Err(format!(
+                    "b keyed {:?} after a's last sample, over the {limit:?} ceiling",
+                    b_on - last
+                )),
+                (Some(last), Some(b_on)) => Ok(b_on - last),
+            };
+            TurnaroundCheck { min_guard, ceiling }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn cable_loop_ack_keys_after_the_peers_real_ptt_off_edge() {
+            let mut config = arq_config();
+            config.host.sessionless_tx_enabled = true;
+            let turnaround = Duration::from_millis(config.radio.turnaround_ms);
+            let run = run_cable_loop(config).await;
+            let check = check_turnaround(&run, turnaround);
+
+            let margin = check.min_guard.expect("minimum guard");
+            let latency = check.ceiling.expect("ceiling");
+            assert!(margin >= MIN_GUARD_MARGIN, "{margin:?}");
+            assert!(latency <= turnaround + SIM_CEILING_SLACK, "{latency:?}");
+            assert_eq!(
+                run.a_unacked_bytes, 0,
+                "the ACK must reach a through the half-duplex cable"
+            );
+            assert_eq!(run.a_in_overflow, 0, "a's input ring overflowed");
+            assert_eq!(run.b_in_overflow, 0, "b's input ring overflowed");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn cable_loop_zero_turnaround_passes_the_ceiling_but_fails_the_minimum_guard() {
+            let mut config = arq_config();
+            config.host.sessionless_tx_enabled = true;
+            config.radio.turnaround_ms = 0;
+            let run = run_cable_loop(config).await;
+            let check = check_turnaround(&run, Duration::ZERO);
+
+            assert!(
+                check.ceiling.is_ok(),
+                "a zero-turnaround station answers fast: {:?}",
+                check.ceiling
+            );
+            let violation = check
+                .min_guard
+                .expect_err("a zero-turnaround station keys while the peer is still keyed");
+            assert!(violation.contains("before a's PTT-off"), "{violation}");
+            assert!(
+                run.a_unacked_bytes > 0,
+                "an ACK sent into a keyed peer is lost"
+            );
+        }
+
+        // ── COP-38: connected-session ARQ through the real run loops ──
+
+        /// Which keyed interval the session cable zeroes once the host write
+        /// is sent.
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum CableFault {
+            /// Nothing is lost.
+            None,
+            /// `a`'s first keyed interval after the write: the data frame.
+            DropFirstData,
+            /// `b`'s first keyed interval after the write: its ACK.
+            DropFirstAck,
+        }
+
+        struct SessionCableRun {
+            /// `b`'s `DataOut` payloads, in order.
+            delivered: Vec<Vec<u8>>,
+            a_in_flight: u8,
+            a_buffered: usize,
+            /// PTT-on edges after the host write was sent.
+            a_keyups_after_write: usize,
+            b_keyups_after_write: usize,
+            /// `a`'s `BUFFER`/`DISCONNECTED` lines after the write.
+            a_status: Vec<String>,
+            /// Virtual time from the write to the last delivered byte.
+            transfer_time: Option<Duration>,
+        }
+
+        /// Virtual-time cap for one session cable run.
+        const SESSION_CABLE_CAP: Duration = Duration::from_secs(1_200);
+
+        /// COP-38: two stations (`VK3ABC` calls `W1AW`) with
+        /// `DaemonConfig::default()` -- default PTT/turnaround timing and
+        /// `arq_enabled = false` -- run their real `run()` loops over the
+        /// same half-duplex cable as `run_cable_loop`. The host's `CONNECT`
+        /// goes to `a`; once both hosts have `CONNECTED` and neither station
+        /// is keyed, `payload` is written to `a`'s data port and `fault` is
+        /// armed: the faulted station's next keyed interval reaches the
+        /// other station as silence. The run ends 10 virtual seconds after
+        /// every byte has reached `b`'s host and `a` has reported `BUFFER 0`
+        /// (its last ACK decoded), or at `SESSION_CABLE_CAP`. No test-side
+        /// retransmit call is made: any retransmission comes from `run()`.
+        async fn run_session_cable(payload: Vec<u8>, fault: CableFault) -> SessionCableRun {
+            let mut config = DaemonConfig::default();
+            assert!(!config.engine.arq_enabled);
+            config.engine.callsign = "VK3ABC".into();
+            let mut a = EventLoop::new(config.clone()).unwrap();
+            config.engine.callsign = "W1AW".into();
+            let mut b = EventLoop::new(config.clone()).unwrap();
+            a.listening = true;
+            b.listening = true;
+            mark_identified(&mut a);
+            mark_identified(&mut b);
+            let a_ptt = install_ptt_log(&mut a);
+            let b_ptt = install_ptt_log(&mut b);
+            let (a_out_producer, mut a_out) = coppa_audio::audio_ring(1_000_000);
+            let (b_out_producer, mut b_out) = coppa_audio::audio_ring(1_000_000);
+            a.set_audio_out(a_out_producer);
+            b.set_audio_out(b_out_producer);
+            let ring = config.audio.buffer_size;
+            let (mut a_in, a_in_consumer) = coppa_audio::audio_ring(ring);
+            let (mut b_in, b_in_consumer) = coppa_audio::audio_ring(ring);
+            a.set_audio_in(a_in_consumer);
+            b.set_audio_in(b_in_consumer);
+            let (a_resp_tx, mut a_resp) = mpsc::unbounded_channel();
+            let (b_resp_tx, mut b_resp) = mpsc::unbounded_channel();
+            a.set_response_tx(a_resp_tx);
+            b.set_response_tx(b_resp_tx);
+            let mut a_vara = super::vara_lines(&mut a);
+            let (a_events, b_events) = (a.event_sender(), b.event_sender());
+            a_events
+                .send(DaemonEvent::Host(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "VK3ABC".into(),
+                    destination: "W1AW".into(),
+                }))
+                .await
+                .unwrap();
+
+            let mut delivered: Vec<Vec<u8>> = Vec::new();
+            let mut a_status = Vec::new();
+            let mut written_at = None;
+            let mut keyups_at_write = (0, 0);
+            let mut transfer_time = None;
+            let cable = async {
+                let start = tokio::time::Instant::now();
+                let mut tick = tokio::time::interval(CABLE_TICK);
+                let mut chunk = vec![0.0f32; 960];
+                let (mut a_connected, mut b_connected) = (false, false);
+                // Armed -> dropping (the faulted station keyed) -> spent.
+                let (mut armed, mut dropping) = (false, false);
+                let mut delivered_bytes = 0usize;
+                let mut done_at: Option<tokio::time::Instant> = None;
+                while start.elapsed() < SESSION_CABLE_CAP
+                    && done_at.is_none_or(|t| t.elapsed() < Duration::from_secs(10))
+                {
+                    tick.tick().await;
+                    while let Ok(resp) = a_resp.try_recv() {
+                        if let coppa_host::HostResponse::StatusUpdate { status, .. } = resp {
+                            a_connected |= status.starts_with("CONNECTED");
+                        }
+                    }
+                    while let Ok(resp) = b_resp.try_recv() {
+                        match resp {
+                            coppa_host::HostResponse::StatusUpdate { status, .. } => {
+                                b_connected |= status.starts_with("CONNECTED");
+                            }
+                            coppa_host::HostResponse::DataOut { data, .. } => {
+                                delivered_bytes += data.len();
+                                delivered.push(data);
+                                if delivered_bytes >= payload.len() {
+                                    transfer_time =
+                                        written_at.map(|t: tokio::time::Instant| t.elapsed());
+                                }
+                            }
+                        }
+                    }
+                    let lines = super::drain_status(&mut a_vara);
+                    if written_at.is_some() {
+                        a_status.extend(lines);
+                    }
+                    if written_at.is_none()
+                        && a_connected
+                        && b_connected
+                        && !a_ptt.keyed()
+                        && !b_ptt.keyed()
+                    {
+                        a_events
+                            .send(DaemonEvent::Host(HostEvent::DataReceived {
+                                client_id: 1,
+                                data: payload.clone(),
+                            }))
+                            .await
+                            .unwrap();
+                        written_at = Some(tokio::time::Instant::now());
+                        keyups_at_write = (
+                            a_ptt.edges().iter().filter(|e| e.1 == PttState::Tx).count(),
+                            b_ptt.edges().iter().filter(|e| e.1 == PttState::Tx).count(),
+                        );
+                        armed = fault != CableFault::None;
+                    }
+                    if done_at.is_none()
+                        && delivered_bytes >= payload.len()
+                        && a_status.last().is_some_and(|l| l == "BUFFER 0")
+                    {
+                        done_at = Some(tokio::time::Instant::now());
+                    }
+
+                    let faulted_keyed = match fault {
+                        CableFault::DropFirstData => a_ptt.keyed(),
+                        CableFault::DropFirstAck => b_ptt.keyed(),
+                        CableFault::None => false,
+                    };
+                    if armed && faulted_keyed {
+                        armed = false;
+                        dropping = true;
+                    }
+
+                    chunk.fill(0.0);
+                    let a_read = a_out.read(&mut chunk);
+                    if b_ptt.keyed() || (dropping && fault == CableFault::DropFirstData) {
+                        chunk.fill(0.0);
+                    }
+                    if dropping
+                        && fault == CableFault::DropFirstData
+                        && a_read == 0
+                        && !a_ptt.keyed()
+                    {
+                        dropping = false;
+                    }
+                    b_in.write(&chunk);
+
+                    chunk.fill(0.0);
+                    let b_read = b_out.read(&mut chunk);
+                    if a_ptt.keyed() || (dropping && fault == CableFault::DropFirstAck) {
+                        chunk.fill(0.0);
+                    }
+                    if dropping
+                        && fault == CableFault::DropFirstAck
+                        && b_read == 0
+                        && !b_ptt.keyed()
+                    {
+                        dropping = false;
+                    }
+                    a_in.write(&chunk);
+                }
+                a_events.send(DaemonEvent::Shutdown).await.unwrap();
+                b_events.send(DaemonEvent::Shutdown).await.unwrap();
+            };
+            let (a_result, b_result, ()) = tokio::join!(a.run(), b.run(), cable);
+            a_result.unwrap();
+            b_result.unwrap();
+
+            let keyups = |log: &PttLog| log.edges().iter().filter(|e| e.1 == PttState::Tx).count();
+            SessionCableRun {
+                delivered,
+                a_in_flight: a.session_link.as_ref().map_or(0, |l| l.tx.in_flight()),
+                a_buffered: a.buffered_tx_bytes(),
+                a_keyups_after_write: keyups(&a_ptt) - keyups_at_write.0,
+                b_keyups_after_write: keyups(&b_ptt) - keyups_at_write.1,
+                a_status,
+                transfer_time,
+            }
+        }
+
+        /// COP-38, the ticket's Gherkin end to end: in an established
+        /// session, a data frame lost in transit (zeroed on the cable) is
+        /// detected by `ArqTx`, retransmitted by `run()`'s own retransmit
+        /// tick -- no test-side call -- and delivered to the peer's host
+        /// exactly once; the peer's ACK then clears `BUFFER`.
+        #[tokio::test(start_paused = true)]
+        async fn cable_loop_lost_session_frame_is_retransmitted_by_the_run_loop() {
+            let payload = b"FC EM 12345_W1AW 1234 567 0\r".to_vec();
+            let run = run_session_cable(payload.clone(), CableFault::DropFirstData).await;
+            assert_eq!(run.delivered, vec![payload], "status: {:?}", run.a_status);
+            assert_eq!(run.a_in_flight, 0, "the retransmission must be ACKed");
+            assert_eq!(run.a_buffered, 0);
+            assert!(
+                run.a_keyups_after_write >= 2,
+                "the lost frame plus its retransmission, got {}",
+                run.a_keyups_after_write
+            );
+            assert_eq!(run.a_status.last().map(String::as_str), Some("BUFFER 0"));
+        }
+
+        /// COP-38: a lost ACK, end to end. `a` retransmits from `run()`, `b`
+        /// drops the duplicate (one `DataOut`) and ACKs again.
+        #[tokio::test(start_paused = true)]
+        async fn cable_loop_lost_session_ack_is_recovered_without_a_duplicate_delivery() {
+            let payload = b"acked, lost, acked again".to_vec();
+            let run = run_session_cable(payload.clone(), CableFault::DropFirstAck).await;
+            assert_eq!(run.delivered, vec![payload], "status: {:?}", run.a_status);
+            assert!(
+                run.b_keyups_after_write >= 2,
+                "the lost ACK plus the re-ACK, got {}",
+                run.b_keyups_after_write
+            );
+            assert_eq!(run.a_in_flight, 0);
+        }
+
+        /// COP-38 (D9b): the real-audio half of the old large-write test. A
+        /// 1000-byte write arrives intact and in order through both real run
+        /// loops, one stop-and-wait frame at a time.
+        #[tokio::test(start_paused = true)]
+        async fn cable_loop_session_write_of_1000_bytes_arrives_intact_in_order() {
+            let payload: Vec<u8> = (0..1000).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+            let run = run_session_cable(payload.clone(), CableFault::None).await;
+            assert_eq!(
+                run.delivered.concat(),
+                payload,
+                "status: {:?}",
+                run.a_status
+            );
+            // At most 95 host bytes fit a level-2 frame (budget 117 minus the
+            // 14-byte MAC and 7-byte transport headers minus one).
+            assert!(
+                run.delivered.len() >= payload.len().div_ceil(95),
+                "{} frames",
+                run.delivered.len()
+            );
+            assert_eq!(run.a_in_flight, 0);
+            assert_eq!(run.a_buffered, 0);
+        }
+
+        /// COP-38: virtual-time throughput of a 2000-byte connected-session
+        /// write for random and B2F-like text payloads -- the source of
+        /// BENCHMARKS.md's COP-38 entry. Run with `cargo test -p coppa-daemon
+        /// --lib --features websocket,cpal-backend -- --ignored
+        /// cable_loop_session_throughput_report --nocapture`.
+        #[tokio::test(start_paused = true)]
+        #[ignore = "throughput report, minutes of real time"]
+        async fn cable_loop_session_throughput_report() {
+            let mut seed: u32 = 0x38_38_38_38;
+            let random: Vec<u8> = (0..2000)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    (seed >> 16) as u8
+                })
+                .collect();
+            let text: Vec<u8> = b"FC EM 12345ABCDE_W1AW 1234 567 0\rSubject: Weekly net report\r\n\
+                Body: Check-ins from the district were steady this week.\r\n"
+                .iter()
+                .copied()
+                .cycle()
+                .take(2000)
+                .collect();
+            for (name, payload) in [("random", random), ("text", text)] {
+                let run = run_session_cable(payload.clone(), CableFault::None).await;
+                assert_eq!(run.delivered.concat(), payload, "{name}");
+                let secs = run.transfer_time.expect("transfer completed").as_secs_f64();
+                println!(
+                    "COP-38 {name}: {} bytes in {secs:.2}s virtual = {:.1} B/s, \
+                     {} data frames, a keyed {} times, b keyed {} times",
+                    payload.len(),
+                    payload.len() as f64 / secs,
+                    run.delivered.len(),
+                    run.a_keyups_after_write,
+                    run.b_keyups_after_write,
+                );
+            }
+        }
+    }
+
+    /// COP-39: every decoded payload reaches the data-port bridge, and the
+    /// bridge delivers it to each data-port client or disconnects a client
+    /// that has stopped reading -- never a gap on an open connection.
+    mod data_delivery {
+        use super::*;
+        use coppa_host::vara::{data_channel, DATA_QUEUE_DEPTH};
+
+        /// The `DataOut` payloads waiting on `rx`, each addressed to every
+        /// client (`client_id` 0). Other responses are skipped.
+        fn data_out(rx: &mut mpsc::UnboundedReceiver<HostResponse>) -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            while let Ok(response) = rx.try_recv() {
+                if let HostResponse::DataOut { client_id, data } = response {
+                    assert_eq!(client_id, 0, "decoded data goes to every client");
+                    out.push(data);
+                }
+            }
+            out
+        }
+
+        /// The payloads waiting on one data-port client's queue.
+        fn drain(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            while let Ok(data) = rx.try_recv() {
+                out.push(data);
+            }
+            out
+        }
+
+        /// `n` distinct payloads.
+        fn numbered(n: usize) -> Vec<Vec<u8>> {
+            (0..n).map(|i| (i as u32).to_be_bytes().to_vec()).collect()
+        }
+
+        fn data_out_for_all(data: Vec<u8>) -> HostResponse {
+            HostResponse::DataOut { client_id: 0, data }
+        }
+
+        #[tokio::test]
+        async fn raw_decoded_frame_reaches_the_data_port_bridge() {
+            let mut event_loop = EventLoop::new(tx_config()).unwrap();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            event_loop.set_response_tx(tx);
+
+            event_loop
+                .decode_and_dispatch_audio(&inert_peer_frame(7))
+                .await;
+
+            assert_eq!(
+                data_out(&mut rx),
+                vec![vec![0xFF, 7, 0, 0, 0, 0, 0, 1, 2, 3]]
+            );
+        }
+
+        #[tokio::test]
+        async fn arq_delivered_payload_reaches_the_data_port_bridge() {
+            let mut config = tx_config();
+            config.engine.arq_enabled = true;
+            let mut b = EventLoop::new(config).unwrap();
+            mark_identified(&mut b);
+            // The ACK is transmitted, so it needs somewhere to go.
+            let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
+            b.set_audio_out(producer);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            b.set_response_tx(tx);
+
+            let pdu = TransportPdu::new_reliable(b.arq_session_id, 0, 0, b"reliable".to_vec());
+            b.decode_and_dispatch_audio(&peer_frame(
+                &pdu,
+                coppa_codec::ofdm::CoppaProfile::hf_standard(),
+            ))
+            .await;
+
+            assert_eq!(data_out(&mut rx), vec![b"reliable".to_vec()]);
+        }
+
+        #[tokio::test]
+        async fn session_data_survives_a_host_that_is_not_reading() {
+            let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+            let local = Callsign::new("VK3ABC").unwrap();
+            let remote = Callsign::new("W1AW").unwrap();
+            let id = event_loop
+                .session_mgr
+                .create(
+                    local.clone(),
+                    remote.clone(),
+                    0,
+                    LinkCapabilities::default(),
+                )
+                .expect("a fresh SessionManager should have a free slot");
+            event_loop
+                .session_mgr
+                .get_mut(id)
+                .expect("just-created session should exist")
+                .state = SessionState::Established;
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            event_loop.set_response_tx(tx);
+
+            // More payloads than the old 64-slot queue held, with nothing
+            // draining the queue meanwhile. COP-38: each one is the next
+            // in-order reliable segment.
+            let payloads = numbered(200);
+            for (seq, payload) in payloads.iter().enumerate() {
+                let segment = TransportPdu::new_reliable(0, seq as u8, 0, payload.clone());
+                event_loop
+                    .handle_mac_pdu(MacPdu::new_data(
+                        local.clone(),
+                        remote.clone(),
+                        0,
+                        segment.to_bytes(),
+                    ))
+                    .await;
+            }
+
+            assert_eq!(data_out(&mut rx), payloads);
+        }
+
+        #[tokio::test]
+        async fn bridge_delivers_every_payload_to_a_host_that_catches_up() {
+            const CLIENT: u32 = 0x8000_0001;
+            let (client_tx, mut client_rx) = data_channel();
+            let senders: VaraDataSenders =
+                Arc::new(Mutex::new(HashMap::from([(CLIENT, client_tx)])));
+            let (tx, rx) = mpsc::unbounded_channel();
+            let bridge = tokio::spawn(forward_data_out(rx, senders.clone()));
+
+            let payloads = numbered(DATA_QUEUE_DEPTH);
+            for (i, payload) in payloads.iter().enumerate() {
+                tx.send(data_out_for_all(payload.clone())).unwrap();
+                if i % 100 == 99 {
+                    tx.send(HostResponse::StatusUpdate {
+                        client_id: 0,
+                        status: "CONNECTED W1AW".to_string(),
+                    })
+                    .unwrap();
+                }
+            }
+            drop(tx);
+            bridge.await.unwrap();
+
+            assert_eq!(drain(&mut client_rx), payloads);
+            assert!(senders.lock().await.contains_key(&CLIENT));
+        }
+
+        #[tokio::test]
+        async fn bridge_disconnects_a_host_that_stops_reading_and_serves_the_rest() {
+            const READING: u32 = 0x8000_0001;
+            const STUCK: u32 = 0x8000_0002;
+            // Deep enough never to overflow in this test.
+            let (reading_tx, mut reading_rx) = mpsc::channel(4 * DATA_QUEUE_DEPTH);
+            let (stuck_tx, mut stuck_rx) = data_channel();
+            let senders: VaraDataSenders = Arc::new(Mutex::new(HashMap::from([
+                (READING, reading_tx),
+                (STUCK, stuck_tx),
+            ])));
+            let (tx, rx) = mpsc::unbounded_channel();
+            let bridge = tokio::spawn(forward_data_out(rx, senders.clone()));
+
+            let payloads = numbered(DATA_QUEUE_DEPTH + 10);
+            for payload in &payloads {
+                tx.send(data_out_for_all(payload.clone())).unwrap();
+            }
+            drop(tx);
+            bridge.await.unwrap();
+
+            assert_eq!(drain(&mut reading_rx), payloads);
+            let map = senders.lock().await;
+            assert!(map.contains_key(&READING));
+            assert!(
+                !map.contains_key(&STUCK),
+                "a host whose queue overflowed must be disconnected"
+            );
+            drop(map);
+            assert_eq!(
+                drain(&mut stuck_rx),
+                payloads[..DATA_QUEUE_DEPTH].to_vec(),
+                "the stuck host gets every payload up to the overflow, with no gap"
+            );
+            assert_eq!(stuck_rx.recv().await, None, "then EOF");
+        }
+
+        #[tokio::test]
+        async fn bridge_delivers_a_unicast_payload_only_to_its_client() {
+            const A: u32 = 0x8000_0001;
+            const B: u32 = 0x8000_0002;
+            let (a_tx, mut a_rx) = data_channel();
+            let (b_tx, mut b_rx) = data_channel();
+            let senders: VaraDataSenders =
+                Arc::new(Mutex::new(HashMap::from([(A, a_tx), (B, b_tx)])));
+            let (tx, rx) = mpsc::unbounded_channel();
+            let bridge = tokio::spawn(forward_data_out(rx, senders.clone()));
+
+            tx.send(HostResponse::DataOut {
+                client_id: B,
+                data: b"only b".to_vec(),
+            })
+            .unwrap();
+            drop(tx);
+            bridge.await.unwrap();
+
+            assert!(drain(&mut a_rx).is_empty());
+            assert_eq!(drain(&mut b_rx), vec![b"only b".to_vec()]);
         }
     }
 }

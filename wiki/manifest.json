@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-09-06T12:17:42Z",
-  "head_commit": "3779efd",
+  "generated_at": "2026-10-27T10:17:33Z",
+  "head_commit": "98d3d2e",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -200,7 +200,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:998da387d75cbaabc88f9281b233f7d19f2599b24d220d7640e752f25ddf6410",
+      "hash": "sha256:e768bca7cf7972cc884bde4b51788999bc77586595cca390952b8a0fb5108ecc",
       "id": "band-conventions",
       "kind": "interface",
       "links": [
@@ -219,6 +219,28 @@
       "title": "What band and sample-rate conventions does coppa use?",
       "verified_commit": "c1d2676",
       "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:9bd2a246313cba83361f290f438daa8cd882616d0cec880bf0be39aff794efea",
+      "id": "cli-settings",
+      "kind": "gotcha",
+      "links": [],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/cli-settings.md",
+      "sources": [
+        "crates/coppa-cli/src/settings.rs",
+        "crates/coppa-cli/src/main.rs",
+        "crates/coppa-daemon/src/config.rs",
+        "crates/coppa-radio/src/band.rs",
+        "coppad.toml.example",
+        "docs/tutorials/getting-started.md"
+      ],
+      "status": "current",
+      "title": "What will bite you when persisting coppa CLI settings?",
+      "verified_commit": "b5144e3",
+      "verified_date": "2026-10-28",
       "visibility": "public"
     },
     {
@@ -262,7 +284,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:19423413380b0dde1dcd15ed0edfc6a3af50378a0b9cc6406a85e2ae98b89d77",
+      "hash": "sha256:ac9e650f54bf3bf10c14c43137106a324e4b077724cc39ea23893e0155358cab",
       "id": "coppa-engine",
       "kind": "subsystem",
       "links": [
@@ -355,7 +377,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:4c050d6d7a647fae7d4c6c50a7f88b27bb6c062f05317af61a6e419702923cb7",
+      "hash": "sha256:07d383ad2f7b85424b2638dd222bb99c61cf8da91a30f419ef3e80caed6228b0",
       "id": "cpal-feature-gate",
       "kind": "gotcha",
       "links": [
@@ -370,12 +392,12 @@
       ],
       "status": "current",
       "title": "What will bite you about the cpal-backend feature flag?",
-      "verified_commit": "c1d2676",
-      "verified_date": "2026-07-07",
+      "verified_commit": "f1dcac4",
+      "verified_date": "2026-10-28",
       "visibility": "public"
     },
     {
-      "hash": "sha256:7c7ad23fa09f0c3845b4f4ab8c9ada3aace5892ac60a4107f275af6c995de901",
+      "hash": "sha256:7163a3fc6b088923b3e2d9392c8d2f4215b3f120c2b85a81327a1019f8afa56f",
       "id": "ldpc-non-convergence",
       "kind": "gotcha",
       "links": [
@@ -388,14 +410,15 @@
       "path": "pages/ldpc-non-convergence.md",
       "sources": [
         "tests/phase_c_loopback.rs",
+        "crates/coppa-bench/src/runner.rs",
         "crates/coppa-protocol/src/fec/ldpc/**",
         "docs/adr/005-nr-bg2-ldpc.md",
         "BENCHMARKS.md"
       ],
       "status": "current",
       "title": "What will bite you about LDPC at speed levels 9 and 10?",
-      "verified_commit": "be2141b",
-      "verified_date": "2026-08-05",
+      "verified_commit": "3cbfd1e",
+      "verified_date": "2026-10-28",
       "visibility": "public"
     },
     {
@@ -418,7 +441,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:d94453fd26d0bcd412480b0f27a0319f3d6aad25e63b99f2c2cf7caaa5d44ea9",
+      "hash": "sha256:ece8378df1627dd56e8d8c10c4a995d5474ccc0993b6d4a7c2760fb7fefe9ec0",
       "id": "phase4-field-readiness",
       "kind": "gotcha",
       "links": [

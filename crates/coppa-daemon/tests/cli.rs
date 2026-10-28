@@ -13,6 +13,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use coppa_daemon::config::DaemonConfig;
+// COP-49: the discovery tests drive the Unix search order (HOME,
+// XDG_CONFIG_HOME, /etc); Windows searches only the cwd and %APPDATA%.
+#[cfg(unix)]
+use coppa_daemon::config::{CONFIG_FILE_NAME, SYSTEM_CONFIG_PATH};
 
 /// How long an informational command may take before the test fails.
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -47,8 +51,11 @@ impl TempDir {
         &self.0
     }
 
+    /// Write `contents` to `name`, which may contain subdirectories.
     fn write(&self, name: &str, contents: &str) -> PathBuf {
         let path = self.0.join(name);
+        std::fs::create_dir_all(path.parent().expect("a parent directory"))
+            .expect("create parent directory");
         std::fs::write(&path, contents).expect("write temporary file");
         path
     }
@@ -69,6 +76,9 @@ struct Daemon {
 }
 
 impl Daemon {
+    /// Spawn `coppad` in `cwd`. COP-49: the child's `HOME` is its own empty
+    /// capture dir and `XDG_CONFIG_HOME`/`APPDATA` are removed, so the config
+    /// search never reaches the real user's files; `envs` override this.
     fn spawn(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Self {
         let capture = TempDir::new("capture");
         let stdout = File::create(capture.0.join("stdout")).expect("create stdout capture");
@@ -78,9 +88,14 @@ impl Daemon {
             .args(args)
             .current_dir(cwd)
             .env_remove("RUST_LOG")
+            // Every daemon gets the default colour decision (COP-51).
+            .env_remove("NO_COLOR")
             // anyhow appends a backtrace to `main`'s error when either is set.
             .env_remove("RUST_BACKTRACE")
             .env_remove("RUST_LIB_BACKTRACE")
+            .env("HOME", capture.path())
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("APPDATA")
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr);
@@ -201,7 +216,12 @@ fn run_ok(cwd: &Path, args: &[&str]) -> String {
 /// Run a command that must fail with exit 1, empty stdout, and an error on
 /// stderr. Returns stderr.
 fn run_config_error(cwd: &Path, args: &[&str]) -> String {
-    let out = run(cwd, args);
+    run_config_error_with_env(cwd, args, &[])
+}
+
+/// [`run_config_error`] with extra environment variables.
+fn run_config_error_with_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> String {
+    let out = run_with_env(cwd, args, envs);
     out.assert_code(1, args);
     assert_eq!(out.stdout, "", "coppad {args:?} stdout");
     out.assert_no_startup();
@@ -237,7 +257,40 @@ fn version_line() -> String {
     format!("coppad {}\n", env!("CARGO_PKG_VERSION"))
 }
 
+/// COP-49: `HOME`'s config file, `$HOME/.config/coppa/coppad.toml`.
+#[cfg(unix)]
+fn home_config_path(home: &Path) -> PathBuf {
+    home.join(".config").join("coppa").join(CONFIG_FILE_NAME)
+}
+
+/// COP-49: `/etc/coppa/coppad.toml` cannot be redirected, so a test that
+/// expects the search to find nothing at all runs only when it is provably
+/// absent. Prints why when it is not.
+#[cfg(unix)]
+fn system_config_absent() -> bool {
+    match Path::new(SYSTEM_CONFIG_PATH).symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        other => {
+            eprintln!("skipping: {SYSTEM_CONFIG_PATH} is present or unreadable here ({other:?})");
+            false
+        }
+    }
+}
+
 // --- help and version -------------------------------------------------------
+
+/// COP-49: the help's lines on the implicit config search, per platform.
+#[cfg(not(windows))]
+const HELP_SEARCH_ORDER: &str = "\
+Without CONFIG or --config, use the first file found of ./coppad.toml,
+$XDG_CONFIG_HOME/coppa/coppad.toml (default ~/.config/coppa/coppad.toml) and
+/etc/coppa/coppad.toml; otherwise use built-in defaults.
+";
+#[cfg(windows)]
+const HELP_SEARCH_ORDER: &str = "\
+Without CONFIG or --config, use the first file found of ./coppad.toml and
+%APPDATA%\\coppa\\coppad.toml; otherwise use built-in defaults.
+";
 
 fn assert_full_help(help: &str) {
     for expected in [
@@ -258,7 +311,7 @@ fn assert_full_help(help: &str) {
         "Print help",
         "-V, --version",
         "Print version",
-        "Without CONFIG or --config, load ./coppad.toml if present; otherwise use built-in defaults.",
+        HELP_SEARCH_ORDER,
         "Explicit config paths must exist. --check does not verify hardware or runtime settings.",
     ] {
         assert!(help.contains(expected), "help lacks {expected:?}:\n{help}");
@@ -285,6 +338,14 @@ fn tnc_help_prints_the_same_usage() {
         run_ok(dir.path(), &["--tnc", "--help"]),
         run_ok(dir.path(), &["--help"])
     );
+}
+
+#[test]
+fn help_does_not_advertise_the_internal_guardian_mode() {
+    let dir = dir_with_malformed_default();
+    let help = run_ok(dir.path(), &["--help"]);
+    assert!(!help.contains("ptt-guardian"), "{help}");
+    assert!(!help.contains("guardian-rigctld-address"), "{help}");
 }
 
 #[test]
@@ -357,17 +418,126 @@ fn conflicting_options_are_usage_errors() {
 
 // --- --check ----------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn check_without_a_config_file_checks_the_defaults() {
+    if !system_config_absent() {
+        return;
+    }
     let dir = TempDir::new("check-defaults");
-    assert_eq!(run_ok(dir.path(), &["--check"]), CHECK_OK);
+    let home = TempDir::new("check-defaults-home");
+    let home_str = home.path().to_str().expect("UTF-8 temp path");
+    let args = ["--check"];
+    let out = run_with_env(dir.path(), &args, &[("HOME", home_str)]);
+    out.assert_code(0, &args);
+    assert_eq!(out.stderr, "");
+    assert_eq!(
+        out.stdout,
+        format!(
+            "No configuration file found; checking the built-in defaults (searched: \
+             coppad.toml, {}, /etc/coppa/coppad.toml).\n{CHECK_OK}",
+            home_config_path(home.path()).display()
+        )
+    );
+}
+
+/// What `--check` prints for an implicit source that found `./coppad.toml`.
+fn check_ok_using_the_local_file() -> String {
+    format!("Using configuration file coppad.toml\n{CHECK_OK}")
 }
 
 #[test]
 fn check_loads_the_implicit_default_file() {
     let dir = TempDir::new("check-implicit");
     dir.write("coppad.toml", "[audio]\nsample_rate = 48000\n");
-    assert_eq!(run_ok(dir.path(), &["--check"]), CHECK_OK);
+    assert_eq!(
+        run_ok(dir.path(), &["--check"]),
+        check_ok_using_the_local_file()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_reports_which_discovered_file_it_used() {
+    // COP-49: the first line names the file the implicit search chose.
+    let home = TempDir::new("discover-home");
+    let home_file = home.write(".config/coppa/coppad.toml", "");
+    let xdg = TempDir::new("discover-xdg");
+    let xdg_file = xdg.write("coppa/coppad.toml", "");
+    let home_str = home.path().to_str().expect("UTF-8 temp path");
+    let xdg_str = xdg.path().to_str().expect("UTF-8 temp path");
+
+    let empty_cwd = TempDir::new("discover-cwd-empty");
+    let local_cwd = TempDir::new("discover-cwd-local");
+    local_cwd.write("coppad.toml", "");
+    // A relative XDG_CONFIG_HOME is ignored even where it would resolve.
+    let relative_cwd = TempDir::new("discover-cwd-relative");
+    relative_cwd.write("xdg/coppa/coppad.toml", "");
+
+    for (what, cwd, envs, expected) in [
+        (
+            "only the HOME file",
+            &empty_cwd,
+            vec![("HOME", home_str)],
+            home_file.display().to_string(),
+        ),
+        (
+            "an absolute XDG_CONFIG_HOME and the HOME file",
+            &empty_cwd,
+            vec![("HOME", home_str), ("XDG_CONFIG_HOME", xdg_str)],
+            xdg_file.display().to_string(),
+        ),
+        (
+            "a local file, XDG_CONFIG_HOME and the HOME file",
+            &local_cwd,
+            vec![("HOME", home_str), ("XDG_CONFIG_HOME", xdg_str)],
+            "coppad.toml".to_string(),
+        ),
+        (
+            "a relative XDG_CONFIG_HOME",
+            &relative_cwd,
+            vec![("HOME", home_str), ("XDG_CONFIG_HOME", "xdg")],
+            home_file.display().to_string(),
+        ),
+    ] {
+        let args = ["--check"];
+        let out = run_with_env(cwd.path(), &args, &envs);
+        out.assert_code(0, &args);
+        assert_eq!(out.stderr, "", "{what}");
+        assert_eq!(
+            out.stdout,
+            format!("Using configuration file {expected}\n{CHECK_OK}"),
+            "{what}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_broken_discovered_config_stops_check_and_run_naming_it() {
+    // COP-49 with COP-36: a discovered file is parsed as strictly as a local
+    // one, so a typo in ~/.config/coppa/coppad.toml stops startup naming it.
+    let cwd = TempDir::new("discover-broken-cwd");
+    let home = TempDir::new("discover-broken-home");
+    let broken = home.write(
+        ".config/coppa/coppad.toml",
+        "[engine]\ncalsign = \"W5AU\"\n",
+    );
+    let home_str = home.path().to_str().expect("UTF-8 temp path");
+    for args in [&["--check"][..], &[]] {
+        let stderr = run_config_error_with_env(cwd.path(), args, &[("HOME", home_str)]);
+        assert!(
+            stderr.starts_with(&format!(
+                "Error: Failed to parse config {}",
+                broken.display()
+            )),
+            "coppad {args:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("unknown field `calsign`"),
+            "coppad {args:?}: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -409,19 +579,21 @@ fn check_accepts_every_explicit_config_form_and_order() {
 #[test]
 fn check_with_log_level_off_ignores_rust_log() {
     let dir = TempDir::new("check-quiet");
+    dir.write("coppad.toml", "");
     let args = ["--check", "--log-level", "off"];
     let out = run_with_env(dir.path(), &args, &[("RUST_LOG", "trace")]);
     out.assert_code(0, &args);
-    assert_eq!(out.stdout, CHECK_OK);
+    assert_eq!(out.stdout, check_ok_using_the_local_file());
     assert_eq!(out.stderr, "");
 }
 
 #[test]
 fn check_with_rust_log_trace_prints_no_tracing() {
     let dir = TempDir::new("check-trace");
+    dir.write("coppad.toml", "");
     let out = run_with_env(dir.path(), &["--check"], &[("RUST_LOG", "trace")]);
     out.assert_code(0, &["--check"]);
-    assert_eq!(out.stdout, CHECK_OK);
+    assert_eq!(out.stdout, check_ok_using_the_local_file());
     assert_eq!(out.stderr, "");
 }
 
@@ -552,13 +724,55 @@ profile = "NOT_A_PROFILE"
 }
 
 #[test]
-fn check_keeps_accepting_unknown_keys() {
+fn check_rejects_unknown_keys_naming_them() {
+    // COP-36: a misspelled or unknown key or table is a parse error, not a
+    // silently ignored line.
     let dir = TempDir::new("check-unknown");
     dir.write(
         "station.toml",
         "top_level_extra = 1\n[engine]\nnot_a_real_key = true\n[mystery]\nvalue = 2\n",
     );
-    assert_eq!(run_ok(dir.path(), &["station.toml", "--check"]), CHECK_OK);
+    let stderr = run_config_error(dir.path(), &["station.toml", "--check"]);
+    assert!(stderr.contains("station.toml"), "{stderr}");
+    assert!(stderr.contains("unknown field `"), "{stderr}");
+}
+
+#[test]
+fn a_misspelled_key_stops_check_and_run_modes_naming_it() {
+    // COP-36's scenario: `calsign` for `callsign` fails to start, naming the
+    // bad key, in --check, in run mode, and through the implicit ./coppad.toml.
+    let dir = TempDir::new("typo-key");
+    dir.write("station.toml", "[engine]\ncalsign = \"W5AU\"\n");
+    for args in [
+        &["--config", "station.toml", "--check"][..],
+        &["station.toml", "--check"],
+        &["--config", "station.toml"],
+        &["station.toml"],
+    ] {
+        let stderr = run_config_error(dir.path(), args);
+        assert!(
+            stderr.starts_with("Error: Failed to load config station.toml"),
+            "coppad {args:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("unknown field `calsign`"),
+            "coppad {args:?}: {stderr}"
+        );
+    }
+
+    let implicit = TempDir::new("typo-key-implicit");
+    implicit.write("coppad.toml", "[engine]\ncalsign = \"W5AU\"\n");
+    for args in [&["--check"][..], &[]] {
+        let stderr = run_config_error(implicit.path(), args);
+        assert!(
+            stderr.starts_with("Error: Failed to parse config coppad.toml"),
+            "coppad {args:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("unknown field `calsign`"),
+            "coppad {args:?}: {stderr}"
+        );
+    }
 }
 
 // --- --print-default-config ---------------------------------------------------
@@ -580,14 +794,18 @@ fn print_default_config_prints_only_the_default_toml() {
     for line in [
         "vara_enabled = false",
         "websocket_enabled = false",
+        "websocket_allowed_origins = []",
         "rate_loop_probe_interval = 0",
         "cp_gate_enabled = false",
         "cp_negotiation_enabled = false",
         "id_interval_secs = 540",
+        "ptt_guardian = true",
     ] {
         assert!(printed.contains(line), "missing {line:?}:\n{printed}");
     }
     assert!(!printed.contains("grid"), "{printed}");
+    // COP-53: an unset token is omitted, never printed as a placeholder.
+    assert!(!printed.contains("websocket_token"), "{printed}");
 
     let parsed: DaemonConfig = toml::from_str(&printed).expect("printed TOML parses");
     assert_eq!(
@@ -635,17 +853,29 @@ fn tnc_without_the_feature_fails_without_a_banner() {
 
 /// Start the daemon and wait until it logs `Daemon ready`. Returns the child
 /// and the time readiness took.
-#[cfg(not(feature = "cpal-backend"))]
+#[cfg(any(not(feature = "cpal-backend"), target_os = "linux"))]
 fn start_until_ready(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> (Daemon, Duration) {
+    start_until(cwd, args, envs, "Daemon ready")
+}
+
+/// Start the daemon and wait until its stdout contains `marker`. Returns the
+/// child and the time that took.
+#[cfg(any(not(feature = "cpal-backend"), target_os = "linux"))]
+fn start_until(
+    cwd: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    marker: &str,
+) -> (Daemon, Duration) {
     let mut daemon = Daemon::spawn(cwd, args, envs);
     loop {
-        if daemon.stdout().contains("Daemon ready") {
+        if daemon.stdout().contains(marker) {
             let elapsed = daemon.started.elapsed();
             return (daemon, elapsed);
         }
         if let Some(status) = daemon.try_exit() {
             panic!(
-                "coppad {args:?} exited with {status} before becoming ready\n\
+                "coppad {args:?} exited with {status} before logging {marker:?}\n\
                  --- stdout ---\n{}\n--- stderr ---\n{}",
                 daemon.stdout(),
                 daemon.stderr()
@@ -654,7 +884,7 @@ fn start_until_ready(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> (Daemo
         if daemon.started.elapsed() >= DEADLINE {
             let (stdout, stderr) = daemon.kill();
             panic!(
-                "coppad {args:?} not ready within {DEADLINE:?}\n\
+                "coppad {args:?} did not log {marker:?} within {DEADLINE:?}\n\
                  --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
             );
         }
@@ -676,10 +906,68 @@ fn explicit_config_starts_the_daemon() {
     }
 }
 
+#[cfg(all(unix, not(feature = "cpal-backend")))]
+#[test]
+fn a_config_in_the_user_config_dir_is_used_without_arguments() {
+    // COP-49's scenario: ~/.config/coppa/coppad.toml is loaded by a bare
+    // `coppad` started from an unrelated working directory.
+    let cwd = TempDir::new("run-discover-cwd");
+    let home = TempDir::new("run-discover-home");
+    let config = home.write(
+        ".config/coppa/coppad.toml",
+        "[engine]\ncallsign = \"W5AU\"\n",
+    );
+    let home_str = home.path().to_str().expect("UTF-8 temp path");
+    let (mut daemon, _) = start_until_ready(cwd.path(), &[], &[("HOME", home_str)]);
+    let (stdout, _) = daemon.kill();
+    // The file was used: its callsign silences the missing-callsign warning.
+    assert!(!stdout.contains("No callsign configured"), "{stdout}");
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("Using configuration file"))
+        .unwrap_or_else(|| panic!("no \"Using configuration file\" line\n{stdout}"));
+    assert!(line.contains("INFO"), "{line}");
+    assert!(
+        line.contains(&config.display().to_string()),
+        "{line} does not name {}",
+        config.display()
+    );
+}
+
+#[cfg(all(unix, not(feature = "cpal-backend")))]
+#[test]
+fn with_no_config_anywhere_the_daemon_warns_listing_the_search() {
+    if !system_config_absent() {
+        return;
+    }
+    let cwd = TempDir::new("run-no-config-cwd");
+    let home = TempDir::new("run-no-config-home");
+    let home_str = home.path().to_str().expect("UTF-8 temp path");
+    let (mut daemon, _) = start_until_ready(cwd.path(), &[], &[("HOME", home_str)]);
+    let (stdout, _) = daemon.kill();
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("No configuration file found"))
+        .unwrap_or_else(|| panic!("no \"No configuration file found\" line\n{stdout}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(
+        line.contains(&format!(
+            "using built-in defaults (searched: coppad.toml, {}, {SYSTEM_CONFIG_PATH})",
+            home_config_path(home.path()).display()
+        )),
+        "{line}"
+    );
+    assert!(line.contains("coppad.toml.example"), "{line}");
+    assert!(!stdout.contains("Using configuration file"), "{stdout}");
+}
+
 #[cfg(not(feature = "cpal-backend"))]
 #[test]
 fn log_level_overrides_rust_log_on_a_running_daemon() {
     let dir = TempDir::new("run-level");
+    // A local config file, so the run does not depend on this machine's
+    // /etc/coppa/coppad.toml.
+    dir.write("coppad.toml", "");
 
     // --log-level info wins over RUST_LOG=off: the daemon logs readiness.
     let (mut loud, ready_after) =
@@ -705,4 +993,658 @@ fn log_level_overrides_rust_log_on_a_running_daemon() {
     let (stdout, stderr) = quiet.kill();
     assert_eq!(stdout, "", "--log-level off must silence tracing");
     assert_eq!(stderr, "");
+}
+
+// --- log output on a non-TTY (COP-51) ---------------------------------------
+//
+// The captures are files, as a log file or the journal would be: no colour
+// codes, and library messages arrive as levelled tracing lines on stdout.
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn a_daemon_logging_to_a_file_writes_no_colour_codes() {
+    let dir = TempDir::new("no-colour");
+    let (mut daemon, _) = start_until_ready(dir.path(), &[], &[]);
+    let (stdout, stderr) = daemon.kill();
+    assert!(stdout.contains("Coppa Daemon starting"), "{stdout}");
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "ANSI escape on stdout:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "ANSI escape on stderr:\n{stderr}"
+    );
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn a_library_message_is_a_tracing_line_not_a_bare_print() {
+    use std::io::Write;
+
+    let dir = TempDir::new("library-message");
+    dir.write(
+        "station.toml",
+        "[host]\nvara_enabled = true\nvara_command_port = 0\nvara_data_port = 0\n",
+    );
+    let (mut daemon, _) = start_until(
+        dir.path(),
+        &["station.toml"],
+        &[],
+        "VARA TCP server listening",
+    );
+    let stdout = daemon.stdout();
+    let addr = stdout
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("command_addr="))
+        .unwrap_or_else(|| panic!("no command_addr field:\n{stdout}"))
+        .to_string();
+
+    // One byte past the command port's 4096-byte line limit, no newline.
+    let mut client = std::net::TcpStream::connect(&addr).expect("connect to the command port");
+    client
+        .write_all(&[b'A'; 4097])
+        .expect("write the over-long line");
+    while !daemon.stdout().contains("over-long line") {
+        if daemon.started.elapsed() >= DEADLINE {
+            let (stdout, stderr) = daemon.kill();
+            panic!("no over-long line warning\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(client);
+    let (stdout, stderr) = daemon.kill();
+    assert_eq!(stderr, "", "library messages must not bypass tracing");
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("over-long line"))
+        .expect("the warning line");
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("coppa_host::vara::command"), "{line}");
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "ANSI escape on stdout:\n{stdout}"
+    );
+}
+
+// --- startup failures (COP-32) ----------------------------------------------
+//
+// A condition that stops the daemon doing its job is an ERROR, never
+// `Daemon ready`. Config and bind failures also exit 1 with `Error: ...` on
+// stderr. Each fails before any audio device opens, so these run in every
+// build that compiles them.
+
+/// Run the daemon on `toml` and require a fatal startup error: exit 1, an
+/// ERROR log line, no readiness, and `Error: <stderr_prefix>` on stderr.
+/// Returns (stdout, stderr).
+fn run_startup_error(toml: &str, stderr_prefix: &str) -> (String, String) {
+    run_startup_error_with_env(toml, stderr_prefix, &[])
+}
+
+/// [`run_startup_error`] with extra environment variables for the daemon.
+fn run_startup_error_with_env(
+    toml: &str,
+    stderr_prefix: &str,
+    envs: &[(&str, &str)],
+) -> (String, String) {
+    let dir = TempDir::new("startup-error");
+    dir.write("station.toml", toml);
+    let args = ["--config", "station.toml"];
+    let out = run_with_env(dir.path(), &args, envs);
+    out.assert_code(1, &args);
+    assert!(out.stdout.contains("ERROR"), "{}", out.stdout);
+    assert!(
+        !out.stdout.contains("Daemon ready") && !out.stdout.contains("Event loop started"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stderr.starts_with(&format!("Error: {stderr_prefix}")),
+        "{}",
+        out.stderr
+    );
+    (out.stdout, out.stderr)
+}
+
+#[test]
+fn an_unknown_ptt_method_logs_an_error_and_exits_1() {
+    run_startup_error(
+        "[radio]\nptt_method = \"carrier-pigeon\"\n",
+        "failed to start daemon event loop: invalid [radio] ptt_method",
+    );
+}
+
+#[test]
+fn a_sample_rate_the_engine_does_not_run_at_is_a_startup_error() {
+    let (stdout, _) = run_startup_error(
+        "[audio]\nsample_rate = 44100\n",
+        "[audio] sample_rate = 44100 is not supported",
+    );
+    assert!(stdout.contains("set sample_rate = 48000"), "{stdout}");
+}
+
+#[test]
+fn an_unknown_profile_name_is_a_startup_error() {
+    // COP-36: run mode rejects the name instead of building a level-derived
+    // engine from it. --check still accepts it (see
+    // check_only_deserializes_and_never_touches_hardware_or_listeners).
+    let (stdout, _) = run_startup_error(
+        "[engine]\nprofile = \"HF_STANDRD\"\n",
+        "[engine] profile = \"HF_STANDRD\" is not a known profile",
+    );
+    assert!(
+        stdout.contains("HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_zero_buffer_size_is_a_startup_error() {
+    let (stdout, _) = run_startup_error(
+        "[audio]\nbuffer_size = 0\n",
+        "[audio] buffer_size = 0 is not supported",
+    );
+    assert!(stdout.contains("set buffer_size = 8192"), "{stdout}");
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn a_named_audio_device_without_the_cpal_backend_is_a_startup_error() {
+    run_startup_error(
+        "[audio]\ninput_device = \"USB Audio CODEC\"\n",
+        "[audio] input_device = \"USB Audio CODEC\" is set, but this coppad was built \
+         without the cpal-backend feature",
+    );
+}
+
+#[test]
+fn a_taken_vara_command_port_is_a_startup_error() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+    let port = taken.local_addr().unwrap().port();
+    run_startup_error(
+        &format!("[host]\nvara_enabled = true\nvara_command_port = {port}\nvara_data_port = 0\n"),
+        &format!("failed to bind the VARA command port to 127.0.0.1:{port}"),
+    );
+}
+
+#[test]
+fn a_taken_vara_data_port_is_a_startup_error() {
+    // Port 0 lets the OS pick a free command port, so only the data port can fail.
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+    let port = taken.local_addr().unwrap().port();
+    run_startup_error(
+        &format!("[host]\nvara_enabled = true\nvara_command_port = 0\nvara_data_port = {port}\n"),
+        &format!("failed to bind the VARA data port to 127.0.0.1:{port}"),
+    );
+}
+
+#[cfg(feature = "websocket")]
+#[test]
+fn a_taken_websocket_port_is_a_startup_error() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+    let port = taken.local_addr().unwrap().port();
+    run_startup_error(
+        &format!(
+            "[host]\nwebsocket_enabled = true\nwebsocket_port = {port}\n\
+             websocket_token = \"{WS_TOKEN}\"\n"
+        ),
+        &format!("failed to bind the WebSocket port to 127.0.0.1:{port}"),
+    );
+}
+
+// --- WebSocket access (COP-53) ----------------------------------------------
+
+/// A valid `[host] websocket_token` for the tests below.
+const WS_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+#[test]
+fn websocket_without_a_token_is_a_startup_error() {
+    // COP-53: refused in every build, before any socket is bound. --check
+    // still accepts the same config (see
+    // check_only_deserializes_and_never_touches_hardware_or_listeners).
+    let (stdout, _) = run_startup_error(
+        "[host]\nwebsocket_enabled = true\n",
+        "[host] websocket_enabled = true requires [host] websocket_token",
+    );
+    assert!(!stdout.contains("WebSocket server listening"), "{stdout}");
+}
+
+#[test]
+fn a_short_websocket_token_is_a_startup_error() {
+    run_startup_error(
+        "[host]\nwebsocket_enabled = true\nwebsocket_token = \"short\"\n",
+        "[host] websocket_token is 5 characters long",
+    );
+}
+
+#[test]
+fn an_invalid_websocket_origin_is_a_startup_error() {
+    run_startup_error(
+        &format!(
+            "[host]\nwebsocket_enabled = true\nwebsocket_token = \"{WS_TOKEN}\"\n\
+             websocket_allowed_origins = [\"*\"]\n"
+        ),
+        "[host] websocket_allowed_origins entry \"*\"",
+    );
+}
+
+/// Send one WebSocket upgrade request for `target` with the given extra
+/// header lines, and return the response's status line.
+#[cfg(all(feature = "websocket", not(feature = "cpal-backend")))]
+fn upgrade_status(port: u16, target: &str, headers: &[String]) -> String {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(DEADLINE))
+        .expect("set read timeout");
+    let mut request = format!(
+        "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: Upgrade\r\n\
+         Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    );
+    for header in headers {
+        request.push_str(header);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).expect("send upgrade");
+    let mut status = String::new();
+    BufReader::new(stream)
+        .read_line(&mut status)
+        .expect("read status line");
+    status
+}
+
+/// COP-53, end to end through the real binary: the configured token and
+/// origin allowlist reach the WebSocket server. A wiring bug shows up either
+/// as the valid cases failing (fail closed) or the evil origin passing (fail
+/// open).
+///
+/// CI's full suite builds with `cpal-backend`, which compiles this test out
+/// (like every `start_until` test), so it runs only under
+/// `cargo test -p coppa-daemon --features websocket --test cli`.
+#[cfg(all(feature = "websocket", not(feature = "cpal-backend")))]
+#[test]
+fn websocket_handshake_requires_an_allowed_origin_and_the_token() {
+    let dir = TempDir::new("ws-auth");
+    dir.write(
+        "station.toml",
+        &format!(
+            "[host]\nwebsocket_enabled = true\nwebsocket_port = 0\n\
+             websocket_token = \"{WS_TOKEN}\"\n\
+             websocket_allowed_origins = [\"http://localhost:3000\"]\n"
+        ),
+    );
+    let args = ["--config", "station.toml"];
+    let (mut daemon, _) = start_until(dir.path(), &args, &[], "Daemon ready");
+    let stdout = daemon.stdout();
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("WebSocket server listening"))
+        .unwrap_or_else(|| panic!("no listening line:\n{stdout}"));
+    let after = &line[line.find("127.0.0.1:").expect("listen address") + "127.0.0.1:".len()..];
+    let port: u16 = after
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .expect("listen port");
+
+    let evil = "Origin: https://evil.example".to_string();
+    let bearer = format!("Authorization: Bearer {WS_TOKEN}");
+    let cases: [(String, Vec<String>, &str); 5] = [
+        ("/".to_string(), vec![evil.clone()], "HTTP/1.1 403"),
+        ("/".to_string(), vec![evil, bearer.clone()], "HTTP/1.1 403"),
+        ("/".to_string(), vec![], "HTTP/1.1 401"),
+        ("/".to_string(), vec![bearer], "HTTP/1.1 101"),
+        (
+            format!("/?token={WS_TOKEN}"),
+            vec!["Origin: http://localhost:3000".to_string()],
+            "HTTP/1.1 101",
+        ),
+    ];
+    for (target, headers, expected) in &cases {
+        let status = upgrade_status(port, target, headers);
+        assert!(
+            status.starts_with(expected),
+            "{headers:?}: expected {expected}, got {status:?}"
+        );
+    }
+
+    // Give the event loop time to log both accepted clients.
+    let deadline = Instant::now() + DEADLINE;
+    let connected = |stdout: &str| {
+        stdout
+            .lines()
+            .filter(|line| line.contains("event_loop") && line.contains("Client connected"))
+            .count()
+    };
+    while connected(&daemon.stdout()) < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let (stdout, stderr) = daemon.kill();
+    assert!(
+        !stdout.contains(WS_TOKEN),
+        "token leaked to stdout:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains(WS_TOKEN),
+        "token leaked to stderr:\n{stderr}"
+    );
+    assert_eq!(
+        connected(&stdout),
+        2,
+        "only the two authorized handshakes may reach the event loop:\n{stdout}"
+    );
+}
+
+#[cfg(feature = "cpal-backend")]
+#[test]
+fn a_missing_named_input_device_is_a_startup_error() {
+    run_startup_error(
+        "[audio]\ninput_device = \"COP-32 no such input device\"\n",
+        "audio input device \"COP-32 no such input device\" not found",
+    );
+}
+
+#[cfg(feature = "cpal-backend")]
+#[test]
+fn a_missing_named_output_device_is_a_startup_error() {
+    // No input name: the output name must be checked before the default
+    // input device is opened, or a host without audio would report that
+    // failure instead.
+    run_startup_error(
+        "[audio]\noutput_device = \"COP-32 no such output device\"\n",
+        "audio output device \"COP-32 no such output device\" not found",
+    );
+}
+
+/// An unreachable rigctld leaves the daemon running without PTT: it logs
+/// ERROR and reports itself degraded instead of ready, and keeps running.
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn an_unreachable_rigctld_is_reported_degraded_not_ready() {
+    let dir = TempDir::new("run-rigctld");
+    dir.write(
+        "station.toml",
+        "[radio]\nptt_method = \"rigctld\"\nrigctld_address = \"127.0.0.1:1\"\n",
+    );
+    let args = ["--config", "station.toml"];
+    let (mut daemon, _) = start_until(dir.path(), &args, &[], "Daemon running degraded");
+    assert!(
+        daemon.try_exit().is_none(),
+        "a degraded daemon keeps running"
+    );
+    let (stdout, _) = daemon.kill();
+    assert!(!stdout.contains("Daemon ready"), "{stdout}");
+    for marker in [
+        "Failed to connect to rigctld",
+        "Daemon running degraded",
+        "no PTT: rigctld at 127.0.0.1:1 is unreachable",
+    ] {
+        let line = stdout
+            .lines()
+            .find(|l| l.contains(marker))
+            .unwrap_or_else(|| panic!("no {marker:?} line\n{stdout}"));
+        assert!(line.contains("ERROR"), "{line}");
+    }
+}
+
+// --- startup summary (COP-50) ------------------------------------------------
+//
+// Just before `Daemon ready` (or `Daemon running degraded`), coppad states its
+// host listeners, audio devices and PTT; its first line names the build.
+// `NO_COLOR=1` keeps each field's key next to its `=`.
+
+/// The first stdout line containing `marker`, and its index.
+#[cfg(any(not(feature = "cpal-backend"), target_os = "linux"))]
+fn line_with<'a>(stdout: &'a str, marker: &str) -> (usize, &'a str) {
+    stdout
+        .lines()
+        .enumerate()
+        .find(|(_, l)| l.contains(marker))
+        .unwrap_or_else(|| panic!("no {marker:?} line\n{stdout}"))
+}
+
+/// COP-50: the first line names the build, even when startup then fails.
+#[test]
+fn startup_line_states_version_git_sha_and_features() {
+    let (stdout, _) = run_startup_error_with_env(
+        "[audio]\nbuffer_size = 0\n",
+        "[audio] buffer_size = 0 is not supported",
+        &[("NO_COLOR", "1")],
+    );
+    let starting = stdout
+        .lines()
+        .find(|l| l.contains("Coppa Daemon starting"))
+        .unwrap_or_else(|| panic!("no starting line\n{stdout}"));
+    assert!(
+        starting.contains(&format!("version=\"{}\"", env!("CARGO_PKG_VERSION"))),
+        "{starting}"
+    );
+    assert!(
+        starting.contains(&format!("git_sha=\"{}\"", env!("COPPA_GIT_SHA"))),
+        "{starting}"
+    );
+    let mut built = Vec::new();
+    for (name, on) in [
+        ("cpal-backend", cfg!(feature = "cpal-backend")),
+        ("gpio-ptt", cfg!(feature = "gpio-ptt")),
+        ("kiss-tnc", cfg!(feature = "kiss-tnc")),
+        ("serial-ptt", cfg!(feature = "serial-ptt")),
+        ("websocket", cfg!(feature = "websocket")),
+    ] {
+        if on {
+            built.push(name);
+        }
+    }
+    let features = if built.is_empty() {
+        "none".to_string()
+    } else {
+        built.join(",")
+    };
+    assert!(
+        starting.contains(&format!("features={features}")),
+        "{starting}"
+    );
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn startup_states_build_listeners_audio_and_ptt_before_ready() {
+    let dir = TempDir::new("summary");
+    dir.write(
+        "station.toml",
+        "[engine]\ncallsign = \"VK2ABC\"\n\
+         [host]\nvara_enabled = true\nvara_command_port = 0\nvara_data_port = 0\n",
+    );
+    let (mut daemon, _) = start_until_ready(
+        dir.path(),
+        &["--config", "station.toml"],
+        &[("NO_COLOR", "1")],
+    );
+    let (stdout, _) = daemon.kill();
+
+    let (_, vara) = line_with(&stdout, "VARA TCP server listening");
+    let command_addr = vara
+        .split_whitespace()
+        .find_map(|kv| kv.strip_prefix("command_addr="))
+        .unwrap();
+    let (host_at, host) = line_with(&stdout, "Host listeners");
+    assert!(host.contains(" INFO "), "{host}");
+    assert!(host.contains("bind_address=127.0.0.1"), "{host}");
+    assert!(
+        host.contains(&format!("vara_command={command_addr}")),
+        "{host}"
+    );
+    let websocket = if cfg!(feature = "websocket") {
+        "websocket=disabled"
+    } else {
+        "websocket=not-built"
+    };
+    assert!(host.contains(websocket), "{host}");
+    assert!(
+        !stdout.contains("accept connections from other hosts"),
+        "{stdout}"
+    );
+
+    let (audio_at, audio) = line_with(&stdout, "Audio devices");
+    assert!(
+        audio.contains(" WARN ") && audio.contains("cpal-backend"),
+        "{audio}"
+    );
+
+    let (ptt_at, ptt) = line_with(&stdout, "PTT method=");
+    assert!(ptt.contains(" INFO "), "{ptt}");
+    assert!(
+        ptt.contains("method=\"none\" active=none state=\"not controlled\" guardian=\"not used\""),
+        "{ptt}"
+    );
+
+    let (ready_at, _) = line_with(&stdout, "Daemon ready");
+    assert!(
+        host_at < audio_at && audio_at < ptt_at && ptt_at < ready_at,
+        "{stdout}"
+    );
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn the_default_config_states_that_nothing_is_listening() {
+    let dir = TempDir::new("summary-default");
+    let (mut daemon, _) = start_until_ready(dir.path(), &[], &[("NO_COLOR", "1")]);
+    let (stdout, _) = daemon.kill();
+    let (_, host) = line_with(&stdout, "Host listeners");
+    assert!(
+        host.contains("vara_command=disabled vara_data=disabled"),
+        "{host}"
+    );
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn a_non_loopback_bind_address_is_warned_about() {
+    let dir = TempDir::new("summary-exposed");
+    dir.write(
+        "station.toml",
+        "[host]\nbind_address = \"0.0.0.0\"\nvara_enabled = true\n\
+         vara_command_port = 0\nvara_data_port = 0\n",
+    );
+    let (mut daemon, _) = start_until_ready(
+        dir.path(),
+        &["--config", "station.toml"],
+        &[("NO_COLOR", "1")],
+    );
+    let (stdout, _) = daemon.kill();
+    let (_, host) = line_with(&stdout, "Host listeners");
+    assert!(host.contains("vara_command=0.0.0.0:"), "{host}");
+    let (_, warning) = line_with(&stdout, "accept connections from other hosts");
+    assert!(warning.contains(" WARN "), "{warning}");
+}
+
+#[cfg(not(feature = "websocket"))]
+#[test]
+fn websocket_enabled_without_the_websocket_feature_is_a_startup_error() {
+    run_startup_error(
+        &format!("[host]\nwebsocket_enabled = true\nwebsocket_token = \"{WS_TOKEN}\"\n"),
+        "[host] websocket_enabled = true is set, but this coppad was built without the \
+         websocket feature",
+    );
+}
+
+/// A fake rigctld that accepts connections and answers every command
+/// `RPRT -1`, like a rig that refuses CAT PTT.
+#[cfg(not(feature = "cpal-backend"))]
+fn refusing_rigctld() -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake rigctld");
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { return };
+            std::thread::spawn(move || {
+                let mut writer = stream.try_clone().unwrap();
+                for line in BufReader::new(stream).lines() {
+                    if line.is_err() || writeln!(writer, "RPRT -1").is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn a_rigctld_that_refuses_ptt_is_reported_degraded_not_ready() {
+    let dir = TempDir::new("summary-refused");
+    dir.write(
+        "station.toml",
+        &format!(
+            "[radio]\nptt_method = \"rigctld\"\nrigctld_address = \"{}\"\nptt_guardian = false\n",
+            refusing_rigctld()
+        ),
+    );
+    let (mut daemon, _) = start_until(
+        dir.path(),
+        &["--config", "station.toml"],
+        &[("NO_COLOR", "1")],
+        "Daemon running degraded",
+    );
+    let (stdout, _) = daemon.kill();
+    assert!(!stdout.contains("Daemon ready"), "{stdout}");
+    let (_, degraded) = line_with(&stdout, "Daemon running degraded");
+    assert!(
+        degraded.contains("PTT release at startup failed: rigctld set_ptt failed: RPRT -1"),
+        "{degraded}"
+    );
+    let (_, ptt) = line_with(&stdout, "PTT method=");
+    assert!(ptt.contains(" WARN "), "{ptt}");
+    assert!(ptt.contains("active=rigctld"), "{ptt}");
+    assert!(
+        ptt.contains("state=\"release failed: rigctld set_ptt failed: RPRT -1\""),
+        "{ptt}"
+    );
+    assert!(
+        ptt.contains("guardian=\"off ([radio] ptt_guardian = false)\""),
+        "{ptt}"
+    );
+}
+
+/// A cpal build reaches readiness on Linux with ALSA pointed at its `null`
+/// PCM, so this test runs where CI's full suite runs (`cpal-backend`).
+#[cfg(all(feature = "cpal-backend", target_os = "linux"))]
+#[test]
+fn startup_names_the_audio_devices_it_opened() {
+    let dir = TempDir::new("summary-cpal");
+    let conf = dir.write(
+        "asound.conf",
+        "pcm.!default { type null }\n\
+         pcm.null { type null hint { show on description \"Discard all samples\" } }\n",
+    );
+    dir.write("station.toml", "[audio]\ninput_device = \"discard\"\n");
+    let (mut daemon, _) = start_until_ready(
+        dir.path(),
+        &["--config", "station.toml"],
+        &[
+            ("NO_COLOR", "1"),
+            ("ALSA_CONFIG_PATH", conf.to_str().unwrap()),
+        ],
+    );
+    let (stdout, _) = daemon.kill();
+    let (_, audio) = line_with(&stdout, "Audio devices");
+    assert!(audio.contains(" INFO "), "{audio}");
+    assert!(
+        audio.contains("input=\"Discard all samples (alsa:null)\""),
+        "{audio}"
+    );
+    assert!(
+        audio.contains("output=\"Default Audio Device (alsa:default)\""),
+        "{audio}"
+    );
+    let (_, input) = line_with(&stdout, "Audio input started");
+    assert!(input.contains("Discard all samples (alsa:null)"), "{input}");
 }

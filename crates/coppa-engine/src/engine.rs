@@ -190,8 +190,25 @@ impl CoppaCore {
         Self::profile_occupied_hz(self.transceiver.profile())
     }
 
+    /// Occupied bandwidth, in Hz, of the profile `set_speed_level(level)` would
+    /// select on this engine's band and CP mode, without rebuilding anything
+    /// (COP-21). A caller that holds RF-frequency evidence asks this before
+    /// committing to a level: 5600 for a level-derived engine at level 5+, 2400
+    /// for any level on an HF-bound engine. `level` is not validated.
+    ///
+    /// It shares `select_ofdm_profile` with every rebuild, so the answer cannot
+    /// disagree with what `set_speed_level` would build.
+    pub fn occupied_bandwidth_hz_at(&self, level: u8) -> u32 {
+        Self::profile_occupied_hz(&Self::select_ofdm_profile(
+            level,
+            self.config.cp_mode,
+            self.config.ofdm_band,
+        ))
+    }
+
     /// Occupied bandwidth of `profile` in Hz: active carriers times carrier
-    /// spacing. Shared by `occupied_bandwidth_hz` and `crate::ladder`.
+    /// spacing, rounded to whole Hz. Shared by `occupied_bandwidth_hz`,
+    /// `occupied_bandwidth_hz_at` and `crate::ladder`.
     pub(crate) fn profile_occupied_hz(profile: &CoppaProfile) -> u32 {
         (profile.total_active_carriers() as f32 * profile.carrier_spacing_hz()).round() as u32
     }
@@ -201,14 +218,13 @@ impl CoppaCore {
         self.encode_bytes(message.as_bytes())
     }
 
-    /// Encode arbitrary binary data to audio samples.
-    ///
-    /// Pipeline:
-    /// 1. Optionally compress (Huffman + LZ4) with a marker byte
-    /// 2. Build CoppaHeader
-    /// 3. Transmit via CoppaTransceiver
-    pub fn encode_bytes(&self, data: &[u8]) -> Result<Vec<f32>> {
-        let payload = if self.config.compression_enabled {
+    /// The exact payload `encode_bytes` would hand the transceiver for
+    /// `data`: optionally Huffman+LZ4-compressed with the marker byte
+    /// prepended, otherwise `data` unchanged (COP-41 refactor out of
+    /// `encode_bytes`, which calls this — the two can never measure and send
+    /// different bytes).
+    fn compress_payload(&self, data: &[u8]) -> Vec<u8> {
+        if self.config.compression_enabled {
             let huffman = HuffmanCodec::new();
             let huffman_bytes = huffman.encode(data);
             let lz4_bytes = lz4_compress(&huffman_bytes);
@@ -218,7 +234,27 @@ impl CoppaCore {
             out
         } else {
             data.to_vec()
-        };
+        }
+    }
+
+    /// Exact length of the payload `encode_bytes` would hand the transceiver
+    /// for `data` (post-compression, marker included) — without building a
+    /// header or synthesizing samples. Callers use this to size writes that
+    /// must fit a speed level's payload budget (COP-41): a chunk whose
+    /// `encoded_payload_len` is at most `max_payload_for_level(level)` is
+    /// exactly a chunk `encode_bytes` will accept at that level.
+    pub fn encoded_payload_len(&self, data: &[u8]) -> usize {
+        self.compress_payload(data).len()
+    }
+
+    /// Encode arbitrary binary data to audio samples.
+    ///
+    /// Pipeline:
+    /// 1. Optionally compress (Huffman + LZ4) with a marker byte
+    /// 2. Build CoppaHeader
+    /// 3. Transmit via CoppaTransceiver
+    pub fn encode_bytes(&self, data: &[u8]) -> Result<Vec<f32>> {
+        let payload = self.compress_payload(data);
 
         if payload.len() > u16::MAX as usize {
             anyhow::bail!(
@@ -490,6 +526,29 @@ impl CoppaCore {
         Ok(())
     }
 
+    /// Rebind this engine's OFDM band in place (COP-21), keeping its speed level
+    /// and negotiated CP mode.
+    ///
+    /// Like `set_speed_level`, this rebuilds the transceiver and streaming
+    /// receiver (any samples buffered mid-frame in the streaming receiver are
+    /// discarded). The engine itself stays frequency-blind: a caller that holds
+    /// RF-frequency evidence (`coppad` does) decides when to call this, typically
+    /// after `occupied_bandwidth_hz_at` shows a level would be wideband.
+    ///
+    /// Returns an error, leaving this engine's current config untouched, if the
+    /// current speed level is not available on `band` (level 9 on HF): lower the
+    /// level first.
+    pub fn set_ofdm_band(&mut self, band: OfdmBand) -> Result<()> {
+        self.check_level(
+            self.config.speed_level,
+            Self::resolves_to_vhf(self.config.speed_level, band),
+        )?;
+        let mut config = self.config.clone();
+        config.ofdm_band = band;
+        self.reconfigure(config);
+        Ok(())
+    }
+
     /// Validate `level` for a frame sent on the VHF profile (`on_vhf_profile`)
     /// or on an HF profile, which carries levels 1-8 only.
     fn check_level(&self, level: u8, on_vhf_profile: bool) -> Result<()> {
@@ -584,6 +643,58 @@ mod tests {
     fn test_engine_default_trait() {
         let core = CoppaCore::default();
         assert_eq!(core.config.sample_rate, 48000);
+    }
+
+    /// COP-41: `encoded_payload_len` is exact — for a matrix of input
+    /// flavors × levels {1, 2, 9} × compression on/off,
+    /// `encoded_payload_len(p) <= max_payload_for_level(l)` holds iff
+    /// `set_speed_level(l)` + `encode_bytes(p)` succeeds. This is the
+    /// invariant the daemon's TX chunker is built on, and it pins the
+    /// `compress_payload` extraction (`encode_bytes` must measure and send
+    /// the same bytes). Input lengths are swept across every budget on the
+    /// ladder (56/117/198) so both directions of the iff are exercised.
+    #[test]
+    fn encoded_payload_len_predicts_encode_bytes_acceptance() {
+        use coppa_protocol::modem::max_payload_for_level;
+
+        // Deterministic input flavors spanning the compression pipeline's
+        // behavior space (see COP-41's research probes): ham text compresses
+        // well, LCG-random bytes are incompressible, all-unknown-high-bytes
+        // are escape-heavy, and empty is the degenerate case.
+        let mut seed: u32 = 0xC0_FF_EE;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            seed
+        };
+        let base_flavors: Vec<Vec<u8>> = vec![
+            b"cq de vk3abc qth melbourne winlink b2f chunk counter 000123456789 abcdefg".to_vec(),
+            (0..220).map(|_| (next() >> 8) as u8).collect(),
+            (0..220).map(|i| 0x80 | (i % 0x40) as u8).collect(),
+            Vec::new(),
+        ];
+        for compression in [false, true] {
+            for level in [1u8, 2, 9] {
+                let budget = max_payload_for_level(level).unwrap();
+                let mut core = CoppaCore::with_config(EngineConfig {
+                    compression_enabled: compression,
+                    ..Default::default()
+                });
+                core.set_speed_level(level)
+                    .expect("levels 1/2/9 are valid on a level-derived engine");
+                for flavor in &base_flavors {
+                    for len in [0usize, 20, 40, 56, 80, 117, 150, 200, 220] {
+                        let input = &flavor[..len.min(flavor.len())];
+                        let predicted_fits = core.encoded_payload_len(input) <= budget;
+                        let encoded_ok = core.encode_bytes(input).is_ok();
+                        assert_eq!(
+                            predicted_fits, encoded_ok,
+                            "compression={compression} level={level} len={len}: \
+                             encoded_payload_len must predict encode_bytes acceptance"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1475,5 +1586,76 @@ mod tests {
             header.bandwidth,
             CoppaProfile::hf_standard_short_cp().bandwidth_id
         );
+    }
+
+    // ── COP-21: band rebinding for frequency-aware callers ────────────────
+
+    #[test]
+    fn occupied_bandwidth_hz_at_reports_the_profile_a_level_would_select() {
+        let level_derived = CoppaCore::new();
+        assert_eq!(level_derived.occupied_bandwidth_hz_at(4), 2400);
+        assert_eq!(level_derived.occupied_bandwidth_hz_at(5), 5600);
+        assert_eq!(level_derived.occupied_bandwidth_hz_at(9), 5600);
+        let hf = CoppaCore::from_profile(&crate::HF_STANDARD);
+        assert_eq!(hf.occupied_bandwidth_hz_at(5), 2400);
+        assert_eq!(hf.occupied_bandwidth_hz_at(8), 2400);
+        let vhf = CoppaCore::from_profile(&crate::VHF_FAST);
+        assert_eq!(vhf.occupied_bandwidth_hz_at(1), 5600);
+        // A pure query: nothing was rebuilt.
+        assert_eq!(level_derived.speed_level(), 1);
+        assert_eq!(level_derived.occupied_bandwidth_hz(), 2400);
+    }
+
+    #[test]
+    fn set_ofdm_band_hf_moves_a_level_derived_engine_off_vhf_wide() {
+        let mut core = CoppaCore::new();
+        core.set_speed_level(5).unwrap();
+        assert!(
+            core.on_vhf_profile(),
+            "test premise: level-derived level 5 is vhf_wide"
+        );
+        core.set_ofdm_band(OfdmBand::Hf)
+            .expect("level 5 is available on HF");
+        assert_eq!(core.config().ofdm_band, OfdmBand::Hf);
+        assert_eq!(core.speed_level(), 5, "the level is kept");
+        assert!(!core.on_vhf_profile());
+        assert_eq!(core.occupied_bandwidth_hz(), 2400);
+        let samples = core.encode("cop21").unwrap();
+        assert_eq!(
+            core.decode(&samples).unwrap(),
+            "cop21",
+            "a real hf_standard level-5 frame"
+        );
+        assert_eq!(core.available_speed_levels(), (1..=8).collect::<Vec<_>>());
+        core.set_speed_level(8).unwrap();
+        assert_eq!(
+            core.occupied_bandwidth_hz(),
+            2400,
+            "later level changes stay on HF"
+        );
+    }
+
+    #[test]
+    fn set_ofdm_band_keeps_the_negotiated_cp_mode() {
+        let mut core = CoppaCore::new();
+        core.set_cp_profile(CpMode::ShortCp);
+        core.set_speed_level(5).unwrap(); // vhf_wide; ShortCp dormant
+        core.set_ofdm_band(OfdmBand::Hf).unwrap();
+        assert_eq!(core.cp_mode(), CpMode::ShortCp);
+        assert_eq!(
+            core.transceiver.profile().cp_samples,
+            CoppaProfile::hf_standard_short_cp().cp_samples
+        );
+    }
+
+    #[test]
+    fn set_ofdm_band_rejects_a_level_the_band_cannot_carry() {
+        let mut core = CoppaCore::new();
+        core.set_speed_level(9).unwrap();
+        let err = core.set_ofdm_band(OfdmBand::Hf).unwrap_err().to_string();
+        assert!(err.contains("not available on an HF profile"), "{err}");
+        assert_eq!(core.config().ofdm_band, OfdmBand::LevelDerived, "untouched");
+        assert_eq!(core.speed_level(), 9);
+        assert!(core.on_vhf_profile());
     }
 }
