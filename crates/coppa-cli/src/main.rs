@@ -362,13 +362,10 @@ fn build_ptt(ptt: &str, rigctld_addr: &str) -> Result<coppa_radio::PttBackend> {
     use coppa_radio::PttBackend;
     validate_ptt_method(ptt)?;
     match ptt {
-        "rigctld" => match coppa_radio::RigctldClient::connect(rigctld_addr) {
-            Ok(client) => Ok(PttBackend::Rigctld(client)),
-            Err(e) => {
-                eprintln!("WARNING: rigctld connect failed ({}), using no PTT", e);
-                Ok(PttBackend::Other(Box::new(coppa_radio::NullPtt::new())))
-            }
-        },
+        "rigctld" => Ok(PttBackend::Rigctld(
+            coppa_radio::RigctldClient::connect(rigctld_addr)
+                .map_err(|e| anyhow::anyhow!("rigctld connection failed: {e}"))?,
+        )),
         "vox" => Ok(PttBackend::Other(Box::new(coppa_radio::VoxPtt::new()))),
         // Only "none" remains once `validate_ptt_method` has passed.
         _ => Ok(PttBackend::Other(Box::new(coppa_radio::NullPtt::new()))),
@@ -470,20 +467,41 @@ fn play_keyed<S: coppa_audio::AudioSink>(
 ) -> Result<u64> {
     use coppa_radio::PttState;
 
-    if let Err(e) = ptt.set_ptt(PttState::Tx) {
-        eprintln!("WARNING: PTT key failed: {}", e);
-    }
-    clock.sleep(lead);
+    let result = match ptt.set_ptt(PttState::Tx) {
+        Ok(()) => {
+            clock.sleep(lead);
+            feed_until_played(sink, &progress, samples, clock).inspect(|_| clock.sleep(tail))
+        }
+        Err(e) => Err(anyhow::anyhow!("failed to key PTT: {e}")),
+    };
 
-    let result = feed_until_played(sink, &progress, samples, clock).inspect(|_| clock.sleep(tail));
-
-    if let Err(e) = ptt.set_ptt(PttState::Rx) {
-        eprintln!("WARNING: PTT unkey failed: {}", e);
-    }
+    let release = ptt
+        .set_ptt(PttState::Rx)
+        .map_err(|e| anyhow::anyhow!("failed to release PTT: {e}"));
     let stopped = sink.stop();
-    let delivered = result?;
-    stopped?;
-    Ok(delivered)
+    match result {
+        Err(primary) => {
+            let mut message = primary.to_string();
+            if let Err(e) = release {
+                message.push_str(&format!("; cleanup: {e}"));
+            }
+            if let Err(e) = stopped {
+                message.push_str(&format!("; cleanup: failed to stop audio: {e}"));
+            }
+            anyhow::bail!("{message}")
+        }
+        Ok(delivered) => {
+            if let Err(e) = release {
+                let suffix = stopped
+                    .err()
+                    .map(|stop| format!("; cleanup: failed to stop audio: {stop}"))
+                    .unwrap_or_default();
+                anyhow::bail!("{e}{suffix}");
+            }
+            stopped?;
+            Ok(delivered)
+        }
+    }
 }
 
 /// The feeding/draining half of [`play_keyed`].
@@ -827,9 +845,14 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
         {
             use coppa_audio::{file_backend::WavSource, AudioSource};
             let mut source = WavSource::open(path)?;
+            if source.sample_rate() != core.config().sample_rate {
+                anyhow::bail!(
+                    "WAV sample rate {} Hz does not match modem sample rate {} Hz; resample the WAV before using coppa rx",
+                    source.sample_rate(), core.config().sample_rate
+                );
+            }
             let total = source.total_samples();
-            // The file's own rate: WavSource does not resample, so "the
-            // first N seconds" is N times the rate the samples were written at.
+            // The checked WAV rate is the engine rate; no resampling occurs.
             let limit = file_sample_limit(total, args.duration, source.sample_rate());
             if verbosity != Verbosity::Quiet && !args.raw {
                 if limit < total {
@@ -842,16 +865,24 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 }
             }
             source.start()?;
-            stream_decode(
+            let summary = stream_decode(
                 &mut core,
                 &mut source,
                 Some(limit),
                 None,
                 args.raw,
                 args.hex,
+                args.profile.as_deref().unwrap_or("default"),
                 verbosity,
             )?;
             source.stop()?;
+            summary.check_failure()?;
+            if summary.good_frames == 0 {
+                anyhow::bail!(
+                    "no frames decoded from {} ({} samples at {} Hz; profile {}); check for a complete Coppa frame and a matching --profile",
+                    path, summary.consumed_samples, source.sample_rate(), args.profile.as_deref().unwrap_or("default")
+                );
+            }
         }
         #[cfg(not(feature = "file-backend"))]
         {
@@ -897,16 +928,18 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 }
             }
             let deadline = live_deadline(std::time::Instant::now(), args.duration);
-            stream_decode(
+            let summary = stream_decode(
                 &mut core,
                 &mut source,
                 None,
                 deadline,
                 args.raw,
                 args.hex,
+                args.profile.as_deref().unwrap_or("default"),
                 verbosity,
             )?;
             source.stop()?;
+            summary.check_failure()?;
             if chatty && args.duration > 0 {
                 println!("Stopped listening after {} s.", args.duration);
             }
@@ -964,7 +997,7 @@ const TRAILING_FLUSH_SAMPLES: usize = 8192;
 
 /// Push audio from `source` through `core`'s streaming decoder
 /// (`CoppaCore::push_samples`) in fixed-size chunks, printing each decoded
-/// frame as it completes (see `print_stream_frame`).
+/// frame as it completes (see `handle_stream_frame`).
 ///
 /// It stops on the first of three conditions:
 /// - `total_samples`, when known (a WAV file, already capped by
@@ -981,6 +1014,23 @@ const TRAILING_FLUSH_SAMPLES: usize = 8192;
 /// Every normal return then pushes `TRAILING_FLUSH_SAMPLES` of silence so a
 /// frame that ends right at the file's end (or just before a live deadline)
 /// can still complete (see that constant's doc).
+#[derive(Default)]
+struct DecodeSummary {
+    good_frames: usize,
+    failed_frames: usize,
+    first_error: Option<String>,
+    consumed_samples: usize,
+}
+
+impl DecodeSummary {
+    fn check_failure(&self) -> Result<()> {
+        if let Some(error) = &self.first_error {
+            anyhow::bail!("{error}");
+        }
+        Ok(())
+    }
+}
+
 fn stream_decode(
     core: &mut CoppaCore,
     source: &mut dyn coppa_audio::AudioSource,
@@ -988,17 +1038,20 @@ fn stream_decode(
     deadline: Option<std::time::Instant>,
     raw: bool,
     hex: bool,
+    profile: &str,
     verbosity: Verbosity,
-) -> Result<()> {
+) -> Result<DecodeSummary> {
     let mut buf = vec![0.0f32; 4096];
-    let mut consumed = 0usize;
-    while total_samples.is_none_or(|total| consumed < total) {
-        let want = total_samples.map_or(buf.len(), |total| buf.len().min(total - consumed));
+    let mut summary = DecodeSummary::default();
+    while total_samples.is_none_or(|total| summary.consumed_samples < total) {
+        let want = total_samples.map_or(buf.len(), |total| {
+            buf.len().min(total - summary.consumed_samples)
+        });
         let n = source.read(&mut buf[..want])?;
         if n > 0 {
-            consumed += n;
+            summary.consumed_samples += n;
             for frame in core.push_samples(&buf[..n]) {
-                print_stream_frame(&frame, raw, hex, verbosity);
+                handle_stream_frame(core, &frame, &mut summary, raw, hex, profile, verbosity);
             }
         }
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
@@ -1011,10 +1064,10 @@ fn stream_decode(
 
     let silence = vec![0.0f32; TRAILING_FLUSH_SAMPLES];
     for frame in core.push_samples(&silence) {
-        print_stream_frame(&frame, raw, hex, verbosity);
+        handle_stream_frame(core, &frame, &mut summary, raw, hex, profile, verbosity);
     }
 
-    Ok(())
+    Ok(summary)
 }
 
 fn hex_string(bytes: &[u8]) -> String {
@@ -1041,16 +1094,26 @@ fn format_decoded(bytes: &[u8], snr_db: f32, hex: bool) -> String {
 /// escaped, quoted text; other payloads fall back to labeled lowercase hex.
 /// `hex` forces labeled hex. `raw` prints only the lowercase hex string,
 /// one per line, on stdout, even when `hex` is also set.
-/// Decode failures are reported on stderr (never stdout, so they never
-/// corrupt a `--raw` capture), suppressed entirely in `Verbosity::Quiet`.
-fn print_stream_frame(
+/// Decode failures are retained for a final nonzero exit even under --quiet.
+fn handle_stream_frame(
+    core: &CoppaCore,
     frame: &coppa_engine::StreamFrame,
+    summary: &mut DecodeSummary,
     raw: bool,
     hex: bool,
+    profile: &str,
     verbosity: Verbosity,
 ) {
     match &frame.payload {
         Ok(bytes) => {
+            if core.appears_compressed_with_wrong_profile(bytes) {
+                summary.failed_frames += 1;
+                summary.first_error.get_or_insert_with(|| format!(
+                    "decoded payload appears compressed but profile {profile} does not enable compression; try --profile HF_STANDARD for HF audio"
+                ));
+                return;
+            }
+            summary.good_frames += 1;
             if raw {
                 println!("{}", hex_string(bytes));
             } else {
@@ -1064,9 +1127,10 @@ fn print_stream_frame(
             }
         }
         Err(e) => {
-            if verbosity != Verbosity::Quiet {
-                eprintln!("Decode failed: {}", e);
-            }
+            summary.failed_frames += 1;
+            summary
+                .first_error
+                .get_or_insert_with(|| format!("payload decode failed: {e}"));
         }
     }
 }
@@ -1501,6 +1565,8 @@ mod tests {
             pub fail_write_after: Option<usize>,
             pub fail_progress: bool,
             pub fail_stop: bool,
+            pub fail_key: bool,
+            pub fail_unkey: bool,
             pub events: Vec<(Duration, String)>,
             fractional: f64,
         }
@@ -1522,6 +1588,8 @@ mod tests {
                     fail_write_after: None,
                     fail_progress: false,
                     fail_stop: false,
+                    fail_key: false,
+                    fail_unkey: false,
                     events: Vec::new(),
                     fractional: 0.0,
                 }))
@@ -1614,6 +1682,12 @@ mod tests {
                     coppa_radio::PttState::Rx => "ptt RX",
                 };
                 d.log(what);
+                if state == coppa_radio::PttState::Tx && d.fail_key {
+                    anyhow::bail!("simulated key failure");
+                }
+                if state == coppa_radio::PttState::Rx && d.fail_unkey {
+                    anyhow::bail!("simulated unkey failure");
+                }
                 Ok(())
             }
             fn get_ptt(&mut self) -> anyhow::Result<coppa_radio::PttState> {
@@ -1777,6 +1851,105 @@ mod tests {
         }
         assert!(run_play_keyed(&device, &samples, 0, 0).is_err());
         assert_eq!(event_names(&device), ["ptt TX", "ptt RX", "stop"]);
+    }
+
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn play_keyed_key_and_unkey_failures_are_fatal() {
+        let device = sim::Device::new(std::time::Duration::ZERO);
+        device.lock().unwrap().fail_key = true;
+        let error = run_play_keyed(&device, &[0.25; 16], 50, 200).unwrap_err();
+        assert!(error.to_string().contains("failed to key PTT"), "{error}");
+        assert_eq!(event_names(&device), ["ptt TX", "ptt RX", "stop"]);
+        assert_eq!(device.lock().unwrap().writes, 0);
+
+        let device = sim::Device::new(std::time::Duration::ZERO);
+        device.lock().unwrap().fail_unkey = true;
+        let error = run_play_keyed(&device, &[0.25; 16], 0, 0).unwrap_err();
+        assert!(
+            error.to_string().contains("failed to release PTT"),
+            "{error}"
+        );
+        assert_eq!(event_names(&device), ["ptt TX", "ptt RX", "stop"]);
+
+        let device = sim::Device::new(std::time::Duration::ZERO);
+        {
+            let mut d = device.lock().unwrap();
+            d.fail_write_after = Some(0);
+            d.fail_unkey = true;
+            d.fail_stop = true;
+        }
+        let error = run_play_keyed(&device, &[0.25; 16], 0, 0).unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.contains("simulated device write failure")
+                && text.contains("failed to release PTT")
+                && text.contains("failed to stop audio"),
+            "{text}"
+        );
+    }
+
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn refused_rigctld_connection_is_an_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let error = build_ptt("rigctld", &addr).err().unwrap();
+        let message = error.to_string();
+        assert!(
+            message.contains("rigctld connection failed") && message.contains(&addr),
+            "{message}"
+        );
+    }
+
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn tx_and_tune_stop_at_rigctld_before_opening_audio() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let tx = cmd_tx(
+            "HI",
+            None,
+            None,
+            None,
+            None,
+            "rigctld",
+            &addr,
+            0,
+            0,
+            None,
+            None,
+            Verbosity::Quiet,
+        )
+        .unwrap_err();
+        let tune = cmd_tune(
+            0.1,
+            None,
+            None,
+            None,
+            None,
+            "rigctld",
+            &addr,
+            0,
+            0,
+            None,
+            None,
+            Verbosity::Quiet,
+        )
+        .unwrap_err();
+        for error in [tx, tune] {
+            let message = error.to_string();
+            assert!(
+                message.contains("rigctld connection failed") && message.contains(&addr),
+                "{message}"
+            );
+            assert!(
+                !message.contains("ALSA") && !message.contains("audio"),
+                "{message}"
+            );
+        }
     }
 
     /// "CLI flags reach the engine": `--rigctld` must actually be the address
@@ -2174,20 +2347,79 @@ mod tests {
         }
     }
 
+    struct FiniteSamples {
+        samples: Vec<f32>,
+        cursor: usize,
+    }
+
+    impl coppa_audio::AudioSource for FiniteSamples {
+        fn read(&mut self, buf: &mut [f32]) -> Result<usize> {
+            let count = buf.len().min(self.samples.len() - self.cursor);
+            buf[..count].copy_from_slice(&self.samples[self.cursor..self.cursor + count]);
+            self.cursor += count;
+            Ok(count)
+        }
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stream_decode_counts_good_and_failed_payload_frames() {
+        let plain = CoppaCore::new().encode("GOOD").unwrap();
+        let profile = coppa_engine::profiles::get_profile("HF_STANDARD").unwrap();
+        let compressed = CoppaCore::with_config(EngineConfig::from_profile(profile))
+            .encode("BAD")
+            .unwrap();
+        let mut samples = plain;
+        samples.extend(std::iter::repeat_n(0.0, 48_000));
+        samples.extend(compressed);
+        let length = samples.len();
+        let mut source = FiniteSamples { samples, cursor: 0 };
+        let summary = stream_decode(
+            &mut CoppaCore::new(),
+            &mut source,
+            Some(length),
+            None,
+            false,
+            false,
+            "default",
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        assert_eq!(summary.consumed_samples, length);
+        assert_eq!(summary.good_frames, 1);
+        assert_eq!(summary.failed_frames, 1);
+        assert!(summary
+            .check_failure()
+            .unwrap_err()
+            .to_string()
+            .contains("appears compressed"));
+    }
+
     #[test]
     fn stream_decode_stops_a_stalled_live_source_at_its_deadline() {
         let start = std::time::Instant::now();
         let deadline = Some(start + std::time::Duration::from_millis(100));
-        stream_decode(
+        let summary = stream_decode(
             &mut CoppaCore::new(),
             &mut Stalled,
             None,
             deadline,
             false,
             false,
+            "default",
             Verbosity::Quiet,
         )
         .unwrap();
+        assert_eq!(summary.good_frames, 0);
+        summary.check_failure().unwrap();
         let elapsed = start.elapsed();
         assert!(
             elapsed >= std::time::Duration::from_millis(100),
@@ -2207,6 +2439,7 @@ mod tests {
             deadline,
             false,
             false,
+            "default",
             Verbosity::Quiet,
         )
         .unwrap();
@@ -2221,17 +2454,68 @@ mod tests {
     #[test]
     fn stream_decode_reads_no_further_than_its_sample_limit() {
         let mut source = Counting::default();
-        stream_decode(
+        let summary = stream_decode(
             &mut CoppaCore::new(),
             &mut source,
             Some(10_000),
             None,
             true,
             false,
+            "default",
             Verbosity::Quiet,
         )
         .unwrap();
         assert_eq!(source.handed_out, 10_000);
+        assert_eq!(summary.consumed_samples, 10_000);
+    }
+
+    #[test]
+    fn stream_frame_outcomes_keep_first_payload_error() {
+        let core = CoppaCore::new();
+        let frame = |payload| coppa_engine::StreamFrame {
+            payload,
+            snr_db: 20.0,
+            cfo_hz: 0.0,
+            frame_start: 0,
+            speed_level: 1,
+            recommended_level: 1,
+            delay_spread_ms: 0.0,
+        };
+        let mut summary = DecodeSummary::default();
+        handle_stream_frame(
+            &core,
+            &frame(Ok(b"GOOD".to_vec())),
+            &mut summary,
+            false,
+            false,
+            "default",
+            Verbosity::Quiet,
+        );
+        handle_stream_frame(
+            &core,
+            &frame(Err(anyhow::anyhow!("first failure"))),
+            &mut summary,
+            false,
+            false,
+            "default",
+            Verbosity::Quiet,
+        );
+        handle_stream_frame(
+            &core,
+            &frame(Err(anyhow::anyhow!("second failure"))),
+            &mut summary,
+            false,
+            false,
+            "default",
+            Verbosity::Quiet,
+        );
+        assert_eq!(summary.good_frames, 1);
+        assert_eq!(summary.failed_frames, 2);
+        let error = summary.check_failure().unwrap_err().to_string();
+        assert!(
+            error.contains("first failure") && !error.contains("second failure"),
+            "{error}"
+        );
     }
 
     #[test]

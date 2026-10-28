@@ -1,6 +1,6 @@
 //! File-based audio backends for regression testing.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 
 use crate::{AudioSink, AudioSource};
@@ -37,21 +37,33 @@ impl WavSource {
     /// Open a WAV file for reading.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let reader = hound::WavReader::open(path.as_ref())
-            .map_err(|e| anyhow!("Failed to open WAV file: {}", e))?;
+            .map_err(|e| anyhow!("Failed to open WAV file {}: {}", path.as_ref().display(), e))?;
         let spec = reader.spec();
         let sample_rate = spec.sample_rate;
 
         let samples: Vec<f32> = match spec.sample_format {
             hound::SampleFormat::Float => reader
                 .into_samples::<f32>()
-                .map(|s| s.unwrap_or(0.0))
-                .collect(),
+                .enumerate()
+                .map(|(index, sample)| {
+                    sample.with_context(|| {
+                        format!("reading WAV {} sample {index}", path.as_ref().display())
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
             hound::SampleFormat::Int => {
                 let max_val = (1i64 << (spec.bits_per_sample - 1)) as f32;
                 reader
                     .into_samples::<i32>()
-                    .map(|s| s.unwrap_or(0) as f32 / max_val)
-                    .collect()
+                    .enumerate()
+                    .map(|(index, sample)| {
+                        sample
+                            .with_context(|| {
+                                format!("reading WAV {} sample {index}", path.as_ref().display())
+                            })
+                            .map(|value| value as f32 / max_val)
+                    })
+                    .collect::<Result<Vec<_>>>()?
             }
         };
 
@@ -286,6 +298,47 @@ impl AudioSink for RawF32Sink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncated_wav_samples_are_errors_for_integer_and_float() {
+        for format in [hound::SampleFormat::Int, hound::SampleFormat::Float] {
+            let path = std::env::temp_dir().join(format!(
+                "coppa_truncated_{}_{}.wav",
+                std::process::id(),
+                if format == hound::SampleFormat::Int {
+                    "int"
+                } else {
+                    "float"
+                }
+            ));
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 48_000,
+                bits_per_sample: 32,
+                sample_format: format,
+            };
+            let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+            if format == hound::SampleFormat::Int {
+                writer.write_sample(42i32).unwrap();
+            } else {
+                writer.write_sample(0.5f32).unwrap();
+            }
+            writer.finalize().unwrap();
+            assert_eq!(WavSource::open(&path).ok().unwrap().total_samples(), 1);
+            let len = std::fs::metadata(&path).unwrap().len();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(len - 2)
+                .unwrap();
+            let err = WavSource::open(&path)
+                .err()
+                .expect("truncated sample must fail");
+            assert!(err.to_string().contains("reading WAV"), "{err}");
+            std::fs::remove_file(path).unwrap();
+        }
+    }
 
     #[test]
     fn test_wav_roundtrip() {

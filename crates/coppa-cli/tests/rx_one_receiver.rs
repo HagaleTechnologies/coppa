@@ -119,20 +119,22 @@ fn rx_duration_decodes_only_the_first_seconds_of_a_file() {
     assert_eq!(raw.trim(), FIRST_HEX);
 }
 
-/// `--duration` counts seconds at the WAV's own rate, not the engine's
-/// 48 kHz: `WavSource` does not resample.
+/// An unsupported WAV rate is rejected before progress or decoding.
 #[test]
-fn rx_duration_counts_seconds_at_the_files_own_sample_rate() {
+fn rx_rejects_wrong_sample_rate() {
     use coppa_audio::AudioSink;
     let wav = TempWav::new("rate");
     let mut sink = coppa_audio::file_backend::WavSink::new(&wav.0, 8_000);
     sink.start().unwrap();
     sink.write(&vec![0.0f32; 40_000]).unwrap();
     sink.stop().unwrap();
-    let (out, _) = ok(&["rx", "<path>", "-d", "2"], &wav.0);
+    let output = coppa(&["rx", "<path>", "-d", "2"], Some(&wav.0));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        out.contains("Reading the first 2 s (16000 of 40000 samples) from"),
-        "{out}"
+        stderr.contains("8000 Hz") && stderr.contains("48000 Hz") && stderr.contains("resample"),
+        "{stderr}"
     );
 }
 
