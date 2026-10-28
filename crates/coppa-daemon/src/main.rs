@@ -26,7 +26,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, ConfigSource, LogLevel, Mode};
 use config::DaemonConfig;
-use event_loop::{DaemonEvent, EventLoop};
+use event_loop::{forward_data_out, DaemonEvent, EventLoop};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -241,10 +241,13 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
 
     let event_tx = event_loop.event_sender();
 
+<<<<<<< HEAD
     // Create response channel and wire it to the event loop
     let (response_tx, response_rx) = tokio::sync::mpsc::channel(64);
     event_loop.set_response_tx(response_tx);
 
+=======
+>>>>>>> 2473a489080265c28423a08a5d053d95a21caa00
     // Wire audio ring buffers
     let (audio_out_producer, audio_out_consumer) =
         coppa_audio::audio_ring(config.audio.buffer_size);
@@ -408,6 +411,51 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
             data_listener,
             &config.host,
         );
+<<<<<<< HEAD
+=======
+        tracing::info!(
+            command_addr = %listen_addr(&cmd_listener),
+            data_addr = %listen_addr(&data_listener),
+            "VARA TCP server listening"
+        );
+
+        // Pipe VARA events into the daemon event loop
+        if let Some(mut vara_rx) = vara_server.take_event_rx() {
+            let vara_event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                while let Some(host_event) = vara_rx.recv().await {
+                    if vara_event_tx
+                        .send(DaemonEvent::Host(host_event))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+
+        // Wire VARA command-port response senders so the event loop can broadcast
+        // SNR/PTT/BUFFER/BUSY telemetry (decision 8, Phase 3 Task 7).
+        event_loop.set_vara_responses(vara_server.response_senders());
+
+        // Decoded payloads reach the data-port clients through this bridge.
+        // Wired only with a VARA server: the queue is unbounded, so it needs
+        // the bridge draining it.
+        let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
+        event_loop.set_response_tx(response_tx);
+        tokio::spawn(forward_data_out(response_rx, vara_server.data_senders()));
+
+        // Serve the listeners bound above
+        tokio::spawn(async move {
+            if let Err(e) = vara_server
+                .run_with_listeners(cmd_listener, data_listener)
+                .await
+            {
+                tracing::error!("VARA server stopped: {e:#}");
+            }
+        });
+>>>>>>> 2473a489080265c28423a08a5d053d95a21caa00
     }
 
     // Start WebSocket server if enabled

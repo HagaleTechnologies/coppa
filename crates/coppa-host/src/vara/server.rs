@@ -7,7 +7,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 
 use super::command::{response_channel, VaraCommandPort};
-use super::data::VaraDataPort;
+use super::data::{data_channel, VaraDataPort};
 use super::protocol::VaraResponse;
 use crate::HostEvent;
 
@@ -199,7 +199,7 @@ impl VaraServer {
                         // E2: Use data-port namespace
                         let client_id = next_data_id.fetch_add(1, Ordering::Relaxed);
                         let ev_tx = data_event_tx.clone();
-                        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
+                        let (data_tx, data_rx) = data_channel();
                         let ds = data_senders.clone();
                         ds.lock().await.insert(client_id, data_tx);
                         let ds_cleanup = ds.clone();

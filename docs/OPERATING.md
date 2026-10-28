@@ -277,3 +277,10 @@ what is queued, closes the connection and logs `VARA command-port client is
 not reading; disconnecting it`. A host never misses a state line while its
 connection stays open. Find out why the host stopped reading, then reconnect
 it.
+
+The data port keeps every received payload; nothing on it is dropped. A host
+that reads again before 1024 payloads are waiting gets all of them, in order.
+If 1024 payloads are waiting, coppad writes what is queued, closes the data
+connection and logs `VARA data-port client is not reading; disconnecting it`.
+The command port stays connected. A host never sees a gap in received data
+while its data connection stays open.
