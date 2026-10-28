@@ -25,7 +25,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, ConfigSource, LogLevel, Mode};
-use config::DaemonConfig;
+use config::{config_candidates, ConfigEnv, DaemonConfig, Discovered};
 use event_loop::{DaemonEvent, EventLoop};
 
 #[tokio::main]
@@ -44,9 +44,10 @@ async fn main() -> Result<()> {
         } => run_ptt_guardian(cli.log_level, ptt_method, rigctld_address).await,
         Mode::Run(source) => {
             // Load before logging so a config error is the only output.
-            let config = load_config(&source)?;
+            let (config, discovered) = load_config(&source)?;
             init_tracing(cli.log_level);
             log_banner();
+            log_config_source(&source, discovered.as_ref());
             // COP-32: a fatal error after logging starts is logged at ERROR,
             // then returned so `main` prints `Error: ...` and exits 1.
             run_daemon(config)
@@ -57,20 +58,58 @@ async fn main() -> Result<()> {
 }
 
 /// Load the configuration a command selected. An explicit path must exist;
-/// the implicit `./coppad.toml` falls back to defaults only when absent.
-fn load_config(source: &ConfigSource) -> Result<DaemonConfig> {
+/// without one, the first file found by the COP-49 search is used, falling
+/// back to defaults only when none exists. The search record is returned for
+/// an implicit source only.
+fn load_config(source: &ConfigSource) -> Result<(DaemonConfig, Option<Discovered>)> {
     match source {
-        ConfigSource::Explicit(path) => DaemonConfig::load(path)
-            .with_context(|| format!("Failed to load config {}", path.display())),
-        ConfigSource::Implicit => DaemonConfig::load_or_default(cli::DEFAULT_CONFIG_PATH),
+        ConfigSource::Explicit(path) => {
+            let config = DaemonConfig::load(path)
+                .with_context(|| format!("Failed to load config {}", path.display()))?;
+            Ok((config, None))
+        }
+        ConfigSource::Implicit => {
+            let discovered =
+                DaemonConfig::discover(&config_candidates(&ConfigEnv::from_process()))?;
+            Ok((discovered.config.clone(), Some(discovered)))
+        }
+    }
+}
+
+/// COP-49: log which file the daemon runs on, or warn that the search found
+/// none and the daemon runs on built-in defaults.
+fn log_config_source(source: &ConfigSource, discovered: Option<&Discovered>) {
+    let used = match source {
+        ConfigSource::Explicit(path) => Some(path.as_path()),
+        ConfigSource::Implicit => discovered.and_then(|d| d.source.as_deref()),
+    };
+    if let Some(path) = used {
+        tracing::info!(path = %path.display(), "Using configuration file");
+    } else if let Some(discovered) = discovered {
+        tracing::warn!(
+            "No configuration file found; using built-in defaults (searched: {}). Copy \
+             coppad.toml.example to one of these paths to configure this station.",
+            discovered.search_summary()
+        );
     }
 }
 
 /// `--check`: read and deserialize the configuration only. Deliberately
 /// returns before PTT parsing or `EventLoop::new`, which can touch hardware.
+/// For an implicit source it first says which file it checked (COP-49).
 fn check_config(source: &ConfigSource) -> Result<()> {
-    load_config(source)?;
+    let (_, discovered) = load_config(source)?;
     let mut stdout = std::io::stdout().lock();
+    if let Some(discovered) = discovered {
+        match &discovered.source {
+            Some(path) => writeln!(stdout, "Using configuration file {}", path.display())?,
+            None => writeln!(
+                stdout,
+                "No configuration file found; checking the built-in defaults (searched: {}).",
+                discovered.search_summary()
+            )?,
+        }
+    }
     writeln!(stdout, "Configuration syntax and field types OK.")?;
     writeln!(stdout, "Hardware and runtime settings were not checked.")?;
     Ok(())

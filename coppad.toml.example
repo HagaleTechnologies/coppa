@@ -1,5 +1,5 @@
 # Coppa Daemon Configuration
-# Copy to coppad.toml and edit as needed.
+# Copy to ~/.config/coppa/coppad.toml (one user), /etc/coppa/coppad.toml (a system service) or ./coppad.toml, and edit as needed.
 # An unknown or misspelled key or table stops coppad at startup, naming the
 # key; `coppad --check` reports it too (COP-36).
 
