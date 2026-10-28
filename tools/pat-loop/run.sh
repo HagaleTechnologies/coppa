@@ -121,16 +121,33 @@ fetch_pat() {
 SCRATCH=$(mktemp -d /tmp/pat-loop.XXXXXX)
 PIDS=()
 
+# Send SIGTERM to a process this script started. One that is already gone
+# exited on its own, which is worth a line on stderr but must not stop the
+# teardown of the others.
+stop() {
+    kill "$1" 2>/dev/null || echo "pat-loop: process $1 had already exited" >&2
+}
+
+# Reap a process `stop` signalled. 0 (a clean shutdown) and 143 (128 +
+# SIGTERM) are the expected statuses; any other is reported, not fatal.
+reap() {
+    local status=0
+    wait "$1" 2>/dev/null || status=$?
+    if ((status != 0 && status != 143)); then
+        echo "pat-loop: process $1 exited with status $status" >&2
+    fi
+}
+
 # Kill only processes this script started, by PID. Never kill by a
 # command-line pattern: the pattern can match this shell's own command line
 # and kill the harness.
 cleanup() {
     local pid
     for pid in "${PIDS[@]}"; do
-        kill "$pid" 2>/dev/null || true
+        stop "$pid"
     done
     for pid in "${PIDS[@]}"; do
-        wait "$pid" 2>/dev/null || true
+        reap "$pid"
     done
     if [[ $KEEP -eq 0 ]]; then
         rm -rf "$SCRATCH"
@@ -287,8 +304,21 @@ done
 wait_for_port "$A_CMD" || die "coppad A never opened its command port ($SCRATCH/a/coppad.log)"
 wait_for_port "$B_CMD" || die "coppad B never opened its command port ($SCRATCH/b/coppad.log)"
 
-count() {
-    grep -c -- "$1" "$2" 2>/dev/null || true
+# Lines matching $1 across both coppad logs. grep -c prints 0 and exits 1
+# when nothing matches, which is a count; exit 2 (a missing or unreadable
+# log) is not, so the function fails. Call it as the only substitution in an
+# assignment (`x=$(count_both ...)`): that assignment then fails too and
+# `set -e` stops the run, where a second substitution in the same
+# expression would supply the exit status instead.
+count_both() {
+    local log n status total=0
+    for log in "$SCRATCH/a/coppad.log" "$SCRATCH/b/coppad.log"; do
+        status=0
+        n=$(grep -c -- "$1" "$log") || status=$?
+        ((status <= 1)) || die "cannot count '$1' in $log"
+        total=$((total + n))
+    done
+    echo "$total"
 }
 
 make_body() {
@@ -363,10 +393,8 @@ EOF
         echo "pat-loop: compose failed ($run/compose.log)" >&2
 
     local before_ovf before_ka
-    before_ovf=$(($(count "Audio input buffer overflow" "$SCRATCH/a/coppad.log") +
-        $(count "Audio input buffer overflow" "$SCRATCH/b/coppad.log")))
-    before_ka=$(($(count "Sending session KEEPALIVE" "$SCRATCH/a/coppad.log") +
-        $(count "Sending session KEEPALIVE" "$SCRATCH/b/coppad.log")))
+    before_ovf=$(count_both "Audio input buffer overflow")
+    before_ka=$(count_both "Sending session KEEPALIVE")
 
     local start=$SECONDS rc=0
     env "${STATION_ENV[@]}" timeout "$TIMEOUT" "$DIAL_PAT" --config "$dial_cfg" \
@@ -375,21 +403,36 @@ EOF
     local elapsed=$((SECONDS - start))
     # Give the listener a moment to file the message, then stop it.
     sleep 2
-    kill "$listener_pid" 2>/dev/null || true
-    wait "$listener_pid" 2>/dev/null || true
+    stop "$listener_pid"
+    reap "$listener_pid"
+    # Reaped: drop it from PIDS, so cleanup does not signal a PID the OS may
+    # have handed to another process since.
+    local kept=() p
+    for p in "${PIDS[@]}"; do
+        if [[ $p != "$listener_pid" ]]; then
+            kept+=("$p")
+        fi
+    done
+    PIDS=("${kept[@]}")
 
     local ovf ka
-    ovf=$(($(count "Audio input buffer overflow" "$SCRATCH/a/coppad.log") +
-        $(count "Audio input buffer overflow" "$SCRATCH/b/coppad.log") - before_ovf))
-    ka=$(($(count "Sending session KEEPALIVE" "$SCRATCH/a/coppad.log") +
-        $(count "Sending session KEEPALIVE" "$SCRATCH/b/coppad.log") - before_ka))
+    ovf=$(count_both "Audio input buffer overflow")
+    ovf=$((ovf - before_ovf))
+    ka=$(count_both "Sending session KEEPALIVE")
+    ka=$((ka - before_ka))
 
     # The delivered body: the listener's inbox file carrying this subject,
     # text after the header's blank line, CRLF normalized (Pat stores CRLF).
-    local match=no received
-    received=$(grep -l -- "Subject: $subject" "$SCRATCH/$listener/mbox/$l_call/in/"*.b2f 2>/dev/null | head -1 || true)
+    # No such file (nothing delivered) leaves match=no, which fails the run.
+    local match=no received="" f
+    for f in "$SCRATCH/$listener/mbox/$l_call/in/"*.b2f; do
+        if [[ -f $f ]] && grep -q -- "Subject: $subject" "$f"; then
+            received=$f
+            break
+        fi
+    done
     if [[ -n "$received" ]]; then
-        python3 - "$received" "$run/body.txt" "$SELF_TEST_MISMATCH" >"$run/match" <<'EOF' || true
+        if python3 - "$received" "$run/body.txt" "$SELF_TEST_MISMATCH" >"$run/match" <<'EOF'
 import sys
 raw = open(sys.argv[1], "rb").read().replace(b"\r", b"")
 got = raw.split(b"\n\n", 1)[1] if b"\n\n" in raw else b""
@@ -398,7 +441,11 @@ if sys.argv[3] == "1":
     want = b"X" + want
 print("yes" if got.rstrip(b"\n") == want.rstrip(b"\n") else "no")
 EOF
-        match=$(cat "$run/match")
+        then
+            match=$(cat "$run/match")
+        else
+            echo "pat-loop: the body comparison itself failed; counting it as no match" >&2
+        fi
     fi
 
     local label="$d_call->$l_call"
@@ -419,12 +466,15 @@ esac
 
 if [[ $FAILED -eq 0 ]]; then
     echo PASS
-    exit 0
+else
+    KEEP=1
+    echo FAIL
+    echo "pat-loop: logs kept in $SCRATCH:"
+    for f in "${LOGS[@]}" "$SCRATCH/a/coppad.log" "$SCRATCH/b/coppad.log" "$SCRATCH/relay.log"; do
+        echo "  $f"
+    done
 fi
-KEEP=1
-echo FAIL
-echo "pat-loop: logs kept in $SCRATCH:"
-for f in "${LOGS[@]}" "$SCRATCH/a/coppad.log" "$SCRATCH/b/coppad.log" "$SCRATCH/relay.log"; do
-    echo "  $f"
-done
-exit 1
+# The exit status: 0 when every direction passed, 1 when any failed. This is
+# a final test, not `exit`, because shellcheck 0.9.0 reads a top-level `exit`
+# as making the EXIT trap's handler unreachable (SC2317 on `cleanup`).
+[[ $FAILED -eq 0 ]]

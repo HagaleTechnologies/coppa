@@ -1544,6 +1544,19 @@ impl EventLoop {
             }
         }
         self.tx_frame_count += 1;
+        // COP-46: a sent session PDU is activity (`Session::touch`'s
+        // contract). The peer's ACK touches the session too, but only once
+        // it arrives: without this, the first frame after 30 s of quiet
+        // leaves `session_cleanup` free to key a KEEPALIVE on top of the
+        // peer's ACK, which then costs a retransmission.
+        if let Some(session) = self
+            .session_link
+            .as_ref()
+            .map(|l| l.session_id)
+            .and_then(|id| self.session_mgr.get_mut(id))
+        {
+            session.touch();
+        }
         tracing::debug!(
             seq,
             frame = self.tx_frame_count,
@@ -1698,35 +1711,6 @@ impl EventLoop {
                 Ok(samples) => {
                     tracing::debug!(seq, attempt, "Retransmitting session frame");
                     Box::pin(self.transmit_samples(&samples)).await;
-<<<<<<< HEAD
-                    if self.tx_generation == generation {
-                        // The gate passed above but refused after the
-                        // courtesy wait (the one `transmit_samples` path
-                        // that keys nothing and leaves `tx_generation`
-                        // alone). Put the chunk back at the head, so the
-                        // retry poll resumes the stream without a hole.
-                        self.session_tx_queue.push_front(chunk);
-                        self.session_tx_held_by_frequency_gate = true;
-                        self.report_buffer().await;
-                        return;
-                    }
-                    self.tx_frame_count += 1;
-                    // COP-46: a sent session PDU is activity
-                    // (`Session::touch`'s contract). Without this, a station
-                    // streaming a long message keys a KEEPALIVE ~30s into
-                    // its own transfer, which can land on the peer's reply
-                    // and, with no ARQ on session data (H-025), lose it for
-                    // good.
-                    if let Some(session) = self.session_mgr.get_mut(chunk.session_id) {
-                        session.touch();
-                    }
-                    tracing::debug!(
-                        frame = self.tx_frame_count,
-                        max = self.max_frames_per_turn,
-                        "Session data frame transmitted"
-                    );
-=======
->>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
                 }
                 Err(e) => tracing::warn!(
                     error = %e,
@@ -11575,7 +11559,6 @@ mod tests {
             );
         }
 
-<<<<<<< HEAD
         /// COP-46: keying a session data frame is session activity, so a
         /// station that is busy sending its own message never keys a
         /// KEEPALIVE in the middle of it. Before the fix only the receive
@@ -11586,6 +11569,9 @@ mod tests {
         /// has no ARQ (H-025), so that reply was lost for good, keepalives
         /// then held the dead session open, and real Pat's `pat connect`
         /// sat until its 900 s timeout (COP-46 plan, two-process run).
+        /// COP-38 has since made session data ARQ-protected, and the peer's
+        /// ACK touches the session as well; this checks the window between
+        /// keying a frame and that ACK arriving.
         #[tokio::test]
         async fn session_send_counts_as_activity() {
             let mut event_loop = EventLoop::new(session_config()).unwrap();
@@ -11618,7 +11604,9 @@ mod tests {
             assert!(
                 !event_loop.session_mgr.get(id).unwrap().needs_keepalive(),
                 "a keyed session data frame must reset the keepalive timer"
-=======
+            );
+        }
+
         /// COP-38 (D6): session `BUFFER` counts bytes the peer has not yet
         /// acknowledged, so a PTT release alone (the frame played, but may
         /// have been lost) never reports `BUFFER 0`; the peer's ACK does.
@@ -12043,7 +12031,6 @@ mod tests {
                 &counts[..5],
                 &[2, 3, 4, 5, 6],
                 "every pass counts: {counts:?}"
->>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
             );
         }
 
