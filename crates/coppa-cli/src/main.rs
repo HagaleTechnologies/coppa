@@ -870,8 +870,7 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 &mut source,
                 Some(limit),
                 None,
-                args.raw,
-                args.hex,
+                (args.raw, args.hex),
                 args.profile.as_deref().unwrap_or("default"),
                 verbosity,
             )?;
@@ -933,8 +932,7 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 &mut source,
                 None,
                 deadline,
-                args.raw,
-                args.hex,
+                (args.raw, args.hex),
                 args.profile.as_deref().unwrap_or("default"),
                 verbosity,
             )?;
@@ -1036,11 +1034,11 @@ fn stream_decode(
     source: &mut dyn coppa_audio::AudioSource,
     total_samples: Option<usize>,
     deadline: Option<std::time::Instant>,
-    raw: bool,
-    hex: bool,
+    output: (bool, bool),
     profile: &str,
     verbosity: Verbosity,
 ) -> Result<DecodeSummary> {
+    let (raw, hex) = output;
     let mut buf = vec![0.0f32; 4096];
     let mut summary = DecodeSummary::default();
     while total_samples.is_none_or(|total| summary.consumed_samples < total) {
@@ -2387,8 +2385,7 @@ mod tests {
             &mut source,
             Some(length),
             None,
-            false,
-            false,
+            (false, false),
             "default",
             Verbosity::Quiet,
         )
@@ -2412,8 +2409,7 @@ mod tests {
             &mut Stalled,
             None,
             deadline,
-            false,
-            false,
+            (false, false),
             "default",
             Verbosity::Quiet,
         )
@@ -2437,8 +2433,7 @@ mod tests {
             &mut Endless,
             None,
             deadline,
-            false,
-            false,
+            (false, false),
             "default",
             Verbosity::Quiet,
         )
@@ -2459,8 +2454,7 @@ mod tests {
             &mut source,
             Some(10_000),
             None,
-            true,
-            false,
+            (true, false),
             "default",
             Verbosity::Quiet,
         )

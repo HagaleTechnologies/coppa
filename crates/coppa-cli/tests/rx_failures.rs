@@ -40,8 +40,9 @@ fn failed(output: Output, expected: &str) {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains(expected), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !String::from_utf8_lossy(&output.stdout).contains("Decoded"),
+        stdout.is_empty() || stdout.lines().all(|line| line.starts_with("Reading ")),
         "{output:?}"
     );
 }
