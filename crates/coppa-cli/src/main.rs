@@ -172,8 +172,9 @@ impl<'a> RxFrameOutput<'a> {
 
 impl ProfileOutput {
     fn from_profile(profile: &coppa_engine::profiles::Profile) -> Result<Self> {
-        let max_payload_bytes = coppa_protocol::modem::max_payload_for_level(profile.speed_level)
-            .ok_or_else(|| anyhow::anyhow!("Invalid speed level for {}", profile.name))?;
+        let max_payload_bytes =
+            coppa_protocol::modem::max_payload_for_level(profile.speed_level)
+                .ok_or_else(|| anyhow::anyhow!("Invalid speed level for {}", profile.name))?;
         Ok(Self {
             name: profile.name,
             description: profile.description,
@@ -1464,7 +1465,8 @@ mod tests {
 
     #[test]
     fn test_loopback_verbose() {
-        cmd_loopback("Verbose", None, Verbosity::Verbose(1)).expect("verbose loopback should succeed");
+        cmd_loopback("Verbose", None, Verbosity::Verbose(1))
+            .expect("verbose loopback should succeed");
     }
 
     #[test]
@@ -2329,22 +2331,37 @@ mod tests {
         ] {
             for before_command in [true, false] {
                 let mut argv = vec!["coppa"];
-                if before_command { argv.extend(&flags); }
+                if before_command {
+                    argv.extend(&flags);
+                }
                 argv.push("devices");
-                if !before_command { argv.extend(&flags); }
+                if !before_command {
+                    argv.extend(&flags);
+                }
                 assert_eq!(Cli::try_parse_from(argv).unwrap().verbose, count);
             }
         }
         for flag in ["-q", "--quiet"] {
-            assert!(Cli::try_parse_from(["coppa", flag, "devices"]).unwrap().quiet);
-            assert!(Cli::try_parse_from(["coppa", "devices", flag]).unwrap().quiet);
+            assert!(
+                Cli::try_parse_from(["coppa", flag, "devices"])
+                    .unwrap()
+                    .quiet
+            );
+            assert!(
+                Cli::try_parse_from(["coppa", "devices", flag])
+                    .unwrap()
+                    .quiet
+            );
         }
         for args in [
             vec!["coppa", "-q", "-v", "devices"],
             vec!["coppa", "--quiet", "--verbose", "devices"],
             vec!["coppa", "--verbose", "--quiet", "devices"],
         ] {
-            assert_eq!(Cli::try_parse_from(args).err().unwrap().kind(), clap::error::ErrorKind::ArgumentConflict);
+            assert_eq!(
+                Cli::try_parse_from(args).err().unwrap().kind(),
+                clap::error::ErrorKind::ArgumentConflict
+            );
         }
     }
 

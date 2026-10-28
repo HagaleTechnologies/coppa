@@ -3,6 +3,14 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[derive(serde::Deserialize)]
+struct DeviceOutputCheck {
+    name: String,
+    max_sample_rate_hz: u32,
+    input_channels: u16,
+    output_channels: u16,
+}
+
 fn run(args: &[&str], path: Option<&Path>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_coppa"));
     for arg in args {
@@ -16,7 +24,11 @@ fn run(args: &[&str], path: Option<&Path>) -> Output {
 }
 
 fn json(output: &Output) -> serde_json::Value {
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
@@ -38,6 +50,14 @@ fn quiet_verbose_conflict_exits_before_output() {
 fn devices_json_is_one_array_with_typed_records() {
     let output = run(&["devices", "--json"], None);
     let value = json(&output);
+    let typed: Vec<DeviceOutputCheck> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(typed.len(), value.as_array().unwrap().len());
+    for (device, value) in typed.iter().zip(value.as_array().unwrap()) {
+        assert_eq!(value["name"], device.name);
+        assert_eq!(value["max_sample_rate_hz"], device.max_sample_rate_hz);
+        assert_eq!(value["input_channels"], device.input_channels);
+        assert_eq!(value["output_channels"], device.output_channels);
+    }
     for device in value.as_array().unwrap() {
         let object = device.as_object().unwrap();
         assert_eq!(object.len(), 4);
@@ -47,6 +67,27 @@ fn devices_json_is_one_array_with_typed_records() {
         assert!(object["output_channels"].is_u64());
     }
     assert_eq!(output.stdout.last(), Some(&b'\n'));
+}
+
+#[cfg(feature = "file-backend")]
+#[test]
+fn rx_json_decodes_a_wav_from_the_tx_command() {
+    let wav = TempWav::new("tx_command");
+    let tx = run(&["tx", "COP-58 test payload", "-o", "<path>"], Some(&wav.0));
+    assert!(
+        tx.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tx.stderr)
+    );
+    let rx = run(&["rx", "<path>", "--json"], Some(&wav.0));
+    let lines = json_lines(&rx);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["payload_text"], "COP-58 test payload");
+    assert_eq!(
+        lines[0]["payload_hex"],
+        "434f502d35382074657374207061796c6f6164"
+    );
+    assert!(rx.stderr.is_empty());
 }
 
 #[test]
@@ -135,8 +176,16 @@ fn write_wav(messages: &[&str]) -> TempWav {
 
 #[cfg(feature = "file-backend")]
 fn json_lines(output: &Output) -> Vec<serde_json::Value> {
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    String::from_utf8(output.stdout.clone()).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect()
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout.clone())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
 }
 
 #[cfg(feature = "file-backend")]
@@ -148,7 +197,14 @@ fn rx_json_streams_frames_in_order_and_listen_matches() {
     assert_eq!(lines.len(), 2);
     for (line, message) in lines.iter().zip(["FIRST FRAME", "SECOND FRAME"]) {
         assert_eq!(line["payload_text"], message);
-        assert_eq!(line["payload_hex"], message.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+        assert_eq!(
+            line["payload_hex"],
+            message
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
         assert!(line["snr_db"].is_number());
         assert!(line["cfo_hz"].is_number());
         assert!(line["frame_start"].is_u64());
@@ -158,6 +214,9 @@ fn rx_json_streams_frames_in_order_and_listen_matches() {
     let listen = run(&["listen", "<path>", "--json"], Some(&wav.0));
     assert_eq!(rx.stdout, listen.stdout);
     assert!(String::from_utf8_lossy(&listen.stderr).contains("deprecated"));
+    let quiet_listen = run(&["-q", "listen", "<path>", "--json"], Some(&wav.0));
+    assert_eq!(rx.stdout, quiet_listen.stdout);
+    assert!(String::from_utf8_lossy(&quiet_listen.stderr).contains("deprecated"));
 
     let quiet = run(&["-q", "rx", "<path>", "--json"], Some(&wav.0));
     assert_eq!(json_lines(&quiet), lines);
@@ -184,6 +243,24 @@ fn rx_json_handles_binary_and_rejects_other_modes() {
         assert_eq!(conflict.status.code(), Some(2));
         assert!(conflict.stdout.is_empty());
     }
+}
+
+#[cfg(feature = "file-backend")]
+#[test]
+fn empty_recording_has_empty_json_stdout() {
+    use coppa_audio::AudioSink;
+    let wav = TempWav::new("empty");
+    let mut sink = coppa_audio::file_backend::WavSink::new(&wav.0, 48_000);
+    sink.start().unwrap();
+    sink.write(&vec![0.0f32; 48_000]).unwrap();
+    sink.stop().unwrap();
+    let output = run(&["rx", "<path>", "--json"], Some(&wav.0));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
 }
 
 #[cfg(feature = "file-backend")]
