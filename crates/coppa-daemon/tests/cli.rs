@@ -630,6 +630,7 @@ fn print_default_config_prints_only_the_default_toml() {
     for line in [
         "vara_enabled = false",
         "websocket_enabled = false",
+        "websocket_allowed_origins = []",
         "rate_loop_probe_interval = 0",
         "cp_gate_enabled = false",
         "cp_negotiation_enabled = false",
@@ -639,6 +640,8 @@ fn print_default_config_prints_only_the_default_toml() {
         assert!(printed.contains(line), "missing {line:?}:\n{printed}");
     }
     assert!(!printed.contains("grid"), "{printed}");
+    // COP-53: an unset token is omitted, never printed as a placeholder.
+    assert!(!printed.contains("websocket_token"), "{printed}");
 
     let parsed: DaemonConfig = toml::from_str(&printed).expect("printed TOML parses");
     assert_eq!(
@@ -878,8 +881,159 @@ fn a_taken_websocket_port_is_a_startup_error() {
     let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
     let port = taken.local_addr().unwrap().port();
     run_startup_error(
-        &format!("[host]\nwebsocket_enabled = true\nwebsocket_port = {port}\n"),
+        &format!(
+            "[host]\nwebsocket_enabled = true\nwebsocket_port = {port}\n\
+             websocket_token = \"{WS_TOKEN}\"\n"
+        ),
         &format!("failed to bind the WebSocket port to 127.0.0.1:{port}"),
+    );
+}
+
+// --- WebSocket access (COP-53) ----------------------------------------------
+
+/// A valid `[host] websocket_token` for the tests below.
+const WS_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+#[test]
+fn websocket_without_a_token_is_a_startup_error() {
+    // COP-53: refused in every build, before any socket is bound. --check
+    // still accepts the same config (see
+    // check_only_deserializes_and_never_touches_hardware_or_listeners).
+    let (stdout, _) = run_startup_error(
+        "[host]\nwebsocket_enabled = true\n",
+        "[host] websocket_enabled = true requires [host] websocket_token",
+    );
+    assert!(!stdout.contains("WebSocket server listening"), "{stdout}");
+}
+
+#[test]
+fn a_short_websocket_token_is_a_startup_error() {
+    run_startup_error(
+        "[host]\nwebsocket_enabled = true\nwebsocket_token = \"short\"\n",
+        "[host] websocket_token is 5 characters long",
+    );
+}
+
+#[test]
+fn an_invalid_websocket_origin_is_a_startup_error() {
+    run_startup_error(
+        &format!(
+            "[host]\nwebsocket_enabled = true\nwebsocket_token = \"{WS_TOKEN}\"\n\
+             websocket_allowed_origins = [\"*\"]\n"
+        ),
+        "[host] websocket_allowed_origins entry \"*\"",
+    );
+}
+
+/// Send one WebSocket upgrade request for `target` with the given extra
+/// header lines, and return the response's status line.
+#[cfg(all(feature = "websocket", not(feature = "cpal-backend")))]
+fn upgrade_status(port: u16, target: &str, headers: &[String]) -> String {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(DEADLINE))
+        .expect("set read timeout");
+    let mut request = format!(
+        "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: Upgrade\r\n\
+         Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    );
+    for header in headers {
+        request.push_str(header);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).expect("send upgrade");
+    let mut status = String::new();
+    BufReader::new(stream)
+        .read_line(&mut status)
+        .expect("read status line");
+    status
+}
+
+/// COP-53, end to end through the real binary: the configured token and
+/// origin allowlist reach the WebSocket server. A wiring bug shows up either
+/// as the valid cases failing (fail closed) or the evil origin passing (fail
+/// open).
+///
+/// CI's full suite builds with `cpal-backend`, which compiles this test out
+/// (like every `start_until` test), so it runs only under
+/// `cargo test -p coppa-daemon --features websocket --test cli`.
+#[cfg(all(feature = "websocket", not(feature = "cpal-backend")))]
+#[test]
+fn websocket_handshake_requires_an_allowed_origin_and_the_token() {
+    let dir = TempDir::new("ws-auth");
+    dir.write(
+        "station.toml",
+        &format!(
+            "[host]\nwebsocket_enabled = true\nwebsocket_port = 0\n\
+             websocket_token = \"{WS_TOKEN}\"\n\
+             websocket_allowed_origins = [\"http://localhost:3000\"]\n"
+        ),
+    );
+    let args = ["--config", "station.toml"];
+    let (mut daemon, _) = start_until(dir.path(), &args, &[], "Daemon ready");
+    let stdout = daemon.stdout();
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("WebSocket server listening"))
+        .unwrap_or_else(|| panic!("no listening line:\n{stdout}"));
+    let after = &line[line.find("127.0.0.1:").expect("listen address") + "127.0.0.1:".len()..];
+    let port: u16 = after
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .expect("listen port");
+
+    let evil = "Origin: https://evil.example".to_string();
+    let bearer = format!("Authorization: Bearer {WS_TOKEN}");
+    let cases: [(String, Vec<String>, &str); 5] = [
+        ("/".to_string(), vec![evil.clone()], "HTTP/1.1 403"),
+        ("/".to_string(), vec![evil, bearer.clone()], "HTTP/1.1 403"),
+        ("/".to_string(), vec![], "HTTP/1.1 401"),
+        ("/".to_string(), vec![bearer], "HTTP/1.1 101"),
+        (
+            format!("/?token={WS_TOKEN}"),
+            vec!["Origin: http://localhost:3000".to_string()],
+            "HTTP/1.1 101",
+        ),
+    ];
+    for (target, headers, expected) in &cases {
+        let status = upgrade_status(port, target, headers);
+        assert!(
+            status.starts_with(expected),
+            "{headers:?}: expected {expected}, got {status:?}"
+        );
+    }
+
+    // Give the event loop time to log both accepted clients.
+    let deadline = Instant::now() + DEADLINE;
+    let connected = |stdout: &str| {
+        stdout
+            .lines()
+            .filter(|line| line.contains("event_loop") && line.contains("Client connected"))
+            .count()
+    };
+    while connected(&daemon.stdout()) < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let (stdout, stderr) = daemon.kill();
+    assert!(
+        !stdout.contains(WS_TOKEN),
+        "token leaked to stdout:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains(WS_TOKEN),
+        "token leaked to stderr:\n{stderr}"
+    );
+    assert_eq!(
+        connected(&stdout),
+        2,
+        "only the two authorized handshakes may reach the event loop:\n{stdout}"
     );
 }
 
