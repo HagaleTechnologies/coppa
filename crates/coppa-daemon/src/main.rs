@@ -417,9 +417,8 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     // Start WebSocket server if enabled
     #[cfg(feature = "websocket")]
     if let Some(ws_listener) = ws_listener {
-<<<<<<< HEAD
         tracing::info!(
-            addr = %listen_addr(&ws_listener),
+            addr = %vara_wiring::listen_addr(&ws_listener),
             allowed_origins = config.host.websocket_allowed_origins.len(),
             "WebSocket server listening"
         );
@@ -434,9 +433,6 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
                 .map_or("", config::SecretToken::expose),
             &config.host.websocket_allowed_origins,
         );
-=======
-        tracing::info!(addr = %vara_wiring::listen_addr(&ws_listener), "WebSocket server listening");
->>>>>>> 8c14fb9136bef7271f81d8c94f5a9c317e0f5867
         let mut ws_server = coppa_host::websocket::WebSocketServer::with_bind_addr(
             config.host.websocket_port,
             config.host.bind_address.clone(),
