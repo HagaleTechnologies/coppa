@@ -8,8 +8,8 @@ sources:
   - crates/coppa-engine/**
   - crates/coppa-protocol/src/**
 verified:
-  commit: 59b0b63
-  date: 2026-07-14
+  commit: 56361d6
+  date: 2026-10-28
 links:
   - overview
   - coppa-protocol
@@ -49,11 +49,14 @@ FFI). The main encode/decode logic is in `coppa-protocol`, not here.
   `occupied_bandwidth_hz_at(level)` previews a level's width — `coppad` uses
   both to keep a level-derived engine HF below 29.7 MHz (COP-21).
   `CoppaCore::on_vhf_profile()` reports which band is actually selected.
-- **Operating profiles:** HF_ROBUST, HF_STANDARD, HF_WIDE, HF_NARROW, VHF_FAST,
-  plus a spread-gated short-CP HF profile (Phase 3). Profile selection affects
+- **Operating profiles:** Engine operating profiles: `HF_ROBUST`, `HF_STANDARD`,
+  `VHF_FAST`, `EMERGENCY` (`profiles::list_profiles`). Profile selection affects
   carrier count, CP length, pilot density. `hf_robust` uses dense pilots;
   `hf_standard`/`hf_wide`/`hf_narrow` are sparse — this sparse/dense distinction
   is critical for fading performance (see [[adr-004-strongest-path-timing]]).
+  `hf_wide`, `hf_narrow` and the short-CP variant are codec-level
+  `CoppaProfile`s (`hf_wide()`, `hf_narrow()`, `hf_standard_short_cp()` in
+  `crates/coppa-codec/src/ofdm/mod.rs`), not engine profiles.
 
 ## Why it is shaped this way
 

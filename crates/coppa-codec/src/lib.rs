@@ -1,8 +1,14 @@
 //! Modulation and demodulation codecs for Coppa.
 //!
-//! Provides the `ConstellationMapper` trait for constellation mapping/demapping,
-//! the `Modem` trait for complete modulation/demodulation, and implementations
-//! for BPSK, QPSK, 8PSK, 16QAM, and 64QAM.
+//! Provides:
+//! - `ofdm`: the OFDM PHY every speed level runs on (`CoppaModem`,
+//!   `CoppaProfile`, the streaming `SyncDetector`), plus a simpler generic
+//!   OFDM stack kept as a teaching example,
+//! - constellation mappers for BPSK, QPSK, 8PSK, 16QAM and 64QAM behind the
+//!   `ConstellationMapper` trait, and the `Modem`, `FecCodec` and
+//!   `ChannelEstimator` traits,
+//! - `afsk`: the AFSK 1200 (Bell 202) modem with HDLC framing and NRZI coding
+//!   that the KISS TNC uses.
 
 pub mod afsk;
 pub mod bpsk;
