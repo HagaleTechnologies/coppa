@@ -159,8 +159,10 @@ the radio's muted output or its own monitor, not the band.
 ## Watching levels live
 
 On a daemon built with the `websocket` feature, set
-`websocket_enabled = true` under `[host]`, connect any WebSocket client (for
-example `websocat ws://127.0.0.1:8400`) and send:
+`websocket_enabled = true` and `websocket_token` under `[host]` (see
+[WebSocket access](#websocket-access)), connect any WebSocket client with the
+token (for example
+`websocat "ws://127.0.0.1:8400/?token=$COPPA_WS_TOKEN"`) and send:
 
 ```text
 {"type":"audio_level","enabled":true}
@@ -187,6 +189,113 @@ independent of the `spectrum` stream.
 | `state` | `ok`, `clipping` or `underdrive` (RX, after this window, using the thresholds above). TX is only ever `ok` or `clipping` |
 | `duration_ms` | Audio span the reading covers |
 | `timestamp_ms` | Wall-clock time the message was sent (Unix epoch, ms) |
+
+## WebSocket access
+
+The WebSocket port can key the transmitter, so `coppad` refuses a client
+unless it presents a shared-secret token. This applies on every
+`bind_address`, loopback included: a web page open in your own browser can
+reach `127.0.0.1` too.
+
+### Setting the token
+
+`websocket_enabled = true` needs `websocket_token` under `[host]`, or `coppad`
+exits at startup with an error naming the key. The token must be at least 16
+characters from `A-Z a-z 0-9 - . _ ~`. Generate one with:
+
+```text
+openssl rand -hex 32
+```
+
+```toml
+[host]
+websocket_enabled = true
+websocket_token = "3f9c0e5b7a2d4c1e8f6a0b9d2c7e4a1f5b8d0c3e6a9f2b5d8c1e4a7f0b3d6c9e"
+```
+
+Make the config file readable only by the account `coppad` runs as
+(`chmod 600`). `coppad --check` does not check the token; starting the daemon
+does.
+
+### Presenting the token
+
+A client presents the token in either of two ways:
+
+- `Authorization: Bearer <token>` on the upgrade request. Use this from
+  scripts and programs that can set headers.
+- A `token` query parameter: `ws://127.0.0.1:8400/?token=<token>`. Browser
+  JavaScript cannot set headers on `new WebSocket(...)`, so a browser page
+  must use this form.
+
+```text
+websocat -H "Authorization: Bearer $COPPA_WS_TOKEN" ws://127.0.0.1:8400/
+websocat "ws://127.0.0.1:8400/?token=$COPPA_WS_TOKEN"
+```
+
+### Allowing a browser page
+
+Browsers send an `Origin` header with every WebSocket handshake, naming the
+page that opened it. When a handshake carries an `Origin`, it must match an
+entry in `websocket_allowed_origins` exactly, even if the page also has the
+token. The default is empty, so no web page can connect until you list it.
+Scripts and programs that send no `Origin` header need only the token.
+
+```toml
+[host]
+websocket_allowed_origins = ["http://localhost:3000", "https://dash.example.org"]
+```
+
+Each entry is `scheme://host[:port]`, exactly as the browser's address bar
+shows the page's origin:
+
+- `http` or `https` only, with no path, query, fragment or user name
+  (`"http://localhost:3000/"` is refused; write `"http://localhost:3000"`).
+- No wildcards. List each origin; another web app on a different local port
+  is exactly the untrusted page this check keeps out.
+- No default port: write `"http://localhost"`, not `"http://localhost:80"`,
+  because browsers omit it.
+- `"null"` is never allowed. It is the origin of sandboxed frames and
+  `file://` pages.
+
+Case does not matter. `coppad` checks every entry at startup and exits with an
+error naming the bad one.
+
+From an allowed page:
+
+```js
+const ws = new WebSocket("ws://127.0.0.1:8400/?token=" + encodeURIComponent(token));
+ws.onopen = () => ws.send(JSON.stringify({ type: "status" }));
+```
+
+### What a refused client sees
+
+The daemon refuses at the HTTP upgrade, before the connection becomes a
+WebSocket, so a refused client never sends a command or receives a broadcast:
+
+- An `Origin` that is not allowed gets `HTTP/1.1 403 Forbidden`.
+- A missing or wrong token gets `HTTP/1.1 401 Unauthorized` with
+  `www-authenticate: Bearer`.
+
+A browser page sees only a failed connection: an `error` event, then close
+code 1006. The daemon prints one line per refusal on stderr, without the token
+or the request URI:
+
+```text
+WebSocket handshake from 127.0.0.1:50358 rejected (403): origin "https://evil.example" is not allowed
+WebSocket handshake from 127.0.0.1:50360 rejected (401): token missing or invalid
+```
+
+On a non-loopback `bind_address`, the token crosses the network in clear text
+over `ws://`. Anyone who can watch that traffic can reuse it.
+
+### What this does not cover
+
+The VARA-style command and data ports and the KISS TCP port have no
+authentication, so that Pat and other VARA clients keep working. A web page
+can still deliver a VARA command line to the command port inside an HTTP
+`POST` body, and the daemon executes it. Until that is fixed, if you enable
+`vara_enabled`, do not browse untrusted sites on the same machine, or run
+`coppad` on a host you do not browse from.
 
 ## Connected sessions: delivery and BUFFER
 

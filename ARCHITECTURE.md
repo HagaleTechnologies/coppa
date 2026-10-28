@@ -100,7 +100,7 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 
 #### Host Interfaces (`coppa-host`)
 - **VARA-style TCP** (`vara-tcp`, default): command port 8300 and data port 8301, a VARA-inspired command set. The modem is not RF/waveform-compatible with VARA and does not interoperate with it over the air
-- **WebSocket** (`websocket`): a JSON API server built on `tokio-tungstenite`, carrying callsign, connect/disconnect, send, received-data, status and spectrum messages
+- **WebSocket** (`websocket`): a JSON API server built on `tokio-tungstenite`, carrying callsign, connect/disconnect, send, received-data, status and spectrum messages; every handshake must present the `[host] websocket_token` and, from a browser, an allowlisted `Origin` (COP-53)
 - **KISS over TCP** (`kiss-tnc`): the host side of the AFSK TNC mode
 
 #### C FFI (`coppa-ffi`)
