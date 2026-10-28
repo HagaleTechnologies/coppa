@@ -136,7 +136,10 @@ impl VaraCommandPort {
                     }
                     Err(e) => {
                         if e.kind() == std::io::ErrorKind::InvalidData {
-                            eprintln!("Command client {} sent over-long line, closing", client_id);
+                            tracing::warn!(
+                                client_id,
+                                "VARA command client sent an over-long line; closing"
+                            );
                         }
                         break;
                     }

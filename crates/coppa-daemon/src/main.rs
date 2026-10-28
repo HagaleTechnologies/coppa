@@ -3,6 +3,10 @@
 //! Manages the engine lifecycle, host interfaces, and radio control in a
 //! persistent background process.
 
+// Diagnostics go through `tracing`; `--check` and `--print-default-config`
+// write their output with `writeln!`.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 // Shared with the library target; the binary uses only part of its API
 // (and none of the output worker without `cpal-backend`).
 #[allow(dead_code)]
@@ -11,6 +15,7 @@ mod cli;
 mod config;
 mod event_loop;
 mod level_meter;
+mod logging;
 mod ptt_guardian;
 #[cfg(feature = "websocket")]
 mod spectrum;
@@ -20,7 +25,7 @@ mod tnc;
 mod tx_chunker;
 mod vara_wiring;
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -91,6 +96,11 @@ fn init_tracing(level: Option<LogLevel>) {
     let rust_log = std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).ok();
     tracing_subscriber::fmt()
         .with_env_filter(cli::log_filter(level, rust_log.as_deref()))
+        // The terminal check alone would override NO_COLOR; see `ansi_enabled`.
+        .with_ansi(logging::ansi_enabled(
+            std::io::stdout().is_terminal(),
+            std::env::var_os("NO_COLOR").as_deref(),
+        ))
         .init();
 }
 

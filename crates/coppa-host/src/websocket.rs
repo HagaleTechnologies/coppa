@@ -323,7 +323,7 @@ impl WebSocketServer {
     pub async fn run(&self) -> anyhow::Result<()> {
         let addr = format!("{}:{}", self.bind_addr, self.port);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        println!("WebSocket server listening on ws://{}", addr);
+        tracing::info!(%addr, "WebSocket server listening");
         self.run_with_listener(listener).await
     }
 
@@ -356,10 +356,7 @@ impl WebSocketServer {
             let permit = match semaphore.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    eprintln!(
-                        "WebSocket connection limit reached, dropping client {}",
-                        peer
-                    );
+                    tracing::warn!(%peer, "WebSocket connection limit reached, dropping client");
                     drop(stream);
                     continue;
                 }
@@ -369,14 +366,14 @@ impl WebSocketServer {
             let mut broadcast_rx = self.broadcast_tx.subscribe();
             let status = self.status.clone();
 
-            println!("WebSocket client {} connected from {}", client_id, peer);
+            tracing::info!(client_id, %peer, "WebSocket client connected");
 
             tokio::spawn(async move {
                 let _permit = permit;
                 let ws = match accept_async_with_config(stream, Some(ws_config)).await {
                     Ok(ws) => ws,
                     Err(e) => {
-                        eprintln!("WebSocket handshake failed for {}: {}", peer, e);
+                        tracing::warn!(%peer, error = %e, "WebSocket handshake failed");
                         return;
                     }
                 };
@@ -501,7 +498,7 @@ impl WebSocketServer {
                 }
 
                 let _ = event_tx.send(HostEvent::Disconnected { client_id }).await;
-                println!("WebSocket client {} disconnected", client_id);
+                tracing::info!(client_id, "WebSocket client disconnected");
             });
         }
     }

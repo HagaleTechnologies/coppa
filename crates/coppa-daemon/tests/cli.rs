@@ -78,6 +78,8 @@ impl Daemon {
             .args(args)
             .current_dir(cwd)
             .env_remove("RUST_LOG")
+            // Every daemon gets the default colour decision (COP-51).
+            .env_remove("NO_COLOR")
             // anyhow appends a backtrace to `main`'s error when either is set.
             .env_remove("RUST_BACKTRACE")
             .env_remove("RUST_LIB_BACKTRACE")
@@ -768,6 +770,78 @@ fn log_level_overrides_rust_log_on_a_running_daemon() {
     let (stdout, stderr) = quiet.kill();
     assert_eq!(stdout, "", "--log-level off must silence tracing");
     assert_eq!(stderr, "");
+}
+
+// --- log output on a non-TTY (COP-51) ---------------------------------------
+//
+// The captures are files, as a log file or the journal would be: no colour
+// codes, and library messages arrive as levelled tracing lines on stdout.
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn a_daemon_logging_to_a_file_writes_no_colour_codes() {
+    let dir = TempDir::new("no-colour");
+    let (mut daemon, _) = start_until_ready(dir.path(), &[], &[]);
+    let (stdout, stderr) = daemon.kill();
+    assert!(stdout.contains("Coppa Daemon starting"), "{stdout}");
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "ANSI escape on stdout:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "ANSI escape on stderr:\n{stderr}"
+    );
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn a_library_message_is_a_tracing_line_not_a_bare_print() {
+    use std::io::Write;
+
+    let dir = TempDir::new("library-message");
+    dir.write(
+        "station.toml",
+        "[host]\nvara_enabled = true\nvara_command_port = 0\nvara_data_port = 0\n",
+    );
+    let (mut daemon, _) = start_until(
+        dir.path(),
+        &["station.toml"],
+        &[],
+        "VARA TCP server listening",
+    );
+    let stdout = daemon.stdout();
+    let addr = stdout
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("command_addr="))
+        .unwrap_or_else(|| panic!("no command_addr field:\n{stdout}"))
+        .to_string();
+
+    // One byte past the command port's 4096-byte line limit, no newline.
+    let mut client = std::net::TcpStream::connect(&addr).expect("connect to the command port");
+    client
+        .write_all(&[b'A'; 4097])
+        .expect("write the over-long line");
+    while !daemon.stdout().contains("over-long line") {
+        if daemon.started.elapsed() >= DEADLINE {
+            let (stdout, stderr) = daemon.kill();
+            panic!("no over-long line warning\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(client);
+    let (stdout, stderr) = daemon.kill();
+    assert_eq!(stderr, "", "library messages must not bypass tracing");
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("over-long line"))
+        .expect("the warning line");
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("coppa_host::vara::command"), "{line}");
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "ANSI escape on stdout:\n{stdout}"
+    );
 }
 
 // --- startup failures (COP-32) ----------------------------------------------

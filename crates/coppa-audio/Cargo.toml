@@ -10,6 +10,7 @@ rust-version.workspace = true
 coppa-dsp = { path = "../coppa-dsp" }
 anyhow = { workspace = true }
 rtrb = { workspace = true }
+tracing = { workspace = true }
 cpal = { workspace = true, optional = true }
 hound = { workspace = true, optional = true }
 

@@ -161,9 +161,10 @@ impl<W: GpioWriter> Drop for GpioPtt<W> {
         // already-lowered pin.
         if self.state == PttState::Tx {
             if let Err(e) = PttControl::set_ptt(self, PttState::Rx) {
-                eprintln!(
-                    "GpioPtt: failed to release PTT on GPIO pin {} on drop: {e}",
-                    self.pin
+                tracing::error!(
+                    pin = self.pin,
+                    error = %e,
+                    "GpioPtt: failed to release PTT on drop"
                 );
             }
         }

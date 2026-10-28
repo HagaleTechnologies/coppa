@@ -10,6 +10,7 @@ rust-version.workspace = true
 coppa-engine = { path = "../coppa-engine" }
 anyhow = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tokio-tungstenite = { version = "0.29", optional = true }

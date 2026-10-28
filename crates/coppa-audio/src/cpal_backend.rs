@@ -204,7 +204,7 @@ impl AudioSource for CpalSource {
                     producer.write(data);
                 },
                 |err| {
-                    eprintln!("CPAL input error: {}", err);
+                    tracing::error!(error = %err, "CPAL input error");
                 },
                 None,
             )
@@ -383,9 +383,9 @@ impl AudioSink for CpalSink {
                 move |err: cpal::Error| {
                     if is_terminal_output_error(err.kind()) {
                         error_progress.fail();
-                        eprintln!("CPAL output error: {}", err);
+                        tracing::error!(error = %err, "CPAL output error");
                     } else {
-                        eprintln!("CPAL output underrun (stream recovered): {}", err);
+                        tracing::warn!(error = %err, "CPAL output underrun (stream recovered)");
                     }
                 },
                 None,
