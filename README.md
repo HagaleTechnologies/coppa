@@ -55,6 +55,9 @@ coppa tx "CQ CQ CQ DE VK2ABC K" -o cq.wav
 # Decode a WAV file (prints the message text)
 coppa rx cq.wav
 
+# Stream one JSON object per decoded frame (pipe into a JSON-lines consumer)
+coppa rx cq.wav --json | jq -c .
+
 # Show the decoded payload as hex bytes instead (--raw: hex only, for scripts)
 coppa rx cq.wav --hex
 
@@ -63,13 +66,28 @@ coppa rx --duration 60
 
 # List audio devices and copy an exact ID (requires cpal-backend feature)
 coppa devices
+coppa devices --json
 
 # Capture the right lane of a stereo input device
 coppa rx --device-id "<id-from-devices>" --input-channel 1 --duration 60
 
 # Show available operating profiles
-coppa config
+coppa profiles
+coppa profiles --json
+coppa profiles -p HF_STANDARD --json
+
+# Suppress status output, or repeat -v for frame metrics on stderr
+coppa -q rx cq.wav
+coppa -vv rx cq.wav
 ```
+
+`rx --json` writes newline-delimited objects with `payload_text` and exact
+`payload_hex` bytes. `payload_text` is `null` for binary payloads. Diagnostics
+go to stderr. `--json` conflicts with `--raw` and `--hex`; `-q`/`--quiet`
+conflicts with `-v`/`--verbose`. `devices --json` and `profiles --json` write
+arrays; `profiles -p NAME --json` writes one object. The existing `config`
+command remains available for its original text output. `listen` is a
+deprecated alias for `rx` and accepts the same flags.
 
 ## KISS TNC (AFSK 1200)
 

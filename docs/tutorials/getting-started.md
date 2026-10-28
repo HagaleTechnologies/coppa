@@ -66,13 +66,29 @@ Decoded: "CQ CQ CQ DE VK2ABC K"  (SNR: 25.7 dB)
 
 Payloads that aren't valid UTF-8 print as `Decoded (hex): …`; `--hex` forces hex, and `--raw` prints only the hex for scripts.
 
+For a stream that scripts can parse, use `--json`:
+
+```bash
+cargo run -p coppa-cli --bin coppa -- rx cq.wav --json | jq -c .
+```
+
+Each decoded frame is one newline-delimited JSON object. `payload_hex` always
+contains the exact bytes; `payload_text` is `null` for binary frames. SNR and
+CFO are numbers when finite and `null` otherwise. Status text is absent from
+JSON stdout, and diagnostics use stderr. `--json` conflicts with `--raw` and
+`--hex`.
+
 ## Listing Audio Devices
 
 Requires the `cpal-backend` feature for real hardware access:
 
 ```bash
 cargo run -p coppa-cli --bin coppa --features cpal-backend -- devices
+cargo run -p coppa-cli --bin coppa --features cpal-backend -- devices --json
 ```
+
+`devices --json` writes a single array, including `[]` when no devices are
+listed.
 
 ## Receiving Live Audio
 
@@ -82,6 +98,7 @@ Requires the `cpal-backend` feature:
 cargo run -p coppa-cli --bin coppa --features cpal-backend -- rx --duration 60
 ```
 
+<<<<<<< HEAD
 With no file, `coppa rx` captures from the default input device. Use
 `coppa devices` to list each device and its host-specific ID, then pass
 `--device-id <id>` for exact input selection or `--device <name>` for a unique
@@ -92,16 +109,31 @@ IDs may change when the audio host reconfigures the device. Decoded frames
 print in the same format as a WAV decode. `--duration` stops after that
 many seconds; without it, `coppa rx` runs until Ctrl+C. `coppa listen` is a deprecated alias for `coppa rx` and will be removed in the
 next release.
+=======
+With no file, `coppa rx` captures from the default input device (`--device <name>` picks
+another by substring) and prints each frame as it decodes, in the same format as a WAV
+decode. `--duration` stops after that many seconds; without it, `coppa rx` runs until
+Ctrl+C. `coppa listen` is a deprecated alias for `coppa rx` and will be removed in the
+next release. It accepts `--json` too and prints its deprecation warning on
+stderr. Use `-q` to suppress status output, or `-v` for diagnostics. Repeat
+`-v` as `-vv` for recommended speed level and delay spread per decoded frame;
+quiet and verbose flags conflict.
+>>>>>>> 5525bb62613a9205daa10e963538bb720e800563
 
 ## Viewing Operating Profiles
 
 ```bash
-# List all profiles
-cargo run -p coppa-cli --bin coppa -- config
+# List all profiles, as text or one JSON array
+cargo run -p coppa-cli --bin coppa -- profiles
+cargo run -p coppa-cli --bin coppa -- profiles --json
 
-# Show details for a specific profile
-cargo run -p coppa-cli --bin coppa -- config -p HF_STANDARD
+# Show one profile, as text or one JSON object
+cargo run -p coppa-cli --bin coppa -- profiles -p HF_STANDARD
+cargo run -p coppa-cli --bin coppa -- profiles -p HF_STANDARD --json
 ```
+
+`config` remains available with its earlier text output. `profiles` reports
+the encoder's maximum bytes per frame for each named profile.
 
 ## Running the Daemon
 
