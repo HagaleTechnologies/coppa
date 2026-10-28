@@ -78,9 +78,8 @@ coppa -q rx cq.wav
 coppa -vv rx cq.wav
 ```
 
-<<<<<<< HEAD
 `coppa` can keep callsign, profile, audio device and rig settings in the same `coppad.toml` as the daemon, with `COPPA_*` environment and flag overrides; see [CLI settings](docs/tutorials/getting-started.md#persisting-your-cli-settings).
-=======
+
 `rx --json` writes newline-delimited objects with `payload_text` and exact
 `payload_hex` bytes. `payload_text` is `null` for binary payloads. Diagnostics
 go to stderr. `--json` conflicts with `--raw` and `--hex`; `-q`/`--quiet`
@@ -88,7 +87,6 @@ conflicts with `-v`/`--verbose`. `devices --json` and `profiles --json` write
 arrays; `profiles -p NAME --json` writes one object. The existing `config`
 command remains available for its original text output. `listen` is a
 deprecated alias for `rx` and accepts the same flags.
->>>>>>> 5525bb62613a9205daa10e963538bb720e800563
 
 ## KISS TNC (AFSK 1200)
 

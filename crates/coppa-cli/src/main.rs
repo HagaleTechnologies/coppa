@@ -4,14 +4,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use coppa_engine::config::EngineConfig;
 use coppa_engine::CoppaCore;
-<<<<<<< HEAD
 use std::path::PathBuf;
 mod settings;
-use settings::{CliEnv, Direction, Layers, RigSettings, SETTINGS_HELP};
-=======
 use serde::Serialize;
+use settings::{CliEnv, Direction, Layers, RigSettings, SETTINGS_HELP};
 use std::io::Write;
->>>>>>> 5525bb62613a9205daa10e963538bb720e800563
 
 /// Output verbosity level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,7 +387,7 @@ fn main() -> Result<()> {
             let profile = layers.profile(profile.as_deref())?;
             let callsign = layers.callsign(callsign.as_deref())?;
             let rig = layers.rig(&rig)?;
-            if verbosity == Verbosity::Verbose {
+            if verbosity.is_verbose() {
                 layers.print_verbose_source();
                 settings::print_setting("Callsign", &callsign);
                 settings::print_setting("Profile", &profile);
@@ -416,7 +413,7 @@ fn main() -> Result<()> {
         Some(Commands::Loopback { message, profile }) => {
             let layers = Layers::load(config_flag.as_deref(), env)?;
             let profile = layers.profile(profile.as_deref())?;
-            if verbosity == Verbosity::Verbose {
+            if verbosity.is_verbose() {
                 layers.print_verbose_source();
                 settings::print_setting("Profile", &profile);
             }
@@ -431,13 +428,12 @@ fn main() -> Result<()> {
             single,
             output,
             profile,
-<<<<<<< HEAD
             rig,
         }) => {
             let layers = Layers::load(config_flag.as_deref(), env)?;
             let profile = layers.profile(profile.as_deref())?;
             let rig = layers.rig(&rig)?;
-            if verbosity == Verbosity::Verbose {
+            if verbosity.is_verbose() {
                 layers.print_verbose_source();
                 settings::print_setting("Profile", &profile);
                 if output.is_none() {
@@ -453,32 +449,8 @@ fn main() -> Result<()> {
                 verbosity,
             )?;
         }
-        Some(Commands::Devices) => cmd_devices()?,
-=======
-            device,
-            ptt,
-            rigctld,
-            ptt_lead_ms,
-            ptt_tail_ms,
-            frequency_hz,
-            band,
-        }) => cmd_tune(
-            seconds,
-            single,
-            output.as_deref(),
-            profile.as_deref(),
-            device.as_deref(),
-            &ptt,
-            &rigctld,
-            ptt_lead_ms,
-            ptt_tail_ms,
-            frequency_hz,
-            band.as_deref(),
-            verbosity,
-        )?,
         Some(Commands::Devices { json }) => cmd_devices(json)?,
         Some(Commands::Profiles(args)) => cmd_profiles(args.profile.as_deref(), args.json)?,
->>>>>>> 5525bb62613a9205daa10e963538bb720e800563
         Some(Commands::Config { profile }) => cmd_config(profile.as_deref())?,
         #[cfg(feature = "kiss-tnc")]
         Some(Commands::Tnc {
@@ -507,7 +479,7 @@ fn resolve_rx_and_run(
     let profile = layers.profile(args.profile.as_deref())?;
     let callsign = layers.callsign(args.callsign.as_deref())?;
     let device = layers.device(args.device.as_deref(), Direction::Input)?;
-    if verbosity == Verbosity::Verbose {
+    if verbosity.is_verbose() {
         layers.print_verbose_source();
         settings::print_setting("Callsign", &callsign);
         settings::print_setting("Profile", &profile);
@@ -841,14 +813,7 @@ fn cmd_tx(
     let config = resolve_config(profile)?;
     let core = CoppaCore::with_config(config);
 
-<<<<<<< HEAD
-    if verbosity == Verbosity::Verbose {
-=======
     if verbosity.is_verbose() {
-        if let Some(cs) = callsign {
-            eprintln!("[verbose] Callsign: {}", cs);
-        }
->>>>>>> 5525bb62613a9205daa10e963538bb720e800563
         eprintln!(
             "[verbose] Config: sample_rate={}, speed_level={}",
             core.config().sample_rate,
@@ -1020,14 +985,7 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
     let mut core = CoppaCore::with_config(config);
     let output_mode = RxOutputMode::from(args);
 
-<<<<<<< HEAD
-    if verbosity == Verbosity::Verbose {
-=======
     if verbosity.is_verbose() {
-        if let Some(cs) = &args.callsign {
-            eprintln!("[verbose] Callsign: {}", cs);
-        }
->>>>>>> 5525bb62613a9205daa10e963538bb720e800563
         eprintln!("[verbose] sample_rate: {}", core.config().sample_rate);
     }
 
@@ -1615,20 +1573,8 @@ mod tests {
             "CQ CQ",
             Some(path_str),
             None,
-<<<<<<< HEAD
             &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
-            Verbosity::Verbose,
-=======
-            Some("VK2ABC"),
-            None,
-            "none",
-            "127.0.0.1:4532",
-            50,
-            200,
-            None,
-            None,
             Verbosity::Verbose(1),
->>>>>>> 5525bb62613a9205daa10e963538bb720e800563
         )
         .expect("tx with callsign should succeed");
         #[cfg(feature = "file-backend")]
