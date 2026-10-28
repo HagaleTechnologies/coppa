@@ -114,7 +114,11 @@ cargo run -p coppa-daemon --bin coppad
 cargo run -p coppa-daemon --bin coppad -- --config my_config.toml
 ```
 
-<<<<<<< HEAD
+For live audio (a radio, or Winlink with Pat), build `coppad` with `--release`
+and `--features cpal-backend`: a debug build decodes too slowly to keep up
+with real-time audio. [docs/PAT.md](../PAT.md) walks through a Winlink
+session with Pat.
+
 Without a config argument, `coppad` uses the first of these files that
 exists, and otherwise runs on built-in defaults:
 
@@ -133,19 +137,6 @@ name with `--config` (or with the older positional form,
 read: a missing or unreadable file is an error that names the path, not a
 silent fallback to defaults. A file the search finds that fails to parse is an
 error too, naming that file.
-=======
-For live audio (a radio, or Winlink with Pat), build `coppad` with `--release`
-and `--features cpal-backend`: a debug build decodes too slowly to keep up
-with real-time audio. [docs/PAT.md](../PAT.md) walks through a Winlink
-session with Pat.
-
-Without a config argument, `coppad` loads `./coppad.toml` if it exists and
-otherwise runs on built-in defaults. A path you name with `--config` (or with
-the older positional form, `coppad my_config.toml`, which still works) must
-exist: a missing or unreadable file is an error that names the path, not a
-silent fallback to defaults. An existing `./coppad.toml` that fails to parse
-is an error too.
->>>>>>> 8c14fb9136bef7271f81d8c94f5a9c317e0f5867
 
 To start from the built-in defaults, print them as TOML, edit the copy, and
 check it before running:
