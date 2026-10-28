@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::HostEvent;
-use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request};
+use tokio_tungstenite::tungstenite::handshake::server::{
+    Callback, ErrorResponse, Request, Response,
+};
 use tokio_tungstenite::tungstenite::http::{header, HeaderValue, StatusCode};
 
 /// JSON message from a WebSocket client.
@@ -249,7 +251,7 @@ fn opt_in_stream(json: &str) -> Option<OptInStream> {
 
 /// COP-53: who may complete a WebSocket handshake. Every handshake must
 /// present `token` (as `Authorization: Bearer <token>` or a `token` query
-/// parameter), and a handshake carrying an `Origin` header -- every browser
+/// parameter; every value presented must be the token), and a handshake carrying an `Origin` header -- every browser
 /// sends one -- must name one of `allowed_origins` exactly (ASCII case
 /// ignored). Checked during the HTTP upgrade, so a refused client never
 /// becomes a WebSocket. An empty token matches nothing.
@@ -338,7 +340,16 @@ fn authorize_handshake(auth: Option<&WsAuth>, request: &Request) -> Result<(), W
             return Err(WsRejection::OriginNotAllowed);
         }
     }
-    if presented_tokens(request).any(|t| token_eq(t, &auth.token)) {
+    // Every presented value must match, so one request is one guess: a
+    // request stuffed with many `token=` values cannot test them all at once.
+    let mut presented = false;
+    for value in presented_tokens(request) {
+        if !token_eq(value, &auth.token) {
+            return Err(WsRejection::TokenMissingOrInvalid);
+        }
+        presented = true;
+    }
+    if presented {
         Ok(())
     } else {
         Err(WsRejection::TokenMissingOrInvalid)
@@ -381,6 +392,26 @@ fn token_eq(presented: &str, expected: &str) -> bool {
         .zip(expected.bytes())
         .fold(0u8, |acc, (a, b)| acc | (a ^ b));
     std::hint::black_box(diff) == 0
+}
+
+/// COP-53: the tungstenite handshake callback. Runs [`authorize_handshake`]
+/// and, on refusal, records why (with the `Origin` for the log line) and
+/// answers with the rejection's status instead of `101`.
+struct HandshakeGate<'a> {
+    auth: Option<&'a WsAuth>,
+    rejection: &'a mut Option<(WsRejection, Option<String>)>,
+}
+
+impl Callback for HandshakeGate<'_> {
+    fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
+        match authorize_handshake(self.auth, request) {
+            Ok(()) => Ok(response),
+            Err(r) => {
+                *self.rejection = Some((r, origin_for_log(request)));
+                Err(r.error_response())
+            }
+        }
+    }
 }
 
 /// The `Origin` header value(s) for a rejection log line. Never reads the
@@ -506,7 +537,6 @@ impl WebSocketServer {
         use std::sync::Arc;
         use tokio::sync::Semaphore;
         use tokio_tungstenite::accept_hdr_async_with_config;
-        use tokio_tungstenite::tungstenite::handshake::server::Response;
         use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
         // Bound per-connection memory: cap WebSocket message/frame sizes.
@@ -542,17 +572,9 @@ impl WebSocketServer {
                 // COP-53: refuse the upgrade itself, so a rejected client never
                 // gets a client ID, a broadcast subscription or a parsed message.
                 let mut rejection: Option<(WsRejection, Option<String>)> = None;
-                // The large `Err` is tungstenite's `Callback` signature, not ours.
-                #[allow(clippy::result_large_err)]
-                let gate = |request: &Request, response: Response| match authorize_handshake(
-                    auth.as_deref(),
-                    request,
-                ) {
-                    Ok(()) => Ok(response),
-                    Err(r) => {
-                        rejection = Some((r, origin_for_log(request)));
-                        Err(r.error_response())
-                    }
+                let gate = HandshakeGate {
+                    auth: auth.as_deref(),
+                    rejection: &mut rejection,
                 };
                 let ws = match accept_hdr_async_with_config(stream, gate, Some(ws_config)).await {
                     Ok(ws) => ws,
@@ -871,6 +893,24 @@ mod tests {
         let second = format!("/?a=1&token={TOKEN}");
         assert_eq!(
             authorize_handshake(Some(&auth()), &request(&second, &[])),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn handshake_with_several_tokens_needs_every_one_to_match() {
+        let many = format!("/?token=guess-0000000000001&token={TOKEN}");
+        assert_eq!(
+            authorize_handshake(Some(&auth()), &request(&many, &[])),
+            Err(WsRejection::TokenMissingOrInvalid)
+        );
+        let bearer = bearer();
+        let both = format!("/?token={TOKEN}");
+        assert_eq!(
+            authorize_handshake(
+                Some(&auth()),
+                &request(&both, &[("Authorization", bearer.as_str())])
+            ),
             Ok(())
         );
     }
