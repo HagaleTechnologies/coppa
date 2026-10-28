@@ -64,6 +64,9 @@ coppa rx --duration 60
 # List audio devices (requires cpal-backend feature)
 coppa devices
 
+# Check audio devices and rigctld without transmitting (pass/fail table)
+coppa doctor
+
 # Show available operating profiles
 coppa config
 ```

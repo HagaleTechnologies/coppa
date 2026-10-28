@@ -110,7 +110,7 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 - cdylib + staticlib output; `build.rs` regenerates `coppa.h` with cbindgen
 
 #### CLI (`coppa-cli`)
-- Binary `coppa`. Subcommands: `tx`, `rx`, `loopback`, `tune`, `devices`, `config`, plus `tnc` when built with `kiss-tnc`. `listen` survives one release as a hidden, deprecated alias of `rx` (COP-56)
+- Binary `coppa`. Subcommands: `tx`, `rx`, `loopback`, `tune`, `devices`, `doctor`, `config`, plus `tnc` when built with `kiss-tnc`. `listen` survives one release as a hidden, deprecated alias of `rx` (COP-56)
 - WAV file I/O via `file-backend` (default); live audio capture and playback need `cpal-backend`
 
 #### Daemon (`coppad`, crate `coppa-daemon`)

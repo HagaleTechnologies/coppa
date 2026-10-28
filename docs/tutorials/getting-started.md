@@ -74,6 +74,37 @@ Requires the `cpal-backend` feature for real hardware access:
 cargo run -p coppa-cli --bin coppa --features cpal-backend -- devices
 ```
 
+## Checking Your Station (coppa doctor)
+
+Build with live audio support, then run the station check before transmitting:
+
+```bash
+cargo build --release -p coppa-cli --features cpal-backend
+./target/release/coppa doctor
+```
+
+The report lists each audio device and whether it advertises the 48 kHz mono
+floating-point format Coppa uses. The input and output device rows show which
+devices Coppa selected, or report a name that matches nothing. The `48 kHz mono`
+rows test-open those devices in Coppa's stream format and report whether the
+open worked. The rigctld rows show whether Coppa connected and whether the
+radio answered a frequency read.
+
+Use `--device NAME` to select both input and output by part of their names, or
+`--input-device NAME` and `--output-device NAME` to select each separately.
+Use `--rigctld HOST:PORT` if the server is elsewhere than `127.0.0.1:4532`.
+For a VOX or no-CAT station, pass `--no-rigctld` to skip both rig checks.
+The command exits with status 0 if no check failed, 1 if any check failed, and
+2 for invalid options. A skipped check is not a failure.
+
+Nothing is transmitted: the audio devices are opened and released without
+starting a stream, and rigctld receives only one `f` frequency query. PTT is
+never keyed.
+
+**What doctor does not check:** audio levels or ALC, whether audio reaches the
+radio, whether PTT actually keys, VOX/serial/GPIO PTT, or `coppad.toml`
+settings. Follow [the operating guide](../OPERATING.md) for those checks.
+
 ## Receiving Live Audio
 
 Requires the `cpal-backend` feature:

@@ -1,5 +1,7 @@
 //! Coppa CLI - command-line interface for the Coppa digital communications system.
 
+mod doctor;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use coppa_engine::config::EngineConfig;
@@ -173,6 +175,8 @@ enum Commands {
     },
     /// List available audio devices.
     Devices,
+    /// Check audio devices and rig control without transmitting.
+    Doctor(doctor::DoctorArgs),
     /// Show current configuration.
     Config {
         /// Profile name to show.
@@ -307,6 +311,7 @@ fn main() -> Result<()> {
             verbosity,
         )?,
         Some(Commands::Devices) => cmd_devices()?,
+        Some(Commands::Doctor(args)) => doctor::cmd_doctor(&args)?,
         Some(Commands::Config { profile }) => cmd_config(profile.as_deref())?,
         #[cfg(feature = "kiss-tnc")]
         Some(Commands::Tnc {

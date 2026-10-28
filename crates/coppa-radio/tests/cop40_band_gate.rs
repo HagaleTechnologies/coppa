@@ -58,6 +58,31 @@ fn poll_frequency_returns_some_on_a_clean_answer() {
 }
 
 #[test]
+fn query_frequency_returns_the_dial_frequency() {
+    let (addr, _) = fake_rigctld("144500000");
+    let mut client = RigctldClient::connect(&addr).unwrap();
+    assert_eq!(client.query_frequency().unwrap(), 144_500_000);
+}
+
+#[test]
+fn query_frequency_reports_a_non_numeric_answer_verbatim() {
+    let (addr, _) = fake_rigctld("RPRT -5");
+    let mut client = RigctldClient::connect(&addr).unwrap();
+    assert_eq!(
+        client.query_frequency().unwrap_err().to_string(),
+        r#"rigctld answered "RPRT -5" to `f`"#
+    );
+}
+
+#[test]
+fn query_frequency_reports_a_peer_that_closed() {
+    let addr = dead_rigctld();
+    let mut client = RigctldClient::connect(&addr).unwrap();
+    let error = client.query_frequency().unwrap_err().to_string();
+    assert!(!error.contains("answered"), "transport error: {error}");
+}
+
+#[test]
 fn poll_frequency_returns_none_when_the_peer_dies() {
     let addr = dead_rigctld();
     let mut client = RigctldClient::connect(&addr).unwrap();

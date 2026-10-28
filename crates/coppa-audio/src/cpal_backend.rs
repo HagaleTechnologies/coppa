@@ -2,14 +2,17 @@
 
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::StreamConfig;
+use cpal::{SampleFormat, StreamConfig};
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::playout::{fill_output, CallbackState, PlaybackProgress, ProgressShared};
 use crate::ringbuf::{audio_ring, AudioRingConsumer, AudioRingProducer};
-use crate::{AudioDevice, AudioSink, AudioSource};
+use crate::{
+    coppa_stream_support, AudioDevice, AudioSink, AudioSource, ConfigRange, DeviceProbe,
+    DeviceSupport, Direction, Support, COPPA_STREAM_CHANNELS,
+};
 
 /// A device's own name and cpal id as the host reports them, e.g.
 /// `Default Audio Device (alsa:default)`; either part is `unknown` when the
@@ -24,6 +27,148 @@ fn name_of(device: &cpal::Device) -> String {
         .map(|id| id.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
     format!("{name} ({id})")
+}
+
+fn coppa_stream_config(sample_rate: u32) -> StreamConfig {
+    StreamConfig {
+        channels: COPPA_STREAM_CHANNELS,
+        sample_rate,
+        buffer_size: cpal::BufferSize::Default,
+    }
+}
+
+fn config_range(range: &cpal::SupportedStreamConfigRange) -> ConfigRange {
+    ConfigRange {
+        channels: range.channels(),
+        min_sample_rate: range.min_sample_rate(),
+        max_sample_rate: range.max_sample_rate(),
+        sample_format: range.sample_format().to_string(),
+        is_f32: range.sample_format() == SampleFormat::F32,
+    }
+}
+
+fn direction_support(
+    device: &cpal::Device,
+    direction: Direction,
+    sample_rate: u32,
+) -> Option<Support> {
+    let ranges: Vec<_> = match direction {
+        Direction::Input => device
+            .supported_input_configs()
+            .ok()?
+            .map(|r| config_range(&r))
+            .collect(),
+        Direction::Output => device
+            .supported_output_configs()
+            .ok()?
+            .map(|r| config_range(&r))
+            .collect(),
+    };
+    if ranges.is_empty() {
+        None
+    } else {
+        Some(coppa_stream_support(&ranges, sample_rate))
+    }
+}
+
+pub fn list_cpal_device_support(sample_rate: u32) -> Result<Vec<DeviceSupport>> {
+    let host = cpal::default_host();
+    Ok(host
+        .devices()
+        .map_err(|e| anyhow!("Failed to list devices: {}", e))?
+        .map(|device| DeviceSupport {
+            name: device
+                .description()
+                .map(|d| d.name().to_string())
+                .unwrap_or_else(|_| "Unknown".into()),
+            id: device
+                .id()
+                .map(|id| id.to_string())
+                .unwrap_or_else(|_| "unknown".into()),
+            input: direction_support(&device, Direction::Input, sample_rate),
+            output: direction_support(&device, Direction::Output, sample_rate),
+        })
+        .collect::<Vec<_>>())
+}
+
+pub fn cpal_backend_name() -> &'static str {
+    cpal::default_host().id().name()
+}
+
+/// Build and immediately release a stream without starting capture or playback.
+pub fn probe_cpal_device(
+    direction: Direction,
+    name: Option<&str>,
+    sample_rate: u32,
+) -> DeviceProbe {
+    let host = cpal::default_host();
+    let requested = name.filter(|name| !name.is_empty());
+    let device = if let Some(name) = requested {
+        let selected = match direction {
+            Direction::Input => find_input_device_by_name(name),
+            Direction::Output => find_output_device_by_name(name),
+        };
+        match selected {
+            Some(device) => device,
+            None => {
+                let available = match direction {
+                    Direction::Input => host.input_devices(),
+                    Direction::Output => host.output_devices(),
+                };
+                let available = available
+                    .map(|devices| {
+                        devices
+                            .filter_map(|device| {
+                                device
+                                    .description()
+                                    .ok()
+                                    .map(|info| info.name().to_string())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                return DeviceProbe::NoMatch { available };
+            }
+        }
+    } else {
+        let selected = match direction {
+            Direction::Input => host.default_input_device(),
+            Direction::Output => host.default_output_device(),
+        };
+        match selected {
+            Some(device) => device,
+            None => return DeviceProbe::NoDefault,
+        }
+    };
+    let device_name = name_of(&device);
+    let config = coppa_stream_config(sample_rate);
+    let stream = match direction {
+        Direction::Input => device.build_input_stream(
+            config,
+            |_: &[f32], _: &cpal::InputCallbackInfo| {},
+            |error| tracing::debug!(error = %error, "doctor probe stream error"),
+            None,
+        ),
+        Direction::Output => device.build_output_stream(
+            config,
+            |data: &mut [f32], _: &cpal::OutputCallbackInfo| data.fill(0.0),
+            |error| tracing::debug!(error = %error, "doctor probe stream error"),
+            None,
+        ),
+    };
+    match stream {
+        Ok(stream) => {
+            drop(stream);
+            DeviceProbe::Opened {
+                device: device_name,
+            }
+        }
+        Err(error) => DeviceProbe::OpenFailed {
+            device: device_name,
+            error: error.to_string(),
+            advertised: direction_support(&device, direction, sample_rate),
+        },
+    }
 }
 
 /// List audio devices via CPAL.
@@ -161,11 +306,7 @@ impl CpalSource {
             .default_input_device()
             .ok_or_else(|| anyhow!("No input device available"))?;
 
-        let config = StreamConfig {
-            channels: 1,
-            sample_rate,
-            buffer_size: cpal::BufferSize::Default,
-        };
+        let config = coppa_stream_config(sample_rate);
 
         // Create a placeholder consumer; start() will replace it with a
         // properly wired ring buffer connected to the CPAL callback.
@@ -186,11 +327,7 @@ impl CpalSource {
         sample_rate: u32,
         _buffer_size: usize,
     ) -> Result<Self> {
-        let config = StreamConfig {
-            channels: 1,
-            sample_rate,
-            buffer_size: cpal::BufferSize::Default,
-        };
+        let config = coppa_stream_config(sample_rate);
 
         let (_producer, consumer) = audio_ring(64);
 
@@ -264,11 +401,7 @@ impl CpalSink {
             .default_output_device()
             .ok_or_else(|| anyhow!("No output device available"))?;
 
-        let config = StreamConfig {
-            channels: 1,
-            sample_rate,
-            buffer_size: cpal::BufferSize::Default,
-        };
+        let config = coppa_stream_config(sample_rate);
 
         // Placeholder producer; start() replaces with properly wired one.
         let (producer, _consumer) = audio_ring(64);
@@ -291,11 +424,7 @@ impl CpalSink {
         sample_rate: u32,
         _buffer_size: usize,
     ) -> Result<Self> {
-        let config = StreamConfig {
-            channels: 1,
-            sample_rate,
-            buffer_size: cpal::BufferSize::Default,
-        };
+        let config = coppa_stream_config(sample_rate);
 
         let (producer, _consumer) = audio_ring(64);
 
@@ -506,6 +635,66 @@ pub fn find_output_device_by_name(name: &str) -> Option<cpal::Device> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coppa_stream_config_is_mono_at_the_requested_rate() {
+        let config = coppa_stream_config(48_000);
+        assert_eq!(config.channels, crate::COPPA_STREAM_CHANNELS);
+        assert_eq!(config.sample_rate, 48_000);
+        assert_eq!(config.buffer_size, cpal::BufferSize::Default);
+    }
+
+    #[test]
+    fn cpal_ranges_convert_with_channels_rates_and_f32_flag() {
+        use cpal::{SampleFormat, SupportedBufferSize, SupportedStreamConfigRange};
+        for (format, label, is_f32) in [
+            (SampleFormat::F32, "f32", true),
+            (SampleFormat::I16, "i16", false),
+        ] {
+            let range = SupportedStreamConfigRange::new(
+                1,
+                8_000,
+                96_000,
+                SupportedBufferSize::Unknown,
+                format,
+            );
+            assert_eq!(
+                config_range(&range),
+                crate::ConfigRange {
+                    channels: 1,
+                    min_sample_rate: 8_000,
+                    max_sample_rate: 96_000,
+                    sample_format: label.into(),
+                    is_f32,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn probing_a_nonexistent_name_reports_no_match_in_both_directions() {
+        for direction in [crate::Direction::Input, crate::Direction::Output] {
+            assert!(matches!(
+                crate::probe_device(direction, Some("NONEXISTENT_DEVICE_XYZ_12345"), 48_000),
+                crate::DeviceProbe::NoMatch { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn device_support_names_match_list_devices() {
+        let support = crate::list_device_support(48_000).unwrap();
+        let devices = crate::list_devices().unwrap();
+        assert_eq!(
+            support.iter().map(|d| &d.name).collect::<Vec<_>>(),
+            devices.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_backend_is_named() {
+        assert!(crate::audio_backend_name().is_some());
+    }
 
     /// Before start / after stop there is no running stream: writes and
     /// progress both fail instead of feeding a disconnected ring.
