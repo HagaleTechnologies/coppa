@@ -2278,7 +2278,7 @@ impl EventLoop {
                         "Connect request refused: another session is active"
                     );
                     if let Some(ref tx) = self.response_tx {
-                        let _ = tx.try_send(coppa_host::HostResponse::StatusUpdate {
+                        let _ = tx.send(HostResponse::StatusUpdate {
                             client_id,
                             status: "DISCONNECTED".to_string(),
                         });
@@ -4462,7 +4462,6 @@ impl EventLoop {
         }
     }
 
-<<<<<<< HEAD
     /// Send a decoded payload to every data-port client (`client_id` 0) through
     /// `response_tx`. The queue is unbounded, so this never waits and never
     /// drops; with no queue wired (no VARA server) it does nothing. It fails
@@ -4478,18 +4477,6 @@ impl EventLoop {
         }
     }
 
-    fn handle_session_data(&mut self, pdu: MacPdu) {
-        let remote = pdu.src.clone();
-        if let Some(session) = self.session_mgr.find_by_remote_mut(&remote) {
-            if session.is_established() {
-                self.tx_frame_count = 0; // Our turn to transmit starts fresh
-                session.touch();
-                self.deliver_to_host(pdu.payload);
-            } else {
-                tracing::debug!(
-                    remote = %remote, state = ?session.state,
-                    "Data received but session not established"
-=======
     /// COP-38 (D8): a session data frame. Its `Reliable` segment goes
     /// through the link's `ArqRx`, which delivers each new segment to the
     /// host once and in order; every reliable frame, a duplicate included,
@@ -4529,17 +4516,15 @@ impl EventLoop {
                     remote = %remote,
                     "Session data frame is not a reliable transport PDU; \
                      is the peer running coppad older than 0.3.0? Dropping it"
->>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
                 );
             }
             return;
         };
-        for (_seq, data) in link.rx.receive(segment.seq_num, segment.payload) {
-            if let Some(ref tx) = self.response_tx {
-                let _ = tx.try_send(coppa_host::HostResponse::DataOut { client_id: 0, data });
-            }
-        }
+        let delivered = link.rx.receive(segment.seq_num, segment.payload);
         let ack = session_ack_frame(link);
+        for (_seq, data) in delivered {
+            self.deliver_to_host(data);
+        }
         match self.engine.encode_bytes(&ack) {
             Ok(samples) => Box::pin(self.transmit_samples(&samples)).await,
             Err(e) => tracing::warn!(error = %e, "Failed to encode session ACK"),
@@ -6380,68 +6365,6 @@ mod tests {
         (a, b, a_consumer, b_consumer)
     }
 
-<<<<<<< HEAD
-        // Patterned, reproducible payload (compressible enough to exercise
-        // the measurement path, not degenerate like a constant fill).
-        let pattern =
-            |size: usize| -> Vec<u8> { (0..size).map(|i| ((i * 31 + 7) % 251) as u8).collect() };
-        for size in [1000usize, 8000] {
-            let payload = pattern(size);
-            // Fresh response channel per transfer so the collected bytes are
-            // exactly this transfer's DataOut stream.
-            let (data_tx, mut data_rx) = mpsc::unbounded_channel();
-            b.set_response_tx(data_tx);
-            let frames_before = a.tx_frame_count;
-
-            a.handle_host_event(HostEvent::DataReceived {
-                client_id: 1,
-                data: payload.clone(),
-            })
-            .await;
-
-            // Drive one chunk per keyed interval: deliver whatever `a` has
-            // transmitted, then release PTT to start the next chunk. The
-            // first chunk transmits immediately from the `DataReceived`
-            // drain when the link is idle (and from the first release when
-            // the previous transfer's last frame is still keyed).
-            let mut collected: Vec<u8> = Vec::with_capacity(size);
-            loop {
-                let mut buf = vec![0.0f32; 4_000_000];
-                let read = a_consumer.read(&mut buf);
-                if read > 0 {
-                    unstick_decoder(&mut b);
-                    b.decode_and_dispatch_audio(&with_lead_and_trail(&buf[..read]))
-                        .await;
-                    while let Ok(resp) = data_rx.try_recv() {
-                        if let HostResponse::DataOut { data, .. } = resp {
-                            collected.extend_from_slice(&data);
-                        }
-                    }
-                }
-                if a.session_tx_queue.is_empty() && read == 0 {
-                    break;
-                }
-                if !a.session_tx_queue.is_empty() {
-                    a.handle_ptt_change(false).await;
-                }
-            }
-
-            assert_eq!(
-                collected, payload,
-                "{size}-byte session write must arrive as the same byte stream"
-            );
-            // Chunks are at most 102 host bytes at level 2 (budget 117 minus
-            // the 14-byte MAC header minus one), so this many bytes cannot
-            // fit in fewer frames.
-            let min_frames = size.div_ceil(103);
-            let frames = a.tx_frame_count - frames_before;
-            assert!(
-                frames >= min_frames,
-                "{size} bytes need >= {min_frames} frames (<= 102 host bytes \
-                 each), got {frames}"
-            );
-            assert!(a.session_tx_queue.is_empty());
-=======
     /// COP-38: give `station`'s session link a 20 ms initial RTO, so a test
     /// can elapse it with a real sleep (the `test_arq_retransmit_marks_
     /// retransmitted_and_caps` precedent). Only before anything is in flight.
@@ -6459,7 +6382,6 @@ mod tests {
         let mut peer = ArqRx::new(SESSION_ARQ_WINDOW);
         for seq in 0..link.tx.next_seq() {
             peer.receive(seq, Vec::new());
->>>>>>> f1dcac4a6ac6c049750cc3d7ff55ac6c22772691
         }
         let (ack_num, bitmap) = peer.ack_info();
         let pdu = MacPdu::new(
@@ -6483,7 +6405,7 @@ mod tests {
     }
 
     /// Every `DataOut` payload queued on `rx`, in order.
-    fn drain_data_out(rx: &mut mpsc::Receiver<coppa_host::HostResponse>) -> Vec<Vec<u8>> {
+    fn drain_data_out(rx: &mut mpsc::UnboundedReceiver<coppa_host::HostResponse>) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         while let Ok(resp) = rx.try_recv() {
             if let coppa_host::HostResponse::DataOut { data, .. } = resp {
@@ -6529,7 +6451,7 @@ mod tests {
     #[tokio::test]
     async fn connected_session_write_is_delivered_and_acked_with_arq_disabled() {
         let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
-        let (data_tx, mut data_rx) = mpsc::channel(64);
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
         b.set_response_tx(data_tx);
         let payload = b"twenty-eight bytes of B2F!!!".to_vec();
         assert_eq!(payload.len(), 28);
@@ -6560,7 +6482,7 @@ mod tests {
     #[tokio::test]
     async fn a_duplicate_session_frame_is_acked_but_delivered_once() {
         let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
-        let (data_tx, mut data_rx) = mpsc::channel(64);
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
         b.set_response_tx(data_tx);
         a.handle_host_event(HostEvent::DataReceived {
             client_id: 1,
@@ -6584,7 +6506,7 @@ mod tests {
     #[tokio::test]
     async fn a_non_reliable_session_payload_is_dropped_without_dataout_or_ack() {
         let (_a, mut b, _a_consumer, mut b_consumer) = connected_pair(0).await;
-        let (data_tx, mut data_rx) = mpsc::channel(64);
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
         b.set_response_tx(data_tx);
         let legacy = MacPdu::new_data(
             Callsign::new("W1AW").unwrap(),
@@ -6657,7 +6579,7 @@ mod tests {
     #[tokio::test]
     async fn lost_session_data_frame_is_retransmitted_and_delivered_once() {
         let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
-        let (data_tx, mut data_rx) = mpsc::channel(64);
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
         b.set_response_tx(data_tx);
         let mut status_rx = vara_lines(&mut a);
         fast_session_rto(&mut a);
@@ -6690,7 +6612,7 @@ mod tests {
     #[tokio::test]
     async fn lost_session_ack_is_recovered_without_a_duplicate_delivery() {
         let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
-        let (data_tx, mut data_rx) = mpsc::channel(64);
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
         b.set_response_tx(data_tx);
         fast_session_rto(&mut a);
         a.handle_host_event(HostEvent::DataReceived {
@@ -6781,7 +6703,7 @@ mod tests {
     #[tokio::test]
     async fn session_write_of_8000_bytes_is_chunked_acked_and_reassembled() {
         let (mut a, mut b, _a_consumer, _b_consumer) = connected_pair(0).await;
-        let (data_tx, mut data_rx) = mpsc::channel(4096);
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
         b.set_response_tx(data_tx);
         let payload: Vec<u8> = (0..8000).map(|i| ((i * 31 + 7) % 251) as u8).collect();
         let frames_before = a.tx_frame_count;
@@ -11823,7 +11745,7 @@ mod tests {
         #[tokio::test]
         async fn a_session_frame_addressed_to_another_station_changes_nothing() {
             let mut event_loop = EventLoop::new(session_config()).unwrap();
-            let (data_tx, mut data_rx) = mpsc::channel(64);
+            let (data_tx, mut data_rx) = mpsc::unbounded_channel();
             event_loop.set_response_tx(data_tx);
             let id = seed_established(&mut event_loop);
             event_loop
@@ -11938,7 +11860,7 @@ mod tests {
         async fn a_second_session_is_refused_while_one_is_active() {
             let mut station = EventLoop::new(session_config()).unwrap();
             station.listening = true;
-            let (resp_tx, mut resp_rx) = mpsc::channel(64);
+            let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
             station.set_response_tx(resp_tx);
             let id = seed_established(&mut station);
             station
@@ -15349,8 +15271,8 @@ mod tests {
             let (mut b_in, b_in_consumer) = coppa_audio::audio_ring(ring);
             a.set_audio_in(a_in_consumer);
             b.set_audio_in(b_in_consumer);
-            let (a_resp_tx, mut a_resp) = mpsc::channel(4096);
-            let (b_resp_tx, mut b_resp) = mpsc::channel(4096);
+            let (a_resp_tx, mut a_resp) = mpsc::unbounded_channel();
+            let (b_resp_tx, mut b_resp) = mpsc::unbounded_channel();
             a.set_response_tx(a_resp_tx);
             b.set_response_tx(b_resp_tx);
             let mut a_vara = super::vara_lines(&mut a);
@@ -15687,15 +15609,17 @@ mod tests {
             event_loop.set_response_tx(tx);
 
             // More payloads than the old 64-slot queue held, with nothing
-            // draining the queue meanwhile.
+            // draining the queue meanwhile. COP-38: each one is the next
+            // in-order reliable segment.
             let payloads = numbered(200);
-            for payload in &payloads {
+            for (seq, payload) in payloads.iter().enumerate() {
+                let segment = TransportPdu::new_reliable(0, seq as u8, 0, payload.clone());
                 event_loop
                     .handle_mac_pdu(MacPdu::new_data(
                         local.clone(),
                         remote.clone(),
                         0,
-                        payload.clone(),
+                        segment.to_bytes(),
                     ))
                     .await;
             }
