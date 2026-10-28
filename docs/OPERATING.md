@@ -357,10 +357,19 @@ station's host gets every byte once, in order.
   sends the next frame. On a clean HF link this carries about 60% of what an
   unacknowledged stream did; on a link that loses frames it is the only mode
   that delivers the data intact.
-- A frame that is still unacknowledged after 5 retransmissions ends the
-  session: coppad sends DISCONNECT to the other station, reports `BUFFER 0`
-  and then `DISCONNECTED`. On a link that has gone completely silent this
-  takes about 3 minutes.
+- A frame that is still unacknowledged after 5 retransmissions stops using
+  the normal budget but does not immediately end the session: coppad holds
+  the link, retransmitting at the most robust speed level the frame still
+  fits, for as long as the other station stays decodable (any decoded frame
+  from it, or even a frame whose header decodes while its payload does not,
+  counts as evidence and restarts the patience clock). Only after 180
+  seconds with no evidence at all does the session end: coppad sends
+  DISCONNECT to the other station, reports `BUFFER 0` and then
+  `DISCONNECTED`. On a link that has gone completely silent this takes
+  about 3 minutes for the budget plus up to 3 more for the hold; on a link
+  that is only faded, the session survives the fade instead of dropping.
+  A held session shows a `BUFFER` count that is not progressing, and a host
+  `DISCONNECT` still ends it immediately.
 - coppad holds one session at a time. While a session exists (connecting or
   connected), every `CONNECT_REQ`, including a repeat from the station already
   in the session, gets no answer, so that station's connect attempt times out.

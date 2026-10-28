@@ -656,6 +656,31 @@ impl ArqTx {
         self.rtt.rto()
     }
 
+    /// COP-68: the current `config.max_retransmit` budget. Read alongside
+    /// [`Self::set_max_retransmit`] by callers that need to observe the
+    /// adaptive budget (e.g. the daemon's fade-hold recovery asserting the
+    /// standard budget was restored).
+    pub fn max_retransmit(&self) -> u8 {
+        self.config.max_retransmit
+    }
+
+    /// COP-68: set `config.max_retransmit` on a live link.
+    ///
+    /// Takes effect immediately: [`Self::get_retransmits`] and
+    /// [`Self::is_failed`] read `config.max_retransmit` on every call, so a
+    /// segment that has already exhausted a lower budget becomes retryable
+    /// (and un-failed) the moment `n` rises past its `transmit_count`. This
+    /// is the hook the daemon's session fade-hold uses to keep retrying a
+    /// doomed segment while the peer stays decodable; raising it never
+    /// resurrects an evicted segment (only [`Self::process_ack`]/abandon/
+    /// [`Self::send`] touch slots). The CP-control pair never calls this:
+    /// its give-up triggers (COP-1 G1/G2/G4) are derived from the fixed
+    /// default budget, and `SWITCH_PROBATION_SECS` hard-codes that
+    /// derivation.
+    pub fn set_max_retransmit(&mut self, n: u8) {
+        self.config.max_retransmit = n;
+    }
+
     /// Number of segments currently in flight (sent but unacked).
     pub fn in_flight(&self) -> u8 {
         self.next_seq.wrapping_sub(self.send_base)
@@ -1615,5 +1640,51 @@ mod tests {
             !tx.is_failed(s0),
             "abandon must clear the failed state it resolves"
         );
+    }
+
+    /// COP-68: `set_max_retransmit` re-enables retries on a segment that has
+    /// already exhausted its budget, immediately (the fake-`Instant` pattern
+    /// of `test_fade_recovery_within_two_rtos` -- `now` is advanced by hand,
+    /// no sleeping).
+    #[test]
+    fn set_max_retransmit_re_enables_retries_on_a_failed_segment() {
+        let mut tx = ArqTx::new(ArqConfig::new(1, 2, Duration::from_millis(50)).unwrap());
+        let mut now = Instant::now();
+        let seq = tx.send(vec![0xA5], now).unwrap();
+
+        // Exhaust the 2-retransmit budget: original + 2 retries leaves
+        // transmit_count = 3 > 2.
+        for _ in 0..2 {
+            now += tx.rto() + Duration::from_millis(1);
+            assert_eq!(tx.get_retransmits(now), vec![seq]);
+            tx.mark_retransmitted(seq, now).unwrap();
+        }
+        assert!(
+            tx.is_failed(seq),
+            "the segment must be failed at count 3 > 2"
+        );
+        now += tx.rto() + Duration::from_millis(1);
+        assert!(
+            tx.get_retransmits(now).is_empty(),
+            "an exhausted segment must stop being retried"
+        );
+
+        // COP-68: raising the budget takes effect immediately -- `is_failed`
+        // clears and the segment is retried again on the existing schedule.
+        assert_eq!(tx.max_retransmit(), 2);
+        tx.set_max_retransmit(5);
+        assert_eq!(tx.max_retransmit(), 5);
+        assert!(
+            !tx.is_failed(seq),
+            "is_failed reads the config per call, so the raise must un-fail at once"
+        );
+        now += tx.rto() + Duration::from_millis(1);
+        assert_eq!(
+            tx.get_retransmits(now),
+            vec![seq],
+            "the raised budget must resume retries"
+        );
+        tx.mark_retransmitted(seq, now).unwrap();
+        assert_eq!(tx.transmit_count(seq), Some(4));
     }
 }
