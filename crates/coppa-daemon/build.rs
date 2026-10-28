@@ -3,8 +3,9 @@
 //!
 //! A `COPPA_GIT_SHA` of 7-40 hex digits in the build environment wins (source
 //! tarballs, distro packaging). Otherwise git answers, but only when it tracks
-//! this crate, so a copy vendored inside another repository never reports
-//! that repository's commit. With neither, the value is `unknown`.
+//! this crate at its own path in the coppa tree, so a copy vendored (even
+//! committed) inside another repository never reports that repository's
+//! commit. With neither, the value is `unknown`.
 
 use std::path::Path;
 use std::process::Command;
@@ -51,6 +52,10 @@ fn watch_head() {
 }
 
 fn from_git() -> Option<String> {
+    // Another repository holds a vendored copy at some other path.
+    if git(&["rev-parse", "--show-prefix"])? != "crates/coppa-daemon/" {
+        return None;
+    }
     git(&["ls-files", "--error-unmatch", "Cargo.toml"])?;
     watch_head();
     git(&["rev-parse", "--short=12", "HEAD"])

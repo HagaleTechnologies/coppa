@@ -29,11 +29,12 @@ impl fmt::Display for Listener {
     }
 }
 
-/// Whether any bound listener accepts connections from other hosts.
+/// Whether any bound listener accepts connections from other hosts. An
+/// IPv4-mapped loopback address (`::ffff:127.0.0.1`) counts as loopback.
 pub fn exposed<'a>(listeners: impl IntoIterator<Item = &'a Listener>) -> bool {
     listeners
         .into_iter()
-        .any(|l| matches!(l, Listener::Listening(addr) if !addr.ip().is_loopback()))
+        .any(|l| matches!(l, Listener::Listening(addr) if !addr.ip().to_canonical().is_loopback()))
 }
 
 /// The PTT backend actually in control after startup.
@@ -215,6 +216,7 @@ mod tests {
     #[test]
     fn only_a_bound_non_loopback_listener_is_exposed() {
         assert!(!exposed(&[addr("127.0.0.1:1"), addr("[::1]:2")]));
+        assert!(!exposed(&[addr("[::ffff:127.0.0.1]:3")]));
         assert!(!exposed(&[Listener::Disabled, Listener::NotBuilt]));
         assert!(exposed(&[addr("127.0.0.1:1"), addr("0.0.0.0:2")]));
         assert!(exposed(&[addr("192.168.1.5:8300")]));
