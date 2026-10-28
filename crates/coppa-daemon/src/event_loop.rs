@@ -107,16 +107,22 @@ const SESSION_FALLBACK_ATTEMPT_GRANT: u8 = 10;
 
 /// COP-68: fade-hold state, entered when the in-flight segment first
 /// exhausts the normal retransmit budget. The link is torn down only after
-/// `no_evidence` of zero peer decodability (see
-/// `SessionLink::last_peer_evidence`); while the peer stays decodable the
-/// budget is re-granted and the segment retransmits at `level` -- the most
-/// robust level whose payload budget fits the segment's encoded frame
-/// (`fittest_level`).
+/// `no_evidence` of zero peer decodability, measured from the LATER of
+/// `entered_at` and the last peer evidence (see
+/// `SessionLink::last_peer_evidence`): a fully faded link spends the whole
+/// normal budget (~135 s at the default RTO) with zero evidence, so a
+/// bound anchored on that stale evidence alone would expire before the
+/// first fallback retransmission is even due (~195 s). While the peer
+/// stays decodable the budget is re-granted and the segment retransmits
+/// at `level` -- the most robust level whose payload budget fits the
+/// segment's encoded frame (`fittest_level`).
 struct SessionFallback {
     level: u8,
     /// Test-shrinkable per-link copy of `SESSION_FALLBACK_NO_EVIDENCE`
     /// (mutated by tests the way `fast_session_rto` swaps the RTO).
     no_evidence: Duration,
+    /// When the hold was entered; the no-evidence bound's other anchor.
+    entered_at: Instant,
 }
 
 /// COP-68: the most robust level (lowest number) at or below `current`
@@ -1845,9 +1851,15 @@ impl EventLoop {
         // COP-68: the give-up bound is wall-clock peer decodability, not
         // "budget exhausted + one RTO" -- a link whose peer answered (or
         // whose header still decodes) at any point in the window stays
-        // held.
+        // held. The bound runs from the LATER of hold entry and the last
+        // peer evidence: a fully faded link reaches entry with its
+        // evidence long stale (the ~135 s normal-budget backoff already
+        // elapsed), and an evidence-only anchor would tear the link down
+        // before the first fallback retransmission (~195 s) -- defeating
+        // the hold's robust-level retry outright.
         if let Some(fallback) = link.fallback.as_ref() {
-            if link.tx.in_flight() > 0 && now >= link.last_peer_evidence + fallback.no_evidence {
+            let bound_start = fallback.entered_at.max(link.last_peer_evidence);
+            if link.tx.in_flight() > 0 && now >= bound_start + fallback.no_evidence {
                 let session_id = link.session_id;
                 self.fail_session_link(session_id).await;
                 return;
@@ -1884,7 +1896,7 @@ impl EventLoop {
                 .session_link
                 .as_ref()
                 .and_then(|l| l.tx.transmit_count(seq))
-                .map_or(0, |count| count + 1);
+                .map_or(0, |count| count.saturating_add(1));
             // COP-68: while the fade hold is active, the rebuilt
             // byte-identical frame is encoded at the fallback level -- the
             // most robust level whose payload budget fits it. The normal
@@ -1931,6 +1943,7 @@ impl EventLoop {
                     link.fallback = Some(SessionFallback {
                         level,
                         no_evidence: SESSION_FALLBACK_NO_EVIDENCE,
+                        entered_at: now,
                     });
                     tracing::info!(
                         seq,
@@ -7304,7 +7317,7 @@ mod tests {
     /// bounded after the refreshed bound with no further evidence.
     #[tokio::test]
     async fn header_only_decode_counts_as_evidence() {
-        let (mut a, mut b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        let (mut a, b, mut a_consumer, _b_consumer) = connected_pair(0).await;
         fast_session_rto(&mut a);
         a.handle_host_event(HostEvent::DataReceived {
             client_id: 1,
@@ -7378,6 +7391,111 @@ mod tests {
             a.session_link.is_none(),
             "teardown must follow the refreshed no-evidence bound"
         );
+    }
+
+    /// COP-68 (review round): the no-evidence bound runs from the LATER
+    /// of hold entry and the last peer evidence. A fully faded link spends
+    /// the whole normal budget (~135 s of backoff at the default RTO)
+    /// with zero peer evidence: anchored on that stale evidence alone, the
+    /// 180 s bound expired before the first fallback retransmission was
+    /// even due (~195 s), so the hold never actually held and no
+    /// robust-level frame ever went out.
+    #[tokio::test]
+    async fn fade_hold_no_evidence_bound_starts_at_hold_entry() {
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"full fade".to_vec(),
+        })
+        .await;
+        read_all(&mut a_consumer); // the data frame is lost
+        exhaust_into_fade_hold(&mut a, &mut a_consumer, 20).await;
+
+        // The fade began before the budget exhausted: the last evidence is
+        // older than hold entry by the whole exhaustion loop. Shrink the
+        // bound to less than the elapsed-since-evidence but more than the
+        // (near-zero) elapsed-since-entry: an evidence-anchored deadline is
+        // already in the past, an entry-anchored one is not.
+        let since_evidence = {
+            let link = a.session_link.as_ref().unwrap();
+            Instant::now().duration_since(link.last_peer_evidence)
+        };
+        assert!(
+            since_evidence > Duration::from_millis(300),
+            "test setup: the exhaustion loop must have outlasted the margin"
+        );
+        a.session_link
+            .as_mut()
+            .unwrap()
+            .fallback
+            .as_mut()
+            .unwrap()
+            .no_evidence = since_evidence - Duration::from_millis(300);
+        a.handle_ptt_change(false).await;
+        a.check_session_retransmits().await;
+        assert!(
+            a.session_link.is_some(),
+            "the no-evidence bound must run from hold entry, not from the \
+             stale pre-fade evidence -- otherwise a fully faded link dies \
+             before its first fallback retransmission"
+        );
+        read_all(&mut a_consumer);
+
+        // The bound still ends the hold once it actually elapses from
+        // entry.
+        for _ in 0..10 {
+            if a.session_link.is_none() {
+                break;
+            }
+            a.handle_ptt_change(false).await;
+            sleep_past_session_rto(&a);
+            a.check_session_retransmits().await;
+            read_all(&mut a_consumer);
+        }
+        assert!(
+            a.session_link.is_none(),
+            "teardown must follow the entry-anchored no-evidence bound"
+        );
+    }
+
+    /// COP-68 (review round): with `transmit_count` pinned at `u8::MAX` by
+    /// a long one-way hold (the adaptive grant keeps the segment retrying
+    /// and `mark_retransmitted` saturates), the daemon's next-attempt
+    /// logging calculation must saturate too -- an unsaturated `count + 1`
+    /// panicked in debug/overflow-checked builds and wrapped the `attempt`
+    /// field to 0 in release.
+    #[tokio::test]
+    async fn fade_hold_attempt_calculation_saturates_past_u8_max() {
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"saturated hold".to_vec(),
+        })
+        .await;
+        read_all(&mut a_consumer); // the data frame is lost
+        exhaust_into_fade_hold(&mut a, &mut a_consumer, 20).await;
+        let seq = a.session_link.as_ref().unwrap().tx.send_base();
+        {
+            let link = a.session_link.as_mut().unwrap();
+            link.tx.set_max_retransmit(u8::MAX);
+            while link.tx.transmit_count(seq) != Some(u8::MAX) {
+                link.tx
+                    .mark_retransmitted(seq, Instant::now())
+                    .expect("the in-flight segment stays pending");
+            }
+        }
+        a.handle_ptt_change(false).await;
+        sleep_past_session_rto(&a);
+        // Before the fix this pass panicked computing `attempt = 255 + 1`;
+        // after it the retransmission goes out and the hold continues.
+        a.check_session_retransmits().await;
+        assert!(
+            a.session_link.is_some(),
+            "the hold must survive a counter pinned at u8::MAX"
+        );
+        read_all(&mut a_consumer);
     }
 
     /// COP-38 (D9a): the 8000-byte write the old large-write test carried,
