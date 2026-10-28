@@ -4344,21 +4344,29 @@ impl EventLoop {
         // COP-44: a repeat CONNECT_REQ from a caller whose handshake is
         // still half-open (it did not hear our CONNECT_ACK) replaces that
         // session, so the caller gets a fresh ACK and the daemon keeps one
-        // session. The host was told PENDING once and is not told again.
-        let replaced: Vec<u8> = self
-            .accepting_sessions()
-            .into_iter()
-            .filter(|&id| {
-                self.session_mgr
-                    .get(id)
-                    .is_some_and(|s| s.remote == pdu.src)
-            })
-            .collect();
-        for &id in &replaced {
-            tracing::info!(remote = %pdu.src, session_id = id, "Repeat CONNECT_REQ; restarting the handshake");
-            self.session_mgr.remove(id);
-        }
-        let replaced = !replaced.is_empty();
+        // session. The host was told PENDING once and is not told again. The
+        // match is the one its CFM will use (`session_id_for_frame`), so a
+        // REQ on another SSID is still refused below. A repeat whose
+        // capabilities do not parse is ignored and the pending handshake
+        // stands.
+        let pending_id = self
+            .session_id_for_frame(&pdu)
+            .filter(|&id| self.is_accepting(id));
+        let replaced = match pending_id {
+            Some(_) if LinkCapabilities::from_bytes(&pdu.payload).is_err() => {
+                tracing::debug!(remote = %pdu.src, "Unreadable repeat CONNECT_REQ; ignoring");
+                return;
+            }
+            Some(id) => {
+                tracing::info!(
+                    remote = %pdu.src, session_id = id,
+                    "Repeat CONNECT_REQ; restarting the handshake"
+                );
+                self.session_mgr.remove(id);
+                true
+            }
+            None => false,
+        };
 
         // COP-38: one session at a time (`active_session_remote`). While a
         // session exists, a CONNECT_REQ, the current peer's included, gets
@@ -4368,10 +4376,6 @@ impl EventLoop {
                 remote = %pdu.src, active = %active,
                 "CONNECT_REQ refused: another session is active"
             );
-            if replaced {
-                self.notify_session(0, SessionNotice::PendingCancelled)
-                    .await;
-            }
             return;
         }
 
@@ -4414,10 +4418,6 @@ impl EventLoop {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to create session for incoming connect");
-                if replaced {
-                    self.notify_session(0, SessionNotice::PendingCancelled)
-                        .await;
-                }
             }
         }
     }
@@ -10766,6 +10766,57 @@ mod tests {
             );
             station.reap_timed_out_sessions().await;
             assert!(session_notices(&mut rx).is_empty());
+        }
+
+        /// A REQ from the pending caller that cannot restart its handshake
+        /// (unreadable capabilities, or another SSID) leaves the pending
+        /// handshake as it was: no line, and the original CFM still connects.
+        #[tokio::test]
+        async fn unmatched_repeat_connect_req_keeps_the_pending_handshake() {
+            let (mut station, mut rx) = listening_responder();
+            let mut remote = peer();
+            station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            assert_eq!(session_notices(&mut rx), [VaraResponse::Pending]);
+            let unreadable = MacPdu::new(
+                MacFrameType::ConnectReq,
+                Callsign::new("VK3ABC").unwrap(),
+                Callsign::new("W1AW").unwrap(),
+                0,
+                vec![0; 6],
+            );
+            let other_ssid = coppa_protocol::session::Session::new(
+                0,
+                Callsign::new("W1AW").unwrap(),
+                Callsign::new("VK3ABC").unwrap(),
+                3,
+                LinkCapabilities::default(),
+            )
+            .initiate()
+            .unwrap();
+            for (what, req) in [("unreadable", unreadable), ("SSID 3", other_ssid)] {
+                station.handle_mac_pdu(req).await;
+                assert!(session_notices(&mut rx).is_empty(), "{what}");
+                let ids = station.session_mgr.active_sessions();
+                assert_eq!(ids.len(), 1, "{what}: {ids:?}");
+                let session = station.session_mgr.get(ids[0]).unwrap();
+                assert_eq!(
+                    (session.state, session.ssid),
+                    (SessionState::Accepting, 0),
+                    "{what}"
+                );
+            }
+            let cfm = remote
+                .handle_connect_ack(&LinkCapabilities::default().to_bytes())
+                .unwrap();
+            station.handle_mac_pdu(cfm).await;
+            assert_eq!(
+                session_notices(&mut rx),
+                [VaraResponse::Connected(
+                    "W1AW".into(),
+                    "VK3ABC".into(),
+                    2400
+                )]
+            );
         }
 
         #[tokio::test]
