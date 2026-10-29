@@ -5,6 +5,11 @@
 - Rust 1.85.0 or later
 - ALSA development headers (Linux): `sudo apt-get install libasound2-dev`
 - udev development headers (Linux), only to build coppad with `--features serial-ptt`: `sudo apt-get install libudev-dev`
+- For radio control (PTT through `rigctld`):
+  `sudo apt-get install libhamlib-utils`. Coppad talks to `rigctld` at
+  `127.0.0.1:4532` by default and runs degraded (no PTT) when it cannot
+  reach it — see
+  [raspberry-pi-install.md](raspberry-pi-install.md) for a worked rigctld setup.
 - No additional dependencies on macOS or Windows
 
 ## Building
@@ -25,10 +30,13 @@ cargo test --workspace
 
 The simplest way to verify everything works is the loopback test, which encodes a message and immediately decodes it.
 
-**Note:** WAV file operations require the `file-backend` feature:
+The `file-backend` feature — WAV input and output — is on by default, so the file
+commands below work on a plain build. A build with `--no-default-features` prints
+`File output not available (compile with file-backend feature)` instead.
+`loopback` itself is pure in-memory encode/decode and touches no files.
 
 ```bash
-cargo run -p coppa-cli --bin coppa --features file-backend -- loopback "Hello from Coppa"
+cargo run -p coppa-cli --bin coppa -- loopback "Hello from Coppa"
 ```
 
 Expected output:
@@ -36,7 +44,7 @@ Expected output:
 Coppa Loopback Test
 ===================
 Input: "Hello from Coppa"
-Encoded: 46080 samples
+Encoded: 65520 samples
 Decoded: "Hello from Coppa"
 PASS: Loopback test successful!
 ```
@@ -44,19 +52,20 @@ PASS: Loopback test successful!
 ## Encoding to a WAV File
 
 ```bash
-cargo run -p coppa-cli --bin coppa --features file-backend -- tx "CQ CQ CQ DE VK2ABC K" -o cq.wav
+cargo run -p coppa-cli --bin coppa -- tx "CQ CQ CQ DE VK2ABC K" -o cq.wav
 ```
 
 Expected output:
 ```
 Encoding: "CQ CQ CQ DE VK2ABC K"
-Written 46080 samples to cq.wav
+Generated 65520 audio samples
+Written to cq.wav
 ```
 
 ## Decoding a WAV File
 
 ```bash
-cargo run -p coppa-cli --bin coppa --features file-backend -- rx -i cq.wav
+cargo run -p coppa-cli --bin coppa -- rx -i cq.wav
 ```
 
 Expected output:
@@ -89,7 +98,9 @@ cargo run -p coppa-cli --bin coppa --features cpal-backend -- devices --json
 ```
 
 `devices --json` writes a single array, including `[]` when no devices are
-listed.
+listed. Without the feature the commands still exit 0: `devices` prints the
+header with `  (none found - CPAL backend may not be available)` and
+`devices --json` prints `[]`.
 
 ## Receiving Live Audio
 
@@ -158,10 +169,13 @@ cargo run -p coppa-daemon --bin coppad
 cargo run -p coppa-daemon --bin coppad -- --config my_config.toml
 ```
 
-For live audio (a radio, or Winlink with Pat), build `coppad` with `--release`
-and `--features cpal-backend`: a debug build decodes too slowly to keep up
-with real-time audio. [docs/PAT.md](../PAT.md) walks through a Winlink
-session with Pat.
+Without the `cpal-backend` feature, `coppad` still starts and prints
+`Daemon ready`, but it logs a warning that it was built without the feature
+and `can neither receive nor transmit` — the feature, not the build profile,
+is what enables audio. For live audio (a radio, or Winlink with Pat), build with
+`--features cpal-backend`, and use `--release` too: a debug build decodes too
+slowly to keep up with real-time audio. [docs/PAT.md](../PAT.md) walks through a
+Winlink session with Pat.
 
 Without a config argument, `coppad` uses the first of these files that
 exists, and otherwise runs on built-in defaults:
@@ -191,9 +205,11 @@ cargo run -p coppa-daemon --bin coppad -- --config my_config.toml --check
 ```
 
 `--check` prints `Configuration syntax and field types OK.` only after it has
-read the file and parsed it into the daemon's configuration. That is all it
-proves: the TOML is well formed, every field has the right type, and there is
-no unknown or misspelled key or table (such as `calsign` for `callsign`); an
+read the file and parsed it into the daemon's configuration. It prints a second
+line, `Hardware and runtime settings were not checked.`, for the same reason.
+That is all it proves: the TOML is well formed, every field has the right type,
+and there is no unknown or misspelled key or table (such as `calsign` for
+`callsign`); an
 unknown key is an error that names it, in `--check` and when the daemon starts.
 It does not check that the PTT method or profile name is valid, that
 `buffer_size` is above 0, that the sample rate suits the profile, that the audio
@@ -209,7 +225,8 @@ build without `cpal-backend`), an audio device that will not open, a host port
 that is already taken, an unknown PTT method, `[host] websocket_enabled = true`
 in a build without the `websocket` feature, or a wideband profile with no
 frequency source stops the daemon: it logs the reason at `ERROR`, prints `Error: ...` on
-stderr and exits with status 1. An unreachable rigctld does not stop it. The
+stderr and exits with status 1. An unreachable rigctld does not stop it; see
+[raspberry-pi-install.md](raspberry-pi-install.md) for setup. The
 daemon keeps running without PTT, logs the failed connection at `ERROR`, and
 logs `Daemon running degraded` with the reason in place of `Daemon ready`. A
 PTT backend that refuses the startup release (for example a rigctld that
@@ -265,7 +282,10 @@ ptt_method = "none"
 # turnaround_ms = 500
 
 [host]
-vara_enabled = true
+# VARA-style TCP control interface. Off by default, matching the shipped
+# coppad.toml.example: these ports carry no authentication, so enable them
+# only on a trusted, firewalled network.
+vara_enabled = false
 vara_command_port = 8300
 vara_data_port = 8301
 # Off by default: data-port and WebSocket `send` bytes are transmitted only
@@ -334,6 +354,16 @@ It prints `Encoded 65520 samples`.
 ```bash
 c++ -x c++ -std=c++17 -Wall -Wextra -Icrates/coppa-ffi hello.c -Ltarget/release -lcoppa_ffi -o hello
 ```
+
+This example uses the FFI v1 batch API — `coppa_engine_create`, `coppa_encode`,
+`coppa_engine_destroy` — which is supported and not deprecated. FFI v2 adds
+`coppa_engine_new_with` (engine with an explicit `coppa_config_t`),
+`coppa_encode_bytes` (binary payloads), `coppa_engine_feed_samples` with
+`coppa_next_frame` (streaming decode) and `coppa_engine_set_speed_level`; the
+older v1 streaming quartet — `coppa_start_stream`, `coppa_feed_samples`,
+`coppa_get_decoded`, `coppa_stop_stream` — is deprecated since FFI v2. Note that
+`coppa_encode` and `coppa_decode` carry text only, and `coppa_decode` drops
+frames that are not valid UTF-8.
 
 ## Next Steps
 
