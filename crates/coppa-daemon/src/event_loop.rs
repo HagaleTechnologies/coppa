@@ -14426,7 +14426,8 @@ mod tests {
                     .busy_gate
                     .observe(&noise_block(0.01, &mut counter));
             }
-            for _ in 0..5 {
+            // COP-33: the gate reports busy only after its 250 ms hold.
+            for _ in 0..busy_burst_blocks(&event_loop.busy_gate) {
                 event_loop
                     .busy_gate
                     .observe(&noise_block(0.5, &mut counter));
@@ -14491,7 +14492,8 @@ mod tests {
                     .busy_gate
                     .observe(&noise_block(0.01, &mut counter));
             }
-            for _ in 0..5 {
+            // COP-33: the gate reports busy only after its 250 ms hold.
+            for _ in 0..busy_burst_blocks(&event_loop.busy_gate) {
                 event_loop
                     .busy_gate
                     .observe(&noise_block(0.5, &mut counter));
