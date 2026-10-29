@@ -229,9 +229,12 @@ struct PendingDisconnect {
 ///   outcome); fewer than two callsigns → `WRONG`.
 /// - `DISCONNECT` → `OK` (then `DISCONNECTED` if a session existed,
 ///   preceded by `CANCELPENDING` when it was a pending inbound one).
+/// - `ABORT` → `OK` (then `DISCONNECTED` at once if a session existed,
+///   preceded by `CANCELPENDING` when it was a pending inbound one; see
+///   `abort_session`).
 /// - `VERSION` → a `VERSION Coppa <pkg version>` line, never `OK`.
-/// - `COMPRESSION …`, `BW500`, `BW2300`, `BW2750`, `ABORT` → `OK`: accepted,
-///   not implemented (matches VARA's own replies to commands Pat sends every
+/// - `COMPRESSION …`, `BW500`, `BW2300`, `BW2750` → `OK`: accepted, not
+///   implemented (matches VARA's own replies to commands Pat sends every
 ///   session).
 /// - anything else (`PUBLIC`, `CWID`, `CHAT`, `WINLINK SESSION`,
 ///   `P2P SESSION`, `CLEANTXBUFFER`, `FOOBAR`, WebSocket JSON, …) → `WRONG`.
@@ -240,7 +243,7 @@ fn vara_reply(command: &VaraCommand) -> VaraResponse {
         VaraCommand::Version => VaraResponse::coppa_version(),
         VaraCommand::MyCall(call) if Callsign::new(call).is_ok() => VaraResponse::Ok,
         VaraCommand::MyCall(_) | VaraCommand::Unknown(_) => VaraResponse::Wrong,
-        // COMPRESSION, BW* and ABORT are accepted but not implemented.
+        // COMPRESSION and BW* are accepted but not implemented.
         VaraCommand::Listen(_)
         | VaraCommand::Tune(_)
         | VaraCommand::Connect { .. }
@@ -425,12 +428,20 @@ fn log_rx_level_transition(state: LevelState, reading: &LevelReading) {
     }
 }
 
+/// Capacity of the daemon's event channel, and the most events
+/// `wait_for_clear_channel` sets aside in `deferred_events` (COP-42).
+const EVENT_CHANNEL_CAPACITY: usize = 256;
+
 /// The main daemon event loop.
 pub struct EventLoop {
     config: DaemonConfig,
     engine: CoppaCore,
     event_rx: mpsc::Receiver<DaemonEvent>,
     event_tx: mpsc::Sender<DaemonEvent>,
+    /// COP-42: events `wait_for_clear_channel` took off `event_rx` while it
+    /// looked for an `ABORT`. `run` dispatches them, in arrival order,
+    /// before it reads `event_rx` again.
+    deferred_events: VecDeque<DaemonEvent>,
     running: bool,
     /// The audio-out ring and the TX samples retained ahead of it until it
     /// has room, shared with the feeder task `run` spawns so a frame larger
@@ -699,7 +710,7 @@ impl EventLoop {
     /// profile has no frequency source at or above 29.7 MHz -- see
     /// `check_frequency_gate_at_startup`.
     pub fn new(config: DaemonConfig) -> Result<Self> {
-        let (event_tx, event_rx) = mpsc::channel(256);
+        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let radio_frequency = config
             .radio
             .frequency_config()
@@ -823,6 +834,7 @@ impl EventLoop {
             engine,
             event_rx,
             event_tx,
+            deferred_events: VecDeque::new(),
             running: false,
             tx_output: Arc::new(std::sync::Mutex::new(TxOutput::default())),
             audio_in: None,
@@ -2070,6 +2082,70 @@ impl EventLoop {
             .await;
     }
 
+    /// The session a local `DISCONNECT` or `ABORT` ends: the first one not
+    /// `Idle` (connecting, established or disconnecting).
+    fn live_session_id(&self) -> Option<u8> {
+        self.session_mgr.active_sessions().into_iter().find(|&id| {
+            self.session_mgr
+                .get(id)
+                .is_some_and(|s| s.state != SessionState::Idle)
+        })
+    }
+
+    /// COP-42: `ABORT`, VARA's dirty disconnect ("Disconnect the link
+    /// immediately"), where `DISCONNECT` is the graceful one. Ends the live
+    /// session now: drops its link (backlog and un-acked frame, COP-38),
+    /// releases PTT if keyed (the frame
+    /// on the air is abandoned), removes the session and pushes
+    /// `DISCONNECTED`. Sends no DISCONNECT frame: keying one would wait out
+    /// the busy-channel courtesy gate. With no live session it does nothing
+    /// beyond the `OK` already sent.
+    ///
+    /// Traffic queued behind a cut frame (sessionless or ARQ frames) is not
+    /// the session's, and the cut frame's own `TxComplete` is now stale, so
+    /// nothing else would drain it. After `DISCONNECTED`, it resumes as in
+    /// `handle_tx_complete`'s cancel arm: once the output has dropped the cut
+    /// audio, so that audio's buffered tail cannot open the next frame.
+    async fn abort_session(&mut self, client_id: u32) {
+        let Some(id) = self.live_session_id() else {
+            tracing::debug!("ABORT but no active session");
+            return;
+        };
+        tracing::info!(session_id = id, "ABORT: ending the session now");
+        let was_pending = self.is_accepting(id);
+        // COP-43: ABORT also ends a DISCONNECT drain at once. Dropping its
+        // record means the drain never sends its DISCONNECT frame or a
+        // second `DISCONNECTED` later.
+        self.pending_disconnect.take_if(|p| p.session_id == id);
+        self.discard_session_tx(id).await;
+        let cut = if self.is_transmitting {
+            Some(self.force_release_ptt().await)
+        } else {
+            None
+        };
+        self.session_mgr.remove(id);
+        // COP-44: as for DISCONNECT, a pending inbound attempt's PENDING is
+        // closed first.
+        if was_pending {
+            self.notify_session(client_id, SessionNotice::PendingCancelled)
+                .await;
+        }
+        self.notify_session(client_id, SessionNotice::Disconnected)
+            .await;
+        if let Some(submitted) = cut {
+            if let Some(feedback) = self.output_feedback.clone() {
+                if !wait_for_discard(&feedback, submitted).await {
+                    tracing::warn!(
+                        "ABORT: cut TX audio not yet dropped by the output; \
+                         new audio stays held behind the drop"
+                    );
+                }
+            }
+            self.try_drain_tx_queue().await;
+            self.drain_session_link().await;
+        }
+    }
+
     /// COP-43: end a pending host `DISCONNECT` once its session's link has
     /// sent its whole backlog and the peer has ACKed every frame (COP-38),
     /// and nothing is keyed (`!is_transmitting`), so `BUFFER 0` comes before
@@ -2182,6 +2258,41 @@ impl EventLoop {
         self.shutdown_flag.clone()
     }
 
+    /// One `event_rx` event (`None`: every sender is gone, which ends the
+    /// loop like `Shutdown`).
+    async fn dispatch_event(&mut self, event: Option<DaemonEvent>) {
+        match event {
+            Some(DaemonEvent::Shutdown) | None => {
+                tracing::info!("Shutdown signal received");
+                if self.is_transmitting {
+                    tracing::info!("Releasing PTT before shutdown");
+                    self.force_release_ptt().await;
+                }
+                // E5: Signal audio threads to stop
+                self.shutdown_flag.store(true, Ordering::Release);
+                self.running = false;
+            }
+            Some(DaemonEvent::Host(host_event)) => {
+                self.handle_host_event(host_event).await;
+            }
+            Some(DaemonEvent::AudioIn(samples)) => {
+                self.handle_audio_in(&samples).await;
+            }
+            Some(DaemonEvent::AudioOut(samples)) => {
+                self.handle_audio_out(&samples);
+            }
+            Some(DaemonEvent::PttChange(tx)) => {
+                self.handle_ptt_change(tx).await;
+            }
+            Some(DaemonEvent::TxComplete {
+                generation,
+                completed,
+            }) => {
+                self.handle_tx_complete(generation, completed).await;
+            }
+        }
+    }
+
     /// Run the event loop until shutdown.
     ///
     /// Polls the event channel and optionally reads audio input samples
@@ -2230,35 +2341,14 @@ impl EventLoop {
             .map(|senders| spawn_vara_keepalive(senders, self.vara_keepalive_period));
 
         while self.running {
+            // COP-42: events a busy-channel wait set aside come first.
+            if let Some(event) = self.deferred_events.pop_front() {
+                self.dispatch_event(Some(event)).await;
+                continue;
+            }
             tokio::select! {
                 event = self.event_rx.recv() => {
-                    match event {
-                        Some(DaemonEvent::Shutdown) | None => {
-                            tracing::info!("Shutdown signal received");
-                            if self.is_transmitting {
-                                tracing::info!("Releasing PTT before shutdown");
-                                self.force_release_ptt().await;
-                            }
-                            // E5: Signal audio threads to stop
-                            self.shutdown_flag.store(true, Ordering::Release);
-                            self.running = false;
-                        }
-                        Some(DaemonEvent::Host(host_event)) => {
-                            self.handle_host_event(host_event).await;
-                        }
-                        Some(DaemonEvent::AudioIn(samples)) => {
-                            self.handle_audio_in(&samples).await;
-                        }
-                        Some(DaemonEvent::AudioOut(samples)) => {
-                            self.handle_audio_out(&samples);
-                        }
-                        Some(DaemonEvent::PttChange(tx)) => {
-                            self.handle_ptt_change(tx).await;
-                        }
-                        Some(DaemonEvent::TxComplete { generation, completed }) => {
-                            self.handle_tx_complete(generation, completed).await;
-                        }
-                    }
+                    self.dispatch_event(event).await;
                 }
                 _ = audio_poll.tick() => {
                     self.poll_audio_input().await;
@@ -2530,8 +2620,9 @@ impl EventLoop {
                             tracing::warn!(callsign = %call, error = %e, "MYCALL rejected")
                         }
                     },
-                    // VERSION is answered by the reply itself. COMPRESSION,
-                    // BW* and ABORT are accepted but not implemented.
+                    VaraCommand::Abort => self.abort_session(client_id).await,
+                    // VERSION is answered by the reply itself. COMPRESSION
+                    // and BW* are accepted but not implemented.
                     // CONNECT/DISCONNECT arrive as
                     // ConnectRequest/DisconnectRequest.
                     _ => {}
@@ -3371,11 +3462,14 @@ impl EventLoop {
     /// the output to drop what it has not played, then `set_ptt(false)`
     /// (hardware, `PTT OFF`, keyed-interval bookkeeping). Never drains the TX
     /// queue: `wait_for_clear_channel` calls this, and draining from there would
-    /// recurse into `transmit_samples`.
-    async fn force_release_ptt(&mut self) {
+    /// recurse into `transmit_samples`. Returns the cumulative submitted count
+    /// the output discards through, for a caller that drains afterwards
+    /// (`abort_session`) to `wait_for_discard` on first.
+    async fn force_release_ptt(&mut self) -> u64 {
         self.tx_generation += 1;
-        self.cancel_pending_tx_audio();
+        let (_, submitted) = self.cancel_pending_tx_audio();
         self.set_ptt(false).await;
+        submitted
     }
 
     /// COP-31: how long PTT has been keyed, if that is already past
@@ -3481,7 +3575,28 @@ impl EventLoop {
             return;
         }
         let allowed = if self.wideband_frequency_check().is_ok() {
-            self.wait_for_clear_channel().await;
+            if self.wait_for_clear_channel().await {
+                // COP-42: an ABORT reached us while this frame waited for a
+                // clear channel. It is dropped unsent; `run` then handles
+                // the ABORT, which ends the session this frame was most
+                // likely for. A sessionless ARQ frame is retransmitted as
+                // after any loss, and a due station ID stays due (its timer
+                // is only reset when an ID actually keys).
+                tracing::info!("ABORT during the busy-channel wait: dropping the waiting frame");
+                if !self.is_transmitting {
+                    self.tx_on_air_bytes = 0;
+                    self.report_buffer().await;
+                    // As for the wideband refusal below, nothing keyed, so no
+                    // release will resume the queues: let the 500 ms
+                    // `retry_held_tx_drain` poll do it.
+                    self.tx_held_by_frequency_gate = !self.tx_queue.is_empty();
+                    self.session_tx_held_by_frequency_gate = self
+                        .session_link
+                        .as_ref()
+                        .is_some_and(|l| !l.backlog.is_empty());
+                }
+                return;
+            }
             self.wait_for_rx_turnaround().await;
             // The rig can retune during the unbounded courtesy wait and
             // its backoff. Resolve fresh evidence before committing to TX.
@@ -3690,13 +3805,24 @@ impl EventLoop {
     /// thread/callback even while this task is blocked here) actually
     /// reaches the gate during the wait, instead of its state going stale for
     /// the whole hold.
-    async fn wait_for_clear_channel(&mut self) {
+    ///
+    /// COP-42: the same blocking means `run` reads no host event during the
+    /// wait, so an `ABORT` would wait behind it and the cancelled frame would
+    /// still key once the channel cleared. Each iteration therefore moves
+    /// whatever `event_rx` holds into `deferred_events` (dispatched by `run`
+    /// afterwards, in order) and returns `true` as soon as one of them is an
+    /// `ABORT` while a session is live; the caller then drops the waiting
+    /// frame. `false` means the channel is clear.
+    async fn wait_for_clear_channel(&mut self) -> bool {
         let hold_ms = self.config.station_id.busy_hold_ms;
         if hold_ms == 0 || !self.busy_gate.current() {
-            return;
+            return false;
         }
         loop {
             while self.busy_gate.current() {
+                if self.abort_waiting() {
+                    return true;
+                }
                 self.observe_busy_gate_from_audio_input().await;
                 tokio::time::sleep(Duration::from_millis(hold_ms)).await;
                 self.release_overdue_ptt_while_waiting().await;
@@ -3706,12 +3832,37 @@ impl EventLoop {
             tokio::time::sleep(Duration::from_secs_f32(holdoff_secs)).await;
             self.release_overdue_ptt_while_waiting().await;
             self.observe_busy_gate_from_audio_input().await; // pick up anything that arrived during the holdoff
+            if self.abort_waiting() {
+                return true;
+            }
 
             if !self.busy_gate.current() {
-                return;
+                return false;
             }
             // Busy again during the holdoff -- loop back and wait again.
         }
+    }
+
+    /// COP-42: move pending `event_rx` events into `deferred_events` (up to
+    /// the channel's own capacity, so a long wait still applies
+    /// back-pressure rather than buffering without bound) and say whether an
+    /// `ABORT` is among them while a session is live. With no live session
+    /// `ABORT` does nothing, so it does not cut the wait either.
+    fn abort_waiting(&mut self) -> bool {
+        while self.deferred_events.len() < EVENT_CHANNEL_CAPACITY {
+            match self.event_rx.try_recv() {
+                Ok(event) => self.deferred_events.push_back(event),
+                Err(_) => break,
+            }
+        }
+        self.live_session_id().is_some()
+            && self.deferred_events.iter().any(|event| {
+                matches!(
+                    event,
+                    DaemonEvent::Host(HostEvent::VaraCommand { command, .. })
+                        if matches!(VaraCommand::parse(command), VaraCommand::Abort)
+                )
+            })
     }
 
     /// COP-31: the PTT backstop inside `wait_for_clear_channel`, which can
@@ -11380,9 +11531,10 @@ mod tests {
             config
         }
 
-        /// Spin up a real `VaraServer` on the given (distinct per test, to avoid
-        /// cross-test port collisions) command/data ports, wire its response
-        /// senders into `event_loop` (mirroring `main.rs`'s
+        /// Spin up a real `VaraServer` on OS-assigned command/data ports
+        /// (`127.0.0.1:0`, so concurrent test runs in separate worktrees can
+        /// never cross-attach), wire its response senders into `event_loop`
+        /// (mirroring `main.rs`'s
         /// `set_vara_responses(vara_server.response_senders())`), start the
         /// server, connect a raw `TcpStream` "mock client" to the command port,
         /// and consume its initial `VERSION ...` greeting. Returns a line reader
@@ -11394,19 +11546,23 @@ mod tests {
         /// response arrives.
         async fn connect_mock_vara_client(
             event_loop: &mut EventLoop,
-            cmd_port: u16,
-            data_port: u16,
         ) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
-            let server = VaraServer::new(cmd_port, data_port);
+            let cmd_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind VARA command port");
+            let data_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind VARA data port");
+            let cmd_addr = cmd_listener.local_addr().expect("command listener address");
+            let server = VaraServer::new(cmd_addr.port(), 0);
             event_loop.set_vara_responses(server.response_senders());
 
             tokio::spawn(async move {
-                let _ = server.run().await;
+                let _ = server.run_with_listeners(cmd_listener, data_listener).await;
             });
-            // Give the server a moment to bind before connecting.
-            tokio::time::sleep(Duration::from_millis(50)).await;
 
-            let stream = TcpStream::connect(("127.0.0.1", cmd_port))
+            // Listeners are already bound, so the connect cannot race the bind.
+            let stream = TcpStream::connect(cmd_addr)
                 .await
                 .expect("mock client should connect to the VARA command port");
             let (read_half, write_half) = stream.into_split();
@@ -11601,7 +11757,7 @@ mod tests {
         #[tokio::test]
         async fn initiator_hears_connected_then_remote_disconnect() {
             let mut station = EventLoop::new(session_config()).unwrap();
-            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19440, 19441).await;
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station).await;
             station
                 .handle_host_event(HostEvent::ConnectRequest {
                     client_id: 1,
@@ -11632,7 +11788,7 @@ mod tests {
         async fn responder_hears_pending_then_connected() {
             let mut station = EventLoop::new(session_config()).unwrap();
             station.listening = true;
-            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19442, 19443).await;
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station).await;
             let mut remote = peer();
             station.handle_mac_pdu(remote.initiate().unwrap()).await;
             assert_eq!(next_session_line(&mut reader).await.trim_end(), "PENDING");
@@ -11660,7 +11816,7 @@ mod tests {
             // COP-40: a wideband station declares its band honestly.
             config.radio.band = Some("2m".into());
             let mut station = EventLoop::new(config).unwrap();
-            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19446, 19447).await;
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station).await;
             station
                 .handle_host_event(HostEvent::ConnectRequest {
                     client_id: 1,
@@ -11682,7 +11838,7 @@ mod tests {
         #[tokio::test]
         async fn local_disconnect_timeout_and_failed_connect_push_disconnected() {
             let mut station = EventLoop::new(session_config()).unwrap();
-            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19444, 19445).await;
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station).await;
             seed_established(&mut station);
             station
                 .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
@@ -11709,6 +11865,151 @@ mod tests {
                 next_session_line(&mut reader).await.trim_end(),
                 "DISCONNECTED"
             );
+        }
+
+        /// The trimmed lines a mock VARA client has received so far.
+        async fn trimmed_lines(reader: &mut BufReader<OwnedReadHalf>) -> Vec<String> {
+            read_available_lines(reader)
+                .await
+                .iter()
+                .map(|line| line.trim_end().to_string())
+                .collect()
+        }
+
+        /// COP-42: `ABORT` on an established session with one chunk on the
+        /// air and more queued drops the queued chunks, cuts the keyed frame
+        /// and ends the session, with `DISCONNECTED` last. Only the cut bumps
+        /// `tx_generation`: no DISCONNECT frame is keyed.
+        #[tokio::test]
+        async fn abort_ends_an_established_session_with_disconnected_last() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station).await;
+            let id = seed_established(&mut station);
+            station
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: (0..1000).map(|i| (i % 251) as u8).collect(),
+                })
+                .await;
+            assert!(station.is_transmitting, "the first chunk must be keyed");
+            assert!(
+                station
+                    .session_link
+                    .as_ref()
+                    .is_some_and(|l| !l.backlog.is_empty()),
+                "the rest of the write must be queued"
+            );
+            read_available_lines(&mut reader).await;
+            let generation = station.tx_generation;
+
+            station
+                .handle_host_event(HostEvent::VaraCommand {
+                    client_id: 1,
+                    command: "ABORT".into(),
+                })
+                .await;
+
+            let lines = trimmed_lines(&mut reader).await;
+            assert_eq!(lines.first().map(String::as_str), Some("OK"), "{lines:?}");
+            // COP-38: the keyed frame's bytes are the link's un-acked
+            // segment, so dropping the link reports `BUFFER 0` before the
+            // cut releases PTT.
+            assert!(
+                lines.ends_with(&["BUFFER 0".into(), "PTT OFF".into(), "DISCONNECTED".into()]),
+                "{lines:?}"
+            );
+            assert!(station.session_mgr.get(id).is_none());
+            assert!(station.session_link.is_none());
+            assert_eq!(station.buffered_tx_bytes(), 0);
+            assert!(!station.is_transmitting);
+            assert_eq!(station.tx_generation, generation + 1);
+        }
+
+        /// COP-42: `ABORT` while a `CONNECT` is pending (its CONNECT_REQ
+        /// keyed) cuts that frame and cancels the attempt at once: exactly
+        /// `OK`, `PTT OFF`, `DISCONNECTED`, and no new frame keyed.
+        #[tokio::test]
+        async fn abort_cuts_the_keyed_frame_and_pushes_disconnected_at_once() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station).await;
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "VK3ABC".into(),
+                    destination: "W1AW".into(),
+                })
+                .await;
+            assert!(station.is_transmitting, "the CONNECT_REQ must be keyed");
+            read_available_lines(&mut reader).await;
+            let generation = station.tx_generation;
+
+            station
+                .handle_host_event(HostEvent::VaraCommand {
+                    client_id: 1,
+                    command: "ABORT".into(),
+                })
+                .await;
+
+            assert_eq!(
+                trimmed_lines(&mut reader).await,
+                ["OK", "PTT OFF", "DISCONNECTED"]
+            );
+            assert!(station.session_mgr.active_sessions().is_empty());
+            assert!(!station.is_transmitting);
+            assert_eq!(station.tx_generation, generation + 1);
+        }
+
+        /// COP-42: with no session, `ABORT` is answered `OK` and nothing else.
+        #[tokio::test]
+        async fn abort_without_a_session_only_answers_ok() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station).await;
+            station
+                .handle_host_event(HostEvent::VaraCommand {
+                    client_id: 1,
+                    command: "ABORT".into(),
+                })
+                .await;
+            assert_eq!(trimmed_lines(&mut reader).await, ["OK"]);
+        }
+
+        /// COP-42: a frame queued behind the one `ABORT` cuts is not the
+        /// session's, and the cut frame's late `TxComplete` is stale, so the
+        /// abort itself resumes it -- after `DISCONNECTED`, never before.
+        #[tokio::test]
+        async fn abort_resumes_traffic_queued_behind_the_cut_frame() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station).await;
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "VK3ABC".into(),
+                    destination: "W1AW".into(),
+                })
+                .await;
+            assert!(station.is_transmitting, "the CONNECT_REQ must be keyed");
+            station.tx_queue.push_back((None, b"queued".to_vec()));
+            read_available_lines(&mut reader).await;
+            let generation = station.tx_generation;
+
+            station
+                .handle_host_event(HostEvent::VaraCommand {
+                    client_id: 1,
+                    command: "ABORT".into(),
+                })
+                .await;
+
+            // The cut still counts the queued frame (`BUFFER 6`); it keys
+            // only after the host has been told DISCONNECTED.
+            let lines = trimmed_lines(&mut reader).await;
+            assert_eq!(
+                lines,
+                ["OK", "PTT OFF", "BUFFER 6", "DISCONNECTED", "PTT ON"],
+                "{lines:?}"
+            );
+            assert!(station.tx_queue.is_empty());
+            assert!(station.is_transmitting);
+            assert_eq!(station.tx_generation, generation + 2);
         }
 
         // COP-44: inbound connect attempts. Each test drives one listening
@@ -12134,7 +12435,7 @@ mod tests {
             use coppa_host::websocket::FIRST_CLIENT_ID;
             let config = session_config();
             let mut station = EventLoop::new(config).unwrap();
-            let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19454, 19455).await;
+            let (mut reader, _writer) = connect_mock_vara_client(&mut station).await;
 
             station
                 .handle_host_event(HostEvent::VaraCommand {
@@ -12326,8 +12627,7 @@ mod tests {
         async fn test_snr_telemetry_emitted_on_decoded_frame() {
             let config = DaemonConfig::default();
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19400, 19401).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
 
             let core = coppa_engine::CoppaCore::new();
             let samples = core
@@ -12451,8 +12751,7 @@ mod tests {
             // Sessionless TX on: the simplest way to make host data key PTT.
             config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19410, 19411).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
             let tx = event_loop.event_sender();
 
             let local = tokio::task::LocalSet::new();
@@ -12525,8 +12824,7 @@ mod tests {
             let mut config = fast_ptt_config();
             config.engine.arq_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19414, 19415).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
 
             // Seed one ARQ segment "sent" long enough ago that its RTO has
             // already elapsed by the time `check_arq_retransmits` runs.
@@ -12586,8 +12884,7 @@ mod tests {
             let mut config = fast_ptt_config();
             config.engine.arq_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19418, 19419).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
 
             // Small max_retransmit(2) and a short initial_rto(20ms) so the
             // whole round trip (seed -> expire -> retransmit -> re-expire ->
@@ -12680,8 +12977,7 @@ mod tests {
         async fn test_session_keepalive_asserts_ptt() {
             let config = fast_ptt_config();
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19416, 19417).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
 
             let local_cs = Callsign::new("VK3ABC").unwrap();
             let remote_cs = Callsign::new("W1AW").unwrap();
@@ -12750,8 +13046,7 @@ mod tests {
             let mut event_loop = EventLoop::new(config).unwrap();
             let (audio_tx, mut audio_rx) = coppa_audio::audio_ring(10_000_000);
             event_loop.set_audio_out(audio_tx);
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19412, 19413).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
             let tx = event_loop.event_sender();
 
             let local = tokio::task::LocalSet::new();
@@ -12845,8 +13140,7 @@ mod tests {
             // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
             config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19490, 19491).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
 
             event_loop.is_transmitting = true;
             event_loop
@@ -12920,8 +13214,7 @@ mod tests {
             // COP-29: these exercise the sessionless raw/ARQ path, now opt-in.
             config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19492, 19493).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
 
             event_loop
                 .handle_host_event(HostEvent::DataReceived {
@@ -12990,8 +13283,7 @@ mod tests {
         #[tokio::test]
         async fn test_session_path_emits_buffer_and_drains_on_peer_ack() {
             let mut event_loop = EventLoop::new(session_config()).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19494, 19495).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
             seed_established(&mut event_loop);
 
             event_loop
@@ -13097,8 +13389,7 @@ mod tests {
         #[tokio::test]
         async fn session_buffer_falls_on_peer_ack_not_on_ptt_release() {
             let mut event_loop = EventLoop::new(session_config()).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19560, 19561).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
             seed_established(&mut event_loop);
             event_loop
                 .handle_host_event(HostEvent::DataReceived {
@@ -13531,8 +13822,7 @@ mod tests {
             // COP-29: these exercise the sessionless raw/ARQ path, now opt-in.
             config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19496, 19497).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
 
             event_loop.is_transmitting = true;
             for i in 0..9u8 {
@@ -13680,21 +13970,22 @@ mod tests {
         }
 
         /// A session's unsent data dies with the session (COP-41 review):
-        /// after a remote DISCONNECT or a timeout, the session link is gone
-        /// (COP-38: its backlog and its un-acked frame both), `BUFFER` stops
-        /// counting them, and neither the next PTT release nor an elapsed RTO
-        /// keys anything -- before this, the queue kept transmitting the dead
-        /// session's data on every release. A local DISCONNECT drains the
-        /// link first instead (COP-43, see
+        /// after an ABORT (COP-42), a remote DISCONNECT or a timeout, the
+        /// session link is gone (COP-38: its backlog and its un-acked frame
+        /// both), `BUFFER` stops counting them, and neither the next PTT
+        /// release nor an elapsed RTO keys anything -- before this, the queue
+        /// kept transmitting the dead session's data on every release. A
+        /// local DISCONNECT drains the link first instead (COP-43, see
         /// `local_disconnect_drains_queued_data_before_the_disconnect_frame`).
         #[tokio::test]
         async fn ended_session_discards_its_unsent_chunks() {
             #[derive(Debug, Clone, Copy)]
             enum End {
+                Abort,
                 RemoteDisconnect,
                 Timeout,
             }
-            for end in [End::RemoteDisconnect, End::Timeout] {
+            for end in [End::Abort, End::RemoteDisconnect, End::Timeout] {
                 let mut event_loop = EventLoop::new(session_config()).unwrap();
                 let (producer, mut consumer) = coppa_audio::audio_ring(4_000_000);
                 event_loop.set_audio_out(producer);
@@ -13713,6 +14004,14 @@ mod tests {
                 assert_eq!(event_loop.buffered_tx_bytes(), 1000, "{end:?}");
 
                 match end {
+                    End::Abort => {
+                        event_loop
+                            .handle_host_event(HostEvent::VaraCommand {
+                                client_id: 1,
+                                command: "ABORT".into(),
+                            })
+                            .await;
+                    }
                     End::RemoteDisconnect => {
                         let disc = MacPdu::new(
                             MacFrameType::Disconnect,
@@ -13926,6 +14225,53 @@ mod tests {
             assert!(
                 last_buffer_zero < disconnected[0],
                 "DISCONNECTED must follow BUFFER 0: {lines:?}"
+            );
+        }
+
+        /// COP-42 x COP-43: an ABORT during a DISCONNECT drain ends it at
+        /// once. The drain's record goes with the session, so no DISCONNECT
+        /// frame keys afterwards and the host hears exactly one
+        /// `DISCONNECTED`, not a second one when the drain would have ended.
+        #[tokio::test]
+        async fn abort_during_a_disconnect_drain_ends_it_once_without_its_frame() {
+            let (mut station, mut consumer, mut reader, _writer, id) = draining_station().await;
+            station
+                .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+                .await;
+            assert!(station.pending_disconnect.is_some());
+            station
+                .handle_host_event(HostEvent::VaraCommand {
+                    client_id: 1,
+                    command: "ABORT".into(),
+                })
+                .await;
+            assert!(station.session_mgr.get(id).is_none());
+            assert!(
+                station.pending_disconnect.is_none(),
+                "ABORT must drop the drain"
+            );
+            assert!(station.session_link.is_none());
+            assert_eq!(station.buffered_tx_bytes(), 0);
+
+            // Whatever was on the air is cut; afterwards nothing more keys.
+            let mut buf = vec![0.0f32; 4_000_000];
+            station.flush_pending_audio_out();
+            while consumer.read(&mut buf) > 0 {}
+            station.handle_ptt_change(false).await;
+            station.flush_pending_audio_out();
+            let n = consumer.read(&mut buf);
+            assert!(
+                !decoded_frame_types(&buf[..n]).contains(&MacFrameType::Disconnect),
+                "ABORT sends no DISCONNECT frame"
+            );
+            let lines = read_available_lines(&mut reader).await;
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.trim_end() == "DISCONNECTED")
+                    .count(),
+                1,
+                "{lines:?}"
             );
         }
 
@@ -14298,8 +14644,7 @@ mod tests {
             // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
             config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19500, 19501).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
 
             let mut seed: u32 = 0xB2_F2_00_2D;
             let data: Vec<u8> = (0..2000)
@@ -14443,8 +14788,7 @@ mod tests {
             // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
             config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19502, 19503).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
             event_loop.is_transmitting = true;
 
             let data: Vec<u8> = (0..8000).map(|i| ((i * 31 + 7) % 251) as u8).collect();
@@ -14546,8 +14890,7 @@ mod tests {
             // COP-29: this exercises the sessionless raw/ARQ path, now opt-in.
             config.host.sessionless_tx_enabled = true;
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19504, 19505).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
             let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
             event_loop.set_audio_out(producer);
 
@@ -14593,8 +14936,7 @@ mod tests {
         async fn test_busy_telemetry_on_then_off_from_noise_burst() {
             let config = DaemonConfig::default();
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, _write_half) =
-                connect_mock_vara_client(&mut event_loop, 19430, 19431).await;
+            let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
 
             // Deterministic PRNG (no external `rand` dependency needed here).
             let mut seed: u32 = 12345;
@@ -14741,6 +15083,129 @@ mod tests {
             assert!(
                 available >= payload.len(),
                 "the deferred transmission should still have gone out eventually"
+            );
+        }
+
+        /// COP-42 review (Codex P1 on #160): an `ABORT` sent while a frame
+        /// waits for a clear channel cuts the wait. The waiting frame never
+        /// keys, the ABORT is set aside for `run` in arrival order (behind the
+        /// event that came before it), and dispatching it ends the session at
+        /// once. Before the fix the wait read no host event, so the ABORT sat
+        /// behind it for as long as the channel stayed busy and the cancelled
+        /// frame keyed first.
+        #[tokio::test(start_paused = true)]
+        async fn abort_cuts_a_busy_channel_wait_and_the_waiting_frame_never_keys() {
+            let mut config = config_with_callsign();
+            config.station_id.busy_hold_ms = 10;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            mark_identified(&mut event_loop);
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+            // Nothing feeds the input ring, so without the ABORT this wait
+            // would never end.
+            let (_audio_in_tx, audio_in_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_in(audio_in_rx);
+            let mut counter = 7u32;
+            for _ in 0..10 {
+                event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.01, &mut counter));
+            }
+            // COP-33: the gate reports busy only after its 250 ms hold.
+            for _ in 0..busy_burst_blocks(&event_loop.busy_gate) {
+                event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.5, &mut counter));
+            }
+            assert!(event_loop.busy_gate.current());
+            let id = super::telemetry::seed_established(&mut event_loop);
+
+            let tx = event_loop.event_tx.clone();
+            tx.send(DaemonEvent::Host(HostEvent::Connected { client_id: 1 }))
+                .await
+                .unwrap();
+            tx.send(DaemonEvent::Host(HostEvent::VaraCommand {
+                client_id: 1,
+                command: "ABORT".to_string(),
+            }))
+            .await
+            .unwrap();
+
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                event_loop.transmit_samples(&[0.25f32; 500]),
+            )
+            .await
+            .expect("an ABORT must cut the busy-channel wait");
+            assert_eq!(
+                audio_out_rx.available(),
+                0,
+                "the waiting frame must not key"
+            );
+            assert!(!event_loop.is_transmitting);
+            assert!(matches!(
+                event_loop.deferred_events.front(),
+                Some(DaemonEvent::Host(HostEvent::Connected { client_id: 1 }))
+            ));
+            assert_eq!(event_loop.deferred_events.len(), 2);
+
+            while let Some(event) = event_loop.deferred_events.pop_front() {
+                event_loop.dispatch_event(Some(event)).await;
+            }
+            assert!(
+                event_loop.session_mgr.get(id).is_none(),
+                "the deferred ABORT must end the session"
+            );
+        }
+
+        /// COP-42: with no live session `ABORT` does nothing, so it does not
+        /// cut a busy-channel wait either; the frame still goes out once the
+        /// channel clears.
+        #[tokio::test(start_paused = true)]
+        async fn abort_without_a_session_leaves_a_busy_channel_wait_alone() {
+            let mut config = config_with_callsign();
+            config.station_id.busy_hold_ms = 10;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            mark_identified(&mut event_loop);
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+            let (mut audio_in_tx, audio_in_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_in(audio_in_rx);
+            let mut counter = 11u32;
+            for _ in 0..10 {
+                event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.01, &mut counter));
+            }
+            // COP-33: the gate reports busy only after its 250 ms hold.
+            for _ in 0..busy_burst_blocks(&event_loop.busy_gate) {
+                event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.5, &mut counter));
+            }
+            assert!(event_loop.busy_gate.current());
+            for _ in 0..15 {
+                audio_in_tx.write(&noise_block(0.01, &mut counter));
+            }
+            event_loop
+                .event_tx
+                .send(DaemonEvent::Host(HostEvent::VaraCommand {
+                    client_id: 1,
+                    command: "ABORT".to_string(),
+                }))
+                .await
+                .unwrap();
+
+            let payload = vec![0.25f32; 500];
+            event_loop.transmit_samples(&payload).await;
+            assert!(
+                audio_out_rx.available() >= payload.len(),
+                "the frame must still go out once the channel clears"
+            );
+            assert_eq!(
+                event_loop.deferred_events.len(),
+                1,
+                "the ABORT is still set aside for `run`"
             );
         }
 

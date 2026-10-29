@@ -530,7 +530,8 @@ nothing queued or un-acked, `DISCONNECTED` follows at once, as before.
 - Data the peer sends while the drain runs is still ACKed and delivered to
   the host, so two stations that both sent `DISCONNECT` with data queued
   drain each other's queues instead of retrying until the budget runs out.
-- `ABORT` does not yet tear the link down (COP-42).
+- `ABORT` during the drain ends it at once (COP-42): the rest is dropped,
+  no DISCONNECT frame is sent, and the host gets one `DISCONNECTED`.
 - A remote DISCONNECT or a session timeout still drops unsent data at once.
 
 ## BUSY lines on the command port
