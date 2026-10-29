@@ -206,8 +206,10 @@ impl CoppaCore {
         ))
     }
 
-    /// Active carriers times carrier spacing, rounded to whole Hz.
-    fn profile_occupied_hz(profile: &CoppaProfile) -> u32 {
+    /// Occupied bandwidth of `profile` in Hz: active carriers times carrier
+    /// spacing, rounded to whole Hz. Shared by `occupied_bandwidth_hz`,
+    /// `occupied_bandwidth_hz_at` and `crate::ladder`.
+    pub(crate) fn profile_occupied_hz(profile: &CoppaProfile) -> u32 {
         (profile.total_active_carriers() as f32 * profile.carrier_spacing_hz()).round() as u32
     }
 

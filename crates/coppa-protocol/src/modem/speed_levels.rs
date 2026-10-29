@@ -87,6 +87,44 @@ pub fn max_payload_for_level(wire_level: u8) -> Option<usize> {
     k_used_for_level(wire_level).map(|k_used| k_used / 8 - PAYLOAD_CRC_LEN)
 }
 
+/// Nominal LDPC code rate of a wire-encoded speed level, as `(numerator,
+/// denominator)` in lowest terms: `k_used_for_level(level) / CODED_BLOCK_LEN`
+/// (1944). Returns `None` for an invalid level.
+///
+/// This is the rate the encoder actually runs. Read it here rather than from
+/// `speed_level_components`'s `CodeRate` or `SPEED_LEVELS[8].ldpc_rate_num/den`
+/// (`coppa_codec::ofdm::coppa_modem`): both still say 7/8 for level 9, which
+/// `k_used` moved to 5/6 (see `docs/SPEC.md` §12). `coppa profiles` shows this
+/// value.
+pub fn code_rate_for_level(wire_level: u8) -> Option<(u16, u16)> {
+    use crate::modem::transceiver::CODED_BLOCK_LEN;
+    fn gcd(a: usize, b: usize) -> usize {
+        if b == 0 {
+            a
+        } else {
+            gcd(b, a % b)
+        }
+    }
+    let k_used = k_used_for_level(wire_level)?;
+    let d = gcd(k_used, CODED_BLOCK_LEN);
+    Some(((k_used / d) as u16, (CODED_BLOCK_LEN / d) as u16))
+}
+
+/// User-facing modulation name of a wire-encoded speed level ("BPSK", "QPSK",
+/// "8PSK", "16-QAM" or "64-QAM"), derived from the constellation mapper
+/// `speed_level_components` returns. Returns `None` for an invalid level.
+pub fn modulation_name_for_level(wire_level: u8) -> Option<&'static str> {
+    let (mapper, _) = speed_level_components(wire_level).ok()?;
+    match mapper.bits_per_symbol() {
+        1 => Some("BPSK"),
+        2 => Some("QPSK"),
+        3 => Some("8PSK"),
+        4 => Some("16-QAM"),
+        6 => Some("64-QAM"),
+        _ => None,
+    }
+}
+
 /// Maximum TOTAL application-payload size (bytes) a multi-codeword frame
 /// (Phase 3 Task 5) will accept for a given wire-encoded speed level and
 /// codeword count: `codewords` independent LDPC codewords, each with its own
@@ -256,6 +294,62 @@ mod tests {
                 rate, expected_rate,
                 "Level {} should have rate {:?}",
                 wire_level, expected_rate
+            );
+        }
+    }
+
+    #[test]
+    fn code_rate_is_k_used_over_1944_in_lowest_terms() {
+        let expected = [
+            (1, (1, 4)),
+            (2, (1, 2)),
+            (3, (1, 2)),
+            (4, (3, 4)),
+            (5, (2, 3)),
+            (6, (1, 2)),
+            (7, (3, 4)),
+            (8, (2, 3)),
+            (9, (5, 6)),
+        ];
+        for (level, rate) in expected {
+            assert_eq!(code_rate_for_level(level), Some(rate), "level {level}");
+        }
+        // Not the stale CodeRate::Rate7_8 label level 9 still carries.
+        assert_ne!(code_rate_for_level(9), Some((7, 8)));
+    }
+
+    #[test]
+    fn code_rate_and_modulation_are_none_outside_1_to_9() {
+        for level in [0, 10] {
+            assert_eq!(code_rate_for_level(level), None, "level {level}");
+            assert_eq!(modulation_name_for_level(level), None, "level {level}");
+        }
+    }
+
+    #[test]
+    fn modulation_names_match_spec_section_6() {
+        let expected = [
+            "BPSK", "BPSK", "QPSK", "QPSK", "8PSK", "16-QAM", "16-QAM", "64-QAM", "64-QAM",
+        ];
+        for (i, name) in expected.iter().enumerate() {
+            let level = i as u8 + 1;
+            assert_eq!(
+                modulation_name_for_level(level),
+                Some(*name),
+                "level {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn modulation_mapper_agrees_with_speed_levels_table() {
+        for entry in SPEED_LEVELS.iter() {
+            let (mapper, _) = speed_level_components(entry.level).unwrap();
+            assert_eq!(
+                mapper.bits_per_symbol(),
+                entry.bits_per_symbol as usize,
+                "level {}",
+                entry.level
             );
         }
     }

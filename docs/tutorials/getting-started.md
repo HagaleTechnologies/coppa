@@ -122,20 +122,25 @@ A copied `coppad.toml.example` sets `profile = "HF_STANDARD"`. That changes the
 CLI's waveform from its built-in no-file default. Set the same profile on the
 peer, including when decoding a WAV file, or the payload may not decode.
 
-## Viewing Operating Profiles
+## Viewing Speed Levels and Profiles
 
 ```bash
-# List all profiles, as text or one JSON array
+# List every speed level and named profile
 cargo run -p coppa-cli --bin coppa -- profiles
-cargo run -p coppa-cli --bin coppa -- profiles --json
+
+# Show one speed level, as text or one JSON object
+cargo run -p coppa-cli --bin coppa -- profiles --level 4
+cargo run -p coppa-cli --bin coppa -- profiles --level 4 --json
 
 # Show one profile, as text or one JSON object
 cargo run -p coppa-cli --bin coppa -- profiles -p HF_STANDARD
 cargo run -p coppa-cli --bin coppa -- profiles -p HF_STANDARD --json
+
+# Every named profile as one JSON array
+cargo run -p coppa-cli --bin coppa -- profiles --json
 ```
 
-`config` remains available with its earlier text output. `profiles` reports
-the encoder's maximum bytes per frame for each named profile.
+`coppa config` is a deprecated alias for `coppa profiles` and will be removed in the next release.
 
 ## Running the Daemon
 

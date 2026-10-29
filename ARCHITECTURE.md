@@ -96,7 +96,8 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 #### Engine (`coppa-engine`)
 - `CoppaCore`: a thin wrapper around `CoppaTransceiver` that adds optional compression and squelch gating. Entry points: `encode_bytes`, `encode_bytes_at_level`, `decode_bytes`, `push_samples` (streaming), `set_speed_level`, `set_cp_profile`, `tune_tone`, plus the text wrappers `encode`/`decode`
 - `EngineConfig` with `OfdmBand` (`LevelDerived`, `Hf`, `Vhf`), which pins the OFDM band across speed-level changes
-- Named operating profiles: `HF_ROBUST` (level 1), `HF_STANDARD` (level 2, the daemon default), `EMERGENCY` (level 1), all HF; `VHF_FAST` (level 8, VHF)
+- Named operating profiles: `HF_ROBUST` (level 1), `HF_STANDARD` (level 2, the daemon default), `EMERGENCY` (level 1, same on the air as `HF_ROBUST`), all HF; `VHF_FAST` (level 8, VHF)
+- `coppa_engine::ladder` assembles each speed level's modulation, code rate, max bytes, air time and bandwidth from the code the encoder runs, for `coppa profiles`
 
 #### Host Interfaces (`coppa-host`)
 - **VARA-style TCP** (`vara-tcp`, default): command port 8300 and data port 8301, a VARA-inspired command set. The modem is not RF/waveform-compatible with VARA and does not interoperate with it over the air

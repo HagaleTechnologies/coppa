@@ -170,7 +170,7 @@ fn soft_symbol(mapper: &dyn ConstellationMapper, llrs: &[f32]) -> Complex32 {
 /// per-rate 802.11 QC-LDPC codec (Z=81, 24 base columns also gave 1944), but
 /// now a fixed rate-matching target rather than an intrinsic per-code
 /// property.
-const CODED_BLOCK_LEN: usize = 1944;
+pub(crate) const CODED_BLOCK_LEN: usize = 1944;
 
 /// Payload integrity check (Phase 3 Task 1): a CRC-32 (CRC-32/ISO-HDLC, the
 /// familiar "zip/gzip/ethernet" polynomial) appended to the application payload

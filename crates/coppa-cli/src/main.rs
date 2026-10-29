@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use coppa_engine::config::EngineConfig;
+use coppa_engine::config::{EngineConfig, OfdmBand};
 use coppa_engine::CoppaCore;
 use std::path::PathBuf;
 mod settings;
@@ -90,15 +90,24 @@ impl RxArgs {
     }
 }
 
-#[derive(clap::Args)]
+/// Flags shared by `coppa profiles` and its deprecated alias `coppa config`, so
+/// the two can never disagree about what they accept.
+#[derive(clap::Args, Debug, Default, PartialEq, Eq)]
 struct ProfilesArgs {
-    /// Profile name to show.
-    #[arg(short, long)]
+    /// Show one named profile (HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY).
+    #[arg(short, long, conflicts_with = "level")]
     profile: Option<String>,
+    /// Show one speed level (1-9).
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
+    level: Option<u8>,
     /// Emit JSON output.
     #[arg(long)]
     json: bool,
 }
+
+/// Printed on stderr whenever the deprecated `coppa config` alias runs, even
+/// under `--quiet`: a script still using it must hear that it is going away.
+const CONFIG_DEPRECATED: &str = "WARNING: 'coppa config' is deprecated and will be removed in the next release. Use 'coppa profiles' instead; it takes the same flags.";
 
 #[derive(Serialize)]
 struct DeviceOutput {
@@ -128,6 +137,36 @@ struct ProfileOutput {
     compression: bool,
     sample_rate_hz: u32,
     ofdm_profile: &'static str,
+}
+
+/// One speed level of `coppa_engine::ladder`, for `profiles --level N --json`.
+/// `hf_*` are `null` on a VHF-only level.
+#[derive(Serialize)]
+struct LevelOutput {
+    level: u8,
+    modulation: &'static str,
+    code_rate: String,
+    max_payload_bytes: usize,
+    hf_bandwidth_hz: Option<u32>,
+    hf_airtime_ms: Option<u32>,
+    vhf_bandwidth_hz: u32,
+    vhf_airtime_ms: u32,
+}
+
+impl From<&coppa_engine::ladder::LevelInfo> for LevelOutput {
+    fn from(row: &coppa_engine::ladder::LevelInfo) -> Self {
+        let ms = |s: f64| (s * 1000.0).round() as u32;
+        Self {
+            level: row.level,
+            modulation: row.modulation,
+            code_rate: format!("{}/{}", row.code_rate.0, row.code_rate.1),
+            max_payload_bytes: row.max_payload_bytes,
+            hf_bandwidth_hz: row.hf.map(|hf| hf.bandwidth_hz),
+            hf_airtime_ms: row.hf.map(|hf| ms(hf.airtime_s)),
+            vhf_bandwidth_hz: row.vhf.bandwidth_hz,
+            vhf_airtime_ms: ms(row.vhf.airtime_s),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -246,6 +285,9 @@ enum Commands {
         /// Operational profile name (e.g., HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY).
         #[arg(long)]
         profile: Option<String>,
+        /// Speed level 1-9, overriding the profile's level but never its band (see `coppa profiles`).
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
+        level: Option<u8>,
         /// Callsign for station identification.
         #[arg(long)]
         callsign: Option<String>,
@@ -263,6 +305,9 @@ enum Commands {
         /// Operational profile name.
         #[arg(long)]
         profile: Option<String>,
+        /// Speed level 1-9, overriding the profile's level but never its band (see `coppa profiles`).
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
+        level: Option<u8>,
     },
     /// Deprecated: use 'coppa rx'. Removed in the next release.
     // COP-56: kept for one release. Delete this variant, LISTEN_DEPRECATED
@@ -299,14 +344,13 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// List operating profiles or show one profile.
+    /// Show the speed levels (modulation, code rate, max bytes, air time, bandwidth) and the named profiles built on them.
     Profiles(ProfilesArgs),
-    /// Show current configuration.
-    Config {
-        /// Profile name to show.
-        #[arg(short, long)]
-        profile: Option<String>,
-    },
+    // COP-55: kept for one release. Delete this variant, CONFIG_DEPRECATED and
+    // the Config dispatch arm in the release after it ships.
+    /// Deprecated: use 'coppa profiles'. Removed in the next release.
+    #[command(hide = true)]
+    Config(ProfilesArgs),
     /// Start the AFSK 1200 TNC (KISS TCP server).
     #[cfg(feature = "kiss-tnc")]
     Tnc {
@@ -340,6 +384,40 @@ fn resolve_config(profile: Option<&str>) -> Result<EngineConfig> {
         }
         None => Ok(EngineConfig::default()),
     }
+}
+
+/// Build the engine for `tx`/`loopback`: the profile (or the default), then
+/// `--level` if one was given. The level changes the speed level and never the
+/// band, as `coppa profiles` says; with no profile the band is HF, so `--level`
+/// alone never builds the 5600 Hz VHF waveform that the wideband gate refuses
+/// below 29.7 MHz. Without `--level` this is exactly the old
+/// `resolve_config` + `with_config` path.
+fn build_core(profile: Option<&str>, level: Option<u8>) -> Result<CoppaCore> {
+    let mut config = resolve_config(profile)?;
+    let Some(level) = level else {
+        return Ok(CoppaCore::with_config(config));
+    };
+    if profile.is_none() {
+        config.ofdm_band = OfdmBand::Hf;
+    }
+    let mut core = CoppaCore::with_config(config);
+    let available = core.available_speed_levels();
+    if !available.contains(&level) {
+        let label = match profile.and_then(coppa_engine::profiles::get_profile) {
+            Some(p) => p.name.to_string(),
+            None => "the default HF profile".to_string(),
+        };
+        let lowest = available.first().copied().unwrap_or(1);
+        let highest = available.last().copied().unwrap_or(1);
+        anyhow::bail!(
+            "level {level} is not available on {label}, which carries levels {lowest}-{highest}; \
+             level {level} is VHF only (use --profile {})",
+            vhf_profile_names().join(" or --profile ")
+        );
+    }
+    // The engine stays the validator of record, as in the FFI's level override.
+    core.set_speed_level(level)?;
+    Ok(core)
 }
 
 /// Library diagnostics (PTT release failures, audio errors, `coppa tnc`
@@ -380,6 +458,7 @@ fn main() -> Result<()> {
             message,
             output,
             profile,
+            level,
             callsign,
             rig,
         }) => {
@@ -399,6 +478,7 @@ fn main() -> Result<()> {
                 &message,
                 output.as_deref(),
                 profile.as_ref().map(|v| v.value.as_str()),
+                level,
                 &rig,
                 verbosity,
             )?;
@@ -410,7 +490,11 @@ fn main() -> Result<()> {
             eprintln!("{LISTEN_DEPRECATED}");
             resolve_rx_and_run(args, config_flag.as_deref(), env, verbosity)?;
         }
-        Some(Commands::Loopback { message, profile }) => {
+        Some(Commands::Loopback {
+            message,
+            profile,
+            level,
+        }) => {
             let layers = Layers::load(config_flag.as_deref(), env)?;
             let profile = layers.profile(profile.as_deref())?;
             if verbosity.is_verbose() {
@@ -420,6 +504,7 @@ fn main() -> Result<()> {
             cmd_loopback(
                 &message,
                 profile.as_ref().map(|v| v.value.as_str()),
+                level,
                 verbosity,
             )?;
         }
@@ -450,8 +535,11 @@ fn main() -> Result<()> {
             )?;
         }
         Some(Commands::Devices { json }) => cmd_devices(json)?,
-        Some(Commands::Profiles(args)) => cmd_profiles(args.profile.as_deref(), args.json)?,
-        Some(Commands::Config { profile }) => cmd_config(profile.as_deref())?,
+        Some(Commands::Profiles(args)) => cmd_profiles(&args)?,
+        Some(Commands::Config(args)) => {
+            eprintln!("{CONFIG_DEPRECATED}");
+            cmd_profiles(&args)?
+        }
         #[cfg(feature = "kiss-tnc")]
         Some(Commands::Tnc {
             port,
@@ -807,11 +895,11 @@ fn cmd_tx(
     message: &str,
     output: Option<&str>,
     profile: Option<&str>,
+    level: Option<u8>,
     rig: &RigSettings,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let config = resolve_config(profile)?;
-    let core = CoppaCore::with_config(config);
+    let core = build_core(profile, level)?;
 
     if verbosity.is_verbose() {
         eprintln!(
@@ -1249,15 +1337,19 @@ fn print_stream_frame(
     Ok(())
 }
 
-fn cmd_loopback(message: &str, profile: Option<&str>, verbosity: Verbosity) -> Result<()> {
+fn cmd_loopback(
+    message: &str,
+    profile: Option<&str>,
+    level: Option<u8>,
+    verbosity: Verbosity,
+) -> Result<()> {
     if verbosity != Verbosity::Quiet {
         println!("Coppa Loopback Test");
         println!("===================");
         println!("Input: \"{}\"", message);
     }
 
-    let config = resolve_config(profile)?;
-    let core = CoppaCore::with_config(config);
+    let core = build_core(profile, level)?;
 
     if verbosity.is_verbose() {
         eprintln!(
@@ -1311,71 +1403,298 @@ fn cmd_devices(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_profiles(profile: Option<&str>, json: bool) -> Result<()> {
-    if let Some(name) = profile {
-        let resolved = coppa_engine::profiles::get_profile(name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Unknown profile: {}. Available: {}",
-                name,
-                coppa_engine::profiles::list_profiles().join(", ")
-            )
-        })?;
-        let output = ProfileOutput::from_profile(resolved)?;
-        if json {
-            return write_json(&output);
-        }
-        println!("Profile: {}", output.name);
-        println!("  Description: {}", output.description);
-        println!("  Speed level: {}", output.speed_level);
-        println!("  Max bytes per frame: {}", output.max_payload_bytes);
-        println!("  Compression: {}", output.compression);
-        println!("  Sample rate: {} Hz", output.sample_rate_hz);
-        println!("  OFDM band: {}", output.ofdm_profile);
-        return Ok(());
+/// `coppa profiles` (and the deprecated `coppa config`): print the speed ladder
+/// and the named profiles, one speed level, or one profile's detail; `--json`
+/// emits the same selection as JSON.
+fn cmd_profiles(args: &ProfilesArgs) -> Result<()> {
+    if args.json {
+        return write_json_profiles(args);
     }
-
-    let profiles: Vec<_> = coppa_engine::profiles::list_profiles()
-        .iter()
-        .map(|name| {
-            let resolved = coppa_engine::profiles::get_profile(name)
-                .ok_or_else(|| anyhow::anyhow!("Profile not found: {name}"))?;
-            ProfileOutput::from_profile(resolved)
-        })
-        .collect::<Result<_>>()?;
-    if json {
-        return write_json(&profiles);
-    }
-    println!("Available profiles:");
-    for profile in profiles {
-        println!("  {} - {}", profile.name, profile.description);
-    }
+    print!("{}", render_profiles(args)?);
     Ok(())
 }
 
-fn cmd_config(profile: Option<&str>) -> Result<()> {
-    if let Some(name) = profile {
-        if let Some(p) = coppa_engine::profiles::get_profile(name) {
-            println!("Profile: {}", p.name);
-            println!("  Description: {}", p.description);
-            println!("  Speed level: {}", p.speed_level);
-            println!("  Max payload: {} bytes", p.max_payload);
-            println!("  ARQ window: {}", p.arq_window);
-            println!("  Compression: {}", p.compression);
-            println!("  Sample rate: {} Hz", p.sample_rate);
-        } else {
-            // F6: Fix config debug format -- use join(", ") instead of {:?}
-            println!("Unknown profile: {}", name);
-            let names = coppa_engine::profiles::list_profiles();
-            println!("Available: {}", names.join(", "));
+/// `profiles --json`: an array of every named profile, one profile object with
+/// `-p`, or one speed-level object with `--level`.
+fn write_json_profiles(args: &ProfilesArgs) -> Result<()> {
+    if let Some(name) = args.profile.as_deref() {
+        resolve_config(Some(name))?;
+        let resolved = coppa_engine::profiles::get_profile(name)
+            .ok_or_else(|| anyhow::anyhow!("Unknown profile: {name}"))?;
+        return write_json(&ProfileOutput::from_profile(resolved)?);
+    }
+    if let Some(level) = args.level {
+        let row = coppa_engine::ladder::level_info(level)
+            .ok_or_else(|| anyhow::anyhow!("no speed level {level}"))?;
+        return write_json(&LevelOutput::from(&row));
+    }
+    let profiles: Vec<_> = named_profiles()
+        .into_iter()
+        .map(ProfileOutput::from_profile)
+        .collect::<Result<_>>()?;
+    write_json(&profiles)
+}
+
+/// Render `coppa profiles`. Every number comes from `coppa_engine::ladder` or
+/// the profile constants, never from text here, so the output cannot drift from
+/// what `tx` enforces (COP-55: `config` used to print a hand-typed max payload of
+/// 64 bytes for a profile whose real limit is 56).
+fn render_profiles(args: &ProfilesArgs) -> Result<String> {
+    let ladder = coppa_engine::ladder::speed_ladder();
+    if let Some(name) = args.profile.as_deref() {
+        return render_profile_detail(name, &ladder);
+    }
+    let mut out = String::new();
+    match args.level {
+        Some(level) => {
+            let row = ladder
+                .iter()
+                .find(|row| row.level == level)
+                .ok_or_else(|| anyhow::anyhow!("no speed level {level}"))?;
+            render_ladder_header(&mut out, &ladder);
+            render_ladder_row(&mut out, row);
         }
-    } else {
-        println!("Available profiles:");
-        for name in coppa_engine::profiles::list_profiles() {
-            let p = coppa_engine::profiles::get_profile(name).unwrap();
-            println!("  {} - {}", p.name, p.description);
+        None => {
+            render_ladder(&mut out, &ladder);
+            out.push('\n');
+            render_profile_table(&mut out, &ladder);
         }
     }
-    Ok(())
+    Ok(out)
+}
+
+/// A profile's band label and its cell on that band, if the band carries the
+/// profile's level. `EngineConfig::from_profile` always pins HF or VHF.
+fn profile_on_band(
+    p: &coppa_engine::Profile,
+    ladder: &[coppa_engine::ladder::LevelInfo],
+) -> (&'static str, Option<coppa_engine::ladder::LevelOnBand>) {
+    let row = ladder.iter().find(|row| row.level == p.speed_level);
+    match EngineConfig::from_profile(p).ofdm_band {
+        OfdmBand::Vhf => ("VHF", row.map(|row| row.vhf)),
+        _ => ("HF", row.and_then(|row| row.hf)),
+    }
+}
+
+/// Every named profile, in `list_profiles()` order.
+fn named_profiles() -> Vec<&'static coppa_engine::Profile> {
+    coppa_engine::profiles::list_profiles()
+        .iter()
+        .filter_map(|name| coppa_engine::profiles::get_profile(name))
+        .collect()
+}
+
+/// Names of the profiles bound to the VHF band.
+fn vhf_profile_names() -> Vec<&'static str> {
+    named_profiles()
+        .into_iter()
+        .filter(|p| EngineConfig::from_profile(p).ofdm_band == OfdmBand::Vhf)
+        .map(|p| p.name)
+        .collect()
+}
+
+/// The first profile listed before `p` that builds the same engine, i.e. is
+/// the same on the air. Derived, so the label disappears if they diverge.
+fn same_on_air_as(p: &coppa_engine::Profile) -> Option<&'static str> {
+    let mine = EngineConfig::from_profile(p);
+    named_profiles()
+        .into_iter()
+        .take_while(|other| other.name != p.name)
+        .find(|other| {
+            let theirs = EngineConfig::from_profile(other);
+            theirs.speed_level == mine.speed_level
+                && theirs.sample_rate == mine.sample_rate
+                && theirs.compression_enabled == mine.compression_enabled
+                && theirs.cp_mode == mine.cp_mode
+                && theirs.ofdm_band == mine.ofdm_band
+        })
+        .map(|other| other.name)
+}
+
+/// "A", "A and B", "A, B and C".
+fn join_and(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+fn airtime_ms(airtime_s: f64) -> String {
+    format!("{} ms", (airtime_s * 1000.0).round() as u32)
+}
+
+fn render_ladder_header(out: &mut String, ladder: &[coppa_engine::ladder::LevelInfo]) {
+    let hf_hz = ladder
+        .iter()
+        .find_map(|row| row.hf)
+        .map_or(0, |hf| hf.bandwidth_hz);
+    let vhf_hz = ladder.first().map_or(0, |row| row.vhf.bandwidth_hz);
+    let vhf_header = format!("VHF, {vhf_hz} Hz");
+    out.push_str(&format!("{:41}AIR TIME PER FRAME\n", ""));
+    out.push_str(&format!(
+        "{:<7}{:<12}{:<11}{:<11}{:<15}{}\n",
+        "LEVEL",
+        "MODULATION",
+        "CODE RATE",
+        "MAX BYTES",
+        format!("HF, {hf_hz} Hz"),
+        vhf_header,
+    ));
+}
+
+fn render_ladder_row(out: &mut String, row: &coppa_engine::ladder::LevelInfo) {
+    let hf = row
+        .hf
+        .map_or_else(|| "VHF only".to_string(), |hf| airtime_ms(hf.airtime_s));
+    out.push_str(&format!(
+        "{:<7}{:<12}{:<11}{:<11}{:<15}{}\n",
+        row.level,
+        row.modulation,
+        format!("{}/{}", row.code_rate.0, row.code_rate.1),
+        row.max_payload_bytes,
+        hf,
+        airtime_ms(row.vhf.airtime_s),
+    ));
+}
+
+fn render_ladder(out: &mut String, ladder: &[coppa_engine::ladder::LevelInfo]) {
+    let hf_top = ladder
+        .iter()
+        .filter(|row| row.hf.is_some())
+        .map(|row| row.level)
+        .max()
+        .unwrap_or(0);
+    let vhf_top = ladder.iter().map(|row| row.level).max().unwrap_or(0);
+    let vhf_names = vhf_profile_names();
+    let carries = if vhf_names.len() == 1 {
+        "carries"
+    } else {
+        "carry"
+    };
+    out.push_str("Speed levels: pick one with --level N on tx or loopback. HF profiles carry\n");
+    out.push_str(&format!(
+        "levels 1-{hf_top}; {} {carries} 1-{vhf_top}. coppa rx detects each frame's level itself.\n\n",
+        join_and(&vhf_names.iter().map(|n| n.to_string()).collect::<Vec<_>>()),
+    ));
+    render_ladder_header(out, ladder);
+    for row in ladder {
+        render_ladder_row(out, row);
+    }
+    let compressing: Vec<String> = named_profiles()
+        .into_iter()
+        .filter(|p| p.compression)
+        .map(|p| p.name.to_string())
+        .collect();
+    out.push('\n');
+    out.push_str("MAX BYTES is the payload one frame carries on the air.");
+    if !compressing.is_empty() {
+        out.push_str(&format!(
+            " {}\ncompress your message first, so how much text fits depends on the text.",
+            join_and(&compressing)
+        ));
+    }
+    out.push('\n');
+    let vhf_only: Vec<String> = ladder
+        .iter()
+        .filter(|row| row.hf.is_none())
+        .map(|row| row.level.to_string())
+        .collect();
+    if !vhf_only.is_empty() {
+        let (noun, verb, pronoun) = if vhf_only.len() == 1 {
+            ("Level", "is", "it does")
+        } else {
+            ("Levels", "are", "they do")
+        };
+        out.push_str(&format!(
+            "{noun} {} {verb} VHF only: {pronoun} not decode reliably through an HF SSB filter.\n",
+            join_and(&vhf_only)
+        ));
+    }
+}
+
+fn render_profile_table(out: &mut String, ladder: &[coppa_engine::ladder::LevelInfo]) {
+    out.push_str(
+        "Profiles: pick one with --profile NAME; --level N changes its level, not its band.\n",
+    );
+    out.push_str(&format!(
+        "{:<13}{:<6}{:<7}{:<13}{}\n",
+        "PROFILE", "BAND", "LEVEL", "COMPRESSION", "DESCRIPTION"
+    ));
+    let mut wide = Vec::new();
+    for p in named_profiles() {
+        let (band, cell) = profile_on_band(p, ladder);
+        let description = match same_on_air_as(p) {
+            Some(twin) => format!("Same on the air as {twin}"),
+            None => p.description.to_string(),
+        };
+        out.push_str(&format!(
+            "{:<13}{:<6}{:<7}{:<13}{}\n",
+            p.name,
+            band,
+            p.speed_level,
+            if p.compression { "on" } else { "off" },
+            description,
+        ));
+        if let Some(cell) = cell {
+            if cell.bandwidth_hz > coppa_radio::band::HF_OCCUPIED_BANDWIDTH_CAP_HZ {
+                wide.push((p.name, cell.bandwidth_hz));
+            }
+        }
+    }
+    if !wide.is_empty() {
+        out.push('\n');
+    }
+    for (name, hz) in wide {
+        out.push_str(&format!(
+            "{name} is {hz} Hz wide and transmits live only at or above {} MHz.\n",
+            coppa_radio::band::US_WIDEBAND_MIN_HZ as f64 / 1_000_000.0
+        ));
+    }
+}
+
+fn render_profile_detail(name: &str, ladder: &[coppa_engine::ladder::LevelInfo]) -> Result<String> {
+    // Same error text (and exit code) `tx`/`rx`/`loopback` give for an unknown name.
+    resolve_config(Some(name))?;
+    let p = coppa_engine::profiles::get_profile(name)
+        .ok_or_else(|| anyhow::anyhow!("Unknown profile: {name}"))?;
+    let (band, cell) = profile_on_band(p, ladder);
+    let cell = cell.ok_or_else(|| {
+        anyhow::anyhow!(
+            "profile {} is level {}, which its band does not carry",
+            p.name,
+            p.speed_level
+        )
+    })?;
+    let row = ladder
+        .iter()
+        .find(|row| row.level == p.speed_level)
+        .ok_or_else(|| anyhow::anyhow!("no speed level {}", p.speed_level))?;
+    let max_bytes = p
+        .max_payload()
+        .ok_or_else(|| anyhow::anyhow!("no speed level {}", p.speed_level))?;
+    let mut out = String::new();
+    out.push_str(&format!("Profile: {}\n", p.name));
+    out.push_str(&format!("  Description: {}\n", p.description));
+    if let Some(twin) = same_on_air_as(p) {
+        out.push_str(&format!("  Same on the air as {twin}\n"));
+    }
+    out.push_str(&format!("  Band: {band}, {} Hz\n", cell.bandwidth_hz));
+    out.push_str(&format!(
+        "  Speed level: {} ({}, code rate {}/{})\n",
+        p.speed_level, row.modulation, row.code_rate.0, row.code_rate.1
+    ));
+    out.push_str(&format!("  Max bytes per frame: {max_bytes}\n"));
+    out.push_str(&format!(
+        "  Air time per frame: {}\n",
+        airtime_ms(cell.airtime_s)
+    ));
+    out.push_str(&format!(
+        "  Compression: {}\n",
+        if p.compression { "on" } else { "off" }
+    ));
+    out.push_str(&format!("  Sample rate: {} Hz\n", p.sample_rate));
+    Ok(out)
 }
 
 #[cfg(feature = "kiss-tnc")]
@@ -1477,28 +1796,28 @@ mod tests {
 
     #[test]
     fn test_loopback_roundtrip() {
-        cmd_loopback("Hello", None, Verbosity::Normal).expect("loopback should succeed");
+        cmd_loopback("Hello", None, None, Verbosity::Normal).expect("loopback should succeed");
     }
 
     #[test]
     fn test_loopback_short_message() {
-        cmd_loopback("Hi", None, Verbosity::Normal).expect("short loopback should succeed");
+        cmd_loopback("Hi", None, None, Verbosity::Normal).expect("short loopback should succeed");
     }
 
     #[test]
     fn test_loopback_with_profile() {
-        cmd_loopback("Test", Some("HF_STANDARD"), Verbosity::Normal)
+        cmd_loopback("Test", Some("HF_STANDARD"), None, Verbosity::Normal)
             .expect("loopback with profile should succeed");
     }
 
     #[test]
     fn test_loopback_quiet() {
-        cmd_loopback("Quiet", None, Verbosity::Quiet).expect("quiet loopback should succeed");
+        cmd_loopback("Quiet", None, None, Verbosity::Quiet).expect("quiet loopback should succeed");
     }
 
     #[test]
     fn test_loopback_verbose() {
-        cmd_loopback("Verbose", None, Verbosity::Verbose(1))
+        cmd_loopback("Verbose", None, None, Verbosity::Verbose(1))
             .expect("verbose loopback should succeed");
     }
 
@@ -1510,6 +1829,7 @@ mod tests {
         cmd_tx(
             "test message",
             Some(path_str),
+            None,
             None,
             &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
             Verbosity::Normal,
@@ -1573,6 +1893,7 @@ mod tests {
             "CQ CQ",
             Some(path_str),
             None,
+            None,
             &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
             Verbosity::Verbose(1),
         )
@@ -1596,23 +1917,254 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_config_list() {
-        cmd_config(None).expect("config list should succeed");
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("coppa").chain(args.iter().copied()))
     }
 
-    #[test]
-    fn test_config_named_profile() {
-        let profiles = coppa_engine::profiles::list_profiles();
-        if let Some(&name) = profiles.first() {
-            cmd_config(Some(name)).expect("config with valid profile should succeed");
+    fn profiles_args(args: &[&str]) -> ProfilesArgs {
+        match parse(args).expect("valid profiles args").command {
+            Some(Commands::Profiles(args)) | Some(Commands::Config(args)) => args,
+            _ => panic!("expected profiles or config"),
         }
     }
 
     #[test]
-    fn test_config_unknown_profile() {
-        cmd_config(Some("NONEXISTENT_PROFILE"))
-            .expect("config with unknown profile should not error");
+    fn profiles_parses_profile_and_level() {
+        assert_eq!(profiles_args(&["profiles"]), ProfilesArgs::default());
+        assert_eq!(
+            profiles_args(&["profiles", "-p", "HF_ROBUST"])
+                .profile
+                .as_deref(),
+            Some("HF_ROBUST")
+        );
+        assert_eq!(profiles_args(&["profiles", "--level", "4"]).level, Some(4));
+    }
+
+    #[test]
+    fn profiles_rejects_level_outside_1_to_9() {
+        for level in ["0", "10"] {
+            let err = parse(&["profiles", "--level", level])
+                .err()
+                .expect("rejected");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{level}"
+            );
+        }
+    }
+
+    #[test]
+    fn profiles_rejects_profile_with_level() {
+        let err = parse(&["profiles", "-p", "HF_ROBUST", "--level", "2"])
+            .err()
+            .expect("rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn config_parses_into_the_same_args_as_profiles() {
+        for flags in [vec![], vec!["-p", "HF_ROBUST"], vec!["--level", "9"]] {
+            let profiles: Vec<&str> = std::iter::once("profiles").chain(flags.clone()).collect();
+            let config: Vec<&str> = std::iter::once("config").chain(flags).collect();
+            assert!(matches!(
+                parse(&config).unwrap().command,
+                Some(Commands::Config(_))
+            ));
+            assert_eq!(profiles_args(&config), profiles_args(&profiles));
+        }
+    }
+
+    #[test]
+    fn top_level_help_lists_profiles_and_hides_config() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_help().to_string();
+        let subcommands: Vec<&str> = help
+            .lines()
+            .filter_map(|line| line.strip_prefix("  "))
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        assert!(subcommands.contains(&"profiles"), "{help}");
+        assert!(!subcommands.contains(&"config"), "{help}");
+    }
+
+    fn rendered(args: &[&str]) -> String {
+        render_profiles(&profiles_args(args)).expect("render")
+    }
+
+    #[test]
+    fn profiles_table_lists_every_level_once() {
+        let out = rendered(&["profiles"]);
+        let ladder = coppa_engine::ladder::speed_ladder();
+        let rows: Vec<&str> = out
+            .lines()
+            .filter(|line| {
+                line.split_whitespace()
+                    .next()
+                    .is_some_and(|first| first.parse::<u8>().is_ok())
+            })
+            .collect();
+        assert_eq!(rows.len(), 9, "{out}");
+        for (row, info) in rows.iter().zip(&ladder) {
+            let hf = match info.hf {
+                Some(hf) => format!("{} ms", (hf.airtime_s * 1000.0).round()),
+                None => "VHF only".to_string(),
+            };
+            let vhf = format!("{} ms", (info.vhf.airtime_s * 1000.0).round());
+            let expected = format!(
+                "{:<7}{:<12}{:<11}{:<11}{:<15}{}",
+                info.level,
+                info.modulation,
+                format!("{}/{}", info.code_rate.0, info.code_rate.1),
+                info.max_payload_bytes,
+                hf,
+                vhf
+            );
+            assert_eq!(*row, expected);
+        }
+        let levels: Vec<u8> = ladder.iter().map(|info| info.level).collect();
+        assert_eq!(levels, (1..=9).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn profiles_table_header_names_both_bandwidths() {
+        let out = rendered(&["profiles"]);
+        assert!(out.contains("HF, 2400 Hz"), "{out}");
+        assert!(out.contains("VHF, 5600 Hz"), "{out}");
+    }
+
+    #[test]
+    fn profiles_table_marks_emergency_as_hf_robust_on_the_air() {
+        let out = rendered(&["profiles"]);
+        let emergency = out
+            .lines()
+            .find(|line| line.starts_with("EMERGENCY"))
+            .expect("EMERGENCY row");
+        assert!(
+            emergency.ends_with("Same on the air as HF_ROBUST"),
+            "{emergency}"
+        );
+        let robust = out
+            .lines()
+            .find(|line| line.starts_with("HF_ROBUST"))
+            .expect("HF_ROBUST row");
+        assert!(!robust.contains("Same on the air"), "{robust}");
+    }
+
+    #[test]
+    fn profile_detail_shows_the_enforced_max_payload() {
+        for name in coppa_engine::profiles::list_profiles() {
+            let p = coppa_engine::profiles::get_profile(name).unwrap();
+            let out = rendered(&["profiles", "-p", name]);
+            let max = coppa_protocol::modem::max_payload_for_level(p.speed_level).unwrap();
+            assert!(
+                out.contains(&format!("Max bytes per frame: {max}\n")),
+                "{out}"
+            );
+            assert!(!out.contains("ARQ window"), "{out}");
+        }
+        let robust = rendered(&["profiles", "-p", "HF_ROBUST"]);
+        assert!(robust.contains("Max bytes per frame: 56\n"), "{robust}");
+        assert!(!robust.contains("64 bytes"), "{robust}");
+    }
+
+    #[test]
+    fn profiles_level_shows_one_row() {
+        let out = rendered(&["profiles", "--level", "4"]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        assert!(lines[0].trim_start().starts_with("AIR TIME PER FRAME"));
+        assert!(lines[1].starts_with("LEVEL"));
+        assert!(lines[2].starts_with("4 "), "{out}");
+    }
+
+    #[test]
+    fn profiles_unknown_profile_is_an_error() {
+        let args = ProfilesArgs {
+            profile: Some("BOGUS".to_string()),
+            ..ProfilesArgs::default()
+        };
+        let err = render_profiles(&args).unwrap_err().to_string();
+        assert!(err.contains("Unknown profile: BOGUS. Available:"), "{err}");
+    }
+
+    #[test]
+    fn tx_and_loopback_parse_level() {
+        match parse(&["tx", "CQ", "--level", "4"]).unwrap().command {
+            Some(Commands::Tx { level, .. }) => assert_eq!(level, Some(4)),
+            _ => panic!("expected tx"),
+        }
+        match parse(&["loopback", "CQ", "--level", "9"]).unwrap().command {
+            Some(Commands::Loopback { level, .. }) => assert_eq!(level, Some(9)),
+            _ => panic!("expected loopback"),
+        }
+    }
+
+    #[test]
+    fn tx_and_loopback_reject_level_0_and_10() {
+        for cmd in ["tx", "loopback"] {
+            for level in ["0", "10"] {
+                let err = parse(&[cmd, "CQ", "--level", level])
+                    .err()
+                    .expect("rejected");
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::ValueValidation,
+                    "{cmd} {level}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_core_without_level_is_todays_default() {
+        let core = build_core(None, None).unwrap();
+        assert_eq!(core.config().ofdm_band, OfdmBand::LevelDerived);
+        assert_eq!(core.speed_level(), 1);
+    }
+
+    #[test]
+    fn level_without_profile_stays_on_hf() {
+        let core = build_core(None, Some(5)).unwrap();
+        assert_eq!(core.speed_level(), 5);
+        assert!(!core.on_vhf_profile());
+        assert_eq!(core.occupied_bandwidth_hz(), 2400);
+    }
+
+    #[test]
+    fn level_overrides_the_profile_level_but_keeps_band_and_compression() {
+        let core = build_core(Some("HF_STANDARD"), Some(7)).unwrap();
+        assert_eq!(core.speed_level(), 7);
+        assert!(core.config().compression_enabled);
+        assert_eq!(core.occupied_bandwidth_hz(), 2400);
+
+        let core = build_core(Some("VHF_FAST"), Some(3)).unwrap();
+        assert_eq!(core.speed_level(), 3);
+        assert_eq!(core.occupied_bandwidth_hz(), 5600);
+    }
+
+    #[test]
+    fn level_9_needs_a_vhf_profile() {
+        let err = build_core(Some("hf_robust"), Some(9))
+            .err()
+            .expect("level 9 on HF refused")
+            .to_string();
+        assert_eq!(
+            err,
+            "level 9 is not available on HF_ROBUST, which carries levels 1-8; \
+             level 9 is VHF only (use --profile VHF_FAST)"
+        );
+        let err = build_core(None, Some(9))
+            .err()
+            .expect("level 9 on the default refused")
+            .to_string();
+        assert!(err.contains("the default HF profile"), "{err}");
+        assert!(build_core(Some("VHF_FAST"), Some(9)).is_ok());
+    }
+
+    #[test]
+    fn loopback_at_an_explicit_level_round_trips() {
+        cmd_loopback("CQ", None, Some(4), Verbosity::Quiet).expect("level 4 loopback");
     }
 
     #[test]
@@ -2161,6 +2713,7 @@ mod tests {
             "hi",
             None,
             None,
+            None,
             &RigSettings::test_values(None, "rigctld-typo", "127.0.0.1:1", 0, 0, None, None),
             Verbosity::Quiet,
         )
@@ -2198,6 +2751,7 @@ mod tests {
             "hi",
             None,
             Some("VHF_FAST"),
+            None,
             &RigSettings::test_values(None, "none", "127.0.0.1:1", 0, 0, None, None),
             Verbosity::Quiet,
         )
@@ -2209,6 +2763,7 @@ mod tests {
             "hi",
             Some(path.to_str().unwrap()),
             Some("VHF_FAST"),
+            None,
             &RigSettings::test_values(None, "none", "127.0.0.1:1", 0, 0, None, None),
             Verbosity::Quiet,
         )
@@ -2233,6 +2788,7 @@ mod tests {
             cmd_tx(
                 "streaming rx roundtrip",
                 Some(path_str),
+                None,
                 None,
                 &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
                 Verbosity::Quiet,

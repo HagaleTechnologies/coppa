@@ -135,9 +135,11 @@ fn profiles_help_list_detail_and_error() {
         "Unknown profile: BOGUS. Available: HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY"
     ));
 
+    // `config` is now a deprecated alias for `profiles` (COP-55).
     let config = run(&["config"], None);
     assert!(config.status.success());
-    assert!(String::from_utf8_lossy(&config.stdout).contains("Available profiles:"));
+    let plain = run(&["profiles"], None);
+    assert_eq!(config.stdout, plain.stdout);
 }
 
 #[cfg(feature = "file-backend")]
