@@ -2153,31 +2153,34 @@ impl EventLoop {
     /// loop like `Shutdown`).
     async fn dispatch_event(&mut self, event: Option<DaemonEvent>) {
         match event {
-                Some(DaemonEvent::Shutdown) | None => {
-                    tracing::info!("Shutdown signal received");
-                    if self.is_transmitting {
-                        tracing::info!("Releasing PTT before shutdown");
-                        self.force_release_ptt().await;
-                    }
-                    // E5: Signal audio threads to stop
-                    self.shutdown_flag.store(true, Ordering::Release);
-                    self.running = false;
+            Some(DaemonEvent::Shutdown) | None => {
+                tracing::info!("Shutdown signal received");
+                if self.is_transmitting {
+                    tracing::info!("Releasing PTT before shutdown");
+                    self.force_release_ptt().await;
                 }
-                Some(DaemonEvent::Host(host_event)) => {
-                    self.handle_host_event(host_event).await;
-                }
-                Some(DaemonEvent::AudioIn(samples)) => {
-                    self.handle_audio_in(&samples).await;
-                }
-                Some(DaemonEvent::AudioOut(samples)) => {
-                    self.handle_audio_out(&samples);
-                }
-                Some(DaemonEvent::PttChange(tx)) => {
-                    self.handle_ptt_change(tx).await;
-                }
-                Some(DaemonEvent::TxComplete { generation, completed }) => {
-                    self.handle_tx_complete(generation, completed).await;
-                }
+                // E5: Signal audio threads to stop
+                self.shutdown_flag.store(true, Ordering::Release);
+                self.running = false;
+            }
+            Some(DaemonEvent::Host(host_event)) => {
+                self.handle_host_event(host_event).await;
+            }
+            Some(DaemonEvent::AudioIn(samples)) => {
+                self.handle_audio_in(&samples).await;
+            }
+            Some(DaemonEvent::AudioOut(samples)) => {
+                self.handle_audio_out(&samples);
+            }
+            Some(DaemonEvent::PttChange(tx)) => {
+                self.handle_ptt_change(tx).await;
+            }
+            Some(DaemonEvent::TxComplete {
+                generation,
+                completed,
+            }) => {
+                self.handle_tx_complete(generation, completed).await;
+            }
         }
     }
 
@@ -14433,7 +14436,11 @@ mod tests {
             )
             .await
             .expect("an ABORT must cut the busy-channel wait");
-            assert_eq!(audio_out_rx.available(), 0, "the waiting frame must not key");
+            assert_eq!(
+                audio_out_rx.available(),
+                0,
+                "the waiting frame must not key"
+            );
             assert!(!event_loop.is_transmitting);
             assert!(matches!(
                 event_loop.deferred_events.front(),
