@@ -24,6 +24,12 @@ Restructure Coppa as a Cargo workspace with 12 crates under `crates/`, organized
 
 The root `Cargo.toml` defines workspace-level dependencies and a root package for integration tests and benchmarks.
 
+**COP-75 update (2026-10-28):** the EWMA channel-quality predictor in `coppa-ml`
+was deleted in Phase 3 Task 9; the crate now holds deterministic
+measurement-driven controllers (see `coppa-ml`'s crate docs and
+`docs/adr/008-phase3-system-layer.md`). The workspace later gained
+`coppa-bench`, a measurement harness that is not a product crate.
+
 ## Consequences
 
 - Each crate compiles and tests independently, improving CI times for targeted changes

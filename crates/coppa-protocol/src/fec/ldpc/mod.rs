@@ -341,8 +341,8 @@ mod nr_ldpc_codec_tests {
     /// even on a perfectly clean channel (0% LLR corruption, i.e. this is not
     /// a noise-margin issue, it's a structural convergence failure). This was
     /// only ever caught by `tests/phase_c_loopback.rs`'s
-    /// `test_all_levels_min_payload` / `test_awgn_level_9_above_threshold`,
-    /// which are workspace integration tests that CI does NOT run (CI only
+    /// `test_all_levels_min_payload` (and `test_awgn_level_9_above_threshold`,
+    /// since removed by COP-70), workspace integration tests that CI does NOT run (CI only
     /// runs `cargo test --lib`, per this crate's `CLAUDE.md`); the existing
     /// `perfect_llr_loopback_every_level` test above uses a 400-bit payload
     /// for every level, which does not reproduce the triggering condition.

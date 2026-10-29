@@ -2,7 +2,18 @@
 
 pub use coppa_radio::band::FrequencyConfig;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::ffi::{OsStr, OsString};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+
+/// File name `coppad` looks for when no config path is given (COP-49): the
+/// first search candidate, relative to the working directory, and the file
+/// name inside every config directory.
+pub const CONFIG_FILE_NAME: &str = "coppad.toml";
+
+/// System-wide config file, last in the Unix search order (COP-49). The same
+/// path COP-48's systemd unit passes explicitly.
+pub const SYSTEM_CONFIG_PATH: &str = "/etc/coppa/coppad.toml";
 
 /// Top-level daemon configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,15 +223,36 @@ impl RadioConfig {
     }
 }
 
+/// A shared secret read from the config file. Never log the value; `Debug`
+/// redacts it (COP-53).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretToken(String);
+
+impl SecretToken {
+    /// The secret itself, for the one place that must compare it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretToken(<redacted>)")
+    }
+}
+
 /// Host interface configuration section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HostConfig {
     /// Address all host servers bind to. Defaults to "127.0.0.1" (loopback only).
     ///
-    /// WARNING: binding to a non-loopback address (e.g. "0.0.0.0") exposes an
-    /// unauthenticated control plane that can key a transmitter to anyone who can
-    /// reach this host. Only change this on a trusted, firewalled network.
+    /// WARNING: binding to a non-loopback address (e.g. "0.0.0.0") exposes the
+    /// VARA-style ports, which have no authentication and can key a transmitter,
+    /// to anyone who can reach this host. The WebSocket port needs
+    /// `websocket_token`, but over `ws://` the token crosses the network in
+    /// clear text. Only change this on a trusted, firewalled network.
     pub bind_address: String,
     /// Enable VARA-style TCP control interface (not RF/waveform-compatible with VARA).
     pub vara_enabled: bool,
@@ -232,6 +264,16 @@ pub struct HostConfig {
     pub websocket_enabled: bool,
     /// WebSocket port.
     pub websocket_port: u16,
+    /// COP-53: shared secret every WebSocket handshake must present, as
+    /// `Authorization: Bearer <token>` or a `token` query parameter. Required
+    /// when `websocket_enabled` is true, whatever `bind_address` is: 16 or
+    /// more characters from `A-Z a-z 0-9 - . _ ~`. Keep the config file
+    /// readable only by the account running `coppad`.
+    pub websocket_token: Option<SecretToken>,
+    /// COP-53: exact browser origins (`scheme://host[:port]`) allowed to open
+    /// the WebSocket. Empty (the default) refuses every web page; scripts that
+    /// send no `Origin` header need only the token.
+    pub websocket_allowed_origins: Vec<String>,
     /// Allow data-port and WebSocket host data to transmit without an established
     /// session. Off by default; intended for sessionless bench rigs. Enabling it
     /// lets any data-port client key the transmitter.
@@ -447,6 +489,8 @@ impl Default for HostConfig {
             vara_data_port: 8301,
             websocket_enabled: false,
             websocket_port: 8400,
+            websocket_token: None,
+            websocket_allowed_origins: Vec::new(),
             sessionless_tx_enabled: false,
         }
     }
@@ -477,34 +521,236 @@ impl Default for StationIdConfig {
     }
 }
 
+/// The environment config discovery reads (COP-49). Injected rather than
+/// read inside [`config_candidates`] so every platform's search order is
+/// testable on any host.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigEnv {
+    /// Use the Windows search order.
+    pub windows: bool,
+    /// `HOME`.
+    pub home: Option<OsString>,
+    /// `XDG_CONFIG_HOME`.
+    pub xdg_config_home: Option<OsString>,
+    /// `APPDATA` (Windows only).
+    pub appdata: Option<OsString>,
+}
+
+impl ConfigEnv {
+    /// This process's environment and platform.
+    pub fn from_process() -> Self {
+        Self {
+            windows: cfg!(windows),
+            home: std::env::var_os("HOME"),
+            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
+            appdata: std::env::var_os("APPDATA"),
+        }
+    }
+}
+
+/// COP-49: the config files `coppad` tries, in order, when no path is given:
+///
+/// 1. `coppad.toml` in the working directory (relative, as printed);
+/// 2. Unix: `$XDG_CONFIG_HOME/coppa/coppad.toml` if that variable is
+///    absolute, else `$HOME/.config/coppa/coppad.toml` if `HOME` is;
+///    Windows: `%APPDATA%\coppa\coppad.toml`;
+/// 3. Unix only: [`SYSTEM_CONFIG_PATH`].
+///
+/// Empty variables are ignored, and so are relative `XDG_CONFIG_HOME` and
+/// `HOME` values (the XDG spec says to ignore relative paths). `APPDATA` is
+/// set by the OS and only needs to be non-empty.
+pub fn config_candidates(env: &ConfigEnv) -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from(CONFIG_FILE_NAME)];
+    if env.windows {
+        if let Some(appdata) = non_empty(&env.appdata) {
+            candidates.push(Path::new(appdata).join("coppa").join(CONFIG_FILE_NAME));
+        }
+    } else {
+        let user_dir = rooted(&env.xdg_config_home)
+            .map(PathBuf::from)
+            .or_else(|| rooted(&env.home).map(|home| Path::new(home).join(".config")));
+        if let Some(dir) = user_dir {
+            candidates.push(dir.join("coppa").join(CONFIG_FILE_NAME));
+        }
+        candidates.push(PathBuf::from(SYSTEM_CONFIG_PATH));
+    }
+    candidates
+}
+
+fn non_empty(value: &Option<OsString>) -> Option<&OsStr> {
+    value.as_deref().filter(|value| !value.is_empty())
+}
+
+/// A non-empty value that is an absolute Unix path. `has_root` rather than
+/// `is_absolute` so the Unix order is also testable on a Windows host, where
+/// `/home/op` has no drive prefix; on Unix the two are the same.
+fn rooted(value: &Option<OsString>) -> Option<&OsStr> {
+    non_empty(value).filter(|value| Path::new(value).has_root())
+}
+
+/// The error for a discovered file that exists but cannot be used. The same
+/// wording the implicit `./coppad.toml` has always used.
+fn parse_error(path: &Path, e: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!("Failed to parse config {}: {}", path.display(), e)
+}
+
+/// Keys shared with the CLI, preserving whether a key was written in TOML.
+/// Typed daemon defaults cannot distinguish an omitted key from an explicit one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SharedSettings {
+    pub callsign: Option<String>,
+    pub profile: Option<String>,
+    pub input_device: Option<String>,
+    pub output_device: Option<String>,
+    pub ptt_method: Option<String>,
+    pub rigctld_address: Option<String>,
+    pub ptt_pre_delay_ms: Option<u64>,
+    pub ptt_tail_delay_ms: Option<u64>,
+    pub frequency_hz: Option<u64>,
+    pub band: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SharedToml {
+    engine: SharedEngine,
+    audio: SharedAudio,
+    radio: SharedRadio,
+}
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SharedEngine {
+    callsign: Option<String>,
+    profile: Option<String>,
+}
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SharedAudio {
+    input_device: Option<String>,
+    output_device: Option<String>,
+}
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SharedRadio {
+    ptt_method: Option<String>,
+    rigctld_address: Option<String>,
+    ptt_pre_delay_ms: Option<u64>,
+    ptt_tail_delay_ms: Option<u64>,
+    frequency_hz: Option<u64>,
+    band: Option<String>,
+}
+impl SharedSettings {
+    fn from_validated_toml(text: &str) -> anyhow::Result<Self> {
+        let view: SharedToml = toml::from_str(text)?;
+        let nonempty = |v: Option<String>| v.filter(|s| !s.is_empty());
+        Ok(Self {
+            callsign: nonempty(view.engine.callsign),
+            profile: view.engine.profile,
+            input_device: nonempty(view.audio.input_device),
+            output_device: nonempty(view.audio.output_device),
+            ptt_method: view.radio.ptt_method,
+            rigctld_address: view.radio.rigctld_address,
+            ptt_pre_delay_ms: view.radio.ptt_pre_delay_ms,
+            ptt_tail_delay_ms: view.radio.ptt_tail_delay_ms,
+            frequency_hz: view.radio.frequency_hz,
+            band: view.radio.band,
+        })
+    }
+}
+
+/// The result of [`DaemonConfig::discover`].
+#[derive(Debug, Clone)]
+pub struct Discovered {
+    /// The loaded file's configuration, or the defaults if none was found.
+    pub config: DaemonConfig,
+    /// Explicitly written CLI-shared keys from the same file.
+    #[allow(dead_code)]
+    // coppad compiles this module too; the CLI consumes this field through the library.
+    pub shared: SharedSettings,
+    /// The file that was loaded, if any.
+    pub source: Option<PathBuf>,
+    /// Every candidate examined, in order, up to and including `source`.
+    pub searched: Vec<PathBuf>,
+    /// Candidates skipped because a parent directory could not be entered.
+    pub permission_denied: Vec<PathBuf>,
+}
+
+impl Discovered {
+    /// `searched` as a comma-separated list, marking each candidate in
+    /// `permission_denied` with `(permission denied)`.
+    pub fn search_summary(&self) -> String {
+        self.searched
+            .iter()
+            .map(|path| {
+                if self.permission_denied.contains(path) {
+                    format!("{} (permission denied)", path.display())
+                } else {
+                    path.display().to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 impl DaemonConfig {
     /// Load configuration from a TOML file.
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        let contents = std::fs::read_to_string(path.as_ref())?;
-        let config: Self = toml::from_str(&contents)?;
-        Ok(config)
+        Ok(Self::load_with_shared(path)?.0)
     }
 
-    /// Load configuration, falling back to defaults if file doesn't exist.
+    /// Load the strict daemon config and the presence-aware CLI view in one read.
+    pub fn load_with_shared<P: AsRef<Path>>(path: P) -> anyhow::Result<(Self, SharedSettings)> {
+        let contents = std::fs::read_to_string(path.as_ref())?;
+        let config: Self = toml::from_str(&contents)?;
+        let shared = SharedSettings::from_validated_toml(&contents)?;
+        Ok((config, shared))
+    }
+
+    /// COP-49: load the first of `candidates` that exists, or the built-in
+    /// defaults when none does. Files are never merged.
     ///
-    /// Returns an error if the config file exists but has parse errors (E3).
-    /// Falls back to defaults only if the file does not exist.
-    pub fn load_or_default<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        match Self::load(path.as_ref()) {
-            Ok(config) => Ok(config),
-            Err(e) => {
-                if path.as_ref().exists() {
-                    // E3: Config file exists but has errors — this is fatal
-                    Err(anyhow::anyhow!(
-                        "Failed to parse config {}: {}",
-                        path.as_ref().display(),
-                        e
-                    ))
-                } else {
-                    Ok(Self::default())
+    /// A candidate is skipped when `fs::metadata` reports it absent
+    /// (`NotFound`, `NotADirectory`) or unreachable (`PermissionDenied`, e.g.
+    /// a home directory hidden by systemd's `ProtectHome=yes`; recorded in
+    /// [`Discovered::permission_denied`]). `Path::exists` cannot make that
+    /// distinction: it reports an unreachable file as absent. Any other
+    /// error, or a visible file that cannot be read or parsed (a directory,
+    /// an unreadable file, bad TOML, an unknown key), is fatal and names the
+    /// path.
+    pub fn discover(candidates: &[PathBuf]) -> anyhow::Result<Discovered> {
+        let mut searched = Vec::new();
+        let mut permission_denied = Vec::new();
+        for path in candidates {
+            searched.push(path.clone());
+            match std::fs::metadata(path) {
+                Ok(_) => {}
+                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                    continue
                 }
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                    permission_denied.push(path.clone());
+                    continue;
+                }
+                Err(e) => return Err(parse_error(path, e)),
             }
+            let (config, shared) =
+                Self::load_with_shared(path).map_err(|e| parse_error(path, e))?;
+            return Ok(Discovered {
+                config,
+                shared,
+                source: Some(path.clone()),
+                searched,
+                permission_denied,
+            });
         }
+        Ok(Discovered {
+            config: Self::default(),
+            shared: SharedSettings::default(),
+            source: None,
+            searched,
+            permission_denied,
+        })
     }
 
     /// COP-36: `[engine] profile` must name a built-in profile
@@ -536,6 +782,21 @@ impl DaemonConfig {
         ))
     }
 
+    /// COP-50: `[host] websocket_enabled = true` needs a build with the
+    /// `websocket` feature (`built`); without it no listener would start and
+    /// nothing would say so. Checked by run mode before any hardware is touched.
+    pub fn check_websocket_built(&self, built: bool) -> Result<(), String> {
+        if built || !self.host.websocket_enabled {
+            return Ok(());
+        }
+        Err(
+            "[host] websocket_enabled = true is set, but this coppad was built without the \
+             websocket feature and starts no WebSocket server; rebuild with --features \
+             websocket, or set websocket_enabled = false"
+                .to_string(),
+        )
+    }
+
     /// COP-32: `[audio] sample_rate` must equal the configured profile's
     /// engine rate. coppad has no resampler, so any other rate plays and
     /// captures audio at the wrong speed. Checked by run mode before any
@@ -554,6 +815,148 @@ impl DaemonConfig {
             self.audio.sample_rate, self.engine.profile
         ))
     }
+
+    /// COP-53: a WebSocket-enabled daemon needs a usable `[host]
+    /// websocket_token` and a well-formed `[host] websocket_allowed_origins`,
+    /// whatever `bind_address` is: a web page in the operator's own browser
+    /// reaches a loopback port too. Checked by run mode before any socket is
+    /// bound; `--check` does not call it.
+    pub fn check_websocket_auth(&self) -> Result<(), String> {
+        if !self.host.websocket_enabled {
+            return Ok(());
+        }
+        let Some(token) = &self.host.websocket_token else {
+            return Err(format!(
+                "[host] websocket_enabled = true requires [host] websocket_token: set it to \
+                 a random value of at least {MIN_WEBSOCKET_TOKEN_CHARS} characters, for \
+                 example the output of `openssl rand -hex 32`"
+            ));
+        };
+        let token = token.expose();
+        let length = token.chars().count();
+        if length < MIN_WEBSOCKET_TOKEN_CHARS {
+            return Err(format!(
+                "[host] websocket_token is {length} characters long; it must be at least \
+                 {MIN_WEBSOCKET_TOKEN_CHARS}, for example the output of `openssl rand -hex 32`"
+            ));
+        }
+        if !token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~'))
+        {
+            return Err(
+                "[host] websocket_token may contain only letters, digits, '-', '.', \
+                 '_' and '~'"
+                    .to_string(),
+            );
+        }
+        for entry in &self.host.websocket_allowed_origins {
+            check_origin_entry(entry).map_err(|reason| {
+                format!("[host] websocket_allowed_origins entry {entry:?} {reason}")
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// COP-53: the shortest `[host] websocket_token` run mode accepts.
+const MIN_WEBSOCKET_TOKEN_CHARS: usize = 16;
+
+/// COP-53: why `entry` is not a browser origin (`scheme "://" host [":"
+/// port]`), or `Ok`. The caller prefixes the key and the entry. The first
+/// matching rule decides the message.
+fn check_origin_entry(entry: &str) -> Result<(), String> {
+    const SHAPE: &str =
+        "is not an origin: write scheme://host[:port], for example \"http://localhost:3000\"";
+    if entry.contains('*') {
+        return Err(
+            "is not an origin: wildcards are not supported; list each scheme://host[:port]"
+                .to_string(),
+        );
+    }
+    if entry.eq_ignore_ascii_case("null") {
+        return Err(
+            "is never allowed: it is the origin of sandboxed frames and file:// pages".to_string(),
+        );
+    }
+    let Some((scheme, rest)) = entry.split_once("://") else {
+        return Err(SHAPE.to_string());
+    };
+    if rest.is_empty() {
+        return Err(SHAPE.to_string());
+    }
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err("is not an origin: only http and https origins are supported".to_string());
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    if let Some((_, host_port)) = authority.rsplit_once('@') {
+        return Err(format!(
+            "is not an origin: an origin has no user name; write \"{scheme}://{host_port}\""
+        ));
+    }
+    if !tail.is_empty() {
+        return Err(format!(
+            "is not an origin: an origin has no path, query or fragment; write \
+             \"{scheme}://{authority}\""
+        ));
+    }
+    let (host, port) = split_host_port(authority)?;
+    let Some(port) = port else {
+        return Ok(());
+    };
+    let port: u16 = match port.parse() {
+        Ok(p) if p > 0 && port.bytes().all(|b| b.is_ascii_digit()) => p,
+        _ => return Err("is not an origin: it has an invalid port".to_string()),
+    };
+    let default_port = if scheme == "http" { 80 } else { 443 };
+    if port == default_port {
+        return Err(format!(
+            "names the default port, which browsers omit: write \"{scheme}://{host}\""
+        ));
+    }
+    Ok(())
+}
+
+/// Split an origin's authority into a validated host and an optional raw
+/// port string, for [`check_origin_entry`].
+fn split_host_port(authority: &str) -> Result<(&str, Option<&str>), String> {
+    const HOST: &str = "is not an origin: its host may contain only letters, digits, '-' and \
+                        '.' (write internationalized names in their xn-- form)";
+    if authority.starts_with('[') {
+        let Some(close) = authority.find(']') else {
+            return Err(HOST.to_string());
+        };
+        let (host, after) = authority.split_at(close + 1);
+        let inner = &host[1..host.len() - 1];
+        if inner.is_empty()
+            || !inner
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+        {
+            return Err(HOST.to_string());
+        }
+        return match after {
+            "" => Ok((host, None)),
+            _ => match after.strip_prefix(':') {
+                Some(port) => Ok((host, Some(port))),
+                None => Err(HOST.to_string()),
+            },
+        };
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    {
+        return Err(HOST.to_string());
+    }
+    Ok((host, port))
 }
 
 #[cfg(test)]
@@ -585,6 +988,13 @@ mod tests {
         assert!(toml::to_string_pretty(&grid_set)
             .unwrap()
             .contains("grid = \"FN20\""));
+
+        // COP-53: an unset token is omitted; the empty allowlist is printed.
+        assert!(
+            printed.contains("websocket_allowed_origins = []"),
+            "{printed}"
+        );
+        assert!(!printed.contains("websocket_token"), "{printed}");
 
         let parsed: DaemonConfig = toml::from_str(&printed).unwrap();
         assert_eq!(toml::to_string_pretty(&parsed).unwrap(), printed);
@@ -763,13 +1173,6 @@ beacon_interval_secs = 600
         assert_eq!(config.station_id.busy_hold_ms, 250);
         assert_eq!(config.station_id.id_interval_secs, 300);
         assert_eq!(config.station_id.beacon_interval_secs, 600);
-    }
-
-    #[test]
-    fn test_load_nonexistent_file() {
-        let path = std::env::temp_dir().join("nonexistent_coppa_config.toml");
-        let config = DaemonConfig::load_or_default(path.to_str().unwrap()).unwrap();
-        assert_eq!(config.audio.sample_rate, 48_000);
     }
 
     // ── PttConfig::parse ──────────────────────────────────────────────
@@ -1049,21 +1452,549 @@ beacon_interval_secs = 600
         assert_eq!(config.radio.turnaround_ms, 500);
     }
 
+    // ── COP-49: config discovery ─────────────────────────────────────
+
+    /// A uniquely named directory under the system temp dir, removed on drop.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "coppa-config-{tag}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create scratch directory");
+            Self(path)
+        }
+
+        /// Write `contents` to `name` (which may contain subdirectories).
+        fn write(&self, name: &str, contents: &str) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).expect("create parent directory");
+            std::fs::write(&path, contents).expect("write scratch file");
+            path
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                // Restore any permissions a test removed, so cleanup works.
+                use std::os::unix::fs::PermissionsExt;
+                fn unlock(dir: &Path) {
+                    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+                    if let Ok(entries) = std::fs::read_dir(dir) {
+                        for entry in entries.flatten() {
+                            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                                unlock(&entry.path());
+                            }
+                        }
+                    }
+                }
+                unlock(&self.0);
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unix_env(home: Option<&str>, xdg: Option<&str>) -> ConfigEnv {
+        ConfigEnv {
+            windows: false,
+            home: home.map(OsString::from),
+            xdg_config_home: xdg.map(OsString::from),
+            appdata: Some(OsString::from("C:\\ignored")),
+        }
+    }
+
+    fn user_candidate(dir: &str) -> PathBuf {
+        Path::new(dir).join("coppa").join(CONFIG_FILE_NAME)
+    }
+
+    const GOOD: &str = "0123456789abcdef0123456789abcdef";
+
+    /// A config with `[host] websocket_enabled = true` and the given token
+    /// and allowlist (COP-53).
+    fn ws(token: Option<&str>, origins: &[&str]) -> DaemonConfig {
+        let mut config = DaemonConfig::default();
+        config.host.websocket_enabled = true;
+        config.host.websocket_token = token.map(|t| SecretToken(t.to_string()));
+        config.host.websocket_allowed_origins = origins.iter().map(|o| o.to_string()).collect();
+        config
+    }
+
     #[test]
-    fn test_load_invalid_config_is_fatal() {
-        // E3: Write a file with invalid TOML and verify it returns Err.
-        // Process-unique path so parallel test binaries can't race on a shared file.
-        let path = std::env::temp_dir().join(format!(
-            "coppa_test_invalid_config_{}.toml",
-            std::process::id()
-        ));
-        std::fs::write(&path, "this is not valid [[[toml").unwrap();
-        let result = DaemonConfig::load_or_default(path.to_str().unwrap());
+    fn websocket_auth_defaults_to_no_token_and_no_origins() {
+        let host = HostConfig::default();
+        assert_eq!(host.websocket_token, None);
+        assert!(host.websocket_allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn secret_token_debug_never_shows_the_value() {
+        let config = ws(Some(GOOD), &[]);
+        let debug = format!("{:?}", config.host);
+        assert!(!debug.contains(GOOD), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+    }
+
+    #[test]
+    fn check_websocket_auth_skips_a_disabled_websocket() {
+        let mut config = ws(None, &["*"]);
+        config.host.websocket_enabled = false;
+        assert_eq!(config.check_websocket_auth(), Ok(()));
+    }
+
+    #[test]
+    fn check_websocket_auth_requires_a_token_when_enabled() {
+        let err = ws(None, &[]).check_websocket_auth().unwrap_err();
         assert!(
-            result.is_err(),
-            "Parse error on existing file should be fatal"
+            err.starts_with("[host] websocket_enabled = true requires [host] websocket_token"),
+            "{err}"
         );
-        std::fs::remove_file(&path).ok();
+        assert!(err.contains("openssl rand -hex 32"), "{err}");
+    }
+
+    #[test]
+    fn check_websocket_auth_rejects_a_short_token() {
+        let err = ws(Some("0123456789abcde"), &[])
+            .check_websocket_auth()
+            .unwrap_err();
+        assert!(
+            err.starts_with("[host] websocket_token is 15 characters long"),
+            "{err}"
+        );
+        assert!(err.contains("at least 16"), "{err}");
+        assert_eq!(
+            ws(Some("0123456789abcdef"), &[]).check_websocket_auth(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn check_websocket_auth_rejects_token_characters_outside_unreserved() {
+        for bad in ['\u{20}', '&', '#', '%', '+', '/', 'é'] {
+            let token: String = std::iter::once(bad)
+                .chain(std::iter::repeat_n('a', 19))
+                .collect();
+            let err = ws(Some(&token), &[]).check_websocket_auth().unwrap_err();
+            assert!(
+                err.starts_with("[host] websocket_token may contain only"),
+                "{bad:?}: {err}"
+            );
+            assert!(!err.contains(&token), "the error must not echo the token");
+        }
+        assert_eq!(ws(Some(GOOD), &[]).check_websocket_auth(), Ok(()));
+        assert_eq!(
+            ws(Some("abc-def.ghi_jkl~mno"), &[]).check_websocket_auth(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn check_websocket_auth_accepts_a_valid_token_and_origins() {
+        let origins = [
+            "http://localhost:3000",
+            "https://dash.example.org",
+            "http://127.0.0.1:8080",
+            "http://[::1]:3000",
+            "HTTP://LOCALHOST:3000",
+            "http://localhost",
+        ];
+        assert_eq!(ws(Some(GOOD), &origins).check_websocket_auth(), Ok(()));
+    }
+
+    #[test]
+    fn check_websocket_auth_rejects_malformed_origin_entries() {
+        let cases = [
+            ("*", "wildcards are not supported"),
+            ("null", "never allowed"),
+            ("localhost:3000", "write scheme://host[:port]"),
+            ("http://localhost:3000/", "write \"http://localhost:3000\""),
+            ("http://localhost:3000/app", "no path, query or fragment"),
+            ("http://localhost:3000?x=1", "no path, query or fragment"),
+            ("http://user@localhost:3000", "no user name"),
+            ("http://localhost:80", "write \"http://localhost\""),
+            ("https://example.org:443", "write \"https://example.org\""),
+            ("ftp://example.org", "only http and https"),
+            ("http://", "write scheme://host[:port]"),
+            ("http://local host", "host may contain only"),
+            ("http://localhost:0", "port"),
+            ("http://localhost:65536", "port"),
+            ("http://localhost:30x0", "port"),
+            ("", "write scheme://host[:port]"),
+        ];
+        for (entry, fragment) in cases {
+            let err = ws(Some(GOOD), &[entry]).check_websocket_auth().unwrap_err();
+            let prefix = format!("[host] websocket_allowed_origins entry {entry:?}");
+            assert!(err.starts_with(&prefix), "{entry:?}: {err}");
+            assert!(err.contains(fragment), "{entry:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_example_config_documents_websocket_auth_keys() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../coppad.toml.example");
+        let text = std::fs::read_to_string(path).unwrap();
+
+        // Both keys appear as commented `key = value` lines inside [host].
+        let mut table = String::new();
+        let mut token_line = false;
+        let mut origins_line = false;
+        for line in text.lines() {
+            let trimmed = line.trim_start_matches('#').trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.contains(' ') {
+                table = trimmed.to_string();
+            }
+            let commented = line.trim_start().starts_with('#');
+            if commented && trimmed.starts_with("websocket_token = ") {
+                assert_eq!(table, "[host]", "websocket_token outside [host]: {line:?}");
+                token_line = true;
+            }
+            if commented && trimmed.starts_with("websocket_allowed_origins = ") {
+                assert_eq!(
+                    table, "[host]",
+                    "websocket_allowed_origins outside [host]: {line:?}"
+                );
+                origins_line = true;
+            }
+        }
+        assert!(token_line, "no commented websocket_token line in [host]");
+        assert!(
+            origins_line,
+            "no commented websocket_allowed_origins line in [host]"
+        );
+        assert!(text.contains("openssl rand -hex 32"));
+
+        let config: DaemonConfig = toml::from_str(&text).unwrap();
+        assert!(!config.host.websocket_enabled);
+    }
+
+    #[test]
+    fn unix_candidates_are_cwd_then_home_config_then_etc() {
+        assert_eq!(
+            config_candidates(&unix_env(Some("/home/op"), None)),
+            vec![
+                PathBuf::from("coppad.toml"),
+                Path::new("/home/op")
+                    .join(".config")
+                    .join("coppa")
+                    .join("coppad.toml"),
+                PathBuf::from("/etc/coppa/coppad.toml"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_absolute_xdg_config_home_replaces_the_home_candidate() {
+        assert_eq!(
+            config_candidates(&unix_env(Some("/home/op"), Some("/srv/xdg"))),
+            vec![
+                PathBuf::from(CONFIG_FILE_NAME),
+                user_candidate("/srv/xdg"),
+                PathBuf::from(SYSTEM_CONFIG_PATH),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_relative_or_empty_xdg_config_home_falls_back_to_home() {
+        let home_only = config_candidates(&unix_env(Some("/home/op"), None));
+        for xdg in ["", "relative/xdg", "./xdg"] {
+            assert_eq!(
+                config_candidates(&unix_env(Some("/home/op"), Some(xdg))),
+                home_only,
+                "XDG_CONFIG_HOME={xdg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unset_empty_or_relative_home_has_no_user_candidate() {
+        for home in [None, Some(""), Some("relative/home")] {
+            assert_eq!(
+                config_candidates(&unix_env(home, None)),
+                vec![
+                    PathBuf::from(CONFIG_FILE_NAME),
+                    PathBuf::from(SYSTEM_CONFIG_PATH)
+                ],
+                "HOME={home:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_candidates_are_cwd_then_appdata_and_ignore_home_and_xdg() {
+        let appdata = "C:\\Users\\op\\AppData\\Roaming";
+        let env = ConfigEnv {
+            windows: true,
+            home: Some(OsString::from("/home/op")),
+            xdg_config_home: Some(OsString::from("/srv/xdg")),
+            appdata: Some(OsString::from(appdata)),
+        };
+        assert_eq!(
+            config_candidates(&env),
+            vec![PathBuf::from(CONFIG_FILE_NAME), user_candidate(appdata)]
+        );
+
+        for appdata in [None, Some(OsString::new())] {
+            let env = ConfigEnv {
+                appdata,
+                ..env.clone()
+            };
+            assert_eq!(
+                config_candidates(&env),
+                vec![PathBuf::from(CONFIG_FILE_NAME)],
+                "{env:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_process_uses_this_platform() {
+        assert_eq!(ConfigEnv::from_process().windows, cfg!(windows));
+    }
+
+    #[test]
+    fn discover_uses_the_first_existing_candidate() {
+        let dir = ScratchDir::new("first-wins");
+        let missing = dir.0.join("missing.toml");
+        let first = dir.write("a/coppad.toml", "[engine]\ncallsign = \"W5AU\"\n");
+        let second = dir.write("b/coppad.toml", "[engine]\ncallsign = \"VK2ABC\"\n");
+        let candidates = vec![missing, first.clone(), second];
+        let found = DaemonConfig::discover(&candidates).unwrap();
+        assert_eq!(found.source.as_ref(), Some(&first));
+        assert_eq!(found.config.engine.callsign, "W5AU");
+        assert_eq!(found.shared.callsign.as_deref(), Some("W5AU"));
+        assert_eq!(found.shared.profile, None);
+        assert_eq!(found.searched, candidates[..2]);
+        assert!(found.permission_denied.is_empty());
+    }
+
+    #[test]
+    fn discover_falls_back_to_defaults_when_nothing_exists() {
+        let dir = ScratchDir::new("none");
+        let candidates = vec![
+            dir.0.join("coppad.toml"),
+            dir.0.join("no/such/dir/coppad.toml"),
+        ];
+        let found = DaemonConfig::discover(&candidates).unwrap();
+        assert_eq!(found.source, None);
+        assert_eq!(found.searched, candidates);
+        assert_eq!(found.config.engine.callsign, "");
+        assert_eq!(found.shared, SharedSettings::default());
+        assert_eq!(found.config.audio.sample_rate, 48_000);
+        assert_eq!(
+            found.search_summary(),
+            format!("{}, {}", candidates[0].display(), candidates[1].display())
+        );
+    }
+
+    #[test]
+    fn discover_skips_a_candidate_under_a_regular_file() {
+        let dir = ScratchDir::new("not-a-dir");
+        let file = dir.write("plain", "");
+        let valid = dir.write("valid/coppad.toml", "");
+        let found = DaemonConfig::discover(&[file.join("coppad.toml"), valid.clone()]).unwrap();
+        assert_eq!(found.source, Some(valid));
+    }
+
+    #[test]
+    fn discover_fails_on_a_directory_naming_it() {
+        let dir = ScratchDir::new("is-dir");
+        let candidate = dir.0.join("coppad.toml");
+        std::fs::create_dir(&candidate).unwrap();
+        let valid = dir.write("valid/coppad.toml", "");
+        let err = DaemonConfig::discover(&[candidate.clone(), valid])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with(&format!("Failed to parse config {}", candidate.display())),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn discover_fails_on_an_unknown_key_without_trying_the_next_file() {
+        let dir = ScratchDir::new("typo");
+        let broken = dir.write("a/coppad.toml", "[engine]\ncalsign = \"W5AU\"\n");
+        let valid = dir.write("b/coppad.toml", "[engine]\ncallsign = \"W5AU\"\n");
+        let err = DaemonConfig::discover(&[broken.clone(), valid])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with(&format!("Failed to parse config {}", broken.display())),
+            "{err}"
+        );
+        assert!(err.contains("unknown field `calsign`"), "{err}");
+    }
+
+    #[test]
+    fn discover_fails_on_malformed_toml_naming_it() {
+        let dir = ScratchDir::new("malformed");
+        let broken = dir.write("coppad.toml", "this is not valid [[[toml");
+        let err = DaemonConfig::discover(std::slice::from_ref(&broken))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with(&format!("Failed to parse config {}", broken.display())),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn shared_settings_preserve_presence_and_empty_values() {
+        let defaults = SharedSettings::from_validated_toml("").unwrap();
+        assert_eq!(defaults.profile, None);
+        assert_eq!(DaemonConfig::default().engine.profile, "HF_STANDARD");
+        let explicit = SharedSettings::from_validated_toml(
+            "[engine]\nprofile = \"HF_STANDARD\"\ncallsign = \"\"\n[audio]\ninput_device = \"\"\noutput_device = \"\"\n[radio]\nband = \"\"\n"
+        ).unwrap();
+        assert_eq!(explicit.profile.as_deref(), Some("HF_STANDARD"));
+        assert_eq!(explicit.callsign, None);
+        assert_eq!(explicit.input_device, None);
+        assert_eq!(explicit.output_device, None);
+        assert_eq!(explicit.band.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn shared_view_covers_every_cli_key_in_a_full_config() {
+        let config = DaemonConfig::default();
+        let text = toml::to_string(&config).unwrap();
+        let shared = SharedSettings::from_validated_toml(&text).unwrap();
+        assert!(shared.profile.is_some());
+        assert!(shared.ptt_method.is_some());
+        assert!(shared.rigctld_address.is_some());
+        assert!(shared.ptt_pre_delay_ms.is_some());
+        assert!(shared.ptt_tail_delay_ms.is_some());
+        // Optional frequency and band are absent in the daemon default;
+        // writing them makes the presence view report them too.
+        let mut config = config;
+        config.engine.callsign = "W5AU".into();
+        config.audio.input_device = "in".into();
+        config.audio.output_device = "out".into();
+        config.radio.frequency_hz = Some(14_074_000);
+        config.radio.band = Some("20m".into());
+        let full = SharedSettings::from_validated_toml(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(full.callsign.as_deref(), Some("W5AU"));
+        assert_eq!(full.input_device.as_deref(), Some("in"));
+        assert_eq!(full.output_device.as_deref(), Some("out"));
+        assert_eq!(full.frequency_hz, Some(14_074_000));
+        assert_eq!(full.band.as_deref(), Some("20m"));
+    }
+
+    #[test]
+    fn strict_config_rejects_typo_before_shared_view() {
+        let path = std::env::temp_dir().join(format!("cop57_typo_{}.toml", std::process::id()));
+        std::fs::write(&path, "[engine]\ncalsign = \"W5AU\"\n").unwrap();
+        let error = DaemonConfig::load_with_shared(&path)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, DaemonConfig::load(&path).unwrap_err().to_string());
+        std::fs::remove_file(path).unwrap();
+        assert!(error.contains("unknown field `calsign`"), "{error}");
+        assert!(error.contains("line 2, column 1"), "{error}");
+    }
+
+    #[test]
+    fn search_summary_marks_permission_denied_candidates() {
+        let found = Discovered {
+            config: DaemonConfig::default(),
+            shared: SharedSettings::default(),
+            source: None,
+            searched: vec![
+                PathBuf::from("coppad.toml"),
+                PathBuf::from("/home/op/.config/coppa/coppad.toml"),
+                PathBuf::from("/etc/coppa/coppad.toml"),
+            ],
+            permission_denied: vec![PathBuf::from("/home/op/.config/coppa/coppad.toml")],
+        };
+        assert_eq!(
+            found.search_summary(),
+            "coppad.toml, /home/op/.config/coppa/coppad.toml (permission denied), \
+             /etc/coppa/coppad.toml"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_skips_a_dangling_symlink() {
+        let dir = ScratchDir::new("dangling");
+        let link = dir.0.join("coppad.toml");
+        std::os::unix::fs::symlink(dir.0.join("nowhere.toml"), &link).unwrap();
+        let valid = dir.write("valid/coppad.toml", "[engine]\ncallsign = \"W5AU\"\n");
+        let found = DaemonConfig::discover(&[link, valid.clone()]).unwrap();
+        assert_eq!(found.source, Some(valid));
+        assert_eq!(found.config.engine.callsign, "W5AU");
+    }
+
+    /// Remove every permission from `dir`. Returns false when the process can
+    /// still list it (it runs as root), so a permission test cannot run.
+    #[cfg(unix)]
+    fn lock(dir: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(dir).is_ok() {
+            eprintln!(
+                "skipping: {} is still readable at mode 000 (root?)",
+                dir.display()
+            );
+            return false;
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_skips_and_records_a_candidate_under_an_unenterable_directory() {
+        let dir = ScratchDir::new("locked-parent");
+        let hidden = dir.write("home/.config/coppa/coppad.toml", "");
+        let valid = dir.write("etc/coppad.toml", "[engine]\ncallsign = \"W5AU\"\n");
+        if !lock(&dir.0.join("home/.config")) {
+            return;
+        }
+        let candidates = vec![hidden.clone(), valid.clone()];
+        let found = DaemonConfig::discover(&candidates).unwrap();
+        assert_eq!(found.source, Some(valid));
+        assert_eq!(found.config.engine.callsign, "W5AU");
+        assert_eq!(found.searched, candidates);
+        assert_eq!(found.permission_denied, vec![hidden.clone()]);
+        assert!(
+            found
+                .search_summary()
+                .starts_with(&format!("{} (permission denied), ", hidden.display())),
+            "{}",
+            found.search_summary()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_fails_on_an_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = ScratchDir::new("locked-file");
+        let unreadable = dir.write("a/coppad.toml", "");
+        let valid = dir.write("b/coppad.toml", "");
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&unreadable).is_ok() {
+            eprintln!(
+                "skipping: {} is still readable at mode 000 (root?)",
+                unreadable.display()
+            );
+            return;
+        }
+        let err = DaemonConfig::discover(&[unreadable.clone(), valid])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with(&format!("Failed to parse config {}", unreadable.display())),
+            "{err}"
+        );
+        assert!(err.contains("ermission denied"), "{err}");
     }
 
     #[test]
@@ -1149,6 +2080,17 @@ beacon_interval_secs = 600
         for name in ["HF_ROBUST", "HF_STANDARD", "VHF_FAST", "EMERGENCY"] {
             assert!(err.contains(name), "{name} missing: {err}");
         }
+    }
+
+    #[test]
+    fn websocket_enabled_needs_a_websocket_build() {
+        let mut config = DaemonConfig::default();
+        assert!(config.check_websocket_built(false).is_ok());
+        config.host.websocket_enabled = true;
+        assert!(config.check_websocket_built(true).is_ok());
+        let err = config.check_websocket_built(false).unwrap_err();
+        assert!(err.contains("--features websocket"), "{err}");
+        assert!(err.contains("websocket_enabled = false"), "{err}");
     }
 
     #[test]

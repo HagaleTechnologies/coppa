@@ -1,0 +1,9 @@
+# tools/pat-loop: per-run ALSA config, written to each process's $HOME/.asoundrc
+# by run.sh with @DIR@ replaced by the scratch directory. Two userspace audio
+# devices joined by relay.py; no sound card or kernel module needed.
+pcm.coppa_a_play { type file; slave.pcm "null"; file "@DIR@/ab_in"; format "raw" }
+pcm.coppa_a_cap  { type file; slave.pcm "null"; file "/dev/null"; infile "@DIR@/ba_out"; format "raw" }
+pcm.coppa_b_play { type file; slave.pcm "null"; file "@DIR@/ba_in"; format "raw" }
+pcm.coppa_b_cap  { type file; slave.pcm "null"; file "/dev/null"; infile "@DIR@/ab_out"; format "raw" }
+pcm.coppa_a { type asym; playback.pcm "coppa_a_play"; capture.pcm "coppa_a_cap"; hint { show on; description "coppa-loop-A" } }
+pcm.coppa_b { type asym; playback.pcm "coppa_b_play"; capture.pcm "coppa_b_cap"; hint { show on; description "coppa-loop-B" } }

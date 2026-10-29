@@ -170,7 +170,7 @@ fn soft_symbol(mapper: &dyn ConstellationMapper, llrs: &[f32]) -> Complex32 {
 /// per-rate 802.11 QC-LDPC codec (Z=81, 24 base columns also gave 1944), but
 /// now a fixed rate-matching target rather than an intrinsic per-code
 /// property.
-const CODED_BLOCK_LEN: usize = 1944;
+pub(crate) const CODED_BLOCK_LEN: usize = 1944;
 
 /// Payload integrity check (Phase 3 Task 1): a CRC-32 (CRC-32/ISO-HDLC, the
 /// familiar "zip/gzip/ethernet" polynomial) appended to the application payload
@@ -253,8 +253,10 @@ const RV_MASK: u8 = 0x03;
 /// addition -- valid because this codec's LLR scales are already calibrated,
 /// per decision 3; no reweighting needed). Evicted on CRC pass, on an
 /// explicit external cumulative-ACK advance (see
-/// [`CoppaTransceiver::harq_evict`]), or on LRU overflow beyond
-/// [`HARQ_MAX_BUFFERS`] -- whichever comes first.
+/// [`CoppaTransceiver::harq_evict`]), on LRU overflow beyond
+/// [`HARQ_MAX_BUFFERS`], or -- COP-68 -- when a transmission of the same seq
+/// arrives at a different speed level (see `get_or_create`'s level-change
+/// eviction guard) -- whichever comes first.
 ///
 /// Decision 3's brief pseudocode names this `LruMap<u8, Vec<f32>>`; there is
 /// no such crate in this workspace's dependencies and the plan disallows
@@ -266,8 +268,12 @@ const RV_MASK: u8 = 0x03;
 /// trigger: those evict by a fixed retained-sample budget, this one by LRU
 /// recency + an explicit count cap).
 struct HarqRxBuffers {
-    /// seq -> accumulated mother-length LLR buffer.
-    map: HashMap<u8, Vec<f32>>,
+    /// seq -> (accumulated mother-length LLR buffer, the speed level that
+    /// buffer was built from). COP-68: the level guard -- a combine whose
+    /// header level differs from the buffered level drops the entry and
+    /// starts fresh (see `get_or_create`), so LLRs from differently
+    /// rate-matched geometries are never added together.
+    map: HashMap<u8, (Vec<f32>, u8)>,
     /// Recency order, least-recently-used at the front, most-recently-used at
     /// the back. Each live seq appears at most once (enforced by `touch`). A
     /// linear scan/removal is fine at this size (capped at
@@ -297,18 +303,39 @@ impl HarqRxBuffers {
     /// evicting the least-recently-used entry first if this insert would
     /// exceed [`HARQ_MAX_BUFFERS`]) if this is the first transmission of
     /// `seq` seen since it was last evicted. Touches `seq` either way.
-    fn get_or_create(&mut self, seq: u8) -> &mut Vec<f32> {
+    ///
+    /// COP-68 level-change eviction guard: if `seq` is buffered at a
+    /// different speed level than this transmission's, the buffered LLRs
+    /// came from a differently rate-matched/punctured geometry -- adding
+    /// them onto this transmission's dematch output is combining numbers
+    /// from different code coordinates. Drop the stale entry and start
+    /// fresh (the research §5 probe measured the misalignment benign at one
+    /// harsh operating point, but the regime is uncharacterized, and
+    /// COP-68's drop-to-a-robust-level retransmissions make cross-level
+    /// combines ordinary rather than rare). Research's five-line
+    /// recommendation, now enforced.
+    fn get_or_create(&mut self, seq: u8, level: u8) -> &mut Vec<f32> {
+        let level_mismatch = self
+            .map
+            .get(&seq)
+            .is_some_and(|(_, buffered_level)| *buffered_level != level);
+        if level_mismatch {
+            self.evict(seq);
+        }
         if !self.map.contains_key(&seq) {
             if self.map.len() >= HARQ_MAX_BUFFERS && !self.order.is_empty() {
                 let lru = self.order.remove(0);
                 self.map.remove(&lru);
             }
-            self.map.insert(seq, vec![0.0f32; NrLdpc::MOTHER_LEN]);
+            self.map
+                .insert(seq, (vec![0.0f32; NrLdpc::MOTHER_LEN], level));
         }
         self.touch(seq);
-        self.map
+        &mut self
+            .map
             .get_mut(&seq)
             .expect("just inserted or already present above")
+            .0
     }
 
     /// Evict `seq`'s buffer, if any (decision 3: CRC pass or an explicit
@@ -836,6 +863,7 @@ impl CoppaTransceiver {
     fn harq_combine_and_decode(
         &self,
         seq: u8,
+        level: u8,
         rv: u8,
         k_used: usize,
         payload_bits: usize,
@@ -851,7 +879,10 @@ impl CoppaTransceiver {
 
         let mut dematched = {
             let mut harq = self.harq_rx.borrow_mut();
-            let acc = harq.get_or_create(seq);
+            // COP-68: `level` (this transmission's header speed level) rides
+            // along so the buffer can evict a differently-leveled entry
+            // instead of combining across rate-matched geometries.
+            let acc = harq.get_or_create(seq, level);
             for (a, &d) in acc.iter_mut().zip(per_tx.iter()) {
                 *a += d;
             }
@@ -1034,8 +1065,15 @@ impl CoppaTransceiver {
         // `Self::harq_combine_and_decode`'s doc.
         let seq = header.seq_num;
         let rv = header.fec_type & RV_MASK;
-        let (posterior, mut decoded_bits, mut converged, mut iterations) =
-            self.harq_combine_and_decode(seq, rv, k_used, payload_bits, &deinterleaved);
+        let (posterior, mut decoded_bits, mut converged, mut iterations) = self
+            .harq_combine_and_decode(
+                seq,
+                header.speed_level,
+                rv,
+                k_used,
+                payload_bits,
+                &deinterleaved,
+            );
 
         // 6b. One-round turbo re-estimation (Task 5): on a first-pass non-convergence,
         // build soft "virtual pilot" symbols from the failed decode's posterior LLRs,
@@ -2409,13 +2447,13 @@ mod tests {
         // checked `converged` alone was misled by exactly that on a stale
         // (accumulator-reuse) bug during development.
         let (_, d_rv0_alone, converged_rv0_alone, _) =
-            tx.harq_combine_and_decode(101, 0, k_used, payload_bits, &llrs_rv0);
+            tx.harq_combine_and_decode(101, 9, 0, k_used, payload_bits, &llrs_rv0);
         assert!(
             !(converged_rv0_alone && descramble_to_payload(&d_rv0_alone, payload.len()) == payload),
             "RV0 alone (30% erasure) must NOT decode correctly -- test fixture invariant"
         );
         let (_, d_rv1_alone, converged_rv1_alone, _) =
-            tx.harq_combine_and_decode(102, 1, k_used, payload_bits, &llrs_rv1);
+            tx.harq_combine_and_decode(102, 9, 1, k_used, payload_bits, &llrs_rv1);
         assert!(
             !(converged_rv1_alone && descramble_to_payload(&d_rv1_alone, payload.len()) == payload),
             "RV1 alone (30% erasure) must NOT decode correctly -- test fixture invariant"
@@ -2424,14 +2462,14 @@ mod tests {
         // Combined: same seq for both transmissions.
         const SEQ: u8 = 200;
         let (_, d_first, converged_first, _) =
-            tx.harq_combine_and_decode(SEQ, 0, k_used, payload_bits, &llrs_rv0);
+            tx.harq_combine_and_decode(SEQ, 9, 0, k_used, payload_bits, &llrs_rv0);
         assert!(
             !(converged_first && descramble_to_payload(&d_first, payload.len()) == payload),
             "first transmission (RV0) alone must not decode correctly (sanity, same as the \
              isolated probe above)"
         );
         let (_, decoded_bits, converged_combined, _) =
-            tx.harq_combine_and_decode(SEQ, 1, k_used, payload_bits, &llrs_rv1);
+            tx.harq_combine_and_decode(SEQ, 9, 1, k_used, payload_bits, &llrs_rv1);
         assert!(
             converged_combined,
             "RV0+RV1 combined via IR-HARQ must converge even though neither alone does"
@@ -2459,7 +2497,7 @@ mod tests {
         let llrs_b = erased_coded_llrs(&mother, k_used, 0, 0.30, 8.0, 0x5EED_0002);
 
         let (_, d_alone, converged_alone, _) =
-            tx.harq_combine_and_decode(210, 0, k_used, payload_bits, &llrs_a);
+            tx.harq_combine_and_decode(210, 9, 0, k_used, payload_bits, &llrs_a);
         assert!(
             !(converged_alone && descramble_to_payload(&d_alone, payload.len()) == payload),
             "one RV0 transmission alone (30% erasure) must NOT decode correctly -- test fixture invariant"
@@ -2467,13 +2505,13 @@ mod tests {
 
         const SEQ: u8 = 211;
         let (_, d_first, converged_first, _) =
-            tx.harq_combine_and_decode(SEQ, 0, k_used, payload_bits, &llrs_a);
+            tx.harq_combine_and_decode(SEQ, 9, 0, k_used, payload_bits, &llrs_a);
         assert!(
             !(converged_first && descramble_to_payload(&d_first, payload.len()) == payload),
             "first RV0 transmission alone must not decode correctly (sanity)"
         );
         let (_, decoded_bits, converged_combined, _) =
-            tx.harq_combine_and_decode(SEQ, 0, k_used, payload_bits, &llrs_b);
+            tx.harq_combine_and_decode(SEQ, 9, 0, k_used, payload_bits, &llrs_b);
         assert!(
             converged_combined,
             "two independently-erased RV0 transmissions of the same seq (Chase combining) \
@@ -2510,6 +2548,64 @@ mod tests {
         );
     }
 
+    /// COP-68 regression, research §5's cross-level operating point: a
+    /// corrupted-payload level-5 frame (header decodes, LDPC fails) leaves
+    /// its LLRs in the seq buffer; a clean level-1 retransmission of the
+    /// same payload must then still decode. With the level-change eviction
+    /// guard this is evict-then-clean-combine; the research probe measured
+    /// the unguarded cross-level combine benign at this exact operating
+    /// point (19-20/20), so the test's role is to pin the regime -- it must
+    /// not be weakened to `#[ignore]`.
+    #[test]
+    fn harq_cross_level_retransmission_decodes_after_failed_frame() {
+        let profile = CoppaProfile::hf_standard();
+        let tx = CoppaTransceiver::new(profile.clone(), 1);
+        let payload = vec![0x77u8; 40]; // fits level 5 (158 B) and level 1 (56 B)
+
+        // A level-5 frame whose payload region is destroyed after the
+        // protected header: the Golay-protected header decodes, LDPC sees
+        // silence, and the failed frame's LLRs land in the seq-0 buffer.
+        let header5 = make_header(5, payload.len() as u16);
+        let mut corrupted = tx
+            .transmit(&header5, &payload)
+            .expect("payload within level 5 capacity");
+        let symbol_len = profile.fft_size + profile.cp_samples;
+        let header_syms = coppa_codec::ofdm::header_fec::PROTECTED_HEADER_CODED_BITS
+            .div_ceil(profile.data_carriers);
+        let header_end = (3 + header_syms) * symbol_len;
+        let cut = header_end.min(corrupted.len());
+        for s in corrupted.iter_mut().skip(cut) {
+            *s = 0.0;
+        }
+
+        let outcome = tx.receive(&corrupted);
+        assert!(
+            matches!(
+                outcome,
+                Err(ReceiveError::LdpcNotConverged { .. }) | Err(ReceiveError::CrcMismatch)
+            ),
+            "the tail-corrupted level-5 frame must fail POST-header (got {outcome:?})"
+        );
+        assert!(
+            tx.harq_rx.borrow().contains(header5.seq_num),
+            "the failed frame's LLRs must be buffered for combining"
+        );
+
+        // A clean level-1 retransmission of the SAME payload decodes: the
+        // guard evicts the level-5 LLRs rather than combining across
+        // rate-matched geometries, then the clean frame decodes on its own.
+        let header1 = make_header(1, payload.len() as u16);
+        let clean = tx
+            .transmit(&header1, &payload)
+            .expect("payload within level 1 capacity");
+        let (h, rx, _lvl) = tx
+            .receive(&clean)
+            .expect("the clean cross-level retransmission must decode");
+        assert_eq!(h.speed_level, 1);
+        assert_eq!(&rx[..payload.len()], payload.as_slice());
+        assert!(!tx.harq_rx.borrow().contains(header1.seq_num));
+    }
+
     /// Task 3 failing-test scenario (c), part 2: inserting more than
     /// `HARQ_MAX_BUFFERS` distinct in-flight seqs evicts the least-recently-
     /// used ones to stay within the cap.
@@ -2524,7 +2620,7 @@ mod tests {
 
         let extra = 5u8;
         for seq in 0u8..(HARQ_MAX_BUFFERS as u8 + extra) {
-            let _ = tx.harq_combine_and_decode(seq, 0, k_used, payload_bits, &weak_llrs);
+            let _ = tx.harq_combine_and_decode(seq, 9, 0, k_used, payload_bits, &weak_llrs);
         }
 
         assert_eq!(
@@ -2559,8 +2655,8 @@ mod tests {
         // `harq_evict` call from the CRC-pass eviction path tested above.
         let weak_llrs = erased_coded_llrs(&mother, k_used, 0, 0.9, 8.0, 0xFACE);
 
-        let _ = tx.harq_combine_and_decode(10, 0, k_used, payload_bits, &weak_llrs);
-        let _ = tx.harq_combine_and_decode(11, 0, k_used, payload_bits, &weak_llrs);
+        let _ = tx.harq_combine_and_decode(10, 9, 0, k_used, payload_bits, &weak_llrs);
+        let _ = tx.harq_combine_and_decode(11, 9, 0, k_used, payload_bits, &weak_llrs);
         assert!(
             tx.harq_rx.borrow().contains(10) && tx.harq_rx.borrow().contains(11),
             "both seqs should have live buffers before eviction"

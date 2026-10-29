@@ -7,7 +7,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 
 use super::command::{response_channel, VaraCommandPort};
-use super::data::VaraDataPort;
+use super::data::{data_channel, VaraDataPort};
 use super::protocol::VaraResponse;
 use crate::HostEvent;
 
@@ -147,7 +147,9 @@ impl VaraServer {
                         let permit = match cmd_semaphore.clone().try_acquire_owned() {
                             Ok(p) => p,
                             Err(_) => {
-                                eprintln!("Command port connection limit reached, dropping client");
+                                tracing::warn!(
+                                    "Command port connection limit reached, dropping client"
+                                );
                                 drop(stream);
                                 continue;
                             }
@@ -167,13 +169,13 @@ impl VaraServer {
                                 VaraCommandPort::handle_client(stream, client_id, ev_tx, resp_rx)
                                     .await
                             {
-                                eprintln!("Command client {} error: {}", client_id, e);
+                                tracing::warn!(client_id, error = %e, "Command client error");
                             }
                             resp_senders_cleanup.lock().await.remove(&cleanup_id);
                         });
                     }
                     Err(e) => {
-                        eprintln!("Command port accept error: {}", e);
+                        tracing::error!(error = %e, "Command port accept error");
                     }
                 }
             }
@@ -191,7 +193,9 @@ impl VaraServer {
                         let permit = match data_semaphore.clone().try_acquire_owned() {
                             Ok(p) => p,
                             Err(_) => {
-                                eprintln!("Data port connection limit reached, dropping client");
+                                tracing::warn!(
+                                    "Data port connection limit reached, dropping client"
+                                );
                                 drop(stream);
                                 continue;
                             }
@@ -199,7 +203,7 @@ impl VaraServer {
                         // E2: Use data-port namespace
                         let client_id = next_data_id.fetch_add(1, Ordering::Relaxed);
                         let ev_tx = data_event_tx.clone();
-                        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
+                        let (data_tx, data_rx) = data_channel();
                         let ds = data_senders.clone();
                         ds.lock().await.insert(client_id, data_tx);
                         let ds_cleanup = ds.clone();
@@ -208,13 +212,13 @@ impl VaraServer {
                             if let Err(e) =
                                 VaraDataPort::handle_client(stream, client_id, ev_tx, data_rx).await
                             {
-                                eprintln!("Data client {} error: {}", client_id, e);
+                                tracing::warn!(client_id, error = %e, "Data client error");
                             }
                             ds_cleanup.lock().await.remove(&client_id);
                         });
                     }
                     Err(e) => {
-                        eprintln!("Data port accept error: {}", e);
+                        tracing::error!(error = %e, "Data port accept error");
                     }
                 }
             }
