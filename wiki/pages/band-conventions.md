@@ -9,8 +9,8 @@ sources:
   - crates/coppa-engine/src/**
   - crates/coppa-codec/src/ofdm/**
 verified:
-  commit: c1d2676
-  date: 2026-07-07
+  commit: 56361d6
+  date: 2026-10-28
 links:
   - overview
   - coppa-engine
@@ -18,8 +18,10 @@ links:
 Coppa operates at a fixed 48 kHz sample rate across all profiles and speed
 levels. The waveform occupies a 300–2700 Hz SSB audio passband (carrier offset
 of 6 FFT bins). All profile constants (carrier count, cyclic prefix length,
-symbol duration, pilot layout) assume 48 kHz; resampling to other rates is the
-caller's responsibility via `coppa-dsp`'s resampling utilities.
+symbol duration, pilot layout) assume 48 kHz. No crate in the workspace
+resamples; audio at another rate must be converted before it reaches Coppa,
+and `coppad` rejects any `[audio] sample_rate` other than the profile's rate
+at startup (`DaemonConfig::check_sample_rate`).
 
 ## Pointers
 

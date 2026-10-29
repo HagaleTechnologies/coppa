@@ -8,11 +8,20 @@ use std::path::PathBuf;
 use clap::{Parser, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
-/// Config file read when neither `CONFIG` nor `--config` is given.
-pub const DEFAULT_CONFIG_PATH: &str = "coppad.toml";
-
+// COP-49: the implicit search order, `config::config_candidates`. Clap is
+// built without `wrap_help`, so these lines print as written; keep each under
+// 90 columns.
+#[cfg(not(windows))]
 const AFTER_HELP: &str = "\
-Without CONFIG or --config, load ./coppad.toml if present; otherwise use built-in defaults.
+Without CONFIG or --config, use the first file found of ./coppad.toml,
+$XDG_CONFIG_HOME/coppa/coppad.toml (default ~/.config/coppa/coppad.toml) and
+/etc/coppa/coppad.toml; otherwise use built-in defaults.
+Explicit config paths must exist. --check does not verify hardware or runtime settings.";
+
+#[cfg(windows)]
+const AFTER_HELP: &str = "\
+Without CONFIG or --config, use the first file found of ./coppad.toml and
+%APPDATA%\\coppa\\coppad.toml; otherwise use built-in defaults.
 Explicit config paths must exist. --check does not verify hardware or runtime settings.";
 
 // No doc comment here: clap would turn it into the `--help` long description.
@@ -97,7 +106,9 @@ impl LogLevel {
 pub enum ConfigSource {
     /// A path named on the command line; it must exist.
     Explicit(PathBuf),
-    /// Nothing named: `./coppad.toml` if present, otherwise built-in defaults.
+    /// Nothing named: the first file found of `./coppad.toml`, the user
+    /// config dir and `/etc/coppa/coppad.toml` (COP-49, see
+    /// `config::config_candidates`), otherwise built-in defaults.
     Implicit,
 }
 

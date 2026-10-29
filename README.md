@@ -21,6 +21,7 @@ Open-source ham radio digital communications system written in Rust.
 | Operating profiles | Implemented | 48 kHz OFDM profiles with runtime speed-level selection within the configured band |
 | Link adaptation | Implemented, limited calibration | Measurement-driven speed selection and ACK-driven RateLoop with ARQ enabled; no model inference; performance targets remain unmet, see [BENCHMARKS.md](BENCHMARKS.md) |
 | Serial/GPIO PTT | Implemented, feature-gated | Daemon serial DTR/RTS uses `serial-ptt`; Linux sysfs GPIO uses `gpio-ptt` |
+| Service files | Provided, not hardware-verified | systemd unit and macOS launchd agent in `contrib/`; Raspberry Pi 4 install guide in [docs/tutorials/raspberry-pi-install.md](docs/tutorials/raspberry-pi-install.md) |
 | KISS TNC (AFSK 1200) | Implemented, bring-up and testing only | Needs the kiss-tnc and cpal-backend features; not a Direwolf replacement; see [docs/TNC.md](docs/TNC.md) |
 | IR-HARQ | Unwired codec primitive | Redundancy-version and combining support exists in the codec; engine/daemon retransmissions do not wire it into an operational IR-HARQ feature |
 | VARA RF/waveform compatibility | Not supported | The TCP control interface is VARA-style; Coppa does not interoperate with VARA over RF |
@@ -52,8 +53,14 @@ coppa loopback "Hello from Coppa"
 # Encode a message to a WAV file
 coppa tx "CQ CQ CQ DE VK2ABC K" -o cq.wav
 
+# Encode at a chosen speed level (HF carries 1-8; see coppa profiles)
+coppa tx "CQ CQ CQ DE VK2ABC K" --level 4 -o cq.wav
+
 # Decode a WAV file (prints the message text)
 coppa rx cq.wav
+
+# Stream one JSON object per decoded frame (pipe into a JSON-lines consumer)
+coppa rx cq.wav --json | jq -c .
 
 # Show the decoded payload as hex bytes instead (--raw: hex only, for scripts)
 coppa rx cq.wav --hex
@@ -63,13 +70,31 @@ coppa rx --duration 60
 
 # List audio devices (requires cpal-backend feature)
 coppa devices
+coppa devices --json
 
 # Check audio devices and rigctld without transmitting (pass/fail table)
 coppa doctor
 
-# Show available operating profiles
-coppa config
+# Show the speed levels and named profiles (add --json for machine-readable output)
+coppa profiles
+coppa profiles --level 4
+coppa profiles --json
+coppa profiles -p HF_STANDARD --json
+
+# Suppress status output, or repeat -v for frame metrics on stderr
+coppa -q rx cq.wav
+coppa -vv rx cq.wav
 ```
+
+`coppa` can keep callsign, profile, audio device and rig settings in the same `coppad.toml` as the daemon, with `COPPA_*` environment and flag overrides; see [CLI settings](docs/tutorials/getting-started.md#persisting-your-cli-settings).
+
+`rx --json` writes newline-delimited objects with `payload_text` and exact
+`payload_hex` bytes. `payload_text` is `null` for binary payloads. Diagnostics
+go to stderr. `--json` conflicts with `--raw` and `--hex`; `-q`/`--quiet`
+conflicts with `-v`/`--verbose`. `devices --json` and `profiles --json` write
+arrays; `profiles -p NAME --json` and `profiles --level N --json` write one
+object. `config` is a deprecated alias for `profiles` and accepts the same
+flags; `listen` is a deprecated alias for `rx` and accepts the same flags.
 
 ## KISS TNC (AFSK 1200)
 
@@ -86,18 +111,19 @@ ignores KISS TXDELAY, persistence and slot time), no digipeating or beaconing, a
 
 | Crate | Description |
 |-------|-------------|
-| `coppa-dsp` | Pure DSP primitives: FFT/IFFT, FIR/IIR filters, AGC, resampling |
-| `coppa-codec` | Modulation/demodulation: BPSK, QPSK, 8PSK, QAM, OFDM |
+| `coppa-dsp` | Pure DSP primitives: FFT/IFFT, FIR design and filtering (windowed-sinc bandpass, Hilbert, root-raised-cosine), AGC, Costas carrier recovery, Gardner timing recovery |
+| `coppa-codec` | Modulation/demodulation: BPSK, QPSK, 8PSK, QAM, OFDM, AFSK 1200 |
 | `coppa-protocol` | OFDM transceiver, NR BG2 LDPC payload coding, framing, ARQ, compression and session management |
-| `coppa-channel` | Channel models for testing: AWGN, sinusoidal fading, frequency offset |
+| `coppa-channel` | Channel models for testing: AWGN, Watterson HF fading, SSB passband filter, frequency, timing and sample-clock offsets, sinusoidal fading |
 | `coppa-audio` | Audio backends: CPAL real-time I/O, WAV file read/write |
 | `coppa-radio` | Radio control: rigctld CAT, serial PTT (DTR/RTS, `serial-ptt` feature), GPIO PTT (Linux sysfs, `gpio-ptt` feature) |
 | `coppa-ml` | Measurement-driven speed selection, RateLoop, CpGate, BusyGate and spectrum sensing |
 | `coppa-engine` | CoppaTransceiver wrapper with compression, squelch and streaming receive |
-| `coppa-host` | Host interfaces: VARA-style TCP control server, WebSocket JSON API |
+| `coppa-host` | Host interfaces: VARA-style TCP control server, WebSocket JSON API, KISS TNC TCP server (`kiss-tnc` feature) |
 | `coppa-ffi` | C FFI bindings (cdylib + staticlib) with streaming decode API |
-| `coppa-cli` | CLI binary (`coppa`) for transmit, receive, loopback, device listing |
+| `coppa-cli` | CLI binary (`coppa`): `tx`, `rx`, `loopback`, `tune`, `devices`, `profiles`, `config`, and `tnc` (`kiss-tnc` feature) |
 | `coppa-daemon` | Long-running daemon (`coppad`) with event loop, audio, and host integration |
+| `coppa-bench` | Measurement harness, not a product crate: BER/FER/goodput-vs-SNR scenarios, benchmark examples, and the lib tests that guard each speed level's AWGN waterfall on every push |
 
 ## Architecture
 
@@ -107,7 +133,7 @@ See [PLAN-hardening.md](PLAN-hardening.md) for known issues and the hardening ro
 
 See [docs/SPEC.md](docs/SPEC.md) for the normative waveform/FEC/protocol conformance specification — the reference for building an independent, interoperable implementation.
 
-See [docs/OPERATING.md](docs/OPERATING.md) for field-operation guidance, including TX level calibration (`coppa tune`).
+See [docs/OPERATING.md](docs/OPERATING.md) for field-operation guidance, including TX level calibration (`coppa tune`). To run coppad as a service (systemd or launchd), see [contrib/README.md](contrib/README.md); for a full Raspberry Pi 4 install, see [docs/tutorials/raspberry-pi-install.md](docs/tutorials/raspberry-pi-install.md).
 
 ## License
 

@@ -350,6 +350,7 @@ name = "coppa"
 version = "0.3.0"
 dependencies = [
  "coppa-audio",
+ "coppa-bench",
  "coppa-channel",
  "coppa-codec",
  "coppa-dsp",
@@ -414,6 +415,7 @@ dependencies = [
  "coppa-protocol",
  "coppa-radio",
  "serde",
+ "serde_json",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
  "tracing-subscriber",
@@ -440,6 +442,7 @@ dependencies = [
  "anyhow",
  "clap",
  "coppa-audio",
+ "coppa-channel",
  "coppa-codec",
  "coppa-dsp",
  "coppa-engine",
