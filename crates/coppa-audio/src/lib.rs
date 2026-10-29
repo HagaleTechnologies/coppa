@@ -9,6 +9,7 @@
 
 use anyhow::Result;
 
+pub mod capability;
 pub mod loopback;
 pub mod playout;
 pub mod resampler;
@@ -21,6 +22,9 @@ pub mod cpal_backend;
 #[cfg(feature = "file-backend")]
 pub mod file_backend;
 
+pub use capability::{
+    coppa_stream_support, ConfigRange, DeviceProbe, DeviceSupport, Direction, OpenedFormat, Support,
+};
 pub use loopback::{LoopbackBackend, LoopbackSink, LoopbackSource};
 pub use playout::PlaybackProgress;
 pub use ringbuf::{audio_ring, AudioRingConsumer, AudioRingProducer};
@@ -99,9 +103,54 @@ pub fn list_devices() -> Result<Vec<AudioDevice>> {
     Ok(Vec::new())
 }
 
+/// Name of the compiled live audio backend.
+#[cfg(feature = "cpal-backend")]
+pub fn audio_backend_name() -> Option<&'static str> {
+    Some(cpal_backend::cpal_backend_name())
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+pub fn audio_backend_name() -> Option<&'static str> {
+    None
+}
+
+/// List devices and their advertised support for Coppa's mono f32 stream.
+#[cfg(feature = "cpal-backend")]
+pub fn list_device_support(sample_rate: u32) -> Result<Vec<DeviceSupport>> {
+    cpal_backend::list_cpal_device_support(sample_rate)
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+pub fn list_device_support(_sample_rate: u32) -> Result<Vec<DeviceSupport>> {
+    Ok(Vec::new())
+}
+
+/// Open a device in Coppa's format and release it without starting the stream.
+/// An output callback, if ever invoked, writes only zeros.
+#[cfg(feature = "cpal-backend")]
+pub fn probe_device(direction: Direction, name: Option<&str>, sample_rate: u32) -> DeviceProbe {
+    cpal_backend::probe_cpal_device(direction, name, sample_rate)
+}
+
+#[cfg(not(feature = "cpal-backend"))]
+pub fn probe_device(_direction: Direction, _name: Option<&str>, _sample_rate: u32) -> DeviceProbe {
+    DeviceProbe::NoBackend
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(feature = "cpal-backend"))]
+    #[test]
+    fn without_a_backend_nothing_is_listed_or_probed() {
+        assert_eq!(audio_backend_name(), None);
+        assert!(list_device_support(48_000).unwrap().is_empty());
+        assert_eq!(
+            probe_device(Direction::Input, None, 48_000),
+            DeviceProbe::NoBackend
+        );
+    }
 
     #[test]
     fn test_audio_device_struct() {

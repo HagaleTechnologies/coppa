@@ -2,15 +2,19 @@
 
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::StreamConfig;
+use cpal::{SampleFormat, StreamConfig};
 use std::str::FromStr;
 
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::capability::{choose_format, FormatRange};
 use crate::playout::{fill_output, CallbackState, PlaybackProgress, ProgressShared};
 use crate::ringbuf::{audio_ring, AudioRingConsumer, AudioRingProducer};
-use crate::{AudioDevice, AudioSink, AudioSource};
+use crate::{
+    coppa_stream_support, AudioDevice, AudioSink, AudioSource, ConfigRange, DeviceProbe,
+    DeviceSupport, Direction, Support,
+};
 
 /// A device's own name and cpal id as the host reports them, e.g.
 /// `Default Audio Device (alsa:default)`; either part is `unknown` when the
@@ -25,6 +29,165 @@ fn name_of(device: &cpal::Device) -> String {
         .map(|id| id.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
     format!("{name} ({id})")
+}
+
+fn config_range(range: &cpal::SupportedStreamConfigRange) -> ConfigRange {
+    ConfigRange {
+        channels: range.channels(),
+        min_sample_rate: range.min_sample_rate(),
+        max_sample_rate: range.max_sample_rate(),
+        sample_format: range.sample_format().to_string(),
+        is_f32: range.sample_format() == SampleFormat::F32,
+    }
+}
+
+fn direction_support(
+    device: &cpal::Device,
+    direction: Direction,
+    sample_rate: u32,
+) -> Option<Support> {
+    let ranges: Vec<_> = match direction {
+        Direction::Input => device
+            .supported_input_configs()
+            .ok()?
+            .map(|r| config_range(&r))
+            .collect(),
+        Direction::Output => device
+            .supported_output_configs()
+            .ok()?
+            .map(|r| config_range(&r))
+            .collect(),
+    };
+    if ranges.is_empty() {
+        None
+    } else {
+        Some(coppa_stream_support(&ranges, direction, sample_rate))
+    }
+}
+
+pub fn list_cpal_device_support(sample_rate: u32) -> Result<Vec<DeviceSupport>> {
+    let host = cpal::default_host();
+    Ok(host
+        .devices()
+        .map_err(|e| anyhow!("Failed to list devices: {}", e))?
+        .map(|device| DeviceSupport {
+            name: device
+                .description()
+                .map(|d| d.name().to_string())
+                .unwrap_or_else(|_| "Unknown".into()),
+            id: device
+                .id()
+                .map(|id| id.to_string())
+                .unwrap_or_else(|_| "unknown".into()),
+            input: direction_support(&device, Direction::Input, sample_rate),
+            output: direction_support(&device, Direction::Output, sample_rate),
+        })
+        .collect::<Vec<_>>())
+}
+
+pub fn cpal_backend_name() -> &'static str {
+    cpal::default_host().id().name()
+}
+
+/// Build and immediately release a stream without starting capture or playback.
+pub fn probe_cpal_device(
+    direction: Direction,
+    name: Option<&str>,
+    sample_rate: u32,
+) -> DeviceProbe {
+    let host = cpal::default_host();
+    let requested = name.filter(|name| !name.is_empty());
+    let audio_direction = match direction {
+        Direction::Input => AudioDirection::Input,
+        Direction::Output => AudioDirection::Output,
+    };
+    // COP-64's resolver, so doctor picks the device tx, rx and tune would:
+    // a unique name match, never the first of several.
+    let device = if let Some(name) = requested {
+        let resolved = match direction {
+            Direction::Input => resolve_input_device(Some(name), None),
+            Direction::Output => resolve_output_device(Some(name), None),
+        };
+        match resolved {
+            Ok(Some(device)) => device,
+            Ok(None) => return DeviceProbe::NoDefault,
+            Err(error) => match error.downcast_ref::<DeviceSelectionError>() {
+                Some(DeviceSelectionError::AmbiguousName { .. }) => {
+                    return DeviceProbe::Ambiguous {
+                        error: error.to_string(),
+                    }
+                }
+                _ => {
+                    let available = match direction {
+                        Direction::Input => host.input_devices(),
+                        Direction::Output => host.output_devices(),
+                    };
+                    let available = available
+                        .map(|devices| {
+                            devices
+                                .filter_map(|device| {
+                                    device
+                                        .description()
+                                        .ok()
+                                        .map(|info| info.name().to_string())
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    return DeviceProbe::NoMatch { available };
+                }
+            },
+        }
+    } else {
+        let selected = match direction {
+            Direction::Input => host.default_input_device(),
+            Direction::Output => host.default_output_device(),
+        };
+        match selected {
+            Some(device) => device,
+            None => return DeviceProbe::NoDefault,
+        }
+    };
+    let device_name = name_of(&device);
+    let failed = |error: String| DeviceProbe::OpenFailed {
+        device: device_name.clone(),
+        error,
+        advertised: direction_support(&device, direction, sample_rate),
+    };
+    // COP-64's format choice (lane 0), the same config CpalSource/CpalSink
+    // and LiveSource/LiveSink open; there is no separate doctor format.
+    let config = match choose_device_config(&device, audio_direction, sample_rate, sample_rate, 0) {
+        Ok(config) => config,
+        Err(error) => return failed(error.to_string()),
+    };
+    let format = crate::OpenedFormat {
+        channels: config.channels,
+        sample_rate: config.sample_rate,
+    };
+    let stream = match direction {
+        Direction::Input => device.build_input_stream(
+            config,
+            |_: &[f32], _: &cpal::InputCallbackInfo| {},
+            |error| tracing::debug!(error = %error, "doctor probe stream error"),
+            None,
+        ),
+        Direction::Output => device.build_output_stream(
+            config,
+            |data: &mut [f32], _: &cpal::OutputCallbackInfo| data.fill(0.0),
+            |error| tracing::debug!(error = %error, "doctor probe stream error"),
+            None,
+        ),
+    };
+    match stream {
+        Ok(stream) => {
+            drop(stream);
+            DeviceProbe::Opened {
+                device: device_name,
+                format,
+            }
+        }
+        Err(error) => failed(error.to_string()),
+    }
 }
 
 /// List audio devices via CPAL.
@@ -758,66 +921,6 @@ pub fn find_output_device_by_name(name: &str) -> Option<cpal::Device> {
     resolve_output_device(Some(name), None).ok().flatten()
 }
 
-#[derive(Clone, Copy, Debug)]
-struct FormatRange {
-    channels: u16,
-    min_rate: u32,
-    max_rate: u32,
-    f32_format: bool,
-}
-
-fn choose_format(
-    ranges: &[FormatRange],
-    direction: AudioDirection,
-    engine_rate: u32,
-    preferred_rate: u32,
-    channel: u16,
-) -> Result<(u16, u32)> {
-    if engine_rate == 0 || preferred_rate == 0 {
-        return Err(anyhow!("audio sample rate must be positive"));
-    }
-    let mut best: Option<(u8, u64, u16, u32)> = None;
-    let mut max_channels = 0u16;
-    for range in ranges {
-        if !range.f32_format {
-            continue;
-        }
-        max_channels = max_channels.max(range.channels);
-        if channel >= range.channels || range.min_rate == 0 || range.min_rate > range.max_rate {
-            continue;
-        }
-        let preferred_supported =
-            range.min_rate <= preferred_rate && preferred_rate <= range.max_rate;
-        let rate = if preferred_supported {
-            preferred_rate
-        } else {
-            engine_rate.clamp(range.min_rate, range.max_rate)
-        };
-        let candidate = (
-            if preferred_supported { 0 } else { 1 },
-            rate.abs_diff(engine_rate) as u64,
-            range.channels,
-            rate,
-        );
-        if best.is_none_or(|b| candidate < b) {
-            best = Some(candidate);
-        }
-    }
-    best.map(|(_, _, channels, rate)| (channels, rate))
-        .ok_or_else(|| {
-            if channel >= max_channels && max_channels > 0 {
-                anyhow!(
-                    "{} channel {} is unavailable; available channels: 0..{}",
-                    direction.label(),
-                    channel,
-                    max_channels - 1
-                )
-            } else {
-                anyhow!("no usable f32 {} audio format", direction.label())
-            }
-        })
-}
-
 fn choose_device_config(
     device: &cpal::Device,
     direction: AudioDirection,
@@ -858,8 +961,13 @@ fn choose_device_config(
             available
         ));
     }
-    let (channels, sample_rate) =
-        choose_format(&ranges, direction, engine_rate, preferred_rate, channel)?;
+    let (channels, sample_rate) = choose_format(
+        &ranges,
+        direction.label(),
+        engine_rate,
+        preferred_rate,
+        channel,
+    )?;
     Ok(StreamConfig {
         channels,
         sample_rate,
@@ -1049,6 +1157,58 @@ impl AudioSink for LiveSink {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cpal_ranges_convert_with_channels_rates_and_f32_flag() {
+        use cpal::{SampleFormat, SupportedBufferSize, SupportedStreamConfigRange};
+        for (format, label, is_f32) in [
+            (SampleFormat::F32, "f32", true),
+            (SampleFormat::I16, "i16", false),
+        ] {
+            let range = SupportedStreamConfigRange::new(
+                1,
+                8_000,
+                96_000,
+                SupportedBufferSize::Unknown,
+                format,
+            );
+            assert_eq!(
+                config_range(&range),
+                crate::ConfigRange {
+                    channels: 1,
+                    min_sample_rate: 8_000,
+                    max_sample_rate: 96_000,
+                    sample_format: label.into(),
+                    is_f32,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn probing_a_nonexistent_name_reports_no_match_in_both_directions() {
+        for direction in [crate::Direction::Input, crate::Direction::Output] {
+            assert!(matches!(
+                crate::probe_device(direction, Some("NONEXISTENT_DEVICE_XYZ_12345"), 48_000),
+                crate::DeviceProbe::NoMatch { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn device_support_names_match_list_devices() {
+        let support = crate::list_device_support(48_000).unwrap();
+        let devices = crate::list_devices().unwrap();
+        assert_eq!(
+            support.iter().map(|d| &d.name).collect::<Vec<_>>(),
+            devices.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_backend_is_named() {
+        assert!(crate::audio_backend_name().is_some());
+    }
+
     fn fixture(name: &str, id: Option<&str>, input: u16, output: u16) -> AudioDevice {
         AudioDevice {
             name: name.into(),
@@ -1138,11 +1298,11 @@ mod tests {
             f32_format: true,
         }];
         assert_eq!(
-            choose_format(&stereo, AudioDirection::Input, 48000, 48000, 1).unwrap(),
+            choose_format(&stereo, AudioDirection::Input.label(), 48000, 48000, 1).unwrap(),
             (2, 44100)
         );
         assert!(
-            choose_format(&stereo, AudioDirection::Input, 48000, 48000, 2)
+            choose_format(&stereo, AudioDirection::Input.label(), 48000, 48000, 2)
                 .unwrap_err()
                 .to_string()
                 .contains("input channel 2")
@@ -1162,16 +1322,18 @@ mod tests {
             },
         ];
         assert_eq!(
-            choose_format(&both, AudioDirection::Output, 48000, 48000, 0).unwrap(),
+            choose_format(&both, AudioDirection::Output.label(), 48000, 48000, 0).unwrap(),
             (1, 48000)
         );
-        assert!(choose_format(&both[1..], AudioDirection::Output, 48000, 48000, 1).is_err());
+        assert!(
+            choose_format(&both[1..], AudioDirection::Output.label(), 48000, 48000, 1).is_err()
+        );
         assert!(choose_format(
             &[FormatRange {
                 f32_format: false,
                 ..both[0]
             }],
-            AudioDirection::Output,
+            AudioDirection::Output.label(),
             48000,
             48000,
             0

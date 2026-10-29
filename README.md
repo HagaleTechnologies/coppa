@@ -72,6 +72,9 @@ coppa rx --duration 60
 coppa devices
 coppa devices --json
 
+# Check audio devices and rigctld without transmitting (pass/fail table)
+coppa doctor
+
 # Capture the right lane of a stereo input device
 coppa rx --device-id "<id-from-devices>" --input-channel 1 --duration 60
 

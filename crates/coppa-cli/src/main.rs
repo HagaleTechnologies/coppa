@@ -1,5 +1,7 @@
 //! Coppa CLI - command-line interface for the Coppa digital communications system.
 
+mod doctor;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use coppa_engine::config::{EngineConfig, OfdmBand};
@@ -358,6 +360,8 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Check audio devices and rig control without transmitting.
+    Doctor(doctor::DoctorArgs),
     /// Show the speed levels (modulation, code rate, max bytes, air time, bandwidth) and the named profiles built on them.
     Profiles(ProfilesArgs),
     // COP-55: kept for one release. Delete this variant, CONFIG_DEPRECATED and
@@ -561,6 +565,7 @@ fn main() -> Result<()> {
             )?;
         }
         Some(Commands::Devices { json }) => cmd_devices(json)?,
+        Some(Commands::Doctor(args)) => doctor::cmd_doctor(&args)?,
         Some(Commands::Profiles(args)) => cmd_profiles(&args)?,
         Some(Commands::Config(args)) => {
             eprintln!("{CONFIG_DEPRECATED}");
