@@ -783,6 +783,7 @@ impl PlaybackClock for SystemClock {
 /// and stop the sink before being returned; PTT and stop failures during
 /// that cleanup do not skip each other.
 #[cfg(feature = "cpal-backend")]
+#[allow(clippy::too_many_arguments)]
 fn play_keyed<S: coppa_audio::AudioSink>(
     sink: &mut S,
     progress: impl Fn(&S) -> Result<coppa_audio::PlaybackProgress>,
@@ -873,6 +874,7 @@ struct AudioOutputSelection<'a> {
     channel: u16,
 }
 
+#[cfg_attr(not(feature = "cpal-backend"), allow(dead_code))]
 impl<'a> AudioOutputSelection<'a> {
     /// COP-64: the output device a live `tx`/`tune` uses, from its resolved
     /// settings. An explicit `--device-id` replaces any layered name.
@@ -3150,8 +3152,23 @@ mod tests {
         assert_eq!(rig.device_id.as_deref(), Some("alsa:output"));
         assert_eq!(rig.output_channel, 1);
         for args in [
-            &["coppa", "tx", "hi", "--device", "USB", "--device-id", "alsa:output"][..],
-            &["coppa", "tune", "--device", "USB", "--device-id", "alsa:output"][..],
+            &[
+                "coppa",
+                "tx",
+                "hi",
+                "--device",
+                "USB",
+                "--device-id",
+                "alsa:output",
+            ][..],
+            &[
+                "coppa",
+                "tune",
+                "--device",
+                "USB",
+                "--device-id",
+                "alsa:output",
+            ][..],
         ] {
             assert_eq!(
                 Cli::try_parse_from(args).err().expect("conflict").kind(),
@@ -3164,9 +3181,13 @@ mod tests {
     /// a layered name alongside it.
     #[test]
     fn output_selection_prefers_an_explicit_device_id() {
-        let mut rig = RigSettings::test_values(Some("USB"), "none", "127.0.0.1:1", 0, 0, None, None);
+        let mut rig =
+            RigSettings::test_values(Some("USB"), "none", "127.0.0.1:1", 0, 0, None, None);
         let selection = AudioOutputSelection::from_rig(&rig);
-        assert_eq!((selection.name, selection.id, selection.channel), (Some("USB"), None, 0));
+        assert_eq!(
+            (selection.name, selection.id, selection.channel),
+            (Some("USB"), None, 0)
+        );
         rig.device_id = Some("alsa:radio".into());
         rig.output_channel = 1;
         let selection = AudioOutputSelection::from_rig(&rig);
@@ -3180,20 +3201,20 @@ mod tests {
     #[test]
     fn explicit_missing_device_id_fails_without_default_fallback() {
         let id = "coppa:no-such-audio-device";
-        let input = resolve_cli_input_device(None, Some(id))
-            .err()
-            .expect("input ID must fail");
+        let Err(input) = resolve_cli_input_device(None, Some(id)) else {
+            panic!("input ID must fail")
+        };
         assert!(
             input.to_string().contains("input audio device ID"),
             "{input}"
         );
         assert!(input.to_string().contains(id), "{input}");
-        let output = resolve_cli_output_device(AudioOutputSelection {
+        let Err(output) = resolve_cli_output_device(AudioOutputSelection {
             id: Some(id),
             ..Default::default()
-        })
-        .err()
-        .expect("output ID must fail");
+        }) else {
+            panic!("output ID must fail")
+        };
         assert!(
             output.to_string().contains("output audio device ID"),
             "{output}"

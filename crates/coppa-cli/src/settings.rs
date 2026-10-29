@@ -374,6 +374,7 @@ pub struct RigSettings {
     /// COP-64: `--device-id`, flag only. When set it replaces `device`.
     pub device_id: Option<String>,
     /// COP-64: `--output-channel`, flag only (zero-based).
+    #[cfg_attr(not(feature = "cpal-backend"), allow(dead_code))]
     pub output_channel: u16,
     pub ptt: Setting<String>,
     pub rigctld: Setting<String>,
