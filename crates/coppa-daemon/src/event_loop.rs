@@ -12,7 +12,7 @@ use coppa_host::vara::{
 use coppa_host::{HostEvent, HostResponse};
 use coppa_ml::CpRecommendation;
 use coppa_ml::{BusyGate, CpGate, RateLoop};
-use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx};
+use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx, DEFAULT_MAX_RETRANSMIT};
 use coppa_protocol::cp_negotiator::{ContentAction, CpMode, CpNegotiator};
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu, StationIdPayload};
 use coppa_protocol::modem::max_payload_for_level;
@@ -85,6 +85,60 @@ fn min_level_budget() -> usize {
 /// turnaround") make a second in-flight frame collide with the peer's ACK.
 const SESSION_ARQ_WINDOW: u8 = 1;
 
+/// COP-68: how long a fade-held session link waits with ZERO peer evidence
+/// (no fully decoded MAC PDU from the peer, no header-only PHY decode)
+/// before tearing down. Derived like `SWITCH_PROBATION_SECS`'s margin: the
+/// bench's Good-preset budget exhaustions (368-492 s of a ramp) precede
+/// Watterson-Good level-1 decodability returning (~480 s) by up to ~112 s,
+/// so 180 s covers the measured worst gap with margin; and it bounds a dead
+/// channel's cost to ~3 fallback frames (1.365 s airtime each) at the 60 s
+/// RTO cap. A peer that stays decodable in either direction holds the link
+/// indefinitely (the IONOS never-drop property); a dead one still ends in
+/// bounded time (worst case ~195 s + 180 s).
+const SESSION_FALLBACK_NO_EVIDENCE: Duration = Duration::from_secs(180);
+
+/// COP-68: retransmit-budget grant per fade-hold event (entry and every
+/// peer-evidence refresh). At the 60 s RTO cap one grant spans >= 10 min,
+/// far past `SESSION_FALLBACK_NO_EVIDENCE`, so the grant can never be what
+/// saves or kills the link -- it only keeps `get_retransmits` returning the
+/// segment while evidence flows. The wall-clock no-evidence bound is what
+/// actually binds.
+const SESSION_FALLBACK_ATTEMPT_GRANT: u8 = 10;
+
+/// COP-68: fade-hold state, entered when the in-flight segment first
+/// exhausts the normal retransmit budget. The link is torn down only after
+/// `no_evidence` of zero peer decodability, measured from the LATER of
+/// `entered_at` and the last peer evidence (see
+/// `SessionLink::last_peer_evidence`): a fully faded link spends the whole
+/// normal budget (~135 s at the default RTO) with zero evidence, so a
+/// bound anchored on that stale evidence alone would expire before the
+/// first fallback retransmission is even due (~195 s). While the peer
+/// stays decodable the budget is re-granted and the segment retransmits
+/// at `level` -- the most robust level whose payload budget fits the
+/// segment's encoded frame (`fittest_level`).
+struct SessionFallback {
+    level: u8,
+    /// Test-shrinkable per-link copy of `SESSION_FALLBACK_NO_EVIDENCE`
+    /// (mutated by tests the way `fast_session_rto` swaps the RTO).
+    no_evidence: Duration,
+    /// When the hold was entered; the no-evidence bound's other anchor.
+    entered_at: Instant,
+}
+
+/// COP-68: the most robust level (lowest number) at or below `current`
+/// whose one-codeword payload budget fits `encoded_len` bytes -- the same
+/// `encoded_payload_len` measure session chunking sizes against, so a
+/// chunk that fit its original level by construction fits the answer here
+/// whenever any lower level's budget also holds it. Falls back to
+/// `current` when nothing lower fits (a segment of 118-178 encoded bytes
+/// has no lower level on today's ladder): the hold still holds, it just
+/// retransmits at the level it already had.
+fn fittest_level(encoded_len: usize, current: u8) -> u8 {
+    (1..=current)
+        .find(|&l| max_payload_for_level(l).is_some_and(|budget| budget >= encoded_len))
+        .unwrap_or(current)
+}
+
 /// COP-38 (D2): the established session's reliable-delivery state. One per
 /// `EventLoop`: every daemon caller treats the session link as singular.
 struct SessionLink {
@@ -100,9 +154,15 @@ struct SessionLink {
     /// Host bytes not yet cut into a segment. Chunked at drain time with the
     /// exact seq that will carry them (D5).
     backlog: VecDeque<u8>,
-    /// Armed once the in-flight segment has used its last retransmission;
-    /// the link fails if no ACK arrives by then (D7).
-    give_up_at: Option<Instant>,
+    /// COP-68: fade-hold state, entered when the in-flight segment first
+    /// exhausts the normal retransmit budget (replaces COP-38's
+    /// `give_up_at` one-RTO death). `None` in the normal regime.
+    fallback: Option<SessionFallback>,
+    /// COP-68: last instant the peer proved itself decodable -- every fully
+    /// decoded MAC PDU from `remote` and every header-only PHY decode
+    /// refreshes it. Initialized at link creation (creation itself follows a
+    /// decoded peer frame).
+    last_peer_evidence: Instant,
     /// One warning per link for a payload that is not a reliable
     /// `TransportPdu`, i.e. a pre-0.3.0 peer (D3).
     warned_legacy_payload: bool,
@@ -1733,7 +1793,8 @@ impl EventLoop {
             tx: ArqTx::new(config),
             rx: ArqRx::new(SESSION_ARQ_WINDOW),
             backlog: VecDeque::new(),
-            give_up_at: None,
+            fallback: None,
+            last_peer_evidence: Instant::now(),
             warned_legacy_payload: false,
         });
     }
@@ -1774,24 +1835,41 @@ impl EventLoop {
             .map(|s| s.remote.clone())
     }
 
-    /// COP-38 (D7): the connected-session retransmit pass. Runs on `run()`'s
-    /// 500 ms retransmit tick whatever `arq_enabled` says (D1). A frame is
-    /// rebuilt from its segment data, byte-identical to the original; once
-    /// it has used its last retransmission the link gets one more RTO for a
-    /// late ACK and then fails (`fail_session_link`).
+    /// COP-38 (D7) + COP-68: the connected-session retransmit pass. Runs on
+    /// `run()`'s 500 ms retransmit tick whatever `arq_enabled` says (D1). A
+    /// frame is rebuilt from its segment data, byte-identical to the
+    /// original. Once it has used its last retransmission the link enters
+    /// the COP-68 fade hold instead of dying: retries continue at the
+    /// fittest robust level with an adaptively re-granted budget, and only
+    /// `SESSION_FALLBACK_NO_EVIDENCE` (default 180 s) with zero peer
+    /// evidence tears the session down (`fail_session_link`).
     async fn check_session_retransmits(&mut self) {
         let now = Instant::now();
         let Some(link) = self.session_link.as_ref() else {
             return;
         };
-        if link.give_up_at.is_some_and(|t| now >= t) && link.tx.in_flight() > 0 {
-            let session_id = link.session_id;
-            self.fail_session_link(session_id).await;
-            return;
+        // COP-68: the give-up bound is wall-clock peer decodability, not
+        // "budget exhausted + one RTO" -- a link whose peer answered (or
+        // whose header still decodes) at any point in the window stays
+        // held. The bound runs from the LATER of hold entry and the last
+        // peer evidence: a fully faded link reaches entry with its
+        // evidence long stale (the ~135 s normal-budget backoff already
+        // elapsed), and an evidence-only anchor would tear the link down
+        // before the first fallback retransmission (~195 s) -- defeating
+        // the hold's robust-level retry outright.
+        if let Some(fallback) = link.fallback.as_ref() {
+            let bound_start = fallback.entered_at.max(link.last_peer_evidence);
+            if link.tx.in_flight() > 0 && now >= bound_start + fallback.no_evidence {
+                let session_id = link.session_id;
+                self.fail_session_link(session_id).await;
+                return;
+            }
         }
         // COP-40: `get_retransmits` backs the RTO off whenever it returns a
         // segment, so asking while the gate refuses would spend backoff and
         // budget on a refusal the first-send path holds without loss.
+        // During a refusal the COP-68 evidence clock keeps running -- by
+        // design: we are not listening, so silence proves nothing either way.
         if self
             .session_link
             .as_ref()
@@ -1818,8 +1896,17 @@ impl EventLoop {
                 .session_link
                 .as_ref()
                 .and_then(|l| l.tx.transmit_count(seq))
-                .map_or(0, |count| count + 1);
-            match self.engine.encode_bytes(&frame) {
+                .map_or(0, |count| count.saturating_add(1));
+            // COP-68: while the fade hold is active, the rebuilt
+            // byte-identical frame is encoded at the fallback level -- the
+            // most robust level whose payload budget fits it. The normal
+            // regime's `encode_bytes` (the engine's current level) is
+            // byte-for-byte unchanged.
+            let encoded = match self.session_link.as_ref().and_then(|l| l.fallback.as_ref()) {
+                Some(fallback) => self.engine.encode_bytes_with_level(&frame, fallback.level),
+                None => self.engine.encode_bytes(&frame),
+            };
+            match encoded {
                 Ok(samples) => {
                     tracing::debug!(seq, attempt, "Retransmitting session frame");
                     Box::pin(self.transmit_samples(&samples)).await;
@@ -1835,8 +1922,37 @@ impl EventLoop {
             // run out.
             if let Some(link) = self.session_link.as_mut() {
                 let _ = link.tx.mark_retransmitted(seq, Instant::now());
-                if link.tx.is_failed(seq) && link.give_up_at.is_none() {
-                    link.give_up_at = Some(Instant::now() + link.tx.rto());
+                if link.tx.is_failed(seq) && link.fallback.is_none() {
+                    // COP-68: first exhaustion enters the fade hold. The
+                    // fittest level is computed over the segment's rebuilt
+                    // frame with the same `encoded_payload_len` measure the
+                    // chunker used, so the encode above cannot fail for
+                    // budget reasons at the fallback level unless nothing
+                    // lower fits (then `fittest_level` returned the current
+                    // level, logged here rather than silently).
+                    let level = fittest_level(
+                        self.engine.encoded_payload_len(&frame),
+                        self.engine.speed_level(),
+                    );
+                    let grant = link
+                        .tx
+                        .transmit_count(seq)
+                        .unwrap_or(0)
+                        .saturating_add(SESSION_FALLBACK_ATTEMPT_GRANT);
+                    link.tx.set_max_retransmit(grant);
+                    link.fallback = Some(SessionFallback {
+                        level,
+                        no_evidence: SESSION_FALLBACK_NO_EVIDENCE,
+                        entered_at: now,
+                    });
+                    tracing::info!(
+                        seq,
+                        fallback_level = level,
+                        no_evidence_secs = SESSION_FALLBACK_NO_EVIDENCE.as_secs(),
+                        "Session fade hold: retransmit budget exhausted; \
+                         holding at the fittest robust level until the \
+                         no-evidence bound"
+                    );
                 }
             }
         }
@@ -2603,7 +2719,18 @@ impl EventLoop {
     /// overflowed. Moving the decode to a worker thread would be the fix if this
     /// ever becomes a real problem.
     async fn decode_and_dispatch_audio(&mut self, samples: &[f32]) {
-        for frame in self.engine.push_samples(samples) {
+        // COP-68: a header-only PHY decode (the peer's preamble and protected
+        // header decoded, the payload failed FEC) is peer evidence. The
+        // counter carries no callsign, so the single session link is
+        // refreshed unconditionally (COP-38 D2: one link per daemon): worst
+        // case a third station's decodable traffic DELAYS teardown -- it can
+        // only delay, never corrupt delivery.
+        let header_only_before = self.engine.header_only_decodes();
+        let frames = self.engine.push_samples(samples);
+        if self.engine.header_only_decodes() > header_only_before {
+            self.note_peer_evidence();
+        }
+        for frame in frames {
             let snr_db = frame.snr_db;
             let recommended_level = frame.recommended_level;
             let delay_spread_ms = frame.delay_spread_ms;
@@ -4366,7 +4493,44 @@ impl EventLoop {
 
     // ── Session handling methods ──────────────────────────────────────
 
+    /// COP-68: the peer just proved itself decodable. Refreshes the session
+    /// link's evidence clock and, while the fade hold is active, re-grants
+    /// the retransmit budget (`transmit_count + SESSION_FALLBACK_ATTEMPT_
+    /// GRANT`) so `is_failed` clears and retries resume on the existing
+    /// backoff schedule. Called for every fully decoded MAC PDU whose source
+    /// is the session's remote, and for every header-only PHY decode.
+    ///
+    /// The grant is naturally monotone: `transmit_count` only grows for an
+    /// in-flight segment (only an ACK clears the slot, and an ACK that
+    /// empties the window exits the hold entirely), so
+    /// `transmit_count + GRANT` always dominates the previous grant.
+    fn note_peer_evidence(&mut self) {
+        let Some(link) = self.session_link.as_mut() else {
+            return;
+        };
+        link.last_peer_evidence = Instant::now();
+        if link.fallback.is_some() && link.tx.in_flight() > 0 {
+            let seq = link.tx.send_base();
+            if let Some(count) = link.tx.transmit_count(seq) {
+                let grant = count.saturating_add(SESSION_FALLBACK_ATTEMPT_GRANT);
+                link.tx.set_max_retransmit(grant);
+            }
+        }
+    }
+
     async fn handle_mac_pdu(&mut self, pdu: MacPdu) {
+        // COP-68: every fully decoded MAC PDU from the session's peer is
+        // evidence the link is alive -- ACK, KEEPALIVE, Data and
+        // Connect-series alike. A one-way-faded link where only the peer's
+        // 30 s keepalives get through stays held, which is the intended
+        // IONOS behavior. PDUs from other callsigns are not evidence.
+        if self
+            .session_link
+            .as_ref()
+            .is_some_and(|l| pdu.src == l.remote)
+        {
+            self.note_peer_evidence();
+        }
         match pdu.frame_type {
             MacFrameType::ConnectReq => self.handle_incoming_connect(pdu).await,
             MacFrameType::ConnectAck => self.handle_connect_ack_rx(pdu).await,
@@ -4711,7 +4875,16 @@ impl EventLoop {
             .tx
             .process_ack(ack.ack_num, ack.ack_bitmap, Instant::now());
         if link.tx.in_flight() == 0 {
-            link.give_up_at = None;
+            // COP-68: an ACK that empties the window ends any fade hold and
+            // restores the standard budget, so the next fade starts from 5
+            // (replaces COP-38's `give_up_at` disarm).
+            if link.fallback.take().is_some() {
+                link.tx.set_max_retransmit(DEFAULT_MAX_RETRANSMIT);
+                tracing::debug!(
+                    "Session fade hold cleared; retry budget restored to {}",
+                    DEFAULT_MAX_RETRANSMIT
+                );
+            }
         }
         if !acked.is_empty() {
             self.report_buffer().await;
@@ -6618,6 +6791,59 @@ mod tests {
         std::thread::sleep(rto + Duration::from_millis(5));
     }
 
+    /// COP-68: drive `station`'s in-flight segment through retransmit passes
+    /// with every leg lost (read and discarded) until the fade hold is
+    /// entered, asserting it actually is within `max_passes`. Mirrors the
+    /// exhaustion test's loop (read -> PTT release -> sleep past RTO ->
+    /// retransmit pass).
+    async fn exhaust_into_fade_hold(
+        station: &mut EventLoop,
+        consumer: &mut coppa_audio::AudioRingConsumer,
+        max_passes: usize,
+    ) {
+        for _ in 0..max_passes {
+            if station
+                .session_link
+                .as_ref()
+                .is_some_and(|l| l.fallback.is_some())
+            {
+                return;
+            }
+            station.handle_ptt_change(false).await;
+            sleep_past_session_rto(station);
+            station.check_session_retransmits().await;
+            read_all(consumer);
+        }
+        panic!("the fade hold must be entered within {max_passes} retransmit passes");
+    }
+
+    /// COP-68: feed `station` a real KEEPALIVE MAC frame from its session
+    /// peer through `handle_mac_pdu` (the `ack_in_flight` construction
+    /// precedent), as peer evidence on the MAC path.
+    async fn keepalive_from_peer(station: &mut EventLoop) {
+        let (dest, src, ssid) = {
+            let link = station.session_link.as_ref().expect("a session link");
+            (link.local.clone(), link.remote.clone(), link.ssid)
+        };
+        let pdu = MacPdu::new(MacFrameType::Keepalive, dest, src, ssid, Vec::new());
+        station.handle_mac_pdu(pdu).await;
+    }
+
+    /// COP-68: destroy a frame's samples after its protected header region
+    /// (preamble + Golay-protected header stay decodable, the payload sees
+    /// silence) -- the deterministic shape of the level>=3 Watterson
+    /// "header decodes / payload fails" regime.
+    fn corrupt_after_header(samples: &mut [f32]) {
+        let profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
+        let symbol_len = profile.fft_size + profile.cp_samples;
+        let header_syms = coppa_codec::ofdm::header_fec::PROTECTED_HEADER_CODED_BITS
+            .div_ceil(profile.data_carriers);
+        let cut = ((3 + header_syms) * symbol_len).min(samples.len());
+        for s in samples.iter_mut().skip(cut) {
+            *s = 0.0;
+        }
+    }
+
     /// Every `DataOut` payload queued on `rx`, in order.
     fn drain_data_out(rx: &mut mpsc::UnboundedReceiver<coppa_host::HostResponse>) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
@@ -7018,10 +7244,14 @@ mod tests {
         assert_eq!(a.session_link.as_ref().unwrap().tx.in_flight(), 0);
     }
 
-    /// COP-38 (D7): a link whose every frame is lost ends cleanly once the
-    /// retry budget is spent: the host hears `BUFFER 0` then `DISCONNECTED`,
-    /// the session is gone, and the last frame keyed is a DISCONNECT the
-    /// peer acts on.
+    /// COP-38 (D7) + COP-68: a link whose every frame is lost ends cleanly
+    /// once the retry budget is spent AND the fade hold's no-evidence bound
+    /// expires with no peer evidence: the host hears `BUFFER 0` then
+    /// `DISCONNECTED`, the session is gone, and the last frame keyed is a
+    /// DISCONNECT the peer acts on. (COP-68 shrinks the link's no-evidence
+    /// bound to ~100 ms the way `fast_session_rto` shrinks the RTO, so the
+    /// teardown is bounded by the no-evidence bound instead of one RTO
+    /// after exhaustion.)
     #[tokio::test]
     async fn exhausted_session_link_sends_disconnect_and_reports_disconnected() {
         let (mut a, mut b, mut a_consumer, _b_consumer) = connected_pair(0).await;
@@ -7034,6 +7264,7 @@ mod tests {
         })
         .await;
         let mut last_leg = Vec::new();
+        let mut hold_shrunk = false;
         for _ in 0..40 {
             if a.session_link.is_none() {
                 break;
@@ -7045,6 +7276,15 @@ mod tests {
             a.handle_ptt_change(false).await;
             sleep_past_session_rto(&a);
             a.check_session_retransmits().await;
+            // COP-68: once the fade hold is entered, shrink its no-evidence
+            // bound (no peer evidence has arrived, so the bound is measured
+            // from long-stale evidence and expires on the next pass).
+            if !hold_shrunk {
+                if let Some(fallback) = a.session_link.as_mut().and_then(|l| l.fallback.as_mut()) {
+                    fallback.no_evidence = Duration::from_millis(100);
+                    hold_shrunk = true;
+                }
+            }
         }
         assert!(
             a.session_link.is_none(),
@@ -7072,6 +7312,371 @@ mod tests {
         assert!(drain_status(&mut b_status_rx)
             .iter()
             .any(|l| l == "DISCONNECTED"));
+    }
+
+    /// COP-68: the fade hold keeps a link alive while the peer stays
+    /// decodable, re-grants the budget per evidence event (transmit_count
+    /// climbs past `DEFAULT_MAX_RETRANSMIT`), and still fails cleanly after
+    /// the no-evidence bound once the peer goes quiet.
+    #[tokio::test]
+    async fn session_link_holds_while_peer_still_decodable_and_fails_after_quiet() {
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        let mut status_rx = vara_lines(&mut a);
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"fade hold me".to_vec(),
+        })
+        .await;
+        read_all(&mut a_consumer); // the data frame is lost
+        exhaust_into_fade_hold(&mut a, &mut a_consumer, 20).await;
+
+        // The old policy died one RTO after exhaustion; COP-68 holds while
+        // the peer stays decodable. Each KEEPALIVE from the remote is
+        // evidence: the budget is re-granted and retries resume.
+        for _ in 0..3 {
+            sleep_past_session_rto(&a); // past the old death point
+            keepalive_from_peer(&mut a).await;
+            a.check_session_retransmits().await;
+            read_all(&mut a_consumer);
+            a.handle_ptt_change(false).await;
+            assert!(
+                a.session_link.is_some(),
+                "the hold must survive a decodable peer"
+            );
+        }
+        let link = a.session_link.as_ref().unwrap();
+        let count = link.tx.transmit_count(link.tx.send_base()).unwrap();
+        assert!(
+            count > DEFAULT_MAX_RETRANSMIT,
+            "the adaptive re-grant must push transmit_count past the normal \
+             budget (got {count})"
+        );
+
+        // Quiet: no more evidence. The link fails after the (shrunk)
+        // no-evidence bound, with the BUFFER 0 -> DISCONNECTED order intact.
+        a.session_link
+            .as_mut()
+            .unwrap()
+            .fallback
+            .as_mut()
+            .unwrap()
+            .no_evidence = Duration::from_millis(100);
+        for _ in 0..10 {
+            if a.session_link.is_none() {
+                break;
+            }
+            a.handle_ptt_change(false).await;
+            sleep_past_session_rto(&a);
+            a.check_session_retransmits().await;
+            read_all(&mut a_consumer);
+        }
+        assert!(
+            a.session_link.is_none(),
+            "the link must fail after the no-evidence bound"
+        );
+        let lines = drain_status(&mut status_rx);
+        let buffer_0 = lines.iter().position(|l| l == "BUFFER 0");
+        let disconnected = lines.iter().position(|l| l == "DISCONNECTED");
+        assert!(
+            buffer_0.is_some() && disconnected.is_some() && buffer_0 < disconnected,
+            "BUFFER 0 must precede DISCONNECTED, got {lines:?}"
+        );
+    }
+
+    /// COP-68: during the hold the retransmission drops to the fittest
+    /// robust level (level 1 for a frame that fits its 56-byte budget), the
+    /// frame bytes stay byte-identical, and a recovering ACK clears the
+    /// hold and restores the standard budget.
+    #[tokio::test]
+    async fn fade_hold_retransmits_at_fittest_level_and_recovers() {
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"tiny".to_vec(),
+        })
+        .await;
+        read_all(&mut a_consumer); // the data frame is lost
+        let seq = a.session_link.as_ref().unwrap().tx.send_base();
+        exhaust_into_fade_hold(&mut a, &mut a_consumer, 20).await;
+        let fallback = a.session_link.as_ref().unwrap().fallback.as_ref().unwrap();
+        assert_eq!(
+            fallback.level, 1,
+            "a small frame's fittest fallback level is 1"
+        );
+
+        // The next retransmission goes out at the fallback level: capture
+        // the audio leg and decode it on an independent raw decoder.
+        a.handle_ptt_change(false).await;
+        sleep_past_session_rto(&a);
+        a.check_session_retransmits().await;
+        let leg = read_all(&mut a_consumer);
+        assert!(!leg.is_empty(), "the held segment must keep retransmitting");
+        // Built exactly the way the daemon builds its own engine
+        // (`CoppaCore::new()` would differ in `compression_enabled`).
+        let mut decoder = CoppaCore::from_profile(&coppa_engine::profiles::HF_STANDARD);
+        let frames = decoder.push_samples(&with_lead_and_trail(&leg));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].speed_level, 1,
+            "the fallback retransmission must be encoded at the fallback level"
+        );
+        let link = a.session_link.as_ref().unwrap();
+        let expected = session_data_frame(link, seq, link.tx.get_segment_data(seq).unwrap());
+        assert_eq!(
+            frames[0]
+                .payload
+                .as_ref()
+                .expect("the fallback frame decodes"),
+            &expected,
+            "the fallback frame's bytes must be the segment's frame bytes"
+        );
+
+        // A recovering ACK empties the window: the hold clears and the
+        // standard budget is restored, so the next fade starts from 5.
+        ack_in_flight(&mut a).await;
+        let link = a.session_link.as_ref().unwrap();
+        assert!(link.fallback.is_none(), "the ACK must clear the fade hold");
+        assert_eq!(link.tx.max_retransmit(), DEFAULT_MAX_RETRANSMIT);
+        assert_eq!(link.tx.in_flight(), 0);
+        assert_eq!(a.buffered_tx_bytes(), 0);
+    }
+
+    /// COP-68: a segment whose encoded frame exceeds level 2's 117-byte
+    /// budget has no lower level to drop to -- the honest "nothing lower
+    /// fits" branch: the link still holds (no teardown at the old death
+    /// point) and retransmits at the current level.
+    #[tokio::test]
+    async fn oversized_segment_holds_at_current_level() {
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        fast_session_rto(&mut a);
+        a.engine.set_speed_level(4).expect("level 4 on HF");
+        let data: Vec<u8> = (0..120).map(|i| (i % 251) as u8).collect();
+        a.handle_host_event(HostEvent::DataReceived { client_id: 1, data })
+            .await;
+        read_all(&mut a_consumer); // the data frame is lost
+        let seq = a.session_link.as_ref().unwrap().tx.send_base();
+        exhaust_into_fade_hold(&mut a, &mut a_consumer, 20).await;
+        let fallback = a.session_link.as_ref().unwrap().fallback.as_ref().unwrap();
+        assert_eq!(
+            fallback.level, 4,
+            "no lower level fits a >117-byte encoded frame; the fittest is the current level"
+        );
+
+        // The link holds past the old death point (one RTO after
+        // exhaustion) and retransmits at the current level.
+        a.handle_ptt_change(false).await;
+        sleep_past_session_rto(&a);
+        a.check_session_retransmits().await;
+        assert!(
+            a.session_link.is_some(),
+            "the hold must survive even with no lower level available"
+        );
+        let leg = read_all(&mut a_consumer);
+        assert!(!leg.is_empty());
+        // Built exactly the way the daemon builds its own engine
+        // (`CoppaCore::new()` would differ in `compression_enabled`).
+        let mut decoder = CoppaCore::from_profile(&coppa_engine::profiles::HF_STANDARD);
+        let frames = decoder.push_samples(&with_lead_and_trail(&leg));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].speed_level, 4,
+            "an oversized segment retransmits at the current level"
+        );
+        let link = a.session_link.as_ref().unwrap();
+        let expected = session_data_frame(link, seq, link.tx.get_segment_data(seq).unwrap());
+        assert_eq!(
+            frames[0].payload.as_ref().expect("the held frame decodes"),
+            &expected
+        );
+    }
+
+    /// COP-68: a header-only PHY decode (preamble + protected header
+    /// decodable, payload destroyed) counts as peer evidence -- the hold
+    /// does not expire at the stale bound when one arrives, and still ends
+    /// bounded after the refreshed bound with no further evidence.
+    #[tokio::test]
+    async fn header_only_decode_counts_as_evidence() {
+        let (mut a, b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"hdr evidence".to_vec(),
+        })
+        .await;
+        read_all(&mut a_consumer); // the data frame is lost
+        exhaust_into_fade_hold(&mut a, &mut a_consumer, 20).await;
+
+        // Shrink the no-evidence bound. The stale evidence's bound expired
+        // long ago during the exhaustion loop, so the next pass would tear
+        // the link down -- unless the corrupted frame refreshes the clock.
+        a.session_link
+            .as_mut()
+            .unwrap()
+            .fallback
+            .as_mut()
+            .unwrap()
+            .no_evidence = Duration::from_millis(400);
+        let stale_bound =
+            a.session_link.as_ref().unwrap().last_peer_evidence + Duration::from_millis(400);
+
+        // A real peer frame (b's KEEPALIVE) whose payload is destroyed
+        // after the protected header: a's decoder counts it header-only.
+        let mut frame = {
+            let (dest, src, ssid) = {
+                let link = a.session_link.as_ref().unwrap();
+                (link.local.clone(), link.remote.clone(), link.ssid)
+            };
+            let pdu = MacPdu::new(MacFrameType::Keepalive, dest, src, ssid, Vec::new());
+            b.engine
+                .encode_bytes(&pdu.to_bytes())
+                .expect("the keepalive frame encodes")
+        };
+        corrupt_after_header(&mut frame);
+        a.handle_ptt_change(false).await;
+        let before_feed = Instant::now();
+        unstick_decoder(&mut a);
+        a.decode_and_dispatch_audio(&with_lead_and_trail(&frame))
+            .await;
+        assert!(
+            a.session_link.as_ref().unwrap().last_peer_evidence >= before_feed,
+            "the header-only decode must refresh the evidence clock now, \
+             not leave it stale from before the fade"
+        );
+
+        // The retransmit pass does NOT tear the link down although the
+        // pre-refresh bound is long expired.
+        a.check_session_retransmits().await;
+        assert!(
+            Instant::now() >= stale_bound,
+            "test setup: the pre-refresh no-evidence bound must already be expired"
+        );
+        assert!(
+            a.session_link.is_some(),
+            "the header-only decode's evidence refresh must hold the link"
+        );
+        read_all(&mut a_consumer);
+
+        // With no further evidence, the refreshed bound still ends the hold.
+        for _ in 0..5 {
+            if a.session_link.is_none() {
+                break;
+            }
+            a.handle_ptt_change(false).await;
+            sleep_past_session_rto(&a);
+            a.check_session_retransmits().await;
+            read_all(&mut a_consumer);
+        }
+        assert!(
+            a.session_link.is_none(),
+            "teardown must follow the refreshed no-evidence bound"
+        );
+    }
+
+    /// COP-68 (review round): the no-evidence bound runs from the LATER
+    /// of hold entry and the last peer evidence. A fully faded link spends
+    /// the whole normal budget (~135 s of backoff at the default RTO)
+    /// with zero peer evidence: anchored on that stale evidence alone, the
+    /// 180 s bound expired before the first fallback retransmission was
+    /// even due (~195 s), so the hold never actually held and no
+    /// robust-level frame ever went out.
+    #[tokio::test]
+    async fn fade_hold_no_evidence_bound_starts_at_hold_entry() {
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"full fade".to_vec(),
+        })
+        .await;
+        read_all(&mut a_consumer); // the data frame is lost
+        exhaust_into_fade_hold(&mut a, &mut a_consumer, 20).await;
+
+        // The fade began before the budget exhausted: the last evidence is
+        // older than hold entry by the whole exhaustion loop. Shrink the
+        // bound to less than the elapsed-since-evidence but more than the
+        // (near-zero) elapsed-since-entry: an evidence-anchored deadline is
+        // already in the past, an entry-anchored one is not.
+        let since_evidence = {
+            let link = a.session_link.as_ref().unwrap();
+            Instant::now().duration_since(link.last_peer_evidence)
+        };
+        assert!(
+            since_evidence > Duration::from_millis(300),
+            "test setup: the exhaustion loop must have outlasted the margin"
+        );
+        a.session_link
+            .as_mut()
+            .unwrap()
+            .fallback
+            .as_mut()
+            .unwrap()
+            .no_evidence = since_evidence - Duration::from_millis(300);
+        a.handle_ptt_change(false).await;
+        a.check_session_retransmits().await;
+        assert!(
+            a.session_link.is_some(),
+            "the no-evidence bound must run from hold entry, not from the \
+             stale pre-fade evidence -- otherwise a fully faded link dies \
+             before its first fallback retransmission"
+        );
+        read_all(&mut a_consumer);
+
+        // The bound still ends the hold once it actually elapses from
+        // entry.
+        for _ in 0..10 {
+            if a.session_link.is_none() {
+                break;
+            }
+            a.handle_ptt_change(false).await;
+            sleep_past_session_rto(&a);
+            a.check_session_retransmits().await;
+            read_all(&mut a_consumer);
+        }
+        assert!(
+            a.session_link.is_none(),
+            "teardown must follow the entry-anchored no-evidence bound"
+        );
+    }
+
+    /// COP-68 (review round): with `transmit_count` pinned at `u8::MAX` by
+    /// a long one-way hold (the adaptive grant keeps the segment retrying
+    /// and `mark_retransmitted` saturates), the daemon's next-attempt
+    /// logging calculation must saturate too -- an unsaturated `count + 1`
+    /// panicked in debug/overflow-checked builds and wrapped the `attempt`
+    /// field to 0 in release.
+    #[tokio::test]
+    async fn fade_hold_attempt_calculation_saturates_past_u8_max() {
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"saturated hold".to_vec(),
+        })
+        .await;
+        read_all(&mut a_consumer); // the data frame is lost
+        exhaust_into_fade_hold(&mut a, &mut a_consumer, 20).await;
+        let seq = a.session_link.as_ref().unwrap().tx.send_base();
+        {
+            let link = a.session_link.as_mut().unwrap();
+            link.tx.set_max_retransmit(u8::MAX);
+            while link.tx.transmit_count(seq) != Some(u8::MAX) {
+                link.tx
+                    .mark_retransmitted(seq, Instant::now())
+                    .expect("the in-flight segment stays pending");
+            }
+        }
+        a.handle_ptt_change(false).await;
+        sleep_past_session_rto(&a);
+        // Before the fix this pass panicked computing `attempt = 255 + 1`;
+        // after it the retransmission goes out and the hold continues.
+        a.check_session_retransmits().await;
+        assert!(
+            a.session_link.is_some(),
+            "the hold must survive a counter pinned at u8::MAX"
+        );
+        read_all(&mut a_consumer);
     }
 
     /// COP-38 (D9a): the 8000-byte write the old large-write test carried,
@@ -12637,7 +13242,8 @@ mod tests {
                 ),
                 rx: ArqRx::new(SESSION_ARQ_WINDOW),
                 backlog: VecDeque::new(),
-                give_up_at: None,
+                fallback: None,
+                last_peer_evidence: Instant::now(),
                 warned_legacy_payload: false,
             }
         }

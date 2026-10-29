@@ -246,7 +246,9 @@ pub struct TxSegment {
     pub seq_num: u8,
     /// Payload data.
     pub data: Vec<u8>,
-    /// Number of times this segment has been transmitted.
+    /// Number of times this segment has been transmitted, saturating at
+    /// `u8::MAX` (COP-68: adaptive re-grants can sustain retries past 255
+    /// transmissions on a long hold; the count pins instead of wrapping).
     pub transmit_count: u8,
     /// Time of last transmission.
     pub last_sent: Option<Instant>,
@@ -528,7 +530,14 @@ impl ArqTx {
         let idx = seq as usize % MAX_WINDOW_SIZE as usize;
         match self.tx_buf[idx] {
             Some(ref mut seg) if seg.seq_num == seq && !seg.acked => {
-                seg.transmit_count += 1;
+                // Saturating: COP-68's adaptive re-grant can keep a segment
+                // retrying far past 255 transmissions on a long one-way hold,
+                // where an unsaturated += 1 would overflow (debug panic /
+                // release wrap corrupting the grant and attempt math). A
+                // pinned count keeps `is_failed`/`get_retransmits` retrying
+                // on the existing schedule; the hold's bound is the caller's
+                // no-evidence clock, not this counter.
+                seg.transmit_count = seg.transmit_count.saturating_add(1);
                 seg.last_sent = Some(now);
                 Ok(())
             }
@@ -654,6 +663,31 @@ impl ArqTx {
     /// Current RTO estimate.
     pub fn rto(&self) -> Duration {
         self.rtt.rto()
+    }
+
+    /// COP-68: the current `config.max_retransmit` budget. Read alongside
+    /// [`Self::set_max_retransmit`] by callers that need to observe the
+    /// adaptive budget (e.g. the daemon's fade-hold recovery asserting the
+    /// standard budget was restored).
+    pub fn max_retransmit(&self) -> u8 {
+        self.config.max_retransmit
+    }
+
+    /// COP-68: set `config.max_retransmit` on a live link.
+    ///
+    /// Takes effect immediately: [`Self::get_retransmits`] and
+    /// [`Self::is_failed`] read `config.max_retransmit` on every call, so a
+    /// segment that has already exhausted a lower budget becomes retryable
+    /// (and un-failed) the moment `n` rises past its `transmit_count`. This
+    /// is the hook the daemon's session fade-hold uses to keep retrying a
+    /// doomed segment while the peer stays decodable; raising it never
+    /// resurrects an evicted segment (only [`Self::process_ack`]/abandon/
+    /// [`Self::send`] touch slots). The CP-control pair never calls this:
+    /// its give-up triggers (COP-1 G1/G2/G4) are derived from the fixed
+    /// default budget, and `SWITCH_PROBATION_SECS` hard-codes that
+    /// derivation.
+    pub fn set_max_retransmit(&mut self, n: u8) {
+        self.config.max_retransmit = n;
     }
 
     /// Number of segments currently in flight (sent but unacked).
@@ -1614,6 +1648,92 @@ mod tests {
         assert!(
             !tx.is_failed(s0),
             "abandon must clear the failed state it resolves"
+        );
+    }
+
+    /// COP-68: `set_max_retransmit` re-enables retries on a segment that has
+    /// already exhausted its budget, immediately (the fake-`Instant` pattern
+    /// of `test_fade_recovery_within_two_rtos` -- `now` is advanced by hand,
+    /// no sleeping).
+    #[test]
+    fn set_max_retransmit_re_enables_retries_on_a_failed_segment() {
+        let mut tx = ArqTx::new(ArqConfig::new(1, 2, Duration::from_millis(50)).unwrap());
+        let mut now = Instant::now();
+        let seq = tx.send(vec![0xA5], now).unwrap();
+
+        // Exhaust the 2-retransmit budget: original + 2 retries leaves
+        // transmit_count = 3 > 2.
+        for _ in 0..2 {
+            now += tx.rto() + Duration::from_millis(1);
+            assert_eq!(tx.get_retransmits(now), vec![seq]);
+            tx.mark_retransmitted(seq, now).unwrap();
+        }
+        assert!(
+            tx.is_failed(seq),
+            "the segment must be failed at count 3 > 2"
+        );
+        now += tx.rto() + Duration::from_millis(1);
+        assert!(
+            tx.get_retransmits(now).is_empty(),
+            "an exhausted segment must stop being retried"
+        );
+
+        // COP-68: raising the budget takes effect immediately -- `is_failed`
+        // clears and the segment is retried again on the existing schedule.
+        assert_eq!(tx.max_retransmit(), 2);
+        tx.set_max_retransmit(5);
+        assert_eq!(tx.max_retransmit(), 5);
+        assert!(
+            !tx.is_failed(seq),
+            "is_failed reads the config per call, so the raise must un-fail at once"
+        );
+        now += tx.rto() + Duration::from_millis(1);
+        assert_eq!(
+            tx.get_retransmits(now),
+            vec![seq],
+            "the raised budget must resume retries"
+        );
+        tx.mark_retransmitted(seq, now).unwrap();
+        assert_eq!(tx.transmit_count(seq), Some(4));
+    }
+
+    /// COP-68 remediate: the daemon's evidence re-grant can sustain a
+    /// segment's retries far past the normal 5-attempt budget (it repeatedly
+    /// grants `transmit_count + GRANT`, saturating at `u8::MAX`), and
+    /// `transmit_count` itself is a `u8` -- so its increment must saturate
+    /// too. Unsaturated, the 256th retransmission of a multi-hour one-way
+    /// hold overflows: panic in debug/overflow-checked builds, wrap to 0 in
+    /// the default release profile, silently corrupting the grant and
+    /// `attempt` arithmetic the hold rests on.
+    #[test]
+    fn transmit_count_saturates_past_u8_max_on_a_long_hold() {
+        let mut tx = ArqTx::new(ArqConfig::new(1, 2, Duration::from_millis(50)).unwrap());
+        let mut now = Instant::now();
+        let seq = tx.send(vec![0xA5], now).unwrap();
+
+        // A one-way hold with peer evidence flowing: the budget stays ahead
+        // of the count all the way to u8::MAX, so every RTO expiry retries.
+        tx.set_max_retransmit(u8::MAX);
+        for _ in 0..(u8::MAX as u32 + 8) {
+            now += tx.rto() + Duration::from_millis(1);
+            assert_eq!(tx.get_retransmits(now), vec![seq]);
+            tx.mark_retransmitted(seq, now).unwrap();
+        }
+        assert_eq!(
+            tx.transmit_count(seq),
+            Some(u8::MAX),
+            "the count must pin at u8::MAX, never wrap"
+        );
+        assert!(
+            !tx.is_failed(seq),
+            "saturation must not un-grant the hold: is_failed reads per call"
+        );
+        now += tx.rto() + Duration::from_millis(1);
+        assert_eq!(
+            tx.get_retransmits(now),
+            vec![seq],
+            "a saturated count must keep the hold retrying: the no-evidence \
+             clock bounds the hold, not the counter"
         );
     }
 }
