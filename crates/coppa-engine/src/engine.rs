@@ -254,6 +254,39 @@ impl CoppaCore {
     /// 2. Build CoppaHeader
     /// 3. Transmit via CoppaTransceiver
     pub fn encode_bytes(&self, data: &[u8]) -> Result<Vec<f32>> {
+        self.encode_bytes_at(data, self.config.speed_level)
+    }
+
+    /// COP-68: `encode_bytes`' exact pipeline (optional Huffman+LZ4
+    /// compression with the marker byte, `CoppaFrameType::Data`, `seq_num`/
+    /// `fec_type` stamped exactly like every other session frame) at an
+    /// explicit `level` (1-9), overriding `self.config.speed_level` for this
+    /// one call.
+    ///
+    /// This is the session fade-hold's fallback encode: a retransmission
+    /// whose frame bytes are byte-identical to the original (rebuilt from
+    /// the segment data) but whose PHY level drops to the most robust level
+    /// whose payload budget still fits the frame. It shares
+    /// [`Self::encode_bytes_at`] with [`Self::encode_bytes`] so the two can
+    /// never diverge -- unlike [`Self::encode_bytes_at_level`] (Beacon frame
+    /// type, no compression, the station-ID/beacon path), which is left
+    /// alone for its existing callers.
+    ///
+    /// Same profile rule as [`Self::encode_bytes_at_level`]: the OFDM
+    /// profile is never rebuilt here, so `level` means "most robust
+    /// modulation/FEC within the profile already in use", and level 9 is
+    /// rejected while this engine is on an HF profile.
+    pub fn encode_bytes_with_level(&self, data: &[u8], level: u8) -> Result<Vec<f32>> {
+        self.check_level(level, self.on_vhf_profile())?;
+        self.encode_bytes_at(data, level)
+    }
+
+    /// The shared body of [`Self::encode_bytes`] and
+    /// [`Self::encode_bytes_with_level`]: compress, build a `Data` header at
+    /// `level`, transmit. Private so the two public entry points (and their
+    /// exact-payload twin [`Self::encoded_payload_len`], which shares
+    /// `compress_payload`) cannot drift apart.
+    fn encode_bytes_at(&self, data: &[u8], level: u8) -> Result<Vec<f32>> {
         let payload = self.compress_payload(data);
 
         if payload.len() > u16::MAX as usize {
@@ -270,7 +303,7 @@ impl CoppaCore {
             frame_type: CoppaFrameType::Data,
             bandwidth: self.transceiver.profile().bandwidth_id,
             fec_type: 0,
-            speed_level: self.config.speed_level,
+            speed_level: level,
             seq_num: 0,
             payload_len: payload.len() as u16,
             codewords: 1,
@@ -469,6 +502,15 @@ impl CoppaCore {
         } else {
             Ok(payload)
         }
+    }
+
+    /// COP-68: pass-through of [`StreamingReceiver::header_only_decodes`] --
+    /// how many candidates decoded a protected header but failed payload FEC
+    /// since this engine's streaming receiver was built. The daemon reads it
+    /// as a before/after delta around each `push_samples` call to treat a
+    /// header-only decode as peer evidence for the session fade-hold.
+    pub fn header_only_decodes(&self) -> u32 {
+        self.streaming.header_only_decodes()
     }
 
     /// Get a reference to the current configuration.
@@ -1089,6 +1131,57 @@ mod tests {
         let core = CoppaCore::new();
         let data = vec![0u8; u16::MAX as usize + 1];
         assert!(core.encode_bytes_at_level(&data, 1).is_err());
+    }
+
+    // ── COP-68: compression-preserving forced-level encode (fade hold) ─────
+
+    /// COP-68: `encode_bytes_with_level` keeps `encode_bytes`' compression
+    /// pipeline and Data frame type, so a fallback frame decodes through the
+    /// normal streaming path with the forced level in the header and the
+    /// original payload after decompression.
+    #[test]
+    fn encode_bytes_with_level_roundtrips_with_compression() {
+        let mut core = CoppaCore::with_config(EngineConfig {
+            speed_level: 4,
+            compression_enabled: true,
+            ..Default::default()
+        });
+        let data = b"hold at level one";
+        let samples = core
+            .encode_bytes_with_level(data, 1)
+            .expect("small payload fits level 1's budget");
+        let samples = with_lead_and_trail(&samples);
+        let frames = core.push_samples(&samples);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].speed_level, 1,
+            "the fallback level must be the one in the header"
+        );
+        assert_eq!(
+            frames[0].payload.as_ref().expect("decode succeeds"),
+            data,
+            "the compressed fallback frame must round-trip to the original bytes"
+        );
+    }
+
+    /// COP-68: the forced level is validated against the profile in use and
+    /// the target level's payload budget applies exactly as `encode_bytes`'s
+    /// own does.
+    #[test]
+    fn encode_bytes_with_level_rejects_invalid_level_and_oversized_payload() {
+        let core = CoppaCore::new();
+        for level in [0u8, 10] {
+            assert!(
+                core.encode_bytes_with_level(b"x", level).is_err(),
+                "level {level} is not a wire level"
+            );
+        }
+        assert!(
+            core.encode_bytes_with_level(&[0u8; 80], 1).is_err(),
+            "80 encoded bytes cannot fit level 1's 56-byte budget"
+        );
+        core.encode_bytes_with_level(&[0u8; 80], 2)
+            .expect("level 2's 117-byte budget fits 80 bytes");
     }
 
     // ── Task 6 (Phase 4): `set_speed_level` mutator for FFI v2 ────────────
