@@ -19,21 +19,26 @@ pub const ARQ_TAG: &[u8; 3] = b"ARQ";
 
 /// Encode one host→TNC frame: `<len:u16 BE><payload>`, `len` = payload
 /// length.
-pub fn encode_host_frame(payload: &[u8]) -> Vec<u8> {
+pub fn encode_host_frame(payload: &[u8]) -> Result<Vec<u8>> {
+    let length =
+        u16::try_from(payload.len()).map_err(|_| anyhow!("host frame exceeds MAX_FRAME"))?;
     let mut frame = Vec::with_capacity(2 + payload.len());
-    frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    frame.extend_from_slice(&length.to_be_bytes());
     frame.extend_from_slice(payload);
-    frame
+    Ok(frame)
 }
 
 /// Encode one TNC→host frame: `<len:u16 BE><tag:3><payload>`, `len` =
 /// 3 + payload length.
-pub fn encode_tnc_frame(tag: &[u8; 3], payload: &[u8]) -> Vec<u8> {
+pub fn encode_tnc_frame(tag: &[u8; 3], payload: &[u8]) -> Result<Vec<u8>> {
+    if payload.len() > MAX_FRAME - tag.len() {
+        return Err(anyhow!("TNC frame exceeds MAX_FRAME"));
+    }
     let mut frame = Vec::with_capacity(2 + 3 + payload.len());
     frame.extend_from_slice(&((3 + payload.len()) as u16).to_be_bytes());
     frame.extend_from_slice(tag);
     frame.extend_from_slice(payload);
-    frame
+    Ok(frame)
 }
 
 /// Decode one TNC→host frame's parts from `bytes`: the tag and the payload
@@ -82,8 +87,8 @@ mod tests {
     #[tokio::test]
     async fn host_frame_round_trips_pat_length_semantics() {
         let two_and_a_half = [
-            &encode_host_frame(b"demo")[..],
-            &encode_host_frame(b"second")[..],
+            &encode_host_frame(b"demo").unwrap()[..],
+            &encode_host_frame(b"second").unwrap()[..],
             // A partial third frame: the length prefix promises 4 bytes but
             // only 2 follow.
             &[0x00u8, 0x04, b't', b'h'][..],
@@ -109,7 +114,7 @@ mod tests {
     /// `len == 3 + payload.len()` (Pat's `frame.go` reads exactly this).
     #[test]
     fn tnc_frame_carries_three_byte_tag() {
-        let frame = encode_tnc_frame(ARQ_TAG, b"demo");
+        let frame = encode_tnc_frame(ARQ_TAG, b"demo").unwrap();
         assert_eq!(
             frame,
             [0x00, 0x07, b'A', b'R', b'Q', b'd', b'e', b'm', b'o']
@@ -119,7 +124,7 @@ mod tests {
         assert_eq!(payload, b"demo");
         // An ERR-tagged frame decodes with tag ERR and the payload after
         // byte 5.
-        let err = encode_tnc_frame(b"ERR", b"x");
+        let err = encode_tnc_frame(b"ERR", b"x").unwrap();
         let (tag, payload) = decode_tnc_frame(&err).unwrap();
         assert_eq!(tag, "ERR");
         assert_eq!(payload, b"x");
@@ -130,9 +135,11 @@ mod tests {
     #[test]
     fn oversized_frame_is_rejected() {
         assert_eq!(MAX_FRAME, u16::MAX as usize);
+        assert!(encode_host_frame(&vec![0; MAX_FRAME + 1]).is_err());
+        assert!(encode_tnc_frame(ARQ_TAG, &vec![0; MAX_FRAME - 2]).is_err());
         // len counts tag+payload, so the largest expressible TNC frame is
         // 65535 bytes total — bounded by construction.
-        let frame = encode_tnc_frame(ARQ_TAG, &[0u8; MAX_FRAME - 3]);
+        let frame = encode_tnc_frame(ARQ_TAG, &[0u8; MAX_FRAME - 3]).unwrap();
         assert_eq!(frame.len(), 2 + MAX_FRAME);
         assert!(decode_tnc_frame(&frame).is_ok());
         // Truncated and inconsistent frames error, never half-deliver.

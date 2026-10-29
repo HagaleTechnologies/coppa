@@ -9,7 +9,7 @@
 //! virtual cable as `pat_vara_session.rs`, and a `PatArdop` emulator per
 //! station drives the command and data ports with the command sequence read
 //! from Pat's ARDOP transport (`wl2k-go/transport/ardop/tnc.go`): the init
-//! burst (echo acks, `STATE` answered with the state word), `LISTEN TRUE`,
+//! burst (echo acks, `STATE` answered with `STATE DISC`), `LISTEN TRUE`,
 //! `ARQCALL` with no echo and `NEWSTATE ISS` then `CONNECTED`, `TARGET`
 //! before `CONNECTED` on the listener (Pat's listen gate), framed data both
 //! ways (`<len:u16 BE>` in, `<len:u16 BE><ARQ><payload>` out), flow control
@@ -239,7 +239,7 @@ impl PatArdop {
             pat.send(cmd).await;
             let reply = pat.next_reply().await;
             let expect = match cmd {
-                "STATE" => "DISCONNECTED".to_string(),
+                "STATE" => "STATE DISC".to_string(),
                 "VERSION" => format!("VERSION Coppa {}", env!("CARGO_PKG_VERSION")),
                 other => other.to_string(),
             };
@@ -436,14 +436,14 @@ async fn pat_ardop_session_connects_exchanges_and_disconnects_both_ways() {
             assert_eq!(a.next_reply().await, "NEWSTATE ISS ", "lines: {:?}", a.seen);
             let line = a.wait("CONNECTED ", CONNECT_TIMEOUT).await;
             assert_eq!(line, "CONNECTED N0CALL 500MAX", "lines: {:?}", a.seen);
-            a.wait("NEWSTATE CONNECTED ", REPLY_TIMEOUT).await;
+            a.wait("NEWSTATE ISS ", REPLY_TIMEOUT).await;
             // The listener saw TARGET first (Pat's listen gate), then
-            // CONNECTED, then NEWSTATE CONNECTED.
+            // CONNECTED, then NEWSTATE IRS.
             let line = b.wait("TARGET ", CONNECT_TIMEOUT).await;
-            assert_eq!(line, "TARGET N1CALL", "lines: {:?}", b.seen);
+            assert_eq!(line, "TARGET N0CALL", "lines: {:?}", b.seen);
             let line = b.wait("CONNECTED ", CONNECT_TIMEOUT).await;
             assert_eq!(line, "CONNECTED N1CALL 500MAX", "lines: {:?}", b.seen);
-            b.wait("NEWSTATE CONNECTED ", REPLY_TIMEOUT).await;
+            b.wait("NEWSTATE IRS ", REPLY_TIMEOUT).await;
             let target_at = b
                 .seen
                 .iter()
@@ -496,8 +496,8 @@ async fn pat_ardop_session_connects_exchanges_and_disconnects_both_ways() {
 
             a.close().await;
             b.wait("DISCONNECTED", DISCONNECT_TIMEOUT).await;
-            b.wait("NEWSTATE DISCONNECTED ", REPLY_TIMEOUT).await;
-            a.wait("NEWSTATE DISCONNECTED ", REPLY_TIMEOUT).await;
+            b.wait("NEWSTATE DISC ", REPLY_TIMEOUT).await;
+            a.wait("NEWSTATE DISC ", REPLY_TIMEOUT).await;
             println!("session 1: DISCONNECTED on both stations");
 
             // Session 2, roles reversed on the same stations: the state
@@ -507,9 +507,9 @@ async fn pat_ardop_session_connects_exchanges_and_disconnects_both_ways() {
             assert_eq!(b.next_reply().await, "NEWSTATE ISS ", "lines: {:?}", b.seen);
             let line = b.wait("CONNECTED ", CONNECT_TIMEOUT).await;
             assert_eq!(line, "CONNECTED N1CALL 500MAX", "lines: {:?}", b.seen);
-            b.wait("NEWSTATE CONNECTED ", REPLY_TIMEOUT).await;
+            b.wait("NEWSTATE ISS ", REPLY_TIMEOUT).await;
             let line = a.wait("TARGET ", CONNECT_TIMEOUT).await;
-            assert_eq!(line, "TARGET N0CALL", "lines: {:?}", a.seen);
+            assert_eq!(line, "TARGET N1CALL", "lines: {:?}", a.seen);
             let line = a.wait("CONNECTED ", CONNECT_TIMEOUT).await;
             assert_eq!(line, "CONNECTED N0CALL 500MAX", "lines: {:?}", a.seen);
             println!("session 2: CONNECTED, reversed");

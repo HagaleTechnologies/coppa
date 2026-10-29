@@ -62,6 +62,7 @@ pub async fn handle_client(
     let (mut reader, mut writer) = stream.into_split();
 
     let event_tx_clone = event_tx.clone();
+    let (read_done_tx, mut read_done_rx) = tokio::sync::oneshot::channel::<()>();
 
     // Read framed data from client: the framing is stripped before the
     // payload becomes a `DataReceived` event.
@@ -75,16 +76,30 @@ pub async fn handle_client(
                 break;
             }
         }
-        // A frame that ends mid-prefix is a clean EOF; anything else is a
-        // truncated frame and closes the connection.
+        // EOF or a truncated frame ends the whole data connection, even
+        // when the server still has its sender registered.
+        drop(read_done_tx);
     });
     let read_abort = read_task.abort_handle();
 
     // Write framed data to client: every queued payload leaves as
     // `<len><ARQ><payload>`.
     let write_task = tokio::spawn(async move {
-        while let Some(data) = data_rx.recv().await {
-            let frame = encode_tnc_frame(ARQ_TAG, &data);
+        loop {
+            let data = tokio::select! {
+                data = data_rx.recv() => match data {
+                    Some(data) => data,
+                    None => break,
+                },
+                _ = &mut read_done_rx => break,
+            };
+            let Ok(frame) = encode_tnc_frame(ARQ_TAG, &data) else {
+                tracing::warn!(
+                    client_id,
+                    "ARDOP outbound frame exceeds wire length; closing"
+                );
+                break;
+            };
             if writer.write_all(&frame).await.is_err() {
                 break;
             }
@@ -181,6 +196,37 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    /// A truncated frame closes the socket even while the server retains
+    /// the output sender. No partial payload may escape to the daemon.
+    #[tokio::test]
+    async fn truncated_frame_closes_both_halves() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (events, mut rx) = mpsc::channel(4);
+        let (_data_tx, data_rx) = data_channel();
+        let handler = tokio::spawn(handle_client(server, 1, events, data_rx));
+        client.write_all(&[0, 4, b'a']).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut received))
+            .await
+            .expect("truncated input must close the output half")
+            .unwrap();
+        assert!(received.is_empty());
+        tokio::time::timeout(Duration::from_secs(1), handler)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            rx.recv().await.is_none(),
+            "partial payload must never be delivered"
+        );
     }
 
     #[test]

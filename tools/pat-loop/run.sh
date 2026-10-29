@@ -91,13 +91,22 @@ done
 
 case "$DIRECTION" in a | b | both) ;; *) die "--direction must be a, b or both" ;; esac
 case "$TRANSPORT" in vara | ardop) ;; *) die "--transport must be vara or ardop" ;; esac
+PAT_TRANSPORT=varahf
+VARA_ENABLED=true
+ARDOP_ENABLED=false
+if [[ $TRANSPORT == ardop ]]; then
+    PAT_TRANSPORT=ardop
+    VARA_ENABLED=false
+    ARDOP_ENABLED=true
+    [[ $LEGACY -eq 0 ]] || die "--legacy-config only supports --transport vara"
+fi
 [[ "$BODY_BYTES" =~ ^[0-9]+$ ]] || die "--body-bytes must be a number"
 [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || die "--timeout must be a number of seconds"
 [[ "$(uname -s)" == Linux ]] || die "Linux only (ALSA file PCMs)"
 command -v python3 >/dev/null || die "python3 is required"
 
 [[ -x "$COPPAD" ]] || die "no coppad at $COPPAD; build it with:
-  cargo build --release -p coppa-daemon --bin coppad --features cpal-backend"
+  cargo build --release -p coppa-daemon --bin coppad --features cpal-backend,ardop"
 COPPAD=$(cd "$(dirname "$COPPAD")" && pwd)/$(basename "$COPPAD")
 if [[ "$COPPAD" == */target/debug/* && $ALLOW_DEBUG -eq 0 ]]; then
     die "refusing a debug coppad ($COPPAD): a debug build cannot decode in real
@@ -182,6 +191,10 @@ while True:
     a = socket.socket()
     a.bind(("127.0.0.1", 0))
     port = a.getsockname()[1]
+    # Pat increments the final ASCII digit, so 9 would become ':'.
+    if port % 10 == 9:
+        a.close()
+        continue
     b = socket.socket()
     try:
         b.bind(("127.0.0.1", port + 1))
@@ -249,12 +262,12 @@ ptt_method = "none"
 
 [host]
 bind_address = "127.0.0.1"
-vara_enabled = true
+vara_enabled = $VARA_ENABLED
 vara_command_port = $cmd
 vara_data_port = $((cmd + 1))
-ardop_enabled = true
-ardop_command_port = $((cmd + 1000))
-ardop_data_port = $((cmd + 1001))
+ardop_enabled = $ARDOP_ENABLED
+ardop_command_port = $cmd
+ardop_data_port = $((cmd + 1))
 
 [engine]
 profile = "HF_STANDARD"
@@ -268,15 +281,11 @@ EOF
         varahf="{ \"addr\": \"localhost:$cmd\", \"bandwidth\": 2300 }"
     fi
     # COP-97: over the ARDOP transport Pat wants the ARDOP connector instead.
-    local ardop
-    ardop="{ \"addr\": \"localhost:$((cmd + 1000))\" }"
-    local pat_listen pat_connector
+    local pat_connector
     if [[ $TRANSPORT == ardop ]]; then
-        pat_listen='"ardop"'
-        pat_connector="\\"ardop\\": $ardop"
+        pat_connector="\"ardop\": { \"addr\": \"localhost:$cmd\" }"
     else
-        pat_listen='"varahf"'
-        pat_connector="\\"varahf\\": $varahf"
+        pat_connector="\"varahf\": $varahf"
     fi
     # version_reporting_disabled and the pre-seeded account-confirmed stamp
     # are TEST-ONLY: they keep Pat from calling the Winlink network (version
@@ -284,6 +293,7 @@ EOF
     cat >"$dir/pat.json" <<EOF
 {
   "mycall": "$call",
+  "locator": "FN31PR",
   "listen": $listen,
   "http_addr": "localhost:$http",
   "version_reporting_disabled": true,
@@ -392,7 +402,7 @@ run_direction() {
 
     station_env "$listener"
     env "${STATION_ENV[@]}" "$PAT" --config "$SCRATCH/$listener/pat.json" \
-        --mbox "$SCRATCH/$listener/mbox" --listen=$TRANSPORT http >"$run/listener.log" 2>&1 &
+        --mbox "$SCRATCH/$listener/mbox" --listen="$PAT_TRANSPORT" http >"$run/listener.log" 2>&1 &
     local listener_pid=$!
     PIDS+=("$listener_pid")
     wait_for_line "$run/listener.log" "Listening for incoming traffic" ||
@@ -408,7 +418,7 @@ run_direction() {
   "mycall": "$d_call",
   "listen": [],
   "version_reporting_disabled": true,
-  "$TRANSPORT": { "host": "localhost", "cmdPort": $cmd, "dataPort": $((cmd + 1)), "bandwidth": 2300 }
+  "varahf": { "host": "localhost", "cmdPort": $cmd, "dataPort": $((cmd + 1)), "bandwidth": 2300 }
 }
 EOF
     fi
@@ -425,7 +435,7 @@ EOF
 
     local start=$SECONDS rc=0
     env "${STATION_ENV[@]}" timeout "$TIMEOUT" "$DIAL_PAT" --config "$dial_cfg" \
-        --mbox "$SCRATCH/$dialer/mbox" connect "$TRANSPORT:///$l_call" \
+        --mbox "$SCRATCH/$dialer/mbox" connect "$PAT_TRANSPORT:///$l_call" \
         </dev/null >"$run/connect.log" 2>&1 || rc=$?
     local elapsed=$((SECONDS - start))
     # Give the listener a moment to file the message, then stop it.

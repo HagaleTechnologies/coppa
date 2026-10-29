@@ -50,6 +50,28 @@ type VaraResponseSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<VaraResponse>>>>;
 #[cfg(feature = "ardop")]
 type ArdopResponseSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<ArdopResponse>>>>;
 
+/// Host settings are local to one ARDOP command connection. A busy
+/// refusal must not make that host believe it owns the established link.
+#[cfg(feature = "ardop")]
+struct ArdopClientState {
+    initialized: bool,
+    refused: bool,
+    arqbw: String,
+    settings: HashMap<String, String>,
+}
+
+#[cfg(feature = "ardop")]
+impl Default for ArdopClientState {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            refused: false,
+            arqbw: "500MAX".into(),
+            settings: HashMap::new(),
+        }
+    }
+}
+
 /// Map of connected VARA data-port clients' data senders
 /// (`VaraServer::data_senders()`), used by [`forward_data_out`].
 pub type VaraDataSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>;
@@ -406,10 +428,10 @@ enum SessionNotice {
     /// A session ended or a connect attempt failed.
     Disconnected,
     /// COP-44: a remote station's CONNECT_REQ was accepted; the handshake
-    /// waits for its CONNECT_CFM. The remote is the pending caller — the
-    /// ARDOP surface announces it as `TARGET <remote>` (COP-97), which
+    /// waits for its CONNECT_CFM. The local address is the target that the
+    /// ARDOP interface announces as `TARGET <local>` (COP-97), which
     /// Pat's listen mode requires before `CONNECTED`.
-    Pending { remote: Callsign },
+    Pending { local: Callsign },
     /// COP-44: the inbound handshake `Pending` announced ended without
     /// `Connected`.
     PendingCancelled,
@@ -630,17 +652,9 @@ pub struct EventLoop {
     /// `main.rs` from `ArdopServer::response_senders()`.
     #[cfg(feature = "ardop")]
     ardop_responses: Option<ArdopResponseSenders>,
-    /// COP-97 (P7): the `ARQBW` token the ARDOP client last set (default
-    /// `500MAX`). coppa's speed ladder does not model ARDOP bandwidths, so
-    /// this is echoed back as the `CONNECTED <remote> <label>` label — an
-    /// honest label, not a speed level (research D2, COP-98 precedent).
+    /// Per-command-client labels, initialization and busy refusal state.
     #[cfg(feature = "ardop")]
-    ardop_arqbw: String,
-    /// COP-97 (P6): whether any ARDOP client has sent `INITIALIZE`. Before
-    /// it (or with no callsign), `STATE` answers `OFFLINE`, as a real TNC
-    /// does before its host initializes it.
-    #[cfg(feature = "ardop")]
-    ardop_initialized: bool,
+    ardop_clients: HashMap<u32, ArdopClientState>,
     /// Outbound raw payload bytes queued for encode+transmit (the sessionless
     /// raw/ARQ `HostEvent::DataReceived` TX path, enabled by
     /// `[host] sessionless_tx_enabled`), tagged with the ARQ seq
@@ -924,9 +938,7 @@ impl EventLoop {
             #[cfg(feature = "ardop")]
             ardop_responses: None,
             #[cfg(feature = "ardop")]
-            ardop_arqbw: "500MAX".to_string(),
-            #[cfg(feature = "ardop")]
-            ardop_initialized: false,
+            ardop_clients: HashMap::new(),
             tx_queue: VecDeque::new(),
             session_link: None,
             arq_tx_backlog: VecDeque::new(),
@@ -1511,7 +1523,10 @@ impl EventLoop {
                 )
             }
             SessionNotice::Disconnected => ("DISCONNECTED".to_string(), VaraResponse::Disconnected),
-            SessionNotice::Pending { .. } => ("PENDING".to_string(), VaraResponse::Pending),
+            SessionNotice::Pending { local } => {
+                tracing::debug!(local = %local, "Inbound session pending");
+                ("PENDING".to_string(), VaraResponse::Pending)
+            }
             SessionNotice::PendingCancelled => {
                 ("CANCELPENDING".to_string(), VaraResponse::CancelPending)
             }
@@ -1531,23 +1546,47 @@ impl EventLoop {
         #[cfg(feature = "ardop")]
         {
             let ardop = match &notice {
-                SessionNotice::Connected { remote, .. } => vec![
-                    ArdopResponse::Connected(remote.to_string(), self.ardop_arqbw.clone()),
-                    ArdopResponse::NewState("CONNECTED".to_string()),
+                SessionNotice::Connected {
+                    remote, we_called, ..
+                } => vec![
+                    ArdopResponse::Connected(remote.to_string(), String::new()),
+                    ArdopResponse::NewState(if *we_called { "ISS" } else { "IRS" }.to_string()),
                 ],
                 SessionNotice::Disconnected => vec![
                     ArdopResponse::Disconnected,
-                    ArdopResponse::NewState("DISCONNECTED".to_string()),
+                    ArdopResponse::NewState("DISC".to_string()),
                 ],
-                SessionNotice::Pending { remote } => {
-                    vec![ArdopResponse::Target(remote.to_string())]
+                SessionNotice::Pending { local } => {
+                    // TARGET is our called address, not the caller. Pat uses it
+                    // as the accepted connection's local address.
+                    vec![
+                        ArdopResponse::Target(local.to_string()),
+                        ArdopResponse::NewState("IRS".to_string()),
+                    ]
                 }
                 SessionNotice::PendingCancelled => {
-                    vec![ArdopResponse::NewState("DISCONNECTED".to_string())]
+                    vec![ArdopResponse::NewState("DISC".to_string())]
                 }
             };
             for response in ardop {
-                self.emit_ardop(response).await;
+                if let ArdopResponse::Connected(remote, _) = &response {
+                    if let Some(senders) = &self.ardop_responses {
+                        senders.lock().await.retain(|&id, tx| {
+                            let bw = self
+                                .ardop_clients
+                                .get(&id)
+                                .map(|state| state.arqbw.as_str())
+                                .unwrap_or("500MAX");
+                            queue_ardop_for_client(
+                                id,
+                                tx,
+                                ArdopResponse::Connected(remote.clone(), bw.to_string()),
+                            )
+                        });
+                    }
+                } else {
+                    self.emit_ardop(response).await;
+                }
             }
         }
         #[cfg(feature = "websocket")]
@@ -2456,6 +2495,8 @@ impl EventLoop {
             }
             HostEvent::Disconnected { client_id } => {
                 tracing::info!(client_id, "Client disconnected");
+                #[cfg(feature = "ardop")]
+                self.ardop_clients.remove(&client_id);
             }
             HostEvent::DataReceived { client_id, data } => {
                 tracing::debug!(client_id, bytes = data.len(), "Data received from client");
@@ -2655,7 +2696,7 @@ impl EventLoop {
                 // COP-97 (scenario 2, P9): the refusal is routed by surface.
                 // A VARA dial keeps today's client-scoped `DISCONNECTED`;
                 // an ARDOP dial gets `FAULT busy` + a client-scoped
-                // `NEWSTATE DISCONNECTED ` — the vocabulary Pat's `arqCall`
+                // `NEWSTATE DISC ` — the vocabulary Pat's `arqCall`
                 // already treats as refusal (no busy token exists in the
                 // ARDOP protocol).
                 if let Some(active) = self.active_session_remote() {
@@ -2666,11 +2707,12 @@ impl EventLoop {
                     if ardop_dial {
                         #[cfg(feature = "ardop")]
                         {
+                            self.ardop_clients.entry(client_id).or_default().refused = true;
                             self.reply_ardop(client_id, ArdopResponse::Fault("busy".into()))
                                 .await;
                             self.reply_ardop(
                                 client_id,
-                                ArdopResponse::NewState("DISCONNECTED".to_string()),
+                                ArdopResponse::NewState("DISC".to_string()),
                             )
                             .await;
                         }
@@ -2686,6 +2728,10 @@ impl EventLoop {
                     return;
                 }
 
+                #[cfg(feature = "ardop")]
+                if ardop_dial {
+                    self.ardop_clients.entry(client_id).or_default().refused = false;
+                }
                 let caps = LinkCapabilities::default();
                 match self.session_mgr.create(local, remote.clone(), 0, caps) {
                     Ok(id) => {
@@ -2737,7 +2783,7 @@ impl EventLoop {
                 tracing::info!(client_id, "Disconnect request");
                 // COP-97: VARA answers `OK`; ARDOP echoes the command (the
                 // echo-as-ack policy Pat's `set()` accepts), then the
-                // `DISCONNECTED`/`NEWSTATE DISCONNECTED ` outcome follows
+                // `DISCONNECTED`/`NEWSTATE DISC ` outcome follows
                 // from `end_session`.
                 #[cfg(feature = "ardop")]
                 if is_ardop_client(client_id) {
@@ -2768,6 +2814,15 @@ impl EventLoop {
                     self.end_session(id, client_id).await;
                 } else {
                     tracing::debug!("Disconnect request but no active session");
+                    #[cfg(feature = "ardop")]
+                    if is_ardop_client(client_id) {
+                        // Pat may close again after receiving the peer's close.
+                        // An idle close still needs a terminal outcome.
+                        self.reply_ardop(client_id, ArdopResponse::Disconnected)
+                            .await;
+                        self.reply_ardop(client_id, ArdopResponse::NewState("DISC".into()))
+                            .await;
+                    }
                 }
             }
         }
@@ -2788,14 +2843,46 @@ impl EventLoop {
     /// - `MYCALL <call>` valid → echo (and the daemon applies it as the
     ///   runtime callsign); invalid or missing → `WRONG`.
     /// - `LISTEN TRUE|FALSE` → echo (and the daemon applies it).
-    /// - `STATE` → the bare state word (P6 mapping).
+    /// - `STATE` → `STATE <state>` using Pat's DISC/ISS/IRS words.
     /// - `VERSION` → `VERSION Coppa <pkg>`, never an echo.
     /// - `SENDID` → echo, then a real station-ID frame via the beacon path
     ///   (P8) — or `FAULT` when no callsign is set or the channel is busy.
     /// - anything else → `WRONG`.
     #[cfg(feature = "ardop")]
     async fn handle_ardop_command(&mut self, client_id: u32, line: &str) {
+        let client = self.ardop_clients.entry(client_id).or_default();
+        let query = match line.trim().to_uppercase().as_str() {
+            "MYCALL" => Some(match self.local_callsign.as_ref() {
+                Some(call) => ArdopResponse::Echo(format!("MYCALL {call}")),
+                None => ArdopResponse::Fault("no callsign".into()),
+            }),
+            "ARQBW" => Some(ArdopResponse::Echo(format!("ARQBW {}", client.arqbw))),
+            key => client
+                .settings
+                .get(key)
+                .map(|value| ArdopResponse::Echo(format!("{key} {value}"))),
+        };
+        if let Some(response) = query {
+            self.reply_ardop(client_id, response).await;
+            return;
+        }
         let command = ArdopCommand::parse(line);
+        if matches!(
+            command,
+            ArdopCommand::Codec(_)
+                | ArdopCommand::ProtocolMode(_)
+                | ArdopCommand::ArqTimeout(_)
+                | ArdopCommand::GridSquare(_)
+                | ArdopCommand::CwId(_)
+        ) {
+            if let Some((key, value)) = line.trim().split_once(' ') {
+                self.ardop_clients
+                    .entry(client_id)
+                    .or_default()
+                    .settings
+                    .insert(key.to_uppercase(), value.trim().to_string());
+            }
+        }
         // The accepted-and-echoed periphery first: one rule, the raw line
         // back, no semantics emulated (`is_echo_only` is the same split
         // `docs/ARDOP.md` prints).
@@ -2806,13 +2893,13 @@ impl EventLoop {
         }
         match command {
             ArdopCommand::Initialize => {
-                self.ardop_initialized = true;
+                self.ardop_clients.entry(client_id).or_default().initialized = true;
                 self.reply_ardop(client_id, ArdopResponse::Echo(line.to_string()))
                     .await;
             }
             ArdopCommand::State => {
-                let state = self.ardop_state_word();
-                self.reply_ardop(client_id, ArdopResponse::Echo(state))
+                let state = self.ardop_state_word(client_id);
+                self.reply_ardop(client_id, ArdopResponse::Echo(format!("STATE {state}")))
                     .await;
             }
             ArdopCommand::Codec(on) => {
@@ -2864,7 +2951,7 @@ impl EventLoop {
             }
             ArdopCommand::ArqBw(bw) => {
                 tracing::debug!(%bw, "ARQBW recorded as a label; coppa's speed ladder is unchanged");
-                self.ardop_arqbw = bw;
+                self.ardop_clients.entry(client_id).or_default().arqbw = bw;
                 self.reply_ardop(client_id, ArdopResponse::Echo(line.to_string()))
                     .await;
             }
@@ -2912,7 +2999,7 @@ impl EventLoop {
             }
             // A pending connect attempt (outbound or inbound) ends through
             // the same teardown path as DISCONNECT (COP-44); the
-            // `DISCONNECTED`/`NEWSTATE DISCONNECTED ` outcome follows from
+            // `DISCONNECTED`/`NEWSTATE DISC ` outcome follows from
             // `end_session`.
             ArdopCommand::CancelPending => {
                 self.reply_ardop(client_id, ArdopResponse::Echo(line.to_string()))
@@ -2945,21 +3032,27 @@ impl EventLoop {
 
     /// COP-97 (P6): the `STATE` reply word. `OFFLINE` before `INITIALIZE`
     /// or with no callsign (a real TNC is offline until its host initializes
-    /// it and it has an identity); `CONNECTED` with an established session;
+    /// it and it has an identity); `ISS` with an established session;
     /// `ISS`/`IRS` while an outbound/inbound handshake is under way (and
     /// through the session, as real TNCs report the traffic role);
-    /// `DISCONNECTED` otherwise.
+    /// `DISC` otherwise.
     #[cfg(feature = "ardop")]
-    fn ardop_state_word(&self) -> String {
-        if !self.ardop_initialized || self.local_callsign.is_none() {
+    fn ardop_state_word(&self, client_id: u32) -> String {
+        let Some(client) = self.ardop_clients.get(&client_id) else {
             return "OFFLINE".to_string();
+        };
+        if !client.initialized || self.local_callsign.is_none() {
+            return "OFFLINE".to_string();
+        }
+        if client.refused {
+            return "DISC".to_string();
         }
         for id in self.session_mgr.active_sessions() {
             let Some(session) = self.session_mgr.get(id) else {
                 continue;
             };
             match session.state {
-                SessionState::Established => return "CONNECTED".to_string(),
+                SessionState::Established => return "ISS".to_string(),
                 // Outbound handshake (CONNECT_REQ sent) reports ISS; inbound
                 // (CONNECT_ACK sent, awaiting CFM) reports IRS.
                 SessionState::Connecting | SessionState::Disconnecting => return "ISS".to_string(),
@@ -2967,7 +3060,7 @@ impl EventLoop {
                 SessionState::Idle => {}
             }
         }
-        "DISCONNECTED".to_string()
+        "DISC".to_string()
     }
 
     async fn handle_audio_in(&mut self, samples: &[f32]) {
@@ -5065,7 +5158,7 @@ impl EventLoop {
                                 self.notify_session(
                                     0,
                                     SessionNotice::Pending {
-                                        remote: remote.clone(),
+                                        local: pdu.dest.clone(),
                                     },
                                 )
                                 .await;
@@ -17575,7 +17668,7 @@ mod tests {
                     pat.send(cmd).await;
                     let reply = pat.next_reply().await;
                     let expect = match cmd {
-                        "STATE" => "DISCONNECTED".to_string(),
+                        "STATE" => "STATE DISC".to_string(),
                         "VERSION" => format!("VERSION Coppa {}", env!("CARGO_PKG_VERSION")),
                         other => other.to_string(),
                     };
@@ -17585,6 +17678,9 @@ mod tests {
                         pat.call, pat.seen
                     );
                 }
+                pat.command("MYCALL", &format!("MYCALL {}", station.call))
+                    .await;
+                pat.command("ARQBW", "ARQBW 500MAX").await;
                 pat
             }
 
@@ -17771,6 +17867,8 @@ mod tests {
             cmd_addr: std::net::SocketAddr,
             data_addr: std::net::SocketAddr,
             keyed: Option<Arc<AtomicBool>>,
+            vara_cmd_addr: std::net::SocketAddr,
+            vara_data_addr: std::net::SocketAddr,
         }
 
         /// Build, wire and start one station inside the current `LocalSet`,
@@ -17818,8 +17916,14 @@ mod tests {
                 data_listener,
                 &host,
             );
+            let vara_cmd = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let vara_data = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let vara_cmd_addr = vara_cmd.local_addr().unwrap();
+            let vara_data_addr = vara_data.local_addr().unwrap();
+            let vara_senders =
+                crate::vara_wiring::serve_vara(&mut event_loop, vara_cmd, vara_data, &host);
             tokio::task::spawn_local(async move {
-                let _ = forward_data_out(response_rx, vec![data_senders]).await;
+                let _ = forward_data_out(response_rx, vec![data_senders, vara_senders]).await;
             });
             tokio::task::spawn_local(async move {
                 let _ = event_loop.run().await;
@@ -17857,6 +17961,8 @@ mod tests {
                     cmd_addr,
                     data_addr,
                     keyed,
+                    vara_cmd_addr,
+                    vara_data_addr,
                 },
                 StationAudio {
                     input: in_producer,
@@ -17947,7 +18053,7 @@ mod tests {
         /// COP-97 Phase 3 test 4: `ARQCALL` maps onto the CONNECT path. The
         /// caller sees `NEWSTATE ISS` then `CONNECTED <remote> <label>`; the
         /// listener sees `TARGET <caller>` BEFORE `CONNECTED` (Pat's listen
-        /// gate) and `NEWSTATE CONNECTED ` on both.
+        /// gate) and `NEWSTATE ISS ` on the caller and `NEWSTATE IRS ` on the listener.
         #[tokio::test(start_paused = true)]
         async fn ardop_dial_maps_onto_the_connect_path() {
             let local = tokio::task::LocalSet::new();
@@ -17971,17 +18077,17 @@ mod tests {
                         "{}: lines: {:?}",
                         a.call, a.seen
                     );
-                    let newstate = a.wait("NEWSTATE CONNECTED ", Duration::from_secs(10)).await;
-                    assert_eq!(newstate, "NEWSTATE CONNECTED ");
+                    let newstate = a.wait("NEWSTATE ISS ", Duration::from_secs(10)).await;
+                    assert_eq!(newstate, "NEWSTATE ISS ");
 
                     // The listener saw TARGET first (Pat's listen
                     // requirement), then CONNECTED.
                     let target = b.wait("TARGET ", Duration::from_secs(60)).await;
-                    assert_eq!(target, "TARGET N1CALL", "{}: lines: {:?}", b.call, b.seen);
+                    assert_eq!(target, "TARGET N0CALL", "{}: lines: {:?}", b.call, b.seen);
                     let connected = b.wait("CONNECTED ", Duration::from_secs(10)).await;
                     assert_eq!(connected, "CONNECTED N1CALL 500MAX");
-                    let newstate = b.wait("NEWSTATE CONNECTED ", Duration::from_secs(10)).await;
-                    assert_eq!(newstate, "NEWSTATE CONNECTED ");
+                    let newstate = b.wait("NEWSTATE IRS ", Duration::from_secs(10)).await;
+                    assert_eq!(newstate, "NEWSTATE IRS ");
                     let target_seen_at = b
                         .seen
                         .iter()
@@ -18050,7 +18156,7 @@ mod tests {
         }
 
         /// COP-97 Phase 3 test 6: `DISCONNECT` tears down on both sides with
-        /// `DISCONNECTED` + `NEWSTATE DISCONNECTED `, and a second `ARQCALL`
+        /// `DISCONNECTED` + `NEWSTATE DISC `, and a second `ARQCALL`
         /// afterwards succeeds (state reset).
         #[tokio::test(start_paused = true)]
         async fn ardop_disconnect_tears_down_and_newstate_follows() {
@@ -18067,17 +18173,15 @@ mod tests {
                     a.send("ARQCALL N0CALL 3").await;
                     a.wait("CONNECTED ", Duration::from_secs(60)).await;
                     b.wait("CONNECTED ", Duration::from_secs(60)).await;
-                    a.wait("NEWSTATE CONNECTED ", Duration::from_secs(10)).await;
-                    b.wait("NEWSTATE CONNECTED ", Duration::from_secs(10)).await;
+                    a.wait("NEWSTATE ISS ", Duration::from_secs(10)).await;
+                    b.wait("NEWSTATE IRS ", Duration::from_secs(10)).await;
 
                     a.send("DISCONNECT").await;
                     assert_eq!(a.next_reply().await, "DISCONNECT", "the echo ack");
                     a.wait("DISCONNECTED", Duration::from_secs(60)).await;
-                    a.wait("NEWSTATE DISCONNECTED ", Duration::from_secs(10))
-                        .await;
+                    a.wait("NEWSTATE DISC ", Duration::from_secs(10)).await;
                     b.wait("DISCONNECTED", Duration::from_secs(60)).await;
-                    b.wait("NEWSTATE DISCONNECTED ", Duration::from_secs(10))
-                        .await;
+                    b.wait("NEWSTATE DISC ", Duration::from_secs(10)).await;
 
                     // A second session with roles reversed on the same
                     // stations: the state reset works.
@@ -18087,6 +18191,78 @@ mod tests {
                     a.wait("CONNECTED ", Duration::from_secs(60)).await;
                 })
                 .await;
+        }
+
+        /// A second host's options never overwrite the first host's label.
+        #[tokio::test]
+        async fn ardop_bandwidth_labels_and_initialization_belong_to_each_client() {
+            let (mut event_loop, mut first_rx) = loop_with_ardop_client().await;
+            let second = FIRST_ARDOP_CMD_CLIENT_ID + 1;
+            let (tx, mut second_rx) = coppa_host::ardop::response_channel();
+            event_loop
+                .ardop_responses
+                .as_ref()
+                .unwrap()
+                .lock()
+                .await
+                .insert(second, tx);
+            event_loop.handle_ardop_command(second, "STATE").await;
+            assert_eq!(
+                second_rx.recv().await,
+                Some(ArdopResponse::Echo("STATE OFFLINE".into()))
+            );
+            event_loop.handle_ardop_command(second, "INITIALIZE").await;
+            second_rx.recv().await.unwrap();
+            event_loop
+                .handle_ardop_command(second, "ARQBW 1000MAX")
+                .await;
+            second_rx.recv().await.unwrap();
+            event_loop
+                .handle_ardop_command(FIRST_ARDOP_CMD_CLIENT_ID, "ARQBW")
+                .await;
+            assert_eq!(
+                first_rx.recv().await,
+                Some(ArdopResponse::Echo("ARQBW 500MAX".into()))
+            );
+            event_loop
+                .notify_session(
+                    0,
+                    SessionNotice::Connected {
+                        local: Callsign::new("N1CALL").unwrap(),
+                        remote: Callsign::new("N0CALL").unwrap(),
+                        we_called: true,
+                    },
+                )
+                .await;
+            assert_eq!(
+                first_rx.recv().await,
+                Some(ArdopResponse::Connected("N0CALL".into(), "500MAX".into()))
+            );
+            assert_eq!(
+                second_rx.recv().await,
+                Some(ArdopResponse::Connected("N0CALL".into(), "1000MAX".into()))
+            );
+        }
+
+        /// Pat can close twice after receiving the peer's disconnect. Even
+        /// with no remaining session, its second close needs an outcome.
+        #[tokio::test]
+        async fn idle_ardop_disconnect_is_answered_without_broadcast() {
+            let (mut event_loop, mut rx) = loop_with_ardop_client().await;
+            event_loop
+                .handle_host_event(HostEvent::DisconnectRequest {
+                    client_id: FIRST_ARDOP_CMD_CLIENT_ID,
+                })
+                .await;
+            assert_eq!(
+                rx.recv().await,
+                Some(ArdopResponse::Echo("DISCONNECT".into()))
+            );
+            assert_eq!(rx.try_recv().unwrap(), ArdopResponse::Disconnected);
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                ArdopResponse::NewState("DISC".into())
+            );
         }
 
         /// COP-97 Phase 3 test 7: `SENDID` keys a real station-ID frame when
@@ -18192,7 +18368,7 @@ mod tests {
 
         /// Scenario 2 verbatim: a VARA session is active; an ARDOP client
         /// dials; it gets exactly `FAULT busy` then
-        /// `NEWSTATE DISCONNECTED `, the VARA client hears nothing new, and
+        /// `NEWSTATE DISC `, the VARA client hears nothing new, and
         /// the first session still stands afterwards.
         #[tokio::test]
         async fn ardop_dial_during_active_vara_session_gets_fault_busy_and_vara_continues() {
@@ -18282,7 +18458,7 @@ mod tests {
                     }
                     assert_eq!(
                         replies,
-                        ["FAULT busy", "NEWSTATE DISCONNECTED "],
+                        ["FAULT busy", "NEWSTATE DISC "],
                         "the busy refusal, in ARDOP vocabulary (NEWSTATE keeps its trailing space)"
                     );
 
@@ -18329,6 +18505,73 @@ mod tests {
                     .expect("DISCONNECT answered")
                     .unwrap();
                     assert_eq!(String::from_utf8_lossy(&line).trim_end(), "OK");
+                })
+                .await;
+        }
+
+        /// Scenario 2 with an established link: the original VARA host
+        /// still exchanges bytes through the modem after the ARDOP refusal.
+        #[tokio::test(start_paused = true)]
+        async fn active_vara_session_exchanges_data_after_ardop_refusal() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (a_station, a_audio) = station("N1CALL", true).await;
+                    let (b_station, b_audio) = station("N0CALL", true).await;
+                    spawn_cable(&a_station, a_audio, &b_station, b_audio);
+                    let mut observer = PatArdop::open(&a_station).await;
+                    let mut peer = PatArdop::open(&b_station).await;
+                    peer.command("LISTEN TRUE", "LISTEN TRUE").await;
+                    let mut vara = TcpStream::connect(a_station.vara_cmd_addr).await.unwrap();
+                    let mut data = TcpStream::connect(a_station.vara_data_addr).await.unwrap();
+                    let (read, mut write) = vara.split();
+                    let mut reader = BufReader::new(read);
+                    let mut line = Vec::new();
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        reader.read_until(b'\r', &mut line),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert!(line.starts_with(b"VERSION Coppa"));
+                    write.write_all(b"CONNECT N1CALL N0CALL\r").await.unwrap();
+                    observer.wait("CONNECTED ", Duration::from_secs(60)).await;
+                    observer
+                        .wait("NEWSTATE ISS ", Duration::from_secs(10))
+                        .await;
+                    peer.wait("CONNECTED ", Duration::from_secs(60)).await;
+                    observer.send("ARQCALL K2XYZ 3").await;
+                    assert_eq!(observer.next_reply().await, "FAULT busy");
+                    assert_eq!(observer.next_reply().await, "NEWSTATE DISC ");
+                    observer.command("STATE", "STATE DISC").await;
+                    data.write_all(b"the VARA session survives").await.unwrap();
+                    assert_eq!(peer.read_data(25).await, b"the VARA session survives");
+                    peer.write_data(b"peer reply").await;
+                    peer.flush().await;
+                    let mut reply = [0; 10];
+                    tokio::time::timeout(Duration::from_secs(60), data.read_exact(&mut reply))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(&reply, b"peer reply");
+                    // The original client gets its connection notice and buffer
+                    // updates, but neither refusal nor disconnect.
+                    write.write_all(b"VERSION\r").await.unwrap();
+                    loop {
+                        line.clear();
+                        tokio::time::timeout(
+                            Duration::from_secs(10),
+                            reader.read_until(b'\r', &mut line),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        assert!(!line.starts_with(b"DISCONNECTED"), "{line:?}");
+                        assert!(!line.starts_with(b"FAULT"), "{line:?}");
+                        if line.starts_with(b"VERSION") {
+                            break;
+                        }
+                    }
                 })
                 .await;
         }
@@ -18392,7 +18635,7 @@ mod tests {
             assert_eq!(rx2.recv().await, Some(ArdopResponse::Fault("busy".into())));
             assert_eq!(
                 rx2.recv().await,
-                Some(ArdopResponse::NewState("DISCONNECTED".into()))
+                Some(ArdopResponse::NewState("DISC".into()))
             );
             // The first session is untouched, and the first client (whose
             // channel rx holds) heard nothing.
@@ -18400,10 +18643,8 @@ mod tests {
             assert!(rx.try_recv().is_err(), "the first client hears nothing");
         }
 
-        /// After a refusal the refused client never entered ISS: with the
-        /// active session still up, `STATE` answers that session's word
-        /// (`CONNECTED` — the refusal changed nothing), and once the session
-        /// ends `STATE` answers `DISCONNECTED` and a later dial proceeds.
+        /// A refused dial leaves that client disconnected while the other
+        /// session stays active. A later dial after teardown still proceeds.
         #[tokio::test]
         async fn busy_refusal_does_not_disturb_state_words() {
             let (mut event_loop, mut rx) = loop_with_ardop_client().await;
@@ -18419,12 +18660,10 @@ mod tests {
             assert_eq!(rx.recv().await, Some(ArdopResponse::Fault("busy".into())));
             assert_eq!(
                 rx.recv().await,
-                Some(ArdopResponse::NewState("DISCONNECTED".into()))
+                Some(ArdopResponse::NewState("DISC".into()))
             );
 
-            // STATE is the link-wide word (P6): the first session is still
-            // up, so CONNECTED — not ISS, which the refused dial never
-            // entered.
+            // The refused client does not own the active session.
             event_loop
                 .handle_host_event(HostEvent::ArdopCommand {
                     client_id: client,
@@ -18433,7 +18672,7 @@ mod tests {
                 .await;
             assert_eq!(
                 rx.recv().await,
-                Some(ArdopResponse::Echo("CONNECTED".into()))
+                Some(ArdopResponse::Echo("STATE DISC".into()))
             );
 
             // After teardown STATE answers DISCONNECTED and a dial
@@ -18449,7 +18688,7 @@ mod tests {
                 .await;
             assert_eq!(
                 rx.recv().await,
-                Some(ArdopResponse::Echo("DISCONNECTED".into()))
+                Some(ArdopResponse::Echo("STATE DISC".into()))
             );
             event_loop
                 .handle_host_event(HostEvent::ConnectRequest {

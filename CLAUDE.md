@@ -64,7 +64,7 @@ cargo bench --workspace
 
 Two workflows:
 - `.github/workflows/ci.yml` runs on every push/PR to main: `cargo check`, `cargo test --lib` (with features, Linux), fmt, and platform checks (Linux/macOS/Windows, `cargo test --workspace --lib`). Lib tests only.
-- `.github/workflows/ci-full.yml` runs when `wait-for-codex.yml` dispatches it for a Codex-clean revision, on merge-queue entries, and on pushes to `main`: the **full test suite** (`test-full`, `cargo test --workspace --features cpal-backend,websocket`, Linux), bench and fuzz compilation, clippy, MSRV (1.85.0), **cargo-deny** supply-chain check, security audit (rustsec/audit-check), and wiki lint.
+- `.github/workflows/ci-full.yml` runs when `wait-for-codex.yml` dispatches it for a Codex-clean revision, on merge-queue entries, and on pushes to `main`: the **full test suite** (`test-full`, `cargo test --workspace --features cpal-backend,websocket,ardop`, Linux), bench and fuzz compilation, clippy, MSRV (1.85.0), **cargo-deny** supply-chain check, security audit (rustsec/audit-check), and wiki lint.
 
 ## MSRV
 

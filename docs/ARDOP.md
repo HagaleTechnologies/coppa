@@ -32,26 +32,27 @@ feature is a startup error. Defaults when the keys are absent: disabled,
 ports 8515/8516 (ardopcf's defaults).
 
 **No token.** Like the VARA ports (COP-53), the ARDOP ports have no
-authentication: any local process — and, if `bind_address` is not loopback,
-anyone who can reach the host — can key the transmitter through them. Keep
+authentication. Any local process, or anyone who can reach a non-loopback
+listener, can key the transmitter through them. A browser page can also
+submit command lines using a no-CORS request, the cross-protocol risk
+recorded in COP-53. This interface adds another unauthenticated command
+port to that existing risk. Keep
 `bind_address = "127.0.0.1"` unless the network is trusted and firewalled.
 
 ## Pat configuration
 
 ```json
 {
-  "connectors": [
-    {
-      "network": "ardop",
-      "config": { "addr": "127.0.0.1:8515" }
-    }
-  ]
+  "mycall": "N1CALL",
+  "locator": "FN31PR",
+  "ardop": { "addr": "127.0.0.1:8515" }
 }
 ```
 
 Pat derives the data port by ASCII-incrementing the last character of the
 command address (`8515` → `8516`), which is why the data port must be
-command + 1. Then:
+command + 1, and the command port must not end in `9`. Set `mycall` and
+`locator` to your own callsign and grid square. Then:
 
 ```sh
 pat connect ardop:///N0CALL      # dial a station
@@ -66,7 +67,7 @@ the command back**; a malformed line answers `WRONG`; a semantically failing
 command answers `FAULT <text>`.
 
 Unsolicited notifications: `NEWSTATE <state> ` (note the trailing space,
-preserved for byte-compatibility with real TNCs), `TARGET <call>` (a pending
+preserved for byte-compatibility with real TNCs), `TARGET <local-call>` (a pending
 inbound request — **required before `CONNECTED` for Pat's listen mode**),
 `CONNECTED <call> <bw>`, `DISCONNECTED`, `BUSY TRUE|FALSE`, `PTT TRUE|FALSE`,
 `BUFFER <n>` (unacked host bytes; falls on the peer's ACK, not on PTT
@@ -74,23 +75,27 @@ release).
 
 ### Command subset
 
+| Verified: Pat sends it | Accepted and echoed | Answered `WRONG` |
+|---|---|---|
+| `INITIALIZE`, `STATE`, `CODEC`, `PROTOCOLMODE`, `ARQTIMEOUT`, `LISTEN`, `MYCALL`, `GRIDSQUARE`, `ARQBW`, `VERSION`, `ARQCALL`, `DISCONNECT`, `CANCELPENDING`, `CWID`, `SENDID` | `SENDVER`, `ARQCALLBYNAME`, `GRACETIMERS`/`GRACETIMES`, `SENDBUFFER`, `FECSEND`, `MYAUX`/`MYAUXCALL`, `TRIMBLE` | Every other verb or malformed command |
+
 Verified: **Pat sends it** (read from `wl2k-go/transport/ardop`'s init and
 session flow):
 
 | Command | Behaviour |
 |---|---|
 | `INITIALIZE` | echo; marks the TNC initialized (`STATE` leaves `OFFLINE`) |
-| `STATE` | replies the state word: `OFFLINE` (before `INITIALIZE`/no callsign), `DISCONNECTED`, `ISS`/`IRS` (outbound/inbound handshake), `CONNECTED` |
+| `STATE` | `STATE <word>`: `OFFLINE` before initialization/no callsign, `DISC` when disconnected, `ISS`/`IRS` while connecting; an established link reports `ISS` |
 | `CODEC TRUE/FALSE` | echo (coppa models no codec gate) |
 | `PROTOCOLMODE ARQ` | echo |
 | `ARQTIMEOUT <s>` | echo, recorded — **does not change coppa's retry budget** (COP-38) |
 | `LISTEN TRUE/FALSE` | echo, applied (answers inbound connects) |
-| `MYCALL <call>` | echo, applied (feeds the station-ID gate); invalid → `WRONG` |
+| `MYCALL [<call>]` | set: echo, applied to the station-ID gate; query: `MYCALL <call>`; invalid → `WRONG` |
 | `GRIDSQUARE <grid>` | echo, stored, unused by ARQ |
-| `ARQBW <bw>` | echo, stored as a label (see below) |
+| `ARQBW [<bw>]` | set: echo, stored per client as a label; query: `ARQBW <bw>` |
 | `VERSION` | `VERSION Coppa <version>` (honest: Pat displays it in logs) |
-| `ARQCALL <target> [<repeats>]` | the dial: no echo; `NEWSTATE ISS ` then `CONNECTED <target> <label>`, or `FAULT busy` + `NEWSTATE DISCONNECTED ` when another session holds the link |
-| `DISCONNECT` | echo, then `DISCONNECTED` + `NEWSTATE DISCONNECTED ` |
+| `ARQCALL <target> [<repeats>]` | the dial: no echo; `NEWSTATE ISS ` then `CONNECTED <target> <label>`, or `FAULT busy` + `NEWSTATE DISC ` when another session holds the link |
+| `DISCONNECT` | echo, then `DISCONNECTED` + `NEWSTATE DISC ` |
 | `CANCELPENDING` | echo; drops a pending (not yet established) attempt |
 | `CWID TRUE/FALSE` | echo (coppa keys no Morse ID) |
 | `SENDID` | echo; transmits a real station-ID frame — `FAULT` with no callsign set or when the channel is busy |
@@ -131,8 +136,26 @@ never transmitted).
 The VARA-style and ARDOP interfaces drive the same modem and its one
 session, so they cannot both drive the transmitter: while a session is
 active, a dial from the *other* surface is refused. A refused `ARQCALL`
-answers `FAULT busy` + a client-scoped `NEWSTATE DISCONNECTED ` — the
+answers `FAULT busy` + a client-scoped `NEWSTATE DISC ` — the
 vocabulary Pat already treats as refusal (the ARDOP protocol has no
 dedicated busy token); a refused VARA `CONNECT` keeps its client-scoped
-`DISCONNECTED`. The first session never hears either refusal. The same
+`DISCONNECTED`. The refused ARDOP client's `STATE` remains `STATE DISC`. The first
+session never hears either refusal. The same
 refusal applies between two clients on the ARDOP surface itself.
+
+## Wire compatibility evidence
+
+Pat v1.0.0 uses wl2k-go v1.0.1. Its [get loop](https://github.com/la5nta/wl2k-go/blob/v1.0.1/transport/ardop/tnc.go)
+waits for a reply with the requested command name. Consequently `STATE`
+answers `STATE DISC`, not a bare state word. Its [state map](https://github.com/la5nta/wl2k-go/blob/v1.0.1/transport/ardop/ardop.go)
+recognizes `DISC`, `ISS`, and `IRS`; connection success is the separate
+`CONNECTED <remote> <label>` notification. New-state notifications use
+`NEWSTATE ISS ` for the caller, `NEWSTATE IRS ` for the listener, and
+`NEWSTATE DISC ` at teardown. `TARGET` names the local called address,
+which Pat's [listener](https://github.com/la5nta/wl2k-go/blob/v1.0.1/transport/ardop/listen.go)
+uses as the accepted connection's local address.
+
+`DISCONNECT` is idempotent. A repeated close receives its echo followed by
+`DISCONNECTED` and `NEWSTATE DISC ` even after the link has ended. Stored
+`GRIDSQUARE`, `CODEC`, `PROTOCOLMODE`, `ARQTIMEOUT`, and `CWID` settings may
+also be queried by sending the verb alone after setting a value.

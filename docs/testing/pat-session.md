@@ -121,30 +121,73 @@ catch a real-time decode stall like the debug-build failure; this harness does.
 
 ## COP-97 run record: Pat over the ARDOP interface (2026-10-29)
 
-Environment: the COP-97 cloud implement container (Linux x86_64,
-`libasound2-dev` installed), coppad built from this branch with
-`--features ardop`. Harness: `tools/pat-loop/run.sh --transport ardop`
-(P12: the COP-46 harness, parametrized; same pinned Pat v1.0.0 + sha256
-check, same verdict rows, same kill-by-PID rules).
+Linux x86_64 cloud container, Rust 1.98.0, Pat v1.0.0 with its pinned
+SHA-256 verified by the harness. The daemon was built with:
 
-Commands (each to be run on a Linux host with the pinned Pat download):
+```sh
+cargo build --release -p coppa-daemon --bin coppad --features cpal-backend,ardop
+```
 
-    tools/pat-loop/run.sh --transport ardop --direction both
-    tools/pat-loop/run.sh --transport ardop --direction a --body-bytes 6000
-    tools/pat-loop/run.sh --transport vara --direction both
+Two release daemon processes used the userspace ALSA loop. Both stations
+used `HF_STANDARD`, callsigns N1CALL/N0CALL and the synthetic grid FN31PR.
+Pat version reporting and account checks were disabled as in COP-46. No
+Winlink service was contacted. Each transport run enabled only its own
+command/data listeners, with free ports selected by the harness.
 
-Not run in this container (the run's not-run list):
+```text
+$ tools/pat-loop/run.sh --transport ardop --direction both --keep
+N1CALL->N0CALL  exit=0  elapsed=60s  body_match=yes  overflow_lines=0  keepalives=0
+N0CALL->N1CALL  exit=0  elapsed=61s  body_match=yes  overflow_lines=0  keepalives=0
+PASS
+```
 
-- The three commands above were NOT executed here: the phase's hard deadline
-  left no room for a release-build two-process run (the repository gate
-  itself consumes the phase's measured budget). The ARDOP harness path is
-  wired exactly as the VARA one (`--transport` selects the Pat connector,
-  the `[host] ardop_*` keys, `--listen` and the dial URI; `relay.py` parses
-  both PTT vocabularies), and the in-process equivalent —
-  `cargo test -p coppa-daemon --test pat_ardop_session --features ardop`,
-  two real `EventLoop` stations over the audio cable with a Pat-ARDOP
-  emulator — passed in both directions. The first operator with a Linux
-  desktop should append the three rows (`exit=`, `body_match=`,
-  `overflow_lines=`, `keepalives=` + PASS/FAIL) here.
-- Real radios, sound cards, RF, `snd-aloop`; Winlink Express (closed
-  source); the VARA regression row for the same reason.
+The long-body run delivered the message and completed Pat's session, but
+failed the harness's zero-overflow condition:
+
+```text
+$ tools/pat-loop/run.sh --transport ardop --direction a --body-bytes 6000 --keep
+N1CALL->N0CALL  (6000 B body)  exit=0  elapsed=407s  body_match=yes  overflow_lines=3  keepalives=0
+FAIL
+```
+
+The three overflow warnings occurred during transmit preparation/playout,
+with 2,368 and 7,168 samples dropped on A and 8,128 on B. The configured
+RX ring holds 8,192 samples, about 171 ms at 48 kHz. This run proves exact
+message delivery and no session keepalives during the long transfer. It
+does not meet the plan's zero-overflow criterion. Audio scheduling remains
+a separate limitation; this adapter does not change the DSP/audio path or
+suppress the harness failure. The short runs above remained overflow-free.
+
+The VARA regression also delivered both messages and completed both Pat
+sessions, with overflow warnings in the same audio loop:
+
+```text
+$ tools/pat-loop/run.sh --transport vara --direction both --keep
+N1CALL->N0CALL  exit=0  elapsed=61s  body_match=yes  overflow_lines=2  keepalives=0
+N0CALL->N1CALL  exit=0  elapsed=62s  body_match=yes  overflow_lines=2  keepalives=0
+FAIL
+```
+
+Thus the runtime overflow observation also occurs with the existing VARA
+transport. It is not confined to ARDOP. The harness retained its failure
+condition and kept its logs for both failed runs. After all three runs,
+`ps` listed no `coppad` or `pat` process, and no relay process remained.
+
+The real client exposed two errors in the planned wire contract. Pat
+requires `STATE DISC`, and its state map uses `DISC`/`ISS`/`IRS` rather
+than `DISCONNECTED`/`CONNECTED`. It also queries `MYCALL` before listening
+and uses `TARGET` as the local called address. The adapter, emulator and
+command documentation now follow those client requirements. See
+[docs/ARDOP.md](../ARDOP.md) for the source links and supported commands.
+A repeated `DISCONNECT` gets a terminal outcome even after the peer has
+closed, so Pat can complete its cleanup without waiting for its timeout.
+
+The in-process counterpart,
+`pat_ardop_session_connects_exchanges_and_disconnects_both_ways`, passed in
+44.6 seconds. It verifies TARGET ordering, both information-role
+notifications, framed payloads, both BUFFER drains and reversed roles.
+It uses virtual time and cannot establish real-time scheduling behavior.
+
+Not run: real radios, sound cards, RF, `snd-aloop`, fading/noise channels,
+Winlink Express, or multi-message sessions. Both ends ran coppa; no ARDOP
+waveform interoperability is claimed.

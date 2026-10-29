@@ -234,8 +234,14 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(4);
         let (_response_tx, response_rx) = mpsc::channel(4);
         let handler = tokio::spawn(handle_client(server, 1, event_tx, response_rx));
-        // Closing our write side ends the session, so read_to_end returns
-        // every byte the server sent: none.
+        let mut probe = [0; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), client.read(&mut probe))
+                .await
+                .is_err(),
+            "ARDOP must stay silent until the host speaks"
+        );
+        // After the quiet window, close and verify that no bytes were sent.
         client.shutdown().await.unwrap();
         let mut sent = Vec::new();
         tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut sent))

@@ -17,7 +17,7 @@
 pub enum ArdopCommand {
     /// `INITIALIZE`: reset the TNC to defaults. Acked by echo.
     Initialize,
-    /// `STATE`: ask for the current state word. Replied with the bare word.
+    /// `STATE`: ask for the current state word. Replied with `STATE <word>` (DISC/ISS/IRS).
     State,
     /// `CODEC TRUE|FALSE`: audio codec gate. Acked by echo; coppa models no
     /// codec gate.
@@ -311,8 +311,8 @@ mod tests {
         assert_eq!(ArdopResponse::Fault("busy".into()).format(), "FAULT busy\r");
         assert_eq!(ArdopResponse::Wrong.format(), "WRONG\r");
         assert_eq!(
-            ArdopResponse::NewState("DISCONNECTED".into()).format(),
-            "NEWSTATE DISCONNECTED \r"
+            ArdopResponse::NewState("DISC".into()).format(),
+            "NEWSTATE DISC \r"
         );
         assert_eq!(ArdopResponse::Busy(true).format(), "BUSY TRUE\r");
         assert_eq!(ArdopResponse::Ptt(false).format(), "PTT FALSE\r");
