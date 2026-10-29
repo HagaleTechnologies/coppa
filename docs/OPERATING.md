@@ -465,6 +465,39 @@ the moment its own PTT releases, so the other station's ACK can still collide
 with that next frame. Sender-side turn discipline is a separate follow-up. The hardware acceptance test for this
 behaviour is `docs/testing/cable-loop-turnaround.md`.
 
+## Ending a session (DISCONNECT)
+
+A host `DISCONNECT` gets `OK` at once. coppad then sends the data the host
+already queued for the session, one frame at a time, each ACKed by the peer
+(COP-38), and only after the last ACK keys the DISCONNECT frame on its own.
+The host sees `BUFFER` fall to `BUFFER 0`, then one `DISCONNECTED`. With
+nothing queued or un-acked, `DISCONNECTED` follows at once, as before.
+
+- A repeated `DISCONNECT` changes nothing: the host still gets one
+  `DISCONNECTED`.
+- While a frame waits for its ACK, COP-38's retry budget bounds the drain:
+  a peer that never ACKs ends it after about 3 minutes. If nothing can key
+  for 10 s, for example because the frequency gate holds wideband TX,
+  coppad drops the rest sooner. Either way it
+  drops what is left, tries to send the DISCONNECT frame and pushes
+  `DISCONNECTED`. A block that held the data also refuses that frame, and
+  the peer then ends the session on its own timeout. A long queue that keeps
+  moving drains in full, so allow for its airtime: at levels 1-2 each frame
+  is about 1.4 s on air, plus the peer's ACK.
+- A `CONNECT` sent before `DISCONNECTED` arrives ends the drain at once: the
+  rest is dropped and the DISCONNECT frame goes out before the new
+  `CONNECT`.
+- A CONNECT_REQ from another station, or from the draining peer itself,
+  gets no answer while the drain runs (the draining session is still the
+  one session coppad allows), so that caller's handshake times out and it
+  must call again after `DISCONNECTED`.
+- Host data written after `DISCONNECT` is not sent on that session.
+- Data the peer sends while the drain runs is still ACKed and delivered to
+  the host, so two stations that both sent `DISCONNECT` with data queued
+  drain each other's queues instead of retrying until the budget runs out.
+- `ABORT` does not yet tear the link down (COP-42).
+- A remote DISCONNECT or a session timeout still drops unsent data at once.
+
 ## BUSY lines on the command port
 
 coppad watches the 300-2800 Hz band of the received audio and sends `BUSY ON`
