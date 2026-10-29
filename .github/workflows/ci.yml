@@ -110,7 +110,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install ALSA dev headers (for cpal)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - run: cargo test --workspace --features cpal-backend,websocket,kiss-tnc,gpio-ptt --lib
+      - run: cargo test --workspace --features cpal-backend,websocket,kiss-tnc,gpio-ptt,ardop --lib
       - run: cargo check --workspace --no-default-features
 
   fmt:

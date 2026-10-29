@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use coppa_daemon::config::DaemonConfig;
-use coppa_daemon::event_loop::EventLoop;
+use coppa_daemon::event_loop::{forward_data_out, EventLoop};
 use coppa_daemon::vara_wiring::serve_vara;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -43,13 +43,8 @@ async fn serve_vara_answers_commands_from_the_running_loop() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
-            serve_vara(
-                &mut event_loop,
-                response_rx,
-                cmd_listener,
-                data_listener,
-                &host,
-            );
+            let data_senders = serve_vara(&mut event_loop, cmd_listener, data_listener, &host);
+            tokio::spawn(forward_data_out(response_rx, vec![data_senders]));
             tokio::task::spawn_local(async move {
                 let _ = event_loop.run().await;
             });

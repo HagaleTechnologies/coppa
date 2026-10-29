@@ -9,6 +9,8 @@
 
 // Shared with the library target; the binary uses only part of its API
 // (and none of the output worker without `cpal-backend`).
+#[cfg(feature = "ardop")]
+mod ardop_wiring;
 #[allow(dead_code)]
 mod audio_output;
 mod build_info;
@@ -267,6 +269,9 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     config
         .check_websocket_built(cfg!(feature = "websocket"))
         .map_err(anyhow::Error::msg)?;
+    config
+        .check_ardop_built(cfg!(feature = "ardop"))
+        .map_err(anyhow::Error::msg)?;
     #[cfg(not(feature = "cpal-backend"))]
     check_no_named_devices(&config.audio)?;
 
@@ -339,6 +344,27 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     } else {
         None
     };
+    // COP-97: the ARDOP TNC host interface's two listeners, bound the same
+    // way (data = command + 1, how every ARDOP client derives it).
+    let ardop_listeners = if config.host.ardop_enabled {
+        let cmd = bind_host_port(
+            "ARDOP command port",
+            &config.host.bind_address,
+            config.host.ardop_command_port,
+            "ardop_command_port",
+        )
+        .await?;
+        let data = bind_host_port(
+            "ARDOP data port",
+            &config.host.bind_address,
+            config.host.ardop_data_port,
+            "ardop_data_port",
+        )
+        .await?;
+        Some((cmd, data))
+    } else {
+        None
+    };
     #[cfg(feature = "websocket")]
     let ws_listener = if config.host.websocket_enabled {
         Some(
@@ -362,6 +388,22 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
             startup_report::Listener::Disabled,
         ),
     };
+    #[cfg(feature = "ardop")]
+    let ardop_state = match &ardop_listeners {
+        Some((cmd, data)) => (listener_state(cmd)?, listener_state(data)?),
+        None => (
+            startup_report::Listener::Disabled,
+            startup_report::Listener::Disabled,
+        ),
+    };
+    // A build without the feature never gets here with `ardop_enabled`
+    // (check_ardop_built refused it), so NotBuilt is unreachable; the arm
+    // keeps the summary shape honest anyway.
+    #[cfg(not(feature = "ardop"))]
+    let ardop_state = (
+        startup_report::Listener::NotBuilt,
+        startup_report::Listener::NotBuilt,
+    );
     #[cfg(feature = "websocket")]
     let ws_state = match &ws_listener {
         Some(listener) => listener_state(listener)?,
@@ -477,21 +519,40 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         let _ = shutdown_flag;
     }
 
-    // Start VARA TCP server (COP-46: the wiring lives in `vara_wiring` so the
-    // integration tests drive the same code)
-    if let Some((cmd_listener, data_listener)) = vara_listeners {
-        // Decoded payloads reach the data-port clients through the bridge
-        // `serve_vara` spawns. Wired only with a VARA server: the queue is
-        // unbounded, so it needs the bridge draining it.
-        let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Start the host servers (COP-46: the wiring lives in `vara_wiring` and
+    // `ardop_wiring` so the integration tests drive the same code).
+    //
+    // COP-97 (P4): one response channel and one `forward_data_out` drainer
+    // feed every enabled data-carrying surface, so `set_response_tx` is
+    // registered exactly once per daemon however many surfaces are on.
+    let mut data_out_senders: Vec<event_loop::VaraDataSenders> = Vec::new();
+    let host_surfaces_on = vara_listeners.is_some() || ardop_listeners.is_some();
+    let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
+    if host_surfaces_on {
         event_loop.set_response_tx(response_tx);
-        vara_wiring::serve_vara(
+    }
+    if let Some((cmd_listener, data_listener)) = vara_listeners {
+        data_out_senders.push(vara_wiring::serve_vara(
             &mut event_loop,
-            response_rx,
             cmd_listener,
             data_listener,
             &config.host,
-        );
+        ));
+    }
+    #[cfg(feature = "ardop")]
+    if let Some((cmd_listener, data_listener)) = ardop_listeners {
+        data_out_senders.push(ardop_wiring::serve_ardop(
+            &mut event_loop,
+            cmd_listener,
+            data_listener,
+            &config.host,
+        ));
+    }
+    if host_surfaces_on {
+        // The queue is unbounded, so it needs exactly one drainer.
+        tokio::spawn(event_loop::forward_data_out(response_rx, data_out_senders));
+    } else {
+        drop(response_rx);
     }
 
     // Start WebSocket server if enabled
@@ -574,10 +635,18 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         bind_address = %config.host.bind_address,
         vara_command = %vara_state.0,
         vara_data = %vara_state.1,
+        ardop_command = %ardop_state.0,
+        ardop_data = %ardop_state.1,
         websocket = %ws_state,
         "Host listeners"
     );
-    if startup_report::exposed([&vara_state.0, &vara_state.1, &ws_state]) {
+    if startup_report::exposed([
+        &vara_state.0,
+        &vara_state.1,
+        &ardop_state.0,
+        &ardop_state.1,
+        &ws_state,
+    ]) {
         tracing::warn!(
             bind_address = %config.host.bind_address,
             "Host listeners accept connections from other hosts; anyone who can reach them \

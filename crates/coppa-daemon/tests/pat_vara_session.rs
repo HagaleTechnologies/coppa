@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use coppa_audio::{AudioRingConsumer, AudioRingProducer};
 use coppa_daemon::config::DaemonConfig;
-use coppa_daemon::event_loop::EventLoop;
+use coppa_daemon::event_loop::{forward_data_out, EventLoop};
 use coppa_daemon::vara_wiring::serve_vara;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -87,13 +87,10 @@ async fn station(call: &'static str) -> (Station, StationAudio) {
     event_loop.set_response_tx(response_tx);
     event_loop.set_audio_in(in_consumer);
     event_loop.set_audio_out(out_producer);
-    serve_vara(
-        &mut event_loop,
-        response_rx,
-        cmd_listener,
-        data_listener,
-        &host,
-    );
+    let data_senders = serve_vara(&mut event_loop, cmd_listener, data_listener, &host);
+    tokio::task::spawn_local(async move {
+        let _ = forward_data_out(response_rx, vec![data_senders]).await;
+    });
     tokio::task::spawn_local(async move {
         let _ = event_loop.run().await;
     });

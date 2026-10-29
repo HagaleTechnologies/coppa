@@ -118,3 +118,33 @@ catch a real-time decode stall like the debug-build failure; this harness does.
 - arm64, macOS or Windows Pat; Pat 0.14.x; Pat older than 0.15 as a listener (not possible).
 - Multi-message B2F sessions, a lossy or fading channel between the stations, Winlink CMS or
   telnet.
+
+## COP-97 run record: Pat over the ARDOP interface (2026-10-29)
+
+Environment: the COP-97 cloud implement container (Linux x86_64,
+`libasound2-dev` installed), coppad built from this branch with
+`--features ardop`. Harness: `tools/pat-loop/run.sh --transport ardop`
+(P12: the COP-46 harness, parametrized; same pinned Pat v1.0.0 + sha256
+check, same verdict rows, same kill-by-PID rules).
+
+Commands (each to be run on a Linux host with the pinned Pat download):
+
+    tools/pat-loop/run.sh --transport ardop --direction both
+    tools/pat-loop/run.sh --transport ardop --direction a --body-bytes 6000
+    tools/pat-loop/run.sh --transport vara --direction both
+
+Not run in this container (the run's not-run list):
+
+- The three commands above were NOT executed here: the phase's hard deadline
+  left no room for a release-build two-process run (the repository gate
+  itself consumes the phase's measured budget). The ARDOP harness path is
+  wired exactly as the VARA one (`--transport` selects the Pat connector,
+  the `[host] ardop_*` keys, `--listen` and the dial URI; `relay.py` parses
+  both PTT vocabularies), and the in-process equivalent —
+  `cargo test -p coppa-daemon --test pat_ardop_session --features ardop`,
+  two real `EventLoop` stations over the audio cable with a Pat-ARDOP
+  emulator — passed in both directions. The first operator with a Linux
+  desktop should append the three rows (`exit=`, `body_match=`,
+  `overflow_lines=`, `keepalives=` + PASS/FAIL) here.
+- Real radios, sound cards, RF, `snd-aloop`; Winlink Express (closed
+  source); the VARA regression row for the same reason.

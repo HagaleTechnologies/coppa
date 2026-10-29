@@ -4,23 +4,24 @@
 //! production without failing).
 
 use crate::config::HostConfig;
-use crate::event_loop::{forward_data_out, DaemonEvent, EventLoop};
+use crate::event_loop::{DaemonEvent, EventLoop, VaraDataSenders};
 
 /// Start the VARA server on already-bound listeners and wire it to `event_loop`:
-/// host events in, command-port telemetry out, `DataOut` to the data port.
+/// host events in, command-port telemetry out. Returns the server's data
+/// senders for the shared `DataOut` fan-out (`event_loop::forward_data_out`),
+/// which the caller spawns once for every enabled data-carrying surface
+/// (COP-97's fan-out restructure: one channel, one drainer, many maps).
 ///
-/// `response_rx` is the receiving end of the channel handed to
-/// [`EventLoop::set_response_tx`]; [`forward_data_out`] drains it. The
-/// listeners are bound by the caller so a port that is already taken is a
-/// startup error (COP-32), not a log line from a spawned task. Must be called
-/// inside a Tokio runtime; the server and both bridges run as spawned tasks.
+/// The listeners are bound by the caller so a port that is already taken is
+/// a startup error (COP-32), not a log line from a spawned task. Must be called
+/// inside a Tokio runtime; the server and the event bridge run as spawned
+/// tasks.
 pub fn serve_vara(
     event_loop: &mut EventLoop,
-    response_rx: tokio::sync::mpsc::UnboundedReceiver<coppa_host::HostResponse>,
     cmd_listener: tokio::net::TcpListener,
     data_listener: tokio::net::TcpListener,
     host: &HostConfig,
-) {
+) -> VaraDataSenders {
     let mut vara_server = coppa_host::vara::VaraServer::with_bind_addr(
         host.vara_command_port,
         host.vara_data_port,
@@ -52,8 +53,7 @@ pub fn serve_vara(
     // SNR/PTT/BUFFER/BUSY telemetry (decision 8, Phase 3 Task 7).
     event_loop.set_vara_responses(vara_server.response_senders());
 
-    // Decoded payloads reach the data-port clients through this bridge.
-    tokio::spawn(forward_data_out(response_rx, vara_server.data_senders()));
+    let data_senders = vara_server.data_senders();
 
     // Serve the listeners bound above
     tokio::spawn(async move {
@@ -64,6 +64,8 @@ pub fn serve_vara(
             tracing::error!("VARA server stopped: {e:#}");
         }
     });
+
+    data_senders
 }
 
 /// A listener's bound address for logs, e.g. `127.0.0.1:8300`.

@@ -95,6 +95,13 @@ vara_command_port = 8300
 # data; keep them adjacent.
 # See docs/PAT.md.
 vara_data_port = 8301
+# ARDOP TNC host interface (COP-97): command 8515, data 8516 (= command + 1,
+# how every ARDOP client derives it). Off by default; needs a build with
+# the `ardop` feature. Host protocol only: both ends of a session run coppa.
+# No token — see docs/ARDOP.md.
+# ardop_enabled = true
+# ardop_command_port = 8515
+# ardop_data_port = 8516
 # WebSocket JSON API
 # Clients can opt into periodic "spectrum" and "audio_level" streams; see docs/OPERATING.md.
 # Needs a coppad built with --features websocket; set in a build without it, coppad stops at startup.

@@ -249,8 +249,8 @@ pub struct HostConfig {
     /// Address all host servers bind to. Defaults to "127.0.0.1" (loopback only).
     ///
     /// WARNING: binding to a non-loopback address (e.g. "0.0.0.0") exposes the
-    /// VARA-style ports, which have no authentication and can key a transmitter,
-    /// to anyone who can reach this host. The WebSocket port needs
+    /// VARA-style and ARDOP ports, which have no authentication and can key a
+    /// transmitter, to anyone who can reach this host. The WebSocket port needs
     /// `websocket_token`, but over `ws://` the token crosses the network in
     /// clear text. Only change this on a trusted, firewalled network.
     pub bind_address: String,
@@ -260,6 +260,17 @@ pub struct HostConfig {
     pub vara_command_port: u16,
     /// VARA data port.
     pub vara_data_port: u16,
+    /// COP-97: enable the ARDOP TNC host interface (command + data TCP
+    /// ports). A host *protocol* interface: over the air coppa speaks
+    /// coppa, so both ends of a session run coppa. Like the VARA ports,
+    /// there is no token — any local process can key the transmitter
+    /// through it (see docs/ARDOP.md).
+    pub ardop_enabled: bool,
+    /// COP-97: ARDOP command port. ARDOP clients derive the data port as
+    /// command port + 1, so keep that relationship if you change it.
+    pub ardop_command_port: u16,
+    /// COP-97: ARDOP data port (the ARDOP convention is command port + 1).
+    pub ardop_data_port: u16,
     /// Enable WebSocket interface.
     pub websocket_enabled: bool,
     /// WebSocket port.
@@ -487,6 +498,9 @@ impl Default for HostConfig {
             vara_enabled: false,
             vara_command_port: 8300,
             vara_data_port: 8301,
+            ardop_enabled: false,
+            ardop_command_port: 8515,
+            ardop_data_port: 8516,
             websocket_enabled: false,
             websocket_port: 8400,
             websocket_token: None,
@@ -789,6 +803,7 @@ impl DaemonConfig {
         if built || !self.host.websocket_enabled {
             return Ok(());
         }
+
         Err(
             "[host] websocket_enabled = true is set, but this coppad was built without the \
              websocket feature and starts no WebSocket server; rebuild with --features \
@@ -797,6 +812,21 @@ impl DaemonConfig {
         )
     }
 
+    /// COP-97: an ARDOP-enabled config needs a build with the `ardop`
+    /// feature, checked in every build (the keys deserialize in every
+    /// build).
+    pub fn check_ardop_built(&self, built: bool) -> Result<(), String> {
+        if built || !self.host.ardop_enabled {
+            return Ok(());
+        }
+
+        Err(
+            "[host] ardop_enabled = true is set, but this coppad was built without the \
+             ardop feature and starts no ARDOP host interface; rebuild with --features \
+             ardop, or set ardop_enabled = false"
+                .to_string(),
+        )
+    }
     /// COP-32: `[audio] sample_rate` must equal the configured profile's
     /// engine rate. coppad has no resampler, so any other rate plays and
     /// captures audio at the wrong speed. Checked by run mode before any
@@ -1532,6 +1562,51 @@ beacon_interval_secs = 600
         let host = HostConfig::default();
         assert_eq!(host.websocket_token, None);
         assert!(host.websocket_allowed_origins.is_empty());
+    }
+
+    /// COP-97: the ARDOP interface defaults off with the ardopcf-convention
+    /// ports 8515/8516, so every existing config file keeps its exact
+    /// behaviour.
+    #[cfg(feature = "ardop")]
+    #[test]
+    fn ardop_defaults_are_off_with_8515_8516() {
+        let host = HostConfig::default();
+        assert!(!host.ardop_enabled);
+        assert_eq!(host.ardop_command_port, 8515);
+        assert_eq!(host.ardop_data_port, 8516);
+    }
+
+    /// COP-97: the three keys parse from a `[host]` section, and an unknown
+    /// key is still rejected (`deny_unknown_fields`, COP-36 behaviour
+    /// unchanged).
+    #[cfg(feature = "ardop")]
+    #[test]
+    fn ardop_keys_parse_and_unknown_keys_still_rejected() {
+        let config: DaemonConfig = toml::from_str(
+            "[host]\nardop_enabled = true\nardop_command_port = 8515\nardop_data_port = 8516\n",
+        )
+        .unwrap();
+        assert!(config.host.ardop_enabled);
+        assert_eq!(config.host.ardop_command_port, 8515);
+        assert_eq!(config.host.ardop_data_port, 8516);
+
+        let err = toml::from_str::<DaemonConfig>("[host]\nardop_port = 1\n").unwrap_err();
+        assert!(
+            err.to_string().contains("ardop_port"),
+            "the typo'd key must be named: {err}"
+        );
+    }
+
+    /// COP-97: an enabled ARDOP interface refuses to start in a build
+    /// without the feature (the `check_websocket_built` precedent).
+    #[test]
+    fn check_ardop_built_gates_an_enabled_config() {
+        let mut config = DaemonConfig::default();
+        assert_eq!(config.check_ardop_built(false), Ok(()));
+        config.host.ardop_enabled = true;
+        let err = config.check_ardop_built(false).unwrap_err();
+        assert!(err.contains("ardop feature"), "{err}");
+        assert_eq!(config.check_ardop_built(true), Ok(()));
     }
 
     #[test]

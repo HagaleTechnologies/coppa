@@ -14,8 +14,10 @@ cannot burst ahead and underrun, and forward whole ALSA periods only (the file
 plugin pads a short capture read with stale data).
 
 On top of that it models a half-duplex radio: one monitor thread per station
-holds a VARA command-port connection open, reads every line, and tracks
-`PTT ON`/`PTT OFF`. While a station is keyed, the relay feeds it silence.
+holds a command-port connection open, reads every line, and tracks the PTT
+state in either host vocabulary: `PTT ON`/`PTT OFF` (the VARA-style ports)
+and `PTT TRUE`/`PTT FALSE` (the ARDOP ports, COP-97). While a station is
+keyed, the relay feeds it silence.
 
 Usage: relay.py DIR A_CMD_PORT B_CMD_PORT
 Python 3 standard library only.
@@ -35,7 +37,10 @@ F_SETPIPE_SZ = 1031
 
 
 def monitor(port, keyed):
-    """Track one station's PTT from its VARA command port, reconnecting."""
+    """Track one station's PTT from its command port, reconnecting.
+
+    Both surfaces report PTT: VARA-style as ON/OFF, ARDOP as TRUE/FALSE.
+    """
     while True:
         try:
             with socket.create_connection(("127.0.0.1", port)) as sock:
@@ -48,9 +53,9 @@ def monitor(port, keyed):
                     *lines, pending = pending.split(b"\r")
                     for line in lines:
                         line = line.strip()
-                        if line == b"PTT ON":
+                        if line in (b"PTT ON", b"PTT TRUE"):
                             keyed.set()
-                        elif line == b"PTT OFF":
+                        elif line in (b"PTT OFF", b"PTT FALSE"):
                             keyed.clear()
         except OSError:
             pass

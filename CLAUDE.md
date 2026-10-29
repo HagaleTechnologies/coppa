@@ -17,7 +17,7 @@ cargo test --workspace --lib
 cargo test --workspace
 
 # With feature flags
-cargo test --workspace --features cpal-backend,websocket,kiss-tnc --lib
+cargo test --workspace --features cpal-backend,websocket,kiss-tnc,ardop --lib
 
 # Clippy (CI runs with -D warnings)
 cargo clippy --workspace --all-targets -- -D warnings
@@ -31,7 +31,7 @@ cargo bench --workspace
 
 ## Testing Policy
 
-**Run `cargo test --workspace` locally before pushing.** Push/PR CI (`ci.yml`) runs lib tests only (`cargo test --workspace --lib` on Linux/macOS/Windows, plus `--features cpal-backend,websocket,kiss-tnc --lib` on Linux), so root `tests/` integration tests and proptest roundtrips do not run on a push. The full suite (`ci-full.yml`'s `test-full` job, Linux, `--features cpal-backend,websocket`) runs only when `wait-for-codex.yml` dispatches it for a Codex-clean revision, on merge-queue entries, and on pushes to `main`. A check that must guard every push belongs in a crate's lib tests: the speed ladder's FER waterfalls are guarded by `coppa-bench`'s `waterfall_bracket_level_*` tests (COP-70). At minimum, run `cargo test --workspace --lib` for a quick sanity check.
+**Run `cargo test --workspace` locally before pushing.** Push/PR CI (`ci.yml`) runs lib tests only (`cargo test --workspace --lib` on Linux/macOS/Windows, plus `--features cpal-backend,websocket,kiss-tnc,ardop --lib` on Linux), so root `tests/` integration tests and proptest roundtrips do not run on a push. The full suite (`ci-full.yml`'s `test-full` job, Linux, `--features cpal-backend,websocket,ardop`) runs only when `wait-for-codex.yml` dispatches it for a Codex-clean revision, on merge-queue entries, and on pushes to `main`. A check that must guard every push belongs in a crate's lib tests: the speed ladder's FER waterfalls are guarded by `coppa-bench`'s `waterfall_bracket_level_*` tests (COP-70). At minimum, run `cargo test --workspace --lib` for a quick sanity check.
 
 ## Workspace Structure
 
