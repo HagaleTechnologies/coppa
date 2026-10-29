@@ -1,6 +1,8 @@
 //! Exercise decoded text and byte output through the real tx/rx commands.
 #![cfg(feature = "file-backend")]
 
+mod common;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -18,7 +20,7 @@ fn run(command: &mut Command) -> String {
 }
 
 fn rx(path: &Path, flags: &[&str]) -> String {
-    run(Command::new(env!("CARGO_BIN_EXE_coppa"))
+    run(common::coppa_command()
         .args(["rx", "-i"])
         .arg(path)
         .args(flags))
@@ -27,7 +29,7 @@ fn rx(path: &Path, flags: &[&str]) -> String {
 #[test]
 fn rx_text_and_explicit_hex_roundtrip() {
     let path = std::env::temp_dir().join(format!("coppa_rx_text_{}.wav", std::process::id()));
-    run(Command::new(env!("CARGO_BIN_EXE_coppa"))
+    run(common::coppa_command()
         .args(["tx", MESSAGE, "-o"])
         .arg(&path));
 

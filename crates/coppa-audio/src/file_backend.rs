@@ -157,10 +157,10 @@ impl Drop for WavSink {
     fn drop(&mut self) {
         if !self.samples.is_empty() {
             if let Err(e) = self.flush_to_file() {
-                eprintln!(
-                    "WavSink::drop: failed to flush samples to {}: {}",
-                    self.path.display(),
-                    e
+                tracing::error!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "WavSink dropped with unflushed samples and could not write them"
                 );
             }
         }

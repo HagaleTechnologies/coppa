@@ -44,16 +44,17 @@ Then build and install the `coppa` binary with both the TNC and live audio:
 cargo install --path crates/coppa-cli --features cpal-backend,kiss-tnc
 ```
 
-`coppa tnc` should print both `Audio … started` lines:
+`coppa tnc` should log both `Audio … started` lines. It writes its status to stderr as
+levelled log lines (coloured only on a terminal; `RUST_LOG` overrides the `info` default):
 
 ```text
 $ coppa tnc --port 8001 --device coppa-loop-A
-TNC mode: KISS port 8001, sample rate 48000 Hz
-KISS server listening on port 8001
-PTT: null (no PTT configured)
-Audio input started (48000Hz)
-TNC ready.
-Audio output started (48000Hz)
+ INFO TNC mode kiss_port=8001 sample_rate=48000
+ INFO KISS server listening port=8001
+ INFO PTT: null (no PTT configured)
+ INFO Audio input started sample_rate=48000
+ INFO TNC ready.
+ INFO Audio output started sample_rate=48000
 ```
 
 If it prints `Audio: none (built without the cpal-backend feature; nothing will be sent or
@@ -99,7 +100,7 @@ is also coppa's.
    ```
 
 4. Start the two TNCs, each in its own terminal. Each prints the startup lines shown under
-   [Build](#build) and ends with `TNC ready.` and `Audio output started (48000Hz)`.
+   [Build](#build) and ends with `TNC ready.` and `Audio output started`.
 
    ```bash
    coppa tnc --port 8001 --device coppa-loop-A   # terminal 1: TNC A
