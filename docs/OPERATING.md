@@ -498,6 +498,35 @@ nothing queued or un-acked, `DISCONNECTED` follows at once, as before.
 - `ABORT` does not yet tear the link down (COP-42).
 - A remote DISCONNECT or a session timeout still drops unsent data at once.
 
+## BUSY lines on the command port
+
+coppad watches the 300-2800 Hz band of the received audio and sends `BUSY ON`
+or `BUSY OFF` to every connected host when the channel's occupancy changes.
+A new state is reported only after it has held for 250 ms of received audio,
+so:
+
+- two consecutive `BUSY` lines are at least 250 ms of audio apart;
+- a station that keys up is reported about 250 ms later, and its end is
+  reported about 250 ms after it stops (a long broadband signal can read
+  clear earlier, see the known gap below). When coppad reads a long stretch of
+  buffered audio at once (after a stall, or while it waits to transmit) and
+  reports a change for it, the next change can be reported up to that
+  stretch's length later: at most the length of coppad's input ring,
+  `[audio] buffer_size` samples (about 170 ms at the default 8192 samples
+  and 48 kHz; a larger `buffer_size` raises this bound in proportion);
+- a burst shorter than 250 ms is never reported.
+
+Detection always runs. `[station_id] busy_hold_ms` does not change it: that
+key only enables coppad's own courtesy wait before it transmits.
+
+Known gap: the noise floor is estimated across the whole audio spectrum, not
+only the 300-2800 Hz band. A receiver whose audio is much quieter outside
+that band, which is typical of an SSB rig, can read as one long `BUSY ON` on
+a quiet band. The floor also adapts to a steady broadband signal, so a long
+transmission can read as `BUSY ON` followed by `BUSY OFF` within half a second
+while it is still on the air, and coppad's own courtesy wait then lets its
+transmission out over it.
+
 ## Inbound connect attempts
 
 A listening coppad (`LISTEN ON`) pushes `PENDING` to every host when it
