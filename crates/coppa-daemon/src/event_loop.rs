@@ -416,12 +416,20 @@ fn log_rx_level_transition(state: LevelState, reading: &LevelReading) {
     }
 }
 
+/// Capacity of the daemon's event channel, and the most events
+/// `wait_for_clear_channel` sets aside in `deferred_events` (COP-42).
+const EVENT_CHANNEL_CAPACITY: usize = 256;
+
 /// The main daemon event loop.
 pub struct EventLoop {
     config: DaemonConfig,
     engine: CoppaCore,
     event_rx: mpsc::Receiver<DaemonEvent>,
     event_tx: mpsc::Sender<DaemonEvent>,
+    /// COP-42: events `wait_for_clear_channel` took off `event_rx` while it
+    /// looked for an `ABORT`. `run` dispatches them, in arrival order,
+    /// before it reads `event_rx` again.
+    deferred_events: VecDeque<DaemonEvent>,
     running: bool,
     /// The audio-out ring and the TX samples retained ahead of it until it
     /// has room, shared with the feeder task `run` spawns so a frame larger
@@ -687,7 +695,7 @@ impl EventLoop {
     /// profile has no frequency source at or above 29.7 MHz -- see
     /// `check_frequency_gate_at_startup`.
     pub fn new(config: DaemonConfig) -> Result<Self> {
-        let (event_tx, event_rx) = mpsc::channel(256);
+        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let radio_frequency = config
             .radio
             .frequency_config()
@@ -811,6 +819,7 @@ impl EventLoop {
             engine,
             event_rx,
             event_tx,
+            deferred_events: VecDeque::new(),
             running: false,
             tx_output: Arc::new(std::sync::Mutex::new(TxOutput::default())),
             audio_in: None,
@@ -2140,6 +2149,38 @@ impl EventLoop {
         self.shutdown_flag.clone()
     }
 
+    /// One `event_rx` event (`None`: every sender is gone, which ends the
+    /// loop like `Shutdown`).
+    async fn dispatch_event(&mut self, event: Option<DaemonEvent>) {
+        match event {
+                Some(DaemonEvent::Shutdown) | None => {
+                    tracing::info!("Shutdown signal received");
+                    if self.is_transmitting {
+                        tracing::info!("Releasing PTT before shutdown");
+                        self.force_release_ptt().await;
+                    }
+                    // E5: Signal audio threads to stop
+                    self.shutdown_flag.store(true, Ordering::Release);
+                    self.running = false;
+                }
+                Some(DaemonEvent::Host(host_event)) => {
+                    self.handle_host_event(host_event).await;
+                }
+                Some(DaemonEvent::AudioIn(samples)) => {
+                    self.handle_audio_in(&samples).await;
+                }
+                Some(DaemonEvent::AudioOut(samples)) => {
+                    self.handle_audio_out(&samples);
+                }
+                Some(DaemonEvent::PttChange(tx)) => {
+                    self.handle_ptt_change(tx).await;
+                }
+                Some(DaemonEvent::TxComplete { generation, completed }) => {
+                    self.handle_tx_complete(generation, completed).await;
+                }
+        }
+    }
+
     /// Run the event loop until shutdown.
     ///
     /// Polls the event channel and optionally reads audio input samples
@@ -2188,35 +2229,14 @@ impl EventLoop {
             .map(|senders| spawn_vara_keepalive(senders, self.vara_keepalive_period));
 
         while self.running {
+            // COP-42: events a busy-channel wait set aside come first.
+            if let Some(event) = self.deferred_events.pop_front() {
+                self.dispatch_event(Some(event)).await;
+                continue;
+            }
             tokio::select! {
                 event = self.event_rx.recv() => {
-                    match event {
-                        Some(DaemonEvent::Shutdown) | None => {
-                            tracing::info!("Shutdown signal received");
-                            if self.is_transmitting {
-                                tracing::info!("Releasing PTT before shutdown");
-                                self.force_release_ptt().await;
-                            }
-                            // E5: Signal audio threads to stop
-                            self.shutdown_flag.store(true, Ordering::Release);
-                            self.running = false;
-                        }
-                        Some(DaemonEvent::Host(host_event)) => {
-                            self.handle_host_event(host_event).await;
-                        }
-                        Some(DaemonEvent::AudioIn(samples)) => {
-                            self.handle_audio_in(&samples).await;
-                        }
-                        Some(DaemonEvent::AudioOut(samples)) => {
-                            self.handle_audio_out(&samples);
-                        }
-                        Some(DaemonEvent::PttChange(tx)) => {
-                            self.handle_ptt_change(tx).await;
-                        }
-                        Some(DaemonEvent::TxComplete { generation, completed }) => {
-                            self.handle_tx_complete(generation, completed).await;
-                        }
-                    }
+                    self.dispatch_event(event).await;
                 }
                 _ = audio_poll.tick() => {
                     self.poll_audio_input().await;
@@ -3367,7 +3387,28 @@ impl EventLoop {
             return;
         }
         let allowed = if self.wideband_frequency_check().is_ok() {
-            self.wait_for_clear_channel().await;
+            if self.wait_for_clear_channel().await {
+                // COP-42: an ABORT reached us while this frame waited for a
+                // clear channel. It is dropped unsent; `run` then handles
+                // the ABORT, which ends the session this frame was most
+                // likely for. A sessionless ARQ frame is retransmitted as
+                // after any loss, and a due station ID stays due (its timer
+                // is only reset when an ID actually keys).
+                tracing::info!("ABORT during the busy-channel wait: dropping the waiting frame");
+                if !self.is_transmitting {
+                    self.tx_on_air_bytes = 0;
+                    self.report_buffer().await;
+                    // As for the wideband refusal below, nothing keyed, so no
+                    // release will resume the queues: let the 500 ms
+                    // `retry_held_tx_drain` poll do it.
+                    self.tx_held_by_frequency_gate = !self.tx_queue.is_empty();
+                    self.session_tx_held_by_frequency_gate = self
+                        .session_link
+                        .as_ref()
+                        .is_some_and(|l| !l.backlog.is_empty());
+                }
+                return;
+            }
             self.wait_for_rx_turnaround().await;
             // The rig can retune during the unbounded courtesy wait and
             // its backoff. Resolve fresh evidence before committing to TX.
@@ -3567,13 +3608,24 @@ impl EventLoop {
     /// thread/callback even while this task is blocked here) actually
     /// reaches the gate during the wait, instead of its state going stale for
     /// the whole hold.
-    async fn wait_for_clear_channel(&mut self) {
+    ///
+    /// COP-42: the same blocking means `run` reads no host event during the
+    /// wait, so an `ABORT` would wait behind it and the cancelled frame would
+    /// still key once the channel cleared. Each iteration therefore moves
+    /// whatever `event_rx` holds into `deferred_events` (dispatched by `run`
+    /// afterwards, in order) and returns `true` as soon as one of them is an
+    /// `ABORT` while a session is live; the caller then drops the waiting
+    /// frame. `false` means the channel is clear.
+    async fn wait_for_clear_channel(&mut self) -> bool {
         let hold_ms = self.config.station_id.busy_hold_ms;
         if hold_ms == 0 || !self.busy_gate.current() {
-            return;
+            return false;
         }
         loop {
             while self.busy_gate.current() {
+                if self.abort_waiting() {
+                    return true;
+                }
                 self.observe_busy_gate_from_audio_input().await;
                 tokio::time::sleep(Duration::from_millis(hold_ms)).await;
                 self.release_overdue_ptt_while_waiting().await;
@@ -3583,12 +3635,39 @@ impl EventLoop {
             tokio::time::sleep(Duration::from_secs_f32(holdoff_secs)).await;
             self.release_overdue_ptt_while_waiting().await;
             self.observe_busy_gate_from_audio_input().await; // pick up anything that arrived during the holdoff
+            if self.abort_waiting() {
+                return true;
+            }
 
             if !self.busy_gate.current() {
-                return;
+                return false;
             }
             // Busy again during the holdoff -- loop back and wait again.
         }
+    }
+
+    /// COP-42: move pending `event_rx` events into `deferred_events` (up to
+    /// the channel's own capacity, so a long wait still applies
+    /// back-pressure rather than buffering without bound) and say whether an
+    /// `ABORT` is among them while a session is live. With no live session
+    /// `ABORT` does nothing, so it does not cut the wait either.
+    fn abort_waiting(&mut self) -> bool {
+        while self.deferred_events.len() < EVENT_CHANNEL_CAPACITY {
+            match self.event_rx.try_recv() {
+                Ok(event) => self.deferred_events.push_back(event),
+                Err(_) => break,
+            }
+        }
+        self.live_session_id().is_some()
+            && self.deferred_events.iter().any(|event| {
+                matches!(
+                    event,
+                    DaemonEvent::Host(HostEvent::VaraCommand {
+                        command: VaraCommand::Abort,
+                        ..
+                    })
+                )
+            })
     }
 
     /// COP-31: the PTT backstop inside `wait_for_clear_channel`, which can
@@ -14301,6 +14380,123 @@ mod tests {
             assert!(
                 available >= payload.len(),
                 "the deferred transmission should still have gone out eventually"
+            );
+        }
+
+        /// COP-42 review (Codex P1 on #160): an `ABORT` sent while a frame
+        /// waits for a clear channel cuts the wait. The waiting frame never
+        /// keys, the ABORT is set aside for `run` in arrival order (behind the
+        /// event that came before it), and dispatching it ends the session at
+        /// once. Before the fix the wait read no host event, so the ABORT sat
+        /// behind it for as long as the channel stayed busy and the cancelled
+        /// frame keyed first.
+        #[tokio::test(start_paused = true)]
+        async fn abort_cuts_a_busy_channel_wait_and_the_waiting_frame_never_keys() {
+            let mut config = config_with_callsign();
+            config.station_id.busy_hold_ms = 10;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            mark_identified(&mut event_loop);
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+            // Nothing feeds the input ring, so without the ABORT this wait
+            // would never end.
+            let (_audio_in_tx, audio_in_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_in(audio_in_rx);
+            let mut counter = 7u32;
+            for _ in 0..10 {
+                event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.01, &mut counter));
+            }
+            for _ in 0..5 {
+                event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.5, &mut counter));
+            }
+            assert!(event_loop.busy_gate.current());
+            let id = super::telemetry::seed_established(&mut event_loop);
+
+            let tx = event_loop.event_tx.clone();
+            tx.send(DaemonEvent::Host(HostEvent::Connected { client_id: 1 }))
+                .await
+                .unwrap();
+            tx.send(DaemonEvent::Host(HostEvent::VaraCommand {
+                client_id: 1,
+                command: VaraCommand::Abort,
+            }))
+            .await
+            .unwrap();
+
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                event_loop.transmit_samples(&[0.25f32; 500]),
+            )
+            .await
+            .expect("an ABORT must cut the busy-channel wait");
+            assert_eq!(audio_out_rx.available(), 0, "the waiting frame must not key");
+            assert!(!event_loop.is_transmitting);
+            assert!(matches!(
+                event_loop.deferred_events.front(),
+                Some(DaemonEvent::Host(HostEvent::Connected { client_id: 1 }))
+            ));
+            assert_eq!(event_loop.deferred_events.len(), 2);
+
+            while let Some(event) = event_loop.deferred_events.pop_front() {
+                event_loop.dispatch_event(Some(event)).await;
+            }
+            assert!(
+                event_loop.session_mgr.get(id).is_none(),
+                "the deferred ABORT must end the session"
+            );
+        }
+
+        /// COP-42: with no live session `ABORT` does nothing, so it does not
+        /// cut a busy-channel wait either; the frame still goes out once the
+        /// channel clears.
+        #[tokio::test(start_paused = true)]
+        async fn abort_without_a_session_leaves_a_busy_channel_wait_alone() {
+            let mut config = config_with_callsign();
+            config.station_id.busy_hold_ms = 10;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            mark_identified(&mut event_loop);
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+            let (mut audio_in_tx, audio_in_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_in(audio_in_rx);
+            let mut counter = 11u32;
+            for _ in 0..10 {
+                event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.01, &mut counter));
+            }
+            for _ in 0..5 {
+                event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.5, &mut counter));
+            }
+            assert!(event_loop.busy_gate.current());
+            for _ in 0..15 {
+                audio_in_tx.write(&noise_block(0.01, &mut counter));
+            }
+            event_loop
+                .event_tx
+                .send(DaemonEvent::Host(HostEvent::VaraCommand {
+                    client_id: 1,
+                    command: VaraCommand::Abort,
+                }))
+                .await
+                .unwrap();
+
+            let payload = vec![0.25f32; 500];
+            event_loop.transmit_samples(&payload).await;
+            assert!(
+                audio_out_rx.available() >= payload.len(),
+                "the frame must still go out once the channel clears"
+            );
+            assert_eq!(
+                event_loop.deferred_events.len(),
+                1,
+                "the ABORT is still set aside for `run`"
             );
         }
 
