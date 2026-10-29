@@ -504,6 +504,26 @@ impl CoppaCore {
         }
     }
 
+    /// Detect a likely compressed frame received with compression disabled.
+    /// An exact compressor round trip is still ambiguous with deliberately
+    /// constructed raw bytes; a future wire envelope would resolve that.
+    pub fn appears_compressed_with_wrong_profile(&self, payload: &[u8]) -> bool {
+        if self.config.compression_enabled || payload.first() != Some(&COMPRESSION_MARKER) {
+            return false;
+        }
+        let Ok(huffman_bytes) = lz4_decompress(&payload[1..]) else {
+            return false;
+        };
+        let huffman = HuffmanCodec::new();
+        let original = huffman.decode(&huffman_bytes);
+        let recompressed = {
+            let mut bytes = vec![COMPRESSION_MARKER];
+            bytes.extend(lz4_compress(&huffman.encode(&original)));
+            bytes
+        };
+        recompressed == payload
+    }
+
     /// COP-68: pass-through of [`StreamingReceiver::header_only_decodes`] --
     /// how many candidates decoded a protected header but failed payload FEC
     /// since this engine's streaming receiver was built. The daemon reads it
@@ -664,6 +684,40 @@ impl Default for CoppaCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compression_probe_requires_exact_compressor_output_not_just_marker() {
+        let plain = CoppaCore::new();
+        let compressed = CoppaCore::with_config(EngineConfig {
+            compression_enabled: true,
+            ..Default::default()
+        });
+        let payload = compressed.compress_payload(b"CQ CQ DE W5AU");
+        assert!(plain.appears_compressed_with_wrong_profile(&payload));
+        assert!(!compressed.appears_compressed_with_wrong_profile(&payload));
+        for bytes in [
+            vec![0xfe],
+            vec![0xfe, 1, 2, 3, 4, 5],
+            vec![0xfe, 0, 0, 0, 0, 0],
+            vec![0xfe, 0xff, 0xff, 0xff, 0xff],
+        ] {
+            assert!(
+                !plain.appears_compressed_with_wrong_profile(&bytes),
+                "{bytes:?}"
+            );
+        }
+        // The actual L1_awgn12 golden payload starts with the marker byte.
+        let golden_hex = "fe6780024ccce40d8954f8265b2991487e4d4ddcb869b6ad36e768b345326da44baf351a463bd401589f5dc5a88f9238580190af6d873868";
+        let golden: Vec<u8> = golden_hex
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        assert!(!plain.appears_compressed_with_wrong_profile(&golden));
+        let mut corrupted = payload;
+        corrupted.push(0);
+        assert!(!plain.appears_compressed_with_wrong_profile(&corrupted));
+    }
 
     #[test]
     fn test_engine_creation() {
