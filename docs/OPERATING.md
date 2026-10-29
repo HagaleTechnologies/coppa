@@ -477,8 +477,8 @@ nothing queued or un-acked, `DISCONNECTED` follows at once, as before.
   `DISCONNECTED`.
 - While a frame waits for its ACK, COP-38's retry budget bounds the drain:
   a peer that never ACKs ends it after about 3 minutes. If nothing can key
-  for 10 s, for example because the frequency gate holds wideband TX or
-  there is no valid callsign, coppad drops the rest sooner. Either way it
+  for 10 s, for example because the frequency gate holds wideband TX,
+  coppad drops the rest sooner. Either way it
   drops what is left, tries to send the DISCONNECT frame and pushes
   `DISCONNECTED`. A block that held the data also refuses that frame, and
   the peer then ends the session on its own timeout. A long queue that keeps
@@ -492,6 +492,9 @@ nothing queued or un-acked, `DISCONNECTED` follows at once, as before.
   one session coppad allows), so that caller's handshake times out and it
   must call again after `DISCONNECTED`.
 - Host data written after `DISCONNECT` is not sent on that session.
+- Data the peer sends while the drain runs is still ACKed and delivered to
+  the host, so two stations that both sent `DISCONNECT` with data queued
+  drain each other's queues instead of retrying until the budget runs out.
 - `ABORT` does not yet tear the link down (COP-42).
 - A remote DISCONNECT or a session timeout still drops unsent data at once.
 

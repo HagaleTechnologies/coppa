@@ -156,8 +156,9 @@ pub struct Session {
     pub session_timeout: Duration,
     /// How long a `Disconnecting` session may go without activity before it
     /// times out. coppad touches a draining session each time one of its
-    /// queued chunks keys (COP-43), so this bounds a stalled drain, not a
-    /// long one.
+    /// queued chunks keys, while a frame is still within its retry budget,
+    /// and when the peer's data or ACK arrives (COP-43), so this bounds a
+    /// stalled drain, not a long one.
     pub disconnect_timeout: Duration,
     /// Number of CONNECT_CFM retransmissions sent (initiator side).
     pub cfm_retries: u8,

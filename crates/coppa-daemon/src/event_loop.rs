@@ -2034,9 +2034,10 @@ impl EventLoop {
     /// Tear down `session_id` at once: drop its link (`BUFFER` reports the
     /// change), send a best-effort DISCONNECT to the peer, remove the
     /// session and tell the host `DISCONNECTED` (after `CANCELPENDING` when
-    /// it was a pending inbound handshake). Shared by the host's
-    /// `DISCONNECT` and COP-38's link failure, so no session data plays after
-    /// the host hears `DISCONNECTED`.
+    /// it was a pending inbound handshake). Used for COP-38's link failure
+    /// of a session no host DISCONNECT is draining, so no session data plays
+    /// after the host hears `DISCONNECTED`; a host `DISCONNECT` drains first
+    /// and ends through `end_local_disconnect` (COP-43).
     async fn end_session(&mut self, session_id: u8, client_id: u32) {
         let was_pending = self.is_accepting(session_id);
         self.discard_session_tx(session_id).await;
@@ -4941,6 +4942,12 @@ impl EventLoop {
     /// is ACKed, because a duplicate means our last ACK was lost. A payload
     /// that is not a reliable `TransportPdu` (a pre-0.3.0 peer) is dropped
     /// without `DataOut` and without an ACK.
+    ///
+    /// COP-43: the session a pending host DISCONNECT is draining keeps
+    /// receiving too. Its link is still up and the peer may be draining its
+    /// own queue toward us (both hosts sent DISCONNECT with data queued); if
+    /// neither station ACKed the other, both links would retry until their
+    /// retry budgets ran out and drop the data on a clean channel.
     async fn handle_session_data(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
         let session_id = self.session_id_for_frame(&pdu);
@@ -4951,7 +4958,12 @@ impl EventLoop {
             );
             return;
         };
-        if !session.is_established() {
+        let draining = session.state == SessionState::Disconnecting
+            && self
+                .pending_disconnect
+                .as_ref()
+                .is_some_and(|p| p.session_id == session.id);
+        if !session.is_established() && !draining {
             tracing::debug!(
                 remote = %remote, state = ?session.state,
                 "Data received but session not established"
@@ -13882,6 +13894,60 @@ mod tests {
             assert!(
                 last_buffer_zero < disconnected[0],
                 "DISCONNECTED must follow BUFFER 0: {lines:?}"
+            );
+        }
+
+        /// COP-43 review (Codex P1 on #158): the session a host DISCONNECT is
+        /// draining still ACKs and delivers the peer's data. When both hosts
+        /// send DISCONNECT with data queued, each station is in exactly this
+        /// state for the other's frames; before the fix it dropped them
+        /// unacknowledged, so both links retried until their retry budgets ran
+        /// out and dropped the data on a clean channel.
+        #[tokio::test]
+        async fn a_draining_session_still_acks_and_delivers_the_peers_data() {
+            let (mut station, mut consumer, _reader, _writer, id) = draining_station().await;
+            let (data_tx, mut data_rx) = mpsc::unbounded_channel();
+            station.set_response_tx(data_tx);
+            station
+                .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+                .await;
+            assert_eq!(
+                station.session_mgr.get(id).map(|s| s.state),
+                Some(SessionState::Disconnecting)
+            );
+            // Nothing is on the air, so the ACK can key at once.
+            station.is_transmitting = false;
+
+            // The peer, draining its own queue toward us.
+            let data = TransportPdu::new_reliable(0, 0, 0, b"peer drain".to_vec()).to_bytes();
+            station
+                .handle_mac_pdu(MacPdu::new(
+                    MacFrameType::Data,
+                    Callsign::new("VK3ABC").unwrap(),
+                    Callsign::new("W1AW").unwrap(),
+                    0,
+                    data,
+                ))
+                .await;
+
+            let link = station.session_link.as_ref().expect("the drain keeps its link");
+            assert_eq!(
+                link.rx.recv_base(),
+                1,
+                "the peer's segment must enter the receive window"
+            );
+            assert_eq!(drain_data_out(&mut data_rx), vec![b"peer drain".to_vec()]);
+            station.flush_pending_audio_out();
+            let mut buf = vec![0.0f32; 4_000_000];
+            let n = consumer.read(&mut buf);
+            assert!(
+                decoded_frame_types(&buf[..n]).contains(&MacFrameType::Ack),
+                "the peer's frame must be ACKed while the drain runs"
+            );
+            assert_eq!(
+                station.session_mgr.get(id).map(|s| s.state),
+                Some(SessionState::Disconnecting),
+                "receiving must not end or revive the drain"
             );
         }
 
