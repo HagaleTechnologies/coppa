@@ -4,6 +4,9 @@
 //! including ring-buffer bridging, loopback testing, VOX detection,
 //! and file I/O for regression testing.
 
+// Library diagnostics go through `tracing`, never straight to stdout/stderr.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 use anyhow::Result;
 
 pub mod loopback;

@@ -317,8 +317,8 @@ impl Drop for RigctldClient {
     /// blocking: one `T 0` on the current connection and, if that fails (the
     /// socket may be dead, e.g. rigctld restarted), one more on a fresh
     /// connection -- at most two writes and reads (2 s each) plus one
-    /// reconnect (2 s). Failure is printed, not propagated (same shape as
-    /// `WavSink::drop`).
+    /// reconnect (2 s). Failure is logged at ERROR, not propagated (same shape
+    /// as `WavSink::drop`).
     fn drop(&mut self) {
         if !self.may_be_keyed {
             return;
@@ -330,9 +330,10 @@ impl Drop for RigctldClient {
             result = RadioControl::set_ptt(self, PttState::Rx);
         }
         if let Err(e) = result {
-            eprintln!(
-                "RigctldClient: failed to release PTT at {} on drop: {e}",
-                self.addr
+            tracing::error!(
+                addr = %self.addr,
+                error = %e,
+                "RigctldClient: failed to release PTT on drop"
             );
         }
     }

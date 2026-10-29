@@ -7,9 +7,9 @@ use clap::Parser;
 
 use coppa_bench::report::{to_csv, to_markdown};
 use coppa_bench::runner::run_scenario;
-use coppa_bench::scenario::{ChannelSpec, Scenario, MODES};
+use coppa_bench::scenario::{mode_for_level, ChannelSpec, ModeInfo, Scenario, MODES};
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(
     name = "coppa-bench",
     about = "BER/FER/goodput-vs-SNR for Coppa PHY modes",
@@ -37,9 +37,12 @@ struct Args {
     /// Channel: awgn | good | moderate | poor (Watterson presets).
     #[arg(long, default_value = "awgn")]
     channel: String,
-    /// OFDM profile: default (per-level) | standard | robust (dense pilots).
+    /// Benchmark OFDM profile: default (per-level) | standard | standard-short-cp | robust | narrow.
     #[arg(long, default_value = "default")]
     profile: String,
+    /// Measure one speed level (1-9); omitted means all nine levels.
+    #[arg(long, value_parser = parse_level)]
+    level: Option<u8>,
     /// Carrier frequency offset (Hz) applied after the channel; 0.0 = none.
     #[arg(long, default_value_t = 0.0)]
     cfo: f32,
@@ -74,6 +77,21 @@ fn snr_points(min: f32, max: f32, step: f32) -> Vec<f32> {
     v
 }
 
+fn parse_level(value: &str) -> Result<u8, String> {
+    let level = value
+        .parse::<u8>()
+        .map_err(|_| format!("invalid speed level '{value}' (expected 1-9)"))?;
+    mode_for_level(level)
+        .map(|_| level)
+        .ok_or_else(|| format!("unknown speed level {level} (expected 1-9)"))
+}
+
+fn selected_modes(level: Option<u8>) -> impl Iterator<Item = &'static ModeInfo> {
+    MODES
+        .iter()
+        .filter(move |mode| level.is_none_or(|selected| mode.level == selected))
+}
+
 fn main() {
     let args = Args::parse();
     let snrs = snr_points(args.snr_min, args.snr_max, args.snr_step);
@@ -86,7 +104,7 @@ fn main() {
     };
 
     let mut all_points = Vec::new();
-    for mode in MODES {
+    for mode in selected_modes(args.level) {
         let scenario = Scenario {
             level: mode.level,
             channel: chan,
@@ -108,4 +126,29 @@ fn main() {
     eprintln!("Wrote {}", csv_path.display());
 
     println!("{}", to_markdown(&all_points, &title));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn level_one_selects_only_one_mode() {
+        let args = Args::try_parse_from(["coppa-bench", "--level", "1"]).unwrap();
+        let levels: Vec<_> = selected_modes(args.level).map(|mode| mode.level).collect();
+        assert_eq!(levels, [1]);
+    }
+
+    #[test]
+    fn omitted_level_selects_all_nine_modes() {
+        let args = Args::try_parse_from(["coppa-bench"]).unwrap();
+        let levels: Vec<_> = selected_modes(args.level).map(|mode| mode.level).collect();
+        assert_eq!(levels, (1..=9).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn invalid_level_is_rejected_by_cli() {
+        let error = Args::try_parse_from(["coppa-bench", "--level", "10"]).unwrap_err();
+        assert!(error.to_string().contains("unknown speed level 10"));
+    }
 }

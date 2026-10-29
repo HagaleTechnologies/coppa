@@ -165,7 +165,7 @@ fn success_count(
 #[test]
 fn short_cp_matches_long_cp_on_watterson_good() {
     let level = 2u8; // BPSK 1/2 -- most robust level, fastest to converge in this bench
-    let snr_db = 12.0; // comfortably above level 2's threshold (see phase_c_loopback.rs's required_snr(2) = 2.0 for AWGN; Watterson-Good costs little extra)
+    let snr_db = 12.0; // comfortably above level 2's AWGN waterfall (~4 dB on this 3 kHz convention, see coppa-bench's `waterfall_bracket_level_2`); Watterson-Good costs little extra
     let trials = 24;
     let seed = 0xC0FFEE;
 

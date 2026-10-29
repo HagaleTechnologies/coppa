@@ -40,7 +40,7 @@ use coppa_codec::ofdm::header_fec;
 use coppa_codec::ofdm::sync_detector::{SyncCandidate, SyncDetector};
 use coppa_codec::ofdm::CoppaProfile;
 
-use crate::modem::transceiver::CoppaTransceiver;
+use crate::modem::transceiver::{CoppaTransceiver, ReceiveError};
 
 /// LDPC coded block length (Z=81, 24 base columns) — constant for all code rates;
 /// mirrors `CoppaModem::demodulate_frame`'s own `CODED_BLOCK_LEN`.
@@ -156,6 +156,16 @@ pub struct StreamingReceiver {
     /// later candidate — see that method's doc for why.
     resume_from: u64,
     pending: Option<Pending>,
+    /// COP-68: candidates whose protected header decoded but whose payload
+    /// failed FEC (`ReceiveError::LdpcNotConverged`/`CrcMismatch` -- the
+    /// post-header kinds). From level 3 up under Watterson fading this
+    /// "header decodes / payload fails" regime is real and SNR-independent,
+    /// and it is the peer-evidence signal the daemon's session fade-hold
+    /// keys on; pre-header failures (`SyncFailed`/`HeaderCorrupt`) never
+    /// touch it. Monotone since construction; an engine rebuild (profile/
+    /// level change) replaces this receiver and restarts the count, which is
+    /// fine for the daemon's before/after-delta read.
+    header_only_decodes: u32,
 }
 
 impl StreamingReceiver {
@@ -201,7 +211,16 @@ impl StreamingReceiver {
             candidates: VecDeque::new(),
             resume_from: 0,
             pending: None,
+            header_only_decodes: 0,
         }
+    }
+
+    /// COP-68: how many candidates since construction decoded a protected
+    /// header but failed the payload FEC (the post-header `ReceiveError`
+    /// kinds) -- the "never drop while a header decodes" evidence signal.
+    /// See the field's doc for the rebuild-resets-the-count caveat.
+    pub fn header_only_decodes(&self) -> u32 {
+        self.header_only_decodes
     }
 
     /// Ring capacity: 2 × max frame length, computed from the profile + SPEED_LEVELS.
@@ -370,8 +389,21 @@ impl StreamingReceiver {
                             delay_spread_ms,
                         });
                     }
-                    Err(_) => {
-                        // Full frame demod/FEC failed; drop it and keep searching.
+                    Err(e) => {
+                        // Full frame demod/FEC failed; drop it and keep
+                        // searching. COP-68: a POST-header failure (the
+                        // header decoded, the payload did not) still proves
+                        // someone is on frequency with a decodable preamble
+                        // and header -- count it so the daemon can treat it
+                        // as peer evidence. Pre-header failures
+                        // (SyncFailed/HeaderCorrupt) prove nothing and are
+                        // not counted.
+                        if matches!(
+                            e,
+                            ReceiveError::LdpcNotConverged { .. } | ReceiveError::CrcMismatch
+                        ) {
+                            self.header_only_decodes += 1;
+                        }
                     }
                 }
                 self.resume_from = start + need as u64;
@@ -722,6 +754,78 @@ mod tests {
             );
             pushed += n;
         }
+    }
+
+    /// COP-68: the header-only decode counter moves only for post-header
+    /// failures. A frame whose sample region after the protected header is
+    /// destroyed (header is Golay-protected and intact, LDPC sees silence)
+    /// increments it by exactly 1; a clean frame and pure noise (sync
+    /// failures) leave it unchanged.
+    #[test]
+    fn header_only_decodes_counts_post_header_failures_only() {
+        let profile = CoppaProfile::hf_standard();
+        let tx = CoppaTransceiver::new(profile.clone(), 1);
+        let payload = b"tail-corrupted frame payload".to_vec();
+        let mut corrupted = make_frame(&tx, 2, &payload);
+
+        // Destroy everything after the protected header region: the preamble
+        // and header stay decodable, the payload LDPC sees silence. This is
+        // the deterministic on-air shape of the level>=3 Watterson regime
+        // the daemon's fade-hold keys on (research §4).
+        let symbol_len = profile.fft_size + profile.cp_samples;
+        let header_syms = header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(profile.data_carriers);
+        let header_end = (3 + header_syms) * symbol_len;
+        let cut = header_end.min(corrupted.len());
+        for s in corrupted.iter_mut().skip(cut) {
+            *s = 0.0;
+        }
+
+        let mut stream = Vec::new();
+        // Leading silence — see the comment in `streaming_decodes_frames_fed_in_odd_chunks`.
+        stream.extend(std::iter::repeat_n(0.0f32, 4 * symbol_len));
+        stream.extend_from_slice(&corrupted);
+        stream.extend(std::iter::repeat_n(0.0f32, 4 * symbol_len));
+
+        let mut rx = StreamingReceiver::new(profile.clone(), 1);
+        let before = rx.header_only_decodes();
+        let decoded = rx.push_samples(&stream);
+        assert!(decoded.is_empty(), "the corrupted frame must not decode");
+        assert_eq!(
+            rx.header_only_decodes(),
+            before + 1,
+            "a header-decodes/payload-fails candidate must count exactly once"
+        );
+
+        // A clean frame of the same payload decodes and does not bump it.
+        let clean = make_frame(&tx, 2, &payload);
+        let mut stream2 = Vec::new();
+        stream2.extend(std::iter::repeat_n(0.0f32, 4 * symbol_len));
+        stream2.extend_from_slice(&clean);
+        stream2.extend(std::iter::repeat_n(0.0f32, 4 * symbol_len));
+        let frames = rx.push_samples(&stream2);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload[..payload.len()], payload[..]);
+        assert_eq!(
+            rx.header_only_decodes(),
+            before + 1,
+            "a fully decoded frame must not count as header-only"
+        );
+
+        // Pure noise (sync failures, maybe header decode failures) never
+        // touches the counter: neither kind is post-header evidence.
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(11);
+        let noise: Vec<f32> = (0..profile.sample_rate as usize)
+            .map(|_| rng.random_range(-0.05f32..0.05f32))
+            .collect();
+        let frames = rx.push_samples(&noise);
+        assert!(frames.is_empty());
+        assert_eq!(
+            rx.header_only_decodes(),
+            before + 1,
+            "pre-header failures must not count as evidence"
+        );
     }
 
     #[test]

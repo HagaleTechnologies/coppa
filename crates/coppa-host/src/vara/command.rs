@@ -136,7 +136,10 @@ impl VaraCommandPort {
                     }
                     Err(e) => {
                         if e.kind() == std::io::ErrorKind::InvalidData {
-                            eprintln!("Command client {} sent over-long line, closing", client_id);
+                            tracing::warn!(
+                                client_id,
+                                "VARA command client sent an over-long line; closing"
+                            );
                         }
                         break;
                     }
@@ -432,6 +435,7 @@ mod tests {
         assert!(!VaraResponse::Wrong.is_disposable());
         assert!(!VaraResponse::coppa_version().is_disposable());
         assert!(!VaraResponse::Pending.is_disposable());
+        assert!(!VaraResponse::CancelPending.is_disposable());
         assert!(!VaraResponse::Connected("W5AU".into(), "K7XYZ".into(), 2300).is_disposable());
         assert!(!VaraResponse::Disconnected.is_disposable());
         assert!(!VaraResponse::Ptt(true).is_disposable());
