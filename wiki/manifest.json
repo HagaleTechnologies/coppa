@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-26T08:02:02Z",
-  "head_commit": "8857be8",
+  "generated_at": "2026-10-28T21:37:01Z",
+  "head_commit": "0d51a30",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -200,7 +200,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:e768bca7cf7972cc884bde4b51788999bc77586595cca390952b8a0fb5108ecc",
+      "hash": "sha256:f494c9d87048c147b2692613240d3118162a7f9b52347d1928a7826d3fa73046",
       "id": "band-conventions",
       "kind": "interface",
       "links": [
@@ -217,12 +217,34 @@
       ],
       "status": "current",
       "title": "What band and sample-rate conventions does coppa use?",
-      "verified_commit": "c1d2676",
-      "verified_date": "2026-07-07",
+      "verified_commit": "56361d6",
+      "verified_date": "2026-10-28",
       "visibility": "public"
     },
     {
-      "hash": "sha256:2e5535309e731793b2f70c8431ff924cf3960ecd46e4e24ce0d0208ef153c6bb",
+      "hash": "sha256:9bd2a246313cba83361f290f438daa8cd882616d0cec880bf0be39aff794efea",
+      "id": "cli-settings",
+      "kind": "gotcha",
+      "links": [],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/cli-settings.md",
+      "sources": [
+        "crates/coppa-cli/src/settings.rs",
+        "crates/coppa-cli/src/main.rs",
+        "crates/coppa-daemon/src/config.rs",
+        "crates/coppa-radio/src/band.rs",
+        "coppad.toml.example",
+        "docs/tutorials/getting-started.md"
+      ],
+      "status": "current",
+      "title": "What will bite you when persisting coppa CLI settings?",
+      "verified_commit": "b5144e3",
+      "verified_date": "2026-10-28",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:571fcce6275f5b9c1263d33c8bd5117af489d97c62bec2dd1f63ab8e475e23a6",
       "id": "coppa-dsp",
       "kind": "subsystem",
       "links": [
@@ -237,8 +259,8 @@
       ],
       "status": "current",
       "title": "How does coppa-dsp work and what does it expose?",
-      "verified_commit": "c1d2676",
-      "verified_date": "2026-07-07",
+      "verified_commit": "56361d6",
+      "verified_date": "2026-10-28",
       "visibility": "public"
     },
     {
@@ -262,7 +284,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:90e4061ee52405b3ff069c3d84d44124db924bef912065c530ff18da17087371",
+      "hash": "sha256:464b8d3b3b051e88ac3765987b3e532b3591b76b523d8dd349efe6322f204e93",
       "id": "coppa-engine",
       "kind": "subsystem",
       "links": [
@@ -279,8 +301,8 @@
       ],
       "status": "current",
       "title": "How does coppa-engine orchestrate the modem pipeline?",
-      "verified_commit": "59b0b63",
-      "verified_date": "2026-07-14",
+      "verified_commit": "56361d6",
+      "verified_date": "2026-10-28",
       "visibility": "public"
     },
     {
@@ -375,7 +397,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:7c7ad23fa09f0c3845b4f4ab8c9ada3aace5892ac60a4107f275af6c995de901",
+      "hash": "sha256:7163a3fc6b088923b3e2d9392c8d2f4215b3f120c2b85a81327a1019f8afa56f",
       "id": "ldpc-non-convergence",
       "kind": "gotcha",
       "links": [
@@ -388,18 +410,19 @@
       "path": "pages/ldpc-non-convergence.md",
       "sources": [
         "tests/phase_c_loopback.rs",
+        "crates/coppa-bench/src/runner.rs",
         "crates/coppa-protocol/src/fec/ldpc/**",
         "docs/adr/005-nr-bg2-ldpc.md",
         "BENCHMARKS.md"
       ],
       "status": "current",
       "title": "What will bite you about LDPC at speed levels 9 and 10?",
-      "verified_commit": "be2141b",
-      "verified_date": "2026-08-05",
+      "verified_commit": "3cbfd1e",
+      "verified_date": "2026-10-28",
       "visibility": "public"
     },
     {
-      "hash": "sha256:62565d2aa64e43caa64422af75ec693abf9bcc60ee46bc0da6bb6e633c62d0e9",
+      "hash": "sha256:e8adc703ca6f9a6b097149842f8431013b0e6b894e881ff8cbf8c875e0a5501c",
       "id": "overview",
       "kind": "overview",
       "links": [],
@@ -413,8 +436,8 @@
       ],
       "status": "current",
       "title": "Coppa \u2014 what is this and where do things live?",
-      "verified_commit": "59b0b63",
-      "verified_date": "2026-07-14",
+      "verified_commit": "56361d6",
+      "verified_date": "2026-10-28",
       "visibility": "public"
     },
     {

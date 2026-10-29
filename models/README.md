@@ -1,13 +1,10 @@
-# Channel-prediction models (placeholder)
+# models/ (unused)
 
-This directory is a placeholder for optional channel-prediction model files.
+Nothing in the workspace reads this directory. `coppa-ml` once had an
+optional model-file registry that scanned it, alongside an EWMA channel-quality
+predictor; Phase 3 Task 9 deleted both as dead code (see
+`docs/adr/008-phase3-system-layer.md`).
 
-**Coppa ships no machine-learning models and no inference runtime.** Channel
-prediction is done by a plain EWMA (exponentially weighted moving average) predictor
-with a linear trend, and MCS selection uses a static SNR-threshold lookup table. There
-is no ONNX/neural-network inference in the codebase.
-
-The `coppa-ml` crate contains an optional registry that scans this directory, but it
-always falls back to the EWMA predictor. Wiring an actual inference runtime (e.g.
-`tract` or `ort`) is **not implemented** and is out of scope for the reference
-implementation.
+**Coppa ships no machine-learning models and no inference runtime.** Speed-level
+selection is a deterministic function of measured per-carrier noise variances
+(`coppa_ml::mcs`), applied by the closed-loop `RateLoop` controller.

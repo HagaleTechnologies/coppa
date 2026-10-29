@@ -1,7 +1,15 @@
 # Coppa Daemon Configuration
-# Copy to coppad.toml and edit as needed.
+# Copy to ~/.config/coppa/coppad.toml (one user), /etc/coppa/coppad.toml (a system service) or ./coppad.toml, and edit as needed.
 # An unknown or misspelled key or table stops coppad at startup, naming the
 # key; `coppad --check` reports it too (COP-36).
+
+# The coppa CLI reads this file too for [engine] callsign/profile, [audio]
+# input_device/output_device, and [radio] ptt_method/rigctld_address/
+# ptt_pre_delay_ms/ptt_tail_delay_ms/frequency_hz/band. Each has a COPPA_*
+# environment override and a CLI flag; flags win over environment, then file.
+# The profile below changes what coppa tx sends and coppa rx expects: a peer
+# using the CLI's built-in no-file default may need the same profile.
+# Use coppa --config PATH or COPPA_CONFIG to select a specific file.
 
 [audio]
 # Preferred hardware sample rate in Hz. If unsupported, coppad selects a
@@ -32,7 +40,12 @@ output_channel = 0
 ptt_method = "none"
 # Example serial PTT via DTR: ptt_method = "serial:/dev/ttyUSB0:dtr"
 # Example serial PTT via RTS: ptt_method = "serial:/dev/ttyUSB0:rts"
-# Example Linux sysfs GPIO PTT: ptt_method = "gpio:17"
+# Example Linux sysfs GPIO PTT: ptt_method = "gpio:529"
+# The number is the kernel's sysfs GPIO number, not the BCM pin: the
+# GPIO chip's base plus the BCM pin. On Raspberry Pi OS with kernel 6.6
+# or later the Pi 4's chip (label pinctrl-bcm2711) has base 512, so
+# BCM 17 is 529. Find the base with:
+#   grep -H . /sys/class/gpio/gpiochip*/label /sys/class/gpio/gpiochip*/base
 # rigctld TCP address (hamlib)
 rigctld_address = "127.0.0.1:4532"
 # Delay in ms after keying PTT before sending audio

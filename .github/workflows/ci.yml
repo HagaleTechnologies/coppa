@@ -47,6 +47,18 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
       - run: cargo check --workspace
       - run: cargo check --workspace --all-features
+      # COP-63: a per-crate aarch64-linux build of the CLI or daemon must not
+      # reach alsa-sys unless the crate's own cpal-backend feature asks for it.
+      # The --workspace checks cannot see this, because they build coppa-audio
+      # with its own default features. cargo tree needs no aarch64 std.
+      - name: CLI and daemon do not pull in alsa-sys on aarch64-linux
+        run: |
+          tree=$(cargo tree --target aarch64-unknown-linux-gnu -p coppa-cli -p coppa-daemon --prefix none --format '{p}')
+          if grep -q '^alsa-sys ' <<<"$tree"; then
+            echo "::error::coppa-cli or coppa-daemon pulls in alsa-sys on aarch64-linux with its own cpal-backend feature off; depend on coppa-audio with default-features = false"
+            cargo tree --target aarch64-unknown-linux-gnu -p coppa-cli -p coppa-daemon -i alsa-sys
+            exit 1
+          fi
       # COP-35: compile and run the getting-started tutorial's C FFI example,
       # as written, against the committed coppa.h, as C and as C++.
       - name: Compile the tutorial's C FFI example against coppa.h
@@ -62,6 +74,30 @@ jobs:
           c++ -x c++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -Icrates/coppa-ffi "$dir/hello.c" -Ltarget/debug -lcoppa_ffi -o "$dir/hello_cpp"
           LD_LIBRARY_PATH=target/debug "$dir/hello"
           LD_LIBRARY_PATH=target/debug "$dir/hello_cpp"
+      # COP-73: run the tutorial's loopback/tx/rx shell blocks and require
+      # every stdout line to appear verbatim in the doc, so the tutorial
+      # cannot drift from the CLI again (this class has recurred 3 times).
+      - name: Tutorial shell blocks match the CLI
+        run: |
+          set -euo pipefail
+          cargo build -p coppa-cli
+          doc=docs/tutorials/getting-started.md
+          tmp="$RUNNER_TEMP/tutorial-blocks"; rm -rf "$tmp"; mkdir -p "$tmp"
+          cli="$PWD/target/debug/coppa"
+          run_doc() {
+            local name="$1"; shift
+            local out line
+            out=$( cd "$tmp" && "$cli" "$@" )
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              grep -qF -- "$line" "$doc" \
+                || { echo "::error::tutorial '$name' output line missing from $doc: $line"; exit 1; }
+            done <<<"$out"
+            echo "'$name' block matches the CLI"
+          }
+          run_doc loopback loopback "Hello from Coppa"
+          run_doc tx tx "CQ CQ CQ DE VK2ABC K" -o cq.wav
+          run_doc rx rx -i cq.wav
 
   test-features:
     name: Test with Features (fast, lib-only)
@@ -74,7 +110,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install ALSA dev headers (for cpal)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - run: cargo test --workspace --features cpal-backend,websocket,kiss-tnc --lib
+      - run: cargo test --workspace --features cpal-backend,websocket,kiss-tnc,gpio-ptt --lib
       - run: cargo check --workspace --no-default-features
 
   fmt:
