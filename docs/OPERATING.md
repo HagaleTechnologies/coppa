@@ -153,13 +153,20 @@ If the guardian cannot be started, coppad logs `Could not start the PTT
 guardian; ...` and runs without it. If the guardian stops while coppad is
 running, coppad logs `PTT guardian is no longer running; ...` once.
 
+To run coppad as a systemd service without breaking the guardian, use the
+shipped unit; see
+[tutorials/raspberry-pi-install.md](tutorials/raspberry-pi-install.md).
+
 ### What is not covered
 
 Nothing in coppad can release PTT in these cases:
 
 - A SIGKILL to every process in coppad's cgroup, which kills the guardian too.
-  systemd does this when a stop takes longer than `TimeoutStopSec`. `pkill -9
-  coppad` does the same.
+  `pkill -9 coppad` does this, because the guardian is also named `coppad`. So
+  does systemd when a stop takes longer than `TimeoutStopSec` under the default
+  `KillMode=control-group`. The shipped `contrib/coppad.service` sets
+  `KillMode=process`, so its timeout kills coppad alone and the guardian still
+  releases PTT.
 - Power loss.
 - Serial PTT, where release depends on the operating system dropping the line
   when the port closes. This has not been checked on real hardware.
@@ -381,10 +388,19 @@ station's host gets every byte once, in order.
   sends the next frame. On a clean HF link this carries about 60% of what an
   unacknowledged stream did; on a link that loses frames it is the only mode
   that delivers the data intact.
-- A frame that is still unacknowledged after 5 retransmissions ends the
-  session: coppad sends DISCONNECT to the other station, reports `BUFFER 0`
-  and then `DISCONNECTED`. On a link that has gone completely silent this
-  takes about 3 minutes.
+- A frame that is still unacknowledged after 5 retransmissions stops using
+  the normal budget but does not immediately end the session: coppad holds
+  the link, retransmitting at the most robust speed level the frame still
+  fits, for as long as the other station stays decodable (any decoded frame
+  from it, or even a frame whose header decodes while its payload does not,
+  counts as evidence and restarts the patience clock). Only after 180
+  seconds with no evidence at all does the session end: coppad sends
+  DISCONNECT to the other station, reports `BUFFER 0` and then
+  `DISCONNECTED`. On a link that has gone completely silent this takes
+  about 3 minutes for the budget plus up to 3 more for the hold; on a link
+  that is only faded, the session survives the fade instead of dropping.
+  A held session shows a `BUFFER` count that is not progressing, and a host
+  `DISCONNECT` still ends it immediately.
 - coppad holds one session at a time. While a session exists (connecting or
   connected), every `CONNECT_REQ`, including a repeat from the station already
   in the session, gets no answer, so that station's connect attempt times out.
@@ -448,6 +464,35 @@ the gap: a station with several ARQ segments queued re-keys for the next one
 the moment its own PTT releases, so the other station's ACK can still collide
 with that next frame. Sender-side turn discipline is a separate follow-up. The hardware acceptance test for this
 behaviour is `docs/testing/cable-loop-turnaround.md`.
+
+## BUSY lines on the command port
+
+coppad watches the 300-2800 Hz band of the received audio and sends `BUSY ON`
+or `BUSY OFF` to every connected host when the channel's occupancy changes.
+A new state is reported only after it has held for 250 ms of received audio,
+so:
+
+- two consecutive `BUSY` lines are at least 250 ms of audio apart;
+- a station that keys up is reported about 250 ms later, and its end is
+  reported about 250 ms after it stops (a long broadband signal can read
+  clear earlier, see the known gap below). When coppad reads a long stretch of
+  buffered audio at once (after a stall, or while it waits to transmit) and
+  reports a change for it, the next change can be reported up to that
+  stretch's length later: at most the length of coppad's input ring,
+  `[audio] buffer_size` samples (about 170 ms at the default 8192 samples
+  and 48 kHz; a larger `buffer_size` raises this bound in proportion);
+- a burst shorter than 250 ms is never reported.
+
+Detection always runs. `[station_id] busy_hold_ms` does not change it: that
+key only enables coppad's own courtesy wait before it transmits.
+
+Known gap: the noise floor is estimated across the whole audio spectrum, not
+only the 300-2800 Hz band. A receiver whose audio is much quieter outside
+that band, which is typical of an SSB rig, can read as one long `BUSY ON` on
+a quiet band. The floor also adapts to a steady broadband signal, so a long
+transmission can read as `BUSY ON` followed by `BUSY OFF` within half a second
+while it is still on the air, and coppad's own courtesy wait then lets its
+transmission out over it.
 
 ## Inbound connect attempts
 

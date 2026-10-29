@@ -21,6 +21,7 @@ Open-source ham radio digital communications system written in Rust.
 | Operating profiles | Implemented | 48 kHz OFDM profiles with runtime speed-level selection within the configured band |
 | Link adaptation | Implemented, limited calibration | Measurement-driven speed selection and ACK-driven RateLoop with ARQ enabled; no model inference; performance targets remain unmet, see [BENCHMARKS.md](BENCHMARKS.md) |
 | Serial/GPIO PTT | Implemented, feature-gated | Daemon serial DTR/RTS uses `serial-ptt`; Linux sysfs GPIO uses `gpio-ptt` |
+| Service files | Provided, not hardware-verified | systemd unit and macOS launchd agent in `contrib/`; Raspberry Pi 4 install guide in [docs/tutorials/raspberry-pi-install.md](docs/tutorials/raspberry-pi-install.md) |
 | KISS TNC (AFSK 1200) | Implemented, bring-up and testing only | Needs the kiss-tnc and cpal-backend features; not a Direwolf replacement; see [docs/TNC.md](docs/TNC.md) |
 | IR-HARQ | Unwired codec primitive | Redundancy-version and combining support exists in the codec; engine/daemon retransmissions do not wire it into an operational IR-HARQ feature |
 | VARA RF/waveform compatibility | Not supported | The TCP control interface is VARA-style; Coppa does not interoperate with VARA over RF |
@@ -52,6 +53,9 @@ coppa loopback "Hello from Coppa"
 # Encode a message to a WAV file
 coppa tx "CQ CQ CQ DE VK2ABC K" -o cq.wav
 
+# Encode at a chosen speed level (HF carries 1-8; see coppa profiles)
+coppa tx "CQ CQ CQ DE VK2ABC K" --level 4 -o cq.wav
+
 # Decode a WAV file (prints the message text)
 coppa rx cq.wav
 
@@ -68,8 +72,9 @@ coppa rx --duration 60
 coppa devices
 coppa devices --json
 
-# Show available operating profiles
+# Show the speed levels and named profiles (add --json for machine-readable output)
 coppa profiles
+coppa profiles --level 4
 coppa profiles --json
 coppa profiles -p HF_STANDARD --json
 
@@ -84,9 +89,9 @@ coppa -vv rx cq.wav
 `payload_hex` bytes. `payload_text` is `null` for binary payloads. Diagnostics
 go to stderr. `--json` conflicts with `--raw` and `--hex`; `-q`/`--quiet`
 conflicts with `-v`/`--verbose`. `devices --json` and `profiles --json` write
-arrays; `profiles -p NAME --json` writes one object. The existing `config`
-command remains available for its original text output. `listen` is a
-deprecated alias for `rx` and accepts the same flags.
+arrays; `profiles -p NAME --json` and `profiles --level N --json` write one
+object. `config` is a deprecated alias for `profiles` and accepts the same
+flags; `listen` is a deprecated alias for `rx` and accepts the same flags.
 
 ## KISS TNC (AFSK 1200)
 
@@ -125,7 +130,7 @@ See [PLAN-hardening.md](PLAN-hardening.md) for known issues and the hardening ro
 
 See [docs/SPEC.md](docs/SPEC.md) for the normative waveform/FEC/protocol conformance specification — the reference for building an independent, interoperable implementation.
 
-See [docs/OPERATING.md](docs/OPERATING.md) for field-operation guidance, including TX level calibration (`coppa tune`).
+See [docs/OPERATING.md](docs/OPERATING.md) for field-operation guidance, including TX level calibration (`coppa tune`). To run coppad as a service (systemd or launchd), see [contrib/README.md](contrib/README.md); for a full Raspberry Pi 4 install, see [docs/tutorials/raspberry-pi-install.md](docs/tutorials/raspberry-pi-install.md).
 
 ## License
 

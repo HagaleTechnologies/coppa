@@ -5,9 +5,12 @@
 //! - [`EngineConfig`] - runtime configuration types
 //! - [`profiles`] - the named operating profiles (`HF_ROBUST`, `HF_STANDARD`,
 //!   `VHF_FAST`, `EMERGENCY`) that `EngineConfig::from_profile` builds from
+//! - [`ladder`] - the real per-level facts (modulation, code rate, max bytes,
+//!   air time, bandwidth) that `coppa profiles` shows
 
 pub mod config;
 pub mod engine;
+pub mod ladder;
 
 pub mod profiles;
 

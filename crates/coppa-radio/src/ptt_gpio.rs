@@ -11,26 +11,70 @@
 //!
 //! # Raspberry Pi usage
 //!
-//! Export the BCM pin once (e.g. via a udev rule or `/etc/rc.local`) and set
-//! its direction to `out`:
+//! The pin number coppad takes is the kernel's sysfs GPIO number, not the BCM
+//! pin: the GPIO chip's base plus the BCM pin. On Raspberry Pi OS with kernel
+//! 6.6 or later the Pi 4's GPIO chip (label `pinctrl-bcm2711`) is registered
+//! at base 512, so BCM GPIO 17 is sysfs GPIO 529. The base is assigned by the
+//! kernel, so read it rather than assuming it:
 //!
 //! ```text
-//! echo 17 > /sys/class/gpio/export
-//! echo out > /sys/class/gpio/gpio17/direction
+//! grep -H . /sys/class/gpio/gpiochip*/label /sys/class/gpio/gpiochip*/base
 //! ```
 //!
-//! `GpioPtt::open` does this automatically on first use if the pin isn't
-//! already exported. Then configure coppad with `ptt = "gpio:17"`.
+//! Then configure coppad with `ptt_method = "gpio:529"` (for BCM 17).
 //!
-//! The process running `coppad` needs write access to
-//! `/sys/class/gpio/export` and `/sys/class/gpio/gpio17/{direction,value}` --
-//! on stock Raspberry Pi OS this typically means adding the user to the
-//! `gpio` group (`sudo usermod -aG gpio $USER`) rather than running as root.
+//! `GpioPtt::open` exports the pin if it isn't already exported and sets its
+//! direction to `out`. The process running `coppad` needs write access to
+//! `/sys/class/gpio/export` and `/sys/class/gpio/gpioN/{direction,value}`: on
+//! Raspberry Pi OS that means membership of the `gpio` group, not root.
+//! Raspberry Pi OS's udev rule (`99-com.rules`) grants the group access to a
+//! newly exported pin asynchronously, a few milliseconds after the export, so
+//! an unprivileged process that writes `direction` at once can be refused.
+//! `SysfsGpio::open` therefore re-tries a freshly exported pin for up to 2 s
+//! while it is refused with `PermissionDenied`.
+//!
+//! The sysfs GPIO interface is deprecated upstream in favour of the GPIO
+//! character device, but is still built into Raspberry Pi kernels
+//! (`CONFIG_GPIO_SYSFS=y`). Test PTT on your image before relying on it.
+//!
 //! Wire the GPIO pin to your radio's PTT input through a transistor or relay
 //! (a GPIO pin cannot directly switch a rig's PTT line/current).
 
 use crate::{PttControl, PttState};
 use anyhow::Result;
+use std::io;
+use std::time::Duration;
+
+/// How many times `SysfsGpio::open` tries a freshly exported pin while udev's
+/// 99-com.rules grants the gpio group access (40 x 50 ms = 2 s in total).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const EXPORT_SETTLE_ATTEMPTS: u32 = 40;
+/// How long `SysfsGpio::open` waits between those tries.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const EXPORT_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Run `op` at least once and at most `max(attempts, 1)` times, sleeping
+/// `interval` between tries, but only while it fails with
+/// [`io::ErrorKind::PermissionDenied`]. A success or any other error returns
+/// at once, so a wrong pin number (EINVAL) is reported immediately.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn retry_permission_denied<T>(
+    attempts: u32,
+    interval: Duration,
+    mut op: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    let attempts = attempts.max(1);
+    let mut tried = 1;
+    loop {
+        match op() {
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied && tried < attempts => {
+                tried += 1;
+                std::thread::sleep(interval);
+            }
+            result => return result,
+        }
+    }
+}
 
 /// Abstraction over "write a digital level to a GPIO line."
 ///
@@ -56,20 +100,45 @@ pub struct SysfsGpio {
 impl SysfsGpio {
     /// Export (if not already exported) and configure GPIO pin `pin` for
     /// output.
+    ///
+    /// When this call exports the pin, the `direction` write and the `value`
+    /// open are re-tried for up to 2 s while they are refused with
+    /// `PermissionDenied`, covering the window before udev grants the `gpio`
+    /// group access to the new pin. The export write itself is not re-tried,
+    /// so a process outside the `gpio` group still fails at once. On failure
+    /// the pin is left exported.
     pub fn open(pin: u32) -> Result<Self> {
         use anyhow::Context;
 
         let gpio_dir = std::path::PathBuf::from(format!("/sys/class/gpio/gpio{pin}"));
+        let mut exported_now = false;
         if !gpio_dir.exists() {
             std::fs::write("/sys/class/gpio/export", pin.to_string())
                 .with_context(|| format!("failed to export GPIO pin {pin}"))?;
+            exported_now = true;
         }
-        std::fs::write(gpio_dir.join("direction"), "out")
-            .with_context(|| format!("failed to set GPIO pin {pin} direction to \"out\""))?;
-        Ok(Self {
-            pin,
-            value_path: gpio_dir.join("value"),
+        let attempts = if exported_now {
+            EXPORT_SETTLE_ATTEMPTS
+        } else {
+            1
+        };
+        let direction_path = gpio_dir.join("direction");
+        retry_permission_denied(attempts, EXPORT_SETTLE_INTERVAL, || {
+            std::fs::write(&direction_path, "out")
         })
+        .with_context(|| format!("failed to set GPIO pin {pin} direction to \"out\""))?;
+        // Open `value` without writing a level (an inverted rig would key), so
+        // the first real write from `EventLoop::new` cannot land in the same
+        // udev window.
+        let value_path = gpio_dir.join("value");
+        retry_permission_denied(attempts, EXPORT_SETTLE_INTERVAL, || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&value_path)
+                .map(drop)
+        })
+        .with_context(|| format!("GPIO pin {pin} value is not writable"))?;
+        Ok(Self { pin, value_path })
     }
 }
 
@@ -177,6 +246,56 @@ mod tests {
     use crate::PttBackend;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn settle_retry_returns_once_permission_is_granted() {
+        let mut calls = 0;
+        let result = retry_permission_denied(5, Duration::ZERO, || {
+            calls += 1;
+            if calls < 3 {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn settle_retry_gives_up_after_its_attempts() {
+        // 4 attempts, all denied: the PermissionDenied is returned, not swallowed.
+        let mut calls = 0;
+        let result: io::Result<()> = retry_permission_denied(4, Duration::ZERO, || {
+            calls += 1;
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(calls, 4);
+    }
+
+    #[test]
+    fn settle_retry_does_not_retry_other_errors() {
+        // A wrong pin number is EINVAL: report it after exactly one call.
+        let mut calls = 0;
+        let result: io::Result<()> = retry_permission_denied(40, Duration::ZERO, || {
+            calls += 1;
+            Err(io::Error::from(io::ErrorKind::InvalidInput))
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn settle_retry_tries_once_when_given_zero_attempts() {
+        let mut calls = 0;
+        let result: io::Result<()> = retry_permission_denied(0, Duration::ZERO, || {
+            calls += 1;
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
 
     /// Loopback mock: records every successful GPIO level write instead of
     /// touching real hardware. Clones share the log, so writes made while the

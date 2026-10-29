@@ -952,7 +952,10 @@ it has no effect on the actual rate-matching pipeline (which uses only
 `k_used_for_level`, §5.2). This is dead/stale metadata, not a wire-format
 bug: it affects no transmitted bit. An implementer should use §5.2's
 `k_used` table as the source of truth for level 9's rate, not this enum
-label.
+label. `SPEED_LEVELS[8]`'s `ldpc_rate_num`/`ldpc_rate_den`
+(`coppa_codec::ofdm::coppa_modem`) carries the same stale 7/8;
+`coppa_protocol::modem::code_rate_for_level` derives the real rate from
+`k_used`, and `coppa profiles` shows that rate.
 
 ---
 

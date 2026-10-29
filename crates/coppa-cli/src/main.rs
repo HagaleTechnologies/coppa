@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use coppa_engine::config::EngineConfig;
+use coppa_engine::config::{EngineConfig, OfdmBand};
 use coppa_engine::CoppaCore;
 use std::path::PathBuf;
 mod settings;
@@ -90,15 +90,24 @@ impl RxArgs {
     }
 }
 
-#[derive(clap::Args)]
+/// Flags shared by `coppa profiles` and its deprecated alias `coppa config`, so
+/// the two can never disagree about what they accept.
+#[derive(clap::Args, Debug, Default, PartialEq, Eq)]
 struct ProfilesArgs {
-    /// Profile name to show.
-    #[arg(short, long)]
+    /// Show one named profile (HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY).
+    #[arg(short, long, conflicts_with = "level")]
     profile: Option<String>,
+    /// Show one speed level (1-9).
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
+    level: Option<u8>,
     /// Emit JSON output.
     #[arg(long)]
     json: bool,
 }
+
+/// Printed on stderr whenever the deprecated `coppa config` alias runs, even
+/// under `--quiet`: a script still using it must hear that it is going away.
+const CONFIG_DEPRECATED: &str = "WARNING: 'coppa config' is deprecated and will be removed in the next release. Use 'coppa profiles' instead; it takes the same flags.";
 
 #[derive(Serialize)]
 struct DeviceOutput {
@@ -128,6 +137,36 @@ struct ProfileOutput {
     compression: bool,
     sample_rate_hz: u32,
     ofdm_profile: &'static str,
+}
+
+/// One speed level of `coppa_engine::ladder`, for `profiles --level N --json`.
+/// `hf_*` are `null` on a VHF-only level.
+#[derive(Serialize)]
+struct LevelOutput {
+    level: u8,
+    modulation: &'static str,
+    code_rate: String,
+    max_payload_bytes: usize,
+    hf_bandwidth_hz: Option<u32>,
+    hf_airtime_ms: Option<u32>,
+    vhf_bandwidth_hz: u32,
+    vhf_airtime_ms: u32,
+}
+
+impl From<&coppa_engine::ladder::LevelInfo> for LevelOutput {
+    fn from(row: &coppa_engine::ladder::LevelInfo) -> Self {
+        let ms = |s: f64| (s * 1000.0).round() as u32;
+        Self {
+            level: row.level,
+            modulation: row.modulation,
+            code_rate: format!("{}/{}", row.code_rate.0, row.code_rate.1),
+            max_payload_bytes: row.max_payload_bytes,
+            hf_bandwidth_hz: row.hf.map(|hf| hf.bandwidth_hz),
+            hf_airtime_ms: row.hf.map(|hf| ms(hf.airtime_s)),
+            vhf_bandwidth_hz: row.vhf.bandwidth_hz,
+            vhf_airtime_ms: ms(row.vhf.airtime_s),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -246,6 +285,9 @@ enum Commands {
         /// Operational profile name (e.g., HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY).
         #[arg(long)]
         profile: Option<String>,
+        /// Speed level 1-9, overriding the profile's level but never its band (see `coppa profiles`).
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
+        level: Option<u8>,
         /// Callsign for station identification.
         #[arg(long)]
         callsign: Option<String>,
@@ -263,6 +305,9 @@ enum Commands {
         /// Operational profile name.
         #[arg(long)]
         profile: Option<String>,
+        /// Speed level 1-9, overriding the profile's level but never its band (see `coppa profiles`).
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
+        level: Option<u8>,
     },
     /// Deprecated: use 'coppa rx'. Removed in the next release.
     // COP-56: kept for one release. Delete this variant, LISTEN_DEPRECATED
@@ -299,14 +344,13 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// List operating profiles or show one profile.
+    /// Show the speed levels (modulation, code rate, max bytes, air time, bandwidth) and the named profiles built on them.
     Profiles(ProfilesArgs),
-    /// Show current configuration.
-    Config {
-        /// Profile name to show.
-        #[arg(short, long)]
-        profile: Option<String>,
-    },
+    // COP-55: kept for one release. Delete this variant, CONFIG_DEPRECATED and
+    // the Config dispatch arm in the release after it ships.
+    /// Deprecated: use 'coppa profiles'. Removed in the next release.
+    #[command(hide = true)]
+    Config(ProfilesArgs),
     /// Start the AFSK 1200 TNC (KISS TCP server).
     #[cfg(feature = "kiss-tnc")]
     Tnc {
@@ -340,6 +384,40 @@ fn resolve_config(profile: Option<&str>) -> Result<EngineConfig> {
         }
         None => Ok(EngineConfig::default()),
     }
+}
+
+/// Build the engine for `tx`/`loopback`: the profile (or the default), then
+/// `--level` if one was given. The level changes the speed level and never the
+/// band, as `coppa profiles` says; with no profile the band is HF, so `--level`
+/// alone never builds the 5600 Hz VHF waveform that the wideband gate refuses
+/// below 29.7 MHz. Without `--level` this is exactly the old
+/// `resolve_config` + `with_config` path.
+fn build_core(profile: Option<&str>, level: Option<u8>) -> Result<CoppaCore> {
+    let mut config = resolve_config(profile)?;
+    let Some(level) = level else {
+        return Ok(CoppaCore::with_config(config));
+    };
+    if profile.is_none() {
+        config.ofdm_band = OfdmBand::Hf;
+    }
+    let mut core = CoppaCore::with_config(config);
+    let available = core.available_speed_levels();
+    if !available.contains(&level) {
+        let label = match profile.and_then(coppa_engine::profiles::get_profile) {
+            Some(p) => p.name.to_string(),
+            None => "the default HF profile".to_string(),
+        };
+        let lowest = available.first().copied().unwrap_or(1);
+        let highest = available.last().copied().unwrap_or(1);
+        anyhow::bail!(
+            "level {level} is not available on {label}, which carries levels {lowest}-{highest}; \
+             level {level} is VHF only (use --profile {})",
+            vhf_profile_names().join(" or --profile ")
+        );
+    }
+    // The engine stays the validator of record, as in the FFI's level override.
+    core.set_speed_level(level)?;
+    Ok(core)
 }
 
 /// Library diagnostics (PTT release failures, audio errors, `coppa tnc`
@@ -380,6 +458,7 @@ fn main() -> Result<()> {
             message,
             output,
             profile,
+            level,
             callsign,
             rig,
         }) => {
@@ -399,6 +478,7 @@ fn main() -> Result<()> {
                 &message,
                 output.as_deref(),
                 profile.as_ref().map(|v| v.value.as_str()),
+                level,
                 &rig,
                 verbosity,
             )?;
@@ -410,7 +490,11 @@ fn main() -> Result<()> {
             eprintln!("{LISTEN_DEPRECATED}");
             resolve_rx_and_run(args, config_flag.as_deref(), env, verbosity)?;
         }
-        Some(Commands::Loopback { message, profile }) => {
+        Some(Commands::Loopback {
+            message,
+            profile,
+            level,
+        }) => {
             let layers = Layers::load(config_flag.as_deref(), env)?;
             let profile = layers.profile(profile.as_deref())?;
             if verbosity.is_verbose() {
@@ -420,6 +504,7 @@ fn main() -> Result<()> {
             cmd_loopback(
                 &message,
                 profile.as_ref().map(|v| v.value.as_str()),
+                level,
                 verbosity,
             )?;
         }
@@ -450,8 +535,11 @@ fn main() -> Result<()> {
             )?;
         }
         Some(Commands::Devices { json }) => cmd_devices(json)?,
-        Some(Commands::Profiles(args)) => cmd_profiles(args.profile.as_deref(), args.json)?,
-        Some(Commands::Config { profile }) => cmd_config(profile.as_deref())?,
+        Some(Commands::Profiles(args)) => cmd_profiles(&args)?,
+        Some(Commands::Config(args)) => {
+            eprintln!("{CONFIG_DEPRECATED}");
+            cmd_profiles(&args)?
+        }
         #[cfg(feature = "kiss-tnc")]
         Some(Commands::Tnc {
             port,
@@ -552,13 +640,10 @@ fn build_ptt(ptt: &str, rigctld_addr: &str) -> Result<coppa_radio::PttBackend> {
     use coppa_radio::PttBackend;
     validate_ptt_method(ptt)?;
     match ptt {
-        "rigctld" => match coppa_radio::RigctldClient::connect(rigctld_addr) {
-            Ok(client) => Ok(PttBackend::Rigctld(client)),
-            Err(e) => {
-                eprintln!("WARNING: rigctld connect failed ({}), using no PTT", e);
-                Ok(PttBackend::Other(Box::new(coppa_radio::NullPtt::new())))
-            }
-        },
+        "rigctld" => Ok(PttBackend::Rigctld(
+            coppa_radio::RigctldClient::connect(rigctld_addr)
+                .map_err(|e| anyhow::anyhow!("rigctld connection failed: {e}"))?,
+        )),
         "vox" => Ok(PttBackend::Other(Box::new(coppa_radio::VoxPtt::new()))),
         // Only "none" remains once `validate_ptt_method` has passed.
         _ => Ok(PttBackend::Other(Box::new(coppa_radio::NullPtt::new()))),
@@ -661,20 +746,41 @@ fn play_keyed<S: coppa_audio::AudioSink>(
 ) -> Result<u64> {
     use coppa_radio::PttState;
 
-    if let Err(e) = ptt.set_ptt(PttState::Tx) {
-        eprintln!("WARNING: PTT key failed: {}", e);
-    }
-    clock.sleep(lead);
+    let result = match ptt.set_ptt(PttState::Tx) {
+        Ok(()) => {
+            clock.sleep(lead);
+            feed_until_played(sink, &progress, samples, clock).inspect(|_| clock.sleep(tail))
+        }
+        Err(e) => Err(anyhow::anyhow!("failed to key PTT: {e}")),
+    };
 
-    let result = feed_until_played(sink, &progress, samples, clock).inspect(|_| clock.sleep(tail));
-
-    if let Err(e) = ptt.set_ptt(PttState::Rx) {
-        eprintln!("WARNING: PTT unkey failed: {}", e);
-    }
+    let release = ptt
+        .set_ptt(PttState::Rx)
+        .map_err(|e| anyhow::anyhow!("failed to release PTT: {e}"));
     let stopped = sink.stop();
-    let delivered = result?;
-    stopped?;
-    Ok(delivered)
+    match result {
+        Err(primary) => {
+            let mut message = primary.to_string();
+            if let Err(e) = release {
+                message.push_str(&format!("; cleanup: {e}"));
+            }
+            if let Err(e) = stopped {
+                message.push_str(&format!("; cleanup: failed to stop audio: {e}"));
+            }
+            anyhow::bail!("{message}")
+        }
+        Ok(delivered) => {
+            if let Err(e) = release {
+                let suffix = stopped
+                    .err()
+                    .map(|stop| format!("; cleanup: failed to stop audio: {stop}"))
+                    .unwrap_or_default();
+                anyhow::bail!("{e}{suffix}");
+            }
+            stopped?;
+            Ok(delivered)
+        }
+    }
 }
 
 /// The feeding/draining half of [`play_keyed`].
@@ -807,11 +913,11 @@ fn cmd_tx(
     message: &str,
     output: Option<&str>,
     profile: Option<&str>,
+    level: Option<u8>,
     rig: &RigSettings,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let config = resolve_config(profile)?;
-    let core = CoppaCore::with_config(config);
+    let core = build_core(profile, level)?;
 
     if verbosity.is_verbose() {
         eprintln!(
@@ -994,9 +1100,15 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
         {
             use coppa_audio::{file_backend::WavSource, AudioSource};
             let mut source = WavSource::open(path)?;
+            if source.sample_rate() != core.config().sample_rate {
+                anyhow::bail!(
+                    "WAV sample rate {} Hz does not match modem sample rate {} Hz; resample the WAV before using coppa rx",
+                    source.sample_rate(),
+                    core.config().sample_rate
+                );
+            }
             let total = source.total_samples();
-            // The file's own rate: WavSource does not resample, so "the
-            // first N seconds" is N times the rate the samples were written at.
+            // The checked WAV rate is the engine rate; no resampling occurs.
             let limit = file_sample_limit(total, args.duration, source.sample_rate());
             if verbosity != Verbosity::Quiet && !args.raw && !args.json {
                 if limit < total {
@@ -1009,15 +1121,26 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 }
             }
             source.start()?;
-            stream_decode(
+            let summary = stream_decode(
                 &mut core,
                 &mut source,
                 Some(limit),
                 None,
                 output_mode,
+                args.profile.as_deref().unwrap_or("default"),
                 verbosity,
             )?;
             source.stop()?;
+            summary.check_failure()?;
+            if summary.good_frames == 0 {
+                anyhow::bail!(
+                    "no frames decoded from {} ({} samples at {} Hz; profile {}); check for a complete Coppa frame and a matching --profile",
+                    path,
+                    summary.consumed_samples,
+                    source.sample_rate(),
+                    args.profile.as_deref().unwrap_or("default")
+                );
+            }
         }
         #[cfg(not(feature = "file-backend"))]
         {
@@ -1066,15 +1189,17 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 }
             }
             let deadline = live_deadline(std::time::Instant::now(), args.duration);
-            stream_decode(
+            let summary = stream_decode(
                 &mut core,
                 &mut source,
                 None,
                 deadline,
                 output_mode,
+                args.profile.as_deref().unwrap_or("default"),
                 verbosity,
             )?;
             source.stop()?;
+            summary.check_failure()?;
             if chatty && args.duration > 0 {
                 println!("Stopped listening after {} s.", args.duration);
             }
@@ -1135,7 +1260,7 @@ const TRAILING_FLUSH_SAMPLES: usize = 8192;
 
 /// Push audio from `source` through `core`'s streaming decoder
 /// (`CoppaCore::push_samples`) in fixed-size chunks, printing each decoded
-/// frame as it completes (see `print_stream_frame`).
+/// frame as it completes (see `handle_stream_frame`).
 ///
 /// It stops on the first of three conditions:
 /// - `total_samples`, when known (a WAV file, already capped by
@@ -1152,23 +1277,47 @@ const TRAILING_FLUSH_SAMPLES: usize = 8192;
 /// Every normal return then pushes `TRAILING_FLUSH_SAMPLES` of silence so a
 /// frame that ends right at the file's end (or just before a live deadline)
 /// can still complete (see that constant's doc).
+#[derive(Default)]
+struct DecodeSummary {
+    good_frames: usize,
+    failed_frames: usize,
+    first_error: Option<String>,
+    consumed_samples: usize,
+    report_live_errors: bool,
+}
+
+impl DecodeSummary {
+    fn check_failure(&self) -> Result<()> {
+        if let Some(error) = &self.first_error {
+            anyhow::bail!("{error}");
+        }
+        Ok(())
+    }
+}
+
 fn stream_decode(
     core: &mut CoppaCore,
     source: &mut dyn coppa_audio::AudioSource,
     total_samples: Option<usize>,
     deadline: Option<std::time::Instant>,
     output_mode: RxOutputMode,
+    profile: &str,
     verbosity: Verbosity,
-) -> Result<()> {
+) -> Result<DecodeSummary> {
     let mut buf = vec![0.0f32; 4096];
-    let mut consumed = 0usize;
-    while total_samples.is_none_or(|total| consumed < total) {
-        let want = total_samples.map_or(buf.len(), |total| buf.len().min(total - consumed));
+    let mut summary = DecodeSummary {
+        report_live_errors: total_samples.is_none(),
+        ..DecodeSummary::default()
+    };
+    while total_samples.is_none_or(|total| summary.consumed_samples < total) {
+        let want = total_samples.map_or(buf.len(), |total| {
+            buf.len().min(total - summary.consumed_samples)
+        });
         let n = source.read(&mut buf[..want])?;
         if n > 0 {
-            consumed += n;
+            summary.consumed_samples += n;
             for frame in core.push_samples(&buf[..n]) {
-                print_stream_frame(&frame, output_mode, verbosity)?;
+                handle_stream_frame(core, &frame, &mut summary, output_mode, profile, verbosity)?;
             }
         }
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
@@ -1181,10 +1330,10 @@ fn stream_decode(
 
     let silence = vec![0.0f32; TRAILING_FLUSH_SAMPLES];
     for frame in core.push_samples(&silence) {
-        print_stream_frame(&frame, output_mode, verbosity)?;
+        handle_stream_frame(core, &frame, &mut summary, output_mode, profile, verbosity)?;
     }
 
-    Ok(())
+    Ok(summary)
 }
 
 fn hex_string(bytes: &[u8]) -> String {
@@ -1211,15 +1360,32 @@ fn format_decoded(bytes: &[u8], snr_db: f32, hex: bool) -> String {
 /// escaped, quoted text; other payloads fall back to labeled lowercase hex.
 /// `hex` forces labeled hex. `raw` prints only the lowercase hex string,
 /// one per line, on stdout, even when `hex` is also set.
-/// Decode failures are reported on stderr (never stdout, so they never
-/// corrupt a `--raw` capture), suppressed entirely in `Verbosity::Quiet`.
-fn print_stream_frame(
+/// Decode failures go to stderr (never stdout, so they never corrupt a
+/// `--raw` or `--json` capture). Live decode failures are printed at once,
+/// including under `--quiet`; every failure is kept in `summary` for a
+/// final nonzero exit.
+fn handle_stream_frame(
+    core: &CoppaCore,
     frame: &coppa_engine::StreamFrame,
+    summary: &mut DecodeSummary,
     output_mode: RxOutputMode,
+    profile: &str,
     verbosity: Verbosity,
 ) -> Result<()> {
     match &frame.payload {
         Ok(bytes) => {
+            if core.appears_compressed_with_wrong_profile(bytes) {
+                summary.failed_frames += 1;
+                let error = format!(
+                    "decoded payload appears compressed but profile {profile} does not enable compression; try --profile HF_STANDARD for HF audio"
+                );
+                if summary.report_live_errors {
+                    eprintln!("{error}");
+                }
+                summary.first_error.get_or_insert(error);
+                return Ok(());
+            }
+            summary.good_frames += 1;
             match output_mode {
                 RxOutputMode::Raw => println!("{}", hex_string(bytes)),
                 RxOutputMode::Text { hex } => {
@@ -1241,23 +1407,30 @@ fn print_stream_frame(
             }
         }
         Err(e) => {
-            if verbosity != Verbosity::Quiet {
-                eprintln!("Decode failed: {}", e);
+            summary.failed_frames += 1;
+            let error = format!("payload decode failed: {e}");
+            if summary.report_live_errors {
+                eprintln!("{error}");
             }
+            summary.first_error.get_or_insert(error);
         }
     }
     Ok(())
 }
 
-fn cmd_loopback(message: &str, profile: Option<&str>, verbosity: Verbosity) -> Result<()> {
+fn cmd_loopback(
+    message: &str,
+    profile: Option<&str>,
+    level: Option<u8>,
+    verbosity: Verbosity,
+) -> Result<()> {
     if verbosity != Verbosity::Quiet {
         println!("Coppa Loopback Test");
         println!("===================");
         println!("Input: \"{}\"", message);
     }
 
-    let config = resolve_config(profile)?;
-    let core = CoppaCore::with_config(config);
+    let core = build_core(profile, level)?;
 
     if verbosity.is_verbose() {
         eprintln!(
@@ -1311,71 +1484,298 @@ fn cmd_devices(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_profiles(profile: Option<&str>, json: bool) -> Result<()> {
-    if let Some(name) = profile {
-        let resolved = coppa_engine::profiles::get_profile(name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Unknown profile: {}. Available: {}",
-                name,
-                coppa_engine::profiles::list_profiles().join(", ")
-            )
-        })?;
-        let output = ProfileOutput::from_profile(resolved)?;
-        if json {
-            return write_json(&output);
-        }
-        println!("Profile: {}", output.name);
-        println!("  Description: {}", output.description);
-        println!("  Speed level: {}", output.speed_level);
-        println!("  Max bytes per frame: {}", output.max_payload_bytes);
-        println!("  Compression: {}", output.compression);
-        println!("  Sample rate: {} Hz", output.sample_rate_hz);
-        println!("  OFDM band: {}", output.ofdm_profile);
-        return Ok(());
+/// `coppa profiles` (and the deprecated `coppa config`): print the speed ladder
+/// and the named profiles, one speed level, or one profile's detail; `--json`
+/// emits the same selection as JSON.
+fn cmd_profiles(args: &ProfilesArgs) -> Result<()> {
+    if args.json {
+        return write_json_profiles(args);
     }
-
-    let profiles: Vec<_> = coppa_engine::profiles::list_profiles()
-        .iter()
-        .map(|name| {
-            let resolved = coppa_engine::profiles::get_profile(name)
-                .ok_or_else(|| anyhow::anyhow!("Profile not found: {name}"))?;
-            ProfileOutput::from_profile(resolved)
-        })
-        .collect::<Result<_>>()?;
-    if json {
-        return write_json(&profiles);
-    }
-    println!("Available profiles:");
-    for profile in profiles {
-        println!("  {} - {}", profile.name, profile.description);
-    }
+    print!("{}", render_profiles(args)?);
     Ok(())
 }
 
-fn cmd_config(profile: Option<&str>) -> Result<()> {
-    if let Some(name) = profile {
-        if let Some(p) = coppa_engine::profiles::get_profile(name) {
-            println!("Profile: {}", p.name);
-            println!("  Description: {}", p.description);
-            println!("  Speed level: {}", p.speed_level);
-            println!("  Max payload: {} bytes", p.max_payload);
-            println!("  ARQ window: {}", p.arq_window);
-            println!("  Compression: {}", p.compression);
-            println!("  Sample rate: {} Hz", p.sample_rate);
-        } else {
-            // F6: Fix config debug format -- use join(", ") instead of {:?}
-            println!("Unknown profile: {}", name);
-            let names = coppa_engine::profiles::list_profiles();
-            println!("Available: {}", names.join(", "));
+/// `profiles --json`: an array of every named profile, one profile object with
+/// `-p`, or one speed-level object with `--level`.
+fn write_json_profiles(args: &ProfilesArgs) -> Result<()> {
+    if let Some(name) = args.profile.as_deref() {
+        resolve_config(Some(name))?;
+        let resolved = coppa_engine::profiles::get_profile(name)
+            .ok_or_else(|| anyhow::anyhow!("Unknown profile: {name}"))?;
+        return write_json(&ProfileOutput::from_profile(resolved)?);
+    }
+    if let Some(level) = args.level {
+        let row = coppa_engine::ladder::level_info(level)
+            .ok_or_else(|| anyhow::anyhow!("no speed level {level}"))?;
+        return write_json(&LevelOutput::from(&row));
+    }
+    let profiles: Vec<_> = named_profiles()
+        .into_iter()
+        .map(ProfileOutput::from_profile)
+        .collect::<Result<_>>()?;
+    write_json(&profiles)
+}
+
+/// Render `coppa profiles`. Every number comes from `coppa_engine::ladder` or
+/// the profile constants, never from text here, so the output cannot drift from
+/// what `tx` enforces (COP-55: `config` used to print a hand-typed max payload of
+/// 64 bytes for a profile whose real limit is 56).
+fn render_profiles(args: &ProfilesArgs) -> Result<String> {
+    let ladder = coppa_engine::ladder::speed_ladder();
+    if let Some(name) = args.profile.as_deref() {
+        return render_profile_detail(name, &ladder);
+    }
+    let mut out = String::new();
+    match args.level {
+        Some(level) => {
+            let row = ladder
+                .iter()
+                .find(|row| row.level == level)
+                .ok_or_else(|| anyhow::anyhow!("no speed level {level}"))?;
+            render_ladder_header(&mut out, &ladder);
+            render_ladder_row(&mut out, row);
         }
-    } else {
-        println!("Available profiles:");
-        for name in coppa_engine::profiles::list_profiles() {
-            let p = coppa_engine::profiles::get_profile(name).unwrap();
-            println!("  {} - {}", p.name, p.description);
+        None => {
+            render_ladder(&mut out, &ladder);
+            out.push('\n');
+            render_profile_table(&mut out, &ladder);
         }
     }
-    Ok(())
+    Ok(out)
+}
+
+/// A profile's band label and its cell on that band, if the band carries the
+/// profile's level. `EngineConfig::from_profile` always pins HF or VHF.
+fn profile_on_band(
+    p: &coppa_engine::Profile,
+    ladder: &[coppa_engine::ladder::LevelInfo],
+) -> (&'static str, Option<coppa_engine::ladder::LevelOnBand>) {
+    let row = ladder.iter().find(|row| row.level == p.speed_level);
+    match EngineConfig::from_profile(p).ofdm_band {
+        OfdmBand::Vhf => ("VHF", row.map(|row| row.vhf)),
+        _ => ("HF", row.and_then(|row| row.hf)),
+    }
+}
+
+/// Every named profile, in `list_profiles()` order.
+fn named_profiles() -> Vec<&'static coppa_engine::Profile> {
+    coppa_engine::profiles::list_profiles()
+        .iter()
+        .filter_map(|name| coppa_engine::profiles::get_profile(name))
+        .collect()
+}
+
+/// Names of the profiles bound to the VHF band.
+fn vhf_profile_names() -> Vec<&'static str> {
+    named_profiles()
+        .into_iter()
+        .filter(|p| EngineConfig::from_profile(p).ofdm_band == OfdmBand::Vhf)
+        .map(|p| p.name)
+        .collect()
+}
+
+/// The first profile listed before `p` that builds the same engine, i.e. is
+/// the same on the air. Derived, so the label disappears if they diverge.
+fn same_on_air_as(p: &coppa_engine::Profile) -> Option<&'static str> {
+    let mine = EngineConfig::from_profile(p);
+    named_profiles()
+        .into_iter()
+        .take_while(|other| other.name != p.name)
+        .find(|other| {
+            let theirs = EngineConfig::from_profile(other);
+            theirs.speed_level == mine.speed_level
+                && theirs.sample_rate == mine.sample_rate
+                && theirs.compression_enabled == mine.compression_enabled
+                && theirs.cp_mode == mine.cp_mode
+                && theirs.ofdm_band == mine.ofdm_band
+        })
+        .map(|other| other.name)
+}
+
+/// "A", "A and B", "A, B and C".
+fn join_and(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+fn airtime_ms(airtime_s: f64) -> String {
+    format!("{} ms", (airtime_s * 1000.0).round() as u32)
+}
+
+fn render_ladder_header(out: &mut String, ladder: &[coppa_engine::ladder::LevelInfo]) {
+    let hf_hz = ladder
+        .iter()
+        .find_map(|row| row.hf)
+        .map_or(0, |hf| hf.bandwidth_hz);
+    let vhf_hz = ladder.first().map_or(0, |row| row.vhf.bandwidth_hz);
+    let vhf_header = format!("VHF, {vhf_hz} Hz");
+    out.push_str(&format!("{:41}AIR TIME PER FRAME\n", ""));
+    out.push_str(&format!(
+        "{:<7}{:<12}{:<11}{:<11}{:<15}{}\n",
+        "LEVEL",
+        "MODULATION",
+        "CODE RATE",
+        "MAX BYTES",
+        format!("HF, {hf_hz} Hz"),
+        vhf_header,
+    ));
+}
+
+fn render_ladder_row(out: &mut String, row: &coppa_engine::ladder::LevelInfo) {
+    let hf = row
+        .hf
+        .map_or_else(|| "VHF only".to_string(), |hf| airtime_ms(hf.airtime_s));
+    out.push_str(&format!(
+        "{:<7}{:<12}{:<11}{:<11}{:<15}{}\n",
+        row.level,
+        row.modulation,
+        format!("{}/{}", row.code_rate.0, row.code_rate.1),
+        row.max_payload_bytes,
+        hf,
+        airtime_ms(row.vhf.airtime_s),
+    ));
+}
+
+fn render_ladder(out: &mut String, ladder: &[coppa_engine::ladder::LevelInfo]) {
+    let hf_top = ladder
+        .iter()
+        .filter(|row| row.hf.is_some())
+        .map(|row| row.level)
+        .max()
+        .unwrap_or(0);
+    let vhf_top = ladder.iter().map(|row| row.level).max().unwrap_or(0);
+    let vhf_names = vhf_profile_names();
+    let carries = if vhf_names.len() == 1 {
+        "carries"
+    } else {
+        "carry"
+    };
+    out.push_str("Speed levels: pick one with --level N on tx or loopback. HF profiles carry\n");
+    out.push_str(&format!(
+        "levels 1-{hf_top}; {} {carries} 1-{vhf_top}. coppa rx detects each frame's level itself.\n\n",
+        join_and(&vhf_names.iter().map(|n| n.to_string()).collect::<Vec<_>>()),
+    ));
+    render_ladder_header(out, ladder);
+    for row in ladder {
+        render_ladder_row(out, row);
+    }
+    let compressing: Vec<String> = named_profiles()
+        .into_iter()
+        .filter(|p| p.compression)
+        .map(|p| p.name.to_string())
+        .collect();
+    out.push('\n');
+    out.push_str("MAX BYTES is the payload one frame carries on the air.");
+    if !compressing.is_empty() {
+        out.push_str(&format!(
+            " {}\ncompress your message first, so how much text fits depends on the text.",
+            join_and(&compressing)
+        ));
+    }
+    out.push('\n');
+    let vhf_only: Vec<String> = ladder
+        .iter()
+        .filter(|row| row.hf.is_none())
+        .map(|row| row.level.to_string())
+        .collect();
+    if !vhf_only.is_empty() {
+        let (noun, verb, pronoun) = if vhf_only.len() == 1 {
+            ("Level", "is", "it does")
+        } else {
+            ("Levels", "are", "they do")
+        };
+        out.push_str(&format!(
+            "{noun} {} {verb} VHF only: {pronoun} not decode reliably through an HF SSB filter.\n",
+            join_and(&vhf_only)
+        ));
+    }
+}
+
+fn render_profile_table(out: &mut String, ladder: &[coppa_engine::ladder::LevelInfo]) {
+    out.push_str(
+        "Profiles: pick one with --profile NAME; --level N changes its level, not its band.\n",
+    );
+    out.push_str(&format!(
+        "{:<13}{:<6}{:<7}{:<13}{}\n",
+        "PROFILE", "BAND", "LEVEL", "COMPRESSION", "DESCRIPTION"
+    ));
+    let mut wide = Vec::new();
+    for p in named_profiles() {
+        let (band, cell) = profile_on_band(p, ladder);
+        let description = match same_on_air_as(p) {
+            Some(twin) => format!("Same on the air as {twin}"),
+            None => p.description.to_string(),
+        };
+        out.push_str(&format!(
+            "{:<13}{:<6}{:<7}{:<13}{}\n",
+            p.name,
+            band,
+            p.speed_level,
+            if p.compression { "on" } else { "off" },
+            description,
+        ));
+        if let Some(cell) = cell {
+            if cell.bandwidth_hz > coppa_radio::band::HF_OCCUPIED_BANDWIDTH_CAP_HZ {
+                wide.push((p.name, cell.bandwidth_hz));
+            }
+        }
+    }
+    if !wide.is_empty() {
+        out.push('\n');
+    }
+    for (name, hz) in wide {
+        out.push_str(&format!(
+            "{name} is {hz} Hz wide and transmits live only at or above {} MHz.\n",
+            coppa_radio::band::US_WIDEBAND_MIN_HZ as f64 / 1_000_000.0
+        ));
+    }
+}
+
+fn render_profile_detail(name: &str, ladder: &[coppa_engine::ladder::LevelInfo]) -> Result<String> {
+    // Same error text (and exit code) `tx`/`rx`/`loopback` give for an unknown name.
+    resolve_config(Some(name))?;
+    let p = coppa_engine::profiles::get_profile(name)
+        .ok_or_else(|| anyhow::anyhow!("Unknown profile: {name}"))?;
+    let (band, cell) = profile_on_band(p, ladder);
+    let cell = cell.ok_or_else(|| {
+        anyhow::anyhow!(
+            "profile {} is level {}, which its band does not carry",
+            p.name,
+            p.speed_level
+        )
+    })?;
+    let row = ladder
+        .iter()
+        .find(|row| row.level == p.speed_level)
+        .ok_or_else(|| anyhow::anyhow!("no speed level {}", p.speed_level))?;
+    let max_bytes = p
+        .max_payload()
+        .ok_or_else(|| anyhow::anyhow!("no speed level {}", p.speed_level))?;
+    let mut out = String::new();
+    out.push_str(&format!("Profile: {}\n", p.name));
+    out.push_str(&format!("  Description: {}\n", p.description));
+    if let Some(twin) = same_on_air_as(p) {
+        out.push_str(&format!("  Same on the air as {twin}\n"));
+    }
+    out.push_str(&format!("  Band: {band}, {} Hz\n", cell.bandwidth_hz));
+    out.push_str(&format!(
+        "  Speed level: {} ({}, code rate {}/{})\n",
+        p.speed_level, row.modulation, row.code_rate.0, row.code_rate.1
+    ));
+    out.push_str(&format!("  Max bytes per frame: {max_bytes}\n"));
+    out.push_str(&format!(
+        "  Air time per frame: {}\n",
+        airtime_ms(cell.airtime_s)
+    ));
+    out.push_str(&format!(
+        "  Compression: {}\n",
+        if p.compression { "on" } else { "off" }
+    ));
+    out.push_str(&format!("  Sample rate: {} Hz\n", p.sample_rate));
+    Ok(out)
 }
 
 #[cfg(feature = "kiss-tnc")]
@@ -1477,28 +1877,28 @@ mod tests {
 
     #[test]
     fn test_loopback_roundtrip() {
-        cmd_loopback("Hello", None, Verbosity::Normal).expect("loopback should succeed");
+        cmd_loopback("Hello", None, None, Verbosity::Normal).expect("loopback should succeed");
     }
 
     #[test]
     fn test_loopback_short_message() {
-        cmd_loopback("Hi", None, Verbosity::Normal).expect("short loopback should succeed");
+        cmd_loopback("Hi", None, None, Verbosity::Normal).expect("short loopback should succeed");
     }
 
     #[test]
     fn test_loopback_with_profile() {
-        cmd_loopback("Test", Some("HF_STANDARD"), Verbosity::Normal)
+        cmd_loopback("Test", Some("HF_STANDARD"), None, Verbosity::Normal)
             .expect("loopback with profile should succeed");
     }
 
     #[test]
     fn test_loopback_quiet() {
-        cmd_loopback("Quiet", None, Verbosity::Quiet).expect("quiet loopback should succeed");
+        cmd_loopback("Quiet", None, None, Verbosity::Quiet).expect("quiet loopback should succeed");
     }
 
     #[test]
     fn test_loopback_verbose() {
-        cmd_loopback("Verbose", None, Verbosity::Verbose(1))
+        cmd_loopback("Verbose", None, None, Verbosity::Verbose(1))
             .expect("verbose loopback should succeed");
     }
 
@@ -1510,6 +1910,7 @@ mod tests {
         cmd_tx(
             "test message",
             Some(path_str),
+            None,
             None,
             &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
             Verbosity::Normal,
@@ -1573,6 +1974,7 @@ mod tests {
             "CQ CQ",
             Some(path_str),
             None,
+            None,
             &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
             Verbosity::Verbose(1),
         )
@@ -1596,23 +1998,254 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_config_list() {
-        cmd_config(None).expect("config list should succeed");
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("coppa").chain(args.iter().copied()))
     }
 
-    #[test]
-    fn test_config_named_profile() {
-        let profiles = coppa_engine::profiles::list_profiles();
-        if let Some(&name) = profiles.first() {
-            cmd_config(Some(name)).expect("config with valid profile should succeed");
+    fn profiles_args(args: &[&str]) -> ProfilesArgs {
+        match parse(args).expect("valid profiles args").command {
+            Some(Commands::Profiles(args)) | Some(Commands::Config(args)) => args,
+            _ => panic!("expected profiles or config"),
         }
     }
 
     #[test]
-    fn test_config_unknown_profile() {
-        cmd_config(Some("NONEXISTENT_PROFILE"))
-            .expect("config with unknown profile should not error");
+    fn profiles_parses_profile_and_level() {
+        assert_eq!(profiles_args(&["profiles"]), ProfilesArgs::default());
+        assert_eq!(
+            profiles_args(&["profiles", "-p", "HF_ROBUST"])
+                .profile
+                .as_deref(),
+            Some("HF_ROBUST")
+        );
+        assert_eq!(profiles_args(&["profiles", "--level", "4"]).level, Some(4));
+    }
+
+    #[test]
+    fn profiles_rejects_level_outside_1_to_9() {
+        for level in ["0", "10"] {
+            let err = parse(&["profiles", "--level", level])
+                .err()
+                .expect("rejected");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{level}"
+            );
+        }
+    }
+
+    #[test]
+    fn profiles_rejects_profile_with_level() {
+        let err = parse(&["profiles", "-p", "HF_ROBUST", "--level", "2"])
+            .err()
+            .expect("rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn config_parses_into_the_same_args_as_profiles() {
+        for flags in [vec![], vec!["-p", "HF_ROBUST"], vec!["--level", "9"]] {
+            let profiles: Vec<&str> = std::iter::once("profiles").chain(flags.clone()).collect();
+            let config: Vec<&str> = std::iter::once("config").chain(flags).collect();
+            assert!(matches!(
+                parse(&config).unwrap().command,
+                Some(Commands::Config(_))
+            ));
+            assert_eq!(profiles_args(&config), profiles_args(&profiles));
+        }
+    }
+
+    #[test]
+    fn top_level_help_lists_profiles_and_hides_config() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_help().to_string();
+        let subcommands: Vec<&str> = help
+            .lines()
+            .filter_map(|line| line.strip_prefix("  "))
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        assert!(subcommands.contains(&"profiles"), "{help}");
+        assert!(!subcommands.contains(&"config"), "{help}");
+    }
+
+    fn rendered(args: &[&str]) -> String {
+        render_profiles(&profiles_args(args)).expect("render")
+    }
+
+    #[test]
+    fn profiles_table_lists_every_level_once() {
+        let out = rendered(&["profiles"]);
+        let ladder = coppa_engine::ladder::speed_ladder();
+        let rows: Vec<&str> = out
+            .lines()
+            .filter(|line| {
+                line.split_whitespace()
+                    .next()
+                    .is_some_and(|first| first.parse::<u8>().is_ok())
+            })
+            .collect();
+        assert_eq!(rows.len(), 9, "{out}");
+        for (row, info) in rows.iter().zip(&ladder) {
+            let hf = match info.hf {
+                Some(hf) => format!("{} ms", (hf.airtime_s * 1000.0).round()),
+                None => "VHF only".to_string(),
+            };
+            let vhf = format!("{} ms", (info.vhf.airtime_s * 1000.0).round());
+            let expected = format!(
+                "{:<7}{:<12}{:<11}{:<11}{:<15}{}",
+                info.level,
+                info.modulation,
+                format!("{}/{}", info.code_rate.0, info.code_rate.1),
+                info.max_payload_bytes,
+                hf,
+                vhf
+            );
+            assert_eq!(*row, expected);
+        }
+        let levels: Vec<u8> = ladder.iter().map(|info| info.level).collect();
+        assert_eq!(levels, (1..=9).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn profiles_table_header_names_both_bandwidths() {
+        let out = rendered(&["profiles"]);
+        assert!(out.contains("HF, 2400 Hz"), "{out}");
+        assert!(out.contains("VHF, 5600 Hz"), "{out}");
+    }
+
+    #[test]
+    fn profiles_table_marks_emergency_as_hf_robust_on_the_air() {
+        let out = rendered(&["profiles"]);
+        let emergency = out
+            .lines()
+            .find(|line| line.starts_with("EMERGENCY"))
+            .expect("EMERGENCY row");
+        assert!(
+            emergency.ends_with("Same on the air as HF_ROBUST"),
+            "{emergency}"
+        );
+        let robust = out
+            .lines()
+            .find(|line| line.starts_with("HF_ROBUST"))
+            .expect("HF_ROBUST row");
+        assert!(!robust.contains("Same on the air"), "{robust}");
+    }
+
+    #[test]
+    fn profile_detail_shows_the_enforced_max_payload() {
+        for name in coppa_engine::profiles::list_profiles() {
+            let p = coppa_engine::profiles::get_profile(name).unwrap();
+            let out = rendered(&["profiles", "-p", name]);
+            let max = coppa_protocol::modem::max_payload_for_level(p.speed_level).unwrap();
+            assert!(
+                out.contains(&format!("Max bytes per frame: {max}\n")),
+                "{out}"
+            );
+            assert!(!out.contains("ARQ window"), "{out}");
+        }
+        let robust = rendered(&["profiles", "-p", "HF_ROBUST"]);
+        assert!(robust.contains("Max bytes per frame: 56\n"), "{robust}");
+        assert!(!robust.contains("64 bytes"), "{robust}");
+    }
+
+    #[test]
+    fn profiles_level_shows_one_row() {
+        let out = rendered(&["profiles", "--level", "4"]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        assert!(lines[0].trim_start().starts_with("AIR TIME PER FRAME"));
+        assert!(lines[1].starts_with("LEVEL"));
+        assert!(lines[2].starts_with("4 "), "{out}");
+    }
+
+    #[test]
+    fn profiles_unknown_profile_is_an_error() {
+        let args = ProfilesArgs {
+            profile: Some("BOGUS".to_string()),
+            ..ProfilesArgs::default()
+        };
+        let err = render_profiles(&args).unwrap_err().to_string();
+        assert!(err.contains("Unknown profile: BOGUS. Available:"), "{err}");
+    }
+
+    #[test]
+    fn tx_and_loopback_parse_level() {
+        match parse(&["tx", "CQ", "--level", "4"]).unwrap().command {
+            Some(Commands::Tx { level, .. }) => assert_eq!(level, Some(4)),
+            _ => panic!("expected tx"),
+        }
+        match parse(&["loopback", "CQ", "--level", "9"]).unwrap().command {
+            Some(Commands::Loopback { level, .. }) => assert_eq!(level, Some(9)),
+            _ => panic!("expected loopback"),
+        }
+    }
+
+    #[test]
+    fn tx_and_loopback_reject_level_0_and_10() {
+        for cmd in ["tx", "loopback"] {
+            for level in ["0", "10"] {
+                let err = parse(&[cmd, "CQ", "--level", level])
+                    .err()
+                    .expect("rejected");
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::ValueValidation,
+                    "{cmd} {level}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_core_without_level_is_todays_default() {
+        let core = build_core(None, None).unwrap();
+        assert_eq!(core.config().ofdm_band, OfdmBand::LevelDerived);
+        assert_eq!(core.speed_level(), 1);
+    }
+
+    #[test]
+    fn level_without_profile_stays_on_hf() {
+        let core = build_core(None, Some(5)).unwrap();
+        assert_eq!(core.speed_level(), 5);
+        assert!(!core.on_vhf_profile());
+        assert_eq!(core.occupied_bandwidth_hz(), 2400);
+    }
+
+    #[test]
+    fn level_overrides_the_profile_level_but_keeps_band_and_compression() {
+        let core = build_core(Some("HF_STANDARD"), Some(7)).unwrap();
+        assert_eq!(core.speed_level(), 7);
+        assert!(core.config().compression_enabled);
+        assert_eq!(core.occupied_bandwidth_hz(), 2400);
+
+        let core = build_core(Some("VHF_FAST"), Some(3)).unwrap();
+        assert_eq!(core.speed_level(), 3);
+        assert_eq!(core.occupied_bandwidth_hz(), 5600);
+    }
+
+    #[test]
+    fn level_9_needs_a_vhf_profile() {
+        let err = build_core(Some("hf_robust"), Some(9))
+            .err()
+            .expect("level 9 on HF refused")
+            .to_string();
+        assert_eq!(
+            err,
+            "level 9 is not available on HF_ROBUST, which carries levels 1-8; \
+             level 9 is VHF only (use --profile VHF_FAST)"
+        );
+        let err = build_core(None, Some(9))
+            .err()
+            .expect("level 9 on the default refused")
+            .to_string();
+        assert!(err.contains("the default HF profile"), "{err}");
+        assert!(build_core(Some("VHF_FAST"), Some(9)).is_ok());
+    }
+
+    #[test]
+    fn loopback_at_an_explicit_level_round_trips() {
+        cmd_loopback("CQ", None, Some(4), Verbosity::Quiet).expect("level 4 loopback");
     }
 
     #[test]
@@ -1733,6 +2366,8 @@ mod tests {
             pub fail_write_after: Option<usize>,
             pub fail_progress: bool,
             pub fail_stop: bool,
+            pub fail_key: bool,
+            pub fail_unkey: bool,
             pub events: Vec<(Duration, String)>,
             fractional: f64,
         }
@@ -1754,6 +2389,8 @@ mod tests {
                     fail_write_after: None,
                     fail_progress: false,
                     fail_stop: false,
+                    fail_key: false,
+                    fail_unkey: false,
                     events: Vec::new(),
                     fractional: 0.0,
                 }))
@@ -1846,6 +2483,12 @@ mod tests {
                     coppa_radio::PttState::Rx => "ptt RX",
                 };
                 d.log(what);
+                if state == coppa_radio::PttState::Tx && d.fail_key {
+                    anyhow::bail!("simulated key failure");
+                }
+                if state == coppa_radio::PttState::Rx && d.fail_unkey {
+                    anyhow::bail!("simulated unkey failure");
+                }
                 Ok(())
             }
             fn get_ptt(&mut self) -> anyhow::Result<coppa_radio::PttState> {
@@ -2011,6 +2654,78 @@ mod tests {
         assert_eq!(event_names(&device), ["ptt TX", "ptt RX", "stop"]);
     }
 
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn play_keyed_key_and_unkey_failures_are_fatal() {
+        let device = sim::Device::new(std::time::Duration::ZERO);
+        device.lock().unwrap().fail_key = true;
+        let error = run_play_keyed(&device, &[0.25; 16], 50, 200).unwrap_err();
+        assert!(error.to_string().contains("failed to key PTT"), "{error}");
+        assert_eq!(event_names(&device), ["ptt TX", "ptt RX", "stop"]);
+        assert_eq!(device.lock().unwrap().writes, 0);
+
+        let device = sim::Device::new(std::time::Duration::ZERO);
+        device.lock().unwrap().fail_unkey = true;
+        let error = run_play_keyed(&device, &[0.25; 16], 0, 0).unwrap_err();
+        assert!(
+            error.to_string().contains("failed to release PTT"),
+            "{error}"
+        );
+        assert_eq!(event_names(&device), ["ptt TX", "ptt RX", "stop"]);
+
+        let device = sim::Device::new(std::time::Duration::ZERO);
+        {
+            let mut d = device.lock().unwrap();
+            d.fail_write_after = Some(0);
+            d.fail_unkey = true;
+            d.fail_stop = true;
+        }
+        let error = run_play_keyed(&device, &[0.25; 16], 0, 0).unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.contains("simulated device write failure")
+                && text.contains("failed to release PTT")
+                && text.contains("failed to stop audio"),
+            "{text}"
+        );
+    }
+
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn refused_rigctld_connection_is_an_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let error = build_ptt("rigctld", &addr).err().unwrap();
+        let message = error.to_string();
+        assert!(
+            message.contains("rigctld connection failed") && message.contains(&addr),
+            "{message}"
+        );
+    }
+
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn tx_and_tune_stop_at_rigctld_before_opening_audio() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let rig = RigSettings::test_values(None, "rigctld", &addr, 0, 0, None, None);
+        let tx = cmd_tx("HI", None, None, None, &rig, Verbosity::Quiet).unwrap_err();
+        let tune = cmd_tune(0.1, None, None, None, &rig, Verbosity::Quiet).unwrap_err();
+        for error in [tx, tune] {
+            let message = error.to_string();
+            assert!(
+                message.contains("rigctld connection failed") && message.contains(&addr),
+                "{message}"
+            );
+            assert!(
+                !message.contains("ALSA") && !message.contains("audio"),
+                "{message}"
+            );
+        }
+    }
+
     /// "CLI flags reach the engine": `--rigctld` must actually be the address
     /// `build_ptt` connects to, not a hardcoded one. A real loopback
     /// `TcpListener` bound to an OS-assigned port stands in for rigctld --
@@ -2161,6 +2876,7 @@ mod tests {
             "hi",
             None,
             None,
+            None,
             &RigSettings::test_values(None, "rigctld-typo", "127.0.0.1:1", 0, 0, None, None),
             Verbosity::Quiet,
         )
@@ -2198,6 +2914,7 @@ mod tests {
             "hi",
             None,
             Some("VHF_FAST"),
+            None,
             &RigSettings::test_values(None, "none", "127.0.0.1:1", 0, 0, None, None),
             Verbosity::Quiet,
         )
@@ -2209,6 +2926,7 @@ mod tests {
             "hi",
             Some(path.to_str().unwrap()),
             Some("VHF_FAST"),
+            None,
             &RigSettings::test_values(None, "none", "127.0.0.1:1", 0, 0, None, None),
             Verbosity::Quiet,
         )
@@ -2233,6 +2951,7 @@ mod tests {
             cmd_tx(
                 "streaming rx roundtrip",
                 Some(path_str),
+                None,
                 None,
                 &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
                 Verbosity::Quiet,
@@ -2420,19 +3139,151 @@ mod tests {
         }
     }
 
+    struct FiniteSamples {
+        samples: Vec<f32>,
+        cursor: usize,
+    }
+
+    impl coppa_audio::AudioSource for FiniteSamples {
+        fn read(&mut self, buf: &mut [f32]) -> Result<usize> {
+            let count = buf.len().min(self.samples.len() - self.cursor);
+            buf[..count].copy_from_slice(&self.samples[self.cursor..self.cursor + count]);
+            self.cursor += count;
+            Ok(count)
+        }
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A live-like source whose read fails after the frames have arrived,
+    /// so stream_decode exits without ever returning a summary.
+    struct InterruptedSamples(FiniteSamples);
+
+    impl coppa_audio::AudioSource for InterruptedSamples {
+        fn read(&mut self, buf: &mut [f32]) -> Result<usize> {
+            if self.0.cursor == self.0.samples.len() {
+                anyhow::bail!("synthetic capture stopped");
+            }
+            self.0.read(buf)
+        }
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn unbounded_live_receive_reports_errors_before_return() {
+        const CHILD: &str = "COPPA_TEST_LIVE_DECODE_DIAGNOSTICS";
+        if std::env::var_os(CHILD).is_some() {
+            let compressed_profile = coppa_engine::profiles::get_profile("HF_STANDARD").unwrap();
+            let compressed = CoppaCore::with_config(EngineConfig::from_profile(compressed_profile))
+                .encode("BAD")
+                .unwrap();
+            let raw = CoppaCore::new()
+                .encode_bytes(&[0xfe, 1, 2, 3, 4, 5])
+                .unwrap();
+            for (mut core, mut samples, profile) in [
+                (CoppaCore::new(), compressed, "default"),
+                (
+                    CoppaCore::with_config(EngineConfig::from_profile(compressed_profile)),
+                    raw,
+                    "HF_STANDARD",
+                ),
+            ] {
+                samples.extend(std::iter::repeat_n(0.0, TRAILING_FLUSH_SAMPLES));
+                let mut source = InterruptedSamples(FiniteSamples { samples, cursor: 0 });
+                let error = stream_decode(
+                    &mut core,
+                    &mut source,
+                    None,
+                    None,
+                    RxOutputMode::Text { hex: false },
+                    profile,
+                    Verbosity::Quiet,
+                )
+                .err()
+                .expect("synthetic live source should stop the decoder");
+                assert!(error.to_string().contains("synthetic capture stopped"));
+            }
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::unbounded_live_receive_reports_errors_before_return",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("appears compressed"), "{stderr}");
+        assert!(stderr.contains("payload decode failed"), "{stderr}");
+    }
+
+    #[test]
+    fn stream_decode_counts_good_and_failed_payload_frames() {
+        let plain = CoppaCore::new().encode("GOOD").unwrap();
+        let profile = coppa_engine::profiles::get_profile("HF_STANDARD").unwrap();
+        let compressed = CoppaCore::with_config(EngineConfig::from_profile(profile))
+            .encode("BAD")
+            .unwrap();
+        let mut samples = plain;
+        samples.extend(std::iter::repeat_n(0.0, 48_000));
+        samples.extend(compressed);
+        let length = samples.len();
+        let mut source = FiniteSamples { samples, cursor: 0 };
+        let summary = stream_decode(
+            &mut CoppaCore::new(),
+            &mut source,
+            Some(length),
+            None,
+            RxOutputMode::Text { hex: false },
+            "default",
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        assert_eq!(summary.consumed_samples, length);
+        assert_eq!(summary.good_frames, 1);
+        assert_eq!(summary.failed_frames, 1);
+        assert!(summary
+            .check_failure()
+            .unwrap_err()
+            .to_string()
+            .contains("appears compressed"));
+    }
+
     #[test]
     fn stream_decode_stops_a_stalled_live_source_at_its_deadline() {
         let start = std::time::Instant::now();
         let deadline = Some(start + std::time::Duration::from_millis(100));
-        stream_decode(
+        let summary = stream_decode(
             &mut CoppaCore::new(),
             &mut Stalled,
             None,
             deadline,
             RxOutputMode::Text { hex: false },
+            "default",
             Verbosity::Quiet,
         )
         .unwrap();
+        assert_eq!(summary.good_frames, 0);
+        summary.check_failure().unwrap();
         let elapsed = start.elapsed();
         assert!(
             elapsed >= std::time::Duration::from_millis(100),
@@ -2451,6 +3302,7 @@ mod tests {
             None,
             deadline,
             RxOutputMode::Text { hex: false },
+            "default",
             Verbosity::Quiet,
         )
         .unwrap();
@@ -2465,16 +3317,55 @@ mod tests {
     #[test]
     fn stream_decode_reads_no_further_than_its_sample_limit() {
         let mut source = Counting::default();
-        stream_decode(
+        let summary = stream_decode(
             &mut CoppaCore::new(),
             &mut source,
             Some(10_000),
             None,
             RxOutputMode::Raw,
+            "default",
             Verbosity::Quiet,
         )
         .unwrap();
         assert_eq!(source.handed_out, 10_000);
+        assert_eq!(summary.consumed_samples, 10_000);
+    }
+
+    #[test]
+    fn stream_frame_outcomes_keep_first_payload_error() {
+        let core = CoppaCore::new();
+        let frame = |payload| coppa_engine::StreamFrame {
+            payload,
+            snr_db: 20.0,
+            cfo_hz: 0.0,
+            frame_start: 0,
+            speed_level: 1,
+            recommended_level: 1,
+            delay_spread_ms: 0.0,
+        };
+        let mut summary = DecodeSummary::default();
+        for payload in [
+            Ok(b"GOOD".to_vec()),
+            Err(anyhow::anyhow!("first failure")),
+            Err(anyhow::anyhow!("second failure")),
+        ] {
+            handle_stream_frame(
+                &core,
+                &frame(payload),
+                &mut summary,
+                RxOutputMode::Text { hex: false },
+                "default",
+                Verbosity::Quiet,
+            )
+            .unwrap();
+        }
+        assert_eq!(summary.good_frames, 1);
+        assert_eq!(summary.failed_frames, 2);
+        let error = summary.check_failure().unwrap_err().to_string();
+        assert!(
+            error.contains("first failure") && !error.contains("second failure"),
+            "{error}"
+        );
     }
 
     #[test]

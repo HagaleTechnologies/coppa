@@ -48,7 +48,7 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 - FFT/IFFT via rustfft (`FftProcessor`)
 - FIR design and filtering: the windowed-sinc bandpass the OFDM TX/RX conditioning uses (`design_bandpass`), a Hilbert design, and a streaming FIR
 - Older single-carrier primitives (AGC, a matched pulse-shaping filter, carrier and symbol-timing recovery) that only the legacy `BpskModem` uses; `benches/throughput.rs` also uses the AGC and the pulse-shaping filter directly. See [Legacy code not on the data path](#legacy-code-not-on-the-data-path)
-- There is no sample-rate converter on the audio path, and nothing checks the rate. Every `CoppaProfile` runs at 48 kHz. The daemon hands its `[audio] sample_rate` (default 48000) to the sound card unchanged, and `coppa rx --input` does not compare a WAV file's rate with the engine's. `crates/coppa-audio/src/resampler.rs` is not compiled: `coppa-audio`'s `lib.rs` does not declare it, and the `rubato` crate it imports is in no `Cargo.toml`
+- There is no sample-rate converter on the audio path. Every `CoppaProfile` runs at 48 kHz. The daemon hands its `[audio] sample_rate` (default 48000) to the sound card unchanged, and `coppa rx --input` rejects a WAV file whose rate differs from the engine's. `crates/coppa-audio/src/resampler.rs` is not compiled: `coppa-audio`'s `lib.rs` does not declare it, and the `rubato` crate it imports is in no `Cargo.toml`
 
 #### Codec Layer (`coppa-codec`)
 - **Constellation mappers** with hard and soft (LLR) demapping: `BpskMapper`, `QpskMapper`, `Psk8Mapper`, `Qam16Mapper`, `Qam64Mapper` (SPEC §6.1). These map bits to OFDM carrier values. None of them is a standalone modem
@@ -96,7 +96,8 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 #### Engine (`coppa-engine`)
 - `CoppaCore`: a thin wrapper around `CoppaTransceiver` that adds optional compression and squelch gating. Entry points: `encode_bytes`, `encode_bytes_at_level`, `decode_bytes`, `push_samples` (streaming), `set_speed_level`, `set_cp_profile`, `tune_tone`, plus the text wrappers `encode`/`decode`
 - `EngineConfig` with `OfdmBand` (`LevelDerived`, `Hf`, `Vhf`), which pins the OFDM band across speed-level changes
-- Named operating profiles: `HF_ROBUST` (level 1), `HF_STANDARD` (level 2, the daemon default), `EMERGENCY` (level 1), all HF; `VHF_FAST` (level 8, VHF)
+- Named operating profiles: `HF_ROBUST` (level 1), `HF_STANDARD` (level 2, the daemon default), `EMERGENCY` (level 1, same on the air as `HF_ROBUST`), all HF; `VHF_FAST` (level 8, VHF)
+- `coppa_engine::ladder` assembles each speed level's modulation, code rate, max bytes, air time and bandwidth from the code the encoder runs, for `coppa profiles`
 
 #### Host Interfaces (`coppa-host`)
 - **VARA-style TCP** (`vara-tcp`, default): command port 8300 and data port 8301, a VARA-inspired command set. The modem is not RF/waveform-compatible with VARA and does not interoperate with it over the air
