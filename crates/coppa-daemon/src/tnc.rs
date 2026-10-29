@@ -331,28 +331,8 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
     let (demod_tx, mut demod_rx) = mpsc::channel::<Vec<u8>>(64);
     let demod_shutdown = shutdown.clone();
 
-    tokio::task::spawn_blocking(move || {
-        let mut demod = coppa_codec::afsk::Demodulator::new();
-        let mut audio_in = audio_in_cons;
-        let mut buf = vec![0.0f32; 1024];
-
-        loop {
-            if demod_shutdown.load(Ordering::Acquire) || audio_in.is_abandoned() {
-                break;
-            }
-            let n = audio_in.read(&mut buf);
-            if n > 0 {
-                demod.process(&buf[..n]);
-                for frame in demod.take_frames() {
-                    // Best-effort send; if the main loop is gone, stop.
-                    if demod_tx.blocking_send(frame).is_err() {
-                        return;
-                    }
-                }
-            } else {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        }
+    let demod_worker = tokio::task::spawn_blocking(move || {
+        run_demod_worker(audio_in_cons, demod_tx, &demod_shutdown)
     });
 
     // -------------------------------------------------------------------------
@@ -420,7 +400,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
         let input_id = config.input_device_id.clone();
         let input_channel = config.input_channel;
         let (input_open_tx, input_open_rx) = tokio::sync::oneshot::channel();
-        tokio::task::spawn_blocking(move || {
+        let input_worker = tokio::task::spawn_blocking(move || {
             let device = coppa_audio::resolve_input_device(
                 input_name
                     .as_deref()
@@ -451,18 +431,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
                     return;
                 }
             };
-            let mut buf = vec![0.0f32; 1024];
-            loop {
-                if mic_prod.is_abandoned() || input_shutdown.load(Ordering::Acquire) {
-                    break;
-                }
-                match source.read(&mut buf) {
-                    Ok(n) if n > 0 => {
-                        mic_prod.write(&buf[..n]);
-                    }
-                    _ => std::thread::sleep(std::time::Duration::from_millis(10)),
-                }
-            }
+            pump_input(&mut source, &mut mic_prod, &input_shutdown);
         });
         let (input_name, input_hardware_rate) = input_open_rx
             .await
@@ -514,9 +483,19 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
                 output_shutdown,
             );
         });
-        let (output_name, output_hardware_rate) = output_open_rx
+        let output_opened = output_open_rx
             .await
-            .context("TNC audio output worker stopped during startup")??;
+            .context("TNC audio output worker stopped during startup")
+            .and_then(|opened| opened);
+        let (output_name, output_hardware_rate) = match output_opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                // COP-64 review: input is already capturing; stop it and the
+                // demodulator, or the runtime waits on them forever.
+                stop_started_workers(&shutdown, vec![input_worker, demod_worker]).await;
+                return Err(error);
+            }
+        };
         tracing::info!(device = ?output_name, output_hardware_rate, engine_rate, "Audio output started");
     }
 
@@ -529,6 +508,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
         );
         let _ = audio_in_prod;
         let _ = audio_out_cons;
+        drop(demod_worker);
     }
 
     // -------------------------------------------------------------------------
@@ -593,6 +573,68 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
     Ok(())
 }
 
+/// The demodulation worker: AFSK-decode the input ring until shutdown, the
+/// input side is gone, or the main loop stops taking frames.
+fn run_demod_worker(
+    mut audio_in: coppa_audio::AudioRingConsumer,
+    demod_tx: mpsc::Sender<Vec<u8>>,
+    shutdown: &AtomicBool,
+) {
+    let mut demod = coppa_codec::afsk::Demodulator::new();
+    let mut buf = vec![0.0f32; 1024];
+    loop {
+        if shutdown.load(Ordering::Acquire) || audio_in.is_abandoned() {
+            break;
+        }
+        let n = audio_in.read(&mut buf);
+        if n > 0 {
+            demod.process(&buf[..n]);
+            for frame in demod.take_frames() {
+                // Best-effort send; if the main loop is gone, stop.
+                if demod_tx.blocking_send(frame).is_err() {
+                    return;
+                }
+            }
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+/// The input worker's loop: move captured audio into the input ring until
+/// shutdown or the demodulator side is gone.
+#[cfg_attr(not(any(feature = "cpal-backend", test)), allow(dead_code))]
+fn pump_input<S: coppa_audio::AudioSource + ?Sized>(
+    source: &mut S,
+    mic_prod: &mut AudioRingProducer,
+    shutdown: &AtomicBool,
+) {
+    let mut buf = vec![0.0f32; 1024];
+    loop {
+        if mic_prod.is_abandoned() || shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        match source.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                mic_prod.write(&buf[..n]);
+            }
+            _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+}
+
+/// COP-64 review (Codex P1 on #173): a startup error after audio workers
+/// have started must stop them before `run_tnc` returns. The input worker
+/// and the demodulator hold the two ends of the input ring, so neither ever
+/// sees the other abandoned; only the shutdown flag ends them.
+#[cfg_attr(not(any(feature = "cpal-backend", test)), allow(dead_code))]
+async fn stop_started_workers(shutdown: &AtomicBool, workers: Vec<tokio::task::JoinHandle<()>>) {
+    shutdown.store(true, Ordering::Release);
+    for worker in workers {
+        let _ = worker.await;
+    }
+}
+
 /// Stop the TNC: tell the audio threads to stop and, if a frame is keyed or
 /// queued, release PTT. Shared by `run_tnc`'s Ctrl-C and SIGTERM branches so
 /// the two cannot drift.
@@ -623,6 +665,52 @@ mod tests {
             error.contains("input_device_id") && error.contains("cpal-backend"),
             "{error}"
         );
+    }
+
+    /// A started input that never delivers audio (a quiet band).
+    struct QuietSource;
+
+    impl coppa_audio::AudioSource for QuietSource {
+        fn read(&mut self, _buf: &mut [f32]) -> Result<usize> {
+            Ok(0)
+        }
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// COP-64 review (Codex P1 on #173): when input capture has started but
+    /// the output then fails to open, the input worker holds the audio ring's
+    /// producer and the demodulator its consumer, so neither sees the other
+    /// abandoned, and on quiet input the demodulator never reaches a failed
+    /// send. Only the shutdown flag stops them; without it the CLI's runtime
+    /// waits on both forever instead of exiting with the startup error.
+    #[tokio::test]
+    async fn a_startup_error_stops_the_already_started_audio_workers() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (producer, consumer) = coppa_audio::audio_ring(4096);
+        let (demod_tx, _demod_rx) = mpsc::channel::<Vec<u8>>(1);
+        let demod_shutdown = shutdown.clone();
+        let demod = tokio::task::spawn_blocking(move || {
+            run_demod_worker(consumer, demod_tx, &demod_shutdown)
+        });
+        let input_shutdown = shutdown.clone();
+        let input = tokio::task::spawn_blocking(move || {
+            let mut producer = producer;
+            pump_input(&mut QuietSource, &mut producer, &input_shutdown)
+        });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stop_started_workers(&shutdown, vec![input, demod]),
+        )
+        .await
+        .expect("the started workers must stop on a startup error");
     }
 
     /// PTT controller recording every state change.
