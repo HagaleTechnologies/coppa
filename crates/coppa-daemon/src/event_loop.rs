@@ -3665,10 +3665,8 @@ impl EventLoop {
             && self.deferred_events.iter().any(|event| {
                 matches!(
                     event,
-                    DaemonEvent::Host(HostEvent::VaraCommand {
-                        command: VaraCommand::Abort,
-                        ..
-                    })
+                    DaemonEvent::Host(HostEvent::VaraCommand { command, .. })
+                        if matches!(VaraCommand::parse(command), VaraCommand::Abort)
                 )
             })
     }
@@ -14425,7 +14423,7 @@ mod tests {
                 .unwrap();
             tx.send(DaemonEvent::Host(HostEvent::VaraCommand {
                 client_id: 1,
-                command: VaraCommand::Abort,
+                command: "ABORT".to_string(),
             }))
             .await
             .unwrap();
@@ -14489,7 +14487,7 @@ mod tests {
                 .event_tx
                 .send(DaemonEvent::Host(HostEvent::VaraCommand {
                     client_id: 1,
-                    command: VaraCommand::Abort,
+                    command: "ABORT".to_string(),
                 }))
                 .await
                 .unwrap();
