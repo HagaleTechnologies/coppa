@@ -2036,8 +2036,10 @@ impl EventLoop {
     /// session and tell the host `DISCONNECTED` (after `CANCELPENDING` when
     /// it was a pending inbound handshake). Used for COP-38's link failure
     /// of a session no host DISCONNECT is draining, so no session data plays
-    /// after the host hears `DISCONNECTED`; a host `DISCONNECT` drains first
-    /// and ends through `end_local_disconnect` (COP-43).
+    /// after the host hears `DISCONNECTED`, and for a host `DISCONNECT` of a
+    /// pending inbound attempt (COP-44), which has nothing to drain. A host
+    /// `DISCONNECT` of any other session drains first and ends through
+    /// `end_local_disconnect` (COP-43).
     async fn end_session(&mut self, session_id: u8, client_id: u32) {
         let was_pending = self.is_accepting(session_id);
         self.discard_session_tx(session_id).await;
@@ -2656,7 +2658,12 @@ impl EventLoop {
                     })
                     .copied();
 
-                if let Some(id) = session_id {
+                // COP-44 x COP-43: a pending inbound attempt has no session
+                // data to drain; it ends at once, with CANCELPENDING before
+                // DISCONNECTED, as COP-44 specifies.
+                if let Some(id) = session_id.filter(|&id| self.is_accepting(id)) {
+                    self.end_session(id, client_id).await;
+                } else if let Some(id) = session_id {
                     let disconnect = self.session_mgr.get_mut(id).map(|s| s.disconnect());
                     match disconnect {
                         Some(Ok(disc_pdu)) => {
@@ -13930,7 +13937,10 @@ mod tests {
                 ))
                 .await;
 
-            let link = station.session_link.as_ref().expect("the drain keeps its link");
+            let link = station
+                .session_link
+                .as_ref()
+                .expect("the drain keeps its link");
             assert_eq!(
                 link.rx.recv_base(),
                 1,
