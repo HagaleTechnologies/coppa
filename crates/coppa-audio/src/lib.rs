@@ -11,6 +11,7 @@ use anyhow::Result;
 
 pub mod loopback;
 pub mod playout;
+pub mod resampler;
 pub mod ringbuf;
 pub mod vox;
 
@@ -26,7 +27,13 @@ pub use ringbuf::{audio_ring, AudioRingConsumer, AudioRingProducer};
 pub use vox::VoxDetector;
 
 #[cfg(feature = "cpal-backend")]
+pub use cpal_backend::{
+    resolve_input_device, resolve_output_device, DeviceSelectionError, LiveSink, LiveSource,
+};
+#[cfg(feature = "cpal-backend")]
 pub use cpal_backend::{CpalSink, CpalSource};
+#[cfg(feature = "cpal-backend")]
+pub type LiveDevice = cpal::Device;
 
 #[cfg(feature = "cpal-backend")]
 pub use cpal_backend::{find_input_device_by_name, find_output_device_by_name};
@@ -38,6 +45,7 @@ pub use file_backend::{RawF32Sink, RawF32Source, WavSink, WavSource};
 #[derive(Debug, Clone)]
 pub struct AudioDevice {
     pub name: String,
+    pub id: Option<String>,
     pub max_sample_rate: u32,
     pub input_channels: u16,
     pub output_channels: u16,
@@ -57,6 +65,12 @@ pub trait AudioSink: Send {
     fn sample_rate(&self) -> u32;
     fn start(&mut self) -> Result<()>;
     fn stop(&mut self) -> Result<()>;
+
+    /// Finalize the current transmission's partial conversion block.
+    /// Subsequent writes may begin a new transmission.
+    fn finish_input(&mut self) -> Result<()> {
+        Ok(())
+    }
 
     /// Drop every sample `write` has accepted that the device has not yet
     /// consumed, so a cancelled transmission's buffered tail cannot play
@@ -93,6 +107,7 @@ mod tests {
     fn test_audio_device_struct() {
         let dev = AudioDevice {
             name: "Test Device".to_string(),
+            id: Some("test:1".to_string()),
             max_sample_rate: 48000,
             input_channels: 1,
             output_channels: 2,
