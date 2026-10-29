@@ -133,6 +133,23 @@ impl TxOutput {
         Some(target)
     }
 
+    /// Register the transmission boundary before exposing its samples to the
+    /// output worker. This prevents a fast worker from crossing the boundary
+    /// before its finish marker becomes visible.
+    pub fn submit_with_finish(
+        &mut self,
+        samples: &[f32],
+        feedback: &OutputFeedback,
+    ) -> Option<u64> {
+        if !self.is_live() {
+            return None;
+        }
+        let target = self.pending.push(samples);
+        feedback.finish_through(target);
+        self.flush();
+        Some(target)
+    }
+
     /// Move retained samples into the ring as far as it has room.
     pub fn flush(&mut self) -> usize {
         match self.producer.as_mut() {
@@ -172,6 +189,8 @@ pub struct OutputFeedback {
     /// Cumulative sample index below which samples not yet handed to the
     /// sink must be discarded (set when the TX owner cancels).
     discard_through: AtomicU64,
+    /// Completed transmission boundaries awaiting the sink's tail flush.
+    finish_targets: std::sync::Mutex<VecDeque<u64>>,
 }
 
 impl OutputFeedback {
@@ -200,6 +219,20 @@ impl OutputFeedback {
     /// `through` (see [`wait_for_discard`]).
     pub fn discard_through(&self, through: u64) {
         self.discard_through.fetch_max(through, Ordering::AcqRel);
+        self.finish_targets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Publish one complete transmission's cumulative mono-sample target.
+    /// The worker flushes the final partial conversion block only after all
+    /// samples through this boundary have reached the sink.
+    pub fn finish_through(&self, target: u64) {
+        self.finish_targets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(target);
     }
 
     /// Publish a sink progress snapshot as one coherent value: consumed
@@ -264,6 +297,7 @@ impl OutputWorker {
         progress: impl FnOnce(&S) -> Result<PlaybackProgress>,
     ) -> Result<usize> {
         let result = self.forward(outer, sink).and_then(|accepted| {
+            self.finish_completed_tails(sink)?;
             let snapshot = progress(sink)?;
             self.feedback
                 .publish(snapshot, self.sample_rate, self.discarded);
@@ -273,6 +307,29 @@ impl OutputWorker {
             self.feedback.fail();
         }
         result
+    }
+
+    fn finish_completed_tails<S: AudioSink>(&mut self, sink: &mut S) -> Result<()> {
+        let forwarded = self.read_total - (self.len - self.offset) as u64;
+        loop {
+            let target = {
+                let mut targets = self
+                    .feedback
+                    .finish_targets
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if targets.front().is_some_and(|target| *target <= forwarded) {
+                    targets.pop_front()
+                } else {
+                    None
+                }
+            };
+            if target.is_none() {
+                break;
+            }
+            sink.finish_input()?;
+        }
+        Ok(())
     }
 
     fn forward<S: AudioSink>(
@@ -300,7 +357,23 @@ impl OutputWorker {
                 return Ok(0);
             }
         }
-        let accepted = sink.write(&self.buf[self.offset..self.len])?;
+        let forwarded = self.read_total - (self.len - self.offset) as u64;
+        let boundary = self
+            .feedback
+            .finish_targets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .front()
+            .copied();
+        let remaining = boundary.map_or(self.len - self.offset, |target| {
+            target
+                .saturating_sub(forwarded)
+                .min((self.len - self.offset) as u64) as usize
+        });
+        if remaining == 0 {
+            return Ok(0);
+        }
+        let accepted = sink.write(&self.buf[self.offset..self.offset + remaining])?;
         self.offset += accepted.min(self.len - self.offset);
         Ok(accepted)
     }
@@ -599,6 +672,7 @@ pub(crate) mod test_support {
         pub fail_writes: bool,
         /// Remaining presentation time reported for the last consumed sample.
         pub remaining: Duration,
+        pub finish_calls: usize,
         /// Like `CpalSink`, a drop request is served by the next callback.
         flush_requested: bool,
         flush_served: Option<u64>,
@@ -615,6 +689,7 @@ pub(crate) mod test_support {
                 calls: 0,
                 fail_writes: false,
                 remaining: Duration::ZERO,
+                finish_calls: 0,
                 flush_requested: false,
                 flush_served: None,
             }
@@ -660,6 +735,10 @@ pub(crate) mod test_support {
             Ok(())
         }
         fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn finish_input(&mut self) -> Result<()> {
+            self.finish_calls += 1;
             Ok(())
         }
         fn discard_buffered(&mut self) -> Result<Option<u64>> {
@@ -738,6 +817,77 @@ mod tests {
         sink.write_limits = vec![Some(100), Some(0), Some(0), Some(333), None, Some(1)];
         let (captured, _) = deliver(&frame, 2048, &mut sink, &[200, 0, 777]);
         assert_eq!(captured, frame);
+    }
+
+    #[test]
+    fn worker_finishes_each_non_aligned_transmission_only_after_its_last_write() {
+        let (mut prod, mut cons) = audio_ring(4096);
+        let feedback = Arc::new(OutputFeedback::default());
+        let mut worker = OutputWorker::new(1024, 48_000, feedback.clone());
+        let mut sink = SimSink::new(4096);
+        sink.write_limits = vec![Some(100), Some(0), Some(333), None];
+        let frame = ramp(1503);
+        prod.write(&frame);
+        feedback.finish_through(frame.len() as u64);
+        while sink.finish_calls == 0 {
+            worker.step(&mut cons, &mut sink, sim_progress).unwrap();
+        }
+        assert_eq!(sink.finish_calls, 1);
+        assert_eq!(sink.callback(4096), frame.len());
+        worker.step(&mut cons, &mut sink, sim_progress).unwrap();
+        assert_eq!(feedback.played(), frame.len() as u64);
+        assert_eq!(sink.captured, frame);
+    }
+
+    #[test]
+    fn worker_does_not_forward_next_frame_across_a_finish_boundary() {
+        let (mut producer, mut consumer) = audio_ring(128);
+        let feedback = Arc::new(OutputFeedback::default());
+        let mut worker = OutputWorker::new(128, 48_000, feedback.clone());
+        let mut sink = SimSink::new(128);
+        let mut both = vec![1.0; 37];
+        both.extend(vec![2.0; 43]);
+        assert_eq!(producer.write(&both), both.len());
+        feedback.finish_through(37);
+        feedback.finish_through(80);
+        assert_eq!(
+            worker.step(&mut consumer, &mut sink, sim_progress).unwrap(),
+            37
+        );
+        assert_eq!(sink.finish_calls, 1);
+        assert_eq!(sink.callback(128), 37);
+        assert_eq!(sink.captured, vec![1.0; 37]);
+        assert_eq!(
+            worker.step(&mut consumer, &mut sink, sim_progress).unwrap(),
+            43
+        );
+        assert_eq!(sink.finish_calls, 2);
+        assert_eq!(sink.callback(128), 43);
+        assert_eq!(&sink.captured[37..], &vec![2.0; 43]);
+    }
+
+    #[test]
+    fn discard_clears_unfinished_tail_before_next_transmission() {
+        let (mut prod, mut cons) = audio_ring(4096);
+        let feedback = Arc::new(OutputFeedback::default());
+        let mut worker = OutputWorker::new(1024, 48_000, feedback.clone());
+        let mut sink = SimSink::new(1024);
+        sink.write_limits = vec![Some(0), Some(0), Some(128)];
+        prod.write(&vec![1.0; 1000]);
+        feedback.finish_through(1000);
+        worker.step(&mut cons, &mut sink, sim_progress).unwrap();
+        feedback.discard_through(1000);
+        sink.callback(0);
+        worker.step(&mut cons, &mut sink, sim_progress).unwrap();
+        assert_eq!(sink.finish_calls, 0);
+        prod.write(&vec![2.0; 100]);
+        feedback.finish_through(1100);
+        for _ in 0..20 {
+            worker.step(&mut cons, &mut sink, sim_progress).unwrap();
+            sink.callback(1024);
+        }
+        assert_eq!(sink.finish_calls, 1);
+        assert_eq!(sink.captured, vec![2.0; 100]);
     }
 
     #[test]

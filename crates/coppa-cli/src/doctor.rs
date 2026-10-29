@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Result};
 use clap::Args;
-use coppa_audio::{DeviceProbe, DeviceSupport, Direction, Support};
+use coppa_audio::{DeviceProbe, DeviceSupport, Direction, OpenedFormat, Support};
 use coppa_radio::RigctldClient;
 use std::fmt;
 use std::io::Write;
@@ -89,8 +89,24 @@ const BACKEND_HINT: &str =
 const DEVICES_HINT: &str = "The audio system reports no devices. Connect the radio's USB audio interface and confirm the OS lists it (Linux: arecord -l and aplay -l).";
 const INPUT_DEVICE_HINT: &str = "Pass --input-device (or --device) with part of a name from the device list above, or set a system default input.";
 const OUTPUT_DEVICE_HINT: &str = "Pass --output-device (or --device) with part of a name from the device list above, or set a system default output.";
-const INPUT_FORMAT_HINT: &str = "Coppa records 1 channel of f32 samples at 48000 Hz. Close other programs using the device (is coppad running?), or pick another input with --input-device; on Linux a plughw: or default: device converts formats.";
-const OUTPUT_FORMAT_HINT: &str = "Coppa plays 1 channel of f32 samples at 48000 Hz. Close other programs using the device (is coppad running?), or pick another output with --output-device; on Linux a plughw: or default: device converts formats.";
+const INPUT_FORMAT_HINT: &str = "Coppa records f32 samples from channel 0 of any channel count, resampling to 48000 Hz if the device does not offer it. Close other programs using the device (is coppad running?), or pick another input with --input-device; on Linux a plughw: or default: device converts formats.";
+const OUTPUT_FORMAT_HINT: &str = "Coppa plays f32 samples on channel 0 of any channel count, resampling from 48000 Hz if the device does not offer it. Close other programs using the device (is coppad running?), or pick another output with --output-device; on Linux a plughw: or default: device converts formats.";
+const INPUT_AMBIGUOUS_HINT: &str = "Several input devices match that name. Pass more of the name with --input-device (or --device), as listed above.";
+const OUTPUT_AMBIGUOUS_HINT: &str = "Several output devices match that name. Pass more of the name with --output-device (or --device), as listed above.";
+
+/// What `coppa doctor` reports for a format Coppa opens (COP-64): the lane it
+/// uses and whether the stream is resampled to or from the engine rate.
+fn describe_format(format: &OpenedFormat, engine_rate: u32) -> String {
+    let resampled = if format.sample_rate == engine_rate {
+        String::new()
+    } else {
+        format!(", resampled to {engine_rate} Hz")
+    };
+    format!(
+        "{} ch f32 at {} Hz, channel 0{resampled}",
+        format.channels, format.sample_rate
+    )
+}
 const RIG_CONNECTION_HINT: &str = "Start rigctld for your radio (for example: rigctld -m <model> -r <serial port>), pass --rigctld HOST:PORT if it listens elsewhere, or --no-rigctld if you key with VOX.";
 const RIG_READ_HINT: &str = "rigctld is running but could not read the radio. Check that the radio is on and that rigctld's -m (model), -r (port) and -s (baud) match it.";
 
@@ -136,23 +152,31 @@ fn devices_check(backend: Option<&str>, listing: &Result<Vec<DeviceSupport>>) ->
     }
 }
 
-fn device_checks(direction: Direction, requested: Option<&str>, probe: &DeviceProbe) -> [Check; 2] {
-    let (device_name, format_name, device_hint, format_hint, label) = match direction {
-        Direction::Input => (
-            "input device",
-            "input 48 kHz mono",
-            INPUT_DEVICE_HINT,
-            INPUT_FORMAT_HINT,
-            "input",
-        ),
-        Direction::Output => (
-            "output device",
-            "output 48 kHz mono",
-            OUTPUT_DEVICE_HINT,
-            OUTPUT_FORMAT_HINT,
-            "output",
-        ),
-    };
+fn device_checks(
+    direction: Direction,
+    requested: Option<&str>,
+    probe: &DeviceProbe,
+    engine_rate: u32,
+) -> [Check; 2] {
+    let (device_name, format_name, device_hint, format_hint, ambiguous_hint, label) =
+        match direction {
+            Direction::Input => (
+                "input device",
+                "input format",
+                INPUT_DEVICE_HINT,
+                INPUT_FORMAT_HINT,
+                INPUT_AMBIGUOUS_HINT,
+                "input",
+            ),
+            Direction::Output => (
+                "output device",
+                "output format",
+                OUTPUT_DEVICE_HINT,
+                OUTPUT_FORMAT_HINT,
+                OUTPUT_AMBIGUOUS_HINT,
+                "output",
+            ),
+        };
     match probe {
         DeviceProbe::NoBackend => [
             Check::new(device_name, Outcome::Skip, "no audio backend", None),
@@ -192,7 +216,21 @@ fn device_checks(direction: Direction, requested: Option<&str>, probe: &DevicePr
                 ),
             ]
         }
-        DeviceProbe::Opened { device } => {
+        DeviceProbe::Ambiguous { error } => [
+            Check::new(
+                device_name,
+                Outcome::Fail,
+                error.clone(),
+                Some(ambiguous_hint),
+            ),
+            Check::new(
+                format_name,
+                Outcome::Skip,
+                format!("no single {label} device to open"),
+                None,
+            ),
+        ],
+        DeviceProbe::Opened { device, format } => {
             let detail = match requested {
                 Some(name) if !name.is_empty() => format!("\"{name}\" matched {device}"),
                 _ => format!("system default: {device}"),
@@ -202,7 +240,10 @@ fn device_checks(direction: Direction, requested: Option<&str>, probe: &DevicePr
                 Check::new(
                     format_name,
                     Outcome::Pass,
-                    "opened 1 ch f32 at 48000 Hz (not started)",
+                    format!(
+                        "opened {} (not started)",
+                        describe_format(format, engine_rate)
+                    ),
                     None,
                 ),
             ]
@@ -225,7 +266,7 @@ fn device_checks(direction: Direction, requested: Option<&str>, probe: &DevicePr
                 Check::new(
                     format_name,
                     Outcome::Fail,
-                    format!("could not open 1 ch f32 at 48000 Hz: {error}{reason}"),
+                    format!("could not open: {error}{reason}"),
                     Some(format_hint),
                 ),
             ]
@@ -298,7 +339,12 @@ fn printable(value: &str) -> String {
         .collect()
 }
 
-fn render(backend: Option<&str>, listing: &Result<Vec<DeviceSupport>>, checks: &[Check]) -> String {
+fn render(
+    backend: Option<&str>,
+    listing: &Result<Vec<DeviceSupport>>,
+    checks: &[Check],
+    engine_rate: u32,
+) -> String {
     let mut output = String::new();
     match backend {
         Some(name) => output.push_str(&format!("\nAudio devices ({}):\n", printable(name))),
@@ -315,9 +361,11 @@ fn render(backend: Option<&str>, listing: &Result<Vec<DeviceSupport>>, checks: &
                 for (label, support) in [("input", &device.input), ("output", &device.output)] {
                     let detail = match support {
                         None => "none".to_owned(),
-                        Some(Support::Yes) => "mono 48 kHz yes".to_owned(),
+                        Some(Support::Yes(format)) => {
+                            format!("usable: {}", describe_format(format, engine_rate))
+                        }
                         Some(Support::No(reason)) => {
-                            format!("mono 48 kHz no ({})", printable(reason))
+                            format!("not usable ({})", printable(reason))
                         }
                     };
                     output.push_str(&format!("    {label}:  {detail}\n"));
@@ -387,6 +435,7 @@ pub(crate) fn cmd_doctor(args: &DoctorArgs) -> Result<()> {
             direction,
             requested,
             &coppa_audio::probe_device(direction, requested, rate),
+            rate,
         ));
     }
     checks.extend(if args.no_rigctld {
@@ -394,7 +443,7 @@ pub(crate) fn cmd_doctor(args: &DoctorArgs) -> Result<()> {
     } else {
         rigctld_checks(&args.rigctld)
     });
-    print!("{}", render(backend, &listing, &checks));
+    print!("{}", render(backend, &listing, &checks, rate));
     verdict(&checks)
 }
 
@@ -420,14 +469,14 @@ mod tests {
             check("audio devices", Outcome::Pass, "1 found", None),
             check("input device", Outcome::Pass, "default", None),
             check(
-                "input 48 kHz mono",
+                "input format",
                 Outcome::Fail,
                 "busy",
                 Some(INPUT_FORMAT_HINT),
             ),
             check("output device", Outcome::Pass, "default", None),
             check(
-                "output 48 kHz mono",
+                "output format",
                 Outcome::Fail,
                 "busy",
                 Some(OUTPUT_FORMAT_HINT),
@@ -444,7 +493,7 @@ mod tests {
 
     #[test]
     fn table_has_a_header_and_aligned_columns_in_check_order() {
-        let report = render(Some("ALSA"), &Ok(vec![]), &sample_checks());
+        let report = render(Some("ALSA"), &Ok(vec![]), &sample_checks(), 48_000);
         let lines: Vec<_> = report
             .lines()
             .filter(|line| {
@@ -463,22 +512,22 @@ mod tests {
 
     #[test]
     fn hints_list_only_failed_checks_under_to_fix() {
-        let report = render(Some("ALSA"), &Ok(vec![]), &sample_checks());
+        let report = render(Some("ALSA"), &Ok(vec![]), &sample_checks(), 48_000);
         let hints = report.split("To fix:\n").nth(1).unwrap();
-        assert!(hints.contains("input 48 kHz mono: Coppa records"));
-        assert!(hints.contains("output 48 kHz mono: Coppa plays"));
+        assert!(hints.contains("input format: Coppa records"));
+        assert!(hints.contains("output format: Coppa plays"));
         assert!(hints.contains("rigctld connection: Start rigctld"));
         assert!(!hints.contains("audio backend:"));
     }
 
     #[test]
     fn no_to_fix_block_when_nothing_failed() {
-        assert!(!render(None, &Ok(vec![]), &skipped_rigctld_checks()).contains("To fix:"));
+        assert!(!render(None, &Ok(vec![]), &skipped_rigctld_checks(), 48_000).contains("To fix:"));
     }
 
     #[test]
     fn summary_counts_each_outcome() {
-        assert!(render(None, &Ok(vec![]), &sample_checks())
+        assert!(render(None, &Ok(vec![]), &sample_checks(), 48_000)
             .contains("Summary: 4 passed, 3 failed, 1 skipped"));
     }
 
@@ -503,6 +552,7 @@ mod tests {
             Some("ALSA"),
             &Ok(listing),
             &[check("input device", Outcome::Fail, "bad\nthing", None)],
+            48_000,
         );
         assert!(report.contains("USB\\u{1b}[31m\\n"));
         assert!(report.contains("id\\r"));
@@ -514,17 +564,21 @@ mod tests {
         let listing = vec![DeviceSupport {
             name: "Card".into(),
             id: "alsa:card".into(),
-            input: Some(Support::Yes),
-            output: Some(Support::No("no 1-channel mode; offers 2 ch".into())),
+            input: Some(Support::Yes(OpenedFormat {
+                channels: 2,
+                sample_rate: 44_100,
+            })),
+            output: Some(Support::No("no f32 mode; formats: i16".into())),
         }];
-        let report = render(Some("ALSA"), &Ok(listing), &[]);
-        assert!(report.contains("input:  mono 48 kHz yes"));
-        assert!(report.contains("output:  mono 48 kHz no (no 1-channel mode; offers 2 ch)"));
+        let report = render(Some("ALSA"), &Ok(listing), &[], 48_000);
+        assert!(report
+            .contains("input:  usable: 2 ch f32 at 44100 Hz, channel 0, resampled to 48000 Hz"));
+        assert!(report.contains("output:  not usable (no f32 mode; formats: i16)"));
     }
 
     #[test]
     fn device_listing_without_backend_or_devices() {
-        assert!(render(None, &Ok(vec![]), &[])
+        assert!(render(None, &Ok(vec![]), &[], 48_000)
             .contains("Audio devices: no audio backend in this build\n  (none found)"));
     }
 
@@ -561,10 +615,18 @@ mod tests {
             None,
             &DeviceProbe::Opened {
                 device: "Default Audio Device".into(),
+                format: OpenedFormat {
+                    channels: 1,
+                    sample_rate: 48_000,
+                },
             },
+            48_000,
         );
         assert_eq!(rows[0].detail, "system default: Default Audio Device");
-        assert_eq!(rows[1].detail, "opened 1 ch f32 at 48000 Hz (not started)");
+        assert_eq!(
+            rows[1].detail,
+            "opened 1 ch f32 at 48000 Hz, channel 0 (not started)"
+        );
         assert_eq!(rows[1].outcome, Outcome::Pass);
     }
 
@@ -575,7 +637,12 @@ mod tests {
             Some("CODEC"),
             &DeviceProbe::Opened {
                 device: "USB Audio CODEC".into(),
+                format: OpenedFormat {
+                    channels: 2,
+                    sample_rate: 48_000,
+                },
             },
+            48_000,
         );
         assert_eq!(rows[0].detail, "\"CODEC\" matched USB Audio CODEC");
     }
@@ -588,15 +655,15 @@ mod tests {
             &DeviceProbe::OpenFailed {
                 device: "Card".into(),
                 error: "busy".into(),
-                advertised: Some(Support::No(
-                    "no f32 mono mode at 48000 Hz (formats: i16)".into(),
-                )),
+                advertised: Some(Support::No("no f32 mode; formats: i16".into())),
             },
+            48_000,
         );
         assert_eq!(rows[0].outcome, Outcome::Pass);
-        assert!(rows[1]
-            .detail
-            .contains("busy; device offers no f32 mono mode"));
+        assert_eq!(
+            rows[1].detail,
+            "could not open: busy; device offers no f32 mode; formats: i16"
+        );
     }
 
     #[test]
@@ -607,6 +674,7 @@ mod tests {
             &DeviceProbe::NoMatch {
                 available: vec!["USB Card".into()],
             },
+            48_000,
         );
         assert_eq!(rows[0].outcome, Outcome::Fail);
         assert!(rows[0]
@@ -617,15 +685,56 @@ mod tests {
 
     #[test]
     fn no_default_device_fails_the_device_row_and_skips_the_format_row() {
-        let rows = device_checks(Direction::Input, None, &DeviceProbe::NoDefault);
+        let rows = device_checks(Direction::Input, None, &DeviceProbe::NoDefault, 48_000);
         assert_eq!(rows[0].detail, "the system reports no default input device");
         assert_eq!(rows[1].outcome, Outcome::Skip);
     }
 
     #[test]
     fn without_a_backend_both_device_rows_skip() {
-        let rows = device_checks(Direction::Input, None, &DeviceProbe::NoBackend);
+        let rows = device_checks(Direction::Input, None, &DeviceProbe::NoBackend, 48_000);
         assert!(rows.iter().all(|row| row.outcome == Outcome::Skip));
+    }
+
+    /// COP-64 x COP-59: a stereo device Coppa opens on channel 0 at
+    /// another rate passes, and the row says so.
+    #[test]
+    fn a_stereo_resampled_open_passes_and_says_how() {
+        let rows = device_checks(
+            Direction::Input,
+            None,
+            &DeviceProbe::Opened {
+                device: "USB Audio CODEC".into(),
+                format: OpenedFormat {
+                    channels: 2,
+                    sample_rate: 44_100,
+                },
+            },
+            48_000,
+        );
+        assert_eq!(rows[1].outcome, Outcome::Pass);
+        assert_eq!(
+            rows[1].detail,
+            "opened 2 ch f32 at 44100 Hz, channel 0, resampled to 48000 Hz (not started)"
+        );
+    }
+
+    /// COP-64's resolver refuses an ambiguous name; doctor fails the device
+    /// row with its message instead of opening the first match.
+    #[test]
+    fn an_ambiguous_name_fails_the_device_row_and_skips_the_format_row() {
+        let rows = device_checks(
+            Direction::Output,
+            Some("USB"),
+            &DeviceProbe::Ambiguous {
+                error: "output device name \"USB\" matches 2 devices".into(),
+            },
+            48_000,
+        );
+        assert_eq!(rows[0].outcome, Outcome::Fail);
+        assert!(rows[0].detail.contains("matches 2 devices"));
+        assert!(rows[0].hint.unwrap().contains("--output-device"));
+        assert_eq!(rows[1].outcome, Outcome::Skip);
     }
 
     #[test]

@@ -49,12 +49,12 @@ levelled log lines (coloured only on a terminal; `RUST_LOG` overrides the `info`
 
 ```text
 $ coppa tnc --port 8001 --device coppa-loop-A
- INFO TNC mode kiss_port=8001 sample_rate=48000
+ INFO TNC mode kiss_port=8001 preferred_hardware_rate=48000 engine_rate=48000
  INFO KISS server listening port=8001
  INFO PTT: null (no PTT configured)
- INFO Audio input started sample_rate=48000
+ INFO Audio input started input_hardware_rate=48000 engine_rate=48000
  INFO TNC ready.
- INFO Audio output started sample_rate=48000
+ INFO Audio output started output_hardware_rate=48000 engine_rate=48000
 ```
 
 If it prints `Audio: none (built without the cpal-backend feature; nothing will be sent or
@@ -78,9 +78,10 @@ is also coppa's.
    sudo modprobe snd-aloop
    ```
 
-2. Give each end of the cable its own name. `--device` picks the first device whose name, as
-   `coppa devices` prints it, contains the string you pass, so each end needs a name the other
-   does not contain:
+2. Give each end of the cable its own name. `--device` accepts a unique name
+   substring; if several devices match, Coppa lists their IDs and refuses to
+   choose one. For reliable selection, copy the exact input and output IDs
+   from `coppa devices` into `--input-device-id` and `--output-device-id`:
 
    ```bash
    cat >> ~/.asoundrc <<'EOF'
@@ -95,16 +96,16 @@ is also coppa's.
    $ coppa devices
    Available audio devices:
      …
-     coppa-loop-A (in: …, out: …, max: … Hz)
-     coppa-loop-B (in: …, out: …, max: … Hz)
+     coppa-loop-A [id: <A-id>] (in: …, out: …, max: … Hz)
+     coppa-loop-B [id: <B-id>] (in: …, out: …, max: … Hz)
    ```
 
 4. Start the two TNCs, each in its own terminal. Each prints the startup lines shown under
    [Build](#build) and ends with `TNC ready.` and `Audio output started`.
 
    ```bash
-   coppa tnc --port 8001 --device coppa-loop-A   # terminal 1: TNC A
-   coppa tnc --port 8002 --device coppa-loop-B   # terminal 2: TNC B
+   coppa tnc --port 8001 --input-device-id "<A-id>" --output-device-id "<A-id>" # terminal 1
+   coppa tnc --port 8002 --input-device-id "<B-id>" --output-device-id "<B-id>" # terminal 2
    ```
 
 5. In a third terminal, attach a receiving client to TNC B. It prints each packet B decodes.
@@ -143,6 +144,14 @@ is also coppa's.
 Stop each `kissutil` and TNC with Ctrl-C. To remove the virtual card afterwards, run
 `sudo modprobe -r snd-aloop` and delete the two `coppa_loop` lines from `~/.asoundrc`.
 
+IDs are specific to the audio host and can change if it reconfigures a device.
+Each stream carries mono modem audio on one zero-based channel. Use
+`--input-channel 1` and/or `--output-channel 1` for the second lane of a stereo
+interface; other output lanes remain silent. If hardware cannot run at the
+48 kHz modem rate, Coppa selects a supported rate and converts audio while
+keeping the modem at 48 kHz. An invalid channel or stale ID fails before the
+TNC reports ready.
+
 ## KISS details
 
 - Frames carry no FCS, as the KISS protocol specifies. The TNC adds the FCS on transmit, and
@@ -160,13 +169,18 @@ Stop each `kissutil` and TNC with Ctrl-C. To remove the virtual card afterwards,
 - **`WARNING: No input device matching 'coppa-loop-A', using default`.** No device has that
   name. Check that `~/.asoundrc` holds the two `coppa_loop` lines, that `snd-aloop` is loaded,
   and that `coppa devices` lists `coppa-loop-A` and `coppa-loop-B`.
+- **An ambiguous name lists several IDs.** Copy the desired ID from `coppa devices`
+  and use the corresponding directional ID flag. An explicit ID that is missing
+  or has the wrong direction is an error; it does not use the default device.
 - **The receiving `kissutil` prints nothing.** Check that both TNCs printed `TNC ready.` and
   both `Audio … started` lines, that the receiver is attached to the other TNC's port, and that
-  the two `--device` names are different.
+  the two exact device IDs are different.
 
 ## How this demo was verified
 
-The `coppa` and `kissutil` commands above were run with these ports and device names against a
-userspace stand-in for `snd-aloop` (ALSA `file` PCMs joined by a paced relay), and printed what
-this guide shows; the `modprobe` and `hw:Loopback` lines were not, because the containers this
-was tested in have no sound modules.
+The original name-based `coppa` and `kissutil` demo was run with these ports
+against a userspace stand-in for `snd-aloop` (ALSA `file` PCMs joined by a
+paced relay). Exact ID selection and stereo channel wiring are covered by
+deterministic tests; they still need checking on a physical radio interface.
+The `modprobe` and `hw:Loopback` lines were not run in that container because
+it had no sound modules.

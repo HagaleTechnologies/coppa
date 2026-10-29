@@ -12,9 +12,9 @@ const ROWS: [&str; 8] = [
     "audio backend",
     "audio devices",
     "input device",
-    "input 48 kHz mono",
+    "input format",
     "output device",
-    "output 48 kHz mono",
+    "output format",
     "rigctld connection",
     "rig CAT read",
 ];
@@ -135,6 +135,10 @@ fn record_connection(
     stop: &AtomicBool,
     answer: &str,
 ) {
+    // The listener is non-blocking, and on macOS an accepted socket inherits
+    // that: read_line then returns WouldBlock mid-line, the partial command is
+    // lost and the rest is recorded as "". Read blocking, with a timeout.
+    stream.set_nonblocking(false).expect("blocking fake stream");
     stream
         .set_read_timeout(Some(Duration::from_millis(100)))
         .expect("fake read timeout");
@@ -196,7 +200,15 @@ fn doctor_prints_every_check_in_order_and_its_exit_matches_its_failures() {
         report.starts_with("Checking audio devices and rig control. Nothing is transmitted and PTT is never keyed.\n"),
         "{report}"
     );
-    assert!(report.contains("Audio devices ("), "{report}");
+    // COP-105: the device-list header depends on the audio backend.
+    if cfg!(feature = "cpal-backend") {
+        assert!(report.contains("Audio devices ("), "{report}");
+    } else {
+        assert!(
+            report.contains("Audio devices: no audio backend in this build"),
+            "{report}"
+        );
+    }
     assert!(
         report.contains("CHECK               RESULT  DETAIL"),
         "{report}"
@@ -262,9 +274,10 @@ fn an_unanswering_rig_fails_cat_read_and_gets_no_ptt_command() {
 
 #[test]
 fn unreachable_rigctld_fails_with_exit_1_and_an_error_line() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve port");
-    let address = listener.local_addr().expect("port address").to_string();
-    drop(listener);
+    // Not a reserved-then-dropped ephemeral port: another test's FakeRig in
+    // this binary can be handed that port before doctor connects, and the
+    // check then passes. Nothing listens on TCP port 1.
+    let address = "127.0.0.1:1".to_string();
     let output = run(&["doctor", "--rigctld", &address]);
     let report = stdout(&output);
     assert_eq!(result(&report, "rigctld connection"), "FAIL", "{report}");
@@ -317,14 +330,20 @@ fn an_unmatched_device_name_fails_its_rows_and_never_falls_back() {
     let report = stdout(&output);
     for direction in ["input", "output"] {
         let device_row = format!("{direction} device");
-        let format_row = format!("{direction} 48 kHz mono");
-        assert_eq!(result(&report, &device_row), "FAIL", "{report}");
-        assert!(
-            row(&report, &device_row).contains(&format!(
-                "no {direction} device name contains \"NONEXISTENT_DEVICE_XYZ_12345\""
-            )),
-            "{report}"
-        );
+        let format_row = format!("{direction} format");
+        // COP-105: without a backend nothing is resolved, so both rows skip
+        // (the backend row is the failure that sets the exit code).
+        if cfg!(feature = "cpal-backend") {
+            assert_eq!(result(&report, &device_row), "FAIL", "{report}");
+            assert!(
+                row(&report, &device_row).contains(&format!(
+                    "no {direction} device name contains \"NONEXISTENT_DEVICE_XYZ_12345\""
+                )),
+                "{report}"
+            );
+        } else {
+            assert_eq!(result(&report, &device_row), "SKIP", "{report}");
+        }
         assert_eq!(result(&report, &format_row), "SKIP", "{report}");
     }
     assert_eq!(

@@ -48,7 +48,7 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 - FFT/IFFT via rustfft (`FftProcessor`)
 - FIR design and filtering: the windowed-sinc bandpass the OFDM TX/RX conditioning uses (`design_bandpass`), a Hilbert design, and a streaming FIR
 - Older single-carrier primitives (AGC, a matched pulse-shaping filter, carrier and symbol-timing recovery) that only the legacy `BpskModem` uses; `benches/throughput.rs` also uses the AGC and the pulse-shaping filter directly. See [Legacy code not on the data path](#legacy-code-not-on-the-data-path)
-- There is no sample-rate converter on the audio path, and nothing checks the rate. Every `CoppaProfile` runs at 48 kHz. The daemon hands its `[audio] sample_rate` (default 48000) to the sound card unchanged, and `coppa rx --input` does not compare a WAV file's rate with the engine's. `crates/coppa-audio/src/resampler.rs` is not compiled: `coppa-audio`'s `lib.rs` does not declare it, and the `rubato` crate it imports is in no `Cargo.toml`
+- There is no sample-rate converter on the audio path. Every `CoppaProfile` runs at 48 kHz. The daemon hands its `[audio] sample_rate` (default 48000) to the sound card unchanged, and `coppa rx --input` rejects a WAV file whose rate differs from the engine's. `crates/coppa-audio/src/resampler.rs` is not compiled: `coppa-audio`'s `lib.rs` does not declare it, and the `rubato` crate it imports is in no `Cargo.toml`
 
 #### Codec Layer (`coppa-codec`)
 - **Constellation mappers** with hard and soft (LLR) demapping: `BpskMapper`, `QpskMapper`, `Psk8Mapper`, `Qam16Mapper`, `Qam64Mapper` (SPEC §6.1). These map bits to OFDM carrier values. None of them is a standalone modem

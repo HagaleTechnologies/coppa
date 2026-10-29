@@ -60,8 +60,10 @@ fn devices_json_is_one_array_with_typed_records() {
     }
     for device in value.as_array().unwrap() {
         let object = device.as_object().unwrap();
-        assert_eq!(object.len(), 4);
+        assert_eq!(object.len(), 5);
         assert!(object["name"].is_string());
+        // COP-64: the exact selector ID, or null when the host gives none.
+        assert!(object["id"].is_string() || object["id"].is_null());
         assert!(object["max_sample_rate_hz"].is_u64());
         assert!(object["input_channels"].is_u64());
         assert!(object["output_channels"].is_u64());
@@ -247,6 +249,9 @@ fn rx_json_handles_binary_and_rejects_other_modes() {
     }
 }
 
+/// A recording with no frame writes no JSON. Since COP-54 it is also a
+/// failure (a script must not see success for a file that decoded
+/// nothing), reported on stderr only, so stdout stays empty.
 #[cfg(feature = "file-backend")]
 #[test]
 fn empty_recording_has_empty_json_stdout() {
@@ -257,12 +262,13 @@ fn empty_recording_has_empty_json_stdout() {
     sink.write(&vec![0.0f32; 48_000]).unwrap();
     sink.stop().unwrap();
     let output = run(&["rx", "<path>", "--json"], Some(&wav.0));
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
     assert!(
-        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).contains("no frames decoded"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stdout.is_empty());
 }
 
 #[cfg(feature = "file-backend")]
