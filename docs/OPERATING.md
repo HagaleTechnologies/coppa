@@ -76,6 +76,11 @@ accept `--device-id` and `--output-channel`; `tnc` accepts separate
 `--input-device-id` and `--output-device-id` flags and both channel flags.
 The legacy `--device` name option remains for a unique match. Warnings go to
 stderr, including with `--quiet`, so decoded output on stdout stays clean.
+The CLI reads a device *name* from `coppad.toml` (`[audio] input_device` and
+`output_device`, see the CLI settings section of the getting-started guide),
+but not the `_device_id` keys or the channel keys: pass `--device-id` and the
+channel flag on the command line. A `--device-id` flag replaces any device
+name from the file or `COPPA_DEVICE`.
 
 ## TX level calibration (TUNE)
 

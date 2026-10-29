@@ -597,7 +597,7 @@ impl std::fmt::Display for DeviceSelectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingName { direction, name } => write!(f, "{direction} audio device name {name:?} not found; run `coppa devices` to list available devices"),
-            Self::AmbiguousName { direction, name, candidates } => write!(f, "{direction} device name {name:?} matches {} devices: {}. Use --device-id with an ID from `coppa devices`.", candidates.len(), candidates.join("; ")),
+            Self::AmbiguousName { direction, name, candidates } => write!(f, "{direction} device name {name:?} matches {} devices: {}. Select one by its ID from `coppa devices`: --device-id for coppa rx/tx/tune, --{direction}-device-id for coppa tnc, or [audio] {direction}_device_id in coppad.toml.", candidates.len(), candidates.join("; ")),
             Self::MissingId { direction, id } => write!(f, "{direction} audio device ID {id:?} not found; run `coppa devices` to list available IDs"),
             Self::WrongDirection { direction, id } => write!(f, "{direction} audio device ID {id:?} has no {direction} channels; run `coppa devices` to check directions"),
         }
@@ -1077,6 +1077,16 @@ mod tests {
                 ]
             }
         );
+        // COP-64 validate finding: the hint must name a selector that every
+        // caller of this error accepts, not only the CLI's --device-id.
+        let message = err.to_string();
+        for selector in [
+            "--device-id for coppa rx/tx/tune",
+            "--input-device-id for coppa tnc",
+            "[audio] input_device_id in coppad.toml",
+        ] {
+            assert!(message.contains(selector), "{message}");
+        }
     }
 
     #[test]
