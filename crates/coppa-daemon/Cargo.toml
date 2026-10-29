@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "coppa_daemon"
 path = "src/lib.rs"
 
+[[test]]
+name = "pat_ardop_session"
+required-features = ["ardop"]
+
 [dependencies]
 coppa-engine = { path = "../coppa-engine" }
 # default-features = false: coppa-audio's defaults turn on cpal-backend (ALSA on
@@ -49,5 +53,6 @@ default = []
 cpal-backend = ["coppa-audio/cpal-backend"]
 websocket = ["coppa-host/websocket", "dep:serde_json"]
 kiss-tnc = ["coppa-host/kiss-tnc"]
+ardop = ["coppa-host/ardop"]
 serial-ptt = ["coppa-radio/serial-ptt"]
 gpio-ptt = ["coppa-radio/gpio-ptt"]

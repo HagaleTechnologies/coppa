@@ -1468,6 +1468,7 @@ fn startup_line_states_version_git_sha_and_features() {
     );
     let mut built = Vec::new();
     for (name, on) in [
+        ("ardop", cfg!(feature = "ardop")),
         ("cpal-backend", cfg!(feature = "cpal-backend")),
         ("gpio-ptt", cfg!(feature = "gpio-ptt")),
         ("kiss-tnc", cfg!(feature = "kiss-tnc")),

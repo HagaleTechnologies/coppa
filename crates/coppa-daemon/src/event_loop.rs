@@ -34,14 +34,52 @@ use crate::audio_output::{
 use crate::config::DaemonConfig;
 use crate::level_meter::{self, LevelReading, LevelState, RxLevelMeter};
 use crate::tx_chunker::{chunk_to_fit, next_chunk_len};
+#[cfg(feature = "ardop")]
+use coppa_host::ardop::{
+    queue_response as queue_ardop_response, ArdopCommand, ArdopResponse, Queued as ArdopQueued,
+    COMMAND_QUEUE_DEPTH as ARDOP_COMMAND_QUEUE_DEPTH,
+};
 
 /// Map of connected VARA command-port clients' response senders
 /// (`VaraServer::response_senders()`), used to broadcast `VaraResponse` telemetry.
 type VaraResponseSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<VaraResponse>>>>;
 
+/// COP-97: map of connected ARDOP command-port clients' response senders
+/// (`ArdopServer::response_senders()`), used to push ARDOP state lines and
+/// telemetry.
+#[cfg(feature = "ardop")]
+type ArdopResponseSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<ArdopResponse>>>>;
+
+/// Host settings are local to one ARDOP command connection. A busy
+/// refusal must not make that host believe it owns the established link.
+#[cfg(feature = "ardop")]
+struct ArdopClientState {
+    initialized: bool,
+    refused: bool,
+    arqbw: String,
+    settings: HashMap<String, String>,
+}
+
+#[cfg(feature = "ardop")]
+impl Default for ArdopClientState {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            refused: false,
+            arqbw: "500MAX".into(),
+            settings: HashMap::new(),
+        }
+    }
+}
+
 /// Map of connected VARA data-port clients' data senders
 /// (`VaraServer::data_senders()`), used by [`forward_data_out`].
 pub type VaraDataSenders = Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>;
+
+/// Every enabled data-carrying surface's data senders (COP-97: the VARA
+/// map, and the ARDOP map when that surface is enabled), each entry one
+/// [`VaraDataSenders`]. One `DataOut` fan-out drains them all.
+pub type DataOutSenders = Vec<VaraDataSenders>;
 
 /// How often every command-port client hears `IAMALIVE`. VARA sends it every
 /// 60 s; Pat closes the modem after 2 minutes without a line, and vARIM after
@@ -279,6 +317,39 @@ fn queue_for_client(
     }
 }
 
+/// COP-97: `queue_for_client`'s ARDOP twin — queue one `ArdopResponse` for
+/// one ARDOP command-port client without waiting, disconnecting (by having
+/// the caller drop the sender) a client that cannot take a state line.
+#[cfg(feature = "ardop")]
+fn queue_ardop_for_client(
+    client_id: u32,
+    tx: &mpsc::Sender<ArdopResponse>,
+    response: ArdopResponse,
+) -> bool {
+    match queue_ardop_response(tx, response) {
+        ArdopQueued::Overflow(line) => {
+            tracing::warn!(
+                client_id,
+                line = line.format().trim_end(),
+                depth = ARDOP_COMMAND_QUEUE_DEPTH,
+                "ARDOP command-port client is not reading; disconnecting it"
+            );
+            false
+        }
+        ArdopQueued::Sent | ArdopQueued::Dropped | ArdopQueued::Closed => true,
+    }
+}
+
+/// COP-97 (P3): true for client IDs in the ARDOP namespaces (command
+/// `0xC000_0001`+, data `0xA000_0001`+). Both sit above every other
+/// surface's range (VARA command 1+, WebSocket `0x4000_0001`+, VARA data
+/// `0x8000_0001`+), so one comparison routes a host event's replies to the
+/// right surface.
+#[cfg(feature = "ardop")]
+fn is_ardop_client(client_id: u32) -> bool {
+    client_id >= coppa_host::ardop::FIRST_ARDOP_DATA_CLIENT_ID
+}
+
 /// Queue `response` for every client in `senders` without waiting. `BUSY` and
 /// `SNR` may be dropped for a client that is falling behind; any other line
 /// that does not fit disconnects that client (`queue_for_client`).
@@ -310,25 +381,33 @@ fn queue_data_for_client(client_id: u32, tx: &mpsc::Sender<Vec<u8>>, data: Vec<u
 }
 
 /// Forward every decoded payload the event loop sends on `responses` to the
-/// data-port clients in `senders`: a `client_id` of 0 goes to every client,
-/// any other to that client alone. It never waits on a client, so one host
-/// that stops reading holds up neither the other clients nor the event
-/// loop's queue; that host is disconnected instead (`queue_data_for_client`).
-/// Returns when every sender for `responses` is dropped.
+/// data-port clients of every surface in `senders`: a `client_id` of 0 goes
+/// to every client, any other to that client alone. It never waits on a
+/// client, so one host that stops reading holds up neither the other
+/// clients nor the event loop's queue; that host is disconnected instead
+/// (`queue_data_for_client`). Returns when every sender for `responses` is
+/// dropped.
+///
+/// COP-97: `senders` is a fan-out list — one entry per enabled data-carrying
+/// surface (VARA, ARDOP) — so both data ports are fed by the single channel
+/// `set_response_tx` registered, and every-queue semantics are kept by
+/// draining it in exactly one task.
 pub async fn forward_data_out(
     mut responses: mpsc::UnboundedReceiver<HostResponse>,
-    senders: VaraDataSenders,
+    senders: DataOutSenders,
 ) {
     while let Some(response) = responses.recv().await {
         // StatusUpdate is deliberately not forwarded: EventLoop::notify_session
         // pushes session state directly to the command port and WebSocket.
         if let HostResponse::DataOut { client_id, data } = response {
-            let mut senders = senders.lock().await;
-            if client_id == 0 {
-                senders.retain(|&id, tx| queue_data_for_client(id, tx, data.clone()));
-            } else if let Some(tx) = senders.get(&client_id) {
-                if !queue_data_for_client(client_id, tx, data) {
-                    senders.remove(&client_id);
+            for senders in &senders {
+                let mut senders = senders.lock().await;
+                if client_id == 0 {
+                    senders.retain(|&id, tx| queue_data_for_client(id, tx, data.clone()));
+                } else if let Some(tx) = senders.get(&client_id) {
+                    if !queue_data_for_client(client_id, tx, data.clone()) {
+                        senders.remove(&client_id);
+                    }
                 }
             }
         }
@@ -364,8 +443,10 @@ enum SessionNotice {
     /// A session ended or a connect attempt failed.
     Disconnected,
     /// COP-44: a remote station's CONNECT_REQ was accepted; the handshake
-    /// waits for its CONNECT_CFM.
-    Pending,
+    /// waits for its CONNECT_CFM. The local address is the target that the
+    /// ARDOP interface announces as `TARGET <local>` (COP-97), which
+    /// Pat's listen mode requires before `CONNECTED`.
+    Pending { local: Callsign },
     /// COP-44: the inbound handshake `Pending` announced ended without
     /// `Connected`.
     PendingCancelled,
@@ -588,6 +669,15 @@ pub struct EventLoop {
     /// broadcasting `VaraResponse` telemetry (SNR/PTT/BUFFER/BUSY — decision 8).
     /// Wired by `main.rs` from `VaraServer::response_senders()`.
     vara_responses: Option<VaraResponseSenders>,
+    /// COP-97: optional map of connected ARDOP command-port clients' response
+    /// senders, for pushing `NEWSTATE`/`CONNECTED`/`TARGET`/`DISCONNECTED`/
+    /// `BUSY`/`PTT`/`BUFFER` lines and answering commands. Wired by
+    /// `main.rs` from `ArdopServer::response_senders()`.
+    #[cfg(feature = "ardop")]
+    ardop_responses: Option<ArdopResponseSenders>,
+    /// Per-command-client labels, initialization and busy refusal state.
+    #[cfg(feature = "ardop")]
+    ardop_clients: HashMap<u32, ArdopClientState>,
     /// Outbound raw payload bytes queued for encode+transmit (the sessionless
     /// raw/ARQ `HostEvent::DataReceived` TX path, enabled by
     /// `[host] sessionless_tx_enabled`), tagged with the ARQ seq
@@ -872,6 +962,10 @@ impl EventLoop {
             #[cfg(feature = "websocket")]
             ws_status: None,
             vara_responses: None,
+            #[cfg(feature = "ardop")]
+            ardop_responses: None,
+            #[cfg(feature = "ardop")]
+            ardop_clients: HashMap::new(),
             tx_queue: VecDeque::new(),
             session_link: None,
             pending_disconnect: None,
@@ -1349,6 +1443,14 @@ impl EventLoop {
         self.vara_responses = Some(senders);
     }
 
+    /// COP-97: wire the ARDOP command-port response senders
+    /// (`ArdopServer::response_senders()`), the ARDOP twin of
+    /// [`EventLoop::set_vara_responses`].
+    #[cfg(feature = "ardop")]
+    pub fn set_ardop_responses(&mut self, senders: ArdopResponseSenders) {
+        self.ardop_responses = Some(senders);
+    }
+
     /// Broadcast one `VaraResponse` to every connected VARA command-port client, if
     /// any are wired up (`set_vara_responses`). A no-op if telemetry hasn't been
     /// wired. Never waits: a client that falls behind may miss `BUSY`/`SNR`, and
@@ -1379,6 +1481,38 @@ impl EventLoop {
             return;
         };
         if !queue_for_client(client_id, tx, response) {
+            senders.remove(&client_id);
+        }
+    }
+
+    /// COP-97: broadcast one `ArdopResponse` to every connected ARDOP
+    /// command-port client (`NEWSTATE`/`CONNECTED`/telemetry pushes), if any
+    /// are wired up. Same never-wait, disconnect-rather-than-drop policy as
+    /// `emit_vara`.
+    #[cfg(feature = "ardop")]
+    async fn emit_ardop(&self, response: ArdopResponse) {
+        if let Some(ref senders) = self.ardop_responses {
+            senders
+                .lock()
+                .await
+                .retain(|&id, tx| queue_ardop_for_client(id, tx, response.clone()));
+        }
+    }
+
+    /// COP-97: send `response` to the ARDOP command-port client that sent
+    /// the command it answers, the ARDOP twin of `reply_vara`. An ARDOP
+    /// client ID finds no VARA sender and vice versa (disjoint namespaces),
+    /// so a reply can never land on the wrong surface.
+    #[cfg(feature = "ardop")]
+    async fn reply_ardop(&self, client_id: u32, response: ArdopResponse) {
+        let Some(ref senders) = self.ardop_responses else {
+            return;
+        };
+        let mut senders = senders.lock().await;
+        let Some(tx) = senders.get(&client_id) else {
+            return;
+        };
+        if !queue_ardop_for_client(client_id, tx, response) {
             senders.remove(&client_id);
         }
     }
@@ -1417,7 +1551,10 @@ impl EventLoop {
                 )
             }
             SessionNotice::Disconnected => ("DISCONNECTED".to_string(), VaraResponse::Disconnected),
-            SessionNotice::Pending => ("PENDING".to_string(), VaraResponse::Pending),
+            SessionNotice::Pending { local } => {
+                tracing::debug!(local = %local, "Inbound session pending");
+                ("PENDING".to_string(), VaraResponse::Pending)
+            }
             SessionNotice::PendingCancelled => {
                 ("CANCELPENDING".to_string(), VaraResponse::CancelPending)
             }
@@ -1429,6 +1566,68 @@ impl EventLoop {
         // connect or disconnect timer, so a host that cannot take it is
         // disconnected instead (`broadcast_vara`).
         self.emit_vara(vara).await;
+        // COP-97: the same session state in ARDOP vocabulary. `CONNECTED`'s
+        // bandwidth token echoes the stored `ARQBW` label (P7); `NEWSTATE`
+        // keeps real TNCs' trailing space; `TARGET` precedes an inbound
+        // `CONNECTED` because Pat's listen mode requires it (research §1.3);
+        // a cancelled pending inbound handshake clears back to DISCONNECTED.
+        #[cfg(feature = "ardop")]
+        {
+            let ardop = match &notice {
+                SessionNotice::Connected {
+                    remote, we_called, ..
+                } => vec![
+                    ArdopResponse::Connected(remote.to_string(), String::new()),
+                    ArdopResponse::NewState(if *we_called { "ISS" } else { "IRS" }.to_string()),
+                ],
+                SessionNotice::Disconnected => vec![
+                    ArdopResponse::Disconnected,
+                    ArdopResponse::NewState("DISC".to_string()),
+                ],
+                SessionNotice::Pending { local } => {
+                    // TARGET is our called address, not the caller. Pat uses it
+                    // as the accepted connection's local address.
+                    vec![
+                        ArdopResponse::Target(local.to_string()),
+                        ArdopResponse::NewState("IRS".to_string()),
+                    ]
+                }
+                SessionNotice::PendingCancelled => {
+                    // The terminal notification must clear the host's
+                    // remembered TARGET: wl2k-go's listener drops its
+                    // pending target only on DISCONNECTED or CANCELPENDING,
+                    // never on NEWSTATE, so a bare NEWSTATE DISC would leave
+                    // the target stale and the still-listening client would
+                    // accept its own later outbound dial as inbound
+                    // (validation PC-1/CR-1). DISCONNECTED clears it;
+                    // NEWSTATE DISC still reports the state.
+                    vec![
+                        ArdopResponse::Disconnected,
+                        ArdopResponse::NewState("DISC".to_string()),
+                    ]
+                }
+            };
+            for response in ardop {
+                if let ArdopResponse::Connected(remote, _) = &response {
+                    if let Some(senders) = &self.ardop_responses {
+                        senders.lock().await.retain(|&id, tx| {
+                            let bw = self
+                                .ardop_clients
+                                .get(&id)
+                                .map(|state| state.arqbw.as_str())
+                                .unwrap_or("500MAX");
+                            queue_ardop_for_client(
+                                id,
+                                tx,
+                                ArdopResponse::Connected(remote.clone(), bw.to_string()),
+                            )
+                        });
+                    }
+                } else {
+                    self.emit_ardop(response).await;
+                }
+            }
+        }
         #[cfg(feature = "websocket")]
         {
             let msg = match notice {
@@ -1440,7 +1639,7 @@ impl EventLoop {
                 SessionNotice::Disconnected => coppa_host::websocket::WsServerMessage::Disconnected,
                 // The WebSocket API has no LISTEN, so it never takes part in
                 // an inbound attempt.
-                SessionNotice::Pending | SessionNotice::PendingCancelled => return,
+                SessionNotice::Pending { .. } | SessionNotice::PendingCancelled => return,
             };
             let remote = self.established_remote();
             if let Some(ref status) = self.ws_status {
@@ -1565,6 +1764,11 @@ impl EventLoop {
         if bytes != self.last_reported_buffer {
             self.last_reported_buffer = bytes;
             self.emit_vara(VaraResponse::Buffer(bytes)).await;
+            // COP-97: the same unacked-byte count in ARDOP vocabulary
+            // (Pat's ARDOP `Flush` waits on `BUFFER 0` exactly as its VARA
+            // one does).
+            #[cfg(feature = "ardop")]
+            self.emit_ardop(ArdopResponse::Buffer(bytes)).await;
         }
     }
 
@@ -2500,6 +2704,8 @@ impl EventLoop {
             }
             HostEvent::Disconnected { client_id } => {
                 tracing::info!(client_id, "Client disconnected");
+                #[cfg(feature = "ardop")]
+                self.ardop_clients.remove(&client_id);
             }
             HostEvent::DataReceived { client_id, data } => {
                 tracing::debug!(client_id, bytes = data.len(), "Data received from client");
@@ -2628,21 +2834,45 @@ impl EventLoop {
                     _ => {}
                 }
             }
+            HostEvent::ArdopCommand { client_id, command } => {
+                tracing::debug!(client_id, command = %command, "ARDOP command received");
+                #[cfg(feature = "ardop")]
+                self.handle_ardop_command(client_id, &command).await;
+                // Without the feature no ARDOP server exists to produce the
+                // event; the arm keeps the match exhaustive anyway.
+                #[cfg(not(feature = "ardop"))]
+                let _ = (client_id, &command);
+            }
             HostEvent::ConnectRequest {
                 client_id,
                 source: _,
                 destination,
             } => {
                 tracing::info!(client_id, destination = %destination, "Connect request");
-                // Reply first (never WRONG: Pat's dial waits only on
-                // CONNECTED/DISCONNECTED), before every early-return
-                // DISCONNECTED and before the CONNECT_REQ goes on air.
-                self.reply_vara(client_id, VaraResponse::Ok).await;
+                // COP-97: the two command surfaces ack a dial in their own
+                // vocabulary. VARA answers `OK` before the outcome; ARDOP
+                // does not echo `ARQCALL` at all — the outcome (or the
+                // refusal) follows (§Design/2).
+                #[cfg(feature = "ardop")]
+                let ardop_dial = is_ardop_client(client_id);
+                #[cfg(not(feature = "ardop"))]
+                let ardop_dial = false;
+                if !ardop_dial {
+                    // Reply first (never WRONG: Pat's dial waits only on
+                    // CONNECTED/DISCONNECTED), before every early-return
+                    // DISCONNECTED and before the CONNECT_REQ goes on air.
+                    self.reply_vara(client_id, VaraResponse::Ok).await;
+                }
 
                 let local = match self.local_callsign {
                     Some(ref cs) => cs.clone(),
                     None => {
                         tracing::warn!("Connect request but no local callsign configured");
+                        if ardop_dial {
+                            #[cfg(feature = "ardop")]
+                            self.reply_ardop(client_id, ArdopResponse::Fault("no callsign".into()))
+                                .await;
+                        }
                         self.notify_session(client_id, SessionNotice::Disconnected)
                             .await;
                         return;
@@ -2653,6 +2883,14 @@ impl EventLoop {
                     Ok(cs) => cs,
                     Err(e) => {
                         tracing::warn!(error = %e, "Invalid destination callsign");
+                        if ardop_dial {
+                            #[cfg(feature = "ardop")]
+                            self.reply_ardop(
+                                client_id,
+                                ArdopResponse::Fault("invalid callsign".into()),
+                            )
+                            .await;
+                        }
                         self.notify_session(client_id, SessionNotice::Disconnected)
                             .await;
                         return;
@@ -2677,27 +2915,63 @@ impl EventLoop {
                 // dialling again. Only the dialling client hears the
                 // refusal: the session that caused it is still up, and
                 // `notify_session` would tell every host it had ended.
+                //
+                // COP-97 (scenario 2, P9): the refusal is routed by surface.
+                // A VARA dial keeps today's client-scoped `DISCONNECTED`;
+                // an ARDOP dial gets `FAULT busy` + a client-scoped
+                // `NEWSTATE DISC ` — the vocabulary Pat's `arqCall`
+                // already treats as refusal (no busy token exists in the
+                // ARDOP protocol).
                 if let Some(active) = self.active_session_remote() {
                     tracing::warn!(
                         destination = %remote, active = %active,
                         "Connect request refused: another session is active"
                     );
-                    if let Some(ref tx) = self.response_tx {
-                        let _ = tx.send(HostResponse::StatusUpdate {
-                            client_id,
-                            status: "DISCONNECTED".to_string(),
-                        });
+                    if ardop_dial {
+                        #[cfg(feature = "ardop")]
+                        {
+                            self.ardop_clients.entry(client_id).or_default().refused = true;
+                            self.reply_ardop(client_id, ArdopResponse::Fault("busy".into()))
+                                .await;
+                            self.reply_ardop(
+                                client_id,
+                                ArdopResponse::NewState("DISC".to_string()),
+                            )
+                            .await;
+                        }
+                    } else {
+                        if let Some(ref tx) = self.response_tx {
+                            let _ = tx.send(HostResponse::StatusUpdate {
+                                client_id,
+                                status: "DISCONNECTED".to_string(),
+                            });
+                        }
+                        self.reply_vara(client_id, VaraResponse::Disconnected).await;
                     }
-                    self.reply_vara(client_id, VaraResponse::Disconnected).await;
                     return;
                 }
 
+                #[cfg(feature = "ardop")]
+                if ardop_dial {
+                    self.ardop_clients.entry(client_id).or_default().refused = false;
+                }
                 let caps = LinkCapabilities::default();
                 match self.session_mgr.create(local, remote.clone(), 0, caps) {
                     Ok(id) => {
                         if let Some(session) = self.session_mgr.get_mut(id) {
                             match session.initiate() {
                                 Ok(req_pdu) => {
+                                    // COP-97: an accepted ARDOP dial enters
+                                    // the outbound handshake state (ISS) —
+                                    // refused dials never enter it (P9).
+                                    if ardop_dial {
+                                        #[cfg(feature = "ardop")]
+                                        self.reply_ardop(
+                                            client_id,
+                                            ArdopResponse::NewState("ISS".to_string()),
+                                        )
+                                        .await;
+                                    }
                                     let pdu_bytes = req_pdu.to_bytes();
                                     match self.engine.encode_bytes(&pdu_bytes) {
                                         Ok(samples) => self.transmit_samples(&samples).await,
@@ -2730,11 +3004,23 @@ impl EventLoop {
             }
             HostEvent::DisconnectRequest { client_id } => {
                 tracing::info!(client_id, "Disconnect request");
+                // COP-97: VARA answers `OK`; ARDOP echoes the command (the
+                // echo-as-ack policy Pat's `set()` accepts), then the
+                // `DISCONNECTED`/`NEWSTATE DISC ` outcome follows
+                // from `end_session`.
+                #[cfg(feature = "ardop")]
+                if is_ardop_client(client_id) {
+                    self.reply_ardop(client_id, ArdopResponse::Echo("DISCONNECT".into()))
+                        .await;
+                } else {
+                    self.reply_vara(client_id, VaraResponse::Ok).await;
+                }
+                #[cfg(not(feature = "ardop"))]
                 self.reply_vara(client_id, VaraResponse::Ok).await;
 
                 // Find the first active session. One already `Disconnecting`
                 // is skipped, so a repeated DISCONNECT changes nothing: the
-                // host gets `OK` now and one `DISCONNECTED` later (COP-43).
+                // host gets its ack now and one `DISCONNECTED` later (COP-43).
                 let session_id = self
                     .session_mgr
                     .active_sessions()
@@ -2794,11 +3080,260 @@ impl EventLoop {
                         }
                         None => {}
                     }
-                } else {
+                } else if self.live_session_id().is_none() {
                     tracing::debug!("Disconnect request but no active session");
+                    #[cfg(feature = "ardop")]
+                    if is_ardop_client(client_id) {
+                        // Pat may close again after receiving the peer's close.
+                        // An idle close still needs a terminal outcome.
+                        self.reply_ardop(client_id, ArdopResponse::Disconnected)
+                            .await;
+                        self.reply_ardop(client_id, ArdopResponse::NewState("DISC".into()))
+                            .await;
+                    }
                 }
             }
         }
+    }
+
+    /// COP-97: parse and act on one ARDOP command-port line (P5: the echo/
+    /// `WRONG` policy lives here, next to the VARA one it mirrors, not in
+    /// the port). `ARQCALL`/`DISCONNECT` never arrive here — the command
+    /// server turns them into `ConnectRequest`/`DisconnectRequest`.
+    ///
+    /// The reply rule, one row per command the parser can produce:
+    ///
+    /// - `INITIALIZE`, `CODEC x`, `PROTOCOLMODE x`, `ARQTIMEOUT n`,
+    ///   `GRIDSQUARE x`, `CWID x` and the accepted-and-echoed periphery →
+    ///   the echo (recorded where noted; nothing coppa does not honestly
+    ///   model is emulated — `ARQTIMEOUT` does not change the COP-38 budget,
+    ///   `ARQBW` does not change the speed ladder).
+    /// - `MYCALL <call>` valid → echo (and the daemon applies it as the
+    ///   runtime callsign); invalid or missing → `WRONG`.
+    /// - `LISTEN TRUE|FALSE` → echo (and the daemon applies it).
+    /// - `STATE` → `STATE <state>` using Pat's DISC/ISS/IRS words.
+    /// - `VERSION` → `VERSION Coppa <pkg>`, never an echo.
+    /// - `SENDID` → echo, then a real station-ID frame via the beacon path
+    ///   (P8) — or `FAULT` when no callsign is set or the channel is busy.
+    /// - anything else → `WRONG`.
+    #[cfg(feature = "ardop")]
+    async fn handle_ardop_command(&mut self, client_id: u32, line: &str) {
+        let client = self.ardop_clients.entry(client_id).or_default();
+        let query = match line.trim().to_uppercase().as_str() {
+            "MYCALL" => Some(match self.local_callsign.as_ref() {
+                Some(call) => ArdopResponse::Echo(format!("MYCALL {call}")),
+                None => ArdopResponse::Fault("no callsign".into()),
+            }),
+            "ARQBW" => Some(ArdopResponse::Echo(format!("ARQBW {}", client.arqbw))),
+            key => client
+                .settings
+                .get(key)
+                .map(|value| ArdopResponse::Echo(format!("{key} {value}"))),
+        };
+        if let Some(response) = query {
+            self.reply_ardop(client_id, response).await;
+            return;
+        }
+        let command = ArdopCommand::parse(line);
+        if matches!(
+            command,
+            ArdopCommand::Codec(_)
+                | ArdopCommand::ProtocolMode(_)
+                | ArdopCommand::ArqTimeout(_)
+                | ArdopCommand::GridSquare(_)
+                | ArdopCommand::CwId(_)
+        ) {
+            if let Some((key, value)) = line.trim().split_once(' ') {
+                self.ardop_clients
+                    .entry(client_id)
+                    .or_default()
+                    .settings
+                    .insert(key.to_uppercase(), value.trim().to_string());
+            }
+        }
+        // The accepted-and-echoed periphery first: one rule, the raw line
+        // back, no semantics emulated (`is_echo_only` is the same split
+        // `docs/ARDOP.md` prints).
+        if command.is_echo_only() {
+            self.reply_ardop(client_id, ArdopResponse::Echo(line.to_string()))
+                .await;
+            return;
+        }
+        match command {
+            ArdopCommand::Initialize => {
+                self.ardop_clients.entry(client_id).or_default().initialized = true;
+                self.reply_ardop(client_id, ArdopResponse::Echo(line.to_string()))
+                    .await;
+            }
+            ArdopCommand::State => {
+                let state = self.ardop_state_word(client_id);
+                self.reply_ardop(client_id, ArdopResponse::Echo(format!("STATE {state}")))
+                    .await;
+            }
+            ArdopCommand::Codec(on) => {
+                tracing::debug!(on, "ARQ CODEC recorded; coppa models no codec gate");
+                self.reply_ardop(client_id, ArdopResponse::Echo(line.to_string()))
+                    .await;
+            }
+            ArdopCommand::ProtocolMode(mode) => {
+                tracing::debug!(%mode, "PROTOCOLMODE recorded; coppa speaks ARQ only");
+                self.reply_ardop(client_id, ArdopResponse::Echo(line.to_string()))
+                    .await;
+            }
+            ArdopCommand::ArqTimeout(seconds) => {
+                tracing::debug!(
+                    seconds,
+                    "ARQTIMEOUT recorded, not enforced; COP-38 owns the retry budget"
+                );
+                self.reply_ardop(client_id, ArdopResponse::Echo(line.to_string()))
+                    .await;
+            }
+            ArdopCommand::Listen(on) => {
+                self.listening = on;
+                if on {
+                    tracing::info!("Listening for incoming connections");
+                } else {
+                    tracing::info!("Stopped listening for incoming connections");
+                }
+                self.reply_ardop(client_id, ArdopResponse::Echo(line.to_string()))
+                    .await;
+            }
+            ArdopCommand::MyCall(call) => match Callsign::new(&call) {
+                Ok(callsign) => {
+                    tracing::info!(callsign = %callsign, "Local callsign set by MYCALL");
+                    self.local_callsign = Some(callsign);
+                    self.reply_ardop(client_id, ArdopResponse::Echo(line.to_string()))
+                        .await;
+                }
+                // Reply WRONG and keep the callsign in force (the VARA
+                // MYCALL precedent).
+                Err(e) => {
+                    tracing::warn!(callsign = %call, error = %e, "MYCALL rejected");
+                    self.reply_ardop(client_id, ArdopResponse::Wrong).await;
+                }
+            },
+            ArdopCommand::GridSquare(grid) => {
+                tracing::debug!(%grid, "GRIDSQUARE recorded; unused by ARQ");
+                self.reply_ardop(client_id, ArdopResponse::Echo(line.to_string()))
+                    .await;
+            }
+            ArdopCommand::ArqBw(bw) => {
+                tracing::debug!(%bw, "ARQBW recorded as a label; coppa's speed ladder is unchanged");
+                self.ardop_clients.entry(client_id).or_default().arqbw = bw;
+                self.reply_ardop(client_id, ArdopResponse::Echo(line.to_string()))
+                    .await;
+            }
+            ArdopCommand::Version => {
+                self.reply_ardop(client_id, ArdopResponse::coppa_version())
+                    .await;
+            }
+            ArdopCommand::SendId => {
+                // P8: a real station-ID frame through the beacon path, under
+                // the same gates `maybe_send_beacon` uses. Refused with
+                // `FAULT` when no callsign is set or the channel is busy.
+                self.reply_ardop(client_id, ArdopResponse::Echo(line.to_string()))
+                    .await;
+                if self.local_callsign.is_none() {
+                    tracing::warn!(client_id, "{NO_CALLSIGN_TX_REFUSAL}");
+                    self.reply_ardop(client_id, ArdopResponse::Fault("no callsign".into()))
+                        .await;
+                    return;
+                }
+                if self.busy_gate.current() {
+                    self.reply_ardop(client_id, ArdopResponse::Fault("busy".into()))
+                        .await;
+                    return;
+                }
+                if let Some(samples) = self.encode_id_beacon_frame() {
+                    let id_before = self.last_id_time.replace(Instant::now());
+                    let generation = self.tx_generation;
+                    self.transmit_samples(&samples).await;
+                    if self.tx_generation == generation {
+                        // Refused (nothing keyed, `tx_generation` alone): no
+                        // ID went out, so an owed ID stays owed.
+                        self.last_id_time = id_before;
+                        self.reply_ardop(client_id, ArdopResponse::Fault("busy".into()))
+                            .await;
+                    }
+                } else {
+                    self.reply_ardop(client_id, ArdopResponse::Fault("no callsign".into()))
+                        .await;
+                }
+            }
+            // The command server intercepts these two; a parse that reaches
+            // here anyway is answered like an unknown verb.
+            ArdopCommand::ArqCall { .. } | ArdopCommand::Disconnect => {
+                self.reply_ardop(client_id, ArdopResponse::Wrong).await;
+            }
+            // A pending connect attempt (outbound or inbound) ends through
+            // the same teardown path as DISCONNECT (COP-44); the
+            // `DISCONNECTED`/`NEWSTATE DISC ` outcome follows from
+            // `end_session`.
+            ArdopCommand::CancelPending => {
+                self.reply_ardop(client_id, ArdopResponse::Echo(line.to_string()))
+                    .await;
+                let pending = self
+                    .session_mgr
+                    .active_sessions()
+                    .iter()
+                    .find(|&&id| {
+                        self.session_mgr
+                            .get(id)
+                            .map(|s| {
+                                matches!(
+                                    s.state,
+                                    SessionState::Connecting | SessionState::Accepting
+                                )
+                            })
+                            .unwrap_or(false)
+                    })
+                    .copied();
+                if let Some(id) = pending {
+                    self.end_session(id, client_id).await;
+                }
+            }
+            ArdopCommand::CwId(on) => {
+                tracing::debug!(on, "CWID recorded; coppa keys no Morse ID");
+                self.reply_ardop(client_id, ArdopResponse::Echo(line.to_string()))
+                    .await;
+            }
+            ArdopCommand::Echo(_) | ArdopCommand::Unknown(_) => {
+                self.reply_ardop(client_id, ArdopResponse::Wrong).await;
+            }
+        }
+    }
+
+    /// COP-97 (P6): the `STATE` reply word. `OFFLINE` before `INITIALIZE`
+    /// or with no callsign (a real TNC is offline until its host initializes
+    /// it and it has an identity); `ISS` with an established session;
+    /// `ISS`/`IRS` while an outbound/inbound handshake is under way (and
+    /// through the session, as real TNCs report the traffic role);
+    /// `DISC` otherwise.
+    #[cfg(feature = "ardop")]
+    fn ardop_state_word(&self, client_id: u32) -> String {
+        let Some(client) = self.ardop_clients.get(&client_id) else {
+            return "OFFLINE".to_string();
+        };
+        if !client.initialized || self.local_callsign.is_none() {
+            return "OFFLINE".to_string();
+        }
+        if client.refused {
+            return "DISC".to_string();
+        }
+        for id in self.session_mgr.active_sessions() {
+            let Some(session) = self.session_mgr.get(id) else {
+                continue;
+            };
+            match session.state {
+                SessionState::Established => return "ISS".to_string(),
+                // Outbound handshake (CONNECT_REQ sent) reports ISS; inbound
+                // (CONNECT_ACK sent, awaiting CFM) reports IRS.
+                SessionState::Connecting | SessionState::Disconnecting => return "ISS".to_string(),
+                SessionState::Accepting => return "IRS".to_string(),
+                SessionState::Idle => {}
+            }
+        }
+        "DISC".to_string()
     }
 
     async fn handle_audio_in(&mut self, samples: &[f32]) {
@@ -2819,6 +3354,8 @@ impl EventLoop {
         // Only emits telemetry on an actual BUSY ON/OFF transition.
         if let Some(new_state) = self.busy_gate.observe(samples) {
             self.emit_vara(VaraResponse::Busy(new_state)).await;
+            #[cfg(feature = "ardop")]
+            self.emit_ardop(ArdopResponse::Busy(new_state)).await;
         }
         self.observe_rx_level(samples);
     }
@@ -4962,7 +5499,13 @@ impl EventLoop {
                             // COP-44: announce the attempt before the ACK,
                             // whose busy-channel wait can last seconds.
                             if !replaced {
-                                self.notify_session(0, SessionNotice::Pending).await;
+                                self.notify_session(
+                                    0,
+                                    SessionNotice::Pending {
+                                        local: pdu.dest.clone(),
+                                    },
+                                )
+                                .await;
                             }
                             let ack_bytes = ack_pdu.to_bytes();
                             match self.engine.encode_bytes(&ack_bytes) {
@@ -5291,6 +5834,8 @@ impl EventLoop {
         // Telemetry: VaraResponse::Ptt at the same moment physical PTT changes
         // (decision 8), not a separately-timed emission.
         self.emit_vara(VaraResponse::Ptt(tx)).await;
+        #[cfg(feature = "ardop")]
+        self.emit_ardop(ArdopResponse::Ptt(tx)).await;
         if tx {
             self.is_transmitting = true;
             // COP-31: every keying path starts the keyed-interval clock the
@@ -18070,7 +18615,7 @@ mod tests {
             let senders: VaraDataSenders =
                 Arc::new(Mutex::new(HashMap::from([(CLIENT, client_tx)])));
             let (tx, rx) = mpsc::unbounded_channel();
-            let bridge = tokio::spawn(forward_data_out(rx, senders.clone()));
+            let bridge = tokio::spawn(forward_data_out(rx, vec![senders.clone()]));
 
             let payloads = numbered(DATA_QUEUE_DEPTH);
             for (i, payload) in payloads.iter().enumerate() {
@@ -18102,7 +18647,7 @@ mod tests {
                 (STUCK, stuck_tx),
             ])));
             let (tx, rx) = mpsc::unbounded_channel();
-            let bridge = tokio::spawn(forward_data_out(rx, senders.clone()));
+            let bridge = tokio::spawn(forward_data_out(rx, vec![senders.clone()]));
 
             let payloads = numbered(DATA_QUEUE_DEPTH + 10);
             for payload in &payloads {
@@ -18136,7 +18681,7 @@ mod tests {
             let senders: VaraDataSenders =
                 Arc::new(Mutex::new(HashMap::from([(A, a_tx), (B, b_tx)])));
             let (tx, rx) = mpsc::unbounded_channel();
-            let bridge = tokio::spawn(forward_data_out(rx, senders.clone()));
+            let bridge = tokio::spawn(forward_data_out(rx, vec![senders.clone()]));
 
             tx.send(HostResponse::DataOut {
                 client_id: B,
@@ -18148,6 +18693,1337 @@ mod tests {
 
             assert!(drain(&mut a_rx).is_empty());
             assert_eq!(drain(&mut b_rx), vec![b"only b".to_vec()]);
+        }
+    }
+
+    // ── COP-97: the ARDOP TNC host interface ─────────────────────────────────
+    //
+    // These drive the real `serve_ardop` wiring (the same code `main` runs)
+    // with a Pat-ARDOP emulator over real TCP, and the two-station tests
+    // join two EventLoops with the pat_vara_session audio cable.
+
+    #[cfg(feature = "ardop")]
+    mod ardop_host {
+        use super::*;
+        use coppa_audio::{AudioRingConsumer, AudioRingProducer};
+        use coppa_host::ardop::{ArdopResponse, FIRST_ARDOP_CMD_CLIENT_ID};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+        use tokio::net::{TcpListener, TcpStream};
+
+        /// One cable tick: 20 ms of 48 kHz audio.
+        const CABLE_TICK: Duration = Duration::from_millis(20);
+        const CABLE_SAMPLES: usize = 960;
+
+        /// Unsolicited command-port lines filtered out when a reply is
+        /// expected (the ARDOP telemetry set).
+        fn is_telemetry(line: &str) -> bool {
+            ["BUSY ", "BUFFER ", "PTT "]
+                .iter()
+                .any(|t| line.starts_with(t))
+        }
+
+        /// A Pat-ARDOP emulator on the two ARDOP sockets: what it sends and
+        /// what it sees back. Lines are `\r`-terminated; replies skip
+        /// telemetry.
+        struct PatArdop {
+            call: &'static str,
+            reader: BufReader<OwnedReadHalf>,
+            writer: OwnedWriteHalf,
+            data: TcpStream,
+            seen: Vec<String>,
+            buffers: Vec<usize>,
+        }
+
+        impl PatArdop {
+            /// Connect both sockets the way Pat does (data address derived
+            /// from the command address), send the verified init sequence,
+            /// assert the exact reply table (§Design/2).
+            async fn open(station: &Station) -> PatArdop {
+                let cmd = TcpStream::connect(station.cmd_addr).await.unwrap();
+                let data_addr = ascii_increment(station.cmd_addr.to_string());
+                assert_eq!(
+                    data_addr.port(),
+                    station.data_addr.port(),
+                    "Pat's ASCII-increment derivation equals cmd+1 on numeric ports"
+                );
+                let data = TcpStream::connect(data_addr).await.unwrap();
+                let (read_half, writer) = cmd.into_split();
+                let mut pat = PatArdop {
+                    call: station.call,
+                    reader: BufReader::new(read_half),
+                    writer,
+                    data,
+                    seen: Vec::new(),
+                    buffers: Vec::new(),
+                };
+                // No greeting: the first line must be the reply to the first
+                // command.
+                for cmd in [
+                    "INITIALIZE",
+                    "STATE",
+                    "CODEC TRUE",
+                    "PROTOCOLMODE ARQ",
+                    "ARQTIMEOUT 90",
+                    "LISTEN FALSE",
+                    format!("MYCALL {}", station.call).as_str(),
+                    "GRIDSQUARE FN31PR",
+                    "ARQBW 500MAX",
+                    "VERSION",
+                ] {
+                    pat.send(cmd).await;
+                    let reply = pat.next_reply().await;
+                    let expect = match cmd {
+                        "STATE" => "STATE DISC".to_string(),
+                        "VERSION" => format!("VERSION Coppa {}", env!("CARGO_PKG_VERSION")),
+                        other => other.to_string(),
+                    };
+                    assert_eq!(
+                        reply, expect,
+                        "{}: reply to {cmd:?}; lines so far: {:?}",
+                        pat.call, pat.seen
+                    );
+                }
+                pat.command("MYCALL", &format!("MYCALL {}", station.call))
+                    .await;
+                pat.command("ARQBW", "ARQBW 500MAX").await;
+                pat
+            }
+
+            async fn send(&mut self, cmd: &str) {
+                self.writer
+                    .write_all(format!("{cmd}\r").as_bytes())
+                    .await
+                    .unwrap();
+            }
+
+            /// The next command-port line, split on `\r`, empties skipped.
+            /// Records `BUFFER` values.
+            async fn next_line(&mut self) -> Option<String> {
+                loop {
+                    let mut raw = Vec::new();
+                    let n = self.reader.read_until(b'\r', &mut raw).await.unwrap();
+                    if n == 0 {
+                        return None;
+                    }
+                    let line = String::from_utf8(raw).expect("ARDOP lines are UTF-8");
+                    let line = line.trim_end_matches('\r').to_string();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Some(n) = line.strip_prefix("BUFFER ") {
+                        self.buffers
+                            .push(n.parse().expect("BUFFER carries a count"));
+                    }
+                    self.seen.push(line.clone());
+                    return Some(line);
+                }
+            }
+
+            /// The next line that is not telemetry.
+            async fn next_reply(&mut self) -> String {
+                let fut = async {
+                    loop {
+                        match self.next_line().await {
+                            Some(line) if is_telemetry(&line) => continue,
+                            Some(line) => return Some(line),
+                            None => return None,
+                        }
+                    }
+                };
+                match tokio::time::timeout(Duration::from_secs(10), fut).await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => {
+                        panic!("{}: command port closed; lines: {:?}", self.call, self.seen)
+                    }
+                    Err(_) => panic!("{}: no reply in time; lines: {:?}", self.call, self.seen),
+                }
+            }
+
+            /// Send `cmd` and assert its exact reply.
+            async fn command(&mut self, cmd: &str, expect: &str) {
+                self.send(cmd).await;
+                let reply = self.next_reply().await;
+                assert_eq!(
+                    reply, expect,
+                    "{}: reply to {cmd:?}; lines so far: {:?}",
+                    self.call, self.seen
+                );
+            }
+
+            /// Wait (bounded) for a line starting with `prefix`.
+            async fn wait(&mut self, prefix: &str, limit: Duration) -> String {
+                let fut = async {
+                    loop {
+                        match self.next_line().await {
+                            Some(line) if line.starts_with(prefix) => return Some(line),
+                            Some(_) => continue,
+                            None => return None,
+                        }
+                    }
+                };
+                match tokio::time::timeout(limit, fut).await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => panic!(
+                        "{}: closed waiting for {prefix:?}; lines: {:?}",
+                        self.call, self.seen
+                    ),
+                    Err(_) => panic!(
+                        "{}: timed out waiting for {prefix:?}; lines: {:?}",
+                        self.call, self.seen
+                    ),
+                }
+            }
+
+            /// Write one framed data-port payload (host→TNC framing).
+            async fn write_data(&mut self, bytes: &[u8]) {
+                let mut frame = (bytes.len() as u16).to_be_bytes().to_vec();
+                frame.extend_from_slice(bytes);
+                self.data.write_all(&frame).await.unwrap();
+            }
+
+            /// Read one TNC→host framed payload: `<len:u16 BE><tag:3>` then
+            /// `len - 3` payload bytes (Pat's `frame.go` reads exactly
+            /// this), repeated until `len` payload bytes arrived.
+            async fn read_data(&mut self, len: usize) -> Vec<u8> {
+                let mut got = Vec::with_capacity(len);
+                while got.len() < len {
+                    let mut header = [0u8; 5];
+                    match tokio::time::timeout(
+                        Duration::from_secs(60),
+                        self.data.read_exact(&mut header),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => panic!("{}: data port read failed: {e}", self.call),
+                        Err(_) => panic!(
+                            "{}: timed out reading a data frame header; lines: {:?}",
+                            self.call, self.seen
+                        ),
+                    }
+                    let frame_len = u16::from_be_bytes([header[0], header[1]]) as usize;
+                    let tag = std::str::from_utf8(&header[2..5]).unwrap_or("???");
+                    assert_eq!(
+                        tag, "ARQ",
+                        "{}: session data carries the ARQ tag",
+                        self.call
+                    );
+                    let mut payload = vec![0u8; frame_len - 3];
+                    match tokio::time::timeout(
+                        Duration::from_secs(60),
+                        self.data.read_exact(&mut payload),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => got.extend_from_slice(&payload),
+                        Ok(Err(e)) => panic!("{}: data port read failed: {e}", self.call),
+                        Err(_) => panic!(
+                            "{}: timed out reading {frame_len} frame bytes; lines: {:?}",
+                            self.call, self.seen
+                        ),
+                    }
+                }
+                got
+            }
+
+            /// Pat's `Flush`: wait for `BUFFER 0` after a nonzero count.
+            async fn flush(&mut self) {
+                let fut = async {
+                    let mut counted = false;
+                    loop {
+                        match self.next_line().await {
+                            Some(line) if line == "BUFFER 0" => {
+                                if counted {
+                                    return true;
+                                }
+                            }
+                            Some(line) if line.starts_with("BUFFER ") => counted = true,
+                            Some(_) => continue,
+                            None => return false,
+                        }
+                    }
+                };
+                match tokio::time::timeout(Duration::from_secs(120), fut).await {
+                    Ok(true) => {}
+                    _ => panic!(
+                        "{}: flush never saw BUFFER 0; lines: {:?}",
+                        self.call, self.seen
+                    ),
+                }
+            }
+        }
+
+        /// Pat's data-address derivation: ASCII-increment of the last
+        /// character of the command address.
+        fn ascii_increment(addr: String) -> std::net::SocketAddr {
+            let mut bytes = addr.into_bytes();
+            let last = bytes.len() - 1;
+            bytes[last] += 1;
+            String::from_utf8(bytes)
+                .expect("derived data address is UTF-8")
+                .parse()
+                .expect("derived data address parses")
+        }
+
+        /// A running station: its ARDOP ports and its keyed state as seen by
+        /// an always-reading PTT monitor on the command port.
+        struct Station {
+            call: &'static str,
+            cmd_addr: std::net::SocketAddr,
+            data_addr: std::net::SocketAddr,
+            keyed: Option<Arc<AtomicBool>>,
+            vara_cmd_addr: std::net::SocketAddr,
+            vara_data_addr: std::net::SocketAddr,
+        }
+
+        /// Build, wire and start one station inside the current `LocalSet`,
+        /// with the ARDOP server served by the real `serve_ardop` wiring and
+        /// one always-reading PTT monitor client. The data port is Pat's
+        /// ASCII-increment derivation of the command port, bound exactly
+        /// (the numeric-address case equals cmd+1), so the emulator's
+        /// derivation check holds by construction.
+        async fn station(call: &'static str, monitor_ptt: bool) -> (Station, StationAudio) {
+            let (cmd_listener, data_listener) = loop {
+                let cmd = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                let cmd_addr = cmd.local_addr().unwrap();
+                // Skip addresses whose last char is '9': ASCII-increment
+                // would leave the digit range, exactly as in real Pat.
+                if cmd_addr.to_string().ends_with('9') {
+                    continue;
+                }
+                let derived = ascii_increment(cmd_addr.to_string());
+                if let Ok(data) = TcpListener::bind(derived).await {
+                    break (cmd, data);
+                }
+            };
+            let cmd_addr = cmd_listener.local_addr().unwrap();
+            let data_addr = data_listener.local_addr().unwrap();
+
+            let mut config = DaemonConfig::default();
+            config.engine.callsign = call.into();
+            config.engine.profile = "HF_STANDARD".into();
+            config.host.ardop_enabled = true;
+            config.host.ardop_command_port = cmd_addr.port();
+            config.host.ardop_data_port = data_addr.port();
+            let host = config.host.clone();
+
+            let (in_producer, in_consumer) = coppa_audio::audio_ring(config.audio.buffer_size);
+            let (out_producer, out_consumer) = coppa_audio::audio_ring(config.audio.buffer_size);
+
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (response_tx, response_rx) = mpsc::unbounded_channel();
+            event_loop.set_response_tx(response_tx);
+            event_loop.set_audio_in(in_consumer);
+            event_loop.set_audio_out(out_producer);
+            let data_senders = crate::ardop_wiring::serve_ardop(
+                &mut event_loop,
+                cmd_listener,
+                data_listener,
+                &host,
+            );
+            let vara_cmd = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let vara_data = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let vara_cmd_addr = vara_cmd.local_addr().unwrap();
+            let vara_data_addr = vara_data.local_addr().unwrap();
+            let vara_senders =
+                crate::vara_wiring::serve_vara(&mut event_loop, vara_cmd, vara_data, &host);
+            tokio::task::spawn_local(async move {
+                let _ = forward_data_out(response_rx, vec![data_senders, vara_senders]).await;
+            });
+            tokio::task::spawn_local(async move {
+                let _ = event_loop.run().await;
+            });
+
+            // PTT monitor: reads every line, tracks the keyed state from
+            // `PTT TRUE/FALSE`.
+            let keyed = if monitor_ptt {
+                let keyed = Arc::new(AtomicBool::new(false));
+                let monitor = TcpStream::connect(cmd_addr).await.unwrap();
+                let flag = keyed.clone();
+                tokio::task::spawn_local(async move {
+                    let (read_half, _write_half) = monitor.into_split();
+                    let mut reader = BufReader::new(read_half);
+                    loop {
+                        let mut line = Vec::new();
+                        match reader.read_until(b'\r', &mut line).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => match String::from_utf8_lossy(&line).trim_end() {
+                                "PTT TRUE" => flag.store(true, Ordering::SeqCst),
+                                "PTT FALSE" => flag.store(false, Ordering::SeqCst),
+                                _ => {}
+                            },
+                        }
+                    }
+                });
+                Some(keyed)
+            } else {
+                None
+            };
+
+            (
+                Station {
+                    call,
+                    cmd_addr,
+                    data_addr,
+                    keyed,
+                    vara_cmd_addr,
+                    vara_data_addr,
+                },
+                StationAudio {
+                    input: in_producer,
+                    output: out_consumer,
+                },
+            )
+        }
+
+        /// A station's audio ring ends, for the cable.
+        struct StationAudio {
+            input: AudioRingProducer,
+            output: AudioRingConsumer,
+        }
+
+        /// One direction of the half-duplex cable.
+        fn cable_step(
+            from_out: &mut AudioRingConsumer,
+            to_in: &mut AudioRingProducer,
+            to_keyed: &AtomicBool,
+            buf: &mut [f32],
+        ) {
+            buf.fill(0.0);
+            let read = from_out.read(buf);
+            if to_keyed.load(Ordering::SeqCst) {
+                buf[..read].fill(0.0);
+            }
+            to_in.write(buf);
+        }
+
+        fn spawn_cable(
+            a: &Station,
+            mut a_audio: StationAudio,
+            b: &Station,
+            mut b_audio: StationAudio,
+        ) {
+            let a_keyed = a.keyed.clone().expect("PTT monitors on");
+            let b_keyed = b.keyed.clone().expect("PTT monitors on");
+            tokio::task::spawn_local(async move {
+                let mut tick = tokio::time::interval(CABLE_TICK);
+                let mut buf = vec![0.0f32; CABLE_SAMPLES];
+                loop {
+                    tick.tick().await;
+                    cable_step(&mut a_audio.output, &mut b_audio.input, &b_keyed, &mut buf);
+                    cable_step(&mut b_audio.output, &mut a_audio.input, &a_keyed, &mut buf);
+                }
+            });
+        }
+
+        /// A plain EventLoop with an ARDOP command client on a real response
+        /// channel (no server, no socket): for reply-shape tests that inject
+        /// events directly. The client has sent `INITIALIZE` and its echo is
+        /// consumed, so `STATE` is past `OFFLINE` and the channel is empty.
+        async fn loop_with_ardop_client() -> (EventLoop, mpsc::Receiver<ArdopResponse>) {
+            let mut config = DaemonConfig::default();
+            config.engine.callsign = "N1CALL".into();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (tx, mut rx) = coppa_host::ardop::response_channel();
+            let senders = Arc::new(Mutex::new(HashMap::from([(FIRST_ARDOP_CMD_CLIENT_ID, tx)])));
+            event_loop.set_ardop_responses(senders);
+            event_loop
+                .handle_host_event(HostEvent::ArdopCommand {
+                    client_id: FIRST_ARDOP_CMD_CLIENT_ID,
+                    command: "INITIALIZE".into(),
+                })
+                .await;
+            assert_eq!(
+                rx.recv().await,
+                Some(ArdopResponse::Echo("INITIALIZE".into()))
+            );
+            (event_loop, rx)
+        }
+
+        /// COP-97 Phase 3 test 3: Pat's init sequence through the real
+        /// `serve_ardop` wiring answers the §Design/2 reply table exactly.
+        #[tokio::test]
+        async fn ardop_command_surface_answers_pat_init_sequence() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let (station, _audio) = station("N1CALL", false).await;
+                    // `PatArdop::open` asserts every reply of the init
+                    // sequence, including no greeting before them.
+                    let _pat = PatArdop::open(&station).await;
+                })
+                .await;
+        }
+
+        /// COP-97 Phase 3 test 4: `ARQCALL` maps onto the CONNECT path. The
+        /// caller sees `NEWSTATE ISS` then `CONNECTED <remote> <label>`; the
+        /// listener sees `TARGET <caller>` BEFORE `CONNECTED` (Pat's listen
+        /// gate) and `NEWSTATE ISS ` on the caller and `NEWSTATE IRS ` on the listener.
+        #[tokio::test(start_paused = true)]
+        async fn ardop_dial_maps_onto_the_connect_path() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let (a_station, a_audio) = station("N1CALL", true).await;
+                    let (b_station, b_audio) = station("N0CALL", true).await;
+                    spawn_cable(&a_station, a_audio, &b_station, b_audio);
+
+                    let mut a = PatArdop::open(&a_station).await;
+                    let mut b = PatArdop::open(&b_station).await;
+
+                    b.command("LISTEN TRUE", "LISTEN TRUE").await;
+                    a.send("ARQCALL N0CALL 3").await;
+                    // No echo: the next non-telemetry line is the outcome.
+                    let iss = a.next_reply().await;
+                    assert_eq!(iss, "NEWSTATE ISS ", "{}: lines: {:?}", a.call, a.seen);
+                    let connected = a.wait("CONNECTED ", Duration::from_secs(60)).await;
+                    assert_eq!(
+                        connected, "CONNECTED N0CALL 500MAX",
+                        "{}: lines: {:?}",
+                        a.call, a.seen
+                    );
+                    let newstate = a.wait("NEWSTATE ISS ", Duration::from_secs(10)).await;
+                    assert_eq!(newstate, "NEWSTATE ISS ");
+
+                    // The listener saw TARGET first (Pat's listen
+                    // requirement), then CONNECTED.
+                    let target = b.wait("TARGET ", Duration::from_secs(60)).await;
+                    assert_eq!(target, "TARGET N0CALL", "{}: lines: {:?}", b.call, b.seen);
+                    let connected = b.wait("CONNECTED ", Duration::from_secs(10)).await;
+                    assert_eq!(connected, "CONNECTED N1CALL 500MAX");
+                    let newstate = b.wait("NEWSTATE IRS ", Duration::from_secs(10)).await;
+                    assert_eq!(newstate, "NEWSTATE IRS ");
+                    let target_seen_at = b
+                        .seen
+                        .iter()
+                        .position(|l| l.starts_with("TARGET "))
+                        .expect("TARGET in seen");
+                    let connected_seen_at = b
+                        .seen
+                        .iter()
+                        .position(|l| l.starts_with("CONNECTED "))
+                        .expect("CONNECTED in seen");
+                    assert!(target_seen_at < connected_seen_at, "{:?}", b.seen);
+                })
+                .await;
+        }
+
+        /// COP-97 Phase 3 test 5: framed session data flows both ways on the
+        /// data port (`ARQ` tag out, stripped in) and `BUFFER` rises then
+        /// falls to 0 on the peer's ACKs (COP-30/38 semantics).
+        #[tokio::test(start_paused = true)]
+        async fn ardop_session_data_flows_and_buffer_falls_on_peer_ack() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let (a_station, a_audio) = station("N1CALL", true).await;
+                    let (b_station, b_audio) = station("N0CALL", true).await;
+                    spawn_cable(&a_station, a_audio, &b_station, b_audio);
+
+                    let mut a = PatArdop::open(&a_station).await;
+                    let mut b = PatArdop::open(&b_station).await;
+                    b.command("LISTEN TRUE", "LISTEN TRUE").await;
+                    a.send("ARQCALL N0CALL 3").await;
+                    a.wait("CONNECTED ", Duration::from_secs(60)).await;
+                    b.wait("CONNECTED ", Duration::from_secs(60)).await;
+
+                    // Listener's banner, framed per P1, arrives byte-exact.
+                    let banner = b";FW: N0CALL\r[Pat-1.0.0-B2FHMG$]\r; N1CALL DE N0CALL ()>\r";
+                    b.write_data(banner).await;
+                    b.flush().await;
+                    assert_eq!(
+                        a.read_data(banner.len()).await,
+                        banner,
+                        "banner, byte-exact"
+                    );
+
+                    let block: Vec<u8> = (0..400)
+                        .map(|i| b' ' + ((i as u8).wrapping_mul(7).wrapping_add(3) % 94))
+                        .collect();
+                    let before = a.buffers.len();
+                    a.write_data(&block).await;
+                    a.flush().await;
+                    assert_eq!(b.read_data(block.len()).await, block, "400 B, byte-exact");
+                    let counts = &a.buffers[before..];
+                    let peak = counts
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|(_, n)| **n)
+                        .map(|(i, _)| i)
+                        .expect("A reported BUFFER while sending");
+                    assert!(
+                        counts[peak..].windows(2).all(|w| w[1] <= w[0]),
+                        "BUFFER must not grow after its peak: {counts:?}"
+                    );
+                    assert_eq!(counts.last(), Some(&0), "BUFFER ends at 0: {counts:?}");
+                })
+                .await;
+        }
+
+        /// COP-97 Phase 3 test 6: `DISCONNECT` tears down on both sides with
+        /// `DISCONNECTED` + `NEWSTATE DISC `, and a second `ARQCALL`
+        /// afterwards succeeds (state reset).
+        #[tokio::test(start_paused = true)]
+        async fn ardop_disconnect_tears_down_and_newstate_follows() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let (a_station, a_audio) = station("N1CALL", true).await;
+                    let (b_station, b_audio) = station("N0CALL", true).await;
+                    spawn_cable(&a_station, a_audio, &b_station, b_audio);
+
+                    let mut a = PatArdop::open(&a_station).await;
+                    let mut b = PatArdop::open(&b_station).await;
+                    b.command("LISTEN TRUE", "LISTEN TRUE").await;
+                    a.send("ARQCALL N0CALL 3").await;
+                    a.wait("CONNECTED ", Duration::from_secs(60)).await;
+                    b.wait("CONNECTED ", Duration::from_secs(60)).await;
+                    a.wait("NEWSTATE ISS ", Duration::from_secs(10)).await;
+                    b.wait("NEWSTATE IRS ", Duration::from_secs(10)).await;
+
+                    a.send("DISCONNECT").await;
+                    assert_eq!(a.next_reply().await, "DISCONNECT", "the echo ack");
+                    a.wait("DISCONNECTED", Duration::from_secs(60)).await;
+                    a.wait("NEWSTATE DISC ", Duration::from_secs(10)).await;
+                    b.wait("DISCONNECTED", Duration::from_secs(60)).await;
+                    b.wait("NEWSTATE DISC ", Duration::from_secs(10)).await;
+
+                    // A second session with roles reversed on the same
+                    // stations: the state reset works.
+                    a.command("LISTEN TRUE", "LISTEN TRUE").await;
+                    b.send("ARQCALL N1CALL 3").await;
+                    b.wait("CONNECTED ", Duration::from_secs(60)).await;
+                    a.wait("CONNECTED ", Duration::from_secs(60)).await;
+                })
+                .await;
+        }
+
+        /// A second host's options never overwrite the first host's label.
+        #[tokio::test]
+        async fn ardop_bandwidth_labels_and_initialization_belong_to_each_client() {
+            let (mut event_loop, mut first_rx) = loop_with_ardop_client().await;
+            let second = FIRST_ARDOP_CMD_CLIENT_ID + 1;
+            let (tx, mut second_rx) = coppa_host::ardop::response_channel();
+            event_loop
+                .ardop_responses
+                .as_ref()
+                .unwrap()
+                .lock()
+                .await
+                .insert(second, tx);
+            event_loop.handle_ardop_command(second, "STATE").await;
+            assert_eq!(
+                second_rx.recv().await,
+                Some(ArdopResponse::Echo("STATE OFFLINE".into()))
+            );
+            event_loop.handle_ardop_command(second, "INITIALIZE").await;
+            second_rx.recv().await.unwrap();
+            event_loop
+                .handle_ardop_command(second, "ARQBW 1000MAX")
+                .await;
+            second_rx.recv().await.unwrap();
+            event_loop
+                .handle_ardop_command(FIRST_ARDOP_CMD_CLIENT_ID, "ARQBW")
+                .await;
+            assert_eq!(
+                first_rx.recv().await,
+                Some(ArdopResponse::Echo("ARQBW 500MAX".into()))
+            );
+            event_loop
+                .notify_session(
+                    0,
+                    SessionNotice::Connected {
+                        local: Callsign::new("N1CALL").unwrap(),
+                        remote: Callsign::new("N0CALL").unwrap(),
+                        we_called: true,
+                    },
+                )
+                .await;
+            assert_eq!(
+                first_rx.recv().await,
+                Some(ArdopResponse::Connected("N0CALL".into(), "500MAX".into()))
+            );
+            assert_eq!(
+                second_rx.recv().await,
+                Some(ArdopResponse::Connected("N0CALL".into(), "1000MAX".into()))
+            );
+        }
+
+        /// Pat can close twice after receiving the peer's disconnect. Even
+        /// with no remaining session, its second close needs an outcome.
+        #[tokio::test]
+        async fn idle_ardop_disconnect_is_answered_without_broadcast() {
+            let (mut event_loop, mut rx) = loop_with_ardop_client().await;
+            event_loop
+                .handle_host_event(HostEvent::DisconnectRequest {
+                    client_id: FIRST_ARDOP_CMD_CLIENT_ID,
+                })
+                .await;
+            assert_eq!(
+                rx.recv().await,
+                Some(ArdopResponse::Echo("DISCONNECT".into()))
+            );
+            assert_eq!(rx.try_recv().unwrap(), ArdopResponse::Disconnected);
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                ArdopResponse::NewState("DISC".into())
+            );
+        }
+
+        async fn ardop_draining_session() -> (EventLoop, mpsc::Receiver<ArdopResponse>, u8) {
+            let (mut station, mut rx) = loop_with_ardop_client().await;
+            let (producer, _consumer) = coppa_audio::audio_ring(4_000_000);
+            station.set_audio_out(producer);
+            let id = telemetry::seed_established(&mut station);
+            station
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: FIRST_ARDOP_CMD_CLIENT_ID,
+                    data: vec![0x42; 300],
+                })
+                .await;
+            let link = station.session_link.as_ref().unwrap();
+            assert_eq!(link.tx.in_flight(), 1);
+            assert!(!link.backlog.is_empty());
+            station
+                .handle_host_event(HostEvent::DisconnectRequest {
+                    client_id: FIRST_ARDOP_CMD_CLIENT_ID,
+                })
+                .await;
+            assert_eq!(
+                station.session_mgr.get(id).unwrap().state,
+                SessionState::Disconnecting
+            );
+            assert!(station.pending_disconnect.is_some());
+            while let Ok(response) = rx.try_recv() {
+                assert!(!matches!(
+                    response,
+                    ArdopResponse::Disconnected | ArdopResponse::NewState(_)
+                ));
+            }
+            (station, rx, id)
+        }
+
+        async fn assert_ardop_drain_finishes_once(
+            station: &mut EventLoop,
+            rx: &mut mpsc::Receiver<ArdopResponse>,
+            id: u8,
+        ) {
+            assert_eq!(
+                station.session_mgr.get(id).unwrap().state,
+                SessionState::Disconnecting
+            );
+            assert!(station.pending_disconnect.is_some());
+            assert_eq!(station.buffered_tx_bytes(), 300);
+            let link = station.session_link.as_ref().unwrap();
+            assert_eq!(link.tx.in_flight(), 1);
+            assert!(!link.backlog.is_empty());
+            for _ in 0..64 {
+                if station.session_mgr.get(id).is_none() {
+                    break;
+                }
+                station.handle_ptt_change(false).await;
+                if station
+                    .session_link
+                    .as_ref()
+                    .is_some_and(|l| l.tx.in_flight() > 0)
+                {
+                    ack_in_flight(station).await;
+                }
+            }
+            assert!(station.session_mgr.get(id).is_none());
+            assert!(station.pending_disconnect.is_none());
+            assert_eq!(station.buffered_tx_bytes(), 0);
+            let mut terminal = Vec::new();
+            while let Ok(response) = rx.try_recv() {
+                if matches!(
+                    response,
+                    ArdopResponse::Disconnected | ArdopResponse::NewState(_)
+                ) {
+                    terminal.push(response);
+                }
+            }
+            assert_eq!(
+                terminal,
+                [
+                    ArdopResponse::Disconnected,
+                    ArdopResponse::NewState("DISC".into())
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn ardop_cancel_pending_preserves_a_disconnect_drain() {
+            let (mut station, mut rx, id) = ardop_draining_session().await;
+            station
+                .handle_ardop_command(FIRST_ARDOP_CMD_CLIENT_ID, "CANCELPENDING")
+                .await;
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                ArdopResponse::Echo("CANCELPENDING".into())
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "cancelling a pending call must not end a drain"
+            );
+            assert_ardop_drain_finishes_once(&mut station, &mut rx, id).await;
+        }
+
+        #[tokio::test]
+        async fn ardop_repeated_disconnect_waits_for_the_existing_drain() {
+            let (mut station, mut rx, id) = ardop_draining_session().await;
+            station
+                .handle_host_event(HostEvent::DisconnectRequest {
+                    client_id: FIRST_ARDOP_CMD_CLIENT_ID,
+                })
+                .await;
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                ArdopResponse::Echo("DISCONNECT".into())
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "a repeated close must not announce completion early"
+            );
+            assert_ardop_drain_finishes_once(&mut station, &mut rx, id).await;
+        }
+
+        /// The next session-critical line on an ARDOP client's queue,
+        /// skipping the telemetry a transmission keying interleaves.
+        async fn next_notice(rx: &mut mpsc::Receiver<ArdopResponse>) -> Option<ArdopResponse> {
+            loop {
+                match rx.recv().await {
+                    Some(
+                        resp @ (ArdopResponse::Disconnected
+                        | ArdopResponse::NewState(_)
+                        | ArdopResponse::Target(_)
+                        | ArdopResponse::Connected(..)),
+                    ) => return Some(resp),
+                    Some(
+                        ArdopResponse::Ptt(_) | ArdopResponse::Busy(_) | ArdopResponse::Buffer(_),
+                    ) => continue,
+                    other => return other,
+                }
+            }
+        }
+
+        /// Validation PC-1/CR-1: a cancelled inbound handshake must send
+        /// the terminal notification that clears a listening host's
+        /// remembered `TARGET`. wl2k-go's listener clears its pending
+        /// target only on `DISCONNECTED` or `CANCELPENDING`, never on
+        /// `NEWSTATE`, so the old bare `NEWSTATE DISC ` left the target
+        /// stale and the still-listening client accepted its own later
+        /// outbound dial as an inbound connection (proved against
+        /// wl2k-go v1.0.1 in the validation probe). This pins the wire
+        /// fix: after `TARGET`, an abandoned inbound attempt answers
+        /// terminal `DISCONNECTED` before `NEWSTATE DISC `, and the
+        /// station is left free for a later outbound call.
+        #[tokio::test]
+        async fn cancelled_inbound_handshake_clears_the_listeners_target() {
+            let mut config = DaemonConfig::default();
+            config.engine.callsign = "VK3ABC".into();
+            config.audio.sample_rate = 100_000_000;
+            config.audio.buffer_size = 0;
+            config.radio.ptt_pre_delay_ms = 0;
+            config.radio.ptt_tail_delay_ms = 0;
+            let mut station = EventLoop::new(config).unwrap();
+            station.listening = true;
+            let (tx, mut rx) = coppa_host::ardop::response_channel();
+            station.set_ardop_responses(Arc::new(Mutex::new(HashMap::from([(
+                FIRST_ARDOP_CMD_CLIENT_ID,
+                tx,
+            )]))));
+            station
+                .handle_ardop_command(FIRST_ARDOP_CMD_CLIENT_ID, "INITIALIZE")
+                .await;
+            assert_eq!(
+                rx.recv().await,
+                Some(ArdopResponse::Echo("INITIALIZE".into()))
+            );
+
+            // An inbound handshake arrives: Pat's listen gate fires.
+            let mut remote = coppa_protocol::session::Session::new(
+                0,
+                Callsign::new("W1AW").unwrap(),
+                Callsign::new("VK3ABC").unwrap(),
+                0,
+                LinkCapabilities::default(),
+            );
+            station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            assert_eq!(
+                next_notice(&mut rx).await,
+                Some(ArdopResponse::Target("VK3ABC".into())),
+                "TARGET names the local called address"
+            );
+            assert_eq!(
+                next_notice(&mut rx).await,
+                Some(ArdopResponse::NewState("IRS".into()))
+            );
+
+            // The caller gives up mid-handshake. Before the fix only
+            // `NEWSTATE DISC ` was sent here; the terminal `DISCONNECTED`
+            // is the line that clears wl2k-go's remembered target.
+            station.handle_mac_pdu(remote.disconnect().unwrap()).await;
+            assert_eq!(
+                next_notice(&mut rx).await,
+                Some(ArdopResponse::Disconnected),
+                "the terminal notification that clears the listener's TARGET"
+            );
+            assert_eq!(
+                next_notice(&mut rx).await,
+                Some(ArdopResponse::NewState("DISC".into()))
+            );
+            assert!(station.session_mgr.active_sessions().is_empty());
+
+            // Free for the later outbound call: STATE answers DISC.
+            station
+                .handle_ardop_command(FIRST_ARDOP_CMD_CLIENT_ID, "STATE")
+                .await;
+            assert_eq!(
+                rx.recv().await,
+                Some(ArdopResponse::Echo("STATE DISC".into()))
+            );
+        }
+
+        /// COP-97 Phase 3 test 7: `SENDID` keys a real station-ID frame when
+        /// a callsign is in force (audio leaves through the TX ring, the
+        /// beacon tests' own assertion pattern), and answers `FAULT` without
+        /// one.
+        #[tokio::test]
+        async fn sendid_keys_a_station_id_frame_only_with_a_callsign() {
+            // With a callsign (config sets N1CALL): the ID frame is
+            // transmitted — samples appear in the audio-out ring, exactly
+            // what `test_beacon_sends_when_enabled_interval_elapsed_and_clear`
+            // asserts for the beacon path SENDID reuses (P8).
+            let mut config = DaemonConfig::default();
+            config.engine.callsign = "N1CALL".into();
+            let mut event_loop = EventLoop::new(config).unwrap();
+            let (tx, mut rx) = coppa_host::ardop::response_channel();
+            event_loop.set_ardop_responses(Arc::new(Mutex::new(HashMap::from([(
+                FIRST_ARDOP_CMD_CLIENT_ID,
+                tx,
+            )]))));
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+
+            assert!(!event_loop.busy_gate.current(), "channel starts clear");
+            event_loop
+                .handle_host_event(HostEvent::ArdopCommand {
+                    client_id: FIRST_ARDOP_CMD_CLIENT_ID,
+                    command: "SENDID".into(),
+                })
+                .await;
+            assert_eq!(
+                rx.recv().await,
+                Some(ArdopResponse::Echo("SENDID".into())),
+                "the echo ack"
+            );
+            assert!(
+                audio_out_rx.available() > 0,
+                "SENDID must transmit a station-ID frame"
+            );
+            assert!(
+                event_loop.last_id_time.is_some(),
+                "the ID timer records the frame"
+            );
+
+            // Without a callsign anywhere: FAULT, nothing keyed.
+            let bare_config = DaemonConfig::default();
+            let mut bare = EventLoop::new(bare_config).unwrap();
+            let (tx, mut rx) = coppa_host::ardop::response_channel();
+            bare.set_ardop_responses(Arc::new(Mutex::new(HashMap::from([(
+                FIRST_ARDOP_CMD_CLIENT_ID,
+                tx,
+            )]))));
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            bare.set_audio_out(audio_out_tx);
+            bare.handle_host_event(HostEvent::ArdopCommand {
+                client_id: FIRST_ARDOP_CMD_CLIENT_ID,
+                command: "SENDID".into(),
+            })
+            .await;
+            assert_eq!(rx.recv().await, Some(ArdopResponse::Echo("SENDID".into())));
+            let reply = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("fault in time")
+                .expect("channel open");
+            assert_eq!(
+                reply,
+                ArdopResponse::Fault("no callsign".into()),
+                "SENDID without a callsign must FAULT"
+            );
+            assert_eq!(audio_out_rx.available(), 0, "nothing keyed");
+        }
+
+        /// COP-97 Phase 3 test 8: the fan-out restructure is invisible to
+        /// the VARA-only world (the `data_delivery` suite above still passes
+        /// against the Vec-shaped bridge), and with both surfaces enabled
+        /// one decoded payload reaches BOTH surfaces' data-port clients.
+        #[tokio::test]
+        async fn fanout_restructure_does_not_change_vara_only_behavior() {
+            // Two sender maps (the VARA and ARDOP surfaces) and one
+            // `DataOut` for client 0: both surfaces' clients get it, in
+            // order, byte-exact.
+            let (vara_tx, mut vara_rx) = coppa_host::vara::data_channel();
+            let vara_map: VaraDataSenders =
+                Arc::new(Mutex::new(HashMap::from([(0x8000_0001, vara_tx)])));
+            let (ardop_tx, mut ardop_rx) = coppa_host::ardop::data_channel();
+            let ardop_map: VaraDataSenders = Arc::new(Mutex::new(HashMap::from([(
+                coppa_host::ardop::FIRST_ARDOP_DATA_CLIENT_ID,
+                ardop_tx,
+            )])));
+            let (tx, rx) = mpsc::unbounded_channel();
+            tx.send(HostResponse::DataOut {
+                client_id: 0,
+                data: b"both".to_vec(),
+            })
+            .unwrap();
+            drop(tx);
+            forward_data_out(rx, vec![vara_map, ardop_map]).await;
+            assert_eq!(vara_rx.recv().await, Some(b"both".to_vec()));
+            assert_eq!(ardop_rx.recv().await, Some(b"both".to_vec()));
+        }
+
+        // ── COP-97 Phase 4: cross-surface busy refusal (scenario 2) ──────
+
+        /// Scenario 2 verbatim: a VARA session is active; an ARDOP client
+        /// dials; it gets exactly `FAULT busy` then
+        /// `NEWSTATE DISC `, the VARA client hears nothing new, and
+        /// the first session still stands afterwards.
+        #[tokio::test]
+        async fn ardop_dial_during_active_vara_session_gets_fault_busy_and_vara_continues() {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    // One event loop, both surfaces wired the way main.rs
+                    // wires them.
+                    let mut config = DaemonConfig::default();
+                    config.engine.callsign = "N1CALL".into();
+                    let mut event_loop = EventLoop::new(config).unwrap();
+                    let (response_tx, response_rx) = mpsc::unbounded_channel();
+                    event_loop.set_response_tx(response_tx);
+                    let host = DaemonConfig::default().host;
+                    let vara_cmd = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                    let vara_data_l = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                    let vara_addr = vara_cmd.local_addr().unwrap();
+                    let vara_senders = crate::vara_wiring::serve_vara(
+                        &mut event_loop,
+                        vara_cmd,
+                        vara_data_l,
+                        &host,
+                    );
+                    let ardop_cmd = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                    let ardop_data_l = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                    let ardop_addr = ardop_cmd.local_addr().unwrap();
+                    let ardop_senders = crate::ardop_wiring::serve_ardop(
+                        &mut event_loop,
+                        ardop_cmd,
+                        ardop_data_l,
+                        &host,
+                    );
+                    tokio::spawn(forward_data_out(
+                        response_rx,
+                        vec![vara_senders, ardop_senders],
+                    ));
+                    tokio::task::spawn_local(async move {
+                        let _ = event_loop.run().await;
+                    });
+
+                    // VARA client connects, greets, sets its callsign, and
+                    // dials W1AW — a session is now active.
+                    let mut vara_client = TcpStream::connect(vara_addr).await.unwrap();
+                    let (vr, mut vw) = vara_client.split();
+                    let mut vara_reader = BufReader::new(vr);
+                    let mut greeting = Vec::new();
+                    vara_reader.read_until(b'\r', &mut greeting).await.unwrap();
+                    assert!(String::from_utf8_lossy(&greeting).starts_with("VERSION"));
+                    vw.write_all(b"MYCALL N1CALL\rCONNECT N1CALL W1AW\r")
+                        .await
+                        .unwrap();
+                    // MYCALL answers OK; CONNECT answers OK (the session is
+                    // Connecting — "active" under COP-38).
+                    for expect in ["OK", "OK"] {
+                        let mut line = Vec::new();
+                        tokio::time::timeout(
+                            Duration::from_secs(5),
+                            vara_reader.read_until(b'\r', &mut line),
+                        )
+                        .await
+                        .expect("VARA reply in time")
+                        .unwrap();
+                        assert_eq!(String::from_utf8_lossy(&line).trim_end(), expect);
+                    }
+
+                    // An ARDOP client connects on the other surface and
+                    // dials: refused with the busy reply.
+                    let mut ardop = TcpStream::connect(ardop_addr).await.unwrap();
+                    let (ar, mut aw) = ardop.split();
+                    let mut ardop_reader = BufReader::new(ar);
+                    aw.write_all(b"ARQCALL K2XYZ 3\r").await.unwrap();
+                    let mut replies = Vec::new();
+                    for _ in 0..2 {
+                        let mut line = Vec::new();
+                        tokio::time::timeout(
+                            Duration::from_secs(5),
+                            ardop_reader.read_until(b'\r', &mut line),
+                        )
+                        .await
+                        .expect("ARDOP reply in time")
+                        .unwrap();
+                        replies.push(
+                            String::from_utf8_lossy(&line)
+                                .trim_end_matches('\r')
+                                .to_string(),
+                        );
+                    }
+                    assert_eq!(
+                        replies,
+                        ["FAULT busy", "NEWSTATE DISC "],
+                        "the busy refusal, in ARDOP vocabulary (NEWSTATE keeps its trailing space)"
+                    );
+
+                    // The VARA client hears nothing about the refusal: no
+                    // session-state line arrives (its own session's PTT
+                    // telemetry may keep flowing — that is the session
+                    // continuing).
+                    let mut extra = Vec::new();
+                    loop {
+                        let mut line = Vec::new();
+                        match tokio::time::timeout(
+                            Duration::from_millis(300),
+                            vara_reader.read_until(b'\r', &mut line),
+                        )
+                        .await
+                        {
+                            Ok(Ok(0)) | Err(_) => break,
+                            Ok(Err(e)) => panic!("read error: {e}"),
+                            Ok(Ok(_)) => extra.push(String::from_utf8_lossy(&line).into_owned()),
+                        }
+                    }
+                    let session_lines: Vec<&String> = extra
+                        .iter()
+                        .filter(|l| {
+                            let l = l.trim_end();
+                            !(l.starts_with("PTT ")
+                                || l.starts_with("BUSY ")
+                                || l.starts_with("BUFFER ")
+                                || l.starts_with("SNR ")
+                                || l.starts_with("IAMALIVE"))
+                        })
+                        .collect();
+                    assert!(
+                        session_lines.is_empty(),
+                        "the VARA client must not hear the ARDOP refusal: {session_lines:?}"
+                    );
+                    vw.write_all(b"DISCONNECT\r").await.unwrap();
+                    let mut line = Vec::new();
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        vara_reader.read_until(b'\r', &mut line),
+                    )
+                    .await
+                    .expect("DISCONNECT answered")
+                    .unwrap();
+                    assert_eq!(String::from_utf8_lossy(&line).trim_end(), "OK");
+                })
+                .await;
+        }
+
+        /// Scenario 2 with an established link: the original VARA host
+        /// still exchanges bytes through the modem after the ARDOP refusal.
+        #[tokio::test(start_paused = true)]
+        async fn active_vara_session_exchanges_data_after_ardop_refusal() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (a_station, a_audio) = station("N1CALL", true).await;
+                    let (b_station, b_audio) = station("N0CALL", true).await;
+                    spawn_cable(&a_station, a_audio, &b_station, b_audio);
+                    let mut observer = PatArdop::open(&a_station).await;
+                    let mut peer = PatArdop::open(&b_station).await;
+                    peer.command("LISTEN TRUE", "LISTEN TRUE").await;
+                    let mut vara = TcpStream::connect(a_station.vara_cmd_addr).await.unwrap();
+                    let mut data = TcpStream::connect(a_station.vara_data_addr).await.unwrap();
+                    let (read, mut write) = vara.split();
+                    let mut reader = BufReader::new(read);
+                    let mut line = Vec::new();
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        reader.read_until(b'\r', &mut line),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert!(line.starts_with(b"VERSION Coppa"));
+                    write.write_all(b"CONNECT N1CALL N0CALL\r").await.unwrap();
+                    observer.wait("CONNECTED ", Duration::from_secs(60)).await;
+                    observer
+                        .wait("NEWSTATE ISS ", Duration::from_secs(10))
+                        .await;
+                    peer.wait("CONNECTED ", Duration::from_secs(60)).await;
+                    observer.send("ARQCALL K2XYZ 3").await;
+                    assert_eq!(observer.next_reply().await, "FAULT busy");
+                    assert_eq!(observer.next_reply().await, "NEWSTATE DISC ");
+                    observer.command("STATE", "STATE DISC").await;
+                    data.write_all(b"the VARA session survives").await.unwrap();
+                    assert_eq!(peer.read_data(25).await, b"the VARA session survives");
+                    peer.write_data(b"peer reply").await;
+                    peer.flush().await;
+                    let mut reply = [0; 10];
+                    tokio::time::timeout(Duration::from_secs(60), data.read_exact(&mut reply))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(&reply, b"peer reply");
+                    // The original client gets its connection notice and buffer
+                    // updates, but neither refusal nor disconnect.
+                    write.write_all(b"VERSION\r").await.unwrap();
+                    loop {
+                        line.clear();
+                        tokio::time::timeout(
+                            Duration::from_secs(10),
+                            reader.read_until(b'\r', &mut line),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        assert!(!line.starts_with(b"DISCONNECTED"), "{line:?}");
+                        assert!(!line.starts_with(b"FAULT"), "{line:?}");
+                        if line.starts_with(b"VERSION") {
+                            break;
+                        }
+                    }
+                })
+                .await;
+        }
+
+        /// The mirror: an ARDOP-driven session is active; a VARA dial gets
+        /// the existing client-scoped `DISCONNECTED`, the ARDOP session
+        /// continues.
+        #[tokio::test]
+        async fn vara_dial_during_active_ardop_session_is_refused_client_scoped() {
+            let (mut event_loop, _rx) = loop_with_ardop_client().await;
+            let id = telemetry::seed_established(&mut event_loop);
+            // A VARA client (ID 1) dials while the session is active.
+            let (vara_tx, mut vara_rx) = coppa_host::vara::response_channel();
+            event_loop.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, vara_tx)]))));
+            event_loop
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "N1CALL".into(),
+                    destination: "K2XYZ".into(),
+                })
+                .await;
+            let reply = vara_rx.recv().await;
+            assert_eq!(
+                reply,
+                Some(coppa_host::vara::VaraResponse::Ok),
+                "the dial's own OK"
+            );
+            let reply = vara_rx.recv().await;
+            assert_eq!(
+                reply,
+                Some(coppa_host::vara::VaraResponse::Disconnected),
+                "the client-scoped refusal"
+            );
+            // The ARDOP session continues.
+            assert_eq!(event_loop.session_mgr.active_sessions(), vec![id]);
+        }
+
+        /// Both clients on the ARDOP surface: a second dial while one is
+        /// active gets `FAULT busy` (mirrors
+        /// `a_second_session_is_refused_while_one_is_active`).
+        #[tokio::test]
+        async fn second_ardop_dial_during_ardop_session_gets_fault_busy() {
+            let (mut event_loop, mut rx) = loop_with_ardop_client().await;
+            let id = telemetry::seed_established(&mut event_loop);
+            let second = FIRST_ARDOP_CMD_CLIENT_ID + 1;
+            let (tx2, mut rx2) = coppa_host::ardop::response_channel();
+            {
+                let senders = event_loop
+                    .ardop_responses
+                    .clone()
+                    .expect("ardop senders wired");
+                senders.lock().await.insert(second, tx2);
+            }
+            event_loop
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: second,
+                    source: "N1CALL".into(),
+                    destination: "K2XYZ".into(),
+                })
+                .await;
+            assert_eq!(rx2.recv().await, Some(ArdopResponse::Fault("busy".into())));
+            assert_eq!(
+                rx2.recv().await,
+                Some(ArdopResponse::NewState("DISC".into()))
+            );
+            // The first session is untouched, and the first client (whose
+            // channel rx holds) heard nothing.
+            assert_eq!(event_loop.session_mgr.active_sessions(), vec![id]);
+            assert!(rx.try_recv().is_err(), "the first client hears nothing");
+        }
+
+        /// A refused dial leaves that client disconnected while the other
+        /// session stays active. A later dial after teardown still proceeds.
+        #[tokio::test]
+        async fn busy_refusal_does_not_disturb_state_words() {
+            let (mut event_loop, mut rx) = loop_with_ardop_client().await;
+            telemetry::seed_established(&mut event_loop);
+            let client = FIRST_ARDOP_CMD_CLIENT_ID;
+            event_loop
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: client,
+                    source: "N1CALL".into(),
+                    destination: "K2XYZ".into(),
+                })
+                .await;
+            assert_eq!(rx.recv().await, Some(ArdopResponse::Fault("busy".into())));
+            assert_eq!(
+                rx.recv().await,
+                Some(ArdopResponse::NewState("DISC".into()))
+            );
+
+            // The refused client does not own the active session.
+            event_loop
+                .handle_host_event(HostEvent::ArdopCommand {
+                    client_id: client,
+                    command: "STATE".into(),
+                })
+                .await;
+            assert_eq!(
+                rx.recv().await,
+                Some(ArdopResponse::Echo("STATE DISC".into()))
+            );
+
+            // After teardown STATE answers DISCONNECTED and a dial
+            // proceeds (no busy refusal): NEWSTATE ISS.
+            for id in event_loop.session_mgr.active_sessions() {
+                event_loop.session_mgr.remove(id);
+            }
+            event_loop
+                .handle_host_event(HostEvent::ArdopCommand {
+                    client_id: client,
+                    command: "STATE".into(),
+                })
+                .await;
+            assert_eq!(
+                rx.recv().await,
+                Some(ArdopResponse::Echo("STATE DISC".into()))
+            );
+            event_loop
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: client,
+                    source: "N1CALL".into(),
+                    destination: "K2XYZ".into(),
+                })
+                .await;
+            assert_eq!(
+                rx.recv().await,
+                Some(ArdopResponse::NewState("ISS".into())),
+                "a dial after teardown proceeds"
+            );
         }
     }
 }
