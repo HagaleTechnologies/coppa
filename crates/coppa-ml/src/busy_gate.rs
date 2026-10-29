@@ -27,6 +27,51 @@
 //! sweep against real recordings was run to tune this constant; if it proves
 //! twitchy/sluggish in real use, treat it the same way `CpGate`'s doc flags its own
 //! untuned constants: adjust with real recordings, not guesswork.
+//!
+//! # Hold
+//!
+//! One block's reading is not a state change. A reading that disagrees with the
+//! current state must persist, without a single agreeing segment in between, for
+//! `HOLD_SECS` (250 ms) of audio before the gate flips; an agreeing segment resets
+//! the count. The hold is counted in samples, not calls, so it means the same thing
+//! whether the caller feeds 20 ms blocks or one long drain, and it is symmetric: a
+//! false `BUSY ON` stalls a client's wait-for-clear (Pat's `waitIfBusy`) as surely
+//! as a false `BUSY OFF` lets a transmission out onto an occupied channel, so
+//! neither direction is the safe one to rush. Before the hold existed the gate
+//! flipped on the first disagreeing block and flapped ON/OFF 3-4 times a second on
+//! quiet input (108 transitions in 32 s, H-020 in
+//! `docs/reviews/2026-09-05-dim-C-host-apis.md`).
+//!
+//! The noise floor keeps adapting while a change is pending, and a sustained
+//! occupant only moderately above the background would otherwise drag it up far
+//! enough to stop reading busy before the hold completes: a step to 3x the
+//! background amplitude (about +9.5 dB) was never reported, and one to 5x
+//! (+14 dB) in only one of four seeded runs. A pending
+//! run of busy readings is therefore judged against a floor that may rise at most
+//! `PENDING_FLOOR_RISE_DB` (3 dB) above the floor from before the run began. On
+//! synthetic white noise that reports a 3x step; a 2x step (+6 dB) is still
+//! missed. Once `BUSY ON` is reported the floor adapts freely again, so a steady
+//! broadband occupant still reads clear while it is on the air (`BUSY OFF` came
+//! 0.26-0.43 s after `BUSY ON` in one run each of steps to 3x-50x the background),
+//! a limit of the floor estimator rather than of the hold.
+//!
+//! [`BusyGate::observe`] splits each call into near-equal segments of at most
+//! `FFT_SIZE` samples and measures every one, so a long call is judged across its
+//! whole length rather than by its first `FFT_SIZE` samples (the hold credits every
+//! sample, so every sample must also be measured). It returns the *net* change
+//! across the call. A change is reported when the call returns, even if the flip
+//! happened early in it, so the hold for the next change restarts at that report:
+//! disagreeing audio in the rest of the reporting call is not counted, which can
+//! delay the next change, in [`BusyGate::current`] as well as in the report, by up
+//! to that call's length.
+//!
+//! What a client watching the `BUSY ON`/`BUSY OFF` lines can rely on:
+//! - two consecutive transitions are separated by at least 250 ms of received audio;
+//! - a state is reported only after it has held for 250 ms, so a real occupant is
+//!   reported about 250 ms after it keys up and after it stops (later, by up to one
+//!   call's length, when the change follows one reported for a long call; a steady
+//!   broadband occupant reads clear earlier, see above);
+//! - a busy pulse shorter than 250 ms is never reported.
 use crate::spectrum_sensor::SpectrumSensor;
 
 /// FFT size used by the internal `SpectrumSensor`. 1024 points gives usable
@@ -55,11 +100,43 @@ const MIN_OCCUPIED_FRACTION: f32 = 0.6;
 /// sentinel's immediate vicinity.
 const CALIBRATION_BLOCKS: u32 = 3;
 
-/// Spectral-occupancy busy gate. See module doc for the threshold/hysteresis.
+/// How long (seconds of audio) a disagreeing reading must persist before the gate
+/// changes state (see module doc's `# Hold`). 250 ms is the value the 2026-09-05
+/// H-020 review suggested after its 32 s quiet-input capture; a measurement on
+/// synthetic coloured noise showed it removes the flapping, and 500 ms measured the
+/// same while doubling detection latency. Like the other constants here it has not
+/// been swept against real recordings.
+const HOLD_SECS: f32 = 0.25;
+
+/// How far (dB) the noise floor a pending run of busy readings is judged against
+/// may rise above the floor from before the run began (see module doc's
+/// `# Hold`). Half of `MARGIN_DB`. Measured on this module's synthetic noise at
+/// 48 kHz: 1, 1.5, 2 and 3 dB left the quiet coloured-noise cases sampled at
+/// their uncapped transition counts (3 dB on all 36 cadence/tilt cases, five
+/// seeds each), while 0.5 dB made one case latch, 0.25 dB made the H-020 case
+/// flap, and freezing the floor outright (0 dB) gave 188 transitions across five
+/// 32 s runs of it. 3 dB is the value furthest from that edge that still reports
+/// a sustained step to 3x the background amplitude. Not swept against real
+/// recordings.
+const PENDING_FLOOR_RISE_DB: f32 = 3.0;
+
+/// Spectral-occupancy busy gate. See module doc for the threshold and the hold.
 pub struct BusyGate {
     sensor: SpectrumSensor,
     busy: bool,
     calibrated_blocks: u32,
+    /// Samples of disagreeing audio needed to flip `busy` (`HOLD_SECS` at the
+    /// gate's sample rate).
+    hold_samples: usize,
+    /// Length, in samples, of the current unbroken run of audio whose reading
+    /// disagrees with `busy`, counted from no earlier than the last reported
+    /// transition.
+    pending_samples: usize,
+    /// While `busy` is false and a run of busy readings is pending, the noise
+    /// floor (dB) from before the run's first segment; the run is judged against
+    /// a floor at most `PENDING_FLOOR_RISE_DB` above it (see module doc's
+    /// `# Hold`). `None` otherwise.
+    pending_floor_db: Option<f32>,
 }
 
 impl BusyGate {
@@ -69,45 +146,101 @@ impl BusyGate {
             sensor: SpectrumSensor::new(FFT_SIZE, sample_rate),
             busy: false,
             calibrated_blocks: 0,
+            hold_samples: (HOLD_SECS * sample_rate).round() as usize,
+            pending_samples: 0,
+            pending_floor_db: None,
         }
     }
 
-    /// Feed one block of audio samples. Updates the internal noise-floor estimate
-    /// and returns `Some(new_state)` only when the busy/not-busy state actually
-    /// changes; returns `None` on every other call, including empty input and the
-    /// first `CALIBRATION_BLOCKS` calls (see that constant's doc).
+    /// Feed a block of audio samples of any length. The block is measured in
+    /// near-equal segments of at most `FFT_SIZE` samples, each updating the
+    /// noise-floor estimate and the hold (see module doc's `# Hold`). Returns
+    /// `Some(new_state)` only when the busy/not-busy state differs from what it was
+    /// before the call (the net change); returns `None` on every other call,
+    /// including empty input, the first `CALIBRATION_BLOCKS` segments (see that
+    /// constant's doc), and any call whose disagreeing audio has not yet lasted
+    /// `HOLD_SECS` since the last reported transition.
     pub fn observe(&mut self, samples: &[f32]) -> Option<bool> {
         if samples.is_empty() {
             return None;
         }
 
+        let before = self.busy;
+        // Equal-length segments rather than `chunks(FFT_SIZE)`: 1030 samples
+        // becomes 515 + 515, not 1024 + a 6-sample sliver whose periodogram is
+        // meaningless.
+        let segments = samples.len().div_ceil(FFT_SIZE);
+        for segment in samples.chunks(samples.len().div_ceil(segments)) {
+            self.observe_segment(segment);
+        }
+        if self.busy == before {
+            return None;
+        }
+        // The transition is reported now, at the end of the call, though the flip
+        // may have landed early in it. Restart the hold here so the next report is
+        // at least `hold_samples` after this one, not after the flip.
+        self.pending_samples = 0;
+        Some(self.busy)
+    }
+
+    /// Measure one segment of at most `FFT_SIZE` samples and advance the hold.
+    fn observe_segment(&mut self, samples: &[f32]) {
         if self.calibrated_blocks < CALIBRATION_BLOCKS {
             self.sensor.update(samples);
             self.calibrated_blocks += 1;
-            return None;
+            return;
         }
 
         // Compare this block against the noise floor established by *prior*
         // blocks before folding this one in — gating a block against a statistic
         // partly derived from itself would make ordinary single-block spectral
         // estimation variance (not a real signal) look "occupied".
-        let occupancy = self
-            .sensor
-            .band_occupancy(samples, BAND_LOW_HZ, BAND_HIGH_HZ, MARGIN_DB);
+        // While a busy reading is pending, the floor may rise at most
+        // `PENDING_FLOOR_RISE_DB` above the one from before the run began: the
+        // live floor keeps folding the run's own segments in and, against it, an
+        // occupant only moderately above the background stops reading busy
+        // before the hold completes. `band_occupancy` compares against
+        // `noise_floor() + margin`, so the capped floor goes in through the
+        // margin (exactly `MARGIN_DB` when the cap does not bind).
+        let live_floor = self.sensor.noise_floor();
+        let floor = match self.pending_floor_db {
+            Some(start) => live_floor.min(start + PENDING_FLOOR_RISE_DB),
+            None => live_floor,
+        };
+        let occupancy = self.sensor.band_occupancy(
+            samples,
+            BAND_LOW_HZ,
+            BAND_HIGH_HZ,
+            MARGIN_DB + (floor - live_floor),
+        );
         self.sensor.update(samples);
 
-        let now_busy = occupancy >= MIN_OCCUPIED_FRACTION;
-        if now_busy != self.busy {
-            self.busy = now_busy;
-            Some(now_busy)
+        let reads_busy = occupancy >= MIN_OCCUPIED_FRACTION;
+        if reads_busy == self.busy {
+            self.pending_samples = 0;
+            self.pending_floor_db = None;
         } else {
-            None
+            if reads_busy && self.pending_floor_db.is_none() {
+                self.pending_floor_db = Some(live_floor);
+            }
+            self.pending_samples += samples.len();
+            if self.pending_samples >= self.hold_samples {
+                self.busy = reads_busy;
+                self.pending_samples = 0;
+                self.pending_floor_db = None;
+            }
         }
     }
 
     /// Current busy state without observing a new block.
     pub fn current(&self) -> bool {
         self.busy
+    }
+
+    /// Samples of disagreeing audio needed to change state, `HOLD_SECS` at this
+    /// gate's sample rate (for introspection/testing).
+    pub fn hold_samples(&self) -> usize {
+        self.hold_samples
     }
 }
 
@@ -197,5 +330,185 @@ mod tests {
         }
         assert!(saw_busy_off, "channel clearing must trigger BUSY OFF");
         assert!(!gate.current());
+    }
+
+    /// Quiet noise with a one-pole low-pass tilt (`y = a*y + (1 - a)*x`), a mild
+    /// high-frequency rolloff like a sound card's input.
+    fn coloured_noise_block(len: usize, a: f32, state: &mut f32, counter: &mut u32) -> Vec<f32> {
+        (0..len)
+            .map(|_| {
+                let x = 0.01 * (rand_like_hash(counter) as f32 / u32::MAX as f32 - 0.5);
+                *state = a * *state + (1.0 - a) * x;
+                *state
+            })
+            .collect()
+    }
+
+    /// The H-020 field capture: quiet input fed at the daemon's ~20 ms block cadence
+    /// (960 samples at 48 kHz) must not produce a single transition in 32 s. With this
+    /// module's hash generator `a = 0.3` is the tilt that flaps without the hold (232
+    /// transitions in 32 s; 0.1 and 0.2 did not flap, 0.45 and above latched once).
+    #[test]
+    fn quiet_coloured_noise_does_not_flap_at_daemon_cadence() {
+        let mut counter = 0u32;
+        let mut state = 0.0f32;
+        let mut gate = BusyGate::new(48_000.0);
+        let mut transitions = 0;
+        for _ in 0..(32 * 48_000 / 960) {
+            if gate
+                .observe(&coloured_noise_block(960, 0.3, &mut state, &mut counter))
+                .is_some()
+            {
+                transitions += 1;
+            }
+        }
+        assert_eq!(transitions, 0, "quiet input must not flap BUSY ON/OFF");
+    }
+
+    /// The ticket's Gherkin: BUSY transitions no more than once per hold interval,
+    /// even when the input itself alternates between burst and quiet block to block.
+    #[test]
+    fn transitions_are_at_least_one_hold_apart() {
+        let mut counter = 0u32;
+        let mut choice = 0u32;
+        let mut gate = BusyGate::new(8000.0);
+        let mut position = 0usize;
+        let mut transition_positions = Vec::new();
+        for _ in 0..400 {
+            let block = if rand_like_hash(&mut choice) % 7 < 3 {
+                band_limited_noise_burst(&mut counter)
+            } else {
+                quiet_block(&mut counter)
+            };
+            position += block.len();
+            if gate.observe(&block).is_some() {
+                transition_positions.push(position);
+            }
+        }
+        assert!(
+            !transition_positions.is_empty(),
+            "the burst/quiet mix must produce at least one transition"
+        );
+        for gap in transition_positions.windows(2) {
+            assert!(
+                gap[1] - gap[0] >= gate.hold_samples(),
+                "transitions at samples {} and {} are closer than the {}-sample hold",
+                gap[0],
+                gap[1],
+                gate.hold_samples()
+            );
+        }
+    }
+
+    #[test]
+    fn a_disagreeing_block_restarts_the_hold() {
+        let mut counter = 0u32;
+        let mut gate = BusyGate::new(8000.0);
+        // 2000 samples of hold at 8 kHz: two 1024-sample bursts cover it, one does not.
+        assert_eq!(gate.hold_samples(), 2000);
+        for _ in 0..10 {
+            assert_eq!(gate.observe(&quiet_block(&mut counter)), None);
+        }
+
+        assert_eq!(gate.observe(&band_limited_noise_burst(&mut counter)), None);
+        assert_eq!(gate.observe(&quiet_block(&mut counter)), None);
+        assert_eq!(
+            gate.observe(&band_limited_noise_burst(&mut counter)),
+            None,
+            "the quiet block in between must have restarted the hold"
+        );
+        assert_eq!(
+            gate.observe(&band_limited_noise_burst(&mut counter)),
+            Some(true)
+        );
+        assert!(gate.current());
+    }
+
+    /// A busy-wait drain hands the gate thousands of samples in one call; every
+    /// sample must be measured, not just the first `FFT_SIZE`.
+    #[test]
+    fn a_long_call_is_measured_across_its_whole_length() {
+        let mut counter = 0u32;
+        let mut gate = BusyGate::new(48_000.0);
+        for _ in 0..10 {
+            assert_eq!(gate.observe(&quiet_block(&mut counter)), None);
+        }
+
+        let mut call = quiet_block(&mut counter);
+        for _ in 0..13 {
+            call.extend(band_limited_noise_burst(&mut counter));
+        }
+        assert_eq!(gate.observe(&call), Some(true));
+        assert!(gate.current());
+    }
+
+    /// A sustained occupant only moderately above the background (3x and 5x the
+    /// quiet amplitude, about +9.5 and +14 dB) must still be reported. The
+    /// noise-floor EWMA folds every segment in, and against that live floor such a
+    /// signal stops reading busy before the 250 ms hold completes; a pending run is
+    /// judged against a floor capped at `PENDING_FLOOR_RISE_DB` above the one from
+    /// before it began.
+    #[test]
+    fn a_sustained_moderate_signal_is_reported_busy() {
+        for amplitude in [0.03, 0.05] {
+            let mut counter = 0u32;
+            let mut gate = BusyGate::new(48_000.0);
+            for _ in 0..10 {
+                assert_eq!(gate.observe(&quiet_block(&mut counter)), None);
+            }
+            let mut reported_on = false;
+            for _ in 0..40 {
+                if gate.observe(&noise_block(amplitude, &mut counter)) == Some(true) {
+                    reported_on = true;
+                    break;
+                }
+            }
+            assert!(
+                reported_on,
+                "a sustained signal at amplitude {amplitude} must trigger BUSY ON"
+            );
+        }
+    }
+
+    /// The daemon drains its whole input ring (up to 8192 samples) in one call after
+    /// a stall, so a flip can land early in a long call while the rest of that call
+    /// already disagrees with the new state. The next transition must still be
+    /// reported at least one hold after this one was reported (when the call
+    /// returned), not one hold after the flip inside it.
+    #[test]
+    fn reported_transitions_are_one_hold_apart_across_a_long_call() {
+        let mut counter = 0u32;
+        let mut gate = BusyGate::new(48_000.0);
+        for _ in 0..10 {
+            assert_eq!(gate.observe(&quiet_block(&mut counter)), None);
+        }
+        // 11 burst blocks: 11264 disagreeing samples, short of the 12000-sample hold.
+        for _ in 0..11 {
+            assert_eq!(gate.observe(&band_limited_noise_burst(&mut counter)), None);
+        }
+        // One drain-sized call: the hold completes in its first segment, and the
+        // seven quiet segments after it already disagree with BUSY ON.
+        let mut call = band_limited_noise_burst(&mut counter);
+        for _ in 0..7 {
+            call.extend(quiet_block(&mut counter));
+        }
+        assert_eq!(gate.observe(&call), Some(true));
+
+        let mut since_report = 0;
+        let mut reported_off = false;
+        for _ in 0..40 {
+            let block = quiet_block(&mut counter);
+            since_report += block.len();
+            if gate.observe(&block) == Some(false) {
+                reported_off = true;
+                break;
+            }
+        }
+        assert!(reported_off, "the channel clearing must still be reported");
+        assert!(
+            since_report >= gate.hold_samples(),
+            "BUSY OFF reported {since_report} samples after BUSY ON, closer than the {}-sample hold",
+            gate.hold_samples()
+        );
     }
 }
