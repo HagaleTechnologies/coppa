@@ -1593,7 +1593,18 @@ impl EventLoop {
                     ]
                 }
                 SessionNotice::PendingCancelled => {
-                    vec![ArdopResponse::NewState("DISC".to_string())]
+                    // The terminal notification must clear the host's
+                    // remembered TARGET: wl2k-go's listener drops its
+                    // pending target only on DISCONNECTED or CANCELPENDING,
+                    // never on NEWSTATE, so a bare NEWSTATE DISC would leave
+                    // the target stale and the still-listening client would
+                    // accept its own later outbound dial as inbound
+                    // (validation PC-1/CR-1). DISCONNECTED clears it;
+                    // NEWSTATE DISC still reports the state.
+                    vec![
+                        ArdopResponse::Disconnected,
+                        ArdopResponse::NewState("DISC".to_string()),
+                    ]
                 }
             };
             for response in ardop {
@@ -19354,6 +19365,103 @@ mod tests {
             assert_eq!(
                 rx.try_recv().unwrap(),
                 ArdopResponse::NewState("DISC".into())
+            );
+        }
+
+        /// The next session-critical line on an ARDOP client's queue,
+        /// skipping the telemetry a transmission keying interleaves.
+        async fn next_notice(rx: &mut mpsc::Receiver<ArdopResponse>) -> Option<ArdopResponse> {
+            loop {
+                match rx.recv().await {
+                    Some(
+                        resp @ (ArdopResponse::Disconnected
+                        | ArdopResponse::NewState(_)
+                        | ArdopResponse::Target(_)
+                        | ArdopResponse::Connected(..)),
+                    ) => return Some(resp),
+                    Some(
+                        ArdopResponse::Ptt(_) | ArdopResponse::Busy(_) | ArdopResponse::Buffer(_),
+                    ) => continue,
+                    other => return other,
+                }
+            }
+        }
+
+        /// Validation PC-1/CR-1: a cancelled inbound handshake must send
+        /// the terminal notification that clears a listening host's
+        /// remembered `TARGET`. wl2k-go's listener clears its pending
+        /// target only on `DISCONNECTED` or `CANCELPENDING`, never on
+        /// `NEWSTATE`, so the old bare `NEWSTATE DISC ` left the target
+        /// stale and the still-listening client accepted its own later
+        /// outbound dial as an inbound connection (proved against
+        /// wl2k-go v1.0.1 in the validation probe). This pins the wire
+        /// fix: after `TARGET`, an abandoned inbound attempt answers
+        /// terminal `DISCONNECTED` before `NEWSTATE DISC `, and the
+        /// station is left free for a later outbound call.
+        #[tokio::test]
+        async fn cancelled_inbound_handshake_clears_the_listeners_target() {
+            let mut config = DaemonConfig::default();
+            config.engine.callsign = "VK3ABC".into();
+            config.audio.sample_rate = 100_000_000;
+            config.audio.buffer_size = 0;
+            config.radio.ptt_pre_delay_ms = 0;
+            config.radio.ptt_tail_delay_ms = 0;
+            let mut station = EventLoop::new(config).unwrap();
+            station.listening = true;
+            let (tx, mut rx) = coppa_host::ardop::response_channel();
+            station.set_ardop_responses(Arc::new(Mutex::new(HashMap::from([(
+                FIRST_ARDOP_CMD_CLIENT_ID,
+                tx,
+            )]))));
+            station
+                .handle_ardop_command(FIRST_ARDOP_CMD_CLIENT_ID, "INITIALIZE")
+                .await;
+            assert_eq!(
+                rx.recv().await,
+                Some(ArdopResponse::Echo("INITIALIZE".into()))
+            );
+
+            // An inbound handshake arrives: Pat's listen gate fires.
+            let mut remote = coppa_protocol::session::Session::new(
+                0,
+                Callsign::new("W1AW").unwrap(),
+                Callsign::new("VK3ABC").unwrap(),
+                0,
+                LinkCapabilities::default(),
+            );
+            station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            assert_eq!(
+                next_notice(&mut rx).await,
+                Some(ArdopResponse::Target("VK3ABC".into())),
+                "TARGET names the local called address"
+            );
+            assert_eq!(
+                next_notice(&mut rx).await,
+                Some(ArdopResponse::NewState("IRS".into()))
+            );
+
+            // The caller gives up mid-handshake. Before the fix only
+            // `NEWSTATE DISC ` was sent here; the terminal `DISCONNECTED`
+            // is the line that clears wl2k-go's remembered target.
+            station.handle_mac_pdu(remote.disconnect().unwrap()).await;
+            assert_eq!(
+                next_notice(&mut rx).await,
+                Some(ArdopResponse::Disconnected),
+                "the terminal notification that clears the listener's TARGET"
+            );
+            assert_eq!(
+                next_notice(&mut rx).await,
+                Some(ArdopResponse::NewState("DISC".into()))
+            );
+            assert!(station.session_mgr.active_sessions().is_empty());
+
+            // Free for the later outbound call: STATE answers DISC.
+            station
+                .handle_ardop_command(FIRST_ARDOP_CMD_CLIENT_ID, "STATE")
+                .await;
+            assert_eq!(
+                rx.recv().await,
+                Some(ArdopResponse::Echo("STATE DISC".into()))
             );
         }
 

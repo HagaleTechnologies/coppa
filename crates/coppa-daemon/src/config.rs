@@ -824,7 +824,6 @@ impl DaemonConfig {
         )
     }
 
-<<<<<<< HEAD
     /// COP-97: an ARDOP-enabled config needs a build with the `ardop`
     /// feature, checked in every build (the keys deserialize in every
     /// build).
@@ -840,14 +839,9 @@ impl DaemonConfig {
                 .to_string(),
         )
     }
-    /// COP-32: `[audio] sample_rate` must equal the configured profile's
-    /// engine rate. coppad has no resampler, so any other rate plays and
-    /// captures audio at the wrong speed. Checked by run mode before any
-    /// hardware is touched; `--check` does not call it.
-=======
+
     /// A positive preferred hardware rate is required before opening audio.
     /// The live backend picks a supported rate and converts to the engine rate.
->>>>>>> 0887a09cde28a06c63cc0a7cbc9623081cf24f10
     pub fn check_sample_rate(&self) -> Result<(), String> {
         if self.audio.sample_rate > 0 {
             return Ok(());

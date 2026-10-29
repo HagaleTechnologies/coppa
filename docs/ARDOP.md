@@ -68,7 +68,11 @@ command answers `FAULT <text>`.
 
 Unsolicited notifications: `NEWSTATE <state> ` (note the trailing space,
 preserved for byte-compatibility with real TNCs), `TARGET <local-call>` (a pending
-inbound request — **required before `CONNECTED` for Pat's listen mode**),
+inbound request — **required before `CONNECTED` for Pat's listen mode**;
+a pending inbound that is cancelled or abandoned ends in a terminal
+`DISCONNECTED` + `NEWSTATE DISC `, because wl2k-go's listener clears its
+remembered target only on `DISCONNECTED`/`CANCELPENDING`, never on
+`NEWSTATE`),
 `CONNECTED <call> <bw>`, `DISCONNECTED`, `BUSY TRUE|FALSE`, `PTT TRUE|FALSE`,
 `BUFFER <n>` (unacked host bytes; falls on the peer's ACK, not on PTT
 release).
