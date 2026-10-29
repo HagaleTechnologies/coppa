@@ -478,8 +478,9 @@ so:
   clear earlier, see the known gap below). When coppad reads a long stretch of
   buffered audio at once (after a stall, or while it waits to transmit) and
   reports a change for it, the next change can be reported up to that
-  stretch's length later: at most about 170 ms, the size of coppad's input
-  buffer;
+  stretch's length later: at most the length of coppad's input ring,
+  `[audio] buffer_size` samples (about 170 ms at the default 8192 samples
+  and 48 kHz; a larger `buffer_size` raises this bound in proportion);
 - a burst shorter than 250 ms is never reported.
 
 Detection always runs. `[station_id] busy_hold_ms` does not change it: that
