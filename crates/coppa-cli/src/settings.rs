@@ -269,7 +269,13 @@ impl Layers {
         self.string(flag, "device", "COPPA_DEVICE", file, key)
     }
     pub fn rig(&self, flags: &RigArgs) -> Result<RigSettings> {
-        let device = self.device(flags.device.as_deref(), Direction::Output)?;
+        // COP-64: an explicit --device-id is a flag, so it beats a file or
+        // environment device name.
+        let device = if flags.device_id.is_some() {
+            None
+        } else {
+            self.device(flags.device.as_deref(), Direction::Output)?
+        };
         let ptt = self
             .string(
                 flags.ptt.as_deref(),
@@ -336,6 +342,8 @@ impl Layers {
         };
         Ok(RigSettings {
             device,
+            device_id: flags.device_id.clone(),
+            output_channel: flags.output_channel,
             ptt,
             rigctld,
             lead,
@@ -363,6 +371,11 @@ impl Layers {
 
 pub struct RigSettings {
     pub device: Option<Setting<String>>,
+    /// COP-64: `--device-id`, flag only. When set it replaces `device`.
+    pub device_id: Option<String>,
+    /// COP-64: `--output-channel`, flag only (zero-based).
+    #[cfg_attr(not(feature = "cpal-backend"), allow(dead_code))]
+    pub output_channel: u16,
     pub ptt: Setting<String>,
     pub rigctld: Setting<String>,
     pub lead: Setting<u64>,
@@ -410,6 +423,9 @@ impl RigSettings {
         if let Some(device) = &self.device {
             eprintln!("[verbose] Device: {} ({})", device.value, device.source);
         }
+        if let Some(id) = &self.device_id {
+            eprintln!("[verbose] Device ID: {id} (--device-id)");
+        }
         eprintln!("[verbose] PTT: {} ({})", self.ptt.value, self.ptt.source);
         eprintln!(
             "[verbose] rigctld: {} ({})",
@@ -442,6 +458,8 @@ impl RigSettings {
     ) -> Self {
         Self {
             device: device.map(|v| Setting::new(v.into(), Source::Flag("device"))),
+            device_id: None,
+            output_channel: 0,
             ptt: Setting::new(ptt.into(), Source::Flag("ptt")),
             rigctld: Setting::new(rigctld.into(), Source::Flag("rigctld")),
             lead: Setting::new(lead, Source::Flag("ptt-lead-ms")),
@@ -571,6 +589,29 @@ mod tests {
         assert!(Layers::for_test(env, SharedSettings::default())
             .rig(&RigArgs::default())
             .is_err());
+    }
+    /// COP-64: `--device-id` is a flag, so it replaces an output device
+    /// name from the file (or environment) rather than being combined with it.
+    #[test]
+    fn device_id_flag_replaces_a_layered_device_name() {
+        let shared = SharedSettings {
+            output_device: Some("file-device".into()),
+            ..Default::default()
+        };
+        let layers = Layers::for_test(CliEnv::default(), shared);
+        let rig = layers
+            .rig(&RigArgs {
+                device_id: Some("alsa:radio".into()),
+                output_channel: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(rig.device.is_none());
+        assert_eq!(rig.device_id.as_deref(), Some("alsa:radio"));
+        assert_eq!(rig.output_channel, 1);
+        let rig = layers.rig(&RigArgs::default()).unwrap();
+        assert_eq!(rig.device.unwrap().value, "file-device");
+        assert!(rig.device_id.is_none());
     }
     #[test]
     fn ptt_compatibility() {
@@ -706,6 +747,8 @@ mod tests {
         assert_eq!(rig.band.as_ref().unwrap().source, Source::Env("COPPA_BAND"));
         let flags = RigArgs {
             device: Some("flag-device".into()),
+            device_id: None,
+            output_channel: 0,
             ptt: Some("none".into()),
             rigctld: Some("flag:4532".into()),
             ptt_lead_ms: Some(90),

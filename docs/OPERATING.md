@@ -9,7 +9,7 @@ build without `cpal-backend`, with the default config, logs:
 
 ```
 INFO coppad: coppad - Coppa Daemon starting version="0.3.0" git_sha="f1dcac4a6ac6" features=none
-INFO coppad: Daemon configuration loaded profile=HF_STANDARD sample_rate=48000 ptt_method=none turnaround_ms=500
+INFO coppad: Daemon configuration loaded profile=HF_STANDARD preferred_hardware_rate=48000 ptt_method=none turnaround_ms=500
 INFO coppad: Host listeners bind_address=127.0.0.1 vara_command=disabled vara_data=disabled websocket=not-built
 WARN coppad: Audio devices: none; this coppad was built without the cpal-backend feature, so it can neither receive nor transmit
 INFO coppad: PTT method="none" active=none state="not controlled" guardian="not used"
@@ -20,10 +20,10 @@ A `cpal-backend,websocket` build with rigctld PTT and the VARA and WebSocket
 servers on logs, before `Daemon ready`:
 
 ```
-INFO coppad: Audio input started device="Default Audio Device (alsa:default)" sample_rate=48000
-INFO coppad: Audio output started device="Default Audio Device (alsa:default)" sample_rate=48000
+INFO coppad: Audio input started device="Default Audio Device (alsa:default)" hardware_rate=48000 engine_rate=48000
+INFO coppad: Audio output started device="Default Audio Device (alsa:default)" hardware_rate=48000 engine_rate=48000
 INFO coppad: Host listeners bind_address=127.0.0.1 vara_command=127.0.0.1:8300 vara_data=127.0.0.1:8301 websocket=127.0.0.1:8400
-INFO coppad: Audio devices input="Default Audio Device (alsa:default)" output="Default Audio Device (alsa:default)" sample_rate=48000
+INFO coppad: Audio devices input="Default Audio Device (alsa:default)" output="Default Audio Device (alsa:default)" input_hardware_rate=48000 output_hardware_rate=48000 engine_rate=48000
 INFO coppad: PTT method="rigctld 127.0.0.1:4532" active=rigctld state="released" guardian="running, pid 28849"
 ```
 
@@ -36,6 +36,8 @@ INFO coppad: PTT method="rigctld 127.0.0.1:4532" active=rigctld state="released"
 | | `vara_command`, `vara_data`, `websocket` | The bound `ip:port` (the real port when 0 is configured), `disabled`, or, for `websocket` only, `not-built` in a build without the `websocket` feature. |
 | `Host listeners accept connections from other hosts; ...` (WARN) | `bind_address` | Logged when a listener is bound to a non-loopback address such as `0.0.0.0`: anyone who can reach it can key the transmitter. |
 | `Audio devices` | `input`, `output` | The device cpal opened, as its name and cpal id, for example `Default Audio Device (alsa:default)`. On ALSA, `default` is whatever PulseAudio, PipeWire or `.asoundrc` route it to; coppad cannot see further. A named device shows its own description and id. |
+| `Audio input/output started` | `hardware_rate`, `engine_rate` | The opened stream rate and modem profile rate; they differ when Coppa resamples. |
+| `Audio devices` | `input_hardware_rate`, `output_hardware_rate`, `engine_rate` | The effective input and output hardware rates and the modem profile rate. |
 | `Audio devices: none; ...` (WARN) | | A build without `cpal-backend`: the daemon runs but moves no audio. |
 | `PTT` | `method` | The configured method: `none`, `vox`, `rigctld <address>`, `serial <port> <dtr\|rts>` or `gpio <pin>`. |
 | | `active` | The backend actually in control: `none`, `vox`, `rigctld`, `serial` or `gpio`. An unreachable rigctld shows `active=none`. |
@@ -46,6 +48,39 @@ The `PTT` line is a WARN when PTT keeps the daemon from calling itself ready.
 `--log-level warn` hides the INFO summary lines but not the WARN ones. Set
 `NO_COLOR=1` when the log goes to a file or the journal, so each key stays next
 to its `=`.
+
+## Selecting a radio audio device
+
+Run `coppa devices` with a `cpal-backend` build to see the host's audio device
+names, IDs, and available input/output channel counts. Copy an ID into
+`[audio] input_device_id` or `output_device_id` in `coppad.toml` for exact
+selection. Leave the corresponding `input_device` or `output_device` name empty
+when setting an ID. A name is a case-insensitive substring selector only when
+it identifies one direction-capable device. If it matches several, startup
+reports their IDs and fails; if an explicit ID is missing or has the wrong
+direction, startup fails rather than using the default. IDs are host-specific
+and can change when the audio host reconfigures devices.
+
+`[audio] input_channel` and `output_channel` are zero-based and default to 0.
+Set either to 1 to use the second lane of a stereo interface. Coppa keeps
+modem audio mono: RX reads only the selected input lane; TX sends only to the
+selected output lane and silences the others. An out-of-range channel or an
+unsupported audio format is a startup error. `[audio] sample_rate` is the
+preferred *hardware* rate, not the modem engine rate. If the selected device
+cannot run that rate, Coppa chooses a supported `f32` rate nearest the engine
+rate and converts the stream, reporting both effective hardware and engine
+rates. The OFDM engine continues at its profile rate.
+
+CLI `rx`/`listen` accept `--device-id` and `--input-channel`; `tx`/`tune`
+accept `--device-id` and `--output-channel`; `tnc` accepts separate
+`--input-device-id` and `--output-device-id` flags and both channel flags.
+The legacy `--device` name option remains for a unique match. Warnings go to
+stderr, including with `--quiet`, so decoded output on stdout stays clean.
+The CLI reads a device *name* from `coppad.toml` (`[audio] input_device` and
+`output_device`, see the CLI settings section of the getting-started guide),
+but not the `_device_id` keys or the channel keys: pass `--device-id` and the
+channel flag on the command line. A `--device-id` flag replaces any device
+name from the file or `COPPA_DEVICE`.
 
 ## TX level calibration (TUNE)
 
@@ -464,6 +499,40 @@ the gap: a station with several ARQ segments queued re-keys for the next one
 the moment its own PTT releases, so the other station's ACK can still collide
 with that next frame. Sender-side turn discipline is a separate follow-up. The hardware acceptance test for this
 behaviour is `docs/testing/cable-loop-turnaround.md`.
+
+## Ending a session (DISCONNECT)
+
+A host `DISCONNECT` gets `OK` at once. coppad then sends the data the host
+already queued for the session, one frame at a time, each ACKed by the peer
+(COP-38), and only after the last ACK keys the DISCONNECT frame on its own.
+The host sees `BUFFER` fall to `BUFFER 0`, then one `DISCONNECTED`. With
+nothing queued or un-acked, `DISCONNECTED` follows at once, as before.
+
+- A repeated `DISCONNECT` changes nothing: the host still gets one
+  `DISCONNECTED`.
+- While a frame waits for its ACK, COP-38's retry budget bounds the drain:
+  a peer that never ACKs ends it after about 3 minutes. If nothing can key
+  for 10 s, for example because the frequency gate holds wideband TX,
+  coppad drops the rest sooner. Either way it
+  drops what is left, tries to send the DISCONNECT frame and pushes
+  `DISCONNECTED`. A block that held the data also refuses that frame, and
+  the peer then ends the session on its own timeout. A long queue that keeps
+  moving drains in full, so allow for its airtime: at levels 1-2 each frame
+  is about 1.4 s on air, plus the peer's ACK.
+- A `CONNECT` sent before `DISCONNECTED` arrives ends the drain at once: the
+  rest is dropped and the DISCONNECT frame goes out before the new
+  `CONNECT`.
+- A CONNECT_REQ from another station, or from the draining peer itself,
+  gets no answer while the drain runs (the draining session is still the
+  one session coppad allows), so that caller's handshake times out and it
+  must call again after `DISCONNECTED`.
+- Host data written after `DISCONNECT` is not sent on that session.
+- Data the peer sends while the drain runs is still ACKed and delivered to
+  the host, so two stations that both sent `DISCONNECT` with data queued
+  drain each other's queues instead of retrying until the budget runs out.
+- `ABORT` during the drain ends it at once (COP-42): the rest is dropped,
+  no DISCONNECT frame is sent, and the host gets one `DISCONNECTED`.
+- A remote DISCONNECT or a session timeout still drops unsent data at once.
 
 ## BUSY lines on the command port
 

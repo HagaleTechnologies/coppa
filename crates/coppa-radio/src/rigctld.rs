@@ -67,32 +67,43 @@ impl RigctldClient {
         })
     }
 
-    /// Ask the rig for its dial frequency (`f`), honestly: `Some(hz)` only on
-    /// a clean numeric answer (which also refreshes the cache), `None` on any
-    /// transport or parse failure. Unlike `RadioControl::get_frequency`, this
-    /// never falls back to the cached or construction-default value, so a
-    /// regulatory check can tell "the rig says X" from "nobody answered".
+    /// Ask the rig for its dial frequency (`f`) with a reason on failure.
+    /// `Ok(hz)` requires a clean numeric answer and refreshes the cache. An
+    /// error reports the transport failure or rigctld's answer, such as
+    /// `RPRT -5` for a hamlib timeout.
     ///
     /// Any failure invalidates the connection: a timed-out read can leave
     /// the late reply buffered on the old socket. The next command must
     /// reconnect successfully before sending or reading anything, even if
     /// earlier reconnect attempts failed.
-    pub fn poll_frequency(&mut self) -> Option<u64> {
-        let answer = self
-            .command("f")
-            .ok()
-            .and_then(|resp| resp.trim().parse::<u64>().ok());
-        match answer {
-            Some(freq) => {
+    pub fn query_frequency(&mut self) -> Result<u64> {
+        let result = self.command("f").and_then(|resp| {
+            let answer = resp.trim();
+            answer
+                .parse::<u64>()
+                .map_err(|_| anyhow!("rigctld answered {answer:?} to `f`"))
+        });
+        match result {
+            Ok(freq) => {
                 self.frequency = freq;
-                Some(freq)
+                Ok(freq)
             }
-            None => {
+            Err(error) => {
                 self.connected = false;
                 let _ = self.stream.shutdown(Shutdown::Both);
-                None
+                Err(error)
             }
         }
+    }
+
+    /// Ask the rig for its dial frequency (`f`), honestly: `Some(hz)` only on
+    /// a clean numeric answer (which also refreshes the cache), `None` on any
+    /// transport or parse failure. Unlike `RadioControl::get_frequency`, this
+    /// never falls back to the cached or construction-default value, so a
+    /// regulatory check can tell "the rig says X" from "nobody answered".
+    /// See [`Self::query_frequency`] for the reason when this returns `None`.
+    pub fn poll_frequency(&mut self) -> Option<u64> {
+        self.query_frequency().ok()
     }
 
     /// Replace the connection with a fresh one to the same address, dropping
