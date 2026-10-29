@@ -5121,6 +5121,16 @@ mod tests {
         event_loop.last_id_time = Some(Instant::now());
     }
 
+    /// COP-33: how many 1024-sample blocks of burst (or of quiet, to release a
+    /// busy gate) a test must feed `BusyGate` to change its state: the gate's
+    /// 250 ms hold plus two blocks of margin (14 at 48 kHz). Keep bursts near this
+    /// length, at least the hold and below about 20 blocks: past that, the gate's
+    /// noise-floor EWMA has adapted to a sustained white burst and it reads clear
+    /// again.
+    fn busy_burst_blocks(gate: &BusyGate) -> usize {
+        gate.hold_samples().div_ceil(1024) + 2
+    }
+
     #[test]
     fn rate_loop_caps_peer_recommendations_at_the_engine_band_limit() {
         for (profile, maximum) in [("HF_STANDARD", 8), ("VHF_FAST", 9)] {
@@ -12410,7 +12420,12 @@ mod tests {
 
             event_loop.handle_audio_in(&samples).await;
 
-            let line = read_line(&mut reader).await;
+            // The busy gate measures the whole frame and may report it as
+            // occupancy first (COP-33); that is correct, not this test's subject.
+            let mut line = read_line(&mut reader).await;
+            while line.starts_with("BUSY") {
+                line = read_line(&mut reader).await;
+            }
             assert!(
                 line.starts_with("SNR "),
                 "expected an SNR line after a decoded frame, got: {}",
@@ -14254,12 +14269,14 @@ mod tests {
             for _ in 0..10 {
                 event_loop.handle_audio_in(&noise_block(0.01)).await;
             }
-            // Inject a band-limited noise burst well above the settled floor.
-            for _ in 0..5 {
+            // Inject a band-limited noise burst well above the settled floor, long
+            // enough to outlast the gate's hold.
+            let burst_blocks = busy_burst_blocks(&event_loop.busy_gate);
+            for _ in 0..burst_blocks {
                 event_loop.handle_audio_in(&noise_block(0.5)).await;
             }
-            // Burst ends; back to quiet.
-            for _ in 0..10 {
+            // Burst ends; back to quiet for at least the hold again.
+            for _ in 0..burst_blocks {
                 event_loop.handle_audio_in(&noise_block(0.01)).await;
             }
 
@@ -14337,7 +14354,7 @@ mod tests {
                     .busy_gate
                     .observe(&noise_block(0.01, &mut counter));
             }
-            for _ in 0..5 {
+            for _ in 0..busy_burst_blocks(&event_loop.busy_gate) {
                 event_loop
                     .busy_gate
                     .observe(&noise_block(0.5, &mut counter));
@@ -14544,7 +14561,7 @@ mod tests {
                     .busy_gate
                     .observe(&noise_block(0.01, &mut counter));
             }
-            for _ in 0..5 {
+            for _ in 0..busy_burst_blocks(&event_loop.busy_gate) {
                 event_loop
                     .busy_gate
                     .observe(&noise_block(0.5, &mut counter));
@@ -14613,14 +14630,30 @@ mod tests {
 
             // Pre-load the ring: quiet noise first (so the busy gate reads
             // clear during the wait, same as the injected-occupancy test
-            // above), then the CONNECT_REQ audio after it.
+            // above), then the CONNECT_REQ audio after it. The CONNECT_REQ is
+            // real in-band energy and correctly reads busy again (COP-33), so
+            // quiet noise follows it too, long enough for the gate to clear a
+            // second time: `with_lead_and_trail`'s exact digital silence drags
+            // the noise floor far down, and the floor needs about 30 segments
+            // to climb back before the hold can even start. 15 and 40 blocks
+            // were measured to hang here; 80 passes.
             for _ in 0..15 {
                 audio_in_tx.write(&noise_block(0.01, &mut counter));
             }
             audio_in_tx.write(&req_audio);
+            for _ in 0..80 {
+                audio_in_tx.write(&noise_block(0.01, &mut counter));
+            }
 
             let payload = vec![0.25f32; 500]; // stand-in "encoded frame" audio
-            event_loop.transmit_samples(&payload).await;
+                                              // Bounded, so a gate that never clears fails this test instead of
+                                              // hanging it.
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                event_loop.transmit_samples(&payload),
+            )
+            .await
+            .expect("the busy-channel wait must resolve once the channel is quiet");
 
             assert!(
                 !event_loop.busy_gate.current(),
@@ -14712,7 +14745,7 @@ mod tests {
                     .busy_gate
                     .observe(&noise_block(0.01, &mut counter));
             }
-            for _ in 0..5 {
+            for _ in 0..busy_burst_blocks(&event_loop.busy_gate) {
                 event_loop
                     .busy_gate
                     .observe(&noise_block(0.5, &mut counter));
@@ -14939,7 +14972,7 @@ mod tests {
                     .busy_gate
                     .observe(&noise_block(0.01, &mut counter));
             }
-            for _ in 0..5 {
+            for _ in 0..busy_burst_blocks(&event_loop.busy_gate) {
                 event_loop
                     .busy_gate
                     .observe(&noise_block(0.5, &mut counter));
@@ -15320,10 +15353,12 @@ mod tests {
             for _ in 0..10 {
                 event_loop.busy_gate.observe(&noise(0.01));
             }
-            for _ in 0..5 {
+            for _ in 0..busy_burst_blocks(&event_loop.busy_gate) {
                 event_loop.busy_gate.observe(&noise(0.5));
             }
             assert!(event_loop.busy_gate.current());
+            // Releasing the courtesy wait takes the gate's hold of quiet audio.
+            let release_blocks = busy_burst_blocks(&event_loop.busy_gate);
             event_loop.tx_on_air_bytes = 5;
             {
                 let tx = event_loop.transmit_samples(&SAMPLES);
@@ -15336,7 +15371,9 @@ mod tests {
                 // The initial frequency check passed. Retune while held,
                 // then feed quiet audio to release the courtesy wait.
                 *rig.answer.lock().unwrap() = "14074000".into();
-                audio_in_tx.write(&noise(0.01));
+                for _ in 0..release_blocks {
+                    audio_in_tx.write(&noise(0.01));
+                }
                 tokio::time::timeout(Duration::from_secs(5), tx)
                     .await
                     .unwrap();
@@ -15521,10 +15558,12 @@ mod tests {
             for _ in 0..10 {
                 event_loop.busy_gate.observe(&noise(0.01));
             }
-            for _ in 0..5 {
+            for _ in 0..busy_burst_blocks(&event_loop.busy_gate) {
                 event_loop.busy_gate.observe(&noise(0.5));
             }
             assert!(event_loop.busy_gate.current());
+            // Releasing the courtesy wait takes the gate's hold of quiet audio.
+            let release_blocks = busy_burst_blocks(&event_loop.busy_gate);
             // Two queued non-ARQ payloads: the drain passes its gate check
             // on 2m, pops the first, and blocks in the courtesy wait.
             event_loop.tx_queue.push_back((None, b"first".to_vec()));
@@ -15540,7 +15579,9 @@ mod tests {
                 // The rig retunes to HF during the wait, then the channel
                 // goes quiet and the courtesy wait releases into a refusal.
                 *rig.answer.lock().unwrap() = "14074000".into();
-                audio_in_tx.write(&noise(0.01));
+                for _ in 0..release_blocks {
+                    audio_in_tx.write(&noise(0.01));
+                }
                 tokio::time::timeout(Duration::from_secs(5), drain)
                     .await
                     .unwrap();
@@ -15652,10 +15693,12 @@ mod tests {
             for _ in 0..10 {
                 event_loop.busy_gate.observe(&noise(0.01));
             }
-            for _ in 0..5 {
+            for _ in 0..busy_burst_blocks(&event_loop.busy_gate) {
                 event_loop.busy_gate.observe(&noise(0.5));
             }
             assert!(event_loop.busy_gate.current());
+            // Releasing the courtesy wait takes the gate's hold of quiet audio.
+            let release_blocks = busy_burst_blocks(&event_loop.busy_gate);
             {
                 let write = session_write(&mut event_loop, b"first second");
                 tokio::pin!(write);
@@ -15665,7 +15708,9 @@ mod tests {
                     _ = tokio::time::sleep(Duration::from_millis(100)) => {}
                 }
                 *rig.answer.lock().unwrap() = "14074000".into();
-                audio_in_tx.write(&noise(0.01));
+                for _ in 0..release_blocks {
+                    audio_in_tx.write(&noise(0.01));
+                }
                 tokio::time::timeout(Duration::from_secs(5), write)
                     .await
                     .unwrap();
@@ -16382,7 +16427,7 @@ mod tests {
                     .busy_gate
                     .observe(&noise_block(0.01, &mut counter));
             }
-            for _ in 0..5 {
+            for _ in 0..busy_burst_blocks(&rig.event_loop.busy_gate) {
                 rig.event_loop
                     .busy_gate
                     .observe(&noise_block(0.5, &mut counter));
