@@ -3020,7 +3020,7 @@ impl EventLoop {
 
                 // Find the first active session. One already `Disconnecting`
                 // is skipped, so a repeated DISCONNECT changes nothing: the
-                // host gets `OK` now and one `DISCONNECTED` later (COP-43).
+                // host gets its ack now and one `DISCONNECTED` later (COP-43).
                 let session_id = self
                     .session_mgr
                     .active_sessions()
@@ -3080,7 +3080,7 @@ impl EventLoop {
                         }
                         None => {}
                     }
-                } else {
+                } else if self.live_session_id().is_none() {
                     tracing::debug!("Disconnect request but no active session");
                     #[cfg(feature = "ardop")]
                     if is_ardop_client(client_id) {
@@ -3279,7 +3279,12 @@ impl EventLoop {
                     .find(|&&id| {
                         self.session_mgr
                             .get(id)
-                            .map(|s| s.state != SessionState::Idle && !s.is_established())
+                            .map(|s| {
+                                matches!(
+                                    s.state,
+                                    SessionState::Connecting | SessionState::Accepting
+                                )
+                            })
                             .unwrap_or(false)
                     })
                     .copied();
@@ -19366,6 +19371,123 @@ mod tests {
                 rx.try_recv().unwrap(),
                 ArdopResponse::NewState("DISC".into())
             );
+        }
+
+        async fn ardop_draining_session() -> (EventLoop, mpsc::Receiver<ArdopResponse>, u8) {
+            let (mut station, mut rx) = loop_with_ardop_client().await;
+            let (producer, _consumer) = coppa_audio::audio_ring(4_000_000);
+            station.set_audio_out(producer);
+            let id = telemetry::seed_established(&mut station);
+            station
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: FIRST_ARDOP_CMD_CLIENT_ID,
+                    data: vec![0x42; 300],
+                })
+                .await;
+            let link = station.session_link.as_ref().unwrap();
+            assert_eq!(link.tx.in_flight(), 1);
+            assert!(!link.backlog.is_empty());
+            station
+                .handle_host_event(HostEvent::DisconnectRequest {
+                    client_id: FIRST_ARDOP_CMD_CLIENT_ID,
+                })
+                .await;
+            assert_eq!(
+                station.session_mgr.get(id).unwrap().state,
+                SessionState::Disconnecting
+            );
+            assert!(station.pending_disconnect.is_some());
+            while let Ok(response) = rx.try_recv() {
+                assert!(!matches!(
+                    response,
+                    ArdopResponse::Disconnected | ArdopResponse::NewState(_)
+                ));
+            }
+            (station, rx, id)
+        }
+
+        async fn assert_ardop_drain_finishes_once(
+            station: &mut EventLoop,
+            rx: &mut mpsc::Receiver<ArdopResponse>,
+            id: u8,
+        ) {
+            assert_eq!(
+                station.session_mgr.get(id).unwrap().state,
+                SessionState::Disconnecting
+            );
+            assert!(station.pending_disconnect.is_some());
+            assert_eq!(station.buffered_tx_bytes(), 300);
+            let link = station.session_link.as_ref().unwrap();
+            assert_eq!(link.tx.in_flight(), 1);
+            assert!(!link.backlog.is_empty());
+            for _ in 0..64 {
+                if station.session_mgr.get(id).is_none() {
+                    break;
+                }
+                station.handle_ptt_change(false).await;
+                if station
+                    .session_link
+                    .as_ref()
+                    .is_some_and(|l| l.tx.in_flight() > 0)
+                {
+                    ack_in_flight(station).await;
+                }
+            }
+            assert!(station.session_mgr.get(id).is_none());
+            assert!(station.pending_disconnect.is_none());
+            assert_eq!(station.buffered_tx_bytes(), 0);
+            let mut terminal = Vec::new();
+            while let Ok(response) = rx.try_recv() {
+                if matches!(
+                    response,
+                    ArdopResponse::Disconnected | ArdopResponse::NewState(_)
+                ) {
+                    terminal.push(response);
+                }
+            }
+            assert_eq!(
+                terminal,
+                [
+                    ArdopResponse::Disconnected,
+                    ArdopResponse::NewState("DISC".into())
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn ardop_cancel_pending_preserves_a_disconnect_drain() {
+            let (mut station, mut rx, id) = ardop_draining_session().await;
+            station
+                .handle_ardop_command(FIRST_ARDOP_CMD_CLIENT_ID, "CANCELPENDING")
+                .await;
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                ArdopResponse::Echo("CANCELPENDING".into())
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "cancelling a pending call must not end a drain"
+            );
+            assert_ardop_drain_finishes_once(&mut station, &mut rx, id).await;
+        }
+
+        #[tokio::test]
+        async fn ardop_repeated_disconnect_waits_for_the_existing_drain() {
+            let (mut station, mut rx, id) = ardop_draining_session().await;
+            station
+                .handle_host_event(HostEvent::DisconnectRequest {
+                    client_id: FIRST_ARDOP_CMD_CLIENT_ID,
+                })
+                .await;
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                ArdopResponse::Echo("DISCONNECT".into())
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "a repeated close must not announce completion early"
+            );
+            assert_ardop_drain_finishes_once(&mut station, &mut rx, id).await;
         }
 
         /// The next session-critical line on an ARDOP client's queue,
