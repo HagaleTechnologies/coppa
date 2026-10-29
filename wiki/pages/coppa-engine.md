@@ -8,8 +8,8 @@ sources:
   - crates/coppa-engine/**
   - crates/coppa-protocol/src/**
 verified:
-  commit: 59b0b63
-  date: 2026-07-14
+  commit: 56361d6
+  date: 2026-10-28
 links:
   - overview
   - coppa-protocol
@@ -49,11 +49,20 @@ FFI). The main encode/decode logic is in `coppa-protocol`, not here.
   `occupied_bandwidth_hz_at(level)` previews a level's width — `coppad` uses
   both to keep a level-derived engine HF below 29.7 MHz (COP-21).
   `CoppaCore::on_vhf_profile()` reports which band is actually selected.
-- **Operating profiles:** HF_ROBUST, HF_STANDARD, HF_WIDE, HF_NARROW, VHF_FAST,
-  plus a spread-gated short-CP HF profile (Phase 3). Profile selection affects
-  carrier count, CP length, pilot density. `hf_robust` uses dense pilots;
-  `hf_standard`/`hf_wide`/`hf_narrow` are sparse — this sparse/dense distinction
-  is critical for fading performance (see [[adr-004-strongest-path-timing]]).
+- **Named profiles:** `HF_ROBUST` (level 1), `HF_STANDARD` (level 2),
+  `EMERGENCY` (level 1) and `VHF_FAST` (level 8). A named profile is a preset of
+  band, speed level and compression. `EMERGENCY` is `HF_ROBUST` on the air: the
+  two build identical engines, and `coppa profiles` says so. Every HF profile
+  runs the `hf_standard` OFDM profile (or its negotiated short-CP twin), and
+  `VHF_FAST` runs `vhf_wide`; the `hf_robust`/`hf_wide`/`hf_narrow`
+  `CoppaProfile` constructors (codec-level, in
+  `crates/coppa-codec/src/ofdm/mod.rs`, with `hf_standard_short_cp()`) are not
+  reachable from a named profile. Pilot
+  density still matters for fading: `hf_robust` uses dense pilots, the others
+  sparse (see [[adr-004-strongest-path-timing]]).
+- **`coppa_engine::ladder`** assembles each speed level's modulation, code rate,
+  max bytes, air time and bandwidth per band from the encoder's own functions;
+  `coppa profiles` prints it (COP-55).
 
 ## Why it is shaped this way
 

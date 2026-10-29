@@ -62,6 +62,7 @@ coppa-protocol = { path = "crates/coppa-protocol" }
 coppa-dsp = { path = "crates/coppa-dsp" }
 
 [dev-dependencies]
+coppa-bench = { path = "crates/coppa-bench" }
 coppa-channel = { path = "crates/coppa-channel" }
 coppa-audio = { path = "crates/coppa-audio" }
 num-complex = { workspace = true }

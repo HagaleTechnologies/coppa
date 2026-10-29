@@ -12,7 +12,7 @@ use coppa_host::vara::{
 use coppa_host::{HostEvent, HostResponse};
 use coppa_ml::CpRecommendation;
 use coppa_ml::{BusyGate, CpGate, RateLoop};
-use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx};
+use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx, DEFAULT_MAX_RETRANSMIT};
 use coppa_protocol::cp_negotiator::{ContentAction, CpMode, CpNegotiator};
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu, StationIdPayload};
 use coppa_protocol::modem::max_payload_for_level;
@@ -85,6 +85,60 @@ fn min_level_budget() -> usize {
 /// turnaround") make a second in-flight frame collide with the peer's ACK.
 const SESSION_ARQ_WINDOW: u8 = 1;
 
+/// COP-68: how long a fade-held session link waits with ZERO peer evidence
+/// (no fully decoded MAC PDU from the peer, no header-only PHY decode)
+/// before tearing down. Derived like `SWITCH_PROBATION_SECS`'s margin: the
+/// bench's Good-preset budget exhaustions (368-492 s of a ramp) precede
+/// Watterson-Good level-1 decodability returning (~480 s) by up to ~112 s,
+/// so 180 s covers the measured worst gap with margin; and it bounds a dead
+/// channel's cost to ~3 fallback frames (1.365 s airtime each) at the 60 s
+/// RTO cap. A peer that stays decodable in either direction holds the link
+/// indefinitely (the IONOS never-drop property); a dead one still ends in
+/// bounded time (worst case ~195 s + 180 s).
+const SESSION_FALLBACK_NO_EVIDENCE: Duration = Duration::from_secs(180);
+
+/// COP-68: retransmit-budget grant per fade-hold event (entry and every
+/// peer-evidence refresh). At the 60 s RTO cap one grant spans >= 10 min,
+/// far past `SESSION_FALLBACK_NO_EVIDENCE`, so the grant can never be what
+/// saves or kills the link -- it only keeps `get_retransmits` returning the
+/// segment while evidence flows. The wall-clock no-evidence bound is what
+/// actually binds.
+const SESSION_FALLBACK_ATTEMPT_GRANT: u8 = 10;
+
+/// COP-68: fade-hold state, entered when the in-flight segment first
+/// exhausts the normal retransmit budget. The link is torn down only after
+/// `no_evidence` of zero peer decodability, measured from the LATER of
+/// `entered_at` and the last peer evidence (see
+/// `SessionLink::last_peer_evidence`): a fully faded link spends the whole
+/// normal budget (~135 s at the default RTO) with zero evidence, so a
+/// bound anchored on that stale evidence alone would expire before the
+/// first fallback retransmission is even due (~195 s). While the peer
+/// stays decodable the budget is re-granted and the segment retransmits
+/// at `level` -- the most robust level whose payload budget fits the
+/// segment's encoded frame (`fittest_level`).
+struct SessionFallback {
+    level: u8,
+    /// Test-shrinkable per-link copy of `SESSION_FALLBACK_NO_EVIDENCE`
+    /// (mutated by tests the way `fast_session_rto` swaps the RTO).
+    no_evidence: Duration,
+    /// When the hold was entered; the no-evidence bound's other anchor.
+    entered_at: Instant,
+}
+
+/// COP-68: the most robust level (lowest number) at or below `current`
+/// whose one-codeword payload budget fits `encoded_len` bytes -- the same
+/// `encoded_payload_len` measure session chunking sizes against, so a
+/// chunk that fit its original level by construction fits the answer here
+/// whenever any lower level's budget also holds it. Falls back to
+/// `current` when nothing lower fits (a segment of 118-178 encoded bytes
+/// has no lower level on today's ladder): the hold still holds, it just
+/// retransmits at the level it already had.
+fn fittest_level(encoded_len: usize, current: u8) -> u8 {
+    (1..=current)
+        .find(|&l| max_payload_for_level(l).is_some_and(|budget| budget >= encoded_len))
+        .unwrap_or(current)
+}
+
 /// COP-38 (D2): the established session's reliable-delivery state. One per
 /// `EventLoop`: every daemon caller treats the session link as singular.
 struct SessionLink {
@@ -100,9 +154,15 @@ struct SessionLink {
     /// Host bytes not yet cut into a segment. Chunked at drain time with the
     /// exact seq that will carry them (D5).
     backlog: VecDeque<u8>,
-    /// Armed once the in-flight segment has used its last retransmission;
-    /// the link fails if no ACK arrives by then (D7).
-    give_up_at: Option<Instant>,
+    /// COP-68: fade-hold state, entered when the in-flight segment first
+    /// exhausts the normal retransmit budget (replaces COP-38's
+    /// `give_up_at` one-RTO death). `None` in the normal regime.
+    fallback: Option<SessionFallback>,
+    /// COP-68: last instant the peer proved itself decodable -- every fully
+    /// decoded MAC PDU from `remote` and every header-only PHY decode
+    /// refreshes it. Initialized at link creation (creation itself follows a
+    /// decoded peer frame).
+    last_peer_evidence: Instant,
     /// One warning per link for a payload that is not a reliable
     /// `TransportPdu`, i.e. a pre-0.3.0 peer (D3).
     warned_legacy_payload: bool,
@@ -148,12 +208,15 @@ fn session_ack_frame(link: &SessionLink) -> Vec<u8> {
 ///
 /// - `MYCALL <call>` valid → `OK` (the daemon applies it as the runtime
 ///   callsign); invalid or missing → `WRONG`.
-/// - `LISTEN ON`/`LISTEN OFF` → `OK`; any other argument → `WRONG`.
+/// - `LISTEN ON`/`LISTEN OFF` → `OK`; any other argument → `WRONG`. While
+///   listening, an inbound connect attempt the daemon answers then pushes
+///   `PENDING`, and the attempt ends in `CONNECTED` or `CANCELPENDING`.
 /// - `TUNE [seconds]` (coppa extension) → `OK`, even when the tone itself is
 ///   then refused for want of a callsign (`transmit_samples` logs why).
 /// - `CONNECT <src> <dst>` → `OK` (then the eventual `CONNECTED`/`DISCONNECTED`
 ///   outcome); fewer than two callsigns → `WRONG`.
-/// - `DISCONNECT` → `OK` (then `DISCONNECTED` if a session existed).
+/// - `DISCONNECT` → `OK` (then `DISCONNECTED` if a session existed,
+///   preceded by `CANCELPENDING` when it was a pending inbound one).
 /// - `VERSION` → a `VERSION Coppa <pkg version>` line, never `OK`.
 /// - `COMPRESSION …`, `BW500`, `BW2300`, `BW2750`, `ABORT` → `OK`: accepted,
 ///   not implemented (matches VARA's own replies to commands Pat sends every
@@ -285,6 +348,12 @@ enum SessionNotice {
     },
     /// A session ended or a connect attempt failed.
     Disconnected,
+    /// COP-44: a remote station's CONNECT_REQ was accepted; the handshake
+    /// waits for its CONNECT_CFM.
+    Pending,
+    /// COP-44: the inbound handshake `Pending` announced ended without
+    /// `Connected`.
+    PendingCancelled,
 }
 
 /// Event types flowing through the daemon event loop.
@@ -370,6 +439,8 @@ pub struct EventLoop {
     /// COP-32: degraded-startup conditions `coppad` reports in place of
     /// "Daemon ready". See [`EventLoop::startup_problems`].
     startup_problems: Vec<String>,
+    /// COP-50: PTT as startup left it, for the startup log.
+    ptt_startup: crate::startup_report::PttStartup,
     /// COP-40: the operator-stated frequency source (`[radio] frequency_hz`
     /// / `band`), validated at startup -- the fallback evidence the
     /// wideband gate in `transmit_samples` uses when no live rigctld answer
@@ -623,20 +694,27 @@ impl EventLoop {
         // a restart un-keys a transmitter an earlier run left keyed (and a Linux
         // serial open's DTR assertion is undone). Before the frequency gate: even a
         // refused start releases.
-        if let Err(e) = ptt.set_ptt(PttState::Rx) {
+        let release = ptt.set_ptt(PttState::Rx).map_err(|e| e.to_string());
+        if let Err(e) = &release {
             tracing::warn!(
                 error = %e,
                 "Could not release PTT at startup; a transmitter left keyed by an earlier run may still be keyed"
             );
         }
+        // create_ptt has already parsed this; same error text if it ever fails.
+        let configured = config
+            .radio
+            .ptt_config()
+            .map_err(|e| anyhow::anyhow!("invalid [radio] ptt_method: {e}"))?;
+        let ptt_startup = crate::startup_report::PttStartup::new(
+            configured,
+            &config.radio.rigctld_address,
+            ptt.is_rigctld(),
+            release,
+        );
         // COP-32: conditions the daemon runs through but must not call ready.
-        let mut startup_problems = Vec::new();
-        if config.radio.ptt_config() == Ok(crate::config::PttConfig::Rigctld) && !ptt.is_rigctld() {
-            startup_problems.push(format!(
-                "no PTT: rigctld at {} is unreachable",
-                config.radio.rigctld_address
-            ));
-        }
+        // COP-50: a backend that refused the release is one of them.
+        let startup_problems: Vec<String> = ptt_startup.problem().into_iter().collect();
 
         // Create engine from profile; all profiles use 48kHz internally.
         // coppad's run mode rejects an unknown profile name before this point
@@ -736,6 +814,7 @@ impl EventLoop {
             ptt,
             ptt_guardian: None,
             startup_problems,
+            ptt_startup,
             radio_frequency,
             tx_held_by_frequency_gate: false,
             session_tx_held_by_frequency_gate: false,
@@ -855,7 +934,7 @@ impl EventLoop {
                     };
                     let ptt = coppa_radio::ptt_serial::SerialPtt::open(&port, serial_line, false)
                         .map_err(|e| {
-                        anyhow::anyhow!("failed to open serial PTT port {port}: {e}")
+                        anyhow::anyhow!("failed to open serial PTT port {port}: {e:#}")
                     })?;
                     Ok(PttBackend::Other(Box::new(ptt)))
                 }
@@ -873,11 +952,11 @@ impl EventLoop {
                 {
                     let pin_num: u32 = pin.parse().map_err(|_| {
                         anyhow::anyhow!(
-                            "invalid GPIO pin {pin:?}: expected a plain pin number, e.g. \"gpio:17\""
+                            "invalid GPIO pin {pin:?}: expected a plain pin number, e.g. \"gpio:529\""
                         )
                     })?;
                     let ptt = coppa_radio::ptt_gpio::GpioPtt::open(pin_num, false)
-                        .map_err(|e| anyhow::anyhow!("failed to open GPIO PTT pin {pin}: {e}"))?;
+                        .map_err(|e| anyhow::anyhow!("failed to open GPIO PTT pin {pin}: {e:#}"))?;
                     Ok(PttBackend::Other(Box::new(ptt)))
                 }
                 #[cfg(not(all(feature = "gpio-ptt", target_os = "linux")))]
@@ -1137,10 +1216,15 @@ impl EventLoop {
     }
 
     /// COP-32: conditions found while starting that leave the daemon running
-    /// but unable to do part of its job (today: rigctld unreachable, so no
-    /// PTT). Empty when startup was clean.
+    /// but unable to do part of its job (today: rigctld unreachable, or a
+    /// refused startup PTT release). Empty when startup was clean.
     pub fn startup_problems(&self) -> &[String] {
         &self.startup_problems
+    }
+
+    /// COP-50: the configured and active PTT backend and the startup release's outcome.
+    pub fn ptt_startup(&self) -> &crate::startup_report::PttStartup {
+        &self.ptt_startup
     }
 
     /// Get a sender for injecting events into the loop.
@@ -1305,6 +1389,10 @@ impl EventLoop {
                 )
             }
             SessionNotice::Disconnected => ("DISCONNECTED".to_string(), VaraResponse::Disconnected),
+            SessionNotice::Pending => ("PENDING".to_string(), VaraResponse::Pending),
+            SessionNotice::PendingCancelled => {
+                ("CANCELPENDING".to_string(), VaraResponse::CancelPending)
+            }
         };
         if let Some(ref tx) = self.response_tx {
             let _ = tx.send(HostResponse::StatusUpdate { client_id, status });
@@ -1315,6 +1403,17 @@ impl EventLoop {
         self.emit_vara(vara).await;
         #[cfg(feature = "websocket")]
         {
+            let msg = match notice {
+                SessionNotice::Connected { remote, .. } => {
+                    coppa_host::websocket::WsServerMessage::Connected {
+                        remote_call: remote.to_string(),
+                    }
+                }
+                SessionNotice::Disconnected => coppa_host::websocket::WsServerMessage::Disconnected,
+                // The WebSocket API has no LISTEN, so it never takes part in
+                // an inbound attempt.
+                SessionNotice::Pending | SessionNotice::PendingCancelled => return,
+            };
             let remote = self.established_remote();
             if let Some(ref status) = self.ws_status {
                 let mut snap = status.lock().await;
@@ -1322,16 +1421,6 @@ impl EventLoop {
                 snap.remote_call = remote.map(|cs| cs.to_string());
             }
             if let Some(ref ws_tx) = self.ws_broadcast {
-                let msg = match notice {
-                    SessionNotice::Connected { remote, .. } => {
-                        coppa_host::websocket::WsServerMessage::Connected {
-                            remote_call: remote.to_string(),
-                        }
-                    }
-                    SessionNotice::Disconnected => {
-                        coppa_host::websocket::WsServerMessage::Disconnected
-                    }
-                };
                 if let Ok(json) = serde_json::to_string(&msg) {
                     let _ = ws_tx.send(json); // An error means no client is subscribed.
                 }
@@ -1340,12 +1429,37 @@ impl EventLoop {
     }
 
     async fn reap_timed_out_sessions(&mut self) {
+        // `cleanup_timed_out` returns only IDs, so note which sessions were
+        // pending inbound handshakes first (COP-44: those end in
+        // CANCELPENDING, not DISCONNECTED).
+        let pending = self.accepting_sessions();
         let removed = self.session_mgr.cleanup_timed_out();
         for id in removed {
             tracing::warn!(session_id = id, "Session timed out");
             self.discard_session_tx(id).await;
-            self.notify_session(0, SessionNotice::Disconnected).await;
+            let notice = if pending.contains(&id) {
+                SessionNotice::PendingCancelled
+            } else {
+                SessionNotice::Disconnected
+            };
+            self.notify_session(0, notice).await;
         }
+    }
+
+    /// COP-44: the sessions in `Accepting`, the inbound handshakes a host
+    /// was told were `PENDING`.
+    fn accepting_sessions(&self) -> Vec<u8> {
+        self.session_mgr
+            .active_sessions()
+            .into_iter()
+            .filter(|&id| self.is_accepting(id))
+            .collect()
+    }
+
+    fn is_accepting(&self, session_id: u8) -> bool {
+        self.session_mgr
+            .get(session_id)
+            .is_some_and(|s| s.state == SessionState::Accepting)
     }
 
     /// COP-40: retry a TX-queue (or, COP-41, session-queue) drain the
@@ -1602,6 +1716,19 @@ impl EventLoop {
             }
         }
         self.tx_frame_count += 1;
+        // COP-46: a sent session PDU is activity (`Session::touch`'s
+        // contract). The peer's ACK touches the session too, but only once
+        // it arrives: without this, the first frame after 30 s of quiet
+        // leaves `session_cleanup` free to key a KEEPALIVE on top of the
+        // peer's ACK, which then costs a retransmission.
+        if let Some(session) = self
+            .session_link
+            .as_ref()
+            .map(|l| l.session_id)
+            .and_then(|id| self.session_mgr.get_mut(id))
+        {
+            session.touch();
+        }
         tracing::debug!(
             seq,
             frame = self.tx_frame_count,
@@ -1666,7 +1793,8 @@ impl EventLoop {
             tx: ArqTx::new(config),
             rx: ArqRx::new(SESSION_ARQ_WINDOW),
             backlog: VecDeque::new(),
-            give_up_at: None,
+            fallback: None,
+            last_peer_evidence: Instant::now(),
             warned_legacy_payload: false,
         });
     }
@@ -1707,24 +1835,41 @@ impl EventLoop {
             .map(|s| s.remote.clone())
     }
 
-    /// COP-38 (D7): the connected-session retransmit pass. Runs on `run()`'s
-    /// 500 ms retransmit tick whatever `arq_enabled` says (D1). A frame is
-    /// rebuilt from its segment data, byte-identical to the original; once
-    /// it has used its last retransmission the link gets one more RTO for a
-    /// late ACK and then fails (`fail_session_link`).
+    /// COP-38 (D7) + COP-68: the connected-session retransmit pass. Runs on
+    /// `run()`'s 500 ms retransmit tick whatever `arq_enabled` says (D1). A
+    /// frame is rebuilt from its segment data, byte-identical to the
+    /// original. Once it has used its last retransmission the link enters
+    /// the COP-68 fade hold instead of dying: retries continue at the
+    /// fittest robust level with an adaptively re-granted budget, and only
+    /// `SESSION_FALLBACK_NO_EVIDENCE` (default 180 s) with zero peer
+    /// evidence tears the session down (`fail_session_link`).
     async fn check_session_retransmits(&mut self) {
         let now = Instant::now();
         let Some(link) = self.session_link.as_ref() else {
             return;
         };
-        if link.give_up_at.is_some_and(|t| now >= t) && link.tx.in_flight() > 0 {
-            let session_id = link.session_id;
-            self.fail_session_link(session_id).await;
-            return;
+        // COP-68: the give-up bound is wall-clock peer decodability, not
+        // "budget exhausted + one RTO" -- a link whose peer answered (or
+        // whose header still decodes) at any point in the window stays
+        // held. The bound runs from the LATER of hold entry and the last
+        // peer evidence: a fully faded link reaches entry with its
+        // evidence long stale (the ~135 s normal-budget backoff already
+        // elapsed), and an evidence-only anchor would tear the link down
+        // before the first fallback retransmission (~195 s) -- defeating
+        // the hold's robust-level retry outright.
+        if let Some(fallback) = link.fallback.as_ref() {
+            let bound_start = fallback.entered_at.max(link.last_peer_evidence);
+            if link.tx.in_flight() > 0 && now >= bound_start + fallback.no_evidence {
+                let session_id = link.session_id;
+                self.fail_session_link(session_id).await;
+                return;
+            }
         }
         // COP-40: `get_retransmits` backs the RTO off whenever it returns a
         // segment, so asking while the gate refuses would spend backoff and
         // budget on a refusal the first-send path holds without loss.
+        // During a refusal the COP-68 evidence clock keeps running -- by
+        // design: we are not listening, so silence proves nothing either way.
         if self
             .session_link
             .as_ref()
@@ -1751,8 +1896,17 @@ impl EventLoop {
                 .session_link
                 .as_ref()
                 .and_then(|l| l.tx.transmit_count(seq))
-                .map_or(0, |count| count + 1);
-            match self.engine.encode_bytes(&frame) {
+                .map_or(0, |count| count.saturating_add(1));
+            // COP-68: while the fade hold is active, the rebuilt
+            // byte-identical frame is encoded at the fallback level -- the
+            // most robust level whose payload budget fits it. The normal
+            // regime's `encode_bytes` (the engine's current level) is
+            // byte-for-byte unchanged.
+            let encoded = match self.session_link.as_ref().and_then(|l| l.fallback.as_ref()) {
+                Some(fallback) => self.engine.encode_bytes_with_level(&frame, fallback.level),
+                None => self.engine.encode_bytes(&frame),
+            };
+            match encoded {
                 Ok(samples) => {
                     tracing::debug!(seq, attempt, "Retransmitting session frame");
                     Box::pin(self.transmit_samples(&samples)).await;
@@ -1768,8 +1922,37 @@ impl EventLoop {
             // run out.
             if let Some(link) = self.session_link.as_mut() {
                 let _ = link.tx.mark_retransmitted(seq, Instant::now());
-                if link.tx.is_failed(seq) && link.give_up_at.is_none() {
-                    link.give_up_at = Some(Instant::now() + link.tx.rto());
+                if link.tx.is_failed(seq) && link.fallback.is_none() {
+                    // COP-68: first exhaustion enters the fade hold. The
+                    // fittest level is computed over the segment's rebuilt
+                    // frame with the same `encoded_payload_len` measure the
+                    // chunker used, so the encode above cannot fail for
+                    // budget reasons at the fallback level unless nothing
+                    // lower fits (then `fittest_level` returned the current
+                    // level, logged here rather than silently).
+                    let level = fittest_level(
+                        self.engine.encoded_payload_len(&frame),
+                        self.engine.speed_level(),
+                    );
+                    let grant = link
+                        .tx
+                        .transmit_count(seq)
+                        .unwrap_or(0)
+                        .saturating_add(SESSION_FALLBACK_ATTEMPT_GRANT);
+                    link.tx.set_max_retransmit(grant);
+                    link.fallback = Some(SessionFallback {
+                        level,
+                        no_evidence: SESSION_FALLBACK_NO_EVIDENCE,
+                        entered_at: now,
+                    });
+                    tracing::info!(
+                        seq,
+                        fallback_level = level,
+                        no_evidence_secs = SESSION_FALLBACK_NO_EVIDENCE.as_secs(),
+                        "Session fade hold: retransmit budget exhausted; \
+                         holding at the fittest robust level until the \
+                         no-evidence bound"
+                    );
                 }
             }
         }
@@ -1798,10 +1981,12 @@ impl EventLoop {
 
     /// Tear down `session_id` at once: drop its link (`BUFFER` reports the
     /// change), send a best-effort DISCONNECT to the peer, remove the
-    /// session and tell the host `DISCONNECTED`. Shared by the host's
+    /// session and tell the host `DISCONNECTED` (after `CANCELPENDING` when
+    /// it was a pending inbound handshake). Shared by the host's
     /// `DISCONNECT` and COP-38's link failure, so no session data plays after
     /// the host hears `DISCONNECTED`.
     async fn end_session(&mut self, session_id: u8, client_id: u32) {
+        let was_pending = self.is_accepting(session_id);
         self.discard_session_tx(session_id).await;
         if let Some(session) = self.session_mgr.get_mut(session_id) {
             match session.disconnect() {
@@ -1820,6 +2005,12 @@ impl EventLoop {
             }
         }
         self.session_mgr.remove(session_id);
+        // COP-44: close the host's PENDING first; DISCONNECTED still answers
+        // its DISCONNECT.
+        if was_pending {
+            self.notify_session(client_id, SessionNotice::PendingCancelled)
+                .await;
+        }
         self.notify_session(client_id, SessionNotice::Disconnected)
             .await;
     }
@@ -1992,6 +2183,8 @@ impl EventLoop {
                                 if let Ok(ka_pdu) = session.keepalive() {
                                     let ka_bytes = ka_pdu.to_bytes();
                                     if let Ok(samples) = self.engine.encode_bytes(&ka_bytes) {
+                                        // COP-46: `tools/pat-loop` counts these.
+                                        tracing::info!(session = id, "Sending session KEEPALIVE");
                                         self.transmit_samples(&samples).await;
                                     }
                                 }
@@ -2526,7 +2719,18 @@ impl EventLoop {
     /// overflowed. Moving the decode to a worker thread would be the fix if this
     /// ever becomes a real problem.
     async fn decode_and_dispatch_audio(&mut self, samples: &[f32]) {
-        for frame in self.engine.push_samples(samples) {
+        // COP-68: a header-only PHY decode (the peer's preamble and protected
+        // header decoded, the payload failed FEC) is peer evidence. The
+        // counter carries no callsign, so the single session link is
+        // refreshed unconditionally (COP-38 D2: one link per daemon): worst
+        // case a third station's decodable traffic DELAYS teardown -- it can
+        // only delay, never corrupt delivery.
+        let header_only_before = self.engine.header_only_decodes();
+        let frames = self.engine.push_samples(samples);
+        if self.engine.header_only_decodes() > header_only_before {
+            self.note_peer_evidence();
+        }
+        for frame in frames {
             let snr_db = frame.snr_db;
             let recommended_level = frame.recommended_level;
             let delay_spread_ms = frame.delay_spread_ms;
@@ -4289,7 +4493,44 @@ impl EventLoop {
 
     // ── Session handling methods ──────────────────────────────────────
 
+    /// COP-68: the peer just proved itself decodable. Refreshes the session
+    /// link's evidence clock and, while the fade hold is active, re-grants
+    /// the retransmit budget (`transmit_count + SESSION_FALLBACK_ATTEMPT_
+    /// GRANT`) so `is_failed` clears and retries resume on the existing
+    /// backoff schedule. Called for every fully decoded MAC PDU whose source
+    /// is the session's remote, and for every header-only PHY decode.
+    ///
+    /// The grant is naturally monotone: `transmit_count` only grows for an
+    /// in-flight segment (only an ACK clears the slot, and an ACK that
+    /// empties the window exits the hold entirely), so
+    /// `transmit_count + GRANT` always dominates the previous grant.
+    fn note_peer_evidence(&mut self) {
+        let Some(link) = self.session_link.as_mut() else {
+            return;
+        };
+        link.last_peer_evidence = Instant::now();
+        if link.fallback.is_some() && link.tx.in_flight() > 0 {
+            let seq = link.tx.send_base();
+            if let Some(count) = link.tx.transmit_count(seq) {
+                let grant = count.saturating_add(SESSION_FALLBACK_ATTEMPT_GRANT);
+                link.tx.set_max_retransmit(grant);
+            }
+        }
+    }
+
     async fn handle_mac_pdu(&mut self, pdu: MacPdu) {
+        // COP-68: every fully decoded MAC PDU from the session's peer is
+        // evidence the link is alive -- ACK, KEEPALIVE, Data and
+        // Connect-series alike. A one-way-faded link where only the peer's
+        // 30 s keepalives get through stays held, which is the intended
+        // IONOS behavior. PDUs from other callsigns are not evidence.
+        if self
+            .session_link
+            .as_ref()
+            .is_some_and(|l| pdu.src == l.remote)
+        {
+            self.note_peer_evidence();
+        }
         match pdu.frame_type {
             MacFrameType::ConnectReq => self.handle_incoming_connect(pdu).await,
             MacFrameType::ConnectAck => self.handle_connect_ack_rx(pdu).await,
@@ -4342,6 +4583,33 @@ impl EventLoop {
             return;
         }
 
+        // COP-44: a repeat CONNECT_REQ from a caller whose handshake is
+        // still half-open (it did not hear our CONNECT_ACK) replaces that
+        // session, so the caller gets a fresh ACK and the daemon keeps one
+        // session. The host was told PENDING once and is not told again. The
+        // match is the one its CFM will use (`session_id_for_frame`), so a
+        // REQ on another SSID is still refused below. A repeat whose
+        // capabilities do not parse is ignored and the pending handshake
+        // stands.
+        let pending_id = self
+            .session_id_for_frame(&pdu)
+            .filter(|&id| self.is_accepting(id));
+        let replaced = match pending_id {
+            Some(_) if LinkCapabilities::from_bytes(&pdu.payload).is_err() => {
+                tracing::debug!(remote = %pdu.src, "Unreadable repeat CONNECT_REQ; ignoring");
+                return;
+            }
+            Some(id) => {
+                tracing::info!(
+                    remote = %pdu.src, session_id = id,
+                    "Repeat CONNECT_REQ; restarting the handshake"
+                );
+                self.session_mgr.remove(id);
+                true
+            }
+            None => false,
+        };
+
         // COP-38: one session at a time (`active_session_remote`). While a
         // session exists, a CONNECT_REQ, the current peer's included, gets
         // no answer, so the caller's handshake times out.
@@ -4363,6 +4631,11 @@ impl EventLoop {
                 if let Some(session) = self.session_mgr.get_mut(id) {
                     match session.handle_connect_req(&pdu.payload) {
                         Ok(ack_pdu) => {
+                            // COP-44: announce the attempt before the ACK,
+                            // whose busy-channel wait can last seconds.
+                            if !replaced {
+                                self.notify_session(0, SessionNotice::Pending).await;
+                            }
                             let ack_bytes = ack_pdu.to_bytes();
                             match self.engine.encode_bytes(&ack_bytes) {
                                 Ok(samples) => self.transmit_samples(&samples).await,
@@ -4376,6 +4649,11 @@ impl EventLoop {
                         Err(e) => {
                             tracing::warn!(error = %e, "Failed to handle CONNECT_REQ");
                             self.session_mgr.remove(id);
+                            // The session this REQ replaced is gone too.
+                            if replaced {
+                                self.notify_session(0, SessionNotice::PendingCancelled)
+                                    .await;
+                            }
                         }
                     }
                 }
@@ -4438,6 +4716,16 @@ impl EventLoop {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to handle CONNECT_CFM");
+                    // COP-44: a rejected CFM ends a pending inbound handshake
+                    // now, not 30 s later in the reaper. A stray CFM for an
+                    // established session changes nothing.
+                    if session.state == SessionState::Accepting {
+                        let session_id = session.id;
+                        self.session_mgr.remove(session_id);
+                        self.discard_session_tx(session_id).await;
+                        self.notify_session(0, SessionNotice::PendingCancelled)
+                            .await;
+                    }
                 }
             }
         } else {
@@ -4450,13 +4738,22 @@ impl EventLoop {
         // Find session ID first to avoid borrow issues
         let session_id = self.session_id_for_frame(&pdu);
         if let Some(id) = session_id {
+            // Read before `handle_disconnect` sets the session `Idle`.
+            let was_pending = self.is_accepting(id);
             if let Some(session) = self.session_mgr.get_mut(id) {
                 session.handle_disconnect();
             }
             self.session_mgr.remove(id);
             tracing::info!(remote = %remote, "Session disconnected by remote");
             self.discard_session_tx(id).await;
-            self.notify_session(0, SessionNotice::Disconnected).await;
+            // COP-44: a caller that gives up mid-handshake cancels the
+            // host's PENDING; the host never heard CONNECTED.
+            let notice = if was_pending {
+                SessionNotice::PendingCancelled
+            } else {
+                SessionNotice::Disconnected
+            };
+            self.notify_session(0, notice).await;
         } else {
             tracing::debug!(remote = %remote, "DISCONNECT from unknown remote");
         }
@@ -4578,7 +4875,16 @@ impl EventLoop {
             .tx
             .process_ack(ack.ack_num, ack.ack_bitmap, Instant::now());
         if link.tx.in_flight() == 0 {
-            link.give_up_at = None;
+            // COP-68: an ACK that empties the window ends any fade hold and
+            // restores the standard budget, so the next fade starts from 5
+            // (replaces COP-38's `give_up_at` disarm).
+            if link.fallback.take().is_some() {
+                link.tx.set_max_retransmit(DEFAULT_MAX_RETRANSMIT);
+                tracing::debug!(
+                    "Session fade hold cleared; retry budget restored to {}",
+                    DEFAULT_MAX_RETRANSMIT
+                );
+            }
         }
         if !acked.is_empty() {
             self.report_buffer().await;
@@ -4713,6 +5019,21 @@ mod tests {
             .err()
             .expect("unrecognized PTT method must be a hard error, not a silent NullPtt");
         assert!(err.to_string().contains("carrier-pigeon"));
+    }
+
+    #[cfg(all(feature = "gpio-ptt", target_os = "linux"))]
+    #[test]
+    fn test_create_ptt_gpio_open_failure_names_the_os_error() {
+        let mut config = DaemonConfig::default();
+        config.radio.ptt_method = "gpio:999999".to_string();
+        let err = EventLoop::create_ptt(&config)
+            .err()
+            .expect("an unexportable GPIO pin must be a startup error");
+        let msg = err.to_string();
+        assert!(msg.contains("failed to open GPIO PTT pin 999999"), "{msg}");
+        // EACCES (not in gpio group), EINVAL (wrong number) and EROFS/ENOENT
+        // (no writable sysfs GPIO) must be distinguishable in the log.
+        assert!(msg.contains("(os error "), "OS cause dropped: {msg}");
     }
 
     #[test]
@@ -6125,6 +6446,7 @@ mod tests {
                         VaraResponse::Connected(..)
                             | VaraResponse::Disconnected
                             | VaraResponse::Pending
+                            | VaraResponse::CancelPending
                     )
                 })
                 .collect()
@@ -6137,9 +6459,11 @@ mod tests {
         .await;
         b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_REQ"))
             .await;
-        assert!(
-            session_lines(&mut b_rx).is_empty(),
-            "REQ is not established"
+        // COP-44: the responder announces the attempt, not a connection.
+        assert_eq!(
+            session_lines(&mut b_rx),
+            [VaraResponse::Pending],
+            "REQ is pending, not established"
         );
         a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "CONNECT_ACK"))
             .await;
@@ -6184,6 +6508,7 @@ mod tests {
                         VaraResponse::Connected(..)
                             | VaraResponse::Disconnected
                             | VaraResponse::Pending
+                            | VaraResponse::CancelPending
                     )
                 })
                 .collect()
@@ -6232,9 +6557,71 @@ mod tests {
         b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_CFM"))
             .await;
 
-        let expected = [VaraResponse::Connected("W5AU".into(), "K7XYZ".into(), 2400)];
-        assert_eq!(session_lines(&mut a_rx), expected);
-        assert_eq!(session_lines(&mut b_rx), expected);
+        let connected = VaraResponse::Connected("W5AU".into(), "K7XYZ".into(), 2400);
+        assert_eq!(session_lines(&mut a_rx), std::slice::from_ref(&connected));
+        // COP-44: the responder heard PENDING at the REQ.
+        assert_eq!(session_lines(&mut b_rx), [VaraResponse::Pending, connected]);
+    }
+
+    /// COP-44: the caller's CONNECT_CFM is lost on air (COP-1 loss
+    /// injection), so the responder's half-open handshake times out. Its host
+    /// was told `PENDING`, so the reaper ends the attempt with
+    /// `CANCELPENDING`, never `DISCONNECTED` for a link it never heard of.
+    #[tokio::test]
+    async fn lost_cfm_cancels_the_pending_inbound_connect() {
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = "VK3ABC".into();
+        config.radio.ptt_pre_delay_ms = 0;
+        config.radio.ptt_tail_delay_ms = 0;
+        let mut a = EventLoop::new(config.clone()).unwrap();
+        config.engine.callsign = "W1AW".into();
+        let mut b = EventLoop::new(config).unwrap();
+        b.listening = true;
+        let (a_producer, mut a_consumer) = coppa_audio::audio_ring(1_000_000);
+        let (b_producer, mut b_consumer) = coppa_audio::audio_ring(1_000_000);
+        a.set_audio_out(a_producer);
+        b.set_audio_out(b_producer);
+        let (b_tx, mut b_rx) = mpsc::channel(64);
+        b.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, b_tx)]))));
+        fn session_lines(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<VaraResponse> {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|response| {
+                    matches!(
+                        response,
+                        VaraResponse::Connected(..)
+                            | VaraResponse::Disconnected
+                            | VaraResponse::Pending
+                            | VaraResponse::CancelPending
+                    )
+                })
+                .collect()
+        }
+
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "VK3ABC".into(),
+            destination: "W1AW".into(),
+        })
+        .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_REQ"))
+            .await;
+        assert_eq!(session_lines(&mut b_rx), [VaraResponse::Pending]);
+        a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "CONNECT_ACK"))
+            .await;
+        let _lost = take_leg(&mut a_consumer, "CONNECT_CFM");
+
+        let ids = b.session_mgr.active_sessions();
+        assert_eq!(ids.len(), 1, "{ids:?}");
+        let session = b.session_mgr.get_mut(ids[0]).unwrap();
+        assert_eq!(session.state, SessionState::Accepting);
+        session.last_activity = Instant::now()
+            .checked_sub(Duration::from_secs(
+                coppa_protocol::session::HANDSHAKE_TIMEOUT_SECS + 1,
+            ))
+            .expect("host uptime exceeds the handshake timeout");
+        b.reap_timed_out_sessions().await;
+        assert_eq!(session_lines(&mut b_rx), [VaraResponse::CancelPending]);
+        assert!(b.session_mgr.active_sessions().is_empty());
     }
 
     /// COP-28: a `MYCALL` that arrives mid-session must not break the
@@ -6404,6 +6791,59 @@ mod tests {
         std::thread::sleep(rto + Duration::from_millis(5));
     }
 
+    /// COP-68: drive `station`'s in-flight segment through retransmit passes
+    /// with every leg lost (read and discarded) until the fade hold is
+    /// entered, asserting it actually is within `max_passes`. Mirrors the
+    /// exhaustion test's loop (read -> PTT release -> sleep past RTO ->
+    /// retransmit pass).
+    async fn exhaust_into_fade_hold(
+        station: &mut EventLoop,
+        consumer: &mut coppa_audio::AudioRingConsumer,
+        max_passes: usize,
+    ) {
+        for _ in 0..max_passes {
+            if station
+                .session_link
+                .as_ref()
+                .is_some_and(|l| l.fallback.is_some())
+            {
+                return;
+            }
+            station.handle_ptt_change(false).await;
+            sleep_past_session_rto(station);
+            station.check_session_retransmits().await;
+            read_all(consumer);
+        }
+        panic!("the fade hold must be entered within {max_passes} retransmit passes");
+    }
+
+    /// COP-68: feed `station` a real KEEPALIVE MAC frame from its session
+    /// peer through `handle_mac_pdu` (the `ack_in_flight` construction
+    /// precedent), as peer evidence on the MAC path.
+    async fn keepalive_from_peer(station: &mut EventLoop) {
+        let (dest, src, ssid) = {
+            let link = station.session_link.as_ref().expect("a session link");
+            (link.local.clone(), link.remote.clone(), link.ssid)
+        };
+        let pdu = MacPdu::new(MacFrameType::Keepalive, dest, src, ssid, Vec::new());
+        station.handle_mac_pdu(pdu).await;
+    }
+
+    /// COP-68: destroy a frame's samples after its protected header region
+    /// (preamble + Golay-protected header stay decodable, the payload sees
+    /// silence) -- the deterministic shape of the level>=3 Watterson
+    /// "header decodes / payload fails" regime.
+    fn corrupt_after_header(samples: &mut [f32]) {
+        let profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
+        let symbol_len = profile.fft_size + profile.cp_samples;
+        let header_syms = coppa_codec::ofdm::header_fec::PROTECTED_HEADER_CODED_BITS
+            .div_ceil(profile.data_carriers);
+        let cut = ((3 + header_syms) * symbol_len).min(samples.len());
+        for s in samples.iter_mut().skip(cut) {
+            *s = 0.0;
+        }
+    }
+
     /// Every `DataOut` payload queued on `rx`, in order.
     fn drain_data_out(rx: &mut mpsc::UnboundedReceiver<coppa_host::HostResponse>) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
@@ -6474,6 +6914,172 @@ mod tests {
         assert!(
             a.arq_tx.is_none(),
             "session data never needs the raw ARQ pair"
+        );
+    }
+
+    /// Bench channel order, with noise referenced to clean power so a fade
+    /// reduces SNR. Padding belongs after the channel, at the RX boundary.
+    fn impair_hf_audio(raw: &[f32], leg_seed: u64) -> Vec<f32> {
+        let sample_rate = 48_000.0;
+        let filtered = coppa_channel::ssb_filter(raw, sample_rate);
+        let clean_power = coppa_channel::mean_power(&filtered);
+        let faded = coppa_channel::watterson::watterson_preset(
+            &filtered,
+            sample_rate,
+            coppa_channel::watterson::WattersonPreset::Good,
+            leg_seed ^ 0x3333_3333_3333_3333,
+        );
+        let noisy = coppa_channel::awgn_ref_seeded(
+            &faded,
+            24.0,
+            clean_power,
+            sample_rate,
+            leg_seed ^ 0x5555_5555_5555_5555,
+        );
+        let shifted = coppa_channel::frequency_shift(&noisy, 20.0, sample_rate);
+        let clocked = coppa_channel::sample_clock_offset(&shifted, 50.0)
+            .expect("50 ppm is a valid sampling clock offset");
+        with_lead_and_trail(&clocked)
+    }
+
+    async fn deliver_impaired_leg(
+        audio: &mut coppa_audio::AudioRingConsumer,
+        peer: &mut EventLoop,
+        seed: u64,
+        stage: &str,
+        unstick: bool,
+    ) -> Result<(), String> {
+        let raw = read_all(audio);
+        if raw.is_empty() {
+            return Err(format!("{stage}: no transmitted audio"));
+        }
+        if unstick {
+            unstick_decoder(peer);
+        }
+        peer.decode_and_dispatch_audio(&impair_hf_audio(&raw, seed))
+            .await;
+        Ok(())
+    }
+
+    fn session_notices_for_impaired_trial(
+        rx: &mut mpsc::Receiver<VaraResponse>,
+    ) -> Vec<VaraResponse> {
+        drain_vara(rx)
+            .into_iter()
+            .filter(|response| {
+                matches!(
+                    response,
+                    VaraResponse::Pending
+                        | VaraResponse::CancelPending
+                        | VaraResponse::Connected(..)
+                        | VaraResponse::Disconnected
+                )
+            })
+            .collect()
+    }
+
+    /// COP-71: every session leg crosses a realistic HF channel before the
+    /// peer's persistent streaming decoder and normal MAC/session dispatch.
+    #[tokio::test]
+    async fn impaired_hf_session_delivers_data_and_audio_ack() {
+        async fn trial(seed: u64) -> Result<(), String> {
+            let mut config = DaemonConfig::default();
+            config.engine.profile = "HF_STANDARD".into();
+            config.engine.callsign = "VK3ABC".into();
+            config.radio.ptt_pre_delay_ms = 0;
+            config.radio.ptt_tail_delay_ms = 0;
+            let (mut a, mut a_audio, mut a_vara) = wired_station(config.clone());
+            config.engine.callsign = "W1AW".into();
+            let (mut b, mut b_audio, mut b_vara) = wired_station(config);
+            a.listening = true;
+            b.listening = true;
+            assert_eq!(a.engine.speed_level(), 2);
+            assert_eq!(b.engine.speed_level(), 2);
+            // A separate two-frame streaming bug affects the first station-ID
+            // prepend under fading; this test isolates the session path.
+            mark_identified(&mut a);
+            mark_identified(&mut b);
+            let (host_tx, mut host_rx) = mpsc::unbounded_channel();
+            b.set_response_tx(host_tx);
+
+            a.handle_host_event(HostEvent::ConnectRequest {
+                client_id: 1,
+                source: "VK3ABC".into(),
+                destination: "W1AW".into(),
+            })
+            .await;
+            deliver_impaired_leg(&mut a_audio, &mut b, seed, "CONNECT_REQ", false).await?;
+            let notices = session_notices_for_impaired_trial(&mut b_vara);
+            if notices != [VaraResponse::Pending] {
+                return Err(format!("CONNECT_REQ: expected PENDING, got {notices:?}"));
+            }
+
+            deliver_impaired_leg(&mut b_audio, &mut a, seed + 0x100, "CONNECT_ACK", false).await?;
+            let notices = session_notices_for_impaired_trial(&mut a_vara);
+            if notices
+                != [VaraResponse::Connected(
+                    "VK3ABC".into(),
+                    "W1AW".into(),
+                    2400,
+                )]
+                || a.session_link.is_none()
+            {
+                return Err(format!("CONNECT_ACK: caller not established: {notices:?}"));
+            }
+
+            deliver_impaired_leg(&mut a_audio, &mut b, seed + 0x200, "CONNECT_CFM", true).await?;
+            let notices = session_notices_for_impaired_trial(&mut b_vara);
+            if notices
+                != [VaraResponse::Connected(
+                    "VK3ABC".into(),
+                    "W1AW".into(),
+                    2400,
+                )]
+                || b.session_link.is_none()
+            {
+                return Err(format!(
+                    "CONNECT_CFM: responder not established: {notices:?}"
+                ));
+            }
+            a.handle_ptt_change(false).await;
+            b.handle_ptt_change(false).await;
+
+            let payload = b"twenty-eight bytes of B2F!!!".to_vec();
+            a.handle_host_event(HostEvent::DataReceived {
+                client_id: 1,
+                data: payload.clone(),
+            })
+            .await;
+            if a.session_link.as_ref().unwrap().tx.in_flight() != 1 {
+                return Err("data: sender did not track the frame".into());
+            }
+            deliver_impaired_leg(&mut a_audio, &mut b, seed + 0x300, "data", true).await?;
+            let received = drain_data_out(&mut host_rx);
+            if received != [payload] {
+                return Err(format!("data: responder host received {received:?}"));
+            }
+
+            deliver_impaired_leg(&mut b_audio, &mut a, seed + 0x400, "data ACK", true).await?;
+            let in_flight = a.session_link.as_ref().unwrap().tx.in_flight();
+            if in_flight != 0 {
+                return Err(format!("data ACK: sender still has {in_flight} in flight"));
+            }
+            Ok(())
+        }
+
+        let seeds = [0x7100_u64, 0x8100, 0x9100];
+        let mut completed = 0;
+        let mut failures = Vec::new();
+        for seed in seeds {
+            match trial(seed).await {
+                Ok(()) => completed += 1,
+                Err(stage) => failures.push(format!("seed {seed:#x}: {stage}")),
+            }
+        }
+        assert!(
+            completed >= 2,
+            "only {completed}/3 complete impaired sessions; {}",
+            failures.join("; ")
         );
     }
 
@@ -6638,10 +7244,14 @@ mod tests {
         assert_eq!(a.session_link.as_ref().unwrap().tx.in_flight(), 0);
     }
 
-    /// COP-38 (D7): a link whose every frame is lost ends cleanly once the
-    /// retry budget is spent: the host hears `BUFFER 0` then `DISCONNECTED`,
-    /// the session is gone, and the last frame keyed is a DISCONNECT the
-    /// peer acts on.
+    /// COP-38 (D7) + COP-68: a link whose every frame is lost ends cleanly
+    /// once the retry budget is spent AND the fade hold's no-evidence bound
+    /// expires with no peer evidence: the host hears `BUFFER 0` then
+    /// `DISCONNECTED`, the session is gone, and the last frame keyed is a
+    /// DISCONNECT the peer acts on. (COP-68 shrinks the link's no-evidence
+    /// bound to ~100 ms the way `fast_session_rto` shrinks the RTO, so the
+    /// teardown is bounded by the no-evidence bound instead of one RTO
+    /// after exhaustion.)
     #[tokio::test]
     async fn exhausted_session_link_sends_disconnect_and_reports_disconnected() {
         let (mut a, mut b, mut a_consumer, _b_consumer) = connected_pair(0).await;
@@ -6654,6 +7264,7 @@ mod tests {
         })
         .await;
         let mut last_leg = Vec::new();
+        let mut hold_shrunk = false;
         for _ in 0..40 {
             if a.session_link.is_none() {
                 break;
@@ -6665,6 +7276,15 @@ mod tests {
             a.handle_ptt_change(false).await;
             sleep_past_session_rto(&a);
             a.check_session_retransmits().await;
+            // COP-68: once the fade hold is entered, shrink its no-evidence
+            // bound (no peer evidence has arrived, so the bound is measured
+            // from long-stale evidence and expires on the next pass).
+            if !hold_shrunk {
+                if let Some(fallback) = a.session_link.as_mut().and_then(|l| l.fallback.as_mut()) {
+                    fallback.no_evidence = Duration::from_millis(100);
+                    hold_shrunk = true;
+                }
+            }
         }
         assert!(
             a.session_link.is_none(),
@@ -6692,6 +7312,371 @@ mod tests {
         assert!(drain_status(&mut b_status_rx)
             .iter()
             .any(|l| l == "DISCONNECTED"));
+    }
+
+    /// COP-68: the fade hold keeps a link alive while the peer stays
+    /// decodable, re-grants the budget per evidence event (transmit_count
+    /// climbs past `DEFAULT_MAX_RETRANSMIT`), and still fails cleanly after
+    /// the no-evidence bound once the peer goes quiet.
+    #[tokio::test]
+    async fn session_link_holds_while_peer_still_decodable_and_fails_after_quiet() {
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        let mut status_rx = vara_lines(&mut a);
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"fade hold me".to_vec(),
+        })
+        .await;
+        read_all(&mut a_consumer); // the data frame is lost
+        exhaust_into_fade_hold(&mut a, &mut a_consumer, 20).await;
+
+        // The old policy died one RTO after exhaustion; COP-68 holds while
+        // the peer stays decodable. Each KEEPALIVE from the remote is
+        // evidence: the budget is re-granted and retries resume.
+        for _ in 0..3 {
+            sleep_past_session_rto(&a); // past the old death point
+            keepalive_from_peer(&mut a).await;
+            a.check_session_retransmits().await;
+            read_all(&mut a_consumer);
+            a.handle_ptt_change(false).await;
+            assert!(
+                a.session_link.is_some(),
+                "the hold must survive a decodable peer"
+            );
+        }
+        let link = a.session_link.as_ref().unwrap();
+        let count = link.tx.transmit_count(link.tx.send_base()).unwrap();
+        assert!(
+            count > DEFAULT_MAX_RETRANSMIT,
+            "the adaptive re-grant must push transmit_count past the normal \
+             budget (got {count})"
+        );
+
+        // Quiet: no more evidence. The link fails after the (shrunk)
+        // no-evidence bound, with the BUFFER 0 -> DISCONNECTED order intact.
+        a.session_link
+            .as_mut()
+            .unwrap()
+            .fallback
+            .as_mut()
+            .unwrap()
+            .no_evidence = Duration::from_millis(100);
+        for _ in 0..10 {
+            if a.session_link.is_none() {
+                break;
+            }
+            a.handle_ptt_change(false).await;
+            sleep_past_session_rto(&a);
+            a.check_session_retransmits().await;
+            read_all(&mut a_consumer);
+        }
+        assert!(
+            a.session_link.is_none(),
+            "the link must fail after the no-evidence bound"
+        );
+        let lines = drain_status(&mut status_rx);
+        let buffer_0 = lines.iter().position(|l| l == "BUFFER 0");
+        let disconnected = lines.iter().position(|l| l == "DISCONNECTED");
+        assert!(
+            buffer_0.is_some() && disconnected.is_some() && buffer_0 < disconnected,
+            "BUFFER 0 must precede DISCONNECTED, got {lines:?}"
+        );
+    }
+
+    /// COP-68: during the hold the retransmission drops to the fittest
+    /// robust level (level 1 for a frame that fits its 56-byte budget), the
+    /// frame bytes stay byte-identical, and a recovering ACK clears the
+    /// hold and restores the standard budget.
+    #[tokio::test]
+    async fn fade_hold_retransmits_at_fittest_level_and_recovers() {
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"tiny".to_vec(),
+        })
+        .await;
+        read_all(&mut a_consumer); // the data frame is lost
+        let seq = a.session_link.as_ref().unwrap().tx.send_base();
+        exhaust_into_fade_hold(&mut a, &mut a_consumer, 20).await;
+        let fallback = a.session_link.as_ref().unwrap().fallback.as_ref().unwrap();
+        assert_eq!(
+            fallback.level, 1,
+            "a small frame's fittest fallback level is 1"
+        );
+
+        // The next retransmission goes out at the fallback level: capture
+        // the audio leg and decode it on an independent raw decoder.
+        a.handle_ptt_change(false).await;
+        sleep_past_session_rto(&a);
+        a.check_session_retransmits().await;
+        let leg = read_all(&mut a_consumer);
+        assert!(!leg.is_empty(), "the held segment must keep retransmitting");
+        // Built exactly the way the daemon builds its own engine
+        // (`CoppaCore::new()` would differ in `compression_enabled`).
+        let mut decoder = CoppaCore::from_profile(&coppa_engine::profiles::HF_STANDARD);
+        let frames = decoder.push_samples(&with_lead_and_trail(&leg));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].speed_level, 1,
+            "the fallback retransmission must be encoded at the fallback level"
+        );
+        let link = a.session_link.as_ref().unwrap();
+        let expected = session_data_frame(link, seq, link.tx.get_segment_data(seq).unwrap());
+        assert_eq!(
+            frames[0]
+                .payload
+                .as_ref()
+                .expect("the fallback frame decodes"),
+            &expected,
+            "the fallback frame's bytes must be the segment's frame bytes"
+        );
+
+        // A recovering ACK empties the window: the hold clears and the
+        // standard budget is restored, so the next fade starts from 5.
+        ack_in_flight(&mut a).await;
+        let link = a.session_link.as_ref().unwrap();
+        assert!(link.fallback.is_none(), "the ACK must clear the fade hold");
+        assert_eq!(link.tx.max_retransmit(), DEFAULT_MAX_RETRANSMIT);
+        assert_eq!(link.tx.in_flight(), 0);
+        assert_eq!(a.buffered_tx_bytes(), 0);
+    }
+
+    /// COP-68: a segment whose encoded frame exceeds level 2's 117-byte
+    /// budget has no lower level to drop to -- the honest "nothing lower
+    /// fits" branch: the link still holds (no teardown at the old death
+    /// point) and retransmits at the current level.
+    #[tokio::test]
+    async fn oversized_segment_holds_at_current_level() {
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        fast_session_rto(&mut a);
+        a.engine.set_speed_level(4).expect("level 4 on HF");
+        let data: Vec<u8> = (0..120).map(|i| (i % 251) as u8).collect();
+        a.handle_host_event(HostEvent::DataReceived { client_id: 1, data })
+            .await;
+        read_all(&mut a_consumer); // the data frame is lost
+        let seq = a.session_link.as_ref().unwrap().tx.send_base();
+        exhaust_into_fade_hold(&mut a, &mut a_consumer, 20).await;
+        let fallback = a.session_link.as_ref().unwrap().fallback.as_ref().unwrap();
+        assert_eq!(
+            fallback.level, 4,
+            "no lower level fits a >117-byte encoded frame; the fittest is the current level"
+        );
+
+        // The link holds past the old death point (one RTO after
+        // exhaustion) and retransmits at the current level.
+        a.handle_ptt_change(false).await;
+        sleep_past_session_rto(&a);
+        a.check_session_retransmits().await;
+        assert!(
+            a.session_link.is_some(),
+            "the hold must survive even with no lower level available"
+        );
+        let leg = read_all(&mut a_consumer);
+        assert!(!leg.is_empty());
+        // Built exactly the way the daemon builds its own engine
+        // (`CoppaCore::new()` would differ in `compression_enabled`).
+        let mut decoder = CoppaCore::from_profile(&coppa_engine::profiles::HF_STANDARD);
+        let frames = decoder.push_samples(&with_lead_and_trail(&leg));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].speed_level, 4,
+            "an oversized segment retransmits at the current level"
+        );
+        let link = a.session_link.as_ref().unwrap();
+        let expected = session_data_frame(link, seq, link.tx.get_segment_data(seq).unwrap());
+        assert_eq!(
+            frames[0].payload.as_ref().expect("the held frame decodes"),
+            &expected
+        );
+    }
+
+    /// COP-68: a header-only PHY decode (preamble + protected header
+    /// decodable, payload destroyed) counts as peer evidence -- the hold
+    /// does not expire at the stale bound when one arrives, and still ends
+    /// bounded after the refreshed bound with no further evidence.
+    #[tokio::test]
+    async fn header_only_decode_counts_as_evidence() {
+        let (mut a, b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"hdr evidence".to_vec(),
+        })
+        .await;
+        read_all(&mut a_consumer); // the data frame is lost
+        exhaust_into_fade_hold(&mut a, &mut a_consumer, 20).await;
+
+        // Shrink the no-evidence bound. The stale evidence's bound expired
+        // long ago during the exhaustion loop, so the next pass would tear
+        // the link down -- unless the corrupted frame refreshes the clock.
+        a.session_link
+            .as_mut()
+            .unwrap()
+            .fallback
+            .as_mut()
+            .unwrap()
+            .no_evidence = Duration::from_millis(400);
+        let stale_bound =
+            a.session_link.as_ref().unwrap().last_peer_evidence + Duration::from_millis(400);
+
+        // A real peer frame (b's KEEPALIVE) whose payload is destroyed
+        // after the protected header: a's decoder counts it header-only.
+        let mut frame = {
+            let (dest, src, ssid) = {
+                let link = a.session_link.as_ref().unwrap();
+                (link.local.clone(), link.remote.clone(), link.ssid)
+            };
+            let pdu = MacPdu::new(MacFrameType::Keepalive, dest, src, ssid, Vec::new());
+            b.engine
+                .encode_bytes(&pdu.to_bytes())
+                .expect("the keepalive frame encodes")
+        };
+        corrupt_after_header(&mut frame);
+        a.handle_ptt_change(false).await;
+        let before_feed = Instant::now();
+        unstick_decoder(&mut a);
+        a.decode_and_dispatch_audio(&with_lead_and_trail(&frame))
+            .await;
+        assert!(
+            a.session_link.as_ref().unwrap().last_peer_evidence >= before_feed,
+            "the header-only decode must refresh the evidence clock now, \
+             not leave it stale from before the fade"
+        );
+
+        // The retransmit pass does NOT tear the link down although the
+        // pre-refresh bound is long expired.
+        a.check_session_retransmits().await;
+        assert!(
+            Instant::now() >= stale_bound,
+            "test setup: the pre-refresh no-evidence bound must already be expired"
+        );
+        assert!(
+            a.session_link.is_some(),
+            "the header-only decode's evidence refresh must hold the link"
+        );
+        read_all(&mut a_consumer);
+
+        // With no further evidence, the refreshed bound still ends the hold.
+        for _ in 0..5 {
+            if a.session_link.is_none() {
+                break;
+            }
+            a.handle_ptt_change(false).await;
+            sleep_past_session_rto(&a);
+            a.check_session_retransmits().await;
+            read_all(&mut a_consumer);
+        }
+        assert!(
+            a.session_link.is_none(),
+            "teardown must follow the refreshed no-evidence bound"
+        );
+    }
+
+    /// COP-68 (review round): the no-evidence bound runs from the LATER
+    /// of hold entry and the last peer evidence. A fully faded link spends
+    /// the whole normal budget (~135 s of backoff at the default RTO)
+    /// with zero peer evidence: anchored on that stale evidence alone, the
+    /// 180 s bound expired before the first fallback retransmission was
+    /// even due (~195 s), so the hold never actually held and no
+    /// robust-level frame ever went out.
+    #[tokio::test]
+    async fn fade_hold_no_evidence_bound_starts_at_hold_entry() {
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"full fade".to_vec(),
+        })
+        .await;
+        read_all(&mut a_consumer); // the data frame is lost
+        exhaust_into_fade_hold(&mut a, &mut a_consumer, 20).await;
+
+        // The fade began before the budget exhausted: the last evidence is
+        // older than hold entry by the whole exhaustion loop. Shrink the
+        // bound to less than the elapsed-since-evidence but more than the
+        // (near-zero) elapsed-since-entry: an evidence-anchored deadline is
+        // already in the past, an entry-anchored one is not.
+        let since_evidence = {
+            let link = a.session_link.as_ref().unwrap();
+            Instant::now().duration_since(link.last_peer_evidence)
+        };
+        assert!(
+            since_evidence > Duration::from_millis(300),
+            "test setup: the exhaustion loop must have outlasted the margin"
+        );
+        a.session_link
+            .as_mut()
+            .unwrap()
+            .fallback
+            .as_mut()
+            .unwrap()
+            .no_evidence = since_evidence - Duration::from_millis(300);
+        a.handle_ptt_change(false).await;
+        a.check_session_retransmits().await;
+        assert!(
+            a.session_link.is_some(),
+            "the no-evidence bound must run from hold entry, not from the \
+             stale pre-fade evidence -- otherwise a fully faded link dies \
+             before its first fallback retransmission"
+        );
+        read_all(&mut a_consumer);
+
+        // The bound still ends the hold once it actually elapses from
+        // entry.
+        for _ in 0..10 {
+            if a.session_link.is_none() {
+                break;
+            }
+            a.handle_ptt_change(false).await;
+            sleep_past_session_rto(&a);
+            a.check_session_retransmits().await;
+            read_all(&mut a_consumer);
+        }
+        assert!(
+            a.session_link.is_none(),
+            "teardown must follow the entry-anchored no-evidence bound"
+        );
+    }
+
+    /// COP-68 (review round): with `transmit_count` pinned at `u8::MAX` by
+    /// a long one-way hold (the adaptive grant keeps the segment retrying
+    /// and `mark_retransmitted` saturates), the daemon's next-attempt
+    /// logging calculation must saturate too -- an unsaturated `count + 1`
+    /// panicked in debug/overflow-checked builds and wrapped the `attempt`
+    /// field to 0 in release.
+    #[tokio::test]
+    async fn fade_hold_attempt_calculation_saturates_past_u8_max() {
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"saturated hold".to_vec(),
+        })
+        .await;
+        read_all(&mut a_consumer); // the data frame is lost
+        exhaust_into_fade_hold(&mut a, &mut a_consumer, 20).await;
+        let seq = a.session_link.as_ref().unwrap().tx.send_base();
+        {
+            let link = a.session_link.as_mut().unwrap();
+            link.tx.set_max_retransmit(u8::MAX);
+            while link.tx.transmit_count(seq) != Some(u8::MAX) {
+                link.tx
+                    .mark_retransmitted(seq, Instant::now())
+                    .expect("the in-flight segment stays pending");
+            }
+        }
+        a.handle_ptt_change(false).await;
+        sleep_past_session_rto(&a);
+        // Before the fix this pass panicked computing `attempt = 255 + 1`;
+        // after it the retransmission goes out and the hold continues.
+        a.check_session_retransmits().await;
+        assert!(
+            a.session_link.is_some(),
+            "the hold must survive a counter pinned at u8::MAX"
+        );
+        read_all(&mut a_consumer);
     }
 
     /// COP-38 (D9a): the 8000-byte write the old large-write test carried,
@@ -10383,9 +11368,15 @@ mod tests {
         }
 
         fn is_session_line(line: &str) -> bool {
-            ["CONNECTED", "DISCONNECTED", "CONNECTING", "PENDING"]
-                .iter()
-                .any(|prefix| line.starts_with(prefix))
+            [
+                "CONNECTED",
+                "DISCONNECTED",
+                "CONNECTING",
+                "PENDING",
+                "CANCELPENDING",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
         }
 
         async fn next_session_line(reader: &mut BufReader<OwnedReadHalf>) -> String {
@@ -10424,13 +11415,17 @@ mod tests {
             );
         }
 
+        /// COP-44: over the real command port, a listening responder hears
+        /// `PENDING` when it answers the caller's CONNECT_REQ, and
+        /// `CONNECTED` only after the CFM.
         #[tokio::test]
-        async fn responder_hears_connected_only_after_cfm() {
+        async fn responder_hears_pending_then_connected() {
             let mut station = EventLoop::new(session_config()).unwrap();
             station.listening = true;
             let (mut reader, _writer) = connect_mock_vara_client(&mut station, 19442, 19443).await;
             let mut remote = peer();
             station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            assert_eq!(next_session_line(&mut reader).await.trim_end(), "PENDING");
             assert!(read_available_lines(&mut reader)
                 .await
                 .iter()
@@ -10504,6 +11499,233 @@ mod tests {
                 next_session_line(&mut reader).await.trim_end(),
                 "DISCONNECTED"
             );
+        }
+
+        // COP-44: inbound connect attempts. Each test drives one listening
+        // responder (VK3ABC) with `peer()` (W1AW) as the caller and reads
+        // the command-port client's queue.
+
+        /// A listening responder with one in-process command-port client
+        /// (`client_id` 1) and that client's queue.
+        fn listening_responder() -> (EventLoop, mpsc::Receiver<VaraResponse>) {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            station.listening = true;
+            let (tx, rx) = mpsc::channel(64);
+            station.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, tx)]))));
+            (station, rx)
+        }
+
+        fn is_session_notice(line: &VaraResponse) -> bool {
+            matches!(
+                line,
+                VaraResponse::Pending
+                    | VaraResponse::CancelPending
+                    | VaraResponse::Connected(..)
+                    | VaraResponse::Disconnected
+            )
+        }
+
+        fn session_notices(rx: &mut mpsc::Receiver<VaraResponse>) -> Vec<VaraResponse> {
+            drain(rx).into_iter().filter(is_session_notice).collect()
+        }
+
+        /// A CFM whose negotiated capabilities exceed what both sides
+        /// advertised, so `handle_connect_cfm` rejects it.
+        fn oversized_cfm() -> MacPdu {
+            MacPdu::new(
+                MacFrameType::ConnectCfm,
+                Callsign::new("VK3ABC").unwrap(),
+                Callsign::new("W1AW").unwrap(),
+                0,
+                LinkCapabilities {
+                    max_payload_size: 9999,
+                    ..Default::default()
+                }
+                .to_bytes(),
+            )
+        }
+
+        #[tokio::test]
+        async fn peer_disconnect_during_inbound_handshake_sends_cancelpending() {
+            let (mut station, mut rx) = listening_responder();
+            let mut remote = peer();
+            station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            assert_eq!(session_notices(&mut rx), [VaraResponse::Pending]);
+            station.handle_mac_pdu(remote.disconnect().unwrap()).await;
+            assert_eq!(session_notices(&mut rx), [VaraResponse::CancelPending]);
+            assert!(station.session_mgr.active_sessions().is_empty());
+        }
+
+        #[tokio::test]
+        async fn rejected_cfm_cancels_pending_at_once() {
+            let (mut station, mut rx) = listening_responder();
+            let mut remote = peer();
+            station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            station.handle_mac_pdu(oversized_cfm()).await;
+            // No reaper call: the session ends with the rejected CFM.
+            assert_eq!(
+                session_notices(&mut rx),
+                [VaraResponse::Pending, VaraResponse::CancelPending]
+            );
+            assert!(station.session_mgr.active_sessions().is_empty());
+        }
+
+        /// A rejected CFM for an established session is a stray, not the end
+        /// of a pending handshake: it changes nothing.
+        #[tokio::test]
+        async fn rejected_cfm_for_an_established_session_changes_nothing() {
+            let (mut station, mut rx) = listening_responder();
+            let id = seed_established(&mut station);
+            station.handle_mac_pdu(oversized_cfm()).await;
+            assert!(session_notices(&mut rx).is_empty());
+            assert_eq!(station.session_mgr.active_sessions(), vec![id]);
+        }
+
+        #[tokio::test]
+        async fn host_disconnect_during_inbound_handshake_sends_cancelpending_then_disconnected() {
+            let (mut station, mut rx) = listening_responder();
+            station.handle_mac_pdu(peer().initiate().unwrap()).await;
+            station
+                .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+                .await;
+            assert_eq!(
+                session_notices(&mut rx),
+                [
+                    VaraResponse::Pending,
+                    VaraResponse::CancelPending,
+                    VaraResponse::Disconnected
+                ]
+            );
+            assert!(station.session_mgr.active_sessions().is_empty());
+        }
+
+        #[tokio::test]
+        async fn repeat_connect_req_keeps_one_session_and_one_pending() {
+            let (mut station, mut rx) = listening_responder();
+            let mut remote = peer();
+            let req = remote.initiate().unwrap();
+            station.handle_mac_pdu(req.clone()).await;
+            station.handle_mac_pdu(req).await;
+            let lines = drain(&mut rx);
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|l| is_session_notice(l))
+                    .collect::<Vec<_>>(),
+                [&VaraResponse::Pending],
+                "{lines:?}"
+            );
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|l| **l == VaraResponse::Ptt(true))
+                    .count(),
+                2,
+                "each REQ is answered with its own CONNECT_ACK: {lines:?}"
+            );
+            let ids = station.session_mgr.active_sessions();
+            assert_eq!(ids.len(), 1, "{ids:?}");
+            assert_eq!(
+                station.session_mgr.get(ids[0]).unwrap().state,
+                SessionState::Accepting
+            );
+
+            let cfm = remote
+                .handle_connect_ack(&LinkCapabilities::default().to_bytes())
+                .unwrap();
+            station.handle_mac_pdu(cfm).await;
+            assert_eq!(
+                session_notices(&mut rx),
+                [VaraResponse::Connected(
+                    "W1AW".into(),
+                    "VK3ABC".into(),
+                    2400
+                )]
+            );
+            station.reap_timed_out_sessions().await;
+            assert!(session_notices(&mut rx).is_empty());
+        }
+
+        /// A REQ from the pending caller that cannot restart its handshake
+        /// (unreadable capabilities, or another SSID) leaves the pending
+        /// handshake as it was: no line, and the original CFM still connects.
+        #[tokio::test]
+        async fn unmatched_repeat_connect_req_keeps_the_pending_handshake() {
+            let (mut station, mut rx) = listening_responder();
+            let mut remote = peer();
+            station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            assert_eq!(session_notices(&mut rx), [VaraResponse::Pending]);
+            let unreadable = MacPdu::new(
+                MacFrameType::ConnectReq,
+                Callsign::new("VK3ABC").unwrap(),
+                Callsign::new("W1AW").unwrap(),
+                0,
+                vec![0; 6],
+            );
+            let other_ssid = coppa_protocol::session::Session::new(
+                0,
+                Callsign::new("W1AW").unwrap(),
+                Callsign::new("VK3ABC").unwrap(),
+                3,
+                LinkCapabilities::default(),
+            )
+            .initiate()
+            .unwrap();
+            for (what, req) in [("unreadable", unreadable), ("SSID 3", other_ssid)] {
+                station.handle_mac_pdu(req).await;
+                assert!(session_notices(&mut rx).is_empty(), "{what}");
+                let ids = station.session_mgr.active_sessions();
+                assert_eq!(ids.len(), 1, "{what}: {ids:?}");
+                let session = station.session_mgr.get(ids[0]).unwrap();
+                assert_eq!(
+                    (session.state, session.ssid),
+                    (SessionState::Accepting, 0),
+                    "{what}"
+                );
+            }
+            let cfm = remote
+                .handle_connect_ack(&LinkCapabilities::default().to_bytes())
+                .unwrap();
+            station.handle_mac_pdu(cfm).await;
+            assert_eq!(
+                session_notices(&mut rx),
+                [VaraResponse::Connected(
+                    "W1AW".into(),
+                    "VK3ABC".into(),
+                    2400
+                )]
+            );
+        }
+
+        #[tokio::test]
+        async fn ignored_connect_req_emits_no_pending() {
+            let other_station = coppa_protocol::session::Session::new(
+                0,
+                Callsign::new("W1AW").unwrap(),
+                Callsign::new("K7XYZ").unwrap(),
+                0,
+                LinkCapabilities::default(),
+            )
+            .initiate()
+            .unwrap();
+            let short_payload = MacPdu::new(
+                MacFrameType::ConnectReq,
+                Callsign::new("VK3ABC").unwrap(),
+                Callsign::new("W1AW").unwrap(),
+                0,
+                vec![0; 6],
+            );
+            for (what, listening, req) in [
+                ("not listening", false, peer().initiate().unwrap()),
+                ("addressed to K7XYZ", true, other_station),
+                ("payload shorter than 7 bytes", true, short_payload),
+            ] {
+                let (mut station, mut rx) = listening_responder();
+                station.listening = listening;
+                station.handle_mac_pdu(req).await;
+                assert!(station.session_mgr.active_sessions().is_empty(), "{what}");
+                assert!(session_notices(&mut rx).is_empty(), "{what}");
+            }
         }
 
         /// COP-28: Pat's startup burst — commands the parser does not know
@@ -11606,6 +12828,54 @@ mod tests {
             );
         }
 
+        /// COP-46: keying a session data frame is session activity, so a
+        /// station that is busy sending its own message never keys a
+        /// KEEPALIVE in the middle of it. Before the fix only the receive
+        /// paths called `Session::touch` (`handle_session_data`,
+        /// `handle_keepalive_rx`), so ~30 s into a long transfer
+        /// `session_cleanup` keyed a KEEPALIVE right after the sender's own
+        /// last data frame -- on top of the peer's `FF` reply. Session data
+        /// has no ARQ (H-025), so that reply was lost for good, keepalives
+        /// then held the dead session open, and real Pat's `pat connect`
+        /// sat until its 900 s timeout (COP-46 plan, two-process run).
+        /// COP-38 has since made session data ARQ-protected, and the peer's
+        /// ACK touches the session as well; this checks the window between
+        /// keying a frame and that ACK arriving.
+        #[tokio::test]
+        async fn session_send_counts_as_activity() {
+            let mut event_loop = EventLoop::new(session_config()).unwrap();
+            let (mut reader, _write_half, _data_addr) =
+                connect_bridged_vara_client_ephemeral(&mut event_loop).await;
+            let id = seed_established(&mut event_loop);
+
+            // Idle long enough that `session_cleanup` would key a KEEPALIVE.
+            event_loop.session_mgr.get_mut(id).unwrap().last_activity = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(40))
+                .unwrap();
+            assert!(
+                event_loop.session_mgr.get(id).unwrap().needs_keepalive(),
+                "precondition: a 40 s idle session needs a keepalive"
+            );
+
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0x66; 12],
+                })
+                .await;
+
+            let lines = read_available_lines(&mut reader).await;
+            assert!(
+                lines.iter().any(|l| l.trim_end() == "PTT ON"),
+                "the session chunk must really key a frame, got: {:?}",
+                lines
+            );
+            assert!(
+                !event_loop.session_mgr.get(id).unwrap().needs_keepalive(),
+                "a keyed session data frame must reset the keepalive timer"
+            );
+        }
+
         /// COP-38 (D6): session `BUFFER` counts bytes the peer has not yet
         /// acknowledged, so a PTT release alone (the frame played, but may
         /// have been lost) never reports `BUFFER 0`; the peer's ACK does.
@@ -11972,7 +13242,8 @@ mod tests {
                 ),
                 rx: ArqRx::new(SESSION_ARQ_WINDOW),
                 backlog: VecDeque::new(),
-                give_up_at: None,
+                fallback: None,
+                last_peer_evidence: Instant::now(),
                 warned_legacy_payload: false,
             }
         }
@@ -14504,6 +15775,34 @@ mod tests {
             let rig = recording_rigctld("1", "14074000", true);
             assert!(EventLoop::new(rigctld_config(&rig)).is_ok());
             assert_eq!(rig.commands(), ["T 0"], "the release was attempted");
+        }
+
+        #[test]
+        fn a_failed_startup_release_is_a_startup_problem() {
+            let rig = recording_rigctld("1", "14074000", true);
+            let event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            assert_eq!(
+                event_loop.startup_problems(),
+                ["PTT release at startup failed: rigctld set_ptt failed: RPRT -1"]
+            );
+            let ptt = event_loop.ptt_startup();
+            assert_eq!(ptt.active(), "rigctld");
+            assert_eq!(
+                ptt.state(),
+                "release failed: rigctld set_ptt failed: RPRT -1"
+            );
+        }
+
+        #[test]
+        fn a_clean_startup_release_is_reported_released() {
+            let rig = recording_rigctld("1", "14074000", false);
+            let event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
+            assert!(event_loop.startup_problems().is_empty());
+            assert_eq!(event_loop.ptt_startup().state(), "released");
+            assert_eq!(
+                event_loop.ptt_startup().method(),
+                format!("rigctld {}", rig.addr)
+            );
         }
 
         #[test]

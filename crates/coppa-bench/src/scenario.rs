@@ -97,8 +97,7 @@ pub fn select_profile(level: u8) -> CoppaProfile {
 }
 
 /// Resolve a named override profile for benchmarking. `"default"` means "use the per-level
-/// `select_profile` rule"; `"standard"`/`"standard-short-cp"`/`"robust"` force that profile for
-/// every level.
+/// `select_profile` rule"; other names force that profile for every level.
 ///
 /// `"standard-short-cp"` is `hf_standard`'s cyclic-prefix variant (`cp_samples: 144` vs. `300`,
 /// every other PHY field identical). It is the ONLY pair in this workspace that isolates CP
@@ -112,8 +111,9 @@ pub fn profile_by_name(name: &str) -> Option<CoppaProfile> {
         "standard" => Some(CoppaProfile::hf_standard()),
         "standard-short-cp" => Some(CoppaProfile::hf_standard_short_cp()),
         "robust" => Some(CoppaProfile::hf_robust()),
+        "narrow" => Some(CoppaProfile::hf_narrow()),
         other => panic!(
-            "unknown profile '{other}' (expected: default|standard|standard-short-cp|robust)"
+            "unknown profile '{other}' (expected: default|standard|standard-short-cp|robust|narrow)"
         ),
     }
 }
@@ -258,5 +258,17 @@ mod tests {
         assert_eq!(robust.pilot_carriers, 12);
         assert_eq!(robust.bandwidth_id, 3);
         assert_eq!(robust.cp_samples, 300);
+    }
+
+    #[test]
+    fn narrow_profile_name_resolves_existing_geometry() {
+        let narrow = profile_by_name("narrow").expect("narrow is a benchmark override");
+        assert_eq!(narrow.data_carriers, 8);
+        assert_eq!(narrow.pilot_carriers, 2);
+        assert_eq!(narrow.bandwidth_id, 0);
+        let expected = CoppaProfile::hf_narrow();
+        assert_eq!(narrow.fft_size, expected.fft_size);
+        assert_eq!(narrow.cp_samples, expected.cp_samples);
+        assert_eq!(narrow.carrier_offset, expected.carrier_offset);
     }
 }

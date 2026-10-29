@@ -1,19 +1,18 @@
 //! Named operational profiles for common use cases.
 
-/// An operational profile defining engine parameters.
+/// A named preset of band, speed level and compression.
 ///
 /// The `speed_level` is the single parameter that controls modulation
-/// (constellation) and FEC (LDPC code rate) inside CoppaTransceiver.
+/// (constellation) and FEC (LDPC code rate) inside CoppaTransceiver; the band
+/// comes from `ofdm_profile`. Everything else a user might want to know about
+/// the level (max bytes, air time, bandwidth) is derived, not stored: see
+/// [`Profile::max_payload`] and [`crate::ladder`].
 #[derive(Debug, Clone)]
 pub struct Profile {
     /// Human-readable profile name.
     pub name: &'static str,
     /// Speed level (1-9). Selects constellation + LDPC rate.
     pub speed_level: u8,
-    /// Maximum payload size in bytes.
-    pub max_payload: usize,
-    /// ARQ window size.
-    pub arq_window: u8,
     /// Whether to enable compression.
     pub compression: bool,
     /// Target sample rate in Hz (always 48000).
@@ -28,8 +27,6 @@ pub struct Profile {
 pub const HF_ROBUST: Profile = Profile {
     name: "HF_ROBUST",
     speed_level: 1,
-    max_payload: 64,
-    arq_window: 4,
     compression: false,
     sample_rate: 48_000,
     description: "Robust HF mode for weak signals and high noise",
@@ -40,8 +37,6 @@ pub const HF_ROBUST: Profile = Profile {
 pub const VHF_FAST: Profile = Profile {
     name: "VHF_FAST",
     speed_level: 8,
-    max_payload: 255,
-    arq_window: 16,
     compression: true,
     sample_rate: 48_000,
     description: "Fast VHF mode for strong signals and low noise",
@@ -52,8 +47,6 @@ pub const VHF_FAST: Profile = Profile {
 pub const EMERGENCY: Profile = Profile {
     name: "EMERGENCY",
     speed_level: 1,
-    max_payload: 32,
-    arq_window: 2,
     compression: false,
     sample_rate: 48_000,
     description: "Emergency mode maximizing reliability",
@@ -64,13 +57,21 @@ pub const EMERGENCY: Profile = Profile {
 pub const HF_STANDARD: Profile = Profile {
     name: "HF_STANDARD",
     speed_level: 2,
-    max_payload: 128,
-    arq_window: 8,
     compression: true,
     sample_rate: 48_000,
     description: "Standard HF mode balancing speed and reliability",
     ofdm_profile: "hf",
 };
+
+impl Profile {
+    /// Largest payload, in bytes, one frame at this profile's speed level
+    /// carries: the limit `CoppaTransceiver::transmit` enforces
+    /// (`coppa_protocol::modem::max_payload_for_level`). `None` only for an
+    /// invalid speed level.
+    pub fn max_payload(&self) -> Option<usize> {
+        coppa_protocol::modem::max_payload_for_level(self.speed_level)
+    }
+}
 
 /// Get a profile by name (case-insensitive).
 pub fn get_profile(name: &str) -> Option<&'static Profile> {
@@ -96,7 +97,7 @@ mod tests {
     fn test_hf_robust_profile() {
         assert_eq!(HF_ROBUST.name, "HF_ROBUST");
         assert_eq!(HF_ROBUST.speed_level, 1);
-        assert_eq!(HF_ROBUST.max_payload, 64);
+        assert_eq!(HF_ROBUST.max_payload(), Some(56));
         assert_eq!(HF_ROBUST.ofdm_profile, "hf");
         // Verify compression is disabled
         let _ = HF_ROBUST.compression; // always false per constant definition
@@ -113,7 +114,6 @@ mod tests {
     #[test]
     fn test_emergency_profile() {
         assert_eq!(EMERGENCY.name, "EMERGENCY");
-        assert_eq!(EMERGENCY.arq_window, 2);
         // Verify compression is disabled
         let _ = EMERGENCY.compression; // always false per constant definition
     }
@@ -137,6 +137,40 @@ mod tests {
     fn test_hf_standard_profile() {
         let p = get_profile("HF_STANDARD").unwrap();
         assert_eq!(p.speed_level, 2);
-        assert_eq!(p.arq_window, 8);
+    }
+
+    #[test]
+    fn profile_max_payload_is_the_enforced_limit() {
+        let expected = [
+            (&HF_ROBUST, 56),
+            (&HF_STANDARD, 117),
+            (&VHF_FAST, 158),
+            (&EMERGENCY, 56),
+        ];
+        for (p, max) in expected {
+            assert_eq!(p.max_payload(), Some(max), "{}", p.name);
+            assert_eq!(
+                p.max_payload(),
+                coppa_protocol::modem::max_payload_for_level(p.speed_level),
+                "{}",
+                p.name
+            );
+        }
+    }
+
+    #[test]
+    fn emergency_is_hf_robust_on_the_air() {
+        use crate::{CoppaCore, EngineConfig};
+        let emergency = EngineConfig::from_profile(&EMERGENCY);
+        let robust = EngineConfig::from_profile(&HF_ROBUST);
+        assert_eq!(emergency.speed_level, robust.speed_level);
+        assert_eq!(emergency.sample_rate, robust.sample_rate);
+        assert_eq!(emergency.compression_enabled, robust.compression_enabled);
+        assert_eq!(emergency.ofdm_band, robust.ofdm_band);
+        let msg = "CQ CQ DE TEST";
+        assert_eq!(
+            CoppaCore::from_profile(&EMERGENCY).encode(msg).unwrap(),
+            CoppaCore::from_profile(&HF_ROBUST).encode(msg).unwrap()
+        );
     }
 }

@@ -3,8 +3,10 @@
 //! alias that prints the same output. These tests run the real binary.
 #![cfg(feature = "file-backend")]
 
+mod common;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 const MESSAGE: &str = "CQ CQ CQ DE VK2ABC K";
 const PAYLOAD_HEX: &str = "435120435120435120444520564b32414243204b";
@@ -27,7 +29,7 @@ impl Drop for TempWav {
 }
 
 fn coppa(args: &[&str], path: Option<&Path>) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_coppa"));
+    let mut command = common::coppa_command();
     for arg in args {
         if *arg == "<path>" {
             command.arg(path.expect("<path> needs a path"));

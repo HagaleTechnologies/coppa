@@ -125,9 +125,10 @@ impl<P: SerialLines> Drop for SerialPtt<P> {
     fn drop(&mut self) {
         if self.state == PttState::Tx {
             if let Err(e) = PttControl::set_ptt(self, PttState::Rx) {
-                eprintln!(
-                    "SerialPtt: failed to release PTT on {} on drop: {e}",
-                    self.port_name
+                tracing::error!(
+                    port = %self.port_name,
+                    error = %e,
+                    "SerialPtt: failed to release PTT on drop"
                 );
             }
         }

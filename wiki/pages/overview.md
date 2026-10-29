@@ -9,15 +9,15 @@ sources:
   - ARCHITECTURE.md
   - CLAUDE.md
 verified:
-  commit: 59b0b63
-  date: 2026-07-14
+  commit: 56361d6
+  date: 2026-10-28
 links:
 ---
 Coppa is an open-source OFDM digital modem for amateur radio written in Rust,
 published as a reference implementation of an HF modem's DSP/FEC/protocol stack.
 It is NOT RF/waveform-compatible with VARA and does not interoperate with it; the
 VARA-style TCP interface mimics VARA's TNC API surface only. The most important
-thing to know before touching it: all 12 crates operate at a fixed 48 kHz sample
+thing to know before touching it: all 12 product crates operate at a fixed 48 kHz sample
 rate; the waveform occupies a 300–2700 Hz SSB passband, which is a **wire-format
 break** from pre-Phase-1 code — and Phase 2's NR BG2 LDPC change and Phase 3's
 multi-codeword frames are further wire breaks (see [[waveform-wire-break]],
@@ -27,7 +27,7 @@ waveform definition is `docs/SPEC.md`; operator documentation is
 
 ## Where things live
 
-- `crates/coppa-dsp/` — pure DSP primitives (FFT, filters, AGC, resampling); see [[coppa-dsp]]
+- `crates/coppa-dsp/` — pure DSP primitives (FFT, filters, AGC); see [[coppa-dsp]]
 - `crates/coppa-codec/` — modulation (BPSK/QPSK/8PSK/16-64QAM), OFDM, streaming `SyncDetector`
 - `crates/coppa-protocol/` — framing, FEC (convolutional + NR BG2 LDPC), ARQ/IR-HARQ, compression; see [[coppa-protocol]]
 - `crates/coppa-channel/` — channel models for testing (AWGN, Watterson HF fading, ssb_filter)
@@ -39,6 +39,7 @@ waveform definition is `docs/SPEC.md`; operator documentation is
 - `crates/coppa-ffi/` — C FFI bindings (cdylib + staticlib), v1 text API + v2 binary/config/event API
 - `crates/coppa-cli/` — CLI binary (`coppa`), incl. live `rx` and two-tone `tune`
 - `crates/coppa-daemon/` — daemon binary (`coppad`): PTT-gated TX chokepoint, busy gate, station ID/beacon; see [[phase4-field-readiness]]
+- `crates/coppa-bench/` — measurement harness (not a product crate); its lib tests guard each level's FER waterfall
 - `docs/adr/` — eight ADRs (workspace, FEC, Phase 1 waveform, sync timing, NR BG2, Phase 2 estimation, multi-codeword, Phase 3 system layer)
 - `docs/SPEC.md` — normative waveform conformance spec; `docs/OPERATING.md` — operator guide
 - `BENCHMARKS.md` — measured performance data; normative for phase acceptance results
