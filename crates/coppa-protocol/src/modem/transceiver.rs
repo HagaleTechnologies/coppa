@@ -1730,7 +1730,7 @@ mod tests {
     }
 
     /// Regression test for the confirmed VHF `TIMING_BACKOFF`/calibration bug
-    /// (see `.superpowers/sdd/vhf-timing-backoff-fix-report.md`): every "clean
+    /// (see `docs/analysis/2026-08-01-vhf-timing-backoff-fix-report.md`): every "clean
     /// loopback" test above transmits with the preamble starting at sample 0 of
     /// the buffer, so `SyncDetector`'s `local_peak_abs.saturating_sub(TIMING_BACKOFF)`
     /// silently saturates to 0 for VHF profiles (no TX bandpass filter, so

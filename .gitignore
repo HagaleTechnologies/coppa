@@ -81,6 +81,7 @@ vara.local.toml
 .worktrees/
 
 # Internal planning/design docs (kept local, not published)
+.superpowers/
 docs/superpowers/
 
 # Raw benchmark/measurement output (regenerable; curated summary goes in BENCHMARKS.md)

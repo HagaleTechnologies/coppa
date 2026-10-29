@@ -8,7 +8,7 @@ VARA-style TCP control interface (modeled on VARA's TCP TNC API — the modem is
 profiles unified at a 48 kHz sample rate across 9 speed levels. Tickets are
 `COP-<n>`.
 
-**Read `CLAUDE.md` first.** Its "Known Limitations" section is the authoritative,
+**Read `CLAUDE.md` first, then `docs/LIMITATIONS.md`.** The limitations doc is the authoritative,
 frequently-amended record of what is measured, what is unproven, and what is
 deliberately left unfixed — it is not summarized here, on purpose. `wiki/INDEX.md`
 maps the wiki: an overview page, per-crate deep-dives, 8 numbered ADR pages, and
