@@ -387,7 +387,11 @@ Field semantics:
 - `payload_len` (12 bits, max 4095): **total** application-payload length in
   bytes, summed across **all** codewords for a multi-codeword frame (§9) —
   not any single codeword's share
-  (`crates/coppa-codec/src/ofdm/frame.rs:263-269`).
+  (`crates/coppa-codec/src/ofdm/frame.rs:263-269`). When §15's compression
+  applies, this field counts **envelope bytes** (`0xFE` marker + LZ4 prefix
+  + block, §15.1), not plaintext bytes; the per-level payload budget (§9)
+  — which the transmitter checks against the post-compression length —
+  remains the effective size limit, far below the field's 4095 maximum.
 - `codewords` (4-bit wire nibble, decoded value `1..=16`): the wire nibble
   stores `codewords - 1`, so `codewords == 1` (the overwhelmingly common,
   pre-multi-codeword-era case) encodes to nibble `0` — byte-for-byte
@@ -984,6 +988,10 @@ A conforming **transmitter** MUST:
       bandpass, peak-normalize to `TX_PEAK = 0.5`).
 - [ ] Use the pilot pattern of §3.3 (even/odd alternating positions, `+1`
       pilot values) on every header and payload OFDM symbol.
+- [ ] If it compresses at all (§15.5's gating is each station's own
+      configuration), apply §15.2's exact transform order — Huffman encode
+      (§15.3, table of §15.3.1) → LZ4 compress (§15.4) → prepend the `0xFE`
+      marker — and count envelope bytes in the header's `payload_len` (§15.1).
 
 A conforming **receiver** MUST:
 
@@ -1010,6 +1018,10 @@ A conforming **receiver** MUST:
       permutations specified, and correctly recover per-codeword payload
       byte ranges via §9.1's split algorithm using the header's
       `payload_len`/`codewords` fields.
+- [ ] If its compression is enabled (§15.5's gating is each station's own
+      configuration), invert §15.2's transform order exactly — strip `0xFE`
+      → LZ4 decompress (§15.4) → Huffman decode (§15.3) — and treat a
+      payload whose first byte is not `0xFE` as raw application bytes.
 
 A conforming implementation MAY:
 
@@ -1025,6 +1037,9 @@ A conforming implementation MAY:
 - [ ] Choose not to support multi-codeword frames (§9) beyond decoding
       `codewords=1` correctly, though it MUST still parse the `codewords`
       header field correctly (§4.2) to know how many codewords follow.
+- [ ] Omit compression entirely (§15): such an implementation never emits
+      the `0xFE` envelope of §15.1 and simply treats every payload as raw
+      application bytes.
 
 ---
 
@@ -1058,3 +1073,267 @@ to their exact `payload_hex` is strong evidence of wire-format compatibility
 with this reference implementation. Vectors are regenerated
 (not hand-authored) via `cargo run -p coppa-bench --release --example
 golden_vectors_gen` (`crates/coppa-protocol/tests/golden_vectors.rs:3-4,129`).
+
+---
+
+## 15. Payload compression envelope
+
+This section documents the optional Huffman + LZ4 payload compression the
+engine applies between the application payload and the §4 frame header, so
+that the full TX chain a receiver must invert is specified in one public
+document. Its regulatory purpose is 47 CFR 97.309(a)(4) (US): a station
+transmitting a data emission "may use any technique whose technical
+characteristics have been documented publicly" — this section is that
+public documentation for coppa's compression. Nothing here changes the
+waveform: the envelope is layered on top of the same wire format (§0.1's
+addition category, not a break), and compression is already on the air
+(the daemon's default profile compresses by default, §15.5).
+
+The layering is: application payload bytes → this section's envelope
+(§15.1) → the §4.2 header's `payload_len` counts **envelope bytes, not
+plaintext bytes** when compression applies. Station-ID/beacon frames are
+never compressed (§15.5), and the header itself is never compressed.
+
+### 15.1 Envelope byte layout
+
+`CoppaCore::compress_payload` (`crates/coppa-engine/src/engine.rs:224-240`)
+builds, byte for byte, when the sending engine's `compression_enabled` is
+`true`:
+
+```
++--------+----------------------------------------------------+
+| 0xFE   | compression marker (1 byte)                        |
++--------+----------------------------------------------------+
+| u32 LE | original size N of the Huffman-encoded byte string |
+| 4 bytes| (lz4_flex `compress_prepend_size` prefix)          |
++--------+----------------------------------------------------+
+| LZ4    | standard lz4.org block, encoding exactly N bytes   |
+| block  | of Huffman-stream bytes                             |
++--------+----------------------------------------------------+
+```
+
+Source: `crates/coppa-engine/src/engine.rs:compress_payload` (marker
+constant `COMPRESSION_MARKER = 0xFE`, `crates/coppa-engine/src/engine.rs:20`;
+LZ4 prefix and block from `crates/coppa-protocol/src/compression/lz4.rs:11-13`,
+§15.4). A compression-disabled transmitter sends the application payload
+bytes unchanged — no marker, no envelope.
+
+### 15.2 Transform order (fixed, not negotiated)
+
+TX: plaintext → Huffman encode (§15.3) → LZ4 compress (§15.4) → prepend
+`0xFE` (`crates/coppa-engine/src/engine.rs:224-240`).
+
+RX: strip `0xFE` → LZ4 decompress → Huffman decode
+(`crates/coppa-engine/src/engine.rs:458-470`).
+
+A conforming transmitter that compresses **MUST** apply exactly this
+transform order, and a conforming receiver with compression enabled
+**MUST** invert it in exactly this order. The order is fixed by the
+implementation and is not negotiated on air.
+
+### 15.3 Huffman layer
+
+The LZ4 block's decompressed content (length N from the §15.1 prefix) is a
+Huffman bitstream produced by `HuffmanCodec::encode`
+(`crates/coppa-protocol/src/compression/huffman.rs:389-437`) with the fixed
+64-entry table of §15.3.1:
+
+- Byte 0 is the **padding count** P, 0–7: the number of zero bits padding
+  the final byte of the bitstream (`huffman.rs:421-424`).
+- The bitstream occupies bytes 1.., packed **MSB-first within each byte**;
+  the final byte is right-padded with P zero bits (`huffman.rs:426-434`).
+- Any byte **not** in the table is emitted as the escape code `11111111`
+  followed by the byte's 8 raw bits, MSB-first (`huffman.rs:409-417`).
+- A **literal `~` (0x7E) always takes the escape branch** despite being in
+  the table with code `11111111`: on the wire it is `11111111 01111110`
+  (`huffman.rs:396-403`). The decoder treats the `11111111` code as "next
+  8 bits are a raw byte" and never emits `~` as a symbol
+  (`huffman.rs:478-490`).
+- `encode(b"")` produces exactly one byte, `0x00` (padding count 0, empty
+  bitstream).
+
+The shipped decoder is the lossy `decode()` (`huffman.rs:443-509`): it
+stops at the first bit position that matches no code ("likely padding or
+corruption") rather than erroring, so bit-level corruption in this layer
+never surfaces as an error. A strict `try_decode()` (`huffman.rs:515-585`,
+`Err` on corrupt bitstreams / truncated escapes / padding > 7) exists but
+is called by no production path; conforming receivers are NOT required to
+implement it.
+
+#### 15.3.1 The fixed Huffman table (64 entries)
+
+`HAM_RADIO_TABLE` (`crates/coppa-protocol/src/compression/huffman.rs:25-353`)
+is a canonical Huffman code: bit-length distribution exactly 1×2-bit, 1×3,
+2×4, 4×5, 8×6, 16×7, 32×8 codes (64 symbols), and each length group's
+first code equals the previous group's last code + 1 shifted left by the
+length delta. Codes are written most-significant bit first.
+
+| Sym | Char | Code | Len |
+|------|------|------|-----|
+| 0x20 | space | `00` | 2 |
+| 0x45 | E | `010` | 3 |
+| 0x54 | T | `0110` | 4 |
+| 0x41 | A | `0111` | 4 |
+| 0x4F | O | `10000` | 5 |
+| 0x49 | I | `10001` | 5 |
+| 0x4E | N | `10010` | 5 |
+| 0x53 | S | `10011` | 5 |
+| 0x52 | R | `101000` | 6 |
+| 0x48 | H | `101001` | 6 |
+| 0x4C | L | `101010` | 6 |
+| 0x44 | D | `101011` | 6 |
+| 0x43 | C | `101100` | 6 |
+| 0x55 | U | `101101` | 6 |
+| 0x4D | M | `101110` | 6 |
+| 0x57 | W | `101111` | 6 |
+| 0x46 | F | `1100000` | 7 |
+| 0x47 | G | `1100001` | 7 |
+| 0x59 | Y | `1100010` | 7 |
+| 0x50 | P | `1100011` | 7 |
+| 0x42 | B | `1100100` | 7 |
+| 0x56 | V | `1100101` | 7 |
+| 0x4B | K | `1100110` | 7 |
+| 0x4A | J | `1100111` | 7 |
+| 0x58 | X | `1101000` | 7 |
+| 0x51 | Q | `1101001` | 7 |
+| 0x5A | Z | `1101010` | 7 |
+| 0x30 | 0 | `1101011` | 7 |
+| 0x31 | 1 | `1101100` | 7 |
+| 0x32 | 2 | `1101101` | 7 |
+| 0x33 | 3 | `1101110` | 7 |
+| 0x34 | 4 | `1101111` | 7 |
+| 0x35 | 5 | `11100000` | 8 |
+| 0x36 | 6 | `11100001` | 8 |
+| 0x37 | 7 | `11100010` | 8 |
+| 0x38 | 8 | `11100011` | 8 |
+| 0x39 | 9 | `11100100` | 8 |
+| 0x2E | . | `11100101` | 8 |
+| 0x2C | , | `11100110` | 8 |
+| 0x3F | ? | `11100111` | 8 |
+| 0x2F | / | `11101000` | 8 |
+| 0x2D | - | `11101001` | 8 |
+| 0x3A | : | `11101010` | 8 |
+| 0x0A | LF | `11101011` | 8 |
+| 0x0D | CR | `11101100` | 8 |
+| 0x21 | ! | `11101101` | 8 |
+| 0x40 | @ | `11101110` | 8 |
+| 0x23 | # | `11101111` | 8 |
+| 0x24 | $ | `11110000` | 8 |
+| 0x28 | ( | `11110001` | 8 |
+| 0x29 | ) | `11110010` | 8 |
+| 0x2B | + | `11110011` | 8 |
+| 0x3D | = | `11110100` | 8 |
+| 0x61 | a | `11110101` | 8 |
+| 0x65 | e | `11110110` | 8 |
+| 0x69 | i | `11110111` | 8 |
+| 0x6F | o | `11111000` | 8 |
+| 0x6E | n | `11111001` | 8 |
+| 0x74 | t | `11111010` | 8 |
+| 0x73 | s | `11111011` | 8 |
+| 0x72 | r | `11111100` | 8 |
+| 0x5F | _ | `11111101` | 8 |
+| 0x2A | * | `11111110` | 8 |
+| 0x7E | ~ | `11111111` | 8 — **ESCAPE** |
+
+The `~` row's code doubles as the escape prefix (§15.3): a decoder reading
+`11111111` consumes 8 more raw bits and emits them as one byte, so `~`
+itself never appears as a decoded symbol.
+
+### 15.4 LZ4 layer
+
+The Huffman-encoded byte string is compressed as a **standard lz4.org
+block** via `lz4_flex` 0.14's `compress_prepend_size`
+(`crates/coppa-protocol/src/compression/lz4.rs:11-13`) — the block format
+plus lz4_flex's one addition, a **4-byte little-endian u32 of the
+decompressed size prepended to the block** (the N of §15.1).
+Decompression (`lz4_decompress`, `lz4.rs:19-32`) rejects any input whose
+claimed decompressed size exceeds `MAX_DECOMPRESS_SIZE = 16_384` bytes
+(`lz4.rs:8`) and surfaces corrupt or truncated blocks as an error. On the
+RX path that error surfaces to the caller — as the `Err` return of
+`CoppaCore::decode_bytes` (`crates/coppa-engine/src/engine.rs:386-401`)
+or as the per-frame `Err` in `StreamFrame::payload` of `push_samples`
+(`engine.rs:417-434`, field at `:47-48`) — and consumers drop the frame
+(the FFI drops it without consuming a `seq`,
+`crates/coppa-ffi/src/lib.rs:98-105`).
+
+### 15.5 Signaling and gating (asymmetric, by design)
+
+Compression is gated by each station's **own** configuration only; there
+is no in-band negotiation and no per-frame compression flag anywhere in
+the §4.2 header:
+
+- A transmitter compresses iff its own `compression_enabled` is set
+  (`crates/coppa-engine/src/config.rs:43`; library default `false`,
+  `config.rs:93`; profile override `config.rs:115`).
+- A receiver decompresses iff its own `compression_enabled` is set **and**
+  the payload's first byte is `0xFE`
+  (`crates/coppa-engine/src/engine.rs:458-470`). A receiver whose
+  compression is disabled passes any payload through untouched, whatever
+  its first byte.
+
+Profile defaults (`crates/coppa-engine/src/profiles.rs:29-78`): HF_STANDARD
+and VHF_FAST compress; HF_ROBUST and EMERGENCY do not; the library default
+(`EngineConfig::default()`) does not. The daemon ships HF_STANDARD, so a
+default `coppad` compresses on air.
+
+Two consequences of this asymmetry, stated rather than hidden:
+
+1. A **compression-disabled receiver** of a compressed peer's frame
+   recovers the still-compressed envelope bytes (marker `0xFE` + LZ4
+   prefix + block) with no error — it has no way to know they were
+   compressed.
+2. A **raw payload that legitimately begins with `0xFE`**, sent by a
+   compression-disabled transmitter, is misread as compressed by a
+   compression-enabled receiver (which will then fail or garble LZ4
+   decompression). No marker escaping exists; this collision is a
+   documented hazard of the shipped format.
+
+Station-ID/beacon frames are **never compressed**: they are built by
+`encode_bytes_at_level` (`crates/coppa-engine/src/engine.rs:309-332`),
+which passes its data through uncompressed by design
+(`crates/coppa-engine/src/engine.rs:299-302`), unlike `encode_bytes`
+(`engine.rs:254-282`), which compresses per this section. Because
+compression changes payload size, a sending stack that must fit a speed
+level's per-level payload budget measures the **post-compression**
+envelope length (`encoded_payload_len`, `engine.rs:244-246`).
+
+### 15.6 Frozen conformance vectors
+
+`crates/coppa-protocol/tests/compression_vectors.rs` (run via `cargo test
+-p coppa-protocol --test compression_vectors`, or as part of `cargo test
+--workspace`) locks the exact wire bytes of §15.1–§15.3, following §14's
+convention that spec vectors carry an executable check. Hexadecimal, one
+byte per two hex digits:
+
+Huffman layer (byte 0 = padding count P, then the MSB-first bitstream):
+
+```
+""                  → 00
+"CQ CQ CQ DE W1AW"  → 01b3496692cd2568bf63de
+"A~B"               → 057ff7ec80        (escape path: literal ~)
+0x7F (DEL)          → 00ff7f            (escape path: byte not in table)
+```
+
+Full §15.1 envelope for `"CQ CQ CQ DE W1AW K"`
+(`0xFE` marker, `0c000000` = u32 LE 12 = Huffman-stream length, then the
+LZ4 block):
+
+```
+fe0c000000c000b3496692cd2568bf63de66
+```
+
+The LZ4 block's bytes pin `lz4_flex` 0.14's output for these inputs; LZ4
+encoding is deterministic here, but a dependency upgrade that changes
+compressed bytes will fail this test — at that point the vector above and
+this test MUST be regenerated together, deliberately and publicly.
+
+### 15.7 Discrepancy note: `AppPdu`'s unused 2-bit compression field
+
+`AppPdu` carries a 2-bit `Compression` enum — `None=0, Deflate=1, Lz4=2,
+Reserved=3` (`crates/coppa-protocol/src/app.rs:50-74`), packed into byte 0
+bits 3–2 of that PDU's header (`app.rs:333-337`) — that is **dead on the
+wire**: no production caller sets it, no DEFLATE implementation exists
+anywhere in the workspace, and it is not the compression of §15.1.
+Implementers MUST NOT build it expecting interop; the engine-layer `0xFE`
+envelope of §15.1 is the only compression on the air. This note follows
+§12's precedent for stale unused definitions.

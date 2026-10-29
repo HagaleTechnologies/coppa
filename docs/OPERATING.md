@@ -78,6 +78,29 @@ across all carriers at once and wrecks decode on every one of them.
 
 Re-run this any time you change antennas, radios, or soundcard levels.
 
+## Where to tune: bandwidth and IARU Region 1 placement
+
+Dial frequency places coppa's carrier grid from 350 Hz above the dial edge.
+Profile widths, in both conventions the docs quote (edge-to-edge carrier
+span / the `occupied_bandwidth_hz` figure the daemon reports):
+hf_standard-class 2350/2400 Hz, hf_narrow 450 Hz, hf_wide 2450/2500 Hz
+(`crates/coppa-engine/src/engine.rs:188-212`). All HF profiles are under
+47 CFR 97.307(f)(3)'s 2.8 kHz authorized bandwidth (the hard limit
+`coppad`'s band gate enforces).
+
+IARU Region 1 band plans are voluntary recommendations (national rules
+bind; in the US that is the 2.8 kHz figure above). A 2.45 kHz-wide hf_wide
+signal fits bandwidth-wise in the 2700 Hz "all modes – digimode" segments
+(e.g. 80 m 3600–3620, 40 m 7050–7053, 20 m 14101–14112, 15 m 21110–21120,
+10 m 28300–28320 and 29200–29300 kHz) and does not belong in 500 Hz
+digimode segments (all of 30 m, 10140–10150 kHz; the PSK/FT8 neighborhoods
+on 80/40/20/15/10 m, e.g. 20 m 14070–14099 kHz). 40 m is the tight fit:
+7050–7053 leaves roughly 275 Hz of margin per side (7040–7047 is a 500 Hz
+narrowband-digimode segment, not a wideband one). hf_wide occupies the
+same segments as wide-class VARA signals, not the narrow-digimode
+convention frequencies. Always check the current IARU R1 band plan for
+segment edges before settling on a frequency.
+
 ## PTT safety when coppad stops
 
 coppad releases PTT when it stops, including in the middle of a
