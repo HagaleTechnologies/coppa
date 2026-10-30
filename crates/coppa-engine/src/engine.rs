@@ -190,6 +190,18 @@ impl CoppaCore {
         Self::profile_occupied_hz(self.transceiver.profile())
     }
 
+    /// Spectrum interval [low, high), in Hz, covering the active carriers.
+    /// The exclusive upper edge is one carrier spacing above the last carrier.
+    pub fn occupied_band_edges_hz(&self) -> (f32, f32) {
+        let profile = self.transceiver.profile();
+        let spacing = profile.carrier_spacing_hz();
+        let first = profile.first_active_bin();
+        (
+            first as f32 * spacing,
+            (first + profile.total_active_carriers()) as f32 * spacing,
+        )
+    }
+
     /// Occupied bandwidth, in Hz, of the profile `set_speed_level(level)` would
     /// select on this engine's band and CP mode, without rebuilding anything
     /// (COP-21). A caller that holds RF-frequency evidence asks this before
@@ -723,6 +735,17 @@ mod tests {
     fn test_engine_creation() {
         let core = CoppaCore::new();
         assert_eq!(core.config.sample_rate, 48000);
+    }
+
+    #[test]
+    fn occupied_band_edges_are_profile_true() {
+        let mut core =
+            CoppaCore::with_config(EngineConfig::from_profile(&crate::profiles::HF_STANDARD));
+        assert_eq!(core.occupied_band_edges_hz(), (350.0, 2750.0));
+        core.set_ofdm_band(OfdmBand::Vhf).unwrap();
+        assert_eq!(core.occupied_band_edges_hz(), (350.0, 5950.0));
+        core.set_ofdm_band(OfdmBand::Hf).unwrap();
+        assert_eq!(core.occupied_band_edges_hz(), (350.0, 2750.0));
     }
 
     #[test]
