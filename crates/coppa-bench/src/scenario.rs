@@ -73,7 +73,7 @@ pub const MODES: &[ModeInfo] = &[
     ModeInfo {
         level: 9,
         // Task 4 (NR BG2 mother code) moved the top level's rate from 7/8 to 5/6
-        // (wire-format break -- see CLAUDE.md's Known Limitations and
+        // (wire-format break -- see docs/LIMITATIONS.md and
         // docs/adr/005-nr-bg2-ldpc.md). k_used = 1620, not the pre-Task-4
         // 1701.
         name: "64QAM 5/6",

@@ -69,7 +69,7 @@ const FIRST_PATH_FRACTION: f32 = 0.5;
 /// `cargo test -p coppa-codec -p coppa-protocol --lib` passes at this value.
 ///
 /// CONFIRMED VHF BUG, FIXED ELSEWHERE, NOT HERE (see
-/// `.superpowers/sdd/vhf-timing-backoff-fix-report.md`): this constant itself
+/// `docs/analysis/2026-08-01-vhf-timing-backoff-fix-report.md`): this constant itself
 /// does not need to scale with `cp_samples` (an earlier fix attempt tried
 /// exactly that and, measured directly, did NOT fix the bug — see the report).
 /// The 30-sample linear phase ramp it introduces is a fixed number of

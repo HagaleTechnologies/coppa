@@ -203,7 +203,7 @@ reproduced (the clamp doesn't interfere with genuine 120 ppm SCO responsiveness;
 fading-artifact spike, previously up to ~48 samples, is now bounded before entering the EWMA).
 This is the fourth piece of work in this exact code area's history (ADR-003, ADR-004, the Phase 2
 CFO×level-4 fix) to catch a plausible-looking regression via the same Watterson guard test before
-it could land — see CLAUDE.md's Known Limitations for the standing pattern this represents.
+it could land — see docs/LIMITATIONS.md for the standing pattern this represents.
 
 **Task 6b (short-CP profile, a closely related follow-on, not itself one of the plan's 9 numbered
 decisions but built on Task 6's prerequisite)**: new `hf_standard_short_cp()` profile
@@ -219,7 +219,7 @@ or wrapping (release) after 255 consecutive calm frames; fixed via
 `saturating_add(1).min(consecutive_needed)`, a textbook-correct fix per the task reviewer,
 plus a 300-iteration regression test. **Disclosed, not fixed, limitation**: `CpGate`'s
 (and, per Task 7 below, `BusyGate`'s) threshold constants are synthetic-test-validated only, not
-swept/calibrated against a real bench the way `SPEED_LEVEL_MIN_CAPACITY` was — see CLAUDE.md's
+swept/calibrated against a real bench the way `SPEED_LEVEL_MIN_CAPACITY` was — see docs/LIMITATIONS.md's
 Known Limitations.
 
 **Follow-on 1 (PR #67, 2026-07-29): CP-switch peer negotiation.** The "no daemon integration, no
@@ -430,14 +430,14 @@ don't round-trip against an older build. Acceptable pre-1.0 (no deployed install
   design deliberately built on (recommend from the actual in-flight frame's own channel estimate,
   at whatever level it used, for zero extra probe overhead) — the very thing that exposes the
   bias, since existing calibration benches never varied the probing level. Not a `RateLoop`
-  hysteresis bug. See BENCHMARKS.md's "Phase 3 Task 4" section and CLAUDE.md's Known Limitations.
+  hysteresis bug. See BENCHMARKS.md's "Phase 3 Task 4" section and docs/LIMITATIONS.md.
 - **Task 8's original benchmark-program acceptance targets** (`milstd` 0/27, `session`
   drop-free-on-good/moderate) were not met, but this is presented as new, more rigorous measurement exposing
   pre-existing PHY/channel-estimation-layer realities (a calibration mismatch between a borrowed
   reference ladder and Coppa's real thresholds; the already-tracked Watterson-Moderate/Poor
   channel-estimation gap; level 9's separately-unexplained high/steep/seed-dependent AWGN
   threshold) — not a regression this phase's own code introduced. See BENCHMARKS.md's "Phase 3
-  Task 8" section and CLAUDE.md's Known Limitations.
+  Task 8" section and docs/LIMITATIONS.md.
 
 **COP-5 update (2026-08-03):** the `session` zero-drop aspiration is superseded, not achieved.
 The benchmark now scores only Good against its deterministic regression floor of at least 2/5

@@ -299,14 +299,14 @@ real, necessary follow-up work (the old table's anchors were partly derived from
 readings, and the new table's anchors are meaningfully different — every threshold dropped), and it
 measurably improves the static `mcs_compare` selector-accuracy metric. It does **not**, however,
 move `RateLoop`'s `closed_loop_arq` acceptance-bar shortfall — the gap there remains open, for the
-same reasons already tracked in CLAUDE.md's RateLoop bullet (the raw per-frame recommendation
+same reasons already tracked in docs/LIMITATIONS.md's RateLoop bullet (the raw per-frame recommendation
 signal's volatility during fast fading, not the calibration table's own accuracy, is still believed
-to be the dominant remaining factor). See CLAUDE.md's RateLoop Known Limitations bullet for the
+to be the dominant remaining factor). See docs/LIMITATIONS.md's RateLoop Known Limitations bullet for the
 updated framing.
 
 ## 2026-07 — RateLoop capacity-metric level-bias diagnosis
 
-CLAUDE.md's `RateLoop` known-limitation bullet root-causes its unmet acceptance bar to
+docs/LIMITATIONS.md's `RateLoop` known-limitation bullet root-causes its unmet acceptance bar to
 `coppa_ml::channel_capacity` possibly "not being invariant to which speed level a measured frame
 happened to use" — a hypothesis that was, until now, an informal, uncommitted diagnostic (see
 `docs/superpowers/specs/2026-07-20-rateloop-capacity-metric-bias-diagnosis-design.md` for the full
@@ -337,7 +337,7 @@ duration/coherence-time effects to matter — is the *one* channel that shows a 
 trend clearing its own noise bound (+1.581 bits/s/Hz, over 13x the 0.121 bound), while all three
 Watterson channels (Good, Moderate, Poor) show gaps well within their (much larger, fading-driven)
 noise bounds. Per the design doc's "AWGN as negative control is load-bearing" open question, this
-result points **away** from the coherence-time/fading-duration mechanism the existing CLAUDE.md
+result points **away** from the coherence-time/fading-duration mechanism the existing docs/LIMITATIONS.md
 hypothesis was built around, not toward it — a real, reproducible level-dependence exists, but it
 is present (and clearest) on the one channel where fading-coherence effects cannot be the cause.
 The per-level DATA rows show the AWGN capacity reading climbing fairly monotonically with level at
@@ -345,7 +345,7 @@ every SNR (e.g. at 24 dB: level 1 = 8.412, level 5 = 10.567, level 10 = 10.628 b
 consistent with something structural to how `channel_capacity` is computed per level (e.g. pilot
 density/placement, equalizer behavior, or noise-variance estimation differing systematically by
 modulation/constellation order) rather than anything fading-related. This is a real, useful, but
-different finding than the one CLAUDE.md's existing bullet assumed: it confirms `channel_capacity`
+different finding than the one docs/LIMITATIONS.md's existing bullet assumed: it confirms `channel_capacity`
 is level-dependent on the *same underlying channel* (the core suspicion), but redirects the likely
 mechanism away from fading-coherence time and toward something in the AWGN-reproducible per-level
 measurement path itself. Distinguishing which specific stage of that path (pilot extraction,
@@ -365,7 +365,7 @@ per-level measurement path itself," naming pilot density, equalizer path, and cl
 noise-variance bias as candidates. This entry runs that investigation down.
 
 **Hypothesis.** `SPEED_LEVELS[level].papr_target_db` is a *deliberately* level-dependent hard-clip
-threshold (6.0 dB at BPSK up to 14.0 dB at 64-QAM — see `CLAUDE.md`'s PAPR bullet) applied once to
+threshold (6.0 dB at BPSK up to 14.0 dB at 64-QAM — see `docs/LIMITATIONS.md`'s PAPR bullet) applied once to
 the whole frame's time-domain samples in `CoppaModem::modulate_mapped`'s TX-conditioning chain
 (`papr_clip`, after RC-overlap windowing, before the optional HF bandpass). This clip acts on
 *every* sample in the frame — preamble, the full-comb probe symbol, the header, and every payload
@@ -569,7 +569,7 @@ AWGN is FER-neutral to slightly *better* for `short_cp` (level 2's FER≤1% thre
 
 **Level 2 (BPSK 1/2) is the cleanest result in this whole measurement.** `short_cp`'s FER≤10% threshold improves a full 3 dB grid-step (15.0→12.0 dB), and per-point FER in the CSV is lower for `short_cp` at *every single* swept SNR from −3 through 30 dB (e.g. 6 dB: 34.5%→32.5%; 12 dB: 11.5%→6.0%; 18 dB: 3.75%→2.5%). Goodput is higher for `short_cp` at every SNR point too (e.g. 9 dB: 557→681 bps, +22%; 18 dB: 660→763 bps, +16%) — both the FER and the airtime-savings effects point the same direction here, reinforcing rather than trading off against each other.
 
-**Level 4 (QPSK 3/4) never clears FER≤10% either way** (consistent with the already-documented residual Watterson-fading gap for this level in CLAUDE.md's Known Limitations). Per-point FER is flat-to-mixed: `short_cp` is a few points better at low-mid SNR (0-12 dB, e.g. 6 dB: 88.25%→85.75%) but a few points *worse* at high SNR (18-30 dB, e.g. 21 dB: 44.25%→48.75%), with no consistent direction and both differences well inside normal 400-trial sampling variance at these FER levels. Despite that, goodput favors `short_cp` at **every** SNR point measured, including the ones where its FER is nominally worse (e.g. 21 dB: 1008→1058 bps even though FER went up) — the airtime savings alone outweighs the small FER wobble.
+**Level 4 (QPSK 3/4) never clears FER≤10% either way** (consistent with the already-documented residual Watterson-fading gap for this level in docs/LIMITATIONS.md). Per-point FER is flat-to-mixed: `short_cp` is a few points better at low-mid SNR (0-12 dB, e.g. 6 dB: 88.25%→85.75%) but a few points *worse* at high SNR (18-30 dB, e.g. 21 dB: 44.25%→48.75%), with no consistent direction and both differences well inside normal 400-trial sampling variance at these FER levels. Despite that, goodput favors `short_cp` at **every** SNR point measured, including the ones where its FER is nominally worse (e.g. 21 dB: 1008→1058 bps even though FER went up) — the airtime savings alone outweighs the small FER wobble.
 
 ### Watterson-Poor: level 2 shows a genuine SNR-dependent crossover; level 4 is a large, consistent win
 
@@ -625,7 +625,7 @@ Reproduce: `cargo run -p coppa-bench --release --example drift_estimate_quality_
 
 `docs/superpowers/specs/2026-07-18-cascaded-drift-tracker-design.md` proposed a third architecture
 for the still-open Watterson-Moderate/level 2 coarse-delay-drift regression documented in
-CLAUDE.md's Known Limitations: a Cascaded payload path
+docs/LIMITATIONS.md: a Cascaded payload path
 (`crate::ofdm::coppa_modem::CoppaModem::equalize_payload_cascaded`, `DRIFT_CASCADE_ENABLED`
 toggle) combining `drift_tracker::DriftTracker`'s per-window coarse-delay tracking with the AR(1)
 `KalmanLagSmoother` tap-amplitude tracker, instead of `equalize_payload_drift_tracked`'s fresh
@@ -700,7 +700,7 @@ Reproduce: `cargo run -p coppa-bench --release --example drift_cascade_gate` (to
 independent Kalman tracker (`crate::ofdm::drift_tracker::DriftTracker`, 2-state `[τ, τ̇]`
 integrated-random-walk model, `coppa_modem.rs`'s `DRIFT_TRACKER_ENABLED` payload-pass toggle)
 aimed at the still-open Phase 2 Task 1/7 coarse-delay-reference-drift regression documented in
-CLAUDE.md's Known Limitations (Task 7's AR(1) tap-amplitude Kalman tracker measured
+docs/LIMITATIONS.md (Task 7's AR(1) tap-amplitude Kalman tracker measured
 Watterson-Moderate/level 2 FER≤10% at 30.0 dB in isolated testing, worse than both the
 pre-Phase-2 18.0 dB baseline and Task 1's own 24.0 dB). This task (Task 5) ran the design's own
 gate bench, tuned its two process-noise constants, and made the ship/no-ship call.
@@ -724,7 +724,7 @@ several Phase 2/3/4 tasks layered on since Task 7's isolated report: this file's
 there to turbo re-estimation's benefit on BPSK outweighing the Task 1/7 estimator regression at
 that specific level. Task 7's 30.0 dB figure was measured in isolation, before turbo
 re-estimation and the rest of Phase 2 Task 8's changes landed; today's real, cumulative number
-on this branch is 15.0 dB. Both facts are true and non-contradictory — CLAUDE.md's own Known
+on this branch is 15.0 dB. Both facts are true and non-contradictory — docs/LIMITATIONS.md's own Known
 Limitations already says as much ("levels 1-2 (BPSK) improve at FER≤10% ... outweighing the
 estimator regression"). This task proceeded past Step 1 on that basis rather than treating it as
 a blocking discrepancy, and measures the new tracker against both the 16.5 dB design bar *and*
@@ -1193,7 +1193,7 @@ higher `RateLoop` climbs, the more inflated its own next capacity reading
 becomes, so it keeps being told to climb regardless of the real channel. This
 is consistent with (and plausibly a further symptom of) the channel-estimation
 issue already tracked as open in this document's "Known Limitations" (see
-CLAUDE.md); it is **not** a bug in `RateLoop`'s hysteresis logic itself, and
+docs/LIMITATIONS.md); it is **not** a bug in `RateLoop`'s hysteresis logic itself, and
 fixing the underlying metric is out of this task's scope (it belongs to the
 channel-estimation / MCS-calibration layer, not the rate-loop controller). See
 `crates/coppa-bench/examples/closed_loop_arq.rs`'s module doc and
@@ -1218,7 +1218,7 @@ Phase 2 dev tasks (delay-domain estimator, soft header, LLR calibration + known-
 NR BG2 LDPC, turbo re-estimation, fast demappers, Kalman tracker) had landed. It measures the
 **cumulative** effect of all six shipped Phase 2 codec changes against the Phase 1 exit
 baseline (`results/p1-hotfix/{awgn,moderate,poor}.csv`) — the same baseline `docs/adr/004` and
-CLAUDE.md's sparse-pilot-regression fix cite as "Phase 1 exit."
+docs/LIMITATIONS.md's sparse-pilot-regression fix cite as "Phase 1 exit."
 
 **Headline finding, stated up front, per this task's explicit instruction to report exactly
 what is measured:** three of Phase 2's seven dev tasks (delay-domain estimator, Kalman
@@ -2776,7 +2776,7 @@ measurement rather than speculative tuning inside this investigation.
 
 Does the short-CP airtime saving move `RateLoop`'s stuck closed-loop metric? COP-2 asked this so the
 project could route its next effort either to the short-CP lever or to fade-diversity interleaving —
-the two levers CLAUDE.md names as untried. The answer has three parts, and the first is settled by
+the two levers docs/LIMITATIONS.md names as untried. The answer has three parts, and the first is settled by
 arithmetic rather than by measurement.
 
 ### Conventions changed — prior `closed_loop_arq` figures are NON-COMPARABLE, not superseded

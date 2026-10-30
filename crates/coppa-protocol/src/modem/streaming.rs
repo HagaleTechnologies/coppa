@@ -495,7 +495,7 @@ impl StreamingReceiver {
     ///
     /// # `SYNC_LEAD_MARGIN`/`HEADER_PEEK_ANCHOR_MARGIN` padding (confirmed VHF
     /// `TIMING_BACKOFF` bug fix, see
-    /// `.superpowers/sdd/vhf-timing-backoff-fix-report.md`)
+    /// `docs/analysis/2026-08-01-vhf-timing-backoff-fix-report.md`)
     ///
     /// For a profile with no TX bandpass filter (VHF, i.e. `self.rx_group_delay
     /// == 0` -- see that field's doc) ONLY: `demodulate_header` ->

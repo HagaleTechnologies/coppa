@@ -1730,7 +1730,7 @@ mod tests {
     }
 
     /// Regression test for the confirmed VHF `TIMING_BACKOFF`/calibration bug
-    /// (see `.superpowers/sdd/vhf-timing-backoff-fix-report.md`): every "clean
+    /// (see `docs/analysis/2026-08-01-vhf-timing-backoff-fix-report.md`): every "clean
     /// loopback" test above transmits with the preamble starting at sample 0 of
     /// the buffer, so `SyncDetector`'s `local_peak_abs.saturating_sub(TIMING_BACKOFF)`
     /// silently saturates to 0 for VHF profiles (no TX bandpass filter, so
@@ -1746,7 +1746,7 @@ mod tests {
     /// that here by prepending a realistic leading offset before the frame, for
     /// every VHF-routed speed level (5, 6, 7, 8, 9), not just
     /// one -- this is exactly the kind of single-operating-point validation gap
-    /// CLAUDE.md's Phase 2 Task 4 cautionary tale warns about.
+    /// docs/LIMITATIONS.md's Phase 2 Task 4 cautionary tale warns about.
     #[test]
     fn vhf_all_levels_survive_realistic_leading_offset() {
         use coppa_codec::ofdm::CoppaProfile;
@@ -1756,7 +1756,7 @@ mod tests {
         // this test's whole point is to exercise realistic leading offsets,
         // not to track whatever the constant happens to be tuned to. Swept
         // across several distinct offsets (not just the exact backoff value)
-        // per CLAUDE.md's Phase 2 Task 4 cautionary tale about validating a
+        // per docs/LIMITATIONS.md's Phase 2 Task 4 cautionary tale about validating a
         // fix at only one operating point: 0 is the degenerate
         // session-start-only case the original bug's saturation hid behind;
         // 1 and 30 bracket the backoff's own saturation boundary; 500 is a
@@ -2946,7 +2946,7 @@ mod tests {
         // configuration (level 6, 7 codewords, 800 bytes) was "<= 0.55x" --
         // measured/honest re-derivation (see the Task 5 report's "scenario (c)"
         // discussion, same pattern as this codebase's other honestly-re-derived
-        // acceptance figures, e.g. CLAUDE.md's soft-header gap re-derivation):
+        // acceptance figures, e.g. docs/LIMITATIONS.md's soft-header gap re-derivation):
         // the actual measured ratio here is ~0.639 (a real, substantial ~36%
         // airtime reduction, just short of the original 0.55 estimate). The
         // "47% -> ~10%" figure decision 6 quotes is calibrated for 64-QAM (bps=6,
