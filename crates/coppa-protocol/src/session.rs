@@ -13,7 +13,7 @@
 //! Sessions are identified by a 4-bit session ID (0-15) and maintain state
 //! for the ARQ layer, keepalive timers, and negotiated link parameters.
 
-use anyhow::{anyhow, Result};
+use crate::ProtocolError;
 use std::time::{Duration, Instant};
 
 use crate::mac::{Callsign, MacFrameType, MacPdu};
@@ -82,12 +82,11 @@ impl LinkCapabilities {
     }
 
     /// Deserialize capabilities from bytes.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
         if bytes.len() < 7 {
-            return Err(anyhow!(
-                "Capabilities too short: {} bytes (need 7)",
-                bytes.len()
-            ));
+            return Err(ProtocolError::CapabilitiesTooShort {
+                actual: bytes.len(),
+            });
         }
         Ok(Self {
             max_payload_size: ((bytes[0] as u16) << 8) | bytes[1] as u16,
@@ -218,12 +217,9 @@ impl Session {
     // ── Initiator side ──────────────────────────────────────────────
 
     /// Initiate a connection: create a CONNECT_REQ PDU.
-    pub fn initiate(&mut self) -> Result<MacPdu> {
+    pub fn initiate(&mut self) -> Result<MacPdu, ProtocolError> {
         if self.state != SessionState::Idle {
-            return Err(anyhow!(
-                "Cannot initiate: session in state {:?}",
-                self.state
-            ));
+            return Err(ProtocolError::CannotInitiate { state: self.state });
         }
 
         self.state = SessionState::Connecting;
@@ -240,9 +236,12 @@ impl Session {
 
     /// Handle CONNECT_ACK response (initiator side).
     /// Returns a CONNECT_CFM PDU with negotiated capabilities.
-    pub fn handle_connect_ack(&mut self, remote_caps_bytes: &[u8]) -> Result<MacPdu> {
+    pub fn handle_connect_ack(
+        &mut self,
+        remote_caps_bytes: &[u8],
+    ) -> Result<MacPdu, ProtocolError> {
         if self.state != SessionState::Connecting {
-            return Err(anyhow!("Unexpected CONNECT_ACK in state {:?}", self.state));
+            return Err(ProtocolError::UnexpectedConnectAck { state: self.state });
         }
 
         let remote_caps = LinkCapabilities::from_bytes(remote_caps_bytes)?;
@@ -270,9 +269,12 @@ impl Session {
 
     /// Handle CONNECT_REQ (responder side).
     /// Returns a CONNECT_ACK PDU with our capabilities.
-    pub fn handle_connect_req(&mut self, remote_caps_bytes: &[u8]) -> Result<MacPdu> {
+    pub fn handle_connect_req(
+        &mut self,
+        remote_caps_bytes: &[u8],
+    ) -> Result<MacPdu, ProtocolError> {
         if self.state != SessionState::Idle {
-            return Err(anyhow!("Unexpected CONNECT_REQ in state {:?}", self.state));
+            return Err(ProtocolError::UnexpectedConnectReq { state: self.state });
         }
 
         let remote_caps = LinkCapabilities::from_bytes(remote_caps_bytes)?;
@@ -292,9 +294,9 @@ impl Session {
     /// Handle CONNECT_CFM (responder side).
     /// Validates that negotiated capabilities are consistent with both sides'
     /// advertised capabilities, then transitions to Established.
-    pub fn handle_connect_cfm(&mut self, negotiated_bytes: &[u8]) -> Result<()> {
+    pub fn handle_connect_cfm(&mut self, negotiated_bytes: &[u8]) -> Result<(), ProtocolError> {
         if self.state != SessionState::Accepting {
-            return Err(anyhow!("Unexpected CONNECT_CFM in state {:?}", self.state));
+            return Err(ProtocolError::UnexpectedConnectCfm { state: self.state });
         }
 
         let negotiated = LinkCapabilities::from_bytes(negotiated_bytes)?;
@@ -306,29 +308,23 @@ impl Session {
                 || negotiated.arq_window > expected.arq_window
                 || negotiated.mcs_index > expected.mcs_index
             {
-                return Err(anyhow!(
-                    "Negotiated capabilities exceed intersection: payload={} (max {}), window={} (max {})",
-                    negotiated.max_payload_size,
-                    expected.max_payload_size,
-                    negotiated.arq_window,
-                    expected.arq_window,
-                ));
+                return Err(ProtocolError::CapabilitiesExceedIntersection {
+                    negotiated: negotiated.clone(),
+                    expected: expected.clone(),
+                });
             }
             // Validate FEC rate does not exceed negotiated rate
             if negotiated.fec_rate() > expected.fec_rate() + f32::EPSILON {
-                return Err(anyhow!(
-                    "Negotiated FEC rate {}/{} exceeds intersection {}/{}",
-                    negotiated.fec_rate_num,
-                    negotiated.fec_rate_den,
-                    expected.fec_rate_num,
-                    expected.fec_rate_den,
-                ));
+                return Err(ProtocolError::FecRateExceedsIntersection {
+                    numerator: negotiated.fec_rate_num,
+                    denominator: negotiated.fec_rate_den,
+                    expected_numerator: expected.fec_rate_num,
+                    expected_denominator: expected.fec_rate_den,
+                });
             }
             // Compression must not be enabled unless both sides support it
             if negotiated.compression && !expected.compression {
-                return Err(anyhow!(
-                    "Negotiated compression enabled but not supported by both peers"
-                ));
+                return Err(ProtocolError::CompressionNotMutuallySupported);
             }
         }
 
@@ -342,9 +338,9 @@ impl Session {
     // ── Common operations ───────────────────────────────────────────
 
     /// Create a DISCONNECT PDU.
-    pub fn disconnect(&mut self) -> Result<MacPdu> {
+    pub fn disconnect(&mut self) -> Result<MacPdu, ProtocolError> {
         if self.state == SessionState::Idle {
-            return Err(anyhow!("Cannot disconnect: session is idle"));
+            return Err(ProtocolError::CannotDisconnectIdle);
         }
 
         self.state = SessionState::Disconnecting;
@@ -367,9 +363,9 @@ impl Session {
     }
 
     /// Create a KEEPALIVE PDU.
-    pub fn keepalive(&mut self) -> Result<MacPdu> {
+    pub fn keepalive(&mut self) -> Result<MacPdu, ProtocolError> {
         if self.state != SessionState::Established {
-            return Err(anyhow!("Cannot send keepalive: session not established"));
+            return Err(ProtocolError::KeepaliveNotEstablished);
         }
 
         self.last_activity = Instant::now();
@@ -477,14 +473,14 @@ impl SessionManager {
         remote: Callsign,
         ssid: u8,
         caps: LinkCapabilities,
-    ) -> Result<u8> {
+    ) -> Result<u8, ProtocolError> {
         for id in 0..16u8 {
             if self.sessions[id as usize].is_none() {
                 self.sessions[id as usize] = Some(Session::new(id, local, remote, ssid, caps));
                 return Ok(id);
             }
         }
-        Err(anyhow!("No free session slots"))
+        Err(ProtocolError::NoFreeSessionSlots)
     }
 
     /// Get a reference to a session by ID.
@@ -585,7 +581,10 @@ mod tests {
 
     #[test]
     fn test_capabilities_too_short() {
-        assert!(LinkCapabilities::from_bytes(&[0; 6]).is_err());
+        assert!(matches!(
+            LinkCapabilities::from_bytes(&[0; 6]),
+            Err(ProtocolError::CapabilitiesTooShort { actual: 6 })
+        ));
     }
 
     #[test]
@@ -687,7 +686,12 @@ mod tests {
             LinkCapabilities::default(),
         );
         s.initiate().unwrap();
-        assert!(s.initiate().is_err());
+        assert!(matches!(
+            s.initiate(),
+            Err(ProtocolError::CannotInitiate {
+                state: SessionState::Connecting
+            })
+        ));
     }
 
     #[test]
@@ -778,7 +782,10 @@ mod tests {
             0,
             LinkCapabilities::default(),
         );
-        assert!(s.disconnect().is_err());
+        assert!(matches!(
+            s.disconnect(),
+            Err(ProtocolError::CannotDisconnectIdle)
+        ));
     }
 
     #[test]
@@ -807,7 +814,10 @@ mod tests {
             0,
             LinkCapabilities::default(),
         );
-        assert!(s.keepalive().is_err());
+        assert!(matches!(
+            s.keepalive(),
+            Err(ProtocolError::KeepaliveNotEstablished)
+        ));
     }
 
     #[test]

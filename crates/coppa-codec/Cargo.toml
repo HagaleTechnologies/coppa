@@ -8,7 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 coppa-dsp = { path = "../coppa-dsp" }
-anyhow = { workspace = true }
+thiserror = { workspace = true }
 crc = { workspace = true }
 num-complex = { workspace = true }
 rustfft = { workspace = true }

@@ -7,7 +7,7 @@
 //! The application PDU supports protocol multiplexing, compression indication,
 //! and fragmentation for payloads that exceed a single transport segment.
 
-use anyhow::{anyhow, Result};
+use crate::ProtocolError;
 
 /// Application protocol identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -32,7 +32,7 @@ pub enum AppProtocol {
 }
 
 impl AppProtocol {
-    pub fn from_u8(val: u8) -> Result<Self> {
+    pub fn from_u8(val: u8) -> Result<Self, ProtocolError> {
         match val & 0x0F {
             0 => Ok(AppProtocol::Text),
             1 => Ok(AppProtocol::Position),
@@ -42,7 +42,7 @@ impl AppProtocol {
             5 => Ok(AppProtocol::Control),
             6 => Ok(AppProtocol::Custom),
             7 => Ok(AppProtocol::CompressedData),
-            v => Err(anyhow!("Unknown app protocol: {}", v)),
+            v => Err(ProtocolError::UnknownAppProtocol { value: v }),
         }
     }
 }
@@ -62,7 +62,7 @@ pub enum Compression {
 }
 
 impl Compression {
-    pub fn from_u8(val: u8) -> Result<Self> {
+    pub fn from_u8(val: u8) -> Result<Self, ProtocolError> {
         match val & 0x03 {
             0 => Ok(Compression::None),
             1 => Ok(Compression::Deflate),
@@ -88,7 +88,7 @@ pub enum FragFlags {
 }
 
 impl FragFlags {
-    pub fn from_u8(val: u8) -> Result<Self> {
+    pub fn from_u8(val: u8) -> Result<Self, ProtocolError> {
         match val & 0x03 {
             0 => Ok(FragFlags::Complete),
             1 => Ok(FragFlags::First),
@@ -250,9 +250,9 @@ impl AppPdu {
     ///
     /// `fragments` must be ordered: First, Middle*, Last (or a single Complete).
     /// All must share the same `frag_id`.
-    pub fn reassemble(fragments: &[Self]) -> Result<Vec<u8>> {
+    pub fn reassemble(fragments: &[Self]) -> Result<Vec<u8>, ProtocolError> {
         if fragments.is_empty() {
-            return Err(anyhow!("No fragments to reassemble"));
+            return Err(ProtocolError::NoFragments);
         }
 
         // Single complete PDU
@@ -262,10 +262,10 @@ impl AppPdu {
 
         // Validate ordering
         if fragments.first().map(|f| f.frag_flags) != Some(FragFlags::First) {
-            return Err(anyhow!("First fragment must have FragFlags::First"));
+            return Err(ProtocolError::MissingFirstFragment);
         }
         if fragments.last().map(|f| f.frag_flags) != Some(FragFlags::Last) {
-            return Err(anyhow!("Last fragment must have FragFlags::Last"));
+            return Err(ProtocolError::MissingLastFragment);
         }
 
         let frag_id = fragments[0].frag_id;
@@ -273,37 +273,32 @@ impl AppPdu {
         let mut payload = Vec::new();
 
         if expected_total as usize != fragments.len() {
-            return Err(anyhow!(
-                "Fragment count mismatch: frag_total={} but got {} fragments",
-                expected_total,
-                fragments.len()
-            ));
+            return Err(ProtocolError::FragmentCountMismatch {
+                declared: expected_total,
+                actual: fragments.len(),
+            });
         }
 
         for (i, frag) in fragments.iter().enumerate() {
             if frag.frag_id != frag_id {
-                return Err(anyhow!(
-                    "Fragment ID mismatch at index {}: expected {}, got {}",
-                    i,
-                    frag_id,
-                    frag.frag_id
-                ));
+                return Err(ProtocolError::FragmentIdMismatch {
+                    index: i,
+                    expected: frag_id,
+                    actual: frag.frag_id,
+                });
             }
             if frag.frag_index != i as u8 {
-                return Err(anyhow!(
-                    "Fragment index mismatch at position {}: expected {}, got {}",
-                    i,
-                    i,
-                    frag.frag_index
-                ));
+                return Err(ProtocolError::FragmentIndexMismatch {
+                    position: i,
+                    actual: frag.frag_index,
+                });
             }
             if frag.frag_total != expected_total {
-                return Err(anyhow!(
-                    "Fragment total mismatch at index {}: expected {}, got {}",
-                    i,
-                    expected_total,
-                    frag.frag_total
-                ));
+                return Err(ProtocolError::FragmentTotalMismatch {
+                    index: i,
+                    expected: expected_total,
+                    actual: frag.frag_total,
+                });
             }
             let expected_flags = if i == 0 {
                 FragFlags::First
@@ -313,12 +308,11 @@ impl AppPdu {
                 FragFlags::Middle
             };
             if frag.frag_flags != expected_flags {
-                return Err(anyhow!(
-                    "Wrong frag flags at index {}: expected {:?}, got {:?}",
-                    i,
-                    expected_flags,
-                    frag.frag_flags
-                ));
+                return Err(ProtocolError::FragmentFlagsMismatch {
+                    index: i,
+                    expected: expected_flags,
+                    actual: frag.frag_flags,
+                });
             }
             payload.extend_from_slice(&frag.payload);
         }
@@ -352,13 +346,12 @@ impl AppPdu {
     }
 
     /// Deserialize from bytes.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
         if bytes.len() < APP_HEADER_SIZE {
-            return Err(anyhow!(
-                "App PDU too short: {} bytes (min {})",
-                bytes.len(),
-                APP_HEADER_SIZE
-            ));
+            return Err(ProtocolError::AppPduTooShort {
+                actual: bytes.len(),
+                min: APP_HEADER_SIZE,
+            });
         }
 
         let protocol = AppProtocol::from_u8((bytes[0] >> 4) & 0x0F)?;
@@ -422,7 +415,10 @@ mod tests {
 
     #[test]
     fn test_invalid_protocol() {
-        assert!(AppProtocol::from_u8(8).is_err());
+        assert!(matches!(
+            AppProtocol::from_u8(8),
+            Err(ProtocolError::UnknownAppProtocol { value: 8 })
+        ));
         assert!(AppProtocol::from_u8(15).is_err());
     }
 
@@ -601,7 +597,10 @@ mod tests {
 
     #[test]
     fn test_reassemble_empty() {
-        assert!(AppPdu::reassemble(&[]).is_err());
+        assert!(matches!(
+            AppPdu::reassemble(&[]),
+            Err(ProtocolError::NoFragments)
+        ));
     }
 
     #[test]

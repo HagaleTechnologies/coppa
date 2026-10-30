@@ -26,7 +26,7 @@
 //! from ever draining its window. [`rto_floor`] computes a real floor from the
 //! configured window, speed level(s), turnaround time, and OFDM profile instead.
 
-use anyhow::{anyhow, Result};
+use crate::ProtocolError;
 use std::time::{Duration, Instant};
 
 use coppa_codec::ofdm::CoppaProfile;
@@ -204,13 +204,16 @@ impl Default for ArqConfig {
 }
 
 impl ArqConfig {
-    pub fn new(window_size: u8, max_retransmit: u8, initial_rto: Duration) -> Result<Self> {
+    pub fn new(
+        window_size: u8,
+        max_retransmit: u8,
+        initial_rto: Duration,
+    ) -> Result<Self, ProtocolError> {
         if window_size == 0 || window_size > MAX_WINDOW_SIZE {
-            return Err(anyhow!(
-                "Window size must be 1-{}, got {}",
-                MAX_WINDOW_SIZE,
-                window_size
-            ));
+            return Err(ProtocolError::InvalidWindowSize {
+                value: window_size,
+                max: MAX_WINDOW_SIZE,
+            });
         }
         Ok(Self {
             window_size,
@@ -410,10 +413,10 @@ impl ArqTx {
 
     /// Queue a segment for transmission. Returns the assigned sequence number,
     /// or an error if the window is full.
-    pub fn send(&mut self, data: Vec<u8>, now: Instant) -> Result<u8> {
+    pub fn send(&mut self, data: Vec<u8>, now: Instant) -> Result<u8, ProtocolError> {
         let in_flight = self.next_seq.wrapping_sub(self.send_base);
         if in_flight >= self.config.window_size {
-            return Err(anyhow!("ARQ window full"));
+            return Err(ProtocolError::ArqWindowFull);
         }
 
         let seq = self.next_seq;
@@ -526,7 +529,7 @@ impl ArqTx {
     /// Does NOT itself apply backoff -- that now happens once per timeout event
     /// in [`Self::get_retransmits`] (decision 4), not once per segment here. See
     /// that method's doc.
-    pub fn mark_retransmitted(&mut self, seq: u8, now: Instant) -> Result<()> {
+    pub fn mark_retransmitted(&mut self, seq: u8, now: Instant) -> Result<(), ProtocolError> {
         let idx = seq as usize % MAX_WINDOW_SIZE as usize;
         match self.tx_buf[idx] {
             Some(ref mut seg) if seg.seq_num == seq && !seg.acked => {
@@ -541,7 +544,7 @@ impl ArqTx {
                 seg.last_sent = Some(now);
                 Ok(())
             }
-            _ => Err(anyhow!("No pending segment with seq {}", seq)),
+            _ => Err(ProtocolError::NoPendingSegment { seq }),
         }
     }
 
@@ -979,7 +982,10 @@ mod tests {
 
     #[test]
     fn test_config_invalid_window() {
-        assert!(ArqConfig::new(0, 5, Duration::from_secs(3)).is_err());
+        assert!(matches!(
+            ArqConfig::new(0, 5, Duration::from_secs(3)),
+            Err(ProtocolError::InvalidWindowSize { value: 0, max: 32 })
+        ));
         assert!(ArqConfig::new(33, 5, Duration::from_secs(3)).is_err());
     }
 
@@ -1007,7 +1013,10 @@ mod tests {
 
         tx.send(vec![0x01], now).unwrap();
         tx.send(vec![0x02], now).unwrap();
-        assert!(tx.send(vec![0x03], now).is_err());
+        assert!(matches!(
+            tx.send(vec![0x03], now),
+            Err(ProtocolError::ArqWindowFull)
+        ));
     }
 
     #[test]

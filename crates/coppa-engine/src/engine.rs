@@ -1,6 +1,6 @@
 //! Main Coppa engine: thin wrapper around CoppaTransceiver with compression and squelch.
 
-use anyhow::Result;
+use crate::EngineError;
 
 use coppa_codec::ofdm::coppa_modem::{SPEED_LEVELS, TX_PEAK};
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
@@ -45,7 +45,7 @@ pub const TUNE_TONE_HIGH_HZ: f32 = 1900.0;
 /// attempt `String::from_utf8` themselves on the raw bytes.
 #[derive(Debug)]
 pub struct StreamFrame {
-    pub payload: Result<Vec<u8>>,
+    pub payload: Result<Vec<u8>, EngineError>,
     /// Real per-carrier-noise SNR estimate (dB) from `CoppaTransceiver::
     /// receive_with_metrics`, `10*log10(1/mean(noise_vars))` — NOT the crude
     /// whole-buffer RMS proxy `handle_audio_in` used to compute before Task 7.
@@ -86,7 +86,7 @@ pub struct StreamFrame {
 ///
 /// let decoded = core.decode(&samples)?;
 /// assert_eq!(decoded, "Hello Coppa");
-/// # Ok::<(), anyhow::Error>(())
+/// # Ok::<(), coppa_engine::EngineError>(())
 /// ```
 pub struct CoppaCore {
     transceiver: CoppaTransceiver,
@@ -214,7 +214,7 @@ impl CoppaCore {
     }
 
     /// Encode a text message to audio samples.
-    pub fn encode(&self, message: &str) -> Result<Vec<f32>> {
+    pub fn encode(&self, message: &str) -> Result<Vec<f32>, EngineError> {
         self.encode_bytes(message.as_bytes())
     }
 
@@ -253,7 +253,7 @@ impl CoppaCore {
     /// 1. Optionally compress (Huffman + LZ4) with a marker byte
     /// 2. Build CoppaHeader
     /// 3. Transmit via CoppaTransceiver
-    pub fn encode_bytes(&self, data: &[u8]) -> Result<Vec<f32>> {
+    pub fn encode_bytes(&self, data: &[u8]) -> Result<Vec<f32>, EngineError> {
         self.encode_bytes_at(data, self.config.speed_level)
     }
 
@@ -276,7 +276,7 @@ impl CoppaCore {
     /// profile is never rebuilt here, so `level` means "most robust
     /// modulation/FEC within the profile already in use", and level 9 is
     /// rejected while this engine is on an HF profile.
-    pub fn encode_bytes_with_level(&self, data: &[u8], level: u8) -> Result<Vec<f32>> {
+    pub fn encode_bytes_with_level(&self, data: &[u8], level: u8) -> Result<Vec<f32>, EngineError> {
         self.check_level(level, self.on_vhf_profile())?;
         self.encode_bytes_at(data, level)
     }
@@ -286,15 +286,14 @@ impl CoppaCore {
     /// `level`, transmit. Private so the two public entry points (and their
     /// exact-payload twin [`Self::encoded_payload_len`], which shares
     /// `compress_payload`) cannot drift apart.
-    fn encode_bytes_at(&self, data: &[u8], level: u8) -> Result<Vec<f32>> {
+    fn encode_bytes_at(&self, data: &[u8], level: u8) -> Result<Vec<f32>, EngineError> {
         let payload = self.compress_payload(data);
 
         if payload.len() > u16::MAX as usize {
-            anyhow::bail!(
-                "Payload too large ({} bytes, max {})",
-                payload.len(),
-                u16::MAX
-            );
+            return Err(EngineError::PayloadTooLarge {
+                len: payload.len(),
+                max: u16::MAX as usize,
+            });
         }
 
         let header = CoppaHeader {
@@ -309,10 +308,7 @@ impl CoppaCore {
             codewords: 1,
         };
 
-        let samples = self
-            .transceiver
-            .transmit(&header, &payload)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let samples = self.transceiver.transmit(&header, &payload)?;
         Ok(samples)
     }
 
@@ -341,10 +337,13 @@ impl CoppaCore {
     /// Because the profile is never rebuilt here, the HF ceiling is checked
     /// against the profile already in use: level 9 is rejected whenever this
     /// engine is on an HF profile, including a level-derived engine below level 5.
-    pub fn encode_bytes_at_level(&self, data: &[u8], level: u8) -> Result<Vec<f32>> {
+    pub fn encode_bytes_at_level(&self, data: &[u8], level: u8) -> Result<Vec<f32>, EngineError> {
         self.check_level(level, self.on_vhf_profile())?;
         if data.len() > u16::MAX as usize {
-            anyhow::bail!("Payload too large ({} bytes, max {})", data.len(), u16::MAX);
+            return Err(EngineError::PayloadTooLarge {
+                len: data.len(),
+                max: u16::MAX as usize,
+            });
         }
 
         let header = CoppaHeader {
@@ -359,10 +358,7 @@ impl CoppaCore {
             codewords: 1,
         };
 
-        let samples = self
-            .transceiver
-            .transmit(&header, data)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let samples = self.transceiver.transmit(&header, data)?;
         Ok(samples)
     }
 
@@ -406,7 +402,7 @@ impl CoppaCore {
     }
 
     /// Decode audio samples back to a text message.
-    pub fn decode(&self, samples: &[f32]) -> Result<String> {
+    pub fn decode(&self, samples: &[f32]) -> Result<String, EngineError> {
         let data = self.decode_bytes(samples)?;
         let message = String::from_utf8(data)?;
         Ok(message)
@@ -418,19 +414,16 @@ impl CoppaCore {
     /// 1. Squelch check (reject silence)
     /// 2. Receive via CoppaTransceiver
     /// 3. Optionally decompress (LZ4 + Huffman)
-    pub fn decode_bytes(&self, samples: &[f32]) -> Result<Vec<u8>> {
+    pub fn decode_bytes(&self, samples: &[f32]) -> Result<Vec<u8>, EngineError> {
         if self.is_squelched(samples) {
-            return Err(anyhow::anyhow!("No signal detected"));
+            return Err(EngineError::NoSignalDetected);
         }
 
         if samples.is_empty() {
-            return Err(anyhow::anyhow!("No samples to decode"));
+            return Err(EngineError::NoSamplesToDecode);
         }
 
-        let (_header, payload, _recommended_level) = self
-            .transceiver
-            .receive(samples)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let (_header, payload, _recommended_level) = self.transceiver.receive(samples)?;
 
         self.decompress_if_needed(payload)
     }
@@ -490,7 +483,7 @@ impl CoppaCore {
 
     /// Undo this engine's optional Huffman+LZ4 compression if the marker byte is
     /// present, shared by `decode_bytes` and `push_samples`.
-    fn decompress_if_needed(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
+    fn decompress_if_needed(&self, payload: Vec<u8>) -> Result<Vec<u8>, EngineError> {
         if self.config.compression_enabled
             && !payload.is_empty()
             && payload[0] == COMPRESSION_MARKER
@@ -580,7 +573,7 @@ impl CoppaCore {
     /// `coppa_protocol::modem::speed_level_components`, the single source of
     /// truth for valid levels that this deliberately defers to rather than
     /// duplicating.
-    pub fn set_speed_level(&mut self, level: u8) -> Result<()> {
+    pub fn set_speed_level(&mut self, level: u8) -> Result<(), EngineError> {
         self.check_level(level, Self::resolves_to_vhf(level, self.config.ofdm_band))?;
         let mut config = self.config.clone();
         config.speed_level = level;
@@ -600,7 +593,7 @@ impl CoppaCore {
     /// Returns an error, leaving this engine's current config untouched, if the
     /// current speed level is not available on `band` (level 9 on HF): lower the
     /// level first.
-    pub fn set_ofdm_band(&mut self, band: OfdmBand) -> Result<()> {
+    pub fn set_ofdm_band(&mut self, band: OfdmBand) -> Result<(), EngineError> {
         self.check_level(
             self.config.speed_level,
             Self::resolves_to_vhf(self.config.speed_level, band),
@@ -613,13 +606,11 @@ impl CoppaCore {
 
     /// Validate `level` for a frame sent on the VHF profile (`on_vhf_profile`)
     /// or on an HF profile, which carries levels 1-8 only.
-    fn check_level(&self, level: u8, on_vhf_profile: bool) -> Result<()> {
+    fn check_level(&self, level: u8, on_vhf_profile: bool) -> Result<(), EngineError> {
         coppa_protocol::modem::speed_level_components(level)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            .map_err(|_| EngineError::InvalidSpeedLevel { level })?;
         if !on_vhf_profile && level > HF_MAX_SPEED_LEVEL {
-            anyhow::bail!(
-                "speed level {level} is not available on an HF profile: HF profiles carry levels 1-8 (COP-24)"
-            );
+            return Err(EngineError::SpeedLevelUnavailableOnHf { level });
         }
         Ok(())
     }
@@ -827,7 +818,7 @@ mod tests {
     fn test_decode_empty_fails() {
         let core = CoppaCore::new();
         let result = core.decode(&[]);
-        assert!(result.is_err(), "decoding empty samples should fail");
+        assert!(matches!(result, Err(EngineError::NoSamplesToDecode)));
     }
 
     #[test]
@@ -839,14 +830,11 @@ mod tests {
         let core = CoppaCore::with_config(config);
         let silence = vec![1e-6; 48000];
         let result = core.decode(&silence);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("No signal detected"),
-            "squelch should reject silence"
-        );
+        assert!(matches!(result, Err(EngineError::NoSignalDetected)));
+        assert!(matches!(
+            core.decode(&[]),
+            Err(EngineError::NoSignalDetected)
+        ));
     }
 
     #[test]
@@ -1044,7 +1032,7 @@ mod tests {
     // `coppa-ffi`) -- real session establishment over actual RF audio
     // through the daemon's real streaming decode path has likely never
     // worked. Fixed by switching `StreamFrame::message: Result<String>` to
-    // `StreamFrame::payload: Result<Vec<u8>>` with no UTF-8 conversion.
+    // `StreamFrame::payload: Result<Vec<u8>, EngineError>` with no UTF-8 conversion.
 
     #[test]
     fn test_push_samples_recovers_non_utf8_binary_payload() {
@@ -1262,8 +1250,10 @@ mod tests {
     #[test]
     fn explicit_level_encoding_rejects_invalid_wire_levels() {
         let core = CoppaCore::new();
-        for level in [0, 10, 255] {
-            assert!(core.encode_bytes_at_level(b"beacon", level).is_err());
+        for level in std::iter::once(0).chain(10..=255) {
+            assert!(
+                matches!(core.encode_bytes_at_level(b"beacon", level), Err(EngineError::InvalidSpeedLevel { level: actual }) if actual == level)
+            );
         }
     }
 
@@ -1272,7 +1262,10 @@ mod tests {
         for profile in [&crate::HF_STANDARD, &crate::HF_ROBUST, &crate::EMERGENCY] {
             let mut core = CoppaCore::from_profile(profile);
             let before = core.speed_level();
-            assert!(core.set_speed_level(9).is_err());
+            assert!(matches!(
+                core.set_speed_level(9),
+                Err(EngineError::SpeedLevelUnavailableOnHf { level: 9 })
+            ));
             assert_eq!(core.speed_level(), before);
             assert!(core.encode_bytes_at_level(b"HF beacon", 9).is_err());
             core.set_speed_level(8).expect("HF accepts its top level");
@@ -1310,7 +1303,10 @@ mod tests {
     fn test_set_speed_level_rejects_removed_level_10() {
         let mut core = CoppaCore::new();
         let before = core.config().speed_level;
-        assert!(core.set_speed_level(10).is_err(), "level 10 is invalid");
+        assert!(matches!(
+            core.set_speed_level(10),
+            Err(EngineError::InvalidSpeedLevel { level: 10 })
+        ));
         assert_eq!(
             core.config().speed_level,
             before,
@@ -1321,9 +1317,18 @@ mod tests {
     #[test]
     fn test_set_speed_level_rejects_out_of_range() {
         let mut core = CoppaCore::new();
-        assert!(core.set_speed_level(0).is_err());
-        assert!(core.set_speed_level(11).is_err());
-        assert!(core.set_speed_level(255).is_err());
+        assert!(matches!(
+            core.set_speed_level(0),
+            Err(EngineError::InvalidSpeedLevel { level: 0 })
+        ));
+        assert!(matches!(
+            core.set_speed_level(11),
+            Err(EngineError::InvalidSpeedLevel { level: 11 })
+        ));
+        assert!(matches!(
+            core.set_speed_level(255),
+            Err(EngineError::InvalidSpeedLevel { level: 255 })
+        ));
     }
 
     // ── Task 1 (Phase 4): TX level calibration (TUNE) ─────────────────────
@@ -1640,7 +1645,10 @@ mod tests {
             );
             assert_eq!(bandwidth, CoppaProfile::hf_standard().bandwidth_id);
         }
-        assert!(core.set_speed_level(9).is_err());
+        assert!(matches!(
+            core.set_speed_level(9),
+            Err(EngineError::SpeedLevelUnavailableOnHf { level: 9 })
+        ));
     }
 
     #[test]

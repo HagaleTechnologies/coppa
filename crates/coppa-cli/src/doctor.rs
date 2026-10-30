@@ -423,8 +423,18 @@ pub(crate) fn cmd_doctor(args: &DoctorArgs) -> Result<()> {
     let rate = coppa_engine::config::EngineConfig::default().sample_rate;
     println!("{HEADER}");
     let _ = std::io::stdout().flush();
-    let backend = coppa_audio::audio_backend_name();
-    let listing = coppa_audio::list_device_support(rate);
+    // A workspace sibling can enable the dependency's CPAL feature without
+    // enabling this binary's live-audio paths. Report this binary's capabilities.
+    let backend = if cfg!(feature = "cpal-backend") {
+        coppa_audio::audio_backend_name()
+    } else {
+        None
+    };
+    let listing = if backend.is_some() {
+        coppa_audio::list_device_support(rate)
+    } else {
+        Ok(Vec::new())
+    };
     let mut checks = vec![
         backend_check(cfg!(feature = "cpal-backend"), backend),
         devices_check(backend, &listing),
@@ -434,7 +444,11 @@ pub(crate) fn cmd_doctor(args: &DoctorArgs) -> Result<()> {
         checks.extend(device_checks(
             direction,
             requested,
-            &coppa_audio::probe_device(direction, requested, rate),
+            &if backend.is_some() {
+                coppa_audio::probe_device(direction, requested, rate)
+            } else {
+                DeviceProbe::NoBackend
+            },
             rate,
         ));
     }

@@ -236,7 +236,7 @@ impl KissServer {
     /// Bind the TCP listener and begin accepting KISS clients.
     ///
     /// This future runs indefinitely.  Spawn it with `tokio::spawn`.
-    pub async fn start(&self) -> anyhow::Result<()> {
+    pub async fn start(&self) -> Result<(), crate::HostError> {
         let addr = format!("{}:{}", self.bind_addr, self.port);
         let listener = TcpListener::bind(&addr).await?;
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));

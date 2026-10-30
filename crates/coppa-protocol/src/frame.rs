@@ -24,7 +24,7 @@
 //! The preamble and sync word are transmitted uncoded so the receiver can find
 //! the frame boundary before invoking FEC decoding.
 
-use anyhow::{anyhow, Result};
+use crate::ProtocolError;
 use crc::{Crc, CRC_16_IBM_SDLC};
 
 /// Generate the 128-bit PN preamble at compile time using an LFSR.
@@ -83,13 +83,12 @@ impl Frame {
     const CRC: Crc<u16> = Crc::<u16>::new(&CRC_16_IBM_SDLC);
 
     /// Create a new frame with the given data.
-    pub fn new(data: Vec<u8>) -> Result<Self> {
+    pub fn new(data: Vec<u8>) -> Result<Self, ProtocolError> {
         if data.len() > Self::MAX_DATA_LENGTH {
-            return Err(anyhow!(
-                "Data too long: {} bytes (max {})",
-                data.len(),
-                Self::MAX_DATA_LENGTH
-            ));
+            return Err(ProtocolError::FrameDataTooLong {
+                len: data.len(),
+                max: Self::MAX_DATA_LENGTH,
+            });
         }
         Ok(Self { data })
     }
@@ -111,7 +110,7 @@ impl Frame {
     /// real difference -- CRC covering the length field -- into this method
     /// directly and deleted the duplicate. See
     /// `.superpowers/sdd/task-9-report.md` for the fold decision.)
-    pub fn to_bits_split(&self) -> Result<(Vec<u8>, Vec<u8>)> {
+    pub fn to_bits_split(&self) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
         let mut header = Vec::new();
         let mut payload = Vec::new();
 
@@ -149,7 +148,7 @@ impl Frame {
     }
 
     /// Convert frame to a flat bit sequence (backward-compatible, no FEC split).
-    pub fn to_bits(&self) -> Result<Vec<u8>> {
+    pub fn to_bits(&self) -> Result<Vec<u8>, ProtocolError> {
         let (header, payload) = self.to_bits_split()?;
         let mut bits = header;
         bits.extend(payload);
@@ -157,11 +156,11 @@ impl Frame {
     }
 
     /// Parse hard-decided bits into a frame.
-    pub fn from_bits(bits: &[u8]) -> Result<Self> {
+    pub fn from_bits(bits: &[u8]) -> Result<Self, ProtocolError> {
         // Minimum: 16 preamble check + 16 sync + 8 length + 16 CRC = 56 bits
         // But preamble is 128 bits, so minimum practical: 128 + 16 + 8 + 16 = 168
         if bits.len() < 168 {
-            return Err(anyhow!("Bit sequence too short"));
+            return Err(ProtocolError::FrameBitsTooShort);
         }
 
         let sync_start = Self::find_sync(bits)?;
@@ -171,7 +170,7 @@ impl Frame {
 
     /// Parse a payload bit sequence (length + data + CRC) into a frame.
     /// Used when FEC decoding has already been applied to the payload.
-    pub fn from_payload_bits(payload_bits: &[u8]) -> Result<Self> {
+    pub fn from_payload_bits(payload_bits: &[u8]) -> Result<Self, ProtocolError> {
         Self::parse_payload(payload_bits)
     }
 
@@ -182,11 +181,11 @@ impl Frame {
     /// Returns the bit index where the sync word starts.
     /// Tolerates up to SYNC_MAX_ERRORS bit errors in the sync word for
     /// robustness against noisy channels.
-    pub fn find_sync(bits: &[u8]) -> Result<usize> {
+    pub fn find_sync(bits: &[u8]) -> Result<usize, ProtocolError> {
         // Need at least 16 bits of preamble check + 16 bits sync word
         let min_preamble_check = 16;
         if bits.len() < min_preamble_check + 16 {
-            return Err(anyhow!("Bit sequence too short for sync detection"));
+            return Err(ProtocolError::SyncBitsTooShort);
         }
 
         let mut best_pos = None;
@@ -210,12 +209,12 @@ impl Frame {
             }
         }
 
-        best_pos.ok_or_else(|| anyhow!("Sync word not found"))
+        best_pos.ok_or(ProtocolError::SyncNotFound)
     }
 
     /// Find sync word, trying both normal and inverted polarity.
     /// Returns (sync_position, inverted) where inverted=true means all bits are flipped.
-    pub fn find_sync_with_polarity(bits: &[u8]) -> Result<(usize, bool)> {
+    pub fn find_sync_with_polarity(bits: &[u8]) -> Result<(usize, bool), ProtocolError> {
         // Try normal polarity first
         if let Ok(pos) = Self::find_sync(bits) {
             return Ok((pos, false));
@@ -227,7 +226,7 @@ impl Frame {
             return Ok((pos, true));
         }
 
-        Err(anyhow!("Sync word not found in either polarity"))
+        Err(ProtocolError::SyncNotFoundEitherPolarity)
     }
 
     // -- MAC PDU integration --
@@ -235,7 +234,7 @@ impl Frame {
     /// Create a frame from a MAC PDU byte payload.
     ///
     /// This wraps a serialized MAC PDU into the PHY frame structure.
-    pub fn from_mac_pdu(mac_bytes: &[u8]) -> Result<Self> {
+    pub fn from_mac_pdu(mac_bytes: &[u8]) -> Result<Self, ProtocolError> {
         Self::new(mac_bytes.to_vec())
     }
 
@@ -280,10 +279,10 @@ impl Frame {
         errors <= max_errors
     }
 
-    fn parse_payload(bits: &[u8]) -> Result<Self> {
+    fn parse_payload(bits: &[u8]) -> Result<Self, ProtocolError> {
         if bits.len() < 24 {
             // minimum: 8 (length) + 0 (data) + 16 (CRC) = 24
-            return Err(anyhow!("Payload too short"));
+            return Err(ProtocolError::FramePayloadTooShort);
         }
 
         let mut bit_index = 0;
@@ -295,7 +294,7 @@ impl Frame {
         // Read data
         let data_bits_needed = length as usize * 8;
         if bit_index + data_bits_needed + 16 > bits.len() {
-            return Err(anyhow!("Truncated frame: missing data or CRC"));
+            return Err(ProtocolError::FrameTruncated);
         }
 
         let mut data = Vec::new();
@@ -315,11 +314,10 @@ impl Frame {
         let calculated_crc = Self::CRC.checksum(&crc_input);
 
         if received_crc != calculated_crc {
-            return Err(anyhow!(
-                "CRC mismatch: expected 0x{:04X}, got 0x{:04X}",
-                calculated_crc,
-                received_crc
-            ));
+            return Err(ProtocolError::FrameCrcMismatch {
+                expected: calculated_crc,
+                actual: received_crc,
+            });
         }
 
         Ok(Self { data })
@@ -362,7 +360,10 @@ mod tests {
     #[test]
     fn test_frame_too_long() {
         let data = vec![0u8; 256];
-        assert!(Frame::new(data).is_err());
+        assert!(matches!(
+            Frame::new(data),
+            Err(ProtocolError::FrameDataTooLong { len: 256, max: 255 })
+        ));
     }
 
     #[test]
@@ -513,14 +514,20 @@ mod tests {
     fn test_truncated_frame_too_short_for_header() {
         // Less than 168 bits minimum for from_bits
         let short_bits = vec![0u8; 40];
-        assert!(Frame::from_bits(&short_bits).is_err());
+        assert!(matches!(
+            Frame::from_bits(&short_bits),
+            Err(ProtocolError::FrameBitsTooShort)
+        ));
     }
 
     #[test]
     fn test_payload_too_short() {
         // Less than 24 bits (8 length + 16 CRC minimum)
         let short_payload = vec![0u8; 16];
-        assert!(Frame::from_payload_bits(&short_payload).is_err());
+        assert!(matches!(
+            Frame::from_payload_bits(&short_payload),
+            Err(ProtocolError::FramePayloadTooShort)
+        ));
     }
 
     #[test]
@@ -537,7 +544,10 @@ mod tests {
     #[test]
     fn test_max_payload_exceeded() {
         let data = vec![0u8; 256]; // one more than MAX_DATA_LENGTH
-        assert!(Frame::new(data).is_err());
+        assert!(matches!(
+            Frame::new(data),
+            Err(ProtocolError::FrameDataTooLong { len: 256, max: 255 })
+        ));
     }
 
     #[test]
