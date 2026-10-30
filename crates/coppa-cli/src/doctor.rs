@@ -423,20 +423,31 @@ pub(crate) fn cmd_doctor(args: &DoctorArgs) -> Result<()> {
     let rate = coppa_engine::config::EngineConfig::default().sample_rate;
     println!("{HEADER}");
     let _ = std::io::stdout().flush();
-    let backend = coppa_audio::audio_backend_name();
-    let listing = coppa_audio::list_device_support(rate);
+    // Workspace feature unification can enable CPAL in coppa-audio even when
+    // this CLI cannot use live audio. Keep every doctor row on the CLI's gate.
+    let live_audio = cfg!(feature = "cpal-backend");
+    let backend = if live_audio {
+        coppa_audio::audio_backend_name()
+    } else {
+        None
+    };
+    let listing = if live_audio {
+        coppa_audio::list_device_support(rate)
+    } else {
+        Ok(Vec::new())
+    };
     let mut checks = vec![
         backend_check(cfg!(feature = "cpal-backend"), backend),
         devices_check(backend, &listing),
     ];
     for direction in [Direction::Input, Direction::Output] {
         let requested = args.requested(direction);
-        checks.extend(device_checks(
-            direction,
-            requested,
-            &coppa_audio::probe_device(direction, requested, rate),
-            rate,
-        ));
+        let probe = if live_audio {
+            coppa_audio::probe_device(direction, requested, rate)
+        } else {
+            DeviceProbe::NoBackend
+        };
+        checks.extend(device_checks(direction, requested, &probe, rate));
     }
     checks.extend(if args.no_rigctld {
         skipped_rigctld_checks()

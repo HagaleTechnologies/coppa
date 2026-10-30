@@ -514,7 +514,11 @@ fn run_arm(
         // an exhaustive sweep; `raise_dwell = 5` is `RateLoop::default_coppa()`'s unchanged default.
         // Left byte-for-byte as it was pre-COP-2: this ticket must not confound a metric change
         // with a tuning change.
-        _ => Some(RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 5, 1).with_probing(2, 1)),
+        _ => Some(
+            RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 5, 1)
+                .unwrap()
+                .with_probing(2, 1),
+        ),
     };
 
     let mut switch_air_s = 0.0f64;
