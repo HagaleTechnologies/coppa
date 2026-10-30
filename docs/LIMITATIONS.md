@@ -1,8 +1,9 @@
 # Known Limitations
 
 Measured gaps, open bugs, unmet acceptance bars and deliberate scope cuts in coppa, each with
-its evidence. This list moved here from `CLAUDE.md` in COP-77; its bullets are unchanged
-except that citations of notes that were never committed were removed.
+its evidence. This list moved here from `CLAUDE.md` in COP-77. Its bullets are unchanged except that
+the one citation of the VHF timing-backoff report follows the report to `docs/analysis/`.
+Citations of notes that were never committed are still here; COP-107 removes them.
 
 Level numbers in text written before COP-24 (2026-10-23) use the old ladder: old 9 is now 8
 and old 10 is now 9. `docs/adr/009-cop24-speed-ladder-renumber.md` has the full mapping.

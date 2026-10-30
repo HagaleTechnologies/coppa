@@ -902,7 +902,7 @@ impl EventLoop {
         // Always constructed (cheap; mirrors RateLoop's own "hardcode the
         // hysteresis constants, only expose the interval/offset-equivalent
         // via config" pattern -- no config knobs for threshold_ms/
-        // consecutive_needed, YAGNI per CLAUDE.md's alpha-calibration
+        // consecutive_needed, YAGNI per docs/LIMITATIONS.md's alpha-calibration
         // cautionary tale). Whether it's ever fed a real observation is
         // gated by `config.engine.cp_gate_enabled` in
         // `decode_and_dispatch_audio`.
@@ -7219,7 +7219,7 @@ mod tests {
         // `cp_negotiation_full_handshake_converges_both_sides` carries at its
         // own ack-decode step: this is `a`'s SECOND real decode of a
         // `CoppaCore::encode_bytes`-built frame, and `CoppaCore` reliably
-        // fails every decode after its first one (CLAUDE.md's standalone
+        // fails every decode after its first one (docs/LIMITATIONS.md's standalone
         // known-limitation bullet, "Bug B" -- real, reproducible, narrowed to
         // a payload-size-dependent spurious sync candidate, and entirely
         // orthogonal to CP negotiation). `set_cp_profile` always rebuilds
@@ -8709,7 +8709,7 @@ mod tests {
     /// Same workaround, for the same reason, as
     /// `lost_cp_switched_converges_both_endpoints_on_long_cp` carries inline:
     /// `CoppaCore` reliably fails every decode after its first one of a
-    /// `CoppaCore::encode_bytes`-built frame (CLAUDE.md's "Bug B", real,
+    /// `CoppaCore::encode_bytes`-built frame (docs/LIMITATIONS.md's "Bug B", real,
     /// reproducible, and entirely orthogonal to CP negotiation).
     /// `set_cp_profile` always rebuilds `self.streaming`, so calling it with
     /// the station's CURRENT mode is a genuine no-op for the profile that

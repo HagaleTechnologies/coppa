@@ -1300,7 +1300,7 @@ impl CoppaModem {
     /// anything). The AWGN-only CFO floor (FER≈1.0 at 39-40 Hz) simply does not
     /// reappear once real Watterson multipath is present — the pre-existing
     /// level-4 Watterson floor (~40-50% FER at high SNR, unrelated to this fix,
-    /// see CLAUDE.md's Known Limitations) dominates and CFO adds no measurable
+    /// see docs/LIMITATIONS.md) dominates and CFO adds no measurable
     /// extra degradation on top of it. See
     /// `.superpowers/sdd/p2-cfo-level4-fix-report.md`'s "Combined CFO + Watterson
     /// fading" addendum for the raw data.

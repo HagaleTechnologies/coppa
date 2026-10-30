@@ -750,7 +750,7 @@ the non-exact-division remainder branch.
 
 ### 7.3 Deleted component: no protocol-side generic interleaver
 
-CLAUDE.md's Known Limitations states the old `coppa-protocol::fec::interleaver`
+docs/LIMITATIONS.md states the old `coppa-protocol::fec::interleaver`
 was deleted as dead code in Phase 3 Task 9. This spec confirms that by
 direct inspection: `crates/coppa-protocol/src/fec/` contains only
 `convolutional.rs`, `ldpc/`, `mod.rs`, and `scrambler.rs` — **no**
@@ -835,7 +835,7 @@ symbols into consecutive OFDM symbols
 
 ### 9.5 Known scope cuts (not implemented)
 
-Per CLAUDE.md's Known Limitations and `docs/adr/007-multi-codeword-frames.md`
+Per docs/LIMITATIONS.md and `docs/adr/007-multi-codeword-frames.md`
 (decisions 4–5): ACK addressing, turbo re-estimation, and persistent IR-HARQ
 LLR combining are **not** extended to the per-codeword level. A
 multi-codeword frame is retransmitted, if at all, as a whole (same `seq`,
@@ -1006,7 +1006,7 @@ A conforming **receiver** MUST:
       `sample_rate=48000`: `±sample_rate/fft_size`,
       `crates/coppa-codec/src/ofdm/sync.rs:202-206`) — beyond this the
       ambiguity-resolution itself wraps (documented limitation, see
-      CLAUDE.md).
+      docs/LIMITATIONS.md).
 - [ ] Correctly decode the protected header per §4.3 (at minimum the hard
       Golay(24,12)+CRC-16 path; soft/LLR decoding is recommended for real
       HF-fading robustness but not required for wire conformance).

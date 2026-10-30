@@ -102,7 +102,7 @@ Task 7's report's working hypothesis is that the drift Task 1 documented is more
 continuously-accumulating phase/coarse-delay reference error than genuine stationary Rayleigh
 amplitude fading, making a zero-mean mean-reverting AR(1) model a poor fit for the actual
 mechanism — a model-class mismatch, not a tuning problem. **This regression is shipped, accepted,
-and unresolved** — see "Consequences" and CLAUDE.md's Known Limitations.
+and unresolved** — see "Consequences" and docs/LIMITATIONS.md.
 
 An addendum to Task 7's report also flags a plausible *additional* contributor never
 independently confirmed: `TrackedTaps::noise_at` returns the tracker's posterior tap-variance
@@ -173,7 +173,7 @@ during Task 4's own Step 5 investigation**: α=0.80 measurably beat α=0.75 in a
 (level 2 only) calibration sweep and was initially shipped as the default — but this broke real
 LDPC convergence at level 10 (100% frame loss, including on a clean channel), caught by
 `tests/phase_c_loopback.rs`'s pre-existing tests, not by the new codec's own unit tests. **Shipped
-default: α=0.75**, validated across the whole ladder. This is recorded in CLAUDE.md as a
+default: α=0.75**, validated across the whole ladder. This is recorded in docs/LIMITATIONS.md as a
 standing lesson: validate any future LDPC-parameter change across the whole speed ladder and
 payload-size extremes, not one representative level. A follow-up hardened this: a dedicated
 regression test (`perfect_llr_loopback_level_10_tiny_payload`) now runs this exact scenario under

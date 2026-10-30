@@ -80,7 +80,7 @@ impl CpGate {
     /// precise value than that reasoning; if this ever needs tuning, follow the
     /// `raise_dwell` sweep in `RateLoop::default_coppa`'s doc as the precedent for how to do
     /// it (sweep across the whole speed ladder / channel conditions, not one representative
-    /// case — see `CLAUDE.md`'s alpha-calibration cautionary tale).
+    /// case — see `docs/LIMITATIONS.md`'s alpha-calibration cautionary tale).
     pub fn default_coppa() -> Self {
         Self::new(2.5, 4)
     }
@@ -157,7 +157,7 @@ mod tests {
         // 6b brief's own framing, "watterson-poor (2 ms + timing slop)" is what the gate
         // must refuse: real per-frame measurement adds sync-timing jitter and fit-residual
         // noise on top of that nominal 2 ms (a real, measured effect -- e.g. the
-        // strongest-path-timing fix documented in CLAUDE.md's Known Limitations exists
+        // strongest-path-timing fix documented in docs/LIMITATIONS.md exists
         // precisely because real timing references aren't perfectly clean), so the
         // synthetic spans this test feeds the gate sit at/just above the 2.5 ms threshold
         // (2.5-3.2 ms) rather than at the idealized noise-free 2.08 ms nominal value. A run

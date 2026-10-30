@@ -74,7 +74,7 @@
 //! own capacity reading becomes, so the loop keeps getting told to climb further regardless of the
 //! real channel. If this hypothesis holds, it would be a pre-existing property of the shared
 //! channel-estimation/capacity layer (consistent with the still-open channel-estimation
-//! limitation in CLAUDE.md's Known Limitations), not a bug introduced by this bench or by
+//! limitation in docs/LIMITATIONS.md), not a bug introduced by this bench or by
 //! `RateLoop`'s hysteresis logic -- and fixing
 //! it is out of this task's scope (it would mean either a level-invariant capacity metric or a
 //! per-level-recalibrated threshold table, both belonging to the channel-estimation/MCS-calibration
@@ -85,7 +85,7 @@
 //! the bar
 //!
 //! Several follow-up investigations (level-bias correction, hysteresis tuning, a probe-level-accuracy
-//! diagnosis -- see `CLAUDE.md`'s RateLoop bullet for the full history) converged on: the passive
+//! diagnosis -- see `docs/LIMITATIONS.md`'s RateLoop bullet for the full history) converged on: the passive
 //! per-frame recommendation is itself a weak same-frame predictor of what a frame could actually
 //! support when measured via a low-order probe, and that accuracy scales with the probing modulation
 //! order. This bench now demonstrates `RateLoop`'s active overshoot probing

@@ -22,7 +22,7 @@ const COMPRESSION_MARKER: u8 = 0xFE;
 /// Low tone of the standard SSB two-tone TX-level calibration signal (Hz).
 /// 700 Hz + 1900 Hz is standard amateur-radio TUNE/two-tone practice: both
 /// fall well inside the waveform's ~300-2700 Hz SSB passband (see
-/// `CLAUDE.md`) and are far enough apart that ALC/scope readings aren't
+/// `docs/LIMITATIONS.md`) and are far enough apart that ALC/scope readings aren't
 /// confused by beat artifacts.
 pub const TUNE_TONE_LOW_HZ: f32 = 700.0;
 /// High tone of the standard SSB two-tone TX-level calibration signal (Hz).

@@ -22,7 +22,7 @@
 //! predictor and an optional-model-file registry (`channel_predictor.rs`,
 //! `registry.rs`) that existed only to gesture at a future inference runtime
 //! that was never built and had no real caller anywhere in this workspace;
-//! Task 9 deleted both as dead code. See CLAUDE.md's Known Limitations for
+//! Task 9 deleted both as dead code. See docs/LIMITATIONS.md for
 //! what adaptation this crate does and does not perform today.
 
 pub mod busy_gate;
