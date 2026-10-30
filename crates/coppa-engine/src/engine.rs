@@ -8,7 +8,6 @@ use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::compression::huffman::HuffmanCodec;
 use coppa_protocol::compression::lz4::{lz4_compress, lz4_decompress};
 use coppa_protocol::cp_negotiator::CpMode;
-use coppa_protocol::modem::speed_levels::max_multi_payload_for_level;
 use coppa_protocol::modem::streaming::StreamingReceiver;
 use coppa_protocol::modem::transceiver::{CoppaTransceiver, MAX_CODEWORDS};
 
@@ -275,13 +274,39 @@ impl CoppaCore {
     /// panic. Level validation is the caller's (`encode_bytes` never checked
     /// it either — the transceiver rejects invalid levels).
     pub fn encode_bytes_with_codewords(&self, data: &[u8], codewords: u8) -> Result<Vec<f32>> {
+        Self::check_codewords(codewords)?;
+        self.encode_bytes_at(data, self.config.speed_level, codewords)
+    }
+
+    /// COP-69: shared codeword-count validation for the codeword-aware
+    /// encode twins (COP-19 surface: `Err`, never a panic).
+    fn check_codewords(codewords: u8) -> Result<()> {
         if codewords > MAX_CODEWORDS {
             anyhow::bail!("codewords ({codewords}) exceeds max {MAX_CODEWORDS}");
         }
         if codewords == 0 {
             anyhow::bail!("codewords (0) is below the minimum of 1");
         }
-        self.encode_bytes_at(data, self.config.speed_level, codewords)
+        Ok(())
+    }
+
+    /// COP-69: the fade-hold re-encode twin of
+    /// [`Self::encode_bytes_with_level`] for a session frame sent with
+    /// `codewords` codewords: the same byte-identical frame bytes,
+    /// re-encoded at the fallback level *at the same codeword count* --
+    /// a multi-codeword segment's budget is
+    /// `max_multi_payload_for_level(level, codewords)`, so judging it
+    /// against the 1-codeword budget (the pre-COP-69 `fittest_level` rule)
+    /// would reject it at every level.
+    pub fn encode_bytes_with_level_and_codewords(
+        &self,
+        data: &[u8],
+        level: u8,
+        codewords: u8,
+    ) -> Result<Vec<f32>> {
+        Self::check_codewords(codewords)?;
+        self.check_level(level, self.on_vhf_profile())?;
+        self.encode_bytes_at(data, level, codewords)
     }
 
     /// COP-69: [`Self::encoded_payload_len`]'s answer for a frame that will

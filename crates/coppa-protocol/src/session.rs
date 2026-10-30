@@ -636,8 +636,10 @@ mod tests {
     /// protocol exactly.
     #[test]
     fn link_capabilities_multi_frame_ack_negotiates_as_and() {
-        let mut set = LinkCapabilities::default();
-        set.multi_frame_ack = true;
+        let set = LinkCapabilities {
+            multi_frame_ack: true,
+            ..LinkCapabilities::default()
+        };
         let clear = LinkCapabilities::default();
 
         assert!(!set.negotiate(&clear).multi_frame_ack);

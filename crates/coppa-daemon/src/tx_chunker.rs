@@ -1,9 +1,11 @@
 //! COP-41: split one host `DataReceived` event into chunks that each fit a
 //! speed level's one-codeword payload budget after framing and compression.
 //!
-//! One TCP read (<= 4096 B) is not one over-the-air frame: the engine encodes
-//! with `codewords: 1`, and `CoppaTransceiver::transmit` rejects encoded
-//! payloads above the level budget (56-198 bytes across levels 1-9). Every TX
+//! One TCP read (<= 4096 B) is not one over-the-air frame: every TX path
+//! but the connected-session link encodes with `codewords: 1` (the session
+//! link picks 1-8 per frame, COP-69, against the same budget rule), and
+//! `CoppaTransceiver::transmit` rejects encoded payloads above the level
+//! budget (56-198 bytes per codeword across levels 1-9). Every TX
 //! path in `event_loop.rs` runs its host bytes through [`chunk_to_fit`] so an
 //! ordinary Pat/B2F chunk becomes several properly-sized frames instead of
 //! one that silently fails to encode (or squeezes through as a single
