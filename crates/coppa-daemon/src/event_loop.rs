@@ -1996,6 +1996,7 @@ impl EventLoop {
                 return;
             }
         };
+        self.raise_session_multi_rto(&samples, codewords);
         // Boxed: `transmit_samples` -> `handle_ptt_change` -> (on PTT
         // release) `drain_session_link` forms the same 3-way async call
         // cycle `try_drain_tx_queue` documents; one edge needs indirection
@@ -2043,6 +2044,32 @@ impl EventLoop {
             max = self.max_frames_per_turn,
             "Session data frame transmitted"
         );
+    }
+
+    /// COP-69: a multi-codeword frame can outlast the initial five-second
+    /// RTO. Raise both the active timeout and its estimator floor before
+    /// submission, including on a slower fallback retransmission. Single-
+    /// codeword sessions retain their existing timing. The full HF long-CP
+    /// ACK is a conservative upper bound for the supported HF short-CP and
+    /// VHF profiles too; this branch still sends full-frame ACKs.
+    fn raise_session_multi_rto(&mut self, samples: &[f32], codewords: u8) {
+        if codewords <= 1 {
+            return;
+        }
+        let data_s = samples.len() as f64 / self.engine.config().sample_rate as f64;
+        let ack_s = coppa_protocol::modem::frame_airtime_s(
+            self.engine.speed_level(),
+            &coppa_codec::ofdm::CoppaProfile::hf_standard(),
+        )
+        .expect("the engine's speed level is always a valid wire level");
+        let radio = &self.config.radio;
+        let turnaround_s = (radio.turnaround_ms + radio.ptt_pre_delay_ms + radio.ptt_tail_delay_ms)
+            as f64
+            / 1000.0;
+        if let Some(link) = self.session_link.as_mut() {
+            link.tx
+                .raise_rto_floor(Duration::from_secs_f64(data_s + 2.0 * turnaround_s + ack_s));
+        }
     }
 
     /// Drop the link of a session that has ended (local or remote
@@ -2244,6 +2271,7 @@ impl EventLoop {
             };
             match encoded {
                 Ok(samples) => {
+                    self.raise_session_multi_rto(&samples, codewords);
                     tracing::debug!(seq, attempt, "Retransmitting session frame");
                     Box::pin(self.transmit_samples(&samples)).await;
                 }
@@ -14637,6 +14665,44 @@ mod tests {
                 .receive(samples)
                 .expect("a clean loopback frame must decode");
             (header, payload)
+        }
+
+        #[tokio::test]
+        async fn multi_codeword_session_rto_covers_airtime_and_ack_after_rtt_sample() {
+            let mut config = cop69_station_config();
+            config.radio.turnaround_ms = 500;
+            let (mut event_loop, mut consumer) = cop69_station_with(config);
+            event_loop.engine.set_speed_level(2).unwrap();
+            for _ in 0..2 {
+                event_loop
+                    .handle_host_event(HostEvent::DataReceived {
+                        client_id: 1,
+                        data: cop69_incompressible(2000),
+                    })
+                    .await;
+                let audio = read_all(&mut consumer);
+                let airtime = Duration::from_secs_f64(audio.len() as f64 / 48_000.0);
+                assert!(airtime > Duration::from_secs(9));
+                let link = event_loop.session_link.as_mut().unwrap();
+                assert_eq!(link.tx_codewords, 8);
+                let floor = airtime + Duration::from_millis(1000 + 1365);
+                assert!(
+                    link.tx.rto() >= floor,
+                    "RTO {:?} < floor {floor:?}",
+                    link.tx.rto()
+                );
+                let now = Instant::now();
+                assert!(link
+                    .tx
+                    .get_retransmits(now + Duration::from_secs(5))
+                    .is_empty());
+                // A tiny synthetic RTT must not discard the multi-codeword floor.
+                let ack = link.tx.next_seq();
+                link.tx.process_ack(ack, 0, now);
+                assert!(link.tx.rto() >= floor);
+                link.backlog.clear();
+                event_loop.handle_ptt_change(false).await;
+            }
         }
 
         /// COP-69: a backlog beyond one codeword's budget, with the
