@@ -15,6 +15,26 @@
 /// Ordered ascending valid coppa speed levels (1-9).
 pub const VALID_SPEED_LEVELS: [u8; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 
+/// Invalid configuration for a [`RateLoop`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLoopError {
+    /// No levels were supplied.
+    EmptyLevels,
+    /// Levels contain a duplicate or are out of order.
+    LevelsNotAscending,
+}
+
+impl std::fmt::Display for RateLoopError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::EmptyLevels => "RateLoop needs a non-empty level set",
+            Self::LevelsNotAscending => "RateLoop levels must be strictly ascending",
+        })
+    }
+}
+
+impl std::error::Error for RateLoopError {}
+
 /// Sender-side adaptive rate controller. Holds an index into an ascending level set.
 pub struct RateLoop {
     levels: Vec<u8>,
@@ -27,13 +47,28 @@ pub struct RateLoop {
 }
 
 impl RateLoop {
-    /// `levels` must be ascending and non-empty; `initial_level` is clamped into the set.
+    /// `levels` must be strictly ascending and non-empty; `initial_level` is clamped into the set.
     /// `raise_dwell` is the number of consecutive higher recommendations required to step up.
     /// Active overshoot probing is disabled by default -- see `with_probing`.
-    pub fn new(levels: Vec<u8>, raise_dwell: u8, initial_level: u8) -> Self {
-        assert!(!levels.is_empty(), "RateLoop needs a non-empty level set");
+    ///
+    /// # Errors
+    /// Returns an error for an empty set, duplicate levels, or descending levels.
+    ///
+    /// ```
+    /// use coppa_ml::RateLoop;
+    /// let mut controller = RateLoop::new(vec![1, 3, 9], 5, 1)?;
+    /// controller.on_ack(3, true);
+    /// # Ok::<(), coppa_ml::rate_loop::RateLoopError>(())
+    /// ```
+    pub fn new(levels: Vec<u8>, raise_dwell: u8, initial_level: u8) -> Result<Self, RateLoopError> {
+        if levels.is_empty() {
+            return Err(RateLoopError::EmptyLevels);
+        }
+        if levels.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(RateLoopError::LevelsNotAscending);
+        }
         let idx = Self::rank(&levels, initial_level);
-        Self {
+        Ok(Self {
             levels,
             idx,
             raise_dwell: raise_dwell.max(1),
@@ -41,7 +76,7 @@ impl RateLoop {
             probe_interval: 0,
             probe_offset: 0,
             frames_since_probe: 0,
-        }
+        })
     }
 
     /// Enable active overshoot probing: every `probe_interval` calls to
@@ -65,16 +100,15 @@ impl RateLoop {
     /// for the measured numbers and the deeper reason this configuration still falls short of
     /// the plan's acceptance bar.
     ///
-    /// Does NOT enable active overshoot probing (see `with_probing`) -- this constructor is what
-    /// `coppa-daemon` uses in production today, which doesn't yet call `level_for_next_transmission`/
-    /// `on_probe_result` (that wiring is deliberately deferred, see the probing design doc's
-    /// "Out of scope" section), so changing this constructor's defaults would have no effect there
-    /// beyond `raise_dwell` itself -- left unchanged from its passive-only-tuned value to avoid an
-    /// unintended behavior change to real production traffic. Callers that want probing (currently
-    /// only `closed_loop_arq.rs`) opt in explicitly via `.with_probing(2, 1)`, the combination
-    /// measured best on that bench.
+    /// Probing stays disabled. The daemon builds its controller from the engine's
+    /// available levels instead of calling this fixed-ladder constructor.
+    ///
+    /// # Panics
+    /// Panics only if the built-in `VALID_SPEED_LEVELS` table is empty or ceases
+    /// to be strictly ascending.
     pub fn default_coppa() -> Self {
         Self::new(VALID_SPEED_LEVELS.to_vec(), 5, 1)
+            .expect("built-in speed levels are non-empty and strictly ascending")
     }
 
     /// Index of the highest level `<= level` (clamped into range).
@@ -120,7 +154,10 @@ impl RateLoop {
         if self.raise_run != 0 {
             return (self.current_level(), false);
         }
-        let probe_idx = (self.idx + self.probe_offset).min(self.levels.len() - 1);
+        let probe_idx = self
+            .idx
+            .saturating_add(self.probe_offset)
+            .min(self.levels.len() - 1);
         if probe_idx == self.idx {
             // Already at the ceiling -- nothing higher to probe, don't waste this frame on a
             // same-level "probe".
@@ -180,17 +217,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cop81_rejects_invalid_levels() {
+        assert!(matches!(
+            RateLoop::new(vec![], 5, 1),
+            Err(RateLoopError::EmptyLevels)
+        ));
+        for levels in [vec![1, 1], vec![3, 2], vec![1, 4, 3]] {
+            assert!(matches!(
+                RateLoop::new(levels, 5, 1),
+                Err(RateLoopError::LevelsNotAscending)
+            ));
+        }
+        assert_eq!(
+            RateLoopError::EmptyLevels.to_string(),
+            "RateLoop needs a non-empty level set"
+        );
+    }
+
+    #[test]
+    fn cop81_custom_levels_clamping_and_zero_dwell() {
+        let mut low = RateLoop::new(vec![0, 17, 255], 0, 0).unwrap();
+        low.on_ack(255, true);
+        assert_eq!(low.current_level(), 17);
+        assert_eq!(RateLoop::new(vec![3, 17], 1, 0).unwrap().current_level(), 3);
+        assert_eq!(
+            RateLoop::new(vec![3, 17], 1, 255).unwrap().current_level(),
+            17
+        );
+        assert_eq!(
+            RateLoop::new(vec![3, 17, 42], 1, 20)
+                .unwrap()
+                .current_level(),
+            17
+        );
+    }
+
+    #[test]
+    fn cop81_probe_offset_cannot_overflow() {
+        let mut r = RateLoop::new(vec![1, 3, 9], 5, 3)
+            .unwrap()
+            .with_probing(1, usize::MAX);
+        assert_eq!(r.level_for_next_transmission(), (9, true));
+        r.on_probe_result(9, true);
+        assert_eq!(r.level_for_next_transmission(), (9, false));
+    }
+
+    #[test]
     fn starts_at_initial_level() {
         assert_eq!(RateLoop::default_coppa().current_level(), 1);
         assert_eq!(
-            RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 6).current_level(),
+            RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 6)
+                .unwrap()
+                .current_level(),
             6
         );
     }
 
     #[test]
     fn raise_is_slow_and_one_step() {
-        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 1);
+        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 1).unwrap();
         r.on_ack(9, true); // higher recommendation, run=1
         assert_eq!(r.current_level(), 1);
         r.on_ack(9, true); // run=2
@@ -203,14 +288,14 @@ mod tests {
 
     #[test]
     fn drop_is_immediate_to_recommendation() {
-        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 7);
+        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 7).unwrap();
         r.on_ack(3, true); // lower recommendation -> jump straight to 3
         assert_eq!(r.current_level(), 3);
     }
 
     #[test]
     fn failure_drops_one_step() {
-        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 6);
+        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 6).unwrap();
         r.on_ack(9, false); // not delivered -> drop one step (6 -> 5)
         assert_eq!(r.current_level(), 5);
         r.on_timeout(); // 5 -> 4
@@ -219,24 +304,24 @@ mod tests {
 
     #[test]
     fn raises_from_7_to_8() {
-        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 1, 7);
+        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 1, 7).unwrap();
         r.on_ack(9, true); // dwell 1 -> step up from 7; next valid level is 8
         assert_eq!(r.current_level(), 8);
     }
 
     #[test]
     fn clamps_at_floor_and_ceiling() {
-        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 1, 1);
+        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 1, 1).unwrap();
         r.on_ack(1, false); // already at floor
         assert_eq!(r.current_level(), 1);
-        let mut r2 = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 1, 9);
+        let mut r2 = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 1, 9).unwrap();
         r2.on_ack(9, true); // already at ceiling
         assert_eq!(r2.current_level(), 9);
     }
 
     #[test]
     fn probing_disabled_by_default() {
-        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 1);
+        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 1).unwrap();
         for _ in 0..20 {
             assert_eq!(r.level_for_next_transmission(), (1, false));
         }
@@ -245,7 +330,9 @@ mod tests {
     #[test]
     fn probe_triggers_at_configured_interval_and_offset() {
         // Starting at level 1 (idx 0), offset 2 -> idx 2 -> level 3.
-        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 1).with_probing(3, 2);
+        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 1)
+            .unwrap()
+            .with_probing(3, 2);
         assert_eq!(r.level_for_next_transmission(), (1, false)); // frame 1
         assert_eq!(r.level_for_next_transmission(), (1, false)); // frame 2
         assert_eq!(r.level_for_next_transmission(), (3, true)); // frame 3 -> probe
@@ -256,7 +343,9 @@ mod tests {
 
     #[test]
     fn probe_is_stall_gated_and_skipped_while_passively_climbing() {
-        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 1).with_probing(2, 2);
+        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 1)
+            .unwrap()
+            .with_probing(2, 2);
         r.on_ack(9, true); // raise_run: 0 -> 1, passive signal already making progress
         assert_eq!(r.level_for_next_transmission(), (1, false)); // interval frame 1
                                                                  // Interval elapses here (frame 2), but raise_run != 0 -> gated, falls back to non-probe.
@@ -272,7 +361,9 @@ mod tests {
     fn probe_offset_clamps_at_ceiling_and_falls_back_to_non_probe() {
         // idx already at the last valid level (9); offset would overflow, clamps to idx itself,
         // which is treated as "nothing to probe" -- not a same-level probe.
-        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 9).with_probing(1, 5);
+        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 3, 9)
+            .unwrap()
+            .with_probing(1, 5);
         assert_eq!(r.level_for_next_transmission(), (9, false));
         assert_eq!(r.level_for_next_transmission(), (9, false));
     }
@@ -280,14 +371,14 @@ mod tests {
     #[test]
     fn probe_success_jumps_immediately_bypassing_raise_dwell() {
         // raise_dwell is huge -- would never raise passively within this test.
-        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 100, 1);
+        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 100, 1).unwrap();
         r.on_probe_result(6, true);
         assert_eq!(r.current_level(), 6);
     }
 
     #[test]
     fn probe_failure_leaves_idx_and_raise_run_untouched() {
-        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 5, 1);
+        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 5, 1).unwrap();
         r.on_ack(9, true); // raise_run: 0 -> 1 (real passive evidence, untouched by the probe below)
         assert_eq!(r.current_level(), 1);
         r.on_probe_result(8, false); // failed probe -- must not touch idx or raise_run

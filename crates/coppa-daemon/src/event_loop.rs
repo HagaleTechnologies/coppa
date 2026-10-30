@@ -847,7 +847,7 @@ impl EventLoop {
         // E6: Initialize ARQ state if enabled
         let (arq_tx, arq_rx) = if config.engine.arq_enabled {
             let arq_config = ArqConfig::default();
-            (Some(ArqTx::new(arq_config)), Some(ArqRx::new(8)))
+            (Some(ArqTx::new(arq_config)?), Some(ArqRx::new(8)))
         } else {
             (None, None)
         };
@@ -897,7 +897,7 @@ impl EventLoop {
         // current_level())`, even with probing disabled. `levels`/`raise_dwell`
         // still match `default_coppa()`'s own choices -- only the initial
         // level differs.
-        let rate_loop = Self::build_rate_loop(&config, &engine, engine.speed_level());
+        let rate_loop = Self::build_rate_loop(&config, &engine, engine.speed_level())?;
 
         // Always constructed (cheap; mirrors RateLoop's own "hardcode the
         // hysteresis constants, only expose the interval/offset-equivalent
@@ -916,7 +916,7 @@ impl EventLoop {
             window_size: 2,
             ..ArqConfig::default()
         };
-        let cp_control_arq_tx = ArqTx::new(cp_control_arq_config);
+        let cp_control_arq_tx = ArqTx::new(cp_control_arq_config)?;
         let cp_control_arq_rx = ArqRx::new(2);
 
         Ok(Self {
@@ -1243,16 +1243,20 @@ impl EventLoop {
     /// starting at `initial_level` (clamped into that ladder). Shared by `new`
     /// and the COP-21 HF rebind so both get the same `raise_dwell` and probing
     /// setup.
-    fn build_rate_loop(config: &DaemonConfig, engine: &CoppaCore, initial_level: u8) -> RateLoop {
-        let rate_loop = RateLoop::new(engine.available_speed_levels(), 5, initial_level);
-        if config.engine.rate_loop_probe_interval > 0 {
+    fn build_rate_loop(
+        config: &DaemonConfig,
+        engine: &CoppaCore,
+        initial_level: u8,
+    ) -> Result<RateLoop> {
+        let rate_loop = RateLoop::new(engine.available_speed_levels(), 5, initial_level)?;
+        Ok(if config.engine.rate_loop_probe_interval > 0 {
             rate_loop.with_probing(
                 config.engine.rate_loop_probe_interval,
                 config.engine.rate_loop_probe_offset,
             )
         } else {
             rate_loop
-        }
+        })
     }
 
     /// COP-21: keep a level-derived engine off `vhf_wide` unless the station
@@ -1303,8 +1307,10 @@ impl EventLoop {
             tracing::warn!(error = %e, "Failed to rebind the engine to the HF profile");
             return;
         }
-        self.rate_loop =
-            Self::build_rate_loop(&self.config, &self.engine, self.rate_loop.current_level());
+        match Self::build_rate_loop(&self.config, &self.engine, self.rate_loop.current_level()) {
+            Ok(rate_loop) => self.rate_loop = rate_loop,
+            Err(e) => tracing::warn!(error = %e, "Failed to rebuild the HF rate loop"),
+        }
         tracing::warn!(
             "speed level {level} selects vhf_wide ({occupied_hz} Hz occupied bandwidth) on this \
              engine because [engine] profile \"{}\" is not a built-in profile, but {}; using \
@@ -2004,6 +2010,9 @@ impl EventLoop {
     /// if it is missing or belongs to another session. Session establishment
     /// itself rebuilds it (`reset_session_link`); this covers any path that
     /// reaches an established session without those handlers.
+    ///
+    /// # Panics
+    /// Panics only if the built-in `SESSION_ARQ_WINDOW` is outside the ARQ window range.
     fn ensure_session_link(&mut self, session_id: u8) {
         if self
             .session_link
@@ -2034,7 +2043,7 @@ impl EventLoop {
             remote: session.remote.clone(),
             local: session.local.clone(),
             ssid: session.ssid,
-            tx: ArqTx::new(config),
+            tx: ArqTx::new(config).expect("SESSION_ARQ_WINDOW is within 1..=MAX_WINDOW_SIZE"),
             rx: ArqRx::new(SESSION_ARQ_WINDOW),
             backlog: VecDeque::new(),
             fallback: None,
@@ -3803,8 +3812,12 @@ impl EventLoop {
                                         Vec::new()
                                     }
                                     TransportType::Reset => {
-                                        // Reset ARQ state
-                                        self.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+                                        // Reset ARQ state. Both windows below are built-in constants
+                                        // within 1..=MAX_WINDOW_SIZE, independent of caller config.
+                                        self.arq_tx =
+                                            Some(ArqTx::new(ArqConfig::default()).expect(
+                                                "default ARQ window is within 1..=MAX_WINDOW_SIZE",
+                                            ));
                                         self.arq_rx = Some(ArqRx::new(8));
                                         // A Reset restarts ARQ sequence numbering from 0,
                                         // so any outstanding probe's tracked seq is no
@@ -3823,7 +3836,7 @@ impl EventLoop {
                                         self.cp_control_arq_tx = ArqTx::new(ArqConfig {
                                             window_size: 2,
                                             ..ArqConfig::default()
-                                        });
+                                        }).expect("fixed CP-control window 2 is within 1..=MAX_WINDOW_SIZE");
                                         self.cp_control_arq_rx = ArqRx::new(2);
                                         self.cp_negotiator = CpNegotiator::new();
                                         self.cp_propose_seq = None;
@@ -7665,7 +7678,8 @@ mod tests {
         let link = station.session_link.as_mut().expect("a session link");
         assert_eq!(link.tx.in_flight(), 0, "swap the RTO before sending");
         link.tx =
-            ArqTx::new(ArqConfig::new(SESSION_ARQ_WINDOW, 5, Duration::from_millis(20)).unwrap());
+            ArqTx::new(ArqConfig::new(SESSION_ARQ_WINDOW, 5, Duration::from_millis(20)).unwrap())
+                .unwrap();
     }
 
     /// COP-38: feed `station` its peer's ACK for every segment it has sent, as
@@ -8975,7 +8989,7 @@ mod tests {
         // disagreeing, the same class of desync this ticket exists to fix,
         // just reached by a different route.
         let mut event_loop = EventLoop::new(cp_enabled_config()).unwrap();
-        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()).unwrap());
         event_loop.arq_rx = Some(ArqRx::new(8));
         event_loop
             .cp_negotiator
@@ -9368,7 +9382,7 @@ mod tests {
         // seeds a non-default starting level. `raise_dwell = 5` is
         // `RateLoop::default_coppa`'s own swept value, so five consecutive
         // higher recommendations is exactly what a real climb costs.
-        a.rate_loop = RateLoop::new(a.engine.available_speed_levels(), 5, 4);
+        a.rate_loop = RateLoop::new(a.engine.available_speed_levels(), 5, 4).unwrap();
 
         // Five real ACKs, encoded under `hf_standard_short_cp` -- `a`'s REAL
         // post-negotiation profile, which is the whole point of driving this
@@ -9418,7 +9432,7 @@ mod tests {
         // is the step that used to land on `hf_standard` and kill the link.
         let arq_config = ArqConfig::new(8, 5, Duration::from_millis(20))
             .expect("window_size=8 is within 1..=MAX_WINDOW_SIZE");
-        let mut arq_tx = ArqTx::new(arq_config);
+        let mut arq_tx = ArqTx::new(arq_config).unwrap();
         arq_tx
             .send(
                 b"expired segment".to_vec(),
@@ -9468,14 +9482,16 @@ mod tests {
         // level 4 immediately afterwards. No ARQ timeout and no VHF dwell at
         // all -- pre-fix, `hf_standard_short_cp` was already lost by the time
         // the revert landed on `hf_standard`.
-        b.rate_loop = RateLoop::new(b.engine.available_speed_levels(), 5, 4).with_probing(1, 1);
+        b.rate_loop = RateLoop::new(b.engine.available_speed_levels(), 5, 4)
+            .unwrap()
+            .with_probing(1, 1);
 
         // A REAL ARQ window holding the seq the queued frame names, rather than a
         // bare `Some(0)` with no segment behind it. That is what makes the
         // probe-success half below reachable: `resolve_probe_if_acked` fires only
         // from inside `if let Some(ref mut arq_tx)`, off a seq that
         // `ArqTx::process_ack` really reports as newly acked.
-        let mut probe_arq_tx = ArqTx::new(ArqConfig::default());
+        let mut probe_arq_tx = ArqTx::new(ArqConfig::default()).unwrap();
         let probe_seq = probe_arq_tx
             .send(b"probe me".to_vec(), Instant::now())
             .expect("a fresh ARQ window should have room");
@@ -9566,7 +9582,7 @@ mod tests {
         // works -- the assertion that fails loudest pre-fix.
         let arq_config = ArqConfig::new(8, 5, Duration::from_millis(20))
             .expect("window_size=8 is within 1..=MAX_WINDOW_SIZE");
-        let mut arq_tx = ArqTx::new(arq_config);
+        let mut arq_tx = ArqTx::new(arq_config).unwrap();
         arq_tx
             .send(
                 b"expired segment".to_vec(),
@@ -9648,7 +9664,7 @@ mod tests {
         // Climb across the boundary through the real ACK path, exactly as
         // `a_rate_loop_vhf_excursion_does_not_desync_a_negotiated_short_cp` does —
         // ACKs encoded under `hf_standard_short_cp`, `b`'s real current profile.
-        b.rate_loop = RateLoop::new(b.engine.available_speed_levels(), 5, 4);
+        b.rate_loop = RateLoop::new(b.engine.available_speed_levels(), 5, 4).unwrap();
         for _ in 0..5 {
             let ack = TransportPdu::new_ack_with_rate(b.arq_session_id, 0, 0, 9);
             unstick_decoder(&mut b);
@@ -9671,7 +9687,7 @@ mod tests {
         // Back down through the real timeout path.
         let arq_config = ArqConfig::new(8, 5, Duration::from_millis(20))
             .expect("window_size=8 is within 1..=MAX_WINDOW_SIZE");
-        let mut arq_tx = ArqTx::new(arq_config);
+        let mut arq_tx = ArqTx::new(arq_config).unwrap();
         arq_tx
             .send(
                 b"expired segment".to_vec(),
@@ -9862,9 +9878,10 @@ mod tests {
         let mut config = DaemonConfig::default();
         config.engine.arq_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
-        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
-        event_loop.rate_loop =
-            RateLoop::new(event_loop.engine.available_speed_levels(), 5, 1).with_probing(1, 1);
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()).unwrap());
+        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 1)
+            .unwrap()
+            .with_probing(1, 1);
 
         let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
         event_loop.set_audio_out(producer);
@@ -9898,12 +9915,13 @@ mod tests {
         let mut config = DaemonConfig::default();
         config.engine.arq_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
-        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()).unwrap());
         // Level 4's budget is 178 bytes; level 5 (the probe target at offset 1)
         // is only 158 -- a real dip in `max_payload_for_level`. A payload in
         // between fits at the current level but not at the probe level.
-        event_loop.rate_loop =
-            RateLoop::new(event_loop.engine.available_speed_levels(), 5, 4).with_probing(1, 1);
+        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 4)
+            .unwrap()
+            .with_probing(1, 1);
 
         let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
         event_loop.set_audio_out(producer);
@@ -9923,8 +9941,9 @@ mod tests {
     async fn non_arq_send_is_never_a_probe_candidate() {
         let config = DaemonConfig::default(); // arq_enabled = false by default
         let mut event_loop = EventLoop::new(config).unwrap();
-        event_loop.rate_loop =
-            RateLoop::new(event_loop.engine.available_speed_levels(), 5, 1).with_probing(1, 1);
+        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 1)
+            .unwrap()
+            .with_probing(1, 1);
 
         let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
         event_loop.set_audio_out(producer);
@@ -11481,7 +11500,7 @@ mod tests {
         let mut event_loop = EventLoop::new(config).unwrap();
         mark_identified(&mut event_loop);
         event_loop.arq_rx = Some(ArqRx::new(8));
-        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()).unwrap());
 
         let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
         event_loop.set_audio_out(producer);
@@ -11557,9 +11576,10 @@ mod tests {
         config.engine.profile = "HF-STANDARD-TYPO".into();
         config.radio.frequency_hz = Some(14_074_000);
         let mut event_loop = EventLoop::new(config).unwrap();
-        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()).unwrap());
         event_loop.engine.set_speed_level(4).unwrap();
-        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 4);
+        event_loop.rate_loop =
+            RateLoop::new(event_loop.engine.available_speed_levels(), 5, 4).unwrap();
         for _ in 0..5 {
             let ack = TransportPdu::new_ack_with_rate(0, 0, 0, 9);
             event_loop
@@ -11584,7 +11604,7 @@ mod tests {
         let mut config = DaemonConfig::default();
         config.engine.arq_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
-        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()).unwrap());
 
         let before_level = event_loop.rate_loop.current_level();
 
@@ -11631,12 +11651,13 @@ mod tests {
         let mut config = DaemonConfig::default();
         config.engine.arq_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
-        let mut arq_tx = ArqTx::new(ArqConfig::default());
+        let mut arq_tx = ArqTx::new(ArqConfig::default()).unwrap();
         let seq = arq_tx
             .send(b"probed segment".to_vec(), Instant::now())
             .expect("a fresh ARQ window should have room");
         event_loop.arq_tx = Some(arq_tx);
-        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 1);
+        event_loop.rate_loop =
+            RateLoop::new(event_loop.engine.available_speed_levels(), 5, 1).unwrap();
         event_loop.probe_state = Some((seq, 6)); // pretend we probed up to level 6
 
         // One ACK event that BOTH cumulatively acks `seq` (resolving the probe)
@@ -11695,7 +11716,7 @@ mod tests {
         config.engine.arq_enabled = true;
         config.engine.cp_negotiation_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
-        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()));
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()).unwrap());
         event_loop.arq_rx = Some(ArqRx::new(8));
         event_loop.probe_state = Some((3, 6)); // pretend a probe is outstanding
 
@@ -11776,13 +11797,14 @@ mod tests {
         let mut config = DaemonConfig::default();
         config.engine.arq_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
-        let mut arq_tx = ArqTx::new(ArqConfig::default());
+        let mut arq_tx = ArqTx::new(ArqConfig::default()).unwrap();
         let seq = arq_tx
             .send(b"probed segment".to_vec(), Instant::now())
             .expect("a fresh ARQ window should have room");
         event_loop.arq_tx = Some(arq_tx);
         event_loop.arq_rx = Some(ArqRx::new(8));
-        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 1);
+        event_loop.rate_loop =
+            RateLoop::new(event_loop.engine.available_speed_levels(), 5, 1).unwrap();
         event_loop.probe_state = Some((seq, 6)); // pretend we probed up to level 6
 
         let (producer, _consumer) = coppa_audio::audio_ring(1_000_000);
@@ -11848,7 +11870,8 @@ mod tests {
         config.engine.arq_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
 
-        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 5);
+        event_loop.rate_loop =
+            RateLoop::new(event_loop.engine.available_speed_levels(), 5, 5).unwrap();
         assert_eq!(event_loop.rate_loop.current_level(), 5);
 
         // Two segments, both already past a short RTO by the time
@@ -11856,7 +11879,7 @@ mod tests {
         // sequence numbers from this single call.
         let arq_config = ArqConfig::new(8, 5, Duration::from_millis(20))
             .expect("window_size=8 is within 1..=MAX_WINDOW_SIZE");
-        let mut arq_tx = ArqTx::new(arq_config);
+        let mut arq_tx = ArqTx::new(arq_config).unwrap();
         let send_time = Instant::now() - Duration::from_millis(100);
         arq_tx
             .send(b"segment one".to_vec(), send_time)
@@ -11883,12 +11906,13 @@ mod tests {
         config.engine.arq_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
 
-        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 5);
+        event_loop.rate_loop =
+            RateLoop::new(event_loop.engine.available_speed_levels(), 5, 5).unwrap();
         assert_eq!(event_loop.rate_loop.current_level(), 5);
 
         let arq_config = ArqConfig::new(8, 5, Duration::from_millis(20))
             .expect("window_size=8 is within 1..=MAX_WINDOW_SIZE");
-        let mut arq_tx = ArqTx::new(arq_config);
+        let mut arq_tx = ArqTx::new(arq_config).unwrap();
         let send_time = Instant::now() - Duration::from_millis(100);
         let seq = arq_tx
             .send(b"probed segment".to_vec(), send_time)
@@ -11917,12 +11941,13 @@ mod tests {
         config.engine.arq_enabled = true;
         let mut event_loop = EventLoop::new(config).unwrap();
 
-        event_loop.rate_loop = RateLoop::new(event_loop.engine.available_speed_levels(), 5, 5);
+        event_loop.rate_loop =
+            RateLoop::new(event_loop.engine.available_speed_levels(), 5, 5).unwrap();
         assert_eq!(event_loop.rate_loop.current_level(), 5);
 
         let arq_config = ArqConfig::new(8, 5, Duration::from_millis(20))
             .expect("window_size=8 is within 1..=MAX_WINDOW_SIZE");
-        let mut arq_tx = ArqTx::new(arq_config);
+        let mut arq_tx = ArqTx::new(arq_config).unwrap();
         let send_time = Instant::now() - Duration::from_millis(100);
         let probe_seq = arq_tx
             .send(b"probed segment".to_vec(), send_time)
@@ -13437,7 +13462,7 @@ mod tests {
             // time instead of the crate default 5s RTO x 5 attempts.
             let arq_config = ArqConfig::new(8, 2, Duration::from_millis(20))
                 .expect("window_size=8 is within 1..=MAX_WINDOW_SIZE");
-            let mut arq_tx = ArqTx::new(arq_config);
+            let mut arq_tx = ArqTx::new(arq_config).unwrap();
             let send_time = Instant::now() - Duration::from_millis(100);
             arq_tx
                 .send(b"stuck segment".to_vec(), send_time)
@@ -14290,7 +14315,8 @@ mod tests {
                 ssid: 0,
                 tx: ArqTx::new(
                     ArqConfig::new(SESSION_ARQ_WINDOW, 5, Duration::from_secs(5)).unwrap(),
-                ),
+                )
+                .unwrap(),
                 rx: ArqRx::new(SESSION_ARQ_WINDOW),
                 backlog: VecDeque::new(),
                 fallback: None,
@@ -18032,10 +18058,13 @@ mod tests {
             mark_identified(&mut b);
             // ARQ timers run on real `std::time::Instant`s with a 5 s initial
             // RTO; a slow runner must not add a retransmit key-up mid-test.
-            a.arq_tx = Some(ArqTx::new(ArqConfig {
-                initial_rto: Duration::from_secs(60),
-                ..ArqConfig::default()
-            }));
+            a.arq_tx = Some(
+                ArqTx::new(ArqConfig {
+                    initial_rto: Duration::from_secs(60),
+                    ..ArqConfig::default()
+                })
+                .unwrap(),
+            );
             let a_ptt = install_ptt_log(&mut a);
             let b_ptt = install_ptt_log(&mut b);
             let (a_out_producer, mut a_out) = coppa_audio::audio_ring(1_000_000);

@@ -203,15 +203,21 @@ impl Default for ArqConfig {
     }
 }
 
+// Shared by both public construction paths, including public-field literals.
+fn validate_window(window_size: u8) -> Result<()> {
+    if window_size == 0 || window_size > MAX_WINDOW_SIZE {
+        return Err(anyhow!(
+            "Window size must be 1-{}, got {}",
+            MAX_WINDOW_SIZE,
+            window_size
+        ));
+    }
+    Ok(())
+}
+
 impl ArqConfig {
     pub fn new(window_size: u8, max_retransmit: u8, initial_rto: Duration) -> Result<Self> {
-        if window_size == 0 || window_size > MAX_WINDOW_SIZE {
-            return Err(anyhow!(
-                "Window size must be 1-{}, got {}",
-                MAX_WINDOW_SIZE,
-                window_size
-            ));
-        }
+        validate_window(window_size)?;
         Ok(Self {
             window_size,
             max_retransmit,
@@ -374,22 +380,18 @@ impl ArqTx {
     /// level(s)/turnaround/profile and uses it as the estimator's RTO floor --
     /// see [`RttEstimator::new_with_floor`].
     ///
-    /// # Panics
-    /// Panics if `window_size` is outside `1..=MAX_WINDOW_SIZE`. `ArqConfig::new`
-    /// already validates this, but `ArqConfig`'s fields are public, so a caller
-    /// could otherwise construct an out-of-range config directly (e.g. via
-    /// `ArqConfig { window_size: 40, ..ArqConfig::default() }`) and bypass that
-    /// check; this is a defensive re-check, not a duplicate of the old
-    /// `window_size + SACK_RANGE <= MAX_WINDOW_SIZE` assert (see [`SACK_RANGE`]'s
-    /// doc for why that assert no longer applies now that SACK covers a full
-    /// window).
-    pub fn new(config: ArqConfig) -> Self {
-        assert!(
-            config.window_size >= 1 && config.window_size <= MAX_WINDOW_SIZE,
-            "window_size ({}) must be within 1..={} (ARQ ring buffer size)",
-            config.window_size,
-            MAX_WINDOW_SIZE,
-        );
+    /// # Errors
+    /// Returns an error if `window_size` is outside `1..=MAX_WINDOW_SIZE`,
+    /// including configurations built with a struct literal.
+    ///
+    /// ```
+    /// use coppa_protocol::arq::{ArqConfig, ArqTx};
+    /// let mut tx = ArqTx::new(ArqConfig::default())?;
+    /// tx.send(vec![1, 2], std::time::Instant::now())?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn new(config: ArqConfig) -> Result<Self> {
+        validate_window(config.window_size)?;
         let floor = rto_floor(
             config.window_size,
             config.speed_level,
@@ -399,13 +401,13 @@ impl ArqTx {
         );
         let rtt = RttEstimator::new_with_floor(config.initial_rto, floor);
         let buf_size = MAX_WINDOW_SIZE as usize;
-        Self {
+        Ok(Self {
             config,
             rtt,
             next_seq: 0,
             send_base: 0,
             tx_buf: vec![None; buf_size],
-        }
+        })
     }
 
     /// Queue a segment for transmission. Returns the assigned sequence number,
@@ -809,12 +811,33 @@ impl ArqRx {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cop81_all_window_values_are_checked_at_both_boundaries() {
+        for window_size in u8::MIN..=u8::MAX {
+            let valid = (1..=MAX_WINDOW_SIZE).contains(&window_size);
+            let config = ArqConfig {
+                window_size,
+                ..ArqConfig::default()
+            };
+            assert_eq!(
+                ArqTx::new(config).is_ok(),
+                valid,
+                "literal window {window_size}"
+            );
+            assert_eq!(
+                ArqConfig::new(window_size, 5, Duration::from_secs(5)).is_ok(),
+                valid,
+                "config window {window_size}"
+            );
+        }
+    }
+
     /// COP-30: `unacked_bytes` sums the payload of every un-acked segment,
     /// and a byte leaves the sum the moment its segment is acked
     /// (cumulatively or selectively) or abandoned.
     #[test]
     fn unacked_bytes_tracks_cumulative_selective_ack_and_abandon() {
-        let mut tx = ArqTx::new(ArqConfig::default());
+        let mut tx = ArqTx::new(ArqConfig::default()).unwrap();
         let now = Instant::now();
         assert_eq!(tx.unacked_bytes(), 0);
         tx.send(vec![0; 3], now).unwrap();
@@ -862,7 +885,7 @@ mod tests {
     /// cycle (original send + 3 retransmits), not just the pure function.
     #[test]
     fn test_transmit_count_feeds_rv_for_attempt_across_full_cycle() {
-        let mut tx = ArqTx::new(ArqConfig::default());
+        let mut tx = ArqTx::new(ArqConfig::default()).unwrap();
         let now = Instant::now();
         let seq = tx.send(vec![0xAA], now).unwrap();
 
@@ -902,7 +925,7 @@ mod tests {
 
     #[test]
     fn test_transmit_count_none_for_unknown_seq() {
-        let tx = ArqTx::new(ArqConfig::default());
+        let tx = ArqTx::new(ArqConfig::default()).unwrap();
         assert_eq!(tx.transmit_count(0), None);
     }
 
@@ -987,7 +1010,7 @@ mod tests {
 
     #[test]
     fn test_tx_send_basic() {
-        let mut tx = ArqTx::new(ArqConfig::default());
+        let mut tx = ArqTx::new(ArqConfig::default()).unwrap();
         let now = Instant::now();
 
         let seq = tx.send(vec![0x01], now).unwrap();
@@ -1002,7 +1025,7 @@ mod tests {
     #[test]
     fn test_tx_window_full() {
         let config = ArqConfig::new(2, 5, Duration::from_secs(5)).unwrap();
-        let mut tx = ArqTx::new(config);
+        let mut tx = ArqTx::new(config).unwrap();
         let now = Instant::now();
 
         tx.send(vec![0x01], now).unwrap();
@@ -1013,7 +1036,7 @@ mod tests {
     #[test]
     fn test_tx_ack_advances_window() {
         let config = ArqConfig::new(2, 5, Duration::from_secs(5)).unwrap();
-        let mut tx = ArqTx::new(config);
+        let mut tx = ArqTx::new(config).unwrap();
         let now = Instant::now();
 
         tx.send(vec![0x01], now).unwrap();
@@ -1029,7 +1052,7 @@ mod tests {
 
     #[test]
     fn test_tx_selective_ack() {
-        let mut tx = ArqTx::new(ArqConfig::default());
+        let mut tx = ArqTx::new(ArqConfig::default()).unwrap();
         let now = Instant::now();
 
         // Send 4 segments
@@ -1059,7 +1082,7 @@ mod tests {
     #[test]
     fn test_tx_retransmit_detection() {
         let config = ArqConfig::new(8, 5, Duration::from_millis(100)).unwrap();
-        let mut tx = ArqTx::new(config);
+        let mut tx = ArqTx::new(config).unwrap();
         let start = Instant::now();
 
         tx.send(vec![0x01], start).unwrap();
@@ -1077,7 +1100,7 @@ mod tests {
     #[test]
     fn test_tx_retransmit_count() {
         let config = ArqConfig::new(8, 2, Duration::from_millis(50)).unwrap();
-        let mut tx = ArqTx::new(config);
+        let mut tx = ArqTx::new(config).unwrap();
         let start = Instant::now();
 
         tx.send(vec![0x01], start).unwrap();
@@ -1096,7 +1119,7 @@ mod tests {
 
     #[test]
     fn test_tx_get_segment_data() {
-        let mut tx = ArqTx::new(ArqConfig::default());
+        let mut tx = ArqTx::new(ArqConfig::default()).unwrap();
         let now = Instant::now();
 
         tx.send(vec![0xAA, 0xBB], now).unwrap();
@@ -1107,7 +1130,7 @@ mod tests {
     #[test]
     fn test_tx_karn_algorithm() {
         let config = ArqConfig::new(8, 5, Duration::from_secs(5)).unwrap();
-        let mut tx = ArqTx::new(config);
+        let mut tx = ArqTx::new(config).unwrap();
         let start = Instant::now();
 
         // Send two segments
@@ -1236,7 +1259,7 @@ mod tests {
 
     #[test]
     fn test_tx_rx_perfect_channel() {
-        let mut tx = ArqTx::new(ArqConfig::default());
+        let mut tx = ArqTx::new(ArqConfig::default()).unwrap();
         let mut rx = ArqRx::new(DEFAULT_WINDOW_SIZE);
         let now = Instant::now();
 
@@ -1265,7 +1288,7 @@ mod tests {
 
     #[test]
     fn test_tx_rx_with_loss() {
-        let mut tx = ArqTx::new(ArqConfig::default());
+        let mut tx = ArqTx::new(ArqConfig::default()).unwrap();
         let mut rx = ArqRx::new(DEFAULT_WINDOW_SIZE);
         let now = Instant::now();
 
@@ -1297,7 +1320,7 @@ mod tests {
     #[test]
     fn test_wrapping_sequence_numbers() {
         let config = ArqConfig::new(8, 5, Duration::from_secs(5)).unwrap();
-        let mut tx = ArqTx::new(config);
+        let mut tx = ArqTx::new(config).unwrap();
         let mut rx = ArqRx::new(8);
         let now = Instant::now();
 
@@ -1370,7 +1393,7 @@ mod tests {
         let config = ArqConfig::new(8, 5, Duration::from_secs(5))
             .unwrap()
             .with_airtime_params(2, turnaround, profile);
-        let mut tx = ArqTx::new(config);
+        let mut tx = ArqTx::new(config).unwrap();
         let start = Instant::now();
 
         for i in 0..50u8 {
@@ -1394,7 +1417,7 @@ mod tests {
         // exactly once: this must double the RTO ONCE (x2), not once per expired
         // segment (which would over-back-off to x2^8 = x256).
         let config = ArqConfig::new(8, 5, Duration::from_millis(100)).unwrap();
-        let mut tx = ArqTx::new(config);
+        let mut tx = ArqTx::new(config).unwrap();
         let start = Instant::now();
 
         for i in 0..8u8 {
@@ -1452,7 +1475,7 @@ mod tests {
         let config = ArqConfig::new(window, 5, Duration::from_secs(5))
             .unwrap()
             .with_airtime_params(level, turnaround, profile.clone());
-        let mut tx = ArqTx::new(config);
+        let mut tx = ArqTx::new(config).unwrap();
         let mut rx = ArqRx::new(window);
 
         let start = Instant::now();
@@ -1532,7 +1555,8 @@ mod tests {
         let mut tx = ArqTx::new(ArqConfig {
             window_size: 2,
             ..ArqConfig::default()
-        });
+        })
+        .unwrap();
         let now = Instant::now();
         let s0 = tx.send(vec![1, 2], now).unwrap();
         let _s1 = tx.send(vec![3, 4], now).unwrap();
@@ -1549,7 +1573,8 @@ mod tests {
         let mut tx = ArqTx::new(ArqConfig {
             window_size: 2,
             ..ArqConfig::default()
-        });
+        })
+        .unwrap();
         let now = Instant::now();
         let s0 = tx.send(vec![1], now).unwrap();
         let next_before = tx.next_seq();
@@ -1567,7 +1592,8 @@ mod tests {
         let mut tx = ArqTx::new(ArqConfig {
             window_size: 2,
             ..ArqConfig::default()
-        });
+        })
+        .unwrap();
         let now = Instant::now();
         let s0 = tx.send(vec![1], now).unwrap();
         let s1 = tx.send(vec![2], now).unwrap();
@@ -1588,7 +1614,8 @@ mod tests {
         let mut tx = ArqTx::new(ArqConfig {
             window_size: 2,
             ..ArqConfig::default()
-        });
+        })
+        .unwrap();
         tx.abandon(200); // never sent
         let s0 = tx.send(vec![1], Instant::now()).unwrap();
         tx.abandon(s0);
@@ -1606,7 +1633,8 @@ mod tests {
         let mut tx = ArqTx::new(ArqConfig {
             window_size: 2,
             ..ArqConfig::default()
-        });
+        })
+        .unwrap();
         let now = Instant::now();
         let s0 = tx.send(vec![1], now).unwrap();
         let s1 = tx.send(vec![2], now).unwrap();
@@ -1635,7 +1663,8 @@ mod tests {
         let mut tx = ArqTx::new(ArqConfig {
             window_size: 2,
             ..ArqConfig::default()
-        });
+        })
+        .unwrap();
         let mut now = Instant::now();
         let s0 = tx.send(vec![1], now).unwrap();
         for _ in 0..=DEFAULT_MAX_RETRANSMIT {
@@ -1657,7 +1686,7 @@ mod tests {
     /// no sleeping).
     #[test]
     fn set_max_retransmit_re_enables_retries_on_a_failed_segment() {
-        let mut tx = ArqTx::new(ArqConfig::new(1, 2, Duration::from_millis(50)).unwrap());
+        let mut tx = ArqTx::new(ArqConfig::new(1, 2, Duration::from_millis(50)).unwrap()).unwrap();
         let mut now = Instant::now();
         let seq = tx.send(vec![0xA5], now).unwrap();
 
@@ -1707,7 +1736,7 @@ mod tests {
     /// `attempt` arithmetic the hold rests on.
     #[test]
     fn transmit_count_saturates_past_u8_max_on_a_long_hold() {
-        let mut tx = ArqTx::new(ArqConfig::new(1, 2, Duration::from_millis(50)).unwrap());
+        let mut tx = ArqTx::new(ArqConfig::new(1, 2, Duration::from_millis(50)).unwrap()).unwrap();
         let mut now = Instant::now();
         let seq = tx.send(vec![0xA5], now).unwrap();
 
