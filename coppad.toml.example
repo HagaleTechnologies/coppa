@@ -161,17 +161,24 @@ id_interval_secs = 540
 beacon_interval_secs = 0
 
 # --- Session Configuration (for connected mode) ---
-# These are operational defaults; session parameters are
-# negotiated with the peer during connection setup.
+# Operational knobs for connected sessions; protocol parameters beyond
+# these are negotiated with the peer during connection setup.
 
-# [session]
-# ARQ window size (1-32, default 8)
+[session]
+# Cap on LDPC codewords per session data frame (1-8, default 8).
+# 8 makes an 8x larger frame: at the daemon-default level 2 that is
+# ~9.5 s of continuous keyed airtime per frame; operators on shared
+# channels can bound it. Only used with peers that also support it
+# (negotiated at connect); any other peer runs 1-codeword frames as
+# before, whatever this is set to.
+max_codewords_per_frame = 8
+# ARQ window size (1-32, default 8) -- not yet a real key
 # arq_window = 8
-# Max retransmit attempts per frame (default 5)
+# Max retransmit attempts per frame (default 5) -- not yet a real key
 # max_retries = 5
-# Connection timeout in seconds (default 30)
+# Connection timeout in seconds (default 30) -- not yet a real key
 # connect_timeout_s = 30
-# Idle timeout in seconds before session drops (default 120)
+# Idle timeout in seconds before session drops (default 120) -- not yet a real key
 # idle_timeout_s = 120
-# Max frames per TX turn before yielding (default 4)
+# Max frames per TX turn before yielding (default 4) -- not yet a real key
 # max_frames_per_turn = 4
