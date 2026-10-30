@@ -16,6 +16,8 @@ use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx, DEFAULT_MAX_RETRANSMIT};
 use coppa_protocol::cp_negotiator::{ContentAction, CpMode, CpNegotiator};
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu, StationIdPayload};
 use coppa_protocol::modem::max_payload_for_level;
+use coppa_protocol::modem::speed_levels::max_multi_payload_for_level;
+use coppa_protocol::modem::transceiver::MAX_CODEWORDS;
 use coppa_protocol::session::{LinkCapabilities, SessionManager, SessionState};
 use coppa_protocol::transport::{TransportPdu, TransportType, TRANSPORT_HEADER_SIZE};
 use coppa_radio::band::{self, FrequencyConfig, FrequencyEvidence, GateRefusal};
@@ -164,17 +166,36 @@ struct SessionFallback {
 }
 
 /// COP-68: the most robust level (lowest number) at or below `current`
-/// whose one-codeword payload budget fits `encoded_len` bytes -- the same
+/// whose payload budget fits `encoded_len` bytes -- the same
 /// `encoded_payload_len` measure session chunking sizes against, so a
 /// chunk that fit its original level by construction fits the answer here
 /// whenever any lower level's budget also holds it. Falls back to
 /// `current` when nothing lower fits (a segment of 118-178 encoded bytes
 /// has no lower level on today's ladder): the hold still holds, it just
-/// retransmits at the level it already had.
-fn fittest_level(encoded_len: usize, current: u8) -> u8 {
+/// retransmits at the level it already had. COP-69: the budget is judged
+/// at the segment's codeword count (`max_multi_payload_for_level(l,
+/// codewords)`), so a multi-codeword segment is never held to a
+/// 1-codeword budget that no level can fit -- the fallback re-encode
+/// would fail for budget reasons at the very level chosen for it.
+fn fittest_level_with_codewords(encoded_len: usize, current: u8, codewords: u8) -> u8 {
     (1..=current)
-        .find(|&l| max_payload_for_level(l).is_some_and(|budget| budget >= encoded_len))
+        .find(|&l| {
+            max_multi_payload_for_level(l, codewords).is_some_and(|budget| budget >= encoded_len)
+        })
         .unwrap_or(current)
+}
+
+/// COP-69: the capabilities this coppad advertises in CONNECT_REQ/ACK.
+/// `multi_frame_ack` is on: this version's session link sends
+/// multi-codeword frames, and the flag is negotiated as an AND exactly like
+/// `compression`, so a peer that does not advertise it keeps today's exact
+/// 1-codeword wire behavior (the fallback is total, asserted on encoded
+/// samples).
+fn local_link_caps() -> LinkCapabilities {
+    LinkCapabilities {
+        multi_frame_ack: true,
+        ..LinkCapabilities::default()
+    }
 }
 
 /// COP-38 (D2): the established session's reliable-delivery state. One per
@@ -204,6 +225,12 @@ struct SessionLink {
     /// One warning per link for a payload that is not a reliable
     /// `TransportPdu`, i.e. a pre-0.3.0 peer (D3).
     warned_legacy_payload: bool,
+    /// COP-69: the codeword count of the in-flight segment. Stop-and-wait
+    /// (`SESSION_ARQ_WINDOW = 1`) guarantees at most one segment is in
+    /// flight, so one field suffices; every send overwrites it and a
+    /// retransmission re-encodes at this count, keeping the rebuilt frame
+    /// byte-identical to the original transmission.
+    tx_codewords: u8,
 }
 
 /// COP-38 (D3): one session data frame. The ACK fields stay zero so a
@@ -1907,7 +1934,36 @@ impl EventLoop {
         if !ready || self.session_tx_held_by_frequency_gate {
             return;
         }
-        let budget = max_payload_for_level(self.engine.speed_level())
+        // COP-69: the per-frame codeword count. Gated by the negotiated
+        // `multi_frame_ack` capability (a peer that did not advertise it
+        // gets today's exact 1-codeword frames) and capped by `[session]
+        // max_codewords_per_frame`; the count itself is ceil(needed /
+        // per-codeword budget), `needed` being the backlog plus the 21 B
+        // MAC + transport headers -- an upper bound, since compression only
+        // shrinks the framed chunk, so the frame always fits the count's
+        // budget while a full backlog reaches the cap.
+        let level = self.engine.speed_level();
+        let backlog_len = self.session_link.as_ref().map_or(0, |l| l.backlog.len());
+        let negotiated_multi = self
+            .session_link
+            .as_ref()
+            .map(|l| l.session_id)
+            .and_then(|id| self.session_mgr.get(id))
+            .and_then(|s| s.negotiated.as_ref())
+            .is_some_and(|c| c.multi_frame_ack);
+        let cap = if negotiated_multi {
+            self.config
+                .session
+                .max_codewords_per_frame
+                .min(MAX_CODEWORDS)
+        } else {
+            1
+        };
+        let per_cw = max_payload_for_level(level)
+            .expect("the engine's speed level is always a valid wire level");
+        let needed = backlog_len + MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE;
+        let codewords = needed.div_ceil(per_cw).clamp(1, cap as usize) as u8;
+        let budget = max_multi_payload_for_level(level, codewords)
             .expect("the engine's speed level is always a valid wire level");
         let (seq, take, frame) = {
             let Some(link) = self.session_link.as_mut() else {
@@ -1921,12 +1977,17 @@ impl EventLoop {
                 link.backlog.as_slices().0,
                 MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE,
                 budget,
-                |c| engine.encoded_payload_len(&session_data_frame(link, seq, c)) <= budget,
+                |c| {
+                    engine.encoded_payload_len_with_codewords(
+                        &session_data_frame(link, seq, c),
+                        codewords,
+                    ) <= budget
+                },
             );
             let chunk: Vec<u8> = link.backlog.iter().take(take).copied().collect();
             (seq, take, session_data_frame(link, seq, &chunk))
         };
-        let samples = match self.engine.encode_bytes(&frame) {
+        let samples = match self.engine.encode_bytes_with_codewords(&frame, codewords) {
             Ok(samples) => samples,
             Err(e) => {
                 // Unreachable for a chunk `next_chunk_len` sized; the bytes
@@ -1935,6 +1996,7 @@ impl EventLoop {
                 return;
             }
         };
+        self.raise_session_multi_rto(&samples, codewords);
         // Boxed: `transmit_samples` -> `handle_ptt_change` -> (on PTT
         // release) `drain_session_link` forms the same 3-way async call
         // cycle `try_drain_tx_queue` documents; one edge needs indirection
@@ -1951,6 +2013,9 @@ impl EventLoop {
         }
         if let Some(link) = self.session_link.as_mut() {
             let chunk: Vec<u8> = link.backlog.drain(..take).collect();
+            // COP-69: remember the count the segment went out with, so a
+            // retransmission re-encodes byte-identically at the same count.
+            link.tx_codewords = codewords;
             match link.tx.send(chunk, Instant::now()) {
                 Ok(sent) => debug_assert_eq!(sent, seq),
                 // Unreachable: `can_send` was checked before transmitting.
@@ -1979,6 +2044,32 @@ impl EventLoop {
             max = self.max_frames_per_turn,
             "Session data frame transmitted"
         );
+    }
+
+    /// COP-69: a multi-codeword frame can outlast the initial five-second
+    /// RTO. Raise both the active timeout and its estimator floor before
+    /// submission, including on a slower fallback retransmission. Single-
+    /// codeword sessions retain their existing timing. The full HF long-CP
+    /// ACK is a conservative upper bound for the supported HF short-CP and
+    /// VHF profiles too; this branch still sends full-frame ACKs.
+    fn raise_session_multi_rto(&mut self, samples: &[f32], codewords: u8) {
+        if codewords <= 1 {
+            return;
+        }
+        let data_s = samples.len() as f64 / self.engine.config().sample_rate as f64;
+        let ack_s = coppa_protocol::modem::frame_airtime_s(
+            self.engine.speed_level(),
+            &coppa_codec::ofdm::CoppaProfile::hf_standard(),
+        )
+        .expect("the engine's speed level is always a valid wire level");
+        let radio = &self.config.radio;
+        let turnaround_s = (radio.turnaround_ms + radio.ptt_pre_delay_ms + radio.ptt_tail_delay_ms)
+            as f64
+            / 1000.0;
+        if let Some(link) = self.session_link.as_mut() {
+            link.tx
+                .raise_rto_floor(Duration::from_secs_f64(data_s + 2.0 * turnaround_s + ack_s));
+        }
     }
 
     /// Drop the link of a session that has ended (local or remote
@@ -2040,6 +2131,7 @@ impl EventLoop {
             fallback: None,
             last_peer_evidence: Instant::now(),
             warned_legacy_payload: false,
+            tx_codewords: 1,
         });
     }
 
@@ -2161,12 +2253,25 @@ impl EventLoop {
             // most robust level whose payload budget fits it. The normal
             // regime's `encode_bytes` (the engine's current level) is
             // byte-for-byte unchanged.
+            // COP-69: a retransmission re-encodes at the codeword count the
+            // segment was sent with, so the rebuilt frame stays
+            // byte-identical to the original (and, in the fade hold, at the
+            // codeword-aware fallback level).
+            let codewords = self
+                .session_link
+                .as_ref()
+                .map_or(1, |l| l.tx_codewords.max(1));
             let encoded = match self.session_link.as_ref().and_then(|l| l.fallback.as_ref()) {
-                Some(fallback) => self.engine.encode_bytes_with_level(&frame, fallback.level),
-                None => self.engine.encode_bytes(&frame),
+                Some(fallback) => self.engine.encode_bytes_with_level_and_codewords(
+                    &frame,
+                    fallback.level,
+                    codewords,
+                ),
+                None => self.engine.encode_bytes_with_codewords(&frame, codewords),
             };
             match encoded {
                 Ok(samples) => {
+                    self.raise_session_multi_rto(&samples, codewords);
                     tracing::debug!(seq, attempt, "Retransmitting session frame");
                     Box::pin(self.transmit_samples(&samples)).await;
                 }
@@ -2184,14 +2289,18 @@ impl EventLoop {
                 if link.tx.is_failed(seq) && link.fallback.is_none() {
                     // COP-68: first exhaustion enters the fade hold. The
                     // fittest level is computed over the segment's rebuilt
-                    // frame with the same `encoded_payload_len` measure the
-                    // chunker used, so the encode above cannot fail for
-                    // budget reasons at the fallback level unless nothing
-                    // lower fits (then `fittest_level` returned the current
-                    // level, logged here rather than silently).
-                    let level = fittest_level(
+                    // frame with the same encoded-length measure the chunker
+                    // used, judged against the segment's codeword count
+                    // (COP-69) so an 8-codeword frame is never held to a
+                    // 1-codeword budget that no level can fit, so the
+                    // encode above cannot fail for budget reasons at the
+                    // fallback level unless nothing lower fits (then the
+                    // twin returned the current level, logged here rather
+                    // than silently).
+                    let level = fittest_level_with_codewords(
                         self.engine.encoded_payload_len(&frame),
                         self.engine.speed_level(),
+                        codewords,
                     );
                     let grant = link
                         .tx
@@ -2955,7 +3064,7 @@ impl EventLoop {
                 if ardop_dial {
                     self.ardop_clients.entry(client_id).or_default().refused = false;
                 }
-                let caps = LinkCapabilities::default();
+                let caps = local_link_caps();
                 match self.session_mgr.create(local, remote.clone(), 0, caps) {
                     Ok(id) => {
                         if let Some(session) = self.session_mgr.get_mut(id) {
@@ -5487,7 +5596,7 @@ impl EventLoop {
         }
 
         let remote = pdu.src.clone();
-        let caps = LinkCapabilities::default();
+        let caps = local_link_caps();
         match self
             .session_mgr
             .create(local, remote.clone(), pdu.ssid, caps)
@@ -8628,9 +8737,14 @@ mod tests {
         );
         let link = a.session_link.as_ref().unwrap();
         assert!(link.backlog.is_empty() && link.tx.in_flight() == 0);
-        // At most 95 host bytes fit a level-2 frame (budget 117 minus the
-        // 14-byte MAC and 7-byte transport headers minus one).
-        let min_frames = payload.len().div_ceil(95);
+        // A frame's host-byte capacity is the session link's codeword budget
+        // (per-codeword budget x the negotiated/capped codeword count) minus
+        // the 14-byte MAC and 7-byte transport headers minus one. Before
+        // COP-69 this was 95 (level 2, one codeword); this pair now
+        // negotiates 8-codeword frames at the engine's current level.
+        let per_cw = max_payload_for_level(a.engine.speed_level()).unwrap();
+        let capacity = per_cw * 8 - MacPdu::HEADER_SIZE - TRANSPORT_HEADER_SIZE - 1;
+        let min_frames = payload.len().div_ceil(capacity);
         let frames = a.tx_frame_count - frames_before;
         assert!(
             frames >= min_frames,
@@ -14296,6 +14410,7 @@ mod tests {
                 fallback: None,
                 last_peer_evidence: Instant::now(),
                 warned_legacy_payload: false,
+                tx_codewords: 1,
             }
         }
 
@@ -14449,6 +14564,340 @@ mod tests {
                 "segment payloads must reassemble the input in order"
             );
             assert_eq!(event_loop.buffered_tx_bytes(), 0);
+        }
+
+        /// COP-69 test rig: 2000 incompressible bytes (the
+        /// `session_chunks_respect_the_encoded_budget` LCG), the shape a
+        /// full multi-codeword frame is cut from.
+        fn cop69_incompressible(len: usize) -> Vec<u8> {
+            let mut seed: u32 = 0xC0_69_C0_69;
+            (0..len)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    (seed >> 16) as u8
+                })
+                .collect()
+        }
+
+        /// COP-69 test rig: a station pinned to level 8 on `HF_STANDARD`
+        /// (level-derived engines resolve 8 to VHF, which would change the
+        /// waveform under test), with a large audio ring so one test can
+        /// read whole 8-codeword frames back.
+        fn cop69_station_config() -> DaemonConfig {
+            let mut config = session_config();
+            config.engine.profile = "HF_STANDARD".into();
+            config
+        }
+
+        /// COP-69 test rig: a wired station (audio ring attached) with an
+        /// established multi-codeword-capable session at level 8, station-ID
+        /// frame suppressed. Returns the consumer the frames arrive on.
+        fn cop69_station_with(config: DaemonConfig) -> (EventLoop, coppa_audio::AudioRingConsumer) {
+            let mut event_loop = EventLoop::new(config).unwrap();
+            event_loop.engine.set_speed_level(8).unwrap();
+            let (producer, consumer) = coppa_audio::audio_ring(8_000_000);
+            event_loop.set_audio_out(producer);
+            mark_identified(&mut event_loop);
+            let session_id = seed_established_multi_frame_ack(&mut event_loop);
+            event_loop.ensure_session_link(session_id);
+            (event_loop, consumer)
+        }
+
+        /// COP-69 test rig: the default level-8 `HF_STANDARD` station.
+        fn cop69_station() -> (EventLoop, coppa_audio::AudioRingConsumer) {
+            cop69_station_with(cop69_station_config())
+        }
+
+        /// COP-69 test rig: `seed_established` with both ends advertising
+        /// `multi_frame_ack`, so the negotiated caps allow multi-codeword
+        /// session frames.
+        fn seed_established_multi_frame_ack(event_loop: &mut EventLoop) -> u8 {
+            let local = LinkCapabilities {
+                multi_frame_ack: true,
+                ..LinkCapabilities::default()
+            };
+            let peer = LinkCapabilities {
+                multi_frame_ack: true,
+                ..LinkCapabilities::default()
+            };
+            let id = event_loop
+                .session_mgr
+                .create(
+                    Callsign::new("VK3ABC").unwrap(),
+                    Callsign::new("W1AW").unwrap(),
+                    0,
+                    local,
+                )
+                .unwrap();
+            let req = event_loop
+                .session_mgr
+                .get_mut(id)
+                .unwrap()
+                .initiate()
+                .unwrap();
+            let mut peer_session = coppa_protocol::session::Session::new(
+                0,
+                Callsign::new("W1AW").unwrap(),
+                Callsign::new("VK3ABC").unwrap(),
+                0,
+                peer,
+            );
+            let ack = peer_session.handle_connect_req(&req.payload).unwrap();
+            let session = event_loop.session_mgr.get_mut(id).unwrap();
+            session.handle_connect_ack(&ack.payload).unwrap();
+            assert!(session
+                .negotiated
+                .as_ref()
+                .is_some_and(|c| c.multi_frame_ack));
+            id
+        }
+
+        /// COP-69 test rig: batch-decode the first frame in `samples` on a
+        /// clean loopback and return its header plus payload, so tests
+        /// assert the codeword count on the encoded wire, not by reading
+        /// code.
+        fn cop69_decode(samples: &[f32]) -> (coppa_codec::ofdm::frame::CoppaHeader, Vec<u8>) {
+            let rx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(
+                coppa_codec::ofdm::CoppaProfile::hf_standard(),
+                1,
+            );
+            let (header, payload, _) = rx
+                .receive(samples)
+                .expect("a clean loopback frame must decode");
+            (header, payload)
+        }
+
+        #[tokio::test]
+        async fn multi_codeword_session_rto_covers_airtime_and_ack_after_rtt_sample() {
+            let mut config = cop69_station_config();
+            config.radio.turnaround_ms = 500;
+            let (mut event_loop, mut consumer) = cop69_station_with(config);
+            event_loop.engine.set_speed_level(2).unwrap();
+            for _ in 0..2 {
+                event_loop
+                    .handle_host_event(HostEvent::DataReceived {
+                        client_id: 1,
+                        data: cop69_incompressible(2000),
+                    })
+                    .await;
+                let audio = read_all(&mut consumer);
+                let airtime = Duration::from_secs_f64(audio.len() as f64 / 48_000.0);
+                assert!(airtime > Duration::from_secs(9));
+                let link = event_loop.session_link.as_mut().unwrap();
+                assert_eq!(link.tx_codewords, 8);
+                let floor = airtime + Duration::from_millis(1000 + 1365);
+                assert!(
+                    link.tx.rto() >= floor,
+                    "RTO {:?} < floor {floor:?}",
+                    link.tx.rto()
+                );
+                let now = Instant::now();
+                assert!(link
+                    .tx
+                    .get_retransmits(now + Duration::from_secs(5))
+                    .is_empty());
+                // A tiny synthetic RTT must not discard the multi-codeword floor.
+                let ack = link.tx.next_seq();
+                link.tx.process_ack(ack, 0, now);
+                assert!(link.tx.rto() >= floor);
+                link.backlog.clear();
+                event_loop.handle_ptt_change(false).await;
+            }
+        }
+
+        /// COP-69: a backlog beyond one codeword's budget, with the
+        /// capability negotiated, is cut as ONE multi-codeword frame -- the
+        /// header on the wire says `codewords = 8`, the whole 8-codeword
+        /// budget is spent, and only the remainder stays backlogged.
+        #[tokio::test]
+        async fn drain_session_link_cuts_full_multi_codeword_frame() {
+            let (mut event_loop, mut consumer) = cop69_station();
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: cop69_incompressible(2000),
+                })
+                .await;
+            let audio = read_all(&mut consumer);
+            let (header, _) = cop69_decode(&audio);
+            assert_eq!(header.codewords, 8, "the frame must carry 8 codewords");
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx.in_flight(), 1);
+            assert_eq!(link.tx_codewords, 8);
+            let budget = max_multi_payload_for_level(8, 8).unwrap();
+            let seq = link.tx.send_base();
+            let segment = link.tx.get_segment_data(seq).unwrap();
+            assert!(
+                event_loop
+                    .engine
+                    .encoded_payload_len_with_codewords(&session_data_frame(link, seq, segment), 8)
+                    <= budget,
+                "the segment must fill (not exceed) the 8-codeword budget"
+            );
+            assert!(
+                !link.backlog.is_empty(),
+                "2000 B cannot fit one frame; the remainder must stay backlogged"
+            );
+        }
+
+        /// COP-69: `[session] max_codewords_per_frame` bounds the count a
+        /// frame is cut at, whatever the backlog asks for.
+        #[tokio::test]
+        async fn drain_session_link_respects_config_cap() {
+            let mut config = cop69_station_config();
+            config.session.max_codewords_per_frame = 3;
+            let (mut event_loop, mut consumer) = cop69_station_with(config);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: cop69_incompressible(2000),
+                })
+                .await;
+            let audio = read_all(&mut consumer);
+            let (header, _) = cop69_decode(&audio);
+            assert_eq!(header.codewords, 3, "the operator cap must bind");
+        }
+
+        /// COP-69: a backlog that fits one codeword's budget is sent as a
+        /// single-codeword frame -- bigger frames are chosen by need, not
+        /// by default.
+        #[tokio::test]
+        async fn drain_session_link_small_backlog_stays_single() {
+            let (mut event_loop, mut consumer) = cop69_station();
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: cop69_incompressible(100),
+                })
+                .await;
+            let audio = read_all(&mut consumer);
+            let (header, _) = cop69_decode(&audio);
+            assert_eq!(header.codewords, 1, "a small backlog must stay 1-codeword");
+        }
+
+        /// COP-69: without the negotiated capability the session link keeps
+        /// today's exact wire behavior -- 1-codeword frames however large
+        /// the backlog is (the interop fallback, asserted on the wire).
+        #[tokio::test]
+        async fn drain_session_link_without_capability_stays_single() {
+            let mut event_loop = EventLoop::new(cop69_station_config()).unwrap();
+            event_loop.engine.set_speed_level(8).unwrap();
+            let (producer, mut consumer) = coppa_audio::audio_ring(8_000_000);
+            event_loop.set_audio_out(producer);
+            mark_identified(&mut event_loop);
+            seed_established(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: cop69_incompressible(2000),
+                })
+                .await;
+            let audio = read_all(&mut consumer);
+            let (header, _) = cop69_decode(&audio);
+            assert_eq!(
+                header.codewords, 1,
+                "no capability, no multi-codeword frames"
+            );
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx_codewords, 1);
+        }
+
+        /// COP-69: a lost 8-codeword frame retransmits as an 8-codeword
+        /// frame -- same seq, byte-identical chunk and payload -- so ARQ
+        /// semantics survive the multi-codeword extension.
+        #[tokio::test]
+        async fn session_retransmit_reencodes_same_codeword_count() {
+            let (mut event_loop, mut consumer) = cop69_station();
+            fast_session_rto(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: cop69_incompressible(2000),
+                })
+                .await;
+            let first = read_all(&mut consumer);
+            let (first_header, first_payload) = cop69_decode(&first);
+            assert_eq!(first_header.codewords, 8);
+
+            event_loop.handle_ptt_change(false).await;
+            sleep_past_session_rto(&event_loop);
+            event_loop.check_session_retransmits().await;
+            let again = read_all(&mut consumer);
+            assert!(!again.is_empty(), "the lost frame must be retransmitted");
+            let (header, payload) = cop69_decode(&again);
+            assert_eq!(
+                header.codewords, 8,
+                "the retransmission must stay 8-codeword"
+            );
+            assert_eq!(header.speed_level, first_header.speed_level);
+            assert_eq!(payload, first_payload, "the frame must be byte-identical");
+        }
+
+        /// COP-69: the fade hold's fallback level is judged against the
+        /// segment's codeword budget. An 8-codeword segment whose encoded
+        /// length no 1-codeword budget can hold still finds a fallback
+        /// level (the twin admits it), the retransmission there encodes
+        /// successfully at the same codeword count, and the 1-codeword
+        /// `fittest_level` would have had no level to offer.
+        #[tokio::test]
+        async fn fade_hold_fallback_accepts_multi_codeword_segment() {
+            let (mut event_loop, mut consumer) = cop69_station();
+            fast_session_rto(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: cop69_incompressible(2000),
+                })
+                .await;
+            read_all(&mut consumer);
+            // Exhaust the retry budget with every leg lost, then confirm
+            // one in-hold retransmission really encodes at the fallback
+            // level with the same codeword count.
+            let mut fallback_level = None;
+            for _ in 0..16 {
+                event_loop.handle_ptt_change(false).await;
+                sleep_past_session_rto(&event_loop);
+                event_loop.check_session_retransmits().await;
+                read_all(&mut consumer);
+                if let Some(level) = event_loop
+                    .session_link
+                    .as_ref()
+                    .and_then(|l| l.fallback.as_ref())
+                    .map(|f| f.level)
+                {
+                    fallback_level = Some(level);
+                    break;
+                }
+            }
+            let fallback_level =
+                fallback_level.expect("the fade hold must be entered within 16 passes");
+            event_loop.handle_ptt_change(false).await;
+            sleep_past_session_rto(&event_loop);
+            event_loop.check_session_retransmits().await;
+            let held = read_all(&mut consumer);
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx_codewords, 8);
+            let seq = link.tx.send_base();
+            let segment = link.tx.get_segment_data(seq).unwrap();
+            let encoded_len = event_loop
+                .engine
+                .encoded_payload_len_with_codewords(&session_data_frame(link, seq, segment), 8);
+            assert!(
+                max_multi_payload_for_level(fallback_level, 8).unwrap() >= encoded_len,
+                "the fallback level's 8-codeword budget must fit the segment \
+                 (level {fallback_level}, encoded {encoded_len})"
+            );
+            assert!(
+                (1..=8).all(|l| max_payload_for_level(l).is_some_and(|b| b < encoded_len)),
+                "no level's 1-codeword budget can hold a full 8-codeword segment \
+                 (the pre-COP-69 rule had no fallback level to offer)"
+            );
+            let (header, _) = cop69_decode(&held);
+            assert_eq!(
+                header.codewords, 8,
+                "the held retransmission stays 8-codeword"
+            );
+            assert_eq!(header.speed_level, fallback_level);
         }
 
         /// COP-41: no pacing regression for the common case -- a small
@@ -18441,10 +18890,16 @@ mod tests {
                 "status: {:?}",
                 run.a_status
             );
-            // At most 95 host bytes fit a level-2 frame (budget 117 minus the
-            // 14-byte MAC and 7-byte transport headers minus one).
+            // A frame's host-byte capacity is the session link's codeword
+            // budget (per-codeword budget x the negotiated/capped codeword
+            // count) minus the 14-byte MAC and 7-byte transport headers
+            // minus one. Before COP-69 this was 95 (level 2, one codeword);
+            // this rig's default engine is level 1 (56 B per codeword) and
+            // the pair now negotiates 8-codeword frames.
+            let per_cw = max_payload_for_level(1).unwrap();
+            let capacity = per_cw * 8 - MacPdu::HEADER_SIZE - TRANSPORT_HEADER_SIZE - 1;
             assert!(
-                run.delivered.len() >= payload.len().div_ceil(95),
+                run.delivered.len() >= payload.len().div_ceil(capacity),
                 "{} frames",
                 run.delivered.len()
             );

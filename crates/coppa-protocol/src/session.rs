@@ -49,6 +49,11 @@ pub struct LinkCapabilities {
     pub arq_window: u8,
     /// Whether compression is supported.
     pub compression: bool,
+    /// COP-69: whether this peer accepts multi-codeword session frames,
+    /// codeword-bitmap ACKs, and short dedicated ACK frames (flags byte bit 1).
+    /// Negotiated as an AND of both sides, exactly like `compression`, so a
+    /// mixed-version pair runs today's protocol untouched.
+    pub multi_frame_ack: bool,
     /// Modulation/coding scheme index.
     pub mcs_index: u8,
 }
@@ -61,6 +66,7 @@ impl Default for LinkCapabilities {
             fec_rate_den: 2,
             arq_window: 8,
             compression: false,
+            multi_frame_ack: false,
             mcs_index: 0,
         }
     }
@@ -75,7 +81,8 @@ impl LinkCapabilities {
         out.push(self.fec_rate_num);
         out.push(self.fec_rate_den);
         out.push(self.arq_window);
-        let flags = if self.compression { 0x01 } else { 0x00 };
+        // Flags byte (byte 5): [compression:1][multi_frame_ack:1][reserved:6].
+        let flags = (self.compression as u8) | ((self.multi_frame_ack as u8) << 1);
         out.push(flags);
         out.push(self.mcs_index);
         out
@@ -95,6 +102,7 @@ impl LinkCapabilities {
             fec_rate_den: bytes[3],
             arq_window: bytes[4],
             compression: bytes[5] & 0x01 != 0,
+            multi_frame_ack: bytes[5] & 0x02 != 0,
             mcs_index: bytes[6],
         })
     }
@@ -115,6 +123,7 @@ impl LinkCapabilities {
             },
             arq_window: self.arq_window.min(peer.arq_window),
             compression: self.compression && peer.compression,
+            multi_frame_ack: self.multi_frame_ack && peer.multi_frame_ack,
             mcs_index: self.mcs_index.min(peer.mcs_index),
         }
     }
@@ -567,6 +576,7 @@ mod tests {
             fec_rate_den: 2,
             arq_window: 8,
             compression: true,
+            multi_frame_ack: false,
             mcs_index: 3,
         };
         let bytes = caps.to_bytes();
@@ -596,6 +606,7 @@ mod tests {
             fec_rate_den: 2,
             arq_window: 8,
             compression: true,
+            multi_frame_ack: true,
             mcs_index: 5,
         };
         let b = LinkCapabilities {
@@ -604,6 +615,7 @@ mod tests {
             fec_rate_den: 3,
             arq_window: 4,
             compression: false,
+            multi_frame_ack: false,
             mcs_index: 3,
         };
         let negotiated = a.negotiate(&b);
@@ -612,7 +624,39 @@ mod tests {
         assert_eq!(negotiated.fec_rate_den, 2);
         assert_eq!(negotiated.arq_window, 4); // min
         assert!(!negotiated.compression); // AND
+        assert!(!negotiated.multi_frame_ack); // AND
         assert_eq!(negotiated.mcs_index, 3); // min
+    }
+
+    /// COP-69: the `multi_frame_ack` capability bit (flags byte bit 1)
+    /// negotiates as an AND — set x clear -> clear, set x set -> set — and
+    /// survives a to_bytes/from_bytes roundtrip. This is the interop gate for
+    /// multi-codeword session frames and short ACK frames: an old peer sends
+    /// flags 0x00, the negotiated bit stays clear, and the pair runs today's
+    /// protocol exactly.
+    #[test]
+    fn link_capabilities_multi_frame_ack_negotiates_as_and() {
+        let set = LinkCapabilities {
+            multi_frame_ack: true,
+            ..LinkCapabilities::default()
+        };
+        let clear = LinkCapabilities::default();
+
+        assert!(!set.negotiate(&clear).multi_frame_ack);
+        assert!(!clear.negotiate(&set).multi_frame_ack);
+        assert!(set.negotiate(&set).multi_frame_ack);
+
+        // Wire roundtrip carries the bit, and an old peer's all-zero flags
+        // byte parses back with the bit clear.
+        let bytes = set.to_bytes();
+        assert_eq!(bytes[5] & 0x02, 0x02, "bit 1 of the flags byte");
+        assert!(
+            LinkCapabilities::from_bytes(&bytes)
+                .unwrap()
+                .multi_frame_ack
+        );
+        let legacy = LinkCapabilities::from_bytes(&[0, 0, 1, 2, 8, 0x00, 0]).unwrap();
+        assert!(!legacy.multi_frame_ack);
     }
 
     #[test]

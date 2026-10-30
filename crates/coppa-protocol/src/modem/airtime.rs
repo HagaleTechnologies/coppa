@@ -55,6 +55,19 @@ fn data_carriers_per_symbol(profile: &CoppaProfile) -> usize {
 /// arithmetic (see that method's `num_header_syms` / `coded_symbols` /
 /// `num_payload_syms`, `crates/coppa-codec/src/ofdm/coppa_modem.rs`).
 pub fn frame_airtime_s(level: u8, profile: &CoppaProfile) -> Option<f64> {
+    multi_frame_airtime_s(level, 1, profile)
+}
+
+/// COP-69 multi-codeword twin of [`frame_airtime_s`]: airtime for one frame
+/// carrying `codewords` (1..=8) back-to-back LDPC blocks at speed `level`.
+///
+/// The preamble and protected header are paid once per frame regardless of the
+/// codeword count — that fixed cost is exactly the ~47%-of-airtime framing
+/// overhead the ticket targets at 64-QAM, and it falls to ~11% for an
+/// 8-codeword frame at level 8 on `hf_standard` (15 symbols of which 7 fixed
+/// -> 66 symbols of which 7 fixed). `codewords == 0` is treated as 1, matching
+/// how every TX/RX site applies `header.codewords.max(1)`.
+pub fn multi_frame_airtime_s(level: u8, codewords: u8, profile: &CoppaProfile) -> Option<f64> {
     let sl = SPEED_LEVELS.iter().find(|s| s.level == level)?;
     let data_per_sym = data_carriers_per_symbol(profile);
     if data_per_sym == 0 {
@@ -63,7 +76,8 @@ pub fn frame_airtime_s(level: u8, profile: &CoppaProfile) -> Option<f64> {
     let symbol_len = profile.fft_size + profile.cp_samples;
 
     let header_syms = PROTECTED_HEADER_CODED_BITS.div_ceil(data_per_sym);
-    let coded_symbols = CODED_BLOCK_LEN.div_ceil(sl.bits_per_symbol as usize);
+    let coded_symbols =
+        CODED_BLOCK_LEN.div_ceil(sl.bits_per_symbol as usize) * codewords.max(1) as usize;
     let payload_syms = coded_symbols.div_ceil(data_per_sym);
 
     let total_syms = PREAMBLE_SYMS + header_syms + payload_syms;
@@ -108,6 +122,46 @@ mod tests {
         let profile = CoppaProfile::hf_standard();
         assert!(frame_airtime_s(10, &profile).is_none());
         assert!(frame_airtime_s(255, &profile).is_none());
+    }
+
+    /// COP-69: exact symbol counts for multi-codeword frames on `hf_standard`.
+    /// Level 8 (64-QAM 2/3): header_syms = 4, coded_symbols = ceil(1944/6) = 324,
+    /// payload_syms = ceil(324/44) = 8. One codeword: 3+4+8 = 15 symbols (the
+    /// ticket's 46.7%-overhead case: 7 of 15 symbols carry no payload bits).
+    /// Eight codewords: 3+4+64 = 66 symbols — the same 7 fixed symbols are now
+    /// 10.6%.
+    #[test]
+    fn multi_frame_airtime_s_exact_symbol_counts_level8_hf() {
+        let profile = CoppaProfile::hf_standard();
+        let t1 = multi_frame_airtime_s(8, 1, &profile).expect("level 8 is valid");
+        let t8 = multi_frame_airtime_s(8, 8, &profile).expect("level 8 is valid");
+        // 15 * 1260 / 48000 = 0.39375 s; 66 * 1260 / 48000 = 1.7325 s.
+        assert!((t1 - 0.39375).abs() < 1e-9, "1-codeword L8 HF = {t1}");
+        assert!((t8 - 1.7325).abs() < 1e-9, "8-codeword L8 HF = {t8}");
+        // The existing 1-codeword API is the codewords=1 case of the new one.
+        assert_eq!(frame_airtime_s(8, &profile), Some(t1));
+    }
+
+    /// COP-69: one 8-codeword frame beats 8 single-codeword frames — the
+    /// preamble + protected header are paid once, not 8 times. 66 symbols vs
+    /// 8 x 15 = 120 symbols.
+    #[test]
+    fn multi_frame_airtime_s_eight_codewords_beats_eight_frames() {
+        let profile = CoppaProfile::hf_standard();
+        let one = multi_frame_airtime_s(8, 1, &profile).unwrap();
+        let eight_separate = one * 8.0;
+        let one_big = multi_frame_airtime_s(8, 8, &profile).unwrap();
+        assert!(
+            one_big < 0.6 * eight_separate,
+            "8-codeword frame ({one_big}s) should be well under 8 separate frames ({eight_separate}s)"
+        );
+        // Every level's 8-codeword frame is shorter than 8 of its 1-codeword
+        // frames (the fixed preamble/header dominates nothing, but never wins).
+        for level in [1u8, 2, 3, 4, 5, 6, 7, 8, 9] {
+            let single = multi_frame_airtime_s(level, 1, &profile).unwrap();
+            let multi = multi_frame_airtime_s(level, 8, &profile).unwrap();
+            assert!(multi < 8.0 * single, "level {level}");
+        }
     }
 
     /// COP-2: `hf_standard` and `hf_standard_short_cp` differ in exactly one field
