@@ -205,6 +205,15 @@ Each of these was observed in the verification runs unless it says otherwise.
 - **PTT.** With `ptt_method = "none"` nothing keys a radio. For a real radio use rigctld, as in
   [OPERATING.md](OPERATING.md).
 
+## Pat over the ARDOP interface
+
+Pat can also drive coppa through its **ARDOP** transport instead of the
+VARA-style one: configure `"ardop": { "addr": "127.0.0.1:8515" }` and
+connect with `pat connect ardop:///<CALL>`. The ARDOP interface is a second,
+open-protocol path with its own command vocabulary — see
+[docs/ARDOP.md](ARDOP.md) for its configuration, its command subset and its
+busy semantics.
+
 ## Troubleshooting
 
 - **`Unable to establish connection to remote: connect timeout`.**

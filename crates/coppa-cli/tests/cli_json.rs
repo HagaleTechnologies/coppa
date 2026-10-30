@@ -60,8 +60,10 @@ fn devices_json_is_one_array_with_typed_records() {
     }
     for device in value.as_array().unwrap() {
         let object = device.as_object().unwrap();
-        assert_eq!(object.len(), 4);
+        assert_eq!(object.len(), 5);
         assert!(object["name"].is_string());
+        // COP-64: the exact selector ID, or null when the host gives none.
+        assert!(object["id"].is_string() || object["id"].is_null());
         assert!(object["max_sample_rate_hz"].is_u64());
         assert!(object["input_channels"].is_u64());
         assert!(object["output_channels"].is_u64());

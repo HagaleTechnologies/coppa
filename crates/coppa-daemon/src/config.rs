@@ -40,7 +40,15 @@ pub struct AudioConfig {
     pub input_device: String,
     /// Output device name (empty = default).
     pub output_device: String,
-    /// Sample rate in Hz.
+    /// Exact host-specific CPAL input device ID (empty = use name or default).
+    pub input_device_id: String,
+    /// Exact host-specific CPAL output device ID (empty = use name or default).
+    pub output_device_id: String,
+    /// Zero-based input lane of a multichannel device.
+    pub input_channel: u16,
+    /// Zero-based output lane; all other output lanes are silent.
+    pub output_channel: u16,
+    /// Preferred hardware sample rate in Hz; the engine retains its profile rate.
     pub sample_rate: u32,
     /// Ring buffer size in samples; must be greater than 0.
     pub buffer_size: usize,
@@ -249,8 +257,8 @@ pub struct HostConfig {
     /// Address all host servers bind to. Defaults to "127.0.0.1" (loopback only).
     ///
     /// WARNING: binding to a non-loopback address (e.g. "0.0.0.0") exposes the
-    /// VARA-style ports, which have no authentication and can key a transmitter,
-    /// to anyone who can reach this host. The WebSocket port needs
+    /// VARA-style and ARDOP ports, which have no authentication and can key a
+    /// transmitter, to anyone who can reach this host. The WebSocket port needs
     /// `websocket_token`, but over `ws://` the token crosses the network in
     /// clear text. Only change this on a trusted, firewalled network.
     pub bind_address: String,
@@ -260,6 +268,17 @@ pub struct HostConfig {
     pub vara_command_port: u16,
     /// VARA data port.
     pub vara_data_port: u16,
+    /// COP-97: enable the ARDOP TNC host interface (command + data TCP
+    /// ports). A host *protocol* interface: over the air coppa speaks
+    /// coppa, so both ends of a session run coppa. Like the VARA ports,
+    /// there is no token — any local process can key the transmitter
+    /// through it (see docs/ARDOP.md).
+    pub ardop_enabled: bool,
+    /// COP-97: ARDOP command port. ARDOP clients derive the data port as
+    /// command port + 1, so keep that relationship if you change it.
+    pub ardop_command_port: u16,
+    /// COP-97: ARDOP data port (the ARDOP convention is command port + 1).
+    pub ardop_data_port: u16,
     /// Enable WebSocket interface.
     pub websocket_enabled: bool,
     /// WebSocket port.
@@ -458,6 +477,10 @@ impl Default for AudioConfig {
         Self {
             input_device: String::new(),
             output_device: String::new(),
+            input_device_id: String::new(),
+            output_device_id: String::new(),
+            input_channel: 0,
+            output_channel: 0,
             sample_rate: 48_000,
             buffer_size: 8192,
         }
@@ -487,6 +510,9 @@ impl Default for HostConfig {
             vara_enabled: false,
             vara_command_port: 8300,
             vara_data_port: 8301,
+            ardop_enabled: false,
+            ardop_command_port: 8515,
+            ardop_data_port: 8516,
             websocket_enabled: false,
             websocket_port: 8400,
             websocket_token: None,
@@ -789,6 +815,7 @@ impl DaemonConfig {
         if built || !self.host.websocket_enabled {
             return Ok(());
         }
+
         Err(
             "[host] websocket_enabled = true is set, but this coppad was built without the \
              websocket feature and starts no WebSocket server; rebuild with --features \
@@ -797,23 +824,55 @@ impl DaemonConfig {
         )
     }
 
-    /// COP-32: `[audio] sample_rate` must equal the configured profile's
-    /// engine rate. coppad has no resampler, so any other rate plays and
-    /// captures audio at the wrong speed. Checked by run mode before any
-    /// hardware is touched; `--check` does not call it.
-    pub fn check_sample_rate(&self) -> Result<(), String> {
-        let engine_rate = coppa_engine::profiles::get_profile(&self.engine.profile).map_or_else(
-            || coppa_engine::EngineConfig::default().sample_rate,
-            |profile| profile.sample_rate,
-        );
-        if self.audio.sample_rate == engine_rate {
+    /// COP-97: an ARDOP-enabled config needs a build with the `ardop`
+    /// feature, checked in every build (the keys deserialize in every
+    /// build).
+    pub fn check_ardop_built(&self, built: bool) -> Result<(), String> {
+        if built || !self.host.ardop_enabled {
             return Ok(());
         }
-        Err(format!(
-            "[audio] sample_rate = {} is not supported: coppad has no resampler and \
-             profile {} runs at {engine_rate} Hz; set sample_rate = {engine_rate}",
-            self.audio.sample_rate, self.engine.profile
-        ))
+
+        Err(
+            "[host] ardop_enabled = true is set, but this coppad was built without the \
+             ardop feature and starts no ARDOP host interface; rebuild with --features \
+             ardop, or set ardop_enabled = false"
+                .to_string(),
+        )
+    }
+
+    /// A positive preferred hardware rate is required before opening audio.
+    /// The live backend picks a supported rate and converts to the engine rate.
+    pub fn check_sample_rate(&self) -> Result<(), String> {
+        if self.audio.sample_rate > 0 {
+            return Ok(());
+        }
+        Err(
+            "[audio] sample_rate = 0 is not supported: set a positive preferred hardware rate"
+                .into(),
+        )
+    }
+
+    /// A name and ID for the same direction would make selection ambiguous.
+    pub fn check_audio_selectors(&self) -> Result<(), String> {
+        for (direction, name, id) in [
+            (
+                "input",
+                &self.audio.input_device,
+                &self.audio.input_device_id,
+            ),
+            (
+                "output",
+                &self.audio.output_device,
+                &self.audio.output_device_id,
+            ),
+        ] {
+            if !name.is_empty() && !id.is_empty() {
+                return Err(format!(
+                    "[audio] {direction}_device and {direction}_device_id cannot both be set"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// COP-53: a WebSocket-enabled daemon needs a usable `[host]
@@ -967,6 +1026,10 @@ mod tests {
     fn test_default_config() {
         let config = DaemonConfig::default();
         assert_eq!(config.audio.sample_rate, 48_000);
+        assert_eq!(config.audio.input_channel, 0);
+        assert_eq!(config.audio.output_channel, 0);
+        assert!(config.audio.input_device_id.is_empty());
+        assert!(config.audio.output_device_id.is_empty());
         assert_eq!(config.host.vara_command_port, 8300);
         assert!(!config.host.vara_enabled);
         assert!(!config.host.websocket_enabled);
@@ -999,6 +1062,8 @@ mod tests {
         let parsed: DaemonConfig = toml::from_str(&printed).unwrap();
         assert_eq!(toml::to_string_pretty(&parsed).unwrap(), printed);
         assert_eq!(parsed.audio.sample_rate, 48_000);
+        assert_eq!(parsed.audio.input_channel, 0);
+        assert_eq!(parsed.audio.output_channel, 0);
         assert_eq!(parsed.radio.ptt_method, "none");
         assert_eq!(parsed.engine.profile, "HF_STANDARD");
         assert_eq!(parsed.engine.grid, None);
@@ -1534,6 +1599,51 @@ beacon_interval_secs = 600
         assert!(host.websocket_allowed_origins.is_empty());
     }
 
+    /// COP-97: the ARDOP interface defaults off with the ardopcf-convention
+    /// ports 8515/8516, so every existing config file keeps its exact
+    /// behaviour.
+    #[cfg(feature = "ardop")]
+    #[test]
+    fn ardop_defaults_are_off_with_8515_8516() {
+        let host = HostConfig::default();
+        assert!(!host.ardop_enabled);
+        assert_eq!(host.ardop_command_port, 8515);
+        assert_eq!(host.ardop_data_port, 8516);
+    }
+
+    /// COP-97: the three keys parse from a `[host]` section, and an unknown
+    /// key is still rejected (`deny_unknown_fields`, COP-36 behaviour
+    /// unchanged).
+    #[cfg(feature = "ardop")]
+    #[test]
+    fn ardop_keys_parse_and_unknown_keys_still_rejected() {
+        let config: DaemonConfig = toml::from_str(
+            "[host]\nardop_enabled = true\nardop_command_port = 8515\nardop_data_port = 8516\n",
+        )
+        .unwrap();
+        assert!(config.host.ardop_enabled);
+        assert_eq!(config.host.ardop_command_port, 8515);
+        assert_eq!(config.host.ardop_data_port, 8516);
+
+        let err = toml::from_str::<DaemonConfig>("[host]\nardop_port = 1\n").unwrap_err();
+        assert!(
+            err.to_string().contains("ardop_port"),
+            "the typo'd key must be named: {err}"
+        );
+    }
+
+    /// COP-97: an enabled ARDOP interface refuses to start in a build
+    /// without the feature (the `check_websocket_built` precedent).
+    #[test]
+    fn check_ardop_built_gates_an_enabled_config() {
+        let mut config = DaemonConfig::default();
+        assert_eq!(config.check_ardop_built(false), Ok(()));
+        config.host.ardop_enabled = true;
+        let err = config.check_ardop_built(false).unwrap_err();
+        assert!(err.contains("ardop feature"), "{err}");
+        assert_eq!(config.check_ardop_built(true), Ok(()));
+    }
+
     #[test]
     fn secret_token_debug_never_shows_the_value() {
         let config = ws(Some(GOOD), &[]);
@@ -2003,22 +2113,61 @@ beacon_interval_secs = 600
     }
 
     #[test]
-    fn check_sample_rate_rejects_any_other_rate() {
+    fn check_sample_rate_accepts_another_positive_hardware_rate() {
         let mut config = DaemonConfig::default();
         config.audio.sample_rate = 44_100;
-        let err = config.check_sample_rate().unwrap_err();
-        assert!(err.contains("sample_rate = 44100"), "{err}");
-        assert!(err.contains("48000 Hz"), "{err}");
-        assert!(err.contains("HF_STANDARD"), "{err}");
+        assert_eq!(config.check_sample_rate(), Ok(()));
+        assert_eq!(
+            coppa_engine::profiles::get_profile(&config.engine.profile)
+                .unwrap()
+                .sample_rate,
+            48_000
+        );
     }
 
     #[test]
-    fn check_sample_rate_uses_the_default_engine_rate_for_an_unknown_profile() {
+    fn check_sample_rate_rejects_zero() {
         let mut config = DaemonConfig::default();
-        config.engine.profile = "NOT_A_PROFILE".into();
-        assert_eq!(config.check_sample_rate(), Ok(()));
-        config.audio.sample_rate = 96_000;
-        assert!(config.check_sample_rate().is_err());
+        config.audio.sample_rate = 0;
+        assert!(config
+            .check_sample_rate()
+            .unwrap_err()
+            .contains("sample_rate = 0"));
+    }
+
+    #[test]
+    fn audio_ids_channels_roundtrip_and_conflicting_selectors_fail() {
+        let config: DaemonConfig = toml::from_str(
+            "[audio]\ninput_device_id = \"alsa:rx\"\noutput_device_id = \"alsa:tx\"\ninput_channel = 1\noutput_channel = 2\nsample_rate = 44100\n"
+        ).unwrap();
+        assert_eq!(config.audio.input_device_id, "alsa:rx");
+        assert_eq!(config.audio.output_device_id, "alsa:tx");
+        assert_eq!(config.audio.input_channel, 1);
+        assert_eq!(config.audio.output_channel, 2);
+        assert_eq!(config.check_audio_selectors(), Ok(()));
+        let printed = toml::to_string(&config).unwrap();
+        assert_eq!(
+            toml::from_str::<DaemonConfig>(&printed)
+                .unwrap()
+                .audio
+                .output_channel,
+            2
+        );
+
+        let conflict: DaemonConfig =
+            toml::from_str("[audio]\ninput_device = \"USB\"\ninput_device_id = \"alsa:rx\"\n")
+                .unwrap();
+        assert!(conflict
+            .check_audio_selectors()
+            .unwrap_err()
+            .contains("input_device and input_device_id"));
+        let conflict: DaemonConfig =
+            toml::from_str("[audio]\noutput_device = \"USB\"\noutput_device_id = \"alsa:tx\"\n")
+                .unwrap();
+        assert!(conflict
+            .check_audio_selectors()
+            .unwrap_err()
+            .contains("output_device and output_device_id"));
     }
 
     #[test]

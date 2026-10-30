@@ -11,6 +11,7 @@ coppa-dsp = { path = "../coppa-dsp" }
 anyhow = { workspace = true }
 rtrb = { workspace = true }
 tracing = { workspace = true }
+rubato = "0.16.2"
 cpal = { workspace = true, optional = true }
 hound = { workspace = true, optional = true }
 

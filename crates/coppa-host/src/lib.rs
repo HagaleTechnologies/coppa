@@ -2,8 +2,9 @@
 //!
 //! Provides a VARA-style TCP command/data port interface (`vara`, default
 //! `vara-tcp` feature; not RF/waveform-compatible with VARA), an optional
-//! WebSocket JSON API for web clients (`websocket` feature), and an optional
-//! KISS TNC TCP server (`kiss`, `kiss-tnc` feature).
+//! WebSocket JSON API for web clients (`websocket` feature), an optional
+//! KISS TNC TCP server (`kiss`, `kiss-tnc` feature), and an optional ARDOP
+//! TNC host command/data port interface (`ardop` feature; COP-97).
 
 // Library diagnostics go through `tracing`, never straight to stdout/stderr.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
@@ -16,6 +17,9 @@ pub mod websocket;
 
 #[cfg(feature = "kiss-tnc")]
 pub mod kiss;
+
+#[cfg(feature = "ardop")]
+pub mod ardop;
 
 /// A frame of data exchanged between host application and the Coppa engine.
 #[derive(Debug, Clone)]
@@ -36,6 +40,12 @@ pub enum HostEvent {
     /// A command-port line other than CONNECT/DISCONNECT. The daemon answers
     /// it on the sending client's own response channel.
     VaraCommand { client_id: u32, command: String },
+    /// An ARDOP command-port line other than ARQCALL/DISCONNECT (the ARDOP
+    /// twins of the two commands the server itself turns into
+    /// `ConnectRequest`/`DisconnectRequest`). Sent by the ARDOP command
+    /// server (`ardop` feature); the daemon parses it, acts on it and
+    /// replies on the sending client's own response channel.
+    ArdopCommand { client_id: u32, command: String },
     /// Connection request (CONNECT callsign1 callsign2).
     ConnectRequest {
         client_id: u32,

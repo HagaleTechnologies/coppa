@@ -10,7 +10,7 @@ Coppa is an open-source OFDM digital modem for amateur radio, written in Rust an
 cargo build --workspace
 cargo test --workspace --lib  # fast tier; what ci.yml runs
 cargo test --workspace  # full suite; run before pushing
-cargo test --workspace --features cpal-backend,websocket,kiss-tnc --lib
+cargo test --workspace --features cpal-backend,websocket,kiss-tnc,ardop --lib
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo bench --workspace
@@ -18,7 +18,7 @@ cargo bench --workspace
 
 ## Testing Policy
 
-**Run `cargo test --workspace` locally before pushing.** CI runs the full suite too (`ci-full.yml`'s `test-full` job, Linux, `--features cpal-backend,websocket`), but a local run is faster feedback. At minimum, run `cargo test --workspace --lib`.
+**Run `cargo test --workspace` locally before pushing.** CI runs the full suite too (`ci-full.yml`'s `test-full` job, Linux, `--features cpal-backend,websocket,ardop`), but a local run is faster feedback. At minimum, run `cargo test --workspace --lib`.
 
 ## Workspace Structure
 

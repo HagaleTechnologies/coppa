@@ -102,6 +102,40 @@ listed. Without the feature the commands still exit 0: `devices` prints the
 header with `  (none found - CPAL backend may not be available)` and
 `devices --json` prints `[]`.
 
+## Checking Your Station (coppa doctor)
+
+Build with live audio support, then run the station check before transmitting:
+
+```bash
+cargo build --release -p coppa-cli --features cpal-backend
+./target/release/coppa doctor
+```
+
+The report lists each audio device and the stream Coppa would open on it:
+any floating-point mode, using channel 0 of a multi-channel device and
+resampling when 48 kHz is not offered (the same choice `rx`, `tx` and `tune`
+make). The input and output device rows show which devices Coppa selected,
+or report a name that matches nothing or matches several devices. The
+`format` rows test-open those devices in that stream format and report what
+was opened, or why the open failed. The rigctld rows show whether Coppa
+connected and whether the radio answered a frequency read.
+
+Use `--device NAME` to select both input and output by a unique part of their
+names, or `--input-device NAME` and `--output-device NAME` to select each
+separately. Doctor checks channel 0; it has no `--device-id` or channel flags.
+Use `--rigctld HOST:PORT` if the server is elsewhere than `127.0.0.1:4532`.
+For a VOX or no-CAT station, pass `--no-rigctld` to skip both rig checks.
+The command exits with status 0 if no check failed, 1 if any check failed, and
+2 for invalid options. A skipped check is not a failure.
+
+Nothing is transmitted: the audio devices are opened and released without
+starting a stream, and rigctld receives only one `f` frequency query. PTT is
+never keyed.
+
+**What doctor does not check:** audio levels or ALC, whether audio reaches the
+radio, whether PTT actually keys, VOX/serial/GPIO PTT, or `coppad.toml`
+settings. Follow [the operating guide](../OPERATING.md) for those checks.
+
 ## Receiving Live Audio
 
 Requires the `cpal-backend` feature:
@@ -110,10 +144,15 @@ Requires the `cpal-backend` feature:
 cargo run -p coppa-cli --bin coppa --features cpal-backend -- rx --duration 60
 ```
 
-With no file, `coppa rx` captures from the default input device (`--device <name>` picks
-another by substring) and prints each frame as it decodes, in the same format as a WAV
-decode. `--duration` stops after that many seconds; without it, `coppa rx` runs until
-Ctrl+C. `coppa listen` is a deprecated alias for `coppa rx` and will be removed in the
+With no file, `coppa rx` captures from the default input device. Use
+`coppa devices` to list each device and its host-specific ID, then pass
+`--device-id <id>` for exact input selection or `--device <name>` for a unique
+name substring. An ambiguous name reports all matching IDs and fails.
+`--input-channel 0` is the default; use channel 1 for the other lane of a
+stereo input. Live output commands use `--device-id` and `--output-channel`.
+IDs may change when the audio host reconfigures the device. Decoded frames
+print in the same format as a WAV decode. `--duration` stops after that
+many seconds; without it, `coppa rx` runs until Ctrl+C. `coppa listen` is a deprecated alias for `coppa rx` and will be removed in the
 next release. It accepts `--json` too and prints its deprecation warning on
 stderr. Use `-q` to suppress status output, or `-v` for diagnostics. Repeat
 `-v` as `-vv` for recommended speed level and delay spread per decoded frame;
@@ -212,17 +251,18 @@ and there is no unknown or misspelled key or table (such as `calsign` for
 `callsign`); an
 unknown key is an error that names it, in `--check` and when the daemon starts.
 It does not check that the PTT method or profile name is valid, that
-`buffer_size` is above 0, that the sample rate suits the profile, that the audio
-devices exist, that rigctld answers, that the host ports are free, or that the
-setup suits your radio. Those surface when the daemon starts. `--check` opens no
+`buffer_size` is above 0, that the preferred hardware sample rate is
+positive, that the audio devices exist, that rigctld answers, that the
+host ports are free, or that the setup suits your radio. Those surface when the daemon starts. `--check` opens no
 hardware and starts no listeners.
 
 When the daemon starts, a condition that stops it doing its job is logged at
 `ERROR`, never as `Daemon ready`. An `[engine] profile` that is not one of the
-four built-in names, `[audio] buffer_size = 0`, a sample rate other than
-48000, a named `[audio]` device that does not exist (or any named device in a
-build without `cpal-backend`), an audio device that will not open, a host port
-that is already taken, an unknown PTT method, `[host] websocket_enabled = true`
+four built-in names, `[audio] buffer_size = 0`, `[audio] sample_rate = 0`,
+a missing or ambiguous named `[audio]` device, a stale device ID, a device
+selector in a build without `cpal-backend`, an unavailable channel or audio
+format, an audio device that will not open, a host port that is already
+taken, an unknown PTT method, `[host] websocket_enabled = true`
 in a build without the `websocket` feature, or a wideband profile with no
 frequency source stops the daemon: it logs the reason at `ERROR`, prints `Error: ...` on
 stderr and exits with status 1. An unreachable rigctld does not stop it; see
@@ -262,14 +302,19 @@ A build without `kiss-tnc` exits with `Error: TNC mode requires the kiss-tnc
 feature`.
 
 [docs/TNC.md](../TNC.md) says what the TNC mode is for (KISS bring-up and
-testing), covers `coppa tnc`, which takes its own `--port` and `--device` so
-several TNCs can run on one machine, and walks through a demo with two of them.
+testing), covers `coppa tnc`, which takes its own `--port`, direction-specific
+`--input-device-id`/`--output-device-id`, and channel flags so several TNCs
+can run on one machine, and walks through a demo with two of them.
 
 Example `coppad.toml`:
 ```toml
 [audio]
-sample_rate = 48000
+sample_rate = 48000 # preferred hardware rate; engine stays at its profile rate
 buffer_size = 8192
+input_device_id = "" # copy an ID from `coppa devices` when needed
+output_device_id = ""
+input_channel = 0 # zero-based
+output_channel = 0
 
 [radio]
 # "none" (default), "vox", "rigctld", or "serial:<port>:<dtr|rts>" /

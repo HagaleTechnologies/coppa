@@ -16,6 +16,7 @@ Open-source ham radio digital communications system written in Rust.
 | ARQ and protocol stack | Implemented | Selective-repeat ARQ, session management and optional Huffman + LZ4 compression; connected-session data is always acknowledged and retransmitted (stop-and-wait); sessionless ARQ (`arq_enabled`) defaults off |
 | CLI | Implemented | Loopback and WAV transmit/receive; live audio requires `cpal-backend` |
 | Daemon event loop | Implemented | Processes audio and host events; live audio requires `cpal-backend` |
+| ARDOP TNC host interface | Implemented, opt-in | Command/data ports default to 8515/8516; `ardop` feature, disabled by default; host-protocol interface only — both ends of a session run coppa — see [docs/ARDOP.md](docs/ARDOP.md) |
 | VARA-style TCP interface | Implemented, opt-in | Control/data ports default to 8300/8301; server disabled by default; not RF-compatible with VARA; verified with Pat (Winlink) — see [docs/PAT.md](docs/PAT.md) |
 | C FFI | Implemented | Shared/static library with one-shot encode/decode and streaming decode |
 | Operating profiles | Implemented | 48 kHz OFDM profiles with runtime speed-level selection within the configured band |
@@ -32,7 +33,7 @@ Open-source ham radio digital communications system written in Rust.
 - Nine speed levels using OFDM carrier constellations from BPSK through 64-QAM; levels 1–8 on HF and 1–9 on VHF.
 - NR BG2 LDPC payload coding with shortening, rate matching and interleaving; Golay and CRC-16 header protection, plus per-codeword CRC-32 payload checks.
 - Selective-repeat ARQ and session management, with optional Huffman + LZ4 compression. Connected-session data is always acknowledged and retransmitted; sessionless ARQ is disabled by default.
-- WAV file I/O and live CPAL audio with `cpal-backend`; daemon serial and Linux GPIO PTT with their respective feature flags.
+- WAV file I/O and live CPAL audio with `cpal-backend`, including exact device IDs, selectable input/output channels, and hardware sample-rate conversion; daemon serial and Linux GPIO PTT with their respective feature flags.
 - VARA-style TCP command/data interface for host applications, disabled by default and not RF-compatible with VARA.
 - C FFI shared/static library with one-shot encode/decode and streaming decode.
 - Deterministic link adaptation and spectrum sensing. Short-CP recommendation and negotiation are opt-in; IR-HARQ remains an unwired codec primitive.
@@ -68,9 +69,15 @@ coppa rx cq.wav --hex
 # Receive live from the default input device for 60 seconds (requires cpal-backend)
 coppa rx --duration 60
 
-# List audio devices (requires cpal-backend feature)
+# List audio devices and copy an exact ID (requires cpal-backend feature)
 coppa devices
 coppa devices --json
+
+# Check audio devices and rigctld without transmitting (pass/fail table)
+coppa doctor
+
+# Capture the right lane of a stereo input device
+coppa rx --device-id "<id-from-devices>" --input-channel 1 --duration 60
 
 # Show the speed levels and named profiles (add --json for machine-readable output)
 coppa profiles

@@ -24,10 +24,14 @@ usage() {
     cat <<'EOF'
 Usage: tools/pat-loop/run.sh [options]
 
-Runs real Pat (built-in varahf transport) against two release coppad
-processes joined by a userspace ALSA audio loop, and prints PASS or FAIL.
+Runs real Pat (built-in varahf or ardop transport, --transport) against two
+release coppad processes joined by a userspace ALSA audio loop, and prints
+PASS or FAIL.
 
 Options:
+  --transport vara|ardop
+                      host interface Pat drives: the VARA-style ports
+                      (default) or coppa's ARDOP TNC host interface (COP-97)
   --pat PATH          Pat binary for both stations (default: download pinned
                       Pat v1.0.0 into a cache dir and check its sha256)
   --dial-pat PATH     a different Pat for the dialing station (e.g. v0.13.1)
@@ -56,6 +60,7 @@ die() {
 
 PAT=""
 DIAL_PAT=""
+TRANSPORT=vara
 LEGACY=0
 COPPAD="$REPO/target/release/coppad"
 ALLOW_DEBUG=0
@@ -67,6 +72,7 @@ SELF_TEST_MISMATCH=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --transport) TRANSPORT=${2:?--transport needs vara or ardop}; shift 2 ;;
         --pat) PAT=${2:?--pat needs a path}; shift 2 ;;
         --dial-pat) DIAL_PAT=${2:?--dial-pat needs a path}; shift 2 ;;
         --legacy-config) LEGACY=1; shift ;;
@@ -84,13 +90,23 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$DIRECTION" in a | b | both) ;; *) die "--direction must be a, b or both" ;; esac
+case "$TRANSPORT" in vara | ardop) ;; *) die "--transport must be vara or ardop" ;; esac
+PAT_TRANSPORT=varahf
+VARA_ENABLED=true
+ARDOP_ENABLED=false
+if [[ $TRANSPORT == ardop ]]; then
+    PAT_TRANSPORT=ardop
+    VARA_ENABLED=false
+    ARDOP_ENABLED=true
+    [[ $LEGACY -eq 0 ]] || die "--legacy-config only supports --transport vara"
+fi
 [[ "$BODY_BYTES" =~ ^[0-9]+$ ]] || die "--body-bytes must be a number"
 [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || die "--timeout must be a number of seconds"
 [[ "$(uname -s)" == Linux ]] || die "Linux only (ALSA file PCMs)"
 command -v python3 >/dev/null || die "python3 is required"
 
 [[ -x "$COPPAD" ]] || die "no coppad at $COPPAD; build it with:
-  cargo build --release -p coppa-daemon --bin coppad --features cpal-backend"
+  cargo build --release -p coppa-daemon --bin coppad --features cpal-backend,ardop"
 COPPAD=$(cd "$(dirname "$COPPAD")" && pwd)/$(basename "$COPPAD")
 if [[ "$COPPAD" == */target/debug/* && $ALLOW_DEBUG -eq 0 ]]; then
     die "refusing a debug coppad ($COPPAD): a debug build cannot decode in real
@@ -175,6 +191,10 @@ while True:
     a = socket.socket()
     a.bind(("127.0.0.1", 0))
     port = a.getsockname()[1]
+    # Pat increments the final ASCII digit, so 9 would become ':'.
+    if port % 10 == 9:
+        a.close()
+        continue
     b = socket.socket()
     try:
         b.bind(("127.0.0.1", port + 1))
@@ -242,9 +262,12 @@ ptt_method = "none"
 
 [host]
 bind_address = "127.0.0.1"
-vara_enabled = true
+vara_enabled = $VARA_ENABLED
 vara_command_port = $cmd
 vara_data_port = $((cmd + 1))
+ardop_enabled = $ARDOP_ENABLED
+ardop_command_port = $cmd
+ardop_data_port = $((cmd + 1))
 
 [engine]
 profile = "HF_STANDARD"
@@ -257,16 +280,24 @@ EOF
     else
         varahf="{ \"addr\": \"localhost:$cmd\", \"bandwidth\": 2300 }"
     fi
+    # COP-97: over the ARDOP transport Pat wants the ARDOP connector instead.
+    local pat_connector
+    if [[ $TRANSPORT == ardop ]]; then
+        pat_connector="\"ardop\": { \"addr\": \"localhost:$cmd\" }"
+    else
+        pat_connector="\"varahf\": $varahf"
+    fi
     # version_reporting_disabled and the pre-seeded account-confirmed stamp
     # are TEST-ONLY: they keep Pat from calling the Winlink network (version
     # report, account-activation check) for these made-up callsigns.
     cat >"$dir/pat.json" <<EOF
 {
   "mycall": "$call",
+  "locator": "FN31PR",
   "listen": $listen,
   "http_addr": "localhost:$http",
   "version_reporting_disabled": true,
-  "varahf": $varahf
+  $pat_connector
 }
 EOF
     date -u +'"%Y-%m-%dT%H:%M:%SZ"' >"$dir/xdg/state/pat/.account-confirmed_$call.json"
@@ -283,7 +314,13 @@ station_env() {
 }
 
 setup_station a "$A_CALL" "$A_CMD" "$A_HTTP" coppa-loop-A '[]' 0
-setup_station b "$B_CALL" "$B_CMD" "$B_HTTP" coppa-loop-B '["varahf"]' 0
+# The listener's listen list follows --transport (P12: existing VARA
+# invocations are unchanged).
+B_LISTEN='["varahf"]'
+if [[ $TRANSPORT == ardop ]]; then
+    B_LISTEN='["ardop"]'
+fi
+setup_station b "$B_CALL" "$B_CMD" "$B_HTTP" coppa-loop-B "$B_LISTEN" 0
 
 python3 "$HERE/relay.py" "$SCRATCH" "$A_CMD" "$B_CMD" >"$SCRATCH/relay.log" 2>&1 &
 PIDS+=($!)
@@ -365,7 +402,7 @@ run_direction() {
 
     station_env "$listener"
     env "${STATION_ENV[@]}" "$PAT" --config "$SCRATCH/$listener/pat.json" \
-        --mbox "$SCRATCH/$listener/mbox" --listen=varahf http >"$run/listener.log" 2>&1 &
+        --mbox "$SCRATCH/$listener/mbox" --listen="$PAT_TRANSPORT" http >"$run/listener.log" 2>&1 &
     local listener_pid=$!
     PIDS+=("$listener_pid")
     wait_for_line "$run/listener.log" "Listening for incoming traffic" ||
@@ -398,7 +435,7 @@ EOF
 
     local start=$SECONDS rc=0
     env "${STATION_ENV[@]}" timeout "$TIMEOUT" "$DIAL_PAT" --config "$dial_cfg" \
-        --mbox "$SCRATCH/$dialer/mbox" connect "varahf:///$l_call" \
+        --mbox "$SCRATCH/$dialer/mbox" connect "$PAT_TRANSPORT:///$l_call" \
         </dev/null >"$run/connect.log" 2>&1 || rc=$?
     local elapsed=$((SECONDS - start))
     # Give the listener a moment to file the message, then stop it.

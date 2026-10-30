@@ -5,7 +5,8 @@ pub const GIT_SHA: &str = env!("COPPA_GIT_SHA");
 
 /// Every coppa-daemon cargo feature and whether this build has it.
 /// `features_lists_every_feature_in_cargo_toml` keeps it complete.
-pub const FEATURES: [(&str, bool); 5] = [
+pub const FEATURES: [(&str, bool); 6] = [
+    ("ardop", cfg!(feature = "ardop")),
     ("cpal-backend", cfg!(feature = "cpal-backend")),
     ("gpio-ptt", cfg!(feature = "gpio-ptt")),
     ("kiss-tnc", cfg!(feature = "kiss-tnc")),
