@@ -1,6 +1,10 @@
 //! WebSocket JSON API for web-based clients.
 
+use base64::Engine as _;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use crate::HostEvent;
@@ -10,7 +14,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 use tokio_tungstenite::tungstenite::http::{header, HeaderValue, StatusCode};
 
 /// JSON message from a WebSocket client.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type")]
 pub enum WsClientMessage {
     /// Set station callsign.
@@ -24,7 +28,11 @@ pub enum WsClientMessage {
     Disconnect,
     /// Send data.
     #[serde(rename = "send")]
-    Send { data: String },
+    Send {
+        data: String,
+        #[serde(default)]
+        encoding: DataEncoding,
+    },
     /// Get status.
     #[serde(rename = "status")]
     Status,
@@ -37,15 +45,19 @@ pub enum WsClientMessage {
     /// [`WsServerMessage::AudioLevel`].
     #[serde(rename = "audio_level")]
     AudioLevel { enabled: bool },
+    #[serde(rename = "log")]
+    Log { enabled: bool },
 }
 
 /// JSON message sent to a WebSocket client.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type")]
 pub enum WsServerMessage {
     /// Connection status update.
     #[serde(rename = "status")]
     Status {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
         connected: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         remote_call: Option<String>,
@@ -88,35 +100,54 @@ pub enum WsServerMessage {
     },
     /// Data received from remote station.
     #[serde(rename = "data")]
-    Data { data: String },
+    Data {
+        data: String,
+        #[serde(default)]
+        encoding: DataEncoding,
+    },
     /// Error message.
     #[serde(rename = "error")]
-    Error { message: String },
-    /// Connection established.
-    #[serde(rename = "connected")]
-    Connected { remote_call: String },
-    /// Disconnected.
-    #[serde(rename = "disconnected")]
-    Disconnected,
-    /// Periodic spectrum/waterfall update (Phase 4 Task 4): a 128-bin
-    /// log-magnitude (dB) power spectrum of Coppa's ~300-2800 Hz SSB
-    /// passband, produced by the daemon from the RX audio stream at a ~4 Hz
-    /// update rate (`crates/coppa-daemon/src/spectrum.rs`).
-    ///
-    /// Opt-in per client (`WsClientMessage::Spectrum { enabled: true }`),
-    /// not broadcast to every connection by default: this is the only
-    /// message type on the shared broadcast channel with an inherent
-    /// periodic rate (4 Hz) rather than being purely event-driven (a decoded
-    /// frame, a connect/disconnect) or client-request/response (`status`) --
-    /// unconditionally forwarding it to every connected client, most of
-    /// which have no use for a waterfall display, would flood them with
-    /// data they didn't ask for. `WebSocketServer::run`'s per-connection
-    /// forwarding loop checks each broadcast message's own `type` field and
-    /// only delivers a `spectrum` message to connections that opted in.
+    Error {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
+    },
+    #[serde(rename = "hello")]
+    Hello { version: u32, server: String },
+    #[serde(rename = "ack")]
+    Ack { id: u64 },
+    #[serde(rename = "session")]
+    Session {
+        state: SessionState,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        remote_call: Option<String>,
+    },
+    #[serde(rename = "ptt")]
+    Ptt { state: bool },
+    #[serde(rename = "busy")]
+    Busy { state: bool },
+    #[serde(rename = "snr")]
+    Snr { db: i32 },
+    #[serde(rename = "level")]
+    Level { level: u8 },
+    #[serde(rename = "heard")]
+    Heard { stations: Vec<HeardStation> },
+    #[serde(rename = "log")]
+    Log {
+        level: String,
+        message: String,
+        timestamp_ms: u64,
+    },
+    #[serde(rename = "decode_fail")]
+    DecodeFail { count: u64, timestamp_ms: u64 },
+    /// Opt-in 128-bin spectrum of the engine's current occupied band.
+    /// Bins span [freq_low_hz, freq_high_hz), lowest frequency first.
     #[serde(rename = "spectrum")]
     Spectrum {
-        /// 128 log-magnitude (dB) bins spanning the ~300-2800 Hz band,
-        /// lowest frequency first.
+        freq_low_hz: f32,
+        freq_high_hz: f32,
+        /// 128 log-magnitude (dB) bins spanning the reported occupied band.
+        /// A wider waveform uses wider bins at the same bin count.
         bins: Vec<f32>,
         /// Wall-clock time this spectrum was computed (Unix epoch, ms).
         timestamp_ms: u64,
@@ -156,8 +187,107 @@ pub enum WsServerMessage {
     },
 }
 
+/// Version of the JSON text protocol announced after authentication.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DataEncoding {
+    #[default]
+    Utf8,
+    Base64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionState {
+    Connected,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HeardStation {
+    pub call: String,
+    pub last_heard_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snr_db: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<u8>,
+}
+
+/// Optional correlation id applies to every request without changing its shape.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+    #[serde(flatten)]
+    pub message: WsClientMessage,
+}
+
+impl WsServerMessage {
+    /// Encode decoded bytes without replacing invalid UTF-8 sequences.
+    pub fn data_from_bytes(bytes: &[u8]) -> Self {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => Self::Data {
+                data: text.to_owned(),
+                encoding: DataEncoding::Utf8,
+            },
+            Err(_) => Self::Data {
+                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                encoding: DataEncoding::Base64,
+            },
+        }
+    }
+}
+
+/// Disposable telemetry alone may use the lossy broadcast path.
+fn is_lossy_telemetry(message: &WsServerMessage) -> bool {
+    matches!(
+        message,
+        WsServerMessage::Spectrum { .. }
+            | WsServerMessage::AudioLevel { .. }
+            | WsServerMessage::Log { .. }
+            | WsServerMessage::DecodeFail { .. }
+    )
+}
+
+const RELIABLE_QUEUE_DEPTH: usize = 256;
+struct ReliableClient {
+    tx: mpsc::Sender<WsServerMessage>,
+    close: tokio::sync::watch::Sender<bool>,
+}
+type ClientRegistry = Arc<Mutex<HashMap<u32, ReliableClient>>>;
+
+/// Nonblocking reliable fan-out. Overflow disconnects the lagging client.
+#[derive(Clone)]
+pub struct WsPush {
+    clients: ClientRegistry,
+}
+impl WsPush {
+    pub fn push(&self, message: &WsServerMessage) {
+        assert!(
+            !is_lossy_telemetry(message),
+            "telemetry belongs on the broadcast path"
+        );
+        self.clients.lock().unwrap().retain(|id, client| {
+            match client.tx.try_send(message.clone()) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(
+                        client_id = id,
+                        "WebSocket reliable queue full, disconnecting client"
+                    );
+                    let _ = client.close.send(true);
+                    false
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            }
+        });
+    }
+}
+
 /// Which audio stream an [`WsServerMessage::AudioLevel`] reading measures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AudioLevelDirection {
     /// Received audio (sound-card input).
@@ -167,7 +297,7 @@ pub enum AudioLevelDirection {
 }
 
 /// Level state carried by [`WsServerMessage::AudioLevel`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AudioLevelState {
     /// Level is usable.
@@ -219,32 +349,18 @@ enum OptInStream {
     Spectrum,
     /// `WsServerMessage::AudioLevel`.
     AudioLevel,
+    Log,
 }
 
-/// Which opt-in stream, if any, a pre-serialized broadcast JSON string
-/// belongs to, used by each connection's forwarding loop in
-/// [`WebSocketServer::run`] to gate delivery on that connection's own opt-in
-/// state. `None` means the message is delivered unconditionally.
-///
-/// The shared broadcast channel (`WebSocketServer::broadcast_tx`) carries
-/// pre-serialized JSON `String`s, not a typed enum -- by the time a message
-/// reaches here it's already text. A full `serde_json::Value` parse (rather
-/// than a cheaper raw prefix/substring check on the JSON text) is the
-/// deliberate choice here: correctness over cleverness. `#[serde(tag =
-/// "type")]`'s internally-tagged encoding does, in practice, always place
-/// `"type"` first in the emitted object, so a `starts_with(r#"{"type":
-/// "spectrum""#)` check would likely work too and avoid a parse -- but that's
-/// an implementation detail of serde's internal tagging, not a stability
-/// guarantee this code should quietly depend on. This runs once per
-/// broadcast message per connected client, at a message rate (status/data
-/// events, plus at most a 4 Hz spectrum stream and a 10 Hz audio-level
-/// stream, across up to `MAX_CONCURRENT_CONNECTIONS` clients) far too low for
-/// the parse cost to matter.
+/// Read a serialized telemetry message's type to apply each client's opt-ins.
+/// Decode-failure diagnostics need no opt-in; data and state use `WsPush`.
+/// Parsing the object keeps this independent of JSON field order.
 fn opt_in_stream(json: &str) -> Option<OptInStream> {
     let value = serde_json::from_str::<serde_json::Value>(json).ok()?;
     match value.get("type")?.as_str()? {
         "spectrum" => Some(OptInStream::Spectrum),
         "audio_level" => Some(OptInStream::AudioLevel),
+        "log" => Some(OptInStream::Log),
         _ => None,
     }
 }
@@ -432,6 +548,7 @@ fn origin_for_log(request: &Request) -> Option<String> {
 
 /// WebSocket server configuration.
 pub struct WebSocketServer {
+    clients: ClientRegistry,
     port: u16,
     bind_addr: String,
     event_tx: mpsc::Sender<HostEvent>,
@@ -456,6 +573,7 @@ impl WebSocketServer {
         let (event_tx, event_rx) = mpsc::channel(256);
         let (broadcast_tx, _) = tokio::sync::broadcast::channel(64);
         Self {
+            clients: Arc::new(Mutex::new(HashMap::new())),
             port,
             bind_addr,
             event_tx,
@@ -493,10 +611,15 @@ impl WebSocketServer {
         self.event_tx.clone()
     }
 
-    /// Get a broadcast sender for pushing engine events to all connected clients.
-    ///
-    /// Send JSON-serialized `WsServerMessage`s through this to broadcast to all
-    /// connected WebSocket clients (e.g., decoded data, status updates).
+    /// Handle for data and state events; never routed through broadcast.
+    pub fn push_handle(&self) -> WsPush {
+        WsPush {
+            clients: self.clients.clone(),
+        }
+    }
+
+    /// Lossy sender for serialized spectrum, audio-level, log and decode-failure
+    /// telemetry. Use [`Self::push_handle`] for decoded data and state changes.
     pub fn broadcast_sender(&self) -> tokio::sync::broadcast::Sender<String> {
         self.broadcast_tx.clone()
     }
@@ -514,8 +637,8 @@ impl WebSocketServer {
     /// (COP-53); without one, every handshake is refused with 401. Each
     /// accepted connection gets a unique client ID. Incoming JSON messages are
     /// parsed as `WsClientMessage` and translated to `HostEvent`s.
-    /// Engine-originated messages are broadcast to all connected clients
-    /// via the `broadcast_sender()` channel.
+    /// Data/state events use per-client queues via [`Self::push_handle`].
+    /// Only disposable telemetry uses [`Self::broadcast_sender`].
     #[cfg(feature = "websocket")]
     pub async fn run(&self) -> anyhow::Result<()> {
         let addr = format!("{}:{}", self.bind_addr, self.port);
@@ -563,6 +686,7 @@ impl WebSocketServer {
             let broadcast_tx = self.broadcast_tx.clone();
             let event_tx = self.event_tx.clone();
             let status = self.status.clone();
+            let clients = self.clients.clone();
 
             tokio::spawn(async move {
                 let _permit = permit;
@@ -599,11 +723,39 @@ impl WebSocketServer {
                 // Subscribe before announcing the client, so no broadcast sent
                 // after `Connected` can be missed.
                 let mut broadcast_rx = broadcast_tx.subscribe();
+                let (reliable_tx, mut reliable_rx) = mpsc::channel(RELIABLE_QUEUE_DEPTH);
+                let (close_tx, mut close_rx) = tokio::sync::watch::channel(false);
+                clients.lock().unwrap().insert(
+                    client_id,
+                    ReliableClient {
+                        tx: reliable_tx,
+                        close: close_tx,
+                    },
+                );
                 tracing::info!(client_id, %peer, "WebSocket client connected");
 
+                let (mut sink, mut ws_stream) = ws.split();
+                // Overflow must cancel every wait after registration, including
+                // host notification and the first socket write.
+                tokio::select! {
+                    biased;
+                    _ = close_rx.changed() => {},
+                    _ = async {
                 let _ = event_tx.send(HostEvent::Connected { client_id }).await;
 
-                let (mut sink, mut ws_stream) = ws.split();
+                let hello = serde_json::to_string(&WsServerMessage::Hello {
+                    version: PROTOCOL_VERSION,
+                    server: format!("coppa {}", env!("CARGO_PKG_VERSION")),
+                })
+                .expect("hello serializes");
+                if sink
+                    .send(tokio_tungstenite::tungstenite::Message::Text(hello.into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let mut log_enabled = false;
 
                 // Per-connection opt-in state for the `spectrum` broadcast stream
                 // (Phase 4 Task 4) -- see `WsServerMessage::Spectrum`'s doc for why
@@ -613,20 +765,25 @@ impl WebSocketServer {
                 // `spectrum_enabled`: a client can want one without the other.
                 let mut audio_level_enabled = false;
 
-                // Main select loop: handle both client messages and engine broadcasts
+                // Handle client messages and engine broadcasts.
                 loop {
                     tokio::select! {
+                        biased;
+                        message = reliable_rx.recv() => {
+                            let Some(message) = message else { break };
+                            let json = serde_json::to_string(&message).expect("server message serializes");
+                            if sink.send(tokio_tungstenite::tungstenite::Message::Text(json.into())).await.is_err() {break;}
+                        }
                         // Engine broadcast → client
                         result = broadcast_rx.recv() => {
                             match result {
                                 Ok(json) => {
-                                    // Drop an opt-in stream this client hasn't
-                                    // asked for; every other broadcast message
-                                    // type is delivered unconditionally, matching
-                                    // this channel's pre-existing behavior.
+                                    // Only subscribed telemetry streams are delivered.
+                                    // Decode-failure aggregates are unconditional.
                                     match opt_in_stream(&json) {
                                         Some(OptInStream::Spectrum) if !spectrum_enabled => continue,
                                         Some(OptInStream::AudioLevel) if !audio_level_enabled => continue,
+                                        Some(OptInStream::Log) if !log_enabled => continue,
                                         _ => {}
                                     }
                                     if sink.send(tokio_tungstenite::tungstenite::Message::Text(json.into())).await.is_err() {
@@ -650,76 +807,59 @@ impl WebSocketServer {
 
                             if msg.is_text() {
                                 let text = msg.to_text().unwrap_or("");
-                                match serde_json::from_str::<WsClientMessage>(text) {
-                                    Ok(client_msg) => {
-                                        let host_event = match client_msg {
-                                            WsClientMessage::MyCall { .. } => {
-                                                HostEvent::VaraCommand {
-                                                    client_id,
-                                                    command: text.to_string(),
-                                                }
-                                            }
-                                            WsClientMessage::Connect { source, destination } => {
-                                                HostEvent::ConnectRequest {
-                                                    client_id,
-                                                    source,
-                                                    destination,
-                                                }
-                                            }
-                                            WsClientMessage::Disconnect => {
-                                                HostEvent::DisconnectRequest { client_id }
-                                            }
-                                            WsClientMessage::Send { data } => {
-                                                HostEvent::DataReceived {
-                                                    client_id,
-                                                    data: data.into_bytes(),
+                                let id = serde_json::from_str::<serde_json::Value>(text).ok().and_then(|v| v.get("id").and_then(serde_json::Value::as_u64));
+                                let response = match serde_json::from_str::<WsRequest>(text) {
+                                    Ok(WsRequest { id, message }) => {
+                                        let mut host_event = None;
+                                        let mut error = None;
+                                        match message {
+                                            WsClientMessage::MyCall {callsign} => host_event = Some(HostEvent::VaraCommand {client_id, command: format!("MYCALL {callsign}")}),
+                                            WsClientMessage::Connect {source, destination} => host_event = Some(HostEvent::ConnectRequest {client_id, source, destination}),
+                                            WsClientMessage::Disconnect => host_event = Some(HostEvent::DisconnectRequest {client_id}),
+                                            WsClientMessage::Send {data, encoding} => {
+                                                let bytes = match encoding {
+                                                    DataEncoding::Utf8 => Ok(data.into_bytes()),
+                                                    DataEncoding::Base64 => base64::engine::general_purpose::STANDARD.decode(data),
+                                                };
+                                                match bytes {
+                                                    Ok(data) => host_event = Some(HostEvent::DataReceived {client_id, data}),
+                                                    Err(e) => error = Some(format!("Invalid base64: {e}")),
                                                 }
                                             }
                                             WsClientMessage::Status => {
                                                 let snapshot = status.lock().await.clone();
-                                                let resp = WsServerMessage::Status {
-                                                    connected: snapshot.connected,
-                                                    remote_call: snapshot.remote_call,
-                                                    snr: snapshot.snr,
-                                                    level: snapshot.level,
-                                                    cfo: snapshot.cfo,
-                                                    short_cp_ok: snapshot.short_cp_ok,
-                                                    cp_desync_episodes: snapshot.cp_desync_episodes,
-                                                };
-                                                if let Ok(json) = serde_json::to_string(&resp) {
-                                                    let _ = sink
-                                                        .send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
-                                                        .await;
-                                                }
+                                                let response = WsServerMessage::Status {id, connected: snapshot.connected, remote_call: snapshot.remote_call, snr: snapshot.snr, level: snapshot.level, cfo: snapshot.cfo, short_cp_ok: snapshot.short_cp_ok, cp_desync_episodes: snapshot.cp_desync_episodes};
+                                                let json = serde_json::to_string(&response).expect("status serializes");
+                                                if sink.send(tokio_tungstenite::tungstenite::Message::Text(json.into())).await.is_err() {break;}
                                                 continue;
                                             }
-                                            WsClientMessage::Spectrum { enabled } => {
-                                                spectrum_enabled = enabled;
-                                                continue;
-                                            }
-                                            WsClientMessage::AudioLevel { enabled } => {
-                                                audio_level_enabled = enabled;
-                                                continue;
-                                            }
-                                        };
-                                        let _ = event_tx.send(host_event).await;
-                                    }
-                                    Err(e) => {
-                                        let resp = WsServerMessage::Error {
-                                            message: format!("Invalid message: {}", e),
-                                        };
-                                        if let Ok(json) = serde_json::to_string(&resp) {
-                                            let _ = sink
-                                                .send(tokio_tungstenite::tungstenite::Message::Text(json.into()))
-                                                .await;
+                                            WsClientMessage::Spectrum {enabled} => spectrum_enabled = enabled,
+                                            WsClientMessage::AudioLevel {enabled} => audio_level_enabled = enabled,
+                                            WsClientMessage::Log {enabled} => log_enabled = enabled,
                                         }
+                                        if let Some(event) = host_event {
+                                            if event_tx.send(event).await.is_err() { error = Some("Daemon unavailable".to_owned()); }
+                                        }
+                                        if let Some(message) = error { Some(WsServerMessage::Error {message, id}) }
+                                        else { id.map(|id| WsServerMessage::Ack {id}) }
                                     }
+                                    Err(e) => Some(WsServerMessage::Error {message: format!("Invalid message: {e}"), id}),
+                                };
+                                if let Some(response) = response {
+                                    let json = serde_json::to_string(&response).expect("response serializes");
+                                    if sink.send(tokio_tungstenite::tungstenite::Message::Text(json.into())).await.is_err() {break;}
                                 }
                             }
                         }
                     }
                 }
 
+                    } => {},
+                }
+                clients.lock().unwrap().remove(&client_id);
+                // Close the transport before reporting to a backpressured daemon.
+                drop(sink);
+                drop(ws_stream);
                 let _ = event_tx.send(HostEvent::Disconnected { client_id }).await;
                 tracing::info!(client_id, "WebSocket client disconnected");
             });
@@ -1001,6 +1141,7 @@ mod tests {
     #[test]
     fn test_ws_server_message_format() {
         let msg = WsServerMessage::Status {
+            id: None,
             connected: true,
             remote_call: Some("VK3DEF".to_string()),
             snr: Some(15),
@@ -1036,6 +1177,8 @@ mod tests {
     #[test]
     fn test_ws_spectrum_server_message_format() {
         let msg = WsServerMessage::Spectrum {
+            freq_low_hz: 350.0,
+            freq_high_hz: 2750.0,
             bins: vec![-80.0; 128],
             timestamp_ms: 1_700_000_000_000,
         };
@@ -1049,6 +1192,8 @@ mod tests {
     #[test]
     fn test_opt_in_stream_classifies_spectrum_and_audio_level_only() {
         let spectrum_json = serde_json::to_string(&WsServerMessage::Spectrum {
+            freq_low_hz: 350.0,
+            freq_high_hz: 2750.0,
             bins: vec![0.0; 128],
             timestamp_ms: 0,
         })
@@ -1071,12 +1216,14 @@ mod tests {
         );
 
         let data_json = serde_json::to_string(&WsServerMessage::Data {
+            encoding: DataEncoding::Utf8,
             data: "hello".to_string(),
         })
         .unwrap();
         assert_eq!(opt_in_stream(&data_json), None);
 
         let status_json = serde_json::to_string(&WsServerMessage::Status {
+            id: None,
             connected: false,
             remote_call: None,
             snr: None,
@@ -1226,6 +1373,7 @@ mod tests {
     #[test]
     fn test_ws_error_message() {
         let msg = WsServerMessage::Error {
+            id: None,
             message: "Not connected".to_string(),
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -1237,7 +1385,7 @@ mod tests {
         let json = r#"{"type":"send","data":"Hello World"}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
-            WsClientMessage::Send { data } => assert_eq!(data, "Hello World"),
+            WsClientMessage::Send { data, .. } => assert_eq!(data, "Hello World"),
             _ => panic!("Wrong variant"),
         }
     }
@@ -1265,8 +1413,9 @@ mod tests {
 
     #[test]
     fn test_ws_connected_message_format() {
-        let msg = WsServerMessage::Connected {
-            remote_call: "VK3DEF".to_string(),
+        let msg = WsServerMessage::Session {
+            state: SessionState::Connected,
+            remote_call: Some("VK3DEF".to_string()),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("VK3DEF"));
@@ -1275,7 +1424,10 @@ mod tests {
 
     #[test]
     fn test_ws_disconnected_message_format() {
-        let msg = WsServerMessage::Disconnected;
+        let msg = WsServerMessage::Session {
+            state: SessionState::Disconnected,
+            remote_call: None,
+        };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("disconnected"));
     }
@@ -1283,6 +1435,7 @@ mod tests {
     #[test]
     fn test_ws_data_message_format() {
         let msg = WsServerMessage::Data {
+            encoding: DataEncoding::Utf8,
             data: "test payload".to_string(),
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -1292,6 +1445,7 @@ mod tests {
     #[test]
     fn test_ws_status_omits_null_fields() {
         let msg = WsServerMessage::Status {
+            id: None,
             connected: false,
             remote_call: None,
             snr: None,
@@ -1332,6 +1486,113 @@ mod tests {
             } => assert_eq!(cp_desync_episodes, 0),
             other => panic!("expected Status, got {other:?}"),
         }
+    }
+    fn golden_messages() -> Vec<&'static str> {
+        vec![
+            r#"{"type":"hello","version":1,"server":"coppa 0.3.0"}"#,
+            r#"{"type":"ack","id":1}"#,
+            r#"{"type":"error","message":"bad"}"#,
+            r#"{"type":"error","message":"bad","id":2}"#,
+            r#"{"type":"data","data":"hello","encoding":"utf8"}"#,
+            r#"{"type":"data","data":"/wA=","encoding":"base64"}"#,
+            r#"{"type":"session","state":"connected","remote_call":"W1AW"}"#,
+            r#"{"type":"session","state":"disconnected"}"#,
+            r#"{"type":"ptt","state":true}"#,
+            r#"{"type":"busy","state":false}"#,
+            r#"{"type":"snr","db":14}"#,
+            r#"{"type":"level","level":2}"#,
+            r#"{"type":"heard","stations":[{"call":"W1AW","last_heard_ms":1,"snr_db":14,"level":2},{"call":"N0CALL","last_heard_ms":2}]}"#,
+            r#"{"type":"log","level":"info","message":"decoded","timestamp_ms":3}"#,
+            r#"{"type":"decode_fail","count":6,"timestamp_ms":4}"#,
+            r#"{"type":"spectrum","freq_low_hz":350.0,"freq_high_hz":5950.0,"bins":[-90.0],"timestamp_ms":5}"#,
+            r#"{"type":"status","connected":false,"cp_desync_episodes":0}"#,
+            r#"{"type":"status","id":2,"connected":false,"cp_desync_episodes":0}"#,
+            r#"{"type":"audio_level","direction":"rx","peak_dbfs":-6.0,"rms_dbfs":-9.0,"clip_fraction":0.0,"state":"ok","duration_ms":100,"timestamp_ms":6}"#,
+        ]
+    }
+
+    #[test]
+    fn protocol_v1_golden_serialization() {
+        for golden in golden_messages() {
+            let message: WsServerMessage = serde_json::from_str(golden).unwrap();
+            assert_eq!(serde_json::to_string(&message).unwrap(), golden);
+        }
+        assert_eq!(
+            serde_json::to_string(&WsServerMessage::data_from_bytes(&[255, 0])).unwrap(),
+            r#"{"type":"data","data":"/wA=","encoding":"base64"}"#
+        );
+    }
+
+    #[test]
+    fn every_request_accepts_optional_ids() {
+        for request in [
+            serde_json::json!({"type":"mycall","callsign":"N0CALL"}),
+            serde_json::json!({"type":"connect","source":"N0CALL","destination":"W1AW"}),
+            serde_json::json!({"type":"disconnect"}),
+            serde_json::json!({"type":"send","data":"hi"}),
+            serde_json::json!({"type":"send","data":"/wA=","encoding":"base64"}),
+            serde_json::json!({"type":"status"}),
+            serde_json::json!({"type":"spectrum","enabled":true}),
+            serde_json::json!({"type":"audio_level","enabled":true}),
+            serde_json::json!({"type":"log","enabled":true}),
+        ] {
+            let parsed: WsRequest = serde_json::from_value(request.clone()).unwrap();
+            assert_eq!(parsed.id, None);
+            let mut with_id = request;
+            with_id["id"] = 17.into();
+            let parsed: WsRequest = serde_json::from_value(with_id).unwrap();
+            assert_eq!(parsed.id, Some(17));
+        }
+        assert!(serde_json::from_str::<WsRequest>(r#"{"type":"unknown","id":1}"#).is_err());
+    }
+
+    #[derive(JsonSchema)]
+    #[serde(untagged)]
+    #[allow(dead_code)]
+    enum ProtocolMessage {
+        Request(WsRequest),
+        Server(WsServerMessage),
+    }
+
+    fn schema_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/schema/websocket-protocol-v1.json")
+    }
+
+    #[test]
+    fn schema_file_matches_derived() {
+        let schema = schemars::schema_for!(ProtocolMessage);
+        let generated = serde_json::to_string_pretty(&schema).unwrap() + "\n";
+        if std::env::var_os("UPDATE_WS_SCHEMA").is_some() {
+            std::fs::create_dir_all(schema_path().parent().unwrap()).unwrap();
+            std::fs::write(schema_path(), &generated).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(schema_path()).expect("run UPDATE_WS_SCHEMA=1 cargo test -p coppa-host --features websocket --lib schema_file_matches_derived"), generated);
+    }
+
+    #[test]
+    fn golden_examples_validate_against_schema() {
+        let schema: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(schema_path()).unwrap()).unwrap();
+        let validator = jsonschema::JSONSchema::compile(&schema).unwrap();
+        for golden in golden_messages() {
+            let instance: serde_json::Value = serde_json::from_str(golden).unwrap();
+            assert!(validator.is_valid(&instance), "invalid golden: {golden}");
+        }
+        for request in [
+            r#"{"type":"send","data":"/wA=","encoding":"base64","id":1}"#,
+            r#"{"type":"log","enabled":true,"id":2}"#,
+            r#"{"type":"status","id":3}"#,
+        ] {
+            assert!(
+                validator.is_valid(&serde_json::from_str(request).unwrap()),
+                "invalid request: {request}"
+            );
+        }
+        assert!(!validator.is_valid(&serde_json::json!({"type":"bogus"})));
+        assert!(
+            !validator.is_valid(&serde_json::json!({"type":"data","encoding":"binary","data":"x"}))
+        );
     }
 }
 
@@ -1393,6 +1654,25 @@ mod integration_tests {
             let _ = server.run_with_listener(listener).await;
         });
         (addr, event_rx, broadcast)
+    }
+
+    async fn connect_test(
+        request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    ) -> Result<
+        (
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tokio_tungstenite::tungstenite::handshake::client::Response,
+        ),
+        tokio_tungstenite::tungstenite::Error,
+    > {
+        use futures_util::StreamExt;
+        let (mut ws, response) = tokio_tungstenite::connect_async(request).await?;
+        let message = ws.next().await.unwrap()?;
+        let hello: WsServerMessage = serde_json::from_str(message.to_text().unwrap()).unwrap();
+        assert!(matches!(hello, WsServerMessage::Hello { version: 1, .. }));
+        Ok((ws, response))
     }
 
     /// Expect the handshake to fail with HTTP `status`; return the response.
@@ -1466,13 +1746,9 @@ mod integration_tests {
     async fn real_server_accepts_allowed_origin_with_query_token() {
         let (addr, mut event_rx, _broadcast) = start_real_server(Some(test_auth())).await;
         let url = format!("ws://{addr}/?token={TOKEN}");
-        let (mut ws, _) = tokio_tungstenite::connect_async(client_request(
-            &url,
-            Some("http://localhost:3000"),
-            None,
-        ))
-        .await
-        .unwrap();
+        let (mut ws, _) = connect_test(client_request(&url, Some("http://localhost:3000"), None))
+            .await
+            .unwrap();
         expect_connected(&mut event_rx).await;
 
         ws.send(Message::Text(r#"{"type":"status"}"#.into()))
@@ -1500,7 +1776,7 @@ mod integration_tests {
     async fn real_server_accepts_bearer_token_without_origin() {
         let (addr, mut event_rx, _broadcast) = start_real_server(Some(test_auth())).await;
         let url = format!("ws://{addr}/");
-        let (ws, _) = tokio_tungstenite::connect_async(client_request(&url, None, Some(TOKEN)))
+        let (ws, _) = connect_test(client_request(&url, None, Some(TOKEN)))
             .await
             .unwrap();
         expect_connected(&mut event_rx).await;
@@ -1526,7 +1802,7 @@ mod integration_tests {
         )
         .await;
         expect_refused(client_request(&url, None, None), 401).await;
-        let (ws, _) = tokio_tungstenite::connect_async(client_request(&url, None, Some(TOKEN)))
+        let (ws, _) = connect_test(client_request(&url, None, Some(TOKEN)))
             .await
             .unwrap();
         assert_eq!(expect_connected(&mut event_rx).await, FIRST_CLIENT_ID);
@@ -1535,105 +1811,8 @@ mod integration_tests {
 
     /// Helper: start a WebSocket server on a random port and return (port, event_rx).
     async fn start_server() -> (u16, mpsc::Receiver<HostEvent>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let (event_tx, event_rx) = mpsc::channel(256);
-
-        tokio::spawn(async move {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            let next_id = AtomicU32::new(1);
-
-            loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok(conn) => conn,
-                    Err(_) => break,
-                };
-                let client_id = next_id.fetch_add(1, Ordering::Relaxed);
-                let tx = event_tx.clone();
-
-                tokio::spawn(async move {
-                    let ws = match tokio_tungstenite::accept_async(stream).await {
-                        Ok(ws) => ws,
-                        Err(_) => return,
-                    };
-
-                    let _ = tx.send(HostEvent::Connected { client_id }).await;
-
-                    let (mut sink, mut stream) = ws.split();
-
-                    while let Some(Ok(msg)) = stream.next().await {
-                        if msg.is_close() {
-                            break;
-                        }
-                        if msg.is_text() {
-                            let text = msg.to_text().unwrap_or("");
-                            match serde_json::from_str::<WsClientMessage>(text) {
-                                Ok(client_msg) => {
-                                    let host_event = match client_msg {
-                                        WsClientMessage::Send { data } => HostEvent::DataReceived {
-                                            client_id,
-                                            data: data.into_bytes(),
-                                        },
-                                        WsClientMessage::Connect {
-                                            source,
-                                            destination,
-                                        } => HostEvent::ConnectRequest {
-                                            client_id,
-                                            source,
-                                            destination,
-                                        },
-                                        WsClientMessage::Disconnect => {
-                                            HostEvent::DisconnectRequest { client_id }
-                                        }
-                                        WsClientMessage::Status => {
-                                            let resp = WsServerMessage::Status {
-                                                connected: false,
-                                                remote_call: None,
-                                                snr: None,
-                                                level: None,
-                                                cfo: None,
-                                                short_cp_ok: None,
-                                                cp_desync_episodes: 0,
-                                            };
-                                            if let Ok(json) = serde_json::to_string(&resp) {
-                                                let _ = sink.send(Message::Text(json.into())).await;
-                                            }
-                                            continue;
-                                        }
-                                        WsClientMessage::MyCall { .. } => HostEvent::VaraCommand {
-                                            client_id,
-                                            command: text.to_string(),
-                                        },
-                                        WsClientMessage::Spectrum { .. }
-                                        | WsClientMessage::AudioLevel { .. } => {
-                                            // This test-only helper doesn't exercise
-                                            // broadcast forwarding at all (see its own
-                                            // doc), so there's no per-connection
-                                            // opt-in state to update here.
-                                            continue;
-                                        }
-                                    };
-                                    let _ = tx.send(host_event).await;
-                                }
-                                Err(e) => {
-                                    let resp = WsServerMessage::Error {
-                                        message: format!("Invalid message: {}", e),
-                                    };
-                                    if let Ok(json) = serde_json::to_string(&resp) {
-                                        let _ = sink.send(Message::Text(json.into())).await;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let _ = tx.send(HostEvent::Disconnected { client_id }).await;
-                });
-            }
-        });
-
-        (port, event_rx)
+        let (addr, events, _) = start_real_server(Some(test_auth())).await;
+        (addr.port(), events)
     }
 
     #[tokio::test]
@@ -1641,7 +1820,9 @@ mod integration_tests {
         let (port, mut event_rx) = start_server().await;
 
         let url = format!("ws://127.0.0.1:{}", port);
-        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let (mut ws, _) = connect_test(client_request(&url, None, Some(TOKEN)))
+            .await
+            .unwrap();
 
         // Should get Connected event
         let event = event_rx.recv().await.unwrap();
@@ -1668,7 +1849,9 @@ mod integration_tests {
         let (port, mut event_rx) = start_server().await;
 
         let url = format!("ws://127.0.0.1:{}", port);
-        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let (mut ws, _) = connect_test(client_request(&url, None, Some(TOKEN)))
+            .await
+            .unwrap();
 
         // Consume Connected event
         let _ = event_rx.recv().await.unwrap();
@@ -1685,6 +1868,7 @@ mod integration_tests {
         assert!(matches!(
             msg,
             WsServerMessage::Status {
+                id: None,
                 connected: false,
                 ..
             }
@@ -1729,7 +1913,7 @@ mod integration_tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
-        let (mut ws, _) = tokio_tungstenite::connect_async(client_request(&url, None, Some(TOKEN)))
+        let (mut ws, _) = connect_test(client_request(&url, None, Some(TOKEN)))
             .await
             .unwrap();
 
@@ -1749,6 +1933,7 @@ mod integration_tests {
                 cfo,
                 short_cp_ok,
                 cp_desync_episodes,
+                ..
             } => {
                 assert!(connected, "status should reflect the live connected flag");
                 assert_eq!(remote_call.as_deref(), Some("VK3DEF"));
@@ -1787,7 +1972,7 @@ mod integration_tests {
         });
 
         let url = format!("ws://{addr}");
-        let (ws, _) = tokio_tungstenite::connect_async(client_request(&url, None, Some(TOKEN)))
+        let (ws, _) = connect_test(client_request(&url, None, Some(TOKEN)))
             .await
             .unwrap();
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
@@ -1818,7 +2003,7 @@ mod integration_tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
-        let (ws, _) = tokio_tungstenite::connect_async(client_request(&url, None, Some(TOKEN)))
+        let (ws, _) = connect_test(client_request(&url, None, Some(TOKEN)))
             .await
             .unwrap();
 
@@ -1841,7 +2026,9 @@ mod integration_tests {
         let (port, mut event_rx) = start_server().await;
 
         let url = format!("ws://127.0.0.1:{}", port);
-        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let (mut ws, _) = connect_test(client_request(&url, None, Some(TOKEN)))
+            .await
+            .unwrap();
 
         let _ = event_rx.recv().await.unwrap();
 
@@ -1864,7 +2051,9 @@ mod integration_tests {
         let (port, mut event_rx) = start_server().await;
 
         let url = format!("ws://127.0.0.1:{}", port);
-        let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let (ws, _) = connect_test(client_request(&url, None, Some(TOKEN)))
+            .await
+            .unwrap();
 
         // Connected
         let event = event_rx.recv().await.unwrap();
@@ -1907,10 +2096,9 @@ mod integration_tests {
         let url = format!("ws://127.0.0.1:{}", port);
 
         // Client A subscribes to spectrum.
-        let (mut ws_a, _) =
-            tokio_tungstenite::connect_async(client_request(&url, None, Some(TOKEN)))
-                .await
-                .unwrap();
+        let (mut ws_a, _) = connect_test(client_request(&url, None, Some(TOKEN)))
+            .await
+            .unwrap();
         ws_a.send(Message::Text(
             r#"{"type":"spectrum","enabled":true}"#.into(),
         ))
@@ -1918,16 +2106,17 @@ mod integration_tests {
         .unwrap();
 
         // Client B never opts in.
-        let (mut ws_b, _) =
-            tokio_tungstenite::connect_async(client_request(&url, None, Some(TOKEN)))
-                .await
-                .unwrap();
+        let (mut ws_b, _) = connect_test(client_request(&url, None, Some(TOKEN)))
+            .await
+            .unwrap();
 
         // Give both connections' select loops a moment to register the
         // subscribe message (Client A) before broadcasting.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let spectrum_msg = WsServerMessage::Spectrum {
+            freq_low_hz: 350.0,
+            freq_high_hz: 2750.0,
             bins: vec![-90.0; 128],
             timestamp_ms: 12345,
         };
@@ -1942,7 +2131,9 @@ mod integration_tests {
             .unwrap();
         let received: WsServerMessage = serde_json::from_str(resp.to_text().unwrap()).unwrap();
         match received {
-            WsServerMessage::Spectrum { bins, timestamp_ms } => {
+            WsServerMessage::Spectrum {
+                bins, timestamp_ms, ..
+            } => {
                 assert_eq!(bins.len(), 128);
                 assert_eq!(timestamp_ms, 12345);
             }
@@ -1955,6 +2146,7 @@ mod integration_tests {
         // B unconditionally SHOULD receive (a `data` message, gated on
         // nothing) and confirming THAT is the first thing Client B sees.
         let canary = WsServerMessage::Data {
+            encoding: DataEncoding::Utf8,
             data: "canary".to_string(),
         };
         broadcast_tx
@@ -1968,7 +2160,7 @@ mod integration_tests {
             .unwrap();
         let received_b: WsServerMessage = serde_json::from_str(resp_b.to_text().unwrap()).unwrap();
         match received_b {
-            WsServerMessage::Data { data } => {
+            WsServerMessage::Data { data, .. } => {
                 assert_eq!(
                     data, "canary",
                     "non-subscribed client's first received message must be the canary, \
@@ -2014,19 +2206,17 @@ mod integration_tests {
         let url = format!("ws://127.0.0.1:{}", port);
 
         // Client A opts into audio_level only; client B into spectrum only.
-        let (mut ws_a, _) =
-            tokio_tungstenite::connect_async(client_request(&url, None, Some(TOKEN)))
-                .await
-                .unwrap();
+        let (mut ws_a, _) = connect_test(client_request(&url, None, Some(TOKEN)))
+            .await
+            .unwrap();
         ws_a.send(Message::Text(
             r#"{"type":"audio_level","enabled":true}"#.into(),
         ))
         .await
         .unwrap();
-        let (mut ws_b, _) =
-            tokio_tungstenite::connect_async(client_request(&url, None, Some(TOKEN)))
-                .await
-                .unwrap();
+        let (mut ws_b, _) = connect_test(client_request(&url, None, Some(TOKEN)))
+            .await
+            .unwrap();
         ws_b.send(Message::Text(
             r#"{"type":"spectrum","enabled":true}"#.into(),
         ))
@@ -2045,12 +2235,15 @@ mod integration_tests {
         })
         .unwrap();
         let spectrum_json = serde_json::to_string(&WsServerMessage::Spectrum {
+            freq_low_hz: 350.0,
+            freq_high_hz: 2750.0,
             bins: vec![-90.0; 128],
             timestamp_ms: 2,
         })
         .unwrap();
         let canary = |data: &str| {
             serde_json::to_string(&WsServerMessage::Data {
+                encoding: DataEncoding::Utf8,
                 data: data.to_string(),
             })
             .unwrap()
@@ -2066,7 +2259,7 @@ mod integration_tests {
             other => panic!("client A expected AudioLevel, got {:?}", other),
         }
         match next_server_message(&mut ws_a, "client A").await {
-            WsServerMessage::Data { data } => assert_eq!(data, "canary"),
+            WsServerMessage::Data { data, .. } => assert_eq!(data, "canary"),
             other => panic!("client A expected the canary, got {:?}", other),
         }
 
@@ -2076,7 +2269,7 @@ mod integration_tests {
             other => panic!("client B expected Spectrum, got {:?}", other),
         }
         match next_server_message(&mut ws_b, "client B").await {
-            WsServerMessage::Data { data } => assert_eq!(data, "canary"),
+            WsServerMessage::Data { data, .. } => assert_eq!(data, "canary"),
             other => panic!("client B expected the canary, got {:?}", other),
         }
 
@@ -2090,11 +2283,296 @@ mod integration_tests {
         broadcast_tx.send(audio_level_json).unwrap();
         broadcast_tx.send(canary("canary2")).unwrap();
         match next_server_message(&mut ws_a, "client A").await {
-            WsServerMessage::Data { data } => assert_eq!(data, "canary2"),
+            WsServerMessage::Data { data, .. } => assert_eq!(data, "canary2"),
             other => panic!("opted-out client A expected canary2, got {:?}", other),
         }
 
         ws_a.close(None).await.ok();
         ws_b.close(None).await.ok();
+    }
+    #[tokio::test]
+    async fn hello_is_first_and_ids_are_echoed() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let (addr, mut events, _) = start_real_server(Some(test_auth())).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(client_request(
+            &format!("ws://{addr}"),
+            None,
+            Some(TOKEN),
+        ))
+        .await
+        .unwrap();
+        expect_connected(&mut events).await;
+        let hello = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+            .await
+            .expect("hello must arrive first")
+            .unwrap()
+            .unwrap();
+        let hello: serde_json::Value = serde_json::from_str(hello.to_text().unwrap()).unwrap();
+        assert_eq!(hello["type"], "hello");
+        assert_eq!(hello["version"], 1);
+        println!("{hello}");
+        for (request, kind) in [
+            (r#"{"type":"mycall","callsign":"N0CALL","id":1}"#, "ack"),
+            (r#"{"type":"status","id":2}"#, "status"),
+            (
+                r#"{"type":"send","encoding":"base64","data":"/wA=","id":3}"#,
+                "ack",
+            ),
+            (
+                r#"{"type":"send","encoding":"base64","data":"?","id":4}"#,
+                "error",
+            ),
+            (r#"{"type":"unknown","id":5}"#, "error"),
+        ] {
+            ws.send(Message::Text(request.into())).await.unwrap();
+            let response = ws.next().await.unwrap().unwrap();
+            let response: serde_json::Value =
+                serde_json::from_str(response.to_text().unwrap()).unwrap();
+            let request: serde_json::Value = serde_json::from_str(request).unwrap();
+            assert_eq!(response["type"], kind);
+            assert_eq!(response["id"], request["id"]);
+        }
+        assert!(
+            matches!(events.recv().await.unwrap(), HostEvent::VaraCommand {command,..} if command == "MYCALL N0CALL")
+        );
+        assert!(
+            matches!(events.recv().await.unwrap(), HostEvent::DataReceived {data,..} if data == [255,0])
+        );
+    }
+
+    async fn start_push_server() -> (
+        std::net::SocketAddr,
+        mpsc::Receiver<HostEvent>,
+        WsPush,
+        tokio::sync::broadcast::Sender<String>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = WebSocketServer::new(0).with_auth(test_auth());
+        let events = server.take_event_rx().unwrap();
+        let push = server.push_handle();
+        let broadcast = server.broadcast_sender();
+        tokio::spawn(async move {
+            server.run_with_listener(listener).await.unwrap();
+        });
+        (addr, events, push, broadcast)
+    }
+
+    #[tokio::test]
+    async fn reliable_events_reach_a_client_that_reads_slowly() {
+        let (addr, mut events, push, _) = start_push_server().await;
+        let (mut ws, _) = connect_test(client_request(&format!("ws://{addr}"), None, Some(TOKEN)))
+            .await
+            .unwrap();
+        expect_connected(&mut events).await;
+        for n in 0..200 {
+            push.push(&WsServerMessage::data_from_bytes(n.to_string().as_bytes()));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        for n in 0..200 {
+            let message = next_server_message(&mut ws, "client").await;
+            assert!(matches!(message, WsServerMessage::Data {data, ..} if data == n.to_string()));
+        }
+        println!("200 sent, 200 received, zero drops");
+    }
+
+    #[tokio::test]
+    async fn client_that_never_reads_is_disconnected() {
+        let (addr, mut events, push, _) = start_push_server().await;
+        let (_ws, _) = connect_test(client_request(&format!("ws://{addr}"), None, Some(TOKEN)))
+            .await
+            .unwrap();
+        let id = expect_connected(&mut events).await;
+        // Current-thread runtime cannot drain the queue during this synchronous burst.
+        for _ in 0..=RELIABLE_QUEUE_DEPTH {
+            push.push(&WsServerMessage::data_from_bytes(b"x"));
+        }
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, HostEvent::Disconnected {client_id} if client_id == id));
+        assert!(push.clients.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reliable_overflow_closes_socket_even_when_host_events_are_full() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = WebSocketServer::new(0).with_auth(test_auth());
+        let event_tx = server.event_sender();
+        let mut events = server.take_event_rx().unwrap();
+        let push = server.push_handle();
+        let task = tokio::spawn(async move {
+            server.run_with_listener(listener).await.unwrap();
+        });
+        let (mut ws, _) = connect_test(client_request(&format!("ws://{addr}"), None, Some(TOKEN)))
+            .await
+            .unwrap();
+        expect_connected(&mut events).await;
+        for _ in 0..256 {
+            event_tx
+                .try_send(HostEvent::Disconnected { client_id: 0 })
+                .unwrap();
+        }
+        for _ in 0..=RELIABLE_QUEUE_DEPTH {
+            push.push(&WsServerMessage::data_from_bytes(b"x"));
+        }
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+            .await
+            .unwrap();
+        assert!(
+            closed.is_none() || closed.is_some_and(|result| result.is_err()),
+            "transport must close without draining host events"
+        );
+        drop(events);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn reliable_overflow_closes_socket_during_startup() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = WebSocketServer::new(0).with_auth(test_auth());
+        let event_tx = server.event_sender();
+        let events = server.take_event_rx().unwrap();
+        let push = server.push_handle();
+        let task = tokio::spawn(async move {
+            server.run_with_listener(listener).await.unwrap();
+        });
+        // Block Connected before the server has written hello.
+        for _ in 0..256 {
+            event_tx
+                .try_send(HostEvent::Disconnected { client_id: 0 })
+                .unwrap();
+        }
+        let (mut ws, _) = tokio_tungstenite::connect_async(client_request(
+            &format!("ws://{addr}"),
+            None,
+            Some(TOKEN),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(push.clients.lock().unwrap().len(), 1);
+        for _ in 0..=RELIABLE_QUEUE_DEPTH {
+            push.push(&WsServerMessage::data_from_bytes(b"x"));
+        }
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+            .await
+            .unwrap();
+        assert!(
+            closed.is_none() || closed.is_some_and(|result| result.is_err()),
+            "transport must close without draining host events"
+        );
+        drop(events);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn reliable_send_after_client_disconnect_is_silent() {
+        let (addr, mut events, push, _) = start_push_server().await;
+        let (mut ws, _) = connect_test(client_request(&format!("ws://{addr}"), None, Some(TOKEN)))
+            .await
+            .unwrap();
+        let id = expect_connected(&mut events).await;
+        ws.close(None).await.unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, HostEvent::Disconnected {client_id} if client_id == id));
+        push.push(&WsServerMessage::data_from_bytes(b"x"));
+        assert!(push.clients.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn telemetry_lag_does_not_disconnect() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let (addr, mut events, _, broadcast) = start_push_server().await;
+        let (mut ws, _) = connect_test(client_request(&format!("ws://{addr}"), None, Some(TOKEN)))
+            .await
+            .unwrap();
+        expect_connected(&mut events).await;
+        ws.send(Message::Text(
+            r#"{"type":"spectrum","enabled":true,"id":1}"#.into(),
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            next_server_message(&mut ws, "client").await,
+            WsServerMessage::Ack { id: 1 }
+        ));
+        for timestamp_ms in 0..200 {
+            let json = serde_json::to_string(&WsServerMessage::Spectrum {
+                bins: vec![-90.0; 128],
+                timestamp_ms,
+                freq_low_hz: 350.0,
+                freq_high_hz: 5950.0,
+            })
+            .unwrap();
+            broadcast.send(json).unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(matches!(
+            next_server_message(&mut ws, "client").await,
+            WsServerMessage::Spectrum { .. }
+        ));
+        assert!(
+            events.try_recv().is_err(),
+            "telemetry lag must not disconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_is_opt_in_per_client() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let (addr, mut events, push, broadcast) = start_push_server().await;
+        let url = format!("ws://{addr}");
+        let (mut a, _) = connect_test(client_request(&url, None, Some(TOKEN)))
+            .await
+            .unwrap();
+        expect_connected(&mut events).await;
+        let (mut b, _) = connect_test(client_request(&url, None, Some(TOKEN)))
+            .await
+            .unwrap();
+        expect_connected(&mut events).await;
+        a.send(Message::Text(
+            r#"{"type":"log","enabled":true,"id":1}"#.into(),
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            next_server_message(&mut a, "client").await,
+            WsServerMessage::Ack { id: 1 }
+        ));
+        broadcast
+            .send(
+                serde_json::to_string(&WsServerMessage::Log {
+                    level: "info".into(),
+                    message: "decoded".into(),
+                    timestamp_ms: 1,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            matches!(next_server_message(&mut a, "client").await, WsServerMessage::Log {message,..} if message == "decoded")
+        );
+        // A correlated status request acts as a barrier after the filtered log.
+        b.send(Message::Text(r#"{"type":"status","id":2}"#.into()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_server_message(&mut b, "client").await,
+            WsServerMessage::Status { id: Some(2), .. }
+        ));
+        push.push(&WsServerMessage::data_from_bytes(b"canary"));
+        assert!(matches!(
+            next_server_message(&mut b, "client").await,
+            WsServerMessage::Data { .. }
+        ));
     }
 }

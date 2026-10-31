@@ -137,14 +137,17 @@ fn print_default_config() -> Result<()> {
 /// which falls back to `info` when absent or invalid.
 fn init_tracing(level: Option<LogLevel>) {
     let rust_log = std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(cli::log_filter(level, rust_log.as_deref()))
-        // The terminal check alone would override NO_COLOR; see `ansi_enabled`.
-        .with_ansi(logging::ansi_enabled(
-            std::io::stdout().is_terminal(),
-            std::env::var_os("NO_COLOR").as_deref(),
-        ))
-        .init();
+    use tracing_subscriber::prelude::*;
+    let format = tracing_subscriber::fmt::layer().with_ansi(logging::ansi_enabled(
+        std::io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+    ));
+    let subscriber = tracing_subscriber::registry()
+        .with(cli::log_filter(level, rust_log.as_deref()))
+        .with(format);
+    #[cfg(feature = "websocket")]
+    let subscriber = subscriber.with(ws_log::WsLogLayer::global().clone());
+    subscriber.init();
 }
 
 fn log_banner() {
@@ -629,8 +632,10 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
             });
         }
 
-        // Wire broadcast sender so the event loop can forward decoded data to WS clients
+        // Wire separate telemetry and reliable data/state paths.
         event_loop.set_ws_broadcast(ws_server.broadcast_sender());
+        event_loop.set_ws_push(ws_server.push_handle());
+        ws_log::WsLogLayer::global().set_sender(ws_server.broadcast_sender());
         // Wire the live status snapshot so `status` replies carry real values
         // (decision 8, Phase 3 Task 7).
         event_loop.set_ws_status(ws_server.status());
@@ -907,3 +912,6 @@ fn open_output(
             )
         })
 }
+
+#[cfg(feature = "websocket")]
+mod ws_log;

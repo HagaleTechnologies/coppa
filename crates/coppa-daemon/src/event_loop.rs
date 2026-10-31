@@ -686,6 +686,14 @@ pub struct EventLoop {
     /// Optional WebSocket broadcast sender for forwarding decoded data.
     #[cfg(feature = "websocket")]
     ws_broadcast: Option<tokio::sync::broadcast::Sender<String>>,
+    #[cfg(feature = "websocket")]
+    ws_push: Option<coppa_host::websocket::WsPush>,
+    #[cfg(feature = "websocket")]
+    ws_heard: Vec<coppa_host::websocket::HeardStation>,
+    #[cfg(feature = "websocket")]
+    ws_decode_fail_count: u64,
+    #[cfg(feature = "websocket")]
+    ws_last_decode_fail: Option<Instant>,
     /// Optional shared live-status snapshot for the WebSocket `status` reply
     /// (decision 8: "WebSocket `status` reply carries real values"). Updated
     /// alongside VARA telemetry whenever a frame decodes and at every session
@@ -986,6 +994,14 @@ impl EventLoop {
             probe_state: None,
             #[cfg(feature = "websocket")]
             ws_broadcast: None,
+            #[cfg(feature = "websocket")]
+            ws_push: None,
+            #[cfg(feature = "websocket")]
+            ws_heard: Vec::new(),
+            #[cfg(feature = "websocket")]
+            ws_decode_fail_count: 0,
+            #[cfg(feature = "websocket")]
+            ws_last_decode_fail: None,
             #[cfg(feature = "websocket")]
             ws_status: None,
             vara_responses: None,
@@ -1419,10 +1435,44 @@ impl EventLoop {
         self.response_tx = Some(tx);
     }
 
-    /// Set the WebSocket broadcast sender for forwarding decoded data to WS clients.
+    /// Set the disposable WebSocket telemetry sender. Data/state use `set_ws_push`.
     #[cfg(feature = "websocket")]
     pub fn set_ws_broadcast(&mut self, tx: tokio::sync::broadcast::Sender<String>) {
         self.ws_broadcast = Some(tx);
+    }
+
+    /// Attach the reliable WebSocket data and state delivery path.
+    #[cfg(feature = "websocket")]
+    pub fn set_ws_push(&mut self, push: coppa_host::websocket::WsPush) {
+        self.ws_push = Some(push);
+    }
+
+    #[cfg(feature = "websocket")]
+    fn ws_push_reliable(&self, msg: coppa_host::websocket::WsServerMessage) {
+        if let Some(push) = &self.ws_push {
+            push.push(&msg);
+        }
+    }
+
+    #[cfg(feature = "websocket")]
+    fn ws_decode_failure(&mut self) {
+        self.ws_decode_fail_count = self.ws_decode_fail_count.saturating_add(1);
+        if self
+            .ws_last_decode_fail
+            .is_some_and(|last| last.elapsed() < Duration::from_millis(500))
+        {
+            return;
+        }
+        self.ws_last_decode_fail = Some(Instant::now());
+        if let Some(tx) = &self.ws_broadcast {
+            let msg = coppa_host::websocket::WsServerMessage::DecodeFail {
+                count: self.ws_decode_fail_count,
+                timestamp_ms: crate::ws_log::timestamp_ms(),
+            };
+            if let Ok(json) = serde_json::to_string(&msg) {
+                let _ = tx.send(json);
+            }
+        }
     }
 
     /// Set the shared live-status snapshot the WebSocket server's `status` reply
@@ -1484,6 +1534,19 @@ impl EventLoop {
     /// one that stops reading is disconnected rather than skipped
     /// (`broadcast_vara`), so a state line is never lost on an open connection.
     async fn emit_vara(&self, response: VaraResponse) {
+        #[cfg(feature = "websocket")]
+        {
+            use coppa_host::websocket::WsServerMessage;
+            let msg = match &response {
+                VaraResponse::Ptt(state) => Some(WsServerMessage::Ptt { state: *state }),
+                VaraResponse::Busy(state) => Some(WsServerMessage::Busy { state: *state }),
+                VaraResponse::Snr(db) => Some(WsServerMessage::Snr { db: *db }),
+                _ => None,
+            };
+            if let Some(msg) = msg {
+                self.ws_push_reliable(msg);
+            }
+        }
         if let Some(ref senders) = self.vara_responses {
             broadcast_vara(senders, response).await;
         }
@@ -1556,7 +1619,7 @@ impl EventLoop {
 
     /// Call after `session_mgr` reflects the change. Broadcasts to all hosts:
     /// session state is link-wide; every attached host wants it.
-    async fn notify_session(&self, client_id: u32, notice: SessionNotice) {
+    async fn notify_session(&mut self, client_id: u32, notice: SessionNotice) {
         let (status, vara) = match &notice {
             SessionNotice::Connected {
                 local,
@@ -1657,15 +1720,36 @@ impl EventLoop {
         }
         #[cfg(feature = "websocket")]
         {
+            use coppa_host::websocket::{HeardStation, SessionState, WsServerMessage};
             let msg = match notice {
                 SessionNotice::Connected { remote, .. } => {
-                    coppa_host::websocket::WsServerMessage::Connected {
-                        remote_call: remote.to_string(),
+                    let call = remote.to_string();
+                    self.ws_heard.retain(|station| station.call != call);
+                    let (snr_db, level) = if let Some(status) = &self.ws_status {
+                        let snapshot = status.lock().await;
+                        (snapshot.snr, snapshot.level)
+                    } else {
+                        (None, None)
+                    };
+                    self.ws_heard.insert(
+                        0,
+                        HeardStation {
+                            call: call.clone(),
+                            last_heard_ms: crate::ws_log::timestamp_ms(),
+                            snr_db,
+                            level,
+                        },
+                    );
+                    self.ws_heard.truncate(32);
+                    WsServerMessage::Session {
+                        state: SessionState::Connected,
+                        remote_call: Some(call),
                     }
                 }
-                SessionNotice::Disconnected => coppa_host::websocket::WsServerMessage::Disconnected,
-                // The WebSocket API has no LISTEN, so it never takes part in
-                // an inbound attempt.
+                SessionNotice::Disconnected => WsServerMessage::Session {
+                    state: SessionState::Disconnected,
+                    remote_call: None,
+                },
                 SessionNotice::Pending { .. } | SessionNotice::PendingCancelled => return,
             };
             let remote = self.established_remote();
@@ -1674,11 +1758,10 @@ impl EventLoop {
                 snap.connected = remote.is_some();
                 snap.remote_call = remote.map(|cs| cs.to_string());
             }
-            if let Some(ref ws_tx) = self.ws_broadcast {
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    let _ = ws_tx.send(json); // An error means no client is subscribed.
-                }
-            }
+            self.ws_push_reliable(msg);
+            self.ws_push_reliable(WsServerMessage::Heard {
+                stations: self.ws_heard.clone(),
+            });
         }
     }
 
@@ -3586,16 +3669,24 @@ impl EventLoop {
         }
         self.last_spectrum_broadcast = Instant::now();
 
+        let (freq_low_hz, freq_high_hz) = self.engine.occupied_band_edges_hz();
         let bins = crate::spectrum::compute_spectrum_bins(
             &self.spectrum_sensor,
             &self.spectrum_buffer,
             self.engine.config().sample_rate as f32,
+            freq_low_hz,
+            freq_high_hz,
         );
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let msg = coppa_host::websocket::WsServerMessage::Spectrum { bins, timestamp_ms };
+        let msg = coppa_host::websocket::WsServerMessage::Spectrum {
+            bins,
+            timestamp_ms,
+            freq_low_hz,
+            freq_high_hz,
+        };
         if let Ok(json) = serde_json::to_string(&msg) {
             let _ = ws_tx.send(json);
         }
@@ -3747,6 +3838,11 @@ impl EventLoop {
                             }
                         }
                     }
+
+                    #[cfg(feature = "websocket")]
+                    self.ws_push_reliable(coppa_host::websocket::WsServerMessage::Level {
+                        level: speed_level,
+                    });
 
                     // WebSocket `status` reply: keep the live snapshot current
                     // (decision 8: "connected, snr, level, cfo").
@@ -3971,13 +4067,7 @@ impl EventLoop {
 
                     if !output_data.is_empty() {
                         tracing::info!(bytes = output_data.len(), "Frame decoded successfully");
-                        self.deliver_to_host(output_data.clone());
-                        // Forward to WebSocket broadcast channel
-                        #[cfg(feature = "websocket")]
-                        if let Some(ref ws_tx) = self.ws_broadcast {
-                            let text = String::from_utf8_lossy(&output_data).into_owned();
-                            let _ = ws_tx.send(text);
-                        }
+                        self.deliver_to_host(output_data);
                     }
                     // Closed-loop rate adaptation (Phase 3 Task 4) is wired: `self.
                     // rate_loop` (`coppa_ml::RateLoop`) is fed from the peer's ACK-carried
@@ -3993,6 +4083,8 @@ impl EventLoop {
                         frame_start = frame.frame_start,
                         "Streaming frame failed to decode"
                     );
+                    #[cfg(feature = "websocket")]
+                    self.ws_decode_failure();
                 }
             }
         }
@@ -5742,10 +5834,15 @@ impl EventLoop {
     }
 
     /// Send a decoded payload to every data-port client (`client_id` 0) through
-    /// `response_tx`. The queue is unbounded, so this never waits and never
-    /// drops; with no queue wired (no VARA server) it does nothing. It fails
-    /// only when the bridge draining the queue has stopped.
+    /// `response_tx`, and to WebSocket clients through their reliable queues.
+    /// The data-port queue is unbounded and never waits; its bridge can fail
+    /// if stopped. WebSocket overflow disconnects the affected client.
+    /// Either delivery path works without the other being wired.
     fn deliver_to_host(&self, data: Vec<u8>) {
+        #[cfg(feature = "websocket")]
+        self.ws_push_reliable(coppa_host::websocket::WsServerMessage::data_from_bytes(
+            &data,
+        ));
         if let Some(ref tx) = self.response_tx {
             if tx
                 .send(HostResponse::DataOut { client_id: 0, data })
@@ -5972,6 +6069,175 @@ impl EventLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "websocket")]
+    type WsClient = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    #[cfg(feature = "websocket")]
+    async fn connect_ws(station: &mut EventLoop) -> (WsClient, tokio::task::JoinHandle<()>) {
+        use coppa_host::websocket::{WebSocketServer, WsAuth};
+        use futures_util::StreamExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server =
+            WebSocketServer::new(port).with_auth(WsAuth::new("test-token", Vec::<String>::new()));
+        station.set_ws_push(server.push_handle());
+        station.set_ws_broadcast(server.broadcast_sender());
+        station.set_ws_status(server.status());
+        let task = tokio::spawn(async move {
+            server.run_with_listener(listener).await.unwrap();
+        });
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/?token=test-token"))
+                .await
+                .unwrap();
+        let hello = ws.next().await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(hello.to_text().unwrap()).unwrap()["type"],
+            "hello"
+        );
+        (ws, task)
+    }
+
+    #[cfg(feature = "websocket")]
+    async fn next_ws_type(ws: &mut WsClient, kind: &str) -> serde_json::Value {
+        use futures_util::StreamExt;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let message = ws.next().await.unwrap().unwrap();
+                let value: serde_json::Value =
+                    serde_json::from_str(message.to_text().unwrap()).unwrap();
+                if value["type"] == kind {
+                    return value;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn websocket_data_is_valid_json_with_encoding() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (mut ws, task) = connect_ws(&mut station).await;
+        let core = coppa_engine::CoppaCore::new();
+        for (bytes, encoding, expected) in [
+            (b"hello dashboard".as_slice(), "utf8", "hello dashboard"),
+            ([0xff, 0x00].as_slice(), "base64", "/wA="),
+        ] {
+            let samples = core.encode_bytes(bytes).unwrap();
+            station
+                .decode_and_dispatch_audio(&with_lead_and_trail(&samples))
+                .await;
+            let data = next_ws_type(&mut ws, "data").await;
+            println!("{data}");
+            assert_eq!(data["encoding"], encoding);
+            assert_eq!(data["data"], expected);
+        }
+        task.abort();
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn websocket_session_data_is_delivered_once_with_encoding() {
+        use futures_util::StreamExt;
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
+        let (mut ws, task) = connect_ws(&mut b).await;
+        // No VARA response bridge is wired: WebSocket delivery is independent.
+        for (bytes, encoding, expected) in [
+            (b"session dashboard".as_slice(), "utf8", "session dashboard"),
+            ([0xff, 0x00].as_slice(), "base64", "/wA="),
+        ] {
+            a.handle_host_event(HostEvent::DataReceived {
+                client_id: 1,
+                data: bytes.to_vec(),
+            })
+            .await;
+            let frame = take_leg(&mut a_consumer, "session data");
+            unstick_decoder(&mut b);
+            b.decode_and_dispatch_audio(&frame).await;
+            let data = next_ws_type(&mut ws, "data").await;
+            assert_eq!(data["encoding"], encoding);
+            assert_eq!(data["data"], expected);
+            take_leg(&mut b_consumer, "first ACK, discarded");
+            b.handle_ptt_change(false).await;
+            unstick_decoder(&mut b);
+            b.decode_and_dispatch_audio(&frame).await;
+            let ack = take_leg(&mut b_consumer, "duplicate ACK");
+            unstick_decoder(&mut a);
+            a.decode_and_dispatch_audio(&ack).await;
+            assert_eq!(a.session_link.as_ref().unwrap().tx.in_flight(), 0);
+            a.handle_ptt_change(false).await;
+            b.handle_ptt_change(false).await;
+        }
+        // Drain telemetry as well, so a duplicate data event cannot hide behind it.
+        assert!(tokio::time::timeout(Duration::from_millis(300), async {
+            while let Some(message) = ws.next().await {
+                let message = message.unwrap();
+                let value: serde_json::Value =
+                    serde_json::from_str(message.to_text().unwrap()).unwrap();
+                assert_ne!(value["type"], "data", "duplicate session payload");
+            }
+        })
+        .await
+        .is_err());
+        task.abort();
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn websocket_hears_ptt_busy_snr_level() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (mut ws, task) = connect_ws(&mut station).await;
+        station.set_ptt(true).await;
+        assert_eq!(next_ws_type(&mut ws, "ptt").await["state"], true);
+        station.set_ptt(false).await;
+        assert_eq!(next_ws_type(&mut ws, "ptt").await["state"], false);
+        station.emit_vara(VaraResponse::Busy(true)).await;
+        assert_eq!(next_ws_type(&mut ws, "busy").await["state"], true);
+        let core = coppa_engine::CoppaCore::new();
+        let samples = core.encode("telemetry").unwrap();
+        station
+            .decode_and_dispatch_audio(&with_lead_and_trail(&samples))
+            .await;
+        assert!(next_ws_type(&mut ws, "snr").await["db"].is_number());
+        assert_eq!(next_ws_type(&mut ws, "level").await["level"], 1);
+        task.abort();
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn websocket_mycall_sets_local_callsign() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        station
+            .handle_host_event(HostEvent::VaraCommand {
+                client_id: coppa_host::websocket::FIRST_CLIENT_ID,
+                command: "MYCALL N0CALL".into(),
+            })
+            .await;
+        assert_eq!(station.local_callsign.unwrap().to_string(), "N0CALL");
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn websocket_decode_fail_is_rate_limited_aggregate() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        station.set_ws_broadcast(tx);
+        for _ in 0..6 {
+            station.ws_decode_failure();
+        }
+        let first: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(first["count"], 1);
+        assert!(rx.try_recv().is_err());
+        station.ws_last_decode_fail = Some(Instant::now() - Duration::from_millis(501));
+        station.ws_decode_failure();
+        let next: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(next["count"], 7);
+    }
 
     /// COP-37: a valid callsign for stations that must transmit. A daemon
     /// with no valid callsign refuses every transmission, so receive-only
@@ -10191,6 +10457,58 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn spectrum_message_carries_engine_bounds() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(16);
+        station.set_ws_broadcast(sender);
+        let samples = vec![0.01; crate::spectrum::SPECTRUM_FFT_SIZE];
+        for (band, expected_high) in [
+            (coppa_engine::OfdmBand::Vhf, 5950.0),
+            (coppa_engine::OfdmBand::Hf, 2750.0),
+        ] {
+            station.engine.set_ofdm_band(band).unwrap();
+            station.last_spectrum_broadcast = Instant::now() - Duration::from_secs(1);
+            station.maybe_broadcast_spectrum(&samples);
+            let value: serde_json::Value =
+                serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+            println!("spectrum bounds 350/{expected_high}");
+            assert_eq!(value["freq_low_hz"], 350.0);
+            assert_eq!(value["freq_high_hz"], expected_high);
+            assert_eq!(value["bins"].as_array().unwrap().len(), 128);
+        }
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn websocket_heard_snapshot_on_session() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (mut ws, task) = connect_ws(&mut station).await;
+        for number in 0..34 {
+            station
+                .notify_session(
+                    1,
+                    SessionNotice::Connected {
+                        local: Callsign::new("N0CALL").unwrap(),
+                        remote: Callsign::new(&format!("W1A{number}")).unwrap(),
+                        we_called: true,
+                    },
+                )
+                .await;
+            let heard = next_ws_type(&mut ws, "heard").await;
+            assert_eq!(
+                heard["stations"].as_array().unwrap().len(),
+                (number + 1).min(32)
+            );
+            assert_eq!(heard["stations"][0]["call"], format!("W1A{number}"));
+        }
+        station.notify_session(1, SessionNotice::Disconnected).await;
+        let heard = next_ws_type(&mut ws, "heard").await;
+        assert_eq!(heard["stations"].as_array().unwrap().len(), 32);
+        task.abort();
+    }
+
     // ── COP-65: RX/TX audio level metering ────────────────────────────────
 
     /// One `audio_level` message, as the broadcast channel carried it.
@@ -12123,7 +12441,7 @@ mod tests {
 
         #[tokio::test]
         async fn slow_host_receives_disconnected_behind_a_busy_backlog() {
-            let (event_loop, _senders, mut rx) = slow_host();
+            let (mut event_loop, _senders, mut rx) = slow_host();
             for _ in 0..coppa_host::vara::TELEMETRY_QUEUE_DEPTH {
                 event_loop.emit_vara(VaraResponse::Busy(true)).await;
             }
@@ -13086,8 +13404,8 @@ mod tests {
 
         /// COP-28: a WebSocket-originated event (whose client ID is from
         /// `coppa_host::websocket::FIRST_CLIENT_ID`'s range) must never draw
-        /// an OK/WRONG reply on a VARA command-port socket, and the WS
-        /// `mycall` message stays a no-op.
+        /// an OK/WRONG reply on a VARA command-port socket. The translated
+        /// WebSocket `mycall` command still sets this station's callsign.
         #[cfg(feature = "websocket")]
         #[tokio::test]
         async fn websocket_ids_never_draw_a_vara_reply() {
@@ -13099,7 +13417,7 @@ mod tests {
             station
                 .handle_host_event(HostEvent::VaraCommand {
                     client_id: FIRST_CLIENT_ID,
-                    command: r#"{"type":"mycall","callsign":"W5AU"}"#.to_string(),
+                    command: "MYCALL W5AU".to_string(),
                 })
                 .await;
             station
@@ -13112,8 +13430,8 @@ mod tests {
 
             assert_eq!(
                 station.local_callsign,
-                Some(Callsign::new("VK3ABC").unwrap()),
-                "the WS mycall message must stay a no-op"
+                Some(Callsign::new("W5AU").unwrap()),
+                "the translated WS mycall command sets the callsign"
             );
             let lines = read_available_lines(&mut reader).await;
             assert!(
@@ -13159,26 +13477,9 @@ mod tests {
         #[cfg(feature = "websocket")]
         #[tokio::test]
         async fn websocket_hears_connected_and_disconnected_and_status_follows() {
-            use coppa_host::websocket::{WsServerMessage, WsStatus};
-            // The same channel carries COP-65 `audio_level` messages (one per
-            // transmission the connect/disconnect handshake makes); only the
-            // session pushes count here.
-            fn next_session_push(
-                rx: &mut tokio::sync::broadcast::Receiver<String>,
-            ) -> Option<WsServerMessage> {
-                while let Ok(json) = rx.try_recv() {
-                    let msg: WsServerMessage = serde_json::from_str(&json).unwrap();
-                    if !matches!(msg, WsServerMessage::AudioLevel { .. }) {
-                        return Some(msg);
-                    }
-                }
-                None
-            }
             let mut station = EventLoop::new(session_config()).unwrap();
-            let (tx, mut rx) = tokio::sync::broadcast::channel(16);
-            let status = Arc::new(Mutex::new(WsStatus::default()));
-            station.set_ws_broadcast(tx);
-            station.set_ws_status(status.clone());
+            let (mut ws, task) = connect_ws(&mut station).await;
+            let status = station.ws_status.clone().unwrap();
             station
                 .handle_host_event(HostEvent::ConnectRequest {
                     client_id: 1,
@@ -13191,25 +13492,26 @@ mod tests {
                 .handle_connect_req(&LinkCapabilities::default().to_bytes())
                 .unwrap();
             station.handle_mac_pdu(ack).await;
-            let msg = next_session_push(&mut rx).expect("connected push");
-            assert!(
-                matches!(msg, WsServerMessage::Connected { remote_call } if remote_call == "W1AW")
-            );
+            let msg = next_ws_type(&mut ws, "session").await;
+            println!("{msg}");
+            assert_eq!(msg["state"], "connected");
+            assert_eq!(msg["remote_call"], "W1AW");
+            let heard = next_ws_type(&mut ws, "heard").await;
+            assert_eq!(heard["stations"][0]["call"], "W1AW");
+            assert!(heard["stations"][0]["last_heard_ms"].as_u64().unwrap() > 0);
             {
                 let snap = status.lock().await;
                 assert!(snap.connected);
                 assert_eq!(snap.remote_call.as_deref(), Some("W1AW"));
             }
             station.handle_mac_pdu(remote.disconnect().unwrap()).await;
-            let msg = next_session_push(&mut rx).expect("disconnected push");
-            assert!(matches!(msg, WsServerMessage::Disconnected));
+            let msg = next_ws_type(&mut ws, "session").await;
+            println!("{msg}");
+            assert_eq!(msg["state"], "disconnected");
             let snap = status.lock().await;
             assert!(!snap.connected);
             assert_eq!(snap.remote_call, None);
-            assert!(
-                next_session_push(&mut rx).is_none(),
-                "exactly one push per transition"
-            );
+            task.abort();
         }
 
         /// Zero-lead/trail-padded encode, mirroring `coppa-engine`'s own streaming

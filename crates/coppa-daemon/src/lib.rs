@@ -24,3 +24,6 @@ pub mod startup_report;
 pub mod tnc;
 pub mod tx_chunker;
 pub mod vara_wiring;
+
+#[cfg(feature = "websocket")]
+pub mod ws_log;
