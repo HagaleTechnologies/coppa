@@ -108,7 +108,7 @@ impl VaraServer {
     /// This spawns accept loops on both ports that dispatch incoming
     /// connections to the appropriate handler. Runs until the returned
     /// shutdown sender is dropped or triggered.
-    pub async fn run(&self) -> anyhow::Result<()> {
+    pub async fn run(&self) -> Result<(), crate::HostError> {
         let cmd_addr = format!("{}:{}", self.bind_addr, self.command_port);
         let data_addr = format!("{}:{}", self.bind_addr, self.data_port);
 
@@ -130,7 +130,7 @@ impl VaraServer {
         &self,
         cmd_listener: TcpListener,
         data_listener: TcpListener,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), crate::HostError> {
         let event_tx = self.event_tx.clone();
         let next_cmd_id = &self.next_cmd_client_id;
         let next_data_id = &self.next_data_client_id;

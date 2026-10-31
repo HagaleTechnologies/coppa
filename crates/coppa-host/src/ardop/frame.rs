@@ -6,7 +6,7 @@
 //! payload, and TNC→host frames add a 3-byte ASCII tag (`ARQ`/`FEC`/`ERR`/
 //! `IDF`) after the length, with `len` counting the tag plus the payload.
 
-use anyhow::{anyhow, Result};
+use crate::HostError;
 use tokio::io::AsyncReadExt;
 
 /// Largest frame the decoder will read: the whole `u16` length space. The
@@ -19,9 +19,11 @@ pub const ARQ_TAG: &[u8; 3] = b"ARQ";
 
 /// Encode one host→TNC frame: `<len:u16 BE><payload>`, `len` = payload
 /// length.
-pub fn encode_host_frame(payload: &[u8]) -> Result<Vec<u8>> {
-    let length =
-        u16::try_from(payload.len()).map_err(|_| anyhow!("host frame exceeds MAX_FRAME"))?;
+pub fn encode_host_frame(payload: &[u8]) -> Result<Vec<u8>, HostError> {
+    let length = u16::try_from(payload.len()).map_err(|_| HostError::HostFrameTooLarge {
+        len: payload.len(),
+        max: MAX_FRAME,
+    })?;
     let mut frame = Vec::with_capacity(2 + payload.len());
     frame.extend_from_slice(&length.to_be_bytes());
     frame.extend_from_slice(payload);
@@ -30,9 +32,12 @@ pub fn encode_host_frame(payload: &[u8]) -> Result<Vec<u8>> {
 
 /// Encode one TNC→host frame: `<len:u16 BE><tag:3><payload>`, `len` =
 /// 3 + payload length.
-pub fn encode_tnc_frame(tag: &[u8; 3], payload: &[u8]) -> Result<Vec<u8>> {
+pub fn encode_tnc_frame(tag: &[u8; 3], payload: &[u8]) -> Result<Vec<u8>, HostError> {
     if payload.len() > MAX_FRAME - tag.len() {
-        return Err(anyhow!("TNC frame exceeds MAX_FRAME"));
+        return Err(HostError::TncFrameTooLarge {
+            len: payload.len(),
+            max: MAX_FRAME - tag.len(),
+        });
     }
     let mut frame = Vec::with_capacity(2 + 3 + payload.len());
     frame.extend_from_slice(&((3 + payload.len()) as u16).to_be_bytes());
@@ -44,33 +49,39 @@ pub fn encode_tnc_frame(tag: &[u8; 3], payload: &[u8]) -> Result<Vec<u8>> {
 /// Decode one TNC→host frame's parts from `bytes`: the tag and the payload
 /// after byte 5 (Pat's `frame.go` semantics: `dataType: string(data[2:5])`,
 /// `data: data[5:]`).
-pub fn decode_tnc_frame(bytes: &[u8]) -> Result<(&str, &[u8])> {
+pub fn decode_tnc_frame(bytes: &[u8]) -> Result<(&str, &[u8]), HostError> {
     if bytes.len() < 2 {
-        return Err(anyhow!("truncated frame: no length prefix"));
+        return Err(HostError::MissingLengthPrefix);
     }
     let len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
     if len < 3 {
-        return Err(anyhow!("frame length {len} carries no tag"));
+        return Err(HostError::MissingTag { len });
     }
     if bytes.len() != 2 + len {
-        return Err(anyhow!(
-            "frame length {len} does not match the {} bytes present",
-            bytes.len() - 2
-        ));
+        return Err(HostError::FrameLengthMismatch {
+            declared: len,
+            actual: bytes.len() - 2,
+        });
     }
-    let tag = std::str::from_utf8(&bytes[2..5]).map_err(|e| anyhow!("bad tag: {e}"))?;
+    let tag =
+        std::str::from_utf8(&bytes[2..5]).map_err(|e| HostError::InvalidTagUtf8 { source: e })?;
     Ok((tag, &bytes[5..]))
 }
 
 /// Read exactly one host→TNC frame from `reader`: the 2-byte big-endian
 /// length, then exactly that many payload bytes. A stream that ends mid-frame
 /// is an error, never a half-delivered payload.
-pub async fn read_host_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
+pub async fn read_host_frame<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> Result<Vec<u8>, HostError> {
     let mut prefix = [0u8; 2];
     reader.read_exact(&mut prefix).await?;
     let len = u16::from_be_bytes(prefix) as usize;
     if len > MAX_FRAME {
-        return Err(anyhow!("frame length {len} exceeds MAX_FRAME"));
+        return Err(HostError::FrameTooLarge {
+            len,
+            max: MAX_FRAME,
+        });
     }
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload).await?;
@@ -107,7 +118,9 @@ mod tests {
         );
         // The partial third frame errors (truncated mid-payload), never
         // half-delivers.
-        assert!(read_host_frame(&mut stream).await.is_err());
+        assert!(
+            matches!(read_host_frame(&mut stream).await, Err(HostError::Io(source)) if source.kind() == std::io::ErrorKind::UnexpectedEof)
+        );
     }
 
     /// TNC→host frames carry the 3-byte ASCII tag after the length;
@@ -135,8 +148,12 @@ mod tests {
     #[test]
     fn oversized_frame_is_rejected() {
         assert_eq!(MAX_FRAME, u16::MAX as usize);
-        assert!(encode_host_frame(&vec![0; MAX_FRAME + 1]).is_err());
-        assert!(encode_tnc_frame(ARQ_TAG, &vec![0; MAX_FRAME - 2]).is_err());
+        assert!(
+            matches!(encode_host_frame(&vec![0; MAX_FRAME + 1]), Err(HostError::HostFrameTooLarge { len, max }) if len == MAX_FRAME + 1 && max == MAX_FRAME)
+        );
+        assert!(
+            matches!(encode_tnc_frame(ARQ_TAG, &vec![0; MAX_FRAME - 2]), Err(HostError::TncFrameTooLarge { len, max }) if len == MAX_FRAME - 2 && max == MAX_FRAME - 3)
+        );
         // len counts tag+payload, so the largest expressible TNC frame is
         // 65535 bytes total — bounded by construction.
         let frame = encode_tnc_frame(ARQ_TAG, &[0u8; MAX_FRAME - 3]).unwrap();

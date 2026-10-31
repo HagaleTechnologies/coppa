@@ -1361,7 +1361,8 @@ impl EventLoop {
             .available_speed_levels()
             .last()
             .map_or(level, |&max| level.min(max));
-        self.engine.set_speed_level(level)
+        self.engine.set_speed_level(level)?;
+        Ok(())
     }
 
     /// COP-32: conditions found while starting that leave the daemon running

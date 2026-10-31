@@ -1,5 +1,5 @@
 //! BPSK (Binary Phase Shift Keying) modem and constellation mapper.
-use anyhow::Result;
+use crate::CodecError;
 use num_complex::Complex32;
 use std::f32::consts::PI;
 
@@ -136,7 +136,7 @@ impl BpskModem {
 }
 
 impl Modem for BpskModem {
-    fn modulate(&self, bits: &[u8]) -> Result<Vec<f32>> {
+    fn modulate(&self, bits: &[u8]) -> Result<Vec<f32>, CodecError> {
         // Differential encoding: d[n] = b[n] XOR d[n-1]
         // This resolves 180-degree Costas loop phase ambiguity at the modem level.
         // Prepend a reference symbol (0 → +1) so that after soft differential
@@ -176,7 +176,7 @@ impl Modem for BpskModem {
         Ok(samples)
     }
 
-    fn demodulate_soft(&mut self, samples: &[f32]) -> Result<Vec<f32>> {
+    fn demodulate_soft(&mut self, samples: &[f32]) -> Result<Vec<f32>, CodecError> {
         if samples.is_empty() {
             return Ok(Vec::new());
         }

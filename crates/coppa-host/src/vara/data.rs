@@ -1,6 +1,6 @@
 //! VARA data port handler (TCP port 8301).
 
-use anyhow::Result;
+use crate::HostError;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -61,7 +61,7 @@ impl VaraDataPort {
         client_id: u32,
         event_tx: mpsc::Sender<HostEvent>,
         mut data_rx: mpsc::Receiver<Vec<u8>>,
-    ) -> Result<()> {
+    ) -> Result<(), HostError> {
         let (mut reader, mut writer) = stream.into_split();
 
         let event_tx_clone = event_tx.clone();
