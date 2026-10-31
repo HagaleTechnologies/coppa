@@ -3958,11 +3958,7 @@ impl EventLoop {
 
                     if !output_data.is_empty() {
                         tracing::info!(bytes = output_data.len(), "Frame decoded successfully");
-                        self.deliver_to_host(output_data.clone());
-                        #[cfg(feature = "websocket")]
-                        self.ws_push_reliable(
-                            coppa_host::websocket::WsServerMessage::data_from_bytes(&output_data),
-                        );
+                        self.deliver_to_host(output_data);
                     }
                     // Closed-loop rate adaptation (Phase 3 Task 4) is wired: `self.
                     // rate_loop` (`coppa_ml::RateLoop`) is fed from the peer's ACK-carried
@@ -5729,10 +5725,15 @@ impl EventLoop {
     }
 
     /// Send a decoded payload to every data-port client (`client_id` 0) through
-    /// `response_tx`. The queue is unbounded, so this never waits and never
-    /// drops; with no queue wired (no VARA server) it does nothing. It fails
-    /// only when the bridge draining the queue has stopped.
+    /// `response_tx`, and to WebSocket clients through their reliable queues.
+    /// The data-port queue is unbounded and never waits; its bridge can fail
+    /// if stopped. WebSocket overflow disconnects the affected client.
+    /// Either delivery path works without the other being wired.
     fn deliver_to_host(&self, data: Vec<u8>) {
+        #[cfg(feature = "websocket")]
+        self.ws_push_reliable(coppa_host::websocket::WsServerMessage::data_from_bytes(
+            &data,
+        ));
         if let Some(ref tx) = self.response_tx {
             if tx
                 .send(HostResponse::DataOut { client_id: 0, data })
@@ -6027,6 +6028,53 @@ mod tests {
             assert_eq!(data["encoding"], encoding);
             assert_eq!(data["data"], expected);
         }
+        task.abort();
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn websocket_session_data_is_delivered_once_with_encoding() {
+        use futures_util::StreamExt;
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
+        let (mut ws, task) = connect_ws(&mut b).await;
+        // No VARA response bridge is wired: WebSocket delivery is independent.
+        for (bytes, encoding, expected) in [
+            (b"session dashboard".as_slice(), "utf8", "session dashboard"),
+            ([0xff, 0x00].as_slice(), "base64", "/wA="),
+        ] {
+            a.handle_host_event(HostEvent::DataReceived {
+                client_id: 1,
+                data: bytes.to_vec(),
+            })
+            .await;
+            let frame = take_leg(&mut a_consumer, "session data");
+            unstick_decoder(&mut b);
+            b.decode_and_dispatch_audio(&frame).await;
+            let data = next_ws_type(&mut ws, "data").await;
+            assert_eq!(data["encoding"], encoding);
+            assert_eq!(data["data"], expected);
+            take_leg(&mut b_consumer, "first ACK, discarded");
+            b.handle_ptt_change(false).await;
+            unstick_decoder(&mut b);
+            b.decode_and_dispatch_audio(&frame).await;
+            let ack = take_leg(&mut b_consumer, "duplicate ACK");
+            unstick_decoder(&mut a);
+            a.decode_and_dispatch_audio(&ack).await;
+            assert_eq!(a.session_link.as_ref().unwrap().tx.in_flight(), 0);
+            a.handle_ptt_change(false).await;
+            b.handle_ptt_change(false).await;
+        }
+        // Drain telemetry as well, so a duplicate data event cannot hide behind it.
+        assert!(tokio::time::timeout(Duration::from_millis(300), async {
+            while let Some(message) = ws.next().await {
+                let message = message.unwrap();
+                let value: serde_json::Value =
+                    serde_json::from_str(message.to_text().unwrap()).unwrap();
+                assert_ne!(value["type"], "data", "duplicate session payload");
+            }
+        })
+        .await
+        .is_err());
         task.abort();
     }
 

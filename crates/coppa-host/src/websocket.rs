@@ -734,9 +734,15 @@ impl WebSocketServer {
                 );
                 tracing::info!(client_id, %peer, "WebSocket client connected");
 
+                let (mut sink, mut ws_stream) = ws.split();
+                // Overflow must cancel every wait after registration, including
+                // host notification and the first socket write.
+                tokio::select! {
+                    biased;
+                    _ = close_rx.changed() => {},
+                    _ = async {
                 let _ = event_tx.send(HostEvent::Connected { client_id }).await;
 
-                let (mut sink, mut ws_stream) = ws.split();
                 let hello = serde_json::to_string(&WsServerMessage::Hello {
                     version: PROTOCOL_VERSION,
                     server: format!("coppa {}", env!("CARGO_PKG_VERSION")),
@@ -747,10 +753,6 @@ impl WebSocketServer {
                     .await
                     .is_err()
                 {
-                    clients.lock().unwrap().remove(&client_id);
-                    drop(sink);
-                    drop(ws_stream);
-                    let _ = event_tx.send(HostEvent::Disconnected { client_id }).await;
                     return;
                 }
                 let mut log_enabled = false;
@@ -763,11 +765,7 @@ impl WebSocketServer {
                 // `spectrum_enabled`: a client can want one without the other.
                 let mut audio_level_enabled = false;
 
-                // Main select loop: handle both client messages and engine broadcasts
-                tokio::select! {
-                    biased;
-                    _ = close_rx.changed() => {},
-                    _ = async {
+                // Handle client messages and engine broadcasts.
                 loop {
                     tokio::select! {
                         biased;
@@ -2418,6 +2416,45 @@ mod integration_tests {
                 .try_send(HostEvent::Disconnected { client_id: 0 })
                 .unwrap();
         }
+        for _ in 0..=RELIABLE_QUEUE_DEPTH {
+            push.push(&WsServerMessage::data_from_bytes(b"x"));
+        }
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+            .await
+            .unwrap();
+        assert!(
+            closed.is_none() || closed.is_some_and(|result| result.is_err()),
+            "transport must close without draining host events"
+        );
+        drop(events);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn reliable_overflow_closes_socket_during_startup() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = WebSocketServer::new(0).with_auth(test_auth());
+        let event_tx = server.event_sender();
+        let events = server.take_event_rx().unwrap();
+        let push = server.push_handle();
+        let task = tokio::spawn(async move {
+            server.run_with_listener(listener).await.unwrap();
+        });
+        // Block Connected before the server has written hello.
+        for _ in 0..256 {
+            event_tx
+                .try_send(HostEvent::Disconnected { client_id: 0 })
+                .unwrap();
+        }
+        let (mut ws, _) = tokio_tungstenite::connect_async(client_request(
+            &format!("ws://{addr}"),
+            None,
+            Some(TOKEN),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(push.clients.lock().unwrap().len(), 1);
         for _ in 0..=RELIABLE_QUEUE_DEPTH {
             push.push(&WsServerMessage::data_from_bytes(b"x"));
         }
