@@ -668,6 +668,14 @@ impl ArqTx {
         self.rtt.rto()
     }
 
+    /// Raise the airtime floor and the active timeout before sending a
+    /// longer frame. Preserve RTT history, sequence numbers and retry backoff.
+    /// Like `rto_floor`, the supplied duration is capped at `MAX_RTO_SECS`.
+    pub fn raise_rto_floor(&mut self, floor: Duration) {
+        self.rtt.floor = self.rtt.floor.max(floor.as_secs_f64().min(MAX_RTO_SECS));
+        self.rtt.rto = self.rtt.rto.max(self.rtt.floor);
+    }
+
     /// COP-68: the current `config.max_retransmit` budget. Read alongside
     /// [`Self::set_max_retransmit`] by callers that need to observe the
     /// adaptive budget (e.g. the daemon's fade-hold recovery asserting the

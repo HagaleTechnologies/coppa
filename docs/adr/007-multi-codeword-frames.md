@@ -103,7 +103,7 @@ little rather than one codeword a lot.
   at 64-QAM" figure decision 6 quotes is calibrated for 64-QAM, where the fixed overhead is a much
   larger fraction of one codeword's (very short) payload span than it is at level 6's 16-QAM -- less
   headroom to amortize away at a lower-order modulation. Same pattern as this codebase's other
-  honestly-re-derived acceptance figures (see `CLAUDE.md`'s Known Limitations, the soft-header
+  honestly-re-derived acceptance figures (see `docs/LIMITATIONS.md`, the soft-header
   gap re-derivation). The test (`multi_codeword_frame_airtime_beats_seven_single_codeword_frames`)
   asserts the real, reproducible bound (<= 0.65x) rather than a known-false 0.55x.
 - **Negative / accepted trade-off, wire-format break**: a frame with `codewords > 1` is not

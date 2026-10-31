@@ -29,7 +29,7 @@ use super::CoppaProfile;
 /// caller-supplied buffer this module hands to `SyncDetector::detect_all`
 /// (`measure_bulk_bias`'s one-time calibration frame AND `demodulate_frame_impl`'s
 /// real per-frame decode). See `measure_bulk_bias`'s "Leading pad" doc section for
-/// the full incident this fixes (`.superpowers/sdd/vhf-timing-backoff-fix-report.md`):
+/// the full incident this fixes (`docs/analysis/2026-08-01-vhf-timing-backoff-fix-report.md`):
 /// without a guaranteed minimum margin, a profile with no TX bandpass filter (VHF)
 /// gets a DIFFERENT (saturated-vs-not) timing/phase-ramp outcome depending purely on
 /// how much leading silence the caller's buffer happened to already have, which
@@ -518,7 +518,7 @@ impl CoppaModem {
     /// start at delay ≥ 0 by construction), matching this estimator's assumptions.
     ///
     /// # Leading pad (confirmed VHF bug fix, see
-    /// `.superpowers/sdd/vhf-timing-backoff-fix-report.md`)
+    /// `docs/analysis/2026-08-01-vhf-timing-backoff-fix-report.md`)
     ///
     /// For a profile with no TX bandpass filter (VHF — see `tx_bpf`'s doc) ONLY,
     /// the calibration frame is prepended with `SYNC_LEAD_MARGIN` samples of
@@ -797,7 +797,7 @@ impl CoppaModem {
         // 0. Guarantee a fixed minimum leading margin before sync detection, for
         // profiles with no TX bandpass filter (VHF) ONLY — see `SYNC_LEAD_MARGIN`'s
         // doc and `measure_bulk_bias`'s "Leading pad" section for the full incident
-        // this fixes (`.superpowers/sdd/vhf-timing-backoff-fix-report.md`).
+        // this fixes (`docs/analysis/2026-08-01-vhf-timing-backoff-fix-report.md`).
         // `receive_with_metrics`/`demodulate_frame` is documented (see
         // `StreamingReceiver`'s doc and `receive_with_metrics`'s doc) to "tolerate
         // arbitrary leading margin/silence before the frame" via this fresh
@@ -1300,7 +1300,7 @@ impl CoppaModem {
     /// anything). The AWGN-only CFO floor (FER≈1.0 at 39-40 Hz) simply does not
     /// reappear once real Watterson multipath is present — the pre-existing
     /// level-4 Watterson floor (~40-50% FER at high SNR, unrelated to this fix,
-    /// see CLAUDE.md's Known Limitations) dominates and CFO adds no measurable
+    /// see docs/LIMITATIONS.md) dominates and CFO adds no measurable
     /// extra degradation on top of it. See
     /// `.superpowers/sdd/p2-cfo-level4-fix-report.md`'s "Combined CFO + Watterson
     /// fading" addendum for the raw data.

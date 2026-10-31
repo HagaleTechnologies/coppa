@@ -72,7 +72,7 @@
 //!   (100-300 trials), flat out to 54 dB. A ~9-14% real success rate is
 //!   easily enough for a 500-attempt seed search to find a decodable frame
 //!   (verified: it does). This IS a real, severe channel-estimation-class
-//!   gap for 64QAM under deep HF fading -- consistent with CLAUDE.md's
+//!   gap for 64QAM under deep HF fading -- consistent with docs/LIMITATIONS.md's
 //!   "Phase 2 channel estimation" and "Turbo re-estimation... concentrated
 //!   on low-order modulation" limitations -- just not the literal "0% at any
 //!   SNR" this doc previously claimed. `L8_poor25` is now generated like
@@ -144,7 +144,7 @@ const DEFAULT_POOR_SNR_DB: f32 = 25.0;
 /// Default AWGN SNR (dB, 3 kHz-referenced) for the `ssbcfo` combination.
 const DEFAULT_SSBCFO_SNR_DB: f32 = 20.0;
 /// CFO applied for the `ssbcfo` combination (Hz) -- well within the documented
-/// +-50 Hz two-stage-acquisition tolerance (CLAUDE.md Known Limitations).
+/// +-50 Hz two-stage-acquisition tolerance (docs/LIMITATIONS.md).
 const SSB_CFO_HZ: f32 = 15.0;
 
 /// Level 8's AWGN/ssb+cfo operating points. Corrected 2026-07-26 (see module

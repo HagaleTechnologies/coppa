@@ -9,7 +9,7 @@ use coppa_protocol::compression::huffman::HuffmanCodec;
 use coppa_protocol::compression::lz4::{lz4_compress, lz4_decompress};
 use coppa_protocol::cp_negotiator::CpMode;
 use coppa_protocol::modem::streaming::StreamingReceiver;
-use coppa_protocol::modem::transceiver::CoppaTransceiver;
+use coppa_protocol::modem::transceiver::{CoppaTransceiver, MAX_CODEWORDS};
 
 use crate::config::{EngineConfig, OfdmBand, HF_MAX_SPEED_LEVEL};
 use crate::profiles::Profile;
@@ -22,7 +22,7 @@ const COMPRESSION_MARKER: u8 = 0xFE;
 /// Low tone of the standard SSB two-tone TX-level calibration signal (Hz).
 /// 700 Hz + 1900 Hz is standard amateur-radio TUNE/two-tone practice: both
 /// fall well inside the waveform's ~300-2700 Hz SSB passband (see
-/// `CLAUDE.md`) and are far enough apart that ALC/scope readings aren't
+/// `docs/LIMITATIONS.md`) and are far enough apart that ALC/scope readings aren't
 /// confused by beat artifacts.
 pub const TUNE_TONE_LOW_HZ: f32 = 700.0;
 /// High tone of the standard SSB two-tone TX-level calibration signal (Hz).
@@ -253,8 +253,81 @@ impl CoppaCore {
     /// 1. Optionally compress (Huffman + LZ4) with a marker byte
     /// 2. Build CoppaHeader
     /// 3. Transmit via CoppaTransceiver
+<<<<<<< HEAD
     pub fn encode_bytes(&self, data: &[u8]) -> Result<Vec<f32>, EngineError> {
         self.encode_bytes_at(data, self.config.speed_level)
+=======
+    pub fn encode_bytes(&self, data: &[u8]) -> Result<Vec<f32>> {
+        self.encode_bytes_at(data, self.config.speed_level, 1)
+    }
+
+    /// COP-69: [`Self::encode_bytes`]' exact pipeline (optional Huffman+LZ4
+    /// compression with the marker byte, `CoppaFrameType::Data`, header
+    /// stamped exactly like every other session frame) with the frame
+    /// carrying `codewords` (1..=8) LDPC codewords instead of exactly one.
+    ///
+    /// The existing `encode_bytes` is unchanged and stays 1-codeword; this is
+    /// the twin the daemon's session link picks its per-frame codeword count
+    /// through. The compressed payload is split near-equally across the
+    /// codewords by the transceiver (ranges recompute deterministically from
+    /// `(payload_len, codewords)`, so nothing above this layer sizes the
+    /// split).
+    ///
+    /// COP-19 surface: invalid codeword counts and payloads that exceed
+    /// `max_multi_payload_for_level(level, codewords)` return `Err`, never
+    /// panic. Level validation is the caller's (`encode_bytes` never checked
+    /// it either — the transceiver rejects invalid levels).
+    pub fn encode_bytes_with_codewords(&self, data: &[u8], codewords: u8) -> Result<Vec<f32>> {
+        Self::check_codewords(codewords)?;
+        self.encode_bytes_at(data, self.config.speed_level, codewords)
+    }
+
+    /// COP-69: shared codeword-count validation for the codeword-aware
+    /// encode twins (COP-19 surface: `Err`, never a panic).
+    fn check_codewords(codewords: u8) -> Result<()> {
+        if codewords > MAX_CODEWORDS {
+            anyhow::bail!("codewords ({codewords}) exceeds max {MAX_CODEWORDS}");
+        }
+        if codewords == 0 {
+            anyhow::bail!("codewords (0) is below the minimum of 1");
+        }
+        Ok(())
+    }
+
+    /// COP-69: the fade-hold re-encode twin of
+    /// [`Self::encode_bytes_with_level`] for a session frame sent with
+    /// `codewords` codewords: the same byte-identical frame bytes,
+    /// re-encoded at the fallback level *at the same codeword count* --
+    /// a multi-codeword segment's budget is
+    /// `max_multi_payload_for_level(level, codewords)`, so judging it
+    /// against the 1-codeword budget (the pre-COP-69 `fittest_level` rule)
+    /// would reject it at every level.
+    pub fn encode_bytes_with_level_and_codewords(
+        &self,
+        data: &[u8],
+        level: u8,
+        codewords: u8,
+    ) -> Result<Vec<f32>> {
+        Self::check_codewords(codewords)?;
+        self.check_level(level, self.on_vhf_profile())?;
+        self.encode_bytes_at(data, level, codewords)
+    }
+
+    /// COP-69: [`Self::encoded_payload_len`]'s answer for a frame that will
+    /// be encoded with `codewords` codewords — the number of payload bytes
+    /// [`Self::encode_bytes_with_codewords`] will split across them. The
+    /// compressed length itself is independent of the codeword count (one
+    /// payload, split by the transceiver); what changes with `codewords` is
+    /// the budget the length must fit, `max_multi_payload_for_level(level,
+    /// codewords)`. Kept as a separate named twin so the session chunker's
+    /// budget check reads symmetrically against that budget.
+    pub fn encoded_payload_len_with_codewords(&self, data: &[u8], codewords: u8) -> usize {
+        debug_assert!(
+            (1..=MAX_CODEWORDS).contains(&codewords),
+            "codewords out of the 1..=MAX_CODEWORDS frame range"
+        );
+        self.compress_payload(data).len()
+>>>>>>> d4dd119b434ef173dd86348ec3d54461c2f98749
     }
 
     /// COP-68: `encode_bytes`' exact pipeline (optional Huffman+LZ4
@@ -278,15 +351,22 @@ impl CoppaCore {
     /// rejected while this engine is on an HF profile.
     pub fn encode_bytes_with_level(&self, data: &[u8], level: u8) -> Result<Vec<f32>, EngineError> {
         self.check_level(level, self.on_vhf_profile())?;
-        self.encode_bytes_at(data, level)
+        self.encode_bytes_at(data, level, 1)
     }
 
     /// The shared body of [`Self::encode_bytes`] and
     /// [`Self::encode_bytes_with_level`]: compress, build a `Data` header at
     /// `level`, transmit. Private so the two public entry points (and their
     /// exact-payload twin [`Self::encoded_payload_len`], which shares
+<<<<<<< HEAD
     /// `compress_payload`) cannot drift apart.
     fn encode_bytes_at(&self, data: &[u8], level: u8) -> Result<Vec<f32>, EngineError> {
+=======
+    /// `compress_payload`) cannot drift apart. COP-69: the header's codeword
+    /// count is threaded through (`1` for the pre-COP-69 entry points,
+    /// caller-chosen for [`Self::encode_bytes_with_codewords`]).
+    fn encode_bytes_at(&self, data: &[u8], level: u8, codewords: u8) -> Result<Vec<f32>> {
+>>>>>>> d4dd119b434ef173dd86348ec3d54461c2f98749
         let payload = self.compress_payload(data);
 
         if payload.len() > u16::MAX as usize {
@@ -305,7 +385,7 @@ impl CoppaCore {
             speed_level: level,
             seq_num: 0,
             payload_len: payload.len() as u16,
-            codewords: 1,
+            codewords,
         };
 
         let samples = self.transceiver.transmit(&header, &payload)?;
@@ -1812,5 +1892,124 @@ mod tests {
         assert_eq!(core.config().ofdm_band, OfdmBand::LevelDerived, "untouched");
         assert_eq!(core.speed_level(), 9);
         assert!(core.on_vhf_profile());
+    }
+
+    // ---- COP-69: the codeword-aware encode twin ----
+
+    /// A full-budget 8-codeword frame at level 8 on an explicitly-pinned HF
+    /// engine roundtrips through the REAL streaming decode path
+    /// (`push_samples`) — the exact capability the daemon's session link
+    /// needs, and the gap COP-69 Phase 1 closed at the `StreamingReceiver`.
+    /// `OfdmBand::Hf` is pinned explicitly: the default band rule resolves
+    /// level 8 to `vhf_wide`, which cost the research phase a false reading.
+    #[test]
+    fn encode_bytes_with_codewords_roundtrips_through_push_samples() {
+        use coppa_protocol::modem::speed_levels::max_multi_payload_for_level;
+
+        let mut core = CoppaCore::with_config(EngineConfig {
+            speed_level: 8,
+            ofdm_band: OfdmBand::Hf,
+            ..Default::default()
+        });
+        let payload: Vec<u8> = (0..max_multi_payload_for_level(8, 8).unwrap())
+            .map(|i| (i % 251) as u8)
+            .collect();
+
+        let samples = core.encode_bytes_with_codewords(&payload, 8).unwrap();
+        // One big frame, not 8 separate ones: 66 symbols (83160 samples)
+        // carries 8 codewords' payload where 8 separate 15-symbol frames
+        // would need 120 symbols — the preamble + protected header are paid
+        // once, not 8 times.
+        let single = core.encode_bytes(&payload[..158]).unwrap();
+        assert!(
+            samples.len() > single.len() * 4 && samples.len() < single.len() * 8,
+            "8-codeword frame ({}) should be one big frame: well over 4x a \
+             1-codeword frame ({}) but well under 8 of them",
+            samples.len(),
+            single.len()
+        );
+
+        // Feed through the real streaming path with leading silence.
+        let symbol_len = 960 + 300; // hf_standard
+        let mut stream = Vec::with_capacity(samples.len() + 8 * symbol_len);
+        stream.extend(std::iter::repeat_n(0.0f32, 8 * symbol_len));
+        stream.extend_from_slice(&samples);
+        stream.extend(std::iter::repeat_n(0.0f32, 4 * symbol_len));
+        let frames = core.push_samples(&stream);
+        assert_eq!(frames.len(), 1, "exactly one 8-codeword frame");
+        assert_eq!(frames[0].payload.as_ref().unwrap(), &payload);
+    }
+
+    /// COP-19: an out-of-range codeword count is an `Err` carrying the
+    /// offending value, never a panic.
+    #[test]
+    fn encode_bytes_with_codewords_rejects_nine() {
+        let core = CoppaCore::new();
+        let err = core
+            .encode_bytes_with_codewords(b"tiny", 9)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("codewords (9) exceeds max 8"), "{err}");
+        let err = core
+            .encode_bytes_with_codewords(b"tiny", 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("below the minimum"), "{err}");
+    }
+
+    /// COP-19: a payload over `max_multi_payload_for_level(level, codewords)`
+    /// is an `Err`, and the boundary is exact — a full-budget payload passes.
+    #[test]
+    fn encode_bytes_with_codewords_rejects_oversize() {
+        use coppa_protocol::modem::speed_levels::max_multi_payload_for_level;
+
+        let core = CoppaCore::with_config(EngineConfig {
+            speed_level: 8,
+            ofdm_band: OfdmBand::Hf,
+            ..Default::default()
+        });
+        let max = max_multi_payload_for_level(8, 8).unwrap();
+        assert!(
+            core.encode_bytes_with_codewords(&vec![0u8; max], 8).is_ok(),
+            "exactly-full payload must encode"
+        );
+        let err = core
+            .encode_bytes_with_codewords(&vec![0u8; max + 1], 8)
+            .unwrap_err()
+            .to_string();
+        assert!(err.to_lowercase().contains("payload"), "{err}");
+    }
+
+    /// The chunker invariant, multi-codeword edition (mirrors COP-41's
+    /// 1-codeword `encoded_payload_len_predicts_encode_bytes_acceptance`):
+    /// `encoded_payload_len_with_codewords(p, cw) <=
+    /// max_multi_payload_for_level(level, cw)` holds iff
+    /// `encode_bytes_with_codewords(p, cw)` accepts `p` at that level.
+    #[test]
+    fn encoded_payload_len_with_codewords_matches_split() {
+        use coppa_protocol::modem::speed_levels::max_multi_payload_for_level;
+
+        for codewords in [1u8, 3, 8] {
+            let core = CoppaCore::with_config(EngineConfig {
+                speed_level: 8,
+                ofdm_band: OfdmBand::Hf,
+                ..Default::default()
+            });
+            let budget = max_multi_payload_for_level(8, codewords).unwrap();
+            let at_budget = vec![0x41u8; budget];
+            let over = vec![0x41u8; budget + 1];
+            assert!(
+                core.encoded_payload_len_with_codewords(&at_budget, codewords) <= budget,
+                "full-budget payload must fit the multi-codeword budget"
+            );
+            assert!(core
+                .encode_bytes_with_codewords(&at_budget, codewords)
+                .is_ok());
+            assert!(
+                core.encoded_payload_len_with_codewords(&over, codewords) > budget,
+                "budget+1 must exceed"
+            );
+            assert!(core.encode_bytes_with_codewords(&over, codewords).is_err());
+        }
     }
 }

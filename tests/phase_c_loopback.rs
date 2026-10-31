@@ -14,7 +14,7 @@ use coppa_protocol::modem::CoppaTransceiver;
 /// see `max_payload_for_level`'s doc. Was `code_rate.info_bits()/8` pre-Task-4
 /// (the old per-rate 802.11 QC-LDPC codec's info width, which for level 10 was
 /// 1701 bits/7/8 rate; the new mother code's level 9 is 1620 bits/5/6 rate -- a
-/// wire-format break, see `CLAUDE.md`'s Known Limitations and this task's ADR).
+/// wire-format break, see `docs/LIMITATIONS.md` and this task's ADR).
 fn max_payload_bytes(wire_level: u8) -> usize {
     max_payload_for_level(wire_level).unwrap()
 }
@@ -127,7 +127,7 @@ fn test_level_8_64qam_rate_2_3() {
 #[test]
 fn test_level_9_64qam_rate_5_6() {
     // Renamed from `rate_7_8`: Task 4's k_used table moved level 10 from
-    // 7/8 to 5/6 (wire-format break, see CLAUDE.md's Known Limitations).
+    // 7/8 to 5/6 (wire-format break, see docs/LIMITATIONS.md).
     // The #[ignore] main previously had here (routing around the old
     // per-rate LDPC codec's level-9/10 non-convergence) is removed: Task 4's
     // NR BG2 mother code fixes this on the unfiltered AWGN channel, guarded

@@ -65,7 +65,7 @@ const SAMPLE_RATE: f32 = 48_000.0;
 const CALIBRATION_TRIALS: usize = 150;
 const MAIN_TRIALS: usize = 300;
 const MAX_ATTEMPTS: u32 = 6;
-/// Watterson-Poor is known (see `CLAUDE.md`'s "irreducible-outage-floor
+/// Watterson-Poor is known (see `docs/LIMITATIONS.md`'s "irreducible-outage-floor
 /// channel" note) to floor well above 10% FER for level 2 at ANY SNR -- an
 /// early wide calibration sweep confirmed this bench's own AWGN+fading
 /// convention agrees (FER still >90% at +1.5 dB, dropping only ~1-2 points

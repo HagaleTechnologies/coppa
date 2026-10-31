@@ -154,7 +154,7 @@ use super::delay_domain::tau_basis;
 /// convergence), because it's chasing a power-weighted average of two
 /// independently-fading taps — consistent with the apparent "coarse-delay drift"
 /// being a *symptom* of amplitude fading rather than a separate phenomenon this
-/// module's AR(1) tap model was ever going to fix. See CLAUDE.md's Known
+/// module's AR(1) tap model was ever going to fix. See docs/LIMITATIONS.md's Known
 /// Limitations (the "Phase 2 channel estimation" bullet and its follow-on
 /// update) for the full account across all four attempts this affects (Task 1,
 /// Task 7 here, and the later Replace/Cascade designs).
