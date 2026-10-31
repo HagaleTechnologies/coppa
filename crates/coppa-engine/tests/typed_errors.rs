@@ -127,3 +127,29 @@ fn malformed_compression_surfaces_in_batch_and_streaming_results() {
         ));
     }
 }
+
+#[test]
+fn multi_codeword_validation_is_matchable_in_both_encode_paths() {
+    let core = CoppaCore::new();
+    for codewords in [0, 9, 255] {
+        for result in [
+            core.encode_bytes_with_codewords(b"tiny", codewords),
+            core.encode_bytes_with_level_and_codewords(b"tiny", 1, codewords),
+        ] {
+            let err = result.unwrap_err();
+            if codewords == 0 {
+                assert!(matches!(err, EngineError::ZeroCodewords));
+                assert_eq!(err.to_string(), "codewords (0) is below the minimum of 1");
+            } else {
+                assert!(matches!(
+                    err,
+                    EngineError::TooManyCodewords { requested, max: 8 } if requested == codewords
+                ));
+                assert_eq!(
+                    err.to_string(),
+                    format!("codewords ({codewords}) exceeds max 8")
+                );
+            }
+        }
+    }
+}

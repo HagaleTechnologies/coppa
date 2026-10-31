@@ -253,11 +253,7 @@ impl CoppaCore {
     /// 1. Optionally compress (Huffman + LZ4) with a marker byte
     /// 2. Build CoppaHeader
     /// 3. Transmit via CoppaTransceiver
-<<<<<<< HEAD
     pub fn encode_bytes(&self, data: &[u8]) -> Result<Vec<f32>, EngineError> {
-        self.encode_bytes_at(data, self.config.speed_level)
-=======
-    pub fn encode_bytes(&self, data: &[u8]) -> Result<Vec<f32>> {
         self.encode_bytes_at(data, self.config.speed_level, 1)
     }
 
@@ -277,19 +273,26 @@ impl CoppaCore {
     /// `max_multi_payload_for_level(level, codewords)` return `Err`, never
     /// panic. Level validation is the caller's (`encode_bytes` never checked
     /// it either — the transceiver rejects invalid levels).
-    pub fn encode_bytes_with_codewords(&self, data: &[u8], codewords: u8) -> Result<Vec<f32>> {
+    pub fn encode_bytes_with_codewords(
+        &self,
+        data: &[u8],
+        codewords: u8,
+    ) -> Result<Vec<f32>, EngineError> {
         Self::check_codewords(codewords)?;
         self.encode_bytes_at(data, self.config.speed_level, codewords)
     }
 
     /// COP-69: shared codeword-count validation for the codeword-aware
     /// encode twins (COP-19 surface: `Err`, never a panic).
-    fn check_codewords(codewords: u8) -> Result<()> {
+    fn check_codewords(codewords: u8) -> Result<(), EngineError> {
         if codewords > MAX_CODEWORDS {
-            anyhow::bail!("codewords ({codewords}) exceeds max {MAX_CODEWORDS}");
+            return Err(EngineError::TooManyCodewords {
+                requested: codewords,
+                max: MAX_CODEWORDS,
+            });
         }
         if codewords == 0 {
-            anyhow::bail!("codewords (0) is below the minimum of 1");
+            return Err(EngineError::ZeroCodewords);
         }
         Ok(())
     }
@@ -307,7 +310,7 @@ impl CoppaCore {
         data: &[u8],
         level: u8,
         codewords: u8,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<Vec<f32>, EngineError> {
         Self::check_codewords(codewords)?;
         self.check_level(level, self.on_vhf_profile())?;
         self.encode_bytes_at(data, level, codewords)
@@ -327,7 +330,6 @@ impl CoppaCore {
             "codewords out of the 1..=MAX_CODEWORDS frame range"
         );
         self.compress_payload(data).len()
->>>>>>> d4dd119b434ef173dd86348ec3d54461c2f98749
     }
 
     /// COP-68: `encode_bytes`' exact pipeline (optional Huffman+LZ4
@@ -358,15 +360,15 @@ impl CoppaCore {
     /// [`Self::encode_bytes_with_level`]: compress, build a `Data` header at
     /// `level`, transmit. Private so the two public entry points (and their
     /// exact-payload twin [`Self::encoded_payload_len`], which shares
-<<<<<<< HEAD
-    /// `compress_payload`) cannot drift apart.
-    fn encode_bytes_at(&self, data: &[u8], level: u8) -> Result<Vec<f32>, EngineError> {
-=======
     /// `compress_payload`) cannot drift apart. COP-69: the header's codeword
     /// count is threaded through (`1` for the pre-COP-69 entry points,
     /// caller-chosen for [`Self::encode_bytes_with_codewords`]).
-    fn encode_bytes_at(&self, data: &[u8], level: u8, codewords: u8) -> Result<Vec<f32>> {
->>>>>>> d4dd119b434ef173dd86348ec3d54461c2f98749
+    fn encode_bytes_at(
+        &self,
+        data: &[u8],
+        level: u8,
+        codewords: u8,
+    ) -> Result<Vec<f32>, EngineError> {
         let payload = self.compress_payload(data);
 
         if payload.len() > u16::MAX as usize {

@@ -19,6 +19,12 @@ pub enum EngineError {
     /// Batch decoding was given no samples with squelch disabled.
     #[error("No samples to decode")]
     NoSamplesToDecode,
+    /// The requested codeword count exceeds the frame limit.
+    #[error("codewords ({requested}) exceeds max {max}")]
+    TooManyCodewords { requested: u8, max: u8 },
+    /// An explicit multi-codeword encode requires at least one codeword.
+    #[error("codewords (0) is below the minimum of 1")]
+    ZeroCodewords,
     /// The transceiver rejected the frame for transmission.
     #[error("{0}")]
     Transmit(#[from] coppa_protocol::modem::TransmitError),
