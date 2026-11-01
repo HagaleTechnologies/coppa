@@ -253,7 +253,7 @@ fn main() {
          level 2's Good op. point here is -6.0 dB, but this codec's own independently-measured \
          Good-preset FER<=10% threshold for that mode is 12.0 dB (see BENCHMARKS.md), an 18 dB \
          gap that has nothing to do with any fading-specific bug. The already-documented \
-         Watterson-Moderate/Poor channel-estimation gap (CLAUDE.md's \"Phase 2 channel \
+         Watterson-Moderate/Poor channel-estimation gap (docs/LIMITATIONS.md's \"Phase 2 channel \
          estimation\" / \"Turbo re-estimation\" known limitations) is a REAL, ADDITIONAL \
          contributing factor for the moderate/poor rows specifically -- but it is not a \
          blanket explanation for every failing row, including Good's, where no such known bug \

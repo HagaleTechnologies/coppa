@@ -114,7 +114,7 @@ Two things will bite you writing such a test:
   `decoded.is_ok()`, which is why this never surfaced there.
 - **A station's *second* real decode of a `CoppaCore::encode_bytes`-built frame
   fails**, per the standalone `CoppaCore` known-limitation bullet in
-  `CLAUDE.md` ("Bug B", still open). The workaround used throughout these tests
+  `docs/LIMITATIONS.md` ("Bug B", still open). The workaround used throughout these tests
   is a same-value `engine.set_cp_profile(current_mode)` call, which rebuilds
   `self.streaming` and clears the stuck state without lying about which profile
   the incoming audio is encoded under. Carry it with its comment; do not chase

@@ -151,7 +151,7 @@ payload bytes
   → f32 audio samples
 ```
 
-`CoppaCore::encode_bytes` builds every frame with one codeword, redundancy version 0 and `seq_num` 0. The multi-codeword and redundancy-version stages are exercised by `CoppaTransceiver`'s own callers and tests.
+`CoppaCore::encode_bytes` builds every frame with one codeword, redundancy version 0 and `seq_num` 0; the daemon's connected-session link encodes its frames through the codeword-aware twins (`encode_bytes_with_codewords`, `encode_bytes_with_level_and_codewords`, COP-69) with 1-8 codewords per frame, negotiated with the peer. The multi-codeword and redundancy-version stages are exercised by `CoppaTransceiver`'s own callers and tests.
 
 ## RX Pipeline
 

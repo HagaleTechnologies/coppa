@@ -1,5 +1,5 @@
 //! Diagnose whether `coppa_ml::channel_capacity`'s reading is level-dependent on the SAME
-//! underlying channel -- CLAUDE.md's RateLoop known-limitation entry names this as the
+//! underlying channel -- docs/LIMITATIONS.md's RateLoop known-limitation entry names this as the
 //! suspected root cause of RateLoop not meeting its acceptance bar, but that diagnosis was
 //! informal/uncommitted. This bench sounds at EVERY real speed level (unlike
 //! `mcs_calibration.rs`'s `sound()`, which hardcodes a level-2 probe) across AWGN (negative

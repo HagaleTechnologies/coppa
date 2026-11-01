@@ -16,6 +16,8 @@ use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx, DEFAULT_MAX_RETRANSMIT};
 use coppa_protocol::cp_negotiator::{ContentAction, CpMode, CpNegotiator};
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu, StationIdPayload};
 use coppa_protocol::modem::max_payload_for_level;
+use coppa_protocol::modem::speed_levels::max_multi_payload_for_level;
+use coppa_protocol::modem::transceiver::MAX_CODEWORDS;
 use coppa_protocol::session::{LinkCapabilities, SessionManager, SessionState};
 use coppa_protocol::transport::{TransportPdu, TransportType, TRANSPORT_HEADER_SIZE};
 use coppa_radio::band::{self, FrequencyConfig, FrequencyEvidence, GateRefusal};
@@ -164,17 +166,36 @@ struct SessionFallback {
 }
 
 /// COP-68: the most robust level (lowest number) at or below `current`
-/// whose one-codeword payload budget fits `encoded_len` bytes -- the same
+/// whose payload budget fits `encoded_len` bytes -- the same
 /// `encoded_payload_len` measure session chunking sizes against, so a
 /// chunk that fit its original level by construction fits the answer here
 /// whenever any lower level's budget also holds it. Falls back to
 /// `current` when nothing lower fits (a segment of 118-178 encoded bytes
 /// has no lower level on today's ladder): the hold still holds, it just
-/// retransmits at the level it already had.
-fn fittest_level(encoded_len: usize, current: u8) -> u8 {
+/// retransmits at the level it already had. COP-69: the budget is judged
+/// at the segment's codeword count (`max_multi_payload_for_level(l,
+/// codewords)`), so a multi-codeword segment is never held to a
+/// 1-codeword budget that no level can fit -- the fallback re-encode
+/// would fail for budget reasons at the very level chosen for it.
+fn fittest_level_with_codewords(encoded_len: usize, current: u8, codewords: u8) -> u8 {
     (1..=current)
-        .find(|&l| max_payload_for_level(l).is_some_and(|budget| budget >= encoded_len))
+        .find(|&l| {
+            max_multi_payload_for_level(l, codewords).is_some_and(|budget| budget >= encoded_len)
+        })
         .unwrap_or(current)
+}
+
+/// COP-69: the capabilities this coppad advertises in CONNECT_REQ/ACK.
+/// `multi_frame_ack` is on: this version's session link sends
+/// multi-codeword frames, and the flag is negotiated as an AND exactly like
+/// `compression`, so a peer that does not advertise it keeps today's exact
+/// 1-codeword wire behavior (the fallback is total, asserted on encoded
+/// samples).
+fn local_link_caps() -> LinkCapabilities {
+    LinkCapabilities {
+        multi_frame_ack: true,
+        ..LinkCapabilities::default()
+    }
 }
 
 /// COP-38 (D2): the established session's reliable-delivery state. One per
@@ -204,6 +225,12 @@ struct SessionLink {
     /// One warning per link for a payload that is not a reliable
     /// `TransportPdu`, i.e. a pre-0.3.0 peer (D3).
     warned_legacy_payload: bool,
+    /// COP-69: the codeword count of the in-flight segment. Stop-and-wait
+    /// (`SESSION_ARQ_WINDOW = 1`) guarantees at most one segment is in
+    /// flight, so one field suffices; every send overwrites it and a
+    /// retransmission re-encodes at this count, keeping the rebuilt frame
+    /// byte-identical to the original transmission.
+    tx_codewords: u8,
 }
 
 /// COP-38 (D3): one session data frame. The ACK fields stay zero so a
@@ -659,6 +686,14 @@ pub struct EventLoop {
     /// Optional WebSocket broadcast sender for forwarding decoded data.
     #[cfg(feature = "websocket")]
     ws_broadcast: Option<tokio::sync::broadcast::Sender<String>>,
+    #[cfg(feature = "websocket")]
+    ws_push: Option<coppa_host::websocket::WsPush>,
+    #[cfg(feature = "websocket")]
+    ws_heard: Vec<coppa_host::websocket::HeardStation>,
+    #[cfg(feature = "websocket")]
+    ws_decode_fail_count: u64,
+    #[cfg(feature = "websocket")]
+    ws_last_decode_fail: Option<Instant>,
     /// Optional shared live-status snapshot for the WebSocket `status` reply
     /// (decision 8: "WebSocket `status` reply carries real values"). Updated
     /// alongside VARA telemetry whenever a frame decodes and at every session
@@ -902,7 +937,7 @@ impl EventLoop {
         // Always constructed (cheap; mirrors RateLoop's own "hardcode the
         // hysteresis constants, only expose the interval/offset-equivalent
         // via config" pattern -- no config knobs for threshold_ms/
-        // consecutive_needed, YAGNI per CLAUDE.md's alpha-calibration
+        // consecutive_needed, YAGNI per docs/LIMITATIONS.md's alpha-calibration
         // cautionary tale). Whether it's ever fed a real observation is
         // gated by `config.engine.cp_gate_enabled` in
         // `decode_and_dispatch_audio`.
@@ -959,6 +994,14 @@ impl EventLoop {
             probe_state: None,
             #[cfg(feature = "websocket")]
             ws_broadcast: None,
+            #[cfg(feature = "websocket")]
+            ws_push: None,
+            #[cfg(feature = "websocket")]
+            ws_heard: Vec::new(),
+            #[cfg(feature = "websocket")]
+            ws_decode_fail_count: 0,
+            #[cfg(feature = "websocket")]
+            ws_last_decode_fail: None,
             #[cfg(feature = "websocket")]
             ws_status: None,
             vara_responses: None,
@@ -1334,7 +1377,8 @@ impl EventLoop {
             .available_speed_levels()
             .last()
             .map_or(level, |&max| level.min(max));
-        self.engine.set_speed_level(level)
+        self.engine.set_speed_level(level)?;
+        Ok(())
     }
 
     /// COP-32: conditions found while starting that leave the daemon running
@@ -1392,10 +1436,44 @@ impl EventLoop {
         self.response_tx = Some(tx);
     }
 
-    /// Set the WebSocket broadcast sender for forwarding decoded data to WS clients.
+    /// Set the disposable WebSocket telemetry sender. Data/state use `set_ws_push`.
     #[cfg(feature = "websocket")]
     pub fn set_ws_broadcast(&mut self, tx: tokio::sync::broadcast::Sender<String>) {
         self.ws_broadcast = Some(tx);
+    }
+
+    /// Attach the reliable WebSocket data and state delivery path.
+    #[cfg(feature = "websocket")]
+    pub fn set_ws_push(&mut self, push: coppa_host::websocket::WsPush) {
+        self.ws_push = Some(push);
+    }
+
+    #[cfg(feature = "websocket")]
+    fn ws_push_reliable(&self, msg: coppa_host::websocket::WsServerMessage) {
+        if let Some(push) = &self.ws_push {
+            push.push(&msg);
+        }
+    }
+
+    #[cfg(feature = "websocket")]
+    fn ws_decode_failure(&mut self) {
+        self.ws_decode_fail_count = self.ws_decode_fail_count.saturating_add(1);
+        if self
+            .ws_last_decode_fail
+            .is_some_and(|last| last.elapsed() < Duration::from_millis(500))
+        {
+            return;
+        }
+        self.ws_last_decode_fail = Some(Instant::now());
+        if let Some(tx) = &self.ws_broadcast {
+            let msg = coppa_host::websocket::WsServerMessage::DecodeFail {
+                count: self.ws_decode_fail_count,
+                timestamp_ms: crate::ws_log::timestamp_ms(),
+            };
+            if let Ok(json) = serde_json::to_string(&msg) {
+                let _ = tx.send(json);
+            }
+        }
     }
 
     /// Set the shared live-status snapshot the WebSocket server's `status` reply
@@ -1457,6 +1535,19 @@ impl EventLoop {
     /// one that stops reading is disconnected rather than skipped
     /// (`broadcast_vara`), so a state line is never lost on an open connection.
     async fn emit_vara(&self, response: VaraResponse) {
+        #[cfg(feature = "websocket")]
+        {
+            use coppa_host::websocket::WsServerMessage;
+            let msg = match &response {
+                VaraResponse::Ptt(state) => Some(WsServerMessage::Ptt { state: *state }),
+                VaraResponse::Busy(state) => Some(WsServerMessage::Busy { state: *state }),
+                VaraResponse::Snr(db) => Some(WsServerMessage::Snr { db: *db }),
+                _ => None,
+            };
+            if let Some(msg) = msg {
+                self.ws_push_reliable(msg);
+            }
+        }
         if let Some(ref senders) = self.vara_responses {
             broadcast_vara(senders, response).await;
         }
@@ -1529,7 +1620,7 @@ impl EventLoop {
 
     /// Call after `session_mgr` reflects the change. Broadcasts to all hosts:
     /// session state is link-wide; every attached host wants it.
-    async fn notify_session(&self, client_id: u32, notice: SessionNotice) {
+    async fn notify_session(&mut self, client_id: u32, notice: SessionNotice) {
         let (status, vara) = match &notice {
             SessionNotice::Connected {
                 local,
@@ -1630,15 +1721,36 @@ impl EventLoop {
         }
         #[cfg(feature = "websocket")]
         {
+            use coppa_host::websocket::{HeardStation, SessionState, WsServerMessage};
             let msg = match notice {
                 SessionNotice::Connected { remote, .. } => {
-                    coppa_host::websocket::WsServerMessage::Connected {
-                        remote_call: remote.to_string(),
+                    let call = remote.to_string();
+                    self.ws_heard.retain(|station| station.call != call);
+                    let (snr_db, level) = if let Some(status) = &self.ws_status {
+                        let snapshot = status.lock().await;
+                        (snapshot.snr, snapshot.level)
+                    } else {
+                        (None, None)
+                    };
+                    self.ws_heard.insert(
+                        0,
+                        HeardStation {
+                            call: call.clone(),
+                            last_heard_ms: crate::ws_log::timestamp_ms(),
+                            snr_db,
+                            level,
+                        },
+                    );
+                    self.ws_heard.truncate(32);
+                    WsServerMessage::Session {
+                        state: SessionState::Connected,
+                        remote_call: Some(call),
                     }
                 }
-                SessionNotice::Disconnected => coppa_host::websocket::WsServerMessage::Disconnected,
-                // The WebSocket API has no LISTEN, so it never takes part in
-                // an inbound attempt.
+                SessionNotice::Disconnected => WsServerMessage::Session {
+                    state: SessionState::Disconnected,
+                    remote_call: None,
+                },
                 SessionNotice::Pending { .. } | SessionNotice::PendingCancelled => return,
             };
             let remote = self.established_remote();
@@ -1647,11 +1759,10 @@ impl EventLoop {
                 snap.connected = remote.is_some();
                 snap.remote_call = remote.map(|cs| cs.to_string());
             }
-            if let Some(ref ws_tx) = self.ws_broadcast {
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    let _ = ws_tx.send(json); // An error means no client is subscribed.
-                }
-            }
+            self.ws_push_reliable(msg);
+            self.ws_push_reliable(WsServerMessage::Heard {
+                stations: self.ws_heard.clone(),
+            });
         }
     }
 
@@ -1907,7 +2018,36 @@ impl EventLoop {
         if !ready || self.session_tx_held_by_frequency_gate {
             return;
         }
-        let budget = max_payload_for_level(self.engine.speed_level())
+        // COP-69: the per-frame codeword count. Gated by the negotiated
+        // `multi_frame_ack` capability (a peer that did not advertise it
+        // gets today's exact 1-codeword frames) and capped by `[session]
+        // max_codewords_per_frame`; the count itself is ceil(needed /
+        // per-codeword budget), `needed` being the backlog plus the 21 B
+        // MAC + transport headers -- an upper bound, since compression only
+        // shrinks the framed chunk, so the frame always fits the count's
+        // budget while a full backlog reaches the cap.
+        let level = self.engine.speed_level();
+        let backlog_len = self.session_link.as_ref().map_or(0, |l| l.backlog.len());
+        let negotiated_multi = self
+            .session_link
+            .as_ref()
+            .map(|l| l.session_id)
+            .and_then(|id| self.session_mgr.get(id))
+            .and_then(|s| s.negotiated.as_ref())
+            .is_some_and(|c| c.multi_frame_ack);
+        let cap = if negotiated_multi {
+            self.config
+                .session
+                .max_codewords_per_frame
+                .min(MAX_CODEWORDS)
+        } else {
+            1
+        };
+        let per_cw = max_payload_for_level(level)
+            .expect("the engine's speed level is always a valid wire level");
+        let needed = backlog_len + MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE;
+        let codewords = needed.div_ceil(per_cw).clamp(1, cap as usize) as u8;
+        let budget = max_multi_payload_for_level(level, codewords)
             .expect("the engine's speed level is always a valid wire level");
         let (seq, take, frame) = {
             let Some(link) = self.session_link.as_mut() else {
@@ -1921,12 +2061,17 @@ impl EventLoop {
                 link.backlog.as_slices().0,
                 MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE,
                 budget,
-                |c| engine.encoded_payload_len(&session_data_frame(link, seq, c)) <= budget,
+                |c| {
+                    engine.encoded_payload_len_with_codewords(
+                        &session_data_frame(link, seq, c),
+                        codewords,
+                    ) <= budget
+                },
             );
             let chunk: Vec<u8> = link.backlog.iter().take(take).copied().collect();
             (seq, take, session_data_frame(link, seq, &chunk))
         };
-        let samples = match self.engine.encode_bytes(&frame) {
+        let samples = match self.engine.encode_bytes_with_codewords(&frame, codewords) {
             Ok(samples) => samples,
             Err(e) => {
                 // Unreachable for a chunk `next_chunk_len` sized; the bytes
@@ -1935,6 +2080,7 @@ impl EventLoop {
                 return;
             }
         };
+        self.raise_session_multi_rto(&samples, codewords);
         // Boxed: `transmit_samples` -> `handle_ptt_change` -> (on PTT
         // release) `drain_session_link` forms the same 3-way async call
         // cycle `try_drain_tx_queue` documents; one edge needs indirection
@@ -1951,6 +2097,9 @@ impl EventLoop {
         }
         if let Some(link) = self.session_link.as_mut() {
             let chunk: Vec<u8> = link.backlog.drain(..take).collect();
+            // COP-69: remember the count the segment went out with, so a
+            // retransmission re-encodes byte-identically at the same count.
+            link.tx_codewords = codewords;
             match link.tx.send(chunk, Instant::now()) {
                 Ok(sent) => debug_assert_eq!(sent, seq),
                 // Unreachable: `can_send` was checked before transmitting.
@@ -1979,6 +2128,32 @@ impl EventLoop {
             max = self.max_frames_per_turn,
             "Session data frame transmitted"
         );
+    }
+
+    /// COP-69: a multi-codeword frame can outlast the initial five-second
+    /// RTO. Raise both the active timeout and its estimator floor before
+    /// submission, including on a slower fallback retransmission. Single-
+    /// codeword sessions retain their existing timing. The full HF long-CP
+    /// ACK is a conservative upper bound for the supported HF short-CP and
+    /// VHF profiles too; this branch still sends full-frame ACKs.
+    fn raise_session_multi_rto(&mut self, samples: &[f32], codewords: u8) {
+        if codewords <= 1 {
+            return;
+        }
+        let data_s = samples.len() as f64 / self.engine.config().sample_rate as f64;
+        let ack_s = coppa_protocol::modem::frame_airtime_s(
+            self.engine.speed_level(),
+            &coppa_codec::ofdm::CoppaProfile::hf_standard(),
+        )
+        .expect("the engine's speed level is always a valid wire level");
+        let radio = &self.config.radio;
+        let turnaround_s = (radio.turnaround_ms + radio.ptt_pre_delay_ms + radio.ptt_tail_delay_ms)
+            as f64
+            / 1000.0;
+        if let Some(link) = self.session_link.as_mut() {
+            link.tx
+                .raise_rto_floor(Duration::from_secs_f64(data_s + 2.0 * turnaround_s + ack_s));
+        }
     }
 
     /// Drop the link of a session that has ended (local or remote
@@ -2040,6 +2215,7 @@ impl EventLoop {
             fallback: None,
             last_peer_evidence: Instant::now(),
             warned_legacy_payload: false,
+            tx_codewords: 1,
         });
     }
 
@@ -2161,12 +2337,25 @@ impl EventLoop {
             // most robust level whose payload budget fits it. The normal
             // regime's `encode_bytes` (the engine's current level) is
             // byte-for-byte unchanged.
+            // COP-69: a retransmission re-encodes at the codeword count the
+            // segment was sent with, so the rebuilt frame stays
+            // byte-identical to the original (and, in the fade hold, at the
+            // codeword-aware fallback level).
+            let codewords = self
+                .session_link
+                .as_ref()
+                .map_or(1, |l| l.tx_codewords.max(1));
             let encoded = match self.session_link.as_ref().and_then(|l| l.fallback.as_ref()) {
-                Some(fallback) => self.engine.encode_bytes_with_level(&frame, fallback.level),
-                None => self.engine.encode_bytes(&frame),
+                Some(fallback) => self.engine.encode_bytes_with_level_and_codewords(
+                    &frame,
+                    fallback.level,
+                    codewords,
+                ),
+                None => self.engine.encode_bytes_with_codewords(&frame, codewords),
             };
             match encoded {
                 Ok(samples) => {
+                    self.raise_session_multi_rto(&samples, codewords);
                     tracing::debug!(seq, attempt, "Retransmitting session frame");
                     Box::pin(self.transmit_samples(&samples)).await;
                 }
@@ -2184,14 +2373,18 @@ impl EventLoop {
                 if link.tx.is_failed(seq) && link.fallback.is_none() {
                     // COP-68: first exhaustion enters the fade hold. The
                     // fittest level is computed over the segment's rebuilt
-                    // frame with the same `encoded_payload_len` measure the
-                    // chunker used, so the encode above cannot fail for
-                    // budget reasons at the fallback level unless nothing
-                    // lower fits (then `fittest_level` returned the current
-                    // level, logged here rather than silently).
-                    let level = fittest_level(
+                    // frame with the same encoded-length measure the chunker
+                    // used, judged against the segment's codeword count
+                    // (COP-69) so an 8-codeword frame is never held to a
+                    // 1-codeword budget that no level can fit, so the
+                    // encode above cannot fail for budget reasons at the
+                    // fallback level unless nothing lower fits (then the
+                    // twin returned the current level, logged here rather
+                    // than silently).
+                    let level = fittest_level_with_codewords(
                         self.engine.encoded_payload_len(&frame),
                         self.engine.speed_level(),
+                        codewords,
                     );
                     let grant = link
                         .tx
@@ -2955,7 +3148,7 @@ impl EventLoop {
                 if ardop_dial {
                     self.ardop_clients.entry(client_id).or_default().refused = false;
                 }
-                let caps = LinkCapabilities::default();
+                let caps = local_link_caps();
                 match self.session_mgr.create(local, remote.clone(), 0, caps) {
                     Ok(id) => {
                         if let Some(session) = self.session_mgr.get_mut(id) {
@@ -3477,16 +3670,24 @@ impl EventLoop {
         }
         self.last_spectrum_broadcast = Instant::now();
 
+        let (freq_low_hz, freq_high_hz) = self.engine.occupied_band_edges_hz();
         let bins = crate::spectrum::compute_spectrum_bins(
             &self.spectrum_sensor,
             &self.spectrum_buffer,
             self.engine.config().sample_rate as f32,
+            freq_low_hz,
+            freq_high_hz,
         );
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let msg = coppa_host::websocket::WsServerMessage::Spectrum { bins, timestamp_ms };
+        let msg = coppa_host::websocket::WsServerMessage::Spectrum {
+            bins,
+            timestamp_ms,
+            freq_low_hz,
+            freq_high_hz,
+        };
         if let Ok(json) = serde_json::to_string(&msg) {
             let _ = ws_tx.send(json);
         }
@@ -3638,6 +3839,11 @@ impl EventLoop {
                             }
                         }
                     }
+
+                    #[cfg(feature = "websocket")]
+                    self.ws_push_reliable(coppa_host::websocket::WsServerMessage::Level {
+                        level: speed_level,
+                    });
 
                     // WebSocket `status` reply: keep the live snapshot current
                     // (decision 8: "connected, snr, level, cfo").
@@ -3862,13 +4068,7 @@ impl EventLoop {
 
                     if !output_data.is_empty() {
                         tracing::info!(bytes = output_data.len(), "Frame decoded successfully");
-                        self.deliver_to_host(output_data.clone());
-                        // Forward to WebSocket broadcast channel
-                        #[cfg(feature = "websocket")]
-                        if let Some(ref ws_tx) = self.ws_broadcast {
-                            let text = String::from_utf8_lossy(&output_data).into_owned();
-                            let _ = ws_tx.send(text);
-                        }
+                        self.deliver_to_host(output_data);
                     }
                     // Closed-loop rate adaptation (Phase 3 Task 4) is wired: `self.
                     // rate_loop` (`coppa_ml::RateLoop`) is fed from the peer's ACK-carried
@@ -3884,6 +4084,8 @@ impl EventLoop {
                         frame_start = frame.frame_start,
                         "Streaming frame failed to decode"
                     );
+                    #[cfg(feature = "websocket")]
+                    self.ws_decode_failure();
                 }
             }
         }
@@ -5487,7 +5689,7 @@ impl EventLoop {
         }
 
         let remote = pdu.src.clone();
-        let caps = LinkCapabilities::default();
+        let caps = local_link_caps();
         match self
             .session_mgr
             .create(local, remote.clone(), pdu.ssid, caps)
@@ -5633,10 +5835,15 @@ impl EventLoop {
     }
 
     /// Send a decoded payload to every data-port client (`client_id` 0) through
-    /// `response_tx`. The queue is unbounded, so this never waits and never
-    /// drops; with no queue wired (no VARA server) it does nothing. It fails
-    /// only when the bridge draining the queue has stopped.
+    /// `response_tx`, and to WebSocket clients through their reliable queues.
+    /// The data-port queue is unbounded and never waits; its bridge can fail
+    /// if stopped. WebSocket overflow disconnects the affected client.
+    /// Either delivery path works without the other being wired.
     fn deliver_to_host(&self, data: Vec<u8>) {
+        #[cfg(feature = "websocket")]
+        self.ws_push_reliable(coppa_host::websocket::WsServerMessage::data_from_bytes(
+            &data,
+        ));
         if let Some(ref tx) = self.response_tx {
             if tx
                 .send(HostResponse::DataOut { client_id: 0, data })
@@ -5863,6 +6070,175 @@ impl EventLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "websocket")]
+    type WsClient = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    #[cfg(feature = "websocket")]
+    async fn connect_ws(station: &mut EventLoop) -> (WsClient, tokio::task::JoinHandle<()>) {
+        use coppa_host::websocket::{WebSocketServer, WsAuth};
+        use futures_util::StreamExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server =
+            WebSocketServer::new(port).with_auth(WsAuth::new("test-token", Vec::<String>::new()));
+        station.set_ws_push(server.push_handle());
+        station.set_ws_broadcast(server.broadcast_sender());
+        station.set_ws_status(server.status());
+        let task = tokio::spawn(async move {
+            server.run_with_listener(listener).await.unwrap();
+        });
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/?token=test-token"))
+                .await
+                .unwrap();
+        let hello = ws.next().await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(hello.to_text().unwrap()).unwrap()["type"],
+            "hello"
+        );
+        (ws, task)
+    }
+
+    #[cfg(feature = "websocket")]
+    async fn next_ws_type(ws: &mut WsClient, kind: &str) -> serde_json::Value {
+        use futures_util::StreamExt;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let message = ws.next().await.unwrap().unwrap();
+                let value: serde_json::Value =
+                    serde_json::from_str(message.to_text().unwrap()).unwrap();
+                if value["type"] == kind {
+                    return value;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn websocket_data_is_valid_json_with_encoding() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (mut ws, task) = connect_ws(&mut station).await;
+        let core = coppa_engine::CoppaCore::new();
+        for (bytes, encoding, expected) in [
+            (b"hello dashboard".as_slice(), "utf8", "hello dashboard"),
+            ([0xff, 0x00].as_slice(), "base64", "/wA="),
+        ] {
+            let samples = core.encode_bytes(bytes).unwrap();
+            station
+                .decode_and_dispatch_audio(&with_lead_and_trail(&samples))
+                .await;
+            let data = next_ws_type(&mut ws, "data").await;
+            println!("{data}");
+            assert_eq!(data["encoding"], encoding);
+            assert_eq!(data["data"], expected);
+        }
+        task.abort();
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn websocket_session_data_is_delivered_once_with_encoding() {
+        use futures_util::StreamExt;
+        let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
+        let (mut ws, task) = connect_ws(&mut b).await;
+        // No VARA response bridge is wired: WebSocket delivery is independent.
+        for (bytes, encoding, expected) in [
+            (b"session dashboard".as_slice(), "utf8", "session dashboard"),
+            ([0xff, 0x00].as_slice(), "base64", "/wA="),
+        ] {
+            a.handle_host_event(HostEvent::DataReceived {
+                client_id: 1,
+                data: bytes.to_vec(),
+            })
+            .await;
+            let frame = take_leg(&mut a_consumer, "session data");
+            unstick_decoder(&mut b);
+            b.decode_and_dispatch_audio(&frame).await;
+            let data = next_ws_type(&mut ws, "data").await;
+            assert_eq!(data["encoding"], encoding);
+            assert_eq!(data["data"], expected);
+            take_leg(&mut b_consumer, "first ACK, discarded");
+            b.handle_ptt_change(false).await;
+            unstick_decoder(&mut b);
+            b.decode_and_dispatch_audio(&frame).await;
+            let ack = take_leg(&mut b_consumer, "duplicate ACK");
+            unstick_decoder(&mut a);
+            a.decode_and_dispatch_audio(&ack).await;
+            assert_eq!(a.session_link.as_ref().unwrap().tx.in_flight(), 0);
+            a.handle_ptt_change(false).await;
+            b.handle_ptt_change(false).await;
+        }
+        // Drain telemetry as well, so a duplicate data event cannot hide behind it.
+        assert!(tokio::time::timeout(Duration::from_millis(300), async {
+            while let Some(message) = ws.next().await {
+                let message = message.unwrap();
+                let value: serde_json::Value =
+                    serde_json::from_str(message.to_text().unwrap()).unwrap();
+                assert_ne!(value["type"], "data", "duplicate session payload");
+            }
+        })
+        .await
+        .is_err());
+        task.abort();
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn websocket_hears_ptt_busy_snr_level() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (mut ws, task) = connect_ws(&mut station).await;
+        station.set_ptt(true).await;
+        assert_eq!(next_ws_type(&mut ws, "ptt").await["state"], true);
+        station.set_ptt(false).await;
+        assert_eq!(next_ws_type(&mut ws, "ptt").await["state"], false);
+        station.emit_vara(VaraResponse::Busy(true)).await;
+        assert_eq!(next_ws_type(&mut ws, "busy").await["state"], true);
+        let core = coppa_engine::CoppaCore::new();
+        let samples = core.encode("telemetry").unwrap();
+        station
+            .decode_and_dispatch_audio(&with_lead_and_trail(&samples))
+            .await;
+        assert!(next_ws_type(&mut ws, "snr").await["db"].is_number());
+        assert_eq!(next_ws_type(&mut ws, "level").await["level"], 1);
+        task.abort();
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn websocket_mycall_sets_local_callsign() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        station
+            .handle_host_event(HostEvent::VaraCommand {
+                client_id: coppa_host::websocket::FIRST_CLIENT_ID,
+                command: "MYCALL N0CALL".into(),
+            })
+            .await;
+        assert_eq!(station.local_callsign.unwrap().to_string(), "N0CALL");
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn websocket_decode_fail_is_rate_limited_aggregate() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        station.set_ws_broadcast(tx);
+        for _ in 0..6 {
+            station.ws_decode_failure();
+        }
+        let first: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(first["count"], 1);
+        assert!(rx.try_recv().is_err());
+        station.ws_last_decode_fail = Some(Instant::now() - Duration::from_millis(501));
+        station.ws_decode_failure();
+        let next: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(next["count"], 7);
+    }
 
     /// COP-37: a valid callsign for stations that must transmit. A daemon
     /// with no valid callsign refuses every transmission, so receive-only
@@ -7219,7 +7595,7 @@ mod tests {
         // `cp_negotiation_full_handshake_converges_both_sides` carries at its
         // own ack-decode step: this is `a`'s SECOND real decode of a
         // `CoppaCore::encode_bytes`-built frame, and `CoppaCore` reliably
-        // fails every decode after its first one (CLAUDE.md's standalone
+        // fails every decode after its first one (docs/LIMITATIONS.md's standalone
         // known-limitation bullet, "Bug B" -- real, reproducible, narrowed to
         // a payload-size-dependent spurious sync candidate, and entirely
         // orthogonal to CP negotiation). `set_cp_profile` always rebuilds
@@ -8628,9 +9004,14 @@ mod tests {
         );
         let link = a.session_link.as_ref().unwrap();
         assert!(link.backlog.is_empty() && link.tx.in_flight() == 0);
-        // At most 95 host bytes fit a level-2 frame (budget 117 minus the
-        // 14-byte MAC and 7-byte transport headers minus one).
-        let min_frames = payload.len().div_ceil(95);
+        // A frame's host-byte capacity is the session link's codeword budget
+        // (per-codeword budget x the negotiated/capped codeword count) minus
+        // the 14-byte MAC and 7-byte transport headers minus one. Before
+        // COP-69 this was 95 (level 2, one codeword); this pair now
+        // negotiates 8-codeword frames at the engine's current level.
+        let per_cw = max_payload_for_level(a.engine.speed_level()).unwrap();
+        let capacity = per_cw * 8 - MacPdu::HEADER_SIZE - TRANSPORT_HEADER_SIZE - 1;
+        let min_frames = payload.len().div_ceil(capacity);
         let frames = a.tx_frame_count - frames_before;
         assert!(
             frames >= min_frames,
@@ -8709,7 +9090,7 @@ mod tests {
     /// Same workaround, for the same reason, as
     /// `lost_cp_switched_converges_both_endpoints_on_long_cp` carries inline:
     /// `CoppaCore` reliably fails every decode after its first one of a
-    /// `CoppaCore::encode_bytes`-built frame (CLAUDE.md's "Bug B", real,
+    /// `CoppaCore::encode_bytes`-built frame (docs/LIMITATIONS.md's "Bug B", real,
     /// reproducible, and entirely orthogonal to CP negotiation).
     /// `set_cp_profile` always rebuilds `self.streaming`, so calling it with
     /// the station's CURRENT mode is a genuine no-op for the profile that
@@ -10075,6 +10456,58 @@ mod tests {
             second_spectrum.is_some(),
             "the rate gate should re-open once its period has (mock-)elapsed"
         );
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn spectrum_message_carries_engine_bounds() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(16);
+        station.set_ws_broadcast(sender);
+        let samples = vec![0.01; crate::spectrum::SPECTRUM_FFT_SIZE];
+        for (band, expected_high) in [
+            (coppa_engine::OfdmBand::Vhf, 5950.0),
+            (coppa_engine::OfdmBand::Hf, 2750.0),
+        ] {
+            station.engine.set_ofdm_band(band).unwrap();
+            station.last_spectrum_broadcast = Instant::now() - Duration::from_secs(1);
+            station.maybe_broadcast_spectrum(&samples);
+            let value: serde_json::Value =
+                serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+            println!("spectrum bounds 350/{expected_high}");
+            assert_eq!(value["freq_low_hz"], 350.0);
+            assert_eq!(value["freq_high_hz"], expected_high);
+            assert_eq!(value["bins"].as_array().unwrap().len(), 128);
+        }
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn websocket_heard_snapshot_on_session() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (mut ws, task) = connect_ws(&mut station).await;
+        for number in 0..34 {
+            station
+                .notify_session(
+                    1,
+                    SessionNotice::Connected {
+                        local: Callsign::new("N0CALL").unwrap(),
+                        remote: Callsign::new(&format!("W1A{number}")).unwrap(),
+                        we_called: true,
+                    },
+                )
+                .await;
+            let heard = next_ws_type(&mut ws, "heard").await;
+            assert_eq!(
+                heard["stations"].as_array().unwrap().len(),
+                (number + 1).min(32)
+            );
+            assert_eq!(heard["stations"][0]["call"], format!("W1A{number}"));
+        }
+        station.notify_session(1, SessionNotice::Disconnected).await;
+        let heard = next_ws_type(&mut ws, "heard").await;
+        assert_eq!(heard["stations"].as_array().unwrap().len(), 32);
+        task.abort();
     }
 
     // ── COP-65: RX/TX audio level metering ────────────────────────────────
@@ -12009,7 +12442,7 @@ mod tests {
 
         #[tokio::test]
         async fn slow_host_receives_disconnected_behind_a_busy_backlog() {
-            let (event_loop, _senders, mut rx) = slow_host();
+            let (mut event_loop, _senders, mut rx) = slow_host();
             for _ in 0..coppa_host::vara::TELEMETRY_QUEUE_DEPTH {
                 event_loop.emit_vara(VaraResponse::Busy(true)).await;
             }
@@ -12972,8 +13405,8 @@ mod tests {
 
         /// COP-28: a WebSocket-originated event (whose client ID is from
         /// `coppa_host::websocket::FIRST_CLIENT_ID`'s range) must never draw
-        /// an OK/WRONG reply on a VARA command-port socket, and the WS
-        /// `mycall` message stays a no-op.
+        /// an OK/WRONG reply on a VARA command-port socket. The translated
+        /// WebSocket `mycall` command still sets this station's callsign.
         #[cfg(feature = "websocket")]
         #[tokio::test]
         async fn websocket_ids_never_draw_a_vara_reply() {
@@ -12985,7 +13418,7 @@ mod tests {
             station
                 .handle_host_event(HostEvent::VaraCommand {
                     client_id: FIRST_CLIENT_ID,
-                    command: r#"{"type":"mycall","callsign":"W5AU"}"#.to_string(),
+                    command: "MYCALL W5AU".to_string(),
                 })
                 .await;
             station
@@ -12998,8 +13431,8 @@ mod tests {
 
             assert_eq!(
                 station.local_callsign,
-                Some(Callsign::new("VK3ABC").unwrap()),
-                "the WS mycall message must stay a no-op"
+                Some(Callsign::new("W5AU").unwrap()),
+                "the translated WS mycall command sets the callsign"
             );
             let lines = read_available_lines(&mut reader).await;
             assert!(
@@ -13045,26 +13478,9 @@ mod tests {
         #[cfg(feature = "websocket")]
         #[tokio::test]
         async fn websocket_hears_connected_and_disconnected_and_status_follows() {
-            use coppa_host::websocket::{WsServerMessage, WsStatus};
-            // The same channel carries COP-65 `audio_level` messages (one per
-            // transmission the connect/disconnect handshake makes); only the
-            // session pushes count here.
-            fn next_session_push(
-                rx: &mut tokio::sync::broadcast::Receiver<String>,
-            ) -> Option<WsServerMessage> {
-                while let Ok(json) = rx.try_recv() {
-                    let msg: WsServerMessage = serde_json::from_str(&json).unwrap();
-                    if !matches!(msg, WsServerMessage::AudioLevel { .. }) {
-                        return Some(msg);
-                    }
-                }
-                None
-            }
             let mut station = EventLoop::new(session_config()).unwrap();
-            let (tx, mut rx) = tokio::sync::broadcast::channel(16);
-            let status = Arc::new(Mutex::new(WsStatus::default()));
-            station.set_ws_broadcast(tx);
-            station.set_ws_status(status.clone());
+            let (mut ws, task) = connect_ws(&mut station).await;
+            let status = station.ws_status.clone().unwrap();
             station
                 .handle_host_event(HostEvent::ConnectRequest {
                     client_id: 1,
@@ -13077,25 +13493,26 @@ mod tests {
                 .handle_connect_req(&LinkCapabilities::default().to_bytes())
                 .unwrap();
             station.handle_mac_pdu(ack).await;
-            let msg = next_session_push(&mut rx).expect("connected push");
-            assert!(
-                matches!(msg, WsServerMessage::Connected { remote_call } if remote_call == "W1AW")
-            );
+            let msg = next_ws_type(&mut ws, "session").await;
+            println!("{msg}");
+            assert_eq!(msg["state"], "connected");
+            assert_eq!(msg["remote_call"], "W1AW");
+            let heard = next_ws_type(&mut ws, "heard").await;
+            assert_eq!(heard["stations"][0]["call"], "W1AW");
+            assert!(heard["stations"][0]["last_heard_ms"].as_u64().unwrap() > 0);
             {
                 let snap = status.lock().await;
                 assert!(snap.connected);
                 assert_eq!(snap.remote_call.as_deref(), Some("W1AW"));
             }
             station.handle_mac_pdu(remote.disconnect().unwrap()).await;
-            let msg = next_session_push(&mut rx).expect("disconnected push");
-            assert!(matches!(msg, WsServerMessage::Disconnected));
+            let msg = next_ws_type(&mut ws, "session").await;
+            println!("{msg}");
+            assert_eq!(msg["state"], "disconnected");
             let snap = status.lock().await;
             assert!(!snap.connected);
             assert_eq!(snap.remote_call, None);
-            assert!(
-                next_session_push(&mut rx).is_none(),
-                "exactly one push per transition"
-            );
+            task.abort();
         }
 
         /// Zero-lead/trail-padded encode, mirroring `coppa-engine`'s own streaming
@@ -14296,6 +14713,7 @@ mod tests {
                 fallback: None,
                 last_peer_evidence: Instant::now(),
                 warned_legacy_payload: false,
+                tx_codewords: 1,
             }
         }
 
@@ -14449,6 +14867,340 @@ mod tests {
                 "segment payloads must reassemble the input in order"
             );
             assert_eq!(event_loop.buffered_tx_bytes(), 0);
+        }
+
+        /// COP-69 test rig: 2000 incompressible bytes (the
+        /// `session_chunks_respect_the_encoded_budget` LCG), the shape a
+        /// full multi-codeword frame is cut from.
+        fn cop69_incompressible(len: usize) -> Vec<u8> {
+            let mut seed: u32 = 0xC0_69_C0_69;
+            (0..len)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    (seed >> 16) as u8
+                })
+                .collect()
+        }
+
+        /// COP-69 test rig: a station pinned to level 8 on `HF_STANDARD`
+        /// (level-derived engines resolve 8 to VHF, which would change the
+        /// waveform under test), with a large audio ring so one test can
+        /// read whole 8-codeword frames back.
+        fn cop69_station_config() -> DaemonConfig {
+            let mut config = session_config();
+            config.engine.profile = "HF_STANDARD".into();
+            config
+        }
+
+        /// COP-69 test rig: a wired station (audio ring attached) with an
+        /// established multi-codeword-capable session at level 8, station-ID
+        /// frame suppressed. Returns the consumer the frames arrive on.
+        fn cop69_station_with(config: DaemonConfig) -> (EventLoop, coppa_audio::AudioRingConsumer) {
+            let mut event_loop = EventLoop::new(config).unwrap();
+            event_loop.engine.set_speed_level(8).unwrap();
+            let (producer, consumer) = coppa_audio::audio_ring(8_000_000);
+            event_loop.set_audio_out(producer);
+            mark_identified(&mut event_loop);
+            let session_id = seed_established_multi_frame_ack(&mut event_loop);
+            event_loop.ensure_session_link(session_id);
+            (event_loop, consumer)
+        }
+
+        /// COP-69 test rig: the default level-8 `HF_STANDARD` station.
+        fn cop69_station() -> (EventLoop, coppa_audio::AudioRingConsumer) {
+            cop69_station_with(cop69_station_config())
+        }
+
+        /// COP-69 test rig: `seed_established` with both ends advertising
+        /// `multi_frame_ack`, so the negotiated caps allow multi-codeword
+        /// session frames.
+        fn seed_established_multi_frame_ack(event_loop: &mut EventLoop) -> u8 {
+            let local = LinkCapabilities {
+                multi_frame_ack: true,
+                ..LinkCapabilities::default()
+            };
+            let peer = LinkCapabilities {
+                multi_frame_ack: true,
+                ..LinkCapabilities::default()
+            };
+            let id = event_loop
+                .session_mgr
+                .create(
+                    Callsign::new("VK3ABC").unwrap(),
+                    Callsign::new("W1AW").unwrap(),
+                    0,
+                    local,
+                )
+                .unwrap();
+            let req = event_loop
+                .session_mgr
+                .get_mut(id)
+                .unwrap()
+                .initiate()
+                .unwrap();
+            let mut peer_session = coppa_protocol::session::Session::new(
+                0,
+                Callsign::new("W1AW").unwrap(),
+                Callsign::new("VK3ABC").unwrap(),
+                0,
+                peer,
+            );
+            let ack = peer_session.handle_connect_req(&req.payload).unwrap();
+            let session = event_loop.session_mgr.get_mut(id).unwrap();
+            session.handle_connect_ack(&ack.payload).unwrap();
+            assert!(session
+                .negotiated
+                .as_ref()
+                .is_some_and(|c| c.multi_frame_ack));
+            id
+        }
+
+        /// COP-69 test rig: batch-decode the first frame in `samples` on a
+        /// clean loopback and return its header plus payload, so tests
+        /// assert the codeword count on the encoded wire, not by reading
+        /// code.
+        fn cop69_decode(samples: &[f32]) -> (coppa_codec::ofdm::frame::CoppaHeader, Vec<u8>) {
+            let rx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(
+                coppa_codec::ofdm::CoppaProfile::hf_standard(),
+                1,
+            );
+            let (header, payload, _) = rx
+                .receive(samples)
+                .expect("a clean loopback frame must decode");
+            (header, payload)
+        }
+
+        #[tokio::test]
+        async fn multi_codeword_session_rto_covers_airtime_and_ack_after_rtt_sample() {
+            let mut config = cop69_station_config();
+            config.radio.turnaround_ms = 500;
+            let (mut event_loop, mut consumer) = cop69_station_with(config);
+            event_loop.engine.set_speed_level(2).unwrap();
+            for _ in 0..2 {
+                event_loop
+                    .handle_host_event(HostEvent::DataReceived {
+                        client_id: 1,
+                        data: cop69_incompressible(2000),
+                    })
+                    .await;
+                let audio = read_all(&mut consumer);
+                let airtime = Duration::from_secs_f64(audio.len() as f64 / 48_000.0);
+                assert!(airtime > Duration::from_secs(9));
+                let link = event_loop.session_link.as_mut().unwrap();
+                assert_eq!(link.tx_codewords, 8);
+                let floor = airtime + Duration::from_millis(1000 + 1365);
+                assert!(
+                    link.tx.rto() >= floor,
+                    "RTO {:?} < floor {floor:?}",
+                    link.tx.rto()
+                );
+                let now = Instant::now();
+                assert!(link
+                    .tx
+                    .get_retransmits(now + Duration::from_secs(5))
+                    .is_empty());
+                // A tiny synthetic RTT must not discard the multi-codeword floor.
+                let ack = link.tx.next_seq();
+                link.tx.process_ack(ack, 0, now);
+                assert!(link.tx.rto() >= floor);
+                link.backlog.clear();
+                event_loop.handle_ptt_change(false).await;
+            }
+        }
+
+        /// COP-69: a backlog beyond one codeword's budget, with the
+        /// capability negotiated, is cut as ONE multi-codeword frame -- the
+        /// header on the wire says `codewords = 8`, the whole 8-codeword
+        /// budget is spent, and only the remainder stays backlogged.
+        #[tokio::test]
+        async fn drain_session_link_cuts_full_multi_codeword_frame() {
+            let (mut event_loop, mut consumer) = cop69_station();
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: cop69_incompressible(2000),
+                })
+                .await;
+            let audio = read_all(&mut consumer);
+            let (header, _) = cop69_decode(&audio);
+            assert_eq!(header.codewords, 8, "the frame must carry 8 codewords");
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx.in_flight(), 1);
+            assert_eq!(link.tx_codewords, 8);
+            let budget = max_multi_payload_for_level(8, 8).unwrap();
+            let seq = link.tx.send_base();
+            let segment = link.tx.get_segment_data(seq).unwrap();
+            assert!(
+                event_loop
+                    .engine
+                    .encoded_payload_len_with_codewords(&session_data_frame(link, seq, segment), 8)
+                    <= budget,
+                "the segment must fill (not exceed) the 8-codeword budget"
+            );
+            assert!(
+                !link.backlog.is_empty(),
+                "2000 B cannot fit one frame; the remainder must stay backlogged"
+            );
+        }
+
+        /// COP-69: `[session] max_codewords_per_frame` bounds the count a
+        /// frame is cut at, whatever the backlog asks for.
+        #[tokio::test]
+        async fn drain_session_link_respects_config_cap() {
+            let mut config = cop69_station_config();
+            config.session.max_codewords_per_frame = 3;
+            let (mut event_loop, mut consumer) = cop69_station_with(config);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: cop69_incompressible(2000),
+                })
+                .await;
+            let audio = read_all(&mut consumer);
+            let (header, _) = cop69_decode(&audio);
+            assert_eq!(header.codewords, 3, "the operator cap must bind");
+        }
+
+        /// COP-69: a backlog that fits one codeword's budget is sent as a
+        /// single-codeword frame -- bigger frames are chosen by need, not
+        /// by default.
+        #[tokio::test]
+        async fn drain_session_link_small_backlog_stays_single() {
+            let (mut event_loop, mut consumer) = cop69_station();
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: cop69_incompressible(100),
+                })
+                .await;
+            let audio = read_all(&mut consumer);
+            let (header, _) = cop69_decode(&audio);
+            assert_eq!(header.codewords, 1, "a small backlog must stay 1-codeword");
+        }
+
+        /// COP-69: without the negotiated capability the session link keeps
+        /// today's exact wire behavior -- 1-codeword frames however large
+        /// the backlog is (the interop fallback, asserted on the wire).
+        #[tokio::test]
+        async fn drain_session_link_without_capability_stays_single() {
+            let mut event_loop = EventLoop::new(cop69_station_config()).unwrap();
+            event_loop.engine.set_speed_level(8).unwrap();
+            let (producer, mut consumer) = coppa_audio::audio_ring(8_000_000);
+            event_loop.set_audio_out(producer);
+            mark_identified(&mut event_loop);
+            seed_established(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: cop69_incompressible(2000),
+                })
+                .await;
+            let audio = read_all(&mut consumer);
+            let (header, _) = cop69_decode(&audio);
+            assert_eq!(
+                header.codewords, 1,
+                "no capability, no multi-codeword frames"
+            );
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx_codewords, 1);
+        }
+
+        /// COP-69: a lost 8-codeword frame retransmits as an 8-codeword
+        /// frame -- same seq, byte-identical chunk and payload -- so ARQ
+        /// semantics survive the multi-codeword extension.
+        #[tokio::test]
+        async fn session_retransmit_reencodes_same_codeword_count() {
+            let (mut event_loop, mut consumer) = cop69_station();
+            fast_session_rto(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: cop69_incompressible(2000),
+                })
+                .await;
+            let first = read_all(&mut consumer);
+            let (first_header, first_payload) = cop69_decode(&first);
+            assert_eq!(first_header.codewords, 8);
+
+            event_loop.handle_ptt_change(false).await;
+            sleep_past_session_rto(&event_loop);
+            event_loop.check_session_retransmits().await;
+            let again = read_all(&mut consumer);
+            assert!(!again.is_empty(), "the lost frame must be retransmitted");
+            let (header, payload) = cop69_decode(&again);
+            assert_eq!(
+                header.codewords, 8,
+                "the retransmission must stay 8-codeword"
+            );
+            assert_eq!(header.speed_level, first_header.speed_level);
+            assert_eq!(payload, first_payload, "the frame must be byte-identical");
+        }
+
+        /// COP-69: the fade hold's fallback level is judged against the
+        /// segment's codeword budget. An 8-codeword segment whose encoded
+        /// length no 1-codeword budget can hold still finds a fallback
+        /// level (the twin admits it), the retransmission there encodes
+        /// successfully at the same codeword count, and the 1-codeword
+        /// `fittest_level` would have had no level to offer.
+        #[tokio::test]
+        async fn fade_hold_fallback_accepts_multi_codeword_segment() {
+            let (mut event_loop, mut consumer) = cop69_station();
+            fast_session_rto(&mut event_loop);
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: cop69_incompressible(2000),
+                })
+                .await;
+            read_all(&mut consumer);
+            // Exhaust the retry budget with every leg lost, then confirm
+            // one in-hold retransmission really encodes at the fallback
+            // level with the same codeword count.
+            let mut fallback_level = None;
+            for _ in 0..16 {
+                event_loop.handle_ptt_change(false).await;
+                sleep_past_session_rto(&event_loop);
+                event_loop.check_session_retransmits().await;
+                read_all(&mut consumer);
+                if let Some(level) = event_loop
+                    .session_link
+                    .as_ref()
+                    .and_then(|l| l.fallback.as_ref())
+                    .map(|f| f.level)
+                {
+                    fallback_level = Some(level);
+                    break;
+                }
+            }
+            let fallback_level =
+                fallback_level.expect("the fade hold must be entered within 16 passes");
+            event_loop.handle_ptt_change(false).await;
+            sleep_past_session_rto(&event_loop);
+            event_loop.check_session_retransmits().await;
+            let held = read_all(&mut consumer);
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx_codewords, 8);
+            let seq = link.tx.send_base();
+            let segment = link.tx.get_segment_data(seq).unwrap();
+            let encoded_len = event_loop
+                .engine
+                .encoded_payload_len_with_codewords(&session_data_frame(link, seq, segment), 8);
+            assert!(
+                max_multi_payload_for_level(fallback_level, 8).unwrap() >= encoded_len,
+                "the fallback level's 8-codeword budget must fit the segment \
+                 (level {fallback_level}, encoded {encoded_len})"
+            );
+            assert!(
+                (1..=8).all(|l| max_payload_for_level(l).is_some_and(|b| b < encoded_len)),
+                "no level's 1-codeword budget can hold a full 8-codeword segment \
+                 (the pre-COP-69 rule had no fallback level to offer)"
+            );
+            let (header, _) = cop69_decode(&held);
+            assert_eq!(
+                header.codewords, 8,
+                "the held retransmission stays 8-codeword"
+            );
+            assert_eq!(header.speed_level, fallback_level);
         }
 
         /// COP-41: no pacing regression for the common case -- a small
@@ -18441,10 +19193,16 @@ mod tests {
                 "status: {:?}",
                 run.a_status
             );
-            // At most 95 host bytes fit a level-2 frame (budget 117 minus the
-            // 14-byte MAC and 7-byte transport headers minus one).
+            // A frame's host-byte capacity is the session link's codeword
+            // budget (per-codeword budget x the negotiated/capped codeword
+            // count) minus the 14-byte MAC and 7-byte transport headers
+            // minus one. Before COP-69 this was 95 (level 2, one codeword);
+            // this rig's default engine is level 1 (56 B per codeword) and
+            // the pair now negotiates 8-codeword frames.
+            let per_cw = max_payload_for_level(1).unwrap();
+            let capacity = per_cw * 8 - MacPdu::HEADER_SIZE - TRANSPORT_HEADER_SIZE - 1;
             assert!(
-                run.delivered.len() >= payload.len().div_ceil(95),
+                run.delivered.len() >= payload.len().div_ceil(capacity),
                 "{} frames",
                 run.delivered.len()
             );

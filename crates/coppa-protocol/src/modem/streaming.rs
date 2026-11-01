@@ -29,9 +29,12 @@
 //!    keeps running on every sample pushed regardless, so a second frame's preamble
 //!    may already be queued by the time the first candidate is abandoned.
 //! 2. Once the header's speed level is known, `need` is extended to cover the full
-//!    frame (payload symbol count from `SPEED_LEVELS`). Once buffered, the full
-//!    `CoppaTransceiver::receive_with_metrics` runs on exactly that slice, is
-//!    emitted as a [`DecodedFrame`], and the receiver returns to `Searching`.
+//!    frame (payload symbol count from `SPEED_LEVELS`, scaled by the header's
+//!    `codewords` count — COP-69: the streaming path previously omitted that
+//!    multiplier and so could not decode a multi-codeword frame at all). Once
+//!    buffered, the full `CoppaTransceiver::receive_with_metrics` runs on exactly
+//!    that slice, is emitted as a [`DecodedFrame`], and the receiver returns to
+//!    `Searching`.
 use std::collections::VecDeque;
 
 use coppa_codec::ofdm::coppa_modem::SPEED_LEVELS;
@@ -40,7 +43,7 @@ use coppa_codec::ofdm::header_fec;
 use coppa_codec::ofdm::sync_detector::{SyncCandidate, SyncDetector};
 use coppa_codec::ofdm::CoppaProfile;
 
-use crate::modem::transceiver::{CoppaTransceiver, ReceiveError};
+use crate::modem::transceiver::{CoppaTransceiver, ReceiveError, MAX_CODEWORDS};
 
 /// LDPC coded block length (Z=81, 24 base columns) — constant for all code rates;
 /// mirrors `CoppaModem::demodulate_frame`'s own `CODED_BLOCK_LEN`.
@@ -51,6 +54,29 @@ const CODED_BLOCK_LEN: usize = 1944;
 /// (`coppa_dsp::fir::design_bandpass(601, ..)`). Needed here only to compute that
 /// filter's group delay; see [`StreamingReceiver::header_peek`]'s doc.
 const RX_BPF_TAPS: usize = 601;
+
+/// Total OFDM symbols one frame occupies on air: 3 preamble symbols, the
+/// protected header, and a payload region of `codewords` back-to-back
+/// 1944-coded-bit LDPC blocks at this speed level's constellation size, packed
+/// `data_carriers`-at-a-time into OFDM symbols.
+///
+/// COP-69: `codewords` comes from the decoded header (`header.codewords`,
+/// 1..=[`MAX_CODEWORDS`]). This is the same multiplier the batch demod
+/// (`CoppaModem::demodulate_frame_impl`) applies; the streaming path must agree
+/// with it or it under-buffers — and then mis-slices — every multi-codeword
+/// frame. Phase 5 prep: a short-ACK frame class will extend this helper with a
+/// frame-class parameter instead of always assuming a full codeword-block
+/// payload region.
+fn frame_symbol_count(
+    header_syms: usize,
+    bits_per_symbol: usize,
+    data_carriers: usize,
+    codewords: usize,
+) -> usize {
+    let coded_symbols = CODED_BLOCK_LEN.div_ceil(bits_per_symbol) * codewords.max(1);
+    let payload_syms = coded_symbols.div_ceil(data_carriers);
+    3 + header_syms + payload_syms
+}
 
 /// One frame fully decoded by [`StreamingReceiver::push_samples`].
 #[derive(Debug, Clone)]
@@ -105,8 +131,9 @@ pub struct StreamingReceiver {
     /// this profile's data carriers per symbol) — constant for a given profile,
     /// independent of speed level.
     header_syms: usize,
-    /// Upper bound on any single frame's sample length for this profile (worst case
-    /// across all 9 speed levels); used to keep the ring bounded while searching.
+    /// Upper bound on any single frame's sample length for this profile (worst
+    /// case across all 9 speed levels at up to [`MAX_CODEWORDS`] codewords);
+    /// used to keep the ring bounded while searching.
     max_frame_samples: usize,
     /// Group delay (samples) of the RX bandpass filter `CoppaTransceiver` applies
     /// internally for HF profiles; `0` for VHF (no RX bandpass at all). See
@@ -225,11 +252,18 @@ impl StreamingReceiver {
 
     /// Ring capacity: 2 × max frame length, computed from the profile + SPEED_LEVELS.
     ///
-    /// Every frame is exactly `3 + header_syms + payload_syms(level)` OFDM symbols —
-    /// `payload_len` only controls how many bytes are extracted from the resulting
-    /// fixed-size (1944-coded-bit) LDPC block afterward, not how many symbols are
-    /// transmitted (see `CoppaModem::demodulate_frame`'s doc). So the worst case
-    /// across all 9 speed levels is a genuine, profile-only upper bound.
+    /// Every frame is exactly `3 + header_syms + payload_syms(level, codewords)`
+    /// OFDM symbols — `payload_len` only controls how many bytes are extracted
+    /// from the resulting fixed-size (1944-coded-bit) LDPC blocks afterward, not
+    /// how many symbols are transmitted (see `CoppaModem::demodulate_frame`'s
+    /// doc). COP-69: `payload_syms` scales with the header's codeword count, so
+    /// the worst case is the most robust speed level (BPSK) at
+    /// [`MAX_CODEWORDS`] codewords — for `hf_standard` that is 361 symbols × 1260
+    /// samples = 454,860 samples per frame, so the ring target is ~909,720
+    /// samples ≈ 3.6 MB at 4 bytes/sample. That is a deliberate size decision,
+    /// not an accident: it is what lets the daemon's real receive path hold a
+    /// whole 8-codeword frame plus searching history (the pre-COP-69 bound was
+    /// the single-codeword 65,520, under 1/3rd of one such frame).
     ///
     /// `payload_syms(level)` is OFDM symbols, not constellation (bit-group) symbols:
     /// 1944 coded bits pack into `1944.div_ceil(bits_per_symbol)` constellation
@@ -239,16 +273,22 @@ impl StreamingReceiver {
     pub fn max_frame_samples(profile: &CoppaProfile) -> usize {
         let symbol_len = profile.fft_size + profile.cp_samples;
         let header_syms = header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(profile.data_carriers);
-        let max_payload_syms = SPEED_LEVELS
+        // `frame_symbol_count` is monotone in `codewords` for every level, so
+        // evaluating at MAX_CODEWORDS yields each level's worst case; the max
+        // over levels is then the profile's true bound.
+        let max_syms = SPEED_LEVELS
             .iter()
             .map(|sl| {
-                CODED_BLOCK_LEN
-                    .div_ceil(sl.bits_per_symbol as usize)
-                    .div_ceil(profile.data_carriers)
+                frame_symbol_count(
+                    header_syms,
+                    sl.bits_per_symbol as usize,
+                    profile.data_carriers,
+                    MAX_CODEWORDS as usize,
+                )
             })
             .max()
             .unwrap_or(0);
-        (3 + header_syms + max_payload_syms) * symbol_len
+        max_syms * symbol_len
     }
 
     /// Current number of raw samples retained in the ring (test/diagnostic hook).
@@ -271,7 +311,11 @@ impl StreamingReceiver {
     /// to supply the last sample a pending candidate needs pays the full
     /// `receive_with_metrics` demod/FEC cost synchronously, inline, before
     /// returning — measured at ~26-33ms for the slower/most robust speed levels on
-    /// this profile. A caller on a latency-sensitive loop (e.g. an async event
+    /// this profile. COP-69: a multi-codeword frame's completing call pays every
+    /// codeword's LDPC pass, so the worst case grows toward ~8x that for an
+    /// 8-codeword frame at the slowest level (amortized per-sample cost is
+    /// unchanged — same total FEC work, just concentrated in one call). A caller
+    /// on a latency-sensitive loop (e.g. an async event
     /// loop driving audio I/O) should expect an occasional call to stall for a
     /// full frame's decode time, not assume every call is cheap. See
     /// `coppa-daemon/src/event_loop.rs`'s `handle_audio_in` for how the daemon
@@ -337,11 +381,19 @@ impl StreamingReceiver {
                     Some(header) => {
                         match SPEED_LEVELS.iter().find(|s| s.level == header.speed_level) {
                             Some(sl) => {
-                                let coded_symbols =
-                                    CODED_BLOCK_LEN.div_ceil(sl.bits_per_symbol as usize);
-                                let payload_syms = coded_symbols.div_ceil(self.data_carriers);
-                                let full_need =
-                                    (3 + self.header_syms + payload_syms) * self.symbol_len;
+                                // COP-69: the payload region scales with the
+                                // header's codeword count (up to MAX_CODEWORDS),
+                                // matching what the TX side and the batch demod
+                                // both assume. Before this multiplier, a
+                                // multi-codeword frame was "completed" after its
+                                // first codeword's worth of samples and every
+                                // such frame failed decode.
+                                let full_need = frame_symbol_count(
+                                    self.header_syms,
+                                    sl.bits_per_symbol as usize,
+                                    self.data_carriers,
+                                    header.codewords.max(1) as usize,
+                                ) * self.symbol_len;
                                 let p = self.pending.as_mut().expect("checked above");
                                 p.need = full_need;
                                 p.header = Some(header);
@@ -495,7 +547,7 @@ impl StreamingReceiver {
     ///
     /// # `SYNC_LEAD_MARGIN`/`HEADER_PEEK_ANCHOR_MARGIN` padding (confirmed VHF
     /// `TIMING_BACKOFF` bug fix, see
-    /// `.superpowers/sdd/vhf-timing-backoff-fix-report.md`)
+    /// `docs/analysis/2026-08-01-vhf-timing-backoff-fix-report.md`)
     ///
     /// For a profile with no TX bandpass filter (VHF, i.e. `self.rx_group_delay
     /// == 0` -- see that field's doc) ONLY: `demodulate_header` ->
@@ -581,6 +633,7 @@ impl StreamingReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modem::speed_levels::max_multi_payload_for_level;
     use coppa_codec::ofdm::frame::CoppaFrameType;
 
     fn header(speed_level: u8, payload_len: u16) -> CoppaHeader {
@@ -601,6 +654,28 @@ mod tests {
         let h = header(speed_level, payload.len() as u16);
         tx.transmit(&h, payload)
             .expect("payload within this test's speed level capacity")
+    }
+
+    /// COP-69 Phase 1 multi-codeword rig: a full-budget frame at
+    /// (`speed_level`, `codewords`), same shape the batch-path multi-codeword
+    /// tests in `transceiver.rs` build.
+    fn make_multi_frame(
+        tx: &CoppaTransceiver,
+        speed_level: u8,
+        payload: &[u8],
+        codewords: u8,
+    ) -> Vec<f32> {
+        let mut h = header(speed_level, payload.len() as u16);
+        h.codewords = codewords;
+        tx.transmit(&h, payload)
+            .expect("payload within this test's multi-codeword capacity")
+    }
+
+    /// A full-budget payload for (`speed_level`, `codewords`) with non-trivial
+    /// content (not all-zero, not repeating single bytes).
+    fn multi_payload(level: u8, codewords: u8) -> Vec<u8> {
+        let max = max_multi_payload_for_level(level, codewords).expect("level on the ladder");
+        (0..max).map(|i| (i % 251) as u8).collect()
     }
 
     /// Feed chunk sizes cycling through this list, regardless of how evenly they
@@ -867,5 +942,174 @@ mod tests {
             decoded.len()
         );
         assert_eq!(decoded[0].payload[..payload2.len()], payload2[..]);
+    }
+
+    // ---- COP-69 Phase 1: the streaming path learns `header.codewords` ----
+    //
+    // Before the fix, `full_need` computed the payload region for exactly one
+    // codeword, so an N-codeword frame was "completed" after 1/N of its samples
+    // and every multi-codeword frame failed decode — while the batch
+    // `CoppaTransceiver::receive` path decoded the same audio perfectly
+    // (research probe `crates/coppa-engine/examples/cop69_probe.rs`, part C:
+    // 0 of 1 decoded). The ring bound had the same blind spot: it maximized
+    // over single-codeword frames only.
+
+    /// An 8-codeword level-8 HF frame (the ticket's 64-QAM case: 8 x 158 = 1264
+    /// B) decodes through the streaming path in a single `push_samples` call.
+    ///
+    /// `CoppaProfile::hf_standard()` is pinned explicitly: `EngineConfig::
+    /// default()` is `LevelDerived` and resolves level 8 to `vhf_wide`, which
+    /// cost the research phase one false reading.
+    #[test]
+    fn streaming_decodes_eight_codeword_frame_hf_level8() {
+        let profile = CoppaProfile::hf_standard();
+        let tx = CoppaTransceiver::new(profile.clone(), 1);
+        let payload = multi_payload(8, 8);
+        let frame = make_multi_frame(&tx, 8, &payload, 8);
+
+        let symbol_len = profile.fft_size + profile.cp_samples;
+        let mut stream = Vec::new();
+        // 8+ symbols of leading silence (see the bootstrap note in
+        // `streaming_decodes_frames_fed_in_odd_chunks`).
+        stream.extend(std::iter::repeat_n(0.0f32, 8 * symbol_len));
+        stream.extend_from_slice(&frame);
+        stream.extend(std::iter::repeat_n(0.0f32, 4 * symbol_len));
+
+        let mut rx = StreamingReceiver::new(profile, 1);
+        let decoded = rx.push_samples(&stream);
+
+        assert_eq!(
+            decoded.len(),
+            1,
+            "the 8-codeword frame must decode through the streaming path"
+        );
+        assert_eq!(decoded[0].header.codewords, 8);
+        assert_eq!(decoded[0].payload[..payload.len()], payload[..]);
+    }
+
+    /// The same 8-codeword frame fed in 4800-sample pushes across many calls —
+    /// the daemon's real feed pattern (`handle_audio_in`'s ring-sized reads).
+    #[test]
+    fn streaming_decodes_multi_codeword_fed_in_small_chunks() {
+        let profile = CoppaProfile::hf_standard();
+        let tx = CoppaTransceiver::new(profile.clone(), 1);
+        let payload = multi_payload(8, 8);
+        let frame = make_multi_frame(&tx, 8, &payload, 8);
+
+        let symbol_len = profile.fft_size + profile.cp_samples;
+        let mut stream = Vec::new();
+        stream.extend(std::iter::repeat_n(0.0f32, 4 * symbol_len));
+        stream.extend_from_slice(&frame);
+        stream.extend(std::iter::repeat_n(0.0f32, 4 * symbol_len));
+
+        let mut rx = StreamingReceiver::new(profile, 1);
+        let decoded = push_in_chunks(&mut rx, &stream, &[4800]);
+
+        assert_eq!(
+            decoded.len(),
+            1,
+            "the 8-codeword frame must decode when fed in 4800-sample chunks"
+        );
+        assert_eq!(decoded[0].header.codewords, 8);
+        assert_eq!(decoded[0].payload[..payload.len()], payload[..]);
+    }
+
+    /// An 8-codeword frame followed by a 1-codeword frame: both decode, and
+    /// the second frame's candidate survives the first frame's much longer
+    /// accumulation (the staleness filter and `resume_from` advance must not
+    /// eat it, and the first frame's `need` must not swallow it).
+    #[test]
+    fn streaming_multi_codeword_back_to_back_frames() {
+        let profile = CoppaProfile::hf_standard();
+        let tx = CoppaTransceiver::new(profile.clone(), 1);
+        let payload8 = multi_payload(8, 8);
+        let payload1 = b"single follows the big frame".to_vec();
+        let frame8 = make_multi_frame(&tx, 8, &payload8, 8);
+        let frame1 = make_frame(&tx, 8, &payload1);
+
+        let symbol_len = profile.fft_size + profile.cp_samples;
+        let mut stream = Vec::new();
+        stream.extend(std::iter::repeat_n(0.0f32, 4 * symbol_len));
+        stream.extend_from_slice(&frame8);
+        // ~4 symbols of silence between the two frames.
+        stream.extend(std::iter::repeat_n(0.0f32, 5000));
+        stream.extend_from_slice(&frame1);
+        stream.extend(std::iter::repeat_n(0.0f32, 4 * symbol_len));
+
+        let mut rx = StreamingReceiver::new(profile, 1);
+        let decoded = push_in_chunks(&mut rx, &stream, &[4800]);
+
+        assert_eq!(
+            decoded.len(),
+            2,
+            "both the 8-codeword and the 1-codeword frame must decode, got {}",
+            decoded.len()
+        );
+        assert_eq!(decoded[0].header.codewords, 8);
+        assert_eq!(decoded[1].header.codewords, 1);
+        assert_eq!(decoded[0].payload[..payload8.len()], payload8[..]);
+        assert_eq!(decoded[1].payload[..payload1.len()], payload1[..]);
+    }
+
+    /// The ring bound must cover the longest frame the ladder can now produce:
+    /// an 8-codeword BPSK frame (361 symbols on `hf_standard`). Before COP-69
+    /// the bound was the single-codeword maximum (65,520 samples) — under a
+    /// third of that frame's 454,860 samples.
+    #[test]
+    fn max_frame_samples_covers_eight_codeword_bpsk() {
+        let profile = CoppaProfile::hf_standard();
+        let tx = CoppaTransceiver::new(profile.clone(), 1);
+        let payload = multi_payload(2, 8); // level 2 = BPSK, the longest frames
+        let frame = make_multi_frame(&tx, 2, &payload, 8);
+
+        let max = StreamingReceiver::max_frame_samples(&profile);
+        assert!(
+            max >= frame.len(),
+            "max_frame_samples ({max}) must cover an 8-codeword BPSK frame ({})",
+            frame.len()
+        );
+    }
+
+    /// Trailing garbage after a long frame must neither evict nor corrupt the
+    /// pending frame: the ring policy was written for <= 52-symbol frames, and
+    /// a 66-symbol frame accumulates across many chunked pushes while noise
+    /// (which may confirm spurious sync candidates) streams in behind it.
+    #[test]
+    fn streaming_multi_codeword_with_trailing_garbage() {
+        let profile = CoppaProfile::hf_standard();
+        let tx = CoppaTransceiver::new(profile.clone(), 1);
+        let payload = multi_payload(8, 8);
+        let frame = make_multi_frame(&tx, 8, &payload, 8);
+
+        let symbol_len = profile.fft_size + profile.cp_samples;
+        let max_frame = StreamingReceiver::max_frame_samples(&profile);
+        let mut stream = Vec::new();
+        stream.extend(std::iter::repeat_n(0.0f32, 4 * symbol_len));
+        stream.extend_from_slice(&frame);
+        // A frame-length-and-a-half of trailing noise after the frame.
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(69);
+        stream.extend(
+            (0..frame.len() + frame.len() / 2).map(|_| rng.random_range(-0.05f32..0.05f32)),
+        );
+
+        let mut rx = StreamingReceiver::new(profile, 1);
+        let decoded = push_in_chunks(&mut rx, &stream, &[4800]);
+
+        assert_eq!(
+            decoded.len(),
+            1,
+            "exactly the multi-codeword frame must decode, got {}",
+            decoded.len()
+        );
+        assert_eq!(decoded[0].header.codewords, 8);
+        assert_eq!(decoded[0].payload[..payload.len()], payload[..]);
+        assert!(
+            rx.len() <= 2 * max_frame,
+            "ring len {} exceeded 2*max_frame_samples ({})",
+            rx.len(),
+            2 * max_frame
+        );
     }
 }

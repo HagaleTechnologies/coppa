@@ -1,6 +1,6 @@
 //! LZ4 compression wrapper using lz4_flex.
 
-use anyhow::{anyhow, Result};
+use crate::ProtocolError;
 
 /// Maximum decompressed size (16 KiB). Prevents OOM from crafted input.
 /// This is 64x the maximum frame payload (255 bytes), providing generous
@@ -16,19 +16,18 @@ pub fn lz4_compress(data: &[u8]) -> Vec<u8> {
 ///
 /// Rejects inputs that claim a decompressed size larger than 16 KiB
 /// to prevent out-of-memory attacks from crafted payloads.
-pub fn lz4_decompress(data: &[u8]) -> Result<Vec<u8>> {
+pub fn lz4_decompress(data: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     if data.len() >= 4 {
         let claimed_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
         if claimed_size > MAX_DECOMPRESS_SIZE {
-            return Err(anyhow!(
-                "LZ4 claimed decompressed size {} exceeds limit {}",
-                claimed_size,
-                MAX_DECOMPRESS_SIZE
-            ));
+            return Err(ProtocolError::DecompressionSizeExceeded {
+                claimed: claimed_size,
+                limit: MAX_DECOMPRESS_SIZE,
+            });
         }
     }
     lz4_flex::decompress_size_prepended(data)
-        .map_err(|e| anyhow!("LZ4 decompression failed: {}", e))
+        .map_err(|e| ProtocolError::Lz4Decompression { source: e })
 }
 
 #[cfg(test)]
@@ -65,7 +64,9 @@ mod tests {
     #[test]
     fn test_lz4_invalid_data() {
         let result = lz4_decompress(&[0xFF, 0xFF, 0xFF, 0xFF]);
-        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(ProtocolError::DecompressionSizeExceeded { claimed, limit: 16_384 }) if claimed == u32::MAX as usize)
+        );
     }
 
     #[test]

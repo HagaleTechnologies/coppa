@@ -175,7 +175,7 @@
 //! **Residual, stated plainly:** if step 6 *and* every retransmission of the
 //! third leg are lost, A's G4 fires and reverts A while B stays on the new
 //! mode. That is multi-leg loss, which this design does not claim to cover
-//! for any leg (see `CLAUDE.md`'s COP-1 bullet); single-leg loss of all five
+//! for any leg (see `docs/LIMITATIONS.md`'s COP-1 bullet); single-leg loss of all five
 //! droppable frames does converge.
 //!
 //! This module owns only G3's clock; G1/G2/G4 are ARQ-budget-driven and
