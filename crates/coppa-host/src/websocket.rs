@@ -74,8 +74,9 @@ pub enum WsServerMessage {
         /// `CpRecommendation::ShortCp`, `Some(false)` = `CpRecommendation::
         /// LongCp`, `None` = `[engine] cp_gate_enabled` is off or no frame has
         /// decoded yet. Measurement/telemetry only -- does not mean the daemon
-        /// has switched (or will switch) CP profile. See `docs/superpowers/
-        /// specs/2026-07-25-cpgate-daemon-wiring-design.md`.
+        /// has switched (or will switch) CP profile. See `BENCHMARKS.md`'s
+        /// "Short-CP coherence-time lever" section (2026-07-25 `CpGate` daemon
+        /// wiring entry).
         #[serde(skip_serializing_if = "Option::is_none")]
         short_cp_ok: Option<bool>,
         /// COP-2: count of distinct CP-mode desync episodes the daemon has observed
@@ -1571,6 +1572,19 @@ mod tests {
             std::fs::write(schema_path(), &generated).unwrap();
         }
         assert_eq!(std::fs::read_to_string(schema_path()).expect("run UPDATE_WS_SCHEMA=1 cargo test -p coppa-host --features websocket --lib schema_file_matches_derived"), generated);
+    }
+
+    /// The schema is a tracked, published contract: its doc-comment-derived
+    /// descriptions must not cite the gitignored `docs/superpowers/` or
+    /// `.superpowers/` working notes (AGENTS.md, "where docs live").
+    #[test]
+    fn schema_cites_no_local_working_notes() {
+        let schema = schemars::schema_for!(ProtocolMessage);
+        let generated = serde_json::to_string(&schema).unwrap();
+        assert!(
+            !generated.contains("superpowers"),
+            "schema cites local notes"
+        );
     }
 
     #[test]

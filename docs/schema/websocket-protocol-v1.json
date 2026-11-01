@@ -325,7 +325,7 @@
               ]
             },
             "short_cp_ok": {
-              "description": "`coppa_ml::CpGate`'s live short-CP recommendation: `Some(true)` = `CpRecommendation::ShortCp`, `Some(false)` = `CpRecommendation:: LongCp`, `None` = `[engine] cp_gate_enabled` is off or no frame has decoded yet. Measurement/telemetry only -- does not mean the daemon has switched (or will switch) CP profile. See `docs/superpowers/ specs/2026-07-25-cpgate-daemon-wiring-design.md`.",
+              "description": "`coppa_ml::CpGate`'s live short-CP recommendation: `Some(true)` = `CpRecommendation::ShortCp`, `Some(false)` = `CpRecommendation:: LongCp`, `None` = `[engine] cp_gate_enabled` is off or no frame has decoded yet. Measurement/telemetry only -- does not mean the daemon has switched (or will switch) CP profile. See `BENCHMARKS.md`'s \"Short-CP coherence-time lever\" section (2026-07-25 `CpGate` daemon wiring entry).",
               "type": [
                 "boolean",
                 "null"
