@@ -1,0 +1,83 @@
+<!doctype html>
+<!--
+  COP-79: the page coppad serves at GET / on its WebSocket port. It is served
+  without a token, so it must never hold one: the operator types the token,
+  it stays in memory, and it is sent only as the ?token= value of the page's
+  own /ws upgrade, which the COP-53 gate checks. No external requests.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coppa operator dashboard</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 2rem; }
+  #rx-level { font-family: ui-monospace, monospace; white-space: pre; }
+</style>
+</head>
+<body>
+<h1>Coppa modem daemon</h1>
+<p id="ws-status">WebSocket: Not connected</p>
+<form id="connect">
+  <label for="token">Access token:</label>
+  <input id="token" type="password" autocomplete="off" required>
+  <button type="submit">Connect</button>
+</form>
+<p id="rx-level">RX level: —</p>
+<script>
+"use strict";
+const statusLine = document.getElementById("ws-status");
+const levelLine = document.getElementById("rx-level");
+const tokenInput = document.getElementById("token");
+let socket = null;
+
+function setStatus(text) { statusLine.textContent = "WebSocket: " + text; }
+function setLevel(text) { levelLine.textContent = "RX level: " + text; }
+function dbfs(value) { return Number(value).toFixed(1); }
+
+document.getElementById("connect").addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (socket) {
+    socket.onclose = null;
+    socket.close();
+  }
+  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  const url = scheme + "//" + location.host + "/ws?token=" +
+    encodeURIComponent(tokenInput.value);
+  let opened = false;
+  setStatus("Connecting…");
+  setLevel("—");
+  const ws = new WebSocket(url);
+  socket = ws;
+  ws.onopen = () => {
+    opened = true;
+    setStatus("Connected");
+    setLevel("waiting for audio");
+    ws.send(JSON.stringify({ type: "audio_level", enabled: true }));
+  };
+  ws.onmessage = (message) => {
+    let msg;
+    try {
+      msg = JSON.parse(message.data);
+    } catch (_) {
+      return;
+    }
+    if (msg.type === "audio_level" && msg.direction === "rx") {
+      setLevel("peak " + dbfs(msg.peak_dbfs) + " dBFS  rms " +
+        dbfs(msg.rms_dbfs) + " dBFS  state " + msg.state);
+    }
+  };
+  ws.onclose = () => {
+    // A browser hides the handshake's 401/403; a socket that never opened
+    // was refused (or the daemon is unreachable).
+    setStatus(opened ? "Not connected"
+      : "Refused: check the token and [host] websocket_allowed_origins");
+    setLevel("—");
+    if (socket === ws) {
+      socket = null;
+    }
+  };
+});
+</script>
+</body>
+</html>

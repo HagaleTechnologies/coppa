@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+use crate::http_route;
 use crate::HostEvent;
 use tokio_tungstenite::tungstenite::handshake::server::{
     Callback, ErrorResponse, Request, Response,
@@ -561,6 +562,9 @@ pub struct WebSocketServer {
     status: std::sync::Arc<tokio::sync::Mutex<WsStatus>>,
     /// COP-53 handshake gate; see [`WsAuth`]. `None` refuses every handshake.
     auth: Option<std::sync::Arc<WsAuth>>,
+    /// COP-79: the page served to a plain (non-upgrade) `GET /`. `None`
+    /// answers such a request `404`.
+    index_html: Option<std::sync::Arc<str>>,
 }
 
 impl WebSocketServer {
@@ -582,6 +586,7 @@ impl WebSocketServer {
             broadcast_tx,
             status: std::sync::Arc::new(tokio::sync::Mutex::new(WsStatus::default())),
             auth: None,
+            index_html: None,
         }
     }
 
@@ -589,6 +594,16 @@ impl WebSocketServer {
     /// `run_with_listener` refuse every handshake with 401.
     pub fn with_auth(mut self, auth: WsAuth) -> Self {
         self.auth = Some(std::sync::Arc::new(auth));
+        self
+    }
+
+    /// COP-79: answer a plain HTTP `GET /` (or `GET /index.html`) on the
+    /// WebSocket port with `html`, so a browser can load a page from the
+    /// same port it then upgrades on. The page is served without a token, so
+    /// it must hold no secret; every upgrade, the page's own included, still
+    /// passes the [`WsAuth`] gate. Without this, such a request gets `404`.
+    pub fn with_index_html(mut self, html: impl Into<String>) -> Self {
+        self.index_html = Some(std::sync::Arc::from(html.into()));
         self
     }
 
@@ -635,7 +650,9 @@ impl WebSocketServer {
     /// Run the WebSocket server, accepting connections and piping events.
     ///
     /// Every handshake is gated by the [`WsAuth`] set with [`Self::with_auth`]
-    /// (COP-53); without one, every handshake is refused with 401. Each
+    /// (COP-53); without one, every handshake is refused with 401. A request
+    /// that is not a WebSocket upgrade gets a static answer instead (COP-79):
+    /// the [`Self::with_index_html`] page at `GET /`, else `404`/`405`. Each
     /// accepted connection gets a unique client ID. Incoming JSON messages are
     /// parsed as `WsClientMessage` and translated to `HostEvent`s.
     /// Data/state events use per-client queues via [`Self::push_handle`].
@@ -675,7 +692,7 @@ impl WebSocketServer {
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
         loop {
-            let (stream, peer) = listener.accept().await?;
+            let (mut stream, peer) = listener.accept().await?;
             // Cap concurrent connections; drop the client if at capacity.
             let permit = match semaphore.clone().try_acquire_owned() {
                 Ok(p) => p,
@@ -690,10 +707,38 @@ impl WebSocketServer {
             let broadcast_tx = self.broadcast_tx.clone();
             let event_tx = self.event_tx.clone();
             let status = self.status.clone();
+            let index_html = self.index_html.clone();
             let clients = self.clients.clone();
 
             tokio::spawn(async move {
                 let _permit = permit;
+                // COP-79: read the request head once and fork on its shape. An
+                // upgrade is replayed unchanged into the COP-53 gate below;
+                // anything else gets a static answer and the connection closes.
+                // Never log the request target or headers: both can carry the
+                // token.
+                let head = match http_route::read_head(&mut stream).await {
+                    Ok(head) => head,
+                    Err(e) => {
+                        if let Some(response) = e.response() {
+                            http_route::respond_and_close(&mut stream, &response).await;
+                        }
+                        tracing::debug!(%peer, error = %e, "HTTP request head refused");
+                        return;
+                    }
+                };
+                let stream = match head.request {
+                    http_route::ClientRequest::Upgrade => {
+                        http_route::PrefixedStream::new(head.bytes, stream)
+                    }
+                    http_route::ClientRequest::Static { method, path } => {
+                        let response =
+                            http_route::static_answer(&method, &path, index_html.as_deref());
+                        http_route::respond_and_close(&mut stream, &response).await;
+                        tracing::debug!(%peer, "Answered a plain HTTP request");
+                        return;
+                    }
+                };
                 // COP-53: refuse the upgrade itself, so a rejected client never
                 // gets a client ID, a broadcast subscription or a parsed message.
                 let mut rejection: Option<(WsRejection, Option<String>)> = None;
@@ -1824,6 +1869,160 @@ mod integration_tests {
             .unwrap();
         assert_eq!(expect_connected(&mut event_rx).await, FIRST_CLIENT_ID);
         drop(ws);
+    }
+
+    const PAGE: &str = "<html>COP-79</html>";
+
+    /// COP-79: start a real, authenticated server that serves `index_html`
+    /// (if any) to plain HTTP requests.
+    async fn start_page_server(
+        index_html: Option<&str>,
+    ) -> (std::net::SocketAddr, mpsc::Receiver<HostEvent>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server =
+            WebSocketServer::with_bind_addr(0, "127.0.0.1".to_string()).with_auth(test_auth());
+        if let Some(html) = index_html {
+            server = server.with_index_html(html);
+        }
+        let event_rx = server.take_event_rx().expect("fresh server");
+        tokio::spawn(async move {
+            let _ = server.run_with_listener(listener).await;
+        });
+        (addr, event_rx)
+    }
+
+    /// Send `request` raw over TCP and return everything the server writes
+    /// before it closes the connection.
+    async fn raw_exchange(addr: std::net::SocketAddr, request: &[u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut response),
+        )
+        .await
+        .expect("the server must close the connection after a static answer")
+        .unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    fn plain_get(path: &str) -> Vec<u8> {
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\n\r\n").into_bytes()
+    }
+
+    #[tokio::test]
+    async fn plain_get_root_serves_the_configured_index() {
+        let (addr, mut event_rx) = start_page_server(Some(PAGE)).await;
+        let response = raw_exchange(addr, &plain_get("/")).await;
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(
+            response.contains("\r\nContent-Type: text/html; charset=utf-8\r\n"),
+            "{response}"
+        );
+        assert!(
+            response.contains(&format!("\r\nContent-Length: {}\r\n", PAGE.len())),
+            "{response}"
+        );
+        assert!(response.contains("\r\nConnection: close\r\n"), "{response}");
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        assert_eq!(body, PAGE);
+        expect_no_event(&mut event_rx).await;
+    }
+
+    #[tokio::test]
+    async fn plain_get_index_html_serves_the_configured_index() {
+        let (addr, _event_rx) = start_page_server(Some(PAGE)).await;
+        let response = raw_exchange(addr, &plain_get("/index.html")).await;
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(response.ends_with(&format!("\r\n\r\n{PAGE}")), "{response}");
+    }
+
+    #[tokio::test]
+    async fn plain_get_root_without_an_index_configured_is_404() {
+        let (addr, _event_rx) = start_page_server(None).await;
+        let response = raw_exchange(addr, &plain_get("/")).await;
+        assert!(
+            response.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "{response}"
+        );
+        assert!(response.ends_with("\r\n\r\nnot found\n"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn unknown_path_is_404() {
+        let (addr, _event_rx) = start_page_server(Some(PAGE)).await;
+        let response = raw_exchange(addr, &plain_get("/nope")).await;
+        assert!(
+            response.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "{response}"
+        );
+        assert!(response.ends_with("\r\n\r\nnot found\n"), "{response}");
+        assert!(!response.contains("nope"), "no request byte is echoed");
+    }
+
+    #[tokio::test]
+    async fn post_root_is_405() {
+        let (addr, _event_rx) = start_page_server(Some(PAGE)).await;
+        let response = raw_exchange(
+            addr,
+            b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 6\r\n\r\nTUNE 1",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+            "{response}"
+        );
+        assert!(response.contains("\r\nAllow: GET\r\n"), "{response}");
+        assert!(response.contains("\r\nConnection: close\r\n"), "{response}");
+        assert!(!response.contains(PAGE), "{response}");
+    }
+
+    #[tokio::test]
+    async fn oversized_request_head_is_refused() {
+        let (addr, mut event_rx) = start_page_server(Some(PAGE)).await;
+        let mut request = b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Pad: ".to_vec();
+        request.resize(9 * 1024, b'a');
+        let response = raw_exchange(addr, &request).await;
+        assert!(
+            response.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"),
+            "{response}"
+        );
+        assert!(response.contains("\r\nConnection: close\r\n"), "{response}");
+        expect_no_event(&mut event_rx).await;
+    }
+
+    /// The pre-read must hand an upgrade to the unchanged COP-53 gate, at the
+    /// canonical `/ws` and at `/` as before, with a page configured.
+    #[tokio::test]
+    async fn upgrade_still_handshakes_through_the_pre_read() {
+        let (addr, mut event_rx) = start_page_server(Some(PAGE)).await;
+        for path in ["/ws", "/"] {
+            let url = format!("ws://{addr}{path}");
+            let (ws, response) =
+                tokio_tungstenite::connect_async(client_request(&url, None, Some(TOKEN)))
+                    .await
+                    .unwrap();
+            assert_eq!(response.status().as_u16(), 101, "{path}");
+            expect_connected(&mut event_rx).await;
+            drop(ws);
+            // Drain this client's Disconnected before the next one connects.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv()).await;
+        }
+        let url = format!("ws://{addr}/ws");
+        expect_refused(
+            client_request(&url, Some("https://evil.example"), Some(TOKEN)),
+            403,
+        )
+        .await;
+        expect_refused(
+            client_request(&url, Some("http://localhost:3000"), None),
+            401,
+        )
+        .await;
+        expect_no_event(&mut event_rx).await;
     }
 
     /// Helper: start a WebSocket server on a random port and return (port, event_rx).

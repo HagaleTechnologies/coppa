@@ -1304,26 +1304,17 @@ fn websocket_handshake_requires_an_allowed_origin_and_the_token() {
     );
     let args = ["--config", "station.toml"];
     let (mut daemon, _) = start_until(dir.path(), &args, &[], "Daemon ready");
-    let stdout = daemon.stdout();
-    let line = stdout
-        .lines()
-        .find(|line| line.contains("WebSocket server listening"))
-        .unwrap_or_else(|| panic!("no listening line:\n{stdout}"));
-    let after = &line[line.find("127.0.0.1:").expect("listen address") + "127.0.0.1:".len()..];
-    let port: u16 = after
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>()
-        .parse()
-        .expect("listen port");
+    let port = websocket_port(&daemon.stdout());
 
     let evil = "Origin: https://evil.example".to_string();
     let bearer = format!("Authorization: Bearer {WS_TOKEN}");
-    let cases: [(String, Vec<String>, &str); 5] = [
+    let cases: [(String, Vec<String>, &str); 6] = [
         ("/".to_string(), vec![evil.clone()], "HTTP/1.1 403"),
         ("/".to_string(), vec![evil, bearer.clone()], "HTTP/1.1 403"),
         ("/".to_string(), vec![], "HTTP/1.1 401"),
-        ("/".to_string(), vec![bearer], "HTTP/1.1 101"),
+        ("/".to_string(), vec![bearer.clone()], "HTTP/1.1 101"),
+        // COP-79: the page's canonical upgrade path.
+        ("/ws".to_string(), vec![bearer], "HTTP/1.1 101"),
         (
             format!("/?token={WS_TOKEN}"),
             vec!["Origin: http://localhost:3000".to_string()],
@@ -1338,7 +1329,7 @@ fn websocket_handshake_requires_an_allowed_origin_and_the_token() {
         );
     }
 
-    // Give the event loop time to log both accepted clients.
+    // Give the event loop time to log the three accepted clients.
     let deadline = Instant::now() + DEADLINE;
     let connected = |stdout: &str| {
         stdout
@@ -1346,7 +1337,7 @@ fn websocket_handshake_requires_an_allowed_origin_and_the_token() {
             .filter(|line| line.contains("event_loop") && line.contains("Client connected"))
             .count()
     };
-    while connected(&daemon.stdout()) < 2 && Instant::now() < deadline {
+    while connected(&daemon.stdout()) < 3 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
     std::thread::sleep(Duration::from_millis(200));
@@ -1361,8 +1352,91 @@ fn websocket_handshake_requires_an_allowed_origin_and_the_token() {
     );
     assert_eq!(
         connected(&stdout),
-        2,
-        "only the two authorized handshakes may reach the event loop:\n{stdout}"
+        3,
+        "only the three authorized handshakes may reach the event loop:\n{stdout}"
+    );
+}
+
+/// The port number from coppad's `WebSocket server listening` line.
+#[cfg(all(feature = "websocket", not(feature = "cpal-backend")))]
+fn websocket_port(stdout: &str) -> u16 {
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("WebSocket server listening"))
+        .unwrap_or_else(|| panic!("no listening line:\n{stdout}"));
+    let after = &line[line.find("127.0.0.1:").expect("listen address") + "127.0.0.1:".len()..];
+    after
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .expect("listen port")
+}
+
+/// COP-79, end to end through the real binary: a browser's plain `GET /` on
+/// the WebSocket port gets the embedded operator page, with no token, and the
+/// page carries no token. Compiled out under `cpal-backend` like the
+/// handshake test above, so it runs under
+/// `cargo test -p coppa-daemon --features websocket --test cli`.
+#[cfg(all(feature = "websocket", not(feature = "cpal-backend")))]
+#[test]
+fn plain_get_root_serves_the_embedded_page() {
+    use std::io::{Read, Write};
+
+    let dir = TempDir::new("ws-page");
+    dir.write(
+        "station.toml",
+        &format!(
+            "[host]\nwebsocket_enabled = true\nwebsocket_port = 0\n\
+             websocket_token = \"{WS_TOKEN}\"\n\
+             websocket_allowed_origins = [\"http://localhost:3000\"]\n"
+        ),
+    );
+    let args = ["--config", "station.toml"];
+    let (mut daemon, _) = start_until(dir.path(), &args, &[], "Daemon ready");
+    let port = websocket_port(&daemon.stdout());
+
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(DEADLINE))
+        .expect("set read timeout");
+    stream
+        .write_all(
+            format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/html\r\n\r\n")
+                .as_bytes(),
+        )
+        .expect("send GET");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read the whole response");
+
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("no header terminator:\n{response}"));
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        head.contains("\r\nContent-Type: text/html; charset=utf-8"),
+        "{head}"
+    );
+    assert!(
+        body.contains("<title>Coppa operator dashboard</title>"),
+        "{body}"
+    );
+    assert!(body.contains("/ws?token="), "the page upgrades at /ws");
+    assert!(
+        !body.contains(WS_TOKEN),
+        "the page must never embed the token"
+    );
+
+    let (stdout, stderr) = daemon.kill();
+    assert!(
+        !stdout.contains(WS_TOKEN),
+        "token leaked to stdout:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains(WS_TOKEN),
+        "token leaked to stderr:\n{stderr}"
     );
 }
 

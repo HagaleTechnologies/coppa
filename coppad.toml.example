@@ -124,6 +124,11 @@ websocket_port = 8400
 # Empty (the default) refuses every web page. Scripts that send no Origin
 # header need only the token.
 # websocket_allowed_origins = ["http://localhost:3000"]
+# A browser opening http://127.0.0.1:8400/ (GET /) gets an operator page from
+# this same port; loading it needs no token, and it holds none. For the page to
+# connect, add its own origin exactly as the browser's address bar shows it,
+# e.g. "http://127.0.0.1:8400" (and "http://localhost:8400" if you open it by
+# that name), to websocket_allowed_origins.
 
 [engine]
 # Profile: HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY (case-insensitive).

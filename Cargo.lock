@@ -541,6 +541,7 @@ dependencies = [
  "base64",
  "coppa-engine",
  "futures-util",
+ "httparse",
  "jsonschema",
  "schemars",
  "serde",
