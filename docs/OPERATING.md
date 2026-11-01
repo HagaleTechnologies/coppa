@@ -309,6 +309,86 @@ unless it presents a shared-secret token. This applies on every
 `bind_address`, loopback included: a web page open in your own browser can
 reach `127.0.0.1` too.
 
+### Dashboard protocol v1
+
+After authentication the first text frame is a versioned greeting:
+
+```json
+{"type":"hello","version":1,"server":"coppa 0.3.0"}
+```
+
+All application messages are JSON text frames. The [protocol schema](schema/websocket-protocol-v1.json)
+defines requests and replies. Version 1 replaces the earlier unversioned API;
+`session` replaces the old `connected` and `disconnected` message types.
+Connecting subscribes the client to data and state events.
+
+Requests may include an unsigned integer `id`. Each request with an id gets
+one reply with that id: `ack`, `status`, or `error`. An ack means accepted
+for processing. It does not mean a connection or transmission completed.
+Callsign validation happens in the daemon; an accepted but invalid `mycall`
+can still be rejected there with a warning log.
+
+```json
+{"type":"mycall","callsign":"N0CALL","id":1}
+{"type":"ack","id":1}
+{"type":"status","id":2}
+{"type":"status","id":2,"connected":false,"cp_desync_episodes":0}
+{"type":"connect","source":"N0CALL","destination":"W1AW","id":3}
+{"type":"ack","id":3}
+{"type":"session","state":"connected","remote_call":"W1AW"}
+{"type":"send","data":"hello dashboard","encoding":"utf8","id":4}
+{"type":"ack","id":4}
+{"type":"data","data":"hello dashboard","encoding":"utf8"}
+{"type":"data","data":"AP8=","encoding":"base64"}
+{"type":"ptt","state":true}
+{"type":"busy","state":false}
+{"type":"snr","db":14}
+{"type":"level","level":2}
+{"type":"heard","stations":[{"call":"W1AW","last_heard_ms":1761452712300,"snr_db":14,"level":2}]}
+{"type":"disconnect","id":5}
+{"type":"ack","id":5}
+{"type":"session","state":"disconnected"}
+{"type":"error","message":"Invalid message"}
+```
+
+For `send`, omitted `encoding` means `utf8`. Use `base64` for arbitrary bytes;
+invalid base64 produces an error with the request id. Received `data` always
+specifies its encoding and preserves every byte. Raw WebSocket binary frames
+are not payload messages. `heard` is a full snapshot of up to 32 recent session
+peers, including the last-heard timestamp, rather than a list of all RF activity.
+
+Data, session, PTT, busy, SNR, level and heard events use a reliable queue for
+each client. A client either receives them in order or its connection closes.
+If 256 pending messages fill that queue, the server disconnects that client;
+it never silently skips a state or data event. Replies go directly to the
+requesting socket. Reconnect and query `status` after losing a connection.
+
+Spectrum, audio levels, logs and decode-failure aggregates are disposable
+telemetry on a separate lossy channel. Lag can skip these messages without
+affecting reliable events. Spectrum, audio levels and logs each require an
+independent opt-in:
+
+```json
+{"type":"spectrum","enabled":true}
+{"type":"audio_level","enabled":true}
+{"type":"log","enabled":true}
+```
+
+Set `enabled` to false to stop a stream. Spectrum frames contain 128 dB bins,
+`timestamp_ms`, `freq_low_hz` and `freq_high_hz`. The bins span the engine's
+current `[freq_low_hz, freq_high_hz)` interval, queried on each update: 350 to
+2750 Hz for HF standard, 350 to 5950 Hz for VHF wide. The wider band has
+coarser bins, about 43.75 Hz each, sampled from an approximately 11.7 Hz FFT.
+
+```json
+{"type":"log","level":"info","message":"Frame decoded successfully","timestamp_ms":1761452712300}
+{"type":"decode_fail","count":6,"timestamp_ms":1761452712300}
+```
+
+Logs carry INFO, WARN and ERROR events, with each message truncated to 2 KiB.
+`decode_fail` is unconditional and reports a cumulative failure count at most
+once per 500 ms. Neither diagnostic stream is a delivery receipt.
+
 ### Setting the token
 
 `websocket_enabled = true` needs `websocket_token` under `[host]`, or `coppad`

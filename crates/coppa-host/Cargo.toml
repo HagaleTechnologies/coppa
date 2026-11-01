@@ -15,10 +15,15 @@ serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tokio-tungstenite = { version = "0.29", optional = true }
 futures-util = { version = "0.3", optional = true }
+base64 = { version = "0.22", optional = true }
+schemars = { version = "0.8.22", optional = true }
 
 [features]
 default = ["vara-tcp"]
 vara-tcp = []
-websocket = ["dep:serde", "dep:serde_json", "dep:tokio-tungstenite", "dep:futures-util"]
+websocket = ["dep:serde", "dep:serde_json", "dep:tokio-tungstenite", "dep:futures-util", "dep:base64", "dep:schemars"]
 kiss-tnc = []
 ardop = []
+
+[dev-dependencies]
+jsonschema = { version = "0.18.3", default-features = false }
