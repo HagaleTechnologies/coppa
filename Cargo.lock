@@ -541,12 +541,9 @@ dependencies = [
  "base64",
  "coppa-engine",
  "futures-util",
-<<<<<<< HEAD
  "httparse",
-=======
  "jsonschema",
  "schemars",
->>>>>>> a6b14ef1d3cf27664cb21a6c54372f90ffac6b44
  "serde",
  "serde_json",
  "thiserror 2.0.18",

@@ -707,11 +707,8 @@ impl WebSocketServer {
             let broadcast_tx = self.broadcast_tx.clone();
             let event_tx = self.event_tx.clone();
             let status = self.status.clone();
-<<<<<<< HEAD
             let index_html = self.index_html.clone();
-=======
             let clients = self.clients.clone();
->>>>>>> a6b14ef1d3cf27664cb21a6c54372f90ffac6b44
 
             tokio::spawn(async move {
                 let _permit = permit;
