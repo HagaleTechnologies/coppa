@@ -57,7 +57,7 @@ Coppa's speed ladder needs; BG1 targets larger transport blocks Coppa has no use
    for the existing ladder's rates, with **one deliberate exception, and a wire-format break**:
    level 10 (64-QAM) moves from rate 7/8 (`k_used`=1701) to rate **5/6** (`k_used`=1620). The Phase
    2 decision audit found 7/8 hitting LDPC non-convergence at high SNR even under the old codec (see
-   `CLAUDE.md`'s Known Limitations, "PAPR clipping..." bullet); 5/6 both relaxes that margin and is
+   `docs/LIMITATIONS.md`, "PAPR clipping..." bullet); 5/6 both relaxes that margin and is
    a cleaner NR-standard-adjacent rate. **This means frames encoded with the pre-Task-4 codec are
    not decodable by the new one, and vice versa, for level 10 specifically (and for every level's
    coded-bit *content*, since the graph itself changed even where the nominal rate did not)** --

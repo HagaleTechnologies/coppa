@@ -55,11 +55,11 @@ pub trait ConstellationMapper: Send {
 /// Complete modem: modulates bytes to audio samples, demodulates samples to bytes.
 pub trait Modem: Send {
     /// Modulate bits to audio samples.
-    fn modulate(&self, bits: &[u8]) -> anyhow::Result<Vec<f32>>;
+    fn modulate(&self, bits: &[u8]) -> Result<Vec<f32>, crate::CodecError>;
 
     /// Demodulate audio samples to soft symbols.
     /// Positive = likely bit 0, negative = likely bit 1.
-    fn demodulate_soft(&mut self, samples: &[f32]) -> anyhow::Result<Vec<f32>>;
+    fn demodulate_soft(&mut self, samples: &[f32]) -> Result<Vec<f32>, crate::CodecError>;
 
     /// Sample rate in Hz.
     fn sample_rate(&self) -> f32;

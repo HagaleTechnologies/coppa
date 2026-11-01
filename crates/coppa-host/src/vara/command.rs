@@ -1,6 +1,6 @@
 //! VARA command port handler (TCP port 8300).
 
-use anyhow::Result;
+use crate::HostError;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -79,7 +79,7 @@ impl VaraCommandPort {
         client_id: u32,
         event_tx: mpsc::Sender<HostEvent>,
         mut response_rx: mpsc::Receiver<VaraResponse>,
-    ) -> Result<()> {
+    ) -> Result<(), HostError> {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
 
@@ -267,7 +267,7 @@ mod tests {
         stream: TcpStream,
         rx: mpsc::Receiver<HostEvent>,
         response_tx: mpsc::Sender<VaraResponse>,
-        handler: tokio::task::JoinHandle<Result<()>>,
+        handler: tokio::task::JoinHandle<Result<(), HostError>>,
     }
 
     /// Connect a client to a real `handle_client` over a loopback socket,

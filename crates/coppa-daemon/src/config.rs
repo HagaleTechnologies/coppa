@@ -30,6 +30,10 @@ pub struct DaemonConfig {
     /// Busy-channel courtesy / station-ID / beacon-mode configuration
     /// (Phase 4 Task 3).
     pub station_id: StationIdConfig,
+    /// Connected-session configuration (COP-69). Every other session
+    /// parameter stays negotiated with the peer; this section holds the
+    /// operator-side knobs.
+    pub session: SessionConfig,
 }
 
 /// Audio configuration section.
@@ -457,6 +461,47 @@ pub struct StationIdConfig {
     pub beacon_interval_secs: u64,
 }
 
+/// Connected-session configuration (COP-69).
+///
+/// One operator-facing knob today: the cap on LDPC codewords per session
+/// data frame. Session parameters beyond this stay negotiated with the peer
+/// in the CONNECT handshake (see `coppa_protocol::session::LinkCapabilities`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionConfig {
+    /// Cap on LDPC codewords per session data frame (1-8, default 8).
+    ///
+    /// `8` makes an 8x larger frame: at the daemon-default level 2 that is
+    /// ~9.5 s of continuous keyed airtime per frame, so operators on shared
+    /// channels can bound it. Only takes effect between peers that both
+    /// advertise the `multi_frame_ack` capability; a mixed-version pair runs
+    /// 1-codeword frames exactly as before regardless of this value.
+    pub max_codewords_per_frame: u8,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            max_codewords_per_frame: 8,
+        }
+    }
+}
+
+impl SessionConfig {
+    /// Validate the codeword cap, naming the key on failure. The wire field
+    /// is 4 bits and the codec's design cap is `MAX_CODEWORDS = 8`, so
+    /// anything outside 1..=8 can never be encoded.
+    pub fn check(&self) -> Result<(), String> {
+        if !(1..=8).contains(&self.max_codewords_per_frame) {
+            return Err(format!(
+                "invalid [session] max_codewords_per_frame ({}); must be 1..=8",
+                self.max_codewords_per_frame
+            ));
+        }
+        Ok(())
+    }
+}
+
 // Sub-structs have non-trivial defaults (custom port numbers, strings, etc.),
 // so we keep explicit Default impls rather than deriving.
 #[allow(clippy::derivable_impls)]
@@ -468,6 +513,7 @@ impl Default for DaemonConfig {
             host: HostConfig::default(),
             engine: EngineSection::default(),
             station_id: StationIdConfig::default(),
+            session: SessionConfig::default(),
         }
     }
 }
@@ -792,6 +838,13 @@ impl DaemonConfig {
             self.engine.profile,
             coppa_engine::profiles::list_profiles().join(", ")
         ))
+    }
+
+    /// COP-69: validate the `[session]` section (the codeword cap), naming
+    /// the key on failure. Called by run mode before any hardware or socket
+    /// is touched, like every other config check.
+    pub fn check_session(&self) -> Result<(), String> {
+        self.session.check()
     }
 
     /// COP-36: `[audio] buffer_size` sizes the RX and TX audio rings, and a
@@ -1515,6 +1568,59 @@ beacon_interval_secs = 600
 
         let config: DaemonConfig = toml::from_str(&text).unwrap();
         assert_eq!(config.radio.turnaround_ms, 500);
+    }
+
+    // ── COP-69: [session] max_codewords_per_frame ────────────────────
+
+    #[test]
+    fn session_max_codewords_per_frame_validates_range() {
+        for valid in [1u8, 4, 8] {
+            let config: DaemonConfig =
+                toml::from_str(&format!("[session]\nmax_codewords_per_frame = {valid}")).unwrap();
+            config.check_session().expect("1..=8 must validate");
+        }
+        for invalid in [0u8, 9, 255] {
+            let config: DaemonConfig =
+                toml::from_str(&format!("[session]\nmax_codewords_per_frame = {invalid}")).unwrap();
+            let err = config.check_session().unwrap_err();
+            assert!(
+                err.contains(&format!(
+                    "invalid [session] max_codewords_per_frame ({invalid}); must be 1..=8"
+                )),
+                "the key and value must be named: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_defaults_to_eight() {
+        assert_eq!(
+            DaemonConfig::default().session.max_codewords_per_frame,
+            8,
+            "the negotiated-capability gate carries the risk; the throughput \
+             model is calibrated at 8"
+        );
+        assert!(DaemonConfig::default().check_session().is_ok());
+    }
+
+    /// Back-compat: every config written before COP-69 has no `[session]`
+    /// section and must keep parsing to the default.
+    #[test]
+    fn session_section_absent_still_parses() {
+        let config: DaemonConfig = toml::from_str("").unwrap();
+        assert_eq!(config.session.max_codewords_per_frame, 8);
+        assert!(config.check_session().is_ok());
+    }
+
+    /// The shipped example file parses and its `[session]` key is real (not
+    /// commented out).
+    #[test]
+    fn example_config_session_section_parses() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../coppad.toml.example");
+        let text = std::fs::read_to_string(path).unwrap();
+        let config: DaemonConfig = toml::from_str(&text).unwrap();
+        assert_eq!(config.session.max_codewords_per_frame, 8);
+        assert!(config.check_session().is_ok());
     }
 
     // ── COP-49: config discovery ─────────────────────────────────────

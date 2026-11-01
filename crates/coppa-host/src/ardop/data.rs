@@ -5,7 +5,7 @@
 //! `<len:u16 BE><tag:3><payload>` with tag `ARQ` for session data (the
 //! framing Pat's `frame.go` reads; see `frame.rs`).
 
-use anyhow::Result;
+use crate::HostError;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -58,7 +58,7 @@ pub async fn handle_client(
     client_id: u32,
     event_tx: mpsc::Sender<HostEvent>,
     mut data_rx: mpsc::Receiver<Vec<u8>>,
-) -> Result<()> {
+) -> Result<(), HostError> {
     let (mut reader, mut writer) = stream.into_split();
 
     let event_tx_clone = event_tx.clone();

@@ -93,7 +93,7 @@ impl ArdopServer {
 
     /// Bind both ports and run. Callers that need OS-assigned ports bind
     /// first and use [`ArdopServer::run_with_listeners`].
-    pub async fn run(&self) -> anyhow::Result<()> {
+    pub async fn run(&self) -> Result<(), crate::HostError> {
         let cmd_addr = format!("{}:{}", self.bind_addr, self.command_port);
         let data_addr = format!("{}:{}", self.bind_addr, self.data_port);
 
@@ -110,7 +110,7 @@ impl ArdopServer {
         &self,
         cmd_listener: TcpListener,
         data_listener: TcpListener,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), crate::HostError> {
         let event_tx = self.event_tx.clone();
         let response_senders = self.response_senders.clone();
 

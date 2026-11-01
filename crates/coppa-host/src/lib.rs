@@ -6,6 +6,22 @@
 //! KISS TNC TCP server (`kiss`, `kiss-tnc` feature), and an optional ARDOP
 //! TNC host command/data port interface (`ardop` feature; COP-97).
 
+//! # Errors
+//!
+//! Fallible public APIs now return [`HostError`], a source-breaking change
+//! from the previous opaque error result. The I/O source remains inspectable.
+//! Include a wildcard when matching this non-exhaustive enum.
+//!
+//! ```
+//! use coppa_host::HostError;
+//! fn explain(error: HostError) -> String {
+//!     match error {
+//!         HostError::Io(source) => format!("I/O failure: {}", source.kind()),
+//!         _ => error.to_string(),
+//!     }
+//! }
+//! ```
+
 // Library diagnostics go through `tracing`, never straight to stdout/stderr.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
@@ -20,6 +36,9 @@ pub mod kiss;
 
 #[cfg(feature = "ardop")]
 pub mod ardop;
+
+pub mod error;
+pub use error::HostError;
 
 /// A frame of data exchanged between host application and the Coppa engine.
 #[derive(Debug, Clone)]

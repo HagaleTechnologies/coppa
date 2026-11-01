@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-28T21:37:01Z",
-  "head_commit": "0d51a30",
+  "generated_at": "2026-10-30T11:12:01Z",
+  "head_commit": "4d39fa7",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -200,7 +200,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:f494c9d87048c147b2692613240d3118162a7f9b52347d1928a7826d3fa73046",
+      "hash": "sha256:a6c5d2b9e71e48d7c7be0eddf29cc6c5707434e21fe720f723ed0918f85af911",
       "id": "band-conventions",
       "kind": "interface",
       "links": [
@@ -212,6 +212,7 @@
       "path": "pages/band-conventions.md",
       "sources": [
         "CLAUDE.md",
+        "docs/LIMITATIONS.md",
         "crates/coppa-engine/src/**",
         "crates/coppa-codec/src/ofdm/**"
       ],
@@ -353,7 +354,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:e8b1c43b57c538fd73c2d00ba0c52076493a24aa08954da907c7800ff86a43fd",
+      "hash": "sha256:e186712614ef0fb057571802295095b7d79c41e2588e7a433d60ac24dd8884dd",
       "id": "cp-negotiation-gotchas",
       "kind": "gotcha",
       "links": [

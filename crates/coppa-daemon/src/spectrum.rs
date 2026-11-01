@@ -17,17 +17,18 @@ use coppa_ml::SpectrumSensor;
 /// from `BusyGate`'s internal one, which uses a smaller 1024-point FFT tuned
 /// for its own occupancy-margin purpose, not bin resolution). At 48 kHz,
 /// 4096 points gives ~11.7 Hz/bin raw resolution -- comfortably finer than
-/// `SPECTRUM_NUM_BINS` bins spanning the ~2.5 kHz band (~19.5 Hz/bin), so
+/// `SPECTRUM_NUM_BINS` bins spanning HF (18.75 Hz/bin) or VHF (43.75 Hz/bin), so
 /// `compute_spectrum_bins` is downsampling (averaging multiple raw bins per
 /// output bin), never upsampling emptiness.
 pub const SPECTRUM_FFT_SIZE: usize = 4096;
 
-/// Lower edge (Hz) of the waterfall band -- matches Coppa's ~300-2800 Hz SSB
-/// passband (see `docs/adr/003-phase1-waveform-break.md`).
-pub const SPECTRUM_LOW_HZ: f32 = 300.0;
+/// HF standard interval used by the tests; production bounds come from the engine.
+#[cfg(test)]
+const SPECTRUM_LOW_HZ: f32 = 350.0;
 
-/// Upper edge (Hz) of the waterfall band.
-pub const SPECTRUM_HIGH_HZ: f32 = 2800.0;
+/// Exclusive upper edge (Hz) for HF standard tests.
+#[cfg(test)]
+const SPECTRUM_HIGH_HZ: f32 = 2750.0;
 
 /// Number of output bins in a `spectrum` WS message (the brief's "128-bin").
 pub const SPECTRUM_NUM_BINS: usize = 128;
@@ -44,7 +45,7 @@ pub const SPECTRUM_UPDATE_HZ: f64 = 4.0;
 const NO_SIGNAL_DB: f32 = -100.0;
 
 /// Compute `SPECTRUM_NUM_BINS` log-magnitude (dB) bins spanning
-/// `[SPECTRUM_LOW_HZ, SPECTRUM_HIGH_HZ)`, from `samples` (ordinarily
+/// `[low_hz, high_hz)`, from `samples` (ordinarily
 /// `SPECTRUM_FFT_SIZE` samples, though `SpectrumSensor::power_spectrum`
 /// itself tolerates a shorter block -- see its own `fft_size.min(samples.len())`
 /// sizing -- so this correctly re-derives each call's real bin resolution
@@ -62,20 +63,30 @@ pub fn compute_spectrum_bins(
     sensor: &SpectrumSensor,
     samples: &[f32],
     sample_rate: f32,
+    low_hz: f32,
+    high_hz: f32,
 ) -> Vec<f32> {
     let spectrum_db = sensor.power_spectrum(samples);
     let n = spectrum_db.len();
-    if n < 2 || sample_rate <= 0.0 {
+    if n < 2
+        || !sample_rate.is_finite()
+        || sample_rate <= 0.0
+        || !low_hz.is_finite()
+        || !high_hz.is_finite()
+        || low_hz < 0.0
+        || high_hz <= low_hz
+        || high_hz > sample_rate / 2.0
+    {
         return vec![NO_SIGNAL_DB; SPECTRUM_NUM_BINS];
     }
     let res = sample_rate / n as f32;
     let half = n / 2; // Only positive frequencies are meaningful.
-    let band_width = SPECTRUM_HIGH_HZ - SPECTRUM_LOW_HZ;
+    let band_width = high_hz - low_hz;
 
     (0..SPECTRUM_NUM_BINS)
         .map(|i| {
-            let lo_hz = SPECTRUM_LOW_HZ + band_width * i as f32 / SPECTRUM_NUM_BINS as f32;
-            let hi_hz = SPECTRUM_LOW_HZ + band_width * (i + 1) as f32 / SPECTRUM_NUM_BINS as f32;
+            let lo_hz = low_hz + band_width * i as f32 / SPECTRUM_NUM_BINS as f32;
+            let hi_hz = low_hz + band_width * (i + 1) as f32 / SPECTRUM_NUM_BINS as f32;
             let lo_bin = ((lo_hz / res).floor().max(0.0) as usize).min(half.saturating_sub(1));
             let hi_bin = (((hi_hz / res).ceil().max(0.0) as usize).max(lo_bin + 1))
                 .min(half.max(lo_bin + 1));
@@ -103,10 +114,45 @@ mod tests {
     }
 
     #[test]
+    fn compute_spectrum_bins_spans_given_band() {
+        let sample_rate = 48_000.0;
+        let sensor = SpectrumSensor::new(SPECTRUM_FFT_SIZE, sample_rate);
+        for freq in [375.0, 5000.0, 5910.0] {
+            let tone = generate_tone(freq, sample_rate, SPECTRUM_FFT_SIZE, 1.0);
+            let bins = compute_spectrum_bins(&sensor, &tone, sample_rate, 350.0, 5950.0);
+            let peak = bins
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0;
+            let expected = ((freq - 350.0) / 5600.0 * 128.0) as usize;
+            assert!(
+                peak.abs_diff(expected) <= 1,
+                "tone {freq}: expected {expected}, got {peak}"
+            );
+        }
+        assert_eq!(
+            compute_spectrum_bins(&sensor, &[], sample_rate, 350.0, 5950.0),
+            vec![NO_SIGNAL_DB; 128]
+        );
+        assert_eq!(
+            compute_spectrum_bins(&sensor, &[0.0; 4096], sample_rate, 5950.0, 350.0),
+            vec![NO_SIGNAL_DB; 128]
+        );
+    }
+
+    #[test]
     fn compute_spectrum_bins_has_the_right_shape() {
         let sensor = SpectrumSensor::new(SPECTRUM_FFT_SIZE, 48_000.0);
         let samples = vec![0.0f32; SPECTRUM_FFT_SIZE];
-        let bins = compute_spectrum_bins(&sensor, &samples, 48_000.0);
+        let bins = compute_spectrum_bins(
+            &sensor,
+            &samples,
+            48_000.0,
+            SPECTRUM_LOW_HZ,
+            SPECTRUM_HIGH_HZ,
+        );
         assert_eq!(bins.len(), SPECTRUM_NUM_BINS);
     }
 
@@ -116,7 +162,13 @@ mod tests {
         let sample_rate = 48_000.0;
         let sensor = SpectrumSensor::new(SPECTRUM_FFT_SIZE, sample_rate);
         let tone = generate_tone(1500.0, sample_rate, SPECTRUM_FFT_SIZE, 1.0);
-        let bins = compute_spectrum_bins(&sensor, &tone, sample_rate);
+        let bins = compute_spectrum_bins(
+            &sensor,
+            &tone,
+            sample_rate,
+            SPECTRUM_LOW_HZ,
+            SPECTRUM_HIGH_HZ,
+        );
 
         let (peak_idx, _) = bins
             .iter()
@@ -124,8 +176,7 @@ mod tests {
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
             .expect("bins must be non-empty");
 
-        // Expected bin: 1500 Hz is (1500 - 300) / ((2800-300)/128) =~ 61.4 bins
-        // into the band -> bin index 61.
+        // Expected bin follows the current HF interval [350, 2750).
         let band_width = SPECTRUM_HIGH_HZ - SPECTRUM_LOW_HZ;
         let expected_idx =
             (((1500.0 - SPECTRUM_LOW_HZ) / band_width) * SPECTRUM_NUM_BINS as f32) as usize;
@@ -149,7 +200,13 @@ mod tests {
         for (m, t) in mixed.iter_mut().zip(in_band_tone.iter()) {
             *m += t;
         }
-        let bins = compute_spectrum_bins(&sensor, &mixed, sample_rate);
+        let bins = compute_spectrum_bins(
+            &sensor,
+            &mixed,
+            sample_rate,
+            SPECTRUM_LOW_HZ,
+            SPECTRUM_HIGH_HZ,
+        );
         let (peak_idx, _) = bins
             .iter()
             .enumerate()
@@ -173,7 +230,13 @@ mod tests {
         let sample_rate = 48_000.0;
         let sensor = SpectrumSensor::new(SPECTRUM_FFT_SIZE, sample_rate);
         let short = generate_tone(1500.0, sample_rate, SPECTRUM_FFT_SIZE / 2, 1.0);
-        let bins = compute_spectrum_bins(&sensor, &short, sample_rate);
+        let bins = compute_spectrum_bins(
+            &sensor,
+            &short,
+            sample_rate,
+            SPECTRUM_LOW_HZ,
+            SPECTRUM_HIGH_HZ,
+        );
         assert_eq!(bins.len(), SPECTRUM_NUM_BINS);
     }
 }
