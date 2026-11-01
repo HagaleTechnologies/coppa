@@ -391,7 +391,7 @@ fn arq_and_decompression_failures() {
         ProtocolError::InvalidWindowSize { value: 0, max: 32 },
         "Window size must be 1-32, got 0"
     );
-    let mut tx = ArqTx::new(ArqConfig::new(1, 1, Duration::from_secs(1)).unwrap());
+    let mut tx = ArqTx::new(ArqConfig::new(1, 1, Duration::from_secs(1)).unwrap()).unwrap();
     let now = Instant::now();
     tx.send(vec![1], now).unwrap();
     failure!(

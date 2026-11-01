@@ -39,7 +39,8 @@ fn abandon_advances_send_base_across_the_u8_sequence_wraparound() {
     let mut tx = ArqTx::new(ArqConfig {
         window_size: 2,
         ..ArqConfig::default()
-    });
+    })
+    .unwrap();
     let now = Instant::now();
 
     // Park the pair one seq short of the wrap so the two segments below
@@ -88,7 +89,8 @@ fn abandon_of_a_wrapped_seq_does_not_clear_an_aliasing_pre_wrap_slot() {
     let mut tx = ArqTx::new(ArqConfig {
         window_size: 2,
         ..ArqConfig::default()
-    });
+    })
+    .unwrap();
     let now = Instant::now();
 
     wind_to(&mut tx, 254, now);

@@ -149,7 +149,7 @@ fn run_session(preset: WattersonPreset, ppm: f32, seed: u64, duration: Duration)
     let config = ArqConfig::new(WINDOW, 5, Duration::from_secs(5))
         .unwrap()
         .with_airtime_params(LEVEL, TURNAROUND, profile);
-    let mut tx = ArqTx::new(config);
+    let mut tx = ArqTx::new(config).unwrap();
     let mut rx = ArqRx::new(WINDOW);
     let start = Instant::now();
     let mut now = start;
