@@ -204,34 +204,23 @@ impl Default for ArqConfig {
 }
 
 // Shared by both public construction paths, including public-field literals.
-fn validate_window(window_size: u8) -> Result<()> {
+fn validate_window(window_size: u8) -> Result<(), ProtocolError> {
     if window_size == 0 || window_size > MAX_WINDOW_SIZE {
-        return Err(anyhow!(
-            "Window size must be 1-{}, got {}",
-            MAX_WINDOW_SIZE,
-            window_size
-        ));
+        return Err(ProtocolError::InvalidWindowSize {
+            value: window_size,
+            max: MAX_WINDOW_SIZE,
+        });
     }
     Ok(())
 }
 
 impl ArqConfig {
-<<<<<<< HEAD
-    pub fn new(window_size: u8, max_retransmit: u8, initial_rto: Duration) -> Result<Self> {
-        validate_window(window_size)?;
-=======
     pub fn new(
         window_size: u8,
         max_retransmit: u8,
         initial_rto: Duration,
     ) -> Result<Self, ProtocolError> {
-        if window_size == 0 || window_size > MAX_WINDOW_SIZE {
-            return Err(ProtocolError::InvalidWindowSize {
-                value: window_size,
-                max: MAX_WINDOW_SIZE,
-            });
-        }
->>>>>>> a6b14ef1d3cf27664cb21a6c54372f90ffac6b44
+        validate_window(window_size)?;
         Ok(Self {
             window_size,
             max_retransmit,
@@ -402,9 +391,9 @@ impl ArqTx {
     /// use coppa_protocol::arq::{ArqConfig, ArqTx};
     /// let mut tx = ArqTx::new(ArqConfig::default())?;
     /// tx.send(vec![1, 2], std::time::Instant::now())?;
-    /// # Ok::<(), anyhow::Error>(())
+    /// # Ok::<(), coppa_protocol::ProtocolError>(())
     /// ```
-    pub fn new(config: ArqConfig) -> Result<Self> {
+    pub fn new(config: ArqConfig) -> Result<Self, ProtocolError> {
         validate_window(config.window_size)?;
         let floor = rto_floor(
             config.window_size,

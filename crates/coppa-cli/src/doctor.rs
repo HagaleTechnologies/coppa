@@ -423,25 +423,14 @@ pub(crate) fn cmd_doctor(args: &DoctorArgs) -> Result<()> {
     let rate = coppa_engine::config::EngineConfig::default().sample_rate;
     println!("{HEADER}");
     let _ = std::io::stdout().flush();
-<<<<<<< HEAD
-    // Workspace feature unification can enable CPAL in coppa-audio even when
-    // this CLI cannot use live audio. Keep every doctor row on the CLI's gate.
-    let live_audio = cfg!(feature = "cpal-backend");
-    let backend = if live_audio {
-=======
     // A workspace sibling can enable the dependency's CPAL feature without
     // enabling this binary's live-audio paths. Report this binary's capabilities.
     let backend = if cfg!(feature = "cpal-backend") {
->>>>>>> a6b14ef1d3cf27664cb21a6c54372f90ffac6b44
         coppa_audio::audio_backend_name()
     } else {
         None
     };
-<<<<<<< HEAD
-    let listing = if live_audio {
-=======
     let listing = if backend.is_some() {
->>>>>>> a6b14ef1d3cf27664cb21a6c54372f90ffac6b44
         coppa_audio::list_device_support(rate)
     } else {
         Ok(Vec::new())
@@ -452,14 +441,6 @@ pub(crate) fn cmd_doctor(args: &DoctorArgs) -> Result<()> {
     ];
     for direction in [Direction::Input, Direction::Output] {
         let requested = args.requested(direction);
-<<<<<<< HEAD
-        let probe = if live_audio {
-            coppa_audio::probe_device(direction, requested, rate)
-        } else {
-            DeviceProbe::NoBackend
-        };
-        checks.extend(device_checks(direction, requested, &probe, rate));
-=======
         checks.extend(device_checks(
             direction,
             requested,
@@ -470,7 +451,6 @@ pub(crate) fn cmd_doctor(args: &DoctorArgs) -> Result<()> {
             },
             rate,
         ));
->>>>>>> a6b14ef1d3cf27664cb21a6c54372f90ffac6b44
     }
     checks.extend(if args.no_rigctld {
         skipped_rigctld_checks()
