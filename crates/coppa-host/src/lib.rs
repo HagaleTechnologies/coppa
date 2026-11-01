@@ -15,6 +15,9 @@ pub mod vara;
 #[cfg(feature = "websocket")]
 pub mod websocket;
 
+#[cfg(feature = "websocket")]
+mod http_route;
+
 #[cfg(feature = "kiss-tnc")]
 pub mod kiss;
 

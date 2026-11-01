@@ -498,6 +498,7 @@ dependencies = [
  "anyhow",
  "coppa-engine",
  "futures-util",
+ "httparse",
  "serde",
  "serde_json",
  "tokio",

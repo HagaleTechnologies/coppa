@@ -606,11 +606,14 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
                 .map_or("", config::SecretToken::expose),
             &config.host.websocket_allowed_origins,
         );
+        // COP-79: a browser that opens the port gets the operator page; its
+        // own /ws upgrade still passes the token and Origin gate above.
         let mut ws_server = coppa_host::websocket::WebSocketServer::with_bind_addr(
             config.host.websocket_port,
             config.host.bind_address.clone(),
         )
-        .with_auth(auth);
+        .with_auth(auth)
+        .with_index_html(include_str!("web/index.html"));
 
         // Pipe WebSocket events into the daemon event loop
         if let Some(mut ws_rx) = ws_server.take_event_rx() {
