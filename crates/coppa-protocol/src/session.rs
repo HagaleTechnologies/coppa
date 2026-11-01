@@ -13,7 +13,7 @@
 //! Sessions are identified by a 4-bit session ID (0-15) and maintain state
 //! for the ARQ layer, keepalive timers, and negotiated link parameters.
 
-use anyhow::{anyhow, Result};
+use crate::ProtocolError;
 use std::time::{Duration, Instant};
 
 use crate::mac::{Callsign, MacFrameType, MacPdu};
@@ -49,6 +49,11 @@ pub struct LinkCapabilities {
     pub arq_window: u8,
     /// Whether compression is supported.
     pub compression: bool,
+    /// COP-69: whether this peer accepts multi-codeword session frames,
+    /// codeword-bitmap ACKs, and short dedicated ACK frames (flags byte bit 1).
+    /// Negotiated as an AND of both sides, exactly like `compression`, so a
+    /// mixed-version pair runs today's protocol untouched.
+    pub multi_frame_ack: bool,
     /// Modulation/coding scheme index.
     pub mcs_index: u8,
 }
@@ -61,6 +66,7 @@ impl Default for LinkCapabilities {
             fec_rate_den: 2,
             arq_window: 8,
             compression: false,
+            multi_frame_ack: false,
             mcs_index: 0,
         }
     }
@@ -75,19 +81,19 @@ impl LinkCapabilities {
         out.push(self.fec_rate_num);
         out.push(self.fec_rate_den);
         out.push(self.arq_window);
-        let flags = if self.compression { 0x01 } else { 0x00 };
+        // Flags byte (byte 5): [compression:1][multi_frame_ack:1][reserved:6].
+        let flags = (self.compression as u8) | ((self.multi_frame_ack as u8) << 1);
         out.push(flags);
         out.push(self.mcs_index);
         out
     }
 
     /// Deserialize capabilities from bytes.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
         if bytes.len() < 7 {
-            return Err(anyhow!(
-                "Capabilities too short: {} bytes (need 7)",
-                bytes.len()
-            ));
+            return Err(ProtocolError::CapabilitiesTooShort {
+                actual: bytes.len(),
+            });
         }
         Ok(Self {
             max_payload_size: ((bytes[0] as u16) << 8) | bytes[1] as u16,
@@ -95,6 +101,7 @@ impl LinkCapabilities {
             fec_rate_den: bytes[3],
             arq_window: bytes[4],
             compression: bytes[5] & 0x01 != 0,
+            multi_frame_ack: bytes[5] & 0x02 != 0,
             mcs_index: bytes[6],
         })
     }
@@ -115,6 +122,7 @@ impl LinkCapabilities {
             },
             arq_window: self.arq_window.min(peer.arq_window),
             compression: self.compression && peer.compression,
+            multi_frame_ack: self.multi_frame_ack && peer.multi_frame_ack,
             mcs_index: self.mcs_index.min(peer.mcs_index),
         }
     }
@@ -218,12 +226,9 @@ impl Session {
     // ── Initiator side ──────────────────────────────────────────────
 
     /// Initiate a connection: create a CONNECT_REQ PDU.
-    pub fn initiate(&mut self) -> Result<MacPdu> {
+    pub fn initiate(&mut self) -> Result<MacPdu, ProtocolError> {
         if self.state != SessionState::Idle {
-            return Err(anyhow!(
-                "Cannot initiate: session in state {:?}",
-                self.state
-            ));
+            return Err(ProtocolError::CannotInitiate { state: self.state });
         }
 
         self.state = SessionState::Connecting;
@@ -240,9 +245,12 @@ impl Session {
 
     /// Handle CONNECT_ACK response (initiator side).
     /// Returns a CONNECT_CFM PDU with negotiated capabilities.
-    pub fn handle_connect_ack(&mut self, remote_caps_bytes: &[u8]) -> Result<MacPdu> {
+    pub fn handle_connect_ack(
+        &mut self,
+        remote_caps_bytes: &[u8],
+    ) -> Result<MacPdu, ProtocolError> {
         if self.state != SessionState::Connecting {
-            return Err(anyhow!("Unexpected CONNECT_ACK in state {:?}", self.state));
+            return Err(ProtocolError::UnexpectedConnectAck { state: self.state });
         }
 
         let remote_caps = LinkCapabilities::from_bytes(remote_caps_bytes)?;
@@ -270,9 +278,12 @@ impl Session {
 
     /// Handle CONNECT_REQ (responder side).
     /// Returns a CONNECT_ACK PDU with our capabilities.
-    pub fn handle_connect_req(&mut self, remote_caps_bytes: &[u8]) -> Result<MacPdu> {
+    pub fn handle_connect_req(
+        &mut self,
+        remote_caps_bytes: &[u8],
+    ) -> Result<MacPdu, ProtocolError> {
         if self.state != SessionState::Idle {
-            return Err(anyhow!("Unexpected CONNECT_REQ in state {:?}", self.state));
+            return Err(ProtocolError::UnexpectedConnectReq { state: self.state });
         }
 
         let remote_caps = LinkCapabilities::from_bytes(remote_caps_bytes)?;
@@ -292,9 +303,9 @@ impl Session {
     /// Handle CONNECT_CFM (responder side).
     /// Validates that negotiated capabilities are consistent with both sides'
     /// advertised capabilities, then transitions to Established.
-    pub fn handle_connect_cfm(&mut self, negotiated_bytes: &[u8]) -> Result<()> {
+    pub fn handle_connect_cfm(&mut self, negotiated_bytes: &[u8]) -> Result<(), ProtocolError> {
         if self.state != SessionState::Accepting {
-            return Err(anyhow!("Unexpected CONNECT_CFM in state {:?}", self.state));
+            return Err(ProtocolError::UnexpectedConnectCfm { state: self.state });
         }
 
         let negotiated = LinkCapabilities::from_bytes(negotiated_bytes)?;
@@ -306,29 +317,23 @@ impl Session {
                 || negotiated.arq_window > expected.arq_window
                 || negotiated.mcs_index > expected.mcs_index
             {
-                return Err(anyhow!(
-                    "Negotiated capabilities exceed intersection: payload={} (max {}), window={} (max {})",
-                    negotiated.max_payload_size,
-                    expected.max_payload_size,
-                    negotiated.arq_window,
-                    expected.arq_window,
-                ));
+                return Err(ProtocolError::CapabilitiesExceedIntersection {
+                    negotiated: negotiated.clone(),
+                    expected: expected.clone(),
+                });
             }
             // Validate FEC rate does not exceed negotiated rate
             if negotiated.fec_rate() > expected.fec_rate() + f32::EPSILON {
-                return Err(anyhow!(
-                    "Negotiated FEC rate {}/{} exceeds intersection {}/{}",
-                    negotiated.fec_rate_num,
-                    negotiated.fec_rate_den,
-                    expected.fec_rate_num,
-                    expected.fec_rate_den,
-                ));
+                return Err(ProtocolError::FecRateExceedsIntersection {
+                    numerator: negotiated.fec_rate_num,
+                    denominator: negotiated.fec_rate_den,
+                    expected_numerator: expected.fec_rate_num,
+                    expected_denominator: expected.fec_rate_den,
+                });
             }
             // Compression must not be enabled unless both sides support it
             if negotiated.compression && !expected.compression {
-                return Err(anyhow!(
-                    "Negotiated compression enabled but not supported by both peers"
-                ));
+                return Err(ProtocolError::CompressionNotMutuallySupported);
             }
         }
 
@@ -342,9 +347,9 @@ impl Session {
     // ── Common operations ───────────────────────────────────────────
 
     /// Create a DISCONNECT PDU.
-    pub fn disconnect(&mut self) -> Result<MacPdu> {
+    pub fn disconnect(&mut self) -> Result<MacPdu, ProtocolError> {
         if self.state == SessionState::Idle {
-            return Err(anyhow!("Cannot disconnect: session is idle"));
+            return Err(ProtocolError::CannotDisconnectIdle);
         }
 
         self.state = SessionState::Disconnecting;
@@ -367,9 +372,9 @@ impl Session {
     }
 
     /// Create a KEEPALIVE PDU.
-    pub fn keepalive(&mut self) -> Result<MacPdu> {
+    pub fn keepalive(&mut self) -> Result<MacPdu, ProtocolError> {
         if self.state != SessionState::Established {
-            return Err(anyhow!("Cannot send keepalive: session not established"));
+            return Err(ProtocolError::KeepaliveNotEstablished);
         }
 
         self.last_activity = Instant::now();
@@ -477,14 +482,14 @@ impl SessionManager {
         remote: Callsign,
         ssid: u8,
         caps: LinkCapabilities,
-    ) -> Result<u8> {
+    ) -> Result<u8, ProtocolError> {
         for id in 0..16u8 {
             if self.sessions[id as usize].is_none() {
                 self.sessions[id as usize] = Some(Session::new(id, local, remote, ssid, caps));
                 return Ok(id);
             }
         }
-        Err(anyhow!("No free session slots"))
+        Err(ProtocolError::NoFreeSessionSlots)
     }
 
     /// Get a reference to a session by ID.
@@ -567,6 +572,7 @@ mod tests {
             fec_rate_den: 2,
             arq_window: 8,
             compression: true,
+            multi_frame_ack: false,
             mcs_index: 3,
         };
         let bytes = caps.to_bytes();
@@ -585,7 +591,10 @@ mod tests {
 
     #[test]
     fn test_capabilities_too_short() {
-        assert!(LinkCapabilities::from_bytes(&[0; 6]).is_err());
+        assert!(matches!(
+            LinkCapabilities::from_bytes(&[0; 6]),
+            Err(ProtocolError::CapabilitiesTooShort { actual: 6 })
+        ));
     }
 
     #[test]
@@ -596,6 +605,7 @@ mod tests {
             fec_rate_den: 2,
             arq_window: 8,
             compression: true,
+            multi_frame_ack: true,
             mcs_index: 5,
         };
         let b = LinkCapabilities {
@@ -604,6 +614,7 @@ mod tests {
             fec_rate_den: 3,
             arq_window: 4,
             compression: false,
+            multi_frame_ack: false,
             mcs_index: 3,
         };
         let negotiated = a.negotiate(&b);
@@ -612,7 +623,39 @@ mod tests {
         assert_eq!(negotiated.fec_rate_den, 2);
         assert_eq!(negotiated.arq_window, 4); // min
         assert!(!negotiated.compression); // AND
+        assert!(!negotiated.multi_frame_ack); // AND
         assert_eq!(negotiated.mcs_index, 3); // min
+    }
+
+    /// COP-69: the `multi_frame_ack` capability bit (flags byte bit 1)
+    /// negotiates as an AND — set x clear -> clear, set x set -> set — and
+    /// survives a to_bytes/from_bytes roundtrip. This is the interop gate for
+    /// multi-codeword session frames and short ACK frames: an old peer sends
+    /// flags 0x00, the negotiated bit stays clear, and the pair runs today's
+    /// protocol exactly.
+    #[test]
+    fn link_capabilities_multi_frame_ack_negotiates_as_and() {
+        let set = LinkCapabilities {
+            multi_frame_ack: true,
+            ..LinkCapabilities::default()
+        };
+        let clear = LinkCapabilities::default();
+
+        assert!(!set.negotiate(&clear).multi_frame_ack);
+        assert!(!clear.negotiate(&set).multi_frame_ack);
+        assert!(set.negotiate(&set).multi_frame_ack);
+
+        // Wire roundtrip carries the bit, and an old peer's all-zero flags
+        // byte parses back with the bit clear.
+        let bytes = set.to_bytes();
+        assert_eq!(bytes[5] & 0x02, 0x02, "bit 1 of the flags byte");
+        assert!(
+            LinkCapabilities::from_bytes(&bytes)
+                .unwrap()
+                .multi_frame_ack
+        );
+        let legacy = LinkCapabilities::from_bytes(&[0, 0, 1, 2, 8, 0x00, 0]).unwrap();
+        assert!(!legacy.multi_frame_ack);
     }
 
     #[test]
@@ -687,7 +730,12 @@ mod tests {
             LinkCapabilities::default(),
         );
         s.initiate().unwrap();
-        assert!(s.initiate().is_err());
+        assert!(matches!(
+            s.initiate(),
+            Err(ProtocolError::CannotInitiate {
+                state: SessionState::Connecting
+            })
+        ));
     }
 
     #[test]
@@ -778,7 +826,10 @@ mod tests {
             0,
             LinkCapabilities::default(),
         );
-        assert!(s.disconnect().is_err());
+        assert!(matches!(
+            s.disconnect(),
+            Err(ProtocolError::CannotDisconnectIdle)
+        ));
     }
 
     #[test]
@@ -807,7 +858,10 @@ mod tests {
             0,
             LinkCapabilities::default(),
         );
-        assert!(s.keepalive().is_err());
+        assert!(matches!(
+            s.keepalive(),
+            Err(ProtocolError::KeepaliveNotEstablished)
+        ));
     }
 
     #[test]

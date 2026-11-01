@@ -8,7 +8,7 @@
 //! `ConnectRequest`/`DisconnectRequest` the way the VARA port treats
 //! `CONNECT`/`DISCONNECT`.
 
-use anyhow::Result;
+use crate::HostError;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -81,7 +81,7 @@ pub async fn handle_client(
     client_id: u32,
     event_tx: mpsc::Sender<HostEvent>,
     mut response_rx: mpsc::Receiver<ArdopResponse>,
-) -> Result<()> {
+) -> Result<(), HostError> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
@@ -264,7 +264,7 @@ mod tests {
         stream: TcpStream,
         rx: mpsc::Receiver<HostEvent>,
         _response_tx: mpsc::Sender<ArdopResponse>,
-        handler: tokio::task::JoinHandle<Result<()>>,
+        handler: tokio::task::JoinHandle<Result<(), HostError>>,
     }
 
     /// Connect a client to a real `handle_client` over a loopback socket

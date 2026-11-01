@@ -8,7 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 coppa-engine = { path = "../coppa-engine" }
-anyhow = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true, optional = true }

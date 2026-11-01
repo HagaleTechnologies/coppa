@@ -7,7 +7,7 @@
 //! Callsign encoding uses a 6-bit charset packing 8 characters into 6 bytes:
 //! - A-Z = 1-26, 0-9 = 27-36, '/' = 37, '-' = 38, space/pad = 0
 
-use anyhow::{anyhow, Result};
+use crate::ProtocolError;
 
 /// Current MAC protocol version.
 pub const MAC_VERSION: u8 = 1;
@@ -35,7 +35,7 @@ pub enum MacFrameType {
 
 impl MacFrameType {
     /// Convert from 4-bit nibble value.
-    pub fn from_u8(val: u8) -> Result<Self> {
+    pub fn from_u8(val: u8) -> Result<Self, ProtocolError> {
         match val & 0x0F {
             0 => Ok(MacFrameType::Data),
             1 => Ok(MacFrameType::Ack),
@@ -46,7 +46,7 @@ impl MacFrameType {
             6 => Ok(MacFrameType::Beacon),
             7 => Ok(MacFrameType::Keepalive),
             8 => Ok(MacFrameType::Relay),
-            v => Err(anyhow!("Unknown MAC frame type: {}", v)),
+            v => Err(ProtocolError::UnknownMacFrameType { value: v }),
         }
     }
 }
@@ -67,18 +67,17 @@ pub struct Callsign {
 
 impl Callsign {
     /// Create a callsign from a string, validating charset and length.
-    pub fn new(s: &str) -> Result<Self> {
+    pub fn new(s: &str) -> Result<Self, ProtocolError> {
         let upper = s.to_uppercase();
         if upper.len() > MAX_CALLSIGN_LEN {
-            return Err(anyhow!(
-                "Callsign too long: {} chars (max {})",
-                upper.len(),
-                MAX_CALLSIGN_LEN
-            ));
+            return Err(ProtocolError::CallsignTooLong {
+                len: upper.len(),
+                max: MAX_CALLSIGN_LEN,
+            });
         }
         for ch in upper.chars() {
             if char_to_code(ch).is_none() {
-                return Err(anyhow!("Invalid callsign character: '{}'", ch));
+                return Err(ProtocolError::InvalidCallsignCharacter { character: ch });
             }
         }
         Ok(Self { text: upper })
@@ -123,7 +122,7 @@ impl Callsign {
     }
 
     /// Decode callsign from 6 bytes.
-    pub fn decode(bytes: &[u8; ENCODED_CALLSIGN_BYTES]) -> Result<Self> {
+    pub fn decode(bytes: &[u8; ENCODED_CALLSIGN_BYTES]) -> Result<Self, ProtocolError> {
         let mut codes = [0u8; MAX_CALLSIGN_LEN];
         codes[0] = (bytes[0] >> 2) & 0x3F;
         codes[1] = ((bytes[0] & 0x03) << 4) | ((bytes[1] >> 4) & 0x0F);
@@ -141,7 +140,7 @@ impl Callsign {
             }
             match code_to_char(code) {
                 Some(ch) => text.push(ch),
-                None => return Err(anyhow!("Invalid callsign code: {}", code)),
+                None => return Err(ProtocolError::InvalidCallsignCode { code }),
             }
         }
 
@@ -229,13 +228,12 @@ impl MacPdu {
     }
 
     /// Deserialize from bytes.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
         if bytes.len() < Self::HEADER_SIZE {
-            return Err(anyhow!(
-                "MAC PDU too short: {} bytes (min {})",
-                bytes.len(),
-                Self::HEADER_SIZE
-            ));
+            return Err(ProtocolError::MacPduTooShort {
+                actual: bytes.len(),
+                min: Self::HEADER_SIZE,
+            });
         }
 
         let version = (bytes[0] >> 4) & 0x0F;
@@ -297,20 +295,18 @@ impl StationIdPayload {
     /// practice, but nothing upstream enforces that), so this returns an
     /// error rather than silently truncating the length prefix and emitting
     /// a corrupted frame.
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
         let callsign_bytes = self.callsign.as_bytes();
         let grid_bytes = self.grid.as_deref().unwrap_or("").as_bytes();
         if callsign_bytes.len() > u8::MAX as usize {
-            return Err(anyhow!(
-                "StationIdPayload: callsign too long to encode ({} bytes, max 255)",
-                callsign_bytes.len()
-            ));
+            return Err(ProtocolError::StationIdCallsignTooLong {
+                len: callsign_bytes.len(),
+            });
         }
         if grid_bytes.len() > u8::MAX as usize {
-            return Err(anyhow!(
-                "StationIdPayload: grid too long to encode ({} bytes, max 255)",
-                grid_bytes.len()
-            ));
+            return Err(ProtocolError::StationIdGridTooLong {
+                len: grid_bytes.len(),
+            });
         }
         let mut out = Vec::with_capacity(2 + callsign_bytes.len() + grid_bytes.len() + 1);
         out.push(callsign_bytes.len() as u8);
@@ -322,30 +318,30 @@ impl StationIdPayload {
     }
 
     /// Deserialize from bytes produced by [`Self::to_bytes`].
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
         if bytes.is_empty() {
-            return Err(anyhow!("StationIdPayload: empty input"));
+            return Err(ProtocolError::StationIdEmpty);
         }
         let callsign_len = bytes[0] as usize;
         let callsign_end = 1 + callsign_len;
         if bytes.len() < callsign_end + 1 {
-            return Err(anyhow!("StationIdPayload: truncated callsign field"));
+            return Err(ProtocolError::StationIdTruncatedCallsign);
         }
         let callsign = String::from_utf8(bytes[1..callsign_end].to_vec())
-            .map_err(|e| anyhow!("StationIdPayload: invalid callsign UTF-8: {e}"))?;
+            .map_err(|e| ProtocolError::StationIdCallsignUtf8 { source: e })?;
 
         let grid_len = bytes[callsign_end] as usize;
         let grid_start = callsign_end + 1;
         let grid_end = grid_start + grid_len;
         if bytes.len() < grid_end + 1 {
-            return Err(anyhow!("StationIdPayload: truncated grid/level field"));
+            return Err(ProtocolError::StationIdTruncatedGridLevel);
         }
         let grid = if grid_len == 0 {
             None
         } else {
             Some(
                 String::from_utf8(bytes[grid_start..grid_end].to_vec())
-                    .map_err(|e| anyhow!("StationIdPayload: invalid grid UTF-8: {e}"))?,
+                    .map_err(|e| ProtocolError::StationIdGridUtf8 { source: e })?,
             )
         };
         let level = bytes[grid_end];
@@ -411,12 +407,18 @@ mod tests {
 
     #[test]
     fn test_callsign_too_long() {
-        assert!(Callsign::new("VK3ABCDEF").is_err());
+        assert!(matches!(
+            Callsign::new("VK3ABCDEF"),
+            Err(ProtocolError::CallsignTooLong { len: 9, max: 8 })
+        ));
     }
 
     #[test]
     fn test_callsign_invalid_char() {
-        assert!(Callsign::new("VK3!ABC").is_err());
+        assert!(matches!(
+            Callsign::new("VK3!ABC"),
+            Err(ProtocolError::InvalidCallsignCharacter { character: '!' })
+        ));
     }
 
     #[test]
@@ -497,7 +499,10 @@ mod tests {
 
     #[test]
     fn test_frame_type_invalid() {
-        assert!(MacFrameType::from_u8(9).is_err());
+        assert!(matches!(
+            MacFrameType::from_u8(9),
+            Err(ProtocolError::UnknownMacFrameType { value: 9 })
+        ));
         assert!(MacFrameType::from_u8(15).is_err());
     }
 

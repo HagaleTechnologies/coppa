@@ -640,7 +640,7 @@ impl WebSocketServer {
     /// Data/state events use per-client queues via [`Self::push_handle`].
     /// Only disposable telemetry uses [`Self::broadcast_sender`].
     #[cfg(feature = "websocket")]
-    pub async fn run(&self) -> anyhow::Result<()> {
+    pub async fn run(&self) -> Result<(), crate::HostError> {
         let addr = format!("{}:{}", self.bind_addr, self.port);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         tracing::info!(%addr, "WebSocket server listening");
@@ -654,7 +654,10 @@ impl WebSocketServer {
     /// first and passes the listener in. The configured `port` is ignored on
     /// this path. Handshakes are gated as described on [`Self::run`].
     #[cfg(feature = "websocket")]
-    pub async fn run_with_listener(&self, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
+    pub async fn run_with_listener(
+        &self,
+        listener: tokio::net::TcpListener,
+    ) -> Result<(), crate::HostError> {
         use futures_util::{SinkExt, StreamExt};
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;

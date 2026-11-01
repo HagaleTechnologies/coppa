@@ -3829,8 +3829,8 @@ mod tests {
         let mut summary = DecodeSummary::default();
         for payload in [
             Ok(b"GOOD".to_vec()),
-            Err(anyhow::anyhow!("first failure")),
-            Err(anyhow::anyhow!("second failure")),
+            Err(coppa_engine::EngineError::NoSignalDetected),
+            Err(coppa_engine::EngineError::NoSamplesToDecode),
         ] {
             handle_stream_frame(
                 &core,
@@ -3846,7 +3846,7 @@ mod tests {
         assert_eq!(summary.failed_frames, 2);
         let error = summary.check_failure().unwrap_err().to_string();
         assert!(
-            error.contains("first failure") && !error.contains("second failure"),
+            error.contains("No signal detected") && !error.contains("No samples to decode"),
             "{error}"
         );
     }

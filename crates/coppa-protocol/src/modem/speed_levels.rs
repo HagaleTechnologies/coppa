@@ -51,7 +51,7 @@ pub fn speed_level_entry(
 /// **wire-format-breaking exception**: level 9 (64-QAM) changes from rate
 /// 7/8 (1701) to rate **5/6** (1620), per the Phase 2 decision audit ("k_used
 /// table" decision) -- 7/8 was found to hit LDPC non-convergence at high SNR
-/// (see `CLAUDE.md`'s Known Limitations), and 5/6 is both a real reduction
+/// (see `docs/LIMITATIONS.md`), and 5/6 is both a real reduction
 /// in that failure mode and a cleaner NR-standard-adjacent rate. **Frames
 /// encoded with the pre-Task-4 codec are not decodable by this codec, and
 /// vice versa** -- this is a wire-format break exactly like the Phase 1 OFDM

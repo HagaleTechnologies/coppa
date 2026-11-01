@@ -133,7 +133,9 @@ ignores KISS TXDELAY, persistence and slot time), no digipeating or beaconing, a
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full system design, TX/RX pipeline details, and layer responsibilities.
 
-See [PLAN-hardening.md](PLAN-hardening.md) for known issues and the hardening roadmap.
+See [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for known limitations: measured gaps, open bugs and targets the code does not yet meet.
+
+See [wiki/INDEX.md](wiki/INDEX.md) for short, question-titled pages on gotchas and the reasons behind design decisions. The wiki points at `docs/` and the code, which win any conflict.
 
 See [docs/SPEC.md](docs/SPEC.md) for the normative waveform/FEC/protocol conformance specification — the reference for building an independent, interoperable implementation.
 

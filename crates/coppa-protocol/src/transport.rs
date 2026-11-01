@@ -14,7 +14,7 @@
 //! `coppa_protocol::arq::SACK_RANGE`'s doc for why 31 of these 32 bits are used
 //! and how that interacts with the ARQ ring buffer size.
 
-use anyhow::{anyhow, Result};
+use crate::ProtocolError;
 
 /// Transport PDU types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -40,7 +40,7 @@ pub enum TransportType {
 }
 
 impl TransportType {
-    pub fn from_u8(val: u8) -> Result<Self> {
+    pub fn from_u8(val: u8) -> Result<Self, ProtocolError> {
         match val & 0x0F {
             0 => Ok(TransportType::Unreliable),
             1 => Ok(TransportType::Reliable),
@@ -48,7 +48,7 @@ impl TransportType {
             3 => Ok(TransportType::Nak),
             4 => Ok(TransportType::Reset),
             5 => Ok(TransportType::CpControl),
-            v => Err(anyhow!("Unknown transport type: {}", v)),
+            v => Err(ProtocolError::UnknownTransportType { value: v }),
         }
     }
 }
@@ -255,13 +255,12 @@ impl TransportPdu {
     }
 
     /// Deserialize from bytes.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
         if bytes.len() < TRANSPORT_HEADER_SIZE {
-            return Err(anyhow!(
-                "Transport PDU too short: {} bytes (min {})",
-                bytes.len(),
-                TRANSPORT_HEADER_SIZE
-            ));
+            return Err(ProtocolError::TransportPduTooShort {
+                actual: bytes.len(),
+                min: TRANSPORT_HEADER_SIZE,
+            });
         }
 
         let session_id = (bytes[0] >> 4) & 0x0F;
@@ -384,13 +383,19 @@ mod tests {
 
     #[test]
     fn test_invalid_transport_type() {
-        assert!(TransportType::from_u8(6).is_err());
+        assert!(matches!(
+            TransportType::from_u8(6),
+            Err(ProtocolError::UnknownTransportType { value: 6 })
+        ));
         assert!(TransportType::from_u8(15).is_err());
     }
 
     #[test]
     fn test_too_short() {
-        assert!(TransportPdu::from_bytes(&[0x00]).is_err());
+        assert!(matches!(
+            TransportPdu::from_bytes(&[0x00]),
+            Err(ProtocolError::TransportPduTooShort { actual: 1, min: 7 })
+        ));
         assert!(TransportPdu::from_bytes(&[0x00, 0x01, 0x02]).is_err());
     }
 

@@ -467,7 +467,6 @@ dependencies = [
 name = "coppa-codec"
 version = "0.3.0"
 dependencies = [
- "anyhow",
  "approx",
  "coppa-channel",
  "coppa-dsp",
@@ -475,6 +474,7 @@ dependencies = [
  "num-complex",
  "rand 0.10.3",
  "rustfft",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -516,7 +516,6 @@ dependencies = [
 name = "coppa-engine"
 version = "0.3.0"
 dependencies = [
- "anyhow",
  "approx",
  "coppa-channel",
  "coppa-codec",
@@ -524,6 +523,7 @@ dependencies = [
  "coppa-protocol",
  "num-complex",
  "rand 0.10.3",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -538,14 +538,18 @@ dependencies = [
 name = "coppa-host"
 version = "0.3.0"
 dependencies = [
+<<<<<<< HEAD
  "anyhow",
  "base64",
+=======
+>>>>>>> 933e4e01b7c112eb04f180ee1bf623fee5b66d3c
  "coppa-engine",
  "futures-util",
  "jsonschema",
  "schemars",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
  "tracing",
@@ -563,7 +567,6 @@ dependencies = [
 name = "coppa-protocol"
 version = "0.3.0"
 dependencies = [
- "anyhow",
  "approx",
  "coppa-bench",
  "coppa-channel",
@@ -577,6 +580,7 @@ dependencies = [
  "proptest",
  "rand 0.10.3",
  "serde",
+ "thiserror 2.0.18",
  "toml 1.1.8+spec-1.1.0",
 ]
 

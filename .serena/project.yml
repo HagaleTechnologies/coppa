@@ -63,8 +63,9 @@ initial_prompt: |
   tools/gen_nr_bg2, with a root `coppa` package holding workspace-level
   integration tests. CoppaTransceiver (coppa-protocol) is the main encode/decode
   pipeline; CoppaCore (coppa-engine) is a thin wrapper around it.
-  Read CLAUDE.md first -- its Known Limitations section is long, current, and
-  authoritative about what is measured, unproven, or deliberately unfixed -- then
+  Read CLAUDE.md first -- the short agent brief -- then docs/LIMITATIONS.md, which is
+  the long, current, and authoritative list of what is measured, unproven, or
+  deliberately unfixed -- then
   wiki/INDEX.md for the page map (overview, per-crate deep-dives, 8 numbered
   ADRs, and several "what will bite you" gotcha pages). Prefer Serena's
   get_symbols_overview / find_symbol / find_referencing_symbols over raw grep for
