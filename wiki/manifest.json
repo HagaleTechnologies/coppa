@@ -423,6 +423,27 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:9c525e41700a2dae28aac59a44ab07c2712620a03d8a3aab01d59a701fabdea9",
+      "id": "mdns-discovery",
+      "kind": "gotcha",
+      "links": [
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/mdns-discovery.md",
+      "sources": [
+        "crates/coppa-daemon/src/mdns.rs",
+        "crates/coppa-daemon/tests/cli.rs",
+        "docs/OPERATING.md"
+      ],
+      "status": "current",
+      "title": "What will bite you when testing coppad's mDNS discovery?",
+      "verified_commit": "b9fdb8d",
+      "verified_date": "2026-11-02",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:e8adc703ca6f9a6b097149842f8431013b0e6b894e881ff8cbf8c875e0a5501c",
       "id": "overview",
       "kind": "overview",

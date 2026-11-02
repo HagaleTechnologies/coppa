@@ -548,6 +548,17 @@ fn origin_for_log(request: &Request) -> Option<String> {
     }
 }
 
+/// COP-140: what a plain `GET /health` on the WebSocket port reports. The
+/// daemon sets it from its startup verdict (`Daemon ready` or `Daemon running
+/// degraded`); see [`WebSocketServer::with_health`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Health {
+    /// Answered as `{"status":"ok"}`.
+    Ok,
+    /// Answered as `{"status":"degraded"}`, still with HTTP 200.
+    Degraded,
+}
+
 /// WebSocket server configuration.
 pub struct WebSocketServer {
     clients: ClientRegistry,
@@ -565,6 +576,12 @@ pub struct WebSocketServer {
     /// COP-79: the page served to a plain (non-upgrade) `GET /`. `None`
     /// answers such a request `404`.
     index_html: Option<std::sync::Arc<str>>,
+    /// COP-140: the status a plain `GET /health` reports. `None` answers such
+    /// a request `404`.
+    health: Option<Health>,
+    /// COP-140: how long a connection has to send its whole request head
+    /// before it is closed, so idle sockets cannot hold every permit.
+    head_read_timeout: std::time::Duration,
 }
 
 impl WebSocketServer {
@@ -587,6 +604,8 @@ impl WebSocketServer {
             status: std::sync::Arc::new(tokio::sync::Mutex::new(WsStatus::default())),
             auth: None,
             index_html: None,
+            health: None,
+            head_read_timeout: http_route::HEAD_READ_TIMEOUT,
         }
     }
 
@@ -604,6 +623,23 @@ impl WebSocketServer {
     /// passes the [`WsAuth`] gate. Without this, such a request gets `404`.
     pub fn with_index_html(mut self, html: impl Into<String>) -> Self {
         self.index_html = Some(std::sync::Arc::from(html.into()));
+        self
+    }
+
+    /// COP-140: answer a plain HTTP `GET /health` (or `HEAD /health`) on the
+    /// WebSocket port with `200` and `{"status":"ok"}` or
+    /// `{"status":"degraded"}`, for monitoring tools. The answer needs no
+    /// token, so it carries the status and nothing else. Without this, such a
+    /// request gets `404`.
+    pub fn with_health(mut self, health: Health) -> Self {
+        self.health = Some(health);
+        self
+    }
+
+    /// Shorten the request-head deadline so a test does not wait 5 s.
+    #[cfg(test)]
+    pub(crate) fn with_head_read_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.head_read_timeout = timeout;
         self
     }
 
@@ -652,7 +688,10 @@ impl WebSocketServer {
     /// Every handshake is gated by the [`WsAuth`] set with [`Self::with_auth`]
     /// (COP-53); without one, every handshake is refused with 401. A request
     /// that is not a WebSocket upgrade gets a static answer instead (COP-79):
-    /// the [`Self::with_index_html`] page at `GET /`, else `404`/`405`. Each
+    /// the [`Self::with_index_html`] page at `GET /`, the [`Self::with_health`]
+    /// status at `GET /health` (COP-140), else `404`/`405`; `HEAD` gets the
+    /// `GET` answer without its body. A connection that sends no complete
+    /// request head within 5 s is closed. Each
     /// accepted connection gets a unique client ID. Incoming JSON messages are
     /// parsed as `WsClientMessage` and translated to `HostEvent`s.
     /// Data/state events use per-client queues via [`Self::push_handle`].
@@ -708,6 +747,8 @@ impl WebSocketServer {
             let event_tx = self.event_tx.clone();
             let status = self.status.clone();
             let index_html = self.index_html.clone();
+            let health = self.health;
+            let head_read_timeout = self.head_read_timeout;
             let clients = self.clients.clone();
 
             tokio::spawn(async move {
@@ -717,9 +758,20 @@ impl WebSocketServer {
                 // anything else gets a static answer and the connection closes.
                 // Never log the request target or headers: both can carry the
                 // token.
-                let head = match http_route::read_head(&mut stream).await {
-                    Ok(head) => head,
-                    Err(e) => {
+                // COP-140: a deadline on the head, so a socket that sends
+                // nothing gives its permit back.
+                let head = match tokio::time::timeout(
+                    head_read_timeout,
+                    http_route::read_head(&mut stream),
+                )
+                .await
+                {
+                    Ok(Ok(head)) => head,
+                    Err(_elapsed) => {
+                        tracing::debug!(%peer, "HTTP request head timed out");
+                        return;
+                    }
+                    Ok(Err(e)) => {
                         if let Some(response) = e.response() {
                             http_route::respond_and_close(&mut stream, &response).await;
                         }
@@ -732,8 +784,12 @@ impl WebSocketServer {
                         http_route::PrefixedStream::new(head.bytes, stream)
                     }
                     http_route::ClientRequest::Static { method, path } => {
-                        let response =
-                            http_route::static_answer(&method, &path, index_html.as_deref());
+                        let response = http_route::static_answer(
+                            &method,
+                            &path,
+                            index_html.as_deref(),
+                            health,
+                        );
                         http_route::respond_and_close(&mut stream, &response).await;
                         tracing::debug!(%peer, "Answered a plain HTTP request");
                         return;
@@ -1878,12 +1934,28 @@ mod integration_tests {
     async fn start_page_server(
         index_html: Option<&str>,
     ) -> (std::net::SocketAddr, mpsc::Receiver<HostEvent>) {
+        start_http_server(index_html, None, None).await
+    }
+
+    /// COP-140: [`start_page_server`] that also reports `health` (if any) at
+    /// `/health`, and closes idle connections after `head_timeout` (if set).
+    async fn start_http_server(
+        index_html: Option<&str>,
+        health: Option<Health>,
+        head_timeout: Option<std::time::Duration>,
+    ) -> (std::net::SocketAddr, mpsc::Receiver<HostEvent>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mut server =
             WebSocketServer::with_bind_addr(0, "127.0.0.1".to_string()).with_auth(test_auth());
         if let Some(html) = index_html {
             server = server.with_index_html(html);
+        }
+        if let Some(health) = health {
+            server = server.with_health(health);
+        }
+        if let Some(timeout) = head_timeout {
+            server = server.with_head_read_timeout(timeout);
         }
         let event_rx = server.take_event_rx().expect("fresh server");
         tokio::spawn(async move {
@@ -1975,9 +2047,137 @@ mod integration_tests {
             response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
             "{response}"
         );
-        assert!(response.contains("\r\nAllow: GET\r\n"), "{response}");
+        assert!(response.contains("\r\nAllow: GET, HEAD\r\n"), "{response}");
         assert!(response.contains("\r\nConnection: close\r\n"), "{response}");
         assert!(!response.contains(PAGE), "{response}");
+    }
+
+    #[tokio::test]
+    async fn plain_get_health_reports_the_configured_status() {
+        for (health, body) in [
+            (Health::Ok, "{\"status\":\"ok\"}\n"),
+            (Health::Degraded, "{\"status\":\"degraded\"}\n"),
+        ] {
+            let (addr, mut event_rx) = start_http_server(Some(PAGE), Some(health), None).await;
+            let response = raw_exchange(addr, &plain_get("/health")).await;
+            assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+            assert!(
+                response.contains("\r\nContent-Type: application/json\r\n"),
+                "{response}"
+            );
+            assert!(
+                response.contains("\r\nCache-Control: no-store\r\n"),
+                "{response}"
+            );
+            assert!(
+                !response.contains("Access-Control-Allow-Origin"),
+                "{response}"
+            );
+            let (_, got) = response.split_once("\r\n\r\n").unwrap();
+            assert_eq!(got, body);
+            expect_no_event(&mut event_rx).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn head_health_returns_headers_only() {
+        let (addr, _event_rx) = start_http_server(None, Some(Health::Ok), None).await;
+        let get = raw_exchange(addr, &plain_get("/health")).await;
+        let head = raw_exchange(
+            addr,
+            b"HEAD /health HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\n\r\n",
+        )
+        .await;
+        let (get_head, _) = get.split_once("\r\n\r\n").unwrap();
+        assert_eq!(head, format!("{get_head}\r\n\r\n"), "no body after HEAD");
+        assert!(head.contains("\r\nContent-Length: 16\r\n"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn health_is_404_when_not_configured() {
+        let (addr, _event_rx) = start_page_server(Some(PAGE)).await;
+        let response = raw_exchange(addr, &plain_get("/health")).await;
+        assert!(
+            response.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "{response}"
+        );
+    }
+
+    /// COP-140: sixteen sockets that never send a request head used to hold
+    /// every permit for as long as they stayed open, so a health probe was
+    /// reset. With the deadline they are closed and the probe gets through.
+    #[tokio::test]
+    async fn idle_connections_cannot_lock_out_a_health_probe() {
+        use tokio::io::AsyncReadExt;
+        let (addr, _event_rx) = start_http_server(
+            None,
+            Some(Health::Ok),
+            Some(std::time::Duration::from_millis(300)),
+        )
+        .await;
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+            idle.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        for stream in &mut idle {
+            let mut buf = [0u8; 16];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(1), stream.read(&mut buf))
+                .await
+                .expect("an idle connection must be closed by the head deadline")
+                .unwrap_or(0);
+            assert_eq!(n, 0, "an idle connection gets no response, only EOF");
+        }
+        let response = raw_exchange(addr, &plain_get("/health")).await;
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    }
+
+    /// COP-140: the deadline covers the whole head, not each read, and a head
+    /// that arrives in pieces before it still upgrades.
+    #[tokio::test]
+    async fn a_head_sent_in_time_is_not_cut_off() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (addr, mut event_rx) = start_http_server(
+            None,
+            Some(Health::Ok),
+            Some(std::time::Duration::from_millis(300)),
+        )
+        .await;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                b"GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\n\
+                  Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n",
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        stream
+            .write_all(
+                format!(
+                    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                     Origin: http://localhost:3000\r\nAuthorization: Bearer {TOKEN}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        let mut buf = [0u8; 512];
+        while !response.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
+                .await
+                .expect("the upgrade must be answered")
+                .unwrap();
+            assert!(n > 0, "closed before answering the upgrade");
+            response.extend_from_slice(&buf[..n]);
+        }
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+            "{response}"
+        );
+        assert_eq!(expect_connected(&mut event_rx).await, FIRST_CLIENT_ID);
     }
 
     #[tokio::test]
