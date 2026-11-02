@@ -209,8 +209,10 @@ Nothing in coppad can release PTT in these cases:
 - `ptt_guardian = false`, after `kill -9`, an out-of-memory kill or a crash.
 - A coppad that is still running but completely stuck (for example,
   deadlocked) while PTT is keyed.
-- `coppa tx` and `coppa tune` stopped with Ctrl-C. Errors and panics in them
-  do release PTT.
+- A second Ctrl-C in `coppa tx` or `coppa tune`, which exits at once without
+  cleanup. The first Ctrl-C (or SIGTERM) releases PTT and stops the audio
+  before exiting with status 130 (COP-86). Errors and panics in them also
+  release PTT.
 
 Turn on your rig's TX time-out timer (TOT), set a little longer than
 `max_tx_duration_s`. It is the only protection that works in every case

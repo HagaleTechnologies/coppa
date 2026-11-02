@@ -88,6 +88,14 @@ coppa profiles -p HF_STANDARD --json
 # Suppress status output, or repeat -v for frame metrics on stderr
 coppa -q rx cq.wav
 coppa -vv rx cq.wav
+
+# Pipe raw audio (s16le, mono, 48 kHz, no header) to a sound card or into rx
+coppa tx "CQ CQ CQ DE VK2ABC K" -o - | aplay -q -f S16_LE -r 48000 -c 1
+arecord -q -f S16_LE -r 48000 -c 1 -t raw | coppa rx -
+
+# Shell completions and the man page
+coppa completions bash > ~/.local/share/bash-completion/completions/coppa
+coppa man > coppa.1
 ```
 
 `coppa` can keep callsign, profile, audio device and rig settings in the same `coppad.toml` as the daemon, with `COPPA_*` environment and flag overrides; see [CLI settings](docs/tutorials/getting-started.md#persisting-your-cli-settings).
