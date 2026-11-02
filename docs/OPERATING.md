@@ -155,7 +155,10 @@ WARN coppad::event_loop: [radio] ptt_invert = true has no effect with ptt_method
 
 An inverted sysfs GPIO line is opened with `direction` set to `high`, its RX
 level, so it does not key the rig while coppad starts. A non-inverted line is
-still opened with `out`, which drives it low.
+still opened with `out`, which drives it low. When coppad lets go of an
+inverted line, it leaves the pin exported and high instead of unexporting it,
+because an unexported Raspberry Pi pin turns back into an input that its
+default pull-down can hold low.
 
 ## PTT safety when coppad stops
 

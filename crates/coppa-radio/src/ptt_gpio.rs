@@ -90,6 +90,16 @@ fn output_direction(idle_high: bool) -> &'static str {
     }
 }
 
+/// Whether `SysfsGpio::drop` unexports the pin. Unexporting hands the pin
+/// back to the kernel, which on a Raspberry Pi makes it an input again; with
+/// the SoC's default pull-down that reads low, which is TX on an active-low
+/// (inverted) rig. So a line whose RX level is high stays exported, driven
+/// high, after coppad lets go of it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn unexport_on_drop(idle_high: bool) -> bool {
+    !idle_high
+}
+
 /// Abstraction over "write a digital level to a GPIO line."
 ///
 /// `GpioPtt` is generic over this trait so its PTT state-machine logic can be
@@ -102,12 +112,14 @@ pub trait GpioWriter: Send {
 
 /// Real sysfs-backed GPIO line: writes `"1"`/`"0"` to
 /// `/sys/class/gpio/gpio<N>/value`. See the module docs for the export/
-/// permissions setup this assumes. Unexports the pin on drop; `GpioPtt::drop`
-/// lowers it first.
+/// permissions setup this assumes. Unexports the pin on drop, unless its RX
+/// level is high (see `unexport_on_drop`); `GpioPtt::drop` drives it to RX
+/// first.
 #[cfg(target_os = "linux")]
 pub struct SysfsGpio {
     pin: u32,
     value_path: std::path::PathBuf,
+    idle_high: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -155,7 +167,11 @@ impl SysfsGpio {
                 .map(drop)
         })
         .with_context(|| format!("GPIO pin {pin} value is not writable"))?;
-        Ok(Self { pin, value_path })
+        Ok(Self {
+            pin,
+            value_path,
+            idle_high,
+        })
     }
 }
 
@@ -171,6 +187,11 @@ impl GpioWriter for SysfsGpio {
 #[cfg(target_os = "linux")]
 impl Drop for SysfsGpio {
     fn drop(&mut self) {
+        // COP-52: an inverted line stays exported and high (see
+        // `unexport_on_drop`).
+        if !unexport_on_drop(self.idle_high) {
+            return;
+        }
         // Best-effort unexport; nothing useful to do if this fails (e.g. pin
         // was already unexported by another process).
         let _ = std::fs::write("/sys/class/gpio/unexport", self.pin.to_string());
@@ -471,6 +492,9 @@ mod tests {
     fn an_inverted_line_starts_as_an_output_at_its_rx_level() {
         assert_eq!(output_direction(true), "high");
         assert_eq!(output_direction(false), "out");
+        // ...and an inverted line is left exported, still high, on drop.
+        assert!(!unexport_on_drop(true));
+        assert!(unexport_on_drop(false));
     }
 
     #[cfg(target_os = "linux")]

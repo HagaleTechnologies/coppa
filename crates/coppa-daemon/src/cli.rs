@@ -292,6 +292,10 @@ mod tests {
                 ptt_invert: true,
             }
         );
+        assert_eq!(
+            error_kind(&["--guardian-ptt-invert"]),
+            ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]
@@ -311,10 +315,6 @@ mod tests {
     fn guardian_address_requires_guardian_mode() {
         assert_eq!(
             error_kind(&["--guardian-rigctld-address", "127.0.0.1:1"]),
-            ErrorKind::MissingRequiredArgument
-        );
-        assert_eq!(
-            error_kind(&["--guardian-ptt-invert"]),
             ErrorKind::MissingRequiredArgument
         );
     }
