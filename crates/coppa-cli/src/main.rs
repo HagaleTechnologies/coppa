@@ -114,7 +114,8 @@ struct Cli {
 /// `coppa listen` (COP-56) so the two cannot drift apart.
 #[derive(clap::Args, Debug, Default, PartialEq, Eq)]
 struct RxArgs {
-    /// WAV file to decode. Without one, captures live audio from an input device.
+    /// WAV file to decode, or - for raw PCM on stdin (see --sample-format).
+    /// Without one, captures live audio from an input device.
     #[arg(value_name = "FILE", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     file: Option<String>,
     /// WAV file to decode (same as FILE).
@@ -162,6 +163,10 @@ struct RxArgs {
     /// Zero-based input channel on the selected device.
     #[arg(long, default_value_t = 0)]
     input_channel: u16,
+    /// Sample encoding of raw PCM on stdin (rx -): s16le (16-bit PCM) or
+    /// f32le (32-bit float), mono 48000 Hz [default: s16le].
+    #[arg(long, value_enum, value_name = "FORMAT", hide_possible_values = true)]
+    sample_format: Option<SampleFormat>,
 }
 
 impl RxArgs {
@@ -359,6 +364,62 @@ const LISTEN_DEPRECATED: &str = "WARNING: 'coppa listen' is deprecated and will 
     removed in the next release. Use 'coppa rx' instead; it takes the same flags, \
     and --raw prints hex.";
 
+/// Sample encoding for `-o` and `rx -` (COP-86). A CLI-local enum, because
+/// `coppa_audio::PcmFormat` exists only in a `file-backend` build.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SampleFormat {
+    /// 16-bit signed PCM, little-endian.
+    #[default]
+    S16le,
+    /// 32-bit float, little-endian.
+    F32le,
+}
+
+#[cfg(feature = "file-backend")]
+impl From<SampleFormat> for coppa_audio::PcmFormat {
+    fn from(format: SampleFormat) -> Self {
+        match format {
+            SampleFormat::S16le => Self::S16Le,
+            SampleFormat::F32le => Self::F32Le,
+        }
+    }
+}
+
+/// `-o` and `--sample-format`, shared by `tx` and `tune` so they cannot drift.
+#[derive(clap::Args, Debug, Default, PartialEq, Eq)]
+struct OutputArgs {
+    /// Write the audio to a WAV file, or - for raw PCM on stdout, instead of playing it.
+    #[arg(short, long, value_name = "FILE", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    output: Option<String>,
+    /// Sample encoding for -o: s16le (16-bit PCM) or f32le (32-bit float) [default: s16le].
+    #[arg(
+        long,
+        value_enum,
+        value_name = "FORMAT",
+        requires = "output",
+        hide_possible_values = true
+    )]
+    sample_format: Option<SampleFormat>,
+}
+
+impl OutputArgs {
+    fn target(&self) -> Option<OutputTarget<'_>> {
+        self.output.as_deref().map(|path| OutputTarget {
+            path,
+            format: self.sample_format.unwrap_or_default(),
+        })
+    }
+}
+
+/// Where `tx`/`tune` write audio instead of playing it: a WAV file, or `-`
+/// for raw PCM on stdout.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(feature = "file-backend"), allow(dead_code))]
+struct OutputTarget<'a> {
+    path: &'a str,
+    format: SampleFormat,
+}
+
 /// Printed on stderr whenever the deprecated `tune --seconds` runs, even under
 /// `--quiet`, like `LISTEN_DEPRECATED`.
 const TUNE_SECONDS_DEPRECATED: &str = "WARNING: '--seconds' is deprecated and will be \
@@ -415,9 +476,8 @@ enum Commands {
         /// Message to transmit.
         #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         message: String,
-        /// Output file for audio samples (WAV format).
-        #[arg(short, long, value_name = "FILE", value_parser = clap::builder::NonEmptyStringValueParser::new())]
-        output: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
         /// Operational profile name (e.g., HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY).
         #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
         profile: Option<String>,
@@ -430,7 +490,7 @@ enum Commands {
         #[command(flatten)]
         rig: RigArgs,
     },
-    /// Receive and decode audio from a WAV file, or live from an audio input device.
+    /// Receive and decode audio from a WAV file, stdin or a live audio input device.
     #[command(after_help = SETTINGS_HELP)]
     Rx(RxArgs),
     /// Run a loopback test (encode -> decode).
@@ -494,9 +554,8 @@ enum Commands {
             value_parser = tune_single_hz
         )]
         single: Option<f32>,
-        /// Output file for audio samples (WAV format) instead of live playback.
-        #[arg(short, long, value_name = "FILE", value_parser = clap::builder::NonEmptyStringValueParser::new())]
-        output: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
         /// Operational profile name (e.g., HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY).
         #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
         profile: Option<String>,
@@ -675,13 +734,13 @@ fn run() -> Result<()> {
                 layers.print_verbose_source();
                 settings::print_setting("Callsign", &callsign);
                 settings::print_setting("Profile", &profile);
-                if output.is_none() {
+                if output.output.is_none() {
                     rig.print_verbose();
                 }
             }
             cmd_tx(
                 &message,
-                output.as_deref(),
+                output.target(),
                 profile.as_ref().map(|v| v.value.as_str()),
                 level,
                 &rig,
@@ -729,14 +788,14 @@ fn run() -> Result<()> {
             if verbosity.is_verbose() {
                 layers.print_verbose_source();
                 settings::print_setting("Profile", &profile);
-                if output.is_none() {
+                if output.output.is_none() {
                     rig.print_verbose();
                 }
             }
             cmd_tune(
                 seconds,
                 single,
-                output.as_deref(),
+                output.target(),
                 profile.as_ref().map(|v| v.value.as_str()),
                 &rig,
                 verbosity,
@@ -841,28 +900,70 @@ fn cmd_man() -> Result<()> {
     emit_raw(&buf)
 }
 
-/// Write `samples` to a WAV file at `path` (file-backend only) — shared by
-/// `cmd_tx`'s and `cmd_tune`'s file-output paths.
-fn write_wav_output(
-    path: &str,
+/// Refuse raw audio to a terminal: it is never what anyone wants.
+#[cfg_attr(not(feature = "file-backend"), allow(dead_code))]
+fn refuse_raw_stdout(is_terminal: bool) -> Result<()> {
+    if is_terminal {
+        anyhow::bail!(
+            "refusing to write raw audio to a terminal; redirect stdout, e.g. \
+             coppa tx MESSAGE -o - | aplay -f S16_LE -r 48000 -c 1"
+        );
+    }
+    Ok(())
+}
+
+/// Refuse raw audio from a terminal: nobody types PCM.
+#[cfg_attr(not(feature = "file-backend"), allow(dead_code))]
+fn refuse_raw_stdin(is_terminal: bool) -> Result<()> {
+    if is_terminal {
+        anyhow::bail!(
+            "refusing to read raw audio from a terminal; pipe it in, e.g. \
+             arecord -f S16_LE -r 48000 -c 1 -t raw | coppa rx -"
+        );
+    }
+    Ok(())
+}
+
+/// Write `samples` to a WAV file, or as raw PCM to stdout for `-`
+/// (file-backend only) — shared by `cmd_tx`'s and `cmd_tune`'s output paths.
+fn write_audio_output(
+    target: OutputTarget<'_>,
     samples: &[f32],
     sample_rate: u32,
     verbosity: Verbosity,
 ) -> Result<()> {
     #[cfg(feature = "file-backend")]
     {
-        use coppa_audio::{file_backend::WavSink, AudioSink};
-        let mut sink = WavSink::new(path, sample_rate);
-        sink.start()?;
-        sink.write(samples)?;
-        sink.stop()?;
-        if verbosity != Verbosity::Quiet {
-            eprintln!("Written to {}", path);
+        use coppa_audio::AudioSink;
+        use std::io::IsTerminal;
+        let format = coppa_audio::PcmFormat::from(target.format);
+        if target.path == "-" {
+            refuse_raw_stdout(std::io::stdout().is_terminal())?;
+            let mut sink = coppa_audio::RawPcmWriter::new(
+                std::io::BufWriter::new(std::io::stdout()),
+                format,
+                sample_rate,
+            );
+            sink.start()?;
+            sink.write(samples)?;
+            sink.stop()?;
+            if verbosity != Verbosity::Quiet {
+                eprintln!("Written to stdout (raw {format}, mono, {sample_rate} Hz)");
+            }
+        } else {
+            let mut sink =
+                coppa_audio::WavSink::with_format(target.path, sample_rate, format.wav_format());
+            sink.start()?;
+            sink.write(samples)?;
+            sink.stop()?;
+            if verbosity != Verbosity::Quiet {
+                eprintln!("Written to {}", target.path);
+            }
         }
     }
     #[cfg(not(feature = "file-backend"))]
     {
-        let _ = path;
+        let _ = target;
         let _ = samples;
         let _ = sample_rate;
         if verbosity != Verbosity::Quiet {
@@ -1311,7 +1412,7 @@ fn transmit_live(
 
 fn cmd_tx(
     message: &str,
-    output: Option<&str>,
+    output: Option<OutputTarget<'_>>,
     profile: Option<&str>,
     level: Option<u8>,
     rig: &RigSettings,
@@ -1340,7 +1441,7 @@ fn cmd_tx(
     }
 
     match output {
-        Some(path) => write_wav_output(path, &samples, core.config().sample_rate, verbosity)?,
+        Some(target) => write_audio_output(target, &samples, core.config().sample_rate, verbosity)?,
         None => {
             // Offline WAV rendering (the `Some` arm) emits no RF and is never
             // gated; live transmission is (COP-40).
@@ -1402,7 +1503,7 @@ fn tune_occupied_hz(single: Option<f32>) -> u32 {
 fn cmd_tune(
     seconds: f32,
     single: Option<f32>,
-    output: Option<&str>,
+    output: Option<OutputTarget<'_>>,
     profile: Option<&str>,
     rig: &RigSettings,
     verbosity: Verbosity,
@@ -1431,7 +1532,7 @@ fn cmd_tune(
     }
 
     match output {
-        Some(path) => write_wav_output(path, &samples, core.config().sample_rate, verbosity)?,
+        Some(target) => write_audio_output(target, &samples, core.config().sample_rate, verbosity)?,
         None => {
             // Offline WAV rendering (the `Some` arm) emits no RF and is never
             // gated; live transmission is (COP-40).
@@ -1499,7 +1600,66 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
         eprintln!("[verbose] sample_rate: {}", core.config().sample_rate);
     }
 
-    if let Some(path) = args.path() {
+    if args.sample_format.is_some() && args.path() != Some("-") {
+        anyhow::bail!(
+            "--sample-format applies only to raw PCM on stdin (rx -); a WAV file's header sets its format"
+        );
+    }
+
+    if args.path() == Some("-") {
+        #[cfg(feature = "file-backend")]
+        {
+            use coppa_audio::AudioSource;
+            use std::io::IsTerminal;
+            refuse_raw_stdin(std::io::stdin().is_terminal())?;
+            let rate = core.config().sample_rate;
+            let format = coppa_audio::PcmFormat::from(args.sample_format.unwrap_or_default());
+            let mut source = coppa_audio::RawPcmReader::new(std::io::stdin(), format, rate);
+            if source.starts_with_wav_header()? {
+                anyhow::bail!(
+                    "stdin starts with a WAV header; pass the file instead (coppa rx FILE) or send headerless PCM"
+                );
+            }
+            if status_enabled(verbosity, args.raw, args.json) {
+                eprintln!("Reading raw {format} audio (mono, {rate} Hz) from stdin...");
+            }
+            source.start()?;
+            let total_samples =
+                (args.duration > 0).then(|| file_sample_limit(usize::MAX, args.duration, rate));
+            let summary = stream_decode(
+                &mut core,
+                &mut source,
+                StopWhen {
+                    total_samples,
+                    eof_on_empty_read: true,
+                    ..StopWhen::default()
+                },
+                output_mode,
+                args.profile.as_deref().unwrap_or("default"),
+                verbosity,
+            )?;
+            source.stop()?;
+            summary.check_failure()?;
+            if summary.good_frames == 0 {
+                anyhow::bail!(
+                    "no frames decoded from stdin ({} samples at {} Hz; profile {}); check for a complete Coppa frame and a matching --profile",
+                    summary.consumed_samples,
+                    rate,
+                    args.profile.as_deref().unwrap_or("default")
+                );
+            }
+        }
+        #[cfg(not(feature = "file-backend"))]
+        {
+            let _ = &mut core;
+            if args.json {
+                anyhow::bail!("Raw stdin input not available (compile with file-backend feature)");
+            }
+            if verbosity != Verbosity::Quiet {
+                eprintln!("Raw stdin input not available (compile with file-backend feature)");
+            }
+        }
+    } else if let Some(path) = args.path() {
         #[cfg(feature = "file-backend")]
         {
             use coppa_audio::{file_backend::WavSource, AudioSource};
@@ -1528,8 +1688,10 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
             let summary = stream_decode(
                 &mut core,
                 &mut source,
-                Some(limit),
-                None,
+                StopWhen {
+                    total_samples: Some(limit),
+                    ..StopWhen::default()
+                },
                 output_mode,
                 args.profile.as_deref().unwrap_or("default"),
                 verbosity,
@@ -1601,8 +1763,10 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
             let summary = stream_decode(
                 &mut core,
                 &mut source,
-                None,
-                deadline,
+                StopWhen {
+                    deadline,
+                    ..StopWhen::default()
+                },
                 output_mode,
                 args.profile.as_deref().unwrap_or("default"),
                 verbosity,
@@ -1709,15 +1873,35 @@ impl DecodeSummary {
     }
 }
 
+/// When `stream_decode` stops reading.
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(
+    not(any(feature = "file-backend", feature = "cpal-backend")),
+    allow(dead_code)
+)]
+struct StopWhen {
+    /// After this many samples (a file, or `rx - -d N`).
+    total_samples: Option<usize>,
+    /// At this instant (live `--duration`).
+    deadline: Option<std::time::Instant>,
+    /// At the first empty read: the source returns 0 only at end of stream
+    /// (`rx -`), rather than when no audio has arrived yet (live capture).
+    eof_on_empty_read: bool,
+}
+
 fn stream_decode(
     core: &mut CoppaCore,
     source: &mut dyn coppa_audio::AudioSource,
-    total_samples: Option<usize>,
-    deadline: Option<std::time::Instant>,
+    stop: StopWhen,
     output_mode: RxOutputMode,
     profile: &str,
     verbosity: Verbosity,
 ) -> Result<DecodeSummary> {
+    let StopWhen {
+        total_samples,
+        deadline,
+        eof_on_empty_read,
+    } = stop;
     let mut buf = vec![0.0f32; 4096];
     let mut summary = DecodeSummary {
         report_live_errors: total_samples.is_none(),
@@ -1735,6 +1919,9 @@ fn stream_decode(
             }
         }
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        if n == 0 && eof_on_empty_read {
             break;
         }
         if n == 0 && total_samples.is_none() {
@@ -2347,7 +2534,10 @@ mod tests {
         let path_str = path.to_str().unwrap();
         cmd_tx(
             "test message",
-            Some(path_str),
+            Some(OutputTarget {
+                path: path_str,
+                format: SampleFormat::F32le,
+            }),
             None,
             None,
             &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
@@ -2369,7 +2559,10 @@ mod tests {
         cmd_tune(
             0.5,
             None,
-            Some(path_str),
+            Some(OutputTarget {
+                path: path_str,
+                format: SampleFormat::F32le,
+            }),
             None,
             &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
             Verbosity::Normal,
@@ -2390,7 +2583,10 @@ mod tests {
         cmd_tune(
             0.5,
             Some(1500.0),
-            Some(path_str),
+            Some(OutputTarget {
+                path: path_str,
+                format: SampleFormat::F32le,
+            }),
             None,
             &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
             Verbosity::Quiet,
@@ -2410,7 +2606,10 @@ mod tests {
         let path_str = path.to_str().unwrap();
         cmd_tx(
             "CQ CQ",
-            Some(path_str),
+            Some(OutputTarget {
+                path: path_str,
+                format: SampleFormat::F32le,
+            }),
             None,
             None,
             &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
@@ -3399,6 +3598,23 @@ mod tests {
     }
 
     #[test]
+    fn raw_audio_refuses_a_terminal() {
+        assert!(refuse_raw_stdout(false).is_ok());
+        let err = refuse_raw_stdout(true).unwrap_err().to_string();
+        assert!(
+            err.starts_with("refusing to write raw audio to a terminal"),
+            "{err}"
+        );
+        assert!(refuse_raw_stdin(false).is_ok());
+        let err = refuse_raw_stdin(true).unwrap_err().to_string();
+        assert!(
+            err.starts_with("refusing to read raw audio from a terminal"),
+            "{err}"
+        );
+        assert!(err.contains("| coppa rx -"), "{err}");
+    }
+
+    #[test]
     fn is_broken_pipe_finds_the_io_error_in_the_chain() {
         let pipe = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone");
         assert!(is_broken_pipe(&anyhow::Error::new(pipe)));
@@ -3560,7 +3776,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!("cop40_{}.wav", std::process::id()));
         cmd_tx(
             "hi",
-            Some(path.to_str().unwrap()),
+            Some(OutputTarget {
+                path: path.to_str().unwrap(),
+                format: SampleFormat::S16le,
+            }),
             Some("VHF_FAST"),
             None,
             &RigSettings::test_values(None, "none", "127.0.0.1:1", 0, 0, None, None),
@@ -3586,7 +3805,10 @@ mod tests {
             let path_str = path.to_str().unwrap();
             cmd_tx(
                 "streaming rx roundtrip",
-                Some(path_str),
+                Some(OutputTarget {
+                    path: path_str,
+                    format: SampleFormat::F32le,
+                }),
                 None,
                 None,
                 &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
@@ -4088,8 +4310,7 @@ mod tests {
                 let error = stream_decode(
                     &mut core,
                     &mut source,
-                    None,
-                    None,
+                    StopWhen::default(),
                     RxOutputMode::Text { hex: false },
                     profile,
                     Verbosity::Quiet,
@@ -4131,8 +4352,10 @@ mod tests {
         let summary = stream_decode(
             &mut CoppaCore::new(),
             &mut source,
-            Some(length),
-            None,
+            StopWhen {
+                total_samples: Some(length),
+                ..StopWhen::default()
+            },
             RxOutputMode::Text { hex: false },
             "default",
             Verbosity::Quiet,
@@ -4155,8 +4378,10 @@ mod tests {
         let summary = stream_decode(
             &mut CoppaCore::new(),
             &mut Stalled,
-            None,
-            deadline,
+            StopWhen {
+                deadline,
+                ..StopWhen::default()
+            },
             RxOutputMode::Text { hex: false },
             "default",
             Verbosity::Quiet,
@@ -4179,8 +4404,10 @@ mod tests {
         stream_decode(
             &mut CoppaCore::new(),
             &mut Endless,
-            None,
-            deadline,
+            StopWhen {
+                deadline,
+                ..StopWhen::default()
+            },
             RxOutputMode::Text { hex: false },
             "default",
             Verbosity::Quiet,
@@ -4200,8 +4427,10 @@ mod tests {
         let summary = stream_decode(
             &mut CoppaCore::new(),
             &mut source,
-            Some(10_000),
-            None,
+            StopWhen {
+                total_samples: Some(10_000),
+                ..StopWhen::default()
+            },
             RxOutputMode::Raw,
             "default",
             Verbosity::Quiet,

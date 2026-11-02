@@ -43,7 +43,9 @@ pub type LiveDevice = cpal::Device;
 pub use cpal_backend::{find_input_device_by_name, find_output_device_by_name};
 
 #[cfg(feature = "file-backend")]
-pub use file_backend::{RawF32Sink, RawF32Source, WavSink, WavSource};
+pub use file_backend::{
+    PcmFormat, RawF32Sink, RawF32Source, RawPcmReader, RawPcmWriter, WavFormat, WavSink, WavSource,
+};
 
 /// Describes an available audio device.
 #[derive(Debug, Clone)]
