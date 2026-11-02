@@ -17,7 +17,7 @@ Open-source ham radio digital communications system written in Rust.
 | CLI | Implemented | Loopback and WAV transmit/receive; live audio requires `cpal-backend` |
 | Daemon event loop | Implemented | Processes audio and host events; live audio requires `cpal-backend` |
 | ARDOP TNC host interface | Implemented, opt-in | Command/data ports default to 8515/8516; `ardop` feature, disabled by default; host-protocol interface only — both ends of a session run coppa — see [docs/ARDOP.md](docs/ARDOP.md) |
-| VARA-style TCP interface | Implemented, opt-in | Control/data ports default to 8300/8301; server disabled by default; not RF-compatible with VARA; verified with Pat (Winlink) — see [docs/PAT.md](docs/PAT.md) |
+| VARA-style TCP interface | Implemented, opt-in | Control/data ports default to 8300/8301; server disabled by default; not RF-compatible with VARA; verified with Pat (Winlink) — see [docs/PAT.md](docs/PAT.md); protocol guide in [docs/HOST-API.md](docs/HOST-API.md) |
 | C FFI | Implemented | Shared/static library with one-shot encode/decode and streaming decode |
 | Operating profiles | Implemented | 48 kHz OFDM profiles with runtime speed-level selection within the configured band |
 | Link adaptation | Implemented, limited calibration | Measurement-driven speed selection and ACK-driven RateLoop with ARQ enabled; no model inference; performance targets remain unmet, see [BENCHMARKS.md](BENCHMARKS.md) |
@@ -138,6 +138,8 @@ See [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for known limitations: measured g
 See [wiki/INDEX.md](wiki/INDEX.md) for short, question-titled pages on gotchas and the reasons behind design decisions. The wiki points at `docs/` and the code, which win any conflict.
 
 See [docs/SPEC.md](docs/SPEC.md) for the normative waveform/FEC/protocol conformance specification — the reference for building an independent, interoperable implementation.
+
+See [docs/HOST-API.md](docs/HOST-API.md) to connect a host application (Pat, a dashboard or your own program) to coppad: the VARA-style command and data ports, the WebSocket API and KISS, with an `nc` walkthrough. For Pat and Winlink specifically, see [docs/PAT.md](docs/PAT.md).
 
 See [docs/OPERATING.md](docs/OPERATING.md) for field-operation guidance, including TX level calibration (`coppa tune`). To run coppad as a service (systemd or launchd), see [contrib/README.md](contrib/README.md); for a full Raspberry Pi 4 install, see [docs/tutorials/raspberry-pi-install.md](docs/tutorials/raspberry-pi-install.md).
 
