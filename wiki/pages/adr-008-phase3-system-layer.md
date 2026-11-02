@@ -36,7 +36,8 @@ missed and documented — know them before "fixing" the wrong layer.
 - **Benchmark program misses its targets**: `milstd` clears 0/27 operating
   points (the borrowed MIL-STD reference-SNR ladder doesn't transfer onto
   Coppa's real thresholds — a calibration mismatch, not a regression);
-  `session` completes drop-free on only 3/5 Good, 0/5 Moderate/Poor (level 2's
+  `session` completes drop-free on only 2/5 Good (3/5 before the 2026-07-26
+  re-run), 0/5 Moderate/Poor (level 2's
   real nonzero Good-preset FER can exhaust the bounded ARQ retransmit budget
   in a low-SNR ramp trough — not an ARQ state-machine bug).
   COP-118 prototyped two fade-diversity fixes on an adapted copy of the

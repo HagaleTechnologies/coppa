@@ -22,18 +22,21 @@ The price of the outer code:
 - A segment takes 16.4 s on air, twice the control's 8.2 s, so 16.4 s is also the minimum
   delivery latency. On Moderate the median block latency was 16.4 s and the worst was 267.1 s.
 
+None of the five completed Moderate outer-code sessions had a block waiting for a retry at the
+600 s cutoff, and on Poor two had one block on its first send. So the 5/5 is not a block caught
+mid-retry by the cutoff.
+
 The ten-minute target is met here only in simulation: five deterministic trials per preset, ideal
 ACK reception, and the adapted harness described below. A 5/5 result is a feasibility signal for
 building this mechanism. It is not a reliability guarantee, and no RF trial was run.
 
 Frequency repetition is not recommended. On Moderate it kept 2/5 sessions up and cost 34.3%
-throughput against the matched control. Two measured causes explain this. First, it protects only
-the payload: the preamble and header are sent as before, and sync or header failures stayed at
-32-34 per Moderate trial, more than its payload failures. Second, the half-band replica sits about
-1200 Hz from its primary. For Moderate's two-tap 1 ms channel the replica and primary have a
-frequency correlation of |cos(pi x 1200 Hz x 1 ms)| = 0.81, so they often fade together. The
-result settles this variant only, not every frequency-diversity design. The same caveat applies to
-the outer code: it is one long-codeword design, not an enlarged NR LDPC graph.
+throughput against the matched control. It protects only the payload. The preamble and header are
+sent as before, and on Moderate sync or header failures took 22-30% of its decoded packets, more
+than its 14-18% payload failures. On Good its payload failures all but vanished, yet one session
+still dropped on sync and header losses. The result settles this variant only, not every
+frequency-diversity design. The same caveat applies to the outer code: it is one long-codeword
+design, not an enlarged NR LDPC graph.
 
 ## What was compared
 
@@ -45,11 +48,17 @@ Two experiments, kept apart:
    harness:
    - `matched-control`: a logical block of six level-2 packets. The block is complete only when all
      six decode.
-   - `freq-rep2`: the same six packets. Each NR-coded BPSK symbol is sent twice in the same OFDM
-     symbol, on data slot `s` and slot `s + 22` of the 44 data slots. That is about 1200 Hz apart,
-     half the 48-carrier active band. The receiver combines the two copies by maximum-ratio
-     combining with its own per-carrier noise estimates, before NR decoding. For BPSK this equals
-     adding the two LLRs.
+   - `freq-rep2`: the same six packets. Coded symbol `k` of 1944 goes into OFDM symbol `k / 22`,
+     on data slot `k % 22` and again on data slot `k % 22 + 22` of that symbol's 44 data slots.
+     `insert_pilots` places the 4 pilots, so the pair is 22 to 26 carriers apart, 1100-1300 Hz,
+     nominally 1200 Hz: half the 48-carrier, 50 Hz-spaced active band. The payload takes 89 OFDM
+     symbols instead of 45. In the last one only slots 0-7 and 22-29 carry data, and the rest are
+     padded with +1 as `modulate_mapped` pads. The header says `codewords: 2`, so the unchanged
+     demodulator returns both copies. The receiver combines each pair by maximum-ratio combining
+     with its own per-carrier noise estimates, before NR decoding. For BPSK this equals adding the
+     two LLRs. Power: `modulate_mapped` clips every arm's frame to the same PAPR target and scales it to
+     the same peak, so each carrier carries about the same power as in the control. The repeated
+     symbols cost airtime, not extra power.
    - `outer-rs12-6`: the six chunks plus six RS parity chunks, sent as twelve ordinary NR-protected
      packets. The block is complete from any six CRC-valid packets.
 
@@ -75,8 +84,10 @@ Changed for the comparison, in all three arms alike:
   `seed ^ 0x3333_3333_3333_3333`. The complex gains are linearly interpolated onto the absolute
   48 kHz time of every transmitted sample. The preset's tap delays (0.5, 1 or 2 ms) are applied to
   the analytic signal. The trace advances through data, retries, ACK time and idle gaps, and is
-  never renormalized per frame. The original bench instead draws an independent realization per
-  frame.
+  never renormalized per frame. At each frame's start the delayed tap contributes nothing for its
+  first 24, 48 or 96 samples, as in `watterson()`, because nothing was sent just before. A trial
+  that would read past the end of its 900 s trace stops with an error, and none did. The original
+  bench instead draws an independent realization per frame.
 - **Noise.** The SNR is the ramp value at each packet's midpoint. The noise uses
   `awgn_ref_seeded`, the 3 kHz convention, with one fixed power reference (the mean power of one
   clean control packet, 2.2229e-2). The noise seed is `seed ^ 0x5555_5555_5555_5555 ^
@@ -99,7 +110,9 @@ Changed for the comparison, in all three arms alike:
 
 Failure counts: "sync/header" means `demodulate_frame` returned nothing. "Payload" means the NR
 decoder did not converge or the CRC failed. No decoded header disagreed with the arm, and no
-rebuilt block differed from the sent block.
+rebuilt block differed from the sent block. A retry still sends packets the receiver already holds,
+and their airtime is charged, but the receiver does not decode them again. Loss rates below
+therefore divide by packets actually decoded (`decodes`), not by packets sent.
 
 ## Prototype checks
 
@@ -111,6 +124,7 @@ CHECK replica alignment: PASS (1944 coded symbols, 3916 demodulated symbols)
 CHECK combining with one replica erased: PASS
 CHECK RS(12,6): PASS (924 six-packet subsets exact, five-packet sets refused)
 CHECK identity channel: PASS (max abs error 4.47e-7)
+CHECK bare-frame symbols: 1936 bare vs 1980 with a 1200-sample tail (1944 needed)
 PROFILE fft 960 cp 300 spacing 50.000 Hz, active carriers 48, data/OFDM symbol 44, replica separation ~1200 Hz (half the active band)
 ARM matched-control: 6 packets/block, packet 1.365 s, block 8.190 s, block bytes 678, initial RTO 60.0 s
 ARM freq-rep2: 6 packets/block, packet 2.520 s, block 15.120 s, block bytes 678, initial RTO 60.0 s
@@ -122,6 +136,8 @@ TRACE moderate: mean tap power 0.982 (expect 1.000); autocorrelation | 0.5s 0.73
 PRESET poor: delay 2.0 ms, sigma 0.50 Hz, |rho_f(sep)| = 0.31, rho_t(1 s) 0.007, rho_t(5 s) 0.000
 TRACE poor: mean tap power 0.992 (expect 1.000); autocorrelation | 0.5s 0.284 vs 0.291 | 1s -0.002 vs 0.007 | 2s -0.001 vs 0.000 | 5s -0.002 vs 0.000
 PREF 2.222894e-2
+POWER freq-rep2: mean packet power 1.725312e-2 (-1.10 dB vs control)
+POWER outer-rs12-6: mean packet power 2.222894e-2 (+0.00 dB vs control)
 ```
 
 The `TRACE` lines average 20 traces over 600 s each. Ensemble tap power is within 4.2% of 1, and
@@ -190,80 +206,91 @@ HARQ). Compare arms only within one table.
 ### Per-trial records (adapted comparison)
 
 `air` is data airtime, ACK airtime and turnaround time in seconds. `tx` counts block transmissions
-and physical packets. `fail` counts lost packets as sync/header and payload. Every session
-overshoots 600 s by at most one ARQ step, as in `session.rs`, and the overshoot is in `elapsed`.
+and physical packets, and `dec` counts packets decoded. `fail` counts lost packets as sync/header
+and payload. `pending` is the number of blocks still unacknowledged when the session ended and the
+highest send count among them; a block fails on its sixth send, so a dropped session shows 6.
+`RTO` is the ARQ's retransmission timeout at the end. Every session overshoots 600 s by at most one
+ARQ step, as in `session.rs`, and the overshoot is in `elapsed`.
 
-| Mechanism | Preset | Trial | Seed | Status | Elapsed s | Bytes | Bytes/min | Blocks | tx (blocks/packets) | air (data/ACK/turn) | Median / max latency s | fail (sync-hdr/payload) |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| matched-control | clean | 0 | `0x5e551000` | completed | 601.2 | 41358 | 4127.9 | 61 | 61/366 | 499.6/83.3/18.3 | 8.2 / 8.2 | 0/0 |
-| matched-control | good | 0 | `0x5e551000` | completed | 607.9 | 23730 | 2342.0 | 35 | 64/384 | 524.2/47.8/10.5 | 26.2 / 279.7 | 59/10 |
-| matched-control | good | 1 | `0x5e551001` | completed | 617.8 | 25086 | 2436.2 | 37 | 67/402 | 548.7/50.5/11.1 | 26.2 / 238.6 | 80/13 |
-| matched-control | good | 2 | `0x5e551002` | completed | 607.3 | 23730 | 2344.4 | 35 | 66/396 | 540.5/47.8/10.5 | 26.2 / 265.9 | 55/17 |
-| matched-control | good | 3 | `0x5e551003` | completed | 608.1 | 23052 | 2274.3 | 34 | 66/396 | 540.5/46.4/10.2 | 36.1 / 194.6 | 56/11 |
-| matched-control | good | 4 | `0x5e551004` | completed | 608.5 | 24408 | 2406.8 | 36 | 66/396 | 540.5/49.1/10.8 | 24.6 / 249.0 | 66/17 |
-| matched-control | moderate | 0 | `0x5e541000` | DROPPED | 338.6 | 2034 | 360.4 | 3 | 35/210 | 286.7/8.2/1.8 | 129.3 / 131.0 | 14/29 |
-| matched-control | moderate | 1 | `0x5e541001` | DROPPED | 596.3 | 8136 | 818.7 | 12 | 63/378 | 516.0/23.2/5.1 | 192.6 / 287.3 | 67/64 |
-| matched-control | moderate | 2 | `0x5e541002` | completed | 613.0 | 11526 | 1128.1 | 17 | 67/402 | 548.7/23.2/5.1 | 256.2 / 297.1 | 61/67 |
-| matched-control | moderate | 3 | `0x5e541003` | DROPPED | 454.5 | 4746 | 626.5 | 7 | 52/312 | 425.9/13.7/3.0 | 139.2 / 281.1 | 32/42 |
-| matched-control | moderate | 4 | `0x5e541004` | DROPPED | 397.9 | 4068 | 613.4 | 6 | 46/276 | 376.7/9.6/2.1 | 85.2 / 154.6 | 38/40 |
-| matched-control | poor | 0 | `0x5e571000` | DROPPED | 348.5 | 678 | 116.7 | 1 | 41/246 | 335.8/1.4/0.3 | 142.7 / 142.7 | 32/51 |
-| matched-control | poor | 1 | `0x5e571001` | DROPPED | 312.0 | 0 | 0.0 | 0 | 28/168 | 229.3/5.5/1.2 | n/a | 15/31 |
-| matched-control | poor | 2 | `0x5e571002` | DROPPED | 355.2 | 2712 | 458.1 | 4 | 38/228 | 311.2/8.2/1.8 | 139.9 / 148.1 | 28/44 |
-| matched-control | poor | 3 | `0x5e571003` | DROPPED | 297.4 | 0 | 0.0 | 0 | 26/156 | 212.9/8.2/1.8 | n/a | 11/30 |
-| matched-control | poor | 4 | `0x5e571004` | DROPPED | 311.7 | 0 | 0.0 | 0 | 29/174 | 237.5/5.5/1.2 | n/a | 18/23 |
-| freq-rep2 | clean | 0 | `0x5e551000` | completed | 604.3 | 24408 | 2423.6 | 36 | 36/216 | 544.3/49.1/10.8 | 15.1 / 15.1 | 0/0 |
-| freq-rep2 | good | 0 | `0x5e551000` | completed | 612.9 | 15594 | 1526.7 | 23 | 38/228 | 574.6/31.4/6.9 | 31.9 / 283.8 | 36/0 |
-| freq-rep2 | good | 1 | `0x5e551001` | completed | 614.5 | 16272 | 1588.8 | 24 | 38/228 | 574.6/32.8/7.2 | 15.1 / 233.5 | 46/0 |
-| freq-rep2 | good | 2 | `0x5e551002` | completed | 609.5 | 14238 | 1401.6 | 21 | 38/228 | 574.6/28.7/6.3 | 62.1 / 250.2 | 37/1 |
-| freq-rep2 | good | 3 | `0x5e551003` | completed | 609.5 | 14238 | 1401.6 | 21 | 38/228 | 574.6/28.7/6.3 | 78.9 / 231.8 | 33/0 |
-| freq-rep2 | good | 4 | `0x5e551004` | DROPPED | 542.9 | 6780 | 749.3 | 10 | 34/204 | 514.1/23.2/5.1 | 15.1 / 294.4 | 29/0 |
-| freq-rep2 | moderate | 0 | `0x5e541000` | completed | 643.2 | 7458 | 695.7 | 11 | 41/246 | 619.9/19.1/4.2 | 97.4 / 433.4 | 33/24 |
-| freq-rep2 | moderate | 1 | `0x5e541001` | completed | 623.1 | 7458 | 718.1 | 11 | 40/240 | 604.8/15.0/3.3 | 245.2 / 339.3 | 33/26 |
-| freq-rep2 | moderate | 2 | `0x5e541002` | DROPPED | 495.3 | 2034 | 246.4 | 3 | 32/192 | 483.8/8.2/1.8 | 77.3 / 77.3 | 34/21 |
-| freq-rep2 | moderate | 3 | `0x5e541003` | DROPPED | 493.8 | 2712 | 329.5 | 4 | 32/192 | 483.8/8.2/1.8 | 94.0 / 110.8 | 32/18 |
-| freq-rep2 | moderate | 4 | `0x5e541004` | DROPPED | 479.2 | 2712 | 339.6 | 4 | 31/186 | 468.7/8.2/1.8 | 142.7 / 157.9 | 33/16 |
-| freq-rep2 | poor | 0 | `0x5e571000` | completed | 622.5 | 4746 | 457.5 | 7 | 40/240 | 604.8/13.7/3.0 | 385.7 / 415.9 | 33/27 |
-| freq-rep2 | poor | 1 | `0x5e571001` | completed | 613.0 | 7458 | 730.0 | 11 | 39/234 | 589.7/19.1/4.2 | 233.5 / 309.1 | 36/21 |
-| freq-rep2 | poor | 2 | `0x5e571002` | DROPPED | 359.1 | 0 | 0.0 | 0 | 23/138 | 347.8/6.8/1.5 | n/a | 22/19 |
-| freq-rep2 | poor | 3 | `0x5e571003` | completed | 613.0 | 9492 | 929.1 | 14 | 39/234 | 589.7/19.1/4.2 | 233.5 / 325.8 | 31/23 |
-| freq-rep2 | poor | 4 | `0x5e571004` | DROPPED | 479.0 | 678 | 84.9 | 1 | 31/186 | 468.7/6.8/1.5 | 75.6 / 75.6 | 35/21 |
-| outer-rs12-6 | clean | 0 | `0x5e551000` | completed | 613.5 | 23052 | 2254.4 | 34 | 34/408 | 556.9/46.4/10.2 | 16.4 / 16.4 | 0/0 |
-| outer-rs12-6 | good | 0 | `0x5e551000` | completed | 603.5 | 18984 | 1887.3 | 28 | 34/408 | 556.9/38.2/8.4 | 16.4 / 134.4 | 81/12 |
-| outer-rs12-6 | good | 1 | `0x5e551001` | completed | 601.9 | 18306 | 1824.9 | 27 | 34/408 | 556.9/36.9/8.1 | 16.4 / 150.8 | 80/19 |
-| outer-rs12-6 | good | 2 | `0x5e551002` | completed | 603.5 | 18984 | 1887.3 | 28 | 34/408 | 556.9/38.2/8.4 | 16.4 / 118.0 | 81/20 |
-| outer-rs12-6 | good | 3 | `0x5e551003` | completed | 605.2 | 19662 | 1949.3 | 29 | 34/408 | 556.9/39.6/8.7 | 16.4 / 118.0 | 75/16 |
-| outer-rs12-6 | good | 4 | `0x5e551004` | completed | 608.5 | 21018 | 2072.3 | 31 | 34/408 | 556.9/42.3/9.3 | 16.4 / 50.8 | 72/26 |
-| outer-rs12-6 | moderate | 0 | `0x5e541000` | completed | 613.3 | 16272 | 1592.0 | 24 | 35/420 | 573.3/32.8/7.2 | 34.4 / 204.9 | 87/112 |
-| outer-rs12-6 | moderate | 1 | `0x5e541001` | completed | 611.6 | 15594 | 1529.8 | 23 | 35/420 | 573.3/31.4/6.9 | 34.4 / 199.9 | 93/108 |
-| outer-rs12-6 | moderate | 2 | `0x5e541002` | completed | 613.3 | 16272 | 1592.0 | 24 | 35/420 | 573.3/32.8/7.2 | 16.4 / 252.4 | 80/112 |
-| outer-rs12-6 | moderate | 3 | `0x5e541003` | completed | 616.6 | 17628 | 1715.4 | 26 | 35/420 | 573.3/35.5/7.8 | 16.4 / 204.9 | 80/113 |
-| outer-rs12-6 | moderate | 4 | `0x5e541004` | completed | 609.9 | 14916 | 1467.3 | 22 | 35/420 | 573.3/30.0/6.6 | 16.4 / 267.1 | 86/108 |
-| outer-rs12-6 | poor | 0 | `0x5e571000` | completed | 601.6 | 11526 | 1149.5 | 17 | 35/420 | 573.3/23.2/5.1 | 83.6 / 268.7 | 94/128 |
-| outer-rs12-6 | poor | 1 | `0x5e571001` | completed | 601.6 | 11526 | 1149.5 | 17 | 35/420 | 573.3/23.2/5.1 | 101.6 / 285.1 | 108/130 |
-| outer-rs12-6 | poor | 2 | `0x5e571002` | completed | 616.3 | 10848 | 1056.1 | 16 | 36/432 | 589.7/21.8/4.8 | 139.4 / 372.0 | 100/148 |
-| outer-rs12-6 | poor | 3 | `0x5e571003` | completed | 636.0 | 12204 | 1151.3 | 18 | 37/444 | 606.1/24.6/5.4 | 52.5 / 322.9 | 107/149 |
-| outer-rs12-6 | poor | 4 | `0x5e571004` | completed | 632.7 | 10848 | 1028.7 | 16 | 37/444 | 606.1/21.8/4.8 | 159.1 / 388.4 | 110/145 |
+| Mechanism | Preset | Trial | Seed | Status | Elapsed s | Bytes | Bytes/min | Blocks | tx (blocks/packets) | dec | air (data/ACK/turn) | Median / max latency s | fail (sync-hdr/payload) | pending (blocks/max sends) | RTO s |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| matched-control | clean | 0 | `0x5e551000` | completed | 601.2 | 41358 | 4127.9 | 61 | 61/366 | 366 | 499.6/83.3/18.3 | 8.2 / 8.2 | 0/0 | 0/0 | 12.6 |
+| matched-control | good | 0 | `0x5e551000` | completed | 607.9 | 23730 | 2342.0 | 35 | 64/384 | 279 | 524.2/47.8/10.5 | 26.2 / 279.7 | 59/10 | 0/0 | 25.2 |
+| matched-control | good | 1 | `0x5e551001` | completed | 617.8 | 25086 | 2436.2 | 37 | 67/402 | 315 | 548.7/50.5/11.1 | 26.2 / 238.6 | 80/13 | 0/0 | 25.2 |
+| matched-control | good | 2 | `0x5e551002` | completed | 607.3 | 23730 | 2344.4 | 35 | 66/396 | 282 | 540.5/47.8/10.5 | 26.2 / 265.9 | 55/17 | 0/0 | 12.6 |
+| matched-control | good | 3 | `0x5e551003` | completed | 608.1 | 23052 | 2274.3 | 34 | 66/396 | 271 | 540.5/46.4/10.2 | 36.1 / 194.6 | 56/11 | 0/0 | 12.6 |
+| matched-control | good | 4 | `0x5e551004` | completed | 608.5 | 24408 | 2406.8 | 36 | 66/396 | 299 | 540.5/49.1/10.8 | 24.6 / 249.0 | 66/17 | 0/0 | 25.2 |
+| matched-control | moderate | 0 | `0x5e541000` | DROPPED | 338.6 | 2034 | 360.4 | 3 | 35/210 | 104 | 286.7/8.2/1.8 | 129.3 / 131.0 | 14/29 | 5/6 | 60.0 |
+| matched-control | moderate | 1 | `0x5e541001` | DROPPED | 596.3 | 8136 | 818.7 | 12 | 63/378 | 245 | 516.0/23.2/5.1 | 192.6 / 287.3 | 67/64 | 3/6 | 60.0 |
+| matched-control | moderate | 2 | `0x5e541002` | completed | 613.0 | 11526 | 1128.1 | 17 | 67/402 | 243 | 548.7/23.2/5.1 | 256.2 / 297.1 | 61/67 | 3/3 | 60.0 |
+| matched-control | moderate | 3 | `0x5e541003` | DROPPED | 454.5 | 4746 | 626.5 | 7 | 52/312 | 154 | 425.9/13.7/3.0 | 139.2 / 281.1 | 32/42 | 5/6 | 60.0 |
+| matched-control | moderate | 4 | `0x5e541004` | DROPPED | 397.9 | 4068 | 613.4 | 6 | 46/276 | 150 | 376.7/9.6/2.1 | 85.2 / 154.6 | 38/40 | 7/6 | 60.0 |
+| matched-control | poor | 0 | `0x5e571000` | DROPPED | 348.5 | 678 | 116.7 | 1 | 41/246 | 122 | 335.8/1.4/0.3 | 142.7 / 142.7 | 32/51 | 8/6 | 60.0 |
+| matched-control | poor | 1 | `0x5e571001` | DROPPED | 312.0 | 0 | 0.0 | 0 | 28/168 | 89 | 229.3/5.5/1.2 | n/a | 15/31 | 4/6 | 60.0 |
+| matched-control | poor | 2 | `0x5e571002` | DROPPED | 355.2 | 2712 | 458.1 | 4 | 38/228 | 133 | 311.2/8.2/1.8 | 139.9 / 148.1 | 28/44 | 6/6 | 60.0 |
+| matched-control | poor | 3 | `0x5e571003` | DROPPED | 297.4 | 0 | 0.0 | 0 | 26/156 | 87 | 212.9/8.2/1.8 | n/a | 11/30 | 2/6 | 60.0 |
+| matched-control | poor | 4 | `0x5e571004` | DROPPED | 311.7 | 0 | 0.0 | 0 | 29/174 | 83 | 237.5/5.5/1.2 | n/a | 18/23 | 4/6 | 60.0 |
+| freq-rep2 | clean | 0 | `0x5e551000` | completed | 604.3 | 24408 | 2423.6 | 36 | 36/216 | 216 | 544.3/49.1/10.8 | 15.1 / 15.1 | 0/0 | 0/0 | 16.8 |
+| freq-rep2 | good | 0 | `0x5e551000` | completed | 612.9 | 15594 | 1526.7 | 23 | 38/228 | 174 | 574.6/31.4/6.9 | 31.9 / 283.8 | 36/0 | 0/0 | 17.2 |
+| freq-rep2 | good | 1 | `0x5e551001` | completed | 614.5 | 16272 | 1588.8 | 24 | 38/228 | 190 | 574.6/32.8/7.2 | 15.1 / 233.5 | 46/0 | 0/0 | 17.2 |
+| freq-rep2 | good | 2 | `0x5e551002` | completed | 609.5 | 14238 | 1401.6 | 21 | 38/228 | 164 | 574.6/28.7/6.3 | 62.1 / 250.2 | 37/1 | 0/0 | 18.2 |
+| freq-rep2 | good | 3 | `0x5e551003` | completed | 609.5 | 14238 | 1401.6 | 21 | 38/228 | 159 | 574.6/28.7/6.3 | 78.9 / 231.8 | 33/0 | 0/0 | 18.2 |
+| freq-rep2 | good | 4 | `0x5e551004` | DROPPED | 542.9 | 6780 | 749.3 | 10 | 34/204 | 136 | 514.1/23.2/5.1 | 15.1 / 294.4 | 29/0 | 1/6 | 40.3 |
+| freq-rep2 | moderate | 0 | `0x5e541000` | completed | 643.2 | 7458 | 695.7 | 11 | 41/246 | 150 | 619.9/19.1/4.2 | 97.4 / 433.4 | 33/24 | 2/3 | 60.0 |
+| freq-rep2 | moderate | 1 | `0x5e541001` | completed | 623.1 | 7458 | 718.1 | 11 | 40/240 | 150 | 604.8/15.0/3.3 | 245.2 / 339.3 | 33/26 | 5/3 | 60.0 |
+| freq-rep2 | moderate | 2 | `0x5e541002` | DROPPED | 495.3 | 2034 | 246.4 | 3 | 32/192 | 115 | 483.8/8.2/1.8 | 77.3 / 77.3 | 34/21 | 5/6 | 60.0 |
+| freq-rep2 | moderate | 3 | `0x5e541003` | DROPPED | 493.8 | 2712 | 329.5 | 4 | 32/192 | 114 | 483.8/8.2/1.8 | 94.0 / 110.8 | 32/18 | 6/6 | 60.0 |
+| freq-rep2 | moderate | 4 | `0x5e541004` | DROPPED | 479.2 | 2712 | 339.6 | 4 | 31/186 | 112 | 468.7/8.2/1.8 | 142.7 / 157.9 | 33/16 | 6/6 | 60.0 |
+| freq-rep2 | poor | 0 | `0x5e571000` | completed | 622.5 | 4746 | 457.5 | 7 | 40/240 | 129 | 604.8/13.7/3.0 | 385.7 / 415.9 | 33/27 | 2/4 | 60.0 |
+| freq-rep2 | poor | 1 | `0x5e571001` | completed | 613.0 | 7458 | 730.0 | 11 | 39/234 | 146 | 589.7/19.1/4.2 | 233.5 / 309.1 | 36/21 | 1/3 | 60.0 |
+| freq-rep2 | poor | 2 | `0x5e571002` | DROPPED | 359.1 | 0 | 0.0 | 0 | 23/138 | 83 | 347.8/6.8/1.5 | n/a | 22/19 | 3/6 | 60.0 |
+| freq-rep2 | poor | 3 | `0x5e571003` | completed | 613.0 | 9492 | 929.1 | 14 | 39/234 | 138 | 589.7/19.1/4.2 | 233.5 / 325.8 | 31/23 | 0/0 | 60.0 |
+| freq-rep2 | poor | 4 | `0x5e571004` | DROPPED | 479.0 | 678 | 84.9 | 1 | 31/186 | 105 | 468.7/6.8/1.5 | 75.6 / 75.6 | 35/21 | 4/6 | 60.0 |
+| outer-rs12-6 | clean | 0 | `0x5e551000` | completed | 613.5 | 23052 | 2254.4 | 34 | 34/408 | 408 | 556.9/46.4/10.2 | 16.4 / 16.4 | 0/0 | 0/0 | 18.0 |
+| outer-rs12-6 | good | 0 | `0x5e551000` | completed | 603.5 | 18984 | 1887.3 | 28 | 34/408 | 386 | 556.9/38.2/8.4 | 16.4 / 134.4 | 81/12 | 0/0 | 18.1 |
+| outer-rs12-6 | good | 1 | `0x5e551001` | completed | 601.9 | 18306 | 1824.9 | 27 | 34/408 | 387 | 556.9/36.9/8.1 | 16.4 / 150.8 | 80/19 | 0/0 | 18.1 |
+| outer-rs12-6 | good | 2 | `0x5e551002` | completed | 603.5 | 18984 | 1887.3 | 28 | 34/408 | 392 | 556.9/38.2/8.4 | 16.4 / 118.0 | 81/20 | 0/0 | 18.1 |
+| outer-rs12-6 | good | 3 | `0x5e551003` | completed | 605.2 | 19662 | 1949.3 | 29 | 34/408 | 394 | 556.9/39.6/8.7 | 16.4 / 118.0 | 75/16 | 0/0 | 18.1 |
+| outer-rs12-6 | good | 4 | `0x5e551004` | completed | 608.5 | 21018 | 2072.3 | 31 | 34/408 | 396 | 556.9/42.3/9.3 | 16.4 / 50.8 | 72/26 | 0/0 | 18.1 |
+| outer-rs12-6 | moderate | 0 | `0x5e541000` | completed | 613.3 | 16272 | 1592.0 | 24 | 35/420 | 386 | 573.3/32.8/7.2 | 34.4 / 204.9 | 87/112 | 0/0 | 18.7 |
+| outer-rs12-6 | moderate | 1 | `0x5e541001` | completed | 611.6 | 15594 | 1529.8 | 23 | 35/420 | 381 | 573.3/31.4/6.9 | 34.4 / 199.9 | 93/108 | 0/0 | 18.7 |
+| outer-rs12-6 | moderate | 2 | `0x5e541002` | completed | 613.3 | 16272 | 1592.0 | 24 | 35/420 | 382 | 573.3/32.8/7.2 | 16.4 / 252.4 | 80/112 | 0/0 | 18.4 |
+| outer-rs12-6 | moderate | 3 | `0x5e541003` | completed | 616.6 | 17628 | 1715.4 | 26 | 35/420 | 395 | 573.3/35.5/7.8 | 16.4 / 204.9 | 80/113 | 0/0 | 18.2 |
+| outer-rs12-6 | moderate | 4 | `0x5e541004` | completed | 609.9 | 14916 | 1467.3 | 22 | 35/420 | 375 | 573.3/30.0/6.6 | 16.4 / 267.1 | 86/108 | 0/0 | 18.9 |
+| outer-rs12-6 | poor | 0 | `0x5e571000` | completed | 601.6 | 11526 | 1149.5 | 17 | 35/420 | 360 | 573.3/23.2/5.1 | 83.6 / 268.7 | 94/128 | 0/0 | 53.2 |
+| outer-rs12-6 | poor | 1 | `0x5e571001` | completed | 601.6 | 11526 | 1149.5 | 17 | 35/420 | 367 | 573.3/23.2/5.1 | 101.6 / 285.1 | 108/130 | 1/1 | 60.0 |
+| outer-rs12-6 | poor | 2 | `0x5e571002` | completed | 616.3 | 10848 | 1056.1 | 16 | 36/432 | 370 | 589.7/21.8/4.8 | 139.4 / 372.0 | 100/148 | 1/1 | 60.0 |
+| outer-rs12-6 | poor | 3 | `0x5e571003` | completed | 636.0 | 12204 | 1151.3 | 18 | 37/444 | 393 | 606.1/24.6/5.4 | 52.5 / 322.9 | 107/149 | 0/0 | 45.7 |
+| outer-rs12-6 | poor | 4 | `0x5e571004` | completed | 632.7 | 10848 | 1028.7 | 16 | 37/444 | 380 | 606.1/21.8/4.8 | 159.1 / 388.4 | 110/145 | 0/0 | 53.2 |
 
 ## Why the outer code survives and repetition does not
 
-Packet loss rates below are per trial, as a share of packets sent. They are not comparable
-between arms one to one: a session that survives keeps sending through the 0 dB trough, while a
-session that drops stops early.
+Loss rates are per trial, as a share of packets decoded. They are not comparable between arms one
+to one: a session that survives keeps sending through the 0 dB trough, while a session that drops
+stops early.
 
-- **The control needs all six packets.** On Moderate it lost 20-35% of its packets: 7-18% to sync
-  or header failure and 13-17% to payload failure. At a 28% loss rate, all six packets of a block
-  arrive only about 14% of the time, so blocks fail repeatedly and the retry budget runs out.
+- **The control needs all six data packets.** On Moderate it lost 41-53% of decoded packets: 13-27%
+  to sync or header failure and 26-28% to payload failure. The receiver keeps good packets across
+  attempts, but at that loss rate some blocks still miss a packet on six sends in a row, and four
+  of five sessions dropped that way.
 - **Repetition cuts payload loss but not sync or header loss.** On Moderate its payload failures
-  fell to 9-11% of packets, while sync or header failures were 13-18%. The preamble and header are
-  not repeated, so they now cause most of its losses, and a block still needs all six packets.
-  Its replica is about 1200 Hz from the primary. On Moderate's 1 ms two-tap channel that pair has
-  a frequency correlation of 0.81, so a deep fade usually hits both copies. On Poor, where the 2 ms
-  delay gives 0.31, repetition did better (3/5).
+  fell to 14-18% of decoded packets, while sync or header failures were 22-30%. The preamble and
+  header are not repeated, and a block still needs all six packets. Three things in this variant
+  work against it, and the run does not separate them:
+  - Its frames are 1.85x longer (2.52 s), so the channel estimate from the preamble ages more
+    across the payload at Moderate's Doppler.
+  - Its mean packet power is 1.10 dB below the control's, because the same PAPR clip and peak
+    scaling act on a signal with a higher peak-to-average ratio. The noise reference is the
+    control's power, so it ran at about 1.1 dB lower SNR.
+  - Its replica pairs are 1100-1300 Hz apart. On Moderate's 1 ms two-tap channel the model gives a
+    complex-gain correlation of 0.59 to 0.95 across that range (0.81 at 1200 Hz, about 0.65 in
+    power), so a deep fade often hits both copies. This is computed from the channel model, not
+    measured. On Poor, where the 2 ms delay gives 0.31 at 1200 Hz, repetition kept 3/5 up.
 - **The outer code absorbs lost packets of either kind.** A packet lost to sync, header or payload
-  failure is an erasure, and any six of twelve rebuild the block. On Moderate it lost 46-48% of its
-  packets, having run through the whole trough, and still rebuilt 22-26 blocks per trial from 35
-  block transmissions. Its parity is spread over 16.4 s, which covers many independent fades at
-  Moderate's 0.25 Hz Doppler sigma.
+  failure is an erasure, and any six of twelve rebuild the block. On Moderate it lost 49-53% of
+  decoded packets, having run through the whole trough, and still rebuilt 22-26 blocks per trial
+  from 35 block transmissions, with no block pending at the cutoff. Its parity is spread over
+  16.4 s, which covers many independent fades at Moderate's 0.25 Hz Doppler sigma.
 
 ## Selection rule
 
@@ -298,11 +325,26 @@ twelve-packet block.
   A production design may choose otherwise, for example by ACKing packets inside a block.
 - **The bench's bare-frame receive loses its last OFDM symbol.** Handing a frame cut at its last
   transmitted sample to the RX bandpass and `demodulate_frame` returned 1936 of 1944 level-2
-  symbols. The same frame with a 1200-sample tail returned 1980. The 300-sample filter delay pushes
+  symbols. The same frame with a 1200-sample tail returned 1980 (the `CHECK bare-frame symbols`
+  line). The 300-sample filter delay pushes
   the final OFDM symbol past the end of the buffer. The original `session.rs` hands
   `CoppaTransceiver::receive` exactly such bare frames, so its level-2 frames decode with 8 coded
   bits erased. This prototype adds the tail in every arm. The effect on other levels and benches
   was not measured. `docs/LIMITATIONS.md` records it.
+- **The 600 s cutoff censors late failures.** A block fails on its sixth send, five RTOs after
+  its first. Once the RTO has backed off to its 60 s cap, a block first sent after about 300 s
+  cannot drop before 600 s, in any arm and in the original bench. The `pending` column shows how
+  close each completed session was. The outer code's completed sessions ended with no block past
+  its first send. The control's one completed Moderate session ended with three blocks pending,
+  the worst on its third send, and repetition's two ended with two and five, also at most three.
+- **Packets are received in isolation.** Each packet passes through the channel on its own buffer
+  with a silent tail. The delayed tap's echo of the previous packet's last samples is dropped, and
+  the tail holds noise where the next packet's preamble would really be. Packets inside a block
+  are sent back to back, so this flatters sync and header detection a little, equally per packet
+  in every arm.
+- **Copied receive helpers.** The decode chain, the median noise fallback, the analytic signal and
+  the SNR ramp are copied from `CoppaTransceiver`, `coppa_channel::watterson` and `session.rs`, not
+  called. A re-run against a changed receiver has to update the copies by hand.
 - **One variant per mechanism.** The frequency result is for half-band pairing on one OFDM
   symbol, with the header unprotected. The long-codeword result is for one RS(12,6) outer code
   over 1.365 s packets. Neither result covers all designs of its kind.
@@ -319,8 +361,8 @@ twelve-packet block.
    then run `cargo run --release --offline` inside `cop118-proto/`. The crate declares an empty
    `[workspace]`, so it is not a member of the coppa workspace. It runs all 48 sessions on
    parallel threads: three arms, three presets, five trials, and one clean session per arm. That
-   took 4 min 54 s wall time here. It prints the `CHECK`, `PROFILE`, `ARM`, `PRESET`, `TRACE` and
-   `PREF` lines above, then one tab-separated `TRIAL` line per session and one `SUMMARY` line per
+   took 5 min 6 s wall time here. It prints the `CHECK`, `PROFILE`, `ARM`, `PRESET`, `TRACE`,
+   `PREF` and `POWER` lines above, then one tab-separated `TRIAL` line per session and one `SUMMARY` line per
    preset and arm. The tables in this report are those lines, unedited apart from layout.
 
 ## Appendix: prototype source
@@ -924,6 +966,13 @@ struct Rec {
     fail_header: usize,
     fail_payload: usize,
     verify_fail: usize,
+    /// Packets actually handed to the receiver (held packets are skipped).
+    decodes: usize,
+    /// Blocks still unacknowledged when the session ended, and the highest
+    /// transmit count among them (5 retransmits = 6 sends is the budget).
+    pending_end: usize,
+    pending_max_tx: u8,
+    rto_end_s: f64,
 }
 
 fn block_data(seed: u64, id: u16, chunk: usize) -> Vec<u8> {
@@ -986,6 +1035,7 @@ fn send_block(
         if slot[i].is_some() {
             continue; // already held; airtime still charged
         }
+        rec.decodes += 1;
         let wave = with_tail(wave);
         let rxw = match cx.trace {
             Some(tr) => {
@@ -1085,6 +1135,7 @@ fn run_session(arm: Arm, preset: Option<WattersonPreset>, seed: u64, p_ref: f32)
     let mut seq_id: HashMap<u8, u16> = HashMap::new();
     let mut submitted: HashMap<u16, Instant> = HashMap::new();
     let mut store: HashMap<u16, Vec<Option<Vec<u8>>>> = HashMap::new();
+    let mut pending: std::collections::HashSet<u8> = std::collections::HashSet::new();
     let frame_air_d = Duration::from_secs_f64(frame_air);
 
     let ack = |seq: u8,
@@ -1120,8 +1171,10 @@ fn run_session(arm: Arm, preset: Option<WattersonPreset>, seed: u64, p_ref: f32)
             let seq = tx.send(data.clone(), now).expect("window has room");
             seq_id.insert(seq, id);
             submitted.insert(id, now);
+            pending.insert(seq);
             rec.block_tx += 1;
             if send_block(&cx, id, &data, &mut store, &mut now, start, &mut rec) {
+                pending.remove(&seq);
                 ack(
                     seq,
                     data,
@@ -1147,6 +1200,7 @@ fn run_session(arm: Arm, preset: Option<WattersonPreset>, seed: u64, p_ref: f32)
             let id = seq_id[&seq];
             rec.block_tx += 1;
             if send_block(&cx, id, &data, &mut store, &mut now, start, &mut rec) {
+                pending.remove(&seq);
                 ack(
                     seq,
                     data,
@@ -1161,6 +1215,13 @@ fn run_session(arm: Arm, preset: Option<WattersonPreset>, seed: u64, p_ref: f32)
         }
     }
     rec.elapsed_s = now.duration_since(start).as_secs_f64();
+    rec.pending_end = pending.len();
+    rec.pending_max_tx = pending
+        .iter()
+        .filter_map(|&q| tx.transmit_count(q))
+        .max()
+        .unwrap_or(0);
+    rec.rto_end_s = tx.rto().as_secs_f64();
     rec
 }
 
@@ -1252,6 +1313,17 @@ fn self_checks(phy: &Phy, code: &OuterCode) {
         .fold(0.0f32, f32::max);
     assert!(err < 1e-3, "identity channel max error {err}");
     println!("CHECK identity channel: PASS (max abs error {err:.2e})");
+    // 6. Bare-frame truncation: the RX bandpass delay drops the last OFDM symbol
+    //    of a buffer cut at the frame's last TX sample.
+    let p: Vec<u8> = (0..META + chunk).map(|_| rng.random::<u8>()).collect();
+    let w = phy.tx(&p, 1, Arm::Control);
+    let bare = phy.demod(&w, Arm::Control).expect("bare demod").1.len();
+    let tail = phy
+        .demod(&with_tail(w), Arm::Control)
+        .expect("tail demod")
+        .1
+        .len();
+    println!("CHECK bare-frame symbols: {bare} bare vs {tail} with a {RX_TAIL}-sample tail (1944 needed)");
 }
 
 fn trace_stats(preset: WattersonPreset) {
@@ -1340,6 +1412,15 @@ fn main() {
     // Fixed noise reference: mean power of one clean control packet.
     let p_ref = coppa_channel::mean_power(&phy.tx(&vec![0x5Au8; META + chunk], 0, Arm::Control));
     println!("PREF {p_ref:.6e}");
+    for arm in [Arm::Freq, Arm::Outer] {
+        let p = coppa_channel::mean_power(&phy.tx(&vec![0x5Au8; META + chunk], 0, arm));
+        println!(
+            "POWER {}: mean packet power {:.6e} ({:+.2} dB vs control)",
+            arm.name(),
+            p,
+            10.0 * (p / p_ref).log10()
+        );
+    }
 
     let arms = [Arm::Control, Arm::Freq, Arm::Outer];
     let presets = [
@@ -1371,7 +1452,7 @@ fn main() {
             .collect()
     });
 
-    println!("\nTRIAL\tarm\tpreset\ttrial\tseed\tstatus\telapsed_s\tbytes\tbytes_per_min\tblocks\tblock_tx\tpackets\tdata_air_s\tack_air_s\tturn_s\tlat_med_s\tlat_max_s\tfail_sync_hdr\tfail_header\tfail_payload\tverify_fail");
+    println!("\nTRIAL\tarm\tpreset\ttrial\tseed\tstatus\telapsed_s\tbytes\tbytes_per_min\tblocks\tblock_tx\tpackets\tdata_air_s\tack_air_s\tturn_s\tlat_med_s\tlat_max_s\tfail_sync_hdr\tfail_header\tfail_payload\tverify_fail\tdecodes\tpending_end\tpending_max_tx\trto_end_s");
     for ((arm, preset, t, seed), r) in &results {
         let mut l = r.latencies.clone();
         l.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -1382,7 +1463,7 @@ fn main() {
         };
         let max = l.last().copied().unwrap_or(f64::NAN);
         println!(
-            "TRIAL\t{}\t{}\t{}\t{:#x}\t{}\t{:.1}\t{}\t{:.1}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{}\t{}\t{}\t{}",
+            "TRIAL\t{}\t{}\t{}\t{:#x}\t{}\t{:.1}\t{}\t{:.1}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}",
             arm.name(),
             preset.map(preset_name).unwrap_or("clean"),
             t,
@@ -1402,7 +1483,11 @@ fn main() {
             r.fail_sync,
             r.fail_header,
             r.fail_payload,
-            r.verify_fail
+            r.verify_fail,
+            r.decodes,
+            r.pending_end,
+            r.pending_max_tx,
+            r.rto_end_s
         );
     }
 
