@@ -98,7 +98,8 @@ across all carriers at once and wrecks decode on every one of them.
    itself has no TX gain setting) all the way down.
 3. Key the calibration tone: `coppa tune` from the CLI (device and PTT settings
    come from the same `coppad.toml`; default 10 seconds,
-   `--seconds N` to change it), or `TUNE` (or `TUNE <seconds>`) on the daemon's
+   `--duration N` (`-d N`, more than 0 and at most 120) to change it; the old
+   `--seconds N` still works for one release with a deprecation warning), or `TUNE` (or `TUNE <seconds>`) on the daemon's
    VARA command port. This transmits a standard two-tone signal (700 Hz +
    1900 Hz, equal amplitude) — the same drive-level convention hams use for
    SSB two-tone tests.

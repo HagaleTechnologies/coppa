@@ -10,20 +10,21 @@ use std::io::Write;
 #[derive(Args, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DoctorArgs {
     /// Audio device to check for both input and output (substring match, as for tx and rx).
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     device: Option<String>,
     /// Input device to check (substring match); overrides --device.
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     input_device: Option<String>,
     /// Output device to check (substring match); overrides --device.
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     output_device: Option<String>,
     /// rigctld address to connect to.
     #[arg(
         long,
         value_name = "HOST:PORT",
         default_value = "127.0.0.1:4532",
-        conflicts_with = "no_rigctld"
+        conflicts_with = "no_rigctld",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
     )]
     rigctld: String,
     /// Skip the rigctld checks (VOX or no-CAT stations).

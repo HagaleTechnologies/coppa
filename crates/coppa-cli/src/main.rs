@@ -38,13 +38,26 @@ impl Verbosity {
 )]
 struct Cli {
     /// Increase diagnostic output; repeat for frame metrics.
-    #[arg(short, long, global = true, action = clap::ArgAction::Count, conflicts_with = "quiet")]
+    #[arg(
+        short,
+        long,
+        global = true,
+        action = clap::ArgAction::Count,
+        conflicts_with = "quiet",
+        help_heading = "Global options"
+    )]
     verbose: u8,
-    /// Suppress all output except decoded messages.
-    #[arg(short, long, global = true, conflicts_with = "verbose")]
+    /// Suppress status output; decoded data, warnings and errors still print.
+    #[arg(
+        short,
+        long,
+        global = true,
+        conflicts_with = "verbose",
+        help_heading = "Global options"
+    )]
     quiet: bool,
     /// Read settings from this file instead of searching for coppad.toml (also COPPA_CONFIG). The file must exist.
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(long, global = true, value_name = "PATH", help_heading = "Global options")]
     config: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
@@ -55,20 +68,33 @@ struct Cli {
 #[derive(clap::Args, Debug, Default, PartialEq, Eq)]
 struct RxArgs {
     /// WAV file to decode. Without one, captures live audio from an input device.
-    #[arg(value_name = "FILE")]
+    #[arg(value_name = "FILE", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     file: Option<String>,
     /// WAV file to decode (same as FILE).
-    #[arg(short, long, value_name = "FILE", conflicts_with = "file")]
+    #[arg(
+        short,
+        long,
+        value_name = "FILE",
+        conflicts_with = "file",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
     input: Option<String>,
     /// Stop after this many seconds of audio: the first N seconds of a file,
     /// or N seconds of live capture (0 = no limit).
-    #[arg(short, long, value_name = "SECONDS", default_value_t = 0)]
+    #[arg(
+        short,
+        long,
+        value_name = "SECONDS",
+        default_value_t = 0,
+        allow_negative_numbers = true,
+        value_parser = rx_seconds
+    )]
     duration: u64,
     /// Operational profile name.
-    #[arg(long)]
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
     profile: Option<String>,
     /// Your callsign. Printed under --verbose; nothing else uses it yet.
-    #[arg(long)]
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
     callsign: Option<String>,
     /// Print only the decoded payload as lowercase hex, one line per frame,
     /// with no labels (always hex, even for text).
@@ -81,10 +107,10 @@ struct RxArgs {
     #[arg(long, conflicts_with_all = ["raw", "hex"])]
     json: bool,
     /// Audio input device name (unique substring, live capture only).
-    #[arg(long, conflicts_with = "device_id")]
+    #[arg(long, conflicts_with = "device_id", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     device: Option<String>,
     /// Exact audio input device ID from `coppa devices`.
-    #[arg(long, conflicts_with = "device")]
+    #[arg(long, conflicts_with = "device", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     device_id: Option<String>,
     /// Zero-based input channel on the selected device.
     #[arg(long, default_value_t = 0)]
@@ -103,7 +129,7 @@ impl RxArgs {
 #[derive(clap::Args, Debug, Default, PartialEq, Eq)]
 struct ProfilesArgs {
     /// Show one named profile (HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY).
-    #[arg(short, long, conflicts_with = "level")]
+    #[arg(short, long, conflicts_with = "level", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     profile: Option<String>,
     /// Show one speed level (1-9).
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
@@ -257,34 +283,51 @@ const LISTEN_DEPRECATED: &str = "WARNING: 'coppa listen' is deprecated and will 
     removed in the next release. Use 'coppa rx' instead; it takes the same flags, \
     and --raw prints hex.";
 
+/// Printed on stderr whenever the deprecated `tune --seconds` runs, even under
+/// `--quiet`, like `LISTEN_DEPRECATED`.
+const TUNE_SECONDS_DEPRECATED: &str = "WARNING: '--seconds' is deprecated and will be \
+    removed in the next release. Use '--duration' (-d); it takes the same value.";
+
 #[derive(clap::Args, Debug, Default, PartialEq, Eq)]
 struct RigArgs {
     /// Audio output device name (unique substring).
-    #[arg(long, conflicts_with = "device_id")]
+    #[arg(long, conflicts_with = "device_id", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     device: Option<String>,
     /// Exact audio output device ID from `coppa devices`.
-    #[arg(long, conflicts_with = "device")]
+    #[arg(long, conflicts_with = "device", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     device_id: Option<String>,
     /// Zero-based output channel on the selected device.
     #[arg(long, default_value_t = 0)]
     output_channel: u16,
-    /// PTT method: "rigctld", "vox" or "none" [default: none].
-    #[arg(long)]
+    /// PTT method [default: none].
+    // clap lists the values and rejects a typo even on the -o path (COP-86);
+    // `validate_ptt_method` still checks env and coppad.toml values.
+    #[arg(long, value_name = "METHOD", value_parser = ["none", "vox", "rigctld"])]
     ptt: Option<String>,
     /// rigctld address for CAT PTT [default: 127.0.0.1:4532].
-    #[arg(long)]
+    #[arg(long, value_name = "HOST:PORT", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     rigctld: Option<String>,
     /// Milliseconds to key PTT before audio starts playing [default: 50].
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "MS",
+        allow_negative_numbers = true,
+        value_parser = whole_number
+    )]
     ptt_lead_ms: Option<u64>,
     /// Milliseconds to hold PTT keyed after audio finishes playing [default: 200].
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "MS",
+        allow_negative_numbers = true,
+        value_parser = whole_number
+    )]
     ptt_tail_ms: Option<u64>,
     /// Explicit operating frequency in Hz for the wideband gate.
-    #[arg(long)]
+    #[arg(long, value_name = "HZ")]
     frequency_hz: Option<u64>,
     /// Operating band label ("160m".."23cm") for the wideband gate.
-    #[arg(long)]
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
     band: Option<String>,
 }
 
@@ -294,18 +337,19 @@ enum Commands {
     #[command(after_help = SETTINGS_HELP)]
     Tx {
         /// Message to transmit.
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         message: String,
         /// Output file for audio samples (WAV format).
-        #[arg(short, long)]
+        #[arg(short, long, value_name = "FILE", value_parser = clap::builder::NonEmptyStringValueParser::new())]
         output: Option<String>,
         /// Operational profile name (e.g., HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY).
-        #[arg(long)]
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
         profile: Option<String>,
         /// Speed level 1-9, overriding the profile's level but never its band (see `coppa profiles`).
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
         level: Option<u8>,
         /// Callsign for station identification.
-        #[arg(long)]
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
         callsign: Option<String>,
         #[command(flatten)]
         rig: RigArgs,
@@ -317,9 +361,10 @@ enum Commands {
     #[command(after_help = SETTINGS_HELP)]
     Loopback {
         /// Message to test.
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         message: String,
         /// Operational profile name.
-        #[arg(long)]
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
         profile: Option<String>,
         /// Speed level 1-9, overriding the profile's level but never its band (see `coppa profiles`).
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
@@ -331,25 +376,53 @@ enum Commands {
     #[command(hide = true)]
     #[command(after_help = SETTINGS_HELP)]
     Listen(RxArgs),
-    /// Transmit a TX-level calibration ("TUNE") tone: standard SSB two-tone
-    /// (700 Hz + 1900 Hz) by default, or a single tone via `--single`. Key
-    /// this while advancing your radio's audio drive level until ALC just
-    /// registers, then back off. See `docs/OPERATING.md`.
+    #[command(
+        about = "Transmit a TX-level calibration tone (two-tone by default)",
+        long_about = "Transmit a TX-level calibration (\"TUNE\") tone: standard SSB two-tone \
+            (700 Hz + 1900 Hz) by default, or a single tone via `--single`. Key this while \
+            advancing your radio's audio drive level until ALC just registers, then back off. \
+            See `docs/OPERATING.md`."
+    )]
     #[command(after_help = SETTINGS_HELP)]
     Tune {
-        /// Duration to key the tone, in seconds.
-        #[arg(long, default_value = "10")]
-        seconds: f32,
-        /// Transmit a single tone at this frequency (Hz) instead of the
-        /// default two-tone signal, e.g. for power measurement with a
+        /// How long to key the tone, in seconds (more than 0, at most 120).
+        #[arg(
+            short,
+            long,
+            value_name = "SECONDS",
+            default_value = "10",
+            allow_negative_numbers = true,
+            value_parser = tune_seconds
+        )]
+        duration: f32,
+        /// Deprecated: use --duration. Removed in the next release.
+        // COP-86: kept for one release. Delete this field,
+        // TUNE_SECONDS_DEPRECATED and its check in the Tune dispatch arm in
+        // the release after it ships.
+        #[arg(
+            long,
+            hide = true,
+            value_name = "SECONDS",
+            conflicts_with = "duration",
+            allow_negative_numbers = true,
+            value_parser = tune_seconds
+        )]
+        seconds: Option<f32>,
+        /// Transmit a single tone at this frequency (300-3000 Hz) instead of
+        /// the default two-tone signal, e.g. for power measurement with a
         /// wattmeter.
-        #[arg(long)]
+        #[arg(
+            long,
+            value_name = "HZ",
+            allow_negative_numbers = true,
+            value_parser = tune_single_hz
+        )]
         single: Option<f32>,
         /// Output file for audio samples (WAV format) instead of live playback.
-        #[arg(short, long)]
+        #[arg(short, long, value_name = "FILE", value_parser = clap::builder::NonEmptyStringValueParser::new())]
         output: Option<String>,
         /// Operational profile name (e.g., HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY).
-        #[arg(long)]
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
         profile: Option<String>,
         #[command(flatten)]
         rig: RigArgs,
@@ -362,7 +435,11 @@ enum Commands {
     },
     /// Check audio devices and rig control without transmitting.
     Doctor(doctor::DoctorArgs),
-    /// Show the speed levels (modulation, code rate, max bytes, air time, bandwidth) and the named profiles built on them.
+    #[command(
+        about = "Show the speed levels and the named profiles built on them",
+        long_about = "Show the speed levels (modulation, code rate, max bytes, air time, \
+            bandwidth) and the named profiles built on them."
+    )]
     Profiles(ProfilesArgs),
     // COP-55: kept for one release. Delete this variant, CONFIG_DEPRECATED and
     // the Config dispatch arm in the release after it ships.
@@ -539,12 +616,17 @@ fn main() -> Result<()> {
             )?;
         }
         Some(Commands::Tune {
+            duration,
             seconds,
             single,
             output,
             profile,
             rig,
         }) => {
+            if seconds.is_some() {
+                eprintln!("{TUNE_SECONDS_DEPRECATED}");
+            }
+            let seconds = seconds.unwrap_or(duration);
             let layers = Layers::load(config_flag.as_deref(), env)?;
             let profile = layers.profile(profile.as_deref())?;
             let rig = layers.rig(&rig)?;
@@ -661,6 +743,61 @@ fn write_wav_output(
         }
     }
     Ok(())
+}
+
+// COP-83 adds these to coppa-engine; switch to them when #192 lands.
+/// Longest `coppa tune --duration`, in seconds.
+const MAX_TUNE_SECONDS: f32 = 120.0;
+/// Lowest `coppa tune --single` frequency, in Hz.
+const TUNE_SINGLE_MIN_HZ: f32 = 300.0;
+/// Highest `coppa tune --single` frequency, in Hz.
+const TUNE_SINGLE_MAX_HZ: f32 = 3000.0;
+
+/// Parse a finite number, or give `message` as clap's reason (COP-86).
+fn parse_finite(s: &str, message: &str) -> Result<f32, String> {
+    match s.trim().parse::<f32>() {
+        Ok(value) if value.is_finite() => Ok(value),
+        _ => Err(message.to_string()),
+    }
+}
+
+/// `coppa tune --duration`: more than 0 and at most `MAX_TUNE_SECONDS`. NaN,
+/// infinity and 0 used to write an empty file or panic (COP-86).
+fn tune_seconds(s: &str) -> Result<f32, String> {
+    let message = format!("must be more than 0 and at most {MAX_TUNE_SECONDS} seconds");
+    let value = parse_finite(s, &message)?;
+    if value > 0.0 && value <= MAX_TUNE_SECONDS {
+        Ok(value)
+    } else {
+        Err(message)
+    }
+}
+
+/// `coppa tune --single`: an audio tone inside the SSB passband.
+fn tune_single_hz(s: &str) -> Result<f32, String> {
+    let message =
+        format!("must be between {TUNE_SINGLE_MIN_HZ} and {TUNE_SINGLE_MAX_HZ} Hz");
+    let value = parse_finite(s, &message)?;
+    if (TUNE_SINGLE_MIN_HZ..=TUNE_SINGLE_MAX_HZ).contains(&value) {
+        Ok(value)
+    } else {
+        Err(message)
+    }
+}
+
+/// A count such as `--ptt-lead-ms`: a whole number, 0 or more. clap's own
+/// parser calls `-5` an unexpected argument; this names the rule instead.
+fn whole_number(s: &str) -> Result<u64, String> {
+    s.trim()
+        .parse::<u64>()
+        .map_err(|_| "must be a whole number, 0 or more".to_string())
+}
+
+/// `coppa rx --duration`: whole seconds, 0 for no limit.
+fn rx_seconds(s: &str) -> Result<u64, String> {
+    s.trim()
+        .parse::<u64>()
+        .map_err(|_| "must be a whole number of seconds, 0 or more (0 = no limit)".to_string())
 }
 
 /// Validate the `--ptt <method>` value (COP-40): an unrecognized value is a
@@ -3093,6 +3230,76 @@ mod tests {
                 .contains("expected \"none\", \"vox\", or \"rigctld\""),
             "{err}"
         );
+    }
+
+    #[test]
+    fn tune_seconds_parser_bounds() {
+        assert_eq!(tune_seconds("120"), Ok(120.0));
+        assert_eq!(tune_seconds("0.01"), Ok(0.01));
+        assert_eq!(tune_seconds(" 5 "), Ok(5.0));
+        for bad in ["0", "-0", "120.01", "-1", "NaN", "nan", "inf", "-inf", "1e12", "ten", ""] {
+            assert_eq!(
+                tune_seconds(bad),
+                Err("must be more than 0 and at most 120 seconds".to_string()),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tune_single_parser_bounds() {
+        assert_eq!(tune_single_hz("300"), Ok(300.0));
+        assert_eq!(tune_single_hz("3000"), Ok(3000.0));
+        assert_eq!(tune_single_hz("1000.5"), Ok(1000.5));
+        for bad in ["299.99", "3000.01", "0", "-5", "NaN", "inf", "30000", "hz"] {
+            assert_eq!(
+                tune_single_hz(bad),
+                Err("must be between 300 and 3000 Hz".to_string()),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_number_parser() {
+        assert_eq!(whole_number("0"), Ok(0));
+        assert_eq!(whole_number("250"), Ok(250));
+        assert_eq!(rx_seconds("0"), Ok(0));
+        assert_eq!(rx_seconds("60"), Ok(60));
+        for bad in ["-5", "-0.5", "1.5", "NaN", "inf", "ms", ""] {
+            assert_eq!(
+                whole_number(bad),
+                Err("must be a whole number, 0 or more".to_string()),
+                "{bad:?}"
+            );
+            assert_eq!(
+                rx_seconds(bad),
+                Err("must be a whole number of seconds, 0 or more (0 = no limit)".to_string()),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tune_duration_and_deprecated_seconds_parse() {
+        let cli = Cli::parse_from(["coppa", "tune", "-d", "2.5"]);
+        let Some(Commands::Tune {
+            duration, seconds, ..
+        }) = cli.command
+        else {
+            panic!("expected Tune");
+        };
+        assert_eq!((duration, seconds), (2.5, None));
+
+        let cli = Cli::parse_from(["coppa", "tune", "--seconds", "3"]);
+        let Some(Commands::Tune {
+            duration, seconds, ..
+        }) = cli.command
+        else {
+            panic!("expected Tune");
+        };
+        assert_eq!((duration, seconds), (10.0, Some(3.0)));
+        assert!(Cli::try_parse_from(["coppa", "tune", "-d", "2", "--seconds", "3"]).is_err());
     }
 
     /// The acceptance command `coppa tx --ptt rigctld-typo` must fail in
