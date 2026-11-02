@@ -89,11 +89,87 @@ impl RigctldClient {
                 Ok(freq)
             }
             Err(error) => {
-                self.connected = false;
-                let _ = self.stream.shutdown(Shutdown::Both);
+                self.invalidate();
                 Err(error)
             }
         }
+    }
+
+    /// COP-84: ask the rig for its mode (`m`) and return the rig's own token
+    /// (`USB`, `PKTLSB`, `CW`, `RTTY`, ...), honestly: never the cached or
+    /// construction-default mode. A successful answer also refreshes the
+    /// cache that [`RadioControl::get_mode`] falls back to.
+    ///
+    /// rigctld answers `m` with two lines (mode, passband) on success but with
+    /// one `RPRT <n>` line on error, so the passband is read only after a
+    /// first line that is not `RPRT`: reading two lines unconditionally
+    /// stalled for the 2 s read timeout on an error. An `RPRT` answer is
+    /// complete and keeps the connection; a transport failure or a first line
+    /// that is not a mode token (1-16 of `A-Z`, `0-9`) invalidates it, since
+    /// the stream may be out of step.
+    pub fn query_mode(&mut self) -> Result<String> {
+        if !self.connected {
+            self.reconnect()?;
+        }
+        let mut lines = self.exchange_mode()?;
+        let token = lines.swap_remove(0);
+        if token.starts_with("RPRT") {
+            return Err(anyhow!("rigctld answered {token:?} to `m`"));
+        }
+        if !is_mode_token(&token) {
+            self.invalidate();
+            return Err(anyhow!(
+                "rigctld answered {token:?} to `m`, which is not a mode token"
+            ));
+        }
+        self.mode = Self::parse_mode(&token);
+        Ok(token)
+    }
+
+    /// COP-84: tune the rig (`F <hz>`). Only an `RPRT 0` answer succeeds. A
+    /// refusal (`RPRT <n>`, n != 0) is an error that keeps the connection;
+    /// any other answer is an error that invalidates it. Success means the
+    /// rig accepted the command, not that it landed on `hz`: read the dial
+    /// back with [`Self::query_frequency`].
+    pub fn try_set_frequency(&mut self, hz: u64) -> Result<()> {
+        let cmd = format!("F {hz}");
+        let answer = self.command(&cmd)?;
+        self.require_rprt_0(&cmd, &answer)
+    }
+
+    /// COP-84: set the rig's mode (`M <token> 0`; passband `0` is hamlib's
+    /// backend default). `token` must be 1-16 of `A-Z`, `0-9` (a hamlib mode
+    /// name such as `PKTUSB`); anything else is refused before any I/O, so no
+    /// caller can smuggle a second command onto the line. Answers are judged
+    /// as for [`Self::try_set_frequency`].
+    pub fn try_set_mode(&mut self, token: &str) -> Result<()> {
+        if !is_mode_token(token) {
+            return Err(anyhow!(
+                "{token:?} is not a rigctld mode token (1-16 of A-Z, 0-9)"
+            ));
+        }
+        let cmd = format!("M {token} 0");
+        let answer = self.command(&cmd)?;
+        self.require_rprt_0(&cmd, &answer)
+    }
+
+    /// Judge a set command's one-line answer: `Ok` on `RPRT 0`; a refusal is
+    /// an error; anything else is an error that invalidates the connection.
+    fn require_rprt_0(&mut self, cmd: &str, answer: &str) -> Result<()> {
+        match expect_rprt_0(answer) {
+            Ok(()) => Ok(()),
+            Err(RprtError::Refused(answer)) => Err(anyhow!("rigctld refused `{cmd}`: {answer}")),
+            Err(RprtError::Garbage(answer)) => {
+                self.invalidate();
+                Err(anyhow!("rigctld answered {answer:?} to `{cmd}`"))
+            }
+        }
+    }
+
+    /// Mark the connection dead so the next command reconnects first.
+    fn invalidate(&mut self) {
+        self.connected = false;
+        let _ = self.stream.shutdown(Shutdown::Both);
     }
 
     /// Ask the rig for its dial frequency (`f`), honestly: `Some(hz)` only on
@@ -142,20 +218,28 @@ impl RigctldClient {
         self.exchange(cmd, 1).map(|mut lines| lines.swap_remove(0))
     }
 
-    /// Send a command and read two lines of response (e.g., mode + passband).
-    fn command_two_lines(&mut self, cmd: &str) -> Result<(String, String)> {
-        if !self.connected {
-            self.reconnect()?;
-        }
-        let mut lines = self.exchange(cmd, 2)?;
-        let line2 = lines.pop().unwrap_or_default();
-        let line1 = lines.pop().unwrap_or_default();
-        Ok((line1, line2))
-    }
-
     /// Write `cmd` and read `count` trimmed response lines on the current
     /// connection; on any failure, mark the connection dead.
     fn exchange(&mut self, cmd: &str, count: usize) -> Result<Vec<String>> {
+        self.exchange_lines(cmd, count, false)
+    }
+
+    /// Write `m` and read its answer on the current connection: the mode and
+    /// passband lines, or a lone `RPRT <n>` error line. Failure handling is
+    /// [`Self::exchange`]'s.
+    fn exchange_mode(&mut self) -> Result<Vec<String>> {
+        self.exchange_lines("m", 2, true)
+    }
+
+    /// Write `cmd` and read up to `count` trimmed response lines, stopping
+    /// early after an `RPRT` line when `stop_at_rprt` is set; on any failure,
+    /// mark the connection dead.
+    fn exchange_lines(
+        &mut self,
+        cmd: &str,
+        count: usize,
+        stop_at_rprt: bool,
+    ) -> Result<Vec<String>> {
         let result = (|| {
             writeln!(self.stream, "{}", cmd)
                 .map_err(|e| anyhow!("Failed to send command: {}", e))?;
@@ -170,13 +254,17 @@ impl RigctldClient {
                 if read == 0 {
                     return Err(anyhow!("rigctld at {} closed the connection", self.addr));
                 }
-                lines.push(line.trim().to_string());
+                let line = line.trim().to_string();
+                let done = stop_at_rprt && line.starts_with("RPRT");
+                lines.push(line);
+                if done {
+                    break;
+                }
             }
             Ok(lines)
         })();
         if result.is_err() {
-            self.connected = false;
-            let _ = self.stream.shutdown(Shutdown::Both);
+            self.invalidate();
         }
         result
     }
@@ -203,6 +291,42 @@ impl RigctldClient {
     }
 }
 
+/// Whether `s` is safe to send as a rigctld mode token: 1-16 bytes of ASCII
+/// `A-Z` and `0-9`, which covers hamlib's mode names (`USB`, `PKTLSB`,
+/// `RTTYR`, ...) and excludes spaces, newlines and lower case.
+fn is_mode_token(s: &str) -> bool {
+    (1..=16).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+/// Why a set command's one-line answer is not `RPRT 0`.
+#[derive(Debug)]
+enum RprtError {
+    /// `RPRT <n>` with `n` not 0, or an unreadable code: the rig refused,
+    /// and the answer is complete.
+    Refused(String),
+    /// Not an `RPRT` line at all: the stream may be out of step.
+    Garbage(String),
+}
+
+/// Classify a set command's one-line answer. `Ok` on `RPRT 0`.
+fn expect_rprt_0(answer: &str) -> std::result::Result<(), RprtError> {
+    if !answer.starts_with("RPRT") {
+        return Err(RprtError::Garbage(answer.to_string()));
+    }
+    let code: i32 = answer
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(-1);
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(RprtError::Refused(answer.to_string()))
+    }
+}
+
 impl RadioControl for RigctldClient {
     fn get_frequency(&mut self) -> Result<u64> {
         match self.command("f") {
@@ -218,47 +342,27 @@ impl RadioControl for RigctldClient {
         }
     }
 
+    /// Strict since COP-84: only an `RPRT 0` answer succeeds (see
+    /// [`RigctldClient::try_set_frequency`]).
     fn set_frequency(&mut self, freq_hz: u64) -> Result<()> {
-        let response = self.command(&format!("F {}", freq_hz))?;
-        if response.starts_with("RPRT") {
-            let code: i32 = response
-                .split_whitespace()
-                .nth(1)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(-1);
-            if code != 0 {
-                return Err(anyhow!("rigctld set_frequency failed: {}", response));
-            }
-        }
+        self.try_set_frequency(freq_hz)?;
         self.frequency = freq_hz;
         Ok(())
     }
 
+    /// Falls back to the cached mode when the rig does not answer cleanly,
+    /// without the 2 s stall a one-line `RPRT` error used to cost (COP-84,
+    /// see [`RigctldClient::query_mode`]).
     fn get_mode(&mut self) -> Result<RadioMode> {
-        // rigctld 'm' command returns two lines: mode string and passband width
-        match self.command_two_lines("m") {
-            Ok((mode_str, _passband)) => {
-                let mode = Self::parse_mode(mode_str.trim());
-                self.mode = mode;
-                Ok(mode)
-            }
-            Err(_) => Ok(self.mode), // fallback to cached on error
-        }
+        self.query_mode()
+            .map(|token| Self::parse_mode(&token))
+            .or(Ok(self.mode))
     }
 
+    /// Strict since COP-84: only an `RPRT 0` answer succeeds (see
+    /// [`RigctldClient::try_set_mode`]).
     fn set_mode(&mut self, mode: RadioMode) -> Result<()> {
-        let mode_str = Self::mode_string(mode);
-        let response = self.command(&format!("M {} 0", mode_str))?;
-        if response.starts_with("RPRT") {
-            let code: i32 = response
-                .split_whitespace()
-                .nth(1)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(-1);
-            if code != 0 {
-                return Err(anyhow!("rigctld set_mode failed: {}", response));
-            }
-        }
+        self.try_set_mode(Self::mode_string(mode))?;
         self.mode = mode;
         Ok(())
     }
@@ -287,15 +391,10 @@ impl RadioControl for RigctldClient {
             self.may_be_keyed = true;
         }
         let response = self.command(&format!("T {}", val))?;
-        if response.starts_with("RPRT") {
-            let code: i32 = response
-                .split_whitespace()
-                .nth(1)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(-1);
-            if code != 0 {
-                return Err(anyhow!("rigctld set_ptt failed: {}", response));
-            }
+        // Unlike the COP-84 setters, an answer that is not `RPRT` still
+        // counts as accepted here: PTT keeps its long-standing leniency.
+        if let Err(RprtError::Refused(response)) = expect_rprt_0(&response) {
+            return Err(anyhow!("rigctld set_ptt failed: {}", response));
         }
         if state == PttState::Rx {
             // Only an accepted `T 0` clears it.
@@ -431,6 +530,15 @@ mod tests {
         ignore_t1: bool,
         /// Answer `T 1`, then close that connection (rigctld restarting).
         close_after_t1: bool,
+        /// COP-84: answer `F` and `M` with `RPRT -1`.
+        refuse_sets: bool,
+        /// COP-84: answer `m` with the single line `RPRT -11`, as hamlib does
+        /// on error.
+        mode_error: bool,
+        /// COP-84: answer `F` with `RPRT 0` but keep the old frequency.
+        sticky_frequency: bool,
+        /// COP-84: answer `F` and `M` with `14074000`, which is not `RPRT`.
+        garbage_set_reply: bool,
     }
 
     /// A recording fake rigctld: accepts any number of connections and
@@ -455,6 +563,8 @@ mod tests {
             let closed = Arc::new(AtomicUsize::new(0));
             let failed_t0 = Arc::new(AtomicBool::new(false));
             let ptt = Arc::new(Mutex::new("0".to_string()));
+            let frequency = Arc::new(Mutex::new("14074000".to_string()));
+            let mode = Arc::new(Mutex::new("PKTLSB".to_string()));
             let (log2, opened2, closed2) = (log.clone(), opened.clone(), closed.clone());
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
@@ -462,6 +572,7 @@ mod tests {
                     opened2.fetch_add(1, Ordering::SeqCst);
                     let (log, closed) = (log2.clone(), closed2.clone());
                     let (failed_t0, ptt) = (failed_t0.clone(), ptt.clone());
+                    let (frequency, mode) = (frequency.clone(), mode.clone());
                     std::thread::spawn(move || {
                         let mut writer = stream.try_clone().unwrap();
                         let mut reader = BufReader::new(stream);
@@ -471,7 +582,30 @@ mod tests {
                             line.clear();
                             log.lock().unwrap().push(cmd.clone());
                             let reply = match cmd.as_str() {
-                                "f" => Some("14074000".to_string()),
+                                "f" => Some(frequency.lock().unwrap().clone()),
+                                "m" if opts.mode_error => Some("RPRT -11".to_string()),
+                                "m" => Some(format!("{}\n2400", mode.lock().unwrap())),
+                                c if (c.starts_with("F ") || c.starts_with("M "))
+                                    && opts.refuse_sets =>
+                                {
+                                    Some("RPRT -1".to_string())
+                                }
+                                c if (c.starts_with("F ") || c.starts_with("M "))
+                                    && opts.garbage_set_reply =>
+                                {
+                                    Some("14074000".to_string())
+                                }
+                                c if c.starts_with("F ") => {
+                                    if !opts.sticky_frequency {
+                                        *frequency.lock().unwrap() = c[2..].to_string();
+                                    }
+                                    Some("RPRT 0".to_string())
+                                }
+                                c if c.starts_with("M ") => {
+                                    let token = c.split_whitespace().nth(1).unwrap_or("");
+                                    *mode.lock().unwrap() = token.to_string();
+                                    Some("RPRT 0".to_string())
+                                }
                                 "t" => Some(ptt.lock().unwrap().clone()),
                                 "T 1" if opts.ignore_t1 => None,
                                 "T 0"
@@ -652,5 +786,148 @@ mod tests {
         PttControl::set_ptt(&mut client, PttState::Rx).unwrap();
         drop(client);
         assert_eq!(fake.settled_log(), ["T 1", "T 0"]);
+    }
+
+    /// Run `f`, returning its result and how long it took.
+    fn timed<T>(f: impl FnOnce() -> T) -> (T, std::time::Duration) {
+        let start = std::time::Instant::now();
+        let out = f();
+        (out, start.elapsed())
+    }
+
+    #[test]
+    fn cop84_query_mode_returns_the_rigs_own_token() {
+        let fake = FakeRigctld::start(FakeOpts::default());
+        let mut client = RigctldClient::connect(&fake.addr).unwrap();
+        assert_eq!(client.query_mode().unwrap(), "PKTLSB");
+        drop(client);
+        assert_eq!(fake.settled_log(), ["m"]);
+    }
+
+    #[test]
+    fn cop84_query_mode_stops_at_a_one_line_rprt_error() {
+        use std::sync::atomic::Ordering;
+
+        let fake = FakeRigctld::start(FakeOpts {
+            mode_error: true,
+            ..FakeOpts::default()
+        });
+        let mut client = RigctldClient::connect(&fake.addr).unwrap();
+        let (result, took) = timed(|| client.query_mode());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("RPRT -11"), "error: {error}");
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "a one-line RPRT must not wait for a passband line: took {took:?}"
+        );
+        // The RPRT answer was complete, so the connection is still in step.
+        assert_eq!(client.query_frequency().unwrap(), 14_074_000);
+        drop(client);
+        assert_eq!(fake.settled_log(), ["m", "f"]);
+        assert_eq!(fake.opened.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cop84_get_mode_no_longer_stalls_or_invents_usb_on_an_rprt_error() {
+        let fake = FakeRigctld::start(FakeOpts {
+            mode_error: true,
+            ..FakeOpts::default()
+        });
+        let mut client = RigctldClient::connect(&fake.addr).unwrap();
+        // The cache still holds the construction default; falling back to it
+        // is RadioControl::get_mode's contract.
+        let (mode, took) = timed(|| RadioControl::get_mode(&mut client));
+        assert_eq!(mode.unwrap(), RadioMode::Usb);
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "took {took:?}"
+        );
+        // Once the cache holds something else, the fallback is that, not Usb.
+        RadioControl::set_mode(&mut client, RadioMode::Lsb).unwrap();
+        let (mode, took) = timed(|| RadioControl::get_mode(&mut client));
+        assert_eq!(mode.unwrap(), RadioMode::Lsb);
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "took {took:?}"
+        );
+        drop(client);
+        assert_eq!(fake.settled_log(), ["m", "M LSB 0", "m"]);
+    }
+
+    #[test]
+    fn cop84_try_set_frequency_requires_exactly_rprt_0() {
+        use std::sync::atomic::Ordering;
+
+        let fake = FakeRigctld::start(FakeOpts::default());
+        let mut client = RigctldClient::connect(&fake.addr).unwrap();
+        client.try_set_frequency(7_074_000).unwrap();
+        drop(client);
+        assert_eq!(fake.settled_log(), ["F 7074000"]);
+
+        let fake = FakeRigctld::start(FakeOpts {
+            refuse_sets: true,
+            ..FakeOpts::default()
+        });
+        let mut client = RigctldClient::connect(&fake.addr).unwrap();
+        let error = client.try_set_frequency(7_074_000).unwrap_err().to_string();
+        assert!(error.contains("RPRT -1"), "error: {error}");
+        assert!(client.connected, "a refusal is a complete answer");
+
+        let fake = FakeRigctld::start(FakeOpts {
+            garbage_set_reply: true,
+            ..FakeOpts::default()
+        });
+        let mut client = RigctldClient::connect(&fake.addr).unwrap();
+        let error = client.try_set_frequency(7_074_000).unwrap_err().to_string();
+        assert!(error.contains("14074000"), "error: {error}");
+        assert_eq!(client.query_frequency().unwrap(), 14_074_000);
+        drop(client);
+        assert_eq!(
+            fake.opened.load(Ordering::SeqCst),
+            2,
+            "a garbage answer invalidates the connection, so the next command reconnects"
+        );
+
+        // An accepted set is not a readback: the rig may stay where it was.
+        let fake = FakeRigctld::start(FakeOpts {
+            sticky_frequency: true,
+            ..FakeOpts::default()
+        });
+        let mut client = RigctldClient::connect(&fake.addr).unwrap();
+        client.try_set_frequency(7_074_000).unwrap();
+        assert_eq!(client.query_frequency().unwrap(), 14_074_000);
+    }
+
+    #[test]
+    fn cop84_try_set_mode_sends_the_token_with_passband_0() {
+        let fake = FakeRigctld::start(FakeOpts::default());
+        let mut client = RigctldClient::connect(&fake.addr).unwrap();
+        client.try_set_mode("PKTUSB").unwrap();
+        drop(client);
+        assert_eq!(fake.settled_log(), ["M PKTUSB 0"]);
+    }
+
+    #[test]
+    fn cop84_try_set_mode_refuses_unsafe_tokens_without_io() {
+        let fake = FakeRigctld::start(FakeOpts::default());
+        let mut client = RigctldClient::connect(&fake.addr).unwrap();
+        for token in ["", "PKT USB", "USB\nT 1", "usb", "ABCDEFGHIJKLMNOPQ"] {
+            assert!(client.try_set_mode(token).is_err(), "token {token:?}");
+        }
+        drop(client);
+        assert!(fake.settled_log().is_empty());
+    }
+
+    #[test]
+    fn cop84_radio_control_setters_are_strict() {
+        let fake = FakeRigctld::start(FakeOpts {
+            garbage_set_reply: true,
+            ..FakeOpts::default()
+        });
+        let mut client = RigctldClient::connect(&fake.addr).unwrap();
+        assert!(RadioControl::set_frequency(&mut client, 7_074_000).is_err());
+        assert!(RadioControl::set_mode(&mut client, RadioMode::Lsb).is_err());
+        drop(client);
+        assert_eq!(fake.settled_log(), ["F 7074000", "M LSB 0"]);
     }
 }

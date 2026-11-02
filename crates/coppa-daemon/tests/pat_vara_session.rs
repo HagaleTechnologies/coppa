@@ -211,7 +211,9 @@ impl PatVara {
         }
         assert_eq!(
             replies,
-            ["WRONG", "WRONG", "OK", "OK", "OK", "OK"],
+            // COP-84: `CWID ON` is OK under the default `[station_id] cwid =
+            // "host"`; it turns on the closing CW ID.
+            ["WRONG", "OK", "OK", "OK", "OK", "OK"],
             "{}: Pat's start burst replies, in order; lines so far: {:?}",
             pat.call,
             pat.seen
@@ -445,6 +447,10 @@ async fn pat_vara_session_connects_exchanges_and_disconnects_both_ways() {
             a.close().await;
             b.wait("DISCONNECTED", DISCONNECT_TIMEOUT).await;
             println!("session 1: DISCONNECTED on both stations");
+            // COP-84: Pat's `CWID ON` turned on the closing CW ID, so A's
+            // last interval carries its Morse ID after the DISCONNECT frame,
+            // and A cannot hear a call until it unkeys. B dials once it has.
+            a.wait("PTT OFF", DISCONNECT_TIMEOUT).await;
 
             // Session 2, roles reversed on the same stations: a listener that
             // takes repeated calls depends on the state reset between them.

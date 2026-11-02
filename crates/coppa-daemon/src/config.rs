@@ -95,6 +95,12 @@ pub struct RadioConfig {
     /// `ptt_guardian`): a helper process that releases PTT if coppad dies
     /// while transmitting. Ignored for `none`, `vox` and serial PTT.
     pub ptt_guardian: bool,
+    /// COP-84: let a VARA command-port client set the rig's frequency
+    /// (`FREQ <hz>`) or mode (`MODE <name>`) through rigctld. Off by default:
+    /// the command port is unauthenticated and any web page can send it a
+    /// line (`docs/LIMITATIONS.md`), so a drive-by set would retune the rig.
+    /// Reading the frequency and mode (`FREQ`, `MODE`) works without it.
+    pub host_rig_control: bool,
 }
 
 /// Which serial control line a `PttConfig::Serial` should drive.
@@ -459,7 +465,48 @@ pub struct StationIdConfig {
     /// tick). `0` (the default) disables beacon mode. Also requires
     /// `[engine] callsign` to be set.
     pub beacon_interval_secs: u64,
+    /// COP-84: Morse (CW) ID keyed right after the DISCONNECT frame of each
+    /// session this station ends, in the same keyed interval. `"host"` (the
+    /// default) leaves it off until a host sends `CWID ON` (VARA) or
+    /// `CWID TRUE` (ARDOP); `"always"` and `"never"` lock it on or off
+    /// against hosts. Needs `[engine] callsign` (or a host's `MYCALL`).
+    pub cwid: CwIdPolicy,
+    /// COP-84: CW ID speed in words per minute (PARIS timing), 10-20,
+    /// default 20. 47 CFR 97.119(b)(1) caps an automatic CW ID at 20 WPM.
+    /// Checked by run mode ([`DaemonConfig::check_station_id`]).
+    pub cwid_wpm: u32,
 }
+
+/// COP-84: who decides whether a CW ID follows each session this station
+/// ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CwIdPolicy {
+    /// Off until a host sends `CWID ON`; hosts may turn it on and off.
+    #[default]
+    Host,
+    /// On; a host's `CWID OFF` is refused.
+    Always,
+    /// Off; a host's `CWID ON` is refused.
+    Never,
+}
+
+impl CwIdPolicy {
+    /// The config spelling, as `[station_id] cwid` takes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CwIdPolicy::Host => "host",
+            CwIdPolicy::Always => "always",
+            CwIdPolicy::Never => "never",
+        }
+    }
+}
+
+/// COP-84: slowest `[station_id] cwid_wpm` run mode accepts.
+pub const MIN_CWID_WPM: u32 = 10;
+/// COP-84: fastest `[station_id] cwid_wpm` run mode accepts; 47 CFR
+/// 97.119(b)(1) caps an automatic CW ID at 20 WPM.
+pub const MAX_CWID_WPM: u32 = 20;
 
 /// Connected-session configuration (COP-69).
 ///
@@ -545,6 +592,7 @@ impl Default for RadioConfig {
             frequency_hz: None,
             band: None,
             ptt_guardian: true,
+            host_rig_control: false,
         }
     }
 }
@@ -589,6 +637,8 @@ impl Default for StationIdConfig {
             busy_hold_ms: 0,
             id_interval_secs: 540,
             beacon_interval_secs: 0,
+            cwid: CwIdPolicy::Host,
+            cwid_wpm: MAX_CWID_WPM,
         }
     }
 }
@@ -845,6 +895,20 @@ impl DaemonConfig {
     /// is touched, like every other config check.
     pub fn check_session(&self) -> Result<(), String> {
         self.session.check()
+    }
+
+    /// COP-84: validate `[station_id] cwid_wpm` (10-20), naming the key and
+    /// the rule on failure. Called by run mode before any hardware or socket
+    /// is touched; `--check` does not call it.
+    pub fn check_station_id(&self) -> Result<(), String> {
+        let wpm = self.station_id.cwid_wpm;
+        if (MIN_CWID_WPM..=MAX_CWID_WPM).contains(&wpm) {
+            return Ok(());
+        }
+        Err(format!(
+            "[station_id] cwid_wpm = {wpm} is outside {MIN_CWID_WPM}-{MAX_CWID_WPM}; \
+             47 CFR 97.119(b)(1) caps an automatic CW ID at 20 WPM"
+        ))
     }
 
     /// COP-36: `[audio] buffer_size` sizes the RX and TX audio rings, and a
@@ -1534,6 +1598,66 @@ beacon_interval_secs = 600
     #[test]
     fn test_turnaround_warning_absent_at_defaults() {
         assert_eq!(RadioConfig::default().turnaround_warning(), None);
+    }
+
+    #[test]
+    fn cop84_station_id_cwid_defaults_to_host_at_20_wpm() {
+        let station_id = StationIdConfig::default();
+        assert_eq!(station_id.cwid, CwIdPolicy::Host);
+        assert_eq!(station_id.cwid_wpm, 20);
+        assert!(!RadioConfig::default().host_rig_control);
+        assert_eq!(DaemonConfig::default().check_station_id(), Ok(()));
+    }
+
+    #[test]
+    fn cop84_cwid_parses_the_three_policies_and_names_them_on_error() {
+        for (text, policy) in [
+            ("host", CwIdPolicy::Host),
+            ("always", CwIdPolicy::Always),
+            ("never", CwIdPolicy::Never),
+        ] {
+            let config: DaemonConfig =
+                toml::from_str(&format!("[station_id]\ncwid = \"{text}\"\n")).unwrap();
+            assert_eq!(config.station_id.cwid, policy);
+            assert_eq!(policy.as_str(), text);
+        }
+        let err = toml::from_str::<DaemonConfig>("[station_id]\ncwid = \"yes\"\n")
+            .unwrap_err()
+            .to_string();
+        for needle in ["cwid", "host", "always", "never"] {
+            assert!(err.contains(needle), "{needle:?} missing from {err:?}");
+        }
+    }
+
+    #[test]
+    fn cop84_check_station_id_limits_cwid_wpm_to_10_through_20() {
+        let with_wpm = |wpm: u32| {
+            let mut config = DaemonConfig::default();
+            config.station_id.cwid_wpm = wpm;
+            config.check_station_id()
+        };
+        assert_eq!(with_wpm(10), Ok(()));
+        assert_eq!(with_wpm(20), Ok(()));
+        assert!(with_wpm(9).is_err());
+        assert!(with_wpm(21).is_err());
+        assert_eq!(
+            with_wpm(25).unwrap_err(),
+            "[station_id] cwid_wpm = 25 is outside 10-20; 47 CFR 97.119(b)(1) caps an \
+             automatic CW ID at 20 WPM"
+        );
+    }
+
+    #[test]
+    fn cop84_example_config_sets_the_cwid_keys_under_station_id() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../coppad.toml.example");
+        let text = std::fs::read_to_string(path).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(value["station_id"]["cwid"].as_str(), Some("host"));
+        assert_eq!(value["station_id"]["cwid_wpm"].as_integer(), Some(20));
+        assert_eq!(value["radio"]["host_rig_control"].as_bool(), Some(false));
+        let config: DaemonConfig = toml::from_str(&text).unwrap();
+        assert_eq!(config.station_id.cwid, CwIdPolicy::Host);
+        assert!(!config.radio.host_rig_control);
     }
 
     #[test]
