@@ -36,7 +36,7 @@ sudo apt-get install -y build-essential pkg-config git curl libasound2-dev libud
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 . "$HOME/.cargo/env"
 git clone https://github.com/HagaleTechnologies/coppa.git && cd coppa
-cargo build --release -p coppa-daemon --features cpal-backend,websocket,gpio-ptt,serial-ptt
+cargo build --release -p coppa-daemon --features cpal-backend,websocket,gpio-ptt,serial-ptt,mdns
 cargo build --release -p coppa-cli --features cpal-backend
 ```
 
@@ -55,6 +55,7 @@ Pick the `coppad` features for the way you will run it:
 | `gpio-ptt` | `ptt_method = "gpio:<pin>"` |
 | `serial-ptt` | `ptt_method = "serial:<port>:<dtr\|rts>"` (needs `libudev-dev`) |
 | `websocket` | The WebSocket JSON API (`[host] websocket_enabled`) |
+| `mdns` | Finding the Pi as `coppad.local` (`[host] mdns_enabled`); turns on `websocket` |
 
 rigctld, VOX and CM108 PTT need no extra feature.
 
@@ -350,6 +351,24 @@ port 8300 and data port 8301. Keep `bind_address = "127.0.0.1"` unless the
 network is trusted. As the example config warns, any other address "exposes
 an UNAUTHENTICATED control plane to the network. Anyone who can reach this
 host could key your transmitter."
+
+Optional, on a trusted, firewalled LAN: to open the operator page from a phone
+or laptop as `coppad.local`, set under `[host]`:
+
+```toml
+bind_address = "0.0.0.0"
+websocket_enabled = true
+websocket_token = "paste the output of openssl rand -hex 32 here"
+websocket_allowed_origins = ["http://coppad.local:8400"]
+mdns_enabled = true
+```
+
+Restart coppad, then open `http://coppad.local:8400/` (or probe
+`http://coppad.local:8400/health`). `bind_address` applies to every listener,
+so with `vara_enabled = true` the VARA-style ports become reachable too. Allow
+UDP port 5353 through any firewall. A Linux client needs nss-mdns to resolve
+`.local` names. See
+[OPERATING.md](../OPERATING.md#monitoring-and-discovery) for the details.
 
 ## 9. Change the configuration
 
