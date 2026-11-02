@@ -75,6 +75,11 @@ pub struct Cli {
     // COP-31: internal. The rigctld address the guardian releases PTT through.
     #[arg(long, hide = true, value_name = "ADDR", requires = "ptt_guardian")]
     pub guardian_rigctld_address: Option<String>,
+
+    // COP-52: internal. `[radio] ptt_invert`, so the guardian releases an
+    // active-low line by driving it high.
+    #[arg(long, hide = true, requires = "ptt_guardian")]
+    pub guardian_ptt_invert: bool,
 }
 
 // Variants carry no doc comments so `--help` keeps the possible values inline.
@@ -128,6 +133,7 @@ pub enum Mode {
     PttGuardian {
         ptt_method: String,
         rigctld_address: String,
+        ptt_invert: bool,
     },
 }
 
@@ -149,6 +155,7 @@ impl Cli {
                     .guardian_rigctld_address
                     .clone()
                     .unwrap_or_else(|| crate::config::RadioConfig::default().rigctld_address),
+                ptt_invert: self.guardian_ptt_invert,
             }
         } else if self.print_default_config {
             Mode::PrintDefaultConfig
@@ -265,6 +272,7 @@ mod tests {
             Mode::PttGuardian {
                 ptt_method: "rigctld".to_string(),
                 rigctld_address: "127.0.0.1:1".to_string(),
+                ptt_invert: false,
             }
         );
         assert_eq!(
@@ -272,8 +280,17 @@ mod tests {
             Mode::PttGuardian {
                 ptt_method: "gpio:17".to_string(),
                 rigctld_address: crate::config::RadioConfig::default().rigctld_address,
+                ptt_invert: false,
             },
             "the address falls back to the [radio] default"
+        );
+        assert_eq!(
+            mode(&["--ptt-guardian", "gpio:17", "--guardian-ptt-invert"]),
+            Mode::PttGuardian {
+                ptt_method: "gpio:17".to_string(),
+                rigctld_address: crate::config::RadioConfig::default().rigctld_address,
+                ptt_invert: true,
+            }
         );
     }
 
@@ -294,6 +311,10 @@ mod tests {
     fn guardian_address_requires_guardian_mode() {
         assert_eq!(
             error_kind(&["--guardian-rigctld-address", "127.0.0.1:1"]),
+            ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            error_kind(&["--guardian-ptt-invert"]),
             ErrorKind::MissingRequiredArgument
         );
     }

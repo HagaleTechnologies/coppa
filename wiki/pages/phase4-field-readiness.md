@@ -61,10 +61,10 @@ a real bug — breaking them will reintroduce that bug.
   without playback progress, or `max_tx_duration_s` cancels and unkeys; no
   hardware/on-air test has validated the timing yet.
 - **PTT is released on every exit path (COP-31).** Four layers: backend
-  `Drop` (rigctld, serial, GPIO), an explicit release at shutdown and at
-  startup, an in-loop backstop on the 500 ms tick, and an out-of-process
-  `coppad --ptt-guardian` for rigctld/GPIO that releases after a SIGKILL or
-  crash. `EventLoop::set_ptt` is the only place the guardian is told about PTT
+  `Drop` (rigctld, serial, GPIO, CM108), an explicit release at shutdown and
+  at startup, an in-loop backstop on the 500 ms tick, and an out-of-process
+  `coppad --ptt-guardian` for rigctld/GPIO/CM108 that releases after a SIGKILL
+  or crash. `EventLoop::set_ptt` is the only place the guardian is told about PTT
   state, so any new direct `self.ptt.set_ptt` call must report to it too, or
   the guardian will miss a key or fire a duplicate release. Exit-path table
   and residuals: `docs/OPERATING.md`, "PTT safety when coppad stops".
@@ -91,12 +91,19 @@ a real bug — breaking them will reintroduce that bug.
 
 ## Configuration gotchas
 
-- PTT config uses extended syntax: `serial:/dev/ttyUSB0:dtr`, `gpio:17`, or
-  the flat `none`/`vox`/`rigctld`. Unrecognized values hard-error at startup —
-  bare `"serial"` is NOT valid. `rigctld` unreachable at startup still falls
-  back to NullPtt, but since COP-32 it logs at ERROR and the daemon logs
-  `Daemon running degraded` instead of `Daemon ready`. There is still no
+- PTT config uses extended syntax: `serial:/dev/ttyUSB0:dtr`, `gpio:17`,
+  `cm108:/dev/hidraw0[:3]` (COP-52), or the flat `none`/`vox`/`rigctld`.
+  Unrecognized values hard-error at startup — bare `"serial"` is NOT valid.
+  `[radio] ptt_invert` flips the line levels for serial, gpio and cm108.
+  `rigctld` unreachable at startup still falls back to NullPtt, but since
+  COP-32 it logs at ERROR and the daemon logs `Daemon running degraded`
+  instead of `Daemon ready`. There is still no
   reconnect, so PTT stays lost for that run.
+- **The guardian must know the line polarity (COP-52).** It reopens the
+  device and writes RX, so it needs `ptt_invert` too, or it "releases" an
+  active-low rig to its keyed level. A CM108 latches its pin until something
+  writes it again, so closing the hidraw file never unkeys the rig; only an
+  RX report does. See `docs/OPERATING.md`, "The PTT guardian".
 - Busy-defer is deliberately independent of callsign (channel courtesy ≠
   identification); station-ID and beacon do gate on callsign.
 - Hardware audio still needs `cpal-backend` (see [[cpal-feature-gate]]), and

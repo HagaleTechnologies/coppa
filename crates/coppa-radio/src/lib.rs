@@ -10,6 +10,7 @@ use anyhow::Result;
 
 pub mod band;
 pub mod null_ptt;
+pub mod ptt_cm108;
 pub mod rigctld;
 pub mod vox_ptt;
 

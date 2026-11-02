@@ -22,6 +22,7 @@ Open-source ham radio digital communications system written in Rust.
 | Operating profiles | Implemented | 48 kHz OFDM profiles with runtime speed-level selection within the configured band |
 | Link adaptation | Implemented, limited calibration | Measurement-driven speed selection and ACK-driven RateLoop with ARQ enabled; no model inference; performance targets remain unmet, see [BENCHMARKS.md](BENCHMARKS.md) |
 | Serial/GPIO PTT | Implemented, feature-gated | Daemon serial DTR/RTS uses `serial-ptt`; Linux sysfs GPIO uses `gpio-ptt` |
+| CM108 PTT | Implemented, no feature flag | Daemon CM108/CM119 HID GPIO PTT (AIOC, Digirig Lite, DRA) through a Linux `/dev/hidraw` node (`ptt_method = "cm108:<hidraw-path>[:<gpio>]"`); tested only against a regular-file stand-in |
 | Service files | Provided, not hardware-verified | systemd unit and macOS launchd agent in `contrib/`; Raspberry Pi 4 install guide in [docs/tutorials/raspberry-pi-install.md](docs/tutorials/raspberry-pi-install.md) |
 | KISS TNC (AFSK 1200) | Implemented, bring-up and testing only | Needs the kiss-tnc and cpal-backend features; not a Direwolf replacement; see [docs/TNC.md](docs/TNC.md) |
 | IR-HARQ | Unwired codec primitive | Redundancy-version and combining support exists in the codec; engine/daemon retransmissions do not wire it into an operational IR-HARQ feature |
@@ -33,7 +34,7 @@ Open-source ham radio digital communications system written in Rust.
 - Nine speed levels using OFDM carrier constellations from BPSK through 64-QAM; levels 1–8 on HF and 1–9 on VHF.
 - NR BG2 LDPC payload coding with shortening, rate matching and interleaving; Golay and CRC-16 header protection, plus per-codeword CRC-32 payload checks.
 - Selective-repeat ARQ and session management, with optional Huffman + LZ4 compression. Connected-session data is always acknowledged and retransmitted; sessionless ARQ is disabled by default.
-- WAV file I/O and live CPAL audio with `cpal-backend`, including exact device IDs, selectable input/output channels, and hardware sample-rate conversion; daemon serial and Linux GPIO PTT with their respective feature flags.
+- WAV file I/O and live CPAL audio with `cpal-backend`, including exact device IDs, selectable input/output channels, and hardware sample-rate conversion; daemon serial and Linux GPIO PTT with their respective feature flags, and Linux CM108 HID PTT with no feature flag.
 - VARA-style TCP command/data interface for host applications, disabled by default and not RF-compatible with VARA.
 - C FFI shared/static library with one-shot encode/decode and streaming decode.
 - Deterministic link adaptation and spectrum sensing. Short-CP recommendation and negotiation are opt-in; IR-HARQ remains an unwired codec primitive.
@@ -120,7 +121,7 @@ ignores KISS TXDELAY, persistence and slot time), no digipeating or beaconing, a
 | `coppa-protocol` | OFDM transceiver, NR BG2 LDPC payload coding, framing, ARQ, compression and session management |
 | `coppa-channel` | Channel models for testing: AWGN, Watterson HF fading, SSB passband filter, frequency, timing and sample-clock offsets, sinusoidal fading |
 | `coppa-audio` | Audio backends: CPAL real-time I/O, WAV file read/write |
-| `coppa-radio` | Radio control: rigctld CAT, serial PTT (DTR/RTS, `serial-ptt` feature), GPIO PTT (Linux sysfs, `gpio-ptt` feature) |
+| `coppa-radio` | Radio control: rigctld CAT, serial PTT (DTR/RTS, `serial-ptt` feature), GPIO PTT (Linux sysfs, `gpio-ptt` feature), CM108 PTT (Linux hidraw, no feature) |
 | `coppa-ml` | Measurement-driven speed selection, RateLoop, CpGate, BusyGate and spectrum sensing |
 | `coppa-engine` | CoppaTransceiver wrapper with compression, squelch and streaming receive |
 | `coppa-host` | Host interfaces: VARA-style TCP control server, WebSocket JSON API, KISS TNC TCP server (`kiss-tnc` feature) |

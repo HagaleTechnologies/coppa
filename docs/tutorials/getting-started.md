@@ -319,7 +319,8 @@ output_channel = 0
 [radio]
 # "none" (default), "vox", "rigctld", or "serial:<port>:<dtr|rts>" /
 # "gpio:<pin>" (Linux only; requires coppad built with --features
-# serial-ptt / gpio-ptt respectively). An unrecognized value is a hard
+# serial-ptt / gpio-ptt respectively), or "cm108:<hidraw-path>[:<gpio>]"
+# (Linux only; no feature needed). An unrecognized value is a hard
 # startup error, not a silent fallback to no PTT.
 ptt_method = "none"
 # Wait this long after decoding a frame before keying (default 500 ms);

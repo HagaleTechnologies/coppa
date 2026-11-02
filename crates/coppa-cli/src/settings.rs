@@ -397,7 +397,7 @@ impl RigSettings {
             Ok(PttConfig::None) => Ok("none"),
             Ok(PttConfig::Vox) => Ok("vox"),
             Ok(PttConfig::Rigctld) => Ok("rigctld"),
-            Ok(PttConfig::Serial { .. } | PttConfig::Gpio { .. }) => anyhow::bail!(
+            Ok(PttConfig::Serial { .. } | PttConfig::Gpio { .. } | PttConfig::Cm108 { .. }) => anyhow::bail!(
                 "PTT method {:?} from {} is coppad-only: coppa tx and coppa tune support \"none\", \"vox\" or \"rigctld\"; pass --ptt to override",
                 self.ptt.value, self.ptt.source),
             Err(error) => anyhow::bail!("PTT method {:?} from {}: {error}", self.ptt.value, self.ptt.source),
@@ -642,6 +642,18 @@ mod tests {
             ..Default::default()
         };
         let layers = Layers::for_test(CliEnv::default(), gpio);
+        assert!(layers
+            .rig(&RigArgs::default())
+            .unwrap()
+            .ptt_method()
+            .unwrap_err()
+            .to_string()
+            .contains("coppad-only"));
+        let cm108 = SharedSettings {
+            ptt_method: Some("cm108:/dev/hidraw0".into()),
+            ..Default::default()
+        };
+        let layers = Layers::for_test(CliEnv::default(), cm108);
         assert!(layers
             .rig(&RigArgs::default())
             .unwrap()

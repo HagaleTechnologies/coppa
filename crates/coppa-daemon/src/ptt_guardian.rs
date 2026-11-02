@@ -1,11 +1,18 @@
 //! COP-31: out-of-process PTT guardian. `coppad` re-spawns itself as
-//! `coppad --ptt-guardian <method> --guardian-rigctld-address <addr>` and
-//! writes one byte per PTT transition to the guardian's stdin: `K` before
-//! keying, `R` after a successful unkey. When stdin reaches EOF (the daemon
-//! exited, however it died) and the last report was `K`, the guardian
-//! releases PTT through its own rigctld connection or GPIO pin. Serial PTT is
-//! excluded: `serialport` opens exclusively and Linux asserts DTR on open,
-//! so a reopen would briefly key the rig it means to release.
+//! `coppad --ptt-guardian <method> --guardian-rigctld-address <addr>
+//! [--guardian-ptt-invert]` and writes one byte per PTT transition to the
+//! guardian's stdin: `K` before keying, `R` after a successful unkey. When
+//! stdin reaches EOF (the daemon exited, however it died) and the last report
+//! was `K`, the guardian releases PTT through its own rigctld connection, GPIO
+//! pin or CM108 hidraw node. Serial PTT is excluded: `serialport` opens
+//! exclusively and Linux asserts DTR on open, so a reopen would briefly key
+//! the rig it means to release.
+//!
+//! COP-52: the guardian is told `[radio] ptt_invert` (`--guardian-ptt-invert`),
+//! because releasing an active-low line means driving it high: a guardian
+//! that assumed active-high would "release" an inverted rig by keying it. A
+//! CM108 latches its pin until the next report, so closing the device never
+//! unkeys it; the guardian must write the RX report.
 //!
 //! The daemon side ([`PttGuardian`]) is told about PTT only from
 //! `EventLoop::set_ptt`, the one place the daemon drives its PTT backend; a
@@ -85,12 +92,14 @@ pub fn watch(
     Outcome::ReleaseFailed(last_err.unwrap_or_else(|| anyhow::anyhow!("no release attempted")))
 }
 
-/// Open a fresh backend for `ptt` and send RX.
+/// Open a fresh backend for `ptt` and send RX. `inverted` is
+/// `[radio] ptt_invert`, so a GPIO or CM108 release drives the line to its
+/// real RX level.
 ///
 /// Deliberately separate from `EventLoop::create_ptt`: that one falls back
 /// to `NullPtt` when rigctld is unreachable, while the guardian must see
 /// that as a failure and retry.
-pub fn release_once(ptt: &PttConfig, rigctld_address: &str) -> anyhow::Result<()> {
+pub fn release_once(ptt: &PttConfig, rigctld_address: &str, inverted: bool) -> anyhow::Result<()> {
     match ptt {
         PttConfig::Rigctld => {
             // Bound TCP establishment per resolved address, as reconnect does.
@@ -107,14 +116,29 @@ pub fn release_once(ptt: &PttConfig, rigctld_address: &str) -> anyhow::Result<()
                 let pin_num: u32 = pin
                     .parse()
                     .map_err(|_| anyhow::anyhow!("invalid GPIO pin {pin:?}"))?;
-                let mut gpio = coppa_radio::ptt_gpio::GpioPtt::open(pin_num, false)?;
+                let mut gpio = coppa_radio::ptt_gpio::GpioPtt::open(pin_num, inverted)?;
                 gpio.set_ptt(PttState::Rx)
             }
             #[cfg(not(all(feature = "gpio-ptt", target_os = "linux")))]
             {
+                let _ = inverted;
                 anyhow::bail!(
                     "GPIO pin {pin}: PTT method 'gpio' requires coppad to be built with \
                      --features gpio-ptt, on Linux"
+                )
+            }
+        }
+        PttConfig::Cm108 { device, gpio } => {
+            #[cfg(target_os = "linux")]
+            {
+                let mut cm108 = coppa_radio::ptt_cm108::Cm108Ptt::open(device, *gpio, inverted)?;
+                cm108.set_ptt(PttState::Rx)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (gpio, inverted);
+                anyhow::bail!(
+                    "CM108 device {device}: PTT method 'cm108' is only available on Linux"
                 )
             }
         }
@@ -123,18 +147,34 @@ pub fn release_once(ptt: &PttConfig, rigctld_address: &str) -> anyhow::Result<()
 }
 
 /// Whether the daemon should run a guardian: `[radio] ptt_guardian` is set
-/// and the backend is a connected rigctld client or a GPIO pin. A rigctld
-/// that was unreachable at startup left `NullPtt`, which has nothing to
-/// guard; serial is excluded (see the module docs).
+/// and the backend is a connected rigctld client, a GPIO pin or a CM108
+/// hidraw node. A rigctld that was unreachable at startup left `NullPtt`,
+/// which has nothing to guard; serial is excluded (see the module docs).
 pub fn ptt_guardian_eligible(radio: &RadioConfig, backend_is_rigctld: bool) -> bool {
     if !radio.ptt_guardian {
         return false;
     }
     match radio.ptt_config() {
         Ok(PttConfig::Rigctld) => backend_is_rigctld,
-        Ok(PttConfig::Gpio { .. }) => true,
+        Ok(PttConfig::Gpio { .. } | PttConfig::Cm108 { .. }) => true,
         _ => false,
     }
+}
+
+/// The arguments `PttGuardian::spawn` starts `coppad` with: the method, the
+/// rigctld address, and `--guardian-ptt-invert` when `[radio] ptt_invert` is
+/// set.
+fn guardian_args(radio: &RadioConfig) -> Vec<String> {
+    let mut args = vec![
+        "--ptt-guardian".to_string(),
+        radio.ptt_method.clone(),
+        "--guardian-rigctld-address".to_string(),
+        radio.rigctld_address.clone(),
+    ];
+    if radio.ptt_invert {
+        args.push("--guardian-ptt-invert".to_string());
+    }
+    args
 }
 
 /// Daemon side of the guardian: the pipe to its stdin, and the child itself.
@@ -150,11 +190,7 @@ impl PttGuardian {
     /// daemon's.
     pub fn spawn(radio: &RadioConfig) -> io::Result<Self> {
         let mut cmd = Command::new(std::env::current_exe()?);
-        cmd.arg("--ptt-guardian")
-            .arg(&radio.ptt_method)
-            .arg("--guardian-rigctld-address")
-            .arg(&radio.rigctld_address)
-            .stdin(Stdio::piped());
+        cmd.args(guardian_args(radio)).stdin(Stdio::piped());
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
         let mut child = cmd.spawn()?;
@@ -357,6 +393,10 @@ mod tests {
             "an unreachable rigctld fell back to NullPtt: nothing to guard"
         );
         assert!(ptt_guardian_eligible(&radio("gpio:17", true), false));
+        assert!(ptt_guardian_eligible(
+            &radio("cm108:/dev/hidraw0", true),
+            false
+        ));
         for method in ["none", "vox", "serial:/dev/ttyUSB0:dtr"] {
             assert!(
                 !ptt_guardian_eligible(&radio(method, true), false),
@@ -365,13 +405,93 @@ mod tests {
         }
         assert!(!ptt_guardian_eligible(&radio("rigctld", false), true));
         assert!(!ptt_guardian_eligible(&radio("gpio:17", false), false));
+        assert!(!ptt_guardian_eligible(
+            &radio("cm108:/dev/hidraw0", false),
+            false
+        ));
+    }
+
+    #[test]
+    fn guardian_args_carry_the_polarity() {
+        let mut radio = RadioConfig {
+            ptt_method: "gpio:17".to_string(),
+            ..RadioConfig::default()
+        };
+        assert_eq!(
+            guardian_args(&radio),
+            [
+                "--ptt-guardian",
+                "gpio:17",
+                "--guardian-rigctld-address",
+                "127.0.0.1:4532"
+            ]
+        );
+        radio.ptt_invert = true;
+        assert_eq!(
+            guardian_args(&radio),
+            [
+                "--ptt-guardian",
+                "gpio:17",
+                "--guardian-rigctld-address",
+                "127.0.0.1:4532",
+                "--guardian-ptt-invert"
+            ]
+        );
     }
 
     #[test]
     fn release_once_refuses_methods_it_does_not_guard() {
-        assert!(release_once(&PttConfig::None, "127.0.0.1:1").is_err());
+        assert!(release_once(&PttConfig::None, "127.0.0.1:1", false).is_err());
         let serial = PttConfig::parse("serial:/dev/ttyUSB0:dtr").unwrap();
-        assert!(release_once(&serial, "127.0.0.1:1").is_err());
+        assert!(release_once(&serial, "127.0.0.1:1", false).is_err());
+    }
+
+    /// A regular file standing in for `/dev/hidrawN`, holding `contents`.
+    #[cfg(target_os = "linux")]
+    fn cm108_stand_in(name: &str, contents: [u8; 5]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "coppa-guardian-cm108-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn release_once_writes_the_cm108_rx_report() {
+        for (inverted, keyed, released) in [
+            (false, [0, 0, 4, 4, 0], [0, 0, 0, 4, 0]),
+            (true, [0, 0, 0, 4, 0], [0, 0, 4, 4, 0]),
+        ] {
+            let path = cm108_stand_in(&format!("release-{inverted}"), keyed);
+            let ptt = PttConfig::Cm108 {
+                device: path.to_str().unwrap().to_string(),
+                gpio: 3,
+            };
+            release_once(&ptt, "", inverted).unwrap();
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                released,
+                "inverted = {inverted}"
+            );
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn release_once_fails_for_a_missing_cm108_device() {
+        let path = std::env::temp_dir().join(format!(
+            "coppa-guardian-cm108-{}-missing",
+            std::process::id()
+        ));
+        let ptt = PttConfig::Cm108 {
+            device: path.to_str().unwrap().to_string(),
+            gpio: 3,
+        };
+        assert!(release_once(&ptt, "", false).is_err());
+        assert!(!path.exists(), "the guardian never creates the node");
     }
 
     #[cfg(target_os = "linux")]
@@ -400,7 +520,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            tx.send(release_once(&PttConfig::Rigctld, &addr.to_string()))
+            tx.send(release_once(&PttConfig::Rigctld, &addr.to_string(), false))
                 .unwrap();
         });
         let result = rx.recv_timeout(Duration::from_secs(3));
