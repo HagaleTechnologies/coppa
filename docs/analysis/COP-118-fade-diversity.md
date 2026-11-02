@@ -11,9 +11,10 @@ code over GF(256), applied across six NR-coded level-2 packets and sent as twelv
 per ARQ segment. The receiver rebuilds the segment from any six packets that pass CRC.
 
 On the adapted CCIR-Moderate session bench it completed **5/5** ten-minute sessions at a mean
-**1579.3 bytes/min**. The matched control completed 1/5 at 709.4 bytes/min. Frequency repetition
-completed 2/5 at 465.9 bytes/min. On Poor the outer code also completed 5/5, at 1107.0 bytes/min.
-Frequency repetition completed 3/5 there and the matched control 0/5.
+**1579.3 bytes/min**. The matched control completed 1/5 at 709.4 bytes/min. Frequency repetition,
+at the control's mean transmit power, completed 3/5 at 625.1 bytes/min. On Poor the outer code also
+completed 5/5, at 1107.0 bytes/min. Frequency repetition completed 4/5 there (3/5 in an equivalent
+run, see "Measured limits") and the matched control 0/5.
 
 The price of the outer code:
 
@@ -30,11 +31,15 @@ The ten-minute target is met here only in simulation: five deterministic trials 
 ACK reception, and the adapted harness described below. A 5/5 result is a feasibility signal for
 building this mechanism. It is not a reliability guarantee, and no RF trial was run.
 
-Frequency repetition is not recommended. On Moderate it kept 2/5 sessions up and cost 34.3%
-throughput against the matched control. It protects only the payload. The preamble and header are
-sent as before, and on Moderate sync or header failures took 22-30% of its decoded packets, more
-than its 14-18% payload failures. On Good its payload failures all but vanished, yet one session
-still dropped on sync and header losses. The result settles this variant only, not every
+Frequency repetition is not recommended. At the control's mean transmit power it kept 3/5
+Moderate sessions up and cost 11.9% throughput against the matched control. An equivalent way of
+setting that power gave 4/5 at a 5.8% cost (see "Measured limits"), so its Moderate survival is
+3/5 to 4/5, below the outer code's 5/5 either way. Held to the control's peak instead, as a
+peak-limited transmitter would hold it, its mean power is 1.10 dB lower and it kept 2/5 at a 34.3%
+cost. It protects only the payload. The preamble and header are sent as before, and on Moderate
+sync or header failures took 16-26% of its decoded packets, about as many as its 15-21% payload
+failures. On Good its payload failures all but vanished, yet sync or header failures still took
+12-22% of its decoded packets. The result settles this variant only, not every
 frequency-diversity design. The same caveat applies to the outer code: it is one long-codeword
 design, not an enlarged NR LDPC graph.
 
@@ -44,21 +49,30 @@ Two experiments, kept apart:
 
 1. **Original control.** `cargo run --release -p coppa-bench --example session`, unchanged. It
    reproduces the ticket's 0/5 Moderate and 0/5 Poor result.
-2. **Adapted comparison.** A scratch crate (source in the appendix) that runs three arms on one
-   harness:
+2. **Adapted comparison.** A scratch crate (source in the appendix) that runs four arms on one
+   harness: the three compared below and one power-sensitivity variant of the frequency arm:
    - `matched-control`: a logical block of six level-2 packets. The block is complete only when all
      six decode.
    - `freq-rep2`: the same six packets. Coded symbol `k` of 1944 goes into OFDM symbol `k / 22`,
      on data slot `k % 22` and again on data slot `k % 22 + 22` of that symbol's 44 data slots.
-     `insert_pilots` places the 4 pilots, so the pair is 22 to 26 carriers apart, 1100-1300 Hz,
-     nominally 1200 Hz: half the 48-carrier, 50 Hz-spaced active band. The payload takes 89 OFDM
+     `insert_pilots` places 4 pilots 12 carriers apart, offset by 6 on odd symbols, and fills the
+     data slots in ascending carrier order. Slots `j` and `j + 22` therefore span exactly two pilot
+     periods, so every pair is 24 carriers (1200 Hz) apart in every OFDM symbol: half the
+     48-carrier, 50 Hz-spaced active band. The `REPLICA` line below measures this from the modem's
+     pilot layout over all 89 symbols. The payload takes 89 OFDM
      symbols instead of 45. In the last one only slots 0-7 and 22-29 carry data, and the rest are
      padded with +1 as `modulate_mapped` pads. The header says `codewords: 2`, so the unchanged
      demodulator returns both copies. The receiver combines each pair by maximum-ratio combining
      with its own per-carrier noise estimates, before NR decoding. For BPSK this equals adding the
-     two LLRs. Power: `modulate_mapped` clips every arm's frame to the same PAPR target and scales it to
-     the same peak, so each carrier carries about the same power as in the control. The repeated
-     symbols cost airtime, not extra power.
+     two LLRs. Power: `modulate_mapped` clips every arm's frame to the same PAPR target and scales it
+     to the same peak. The repeated frame has a higher peak-to-average ratio, so at that peak its
+     mean packet power is 1.10 dB below the control's. The plan holds total transmit power equal,
+     so `freq-rep2` multiplies every frame by one fixed gain that brings its mean packet power to
+     the control's (the `POWER` lines). Its peak is then 1.10 dB above the control's. The repeated
+     symbols cost airtime, not extra mean power.
+   - `freq-rep2-peak`: `freq-rep2` without that gain, at the control's peak and 1.10 dB below its
+     mean power. It shows what the arm does on a peak-limited transmitter. It is a sensitivity row,
+     not one of the compared candidates, and takes no part in the selection rule.
    - `outer-rs12-6`: the six chunks plus six RS parity chunks, sent as twelve ordinary NR-protected
      packets. The block is complete from any six CRC-valid packets.
 
@@ -68,7 +82,7 @@ stripe independent codewords.
 
 ## Harness
 
-Unchanged from `crates/coppa-bench/examples/session.rs`, in all three arms:
+Unchanged from `crates/coppa-bench/examples/session.rs`, in all four arms:
 
 - Speed level 2 (BPSK, NR BG2 rate 1/2) and ARQ window 8.
 - The real `ArqTx`/`ArqRx` state machines with a five-retransmit budget. A session drops when
@@ -77,7 +91,7 @@ Unchanged from `crates/coppa-bench/examples/session.rs`, in all three arms:
   charged one level-2 frame of airtime plus two turnarounds.
 - Seeds `0x5E55_1000 ^ (preset << 16) ^ trial`, as in `session.rs`.
 
-Changed for the comparison, in all three arms alike:
+Changed for the comparison, in all four arms alike:
 
 - **Channel.** Each trial has one continuous Watterson realization. Both tap-gain traces come from
   `coppa_channel::watterson::watterson_with_gains`, run once at 100 Hz over 900 s, with seed
@@ -100,7 +114,7 @@ Changed for the comparison, in all three arms alike:
   ACKs every frame.
 - **RTO.** The initial RTO uses the `arq::rto_floor` formula with the arm's block airtime in place
   of one frame's: `8 x block + 2 x 0.15 s + ACK`. That is capped at the ARQ's 60 s backoff ceiling,
-  and the cap applies to all three arms. The floor inside `ArqTx` is still the frame-based one.
+  and the cap applies to all four arms. The floor inside `ArqTx` is still the frame-based one.
   Backoff and retry budget are unchanged.
 - **Receiver.** Every arm uses the same chain: the HF 601-tap RX bandpass, then
   `CoppaModem::demodulate_frame`, then soft demap, deinterleave, rate dematch at RV0, pad pinning,
@@ -119,15 +133,17 @@ therefore divide by packets actually decoded (`decodes`), not by packets sent.
 All passed before the measurement, in the same run:
 
 ```text
-CHECK clean exact-byte recovery: PASS (3 packets x 3 arms)
+CHECK clean exact-byte recovery: PASS (3 packets x 4 arms)
 CHECK replica alignment: PASS (1944 coded symbols, 3916 demodulated symbols)
 CHECK combining with one replica erased: PASS
 CHECK RS(12,6): PASS (924 six-packet subsets exact, five-packet sets refused)
 CHECK identity channel: PASS (max abs error 4.47e-7)
 CHECK bare-frame symbols: 1936 bare vs 1980 with a 1200-sample tail (1944 needed)
 PROFILE fft 960 cp 300 spacing 50.000 Hz, active carriers 48, data/OFDM symbol 44, replica separation ~1200 Hz (half the active band)
+REPLICA separation 24..=24 carriers, 1200..=1200 Hz, over 89 OFDM symbols x 22 slot pairs
 ARM matched-control: 6 packets/block, packet 1.365 s, block 8.190 s, block bytes 678, initial RTO 60.0 s
 ARM freq-rep2: 6 packets/block, packet 2.520 s, block 15.120 s, block bytes 678, initial RTO 60.0 s
+ARM freq-rep2-peak: 6 packets/block, packet 2.520 s, block 15.120 s, block bytes 678, initial RTO 60.0 s
 ARM outer-rs12-6: 12 packets/block, packet 1.365 s, block 16.380 s, block bytes 678, initial RTO 60.0 s
 PRESET good: delay 0.5 ms, sigma 0.05 Hz, |rho_f(sep)| = 0.31, rho_t(1 s) 0.952, rho_t(5 s) 0.291
 TRACE good: mean tap power 0.958 (expect 1.000); autocorrelation | 0.5s 0.987 vs 0.988 | 1s 0.951 vs 0.952 | 2s 0.816 vs 0.821 | 5s 0.278 vs 0.291
@@ -136,11 +152,16 @@ TRACE moderate: mean tap power 0.982 (expect 1.000); autocorrelation | 0.5s 0.73
 PRESET poor: delay 2.0 ms, sigma 0.50 Hz, |rho_f(sep)| = 0.31, rho_t(1 s) 0.007, rho_t(5 s) 0.000
 TRACE poor: mean tap power 0.992 (expect 1.000); autocorrelation | 0.5s 0.284 vs 0.291 | 1s -0.002 vs 0.007 | 2s -0.001 vs 0.000 | 5s -0.002 vs 0.000
 PREF 2.222894e-2
-POWER freq-rep2: mean packet power 1.725312e-2 (-1.10 dB vs control)
-POWER outer-rs12-6: mean packet power 2.222894e-2 (+0.00 dB vs control)
+POWER freq-rep2: mean packet power 2.222890e-2 (-0.00 dB vs control), peak +1.10 dB vs control
+POWER freq-rep2-peak: mean packet power 1.725312e-2 (-1.10 dB vs control), peak +0.00 dB vs control
+POWER outer-rs12-6: mean packet power 2.222894e-2 (+0.00 dB vs control), peak +0.00 dB vs control
 ```
 
-The `TRACE` lines average 20 traces over 600 s each. Ensemble tap power is within 4.2% of 1, and
+The `REPLICA` line takes the modem's own pilot layout (`CoppaPilotPattern` with 48 active carriers
+and 4 pilots) and measures the carrier distance of all 22 slot pairs in all 89 payload symbols. The
+`POWER` lines measure one packet per arm against the control's: `freq-rep2` matches the control's
+mean power with a 1.10 dB higher peak, and `freq-rep2-peak` matches its peak with a 1.10 dB lower
+mean. The `TRACE` lines average 20 traces over 600 s each. Ensemble tap power is within 4.2% of 1, and
 the measured autocorrelation follows the generator's Gaussian-Doppler form
 `exp(-2 pi^2 sigma^2 tau^2)`. Linear interpolation between 10 ms points is far finer than any
 preset's fade rate.
@@ -180,13 +201,16 @@ block across the five trials.
 | Preset | Mechanism | Survival | Mean bytes/min | Throughput cost | Median latency | Max latency |
 |---|---|---|---|---|---|---|
 | Good | matched-control | 5/5 | 2360.7 | 0% | 26.2 s | 279.7 s |
-| Good | freq-rep2 | 4/5 | 1333.6 | 43.5% | 31.9 s | 294.4 s |
+| Good | freq-rep2 | 5/5 | 1634.1 | 30.8% | 15.1 s | 251.9 s |
+| Good | freq-rep2-peak | 4/5 | 1333.6 | 43.5% | 31.9 s | 294.4 s |
 | Good | outer-rs12-6 | 5/5 | 1924.2 | 18.5% | 16.4 s | 150.8 s |
 | **Moderate** | matched-control | 1/5 | 709.4 | 0% | 190.9 s | 297.1 s |
-| **Moderate** | freq-rep2 | 2/5 | 465.9 | 34.3% | 97.4 s | 433.4 s |
+| **Moderate** | freq-rep2 | 3/5 | 625.1 | 11.9% | 203.2 s | 371.2 s |
+| **Moderate** | freq-rep2-peak | 2/5 | 465.9 | 34.3% | 97.4 s | 433.4 s |
 | **Moderate** | outer-rs12-6 | **5/5** | **1579.3** | **-122.6%** | 16.4 s | 267.1 s |
 | Poor | matched-control | 0/5 | 115.0 | 0% | 139.9 s | 148.1 s |
-| Poor | freq-rep2 | 3/5 | 440.3 | -283.0% | 246.9 s | 415.9 s |
+| Poor | freq-rep2 | 4/5 | 634.2 | -451.7% | 266.4 s | 415.9 s |
+| Poor | freq-rep2-peak | 3/5 | 440.3 | -283.0% | 246.9 s | 415.9 s |
 | Poor | outer-rs12-6 | 5/5 | 1107.0 | -862.9% | 101.6 s | 388.4 s |
 
 Clean channel, no fading and no noise, one 600 s session per arm. These rows separate coding and
@@ -196,6 +220,7 @@ airtime overhead from loss:
 |---|---|---|---|---|
 | matched-control | 4127.9 | 0% | 601.2 s / 41358 B = 14.54 ms | 1.00x |
 | freq-rep2 | 2423.6 | 41.3% | 604.3 s / 24408 B = 24.76 ms | 1.70x |
+| freq-rep2-peak | 2423.6 | 41.3% | 604.3 s / 24408 B = 24.76 ms | 1.70x |
 | outer-rs12-6 | 2254.4 | 45.4% | 613.5 s / 23052 B = 26.61 ms | 1.83x |
 
 The adapted matched control is not the original bench. It completes 5/5 Good sessions where the
@@ -231,21 +256,37 @@ ARQ step, as in `session.rs`, and the overshoot is in `elapsed`.
 | matched-control | poor | 3 | `0x5e571003` | DROPPED | 297.4 | 0 | 0.0 | 0 | 26/156 | 87 | 212.9/8.2/1.8 | n/a | 11/30 | 2/6 | 60.0 |
 | matched-control | poor | 4 | `0x5e571004` | DROPPED | 311.7 | 0 | 0.0 | 0 | 29/174 | 83 | 237.5/5.5/1.2 | n/a | 18/23 | 4/6 | 60.0 |
 | freq-rep2 | clean | 0 | `0x5e551000` | completed | 604.3 | 24408 | 2423.6 | 36 | 36/216 | 216 | 544.3/49.1/10.8 | 15.1 / 15.1 | 0/0 | 0/0 | 16.8 |
-| freq-rep2 | good | 0 | `0x5e551000` | completed | 612.9 | 15594 | 1526.7 | 23 | 38/228 | 174 | 574.6/31.4/6.9 | 31.9 / 283.8 | 36/0 | 0/0 | 17.2 |
-| freq-rep2 | good | 1 | `0x5e551001` | completed | 614.5 | 16272 | 1588.8 | 24 | 38/228 | 190 | 574.6/32.8/7.2 | 15.1 / 233.5 | 46/0 | 0/0 | 17.2 |
-| freq-rep2 | good | 2 | `0x5e551002` | completed | 609.5 | 14238 | 1401.6 | 21 | 38/228 | 164 | 574.6/28.7/6.3 | 62.1 / 250.2 | 37/1 | 0/0 | 18.2 |
-| freq-rep2 | good | 3 | `0x5e551003` | completed | 609.5 | 14238 | 1401.6 | 21 | 38/228 | 159 | 574.6/28.7/6.3 | 78.9 / 231.8 | 33/0 | 0/0 | 18.2 |
-| freq-rep2 | good | 4 | `0x5e551004` | DROPPED | 542.9 | 6780 | 749.3 | 10 | 34/204 | 136 | 514.1/23.2/5.1 | 15.1 / 294.4 | 29/0 | 1/6 | 40.3 |
-| freq-rep2 | moderate | 0 | `0x5e541000` | completed | 643.2 | 7458 | 695.7 | 11 | 41/246 | 150 | 619.9/19.1/4.2 | 97.4 / 433.4 | 33/24 | 2/3 | 60.0 |
-| freq-rep2 | moderate | 1 | `0x5e541001` | completed | 623.1 | 7458 | 718.1 | 11 | 40/240 | 150 | 604.8/15.0/3.3 | 245.2 / 339.3 | 33/26 | 5/3 | 60.0 |
-| freq-rep2 | moderate | 2 | `0x5e541002` | DROPPED | 495.3 | 2034 | 246.4 | 3 | 32/192 | 115 | 483.8/8.2/1.8 | 77.3 / 77.3 | 34/21 | 5/6 | 60.0 |
-| freq-rep2 | moderate | 3 | `0x5e541003` | DROPPED | 493.8 | 2712 | 329.5 | 4 | 32/192 | 114 | 483.8/8.2/1.8 | 94.0 / 110.8 | 32/18 | 6/6 | 60.0 |
-| freq-rep2 | moderate | 4 | `0x5e541004` | DROPPED | 479.2 | 2712 | 339.6 | 4 | 31/186 | 112 | 468.7/8.2/1.8 | 142.7 / 157.9 | 33/16 | 6/6 | 60.0 |
-| freq-rep2 | poor | 0 | `0x5e571000` | completed | 622.5 | 4746 | 457.5 | 7 | 40/240 | 129 | 604.8/13.7/3.0 | 385.7 / 415.9 | 33/27 | 2/4 | 60.0 |
-| freq-rep2 | poor | 1 | `0x5e571001` | completed | 613.0 | 7458 | 730.0 | 11 | 39/234 | 146 | 589.7/19.1/4.2 | 233.5 / 309.1 | 36/21 | 1/3 | 60.0 |
-| freq-rep2 | poor | 2 | `0x5e571002` | DROPPED | 359.1 | 0 | 0.0 | 0 | 23/138 | 83 | 347.8/6.8/1.5 | n/a | 22/19 | 3/6 | 60.0 |
-| freq-rep2 | poor | 3 | `0x5e571003` | completed | 613.0 | 9492 | 929.1 | 14 | 39/234 | 138 | 589.7/19.1/4.2 | 233.5 / 325.8 | 31/23 | 0/0 | 60.0 |
-| freq-rep2 | poor | 4 | `0x5e571004` | DROPPED | 479.0 | 678 | 84.9 | 1 | 31/186 | 105 | 468.7/6.8/1.5 | 75.6 / 75.6 | 35/21 | 4/6 | 60.0 |
+| freq-rep2 | good | 0 | `0x5e551000` | completed | 601.1 | 16950 | 1692.0 | 25 | 37/222 | 184 | 559.4/34.1/7.5 | 15.1 / 161.2 | 34/0 | 0/0 | 17.0 |
+| freq-rep2 | good | 1 | `0x5e551001` | completed | 614.5 | 16272 | 1588.8 | 24 | 38/228 | 185 | 574.6/32.8/7.2 | 15.1 / 216.7 | 41/0 | 0/0 | 17.2 |
+| freq-rep2 | good | 2 | `0x5e551002` | completed | 616.2 | 16950 | 1650.5 | 25 | 38/228 | 172 | 574.6/34.1/7.5 | 15.1 / 251.9 | 20/2 | 0/0 | 17.0 |
+| freq-rep2 | good | 3 | `0x5e551003` | completed | 614.5 | 16272 | 1588.8 | 24 | 38/228 | 168 | 574.6/32.8/7.2 | 31.9 / 186.4 | 24/0 | 0/0 | 17.2 |
+| freq-rep2 | good | 4 | `0x5e551004` | completed | 616.2 | 16950 | 1650.5 | 25 | 38/228 | 174 | 574.6/34.1/7.5 | 15.1 / 235.1 | 24/0 | 0/0 | 17.2 |
+| freq-rep2 | moderate | 0 | `0x5e541000` | completed | 629.8 | 8136 | 775.1 | 12 | 40/240 | 143 | 604.8/20.5/4.5 | 287.3 / 354.4 | 27/21 | 1/3 | 60.0 |
+| freq-rep2 | moderate | 1 | `0x5e541001` | completed | 628.1 | 9492 | 906.7 | 14 | 40/240 | 150 | 604.8/19.1/4.2 | 273.8 / 344.3 | 24/29 | 3/2 | 60.0 |
+| freq-rep2 | moderate | 2 | `0x5e541002` | DROPPED | 610.2 | 4068 | 400.0 | 6 | 39/234 | 131 | 589.7/16.4/3.6 | 276.0 / 339.8 | 26/23 | 2/6 | 60.0 |
+| freq-rep2 | moderate | 3 | `0x5e541003` | DROPPED | 510.4 | 2712 | 318.8 | 4 | 33/198 | 126 | 499.0/8.2/1.8 | 94.0 / 110.8 | 33/27 | 6/6 | 60.0 |
+| freq-rep2 | moderate | 4 | `0x5e541004` | completed | 673.5 | 8136 | 724.8 | 12 | 43/258 | 150 | 650.2/19.1/4.2 | 203.2 / 371.2 | 27/31 | 2/3 | 60.0 |
+| freq-rep2 | poor | 0 | `0x5e571000` | completed | 622.5 | 4068 | 392.1 | 6 | 40/240 | 125 | 604.8/13.7/3.0 | 385.7 / 415.9 | 27/28 | 2/5 | 60.0 |
+| freq-rep2 | poor | 1 | `0x5e571001` | completed | 660.5 | 9492 | 862.2 | 14 | 42/252 | 154 | 635.0/20.5/4.5 | 262.5 / 324.7 | 30/29 | 1/2 | 60.0 |
+| freq-rep2 | poor | 2 | `0x5e571002` | DROPPED | 524.1 | 3390 | 388.1 | 5 | 34/204 | 126 | 514.1/8.2/1.8 | 157.9 / 188.1 | 34/22 | 7/6 | 60.0 |
+| freq-rep2 | poor | 3 | `0x5e571003` | completed | 613.0 | 9492 | 929.1 | 14 | 39/234 | 142 | 589.7/19.1/4.2 | 233.5 / 327.5 | 30/23 | 1/1 | 60.0 |
+| freq-rep2 | poor | 4 | `0x5e571004` | completed | 610.7 | 6102 | 599.5 | 9 | 39/234 | 136 | 589.7/16.4/3.6 | 311.7 / 373.9 | 29/25 | 2/3 | 60.0 |
+| freq-rep2-peak | clean | 0 | `0x5e551000` | completed | 604.3 | 24408 | 2423.6 | 36 | 36/216 | 216 | 544.3/49.1/10.8 | 15.1 / 15.1 | 0/0 | 0/0 | 16.8 |
+| freq-rep2-peak | good | 0 | `0x5e551000` | completed | 612.9 | 15594 | 1526.7 | 23 | 38/228 | 174 | 574.6/31.4/6.9 | 31.9 / 283.8 | 36/0 | 0/0 | 17.2 |
+| freq-rep2-peak | good | 1 | `0x5e551001` | completed | 614.5 | 16272 | 1588.8 | 24 | 38/228 | 190 | 574.6/32.8/7.2 | 15.1 / 233.5 | 46/0 | 0/0 | 17.2 |
+| freq-rep2-peak | good | 2 | `0x5e551002` | completed | 609.5 | 14238 | 1401.6 | 21 | 38/228 | 164 | 574.6/28.7/6.3 | 62.1 / 250.2 | 37/1 | 0/0 | 18.2 |
+| freq-rep2-peak | good | 3 | `0x5e551003` | completed | 609.5 | 14238 | 1401.6 | 21 | 38/228 | 159 | 574.6/28.7/6.3 | 78.9 / 231.8 | 33/0 | 0/0 | 18.2 |
+| freq-rep2-peak | good | 4 | `0x5e551004` | DROPPED | 542.9 | 6780 | 749.3 | 10 | 34/204 | 136 | 514.1/23.2/5.1 | 15.1 / 294.4 | 29/0 | 1/6 | 40.3 |
+| freq-rep2-peak | moderate | 0 | `0x5e541000` | completed | 643.2 | 7458 | 695.7 | 11 | 41/246 | 150 | 619.9/19.1/4.2 | 97.4 / 433.4 | 33/24 | 2/3 | 60.0 |
+| freq-rep2-peak | moderate | 1 | `0x5e541001` | completed | 623.1 | 7458 | 718.1 | 11 | 40/240 | 150 | 604.8/15.0/3.3 | 245.2 / 339.3 | 33/26 | 5/3 | 60.0 |
+| freq-rep2-peak | moderate | 2 | `0x5e541002` | DROPPED | 495.3 | 2034 | 246.4 | 3 | 32/192 | 115 | 483.8/8.2/1.8 | 77.3 / 77.3 | 34/21 | 5/6 | 60.0 |
+| freq-rep2-peak | moderate | 3 | `0x5e541003` | DROPPED | 493.8 | 2712 | 329.5 | 4 | 32/192 | 114 | 483.8/8.2/1.8 | 94.0 / 110.8 | 32/18 | 6/6 | 60.0 |
+| freq-rep2-peak | moderate | 4 | `0x5e541004` | DROPPED | 479.2 | 2712 | 339.6 | 4 | 31/186 | 112 | 468.7/8.2/1.8 | 142.7 / 157.9 | 33/16 | 6/6 | 60.0 |
+| freq-rep2-peak | poor | 0 | `0x5e571000` | completed | 622.5 | 4746 | 457.5 | 7 | 40/240 | 129 | 604.8/13.7/3.0 | 385.7 / 415.9 | 33/27 | 2/4 | 60.0 |
+| freq-rep2-peak | poor | 1 | `0x5e571001` | completed | 613.0 | 7458 | 730.0 | 11 | 39/234 | 146 | 589.7/19.1/4.2 | 233.5 / 309.1 | 36/21 | 1/3 | 60.0 |
+| freq-rep2-peak | poor | 2 | `0x5e571002` | DROPPED | 359.1 | 0 | 0.0 | 0 | 23/138 | 83 | 347.8/6.8/1.5 | n/a | 22/19 | 3/6 | 60.0 |
+| freq-rep2-peak | poor | 3 | `0x5e571003` | completed | 613.0 | 9492 | 929.1 | 14 | 39/234 | 138 | 589.7/19.1/4.2 | 233.5 / 325.8 | 31/23 | 0/0 | 60.0 |
+| freq-rep2-peak | poor | 4 | `0x5e571004` | DROPPED | 479.0 | 678 | 84.9 | 1 | 31/186 | 105 | 468.7/6.8/1.5 | 75.6 / 75.6 | 35/21 | 4/6 | 60.0 |
 | outer-rs12-6 | clean | 0 | `0x5e551000` | completed | 613.5 | 23052 | 2254.4 | 34 | 34/408 | 408 | 556.9/46.4/10.2 | 16.4 / 16.4 | 0/0 | 0/0 | 18.0 |
 | outer-rs12-6 | good | 0 | `0x5e551000` | completed | 603.5 | 18984 | 1887.3 | 28 | 34/408 | 386 | 556.9/38.2/8.4 | 16.4 / 134.4 | 81/12 | 0/0 | 18.1 |
 | outer-rs12-6 | good | 1 | `0x5e551001` | completed | 601.9 | 18306 | 1824.9 | 27 | 34/408 | 387 | 556.9/36.9/8.1 | 16.4 / 150.8 | 80/19 | 0/0 | 18.1 |
@@ -273,19 +314,21 @@ stops early.
   to sync or header failure and 26-28% to payload failure. The receiver keeps good packets across
   attempts, but at that loss rate some blocks still miss a packet on six sends in a row, and four
   of five sessions dropped that way.
-- **Repetition cuts payload loss but not sync or header loss.** On Moderate its payload failures
-  fell to 14-18% of decoded packets, while sync or header failures were 22-30%. The preamble and
-  header are not repeated, and a block still needs all six packets. Three things in this variant
-  work against it, and the run does not separate them:
+- **Repetition cuts payload loss but not sync or header loss.** On Moderate, at equal mean power,
+  its payload failures fell to 15-21% of decoded packets from the control's 26-28%, while its sync
+  or header failures were 16-26%, much like the control's 13-27%. The preamble and header are not
+  repeated, and a block still needs all six packets. Two things in this variant work against it,
+  and the run does not separate them:
   - Its frames are 1.85x longer (2.52 s), so the channel estimate from the preamble ages more
     across the payload at Moderate's Doppler.
-  - Its mean packet power is 1.10 dB below the control's, because the same PAPR clip and peak
-    scaling act on a signal with a higher peak-to-average ratio. The noise reference is the
-    control's power, so it ran at about 1.1 dB lower SNR.
-  - Its replica pairs are 1100-1300 Hz apart. On Moderate's 1 ms two-tap channel the model gives a
-    complex-gain correlation of 0.59 to 0.95 across that range (0.81 at 1200 Hz, about 0.65 in
-    power), so a deep fade often hits both copies. This is computed from the channel model, not
-    measured. On Poor, where the 2 ms delay gives 0.31 at 1200 Hz, repetition kept 3/5 up.
+  - Its replica pairs are exactly 1200 Hz apart. On Moderate's 1 ms two-tap channel the model
+    gives a complex-gain correlation of 0.81 at that separation (about 0.65 in power), so a deep
+    fade often hits both copies. This is computed from the channel model, not measured. On Poor,
+    where the 2 ms delay gives 0.31, repetition kept 3/5 to 4/5 up.
+- **Holding the peak instead costs repetition one or two more Moderate sessions.**
+  `freq-rep2-peak` runs 1.10 dB below the control's mean power and kept 2/5 Moderate sessions,
+  against 3/5 to 4/5 at equal mean power. Its sync or header
+  failures rose to 22-30% of decoded packets, above its 14-18% payload failures.
 - **The outer code absorbs lost packets of either kind.** A packet lost to sync, header or payload
   failure is an erasure, and any six of twelve rebuild the block. On Moderate it lost 49-53% of
   decoded packets, having run through the whole trough, and still rebuilt 22-26 blocks per trial
@@ -296,15 +339,17 @@ stops early.
 
 The rule fixed in the plan, applied in order:
 
-1. **Moderate session survival.** outer-rs12-6 5/5, freq-rep2 2/5, matched control 1/5. The
+1. **Moderate session survival.** outer-rs12-6 5/5, freq-rep2 3/5, matched control 1/5. The
    outer code wins.
-2. **Matched Moderate net goodput.** outer-rs12-6 1579.3, matched control 709.4, freq-rep2 465.9
+2. **Matched Moderate net goodput.** outer-rs12-6 1579.3, matched control 709.4, freq-rep2 625.1
    bytes/min. Not needed to break a tie, and it agrees.
 3. **Clean-channel airtime cost.** freq-rep2 1.70x and outer-rs12-6 1.83x the control. The outer
    code is 7.5% dearer per clean-channel byte than repetition. This is the one criterion it loses,
    and the rule ranks it last.
 
-Poor, the stress check, agrees: 5/5 against 3/5. Good, the regression diagnostic, shows the
+The order does not change with the frequency arm's power setting: `freq-rep2-peak` kept 2/5 at
+465.9 bytes/min, and the noise-referenced variant in "Measured limits" kept 4/5 at 668.0. Poor, the
+stress check, agrees: 5/5 against 3/5 to 4/5. Good, the regression diagnostic, shows the
 outer code costing 18.5% throughput against the matched control, with no survival loss (5/5). The
 selected variant is `outer-rs12-6` exactly as specified in the appendix: RS(12,6) over GF(256)
 with polynomial 0x11d and a systematic Cauchy generator `C[j][i] = 1 / ((6 + j) xor i)`. It runs
@@ -336,7 +381,21 @@ twelve-packet block.
   cannot drop before 600 s, in any arm and in the original bench. The `pending` column shows how
   close each completed session was. The outer code's completed sessions ended with no block past
   its first send. The control's one completed Moderate session ended with three blocks pending,
-  the worst on its third send, and repetition's two ended with two and five, also at most three.
+  the worst on its third send. Repetition's three completed Moderate sessions ended with one to
+  three blocks pending, at most on their third send, but one of its completed Poor sessions had a
+  block on its fifth send. `freq-rep2-peak`'s two completed Moderate sessions ended with two and
+  five, also at most on the third send.
+- **One session either way is within the bench's sensitivity.** Raising `freq-rep2`'s signal by
+  1.10 dB (the appendix) and lowering the noise reference by 1.10 dB instead give every packet the
+  same SNR. The second runs `freq-rep2-peak` with the noise reference set to its own mean packet
+  power (1.725312e-2) instead of the control's (Reproduce step 3). It gave Moderate 4/5 at 668.0
+  bytes/min (a 5.8% cost), Good 5/5 at 1613.4 and Poor 3/5 at 460.8. Moderate trials 0 and 1
+  match the appendix run exactly. Moderate trial 2 differs by one sync or header failure and still
+  drops at 610.2 s. Moderate trials 3 and 4 and Poor trial 1 end differently. The receive chain is
+  not exactly invariant to scaling its input, and one packet decision that flips changes the
+  timing, channel and noise of every later packet in that session. So read repetition's survival
+  as 3/5 to 4/5 on both Moderate and Poor, and the outer code's Moderate margin over it as one or
+  two sessions in five.
 - **Packets are received in isolation.** Each packet passes through the channel on its own buffer
   with a silent tail. The delayed tap's echo of the previous packet's last samples is dropped, and
   the tail holds noise where the next packet's preamble would really be. Packets inside a block
@@ -359,11 +418,18 @@ twelve-packet block.
 2. Comparison: place the two appendix files in a directory `cop118-proto/` next to a checkout
    named `coppa` (or edit the paths in `Cargo.toml`). Copy the checkout's `Cargo.lock` into it,
    then run `cargo run --release --offline` inside `cop118-proto/`. The crate declares an empty
-   `[workspace]`, so it is not a member of the coppa workspace. It runs all 48 sessions on
-   parallel threads: three arms, three presets, five trials, and one clean session per arm. That
-   took 5 min 6 s wall time here. It prints the `CHECK`, `PROFILE`, `ARM`, `PRESET`, `TRACE`,
+   `[workspace]`, so it is not a member of the coppa workspace. It runs all 64 sessions on
+   parallel threads: four arms, three presets, five trials, and one clean session per arm. That
+   took 6 min 33 s wall time here. It prints the `CHECK`, `PROFILE`, `REPLICA`, `ARM`, `PRESET`, `TRACE`,
    `PREF` and `POWER` lines above, then one tab-separated `TRIAL` line per session and one `SUMMARY` line per
    preset and arm. The tables in this report are those lines, unedited apart from layout.
+3. Noise-referenced sensitivity run ("Measured limits"): in the appendix's `main`, replace the line
+   `let arms = [Arm::Control, Arm::Freq, Arm::FreqPeak, Arm::Outer];` with the two lines
+   `let p_ref = coppa_channel::mean_power(&phy.tx(&vec![0x5Au8; META + chunk], 0, Arm::FreqPeak));`
+   and `let arms = [Arm::FreqPeak];`, then run the same command. It runs the 16 `freq-rep2-peak`
+   sessions at that noise reference and took 1 min 32 s here. Its `SUMMARY` cost column reads
+   `undefined` because the control does not run, so the 5.8% above is against the appendix run's
+   709.4 bytes/min control.
 
 ## Appendix: prototype source
 
@@ -400,7 +466,10 @@ crc = "3.2"
 //!   complete only when all six decode;
 //! - `freq-rep2`: the same six packets, each coded BPSK symbol repeated on a
 //!   second data carrier half the data band away, combined with the receiver's
-//!   own per-carrier noise estimates before NR decoding;
+//!   own per-carrier noise estimates before NR decoding, with the frame scaled
+//!   to the control's mean packet power;
+//! - `freq-rep2-peak`: `freq-rep2` left at the control's peak amplitude, as
+//!   `modulate_mapped` returns it (a PEP-limited sensitivity variant);
 //! - `outer-rs12-6`: a systematic RS(12,6) GF(256) erasure code across the six
 //!   chunks, sent as twelve NR-coded packets, complete from any six.
 //!
@@ -421,6 +490,7 @@ use coppa_channel::watterson::{watterson_with_gains, WattersonPreset};
 use coppa_codec::ofdm::coppa_modem::{CoppaModem, SPEED_LEVELS};
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_codec::ofdm::interleaver::BlockInterleaver;
+use coppa_codec::ofdm::pilots::CoppaPilotPattern;
 use coppa_codec::traits::ConstellationMapper;
 use coppa_dsp::fft::FftProcessor;
 use coppa_dsp::fir::{design_bandpass, Fir};
@@ -467,7 +537,10 @@ fn with_tail(mut w: Vec<f32>) -> Vec<f32> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Arm {
     Control,
+    /// Frequency repetition at the control's mean packet power.
     Freq,
+    /// Frequency repetition at the control's peak amplitude.
+    FreqPeak,
     Outer,
 }
 
@@ -476,8 +549,12 @@ impl Arm {
         match self {
             Arm::Control => "matched-control",
             Arm::Freq => "freq-rep2",
+            Arm::FreqPeak => "freq-rep2-peak",
             Arm::Outer => "outer-rs12-6",
         }
+    }
+    fn is_freq(self) -> bool {
+        matches!(self, Arm::Freq | Arm::FreqPeak)
     }
     fn packets(self) -> usize {
         match self {
@@ -658,6 +735,9 @@ struct Phy {
     papr_db: f32,
     dps: usize,
     max_payload: usize,
+    /// Amplitude gain that brings a `freq-rep2` frame from the control's peak
+    /// to the control's mean packet power.
+    freq_gain: f32,
 }
 
 fn header(len: usize, seq: u8, codewords: u8) -> CoppaHeader {
@@ -709,7 +789,7 @@ impl Phy {
         let modem = CoppaModem::new(profile, 1);
         let dps = modem.data_carriers_per_symbol();
         assert!(dps % 2 == 0, "pairing needs an even data-carrier count");
-        Self {
+        let mut phy = Self {
             modem,
             rx_bpf,
             ldpc: NrLdpc::new(),
@@ -719,7 +799,15 @@ impl Phy {
             papr_db,
             dps,
             max_payload: max_payload_for_level(LEVEL).expect("level 2"),
-        }
+            freq_gain: 1.0,
+        };
+        // Equal mean power: the same probe packet that sets the noise
+        // reference in `main`, sent by the control and at equal peak.
+        let probe = vec![0x5Au8; phy.max_payload];
+        let p_ctrl = coppa_channel::mean_power(&phy.tx(&probe, 0, Arm::Control));
+        let p_peak = coppa_channel::mean_power(&phy.tx(&probe, 0, Arm::FreqPeak));
+        phy.freq_gain = (p_ctrl / p_peak).sqrt();
+        phy
     }
 
     /// Same chain as `CoppaTransceiver::transmit` for one RV0 codeword.
@@ -753,7 +841,7 @@ impl Phy {
     fn tx(&self, payload: &[u8], seq: u8, arm: Arm) -> Vec<f32> {
         let c = self.encode_symbols(payload);
         match arm {
-            Arm::Freq => {
+            Arm::Freq | Arm::FreqPeak => {
                 let nsym = CODED.div_ceil(self.dps / 2);
                 let mut s = vec![Complex32::new(1.0, 0.0); nsym * self.dps];
                 for (k, &sym) in c.iter().enumerate() {
@@ -762,8 +850,14 @@ impl Phy {
                     s[r] = sym;
                 }
                 // `codewords: 2` makes the receiver demodulate 2 x 1944 symbols.
-                self.modem
-                    .modulate_mapped(&header(payload.len(), seq, 2), &s, self.papr_db)
+                let w = self
+                    .modem
+                    .modulate_mapped(&header(payload.len(), seq, 2), &s, self.papr_db);
+                if arm == Arm::Freq {
+                    w.into_iter().map(|v| v * self.freq_gain).collect()
+                } else {
+                    w
+                }
             }
             _ => self
                 .modem
@@ -781,7 +875,7 @@ impl Phy {
             .modem
             .demodulate_frame(&filtered)
             .ok_or(Fail::SyncOrHeader)?;
-        let want_cw = if arm == Arm::Freq { 2 } else { 1 };
+        let want_cw = if arm.is_freq() { 2 } else { 1 };
         if hdr.speed_level != LEVEL
             || hdr.codewords != want_cw
             || hdr.payload_len as usize > self.max_payload
@@ -872,7 +966,7 @@ impl Phy {
 
     fn rx(&self, samples: &[f32], arm: Arm) -> Result<Vec<u8>, Fail> {
         let (hdr, syms, nvs) = self.demod(samples, arm)?;
-        let (syms, nvs) = if arm == Arm::Freq {
+        let (syms, nvs) = if arm.is_freq() {
             self.combine(&syms, &nvs)
         } else {
             (syms, nvs)
@@ -1231,14 +1325,14 @@ fn self_checks(phy: &Phy, code: &OuterCode) {
     let chunk = phy.max_payload - META;
     let mut rng = StdRng::seed_from_u64(118);
     // 1. Clean exact-byte recovery, every arm.
-    for arm in [Arm::Control, Arm::Freq, Arm::Outer] {
+    for arm in [Arm::Control, Arm::Freq, Arm::FreqPeak, Arm::Outer] {
         for _ in 0..3 {
             let p: Vec<u8> = (0..META + chunk).map(|_| rng.random::<u8>()).collect();
             let w = with_tail(phy.tx(&p, 7, arm));
             assert_eq!(phy.rx(&w, arm), Ok(p), "{} clean loopback", arm.name());
         }
     }
-    println!("CHECK clean exact-byte recovery: PASS (3 packets x 3 arms)");
+    println!("CHECK clean exact-byte recovery: PASS (3 packets x 4 arms)");
     // 2. Replica alignment: on a clean frame both copies of every coded symbol
     //    carry the transmitted BPSK sign.
     let p: Vec<u8> = (0..META + chunk).map(|_| rng.random::<u8>()).collect();
@@ -1375,8 +1469,29 @@ fn main() {
         "PROFILE fft {} cp {} spacing {:.3} Hz, active carriers {}, data/OFDM symbol {}, replica separation ~{:.0} Hz (half the active band)",
         profile.fft_size, profile.cp_samples, spacing, active, phy.dps, sep_hz
     );
+    // Replica separation in carriers, from the modem's pilot layout, over every
+    // OFDM symbol of a freq-rep2 payload (both pilot parities).
+    let pilots = CoppaPilotPattern::new(active, profile.pilot_carriers);
+    let h = phy.dps / 2;
+    let nsym = CODED.div_ceil(h);
+    let seps: Vec<usize> = (0..nsym)
+        .flat_map(|sym| {
+            let d = pilots.data_indices(sym);
+            (0..h).map(move |j| d[j + h] - d[j]).collect::<Vec<_>>()
+        })
+        .collect();
+    let (smin, smax) = (*seps.iter().min().unwrap(), *seps.iter().max().unwrap());
+    println!(
+        "REPLICA separation {}..={} carriers, {:.0}..={:.0} Hz, over {} OFDM symbols x {} slot pairs",
+        smin,
+        smax,
+        smin as f64 * spacing,
+        smax as f64 * spacing,
+        nsym,
+        h
+    );
     let frame_air = frame_airtime_s(LEVEL, &profile).expect("level 2");
-    for arm in [Arm::Control, Arm::Freq, Arm::Outer] {
+    for arm in [Arm::Control, Arm::Freq, Arm::FreqPeak, Arm::Outer] {
         let b = block_airtime_s(&phy, arm, chunk);
         println!(
             "ARM {}: {} packets/block, packet {:.3} s, block {:.3} s, block bytes {}, initial RTO {:.1} s",
@@ -1412,17 +1527,21 @@ fn main() {
     // Fixed noise reference: mean power of one clean control packet.
     let p_ref = coppa_channel::mean_power(&phy.tx(&vec![0x5Au8; META + chunk], 0, Arm::Control));
     println!("PREF {p_ref:.6e}");
-    for arm in [Arm::Freq, Arm::Outer] {
-        let p = coppa_channel::mean_power(&phy.tx(&vec![0x5Au8; META + chunk], 0, arm));
+    let peak = |w: &[f32]| w.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let peak_ref = peak(&phy.tx(&vec![0x5Au8; META + chunk], 0, Arm::Control));
+    for arm in [Arm::Freq, Arm::FreqPeak, Arm::Outer] {
+        let w = phy.tx(&vec![0x5Au8; META + chunk], 0, arm);
+        let p = coppa_channel::mean_power(&w);
         println!(
-            "POWER {}: mean packet power {:.6e} ({:+.2} dB vs control)",
+            "POWER {}: mean packet power {:.6e} ({:+.2} dB vs control), peak {:+.2} dB vs control",
             arm.name(),
             p,
-            10.0 * (p / p_ref).log10()
+            10.0 * (p / p_ref).log10(),
+            20.0 * (peak(&w) / peak_ref).log10()
         );
     }
 
-    let arms = [Arm::Control, Arm::Freq, Arm::Outer];
+    let arms = [Arm::Control, Arm::Freq, Arm::FreqPeak, Arm::Outer];
     let presets = [
         WattersonPreset::Good,
         WattersonPreset::Moderate,

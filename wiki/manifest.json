@@ -157,7 +157,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:8192581e162b532e7611786d7a3220b340a6f7e96f5bead2e449d59c9b2634cd",
+      "hash": "sha256:2b6fe19d394f76e72085327e426b11bd13e3a106e4f4de70ff3ae142977d0224",
       "id": "adr-008-phase3-system-layer",
       "kind": "decision-digest",
       "links": [
