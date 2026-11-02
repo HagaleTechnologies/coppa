@@ -19,6 +19,10 @@ mod config;
 mod event_loop;
 mod level_meter;
 mod logging;
+// COP-140: the binary uses the advertisement plan and, with `mdns`, the
+// responder; the pure helpers its tests cover stay library API.
+#[allow(dead_code, unused_imports)]
+mod mdns;
 mod ptt_guardian;
 #[cfg(feature = "websocket")]
 mod spectrum;
@@ -277,6 +281,9 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     config
         .check_ardop_built(cfg!(feature = "ardop"))
         .map_err(anyhow::Error::msg)?;
+    config
+        .check_mdns(cfg!(feature = "mdns"))
+        .map_err(anyhow::Error::msg)?;
     #[cfg(not(feature = "cpal-backend"))]
     check_no_selected_devices(&config.audio)?;
 
@@ -416,6 +423,29 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     };
     #[cfg(not(feature = "websocket"))]
     let ws_state = startup_report::Listener::NotBuilt;
+
+    // COP-140: advertise the bound WebSocket port as coppad.local. The bound
+    // address decides it, so a host-name bind_address such as "localhost"
+    // that check_mdns could not judge is refused here.
+    #[cfg(feature = "mdns")]
+    let mdns_responder = match &ws_state {
+        startup_report::Listener::Listening(addr) if config.host.mdns_enabled => {
+            let ad = mdns::advertisement(*addr).map_err(|_| {
+                anyhow::anyhow!(mdns::unreachable_bind_address(&addr.ip().to_string()))
+            })?;
+            let responder = mdns::Responder::start(&ad)
+                .map_err(|e| anyhow::anyhow!("failed to start the mDNS responder: {e}"))?;
+            tracing::info!(
+                host = %mdns::HOST_NAME,
+                service = %format!("{}.{}", mdns::INSTANCE, mdns::SERVICE_TYPE),
+                port = ad.port,
+                addresses = ?ad.addresses.to_string(),
+                "mDNS advertisement"
+            );
+            Some(responder)
+        }
+        _ => None,
+    };
 
     // Connect CPAL audio streams to ring buffers
     #[cfg(feature = "cpal-backend")]
@@ -610,6 +640,14 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
                 .map_or("", config::SecretToken::expose),
             &config.host.websocket_allowed_origins,
         );
+        // COP-140: /health reports the same verdict as "Daemon ready" /
+        // "Daemon running degraded" below; startup_problems() is fixed by
+        // EventLoop::new.
+        let health = if event_loop.startup_problems().is_empty() {
+            coppa_host::websocket::Health::Ok
+        } else {
+            coppa_host::websocket::Health::Degraded
+        };
         // COP-79: a browser that opens the port gets the operator page; its
         // own /ws upgrade still passes the token and Origin gate above.
         let mut ws_server = coppa_host::websocket::WebSocketServer::with_bind_addr(
@@ -617,7 +655,8 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
             config.host.bind_address.clone(),
         )
         .with_auth(auth)
-        .with_index_html(include_str!("web/index.html"));
+        .with_index_html(include_str!("web/index.html"))
+        .with_health(health);
 
         // Pipe WebSocket events into the daemon event loop
         if let Some(mut ws_rx) = ws_server.take_event_rx() {
@@ -738,6 +777,13 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
 
     // Run the event loop
     event_loop.run().await?;
+
+    // COP-140: goodbye packets, so peers drop coppad.local now rather than
+    // when its records expire.
+    #[cfg(feature = "mdns")]
+    if let Some(responder) = mdns_responder {
+        responder.stop().await;
+    }
 
     tracing::info!("Daemon stopped");
     Ok(())
