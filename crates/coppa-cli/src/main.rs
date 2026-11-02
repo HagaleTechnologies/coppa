@@ -35,11 +35,48 @@ impl Verbosity {
     }
 }
 
+/// Every coppa-cli cargo feature and whether this build has it, for
+/// `--version`. `cli_features_lists_every_feature_in_cargo_toml` keeps it
+/// complete.
+const CLI_FEATURES: [(&str, bool); 3] = [
+    ("cpal-backend", cfg!(feature = "cpal-backend")),
+    ("file-backend", cfg!(feature = "file-backend")),
+    ("kiss-tnc", cfg!(feature = "kiss-tnc")),
+];
+
+/// The enabled CLI features, comma-separated, or `none`.
+fn cli_features() -> String {
+    let on: Vec<&str> = CLI_FEATURES
+        .iter()
+        .filter(|(_, enabled)| *enabled)
+        .map(|(name, _)| *name)
+        .collect();
+    if on.is_empty() {
+        "none".to_string()
+    } else {
+        on.join(",")
+    }
+}
+
+/// `coppa --version` (COP-86): the build facts a bug report needs. The first
+/// line is what `-V` prints, so `coppa --version | head -1` keeps working.
+static LONG_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "{}\ncommit: {}\nfeatures: {}\nwire format: {}",
+        env!("CARGO_PKG_VERSION"),
+        coppa_daemon::build_info::GIT_SHA,
+        cli_features(),
+        coppa_engine::WIRE_FORMAT_VERSION
+    )
+});
+
 #[derive(Parser)]
 #[command(
     name = "coppa",
     about = "Coppa - Ham Radio Digital Communications System",
-    version
+    version,
+    long_version = LONG_VERSION.as_str(),
+    arg_required_else_help = true
 )]
 struct Cli {
     /// Increase diagnostic output; repeat for frame metrics.
@@ -70,7 +107,7 @@ struct Cli {
     )]
     config: Option<PathBuf>,
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 /// Flags for `coppa rx`, shared with its deprecated hidden alias
@@ -485,6 +522,14 @@ enum Commands {
     /// Deprecated: use 'coppa profiles'. Removed in the next release.
     #[command(hide = true)]
     Config(ProfilesArgs),
+    /// Print a shell completion script (bash, elvish, fish, powershell, zsh).
+    Completions {
+        /// Shell to generate the script for.
+        #[arg(value_enum, value_name = "SHELL")]
+        shell: clap_complete::Shell,
+    },
+    /// Print the coppa(1) man page in roff format.
+    Man,
     /// Start the AFSK 1200 TNC (KISS TCP server).
     #[cfg(feature = "kiss-tnc")]
     Tnc {
@@ -614,14 +659,14 @@ fn run() -> Result<()> {
     let config_flag = cli.config;
     let env = CliEnv::from_process();
     match cli.command {
-        Some(Commands::Tx {
+        Commands::Tx {
             message,
             output,
             profile,
             level,
             callsign,
             rig,
-        }) => {
+        } => {
             let layers = Layers::load(config_flag.as_deref(), env)?;
             let profile = layers.profile(profile.as_deref())?;
             let callsign = layers.callsign(callsign.as_deref())?;
@@ -643,18 +688,16 @@ fn run() -> Result<()> {
                 verbosity,
             )?;
         }
-        Some(Commands::Rx(args)) => {
-            resolve_rx_and_run(args, config_flag.as_deref(), env, verbosity)?
-        }
-        Some(Commands::Listen(args)) => {
+        Commands::Rx(args) => resolve_rx_and_run(args, config_flag.as_deref(), env, verbosity)?,
+        Commands::Listen(args) => {
             eprintln!("{LISTEN_DEPRECATED}");
             resolve_rx_and_run(args, config_flag.as_deref(), env, verbosity)?;
         }
-        Some(Commands::Loopback {
+        Commands::Loopback {
             message,
             profile,
             level,
-        }) => {
+        } => {
             let layers = Layers::load(config_flag.as_deref(), env)?;
             let profile = layers.profile(profile.as_deref())?;
             if verbosity.is_verbose() {
@@ -668,14 +711,14 @@ fn run() -> Result<()> {
                 verbosity,
             )?;
         }
-        Some(Commands::Tune {
+        Commands::Tune {
             duration,
             seconds,
             single,
             output,
             profile,
             rig,
-        }) => {
+        } => {
             if seconds.is_some() {
                 eprintln!("{TUNE_SECONDS_DEPRECATED}");
             }
@@ -699,15 +742,15 @@ fn run() -> Result<()> {
                 verbosity,
             )?;
         }
-        Some(Commands::Devices { json }) => cmd_devices(json)?,
-        Some(Commands::Doctor(args)) => doctor::cmd_doctor(&args)?,
-        Some(Commands::Profiles(args)) => cmd_profiles(&args)?,
-        Some(Commands::Config(args)) => {
+        Commands::Devices { json } => cmd_devices(json)?,
+        Commands::Doctor(args) => doctor::cmd_doctor(&args)?,
+        Commands::Profiles(args) => cmd_profiles(&args)?,
+        Commands::Config(args) => {
             eprintln!("{CONFIG_DEPRECATED}");
             cmd_profiles(&args)?
         }
         #[cfg(feature = "kiss-tnc")]
-        Some(Commands::Tnc {
+        Commands::Tnc {
             port,
             device,
             input_device_id,
@@ -716,7 +759,7 @@ fn run() -> Result<()> {
             output_channel,
             rig,
             vox,
-        }) => cmd_tnc(
+        } => cmd_tnc(
             port,
             device,
             input_device_id,
@@ -726,10 +769,8 @@ fn run() -> Result<()> {
             rig,
             vox,
         )?,
-        None => {
-            emit("Coppa - Ham Radio Digital Communications System")?;
-            emit("Use --help for available commands")?;
-        }
+        Commands::Completions { shell } => cmd_completions(shell)?,
+        Commands::Man => cmd_man()?,
     }
 
     Ok(())
@@ -765,6 +806,39 @@ fn resolve_rx_and_run(
     args.device = device.map(|v| v.value);
     cmd_rx(&args, verbosity)?;
     Ok(())
+}
+
+/// `coppa completions SHELL`. `clap_complete::generate` panics on a write
+/// error, so the script is built in memory and written through `emit_raw`.
+fn cmd_completions(shell: clap_complete::Shell) -> Result<()> {
+    let mut buf = Vec::new();
+    clap_complete::generate(shell, &mut completion_command(), "coppa", &mut buf);
+    emit_raw(&buf)
+}
+
+/// `Cli::command()` without its hidden subcommands. clap_complete offers
+/// hidden subcommands too, and the deprecated `listen`/`config` aliases
+/// should not be suggested to anyone.
+fn completion_command() -> clap::Command {
+    use clap::CommandFactory;
+    let full = Cli::command();
+    let visible: Vec<clap::Command> = full
+        .get_subcommands()
+        .filter(|sub| !sub.is_hide_set())
+        .cloned()
+        .collect();
+    clap::Command::new("coppa")
+        .version(env!("CARGO_PKG_VERSION"))
+        .args(full.get_arguments().cloned())
+        .subcommands(visible)
+}
+
+/// `coppa man`: the top-level coppa(1) page, generated from the real flags.
+fn cmd_man() -> Result<()> {
+    use clap::CommandFactory;
+    let mut buf = Vec::new();
+    clap_mangen::Man::new(Cli::command()).render(&mut buf)?;
+    emit_raw(&buf)
 }
 
 /// Write `samples` to a WAV file at `path` (file-backend only) — shared by
@@ -2368,7 +2442,7 @@ mod tests {
 
     fn profiles_args(args: &[&str]) -> ProfilesArgs {
         match parse(args).expect("valid profiles args").command {
-            Some(Commands::Profiles(args)) | Some(Commands::Config(args)) => args,
+            Commands::Profiles(args) | Commands::Config(args) => args,
             _ => panic!("expected profiles or config"),
         }
     }
@@ -2414,7 +2488,7 @@ mod tests {
             let config: Vec<&str> = std::iter::once("config").chain(flags).collect();
             assert!(matches!(
                 parse(&config).unwrap().command,
-                Some(Commands::Config(_))
+                Commands::Config(_)
             ));
             assert_eq!(profiles_args(&config), profiles_args(&profiles));
         }
@@ -2536,11 +2610,11 @@ mod tests {
     #[test]
     fn tx_and_loopback_parse_level() {
         match parse(&["tx", "CQ", "--level", "4"]).unwrap().command {
-            Some(Commands::Tx { level, .. }) => assert_eq!(level, Some(4)),
+            Commands::Tx { level, .. } => assert_eq!(level, Some(4)),
             _ => panic!("expected tx"),
         }
         match parse(&["loopback", "CQ", "--level", "9"]).unwrap().command {
-            Some(Commands::Loopback { level, .. }) => assert_eq!(level, Some(9)),
+            Commands::Loopback { level, .. } => assert_eq!(level, Some(9)),
             _ => panic!("expected loopback"),
         }
     }
@@ -2646,7 +2720,7 @@ mod tests {
             "500",
         ]);
         match cli.command {
-            Some(Commands::Tx { rig, .. }) => {
+            Commands::Tx { rig, .. } => {
                 assert_eq!(rig.rigctld.as_deref(), Some("192.168.1.50:4532"));
                 assert_eq!(rig.ptt_lead_ms, Some(75));
                 assert_eq!(rig.ptt_tail_ms, Some(500));
@@ -2659,7 +2733,7 @@ mod tests {
     fn test_cli_tx_ptt_flags_default() {
         let cli = Cli::parse_from(["coppa", "tx", "hello"]);
         match cli.command {
-            Some(Commands::Tx { rig, .. }) => {
+            Commands::Tx { rig, .. } => {
                 assert_eq!(rig.ptt, None);
                 assert_eq!(rig.rigctld, None);
                 assert_eq!(rig.ptt_lead_ms, None);
@@ -2682,7 +2756,7 @@ mod tests {
             "20",
         ]);
         match cli.command {
-            Some(Commands::Tune { rig, .. }) => {
+            Commands::Tune { rig, .. } => {
                 assert_eq!(rig.rigctld.as_deref(), Some("10.0.0.5:4532"));
                 assert_eq!(rig.ptt_lead_ms, Some(10));
                 assert_eq!(rig.ptt_tail_ms, Some(20));
@@ -2695,7 +2769,7 @@ mod tests {
     fn test_cli_tune_ptt_flags_default() {
         let cli = Cli::parse_from(["coppa", "tune"]);
         match cli.command {
-            Some(Commands::Tune { rig, .. }) => {
+            Commands::Tune { rig, .. } => {
                 assert_eq!(rig.ptt, None);
                 assert_eq!(rig.rigctld, None);
                 assert_eq!(rig.ptt_lead_ms, None);
@@ -3286,6 +3360,45 @@ mod tests {
     }
 
     #[test]
+    fn cli_features_lists_every_feature_in_cargo_toml() {
+        let manifest: toml::Table = include_str!("../Cargo.toml").parse().unwrap();
+        let mut declared: Vec<&str> = manifest["features"]
+            .as_table()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .filter(|name| *name != "default")
+            .collect();
+        declared.sort_unstable();
+        let listed: Vec<&str> = CLI_FEATURES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(listed, declared);
+        assert!(cli_features() == "none" || !cli_features().is_empty());
+    }
+
+    #[test]
+    fn long_version_lines() {
+        let lines: Vec<&str> = LONG_VERSION.lines().collect();
+        assert_eq!(lines.len(), 4, "{}", *LONG_VERSION);
+        assert_eq!(lines[0], env!("CARGO_PKG_VERSION"));
+        assert!(lines[1].starts_with("commit: "), "{}", lines[1]);
+        assert_eq!(lines[2], format!("features: {}", cli_features()));
+        assert_eq!(lines[3], "wire format: 1");
+    }
+
+    #[test]
+    fn completion_command_drops_hidden_subcommands() {
+        let cmd = completion_command();
+        let names: Vec<&str> = cmd.get_subcommands().map(|sub| sub.get_name()).collect();
+        for visible in ["tx", "rx", "tune", "completions", "man"] {
+            assert!(names.contains(&visible), "{names:?}");
+        }
+        assert!(
+            !names.contains(&"listen") && !names.contains(&"config"),
+            "{names:?}"
+        );
+    }
+
+    #[test]
     fn is_broken_pipe_finds_the_io_error_in_the_chain() {
         let pipe = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone");
         assert!(is_broken_pipe(&anyhow::Error::new(pipe)));
@@ -3360,18 +3473,18 @@ mod tests {
     #[test]
     fn tune_duration_and_deprecated_seconds_parse() {
         let cli = Cli::parse_from(["coppa", "tune", "-d", "2.5"]);
-        let Some(Commands::Tune {
+        let Commands::Tune {
             duration, seconds, ..
-        }) = cli.command
+        } = cli.command
         else {
             panic!("expected Tune");
         };
         assert_eq!((duration, seconds), (2.5, None));
 
         let cli = Cli::parse_from(["coppa", "tune", "--seconds", "3"]);
-        let Some(Commands::Tune {
+        let Commands::Tune {
             duration, seconds, ..
-        }) = cli.command
+        } = cli.command
         else {
             panic!("expected Tune");
         };
@@ -3415,7 +3528,7 @@ mod tests {
     fn test_cli_parses_frequency_flags_on_tx_and_tune() {
         let cli = Cli::parse_from(["coppa", "tx", "hi", "--frequency-hz", "144500000"]);
         match cli.command {
-            Some(Commands::Tx { rig, .. }) => {
+            Commands::Tx { rig, .. } => {
                 assert_eq!(rig.frequency_hz, Some(144_500_000));
                 assert_eq!(rig.band, None);
             }
@@ -3423,7 +3536,7 @@ mod tests {
         }
         let cli = Cli::parse_from(["coppa", "tune", "--band", "2m"]);
         match cli.command {
-            Some(Commands::Tune { rig, .. }) => assert_eq!(rig.band.as_deref(), Some("2m")),
+            Commands::Tune { rig, .. } => assert_eq!(rig.band.as_deref(), Some("2m")),
             _ => panic!("expected Tune command"),
         }
     }
@@ -3512,7 +3625,7 @@ mod tests {
             "--device",
             "Mic",
         ]);
-        let Some(Commands::Rx(args)) = cli.command else {
+        let Commands::Rx(args) = cli.command else {
             panic!("expected Rx")
         };
         assert_eq!(args.path(), Some("x.wav"));
@@ -3523,7 +3636,7 @@ mod tests {
         assert_eq!(args.device.as_deref(), Some("Mic"));
 
         let cli = Cli::parse_from(["coppa", "rx", "-i", "y.wav"]);
-        let Some(Commands::Rx(args)) = cli.command else {
+        let Commands::Rx(args) = cli.command else {
             panic!("expected Rx")
         };
         assert_eq!(args.path(), Some("y.wav"));
@@ -3532,7 +3645,7 @@ mod tests {
 
     #[test]
     fn exact_device_and_channel_flags_parse_and_conflict() {
-        let Some(Commands::Rx(rx)) = Cli::parse_from([
+        let Commands::Rx(rx) = Cli::parse_from([
             "coppa",
             "rx",
             "--device-id",
@@ -3560,7 +3673,7 @@ mod tests {
             .kind(),
             clap::error::ErrorKind::ArgumentConflict,
         );
-        let Some(Commands::Listen(listen)) = Cli::parse_from([
+        let Commands::Listen(listen) = Cli::parse_from([
             "coppa",
             "listen",
             "--device-id",
@@ -3574,7 +3687,7 @@ mod tests {
         };
         assert_eq!(rx, listen);
 
-        let Some(Commands::Tx { rig, .. }) = Cli::parse_from([
+        let Commands::Tx { rig, .. } = Cli::parse_from([
             "coppa",
             "tx",
             "hi",
@@ -3589,7 +3702,7 @@ mod tests {
         };
         assert_eq!(rig.device_id.as_deref(), Some("alsa:output"));
         assert_eq!(rig.output_channel, 1);
-        let Some(Commands::Tune { rig, .. }) = Cli::parse_from([
+        let Commands::Tune { rig, .. } = Cli::parse_from([
             "coppa",
             "tune",
             "--device-id",
@@ -3677,13 +3790,13 @@ mod tests {
     #[cfg(feature = "kiss-tnc")]
     #[test]
     fn tnc_directional_device_and_channel_flags_parse() {
-        let Some(Commands::Tnc {
+        let Commands::Tnc {
             input_device_id,
             output_device_id,
             input_channel,
             output_channel,
             ..
-        }) = Cli::parse_from([
+        } = Cli::parse_from([
             "coppa",
             "tnc",
             "--input-device-id",
@@ -4151,10 +4264,10 @@ mod tests {
             "Mic",
         ];
         let parse = |sub: &str| Cli::parse_from(["coppa", sub].into_iter().chain(flags)).command;
-        let Some(Commands::Rx(rx)) = parse("rx") else {
+        let Commands::Rx(rx) = parse("rx") else {
             panic!("expected Rx")
         };
-        let Some(Commands::Listen(listen)) = parse("listen") else {
+        let Commands::Listen(listen) = parse("listen") else {
             panic!("expected Listen")
         };
         assert_eq!(rx, listen);

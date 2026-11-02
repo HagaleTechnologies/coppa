@@ -19,6 +19,11 @@ use crate::profiles::Profile;
 /// Huffman+LZ4 compressed. Otherwise the payload is raw.
 const COMPRESSION_MARKER: u8 = 0xFE;
 
+/// Coppa wire-format version this engine transmits and decodes
+/// (`docs/SPEC.md` §0.1). It keys the preamble and probe sequences and is
+/// carried in `CoppaHeader::version`, so changing it is a wire-format break.
+pub const WIRE_FORMAT_VERSION: u8 = 1;
+
 /// Low tone of the standard SSB two-tone TX-level calibration signal (Hz).
 /// 700 Hz + 1900 Hz is standard amateur-radio TUNE/two-tone practice: both
 /// fall well inside the waveform's ~300-2700 Hz SSB passband (see
@@ -126,8 +131,8 @@ impl CoppaCore {
     fn build(config: EngineConfig) -> Self {
         let ofdm_profile =
             Self::select_ofdm_profile(config.speed_level, config.cp_mode, config.ofdm_band);
-        let transceiver = CoppaTransceiver::new(ofdm_profile.clone(), 1);
-        let streaming = StreamingReceiver::new(ofdm_profile, 1);
+        let transceiver = CoppaTransceiver::new(ofdm_profile.clone(), WIRE_FORMAT_VERSION);
+        let streaming = StreamingReceiver::new(ofdm_profile, WIRE_FORMAT_VERSION);
         Self {
             transceiver,
             config,
@@ -391,7 +396,7 @@ impl CoppaCore {
         }
 
         let header = CoppaHeader {
-            version: 1,
+            version: WIRE_FORMAT_VERSION,
             phy_mode: 0,
             frame_type: CoppaFrameType::Data,
             bandwidth: self.transceiver.profile().bandwidth_id,
@@ -441,7 +446,7 @@ impl CoppaCore {
         }
 
         let header = CoppaHeader {
-            version: 1,
+            version: WIRE_FORMAT_VERSION,
             phy_mode: 0,
             frame_type: CoppaFrameType::Beacon,
             bandwidth: self.transceiver.profile().bandwidth_id,
@@ -1718,6 +1723,31 @@ mod tests {
             CoppaProfile::hf_standard_short_cp().bandwidth_id,
             "returning below level 5 must rebuild onto hf_standard_short_cp, not hf_standard"
         );
+    }
+
+    /// `coppa --version` prints this; a bump is a deliberate, spec-visible
+    /// wire-format break (`docs/SPEC.md` §0.1), never a side effect.
+    #[test]
+    fn wire_format_version_is_1() {
+        assert_eq!(WIRE_FORMAT_VERSION, 1);
+    }
+
+    /// The constant is the version the engine actually uses: a receiver built
+    /// with it decodes `CoppaCore::encode` output.
+    #[test]
+    fn wire_format_version_decodes_engine_frames() {
+        use coppa_protocol::modem::transceiver::CoppaTransceiver;
+        let core = CoppaCore::new();
+        let samples = core.encode("wire format").unwrap();
+        let profile = CoppaCore::select_ofdm_profile(
+            core.config.speed_level,
+            core.config.cp_mode,
+            core.config.ofdm_band,
+        );
+        let rx = CoppaTransceiver::new(profile, WIRE_FORMAT_VERSION);
+        let (header, payload, _) = rx.receive(&samples).expect("decode");
+        assert_eq!(header.version, WIRE_FORMAT_VERSION);
+        assert_eq!(payload, b"wire format");
     }
 
     /// Decode `samples` through a receiver built for `profile` and return the wire
