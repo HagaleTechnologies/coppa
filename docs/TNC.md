@@ -154,6 +154,9 @@ TNC reports ready.
 
 ## KISS details
 
+See also [HOST-API.md](HOST-API.md#kiss-afsk-1200-tnc-mode), which lists these details for host
+authors alongside two known framing defects.
+
 - Frames carry no FCS, as the KISS protocol specifies. The TNC adds the FCS on transmit, and
   on receive it checks the FCS, drops frames that fail, and strips it before passing the frame
   to clients. A host that appends its own FCS gets two on air.

@@ -26,7 +26,8 @@ fn abandon_advances_send_base_over_a_selectively_acked_segment() {
     let mut tx = ArqTx::new(ArqConfig {
         window_size: 2,
         ..ArqConfig::default()
-    });
+    })
+    .unwrap();
     let now = Instant::now();
 
     let s0 = tx.send(vec![1], now).unwrap();
