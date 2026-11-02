@@ -89,8 +89,8 @@ Enter sends `\n`, which coppad accepts. Commands are case-insensitive.
 
 In a second terminal, `nc 127.0.0.1 8301` opens the data port. Type `hello` and press Enter:
 nothing is sent, because no session exists, and coppad logs
-`No established session; host data dropped, not transmitted`. The data port never closes the
-connection itself, so press Ctrl-C to leave.
+`No established session; host data dropped, not transmitted`. coppad does not close an idle
+data connection, so press Ctrl-C to leave.
 
 With two coppads (two machines, or one machine with two audio devices; [PAT.md](PAT.md) shows
 the configs), run `LISTEN ON` on one and `CONNECT <me> <other>` on the other, then type on
@@ -105,8 +105,9 @@ closes the connection.
 
 **Replies and pushed lines.** Each command gets exactly one reply, sent only to the client that
 sent it. Every other line coppad sends (`PTT`, `CONNECTED`, `BUFFER`, ...) goes to every
-command-port client. Replies stay in the order you sent the commands, but they can queue behind
-a transmission, so wait for each reply instead of counting on a fixed delay.
+command-port client, with one exception: the `DISCONNECTED` that refuses a `CONNECT` goes
+only to the client that dialled. Replies stay in the order you sent the commands, but they can
+queue behind a transmission, so wait for each reply instead of counting on a fixed delay.
 
 ### Commands
 
@@ -235,8 +236,10 @@ start; `BUSY` and `SNR` lines are left out.
 - **VARA and ARDOP share the session.** A dial from one surface is refused while the other
   holds the link ([ARDOP.md](ARDOP.md#busy-semantics-one-transmitter-two-interfaces)).
 - **Delivery.** Connected-session data is acknowledged and resent if lost; the other host gets
-  every byte once, in order. A frame still unacknowledged after the retry budget and a hold of
-  up to 180 s ends the session.
+  every byte once, in order. Once a frame has used its 5 retransmissions, coppad holds the link
+  for as long as the other station stays decodable, and ends the session only after 180 s with
+  no sign of it ([OPERATING.md](OPERATING.md#connected-sessions-delivery-and-buffer)). A held
+  session shows a `BUFFER` count that does not move.
 - **Ending.** `DISCONNECT` drains the queue first; `ABORT` does not
   ([OPERATING.md](OPERATING.md#ending-a-session-disconnect)).
 - **Inbound attempts.** `PENDING`, then `CONNECTED` or `CANCELPENDING`
@@ -278,10 +281,10 @@ with that `id`: `ack`, `status` or `error`. An `ack` means accepted, not done.
 | Request | Reply | Notes |
 |---|---|---|
 | `{"type":"mycall","callsign":"N1CALL","id":1}` | `{"type":"ack","id":1}` | becomes the line `MYCALL N1CALL`; the ack does not mean the callsign is valid (coppad checks it later and only logs a warning) |
-| `{"type":"connect","source":"N1CALL","destination":"N0CALL","id":2}` | `ack` | `source` is ignored; the outcome arrives as a `session` message |
-| `{"type":"disconnect","id":3}` | `ack` | then `session` with `"state":"disconnected"` |
+| `{"type":"connect","source":"N1CALL","destination":"N0CALL","id":2}` | `ack` | `source` is ignored; the outcome arrives as a `session` message, except when another session already holds the link: that refusal sends a WebSocket client nothing, so check `status` |
+| `{"type":"disconnect","id":3}` | `ack` | then `session` with `"state":"disconnected"` if a session existed; with none, only the `ack` |
 | `{"type":"send","data":"hello","id":4}` | `ack` | `encoding` is `utf8` (the default) or `base64`; bad base64 gets `error`; with no session the bytes are dropped after the ack |
-| `{"type":"status","id":5}` | `{"type":"status","id":5,"connected":false,"cp_desync_episodes":0}` | during a session it adds `remote_call`, `snr`, `level` and `cfo` |
+| `{"type":"status","id":5}` | `{"type":"status","id":5,"connected":false,"cp_desync_episodes":0}` | `remote_call` appears while a session exists; `snr`, `level` and `cfo` describe the last decoded frame and stay after a session ends; `short_cp_ok` appears when `[engine] cp_gate_enabled` is on |
 | `{"type":"spectrum","enabled":true}` | `ack` | opt in to (or, with `false`, out of) `spectrum` messages |
 | `{"type":"audio_level","enabled":true}` | `ack` | the same for `audio_level` |
 | `{"type":"log","enabled":true}` | `ack` | the same for `log` |
@@ -290,7 +293,8 @@ Anything else gets an `error`, with the request's `id` if it had one, for exampl
 `{"type":"error","message":"Invalid message: unknown variant ...","id":6}`. Binary frames are
 ignored. There is **no `listen` request**: a station driven only over WebSocket can dial but
 cannot answer a call (see [Session rules](#session-rules-for-every-interface) and
-[LIMITATIONS.md](LIMITATIONS.md)).
+[LIMITATIONS.md](LIMITATIONS.md)). A refused dial is also silent on WebSocket, as noted in the
+`connect` row.
 
 ### Messages coppad sends
 
@@ -344,7 +348,8 @@ VARA path does not use it. [TNC.md](TNC.md) covers building and running it.
   are parsed and ignored.
 - Send frames without an FCS. The TNC adds it on transmit, checks and strips it on receive.
 - Up to 256 bytes of information field.
-- Every client gets every decoded frame. Up to 16 clients.
+- Every client gets each decoded frame, unless it falls more than 64 frames behind: then it
+  silently skips the oldest. Up to 16 clients.
 - A client that sends 64 KiB with no `FEND` is disconnected.
 - No authentication. Keep it on loopback.
 
