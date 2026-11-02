@@ -1771,7 +1771,10 @@ impl EventLoop {
             // value than the pushes it then receives.
             let mirrored = matches!(
                 response,
-                VaraResponse::Ptt(_) | VaraResponse::Busy(_) | VaraResponse::Buffer(_)
+                VaraResponse::Ptt(_)
+                    | VaraResponse::Busy(_)
+                    | VaraResponse::Snr(_)
+                    | VaraResponse::Buffer(_)
             );
             if let Some(status) = self.ws_status.as_ref().filter(|_| mirrored) {
                 let mut snap = status.lock().await;
@@ -1785,6 +1788,7 @@ impl EventLoop {
                         }
                     }
                     VaraResponse::Busy(state) => snap.busy = Some(*state),
+                    VaraResponse::Snr(db) => snap.snr = Some(*db),
                     VaraResponse::Buffer(bytes) => snap.buffer = Some(*bytes as u64),
                     _ => {}
                 }
@@ -4031,7 +4035,7 @@ impl EventLoop {
                     // `CpGate` (`docs/superpowers/specs/
                     // 2026-07-25-cpgate-daemon-wiring-design.md`): feed this
                     // frame's measured delay spread on the same "decode fully
-                    // succeeded" event the SNR/level telemetry above uses. Off
+                    // succeeded" event the SNR/level telemetry uses. Off
                     // by default (`cp_gate_enabled`). Runs regardless of
                     // whether the `websocket` feature is compiled in -- only
                     // the telemetry *surface* below is feature-gated, not the
@@ -4118,11 +4122,6 @@ impl EventLoop {
                         }
                     }
 
-                    #[cfg(feature = "websocket")]
-                    self.ws_push_reliable(coppa_host::websocket::WsServerMessage::Level {
-                        level: speed_level,
-                    });
-
                     // WebSocket `status` reply: keep the live snapshot current
                     // (decision 8: "connected, snr, level, cfo").
                     //
@@ -4140,7 +4139,7 @@ impl EventLoop {
                         let mut snap = status.lock().await;
                         snap.connected = remote.is_some();
                         snap.remote_call = remote.map(|cs| cs.to_string());
-                        snap.snr = Some(snr_db.round() as i32);
+                        // `snr` was written by `emit_vara` above, before its push.
                         snap.level = Some(speed_level);
                         snap.cfo = Some(cfo_hz);
                         snap.short_cp_ok = if self.config.engine.cp_gate_enabled {
@@ -4159,6 +4158,12 @@ impl EventLoop {
                         // under-reports a live problem but can never invent one.
                         snap.cp_desync_episodes = self.cp_desync_episodes;
                     }
+                    // COP-83: pushed after `snap.level` is written, the rule in
+                    // `emit_vara`.
+                    #[cfg(feature = "websocket")]
+                    self.ws_push_reliable(coppa_host::websocket::WsServerMessage::Level {
+                        level: speed_level,
+                    });
 
                     let decoded_bytes = payload.as_slice();
 
@@ -10928,6 +10933,53 @@ mod tests {
         station.emit_vara(VaraResponse::Busy(true)).await;
         assert_eq!(next_ws_type(&mut ws, "busy").await["state"], true);
         assert_eq!(ws_status_reply(&mut ws).await["busy"], true);
+        task.abort();
+    }
+
+    /// `snr` and `level` follow the mirroring rule too: while the test holds
+    /// the `status` lock, so the daemon cannot write the snapshot, a decoded
+    /// frame must push neither. Before the fix both went out first.
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn snr_and_level_are_in_status_before_they_are_pushed() {
+        use futures_util::StreamExt;
+        use std::future::Future;
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (mut ws, task) = connect_ws(&mut station).await;
+        let status = station.ws_status.clone().unwrap();
+        let samples = coppa_engine::CoppaCore::new().encode("telemetry").unwrap();
+        let samples = with_lead_and_trail(&samples);
+        let held = status.lock().await;
+        let decode = station.decode_and_dispatch_audio(&samples);
+        tokio::pin!(decode);
+        // Run the synchronous decode before the window opens, so a slow build
+        // cannot use up the 300 ms before a push could arrive.
+        let first_poll =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(decode.as_mut().poll(cx))).await;
+        assert!(first_poll.is_pending(), "the decode must wait for status");
+        let early_push = async {
+            loop {
+                let message = ws.next().await.unwrap().unwrap();
+                let value: serde_json::Value =
+                    serde_json::from_str(message.to_text().unwrap()).unwrap();
+                if value["type"] == "snr" || value["type"] == "level" {
+                    return value;
+                }
+            }
+        };
+        tokio::select! {
+            _ = &mut decode => panic!("the decode cannot finish while status is locked"),
+            value = early_push => panic!("pushed before status was written: {value}"),
+            _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+        }
+        drop(held);
+        decode.await;
+        let db = next_ws_type(&mut ws, "snr").await["db"].clone();
+        assert!(db.is_number(), "got {db}");
+        assert_eq!(next_ws_type(&mut ws, "level").await["level"], 1);
+        let reply = ws_status_reply(&mut ws).await;
+        assert_eq!(reply["snr"], db);
+        assert_eq!(reply["level"], 1);
         task.abort();
     }
 
