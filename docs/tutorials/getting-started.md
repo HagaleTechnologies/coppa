@@ -74,6 +74,10 @@ Reading 65520 samples from cq.wav
 Decoded: "CQ CQ CQ DE VK2ABC K"  (SNR: 25.7 dB)
 ```
 
+Status lines such as `Reading ...` go to stderr and stdout carries only the
+decoded frames, so `coppa rx cq.wav > decoded.txt` captures just the decoded
+lines.
+
 Payloads that aren't valid UTF-8 print as `Decoded (hex): …`; `--hex` forces hex, and `--raw` prints only the hex for scripts.
 
 For a stream that scripts can parse, use `--json`:

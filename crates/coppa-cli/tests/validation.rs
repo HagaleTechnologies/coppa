@@ -216,8 +216,15 @@ fn help_layout() {
     let tune = run(&["tune", "--help"]);
     assert_ok(&tune);
     let tune = stdout(&tune);
-    for needle in ["-d, --duration <SECONDS>", "--single <HZ>", "--ptt-lead-ms <MS>"] {
-        assert!(tune.contains(needle), "tune --help lacks {needle:?}:\n{tune}");
+    for needle in [
+        "-d, --duration <SECONDS>",
+        "--single <HZ>",
+        "--ptt-lead-ms <MS>",
+    ] {
+        assert!(
+            tune.contains(needle),
+            "tune --help lacks {needle:?}:\n{tune}"
+        );
     }
     assert!(!tune.contains("--seconds"), "{tune}");
 

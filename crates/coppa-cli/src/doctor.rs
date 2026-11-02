@@ -5,7 +5,6 @@ use clap::Args;
 use coppa_audio::{DeviceProbe, DeviceSupport, Direction, OpenedFormat, Support};
 use coppa_radio::RigctldClient;
 use std::fmt;
-use std::io::Write;
 
 #[derive(Args, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DoctorArgs {
@@ -422,8 +421,8 @@ fn verdict(checks: &[Check]) -> Result<()> {
 
 pub(crate) fn cmd_doctor(args: &DoctorArgs) -> Result<()> {
     let rate = coppa_engine::config::EngineConfig::default().sample_rate;
-    println!("{HEADER}");
-    let _ = std::io::stdout().flush();
+    // `emit` flushes, so the header shows before the slower probes run.
+    crate::emit(HEADER)?;
     // A workspace sibling can enable the dependency's CPAL feature without
     // enabling this binary's live-audio paths. Report this binary's capabilities.
     let backend = if cfg!(feature = "cpal-backend") {
@@ -458,7 +457,7 @@ pub(crate) fn cmd_doctor(args: &DoctorArgs) -> Result<()> {
     } else {
         rigctld_checks(&args.rigctld)
     });
-    print!("{}", render(backend, &listing, &checks, rate));
+    crate::emit_raw(render(backend, &listing, &checks, rate).as_bytes())?;
     verdict(&checks)
 }
 

@@ -1,4 +1,9 @@
 //! Coppa CLI - command-line interface for the Coppa digital communications system.
+//!
+//! Stream rule (COP-86): stdout carries data only (decoded frames, JSON, raw
+//! PCM, reports) and is written through [`emit`]/[`emit_raw`], so a closed
+//! pipe ends the run quietly instead of panicking. Status goes to stderr.
+#![cfg_attr(not(test), deny(clippy::print_stdout))]
 
 mod doctor;
 
@@ -57,7 +62,12 @@ struct Cli {
     )]
     quiet: bool,
     /// Read settings from this file instead of searching for coppad.toml (also COPPA_CONFIG). The file must exist.
-    #[arg(long, global = true, value_name = "PATH", help_heading = "Global options")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help_heading = "Global options"
+    )]
     config: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
@@ -270,10 +280,39 @@ impl ProfileOutput {
 
 fn write_json<T: Serialize>(value: &T) -> Result<()> {
     let line = serde_json::to_string(value)?;
+    emit(line)
+}
+
+/// Write one line of data to stdout. Unlike `println!`, a closed pipe comes
+/// back as an error that `main` turns into a quiet exit 0 (COP-86).
+fn emit(line: impl std::fmt::Display) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     writeln!(stdout, "{line}")?;
     stdout.flush()?;
     Ok(())
+}
+
+/// Write bytes to stdout as they are, with `emit`'s closed-pipe handling.
+fn emit_raw(bytes: &[u8]) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(bytes)?;
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Whether `rx` prints status lines: not under `--quiet`, and not when
+/// stdout is a `--raw` or `--json` capture (COP-58).
+fn status_enabled(verbosity: Verbosity, raw: bool, json: bool) -> bool {
+    verbosity != Verbosity::Quiet && !raw && !json
+}
+
+/// True when `error` comes from writing to a pipe whose reader has gone.
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
 }
 
 /// Printed on stderr every time the hidden `listen` alias runs (COP-56).
@@ -546,7 +585,21 @@ fn init_logging() {
         .init();
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        // The reader of stdout went away (`coppa rx f.wav | head -1`): it
+        // chose to stop, so stop quietly, as `head` does.
+        Err(error) if is_broken_pipe(&error) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            // Byte-identical to anyhow's own `Termination` output.
+            eprintln!("Error: {error:?}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     init_logging();
 
@@ -674,8 +727,8 @@ fn main() -> Result<()> {
             vox,
         )?,
         None => {
-            println!("Coppa - Ham Radio Digital Communications System");
-            println!("Use --help for available commands");
+            emit("Coppa - Ham Radio Digital Communications System")?;
+            emit("Use --help for available commands")?;
         }
     }
 
@@ -730,7 +783,7 @@ fn write_wav_output(
         sink.write(samples)?;
         sink.stop()?;
         if verbosity != Verbosity::Quiet {
-            println!("Written to {}", path);
+            eprintln!("Written to {}", path);
         }
     }
     #[cfg(not(feature = "file-backend"))]
@@ -739,7 +792,7 @@ fn write_wav_output(
         let _ = samples;
         let _ = sample_rate;
         if verbosity != Verbosity::Quiet {
-            println!("File output not available (compile with file-backend feature)");
+            eprintln!("File output not available (compile with file-backend feature)");
         }
     }
     Ok(())
@@ -775,8 +828,7 @@ fn tune_seconds(s: &str) -> Result<f32, String> {
 
 /// `coppa tune --single`: an audio tone inside the SSB passband.
 fn tune_single_hz(s: &str) -> Result<f32, String> {
-    let message =
-        format!("must be between {TUNE_SINGLE_MIN_HZ} and {TUNE_SINGLE_MAX_HZ} Hz");
+    let message = format!("must be between {TUNE_SINGLE_MIN_HZ} and {TUNE_SINGLE_MAX_HZ} Hz");
     let value = parse_finite(s, &message)?;
     if (TUNE_SINGLE_MIN_HZ..=TUNE_SINGLE_MAX_HZ).contains(&value) {
         Ok(value)
@@ -1202,11 +1254,11 @@ fn cmd_tx(
     }
 
     if verbosity != Verbosity::Quiet {
-        println!("Encoding: \"{}\"", message);
+        eprintln!("Encoding: \"{}\"", message);
     }
     let samples = core.encode(message)?;
     if verbosity != Verbosity::Quiet {
-        println!("Generated {} audio samples", samples.len());
+        eprintln!("Generated {} audio samples", samples.len());
     }
     if verbosity.is_verbose() {
         let duration_s = samples.len() as f64 / core.config().sample_rate as f64;
@@ -1248,7 +1300,9 @@ fn cmd_tx(
                 cli_gate_decision(gate.profile, gate.occupied_hz, None, gate.stated)?;
                 let _ = rig;
                 if verbosity != Verbosity::Quiet {
-                    println!("Live audio output not available (compile with cpal-backend feature)");
+                    eprintln!(
+                        "Live audio output not available (compile with cpal-backend feature)"
+                    );
                 }
             }
         }
@@ -1284,11 +1338,11 @@ fn cmd_tune(
 
     if verbosity != Verbosity::Quiet {
         match single {
-            Some(freq) => println!(
+            Some(freq) => eprintln!(
                 "Generating single-tone calibration signal: {} Hz, {:.1}s",
                 freq, seconds
             ),
-            None => println!(
+            None => eprintln!(
                 "Generating two-tone calibration signal: {} Hz + {} Hz, {:.1}s",
                 coppa_engine::TUNE_TONE_LOW_HZ,
                 coppa_engine::TUNE_TONE_HIGH_HZ,
@@ -1299,7 +1353,7 @@ fn cmd_tune(
 
     let samples = core.tune_tone(seconds, single);
     if verbosity != Verbosity::Quiet {
-        println!("Generated {} audio samples", samples.len());
+        eprintln!("Generated {} audio samples", samples.len());
     }
 
     match output {
@@ -1337,7 +1391,9 @@ fn cmd_tune(
                 cli_gate_decision(gate.profile, gate.occupied_hz, None, gate.stated)?;
                 let _ = rig;
                 if verbosity != Verbosity::Quiet {
-                    println!("Live audio output not available (compile with cpal-backend feature)");
+                    eprintln!(
+                        "Live audio output not available (compile with cpal-backend feature)"
+                    );
                 }
             }
         }
@@ -1384,14 +1440,14 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
             let total = source.total_samples();
             // The checked WAV rate is the engine rate; no resampling occurs.
             let limit = file_sample_limit(total, args.duration, source.sample_rate());
-            if verbosity != Verbosity::Quiet && !args.raw && !args.json {
+            if status_enabled(verbosity, args.raw, args.json) {
                 if limit < total {
-                    println!(
+                    eprintln!(
                         "Reading the first {} s ({} of {} samples) from {}",
                         args.duration, limit, total, path
                     );
                 } else {
-                    println!("Reading {} samples from {}", total, path);
+                    eprintln!("Reading {} samples from {}", total, path);
                 }
             }
             source.start()?;
@@ -1424,7 +1480,7 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 anyhow::bail!("File input not available (compile with file-backend feature)");
             }
             if verbosity != Verbosity::Quiet {
-                println!("File input not available (compile with file-backend feature)");
+                eprintln!("File input not available (compile with file-backend feature)");
             }
         }
     } else {
@@ -1456,15 +1512,15 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 );
             }
             source.start()?;
-            let chatty = verbosity != Verbosity::Quiet && !args.raw && !args.json;
+            let chatty = status_enabled(verbosity, args.raw, args.json);
             if chatty {
                 if args.duration > 0 {
-                    println!(
+                    eprintln!(
                         "Listening for live audio for {} s (Ctrl+C to stop)...",
                         args.duration
                     );
                 } else {
-                    println!("Listening for live audio (Ctrl+C to stop)...");
+                    eprintln!("Listening for live audio (Ctrl+C to stop)...");
                 }
             }
             let deadline = live_deadline(std::time::Instant::now(), args.duration);
@@ -1480,7 +1536,7 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
             source.stop()?;
             summary.check_failure()?;
             if chatty && args.duration > 0 {
-                println!("Stopped listening after {} s.", args.duration);
+                eprintln!("Stopped listening after {} s.", args.duration);
             }
         }
         #[cfg(not(feature = "cpal-backend"))]
@@ -1496,7 +1552,7 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 anyhow::bail!("Live audio input not available (compile with cpal-backend feature)");
             }
             if verbosity != Verbosity::Quiet {
-                println!("Live audio input not available (compile with cpal-backend feature)");
+                eprintln!("Live audio input not available (compile with cpal-backend feature)");
             }
         }
     }
@@ -1671,10 +1727,8 @@ fn handle_stream_frame(
             }
             summary.good_frames += 1;
             match output_mode {
-                RxOutputMode::Raw => println!("{}", hex_string(bytes)),
-                RxOutputMode::Text { hex } => {
-                    println!("{}", format_decoded(bytes, frame.snr_db, hex));
-                }
+                RxOutputMode::Raw => emit(hex_string(bytes))?,
+                RxOutputMode::Text { hex } => emit(format_decoded(bytes, frame.snr_db, hex))?,
                 RxOutputMode::Json => write_json(&RxFrameOutput::from_frame(frame, bytes))?,
             }
             if verbosity.is_verbose() {
@@ -1709,9 +1763,9 @@ fn cmd_loopback(
     verbosity: Verbosity,
 ) -> Result<()> {
     if verbosity != Verbosity::Quiet {
-        println!("Coppa Loopback Test");
-        println!("===================");
-        println!("Input: \"{}\"", message);
+        emit("Coppa Loopback Test")?;
+        emit("===================")?;
+        emit(format_args!("Input: \"{}\"", message))?;
     }
 
     let core = build_core(profile, level)?;
@@ -1726,22 +1780,22 @@ fn cmd_loopback(
 
     let samples = core.encode(message)?;
     if verbosity != Verbosity::Quiet {
-        println!("Encoded: {} samples", samples.len());
+        emit(format_args!("Encoded: {} samples", samples.len()))?;
     }
 
     let decoded = core.decode(&samples)?;
     if verbosity != Verbosity::Quiet {
-        println!("Decoded: \"{}\"", decoded);
+        emit(format_args!("Decoded: \"{}\"", decoded))?;
     }
 
     if message == decoded {
         if verbosity != Verbosity::Quiet {
-            println!("PASS: Loopback test successful!");
+            emit("PASS: Loopback test successful!")?;
         }
     } else {
-        println!("FAIL: Messages don't match!");
-        println!("  Expected: \"{}\"", message);
-        println!("  Got:      \"{}\"", decoded);
+        emit("FAIL: Messages don't match!")?;
+        emit(format_args!("  Expected: \"{}\"", message))?;
+        emit(format_args!("  Got:      \"{}\"", decoded))?;
         std::process::exit(1);
     }
 
@@ -1755,7 +1809,7 @@ fn cmd_devices(json: bool) -> Result<()> {
         return write_json(&output);
     }
     for line in device_lines(&devices) {
-        println!("{line}");
+        emit(line)?;
     }
     Ok(())
 }
@@ -1786,8 +1840,7 @@ fn cmd_profiles(args: &ProfilesArgs) -> Result<()> {
     if args.json {
         return write_json_profiles(args);
     }
-    print!("{}", render_profiles(args)?);
-    Ok(())
+    emit_raw(render_profiles(args)?.as_bytes())
 }
 
 /// `profiles --json`: an array of every named profile, one profile object with
@@ -3233,11 +3286,35 @@ mod tests {
     }
 
     #[test]
+    fn is_broken_pipe_finds_the_io_error_in_the_chain() {
+        let pipe = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone");
+        assert!(is_broken_pipe(&anyhow::Error::new(pipe)));
+        let wrapped =
+            anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone"))
+                .context("writing raw audio");
+        assert!(is_broken_pipe(&wrapped));
+        let other = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        assert!(!is_broken_pipe(&anyhow::Error::new(other)));
+        assert!(!is_broken_pipe(&anyhow::anyhow!("Broken pipe")));
+    }
+
+    #[test]
+    fn status_enabled_follows_quiet_raw_and_json() {
+        assert!(status_enabled(Verbosity::Normal, false, false));
+        assert!(status_enabled(Verbosity::Verbose(1), false, false));
+        assert!(!status_enabled(Verbosity::Quiet, false, false));
+        assert!(!status_enabled(Verbosity::Normal, true, false));
+        assert!(!status_enabled(Verbosity::Normal, false, true));
+    }
+
+    #[test]
     fn tune_seconds_parser_bounds() {
         assert_eq!(tune_seconds("120"), Ok(120.0));
         assert_eq!(tune_seconds("0.01"), Ok(0.01));
         assert_eq!(tune_seconds(" 5 "), Ok(5.0));
-        for bad in ["0", "-0", "120.01", "-1", "NaN", "nan", "inf", "-inf", "1e12", "ten", ""] {
+        for bad in [
+            "0", "-0", "120.01", "-1", "NaN", "nan", "inf", "-inf", "1e12", "ten", "",
+        ] {
             assert_eq!(
                 tune_seconds(bad),
                 Err("must be more than 0 and at most 120 seconds".to_string()),
