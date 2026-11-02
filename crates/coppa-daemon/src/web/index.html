@@ -1,9 +1,15 @@
 <!doctype html>
 <!--
-  COP-79: the page coppad serves at GET / on its WebSocket port. It is served
-  without a token, so it must never hold one: the operator types the token,
-  it stays in memory, and it is sent only as the ?token= value of the page's
-  own /ws upgrade, which the COP-53 gate checks. No external requests.
+  COP-79 / COP-83: the operator dashboard coppad serves at GET / on its
+  WebSocket port. It is served without a token, so it must never hold one:
+  the operator types the token, it stays in memory (auto-reconnect reuses the
+  in-memory value), and it is sent only as the ?token= value of the page's own
+  /ws upgrade, which the COP-53 gate checks. No external requests.
+
+  One inline script. DOM writes go through textContent, createElement and
+  attribute setters only. Every request goes through request(type, fields).
+  The wire format is WebSocket protocol v1 (docs/OPERATING.md, "Dashboard
+  protocol v1"); unknown fields and message types are ignored.
 -->
 <html lang="en">
 <head>
@@ -11,73 +17,748 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Coppa operator dashboard</title>
 <style>
-  body { font-family: system-ui, sans-serif; margin: 2rem; }
-  #rx-level { font-family: ui-monospace, monospace; white-space: pre; }
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9; --card: #ffffff; --fg: #1d2330; --muted: #5d6675;
+    --line: #d5d9e0; --accent: #2f6fd6; --ok: #1f8a4c; --warn: #b26a00;
+    --bad: #c62828; --lamp: #e3e6eb; --canvas: #10131a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --card: #1b1f27; --fg: #e4e7ec; --muted: #9aa3b2;
+      --line: #2e3440; --accent: #6ea0ff; --ok: #4cc27f; --warn: #f0a838;
+      --bad: #ff6b6b; --lamp: #2a303b; --canvas: #0a0c10;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; margin: 0; background: var(--bg); color: var(--fg); }
+  header { padding: 0.75rem 1rem; border-bottom: 1px solid var(--line); background: var(--card); }
+  h1 { font-size: 1.25rem; margin: 0 0 0.5rem; }
+  h2 { font-size: 1rem; margin: 0 0 0.5rem; }
+  .strip { display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem; align-items: center; }
+  .lamp { padding: 0.15rem 0.6rem; border-radius: 0.75rem; background: var(--lamp); font-weight: 600; }
+  .lamp.tx { background: var(--bad); color: #fff; }
+  .lamp.busy { background: var(--warn); color: #000; }
+  .lamp.blink { animation: blink 1s steps(2, start) infinite; }
+  @keyframes blink { to { visibility: hidden; } }
+  main { display: grid; grid-template-columns: 1fr; gap: 0.75rem; padding: 0.75rem; }
+  @media (min-width: 800px) { main { grid-template-columns: 1fr 1fr; } .wide { grid-column: 1 / -1; } }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 0.5rem; padding: 0.75rem; min-width: 0; }
+  .sub + .sub { margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--line); }
+  canvas { display: block; width: 100%; background: var(--canvas); border-radius: 0.25rem; }
+  .axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 0.8rem; }
+  .mono { font-family: ui-monospace, monospace; white-space: pre-wrap; }
+  .muted { color: var(--muted); }
+  .meter { position: relative; height: 1rem; background: var(--lamp); border-radius: 0.25rem; overflow: hidden; margin: 0.25rem 0; }
+  .meter .fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: var(--ok); }
+  .meter .fill.clipping { background: var(--bad); }
+  .meter .fill.underdrive { background: var(--warn); }
+  .meter .tick { position: absolute; top: 0; bottom: 0; width: 2px; left: 0; background: var(--fg); }
+  .buttons { display: flex; flex-wrap: wrap; gap: 0.25rem; margin: 0.4rem 0; }
+  button { font: inherit; padding: 0.25rem 0.6rem; border: 1px solid var(--line); border-radius: 0.25rem; background: var(--lamp); color: var(--fg); cursor: pointer; }
+  button[aria-pressed="true"] { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 700; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  input { font: inherit; padding: 0.2rem 0.4rem; border: 1px solid var(--line); border-radius: 0.25rem; background: var(--bg); color: var(--fg); }
+  #log { height: 14rem; overflow-y: auto; font-size: 0.85rem; }
+  .row { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; margin: 0.25rem 0; }
+  #send-data { flex: 1; min-width: 12rem; }
 </style>
 </head>
 <body>
-<h1>Coppa modem daemon</h1>
-<p id="ws-status">WebSocket: Not connected</p>
-<form id="connect">
-  <label for="token">Access token:</label>
-  <input id="token" type="password" autocomplete="off" required>
-  <button type="submit">Connect</button>
-</form>
-<p id="rx-level">RX level: —</p>
+<header>
+  <h1>Coppa operator dashboard</h1>
+  <form id="token-form" class="row">
+    <label for="token">Access token:</label>
+    <input id="token" type="password" autocomplete="off" required>
+    <button type="submit">Connect</button>
+  </form>
+  <div class="strip">
+    <span id="conn">Connection: Not connected</span>
+    <span id="daemon">Daemon: —</span>
+    <span id="mycall-line">MYCALL —</span>
+    <span id="ptt-lamp" class="lamp">PTT: —</span>
+    <span id="busy-lamp" class="lamp">Channel: —</span>
+  </div>
+</header>
+<main>
+  <section>
+    <h2 id="wf-title">Waterfall</h2>
+    <p id="wf-empty" class="muted">No spectrum received yet. The daemon sends one only while it receives audio.</p>
+    <canvas id="waterfall" width="512" height="240" aria-label="Waterfall"></canvas>
+    <canvas id="spectrum" width="512" height="80" aria-label="Spectrum"></canvas>
+    <div class="axis"><span id="wf-low"></span><span id="wf-high"></span></div>
+  </section>
+  <section>
+    <div class="sub">
+      <h2>RX level</h2>
+      <div class="meter" aria-hidden="true"><div id="rx-fill" class="fill"></div><div id="rx-tick" class="tick"></div></div>
+      <div id="rx-text">waiting for audio</div>
+      <div id="tx-text" class="muted">Last TX level: —</div>
+    </div>
+    <div class="sub">
+      <h2>S/N</h2>
+      <div id="snr-text">No frame decoded yet</div>
+      <canvas id="sparkline" width="240" height="40" aria-label="S/N sparkline"></canvas>
+      <div class="muted">last 2 min</div>
+      <div id="cfo-text">CFO —</div>
+    </div>
+    <div class="sub">
+      <h2>Speed level</h2>
+      <div class="row"><span id="tx-level">TX —</span><span id="rx-level" class="muted">RX —</span></div>
+      <div id="level-buttons" class="buttons"></div>
+      <div id="level-result" class="muted"></div>
+      <div id="buffer-text">Buffer —</div>
+    </div>
+  </section>
+  <section>
+    <div class="sub">
+      <h2>Session</h2>
+      <div id="session-text">No session</div>
+      <div id="link-text" class="muted"></div>
+    </div>
+    <div class="sub">
+      <h2>Heard</h2>
+      <div id="heard" class="mono"></div>
+    </div>
+  </section>
+  <section>
+    <h2>TUNE</h2>
+    <div class="row">
+      <label for="tune-seconds">Seconds</label>
+      <input id="tune-seconds" type="number" min="1" max="30" step="1" value="10" size="5">
+      <button id="tune-two" type="button">Two-tone</button>
+      <button id="tune-single" type="button">Single tone 1500 Hz</button>
+    </div>
+    <div id="tune-note" class="muted" hidden>Unavailable while transmitting</div>
+    <div id="tune-result" class="muted"></div>
+  </section>
+  <section class="wide">
+    <h2>Log</h2>
+    <div id="log" class="mono"></div>
+  </section>
+  <section class="wide">
+    <div class="row">
+      <label for="mycall-input">MYCALL</label>
+      <input id="mycall-input" size="10" autocomplete="off">
+      <button id="mycall-set" type="button">Set</button>
+      <label for="call-input">Call station</label>
+      <input id="call-input" size="10" autocomplete="off">
+      <button id="call-button" type="button">Call</button>
+      <button id="disconnect-button" type="button">Disconnect</button>
+    </div>
+    <form id="send-form" class="row">
+      <label for="send-data">Send</label>
+      <input id="send-data" autocomplete="off" placeholder="Connect a session to send">
+      <button id="send-button" type="submit">Send</button>
+    </form>
+    <div id="command-result" class="muted"></div>
+  </section>
+</main>
 <script>
 "use strict";
-const statusLine = document.getElementById("ws-status");
-const levelLine = document.getElementById("rx-level");
-const tokenInput = document.getElementById("token");
-let socket = null;
 
-function setStatus(text) { statusLine.textContent = "WebSocket: " + text; }
-function setLevel(text) { levelLine.textContent = "RX level: " + text; }
-function dbfs(value) { return Number(value).toFixed(1); }
+// ---- State -------------------------------------------------------------
 
-document.getElementById("connect").addEventListener("submit", (event) => {
-  event.preventDefault();
-  if (socket) {
-    socket.onclose = null;
-    socket.close();
+const RETRY_S = [1, 2, 4, 8, 15];
+const SNR_WINDOW_MS = 120000;
+const LOG_CAP = 500;
+const $ = (id) => document.getElementById(id);
+
+const state = {
+  token: "",
+  socket: null,
+  phase: "idle", // idle | connecting | open | refused | lost | version
+  serverVersion: null,
+  autoRetry: false,
+  retryIndex: 0,
+  retryAt: 0,
+  retryTimer: null,
+  nextId: 0,
+  pending: new Map(),
+  openedAt: 0,
+  lastStatusAt: 0,
+  status: null,
+  ptt: null,
+  pttSince: 0,
+  busy: null,
+  mycall: undefined,
+  speedLevel: null,
+  speedMode: null,
+  speedLevels: null,
+  levelKey: "",
+  rxLevel: null,
+  buffer: null,
+  snrPoints: [],
+  lastSnr: null,
+  lastSnrAt: 0,
+  cfo: null,
+  session: { connected: false, call: null, since: 0, calling: null },
+  link: null,
+  heard: [],
+  heardKey: "",
+  rxAudio: null,
+  txAudio: null,
+  wf: { have: false, low: null, high: null, floor: 0, ceil: 0 },
+};
+
+function now() { return performance.now(); }
+function pad2(n) { return String(n).padStart(2, "0"); }
+function clock(ms) {
+  const d = new Date(ms);
+  return pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
+}
+function duration(seconds) {
+  const s = Math.max(0, Math.floor(seconds));
+  return pad2(Math.floor(s / 3600)) + ":" + pad2(Math.floor(s / 60) % 60) + ":" + pad2(s % 60);
+}
+function db1(v) { return Number(v).toFixed(1); }
+function isOpen() { return state.phase === "open"; }
+function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+// ---- Socket and request ------------------------------------------------
+
+// The one place a frame leaves the page. `onResult(error)` gets null on
+// `ack`, or the `error` message text.
+function request(type, fields, onResult) {
+  const ws = state.socket;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    if (onResult) onResult("not connected");
+    return;
   }
+  state.nextId += 1;
+  const id = state.nextId;
+  if (onResult) state.pending.set(id, onResult);
+  ws.send(JSON.stringify(Object.assign({}, fields || {}, { type: type, id: id })));
+}
+
+function outcome(element, label) {
+  return (error) => {
+    element.textContent = error == null ? label + ": accepted" : label + ": refused: " + error;
+  };
+}
+
+function connect(auto) {
+  if (state.retryTimer) { clearTimeout(state.retryTimer); state.retryTimer = null; }
+  if (state.socket) { state.socket.onclose = null; state.socket.close(); state.socket = null; }
   const scheme = location.protocol === "https:" ? "wss:" : "ws:";
-  const url = scheme + "//" + location.host + "/ws?token=" +
-    encodeURIComponent(tokenInput.value);
+  const url = scheme + "//" + location.host + "/ws?token=" + encodeURIComponent(state.token);
+  state.autoRetry = auto;
+  state.phase = "connecting";
   let opened = false;
-  setStatus("Connecting…");
-  setLevel("—");
   const ws = new WebSocket(url);
-  socket = ws;
+  state.socket = ws;
   ws.onopen = () => {
     opened = true;
-    setStatus("Connected");
-    setLevel("waiting for audio");
-    ws.send(JSON.stringify({ type: "audio_level", enabled: true }));
+    state.openedAt = now();
+    state.lastStatusAt = 0;
   };
-  ws.onmessage = (message) => {
+  ws.onmessage = (event) => {
     let msg;
-    try {
-      msg = JSON.parse(message.data);
-    } catch (_) {
-      return;
-    }
-    if (msg.type === "audio_level" && msg.direction === "rx") {
-      setLevel("peak " + dbfs(msg.peak_dbfs) + " dBFS  rms " +
-        dbfs(msg.rms_dbfs) + " dBFS  state " + msg.state);
-    }
+    try { msg = JSON.parse(event.data); } catch (_) { return; }
+    if (msg && typeof msg.type === "string") handle(msg);
   };
   ws.onclose = () => {
-    // A browser hides the handshake's 401/403; a socket that never opened
-    // was refused (or the daemon is unreachable).
-    setStatus(opened ? "Not connected"
-      : "Refused: check the token and [host] websocket_allowed_origins");
-    setLevel("—");
-    if (socket === ws) {
-      socket = null;
+    if (state.socket !== ws) return;
+    state.socket = null;
+    for (const settle of state.pending.values()) settle("connection closed");
+    state.pending.clear();
+    resetLive();
+    // A browser hides the handshake's 401/403: a socket that never opened on
+    // the operator's own attempt was refused or the daemon is unreachable.
+    if (!opened && !auto) {
+      state.phase = "refused";
+      $("token-form").hidden = false;
+    } else if (state.phase !== "version") {
+      scheduleRetry();
     }
+    render();
   };
+  render();
+}
+
+function scheduleRetry() {
+  const delay = RETRY_S[Math.min(state.retryIndex, RETRY_S.length - 1)];
+  state.retryIndex += 1;
+  state.phase = "lost";
+  state.retryAt = now() + delay * 1000;
+  state.retryTimer = setTimeout(() => { state.retryTimer = null; connect(true); }, delay * 1000);
+}
+
+function resetLive() {
+  state.status = null;
+  state.ptt = null;
+  state.busy = null;
+  state.mycall = undefined;
+  state.rxAudio = null;
+}
+
+function onHello(msg) {
+  state.serverVersion = msg.version;
+  if (msg.version !== 1) {
+    state.phase = "version";
+    return;
+  }
+  state.phase = "open";
+  state.retryIndex = 0;
+  $("token-form").hidden = true;
+  request("spectrum", { enabled: true });
+  request("audio_level", { enabled: true });
+  request("log", { enabled: true });
+  request("status");
+}
+
+$("token-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  state.token = $("token").value;
+  $("token").value = "";
+  state.retryIndex = 0;
+  connect(false);
 });
+
+// ---- Message handlers --------------------------------------------------
+
+function handle(msg) {
+  switch (msg.type) {
+    case "hello": onHello(msg); break;
+    case "ack": settle(msg.id, null); break;
+    case "error":
+      if (msg.id != null && state.pending.has(msg.id)) settle(msg.id, msg.message);
+      else addLog(Date.now(), "ERROR", String(msg.message));
+      break;
+    case "status": applyStatus(msg); break;
+    case "ptt": setPtt(msg.state === true, null); break;
+    case "busy": state.busy = msg.state === true; break;
+    case "snr": addSnr(msg.db); break;
+    case "level": state.rxLevel = msg.level; break;
+    case "buffer": state.buffer = msg.bytes; break;
+    case "speed_level": state.speedLevel = msg.level; state.speedMode = msg.mode; break;
+    case "session": applySession(msg.state === "connected", msg.remote_call || null, true); break;
+    case "heard": if (Array.isArray(msg.stations)) state.heard = msg.stations; break;
+    case "data":
+      addLog(Date.now(), null, msg.encoding === "base64"
+        ? "RX data (base64): " + msg.data : "RX data: " + msg.data);
+      break;
+    case "log": addLog(msg.timestamp_ms, String(msg.level).toUpperCase(), String(msg.message)); break;
+    case "spectrum": drawSpectrum(msg); break;
+    case "audio_level": applyAudioLevel(msg); break;
+    default: break;
+  }
+  render();
+}
+
+function settle(id, error) {
+  const done = state.pending.get(id);
+  if (!done) return;
+  state.pending.delete(id);
+  done(error);
+}
+
+function applyStatus(msg) {
+  state.pending.delete(msg.id);
+  state.lastStatusAt = now();
+  state.status = msg;
+  if (typeof msg.ptt === "boolean") setPtt(msg.ptt, typeof msg.ptt_keyed_ms === "number" ? msg.ptt_keyed_ms : null);
+  if (typeof msg.busy === "boolean") state.busy = msg.busy;
+  // `max_tx_s` marks a reply carrying daemon data; without it, MYCALL is unknown.
+  state.mycall = typeof msg.mycall === "string" ? msg.mycall
+    : typeof msg.max_tx_s === "number" ? null : undefined;
+  if (typeof msg.buffer === "number") state.buffer = msg.buffer;
+  if (typeof msg.speed_level === "number") state.speedLevel = msg.speed_level;
+  if (typeof msg.speed_level_mode === "string") state.speedMode = msg.speed_level_mode;
+  if (Array.isArray(msg.speed_levels)) state.speedLevels = msg.speed_levels;
+  if (typeof msg.level === "number") state.rxLevel = msg.level;
+  if (typeof msg.cfo === "number") state.cfo = msg.cfo;
+  if (typeof msg.snr === "number" && state.lastSnr === null) state.lastSnr = msg.snr;
+  if (Array.isArray(msg.heard)) state.heard = msg.heard;
+  state.link = msg.link || null;
+  if (msg.connected !== state.session.connected) applySession(msg.connected === true, msg.remote_call || null, false);
+  if (typeof msg.max_tune_s === "number") $("tune-seconds").max = String(msg.max_tune_s);
+  const input = $("mycall-input");
+  if (state.mycall && input.value === "" && document.activeElement !== input) input.value = state.mycall;
+}
+
+function setPtt(on, keyedMs) {
+  const was = state.ptt;
+  if (on) {
+    if (keyedMs !== null) state.pttSince = now() - keyedMs;
+    else if (was !== true) state.pttSince = now();
+  }
+  state.ptt = on;
+  if (was !== null && was !== on) markEdge(on);
+}
+
+function applySession(connected, call, fromPush) {
+  if (connected) {
+    state.session = { connected: true, call: call, since: fromPush ? now() : 0, calling: null };
+  } else if (fromPush || !state.session.calling) {
+    state.session = { connected: false, call: null, since: 0, calling: null };
+  }
+}
+
+function addSnr(db) {
+  const t = now();
+  state.lastSnr = db;
+  state.lastSnrAt = t;
+  state.snrPoints.push({ t: t, db: db });
+}
+
+function applyAudioLevel(msg) {
+  if (msg.direction === "rx") state.rxAudio = msg;
+  else if (msg.direction === "tx") state.txAudio = msg;
+}
+
+function addLog(timestampMs, level, text) {
+  const pane = $("log");
+  const stick = pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 4;
+  const empty = pane.querySelector(".empty");
+  if (empty) empty.remove();
+  const line = document.createElement("div");
+  line.textContent = clock(Number(timestampMs) || Date.now()) + " " + (level ? level + " " : "") + text;
+  pane.appendChild(line);
+  while (pane.childElementCount > LOG_CAP) pane.firstElementChild.remove();
+  if (stick) pane.scrollTop = pane.scrollHeight;
+}
+
+// ---- Renderers ---------------------------------------------------------
+
+function connectionText() {
+  switch (state.phase) {
+    case "connecting": return "Connection: Connecting…";
+    case "open": return "Connection: Connected";
+    case "refused":
+      return "Connection: Refused or unreachable: check the token, and that [host] websocket_allowed_origins lists \"" + location.origin + "\"";
+    case "lost":
+      return "Connection: Connection lost; reconnecting in " + Math.max(1, Math.ceil((state.retryAt - now()) / 1000)) + " s…";
+    case "version":
+      return "Connection: Connected, but the daemon speaks protocol version " + state.serverVersion + "; this page expects protocol version 1";
+    default: return "Connection: Not connected";
+  }
+}
+
+function daemonText() {
+  if (!isOpen()) return "Daemon: —";
+  const since = state.lastStatusAt || state.openedAt;
+  const quiet = now() - since;
+  if (quiet >= 5000) return "Daemon: not answering for " + Math.floor(quiet / 1000) + " s";
+  const s = state.status;
+  if (!s) return "Daemon: —";
+  if (typeof s.loop_age_ms === "number" && s.loop_age_ms >= 3000) {
+    return "Daemon: event loop stalled for " + Math.floor(s.loop_age_ms / 1000) + " s";
+  }
+  if (s.waiting_for_clear_channel === true) return "Daemon: waiting for a clear channel to transmit";
+  return "Daemon: running";
+}
+
+function renderHeader() {
+  $("conn").textContent = connectionText();
+  $("daemon").textContent = daemonText();
+  $("mycall-line").textContent = !isOpen() || state.mycall === undefined ? "MYCALL —"
+    : state.mycall ? "MYCALL " + state.mycall : "MYCALL not set";
+  const lamp = $("ptt-lamp");
+  lamp.className = "lamp";
+  if (!isOpen() || state.ptt === null) {
+    lamp.textContent = "PTT: —";
+  } else if (!state.ptt) {
+    lamp.textContent = "PTT: RX";
+  } else {
+    const elapsed = (now() - state.pttSince) / 1000;
+    const max = state.status && typeof state.status.max_tx_s === "number" ? state.status.max_tx_s : null;
+    lamp.classList.add("tx");
+    if (max !== null && elapsed > max + 2) {
+      lamp.classList.add("blink");
+      lamp.textContent = "PTT: TX " + Math.floor(elapsed) + " s: past the " + max + " s limit. Check the radio and the PTT line.";
+    } else {
+      lamp.textContent = "PTT: TX " + elapsed.toFixed(1) + " s" + (max !== null ? " of " + max + " s" : "");
+    }
+  }
+  const busy = $("busy-lamp");
+  busy.className = "lamp";
+  if (!isOpen() || state.busy === null) busy.textContent = "Channel: —";
+  else if (state.busy) { busy.textContent = "Channel: busy"; busy.classList.add("busy"); }
+  else busy.textContent = "Channel: clear";
+}
+
+function renderLevels() {
+  const keyed = isOpen() && state.ptt === true;
+  const rx = state.rxAudio;
+  const fill = $("rx-fill");
+  const tick = $("rx-tick");
+  const pct = (dbfs) => Math.max(0, Math.min(100, (Number(dbfs) + 60) / 60 * 100)) + "%";
+  if (keyed || !rx) {
+    $("rx-text").textContent = keyed ? "paused while transmitting" : "waiting for audio";
+    fill.style.width = "0";
+    tick.style.left = "0";
+  } else {
+    $("rx-text").textContent = "peak " + db1(rx.peak_dbfs) + " dBFS · rms " + db1(rx.rms_dbfs) + " dBFS · " + rx.state;
+    fill.className = "fill " + rx.state;
+    fill.style.width = pct(rx.rms_dbfs);
+    tick.style.left = pct(rx.peak_dbfs);
+  }
+  const tx = state.txAudio;
+  $("tx-text").textContent = tx
+    ? "Last TX level: peak " + db1(tx.peak_dbfs) + " dBFS · rms " + db1(tx.rms_dbfs) + " dBFS · " + tx.state + " (" + (tx.duration_ms / 1000).toFixed(1) + " s)"
+    : "Last TX level: —";
+}
+
+function renderSnr() {
+  if (state.lastSnr === null) $("snr-text").textContent = "No frame decoded yet";
+  else if (state.lastSnrAt) $("snr-text").textContent = state.lastSnr + " dB · last frame " + Math.floor((now() - state.lastSnrAt) / 1000) + " s ago";
+  else $("snr-text").textContent = state.lastSnr + " dB";
+  $("cfo-text").textContent = state.cfo === null ? "CFO —"
+    : "CFO " + (state.cfo >= 0 ? "+" : "") + state.cfo.toFixed(1) + " Hz (last decoded frame)";
+  drawSparkline();
+}
+
+function renderSpeed() {
+  $("tx-level").textContent = state.speedLevel === null ? "TX —"
+    : "TX " + state.speedLevel + " · " + (state.speedMode === "manual" ? "manual" : "auto");
+  $("rx-level").textContent = state.rxLevel === null ? "RX —" : "RX " + state.rxLevel + " (last decoded frame)";
+  const levels = state.speedLevels || [];
+  const key = levels.join(",");
+  const box = $("level-buttons");
+  if (key !== state.levelKey || box.childElementCount === 0) {
+    state.levelKey = key;
+    box.replaceChildren();
+    const choices = ["auto"].concat(levels);
+    for (const choice of choices) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = choice === "auto" ? "Auto" : String(choice);
+      button.dataset.level = String(choice);
+      button.addEventListener("click", () => setSpeedLevel(choice));
+      box.appendChild(button);
+    }
+  }
+  for (const button of box.children) {
+    const choice = button.dataset.level;
+    const pressed = choice === "auto" ? state.speedMode === "auto"
+      : state.speedMode === "manual" && String(state.speedLevel) === choice;
+    button.setAttribute("aria-pressed", pressed ? "true" : "false");
+    button.disabled = !isOpen();
+  }
+  $("buffer-text").textContent = state.buffer === null ? "Buffer —"
+    : state.buffer === 0 ? "Buffer 0 bytes" : "Buffer " + state.buffer + " bytes waiting to be sent or acknowledged";
+}
+
+function renderSession() {
+  const s = state.session;
+  let text = "No session";
+  if (s.connected) {
+    text = "Connected to " + (s.call || "—") + (s.since ? " · " + duration((now() - s.since) / 1000) : "");
+  } else if (s.calling) {
+    text = "Calling " + s.calling + "…";
+  }
+  $("session-text").textContent = text;
+  const link = state.link;
+  $("link-text").textContent = !link ? ""
+    : link.fade_hold ? "Fade hold: retransmitting at a lower level"
+    : "In flight " + link.in_flight + " · retries " + link.retries + " of " + link.max_retries + " · RTO " + (link.rto_ms / 1000).toFixed(1) + " s";
+  const rows = state.heard.slice().sort((a, b) => b.last_heard_ms - a.last_heard_ms);
+  const key = JSON.stringify(rows);
+  if (key !== state.heardKey) {
+    state.heardKey = key;
+    const box = $("heard");
+    box.replaceChildren();
+    if (rows.length === 0) {
+      box.textContent = "No stations heard yet. Stations appear here after a session connects.";
+    }
+    for (const station of rows) {
+      const row = document.createElement("div");
+      row.textContent = String(station.call).padEnd(8) + " " +
+        (station.snr_db != null ? station.snr_db + " dB" : "— dB").padEnd(7) + " " +
+        "level " + (station.level != null ? station.level : "—") + "   " + clock(station.last_heard_ms);
+      box.appendChild(row);
+    }
+  }
+  const sessionUp = isOpen() && s.connected;
+  $("send-data").disabled = !sessionUp;
+  $("send-button").disabled = !sessionUp;
+  $("mycall-set").disabled = !isOpen();
+  $("call-button").disabled = !isOpen();
+  $("disconnect-button").disabled = !isOpen();
+}
+
+function renderTune() {
+  const keyed = isOpen() && state.ptt === true;
+  $("tune-two").disabled = !isOpen() || keyed;
+  $("tune-single").disabled = !isOpen() || keyed;
+  $("tune-note").hidden = !keyed;
+}
+
+function render() {
+  renderHeader();
+  renderLevels();
+  renderSnr();
+  renderSpeed();
+  renderSession();
+  renderTune();
+}
+
+// ---- Controls ----------------------------------------------------------
+
+function setSpeedLevel(choice) {
+  const label = "Speed level " + choice;
+  request("set_speed_level", { level: choice }, outcome($("level-result"), label));
+}
+
+function tune(singleHz) {
+  const seconds = Number($("tune-seconds").value);
+  const result = outcome($("tune-result"), "TUNE");
+  if (!Number.isFinite(seconds)) { result("enter a number of seconds"); return; }
+  const fields = singleHz ? { seconds: seconds, single_hz: singleHz } : { seconds: seconds };
+  request("tune", fields, result);
+}
+
+$("tune-two").addEventListener("click", () => tune(null));
+$("tune-single").addEventListener("click", () => tune(1500));
+
+$("mycall-set").addEventListener("click", () => {
+  request("mycall", { callsign: $("mycall-input").value.trim() }, outcome($("command-result"), "mycall"));
+});
+
+$("call-button").addEventListener("click", () => {
+  const destination = $("call-input").value.trim();
+  const show = outcome($("command-result"), "connect");
+  request("connect", { source: state.mycall || "", destination: destination }, (error) => {
+    show(error);
+    if (error == null && !state.session.connected) state.session.calling = destination;
+    render();
+  });
+});
+
+$("disconnect-button").addEventListener("click", () => {
+  request("disconnect", {}, outcome($("command-result"), "disconnect"));
+});
+
+$("send-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const input = $("send-data");
+  const show = outcome($("command-result"), "send");
+  request("send", { data: input.value }, (error) => {
+    show(error);
+    if (error == null) input.value = "";
+  });
+});
+
+// ---- Canvas drawing ----------------------------------------------------
+
+const VIRIDIS = [[68, 1, 84], [59, 82, 139], [33, 145, 140], [94, 201, 98], [253, 231, 37]];
+function colour(t) {
+  const x = Math.max(0, Math.min(1, t)) * (VIRIDIS.length - 1);
+  const i = Math.min(VIRIDIS.length - 2, Math.floor(x));
+  const f = x - i;
+  const a = VIRIDIS[i];
+  const b = VIRIDIS[i + 1];
+  return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
+}
+
+function scrollWaterfall(ctx, canvas) {
+  ctx.drawImage(canvas, 0, 0, canvas.width, canvas.height - 1, 0, 1, canvas.width, canvas.height - 1);
+}
+
+function markEdge(on) {
+  if (!state.wf.have) return;
+  const canvas = $("waterfall");
+  const ctx = canvas.getContext("2d");
+  scrollWaterfall(ctx, canvas);
+  ctx.fillStyle = on ? "#e53935" : "#9e9e9e";
+  ctx.fillRect(0, 0, canvas.width, 1);
+}
+
+function drawSpectrum(msg) {
+  const bins = Array.isArray(msg.bins) ? msg.bins.map(Number) : [];
+  if (bins.length === 0) return;
+  const wf = state.wf;
+  const canvas = $("waterfall");
+  const ctx = canvas.getContext("2d");
+  if (wf.low !== msg.freq_low_hz || wf.high !== msg.freq_high_hz) {
+    wf.low = msg.freq_low_hz;
+    wf.high = msg.freq_high_hz;
+    wf.have = false;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const low = Math.round(wf.low);
+    const high = Math.round(wf.high);
+    $("wf-title").textContent = "Waterfall " + low + "–" + high + " Hz";
+    $("wf-low").textContent = low + " Hz";
+    $("wf-high").textContent = high + " Hz";
+  }
+  const sorted = bins.slice().sort((a, b) => a - b);
+  const p20 = sorted[Math.floor(0.2 * (sorted.length - 1))];
+  const max = sorted[sorted.length - 1];
+  if (!wf.have) { wf.floor = p20; wf.ceil = max; }
+  else { wf.floor += 0.1 * (p20 - wf.floor); wf.ceil += 0.1 * (max - wf.ceil); }
+  if (wf.ceil < wf.floor + 30) wf.ceil = wf.floor + 30;
+  wf.have = true;
+  $("wf-empty").hidden = true;
+  const scale = (v) => (v - wf.floor) / (wf.ceil - wf.floor);
+
+  scrollWaterfall(ctx, canvas);
+  const row = ctx.createImageData(canvas.width, 1);
+  for (let x = 0; x < canvas.width; x += 1) {
+    const c = colour(scale(bins[Math.floor(x * bins.length / canvas.width)]));
+    row.data[x * 4] = c[0];
+    row.data[x * 4 + 1] = c[1];
+    row.data[x * 4 + 2] = c[2];
+    row.data[x * 4 + 3] = 255;
+  }
+  ctx.putImageData(row, 0, 0);
+
+  const line = $("spectrum");
+  const lctx = line.getContext("2d");
+  lctx.clearRect(0, 0, line.width, line.height);
+  lctx.strokeStyle = css("--ok") || "#4cc27f";
+  lctx.lineWidth = 1.5;
+  lctx.beginPath();
+  bins.forEach((v, i) => {
+    const x = (i + 0.5) * line.width / bins.length;
+    const y = line.height - Math.max(0, Math.min(1, scale(v))) * (line.height - 2) - 1;
+    if (i === 0) lctx.moveTo(x, y); else lctx.lineTo(x, y);
+  });
+  lctx.stroke();
+}
+
+function drawSparkline() {
+  const canvas = $("sparkline");
+  const ctx = canvas.getContext("2d");
+  const t = now();
+  state.snrPoints = state.snrPoints.filter((p) => t - p.t <= SNR_WINDOW_MS);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const points = state.snrPoints;
+  if (points.length === 0) return;
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const p of points) { lo = Math.min(lo, p.db); hi = Math.max(hi, p.db); }
+  lo -= 3;
+  hi += 3;
+  const xy = (p) => [
+    (1 - (t - p.t) / SNR_WINDOW_MS) * (canvas.width - 4) + 2,
+    canvas.height - 2 - (p.db - lo) / (hi - lo) * (canvas.height - 4),
+  ];
+  ctx.strokeStyle = css("--accent") || "#6ea0ff";
+  ctx.fillStyle = ctx.strokeStyle;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  points.forEach((p, i) => {
+    const [x, y] = xy(p);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  const [lx, ly] = xy(points[points.length - 1]);
+  ctx.fillRect(lx - 2, ly - 2, 4, 4);
+}
+
+// ---- Timers ------------------------------------------------------------
+
+(function init() {
+  const empty = document.createElement("div");
+  empty.className = "empty muted";
+  empty.textContent = "No log lines yet.";
+  $("log").appendChild(empty);
+  render();
+  setInterval(() => { if (isOpen()) request("status"); }, 1000);
+  setInterval(() => { renderHeader(); renderSession(); }, 100);
+  setInterval(renderSnr, 1000);
+}());
 </script>
 </body>
 </html>

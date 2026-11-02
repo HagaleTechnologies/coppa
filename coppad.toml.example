@@ -129,6 +129,8 @@ websocket_port = 8400
 # connect, add its own origin exactly as the browser's address bar shows it,
 # e.g. "http://127.0.0.1:8400" (and "http://localhost:8400" if you open it by
 # that name), to websocket_allowed_origins.
+# That page is the operator dashboard (speed level, S/N, TUNE, PTT/BUSY); if
+# it cannot connect, its refusal line names the exact origin to add.
 
 [engine]
 # Profile: HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY (case-insensitive).

@@ -28,6 +28,8 @@ mod startup_report;
 mod tnc;
 mod tx_chunker;
 mod vara_wiring;
+#[cfg(feature = "websocket")]
+mod web;
 
 use std::io::{IsTerminal, Write};
 
@@ -617,7 +619,7 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
             config.host.bind_address.clone(),
         )
         .with_auth(auth)
-        .with_index_html(include_str!("web/index.html"));
+        .with_index_html(web::INDEX_HTML);
 
         // Pipe WebSocket events into the daemon event loop
         if let Some(mut ws_rx) = ws_server.take_event_rx() {

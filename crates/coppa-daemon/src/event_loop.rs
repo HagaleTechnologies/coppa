@@ -319,6 +319,27 @@ fn vara_reply(command: &VaraCommand) -> VaraResponse {
     }
 }
 
+/// COP-83: the TUNE duration the daemon transmits for a requested one.
+/// `None` is the VARA default of 10 s. The result never exceeds
+/// `[radio] max_tx_duration_s` (the playout watch would cut the tone there
+/// anyway) or [`coppa_engine::MAX_TUNE_SECONDS`]; NaN and negative values
+/// give 0.
+fn tune_seconds(requested: Option<f32>, max_tx_duration_s: u64) -> f32 {
+    let bound = max_tune_seconds(max_tx_duration_s);
+    let seconds = requested.unwrap_or(10.0);
+    if seconds.is_nan() {
+        0.0
+    } else {
+        seconds.clamp(0.0, bound)
+    }
+}
+
+/// COP-83: the longest TUNE the daemon transmits, in seconds: the smaller of
+/// `[radio] max_tx_duration_s` and [`coppa_engine::MAX_TUNE_SECONDS`].
+fn max_tune_seconds(max_tx_duration_s: u64) -> f32 {
+    (max_tx_duration_s as f32).min(coppa_engine::MAX_TUNE_SECONDS)
+}
+
 /// Queue `response` for one command-port client without waiting
 /// (`queue_response`). Returns `false` when a line that must not be dropped
 /// finds the client's queue full: the client has stopped reading, and the
@@ -683,6 +704,15 @@ pub struct EventLoop {
     /// 2026-07-25-rateloop-daemon-probe-wiring-design.md`.
     #[allow(dead_code)] // used by Tasks 4-6
     probe_state: Option<(u8, u8)>,
+    /// COP-83: TX speed level pinned by the WebSocket `set_speed_level`
+    /// request. While `Some`, the rate loop keeps learning but does not
+    /// change the engine's level (`apply_rate_loop_level`) and does not
+    /// probe. Not persisted.
+    manual_speed_level: Option<u8>,
+    /// COP-83: the `(level, manual)` pair last sent as a `speed_level`
+    /// push, so `publish_speed_level` pushes only changes.
+    #[cfg(feature = "websocket")]
+    last_pushed_speed_level: Option<(u8, bool)>,
     /// Optional WebSocket broadcast sender for forwarding decoded data.
     #[cfg(feature = "websocket")]
     ws_broadcast: Option<tokio::sync::broadcast::Sender<String>>,
@@ -992,6 +1022,9 @@ impl EventLoop {
             cp_control_arq_rx,
             arq_next_seq: 0,
             probe_state: None,
+            manual_speed_level: None,
+            #[cfg(feature = "websocket")]
+            last_pushed_speed_level: None,
             #[cfg(feature = "websocket")]
             ws_broadcast: None,
             #[cfg(feature = "websocket")]
@@ -1387,6 +1420,188 @@ impl EventLoop {
         Ok(())
     }
 
+    /// COP-83: apply a level the rate loop chose, unless the operator has
+    /// pinned one (`manual_speed_level`). Every rate-loop apply site goes
+    /// through here; `apply_speed_level` stays the one engine mutator.
+    fn apply_rate_loop_level(&mut self, level: u8) -> Result<()> {
+        if self.manual_speed_level.is_some() {
+            return Ok(());
+        }
+        self.apply_speed_level(level)
+    }
+
+    /// COP-83: the WebSocket `set_speed_level` request. `Some(level)` pins
+    /// the level every new frame uses, sessionless or in a session, until
+    /// `None` returns control to the rate loop. A pin set mid-session raises
+    /// the session link's RTO floor for the new level, so a slower level
+    /// does not cause spurious retransmits.
+    async fn handle_set_speed_level(&mut self, level: Option<u8>) {
+        match level {
+            Some(requested) => {
+                let ladder = self.engine.available_speed_levels();
+                if !ladder.contains(&requested) {
+                    tracing::warn!(
+                        level = requested,
+                        available = ?ladder,
+                        "set_speed_level refused: speed level {requested} is not available on this profile"
+                    );
+                    return;
+                }
+                if let Err(e) = self.apply_speed_level(requested) {
+                    tracing::warn!(level = requested, error = %e, "set_speed_level refused");
+                    return;
+                }
+                // COP-21: a rebind to HF may have clamped the level; pin what
+                // is actually in force.
+                let applied = self.engine.speed_level();
+                self.manual_speed_level = Some(applied);
+                self.raise_session_rto_for_level(applied);
+                tracing::info!("Speed level set to {applied} (manual)");
+            }
+            None => {
+                self.manual_speed_level = None;
+                if let Err(e) = self.apply_speed_level(self.rate_loop.current_level()) {
+                    tracing::warn!(error = %e, "Failed to apply RateLoop's speed level after set_speed_level auto");
+                }
+                tracing::info!(
+                    "Speed level returned to automatic control (level {})",
+                    self.engine.speed_level()
+                );
+            }
+        }
+        self.publish_speed_level().await;
+    }
+
+    /// COP-83: raise the session link's RTO floor for frames at `level`
+    /// (computed as `ensure_session_link` sizes a new link's).
+    fn raise_session_rto_for_level(&mut self, level: u8) {
+        let radio = &self.config.radio;
+        let turnaround = Duration::from_millis(
+            radio.turnaround_ms + radio.ptt_pre_delay_ms + radio.ptt_tail_delay_ms,
+        );
+        let floor = coppa_protocol::arq::rto_floor(
+            SESSION_ARQ_WINDOW,
+            level,
+            level,
+            turnaround,
+            &coppa_codec::ofdm::CoppaProfile::hf_standard(),
+        );
+        if let Some(link) = self.session_link.as_mut() {
+            link.tx.raise_rto_floor(floor);
+        }
+    }
+
+    /// COP-83: write the TX speed level and its mode to the WebSocket
+    /// snapshot, and push `speed_level` when either changed since the last
+    /// push. Re-syncs the pin first if a COP-21 rebind changed the engine's
+    /// level under it.
+    async fn publish_speed_level(&mut self) {
+        let level = self.engine.speed_level();
+        if self.manual_speed_level.is_some_and(|pin| pin != level) {
+            self.manual_speed_level = Some(level);
+        }
+        #[cfg(feature = "websocket")]
+        {
+            use coppa_host::websocket::{SpeedLevelMode, WsServerMessage};
+            let manual = self.manual_speed_level.is_some();
+            let mode = if manual {
+                SpeedLevelMode::Manual
+            } else {
+                SpeedLevelMode::Auto
+            };
+            if let Some(ref status) = self.ws_status {
+                let mut snap = status.lock().await;
+                snap.speed_level = Some(level);
+                snap.speed_level_mode = Some(mode);
+                snap.speed_levels = Some(self.engine.available_speed_levels());
+            }
+            if self.last_pushed_speed_level != Some((level, manual)) {
+                self.last_pushed_speed_level = Some((level, manual));
+                self.ws_push_reliable(WsServerMessage::SpeedLevel { level, mode });
+            }
+        }
+    }
+
+    /// COP-83: key the TX-level calibration tone, for VARA `TUNE` and the
+    /// WebSocket `tune` request. Task 1 (Phase 4): `TUNE` (or `TUNE
+    /// <seconds>`) generates the standard SSB two-tone calibration signal
+    /// (or a single tone at `single_hz`) and sends it through the same
+    /// PTT-key/stream/PTT-unkey path real frames use (`transmit_samples`),
+    /// so an operator can set their radio's audio drive level via ALC
+    /// exactly as they would for real traffic. The duration is bounded by
+    /// `tune_seconds`.
+    async fn start_tune(&mut self, requested: Option<f32>, single_hz: Option<f32>) {
+        let seconds = tune_seconds(requested, self.config.radio.max_tx_duration_s);
+        if let Some(requested) = requested.filter(|&r| r != seconds) {
+            tracing::warn!(requested_s = requested, seconds, "TUNE duration clamped");
+        }
+        tracing::info!(seconds, "TUNE: transmitting TX-level calibration tone");
+        let samples = self.engine.tune_tone(seconds, single_hz);
+        self.transmit_samples(&samples).await;
+    }
+
+    /// COP-83: publish the slow-changing `status` fields (callsign, limits,
+    /// session link) and the event-loop heartbeat to the WebSocket
+    /// snapshot. Runs at `run()` start and on every 500 ms tick.
+    #[cfg(feature = "websocket")]
+    async fn publish_ws_snapshot(&mut self) {
+        use coppa_host::websocket::LinkStats;
+        let link = self.session_link.as_ref().map(|link| {
+            let in_flight = link.tx.in_flight();
+            let retries = if in_flight > 0 {
+                link.tx
+                    .transmit_count(link.tx.send_base())
+                    .map_or(0, |count| count.saturating_sub(1))
+            } else {
+                0
+            };
+            LinkStats {
+                in_flight,
+                retries,
+                max_retries: link.tx.max_retransmit(),
+                rto_ms: link.tx.rto().as_millis() as u64,
+                fade_hold: link.fallback.is_some(),
+            }
+        });
+        let max_tx_s = self.config.radio.max_tx_duration_s;
+        if let Some(ref status) = self.ws_status {
+            let mut snap = status.lock().await;
+            snap.mycall = self.local_callsign.as_ref().map(|c| c.to_string());
+            snap.max_tx_s = Some(max_tx_s);
+            snap.max_tune_s = Some(max_tune_seconds(max_tx_s) as u64);
+            snap.loop_heartbeat = Some(Instant::now());
+            snap.ptt.get_or_insert(self.is_transmitting);
+            snap.busy.get_or_insert(self.busy_gate.current());
+            snap.buffer.get_or_insert(self.last_reported_buffer as u64);
+            snap.waiting_for_clear_channel.get_or_insert(false);
+            if snap.heard.is_none() {
+                snap.heard = Some(self.ws_heard.clone());
+            }
+            snap.link = link;
+        }
+        self.publish_speed_level().await;
+    }
+
+    #[cfg(not(feature = "websocket"))]
+    async fn publish_ws_snapshot(&mut self) {
+        self.publish_speed_level().await;
+    }
+
+    /// COP-83: mark a busy-channel wait in the WebSocket snapshot. Each wait
+    /// step also refreshes the heartbeat, because the wait blocks the 500 ms
+    /// tick that normally does: a legitimate wait must not read as a stall.
+    #[cfg(feature = "websocket")]
+    async fn mark_clear_channel_wait(&self, waiting: bool) {
+        if let Some(ref status) = self.ws_status {
+            let mut snap = status.lock().await;
+            snap.waiting_for_clear_channel = Some(waiting);
+            snap.loop_heartbeat = Some(Instant::now());
+        }
+    }
+
+    #[cfg(not(feature = "websocket"))]
+    async fn mark_clear_channel_wait(&self, _waiting: bool) {}
+
     /// COP-32: conditions found while starting that leave the daemon running
     /// but unable to do part of its job (today: rigctld unreachable, or a
     /// refused startup PTT release). Empty when startup was clean.
@@ -1544,10 +1759,32 @@ impl EventLoop {
         #[cfg(feature = "websocket")]
         {
             use coppa_host::websocket::WsServerMessage;
+            // COP-83: `status` mirrors every reliable state push, written
+            // before the push so a client's `status` never ends on an older
+            // value than the pushes it then receives.
+            if let Some(ref status) = self.ws_status {
+                let mut snap = status.lock().await;
+                match &response {
+                    VaraResponse::Ptt(state) => {
+                        snap.ptt = Some(*state);
+                        if *state {
+                            snap.ptt_since.get_or_insert_with(Instant::now);
+                        } else {
+                            snap.ptt_since = None;
+                        }
+                    }
+                    VaraResponse::Busy(state) => snap.busy = Some(*state),
+                    VaraResponse::Buffer(bytes) => snap.buffer = Some(*bytes as u64),
+                    _ => {}
+                }
+            }
             let msg = match &response {
                 VaraResponse::Ptt(state) => Some(WsServerMessage::Ptt { state: *state }),
                 VaraResponse::Busy(state) => Some(WsServerMessage::Busy { state: *state }),
                 VaraResponse::Snr(db) => Some(WsServerMessage::Snr { db: *db }),
+                VaraResponse::Buffer(bytes) => Some(WsServerMessage::Buffer {
+                    bytes: *bytes as u64,
+                }),
                 _ => None,
             };
             if let Some(msg) = msg {
@@ -1764,6 +2001,7 @@ impl EventLoop {
                 let mut snap = status.lock().await;
                 snap.connected = remote.is_some();
                 snap.remote_call = remote.map(|cs| cs.to_string());
+                snap.heard = Some(self.ws_heard.clone());
             }
             self.ws_push_reliable(msg);
             self.ws_push_reliable(WsServerMessage::Heard {
@@ -1924,7 +2162,8 @@ impl EventLoop {
             // attribute an outcome).
             let probing_eligible = self.probe_state.is_none()
                 && self.config.engine.arq_enabled
-                && self.arq_tx.is_some();
+                && self.arq_tx.is_some()
+                && self.manual_speed_level.is_none();
 
             let (level, is_probe) = match seq_opt {
                 Some(_) if probing_eligible => {
@@ -1958,7 +2197,7 @@ impl EventLoop {
             // is real, avoidable per-frame cost whenever the level hasn't
             // actually changed.
             if self.engine.speed_level() != level {
-                if let Err(e) = self.apply_speed_level(level) {
+                if let Err(e) = self.apply_rate_loop_level(level) {
                     tracing::warn!(error = %e, "Failed to apply speed level for queued TX frame");
                 }
             }
@@ -1991,7 +2230,7 @@ impl EventLoop {
             }
 
             if is_probe {
-                if let Err(e) = self.apply_speed_level(self.rate_loop.current_level()) {
+                if let Err(e) = self.apply_rate_loop_level(self.rate_loop.current_level()) {
                     tracing::warn!(error = %e, "Failed to revert speed level after probe");
                 }
             }
@@ -2712,6 +2951,7 @@ impl EventLoop {
     pub async fn run(&mut self) -> Result<()> {
         self.running = true;
         tracing::info!(profile = %self.config.engine.profile, "Event loop started");
+        self.publish_ws_snapshot().await;
 
         let mut audio_poll = tokio::time::interval(tokio::time::Duration::from_millis(20));
         // E6: ARQ retransmit check interval (500ms)
@@ -2772,6 +3012,8 @@ impl EventLoop {
                     // COP-43: covers a PTT release that ran no drain (e.g.
                     // `force_release_ptt`).
                     self.finish_drained_disconnect().await;
+                    // COP-83: heartbeat, limits, link stats, speed level.
+                    self.publish_ws_snapshot().await;
                 }
                 _ = beacon_poll.tick() => {
                     self.maybe_send_beacon().await;
@@ -3004,22 +3246,14 @@ impl EventLoop {
                             tracing::info!("Stopped listening for incoming connections");
                         }
                     }
-                    VaraCommand::Tune(seconds) => {
-                        // Task 1 (Phase 4): TX level calibration. `TUNE` (or
-                        // `TUNE <seconds>`) generates the standard SSB
-                        // two-tone calibration signal and sends it through
-                        // the same PTT-key/stream/PTT-unkey path real frames
-                        // use (`transmit_samples`), so an operator can set
-                        // their radio's audio drive level via ALC exactly as
-                        // they would for real traffic.
-                        let seconds = seconds.unwrap_or(10.0);
-                        tracing::info!(seconds, "TUNE: transmitting TX-level calibration tone");
-                        let samples = self.engine.tune_tone(seconds, None);
-                        self.transmit_samples(&samples).await;
-                    }
+                    VaraCommand::Tune(seconds) => self.start_tune(seconds, None).await,
                     VaraCommand::MyCall(call) => match Callsign::new(&call) {
                         Ok(callsign) => {
                             tracing::info!(callsign = %callsign, "Local callsign set by MYCALL");
+                            #[cfg(feature = "websocket")]
+                            if let Some(ref status) = self.ws_status {
+                                status.lock().await.mycall = Some(callsign.to_string());
+                            }
                             self.local_callsign = Some(callsign);
                         }
                         // Already answered WRONG by `vara_reply`; keep the
@@ -3035,6 +3269,30 @@ impl EventLoop {
                     // ConnectRequest/DisconnectRequest.
                     _ => {}
                 }
+            }
+            HostEvent::Tune {
+                client_id,
+                seconds,
+                single_hz,
+            } => {
+                tracing::debug!(client_id, ?seconds, ?single_hz, "TUNE request received");
+                // The WS task checks this only once the daemon has published
+                // its snapshot; the daemon re-checks every request.
+                if let Some(hz) = single_hz.filter(|hz| {
+                    !(coppa_engine::TUNE_SINGLE_MIN_HZ..=coppa_engine::TUNE_SINGLE_MAX_HZ)
+                        .contains(hz)
+                }) {
+                    tracing::warn!(
+                        single_hz = hz,
+                        "TUNE refused: single_hz must be between 300 and 3000 Hz"
+                    );
+                    return;
+                }
+                self.start_tune(seconds, single_hz).await;
+            }
+            HostEvent::SetSpeedLevel { client_id, level } => {
+                tracing::debug!(client_id, ?level, "set_speed_level request received");
+                self.handle_set_speed_level(level).await;
             }
             HostEvent::ArdopCommand { client_id, command } => {
                 tracing::debug!(client_id, command = %command, "ARDOP command received");
@@ -4008,7 +4266,7 @@ impl EventLoop {
                                         if !probe_resolved {
                                             if let Some(rate) = pdu.suggested_rate() {
                                                 self.rate_loop.on_ack(rate, true);
-                                                if let Err(e) = self.apply_speed_level(
+                                                if let Err(e) = self.apply_rate_loop_level(
                                                     self.rate_loop.current_level(),
                                                 ) {
                                                     tracing::warn!(error = %e, "Failed to apply RateLoop's recommended speed level");
@@ -4570,6 +4828,17 @@ impl EventLoop {
         if hold_ms == 0 || !self.busy_gate.current() {
             return false;
         }
+        // COP-83: `status.waiting_for_clear_channel` is true for exactly the
+        // wait, and each step refreshes the heartbeat this wait blocks.
+        self.mark_clear_channel_wait(true).await;
+        let aborted = self.wait_until_channel_clear(hold_ms).await;
+        self.mark_clear_channel_wait(false).await;
+        aborted
+    }
+
+    /// The body of `wait_for_clear_channel`: wait while the channel reads
+    /// busy, then a random holdoff. Returns `true` when an `ABORT` cut it.
+    async fn wait_until_channel_clear(&mut self, hold_ms: u64) -> bool {
         loop {
             while self.busy_gate.current() {
                 if self.abort_waiting() {
@@ -4578,11 +4847,13 @@ impl EventLoop {
                 self.observe_busy_gate_from_audio_input().await;
                 tokio::time::sleep(Duration::from_millis(hold_ms)).await;
                 self.release_overdue_ptt_while_waiting().await;
+                self.mark_clear_channel_wait(true).await;
             }
 
             let holdoff_secs: f32 = rand::rng().random_range(0.5f32..2.0f32);
             tokio::time::sleep(Duration::from_secs_f32(holdoff_secs)).await;
             self.release_overdue_ptt_while_waiting().await;
+            self.mark_clear_channel_wait(true).await;
             self.observe_busy_gate_from_audio_input().await; // pick up anything that arrived during the holdoff
             if self.abort_waiting() {
                 return true;
@@ -4786,7 +5057,7 @@ impl EventLoop {
         if let Some((seq, level)) = self.probe_state {
             if newly_acked.contains(&seq) {
                 self.rate_loop.on_probe_result(level, true);
-                if let Err(e) = self.apply_speed_level(self.rate_loop.current_level()) {
+                if let Err(e) = self.apply_rate_loop_level(self.rate_loop.current_level()) {
                     tracing::warn!(error = %e, "Failed to apply speed level after probe success");
                 }
                 self.probe_state = None;
@@ -4872,7 +5143,7 @@ impl EventLoop {
         // Applied after the `arq_tx` borrow ends: `apply_speed_level` needs all of
         // `self` (COP-21), and must still run before the encode below.
         if timed_out {
-            if let Err(e) = self.apply_speed_level(self.rate_loop.current_level()) {
+            if let Err(e) = self.apply_rate_loop_level(self.rate_loop.current_level()) {
                 tracing::warn!(error = %e, "Failed to apply RateLoop's recommended speed level after timeout");
             }
         }
@@ -6051,6 +6322,8 @@ impl EventLoop {
             Err(e) => tracing::warn!(error = %e, "PTT control error"),
         }
         tracing::info!(state = if tx { "TX" } else { "RX" }, "PTT state change");
+        // COP-83: the level the frame being keyed was encoded at.
+        self.publish_speed_level().await;
         // Telemetry: VaraResponse::Ptt at the same moment physical PTT changes
         // (decision 8), not a separately-timed emission.
         self.emit_vara(VaraResponse::Ptt(tx)).await;
@@ -10526,6 +10799,549 @@ mod tests {
         station.notify_session(1, SessionNotice::Disconnected).await;
         let heard = next_ws_type(&mut ws, "heard").await;
         assert_eq!(heard["stations"].as_array().unwrap().len(), 32);
+        task.abort();
+    }
+
+    // ── COP-83: TUNE bound, status mirroring, speed-level pin ─────────────
+
+    #[test]
+    fn tune_seconds_defaults_and_clamps() {
+        assert_eq!(tune_seconds(None, 30), 10.0);
+        assert_eq!(tune_seconds(Some(2.0), 30), 2.0);
+        assert_eq!(tune_seconds(Some(1e12), 30), 30.0);
+        assert_eq!(tune_seconds(Some(f32::INFINITY), 30), 30.0);
+        assert_eq!(
+            tune_seconds(Some(500.0), 300),
+            coppa_engine::MAX_TUNE_SECONDS
+        );
+    }
+
+    /// The reproduced abort: `TUNE 1e12` allocated 192 EB and killed the
+    /// daemon. Now it is answered `OK`, keys a tone of at most
+    /// `max_tx_duration_s`, and the same loop answers the next command.
+    #[tokio::test]
+    async fn vara_tune_with_a_huge_duration_keys_a_bounded_tone() {
+        let logs = LogCapture::default();
+        let _guard = logs.install();
+        let mut config = tx_config();
+        config.radio.max_tx_duration_s = 2;
+        let (mut station, mut audio_rx, mut vara_rx) = wired_station(config);
+        mark_identified(&mut station);
+        send_vara_command(&mut station, "TUNE 1e12").await;
+        assert_eq!(
+            drain_vara(&mut vara_rx),
+            vec![VaraResponse::Ok, VaraResponse::Ptt(true)]
+        );
+        let sent = transmitted_samples(&station, &mut audio_rx);
+        assert!(sent > 0, "the tone must be keyed");
+        assert!(
+            sent <= 2 * 48_000,
+            "at most max_tx_duration_s of tone, got {sent}"
+        );
+        assert!(logs.contents().contains("TUNE duration clamped"));
+        send_vara_command(&mut station, "VERSION").await;
+        assert!(
+            matches!(
+                drain_vara(&mut vara_rx).as_slice(),
+                [VaraResponse::Version(_)]
+            ),
+            "the daemon must keep answering after a huge TUNE"
+        );
+    }
+
+    #[cfg(feature = "websocket")]
+    async fn ws_status_reply(ws: &mut WsClient) -> serde_json::Value {
+        use futures_util::SinkExt;
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"status","id":1}"#.into(),
+        ))
+        .await
+        .unwrap();
+        next_ws_type(ws, "status").await
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn a_client_joining_mid_transmission_learns_ptt_from_status() {
+        use coppa_host::websocket::{WebSocketServer, WsAuth};
+        use futures_util::StreamExt;
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server =
+            WebSocketServer::new(port).with_auth(WsAuth::new("test-token", Vec::<String>::new()));
+        station.set_ws_push(server.push_handle());
+        station.set_ws_status(server.status());
+        let task = tokio::spawn(async move {
+            server.run_with_listener(listener).await.unwrap();
+        });
+        let url = format!("ws://127.0.0.1:{port}/?token=test-token");
+        let (mut first, _) = tokio_tungstenite::connect_async(url.as_str())
+            .await
+            .unwrap();
+        station.set_ptt(true).await;
+        assert_eq!(next_ws_type(&mut first, "ptt").await["state"], true);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (mut second, _) = tokio_tungstenite::connect_async(url.as_str())
+            .await
+            .unwrap();
+        let hello = second.next().await.unwrap().unwrap();
+        assert!(hello.to_text().unwrap().contains("hello"));
+        let reply = ws_status_reply(&mut second).await;
+        assert_eq!(reply["ptt"], true);
+        assert!(reply["ptt_keyed_ms"].as_u64().is_some_and(|ms| ms >= 50));
+        task.abort();
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn status_after_a_ptt_push_reports_the_pushed_state() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (mut ws, task) = connect_ws(&mut station).await;
+        station.set_ptt(true).await;
+        assert_eq!(next_ws_type(&mut ws, "ptt").await["state"], true);
+        assert_eq!(ws_status_reply(&mut ws).await["ptt"], true);
+        station.set_ptt(false).await;
+        assert_eq!(next_ws_type(&mut ws, "ptt").await["state"], false);
+        let reply = ws_status_reply(&mut ws).await;
+        assert_eq!(reply["ptt"], false);
+        assert!(reply.get("ptt_keyed_ms").is_none());
+        task.abort();
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn busy_is_mirrored_in_status() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (mut ws, task) = connect_ws(&mut station).await;
+        station.emit_vara(VaraResponse::Busy(true)).await;
+        assert_eq!(next_ws_type(&mut ws, "busy").await["state"], true);
+        assert_eq!(ws_status_reply(&mut ws).await["busy"], true);
+        task.abort();
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn buffer_changes_reach_websocket_and_status() {
+        let mut config = tx_config();
+        config.host.sessionless_tx_enabled = true;
+        let (mut station, _audio_rx, _vara_rx) = wired_station(config);
+        mark_identified(&mut station);
+        let (mut ws, task) = connect_ws(&mut station).await;
+        station
+            .handle_host_event(HostEvent::DataReceived {
+                client_id: 1,
+                data: b"hello dashboard".to_vec(),
+            })
+            .await;
+        let bytes = next_ws_type(&mut ws, "buffer").await["bytes"].clone();
+        assert!(bytes.as_u64().is_some_and(|n| n > 0), "got {bytes}");
+        assert_eq!(ws_status_reply(&mut ws).await["buffer"], bytes);
+        station.handle_ptt_change(false).await;
+        assert_eq!(next_ws_type(&mut ws, "buffer").await["bytes"], 0);
+        assert_eq!(ws_status_reply(&mut ws).await["buffer"], 0);
+        task.abort();
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn snapshot_publishes_mycall_limits_and_heartbeat() {
+        let mut station = EventLoop::new(tx_config()).unwrap();
+        let (mut ws, task) = connect_ws(&mut station).await;
+        station.publish_ws_snapshot().await;
+        let reply = ws_status_reply(&mut ws).await;
+        assert_eq!(reply["mycall"], TEST_CALLSIGN);
+        assert_eq!(reply["max_tx_s"], 30);
+        assert_eq!(reply["max_tune_s"], 30);
+        assert!(reply["loop_age_ms"].as_u64().is_some_and(|ms| ms < 1000));
+        assert_eq!(reply["speed_level_mode"], "auto");
+        assert_eq!(
+            reply["speed_levels"],
+            serde_json::json!([1, 2, 3, 4, 5, 6, 7, 8])
+        );
+
+        station
+            .handle_host_event(HostEvent::VaraCommand {
+                client_id: coppa_host::websocket::FIRST_CLIENT_ID,
+                command: "MYCALL W1AW".into(),
+            })
+            .await;
+        assert_eq!(ws_status_reply(&mut ws).await["mycall"], "W1AW");
+        station
+            .handle_host_event(HostEvent::VaraCommand {
+                client_id: coppa_host::websocket::FIRST_CLIENT_ID,
+                command: "MYCALL !!bad!!".into(),
+            })
+            .await;
+        assert_eq!(ws_status_reply(&mut ws).await["mycall"], "W1AW");
+        task.abort();
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn heard_snapshot_is_in_status() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (mut ws, task) = connect_ws(&mut station).await;
+        station
+            .notify_session(
+                1,
+                SessionNotice::Connected {
+                    local: Callsign::new("N0CALL").unwrap(),
+                    remote: Callsign::new("W1AW").unwrap(),
+                    we_called: true,
+                },
+            )
+            .await;
+        let heard = next_ws_type(&mut ws, "heard").await;
+        assert_eq!(ws_status_reply(&mut ws).await["heard"], heard["stations"]);
+        task.abort();
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn link_stats_follow_the_session_link() {
+        let (mut a, _b, _a_consumer, _b_consumer) = connected_pair(0).await;
+        let (mut ws, task) = connect_ws(&mut a).await;
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"link stats".to_vec(),
+        })
+        .await;
+        a.publish_ws_snapshot().await;
+        let (max_retries, rto_ms) = {
+            let tx = &a.session_link.as_ref().unwrap().tx;
+            (tx.max_retransmit(), tx.rto().as_millis() as u64)
+        };
+        assert_eq!(
+            ws_status_reply(&mut ws).await["link"],
+            serde_json::json!({"in_flight":1,"retries":0,"max_retries":max_retries,"rto_ms":rto_ms,"fade_hold":false})
+        );
+        a.session_link = None;
+        a.publish_ws_snapshot().await;
+        assert!(ws_status_reply(&mut ws).await.get("link").is_none());
+        task.abort();
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn busy_channel_wait_is_reported_not_stalled() {
+        let mut config = DaemonConfig::default();
+        config.audio.sample_rate = 48_000;
+        config.station_id.busy_hold_ms = 10;
+        let mut station = EventLoop::new(config).unwrap();
+        let (mut audio_in_tx, audio_in_rx) = coppa_audio::audio_ring(32_768);
+        station.set_audio_in(audio_in_rx);
+        let status = Arc::new(Mutex::new(coppa_host::websocket::WsStatus::default()));
+        station.set_ws_status(status.clone());
+        let mut counter = 1u32;
+        let mut noise = |amplitude: f32| -> Vec<f32> {
+            (0..1024)
+                .map(|_| {
+                    counter = counter.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    amplitude * ((counter >> 8) as f32 / (1u32 << 24) as f32 - 0.5)
+                })
+                .collect()
+        };
+        for _ in 0..10 {
+            station.busy_gate.observe(&noise(0.01));
+        }
+        for _ in 0..busy_burst_blocks(&station.busy_gate) {
+            station.busy_gate.observe(&noise(0.5));
+        }
+        assert!(station.busy_gate.current());
+        let release_blocks = busy_burst_blocks(&station.busy_gate);
+        {
+            let wait = station.wait_for_clear_channel();
+            tokio::pin!(wait);
+            tokio::select! {
+                biased;
+                _ = &mut wait => panic!("the wait must hold while the channel is busy"),
+                _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+            }
+            let reply = status.lock().await.clone().reply(None);
+            let json = serde_json::to_value(&reply).unwrap();
+            assert_eq!(json["waiting_for_clear_channel"], true);
+            assert!(
+                json["loop_age_ms"].as_u64().is_some_and(|ms| ms < 1000),
+                "a busy-channel wait is not a stall: {json}"
+            );
+            for _ in 0..release_blocks {
+                audio_in_tx.write(&noise(0.01));
+            }
+            let aborted = tokio::time::timeout(Duration::from_secs(5), wait)
+                .await
+                .unwrap();
+            assert!(!aborted);
+        }
+        assert_eq!(status.lock().await.waiting_for_clear_channel, Some(false));
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn websocket_tune_keys_a_two_tone() {
+        let (mut station, mut audio_rx, mut vara_rx) = wired_station(tx_config());
+        mark_identified(&mut station);
+        let (mut ws, task) = connect_ws(&mut station).await;
+        station
+            .handle_host_event(HostEvent::Tune {
+                client_id: coppa_host::websocket::FIRST_CLIENT_ID,
+                seconds: Some(1.0),
+                single_hz: None,
+            })
+            .await;
+        assert_eq!(next_ws_type(&mut ws, "ptt").await["state"], true);
+        assert_eq!(drain_vara(&mut vara_rx), vec![VaraResponse::Ptt(true)]);
+        let expected = station.engine.tune_tone(1.0, None);
+        let available = transmitted_samples(&station, &mut audio_rx);
+        let mut captured = vec![0.0f32; available];
+        audio_rx.read(&mut captured);
+        assert_eq!(captured, expected);
+        task.abort();
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn websocket_tune_single_hz_keys_a_single_tone() {
+        let (mut station, mut audio_rx, _vara_rx) = wired_station(tx_config());
+        mark_identified(&mut station);
+        station
+            .handle_host_event(HostEvent::Tune {
+                client_id: coppa_host::websocket::FIRST_CLIENT_ID,
+                seconds: Some(1.0),
+                single_hz: Some(1500.0),
+            })
+            .await;
+        let expected = station.engine.tune_tone(1.0, Some(1500.0));
+        let available = transmitted_samples(&station, &mut audio_rx);
+        let mut captured = vec![0.0f32; available];
+        audio_rx.read(&mut captured);
+        assert_eq!(captured, expected);
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn websocket_tune_is_clamped_like_vara() {
+        let mut config = tx_config();
+        config.radio.max_tx_duration_s = 2;
+        let (mut station, mut audio_rx, _vara_rx) = wired_station(config);
+        mark_identified(&mut station);
+        station
+            .handle_host_event(HostEvent::Tune {
+                client_id: coppa_host::websocket::FIRST_CLIENT_ID,
+                seconds: Some(1e12),
+                single_hz: None,
+            })
+            .await;
+        let sent = transmitted_samples(&station, &mut audio_rx);
+        assert!(sent > 0 && sent <= 2 * 48_000, "got {sent}");
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn websocket_tune_without_callsign_keys_nothing() {
+        let logs = LogCapture::default();
+        let _guard = logs.install();
+        let (mut station, mut audio_rx, mut vara_rx) = wired_station(DaemonConfig::default());
+        station
+            .handle_host_event(HostEvent::Tune {
+                client_id: coppa_host::websocket::FIRST_CLIENT_ID,
+                seconds: None,
+                single_hz: None,
+            })
+            .await;
+        assert!(drain_vara(&mut vara_rx).is_empty(), "no PTT may key");
+        assert_eq!(transmitted_samples(&station, &mut audio_rx), 0);
+        assert_eq!(logs.refusals(), 1, "got: {}", logs.contents());
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn manual_level_is_applied_and_pushed() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (mut ws, task) = connect_ws(&mut station).await;
+        station
+            .handle_host_event(HostEvent::SetSpeedLevel {
+                client_id: coppa_host::websocket::FIRST_CLIENT_ID,
+                level: Some(3),
+            })
+            .await;
+        assert_eq!(station.engine.speed_level(), 3);
+        let push = next_ws_type(&mut ws, "speed_level").await;
+        assert_eq!(
+            push,
+            serde_json::json!({"type":"speed_level","level":3,"mode":"manual"})
+        );
+        let reply = ws_status_reply(&mut ws).await;
+        assert_eq!(reply["speed_level"], 3);
+        assert_eq!(reply["speed_level_mode"], "manual");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn manual_level_survives_the_sessionless_drain() {
+        let mut config = tx_config();
+        config.host.sessionless_tx_enabled = true;
+        let (mut station, mut audio_rx, _vara_rx) = wired_station(config);
+        mark_identified(&mut station);
+        station.handle_set_speed_level(Some(3)).await;
+        assert_ne!(station.rate_loop.current_level(), 3);
+        station
+            .handle_host_event(HostEvent::DataReceived {
+                client_id: 1,
+                data: b"pinned".to_vec(),
+            })
+            .await;
+        assert_eq!(station.engine.speed_level(), 3);
+        let available = transmitted_samples(&station, &mut audio_rx);
+        let mut captured = vec![0.0f32; available];
+        audio_rx.read(&mut captured);
+        let mut decoder = coppa_engine::CoppaCore::new();
+        let frames = decoder.push_samples(&with_lead_and_trail(&captured));
+        assert_eq!(frames.len(), 1, "one frame");
+        assert_eq!(
+            frames[0].speed_level, 3,
+            "the frame must be encoded at the pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_level_ignores_rate_loop_feedback() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        station.handle_set_speed_level(Some(3)).await;
+        let before = station.rate_loop.current_level();
+        station.rate_loop.on_timeout();
+        // The timeout, ACK and probe sites all apply through here.
+        station
+            .apply_rate_loop_level(station.rate_loop.current_level())
+            .unwrap();
+        assert!(
+            station.rate_loop.current_level() < before,
+            "the rate loop keeps learning"
+        );
+        assert_eq!(station.engine.speed_level(), 3);
+        station.probe_state = Some((0, 4));
+        assert!(station.resolve_probe_if_acked(&[0]));
+        assert_eq!(station.engine.speed_level(), 3);
+    }
+
+    #[tokio::test]
+    async fn no_probe_while_pinned() {
+        let mut config = tx_config();
+        config.host.sessionless_tx_enabled = true;
+        config.engine.arq_enabled = true;
+        config.engine.rate_loop_probe_interval = 1;
+        let (mut station, _audio_rx, _vara_rx) = wired_station(config);
+        mark_identified(&mut station);
+        station.handle_set_speed_level(Some(3)).await;
+        for _ in 0..3 {
+            station
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: b"x".to_vec(),
+                })
+                .await;
+            assert_eq!(station.engine.speed_level(), 3);
+            assert!(station.probe_state.is_none());
+            station.handle_ptt_change(false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_returns_control_to_the_rate_loop() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        station.handle_set_speed_level(Some(5)).await;
+        assert_eq!(station.manual_speed_level, Some(5));
+        station.handle_set_speed_level(None).await;
+        assert_eq!(station.manual_speed_level, None);
+        assert_eq!(
+            station.engine.speed_level(),
+            station.rate_loop.current_level()
+        );
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn auto_is_pushed_as_auto() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (mut ws, task) = connect_ws(&mut station).await;
+        station.handle_set_speed_level(Some(5)).await;
+        assert_eq!(next_ws_type(&mut ws, "speed_level").await["mode"], "manual");
+        station.handle_set_speed_level(None).await;
+        let push = next_ws_type(&mut ws, "speed_level").await;
+        assert_eq!(push["mode"], "auto");
+        assert_eq!(push["level"], station.rate_loop.current_level());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn unavailable_level_is_refused_and_logged() {
+        let logs = LogCapture::default();
+        let _guard = logs.install();
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        let level = station.engine.speed_level();
+        station.handle_set_speed_level(Some(9)).await;
+        assert_eq!(station.engine.speed_level(), level);
+        assert_eq!(station.manual_speed_level, None);
+        assert!(
+            logs.contents().contains("set_speed_level refused"),
+            "got: {}",
+            logs.contents()
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_level_mid_session_raises_the_session_rto_floor() {
+        let (mut a, _b, _a_consumer, _b_consumer) = connected_pair(0).await;
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"rto".to_vec(),
+        })
+        .await;
+        assert!(a.session_link.is_some());
+        a.handle_set_speed_level(Some(1)).await;
+        let radio = &a.config.radio;
+        let floor = coppa_protocol::arq::rto_floor(
+            SESSION_ARQ_WINDOW,
+            1,
+            1,
+            Duration::from_millis(
+                radio.turnaround_ms + radio.ptt_pre_delay_ms + radio.ptt_tail_delay_ms,
+            ),
+            &coppa_codec::ofdm::CoppaProfile::hf_standard(),
+        );
+        assert!(a.session_link.as_ref().unwrap().tx.rto() >= floor);
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn rate_loop_changes_are_pushed() {
+        let mut station = EventLoop::new(DaemonConfig::default()).unwrap();
+        let (mut ws, task) = connect_ws(&mut station).await;
+        station.publish_speed_level().await;
+        let first = next_ws_type(&mut ws, "speed_level").await;
+        assert_eq!(first["mode"], "auto");
+        station.rate_loop.on_timeout();
+        station.rate_loop.on_timeout();
+        station
+            .apply_rate_loop_level(station.rate_loop.current_level())
+            .unwrap();
+        let level = station.engine.speed_level();
+        assert_ne!(
+            serde_json::json!(level),
+            first["level"],
+            "the timeout must drop the level"
+        );
+        station.publish_speed_level().await;
+        let push = next_ws_type(&mut ws, "speed_level").await;
+        assert_eq!(
+            push,
+            serde_json::json!({"type":"speed_level","level":level,"mode":"auto"})
+        );
+        // Nothing changed: no push.
+        station.publish_speed_level().await;
+        station.set_ptt(true).await;
+        let next = next_ws_type(&mut ws, "ptt").await;
+        assert_eq!(next["state"], true, "no speed_level push may precede it");
         task.abort();
     }
 

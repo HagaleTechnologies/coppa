@@ -27,6 +27,15 @@ const COMPRESSION_MARKER: u8 = 0xFE;
 pub const TUNE_TONE_LOW_HZ: f32 = 700.0;
 /// High tone of the standard SSB two-tone TX-level calibration signal (Hz).
 pub const TUNE_TONE_HIGH_HZ: f32 = 1900.0;
+/// Longest TX-level calibration tone [`CoppaCore::tune_tone`] generates, in
+/// seconds. Longer (or infinite) requests are cut to this, so no caller can
+/// make the engine allocate without bound (COP-83: VARA `TUNE 1e12` aborted
+/// the daemon on a 192 EB allocation).
+pub const MAX_TUNE_SECONDS: f32 = 120.0;
+/// Lowest single-tone TUNE frequency a host interface accepts (Hz).
+pub const TUNE_SINGLE_MIN_HZ: f32 = 300.0;
+/// Highest single-tone TUNE frequency a host interface accepts (Hz).
+pub const TUNE_SINGLE_MAX_HZ: f32 = 3000.0;
 
 /// One decode result surfaced by [`CoppaCore::push_samples`] for a single frame
 /// `StreamingReceiver` completed.
@@ -467,8 +476,16 @@ impl CoppaCore {
     ///
     /// Peak-normalized to the same [`TX_PEAK`] frames use, so the drive level
     /// an operator sets here transfers directly to real traffic.
+    ///
+    /// `seconds` is capped at [`MAX_TUNE_SECONDS`]; a NaN or negative
+    /// duration gives an empty buffer.
     pub fn tune_tone(&self, seconds: f32, single_hz: Option<f32>) -> Vec<f32> {
         let sample_rate = self.config.sample_rate as f32;
+        let seconds = if seconds.is_nan() {
+            0.0
+        } else {
+            seconds.clamp(0.0, MAX_TUNE_SECONDS)
+        };
         let n = (seconds * sample_rate).round().max(0.0) as usize;
         let two_pi = std::f32::consts::TAU;
 
@@ -1451,6 +1468,22 @@ mod tests {
             let fft = FftProcessor::new(sample_rate);
             let input: Vec<Complex32> = samples.iter().map(|&s| Complex32::new(s, 0.0)).collect();
             fft.forward(&input).iter().map(|c| c.norm()).collect()
+        }
+
+        #[test]
+        fn caps_duration_at_max_tune_seconds() {
+            let core = CoppaCore::new();
+            let sample_rate = core.config().sample_rate as f32;
+            let capped = (MAX_TUNE_SECONDS * sample_rate).round() as usize;
+
+            assert_eq!(core.tune_tone(f32::INFINITY, None).len(), capped);
+            assert_eq!(core.tune_tone(1e12, None).len(), capped);
+            assert!(core.tune_tone(f32::NAN, None).is_empty());
+            assert!(core.tune_tone(-5.0, None).is_empty());
+            assert_eq!(
+                core.tune_tone(10.0, None).len(),
+                (10.0 * sample_rate).round() as usize
+            );
         }
 
         #[test]
