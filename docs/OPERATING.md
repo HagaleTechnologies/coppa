@@ -695,7 +695,7 @@ disconnects (this station sends nothing), after a session times out with no
 drain, or after `TUNE`, a beacon or sessionless data. The OFDM station-ID
 frame still covers the 10-minute rule as before.
 
-coppad keys the callsign in force (`MYCALL`, or `[station] callsign`) with
+coppad keys the callsign in force (`MYCALL`, or `[engine] callsign`) with
 any `-SSID` dropped, because the SSID is a network address and not part of
 the licensed call. `N1CALL-10` keys `N1CALL`. A `/` portable designator
 stays, so `N1CALL/P` keys `N1CALL/P`.

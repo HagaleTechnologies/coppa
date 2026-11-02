@@ -122,7 +122,10 @@ on a fixed delay.
 | `ABORT` | `OK`, then `DISCONNECTED` at once | ends the session or a pending dial, drops queued data, sends no DISCONNECT frame; with no session, `OK` and nothing else |
 | `BW500`, `BW2300`, `BW2750`, `COMPRESSION <anything>` | `OK` | none; `[engine] profile` sets the waveform |
 | `TUNE [seconds]` | `OK`, then `PTT ON`, `PTT OFF` | coppa extension: two-tone calibration, default 10 s; still `OK` when coppad cannot transmit (it logs why) |
-| anything else, including `PUBLIC`, `CWID`, `CHAT`, `CQFRAME`, `WINLINK SESSION`, `P2P SESSION`, `CLEANTXBUFFER`, `BW9999` | `WRONG` | none |
+| `CWID ON` / `CWID OFF` | `OK`; `WRONG` when `[station_id] cwid` locks the state (`"always"` refuses `OFF`, `"never"` refuses `ON`), or for any other argument | turns the closing Morse ID on or off for the whole daemon; the ID follows the DISCONNECT frame of a session this station ends; [OPERATING.md](OPERATING.md#morse-cw-id-at-session-end) has the exceptions |
+| `FREQ` / `FREQ <hz>` | `FREQ <hz>`, a fresh reading from the rig; `WRONG` with no rigctld backend, no clean answer, or a refused set | coppa extension, needs `[radio] ptt_method = "rigctld"`: reads the rig's frequency; `<hz>` (decimal Hz) sets it first. Sets are off unless `[radio] host_rig_control = true`; [OPERATING.md](OPERATING.md#rig-frequency-and-mode-from-a-host-freq-mode) lists every refusal |
+| `MODE` / `MODE <name>` | `MODE <token>`, the rig's own token (`USB`, `PKTLSB`, `CW`, ...); `WRONG` as for `FREQ` | coppa extension: reads the rig's mode; `<name>` is `USB`, `LSB`, `PKTUSB` or `PKTLSB` (any case) and sets it first under the same rules as `FREQ <hz>`; any other name gets `WRONG` |
+| anything else, including `PUBLIC`, `CHAT`, `CQFRAME`, `WINLINK SESSION`, `P2P SESSION`, `CLEANTXBUFFER`, `BW9999` | `WRONG` | none |
 
 - A `CONNECT` to a valid `<target>` while a session exists (connecting or connected) gets `OK`
   and then `DISCONNECTED`, to the dialling client only. Send `DISCONNECT` first.
