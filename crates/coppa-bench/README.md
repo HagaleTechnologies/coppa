@@ -14,7 +14,9 @@ Not on crates.io and not a product crate. From a clone of the repository:
   `crates/coppa-bench/examples/`.
 - `cargo test -p coppa-bench --lib waterfall_bracket` runs the per-level FER guards.
 
-Results and conventions are in [BENCHMARKS.md](https://github.com/HagaleTechnologies/coppa/blob/main/BENCHMARKS.md).
+Results are logged in [BENCHMARKS.md](https://github.com/HagaleTechnologies/coppa/blob/main/BENCHMARKS.md).
+Read its "Measurement conventions corrected" section first: entries older than that section
+use an SNR convention that reads about 9 dB optimistic.
 
 ## Limits
 

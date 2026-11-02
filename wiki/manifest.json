@@ -22,7 +22,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:22bcd8bf5b2ac2feb4e62d9a3fe26798b3f914e830d4af7784585308403e63f3",
+      "hash": "sha256:5236467cf8a4d75d2289d781a27ee787b302c2ed3a0333c953301e03caf854e5",
       "id": "adr-002-fec-strategy",
       "kind": "decision-digest",
       "links": [
@@ -40,8 +40,8 @@
       ],
       "status": "current",
       "title": "Why does coppa use both convolutional and LDPC codes?",
-      "verified_commit": "b9fdb8d",
-      "verified_date": "2026-11-02",
+      "verified_commit": "59b0b63",
+      "verified_date": "2026-07-14",
       "visibility": "public"
     },
     {
@@ -423,7 +423,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:f50972cce25723017f6576ce2582fe288d3f7c1603bc24a8552ff345243f0f0f",
+      "hash": "sha256:e8adc703ca6f9a6b097149842f8431013b0e6b894e881ff8cbf8c875e0a5501c",
       "id": "overview",
       "kind": "overview",
       "links": [],
@@ -437,8 +437,8 @@
       ],
       "status": "current",
       "title": "Coppa \u2014 what is this and where do things live?",
-      "verified_commit": "b9fdb8d",
-      "verified_date": "2026-11-02",
+      "verified_commit": "56361d6",
+      "verified_date": "2026-10-28",
       "visibility": "public"
     },
     {

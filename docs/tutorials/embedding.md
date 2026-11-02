@@ -198,7 +198,10 @@ assert_eq!(core.decode_bytes(&noisy).expect("level 1 decodes at 10 dB"), b"throu
 ```
 
 `awgn_seeded` is simpler but references the full 48 kHz band, which reads about 9 dB better than
-the 3 kHz figure. [BENCHMARKS.md](../../BENCHMARKS.md) lists the SNR each level needs.
+the 3 kHz figure. The SNR band where each level's frame error rate falls to 10% or less, on
+the 3 kHz reference with every level pinned to the `hf_standard` profile, is listed in the doc
+comment on `bracket` in [crates/coppa-bench/src/runner.rs](../../crates/coppa-bench/src/runner.rs).
+The `waterfall_bracket_level_N` tests there check one SNR point below and one above each band.
 
 ## What the library does not do
 

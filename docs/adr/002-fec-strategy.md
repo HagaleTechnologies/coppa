@@ -2,15 +2,7 @@
 
 ## Status
 
-Superseded by ADR-005
-
-**COP-88 update (2026-11-02):** neither half of this decision describes the shipped system.
-ADR-005 replaced the six-rate 802.11 QC-LDPC family with a single NR BG2 mother code,
-rate-matched per speed level. The rate-1/2 K=7 convolutional code and its Viterbi decoder
-remain in `coppa-protocol` (`fec/convolutional.rs`), but no transmit or receive path uses
-them: `grep -rn 'ViterbiDecoder\|ConvEncoder' crates` finds no use outside that file, and
-`ARCHITECTURE.md`'s "Legacy code not on the data path" lists the benchmark and fuzz target
-as its only callers. The text below is kept as the original record.
+Accepted
 
 ## Context
 
