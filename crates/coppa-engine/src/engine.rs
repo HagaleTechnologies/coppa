@@ -55,8 +55,12 @@ pub struct StreamFrame {
     /// Carrier frequency offset (Hz) the sync detector estimated for this frame
     /// before demodulation.
     pub cfo_hz: f32,
-    /// Absolute sample index of the frame's preamble start, counted over every
-    /// sample ever passed to [`CoppaCore::push_samples`].
+    /// Sample index of the frame's preamble start, counted over the samples
+    /// passed to [`CoppaCore::push_samples`] since the engine's streaming
+    /// receiver was last built. Construction, `reconfigure`, `set_speed_level`,
+    /// `set_ofdm_band` and `set_cp_profile` each build a fresh receiver and
+    /// restart the count at 0. A chunk that squelch drops never reaches the
+    /// receiver, so its samples are not counted.
     pub frame_start: u64,
     /// Speed level (1-9) the transmitting station encoded this frame at, from the
     /// decoded protected header (`DecodedFrame::header.speed_level`). Added for

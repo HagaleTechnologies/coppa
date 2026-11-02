@@ -169,9 +169,9 @@ pub enum ProtocolError {
     /// CRC mismatch.
     #[error("CRC mismatch: expected 0x{expected:04X}, got 0x{actual:04X}")]
     FrameCrcMismatch {
-        /// CRC-16 carried in the frame.
+        /// CRC-16 computed over the received length byte and data.
         expected: u16,
-        /// CRC-16 computed over the received data.
+        /// CRC-16 carried in the frame.
         actual: u16,
     },
     /// Capabilities too short.

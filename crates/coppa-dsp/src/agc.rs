@@ -41,7 +41,9 @@ impl AdaptiveAgc {
 
     /// Returns `samples` with one gain applied per block, updating the
     /// smoothed power estimate as it goes. An empty input returns an empty
-    /// vector; a block with RMS below 1e-10 passes through at unity gain.
+    /// vector. A block passes through at unity gain unless the smoothed RMS
+    /// estimate (the square root of the updated power estimate, not the
+    /// block's own RMS) is above 1e-10.
     pub fn process(&mut self, samples: &[f32]) -> Vec<f32> {
         if samples.is_empty() {
             return Vec::new();
@@ -151,5 +153,23 @@ mod tests {
             "AGC should track amplitude change, ratio={}",
             ratio
         );
+    }
+
+    #[test]
+    fn test_agc_unity_gain_follows_smoothed_estimate_not_block_rms() {
+        let block = 64;
+        let tiny = vec![1e-12_f32; block];
+
+        // First block: the estimate is the block's own power, so unity gain.
+        let mut agc = AdaptiveAgc::new(1.0, block);
+        assert_eq!(agc.process(&tiny), tiny);
+
+        // After a loud block the smoothed estimate stays far above 1e-10, so
+        // the same tiny block is scaled down rather than passed through.
+        let mut agc = AdaptiveAgc::new(1.0, block);
+        let loud = vec![10.0_f32; block];
+        agc.process(&loud);
+        let out = agc.process(&tiny);
+        assert!(out.iter().all(|&y| y < 0.5e-12), "{out:?}");
     }
 }

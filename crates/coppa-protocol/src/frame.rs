@@ -596,4 +596,18 @@ mod tests {
         let bits = vec![0u8; 100];
         assert!(Frame::find_sync_with_polarity(&bits).is_err());
     }
+
+    #[test]
+    fn test_crc_mismatch_expected_is_computed_and_actual_is_carried() {
+        let (_, mut bits) = Frame::new(vec![42]).unwrap().to_bits_split().unwrap();
+        *bits.last_mut().unwrap() ^= 1;
+        let computed = Frame::CRC.checksum(&[1, 42]);
+        match Frame::from_payload_bits(&bits) {
+            Err(ProtocolError::FrameCrcMismatch { expected, actual }) => {
+                assert_eq!(expected, computed);
+                assert_eq!(actual, computed ^ 1);
+            }
+            other => panic!("expected FrameCrcMismatch, got {other:?}"),
+        }
+    }
 }
