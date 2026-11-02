@@ -1120,11 +1120,11 @@ impl WebSocketServer {
                                             WsClientMessage::Spectrum {enabled} => spectrum_enabled = enabled,
                                             WsClientMessage::AudioLevel {enabled} => audio_level_enabled = enabled,
                                             WsClientMessage::Log {enabled} => log_enabled = enabled,
-                                            WsClientMessage::Tune {seconds, single_hz} => match status.lock().await.clone().check_tune(seconds, single_hz) {
+                                            WsClientMessage::Tune {seconds, single_hz} => match status.lock().await.check_tune(seconds, single_hz) {
                                                 Ok(()) => host_event = Some(HostEvent::Tune {client_id, seconds, single_hz}),
                                                 Err(message) => error = Some(message),
                                             },
-                                            WsClientMessage::SetSpeedLevel {level} => match status.lock().await.clone().check_speed_level(level) {
+                                            WsClientMessage::SetSpeedLevel {level} => match status.lock().await.check_speed_level(level) {
                                                 Ok(()) => host_event = Some(HostEvent::SetSpeedLevel {client_id, level: match level {SpeedLevelSetting::Auto(_) => None, SpeedLevelSetting::Level(n) => Some(n)}}),
                                                 Err(message) => error = Some(message),
                                             },

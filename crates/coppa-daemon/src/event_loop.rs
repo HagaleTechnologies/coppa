@@ -1447,9 +1447,13 @@ impl EventLoop {
                     );
                     return;
                 }
-                if let Err(e) = self.apply_speed_level(requested) {
-                    tracing::warn!(level = requested, error = %e, "set_speed_level refused");
-                    return;
+                // A level change reconfigures the receiver (dropping a frame
+                // mid-decode), so an unchanged level is not re-applied.
+                if self.engine.speed_level() != requested {
+                    if let Err(e) = self.apply_speed_level(requested) {
+                        tracing::warn!(level = requested, error = %e, "set_speed_level refused");
+                        return;
+                    }
                 }
                 // COP-21: a rebind to HF may have clamped the level; pin what
                 // is actually in force.
@@ -1460,8 +1464,11 @@ impl EventLoop {
             }
             None => {
                 self.manual_speed_level = None;
-                if let Err(e) = self.apply_speed_level(self.rate_loop.current_level()) {
-                    tracing::warn!(error = %e, "Failed to apply RateLoop's speed level after set_speed_level auto");
+                let level = self.rate_loop.current_level();
+                if self.engine.speed_level() != level {
+                    if let Err(e) = self.apply_speed_level(level) {
+                        tracing::warn!(error = %e, "Failed to apply RateLoop's speed level after set_speed_level auto");
+                    }
                 }
                 tracing::info!(
                     "Speed level returned to automatic control (level {})",
@@ -1762,7 +1769,11 @@ impl EventLoop {
             // COP-83: `status` mirrors every reliable state push, written
             // before the push so a client's `status` never ends on an older
             // value than the pushes it then receives.
-            if let Some(ref status) = self.ws_status {
+            let mirrored = matches!(
+                response,
+                VaraResponse::Ptt(_) | VaraResponse::Busy(_) | VaraResponse::Buffer(_)
+            );
+            if let Some(status) = self.ws_status.as_ref().filter(|_| mirrored) {
                 let mut snap = status.lock().await;
                 match &response {
                     VaraResponse::Ptt(state) => {
