@@ -456,6 +456,10 @@ unless it presents a shared-secret token. This applies on every
 `bind_address`, loopback included: a web page open in your own browser can
 reach `127.0.0.1` too.
 
+For a host author's overview of every port, including the WebSocket
+handshake outcomes and request table, see [HOST-API.md](HOST-API.md). This
+section owns the token and Origin setup.
+
 ### Dashboard protocol v1
 
 After authentication the first text frame is a versioned greeting:

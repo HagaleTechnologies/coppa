@@ -191,3 +191,68 @@ It uses virtual time and cannot establish real-time scheduling behavior.
 Not run: real radios, sound cards, RF, `snd-aloop`, fading/noise channels,
 Winlink Express, or multi-message sessions. Both ends ran coppa; no ARDOP
 waveform interoperability is claimed.
+
+## COP-76 run record (2026-11-02)
+
+Linux x86_64 cloud container, Rust 1.98.0, main at `b9fdb8d` (coppad 0.3.0), Pat v1.0.0 with
+its pinned SHA-256 verified by the harness. The daemon was built with:
+
+```sh
+cargo build --release -p coppa-daemon --bin coppad --features cpal-backend
+```
+
+The COP-76 research ran the VARA harness unchanged, both directions:
+
+```text
+$ tools/pat-loop/run.sh --direction both
+N1CALL->N0CALL  exit=0  elapsed=52s  body_match=yes  overflow_lines=2  keepalives=0
+N0CALL->N1CALL  exit=0  elapsed=53s  body_match=yes  overflow_lines=1  keepalives=0
+FAIL
+```
+
+Pat completed both sessions and both messages matched byte for byte. The harness reports
+`FAIL` only on its zero-overflow rule: `Audio input buffer overflow dropped=448` (about 9 ms of
+samples at 48 kHz) appeared once or twice per run. A second run, with debug logging, gave
+`elapsed=52s ... overflow_lines=1`, so the result repeated. The overflow was not diagnosed. It
+matches the VARA regression in the COP-97 record above. The longer sessions (52 s against 38 s
+on 2026-10-27) are consistent with COP-38's stop-and-wait.
+
+The COP-76 implementation re-ran the same harness later that day, on the same commit with
+only documentation changed (the coppad binary was rebuilt from identical code):
+
+```text
+$ tools/pat-loop/run.sh --direction both
+pat-loop: Pat v1.0.0 (sha256 OK), coppad …/target/release/coppad
+N1CALL->N0CALL  exit=0  elapsed=52s  body_match=yes  overflow_lines=0  keepalives=0
+N0CALL->N1CALL  exit=0  elapsed=49s  body_match=yes  overflow_lines=0  keepalives=0
+PASS
+```
+
+So the overflow is intermittent in this container: two of the three runs logged it, one did
+not. Every session shown delivered its message byte for byte.
+
+With `RUST_LOG=coppad=debug,coppa_host=debug tools/pat-loop/run.sh --direction a --keep`,
+coppad's `VARA command received` lines for the Pat connection were:
+
+```text
+Dialer (N1CALL)                           Listener (N0CALL)
+PUBLIC ON                                 PUBLIC ON
+CWID ON                                   CWID ON
+COMPRESSION TEXT                          COMPRESSION TEXT
+MYCALL N1CALL                             MYCALL N0CALL
+LISTEN OFF                                LISTEN OFF
+VERSION                                   VERSION
+BW2300                                    BW2300
+WINLINK SESSION                           LISTEN ON
+(Connect request, destination N0CALL)     (Session fully established (responder) remote=N1CALL)
+(Disconnect request)                      (Disconnect request)
+BW2300                                    BW2300
+```
+
+Lines in parentheses are coppad's own log events, not commands. Compared with the COP-46 notes,
+Pat v1.0.0 also sends `VERSION` in its opening burst and sends `BW2300` again after the session
+ends. coppad answers `WRONG` to `PUBLIC ON`, `CWID ON` and `WINLINK SESSION`, which Pat treats as
+a no-op. [docs/PAT.md](../PAT.md#what-coppad-does-with-pats-commands) tabulates every reply.
+
+Not run: real radios, sound cards, RF, `snd-aloop`, Pat's `?p2p=true` and `?bw=` dial options,
+or Pat versions other than v1.0.0.
