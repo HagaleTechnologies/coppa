@@ -10,6 +10,37 @@
 //! - PHY framing, MAC/transport/application PDUs, selective-repeat ARQ,
 //!   sessions, compression, the AX.25 UI frame codec, and the CP-profile
 //!   negotiator (`cp_negotiator`).
+//!
+//! # Example
+//!
+//! One frame through [`modem::CoppaTransceiver`] and back, with no channel in
+//! between. The transceiver LDPC-encodes, interleaves and maps the payload,
+//! then modulates it into 48 kHz audio; `receive` reverses every step.
+//!
+//! ```
+//! use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
+//! use coppa_codec::ofdm::CoppaProfile;
+//! use coppa_protocol::modem::CoppaTransceiver;
+//!
+//! let transceiver = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+//! let payload = b"CQ CQ DE N0CALL";
+//! let header = CoppaHeader {
+//!     version: 1,
+//!     phy_mode: 0,
+//!     frame_type: CoppaFrameType::Data,
+//!     bandwidth: transceiver.profile().bandwidth_id,
+//!     fec_type: 0,
+//!     speed_level: 1,
+//!     seq_num: 0,
+//!     payload_len: payload.len() as u16,
+//!     codewords: 1,
+//! };
+//! let audio = transceiver.transmit(&header, payload).expect("payload fits level 1");
+//! let (rx_header, rx_payload, _recommended_level) =
+//!     transceiver.receive(&audio).expect("clean loopback decodes");
+//! assert_eq!(rx_header.speed_level, 1);
+//! assert_eq!(rx_payload, payload);
+//! ```
 
 //! # Errors
 //!
