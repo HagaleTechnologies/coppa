@@ -180,6 +180,41 @@ mod tests {
         }
     }
 
+    /// The code of the page's top-level `function {name}(`, up to the next
+    /// top-level function, without `//` comment lines.
+    fn page_function(name: &str) -> String {
+        let start = INDEX_HTML
+            .find(&format!("\nfunction {name}("))
+            .unwrap_or_else(|| panic!("page defines {name}"));
+        let rest = &INDEX_HTML[start + 1..];
+        let end = rest
+            .find("\nfunction ")
+            .unwrap_or_else(|| panic!("a function follows {name}"));
+        rest[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A reconnect can miss `session` pushes. `applyStatus` must compare the
+    /// status reply's `remote_call` with the cached peer, not only the
+    /// `connected` flag, and a socket loss must forget what the page cannot
+    /// know afterwards: when the session started and whether a call is
+    /// still being placed.
+    #[test]
+    fn page_reconciles_the_session_from_status_after_a_reconnect() {
+        let apply_status = page_function("applyStatus");
+        assert!(
+            apply_status.contains("call !== state.session.call)"),
+            "applyStatus never compares remote_call with the cached session peer"
+        );
+        let reset_live = page_function("resetLive");
+        for line in ["state.session.since = 0;", "state.session.calling = null;"] {
+            assert!(reset_live.contains(line), "resetLive lacks {line:?}");
+        }
+    }
+
     #[test]
     fn page_shows_the_reviewed_wording() {
         for text in WORDING {

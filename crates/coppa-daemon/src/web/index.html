@@ -290,6 +290,9 @@ function resetLive() {
   state.busy = null;
   state.mycall = undefined;
   state.rxAudio = null;
+  // Session pushes missed while the socket is down make these unknowable.
+  state.session.since = 0;
+  state.session.calling = null;
 }
 
 function onHello(msg) {
@@ -371,7 +374,11 @@ function applyStatus(msg) {
   if (typeof msg.snr === "number" && state.lastSnr === null) state.lastSnr = msg.snr;
   if (Array.isArray(msg.heard)) state.heard = msg.heard;
   state.link = msg.link || null;
-  if (msg.connected !== state.session.connected) applySession(msg.connected === true, msg.remote_call || null, false);
+  // A reconnect can miss session pushes, so the peer is reconciled as well.
+  const call = msg.remote_call || null;
+  if (msg.connected !== state.session.connected || (msg.connected === true && call !== state.session.call)) {
+    applySession(msg.connected === true, call, false);
+  }
   if (typeof msg.max_tune_s === "number") $("tune-seconds").max = String(msg.max_tune_s);
   const input = $("mycall-input");
   if (state.mycall && input.value === "" && document.activeElement !== input) input.value = state.mycall;
