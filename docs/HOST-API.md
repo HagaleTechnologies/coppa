@@ -105,9 +105,10 @@ closes the connection.
 
 **Replies and pushed lines.** Each command gets exactly one reply, sent only to the client that
 sent it. Every other line coppad sends (`PTT`, `CONNECTED`, `BUFFER`, ...) goes to every
-command-port client, with one exception: the `DISCONNECTED` that refuses a `CONNECT` goes
-only to the client that dialled. Replies stay in the order you sent the commands, but they can
-queue behind a transmission, so wait for each reply instead of counting on a fixed delay.
+command-port client, with one exception: the `DISCONNECTED` that refuses a `CONNECT` because a
+session already exists goes only to the client that dialled. Replies stay in the order you sent
+the commands, but they can queue behind a transmission, so wait for each reply instead of counting
+on a fixed delay.
 
 ### Commands
 
@@ -123,9 +124,12 @@ queue behind a transmission, so wait for each reply instead of counting on a fix
 | `TUNE [seconds]` | `OK`, then `PTT ON`, `PTT OFF` | coppa extension: two-tone calibration, default 10 s; still `OK` when coppad cannot transmit (it logs why) |
 | anything else, including `PUBLIC`, `CWID`, `CHAT`, `CQFRAME`, `WINLINK SESSION`, `P2P SESSION`, `CLEANTXBUFFER`, `BW9999` | `WRONG` | none |
 
-- A `CONNECT` while a session exists (connecting or connected) gets `OK` and then
-  `DISCONNECTED`, to the dialling client only. Send `DISCONNECT` first.
-- A `CONNECT` with no valid callsign set gets `OK` and then `DISCONNECTED` at once.
+- A `CONNECT` to a valid `<target>` while a session exists (connecting or connected) gets `OK`
+  and then `DISCONNECTED`, to the dialling client only. Send `DISCONNECT` first.
+- A `CONNECT` with no valid callsign set, or with an invalid `<target>`, gets `OK` and then
+  `DISCONNECTED` at once. That `DISCONNECTED` goes to every command-port client, and every
+  WebSocket client gets a `session` message with `"state":"disconnected"`. An invalid `<target>`
+  is refused this way even while a session exists, and that session stays up.
 - When the session is a pending inbound attempt (after `PENDING`), `DISCONNECT` and `ABORT` push
   `CANCELPENDING` before `DISCONNECTED`.
 - `DISCONNECT` sends what the host already queued, waits for each frame's ACK, and only then
@@ -276,25 +280,27 @@ After `101` the first frame is:
 ### Requests
 
 Any request may carry an unsigned integer `id`. A request with an `id` gets exactly one reply
-with that `id`: `ack`, `status` or `error`. An `ack` means accepted, not done.
+with that `id`: `ack`, `status` or `error`. An `ack` means accepted, not done. A request without
+an `id` gets no `ack`. A `status` request is still answered and a rejected request still gets an
+`error`, both without an `id`; every other request is accepted silently.
 
 | Request | Reply | Notes |
 |---|---|---|
 | `{"type":"mycall","callsign":"N1CALL","id":1}` | `{"type":"ack","id":1}` | becomes the line `MYCALL N1CALL`; the ack does not mean the callsign is valid (coppad checks it later and only logs a warning) |
-| `{"type":"connect","source":"N1CALL","destination":"N0CALL","id":2}` | `ack` | `source` is ignored; the outcome arrives as a `session` message, except when another session already holds the link: that refusal sends a WebSocket client nothing, so check `status` |
+| `{"type":"connect","source":"N1CALL","destination":"N0CALL","id":2}` | `ack` | `source` is ignored; the outcome arrives as a `session` message, except when the dial is refused because another session already holds the link: that refusal sends a WebSocket client nothing, so check `status` |
 | `{"type":"disconnect","id":3}` | `ack` | then `session` with `"state":"disconnected"` if a session existed; with none, only the `ack` |
 | `{"type":"send","data":"hello","id":4}` | `ack` | `encoding` is `utf8` (the default) or `base64`; bad base64 gets `error`; with no session the bytes are dropped after the ack |
 | `{"type":"status","id":5}` | `{"type":"status","id":5,"connected":false,"cp_desync_episodes":0}` | `remote_call` appears while a session exists; `snr`, `level` and `cfo` describe the last decoded frame and stay after a session ends; `short_cp_ok` appears when `[engine] cp_gate_enabled` is on |
-| `{"type":"spectrum","enabled":true}` | `ack` | opt in to (or, with `false`, out of) `spectrum` messages |
-| `{"type":"audio_level","enabled":true}` | `ack` | the same for `audio_level` |
-| `{"type":"log","enabled":true}` | `ack` | the same for `log` |
+| `{"type":"spectrum","enabled":true,"id":6}` | `ack` | opt in to (or, with `false`, out of) `spectrum` messages |
+| `{"type":"audio_level","enabled":true,"id":7}` | `ack` | the same for `audio_level` |
+| `{"type":"log","enabled":true,"id":8}` | `ack` | the same for `log` |
 
 Anything else gets an `error`, with the request's `id` if it had one, for example
-`{"type":"error","message":"Invalid message: unknown variant ...","id":6}`. Binary frames are
+`{"type":"error","message":"Invalid message: unknown variant ...","id":9}`. Binary frames are
 ignored. There is **no `listen` request**: a station driven only over WebSocket can dial but
 cannot answer a call (see [Session rules](#session-rules-for-every-interface) and
-[LIMITATIONS.md](LIMITATIONS.md)). A refused dial is also silent on WebSocket, as noted in the
-`connect` row.
+[LIMITATIONS.md](LIMITATIONS.md)). A dial refused because another session holds the link is
+also silent on WebSocket, as noted in the `connect` row.
 
 ### Messages coppad sends
 
