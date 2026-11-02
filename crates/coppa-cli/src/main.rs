@@ -6,6 +6,7 @@
 #![cfg_attr(not(test), deny(clippy::print_stdout))]
 
 mod doctor;
+mod interrupt;
 mod style;
 
 use anyhow::Result;
@@ -746,6 +747,11 @@ fn main() -> std::process::ExitCode {
         // The reader of stdout went away (`coppa rx f.wav | head -1`): it
         // chose to stop, so stop quietly, as `head` does.
         Err(error) if is_broken_pipe(&error) => std::process::ExitCode::SUCCESS,
+        // Only returned once PTT was released and the audio stopped.
+        Err(error) if error.is::<interrupt::Interrupted>() => {
+            eprintln!("Interrupted: transmission stopped and PTT released.");
+            std::process::ExitCode::from(130)
+        }
         Err(error) => {
             // Byte-identical to anyhow's own `Termination` output.
             let prefix = style::paint("Error", style::Tone::BoldRed, style::stderr_color());
@@ -1175,20 +1181,57 @@ const PLAYBACK_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 trait PlaybackClock {
     fn now(&self) -> std::time::Instant;
     fn sleep(&mut self, duration: std::time::Duration);
+    /// Ctrl-C or SIGTERM has arrived: stop transmitting (COP-86).
+    fn interrupted(&self) -> bool {
+        false
+    }
+    /// Sleep `duration`, in slices of at most `PLAYBACK_POLL`, stopping
+    /// early on an interrupt so a multi-second PTT lead or tail never delays
+    /// the release. Returns whether it was interrupted.
+    fn sleep_or_interrupt(&mut self, duration: std::time::Duration) -> bool {
+        let end = self.now() + duration;
+        loop {
+            if self.interrupted() {
+                return true;
+            }
+            let left = end.saturating_duration_since(self.now());
+            if left.is_zero() {
+                return false;
+            }
+            self.sleep(left.min(PLAYBACK_POLL));
+        }
+    }
 }
 
-/// The wall clock and a real thread sleep.
+/// The wall clock, a real thread sleep, and the process's signal flag.
 #[cfg(feature = "cpal-backend")]
-struct SystemClock;
+struct SystemClock<'a> {
+    interrupt: Option<&'a interrupt::Interrupt>,
+}
 
 #[cfg(feature = "cpal-backend")]
-impl PlaybackClock for SystemClock {
+impl PlaybackClock for SystemClock<'_> {
     fn now(&self) -> std::time::Instant {
         std::time::Instant::now()
     }
     fn sleep(&mut self, duration: std::time::Duration) {
         std::thread::sleep(duration);
     }
+    fn interrupted(&self) -> bool {
+        self.interrupt.is_some_and(interrupt::Interrupt::is_set)
+    }
+}
+
+/// `clock.sleep_or_interrupt` as a `Result`: `Err(Interrupted)` on Ctrl-C.
+#[cfg(feature = "cpal-backend")]
+fn sleep_unless_interrupted(
+    clock: &mut dyn PlaybackClock,
+    duration: std::time::Duration,
+) -> Result<()> {
+    if clock.sleep_or_interrupt(duration) {
+        return Err(interrupt::Interrupted.into());
+    }
+    Ok(())
 }
 
 /// Key PTT, wait `lead`, feed every sample of `samples` into `sink`
@@ -1215,11 +1258,9 @@ fn play_keyed<S: coppa_audio::AudioSink>(
     use coppa_radio::PttState;
 
     let result = match ptt.set_ptt(PttState::Tx) {
-        Ok(()) => {
-            clock.sleep(lead);
-            feed_until_played(sink, &progress, &finish, samples, clock)
-                .inspect(|_| clock.sleep(tail))
-        }
+        Ok(()) => sleep_unless_interrupted(clock, lead)
+            .and_then(|()| feed_until_played(sink, &progress, &finish, samples, clock))
+            .and_then(|delivered| sleep_unless_interrupted(clock, tail).map(|()| delivered)),
         Err(e) => Err(anyhow::anyhow!("failed to key PTT: {e}")),
     };
 
@@ -1228,6 +1269,12 @@ fn play_keyed<S: coppa_audio::AudioSink>(
         .map_err(|e| anyhow::anyhow!("failed to release PTT: {e}"));
     let stopped = sink.stop();
     match result {
+        // Keep the type, so `main` can report a clean interrupt with 130.
+        Err(primary)
+            if primary.is::<interrupt::Interrupted>() && release.is_ok() && stopped.is_ok() =>
+        {
+            Err(primary)
+        }
         Err(primary) => {
             let mut message = primary.to_string();
             if let Err(e) = release {
@@ -1267,6 +1314,9 @@ fn feed_until_played<S: coppa_audio::AudioSink>(
     let mut last_progress_at = clock.now();
     let mut finished = false;
     loop {
+        if clock.interrupted() {
+            return Err(interrupt::Interrupted.into());
+        }
         if offset < samples.len() {
             let written = sink.write(&samples[offset..])?;
             let written = written.min(samples.len() - offset);
@@ -1404,6 +1454,8 @@ fn transmit_live(
 
     // Create PTT controller
     let mut ptt_ctrl = build_ptt(ptt, rigctld_addr)?;
+    // Before keying: a Ctrl-C from here on releases PTT (COP-86).
+    let interrupt = interrupt::Interrupt::install()?;
 
     // COP-40: refuse a wideband emission below 29.7 MHz before any audio
     // device is opened or PTT keyed.
@@ -1451,7 +1503,9 @@ fn transmit_live(
         samples,
         std::time::Duration::from_millis(ptt_lead_ms),
         std::time::Duration::from_millis(ptt_tail_ms),
-        &mut SystemClock,
+        &mut SystemClock {
+            interrupt: Some(&interrupt),
+        },
     )?;
 
     if verbosity != Verbosity::Quiet {
@@ -1657,6 +1711,12 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
             "--sample-format applies only to raw PCM on stdin (rx -); a WAV file's header sets its format"
         );
     }
+    // Before the first status line: callers (and the tests) may signal as
+    // soon as they see it.
+    let interrupt = interrupt::Interrupt::install()?;
+    let chatty = status_enabled(verbosity, args.raw, args.json);
+    #[cfg(not(any(feature = "file-backend", feature = "cpal-backend")))]
+    let _ = (&interrupt, chatty);
 
     if args.path() == Some("-") {
         #[cfg(feature = "file-backend")]
@@ -1667,13 +1727,17 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
             let rate = core.config().sample_rate;
             let format = coppa_audio::PcmFormat::from(args.sample_format.unwrap_or_default());
             let mut source = coppa_audio::RawPcmReader::new(std::io::stdin(), format, rate);
+            // Status first: the header check blocks until the producer
+            // writes, and the operator should see what coppa is waiting for.
+            if chatty {
+                eprintln!(
+                    "Reading raw {format} audio (mono, {rate} Hz) from stdin (Ctrl+C to stop)..."
+                );
+            }
             if source.starts_with_wav_header()? {
                 anyhow::bail!(
                     "stdin starts with a WAV header; pass the file instead (coppa rx FILE) or send headerless PCM"
                 );
-            }
-            if status_enabled(verbosity, args.raw, args.json) {
-                eprintln!("Reading raw {format} audio (mono, {rate} Hz) from stdin...");
             }
             source.start()?;
             let total_samples =
@@ -1683,6 +1747,7 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 &mut source,
                 StopWhen {
                     total_samples,
+                    interrupt: Some(&interrupt),
                     eof_on_empty_read: true,
                     ..StopWhen::default()
                 },
@@ -1691,15 +1756,17 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 verbosity,
             )?;
             source.stop()?;
-            summary.check_failure()?;
-            if summary.good_frames == 0 {
-                anyhow::bail!(
+            if chatty && summary.interrupted {
+                eprintln!("{}", summary.stop_line(rate));
+            }
+            summary.finish(|| {
+                format!(
                     "no frames decoded from stdin ({} samples at {} Hz; profile {}); check for a complete Coppa frame and a matching --profile",
                     summary.consumed_samples,
                     rate,
                     args.profile.as_deref().unwrap_or("default")
-                );
-            }
+                )
+            })?;
         }
         #[cfg(not(feature = "file-backend"))]
         {
@@ -1726,7 +1793,7 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
             let total = source.total_samples();
             // The checked WAV rate is the engine rate; no resampling occurs.
             let limit = file_sample_limit(total, args.duration, source.sample_rate());
-            if status_enabled(verbosity, args.raw, args.json) {
+            if chatty {
                 if limit < total {
                     eprintln!(
                         "Reading the first {} s ({} of {} samples) from {}",
@@ -1742,6 +1809,7 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 &mut source,
                 StopWhen {
                     total_samples: Some(limit),
+                    interrupt: Some(&interrupt),
                     ..StopWhen::default()
                 },
                 output_mode,
@@ -1749,16 +1817,18 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 verbosity,
             )?;
             source.stop()?;
-            summary.check_failure()?;
-            if summary.good_frames == 0 {
-                anyhow::bail!(
+            if chatty && summary.interrupted {
+                eprintln!("{}", summary.stop_line(source.sample_rate()));
+            }
+            summary.finish(|| {
+                format!(
                     "no frames decoded from {} ({} samples at {} Hz; profile {}); check for a complete Coppa frame and a matching --profile",
                     path,
                     summary.consumed_samples,
                     source.sample_rate(),
                     args.profile.as_deref().unwrap_or("default")
-                );
-            }
+                )
+            })?;
         }
         #[cfg(not(feature = "file-backend"))]
         {
@@ -1800,7 +1870,6 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 );
             }
             source.start()?;
-            let chatty = status_enabled(verbosity, args.raw, args.json);
             if chatty {
                 if args.duration > 0 {
                     eprintln!(
@@ -1817,6 +1886,7 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 &mut source,
                 StopWhen {
                     deadline,
+                    interrupt: Some(&interrupt),
                     ..StopWhen::default()
                 },
                 output_mode,
@@ -1824,10 +1894,10 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 verbosity,
             )?;
             source.stop()?;
-            summary.check_failure()?;
-            if chatty && args.duration > 0 {
-                eprintln!("Stopped listening after {} s.", args.duration);
+            if chatty {
+                eprintln!("{}", summary.stop_line(engine_rate));
             }
+            summary.check_failure()?;
         }
         #[cfg(not(feature = "cpal-backend"))]
         {
@@ -1907,6 +1977,10 @@ const TRAILING_FLUSH_SAMPLES: usize = 8192;
 /// Every normal return then pushes `TRAILING_FLUSH_SAMPLES` of silence so a
 /// frame that ends right at the file's end (or just before a live deadline)
 /// can still complete (see that constant's doc).
+#[cfg_attr(
+    not(any(feature = "file-backend", feature = "cpal-backend")),
+    allow(dead_code)
+)]
 #[derive(Default)]
 struct DecodeSummary {
     good_frames: usize,
@@ -1914,9 +1988,44 @@ struct DecodeSummary {
     first_error: Option<String>,
     consumed_samples: usize,
     report_live_errors: bool,
+    /// Reading stopped because of Ctrl-C or SIGTERM (COP-86).
+    interrupted: bool,
+    /// Level warnings printed during the read, such as clipping (COP-86).
+    warnings: Vec<String>,
 }
 
+#[cfg_attr(
+    not(any(feature = "file-backend", feature = "cpal-backend")),
+    allow(dead_code)
+)]
 impl DecodeSummary {
+    /// The line an ended capture prints on stderr (COP-86), e.g.
+    /// `Stopped after 42.3 s of audio: 1 frame decoded, 0 failed.`
+    fn stop_line(&self, sample_rate: u32) -> String {
+        let seconds = self.consumed_samples as f64 / f64::from(sample_rate.max(1));
+        let noun = if self.good_frames == 1 {
+            "frame"
+        } else {
+            "frames"
+        };
+        format!(
+            "Stopped after {seconds:.1} s of audio: {} {noun} decoded, {} failed.",
+            self.good_frames, self.failed_frames
+        )
+    }
+
+    /// `coppa rx`'s exit for a finished read: a decode failure is an error;
+    /// with no frames at all, an input that ended by itself (a file, or stdin
+    /// at EOF) is an error too, while a capture the operator stopped is not.
+    #[cfg_attr(not(feature = "file-backend"), allow(dead_code))]
+    fn finish(&self, no_frames: impl FnOnce() -> String) -> Result<()> {
+        self.check_failure()?;
+        if self.good_frames == 0 && !self.interrupted {
+            anyhow::bail!("{}", no_frames());
+        }
+        Ok(())
+    }
+
     fn check_failure(&self) -> Result<()> {
         if let Some(error) = &self.first_error {
             anyhow::bail!("{error}");
@@ -1931,9 +2040,11 @@ impl DecodeSummary {
     not(any(feature = "file-backend", feature = "cpal-backend")),
     allow(dead_code)
 )]
-struct StopWhen {
+struct StopWhen<'a> {
     /// After this many samples (a file, or `rx - -d N`).
     total_samples: Option<usize>,
+    /// When Ctrl-C or SIGTERM arrives.
+    interrupt: Option<&'a interrupt::Interrupt>,
     /// At this instant (live `--duration`).
     deadline: Option<std::time::Instant>,
     /// At the first empty read: the source returns 0 only at end of stream
@@ -1944,17 +2055,22 @@ struct StopWhen {
 fn stream_decode(
     core: &mut CoppaCore,
     source: &mut dyn coppa_audio::AudioSource,
-    stop: StopWhen,
+    stop: StopWhen<'_>,
     output_mode: RxOutputMode,
     profile: &str,
     verbosity: Verbosity,
 ) -> Result<DecodeSummary> {
     let StopWhen {
         total_samples,
+        interrupt,
         deadline,
         eof_on_empty_read,
     } = stop;
     let mut buf = vec![0.0f32; 4096];
+    // The daemon's meter and wording: a warning each time the input starts
+    // clipping (COP-86). Underdrive is not reported, because it would fire
+    // on the silent stretches of ordinary recordings.
+    let mut meter = coppa_daemon::level_meter::RxLevelMeter::new(source.sample_rate());
     let mut summary = DecodeSummary {
         report_live_errors: total_samples.is_none(),
         ..DecodeSummary::default()
@@ -1966,9 +2082,23 @@ fn stream_decode(
         let n = source.read(&mut buf[..want])?;
         if n > 0 {
             summary.consumed_samples += n;
+            for update in meter.observe(&buf[..n]) {
+                if update.transition == Some(coppa_daemon::level_meter::LevelState::Clipping) {
+                    let message = coppa_daemon::level_meter::rx_transition_message(
+                        coppa_daemon::level_meter::LevelState::Clipping,
+                        &update.reading,
+                    );
+                    style::warn(message);
+                    summary.warnings.push(message.to_string());
+                }
+            }
             for frame in core.push_samples(&buf[..n]) {
                 handle_stream_frame(core, &frame, &mut summary, output_mode, profile, verbosity)?;
             }
+        }
+        if interrupt.is_some_and(interrupt::Interrupt::is_set) {
+            summary.interrupted = true;
+            break;
         }
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             break;
@@ -3114,6 +3244,8 @@ mod tests {
             pub fail_unkey: bool,
             pub events: Vec<(Duration, String)>,
             fractional: f64,
+            /// Simulated Ctrl-C at this offset from `start`.
+            pub interrupt_at: Option<Duration>,
         }
 
         impl Device {
@@ -3137,6 +3269,7 @@ mod tests {
                     fail_unkey: false,
                     events: Vec::new(),
                     fractional: 0.0,
+                    interrupt_at: None,
                 }))
             }
 
@@ -3214,6 +3347,28 @@ mod tests {
                     d.log(format!("sleep {}ms", duration.as_millis()));
                 }
                 d.advance(duration);
+            }
+            fn interrupted(&self) -> bool {
+                let d = self.0.lock().unwrap();
+                d.interrupt_at
+                    .is_some_and(|at| d.now.saturating_duration_since(d.start) >= at)
+            }
+            // One logged sleep, cut short at the simulated interrupt.
+            fn sleep_or_interrupt(&mut self, duration: Duration) -> bool {
+                let (now, at) = {
+                    let d = self.0.lock().unwrap();
+                    (d.now, d.interrupt_at.map(|at| d.start + at))
+                };
+                match at {
+                    Some(at) if at < now + duration => {
+                        self.sleep(at.saturating_duration_since(now));
+                        true
+                    }
+                    _ => {
+                        self.sleep(duration);
+                        false
+                    }
+                }
             }
         }
 
@@ -3463,6 +3618,97 @@ mod tests {
         assert_eq!(event_names(&device), ["ptt TX", "ptt RX", "stop"]);
     }
 
+    /// COP-86: Ctrl-C during the lead, the feed or the tail unkeys and
+    /// stops at once, and returns the `Interrupted` type `main` maps to 130.
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn play_keyed_interrupted_releases_ptt() {
+        let samples = vec![0.25f32; 48_000];
+        // (interrupt at, lead, tail): during the 1 s lead, during the 1 s of
+        // audio after a 100 ms lead, and during the 3 s tail.
+        for (at_ms, lead_ms, tail_ms) in [(500, 1_000, 200), (600, 100, 200), (2_000, 100, 3_000)] {
+            let device = sim::Device::new(std::time::Duration::ZERO);
+            device.lock().unwrap().interrupt_at = Some(std::time::Duration::from_millis(at_ms));
+            let error = run_play_keyed(&device, &samples, lead_ms, tail_ms).unwrap_err();
+            assert!(error.is::<interrupt::Interrupted>(), "{at_ms} ms: {error}");
+            let names = event_names(&device);
+            assert_eq!(
+                names.first().map(String::as_str),
+                Some("ptt TX"),
+                "{names:?}"
+            );
+            assert_eq!(&names[names.len() - 2..], ["ptt RX", "stop"], "{names:?}");
+            let unkey = event_time(&device, "ptt RX");
+            assert!(
+                unkey >= std::time::Duration::from_millis(at_ms)
+                    && unkey < std::time::Duration::from_millis(at_ms + 10),
+                "{at_ms} ms: unkeyed at {unkey:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn play_keyed_interrupt_with_failed_release_is_a_plain_error() {
+        let device = sim::Device::new(std::time::Duration::ZERO);
+        {
+            let mut d = device.lock().unwrap();
+            d.interrupt_at = Some(std::time::Duration::from_millis(10));
+            d.fail_unkey = true;
+        }
+        let error = run_play_keyed(&device, &[0.25; 48_000], 1_000, 200).unwrap_err();
+        assert!(!error.is::<interrupt::Interrupted>(), "{error}");
+        assert!(
+            error
+                .to_string()
+                .starts_with("interrupted; cleanup: failed to release PTT"),
+            "{error}"
+        );
+        assert_eq!(
+            event_names(&device).last().map(String::as_str),
+            Some("stop")
+        );
+    }
+
+    /// The real clock's sliced sleep notices an interrupt between slices.
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn default_sleep_or_interrupt_stops_between_slices() {
+        struct Counting {
+            now: std::time::Instant,
+            sleeps: usize,
+            interrupt_after: usize,
+        }
+        impl PlaybackClock for Counting {
+            fn now(&self) -> std::time::Instant {
+                self.now
+            }
+            fn sleep(&mut self, duration: std::time::Duration) {
+                assert!(duration <= PLAYBACK_POLL);
+                self.now += duration;
+                self.sleeps += 1;
+            }
+            fn interrupted(&self) -> bool {
+                self.sleeps >= self.interrupt_after
+            }
+        }
+        let start = std::time::Instant::now();
+        let mut clock = Counting {
+            now: start,
+            sleeps: 0,
+            interrupt_after: 3,
+        };
+        assert!(clock.sleep_or_interrupt(std::time::Duration::from_secs(5)));
+        assert_eq!(clock.sleeps, 3);
+        let mut clock = Counting {
+            now: start,
+            sleeps: 0,
+            interrupt_after: usize::MAX,
+        };
+        assert!(!clock.sleep_or_interrupt(std::time::Duration::from_millis(9)));
+        assert_eq!(clock.now - start, std::time::Duration::from_millis(9));
+    }
+
     #[cfg(feature = "cpal-backend")]
     #[test]
     fn play_keyed_key_and_unkey_failures_are_fatal() {
@@ -3702,6 +3948,169 @@ mod tests {
             !names.contains(&"listen") && !names.contains(&"config"),
             "{names:?}"
         );
+    }
+
+    #[test]
+    fn clip_warning_fires_once_per_entry() {
+        // 600 ms at full scale (six meter windows), then clean audio.
+        let mut samples = vec![1.0f32; 48_000 * 6 / 10];
+        samples.extend(std::iter::repeat_n(0.1f32, 48_000));
+        let mut source = coppa_audio::RawF32Source::from_samples(samples.clone(), 48_000);
+        let summary = stream_decode(
+            &mut CoppaCore::new(),
+            &mut source,
+            StopWhen {
+                total_samples: Some(samples.len()),
+                ..StopWhen::default()
+            },
+            RxOutputMode::Text { hex: false },
+            "default",
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        // One entry into clipping, one warning, however long it lasts.
+        assert_eq!(summary.warnings.len(), 1, "{:?}", summary.warnings);
+        assert!(summary.warnings[0].starts_with("RX audio input is clipping"));
+    }
+
+    #[test]
+    fn summary_line_wording() {
+        let mut summary = DecodeSummary {
+            consumed_samples: 48_000 * 42 + 14_400,
+            good_frames: 1,
+            ..DecodeSummary::default()
+        };
+        assert_eq!(
+            summary.stop_line(48_000),
+            "Stopped after 42.3 s of audio: 1 frame decoded, 0 failed."
+        );
+        summary.good_frames = 2;
+        summary.failed_frames = 1;
+        assert!(summary
+            .stop_line(48_000)
+            .ends_with(": 2 frames decoded, 1 failed."));
+        summary.good_frames = 0;
+        assert!(summary.stop_line(48_000).contains(": 0 frames decoded"));
+    }
+
+    #[test]
+    fn interrupted_live_capture_with_no_frames_is_ok() {
+        let summary = DecodeSummary {
+            interrupted: true,
+            ..DecodeSummary::default()
+        };
+        assert!(summary.finish(|| "no frames".to_string()).is_ok());
+        let finished = DecodeSummary::default();
+        let err = finished.finish(|| "no frames".to_string()).unwrap_err();
+        assert_eq!(err.to_string(), "no frames");
+    }
+
+    #[test]
+    fn interrupted_capture_with_a_failure_exits_one() {
+        let summary = DecodeSummary {
+            interrupted: true,
+            good_frames: 1,
+            failed_frames: 1,
+            first_error: Some("payload decode failed: bad".to_string()),
+            ..DecodeSummary::default()
+        };
+        let err = summary.finish(|| "no frames".to_string()).unwrap_err();
+        assert_eq!(err.to_string(), "payload decode failed: bad");
+    }
+
+    #[test]
+    fn interrupt_flag_stops_stream_decode() {
+        struct Silence {
+            reads: usize,
+            flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl coppa_audio::AudioSource for Silence {
+            fn read(&mut self, buf: &mut [f32]) -> anyhow::Result<usize> {
+                self.reads += 1;
+                if self.reads == 5 {
+                    self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                buf.fill(0.0);
+                Ok(buf.len())
+            }
+            fn sample_rate(&self) -> u32 {
+                48_000
+            }
+            fn start(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn stop(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        let (interrupt, flag) = interrupt::Interrupt::manual();
+        let mut source = Silence { reads: 0, flag };
+        let summary = stream_decode(
+            &mut CoppaCore::new(),
+            &mut source,
+            StopWhen {
+                interrupt: Some(&interrupt),
+                ..StopWhen::default()
+            },
+            RxOutputMode::Text { hex: false },
+            "default",
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        assert!(summary.interrupted);
+        assert_eq!(source.reads, 5);
+        assert_eq!(summary.consumed_samples, 5 * 4096);
+    }
+
+    #[test]
+    fn interrupt_still_runs_the_trailing_flush() {
+        // A frame that ends right where the interrupt lands still decodes,
+        // because the trailing flush runs on every exit path.
+        struct FrameThenStop {
+            samples: Vec<f32>,
+            position: usize,
+            flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl coppa_audio::AudioSource for FrameThenStop {
+            fn read(&mut self, buf: &mut [f32]) -> anyhow::Result<usize> {
+                let n = buf.len().min(self.samples.len() - self.position);
+                buf[..n].copy_from_slice(&self.samples[self.position..self.position + n]);
+                self.position += n;
+                if self.position == self.samples.len() {
+                    self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(n)
+            }
+            fn sample_rate(&self) -> u32 {
+                48_000
+            }
+            fn start(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn stop(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        let (interrupt, flag) = interrupt::Interrupt::manual();
+        let mut source = FrameThenStop {
+            samples: CoppaCore::new().encode("FLUSHED").unwrap(),
+            position: 0,
+            flag,
+        };
+        let summary = stream_decode(
+            &mut CoppaCore::new(),
+            &mut source,
+            StopWhen {
+                interrupt: Some(&interrupt),
+                ..StopWhen::default()
+            },
+            RxOutputMode::Text { hex: false },
+            "default",
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        assert!(summary.interrupted);
+        assert_eq!(summary.good_frames, 1);
     }
 
     #[test]

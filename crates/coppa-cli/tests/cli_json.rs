@@ -60,13 +60,19 @@ fn devices_json_is_one_array_with_typed_records() {
     }
     for device in value.as_array().unwrap() {
         let object = device.as_object().unwrap();
-        assert_eq!(object.len(), 5);
+        // COP-86 added four fields after the original five (additive, COP-58).
+        assert_eq!(object.len(), 9);
         assert!(object["name"].is_string());
         // COP-64: the exact selector ID, or null when the host gives none.
         assert!(object["id"].is_string() || object["id"].is_null());
         assert!(object["max_sample_rate_hz"].is_u64());
         assert!(object["input_channels"].is_u64());
         assert!(object["output_channels"].is_u64());
+        for key in ["input_supports_48000_hz", "output_supports_48000_hz"] {
+            assert!(object[key].is_boolean() || object[key].is_null(), "{key}");
+        }
+        assert!(object["is_default_input"].is_boolean());
+        assert!(object["is_default_output"].is_boolean());
     }
     assert_eq!(output.stdout.last(), Some(&b'\n'));
 }

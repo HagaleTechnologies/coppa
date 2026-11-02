@@ -215,3 +215,34 @@ fn sample_format_requires_output() {
     let output = run_in(&scratch, &["tx", "hi", "--sample-format", "f32le"]);
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
 }
+
+/// COP-86 (H-076): `rx` warns when its input clips, and still decodes.
+#[test]
+fn clipped_file_warns() {
+    use coppa_audio::{AudioSink, AudioSource};
+    let scratch = Scratch::new();
+    assert_ok(&run_in(&scratch, &["tx", "hi", "-o", "f.wav"]));
+    let mut source = coppa_audio::WavSource::open(scratch.0.join("f.wav")).unwrap();
+    let mut frame = vec![0.0f32; source.total_samples()];
+    source.read(&mut frame).unwrap();
+    let clipped: Vec<f32> = frame.iter().map(|s| (20.0 * s).clamp(-1.0, 1.0)).collect();
+    let mut sink = coppa_audio::WavSink::with_format(
+        scratch.0.join("clipped.wav"),
+        48_000,
+        coppa_audio::WavFormat::Float32,
+    );
+    sink.write(&clipped).unwrap();
+    sink.stop().unwrap();
+
+    let output = run_in(&scratch, &["rx", "clipped.wav"]);
+    assert!(
+        stderr(&output).contains("WARNING: RX audio input is clipping"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains("Decoded: \"hi\""),
+        "{}",
+        stdout(&output)
+    );
+}
