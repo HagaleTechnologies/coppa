@@ -48,7 +48,7 @@
 //!   exactly the mechanism that corrupted Task 1's rejected per-window re-fit).
 //! - **Recursion**: standard complex Kalman filter, implemented via the same
 //!   information-form (normal-equations) linear algebra
-//!   [`super::delay_domain::solve_ridge`] uses (`L≤8`, so direct Gaussian
+//!   `super::delay_domain::solve_ridge` uses (`L≤8`, so direct Gaussian
 //!   elimination/LU is exact and cheap) — predict: `h_pred=a·h_prev`,
 //!   `P_pred=a²·P_prev+Q`; update: MAP combination of the Gaussian prior
 //!   `N(h_pred,P_pred)` with the weighted-least-squares observation likelihood,

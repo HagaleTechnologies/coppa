@@ -9,6 +9,9 @@ rust-version.workspace = true
 [[bin]]
 name = "coppa"
 path = "src/main.rs"
+# COP-88: the root `coppa` lib owns target/doc/coppa; documenting this bin too
+# is a cargo output filename collision (rust-lang/cargo#6313).
+doc = false
 
 [dependencies]
 coppa-engine = { path = "../coppa-engine" }

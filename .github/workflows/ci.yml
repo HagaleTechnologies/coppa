@@ -47,6 +47,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
       - run: cargo check --workspace
       - run: cargo check --workspace --all-features
+      # COP-88: rustdoc must stay warning-free (broken intra-doc links, links
+      # to private items, stray HTML tags). serial-ptt needs the libudev
+      # headers installed above.
+      - name: rustdoc with warnings denied
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
       # COP-63: a per-crate aarch64-linux build of the CLI or daemon must not
       # reach alsa-sys unless the crate's own cpal-backend feature asks for it.
       # The --workspace checks cannot see this, because they build coppa-audio

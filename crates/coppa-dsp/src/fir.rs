@@ -23,7 +23,7 @@ pub fn design_bandpass(taps: usize, fs: f32, f_lo: f32, f_hi: f32) -> Vec<f32> {
         .collect()
 }
 
-/// Odd-length Hilbert transformer (type-III FIR): h[k] = 2/(pi*k) for odd k, else 0,
+/// Odd-length Hilbert transformer (type-III FIR): h\[k\] = 2/(pi*k) for odd k, else 0,
 /// Blackman-windowed. Pass real x; get the quadrature component with (taps-1)/2 delay.
 pub fn design_hilbert(taps: usize) -> Vec<f32> {
     assert!(taps % 2 == 1, "Hilbert FIR needs odd length");

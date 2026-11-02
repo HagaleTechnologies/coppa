@@ -29,7 +29,7 @@ impl LinearInterpolationEstimator {
     /// Compute per-carrier effective noise variance after MMSE equalization.
     ///
     /// For each data carrier k, the effective noise variance on the equalized
-    /// symbol is σ²/|H[k]|². This accounts for frequency-selective fading:
+    /// symbol is σ²/|H\[k\]|². This accounts for frequency-selective fading:
     /// carriers with weak channel gain have higher effective noise.
     pub fn per_carrier_noise(&self, data_carrier_indices: &[usize]) -> Vec<f32> {
         let sigma2 = self.noise_var;
@@ -50,7 +50,7 @@ impl LinearInterpolationEstimator {
             .collect()
     }
 
-    /// Per-carrier Wiener gain g[k] = |H[k]|^2 / (|H[k]|^2 + sigma^2) — the amplitude bias the
+    /// Per-carrier Wiener gain g\[k\] = |H\[k\]|^2 / (|H\[k\]|^2 + sigma^2) — the amplitude bias the
     /// MMSE equalizer applies. Dividing an equalized symbol by g un-biases it to constellation
     /// scale (equivalent to zero-forcing), which matters for amplitude-bearing QAM.
     pub fn per_carrier_gain(&self, data_carrier_indices: &[usize]) -> Vec<f32> {
@@ -151,7 +151,7 @@ impl ChannelEstimator for LinearInterpolationEstimator {
     }
 }
 
-/// MMSE equalizer: X_hat[k] = Y[k] * H*[k] / (|H[k]|^2 + sigma^2)
+/// MMSE equalizer: X_hat\[k\] = Y\[k\] * H*\[k\] / (|H\[k\]|^2 + sigma^2)
 pub fn mmse_equalize(
     received: &[Complex32],
     estimator: &dyn ChannelEstimator,

@@ -91,7 +91,7 @@ fn k0_offset(buf_len: usize, rv: u8) -> usize {
 /// are implemented for Phase 3 (HARQ incremental redundancy).
 ///
 /// # Panics
-/// See [`matching_buffer`] and [`k0_offset`].
+/// See `matching_buffer` and `k0_offset`.
 pub fn rate_match(mother: &[u8], k_used: usize, e: usize, rv: u8) -> Vec<u8> {
     let buf = matching_buffer(mother, k_used);
     let buf_len = buf.len();
@@ -111,7 +111,7 @@ pub fn rate_match(mother: &[u8], k_used: usize, e: usize, rv: u8) -> Vec<u8> {
 /// via a hard decision first.
 ///
 /// # Panics
-/// See [`matching_buffer`] and [`k0_offset`].
+/// See `matching_buffer` and `k0_offset`.
 pub fn rate_match_llr(mother_llrs: &[f32], k_used: usize, e: usize, rv: u8) -> Vec<f32> {
     let buf = matching_buffer(mother_llrs, k_used);
     let buf_len = buf.len();
@@ -136,7 +136,7 @@ pub fn rate_match_llr(mother_llrs: &[f32], k_used: usize, e: usize, rv: u8) -> V
 /// (soft/LLR chase-combining), not overwritten.
 ///
 /// # Panics
-/// Panics if `llrs.len() != e`, or (via [`matching_buffer`]/[`k0_offset`])
+/// Panics if `llrs.len() != e`, or (via `matching_buffer`/`k0_offset`)
 /// for invalid `k_used`/`rv`/`mother_len`.
 pub fn rate_dematch(llrs: &[f32], k_used: usize, e: usize, rv: u8, mother_len: usize) -> Vec<f32> {
     assert_eq!(llrs.len(), e, "llrs.len() must equal e");

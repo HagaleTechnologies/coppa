@@ -20,7 +20,7 @@
 //!
 //! 1. First `need = rx_group_delay + (3 + header_syms) * symbol_len` — just enough
 //!    for the preamble, probe/fine-sync symbol, and the protected header, PLUS the
-//!    RX bandpass filter's own group delay (see [`StreamingReceiver::header_peek`]'s
+//!    RX bandpass filter's own group delay (see `StreamingReceiver::header_peek`'s
 //!    doc for why that's needed). Once buffered, the header ALONE is demodulated
 //!    (`CoppaTransceiver::demodulate_header`) to learn the frame's speed level. A
 //!    header decode failure discards the candidate and

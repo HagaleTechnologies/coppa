@@ -354,7 +354,7 @@ impl CoppaCore {
     /// whose frame bytes are byte-identical to the original (rebuilt from
     /// the segment data) but whose PHY level drops to the most robust level
     /// whose payload budget still fits the frame. It shares
-    /// [`Self::encode_bytes_at`] with [`Self::encode_bytes`] so the two can
+    /// `Self::encode_bytes_at` with [`Self::encode_bytes`] so the two can
     /// never diverge -- unlike [`Self::encode_bytes_at_level`] (Beacon frame
     /// type, no compression, the station-ID/beacon path), which is left
     /// alone for its existing callers.

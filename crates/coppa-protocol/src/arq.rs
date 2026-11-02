@@ -305,7 +305,7 @@ pub struct RttEstimator {
 
 impl RttEstimator {
     /// Create a new estimator with a given initial RTO and the fixed
-    /// [`MIN_RTO_SECS`] floor. Prefer [`RttEstimator::new_with_floor`] with a real
+    /// `MIN_RTO_SECS` floor. Prefer [`RttEstimator::new_with_floor`] with a real
     /// [`rto_floor`] for production half-duplex sessions (see that function's
     /// doc) -- this constructor exists for callers that don't have (or don't
     /// need) a computed floor.

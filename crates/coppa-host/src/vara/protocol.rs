@@ -3,9 +3,9 @@
 /// Commands received from a VARA client on the command port.
 #[derive(Debug, Clone, PartialEq)]
 pub enum VaraCommand {
-    /// Set the station callsign: MYCALL <callsign>
+    /// Set the station callsign: `MYCALL <callsign>`
     MyCall(String),
-    /// Connect to a remote station: CONNECT <source> <dest> [via <digi>]
+    /// Connect to a remote station: `CONNECT <source> <dest> [via <digi>]`
     Connect { source: String, destination: String },
     /// Disconnect the current session.
     Disconnect,
@@ -13,7 +13,7 @@ pub enum VaraCommand {
     /// `ON`/`OFF` parses as `Unknown`.
     Listen(bool),
     /// Two-tone TX calibration tone (coppa extension, not a VARA command):
-    /// TUNE [seconds]. A non-positive or unparseable duration falls back to
+    /// TUNE \[seconds\]. A non-positive or unparseable duration falls back to
     /// `None` (the caller's default).
     Tune(Option<f32>),
     /// Set compression: COMPRESSION ON|OFF
