@@ -2780,8 +2780,10 @@ impl EventLoop {
                     self.reap_timed_out_sessions().await;
                     // Send keepalives for active sessions
                     let active = self.session_mgr.active_sessions();
-                    let now = Instant::now();
                     for id in active {
+                        // Read the clock per session: `transmit_samples` below
+                        // can wait seconds for a clear channel and PTT.
+                        let now = Instant::now();
                         let needs = self.session_mgr.get(id).map(|s| s.needs_keepalive(now)).unwrap_or(false);
                         if needs {
                             if let Some(session) = self.session_mgr.get_mut(id) {
