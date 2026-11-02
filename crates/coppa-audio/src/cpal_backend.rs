@@ -190,7 +190,6 @@ pub fn probe_cpal_device(
     }
 }
 
-/// List audio devices via CPAL.
 /// The host's default input and output devices, named and identified the
 /// way `list_cpal_devices` names and identifies every device.
 pub fn default_cpal_devices() -> crate::DefaultDevices {
@@ -208,6 +207,7 @@ pub fn default_cpal_devices() -> crate::DefaultDevices {
     }
 }
 
+/// List audio devices via CPAL.
 pub fn list_cpal_devices() -> Result<Vec<AudioDevice>> {
     let host = cpal::default_host();
     let mut devices = Vec::new();

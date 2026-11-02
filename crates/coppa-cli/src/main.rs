@@ -378,20 +378,44 @@ fn write_json<T: Serialize>(value: &T) -> Result<()> {
 }
 
 /// Write one line of data to stdout. Unlike `println!`, a closed pipe comes
-/// back as an error that `main` turns into a quiet exit 0 (COP-86).
+/// back as [`StdoutClosed`], which `main` turns into a quiet exit 0 (COP-86).
 fn emit(line: impl std::fmt::Display) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
-    writeln!(stdout, "{line}")?;
-    stdout.flush()?;
-    Ok(())
+    writeln!(stdout, "{line}")
+        .and_then(|()| stdout.flush())
+        .map_err(stdout_error)
 }
 
 /// Write bytes to stdout as they are, with `emit`'s closed-pipe handling.
 fn emit_raw(bytes: &[u8]) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
-    stdout.write_all(bytes)?;
-    stdout.flush()?;
-    Ok(())
+    stdout
+        .write_all(bytes)
+        .and_then(|()| stdout.flush())
+        .map_err(stdout_error)
+}
+
+/// The reader of stdout went away. Only stdout writes produce it, so a
+/// broken pipe on any other stream (a rigctld or TNC socket) stays an error.
+#[derive(Debug)]
+struct StdoutClosed;
+
+impl std::fmt::Display for StdoutClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stdout was closed")
+    }
+}
+
+impl std::error::Error for StdoutClosed {}
+
+/// A failed stdout write: [`StdoutClosed`] for a broken pipe, else the error.
+fn stdout_error(error: impl Into<anyhow::Error>) -> anyhow::Error {
+    let error = error.into();
+    if is_broken_pipe(&error) {
+        StdoutClosed.into()
+    } else {
+        error
+    }
 }
 
 /// Whether `rx` prints status lines: not under `--quiet`, and not when
@@ -746,7 +770,7 @@ fn main() -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         // The reader of stdout went away (`coppa rx f.wav | head -1`): it
         // chose to stop, so stop quietly, as `head` does.
-        Err(error) if is_broken_pipe(&error) => std::process::ExitCode::SUCCESS,
+        Err(error) if error.is::<StdoutClosed>() => std::process::ExitCode::SUCCESS,
         // Only returned once PTT was released and the audio stopped.
         Err(error) if error.is::<interrupt::Interrupted>() => {
             eprintln!("Interrupted: transmission stopped and PTT released.");
@@ -1003,8 +1027,8 @@ fn write_audio_output(
                 sample_rate,
             );
             sink.start()?;
-            sink.write(samples)?;
-            sink.stop()?;
+            sink.write(samples).map_err(stdout_error)?;
+            sink.stop().map_err(stdout_error)?;
             if verbosity != Verbosity::Quiet {
                 eprintln!("Written to stdout (raw {format}, mono, {sample_rate} Hz)");
             }
@@ -1257,11 +1281,18 @@ fn play_keyed<S: coppa_audio::AudioSink>(
 ) -> Result<u64> {
     use coppa_radio::PttState;
 
-    let result = match ptt.set_ptt(PttState::Tx) {
+    // A Ctrl-C before keying never keys the rig at all.
+    let keyed = if clock.interrupted() {
+        Err(interrupt::Interrupted.into())
+    } else {
+        ptt.set_ptt(PttState::Tx)
+            .map_err(|e| anyhow::anyhow!("failed to key PTT: {e}"))
+    };
+    let result = match keyed {
         Ok(()) => sleep_unless_interrupted(clock, lead)
             .and_then(|()| feed_until_played(sink, &progress, &finish, samples, clock))
             .and_then(|delivered| sleep_unless_interrupted(clock, tail).map(|()| delivered)),
-        Err(e) => Err(anyhow::anyhow!("failed to key PTT: {e}")),
+        Err(e) => Err(e),
     };
 
     let release = ptt
@@ -1477,10 +1508,13 @@ fn transmit_live(
         selection.channel,
     )?;
     if sink.hardware_rate() != sample_rate {
-        eprintln!(
-            "WARNING: output audio device {} uses {} Hz hardware rate (requested {} Hz, engine {} Hz)",
-            sink.device_name(), sink.hardware_rate(), sample_rate, sample_rate
-        );
+        style::warn(format_args!(
+            "output audio device {} uses {} Hz hardware rate (requested {} Hz, engine {} Hz)",
+            sink.device_name(),
+            sink.hardware_rate(),
+            sample_rate,
+            sample_rate
+        ));
     }
     if verbosity.is_verbose() {
         eprintln!(
@@ -1856,10 +1890,13 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 args.input_channel,
             )?;
             if source.hardware_rate() != engine_rate {
-                eprintln!(
-                    "WARNING: input audio device {} uses {} Hz hardware rate (requested {} Hz, engine {} Hz)",
-                    source.device_name(), source.hardware_rate(), engine_rate, engine_rate
-                );
+                style::warn(format_args!(
+                    "input audio device {} uses {} Hz hardware rate (requested {} Hz, engine {} Hz)",
+                    source.device_name(),
+                    source.hardware_rate(),
+                    engine_rate,
+                    engine_rate
+                ));
             }
             if verbosity.is_verbose() {
                 eprintln!(
@@ -2072,7 +2109,9 @@ fn stream_decode(
     // on the silent stretches of ordinary recordings.
     let mut meter = coppa_daemon::level_meter::RxLevelMeter::new(source.sample_rate());
     let mut summary = DecodeSummary {
-        report_live_errors: total_samples.is_none(),
+        // A live capture or a stream (`rx -`, with or without -d) reports
+        // failures as they happen; a file reports them at the end.
+        report_live_errors: total_samples.is_none() || eof_on_empty_read,
         ..DecodeSummary::default()
     };
     while total_samples.is_none_or(|total| summary.consumed_samples < total) {
@@ -2236,9 +2275,10 @@ fn cmd_loopback(
             emit("PASS: Loopback test successful!")?;
         }
     } else {
-        emit("FAIL: Messages don't match!")?;
-        emit(format_args!("  Expected: \"{}\"", message))?;
-        emit(format_args!("  Got:      \"{}\"", decoded))?;
+        // Best effort: a closed stdout must not turn this failure into exit 0.
+        let _ = emit("FAIL: Messages don't match!")
+            .and_then(|()| emit(format_args!("  Expected: \"{}\"", message)))
+            .and_then(|()| emit(format_args!("  Got:      \"{}\"", decoded)));
         std::process::exit(1);
     }
 
@@ -4128,6 +4168,31 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("| coppa rx -"), "{err}");
+    }
+
+    #[test]
+    fn only_a_stdout_broken_pipe_becomes_stdout_closed() {
+        let pipe = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone");
+        assert!(stdout_error(pipe).is::<StdoutClosed>());
+        let other = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        assert!(!stdout_error(other).is::<StdoutClosed>());
+        // A broken pipe that never went through a stdout write (a socket)
+        // is not StdoutClosed, so `main` still reports it.
+        let socket = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "rigctld",
+        ));
+        assert!(!socket.is::<StdoutClosed>());
+    }
+
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn play_keyed_never_keys_after_an_early_interrupt() {
+        let device = sim::Device::new(std::time::Duration::ZERO);
+        device.lock().unwrap().interrupt_at = Some(std::time::Duration::ZERO);
+        let error = run_play_keyed(&device, &[0.25; 4800], 50, 200).unwrap_err();
+        assert!(error.is::<interrupt::Interrupted>(), "{error}");
+        assert!(!event_names(&device).iter().any(|e| e == "ptt TX"));
     }
 
     #[test]
