@@ -1105,6 +1105,17 @@ re-baselined. With the current 2/5 Good result the benchmark reports **MET**. Th
 regression floor for this exact schedule and seed set, not a production reliability guarantee, and
 it supersedes rather than achieves the original zero-drop aspiration.
 
+**COP-118 (2026-11-02): fade-diversity prototypes on an adapted version of this bench.** A scratch
+harness ran this bench's level, window, retry budget, ramp and seeds over one continuous Watterson
+trace per trial, with one ARQ segment per six-chunk logical block. A systematic RS(12,6) outer code
+across twelve NR-coded packets completed 5/5 Moderate and 5/5 Poor sessions (1579.3 and 1107.0
+bytes/min). Half-band carrier repetition at the control's mean transmit power completed 3/5 and
+4/5, each within one session of an equivalent noise-referenced run (4/5 and 3/5), and 2/5 and 3/5
+when held to the control's peak instead. The matched six-packet control completed 1/5 and 0/5.
+The outer code costs 45.4% of clean-channel goodput. These numbers come from a different harness
+from the tables above and are not comparable with them. See
+`docs/analysis/COP-118-fade-diversity.md`.
+
 ### Golden vectors: 20 WAVs + manifest, all 20 expected to decode
 
 `crates/coppa-bench/diagnostics/golden_vectors_gen.rs` generates 20 combinations (levels {1, 2, 5,
