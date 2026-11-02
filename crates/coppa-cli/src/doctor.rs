@@ -1,5 +1,6 @@
 //! `coppa doctor` (COP-59): inspect audio and rig control without transmitting.
 
+use crate::style::{paint, Tone};
 use anyhow::{bail, Result};
 use clap::Args;
 use coppa_audio::{DeviceProbe, DeviceSupport, Direction, OpenedFormat, Support};
@@ -344,6 +345,7 @@ fn render(
     listing: &Result<Vec<DeviceSupport>>,
     checks: &[Check],
     engine_rate: u32,
+    color: bool,
 ) -> String {
     let mut output = String::new();
     match backend {
@@ -387,10 +389,17 @@ fn render(
         + 2;
     output.push_str(&format!("\n{:<width$}{:<8}DETAIL\n", "CHECK", "RESULT"));
     for check in checks {
+        // Pad first, then colour, so the SGR bytes never shift the columns.
+        let tone = match check.outcome {
+            Outcome::Pass => Tone::Green,
+            Outcome::Fail => Tone::Red,
+            Outcome::Skip => Tone::Yellow,
+        };
+        // `Outcome`'s Display ignores width, so pad its string form.
+        let result = paint(&format!("{:<8}", check.outcome.to_string()), tone, color);
         output.push_str(&format!(
-            "{:<width$}{:<8}{}\n",
+            "{:<width$}{result}{}\n",
             check.name,
-            check.outcome.to_string(),
             printable(&check.detail)
         ));
     }
@@ -457,7 +466,14 @@ pub(crate) fn cmd_doctor(args: &DoctorArgs) -> Result<()> {
     } else {
         rigctld_checks(&args.rigctld)
     });
-    crate::emit_raw(render(backend, &listing, &checks, rate).as_bytes())?;
+    let report = render(
+        backend,
+        &listing,
+        &checks,
+        rate,
+        crate::style::stdout_color(),
+    );
+    crate::emit_raw(report.as_bytes())?;
     verdict(&checks)
 }
 
@@ -506,8 +522,42 @@ mod tests {
     }
 
     #[test]
+    fn doctor_render_aligns_with_colour() {
+        let report = render(Some("ALSA"), &Ok(vec![]), &sample_checks(), 48_000, true);
+        assert!(report.contains("\u{1b}[32m"), "{report}");
+        let plain = strip_sgr(&report);
+        assert_eq!(
+            plain,
+            render(Some("ALSA"), &Ok(vec![]), &sample_checks(), 48_000, false)
+        );
+        let lines: Vec<_> = plain
+            .lines()
+            .filter(|line| line.starts_with("CHECK") || line.starts_with("audio backend"))
+            .collect();
+        assert_eq!(lines[0].find("RESULT"), lines[1].find("PASS"));
+    }
+
+    /// `text` without SGR escape sequences.
+    fn strip_sgr(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
     fn table_has_a_header_and_aligned_columns_in_check_order() {
-        let report = render(Some("ALSA"), &Ok(vec![]), &sample_checks(), 48_000);
+        let report = render(Some("ALSA"), &Ok(vec![]), &sample_checks(), 48_000, false);
         let lines: Vec<_> = report
             .lines()
             .filter(|line| {
@@ -526,7 +576,7 @@ mod tests {
 
     #[test]
     fn hints_list_only_failed_checks_under_to_fix() {
-        let report = render(Some("ALSA"), &Ok(vec![]), &sample_checks(), 48_000);
+        let report = render(Some("ALSA"), &Ok(vec![]), &sample_checks(), 48_000, false);
         let hints = report.split("To fix:\n").nth(1).unwrap();
         assert!(hints.contains("input format: Coppa records"));
         assert!(hints.contains("output format: Coppa plays"));
@@ -536,12 +586,15 @@ mod tests {
 
     #[test]
     fn no_to_fix_block_when_nothing_failed() {
-        assert!(!render(None, &Ok(vec![]), &skipped_rigctld_checks(), 48_000).contains("To fix:"));
+        assert!(
+            !render(None, &Ok(vec![]), &skipped_rigctld_checks(), 48_000, false)
+                .contains("To fix:")
+        );
     }
 
     #[test]
     fn summary_counts_each_outcome() {
-        assert!(render(None, &Ok(vec![]), &sample_checks(), 48_000)
+        assert!(render(None, &Ok(vec![]), &sample_checks(), 48_000, false)
             .contains("Summary: 4 passed, 3 failed, 1 skipped"));
     }
 
@@ -567,6 +620,7 @@ mod tests {
             &Ok(listing),
             &[check("input device", Outcome::Fail, "bad\nthing", None)],
             48_000,
+            false,
         );
         assert!(report.contains("USB\\u{1b}[31m\\n"));
         assert!(report.contains("id\\r"));
@@ -584,7 +638,7 @@ mod tests {
             })),
             output: Some(Support::No("no f32 mode; formats: i16".into())),
         }];
-        let report = render(Some("ALSA"), &Ok(listing), &[], 48_000);
+        let report = render(Some("ALSA"), &Ok(listing), &[], 48_000, false);
         assert!(report
             .contains("input:  usable: 2 ch f32 at 44100 Hz, channel 0, resampled to 48000 Hz"));
         assert!(report.contains("output:  not usable (no f32 mode; formats: i16)"));
@@ -592,7 +646,7 @@ mod tests {
 
     #[test]
     fn device_listing_without_backend_or_devices() {
-        assert!(render(None, &Ok(vec![]), &[], 48_000)
+        assert!(render(None, &Ok(vec![]), &[], 48_000, false)
             .contains("Audio devices: no audio backend in this build\n  (none found)"));
     }
 

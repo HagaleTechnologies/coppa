@@ -128,3 +128,31 @@ fn closed_pipe_exits_zero_without_panic() {
         assert!(!err.contains("Broken pipe"), "{args:?}: {err}");
     }
 }
+
+#[test]
+fn no_ansi_when_piped() {
+    let scratch = Scratch::new();
+    write_hi_wav(&scratch);
+    for args in [&["doctor", "--no-rigctld"][..], &["listen", "f.wav"][..]] {
+        let output = coppa_command()
+            .current_dir(&scratch.0)
+            .env_remove("NO_COLOR")
+            .args(args)
+            .output()
+            .expect("run coppa");
+        let (out, err) = (stdout(&output), stderr(&output));
+        assert!(!out.contains('\u{1b}'), "{args:?} stdout:\n{out}");
+        assert!(!err.contains('\u{1b}'), "{args:?} stderr:\n{err}");
+    }
+    let listen = coppa_command()
+        .current_dir(&scratch.0)
+        .env_remove("NO_COLOR")
+        .args(["listen", "f.wav"])
+        .output()
+        .expect("run coppa");
+    assert!(
+        stderr(&listen).contains("WARNING: 'coppa listen' is deprecated"),
+        "{}",
+        stderr(&listen)
+    );
+}

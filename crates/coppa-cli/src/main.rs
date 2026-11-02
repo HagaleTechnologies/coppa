@@ -6,6 +6,7 @@
 #![cfg_attr(not(test), deny(clippy::print_stdout))]
 
 mod doctor;
+mod style;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -191,9 +192,45 @@ struct ProfilesArgs {
     json: bool,
 }
 
-/// Printed on stderr whenever the deprecated `coppa config` alias runs, even
-/// under `--quiet`: a script still using it must hear that it is going away.
-const CONFIG_DEPRECATED: &str = "WARNING: 'coppa config' is deprecated and will be removed in the next release. Use 'coppa profiles' instead; it takes the same flags.";
+/// Printed on stderr, after `WARNING:`, whenever the deprecated `coppa
+/// config` alias runs, even under `--quiet`: a script still using it must
+/// hear that it is going away.
+const CONFIG_DEPRECATED: &str = "'coppa config' is deprecated and will be removed in the next release. Use 'coppa profiles' instead; it takes the same flags.";
+
+/// The rate `coppa devices` reports support for: every profile's rate.
+const DEVICES_RATE_HZ: u32 = 48_000;
+
+/// One device's support for `DEVICES_RATE_HZ`, per direction: `None` when
+/// the device advertises nothing that way. The outer `None` of
+/// [`rate_support`] means unknown (the support listing failed or skipped it).
+type RateSupport = (Option<bool>, Option<bool>);
+
+/// Look up `device` (by id) in the support listing.
+fn rate_support(
+    device: &coppa_audio::AudioDevice,
+    support: &Result<Vec<coppa_audio::DeviceSupport>>,
+) -> Option<RateSupport> {
+    let id = device.id.as_deref()?;
+    let entry = support.as_ref().ok()?.iter().find(|entry| entry.id == id)?;
+    let supports = |direction: &Option<coppa_audio::Support>| {
+        direction.as_ref().map(|support| {
+            matches!(support, coppa_audio::Support::Yes(format)
+                if format.sample_rate == DEVICES_RATE_HZ)
+        })
+    };
+    Some((supports(&entry.input), supports(&entry.output)))
+}
+
+/// Whether `device` is the host's default `default`, matched by id.
+fn is_default(
+    device: &coppa_audio::AudioDevice,
+    default: Option<&coppa_audio::DefaultDevice>,
+) -> bool {
+    match (device.id.as_deref(), default.and_then(|d| d.id.as_deref())) {
+        (Some(id), Some(default_id)) => id == default_id,
+        _ => false,
+    }
+}
 
 #[derive(Serialize)]
 struct DeviceOutput {
@@ -202,16 +239,30 @@ struct DeviceOutput {
     max_sample_rate_hz: u32,
     input_channels: u16,
     output_channels: u16,
+    // COP-86: additive fields after the original five (COP-58 contract).
+    input_supports_48000_hz: Option<bool>,
+    output_supports_48000_hz: Option<bool>,
+    is_default_input: bool,
+    is_default_output: bool,
 }
 
-impl From<&coppa_audio::AudioDevice> for DeviceOutput {
-    fn from(device: &coppa_audio::AudioDevice) -> Self {
+impl DeviceOutput {
+    fn new(
+        device: &coppa_audio::AudioDevice,
+        support: &Result<Vec<coppa_audio::DeviceSupport>>,
+        defaults: &coppa_audio::DefaultDevices,
+    ) -> Self {
+        let (input_supports, output_supports) = rate_support(device, support).unwrap_or_default();
         Self {
             name: device.name.clone(),
             id: device.id.clone(),
             max_sample_rate_hz: device.max_sample_rate,
             input_channels: device.input_channels,
             output_channels: device.output_channels,
+            input_supports_48000_hz: input_supports,
+            output_supports_48000_hz: output_supports,
+            is_default_input: is_default(device, defaults.input.as_ref()),
+            is_default_output: is_default(device, defaults.output.as_ref()),
         }
     }
 }
@@ -357,10 +408,10 @@ fn is_broken_pipe(error: &anyhow::Error) -> bool {
     })
 }
 
-/// Printed on stderr every time the hidden `listen` alias runs (COP-56).
-/// Unconditional, like this file's other `WARNING:` lines, so `--quiet`
-/// scripts still see it; stderr keeps stdout captures clean.
-const LISTEN_DEPRECATED: &str = "WARNING: 'coppa listen' is deprecated and will be \
+/// Printed on stderr, after `WARNING:`, every time the hidden `listen` alias
+/// runs (COP-56). Unconditional, like this file's other `WARNING:` lines, so
+/// `--quiet` scripts still see it; stderr keeps stdout captures clean.
+const LISTEN_DEPRECATED: &str = "'coppa listen' is deprecated and will be \
     removed in the next release. Use 'coppa rx' instead; it takes the same flags, \
     and --raw prints hex.";
 
@@ -420,9 +471,9 @@ struct OutputTarget<'a> {
     format: SampleFormat,
 }
 
-/// Printed on stderr whenever the deprecated `tune --seconds` runs, even under
-/// `--quiet`, like `LISTEN_DEPRECATED`.
-const TUNE_SECONDS_DEPRECATED: &str = "WARNING: '--seconds' is deprecated and will be \
+/// Printed on stderr, after `WARNING:`, whenever the deprecated `tune
+/// --seconds` runs, even under `--quiet`, like `LISTEN_DEPRECATED`.
+const TUNE_SECONDS_DEPRECATED: &str = "'--seconds' is deprecated and will be \
     removed in the next release. Use '--duration' (-d); it takes the same value.";
 
 #[derive(clap::Args, Debug, Default, PartialEq, Eq)]
@@ -697,7 +748,8 @@ fn main() -> std::process::ExitCode {
         Err(error) if is_broken_pipe(&error) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             // Byte-identical to anyhow's own `Termination` output.
-            eprintln!("Error: {error:?}");
+            let prefix = style::paint("Error", style::Tone::BoldRed, style::stderr_color());
+            eprintln!("{prefix}: {error:?}");
             std::process::ExitCode::FAILURE
         }
     }
@@ -749,7 +801,7 @@ fn run() -> Result<()> {
         }
         Commands::Rx(args) => resolve_rx_and_run(args, config_flag.as_deref(), env, verbosity)?,
         Commands::Listen(args) => {
-            eprintln!("{LISTEN_DEPRECATED}");
+            style::warn(LISTEN_DEPRECATED);
             resolve_rx_and_run(args, config_flag.as_deref(), env, verbosity)?;
         }
         Commands::Loopback {
@@ -779,7 +831,7 @@ fn run() -> Result<()> {
             rig,
         } => {
             if seconds.is_some() {
-                eprintln!("{TUNE_SECONDS_DEPRECATED}");
+                style::warn(TUNE_SECONDS_DEPRECATED);
             }
             let seconds = seconds.unwrap_or(duration);
             let layers = Layers::load(config_flag.as_deref(), env)?;
@@ -805,7 +857,7 @@ fn run() -> Result<()> {
         Commands::Doctor(args) => doctor::cmd_doctor(&args)?,
         Commands::Profiles(args) => cmd_profiles(&args)?,
         Commands::Config(args) => {
-            eprintln!("{CONFIG_DEPRECATED}");
+            style::warn(CONFIG_DEPRECATED);
             cmd_profiles(&args)?
         }
         #[cfg(feature = "kiss-tnc")]
@@ -1286,14 +1338,14 @@ fn resolve_cli_output_device(
         Ok(device) => Ok(device),
         Err(error) => match error.downcast_ref::<coppa_audio::DeviceSelectionError>() {
             Some(coppa_audio::DeviceSelectionError::MissingName { .. }) => {
-                eprintln!(
-                    "WARNING: No output device matching '{}', using default",
+                style::warn(format_args!(
+                    "No output device matching '{}', using default",
                     selection.name.unwrap_or_default()
-                );
+                ));
                 Ok(None)
             }
             Some(coppa_audio::DeviceSelectionError::AmbiguousName { .. }) => {
-                eprintln!("WARNING: {error}");
+                style::warn(&error);
                 anyhow::bail!("ambiguous output audio device")
             }
             _ => Err(error),
@@ -1310,14 +1362,14 @@ fn resolve_cli_input_device(
         Ok(device) => Ok(device),
         Err(error) => match error.downcast_ref::<coppa_audio::DeviceSelectionError>() {
             Some(coppa_audio::DeviceSelectionError::MissingName { .. }) => {
-                eprintln!(
-                    "WARNING: No input device matching '{}', using default",
+                style::warn(format_args!(
+                    "No input device matching '{}', using default",
                     name.unwrap_or_default()
-                );
+                ));
                 Ok(None)
             }
             Some(coppa_audio::DeviceSelectionError::AmbiguousName { .. }) => {
-                eprintln!("WARNING: {error}");
+                style::warn(&error);
                 anyhow::bail!("ambiguous input audio device")
             }
             _ => Err(error),
@@ -2065,31 +2117,56 @@ fn cmd_loopback(
 
 fn cmd_devices(json: bool) -> Result<()> {
     let devices = coppa_audio::list_devices()?;
+    let support = coppa_audio::list_device_support(DEVICES_RATE_HZ);
+    let defaults = coppa_audio::default_devices();
     if json {
-        let output: Vec<_> = devices.iter().map(DeviceOutput::from).collect();
+        let output: Vec<_> = devices
+            .iter()
+            .map(|device| DeviceOutput::new(device, &support, &defaults))
+            .collect();
         return write_json(&output);
     }
-    for line in device_lines(&devices) {
+    for line in device_lines(&devices, &support, &defaults) {
         emit(line)?;
     }
     Ok(())
 }
 
-fn device_lines(devices: &[coppa_audio::AudioDevice]) -> Vec<String> {
+fn device_lines(
+    devices: &[coppa_audio::AudioDevice],
+    support: &Result<Vec<coppa_audio::DeviceSupport>>,
+    defaults: &coppa_audio::DefaultDevices,
+) -> Vec<String> {
     let mut lines = vec!["Available audio devices:".to_string()];
     if devices.is_empty() {
         lines.push("  (none found - CPAL backend may not be available)".to_string());
-    } else {
-        lines.extend(devices.iter().map(|dev| {
-            format!(
-                "  {} [id: {}] (in: {}ch, out: {}ch, max: {} Hz)",
-                dev.name,
-                dev.id.as_deref().unwrap_or("unavailable"),
-                dev.input_channels,
-                dev.output_channels,
-                dev.max_sample_rate,
-            )
-        }));
+        return lines;
+    }
+    lines.extend(devices.iter().map(|dev| {
+        let rate = match rate_support(dev, support) {
+            None => "unknown",
+            Some((Some(true), Some(true))) => "in+out",
+            Some((Some(true), _)) => "in",
+            Some((_, Some(true))) => "out",
+            Some(_) => "no",
+        };
+        format!(
+            "  {} [id: {}] (in: {}ch, out: {}ch, 48 kHz: {rate})",
+            dev.name,
+            dev.id.as_deref().unwrap_or("unavailable"),
+            dev.input_channels,
+            dev.output_channels,
+        )
+    }));
+    for (label, default) in [("input", &defaults.input), ("output", &defaults.output)] {
+        lines.push(match default {
+            Some(device) => format!(
+                "Default {label}: {} [id: {}]",
+                device.name,
+                device.id.as_deref().unwrap_or("unavailable")
+            ),
+            None => format!("Default {label}: none"),
+        });
     }
     lines
 }
@@ -2432,11 +2509,41 @@ mod tests {
             input_channels: 1,
             output_channels: 2,
         };
-        let value = serde_json::to_value(DeviceOutput::from(&device)).unwrap();
+        let unknown = Err(anyhow::anyhow!("listing failed"));
+        let value = serde_json::to_value(DeviceOutput::new(&device, &unknown, &Default::default()))
+            .unwrap();
         assert_eq!(value["name"], device.name);
         assert_eq!(value["id"], "alsa:radio-a");
         assert_eq!(value["max_sample_rate_hz"], 48_000);
-        assert_eq!(value.as_object().unwrap().len(), 5);
+        assert_eq!(value["input_channels"], 1);
+        assert_eq!(value["output_channels"], 2);
+        assert_eq!(value["input_supports_48000_hz"], serde_json::Value::Null);
+        assert_eq!(value["output_supports_48000_hz"], serde_json::Value::Null);
+        assert_eq!(value["is_default_input"], false);
+        assert_eq!(value["is_default_output"], false);
+        assert_eq!(value.as_object().unwrap().len(), 9);
+
+        let support = Ok(vec![coppa_audio::DeviceSupport {
+            name: device.name.clone(),
+            id: "alsa:radio-a".into(),
+            input: Some(coppa_audio::Support::Yes(coppa_audio::OpenedFormat {
+                channels: 1,
+                sample_rate: 48_000,
+            })),
+            output: None,
+        }]);
+        let defaults = coppa_audio::DefaultDevices {
+            input: Some(coppa_audio::DefaultDevice {
+                name: "USB".into(),
+                id: Some("alsa:radio-a".into()),
+            }),
+            output: None,
+        };
+        let value = serde_json::to_value(DeviceOutput::new(&device, &support, &defaults)).unwrap();
+        assert_eq!(value["input_supports_48000_hz"], true);
+        assert_eq!(value["output_supports_48000_hz"], serde_json::Value::Null);
+        assert_eq!(value["is_default_input"], true);
+        assert_eq!(value["is_default_output"], false);
     }
 
     #[test]
@@ -4055,8 +4162,9 @@ mod tests {
 
     #[test]
     fn device_inventory_shows_ids_and_clean_empty_state() {
+        let unknown = || Err(anyhow::anyhow!("listing failed"));
         assert_eq!(
-            device_lines(&[]),
+            device_lines(&[], &unknown(), &Default::default()),
             [
                 "Available audio devices:",
                 "  (none found - CPAL backend may not be available)",
@@ -4079,13 +4187,81 @@ mod tests {
             },
         ];
         assert_eq!(
-            device_lines(&devices),
+            device_lines(&devices, &unknown(), &Default::default()),
             [
                 "Available audio devices:",
-                "  USB Audio [id: alsa:radio-a] (in: 2ch, out: 2ch, max: 48000 Hz)",
-                "  USB Audio [id: unavailable] (in: 2ch, out: 0ch, max: 44100 Hz)",
+                "  USB Audio [id: alsa:radio-a] (in: 2ch, out: 2ch, 48 kHz: unknown)",
+                "  USB Audio [id: unavailable] (in: 2ch, out: 0ch, 48 kHz: unknown)",
+                "Default input: none",
+                "Default output: none",
             ]
         );
+    }
+
+    #[test]
+    fn device_lines_show_48k_support_and_defaults() {
+        use coppa_audio::{AudioDevice, DeviceSupport, OpenedFormat, Support};
+        let device = |id: &str| AudioDevice {
+            name: format!("Card {id}"),
+            id: Some(id.into()),
+            max_sample_rate: 192_000,
+            input_channels: 2,
+            output_channels: 2,
+        };
+        let yes = || {
+            Some(Support::Yes(OpenedFormat {
+                channels: 1,
+                sample_rate: 48_000,
+            }))
+        };
+        let no = || Some(Support::No("no 48 kHz".into()));
+        let entry = |id: &str, input, output| DeviceSupport {
+            name: format!("Card {id}"),
+            id: id.into(),
+            input,
+            output,
+        };
+        let devices = [
+            device("both"),
+            device("in"),
+            device("out"),
+            device("none"),
+            device("missing"),
+        ];
+        let support = Ok(vec![
+            entry("both", yes(), yes()),
+            entry("in", yes(), no()),
+            entry("out", None, yes()),
+            entry("none", no(), no()),
+        ]);
+        let defaults = coppa_audio::DefaultDevices {
+            input: Some(coppa_audio::DefaultDevice {
+                name: "Default Audio Device".into(),
+                id: Some("alsa:default".into()),
+            }),
+            output: None,
+        };
+        let lines = device_lines(&devices, &support, &defaults);
+        assert_eq!(
+            lines,
+            [
+                "Available audio devices:",
+                "  Card both [id: both] (in: 2ch, out: 2ch, 48 kHz: in+out)",
+                "  Card in [id: in] (in: 2ch, out: 2ch, 48 kHz: in)",
+                "  Card out [id: out] (in: 2ch, out: 2ch, 48 kHz: out)",
+                "  Card none [id: none] (in: 2ch, out: 2ch, 48 kHz: no)",
+                "  Card missing [id: missing] (in: 2ch, out: 2ch, 48 kHz: unknown)",
+                "Default input: Default Audio Device [id: alsa:default]",
+                "Default output: none",
+            ]
+        );
+        assert!(lines.iter().all(|line| !line.contains("max:")));
+        let failed = device_lines(
+            &devices[..1],
+            &Err(anyhow::anyhow!("listing failed")),
+            &defaults,
+        );
+        assert!(failed[1].ends_with("48 kHz: unknown)"), "{failed:?}");
     }
 
     #[test]
