@@ -148,7 +148,7 @@ pub fn select_speed_level_calibrated(capacity: f32) -> u8 {
 }
 
 /// SNR grid points (dB) the `*_LEVEL_CORRECTION` tables below are calibrated at. Measured under
-/// AWGN by `crates/coppa-bench/examples/capacity_level_correction_calibration.rs` (profile
+/// AWGN by `crates/coppa-bench/diagnostics/capacity_level_correction_calibration.rs` (profile
 /// `robust`, seed `0xCA11B`, 200 trials/cell) -- see `BENCHMARKS.md`'s dated section for the real
 /// run this table was generated from.
 const CORRECTION_SNR_GRID: [f32; 5] = [6.0, 12.0, 18.0, 24.0, 30.0];

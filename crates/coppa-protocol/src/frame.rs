@@ -63,6 +63,7 @@ const PN_PREAMBLE: [u8; 16] = make_pn_preamble();
 /// find the frame boundary before invoking FEC decoding.
 #[derive(Debug, Clone)]
 pub struct Frame {
+    /// Payload bytes; at most 255, the reach of the 8-bit length field.
     pub data: Vec<u8>,
 }
 

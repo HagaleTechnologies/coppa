@@ -5,7 +5,7 @@ name: CI
 # still run immediately on every push, exactly as before this migration.
 #
 # The former codex-clean-gated jobs (test-full, bench-fuzz, clippy, msrv, deny, audit,
-# wiki-lint) moved to ci-full.yml, which only runs via workflow_dispatch once
+# wiki-lint, plus COP-90's semver) live in ci-full.yml, which only runs via workflow_dispatch once
 # wait-for-codex.yml's event-driven gate confirms a revision clean -- see that file's own
 # header for the full architecture. This file no longer produces the required "CI" check at
 # all: ci-full.yml's own fan-in job owns that name now (Checks-API-managed, attached explicitly
@@ -42,11 +42,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           toolchain: "1.98.0"
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install ALSA and libudev dev headers (for cpal and serialport)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
       - run: cargo check --workspace
       - run: cargo check --workspace --all-features
+      # COP-90 (H-136): the library crates compile for the browser target.
+      # coppa-channel is left out (getrandom needs the wasm_js feature).
+      # Compiling is not running: see coppa-protocol's "Portability" docs.
+      - name: Library crates compile for wasm32-unknown-unknown
+        run: cargo check --target wasm32-unknown-unknown -p coppa-dsp -p coppa-codec -p coppa-protocol -p coppa-ml -p coppa-engine
       # COP-63: a per-crate aarch64-linux build of the CLI or daemon must not
       # reach alsa-sys unless the crate's own cpal-backend feature asks for it.
       # The --workspace checks cannot see this, because they build coppa-audio

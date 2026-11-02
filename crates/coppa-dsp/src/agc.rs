@@ -11,6 +11,7 @@
 /// the new measurement). So `beta_attack < beta_release` means the AGC responds
 /// faster to sudden power increases (attack) than to decreases (release), which
 /// prevents clipping on strong signals while avoiding pumping on fades.
+#[derive(Debug, Clone)]
 pub struct AdaptiveAgc {
     target_level: f32,
     block_size: usize,
@@ -22,6 +23,10 @@ pub struct AdaptiveAgc {
 }
 
 impl AdaptiveAgc {
+    /// Creates an AGC that scales each `block_size`-sample block towards an
+    /// RMS of `target_level` (linear amplitude). The gain is clamped to
+    /// 1e-4..=1e4, and the first block seeds the power estimate.
+    #[must_use]
     pub fn new(target_level: f32, block_size: usize) -> Self {
         Self {
             target_level,
@@ -34,6 +39,9 @@ impl AdaptiveAgc {
         }
     }
 
+    /// Returns `samples` with one gain applied per block, updating the
+    /// smoothed power estimate as it goes. An empty input returns an empty
+    /// vector; a block with RMS below 1e-10 passes through at unity gain.
     pub fn process(&mut self, samples: &[f32]) -> Vec<f32> {
         if samples.is_empty() {
             return Vec::new();
@@ -76,6 +84,7 @@ impl AdaptiveAgc {
         output
     }
 
+    /// Forgets the power estimate, so the next block seeds it afresh.
     pub fn reset(&mut self) {
         self.power_estimate = None;
     }

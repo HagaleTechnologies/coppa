@@ -592,6 +592,7 @@ impl WebSocketServer {
 
     /// COP-53: require `auth` on every handshake. Without this, `run` and
     /// `run_with_listener` refuse every handshake with 401.
+    #[must_use]
     pub fn with_auth(mut self, auth: WsAuth) -> Self {
         self.auth = Some(std::sync::Arc::new(auth));
         self
@@ -602,6 +603,7 @@ impl WebSocketServer {
     /// same port it then upgrades on. The page is served without a token, so
     /// it must hold no secret; every upgrade, the page's own included, still
     /// passes the [`WsAuth`] gate. Without this, such a request gets `404`.
+    #[must_use]
     pub fn with_index_html(mut self, html: impl Into<String>) -> Self {
         self.index_html = Some(std::sync::Arc::from(html.into()));
         self

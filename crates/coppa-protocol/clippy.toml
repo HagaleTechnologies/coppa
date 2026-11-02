@@ -1,0 +1,7 @@
+# COP-90 (H-136): coppa-protocol takes time from its caller (`now: Instant`),
+# as ArqTx, CpNegotiator and Session do. wasm32-unknown-unknown has no clock,
+# so a clock read here traps at runtime there.
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "take `now: Instant` from the caller (COP-90)" },
+    { path = "std::time::Instant::elapsed", reason = "compute from a caller-supplied `now` (COP-90)" },
+]

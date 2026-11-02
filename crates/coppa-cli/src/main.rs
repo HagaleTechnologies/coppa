@@ -2401,8 +2401,7 @@ mod tests {
     #[test]
     fn level_9_needs_a_vhf_profile() {
         let err = build_core(Some("hf_robust"), Some(9))
-            .err()
-            .expect("level 9 on HF refused")
+            .expect_err("level 9 on HF refused")
             .to_string();
         assert_eq!(
             err,
@@ -2410,8 +2409,7 @@ mod tests {
              level 9 is VHF only (use --profile VHF_FAST)"
         );
         let err = build_core(None, Some(9))
-            .err()
-            .expect("level 9 on the default refused")
+            .expect_err("level 9 on the default refused")
             .to_string();
         assert!(err.contains("the default HF profile"), "{err}");
         assert!(build_core(Some("VHF_FAST"), Some(9)).is_ok());

@@ -113,6 +113,7 @@ pub struct SyncCandidate {
 /// confirmation, strongest-path timing (falling back to first-path only when
 /// the two are separated by more than half the cyclic prefix — see
 /// `docs/adr/004-strongest-path-timing.md`).
+#[derive(Debug)]
 pub struct SyncDetector {
     profile: CoppaProfile,
     /// OFDM symbol length (fft_size + cp_samples) — the Schmidl-Cox lag `L`.
@@ -167,6 +168,9 @@ pub struct SyncDetector {
 }
 
 impl SyncDetector {
+    /// Creates a detector for `profile`'s preamble at protocol `version`, in the
+    /// idle state with no samples pushed. Precomputes the reference preamble
+    /// and the 129-tap Hilbert transformer.
     pub fn new(profile: CoppaProfile, version: u8) -> Self {
         let symbol_len = profile.fft_size + profile.cp_samples;
         let two_l = 2 * symbol_len;
@@ -488,6 +492,7 @@ fn derotate_window(samples: &[f32], abs_start: u64, cfo_hz: f32, sample_rate: f3
 /// A plain O(1)-per-sample delay line: `process` emits `x[n - delay]` for each
 /// pushed `x[n]`, carrying state across calls exactly like `StreamingFir` does,
 /// but without spending a full convolution to compute a shift.
+#[derive(Debug)]
 struct DelayLine {
     buf: VecDeque<f32>,
 }

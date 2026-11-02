@@ -1777,7 +1777,7 @@ impl EventLoop {
         // pending inbound handshakes first (COP-44: those end in
         // CANCELPENDING, not DISCONNECTED).
         let pending = self.accepting_sessions();
-        let removed = self.session_mgr.cleanup_timed_out();
+        let removed = self.session_mgr.cleanup_timed_out(Instant::now());
         for id in removed {
             // COP-43: a drain that keyed nothing for `disconnect_timeout`
             // ends the way a drained one does, minus the unsent chunks.
@@ -2126,7 +2126,7 @@ impl EventLoop {
             .map(|l| l.session_id)
             .and_then(|id| self.session_mgr.get_mut(id))
         {
-            session.touch();
+            session.touch(Instant::now());
         }
         tracing::debug!(
             seq,
@@ -2462,7 +2462,7 @@ impl EventLoop {
         let was_pending = self.is_accepting(session_id);
         self.discard_session_tx(session_id).await;
         if let Some(session) = self.session_mgr.get_mut(session_id) {
-            match session.disconnect() {
+            match session.disconnect(Instant::now()) {
                 Ok(disc_pdu) => {
                     let pdu_bytes = disc_pdu.to_bytes();
                     match self.engine.encode_bytes(&pdu_bytes) {
@@ -2597,7 +2597,7 @@ impl EventLoop {
     fn touch_draining_session(&mut self, session_id: u8) {
         if let Some(session) = self.session_mgr.get_mut(session_id) {
             if session.state == SessionState::Disconnecting {
-                session.touch();
+                session.touch(Instant::now());
             }
         }
     }
@@ -2780,11 +2780,12 @@ impl EventLoop {
                     self.reap_timed_out_sessions().await;
                     // Send keepalives for active sessions
                     let active = self.session_mgr.active_sessions();
+                    let now = Instant::now();
                     for id in active {
-                        let needs = self.session_mgr.get(id).map(|s| s.needs_keepalive()).unwrap_or(false);
+                        let needs = self.session_mgr.get(id).map(|s| s.needs_keepalive(now)).unwrap_or(false);
                         if needs {
                             if let Some(session) = self.session_mgr.get_mut(id) {
-                                if let Ok(ka_pdu) = session.keepalive() {
+                                if let Ok(ka_pdu) = session.keepalive(now) {
                                     let ka_bytes = ka_pdu.to_bytes();
                                     if let Ok(samples) = self.engine.encode_bytes(&ka_bytes) {
                                         // COP-46: `tools/pat-loop` counts these.
@@ -3158,10 +3159,11 @@ impl EventLoop {
                     self.ardop_clients.entry(client_id).or_default().refused = false;
                 }
                 let caps = local_link_caps();
-                match self.session_mgr.create(local, remote.clone(), 0, caps) {
+                let now = Instant::now();
+                match self.session_mgr.create(local, remote.clone(), 0, caps, now) {
                     Ok(id) => {
                         if let Some(session) = self.session_mgr.get_mut(id) {
-                            match session.initiate() {
+                            match session.initiate(now) {
                                 Ok(req_pdu) => {
                                     // COP-97: an accepted ARDOP dial enters
                                     // the outbound handshake state (ISS) —
@@ -3243,7 +3245,10 @@ impl EventLoop {
                 if let Some(id) = session_id.filter(|&id| self.is_accepting(id)) {
                     self.end_session(id, client_id).await;
                 } else if let Some(id) = session_id {
-                    let disconnect = self.session_mgr.get_mut(id).map(|s| s.disconnect());
+                    let disconnect = self
+                        .session_mgr
+                        .get_mut(id)
+                        .map(|s| s.disconnect(Instant::now()));
                     match disconnect {
                         Some(Ok(disc_pdu)) => {
                             // COP-43: VARA's `DISCONNECT` disconnects "once
@@ -5703,13 +5708,14 @@ impl EventLoop {
 
         let remote = pdu.src.clone();
         let caps = local_link_caps();
+        let now = Instant::now();
         match self
             .session_mgr
-            .create(local, remote.clone(), pdu.ssid, caps)
+            .create(local, remote.clone(), pdu.ssid, caps, now)
         {
             Ok(id) => {
                 if let Some(session) = self.session_mgr.get_mut(id) {
-                    match session.handle_connect_req(&pdu.payload) {
+                    match session.handle_connect_req(&pdu.payload, now) {
                         Ok(ack_pdu) => {
                             // COP-44: announce the attempt before the ACK,
                             // whose busy-channel wait can last seconds.
@@ -5754,7 +5760,7 @@ impl EventLoop {
         let remote = pdu.src.clone();
         let session_id = self.session_id_for_frame(&pdu);
         if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
-            match session.handle_connect_ack(&pdu.payload) {
+            match session.handle_connect_ack(&pdu.payload, Instant::now()) {
                 Ok(cfm_pdu) => {
                     let notice = SessionNotice::Connected {
                         local: session.local.clone(),
@@ -5786,7 +5792,7 @@ impl EventLoop {
         let remote = pdu.src.clone();
         let session_id = self.session_id_for_frame(&pdu);
         if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
-            match session.handle_connect_cfm(&pdu.payload) {
+            match session.handle_connect_cfm(&pdu.payload, Instant::now()) {
                 Ok(()) => {
                     session.confirm_established();
                     tracing::info!(remote = %remote, "Session fully established (responder)");
@@ -5902,7 +5908,7 @@ impl EventLoop {
             return;
         }
         self.tx_frame_count = 0; // Our turn to transmit starts fresh
-        session.touch();
+        session.touch(Instant::now());
         let session_id = session.id;
         self.ensure_session_link(session_id);
         let Some(link) = self.session_link.as_mut() else {
@@ -5955,7 +5961,7 @@ impl EventLoop {
         if !session.is_established() && !draining {
             return;
         }
-        session.touch();
+        session.touch(Instant::now());
         let session_id = session.id;
         let Ok(ack) = TransportPdu::from_bytes(&pdu.payload) else {
             return;
@@ -6008,7 +6014,7 @@ impl EventLoop {
     fn handle_keepalive_rx(&mut self, pdu: MacPdu) {
         let session_id = self.session_id_for_frame(&pdu);
         if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
-            session.touch();
+            session.touch(Instant::now());
         }
     }
 
@@ -11894,7 +11900,7 @@ mod tests {
 
     // ── Task 5: real wire-level round-trip integration tests ─────────────────
     //
-    // Unlike `crates/coppa-bench/examples/closed_loop_arq.rs` (which drives
+    // Unlike `crates/coppa-bench/diagnostics/closed_loop_arq.rs` (which drives
     // `ArqTx`/`ArqRx` directly, in-process, bypassing encode/decode entirely),
     // these two tests exercise the REAL wire path: an independent "peer"
     // `CoppaTransceiver` encodes real OFDM audio samples, `EventLoop` decodes
@@ -12716,6 +12722,7 @@ mod tests {
                 Callsign::new("VK3ABC").unwrap(),
                 0,
                 LinkCapabilities::default(),
+                std::time::Instant::now(),
             )
         }
 
@@ -12727,12 +12734,17 @@ mod tests {
                     Callsign::new("W1AW").unwrap(),
                     0,
                     LinkCapabilities::default(),
+                    std::time::Instant::now(),
                 )
                 .unwrap();
             let session = event_loop.session_mgr.get_mut(id).unwrap();
-            let req = session.initiate().unwrap();
-            let ack = peer().handle_connect_req(&req.payload).unwrap();
-            session.handle_connect_ack(&ack.payload).unwrap();
+            let req = session.initiate(std::time::Instant::now()).unwrap();
+            let ack = peer()
+                .handle_connect_req(&req.payload, std::time::Instant::now())
+                .unwrap();
+            session
+                .handle_connect_ack(&ack.payload, std::time::Instant::now())
+                .unwrap();
             id
         }
 
@@ -12770,14 +12782,19 @@ mod tests {
                 .await;
             let mut remote = peer();
             let ack = remote
-                .handle_connect_req(&LinkCapabilities::default().to_bytes())
+                .handle_connect_req(
+                    &LinkCapabilities::default().to_bytes(),
+                    std::time::Instant::now(),
+                )
                 .unwrap();
             station.handle_mac_pdu(ack).await;
             assert_eq!(
                 next_session_line(&mut reader).await.trim_end(),
                 "CONNECTED VK3ABC W1AW 2400"
             );
-            station.handle_mac_pdu(remote.disconnect().unwrap()).await;
+            station
+                .handle_mac_pdu(remote.disconnect(std::time::Instant::now()).unwrap())
+                .await;
             assert_eq!(
                 next_session_line(&mut reader).await.trim_end(),
                 "DISCONNECTED"
@@ -12793,14 +12810,19 @@ mod tests {
             station.listening = true;
             let (mut reader, _writer) = connect_mock_vara_client(&mut station).await;
             let mut remote = peer();
-            station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            station
+                .handle_mac_pdu(remote.initiate(std::time::Instant::now()).unwrap())
+                .await;
             assert_eq!(next_session_line(&mut reader).await.trim_end(), "PENDING");
             assert!(read_available_lines(&mut reader)
                 .await
                 .iter()
                 .all(|line| !is_session_line(line)));
             let cfm = remote
-                .handle_connect_ack(&LinkCapabilities::default().to_bytes())
+                .handle_connect_ack(
+                    &LinkCapabilities::default().to_bytes(),
+                    std::time::Instant::now(),
+                )
                 .unwrap();
             station.handle_mac_pdu(cfm).await;
             assert_eq!(
@@ -12829,7 +12851,10 @@ mod tests {
                 .await;
             let mut remote = peer();
             let ack = remote
-                .handle_connect_req(&LinkCapabilities::default().to_bytes())
+                .handle_connect_req(
+                    &LinkCapabilities::default().to_bytes(),
+                    std::time::Instant::now(),
+                )
                 .unwrap();
             station.handle_mac_pdu(ack).await;
             assert_eq!(
@@ -13063,9 +13088,13 @@ mod tests {
         async fn peer_disconnect_during_inbound_handshake_sends_cancelpending() {
             let (mut station, mut rx) = listening_responder();
             let mut remote = peer();
-            station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            station
+                .handle_mac_pdu(remote.initiate(std::time::Instant::now()).unwrap())
+                .await;
             assert_eq!(session_notices(&mut rx), [VaraResponse::Pending]);
-            station.handle_mac_pdu(remote.disconnect().unwrap()).await;
+            station
+                .handle_mac_pdu(remote.disconnect(std::time::Instant::now()).unwrap())
+                .await;
             assert_eq!(session_notices(&mut rx), [VaraResponse::CancelPending]);
             assert!(station.session_mgr.active_sessions().is_empty());
         }
@@ -13074,7 +13103,9 @@ mod tests {
         async fn rejected_cfm_cancels_pending_at_once() {
             let (mut station, mut rx) = listening_responder();
             let mut remote = peer();
-            station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            station
+                .handle_mac_pdu(remote.initiate(std::time::Instant::now()).unwrap())
+                .await;
             station.handle_mac_pdu(oversized_cfm()).await;
             // No reaper call: the session ends with the rejected CFM.
             assert_eq!(
@@ -13098,7 +13129,9 @@ mod tests {
         #[tokio::test]
         async fn host_disconnect_during_inbound_handshake_sends_cancelpending_then_disconnected() {
             let (mut station, mut rx) = listening_responder();
-            station.handle_mac_pdu(peer().initiate().unwrap()).await;
+            station
+                .handle_mac_pdu(peer().initiate(std::time::Instant::now()).unwrap())
+                .await;
             station
                 .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
                 .await;
@@ -13117,7 +13150,7 @@ mod tests {
         async fn repeat_connect_req_keeps_one_session_and_one_pending() {
             let (mut station, mut rx) = listening_responder();
             let mut remote = peer();
-            let req = remote.initiate().unwrap();
+            let req = remote.initiate(std::time::Instant::now()).unwrap();
             station.handle_mac_pdu(req.clone()).await;
             station.handle_mac_pdu(req).await;
             let lines = drain(&mut rx);
@@ -13145,7 +13178,10 @@ mod tests {
             );
 
             let cfm = remote
-                .handle_connect_ack(&LinkCapabilities::default().to_bytes())
+                .handle_connect_ack(
+                    &LinkCapabilities::default().to_bytes(),
+                    std::time::Instant::now(),
+                )
                 .unwrap();
             station.handle_mac_pdu(cfm).await;
             assert_eq!(
@@ -13167,7 +13203,9 @@ mod tests {
         async fn unmatched_repeat_connect_req_keeps_the_pending_handshake() {
             let (mut station, mut rx) = listening_responder();
             let mut remote = peer();
-            station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            station
+                .handle_mac_pdu(remote.initiate(std::time::Instant::now()).unwrap())
+                .await;
             assert_eq!(session_notices(&mut rx), [VaraResponse::Pending]);
             let unreadable = MacPdu::new(
                 MacFrameType::ConnectReq,
@@ -13182,8 +13220,9 @@ mod tests {
                 Callsign::new("VK3ABC").unwrap(),
                 3,
                 LinkCapabilities::default(),
+                std::time::Instant::now(),
             )
-            .initiate()
+            .initiate(std::time::Instant::now())
             .unwrap();
             for (what, req) in [("unreadable", unreadable), ("SSID 3", other_ssid)] {
                 station.handle_mac_pdu(req).await;
@@ -13198,7 +13237,10 @@ mod tests {
                 );
             }
             let cfm = remote
-                .handle_connect_ack(&LinkCapabilities::default().to_bytes())
+                .handle_connect_ack(
+                    &LinkCapabilities::default().to_bytes(),
+                    std::time::Instant::now(),
+                )
                 .unwrap();
             station.handle_mac_pdu(cfm).await;
             assert_eq!(
@@ -13219,8 +13261,9 @@ mod tests {
                 Callsign::new("K7XYZ").unwrap(),
                 0,
                 LinkCapabilities::default(),
+                std::time::Instant::now(),
             )
-            .initiate()
+            .initiate(std::time::Instant::now())
             .unwrap();
             let short_payload = MacPdu::new(
                 MacFrameType::ConnectReq,
@@ -13230,7 +13273,11 @@ mod tests {
                 vec![0; 6],
             );
             for (what, listening, req) in [
-                ("not listening", false, peer().initiate().unwrap()),
+                (
+                    "not listening",
+                    false,
+                    peer().initiate(std::time::Instant::now()).unwrap(),
+                ),
                 ("addressed to K7XYZ", true, other_station),
                 ("payload shorter than 7 bytes", true, short_payload),
             ] {
@@ -13515,7 +13562,10 @@ mod tests {
                 .await;
             let mut remote = peer();
             let ack = remote
-                .handle_connect_req(&LinkCapabilities::default().to_bytes())
+                .handle_connect_req(
+                    &LinkCapabilities::default().to_bytes(),
+                    std::time::Instant::now(),
+                )
                 .unwrap();
             station.handle_mac_pdu(ack).await;
             let msg = next_ws_type(&mut ws, "session").await;
@@ -13530,7 +13580,9 @@ mod tests {
                 assert!(snap.connected);
                 assert_eq!(snap.remote_call.as_deref(), Some("W1AW"));
             }
-            station.handle_mac_pdu(remote.disconnect().unwrap()).await;
+            station
+                .handle_mac_pdu(remote.disconnect(std::time::Instant::now()).unwrap())
+                .await;
             let msg = next_ws_type(&mut ws, "session").await;
             println!("{msg}");
             assert_eq!(msg["state"], "disconnected");
@@ -13970,7 +14022,13 @@ mod tests {
             let remote_cs = Callsign::new("W1AW").unwrap();
             let id = event_loop
                 .session_mgr
-                .create(local_cs, remote_cs, 0, LinkCapabilities::default())
+                .create(
+                    local_cs,
+                    remote_cs,
+                    0,
+                    LinkCapabilities::default(),
+                    std::time::Instant::now(),
+                )
                 .expect("a fresh SessionManager should have a free slot");
             {
                 let session = event_loop
@@ -14347,7 +14405,11 @@ mod tests {
                 .checked_sub(Duration::from_secs(40))
                 .unwrap();
             assert!(
-                event_loop.session_mgr.get(id).unwrap().needs_keepalive(),
+                event_loop
+                    .session_mgr
+                    .get(id)
+                    .unwrap()
+                    .needs_keepalive(std::time::Instant::now()),
                 "precondition: a 40 s idle session needs a keepalive"
             );
 
@@ -14365,7 +14427,11 @@ mod tests {
                 lines
             );
             assert!(
-                !event_loop.session_mgr.get(id).unwrap().needs_keepalive(),
+                !event_loop
+                    .session_mgr
+                    .get(id)
+                    .unwrap()
+                    .needs_keepalive(std::time::Instant::now()),
                 "a keyed session data frame must reset the keepalive timer"
             );
         }
@@ -14640,10 +14706,16 @@ mod tests {
                     Callsign::new("VK3ABC").unwrap(),
                     ssid,
                     LinkCapabilities::default(),
+                    std::time::Instant::now(),
                 );
-                station.handle_mac_pdu(other.initiate().unwrap()).await;
+                station
+                    .handle_mac_pdu(other.initiate(std::time::Instant::now()).unwrap())
+                    .await;
                 let cfm = other
-                    .handle_connect_ack(&LinkCapabilities::default().to_bytes())
+                    .handle_connect_ack(
+                        &LinkCapabilities::default().to_bytes(),
+                        std::time::Instant::now(),
+                    )
                     .unwrap();
                 station.handle_mac_pdu(cfm).await;
                 assert_eq!(
@@ -14956,13 +15028,14 @@ mod tests {
                     Callsign::new("W1AW").unwrap(),
                     0,
                     local,
+                    std::time::Instant::now(),
                 )
                 .unwrap();
             let req = event_loop
                 .session_mgr
                 .get_mut(id)
                 .unwrap()
-                .initiate()
+                .initiate(std::time::Instant::now())
                 .unwrap();
             let mut peer_session = coppa_protocol::session::Session::new(
                 0,
@@ -14970,10 +15043,15 @@ mod tests {
                 Callsign::new("VK3ABC").unwrap(),
                 0,
                 peer,
+                std::time::Instant::now(),
             );
-            let ack = peer_session.handle_connect_req(&req.payload).unwrap();
+            let ack = peer_session
+                .handle_connect_req(&req.payload, std::time::Instant::now())
+                .unwrap();
             let session = event_loop.session_mgr.get_mut(id).unwrap();
-            session.handle_connect_ack(&ack.payload).unwrap();
+            session
+                .handle_connect_ack(&ack.payload, std::time::Instant::now())
+                .unwrap();
             assert!(session
                 .negotiated
                 .as_ref()
@@ -15830,7 +15908,9 @@ mod tests {
             assert!(station.pending_disconnect.is_some());
 
             let mut caller = peer();
-            station.handle_mac_pdu(caller.initiate().unwrap()).await;
+            station
+                .handle_mac_pdu(caller.initiate(std::time::Instant::now()).unwrap())
+                .await;
             assert_eq!(station.session_mgr.active_sessions(), vec![id]);
             assert_eq!(
                 station.session_mgr.get(id).map(|s| s.state),
@@ -16590,8 +16670,9 @@ mod tests {
                 local_cs.clone(),
                 0,
                 LinkCapabilities::default(),
+                std::time::Instant::now(),
             );
-            let req_pdu = remote_session.initiate().unwrap();
+            let req_pdu = remote_session.initiate(std::time::Instant::now()).unwrap();
             let req_samples = event_loop
                 .engine
                 .encode_bytes(&req_pdu.to_bytes())
@@ -19366,6 +19447,7 @@ mod tests {
                     remote.clone(),
                     0,
                     LinkCapabilities::default(),
+                    std::time::Instant::now(),
                 )
                 .expect("a fresh SessionManager should have a free slot");
             event_loop
@@ -20337,8 +20419,11 @@ mod tests {
                 Callsign::new("VK3ABC").unwrap(),
                 0,
                 LinkCapabilities::default(),
+                std::time::Instant::now(),
             );
-            station.handle_mac_pdu(remote.initiate().unwrap()).await;
+            station
+                .handle_mac_pdu(remote.initiate(std::time::Instant::now()).unwrap())
+                .await;
             assert_eq!(
                 next_notice(&mut rx).await,
                 Some(ArdopResponse::Target("VK3ABC".into())),
@@ -20352,7 +20437,9 @@ mod tests {
             // The caller gives up mid-handshake. Before the fix only
             // `NEWSTATE DISC ` was sent here; the terminal `DISCONNECTED`
             // is the line that clears wl2k-go's remembered target.
-            station.handle_mac_pdu(remote.disconnect().unwrap()).await;
+            station
+                .handle_mac_pdu(remote.disconnect(std::time::Instant::now()).unwrap())
+                .await;
             assert_eq!(
                 next_notice(&mut rx).await,
                 Some(ArdopResponse::Disconnected),

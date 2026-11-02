@@ -19,6 +19,9 @@
 //! Lives in `tests/` rather than `arq.rs`'s inline `mod tests` because the
 //! verify phase is read-only with respect to application source.
 
+// Tests build `Instant`s to pass as the API's `now` (COP-90 guard).
+#![allow(clippy::disallowed_methods)]
+
 use coppa_protocol::arq::{ArqConfig, ArqTx};
 use std::time::Instant;
 
