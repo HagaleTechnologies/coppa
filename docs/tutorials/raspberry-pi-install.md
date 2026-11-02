@@ -316,9 +316,11 @@ If your interface keys the rig when its PTT line is low, add:
 ptt_invert = true
 ```
 
-TX then drives the line low and RX drives it high. It applies to serial,
-gpio and cm108 PTT, and the PTT guardian is told about it. With `none`,
-`vox` or `rigctld`, coppad logs a warning and ignores it. See
+TX then drives the line low and RX drives it high. It applies to gpio and
+cm108 PTT, and the PTT guardian is told about it. With serial PTT, coppad
+refuses to start, because closing the port would leave an active-low rig
+keyed. With `none`, `vox` or `rigctld`, coppad logs a warning and ignores
+it. See
 [OPERATING.md](../OPERATING.md#active-low-ptt-lines-ptt_invert).
 
 ### VOX

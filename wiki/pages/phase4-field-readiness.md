@@ -94,7 +94,9 @@ a real bug — breaking them will reintroduce that bug.
 - PTT config uses extended syntax: `serial:/dev/ttyUSB0:dtr`, `gpio:17`,
   `cm108:/dev/hidraw0[:3]` (COP-52), or the flat `none`/`vox`/`rigctld`.
   Unrecognized values hard-error at startup — bare `"serial"` is NOT valid.
-  `[radio] ptt_invert` flips the line levels for serial, gpio and cm108.
+  `[radio] ptt_invert` flips the line levels for gpio and cm108. With
+  serial PTT it is a startup error (COP-144): closing the port deasserts
+  DTR/RTS, which an active-low rig reads as TX.
   `rigctld` unreachable at startup still falls back to NullPtt, but since
   COP-32 it logs at ERROR and the daemon logs `Daemon running degraded`
   instead of `Daemon ready`. There is still no

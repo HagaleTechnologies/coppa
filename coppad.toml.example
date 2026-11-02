@@ -53,7 +53,9 @@ ptt_method = "none"
 # Another pin:              ptt_method = "cm108:/dev/hidraw0:4"
 # A udev symlink (see the Pi tutorial, step 7):  ptt_method = "cm108:/dev/cm108ptt"
 # Active-low PTT line: TX drives the line low and RX drives it high.
-# Applies to serial, gpio and cm108 PTT; ignored, with a warning, for the others.
+# Applies to gpio and cm108 PTT. With serial PTT coppad refuses to start,
+# because closing the port would leave an active-low rig keyed. Ignored,
+# with a warning, for none, vox and rigctld.
 ptt_invert = false
 # rigctld TCP address (hamlib)
 rigctld_address = "127.0.0.1:4532"

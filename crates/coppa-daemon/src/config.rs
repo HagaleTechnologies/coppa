@@ -97,8 +97,9 @@ pub struct RadioConfig {
     /// while transmitting. Ignored for `none`, `vox` and serial PTT.
     pub ptt_guardian: bool,
     /// COP-52: active-low PTT line: TX drives the line low, RX drives it
-    /// high. Applies to serial, gpio and cm108 PTT; for the other methods it
-    /// has no effect and coppad logs a warning (see
+    /// high. Applies to gpio and cm108 PTT. With serial PTT coppad refuses
+    /// to start (see [`RadioConfig::ptt_invert_error`]); for the other
+    /// methods it has no effect and coppad logs a warning (see
     /// [`RadioConfig::ptt_invert_warning`]).
     pub ptt_invert: bool,
 }
@@ -270,7 +271,29 @@ impl RadioConfig {
         match self.ptt_config() {
             Ok(ptt) if !ptt.applies_ptt_invert() => Some(format!(
                 "[radio] ptt_invert = true has no effect with ptt_method {:?}; it applies to \
-                 serial, gpio and cm108 PTT",
+                 gpio and cm108 PTT",
+                self.ptt_method
+            )),
+            _ => None,
+        }
+    }
+
+    /// COP-144 (owner decision, option A): the startup error for
+    /// `ptt_invert = true` with serial PTT. Inverted serial PTT holds DTR or
+    /// RTS asserted for RX, and the operating system deasserts both lines when
+    /// the port closes, so after coppad exits, by any path, an active-low rig
+    /// sits keyed. `None` for every other combination, or when `ptt_method`
+    /// does not parse (that error is reported on its own).
+    pub fn ptt_invert_error(&self) -> Option<String> {
+        if !self.ptt_invert {
+            return None;
+        }
+        match self.ptt_config() {
+            Ok(PttConfig::Serial { .. }) => Some(format!(
+                "[radio] ptt_invert = true is refused with ptt_method {:?}: inverted serial PTT \
+                 holds the line asserted for receive, and the operating system deasserts it \
+                 when the port closes, so an active-low rig would be left keyed after coppad \
+                 exits; use gpio or cm108 PTT for an active-low line",
                 self.ptt_method
             )),
             _ => None,
@@ -1601,11 +1624,33 @@ beacon_interval_secs = 600
             radio("rigctld", true).ptt_invert_warning().as_deref(),
             Some(
                 "[radio] ptt_invert = true has no effect with ptt_method \"rigctld\"; it applies \
-                 to serial, gpio and cm108 PTT"
+                 to gpio and cm108 PTT"
             )
         );
         assert_eq!(radio("cm108:/dev/hidraw0", true).ptt_invert_warning(), None);
         assert_eq!(radio("rigctld", false).ptt_invert_warning(), None);
+    }
+
+    #[test]
+    fn ptt_invert_error_refuses_only_inverted_serial_ptt() {
+        let radio = |method: &str, ptt_invert: bool| RadioConfig {
+            ptt_method: method.to_string(),
+            ptt_invert,
+            ..RadioConfig::default()
+        };
+        for method in ["serial:/dev/ttyUSB0:dtr", "serial:/dev/ttyUSB0:rts"] {
+            let error = radio(method, true)
+                .ptt_invert_error()
+                .unwrap_or_else(|| panic!("{method} with ptt_invert must be refused"));
+            assert!(error.contains(&format!("{method:?}")), "{error}");
+            assert!(error.contains("left keyed after coppad exits"), "{error}");
+            assert_eq!(radio(method, false).ptt_invert_error(), None);
+        }
+        for method in ["gpio:529", "cm108:/dev/hidraw0", "none", "vox", "rigctld"] {
+            assert_eq!(radio(method, true).ptt_invert_error(), None, "{method}");
+        }
+        // An unparsable method reports its own error, not this one.
+        assert_eq!(radio("serial", true).ptt_invert_error(), None);
     }
 
     #[test]

@@ -1064,13 +1064,18 @@ impl EventLoop {
     /// backends also release PTT on drop if they may have left it keyed, so an
     /// error return or a panic after this point still un-keys the rig.
     ///
-    /// COP-52: `[radio] ptt_invert` reaches the serial, GPIO and CM108
-    /// backends; with any other method it only logs a warning.
+    /// COP-52: `[radio] ptt_invert` reaches the GPIO and CM108 backends; with
+    /// serial PTT it is a startup error (COP-144, see
+    /// `RadioConfig::ptt_invert_error`), and with any other method it only
+    /// logs a warning.
     fn create_ptt(config: &DaemonConfig) -> Result<PttBackend> {
         let parsed = config
             .radio
             .ptt_config()
             .map_err(|e| anyhow::anyhow!("invalid [radio] ptt_method: {e}"))?;
+        if let Some(error) = config.radio.ptt_invert_error() {
+            return Err(anyhow::anyhow!("{error}"));
+        }
         if let Some(warning) = config.radio.ptt_invert_warning() {
             tracing::warn!("{warning}");
         }
@@ -6473,6 +6478,31 @@ mod tests {
         config.radio.ptt_method = "none".to_string();
         config.radio.ptt_invert = true;
         assert!(EventLoop::create_ptt(&config).is_ok());
+    }
+
+    /// COP-144 option A: inverted serial PTT is refused before the port is
+    /// opened, with or without the `serial-ptt` feature.
+    #[test]
+    fn create_ptt_refuses_ptt_invert_with_serial_ptt() {
+        let mut config = DaemonConfig::default();
+        config.radio.ptt_method = "serial:/dev/ttyUSB0:rts".to_string();
+        config.radio.ptt_invert = true;
+        let Err(error) = EventLoop::create_ptt(&config) else {
+            panic!("inverted serial PTT must be a startup error");
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("ptt_invert = true is refused"),
+            "{message}"
+        );
+        assert!(
+            message.contains("left keyed after coppad exits"),
+            "{message}"
+        );
+        assert!(
+            EventLoop::new(config).is_err(),
+            "EventLoop::new must refuse it too"
+        );
     }
 
     #[test]

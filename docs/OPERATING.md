@@ -42,7 +42,7 @@ INFO coppad: PTT method="rigctld 127.0.0.1:4532" active=rigctld state="released"
 | `Audio input/output started` | `hardware_rate`, `engine_rate` | The opened stream rate and modem profile rate; they differ when Coppa resamples. |
 | `Audio devices` | `input_hardware_rate`, `output_hardware_rate`, `engine_rate` | The effective input and output hardware rates and the modem profile rate. |
 | `Audio devices: none; ...` (WARN) | | A build without `cpal-backend`: the daemon runs but moves no audio. |
-| `PTT` | `method` | The configured method: `none`, `vox`, `rigctld <address>`, `serial <port> <dtr\|rts>`, `gpio <pin>` or `cm108 <device> gpio <n>`. With `[radio] ptt_invert = true`, the serial, gpio and cm108 forms end in ` inverted`, for example `gpio 529 inverted`. |
+| `PTT` | `method` | The configured method: `none`, `vox`, `rigctld <address>`, `serial <port> <dtr\|rts>`, `gpio <pin>` or `cm108 <device> gpio <n>`. With `[radio] ptt_invert = true`, the gpio and cm108 forms end in ` inverted`, for example `gpio 529 inverted`. |
 | | `active` | The backend actually in control: `none`, `vox`, `rigctld`, `serial`, `gpio` or `cm108`. An unreachable rigctld shows `active=none`. |
 | | `state` | `released` (the startup release succeeded), `release failed: <error>`, or `not controlled` (none, VOX, or an unreachable rigctld, where coppad drives no PTT line). |
 | | `guardian` | `running, pid <n>`, `failed to start: <error>`, `off ([radio] ptt_guardian = false)`, or `not used`. See [The PTT guardian](#the-ptt-guardian). |
@@ -149,12 +149,18 @@ ptt_invert = true
 ```
 
 TX then drives the line low and RX drives it high. It defaults to `false`,
-and it applies to serial, gpio and cm108 PTT. With `none`, `vox` or
-`rigctld`, coppad starts and logs one warning:
+and it applies to gpio and cm108 PTT. With `none`, `vox` or `rigctld`,
+coppad starts and logs one warning:
 
 ```
-WARN coppad::event_loop: [radio] ptt_invert = true has no effect with ptt_method "rigctld"; it applies to serial, gpio and cm108 PTT
+WARN coppad::event_loop: [radio] ptt_invert = true has no effect with ptt_method "rigctld"; it applies to gpio and cm108 PTT
 ```
+
+With serial PTT, coppad refuses to start (COP-144). Inverted serial PTT
+would hold DTR or RTS asserted for RX, and the operating system deasserts
+both lines when the port closes, so an active-low rig would sit keyed after
+coppad exits, by any path. The error names the method and that hazard. Use
+gpio or cm108 PTT for an active-low line.
 
 An inverted sysfs GPIO line is opened with `direction` set to `high`, its RX
 level, so it does not key the rig while coppad starts. A non-inverted line is
