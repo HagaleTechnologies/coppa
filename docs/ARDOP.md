@@ -10,6 +10,9 @@ both ends of a `coppad` session must run coppa. The ARDOP ports exist so a
 host that only speaks ARDOP can drive coppa — the same reason the
 VARA-style ports exist (`docs/PAT.md`).
 
+See also [HOST-API.md](HOST-API.md), which covers every host interface
+(VARA-style, WebSocket, KISS) and the session rules they share with this one.
+
 ## Configuration
 
 ```toml

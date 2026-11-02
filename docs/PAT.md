@@ -15,6 +15,13 @@ This guide was verified with real Pat v1.0.0 against two real `coppad` processes
 machine, joined by a userspace audio loop (see [How this was verified](#how-this-was-verified)).
 It was not run over real radios.
 
+For the protocol itself (every command and reply, the data port, the WebSocket and KISS
+interfaces, and an `nc` walkthrough), see [HOST-API.md](HOST-API.md).
+
+**Security.** The VARA-style ports have no authentication: anything that can reach them can key
+your transmitter. Keep `bind_address = "127.0.0.1"`, and see
+[HOST-API.md](HOST-API.md#security) for the browser risk that applies even on loopback.
+
 ## Build
 
 Build coppad **in release mode** with live audio:
@@ -27,6 +34,12 @@ cargo build --release -p coppa-daemon --bin coppad --features cpal-backend
 A debug build (`cargo build --workspace`) decodes too slowly for real-time audio. It drops
 input while decoding (`Audio input buffer overflow dropped=…` in coppad's log), misses the
 connect request, and Pat reports `Unable to establish connection to remote: connect timeout`.
+
+Both stations need coppad 0.3.0 or later. An older station cannot decode the current session
+frame format: its host gets extra header bytes in the data, it never sends an ACK, and the newer
+station ends the session after its retry budget (see
+[OPERATING.md](OPERATING.md#connected-sessions-delivery-and-buffer)). Pat logs each station's
+version as `VARA modem (Coppa <version>) initialized`.
 
 Pat itself comes from its [releases page](https://github.com/la5nta/pat/releases). Pat 1.0.0
 was tested; Pat 0.15 or newer is needed to *listen* for calls (see
@@ -98,6 +111,29 @@ form, which was verified for dialing only:
 "varahf": { "host": "localhost", "cmdPort": 8300, "dataPort": 8301, "bandwidth": 2300 }
 ```
 
+## What coppad does with Pat's commands
+
+When Pat opens the modem it sends `PUBLIC ON`, `CWID ON`, `COMPRESSION TEXT`, `MYCALL <call>`,
+`LISTEN OFF` and `VERSION`. Before a dial it sends `BW2300` (your `bandwidth`), then
+`WINLINK SESSION` (or `P2P SESSION` for a `?p2p=true` URL), then `CONNECT`. To listen it sends
+`LISTEN ON`. These were read from coppad's debug log during a real Pat v1.0.0 session.
+
+| Pat sends | coppad replies | Honoured? |
+|---|---|---|
+| `PUBLIC ON`, `CWID ON` | `WRONG` | no; coppad's `[station_id]` settings do station ID |
+| `COMPRESSION TEXT`, `BW2300` | `OK` | accepted, no effect; `[engine] profile` sets the waveform, so match it on both stations |
+| `MYCALL <call>` | `OK` | yes, becomes the daemon's callsign |
+| `LISTEN OFF` / `LISTEN ON` | `OK` | yes; coppad starts with listening off |
+| `VERSION` | `VERSION Coppa 0.3.0` | answered |
+| `WINLINK SESSION`, `P2P SESSION` | `WRONG` | no, ignored |
+| `CONNECT <me> <target>` | `OK`, then `CONNECTED` or `DISCONNECTED` | yes; `<me>` is ignored and the daemon's callsign is used |
+| `DISCONNECT` | `OK`, then `DISCONNECTED` | yes, after queued data is ACKed |
+| `ABORT` (Pat's fallback after 60 s) | `OK`, then `DISCONNECTED` | yes, at once |
+
+Pat treats `WRONG` as a no-op, so these replies are harmless. Pat closes the modem if its
+command socket is silent for 2 minutes; coppad's `IAMALIVE` every 60 s keeps it open. The full
+command table, and how coppa differs from VARA, are in [HOST-API.md](HOST-API.md).
+
 ## Run a session
 
 Start both coppads, then Pat on the listening station, then compose and dial on the other:
@@ -153,8 +189,9 @@ FQ
 2026/10/27 20:10:19 Disconnected.
 ```
 
-These lines are from the verification run (Pat's progress and `GZIP_EXPERIMENT` lines left
-out, subject shortened). Either station can dial; swap the roles by starting the listener on A.
+These lines are from the 2026-10-27 verification run, when coppad reported version 0.2.0
+(Pat's progress and `GZIP_EXPERIMENT` lines left out, subject shortened). Either station can
+dial; swap the roles by starting the listener on A.
 
 On a real radio, set `[radio]` for your PTT (`ptt_method = "rigctld"`, see
 [OPERATING.md](OPERATING.md)) and point `[audio]` at the radio's sound card. That setup has not
@@ -181,8 +218,6 @@ not model a half-duplex radio, which is more forgiving than a real one.
 
 Each of these was observed in the verification runs unless it says otherwise.
 
-- **`BW` and `COMPRESSION` are accepted and ignored.** Match `[engine] profile` on both
-  stations yourself.
 - **Data port = command port + 1.** Pat has no setting for the data port in its current config
   form; only the Pat 0.13.x legacy form sets `dataPort` itself.
 - **Pat 0.15 or newer is needed to listen.** VARA listening first appears in Pat 0.15.0. Pat
@@ -192,14 +227,18 @@ Each of these was observed in the verification runs unless it says otherwise.
   with `'varahf' is not a valid listen method`.
 - **Connected-session data is stop-and-wait ARQ** (COP-38), whatever `arq_enabled` says. The
   other station ACKs each frame and a lost frame is sent again; `BUFFER` falls on the ACK. A
-  frame still unacknowledged after 5 retransmissions ends the session (`DISCONNECTED`), about
-  3 minutes on a silent link. See [OPERATING.md](OPERATING.md#connected-sessions-delivery-and-buffer).
-  This entry comes from the code, not the runs: the verification runs predate COP-38.
-- **`DISCONNECT` discards data still queued in coppad** (H-032). Pat flushes (waits for
-  `BUFFER 0`) before it closes, so a normal Pat session is not affected.
+  frame still unacknowledged after 5 retransmissions makes coppad hold the link while the
+  other station stays decodable; on a silent link the session ends (`DISCONNECTED`) after about
+  3 minutes of retries plus up to 3 more of holding. See
+  [OPERATING.md](OPERATING.md#connected-sessions-delivery-and-buffer). The COP-76 run is after
+  COP-38, but no run lost a frame, so the retry and silent-link timings come from the code.
+- **`DISCONNECT` sends queued data first** (COP-43). coppad sends what the host already
+  queued, waits for each ACK, and only then sends `DISCONNECTED`. Pat also flushes (waits for
+  `BUFFER 0`) before it closes. See [OPERATING.md](OPERATING.md#ending-a-session-disconnect).
 - **Throughput is low.** At `HF_STANDARD`, a 6000-byte message (3940 bytes after Pat's
-  compression) took 225 s, about 17 B/s. That run predates COP-38; OPERATING.md puts
-  stop-and-wait at about 60% of the old stream on a clean link, so expect less.
+  compression) took 225 s, about 17 B/s. That figure is dated: the run predates COP-38, and
+  OPERATING.md puts stop-and-wait at about 60% of the old stream on a clean link, so expect
+  less. It has not been measured again.
 - **Station identification.** The first transmission, and every one after `id_interval_secs`,
   carries a station-ID frame, which adds about 1.4 s.
 - **PTT.** With `ptt_method = "none"` nothing keys a radio. For a real radio use rigctld, as in
@@ -233,4 +272,7 @@ busy semantics.
 [docs/testing/pat-session.md](testing/pat-session.md) records the runs behind this guide: Pat
 versions and checksums, the harness commands and their output, the debug-build failure, and
 what was not run. CI runs `crates/coppa-daemon/tests/pat_vara_session.rs`, which replays Pat's
-VARA command sequence against two in-process stations on every push.
+VARA command sequence against two in-process stations on every push. The
+[COP-76 run record](testing/pat-session.md#cop-76-run-record-2026-11-02) is the latest: at
+`b9fdb8d` Pat v1.0.0 delivered every message byte for byte, but two of three harness runs
+logged an audio input overflow, which the harness counts as `FAIL`; the third reported `PASS`.
