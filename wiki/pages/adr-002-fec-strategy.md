@@ -8,8 +8,8 @@ sources:
   - docs/adr/002-fec-strategy.md
   - crates/coppa-protocol/src/fec/**
 verified:
-  commit: 59b0b63
-  date: 2026-07-14
+  commit: b9fdb8d
+  date: 2026-11-02
 links:
   - overview
   - coppa-protocol
@@ -30,8 +30,11 @@ across a wide SNR range.
 **Superseded detail:** this ADR's original LDPC design (six separate 802.11
 QC-LDPC base matrices at a fixed 1,944-bit codeword) was replaced in Phase 2 by
 a single 5G-NR-style BG2 mother code (Zc=176) rate-matched per speed level via
-a circular buffer — a wire-format break. The two-family strategy itself stands;
-the LDPC family's internals are now governed by [[adr-005-nr-bg2-ldpc]].
+a circular buffer — a wire-format break. The two-family strategy does not
+describe the shipped system either: the convolutional/Viterbi code still
+compiles and has tests, but no transmit or receive path uses it. ADR-002's
+status is therefore "Superseded by ADR-005" (COP-88), and the LDPC layer is
+governed by [[adr-005-nr-bg2-ldpc]].
 
 The old caveat about levels 9/10 non-convergence at high SNR is fixed (by the
 BG2 change plus level 10 moving 7/8 → 5/6); a narrower level-9-under-fading
