@@ -22,14 +22,24 @@ pub const ENCODED_CALLSIGN_BYTES: usize = 6;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum MacFrameType {
+    /// Payload data for a session (type nibble 0).
     Data = 0,
+    /// Acknowledgement of received data (type nibble 1).
     Ack = 1,
+    /// First handshake step: the caller's capabilities (type nibble 2).
     ConnectReq = 2,
+    /// Second handshake step: the callee's capabilities (type nibble 3).
     ConnectAck = 3,
+    /// Third handshake step: the negotiated capabilities (type nibble 4).
     ConnectCfm = 4,
+    /// Session teardown (type nibble 5).
     Disconnect = 5,
+    /// Unconnected station announcement (type nibble 6).
     Beacon = 6,
+    /// Liveness probe on an idle established session (type nibble 7).
     Keepalive = 7,
+    /// Reserved for relayed traffic; no transmit or receive path builds one
+    /// yet (type nibble 8).
     Relay = 8,
 }
 

@@ -26,6 +26,7 @@ use num_complex::Complex32;
 ///     assert_eq!(mapper.demap_hard(symbol), bits.to_vec());
 /// }
 /// ```
+#[derive(Debug)]
 pub struct QpskMapper;
 
 const SCALE: f32 = std::f32::consts::FRAC_1_SQRT_2;

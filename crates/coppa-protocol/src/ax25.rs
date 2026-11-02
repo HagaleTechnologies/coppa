@@ -82,7 +82,9 @@ impl Ax25Address {
 /// An AX.25 UI frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ax25Frame {
+    /// Destination address, the first address in the frame.
     pub dest: Ax25Address,
+    /// Source (sending station) address, the second address in the frame.
     pub src: Ax25Address,
     /// Up to [`MAX_DIGIPEATERS`] digipeater addresses.
     pub digipeaters: Vec<Ax25Address>,

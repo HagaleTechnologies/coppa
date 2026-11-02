@@ -1,7 +1,7 @@
 name: ci
 
 # HAG-78: this file replaces the old ci.yml's own codex-clean-gated jobs (test-full, bench-fuzz,
-# clippy, msrv, deny, audit, wiki-lint). It runs ONLY via workflow_dispatch (once
+# clippy, msrv, deny, audit, wiki-lint; COP-90 added semver). It runs ONLY via workflow_dispatch (once
 # wait-for-codex.yml's event-driven gate confirms a revision clean), plus push/merge_group for
 # the non-PR paths -- there is no mid-review-loop skip state to guard against here, since this
 # whole workflow only ever runs once a revision is already confirmed clean or has no PR review
@@ -196,6 +196,44 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
 
+  # COP-90 (H-135): a public Rust API break in a library crate must come with a
+  # minor version bump (docs/DECISIONS/2026-11-02-public-rust-api-semver-gate.md).
+  # The baseline is the merge base with main, so the check covers only this
+  # revision's own changes. On a push to main the merge base is HEAD and there
+  # is nothing to compare; the job still has to succeed for the `ci` fan-in.
+  semver:
+    name: Semver check (cargo-semver-checks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install ALSA and libudev dev headers (for cpal and serialport)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+      - name: Install cargo-semver-checks 0.51.0 (pinned and checksum-verified)
+        run: |
+          set -euo pipefail
+          url=https://github.com/obi1kenobi/cargo-semver-checks/releases/download/v0.51.0/cargo-semver-checks-x86_64-unknown-linux-gnu.tar.gz
+          curl -fsSL -o "$RUNNER_TEMP/csc.tgz" "$url"
+          echo "cacadafaa5cd27ae6d05a74a103266917ebab4c5e43c898360e177d4fbf06a65  $RUNNER_TEMP/csc.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/csc.tgz" -C "$HOME/.cargo/bin" cargo-semver-checks
+      - name: Public Rust API matches main, or the version says it does not
+        run: |
+          set -euo pipefail
+          base=$(git merge-base HEAD origin/main)
+          if [ "$base" = "$(git rev-parse HEAD)" ]; then
+            echo "HEAD is main's tip; nothing to compare."
+            exit 0
+          fi
+          cargo semver-checks --workspace \
+            --exclude coppa-cli --exclude coppa-daemon --exclude coppa-bench --exclude gen_nr_bg2 \
+            --baseline-rev "$base"
+
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
@@ -332,7 +370,7 @@ jobs:
             wait_for_all "Create CI check-run on the reviewed SHA"
           fi
           SECONDS=0
-          wait_for_all "Full test suite" "Bench & Fuzz Compilation" Clippy "MSRV Check" "Supply-chain check (cargo-deny)" "Security Audit" "Wiki lint"
+          wait_for_all "Full test suite" "Bench & Fuzz Compilation" Clippy "MSRV Check" "Supply-chain check (cargo-deny)" "Semver check (cargo-semver-checks)" "Security Audit" "Wiki lint"
 
       - name: Mint a hagale-agent installation token for the CI check-run
         id: app-token
@@ -413,6 +451,7 @@ jobs:
         clippy,
         msrv,
         deny,
+        semver,
         audit,
         wiki-lint,
         checks-queue-watchdog,
@@ -475,11 +514,12 @@ jobs:
           CLIPPY: ${{ needs.clippy.result }}
           MSRV: ${{ needs.msrv.result }}
           DENY: ${{ needs.deny.result }}
+          SEMVER: ${{ needs.semver.result }}
           AUDIT: ${{ needs.audit.result }}
           WIKI_LINT: ${{ needs.wiki-lint.result }}
           CHECKS_QUEUE_WATCHDOG: ${{ needs.checks-queue-watchdog.result }}
         run: |
-          echo "test-full=$TEST_FULL bench-fuzz=$BENCH_FUZZ clippy=$CLIPPY msrv=$MSRV deny=$DENY audit=$AUDIT wiki-lint=$WIKI_LINT checks-queue-watchdog=$CHECKS_QUEUE_WATCHDOG"
+          echo "test-full=$TEST_FULL bench-fuzz=$BENCH_FUZZ clippy=$CLIPPY msrv=$MSRV deny=$DENY semver=$SEMVER audit=$AUDIT wiki-lint=$WIKI_LINT checks-queue-watchdog=$CHECKS_QUEUE_WATCHDOG"
           # create-ci-check legitimately reports "skipped" on every event but workflow_dispatch
           # (its own `if:` only runs for workflow_dispatch) -- excluded from the generic loop
           # below via an explicit re-check instead, so a real create-ci-check FAILURE (which is
@@ -488,7 +528,7 @@ jobs:
             echo "outcome=failure" >> "$GITHUB_OUTPUT"
             exit 1
           fi
-          for r in "$TEST_FULL" "$BENCH_FUZZ" "$CLIPPY" "$MSRV" "$DENY" "$AUDIT" "$WIKI_LINT" "$CHECKS_QUEUE_WATCHDOG"; do
+          for r in "$TEST_FULL" "$BENCH_FUZZ" "$CLIPPY" "$MSRV" "$DENY" "$SEMVER" "$AUDIT" "$WIKI_LINT" "$CHECKS_QUEUE_WATCHDOG"; do
             if [ "$r" != success ]; then
               echo "outcome=failure" >> "$GITHUB_OUTPUT"
               exit 1

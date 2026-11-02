@@ -172,7 +172,7 @@
       "sources": [
         "docs/adr/008-phase3-system-layer.md",
         "crates/coppa-ml/src/**",
-        "crates/coppa-bench/examples/**"
+        "crates/coppa-bench/diagnostics/**"
       ],
       "status": "current",
       "title": "What did Phase 3's system layer ship, and which targets did it miss?",

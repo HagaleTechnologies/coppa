@@ -7,8 +7,11 @@
 /// A fixed Huffman code entry.
 #[derive(Debug, Clone, Copy)]
 pub struct HuffmanEntry {
+    /// Byte this entry encodes.
     pub symbol: u8,
+    /// Code word, right-aligned in the low `bits` bits, sent MSB first.
     pub code: u32,
+    /// Code length in bits, 2 to 8.
     pub bits: u8,
 }
 
@@ -356,6 +359,14 @@ pub const HAM_RADIO_TABLE: [HuffmanEntry; 64] = [
 pub struct HuffmanCodec {
     // Encode lookup: byte -> (code, bits)
     encode_table: [(u32, u8); 256],
+}
+
+impl std::fmt::Debug for HuffmanCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The 256-entry lookup is built from the fixed table; printing it
+        // would add kilobytes and no information.
+        f.debug_struct("HuffmanCodec").finish_non_exhaustive()
+    }
 }
 
 impl HuffmanCodec {

@@ -1,20 +1,36 @@
+//! Row-write/column-read block interleaver for the generic OFDM stack.
+
 /// Block interleaver for spreading coded bits across OFDM time-frequency grid.
 ///
 /// Writes bits row-wise (across carriers within one OFDM symbol) and reads
 /// column-wise (across symbols on the same carrier). This spreads adjacent
 /// coded bits across both frequency and time dimensions.
+#[derive(Debug, Clone)]
 pub struct BlockInterleaver {
     rows: usize,
     cols: usize,
 }
 
 impl BlockInterleaver {
+    /// Creates an interleaver with `carriers` columns and enough rows
+    /// (`ceil(block_size / carriers)`) to hold `block_size` bits.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `carriers` is zero.
     pub fn new(block_size: usize, carriers: usize) -> Self {
         let cols = carriers;
         let rows = block_size.div_ceil(carriers);
         Self { rows, cols }
     }
 
+    /// Permutes `bits` by writing them row-wise and reading column-wise.
+    /// Unused grid cells are skipped, so the output has exactly `bits.len()`
+    /// entries.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bits.len()` exceeds the grid size (`rows * cols`).
     pub fn interleave(&self, bits: &[u8]) -> Vec<u8> {
         let n = bits.len();
         let total = self.rows * self.cols;
@@ -61,6 +77,12 @@ impl BlockInterleaver {
         output
     }
 
+    /// Inverse of [`Self::interleave`] for soft LLRs: restores the original
+    /// (pre-interleave) order. The output has exactly `llrs.len()` entries.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `llrs.len()` exceeds the grid size (`rows * cols`).
     pub fn deinterleave(&self, llrs: &[f32]) -> Vec<f32> {
         let n = llrs.len();
         let total = self.rows * self.cols;

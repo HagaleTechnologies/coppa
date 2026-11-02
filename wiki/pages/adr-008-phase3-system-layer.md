@@ -7,7 +7,7 @@ maintainer: agent
 sources:
   - docs/adr/008-phase3-system-layer.md
   - crates/coppa-ml/src/**
-  - crates/coppa-bench/examples/**
+  - crates/coppa-bench/diagnostics/**
 verified:
   commit: 59b0b63
   date: 2026-07-14

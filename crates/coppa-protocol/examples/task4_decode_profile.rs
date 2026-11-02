@@ -5,6 +5,10 @@
 //! (`total_llr`, `check_to_var`) vs (c) the per-iteration layered-update
 //! compute itself (measured by forcing 1 vs 5 vs 30 iterations on the same
 //! non-convergent input and looking at the marginal per-iteration cost).
+
+// This program times wall-clock work, so it reads the clock (COP-90 guard).
+#![allow(clippy::disallowed_methods)]
+
 use coppa_protocol::fec::ldpc::decoder::NrBg2Decoder;
 use coppa_protocol::fec::ldpc::nr_bg2;
 use coppa_protocol::fec::ldpc::NrLdpc;

@@ -6,6 +6,7 @@
 use std::f32::consts::TAU;
 
 /// BPSK Costas loop tracking carrier phase and frequency.
+#[derive(Debug, Clone)]
 pub struct CostasLoop {
     phase: f32,
     freq: f32,
@@ -20,6 +21,11 @@ pub struct CostasLoop {
 }
 
 impl CostasLoop {
+    /// Creates a loop for a carrier at `carrier_freq` Hz sampled at
+    /// `sample_rate` Hz. `loop_bandwidth` is the normalised loop bandwidth
+    /// (critically damped, zeta = 1/sqrt(2)); the arm filters' corner is
+    /// 0.3 x `carrier_freq`, kept within 30..=200 Hz.
+    #[must_use]
     pub fn new(carrier_freq: f32, sample_rate: f32, loop_bandwidth: f32) -> Self {
         let zeta = std::f32::consts::FRAC_1_SQRT_2;
         let denom = 1.0 + 2.0 * zeta * loop_bandwidth + loop_bandwidth * loop_bandwidth;
@@ -44,6 +50,9 @@ impl CostasLoop {
         }
     }
 
+    /// Mixes `samples` down to baseband and returns one filtered I-channel
+    /// sample per input sample, advancing the loop's phase and frequency
+    /// state. The frequency correction is clamped to +/-0.12 rad/sample.
     pub fn process(&mut self, samples: &[f32]) -> Vec<f32> {
         let mut output = Vec::with_capacity(samples.len());
 
@@ -76,6 +85,8 @@ impl CostasLoop {
         output
     }
 
+    /// Zeroes the phase, frequency correction and arm filters; the carrier
+    /// frequency and loop gains are kept.
     pub fn reset(&mut self) {
         self.phase = 0.0;
         self.freq = 0.0;

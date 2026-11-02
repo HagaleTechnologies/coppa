@@ -5,6 +5,7 @@ use num_complex::Complex32;
 ///
 /// Pilots are evenly distributed among the active subcarriers to enable
 /// channel estimation via interpolation.
+#[derive(Debug)]
 pub struct PilotPattern {
     /// Indices of pilot subcarriers within the active carrier set.
     pub pilot_indices: Vec<usize>,

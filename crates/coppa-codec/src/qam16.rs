@@ -6,6 +6,7 @@ use num_complex::Complex32;
 ///
 /// 4x4 grid with Gray-coded I and Q axes, normalized to unit average power.
 /// I axis uses bits [b0, b1], Q axis uses bits [b2, b3].
+#[derive(Debug)]
 pub struct Qam16Mapper;
 
 // Normalized amplitude levels for 16QAM (unit average power)

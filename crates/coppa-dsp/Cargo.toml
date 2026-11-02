@@ -12,3 +12,6 @@ rustfft = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }
+
+[lints]
+workspace = true
