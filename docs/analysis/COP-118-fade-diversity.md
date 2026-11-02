@@ -416,7 +416,9 @@ twelve-packet block.
    `cargo run --release -p coppa-bench --example session`. It took 4 min 31 s wall time here on a
    shared 32-core host.
 2. Comparison: place the two appendix files in a directory `cop118-proto/` next to a checkout
-   named `coppa` (or edit the paths in `Cargo.toml`). Copy the checkout's `Cargo.lock` into it,
+   at `a6b14ef` named `coppa` (or edit the paths in `Cargo.toml`). Later commits make
+   `ArqTx::new` return a `Result` (COP-81), so the appendix does not compile against them
+   unchanged. Copy the checkout's `Cargo.lock` into it,
    then run `cargo run --release --offline` inside `cop118-proto/`. The crate declares an empty
    `[workspace]`, so it is not a member of the coppa workspace. It runs all 64 sessions on
    parallel threads: four arms, three presets, five trials, and one clean session per arm. That
