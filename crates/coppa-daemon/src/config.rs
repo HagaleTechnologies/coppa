@@ -96,21 +96,18 @@ pub struct RadioConfig {
     /// `ptt_guardian`): a helper process that releases PTT if coppad dies
     /// while transmitting. Ignored for `none`, `vox` and serial PTT.
     pub ptt_guardian: bool,
-<<<<<<< HEAD
     /// COP-52: active-low PTT line: TX drives the line low, RX drives it
     /// high. Applies to gpio and cm108 PTT. With serial PTT coppad refuses
     /// to start (see [`RadioConfig::ptt_invert_error`]); for the other
     /// methods it has no effect and coppad logs a warning (see
     /// [`RadioConfig::ptt_invert_warning`]).
     pub ptt_invert: bool,
-=======
     /// COP-84: let a VARA command-port client set the rig's frequency
     /// (`FREQ <hz>`) or mode (`MODE <name>`) through rigctld. Off by default:
     /// the command port is unauthenticated and any web page can send it a
     /// line (`docs/LIMITATIONS.md`), so a drive-by set would retune the rig.
     /// Reading the frequency and mode (`FREQ`, `MODE`) works without it.
     pub host_rig_control: bool,
->>>>>>> 2526b50196b1e32966f34088530595360b23be79
 }
 
 /// Which serial control line a `PttConfig::Serial` should drive.
@@ -696,11 +693,8 @@ impl Default for RadioConfig {
             frequency_hz: None,
             band: None,
             ptt_guardian: true,
-<<<<<<< HEAD
             ptt_invert: false,
-=======
             host_rig_control: false,
->>>>>>> 2526b50196b1e32966f34088530595360b23be79
         }
     }
 }
