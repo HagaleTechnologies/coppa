@@ -445,7 +445,9 @@ dependencies = [
 name = "coppa-bench"
 version = "0.5.0"
 dependencies = [
+ "anyhow",
  "clap",
+ "coppa-audio",
  "coppa-channel",
  "coppa-codec",
  "coppa-ml",

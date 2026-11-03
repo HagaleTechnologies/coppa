@@ -511,6 +511,28 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:b352ed5416cfb4361ca06c059b10fc089ffed56f1474c9857b8e9cc1d588c949",
+      "id": "tnc-direwolf-benchmark",
+      "kind": "gotcha",
+      "links": [
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/tnc-direwolf-benchmark.md",
+      "sources": [
+        "tools/tnc-bench/run.sh",
+        "crates/coppa-bench/src/afsk_direwolf.rs",
+        "crates/coppa-codec/src/afsk.rs",
+        "docs/testing/tnc-direwolf-wa8lmf.md"
+      ],
+      "status": "current",
+      "title": "What will bite you when measuring coppa's TNC against Direwolf?",
+      "verified_commit": "2526b50",
+      "verified_date": "2026-11-03",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:ef55c7a0ce1f6a7f46bf351ab29ac09a824708f502b0917f8a77296b49a27164",
       "id": "watterson-level-4-gap",
       "kind": "gotcha",
