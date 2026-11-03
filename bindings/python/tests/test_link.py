@@ -7,8 +7,10 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import unittest
 from array import array
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -90,6 +92,54 @@ class LinkTests(unittest.TestCase):
         self.assertEqual(events["b"][0].remote, "N0AAA")
         self.assertEqual(events["a"][1].reason, coppa.DisconnectReason.LOCAL)
         self.assertEqual(events["b"][1].reason, coppa.DisconnectReason.REMOTE)
+
+    def test_two_threads_recv_get_each_byte_once(self):
+        """The thread rule: two threads calling recv() on one Link get every
+        delivered byte exactly once between them."""
+        payload = bytes(i % 251 for i in range(680))
+        # Speed level 8 delivers the payload in a few frames; the race is in
+        # recv(), not on the air.
+        a = coppa.Link("N0AAA", speed_level=8)
+        b = coppa.Link("N0BBB", speed_level=8)
+        got = [bytearray(), bytearray()]
+        try:
+            b.listen(True)
+            a.connect("N0BBB", 0)
+            a_rx = array("f", bytes(4 * BLOCK))
+            b_rx = array("f", bytes(4 * BLOCK))
+            sent = False
+            for tick in range(1, 30001):
+                now = tick * 20
+                a_tx, _ = a.process(now, a_rx, BLOCK)
+                b_tx, _ = b.process(now, b_rx, BLOCK)
+                a_rx, b_rx = b_tx, a_tx
+                if not sent and a.state == coppa.LinkState.CONNECTED:
+                    a.send(payload)
+                    sent = True
+                if sent and a.pending_bytes == 0:
+                    break
+            self.assertTrue(sent and a.pending_bytes == 0, "payload was not delivered")
+
+            errors = []
+
+            def drain(out):
+                try:
+                    while chunk := b.recv(1):
+                        out.extend(chunk)
+                except Exception as e:  # noqa: BLE001 - asserted after join
+                    errors.append(e)
+
+            threads = [threading.Thread(target=drain, args=(out,)) for out in got]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            a.close()
+            b.close()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(got[0]) + len(got[1]), len(payload))
+        self.assertEqual(Counter(got[0] + got[1]), Counter(payload))
 
     def test_two_processes_connect_and_send(self):
         """Scenario 1: two processes using the binding on a loopback channel;

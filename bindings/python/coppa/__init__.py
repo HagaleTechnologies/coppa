@@ -150,7 +150,6 @@ class Link:
     def __init__(self, callsign, profile=None, speed_level=0, turnaround_ms=0):
         self._h = ctypes.c_void_p()
         self._tx_buf = None
-        self._rx_buf = None
         cfg = _ffi.LinkConfigStruct()
         cfg.struct_size = ctypes.sizeof(_ffi.LinkConfigStruct)
         cfg.callsign = callsign.encode("utf-8")
@@ -220,9 +219,10 @@ class Link:
 
     def recv(self, max_bytes=65536):
         """Return delivered bytes (up to ``max_bytes``), or b'' when none."""
-        if self._rx_buf is None or len(self._rx_buf) != max_bytes:
-            self._rx_buf = (ctypes.c_uint8 * max_bytes)()
-        buf = self._rx_buf
+        # A fresh buffer per call: ctypes releases the GIL during the C call,
+        # so a buffer kept on the Link would let a second thread's recv()
+        # overwrite these bytes before they are copied out.
+        buf = (ctypes.c_uint8 * max_bytes)()
         out_len = ctypes.c_size_t(0)
         _check(_ffi.lib.coppa_link_recv(self._handle(), buf, max_bytes, ctypes.byref(out_len)))
         return bytes(buf[: out_len.value])

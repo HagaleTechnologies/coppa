@@ -3034,10 +3034,11 @@ mod tests {
     #[test]
     fn test_poisoned_handle_message() {
         let mut h = coppa_engine_create();
+        assert!(!h.is_null());
         let addr = h as usize;
         let _ = std::thread::spawn(move || {
             let h = addr as *mut CoppaHandle;
-            let _guard = unsafe { (*h).engine.lock() };
+            let _guard = unsafe { h.as_ref() }.unwrap().engine.lock();
             panic!("poison the engine lock on purpose");
         })
         .join();
