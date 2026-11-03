@@ -23,8 +23,5 @@
 - [What contract does coppa-dsp expose to skimmer?](pages/coppa-dsp-skimmer-interface.md) — `coppa-dsp` is consumed by the skimmer repo as a pure-DSP library — it provides
 - [What will bite you about this repo's agent tooling (Serena and humanlayer thoughts)?](pages/agent-tooling.md) — COP-11 filed two unrelated developer-tooling defects together: catalyst-dev's
 - [What will bite you when persisting coppa CLI settings?](pages/cli-settings.md) — Profile, band and TNC gotchas.
-<<<<<<< HEAD
 - [Which stream and exit code does coppa use?](pages/cli-output.md) — stdout is data only; broken pipe, Ctrl-C and 130 rules.
-=======
 - [What will bite you when testing coppad's mDNS discovery?](pages/mdns-discovery.md) — Loopback answers and glibc's missing .local lookup fool same-host tests.
->>>>>>> 2681082012e5bfa00fedf488a52b7857a4389ab3
