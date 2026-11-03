@@ -33,11 +33,7 @@ INFO coppad: PTT method="rigctld 127.0.0.1:4532" active=rigctld state="released"
 | | `git_sha` | The commit HEAD pointed at when `coppad` was built (12 hex digits), or `unknown` for a build from a tree without `.git`. Packagers building from a tarball set `COPPA_GIT_SHA` (7-40 hex digits) at build time. It does not flag uncommitted changes. |
 | | `features` | `coppa-daemon`'s cargo features in this build (`cpal-backend`, `gpio-ptt`, `kiss-tnc`, `mdns`, `serial-ptt`, `websocket`), comma-separated, or `none`. |
 | `Host listeners` | `bind_address` | `[host] bind_address`. |
-<<<<<<< HEAD
-| | `vara_command`, `vara_data`, `websocket` | The bound `ip:port` (the real port when 0 is configured), `disabled`, or, for `websocket` only, `not-built` in a build without the `websocket` feature. The `websocket` port also serves the operator dashboard over plain HTTP at `GET /` (COP-79, COP-83; see [Operator dashboard](#operator-dashboard)). |
-=======
-| | `vara_command`, `vara_data`, `websocket` | The bound `ip:port` (the real port when 0 is configured), `disabled`, or, for `websocket` only, `not-built` in a build without the `websocket` feature. The `websocket` port also serves the operator page over plain HTTP at `GET /` (COP-79) and answers `GET /health` (COP-140, see [Health check](#health-check)). |
->>>>>>> 2681082012e5bfa00fedf488a52b7857a4389ab3
+| | `vara_command`, `vara_data`, `websocket` | The bound `ip:port` (the real port when 0 is configured), `disabled`, or, for `websocket` only, `not-built` in a build without the `websocket` feature. The `websocket` port also serves the operator dashboard over plain HTTP at `GET /` (COP-79, COP-83; see [Operator dashboard](#operator-dashboard)) and answers `GET /health` (COP-140, see [Health check](#health-check)). |
 | `Host listeners accept connections from other hosts; ...` (WARN) | `bind_address` | Logged when a listener is bound to a non-loopback address such as `0.0.0.0`: anyone who can reach it can key the transmitter. |
 | `mDNS advertisement` | `host`, `service`, `port`, `addresses` | Only with `[host] mdns_enabled = true` in an `mdns` build. The advertised host (`coppad.local.`), service instance (`coppad._coppa._tcp.local.`), bound WebSocket port, and `every non-loopback IPv4 address` (`bind_address = "0.0.0.0"`), `every non-loopback address` (`"[::]"`) or the single bound address. See [Finding coppad on the network](#finding-coppad-on-the-network-mdns). |
 | `mDNS name already in use on this network; ...` (WARN) | `original`, `new_name` | Another host answers for the name, so the responder renamed this daemon, for example to `coppad-2.local.`. Clients must use the new name. |
@@ -775,7 +771,10 @@ The page makes no external requests. Each card:
 - **RX level**: the `audio_level` RX reading as a bar from -60 to 0 dBFS
   (see [RX level](#rx-level)), and the last transmission's TX level.
 - **S/N**: the last decoded frame's S/N, how long ago it arrived, and a
-  sparkline of the last 2 minutes. CFO is the last decoded frame's offset.
+  sparkline of the last 2 minutes. When the connection drops the age is
+  dropped too; after a reconnect the page takes the S/N from `status`, which
+  has no arrival time, so the age is missing until the next frame decodes.
+  CFO is the last decoded frame's offset.
 - **Speed level**: `TX <n> · auto` or `TX <n> · manual` (ours), `RX <n>` (the
   peer's last decoded frame), `Auto` plus one button per level the profile
   accepts, and the buffer count.

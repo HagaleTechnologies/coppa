@@ -633,12 +633,8 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
             config.host.bind_address.clone(),
         )
         .with_auth(auth)
-<<<<<<< HEAD
-        .with_index_html(web::INDEX_HTML);
-=======
-        .with_index_html(include_str!("web/index.html"))
+        .with_index_html(web::INDEX_HTML)
         .with_health(health);
->>>>>>> 2681082012e5bfa00fedf488a52b7857a4389ab3
 
         // Pipe WebSocket events into the daemon event loop
         if let Some(mut ws_rx) = ws_server.take_event_rx() {

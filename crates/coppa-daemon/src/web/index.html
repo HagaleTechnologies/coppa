@@ -293,6 +293,9 @@ function resetLive() {
   // Session pushes missed while the socket is down make these unknowable.
   state.session.since = 0;
   state.session.calling = null;
+  // A frame decoded while the socket is down reaches the page only as
+  // `status.snr`, which carries no time, so the next status sets the reading.
+  state.lastSnrAt = 0;
 }
 
 function onHello(msg) {
@@ -371,7 +374,12 @@ function applyStatus(msg) {
   if (Array.isArray(msg.speed_levels)) state.speedLevels = msg.speed_levels;
   if (typeof msg.level === "number") state.rxLevel = msg.level;
   if (typeof msg.cfo === "number") state.cfo = msg.cfo;
-  if (typeof msg.snr === "number" && state.lastSnr === null) state.lastSnr = msg.snr;
+  // A reading without an arrival time follows status; daemon data without
+  // `snr` means no frame has decoded since the daemon started.
+  if (!state.lastSnrAt) {
+    if (typeof msg.snr === "number") state.lastSnr = msg.snr;
+    else if (typeof msg.max_tx_s === "number") state.lastSnr = null;
+  }
   if (Array.isArray(msg.heard)) state.heard = msg.heard;
   state.link = msg.link || null;
   // A reconnect can miss session pushes, so the peer is reconciled as well.

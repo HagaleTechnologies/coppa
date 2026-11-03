@@ -129,14 +129,12 @@ websocket_port = 8400
 # this same port; loading it needs no token, and it holds none. For the page to
 # connect, add its own origin exactly as the browser's address bar shows it,
 # e.g. "http://127.0.0.1:8400" (and "http://localhost:8400" if you open it by
-<<<<<<< HEAD
-# that name), to websocket_allowed_origins.
+# that name, and "http://coppad.local:8400" if you open it by its mDNS name),
+# to websocket_allowed_origins.
 # That page is the operator dashboard (speed level, S/N, TUNE, PTT/BUSY); if
 # it cannot connect, its refusal line names the exact origin to add.
-=======
-# that name, and "http://coppad.local:8400" if you open it by its mDNS name),
-# to websocket_allowed_origins. GET /health on this port answers
-# {"status":"ok"} or {"status":"degraded"} for monitoring tools, with no token.
+# GET /health on this port answers {"status":"ok"} or {"status":"degraded"}
+# for monitoring tools, with no token.
 # mDNS (COP-140): advertise this daemon on the local network as coppad.local,
 # with one "_coppa._tcp" service for the WebSocket port above (the operator
 # page at / and the health check at /health). Phones, tablets, macOS, Windows
@@ -147,7 +145,6 @@ websocket_port = 8400
 # http://coppad.local:8400/ needs "http://coppad.local:8400" in
 # websocket_allowed_origins.
 mdns_enabled = false
->>>>>>> 2681082012e5bfa00fedf488a52b7857a4389ab3
 
 [engine]
 # Profile: HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY (case-insensitive).

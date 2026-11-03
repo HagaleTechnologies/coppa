@@ -215,6 +215,25 @@ mod tests {
         }
     }
 
+    /// `applyStatus` takes `status.snr` only while the page's reading has no
+    /// arrival time, so a socket loss must drop that time: a frame decoded
+    /// while the socket was down is known only from `status.snr`.
+    #[test]
+    fn page_reconciles_the_snr_from_status_after_a_reconnect() {
+        let apply_status = page_function("applyStatus");
+        for line in [
+            "if (!state.lastSnrAt) {",
+            "if (typeof msg.snr === \"number\") state.lastSnr = msg.snr;",
+        ] {
+            assert!(apply_status.contains(line), "applyStatus lacks {line:?}");
+        }
+        let reset_live = page_function("resetLive");
+        assert!(
+            reset_live.contains("state.lastSnrAt = 0;"),
+            "resetLive keeps the S/N arrival time across a socket loss"
+        );
+    }
+
     #[test]
     fn page_shows_the_reviewed_wording() {
         for text in WORDING {
