@@ -2155,13 +2155,13 @@ impl EventLoop {
                 return;
             }
         };
-        self.raise_session_multi_rto(&samples, codewords);
         // Boxed: `transmit_samples` -> `handle_ptt_change` -> (on PTT
         // release) `drain_session_link` forms the same 3-way async call
         // cycle `try_drain_tx_queue` documents; one edge needs indirection
         // to give the compiler a finite-sized future.
         let generation = self.tx_generation;
-        Box::pin(self.transmit_samples(&samples)).await;
+        let keyed = Box::pin(self.transmit_samples_keyed(&samples)).await;
+        self.set_session_segment_floor(keyed, samples.len(), codewords);
         if self.tx_generation == generation {
             // The gate passed above but refused after the courtesy wait (the
             // one `transmit_samples` path that keys nothing and leaves
@@ -2205,17 +2205,30 @@ impl EventLoop {
         );
     }
 
-    /// COP-69: a multi-codeword frame can outlast the initial five-second
-    /// RTO. Raise both the active timeout and its estimator floor before
-    /// submission, including on a slower fallback retransmission. Single-
-    /// codeword sessions retain their existing timing. The full HF long-CP
+    /// COP-69, COP-111: size the retransmit timeout of the session frame
+    /// just sent from the audio `transmit_samples_keyed` actually keyed:
+    /// `keyed` samples (the frame plus any station ID the timer prepended),
+    /// both turnarounds and the peer's ACK. A multi-codeword frame can
+    /// outlast the initial five-second RTO, and a prepended ID can push any
+    /// frame past the link's base floor. The floor is the link's per-
+    /// transmission segment floor, replaced on every session transmission
+    /// (a fallback retransmission included), so a later short frame does not
+    /// inherit a long frame's timeout. It is zero for a single-codeword frame
+    /// with no ID, which keeps the estimator's own timing. `keyed == 0` means
+    /// the transmission was refused and nothing changes. The full HF long-CP
     /// ACK is a conservative upper bound for the supported HF short-CP and
     /// VHF profiles too; this branch still sends full-frame ACKs.
-    fn raise_session_multi_rto(&mut self, samples: &[f32], codewords: u8) {
-        if codewords <= 1 {
+    fn set_session_segment_floor(&mut self, keyed: usize, frame_len: usize, codewords: u8) {
+        if keyed == 0 {
             return;
         }
-        let data_s = samples.len() as f64 / self.engine.config().sample_rate as f64;
+        if codewords <= 1 && keyed <= frame_len {
+            if let Some(link) = self.session_link.as_mut() {
+                link.tx.set_segment_floor(Duration::ZERO);
+            }
+            return;
+        }
+        let data_s = keyed as f64 / self.engine.config().sample_rate as f64;
         let ack_s = coppa_protocol::modem::frame_airtime_s(
             self.engine.speed_level(),
             &coppa_codec::ofdm::CoppaProfile::hf_standard(),
@@ -2227,7 +2240,7 @@ impl EventLoop {
             / 1000.0;
         if let Some(link) = self.session_link.as_mut() {
             link.tx
-                .raise_rto_floor(Duration::from_secs_f64(data_s + 2.0 * turnaround_s + ack_s));
+                .set_segment_floor(Duration::from_secs_f64(data_s + 2.0 * turnaround_s + ack_s));
         }
     }
 
@@ -2433,9 +2446,9 @@ impl EventLoop {
             };
             match encoded {
                 Ok(samples) => {
-                    self.raise_session_multi_rto(&samples, codewords);
                     tracing::debug!(seq, attempt, "Retransmitting session frame");
-                    Box::pin(self.transmit_samples(&samples)).await;
+                    let keyed = Box::pin(self.transmit_samples_keyed(&samples)).await;
+                    self.set_session_segment_floor(keyed, samples.len(), codewords);
                 }
                 Err(e) => tracing::warn!(
                     error = %e,
@@ -4608,6 +4621,15 @@ impl EventLoop {
     /// `NO_CALLSIGN_TX_REFUSAL` at `ERROR` for each attempt. This covers
     /// every caller, including `TUNE`, which no upstream feature gate sees.
     async fn transmit_samples(&mut self, samples: &[f32]) {
+        self.transmit_samples_keyed(samples).await;
+    }
+
+    /// [`Self::transmit_samples`], returning how many samples it keyed:
+    /// `samples.len()` plus any station-ID frame the timer prepended, or `0`
+    /// when it refused (no callsign, ABORT during the busy-channel wait, or
+    /// the wideband gate). COP-111: a session sizes the retransmit timeout of
+    /// the frame it just sent from this count, so a prepended ID is covered.
+    async fn transmit_samples_keyed(&mut self, samples: &[f32]) -> usize {
         if self.local_callsign.is_none() {
             tracing::error!("{NO_CALLSIGN_TX_REFUSAL}");
             if !self.is_transmitting {
@@ -4619,7 +4641,7 @@ impl EventLoop {
                 self.tx_on_air_bytes = 0;
                 self.report_buffer().await;
             }
-            return;
+            return 0;
         }
         let allowed = if self.wideband_frequency_check().is_ok() {
             if let Some(cut) = self.wait_for_clear_channel().await {
@@ -4650,7 +4672,7 @@ impl EventLoop {
                         .as_ref()
                         .is_some_and(|l| !l.backlog.is_empty());
                 }
-                return;
+                return 0;
             }
             self.wait_for_rx_turnaround().await;
             // The rig can retune during the unbounded courtesy wait and
@@ -4682,7 +4704,7 @@ impl EventLoop {
                     .as_ref()
                     .is_some_and(|l| !l.backlog.is_empty());
             }
-            return;
+            return 0;
         }
         // Station-ID timer (Phase 4 Task 3): prepend an ID/beacon frame to
         // this transmission if due. Deliberately only checked here, at an
@@ -4828,6 +4850,7 @@ impl EventLoop {
                 tracing::warn!(error = %e, "Failed to deassert PTT after TX");
             }
         });
+        samples.len()
     }
 
     /// Busy-channel courtesy gate (Phase 4 Task 3): if `[station_id]
@@ -15357,6 +15380,9 @@ mod tests {
             let mut event_loop = EventLoop::new(session_config()).unwrap();
             let (producer, mut consumer) = coppa_audio::audio_ring(4_000_000);
             event_loop.set_audio_out(producer);
+            // COP-111: the first frame's station ID would raise its timeout
+            // by the ID's airtime, and `sleep_past_session_rto` sleeps it.
+            mark_identified(&mut event_loop);
             let id = seed_established(&mut event_loop);
             event_loop.ensure_session_link(id);
             fast_session_rto(&mut event_loop);
@@ -15643,6 +15669,149 @@ mod tests {
                 link.backlog.clear();
                 event_loop.handle_ptt_change(false).await;
             }
+        }
+
+        /// COP-111 test rig: `cop69_station_with` at level 2 with coppad's
+        /// default PTT timing and a 500 ms turnaround, the setup the
+        /// recheck measured the residual on.
+        fn cop111_station() -> (EventLoop, coppa_audio::AudioRingConsumer) {
+            let mut config = cop69_station_config();
+            config.radio.turnaround_ms = 500;
+            config.radio.ptt_pre_delay_ms = 50;
+            config.radio.ptt_tail_delay_ms = 200;
+            let (mut event_loop, consumer) = cop69_station_with(config);
+            event_loop.engine.set_speed_level(2).unwrap();
+            (event_loop, consumer)
+        }
+
+        /// COP-111: the earliest the peer's ACK to `keyed_s` seconds of
+        /// keyed audio can finish, assuming zero decode time: our PTT tail,
+        /// the peer's turnaround and PTT pre-delay, then one level-2 ACK.
+        fn cop111_ack_done(keyed_s: f64) -> Duration {
+            let ack_s = coppa_protocol::modem::frame_airtime_s(
+                2,
+                &coppa_codec::ofdm::CoppaProfile::hf_standard(),
+            )
+            .unwrap();
+            Duration::from_secs_f64(keyed_s + 0.200 + 0.500 + 0.050 + ack_s)
+        }
+
+        /// COP-111: asserts the session frame just keyed (`keyed_s` seconds
+        /// of audio) cannot time out before the peer's ACK can finish.
+        fn assert_rto_covers_the_ack(event_loop: &mut EventLoop, keyed_s: f64) {
+            let ack_done = cop111_ack_done(keyed_s);
+            let link = event_loop.session_link.as_mut().unwrap();
+            assert!(
+                link.tx.rto() >= ack_done,
+                "RTO {:?} < ACK done {ack_done:?} after {keyed_s} s keyed",
+                link.tx.rto()
+            );
+            assert!(
+                link.tx
+                    .get_retransmits(Instant::now() + ack_done)
+                    .is_empty(),
+                "the frame was due before the peer's ACK could finish"
+            );
+        }
+
+        /// COP-111 (R1): a station ID prepended to a multi-codeword frame is
+        /// part of the audio the timeout covers. Before the fix the timeout
+        /// expired 0.615 s before the peer's ACK could finish, and the
+        /// sender keyed a duplicate 9.5 s frame over it.
+        #[tokio::test]
+        async fn multi_codeword_rto_covers_a_prepended_station_id() {
+            let (mut event_loop, mut consumer) = cop111_station();
+            event_loop.last_id_time = None;
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: cop69_incompressible(2000),
+                })
+                .await;
+            let keyed_s = read_all(&mut consumer).len() as f64 / 48_000.0;
+            assert!(keyed_s > 10.5, "the ID must be in the audio: {keyed_s} s");
+            assert!(event_loop.last_id_time.is_some(), "the ID must have keyed");
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx_codewords, 8);
+            assert_rto_covers_the_ack(&mut event_loop, keyed_s);
+        }
+
+        /// COP-111 (R1): the same holds for a single-codeword frame once the
+        /// RTT estimator has converged to the link's base floor. Before the
+        /// fix the margin was -0.938 s.
+        #[tokio::test]
+        async fn single_codeword_rto_covers_a_prepended_station_id() {
+            let (mut event_loop, mut consumer) = cop111_station();
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: b"hi".to_vec(),
+                })
+                .await;
+            read_all(&mut consumer);
+            {
+                let link = event_loop.session_link.as_mut().unwrap();
+                assert_eq!(link.tx_codewords, 1);
+                let ack = link.tx.next_seq();
+                assert_eq!(link.tx.process_ack(ack, 0, Instant::now()).len(), 1);
+            }
+            event_loop.handle_ptt_change(false).await;
+
+            event_loop.last_id_time = None;
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: b"hi".to_vec(),
+                })
+                .await;
+            let keyed = read_all(&mut consumer).len();
+            assert!(event_loop.last_id_time.is_some(), "the ID must have keyed");
+            assert_eq!(event_loop.session_link.as_ref().unwrap().tx_codewords, 1);
+            assert_rto_covers_the_ack(&mut event_loop, keyed as f64 / 48_000.0);
+        }
+
+        /// COP-111 (R2): a long frame's timeout does not outlive it. A
+        /// 1-codeword frame after an 8-codeword one gets the link's own
+        /// timing back. Before the fix it kept the 12.341 s RTO.
+        #[tokio::test]
+        async fn single_codeword_frame_after_multi_codeword_frame_gets_its_own_rto() {
+            let (mut event_loop, mut consumer) = cop111_station();
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: cop69_incompressible(2000),
+                })
+                .await;
+            read_all(&mut consumer);
+            {
+                let link = event_loop.session_link.as_mut().unwrap();
+                assert_eq!(link.tx_codewords, 8);
+                let ack = link.tx.next_seq();
+                assert_eq!(link.tx.process_ack(ack, 0, Instant::now()).len(), 1);
+                link.backlog.clear();
+            }
+            event_loop.handle_ptt_change(false).await;
+
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: b"hi".to_vec(),
+                })
+                .await;
+            read_all(&mut consumer);
+            let link = event_loop.session_link.as_mut().unwrap();
+            assert_eq!(link.tx_codewords, 1);
+            assert!(
+                link.tx.rto() < Duration::from_secs(6),
+                "a short frame inherited a long frame's timeout: {:?}",
+                link.tx.rto()
+            );
+            assert!(
+                !link
+                    .tx
+                    .get_retransmits(Instant::now() + Duration::from_secs(6))
+                    .is_empty(),
+                "the short frame must be due by 6 s"
+            );
         }
 
         /// COP-69: a backlog beyond one codeword's budget, with the
