@@ -3,7 +3,8 @@
 Measurement harness, not a product crate: BER/FER/goodput-vs-SNR scenarios, benchmark examples, and the lib tests that guard each speed level's AWGN waterfall on every push.
 
 Part of [coppa](https://github.com/HagaleTechnologies/coppa), an OFDM HF modem
-reference implementation. Depends on coppa-channel, coppa-codec, coppa-ml and coppa-protocol; no other coppa crate depends on it.
+reference implementation. Depends on coppa-channel, coppa-codec, coppa-ml and coppa-protocol; coppa-protocol and the root
+`coppa` crate use it only as a dev-dependency, for tests.
 
 ## Run
 
