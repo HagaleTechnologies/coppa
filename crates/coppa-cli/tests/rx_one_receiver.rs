@@ -100,14 +100,19 @@ fn rx_duration_decodes_only_the_first_seconds_of_a_file() {
     let first = "Decoded: \"FIRST FRAME DE VK2ABC\"";
     let second = "Decoded: \"SECOND FRAME DE VK2ABC\"";
 
-    let (all, _) = ok(&["rx", "<path>"], &two.0);
-    assert!(all.contains("Reading 179040 samples from"), "{all}");
+    // Status lines are on stderr since COP-86; decoded frames on stdout.
+    let (all, all_status) = ok(&["rx", "<path>"], &two.0);
+    assert!(
+        all_status.contains("Reading 179040 samples from"),
+        "{all_status}"
+    );
+    assert!(!all.contains("Reading "), "{all}");
     assert!(all.contains(first) && all.contains(second), "{all}");
 
-    let (cut, _) = ok(&["rx", "<path>", "-d", "2"], &two.0);
+    let (cut, cut_status) = ok(&["rx", "<path>", "-d", "2"], &two.0);
     assert!(
-        cut.contains("Reading the first 2 s (96000 of 179040 samples) from"),
-        "{cut}"
+        cut_status.contains("Reading the first 2 s (96000 of 179040 samples) from"),
+        "{cut_status}"
     );
     assert!(cut.contains(first), "{cut}");
     assert!(!cut.contains("SECOND FRAME"), "{cut}");

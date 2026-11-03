@@ -29,6 +29,8 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing-subscriber = { workspace = true }
+clap_complete = { workspace = true }
+clap_mangen = { workspace = true }
 
 [dev-dependencies]
 # Golden-vector manifest parsing (tests/rx_golden.rs), matching

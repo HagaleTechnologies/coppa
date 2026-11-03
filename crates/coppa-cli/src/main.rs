@@ -1,6 +1,13 @@
 //! Coppa CLI - command-line interface for the Coppa digital communications system.
+//!
+//! Stream rule (COP-86): stdout carries data only (decoded frames, JSON, raw
+//! PCM, reports) and is written through [`emit`]/[`emit_raw`], so a closed
+//! pipe ends the run quietly instead of panicking. Status goes to stderr.
+#![cfg_attr(not(test), deny(clippy::print_stdout))]
 
 mod doctor;
+mod interrupt;
+mod style;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -30,45 +37,114 @@ impl Verbosity {
     }
 }
 
+/// Every coppa-cli cargo feature and whether this build has it, for
+/// `--version`. `cli_features_lists_every_feature_in_cargo_toml` keeps it
+/// complete.
+const CLI_FEATURES: [(&str, bool); 3] = [
+    ("cpal-backend", cfg!(feature = "cpal-backend")),
+    ("file-backend", cfg!(feature = "file-backend")),
+    ("kiss-tnc", cfg!(feature = "kiss-tnc")),
+];
+
+/// The enabled CLI features, comma-separated, or `none`.
+fn cli_features() -> String {
+    let on: Vec<&str> = CLI_FEATURES
+        .iter()
+        .filter(|(_, enabled)| *enabled)
+        .map(|(name, _)| *name)
+        .collect();
+    if on.is_empty() {
+        "none".to_string()
+    } else {
+        on.join(",")
+    }
+}
+
+/// `coppa --version` (COP-86): the build facts a bug report needs. The first
+/// line is what `-V` prints, so `coppa --version | head -1` keeps working.
+static LONG_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "{}\ncommit: {}\nfeatures: {}\nwire format: {}",
+        env!("CARGO_PKG_VERSION"),
+        coppa_daemon::build_info::GIT_SHA,
+        cli_features(),
+        coppa_engine::WIRE_FORMAT_VERSION
+    )
+});
+
 #[derive(Parser)]
 #[command(
     name = "coppa",
     about = "Coppa - Ham Radio Digital Communications System",
-    version
+    version,
+    long_version = LONG_VERSION.as_str(),
+    arg_required_else_help = true
 )]
 struct Cli {
     /// Increase diagnostic output; repeat for frame metrics.
-    #[arg(short, long, global = true, action = clap::ArgAction::Count, conflicts_with = "quiet")]
+    #[arg(
+        short,
+        long,
+        global = true,
+        action = clap::ArgAction::Count,
+        conflicts_with = "quiet",
+        help_heading = "Global options"
+    )]
     verbose: u8,
-    /// Suppress all output except decoded messages.
-    #[arg(short, long, global = true, conflicts_with = "verbose")]
+    /// Suppress status output; decoded data, warnings and errors still print.
+    #[arg(
+        short,
+        long,
+        global = true,
+        conflicts_with = "verbose",
+        help_heading = "Global options"
+    )]
     quiet: bool,
     /// Read settings from this file instead of searching for coppad.toml (also COPPA_CONFIG). The file must exist.
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help_heading = "Global options"
+    )]
     config: Option<PathBuf>,
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 /// Flags for `coppa rx`, shared with its deprecated hidden alias
 /// `coppa listen` (COP-56) so the two cannot drift apart.
 #[derive(clap::Args, Debug, Default, PartialEq, Eq)]
 struct RxArgs {
-    /// WAV file to decode. Without one, captures live audio from an input device.
-    #[arg(value_name = "FILE")]
+    /// WAV file to decode, or - for raw PCM on stdin (see --sample-format).
+    /// Without one, captures live audio from an input device.
+    #[arg(value_name = "FILE", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     file: Option<String>,
     /// WAV file to decode (same as FILE).
-    #[arg(short, long, value_name = "FILE", conflicts_with = "file")]
+    #[arg(
+        short,
+        long,
+        value_name = "FILE",
+        conflicts_with = "file",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
     input: Option<String>,
     /// Stop after this many seconds of audio: the first N seconds of a file,
     /// or N seconds of live capture (0 = no limit).
-    #[arg(short, long, value_name = "SECONDS", default_value_t = 0)]
+    #[arg(
+        short,
+        long,
+        value_name = "SECONDS",
+        default_value_t = 0,
+        allow_negative_numbers = true,
+        value_parser = rx_seconds
+    )]
     duration: u64,
     /// Operational profile name.
-    #[arg(long)]
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
     profile: Option<String>,
     /// Your callsign. Printed under --verbose; nothing else uses it yet.
-    #[arg(long)]
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
     callsign: Option<String>,
     /// Print only the decoded payload as lowercase hex, one line per frame,
     /// with no labels (always hex, even for text).
@@ -81,14 +157,18 @@ struct RxArgs {
     #[arg(long, conflicts_with_all = ["raw", "hex"])]
     json: bool,
     /// Audio input device name (unique substring, live capture only).
-    #[arg(long, conflicts_with = "device_id")]
+    #[arg(long, conflicts_with = "device_id", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     device: Option<String>,
     /// Exact audio input device ID from `coppa devices`.
-    #[arg(long, conflicts_with = "device")]
+    #[arg(long, conflicts_with = "device", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     device_id: Option<String>,
     /// Zero-based input channel on the selected device.
     #[arg(long, default_value_t = 0)]
     input_channel: u16,
+    /// Sample encoding of raw PCM on stdin (rx -): s16le (16-bit PCM) or
+    /// f32le (32-bit float), mono 48000 Hz [default: s16le].
+    #[arg(long, value_enum, value_name = "FORMAT", hide_possible_values = true)]
+    sample_format: Option<SampleFormat>,
 }
 
 impl RxArgs {
@@ -103,7 +183,7 @@ impl RxArgs {
 #[derive(clap::Args, Debug, Default, PartialEq, Eq)]
 struct ProfilesArgs {
     /// Show one named profile (HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY).
-    #[arg(short, long, conflicts_with = "level")]
+    #[arg(short, long, conflicts_with = "level", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     profile: Option<String>,
     /// Show one speed level (1-9).
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
@@ -113,9 +193,45 @@ struct ProfilesArgs {
     json: bool,
 }
 
-/// Printed on stderr whenever the deprecated `coppa config` alias runs, even
-/// under `--quiet`: a script still using it must hear that it is going away.
-const CONFIG_DEPRECATED: &str = "WARNING: 'coppa config' is deprecated and will be removed in the next release. Use 'coppa profiles' instead; it takes the same flags.";
+/// Printed on stderr, after `WARNING:`, whenever the deprecated `coppa
+/// config` alias runs, even under `--quiet`: a script still using it must
+/// hear that it is going away.
+const CONFIG_DEPRECATED: &str = "'coppa config' is deprecated and will be removed in the next release. Use 'coppa profiles' instead; it takes the same flags.";
+
+/// The rate `coppa devices` reports support for: every profile's rate.
+const DEVICES_RATE_HZ: u32 = 48_000;
+
+/// One device's support for `DEVICES_RATE_HZ`, per direction: `None` when
+/// the device advertises nothing that way. The outer `None` of
+/// [`rate_support`] means unknown (the support listing failed or skipped it).
+type RateSupport = (Option<bool>, Option<bool>);
+
+/// Look up `device` (by id) in the support listing.
+fn rate_support(
+    device: &coppa_audio::AudioDevice,
+    support: &Result<Vec<coppa_audio::DeviceSupport>>,
+) -> Option<RateSupport> {
+    let id = device.id.as_deref()?;
+    let entry = support.as_ref().ok()?.iter().find(|entry| entry.id == id)?;
+    let supports = |direction: &Option<coppa_audio::Support>| {
+        direction.as_ref().map(|support| {
+            matches!(support, coppa_audio::Support::Yes(format)
+                if format.sample_rate == DEVICES_RATE_HZ)
+        })
+    };
+    Some((supports(&entry.input), supports(&entry.output)))
+}
+
+/// Whether `device` is the host's default `default`, matched by id.
+fn is_default(
+    device: &coppa_audio::AudioDevice,
+    default: Option<&coppa_audio::DefaultDevice>,
+) -> bool {
+    match (device.id.as_deref(), default.and_then(|d| d.id.as_deref())) {
+        (Some(id), Some(default_id)) => id == default_id,
+        _ => false,
+    }
+}
 
 #[derive(Serialize)]
 struct DeviceOutput {
@@ -124,16 +240,30 @@ struct DeviceOutput {
     max_sample_rate_hz: u32,
     input_channels: u16,
     output_channels: u16,
+    // COP-86: additive fields after the original five (COP-58 contract).
+    input_supports_48000_hz: Option<bool>,
+    output_supports_48000_hz: Option<bool>,
+    is_default_input: bool,
+    is_default_output: bool,
 }
 
-impl From<&coppa_audio::AudioDevice> for DeviceOutput {
-    fn from(device: &coppa_audio::AudioDevice) -> Self {
+impl DeviceOutput {
+    fn new(
+        device: &coppa_audio::AudioDevice,
+        support: &Result<Vec<coppa_audio::DeviceSupport>>,
+        defaults: &coppa_audio::DefaultDevices,
+    ) -> Self {
+        let (input_supports, output_supports) = rate_support(device, support).unwrap_or_default();
         Self {
             name: device.name.clone(),
             id: device.id.clone(),
             max_sample_rate_hz: device.max_sample_rate,
             input_channels: device.input_channels,
             output_channels: device.output_channels,
+            input_supports_48000_hz: input_supports,
+            output_supports_48000_hz: output_supports,
+            is_default_input: is_default(device, defaults.input.as_ref()),
+            is_default_output: is_default(device, defaults.output.as_ref()),
         }
     }
 }
@@ -244,47 +374,173 @@ impl ProfileOutput {
 
 fn write_json<T: Serialize>(value: &T) -> Result<()> {
     let line = serde_json::to_string(value)?;
-    let mut stdout = std::io::stdout().lock();
-    writeln!(stdout, "{line}")?;
-    stdout.flush()?;
-    Ok(())
+    emit(line)
 }
 
-/// Printed on stderr every time the hidden `listen` alias runs (COP-56).
-/// Unconditional, like this file's other `WARNING:` lines, so `--quiet`
-/// scripts still see it; stderr keeps stdout captures clean.
-const LISTEN_DEPRECATED: &str = "WARNING: 'coppa listen' is deprecated and will be \
+/// Write one line of data to stdout. Unlike `println!`, a closed pipe comes
+/// back as [`StdoutClosed`], which `main` turns into a quiet exit 0 (COP-86).
+fn emit(line: impl std::fmt::Display) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{line}")
+        .and_then(|()| stdout.flush())
+        .map_err(stdout_error)
+}
+
+/// Write bytes to stdout as they are, with `emit`'s closed-pipe handling.
+fn emit_raw(bytes: &[u8]) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(bytes)
+        .and_then(|()| stdout.flush())
+        .map_err(stdout_error)
+}
+
+/// The reader of stdout went away. Only stdout writes produce it, so a
+/// broken pipe on any other stream (a rigctld or TNC socket) stays an error.
+#[derive(Debug)]
+struct StdoutClosed;
+
+impl std::fmt::Display for StdoutClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stdout was closed")
+    }
+}
+
+impl std::error::Error for StdoutClosed {}
+
+/// A failed stdout write: [`StdoutClosed`] for a broken pipe, else the error.
+fn stdout_error(error: impl Into<anyhow::Error>) -> anyhow::Error {
+    let error = error.into();
+    if is_broken_pipe(&error) {
+        StdoutClosed.into()
+    } else {
+        error
+    }
+}
+
+/// Whether `rx` prints status lines: not under `--quiet`, and not when
+/// stdout is a `--raw` or `--json` capture (COP-58).
+fn status_enabled(verbosity: Verbosity, raw: bool, json: bool) -> bool {
+    verbosity != Verbosity::Quiet && !raw && !json
+}
+
+/// True when `error` comes from writing to a pipe whose reader has gone.
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
+}
+
+/// Printed on stderr, after `WARNING:`, every time the hidden `listen` alias
+/// runs (COP-56). Unconditional, like this file's other `WARNING:` lines, so
+/// `--quiet` scripts still see it; stderr keeps stdout captures clean.
+const LISTEN_DEPRECATED: &str = "'coppa listen' is deprecated and will be \
     removed in the next release. Use 'coppa rx' instead; it takes the same flags, \
     and --raw prints hex.";
+
+/// Sample encoding for `-o` and `rx -` (COP-86). A CLI-local enum, because
+/// `coppa_audio::PcmFormat` exists only in a `file-backend` build.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SampleFormat {
+    /// 16-bit signed PCM, little-endian.
+    #[default]
+    S16le,
+    /// 32-bit float, little-endian.
+    F32le,
+}
+
+#[cfg(feature = "file-backend")]
+impl From<SampleFormat> for coppa_audio::PcmFormat {
+    fn from(format: SampleFormat) -> Self {
+        match format {
+            SampleFormat::S16le => Self::S16Le,
+            SampleFormat::F32le => Self::F32Le,
+        }
+    }
+}
+
+/// `-o` and `--sample-format`, shared by `tx` and `tune` so they cannot drift.
+#[derive(clap::Args, Debug, Default, PartialEq, Eq)]
+struct OutputArgs {
+    /// Write the audio to a WAV file, or - for raw PCM on stdout, instead of playing it.
+    #[arg(short, long, value_name = "FILE", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    output: Option<String>,
+    /// Sample encoding for -o: s16le (16-bit PCM) or f32le (32-bit float) [default: s16le].
+    #[arg(
+        long,
+        value_enum,
+        value_name = "FORMAT",
+        requires = "output",
+        hide_possible_values = true
+    )]
+    sample_format: Option<SampleFormat>,
+}
+
+impl OutputArgs {
+    fn target(&self) -> Option<OutputTarget<'_>> {
+        self.output.as_deref().map(|path| OutputTarget {
+            path,
+            format: self.sample_format.unwrap_or_default(),
+        })
+    }
+}
+
+/// Where `tx`/`tune` write audio instead of playing it: a WAV file, or `-`
+/// for raw PCM on stdout.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(feature = "file-backend"), allow(dead_code))]
+struct OutputTarget<'a> {
+    path: &'a str,
+    format: SampleFormat,
+}
+
+/// Printed on stderr, after `WARNING:`, whenever the deprecated `tune
+/// --seconds` runs, even under `--quiet`, like `LISTEN_DEPRECATED`.
+const TUNE_SECONDS_DEPRECATED: &str = "'--seconds' is deprecated and will be \
+    removed in the next release. Use '--duration' (-d); it takes the same value.";
 
 #[derive(clap::Args, Debug, Default, PartialEq, Eq)]
 struct RigArgs {
     /// Audio output device name (unique substring).
-    #[arg(long, conflicts_with = "device_id")]
+    #[arg(long, conflicts_with = "device_id", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     device: Option<String>,
     /// Exact audio output device ID from `coppa devices`.
-    #[arg(long, conflicts_with = "device")]
+    #[arg(long, conflicts_with = "device", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     device_id: Option<String>,
     /// Zero-based output channel on the selected device.
     #[arg(long, default_value_t = 0)]
     output_channel: u16,
-    /// PTT method: "rigctld", "vox" or "none" [default: none].
-    #[arg(long)]
+    /// PTT method [default: none].
+    // clap lists the values and rejects a typo even on the -o path (COP-86);
+    // `validate_ptt_method` still checks env and coppad.toml values.
+    #[arg(long, value_name = "METHOD", value_parser = ["none", "vox", "rigctld"])]
     ptt: Option<String>,
     /// rigctld address for CAT PTT [default: 127.0.0.1:4532].
-    #[arg(long)]
+    #[arg(long, value_name = "HOST:PORT", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     rigctld: Option<String>,
     /// Milliseconds to key PTT before audio starts playing [default: 50].
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "MS",
+        allow_negative_numbers = true,
+        value_parser = whole_number
+    )]
     ptt_lead_ms: Option<u64>,
     /// Milliseconds to hold PTT keyed after audio finishes playing [default: 200].
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "MS",
+        allow_negative_numbers = true,
+        value_parser = whole_number
+    )]
     ptt_tail_ms: Option<u64>,
     /// Explicit operating frequency in Hz for the wideband gate.
-    #[arg(long)]
+    #[arg(long, value_name = "HZ")]
     frequency_hz: Option<u64>,
     /// Operating band label ("160m".."23cm") for the wideband gate.
-    #[arg(long)]
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
     band: Option<String>,
 }
 
@@ -294,32 +550,33 @@ enum Commands {
     #[command(after_help = SETTINGS_HELP)]
     Tx {
         /// Message to transmit.
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         message: String,
-        /// Output file for audio samples (WAV format).
-        #[arg(short, long)]
-        output: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
         /// Operational profile name (e.g., HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY).
-        #[arg(long)]
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
         profile: Option<String>,
         /// Speed level 1-9, overriding the profile's level but never its band (see `coppa profiles`).
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
         level: Option<u8>,
         /// Callsign for station identification.
-        #[arg(long)]
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
         callsign: Option<String>,
         #[command(flatten)]
         rig: RigArgs,
     },
-    /// Receive and decode audio from a WAV file, or live from an audio input device.
+    /// Receive and decode audio from a WAV file, stdin or a live audio input device.
     #[command(after_help = SETTINGS_HELP)]
     Rx(RxArgs),
     /// Run a loopback test (encode -> decode).
     #[command(after_help = SETTINGS_HELP)]
     Loopback {
         /// Message to test.
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         message: String,
         /// Operational profile name.
-        #[arg(long)]
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
         profile: Option<String>,
         /// Speed level 1-9, overriding the profile's level but never its band (see `coppa profiles`).
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
@@ -331,25 +588,52 @@ enum Commands {
     #[command(hide = true)]
     #[command(after_help = SETTINGS_HELP)]
     Listen(RxArgs),
-    /// Transmit a TX-level calibration ("TUNE") tone: standard SSB two-tone
-    /// (700 Hz + 1900 Hz) by default, or a single tone via `--single`. Key
-    /// this while advancing your radio's audio drive level until ALC just
-    /// registers, then back off. See `docs/OPERATING.md`.
+    #[command(
+        about = "Transmit a TX-level calibration tone (two-tone by default)",
+        long_about = "Transmit a TX-level calibration (\"TUNE\") tone: standard SSB two-tone \
+            (700 Hz + 1900 Hz) by default, or a single tone via `--single`. Key this while \
+            advancing your radio's audio drive level until ALC just registers, then back off. \
+            See `docs/OPERATING.md`."
+    )]
     #[command(after_help = SETTINGS_HELP)]
     Tune {
-        /// Duration to key the tone, in seconds.
-        #[arg(long, default_value = "10")]
-        seconds: f32,
-        /// Transmit a single tone at this frequency (Hz) instead of the
-        /// default two-tone signal, e.g. for power measurement with a
+        /// How long to key the tone, in seconds (more than 0, at most 120).
+        #[arg(
+            short,
+            long,
+            value_name = "SECONDS",
+            default_value = "10",
+            allow_negative_numbers = true,
+            value_parser = tune_seconds
+        )]
+        duration: f32,
+        /// Deprecated: use --duration. Removed in the next release.
+        // COP-86: kept for one release. Delete this field,
+        // TUNE_SECONDS_DEPRECATED and its check in the Tune dispatch arm in
+        // the release after it ships.
+        #[arg(
+            long,
+            hide = true,
+            value_name = "SECONDS",
+            conflicts_with = "duration",
+            allow_negative_numbers = true,
+            value_parser = tune_seconds
+        )]
+        seconds: Option<f32>,
+        /// Transmit a single tone at this frequency (300-3000 Hz) instead of
+        /// the default two-tone signal, e.g. for power measurement with a
         /// wattmeter.
-        #[arg(long)]
+        #[arg(
+            long,
+            value_name = "HZ",
+            allow_negative_numbers = true,
+            value_parser = tune_single_hz
+        )]
         single: Option<f32>,
-        /// Output file for audio samples (WAV format) instead of live playback.
-        #[arg(short, long)]
-        output: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
         /// Operational profile name (e.g., HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY).
-        #[arg(long)]
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
         profile: Option<String>,
         #[command(flatten)]
         rig: RigArgs,
@@ -362,13 +646,25 @@ enum Commands {
     },
     /// Check audio devices and rig control without transmitting.
     Doctor(doctor::DoctorArgs),
-    /// Show the speed levels (modulation, code rate, max bytes, air time, bandwidth) and the named profiles built on them.
+    #[command(
+        about = "Show the speed levels and the named profiles built on them",
+        long_about = "Show the speed levels (modulation, code rate, max bytes, air time, \
+            bandwidth) and the named profiles built on them."
+    )]
     Profiles(ProfilesArgs),
     // COP-55: kept for one release. Delete this variant, CONFIG_DEPRECATED and
     // the Config dispatch arm in the release after it ships.
     /// Deprecated: use 'coppa profiles'. Removed in the next release.
     #[command(hide = true)]
     Config(ProfilesArgs),
+    /// Print a shell completion script (bash, elvish, fish, powershell, zsh).
+    Completions {
+        /// Shell to generate the script for.
+        #[arg(value_enum, value_name = "SHELL")]
+        shell: clap_complete::Shell,
+    },
+    /// Print the coppa(1) man page in roff format.
+    Man,
     /// Start the AFSK 1200 TNC (KISS TCP server).
     #[cfg(feature = "kiss-tnc")]
     Tnc {
@@ -469,7 +765,27 @@ fn init_logging() {
         .init();
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        // The reader of stdout went away (`coppa rx f.wav | head -1`): it
+        // chose to stop, so stop quietly, as `head` does.
+        Err(error) if error.is::<StdoutClosed>() => std::process::ExitCode::SUCCESS,
+        // Only returned once PTT was released and the audio stopped.
+        Err(error) if error.is::<interrupt::Interrupted>() => {
+            eprintln!("Interrupted: transmission stopped and PTT released.");
+            std::process::ExitCode::from(130)
+        }
+        Err(error) => {
+            // Byte-identical to anyhow's own `Termination` output.
+            let prefix = style::paint("Error", style::Tone::BoldRed, style::stderr_color());
+            eprintln!("{prefix}: {error:?}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     init_logging();
 
@@ -484,14 +800,14 @@ fn main() -> Result<()> {
     let config_flag = cli.config;
     let env = CliEnv::from_process();
     match cli.command {
-        Some(Commands::Tx {
+        Commands::Tx {
             message,
             output,
             profile,
             level,
             callsign,
             rig,
-        }) => {
+        } => {
             let layers = Layers::load(config_flag.as_deref(), env)?;
             let profile = layers.profile(profile.as_deref())?;
             let callsign = layers.callsign(callsign.as_deref())?;
@@ -500,31 +816,29 @@ fn main() -> Result<()> {
                 layers.print_verbose_source();
                 settings::print_setting("Callsign", &callsign);
                 settings::print_setting("Profile", &profile);
-                if output.is_none() {
+                if output.output.is_none() {
                     rig.print_verbose();
                 }
             }
             cmd_tx(
                 &message,
-                output.as_deref(),
+                output.target(),
                 profile.as_ref().map(|v| v.value.as_str()),
                 level,
                 &rig,
                 verbosity,
             )?;
         }
-        Some(Commands::Rx(args)) => {
-            resolve_rx_and_run(args, config_flag.as_deref(), env, verbosity)?
-        }
-        Some(Commands::Listen(args)) => {
-            eprintln!("{LISTEN_DEPRECATED}");
+        Commands::Rx(args) => resolve_rx_and_run(args, config_flag.as_deref(), env, verbosity)?,
+        Commands::Listen(args) => {
+            style::warn(LISTEN_DEPRECATED);
             resolve_rx_and_run(args, config_flag.as_deref(), env, verbosity)?;
         }
-        Some(Commands::Loopback {
+        Commands::Loopback {
             message,
             profile,
             level,
-        }) => {
+        } => {
             let layers = Layers::load(config_flag.as_deref(), env)?;
             let profile = layers.profile(profile.as_deref())?;
             if verbosity.is_verbose() {
@@ -538,41 +852,46 @@ fn main() -> Result<()> {
                 verbosity,
             )?;
         }
-        Some(Commands::Tune {
+        Commands::Tune {
+            duration,
             seconds,
             single,
             output,
             profile,
             rig,
-        }) => {
+        } => {
+            if seconds.is_some() {
+                style::warn(TUNE_SECONDS_DEPRECATED);
+            }
+            let seconds = seconds.unwrap_or(duration);
             let layers = Layers::load(config_flag.as_deref(), env)?;
             let profile = layers.profile(profile.as_deref())?;
             let rig = layers.rig(&rig)?;
             if verbosity.is_verbose() {
                 layers.print_verbose_source();
                 settings::print_setting("Profile", &profile);
-                if output.is_none() {
+                if output.output.is_none() {
                     rig.print_verbose();
                 }
             }
             cmd_tune(
                 seconds,
                 single,
-                output.as_deref(),
+                output.target(),
                 profile.as_ref().map(|v| v.value.as_str()),
                 &rig,
                 verbosity,
             )?;
         }
-        Some(Commands::Devices { json }) => cmd_devices(json)?,
-        Some(Commands::Doctor(args)) => doctor::cmd_doctor(&args)?,
-        Some(Commands::Profiles(args)) => cmd_profiles(&args)?,
-        Some(Commands::Config(args)) => {
-            eprintln!("{CONFIG_DEPRECATED}");
+        Commands::Devices { json } => cmd_devices(json)?,
+        Commands::Doctor(args) => doctor::cmd_doctor(&args)?,
+        Commands::Profiles(args) => cmd_profiles(&args)?,
+        Commands::Config(args) => {
+            style::warn(CONFIG_DEPRECATED);
             cmd_profiles(&args)?
         }
         #[cfg(feature = "kiss-tnc")]
-        Some(Commands::Tnc {
+        Commands::Tnc {
             port,
             device,
             input_device_id,
@@ -581,7 +900,7 @@ fn main() -> Result<()> {
             output_channel,
             rig,
             vox,
-        }) => cmd_tnc(
+        } => cmd_tnc(
             port,
             device,
             input_device_id,
@@ -591,10 +910,8 @@ fn main() -> Result<()> {
             rig,
             vox,
         )?,
-        None => {
-            println!("Coppa - Ham Radio Digital Communications System");
-            println!("Use --help for available commands");
-        }
+        Commands::Completions { shell } => cmd_completions(shell)?,
+        Commands::Man => cmd_man()?,
     }
 
     Ok(())
@@ -632,35 +949,164 @@ fn resolve_rx_and_run(
     Ok(())
 }
 
-/// Write `samples` to a WAV file at `path` (file-backend only) — shared by
-/// `cmd_tx`'s and `cmd_tune`'s file-output paths.
-fn write_wav_output(
-    path: &str,
+/// `coppa completions SHELL`. `clap_complete::generate` panics on a write
+/// error, so the script is built in memory and written through `emit_raw`.
+fn cmd_completions(shell: clap_complete::Shell) -> Result<()> {
+    let mut buf = Vec::new();
+    clap_complete::generate(shell, &mut completion_command(), "coppa", &mut buf);
+    emit_raw(&buf)
+}
+
+/// `Cli::command()` without its hidden subcommands. clap_complete offers
+/// hidden subcommands too, and the deprecated `listen`/`config` aliases
+/// should not be suggested to anyone.
+fn completion_command() -> clap::Command {
+    use clap::CommandFactory;
+    let full = Cli::command();
+    let visible: Vec<clap::Command> = full
+        .get_subcommands()
+        .filter(|sub| !sub.is_hide_set())
+        .cloned()
+        .collect();
+    clap::Command::new("coppa")
+        .version(env!("CARGO_PKG_VERSION"))
+        .args(full.get_arguments().cloned())
+        .subcommands(visible)
+}
+
+/// `coppa man`: the top-level coppa(1) page, generated from the real flags.
+fn cmd_man() -> Result<()> {
+    use clap::CommandFactory;
+    let mut buf = Vec::new();
+    clap_mangen::Man::new(Cli::command()).render(&mut buf)?;
+    emit_raw(&buf)
+}
+
+/// Refuse raw audio to a terminal: it is never what anyone wants.
+#[cfg_attr(not(feature = "file-backend"), allow(dead_code))]
+fn refuse_raw_stdout(is_terminal: bool) -> Result<()> {
+    if is_terminal {
+        anyhow::bail!(
+            "refusing to write raw audio to a terminal; redirect stdout, e.g. \
+             coppa tx MESSAGE -o - | aplay -f S16_LE -r 48000 -c 1"
+        );
+    }
+    Ok(())
+}
+
+/// Refuse raw audio from a terminal: nobody types PCM.
+#[cfg_attr(not(feature = "file-backend"), allow(dead_code))]
+fn refuse_raw_stdin(is_terminal: bool) -> Result<()> {
+    if is_terminal {
+        anyhow::bail!(
+            "refusing to read raw audio from a terminal; pipe it in, e.g. \
+             arecord -f S16_LE -r 48000 -c 1 -t raw | coppa rx -"
+        );
+    }
+    Ok(())
+}
+
+/// Write `samples` to a WAV file, or as raw PCM to stdout for `-`
+/// (file-backend only) — shared by `cmd_tx`'s and `cmd_tune`'s output paths.
+fn write_audio_output(
+    target: OutputTarget<'_>,
     samples: &[f32],
     sample_rate: u32,
     verbosity: Verbosity,
 ) -> Result<()> {
     #[cfg(feature = "file-backend")]
     {
-        use coppa_audio::{file_backend::WavSink, AudioSink};
-        let mut sink = WavSink::new(path, sample_rate);
-        sink.start()?;
-        sink.write(samples)?;
-        sink.stop()?;
-        if verbosity != Verbosity::Quiet {
-            println!("Written to {}", path);
+        use coppa_audio::AudioSink;
+        use std::io::IsTerminal;
+        let format = coppa_audio::PcmFormat::from(target.format);
+        if target.path == "-" {
+            refuse_raw_stdout(std::io::stdout().is_terminal())?;
+            let mut sink = coppa_audio::RawPcmWriter::new(
+                std::io::BufWriter::new(std::io::stdout()),
+                format,
+                sample_rate,
+            );
+            sink.start()?;
+            sink.write(samples).map_err(stdout_error)?;
+            sink.stop().map_err(stdout_error)?;
+            if verbosity != Verbosity::Quiet {
+                eprintln!("Written to stdout (raw {format}, mono, {sample_rate} Hz)");
+            }
+        } else {
+            let mut sink =
+                coppa_audio::WavSink::with_format(target.path, sample_rate, format.wav_format());
+            sink.start()?;
+            sink.write(samples)?;
+            sink.stop()?;
+            if verbosity != Verbosity::Quiet {
+                eprintln!("Written to {}", target.path);
+            }
         }
     }
     #[cfg(not(feature = "file-backend"))]
     {
-        let _ = path;
+        let _ = target;
         let _ = samples;
         let _ = sample_rate;
         if verbosity != Verbosity::Quiet {
-            println!("File output not available (compile with file-backend feature)");
+            eprintln!("File output not available (compile with file-backend feature)");
         }
     }
     Ok(())
+}
+
+// COP-83 adds these to coppa-engine; switch to them when #192 lands.
+/// Longest `coppa tune --duration`, in seconds.
+const MAX_TUNE_SECONDS: f32 = 120.0;
+/// Lowest `coppa tune --single` frequency, in Hz.
+const TUNE_SINGLE_MIN_HZ: f32 = 300.0;
+/// Highest `coppa tune --single` frequency, in Hz.
+const TUNE_SINGLE_MAX_HZ: f32 = 3000.0;
+
+/// Parse a finite number, or give `message` as clap's reason (COP-86).
+fn parse_finite(s: &str, message: &str) -> Result<f32, String> {
+    match s.trim().parse::<f32>() {
+        Ok(value) if value.is_finite() => Ok(value),
+        _ => Err(message.to_string()),
+    }
+}
+
+/// `coppa tune --duration`: more than 0 and at most `MAX_TUNE_SECONDS`. NaN,
+/// infinity and 0 used to write an empty file or panic (COP-86).
+fn tune_seconds(s: &str) -> Result<f32, String> {
+    let message = format!("must be more than 0 and at most {MAX_TUNE_SECONDS} seconds");
+    let value = parse_finite(s, &message)?;
+    if value > 0.0 && value <= MAX_TUNE_SECONDS {
+        Ok(value)
+    } else {
+        Err(message)
+    }
+}
+
+/// `coppa tune --single`: an audio tone inside the SSB passband.
+fn tune_single_hz(s: &str) -> Result<f32, String> {
+    let message = format!("must be between {TUNE_SINGLE_MIN_HZ} and {TUNE_SINGLE_MAX_HZ} Hz");
+    let value = parse_finite(s, &message)?;
+    if (TUNE_SINGLE_MIN_HZ..=TUNE_SINGLE_MAX_HZ).contains(&value) {
+        Ok(value)
+    } else {
+        Err(message)
+    }
+}
+
+/// A count such as `--ptt-lead-ms`: a whole number, 0 or more. clap's own
+/// parser calls `-5` an unexpected argument; this names the rule instead.
+fn whole_number(s: &str) -> Result<u64, String> {
+    s.trim()
+        .parse::<u64>()
+        .map_err(|_| "must be a whole number, 0 or more".to_string())
+}
+
+/// `coppa rx --duration`: whole seconds, 0 for no limit.
+fn rx_seconds(s: &str) -> Result<u64, String> {
+    s.trim()
+        .parse::<u64>()
+        .map_err(|_| "must be a whole number of seconds, 0 or more (0 = no limit)".to_string())
 }
 
 /// Validate the `--ptt <method>` value (COP-40): an unrecognized value is a
@@ -759,20 +1205,57 @@ const PLAYBACK_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 trait PlaybackClock {
     fn now(&self) -> std::time::Instant;
     fn sleep(&mut self, duration: std::time::Duration);
+    /// Ctrl-C or SIGTERM has arrived: stop transmitting (COP-86).
+    fn interrupted(&self) -> bool {
+        false
+    }
+    /// Sleep `duration`, in slices of at most `PLAYBACK_POLL`, stopping
+    /// early on an interrupt so a multi-second PTT lead or tail never delays
+    /// the release. Returns whether it was interrupted.
+    fn sleep_or_interrupt(&mut self, duration: std::time::Duration) -> bool {
+        let end = self.now() + duration;
+        loop {
+            if self.interrupted() {
+                return true;
+            }
+            let left = end.saturating_duration_since(self.now());
+            if left.is_zero() {
+                return false;
+            }
+            self.sleep(left.min(PLAYBACK_POLL));
+        }
+    }
 }
 
-/// The wall clock and a real thread sleep.
+/// The wall clock, a real thread sleep, and the process's signal flag.
 #[cfg(feature = "cpal-backend")]
-struct SystemClock;
+struct SystemClock<'a> {
+    interrupt: Option<&'a interrupt::Interrupt>,
+}
 
 #[cfg(feature = "cpal-backend")]
-impl PlaybackClock for SystemClock {
+impl PlaybackClock for SystemClock<'_> {
     fn now(&self) -> std::time::Instant {
         std::time::Instant::now()
     }
     fn sleep(&mut self, duration: std::time::Duration) {
         std::thread::sleep(duration);
     }
+    fn interrupted(&self) -> bool {
+        self.interrupt.is_some_and(interrupt::Interrupt::is_set)
+    }
+}
+
+/// `clock.sleep_or_interrupt` as a `Result`: `Err(Interrupted)` on Ctrl-C.
+#[cfg(feature = "cpal-backend")]
+fn sleep_unless_interrupted(
+    clock: &mut dyn PlaybackClock,
+    duration: std::time::Duration,
+) -> Result<()> {
+    if clock.sleep_or_interrupt(duration) {
+        return Err(interrupt::Interrupted.into());
+    }
+    Ok(())
 }
 
 /// Key PTT, wait `lead`, feed every sample of `samples` into `sink`
@@ -798,13 +1281,18 @@ fn play_keyed<S: coppa_audio::AudioSink>(
 ) -> Result<u64> {
     use coppa_radio::PttState;
 
-    let result = match ptt.set_ptt(PttState::Tx) {
-        Ok(()) => {
-            clock.sleep(lead);
-            feed_until_played(sink, &progress, &finish, samples, clock)
-                .inspect(|_| clock.sleep(tail))
-        }
-        Err(e) => Err(anyhow::anyhow!("failed to key PTT: {e}")),
+    // A Ctrl-C before keying never keys the rig at all.
+    let keyed = if clock.interrupted() {
+        Err(interrupt::Interrupted.into())
+    } else {
+        ptt.set_ptt(PttState::Tx)
+            .map_err(|e| anyhow::anyhow!("failed to key PTT: {e}"))
+    };
+    let result = match keyed {
+        Ok(()) => sleep_unless_interrupted(clock, lead)
+            .and_then(|()| feed_until_played(sink, &progress, &finish, samples, clock))
+            .and_then(|delivered| sleep_unless_interrupted(clock, tail).map(|()| delivered)),
+        Err(e) => Err(e),
     };
 
     let release = ptt
@@ -812,6 +1300,12 @@ fn play_keyed<S: coppa_audio::AudioSink>(
         .map_err(|e| anyhow::anyhow!("failed to release PTT: {e}"));
     let stopped = sink.stop();
     match result {
+        // Keep the type, so `main` can report a clean interrupt with 130.
+        Err(primary)
+            if primary.is::<interrupt::Interrupted>() && release.is_ok() && stopped.is_ok() =>
+        {
+            Err(primary)
+        }
         Err(primary) => {
             let mut message = primary.to_string();
             if let Err(e) = release {
@@ -851,6 +1345,9 @@ fn feed_until_played<S: coppa_audio::AudioSink>(
     let mut last_progress_at = clock.now();
     let mut finished = false;
     loop {
+        if clock.interrupted() {
+            return Err(interrupt::Interrupted.into());
+        }
         if offset < samples.len() {
             let written = sink.write(&samples[offset..])?;
             let written = written.min(samples.len() - offset);
@@ -922,14 +1419,14 @@ fn resolve_cli_output_device(
         Ok(device) => Ok(device),
         Err(error) => match error.downcast_ref::<coppa_audio::DeviceSelectionError>() {
             Some(coppa_audio::DeviceSelectionError::MissingName { .. }) => {
-                eprintln!(
-                    "WARNING: No output device matching '{}', using default",
+                style::warn(format_args!(
+                    "No output device matching '{}', using default",
                     selection.name.unwrap_or_default()
-                );
+                ));
                 Ok(None)
             }
             Some(coppa_audio::DeviceSelectionError::AmbiguousName { .. }) => {
-                eprintln!("WARNING: {error}");
+                style::warn(&error);
                 anyhow::bail!("ambiguous output audio device")
             }
             _ => Err(error),
@@ -946,14 +1443,14 @@ fn resolve_cli_input_device(
         Ok(device) => Ok(device),
         Err(error) => match error.downcast_ref::<coppa_audio::DeviceSelectionError>() {
             Some(coppa_audio::DeviceSelectionError::MissingName { .. }) => {
-                eprintln!(
-                    "WARNING: No input device matching '{}', using default",
+                style::warn(format_args!(
+                    "No input device matching '{}', using default",
                     name.unwrap_or_default()
-                );
+                ));
                 Ok(None)
             }
             Some(coppa_audio::DeviceSelectionError::AmbiguousName { .. }) => {
-                eprintln!("WARNING: {error}");
+                style::warn(&error);
                 anyhow::bail!("ambiguous input audio device")
             }
             _ => Err(error),
@@ -988,6 +1485,8 @@ fn transmit_live(
 
     // Create PTT controller
     let mut ptt_ctrl = build_ptt(ptt, rigctld_addr)?;
+    // Before keying: a Ctrl-C from here on releases PTT (COP-86).
+    let interrupt = interrupt::Interrupt::install()?;
 
     // COP-40: refuse a wideband emission below 29.7 MHz before any audio
     // device is opened or PTT keyed.
@@ -1009,10 +1508,13 @@ fn transmit_live(
         selection.channel,
     )?;
     if sink.hardware_rate() != sample_rate {
-        eprintln!(
-            "WARNING: output audio device {} uses {} Hz hardware rate (requested {} Hz, engine {} Hz)",
-            sink.device_name(), sink.hardware_rate(), sample_rate, sample_rate
-        );
+        style::warn(format_args!(
+            "output audio device {} uses {} Hz hardware rate (requested {} Hz, engine {} Hz)",
+            sink.device_name(),
+            sink.hardware_rate(),
+            sample_rate,
+            sample_rate
+        ));
     }
     if verbosity.is_verbose() {
         eprintln!(
@@ -1035,7 +1537,9 @@ fn transmit_live(
         samples,
         std::time::Duration::from_millis(ptt_lead_ms),
         std::time::Duration::from_millis(ptt_tail_ms),
-        &mut SystemClock,
+        &mut SystemClock {
+            interrupt: Some(&interrupt),
+        },
     )?;
 
     if verbosity != Verbosity::Quiet {
@@ -1048,7 +1552,7 @@ fn transmit_live(
 
 fn cmd_tx(
     message: &str,
-    output: Option<&str>,
+    output: Option<OutputTarget<'_>>,
     profile: Option<&str>,
     level: Option<u8>,
     rig: &RigSettings,
@@ -1065,11 +1569,11 @@ fn cmd_tx(
     }
 
     if verbosity != Verbosity::Quiet {
-        println!("Encoding: \"{}\"", message);
+        eprintln!("Encoding: \"{}\"", message);
     }
     let samples = core.encode(message)?;
     if verbosity != Verbosity::Quiet {
-        println!("Generated {} audio samples", samples.len());
+        eprintln!("Generated {} audio samples", samples.len());
     }
     if verbosity.is_verbose() {
         let duration_s = samples.len() as f64 / core.config().sample_rate as f64;
@@ -1077,7 +1581,7 @@ fn cmd_tx(
     }
 
     match output {
-        Some(path) => write_wav_output(path, &samples, core.config().sample_rate, verbosity)?,
+        Some(target) => write_audio_output(target, &samples, core.config().sample_rate, verbosity)?,
         None => {
             // Offline WAV rendering (the `Some` arm) emits no RF and is never
             // gated; live transmission is (COP-40).
@@ -1111,7 +1615,9 @@ fn cmd_tx(
                 cli_gate_decision(gate.profile, gate.occupied_hz, None, gate.stated)?;
                 let _ = rig;
                 if verbosity != Verbosity::Quiet {
-                    println!("Live audio output not available (compile with cpal-backend feature)");
+                    eprintln!(
+                        "Live audio output not available (compile with cpal-backend feature)"
+                    );
                 }
             }
         }
@@ -1137,7 +1643,7 @@ fn tune_occupied_hz(single: Option<f32>) -> u32 {
 fn cmd_tune(
     seconds: f32,
     single: Option<f32>,
-    output: Option<&str>,
+    output: Option<OutputTarget<'_>>,
     profile: Option<&str>,
     rig: &RigSettings,
     verbosity: Verbosity,
@@ -1147,11 +1653,11 @@ fn cmd_tune(
 
     if verbosity != Verbosity::Quiet {
         match single {
-            Some(freq) => println!(
+            Some(freq) => eprintln!(
                 "Generating single-tone calibration signal: {} Hz, {:.1}s",
                 freq, seconds
             ),
-            None => println!(
+            None => eprintln!(
                 "Generating two-tone calibration signal: {} Hz + {} Hz, {:.1}s",
                 coppa_engine::TUNE_TONE_LOW_HZ,
                 coppa_engine::TUNE_TONE_HIGH_HZ,
@@ -1162,11 +1668,11 @@ fn cmd_tune(
 
     let samples = core.tune_tone(seconds, single);
     if verbosity != Verbosity::Quiet {
-        println!("Generated {} audio samples", samples.len());
+        eprintln!("Generated {} audio samples", samples.len());
     }
 
     match output {
-        Some(path) => write_wav_output(path, &samples, core.config().sample_rate, verbosity)?,
+        Some(target) => write_audio_output(target, &samples, core.config().sample_rate, verbosity)?,
         None => {
             // Offline WAV rendering (the `Some` arm) emits no RF and is never
             // gated; live transmission is (COP-40).
@@ -1200,7 +1706,9 @@ fn cmd_tune(
                 cli_gate_decision(gate.profile, gate.occupied_hz, None, gate.stated)?;
                 let _ = rig;
                 if verbosity != Verbosity::Quiet {
-                    println!("Live audio output not available (compile with cpal-backend feature)");
+                    eprintln!(
+                        "Live audio output not available (compile with cpal-backend feature)"
+                    );
                 }
             }
         }
@@ -1232,7 +1740,79 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
         eprintln!("[verbose] sample_rate: {}", core.config().sample_rate);
     }
 
-    if let Some(path) = args.path() {
+    if args.sample_format.is_some() && args.path() != Some("-") {
+        anyhow::bail!(
+            "--sample-format applies only to raw PCM on stdin (rx -); a WAV file's header sets its format"
+        );
+    }
+    // Before the first status line: callers (and the tests) may signal as
+    // soon as they see it.
+    let interrupt = interrupt::Interrupt::install()?;
+    let chatty = status_enabled(verbosity, args.raw, args.json);
+    #[cfg(not(any(feature = "file-backend", feature = "cpal-backend")))]
+    let _ = (&interrupt, chatty);
+
+    if args.path() == Some("-") {
+        #[cfg(feature = "file-backend")]
+        {
+            use coppa_audio::AudioSource;
+            use std::io::IsTerminal;
+            refuse_raw_stdin(std::io::stdin().is_terminal())?;
+            let rate = core.config().sample_rate;
+            let format = coppa_audio::PcmFormat::from(args.sample_format.unwrap_or_default());
+            let mut source = coppa_audio::RawPcmReader::new(std::io::stdin(), format, rate);
+            // Status first: the header check blocks until the producer
+            // writes, and the operator should see what coppa is waiting for.
+            if chatty {
+                eprintln!(
+                    "Reading raw {format} audio (mono, {rate} Hz) from stdin (Ctrl+C to stop)..."
+                );
+            }
+            if source.starts_with_wav_header()? {
+                anyhow::bail!(
+                    "stdin starts with a WAV header; pass the file instead (coppa rx FILE) or send headerless PCM"
+                );
+            }
+            source.start()?;
+            let total_samples =
+                (args.duration > 0).then(|| file_sample_limit(usize::MAX, args.duration, rate));
+            let summary = stream_decode(
+                &mut core,
+                &mut source,
+                StopWhen {
+                    total_samples,
+                    interrupt: Some(&interrupt),
+                    eof_on_empty_read: true,
+                    ..StopWhen::default()
+                },
+                output_mode,
+                args.profile.as_deref().unwrap_or("default"),
+                verbosity,
+            )?;
+            source.stop()?;
+            if chatty && summary.interrupted {
+                eprintln!("{}", summary.stop_line(rate));
+            }
+            summary.finish(|| {
+                format!(
+                    "no frames decoded from stdin ({} samples at {} Hz; profile {}); check for a complete Coppa frame and a matching --profile",
+                    summary.consumed_samples,
+                    rate,
+                    args.profile.as_deref().unwrap_or("default")
+                )
+            })?;
+        }
+        #[cfg(not(feature = "file-backend"))]
+        {
+            let _ = &mut core;
+            if args.json {
+                anyhow::bail!("Raw stdin input not available (compile with file-backend feature)");
+            }
+            if verbosity != Verbosity::Quiet {
+                eprintln!("Raw stdin input not available (compile with file-backend feature)");
+            }
+        }
+    } else if let Some(path) = args.path() {
         #[cfg(feature = "file-backend")]
         {
             use coppa_audio::{file_backend::WavSource, AudioSource};
@@ -1247,37 +1827,42 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
             let total = source.total_samples();
             // The checked WAV rate is the engine rate; no resampling occurs.
             let limit = file_sample_limit(total, args.duration, source.sample_rate());
-            if verbosity != Verbosity::Quiet && !args.raw && !args.json {
+            if chatty {
                 if limit < total {
-                    println!(
+                    eprintln!(
                         "Reading the first {} s ({} of {} samples) from {}",
                         args.duration, limit, total, path
                     );
                 } else {
-                    println!("Reading {} samples from {}", total, path);
+                    eprintln!("Reading {} samples from {}", total, path);
                 }
             }
             source.start()?;
             let summary = stream_decode(
                 &mut core,
                 &mut source,
-                Some(limit),
-                None,
+                StopWhen {
+                    total_samples: Some(limit),
+                    interrupt: Some(&interrupt),
+                    ..StopWhen::default()
+                },
                 output_mode,
                 args.profile.as_deref().unwrap_or("default"),
                 verbosity,
             )?;
             source.stop()?;
-            summary.check_failure()?;
-            if summary.good_frames == 0 {
-                anyhow::bail!(
+            if chatty && summary.interrupted {
+                eprintln!("{}", summary.stop_line(source.sample_rate()));
+            }
+            summary.finish(|| {
+                format!(
                     "no frames decoded from {} ({} samples at {} Hz; profile {}); check for a complete Coppa frame and a matching --profile",
                     path,
                     summary.consumed_samples,
                     source.sample_rate(),
                     args.profile.as_deref().unwrap_or("default")
-                );
-            }
+                )
+            })?;
         }
         #[cfg(not(feature = "file-backend"))]
         {
@@ -1287,7 +1872,7 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 anyhow::bail!("File input not available (compile with file-backend feature)");
             }
             if verbosity != Verbosity::Quiet {
-                println!("File input not available (compile with file-backend feature)");
+                eprintln!("File input not available (compile with file-backend feature)");
             }
         }
     } else {
@@ -1305,10 +1890,13 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 args.input_channel,
             )?;
             if source.hardware_rate() != engine_rate {
-                eprintln!(
-                    "WARNING: input audio device {} uses {} Hz hardware rate (requested {} Hz, engine {} Hz)",
-                    source.device_name(), source.hardware_rate(), engine_rate, engine_rate
-                );
+                style::warn(format_args!(
+                    "input audio device {} uses {} Hz hardware rate (requested {} Hz, engine {} Hz)",
+                    source.device_name(),
+                    source.hardware_rate(),
+                    engine_rate,
+                    engine_rate
+                ));
             }
             if verbosity.is_verbose() {
                 eprintln!(
@@ -1319,32 +1907,34 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 );
             }
             source.start()?;
-            let chatty = verbosity != Verbosity::Quiet && !args.raw && !args.json;
             if chatty {
                 if args.duration > 0 {
-                    println!(
+                    eprintln!(
                         "Listening for live audio for {} s (Ctrl+C to stop)...",
                         args.duration
                     );
                 } else {
-                    println!("Listening for live audio (Ctrl+C to stop)...");
+                    eprintln!("Listening for live audio (Ctrl+C to stop)...");
                 }
             }
             let deadline = live_deadline(std::time::Instant::now(), args.duration);
             let summary = stream_decode(
                 &mut core,
                 &mut source,
-                None,
-                deadline,
+                StopWhen {
+                    deadline,
+                    interrupt: Some(&interrupt),
+                    ..StopWhen::default()
+                },
                 output_mode,
                 args.profile.as_deref().unwrap_or("default"),
                 verbosity,
             )?;
             source.stop()?;
-            summary.check_failure()?;
-            if chatty && args.duration > 0 {
-                println!("Stopped listening after {} s.", args.duration);
+            if chatty {
+                eprintln!("{}", summary.stop_line(engine_rate));
             }
+            summary.check_failure()?;
         }
         #[cfg(not(feature = "cpal-backend"))]
         {
@@ -1359,7 +1949,7 @@ fn cmd_rx(args: &RxArgs, verbosity: Verbosity) -> Result<()> {
                 anyhow::bail!("Live audio input not available (compile with cpal-backend feature)");
             }
             if verbosity != Verbosity::Quiet {
-                println!("Live audio input not available (compile with cpal-backend feature)");
+                eprintln!("Live audio input not available (compile with cpal-backend feature)");
             }
         }
     }
@@ -1424,6 +2014,10 @@ const TRAILING_FLUSH_SAMPLES: usize = 8192;
 /// Every normal return then pushes `TRAILING_FLUSH_SAMPLES` of silence so a
 /// frame that ends right at the file's end (or just before a live deadline)
 /// can still complete (see that constant's doc).
+#[cfg_attr(
+    not(any(feature = "file-backend", feature = "cpal-backend")),
+    allow(dead_code)
+)]
 #[derive(Default)]
 struct DecodeSummary {
     good_frames: usize,
@@ -1431,9 +2025,44 @@ struct DecodeSummary {
     first_error: Option<String>,
     consumed_samples: usize,
     report_live_errors: bool,
+    /// Reading stopped because of Ctrl-C or SIGTERM (COP-86).
+    interrupted: bool,
+    /// Level warnings printed during the read, such as clipping (COP-86).
+    warnings: Vec<String>,
 }
 
+#[cfg_attr(
+    not(any(feature = "file-backend", feature = "cpal-backend")),
+    allow(dead_code)
+)]
 impl DecodeSummary {
+    /// The line an ended capture prints on stderr (COP-86), e.g.
+    /// `Stopped after 42.3 s of audio: 1 frame decoded, 0 failed.`
+    fn stop_line(&self, sample_rate: u32) -> String {
+        let seconds = self.consumed_samples as f64 / f64::from(sample_rate.max(1));
+        let noun = if self.good_frames == 1 {
+            "frame"
+        } else {
+            "frames"
+        };
+        format!(
+            "Stopped after {seconds:.1} s of audio: {} {noun} decoded, {} failed.",
+            self.good_frames, self.failed_frames
+        )
+    }
+
+    /// `coppa rx`'s exit for a finished read: a decode failure is an error;
+    /// with no frames at all, an input that ended by itself (a file, or stdin
+    /// at EOF) is an error too, while a capture the operator stopped is not.
+    #[cfg_attr(not(feature = "file-backend"), allow(dead_code))]
+    fn finish(&self, no_frames: impl FnOnce() -> String) -> Result<()> {
+        self.check_failure()?;
+        if self.good_frames == 0 && !self.interrupted {
+            anyhow::bail!("{}", no_frames());
+        }
+        Ok(())
+    }
+
     fn check_failure(&self) -> Result<()> {
         if let Some(error) = &self.first_error {
             anyhow::bail!("{error}");
@@ -1442,18 +2071,47 @@ impl DecodeSummary {
     }
 }
 
+/// When `stream_decode` stops reading.
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(
+    not(any(feature = "file-backend", feature = "cpal-backend")),
+    allow(dead_code)
+)]
+struct StopWhen<'a> {
+    /// After this many samples (a file, or `rx - -d N`).
+    total_samples: Option<usize>,
+    /// When Ctrl-C or SIGTERM arrives.
+    interrupt: Option<&'a interrupt::Interrupt>,
+    /// At this instant (live `--duration`).
+    deadline: Option<std::time::Instant>,
+    /// At the first empty read: the source returns 0 only at end of stream
+    /// (`rx -`), rather than when no audio has arrived yet (live capture).
+    eof_on_empty_read: bool,
+}
+
 fn stream_decode(
     core: &mut CoppaCore,
     source: &mut dyn coppa_audio::AudioSource,
-    total_samples: Option<usize>,
-    deadline: Option<std::time::Instant>,
+    stop: StopWhen<'_>,
     output_mode: RxOutputMode,
     profile: &str,
     verbosity: Verbosity,
 ) -> Result<DecodeSummary> {
+    let StopWhen {
+        total_samples,
+        interrupt,
+        deadline,
+        eof_on_empty_read,
+    } = stop;
     let mut buf = vec![0.0f32; 4096];
+    // The daemon's meter and wording: a warning each time the input starts
+    // clipping (COP-86). Underdrive is not reported, because it would fire
+    // on the silent stretches of ordinary recordings.
+    let mut meter = coppa_daemon::level_meter::RxLevelMeter::new(source.sample_rate());
     let mut summary = DecodeSummary {
-        report_live_errors: total_samples.is_none(),
+        // A live capture or a stream (`rx -`, with or without -d) reports
+        // failures as they happen; a file reports them at the end.
+        report_live_errors: total_samples.is_none() || eof_on_empty_read,
         ..DecodeSummary::default()
     };
     while total_samples.is_none_or(|total| summary.consumed_samples < total) {
@@ -1463,11 +2121,28 @@ fn stream_decode(
         let n = source.read(&mut buf[..want])?;
         if n > 0 {
             summary.consumed_samples += n;
+            for update in meter.observe(&buf[..n]) {
+                if update.transition == Some(coppa_daemon::level_meter::LevelState::Clipping) {
+                    let message = coppa_daemon::level_meter::rx_transition_message(
+                        coppa_daemon::level_meter::LevelState::Clipping,
+                        &update.reading,
+                    );
+                    style::warn(message);
+                    summary.warnings.push(message.to_string());
+                }
+            }
             for frame in core.push_samples(&buf[..n]) {
                 handle_stream_frame(core, &frame, &mut summary, output_mode, profile, verbosity)?;
             }
         }
+        if interrupt.is_some_and(interrupt::Interrupt::is_set) {
+            summary.interrupted = true;
+            break;
+        }
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        if n == 0 && eof_on_empty_read {
             break;
         }
         if n == 0 && total_samples.is_none() {
@@ -1534,10 +2209,8 @@ fn handle_stream_frame(
             }
             summary.good_frames += 1;
             match output_mode {
-                RxOutputMode::Raw => println!("{}", hex_string(bytes)),
-                RxOutputMode::Text { hex } => {
-                    println!("{}", format_decoded(bytes, frame.snr_db, hex));
-                }
+                RxOutputMode::Raw => emit(hex_string(bytes))?,
+                RxOutputMode::Text { hex } => emit(format_decoded(bytes, frame.snr_db, hex))?,
                 RxOutputMode::Json => write_json(&RxFrameOutput::from_frame(frame, bytes))?,
             }
             if verbosity.is_verbose() {
@@ -1572,9 +2245,9 @@ fn cmd_loopback(
     verbosity: Verbosity,
 ) -> Result<()> {
     if verbosity != Verbosity::Quiet {
-        println!("Coppa Loopback Test");
-        println!("===================");
-        println!("Input: \"{}\"", message);
+        emit("Coppa Loopback Test")?;
+        emit("===================")?;
+        emit(format_args!("Input: \"{}\"", message))?;
     }
 
     let core = build_core(profile, level)?;
@@ -1589,22 +2262,23 @@ fn cmd_loopback(
 
     let samples = core.encode(message)?;
     if verbosity != Verbosity::Quiet {
-        println!("Encoded: {} samples", samples.len());
+        emit(format_args!("Encoded: {} samples", samples.len()))?;
     }
 
     let decoded = core.decode(&samples)?;
     if verbosity != Verbosity::Quiet {
-        println!("Decoded: \"{}\"", decoded);
+        emit(format_args!("Decoded: \"{}\"", decoded))?;
     }
 
     if message == decoded {
         if verbosity != Verbosity::Quiet {
-            println!("PASS: Loopback test successful!");
+            emit("PASS: Loopback test successful!")?;
         }
     } else {
-        println!("FAIL: Messages don't match!");
-        println!("  Expected: \"{}\"", message);
-        println!("  Got:      \"{}\"", decoded);
+        // Best effort: a closed stdout must not turn this failure into exit 0.
+        let _ = emit("FAIL: Messages don't match!")
+            .and_then(|()| emit(format_args!("  Expected: \"{}\"", message)))
+            .and_then(|()| emit(format_args!("  Got:      \"{}\"", decoded)));
         std::process::exit(1);
     }
 
@@ -1613,31 +2287,56 @@ fn cmd_loopback(
 
 fn cmd_devices(json: bool) -> Result<()> {
     let devices = coppa_audio::list_devices()?;
+    let support = coppa_audio::list_device_support(DEVICES_RATE_HZ);
+    let defaults = coppa_audio::default_devices();
     if json {
-        let output: Vec<_> = devices.iter().map(DeviceOutput::from).collect();
+        let output: Vec<_> = devices
+            .iter()
+            .map(|device| DeviceOutput::new(device, &support, &defaults))
+            .collect();
         return write_json(&output);
     }
-    for line in device_lines(&devices) {
-        println!("{line}");
+    for line in device_lines(&devices, &support, &defaults) {
+        emit(line)?;
     }
     Ok(())
 }
 
-fn device_lines(devices: &[coppa_audio::AudioDevice]) -> Vec<String> {
+fn device_lines(
+    devices: &[coppa_audio::AudioDevice],
+    support: &Result<Vec<coppa_audio::DeviceSupport>>,
+    defaults: &coppa_audio::DefaultDevices,
+) -> Vec<String> {
     let mut lines = vec!["Available audio devices:".to_string()];
     if devices.is_empty() {
         lines.push("  (none found - CPAL backend may not be available)".to_string());
-    } else {
-        lines.extend(devices.iter().map(|dev| {
-            format!(
-                "  {} [id: {}] (in: {}ch, out: {}ch, max: {} Hz)",
-                dev.name,
-                dev.id.as_deref().unwrap_or("unavailable"),
-                dev.input_channels,
-                dev.output_channels,
-                dev.max_sample_rate,
-            )
-        }));
+        return lines;
+    }
+    lines.extend(devices.iter().map(|dev| {
+        let rate = match rate_support(dev, support) {
+            None => "unknown",
+            Some((Some(true), Some(true))) => "in+out",
+            Some((Some(true), _)) => "in",
+            Some((_, Some(true))) => "out",
+            Some(_) => "no",
+        };
+        format!(
+            "  {} [id: {}] (in: {}ch, out: {}ch, 48 kHz: {rate})",
+            dev.name,
+            dev.id.as_deref().unwrap_or("unavailable"),
+            dev.input_channels,
+            dev.output_channels,
+        )
+    }));
+    for (label, default) in [("input", &defaults.input), ("output", &defaults.output)] {
+        lines.push(match default {
+            Some(device) => format!(
+                "Default {label}: {} [id: {}]",
+                device.name,
+                device.id.as_deref().unwrap_or("unavailable")
+            ),
+            None => format!("Default {label}: none"),
+        });
     }
     lines
 }
@@ -1649,8 +2348,7 @@ fn cmd_profiles(args: &ProfilesArgs) -> Result<()> {
     if args.json {
         return write_json_profiles(args);
     }
-    print!("{}", render_profiles(args)?);
-    Ok(())
+    emit_raw(render_profiles(args)?.as_bytes())
 }
 
 /// `profiles --json`: an array of every named profile, one profile object with
@@ -1981,11 +2679,41 @@ mod tests {
             input_channels: 1,
             output_channels: 2,
         };
-        let value = serde_json::to_value(DeviceOutput::from(&device)).unwrap();
+        let unknown = Err(anyhow::anyhow!("listing failed"));
+        let value = serde_json::to_value(DeviceOutput::new(&device, &unknown, &Default::default()))
+            .unwrap();
         assert_eq!(value["name"], device.name);
         assert_eq!(value["id"], "alsa:radio-a");
         assert_eq!(value["max_sample_rate_hz"], 48_000);
-        assert_eq!(value.as_object().unwrap().len(), 5);
+        assert_eq!(value["input_channels"], 1);
+        assert_eq!(value["output_channels"], 2);
+        assert_eq!(value["input_supports_48000_hz"], serde_json::Value::Null);
+        assert_eq!(value["output_supports_48000_hz"], serde_json::Value::Null);
+        assert_eq!(value["is_default_input"], false);
+        assert_eq!(value["is_default_output"], false);
+        assert_eq!(value.as_object().unwrap().len(), 9);
+
+        let support = Ok(vec![coppa_audio::DeviceSupport {
+            name: device.name.clone(),
+            id: "alsa:radio-a".into(),
+            input: Some(coppa_audio::Support::Yes(coppa_audio::OpenedFormat {
+                channels: 1,
+                sample_rate: 48_000,
+            })),
+            output: None,
+        }]);
+        let defaults = coppa_audio::DefaultDevices {
+            input: Some(coppa_audio::DefaultDevice {
+                name: "USB".into(),
+                id: Some("alsa:radio-a".into()),
+            }),
+            output: None,
+        };
+        let value = serde_json::to_value(DeviceOutput::new(&device, &support, &defaults)).unwrap();
+        assert_eq!(value["input_supports_48000_hz"], true);
+        assert_eq!(value["output_supports_48000_hz"], serde_json::Value::Null);
+        assert_eq!(value["is_default_input"], true);
+        assert_eq!(value["is_default_output"], false);
     }
 
     #[test]
@@ -2083,7 +2811,10 @@ mod tests {
         let path_str = path.to_str().unwrap();
         cmd_tx(
             "test message",
-            Some(path_str),
+            Some(OutputTarget {
+                path: path_str,
+                format: SampleFormat::F32le,
+            }),
             None,
             None,
             &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
@@ -2105,7 +2836,10 @@ mod tests {
         cmd_tune(
             0.5,
             None,
-            Some(path_str),
+            Some(OutputTarget {
+                path: path_str,
+                format: SampleFormat::F32le,
+            }),
             None,
             &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
             Verbosity::Normal,
@@ -2126,7 +2860,10 @@ mod tests {
         cmd_tune(
             0.5,
             Some(1500.0),
-            Some(path_str),
+            Some(OutputTarget {
+                path: path_str,
+                format: SampleFormat::F32le,
+            }),
             None,
             &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
             Verbosity::Quiet,
@@ -2146,7 +2883,10 @@ mod tests {
         let path_str = path.to_str().unwrap();
         cmd_tx(
             "CQ CQ",
-            Some(path_str),
+            Some(OutputTarget {
+                path: path_str,
+                format: SampleFormat::F32le,
+            }),
             None,
             None,
             &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
@@ -2178,7 +2918,7 @@ mod tests {
 
     fn profiles_args(args: &[&str]) -> ProfilesArgs {
         match parse(args).expect("valid profiles args").command {
-            Some(Commands::Profiles(args)) | Some(Commands::Config(args)) => args,
+            Commands::Profiles(args) | Commands::Config(args) => args,
             _ => panic!("expected profiles or config"),
         }
     }
@@ -2224,7 +2964,7 @@ mod tests {
             let config: Vec<&str> = std::iter::once("config").chain(flags).collect();
             assert!(matches!(
                 parse(&config).unwrap().command,
-                Some(Commands::Config(_))
+                Commands::Config(_)
             ));
             assert_eq!(profiles_args(&config), profiles_args(&profiles));
         }
@@ -2346,11 +3086,11 @@ mod tests {
     #[test]
     fn tx_and_loopback_parse_level() {
         match parse(&["tx", "CQ", "--level", "4"]).unwrap().command {
-            Some(Commands::Tx { level, .. }) => assert_eq!(level, Some(4)),
+            Commands::Tx { level, .. } => assert_eq!(level, Some(4)),
             _ => panic!("expected tx"),
         }
         match parse(&["loopback", "CQ", "--level", "9"]).unwrap().command {
-            Some(Commands::Loopback { level, .. }) => assert_eq!(level, Some(9)),
+            Commands::Loopback { level, .. } => assert_eq!(level, Some(9)),
             _ => panic!("expected loopback"),
         }
     }
@@ -2454,7 +3194,7 @@ mod tests {
             "500",
         ]);
         match cli.command {
-            Some(Commands::Tx { rig, .. }) => {
+            Commands::Tx { rig, .. } => {
                 assert_eq!(rig.rigctld.as_deref(), Some("192.168.1.50:4532"));
                 assert_eq!(rig.ptt_lead_ms, Some(75));
                 assert_eq!(rig.ptt_tail_ms, Some(500));
@@ -2467,7 +3207,7 @@ mod tests {
     fn test_cli_tx_ptt_flags_default() {
         let cli = Cli::parse_from(["coppa", "tx", "hello"]);
         match cli.command {
-            Some(Commands::Tx { rig, .. }) => {
+            Commands::Tx { rig, .. } => {
                 assert_eq!(rig.ptt, None);
                 assert_eq!(rig.rigctld, None);
                 assert_eq!(rig.ptt_lead_ms, None);
@@ -2490,7 +3230,7 @@ mod tests {
             "20",
         ]);
         match cli.command {
-            Some(Commands::Tune { rig, .. }) => {
+            Commands::Tune { rig, .. } => {
                 assert_eq!(rig.rigctld.as_deref(), Some("10.0.0.5:4532"));
                 assert_eq!(rig.ptt_lead_ms, Some(10));
                 assert_eq!(rig.ptt_tail_ms, Some(20));
@@ -2503,7 +3243,7 @@ mod tests {
     fn test_cli_tune_ptt_flags_default() {
         let cli = Cli::parse_from(["coppa", "tune"]);
         match cli.command {
-            Some(Commands::Tune { rig, .. }) => {
+            Commands::Tune { rig, .. } => {
                 assert_eq!(rig.ptt, None);
                 assert_eq!(rig.rigctld, None);
                 assert_eq!(rig.ptt_lead_ms, None);
@@ -2542,6 +3282,8 @@ mod tests {
             pub fail_unkey: bool,
             pub events: Vec<(Duration, String)>,
             fractional: f64,
+            /// Simulated Ctrl-C at this offset from `start`.
+            pub interrupt_at: Option<Duration>,
         }
 
         impl Device {
@@ -2565,6 +3307,7 @@ mod tests {
                     fail_unkey: false,
                     events: Vec::new(),
                     fractional: 0.0,
+                    interrupt_at: None,
                 }))
             }
 
@@ -2642,6 +3385,28 @@ mod tests {
                     d.log(format!("sleep {}ms", duration.as_millis()));
                 }
                 d.advance(duration);
+            }
+            fn interrupted(&self) -> bool {
+                let d = self.0.lock().unwrap();
+                d.interrupt_at
+                    .is_some_and(|at| d.now.saturating_duration_since(d.start) >= at)
+            }
+            // One logged sleep, cut short at the simulated interrupt.
+            fn sleep_or_interrupt(&mut self, duration: Duration) -> bool {
+                let (now, at) = {
+                    let d = self.0.lock().unwrap();
+                    (d.now, d.interrupt_at.map(|at| d.start + at))
+                };
+                match at {
+                    Some(at) if at < now + duration => {
+                        self.sleep(at.saturating_duration_since(now));
+                        true
+                    }
+                    _ => {
+                        self.sleep(duration);
+                        false
+                    }
+                }
             }
         }
 
@@ -2891,6 +3656,97 @@ mod tests {
         assert_eq!(event_names(&device), ["ptt TX", "ptt RX", "stop"]);
     }
 
+    /// COP-86: Ctrl-C during the lead, the feed or the tail unkeys and
+    /// stops at once, and returns the `Interrupted` type `main` maps to 130.
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn play_keyed_interrupted_releases_ptt() {
+        let samples = vec![0.25f32; 48_000];
+        // (interrupt at, lead, tail): during the 1 s lead, during the 1 s of
+        // audio after a 100 ms lead, and during the 3 s tail.
+        for (at_ms, lead_ms, tail_ms) in [(500, 1_000, 200), (600, 100, 200), (2_000, 100, 3_000)] {
+            let device = sim::Device::new(std::time::Duration::ZERO);
+            device.lock().unwrap().interrupt_at = Some(std::time::Duration::from_millis(at_ms));
+            let error = run_play_keyed(&device, &samples, lead_ms, tail_ms).unwrap_err();
+            assert!(error.is::<interrupt::Interrupted>(), "{at_ms} ms: {error}");
+            let names = event_names(&device);
+            assert_eq!(
+                names.first().map(String::as_str),
+                Some("ptt TX"),
+                "{names:?}"
+            );
+            assert_eq!(&names[names.len() - 2..], ["ptt RX", "stop"], "{names:?}");
+            let unkey = event_time(&device, "ptt RX");
+            assert!(
+                unkey >= std::time::Duration::from_millis(at_ms)
+                    && unkey < std::time::Duration::from_millis(at_ms + 10),
+                "{at_ms} ms: unkeyed at {unkey:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn play_keyed_interrupt_with_failed_release_is_a_plain_error() {
+        let device = sim::Device::new(std::time::Duration::ZERO);
+        {
+            let mut d = device.lock().unwrap();
+            d.interrupt_at = Some(std::time::Duration::from_millis(10));
+            d.fail_unkey = true;
+        }
+        let error = run_play_keyed(&device, &[0.25; 48_000], 1_000, 200).unwrap_err();
+        assert!(!error.is::<interrupt::Interrupted>(), "{error}");
+        assert!(
+            error
+                .to_string()
+                .starts_with("interrupted; cleanup: failed to release PTT"),
+            "{error}"
+        );
+        assert_eq!(
+            event_names(&device).last().map(String::as_str),
+            Some("stop")
+        );
+    }
+
+    /// The real clock's sliced sleep notices an interrupt between slices.
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn default_sleep_or_interrupt_stops_between_slices() {
+        struct Counting {
+            now: std::time::Instant,
+            sleeps: usize,
+            interrupt_after: usize,
+        }
+        impl PlaybackClock for Counting {
+            fn now(&self) -> std::time::Instant {
+                self.now
+            }
+            fn sleep(&mut self, duration: std::time::Duration) {
+                assert!(duration <= PLAYBACK_POLL);
+                self.now += duration;
+                self.sleeps += 1;
+            }
+            fn interrupted(&self) -> bool {
+                self.sleeps >= self.interrupt_after
+            }
+        }
+        let start = std::time::Instant::now();
+        let mut clock = Counting {
+            now: start,
+            sleeps: 0,
+            interrupt_after: 3,
+        };
+        assert!(clock.sleep_or_interrupt(std::time::Duration::from_secs(5)));
+        assert_eq!(clock.sleeps, 3);
+        let mut clock = Counting {
+            now: start,
+            sleeps: 0,
+            interrupt_after: usize::MAX,
+        };
+        assert!(!clock.sleep_or_interrupt(std::time::Duration::from_millis(9)));
+        assert_eq!(clock.now - start, std::time::Duration::from_millis(9));
+    }
+
     #[cfg(feature = "cpal-backend")]
     #[test]
     fn play_keyed_key_and_unkey_failures_are_fatal() {
@@ -3093,6 +3949,344 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cli_features_lists_every_feature_in_cargo_toml() {
+        let manifest: toml::Table = include_str!("../Cargo.toml").parse().unwrap();
+        let mut declared: Vec<&str> = manifest["features"]
+            .as_table()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .filter(|name| *name != "default")
+            .collect();
+        declared.sort_unstable();
+        let listed: Vec<&str> = CLI_FEATURES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(listed, declared);
+        assert!(cli_features() == "none" || !cli_features().is_empty());
+    }
+
+    #[test]
+    fn long_version_lines() {
+        let lines: Vec<&str> = LONG_VERSION.lines().collect();
+        assert_eq!(lines.len(), 4, "{}", *LONG_VERSION);
+        assert_eq!(lines[0], env!("CARGO_PKG_VERSION"));
+        assert!(lines[1].starts_with("commit: "), "{}", lines[1]);
+        assert_eq!(lines[2], format!("features: {}", cli_features()));
+        assert_eq!(lines[3], "wire format: 1");
+    }
+
+    #[test]
+    fn completion_command_drops_hidden_subcommands() {
+        let cmd = completion_command();
+        let names: Vec<&str> = cmd.get_subcommands().map(|sub| sub.get_name()).collect();
+        for visible in ["tx", "rx", "tune", "completions", "man"] {
+            assert!(names.contains(&visible), "{names:?}");
+        }
+        assert!(
+            !names.contains(&"listen") && !names.contains(&"config"),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn clip_warning_fires_once_per_entry() {
+        // 600 ms at full scale (six meter windows), then clean audio.
+        let mut samples = vec![1.0f32; 48_000 * 6 / 10];
+        samples.extend(std::iter::repeat_n(0.1f32, 48_000));
+        let mut source = coppa_audio::RawF32Source::from_samples(samples.clone(), 48_000);
+        let summary = stream_decode(
+            &mut CoppaCore::new(),
+            &mut source,
+            StopWhen {
+                total_samples: Some(samples.len()),
+                ..StopWhen::default()
+            },
+            RxOutputMode::Text { hex: false },
+            "default",
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        // One entry into clipping, one warning, however long it lasts.
+        assert_eq!(summary.warnings.len(), 1, "{:?}", summary.warnings);
+        assert!(summary.warnings[0].starts_with("RX audio input is clipping"));
+    }
+
+    #[test]
+    fn summary_line_wording() {
+        let mut summary = DecodeSummary {
+            consumed_samples: 48_000 * 42 + 14_400,
+            good_frames: 1,
+            ..DecodeSummary::default()
+        };
+        assert_eq!(
+            summary.stop_line(48_000),
+            "Stopped after 42.3 s of audio: 1 frame decoded, 0 failed."
+        );
+        summary.good_frames = 2;
+        summary.failed_frames = 1;
+        assert!(summary
+            .stop_line(48_000)
+            .ends_with(": 2 frames decoded, 1 failed."));
+        summary.good_frames = 0;
+        assert!(summary.stop_line(48_000).contains(": 0 frames decoded"));
+    }
+
+    #[test]
+    fn interrupted_live_capture_with_no_frames_is_ok() {
+        let summary = DecodeSummary {
+            interrupted: true,
+            ..DecodeSummary::default()
+        };
+        assert!(summary.finish(|| "no frames".to_string()).is_ok());
+        let finished = DecodeSummary::default();
+        let err = finished.finish(|| "no frames".to_string()).unwrap_err();
+        assert_eq!(err.to_string(), "no frames");
+    }
+
+    #[test]
+    fn interrupted_capture_with_a_failure_exits_one() {
+        let summary = DecodeSummary {
+            interrupted: true,
+            good_frames: 1,
+            failed_frames: 1,
+            first_error: Some("payload decode failed: bad".to_string()),
+            ..DecodeSummary::default()
+        };
+        let err = summary.finish(|| "no frames".to_string()).unwrap_err();
+        assert_eq!(err.to_string(), "payload decode failed: bad");
+    }
+
+    #[test]
+    fn interrupt_flag_stops_stream_decode() {
+        struct Silence {
+            reads: usize,
+            flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl coppa_audio::AudioSource for Silence {
+            fn read(&mut self, buf: &mut [f32]) -> anyhow::Result<usize> {
+                self.reads += 1;
+                if self.reads == 5 {
+                    self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                buf.fill(0.0);
+                Ok(buf.len())
+            }
+            fn sample_rate(&self) -> u32 {
+                48_000
+            }
+            fn start(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn stop(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        let (interrupt, flag) = interrupt::Interrupt::manual();
+        let mut source = Silence { reads: 0, flag };
+        let summary = stream_decode(
+            &mut CoppaCore::new(),
+            &mut source,
+            StopWhen {
+                interrupt: Some(&interrupt),
+                ..StopWhen::default()
+            },
+            RxOutputMode::Text { hex: false },
+            "default",
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        assert!(summary.interrupted);
+        assert_eq!(source.reads, 5);
+        assert_eq!(summary.consumed_samples, 5 * 4096);
+    }
+
+    #[test]
+    fn interrupt_still_runs_the_trailing_flush() {
+        // A frame that ends right where the interrupt lands still decodes,
+        // because the trailing flush runs on every exit path.
+        struct FrameThenStop {
+            samples: Vec<f32>,
+            position: usize,
+            flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl coppa_audio::AudioSource for FrameThenStop {
+            fn read(&mut self, buf: &mut [f32]) -> anyhow::Result<usize> {
+                let n = buf.len().min(self.samples.len() - self.position);
+                buf[..n].copy_from_slice(&self.samples[self.position..self.position + n]);
+                self.position += n;
+                if self.position == self.samples.len() {
+                    self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(n)
+            }
+            fn sample_rate(&self) -> u32 {
+                48_000
+            }
+            fn start(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn stop(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        let (interrupt, flag) = interrupt::Interrupt::manual();
+        let mut source = FrameThenStop {
+            samples: CoppaCore::new().encode("FLUSHED").unwrap(),
+            position: 0,
+            flag,
+        };
+        let summary = stream_decode(
+            &mut CoppaCore::new(),
+            &mut source,
+            StopWhen {
+                interrupt: Some(&interrupt),
+                ..StopWhen::default()
+            },
+            RxOutputMode::Text { hex: false },
+            "default",
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        assert!(summary.interrupted);
+        assert_eq!(summary.good_frames, 1);
+    }
+
+    #[test]
+    fn raw_audio_refuses_a_terminal() {
+        assert!(refuse_raw_stdout(false).is_ok());
+        let err = refuse_raw_stdout(true).unwrap_err().to_string();
+        assert!(
+            err.starts_with("refusing to write raw audio to a terminal"),
+            "{err}"
+        );
+        assert!(refuse_raw_stdin(false).is_ok());
+        let err = refuse_raw_stdin(true).unwrap_err().to_string();
+        assert!(
+            err.starts_with("refusing to read raw audio from a terminal"),
+            "{err}"
+        );
+        assert!(err.contains("| coppa rx -"), "{err}");
+    }
+
+    #[test]
+    fn only_a_stdout_broken_pipe_becomes_stdout_closed() {
+        let pipe = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone");
+        assert!(stdout_error(pipe).is::<StdoutClosed>());
+        let other = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        assert!(!stdout_error(other).is::<StdoutClosed>());
+        // A broken pipe that never went through a stdout write (a socket)
+        // is not StdoutClosed, so `main` still reports it.
+        let socket = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "rigctld",
+        ));
+        assert!(!socket.is::<StdoutClosed>());
+    }
+
+    #[cfg(feature = "cpal-backend")]
+    #[test]
+    fn play_keyed_never_keys_after_an_early_interrupt() {
+        let device = sim::Device::new(std::time::Duration::ZERO);
+        device.lock().unwrap().interrupt_at = Some(std::time::Duration::ZERO);
+        let error = run_play_keyed(&device, &[0.25; 4800], 50, 200).unwrap_err();
+        assert!(error.is::<interrupt::Interrupted>(), "{error}");
+        assert!(!event_names(&device).iter().any(|e| e == "ptt TX"));
+    }
+
+    #[test]
+    fn is_broken_pipe_finds_the_io_error_in_the_chain() {
+        let pipe = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone");
+        assert!(is_broken_pipe(&anyhow::Error::new(pipe)));
+        let wrapped =
+            anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone"))
+                .context("writing raw audio");
+        assert!(is_broken_pipe(&wrapped));
+        let other = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        assert!(!is_broken_pipe(&anyhow::Error::new(other)));
+        assert!(!is_broken_pipe(&anyhow::anyhow!("Broken pipe")));
+    }
+
+    #[test]
+    fn status_enabled_follows_quiet_raw_and_json() {
+        assert!(status_enabled(Verbosity::Normal, false, false));
+        assert!(status_enabled(Verbosity::Verbose(1), false, false));
+        assert!(!status_enabled(Verbosity::Quiet, false, false));
+        assert!(!status_enabled(Verbosity::Normal, true, false));
+        assert!(!status_enabled(Verbosity::Normal, false, true));
+    }
+
+    #[test]
+    fn tune_seconds_parser_bounds() {
+        assert_eq!(tune_seconds("120"), Ok(120.0));
+        assert_eq!(tune_seconds("0.01"), Ok(0.01));
+        assert_eq!(tune_seconds(" 5 "), Ok(5.0));
+        for bad in [
+            "0", "-0", "120.01", "-1", "NaN", "nan", "inf", "-inf", "1e12", "ten", "",
+        ] {
+            assert_eq!(
+                tune_seconds(bad),
+                Err("must be more than 0 and at most 120 seconds".to_string()),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tune_single_parser_bounds() {
+        assert_eq!(tune_single_hz("300"), Ok(300.0));
+        assert_eq!(tune_single_hz("3000"), Ok(3000.0));
+        assert_eq!(tune_single_hz("1000.5"), Ok(1000.5));
+        for bad in ["299.99", "3000.01", "0", "-5", "NaN", "inf", "30000", "hz"] {
+            assert_eq!(
+                tune_single_hz(bad),
+                Err("must be between 300 and 3000 Hz".to_string()),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_number_parser() {
+        assert_eq!(whole_number("0"), Ok(0));
+        assert_eq!(whole_number("250"), Ok(250));
+        assert_eq!(rx_seconds("0"), Ok(0));
+        assert_eq!(rx_seconds("60"), Ok(60));
+        for bad in ["-5", "-0.5", "1.5", "NaN", "inf", "ms", ""] {
+            assert_eq!(
+                whole_number(bad),
+                Err("must be a whole number, 0 or more".to_string()),
+                "{bad:?}"
+            );
+            assert_eq!(
+                rx_seconds(bad),
+                Err("must be a whole number of seconds, 0 or more (0 = no limit)".to_string()),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tune_duration_and_deprecated_seconds_parse() {
+        let cli = Cli::parse_from(["coppa", "tune", "-d", "2.5"]);
+        let Commands::Tune {
+            duration, seconds, ..
+        } = cli.command
+        else {
+            panic!("expected Tune");
+        };
+        assert_eq!((duration, seconds), (2.5, None));
+
+        let cli = Cli::parse_from(["coppa", "tune", "--seconds", "3"]);
+        let Commands::Tune {
+            duration, seconds, ..
+        } = cli.command
+        else {
+            panic!("expected Tune");
+        };
+        assert_eq!((duration, seconds), (10.0, Some(3.0)));
+        assert!(Cli::try_parse_from(["coppa", "tune", "-d", "2", "--seconds", "3"]).is_err());
+    }
+
     /// The acceptance command `coppa tx --ptt rigctld-typo` must fail in
     /// every build, not only where audio exists (COP-40 plan, Phase 5
     /// manual check 3). In the audio build `transmit_live` -> `build_ptt`
@@ -3129,7 +4323,7 @@ mod tests {
     fn test_cli_parses_frequency_flags_on_tx_and_tune() {
         let cli = Cli::parse_from(["coppa", "tx", "hi", "--frequency-hz", "144500000"]);
         match cli.command {
-            Some(Commands::Tx { rig, .. }) => {
+            Commands::Tx { rig, .. } => {
                 assert_eq!(rig.frequency_hz, Some(144_500_000));
                 assert_eq!(rig.band, None);
             }
@@ -3137,7 +4331,7 @@ mod tests {
         }
         let cli = Cli::parse_from(["coppa", "tune", "--band", "2m"]);
         match cli.command {
-            Some(Commands::Tune { rig, .. }) => assert_eq!(rig.band.as_deref(), Some("2m")),
+            Commands::Tune { rig, .. } => assert_eq!(rig.band.as_deref(), Some("2m")),
             _ => panic!("expected Tune command"),
         }
     }
@@ -3161,7 +4355,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!("cop40_{}.wav", std::process::id()));
         cmd_tx(
             "hi",
-            Some(path.to_str().unwrap()),
+            Some(OutputTarget {
+                path: path.to_str().unwrap(),
+                format: SampleFormat::S16le,
+            }),
             Some("VHF_FAST"),
             None,
             &RigSettings::test_values(None, "none", "127.0.0.1:1", 0, 0, None, None),
@@ -3187,7 +4384,10 @@ mod tests {
             let path_str = path.to_str().unwrap();
             cmd_tx(
                 "streaming rx roundtrip",
-                Some(path_str),
+                Some(OutputTarget {
+                    path: path_str,
+                    format: SampleFormat::F32le,
+                }),
                 None,
                 None,
                 &RigSettings::test_values(None, "none", "127.0.0.1:4532", 50, 200, None, None),
@@ -3226,7 +4426,7 @@ mod tests {
             "--device",
             "Mic",
         ]);
-        let Some(Commands::Rx(args)) = cli.command else {
+        let Commands::Rx(args) = cli.command else {
             panic!("expected Rx")
         };
         assert_eq!(args.path(), Some("x.wav"));
@@ -3237,7 +4437,7 @@ mod tests {
         assert_eq!(args.device.as_deref(), Some("Mic"));
 
         let cli = Cli::parse_from(["coppa", "rx", "-i", "y.wav"]);
-        let Some(Commands::Rx(args)) = cli.command else {
+        let Commands::Rx(args) = cli.command else {
             panic!("expected Rx")
         };
         assert_eq!(args.path(), Some("y.wav"));
@@ -3246,7 +4446,7 @@ mod tests {
 
     #[test]
     fn exact_device_and_channel_flags_parse_and_conflict() {
-        let Some(Commands::Rx(rx)) = Cli::parse_from([
+        let Commands::Rx(rx) = Cli::parse_from([
             "coppa",
             "rx",
             "--device-id",
@@ -3274,7 +4474,7 @@ mod tests {
             .kind(),
             clap::error::ErrorKind::ArgumentConflict,
         );
-        let Some(Commands::Listen(listen)) = Cli::parse_from([
+        let Commands::Listen(listen) = Cli::parse_from([
             "coppa",
             "listen",
             "--device-id",
@@ -3288,7 +4488,7 @@ mod tests {
         };
         assert_eq!(rx, listen);
 
-        let Some(Commands::Tx { rig, .. }) = Cli::parse_from([
+        let Commands::Tx { rig, .. } = Cli::parse_from([
             "coppa",
             "tx",
             "hi",
@@ -3303,7 +4503,7 @@ mod tests {
         };
         assert_eq!(rig.device_id.as_deref(), Some("alsa:output"));
         assert_eq!(rig.output_channel, 1);
-        let Some(Commands::Tune { rig, .. }) = Cli::parse_from([
+        let Commands::Tune { rig, .. } = Cli::parse_from([
             "coppa",
             "tune",
             "--device-id",
@@ -3391,13 +4591,13 @@ mod tests {
     #[cfg(feature = "kiss-tnc")]
     #[test]
     fn tnc_directional_device_and_channel_flags_parse() {
-        let Some(Commands::Tnc {
+        let Commands::Tnc {
             input_device_id,
             output_device_id,
             input_channel,
             output_channel,
             ..
-        }) = Cli::parse_from([
+        } = Cli::parse_from([
             "coppa",
             "tnc",
             "--input-device-id",
@@ -3434,8 +4634,9 @@ mod tests {
 
     #[test]
     fn device_inventory_shows_ids_and_clean_empty_state() {
+        let unknown = || Err(anyhow::anyhow!("listing failed"));
         assert_eq!(
-            device_lines(&[]),
+            device_lines(&[], &unknown(), &Default::default()),
             [
                 "Available audio devices:",
                 "  (none found - CPAL backend may not be available)",
@@ -3458,13 +4659,81 @@ mod tests {
             },
         ];
         assert_eq!(
-            device_lines(&devices),
+            device_lines(&devices, &unknown(), &Default::default()),
             [
                 "Available audio devices:",
-                "  USB Audio [id: alsa:radio-a] (in: 2ch, out: 2ch, max: 48000 Hz)",
-                "  USB Audio [id: unavailable] (in: 2ch, out: 0ch, max: 44100 Hz)",
+                "  USB Audio [id: alsa:radio-a] (in: 2ch, out: 2ch, 48 kHz: unknown)",
+                "  USB Audio [id: unavailable] (in: 2ch, out: 0ch, 48 kHz: unknown)",
+                "Default input: none",
+                "Default output: none",
             ]
         );
+    }
+
+    #[test]
+    fn device_lines_show_48k_support_and_defaults() {
+        use coppa_audio::{AudioDevice, DeviceSupport, OpenedFormat, Support};
+        let device = |id: &str| AudioDevice {
+            name: format!("Card {id}"),
+            id: Some(id.into()),
+            max_sample_rate: 192_000,
+            input_channels: 2,
+            output_channels: 2,
+        };
+        let yes = || {
+            Some(Support::Yes(OpenedFormat {
+                channels: 1,
+                sample_rate: 48_000,
+            }))
+        };
+        let no = || Some(Support::No("no 48 kHz".into()));
+        let entry = |id: &str, input, output| DeviceSupport {
+            name: format!("Card {id}"),
+            id: id.into(),
+            input,
+            output,
+        };
+        let devices = [
+            device("both"),
+            device("in"),
+            device("out"),
+            device("none"),
+            device("missing"),
+        ];
+        let support = Ok(vec![
+            entry("both", yes(), yes()),
+            entry("in", yes(), no()),
+            entry("out", None, yes()),
+            entry("none", no(), no()),
+        ]);
+        let defaults = coppa_audio::DefaultDevices {
+            input: Some(coppa_audio::DefaultDevice {
+                name: "Default Audio Device".into(),
+                id: Some("alsa:default".into()),
+            }),
+            output: None,
+        };
+        let lines = device_lines(&devices, &support, &defaults);
+        assert_eq!(
+            lines,
+            [
+                "Available audio devices:",
+                "  Card both [id: both] (in: 2ch, out: 2ch, 48 kHz: in+out)",
+                "  Card in [id: in] (in: 2ch, out: 2ch, 48 kHz: in)",
+                "  Card out [id: out] (in: 2ch, out: 2ch, 48 kHz: out)",
+                "  Card none [id: none] (in: 2ch, out: 2ch, 48 kHz: no)",
+                "  Card missing [id: missing] (in: 2ch, out: 2ch, 48 kHz: unknown)",
+                "Default input: Default Audio Device [id: alsa:default]",
+                "Default output: none",
+            ]
+        );
+        assert!(lines.iter().all(|line| !line.contains("max:")));
+        let failed = device_lines(
+            &devices[..1],
+            &Err(anyhow::anyhow!("listing failed")),
+            &defaults,
+        );
+        assert!(failed[1].ends_with("48 kHz: unknown)"), "{failed:?}");
     }
 
     #[test]
@@ -3689,8 +4958,7 @@ mod tests {
                 let error = stream_decode(
                     &mut core,
                     &mut source,
-                    None,
-                    None,
+                    StopWhen::default(),
                     RxOutputMode::Text { hex: false },
                     profile,
                     Verbosity::Quiet,
@@ -3732,8 +5000,10 @@ mod tests {
         let summary = stream_decode(
             &mut CoppaCore::new(),
             &mut source,
-            Some(length),
-            None,
+            StopWhen {
+                total_samples: Some(length),
+                ..StopWhen::default()
+            },
             RxOutputMode::Text { hex: false },
             "default",
             Verbosity::Quiet,
@@ -3756,8 +5026,10 @@ mod tests {
         let summary = stream_decode(
             &mut CoppaCore::new(),
             &mut Stalled,
-            None,
-            deadline,
+            StopWhen {
+                deadline,
+                ..StopWhen::default()
+            },
             RxOutputMode::Text { hex: false },
             "default",
             Verbosity::Quiet,
@@ -3780,8 +5052,10 @@ mod tests {
         stream_decode(
             &mut CoppaCore::new(),
             &mut Endless,
-            None,
-            deadline,
+            StopWhen {
+                deadline,
+                ..StopWhen::default()
+            },
             RxOutputMode::Text { hex: false },
             "default",
             Verbosity::Quiet,
@@ -3801,8 +5075,10 @@ mod tests {
         let summary = stream_decode(
             &mut CoppaCore::new(),
             &mut source,
-            Some(10_000),
-            None,
+            StopWhen {
+                total_samples: Some(10_000),
+                ..StopWhen::default()
+            },
             RxOutputMode::Raw,
             "default",
             Verbosity::Quiet,
@@ -3865,10 +5141,10 @@ mod tests {
             "Mic",
         ];
         let parse = |sub: &str| Cli::parse_from(["coppa", sub].into_iter().chain(flags)).command;
-        let Some(Commands::Rx(rx)) = parse("rx") else {
+        let Commands::Rx(rx) = parse("rx") else {
             panic!("expected Rx")
         };
-        let Some(Commands::Listen(listen)) = parse("listen") else {
+        let Commands::Listen(listen) = parse("listen") else {
             panic!("expected Listen")
         };
         assert_eq!(rx, listen);

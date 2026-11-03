@@ -28,7 +28,8 @@ modem; this spec describes only Coppa's own wire format.
 This spec describes **wire-format version 1** — the format produced when
 `CoppaTransceiver`/`CoppaModem` are constructed with `version: 1`, which is
 what every current production caller uses
-(`crates/coppa-engine/src/engine.rs:116,128,180,225`). The protocol version
+(`crates/coppa-engine/src/engine.rs:WIRE_FORMAT_VERSION`, which `coppa
+--version` prints). The protocol version
 number is also carried on the wire (`CoppaHeader::version`, §4) and keys the
 preamble/probe pseudo-random sequences (§2, §3), so a receiver can in
 principle distinguish version-1 frames from a future version's frames at the

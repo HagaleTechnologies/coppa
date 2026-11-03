@@ -223,6 +223,28 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:904fee87bf54c08c38d8604aacea4ac0c0d721e1af546335b4b54e00dd780aba",
+      "id": "cli-output",
+      "kind": "gotcha",
+      "links": [],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/cli-output.md",
+      "sources": [
+        "crates/coppa-cli/src/main.rs",
+        "crates/coppa-cli/src/interrupt.rs",
+        "crates/coppa-cli/src/style.rs",
+        "crates/coppa-audio/src/file_backend.rs",
+        ".github/workflows/ci.yml",
+        "docs/tutorials/getting-started.md"
+      ],
+      "status": "current",
+      "title": "Which stream and exit code does coppa use?",
+      "verified_commit": "54f23b4",
+      "verified_date": "2026-11-03",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:9bd2a246313cba83361f290f438daa8cd882616d0cec880bf0be39aff794efea",
       "id": "cli-settings",
       "kind": "gotcha",
