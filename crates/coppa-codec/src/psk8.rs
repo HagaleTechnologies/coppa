@@ -7,6 +7,7 @@ use std::f32::consts::PI;
 ///
 /// 8 points equally spaced on the unit circle, Gray-coded so adjacent
 /// points differ by exactly 1 bit.
+#[derive(Debug)]
 pub struct Psk8Mapper;
 
 // Gray code ordering for 8PSK: 000, 001, 011, 010, 110, 111, 101, 100

@@ -104,7 +104,7 @@ session flow):
 | `ARQCALL <target> [<repeats>]` | the dial: no echo; `NEWSTATE ISS ` then `CONNECTED <target> <label>`, or `FAULT busy` + `NEWSTATE DISC ` when another session holds the link |
 | `DISCONNECT` | echo, then `DISCONNECTED` + `NEWSTATE DISC ` |
 | `CANCELPENDING` | echo; drops a pending (not yet established) attempt |
-| `CWID TRUE/FALSE` | echo (coppa keys no Morse ID) |
+| `CWID TRUE/FALSE` | echo; turns the closing Morse ID on or off, unless `[station_id] cwid` is `"always"` or `"never"`, which keep their state (the line is still echoed; see OPERATING.md) |
 | `SENDID` | echo; transmits a real station-ID frame — `FAULT` with no callsign set or when the channel is busy |
 
 Accepted and echoed (real-TNC commands no verified client sends; Winlink

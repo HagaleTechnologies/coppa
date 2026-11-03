@@ -95,6 +95,12 @@ pub struct RadioConfig {
     /// `ptt_guardian`): a helper process that releases PTT if coppad dies
     /// while transmitting. Ignored for `none`, `vox` and serial PTT.
     pub ptt_guardian: bool,
+    /// COP-84: let a VARA command-port client set the rig's frequency
+    /// (`FREQ <hz>`) or mode (`MODE <name>`) through rigctld. Off by default:
+    /// the command port is unauthenticated and any web page can send it a
+    /// line (`docs/LIMITATIONS.md`), so a drive-by set would retune the rig.
+    /// Reading the frequency and mode (`FREQ`, `MODE`) works without it.
+    pub host_rig_control: bool,
 }
 
 /// Which serial control line a `PttConfig::Serial` should drive.
@@ -297,6 +303,12 @@ pub struct HostConfig {
     /// the WebSocket. Empty (the default) refuses every web page; scripts that
     /// send no `Origin` header need only the token.
     pub websocket_allowed_origins: Vec<String>,
+    /// COP-140: advertise this daemon on the local network over mDNS as
+    /// `coppad.local`, with one `_coppa._tcp` service for the WebSocket port
+    /// (the operator page at `/` and the health check at `/health`), and
+    /// nothing else. Needs a build with the `mdns` feature,
+    /// `websocket_enabled = true`, and a `bind_address` other hosts can reach.
+    pub mdns_enabled: bool,
     /// Allow data-port and WebSocket host data to transmit without an established
     /// session. Off by default; intended for sessionless bench rigs. Enabling it
     /// lets any data-port client key the transmitter.
@@ -459,7 +471,48 @@ pub struct StationIdConfig {
     /// tick). `0` (the default) disables beacon mode. Also requires
     /// `[engine] callsign` to be set.
     pub beacon_interval_secs: u64,
+    /// COP-84: Morse (CW) ID keyed right after the DISCONNECT frame of each
+    /// session this station ends, in the same keyed interval. `"host"` (the
+    /// default) leaves it off until a host sends `CWID ON` (VARA) or
+    /// `CWID TRUE` (ARDOP); `"always"` and `"never"` lock it on or off
+    /// against hosts. Needs `[engine] callsign` (or a host's `MYCALL`).
+    pub cwid: CwIdPolicy,
+    /// COP-84: CW ID speed in words per minute (PARIS timing), 10-20,
+    /// default 20. 47 CFR 97.119(b)(1) caps an automatic CW ID at 20 WPM.
+    /// Checked by run mode ([`DaemonConfig::check_station_id`]).
+    pub cwid_wpm: u32,
 }
+
+/// COP-84: who decides whether a CW ID follows each session this station
+/// ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CwIdPolicy {
+    /// Off until a host sends `CWID ON`; hosts may turn it on and off.
+    #[default]
+    Host,
+    /// On; a host's `CWID OFF` is refused.
+    Always,
+    /// Off; a host's `CWID ON` is refused.
+    Never,
+}
+
+impl CwIdPolicy {
+    /// The config spelling, as `[station_id] cwid` takes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CwIdPolicy::Host => "host",
+            CwIdPolicy::Always => "always",
+            CwIdPolicy::Never => "never",
+        }
+    }
+}
+
+/// COP-84: slowest `[station_id] cwid_wpm` run mode accepts.
+pub const MIN_CWID_WPM: u32 = 10;
+/// COP-84: fastest `[station_id] cwid_wpm` run mode accepts; 47 CFR
+/// 97.119(b)(1) caps an automatic CW ID at 20 WPM.
+pub const MAX_CWID_WPM: u32 = 20;
 
 /// Connected-session configuration (COP-69).
 ///
@@ -545,6 +598,7 @@ impl Default for RadioConfig {
             frequency_hz: None,
             band: None,
             ptt_guardian: true,
+            host_rig_control: false,
         }
     }
 }
@@ -563,6 +617,7 @@ impl Default for HostConfig {
             websocket_port: 8400,
             websocket_token: None,
             websocket_allowed_origins: Vec::new(),
+            mdns_enabled: false,
             sessionless_tx_enabled: false,
         }
     }
@@ -589,6 +644,8 @@ impl Default for StationIdConfig {
             busy_hold_ms: 0,
             id_interval_secs: 540,
             beacon_interval_secs: 0,
+            cwid: CwIdPolicy::Host,
+            cwid_wpm: MAX_CWID_WPM,
         }
     }
 }
@@ -847,6 +904,20 @@ impl DaemonConfig {
         self.session.check()
     }
 
+    /// COP-84: validate `[station_id] cwid_wpm` (10-20), naming the key and
+    /// the rule on failure. Called by run mode before any hardware or socket
+    /// is touched; `--check` does not call it.
+    pub fn check_station_id(&self) -> Result<(), String> {
+        let wpm = self.station_id.cwid_wpm;
+        if (MIN_CWID_WPM..=MAX_CWID_WPM).contains(&wpm) {
+            return Ok(());
+        }
+        Err(format!(
+            "[station_id] cwid_wpm = {wpm} is outside {MIN_CWID_WPM}-{MAX_CWID_WPM}; \
+             47 CFR 97.119(b)(1) caps an automatic CW ID at 20 WPM"
+        ))
+    }
+
     /// COP-36: `[audio] buffer_size` sizes the RX and TX audio rings, and a
     /// zero-capacity ring silently drops every sample. Checked by run mode
     /// before any hardware is touched; `--check` does not call it.
@@ -891,6 +962,44 @@ impl DaemonConfig {
              ardop, or set ardop_enabled = false"
                 .to_string(),
         )
+    }
+
+    /// COP-140: `[host] mdns_enabled = true` needs a build with the `mdns`
+    /// feature (`built`), the WebSocket listener it advertises, and a
+    /// `bind_address` other hosts can reach. A host name such as `localhost`
+    /// passes here; run mode checks the address it binds to as well. Checked
+    /// by run mode before any hardware is touched; `--check` does not call it.
+    pub fn check_mdns(&self, built: bool) -> Result<(), String> {
+        let host = &self.host;
+        if !host.mdns_enabled {
+            return Ok(());
+        }
+        if !built {
+            return Err(
+                "[host] mdns_enabled = true is set, but this coppad was built without the \
+                 mdns feature and advertises nothing; rebuild with --features mdns, or set \
+                 mdns_enabled = false"
+                    .to_string(),
+            );
+        }
+        if !host.websocket_enabled {
+            return Err(
+                "[host] mdns_enabled = true needs [host] websocket_enabled = true: coppad \
+                 advertises its WebSocket port (the operator page and /health) and nothing else"
+                    .to_string(),
+            );
+        }
+        let literal = host
+            .bind_address
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        if let Ok(ip) = literal.parse::<std::net::IpAddr>() {
+            let bound = std::net::SocketAddr::new(ip, host.websocket_port);
+            if crate::mdns::advertisement(bound).is_err() {
+                return Err(crate::mdns::unreachable_bind_address(&host.bind_address));
+            }
+        }
+        Ok(())
     }
 
     /// A positive preferred hardware rate is required before opening audio.
@@ -1537,6 +1646,66 @@ beacon_interval_secs = 600
     }
 
     #[test]
+    fn cop84_station_id_cwid_defaults_to_host_at_20_wpm() {
+        let station_id = StationIdConfig::default();
+        assert_eq!(station_id.cwid, CwIdPolicy::Host);
+        assert_eq!(station_id.cwid_wpm, 20);
+        assert!(!RadioConfig::default().host_rig_control);
+        assert_eq!(DaemonConfig::default().check_station_id(), Ok(()));
+    }
+
+    #[test]
+    fn cop84_cwid_parses_the_three_policies_and_names_them_on_error() {
+        for (text, policy) in [
+            ("host", CwIdPolicy::Host),
+            ("always", CwIdPolicy::Always),
+            ("never", CwIdPolicy::Never),
+        ] {
+            let config: DaemonConfig =
+                toml::from_str(&format!("[station_id]\ncwid = \"{text}\"\n")).unwrap();
+            assert_eq!(config.station_id.cwid, policy);
+            assert_eq!(policy.as_str(), text);
+        }
+        let err = toml::from_str::<DaemonConfig>("[station_id]\ncwid = \"yes\"\n")
+            .unwrap_err()
+            .to_string();
+        for needle in ["cwid", "host", "always", "never"] {
+            assert!(err.contains(needle), "{needle:?} missing from {err:?}");
+        }
+    }
+
+    #[test]
+    fn cop84_check_station_id_limits_cwid_wpm_to_10_through_20() {
+        let with_wpm = |wpm: u32| {
+            let mut config = DaemonConfig::default();
+            config.station_id.cwid_wpm = wpm;
+            config.check_station_id()
+        };
+        assert_eq!(with_wpm(10), Ok(()));
+        assert_eq!(with_wpm(20), Ok(()));
+        assert!(with_wpm(9).is_err());
+        assert!(with_wpm(21).is_err());
+        assert_eq!(
+            with_wpm(25).unwrap_err(),
+            "[station_id] cwid_wpm = 25 is outside 10-20; 47 CFR 97.119(b)(1) caps an \
+             automatic CW ID at 20 WPM"
+        );
+    }
+
+    #[test]
+    fn cop84_example_config_sets_the_cwid_keys_under_station_id() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../coppad.toml.example");
+        let text = std::fs::read_to_string(path).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(value["station_id"]["cwid"].as_str(), Some("host"));
+        assert_eq!(value["station_id"]["cwid_wpm"].as_integer(), Some(20));
+        assert_eq!(value["radio"]["host_rig_control"].as_bool(), Some(false));
+        let config: DaemonConfig = toml::from_str(&text).unwrap();
+        assert_eq!(config.station_id.cwid, CwIdPolicy::Host);
+        assert!(!config.radio.host_rig_control);
+    }
+
+    #[test]
     fn test_example_config_documents_turnaround_under_radio() {
         // Read at runtime rather than `include_str!`, which would make the
         // crate unpackable without the workspace-root example file.
@@ -1748,6 +1917,86 @@ beacon_interval_secs = 600
         let err = config.check_ardop_built(false).unwrap_err();
         assert!(err.contains("ardop feature"), "{err}");
         assert_eq!(config.check_ardop_built(true), Ok(()));
+    }
+
+    /// COP-140: the mDNS key's startup checks, in order.
+    fn mdns_config(bind_address: &str) -> DaemonConfig {
+        let mut config = ws(Some(GOOD), &[]);
+        config.host.mdns_enabled = true;
+        config.host.bind_address = bind_address.to_string();
+        config
+    }
+
+    #[test]
+    fn check_mdns_passes_when_disabled() {
+        let config = DaemonConfig::default();
+        assert_eq!(config.check_mdns(false), Ok(()));
+        assert_eq!(config.check_mdns(true), Ok(()));
+    }
+
+    #[test]
+    fn check_mdns_refuses_a_build_without_the_feature() {
+        assert_eq!(
+            mdns_config("0.0.0.0").check_mdns(false),
+            Err(
+                "[host] mdns_enabled = true is set, but this coppad was built without the \
+                 mdns feature and advertises nothing; rebuild with --features mdns, or set \
+                 mdns_enabled = false"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn check_mdns_needs_the_websocket_listener() {
+        let mut config = mdns_config("0.0.0.0");
+        config.host.websocket_enabled = false;
+        assert_eq!(
+            config.check_mdns(true),
+            Err(
+                "[host] mdns_enabled = true needs [host] websocket_enabled = true: coppad \
+                 advertises its WebSocket port (the operator page and /health) and nothing else"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn check_mdns_refuses_a_loopback_bind_address() {
+        for bind in ["127.0.0.1", "127.0.0.2", "::1", "[::1]"] {
+            assert_eq!(
+                mdns_config(bind).check_mdns(true),
+                Err(crate::mdns::unreachable_bind_address(bind)),
+                "{bind}"
+            );
+        }
+        let err = mdns_config("127.0.0.1").check_mdns(true).unwrap_err();
+        assert!(
+            err.starts_with(
+                "[host] mdns_enabled = true needs a bind_address other hosts can reach, but \
+                 bind_address = \"127.0.0.1\" is loopback, so coppad.local would send"
+            ),
+            "{err}"
+        );
+        for bind in ["0.0.0.0", "[::]", "192.168.1.20"] {
+            assert_eq!(mdns_config(bind).check_mdns(true), Ok(()), "{bind}");
+        }
+        // A host name: the bound-address check in run mode decides it.
+        assert_eq!(mdns_config("localhost").check_mdns(true), Ok(()));
+    }
+
+    #[test]
+    fn mdns_enabled_defaults_to_false_and_round_trips() {
+        assert!(!DaemonConfig::default().host.mdns_enabled);
+        let parsed: DaemonConfig = toml::from_str("[host]\nmdns_enabled = true\n").unwrap();
+        assert!(parsed.host.mdns_enabled);
+        let printed = toml::to_string(&parsed).unwrap();
+        let reparsed: DaemonConfig = toml::from_str(&printed).unwrap();
+        assert!(reparsed.host.mdns_enabled);
+        let err =
+            toml::from_str::<DaemonConfig>("[host]\nmdns_enabled = true\nmdns_name = \"x\"\n")
+                .unwrap_err();
+        assert!(err.to_string().contains("mdns_name"), "{err}");
     }
 
     #[test]

@@ -5,7 +5,10 @@
 use std::f32::consts::PI;
 
 /// Normalization mode for the RRC filter coefficients.
+///
+/// Marked `#[non_exhaustive]`: a match outside this crate needs a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum NormMode {
     /// Normalize so the DC gain is unity. Appropriate for NRZ-style input
     /// where the filter acts as a spectral shaper (TX path).
@@ -15,17 +18,24 @@ pub enum NormMode {
     Energy,
 }
 
+/// A root-raised-cosine FIR with fixed, precomputed coefficients.
+///
+/// The filter has `2 * (span_symbols * samples_per_symbol / 2) + 1` taps,
+/// centred on the symbol instant, and roll-off `alpha`.
+#[derive(Debug, Clone)]
 pub struct RrcFilter {
     coefficients: Vec<f32>,
 }
 
 impl RrcFilter {
     /// Create an RRC filter with DC-gain normalization (backward compatible).
+    #[must_use]
     pub fn new(alpha: f32, span_symbols: usize, samples_per_symbol: usize) -> Self {
         Self::new_with_norm(alpha, span_symbols, samples_per_symbol, NormMode::DcGain)
     }
 
     /// Create an RRC filter with the specified normalization mode.
+    #[must_use]
     pub fn new_with_norm(
         alpha: f32,
         span_symbols: usize,
@@ -69,6 +79,10 @@ impl RrcFilter {
         Self { coefficients }
     }
 
+    /// Convolves `input` with the filter, centred so the output has the same
+    /// length as the input and no group delay; samples beyond either edge
+    /// count as zero. An empty input returns an empty vector.
+    #[must_use]
     pub fn filter(&self, input: &[f32]) -> Vec<f32> {
         if input.is_empty() {
             return Vec::new();
@@ -91,6 +105,8 @@ impl RrcFilter {
         output
     }
 
+    /// The normalised filter taps; the response is symmetric about the centre tap.
+    #[must_use]
     pub fn coefficients(&self) -> &[f32] {
         &self.coefficients
     }

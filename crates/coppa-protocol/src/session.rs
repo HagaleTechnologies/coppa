@@ -12,6 +12,10 @@
 //!
 //! Sessions are identified by a 4-bit session ID (0-15) and maintain state
 //! for the ARQ layer, keepalive timers, and negotiated link parameters.
+//!
+//! Every method that needs the time takes `now: Instant` from the caller, the
+//! same convention as `ArqTx` and `CpNegotiator`; a session never reads the
+//! clock itself (COP-90, H-136).
 
 use crate::ProtocolError;
 use std::time::{Duration, Instant};
@@ -107,6 +111,7 @@ impl LinkCapabilities {
     }
 
     /// Negotiate capabilities: take the minimum/intersection of both sides.
+    #[must_use]
     pub fn negotiate(&self, peer: &LinkCapabilities) -> LinkCapabilities {
         LinkCapabilities {
             max_payload_size: self.max_payload_size.min(peer.max_payload_size),
@@ -195,15 +200,16 @@ pub const HANDSHAKE_TIMEOUT_SECS: u64 = 30;
 pub const MAX_CFM_RETRIES: u8 = 3;
 
 impl Session {
-    /// Create a new session in Idle state.
+    /// Create a new session in Idle state. `created_at` and `last_activity`
+    /// are both set to `now`.
     pub fn new(
         id: u8,
         local: Callsign,
         remote: Callsign,
         ssid: u8,
         local_caps: LinkCapabilities,
+        now: Instant,
     ) -> Self {
-        let now = Instant::now();
         Self {
             id: id & 0x0F,
             state: SessionState::Idle,
@@ -226,13 +232,13 @@ impl Session {
     // ── Initiator side ──────────────────────────────────────────────
 
     /// Initiate a connection: create a CONNECT_REQ PDU.
-    pub fn initiate(&mut self) -> Result<MacPdu, ProtocolError> {
+    pub fn initiate(&mut self, now: Instant) -> Result<MacPdu, ProtocolError> {
         if self.state != SessionState::Idle {
             return Err(ProtocolError::CannotInitiate { state: self.state });
         }
 
         self.state = SessionState::Connecting;
-        self.last_activity = Instant::now();
+        self.last_activity = now;
 
         Ok(MacPdu::new(
             MacFrameType::ConnectReq,
@@ -248,6 +254,7 @@ impl Session {
     pub fn handle_connect_ack(
         &mut self,
         remote_caps_bytes: &[u8],
+        now: Instant,
     ) -> Result<MacPdu, ProtocolError> {
         if self.state != SessionState::Connecting {
             return Err(ProtocolError::UnexpectedConnectAck { state: self.state });
@@ -259,7 +266,7 @@ impl Session {
         self.remote_caps = Some(remote_caps);
         self.negotiated = Some(negotiated.clone());
         self.state = SessionState::Established;
-        self.last_activity = Instant::now();
+        self.last_activity = now;
 
         let cfm_pdu = MacPdu::new(
             MacFrameType::ConnectCfm,
@@ -281,6 +288,7 @@ impl Session {
     pub fn handle_connect_req(
         &mut self,
         remote_caps_bytes: &[u8],
+        now: Instant,
     ) -> Result<MacPdu, ProtocolError> {
         if self.state != SessionState::Idle {
             return Err(ProtocolError::UnexpectedConnectReq { state: self.state });
@@ -289,7 +297,7 @@ impl Session {
         let remote_caps = LinkCapabilities::from_bytes(remote_caps_bytes)?;
         self.remote_caps = Some(remote_caps);
         self.state = SessionState::Accepting;
-        self.last_activity = Instant::now();
+        self.last_activity = now;
 
         Ok(MacPdu::new(
             MacFrameType::ConnectAck,
@@ -303,7 +311,11 @@ impl Session {
     /// Handle CONNECT_CFM (responder side).
     /// Validates that negotiated capabilities are consistent with both sides'
     /// advertised capabilities, then transitions to Established.
-    pub fn handle_connect_cfm(&mut self, negotiated_bytes: &[u8]) -> Result<(), ProtocolError> {
+    pub fn handle_connect_cfm(
+        &mut self,
+        negotiated_bytes: &[u8],
+        now: Instant,
+    ) -> Result<(), ProtocolError> {
         if self.state != SessionState::Accepting {
             return Err(ProtocolError::UnexpectedConnectCfm { state: self.state });
         }
@@ -339,7 +351,7 @@ impl Session {
 
         self.negotiated = Some(negotiated);
         self.state = SessionState::Established;
-        self.last_activity = Instant::now();
+        self.last_activity = now;
 
         Ok(())
     }
@@ -347,13 +359,13 @@ impl Session {
     // ── Common operations ───────────────────────────────────────────
 
     /// Create a DISCONNECT PDU.
-    pub fn disconnect(&mut self) -> Result<MacPdu, ProtocolError> {
+    pub fn disconnect(&mut self, now: Instant) -> Result<MacPdu, ProtocolError> {
         if self.state == SessionState::Idle {
             return Err(ProtocolError::CannotDisconnectIdle);
         }
 
         self.state = SessionState::Disconnecting;
-        self.last_activity = Instant::now();
+        self.last_activity = now;
 
         Ok(MacPdu::new(
             MacFrameType::Disconnect,
@@ -372,12 +384,12 @@ impl Session {
     }
 
     /// Create a KEEPALIVE PDU.
-    pub fn keepalive(&mut self) -> Result<MacPdu, ProtocolError> {
+    pub fn keepalive(&mut self, now: Instant) -> Result<MacPdu, ProtocolError> {
         if self.state != SessionState::Established {
             return Err(ProtocolError::KeepaliveNotEstablished);
         }
 
-        self.last_activity = Instant::now();
+        self.last_activity = now;
 
         Ok(MacPdu::new(
             MacFrameType::Keepalive,
@@ -393,7 +405,7 @@ impl Session {
     /// After transitioning to Established, if no data ACK is received within
     /// 2x RTO, the CFM may have been lost. Returns the cached CFM PDU if a
     /// retry is warranted and the retry limit has not been exceeded.
-    pub fn maybe_retry_cfm(&mut self, rto: Duration) -> Option<MacPdu> {
+    pub fn maybe_retry_cfm(&mut self, rto: Duration, now: Instant) -> Option<MacPdu> {
         if self.state != SessionState::Established {
             return None;
         }
@@ -401,10 +413,10 @@ impl Session {
             return None;
         }
         let deadline = rto.saturating_mul(2);
-        if self.last_activity.elapsed() >= deadline {
+        if now.saturating_duration_since(self.last_activity) >= deadline {
             if let Some(ref cfm) = self.last_cfm {
                 self.cfm_retries += 1;
-                self.last_activity = Instant::now();
+                self.last_activity = now;
                 return Some(cfm.clone());
             }
         }
@@ -417,35 +429,38 @@ impl Session {
         self.last_cfm = None;
     }
 
-    /// Record activity (call when any PDU is sent or received).
-    pub fn touch(&mut self) {
-        self.last_activity = Instant::now();
+    /// Record activity at `now` (call when any PDU is sent or received).
+    pub fn touch(&mut self, now: Instant) {
+        self.last_activity = now;
     }
 
-    /// Check if a keepalive should be sent.
-    pub fn needs_keepalive(&self) -> bool {
+    /// Check if a keepalive should be sent at `now`.
+    pub fn needs_keepalive(&self, now: Instant) -> bool {
         self.state == SessionState::Established
-            && self.last_activity.elapsed() >= self.keepalive_interval
+            && now.saturating_duration_since(self.last_activity) >= self.keepalive_interval
     }
 
-    /// Check if the session has timed out.
+    /// Check if the session has timed out at `now`.
     ///
     /// Uses shorter timeouts for transient states:
     /// - Disconnecting: `disconnect_timeout` (`DEFAULT_DISCONNECT_TIMEOUT_SECS`, 10s)
     /// - Connecting/Accepting (handshake): `HANDSHAKE_TIMEOUT_SECS` (30s)
     /// - Established: full `session_timeout` (120s)
-    pub fn is_timed_out(&self) -> bool {
+    ///
+    /// A `now` earlier than `last_activity` counts as no time elapsed.
+    pub fn is_timed_out(&self, now: Instant) -> bool {
         if self.state == SessionState::Idle {
             return false;
         }
         if self.state == SessionState::Disconnecting {
-            return self.last_activity.elapsed() >= self.disconnect_timeout;
+            return now.saturating_duration_since(self.last_activity) >= self.disconnect_timeout;
         }
         // Handshake states use a shorter timeout to avoid lingering half-open sessions
         if self.state == SessionState::Connecting || self.state == SessionState::Accepting {
-            return self.last_activity.elapsed() >= Duration::from_secs(HANDSHAKE_TIMEOUT_SECS);
+            return now.saturating_duration_since(self.last_activity)
+                >= Duration::from_secs(HANDSHAKE_TIMEOUT_SECS);
         }
-        self.last_activity.elapsed() >= self.session_timeout
+        now.saturating_duration_since(self.last_activity) >= self.session_timeout
     }
 
     /// Whether this session is established and ready for data transfer.
@@ -475,17 +490,18 @@ impl SessionManager {
         }
     }
 
-    /// Allocate a new session, returning its ID.
+    /// Allocate a new session created at `now`, returning its ID.
     pub fn create(
         &mut self,
         local: Callsign,
         remote: Callsign,
         ssid: u8,
         caps: LinkCapabilities,
+        now: Instant,
     ) -> Result<u8, ProtocolError> {
         for id in 0..16u8 {
             if self.sessions[id as usize].is_none() {
-                self.sessions[id as usize] = Some(Session::new(id, local, remote, ssid, caps));
+                self.sessions[id as usize] = Some(Session::new(id, local, remote, ssid, caps, now));
                 return Ok(id);
             }
         }
@@ -531,13 +547,13 @@ impl SessionManager {
             .collect()
     }
 
-    /// Clean up timed-out sessions. Returns IDs of removed sessions.
-    pub fn cleanup_timed_out(&mut self) -> Vec<u8> {
+    /// Clean up sessions timed out at `now`. Returns IDs of removed sessions.
+    pub fn cleanup_timed_out(&mut self, now: Instant) -> Vec<u8> {
         let mut removed = Vec::new();
         for id in 0..16u8 {
             let timed_out = self.sessions[id as usize]
                 .as_ref()
-                .map(|s| s.is_timed_out())
+                .map(|s| s.is_timed_out(now))
                 .unwrap_or(false);
             if timed_out {
                 self.sessions[id as usize] = None;
@@ -560,6 +576,21 @@ mod tests {
 
     fn make_callsign(s: &str) -> Callsign {
         Callsign::new(s).unwrap()
+    }
+
+    fn t0() -> Instant {
+        Instant::now()
+    }
+
+    fn session(now: Instant) -> Session {
+        Session::new(
+            0,
+            make_callsign("AA1AA"),
+            make_callsign("BB2BB"),
+            0,
+            LinkCapabilities::default(),
+            now,
+        )
     }
 
     // ── LinkCapabilities tests ──────────────────────────────────────
@@ -670,6 +701,7 @@ mod tests {
 
     #[test]
     fn test_three_way_handshake() {
+        let now = t0();
         let local_caps = LinkCapabilities::default();
         let remote_caps = LinkCapabilities {
             max_payload_size: 150,
@@ -683,6 +715,7 @@ mod tests {
             make_callsign("W1AW"),
             0,
             local_caps.clone(),
+            now,
         );
 
         // Responder
@@ -692,25 +725,26 @@ mod tests {
             make_callsign("VK3ABC"),
             0,
             remote_caps.clone(),
+            now,
         );
 
         // Step 1: Initiator sends CONNECT_REQ
-        let req_pdu = initiator.initiate().unwrap();
+        let req_pdu = initiator.initiate(now).unwrap();
         assert_eq!(initiator.state, SessionState::Connecting);
         assert_eq!(req_pdu.frame_type, MacFrameType::ConnectReq);
 
         // Step 2: Responder handles CONNECT_REQ, sends CONNECT_ACK
-        let ack_pdu = responder.handle_connect_req(&req_pdu.payload).unwrap();
+        let ack_pdu = responder.handle_connect_req(&req_pdu.payload, now).unwrap();
         assert_eq!(responder.state, SessionState::Accepting);
         assert_eq!(ack_pdu.frame_type, MacFrameType::ConnectAck);
 
         // Step 3: Initiator handles CONNECT_ACK, sends CONNECT_CFM
-        let cfm_pdu = initiator.handle_connect_ack(&ack_pdu.payload).unwrap();
+        let cfm_pdu = initiator.handle_connect_ack(&ack_pdu.payload, now).unwrap();
         assert_eq!(initiator.state, SessionState::Established);
         assert_eq!(cfm_pdu.frame_type, MacFrameType::ConnectCfm);
 
         // Step 4: Responder handles CONNECT_CFM
-        responder.handle_connect_cfm(&cfm_pdu.payload).unwrap();
+        responder.handle_connect_cfm(&cfm_pdu.payload, now).unwrap();
         assert_eq!(responder.state, SessionState::Established);
 
         // Both should have the same negotiated capabilities
@@ -722,16 +756,18 @@ mod tests {
 
     #[test]
     fn test_cannot_initiate_twice() {
+        let now = t0();
         let mut s = Session::new(
             0,
             make_callsign("AA1AA"),
             make_callsign("BB2BB"),
             0,
             LinkCapabilities::default(),
+            now,
         );
-        s.initiate().unwrap();
+        s.initiate(now).unwrap();
         assert!(matches!(
-            s.initiate(),
+            s.initiate(now),
             Err(ProtocolError::CannotInitiate {
                 state: SessionState::Connecting
             })
@@ -740,108 +776,124 @@ mod tests {
 
     #[test]
     fn test_connect_ack_wrong_state() {
+        let now = t0();
         let mut s = Session::new(
             0,
             make_callsign("AA1AA"),
             make_callsign("BB2BB"),
             0,
             LinkCapabilities::default(),
+            now,
         );
         let caps_bytes = LinkCapabilities::default().to_bytes();
-        assert!(s.handle_connect_ack(&caps_bytes).is_err());
+        assert!(s.handle_connect_ack(&caps_bytes, now).is_err());
     }
 
     #[test]
     fn test_connect_req_wrong_state() {
+        let now = t0();
         let mut s = Session::new(
             0,
             make_callsign("AA1AA"),
             make_callsign("BB2BB"),
             0,
             LinkCapabilities::default(),
+            now,
         );
-        s.initiate().unwrap();
+        s.initiate(now).unwrap();
         let caps_bytes = LinkCapabilities::default().to_bytes();
-        assert!(s.handle_connect_req(&caps_bytes).is_err());
+        assert!(s.handle_connect_req(&caps_bytes, now).is_err());
     }
 
     #[test]
     fn test_connect_cfm_wrong_state() {
+        let now = t0();
         let mut s = Session::new(
             0,
             make_callsign("AA1AA"),
             make_callsign("BB2BB"),
             0,
             LinkCapabilities::default(),
+            now,
         );
         let caps_bytes = LinkCapabilities::default().to_bytes();
-        assert!(s.handle_connect_cfm(&caps_bytes).is_err());
+        assert!(s.handle_connect_cfm(&caps_bytes, now).is_err());
     }
 
     // ── Disconnect tests ────────────────────────────────────────────
 
     #[test]
     fn test_disconnect() {
+        let now = t0();
         let mut s = Session::new(
             0,
             make_callsign("AA1AA"),
             make_callsign("BB2BB"),
             0,
             LinkCapabilities::default(),
+            now,
         );
-        s.initiate().unwrap();
+        s.initiate(now).unwrap();
 
-        let disc_pdu = s.disconnect().unwrap();
+        let disc_pdu = s.disconnect(now).unwrap();
         assert_eq!(disc_pdu.frame_type, MacFrameType::Disconnect);
         assert_eq!(s.state, SessionState::Disconnecting);
     }
 
     #[test]
     fn test_disconnecting_session_times_out_after_disconnect_timeout() {
+        let now = t0();
         let mut s = Session::new(
             0,
             make_callsign("AA1AA"),
             make_callsign("BB2BB"),
             0,
             LinkCapabilities::default(),
+            now,
         );
-        s.initiate().unwrap();
-        s.disconnect().unwrap();
+        s.initiate(now).unwrap();
+        s.disconnect(now).unwrap();
         assert_eq!(
             s.disconnect_timeout,
             Duration::from_secs(DEFAULT_DISCONNECT_TIMEOUT_SECS)
         );
-        assert!(!s.is_timed_out(), "the default 10 s has not elapsed");
-
-        s.disconnect_timeout = Duration::ZERO;
-        assert!(s.is_timed_out());
+        let limit = Duration::from_secs(DEFAULT_DISCONNECT_TIMEOUT_SECS);
+        assert!(
+            !s.is_timed_out(now + limit - Duration::from_millis(1)),
+            "the default 10 s has not elapsed"
+        );
+        assert!(s.is_timed_out(now + limit));
     }
 
     #[test]
     fn test_disconnect_idle() {
+        let now = t0();
         let mut s = Session::new(
             0,
             make_callsign("AA1AA"),
             make_callsign("BB2BB"),
             0,
             LinkCapabilities::default(),
+            now,
         );
         assert!(matches!(
-            s.disconnect(),
+            s.disconnect(now),
             Err(ProtocolError::CannotDisconnectIdle)
         ));
     }
 
     #[test]
     fn test_handle_disconnect() {
+        let now = t0();
         let mut s = Session::new(
             0,
             make_callsign("AA1AA"),
             make_callsign("BB2BB"),
             0,
             LinkCapabilities::default(),
+            now,
         );
-        s.initiate().unwrap();
+        s.initiate(now).unwrap();
         s.handle_disconnect();
         assert_eq!(s.state, SessionState::Idle);
         assert!(s.negotiated.is_none());
@@ -851,27 +903,31 @@ mod tests {
 
     #[test]
     fn test_keepalive_not_established() {
+        let now = t0();
         let mut s = Session::new(
             0,
             make_callsign("AA1AA"),
             make_callsign("BB2BB"),
             0,
             LinkCapabilities::default(),
+            now,
         );
         assert!(matches!(
-            s.keepalive(),
+            s.keepalive(now),
             Err(ProtocolError::KeepaliveNotEstablished)
         ));
     }
 
     #[test]
     fn test_is_established() {
+        let now = t0();
         let mut s = Session::new(
             0,
             make_callsign("AA1AA"),
             make_callsign("BB2BB"),
             0,
             LinkCapabilities::default(),
+            now,
         );
         assert!(!s.is_established());
         // Manually set for testing
@@ -881,12 +937,14 @@ mod tests {
 
     #[test]
     fn test_reset() {
+        let now = t0();
         let mut s = Session::new(
             0,
             make_callsign("AA1AA"),
             make_callsign("BB2BB"),
             0,
             LinkCapabilities::default(),
+            now,
         );
         s.state = SessionState::Established;
         s.negotiated = Some(LinkCapabilities::default());
@@ -899,6 +957,7 @@ mod tests {
 
     #[test]
     fn test_manager_create_and_get() {
+        let now = t0();
         let mut mgr = SessionManager::new();
         let id = mgr
             .create(
@@ -906,6 +965,7 @@ mod tests {
                 make_callsign("BB2BB"),
                 0,
                 LinkCapabilities::default(),
+                now,
             )
             .unwrap();
         assert_eq!(id, 0);
@@ -917,6 +977,7 @@ mod tests {
 
     #[test]
     fn test_manager_multiple_sessions() {
+        let now = t0();
         let mut mgr = SessionManager::new();
         for i in 0..16u8 {
             // Use valid callsign chars
@@ -927,6 +988,7 @@ mod tests {
                     remote_cs,
                     0,
                     LinkCapabilities::default(),
+                    now,
                 )
                 .unwrap();
             assert_eq!(id, i);
@@ -939,12 +1001,14 @@ mod tests {
                 make_callsign("R16"),
                 0,
                 LinkCapabilities::default(),
+                now,
             )
             .is_err());
     }
 
     #[test]
     fn test_manager_remove() {
+        let now = t0();
         let mut mgr = SessionManager::new();
         let id = mgr
             .create(
@@ -952,6 +1016,7 @@ mod tests {
                 make_callsign("B"),
                 0,
                 LinkCapabilities::default(),
+                now,
             )
             .unwrap();
         assert!(mgr.get(id).is_some());
@@ -961,12 +1026,14 @@ mod tests {
 
     #[test]
     fn test_manager_find_by_remote() {
+        let now = t0();
         let mut mgr = SessionManager::new();
         mgr.create(
             make_callsign("LOCAL"),
             make_callsign("REMOTE"),
             0,
             LinkCapabilities::default(),
+            now,
         )
         .unwrap();
 
@@ -979,12 +1046,14 @@ mod tests {
 
     #[test]
     fn test_manager_active_sessions() {
+        let now = t0();
         let mut mgr = SessionManager::new();
         mgr.create(
             make_callsign("L"),
             make_callsign("R1"),
             0,
             LinkCapabilities::default(),
+            now,
         )
         .unwrap();
         mgr.create(
@@ -992,6 +1061,7 @@ mod tests {
             make_callsign("R2"),
             0,
             LinkCapabilities::default(),
+            now,
         )
         .unwrap();
 
@@ -1009,6 +1079,7 @@ mod tests {
 
     #[test]
     fn test_full_handshake_through_manager() {
+        let now = t0();
         let mut mgr_a = SessionManager::new();
         let mut mgr_b = SessionManager::new();
 
@@ -1025,32 +1096,44 @@ mod tests {
 
         // A creates session and initiates
         let id_a = mgr_a
-            .create(make_callsign("ALPHA"), make_callsign("BRAVO"), 0, caps_a)
+            .create(
+                make_callsign("ALPHA"),
+                make_callsign("BRAVO"),
+                0,
+                caps_a,
+                now,
+            )
             .unwrap();
-        let req = mgr_a.get_mut(id_a).unwrap().initiate().unwrap();
+        let req = mgr_a.get_mut(id_a).unwrap().initiate(now).unwrap();
 
         // B creates session and handles request
         let id_b = mgr_b
-            .create(make_callsign("BRAVO"), make_callsign("ALPHA"), 0, caps_b)
+            .create(
+                make_callsign("BRAVO"),
+                make_callsign("ALPHA"),
+                0,
+                caps_b,
+                now,
+            )
             .unwrap();
         let ack = mgr_b
             .get_mut(id_b)
             .unwrap()
-            .handle_connect_req(&req.payload)
+            .handle_connect_req(&req.payload, now)
             .unwrap();
 
         // A handles ACK
         let cfm = mgr_a
             .get_mut(id_a)
             .unwrap()
-            .handle_connect_ack(&ack.payload)
+            .handle_connect_ack(&ack.payload, now)
             .unwrap();
 
         // B handles CFM
         mgr_b
             .get_mut(id_b)
             .unwrap()
-            .handle_connect_cfm(&cfm.payload)
+            .handle_connect_cfm(&cfm.payload, now)
             .unwrap();
 
         // Both established
@@ -1063,5 +1146,94 @@ mod tests {
         assert_eq!(neg_a, neg_b);
         assert_eq!(neg_a.max_payload_size, 150);
         assert_eq!(neg_a.arq_window, 4);
+    }
+
+    // ── Caller-supplied time (COP-90, H-136) ────────────────────────
+
+    #[test]
+    fn new_session_records_the_caller_time() {
+        let now = t0();
+        let s = session(now);
+        assert_eq!(s.created_at, now);
+        assert_eq!(s.last_activity, now);
+    }
+
+    #[test]
+    fn handshake_timeout_follows_the_caller_clock() {
+        let now = t0();
+        let mut s = session(now);
+        s.initiate(now).unwrap();
+        let limit = Duration::from_secs(HANDSHAKE_TIMEOUT_SECS);
+        assert!(!s.is_timed_out(now + limit - Duration::from_millis(1)));
+        assert!(s.is_timed_out(now + limit));
+    }
+
+    #[test]
+    fn keepalive_is_due_after_the_interval_and_resets_on_send() {
+        let now = t0();
+        let mut s = session(now);
+        s.state = SessionState::Established;
+        let k = s.keepalive_interval;
+        assert!(!s.needs_keepalive(now + k - Duration::from_millis(1)));
+        assert!(s.needs_keepalive(now + k));
+        s.keepalive(now + k).unwrap();
+        assert!(!s.needs_keepalive(now + k + k - Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn cfm_retry_waits_two_rto_of_caller_time() {
+        let now = t0();
+        let mut a = session(now);
+        a.initiate(now).unwrap();
+        a.handle_connect_ack(&LinkCapabilities::default().to_bytes(), now)
+            .unwrap();
+        let rto = Duration::from_secs(1);
+        assert!(a
+            .maybe_retry_cfm(rto, now + Duration::from_millis(1999))
+            .is_none());
+        assert!(a
+            .maybe_retry_cfm(rto, now + Duration::from_secs(2))
+            .is_some());
+        assert_eq!(a.cfm_retries, 1);
+    }
+
+    #[test]
+    fn cleanup_removes_only_sessions_expired_at_now() {
+        let now = t0();
+        let mut m = SessionManager::new();
+        let draining = m
+            .create(
+                make_callsign("AA1AA"),
+                make_callsign("BB2BB"),
+                0,
+                LinkCapabilities::default(),
+                now,
+            )
+            .unwrap();
+        let live = m
+            .create(
+                make_callsign("AA1AA"),
+                make_callsign("CC3CC"),
+                0,
+                LinkCapabilities::default(),
+                now,
+            )
+            .unwrap();
+        m.get_mut(draining).unwrap().initiate(now).unwrap();
+        m.get_mut(draining).unwrap().disconnect(now).unwrap();
+        m.get_mut(live).unwrap().state = SessionState::Established;
+        let removed =
+            m.cleanup_timed_out(now + Duration::from_secs(DEFAULT_DISCONNECT_TIMEOUT_SECS));
+        assert_eq!(removed, vec![draining]);
+        assert!(m.get(live).is_some());
+    }
+
+    #[test]
+    fn a_now_earlier_than_last_activity_counts_as_no_time_elapsed() {
+        let now = t0();
+        let mut s = session(now);
+        s.initiate(now).unwrap();
+        s.touch(now + Duration::from_secs(5));
+        assert!(!s.is_timed_out(now));
     }
 }

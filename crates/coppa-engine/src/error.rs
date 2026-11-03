@@ -6,13 +6,24 @@
 pub enum EngineError {
     /// The payload exceeds the header's length field.
     #[error("Payload too large ({len} bytes, max {max})")]
-    PayloadTooLarge { len: usize, max: usize },
+    PayloadTooLarge {
+        /// Payload length in bytes, after compression when it is enabled.
+        len: usize,
+        /// Largest payload the header's length field can carry, in bytes.
+        max: usize,
+    },
     /// The requested wire speed level is invalid.
     #[error("Invalid speed level: {level}")]
-    InvalidSpeedLevel { level: u8 },
+    InvalidSpeedLevel {
+        /// The rejected level; valid levels are 1-9.
+        level: u8,
+    },
     /// The requested level requires a VHF profile.
     #[error("speed level {level} is not available on an HF profile: HF profiles carry levels 1-8 (COP-24)")]
-    SpeedLevelUnavailableOnHf { level: u8 },
+    SpeedLevelUnavailableOnHf {
+        /// The requested VHF-only level (9).
+        level: u8,
+    },
     /// Input power is below the configured squelch.
     #[error("No signal detected")]
     NoSignalDetected,
@@ -21,7 +32,12 @@ pub enum EngineError {
     NoSamplesToDecode,
     /// The requested codeword count exceeds the frame limit.
     #[error("codewords ({requested}) exceeds max {max}")]
-    TooManyCodewords { requested: u8, max: u8 },
+    TooManyCodewords {
+        /// Codewords per frame the caller asked for.
+        requested: u8,
+        /// Most codewords one frame may carry.
+        max: u8,
+    },
     /// An explicit multi-codeword encode requires at least one codeword.
     #[error("codewords (0) is below the minimum of 1")]
     ZeroCodewords,

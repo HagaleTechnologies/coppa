@@ -331,6 +331,11 @@ impl Default for NrBg2Encoder {
 }
 
 impl NrBg2Encoder {
+    /// Build the encoder by inverting the BG2 core parity submatrix over GF(2).
+    ///
+    /// # Panics
+    ///
+    /// If the core submatrix is singular, which the shipped BG2 table is not.
     pub fn new() -> Self {
         let core = build_core_matrix(nr_bg2::ENTRIES, nr_bg2::ZC);
         let core_inv = core

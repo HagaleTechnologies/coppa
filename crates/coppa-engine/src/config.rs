@@ -15,7 +15,10 @@ pub const HF_MAX_SPEED_LEVEL: u8 = 8;
 /// [`Profile`] silently went on air as `vhf_wide` the moment `RateLoop` raised it
 /// to level 5 (and a VHF engine silently dropped to HF below level 5). A named
 /// profile now pins its band here, and every rebuild honors it.
+///
+/// Marked `#[non_exhaustive]`: a match outside this crate needs a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OfdmBand {
     /// Historical rule: levels 1-4 HF, >= 5 VHF. The `EngineConfig::default()`
     /// value -- an engine with no operator band preference keeps today's behavior.

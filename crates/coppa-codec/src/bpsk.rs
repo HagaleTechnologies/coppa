@@ -25,6 +25,7 @@ use crate::traits::{ConstellationMapper, Modem};
 ///     assert_eq!(mapper.demap_hard(symbol), vec![bit]);
 /// }
 /// ```
+#[derive(Debug)]
 pub struct BpskMapper;
 
 impl ConstellationMapper for BpskMapper {
@@ -84,6 +85,7 @@ impl ConstellationMapper for BpskMapper {
 /// let soft = modem.demodulate_soft(&audio).unwrap();
 /// assert!(!soft.is_empty());
 /// ```
+#[derive(Debug)]
 pub struct BpskModem {
     sample_rate_hz: f32,
     carrier_freq: f32,
@@ -102,6 +104,8 @@ impl Default for BpskModem {
 }
 
 impl BpskModem {
+    /// Creates the default modem: 8 kHz sample rate, 31.25 baud and a
+    /// 1000 Hz carrier (256 samples per symbol).
     pub fn new() -> Self {
         Self::with_params(8000.0, 31.25, 1000.0)
     }

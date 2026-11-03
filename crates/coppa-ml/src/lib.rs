@@ -25,6 +25,8 @@
 //! Task 9 deleted both as dead code. See docs/LIMITATIONS.md for
 //! what adaptation this crate does and does not perform today.
 
+#![warn(missing_docs, missing_debug_implementations)]
+
 pub mod busy_gate;
 pub mod cp_gate;
 pub mod mcs;

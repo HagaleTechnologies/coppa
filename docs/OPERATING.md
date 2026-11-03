@@ -31,10 +31,13 @@ INFO coppad: PTT method="rigctld 127.0.0.1:4532" active=rigctld state="released"
 |---|---|---|
 | `Coppa Daemon starting` | `version` | The `coppad` version. |
 | | `git_sha` | The commit HEAD pointed at when `coppad` was built (12 hex digits), or `unknown` for a build from a tree without `.git`. Packagers building from a tarball set `COPPA_GIT_SHA` (7-40 hex digits) at build time. It does not flag uncommitted changes. |
-| | `features` | `coppa-daemon`'s cargo features in this build (`cpal-backend`, `gpio-ptt`, `kiss-tnc`, `serial-ptt`, `websocket`), comma-separated, or `none`. |
+| | `features` | `coppa-daemon`'s cargo features in this build (`cpal-backend`, `gpio-ptt`, `kiss-tnc`, `mdns`, `serial-ptt`, `websocket`), comma-separated, or `none`. |
 | `Host listeners` | `bind_address` | `[host] bind_address`. |
-| | `vara_command`, `vara_data`, `websocket` | The bound `ip:port` (the real port when 0 is configured), `disabled`, or, for `websocket` only, `not-built` in a build without the `websocket` feature. The `websocket` port also serves the operator page over plain HTTP at `GET /` (COP-79). |
+| | `vara_command`, `vara_data`, `websocket` | The bound `ip:port` (the real port when 0 is configured), `disabled`, or, for `websocket` only, `not-built` in a build without the `websocket` feature. The `websocket` port also serves the operator page over plain HTTP at `GET /` (COP-79) and answers `GET /health` (COP-140, see [Health check](#health-check)). |
 | `Host listeners accept connections from other hosts; ...` (WARN) | `bind_address` | Logged when a listener is bound to a non-loopback address such as `0.0.0.0`: anyone who can reach it can key the transmitter. |
+| `mDNS advertisement` | `host`, `service`, `port`, `addresses` | Only with `[host] mdns_enabled = true` in an `mdns` build. The advertised host (`coppad.local.`), service instance (`coppad._coppa._tcp.local.`), bound WebSocket port, and `every non-loopback IPv4 address` (`bind_address = "0.0.0.0"`), `every non-loopback address` (`"[::]"`) or the single bound address. See [Finding coppad on the network](#finding-coppad-on-the-network-mdns). |
+| `mDNS name already in use on this network; ...` (WARN) | `original`, `new_name` | Another host answers for the name, so the responder renamed this daemon, for example to `coppad-2.local.`. Clients must use the new name. |
+| `mDNS responder error` (WARN) | `error` | A socket or interface problem the responder hit after startup. |
 | `Audio devices` | `input`, `output` | The device cpal opened, as its name and cpal id, for example `Default Audio Device (alsa:default)`. On ALSA, `default` is whatever PulseAudio, PipeWire or `.asoundrc` route it to; coppad cannot see further. A named device shows its own description and id. |
 | `Audio input/output started` | `hardware_rate`, `engine_rate` | The opened stream rate and modem profile rate; they differ when Coppa resamples. |
 | `Audio devices` | `input_hardware_rate`, `output_hardware_rate`, `engine_rate` | The effective input and output hardware rates and the modem profile rate. |
@@ -98,7 +101,8 @@ across all carriers at once and wrecks decode on every one of them.
    itself has no TX gain setting) all the way down.
 3. Key the calibration tone: `coppa tune` from the CLI (device and PTT settings
    come from the same `coppad.toml`; default 10 seconds,
-   `--seconds N` to change it), or `TUNE` (or `TUNE <seconds>`) on the daemon's
+   `--duration N` (`-d N`, more than 0 and at most 120) to change it; the old
+   `--seconds N` still works for one release with a deprecation warning), or `TUNE` (or `TUNE <seconds>`) on the daemon's
    VARA command port. This transmits a standard two-tone signal (700 Hz +
    1900 Hz, equal amplitude) — the same drive-level convention hams use for
    SSB two-tone tests.
@@ -208,8 +212,10 @@ Nothing in coppad can release PTT in these cases:
 - `ptt_guardian = false`, after `kill -9`, an out-of-memory kill or a crash.
 - A coppad that is still running but completely stuck (for example,
   deadlocked) while PTT is keyed.
-- `coppa tx` and `coppa tune` stopped with Ctrl-C. Errors and panics in them
-  do release PTT.
+- A second Ctrl-C in `coppa tx` or `coppa tune`, which exits at once without
+  cleanup. The first Ctrl-C (or SIGTERM) releases PTT and stops the audio
+  before exiting with status 130 (COP-86). Errors and panics in them also
+  release PTT.
 
 Turn on your rig's TX time-out timer (TOT), set a little longer than
 `max_tx_duration_s`. It is the only protection that works in every case
@@ -309,6 +315,142 @@ token and the page holds none; its `/ws` upgrade presents the token you type.
 | `state` | `ok`, `clipping` or `underdrive` (RX, after this window, using the thresholds above). TX is only ever `ok` or `clipping` |
 | `duration_ms` | Audio span the reading covers |
 | `timestamp_ms` | Wall-clock time the message was sent (Unix epoch, ms) |
+
+## Monitoring and discovery
+
+### Health check
+
+On a daemon with the WebSocket listener (built with `--features websocket`,
+run with `[host] websocket_enabled = true`), the WebSocket port answers
+`GET /health` and `HEAD /health` (COP-140). No token is needed. After
+`Daemon ready`:
+
+```console
+$ curl -i http://127.0.0.1:8400/health
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 16
+Cache-Control: no-store
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+Content-Security-Policy: frame-ancestors 'none'
+Connection: close
+
+{"status":"ok"}
+```
+
+After `Daemon running degraded` (for example `[radio] ptt_method = "rigctld"`
+with rigctld unreachable), the status line is the same and the body is:
+
+```text
+{"status":"degraded"}
+```
+
+- Both values return HTTP 200. A monitor that alerts on degradation matches
+  the `status` field, not the status code. `degraded` means startup found the
+  problems that the `Daemon running degraded problems=...` log line lists;
+  the body never repeats them.
+- The value is the startup verdict. A fault that starts later does not change
+  it, and a build without `cpal-backend` reports `ok`. `docs/LIMITATIONS.md`
+  has the details.
+- The body carries only the status: no version, callsign, frequency, PTT state
+  or session data. The query string is ignored, and the response has no
+  `Access-Control-Allow-Origin` header, so a page on another site cannot read
+  it.
+- `HEAD` returns the `GET` head, `Content-Length` included, with no body. This
+  holds for every path `GET` answers. Other methods get `405` with
+  `Allow: GET, HEAD`.
+- A connection must send its whole request head within 5 s, or the daemon
+  closes it without a response.
+- Without the WebSocket listener there is no port, so a probe gets "connection
+  refused".
+
+A probe in a systemd unit or a shell script:
+
+```bash
+curl -fsS http://127.0.0.1:8400/health | grep -q '"status":"ok"'
+```
+
+A Nagios or Icinga `check_http` probe that goes critical unless the daemon is
+healthy (Uptime Kuma: an HTTP(s) - Keyword monitor with the keyword
+`"status":"ok"`):
+
+```bash
+check_http -H 127.0.0.1 -p 8400 -u /health -s '"status":"ok"'
+```
+
+### Finding coppad on the network (mDNS)
+
+A `coppad` built with the `mdns` feature can advertise itself on the local
+network, so a phone, tablet or laptop opens it as `http://coppad.local:8400/`
+without knowing its address. The feature turns on `websocket` too:
+
+```bash
+cargo build --release -p coppa-daemon --features cpal-backend,websocket,mdns
+```
+
+```toml
+[host]
+bind_address = "0.0.0.0"
+websocket_enabled = true
+mdns_enabled = true
+```
+
+`mdns_enabled = true` needs all three of:
+
+- a `coppad` built with `--features mdns`;
+- `websocket_enabled = true`, because the WebSocket port is the only one
+  advertised;
+- a `bind_address` other hosts can reach, such as `"0.0.0.0"` or this host's
+  LAN address. Read the `bind_address` warning in `coppad.toml.example` first,
+  and use it only on a trusted, firewalled network.
+
+Otherwise `coppad` stops at startup, before it touches audio or PTT, with one
+of:
+
+```text
+Error: [host] mdns_enabled = true is set, but this coppad was built without the mdns feature and advertises nothing; rebuild with --features mdns, or set mdns_enabled = false
+Error: [host] mdns_enabled = true needs [host] websocket_enabled = true: coppad advertises its WebSocket port (the operator page and /health) and nothing else
+Error: [host] mdns_enabled = true needs a bind_address other hosts can reach, but bind_address = "127.0.0.1" is loopback, so coppad.local would send clients to a port that refuses them; set bind_address = "0.0.0.0" or this host's LAN address, on a trusted, firewalled network
+```
+
+A `bind_address` host name that resolves to loopback, such as `localhost`, gets
+the third message after the listener binds, naming the bound address.
+
+mDNS uses multicast on UDP port 5353; allow it through the host firewall.
+The responder runs inside `coppad` and needs no Avahi or Bonjour daemon. The
+daemon advertises:
+
+| Record | Value |
+|---|---|
+| Host name (A, and AAAA for `[::]`) | `coppad.local.` |
+| Service instance | `coppad._coppa._tcp.local.` |
+| SRV | `coppad.local.`, the bound WebSocket port (8400 by default) |
+| TXT | `txtvers=1`, `path=/`, `health=/health` |
+
+The VARA-style command and data ports, the ARDOP ports and KISS are not
+advertised. On a clean shutdown the daemon withdraws the records.
+
+Phones, tablets, macOS, Windows and browsers resolve `.local` names
+themselves. A Linux client needs nss-mdns (Avahi's `libnss-mdns` package with
+`mdns4_minimal` in `/etc/nsswitch.conf`); without it `getent hosts
+coppad.local` and `curl http://coppad.local:8400/` fail. On such a host,
+`avahi-browse -rt _coppa._tcp` lists the daemon; on macOS,
+`dns-sd -B _coppa._tcp` does.
+
+To open the operator page by its mDNS name, add that origin to
+`websocket_allowed_origins`, or the page reports `Refused`:
+
+```toml
+websocket_allowed_origins = ["http://coppad.local:8400"]
+```
+
+The name is fixed at `coppad.local`. If another host on the LAN already
+answers for it, the responder picks a new name (for example `coppad-2.local`)
+and logs `mDNS name already in use on this network; advertising under the new
+name` with `original` and `new_name`. Use the new name, and add its origin if
+you open the page by it. Set `RUST_LOG=mdns_sd=debug` to see the responder's
+own log.
 
 ## WebSocket access
 
@@ -625,6 +767,187 @@ nothing queued or un-acked, `DISCONNECTED` follows at once, as before.
 - `ABORT` during the drain ends it at once (COP-42): the rest is dropped,
   no DISCONNECT frame is sent, and the host gets one `DISCONNECTED`.
 - A remote DISCONNECT or a session timeout still drops unsent data at once.
+
+When CW ID is on, the DISCONNECT frame that ends a session is followed by
+this station's callsign in Morse in the same transmission. See "Morse (CW)
+ID at session end" below.
+
+## Morse (CW) ID at session end
+
+When CW ID is on, a station that ends a session keys its callsign in Morse
+right after its DISCONNECT frame, in the same transmission. The ID is a
+1000 Hz tone with 5 ms raised-cosine edges, at the same peak level as the
+OFDM audio. It goes through the same transmit path as every frame, so the
+callsign gate, the wideband gate, the busy-channel wait, turnaround and the
+PTT rules all apply to it.
+
+```toml
+[station_id]
+cwid = "host"
+cwid_wpm = 20
+```
+
+`cwid` decides who turns it on and off:
+
+| `cwid` | CW ID | Host `CWID ON` | Host `CWID OFF` |
+|---|---|---|---|
+| `"host"` (default) | off until a host sends `CWID ON` | `OK`, turns it on | `OK`, turns it off |
+| `"always"` | on | `OK`, no change | `WRONG`, stays on |
+| `"never"` | off | `WRONG`, stays off | `OK`, no change |
+
+The state applies to the whole daemon. With several hosts connected, the
+last one to send `CWID ON` or `CWID OFF` wins. `CWID` alone, or with any
+other argument (`CWID TRUE`, `CWID MAYBE`), gets `WRONG` and changes
+nothing. coppad logs each change at `INFO` (`CW ID turned on by VARA client
+3`) and each refusal (`CWID OFF refused: [station_id] cwid = "always"`). At
+startup it logs the current state, for example:
+
+```text
+INFO coppad::event_loop: CW ID after each session this station ends: off until a host sends CWID ON ([station_id] cwid = "host", 20 WPM)
+```
+
+Pat's VARA HF driver sends `CWID ON` every time it starts. Under the
+default `cwid = "host"`, that turns the CW ID on for the daemon, and every
+Pat session this station ends gains about 4.7 s of Morse for a 6-character
+call at 20 WPM. Set `cwid = "never"` if you do not want it.
+
+ARDOP hosts send `CWID TRUE` or `CWID FALSE` on the ARDOP command port.
+coppad always echoes the line, because a `WRONG` there would break Winlink
+Express init. Under `"host"` it applies the change. Under `"always"` or
+`"never"` the state does not change, and coppad logs, for example,
+`ARDOP CWID FALSE echoed but not applied: [station_id] cwid = "always"`.
+
+The CW ID follows every DISCONNECT frame this station sends to end a
+session:
+
+- a host `DISCONNECT`, once the queued data has drained;
+- a host `DISCONNECT` of a pending inbound attempt;
+- a session that COP-38's retry budget ends as a link failure;
+- a stalled drain that coppad ends;
+- a `CONNECT` that ends a drain.
+
+One transmission then carries the frame and the ID:
+
+```text
+PTT on | pre-delay | [station-ID frame, if due] | DISCONNECT frame | 7 units of silence | callsign in Morse | PTT tail | PTT off
+```
+
+There is no CW ID after `ABORT` (no frame is sent), after the other station
+disconnects (this station sends nothing), after a session times out with no
+drain, or after `TUNE`, a beacon or sessionless data. The OFDM station-ID
+frame still covers the 10-minute rule as before.
+
+coppad keys the callsign in force (`MYCALL`, or `[engine] callsign`) with
+any `-SSID` dropped, because the SSID is a network address and not part of
+the licensed call. `N1CALL-10` keys `N1CALL`. A `/` portable designator
+stays, so `N1CALL/P` keys `N1CALL/P`.
+
+`cwid_wpm` takes 10 to 20 (default 20). 47 CFR 97.119(b)(1) caps a CW ID
+sent by an automatic device at 20 WPM. Any other value stops coppad at
+startup:
+
+```text
+Error: [station_id] cwid_wpm = 25 is outside 10-20; 47 CFR 97.119(b)(1) caps an automatic CW ID at 20 WPM
+```
+
+`coppad --check` checks syntax and types only, so it does not report this.
+A `cwid` value other than the three above fails both, naming the key.
+
+Timing follows PARIS: one unit is 1.2 / WPM seconds. Airtime of the Morse
+part, including its 7-unit lead-in:
+
+| Callsign | Units | 20 WPM | 10 WPM |
+|---|---|---|---|
+| `N1CALL` | 78 | 4.68 s | 9.36 s |
+| `VE3ABCD` | 80 | 4.80 s | 9.60 s |
+| `N1CALL/P` | 108 | 6.48 s | 12.96 s |
+| `00000000` (longest 8-character call) | 180 | 10.80 s | 21.60 s |
+
+`[radio] max_tx_duration_s` (default 30) cuts any transmission that runs
+longer. If the DISCONNECT frame plus the CW ID would not fit inside
+`max_tx_duration_s` less a 2 s margin, coppad sends the frame alone and
+logs a warning:
+
+```text
+WARN coppad::event_loop: CW ID skipped: the DISCONNECT frame (1.9 s) plus the CW ID (4.7 s) would exceed [radio] max_tx_duration_s = 3 less a 2 s margin
+```
+
+The margin leaves room for a prepended station-ID frame and the PTT
+pre-delay. At the 30 s default, the longest call at 10 WPM still fits.
+
+## Rig frequency and mode from a host (FREQ, MODE)
+
+With `[radio] ptt_method = "rigctld"`, a host on the VARA command port can
+read the rig's frequency and mode. If the operator allows it, the host can
+also set them. These commands are coppa extensions, like `TUNE`. VARA has no
+such commands.
+
+| Line | Reply | Effect |
+|---|---|---|
+| `FREQ` | `FREQ <hz>`, the rig's answer to rigctld `f`; `WRONG` with no rigctld backend or no clean answer | none |
+| `FREQ <hz>` (decimal Hz, one argument) | `FREQ <hz>` as the rig reports it after the set; `WRONG` if refused or the rig did not accept it | sends `F <hz>`, then `f` |
+| `MODE` | `MODE <token>`, the rig's own token (`USB`, `PKTLSB`, `CW`, `RTTY`, ...); `WRONG` as for `FREQ` | none |
+| `MODE USB` / `LSB` / `PKTUSB` / `PKTLSB` (any case) | `MODE <token>` as the rig reports it after the set; `WRONG` if refused or rejected | sends `M <TOKEN> 0`, then `m` |
+| `FREQ 7.074`, `FREQ -1`, `FREQ 1 2`, `MODE CW`, `MODE USB 2400`, `FREQUENCY` | `WRONG` | none |
+
+The `0` in `M <TOKEN> 0` asks hamlib for the radio backend's default
+passband. coppad never answers from a cached or default value: every reply
+is a fresh reading from the rig.
+
+Reads work whenever the PTT backend is rigctld. Sets also need:
+
+```toml
+[radio]
+host_rig_control = true
+```
+
+`host_rig_control` is `false` by default. The command port has no
+authentication, and any web page you visit can send it a VARA line with a
+no-CORS POST (see `docs/LIMITATIONS.md`). With sets allowed, such a page
+could retune the rig.
+
+coppad refuses a set with `WRONG` and logs one `INFO` line with the reason.
+It checks in this order and reports the first reason that applies:
+
+1. `[radio] host_rig_control` is `false`.
+2. The PTT backend is not rigctld. This includes a rigctld that was
+   unreachable at startup, where coppad fell back to no PTT.
+3. The frequency is 0 or above 30 GHz.
+4. coppad is transmitting, or has sessionless data queued to send.
+5. A session is live (connecting, connected or disconnecting).
+
+With the default config, the log line reads:
+
+```text
+INFO coppad::event_loop: FREQ 7074000 refused: host rig control is off; set [radio] host_rig_control = true to allow it
+```
+
+The reply to a set is what the rig reports afterwards, not what the host
+asked for. If the rig accepts `F 7074005` but reports 7074000, the host gets
+`FREQ 7074000` and coppad logs a warning. A host should compare the reply
+with its request.
+
+```text
+WARN coppad::event_loop: FREQ 7074005: rig reports 7074000 Hz after the set
+```
+
+A retune does not get around the frequency gate (COP-40). On a wideband
+profile, coppad reads the rig's frequency before each transmission and
+refuses it below 29.7 MHz. A host retune below 29.7 MHz on `VHF_FAST`
+therefore gets a warning, and every later transmission is refused until the
+rig is retuned:
+
+```text
+WARN coppad::event_loop: FREQ 14074000: the rig is now below 29.7 MHz; the VHF_FAST profile's wideband gate will refuse every transmission until it is retuned
+```
+
+coppad talks to rigctld on its main event loop, as it does for PTT. A
+healthy rigctld answers in milliseconds. A dead one stalls the loop for up
+to about 4 s per query and about 6 s per set (a 2 s reconnect and a 2 s
+read for each step).
+
+Only the VARA command port has these commands. The WebSocket API, the ARDOP
+command port and the C FFI have no frequency or mode control.
 
 ## BUSY lines on the command port
 

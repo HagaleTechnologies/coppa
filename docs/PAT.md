@@ -120,7 +120,8 @@ When Pat opens the modem it sends `PUBLIC ON`, `CWID ON`, `COMPRESSION TEXT`, `M
 
 | Pat sends | coppad replies | Honoured? |
 |---|---|---|
-| `PUBLIC ON`, `CWID ON` | `WRONG` | no; coppad's `[station_id]` settings do station ID |
+| `PUBLIC ON` | `WRONG` | no; coppad's `[station_id]` settings do station ID |
+| `CWID ON` | `OK`; `WRONG` under `[station_id] cwid = "never"` | yes under the default `cwid = "host"`: turns on the closing Morse ID, which follows the DISCONNECT frame of a session this station ends, about 4.7 s of CW at 20 WPM for a 6-character call; no ID after `ABORT` ([OPERATING.md](OPERATING.md#morse-cw-id-at-session-end) has every exception) |
 | `COMPRESSION TEXT`, `BW2300` | `OK` | accepted, no effect; `[engine] profile` sets the waveform, so match it on both stations |
 | `MYCALL <call>` | `OK` | yes, becomes the daemon's callsign |
 | `LISTEN OFF` / `LISTEN ON` | `OK` | yes; coppad starts with listening off |

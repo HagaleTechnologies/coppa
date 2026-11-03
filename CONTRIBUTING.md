@@ -38,6 +38,10 @@ cargo fmt --all -- --check
 - Make sure CI is green: clippy (`-D warnings`), `fmt`, and tests across the
   Linux/macOS/Windows matrix.
 - Match the surrounding code's style, naming, and comment density.
+- If your change breaks a public Rust API in a library crate, bump the minor
+  `version` in the root `Cargo.toml` (`[workspace.package]` and `[package]`) in
+  the same PR. CI's semver job fails otherwise; see
+  `docs/DECISIONS/2026-11-02-public-rust-api-semver-gate.md`.
 
 ## Licensing
 

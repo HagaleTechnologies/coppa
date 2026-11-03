@@ -61,6 +61,12 @@ max_tx_duration_s = 30
 # for "none", "vox" and serial PTT; for serial, the OS drops DTR/RTS when the
 # port closes. Set to false to disable.
 ptt_guardian = true
+# COP-84: let a VARA command-port client retune the rig (FREQ <hz>) or change
+# its mode (MODE USB|LSB|PKTUSB|PKTLSB) through rigctld. Off by default: the
+# command port has no authentication, and any web page you visit can send it
+# a line. Reading the frequency and mode (FREQ, MODE) works without this.
+# Sets are refused while transmitting or while a session is live.
+host_rig_control = false
 # Half-duplex RX->TX turnaround: after decoding a frame, wait this many ms
 # before keying PTT for any transmission (ACKs, CONNECT_ACK, replies). The
 # OTHER station stays keyed for its own ptt_tail_delay_ms (or its rig's VOX
@@ -129,7 +135,19 @@ websocket_port = 8400
 # this same port; loading it needs no token, and it holds none. For the page to
 # connect, add its own origin exactly as the browser's address bar shows it,
 # e.g. "http://127.0.0.1:8400" (and "http://localhost:8400" if you open it by
-# that name), to websocket_allowed_origins.
+# that name, and "http://coppad.local:8400" if you open it by its mDNS name),
+# to websocket_allowed_origins. GET /health on this port answers
+# {"status":"ok"} or {"status":"degraded"} for monitoring tools, with no token.
+# mDNS (COP-140): advertise this daemon on the local network as coppad.local,
+# with one "_coppa._tcp" service for the WebSocket port above (the operator
+# page at / and the health check at /health). Phones, tablets, macOS, Windows
+# and browsers resolve .local names themselves; a Linux client needs nss-mdns
+# (Avahi). Needs a coppad built with --features mdns, websocket_enabled = true,
+# and a bind_address other hosts can reach (for example "0.0.0.0"; read the
+# bind_address warning above first). Uses UDP port 5353. A page opened at
+# http://coppad.local:8400/ needs "http://coppad.local:8400" in
+# websocket_allowed_origins.
+mdns_enabled = false
 
 [engine]
 # Profile: HF_ROBUST, HF_STANDARD, VHF_FAST, EMERGENCY (case-insensitive).
@@ -165,6 +183,15 @@ id_interval_secs = 540
 # retried on the next tick). 0 (default) disables beacon mode. Also requires
 # [engine] callsign to be set.
 beacon_interval_secs = 0
+# COP-84: Morse (CW) ID after the DISCONNECT frame of each session this
+# station ends. "host" (default): off until a host sends CWID ON (Pat's VARA
+# driver does, on every start); hosts may turn it on and off. "always": on;
+# a host's CWID OFF is refused. "never": off; a host's CWID ON is refused.
+# Costs about 4.7 s of airtime per session for a 6-character call at 20 WPM.
+cwid = "host"
+# CW ID speed in words per minute, 10-20. 47 CFR 97.119(b)(1) caps an
+# automatic CW ID at 20 WPM.
+cwid_wpm = 20
 
 # --- Session Configuration (for connected mode) ---
 # Operational knobs for connected sessions; protocol parameters beyond

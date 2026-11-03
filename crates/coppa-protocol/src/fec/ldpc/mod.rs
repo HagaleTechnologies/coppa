@@ -28,6 +28,19 @@ pub struct LdpcCodec {
     code_rate: CodeRate,
 }
 
+impl std::fmt::Debug for LdpcCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The encoder and decoder hold the expanded code matrices; print only
+        // the parameters that identify the code.
+        let code = self.code();
+        f.debug_struct("LdpcCodec")
+            .field("code_rate", &self.code_rate)
+            .field("info_bits", &code.info_bits())
+            .field("coded_bits", &code.coded_bits())
+            .finish_non_exhaustive()
+    }
+}
+
 impl LdpcCodec {
     /// Create a new LDPC codec for the given code rate.
     pub fn new(rate: CodeRate) -> Self {
@@ -85,6 +98,8 @@ impl Default for NrLdpc {
 }
 
 impl NrLdpc {
+    /// Build the lifted BG2 encoder and decoder (Zc = 176). This is the
+    /// expensive step; build once and reuse.
     pub fn new() -> Self {
         Self {
             encoder: encoder::NrBg2Encoder::new(),

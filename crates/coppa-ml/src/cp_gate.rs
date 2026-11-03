@@ -44,6 +44,7 @@ pub enum CpRecommendation {
 }
 
 /// Spread-gated short-CP recommendation state. See the module doc for the hysteresis rule.
+#[derive(Debug)]
 pub struct CpGate {
     threshold_ms: f32,
     consecutive_needed: u8,
