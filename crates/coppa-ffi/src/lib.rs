@@ -1576,8 +1576,27 @@ pub unsafe extern "C" fn coppa_link_process(
             return Err((COPPA_ERR_NULL_ARG, "tx is null".to_owned()));
         }
         let now = l.instant(now_ms)?;
+        // A caller may pass one buffer for both rx and tx (an in-place
+        // audio callback). A shared slice over memory that a mutable slice
+        // also covers is undefined behaviour, so copy rx first when the two
+        // ranges overlap.
+        let overlaps = rx_len > 0 && tx_len > 0 && {
+            let (r0, r1) = (
+                rx as usize,
+                rx as usize + rx_len * std::mem::size_of::<f32>(),
+            );
+            let (t0, t1) = (
+                tx as usize,
+                tx as usize + tx_len * std::mem::size_of::<f32>(),
+            );
+            r0 < t1 && t0 < r1
+        };
+        let rx_copy: Vec<f32>;
         let rx: &[f32] = if rx_len == 0 {
             &[]
+        } else if overlaps {
+            rx_copy = std::slice::from_raw_parts(rx, rx_len).to_vec();
+            &rx_copy
         } else {
             std::slice::from_raw_parts(rx, rx_len)
         };

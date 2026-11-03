@@ -726,6 +726,9 @@ impl Link {
         arq.tx.process_ack(ack.ack_num, ack.ack_bitmap, now);
         if arq.tx.in_flight() == 0 {
             self.data_keyed_at = None;
+            // Retransmissions queued behind a turnaround hold are now stale;
+            // keying them would only waste half-duplex airtime.
+            self.queue.retain(|f| f.kind != FrameKind::Data);
         }
         if self.awaiting_first_ack {
             self.awaiting_first_ack = false;
@@ -796,6 +799,11 @@ impl Link {
             return;
         }
         let seqs = arq.tx.get_retransmits(now);
+        if !seqs.is_empty() {
+            // The window is one frame, so an older queued copy of the same
+            // segment that never got keyed is superseded by this one.
+            self.queue.retain(|f| f.kind != FrameKind::Data);
+        }
         for seq in seqs {
             let Some(arq) = self.arq.as_mut() else {
                 return;
@@ -927,7 +935,10 @@ impl Link {
         let budget =
             coppa_protocol::modem::max_payload_for_level(self.core.speed_level()).unwrap_or(0);
         let header = MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE;
-        let rest: Vec<u8> = self.backlog.iter().copied().collect();
+        let optimistic = budget.saturating_sub(header + 1).max(1);
+        // Only the first `optimistic` bytes can go in one chunk; copying the
+        // whole backlog here would make a large send() quadratic.
+        let rest: Vec<u8> = self.backlog.iter().take(optimistic).copied().collect();
         let Some(session) = self.session.as_ref() else {
             return 1;
         };
@@ -936,7 +947,6 @@ impl Link {
                 .encoded_payload_len(&session_data_frame(session, seq, c))
                 <= budget
         };
-        let optimistic = budget.saturating_sub(header + 1).max(1);
         let mut target = optimistic.min(rest.len());
         let mut rejected = None;
         while target > 1 && !fits(&rest[..target]) {

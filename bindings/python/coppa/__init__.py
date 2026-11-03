@@ -150,6 +150,7 @@ class Link:
     def __init__(self, callsign, profile=None, speed_level=0, turnaround_ms=0):
         self._h = ctypes.c_void_p()
         self._tx_buf = None
+        self._rx_buf = None
         cfg = _ffi.LinkConfigStruct()
         cfg.struct_size = ctypes.sizeof(_ffi.LinkConfigStruct)
         cfg.callsign = callsign.encode("utf-8")
@@ -176,7 +177,10 @@ class Link:
 
     def send(self, data):
         """Queue bytes for reliable delivery. Needs state CONNECTED."""
-        buf = bytes(data)
+        if isinstance(data, (int, str)):
+            # bytes(5) would queue five NUL bytes; refuse it instead.
+            raise TypeError("send() needs a bytes-like object, not %s" % type(data).__name__)
+        buf = bytes(memoryview(data).cast("B"))
         arr = (ctypes.c_uint8 * len(buf)).from_buffer_copy(buf) if buf else None
         _check(_ffi.lib.coppa_link_send(self._handle(), arr, len(buf)))
 
@@ -192,7 +196,11 @@ class Link:
         number of rx samples. Returns ``(array('f') of tx_len samples, active)``
         where the first ``active`` samples are signal and the rest are zero.
         """
-        raw = memoryview(rx).cast("B")
+        view = memoryview(rx)
+        if view.itemsize != 1 and view.format not in ("f", "<f", "=f"):
+            # A float64 buffer read as float32 would decode as noise.
+            raise TypeError("rx must be float32 samples or raw bytes, not format %r" % view.format)
+        raw = view.cast("B")
         n_rx = len(raw) // 4
         if tx_len is None:
             tx_len = n_rx
@@ -212,7 +220,9 @@ class Link:
 
     def recv(self, max_bytes=65536):
         """Return delivered bytes (up to ``max_bytes``), or b'' when none."""
-        buf = (ctypes.c_uint8 * max_bytes)()
+        if self._rx_buf is None or len(self._rx_buf) != max_bytes:
+            self._rx_buf = (ctypes.c_uint8 * max_bytes)()
+        buf = self._rx_buf
         out_len = ctypes.c_size_t(0)
         _check(_ffi.lib.coppa_link_recv(self._handle(), buf, max_bytes, ctypes.byref(out_len)))
         return bytes(buf[: out_len.value])
