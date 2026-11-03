@@ -47,10 +47,11 @@ threads, the old step resolved all five and made six mutations after the move.
 
 ## Limits
 
-- **One thread can still resolve after a push.** A push that lands after a thread's own check
-  and before its reply lets that one thread resolve against the old head. GitHub has no
-  compare-and-set on review-thread mutations, so any check before a mutation is
-  check-then-act.
+- **One thread can still resolve after a push.** The check runs before the thread's compare,
+  first live read, reply, second live read and resolve. A push that lands anywhere in that
+  span, up to the resolve itself, lets that one thread get its reply naming the old head and
+  resolve. The next thread's check then stops the loop. GitHub has no compare-and-set on
+  review-thread mutations, so any check before a mutation is check-then-act.
 - **A stop changes no verdict.** `outcome=success` is written before the loop, so it stands, and
   the `Update the check-run` step still concludes H1's check-run and dispatches `ci-full.yml`
   for H1, as before. That is correct for H1. The threads left unresolved stay unresolved and
@@ -84,6 +85,12 @@ pre-COP-141 file, which must fail.
 - **The request-marker POST retry, the other hunk of `f8e1243`.** It fixes a different failure
   in the request job, and its context does not match coppa's (the pre-existing check-run
   condition has no title clause here). It needs its own ticket and test.
-- **A second head check just before the reply mutation.** It would narrow the one-thread window
-  above by one API call and still not close it, at the cost of another call per thread.
+- **A second head check just before the reply mutation.** It would take the compare and the
+  first live read out of the one-thread window above, but the reply, the second live read and
+  the resolve would stay in it, at the cost of another call per thread.
+- **Moving the one check down to just before the reply.** That narrows the window by the same
+  two calls with no extra call, but the check would no longer come before the thread's work,
+  as the ticket asks ("the loop checks before its next thread"), threads after a move would
+  still spend their compare and live read, and the step would stop matching upstream's
+  placement, which keeps the fleet's copies of this file diffable.
 - **A retry on the in-loop lookup.** The next iteration already checks again.

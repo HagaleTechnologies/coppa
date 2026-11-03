@@ -13,9 +13,15 @@
 //! `issue_comment`, so a PR that edits it never exercises its own change. This
 //! test is the only pre-merge evidence. It extracts the real `compute-verdict`
 //! `run:` body, substitutes the two `${{ ... }}` baseline expressions, and runs it
-//! under `bash --noprofile --norc -e` (GitHub's default for a `run:` step with no
-//! `shell:`) against a stateful mock `gh` placed first on `PATH`. The mock moves
-//! the head from H1 to H2 on the trigger each case names.
+//! under `bash --noprofile --norc -e` against a stateful mock `gh` placed first on
+//! `PATH`, with a cleared environment. GitHub runs a `run:` step with no `shell:`
+//! as `bash -e {0}`. A non-interactive shell reads no profile or rc file either
+//! way, so the two extra flags only make that explicit. The mock moves the head
+//! from H1 to H2 on the trigger each case names.
+//!
+//! The step writes its error logs to fixed `/tmp/*-err.log` paths. The harness
+//! points those at the case's own scratch directory, so concurrent runs from
+//! other checkouts or users cannot collide on them.
 //!
 //! The `run:` body is extracted by hand rather than with a YAML crate, for the
 //! reason `tests/serena_project_config.rs` gives: a tooling guard test is not
@@ -44,8 +50,7 @@ use std::sync::Mutex;
 
 /// Runs one case at a time. Each case writes an executable mock and then spawns
 /// `bash`. Serialising keeps a spawn in another test thread from inheriting the
-/// mock's open write descriptor, which would make its exec fail with ETXTBSY,
-/// and keeps the step's fixed `/tmp/*-err.log` files to one writer.
+/// mock's open write descriptor, which would make its exec fail with ETXTBSY.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// The two step expressions that `compute-verdict` reads from the `baseline`
@@ -264,6 +269,21 @@ fn runnable_body(src: &str, ids: &[String]) -> String {
     body
 }
 
+/// Points the step's fixed `/tmp/` error-log paths at `dir`. The path is spliced
+/// into unquoted shell redirections, so it is used only when every character is
+/// shell-safe. Otherwise the step keeps `/tmp/`, where concurrent runs by the
+/// same user can mix message text but not control flow.
+fn redirect_tmp_logs(body: &str, dir: &Path) -> String {
+    let safe = dir.to_str().filter(|d| {
+        d.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c))
+    });
+    match safe {
+        Some(d) => body.replace("/tmp/", &format!("{d}/")),
+        None => body.to_string(),
+    }
+}
+
 /// Returns true when `bash` and `jq` both run. Panics instead of skipping when
 /// `CI` is set, so CI cannot pass by skipping.
 fn tools_available() -> bool {
@@ -399,16 +419,17 @@ fn run_case(case: &Case) -> Option<Run> {
         return None;
     }
 
-    let ids = thread_ids(case.threads);
-    let body = runnable_body(&read_workflow(), &ids);
-
     let scratch = Scratch::new(case.name);
     let bin = scratch.path.join("bin");
     let state = scratch.path.join("state");
-    for dir in [&bin, &state] {
+    let logs = scratch.path.join("logs");
+    for dir in [&bin, &state, &logs] {
         fs::create_dir_all(dir)
             .unwrap_or_else(|e| panic!("failed to create {}: {e}", dir.display()));
     }
+
+    let ids = thread_ids(case.threads);
+    let body = redirect_tmp_logs(&runnable_body(&read_workflow(), &ids), &logs);
     let gh = bin.join("gh");
     write(&gh, MOCK_GH);
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o755))
