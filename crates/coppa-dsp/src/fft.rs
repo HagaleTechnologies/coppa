@@ -7,10 +7,21 @@ use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 use std::sync::Arc;
 
+/// Why an [`FftProcessor`] could not be built or could not transform an input.
+///
+/// Marked `#[non_exhaustive]`: a match outside this crate needs a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum FftError {
+    /// The requested transform size was 0.
     ZeroSize,
-    LengthMismatch { expected: usize, got: usize },
+    /// The input slice's length differs from the processor's size.
+    LengthMismatch {
+        /// The processor's configured size, in samples.
+        expected: usize,
+        /// The length of the slice the caller passed, in samples.
+        got: usize,
+    },
 }
 
 impl std::fmt::Display for FftError {
@@ -51,13 +62,28 @@ impl std::error::Error for FftError {}
 ///     assert!((a - b).norm() < 1e-4);
 /// }
 /// ```
+#[derive(Clone)]
 pub struct FftProcessor {
     size: usize,
     fwd: Arc<dyn Fft<f32>>,
     inv: Arc<dyn Fft<f32>>,
 }
 
+impl std::fmt::Debug for FftProcessor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The rustfft plans are `dyn Fft` trait objects with no `Debug`.
+        f.debug_struct("FftProcessor")
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
 impl FftProcessor {
+    /// Plans a forward and an inverse transform of `size` points.
+    ///
+    /// Panics if `size` is 0; use [`FftProcessor::try_new`] to get an error
+    /// instead.
+    #[must_use]
     pub fn new(size: usize) -> Self {
         assert!(size > 0, "FFT size must be > 0");
         let mut planner = FftPlanner::new();
@@ -75,6 +101,7 @@ impl FftProcessor {
     }
 
     /// Forward FFT: time domain -> frequency domain.
+    #[must_use]
     pub fn forward(&self, input: &[Complex32]) -> Vec<Complex32> {
         assert_eq!(
             input.len(),
@@ -103,6 +130,7 @@ impl FftProcessor {
 
     /// Inverse FFT: frequency domain -> time domain.
     /// Output is scaled by 1/N.
+    #[must_use]
     pub fn inverse(&self, input: &[Complex32]) -> Vec<Complex32> {
         assert_eq!(
             input.len(),
@@ -134,6 +162,8 @@ impl FftProcessor {
         Ok(self.inverse(input))
     }
 
+    /// The transform length in points, fixed at construction.
+    #[must_use]
     pub fn size(&self) -> usize {
         self.size
     }
@@ -181,6 +211,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "FFT size must be > 0")]
     fn test_fft_zero_size_panics() {
-        FftProcessor::new(0);
+        let _ = FftProcessor::new(0);
     }
 }

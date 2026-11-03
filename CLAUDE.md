@@ -49,8 +49,8 @@ cargo bench --workspace
 
 ## CI and MSRV
 
-- `ci.yml` (every push, PR and merge-queue run): `cargo check` with default, all and no default features; `cargo test --lib` with features; `cargo fmt --check`; and a Linux/macOS/Windows matrix (`--lib` only).
-- `ci-full.yml` (dispatched once the Codex review gate passes, plus push and merge queue): full test suite, bench and fuzz builds, clippy `-D warnings`, MSRV, cargo-deny, security audit, and sunto's `wiki-lint` on `wiki/`.
+- `ci.yml` (every push, PR and merge-queue run): `cargo check` with default, all and no default features; `cargo test --lib` with features; `cargo fmt --check`; `cargo check --target wasm32-unknown-unknown` for `coppa-dsp`, `-codec`, `-protocol`, `-ml` and `-engine`; and a Linux/macOS/Windows matrix (`--lib` only).
+- `ci-full.yml` (dispatched once the Codex review gate passes, plus push and merge queue): full test suite, bench and fuzz builds, clippy `-D warnings`, MSRV, cargo-deny, security audit, cargo-semver-checks against the merge base (a public API break needs a minor version bump), and sunto's `wiki-lint` on `wiki/`.
 - MSRV is 1.85.0, enforced in CI and `Cargo.toml`.
 
 ## Known limitations and where docs live

@@ -421,10 +421,13 @@ impl Default for NrBg2Decoder {
 }
 
 impl NrBg2Decoder {
+    /// Decoder with the default min-sum scale (0.75) and iteration cap (30).
     pub fn new() -> Self {
         Self::with_params(NR_DEFAULT_SCALE, NR_DEFAULT_MAX_ITERATIONS)
     }
 
+    /// Decoder with an explicit normalized min-sum `scale` (multiplied into
+    /// each check-to-variable magnitude) and a cap of `max_iterations`.
     pub fn with_params(scale: f32, max_iterations: usize) -> Self {
         let mut rows_edges: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nr_bg2::BASE_ROWS];
         for &(r, c, s) in nr_bg2::ENTRIES {

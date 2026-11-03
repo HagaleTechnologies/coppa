@@ -27,3 +27,6 @@ default = []
 # compiled, with only the real device access limited to Linux.
 serial-ptt = ["dep:serialport"]
 gpio-ptt = []
+
+[lints]
+workspace = true

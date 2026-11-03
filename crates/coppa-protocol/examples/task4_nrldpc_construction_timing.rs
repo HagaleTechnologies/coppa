@@ -7,6 +7,10 @@
 //! Not part of the bench gate itself (that's `decode CPU/frame`, a steady-
 //! state per-frame cost, measured separately in `coppa-bench`); this is
 //! purely about one-time construction cost.
+
+// This program times wall-clock work, so it reads the clock (COP-90 guard).
+#![allow(clippy::disallowed_methods)]
+
 use coppa_protocol::fec::ldpc::codes::CodeRate;
 use coppa_protocol::fec::ldpc::{LdpcCodec, NrLdpc};
 use std::time::Instant;

@@ -43,7 +43,9 @@ pub type LiveDevice = cpal::Device;
 pub use cpal_backend::{find_input_device_by_name, find_output_device_by_name};
 
 #[cfg(feature = "file-backend")]
-pub use file_backend::{RawF32Sink, RawF32Source, WavSink, WavSource};
+pub use file_backend::{
+    PcmFormat, RawF32Sink, RawF32Source, RawPcmReader, RawPcmWriter, WavFormat, WavSink, WavSource,
+};
 
 /// Describes an available audio device.
 #[derive(Debug, Clone)]
@@ -53,6 +55,21 @@ pub struct AudioDevice {
     pub max_sample_rate: u32,
     pub input_channels: u16,
     pub output_channels: u16,
+}
+
+/// The host's default device in one direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultDevice {
+    pub name: String,
+    pub id: Option<String>,
+}
+
+/// The host's default input and output devices, `None` where there is none
+/// (or no audio backend in this build).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DefaultDevices {
+    pub input: Option<DefaultDevice>,
+    pub output: Option<DefaultDevice>,
 }
 
 /// Audio capture source.
@@ -103,6 +120,20 @@ pub fn list_devices() -> Result<Vec<AudioDevice>> {
     Ok(Vec::new())
 }
 
+/// The host's default input and output devices. The default can be missing
+/// from `list_devices` (ALSA's `default` PCM, for one), so it is reported on
+/// its own.
+#[cfg(feature = "cpal-backend")]
+pub fn default_devices() -> DefaultDevices {
+    cpal_backend::default_cpal_devices()
+}
+
+/// The host's default devices (no backend available: none).
+#[cfg(not(feature = "cpal-backend"))]
+pub fn default_devices() -> DefaultDevices {
+    DefaultDevices::default()
+}
+
 /// Name of the compiled live audio backend.
 #[cfg(feature = "cpal-backend")]
 pub fn audio_backend_name() -> Option<&'static str> {
@@ -145,6 +176,7 @@ mod tests {
     #[test]
     fn without_a_backend_nothing_is_listed_or_probed() {
         assert_eq!(audio_backend_name(), None);
+        assert_eq!(default_devices(), DefaultDevices::default());
         assert!(list_device_support(48_000).unwrap().is_empty());
         assert_eq!(
             probe_device(Direction::Input, None, 48_000),

@@ -165,10 +165,11 @@ fn tx_at_a_level_decodes_with_plain_rx() {
     let tx = coppa(&["tx", "CQ CQ DE TEST", "--level", "4", "-o", wav.path()]);
     assert!(tx.status.success(), "{}", stderr(&tx));
     // 37800 samples at 48 kHz is the 788 ms HF row of `coppa profiles`.
+    // Status lines are on stderr since COP-86.
     assert!(
-        stdout(&tx).contains("Generated 37800 audio samples"),
+        stderr(&tx).contains("Generated 37800 audio samples"),
         "{}",
-        stdout(&tx)
+        stderr(&tx)
     );
 
     let rx = coppa(&["rx", "-i", wav.path()]);
