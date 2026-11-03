@@ -10,4 +10,5 @@ pub mod profile_ab;
 pub mod report;
 pub mod runner;
 pub mod scenario;
+pub mod sync_threshold;
 pub mod transfer;
