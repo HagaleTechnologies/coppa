@@ -99,8 +99,15 @@ command -v "$DIREWOLF" >/dev/null 2>&1 ||
     setup_fail "missing tool: $DIREWOLF (Debian/Ubuntu: apt install direwolf, or pass --direwolf PATH)"
 command -v "$ATEST" >/dev/null 2>&1 ||
     setup_fail "missing tool: $ATEST (Debian/Ubuntu: apt install direwolf, or pass --atest PATH)"
-DIREWOLF=$(command -v "$DIREWOLF")
-ATEST=$(command -v "$ATEST")
+# Absolute paths: the script changes to the repo root before running the programs.
+abspath() {
+    case "$1" in
+        /*) printf '%s\n' "$1" ;;
+        *) printf '%s/%s\n' "$(cd "$(dirname "$1")" && pwd)" "$(basename "$1")" ;;
+    esac
+}
+DIREWOLF=$(abspath "$(command -v "$DIREWOLF")")
+ATEST=$(abspath "$(command -v "$ATEST")")
 
 # The ISO: --iso, or the cached download.
 CACHED=0
@@ -118,7 +125,7 @@ if [[ -z "$ISO" ]]; then
 fi
 [[ -f "$ISO" ]] || setup_fail "$ISO: no such file"
 
-check_pin() { # path want label; exits 2 on a mismatch
+check_pin() { # path want label; prints the mismatch and returns 1
     local got
     got=$(sha256 "$1")
     if [[ "$got" != "$2" ]]; then
@@ -171,6 +178,8 @@ say "coppa $COPPA_SHA ($TREE), direwolf $DIREWOLF, atest $ATEST"
 
 say "building and running coppa-bench --example afsk_vs_direwolf (release)"
 cd "$REPO"
+cargo build --release -q -p coppa-bench --example afsk_vs_direwolf ||
+    setup_fail "cargo build of coppa-bench --example afsk_vs_direwolf failed"
 status=0
 cargo run --release -q -p coppa-bench --example afsk_vs_direwolf -- \
     --wav "$SCRATCH/track2.wav" --direwolf "$DIREWOLF" --atest "$ATEST" \

@@ -442,15 +442,24 @@ fn write_channel0<R: io::Read, W: Write>(
     sink.flush()
 }
 
-/// Runs `program -c <work_dir>/direwolf.conf -t 0` with channel 0 of `wav` on stdin as 16-bit
-/// little-endian samples, and counts its channel 0 frame lines.
-pub fn run_direwolf(program: &Path, wav: &Path, work_dir: &Path) -> Result<DecoderRun> {
+/// Opens `wav` and checks that it is 16-bit PCM, the only input `run_direwolf` streams to
+/// `direwolf`. The `afsk_vs_direwolf` diagnostic calls it before coppa's pass, so a wrong file
+/// fails at once instead of after minutes of decoding.
+pub fn open_pcm16(wav: &Path) -> Result<hound::WavReader<io::BufReader<std::fs::File>>> {
     let reader = hound::WavReader::open(wav)
         .with_context(|| format!("{}: cannot open as WAV", wav.display()))?;
     let spec = reader.spec();
     if spec.sample_format != hound::SampleFormat::Int || spec.bits_per_sample != 16 {
         bail!("{}: direwolf input must be 16-bit PCM", wav.display());
     }
+    Ok(reader)
+}
+
+/// Runs `program -c <work_dir>/direwolf.conf -t 0` with channel 0 of `wav` on stdin as 16-bit
+/// little-endian samples, and counts its channel 0 frame lines.
+pub fn run_direwolf(program: &Path, wav: &Path, work_dir: &Path) -> Result<DecoderRun> {
+    let reader = open_pcm16(wav)?;
+    let spec = reader.spec();
     let conf = work_dir.join("direwolf.conf");
     std::fs::write(&conf, direwolf_config(spec.sample_rate))
         .with_context(|| format!("writing {}", conf.display()))?;

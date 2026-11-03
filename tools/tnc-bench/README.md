@@ -29,10 +29,10 @@ No redistribution terms are stated on the page or in the ISO, so the script fetc
 run time and nothing is committed to this repo. The page asks: "Please DO NOT play these test
 tracks over-the-air! My callsign is embedded in the beacons and will be igated."
 
-The script checks four pins: the ISO SHA-256 before extraction, the FLAC SHA-256 after it, and
-the decoded WAV SHA-256. A mismatch on the ISO or FLAC stops the run with exit 2. `flac -d`
-checks the audio against the MD5 in the FLAC header, so a WAV that differs from the pin (the
-header bytes depend on the `flac` build) only prints a note.
+The script checks three SHA-256 pins: the ISO before extraction, the track's FLAC after it, and
+the decoded WAV. A mismatch on the ISO or FLAC stops the run with exit 2. `flac -d` checks the
+audio against the MD5 stored in the FLAC header (the record lists it as a fourth pin), so a WAV
+that differs from its pin (the header bytes depend on the `flac` build) only prints a note.
 
 ## Requirements
 
@@ -95,8 +95,8 @@ The report lines:
 Options: `--iso PATH` uses a local ISO, `--direwolf PATH` and `--atest PATH` pick the programs,
 and `--keep` keeps the scratch directory (the WAV, `direwolf.conf`, `direwolf.txt` and
 `atest.txt`) and prints its path. Exit status: 0 report printed, 1 a decoder failed, 2 setup
-error (a missing tool, a failed download, a checksum mismatch, or a failed extraction or
-decode).
+error (a missing tool, a failed download, a checksum mismatch, a failed extraction or
+decode, or a failed build of the diagnostic).
 
 The program underneath also runs on any 16-bit PCM WAV:
 

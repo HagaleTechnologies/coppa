@@ -16,12 +16,14 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 
 use coppa_bench::afsk_direwolf::{
-    coppa_counts_by_offset, load_channel0, run_atest, run_direwolf, Report, START_OFFSETS,
+    coppa_counts_by_offset, load_channel0, open_pcm16, run_atest, run_direwolf, Report,
+    START_OFFSETS,
 };
 
 #[derive(Debug, Parser)]
@@ -53,23 +55,42 @@ impl Drop for TempDir {
     }
 }
 
+/// Creates `dir` readable only by this user, failing if it already exists, so a directory or
+/// symlink someone else planted under the shared temp dir is never written into.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
 fn run(args: &Args) -> Result<Report> {
+    // Direwolf needs 16-bit PCM; check before coppa's eight passes, not after.
+    drop(open_pcm16(&args.wav)?);
     let (samples, input) = load_channel0(&args.wav)?;
     let offsets = START_OFFSETS.to_vec();
     let coppa_by_offset = coppa_counts_by_offset(&samples, input.rate, &offsets)?;
     drop(samples);
 
-    let _temp;
+    let temp;
     let work_dir: &Path = match &args.log_dir {
         Some(dir) => {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
             dir
         }
         None => {
-            let dir = std::env::temp_dir().join(format!("afsk_vs_direwolf_{}", std::process::id()));
-            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-            _temp = TempDir(dir);
-            &_temp.0
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir()
+                .join(format!("afsk_vs_direwolf_{}_{nanos}", std::process::id()));
+            create_private_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            temp = TempDir(dir);
+            &temp.0
         }
     };
 

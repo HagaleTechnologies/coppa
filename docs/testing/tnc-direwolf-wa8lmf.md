@@ -96,7 +96,6 @@ tnc-bench: track 2 is Audio-Tracks/02_100-Mic-E-Bursts-DE-emphasized.flac, sha25
 tnc-bench: flac 1.4.3 decoded track2.wav, sha256 OK
 tnc-bench: coppa 2526b50 (uncommitted changes), direwolf …/usr/bin/direwolf, atest …/usr/bin/atest
 tnc-bench: building and running coppa-bench --example afsk_vs_direwolf (release)
-tnc-bench: kept …/tnc-bench.NJKpzW
 input: track2.wav, 44100 Hz, 2 channels, 16-bit, 1549.9 s
 coppa:    412 packets (AFSK 1200 demodulator, resampled 44100 -> 48000 Hz)
 coppa by start offset: 0:412 5:416 10:398 15:399 20:390 25:397 30:388 35:407 (spread 388 to 416)
@@ -104,10 +103,11 @@ direwolf: 1000 packets (Dire Wolf version 1.7, profile A+)
 atest:    982 packets (profile A)
 coppa / direwolf: 41.2% (95% bar: 950 packets, not met)
 coppa / atest:    42.0% (95% bar: 933 packets, not met)
+tnc-bench: kept …/tnc-bench.NJKpzW
 ```
 
-The run exited 0 and took 62 s of wall time, including the download and a release build of
-`coppa-bench`.
+The run exited 0 and took 62 s of wall time on this container, including the download and
+`cargo run --release`.
 
 | Decoder | Settings | Packets | coppa as a percentage of it | 95 percent bar |
 |---|---|---:|---:|---|
