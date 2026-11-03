@@ -275,6 +275,7 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     config.check_sample_rate().map_err(anyhow::Error::msg)?;
     config.check_audio_selectors().map_err(anyhow::Error::msg)?;
     config.check_session().map_err(anyhow::Error::msg)?;
+    config.check_station_id().map_err(anyhow::Error::msg)?;
     config.check_websocket_auth().map_err(anyhow::Error::msg)?;
     config
         .check_websocket_built(cfg!(feature = "websocket"))

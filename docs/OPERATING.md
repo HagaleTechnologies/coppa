@@ -941,6 +941,187 @@ nothing queued or un-acked, `DISCONNECTED` follows at once, as before.
   no DISCONNECT frame is sent, and the host gets one `DISCONNECTED`.
 - A remote DISCONNECT or a session timeout still drops unsent data at once.
 
+When CW ID is on, the DISCONNECT frame that ends a session is followed by
+this station's callsign in Morse in the same transmission. See "Morse (CW)
+ID at session end" below.
+
+## Morse (CW) ID at session end
+
+When CW ID is on, a station that ends a session keys its callsign in Morse
+right after its DISCONNECT frame, in the same transmission. The ID is a
+1000 Hz tone with 5 ms raised-cosine edges, at the same peak level as the
+OFDM audio. It goes through the same transmit path as every frame, so the
+callsign gate, the wideband gate, the busy-channel wait, turnaround and the
+PTT rules all apply to it.
+
+```toml
+[station_id]
+cwid = "host"
+cwid_wpm = 20
+```
+
+`cwid` decides who turns it on and off:
+
+| `cwid` | CW ID | Host `CWID ON` | Host `CWID OFF` |
+|---|---|---|---|
+| `"host"` (default) | off until a host sends `CWID ON` | `OK`, turns it on | `OK`, turns it off |
+| `"always"` | on | `OK`, no change | `WRONG`, stays on |
+| `"never"` | off | `WRONG`, stays off | `OK`, no change |
+
+The state applies to the whole daemon. With several hosts connected, the
+last one to send `CWID ON` or `CWID OFF` wins. `CWID` alone, or with any
+other argument (`CWID TRUE`, `CWID MAYBE`), gets `WRONG` and changes
+nothing. coppad logs each change at `INFO` (`CW ID turned on by VARA client
+3`) and each refusal (`CWID OFF refused: [station_id] cwid = "always"`). At
+startup it logs the current state, for example:
+
+```text
+INFO coppad::event_loop: CW ID after each session this station ends: off until a host sends CWID ON ([station_id] cwid = "host", 20 WPM)
+```
+
+Pat's VARA HF driver sends `CWID ON` every time it starts. Under the
+default `cwid = "host"`, that turns the CW ID on for the daemon, and every
+Pat session this station ends gains about 4.7 s of Morse for a 6-character
+call at 20 WPM. Set `cwid = "never"` if you do not want it.
+
+ARDOP hosts send `CWID TRUE` or `CWID FALSE` on the ARDOP command port.
+coppad always echoes the line, because a `WRONG` there would break Winlink
+Express init. Under `"host"` it applies the change. Under `"always"` or
+`"never"` the state does not change, and coppad logs, for example,
+`ARDOP CWID FALSE echoed but not applied: [station_id] cwid = "always"`.
+
+The CW ID follows every DISCONNECT frame this station sends to end a
+session:
+
+- a host `DISCONNECT`, once the queued data has drained;
+- a host `DISCONNECT` of a pending inbound attempt;
+- a session that COP-38's retry budget ends as a link failure;
+- a stalled drain that coppad ends;
+- a `CONNECT` that ends a drain.
+
+One transmission then carries the frame and the ID:
+
+```text
+PTT on | pre-delay | [station-ID frame, if due] | DISCONNECT frame | 7 units of silence | callsign in Morse | PTT tail | PTT off
+```
+
+There is no CW ID after `ABORT` (no frame is sent), after the other station
+disconnects (this station sends nothing), after a session times out with no
+drain, or after `TUNE`, a beacon or sessionless data. The OFDM station-ID
+frame still covers the 10-minute rule as before.
+
+coppad keys the callsign in force (`MYCALL`, or `[engine] callsign`) with
+any `-SSID` dropped, because the SSID is a network address and not part of
+the licensed call. `N1CALL-10` keys `N1CALL`. A `/` portable designator
+stays, so `N1CALL/P` keys `N1CALL/P`.
+
+`cwid_wpm` takes 10 to 20 (default 20). 47 CFR 97.119(b)(1) caps a CW ID
+sent by an automatic device at 20 WPM. Any other value stops coppad at
+startup:
+
+```text
+Error: [station_id] cwid_wpm = 25 is outside 10-20; 47 CFR 97.119(b)(1) caps an automatic CW ID at 20 WPM
+```
+
+`coppad --check` checks syntax and types only, so it does not report this.
+A `cwid` value other than the three above fails both, naming the key.
+
+Timing follows PARIS: one unit is 1.2 / WPM seconds. Airtime of the Morse
+part, including its 7-unit lead-in:
+
+| Callsign | Units | 20 WPM | 10 WPM |
+|---|---|---|---|
+| `N1CALL` | 78 | 4.68 s | 9.36 s |
+| `VE3ABCD` | 80 | 4.80 s | 9.60 s |
+| `N1CALL/P` | 108 | 6.48 s | 12.96 s |
+| `00000000` (longest 8-character call) | 180 | 10.80 s | 21.60 s |
+
+`[radio] max_tx_duration_s` (default 30) cuts any transmission that runs
+longer. If the DISCONNECT frame plus the CW ID would not fit inside
+`max_tx_duration_s` less a 2 s margin, coppad sends the frame alone and
+logs a warning:
+
+```text
+WARN coppad::event_loop: CW ID skipped: the DISCONNECT frame (1.9 s) plus the CW ID (4.7 s) would exceed [radio] max_tx_duration_s = 3 less a 2 s margin
+```
+
+The margin leaves room for a prepended station-ID frame and the PTT
+pre-delay. At the 30 s default, the longest call at 10 WPM still fits.
+
+## Rig frequency and mode from a host (FREQ, MODE)
+
+With `[radio] ptt_method = "rigctld"`, a host on the VARA command port can
+read the rig's frequency and mode. If the operator allows it, the host can
+also set them. These commands are coppa extensions, like `TUNE`. VARA has no
+such commands.
+
+| Line | Reply | Effect |
+|---|---|---|
+| `FREQ` | `FREQ <hz>`, the rig's answer to rigctld `f`; `WRONG` with no rigctld backend or no clean answer | none |
+| `FREQ <hz>` (decimal Hz, one argument) | `FREQ <hz>` as the rig reports it after the set; `WRONG` if refused or the rig did not accept it | sends `F <hz>`, then `f` |
+| `MODE` | `MODE <token>`, the rig's own token (`USB`, `PKTLSB`, `CW`, `RTTY`, ...); `WRONG` as for `FREQ` | none |
+| `MODE USB` / `LSB` / `PKTUSB` / `PKTLSB` (any case) | `MODE <token>` as the rig reports it after the set; `WRONG` if refused or rejected | sends `M <TOKEN> 0`, then `m` |
+| `FREQ 7.074`, `FREQ -1`, `FREQ 1 2`, `MODE CW`, `MODE USB 2400`, `FREQUENCY` | `WRONG` | none |
+
+The `0` in `M <TOKEN> 0` asks hamlib for the radio backend's default
+passband. coppad never answers from a cached or default value: every reply
+is a fresh reading from the rig.
+
+Reads work whenever the PTT backend is rigctld. Sets also need:
+
+```toml
+[radio]
+host_rig_control = true
+```
+
+`host_rig_control` is `false` by default. The command port has no
+authentication, and any web page you visit can send it a VARA line with a
+no-CORS POST (see `docs/LIMITATIONS.md`). With sets allowed, such a page
+could retune the rig.
+
+coppad refuses a set with `WRONG` and logs one `INFO` line with the reason.
+It checks in this order and reports the first reason that applies:
+
+1. `[radio] host_rig_control` is `false`.
+2. The PTT backend is not rigctld. This includes a rigctld that was
+   unreachable at startup, where coppad fell back to no PTT.
+3. The frequency is 0 or above 30 GHz.
+4. coppad is transmitting, or has sessionless data queued to send.
+5. A session is live (connecting, connected or disconnecting).
+
+With the default config, the log line reads:
+
+```text
+INFO coppad::event_loop: FREQ 7074000 refused: host rig control is off; set [radio] host_rig_control = true to allow it
+```
+
+The reply to a set is what the rig reports afterwards, not what the host
+asked for. If the rig accepts `F 7074005` but reports 7074000, the host gets
+`FREQ 7074000` and coppad logs a warning. A host should compare the reply
+with its request.
+
+```text
+WARN coppad::event_loop: FREQ 7074005: rig reports 7074000 Hz after the set
+```
+
+A retune does not get around the frequency gate (COP-40). On a wideband
+profile, coppad reads the rig's frequency before each transmission and
+refuses it below 29.7 MHz. A host retune below 29.7 MHz on `VHF_FAST`
+therefore gets a warning, and every later transmission is refused until the
+rig is retuned:
+
+```text
+WARN coppad::event_loop: FREQ 14074000: the rig is now below 29.7 MHz; the VHF_FAST profile's wideband gate will refuse every transmission until it is retuned
+```
+
+coppad talks to rigctld on its main event loop, as it does for PTT. A
+healthy rigctld answers in milliseconds. A dead one stalls the loop for up
+to about 4 s per query and about 6 s per set (a 2 s reconnect and a 2 s
+read for each step).
+
+Only the VARA command port has these commands. The WebSocket API, the ARDOP
+command port and the C FFI have no frequency or mode control.
+
 ## BUSY lines on the command port
 
 coppad watches the 300-2800 Hz band of the received audio and sends `BUSY ON`

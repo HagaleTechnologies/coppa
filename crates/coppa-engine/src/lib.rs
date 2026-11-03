@@ -7,6 +7,7 @@
 //!   `VHF_FAST`, `EMERGENCY`) that `EngineConfig::from_profile` builds from
 //! - [`ladder`] - the real per-level facts (modulation, code rate, max bytes,
 //!   air time, bandwidth) that `coppa profiles` shows
+//! - [`morse`] - Morse (CW) keying for the station's closing CW ID
 //!
 //! # Errors
 //!
@@ -29,6 +30,7 @@
 pub mod config;
 pub mod engine;
 pub mod ladder;
+pub mod morse;
 
 pub mod profiles;
 
