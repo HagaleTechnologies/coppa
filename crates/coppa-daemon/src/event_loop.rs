@@ -13985,6 +13985,67 @@ mod tests {
             );
         }
 
+        /// Read a committed golden WAV (16-bit PCM) as samples in [-1, 1),
+        /// dividing by 32768 as `coppa_protocol`'s golden test does.
+        fn read_golden_wav(id: &str) -> Vec<f32> {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testdata/golden")
+                .join(format!("{id}.wav"));
+            let mut reader = hound::WavReader::open(&path)
+                .unwrap_or_else(|e| panic!("open golden WAV {}: {e}", path.display()));
+            assert_eq!(reader.spec().bits_per_sample, 16, "{id} is not 16-bit PCM");
+            reader
+                .samples::<i16>()
+                .map(|s| f32::from(s.expect("golden WAV sample")) / 32768.0)
+                .collect()
+        }
+
+        /// COP-126 scenario "Golden vectors decode through the real receiver":
+        /// `L1_awgn12` and `L2_awgn12` decode through the daemon's own audio
+        /// path (`handle_audio_in` -> `CoppaCore::push_samples` ->
+        /// `StreamingReceiver`), fed the way the audio loop feeds it. Before
+        /// COP-126 the streaming sync detector saw unfiltered noise and
+        /// decoded neither file.
+        #[tokio::test]
+        async fn golden_awgn12_vectors_decode_through_the_daemon_receive_path() {
+            /// 100 ms at 48 kHz.
+            const CHUNK: usize = 4800;
+            /// The CLI's `TRAILING_FLUSH_SAMPLES`.
+            const TRAILING_FLUSH_SAMPLES: usize = 8192;
+            for id in ["L1_awgn12", "L2_awgn12"] {
+                let mut event_loop = EventLoop::new(DaemonConfig::default()).unwrap();
+                // The golden payloads are random bytes, not compressed frames,
+                // and `L1_awgn12`'s happens to start with the compression
+                // marker byte (0xFE). With the default profile's compression
+                // on, the daemon would decode the frame and then reject the
+                // payload in `decompress_if_needed`, which says nothing about
+                // the receive path. Turn compression off, as `coppa rx --raw`
+                // decodes, and keep the default HF profile otherwise.
+                let raw_config = coppa_engine::EngineConfig {
+                    compression_enabled: false,
+                    ..event_loop.engine.config().clone()
+                };
+                event_loop.engine.reconfigure(raw_config);
+                assert!(
+                    !event_loop.engine.on_vhf_profile(),
+                    "the default daemon must receive on an HF profile"
+                );
+                let (mut reader, _write_half) = connect_mock_vara_client(&mut event_loop).await;
+
+                let mut samples = read_golden_wav(id);
+                samples.extend(std::iter::repeat_n(0.0f32, TRAILING_FLUSH_SAMPLES));
+                for chunk in samples.chunks(CHUNK) {
+                    event_loop.handle_audio_in(chunk).await;
+                }
+
+                let lines = lines_within(&mut reader, Duration::from_millis(500)).await;
+                assert!(
+                    lines.iter().any(|l| l.starts_with("SNR ")),
+                    "{id}: expected an SNR line for a decoded frame, got {lines:?}"
+                );
+            }
+        }
+
         /// Collect lines until a full window passes without another line.
         /// Command-port responses end in a bare CR (COP-27), so split on `\r`.
         async fn lines_within(

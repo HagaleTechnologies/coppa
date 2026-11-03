@@ -520,6 +520,7 @@ dependencies = [
  "coppa-protocol",
  "coppa-radio",
  "futures-util",
+ "hound",
  "mdns-sd",
  "rand 0.10.3",
  "serde",

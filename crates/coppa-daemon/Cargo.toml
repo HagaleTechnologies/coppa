@@ -50,6 +50,8 @@ mdns-sd = "0.21"
 futures-util = "0.3"
 tokio-tungstenite = "0.29"
 coppa-channel = { path = "../coppa-channel" }
+# COP-126: the golden-vector receive test reads the committed WAVs.
+hound = { workspace = true }
 # test-util: only pulled in for test builds (Cargo dev-dependency feature
 # unification under resolver = "2" doesn't leak into the release binary) --
 # needed for `#[tokio::test(start_paused = true)]` / `tokio::time::advance`
