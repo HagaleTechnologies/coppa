@@ -32,16 +32,18 @@ fn test_mac_pdu_roundtrip_through_engine() {
 #[test]
 fn test_session_handshake_roundtrip_through_engine() {
     use coppa_protocol::session::{LinkCapabilities, Session};
+    use std::time::Instant;
 
     let engine = CoppaCore::new();
+    let now = Instant::now();
 
     let local = Callsign::new("N0CALL").unwrap();
     let remote = Callsign::new("W1AW").unwrap();
 
     // Create initiator session and generate CONNECT_REQ
     let caps = LinkCapabilities::default();
-    let mut initiator = Session::new(0, local.clone(), remote.clone(), 0, caps.clone());
-    let connect_req = initiator.initiate().unwrap();
+    let mut initiator = Session::new(0, local.clone(), remote.clone(), 0, caps.clone(), now);
+    let connect_req = initiator.initiate(now).unwrap();
     let req_bytes = connect_req.to_bytes();
 
     // Encode → decode the CONNECT_REQ
@@ -50,8 +52,10 @@ fn test_session_handshake_roundtrip_through_engine() {
     let decoded_pdu = MacPdu::from_bytes(&decoded).unwrap();
 
     // Responder handles it
-    let mut responder = Session::new(0, remote.clone(), local.clone(), 0, caps);
-    let connect_ack = responder.handle_connect_req(&decoded_pdu.payload).unwrap();
+    let mut responder = Session::new(0, remote.clone(), local.clone(), 0, caps, now);
+    let connect_ack = responder
+        .handle_connect_req(&decoded_pdu.payload, now)
+        .unwrap();
     let ack_bytes = connect_ack.to_bytes();
 
     // Encode → decode the CONNECT_ACK
@@ -60,7 +64,9 @@ fn test_session_handshake_roundtrip_through_engine() {
     let decoded_ack = MacPdu::from_bytes(&decoded2).unwrap();
 
     // Initiator handles ACK
-    let cfm = initiator.handle_connect_ack(&decoded_ack.payload).unwrap();
+    let cfm = initiator
+        .handle_connect_ack(&decoded_ack.payload, now)
+        .unwrap();
     assert!(initiator.is_established());
 
     // Encode → decode the CONNECT_CFM
@@ -69,6 +75,8 @@ fn test_session_handshake_roundtrip_through_engine() {
     let decoded_cfm = MacPdu::from_bytes(&decoded3).unwrap();
 
     // Responder handles CFM
-    responder.handle_connect_cfm(&decoded_cfm.payload).unwrap();
+    responder
+        .handle_connect_cfm(&decoded_cfm.payload, now)
+        .unwrap();
     assert!(responder.is_established());
 }

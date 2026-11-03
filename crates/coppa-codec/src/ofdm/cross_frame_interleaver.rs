@@ -6,6 +6,7 @@
 
 /// A bijective permutation over `N * C` elements: `N` codewords (codeword `k` at
 /// `[k*C..(k+1)*C]`) <-> `N` frame-blocks (frame `f` at `[f*C..(f+1)*C]`).
+#[derive(Debug)]
 pub struct CrossFrameInterleaver {
     /// `forward[input_index] = output_index`. Input is codeword-major, output is frame-major.
     forward: Vec<usize>,

@@ -65,6 +65,8 @@
 //! kept, unchanged, as a deprecated wrapper API for one release — see each
 //! function's own doc comment.
 
+#![warn(missing_docs, missing_debug_implementations)]
+
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -80,6 +82,7 @@ use std::sync::Mutex;
 /// `next_seq` exist only for the v2 event-style streaming API — v1
 /// functions never touch them, so extending this struct changes no v1
 /// signature or behavior.
+#[derive(Debug)]
 pub struct CoppaHandle {
     engine: Mutex<coppa_engine::CoppaCore>,
     /// Frames completed by [`coppa_engine_feed_samples`], queued (FIFO) for
@@ -102,6 +105,7 @@ pub struct CoppaHandle {
 /// incremented only for frames that actually get queued (a frame whose
 /// payload failed decompression is dropped without consuming a `seq` value —
 /// see [`coppa_engine_feed_samples`]'s doc).
+#[derive(Debug)]
 struct QueuedFrame {
     payload: Vec<u8>,
     snr_db: f32,
@@ -123,6 +127,7 @@ struct QueuedFrame {
 /// deprecated wrapper for one release — see [`coppa_start_stream`]'s doc.
 /// New code should use [`CoppaHandle`] (`coppa_engine_t`) with
 /// [`coppa_engine_feed_samples`]/[`coppa_next_frame`] instead.
+#[derive(Debug)]
 pub struct CoppaStreamHandle {
     engine: Mutex<coppa_engine::CoppaCore>,
     decoded_messages: Mutex<VecDeque<String>>,
@@ -352,10 +357,16 @@ pub unsafe extern "C" fn coppa_free_string(s: *mut c_char) {
 ///   config-readback API (e.g. `coppa_engine_get_config`) should add
 ///   storage and an accessor together. Pass null if unused.
 #[repr(C)]
+#[derive(Debug)]
 pub struct CoppaConfig {
+    /// Sample rate in Hz; `0` keeps the resolved profile's rate (48000 today).
     pub sample_rate: u32,
+    /// Null-terminated profile name, matched case-insensitively; null or empty
+    /// starts from `EngineConfig::default()`.
     pub profile: *const c_char,
+    /// Speed-level override 1-9 (9 is VHF-only); `0` keeps the profile's level.
     pub speed_level: u8,
+    /// Null-terminated callsign; validated as UTF-8, then discarded. May be null.
     pub callsign: *const c_char,
 }
 
@@ -374,12 +385,21 @@ pub struct CoppaConfig {
 /// [`QueuedFrame`]'s doc) — `coppa_engine::StreamFrame` itself has no
 /// sequence-number field.
 #[repr(C)]
+#[derive(Debug)]
 pub struct CoppaFrame {
+    /// Owned payload buffer; free it with `coppa_free_frame_payload`. Null when
+    /// no frame was pending.
     pub payload: *mut u8,
+    /// Length of `payload` in bytes; pass this exact value when freeing it.
     pub payload_len: usize,
+    /// Per-carrier-noise SNR estimate of the frame, in dB.
     pub snr_db: f32,
+    /// Carrier frequency offset the sync detector estimated, in Hz.
     pub cfo_hz: f32,
+    /// Speed level (1-9) the sender encoded the frame at.
     pub speed_level: u8,
+    /// Per-handle frame counter: 0 for the first frame this handle queued,
+    /// incremented once per queued frame.
     pub seq: u64,
 }
 

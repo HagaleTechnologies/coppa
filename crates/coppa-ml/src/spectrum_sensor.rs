@@ -4,6 +4,7 @@ use num_complex::Complex32;
 use rustfft::FftPlanner;
 
 /// FFT-based spectrum analyzer for channel sensing.
+#[derive(Debug)]
 pub struct SpectrumSensor {
     fft_size: usize,
     sample_rate: f32,

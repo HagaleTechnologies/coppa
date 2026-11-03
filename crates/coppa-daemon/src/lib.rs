@@ -16,6 +16,7 @@ pub mod config;
 pub mod event_loop;
 pub mod level_meter;
 pub mod logging;
+pub mod mdns;
 pub mod ptt_guardian;
 #[cfg(feature = "websocket")]
 pub mod spectrum;

@@ -9,6 +9,7 @@ const G1: u8 = 0x79; // 0o171
 const G2: u8 = 0x5B; // 0o133
 
 /// Rate-1/2 convolutional encoder.
+#[derive(Debug)]
 pub struct ConvEncoder {
     state: u8,
 }
@@ -20,6 +21,7 @@ impl Default for ConvEncoder {
 }
 
 impl ConvEncoder {
+    /// Create an encoder with an all-zero shift register.
     pub fn new() -> Self {
         Self { state: 0 }
     }
@@ -77,6 +79,7 @@ impl FecCodec for ConvEncoder {
 /// represents confidence (larger magnitude = more reliable decision).
 /// Branch metrics are computed as Euclidean distance between the received
 /// soft symbol and the expected +1/-1 reference.
+#[derive(Debug)]
 pub struct ViterbiDecoder {
     /// Precomputed state transitions.
     transitions: Vec<[(u8, u8, usize); 2]>,
@@ -89,6 +92,7 @@ impl Default for ViterbiDecoder {
 }
 
 impl ViterbiDecoder {
+    /// Create a decoder with the 64-state trellis transitions precomputed.
     pub fn new() -> Self {
         // Precompute transitions once
         let mut transitions = vec![[(0u8, 0u8, 0usize); 2]; NUM_STATES];
@@ -105,6 +109,9 @@ impl ViterbiDecoder {
         Self { transitions }
     }
 
+    /// Decode soft symbols (two per coded bit pair, positive means bit 0) of a
+    /// terminated trellis into data bits, one `0`/`1` per byte. The six flush
+    /// bits are dropped, and fewer than seven symbol pairs decode to nothing.
     pub fn decode(&self, soft_symbols: &[f32]) -> Vec<u8> {
         if soft_symbols.len() < 2 {
             return Vec::new();
@@ -174,6 +181,8 @@ impl ViterbiDecoder {
         decoded
     }
 
+    /// Decode hard bits (`0` or nonzero, one per byte) by mapping them to
+    /// soft symbols of magnitude 1 and running [`ViterbiDecoder::decode`].
     pub fn decode_hard(&self, bits: &[u8]) -> Vec<u8> {
         let soft: Vec<f32> = bits
             .iter()
