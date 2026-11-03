@@ -266,26 +266,34 @@ impl SyncDetector {
     /// detector finds a preamble at about 10 dB lower SNR than `new` (see
     /// BENCHMARKS.md, "COP-126").
     ///
-    /// A VHF profile, or a profile whose FFT size, cyclic prefix or sample
-    /// rate does not divide by 4, gets exactly `new`. Use `new` or
-    /// `detect_all` when the input is already band-pass filtered, as the
-    /// batch receive path does.
+    /// A VHF profile gets exactly `new`. So does a profile whose geometry does
+    /// not suit a factor of 4: an FFT size, cyclic prefix or sample rate that
+    /// does not divide by 4, a quarter FFT size that is odd (the CFO estimate
+    /// needs a whole half-symbol lag), or a sample rate too low to decimate
+    /// without folding noise into the passband. Use `new` or `detect_all`
+    /// when the input is already band-pass filtered, as the batch receive
+    /// path does.
     pub fn new_prefiltered(profile: CoppaProfile, version: u8) -> Self {
         let mut detector = Self::new(profile, version);
         let d = PREFILTER_DECIMATION.get();
         let p = &detector.profile;
-        let divides = p.fft_size % d == 0 && p.cp_samples % d == 0 && p.sample_rate % d as u32 == 0;
-        let coarse_rate = p.sample_rate as f32 / d as f32;
-        if p.phy_mode != 0 || !divides || coarse_rate / 2.0 <= PREFILTER_HI_HZ {
+        let divides = p.fft_size % d == 0
+            && (p.fft_size / d) % 2 == 0
+            && p.cp_samples % d == 0
+            && p.sample_rate % d as u32 == 0;
+        let fs = p.sample_rate as f32;
+        let coarse_rate = fs / d as f32;
+        // After decimation, noise at input frequency `f` folds to
+        // `coarse_rate - f`. It stays out of the passband when the filter's
+        // stopband edge (`PREFILTER_HI_HZ` plus the Blackman transition width,
+        // about 5.5 * fs / taps) lies below `coarse_rate - PREFILTER_HI_HZ`.
+        let stopband_edge = PREFILTER_HI_HZ + 5.5 * fs / PREFILTER_TAPS as f32;
+        let no_alias = stopband_edge <= coarse_rate - PREFILTER_HI_HZ;
+        if p.phy_mode != 0 || !divides || !no_alias {
             return detector;
         }
         let fir = DecimatingFir::new(
-            design_bandpass(
-                PREFILTER_TAPS,
-                p.sample_rate as f32,
-                PREFILTER_LO_HZ,
-                PREFILTER_HI_HZ,
-            ),
+            design_bandpass(PREFILTER_TAPS, fs, PREFILTER_LO_HZ, PREFILTER_HI_HZ),
             PREFILTER_DECIMATION,
         );
         let fft_size = p.fft_size / d;
@@ -1159,5 +1167,32 @@ mod tests {
         }
         let clean_raw = SyncDetector::new(profile, 1).push(&clean);
         assert_eq!(clean_raw.len(), 1, "clean VHF candidates {clean_raw:?}");
+    }
+
+    /// A geometry that does not suit a factor of 4 gets the plain detector.
+    #[test]
+    fn prefiltered_detector_falls_back_when_the_geometry_does_not_fit() {
+        let hf = CoppaProfile::hf_standard();
+        assert!(SyncDetector::new_prefiltered(hf.clone(), 1)
+            .coarse
+            .prefilter
+            .is_some());
+        let low_rate = CoppaProfile {
+            sample_rate: 16_000,
+            ..hf.clone()
+        };
+        let odd_quarter_fft = CoppaProfile {
+            fft_size: 964,
+            ..hf.clone()
+        };
+        let odd_cp = CoppaProfile {
+            cp_samples: 301,
+            ..hf
+        };
+        for profile in [low_rate, odd_quarter_fft, odd_cp] {
+            let detector = SyncDetector::new_prefiltered(profile, 1);
+            assert!(detector.coarse.prefilter.is_none());
+            assert_eq!(detector.coarse.decimation, 1);
+        }
     }
 }
