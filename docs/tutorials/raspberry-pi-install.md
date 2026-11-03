@@ -311,13 +311,19 @@ UDP port 5353 through any firewall. A Linux client needs nss-mdns to resolve
 
 ## 9. Change the configuration
 
-coppad has no reload. Edit the file, check it, then restart:
+Edit the file, check it, then reload. coppad re-reads the file on SIGHUP
+and applies the settings it can change while running:
 
 ```bash
 sudoedit /etc/coppa/coppad.toml
 sudo -u coppa coppad --config /etc/coppa/coppad.toml --check
-sudo systemctl restart coppad
+sudo systemctl reload coppad
+journalctl -u coppad -n 5   # a restart_required= line means: sudo systemctl restart coppad
 ```
+
+[OPERATING.md](../OPERATING.md#reloading-the-configuration) lists which
+settings a reload applies. Audio devices, PTT method and listener ports need
+`sudo systemctl restart coppad`.
 
 ## 10. What the unit does
 

@@ -19,12 +19,16 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+mod support;
+use support::{
+    free_ports, process_alive, send_signal, stays_false, strip_ansi, wait_until, TempDir,
+};
 
 /// How long the daemon may take to log `Daemon ready`. Generous: debug
 /// builds of five daemons start in parallel.
@@ -37,32 +41,6 @@ const EXIT_DEADLINE: Duration = Duration::from_secs(5);
 const GUARDIAN_DEADLINE: Duration = Duration::from_secs(5);
 
 const GUARDIAN_STARTED: &str = "PTT guardian started pid=";
-
-/// Poll `pred` every 10 ms until it holds or `timeout` passes.
-fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
-    let start = Instant::now();
-    loop {
-        if pred() {
-            return true;
-        }
-        if start.elapsed() >= timeout {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// Check that `pred` stays false for the whole of `period`.
-fn stays_false(period: Duration, mut pred: impl FnMut() -> bool) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < period {
-        if pred() {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    !pred()
-}
 
 // ---------------------------------------------------------------------------
 // Fake rigctld
@@ -255,93 +233,6 @@ fn serve(conn: usize, stream: TcpStream, state: &Mutex<RigState>) {
 // The daemon under test
 // ---------------------------------------------------------------------------
 
-/// A uniquely named directory under the system temp dir, removed on drop.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "coppad-ptt-{tag}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("create temporary directory");
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Two distinct free TCP ports on loopback, picked by the OS.
-fn free_ports() -> (u16, u16) {
-    let a = TcpListener::bind("127.0.0.1:0").expect("bind free port");
-    let b = TcpListener::bind("127.0.0.1:0").expect("bind free port");
-    (
-        a.local_addr().unwrap().port(),
-        b.local_addr().unwrap().port(),
-    )
-}
-
-/// Remove ANSI escape sequences (tracing's colour codes) from `text`.
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                for c in chars.by_ref() {
-                    if ('@'..='~').contains(&c) {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// Whether `pid` is a live process. A zombie (exited, not yet reaped by
-/// its new parent) counts as gone.
-fn process_alive(pid: u32) -> bool {
-    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        // The state follows the parenthesised command name.
-        return match stat.rfind(')') {
-            Some(i) => !stat[i + 1..].trim_start().starts_with('Z'),
-            None => true,
-        };
-    }
-    if Path::new("/proc/self/stat").exists() {
-        // procfs is mounted and has no entry for `pid`.
-        return false;
-    }
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-fn send_signal(signal: &str, target: &str) {
-    let status = Command::new("kill")
-        .args([signal, "--", target])
-        .status()
-        .expect("run kill");
-    assert!(status.success(), "kill {signal} -- {target} failed");
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Group {
     /// The test binary's process group (the default).
@@ -362,13 +253,25 @@ struct Coppad {
 
 impl Coppad {
     fn start(fake: &FakeRigctld, ptt_guardian: bool, group: Group) -> Self {
+        Self::start_with_pre_delay(fake, ptt_guardian, group, 0)
+    }
+
+    /// As [`Coppad::start`], with `[radio] ptt_pre_delay_ms` set. A long
+    /// pre-delay holds the event loop between keying and the first sample,
+    /// so a first stop request cannot finish while it lasts (COP-85).
+    fn start_with_pre_delay(
+        fake: &FakeRigctld,
+        ptt_guardian: bool,
+        group: Group,
+        ptt_pre_delay_ms: u64,
+    ) -> Self {
         let dir = TempDir::new("daemon");
         let (command_port, data_port) = free_ports();
         let config = format!(
             "[radio]\n\
              ptt_method = \"rigctld\"\n\
              rigctld_address = \"{}\"\n\
-             ptt_pre_delay_ms = 0\n\
+             ptt_pre_delay_ms = {ptt_pre_delay_ms}\n\
              ptt_guardian = {ptt_guardian}\n\
              \n\
              [host]\n\
@@ -670,4 +573,60 @@ fn guardian_disabled_by_config_leaves_sigkill_unreleased() {
     );
     assert_eq!(fake.ptt_at_eof(0), Some(1), "rigctld log {:?}", fake.log());
     assert_eq!(fake.ptt(), 1, "rigctld log {:?}", fake.log());
+}
+
+/// COP-85: a second stop request while the first waits behind a long
+/// pre-delay forces the exit: the daemon releases PTT on its own rigctld
+/// connection and exits 130 at once, instead of staying keyed until the
+/// pre-delay ends.
+fn second_stop_request_forces_the_exit(first: &str, first_name: &str) {
+    let fake = FakeRigctld::start();
+    let mut daemon = Coppad::start_with_pre_delay(&fake, true, Group::Inherit, 15_000);
+    daemon.key(&fake);
+
+    send_signal(first, &daemon.pid().to_string());
+    daemon.wait_for_log(
+        &format!("Received {first_name}, shutting down"),
+        EXIT_DEADLINE,
+    );
+    assert!(
+        stays_false(Duration::from_millis(300), || daemon.try_exit().is_some()),
+        "the pre-delay must hold the first stop request\n{}",
+        daemon.output()
+    );
+
+    let forced_at = Instant::now();
+    send_signal("-INT", &daemon.pid().to_string());
+    let status = daemon.wait_exit(EXIT_DEADLINE);
+    assert_eq!(status.code(), Some(130), "exit status\n{}", daemon.output());
+    assert!(
+        forced_at.elapsed() < Duration::from_secs(5),
+        "the forced exit took {:?}",
+        forced_at.elapsed()
+    );
+    assert_eq!(
+        fake.ptt_commands(0).last().map(String::as_str),
+        Some("T 0"),
+        "the daemon's own connection must release PTT; rigctld log {:?}\n{}",
+        fake.log(),
+        daemon.output()
+    );
+    let output = daemon.output();
+    for line in [
+        "Received SIGINT again; forcing exit",
+        "Releasing PTT for a forced exit",
+        "Daemon stopped before its shutdown finished",
+    ] {
+        assert!(output.contains(line), "missing {line:?}\n{output}");
+    }
+}
+
+#[test]
+fn a_second_sigint_during_a_long_pre_delay_releases_ptt_and_exits_130() {
+    second_stop_request_forces_the_exit("-INT", "SIGINT");
+}
+
+#[test]
+fn sigterm_then_sigint_also_forces_the_exit() {
+    second_stop_request_forces_the_exit("-TERM", "SIGTERM");
 }

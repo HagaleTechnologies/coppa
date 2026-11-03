@@ -822,7 +822,127 @@ impl Discovered {
     }
 }
 
+/// COP-85: keys a SIGHUP reload applies to the running daemon, as
+/// (section, key). Every other key keeps its running value until a restart,
+/// so a key added later is restart-only until it is listed here.
+/// `cp_gate_enabled` and `cp_negotiation_enabled` stay out: turning
+/// negotiation off mid-handshake could leave two stations on different CP
+/// profiles.
+pub const RELOADABLE_KEYS: &[(&str, &str)] = &[
+    ("radio", "ptt_pre_delay_ms"),
+    ("radio", "ptt_tail_delay_ms"),
+    ("radio", "max_tx_duration_s"),
+    ("radio", "turnaround_ms"),
+    ("radio", "host_rig_control"),
+    ("station_id", "busy_hold_ms"),
+    ("station_id", "id_interval_secs"),
+    ("station_id", "beacon_interval_secs"),
+    ("station_id", "cwid"),
+    ("station_id", "cwid_wpm"),
+    ("engine", "callsign"),
+    ("engine", "grid"),
+    ("session", "max_codewords_per_frame"),
+    ("host", "sessionless_tx_enabled"),
+];
+
+/// COP-85: what a reload changes. Labels are `[section] key` and never carry
+/// a value, so a changed `websocket_token` is never logged.
+#[derive(Debug, Clone)]
+pub struct ReloadPlan {
+    /// The running configuration with every changed reloadable key taken
+    /// from the file.
+    pub effective: DaemonConfig,
+    /// Reloadable keys whose value changed, in section and key order.
+    pub applied: Vec<String>,
+    /// Restart-only keys whose value changed; they keep their running value.
+    pub restart_required: Vec<String>,
+}
+
+impl ReloadPlan {
+    /// Whether the reload applied `[section] key`.
+    pub fn applies(&self, section: &str, key: &str) -> bool {
+        let label = reload_label(section, key);
+        self.applied.iter().any(|applied| *applied == label)
+    }
+}
+
+fn reload_label(section: &str, key: &str) -> String {
+    format!("[{section}] {key}")
+}
+
+/// COP-85: compare the running configuration with a freshly loaded `file`
+/// key by key. A changed key in [`RELOADABLE_KEYS`] is copied into the
+/// result; any other changed key is reported as restart-only and keeps its
+/// running value.
+pub fn plan_reload(running: &DaemonConfig, file: &DaemonConfig) -> anyhow::Result<ReloadPlan> {
+    use std::collections::BTreeSet;
+    use toml::{Table, Value};
+
+    fn as_table(config: &DaemonConfig) -> anyhow::Result<Table> {
+        match Value::try_from(config)? {
+            Value::Table(table) => Ok(table),
+            other => anyhow::bail!("configuration serialized as {}", other.type_str()),
+        }
+    }
+
+    let mut effective = as_table(running)?;
+    let file = as_table(file)?;
+    let mut applied = Vec::new();
+    let mut restart_required = Vec::new();
+    let sections: BTreeSet<String> = effective.keys().chain(file.keys()).cloned().collect();
+    for section in sections {
+        let old = effective.get(&section).cloned();
+        let new = file.get(&section).cloned();
+        if old == new {
+            continue;
+        }
+        let (old_keys, new_keys) = match (old, new) {
+            (Some(Value::Table(old)), Some(Value::Table(new))) => (old, new),
+            (Some(Value::Table(old)), None) => (old, Table::new()),
+            (None, Some(Value::Table(new))) => (Table::new(), new),
+            // Not a section table: compared whole, and restart-only.
+            _ => {
+                restart_required.push(format!("[{section}]"));
+                continue;
+            }
+        };
+        let keys: BTreeSet<&String> = old_keys.keys().chain(new_keys.keys()).collect();
+        for key in keys {
+            let new_value = new_keys.get(key);
+            if old_keys.get(key) == new_value {
+                continue;
+            }
+            let label = reload_label(&section, key);
+            if !RELOADABLE_KEYS.contains(&(section.as_str(), key.as_str())) {
+                restart_required.push(label);
+                continue;
+            }
+            let table = effective
+                .entry(section.clone())
+                .or_insert_with(|| Value::Table(Table::new()));
+            if let Value::Table(table) = table {
+                match new_value {
+                    Some(value) => {
+                        table.insert(key.clone(), value.clone());
+                    }
+                    None => {
+                        table.remove(key);
+                    }
+                }
+            }
+            applied.push(label);
+        }
+    }
+    let effective: DaemonConfig = Value::Table(effective).try_into()?;
+    Ok(ReloadPlan {
+        effective,
+        applied,
+        restart_required,
+    })
+}
+
 impl DaemonConfig {
+    /// Load configuration from a TOML file.impl DaemonConfig {
     /// Load configuration from a TOML file.
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         Ok(Self::load_with_shared(path)?.0)
@@ -880,6 +1000,62 @@ impl DaemonConfig {
             searched,
             permission_denied,
         })
+    }
+
+    /// COP-85: every config gate run mode applies before it touches hardware
+    /// or binds a socket, in the order startup reports them. The profile
+    /// check comes first so a typo'd name is reported as an unknown profile,
+    /// not through `check_sample_rate`'s fallback rate. The build checks read
+    /// this binary's own features. `--check` does not call it.
+    pub fn check_for_run(&self) -> Result<(), String> {
+        self.check_profile()?;
+        self.check_buffer_size()?;
+        self.check_sample_rate()?;
+        self.check_audio_selectors()?;
+        self.check_session()?;
+        self.check_station_id()?;
+        self.check_websocket_auth()?;
+        self.check_websocket_built(cfg!(feature = "websocket"))?;
+        self.check_ardop_built(cfg!(feature = "ardop"))?;
+        self.check_mdns(cfg!(feature = "mdns"))?;
+        self.check_devices_built(cfg!(feature = "cpal-backend"))
+    }
+
+    /// COP-85: the gates a SIGHUP reload applies before it changes anything:
+    /// [`Self::check_for_run`], then the `[radio] ptt_method` and frequency
+    /// parses `EventLoop::new` would otherwise reject. Hardware (port binds,
+    /// device opens, rigctld) is not checked.
+    pub fn check_for_reload(&self) -> Result<(), String> {
+        self.check_for_run()?;
+        self.radio
+            .ptt_config()
+            .map_err(|e| format!("invalid [radio] ptt_method: {e}"))?;
+        self.radio.frequency_config()?;
+        Ok(())
+    }
+
+    /// COP-32: a build without `cpal-backend` opens no audio device, so a
+    /// named one can never be found. `cpal_built` is whether this binary has
+    /// the feature.
+    pub fn check_devices_built(&self, cpal_built: bool) -> Result<(), String> {
+        if cpal_built {
+            return Ok(());
+        }
+        for (key, name) in [
+            ("input_device", &self.audio.input_device),
+            ("output_device", &self.audio.output_device),
+            ("input_device_id", &self.audio.input_device_id),
+            ("output_device_id", &self.audio.output_device_id),
+        ] {
+            if !name.is_empty() {
+                return Err(format!(
+                    "[audio] {key} = {name:?} is set, but this coppad was built without the \
+                     cpal-backend feature and opens no audio devices; rebuild with \
+                     --features cpal-backend, or clear [audio] {key}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// COP-36: `[engine] profile` must name a built-in profile
@@ -2608,5 +2784,161 @@ beacon_interval_secs = 600
             "{err}"
         );
         assert!(err.contains("set buffer_size = 8192"), "{err}");
+    }
+
+    /// COP-85: `check_for_run` reports each gate with the text the
+    /// individual check produces, as run mode did before it was gathered.
+    #[test]
+    fn check_for_run_reports_each_gate_with_its_startup_text() {
+        let mut config = DaemonConfig::default();
+        assert_eq!(config.check_for_run(), Ok(()));
+
+        config.engine.profile = "HF_STANDRD".to_string();
+        assert_eq!(config.check_for_run(), config.check_profile());
+        assert!(config.check_for_run().is_err());
+
+        let mut config = DaemonConfig::default();
+        config.audio.buffer_size = 0;
+        assert_eq!(config.check_for_run(), config.check_buffer_size());
+        assert!(config.check_for_run().is_err());
+
+        let mut config = DaemonConfig::default();
+        config.host.websocket_enabled = true;
+        assert_eq!(config.check_for_run(), config.check_websocket_auth());
+        assert!(config.check_for_run().is_err());
+    }
+
+    /// COP-85: the no-audio build refuses a named device with the text
+    /// run mode always used, and an audio build accepts it.
+    #[test]
+    fn check_for_run_refuses_a_named_device_without_cpal_backend() {
+        let mut config = DaemonConfig::default();
+        assert_eq!(config.check_devices_built(false), Ok(()));
+        config.audio.input_device = "x".to_string();
+        assert_eq!(config.check_devices_built(true), Ok(()));
+        assert_eq!(
+            config.check_devices_built(false).unwrap_err(),
+            "[audio] input_device = \"x\" is set, but this coppad was built without the \
+             cpal-backend feature and opens no audio devices; rebuild with \
+             --features cpal-backend, or clear [audio] input_device"
+        );
+        if !cfg!(feature = "cpal-backend") {
+            assert_eq!(config.check_for_run(), config.check_devices_built(false));
+        }
+    }
+
+    /// COP-85: a reload also refuses what `EventLoop::new` would refuse.
+    #[test]
+    fn check_for_reload_also_parses_ptt_method_and_frequency() {
+        let config = DaemonConfig::default();
+        assert_eq!(config.check_for_reload(), Ok(()));
+
+        let mut config = DaemonConfig::default();
+        config.radio.ptt_method = "bogus".to_string();
+        assert_eq!(config.check_for_run(), Ok(()));
+        let err = config.check_for_reload().unwrap_err();
+        assert!(err.starts_with("invalid [radio] ptt_method: "), "{err}");
+
+        let mut config = DaemonConfig::default();
+        config.radio.band = Some("11m".to_string());
+        assert_eq!(config.check_for_run(), Ok(()));
+        assert_eq!(
+            config.check_for_reload(),
+            Err(config.radio.frequency_config().unwrap_err())
+        );
+    }
+
+    fn toml_of(config: &DaemonConfig) -> String {
+        toml::to_string(config).unwrap()
+    }
+
+    /// COP-85: a reload copies changed live keys and keeps restart-only ones.
+    #[test]
+    fn reload_plan_applies_live_keys_and_keeps_restart_only_keys() {
+        let running = DaemonConfig::default();
+        let mut file = DaemonConfig::default();
+        file.radio.ptt_tail_delay_ms = 300;
+        file.station_id.busy_hold_ms = 750;
+        file.host.vara_command_port = 8310;
+        file.engine.profile = "HF_ROBUST".to_string();
+
+        let plan = plan_reload(&running, &file).unwrap();
+        assert_eq!(
+            plan.applied,
+            ["[radio] ptt_tail_delay_ms", "[station_id] busy_hold_ms"]
+        );
+        assert_eq!(
+            plan.restart_required,
+            ["[engine] profile", "[host] vara_command_port"]
+        );
+        assert!(plan.applies("radio", "ptt_tail_delay_ms"));
+        assert!(!plan.applies("host", "vara_command_port"));
+        assert_eq!(plan.effective.radio.ptt_tail_delay_ms, 300);
+        assert_eq!(plan.effective.station_id.busy_hold_ms, 750);
+        assert_eq!(
+            plan.effective.host.vara_command_port,
+            running.host.vara_command_port
+        );
+        assert_eq!(plan.effective.engine.profile, running.engine.profile);
+    }
+
+    #[test]
+    fn reload_plan_of_an_unchanged_file_changes_nothing() {
+        let mut running = DaemonConfig::default();
+        running.engine.callsign = "N0CALL".to_string();
+        running.engine.grid = Some("FN20".to_string());
+        let plan = plan_reload(&running, &running.clone()).unwrap();
+        assert!(plan.applied.is_empty(), "{:?}", plan.applied);
+        assert!(
+            plan.restart_required.is_empty(),
+            "{:?}",
+            plan.restart_required
+        );
+        assert_eq!(toml_of(&plan.effective), toml_of(&running));
+    }
+
+    /// COP-85: an optional reloadable key that the file clears is cleared.
+    #[test]
+    fn reload_plan_clears_an_optional_live_key_the_file_drops() {
+        let mut running = DaemonConfig::default();
+        running.engine.grid = Some("FN20".to_string());
+        let plan = plan_reload(&running, &DaemonConfig::default()).unwrap();
+        assert_eq!(plan.applied, ["[engine] grid"]);
+        assert_eq!(plan.effective.engine.grid, None);
+    }
+
+    /// COP-85: a renamed config field must not leave a dead reload entry.
+    #[test]
+    fn every_reloadable_key_names_a_real_config_key() {
+        let mut config = DaemonConfig::default();
+        config.engine.grid = Some("FN20".to_string());
+        let toml::Value::Table(table) = toml::Value::try_from(&config).unwrap() else {
+            panic!("config is not a table");
+        };
+        for (section, key) in RELOADABLE_KEYS {
+            let section_table = table
+                .get(*section)
+                .and_then(toml::Value::as_table)
+                .unwrap_or_else(|| panic!("no [{section}] section"));
+            assert!(
+                section_table.contains_key(*key),
+                "[{section}] {key} is in RELOADABLE_KEYS but not in the config"
+            );
+        }
+    }
+
+    #[test]
+    fn reload_plan_names_a_changed_token_without_its_value() {
+        let secret = "s3cretTokenValue-0123456789abcdef";
+        let running = DaemonConfig::default();
+        let file: DaemonConfig =
+            toml::from_str(&format!("[host]\nwebsocket_token = \"{secret}\"\n")).unwrap();
+        let plan = plan_reload(&running, &file).unwrap();
+        assert_eq!(plan.restart_required, ["[host] websocket_token"]);
+        assert!(plan.applied.is_empty());
+        for label in plan.applied.iter().chain(&plan.restart_required) {
+            assert!(!label.contains(secret), "{label}");
+        }
+        assert!(plan.effective.host.websocket_token.is_none());
     }
 }

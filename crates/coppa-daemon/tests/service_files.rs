@@ -325,6 +325,18 @@ fn systemd_unit_leaves_the_ptt_guardian_alone_on_stop() {
     );
 }
 
+/// COP-85: `systemctl reload coppad` sends SIGHUP to coppad alone.
+#[test]
+fn systemd_unit_reloads_with_sighup_to_the_main_process() {
+    let entries = unit_entries(&read(UNIT));
+    assert_eq!(
+        unit_value(&entries, "Service", "ExecReload"),
+        "/bin/kill -HUP $MAINPID",
+        "systemctl reload must signal coppad alone; KillMode=process keeps the guardian out \
+         of it, and the guardian ignores SIGHUP anyway"
+    );
+}
+
 #[test]
 fn systemd_unit_omits_directives_that_break_audio_or_ptt() {
     let entries = unit_entries(&read(UNIT));

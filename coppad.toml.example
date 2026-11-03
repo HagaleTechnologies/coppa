@@ -2,6 +2,8 @@
 # Copy to ~/.config/coppa/coppad.toml (one user), /etc/coppa/coppad.toml (a system service) or ./coppad.toml, and edit as needed.
 # An unknown or misspelled key or table stops coppad at startup, naming the
 # key; `coppad --check` reports it too (COP-36).
+# coppad re-reads this file on SIGHUP (`systemctl reload coppad`);
+# docs/OPERATING.md lists the settings that need a restart (COP-85).
 
 # The coppa CLI reads this file too for [engine] callsign/profile, [audio]
 # input_device/output_device, and [radio] ptt_method/rigctld_address/

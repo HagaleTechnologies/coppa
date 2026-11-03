@@ -18,6 +18,7 @@ pub mod level_meter;
 pub mod logging;
 pub mod mdns;
 pub mod ptt_guardian;
+pub mod signals;
 #[cfg(feature = "websocket")]
 pub mod spectrum;
 pub mod startup_report;

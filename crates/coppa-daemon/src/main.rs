@@ -20,6 +20,7 @@ mod event_loop;
 mod level_meter;
 mod logging;
 mod ptt_guardian;
+mod signals;
 #[cfg(feature = "websocket")]
 mod spectrum;
 mod startup_report;
@@ -62,7 +63,7 @@ async fn main() -> Result<()> {
             log_config_source(&source, discovered.as_ref());
             // COP-32: a fatal error after logging starts is logged at ERROR,
             // then returned so `main` prints `Error: ...` and exits 1.
-            run_daemon(config)
+            run_daemon(config, source)
                 .await
                 .inspect_err(|e| tracing::error!("{e:#}"))
         }
@@ -247,7 +248,31 @@ async fn run_ptt_guardian(
     }
 }
 
-async fn run_daemon(config: DaemonConfig) -> Result<()> {
+/// COP-85: SIGHUP. Re-read the configuration source the daemon started
+/// from, log which file it read as startup does, validate it with the run
+/// gates plus the PTT-method and frequency parses, and hand it to the event
+/// loop. Any failure is logged and changes nothing.
+fn reload_config(source: &ConfigSource, event_tx: &tokio::sync::mpsc::Sender<DaemonEvent>) {
+    let loaded = load_config(source).and_then(|(config, discovered)| {
+        log_config_source(source, discovered.as_ref());
+        config.check_for_reload().map_err(anyhow::Error::msg)?;
+        Ok(config)
+    });
+    match loaded {
+        Ok(config) => {
+            let tx = event_tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(DaemonEvent::Reload(Box::new(config))).await;
+            });
+        }
+        Err(e) => tracing::error!(
+            error = %format!("{e:#}"),
+            "Configuration reload failed; coppad keeps running on its current settings"
+        ),
+    }
+}
+
+async fn run_daemon(config: DaemonConfig, source: ConfigSource) -> Result<()> {
     if config.engine.callsign.is_empty() {
         tracing::warn!("No callsign configured. Set [engine] callsign in config.");
     }
@@ -264,28 +289,10 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     );
 
     // COP-32/COP-36: config checks first, before any hardware or socket is
-    // touched. The profile check comes first so a typo'd name is reported as
-    // an unknown profile, not through check_sample_rate's fallback rate.
-    // COP-53: a WebSocket-enabled config needs a valid token and origin list,
-    // checked in every build (the keys deserialize in every build).
-    config.check_profile().map_err(anyhow::Error::msg)?;
-    config.check_buffer_size().map_err(anyhow::Error::msg)?;
-    config.check_sample_rate().map_err(anyhow::Error::msg)?;
-    config.check_audio_selectors().map_err(anyhow::Error::msg)?;
-    config.check_session().map_err(anyhow::Error::msg)?;
-    config.check_station_id().map_err(anyhow::Error::msg)?;
-    config.check_websocket_auth().map_err(anyhow::Error::msg)?;
-    config
-        .check_websocket_built(cfg!(feature = "websocket"))
-        .map_err(anyhow::Error::msg)?;
-    config
-        .check_ardop_built(cfg!(feature = "ardop"))
-        .map_err(anyhow::Error::msg)?;
-    config
-        .check_mdns(cfg!(feature = "mdns"))
-        .map_err(anyhow::Error::msg)?;
-    #[cfg(not(feature = "cpal-backend"))]
-    check_no_selected_devices(&config.audio)?;
+    // touched. COP-53: a WebSocket-enabled config needs a valid token and
+    // origin list, checked in every build (the keys deserialize in every
+    // build). COP-85: the gates live in one function a reload reuses.
+    config.check_for_run().map_err(anyhow::Error::msg)?;
 
     // Create event loop. Fails loudly (rather than silently falling back to
     // NullPtt) if [radio] ptt_method doesn't parse or names an
@@ -666,26 +673,15 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         });
     }
 
-    // Handle shutdown signals
-    let shutdown_tx = event_tx.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        tracing::info!("Received SIGINT, shutting down");
-        let _ = shutdown_tx.send(DaemonEvent::Shutdown).await;
-    });
-
-    #[cfg(unix)]
-    {
-        let sigterm_tx = event_tx.clone();
-        tokio::spawn(async move {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm =
-                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
-            sigterm.recv().await;
-            tracing::info!("Received SIGTERM, shutting down");
-            let _ = sigterm_tx.send(DaemonEvent::Shutdown).await;
-        });
-    }
+    // COP-85: every stop and reload handler is installed here, before
+    // "Daemon ready", so a signal sent right after that line never meets a
+    // default action. A second stop request wakes `force`.
+    let signals = signals::Signals::register()?;
+    let force = std::sync::Arc::new(tokio::sync::Notify::new());
+    let reload_tx = event_tx.clone();
+    tokio::spawn(signals.run(event_tx.clone(), force.clone(), move || {
+        reload_config(&source, &reload_tx);
+    }));
 
     // COP-50: state what startup actually did, then ready or degraded.
     tracing::info!(
@@ -776,8 +772,24 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         tracing::error!(problems = %problems.join("; "), "Daemon running degraded");
     }
 
-    // Run the event loop
-    let run = event_loop.run().await;
+    // Run the event loop. COP-85: a second stop request cancels it at its
+    // next await point; PTT is then released here and the process exits.
+    let finished = {
+        let run = event_loop.run();
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => Some(result),
+            () = force.notified() => None,
+        }
+    };
+    let Some(run) = finished else {
+        event_loop.release_ptt_for_forced_exit();
+        // The backend's Drop releases again if needed; the guardian pipe
+        // closes with an `R` already sent. The mDNS goodbye is skipped.
+        drop(event_loop);
+        tracing::warn!("Daemon stopped before its shutdown finished");
+        std::process::exit(signals::FORCED_EXIT_STATUS);
+    };
 
     // COP-140: goodbye packets, on an event-loop error too, so peers drop
     // coppad.local now rather than when its records expire.
@@ -788,27 +800,6 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     run?;
 
     tracing::info!("Daemon stopped");
-    Ok(())
-}
-
-/// COP-32: a build without `cpal-backend` opens no audio device, so a named
-/// one can never be found.
-#[cfg(not(feature = "cpal-backend"))]
-fn check_no_selected_devices(audio: &config::AudioConfig) -> Result<()> {
-    for (key, name) in [
-        ("input_device", &audio.input_device),
-        ("output_device", &audio.output_device),
-        ("input_device_id", &audio.input_device_id),
-        ("output_device_id", &audio.output_device_id),
-    ] {
-        if !name.is_empty() {
-            anyhow::bail!(
-                "[audio] {key} = {name:?} is set, but this coppad was built without the \
-                 cpal-backend feature and opens no audio devices; rebuild with \
-                 --features cpal-backend, or clear [audio] {key}"
-            );
-        }
-    }
     Ok(())
 }
 

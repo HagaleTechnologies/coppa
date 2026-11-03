@@ -147,7 +147,9 @@ transmission. What does the release depends on how it stops:
 
 | How coppad stops | What releases PTT |
 |---|---|
-| `systemctl stop`, SIGTERM or Ctrl-C (SIGINT) | coppad, before it exits. The log shows `Releasing PTT before shutdown`, and VARA hosts see `PTT OFF`. |
+| `systemctl stop`, SIGTERM or Ctrl-C (SIGINT) | coppad, before it exits. The log shows `Releasing PTT before shutdown`, and VARA hosts see `PTT OFF`. A frame waiting for a busy channel (`[station_id] busy_hold_ms`) is dropped: `Shutdown during the busy-channel wait: dropping the waiting frame`. |
+| A second Ctrl-C, SIGINT or SIGTERM while stopping | coppad, at once: it logs `Received SIGINT again; forcing exit` and `Releasing PTT for a forced exit`, drives PTT to RX on its own backend, tells the guardian, and exits with status 130 (COP-85). It skips the mDNS goodbye, so peers drop `coppad.local` when its records expire. If this cannot finish within 2 s, coppad logs `Shutdown did not finish within 2 s of the second stop signal; exiting now` and exits 130 without it; the guardian then releases rigctld or GPIO PTT. |
+| SIGHUP (`systemctl reload coppad`) | Not a stop. coppad re-reads its configuration and keeps running; see [Reloading the configuration](#reloading-the-configuration). |
 | An error or a panic | The PTT backend, as coppad unwinds. |
 | coppad keeps running, but the task that ends a transmission has died | A check that runs every 500 ms. Once PTT has been keyed for `max_tx_duration_s` plus 2 s, it forces PTT off and logs `PTT backstop: keyed past max_tx_duration_s plus grace with no release; forcing PTT off`. |
 | `kill -9`, an out-of-memory kill or a crash, with rigctld or GPIO PTT | The PTT guardian (below). |
@@ -211,7 +213,9 @@ Nothing in coppad can release PTT in these cases:
   when the port closes. This has not been checked on real hardware.
 - `ptt_guardian = false`, after `kill -9`, an out-of-memory kill or a crash.
 - A coppad that is still running but completely stuck (for example,
-  deadlocked) while PTT is keyed.
+  deadlocked) while PTT is keyed. A second stop signal still ends the
+  process after 2 s, but without its own release; the guardian, if
+  running, then releases rigctld or GPIO PTT.
 - A second Ctrl-C in `coppa tx` or `coppa tune`, which exits at once without
   cleanup. The first Ctrl-C (or SIGTERM) releases PTT and stops the audio
   before exiting with status 130 (COP-86). Errors and panics in them also
@@ -240,6 +244,65 @@ It cannot see your OS mixer or your radio's ALC, which is where over-drive
 actually happens. Steps 1-6 above remain the only drive-level check. If the
 daemon ever logs `TX audio is clipping before it leaves Coppa`, that is a Coppa
 bug, not a level setting; please report it.
+
+## Reloading the configuration
+
+On Linux and macOS, SIGHUP makes coppad re-read the configuration file it
+started from (COP-85). With the shipped systemd unit:
+
+```bash
+sudoedit /etc/coppa/coppad.toml
+sudo -u coppa coppad --config /etc/coppa/coppad.toml --check
+sudo systemctl reload coppad
+journalctl -u coppad -n 5   # a restart_required= line means: sudo systemctl restart coppad
+```
+
+Under launchd, `launchctl kill SIGHUP gui/$(id -u)/io.github.hagaletechnologies.coppad`
+sends the same signal (not tested here). Windows has no SIGHUP: restart
+coppad to apply a change there.
+
+A reload checks the file with the same checks as startup, plus the
+`[radio] ptt_method` and frequency parses. It does not open hardware or bind
+ports. It then applies these keys and keeps the running value of every other
+key until a restart:
+
+| Key | When it takes effect |
+|---|---|
+| `[radio] ptt_pre_delay_ms`, `ptt_tail_delay_ms` | the next transmission |
+| `[radio] max_tx_duration_s` | the next transmission, and the 500 ms PTT backstop at once |
+| `[radio] turnaround_ms` | the next key-up. The startup warning about turnaround and tail delay is re-checked. |
+| `[radio] host_rig_control` | the next `FREQ`/`MODE` set from a host |
+| `[station_id] busy_hold_ms`, `id_interval_secs`, `beacon_interval_secs`, `cwid_wpm` | their next use |
+| `[station_id] cwid` | at once. CW ID is reset to what startup would choose for the new policy. |
+| `[engine] callsign` | at once, only when the file's value changed since the last load. It then replaces a callsign a host set with `MYCALL`. A connected session keeps the callsign it started with. |
+| `[engine] grid` | the next ID or beacon frame |
+| `[session] max_codewords_per_frame` | the next frame |
+| `[host] sessionless_tx_enabled` | the next host send |
+
+Restart-only: all of `[audio]`; `[host]` ports, `bind_address`, every
+`*_enabled` switch, `websocket_token`, `websocket_allowed_origins`,
+`mdns_enabled`; `[radio] ptt_method`, `rigctld_address`, `ptt_guardian`,
+`frequency_hz`, `band`; `[engine] profile`, `arq_enabled`,
+`rate_loop_probe_interval`, `rate_loop_probe_offset`, `cp_gate_enabled`,
+`cp_negotiation_enabled`. A key added to the config later is restart-only
+until it is added to the reload list (`RELOADABLE_KEYS` in
+`crates/coppa-daemon/src/config.rs`).
+
+What the log shows:
+
+| Log line | Meaning |
+|---|---|
+| `Received SIGHUP, reloading configuration`, then `Using configuration file path=...` | A reload started and read this file. |
+| `Configuration reloaded applied=[radio] ptt_tail_delay_ms, ...` | These keys changed and now apply. |
+| `Configuration reload kept the running values of settings that change only on restart restart_required=[host] vara_command_port, ...` (WARN) | These keys changed but need a restart. The line names keys only, never values, so a changed `websocket_token` is never logged. |
+| `Configuration reloaded; no settings changed` | The file matches the running settings. |
+| `Configuration reloaded; nothing changed that applies before a restart` | Only restart-only keys changed (named in the WARN line before it). |
+| `Configuration reload failed; coppad keeps running on its current settings error=...` (ERROR) | The file does not parse or fails a startup check. Nothing changed. |
+| `Received SIGHUP during shutdown; not reloading` | A SIGHUP after a stop request is ignored. |
+
+Closing the terminal that started a foreground coppad now sends it SIGHUP,
+which reloads instead of killing it. Stop it with Ctrl-C, `kill` or
+`systemctl stop`.
 
 ## RX level
 

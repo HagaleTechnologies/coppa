@@ -59,6 +59,14 @@ agent:
 launchctl kickstart -k gui/$(id -u)/io.github.hagaletechnologies.coppad
 ```
 
+Or reload it in place (COP-85; not tested under launchd). The settings a
+reload cannot apply are named in a `restart_required=` log line, and
+`docs/OPERATING.md` lists them:
+
+```bash
+launchctl kill SIGHUP gui/$(id -u)/io.github.hagaletechnologies.coppad
+```
+
 To stop it and keep it stopped until the next `bootstrap`:
 
 ```bash

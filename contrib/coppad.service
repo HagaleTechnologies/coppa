@@ -18,6 +18,9 @@ StartLimitIntervalSec=0
 [Service]
 Type=exec
 ExecStart=/usr/local/bin/coppad --config /etc/coppa/coppad.toml
+# COP-85: `systemctl reload coppad` re-reads the config file. Settings that
+# need a restart are named in the journal (docs/OPERATING.md).
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=10
 # Plain-text log lines for the journal (coppad colours its output otherwise).
