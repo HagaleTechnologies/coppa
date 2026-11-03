@@ -49,7 +49,7 @@ const DRIFT_INNOVATION_CLAMP: f32 = 1.0;
 
 /// Per-step posterior: `[τ, τ̇]` and their 2×2 covariance
 /// `[[p_tt, p_td], [p_td, p_dd]]` (symmetric, stored as 3 floats).
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct DriftState {
     tau: f32,
     tau_dot: f32,
@@ -61,6 +61,7 @@ struct DriftState {
 /// Stateful 2-state (delay, delay-rate) Kalman filter over a sequence of
 /// per-symbol delay observations within one frame. See the module doc for
 /// the full model.
+#[derive(Debug)]
 pub struct DriftTracker {
     q_tau: f32,
     q_dot: f32,

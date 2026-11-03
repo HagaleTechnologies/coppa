@@ -17,3 +17,6 @@ rustfft = { workspace = true }
 approx = { workspace = true }
 coppa-channel = { path = "../coppa-channel" }
 rand = { workspace = true }
+
+[lints]
+workspace = true

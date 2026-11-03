@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Measurement harness: BER/FER/goodput-vs-SNR for Coppa PHY modes"
+# COP-90 (H-137): the measurement programs live in diagnostics/, one
+# [[example]] stanza each; tests/diagnostics_registered.rs keeps them in step.
+autoexamples = false
 
 [dependencies]
 coppa-codec = { path = "../coppa-codec" }
@@ -18,3 +21,162 @@ hound = { workspace = true }
 toml = { workspace = true }
 serde = { workspace = true }
 crc = { workspace = true }
+
+[lints]
+workspace = true
+
+[[example]]
+name = "adaptive_mcs_validation"
+path = "diagnostics/adaptive_mcs_validation.rs"
+
+[[example]]
+name = "capacity_ground_truth_diagnosis"
+path = "diagnostics/capacity_ground_truth_diagnosis.rs"
+
+[[example]]
+name = "capacity_level_correction_calibration"
+path = "diagnostics/capacity_level_correction_calibration.rs"
+
+[[example]]
+name = "capacity_metric_level_bias"
+path = "diagnostics/capacity_metric_level_bias.rs"
+
+[[example]]
+name = "capacity_snr_reference_diagnosis"
+path = "diagnostics/capacity_snr_reference_diagnosis.rs"
+
+[[example]]
+name = "cfo_level4_repro"
+path = "diagnostics/cfo_level4_repro.rs"
+
+[[example]]
+name = "closed_loop_arq"
+path = "diagnostics/closed_loop_arq.rs"
+
+[[example]]
+name = "drift_cascade_gate"
+path = "diagnostics/drift_cascade_gate.rs"
+
+[[example]]
+name = "drift_estimate_quality_diagnosis"
+path = "diagnostics/drift_estimate_quality_diagnosis.rs"
+
+[[example]]
+name = "drift_tracker_gate"
+path = "diagnostics/drift_tracker_gate.rs"
+
+[[example]]
+name = "estimator_diagnosis"
+path = "diagnostics/estimator_diagnosis.rs"
+
+[[example]]
+name = "fading_diagnosis"
+path = "diagnostics/fading_diagnosis.rs"
+
+[[example]]
+name = "golden_vectors_gen"
+path = "diagnostics/golden_vectors_gen.rs"
+
+[[example]]
+name = "header_diagnostic"
+path = "diagnostics/header_diagnostic.rs"
+
+[[example]]
+name = "ldpc_decode_timing"
+path = "diagnostics/ldpc_decode_timing.rs"
+
+[[example]]
+name = "level9_ground_truth_admissibility"
+path = "diagnostics/level9_ground_truth_admissibility.rs"
+
+[[example]]
+name = "level9_profile_ab"
+path = "diagnostics/level9_profile_ab.rs"
+
+[[example]]
+name = "mcs_calibration"
+path = "diagnostics/mcs_calibration.rs"
+
+[[example]]
+name = "mcs_compare"
+path = "diagnostics/mcs_compare.rs"
+
+[[example]]
+name = "milstd"
+path = "diagnostics/milstd.rs"
+
+[[example]]
+name = "papr_clip_level_bias"
+path = "diagnostics/papr_clip_level_bias.rs"
+
+[[example]]
+name = "per_frame_link_diagnosis"
+path = "diagnostics/per_frame_link_diagnosis.rs"
+
+[[example]]
+name = "regression_root_cause"
+path = "diagnostics/regression_root_cause.rs"
+
+[[example]]
+name = "sample_clock_offset"
+path = "diagnostics/sample_clock_offset.rs"
+
+[[example]]
+name = "session"
+path = "diagnostics/session.rs"
+
+[[example]]
+name = "short_cp_fading_gate"
+path = "diagnostics/short_cp_fading_gate.rs"
+
+[[example]]
+name = "task1_gate"
+path = "diagnostics/task1_gate.rs"
+
+[[example]]
+name = "task3_fec_isolated_gate"
+path = "diagnostics/task3_fec_isolated_gate.rs"
+
+[[example]]
+name = "task3_harq_ir_bench"
+path = "diagnostics/task3_harq_ir_bench.rs"
+
+[[example]]
+name = "task3_short_payload_gate"
+path = "diagnostics/task3_short_payload_gate.rs"
+
+[[example]]
+name = "task4_alpha_calibration"
+path = "diagnostics/task4_alpha_calibration.rs"
+
+[[example]]
+name = "task4_bg2_ldpc_gate"
+path = "diagnostics/task4_bg2_ldpc_gate.rs"
+
+[[example]]
+name = "task5_gate"
+path = "diagnostics/task5_gate.rs"
+
+[[example]]
+name = "task5_multi_codeword_transfer"
+path = "diagnostics/task5_multi_codeword_transfer.rs"
+
+[[example]]
+name = "task5_rescue_rate"
+path = "diagnostics/task5_rescue_rate.rs"
+
+[[example]]
+name = "task7_gate"
+path = "diagnostics/task7_gate.rs"
+
+[[example]]
+name = "transfer_baseline"
+path = "diagnostics/transfer_baseline.rs"
+
+[[example]]
+name = "watterson_header_precise"
+path = "diagnostics/watterson_header_precise.rs"
+
+[[example]]
+name = "watterson_sanity_sweep"
+path = "diagnostics/watterson_sanity_sweep.rs"

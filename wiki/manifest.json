@@ -157,7 +157,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:8192581e162b532e7611786d7a3220b340a6f7e96f5bead2e449d59c9b2634cd",
+      "hash": "sha256:2b6fe19d394f76e72085327e426b11bd13e3a106e4f4de70ff3ae142977d0224",
       "id": "adr-008-phase3-system-layer",
       "kind": "decision-digest",
       "links": [
@@ -172,7 +172,7 @@
       "sources": [
         "docs/adr/008-phase3-system-layer.md",
         "crates/coppa-ml/src/**",
-        "crates/coppa-bench/examples/**"
+        "crates/coppa-bench/diagnostics/**"
       ],
       "status": "current",
       "title": "What did Phase 3's system layer ship, and which targets did it miss?",
@@ -420,6 +420,27 @@
       "title": "What will bite you about LDPC at speed levels 9 and 10?",
       "verified_commit": "3cbfd1e",
       "verified_date": "2026-10-28",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:9c525e41700a2dae28aac59a44ab07c2712620a03d8a3aab01d59a701fabdea9",
+      "id": "mdns-discovery",
+      "kind": "gotcha",
+      "links": [
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/mdns-discovery.md",
+      "sources": [
+        "crates/coppa-daemon/src/mdns.rs",
+        "crates/coppa-daemon/tests/cli.rs",
+        "docs/OPERATING.md"
+      ],
+      "status": "current",
+      "title": "What will bite you when testing coppad's mDNS discovery?",
+      "verified_commit": "b9fdb8d",
+      "verified_date": "2026-11-02",
       "visibility": "public"
     },
     {

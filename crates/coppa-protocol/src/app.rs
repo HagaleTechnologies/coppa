@@ -32,6 +32,9 @@ pub enum AppProtocol {
 }
 
 impl AppProtocol {
+    /// Decode the low nibble of `val`; the high nibble is ignored.
+    ///
+    /// Returns [`ProtocolError::UnknownAppProtocol`] for nibble values 8 to 15.
     pub fn from_u8(val: u8) -> Result<Self, ProtocolError> {
         match val & 0x0F {
             0 => Ok(AppProtocol::Text),
@@ -62,6 +65,8 @@ pub enum Compression {
 }
 
 impl Compression {
+    /// Decode the low two bits of `val`; the other bits are ignored, so this
+    /// never fails.
     pub fn from_u8(val: u8) -> Result<Self, ProtocolError> {
         match val & 0x03 {
             0 => Ok(Compression::None),
@@ -88,6 +93,8 @@ pub enum FragFlags {
 }
 
 impl FragFlags {
+    /// Decode the low two bits of `val`; the other bits are ignored, so this
+    /// never fails.
     pub fn from_u8(val: u8) -> Result<Self, ProtocolError> {
         match val & 0x03 {
             0 => Ok(FragFlags::Complete),
@@ -178,6 +185,7 @@ impl AppPdu {
     }
 
     /// Set compression method.
+    #[must_use]
     pub fn with_compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
         self

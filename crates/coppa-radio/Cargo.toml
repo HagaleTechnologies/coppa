@@ -23,3 +23,6 @@ default = []
 # on any OS so its state-machine logic can be unit-tested with a mock.
 serial-ptt = ["dep:serialport"]
 gpio-ptt = []
+
+[lints]
+workspace = true

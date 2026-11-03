@@ -230,6 +230,7 @@ pub enum CpMode {
 }
 
 impl CpMode {
+    /// Wire byte for this mode: `0x00` for `LongCp`, `0x01` for `ShortCp`.
     pub fn to_wire(self) -> u8 {
         match self {
             CpMode::LongCp => 0x00,
@@ -237,6 +238,8 @@ impl CpMode {
         }
     }
 
+    /// Decode a wire byte: `0x01` is `ShortCp` and every other value is
+    /// `LongCp`, so an unknown byte falls back to the long CP.
     pub fn from_wire(byte: u8) -> Self {
         if byte == 0x01 {
             CpMode::ShortCp
@@ -301,6 +304,7 @@ pub enum CpTimeout {
 
 /// Negotiation state for one direction of one link. See the module doc for
 /// the proposer/confirmer role split and the G1-G4 give-up table.
+#[derive(Debug)]
 pub struct CpNegotiator {
     current: CpMode,
     /// A's side: set when we sent a Confirm and are waiting to see its ARQ
@@ -328,6 +332,7 @@ pub struct CpNegotiator {
 }
 
 impl CpNegotiator {
+    /// Start on `CpMode::LongCp` with no negotiation in flight.
     pub fn new() -> Self {
         Self {
             current: CpMode::LongCp,

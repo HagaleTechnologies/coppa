@@ -16,7 +16,10 @@
 pub const VALID_SPEED_LEVELS: [u8; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 
 /// Invalid configuration for a [`RateLoop`].
+///
+/// Marked `#[non_exhaustive]`: a match outside this crate needs a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RateLoopError {
     /// No levels were supplied.
     EmptyLevels,
@@ -36,6 +39,7 @@ impl std::fmt::Display for RateLoopError {
 impl std::error::Error for RateLoopError {}
 
 /// Sender-side adaptive rate controller. Holds an index into an ascending level set.
+#[derive(Debug)]
 pub struct RateLoop {
     levels: Vec<u8>,
     idx: usize,
@@ -86,6 +90,7 @@ impl RateLoop {
     /// per-frame recommendation is weak (see
     /// `docs/superpowers/specs/2026-07-25-rateloop-active-overshoot-probing-design.md`).
     /// `probe_interval = 0` (the default from `new`) disables probing entirely.
+    #[must_use]
     pub fn with_probing(mut self, probe_interval: u32, probe_offset: usize) -> Self {
         self.probe_interval = probe_interval;
         self.probe_offset = probe_offset;
@@ -93,7 +98,7 @@ impl RateLoop {
     }
 
     /// The standard coppa level set, starting at the most robust level. `raise_dwell = 5` is the
-    /// value found by sweeping 3/4/5/6/8/10/12/15 against `crates/coppa-bench/examples/
+    /// value found by sweeping 3/4/5/6/8/10/12/15 against `crates/coppa-bench/diagnostics/
     /// closed_loop_arq.rs`'s time-varying-channel bench (`robust` profile): 5 was the peak
     /// (adaptive/best-fixed and adaptive/oracle both highest there and falling off on both
     /// sides), not just a monotonic "more dwell is safer" choice -- see that bench's module doc
@@ -141,7 +146,7 @@ impl RateLoop {
     /// can't make progress in (a channel it reads as persistently low); spending a probe slot while
     /// it's already climbing just trades away guaranteed throughput for no benefit. Measured to
     /// give a small but consistent improvement over unconditional probing on
-    /// `crates/coppa-bench/examples/closed_loop_arq.rs` -- see the design doc's "Outcome" section.
+    /// `crates/coppa-bench/diagnostics/closed_loop_arq.rs` -- see the design doc's "Outcome" section.
     pub fn level_for_next_transmission(&mut self) -> (u8, bool) {
         if self.probe_interval == 0 {
             return (self.current_level(), false);

@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "coppad"
 path = "src/main.rs"
@@ -38,8 +41,12 @@ serde_json = { workspace = true, optional = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# COP-140: mDNS responder for coppad.local; pure Rust, no system daemon.
+mdns-sd = { version = "0.21", optional = true }
 
 [dev-dependencies]
+# COP-140: the round-trip test browses and resolves with the same crate.
+mdns-sd = "0.21"
 futures-util = "0.3"
 tokio-tungstenite = "0.29"
 coppa-channel = { path = "../coppa-channel" }
@@ -58,3 +65,5 @@ kiss-tnc = ["coppa-host/kiss-tnc"]
 ardop = ["coppa-host/ardop"]
 serial-ptt = ["coppa-radio/serial-ptt"]
 gpio-ptt = ["coppa-radio/gpio-ptt"]
+# mDNS needs the WebSocket listener: it advertises that port and nothing else.
+mdns = ["websocket", "dep:mdns-sd"]

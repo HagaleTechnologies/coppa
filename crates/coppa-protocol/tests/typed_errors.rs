@@ -1,3 +1,6 @@
+// Tests build `Instant`s to pass as the API's `now` (COP-90 guard).
+#![allow(clippy::disallowed_methods)]
+
 use coppa_protocol::{mac::Callsign, ProtocolError};
 #[test]
 fn callers_match_error_kind() {
@@ -266,6 +269,7 @@ fn session(caps: LinkCapabilities) -> Session {
         Callsign::new("B").unwrap(),
         0,
         caps,
+        Instant::now(),
     )
 }
 
@@ -278,39 +282,39 @@ fn session_state_errors_and_exhaustion() {
     );
     let mut s = session(LinkCapabilities::default());
     failure!(
-        s.handle_connect_ack(&[]),
+        s.handle_connect_ack(&[], Instant::now()),
         ProtocolError::UnexpectedConnectAck {
             state: SessionState::Idle
         },
         "Unexpected CONNECT_ACK in state Idle"
     );
     failure!(
-        s.handle_connect_cfm(&[]),
+        s.handle_connect_cfm(&[], Instant::now()),
         ProtocolError::UnexpectedConnectCfm {
             state: SessionState::Idle
         },
         "Unexpected CONNECT_CFM in state Idle"
     );
     failure!(
-        s.disconnect(),
+        s.disconnect(Instant::now()),
         ProtocolError::CannotDisconnectIdle,
         "Cannot disconnect: session is idle"
     );
     failure!(
-        s.keepalive(),
+        s.keepalive(Instant::now()),
         ProtocolError::KeepaliveNotEstablished,
         "Cannot send keepalive: session not established"
     );
-    s.initiate().unwrap();
+    s.initiate(Instant::now()).unwrap();
     failure!(
-        s.initiate(),
+        s.initiate(Instant::now()),
         ProtocolError::CannotInitiate {
             state: SessionState::Connecting
         },
         "Cannot initiate: session in state Connecting"
     );
     failure!(
-        s.handle_connect_req(&[]),
+        s.handle_connect_req(&[], Instant::now()),
         ProtocolError::UnexpectedConnectReq {
             state: SessionState::Connecting
         },
@@ -324,6 +328,7 @@ fn session_state_errors_and_exhaustion() {
                 Callsign::broadcast(),
                 0,
                 LinkCapabilities::default(),
+                Instant::now(),
             )
             .unwrap();
     }
@@ -332,7 +337,8 @@ fn session_state_errors_and_exhaustion() {
             Callsign::broadcast(),
             Callsign::broadcast(),
             0,
-            LinkCapabilities::default()
+            LinkCapabilities::default(),
+            Instant::now()
         ),
         ProtocolError::NoFreeSessionSlots,
         "No free session slots"
@@ -346,10 +352,13 @@ fn negotiated_capability_errors_retain_snapshots() {
         ..LinkCapabilities::default()
     };
     let mut s = session(caps.clone());
-    s.handle_connect_req(&caps.to_bytes()).unwrap();
+    s.handle_connect_req(&caps.to_bytes(), Instant::now())
+        .unwrap();
     let mut bad = caps.clone();
     bad.mcs_index += 1;
-    let error = s.handle_connect_cfm(&bad.to_bytes()).unwrap_err();
+    let error = s
+        .handle_connect_cfm(&bad.to_bytes(), Instant::now())
+        .unwrap_err();
     match &error {
         ProtocolError::CapabilitiesExceedIntersection {
             negotiated,
@@ -364,7 +373,9 @@ fn negotiated_capability_errors_retain_snapshots() {
     let mut bad = caps.clone();
     bad.fec_rate_num = 1;
     bad.fec_rate_den = 1;
-    let e = s.handle_connect_cfm(&bad.to_bytes()).unwrap_err();
+    let e = s
+        .handle_connect_cfm(&bad.to_bytes(), Instant::now())
+        .unwrap_err();
     assert!(
         matches!(e, ProtocolError::FecRateExceedsIntersection { numerator: 1, denominator: 1, expected_numerator, expected_denominator } if expected_numerator == caps.fec_rate_num && expected_denominator == caps.fec_rate_den)
     );
@@ -378,7 +389,7 @@ fn negotiated_capability_errors_retain_snapshots() {
     let mut bad = caps;
     bad.compression = true;
     failure!(
-        s.handle_connect_cfm(&bad.to_bytes()),
+        s.handle_connect_cfm(&bad.to_bytes(), Instant::now()),
         ProtocolError::CompressionNotMutuallySupported,
         "Negotiated compression enabled but not supported by both peers"
     );

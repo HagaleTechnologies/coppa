@@ -31,10 +31,13 @@ INFO coppad: PTT method="rigctld 127.0.0.1:4532" active=rigctld state="released"
 |---|---|---|
 | `Coppa Daemon starting` | `version` | The `coppad` version. |
 | | `git_sha` | The commit HEAD pointed at when `coppad` was built (12 hex digits), or `unknown` for a build from a tree without `.git`. Packagers building from a tarball set `COPPA_GIT_SHA` (7-40 hex digits) at build time. It does not flag uncommitted changes. |
-| | `features` | `coppa-daemon`'s cargo features in this build (`cpal-backend`, `gpio-ptt`, `kiss-tnc`, `serial-ptt`, `websocket`), comma-separated, or `none`. |
+| | `features` | `coppa-daemon`'s cargo features in this build (`cpal-backend`, `gpio-ptt`, `kiss-tnc`, `mdns`, `serial-ptt`, `websocket`), comma-separated, or `none`. |
 | `Host listeners` | `bind_address` | `[host] bind_address`. |
-| | `vara_command`, `vara_data`, `websocket` | The bound `ip:port` (the real port when 0 is configured), `disabled`, or, for `websocket` only, `not-built` in a build without the `websocket` feature. The `websocket` port also serves the operator page over plain HTTP at `GET /` (COP-79). |
+| | `vara_command`, `vara_data`, `websocket` | The bound `ip:port` (the real port when 0 is configured), `disabled`, or, for `websocket` only, `not-built` in a build without the `websocket` feature. The `websocket` port also serves the operator page over plain HTTP at `GET /` (COP-79) and answers `GET /health` (COP-140, see [Health check](#health-check)). |
 | `Host listeners accept connections from other hosts; ...` (WARN) | `bind_address` | Logged when a listener is bound to a non-loopback address such as `0.0.0.0`: anyone who can reach it can key the transmitter. |
+| `mDNS advertisement` | `host`, `service`, `port`, `addresses` | Only with `[host] mdns_enabled = true` in an `mdns` build. The advertised host (`coppad.local.`), service instance (`coppad._coppa._tcp.local.`), bound WebSocket port, and `every non-loopback IPv4 address` (`bind_address = "0.0.0.0"`), `every non-loopback address` (`"[::]"`) or the single bound address. See [Finding coppad on the network](#finding-coppad-on-the-network-mdns). |
+| `mDNS name already in use on this network; ...` (WARN) | `original`, `new_name` | Another host answers for the name, so the responder renamed this daemon, for example to `coppad-2.local.`. Clients must use the new name. |
+| `mDNS responder error` (WARN) | `error` | A socket or interface problem the responder hit after startup. |
 | `Audio devices` | `input`, `output` | The device cpal opened, as its name and cpal id, for example `Default Audio Device (alsa:default)`. On ALSA, `default` is whatever PulseAudio, PipeWire or `.asoundrc` route it to; coppad cannot see further. A named device shows its own description and id. |
 | `Audio input/output started` | `hardware_rate`, `engine_rate` | The opened stream rate and modem profile rate; they differ when Coppa resamples. |
 | `Audio devices` | `input_hardware_rate`, `output_hardware_rate`, `engine_rate` | The effective input and output hardware rates and the modem profile rate. |
@@ -313,12 +316,152 @@ token and the page holds none; its `/ws` upgrade presents the token you type.
 | `duration_ms` | Audio span the reading covers |
 | `timestamp_ms` | Wall-clock time the message was sent (Unix epoch, ms) |
 
+## Monitoring and discovery
+
+### Health check
+
+On a daemon with the WebSocket listener (built with `--features websocket`,
+run with `[host] websocket_enabled = true`), the WebSocket port answers
+`GET /health` and `HEAD /health` (COP-140). No token is needed. After
+`Daemon ready`:
+
+```console
+$ curl -i http://127.0.0.1:8400/health
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 16
+Cache-Control: no-store
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+Content-Security-Policy: frame-ancestors 'none'
+Connection: close
+
+{"status":"ok"}
+```
+
+After `Daemon running degraded` (for example `[radio] ptt_method = "rigctld"`
+with rigctld unreachable), the status line is the same and the body is:
+
+```text
+{"status":"degraded"}
+```
+
+- Both values return HTTP 200. A monitor that alerts on degradation matches
+  the `status` field, not the status code. `degraded` means startup found the
+  problems that the `Daemon running degraded problems=...` log line lists;
+  the body never repeats them.
+- The value is the startup verdict. A fault that starts later does not change
+  it, and a build without `cpal-backend` reports `ok`. `docs/LIMITATIONS.md`
+  has the details.
+- The body carries only the status: no version, callsign, frequency, PTT state
+  or session data. The query string is ignored, and the response has no
+  `Access-Control-Allow-Origin` header, so a page on another site cannot read
+  it.
+- `HEAD` returns the `GET` head, `Content-Length` included, with no body. This
+  holds for every path `GET` answers. Other methods get `405` with
+  `Allow: GET, HEAD`.
+- A connection must send its whole request head within 5 s, or the daemon
+  closes it without a response.
+- Without the WebSocket listener there is no port, so a probe gets "connection
+  refused".
+
+A probe in a systemd unit or a shell script:
+
+```bash
+curl -fsS http://127.0.0.1:8400/health | grep -q '"status":"ok"'
+```
+
+A Nagios or Icinga `check_http` probe that goes critical unless the daemon is
+healthy (Uptime Kuma: an HTTP(s) - Keyword monitor with the keyword
+`"status":"ok"`):
+
+```bash
+check_http -H 127.0.0.1 -p 8400 -u /health -s '"status":"ok"'
+```
+
+### Finding coppad on the network (mDNS)
+
+A `coppad` built with the `mdns` feature can advertise itself on the local
+network, so a phone, tablet or laptop opens it as `http://coppad.local:8400/`
+without knowing its address. The feature turns on `websocket` too:
+
+```bash
+cargo build --release -p coppa-daemon --features cpal-backend,websocket,mdns
+```
+
+```toml
+[host]
+bind_address = "0.0.0.0"
+websocket_enabled = true
+mdns_enabled = true
+```
+
+`mdns_enabled = true` needs all three of:
+
+- a `coppad` built with `--features mdns`;
+- `websocket_enabled = true`, because the WebSocket port is the only one
+  advertised;
+- a `bind_address` other hosts can reach, such as `"0.0.0.0"` or this host's
+  LAN address. Read the `bind_address` warning in `coppad.toml.example` first,
+  and use it only on a trusted, firewalled network.
+
+Otherwise `coppad` stops at startup, before it touches audio or PTT, with one
+of:
+
+```text
+Error: [host] mdns_enabled = true is set, but this coppad was built without the mdns feature and advertises nothing; rebuild with --features mdns, or set mdns_enabled = false
+Error: [host] mdns_enabled = true needs [host] websocket_enabled = true: coppad advertises its WebSocket port (the operator page and /health) and nothing else
+Error: [host] mdns_enabled = true needs a bind_address other hosts can reach, but bind_address = "127.0.0.1" is loopback, so coppad.local would send clients to a port that refuses them; set bind_address = "0.0.0.0" or this host's LAN address, on a trusted, firewalled network
+```
+
+A `bind_address` host name that resolves to loopback, such as `localhost`, gets
+the third message after the listener binds, naming the bound address.
+
+mDNS uses multicast on UDP port 5353; allow it through the host firewall.
+The responder runs inside `coppad` and needs no Avahi or Bonjour daemon. The
+daemon advertises:
+
+| Record | Value |
+|---|---|
+| Host name (A, and AAAA for `[::]`) | `coppad.local.` |
+| Service instance | `coppad._coppa._tcp.local.` |
+| SRV | `coppad.local.`, the bound WebSocket port (8400 by default) |
+| TXT | `txtvers=1`, `path=/`, `health=/health` |
+
+The VARA-style command and data ports, the ARDOP ports and KISS are not
+advertised. On a clean shutdown the daemon withdraws the records.
+
+Phones, tablets, macOS, Windows and browsers resolve `.local` names
+themselves. A Linux client needs nss-mdns (Avahi's `libnss-mdns` package with
+`mdns4_minimal` in `/etc/nsswitch.conf`); without it `getent hosts
+coppad.local` and `curl http://coppad.local:8400/` fail. On such a host,
+`avahi-browse -rt _coppa._tcp` lists the daemon; on macOS,
+`dns-sd -B _coppa._tcp` does.
+
+To open the operator page by its mDNS name, add that origin to
+`websocket_allowed_origins`, or the page reports `Refused`:
+
+```toml
+websocket_allowed_origins = ["http://coppad.local:8400"]
+```
+
+The name is fixed at `coppad.local`. If another host on the LAN already
+answers for it, the responder picks a new name (for example `coppad-2.local`)
+and logs `mDNS name already in use on this network; advertising under the new
+name` with `original` and `new_name`. Use the new name, and add its origin if
+you open the page by it. Set `RUST_LOG=mdns_sd=debug` to see the responder's
+own log.
+
 ## WebSocket access
 
 The WebSocket port can key the transmitter, so `coppad` refuses a client
 unless it presents a shared-secret token. This applies on every
 `bind_address`, loopback included: a web page open in your own browser can
 reach `127.0.0.1` too.
+
+For a host author's overview of every port, including the WebSocket
+handshake outcomes and request table, see [HOST-API.md](HOST-API.md). This
+section owns the token and Origin setup.
 
 ### Dashboard protocol v1
 

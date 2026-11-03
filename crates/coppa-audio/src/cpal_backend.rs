@@ -752,7 +752,11 @@ impl AudioDirection {
     }
 }
 
+/// Why a named audio device could not be selected.
+///
+/// Marked `#[non_exhaustive]`: a match outside this crate needs a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DeviceSelectionError {
     MissingName {
         direction: &'static str,

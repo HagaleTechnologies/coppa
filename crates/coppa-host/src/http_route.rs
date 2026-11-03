@@ -4,7 +4,9 @@
 //! its shape. A WebSocket upgrade is replayed, byte for byte, into the
 //! unchanged COP-53 handshake gate through [`PrefixedStream`]. Any other
 //! request gets a fixed static answer: the configured page at `GET /` and
-//! `GET /index.html`, `404`, `405`, `400` or `431`. Routing is on request
+//! `GET /index.html`, the configured health status at `GET /health`
+//! (COP-140), `404`, `405`, `400` or `431`. `HEAD` gets the `GET` answer
+//! without its body. Routing is on request
 //! shape, not path, because the gate has never looked at the path and
 //! existing clients upgrade at more than `/ws`.
 //!
@@ -17,6 +19,8 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+use crate::websocket::Health;
+
 /// Largest request head read before the connection is answered `431`.
 pub(crate) const MAX_HTTP_HEAD_BYTES: usize = 8 * 1024;
 
@@ -28,13 +32,21 @@ const MAX_HEADERS: usize = 124;
 const LINGER: std::time::Duration = std::time::Duration::from_millis(500);
 const MAX_LINGER_BYTES: usize = 64 * 1024;
 
+/// COP-140: how long a connection has to send its whole request head. Without
+/// a deadline, 16 sockets that send nothing hold every connection permit for
+/// as long as they stay open, and a health probe is refused all that time.
+pub(crate) const HEAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 const NOT_FOUND_BODY: &[u8] = b"not found\n";
 const METHOD_NOT_ALLOWED_BODY: &[u8] = b"method not allowed\n";
 const BAD_REQUEST_BODY: &[u8] = b"bad request\n";
 const HEAD_TOO_LARGE_BODY: &[u8] = b"request header fields too large\n";
+const HEALTH_OK_BODY: &[u8] = b"{\"status\":\"ok\"}\n";
+const HEALTH_DEGRADED_BODY: &[u8] = b"{\"status\":\"degraded\"}\n";
 
 const TEXT_PLAIN: &str = "text/plain; charset=utf-8";
 const TEXT_HTML: &str = "text/html; charset=utf-8";
+const APPLICATION_JSON: &str = "application/json";
 
 /// What a connection's request head asks for.
 #[derive(Debug, PartialEq, Eq)]
@@ -85,11 +97,13 @@ impl HeadError {
             HeadError::TooLarge => Some(static_response(
                 StatusLine::HEAD_TOO_LARGE,
                 false,
+                false,
                 TEXT_PLAIN,
                 HEAD_TOO_LARGE_BODY,
             )),
             HeadError::Malformed => Some(static_response(
                 StatusLine::BAD_REQUEST,
+                false,
                 false,
                 TEXT_PLAIN,
                 BAD_REQUEST_BODY,
@@ -163,23 +177,58 @@ pub(crate) fn classify(request: &httparse::Request<'_, '_>) -> ClientRequest {
 
 /// The complete response for a non-upgrade request. Only the path before any
 /// `?` is matched, so `/?token=...` still gets the page, and the query is
-/// never echoed or logged.
-pub(crate) fn static_answer(method: &str, path: &str, index_html: Option<&str>) -> Vec<u8> {
-    if method != "GET" {
-        return static_response(
-            StatusLine::METHOD_NOT_ALLOWED,
-            true,
-            TEXT_PLAIN,
-            METHOD_NOT_ALLOWED_BODY,
-        );
-    }
-    let path = path.split_once('?').map_or(path, |(p, _)| p);
-    match (path, index_html) {
-        ("/" | "/index.html", Some(html)) => {
-            static_response(StatusLine::OK, false, TEXT_HTML, html.as_bytes())
+/// never echoed or logged. `HEAD` gets the `GET` response with its body cut
+/// off, so `Content-Length` still states the `GET` body's length.
+pub(crate) fn static_answer(
+    method: &str,
+    path: &str,
+    index_html: Option<&str>,
+    health: Option<Health>,
+) -> Vec<u8> {
+    let head_only = match method {
+        "GET" => false,
+        "HEAD" => true,
+        _ => {
+            return static_response(
+                StatusLine::METHOD_NOT_ALLOWED,
+                true,
+                false,
+                TEXT_PLAIN,
+                METHOD_NOT_ALLOWED_BODY,
+            )
         }
-        _ => static_response(StatusLine::NOT_FOUND, false, TEXT_PLAIN, NOT_FOUND_BODY),
+    };
+    let path = path.split_once('?').map_or(path, |(p, _)| p);
+    let (mut response, body_len) = match (path, index_html, health) {
+        ("/" | "/index.html", Some(html), _) => (
+            static_response(StatusLine::OK, false, false, TEXT_HTML, html.as_bytes()),
+            html.len(),
+        ),
+        ("/health", _, Some(health)) => {
+            let body = match health {
+                Health::Ok => HEALTH_OK_BODY,
+                Health::Degraded => HEALTH_DEGRADED_BODY,
+            };
+            (
+                static_response(StatusLine::OK, false, true, APPLICATION_JSON, body),
+                body.len(),
+            )
+        }
+        _ => (
+            static_response(
+                StatusLine::NOT_FOUND,
+                false,
+                false,
+                TEXT_PLAIN,
+                NOT_FOUND_BODY,
+            ),
+            NOT_FOUND_BODY.len(),
+        ),
+    };
+    if head_only {
+        response.truncate(response.len() - body_len);
     }
+    response
 }
 
 /// Write `response`, half-close, then briefly drain what the peer still
@@ -219,20 +268,30 @@ impl StatusLine {
 }
 
 /// Build a whole response: status line, `Content-Type`, `Content-Length`,
-/// `Allow: GET` when `allow_get`, headers that stop other sites framing the
-/// page and browsers sniffing a different type, `Connection: close`, then
-/// `body`.
+/// `Allow: GET, HEAD` when `allow_get`, `Cache-Control: no-store` when
+/// `no_store`, headers that stop other sites framing the page and browsers
+/// sniffing a different type, `Connection: close`, then `body`.
 pub(crate) fn static_response(
     status: StatusLine,
     allow_get: bool,
+    no_store: bool,
     content_type: &str,
     body: &[u8],
 ) -> Vec<u8> {
     let StatusLine(code, reason) = status;
-    let allow = if allow_get { "Allow: GET\r\n" } else { "" };
+    let allow = if allow_get {
+        "Allow: GET, HEAD\r\n"
+    } else {
+        ""
+    };
+    let cache = if no_store {
+        "Cache-Control: no-store\r\n"
+    } else {
+        ""
+    };
     let mut response = format!(
         "HTTP/1.1 {code} {reason}\r\nContent-Type: {content_type}\r\n\
-         Content-Length: {}\r\n{allow}X-Content-Type-Options: nosniff\r\n\
+         Content-Length: {}\r\n{allow}{cache}X-Content-Type-Options: nosniff\r\n\
          X-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'\r\n\
          Connection: close\r\n\r\n",
         body.len()
@@ -379,7 +438,7 @@ mod tests {
     #[test]
     fn static_answers_cover_page_404_and_405() {
         let page = Some("<html></html>");
-        let ok = String::from_utf8(static_answer("GET", "/?token=secret", page)).unwrap();
+        let ok = String::from_utf8(static_answer("GET", "/?token=secret", page, None)).unwrap();
         assert!(ok.starts_with("HTTP/1.1 200 OK\r\n"), "{ok}");
         assert!(ok.contains("Content-Length: 13\r\n"), "{ok}");
         assert!(ok.ends_with("\r\n\r\n<html></html>"), "{ok}");
@@ -390,16 +449,116 @@ mod tests {
         );
         assert!(!ok.contains("secret"));
 
-        let missing = String::from_utf8(static_answer("GET", "/", None)).unwrap();
+        let missing = String::from_utf8(static_answer("GET", "/", None, None)).unwrap();
         assert!(
             missing.starts_with("HTTP/1.1 404 Not Found\r\n"),
             "{missing}"
         );
         assert!(missing.ends_with("\r\n\r\nnot found\n"), "{missing}");
 
-        let post = String::from_utf8(static_answer("POST", "/", page)).unwrap();
+        let post = String::from_utf8(static_answer("POST", "/", page, None)).unwrap();
         assert!(post.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
-        assert!(post.contains("Allow: GET\r\n"));
+        assert!(post.contains("Allow: GET, HEAD\r\n"));
+    }
+
+    #[test]
+    fn health_answers_ok_and_degraded_as_uncached_json() {
+        let ok =
+            String::from_utf8(static_answer("GET", "/health", None, Some(Health::Ok))).unwrap();
+        assert!(ok.starts_with("HTTP/1.1 200 OK\r\n"), "{ok}");
+        assert!(
+            ok.contains("\r\nContent-Type: application/json\r\n"),
+            "{ok}"
+        );
+        assert!(ok.contains("\r\nCache-Control: no-store\r\n"), "{ok}");
+        assert!(ok.contains("\r\nContent-Length: 16\r\n"), "{ok}");
+        assert!(ok.ends_with("\r\n\r\n{\"status\":\"ok\"}\n"), "{ok}");
+        assert!(!ok.contains("Access-Control-Allow-Origin"), "{ok}");
+
+        let degraded = String::from_utf8(static_answer(
+            "GET",
+            "/health",
+            None,
+            Some(Health::Degraded),
+        ))
+        .unwrap();
+        assert!(degraded.starts_with("HTTP/1.1 200 OK\r\n"), "{degraded}");
+        assert!(
+            degraded.contains("\r\nContent-Length: 22\r\n"),
+            "{degraded}"
+        );
+        assert!(
+            degraded.ends_with("\r\n\r\n{\"status\":\"degraded\"}\n"),
+            "{degraded}"
+        );
+    }
+
+    #[test]
+    fn health_without_a_value_configured_is_404() {
+        let missing =
+            String::from_utf8(static_answer("GET", "/health", Some("<html></html>"), None))
+                .unwrap();
+        assert!(
+            missing.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "{missing}"
+        );
+        assert!(!missing.contains("Cache-Control"), "{missing}");
+    }
+
+    #[test]
+    fn health_ignores_the_query_and_never_echoes_it() {
+        let ok = String::from_utf8(static_answer(
+            "GET",
+            "/health?token=secret",
+            None,
+            Some(Health::Ok),
+        ))
+        .unwrap();
+        assert!(ok.starts_with("HTTP/1.1 200 OK\r\n"), "{ok}");
+        assert!(ok.ends_with("{\"status\":\"ok\"}\n"), "{ok}");
+        assert!(!ok.contains("secret"), "{ok}");
+        assert!(!ok.contains("token"), "{ok}");
+    }
+
+    #[test]
+    fn head_is_the_get_response_without_its_body() {
+        let page = Some("<html></html>");
+        for path in ["/", "/index.html", "/health", "/nope"] {
+            let get = static_answer("GET", path, page, Some(Health::Ok));
+            let head = static_answer("HEAD", path, page, Some(Health::Ok));
+            let split = get
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("a response head")
+                + 4;
+            assert!(split < get.len(), "GET {path} has a body");
+            assert_eq!(head, get[..split], "HEAD {path}");
+            let text = String::from_utf8(head).unwrap();
+            let length = format!("\r\nContent-Length: {}\r\n", get.len() - split);
+            assert!(text.contains(&length), "HEAD {path}: {text}");
+        }
+    }
+
+    #[test]
+    fn other_methods_are_405_allowing_get_and_head() {
+        for method in ["POST", "PUT", "OPTIONS", "DELETE"] {
+            let response = String::from_utf8(static_answer(
+                method,
+                "/health",
+                Some("<html></html>"),
+                Some(Health::Ok),
+            ))
+            .unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+                "{method}: {response}"
+            );
+            assert!(
+                response.contains("\r\nAllow: GET, HEAD\r\n"),
+                "{method}: {response}"
+            );
+            assert!(!response.contains("status"), "{method}: {response}");
+        }
     }
 
     #[tokio::test]

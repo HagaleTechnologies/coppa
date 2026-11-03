@@ -215,6 +215,11 @@ fn validate_window(window_size: u8) -> Result<(), ProtocolError> {
 }
 
 impl ArqConfig {
+    /// Build a config with the default airtime parameters (speed level,
+    /// turnaround and `CoppaProfile::hf_standard()`).
+    ///
+    /// Returns [`ProtocolError::InvalidWindowSize`] unless
+    /// `1 <= window_size <= MAX_WINDOW_SIZE`.
     pub fn new(
         window_size: u8,
         max_retransmit: u8,
@@ -234,6 +239,7 @@ impl ArqConfig {
 
     /// Set the speed level(s)/turnaround/profile used for the [`rto_floor`]
     /// half-duplex airtime calculation (decision 4). Builder-style.
+    #[must_use]
     pub fn with_airtime_params(
         mut self,
         speed_level: u8,
@@ -746,6 +752,8 @@ pub struct ArqRx {
 }
 
 impl ArqRx {
+    /// Create a receiver expecting sequence number 0. `window_size` is clamped
+    /// to `MAX_WINDOW_SIZE`; it is not otherwise validated.
     pub fn new(window_size: u8) -> Self {
         let buf_size = MAX_WINDOW_SIZE as usize;
         Self {

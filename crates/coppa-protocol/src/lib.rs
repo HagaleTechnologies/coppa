@@ -17,6 +17,9 @@
 //! opaque error. This is a source-breaking signature change. Match its typed
 //! fields and keep a wildcard arm because the enum is non-exhaustive.
 //! Existing transceiver `TransmitError` and `ReceiveError` remain separate.
+//! `TransmitError` is also `#[non_exhaustive]`; `ReceiveError` deliberately
+//! is not, because coppa-bench buckets every variant and a wildcard arm there
+//! would hide a new one.
 //!
 //! ```
 //! use coppa_protocol::{mac::Callsign, ProtocolError};
@@ -25,6 +28,20 @@
 //!     other => panic!("unexpected result: {other:?}"),
 //! }
 //! ```
+//!
+//! # Portability
+//!
+//! The crate compiles for `wasm32-unknown-unknown` and never reads the clock:
+//! every method that needs the time takes `now: std::time::Instant` from the
+//! caller. That still leaves `Session`, `ArqTx` and `CpNegotiator` unusable on
+//! `wasm32-unknown-unknown`, because a caller there cannot construct an
+//! `Instant` (`Instant::now()` traps), until a crate-wide timestamp type exists
+//! (see `docs/LIMITATIONS.md`).
+
+#![warn(missing_docs, missing_debug_implementations)]
+// Unit tests build synthetic `Instant`s from `Instant::now()`; the
+// clippy.toml clock ban (COP-90) applies to library code only.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod error;
 pub use error::ProtocolError;
@@ -42,6 +59,8 @@ pub mod compression;
 
 pub mod ax25;
 
+/// The modem pipeline: `CoppaTransceiver`, `StreamingReceiver`, the speed
+/// levels and the airtime model.
 pub mod modem;
 
 pub use frame::Frame;

@@ -40,6 +40,9 @@ pub enum TransportType {
 }
 
 impl TransportType {
+    /// Decode the low nibble of `val`; the high nibble is ignored.
+    ///
+    /// Returns [`ProtocolError::UnknownTransportType`] for nibble values 6 to 15.
     pub fn from_u8(val: u8) -> Result<Self, ProtocolError> {
         match val & 0x0F {
             0 => Ok(TransportType::Unreliable),

@@ -489,12 +489,14 @@ impl McsEntry {
 ///     assert!((a - b).norm() < 0.01);
 /// }
 /// ```
+#[derive(Debug)]
 pub struct OfdmModulator {
     profile: OfdmProfile,
     fft: coppa_dsp::fft::FftProcessor,
 }
 
 impl OfdmModulator {
+    /// Creates a modulator for `profile`, planning an FFT of `profile.fft_size`.
     pub fn new(profile: OfdmProfile) -> Self {
         let fft = coppa_dsp::fft::FftProcessor::new(profile.fft_size);
         Self { profile, fft }
@@ -542,18 +544,21 @@ impl OfdmModulator {
         output
     }
 
+    /// The profile this modulator was built for.
     pub fn profile(&self) -> &OfdmProfile {
         &self.profile
     }
 }
 
 /// OFDM demodulator: extracts frequency-domain symbols from time-domain samples.
+#[derive(Debug)]
 pub struct OfdmDemodulator {
     profile: OfdmProfile,
     fft: coppa_dsp::fft::FftProcessor,
 }
 
 impl OfdmDemodulator {
+    /// Creates a demodulator for `profile`, planning an FFT of `profile.fft_size`.
     pub fn new(profile: OfdmProfile) -> Self {
         let fft = coppa_dsp::fft::FftProcessor::new(profile.fft_size);
         Self { profile, fft }
@@ -582,6 +587,7 @@ impl OfdmDemodulator {
         output
     }
 
+    /// The profile this demodulator was built for.
     pub fn profile(&self) -> &OfdmProfile {
         &self.profile
     }

@@ -79,9 +79,22 @@ typedef struct CoppaStreamHandle CoppaStreamHandle;
  *   storage and an accessor together. Pass null if unused.
  */
 typedef struct coppa_config_t {
+  /**
+   * Sample rate in Hz; `0` keeps the resolved profile's rate (48000 today).
+   */
   uint32_t sample_rate;
+  /**
+   * Null-terminated profile name, matched case-insensitively; null or empty
+   * starts from `EngineConfig::default()`.
+   */
   const char *profile;
+  /**
+   * Speed-level override 1-9 (9 is VHF-only); `0` keeps the profile's level.
+   */
   uint8_t speed_level;
+  /**
+   * Null-terminated callsign; validated as UTF-8, then discarded. May be null.
+   */
   const char *callsign;
 } coppa_config_t;
 
@@ -102,11 +115,31 @@ typedef struct coppa_config_t {
  * sequence-number field.
  */
 typedef struct coppa_frame_t {
+  /**
+   * Owned payload buffer; free it with `coppa_free_frame_payload`. Null when
+   * no frame was pending.
+   */
   uint8_t *payload;
+  /**
+   * Length of `payload` in bytes; pass this exact value when freeing it.
+   */
   uintptr_t payload_len;
+  /**
+   * Per-carrier-noise SNR estimate of the frame, in dB.
+   */
   float snr_db;
+  /**
+   * Carrier frequency offset the sync detector estimated, in Hz.
+   */
   float cfo_hz;
+  /**
+   * Speed level (1-9) the sender encoded the frame at.
+   */
   uint8_t speed_level;
+  /**
+   * Per-handle frame counter: 0 for the first frame this handle queued,
+   * incremented once per queued frame.
+   */
   uint64_t seq;
 } coppa_frame_t;
 

@@ -121,6 +121,7 @@ const HOLD_SECS: f32 = 0.25;
 const PENDING_FLOOR_RISE_DB: f32 = 3.0;
 
 /// Spectral-occupancy busy gate. See module doc for the threshold and the hold.
+#[derive(Debug)]
 pub struct BusyGate {
     sensor: SpectrumSensor,
     busy: bool,
