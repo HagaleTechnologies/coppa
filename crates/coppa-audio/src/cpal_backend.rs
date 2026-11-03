@@ -190,6 +190,23 @@ pub fn probe_cpal_device(
     }
 }
 
+/// The host's default input and output devices, named and identified the
+/// way `list_cpal_devices` names and identifies every device.
+pub fn default_cpal_devices() -> crate::DefaultDevices {
+    let host = cpal::default_host();
+    let describe = |device: cpal::Device| crate::DefaultDevice {
+        name: device
+            .description()
+            .map(|d| d.name().to_string())
+            .unwrap_or_else(|_| "Unknown".to_string()),
+        id: device.id().ok().map(|id| id.to_string()),
+    };
+    crate::DefaultDevices {
+        input: host.default_input_device().map(describe),
+        output: host.default_output_device().map(describe),
+    }
+}
+
 /// List audio devices via CPAL.
 pub fn list_cpal_devices() -> Result<Vec<AudioDevice>> {
     let host = cpal::default_host();

@@ -93,7 +93,9 @@ jobs:
           run_doc() {
             local name="$1"; shift
             local out line
-            out=$( cd "$tmp" && "$cli" "$@" )
+            # Status lines are on stderr since COP-86; capture both streams
+            # so tx and rx -i are still checked, not passed vacuously.
+            out=$( cd "$tmp" && "$cli" "$@" 2>&1 )
             while IFS= read -r line; do
               [ -n "$line" ] || continue
               grep -qF -- "$line" "$doc" \
