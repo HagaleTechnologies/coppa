@@ -24,8 +24,65 @@ pub enum VaraCommand {
     Abort,
     /// Get the software version.
     Version,
+    /// Closing Morse ID on or off: CWID ON|OFF. Any other argument parses as
+    /// `Unknown`.
+    CwId(bool),
+    /// Rig frequency or mode (coppa extension, not a VARA command): FREQ [hz]
+    /// or MODE [USB|LSB|PKTUSB|PKTLSB]. Any other shape parses as `Unknown`.
+    Rig(RigCommand),
     /// Unknown command.
     Unknown(String),
+}
+
+/// coppa extension: rig control through the daemon's rigctld (not a VARA
+/// command).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RigCommand {
+    /// `FREQ`: report the rig's frequency.
+    QueryFrequency,
+    /// `FREQ <hz>`: set the rig's frequency, in decimal Hz.
+    SetFrequency(u64),
+    /// `MODE`: report the rig's mode.
+    QueryMode,
+    /// `MODE <name>`: set the rig's mode.
+    SetMode(RigMode),
+}
+
+/// The SSB data modes a host may set with `MODE <name>`; the names are
+/// hamlib's tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RigMode {
+    /// Upper sideband.
+    Usb,
+    /// Lower sideband.
+    Lsb,
+    /// Upper sideband, data (packet) mode.
+    PktUsb,
+    /// Lower sideband, data (packet) mode.
+    PktLsb,
+}
+
+impl RigMode {
+    /// The hamlib token for this mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RigMode::Usb => "USB",
+            RigMode::Lsb => "LSB",
+            RigMode::PktUsb => "PKTUSB",
+            RigMode::PktLsb => "PKTLSB",
+        }
+    }
+
+    /// Parse a mode name, case-insensitive. Only the four SSB data modes.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_uppercase().as_str() {
+            "USB" => Some(RigMode::Usb),
+            "LSB" => Some(RigMode::Lsb),
+            "PKTUSB" => Some(RigMode::PktUsb),
+            "PKTLSB" => Some(RigMode::PktLsb),
+            _ => None,
+        }
+    }
 }
 
 /// Responses sent to a VARA client on the command port.
@@ -59,6 +116,10 @@ pub enum VaraResponse {
     Snr(i32),
     /// Keepalive, sent every 60 seconds.
     IAmAlive,
+    /// The rig's frequency in Hz, in reply to `FREQ [hz]` (coppa extension).
+    Freq(u64),
+    /// The rig's own mode token, in reply to `MODE [name]` (coppa extension).
+    Mode(String),
 }
 
 impl VaraCommand {
@@ -107,6 +168,36 @@ impl VaraCommand {
             Some("BW2750") => VaraCommand::Bandwidth(2750),
             Some("ABORT") => VaraCommand::Abort,
             Some("VERSION") => VaraCommand::Version,
+            Some("CWID") => {
+                let args: Vec<&str> = trimmed.split_whitespace().skip(1).collect();
+                match args.as_slice() {
+                    [arg] if arg.eq_ignore_ascii_case("ON") => VaraCommand::CwId(true),
+                    [arg] if arg.eq_ignore_ascii_case("OFF") => VaraCommand::CwId(false),
+                    _ => VaraCommand::Unknown(trimmed.to_string()),
+                }
+            }
+            Some("FREQ") => {
+                let args: Vec<&str> = trimmed.split_whitespace().skip(1).collect();
+                match args.as_slice() {
+                    [] => VaraCommand::Rig(RigCommand::QueryFrequency),
+                    [hz] if hz.bytes().all(|b| b.is_ascii_digit()) => match hz.parse::<u64>() {
+                        Ok(hz) => VaraCommand::Rig(RigCommand::SetFrequency(hz)),
+                        Err(_) => VaraCommand::Unknown(trimmed.to_string()),
+                    },
+                    _ => VaraCommand::Unknown(trimmed.to_string()),
+                }
+            }
+            Some("MODE") => {
+                let args: Vec<&str> = trimmed.split_whitespace().skip(1).collect();
+                match args.as_slice() {
+                    [] => VaraCommand::Rig(RigCommand::QueryMode),
+                    [name] => match RigMode::parse(name) {
+                        Some(mode) => VaraCommand::Rig(RigCommand::SetMode(mode)),
+                        None => VaraCommand::Unknown(trimmed.to_string()),
+                    },
+                    _ => VaraCommand::Unknown(trimmed.to_string()),
+                }
+            }
             _ => VaraCommand::Unknown(trimmed.to_string()),
         }
     }
@@ -134,6 +225,8 @@ impl VaraResponse {
             VaraResponse::Busy(b) => format!("BUSY {}\r", if *b { "ON" } else { "OFF" }),
             VaraResponse::Snr(snr) => format!("SNR {}\r", snr),
             VaraResponse::IAmAlive => "IAMALIVE\r".to_string(),
+            VaraResponse::Freq(hz) => format!("FREQ {}\r", hz),
+            VaraResponse::Mode(token) => format!("MODE {}\r", token),
         }
     }
 
@@ -282,6 +375,89 @@ mod tests {
             VaraResponse::coppa_version(),
             VaraResponse::Version(format!("Coppa {}", env!("CARGO_PKG_VERSION")))
         );
+    }
+
+    #[test]
+    fn cop84_parse_cwid() {
+        assert_eq!(VaraCommand::parse("CWID ON"), VaraCommand::CwId(true));
+        assert_eq!(VaraCommand::parse("cwid off"), VaraCommand::CwId(false));
+        for line in ["CWID", "CWID TRUE", "CWID ON NOW", "CWIDON"] {
+            assert!(
+                matches!(VaraCommand::parse(line), VaraCommand::Unknown(_)),
+                "{line:?} should parse as Unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn cop84_parse_freq() {
+        assert_eq!(
+            VaraCommand::parse("FREQ"),
+            VaraCommand::Rig(RigCommand::QueryFrequency)
+        );
+        assert_eq!(
+            VaraCommand::parse("freq 7074000"),
+            VaraCommand::Rig(RigCommand::SetFrequency(7_074_000))
+        );
+        // The parser checks only the shape; the daemon refuses 0.
+        assert_eq!(
+            VaraCommand::parse("FREQ 0"),
+            VaraCommand::Rig(RigCommand::SetFrequency(0))
+        );
+        for line in [
+            "FREQ 7.074",
+            "FREQ -1",
+            "FREQ 1 2",
+            "FREQ 0x10",
+            "FREQUENCY",
+            "FREQ 99999999999999999999999",
+        ] {
+            assert!(
+                matches!(VaraCommand::parse(line), VaraCommand::Unknown(_)),
+                "{line:?} should parse as Unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn cop84_parse_mode() {
+        assert_eq!(
+            VaraCommand::parse("MODE"),
+            VaraCommand::Rig(RigCommand::QueryMode)
+        );
+        assert_eq!(
+            VaraCommand::parse("mode pktlsb"),
+            VaraCommand::Rig(RigCommand::SetMode(RigMode::PktLsb))
+        );
+        assert_eq!(
+            VaraCommand::parse("MODE USB"),
+            VaraCommand::Rig(RigCommand::SetMode(RigMode::Usb))
+        );
+        assert_eq!(
+            VaraCommand::parse("MODE LSB"),
+            VaraCommand::Rig(RigCommand::SetMode(RigMode::Lsb))
+        );
+        assert_eq!(
+            VaraCommand::parse("MODE PKTUSB"),
+            VaraCommand::Rig(RigCommand::SetMode(RigMode::PktUsb))
+        );
+        for line in ["MODE CW", "MODE USB 2400", "MODEX"] {
+            assert!(
+                matches!(VaraCommand::parse(line), VaraCommand::Unknown(_)),
+                "{line:?} should parse as Unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn cop84_format_freq_and_mode_replies() {
+        assert_eq!(VaraResponse::Freq(7_074_000).format(), "FREQ 7074000\r");
+        assert_eq!(
+            VaraResponse::Mode("PKTLSB".into()).format(),
+            "MODE PKTLSB\r"
+        );
+        assert!(!VaraResponse::Freq(7_074_000).is_disposable());
+        assert!(!VaraResponse::Mode("PKTLSB".into()).is_disposable());
     }
 
     #[test]

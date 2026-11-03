@@ -85,6 +85,55 @@ impl PttBackend {
     pub fn is_rigctld(&self) -> bool {
         matches!(self, PttBackend::Rigctld(_))
     }
+
+    /// COP-84: the rig's dial frequency, with the reason on failure. Honest,
+    /// never cached -- see [`RigctldClient::query_frequency`]. A backend with
+    /// no CAT control answers an error without any I/O.
+    pub fn query_frequency(&mut self) -> Result<u64> {
+        match self {
+            PttBackend::Rigctld(client) => client.query_frequency(),
+            PttBackend::Other(_) => Err(no_cat_control()),
+        }
+    }
+
+    /// COP-84: the rig's mode, as the rig's own token (`USB`, `PKTLSB`, ...).
+    /// Honest, never cached -- see [`RigctldClient::query_mode`]. A backend
+    /// with no CAT control answers an error without any I/O.
+    pub fn query_mode(&mut self) -> Result<String> {
+        match self {
+            PttBackend::Rigctld(client) => client.query_mode(),
+            PttBackend::Other(_) => Err(no_cat_control()),
+        }
+    }
+
+    /// COP-84: tune the rig; `Ok` only when the rig answered `RPRT 0`. Honest,
+    /// never cached: read the dial back with [`Self::query_frequency`] -- see
+    /// [`RigctldClient::try_set_frequency`]. A backend with no CAT control
+    /// answers an error without any I/O.
+    pub fn set_frequency(&mut self, hz: u64) -> Result<()> {
+        match self {
+            PttBackend::Rigctld(client) => client.try_set_frequency(hz),
+            PttBackend::Other(_) => Err(no_cat_control()),
+        }
+    }
+
+    /// COP-84: set the rig's mode to a hamlib token; `Ok` only when the rig
+    /// answered `RPRT 0`. Honest, never cached: read it back with
+    /// [`Self::query_mode`] -- see [`RigctldClient::try_set_mode`]. A backend
+    /// with no CAT control answers an error without any I/O.
+    pub fn set_mode(&mut self, token: &str) -> Result<()> {
+        match self {
+            PttBackend::Rigctld(client) => client.try_set_mode(token),
+            PttBackend::Other(_) => Err(no_cat_control()),
+        }
+    }
+}
+
+/// The error every rig-control call gets from a backend that only keys PTT.
+fn no_cat_control() -> anyhow::Error {
+    anyhow::anyhow!(
+        "this PTT backend has no CAT control; rig control needs [radio] ptt_method = \"rigctld\""
+    )
 }
 
 impl PttControl for PttBackend {
@@ -114,6 +163,23 @@ mod tests {
         assert_eq!(backend.poll_frequency(), None);
         backend.set_ptt(PttState::Tx).unwrap();
         assert_eq!(backend.get_ptt().unwrap(), PttState::Tx);
+    }
+
+    #[test]
+    fn cop84_ptt_backend_other_has_no_cat_control() {
+        let mut backend = PttBackend::Other(Box::new(NullPtt::new()));
+        let errors = [
+            backend.query_frequency().map(|_| ()).unwrap_err(),
+            backend.query_mode().map(|_| ()).unwrap_err(),
+            backend.set_frequency(7_074_000).unwrap_err(),
+            backend.set_mode("USB").unwrap_err(),
+        ];
+        for error in errors {
+            assert!(
+                error.to_string().contains("no CAT control"),
+                "error: {error}"
+            );
+        }
     }
 
     #[test]
