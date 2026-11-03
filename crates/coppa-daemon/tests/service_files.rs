@@ -329,7 +329,7 @@ fn systemd_unit_runs_unprivileged_with_device_groups() {
         .collect();
     assert_eq!(
         groups, expected,
-        "coppad needs audio (sound cards), dialout (serial PTT) and gpio (sysfs GPIO PTT)"
+        "coppad needs audio (sound cards), dialout (serial PTT) and gpio (GPIO PTT)"
     );
 }
 
@@ -392,7 +392,7 @@ fn systemd_unit_omits_directives_that_break_audio_or_ptt() {
     let forbidden = [
         (
             "ProtectKernelTunables",
-            "it makes /sys read-only, so GPIO PTT writes fail",
+            "it makes /sys read-only, so sysfs GPIO PTT writes fail",
         ),
         (
             "PrivateDevices",

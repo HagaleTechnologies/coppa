@@ -42,7 +42,8 @@ TimeoutStopSec=20
 
 User=coppa
 Group=coppa
-# Sound cards (audio), serial PTT ports (dialout), sysfs GPIO PTT (gpio).
+# Sound cards (audio), serial PTT ports (dialout), GPIO PTT (gpio: the
+# /dev/gpiochip* character devices, and sysfs GPIO for the old gpio:<number> form).
 # Every group listed must exist. On a host with no "gpio" group (anything
 # other than Raspberry Pi OS), delete it here, or systemd refuses to start
 # coppad with status=216/GROUP.
@@ -58,8 +59,10 @@ ProtectKernelLogs=yes
 ProtectHostname=yes
 RestrictSUIDSGID=yes
 # Deliberately not set, because each one breaks audio or PTT:
-#   ProtectKernelTunables  makes /sys read-only, so GPIO PTT writes fail
-#   PrivateDevices         hides /dev/snd and /dev/ttyUSB*, so no audio or serial PTT
+#   ProtectKernelTunables  makes /sys read-only, so the old sysfs GPIO PTT
+#                          form (gpio:<number>) fails
+#   PrivateDevices         hides /dev/snd, /dev/ttyUSB* and /dev/gpiochip*, so no
+#                          audio, serial or GPIO PTT
 #   ProtectClock, DeviceAllow, DevicePolicy
 #                          below systemd 252, ProtectClock alone denies every
 #                          device except the RTC

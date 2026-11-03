@@ -11,8 +11,8 @@ sources:
   - docs/OPERATING.md
   - docs/SPEC.md
 verified:
-  commit: 59b0b63
-  date: 2026-07-14
+  commit: dc18b8b
+  date: 2026-11-03
 links:
   - overview
   - coppa-engine
@@ -91,8 +91,17 @@ a real bug — breaking them will reintroduce that bug.
 
 ## Configuration gotchas
 
-- PTT config uses extended syntax: `serial:/dev/ttyUSB0:dtr`, `gpio:17`, or
-  the flat `none`/`vox`/`rigctld`. Unrecognized values hard-error at startup —
+- **GPIO PTT has two forms (COP-85).** `gpio:<chip>:<line>` goes through the
+  GPIO character device (`gpiocdev`, chip by path, name or label; a label two
+  chips share is refused). The old `gpio:<number>` is a sysfs number, not a
+  BCM pin: it still opens through `/sys/class/gpio` with a deprecation warning,
+  and is a startup error where the kernel has no sysfs GPIO. Once a chardev
+  request is dropped the line's level is up to the driver, so the release
+  before drop matters. Details: `crates/coppa-radio/src/ptt_gpio.rs` module
+  docs and `docs/tutorials/raspberry-pi-install.md` step 7.
+
+- PTT config uses extended syntax: `serial:/dev/ttyUSB0:dtr`,
+  `gpio:pinctrl-bcm2711:17`, or the flat `none`/`vox`/`rigctld`. Unrecognized values hard-error at startup —
   bare `"serial"` is NOT valid. `rigctld` unreachable at startup still falls
   back to NullPtt, but since COP-32 it logs at ERROR and the daemon logs
   `Daemon running degraded` instead of `Daemon ready`. There is still no

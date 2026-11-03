@@ -101,19 +101,18 @@ pub fn release_once(ptt: &PttConfig, rigctld_address: &str) -> anyhow::Result<()
             )?;
             PttControl::set_ptt(&mut client, PttState::Rx)
         }
-        PttConfig::Gpio { pin } => {
+        PttConfig::Gpio { line } => {
             #[cfg(all(feature = "gpio-ptt", target_os = "linux"))]
             {
-                let pin_num: u32 = pin
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("invalid GPIO pin {pin:?}"))?;
-                let mut gpio = coppa_radio::ptt_gpio::GpioPtt::open(pin_num, false)?;
+                // COP-85: the guardian's own consumer label, so `gpioinfo`
+                // tells it apart from the daemon.
+                let mut gpio = crate::event_loop::open_gpio_ptt(line, "coppad-guardian")?;
                 gpio.set_ptt(PttState::Rx)
             }
             #[cfg(not(all(feature = "gpio-ptt", target_os = "linux")))]
             {
                 anyhow::bail!(
-                    "GPIO pin {pin}: PTT method 'gpio' requires coppad to be built with \
+                    "GPIO line {line}: PTT method 'gpio' requires coppad to be built with \
                      --features gpio-ptt, on Linux"
                 )
             }
@@ -387,6 +386,19 @@ mod tests {
         }
         assert!(!ptt_guardian_eligible(&radio("rigctld", false), true));
         assert!(!ptt_guardian_eligible(&radio("gpio:17", false), false));
+    }
+
+    #[cfg(all(feature = "gpio-ptt", target_os = "linux"))]
+    #[test]
+    fn release_once_opens_the_chardev_form() {
+        let ptt = PttConfig::parse("gpio:coppa-test-no-such-chip:3").unwrap();
+        let msg = release_once(&ptt, "127.0.0.1:1").unwrap_err().to_string();
+        assert!(
+            msg.starts_with(
+                "failed to open GPIO PTT line coppa-test-no-such-chip:3: no GPIO chip matches"
+            ),
+            "{msg}"
+        );
     }
 
     #[test]

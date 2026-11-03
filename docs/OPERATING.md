@@ -42,7 +42,7 @@ INFO coppad: PTT method="rigctld 127.0.0.1:4532" active=rigctld state="released"
 | `Audio input/output started` | `hardware_rate`, `engine_rate` | The opened stream rate and modem profile rate; they differ when Coppa resamples. |
 | `Audio devices` | `input_hardware_rate`, `output_hardware_rate`, `engine_rate` | The effective input and output hardware rates and the modem profile rate. |
 | `Audio devices: none; ...` (WARN) | | A build without `cpal-backend`: the daemon runs but moves no audio. |
-| `PTT` | `method` | The configured method: `none`, `vox`, `rigctld <address>`, `serial <port> <dtr\|rts>` or `gpio <pin>`. |
+| `PTT` | `method` | The configured method: `none`, `vox`, `rigctld <address>`, `serial <port> <dtr\|rts>`, `gpio <chip>:<line>`, or `gpio <number> (sysfs)` for the deprecated sysfs form. |
 | | `active` | The backend actually in control: `none`, `vox`, `rigctld`, `serial` or `gpio`. An unreachable rigctld shows `active=none`. |
 | | `state` | `released` (the startup release succeeded), `release failed: <error>`, or `not controlled` (none, VOX, or an unreachable rigctld, where coppad drives no PTT line). |
 | | `guardian` | `running, pid <n>`, `failed to start: <error>`, `off ([radio] ptt_guardian = false)`, or `not used`. See [The PTT guardian](#the-ptt-guardian). |
@@ -161,7 +161,8 @@ Ctrl-C.
 
 ### The PTT guardian
 
-With `ptt_method = "rigctld"` or `"gpio:<pin>"`, coppad starts a helper
+With `ptt_method = "rigctld"` or `"gpio:<chip>:<line>"` (or the deprecated
+`"gpio:<number>"`), coppad starts a helper
 process, `coppad --ptt-guardian ...`, and logs:
 
 ```
@@ -170,7 +171,7 @@ INFO coppad: PTT guardian started pid=6441
 
 coppad tells the guardian each time it keys and releases PTT. If coppad exits
 while PTT is keyed, however it died, the guardian opens its own rigctld
-connection or GPIO pin, releases PTT and exits:
+connection or GPIO line, releases PTT and exits:
 
 ```
 WARN coppad::ptt_guardian: coppad exited while PTT was keyed; releasing it ptt_method=rigctld

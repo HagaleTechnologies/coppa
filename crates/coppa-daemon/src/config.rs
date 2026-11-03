@@ -66,7 +66,8 @@ pub struct RadioConfig {
     /// `"none"`, `"vox"`, `"rigctld"` -- for backward compatibility, or an
     /// extended `method:args` form for backends that need extra parameters:
     /// `"serial:/dev/ttyUSB0:dtr"`, `"serial:/dev/ttyUSB0:rts"`,
-    /// `"gpio:17"`. See [`PttConfig::parse`].
+    /// `"gpio:pinctrl-bcm2711:17"` (or the deprecated sysfs `"gpio:529"`).
+    /// See [`PttConfig::parse`].
     pub ptt_method: String,
     /// rigctld address (e.g., "127.0.0.1:4532").
     pub rigctld_address: String,
@@ -125,8 +126,62 @@ pub enum PttConfig {
         line: PttSerialLine,
     },
     Gpio {
-        pin: String,
+        line: GpioLine,
     },
+}
+
+/// Which GPIO line `ptt_method = "gpio:..."` names (COP-85).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpioLine {
+    /// `gpio:<number>`: a kernel sysfs GPIO number, driven through the
+    /// deprecated `/sys/class/gpio` interface.
+    Sysfs(u32),
+    /// `gpio:<chip>:<line>`: a line offset on a GPIO character device. The
+    /// chip is a path (`/dev/gpiochip0`), a name (`gpiochip0`) or a label
+    /// (`pinctrl-bcm2711`).
+    Chardev { chip: String, line: u32 },
+}
+
+impl std::fmt::Display for GpioLine {
+    /// `pinctrl-bcm2711:17`, or `529 (sysfs)` for the old form.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GpioLine::Sysfs(number) => write!(f, "{number} (sysfs)"),
+            GpioLine::Chardev { chip, line } => write!(f, "{chip}:{line}"),
+        }
+    }
+}
+
+/// The GPIO form every `gpio` parse error points at.
+const GPIO_EXPECTED: &str =
+    "expected \"gpio:<chip>:<line>\", for example \"gpio:pinctrl-bcm2711:17\"";
+
+impl GpioLine {
+    /// Parse the part of `ptt_method` after `gpio:`. `whole` is the full
+    /// config string, quoted in errors.
+    fn parse(arg: &str, whole: &str) -> Result<Self, PttConfigError> {
+        let fail = |what: &str| {
+            Err(PttConfigError(format!(
+                "gpio PTT config {whole:?} {what}; {GPIO_EXPECTED}"
+            )))
+        };
+        match arg.rsplit_once(':') {
+            None if arg.is_empty() => fail("is missing the chip and line"),
+            None => match arg.parse() {
+                Ok(number) => Ok(GpioLine::Sysfs(number)),
+                Err(_) => fail("has no line number"),
+            },
+            Some(("", _)) => fail("is missing the chip"),
+            Some((_, "")) => fail("is missing the line"),
+            Some((chip, line)) => match line.parse() {
+                Ok(line) => Ok(GpioLine::Chardev {
+                    chip: chip.to_string(),
+                    line,
+                }),
+                Err(_) => fail("has a line that is not a number"),
+            },
+        }
+    }
 }
 
 impl PttConfig {
@@ -173,19 +228,12 @@ impl PttConfig {
                     line,
                 })
             }
-            ("gpio", Some(pin)) => {
-                if pin.is_empty() {
-                    return Err(PttConfigError(format!(
-                        "gpio PTT config {s:?} is missing the pin; expected \"gpio:<pin>\""
-                    )));
-                }
-                Ok(PttConfig::Gpio {
-                    pin: pin.to_string(),
-                })
-            }
+            ("gpio", Some(arg)) => Ok(PttConfig::Gpio {
+                line: GpioLine::parse(arg, s)?,
+            }),
             _ => Err(PttConfigError(format!(
                 "unknown PTT method {s:?}; expected one of \"none\", \"vox\", \"rigctld\", \
-                 \"serial:<port>:<dtr|rts>\", \"gpio:<pin>\""
+                 \"serial:<port>:<dtr|rts>\", \"gpio:<chip>:<line>\""
             ))),
         }
     }
@@ -1668,19 +1716,66 @@ beacon_interval_secs = 600
     }
 
     #[test]
-    fn test_ptt_parse_gpio_pin() {
+    fn gpio_chardev_form_parses_chip_and_line() {
+        for chip in ["pinctrl-bcm2711", "gpiochip0", "/dev/gpiochip0"] {
+            assert_eq!(
+                PttConfig::parse(&format!("gpio:{chip}:17")).unwrap(),
+                PttConfig::Gpio {
+                    line: GpioLine::Chardev {
+                        chip: chip.to_string(),
+                        line: 17
+                    }
+                },
+                "{chip}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpio_number_form_is_the_legacy_sysfs_number() {
         assert_eq!(
-            PttConfig::parse("gpio:17").unwrap(),
+            PttConfig::parse("gpio:529").unwrap(),
             PttConfig::Gpio {
-                pin: "17".to_string()
+                line: GpioLine::Sysfs(529)
             }
         );
     }
 
     #[test]
-    fn test_ptt_parse_gpio_missing_pin_errors() {
-        let err = PttConfig::parse("gpio").unwrap_err();
-        assert!(err.to_string().contains("gpio:<pin>"));
+    fn gpio_parse_errors_name_the_expected_forms() {
+        for bad in [
+            "gpio:",
+            "gpio::17",
+            "gpio:chip:",
+            "gpio:chip:x",
+            "gpio:abc",
+            "gpio:pinctrl-bcm2711:-1",
+        ] {
+            let err = PttConfig::parse(bad).unwrap_err().to_string();
+            assert!(err.contains("\"gpio:<chip>:<line>\""), "{bad}: {err}");
+            assert!(err.contains(&format!("{bad:?}")), "{bad}: {err}");
+        }
+        let err = PttConfig::parse("gpio:pinctrl-bcm2711:x")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "gpio PTT config \"gpio:pinctrl-bcm2711:x\" has a line that is not a number; \
+             expected \"gpio:<chip>:<line>\", for example \"gpio:pinctrl-bcm2711:17\""
+        );
+        // A bare "gpio" is an unknown method, and that error lists the form.
+        let err = PttConfig::parse("gpio").unwrap_err().to_string();
+        assert!(err.contains("\"gpio:<chip>:<line>\""), "{err}");
+    }
+
+    #[test]
+    fn gpio_line_display_marks_the_sysfs_form() {
+        assert_eq!(GpioLine::Sysfs(529).to_string(), "529 (sysfs)");
+        let chardev = GpioLine::Chardev {
+            chip: "pinctrl-bcm2711".into(),
+            line: 17,
+        };
+        assert_eq!(chardev.to_string(), "pinctrl-bcm2711:17");
     }
 
     #[test]
@@ -1699,7 +1794,7 @@ beacon_interval_secs = 600
         assert_eq!(
             radio.ptt_config().unwrap(),
             PttConfig::Gpio {
-                pin: "4".to_string()
+                line: GpioLine::Sysfs(4)
             }
         );
     }

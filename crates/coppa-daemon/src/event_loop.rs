@@ -1180,21 +1180,22 @@ impl EventLoop {
                     ))
                 }
             }
-            crate::config::PttConfig::Gpio { pin } => {
+            crate::config::PttConfig::Gpio { line } => {
                 #[cfg(all(feature = "gpio-ptt", target_os = "linux"))]
                 {
-                    let pin_num: u32 = pin.parse().map_err(|_| {
-                        anyhow::anyhow!(
-                            "invalid GPIO pin {pin:?}: expected a plain pin number, e.g. \"gpio:529\""
-                        )
-                    })?;
-                    let ptt = coppa_radio::ptt_gpio::GpioPtt::open(pin_num, false)
-                        .map_err(|e| anyhow::anyhow!("failed to open GPIO PTT pin {pin}: {e:#}"))?;
-                    Ok(PttBackend::Other(Box::new(ptt)))
+                    let ptt = open_gpio_ptt(&line, "coppad")?;
+                    if let crate::config::GpioLine::Sysfs(number) = line {
+                        let equivalent = coppa_radio::ptt_gpio::sysfs_number_to_chardev(
+                            number,
+                            &coppa_radio::ptt_gpio::read_sysfs_chips(),
+                        );
+                        tracing::warn!("{}", sysfs_gpio_deprecation(number, equivalent));
+                    }
+                    Ok(PttBackend::Other(ptt))
                 }
                 #[cfg(not(all(feature = "gpio-ptt", target_os = "linux")))]
                 {
-                    let _ = pin;
+                    let _ = line;
                     Err(anyhow::anyhow!(
                         "PTT method 'gpio' requires coppad to be built with \
                          --features gpio-ptt, on Linux"
@@ -6494,6 +6495,66 @@ impl EventLoop {
     }
 }
 
+/// COP-85: the warning logged when `ptt_method` uses the deprecated sysfs
+/// form, naming the equivalent character-device form when the sysfs chip
+/// table maps the number to one.
+#[cfg_attr(not(all(feature = "gpio-ptt", target_os = "linux")), allow(dead_code))]
+pub(crate) fn sysfs_gpio_deprecation(number: u32, equivalent: Option<(String, u32)>) -> String {
+    let deprecated =
+        format!("ptt_method = \"gpio:{number}\" uses the deprecated sysfs GPIO interface");
+    match equivalent {
+        Some((chip, line)) => format!(
+            "{deprecated}; ptt_method = \"gpio:{chip}:{line}\" drives the same line through \
+             the GPIO character device"
+        ),
+        None => format!(
+            "{deprecated}; use \"gpio:<chip>:<line>\" to drive it through the GPIO character \
+             device (gpiodetect lists the chips)"
+        ),
+    }
+}
+
+/// COP-85: the startup error for the sysfs form on a kernel without sysfs
+/// GPIO.
+#[cfg_attr(not(all(feature = "gpio-ptt", target_os = "linux")), allow(dead_code))]
+pub(crate) fn sysfs_gpio_missing(number: u32) -> String {
+    format!(
+        "ptt_method = \"gpio:{number}\" needs the sysfs GPIO interface (/sys/class/gpio), which \
+         this kernel does not provide; use \"gpio:<chip>:<line>\", for example \
+         \"gpio:pinctrl-bcm2711:17\""
+    )
+}
+
+/// COP-85: open the GPIO PTT line `line` names, at its RX level, for the
+/// daemon (`consumer` `coppad`) or the guardian (`coppad-guardian`).
+///
+/// The character-device form requests the line through `/dev/gpiochipN`.
+/// The sysfs form fails with a migration message when the kernel has no
+/// `/sys/class/gpio/export`, and otherwise opens the pin as before COP-85.
+#[cfg(all(feature = "gpio-ptt", target_os = "linux"))]
+pub(crate) fn open_gpio_ptt(
+    line: &crate::config::GpioLine,
+    consumer: &str,
+) -> Result<Box<dyn PttControl>> {
+    use coppa_radio::ptt_gpio::GpioPtt;
+    match line {
+        crate::config::GpioLine::Chardev { chip, line } => {
+            let ptt = GpioPtt::open_chardev(chip, *line, false, consumer).map_err(|e| {
+                anyhow::anyhow!("failed to open GPIO PTT line {chip}:{line}: {e:#}")
+            })?;
+            Ok(Box::new(ptt))
+        }
+        crate::config::GpioLine::Sysfs(number) => {
+            if !std::path::Path::new("/sys/class/gpio/export").exists() {
+                anyhow::bail!("{}", sysfs_gpio_missing(*number));
+            }
+            let ptt = GpioPtt::open(*number, false)
+                .map_err(|e| anyhow::anyhow!("failed to open GPIO PTT pin {number}: {e:#}"))?;
+            Ok(Box::new(ptt))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6739,10 +6800,50 @@ mod tests {
             .err()
             .expect("an unexportable GPIO pin must be a startup error");
         let msg = err.to_string();
+        if !std::path::Path::new("/sys/class/gpio/export").exists() {
+            // COP-85: a kernel without sysfs GPIO gets the migration message.
+            assert_eq!(msg, sysfs_gpio_missing(999_999));
+            return;
+        }
         assert!(msg.contains("failed to open GPIO PTT pin 999999"), "{msg}");
         // EACCES (not in gpio group), EINVAL (wrong number) and EROFS/ENOENT
         // (no writable sysfs GPIO) must be distinguishable in the log.
         assert!(msg.contains("(os error "), "OS cause dropped: {msg}");
+    }
+
+    #[cfg(all(feature = "gpio-ptt", target_os = "linux"))]
+    #[test]
+    fn create_ptt_chardev_with_no_such_chip_fails_naming_it() {
+        let mut config = DaemonConfig::default();
+        config.radio.ptt_method = "gpio:coppa-test-no-such-chip:3".to_string();
+        let msg = EventLoop::create_ptt(&config)
+            .err()
+            .expect("a missing GPIO chip must be a startup error")
+            .to_string();
+        assert!(
+            msg.starts_with(
+                "failed to open GPIO PTT line coppa-test-no-such-chip:3: no GPIO chip matches \
+                 \"coppa-test-no-such-chip\""
+            ),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn sysfs_gpio_messages_name_the_character_device_form() {
+        assert_eq!(
+            sysfs_gpio_deprecation(529, Some(("pinctrl-bcm2711".into(), 17))),
+            "ptt_method = \"gpio:529\" uses the deprecated sysfs GPIO interface; ptt_method = \
+             \"gpio:pinctrl-bcm2711:17\" drives the same line through the GPIO character device"
+        );
+        let unmapped = sysfs_gpio_deprecation(529, None);
+        assert!(unmapped.contains("\"gpio:<chip>:<line>\""), "{unmapped}");
+        assert_eq!(
+            sysfs_gpio_missing(529),
+            "ptt_method = \"gpio:529\" needs the sysfs GPIO interface (/sys/class/gpio), which \
+             this kernel does not provide; use \"gpio:<chip>:<line>\", for example \
+             \"gpio:pinctrl-bcm2711:17\""
+        );
     }
 
     #[test]

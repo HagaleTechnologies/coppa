@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-11-03T17:40:00Z",
-  "head_commit": "2526b50",
+  "generated_at": "2026-11-03T20:05:00Z",
+  "head_commit": "dc18b8b",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -485,7 +485,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:ece8378df1627dd56e8d8c10c4a995d5474ccc0993b6d4a7c2760fb7fefe9ec0",
+      "hash": "sha256:1011e23c8debd0ee717dbcceff559f2988c21df216d04c28df6282b67fa548da",
       "id": "phase4-field-readiness",
       "kind": "gotcha",
       "links": [
@@ -506,8 +506,8 @@
       ],
       "status": "current",
       "title": "What will bite you in the daemon's real-radio TX/RX path?",
-      "verified_commit": "59b0b63",
-      "verified_date": "2026-07-14",
+      "verified_commit": "dc18b8b",
+      "verified_date": "2026-11-03",
       "visibility": "public"
     },
     {
