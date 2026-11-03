@@ -30,14 +30,20 @@ use std::f32::consts::TAU;
 /// One propagation path: relative delay (seconds) and average power (linear).
 #[derive(Debug, Clone, Copy)]
 pub struct Tap {
+    /// Delay of this path relative to the first, in seconds (0.0 for the first).
     pub delay_s: f32,
+    /// Average power of this path as a linear fraction; the presets split 1.0
+    /// equally across their two paths.
     pub power: f32,
 }
 
 /// Watterson channel configuration: a set of faded taps and a Doppler spread.
 #[derive(Debug, Clone)]
 pub struct WattersonConfig {
+    /// The propagation paths, each Rayleigh-faded independently.
     pub taps: Vec<Tap>,
+    /// ITU-R F.1487 frequency spread in Hz: the two-sigma width of each tap's
+    /// Gaussian Doppler spectrum (see [`Self::doppler_sigma_hz`]).
     pub doppler_spread_hz: f32,
 }
 
@@ -53,8 +59,11 @@ impl WattersonConfig {
 /// Standard ITU-R F.1487 / CCIR HF test channels (two equal-power paths).
 #[derive(Debug, Clone, Copy)]
 pub enum WattersonPreset {
+    /// Mid-latitude quiet: 0.5 ms differential delay, 0.1 Hz Doppler spread.
     Good,
+    /// Mid-latitude moderate: 1 ms differential delay, 0.5 Hz Doppler spread.
     Moderate,
+    /// Mid-latitude disturbed: 2 ms differential delay, 1 Hz Doppler spread.
     Poor,
 }
 

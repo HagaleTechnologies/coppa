@@ -1,6 +1,10 @@
 pub mod airtime;
+/// Per-speed-level tables: constellation, LDPC rate and payload capacity for
+/// levels 1 to 9.
 pub mod speed_levels;
 pub mod streaming;
+/// `CoppaTransceiver`, the one-frame encode/decode pipeline, and its
+/// `TransmitError`/`ReceiveError` types.
 pub mod transceiver;
 
 pub use airtime::frame_airtime_s;

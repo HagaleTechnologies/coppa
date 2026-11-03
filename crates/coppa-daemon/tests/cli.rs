@@ -795,6 +795,7 @@ fn print_default_config_prints_only_the_default_toml() {
         "vara_enabled = false",
         "websocket_enabled = false",
         "websocket_allowed_origins = []",
+        "mdns_enabled = false",
         "rate_loop_probe_interval = 0",
         "cp_gate_enabled = false",
         "cp_negotiation_enabled = false",
@@ -1357,20 +1358,73 @@ fn websocket_handshake_requires_an_allowed_origin_and_the_token() {
     );
 }
 
-/// The port number from coppad's `WebSocket server listening` line.
+/// The port number from coppad's `WebSocket server listening` line: the
+/// digits after the first `:` that precedes one in its `addr` field, so it
+/// reads `127.0.0.1:N`, `0.0.0.0:N` and `[::]:N` alike.
 #[cfg(all(feature = "websocket", not(feature = "cpal-backend")))]
 fn websocket_port(stdout: &str) -> u16 {
     let line = stdout
         .lines()
         .find(|line| line.contains("WebSocket server listening"))
         .unwrap_or_else(|| panic!("no listening line:\n{stdout}"));
-    let after = &line[line.find("127.0.0.1:").expect("listen address") + "127.0.0.1:".len()..];
-    after
+    let addr = &line[line.find("addr").expect("listen address")..];
+    let colon = addr
+        .char_indices()
+        .find(|&(i, c)| c == ':' && addr[i + 1..].starts_with(|next: char| next.is_ascii_digit()))
+        .map(|(i, _)| i)
+        .unwrap_or_else(|| panic!("no port in {line:?}"));
+    addr[colon + 1..]
         .chars()
         .take_while(char::is_ascii_digit)
         .collect::<String>()
         .parse()
         .expect("listen port")
+}
+
+/// Send `request` over plain TCP to `addr` and split everything coppad
+/// writes before it closes the connection into head and body.
+#[cfg(all(feature = "websocket", not(feature = "cpal-backend")))]
+fn raw_http(addr: impl std::net::ToSocketAddrs, request: &str) -> (String, String) {
+    use std::io::{Read, Write};
+
+    let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(DEADLINE))
+        .expect("set read timeout");
+    stream.write_all(request.as_bytes()).expect("send request");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read the whole response");
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("no header terminator:\n{response}"));
+    (head.to_string(), body.to_string())
+}
+
+/// A WebSocket-enabled `[host]` section on an OS-assigned port; `extra`
+/// lines are appended to it.
+#[cfg(all(feature = "websocket", not(feature = "cpal-backend")))]
+fn ws_host_toml(extra: &str) -> String {
+    format!(
+        "[host]\nwebsocket_enabled = true\nwebsocket_port = 0\n\
+         websocket_token = \"{WS_TOKEN}\"\n\
+         websocket_allowed_origins = [\"http://localhost:3000\"]\n{extra}"
+    )
+}
+
+/// Kill `daemon` and assert the WebSocket token never reached its output.
+#[cfg(all(feature = "websocket", not(feature = "cpal-backend")))]
+fn kill_without_leaking_the_token(daemon: &mut Daemon) {
+    let (stdout, stderr) = daemon.kill();
+    assert!(
+        !stdout.contains(WS_TOKEN),
+        "token leaked to stdout:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains(WS_TOKEN),
+        "token leaked to stderr:\n{stderr}"
+    );
 }
 
 /// COP-79, end to end through the real binary: a browser's plain `GET /` on
@@ -1381,39 +1435,16 @@ fn websocket_port(stdout: &str) -> u16 {
 #[cfg(all(feature = "websocket", not(feature = "cpal-backend")))]
 #[test]
 fn plain_get_root_serves_the_embedded_page() {
-    use std::io::{Read, Write};
-
     let dir = TempDir::new("ws-page");
-    dir.write(
-        "station.toml",
-        &format!(
-            "[host]\nwebsocket_enabled = true\nwebsocket_port = 0\n\
-             websocket_token = \"{WS_TOKEN}\"\n\
-             websocket_allowed_origins = [\"http://localhost:3000\"]\n"
-        ),
-    );
+    dir.write("station.toml", &ws_host_toml(""));
     let args = ["--config", "station.toml"];
     let (mut daemon, _) = start_until(dir.path(), &args, &[], "Daemon ready");
     let port = websocket_port(&daemon.stdout());
 
-    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
-    stream
-        .set_read_timeout(Some(DEADLINE))
-        .expect("set read timeout");
-    stream
-        .write_all(
-            format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/html\r\n\r\n")
-                .as_bytes(),
-        )
-        .expect("send GET");
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .expect("read the whole response");
-
-    let (head, body) = response
-        .split_once("\r\n\r\n")
-        .unwrap_or_else(|| panic!("no header terminator:\n{response}"));
+    let (head, body) = raw_http(
+        ("127.0.0.1", port),
+        &format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/html\r\n\r\n"),
+    );
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     assert!(
         head.contains("\r\nContent-Type: text/html; charset=utf-8"),
@@ -1429,14 +1460,161 @@ fn plain_get_root_serves_the_embedded_page() {
         "the page must never embed the token"
     );
 
-    let (stdout, stderr) = daemon.kill();
+    kill_without_leaking_the_token(&mut daemon);
+}
+
+/// COP-140, scenario "A monitor reads health", through the real binary: a
+/// daemon that logged `Daemon ready` answers `GET /health` with 200 and
+/// `{"status":"ok"}`, and `HEAD /health` with the same head and no body.
+#[cfg(all(feature = "websocket", not(feature = "cpal-backend")))]
+#[test]
+fn a_ready_daemon_reports_ok_health() {
+    let dir = TempDir::new("ws-health");
+    dir.write("station.toml", &ws_host_toml(""));
+    let args = ["--config", "station.toml"];
+    let (mut daemon, _) = start_until(dir.path(), &args, &[], "Daemon ready");
+    let port = websocket_port(&daemon.stdout());
+
+    let (head, body) = raw_http(
+        ("127.0.0.1", port),
+        &format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     assert!(
-        !stdout.contains(WS_TOKEN),
-        "token leaked to stdout:\n{stdout}"
+        head.contains("\r\nContent-Type: application/json\r\n"),
+        "{head}"
+    );
+    assert!(head.contains("\r\nCache-Control: no-store\r\n"), "{head}");
+    assert_eq!(body, "{\"status\":\"ok\"}\n");
+
+    let (head_only, no_body) = raw_http(
+        ("127.0.0.1", port),
+        &format!("HEAD /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+    );
+    assert_eq!(head_only, head, "HEAD gets the GET head");
+    assert_eq!(no_body, "", "HEAD gets no body");
+
+    kill_without_leaking_the_token(&mut daemon);
+}
+
+/// COP-140: a daemon that logged `Daemon running degraded` (rigctld
+/// unreachable) still answers 200, with `{"status":"degraded"}` and nothing
+/// of the problem text.
+#[cfg(all(feature = "websocket", not(feature = "cpal-backend")))]
+#[test]
+fn a_degraded_daemon_reports_degraded_health() {
+    let dir = TempDir::new("ws-health-degraded");
+    dir.write(
+        "station.toml",
+        &format!(
+            "{}[radio]\nptt_method = \"rigctld\"\nrigctld_address = \"127.0.0.1:1\"\n",
+            ws_host_toml("")
+        ),
+    );
+    let args = ["--config", "station.toml"];
+    let (mut daemon, _) = start_until(dir.path(), &args, &[], "Daemon running degraded");
+    let port = websocket_port(&daemon.stdout());
+
+    let (head, body) = raw_http(
+        ("127.0.0.1", port),
+        &format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, "{\"status\":\"degraded\"}\n");
+    assert!(!body.contains("rigctld") && !body.contains("127.0.0.1:1"));
+
+    kill_without_leaking_the_token(&mut daemon);
+}
+
+/// COP-140, scenario "The daemon can be found", through the real binary: a
+/// client on the network browses for `_coppa._tcp`, resolves `coppad.local`
+/// to an address other hosts can use, and reads `/health` there. The client
+/// is `mdns-sd` itself, because glibc resolves `.local` only with nss-mdns.
+#[cfg(all(feature = "mdns", not(feature = "cpal-backend")))]
+#[test]
+fn the_daemon_can_be_found_as_coppad_local() {
+    use mdns_sd::{HostnameResolutionEvent, ServiceDaemon, ServiceEvent};
+
+    let dir = TempDir::new("mdns");
+    dir.write(
+        "station.toml",
+        &ws_host_toml("bind_address = \"0.0.0.0\"\nmdns_enabled = true\n"),
+    );
+    let args = ["--config", "station.toml"];
+    let (mut daemon, _) = start_until(dir.path(), &args, &[("NO_COLOR", "1")], "Daemon ready");
+    let stdout = daemon.stdout();
+    let port = websocket_port(&stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("mDNS advertisement"))
+        .unwrap_or_else(|| panic!("no mDNS advertisement line\n{stdout}"));
+    assert!(line.contains("host=coppad.local."), "{line}");
+    assert!(line.contains(&format!("port={port}")), "{line}");
+
+    let client = ServiceDaemon::new().expect("start the mDNS client");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let browse = client.browse("_coppa._tcp.local.").expect("browse");
+    let service = loop {
+        match browse.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(ServiceEvent::ServiceResolved(service)) if service.get_port() == port => {
+                break service;
+            }
+            Ok(_) => {}
+            Err(e) => panic!("no _coppa._tcp service on port {port} resolved: {e}"),
+        }
+    };
+    assert_eq!(service.get_fullname(), "coppad._coppa._tcp.local.");
+    assert_eq!(service.get_hostname(), "coppad.local.");
+    assert_eq!(service.get_property_val_str("health"), Some("/health"));
+    let _ = client.stop_browse("_coppa._tcp.local.");
+
+    let lookup = client
+        .resolve_hostname("coppad.local.", Some(5000))
+        .expect("resolve coppad.local.");
+    let ip = loop {
+        match lookup.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(HostnameResolutionEvent::AddressesFound(_, found)) => {
+                if let Some(ip) = found
+                    .iter()
+                    .map(|a| a.to_ip_addr())
+                    .find(|ip| !ip.is_loopback())
+                {
+                    break ip;
+                }
+            }
+            Ok(HostnameResolutionEvent::SearchTimeout(name)) => {
+                panic!("{name} resolved to no non-loopback address")
+            }
+            Ok(_) => {}
+            Err(e) => panic!("coppad.local. did not resolve: {e}"),
+        }
+    };
+    let _ = client.shutdown();
+
+    let (head, body) = raw_http(
+        (ip, port),
+        &format!("GET /health HTTP/1.1\r\nHost: coppad.local:{port}\r\n\r\n"),
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, "{\"status\":\"ok\"}\n");
+
+    kill_without_leaking_the_token(&mut daemon);
+}
+
+/// COP-140: `localhost` is a host name, so check_mdns cannot judge it; the
+/// address it binds to is loopback, and startup stops there.
+#[cfg(all(feature = "mdns", not(feature = "cpal-backend")))]
+#[test]
+fn a_localhost_bind_address_is_refused_after_binding() {
+    let (_, stderr) = run_startup_error(
+        &ws_host_toml("bind_address = \"localhost\"\nmdns_enabled = true\n"),
+        "[host] mdns_enabled = true needs a bind_address other hosts can reach, but \
+         bind_address = \"",
     );
     assert!(
-        !stderr.contains(WS_TOKEN),
-        "token leaked to stderr:\n{stderr}"
+        stderr.contains("bind_address = \"127.0.0.1\"")
+            || stderr.contains("bind_address = \"::1\""),
+        "the message names the bound loopback address: {stderr}"
     );
 }
 
@@ -1546,6 +1724,7 @@ fn startup_line_states_version_git_sha_and_features() {
         ("cpal-backend", cfg!(feature = "cpal-backend")),
         ("gpio-ptt", cfg!(feature = "gpio-ptt")),
         ("kiss-tnc", cfg!(feature = "kiss-tnc")),
+        ("mdns", cfg!(feature = "mdns")),
         ("serial-ptt", cfg!(feature = "serial-ptt")),
         ("websocket", cfg!(feature = "websocket")),
     ] {

@@ -14,6 +14,10 @@
 //!    that down into `receive_with_metrics`, `demodulate_frame` (sync + OFDM
 //!    demod), LDPC decode, and the RX bandpass filter alone, to show where the
 //!    remaining time actually goes.
+
+// This program times wall-clock work, so it reads the clock (COP-90 guard).
+#![allow(clippy::disallowed_methods)]
+
 use std::time::Instant;
 
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};

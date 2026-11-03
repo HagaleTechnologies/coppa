@@ -17,6 +17,7 @@
 use num_complex::Complex32;
 
 /// Sparse delay-domain channel estimate over the active-carrier grid.
+#[derive(Debug)]
 pub struct DelayDomainEstimator {
     nc: usize, // active carriers
     #[allow(dead_code)]

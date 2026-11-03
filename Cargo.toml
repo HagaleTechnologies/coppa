@@ -19,10 +19,20 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85.0"
+
+# COP-90 (H-135). Inherited by every package except coppa-audio (five
+# `unsafe impl Send`) and coppa-ffi (the C ABI). Cargo cannot combine
+# `[lints] workspace = true` with local overrides, so crate-specific lints
+# (missing_docs and friends) live in each crate's lib.rs instead.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+return_self_not_must_use = "warn"
 
 [workspace.dependencies]
 thiserror = "2.0.18"
@@ -42,6 +52,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4.6"
+clap_mangen = "0.3"
 lz4_flex = "0.14"
 proptest = "1.5"
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -51,7 +63,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Root package for workspace-level integration tests
 [package]
 name = "coppa"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Open-source ham radio digital communications system"
 license = "MIT OR Apache-2.0"
@@ -70,6 +82,9 @@ num-complex = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
 rand = { workspace = true }
+
+[lints]
+workspace = true
 
 [[bench]]
 name = "throughput"

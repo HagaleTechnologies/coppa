@@ -8,6 +8,7 @@ use num_complex::Complex32;
 ///
 /// Estimates channel response at pilot positions, then interpolates
 /// to get estimates at all data subcarrier positions.
+#[derive(Debug, Clone)]
 pub struct LinearInterpolationEstimator {
     /// Channel estimates at each subcarrier index.
     h_estimates: Vec<Complex32>,
@@ -18,6 +19,9 @@ pub struct LinearInterpolationEstimator {
 }
 
 impl LinearInterpolationEstimator {
+    /// Creates an estimator for `num_carriers` subcarriers, starting from a
+    /// flat unit-gain channel (`H = 1 + 0j` everywhere) and a noise variance of
+    /// 0.01 until the first pilot update.
     pub fn new(num_carriers: usize) -> Self {
         Self {
             h_estimates: vec![Complex32::new(1.0, 0.0); num_carriers],

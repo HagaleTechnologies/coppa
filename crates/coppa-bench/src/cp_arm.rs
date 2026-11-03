@@ -5,7 +5,8 @@
 //!
 //! # Why this is a lib module and not part of the example
 //!
-//! CI compiles `crates/coppa-bench/examples/*.rs` (via
+//! CI compiles `crates/coppa-bench/diagnostics/*.rs` (registered as
+//! `[[example]]` targets, via
 //! `cargo clippy --workspace --all-targets`) but **never runs them**, so any
 //! arithmetic or state machine left inside an example's `main()` is invisible to
 //! `cargo test --workspace`. An inverted re-entrancy guard or a handshake charged

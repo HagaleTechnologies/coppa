@@ -3,6 +3,8 @@
 //! This is the root crate that re-exports sub-crates for convenience.
 //! For direct use, depend on individual crates (coppa-engine, coppa-codec, etc.).
 
+#![warn(missing_docs, missing_debug_implementations)]
+
 pub use coppa_codec as codec;
 pub use coppa_dsp as dsp;
 pub use coppa_engine as engine;

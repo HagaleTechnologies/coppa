@@ -141,14 +141,14 @@ use super::delay_domain::tau_basis;
 /// `rho(τ)=exp(-2π²σ²τ²)` autocorrelation shows a level-2 (`hf_standard`, 1.365 s)
 /// frame decorrelates to ~10% correlation by frame-end — the channel loses
 /// coherence WITHIN a single frame, not over "1-10s." A follow-on investigation
-/// (`crates/coppa-bench/examples/regression_root_cause.rs`) measured a **flat
+/// (`crates/coppa-bench/diagnostics/regression_root_cause.rs`) measured a **flat
 /// single-tap channel** (no multipath at all, so a "stale coarse-delay
 /// reference" isn't even a coherent failure mode there) at Moderate's real
 /// Doppler producing FER comparable to or worse than the real 2-tap channel at
 /// low-to-mid SNR, and found `LdpcNotConverged` failures are SNR-*independent*
 /// across 9-24 dB — the signature of a hard fading-outage floor, not an
 /// estimation-quality problem. A companion investigation
-/// (`crates/coppa-bench/examples/drift_estimate_quality_diagnosis.rs`) also
+/// (`crates/coppa-bench/diagnostics/drift_estimate_quality_diagnosis.rs`) also
 /// found the `DriftTracker`-based designs' own tracked delay never converges
 /// even at 24 dB on real Watterson-Moderate frames (unlike its clean AWGN-control
 /// convergence), because it's chasing a power-weighted average of two
@@ -198,7 +198,7 @@ pub fn ar1_coefficient(sigma_d_hz: f32, t_s: f32) -> f32 {
 
 /// One step's posterior (filtered) state: `L` complex taps + their `L×L` Hermitian
 /// covariance (row-major).
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct StepState {
     h: Vec<Complex32>,
     p: Vec<Complex32>,
@@ -403,6 +403,7 @@ fn rts_step(
 /// uncertain is `H(k)` given everything the tracker has seen," which is a strictly
 /// more informative quantity than [`super::delay_domain::DelayDomainEstimator`]'s
 /// single residual-variance scalar.
+#[derive(Debug)]
 pub struct TrackedTaps {
     nc: usize,
     taps: Vec<Complex32>,
@@ -500,6 +501,7 @@ impl TrackedTaps {
 /// Stateful AR(1) Kalman filter + lag-2 fixed-lag (RTS) smoother over a sequence of
 /// per-symbol pooled-pilot observations within one frame. See the module doc for
 /// the full model.
+#[derive(Debug)]
 pub struct KalmanLagSmoother {
     nc: usize,
     l: usize,

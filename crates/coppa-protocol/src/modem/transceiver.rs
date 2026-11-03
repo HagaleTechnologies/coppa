@@ -358,6 +358,10 @@ impl HarqRxBuffers {
     }
 }
 
+/// The one-frame encode/decode pipeline: OFDM modem, NR BG2 LDPC with rate
+/// matching, per-level constellation mapping and interleaving, and IR-HARQ
+/// combining on receive. One instance serves every speed level of its
+/// profile; it is `Send` but not `Sync` (see `LevelComponents::mapper`).
 pub struct CoppaTransceiver {
     modem: CoppaModem,
     profile: CoppaProfile,
@@ -440,11 +444,39 @@ pub struct CoppaTransceiver {
     harq_rx: RefCell<HarqRxBuffers>,
 }
 
+impl std::fmt::Debug for CoppaTransceiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The modem, LDPC graph, per-level tables and HARQ buffers run to
+        // kilobytes; print what identifies the instance and its options.
+        f.debug_struct("CoppaTransceiver")
+            .field("profile", &self.profile)
+            .field("speed_levels", &self.codecs.len())
+            .field("turbo", &self.turbo)
+            .field(
+                "cross_codeword_interleave_override",
+                &self.cross_codeword_interleave_override,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why [`CoppaTransceiver::receive`] returned no payload. Each variant names
+/// the pipeline stage that failed, in pipeline order.
 #[derive(Debug)]
 pub enum ReceiveError {
+    /// No frame was found in the samples (preamble synchronization failed).
     SyncFailed,
+    /// The protected header did not decode, or it claims values this codec
+    /// never sends (for example more than [`MAX_CODEWORDS`] codewords).
     HeaderCorrupt,
-    LdpcNotConverged { iterations: usize },
+    /// The header decoded but at least one payload codeword's LDPC decode did
+    /// not converge.
+    LdpcNotConverged {
+        /// Iterations the decoder ran before giving up; `0` from the
+        /// multi-codeword path, which does not report a count.
+        iterations: usize,
+    },
+    /// LDPC converged but the payload CRC did not match.
     CrcMismatch,
 }
 
@@ -468,19 +500,31 @@ impl std::fmt::Display for ReceiveError {
 impl std::error::Error for ReceiveError {}
 
 /// TX-side errors from [`CoppaTransceiver::transmit`] (Phase 3 Task 1).
+///
+/// Marked `#[non_exhaustive]`: a match outside this crate needs a wildcard arm.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TransmitError {
     /// `payload.len()` exceeded this speed level's capacity
     /// (`crate::modem::speed_levels::max_payload_for_level`). Oversized payloads
     /// are a hard error now -- the pre-Task-1 codec silently truncated them
     /// instead, which is a data-loss footgun a caller can't detect.
-    PayloadTooLarge { max: usize },
+    PayloadTooLarge {
+        /// Largest payload this level and codeword count carries, in bytes.
+        max: usize,
+    },
     /// `header.codewords` exceeded [`MAX_CODEWORDS`] (Phase 3 Task 5).
-    TooManyCodewords { max: u8 },
+    TooManyCodewords {
+        /// [`MAX_CODEWORDS`], the largest codeword count accepted.
+        max: u8,
+    },
     /// `header.speed_level` is not a wire speed level this transceiver knows
     /// (see `speed_level_components`). `CoppaHeader`'s fields are all `pub`, so
     /// a caller can build such a header; `transmit` used to panic on it (COP-19).
-    InvalidSpeedLevel { level: u8 },
+    InvalidSpeedLevel {
+        /// Speed level the header carried.
+        level: u8,
+    },
 }
 
 impl std::fmt::Display for TransmitError {
@@ -557,6 +601,9 @@ pub(crate) fn split_payload_across_codewords(
 }
 
 impl CoppaTransceiver {
+    /// Build a transceiver for `profile` and protocol `version`, with the
+    /// LDPC graph and all nine speed levels' tables built up front (the
+    /// expensive step, so build once and reuse). Turbo re-estimation is on.
     pub fn new(profile: CoppaProfile, version: u8) -> Self {
         // phy_mode 0 = HF/SSB; mirrors the TX bandpass gate in `CoppaModem::new`.
         let rx_bpf = (profile.phy_mode == 0).then(|| {
@@ -611,6 +658,7 @@ impl CoppaTransceiver {
     /// Enable/disable one-round turbo re-estimation (Task 5, default: on).
     /// Builder-style so bench code can construct a turbo-off transceiver for
     /// an A/B comparison: `CoppaTransceiver::new(profile, version).with_turbo(false)`.
+    #[must_use]
     pub fn with_turbo(mut self, on: bool) -> Self {
         self.turbo = on;
         self
@@ -627,6 +675,7 @@ impl CoppaTransceiver {
     /// `Self::cross_codeword_interleave_override`'s doc. `None` (the
     /// default) restores normal level-gated behavior. Builder-style, same
     /// pattern as [`Self::with_turbo`].
+    #[must_use]
     pub fn with_cross_codeword_interleave_override(mut self, over: Option<bool>) -> Self {
         self.cross_codeword_interleave_override = over;
         self
@@ -673,6 +722,12 @@ impl CoppaTransceiver {
         self.modem.data_carriers_per_symbol()
     }
 
+    /// Encode `payload` as one frame described by `header` and return its
+    /// audio samples at the profile's sample rate.
+    ///
+    /// `header.speed_level` and `header.codewords` choose the coding; the
+    /// payload must fit that level's capacity. Errors are
+    /// [`TransmitError`]s; nothing is truncated.
     pub fn transmit(
         &self,
         header: &CoppaHeader,
@@ -1602,6 +1657,16 @@ mod tests {
         let (_h, rx, _lvl) = tx.receive(&samples).expect("clean loopback should decode");
         assert_eq!(&rx[..payload.len()], payload.as_slice());
         assert_eq!(tx.turbo_attempts(), 0);
+    }
+
+    #[test]
+    fn debug_output_is_short() {
+        // COP-90: `{:?}` of an embedding struct must not dump the LDPC graph,
+        // the per-level tables or the HARQ buffers into a log line.
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let s = format!("{tx:?}");
+        assert!(s.len() < 1024, "{} bytes: {s}", s.len());
+        assert!(s.starts_with("CoppaTransceiver {"), "{s}");
     }
 
     #[test]

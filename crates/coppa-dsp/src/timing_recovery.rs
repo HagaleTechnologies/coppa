@@ -2,6 +2,7 @@
 ///
 /// Operates on baseband samples (post-carrier-recovery, post-matched-filter)
 /// and outputs one optimally-timed sample per symbol.
+#[derive(Debug, Clone)]
 pub struct GardnerTimingRecovery {
     samples_per_symbol: f32,
     mu: f32,
@@ -11,6 +12,10 @@ pub struct GardnerTimingRecovery {
 }
 
 impl GardnerTimingRecovery {
+    /// Creates a recovery loop for `samples_per_symbol` input samples per
+    /// symbol. `loop_bandwidth` is the normalised bandwidth of the critically
+    /// damped (zeta = 1/sqrt(2)) second-order loop.
+    #[must_use]
     pub fn new(samples_per_symbol: f32, loop_bandwidth: f32) -> Self {
         let zeta = std::f32::consts::FRAC_1_SQRT_2;
         let denom = 1.0 + 2.0 * zeta * loop_bandwidth + loop_bandwidth * loop_bandwidth;
@@ -26,6 +31,10 @@ impl GardnerTimingRecovery {
         }
     }
 
+    /// Returns one cubic-interpolated sample per symbol from `baseband`,
+    /// starting half a symbol in. Input shorter than `samples_per_symbol + 2`
+    /// returns an empty vector. The per-symbol timing correction is clamped
+    /// to 10% of a symbol.
     pub fn recover(&mut self, baseband: &[f32]) -> Vec<f32> {
         if baseband.len() < self.samples_per_symbol as usize + 2 {
             return Vec::new();
@@ -72,12 +81,17 @@ impl GardnerTimingRecovery {
         output
     }
 
+    /// Zeroes the timing phase and the integrated rate correction.
     pub fn reset(&mut self) {
         self.mu = 0.0;
         self.rate_adjust = 0.0;
     }
 }
 
+/// Cubic (Catmull-Rom) interpolation of `data` at fractional index `pos`.
+/// Neighbour indices are clamped to the slice, so `pos` near either end reuses
+/// the edge sample. Panics if `data` is empty.
+#[must_use]
 pub fn cubic_interpolate(data: &[f32], pos: f32) -> f32 {
     let idx = pos as usize;
     let frac = pos - idx as f32;

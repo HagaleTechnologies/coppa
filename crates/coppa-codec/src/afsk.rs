@@ -200,6 +200,7 @@ pub fn modulate(frame_bytes: &[u8]) -> Vec<f32> {
 ///
 /// Feed audio samples via [`Demodulator::process`], then call
 /// [`Demodulator::take_frames`] to retrieve any fully decoded frames.
+#[derive(Debug)]
 pub struct Demodulator {
     // Correlator accumulators
     mark_sin_acc: f32,
@@ -233,6 +234,8 @@ impl Default for Demodulator {
 }
 
 impl Demodulator {
+    /// Creates a demodulator in the idle state: no frame in progress, NRZI
+    /// reference set to mark, and no decoded frames queued.
     pub fn new() -> Self {
         Self {
             mark_sin_acc: 0.0,

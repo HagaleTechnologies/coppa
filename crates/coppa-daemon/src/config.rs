@@ -297,6 +297,12 @@ pub struct HostConfig {
     /// the WebSocket. Empty (the default) refuses every web page; scripts that
     /// send no `Origin` header need only the token.
     pub websocket_allowed_origins: Vec<String>,
+    /// COP-140: advertise this daemon on the local network over mDNS as
+    /// `coppad.local`, with one `_coppa._tcp` service for the WebSocket port
+    /// (the operator page at `/` and the health check at `/health`), and
+    /// nothing else. Needs a build with the `mdns` feature,
+    /// `websocket_enabled = true`, and a `bind_address` other hosts can reach.
+    pub mdns_enabled: bool,
     /// Allow data-port and WebSocket host data to transmit without an established
     /// session. Off by default; intended for sessionless bench rigs. Enabling it
     /// lets any data-port client key the transmitter.
@@ -563,6 +569,7 @@ impl Default for HostConfig {
             websocket_port: 8400,
             websocket_token: None,
             websocket_allowed_origins: Vec::new(),
+            mdns_enabled: false,
             sessionless_tx_enabled: false,
         }
     }
@@ -891,6 +898,44 @@ impl DaemonConfig {
              ardop, or set ardop_enabled = false"
                 .to_string(),
         )
+    }
+
+    /// COP-140: `[host] mdns_enabled = true` needs a build with the `mdns`
+    /// feature (`built`), the WebSocket listener it advertises, and a
+    /// `bind_address` other hosts can reach. A host name such as `localhost`
+    /// passes here; run mode checks the address it binds to as well. Checked
+    /// by run mode before any hardware is touched; `--check` does not call it.
+    pub fn check_mdns(&self, built: bool) -> Result<(), String> {
+        let host = &self.host;
+        if !host.mdns_enabled {
+            return Ok(());
+        }
+        if !built {
+            return Err(
+                "[host] mdns_enabled = true is set, but this coppad was built without the \
+                 mdns feature and advertises nothing; rebuild with --features mdns, or set \
+                 mdns_enabled = false"
+                    .to_string(),
+            );
+        }
+        if !host.websocket_enabled {
+            return Err(
+                "[host] mdns_enabled = true needs [host] websocket_enabled = true: coppad \
+                 advertises its WebSocket port (the operator page and /health) and nothing else"
+                    .to_string(),
+            );
+        }
+        let literal = host
+            .bind_address
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        if let Ok(ip) = literal.parse::<std::net::IpAddr>() {
+            let bound = std::net::SocketAddr::new(ip, host.websocket_port);
+            if crate::mdns::advertisement(bound).is_err() {
+                return Err(crate::mdns::unreachable_bind_address(&host.bind_address));
+            }
+        }
+        Ok(())
     }
 
     /// A positive preferred hardware rate is required before opening audio.
@@ -1748,6 +1793,86 @@ beacon_interval_secs = 600
         let err = config.check_ardop_built(false).unwrap_err();
         assert!(err.contains("ardop feature"), "{err}");
         assert_eq!(config.check_ardop_built(true), Ok(()));
+    }
+
+    /// COP-140: the mDNS key's startup checks, in order.
+    fn mdns_config(bind_address: &str) -> DaemonConfig {
+        let mut config = ws(Some(GOOD), &[]);
+        config.host.mdns_enabled = true;
+        config.host.bind_address = bind_address.to_string();
+        config
+    }
+
+    #[test]
+    fn check_mdns_passes_when_disabled() {
+        let config = DaemonConfig::default();
+        assert_eq!(config.check_mdns(false), Ok(()));
+        assert_eq!(config.check_mdns(true), Ok(()));
+    }
+
+    #[test]
+    fn check_mdns_refuses_a_build_without_the_feature() {
+        assert_eq!(
+            mdns_config("0.0.0.0").check_mdns(false),
+            Err(
+                "[host] mdns_enabled = true is set, but this coppad was built without the \
+                 mdns feature and advertises nothing; rebuild with --features mdns, or set \
+                 mdns_enabled = false"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn check_mdns_needs_the_websocket_listener() {
+        let mut config = mdns_config("0.0.0.0");
+        config.host.websocket_enabled = false;
+        assert_eq!(
+            config.check_mdns(true),
+            Err(
+                "[host] mdns_enabled = true needs [host] websocket_enabled = true: coppad \
+                 advertises its WebSocket port (the operator page and /health) and nothing else"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn check_mdns_refuses_a_loopback_bind_address() {
+        for bind in ["127.0.0.1", "127.0.0.2", "::1", "[::1]"] {
+            assert_eq!(
+                mdns_config(bind).check_mdns(true),
+                Err(crate::mdns::unreachable_bind_address(bind)),
+                "{bind}"
+            );
+        }
+        let err = mdns_config("127.0.0.1").check_mdns(true).unwrap_err();
+        assert!(
+            err.starts_with(
+                "[host] mdns_enabled = true needs a bind_address other hosts can reach, but \
+                 bind_address = \"127.0.0.1\" is loopback, so coppad.local would send"
+            ),
+            "{err}"
+        );
+        for bind in ["0.0.0.0", "[::]", "192.168.1.20"] {
+            assert_eq!(mdns_config(bind).check_mdns(true), Ok(()), "{bind}");
+        }
+        // A host name: the bound-address check in run mode decides it.
+        assert_eq!(mdns_config("localhost").check_mdns(true), Ok(()));
+    }
+
+    #[test]
+    fn mdns_enabled_defaults_to_false_and_round_trips() {
+        assert!(!DaemonConfig::default().host.mdns_enabled);
+        let parsed: DaemonConfig = toml::from_str("[host]\nmdns_enabled = true\n").unwrap();
+        assert!(parsed.host.mdns_enabled);
+        let printed = toml::to_string(&parsed).unwrap();
+        let reparsed: DaemonConfig = toml::from_str(&printed).unwrap();
+        assert!(reparsed.host.mdns_enabled);
+        let err =
+            toml::from_str::<DaemonConfig>("[host]\nmdns_enabled = true\nmdns_name = \"x\"\n")
+                .unwrap_err();
+        assert!(err.to_string().contains("mdns_name"), "{err}");
     }
 
     #[test]

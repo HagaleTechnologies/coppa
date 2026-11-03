@@ -12,3 +12,6 @@ num-complex = { workspace = true }
 
 [features]
 default = []
+
+[lints]
+workspace = true

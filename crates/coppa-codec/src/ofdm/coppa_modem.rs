@@ -80,13 +80,22 @@ pub const HEADER_PEEK_ANCHOR_MARGIN: usize =
 /// Speed level configuration for future MCS support.
 #[derive(Debug, Clone, Copy)]
 pub struct SpeedLevel {
+    /// Speed level number, 1 (most robust) to 9 (fastest), as numbered since
+    /// COP-24.
     pub level: u8,
+    /// Coded bits carried per constellation symbol: 1 (BPSK), 2 (QPSK),
+    /// 3 (8PSK), 4 (16-QAM) or 6 (64-QAM).
     pub bits_per_symbol: u8,
+    /// Numerator of the LDPC code rate (`ldpc_rate_num / ldpc_rate_den`).
     pub ldpc_rate_num: u8,
+    /// Denominator of the LDPC code rate (`ldpc_rate_num / ldpc_rate_den`).
     pub ldpc_rate_den: u8,
+    /// Peak-to-average power target, in dB, that the TX PAPR clip enforces
+    /// for this level's body symbols.
     pub papr_target_db: f32,
 }
 
+/// The nine speed levels in ascending order; `SPEED_LEVELS[n - 1].level == n`.
 pub const SPEED_LEVELS: [SpeedLevel; 9] = [
     SpeedLevel {
         level: 1,
@@ -307,6 +316,10 @@ const SCO_SLIP_THRESHOLD: f32 = 0.5;
 const SCO_PER_SYMBOL_CLAMP: f32 = 2.0;
 
 /// High-level OFDM modem for the Coppa Protocol.
+///
+/// `Debug` prints only the profile's geometry and the version: the FFT plans, pilot tables,
+/// TX filter taps and the last frame's workspace would put kilobytes into any
+/// log line that formats a struct holding a modem.
 pub struct CoppaModem {
     profile: CoppaProfile,
     fft: FftProcessor,
@@ -354,6 +367,18 @@ pub struct CoppaModem {
     last_frame_workspace: RefCell<Option<LastFrameWorkspace>>,
 }
 
+impl std::fmt::Debug for CoppaModem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoppaModem")
+            .field("sample_rate", &self.profile.sample_rate)
+            .field("fft_size", &self.profile.fft_size)
+            .field("cp_samples", &self.profile.cp_samples)
+            .field("phy_mode", &self.profile.phy_mode)
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
 /// One frame's probe-derived delay-domain calibration: the fixed bulk-delay bias,
 /// the chosen tap-model order, and the probe's own tap estimate + residual noise
 /// variance — the latter two seed [`KalmanLagSmoother`] (see
@@ -375,7 +400,9 @@ struct ProbeCalibration {
 /// exposing `DriftTracker`'s internal per-window state for an external
 /// investigation into the Cascaded/Replace designs' shared 18.0 dB ceiling.
 /// Not used by any production path.
+#[derive(Debug)]
 pub struct DriftDiagnostics {
+    /// Speed level (1-9) of the frame the diagnostic was run on.
     pub speed_level: u8,
     /// The frame-fixed reference the ORIGINAL (unchanged) payload path uses
     /// unchanged for the whole frame — `self.calibrated_bias` alone (the

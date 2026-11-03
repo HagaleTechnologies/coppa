@@ -81,7 +81,10 @@ fn frame_symbol_count(
 /// One frame fully decoded by [`StreamingReceiver::push_samples`].
 #[derive(Debug, Clone)]
 pub struct DecodedFrame {
+    /// Protected header decoded ahead of the payload (speed level, frame
+    /// type, codeword count and the other per-frame fields).
     pub header: CoppaHeader,
+    /// Payload bytes after LDPC decoding and the CRC check.
     pub payload: Vec<u8>,
     /// `10*log10(1 / mean(per-carrier noise variance))`, from
     /// `CoppaTransceiver::receive_with_metrics`.
@@ -195,7 +198,24 @@ pub struct StreamingReceiver {
     header_only_decodes: u32,
 }
 
+impl std::fmt::Debug for StreamingReceiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The ring holds up to a frame of raw audio; print the geometry and
+        // how much is buffered, not the samples.
+        f.debug_struct("StreamingReceiver")
+            .field("symbol_len", &self.symbol_len)
+            .field("data_carriers", &self.data_carriers)
+            .field("max_frame_samples", &self.max_frame_samples)
+            .field("buffered_samples", &self.ring.len())
+            .field("total_pushed", &self.total_pushed)
+            .finish_non_exhaustive()
+    }
+}
+
 impl StreamingReceiver {
+    /// Create a receiver for `profile` whose sync detector and transceiver
+    /// expect protocol `version` (the header nibble that keys the preamble
+    /// PN). The ring starts empty.
     pub fn new(profile: CoppaProfile, version: u8) -> Self {
         let symbol_len = profile.fft_size + profile.cp_samples;
         let data_carriers = profile.data_carriers;
@@ -296,6 +316,7 @@ impl StreamingReceiver {
         self.ring.len()
     }
 
+    /// True when the ring holds no samples (see [`Self::len`]).
     pub fn is_empty(&self) -> bool {
         self.ring.is_empty()
     }

@@ -19,6 +19,11 @@ use crate::profiles::Profile;
 /// Huffman+LZ4 compressed. Otherwise the payload is raw.
 const COMPRESSION_MARKER: u8 = 0xFE;
 
+/// Coppa wire-format version this engine transmits and decodes
+/// (`docs/SPEC.md` §0.1). It keys the preamble and probe sequences and is
+/// carried in `CoppaHeader::version`, so changing it is a wire-format break.
+pub const WIRE_FORMAT_VERSION: u8 = 1;
+
 /// Low tone of the standard SSB two-tone TX-level calibration signal (Hz).
 /// 700 Hz + 1900 Hz is standard amateur-radio TUNE/two-tone practice: both
 /// fall well inside the waveform's ~300-2700 Hz SSB passband (see
@@ -45,12 +50,22 @@ pub const TUNE_TONE_HIGH_HZ: f32 = 1900.0;
 /// attempt `String::from_utf8` themselves on the raw bytes.
 #[derive(Debug)]
 pub struct StreamFrame {
+    /// The frame's payload bytes after optional decompression, or the typed
+    /// failure that stopped this one frame (see the struct docs above).
     pub payload: Result<Vec<u8>, EngineError>,
     /// Real per-carrier-noise SNR estimate (dB) from `CoppaTransceiver::
     /// receive_with_metrics`, `10*log10(1/mean(noise_vars))` — NOT the crude
     /// whole-buffer RMS proxy `handle_audio_in` used to compute before Task 7.
     pub snr_db: f32,
+    /// Carrier frequency offset (Hz) the sync detector estimated for this frame
+    /// before demodulation.
     pub cfo_hz: f32,
+    /// Sample index of the frame's preamble start, counted over the samples
+    /// passed to [`CoppaCore::push_samples`] since the engine's streaming
+    /// receiver was last built. Construction, `reconfigure`, `set_speed_level`,
+    /// `set_ofdm_band` and `set_cp_profile` each build a fresh receiver and
+    /// restart the count at 0. A chunk that squelch drops never reaches the
+    /// receiver, so its samples are not counted.
     pub frame_start: u64,
     /// Speed level (1-9) the transmitting station encoded this frame at, from the
     /// decoded protected header (`DecodedFrame::header.speed_level`). Added for
@@ -100,6 +115,19 @@ pub struct CoppaCore {
     streaming: StreamingReceiver,
 }
 
+impl std::fmt::Debug for CoppaCore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The transceiver and streaming receiver own per-level code tables that
+        // would print kilobytes; the config and OFDM geometry identify the engine.
+        let profile = self.transceiver.profile();
+        f.debug_struct("CoppaCore")
+            .field("config", &self.config)
+            .field("fft_size", &profile.fft_size)
+            .field("cp_samples", &profile.cp_samples)
+            .finish_non_exhaustive()
+    }
+}
+
 impl CoppaCore {
     /// Create a new engine with default configuration (speed_level=1, hf_standard profile).
     pub fn new() -> Self {
@@ -126,8 +154,8 @@ impl CoppaCore {
     fn build(config: EngineConfig) -> Self {
         let ofdm_profile =
             Self::select_ofdm_profile(config.speed_level, config.cp_mode, config.ofdm_band);
-        let transceiver = CoppaTransceiver::new(ofdm_profile.clone(), 1);
-        let streaming = StreamingReceiver::new(ofdm_profile, 1);
+        let transceiver = CoppaTransceiver::new(ofdm_profile.clone(), WIRE_FORMAT_VERSION);
+        let streaming = StreamingReceiver::new(ofdm_profile, WIRE_FORMAT_VERSION);
         Self {
             transceiver,
             config,
@@ -391,7 +419,7 @@ impl CoppaCore {
         }
 
         let header = CoppaHeader {
-            version: 1,
+            version: WIRE_FORMAT_VERSION,
             phy_mode: 0,
             frame_type: CoppaFrameType::Data,
             bandwidth: self.transceiver.profile().bandwidth_id,
@@ -441,7 +469,7 @@ impl CoppaCore {
         }
 
         let header = CoppaHeader {
-            version: 1,
+            version: WIRE_FORMAT_VERSION,
             phy_mode: 0,
             frame_type: CoppaFrameType::Beacon,
             bandwidth: self.transceiver.profile().bandwidth_id,
@@ -769,6 +797,14 @@ impl Default for CoppaCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_is_short_and_names_the_config() {
+        let core = CoppaCore::new();
+        let s = format!("{core:?}");
+        assert!(s.len() < 1024, "{} bytes: {s}", s.len());
+        assert!(s.contains("speed_level: 1"), "{s}");
+    }
 
     #[test]
     fn compression_probe_requires_exact_compressor_output_not_just_marker() {
@@ -1718,6 +1754,31 @@ mod tests {
             CoppaProfile::hf_standard_short_cp().bandwidth_id,
             "returning below level 5 must rebuild onto hf_standard_short_cp, not hf_standard"
         );
+    }
+
+    /// `coppa --version` prints this; a bump is a deliberate, spec-visible
+    /// wire-format break (`docs/SPEC.md` §0.1), never a side effect.
+    #[test]
+    fn wire_format_version_is_1() {
+        assert_eq!(WIRE_FORMAT_VERSION, 1);
+    }
+
+    /// The constant is the version the engine actually uses: a receiver built
+    /// with it decodes `CoppaCore::encode` output.
+    #[test]
+    fn wire_format_version_decodes_engine_frames() {
+        use coppa_protocol::modem::transceiver::CoppaTransceiver;
+        let core = CoppaCore::new();
+        let samples = core.encode("wire format").unwrap();
+        let profile = CoppaCore::select_ofdm_profile(
+            core.config.speed_level,
+            core.config.cp_mode,
+            core.config.ofdm_band,
+        );
+        let rx = CoppaTransceiver::new(profile, WIRE_FORMAT_VERSION);
+        let (header, payload, _) = rx.receive(&samples).expect("decode");
+        assert_eq!(header.version, WIRE_FORMAT_VERSION);
+        assert_eq!(payload, b"wire format");
     }
 
     /// Decode `samples` through a receiver built for `profile` and return the wire

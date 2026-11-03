@@ -8,13 +8,19 @@ use num_complex::Complex32;
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum FrameType {
+    /// Code 0: a frame carrying payload data.
     Data = 0,
+    /// Code 1: an acknowledgement.
     Ack = 1,
+    /// Code 2: a link-control frame.
     Control = 2,
+    /// Code 3: a beacon.
     Beacon = 3,
 }
 
 impl FrameType {
+    /// Decodes the frame type from the low two bits of `val`; the upper six
+    /// bits are ignored, so every input maps to a variant.
     pub fn from_u8(val: u8) -> Self {
         match val & 0x03 {
             0 => FrameType::Data,
@@ -184,16 +190,24 @@ pub fn generate_lts(profile: &OfdmProfile) -> Vec<Complex32> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CoppaFrameType {
+    /// Wire code 0: a frame carrying payload data.
     Data = 0,
+    /// Wire code 1: a positive acknowledgement.
     Ack = 1,
+    /// Wire code 2: a negative acknowledgement.
     Nak = 2,
+    /// Wire code 3: a connection request.
     Connect = 3,
+    /// Wire code 4: the answer to a connection request.
     ConnectAck = 4,
+    /// Wire code 5: a disconnect.
     Disconnect = 5,
+    /// Wire code 6: a beacon.
     Beacon = 6,
 }
 
 impl CoppaFrameType {
+    /// Decodes a wire code; returns `None` for any value above 6.
     pub fn from_u8(val: u8) -> Option<Self> {
         match val {
             0 => Some(CoppaFrameType::Data),

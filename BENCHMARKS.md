@@ -386,7 +386,7 @@ level 10 through the harsh 6.0 dB target only levels 1/2 normally get should low
 the gap survives a uniform clip target similarly to how it appears naturally, that falsifies PAPR
 clipping as the mechanism.
 
-**Method.** New `crates/coppa-bench/examples/papr_clip_level_bias.rs`: for each of the 9 real
+**Method.** New `crates/coppa-bench/diagnostics/papr_clip_level_bias.rs`: for each of the 9 real
 speed levels, builds ONE fixed set of constellation-mapped payload symbols (pseudorandom bits
 through that level's real mapper, `CODED_BLOCK_LEN.div_ceil(bits_per_symbol)` symbols — the same
 count `CoppaTransceiver::transmit` produces for one codeword) and modulates it three ways, varying
@@ -461,7 +461,7 @@ root-caused it to `SPEED_LEVELS[level].papr_target_db`, both diagnose-only). Thi
 fix: `coppa_ml::recommend_speed_level` now takes the frame's originating speed level and corrects
 its raw `channel_capacity`/`channel_selectivity` readings for that level's known PAPR-clip-induced
 self-noise floor before the calibrated lookup, using a `(level × SNR)` correction table measured by
-the new `crates/coppa-bench/examples/capacity_level_correction_calibration.rs` (profile `robust`,
+the new `crates/coppa-bench/diagnostics/capacity_level_correction_calibration.rs` (profile `robust`,
 seed `0xCA11B`, 200 trials/cell, AWGN only). The bias turned out not to be a flat per-level offset —
 it grows with SNR (e.g. level 10's correction is +0.10 bits/s/Hz at 6 dB but +3.30 at 30 dB) — so
 the correction interpolates over the same 5-point SNR grid the diagnostic benches used, on the
@@ -595,7 +595,7 @@ The Cascaded design (below) and the earlier Replace design (PR #41) both measure
 
 ### Investigation 1: is `DriftTracker`'s own estimate the bottleneck?
 
-New `CoppaModem::diagnose_drift_tracking` hook + `crates/coppa-bench/examples/drift_estimate_quality_diagnosis.rs` (150 trials/point, real frames, AWGN control vs. Watterson-Moderate/level 2):
+New `CoppaModem::diagnose_drift_tracking` hook + `crates/coppa-bench/diagnostics/drift_estimate_quality_diagnosis.rs` (150 trials/point, real frames, AWGN control vs. Watterson-Moderate/level 2):
 
 | | AWGN, 12→24 dB | Watterson-Moderate, 12→24 dB |
 |---|---|---|
@@ -607,7 +607,7 @@ The AWGN control behaves exactly as a well-tuned estimator should. On Watterson-
 
 ### Investigation 2: what's actually causing the frame loss?
 
-New `crates/coppa-bench/examples/regression_root_cause.rs` (400 trials/point, real Watterson-Moderate/level 2, 9–24 dB):
+New `crates/coppa-bench/diagnostics/regression_root_cause.rs` (400 trials/point, real Watterson-Moderate/level 2, 9–24 dB):
 
 1. **The codebase's own "amplitude-fading coherence time ~1-10s, much longer than one frame" assumption (`kalman_tracker.rs`, carried through Task 1/7's reasoning) was never checked against `coppa-channel`'s actually-configured Watterson-Moderate Doppler spread.** `WattersonPreset::Moderate` sets `doppler_spread_hz = 0.5` → PSD sigma `0.25` Hz (the assumption text also conflated the *spread* with the *sigma*, a related unit slip). Plugging the correct sigma into `watterson.rs`'s own verified `rho(τ)=exp(-2π²σ²τ²)` autocorrelation: a level-2 (`hf_standard`, 1.365 s) frame decorrelates to **~10% correlation by frame-end** — the channel loses coherence *within* a single frame. (Good, at σ=0.05 Hz, genuinely fits the original "much longer than a frame" claim — ρ stays above 91% for the whole frame; the assumption was never wrong for Good, only silently over-generalized to Moderate/Poor.)
 2. **`LdpcNotConverged` failure counts are SNR-independent** across 9→24 dB (14/16/13/15/12/13, a 1.08× ratio end-to-end) while `SyncFailed` is clearly SNR-driven (46→2, 23.0×) — the signature of a hard, channel-realization-dependent fading-outage floor, not an estimation-quality problem that should shrink with more SNR margin.
@@ -1105,9 +1105,20 @@ re-baselined. With the current 2/5 Good result the benchmark reports **MET**. Th
 regression floor for this exact schedule and seed set, not a production reliability guarantee, and
 it supersedes rather than achieves the original zero-drop aspiration.
 
+**COP-118 (2026-11-02): fade-diversity prototypes on an adapted version of this bench.** A scratch
+harness ran this bench's level, window, retry budget, ramp and seeds over one continuous Watterson
+trace per trial, with one ARQ segment per six-chunk logical block. A systematic RS(12,6) outer code
+across twelve NR-coded packets completed 5/5 Moderate and 5/5 Poor sessions (1579.3 and 1107.0
+bytes/min). Half-band carrier repetition at the control's mean transmit power completed 3/5 and
+4/5, each within one session of an equivalent noise-referenced run (4/5 and 3/5), and 2/5 and 3/5
+when held to the control's peak instead. The matched six-packet control completed 1/5 and 0/5.
+The outer code costs 45.4% of clean-channel goodput. These numbers come from a different harness
+from the tables above and are not comparable with them. See
+`docs/analysis/COP-118-fade-diversity.md`.
+
 ### Golden vectors: 20 WAVs + manifest, all 20 expected to decode
 
-`crates/coppa-bench/examples/golden_vectors_gen.rs` generates 20 combinations (levels {1, 2, 5,
+`crates/coppa-bench/diagnostics/golden_vectors_gen.rs` generates 20 combinations (levels {1, 2, 5,
 6, 9} × channels {clean, awgn@12dB, poor@25dB, ssb+cfo}) as 48 kHz/16-bit-PCM WAVs +
 `testdata/golden/manifest.toml` (seed, level, payload hex, expected decode outcome), each
 seed-searched (up to 500 attempts) to a payload the current codec actually decodes correctly at
@@ -1139,7 +1150,7 @@ the ACK (`TransportPdu::new_ack_with_rate`/`suggested_rate()`); the sender's
 `coppa_ml::RateLoop` applies it with hysteresis (raise one level only after
 `raise_dwell` consecutive higher recommendations; drop immediately to the
 recommendation on a lower one, or one step on any delivery failure/ARQ
-timeout). Validated by `crates/coppa-bench/examples/closed_loop_arq.rs` — a
+timeout). Validated by `crates/coppa-bench/diagnostics/closed_loop_arq.rs` — a
 simulation-only bench (no daemon/audio wiring; that remains deferred, per the
 plan). The old, dead `coppa-engine::RateController` (never wired to anything
 beyond a debug log) and the aspirational, unused, SNR-only `coppa-ml::MCS_TABLE`
@@ -1196,7 +1207,7 @@ issue already tracked as open in this document's "Known Limitations" (see
 docs/LIMITATIONS.md); it is **not** a bug in `RateLoop`'s hysteresis logic itself, and
 fixing the underlying metric is out of this task's scope (it belongs to the
 channel-estimation / MCS-calibration layer, not the rate-loop controller). See
-`crates/coppa-bench/examples/closed_loop_arq.rs`'s module doc and
+`crates/coppa-bench/diagnostics/closed_loop_arq.rs`'s module doc and
 `.superpowers/sdd/task-4-report.md` for the full investigation, including two
 unrelated real bugs found and fixed in the bench itself along the way (a
 constant `seq_num` corrupting IR-HARQ's per-seq accumulator across
@@ -1493,7 +1504,7 @@ clippy, and fmt all clean after the fix.
 
 Levels 2/3/6 (BPSK/QPSK/16QAM 1/2), robust profile, 6/12/18/24/30 dB, per-cell attribution of
 every dropped frame to header-CRC-failure vs. genuine payload limit (see
-`crates/coppa-bench/examples/header_diagnostic.rs`'s own doc comment for the exact attribution
+`crates/coppa-bench/diagnostics/header_diagnostic.rs`'s own doc comment for the exact attribution
 rule). Reproduce with `cargo run --release -p coppa-bench --example header_diagnostic`.
 
 | Level | Total frame failures (5 SNR points) | of which header-caused | Share |

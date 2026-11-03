@@ -12,6 +12,8 @@
 //! ionospheric channel. For a realistic Rayleigh/Watterson HF channel model,
 //! see the [`watterson`] module.
 
+#![warn(missing_docs, missing_debug_implementations)]
+
 pub mod watterson;
 
 use coppa_dsp::fft::FftProcessor;
