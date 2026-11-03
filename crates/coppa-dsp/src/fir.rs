@@ -1,6 +1,7 @@
 //! Linear-phase FIR design (windowed sinc) and block filtering.
 
 /// Odd-length linear-phase bandpass via Blackman-windowed sinc.
+#[must_use]
 pub fn design_bandpass(taps: usize, fs: f32, f_lo: f32, f_hi: f32) -> Vec<f32> {
     assert!(taps % 2 == 1, "linear phase needs odd length");
     let m = (taps - 1) as f32 / 2.0;
@@ -25,6 +26,7 @@ pub fn design_bandpass(taps: usize, fs: f32, f_lo: f32, f_hi: f32) -> Vec<f32> {
 
 /// Odd-length Hilbert transformer (type-III FIR): h[k] = 2/(pi*k) for odd k, else 0,
 /// Blackman-windowed. Pass real x; get the quadrature component with (taps-1)/2 delay.
+#[must_use]
 pub fn design_hilbert(taps: usize) -> Vec<f32> {
     assert!(taps % 2 == 1, "Hilbert FIR needs odd length");
     let m = (taps - 1) as i64 / 2;
@@ -45,6 +47,7 @@ pub fn design_hilbert(taps: usize) -> Vec<f32> {
 
 /// Streaming FIR with carry-over state (history of `taps - 1` input samples), for
 /// filtering a signal delivered in chunks without discontinuities at chunk boundaries.
+#[derive(Debug, Clone)]
 pub struct StreamingFir {
     coeffs: Vec<f32>,
     /// The last `coeffs.len() - 1` input samples seen, oldest first.
@@ -58,6 +61,9 @@ pub struct StreamingFir {
 }
 
 impl StreamingFir {
+    /// Creates a filter with taps `coeffs` and an all-zero history, so the
+    /// first `coeffs.len() - 1` outputs see zeros before the signal starts.
+    #[must_use]
     pub fn new(coeffs: Vec<f32>) -> Self {
         let hist_len = coeffs.len().saturating_sub(1);
         let nonzero = coeffs
@@ -103,19 +109,27 @@ impl StreamingFir {
     }
 }
 
+/// A block FIR filter: each call filters one block on its own, with no state
+/// carried between calls (see [`StreamingFir`] for that).
+#[derive(Debug, Clone)]
 pub struct Fir {
     coeffs: Vec<f32>,
 }
 
 impl Fir {
+    /// Creates a filter with taps `coeffs`. The methods assume at least one
+    /// tap.
+    #[must_use]
     pub fn new(coeffs: Vec<f32>) -> Self {
         Self { coeffs }
     }
     /// Group delay in samples: (taps-1)/2.
+    #[must_use]
     pub fn group_delay(&self) -> usize {
         (self.coeffs.len() - 1) / 2
     }
     /// Convolve a block (output length = input length; zero-padded edges).
+    #[must_use]
     pub fn filter_block(&self, x: &[f32]) -> Vec<f32> {
         let l = self.coeffs.len();
         let mut y = vec![0.0f32; x.len()];
@@ -164,7 +178,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "odd length")]
     fn design_hilbert_rejects_even_taps() {
-        design_hilbert(128);
+        let _ = design_hilbert(128);
     }
 
     #[test]

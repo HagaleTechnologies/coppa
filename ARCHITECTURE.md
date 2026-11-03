@@ -101,7 +101,7 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 
 #### Host Interfaces (`coppa-host`)
 - **VARA-style TCP** (`vara-tcp`, default): command port 8300 and data port 8301, a VARA-inspired command set. The modem is not RF/waveform-compatible with VARA and does not interoperate with it over the air
-- **WebSocket** (`websocket`): a JSON API server built on `tokio-tungstenite`, carrying callsign, connect/disconnect, send, received-data, status and spectrum messages; every handshake must present the `[host] websocket_token` and, from a browser, an allowlisted `Origin` (COP-53). The same port answers a plain HTTP `GET /` (or `GET /index.html`) with an embedded operator page (COP-79, `crates/coppa-daemon/src/web/index.html`), which upgrades at `/ws`; the accept loop reads each request head once and hands upgrades, byte for byte, to the unchanged gate (`crates/coppa-host/src/http_route.rs`)
+- **WebSocket** (`websocket`): a JSON API server built on `tokio-tungstenite`, carrying callsign, connect/disconnect, send, received-data, status and spectrum messages; every handshake must present the `[host] websocket_token` and, from a browser, an allowlisted `Origin` (COP-53). The same port answers a plain HTTP `GET /` (or `GET /index.html`) with an embedded operator page (COP-79, `crates/coppa-daemon/src/web/index.html`), which upgrades at `/ws`; the accept loop reads each request head once and hands upgrades, byte for byte, to the unchanged gate (`crates/coppa-host/src/http_route.rs`). It also answers `GET`/`HEAD /health` with `{"status":"ok"}` or `{"status":"degraded"}`, unauthenticated, when the embedder calls `WebSocketServer::with_health` (COP-140), and closes any connection that has not sent its request head within 5 s
 - **KISS over TCP** (`kiss-tnc`): the host side of the AFSK TNC mode
 - [docs/HOST-API.md](docs/HOST-API.md) documents what a host sends and receives on each of these ports
 
@@ -120,6 +120,7 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 - Tokio event loop multiplexing audio, host clients (VARA-style TCP, WebSocket), radio control, ARQ timers, `RateLoop`, `CpGate`/CP negotiation and `BusyGate`
 - Options: `--config <PATH>` (or a positional config path), `--check`, `--log-level`, `--print-default-config`, `--tnc`. Without a config path it uses the first file found of `./coppad.toml`, `$XDG_CONFIG_HOME/coppa/coppad.toml` (default `~/.config/coppa/coppad.toml`; `%APPDATA%\coppa\coppad.toml` on Windows) and `/etc/coppa/coppad.toml`, otherwise built-in defaults, and logs which one it used (COP-49)
 - Hardware audio requires the `cpal-backend` feature; without it the daemon runs but moves no audio
+- Optional mDNS responder (`mdns` feature, `[host] mdns_enabled`, COP-140): advertises `coppad.local.` and one `_coppa._tcp` service for the WebSocket port, using the in-process `mdns-sd` crate (`crates/coppa-daemon/src/mdns.rs`)
 - Ctrl-C graceful shutdown
 - RX/TX audio level meter with clipping/underdrive warnings (logs + opt-in WebSocket `audio_level` stream)
 
@@ -266,6 +267,7 @@ Declared in a crate's own manifest rather than the workspace table:
 |---|---|---|---|
 | `coppa-host` | `tokio-tungstenite` | 0.29 | optional, `websocket`: WebSocket server |
 | `coppa-host` | `futures-util` | 0.3 | optional, `websocket` |
+| `coppa-daemon` | `mdns-sd` | 0.21 | optional, `mdns`: mDNS responder; also a dev-dependency for the discovery test |
 | `coppa-ffi` | `cbindgen` | 0.29 | build-dependency: generates `coppa.h` |
 
 Feature flags (`[features]` tables):
@@ -274,7 +276,7 @@ Feature flags (`[features]` tables):
 |---|---|---|
 | `coppa-audio` | `cpal-backend`, `file-backend` | — |
 | `coppa-cli` | `file-backend` | `cpal-backend`, `kiss-tnc` |
-| `coppa-daemon` | none | `cpal-backend`, `websocket`, `kiss-tnc`, `serial-ptt`, `gpio-ptt` |
+| `coppa-daemon` | none | `cpal-backend`, `websocket`, `kiss-tnc`, `serial-ptt`, `gpio-ptt`, `mdns` (implies `websocket`) |
 | `coppa-host` | `vara-tcp` | `websocket`, `kiss-tnc` |
 | `coppa-radio` | none | `serial-ptt`, `gpio-ptt` |
 | `coppa-ml` | none (`default = []`) | — |

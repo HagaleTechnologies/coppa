@@ -74,6 +74,10 @@ Reading 65520 samples from cq.wav
 Decoded: "CQ CQ CQ DE VK2ABC K"  (SNR: 25.7 dB)
 ```
 
+Status lines such as `Reading ...` go to stderr and stdout carries only the
+decoded frames, so `coppa rx cq.wav > decoded.txt` captures just the decoded
+lines.
+
 Payloads that aren't valid UTF-8 print as `Decoded (hex): …`; `--hex` forces hex, and `--raw` prints only the hex for scripts.
 
 For a stream that scripts can parse, use `--json`:
@@ -152,11 +156,38 @@ name substring. An ambiguous name reports all matching IDs and fails.
 stereo input. Live output commands use `--device-id` and `--output-channel`.
 IDs may change when the audio host reconfigures the device. Decoded frames
 print in the same format as a WAV decode. `--duration` stops after that
-many seconds; without it, `coppa rx` runs until Ctrl+C. `coppa listen` is a deprecated alias for `coppa rx` and will be removed in the
+many seconds; without it, `coppa rx` runs until Ctrl+C. Either way it prints
+`Stopped after N.N s of audio: X frames decoded, Y failed.` on stderr and exits
+0 (1 if a frame failed to decode); a second Ctrl+C exits at once. `coppa listen` is a deprecated alias for `coppa rx` and will be removed in the
 next release. It accepts `--json` too and prints its deprecation warning on
 stderr. Use `-q` to suppress status output, or `-v` for diagnostics. Repeat
 `-v` as `-vv` for recommended speed level and delay spread per decoded frame;
 quiet and verbose flags conflict.
+
+### Piping raw audio
+
+`coppa tx -o -` and `coppa tune -o -` write headerless PCM to stdout, and
+`coppa rx -` reads it from stdin: 16-bit signed little-endian (`s16le`), mono,
+48000 Hz. `--sample-format f32le` switches either end to 32-bit float. WAV
+files written with `-o FILE` are 16-bit PCM by default; `--sample-format
+f32le` writes the older 32-bit float file. Raw audio is never written to or
+read from a terminal.
+
+```bash
+coppa tx "CQ CQ CQ DE VK2ABC K" -o - | aplay -q -f S16_LE -r 48000 -c 1
+arecord -q -f S16_LE -r 48000 -c 1 -t raw | coppa rx -
+```
+
+### Shell completions and man page
+
+`coppa completions <bash|elvish|fish|powershell|zsh>` prints a completion
+script, and `coppa man` prints the coppa(1) page in roff. `coppa --version`
+prints the git commit, the CLI's cargo features and the wire-format version.
+
+```bash
+coppa completions bash > ~/.local/share/bash-completion/completions/coppa
+coppa man > coppa.1 && man ./coppa.1
+```
 
 ## Persisting your CLI settings
 

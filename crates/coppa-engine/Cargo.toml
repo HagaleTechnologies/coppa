@@ -17,3 +17,6 @@ coppa-channel = { path = "../coppa-channel" }
 approx = { workspace = true }
 rand = { workspace = true }
 num-complex = { workspace = true }
+
+[lints]
+workspace = true
