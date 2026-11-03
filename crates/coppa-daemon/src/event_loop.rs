@@ -339,7 +339,6 @@ fn cwid_request_allowed(policy: CwIdPolicy, on: bool) -> bool {
     }
 }
 
-<<<<<<< HEAD
 /// COP-83: the TUNE duration the daemon transmits for a requested one.
 /// `None` is the VARA default of 10 s. The result never exceeds
 /// `[radio] max_tx_duration_s` (the playout watch would cut the tone there
@@ -360,7 +359,7 @@ fn tune_seconds(requested: Option<f32>, max_tx_duration_s: u64) -> f32 {
 fn max_tune_seconds(max_tx_duration_s: u64) -> f32 {
     (max_tx_duration_s as f32).min(coppa_engine::MAX_TUNE_SECONDS)
 }
-=======
+
 /// COP-84: the CW ID state in words, for the startup line and change logs.
 fn describe_cw_id(policy: CwIdPolicy, on: bool, wpm: u32) -> String {
     let state = match (policy, on) {
@@ -381,7 +380,6 @@ fn describe_cw_id(policy: CwIdPolicy, on: bool, wpm: u32) -> String {
 /// CW ID that would not fit in the limit less this margin goes out without
 /// the CW ID (`EventLoop::with_closing_cw_id`).
 const CW_ID_TX_MARGIN_SECS: f32 = 2.0;
->>>>>>> 2526b50196b1e32966f34088530595360b23be79
 
 /// Queue `response` for one command-port client without waiting
 /// (`queue_response`). Returns `false` when a line that must not be dropped
