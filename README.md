@@ -18,7 +18,8 @@ Open-source ham radio digital communications system written in Rust.
 | Daemon event loop | Implemented | Processes audio and host events; live audio requires `cpal-backend` |
 | ARDOP TNC host interface | Implemented, opt-in | Command/data ports default to 8515/8516; `ardop` feature, disabled by default; host-protocol interface only — both ends of a session run coppa — see [docs/ARDOP.md](docs/ARDOP.md) |
 | VARA-style TCP interface | Implemented, opt-in | Control/data ports default to 8300/8301; server disabled by default; not RF-compatible with VARA; verified with Pat (Winlink) — see [docs/PAT.md](docs/PAT.md); protocol guide in [docs/HOST-API.md](docs/HOST-API.md) |
-| C FFI | Implemented | Shared/static library with one-shot encode/decode and streaming decode |
+| C FFI | Implemented | Shared/static library with one-shot encode/decode, streaming decode, connected links (`coppa_link_*`), readable errors and an ABI version |
+| Python binding | Implemented, not published | `bindings/python`: a stdlib-only `ctypes` binding that drives a connected link; Linux-tested; see [bindings/python/README.md](bindings/python/README.md) |
 | Operating profiles | Implemented | 48 kHz OFDM profiles with runtime speed-level selection within the configured band |
 | Link adaptation | Implemented, limited calibration | Measurement-driven speed selection and ACK-driven RateLoop with ARQ enabled; no model inference; performance targets remain unmet, see [BENCHMARKS.md](BENCHMARKS.md) |
 | Serial/GPIO PTT | Implemented, feature-gated | Daemon serial DTR/RTS uses `serial-ptt`; Linux sysfs GPIO uses `gpio-ptt` |
@@ -35,7 +36,8 @@ Open-source ham radio digital communications system written in Rust.
 - Selective-repeat ARQ and session management, with optional Huffman + LZ4 compression. Connected-session data is always acknowledged and retransmitted; sessionless ARQ is disabled by default.
 - WAV file I/O and live CPAL audio with `cpal-backend`, including exact device IDs, selectable input/output channels, and hardware sample-rate conversion; daemon serial and Linux GPIO PTT with their respective feature flags.
 - VARA-style TCP command/data interface for host applications, disabled by default and not RF-compatible with VARA.
-- C FFI shared/static library with one-shot encode/decode and streaming decode.
+- C FFI shared/static library with one-shot encode/decode, streaming decode, connected links (`coppa_link_*`), readable errors and an ABI version.
+- Python binding (`bindings/python`, not published) that drives a connected link over audio samples.
 - Deterministic link adaptation and spectrum sensing. Short-CP recommendation and negotiation are opt-in; IR-HARQ remains an unwired codec primitive.
 
 ## Quick Start
@@ -132,7 +134,7 @@ ignores KISS TXDELAY, persistence and slot time), no digipeating or beaconing, a
 | `coppa-ml` | Measurement-driven speed selection, RateLoop, CpGate, BusyGate and spectrum sensing |
 | `coppa-engine` | CoppaTransceiver wrapper with compression, squelch and streaming receive |
 | `coppa-host` | Host interfaces: VARA-style TCP control server, WebSocket JSON API, KISS TNC TCP server (`kiss-tnc` feature) |
-| `coppa-ffi` | C FFI bindings (cdylib + staticlib) with streaming decode API |
+| `coppa-ffi` | C FFI bindings (cdylib + staticlib) with streaming decode, connected links (`coppa_link_*`), readable errors and an ABI version; the Python binding (`bindings/python`, not published) wraps it |
 | `coppa-cli` | CLI binary (`coppa`): `tx`, `rx`, `loopback`, `tune`, `devices`, `profiles`, `config`, and `tnc` (`kiss-tnc` feature) |
 | `coppa-daemon` | Long-running daemon (`coppad`) with event loop, audio, and host integration |
 | `coppa-bench` | Measurement harness, not a product crate: BER/FER/goodput-vs-SNR scenarios, benchmark examples, and the lib tests that guard each speed level's AWGN waterfall on every push |

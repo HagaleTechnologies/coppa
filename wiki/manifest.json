@@ -555,6 +555,29 @@
       "verified_commit": "c1d2676",
       "verified_date": "2026-07-07",
       "visibility": "public"
+    },
+    {
+      "hash": "sha256:ac39bc66ccd9135455da8f650dbe75aae66fb25d00fafe03d4072ce6647f8d34",
+      "id": "c-ffi-and-python-link",
+      "kind": "gotcha",
+      "links": [
+        "overview",
+        "coppa-engine"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/c-ffi-and-python-link.md",
+      "sources": [
+        "crates/coppa-ffi/src/lib.rs",
+        "crates/coppa-ffi/cbindgen.toml",
+        "crates/coppa-engine/src/link.rs",
+        "bindings/python/coppa/_ffi.py"
+      ],
+      "status": "current",
+      "title": "What will bite you when calling coppa from C or Python?",
+      "verified_commit": "2526b50",
+      "verified_date": "2026-11-03",
+      "visibility": "public"
     }
   ],
   "repo": "coppa",

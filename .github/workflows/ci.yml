@@ -80,6 +80,21 @@ jobs:
           c++ -x c++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -Icrates/coppa-ffi "$dir/hello.c" -Ltarget/debug -lcoppa_ffi -o "$dir/hello_cpp"
           LD_LIBRARY_PATH=target/debug "$dir/hello"
           LD_LIBRARY_PATH=target/debug "$dir/hello_cpp"
+      # COP-139: scenario 2 (readable FFI errors) and the C link API, as C and as C++.
+      - name: C error strings and link example
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/ffi-cop139"; mkdir -p "$dir"
+          for src in crates/coppa-ffi/tests/c/error_strings.c crates/coppa-ffi/examples/c/link_loopback.c; do
+            name=$(basename "$src" .c)
+            cc -std=c11 -Wall -Wextra -Wpedantic -Werror -Icrates/coppa-ffi "$src" -Ltarget/debug -lcoppa_ffi -o "$dir/$name"
+            c++ -x c++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -Icrates/coppa-ffi "$src" -Ltarget/debug -lcoppa_ffi -o "$dir/${name}_cpp"
+            LD_LIBRARY_PATH=target/debug "$dir/$name"
+            LD_LIBRARY_PATH=target/debug "$dir/${name}_cpp"
+          done
+      # COP-139: scenario 1, two Python processes hold a link over a socketpair.
+      - name: Python binding tests
+        run: COPPA_LIB="$PWD/target/debug/libcoppa_ffi.so" python3 -m unittest discover -s bindings/python/tests -v
       # COP-73: run the tutorial's loopback/tx/rx shell blocks and require
       # every stdout line to appear verbatim in the doc, so the tutorial
       # cannot drift from the CLI again (this class has recurred 3 times).
