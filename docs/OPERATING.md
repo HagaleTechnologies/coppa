@@ -304,6 +304,54 @@ Closing the terminal that started a foreground coppad now sends it SIGHUP,
 which reloads instead of killing it. Stop it with Ctrl-C, `kill` or
 `systemctl stop`.
 
+## Running more than one coppad
+
+`coppad --instance NAME` (COP-85) names one daemon of several on a host:
+
+- Without `--config`, it looks for `coppad-NAME.toml` in the places it would
+  look for `coppad.toml` (`./`, the user config directory, `/etc/coppa/`; on
+  Windows `%APPDATA%\coppa\`). With `--config PATH`, the path wins and the
+  name only labels logs and mDNS.
+- Every log line, its PTT guardian's included, starts with `[NAME] `.
+- With `[host] mdns_enabled = true`, it advertises `coppad-NAME.local.` and
+  the service `coppad-NAME._coppa._tcp.local.`.
+- A name is 1 to 32 letters, digits and hyphens, not starting or ending with
+  a hyphen. Anything else is a usage error (exit status 2).
+
+Without `--instance`, file names, log lines and mDNS names are unchanged.
+
+The template unit `contrib/coppad@.service` runs one instance per name:
+`sudo systemctl enable --now coppad@vhf` starts `coppad --instance vhf --config
+/etc/coppa/coppad-vhf.toml`. `contrib/README.md` has the install steps.
+
+Plan the ports: every enabled listener (`vara_command_port`, `vara_data_port`,
+`ardop_command_port`, `ardop_data_port`, `websocket_port`) needs its own port per instance,
+for example 8300/8301 for one and 8310/8311 for the next. A serial port or a
+GPIO line can be held by one instance only. Two instances on one audio device,
+and two mDNS instances on one LAN, have not been tested.
+
+## Running coppad on Windows
+
+Build it with the release feature set:
+
+```powershell
+cargo build --release -p coppa-daemon --features cpal-backend,websocket,kiss-tnc,ardop,mdns,serial-ptt
+```
+
+- Stop it with Ctrl-C. A second Ctrl-C while it stops forces the exit after
+  releasing PTT (status 130). Ctrl-Break, closing the console window and
+  Windows shutting down stop it the same way, logging
+  `Received Ctrl-Break, shutting down`, `Console window closing, shutting down`
+  or `Windows is shutting down; shutting down`.
+- There is no reload: restart coppad to apply a change.
+- Serial PTT is written as `ptt_method = "serial:COM3:dtr"`.
+- The PTT guardian runs in its own process group, so a console Ctrl-C to
+  coppad does not reach it.
+
+No real Windows radio setup (audio device, COM port, rig) has been tested. CI
+builds the release binary and runs a headless smoke test of it
+(`crates/coppa-daemon/tests/runtime_smoke.rs`) on `windows-latest` (COP-85).
+
 ## RX level
 
 `coppad` meters its raw receive audio every 100 ms and logs a line only when

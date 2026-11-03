@@ -1,0 +1,69 @@
+# systemd template unit for running more than one coppad (COP-85):
+# `systemctl enable --now coppad@vhf` runs `coppad --instance vhf` on
+# /etc/coppa/coppad-vhf.toml. Every instance needs its own listener ports,
+# serial port or GPIO line. Apart from Description and ExecStart, this file
+# matches contrib/coppad.service; tests/service_files.rs checks that.
+#
+# Raspberry Pi 4 walkthrough: docs/tutorials/raspberry-pi-install.md
+# Any other systemd host:     contrib/README.md
+#
+# Expects /usr/local/bin/coppad, /etc/coppa/coppad-<instance>.toml readable
+# by group coppa, and a system user and group named coppa.
+
+[Unit]
+Description=Coppa digital modem daemon (coppad instance %i)
+Documentation=https://github.com/HagaleTechnologies/coppa/blob/main/docs/tutorials/raspberry-pi-install.md
+Documentation=https://github.com/HagaleTechnologies/coppa/blob/main/docs/OPERATING.md
+After=network.target sound.target
+# Keep retrying for as long as a failure lasts (for example, an unplugged USB
+# sound card), instead of giving up after a burst of failed starts.
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/coppad --instance %i --config /etc/coppa/coppad-%i.toml
+# COP-85: `systemctl reload coppad` re-reads the config file. Settings that
+# need a restart are named in the journal (docs/OPERATING.md).
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10
+# Plain-text log lines for the journal (coppad colours its output otherwise).
+Environment=NO_COLOR=1
+
+# On stop, systemd sends SIGTERM to coppad, which releases PTT and exits.
+# KillMode=process keeps systemd away from the PTT guardian
+# (coppad --ptt-guardian), which runs in this unit's cgroup. If coppad is
+# still running after TimeoutStopSec, systemd SIGKILLs coppad alone, and the
+# guardian then releases PTT itself. With the default KillMode=control-group
+# that SIGKILL would also kill the guardian. With mixed, the guardian would be
+# SIGKILLed the moment coppad exits.
+KillMode=process
+TimeoutStopSec=20
+
+User=coppa
+Group=coppa
+# Sound cards (audio), serial PTT ports (dialout), sysfs GPIO PTT (gpio).
+# Every group listed must exist. On a host with no "gpio" group (anything
+# other than Raspberry Pi OS), delete it here, or systemd refuses to start
+# coppad with status=216/GROUP.
+SupplementaryGroups=audio dialout gpio
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+# Deliberately not set, because each one breaks audio or PTT:
+#   ProtectKernelTunables  makes /sys read-only, so GPIO PTT writes fail
+#   PrivateDevices         hides /dev/snd and /dev/ttyUSB*, so no audio or serial PTT
+#   ProtectClock, DeviceAllow, DevicePolicy
+#                          below systemd 252, ProtectClock alone denies every
+#                          device except the RTC
+#   DynamicUser            no fixed user to put in the audio/dialout/gpio groups
+
+[Install]
+WantedBy=multi-user.target

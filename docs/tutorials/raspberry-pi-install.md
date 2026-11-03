@@ -325,6 +325,10 @@ journalctl -u coppad -n 5   # a restart_required= line means: sudo systemctl res
 settings a reload applies. Audio devices, PTT method and listener ports need
 `sudo systemctl restart coppad`.
 
+To run a second coppad on the same Pi (for example, one radio on HF and one
+on VHF), use the template unit `contrib/coppad@.service`; see
+"More than one coppad" in `contrib/README.md`.
+
 ## 10. What the unit does
 
 - **Failure:** `Restart=on-failure` with `RestartSec=10` and

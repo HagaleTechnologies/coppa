@@ -689,21 +689,62 @@ impl ConfigEnv {
 /// `HOME` values (the XDG spec says to ignore relative paths). `APPDATA` is
 /// set by the OS and only needs to be non-empty.
 pub fn config_candidates(env: &ConfigEnv) -> Vec<PathBuf> {
-    let mut candidates = vec![PathBuf::from(CONFIG_FILE_NAME)];
+    config_candidates_named(env, CONFIG_FILE_NAME)
+}
+
+/// COP-85: [`config_candidates`] for a file named `file_name` (for an
+/// instance, `coppad-NAME.toml`), in the same directories and order.
+pub fn config_candidates_named(env: &ConfigEnv, file_name: &str) -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from(file_name)];
     if env.windows {
         if let Some(appdata) = non_empty(&env.appdata) {
-            candidates.push(Path::new(appdata).join("coppa").join(CONFIG_FILE_NAME));
+            candidates.push(Path::new(appdata).join("coppa").join(file_name));
         }
     } else {
         let user_dir = rooted(&env.xdg_config_home)
             .map(PathBuf::from)
             .or_else(|| rooted(&env.home).map(|home| Path::new(home).join(".config")));
         if let Some(dir) = user_dir {
-            candidates.push(dir.join("coppa").join(CONFIG_FILE_NAME));
+            candidates.push(dir.join("coppa").join(file_name));
         }
-        candidates.push(PathBuf::from(SYSTEM_CONFIG_PATH));
+        candidates.push(
+            Path::new(SYSTEM_CONFIG_PATH)
+                .parent()
+                .unwrap_or(Path::new("/"))
+                .join(file_name),
+        );
     }
     candidates
+}
+
+/// COP-85: the config file name an instance searches for: `coppad.toml`
+/// without an instance, `coppad-NAME.toml` with one.
+pub fn config_file_name(instance: Option<&str>) -> String {
+    match instance {
+        Some(name) => format!("coppad-{name}.toml"),
+        None => CONFIG_FILE_NAME.to_string(),
+    }
+}
+
+/// The longest `--instance` name.
+pub const MAX_INSTANCE_NAME_CHARS: usize = 32;
+
+/// COP-85: an instance name is 1 to 32 ASCII letters, digits and hyphens,
+/// not starting or ending with a hyphen, so it is safe in a file name, a log
+/// prefix, a systemd `%i` and an mDNS host label.
+pub fn check_instance_name(name: &str) -> Result<(), String> {
+    let valid = (1..=MAX_INSTANCE_NAME_CHARS).contains(&name.len())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !name.starts_with('-')
+        && !name.ends_with('-');
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "use 1 to {MAX_INSTANCE_NAME_CHARS} letters, digits and hyphens, not starting or \
+             ending with a hyphen"
+        ))
+    }
 }
 
 fn non_empty(value: &Option<OsString>) -> Option<&OsStr> {
@@ -2940,5 +2981,70 @@ beacon_interval_secs = 600
             assert!(!label.contains(secret), "{label}");
         }
         assert!(plan.effective.host.websocket_token.is_none());
+    }
+
+    #[test]
+    fn instance_names_are_letters_digits_and_inner_hyphens() {
+        for name in ["hf", "vhf-2", "A1", &"a".repeat(32)] {
+            assert_eq!(check_instance_name(name), Ok(()), "{name}");
+        }
+        for name in [
+            "",
+            "-hf",
+            "hf-",
+            "hf_1",
+            "hf.1",
+            "hf/1",
+            "h\u{e9}",
+            &"a".repeat(33),
+        ] {
+            assert_eq!(
+                check_instance_name(name).unwrap_err(),
+                "use 1 to 32 letters, digits and hyphens, not starting or ending with a hyphen",
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn instance_config_candidates_use_coppad_name_toml() {
+        assert_eq!(config_file_name(None), "coppad.toml");
+        assert_eq!(config_file_name(Some("hf")), "coppad-hf.toml");
+        let unix = ConfigEnv {
+            windows: false,
+            home: Some("/home/op".into()),
+            xdg_config_home: None,
+            appdata: None,
+        };
+        let windows = ConfigEnv {
+            windows: true,
+            home: None,
+            xdg_config_home: None,
+            appdata: Some("C:\\Users\\op\\AppData\\Roaming".into()),
+        };
+        for env in [&unix, &windows] {
+            let named = config_candidates_named(env, &config_file_name(Some("hf")));
+            assert!(!named.is_empty());
+            for path in &named {
+                assert!(path.ends_with("coppad-hf.toml"), "{}", path.display());
+            }
+            let plain = config_candidates(env);
+            assert_eq!(plain.len(), named.len());
+            for (plain, named) in plain.iter().zip(&named) {
+                assert_eq!(plain.parent(), named.parent());
+            }
+        }
+        assert_eq!(
+            config_candidates(&unix),
+            [
+                PathBuf::from("coppad.toml"),
+                PathBuf::from("/home/op/.config/coppa/coppad.toml"),
+                PathBuf::from("/etc/coppa/coppad.toml"),
+            ]
+        );
+        assert_eq!(
+            config_candidates_named(&unix, "coppad-hf.toml").last(),
+            Some(&PathBuf::from("/etc/coppa/coppad-hf.toml"))
+        );
     }
 }

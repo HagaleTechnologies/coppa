@@ -49,21 +49,30 @@ async fn main() -> Result<()> {
 
     match cli.mode() {
         Mode::PrintDefaultConfig => print_default_config(),
-        Mode::Check(source) => check_config(&source),
+        Mode::Check(source) => check_config(&source, cli.instance.as_deref()),
         Mode::Tnc => run_tnc(cli.log_level).await,
         Mode::PttGuardian {
             ptt_method,
             rigctld_address,
-        } => run_ptt_guardian(cli.log_level, ptt_method, rigctld_address).await,
+        } => {
+            run_ptt_guardian(
+                cli.log_level,
+                cli.instance.as_deref(),
+                ptt_method,
+                rigctld_address,
+            )
+            .await
+        }
         Mode::Run(source) => {
+            let instance = cli.instance.as_deref();
             // Load before logging so a config error is the only output.
-            let (config, discovered) = load_config(&source)?;
-            init_tracing(cli.log_level);
+            let (config, discovered) = load_config(&source, instance)?;
+            init_tracing(cli.log_level, instance);
             log_banner();
             log_config_source(&source, discovered.as_ref());
             // COP-32: a fatal error after logging starts is logged at ERROR,
             // then returned so `main` prints `Error: ...` and exits 1.
-            run_daemon(config, source)
+            run_daemon(config, source, cli.instance.clone())
                 .await
                 .inspect_err(|e| tracing::error!("{e:#}"))
         }
@@ -74,7 +83,12 @@ async fn main() -> Result<()> {
 /// without one, the first file found by the COP-49 search is used, falling
 /// back to defaults only when none exists. The search record is returned for
 /// an implicit source only.
-fn load_config(source: &ConfigSource) -> Result<(DaemonConfig, Option<Discovered>)> {
+/// COP-85: with an instance, the implicit search looks for
+/// `coppad-NAME.toml` in the same places.
+fn load_config(
+    source: &ConfigSource,
+    instance: Option<&str>,
+) -> Result<(DaemonConfig, Option<Discovered>)> {
     match source {
         ConfigSource::Explicit(path) => {
             let config = DaemonConfig::load(path)
@@ -82,8 +96,14 @@ fn load_config(source: &ConfigSource) -> Result<(DaemonConfig, Option<Discovered
             Ok((config, None))
         }
         ConfigSource::Implicit => {
-            let discovered =
-                DaemonConfig::discover(&config_candidates(&ConfigEnv::from_process()))?;
+            let env = ConfigEnv::from_process();
+            let candidates = match instance {
+                None => config_candidates(&env),
+                Some(_) => {
+                    config::config_candidates_named(&env, &config::config_file_name(instance))
+                }
+            };
+            let discovered = DaemonConfig::discover(&candidates)?;
             Ok((discovered.config.clone(), Some(discovered)))
         }
     }
@@ -110,8 +130,8 @@ fn log_config_source(source: &ConfigSource, discovered: Option<&Discovered>) {
 /// `--check`: read and deserialize the configuration only. Deliberately
 /// returns before PTT parsing or `EventLoop::new`, which can touch hardware.
 /// For an implicit source it first says which file it checked (COP-49).
-fn check_config(source: &ConfigSource) -> Result<()> {
-    let (_, discovered) = load_config(source)?;
+fn check_config(source: &ConfigSource, instance: Option<&str>) -> Result<()> {
+    let (_, discovered) = load_config(source, instance)?;
     let mut stdout = std::io::stdout().lock();
     if let Some(discovered) = discovered {
         match &discovered.source {
@@ -139,16 +159,32 @@ fn print_default_config() -> Result<()> {
 
 /// Structured logging for the run modes: `--log-level` overrides `RUST_LOG`,
 /// which falls back to `info` when absent or invalid.
-fn init_tracing(level: Option<LogLevel>) {
+/// COP-85: with an instance, every line starts with `[NAME] `.
+fn init_tracing(level: Option<LogLevel>, instance: Option<&str>) {
     let rust_log = std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).ok();
     use tracing_subscriber::prelude::*;
-    let format = tracing_subscriber::fmt::layer().with_ansi(logging::ansi_enabled(
+    let ansi = logging::ansi_enabled(
         std::io::stdout().is_terminal(),
         std::env::var_os("NO_COLOR").as_deref(),
-    ));
+    );
+    let (plain, prefixed) = match instance {
+        None => (Some(tracing_subscriber::fmt::layer().with_ansi(ansi)), None),
+        Some(name) => (
+            None,
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(ansi)
+                    .event_format(logging::InstanceFormat::new(
+                        name,
+                        tracing_subscriber::fmt::format().with_ansi(ansi),
+                    )),
+            ),
+        ),
+    };
     let subscriber = tracing_subscriber::registry()
         .with(cli::log_filter(level, rust_log.as_deref()))
-        .with(format);
+        .with(plain)
+        .with(prefixed);
     #[cfg(feature = "websocket")]
     let subscriber = subscriber.with(ws_log::WsLogLayer::global().clone());
     subscriber.init();
@@ -166,7 +202,7 @@ fn log_banner() {
 /// `--tnc`: the KISS TNC with its own defaults (no daemon config file).
 #[cfg(feature = "kiss-tnc")]
 async fn run_tnc(level: Option<LogLevel>) -> Result<()> {
-    init_tracing(level);
+    init_tracing(level, None);
     log_banner();
     tnc::run_tnc(tnc::TncConfig::default()).await
 }
@@ -182,10 +218,11 @@ async fn run_tnc(_level: Option<LogLevel>) -> Result<()> {
 /// release fails after its bounded retries.
 async fn run_ptt_guardian(
     level: Option<LogLevel>,
+    instance: Option<&str>,
     ptt_method: String,
     rigctld_address: String,
 ) -> Result<()> {
-    init_tracing(level);
+    init_tracing(level, instance);
 
     // Replace the default actions of SIGINT, SIGTERM and SIGHUP for the
     // guardian's whole life: it must outlive the daemon, and only stdin EOF
@@ -199,6 +236,17 @@ async fn run_ptt_guardian(
             signal(SignalKind::interrupt()).context("failed to register SIGINT handler")?,
             signal(SignalKind::terminate()).context("failed to register SIGTERM handler")?,
             signal(SignalKind::hangup()).context("failed to register SIGHUP handler")?,
+        )
+    };
+    // COP-85: the Windows counterpart. The guardian runs in its own process
+    // group, so a console Ctrl-C does not reach it, but a Ctrl-Break or a
+    // Ctrl-C sent to its group must not stop it either.
+    #[cfg(windows)]
+    let (_ctrl_c, _ctrl_break) = {
+        use tokio::signal::windows;
+        (
+            windows::ctrl_c().context("failed to register the Ctrl-C handler")?,
+            windows::ctrl_break().context("failed to register the Ctrl-Break handler")?,
         )
     };
 
@@ -252,8 +300,12 @@ async fn run_ptt_guardian(
 /// from, log which file it read as startup does, validate it with the run
 /// gates plus the PTT-method and frequency parses, and hand it to the event
 /// loop. Any failure is logged and changes nothing.
-fn reload_config(source: &ConfigSource, event_tx: &tokio::sync::mpsc::Sender<DaemonEvent>) {
-    let loaded = load_config(source).and_then(|(config, discovered)| {
+fn reload_config(
+    source: &ConfigSource,
+    instance: Option<&str>,
+    event_tx: &tokio::sync::mpsc::Sender<DaemonEvent>,
+) {
+    let loaded = load_config(source, instance).and_then(|(config, discovered)| {
         log_config_source(source, discovered.as_ref());
         config.check_for_reload().map_err(anyhow::Error::msg)?;
         Ok(config)
@@ -272,7 +324,11 @@ fn reload_config(source: &ConfigSource, event_tx: &tokio::sync::mpsc::Sender<Dae
     }
 }
 
-async fn run_daemon(config: DaemonConfig, source: ConfigSource) -> Result<()> {
+async fn run_daemon(
+    config: DaemonConfig,
+    source: ConfigSource,
+    instance: Option<String>,
+) -> Result<()> {
     if config.engine.callsign.is_empty() {
         tracing::warn!("No callsign configured. Set [engine] callsign in config.");
     }
@@ -307,7 +363,7 @@ async fn run_daemon(config: DaemonConfig, source: ConfigSource) -> Result<()> {
     // Failing to start it is logged, not fatal.
     // COP-50: the guardian's state is kept for the startup summary.
     let guardian = if event_loop.ptt_guardian_eligible() {
-        match ptt_guardian::PttGuardian::spawn(&config.radio) {
+        match ptt_guardian::PttGuardian::spawn(&config.radio, instance.as_deref()) {
             Ok(guardian) => {
                 let pid = guardian.pid().unwrap_or_default();
                 tracing::info!(pid, "PTT guardian started");
@@ -679,8 +735,9 @@ async fn run_daemon(config: DaemonConfig, source: ConfigSource) -> Result<()> {
     let signals = signals::Signals::register()?;
     let force = std::sync::Arc::new(tokio::sync::Notify::new());
     let reload_tx = event_tx.clone();
+    let reload_instance = instance.clone();
     tokio::spawn(signals.run(event_tx.clone(), force.clone(), move || {
-        reload_config(&source, &reload_tx);
+        reload_config(&source, reload_instance.as_deref(), &reload_tx);
     }));
 
     // COP-50: state what startup actually did, then ready or degraded.
@@ -750,11 +807,12 @@ async fn run_daemon(config: DaemonConfig, source: ConfigSource) -> Result<()> {
             let ad = mdns::advertisement(*addr).map_err(|_| {
                 anyhow::anyhow!(mdns::unreachable_bind_address(&addr.ip().to_string()))
             })?;
-            let responder = mdns::Responder::start(&ad)
+            let names = mdns::Names::for_instance(instance.as_deref());
+            let responder = mdns::Responder::start_named(&ad, &names)
                 .map_err(|e| anyhow::anyhow!("failed to start the mDNS responder: {e}"))?;
             tracing::info!(
-                host = %mdns::HOST_NAME,
-                service = %format!("{}.{}", mdns::INSTANCE, mdns::SERVICE_TYPE),
+                host = %names.host,
+                service = %format!("{}.{}", names.instance, mdns::SERVICE_TYPE),
                 port = ad.port,
                 addresses = ?ad.addresses.to_string(),
                 "mDNS advertisement"

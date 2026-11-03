@@ -3,6 +3,7 @@
 | File | What it is |
 |---|---|
 | [`coppad.service`](coppad.service) | systemd unit: runs coppad as the non-root user `coppa`, restarts it on failure, and leaves the PTT guardian alone on stop |
+| [`coppad@.service`](coppad@.service) | systemd template unit: `coppad@NAME` runs `coppad --instance NAME` on `/etc/coppa/coppad-NAME.toml`, for more than one coppad on one host (COP-85) |
 | [`io.github.hagaletechnologies.coppad.plist`](io.github.hagaletechnologies.coppad.plist) | macOS launchd agent: runs coppad in your login session and restarts it on failure |
 
 Neither file has been verified on real hardware yet. For a complete walkthrough
@@ -33,6 +34,25 @@ Most distributions other than Raspberry Pi OS have no `gpio` group. Drop
 `gpio` from the `useradd --groups` list, and delete it from the unit's
 `SupplementaryGroups=` line, or systemd refuses to start coppad with
 `status=216/GROUP`.
+
+### More than one coppad
+
+Each instance reads its own file, `/etc/coppa/coppad-NAME.toml`, and prefixes
+its log lines with `[NAME]`. Give every enabled listener its own port, and
+each instance its own serial port or GPIO line:
+
+```bash
+sudo install -o root -g coppa -m 0640 coppad.toml.example /etc/coppa/coppad-vhf.toml
+sudoedit /etc/coppa/coppad-vhf.toml     # give every enabled listener its own port
+sudo -u coppa coppad --instance vhf --config /etc/coppa/coppad-vhf.toml --check
+sudo install -m 0644 contrib/coppad@.service /etc/systemd/system/coppad@.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now coppad@vhf
+sudo systemctl reload coppad@vhf
+journalctl -u coppad@vhf -f
+```
+
+See `docs/OPERATING.md`, "Running more than one coppad".
 
 ## macOS (LaunchAgent)
 

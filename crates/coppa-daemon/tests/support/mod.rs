@@ -1,13 +1,17 @@
 //! COP-85: helpers shared by the daemon integration tests that run the real
-//! `coppad` binary (`ptt_release.rs`, `reload.rs`). Each test crate uses a
-//! subset, hence the `dead_code` allowance.
+//! `coppad` binary (`ptt_release.rs`, `reload.rs`, `runtime_smoke.rs`): a
+//! recording fake rigctld, temporary directories, free ports and a daemon
+//! runner. Each test crate uses a subset, hence the `dead_code` allowance.
+//! Only `process_alive` and `send_signal` are Unix-only.
 #![allow(dead_code)]
 
 use std::fs::File;
+use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -239,11 +243,55 @@ impl Daemon {
     }
 }
 
+impl Daemon {
+    /// Kill coppad alone (SIGKILL on Unix, TerminateProcess on Windows)
+    /// and reap it.
+    pub fn kill(&mut self) {
+        self.child.kill().expect("kill coppad");
+        self.child.wait().expect("reap coppad");
+        self.reaped = true;
+    }
+
+    /// The guardian's pid, from `PTT guardian started pid=<n>`.
+    pub fn guardian_pid(&self) -> Option<u32> {
+        const STARTED: &str = "PTT guardian started pid=";
+        let output = self.output();
+        let rest = &output[output.find(STARTED)? + STARTED.len()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    }
+}
+
+/// Kill a left-over process by pid, ignoring errors: `kill -KILL` on Unix,
+/// `taskkill /F /PID` on Windows.
+pub fn kill_pid(pid: u32) {
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = Command::new("kill");
+        command.args(["-KILL", &pid.to_string()]);
+        command
+    };
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("taskkill");
+        command.args(["/F", "/PID", &pid.to_string()]);
+        command
+    };
+    #[cfg(any(unix, windows))]
+    let _ = command.stdout(Stdio::null()).stderr(Stdio::null()).status();
+}
+
 impl Drop for Daemon {
     fn drop(&mut self) {
+        let guardian = self.guardian_pid();
         if !self.reaped {
             let _ = self.child.kill();
             let _ = self.child.wait();
+        }
+        // A failing test must not leak the guardian either. A guardian that
+        // already exited is a harmless no-op here.
+        if let Some(pid) = guardian {
+            kill_pid(pid);
         }
     }
 }
@@ -257,4 +305,191 @@ pub fn connect(port: u16) -> TcpStream {
         stream.is_some()
     });
     stream.unwrap_or_else(|| panic!("could not connect to {addr}"))
+}
+
+// ---------------------------------------------------------------------------
+// Fake rigctld
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    Connect,
+    Cmd(String),
+    Eof,
+}
+
+/// One logged event: which connection, what happened, and the rig's PTT
+/// state (`0`/`1`) right after it.
+#[derive(Debug, Clone)]
+pub struct Record {
+    conn: usize,
+    event: Event,
+    ptt: u8,
+}
+
+#[derive(Default)]
+pub struct RigState {
+    ptt: u8,
+    connections: usize,
+    log: Vec<Record>,
+}
+
+/// A rigctld stand-in that accepts any number of connections, answers the
+/// commands `RigctldClient` sends, and records everything. PTT state is
+/// shared across connections, as it is on a real rig.
+pub struct FakeRigctld {
+    addr: SocketAddr,
+    state: Arc<Mutex<RigState>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl FakeRigctld {
+    pub fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake rigctld");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking fake rigctld listener");
+        let addr = listener.local_addr().expect("fake rigctld address");
+        let state = Arc::new(Mutex::new(RigState::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let state = state.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            // BSD/macOS accepted sockets inherit the
+                            // listener's O_NONBLOCK; serve() needs blocking
+                            // reads or WouldBlock reads as EOF.
+                            stream
+                                .set_nonblocking(false)
+                                .expect("blocking fake rigctld stream");
+                            let conn = {
+                                let mut s = state.lock().unwrap();
+                                let conn = s.connections;
+                                s.connections += 1;
+                                let ptt = s.ptt;
+                                s.log.push(Record {
+                                    conn,
+                                    event: Event::Connect,
+                                    ptt,
+                                });
+                                conn
+                            };
+                            let state = state.clone();
+                            thread::spawn(move || serve(conn, stream, &state));
+                        }
+                        Err(_) => thread::sleep(Duration::from_millis(5)),
+                    }
+                }
+            });
+        }
+        Self { addr, state, stop }
+    }
+
+    pub fn address(&self) -> String {
+        self.addr.to_string()
+    }
+
+    pub fn ptt(&self) -> u8 {
+        self.state.lock().unwrap().ptt
+    }
+
+    pub fn connections(&self) -> usize {
+        self.state.lock().unwrap().connections
+    }
+
+    pub fn log(&self) -> Vec<Record> {
+        self.state.lock().unwrap().log.clone()
+    }
+
+    pub fn events(&self, conn: usize) -> Vec<Event> {
+        self.log()
+            .into_iter()
+            .filter(|r| r.conn == conn)
+            .map(|r| r.event)
+            .collect()
+    }
+
+    /// The PTT commands (`T 0`/`T 1`) connection `conn` sent, in order.
+    pub fn ptt_commands(&self, conn: usize) -> Vec<String> {
+        self.events(conn)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Cmd(c) if c.starts_with("T ") => Some(c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether any connection other than the daemon's own (connection 0)
+    /// has sent `T 0`.
+    pub fn another_connection_released(&self) -> bool {
+        self.log()
+            .iter()
+            .any(|r| r.conn > 0 && r.event == Event::Cmd("T 0".to_string()))
+    }
+
+    pub fn has_eof(&self, conn: usize) -> bool {
+        self.events(conn).contains(&Event::Eof)
+    }
+
+    /// The rig's PTT state when connection `conn` closed.
+    pub fn ptt_at_eof(&self, conn: usize) -> Option<u8> {
+        self.log()
+            .into_iter()
+            .find(|r| r.conn == conn && r.event == Event::Eof)
+            .map(|r| r.ptt)
+    }
+}
+
+impl Drop for FakeRigctld {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+fn serve(conn: usize, stream: TcpStream, state: &Mutex<RigState>) {
+    let mut writer = stream.try_clone().expect("clone fake rigctld stream");
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).unwrap_or(0);
+        let mut s = state.lock().unwrap();
+        if n == 0 {
+            let ptt = s.ptt;
+            s.log.push(Record {
+                conn,
+                event: Event::Eof,
+                ptt,
+            });
+            return;
+        }
+        let cmd = line.trim().to_string();
+        let reply = if cmd == "f" {
+            "14074000\n".to_string()
+        } else if cmd == "t" {
+            format!("{}\n", s.ptt)
+        } else if let Some(value) = cmd.strip_prefix("T ") {
+            s.ptt = u8::from(value.trim() != "0");
+            "RPRT 0\n".to_string()
+        } else if cmd == "m" {
+            "USB\n2400\n".to_string()
+        } else {
+            "RPRT 0\n".to_string()
+        };
+        let ptt = s.ptt;
+        s.log.push(Record {
+            conn,
+            event: Event::Cmd(cmd),
+            ptt,
+        });
+        drop(s);
+        if writer.write_all(reply.as_bytes()).is_err() {
+            // The peer is gone; the next read reports the EOF.
+            continue;
+        }
+    }
 }

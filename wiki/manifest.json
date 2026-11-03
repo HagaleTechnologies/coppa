@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-30T11:12:01Z",
-  "head_commit": "4d39fa7",
+  "generated_at": "2026-11-03T17:40:00Z",
+  "head_commit": "2526b50",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -445,7 +445,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:9c525e41700a2dae28aac59a44ab07c2712620a03d8a3aab01d59a701fabdea9",
+      "hash": "sha256:8fc6a50b80a14c5af822cbd0abc7f759b460044997d49b01e0fe563ec0c3599c",
       "id": "mdns-discovery",
       "kind": "gotcha",
       "links": [
@@ -461,8 +461,8 @@
       ],
       "status": "current",
       "title": "What will bite you when testing coppad's mDNS discovery?",
-      "verified_commit": "b9fdb8d",
-      "verified_date": "2026-11-02",
+      "verified_commit": "2526b50",
+      "verified_date": "2026-11-03",
       "visibility": "public"
     },
     {
