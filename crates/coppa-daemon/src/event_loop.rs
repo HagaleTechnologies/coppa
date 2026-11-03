@@ -6,8 +6,8 @@ use anyhow::Result;
 use coppa_audio::{AudioRingConsumer, AudioRingProducer};
 use coppa_engine::{CoppaCore, OfdmBand};
 use coppa_host::vara::{
-    queue_data, queue_response, DataQueued, Queued, VaraCommand, VaraResponse, COMMAND_QUEUE_DEPTH,
-    DATA_QUEUE_DEPTH,
+    queue_data, queue_response, DataQueued, Queued, RigCommand, VaraCommand, VaraResponse,
+    COMMAND_QUEUE_DEPTH, DATA_QUEUE_DEPTH,
 };
 use coppa_host::{HostEvent, HostResponse};
 use coppa_ml::CpRecommendation;
@@ -33,7 +33,7 @@ use crate::audio_output::{
     wait_for_discard, wait_for_playout, IntervalProgress, OutputFeedback, PlayoutWatch, StallClock,
     TxOutput, PROGRESS_TICK,
 };
-use crate::config::DaemonConfig;
+use crate::config::{CwIdPolicy, DaemonConfig};
 use crate::level_meter::{self, LevelReading, LevelState, RxLevelMeter};
 use crate::tx_chunker::{chunk_to_fit, next_chunk_len};
 #[cfg(feature = "ardop")]
@@ -301,13 +301,22 @@ struct PendingDisconnect {
 /// - `COMPRESSION …`, `BW500`, `BW2300`, `BW2750` → `OK`: accepted, not
 ///   implemented (matches VARA's own replies to commands Pat sends every
 ///   session).
-/// - anything else (`PUBLIC`, `CWID`, `CHAT`, `WINLINK SESSION`,
-///   `P2P SESSION`, `CLEANTXBUFFER`, `FOOBAR`, WebSocket JSON, …) → `WRONG`.
-fn vara_reply(command: &VaraCommand) -> VaraResponse {
-    match command {
+/// - `CWID ON`/`CWID OFF` (COP-84) → `OK`, then the closing CW ID is turned
+///   on or off for the whole daemon; `WRONG` when `[station_id] cwid` locks
+///   the other state (`"never"` refuses `ON`, `"always"` refuses `OFF`; see
+///   `cwid_request_allowed`). Any other `CWID` argument → `WRONG`.
+/// - `FREQ [hz]`/`MODE [name]` (coppa extensions, COP-84) → `None` here:
+///   answered after the rig is asked, by `answer_rig_command`.
+/// - anything else (`PUBLIC`, `CHAT`, `WINLINK SESSION`, `P2P SESSION`,
+///   `CLEANTXBUFFER`, `FOOBAR`, WebSocket JSON, …) → `WRONG`.
+fn vara_reply(command: &VaraCommand, cwid: CwIdPolicy) -> Option<VaraResponse> {
+    Some(match command {
         VaraCommand::Version => VaraResponse::coppa_version(),
         VaraCommand::MyCall(call) if Callsign::new(call).is_ok() => VaraResponse::Ok,
         VaraCommand::MyCall(_) | VaraCommand::Unknown(_) => VaraResponse::Wrong,
+        VaraCommand::CwId(on) if cwid_request_allowed(cwid, *on) => VaraResponse::Ok,
+        VaraCommand::CwId(_) => VaraResponse::Wrong,
+        VaraCommand::Rig(_) => return None,
         // COMPRESSION and BW* are accepted but not implemented.
         VaraCommand::Listen(_)
         | VaraCommand::Tune(_)
@@ -316,8 +325,40 @@ fn vara_reply(command: &VaraCommand) -> VaraResponse {
         | VaraCommand::Compression(_)
         | VaraCommand::Bandwidth(_)
         | VaraCommand::Abort => VaraResponse::Ok,
+    })
+}
+
+/// COP-84: whether a host may turn the closing CW ID on (`on`) or off under
+/// `policy`. The single source for both the VARA reply and the apply
+/// decision (`EventLoop::apply_host_cwid`).
+fn cwid_request_allowed(policy: CwIdPolicy, on: bool) -> bool {
+    match policy {
+        CwIdPolicy::Host => true,
+        CwIdPolicy::Always => on,
+        CwIdPolicy::Never => !on,
     }
 }
+
+/// COP-84: the CW ID state in words, for the startup line and change logs.
+fn describe_cw_id(policy: CwIdPolicy, on: bool, wpm: u32) -> String {
+    let state = match (policy, on) {
+        (CwIdPolicy::Host, false) => "off until a host sends CWID ON",
+        (CwIdPolicy::Host, true) => "on, turned on by a host",
+        (_, true) => "on",
+        (_, false) => "off",
+    };
+    format!(
+        "{state} ([station_id] cwid = \"{}\", {wpm} WPM)",
+        policy.as_str()
+    )
+}
+
+/// COP-84: room left inside `[radio] max_tx_duration_s` for what the closing
+/// CW ID's interval may also carry: a prepended station-ID frame (about
+/// 1.4 s, `docs/PAT.md`) and the PTT pre-delay. A DISCONNECT frame plus its
+/// CW ID that would not fit in the limit less this margin goes out without
+/// the CW ID (`EventLoop::with_closing_cw_id`).
+const CW_ID_TX_MARGIN_SECS: f32 = 2.0;
 
 /// Queue `response` for one command-port client without waiting
 /// (`queue_response`). Returns `false` when a line that must not be dropped
@@ -771,6 +812,12 @@ pub struct EventLoop {
     vara_keepalive_period: Duration,
     /// Whether we are listening for incoming connections.
     listening: bool,
+    /// COP-84: whether a CW ID follows the DISCONNECT frame of each session
+    /// this station ends (`with_closing_cw_id`). Daemon-wide: the last host
+    /// to send `CWID ON|OFF` wins. Starts on only under
+    /// `[station_id] cwid = "always"`; a host changes it only under
+    /// `"host"` (`apply_host_cwid`).
+    cw_id_on: bool,
     /// Whether the link is currently mid-transmission (PTT asserted). Gates
     /// `try_drain_tx_queue` so only one frame transmits at a time; set/cleared in
     /// `handle_ptt_change`.
@@ -954,6 +1001,12 @@ impl EventLoop {
         let cp_control_arq_tx = ArqTx::new(cp_control_arq_config)?;
         let cp_control_arq_rx = ArqRx::new(2);
 
+        let cw_id_on = config.station_id.cwid == CwIdPolicy::Always;
+        tracing::info!(
+            "CW ID after each session this station ends: {}",
+            describe_cw_id(config.station_id.cwid, cw_id_on, config.station_id.cwid_wpm)
+        );
+
         Ok(Self {
             config,
             engine,
@@ -1021,6 +1074,7 @@ impl EventLoop {
             local_callsign,
             vara_keepalive_period: VARA_KEEPALIVE_PERIOD,
             listening: false,
+            cw_id_on,
             is_transmitting: false,
             tx_frame_count: 0,
             max_frames_per_turn: 4,
@@ -2466,7 +2520,10 @@ impl EventLoop {
                 Ok(disc_pdu) => {
                     let pdu_bytes = disc_pdu.to_bytes();
                     match self.engine.encode_bytes(&pdu_bytes) {
-                        Ok(samples) => Box::pin(self.transmit_samples(&samples)).await,
+                        Ok(samples) => {
+                            let samples = self.with_closing_cw_id(samples, session_id);
+                            Box::pin(self.transmit_samples(&samples)).await
+                        }
                         Err(e) => {
                             tracing::warn!(error = %e, "Failed to encode DISCONNECT")
                         }
@@ -2496,6 +2553,191 @@ impl EventLoop {
                 .get(id)
                 .is_some_and(|s| s.state != SessionState::Idle)
         })
+    }
+
+    /// COP-84: `frame` with this station's CW ID appended when one is due: CW
+    /// ID is on, a local callsign is in force, and frame + ID fit inside
+    /// what `max_tx_duration_s` leaves of the keyed interval, less the PTT
+    /// pre-delay and `CW_ID_TX_MARGIN_SECS` (otherwise the frame is returned
+    /// alone and a WARN says why). The ID keys the callsign the DISCONNECT
+    /// frame carries: session `session_id`'s own local callsign (a session
+    /// keeps the one it was set up with, even after a later `MYCALL`), else
+    /// the station's. Called only where this station ends a session with a
+    /// DISCONNECT frame (`end_session`, `end_local_disconnect`), before the
+    /// session is removed; `transmit_samples` then gates the whole interval
+    /// as one transmission, so no busy wait can fall between the frame and
+    /// its ID.
+    fn with_closing_cw_id(&self, mut frame: Vec<f32>, session_id: u8) -> Vec<f32> {
+        if !self.cw_id_on {
+            return frame;
+        }
+        let session_call = self.session_mgr.get(session_id).map(|s| &s.local);
+        let Some(callsign) = session_call.or(self.local_callsign.as_ref()) else {
+            return frame;
+        };
+        let wpm = self.config.station_id.cwid_wpm;
+        let rate = self.engine.config().sample_rate;
+        let cw_id = match coppa_engine::morse::cw_id_samples(callsign.as_str(), wpm, rate) {
+            Ok(samples) => samples,
+            // Unreachable for a parsed `Callsign` with its SSID dropped and a
+            // checked `cwid_wpm`; never worth a panic on air.
+            Err(e) => {
+                tracing::warn!(callsign = %callsign, error = %e, "CW ID skipped: cannot key the callsign in Morse");
+                return frame;
+            }
+        };
+        let rate = rate.max(1) as f32;
+        let frame_secs = frame.len() as f32 / rate;
+        let cw_id_secs = cw_id.len() as f32 / rate;
+        let max_tx = self.config.radio.max_tx_duration_s;
+        // A frame that joins an interval already keyed gets only what is
+        // left of the limit (`transmit_samples`' watchdog deadline).
+        let keyed_secs = self
+            .tx_keyed_since
+            .map_or(0.0, |since| since.elapsed().as_secs_f32());
+        let pre_delay_secs = self.config.radio.ptt_pre_delay_ms as f32 / 1000.0;
+        let budget = max_tx as f32 - keyed_secs - pre_delay_secs - CW_ID_TX_MARGIN_SECS;
+        if frame_secs + cw_id_secs > budget {
+            tracing::warn!(
+                "CW ID skipped: the DISCONNECT frame ({frame_secs:.1} s) plus the CW ID \
+                 ({cw_id_secs:.1} s) would exceed [radio] max_tx_duration_s = {max_tx} less a \
+                 {CW_ID_TX_MARGIN_SECS} s margin, the PTT pre-delay and {keyed_secs:.1} s \
+                 already keyed"
+            );
+            return frame;
+        }
+        frame.extend_from_slice(&cw_id);
+        frame
+    }
+
+    /// COP-84: a host's request (`who`: "VARA client 3", "ARDOP client 2") to
+    /// turn the closing CW ID on or off. Applied only under
+    /// `[station_id] cwid = "host"`; a locked policy keeps its state. Returns
+    /// whether the request was allowed (`cwid_request_allowed`); the caller
+    /// logs a refusal in its own protocol's words.
+    fn apply_host_cwid(&mut self, on: bool, who: &str) -> bool {
+        let policy = self.config.station_id.cwid;
+        if !cwid_request_allowed(policy, on) {
+            return false;
+        }
+        if policy == CwIdPolicy::Host && self.cw_id_on != on {
+            self.cw_id_on = on;
+            tracing::info!(
+                "CW ID turned {} by {who}: {}",
+                if on { "on" } else { "off" },
+                describe_cw_id(policy, on, self.config.station_id.cwid_wpm)
+            );
+        }
+        true
+    }
+
+    /// COP-84: why a host's rig set (`FREQ <hz>` when `hz` is `Some`,
+    /// `MODE <name>` otherwise) is refused, checked in this order, or `None`
+    /// when it may go ahead.
+    fn rig_set_refusal(&self, hz: Option<u64>) -> Option<&'static str> {
+        if !self.config.radio.host_rig_control {
+            return Some(
+                "host rig control is off; set [radio] host_rig_control = true to allow it",
+            );
+        }
+        if !self.ptt.is_rigctld() {
+            return Some(
+                "no rigctld connection; rig control needs [radio] ptt_method = \"rigctld\" \
+                 and a reachable rigctld",
+            );
+        }
+        if hz.is_some_and(|hz| hz == 0 || hz > band::MAX_PLAUSIBLE_FREQUENCY_HZ) {
+            return Some("the frequency is 0 or above 30 GHz");
+        }
+        if self.is_transmitting || !self.tx_queue.is_empty() {
+            return Some("this station is transmitting or has transmissions queued");
+        }
+        if self.live_session_id().is_some() {
+            return Some("a session is live (connecting, connected or disconnecting)");
+        }
+        None
+    }
+
+    /// COP-84: answer a `FREQ`/`MODE` line by asking the rig. Blocking
+    /// rigctld I/O on the event-loop task, as `set_ptt` and
+    /// `frequency_evidence` already do: a dead rigctld costs up to ~4 s for a
+    /// query and ~6 s for a set (2 s reconnect + 2 s read each step). Reads
+    /// are honest (`query_frequency`, `query_mode`). A set is refused (WRONG,
+    /// one INFO line with the reason) when `[radio] host_rig_control` is off,
+    /// the backend is not rigctld, the frequency is 0 or above
+    /// `MAX_PLAUSIBLE_FREQUENCY_HZ`, the daemon is transmitting, or a session
+    /// is live (`rig_set_refusal`); otherwise it is sent and read back, and
+    /// the reply is what the rig reports.
+    fn answer_rig_command(&mut self, command: &RigCommand) -> VaraResponse {
+        match command {
+            RigCommand::QueryFrequency => match self.ptt.query_frequency() {
+                Ok(hz) => VaraResponse::Freq(hz),
+                Err(e) => {
+                    tracing::warn!("FREQ: could not read the rig's frequency: {e:#}");
+                    VaraResponse::Wrong
+                }
+            },
+            RigCommand::QueryMode => match self.ptt.query_mode() {
+                Ok(token) => VaraResponse::Mode(token),
+                Err(e) => {
+                    tracing::warn!("MODE: could not read the rig's mode: {e:#}");
+                    VaraResponse::Wrong
+                }
+            },
+            RigCommand::SetFrequency(hz) => {
+                let hz = *hz;
+                if let Some(reason) = self.rig_set_refusal(Some(hz)) {
+                    tracing::info!("FREQ {hz} refused: {reason}");
+                    return VaraResponse::Wrong;
+                }
+                if let Err(e) = self.ptt.set_frequency(hz) {
+                    tracing::warn!("FREQ {hz}: the rig did not accept the set: {e:#}");
+                    return VaraResponse::Wrong;
+                }
+                let readback = match self.ptt.query_frequency() {
+                    Ok(readback) => readback,
+                    Err(e) => {
+                        tracing::warn!("FREQ {hz}: could not read the frequency back: {e:#}");
+                        return VaraResponse::Wrong;
+                    }
+                };
+                if readback != hz {
+                    tracing::warn!("FREQ {hz}: rig reports {readback} Hz after the set");
+                }
+                let wideband = band::gate(self.engine.occupied_bandwidth_hz(), None).is_err();
+                if wideband && readback < band::US_WIDEBAND_MIN_HZ {
+                    tracing::warn!(
+                        "FREQ {hz}: the rig is now below 29.7 MHz; the {} profile's wideband \
+                         gate will refuse every transmission until it is retuned",
+                        self.config.engine.profile
+                    );
+                }
+                VaraResponse::Freq(readback)
+            }
+            RigCommand::SetMode(mode) => {
+                let token = mode.as_str();
+                if let Some(reason) = self.rig_set_refusal(None) {
+                    tracing::info!("MODE {token} refused: {reason}");
+                    return VaraResponse::Wrong;
+                }
+                if let Err(e) = self.ptt.set_mode(token) {
+                    tracing::warn!("MODE {token}: the rig did not accept the set: {e:#}");
+                    return VaraResponse::Wrong;
+                }
+                match self.ptt.query_mode() {
+                    Ok(readback) => {
+                        if readback != token {
+                            tracing::warn!("MODE {token}: rig reports {readback} after the set");
+                        }
+                        VaraResponse::Mode(readback)
+                    }
+                    Err(e) => {
+                        tracing::warn!("MODE {token}: could not read the mode back: {e:#}");
+                        VaraResponse::Wrong
+                    }
+                }
+            }
+        }
     }
 
     /// COP-42: `ABORT`, VARA's dirty disconnect ("Disconnect the link
@@ -2582,7 +2824,10 @@ impl EventLoop {
             // Boxed: `handle_ptt_change` -> `finish_drained_disconnect` ->
             // `transmit_samples` -> `handle_ptt_change` is the same async
             // call cycle `drain_session_link` documents.
-            Ok(samples) => Box::pin(self.transmit_samples(&samples)).await,
+            Ok(samples) => {
+                let samples = self.with_closing_cw_id(samples, pending.session_id);
+                Box::pin(self.transmit_samples(&samples)).await
+            }
             Err(e) => tracing::warn!(error = %e, "Failed to encode DISCONNECT"),
         }
         self.session_mgr.remove(pending.session_id);
@@ -2996,8 +3241,14 @@ impl EventLoop {
                 let command = VaraCommand::parse(&command);
                 // Reply first: it answers the command itself, so it reaches
                 // the client before anything the command causes (TUNE's PTT
-                // lines).
-                self.reply_vara(client_id, vara_reply(&command)).await;
+                // lines). COP-84: a rig command's reply is what the rig says.
+                let reply = match &command {
+                    VaraCommand::Rig(rig) => self.answer_rig_command(rig),
+                    // `vara_reply` is `None` only for `Rig`.
+                    other => vara_reply(other, self.config.station_id.cwid)
+                        .unwrap_or(VaraResponse::Wrong),
+                };
+                self.reply_vara(client_id, reply).await;
                 match command {
                     VaraCommand::Listen(on) => {
                         self.listening = on;
@@ -3032,6 +3283,16 @@ impl EventLoop {
                         }
                     },
                     VaraCommand::Abort => self.abort_session(client_id).await,
+                    VaraCommand::CwId(on) => {
+                        let applied = self.apply_host_cwid(on, &format!("VARA client {client_id}"));
+                        if !applied {
+                            tracing::info!(
+                                "CWID {} refused: [station_id] cwid = \"{}\"",
+                                if on { "ON" } else { "OFF" },
+                                self.config.station_id.cwid.as_str()
+                            );
+                        }
+                    }
                     // VERSION is answered by the reply itself. COMPRESSION
                     // and BW* are accepted but not implemented.
                     // CONNECT/DISCONNECT arrive as
@@ -3502,7 +3763,16 @@ impl EventLoop {
                 }
             }
             ArdopCommand::CwId(on) => {
-                tracing::debug!(on, "CWID recorded; coppa keys no Morse ID");
+                // COP-84: always echoed (a WRONG would break Winlink
+                // Express's init, `docs/ARDOP.md`); applied under
+                // `[station_id] cwid = "host"` only.
+                if !self.apply_host_cwid(on, &format!("ARDOP client {client_id}")) {
+                    tracing::info!(
+                        "ARDOP CWID {} echoed but not applied: [station_id] cwid = \"{}\"",
+                        if on { "TRUE" } else { "FALSE" },
+                        self.config.station_id.cwid.as_str()
+                    );
+                }
                 self.reply_ardop(client_id, ArdopResponse::Echo(line.to_string()))
                     .await;
             }
@@ -11513,6 +11783,8 @@ mod tests {
             "BW2300",
             "BW500",
             "ABORT",
+            "CWID ON",
+            "CWID OFF",
         ];
         let wrong = vec![
             "MYCALL VE3ABCD-15", // 10 chars
@@ -11522,7 +11794,8 @@ mod tests {
             "LISTEN MAYBE",
             "CONNECT W5AU",
             "PUBLIC ON",
-            "CWID ON",
+            "CWID",
+            "CWID TRUE",
             "WINLINK SESSION",
             "P2P SESSION",
             "CLEANTXBUFFER",
@@ -11531,23 +11804,51 @@ mod tests {
         ];
         for line in ok {
             assert_eq!(
-                vara_reply(&VaraCommand::parse(line)),
-                VaraResponse::Ok,
+                vara_reply(&VaraCommand::parse(line), CwIdPolicy::Host),
+                Some(VaraResponse::Ok),
                 "{line:?} should be answered OK"
             );
         }
         for line in wrong {
             assert_eq!(
-                vara_reply(&VaraCommand::parse(line)),
-                VaraResponse::Wrong,
+                vara_reply(&VaraCommand::parse(line), CwIdPolicy::Host),
+                Some(VaraResponse::Wrong),
                 "{line:?} should be answered WRONG"
             );
         }
         assert_eq!(
-            vara_reply(&VaraCommand::parse("VERSION")),
-            VaraResponse::coppa_version(),
+            vara_reply(&VaraCommand::parse("VERSION"), CwIdPolicy::Host),
+            Some(VaraResponse::coppa_version()),
             "VERSION is answered with the version line, never OK"
         );
+        // COP-84: rig commands are answered after the rig is asked.
+        for line in ["FREQ", "FREQ 7074000", "MODE", "MODE USB"] {
+            assert_eq!(
+                vara_reply(&VaraCommand::parse(line), CwIdPolicy::Host),
+                None,
+                "{line:?} is answered by answer_rig_command"
+            );
+        }
+    }
+
+    /// COP-84: `CWID ON|OFF` is refused only when `[station_id] cwid` locks
+    /// the other state.
+    #[test]
+    fn cop84_vara_cwid_reply_follows_the_policy() {
+        for (policy, line, expected) in [
+            (CwIdPolicy::Host, "CWID ON", VaraResponse::Ok),
+            (CwIdPolicy::Host, "CWID OFF", VaraResponse::Ok),
+            (CwIdPolicy::Always, "CWID ON", VaraResponse::Ok),
+            (CwIdPolicy::Always, "CWID OFF", VaraResponse::Wrong),
+            (CwIdPolicy::Never, "CWID ON", VaraResponse::Wrong),
+            (CwIdPolicy::Never, "CWID OFF", VaraResponse::Ok),
+        ] {
+            assert_eq!(
+                vara_reply(&VaraCommand::parse(line), policy),
+                Some(expected),
+                "{policy:?} {line:?}"
+            );
+        }
     }
 
     /// COP-28: a valid `MYCALL` replaces the configured callsign (upper-cased
@@ -12711,13 +13012,13 @@ mod tests {
             lines
         }
 
-        fn session_config() -> DaemonConfig {
+        pub(super) fn session_config() -> DaemonConfig {
             let mut config = fast_ptt_config();
             config.engine.callsign = "VK3ABC".into();
             config
         }
 
-        fn peer() -> coppa_protocol::session::Session {
+        pub(super) fn peer() -> coppa_protocol::session::Session {
             coppa_protocol::session::Session::new(
                 0,
                 Callsign::new("W1AW").unwrap(),
@@ -13291,10 +13592,11 @@ mod tests {
             }
         }
 
-        /// COP-28: Pat's startup burst — commands the parser does not know
-        /// (`PUBLIC`, `CWID`), commands it accepts-but-ignores
-        /// (`COMPRESSION`, `LISTEN`), `MYCALL`, `VERSION` and garbage — each
-        /// gets exactly one reply, in order, and no reply is doubled.
+        /// COP-28: Pat's startup burst — a command the parser does not know
+        /// (`PUBLIC`), `CWID ON` (COP-84: `OK`, it turns on the closing CW
+        /// ID), commands it accepts-but-ignores (`COMPRESSION`, `LISTEN`),
+        /// `MYCALL`, `VERSION` and garbage — each gets exactly one reply, in
+        /// order, and no reply is doubled.
         #[tokio::test]
         async fn pat_startup_commands_each_get_their_reply() {
             let config = fast_ptt_config();
@@ -13323,15 +13625,7 @@ mod tests {
                     let version = format!("VERSION Coppa {}", env!("CARGO_PKG_VERSION"));
                     assert_eq!(
                         replies,
-                        vec![
-                            "WRONG",
-                            "WRONG",
-                            "OK",
-                            "OK",
-                            "OK",
-                            version.trim_end(),
-                            "WRONG",
-                        ],
+                        vec!["WRONG", "OK", "OK", "OK", "OK", version.trim_end(), "WRONG",],
                         "each command gets exactly the reply the table promises"
                     );
                     assert!(
@@ -15460,7 +15754,7 @@ mod tests {
         /// The frame types `CoppaCore` decodes from one keyed interval's
         /// audio, in order. HF_STANDARD, the daemon's default profile:
         /// `CoppaCore::new()` would decode only a station-ID beacon.
-        fn decoded_frame_types(audio: &[f32]) -> Vec<MacFrameType> {
+        pub(super) fn decoded_frame_types(audio: &[f32]) -> Vec<MacFrameType> {
             let mut decoder = coppa_engine::CoppaCore::from_profile(
                 coppa_engine::profiles::get_profile("HF_STANDARD").unwrap(),
             );
@@ -15521,7 +15815,20 @@ mod tests {
             OwnedWriteHalf,
             u8,
         ) {
-            let mut station = EventLoop::new(session_config()).unwrap();
+            draining_station_with(session_config()).await
+        }
+
+        /// `draining_station` on `config` (COP-84 varies `[station_id]`).
+        pub(super) async fn draining_station_with(
+            config: DaemonConfig,
+        ) -> (
+            EventLoop,
+            coppa_audio::AudioRingConsumer,
+            BufReader<OwnedReadHalf>,
+            OwnedWriteHalf,
+            u8,
+        ) {
+            let mut station = EventLoop::new(config).unwrap();
             let (producer, consumer) = coppa_audio::audio_ring(4_000_000);
             station.set_audio_out(producer);
             let (reader, writer) = connect_mock_vara_client_ephemeral(&mut station).await;
@@ -17160,6 +17467,769 @@ mod tests {
     }
 
     // ── COP-40: operating-frequency source and the wideband HF/VHF gate ──
+
+    // ── COP-84: closing CW ID (H-038) ────────────────────────────────────
+
+    mod cop84_cw_id {
+        use super::telemetry::{
+            decoded_frame_types, draining_station_with, peer, seed_established, session_config,
+        };
+        use super::*;
+
+        fn cw_config(policy: CwIdPolicy) -> DaemonConfig {
+            let mut config = session_config();
+            config.station_id.cwid = policy;
+            config
+        }
+
+        /// The CW ID samples `station` keys for `call` at its configured
+        /// speed and engine rate.
+        fn expected_cw_id(station: &EventLoop, call: &str) -> Vec<f32> {
+            coppa_engine::morse::cw_id_samples(
+                call,
+                station.config.station_id.cwid_wpm,
+                station.engine.config().sample_rate,
+            )
+            .unwrap()
+        }
+
+        /// Everything `station` has keyed since the last read.
+        fn keyed_audio(
+            station: &EventLoop,
+            audio_rx: &mut coppa_audio::AudioRingConsumer,
+        ) -> Vec<f32> {
+            station.flush_pending_audio_out();
+            let mut buf = vec![0.0f32; audio_rx.available()];
+            let n = audio_rx.read(&mut buf);
+            buf.truncate(n);
+            buf
+        }
+
+        /// A wired station (VARA client 1) with an established session and
+        /// its startup station ID already sent, so a keyed interval is the
+        /// frame alone.
+        fn established(
+            config: DaemonConfig,
+        ) -> (
+            EventLoop,
+            coppa_audio::AudioRingConsumer,
+            mpsc::Receiver<VaraResponse>,
+        ) {
+            let (mut station, audio_rx, vara_rx) = wired_station(config);
+            mark_identified(&mut station);
+            seed_established(&mut station);
+            (station, audio_rx, vara_rx)
+        }
+
+        /// A host DISCONNECT of the station's established session (nothing
+        /// queued, so it drains at once) and the audio it keyed.
+        async fn local_disconnect_audio(
+            station: &mut EventLoop,
+            audio_rx: &mut coppa_audio::AudioRingConsumer,
+        ) -> Vec<f32> {
+            station
+                .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+                .await;
+            assert!(
+                station.session_mgr.active_sessions().is_empty(),
+                "the drained session must end"
+            );
+            let audio = keyed_audio(station, audio_rx);
+            station.handle_ptt_change(false).await;
+            audio
+        }
+
+        #[tokio::test]
+        async fn cop84_cw_id_follows_the_disconnect_frame_of_a_drained_local_disconnect() {
+            let (mut station, mut consumer, _reader, _writer, id) =
+                draining_station_with(cw_config(CwIdPolicy::Always)).await;
+            assert!(station.cw_id_on);
+            station
+                .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+                .await;
+            let mut buf = vec![0.0f32; 4_000_000];
+            let mut last_interval = Vec::new();
+            for _ in 0..64 {
+                if station.session_mgr.get(id).is_none() {
+                    break;
+                }
+                station.handle_ptt_change(false).await;
+                station.flush_pending_audio_out();
+                let n = consumer.read(&mut buf);
+                if n > 0 {
+                    last_interval = buf[..n].to_vec();
+                }
+                if station
+                    .session_link
+                    .as_ref()
+                    .is_some_and(|l| l.tx.in_flight() > 0)
+                {
+                    ack_in_flight(&mut station).await;
+                }
+            }
+            assert!(station.session_mgr.get(id).is_none(), "the drain must end");
+            let cw_id = expected_cw_id(&station, "VK3ABC");
+            assert!(
+                last_interval.len() > cw_id.len(),
+                "the last interval carries the frame and the ID"
+            );
+            assert!(
+                last_interval.ends_with(&cw_id),
+                "the last keyed interval must end with the CW ID"
+            );
+            let frame = &last_interval[..last_interval.len() - cw_id.len()];
+            assert_eq!(
+                decoded_frame_types(frame).last(),
+                Some(&MacFrameType::Disconnect),
+                "the CW ID follows the DISCONNECT frame"
+            );
+            assert_eq!(
+                decoded_frame_types(&last_interval).last(),
+                Some(&MacFrameType::Disconnect),
+                "the frame still decodes with the CW ID after it"
+            );
+        }
+
+        #[tokio::test]
+        async fn cop84_no_cw_id_under_the_default_policy() {
+            let (mut station, mut audio_rx, _vara_rx) = established(session_config());
+            assert_eq!(station.config.station_id.cwid, CwIdPolicy::Host);
+            assert!(!station.cw_id_on, "off until a host sends CWID ON");
+            let audio = local_disconnect_audio(&mut station, &mut audio_rx).await;
+            let cw_id = expected_cw_id(&station, "VK3ABC");
+            assert_eq!(
+                decoded_frame_types(&audio).last(),
+                Some(&MacFrameType::Disconnect)
+            );
+            assert!(!audio.ends_with(&cw_id));
+            assert!(
+                audio.len() < cw_id.len(),
+                "the interval is the frame alone ({} samples)",
+                audio.len()
+            );
+        }
+
+        #[tokio::test]
+        async fn cop84_cw_id_follows_end_session_for_a_pending_inbound_disconnect() {
+            let (mut station, mut audio_rx, mut vara_rx) =
+                wired_station(cw_config(CwIdPolicy::Always));
+            mark_identified(&mut station);
+            station.listening = true;
+            station
+                .handle_mac_pdu(peer().initiate(std::time::Instant::now()).unwrap())
+                .await;
+            assert_eq!(
+                station.accepting_sessions().len(),
+                1,
+                "a pending inbound attempt"
+            );
+            // The CONNECT_ACK keyed; release it and set its audio aside.
+            keyed_audio(&station, &mut audio_rx);
+            station.handle_ptt_change(false).await;
+            drain_vara(&mut vara_rx);
+
+            station
+                .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+                .await;
+            assert!(station.session_mgr.active_sessions().is_empty());
+            let audio = keyed_audio(&station, &mut audio_rx);
+            let cw_id = expected_cw_id(&station, "VK3ABC");
+            assert!(audio.len() > cw_id.len());
+            assert!(audio.ends_with(&cw_id), "end_session keys the CW ID");
+            assert_eq!(
+                decoded_frame_types(&audio[..audio.len() - cw_id.len()]).last(),
+                Some(&MacFrameType::Disconnect)
+            );
+        }
+
+        #[tokio::test]
+        async fn cop84_cw_id_drops_the_ssid() {
+            let mut config = cw_config(CwIdPolicy::Always);
+            config.engine.callsign = "N1CALL-7".into();
+            let (mut station, mut audio_rx, _vara_rx) = wired_station(config);
+            mark_identified(&mut station);
+            let id = station
+                .session_mgr
+                .create(
+                    Callsign::new("N1CALL-7").unwrap(),
+                    Callsign::new("W1AW").unwrap(),
+                    0,
+                    LinkCapabilities::default(),
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+            let session = station.session_mgr.get_mut(id).unwrap();
+            let req = session.initiate(std::time::Instant::now()).unwrap();
+            let ack = coppa_protocol::session::Session::new(
+                0,
+                Callsign::new("W1AW").unwrap(),
+                Callsign::new("N1CALL-7").unwrap(),
+                0,
+                LinkCapabilities::default(),
+                std::time::Instant::now(),
+            )
+            .handle_connect_req(&req.payload, std::time::Instant::now())
+            .unwrap();
+            session
+                .handle_connect_ack(&ack.payload, std::time::Instant::now())
+                .unwrap();
+            let audio = local_disconnect_audio(&mut station, &mut audio_rx).await;
+            let cw_id = expected_cw_id(&station, "N1CALL");
+            assert_eq!(cw_id, expected_cw_id(&station, "N1CALL-7"));
+            assert!(
+                audio.ends_with(&cw_id),
+                "the CW ID keys N1CALL, not N1CALL-7"
+            );
+        }
+
+        /// The ID keys the callsign the DISCONNECT frame carries: the
+        /// session's own, even after a mid-session `MYCALL`.
+        #[tokio::test]
+        async fn cop84_cw_id_keys_the_sessions_callsign_after_a_mycall() {
+            let (mut station, mut audio_rx, mut vara_rx) =
+                established(cw_config(CwIdPolicy::Always));
+            send_vara_command(&mut station, "MYCALL K2XYZ").await;
+            assert_eq!(drain_vara(&mut vara_rx), [VaraResponse::Ok]);
+            let audio = local_disconnect_audio(&mut station, &mut audio_rx).await;
+            assert!(audio.ends_with(&expected_cw_id(&station, "VK3ABC")));
+            assert!(!audio.ends_with(&expected_cw_id(&station, "K2XYZ")));
+        }
+
+        #[tokio::test]
+        async fn cop84_abort_remote_disconnect_and_tune_key_no_cw_id() {
+            // (a) ABORT sends no frame, so no CW ID either.
+            let (mut station, mut audio_rx, _vara_rx) = established(cw_config(CwIdPolicy::Always));
+            send_vara_command(&mut station, "ABORT").await;
+            assert!(station.session_mgr.active_sessions().is_empty());
+            assert_eq!(transmitted_samples(&station, &mut audio_rx), 0);
+
+            // (b) The remote ends the session: this station sends nothing.
+            let (mut station, mut audio_rx, _vara_rx) = established(cw_config(CwIdPolicy::Always));
+            let id = station.session_mgr.active_sessions()[0];
+            let session = station.session_mgr.get(id).unwrap();
+            // `MacPdu::new` takes the destination first.
+            let disc = MacPdu::new(
+                MacFrameType::Disconnect,
+                session.local.clone(),
+                session.remote.clone(),
+                session.ssid & 0x0F,
+                Vec::new(),
+            );
+            station.handle_incoming_disconnect(disc).await;
+            assert!(station.session_mgr.active_sessions().is_empty());
+            assert_eq!(transmitted_samples(&station, &mut audio_rx), 0);
+
+            // (c) TUNE keys its tone alone.
+            let (mut station, mut audio_rx, _vara_rx) =
+                wired_station(cw_config(CwIdPolicy::Always));
+            mark_identified(&mut station);
+            send_vara_command(&mut station, "TUNE 1").await;
+            let audio = keyed_audio(&station, &mut audio_rx);
+            assert!(!audio.is_empty(), "TUNE keys its tone");
+            assert!(!audio.ends_with(&expected_cw_id(&station, "VK3ABC")));
+        }
+
+        #[tokio::test]
+        async fn cop84_cw_id_is_skipped_with_a_warning_when_it_would_overrun_max_tx() {
+            let logs = LogCapture::default();
+            let _guard = logs.install();
+            let mut config = cw_config(CwIdPolicy::Always);
+            config.radio.max_tx_duration_s = 3;
+            let (mut station, mut audio_rx, _vara_rx) = established(config);
+            let audio = local_disconnect_audio(&mut station, &mut audio_rx).await;
+            let cw_id = expected_cw_id(&station, "VK3ABC");
+            assert_eq!(
+                decoded_frame_types(&audio).last(),
+                Some(&MacFrameType::Disconnect),
+                "the DISCONNECT frame still keys"
+            );
+            assert!(!audio.ends_with(&cw_id));
+            let contents = logs.contents();
+            assert!(contents.contains("CW ID skipped"), "{contents}");
+            assert!(contents.contains("max_tx_duration_s"), "{contents}");
+        }
+
+        #[tokio::test]
+        async fn cop84_startup_logs_the_cw_id_state() {
+            let logs = LogCapture::default();
+            let _guard = logs.install();
+            let _station = EventLoop::new(DaemonConfig::default()).unwrap();
+            let contents = logs.contents();
+            assert!(
+                contents.contains("CW ID after each session this station ends"),
+                "{contents}"
+            );
+            assert!(contents.contains(r#"cwid = "host""#), "{contents}");
+        }
+
+        #[tokio::test]
+        async fn cop84_vara_cwid_on_turns_on_the_closing_id_and_off_turns_it_off() {
+            let (mut station, mut audio_rx, mut vara_rx) = established(session_config());
+            send_vara_command(&mut station, "CWID ON").await;
+            assert_eq!(drain_vara(&mut vara_rx), [VaraResponse::Ok]);
+            assert!(station.cw_id_on);
+            let audio = local_disconnect_audio(&mut station, &mut audio_rx).await;
+            let cw_id = expected_cw_id(&station, "VK3ABC");
+            assert!(audio.ends_with(&cw_id), "CWID ON keys the closing ID");
+
+            seed_established(&mut station);
+            drain_vara(&mut vara_rx);
+            send_vara_command(&mut station, "CWID OFF").await;
+            assert_eq!(drain_vara(&mut vara_rx), [VaraResponse::Ok]);
+            assert!(!station.cw_id_on);
+            let audio = local_disconnect_audio(&mut station, &mut audio_rx).await;
+            assert!(!audio.is_empty(), "the DISCONNECT frame keys");
+            assert!(!audio.ends_with(&cw_id), "CWID OFF keys no ID");
+        }
+
+        #[tokio::test]
+        async fn cop84_locked_policies_refuse_the_opposite_vara_cwid() {
+            let logs = LogCapture::default();
+            let _guard = logs.install();
+            let (mut station, _audio_rx, mut vara_rx) = wired_station(cw_config(CwIdPolicy::Never));
+            send_vara_command(&mut station, "CWID ON").await;
+            assert_eq!(drain_vara(&mut vara_rx), [VaraResponse::Wrong]);
+            assert!(!station.cw_id_on);
+            assert!(
+                logs.contents().contains("CWID ON refused"),
+                "{}",
+                logs.contents()
+            );
+
+            let (mut station, _audio_rx, mut vara_rx) =
+                wired_station(cw_config(CwIdPolicy::Always));
+            send_vara_command(&mut station, "CWID OFF").await;
+            assert_eq!(drain_vara(&mut vara_rx), [VaraResponse::Wrong]);
+            assert!(station.cw_id_on);
+            assert!(
+                logs.contents()
+                    .contains(r#"CWID OFF refused: [station_id] cwid = "always""#),
+                "{}",
+                logs.contents()
+            );
+        }
+
+        #[tokio::test]
+        async fn cop84_last_vara_client_to_send_cwid_wins() {
+            let (mut station, _audio_rx, mut first_rx) = wired_station(session_config());
+            let (second_tx, mut second_rx) = mpsc::channel(64);
+            station
+                .vara_responses
+                .as_ref()
+                .unwrap()
+                .lock()
+                .await
+                .insert(2, second_tx);
+            send_vara_command(&mut station, "CWID ON").await;
+            assert!(station.cw_id_on);
+            station
+                .handle_host_event(HostEvent::VaraCommand {
+                    client_id: 2,
+                    command: "CWID OFF".into(),
+                })
+                .await;
+            assert!(!station.cw_id_on, "the last client to send CWID wins");
+            assert_eq!(drain_vara(&mut first_rx), [VaraResponse::Ok]);
+            assert_eq!(drain_vara(&mut second_rx), [VaraResponse::Ok]);
+        }
+
+        #[cfg(feature = "ardop")]
+        #[tokio::test]
+        async fn cop84_ardop_cwid_true_applies_and_always_echoes() {
+            use coppa_host::ardop::{ArdopResponse, FIRST_ARDOP_CMD_CLIENT_ID};
+            async fn ardop_station(
+                policy: CwIdPolicy,
+            ) -> (EventLoop, mpsc::Receiver<ArdopResponse>) {
+                let mut station = EventLoop::new(cw_config(policy)).unwrap();
+                let (tx, mut rx) = coppa_host::ardop::response_channel();
+                station.set_ardop_responses(Arc::new(Mutex::new(HashMap::from([(
+                    FIRST_ARDOP_CMD_CLIENT_ID,
+                    tx,
+                )]))));
+                station
+                    .handle_ardop_command(FIRST_ARDOP_CMD_CLIENT_ID, "INITIALIZE")
+                    .await;
+                assert_eq!(
+                    rx.recv().await,
+                    Some(ArdopResponse::Echo("INITIALIZE".into()))
+                );
+                (station, rx)
+            }
+            let logs = LogCapture::default();
+            let _guard = logs.install();
+
+            let (mut station, mut rx) = ardop_station(CwIdPolicy::Host).await;
+            station
+                .handle_ardop_command(FIRST_ARDOP_CMD_CLIENT_ID, "CWID TRUE")
+                .await;
+            assert_eq!(
+                rx.recv().await,
+                Some(ArdopResponse::Echo("CWID TRUE".into()))
+            );
+            assert!(station.cw_id_on);
+            station
+                .handle_ardop_command(FIRST_ARDOP_CMD_CLIENT_ID, "CWID FALSE")
+                .await;
+            assert_eq!(
+                rx.recv().await,
+                Some(ArdopResponse::Echo("CWID FALSE".into()))
+            );
+            assert!(!station.cw_id_on);
+
+            let (mut station, mut rx) = ardop_station(CwIdPolicy::Never).await;
+            station
+                .handle_ardop_command(FIRST_ARDOP_CMD_CLIENT_ID, "CWID TRUE")
+                .await;
+            assert_eq!(
+                rx.recv().await,
+                Some(ArdopResponse::Echo("CWID TRUE".into()))
+            );
+            assert!(!station.cw_id_on);
+            assert!(
+                logs.contents().contains("echoed but not applied"),
+                "{}",
+                logs.contents()
+            );
+        }
+    }
+
+    // ── COP-84: host rig control (H-039) ─────────────────────────────────
+
+    mod cop84_rig_control {
+        use super::*;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        #[derive(Default)]
+        struct RigState {
+            frequency: u64,
+            mode: String,
+            ptt: String,
+            seen: Vec<String>,
+        }
+
+        /// A stateful fake rigctld (any number of connections): `f`/`F`,
+        /// `m`/`M`, `t`/`T`, recording every command.
+        struct FakeRig {
+            addr: String,
+            state: Arc<std::sync::Mutex<RigState>>,
+            refuse_sets: Arc<AtomicBool>,
+            mode_error: Arc<AtomicBool>,
+            sticky_frequency: Arc<AtomicBool>,
+        }
+
+        impl FakeRig {
+            fn start(frequency: u64) -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap().to_string();
+                let state = Arc::new(std::sync::Mutex::new(RigState {
+                    frequency,
+                    mode: "PKTLSB".into(),
+                    ptt: "0".into(),
+                    seen: Vec::new(),
+                }));
+                let rig = FakeRig {
+                    addr,
+                    state,
+                    refuse_sets: Arc::new(AtomicBool::new(false)),
+                    mode_error: Arc::new(AtomicBool::new(false)),
+                    sticky_frequency: Arc::new(AtomicBool::new(false)),
+                };
+                let (state, refuse, mode_error, sticky) = (
+                    Arc::clone(&rig.state),
+                    Arc::clone(&rig.refuse_sets),
+                    Arc::clone(&rig.mode_error),
+                    Arc::clone(&rig.sticky_frequency),
+                );
+                std::thread::spawn(move || {
+                    for stream in listener.incoming() {
+                        let Ok(stream) = stream else { return };
+                        let (state, refuse, mode_error, sticky) = (
+                            Arc::clone(&state),
+                            Arc::clone(&refuse),
+                            Arc::clone(&mode_error),
+                            Arc::clone(&sticky),
+                        );
+                        std::thread::spawn(move || {
+                            let mut writer = stream.try_clone().unwrap();
+                            for line in BufReader::new(stream).lines() {
+                                let Ok(line) = line else { break };
+                                let cmd = line.trim().to_string();
+                                let reply = {
+                                    let mut rig = state.lock().unwrap();
+                                    rig.seen.push(cmd.clone());
+                                    let mut words = cmd.split_whitespace();
+                                    match words.next() {
+                                        Some("f") => rig.frequency.to_string(),
+                                        Some("m") if mode_error.load(Ordering::SeqCst) => {
+                                            "RPRT -11".into()
+                                        }
+                                        Some("m") => format!("{}\n2400", rig.mode),
+                                        Some("t") => rig.ptt.clone(),
+                                        Some("T") => {
+                                            rig.ptt = words.next().unwrap_or("0").into();
+                                            "RPRT 0".into()
+                                        }
+                                        Some("F" | "M") if refuse.load(Ordering::SeqCst) => {
+                                            "RPRT -1".into()
+                                        }
+                                        Some("F") => {
+                                            if !sticky.load(Ordering::SeqCst) {
+                                                if let Some(hz) =
+                                                    words.next().and_then(|w| w.parse().ok())
+                                                {
+                                                    rig.frequency = hz;
+                                                }
+                                            }
+                                            "RPRT 0".into()
+                                        }
+                                        Some("M") => {
+                                            rig.mode = words.next().unwrap_or("").into();
+                                            "RPRT 0".into()
+                                        }
+                                        _ => "RPRT -1".into(),
+                                    }
+                                };
+                                if writeln!(writer, "{reply}").is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                });
+                rig
+            }
+
+            fn seen(&self) -> Vec<String> {
+                self.state.lock().unwrap().seen.clone()
+            }
+
+            /// Commands seen from now on: `seen()[mark..]`.
+            fn mark(&self) -> usize {
+                self.seen().len()
+            }
+
+            fn since(&self, mark: usize) -> Vec<String> {
+                self.seen()[mark..].to_vec()
+            }
+        }
+
+        fn rig_config(rig: &FakeRig, host_rig_control: bool) -> DaemonConfig {
+            let mut config = tx_config();
+            config.radio.ptt_method = "rigctld".into();
+            config.radio.rigctld_address = rig.addr.clone();
+            config.radio.ptt_pre_delay_ms = 0;
+            config.radio.ptt_tail_delay_ms = 0;
+            config.radio.host_rig_control = host_rig_control;
+            config
+        }
+
+        async fn ask(
+            station: &mut EventLoop,
+            vara_rx: &mut mpsc::Receiver<VaraResponse>,
+            line: &str,
+        ) -> VaraResponse {
+            send_vara_command(station, line).await;
+            let replies = drain_vara(vara_rx);
+            assert_eq!(replies.len(), 1, "{line:?}: {replies:?}");
+            replies.into_iter().next().unwrap()
+        }
+
+        #[tokio::test]
+        async fn cop84_freq_and_mode_queries_read_the_rig() {
+            let rig = FakeRig::start(14_074_000);
+            let config = rig_config(&rig, false);
+            assert!(!config.radio.host_rig_control, "the default");
+            let (mut station, _audio_rx, mut vara_rx) = wired_station(config);
+            let mark = rig.mark();
+            assert_eq!(
+                ask(&mut station, &mut vara_rx, "FREQ").await,
+                VaraResponse::Freq(14_074_000)
+            );
+            assert_eq!(
+                ask(&mut station, &mut vara_rx, "MODE").await,
+                VaraResponse::Mode("PKTLSB".into())
+            );
+            assert_eq!(rig.since(mark), ["f", "m"]);
+        }
+
+        #[tokio::test]
+        async fn cop84_rig_commands_without_rigctld_are_wrong_with_no_io() {
+            let mut config = tx_config();
+            config.radio.host_rig_control = true;
+            let (mut station, _audio_rx, mut vara_rx) = wired_station(config);
+            for line in ["FREQ", "FREQ 7074000", "MODE", "MODE USB"] {
+                assert_eq!(
+                    ask(&mut station, &mut vara_rx, line).await,
+                    VaraResponse::Wrong,
+                    "{line:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn cop84_sets_are_refused_while_host_rig_control_is_off() {
+            let logs = LogCapture::default();
+            let _guard = logs.install();
+            let rig = FakeRig::start(14_074_000);
+            let (mut station, _audio_rx, mut vara_rx) = wired_station(rig_config(&rig, false));
+            let mark = rig.mark();
+            for line in ["FREQ 7074000", "MODE USB"] {
+                assert_eq!(
+                    ask(&mut station, &mut vara_rx, line).await,
+                    VaraResponse::Wrong,
+                    "{line:?}"
+                );
+            }
+            assert!(rig.since(mark).is_empty(), "{:?}", rig.since(mark));
+            assert!(
+                logs.contents().contains("host rig control is off"),
+                "{}",
+                logs.contents()
+            );
+        }
+
+        #[tokio::test]
+        async fn cop84_freq_set_replies_with_the_readback() {
+            let rig = FakeRig::start(14_074_000);
+            let (mut station, _audio_rx, mut vara_rx) = wired_station(rig_config(&rig, true));
+            let mark = rig.mark();
+            assert_eq!(
+                ask(&mut station, &mut vara_rx, "FREQ 7074000").await,
+                VaraResponse::Freq(7_074_000)
+            );
+            assert_eq!(rig.since(mark), ["F 7074000", "f"]);
+        }
+
+        #[tokio::test]
+        async fn cop84_freq_set_reports_where_the_rig_really_is() {
+            let logs = LogCapture::default();
+            let _guard = logs.install();
+            let rig = FakeRig::start(14_074_000);
+            rig.sticky_frequency.store(true, Ordering::SeqCst);
+            let (mut station, _audio_rx, mut vara_rx) = wired_station(rig_config(&rig, true));
+            assert_eq!(
+                ask(&mut station, &mut vara_rx, "FREQ 7074000").await,
+                VaraResponse::Freq(14_074_000)
+            );
+            assert!(
+                logs.contents().contains("rig reports 14074000 Hz"),
+                "{}",
+                logs.contents()
+            );
+        }
+
+        #[tokio::test]
+        async fn cop84_mode_set_replies_with_the_readback() {
+            let rig = FakeRig::start(14_074_000);
+            let (mut station, _audio_rx, mut vara_rx) = wired_station(rig_config(&rig, true));
+            let mark = rig.mark();
+            assert_eq!(
+                ask(&mut station, &mut vara_rx, "MODE PKTUSB").await,
+                VaraResponse::Mode("PKTUSB".into())
+            );
+            assert_eq!(rig.since(mark), ["M PKTUSB 0", "m"]);
+        }
+
+        #[tokio::test]
+        async fn cop84_rejected_set_and_failed_query_are_wrong() {
+            let rig = FakeRig::start(14_074_000);
+            rig.refuse_sets.store(true, Ordering::SeqCst);
+            rig.mode_error.store(true, Ordering::SeqCst);
+            let (mut station, _audio_rx, mut vara_rx) = wired_station(rig_config(&rig, true));
+            assert_eq!(
+                ask(&mut station, &mut vara_rx, "FREQ 7074000").await,
+                VaraResponse::Wrong
+            );
+            assert_eq!(
+                ask(&mut station, &mut vara_rx, "MODE").await,
+                VaraResponse::Wrong
+            );
+        }
+
+        #[tokio::test]
+        async fn cop84_sets_are_refused_out_of_range_while_transmitting_or_in_session() {
+            let logs = LogCapture::default();
+            let _guard = logs.install();
+            let rig = FakeRig::start(14_074_000);
+            let (mut station, _audio_rx, mut vara_rx) = wired_station(rig_config(&rig, true));
+            let mark = rig.mark();
+            for line in ["FREQ 0", "FREQ 30000000001"] {
+                assert_eq!(
+                    ask(&mut station, &mut vara_rx, line).await,
+                    VaraResponse::Wrong,
+                    "{line:?}"
+                );
+            }
+            assert!(logs
+                .contents()
+                .contains("the frequency is 0 or above 30 GHz"));
+
+            station.is_transmitting = true;
+            assert_eq!(
+                ask(&mut station, &mut vara_rx, "FREQ 7074000").await,
+                VaraResponse::Wrong
+            );
+            assert!(logs.contents().contains("this station is transmitting"));
+            station.is_transmitting = false;
+
+            let id = station
+                .session_mgr
+                .create(
+                    Callsign::new(TEST_CALLSIGN).unwrap(),
+                    Callsign::new("W1AW").unwrap(),
+                    0,
+                    LinkCapabilities::default(),
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+            station
+                .session_mgr
+                .get_mut(id)
+                .unwrap()
+                .initiate(std::time::Instant::now())
+                .unwrap();
+            assert_eq!(station.live_session_id(), Some(id));
+            for line in ["FREQ 7074000", "MODE USB"] {
+                assert_eq!(
+                    ask(&mut station, &mut vara_rx, line).await,
+                    VaraResponse::Wrong,
+                    "{line:?}"
+                );
+            }
+            assert!(logs.contents().contains("a session is live"));
+            let sets: Vec<String> = rig
+                .since(mark)
+                .into_iter()
+                .filter(|c| c.starts_with('F') || c.starts_with('M'))
+                .collect();
+            assert!(sets.is_empty(), "no set may reach the rig: {sets:?}");
+        }
+
+        #[tokio::test]
+        async fn cop84_a_host_retune_below_29_7_mhz_closes_the_wideband_gate() {
+            let logs = LogCapture::default();
+            let _guard = logs.install();
+            let rig = FakeRig::start(144_500_000);
+            let mut config = rig_config(&rig, true);
+            config.engine.profile = "VHF_FAST".into();
+            config.audio.sample_rate = 100_000_000;
+            config.audio.buffer_size = 0;
+            let (mut station, mut audio_rx, mut vara_rx) = wired_station(config);
+            assert_eq!(
+                ask(&mut station, &mut vara_rx, "FREQ 14074000").await,
+                VaraResponse::Freq(14_074_000)
+            );
+            assert!(
+                logs.contents().contains("wideband gate will refuse"),
+                "{}",
+                logs.contents()
+            );
+            send_vara_command(&mut station, "TUNE 1").await;
+            assert_eq!(transmitted_samples(&station, &mut audio_rx), 0);
+            assert!(logs.contents().contains("97.307"), "{}", logs.contents());
+        }
+    }
 
     mod cop40_frequency_gate {
         use super::*;
