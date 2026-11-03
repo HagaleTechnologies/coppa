@@ -17615,7 +17615,9 @@ mod tests {
                 wired_station(cw_config(CwIdPolicy::Always));
             mark_identified(&mut station);
             station.listening = true;
-            station.handle_mac_pdu(peer().initiate().unwrap()).await;
+            station
+                .handle_mac_pdu(peer().initiate(std::time::Instant::now()).unwrap())
+                .await;
             assert_eq!(
                 station.accepting_sessions().len(),
                 1,
@@ -17653,20 +17655,24 @@ mod tests {
                     Callsign::new("W1AW").unwrap(),
                     0,
                     LinkCapabilities::default(),
+                    std::time::Instant::now(),
                 )
                 .unwrap();
             let session = station.session_mgr.get_mut(id).unwrap();
-            let req = session.initiate().unwrap();
+            let req = session.initiate(std::time::Instant::now()).unwrap();
             let ack = coppa_protocol::session::Session::new(
                 0,
                 Callsign::new("W1AW").unwrap(),
                 Callsign::new("N1CALL-7").unwrap(),
                 0,
                 LinkCapabilities::default(),
+                std::time::Instant::now(),
             )
-            .handle_connect_req(&req.payload)
+            .handle_connect_req(&req.payload, std::time::Instant::now())
             .unwrap();
-            session.handle_connect_ack(&ack.payload).unwrap();
+            session
+                .handle_connect_ack(&ack.payload, std::time::Instant::now())
+                .unwrap();
             let audio = local_disconnect_audio(&mut station, &mut audio_rx).await;
             let cw_id = expected_cw_id(&station, "N1CALL");
             assert_eq!(cw_id, expected_cw_id(&station, "N1CALL-7"));
@@ -18174,9 +18180,15 @@ mod tests {
                     Callsign::new("W1AW").unwrap(),
                     0,
                     LinkCapabilities::default(),
+                    std::time::Instant::now(),
                 )
                 .unwrap();
-            station.session_mgr.get_mut(id).unwrap().initiate().unwrap();
+            station
+                .session_mgr
+                .get_mut(id)
+                .unwrap()
+                .initiate(std::time::Instant::now())
+                .unwrap();
             assert_eq!(station.live_session_id(), Some(id));
             for line in ["FREQ 7074000", "MODE USB"] {
                 assert_eq!(

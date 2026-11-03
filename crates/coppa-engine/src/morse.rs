@@ -34,7 +34,12 @@ pub enum MorseError {
     Empty,
     /// The text has more than [`MAX_TEXT_CHARS`] characters.
     #[error("text is {len} characters; at most {max} can be keyed")]
-    TooLong { len: usize, max: usize },
+    TooLong {
+        /// Characters in the text.
+        len: usize,
+        /// The most that can be keyed, [`MAX_TEXT_CHARS`].
+        max: usize,
+    },
     /// A character with no Morse pattern (only `A-Z`, `0-9` and `/` key).
     #[error("character {0:?} has no Morse pattern (A-Z, 0-9 and / only)")]
     UnsupportedCharacter(char),
