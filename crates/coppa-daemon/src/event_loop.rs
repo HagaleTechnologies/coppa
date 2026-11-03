@@ -35,7 +35,7 @@ use crate::audio_output::{
 };
 use crate::config::DaemonConfig;
 use crate::level_meter::{self, LevelReading, LevelState, RxLevelMeter};
-use crate::tx_chunker::{chunk_to_fit, next_chunk_len};
+use crate::tx_chunker::{chunk_to_fit, next_chunk_len, next_growing_chunk_len};
 #[cfg(feature = "ardop")]
 use coppa_host::ardop::{
     queue_response as queue_ardop_response, ArdopCommand, ArdopResponse, Queued as ArdopQueued,
@@ -197,6 +197,16 @@ fn local_link_caps() -> LinkCapabilities {
         ..LinkCapabilities::default()
     }
 }
+
+/// COP-110: the most raw host bytes one multi-codeword session frame takes.
+/// A compressible chunk may grow past its raw-byte target, but the peer
+/// rejects any frame whose Huffman stage exceeds `MAX_DECOMPRESS_SIZE`
+/// (16 KiB, `coppa-protocol/src/compression/lz4.rs`, `docs/SPEC.md`
+/// §15.4). The fixed Huffman table at worst doubles its input (every byte
+/// escaped to 16 bits, as for zeros), so 4096 raw bytes stay at half that
+/// limit. 8192 zeros measured as rejected. 4096 is also one maximum host
+/// read, so one usual write drains in one frame.
+const SESSION_MAX_CHUNK_BYTES: usize = 4096;
 
 /// COP-38 (D2): the established session's reliable-delivery state. One per
 /// `EventLoop`: every daemon caller treats the session link as singular.
@@ -2024,16 +2034,17 @@ impl EventLoop {
         if !ready || self.session_tx_held_by_frequency_gate {
             return;
         }
-        // COP-69: the per-frame codeword count. Gated by the negotiated
+        // COP-69: the per-frame codeword count, gated by the negotiated
         // `multi_frame_ack` capability (a peer that did not advertise it
         // gets today's exact 1-codeword frames) and capped by `[session]
-        // max_codewords_per_frame`; the count itself is ceil(needed /
-        // per-codeword budget), `needed` being the backlog plus the 21 B
-        // MAC + transport headers -- an upper bound, since compression only
-        // shrinks the framed chunk, so the frame always fits the count's
-        // budget while a full backlog reaches the cap.
+        // max_codewords_per_frame`. COP-110: the compressed frame, not the
+        // raw backlog, decides the count. Compression can shrink a chunk
+        // (914 B of zeros become 53 B) or grow it (518 B of random data
+        // become 935 B at level 2), so the chunk is cut against the cap's
+        // full budget first, may grow past the raw target while it still
+        // fits (up to `SESSION_MAX_CHUNK_BYTES`), and the count is the
+        // fewest codewords whose budget holds the encoded frame.
         let level = self.engine.speed_level();
-        let backlog_len = self.session_link.as_ref().map_or(0, |l| l.backlog.len());
         let negotiated_multi = self
             .session_link
             .as_ref()
@@ -2049,13 +2060,9 @@ impl EventLoop {
         } else {
             1
         };
-        let per_cw = max_payload_for_level(level)
+        let cap_budget = max_multi_payload_for_level(level, cap)
             .expect("the engine's speed level is always a valid wire level");
-        let needed = backlog_len + MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE;
-        let codewords = needed.div_ceil(per_cw).clamp(1, cap as usize) as u8;
-        let budget = max_multi_payload_for_level(level, codewords)
-            .expect("the engine's speed level is always a valid wire level");
-        let (seq, take, frame) = {
+        let (seq, take, frame, codewords) = {
             let Some(link) = self.session_link.as_mut() else {
                 return;
             };
@@ -2063,24 +2070,38 @@ impl EventLoop {
             let link = &*link;
             let seq = link.tx.next_seq();
             let engine = &self.engine;
-            let take = next_chunk_len(
-                link.backlog.as_slices().0,
-                MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE,
-                budget,
-                |c| {
-                    engine.encoded_payload_len_with_codewords(
-                        &session_data_frame(link, seq, c),
-                        codewords,
-                    ) <= budget
-                },
-            );
-            let chunk: Vec<u8> = link.backlog.iter().take(take).copied().collect();
-            (seq, take, session_data_frame(link, seq, &chunk))
+            let backlog = link.backlog.as_slices().0;
+            let header_len = MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE;
+            let fits = |c: &[u8]| {
+                engine.encoded_payload_len_with_codewords(&session_data_frame(link, seq, c), cap)
+                    <= cap_budget
+            };
+            let take = if cap == 1 {
+                next_chunk_len(backlog, header_len, cap_budget, fits)
+            } else {
+                next_growing_chunk_len(
+                    backlog,
+                    header_len,
+                    cap_budget,
+                    SESSION_MAX_CHUNK_BYTES,
+                    fits,
+                )
+            };
+            let frame = session_data_frame(link, seq, &backlog[..take]);
+            let codewords = if cap == 1 {
+                1
+            } else {
+                let encoded = engine.encoded_payload_len_with_codewords(&frame, cap);
+                (1..=cap)
+                    .find(|&c| max_multi_payload_for_level(level, c).is_some_and(|b| b >= encoded))
+                    .unwrap_or(cap)
+            };
+            (seq, take, frame, codewords)
         };
         let samples = match self.engine.encode_bytes_with_codewords(&frame, codewords) {
             Ok(samples) => samples,
             Err(e) => {
-                // Unreachable for a chunk `next_chunk_len` sized; the bytes
+                // Unreachable for a chunk sized against `cap_budget`; the bytes
                 // stay in the backlog.
                 tracing::error!(error = %e, seq, "Failed to encode session data");
                 return;
@@ -8747,6 +8768,10 @@ mod tests {
     async fn oversized_segment_holds_at_current_level() {
         let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
         fast_session_rto(&mut a);
+        // COP-110: one codeword per frame, so the 120 B segment stays a
+        // 1-codeword frame too big for any lower level (with 2 codewords,
+        // level 2's 234 B budget would hold it).
+        a.config.session.max_codewords_per_frame = 1;
         a.engine.set_speed_level(4).expect("level 4 on HF");
         let data: Vec<u8> = (0..120).map(|i| (i % 251) as u8).collect();
         a.handle_host_event(HostEvent::DataReceived { client_id: 1, data })
@@ -15064,6 +15089,13 @@ mod tests {
                 "the segment must fill (not exceed) the 8-codeword budget"
             );
             assert!(
+                event_loop
+                    .engine
+                    .encoded_payload_len_with_codewords(&session_data_frame(link, seq, segment), 8)
+                    > max_multi_payload_for_level(8, 7).unwrap(),
+                "the segment must need all 8 codewords, not fit 7"
+            );
+            assert!(
                 !link.backlog.is_empty(),
                 "2000 B cannot fit one frame; the remainder must stay backlogged"
             );
@@ -15093,15 +15125,194 @@ mod tests {
         #[tokio::test]
         async fn drain_session_link_small_backlog_stays_single() {
             let (mut event_loop, mut consumer) = cop69_station();
+            let data = cop69_incompressible(40);
+            assert!(
+                cop69_framed_len(&event_loop, &data) <= max_payload_for_level(8).unwrap(),
+                "precondition: the framed, compressed write fits one codeword"
+            );
             event_loop
-                .handle_host_event(HostEvent::DataReceived {
-                    client_id: 1,
-                    data: cop69_incompressible(100),
-                })
+                .handle_host_event(HostEvent::DataReceived { client_id: 1, data })
                 .await;
             let audio = read_all(&mut consumer);
             let (header, _) = cop69_decode(&audio);
             assert_eq!(header.codewords, 1, "a small backlog must stay 1-codeword");
+        }
+
+        /// COP-110 test rig: the encoded (framed and compressed) length of a
+        /// session frame carrying `data` as the link's next segment, the
+        /// measure the drain sizes codewords by.
+        fn cop69_framed_len(event_loop: &EventLoop, data: &[u8]) -> usize {
+            let link = event_loop.session_link.as_ref().unwrap();
+            let frame = session_data_frame(link, link.tx.next_seq(), data);
+            event_loop
+                .engine
+                .encoded_payload_len_with_codewords(&frame, 1)
+        }
+
+        /// COP-110 test rig: the encoded length of the in-flight segment's
+        /// frame, exactly as it went out.
+        fn cop69_in_flight_encoded_len(event_loop: &EventLoop) -> usize {
+            let link = event_loop.session_link.as_ref().unwrap();
+            let seq = link.tx.send_base();
+            let segment = link.tx.get_segment_data(seq).unwrap();
+            event_loop
+                .engine
+                .encoded_payload_len_with_codewords(&session_data_frame(link, seq, segment), 1)
+        }
+
+        /// COP-110 test rig: the fewest codewords at `level` whose budget
+        /// holds `encoded` bytes.
+        fn cop69_fewest_codewords(level: u8, encoded: usize) -> u8 {
+            (1..=MAX_CODEWORDS)
+                .find(|&c| max_multi_payload_for_level(level, c).is_some_and(|b| b >= encoded))
+                .expect("some count up to MAX_CODEWORDS holds the frame")
+        }
+
+        /// COP-110: the codeword count follows the compressed frame, not the
+        /// raw backlog. 914 B of zeros compress to one codeword's worth, and
+        /// 914 B of B2F-like text to a few, so neither pays for 8.
+        #[tokio::test]
+        async fn drain_session_link_uses_the_fewest_codewords_the_compressed_frame_needs() {
+            let (mut event_loop, mut consumer) = cop69_station();
+            event_loop.engine.set_speed_level(2).unwrap();
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0u8; 914],
+                })
+                .await;
+            let (header, _) = cop69_decode(&read_all(&mut consumer));
+            assert_eq!(header.codewords, 1, "914 B of zeros fit one codeword");
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx_codewords, 1);
+            assert!(link.backlog.is_empty(), "the whole write fits the frame");
+
+            let text: Vec<u8> = b"FC EM 12345ABCDE_W1AW 1234 567 0\rSubject: Weekly net report\r\n\
+                Body: Check-ins from the district were steady this week.\r\n"
+                .iter()
+                .copied()
+                .cycle()
+                .take(914)
+                .collect();
+            let (mut event_loop, mut consumer) = cop69_station();
+            event_loop.engine.set_speed_level(2).unwrap();
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: text,
+                })
+                .await;
+            let (header, _) = cop69_decode(&read_all(&mut consumer));
+            let expected = cop69_fewest_codewords(2, cop69_in_flight_encoded_len(&event_loop));
+            assert_eq!(
+                header.codewords, expected,
+                "the fewest codewords that hold the frame"
+            );
+            assert!(
+                header.codewords < 8,
+                "compressible text must not pay for 8 codewords"
+            );
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx_codewords, expected);
+            assert!(link.backlog.is_empty(), "the whole write fits the frame");
+        }
+
+        /// COP-110: a compressible backlog fills the frame past the raw
+        /// target (`budget - 22`, 914 B at level 2 with 8 codewords): 2500 B
+        /// of zeros go out whole in one 1-codeword frame.
+        #[tokio::test]
+        async fn drain_session_link_grows_the_chunk_past_the_raw_budget() {
+            let (mut event_loop, mut consumer) = cop69_station();
+            event_loop.engine.set_speed_level(2).unwrap();
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![0u8; 2500],
+                })
+                .await;
+            let (header, _) = cop69_decode(&read_all(&mut consumer));
+            assert_eq!(header.codewords, 1);
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx.in_flight(), 1);
+            let segment = link.tx.get_segment_data(link.tx.send_base()).unwrap();
+            assert_eq!(segment.len(), 2500, "the chunk must grow past 914 B");
+            assert!(link.backlog.is_empty());
+        }
+
+        /// COP-110: a grown chunk stops at `SESSION_MAX_CHUNK_BYTES`, so the
+        /// peer's decompressor (16 KiB Huffman-stage limit) always accepts
+        /// it: the frame decodes back to exactly the first 4096 bytes.
+        #[tokio::test]
+        async fn drain_session_link_caps_a_grown_chunk_at_what_the_peer_can_decompress() {
+            let (mut event_loop, mut consumer) = cop69_station();
+            event_loop.engine.set_speed_level(2).unwrap();
+            let data = vec![0u8; 6000];
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: data.clone(),
+                })
+                .await;
+            let audio = read_all(&mut consumer);
+            let link = event_loop.session_link.as_ref().unwrap();
+            let segment = link.tx.get_segment_data(link.tx.send_base()).unwrap();
+            assert_eq!(segment.len(), SESSION_MAX_CHUNK_BYTES);
+            assert_eq!(link.backlog.len(), data.len() - SESSION_MAX_CHUNK_BYTES);
+            let decoded = event_loop
+                .engine
+                .decode_bytes(&audio)
+                .expect("the peer must decode and decompress the frame");
+            let mac = MacPdu::from_bytes(&decoded).expect("a MAC data frame");
+            let transport = TransportPdu::from_bytes(&mac.payload).expect("a transport PDU");
+            assert_eq!(transport.payload, data[..SESSION_MAX_CHUNK_BYTES]);
+        }
+
+        /// COP-110: an incompressible write that grows past one codeword
+        /// once compressed goes out whole in the fewest codewords that hold
+        /// it, instead of a 1-codeword frame and a second frame for the rest.
+        #[tokio::test]
+        async fn drain_session_link_sends_a_small_incompressible_write_in_one_frame() {
+            let (mut event_loop, mut consumer) = cop69_station();
+            let data = cop69_incompressible(100);
+            let encoded = cop69_framed_len(&event_loop, &data);
+            assert!(
+                encoded > max_payload_for_level(8).unwrap(),
+                "precondition: the framed, compressed write exceeds one codeword"
+            );
+            event_loop
+                .handle_host_event(HostEvent::DataReceived { client_id: 1, data })
+                .await;
+            let (header, _) = cop69_decode(&read_all(&mut consumer));
+            assert_eq!(header.codewords, cop69_fewest_codewords(8, encoded));
+            assert!(header.codewords >= 2);
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert!(link.backlog.is_empty(), "the write goes out in one frame");
+        }
+
+        /// COP-110: an incompressible remainder that fits the cap's budget
+        /// once compressed goes out as one frame. The raw-byte count used to
+        /// pick 5 codewords for 467 B at level 2 and leave bytes behind.
+        #[tokio::test]
+        async fn drain_session_link_sends_an_incompressible_remainder_as_one_frame() {
+            let (mut event_loop, mut consumer) = cop69_station();
+            event_loop.engine.set_speed_level(2).unwrap();
+            let data = cop69_incompressible(467);
+            let encoded = cop69_framed_len(&event_loop, &data);
+            assert!(
+                encoded <= max_multi_payload_for_level(2, 8).unwrap(),
+                "precondition: the framed, compressed write fits 8 codewords"
+            );
+            event_loop
+                .handle_host_event(HostEvent::DataReceived { client_id: 1, data })
+                .await;
+            let (header, _) = cop69_decode(&read_all(&mut consumer));
+            assert_eq!(header.codewords, cop69_fewest_codewords(2, encoded));
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx.in_flight(), 1);
+            assert!(
+                link.backlog.is_empty(),
+                "the remainder goes out in one frame"
+            );
         }
 
         /// COP-69: without the negotiated capability the session link keeps
@@ -19222,19 +19433,10 @@ mod tests {
                 "status: {:?}",
                 run.a_status
             );
-            // A frame's host-byte capacity is the session link's codeword
-            // budget (per-codeword budget x the negotiated/capped codeword
-            // count) minus the 14-byte MAC and 7-byte transport headers
-            // minus one. Before COP-69 this was 95 (level 2, one codeword);
-            // this rig's default engine is level 1 (56 B per codeword) and
-            // the pair now negotiates 8-codeword frames.
-            let per_cw = max_payload_for_level(1).unwrap();
-            let capacity = per_cw * 8 - MacPdu::HEADER_SIZE - TRANSPORT_HEADER_SIZE - 1;
-            assert!(
-                run.delivered.len() >= payload.len().div_ceil(capacity),
-                "{} frames",
-                run.delivered.len()
-            );
+            // COP-110: a frame's host-byte capacity depends on how the data
+            // compresses (the session link sizes frames after compression),
+            // so the test only asserts the write needed more than one frame.
+            assert!(run.delivered.len() >= 2, "{} frames", run.delivered.len());
             assert_eq!(run.a_in_flight, 0);
             assert_eq!(run.a_buffered, 0);
         }
