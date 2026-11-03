@@ -64,6 +64,14 @@ async fn main() -> Result<()> {
             .await
         }
         Mode::Run(source) => {
+            // COP-85: from here on SIGHUP never kills coppad, even before
+            // the reload handler runs (`systemctl reload` during startup is
+            // ignored). Tokio keeps the handler installed for the life of
+            // the process.
+            #[cfg(unix)]
+            let _startup_hangup =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                    .context("failed to register the SIGHUP handler")?;
             let instance = cli.instance.as_deref();
             // Load before logging so a config error is the only output.
             let (config, discovered) = load_config(&source, instance)?;
@@ -297,30 +305,53 @@ async fn run_ptt_guardian(
 }
 
 /// COP-85: SIGHUP. Re-read the configuration source the daemon started
-/// from, log which file it read as startup does, validate it with the run
-/// gates plus the PTT-method and frequency parses, and hand it to the event
-/// loop. Any failure is logged and changes nothing.
-fn reload_config(
-    source: &ConfigSource,
-    instance: Option<&str>,
-    event_tx: &tokio::sync::mpsc::Sender<DaemonEvent>,
+/// from, log which file it read as startup does, and validate it with the
+/// run gates plus the PTT-method and frequency parses. Blocking file I/O:
+/// run it off the async workers. An implicit search that now finds no file
+/// is refused rather than reverting every setting to the built-in defaults.
+fn load_for_reload(source: &ConfigSource, instance: Option<&str>) -> Result<DaemonConfig> {
+    let (config, discovered) = load_config(source, instance)?;
+    if let Some(discovered) = discovered.as_ref().filter(|d| d.source.is_none()) {
+        anyhow::bail!(
+            "no configuration file found (searched: {})",
+            discovered.search_summary()
+        );
+    }
+    log_config_source(source, discovered.as_ref());
+    config.check_for_reload().map_err(anyhow::Error::msg)?;
+    Ok(config)
+}
+
+/// COP-85: serve reload requests one at a time, in arrival order, so an
+/// older file is never applied after a newer one. Each accepted file goes to
+/// the event loop as `DaemonEvent::Reload`; a refused one changes nothing.
+async fn serve_reloads(
+    mut requests: tokio::sync::mpsc::UnboundedReceiver<()>,
+    source: ConfigSource,
+    instance: Option<String>,
+    event_tx: tokio::sync::mpsc::Sender<DaemonEvent>,
 ) {
-    let loaded = load_config(source, instance).and_then(|(config, discovered)| {
-        log_config_source(source, discovered.as_ref());
-        config.check_for_reload().map_err(anyhow::Error::msg)?;
-        Ok(config)
-    });
-    match loaded {
-        Ok(config) => {
-            let tx = event_tx.clone();
-            tokio::spawn(async move {
-                let _ = tx.send(DaemonEvent::Reload(Box::new(config))).await;
-            });
+    while requests.recv().await.is_some() {
+        let (source, instance) = (source.clone(), instance.clone());
+        let loaded =
+            tokio::task::spawn_blocking(move || load_for_reload(&source, instance.as_deref()))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("reload task failed: {e}")));
+        match loaded {
+            Ok(config) => {
+                if event_tx
+                    .send(DaemonEvent::Reload(Box::new(config)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(e) => tracing::error!(
+                error = %format!("{e:#}"),
+                "Configuration reload failed; coppad keeps running on its current settings"
+            ),
         }
-        Err(e) => tracing::error!(
-            error = %format!("{e:#}"),
-            "Configuration reload failed; coppad keeps running on its current settings"
-        ),
     }
 }
 
@@ -734,10 +765,15 @@ async fn run_daemon(
     // default action. A second stop request wakes `force`.
     let signals = signals::Signals::register()?;
     let force = std::sync::Arc::new(tokio::sync::Notify::new());
-    let reload_tx = event_tx.clone();
-    let reload_instance = instance.clone();
+    let (reload_requests, reload_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(serve_reloads(
+        reload_rx,
+        source,
+        instance.clone(),
+        event_tx.clone(),
+    ));
     tokio::spawn(signals.run(event_tx.clone(), force.clone(), move || {
-        reload_config(&source, reload_instance.as_deref(), &reload_tx);
+        let _ = reload_requests.send(());
     }));
 
     // COP-50: state what startup actually did, then ready or degraded.

@@ -268,9 +268,9 @@ key until a restart:
 
 | Key | When it takes effect |
 |---|---|
-| `[radio] ptt_pre_delay_ms`, `ptt_tail_delay_ms` | the next transmission |
+| `[radio] ptt_pre_delay_ms`, `ptt_tail_delay_ms` | the next transmission. A connected session keeps the ARQ timeout it computed from them when it started. |
 | `[radio] max_tx_duration_s` | the next transmission, and the 500 ms PTT backstop at once |
-| `[radio] turnaround_ms` | the next key-up. The startup warning about turnaround and tail delay is re-checked. |
+| `[radio] turnaround_ms` | the next key-up. A connected session keeps the ARQ timeout it computed when it started. The startup warning about turnaround and tail delay is re-checked. |
 | `[radio] host_rig_control` | the next `FREQ`/`MODE` set from a host |
 | `[station_id] busy_hold_ms`, `id_interval_secs`, `beacon_interval_secs`, `cwid_wpm` | their next use |
 | `[station_id] cwid` | at once. CW ID is reset to what startup would choose for the new policy. |
@@ -297,7 +297,7 @@ What the log shows:
 | `Configuration reload kept the running values of settings that change only on restart restart_required=[host] vara_command_port, ...` (WARN) | These keys changed but need a restart. The line names keys only, never values, so a changed `websocket_token` is never logged. |
 | `Configuration reloaded; no settings changed` | The file matches the running settings. |
 | `Configuration reloaded; nothing changed that applies before a restart` | Only restart-only keys changed (named in the WARN line before it). |
-| `Configuration reload failed; coppad keeps running on its current settings error=...` (ERROR) | The file does not parse or fails a startup check. Nothing changed. |
+| `Configuration reload failed; coppad keeps running on its current settings error=...` (ERROR) | The file does not parse or fails a startup check, or (without `--config`) the search no longer finds a file. Nothing changed. |
 | `Received SIGHUP during shutdown; not reloading` | A SIGHUP after a stop request is ignored. |
 
 Closing the terminal that started a foreground coppad now sends it SIGHUP,
@@ -339,10 +339,14 @@ cargo build --release -p coppa-daemon --features cpal-backend,websocket,kiss-tnc
 ```
 
 - Stop it with Ctrl-C. A second Ctrl-C while it stops forces the exit after
-  releasing PTT (status 130). Ctrl-Break, closing the console window and
-  Windows shutting down stop it the same way, logging
-  `Received Ctrl-Break, shutting down`, `Console window closing, shutting down`
-  or `Windows is shutting down; shutting down`.
+  releasing PTT (status 130). Ctrl-Break stops it the same way
+  (`Received Ctrl-Break, shutting down`).
+- Closing the console window or shutting Windows down logs
+  `Console window closing, shutting down` or
+  `Windows is shutting down; shutting down` and starts the same stop, but
+  Windows ends the process soon after, so the PTT release may not finish.
+  The guardian shares the console and ends with it. Stop coppad with Ctrl-C
+  before closing its window, and set the rig's TX time-out timer.
 - There is no reload: restart coppad to apply a change.
 - Serial PTT is written as `ptt_method = "serial:COM3:dtr"`.
 - The PTT guardian runs in its own process group, so a console Ctrl-C to

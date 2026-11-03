@@ -903,7 +903,7 @@ impl ReloadPlan {
     /// Whether the reload applied `[section] key`.
     pub fn applies(&self, section: &str, key: &str) -> bool {
         let label = reload_label(section, key);
-        self.applied.iter().any(|applied| *applied == label)
+        self.applied.contains(&label)
     }
 }
 
@@ -983,7 +983,6 @@ pub fn plan_reload(running: &DaemonConfig, file: &DaemonConfig) -> anyhow::Resul
 }
 
 impl DaemonConfig {
-    /// Load configuration from a TOML file.impl DaemonConfig {
     /// Load configuration from a TOML file.
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         Ok(Self::load_with_shared(path)?.0)

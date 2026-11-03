@@ -6410,9 +6410,15 @@ impl EventLoop {
             }
         };
         if plan.applies("engine", "callsign") {
-            // An invalid value warns (as at startup) and disables TX.
+            // An invalid value warns (as at startup) and disables TX; so
+            // does a cleared one, which warns here.
             self.local_callsign = configured_callsign(&plan.effective.engine.callsign);
-            if self.local_callsign.is_some() {
+            if plan.effective.engine.callsign.is_empty() {
+                tracing::warn!(
+                    "[engine] callsign cleared by configuration reload; transmission disabled \
+                     until a valid MYCALL is set"
+                );
+            } else if self.local_callsign.is_some() {
                 tracing::info!(
                     callsign = %plan.effective.engine.callsign,
                     "Local callsign set by configuration reload"
