@@ -10,7 +10,7 @@ build without `cpal-backend`, with the default config, logs:
 ```
 INFO coppad: coppad - Coppa Daemon starting version="0.3.0" git_sha="f1dcac4a6ac6" features=none
 INFO coppad: Daemon configuration loaded profile=HF_STANDARD preferred_hardware_rate=48000 ptt_method=none turnaround_ms=500
-INFO coppad: Host listeners bind_address=127.0.0.1 vara_command=disabled vara_data=disabled websocket=not-built
+INFO coppad: Host listeners bind_address=127.0.0.1 vara_command=disabled vara_data=disabled ardop_command=not-built ardop_data=not-built websocket=not-built kiss=not-built
 WARN coppad: Audio devices: none; this coppad was built without the cpal-backend feature, so it can neither receive nor transmit
 INFO coppad: PTT method="none" active=none state="not controlled" guardian="not used"
 INFO coppad: Daemon ready
@@ -22,7 +22,7 @@ servers on logs, before `Daemon ready`:
 ```
 INFO coppad: Audio input started device="Default Audio Device (alsa:default)" hardware_rate=48000 engine_rate=48000
 INFO coppad: Audio output started device="Default Audio Device (alsa:default)" hardware_rate=48000 engine_rate=48000
-INFO coppad: Host listeners bind_address=127.0.0.1 vara_command=127.0.0.1:8300 vara_data=127.0.0.1:8301 websocket=127.0.0.1:8400
+INFO coppad: Host listeners bind_address=127.0.0.1 vara_command=127.0.0.1:8300 vara_data=127.0.0.1:8301 ardop_command=disabled ardop_data=disabled websocket=127.0.0.1:8400 kiss=disabled
 INFO coppad: Audio devices input="Default Audio Device (alsa:default)" output="Default Audio Device (alsa:default)" input_hardware_rate=48000 output_hardware_rate=48000 engine_rate=48000
 INFO coppad: PTT method="rigctld 127.0.0.1:4532" active=rigctld state="released" guardian="running, pid 28849"
 ```
@@ -33,7 +33,7 @@ INFO coppad: PTT method="rigctld 127.0.0.1:4532" active=rigctld state="released"
 | | `git_sha` | The commit HEAD pointed at when `coppad` was built (12 hex digits), or `unknown` for a build from a tree without `.git`. Packagers building from a tarball set `COPPA_GIT_SHA` (7-40 hex digits) at build time. It does not flag uncommitted changes. |
 | | `features` | `coppa-daemon`'s cargo features in this build (`cpal-backend`, `gpio-ptt`, `kiss-tnc`, `mdns`, `serial-ptt`, `websocket`), comma-separated, or `none`. |
 | `Host listeners` | `bind_address` | `[host] bind_address`. |
-| | `vara_command`, `vara_data`, `websocket` | The bound `ip:port` (the real port when 0 is configured), `disabled`, or, for `websocket` only, `not-built` in a build without the `websocket` feature. The `websocket` port also serves the operator page over plain HTTP at `GET /` (COP-79) and answers `GET /health` (COP-140, see [Health check](#health-check)). |
+| | `vara_command`, `vara_data`, `ardop_command`, `ardop_data`, `websocket`, `kiss` | The bound `ip:port` (the real port when 0 is configured), `disabled`, or, `not-built` when the listener feature (`websocket`, `ardop` or `kiss-tnc`) is absent. The `websocket` port also serves the operator dashboard over plain HTTP at `GET /` (COP-79, COP-83; see [Operator dashboard](#operator-dashboard)) and answers `GET /health` (COP-140, see [Health check](#health-check)). |
 | `Host listeners accept connections from other hosts; ...` (WARN) | `bind_address` | Logged when a listener is bound to a non-loopback address such as `0.0.0.0`: anyone who can reach it can key the transmitter. |
 | `mDNS advertisement` | `host`, `service`, `port`, `addresses` | Only with `[host] mdns_enabled = true` in an `mdns` build. The advertised host (`coppad.local.`), service instance (`coppad._coppa._tcp.local.`), bound WebSocket port, and `every non-loopback IPv4 address` (`bind_address = "0.0.0.0"`), `every non-loopback address` (`"[::]"`) or the single bound address. See [Finding coppad on the network](#finding-coppad-on-the-network-mdns). |
 | `mDNS name already in use on this network; ...` (WARN) | `original`, `new_name` | Another host answers for the name, so the responder renamed this daemon, for example to `coppad-2.local.`. Clients must use the new name. |
@@ -105,7 +105,10 @@ across all carriers at once and wrecks decode on every one of them.
    `--seconds N` still works for one release with a deprecation warning), or `TUNE` (or `TUNE <seconds>`) on the daemon's
    VARA command port. This transmits a standard two-tone signal (700 Hz +
    1900 Hz, equal amplitude) — the same drive-level convention hams use for
-   SSB two-tone tests.
+   SSB two-tone tests. The daemon caps a TUNE at `[radio] max_tx_duration_s`
+   (and never more than 120 s). From the dashboard or any WebSocket client,
+   send `{"type":"tune"}` (optional `seconds`, `single_hz`); see
+   [Operator dashboard](#operator-dashboard).
 4. Slowly advance your audio drive level until the ALC meter *just* begins to
    register (first needle movement / first LED).
 5. Back off slightly from that point — a few dB is enough. ALC actively
@@ -298,13 +301,9 @@ transmission:
 Send `{"type":"audio_level","enabled":false}` to stop. This stream is
 independent of the `spectrum` stream.
 
-A browser can show the same RX reading without a separate client: open
-`http://127.0.0.1:8400/` (`GET /` on the WebSocket port, COP-79), enter the
-token and press Connect. The page needs its own origin, exactly as the
-browser's address bar shows it, in `websocket_allowed_origins`: for example
-`http://127.0.0.1:8400`, and also `http://localhost:8400` if you open it by
-that name. Without it the page reports `Refused`. Loading the page needs no
-token and the page holds none; its `/ws` upgrade presents the token you type.
+A browser can show the same RX reading without a separate client: the
+operator dashboard at `GET /` on the WebSocket port draws it as a meter. See
+[Operator dashboard](#operator-dashboard).
 
 | Field | Meaning |
 |---|---|
@@ -474,7 +473,9 @@ After authentication the first text frame is a versioned greeting:
 All application messages are JSON text frames. The [protocol schema](schema/websocket-protocol-v1.json)
 defines requests and replies. Version 1 replaces the earlier unversioned API;
 `session` replaces the old `connected` and `disconnected` message types.
-Connecting subscribes the client to data and state events.
+Connecting subscribes the client to data and state events. Version 1 grows
+only by adding optional fields and new message types; a client must ignore
+fields and types it does not know.
 
 Requests may include an unsigned integer `id`. Each request with an id gets
 one reply with that id: `ack`, `status`, or `error`. An ack means accepted
@@ -499,6 +500,8 @@ can still be rejected there with a warning log.
 {"type":"snr","db":14}
 {"type":"level","level":2}
 {"type":"heard","stations":[{"call":"W1AW","last_heard_ms":1761452712300,"snr_db":14,"level":2}]}
+{"type":"buffer","bytes":15}
+{"type":"buffer","bytes":0}
 {"type":"disconnect","id":5}
 {"type":"ack","id":5}
 {"type":"session","state":"disconnected"}
@@ -510,12 +513,106 @@ invalid base64 produces an error with the request id. Received `data` always
 specifies its encoding and preserves every byte. Raw WebSocket binary frames
 are not payload messages. `heard` is a full snapshot of up to 32 recent session
 peers, including the last-heard timestamp, rather than a list of all RF activity.
+`buffer` is sent when the count of host bytes not yet sent or acknowledged
+changes, the same moment the VARA `BUFFER` line goes out.
 
-Data, session, PTT, busy, SNR, level and heard events use a reliable queue for
-each client. A client either receives them in order or its connection closes.
-If 256 pending messages fill that queue, the server disconnects that client;
-it never silently skips a state or data event. Replies go directly to the
-requesting socket. Reconnect and query `status` after losing a connection.
+Data, session, PTT, busy, SNR, level, heard, buffer and speed-level events use
+a reliable queue for each client. A client either receives them in order or
+its connection closes. If 256 pending messages fill that queue, the server
+disconnects that client; it never silently skips a state or data event.
+Replies go directly to the requesting socket. Reconnect and query `status`
+after losing a connection.
+
+#### What `status` reports
+
+A daemon fills in more of the `status` reply than the minimal example above.
+Each field appears only once the daemon has published it, so a server with no
+daemon behind it still sends `{"type":"status","id":2,"connected":false,"cp_desync_episodes":0}`.
+Idle, a reply looks like this:
+
+```json
+{"type":"status","id":1,"connected":false,"cp_desync_episodes":0,"ptt":false,"busy":false,"waiting_for_clear_channel":false,"buffer":0,"speed_level":2,"speed_level_mode":"auto","speed_levels":[1,2,3,4,5,6,7,8],"mycall":"N0CALL","max_tx_s":30,"max_tune_s":30,"loop_age_ms":212,"heard":[]}
+```
+
+A client that joins 1.2 s into a transmission learns it at once:
+
+```json
+{"type":"status","id":1,"connected":false,"cp_desync_episodes":0,"ptt":true,"ptt_keyed_ms":1234,"busy":false,"waiting_for_clear_channel":false,"buffer":0,"speed_level":2,"speed_level_mode":"auto","speed_levels":[1,2,3,4,5,6,7,8],"mycall":"N0CALL","max_tx_s":30,"max_tune_s":30,"loop_age_ms":95,"heard":[]}
+```
+
+In a session, `remote_call`, `snr`, `level` and `cfo` appear as before, and
+`link` is added while the session has an ARQ link:
+
+```json
+"link":{"in_flight":1,"retries":1,"max_retries":10,"rto_ms":5200,"fade_hold":false}
+```
+
+| Field | Meaning |
+|---|---|
+| `ptt` | PTT state the daemon last commanded |
+| `ptt_keyed_ms` | Milliseconds PTT has been keyed, computed when the reply is built. Present only while `ptt` is true |
+| `busy` | Last `busy` push value (RX-band occupancy) |
+| `waiting_for_clear_channel` | True while a transmission is held by `[station_id] busy_hold_ms` for a clear channel |
+| `buffer` | Host bytes not yet sent or acknowledged (the VARA `BUFFER` count) |
+| `speed_level` | Speed level our next frame is encoded at |
+| `speed_level_mode` | `auto` (the rate loop chooses) or `manual` (pinned by `set_speed_level`) |
+| `speed_levels` | Levels `set_speed_level` accepts on this engine (HF 1-8, VHF 1-9) |
+| `mycall` | Callsign in force; absent when none |
+| `max_tx_s` | `[radio] max_tx_duration_s` |
+| `max_tune_s` | Longest TUNE accepted: the smaller of `max_tx_s` and 120 |
+| `loop_age_ms` | Milliseconds since the daemon's event loop last completed its 500 ms housekeeping tick or a busy-channel wait step, computed when the reply is built |
+| `heard` | The same snapshot the `heard` push carries |
+| `link` | Session ARQ link: `in_flight`, `retries` (transmissions of the in-flight segment minus one), `max_retries`, `rto_ms`, `fade_hold`. Absent without a session link |
+
+Every reliable state push (`session`, `ptt`, `busy`, `snr`, `level`, `heard`,
+`buffer`, `speed_level`) has a matching `status` field, and the daemon updates
+the field before it pushes. A client that sends `status` after connecting
+therefore never ends on an older value than the pushes it then receives.
+
+#### TUNE and speed level requests
+
+`tune` keys the TX-level calibration tone, exactly like VARA `TUNE`.
+`seconds` defaults to 10 and must be greater than 0 and at most `max_tune_s`.
+Without `single_hz` the tone is the 700 + 1900 Hz two-tone; with it, a single
+tone at that frequency, between 300 and 3000 Hz (the CLI's
+`coppa tune --single`). A daemon with no callsign in force refuses it:
+
+```json
+{"type":"tune","id":2}
+{"type":"ack","id":2}
+{"type":"ptt","state":true}
+{"type":"ptt","state":false}
+{"type":"tune","seconds":5,"single_hz":1500,"id":3}
+{"type":"ack","id":3}
+{"type":"tune","seconds":120,"id":4}
+{"type":"error","message":"TUNE seconds must be greater than 0 and at most 30","id":4}
+{"type":"tune","seconds":5,"single_hz":5000,"id":5}
+{"type":"error","message":"TUNE single_hz must be between 300 and 3000 Hz","id":5}
+{"type":"tune","id":6}
+{"type":"error","message":"No callsign is set; set MYCALL before TUNE","id":6}
+```
+
+`set_speed_level` takes an integer level or the string `"auto"`. A request
+without `level` is an error, so a typo cannot silently mean `auto`:
+
+```json
+{"type":"set_speed_level","level":3,"id":7}
+{"type":"ack","id":7}
+{"type":"speed_level","level":3,"mode":"manual"}
+{"type":"set_speed_level","level":9,"id":8}
+{"type":"error","message":"Speed level 9 is not available on this profile (levels 1-8)","id":8}
+{"type":"set_speed_level","level":"auto","id":9}
+{"type":"ack","id":9}
+{"type":"speed_level","level":2,"mode":"auto"}
+```
+
+`set_speed_level` pins the level every new frame uses, sessionless or in a
+session, until `{"level":"auto"}` or a restart. While pinned, the rate loop
+keeps measuring but does not change the level and does not probe. COP-68
+fade-hold retransmissions still use the fade-hold level. `level` (push and
+`status`) is the peer's level as decoded; `speed_level` is ours. The
+`speed_level` push is sent whenever the level our next frame uses or the mode
+changes, including the rate loop's own changes.
 
 Spectrum, audio levels, logs and decode-failure aggregates are disposable
 telemetry on a separate lossy channel. Lag can skip these messages without
@@ -539,7 +636,14 @@ coarser bins, about 43.75 Hz each, sampled from an approximately 11.7 Hz FFT.
 {"type":"decode_fail","count":6,"timestamp_ms":1761452712300}
 ```
 
-Logs carry INFO, WARN and ERROR events, with each message truncated to 2 KiB.
+Logs carry INFO, WARN and ERROR events with the console line's `key=value`
+fields appended to the message, so a refusal shows its reason:
+
+```json
+{"type":"log","level":"warn","message":"coppad::event_loop: MYCALL rejected callsign=!!bad!! error=Invalid callsign character: '!'","timestamp_ms":1793600129709}
+```
+
+Each message is truncated to 2 KiB, fields included.
 `decode_fail` is unconditional and reports a cumulative failure count at most
 once per 500 ms. Neither diagnostic stream is a delivery receipt.
 
@@ -636,12 +740,81 @@ over `ws://`. Anyone who can watch that traffic can reuse it.
 
 ### What this does not cover
 
-The VARA-style command and data ports and the KISS TCP port have no
+The VARA-style command and data ports and both KISS TCP ports have no
 authentication, so that Pat and other VARA clients keep working. A web page
 can still deliver a VARA command line to the command port inside an HTTP
 `POST` body, and the daemon executes it. Until that is fixed, if you enable
 `vara_enabled`, do not browse untrusted sites on the same machine, or run
 `coppad` on a host you do not browse from.
+
+## Operator dashboard
+
+`coppad` serves an operator dashboard at `GET /` on the WebSocket port
+(COP-79, COP-83): one static page that sets a speed level, shows S/N, keys
+TUNE and tells transmitting from a hang without a terminal.
+
+1. Build `coppad` with the `websocket` feature, and set `websocket_enabled =
+   true` and `websocket_token` under `[host]` (see
+   [Setting the token](#setting-the-token)).
+2. Add the page's own origin, exactly as the browser's address bar shows it,
+   to `websocket_allowed_origins`: for example `"http://127.0.0.1:8400"`, and
+   also `"http://localhost:8400"` if you open it by that name. The page's
+   refusal line names the exact string to add.
+3. Open `http://127.0.0.1:8400/`, type the token and press Connect. Loading
+   the page needs no token. The page keeps the token in memory only, so a
+   reload asks for it again; an automatic reconnect reuses it.
+
+The page makes no external requests. Each card:
+
+- **Header**: `Connection:`, `Daemon:`, `MYCALL`, the PTT lamp and the
+  Channel (BUSY) lamp. See the table below.
+- **Waterfall**: one row per `spectrum` frame (4 per second, only while the
+  daemon receives audio), with a spectrum line underneath, a red line where
+  PTT went on and a grey line where it went off.
+- **RX level**: the `audio_level` RX reading as a bar from -60 to 0 dBFS
+  (see [RX level](#rx-level)), and the last transmission's TX level.
+- **S/N**: the last decoded frame's S/N, how long ago it arrived, and a
+  sparkline of the last 2 minutes. When the connection drops the age is
+  dropped too; after a reconnect the page takes the S/N from `status`, which
+  has no arrival time, so the age is missing until the next frame decodes.
+  CFO is the last decoded frame's offset.
+- **Speed level**: `TX <n> · auto` or `TX <n> · manual` (ours), `RX <n>` (the
+  peer's last decoded frame), `Auto` plus one button per level the profile
+  accepts, and the buffer count.
+- **TUNE**: `Seconds` (default 10, at most `max_tune_s`), `Two-tone` and
+  `Single tone 1500 Hz`. Disabled while PTT is keyed. A TUNE cannot be stopped
+  early; it ends after its seconds.
+- **Session**: the session state, the ARQ link (in flight, retries, RTO, fade
+  hold) and the heard list of recent session peers.
+- **Log**: INFO, WARN and ERROR lines with their `key=value` fields, and
+  received data.
+- **Command box**: `MYCALL` and `Set`, `Call station` with `Call` and
+  `Disconnect`, and `Send` (enabled only while a session is connected).
+
+A request's result shows as `<request>: accepted` or
+`<request>: refused: <reason>`. Accepted means accepted for processing; a
+refusal the daemon makes later (an invalid `MYCALL`, for example) shows as a
+WARN line in the log pane.
+
+### Reading the header: transmitting or hung?
+
+| Header shows | What it means | What to check |
+|---|---|---|
+| `Connection: Not connected` | The page has not connected, or you closed it | Type the token and press Connect |
+| `Connection: Connecting…` | The WebSocket handshake is in progress | Wait; it should finish within a second |
+| `Connection: Connected` | The page speaks protocol version 1 with the daemon | Nothing |
+| `Connection: Refused or unreachable: check the token, and that [host] websocket_allowed_origins lists "<origin>"` | The socket never opened: wrong token (401), origin not allowed (403) or daemon not reachable. The browser cannot tell which | The token, the quoted origin in `websocket_allowed_origins`, and that `coppad` is running. The page does not retry |
+| `Connection: Connection lost; reconnecting in <n> s…` | The socket was open and closed | Whether `coppad` is still running. The page retries after 1, 2, 4, 8, then every 15 s |
+| `Connection: Connected, but the daemon speaks protocol version <n>; this page expects protocol version 1` | The daemon and the page are from different releases | Use the page the daemon serves |
+| `Daemon: —` | Not connected | The `Connection:` line |
+| `Daemon: running` | A `status` reply arrived within 5 s and the event loop ticked within 3 s | Nothing |
+| `Daemon: waiting for a clear channel to transmit` | A transmission is held by `[station_id] busy_hold_ms` until the channel clears | The Channel lamp; another station is on frequency |
+| `Daemon: event loop stalled for <n> s` | The process answers, but its event loop has not ticked for 3 s or more | The daemon log; a stuck radio, audio or PTT call. Restart `coppad` if it does not recover |
+| `Daemon: not answering for <n> s` | The socket is open but no `status` reply came for 5 s | Whether the `coppad` process is alive and not starved of CPU |
+| `PTT: —` | PTT state unknown (not connected) | The `Connection:` line |
+| `PTT: RX` | The transmitter is not keyed | Nothing |
+| `PTT: TX <x.x> s of <max_tx_s> s` | The transmitter is keyed, for that long, against `[radio] max_tx_duration_s` | Nothing; a frame or TUNE ends on its own |
+| `PTT: TX <n> s: past the <max_tx_s> s limit. Check the radio and the PTT line.` | PTT has been keyed more than 2 s past the limit, so the daemon's own backstop should already have released it | The radio, the PTT line and the daemon log; see [PTT safety](#ptt-safety-when-coppad-stops) |
 
 ## Connected sessions: delivery and BUFFER
 
@@ -768,6 +941,187 @@ nothing queued or un-acked, `DISCONNECTED` follows at once, as before.
   no DISCONNECT frame is sent, and the host gets one `DISCONNECTED`.
 - A remote DISCONNECT or a session timeout still drops unsent data at once.
 
+When CW ID is on, the DISCONNECT frame that ends a session is followed by
+this station's callsign in Morse in the same transmission. See "Morse (CW)
+ID at session end" below.
+
+## Morse (CW) ID at session end
+
+When CW ID is on, a station that ends a session keys its callsign in Morse
+right after its DISCONNECT frame, in the same transmission. The ID is a
+1000 Hz tone with 5 ms raised-cosine edges, at the same peak level as the
+OFDM audio. It goes through the same transmit path as every frame, so the
+callsign gate, the wideband gate, the busy-channel wait, turnaround and the
+PTT rules all apply to it.
+
+```toml
+[station_id]
+cwid = "host"
+cwid_wpm = 20
+```
+
+`cwid` decides who turns it on and off:
+
+| `cwid` | CW ID | Host `CWID ON` | Host `CWID OFF` |
+|---|---|---|---|
+| `"host"` (default) | off until a host sends `CWID ON` | `OK`, turns it on | `OK`, turns it off |
+| `"always"` | on | `OK`, no change | `WRONG`, stays on |
+| `"never"` | off | `WRONG`, stays off | `OK`, no change |
+
+The state applies to the whole daemon. With several hosts connected, the
+last one to send `CWID ON` or `CWID OFF` wins. `CWID` alone, or with any
+other argument (`CWID TRUE`, `CWID MAYBE`), gets `WRONG` and changes
+nothing. coppad logs each change at `INFO` (`CW ID turned on by VARA client
+3`) and each refusal (`CWID OFF refused: [station_id] cwid = "always"`). At
+startup it logs the current state, for example:
+
+```text
+INFO coppad::event_loop: CW ID after each session this station ends: off until a host sends CWID ON ([station_id] cwid = "host", 20 WPM)
+```
+
+Pat's VARA HF driver sends `CWID ON` every time it starts. Under the
+default `cwid = "host"`, that turns the CW ID on for the daemon, and every
+Pat session this station ends gains about 4.7 s of Morse for a 6-character
+call at 20 WPM. Set `cwid = "never"` if you do not want it.
+
+ARDOP hosts send `CWID TRUE` or `CWID FALSE` on the ARDOP command port.
+coppad always echoes the line, because a `WRONG` there would break Winlink
+Express init. Under `"host"` it applies the change. Under `"always"` or
+`"never"` the state does not change, and coppad logs, for example,
+`ARDOP CWID FALSE echoed but not applied: [station_id] cwid = "always"`.
+
+The CW ID follows every DISCONNECT frame this station sends to end a
+session:
+
+- a host `DISCONNECT`, once the queued data has drained;
+- a host `DISCONNECT` of a pending inbound attempt;
+- a session that COP-38's retry budget ends as a link failure;
+- a stalled drain that coppad ends;
+- a `CONNECT` that ends a drain.
+
+One transmission then carries the frame and the ID:
+
+```text
+PTT on | pre-delay | [station-ID frame, if due] | DISCONNECT frame | 7 units of silence | callsign in Morse | PTT tail | PTT off
+```
+
+There is no CW ID after `ABORT` (no frame is sent), after the other station
+disconnects (this station sends nothing), after a session times out with no
+drain, or after `TUNE`, a beacon or sessionless data. The OFDM station-ID
+frame still covers the 10-minute rule as before.
+
+coppad keys the callsign in force (`MYCALL`, or `[engine] callsign`) with
+any `-SSID` dropped, because the SSID is a network address and not part of
+the licensed call. `N1CALL-10` keys `N1CALL`. A `/` portable designator
+stays, so `N1CALL/P` keys `N1CALL/P`.
+
+`cwid_wpm` takes 10 to 20 (default 20). 47 CFR 97.119(b)(1) caps a CW ID
+sent by an automatic device at 20 WPM. Any other value stops coppad at
+startup:
+
+```text
+Error: [station_id] cwid_wpm = 25 is outside 10-20; 47 CFR 97.119(b)(1) caps an automatic CW ID at 20 WPM
+```
+
+`coppad --check` checks syntax and types only, so it does not report this.
+A `cwid` value other than the three above fails both, naming the key.
+
+Timing follows PARIS: one unit is 1.2 / WPM seconds. Airtime of the Morse
+part, including its 7-unit lead-in:
+
+| Callsign | Units | 20 WPM | 10 WPM |
+|---|---|---|---|
+| `N1CALL` | 78 | 4.68 s | 9.36 s |
+| `VE3ABCD` | 80 | 4.80 s | 9.60 s |
+| `N1CALL/P` | 108 | 6.48 s | 12.96 s |
+| `00000000` (longest 8-character call) | 180 | 10.80 s | 21.60 s |
+
+`[radio] max_tx_duration_s` (default 30) cuts any transmission that runs
+longer. If the DISCONNECT frame plus the CW ID would not fit inside
+`max_tx_duration_s` less a 2 s margin, coppad sends the frame alone and
+logs a warning:
+
+```text
+WARN coppad::event_loop: CW ID skipped: the DISCONNECT frame (1.9 s) plus the CW ID (4.7 s) would exceed [radio] max_tx_duration_s = 3 less a 2 s margin
+```
+
+The margin leaves room for a prepended station-ID frame and the PTT
+pre-delay. At the 30 s default, the longest call at 10 WPM still fits.
+
+## Rig frequency and mode from a host (FREQ, MODE)
+
+With `[radio] ptt_method = "rigctld"`, a host on the VARA command port can
+read the rig's frequency and mode. If the operator allows it, the host can
+also set them. These commands are coppa extensions, like `TUNE`. VARA has no
+such commands.
+
+| Line | Reply | Effect |
+|---|---|---|
+| `FREQ` | `FREQ <hz>`, the rig's answer to rigctld `f`; `WRONG` with no rigctld backend or no clean answer | none |
+| `FREQ <hz>` (decimal Hz, one argument) | `FREQ <hz>` as the rig reports it after the set; `WRONG` if refused or the rig did not accept it | sends `F <hz>`, then `f` |
+| `MODE` | `MODE <token>`, the rig's own token (`USB`, `PKTLSB`, `CW`, `RTTY`, ...); `WRONG` as for `FREQ` | none |
+| `MODE USB` / `LSB` / `PKTUSB` / `PKTLSB` (any case) | `MODE <token>` as the rig reports it after the set; `WRONG` if refused or rejected | sends `M <TOKEN> 0`, then `m` |
+| `FREQ 7.074`, `FREQ -1`, `FREQ 1 2`, `MODE CW`, `MODE USB 2400`, `FREQUENCY` | `WRONG` | none |
+
+The `0` in `M <TOKEN> 0` asks hamlib for the radio backend's default
+passband. coppad never answers from a cached or default value: every reply
+is a fresh reading from the rig.
+
+Reads work whenever the PTT backend is rigctld. Sets also need:
+
+```toml
+[radio]
+host_rig_control = true
+```
+
+`host_rig_control` is `false` by default. The command port has no
+authentication, and any web page you visit can send it a VARA line with a
+no-CORS POST (see `docs/LIMITATIONS.md`). With sets allowed, such a page
+could retune the rig.
+
+coppad refuses a set with `WRONG` and logs one `INFO` line with the reason.
+It checks in this order and reports the first reason that applies:
+
+1. `[radio] host_rig_control` is `false`.
+2. The PTT backend is not rigctld. This includes a rigctld that was
+   unreachable at startup, where coppad fell back to no PTT.
+3. The frequency is 0 or above 30 GHz.
+4. coppad is transmitting, or has sessionless data queued to send.
+5. A session is live (connecting, connected or disconnecting).
+
+With the default config, the log line reads:
+
+```text
+INFO coppad::event_loop: FREQ 7074000 refused: host rig control is off; set [radio] host_rig_control = true to allow it
+```
+
+The reply to a set is what the rig reports afterwards, not what the host
+asked for. If the rig accepts `F 7074005` but reports 7074000, the host gets
+`FREQ 7074000` and coppad logs a warning. A host should compare the reply
+with its request.
+
+```text
+WARN coppad::event_loop: FREQ 7074005: rig reports 7074000 Hz after the set
+```
+
+A retune does not get around the frequency gate (COP-40). On a wideband
+profile, coppad reads the rig's frequency before each transmission and
+refuses it below 29.7 MHz. A host retune below 29.7 MHz on `VHF_FAST`
+therefore gets a warning, and every later transmission is refused until the
+rig is retuned:
+
+```text
+WARN coppad::event_loop: FREQ 14074000: the rig is now below 29.7 MHz; the VHF_FAST profile's wideband gate will refuse every transmission until it is retuned
+```
+
+coppad talks to rigctld on its main event loop, as it does for PTT. A
+healthy rigctld answers in milliseconds. A dead one stalls the loop for up
+to about 4 s per query and about 6 s per set (a 2 s reconnect and a 2 s
+read for each step).
+
+Only the VARA command port has these commands. The WebSocket API, the ARDOP
+command port and the C FFI have no frequency or mode control.
+
 ## BUSY lines on the command port
 
 coppad watches the 300-2800 Hz band of the received audio and sends `BUSY ON`
@@ -828,3 +1182,5 @@ If 1024 payloads are waiting, coppad writes what is queued, closes the data
 connection and logs `VARA data-port client is not reading; disconnecting it`.
 The command port stays connected. A host never sees a gap in received data
 while its data connection stays open.
+
+For the OFDM KISS datagram port (8100), see [RETICULUM.md](RETICULUM.md).

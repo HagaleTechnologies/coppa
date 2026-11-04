@@ -23,6 +23,7 @@ Open-source ham radio digital communications system written in Rust.
 | Link adaptation | Implemented, limited calibration | Measurement-driven speed selection and ACK-driven RateLoop with ARQ enabled; no model inference; performance targets remain unmet, see [BENCHMARKS.md](BENCHMARKS.md) |
 | Serial/GPIO PTT | Implemented, feature-gated | Daemon serial DTR/RTS uses `serial-ptt`; Linux sysfs GPIO uses `gpio-ptt` |
 | Service files | Provided, not hardware-verified | systemd unit and macOS launchd agent in `contrib/`; Raspberry Pi 4 install guide in [docs/tutorials/raspberry-pi-install.md](docs/tutorials/raspberry-pi-install.md) |
+| KISS datagrams (HF OFDM) | Implemented | Reticulum TCP KISS on port 8100; see [docs/RETICULUM.md](docs/RETICULUM.md) |
 | KISS TNC (AFSK 1200) | Implemented, bring-up and testing only | Needs the kiss-tnc and cpal-backend features; not a Direwolf replacement; see [docs/TNC.md](docs/TNC.md) |
 | IR-HARQ | Unwired codec primitive | Redundancy-version and combining support exists in the codec; engine/daemon retransmissions do not wire it into an operational IR-HARQ feature |
 | VARA RF/waveform compatibility | Not supported | The TCP control interface is VARA-style; Coppa does not interoperate with VARA over RF |
@@ -108,6 +109,12 @@ arrays; `profiles -p NAME --json` and `profiles --level N --json` write one
 object. `config` is a deprecated alias for `profiles` and accepts the same
 flags; `listen` is a deprecated alias for `rx` and accepts the same flags.
 
+## KISS datagrams on HF OFDM
+
+`coppad` offers broadcast KISS datagrams over the OFDM modem on port 8100.
+Build with `kiss-tnc`, enable `[host] kiss_enabled = true`, and follow
+[docs/RETICULUM.md](docs/RETICULUM.md) for Reticulum setup and packet limits.
+
 ## KISS TNC (AFSK 1200)
 
 `coppa tnc` runs a 1200-baud AFSK (Bell 202) AX.25 TNC behind a KISS TCP port. Use it for
@@ -133,7 +140,7 @@ Each crate has a README in `crates/<name>/`; to call the modem from your own Rus
 | `coppa-radio` | Radio control: rigctld CAT, serial PTT (DTR/RTS, `serial-ptt` feature), GPIO PTT (Linux sysfs, `gpio-ptt` feature) |
 | `coppa-ml` | Measurement-driven speed selection, RateLoop, CpGate, BusyGate and spectrum sensing |
 | `coppa-engine` | CoppaTransceiver wrapper with compression, squelch and streaming receive |
-| `coppa-host` | Host interfaces: VARA-style TCP control server, WebSocket JSON API, KISS TNC TCP server (`kiss-tnc` feature) |
+| `coppa-host` | Host interfaces: VARA-style TCP control server, WebSocket JSON API, KISS datagram and AFSK TNC TCP servers (`kiss-tnc` feature) |
 | `coppa-ffi` | C FFI bindings (cdylib + staticlib) with streaming decode API |
 | `coppa-cli` | CLI binary (`coppa`): `tx`, `rx`, `loopback`, `tune`, `devices`, `profiles`, `config`, and `tnc` (`kiss-tnc` feature) |
 | `coppa-daemon` | Long-running daemon (`coppad`) with event loop, audio, and host integration |
@@ -149,7 +156,7 @@ See [wiki/INDEX.md](wiki/INDEX.md) for short, question-titled pages on gotchas a
 
 See [docs/SPEC.md](docs/SPEC.md) for the normative waveform/FEC/protocol conformance specification — the reference for building an independent, interoperable implementation.
 
-See [docs/HOST-API.md](docs/HOST-API.md) to connect a host application (Pat, a dashboard or your own program) to coppad: the VARA-style command and data ports, the WebSocket API and KISS, with an `nc` walkthrough. For Pat and Winlink specifically, see [docs/PAT.md](docs/PAT.md).
+See [docs/HOST-API.md](docs/HOST-API.md) to connect a host application (Pat, a dashboard or your own program) to coppad: the VARA-style command and data ports, the WebSocket API and KISS, with an `nc` walkthrough. For Reticulum over OFDM, see [docs/RETICULUM.md](docs/RETICULUM.md). For Pat and Winlink specifically, see [docs/PAT.md](docs/PAT.md).
 
 See [docs/OPERATING.md](docs/OPERATING.md) for field-operation guidance, including TX level calibration (`coppa tune`). To run coppad as a service (systemd or launchd), see [contrib/README.md](contrib/README.md); for a full Raspberry Pi 4 install, see [docs/tutorials/raspberry-pi-install.md](docs/tutorials/raspberry-pi-install.md).
 

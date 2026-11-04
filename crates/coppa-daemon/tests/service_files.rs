@@ -10,6 +10,9 @@
 //! builds when packaged without `contrib/` or `docs/`; these tests need a
 //! full checkout to run, like `config.rs`'s example-config test.
 
+// COP-142: the std-clock ban in clippy.toml targets event_loop only.
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};

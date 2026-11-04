@@ -181,6 +181,27 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:fa060b6c5bcdf002f2b2c27f358f5041101f37e5200aa77589e6dcf7740b6810",
+      "id": "adr-011-decimated-sync-prefilter",
+      "kind": "decision-digest",
+      "links": [
+        "adr-003-waveform-break",
+        "adr-004-strongest-path-timing"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/adr-011-decimated-sync-prefilter.md",
+      "sources": [
+        "docs/adr/011-cop126-decimated-sync-prefilter.md",
+        "crates/coppa-codec/src/ofdm/sync_detector.rs"
+      ],
+      "status": "current",
+      "title": "Why does the streaming receiver's SyncDetector band-pass and decimate its input?",
+      "verified_commit": "2526b50",
+      "verified_date": "2026-11-03",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:13a7fb2e979343d94243578e036c469e63abad53334d10e485f801fcfcf9f102",
       "id": "agent-tooling",
       "kind": "gotcha",
@@ -307,7 +328,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:464b8d3b3b051e88ac3765987b3e532b3591b76b523d8dd349efe6322f204e93",
+      "hash": "sha256:8d291446f9febc4868ce782cfd1d8784deaab78984d90224e516e42f17651eab",
       "id": "coppa-engine",
       "kind": "subsystem",
       "links": [
@@ -329,7 +350,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:7477efa7bd7802b3e7d22d5e5d3bbed5232209e75b27f423a65310ac134db09c",
+      "hash": "sha256:681566d6e8792b71211acf058d96632a8ca1f31de73737297cf98769574454f6",
       "id": "coppa-protocol",
       "kind": "subsystem",
       "links": [
@@ -344,12 +365,13 @@
       "maintainer": "agent",
       "path": "pages/coppa-protocol.md",
       "sources": [
-        "crates/coppa-protocol/**"
+        "crates/coppa-protocol/**",
+        "docs/SPEC.md"
       ],
       "status": "current",
       "title": "How does coppa-protocol handle framing, FEC, and ARQ?",
-      "verified_commit": "be2141b",
-      "verified_date": "2026-08-05",
+      "verified_commit": "edb17bc",
+      "verified_date": "2026-11-04",
       "visibility": "public"
     },
     {
@@ -485,6 +507,27 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:b1fa92d938a3445339f1d05cc025443e43a96c9a4cec7f35b0ac9b430654f2aa",
+      "id": "paused-clock-timers",
+      "kind": "gotcha",
+      "links": [
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/paused-clock-timers.md",
+      "sources": [
+        "crates/coppa-daemon/src/event_loop.rs",
+        "crates/coppa-daemon/src/audio_output.rs",
+        "crates/coppa-daemon/clippy.toml"
+      ],
+      "status": "current",
+      "title": "What will bite you when a paused-clock test drives the daemon's timers?",
+      "verified_commit": "2526b50",
+      "verified_date": "2026-11-04",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:ece8378df1627dd56e8d8c10c4a995d5474ccc0993b6d4a7c2760fb7fefe9ec0",
       "id": "phase4-field-readiness",
       "kind": "gotcha",
@@ -508,6 +551,28 @@
       "title": "What will bite you in the daemon's real-radio TX/RX path?",
       "verified_commit": "59b0b63",
       "verified_date": "2026-07-14",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:b352ed5416cfb4361ca06c059b10fc089ffed56f1474c9857b8e9cc1d588c949",
+      "id": "tnc-direwolf-benchmark",
+      "kind": "gotcha",
+      "links": [
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/tnc-direwolf-benchmark.md",
+      "sources": [
+        "tools/tnc-bench/run.sh",
+        "crates/coppa-bench/src/afsk_direwolf.rs",
+        "crates/coppa-codec/src/afsk.rs",
+        "docs/testing/tnc-direwolf-wa8lmf.md"
+      ],
+      "status": "current",
+      "title": "What will bite you when measuring coppa's TNC against Direwolf?",
+      "verified_commit": "2526b50",
+      "verified_date": "2026-11-03",
       "visibility": "public"
     },
     {

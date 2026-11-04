@@ -53,6 +53,10 @@ by the CP-control pair.
    Once the in-flight frame has used its last retransmission, one more RTO
    is allowed for a late ACK; then the daemon sends a best-effort
    DISCONNECT, reports `BUFFER 0` and then `DISCONNECTED`.
+   **UPDATE (COP-69, COP-111):** a session transmission longer than one
+   codeword, or one carrying our station ID, also gets a per-transmission
+   floor (`ArqTx::set_segment_floor`): its keyed audio, both turnarounds and
+   one ACK. The floor is replaced at the next transmission.
 6. **`BUFFER` is ACK-driven (D6):** backlog plus unacknowledged bytes.
 7. **The wire break is documented, with a minor version bump and no
    negotiation (D11).** The workspace goes from 0.2.0 to 0.3.0, following

@@ -13,8 +13,7 @@ pub enum Listener {
     Listening(SocketAddr),
     /// Turned off in `[host]`.
     Disabled,
-    /// This build lacks the cargo feature the listener needs. Only the
-    /// WebSocket listener has one, so a `websocket` build never constructs it.
+    /// This build lacks the feature for a WebSocket, ARDOP or KISS listener.
     #[cfg_attr(feature = "websocket", allow(dead_code))]
     NotBuilt,
 }

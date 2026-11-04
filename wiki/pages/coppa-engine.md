@@ -71,3 +71,12 @@ coupling the test infrastructure to the full engine stack. Applications that
 need only encode/decode (FFI, CLI loopback) get a minimal API surface. The
 daemon and FFI both route streaming decode through `CoppaCore::push_samples`
 rather than duplicating squelch/decompression/payload contracts.
+
+## Benchmark denominators
+
+`cargo bench --bench throughput` covers encode and decode at all nine levels.
+Criterion throughput divides the common 32-byte payload by CPU processing time;
+the ideal clean-loopback frame report divides recovered payload bits by encoded
+audio airtime. These denominators differ, and neither includes session overhead.
+See [Engine processing and ideal frame goodput](../../BENCHMARKS.md#engine-processing-and-ideal-frame-goodput-cop-131)
+for the workload, profile routing, units and reproducible commands.

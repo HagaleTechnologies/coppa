@@ -380,6 +380,10 @@ pub struct ArqTx {
     send_base: u8,
     /// Transmit buffer, indexed by (seq_num % MAX_WINDOW_SIZE).
     tx_buf: Vec<Option<TxSegment>>,
+    /// COP-111: per-transmission lower bound on the timeout, in seconds, set
+    /// by [`Self::set_segment_floor`] and replaced on every call. Never folded
+    /// into the RTT estimator's own floor.
+    segment_floor: f64,
 }
 
 impl ArqTx {
@@ -416,6 +420,7 @@ impl ArqTx {
             next_seq: 0,
             send_base: 0,
             tx_buf: vec![None; buf_size],
+            segment_floor: 0.0,
         })
     }
 
@@ -505,7 +510,7 @@ impl ArqTx {
     /// for each returned sequence number after actually retransmitting it;
     /// `mark_retransmitted` itself no longer triggers backoff (see its doc).
     pub fn get_retransmits(&mut self, now: Instant) -> Vec<u8> {
-        let rto = self.rtt.rto();
+        let rto = self.rto();
         let mut retransmits = Vec::new();
 
         let mut seq = self.send_base;
@@ -526,6 +531,9 @@ impl ArqTx {
         }
 
         if !retransmits.is_empty() {
+            // COP-111: back off from the effective timeout, so a segment
+            // floor doubles exactly as `raise_rto_floor`'s raised RTO did.
+            self.rtt.rto = self.rtt.rto.max(self.segment_floor);
             self.rtt.backoff();
         }
 
@@ -671,14 +679,27 @@ impl ArqTx {
         self.next_seq
     }
 
-    /// Current RTO estimate.
+    /// Current retransmit timeout: the RTT estimator's value (backoff included)
+    /// or the segment floor, whichever is longer.
     pub fn rto(&self) -> Duration {
-        self.rtt.rto()
+        Duration::from_secs_f64(self.rtt.rto.max(self.segment_floor))
+    }
+
+    /// Lower bound on the retransmit timeout for the transmission just keyed,
+    /// from the caller's airtime model of it (frame, any prepended station ID,
+    /// both turnarounds and the peer's ACK). Each call replaces the previous
+    /// value, and `Duration::ZERO` clears it, so a short frame after a long one
+    /// gets the estimator's own timing back. Unlike [`Self::raise_rto_floor`] it
+    /// never becomes the RTT estimator's floor. Capped at the 60 s backoff cap.
+    pub fn set_segment_floor(&mut self, floor: Duration) {
+        self.segment_floor = floor.as_secs_f64().min(MAX_RTO_SECS);
     }
 
     /// Raise the airtime floor and the active timeout before sending a
     /// longer frame. Preserve RTT history, sequence numbers and retry backoff.
     /// Like `rto_floor`, the supplied duration is capped at `MAX_RTO_SECS`.
+    /// The raised floor persists into every later RTT update, so a caller
+    /// sizing the timeout per frame should use [`Self::set_segment_floor`].
     pub fn raise_rto_floor(&mut self, floor: Duration) {
         self.rtt.floor = self.rtt.floor.max(floor.as_secs_f64().min(MAX_RTO_SECS));
         self.rtt.rto = self.rtt.rto.max(self.rtt.floor);
@@ -1789,5 +1810,94 @@ mod tests {
             "a saturated count must keep the hold retrying: the no-evidence \
              clock bounds the hold, not the counter"
         );
+    }
+
+    /// The window-1 config the daemon's session link builds (COP-111).
+    fn cop111_window1_tx() -> ArqTx {
+        ArqTx::new(ArqConfig {
+            window_size: 1,
+            ..ArqConfig::default()
+        })
+        .unwrap()
+    }
+
+    fn assert_secs(actual: Duration, expected: f64, what: &str) {
+        assert!(
+            (actual.as_secs_f64() - expected).abs() < 1e-6,
+            "{what}: got {actual:?}, expected {expected} s"
+        );
+    }
+
+    /// COP-111: the segment floor is the timeout for the transmission it was
+    /// set for. Nothing is due before it, the segment is due once it has
+    /// passed, and the timeout event doubles from the floor.
+    #[test]
+    fn segment_floor_bounds_the_timeout_until_it_fires() {
+        let mut tx = cop111_window1_tx();
+        let t0 = Instant::now();
+        let seq = tx.send(vec![0x11; 32], t0).unwrap();
+        tx.set_segment_floor(Duration::from_secs_f64(13.706));
+        assert_secs(tx.rto(), 13.706, "rto() after set_segment_floor");
+
+        assert!(
+            tx.get_retransmits(t0 + Duration::from_secs(13)).is_empty(),
+            "nothing may be due before the segment floor"
+        );
+        assert_eq!(
+            tx.get_retransmits(t0 + Duration::from_millis(13_800)),
+            vec![seq],
+            "the segment must be due once the floor has passed"
+        );
+        assert_secs(tx.rto(), 27.412, "rto() after the timeout fired");
+    }
+
+    /// COP-111: unlike `raise_rto_floor`, the segment floor does not outlive
+    /// its transmission. A short segment after a long one gets the link's
+    /// own computed floor back.
+    #[test]
+    fn segment_floor_does_not_carry_into_the_next_segment() {
+        let mut tx = cop111_window1_tx();
+        let config = ArqConfig {
+            window_size: 1,
+            ..ArqConfig::default()
+        };
+        let base_floor = rto_floor(
+            1,
+            config.speed_level,
+            config.ack_speed_level,
+            config.turnaround,
+            &config.profile,
+        );
+
+        let t0 = Instant::now();
+        let long = tx.send(vec![0x22; 64], t0).unwrap();
+        tx.set_segment_floor(Duration::from_secs_f64(12.341));
+        assert_eq!(
+            tx.process_ack(long.wrapping_add(1), 0, t0 + Duration::from_millis(500)),
+            vec![long]
+        );
+
+        let t1 = t0 + Duration::from_secs(1);
+        tx.send(vec![0x33; 4], t1).unwrap();
+        tx.set_segment_floor(Duration::ZERO);
+        assert_secs(
+            tx.rto(),
+            base_floor.as_secs_f64(),
+            "a short segment after a long one",
+        );
+        assert!(
+            tx.rto() < Duration::from_secs_f64(12.341),
+            "the long segment's floor must not carry over: {:?}",
+            tx.rto()
+        );
+    }
+
+    /// COP-111: like every other timeout input, the segment floor is capped
+    /// at the 60 s backoff cap.
+    #[test]
+    fn segment_floor_is_capped_at_the_backoff_cap() {
+        let mut tx = cop111_window1_tx();
+        tx.set_segment_floor(Duration::from_secs(90));
+        assert_eq!(tx.rto(), Duration::from_secs_f64(MAX_RTO_SECS));
     }
 }

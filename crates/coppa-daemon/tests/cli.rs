@@ -6,6 +6,9 @@
 //! for the expected exit. Output goes to temporary files rather than pipes, so
 //! a full pipe cannot hide the process finishing.
 
+// COP-142: the std-clock ban in clippy.toml targets event_loop only.
+#![allow(clippy::disallowed_methods)]
+
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -1813,6 +1816,14 @@ fn the_default_config_states_that_nothing_is_listening() {
         host.contains("vara_command=disabled vara_data=disabled"),
         "{host}"
     );
+    assert!(
+        host.contains(if cfg!(feature = "kiss-tnc") {
+            "kiss=disabled"
+        } else {
+            "kiss=not-built"
+        }),
+        "{host}"
+    );
 }
 
 #[cfg(not(feature = "cpal-backend"))]
@@ -1945,5 +1956,48 @@ fn startup_names_the_audio_devices_it_opened() {
     assert!(
         input.contains("hardware_rate=") && input.contains("engine_rate=48000"),
         "{input}"
+    );
+}
+
+#[cfg(not(feature = "kiss-tnc"))]
+#[test]
+fn kiss_enabled_without_the_kiss_tnc_feature_is_a_startup_error() {
+    run_startup_error(
+        "[host]\nkiss_enabled = true\n",
+        "[host] kiss_enabled = true is set, but this coppad was built without the kiss-tnc feature",
+    );
+}
+
+#[cfg(all(feature = "kiss-tnc", not(feature = "cpal-backend")))]
+#[test]
+fn the_kiss_listener_is_reported_at_startup() {
+    let dir = TempDir::new("kiss-summary");
+    dir.write(
+        "station.toml",
+        "[engine]\ncallsign = \"N1CALL\"\n[host]\nkiss_enabled = true\nkiss_port = 0\n",
+    );
+    let (mut daemon, _) = start_until_ready(
+        dir.path(),
+        &["--config", "station.toml"],
+        &[("NO_COLOR", "1")],
+    );
+    let (stdout, _) = daemon.kill();
+    let (kiss_at, _) = line_with(&stdout, "KISS datagram interface listening");
+    let (_, host) = line_with(&stdout, "Host listeners");
+    let (ready_at, _) = line_with(&stdout, "Daemon ready");
+    assert!(host.contains("kiss=127.0.0.1:"), "{host}");
+    assert!(kiss_at < ready_at);
+}
+
+#[cfg(feature = "kiss-tnc")]
+#[test]
+fn a_taken_kiss_datagram_port_is_a_startup_error() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    run_startup_error(
+        &format!(
+            "[host]\nkiss_enabled = true\nkiss_port = {}\n",
+            listener.local_addr().unwrap().port()
+        ),
+        "failed to bind the KISS datagram port to 127.0.0.1:",
     );
 }

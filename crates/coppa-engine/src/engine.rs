@@ -32,6 +32,15 @@ pub const WIRE_FORMAT_VERSION: u8 = 1;
 pub const TUNE_TONE_LOW_HZ: f32 = 700.0;
 /// High tone of the standard SSB two-tone TX-level calibration signal (Hz).
 pub const TUNE_TONE_HIGH_HZ: f32 = 1900.0;
+/// Longest TX-level calibration tone [`CoppaCore::tune_tone`] generates, in
+/// seconds. Longer (or infinite) requests are cut to this, so no caller can
+/// make the engine allocate without bound (COP-83: VARA `TUNE 1e12` aborted
+/// the daemon on a 192 EB allocation).
+pub const MAX_TUNE_SECONDS: f32 = 120.0;
+/// Lowest single-tone TUNE frequency a host interface accepts (Hz).
+pub const TUNE_SINGLE_MIN_HZ: f32 = 300.0;
+/// Highest single-tone TUNE frequency a host interface accepts (Hz).
+pub const TUNE_SINGLE_MAX_HZ: f32 = 3000.0;
 
 /// One decode result surfaced by [`CoppaCore::push_samples`] for a single frame
 /// `StreamingReceiver` completed.
@@ -322,6 +331,20 @@ impl CoppaCore {
         self.encode_bytes_at(data, self.config.speed_level, codewords)
     }
 
+    /// Encode a Data frame without applying compression, using 1..=8 codewords.
+    ///
+    /// A compression-enabled receiver decompresses payloads starting with `0xFE`.
+    /// Callers must frame their payload so its first byte cannot equal that marker.
+    /// The daemon's Datagram MAC header starts with `0x19` and provides this framing.
+    pub fn encode_uncompressed_with_codewords(
+        &self,
+        data: &[u8],
+        codewords: u8,
+    ) -> Result<Vec<f32>, EngineError> {
+        Self::check_codewords(codewords)?;
+        self.encode_payload_at(data, self.config.speed_level, codewords)
+    }
+
     /// COP-69: shared codeword-count validation for the codeword-aware
     /// encode twins (COP-19 surface: `Err`, never a panic).
     fn check_codewords(codewords: u8) -> Result<(), EngineError> {
@@ -410,7 +433,16 @@ impl CoppaCore {
         codewords: u8,
     ) -> Result<Vec<f32>, EngineError> {
         let payload = self.compress_payload(data);
+        self.encode_payload_at(&payload, level, codewords)
+    }
 
+    /// Build and transmit a Data frame from an already prepared payload.
+    fn encode_payload_at(
+        &self,
+        payload: &[u8],
+        level: u8,
+        codewords: u8,
+    ) -> Result<Vec<f32>, EngineError> {
         if payload.len() > u16::MAX as usize {
             return Err(EngineError::PayloadTooLarge {
                 len: payload.len(),
@@ -430,7 +462,7 @@ impl CoppaCore {
             codewords,
         };
 
-        let samples = self.transceiver.transmit(&header, &payload)?;
+        let samples = self.transceiver.transmit(&header, payload)?;
         Ok(samples)
     }
 
@@ -495,8 +527,16 @@ impl CoppaCore {
     ///
     /// Peak-normalized to the same [`TX_PEAK`] frames use, so the drive level
     /// an operator sets here transfers directly to real traffic.
+    ///
+    /// `seconds` is capped at [`MAX_TUNE_SECONDS`]; a NaN or negative
+    /// duration gives an empty buffer.
     pub fn tune_tone(&self, seconds: f32, single_hz: Option<f32>) -> Vec<f32> {
         let sample_rate = self.config.sample_rate as f32;
+        let seconds = if seconds.is_nan() {
+            0.0
+        } else {
+            seconds.clamp(0.0, MAX_TUNE_SECONDS)
+        };
         let n = (seconds * sample_rate).round().max(0.0) as usize;
         let two_pi = std::f32::consts::TAU;
 
@@ -797,6 +837,62 @@ impl Default for CoppaCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn datagram_test_payload() -> Vec<u8> {
+        let mut state = 0x1380_abcd_u32;
+        let mut payload: Vec<u8> = (0..514)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        payload[0] = 0x19;
+        payload
+    }
+
+    #[test]
+    fn uncompressed_multi_codeword_encode_round_trips_on_a_compressing_engine() {
+        let core = CoppaCore::from_profile(&crate::profiles::HF_STANDARD);
+        let payload = datagram_test_payload();
+        let audio = core
+            .encode_uncompressed_with_codewords(&payload, 5)
+            .unwrap();
+        assert_eq!(core.decode_bytes(&audio).unwrap(), payload);
+    }
+
+    #[test]
+    fn uncompressed_encode_fits_where_the_compressed_path_does_not() {
+        let core = CoppaCore::from_profile(&crate::profiles::HF_STANDARD);
+        let payload = datagram_test_payload();
+        assert!(core.encoded_payload_len(&payload) > 585);
+        assert!(core.encode_uncompressed_with_codewords(&payload, 5).is_ok());
+    }
+
+    #[test]
+    fn uncompressed_encode_rejects_bad_codeword_counts() {
+        let core = CoppaCore::from_profile(&crate::profiles::HF_STANDARD);
+        assert!(matches!(
+            core.encode_uncompressed_with_codewords(b"x", 0),
+            Err(EngineError::ZeroCodewords)
+        ));
+        assert!(matches!(
+            core.encode_uncompressed_with_codewords(b"x", 9),
+            Err(EngineError::TooManyCodewords {
+                requested: 9,
+                max: 8
+            })
+        ));
+    }
+
+    #[test]
+    fn uncompressed_encode_rejects_a_payload_over_the_budget() {
+        let core = CoppaCore::from_profile(&crate::profiles::HF_STANDARD);
+        assert!(core
+            .encode_uncompressed_with_codewords(&vec![0x19; 937], 8)
+            .is_err());
+    }
 
     #[test]
     fn debug_output_is_short_and_names_the_config() {
@@ -1487,6 +1583,22 @@ mod tests {
             let fft = FftProcessor::new(sample_rate);
             let input: Vec<Complex32> = samples.iter().map(|&s| Complex32::new(s, 0.0)).collect();
             fft.forward(&input).iter().map(|c| c.norm()).collect()
+        }
+
+        #[test]
+        fn caps_duration_at_max_tune_seconds() {
+            let core = CoppaCore::new();
+            let sample_rate = core.config().sample_rate as f32;
+            let capped = (MAX_TUNE_SECONDS * sample_rate).round() as usize;
+
+            assert_eq!(core.tune_tone(f32::INFINITY, None).len(), capped);
+            assert_eq!(core.tune_tone(1e12, None).len(), capped);
+            assert!(core.tune_tone(f32::NAN, None).is_empty());
+            assert!(core.tune_tone(-5.0, None).is_empty());
+            assert_eq!(
+                core.tune_tone(10.0, None).len(),
+                (10.0 * sample_rate).round() as usize
+            );
         }
 
         #[test]

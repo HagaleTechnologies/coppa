@@ -38,31 +38,11 @@
 //! self-check that this test's partition doesn't silently drop a vector, not
 //! a re-statement of that shape guarantee.
 //!
-//! ## Two vectors are excluded: a pre-existing, already-documented
-//! ## `StreamingReceiver` sensitivity gap, not a Task 4 regression
+//! ## Every vector runs
 //!
-//! `L1_awgn12`/`L2_awgn12` (hf_standard, 12 dB AWGN, no CFO) decode fine via
-//! the batch `CoppaTransceiver::receive` API (`golden_vectors.rs`) but
-//! produce zero frames via `StreamingReceiver::push_samples` even after this
-//! task's `header_peek` CFO fix (see `crates/coppa-protocol/src/modem/
-//! streaming.rs`'s `header_peek` doc). Root-caused directly (a throwaway
-//! diagnostic comparing `SyncDetector::detect_all` on raw vs. RX-bandpass-
-//! filtered samples for these two files: 0 candidates raw, 1 filtered, for
-//! both) to an ALREADY-DOCUMENTED, PRE-EXISTING trade-off from Phase 3 Task 7
-//! (see the `ring` field's doc comment in `streaming.rs`): `StreamingReceiver`
-//! deliberately runs `SyncDetector` on raw (unfiltered) samples rather than
-//! continuously RX-bandpass-filtering the whole stream (measured ~13x more
-//! expensive for a real-time daemon), at a measured ~9 dB sync-sensitivity
-//! cost relative to filtering first. `CoppaTransceiver::receive` filters the
-//! whole buffer before its own internal sync search, so it doesn't pay this
-//! cost. This gap only affects HF profiles (VHF has no RX bandpass filter at
-//! all, so raw == filtered there) -- exactly why `L5_awgn12`/`L6_awgn12`/
-//! `L9_awgn12` (vhf_wide) are unaffected and remain in this test's covered
-//! set. This is a real, pre-existing `StreamingReceiver` limitation, not
-//! introduced by this task and not fixed by it (recovering that margin is
-//! explicitly called out in `streaming.rs`'s own doc as "a reasonable future
-//! improvement but out of [Task 7's] scope" -- equally out of Task 4's scope
-//! here, which is CLI/WebSocket completion, not sync-detector sensitivity).
+//! All 20 vectors run through `coppa rx` since COP-126, which gave the
+//! streaming receiver's sync detector its own decimated band-pass
+//! (`docs/adr/011-cop126-decimated-sync-prefilter.md`).
 
 mod common;
 
@@ -114,14 +94,6 @@ fn needs_vhf_profile(level: u8, channel: &str) -> bool {
     level >= 5 && channel != "poor25" && channel != "ssbcfo"
 }
 
-/// See this file's module doc ("Two vectors are excluded...") for the full
-/// root-cause: a pre-existing, already-documented `StreamingReceiver`
-/// raw-vs-filtered sync sensitivity gap (Phase 3 Task 7), only reachable on
-/// HF-profile vectors (levels 1-4) under real (non-injected) AWGN.
-fn is_known_streaming_receiver_gap(level: u8, channel: &str) -> bool {
-    level < 5 && channel == "awgn12"
-}
-
 /// Run `coppa rx --input <wav> --raw [--profile <name>]` and return its
 /// trimmed stdout (expected to be one lowercase-hex line per decoded frame).
 fn run_rx(wav_path: &Path, profile: Option<&str>) -> String {
@@ -149,11 +121,6 @@ fn golden_vectors_rx_cli_decodes_and_prints_payloads() {
         if !v.expected_decode_ok {
             // Documented, verified known-limitation failure (see manifest.toml's
             // header comment) -- not this test's concern.
-            continue;
-        }
-        if is_known_streaming_receiver_gap(v.level, &v.channel) {
-            // Pre-existing, already-documented StreamingReceiver limitation --
-            // see this file's module doc. Not this task's to fix.
             continue;
         }
 
@@ -186,12 +153,10 @@ fn golden_vectors_rx_cli_decodes_and_prints_payloads() {
 /// (as of 2026-07-26 -- see `golden_vectors_gen.rs`'s module doc: the
 /// previous `L9_poor25` "structurally undecodable" classification was a
 /// stale-IR-HARQ-accumulator bench bug, fixed, and that vector now decodes
-/// like every other), 2 are the documented `StreamingReceiver`
-/// sync-sensitivity gap (module doc), and the remaining 18 are exactly what
-/// `golden_vectors_rx_cli_decodes_and_prints_payloads` above actually
-/// exercises -- catches either exclusion list silently drifting out of sync
-/// with the manifest (e.g. a regenerated manifest changing which vectors
-/// exist).
+/// like every other), and all 20 are what
+/// `golden_vectors_rx_cli_decodes_and_prints_payloads` above exercises, with
+/// no exclusion (COP-126 removed the last one) -- catches the test silently
+/// dropping a vector, or a regenerated manifest changing which vectors exist.
 #[test]
 fn test_rx_golden_vectors_cover_every_vector_exactly_once() {
     let manifest = read_manifest();
@@ -212,23 +177,12 @@ fn test_rx_golden_vectors_cover_every_vector_exactly_once() {
         "expected 20 known-good golden vectors"
     );
 
-    let known_gap_count = expected_ok
-        .iter()
-        .filter(|v| is_known_streaming_receiver_gap(v.level, &v.channel))
-        .count();
+    // `golden_vectors_rx_cli_decodes_and_prints_payloads` skips only vectors
+    // that are not `expected_decode_ok`, so every one of these is covered.
+    let covered = expected_ok.len();
     assert_eq!(
-        known_gap_count, 2,
-        "expected exactly 2 vectors (L1_awgn12, L2_awgn12) in the documented \
-         StreamingReceiver sync-sensitivity gap"
-    );
-
-    let covered = expected_ok
-        .iter()
-        .filter(|v| !is_known_streaming_receiver_gap(v.level, &v.channel))
-        .count();
-    assert_eq!(
-        covered, 18,
-        "expected 18 vectors actually covered by the rx CLI test"
+        covered, 20,
+        "expected all 20 vectors covered by the rx CLI test, with no exclusion"
     );
 
     for v in &expected_ok {
