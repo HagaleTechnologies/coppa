@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 
 use coppa_bench::scenario::select_profile;
 use coppa_codec::ofdm::CoppaProfile;
+use coppa_protocol::modem::streaming::StreamingReceiver;
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 
 #[derive(serde::Deserialize)]
@@ -228,5 +229,62 @@ fn golden_manifest_covers_the_full_grid() {
         manifest.vectors.len(),
         levels.len() * channels.len(),
         "manifest has unexpected extra/missing entries"
+    );
+}
+
+/// Streaming chunk size: 100 ms at 48 kHz, the size `coppa rx` and the
+/// daemon's audio loop push.
+const STREAM_CHUNK: usize = 4800;
+/// Trailing zeros after each WAV, matching the CLI's `TRAILING_FLUSH_SAMPLES`,
+/// so a frame that ends near the end of the file still completes.
+const TRAILING_FLUSH_SAMPLES: usize = 8192;
+
+/// COP-126: every golden vector decodes through `StreamingReceiver`, the
+/// receive path the daemon, `coppa rx` and the FFI share, not only through
+/// the batch `CoppaTransceiver::receive` above. Before COP-126 the streaming
+/// detector saw unfiltered noise and missed `L1_awgn12` and `L2_awgn12`.
+#[test]
+fn golden_vectors_decode_through_the_streaming_receiver() {
+    let dir = golden_dir();
+    let manifest_text = std::fs::read_to_string(dir.join("manifest.toml"))
+        .expect("failed to read golden manifest.toml");
+    let manifest: ManifestFile =
+        toml::from_str(&manifest_text).expect("failed to parse golden manifest.toml");
+    assert_eq!(
+        manifest.vectors.len(),
+        20,
+        "expected the full 20-vector grid"
+    );
+
+    let mut failures = Vec::new();
+    for v in &manifest.vectors {
+        let (mut samples, _) = read_wav_f32(&dir.join(&v.wav_file));
+        samples.extend(std::iter::repeat_n(0.0f32, TRAILING_FLUSH_SAMPLES));
+        let expected_payload = decode_hex(&v.payload_hex);
+
+        let mut rx = StreamingReceiver::new(profile_for(v.level, &v.channel), 1);
+        let mut decoded = Vec::new();
+        for chunk in samples.chunks(STREAM_CHUNK) {
+            decoded.extend(rx.push_samples(chunk));
+        }
+
+        let ok = decoded.len() == 1
+            && decoded[0].payload.len() >= expected_payload.len()
+            && decoded[0].payload[..expected_payload.len()] == expected_payload[..];
+        if ok != v.expected_decode_ok {
+            failures.push(format!(
+                "{}: {} frame(s) decoded through the streaming receiver",
+                v.id,
+                decoded.len()
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "streaming golden vector failures ({}/{}):\n{}",
+        failures.len(),
+        manifest.vectors.len(),
+        failures.join("\n")
     );
 }

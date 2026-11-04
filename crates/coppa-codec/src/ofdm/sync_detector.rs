@@ -21,11 +21,28 @@
 //! successor Phase-2 rate-loop plan) for the original design rationale and locked
 //! algorithm, and `docs/adr/004-strongest-path-timing.md` for the timing-anchor
 //! correction on top of it.
+//!
+//! # Two front ends
+//!
+//! [`SyncDetector::new`] (and [`SyncDetector::detect_all`]) runs the coarse
+//! plateau search on its input as given. Use it when the input is already
+//! band-pass filtered, as the batch receive path (`CoppaTransceiver`) does.
+//!
+//! [`SyncDetector::new_prefiltered`] is for a caller that feeds raw receiver
+//! audio, such as the streaming receiver. On an HF profile it band-passes a
+//! copy of the input to 250-2850 Hz (the HF RX filter's passband) and
+//! decimates it by 4, and the Schmidl-Cox plateau search runs on that copy at a
+//! quarter of the sample rate. Without the filter, the plateau test sees noise
+//! across the whole 24 kHz band, about 9 dB more than the batch path sees.
+//! The confirm and strongest-path timing steps run at the full sample rate on
+//! the raw input in both front ends, so candidate coordinates are the same
+//! (`docs/adr/011-cop126-decimated-sync-prefilter.md`).
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 
 use num_complex::Complex32;
 
-use coppa_dsp::fir::{design_hilbert, StreamingFir};
+use coppa_dsp::fir::{design_bandpass, design_hilbert, DecimatingFir, StreamingFir};
 
 use super::sync::generate_coppa_preamble;
 use super::CoppaProfile;
@@ -39,6 +56,24 @@ const GROUP_DELAY: u64 = (HILBERT_TAPS as u64 - 1) / 2;
 const STRIDE: u64 = 16;
 /// Plateau open/close threshold on the normalized Schmidl-Cox metric M.
 const PLATEAU_THRESHOLD: f32 = 0.5;
+/// Tap count of `new_prefiltered`'s coarse-stage band-pass (odd, so it is
+/// linear phase with a whole-sample group delay of 60). 121 taps came within
+/// 0.01 dB of the sync threshold a full-rate filter reaches, and the decimated
+/// detector still costs less per sample than the unfiltered one (COP-126
+/// sweep, BENCHMARKS.md "COP-126").
+const PREFILTER_TAPS: usize = 121;
+/// Decimation factor of `new_prefiltered`'s coarse stage. Every HF profile's
+/// FFT size, cyclic prefix and sample rate divide by 4, and 12 kHz still
+/// holds the 2850 Hz band edge well below Nyquist.
+const PREFILTER_DECIMATION: NonZeroUsize = match NonZeroUsize::new(4) {
+    Some(d) => d,
+    None => panic!("decimation factor must be non-zero"),
+};
+/// Lower edge (Hz) of the coarse-stage band-pass: the HF RX filter's passband,
+/// the same band as `CoppaModem`'s `tx_bpf` and `CoppaTransceiver`'s `rx_bpf`.
+const PREFILTER_LO_HZ: f32 = 250.0;
+/// Upper edge (Hz) of the coarse-stage band-pass (see `PREFILTER_LO_HZ`).
+const PREFILTER_HI_HZ: f32 = 2850.0;
 /// Confirmation cross-correlation threshold: rejects steady tones and other
 /// non-preamble self-similar signals (measured tone-vs-Newman-comb xcorr <= ~0.1).
 const CONFIRM_THRESHOLD: f32 = 0.25;
@@ -116,8 +151,10 @@ pub struct SyncCandidate {
 #[derive(Debug)]
 pub struct SyncDetector {
     profile: CoppaProfile,
-    /// OFDM symbol length (fft_size + cp_samples) — the Schmidl-Cox lag `L`.
-    symbol_len: usize,
+    /// Parameters of the Schmidl-Cox plateau search (stage 1). `new` sets the
+    /// identity stage (full rate, no filter); `new_prefiltered` may install a
+    /// band-pass decimated stage.
+    coarse: CoarseStage,
     /// Cached clean 2-symbol preamble (length `2*symbol_len`), used for confirm
     /// + first-path cross-correlation.
     reference: Vec<f32>,
@@ -133,14 +170,15 @@ pub struct SyncDetector {
     /// 129-tap Hilbert transformer producing the quadrature component.
     hilbert: StreamingFir,
 
-    /// Ring of up to `2*symbol_len + 1` most recent analytic samples, used to
+    /// Ring of up to `2*coarse.lag + 1` most recent analytic samples, used to
     /// maintain the O(1) sliding Schmidl-Cox sums.
     ring: VecDeque<Complex32>,
     bootstrapped: bool,
     p: Complex32,
     e1: f32,
     e2: f32,
-    /// Current Schmidl-Cox window-start index (valid once bootstrapped).
+    /// Current Schmidl-Cox window-start index (valid once bootstrapped), in
+    /// coarse-stage samples.
     d: u64,
 
     in_plateau: bool,
@@ -180,9 +218,20 @@ impl SyncDetector {
         let hilbert_coeffs = design_hilbert(HILBERT_TAPS);
         let retain_samples = (4 * two_l).max(HILBERT_TAPS) as u64;
 
+        let coarse = CoarseStage {
+            prefilter: None,
+            decimation: 1,
+            prefilter_delay: 0,
+            lag: symbol_len,
+            fft_size: profile.fft_size,
+            cp_samples: profile.cp_samples,
+            sample_rate: profile.sample_rate as f32,
+            stride: STRIDE,
+        };
+
         Self {
             profile,
-            symbol_len,
+            coarse,
             reference,
             ref_energy,
             delay: DelayLine::new(GROUP_DELAY as usize),
@@ -205,6 +254,64 @@ impl SyncDetector {
         }
     }
 
+    /// Creates a detector for a caller that feeds it raw receiver audio, such
+    /// as `coppa_protocol::modem::streaming::StreamingReceiver`.
+    ///
+    /// For an HF profile (`phy_mode == 0`), the Schmidl-Cox plateau search
+    /// runs on a copy of the input that is band-passed to 250-2850 Hz (the HF
+    /// RX filter's passband) and decimated by 4. The confirm and
+    /// strongest-path timing steps still run at the full sample rate on the
+    /// raw input, so `SyncCandidate::frame_start` uses the same coordinates as
+    /// `new`, and on a clean frame it has the same value. On white noise this
+    /// detector finds a preamble at about 10 dB lower SNR than `new` (see
+    /// BENCHMARKS.md, "COP-126").
+    ///
+    /// A VHF profile gets exactly `new`. So does a profile whose geometry does
+    /// not suit a factor of 4: an FFT size, cyclic prefix or sample rate that
+    /// does not divide by 4, a quarter FFT size that is odd (the CFO estimate
+    /// needs a whole half-symbol lag), or a sample rate too low to decimate
+    /// without folding noise into the passband. Use `new` or `detect_all`
+    /// when the input is already band-pass filtered, as the batch receive
+    /// path does.
+    pub fn new_prefiltered(profile: CoppaProfile, version: u8) -> Self {
+        let mut detector = Self::new(profile, version);
+        let d = PREFILTER_DECIMATION.get();
+        let p = &detector.profile;
+        let divides = p.fft_size % d == 0
+            && (p.fft_size / d) % 2 == 0
+            && p.cp_samples % d == 0
+            && p.sample_rate % d as u32 == 0;
+        let fs = p.sample_rate as f32;
+        let coarse_rate = fs / d as f32;
+        // After decimation, noise at input frequency `f` folds to
+        // `coarse_rate - f`. It stays out of the passband when the filter's
+        // stopband edge (`PREFILTER_HI_HZ` plus the Blackman transition width,
+        // about 5.5 * fs / taps) lies below `coarse_rate - PREFILTER_HI_HZ`.
+        let stopband_edge = PREFILTER_HI_HZ + 5.5 * fs / PREFILTER_TAPS as f32;
+        let no_alias = stopband_edge <= coarse_rate - PREFILTER_HI_HZ;
+        if p.phy_mode != 0 || !divides || !no_alias {
+            return detector;
+        }
+        let fir = DecimatingFir::new(
+            design_bandpass(PREFILTER_TAPS, fs, PREFILTER_LO_HZ, PREFILTER_HI_HZ),
+            PREFILTER_DECIMATION,
+        );
+        let fft_size = p.fft_size / d;
+        let cp_samples = p.cp_samples / d;
+        detector.coarse = CoarseStage {
+            prefilter_delay: fir.group_delay() as u64,
+            prefilter: Some(fir),
+            decimation: d as u64,
+            lag: fft_size + cp_samples,
+            fft_size,
+            cp_samples,
+            sample_rate: coarse_rate,
+            stride: (STRIDE / d as u64).max(1),
+        };
+        detector.ring = VecDeque::with_capacity(2 * detector.coarse.lag + 2);
+        detector
+    }
+
     /// Push samples; returns any candidates confirmed in this block (candidates
     /// whose coarse timing was found earlier but needed more future samples to
     /// confirm are resolved on a later `push` once enough history has arrived).
@@ -221,12 +328,23 @@ impl SyncDetector {
 
         self.resolve_pending(&mut out);
 
-        let mut delayed = Vec::with_capacity(samples.len());
-        self.delay.process(samples, &mut delayed);
-        let mut quadrature = Vec::with_capacity(samples.len());
-        self.hilbert.process(samples, &mut quadrature);
+        // Stage 1 runs on the decimated band-pass copy when a pre-filter is
+        // installed, and on the input itself otherwise.
+        let mut decimated = Vec::new();
+        let front: &[f32] = match self.coarse.prefilter.as_mut() {
+            Some(fir) => {
+                fir.process(samples, &mut decimated);
+                &decimated
+            }
+            None => samples,
+        };
 
-        for k in 0..samples.len() {
+        let mut delayed = Vec::with_capacity(front.len());
+        self.delay.process(front, &mut delayed);
+        let mut quadrature = Vec::with_capacity(front.len());
+        self.hilbert.process(front, &mut quadrature);
+
+        for k in 0..front.len() {
             let z = Complex32::new(delayed[k], quadrature[k]);
             self.ingest_analytic_sample(z, &mut out);
         }
@@ -246,7 +364,7 @@ impl SyncDetector {
     }
 
     fn ingest_analytic_sample(&mut self, z: Complex32, out: &mut Vec<SyncCandidate>) {
-        let l = self.symbol_len;
+        let l = self.coarse.lag;
         let two_l = 2 * l;
 
         self.ring.push_back(z);
@@ -291,7 +409,7 @@ impl SyncDetector {
     }
 
     fn evaluate_metric(&mut self, out: &mut Vec<SyncCandidate>) {
-        if self.d % STRIDE != 0 {
+        if self.d % self.coarse.stride != 0 {
             return;
         }
         let denom = (self.e1 * self.e2).max(1e-20);
@@ -306,7 +424,16 @@ impl SyncDetector {
             self.in_plateau = true;
         } else if self.in_plateau {
             self.in_plateau = false;
-            let coarse_peak = self.plateau_best_d.saturating_sub(GROUP_DELAY);
+            // `plateau_best_d - GROUP_DELAY` is the plateau peak in coarse-stage
+            // samples (the Hilbert/delay-line pair delays the analytic signal
+            // by GROUP_DELAY coarse samples). Coarse sample `k` is the
+            // pre-filter's output at input index `k * decimation`, whose
+            // content is the input near `k * decimation - prefilter_delay`.
+            // With the identity stage (decimation 1, delay 0) this is the
+            // plain `plateau_best_d - GROUP_DELAY`.
+            let coarse_peak = (self.plateau_best_d.saturating_sub(GROUP_DELAY)
+                * self.coarse.decimation)
+                .saturating_sub(self.coarse.prefilter_delay);
             let cfo_hz = self.plateau_best_cfo;
             if !self.try_resolve_one(coarse_peak, cfo_hz, out) {
                 self.pending.push_back((coarse_peak, cfo_hz));
@@ -316,17 +443,20 @@ impl SyncDetector {
 
     /// Two-stage CFO estimate (`estimate_cfo_two_stage`) from the ring's CURRENT
     /// contents. Whenever `evaluate_metric` runs, `self.ring` holds exactly
-    /// `2*symbol_len` analytic samples spanning the window `[self.d, self.d+2*symbol_len)`
+    /// `2*coarse.lag` analytic samples spanning the window `[self.d, self.d+2*coarse.lag)`
     /// (see the recurrence comment in `ingest_analytic_sample`), which is exactly the
-    /// analytic window `estimate_cfo_two_stage` needs for `coarse_start = 0`.
+    /// analytic window `estimate_cfo_two_stage` needs for `coarse_start = 0`. The
+    /// coarse stage's FFT size, cyclic prefix and sample rate all scale by the
+    /// same decimation factor, so the bin spacing and the estimate's ambiguity
+    /// step are the same as at the full rate.
     fn estimate_cfo_from_ring(&self) -> f32 {
         let window: Vec<Complex32> = self.ring.iter().copied().collect();
         super::sync::estimate_cfo_two_stage(
             &window,
             0,
-            self.profile.fft_size,
-            self.profile.cp_samples,
-            self.profile.sample_rate as f32,
+            self.coarse.fft_size,
+            self.coarse.cp_samples,
+            self.coarse.sample_rate,
         )
     }
 
@@ -466,6 +596,30 @@ impl SyncDetector {
             self.history_base += 1;
         }
     }
+}
+
+/// Parameters of the coarse (Schmidl-Cox plateau) stage. `SyncDetector::new`
+/// builds the identity stage: full rate, no filter. `new_prefiltered` builds a
+/// band-pass decimated one with every length and rate divided by `decimation`.
+#[derive(Debug)]
+struct CoarseStage {
+    /// Band-pass decimator ahead of the plateau search, if any.
+    prefilter: Option<DecimatingFir>,
+    /// Input samples per coarse-stage sample (1 with no pre-filter).
+    decimation: u64,
+    /// The pre-filter's group delay in input samples (0 with no pre-filter).
+    prefilter_delay: u64,
+    /// The Schmidl-Cox lag `L`, one OFDM symbol in coarse-stage samples.
+    lag: usize,
+    /// FFT size in coarse-stage samples, for the CFO estimate.
+    fft_size: usize,
+    /// Cyclic prefix in coarse-stage samples, for the CFO estimate.
+    cp_samples: usize,
+    /// Coarse-stage sample rate (Hz), for the CFO estimate.
+    sample_rate: f32,
+    /// Evaluate the metric every `stride` coarse-stage samples, which is one
+    /// evaluation per `STRIDE` input samples in both stages.
+    stride: u64,
 }
 
 /// De-rotate a real-valued window by `e^{-j*2*pi*cfo_hz*t/sample_rate}` (converting to
@@ -798,5 +952,247 @@ mod tests {
              ({expected}), not the far, stronger echo; err={err}",
             candidates[0].frame_start
         );
+    }
+
+    /// Push `x` into `detector` in `chunk`-sample pieces and collect every
+    /// candidate.
+    fn push_chunked(detector: &mut SyncDetector, x: &[f32], chunk: usize) -> Vec<SyncCandidate> {
+        let mut out = Vec::new();
+        for c in x.chunks(chunk) {
+            out.extend(detector.push(c));
+        }
+        out
+    }
+
+    /// Clean frame with 4 symbols of leading and 4 of trailing silence, pushed
+    /// in 512-sample chunks: the pre-filtered detector times it exactly like
+    /// the raw one on every HF profile.
+    #[test]
+    fn prefiltered_detector_times_clean_frames_like_the_raw_detector() {
+        for (name, profile) in [
+            ("hf_standard", CoppaProfile::hf_standard()),
+            ("hf_robust", CoppaProfile::hf_robust()),
+            ("hf_narrow", CoppaProfile::hf_narrow()),
+            ("hf_wide", CoppaProfile::hf_wide()),
+            ("hf_standard_short_cp", CoppaProfile::hf_standard_short_cp()),
+        ] {
+            let (_, clean) = leading_clean_frame(&profile);
+            let raw = push_chunked(&mut SyncDetector::new(profile.clone(), 1), &clean, 512);
+            let pre = push_chunked(
+                &mut SyncDetector::new_prefiltered(profile.clone(), 1),
+                &clean,
+                512,
+            );
+            assert_eq!(raw.len(), 1, "{name}: raw candidates {raw:?}");
+            assert_eq!(pre.len(), 1, "{name}: prefiltered candidates {pre:?}");
+            assert_eq!(
+                raw[0].frame_start, pre[0].frame_start,
+                "{name}: raw {raw:?} vs prefiltered {pre:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefiltered_detector_prefers_strongest_path_at_realistic_hf_delay() {
+        let profile = CoppaProfile::hf_standard();
+        let (lead, clean) = leading_clean_frame(&profile);
+        let delay = 96usize;
+        let rx = two_tap(&clean, 0.6, 1.0, delay);
+
+        let candidates = SyncDetector::new_prefiltered(profile.clone(), 1).push(&rx);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "expected exactly one candidate, got {candidates:?}"
+        );
+        let expected =
+            lead as i64 + tx_bpf_group_delay(&profile) + delay as i64 - TIMING_BACKOFF as i64;
+        let err = (candidates[0].frame_start as i64 - expected).abs();
+        assert!(
+            err <= 30,
+            "frame_start {} should be within 30 of the STRONGER echo's arrival - backoff \
+             ({expected}); err={err}",
+            candidates[0].frame_start
+        );
+    }
+
+    #[test]
+    fn prefiltered_detector_falls_back_to_first_path_beyond_half_cp() {
+        let profile = CoppaProfile::hf_standard();
+        let (lead, clean) = leading_clean_frame(&profile);
+        let delay = profile.cp_samples * 3 / 4;
+        let rx = two_tap(&clean, 0.6, 1.0, delay);
+
+        let candidates = SyncDetector::new_prefiltered(profile.clone(), 1).push(&rx);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "expected exactly one candidate, got {candidates:?}"
+        );
+        let expected = lead as i64 + tx_bpf_group_delay(&profile) - TIMING_BACKOFF as i64;
+        let err = (candidates[0].frame_start as i64 - expected).abs();
+        assert!(
+            err <= 30,
+            "frame_start {} should be within 30 of the DIRECT path's arrival - backoff \
+             ({expected}); err={err}",
+            candidates[0].frame_start
+        );
+    }
+
+    /// Full-band white noise at 6 dB (3 kHz convention) with no RX filter:
+    /// the raw plateau test never fires, and the pre-filtered one does.
+    #[test]
+    fn prefiltered_detector_finds_a_frame_the_raw_detector_misses_in_full_band_noise() {
+        let profile = CoppaProfile::hf_standard();
+        let frame = test_frame(&profile);
+        let frame_power = coppa_channel::mean_power(&frame);
+        let lead = 30_000usize;
+        let mut clean = vec![0.0f32; lead];
+        clean.extend_from_slice(&frame);
+        clean.extend(std::iter::repeat_n(
+            0.0f32,
+            4 * (profile.fft_size + profile.cp_samples),
+        ));
+
+        let reference = push_chunked(
+            &mut SyncDetector::new_prefiltered(profile.clone(), 1),
+            &clean,
+            512,
+        );
+        assert_eq!(reference.len(), 1, "clean candidates {reference:?}");
+
+        let noisy = coppa_channel::awgn_ref_seeded(&clean, 6.0, frame_power, 48_000.0, 0xC0FFEE);
+        let pre = push_chunked(
+            &mut SyncDetector::new_prefiltered(profile.clone(), 1),
+            &noisy,
+            512,
+        );
+        let raw = push_chunked(&mut SyncDetector::new(profile, 1), &noisy, 512);
+        assert_eq!(pre.len(), 1, "prefiltered candidates {pre:?}");
+        let err = pre[0].frame_start.abs_diff(reference[0].frame_start);
+        assert!(err <= 60, "prefiltered timing off by {err}: {pre:?}");
+        assert!(raw.is_empty(), "raw detector should miss at 6 dB: {raw:?}");
+    }
+
+    #[test]
+    fn prefiltered_detector_rejects_steady_tone_and_white_noise() {
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+        let profile = CoppaProfile::hf_standard();
+        let sr = profile.sample_rate as f32;
+        let tone: Vec<f32> = (0..(5.0 * sr) as usize)
+            .map(|i| (std::f32::consts::TAU * 1000.0 * i as f32 / sr).sin())
+            .collect();
+        let mut rng = StdRng::seed_from_u64(11);
+        let noise: Vec<f32> = (0..(10.0 * sr) as usize)
+            .map(|_| rng.random_range(-1.0f32..1.0))
+            .collect();
+        for (name, x) in [("tone", &tone), ("noise", &noise)] {
+            let candidates = push_chunked(
+                &mut SyncDetector::new_prefiltered(profile.clone(), 1),
+                x,
+                512,
+            );
+            assert!(candidates.is_empty(), "{name}: {candidates:?}");
+        }
+    }
+
+    #[test]
+    fn prefiltered_detector_output_does_not_depend_on_chunk_size() {
+        let profile = CoppaProfile::hf_standard();
+        let frame = test_frame(&profile);
+        let frame_power = coppa_channel::mean_power(&frame);
+        let sym = profile.fft_size + profile.cp_samples;
+        let mut clean = vec![0.0f32; 4 * sym];
+        clean.extend_from_slice(&frame[..(6 * sym).min(frame.len())]);
+        clean.extend(std::iter::repeat_n(0.0f32, 4 * sym));
+        let noisy = coppa_channel::awgn_ref_seeded(&clean, 10.0, frame_power, 48_000.0, 5);
+
+        let whole = SyncDetector::new_prefiltered(profile.clone(), 1).push(&noisy);
+        assert!(!whole.is_empty(), "expected a candidate at 10 dB");
+        for chunk in [1usize, 7, 512, 4800] {
+            let got = push_chunked(
+                &mut SyncDetector::new_prefiltered(profile.clone(), 1),
+                &noisy,
+                chunk,
+            );
+            assert_eq!(
+                got.len(),
+                whole.len(),
+                "chunk {chunk}: {got:?} vs {whole:?}"
+            );
+            for (a, b) in got.iter().zip(&whole) {
+                assert_eq!(a.frame_start, b.frame_start, "chunk {chunk}");
+                assert!((a.cfo_hz - b.cfo_hz).abs() < 1e-6, "chunk {chunk}");
+                assert!(
+                    (a.confirm_xcorr - b.confirm_xcorr).abs() < 1e-6,
+                    "chunk {chunk}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prefiltered_detector_estimates_an_injected_cfo() {
+        let profile = CoppaProfile::hf_standard();
+        let (_, clean) = leading_clean_frame(&profile);
+        let shifted = super::super::sync::remove_cfo(&clean, -15.0, profile.sample_rate as f32);
+        let candidates = push_chunked(
+            &mut SyncDetector::new_prefiltered(profile, 1),
+            &shifted,
+            512,
+        );
+        assert_eq!(candidates.len(), 1, "candidates {candidates:?}");
+        assert!(
+            (candidates[0].cfo_hz - 15.0).abs() < 1.0,
+            "cfo estimate {} should be within 1 Hz of 15",
+            candidates[0].cfo_hz
+        );
+    }
+
+    #[test]
+    fn prefiltered_detector_on_vhf_is_the_raw_detector() {
+        let profile = CoppaProfile::vhf_wide();
+        let (_, clean) = leading_clean_frame(&profile);
+        let frame_power = coppa_channel::mean_power(&clean);
+        let noisy = coppa_channel::awgn_ref_seeded(&clean, 6.0, frame_power, 48_000.0, 3);
+        for x in [&clean, &noisy] {
+            let raw = push_chunked(&mut SyncDetector::new(profile.clone(), 1), x, 512);
+            let pre = push_chunked(
+                &mut SyncDetector::new_prefiltered(profile.clone(), 1),
+                x,
+                512,
+            );
+            assert_eq!(raw, pre);
+        }
+        let clean_raw = SyncDetector::new(profile, 1).push(&clean);
+        assert_eq!(clean_raw.len(), 1, "clean VHF candidates {clean_raw:?}");
+    }
+
+    /// A geometry that does not suit a factor of 4 gets the plain detector.
+    #[test]
+    fn prefiltered_detector_falls_back_when_the_geometry_does_not_fit() {
+        let hf = CoppaProfile::hf_standard();
+        assert!(SyncDetector::new_prefiltered(hf.clone(), 1)
+            .coarse
+            .prefilter
+            .is_some());
+        let low_rate = CoppaProfile {
+            sample_rate: 16_000,
+            ..hf.clone()
+        };
+        let odd_quarter_fft = CoppaProfile {
+            fft_size: 964,
+            ..hf.clone()
+        };
+        let odd_cp = CoppaProfile {
+            cp_samples: 301,
+            ..hf
+        };
+        for profile in [low_rate, odd_quarter_fft, odd_cp] {
+            let detector = SyncDetector::new_prefiltered(profile, 1);
+            assert!(detector.coarse.prefilter.is_none());
+            assert_eq!(detector.coarse.decimation, 1);
+        }
     }
 }
