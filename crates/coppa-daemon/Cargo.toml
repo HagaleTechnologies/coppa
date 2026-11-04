@@ -21,6 +21,10 @@ path = "src/lib.rs"
 name = "pat_ardop_session"
 required-features = ["ardop"]
 
+[[test]]
+name = "kiss_datagram"
+required-features = ["kiss-tnc"]
+
 [dependencies]
 coppa-engine = { path = "../coppa-engine" }
 # default-features = false: coppa-audio's defaults turn on cpal-backend (ALSA on

@@ -633,6 +633,7 @@ impl WebSocketServer {
     /// `{"status":"degraded"}`, for monitoring tools. The answer needs no
     /// token, so it carries the status and nothing else. Without this, such a
     /// request gets `404`.
+    #[must_use]
     pub fn with_health(mut self, health: Health) -> Self {
         self.health = Some(health);
         self

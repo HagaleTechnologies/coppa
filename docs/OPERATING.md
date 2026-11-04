@@ -10,7 +10,7 @@ build without `cpal-backend`, with the default config, logs:
 ```
 INFO coppad: coppad - Coppa Daemon starting version="0.3.0" git_sha="f1dcac4a6ac6" features=none
 INFO coppad: Daemon configuration loaded profile=HF_STANDARD preferred_hardware_rate=48000 ptt_method=none turnaround_ms=500
-INFO coppad: Host listeners bind_address=127.0.0.1 vara_command=disabled vara_data=disabled websocket=not-built
+INFO coppad: Host listeners bind_address=127.0.0.1 vara_command=disabled vara_data=disabled ardop_command=not-built ardop_data=not-built websocket=not-built kiss=not-built
 WARN coppad: Audio devices: none; this coppad was built without the cpal-backend feature, so it can neither receive nor transmit
 INFO coppad: PTT method="none" active=none state="not controlled" guardian="not used"
 INFO coppad: Daemon ready
@@ -22,7 +22,7 @@ servers on logs, before `Daemon ready`:
 ```
 INFO coppad: Audio input started device="Default Audio Device (alsa:default)" hardware_rate=48000 engine_rate=48000
 INFO coppad: Audio output started device="Default Audio Device (alsa:default)" hardware_rate=48000 engine_rate=48000
-INFO coppad: Host listeners bind_address=127.0.0.1 vara_command=127.0.0.1:8300 vara_data=127.0.0.1:8301 websocket=127.0.0.1:8400
+INFO coppad: Host listeners bind_address=127.0.0.1 vara_command=127.0.0.1:8300 vara_data=127.0.0.1:8301 ardop_command=disabled ardop_data=disabled websocket=127.0.0.1:8400 kiss=disabled
 INFO coppad: Audio devices input="Default Audio Device (alsa:default)" output="Default Audio Device (alsa:default)" input_hardware_rate=48000 output_hardware_rate=48000 engine_rate=48000
 INFO coppad: PTT method="rigctld 127.0.0.1:4532" active=rigctld state="released" guardian="running, pid 28849"
 ```
@@ -33,7 +33,7 @@ INFO coppad: PTT method="rigctld 127.0.0.1:4532" active=rigctld state="released"
 | | `git_sha` | The commit HEAD pointed at when `coppad` was built (12 hex digits), or `unknown` for a build from a tree without `.git`. Packagers building from a tarball set `COPPA_GIT_SHA` (7-40 hex digits) at build time. It does not flag uncommitted changes. |
 | | `features` | `coppa-daemon`'s cargo features in this build (`cpal-backend`, `gpio-ptt`, `kiss-tnc`, `mdns`, `serial-ptt`, `websocket`), comma-separated, or `none`. |
 | `Host listeners` | `bind_address` | `[host] bind_address`. |
-| | `vara_command`, `vara_data`, `websocket` | The bound `ip:port` (the real port when 0 is configured), `disabled`, or, for `websocket` only, `not-built` in a build without the `websocket` feature. The `websocket` port also serves the operator page over plain HTTP at `GET /` (COP-79) and answers `GET /health` (COP-140, see [Health check](#health-check)). |
+| | `vara_command`, `vara_data`, `ardop_command`, `ardop_data`, `websocket`, `kiss` | The bound `ip:port` (the real port when 0 is configured), `disabled`, or, `not-built` when the listener feature (`websocket`, `ardop` or `kiss-tnc`) is absent. The `websocket` port also serves the operator page over plain HTTP at `GET /` (COP-79) and answers `GET /health` (COP-140, see [Health check](#health-check)). |
 | `Host listeners accept connections from other hosts; ...` (WARN) | `bind_address` | Logged when a listener is bound to a non-loopback address such as `0.0.0.0`: anyone who can reach it can key the transmitter. |
 | `mDNS advertisement` | `host`, `service`, `port`, `addresses` | Only with `[host] mdns_enabled = true` in an `mdns` build. The advertised host (`coppad.local.`), service instance (`coppad._coppa._tcp.local.`), bound WebSocket port, and `every non-loopback IPv4 address` (`bind_address = "0.0.0.0"`), `every non-loopback address` (`"[::]"`) or the single bound address. See [Finding coppad on the network](#finding-coppad-on-the-network-mdns). |
 | `mDNS name already in use on this network; ...` (WARN) | `original`, `new_name` | Another host answers for the name, so the responder renamed this daemon, for example to `coppad-2.local.`. Clients must use the new name. |
@@ -636,7 +636,7 @@ over `ws://`. Anyone who can watch that traffic can reuse it.
 
 ### What this does not cover
 
-The VARA-style command and data ports and the KISS TCP port have no
+The VARA-style command and data ports and both KISS TCP ports have no
 authentication, so that Pat and other VARA clients keep working. A web page
 can still deliver a VARA command line to the command port inside an HTTP
 `POST` body, and the daemon executes it. Until that is fixed, if you enable
@@ -1009,3 +1009,5 @@ If 1024 payloads are waiting, coppad writes what is queued, closes the data
 connection and logs `VARA data-port client is not reading; disconnecting it`.
 The command port stays connected. A host never sees a gap in received data
 while its data connection stays open.
+
+For the OFDM KISS datagram port (8100), see [RETICULUM.md](RETICULUM.md).

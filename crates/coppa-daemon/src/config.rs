@@ -267,7 +267,7 @@ pub struct HostConfig {
     /// Address all host servers bind to. Defaults to "127.0.0.1" (loopback only).
     ///
     /// WARNING: binding to a non-loopback address (e.g. "0.0.0.0") exposes the
-    /// VARA-style and ARDOP ports, which have no authentication and can key a
+    /// VARA-style, ARDOP and KISS ports, which have no authentication and can key a
     /// transmitter, to anyone who can reach this host. The WebSocket port needs
     /// `websocket_token`, but over `ws://` the token crosses the network in
     /// clear text. Only change this on a trusted, firewalled network.
@@ -289,6 +289,11 @@ pub struct HostConfig {
     pub ardop_command_port: u16,
     /// COP-97: ARDOP data port (the ARDOP convention is command port + 1).
     pub ardop_data_port: u16,
+    /// COP-138: enable broadcast KISS datagrams on the OFDM modem.
+    /// No authentication; any client can key TX. See docs/RETICULUM.md.
+    pub kiss_enabled: bool,
+    /// TCP port for the OFDM KISS datagram interface.
+    pub kiss_port: u16,
     /// Enable WebSocket interface.
     pub websocket_enabled: bool,
     /// WebSocket port.
@@ -613,6 +618,8 @@ impl Default for HostConfig {
             ardop_enabled: false,
             ardop_command_port: 8515,
             ardop_data_port: 8516,
+            kiss_enabled: false,
+            kiss_port: 8100,
             websocket_enabled: false,
             websocket_port: 8400,
             websocket_token: None,
@@ -962,6 +969,14 @@ impl DaemonConfig {
              ardop, or set ardop_enabled = false"
                 .to_string(),
         )
+    }
+
+    /// An enabled KISS interface requires the kiss-tnc build feature.
+    pub fn check_kiss_built(&self, built: bool) -> Result<(), String> {
+        if built || !self.host.kiss_enabled {
+            return Ok(());
+        }
+        Err("[host] kiss_enabled = true is set, but this coppad was built without the kiss-tnc feature and starts no KISS datagram interface; rebuild with --features kiss-tnc, or set kiss_enabled = false".into())
     }
 
     /// COP-140: `[host] mdns_enabled = true` needs a build with the `mdns`
@@ -2608,5 +2623,32 @@ beacon_interval_secs = 600
             "{err}"
         );
         assert!(err.contains("set buffer_size = 8192"), "{err}");
+    }
+    #[test]
+    fn kiss_keys_default_off_on_port_8100() {
+        let c = DaemonConfig::default();
+        assert!(!c.host.kiss_enabled);
+        assert_eq!(c.host.kiss_port, 8100);
+    }
+
+    #[test]
+    fn check_kiss_built_gates_an_enabled_config() {
+        let mut c = DaemonConfig::default();
+        assert!(c.check_kiss_built(false).is_ok());
+        c.host.kiss_enabled = true;
+        assert!(c.check_kiss_built(true).is_ok());
+        assert!(c
+            .check_kiss_built(false)
+            .unwrap_err()
+            .contains("kiss-tnc feature"));
+    }
+
+    #[test]
+    fn example_config_documents_the_kiss_keys() {
+        let text = include_str!("../../../coppad.toml.example");
+        let _: DaemonConfig = toml::from_str(text).unwrap();
+        let host = text.split("[host]").nth(1).unwrap();
+        assert!(host.contains("# kiss_enabled = true"));
+        assert!(host.contains("# kiss_port = 8100"));
     }
 }

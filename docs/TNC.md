@@ -1,5 +1,8 @@
 # KISS TNC (AFSK 1200)
 
+For KISS datagrams on the HF OFDM modem, see [RETICULUM.md](RETICULUM.md).
+This page covers the separate AFSK mode.
+
 ## What this mode is for
 
 `coppa tnc` runs a 1200-baud AFSK (Bell 202) AX.25 TNC behind a KISS TCP port. Use it for
@@ -155,7 +158,8 @@ TNC reports ready.
 ## KISS details
 
 See also [HOST-API.md](HOST-API.md#kiss-afsk-1200-tnc-mode), which lists these details for host
-authors alongside two known framing defects.
+authors. The shared server now keeps a frame whole across split TCP reads, including
+escapes. Nonzero KISS ports remain unsupported.
 
 - Frames carry no FCS, as the KISS protocol specifies. The TNC adds the FCS on transmit, and
   on receive it checks the FCS, drops frames that fail, and strips it before passing the frame
