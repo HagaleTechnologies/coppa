@@ -26,10 +26,27 @@ fi
 SCRATCH=$(mktemp -d /tmp/reticulum-loop.XXXXXX)
 PIDS=()
 cleanup() {
-    local pid
-    for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
-    for pid in "${PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+    local status=$? pid child_status
+    for pid in "${PIDS[@]}"; do
+        if ! kill "$pid"; then
+            echo "cleanup: could not terminate child $pid" >&2
+            if [[ $status -eq 0 ]]; then status=1; fi
+        fi
+    done
+    for pid in "${PIDS[@]}"; do
+        if wait "$pid"; then
+            continue
+        else
+            child_status=$?
+            # SIGTERM is expected after the kill above; other failures are not.
+            if [[ $child_status -ne 143 ]]; then
+                echo "cleanup: child $pid exited with status $child_status" >&2
+                if [[ $status -eq 0 ]]; then status=$child_status; fi
+            fi
+        fi
+    done
     if [[ $KEEP -eq 0 ]]; then rm -rf "$SCRATCH"; fi
+    exit "$status"
 }
 trap cleanup EXIT
 python3 -m venv "$SCRATCH/venv"
