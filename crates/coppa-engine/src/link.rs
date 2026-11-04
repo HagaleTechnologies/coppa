@@ -98,7 +98,9 @@ pub struct LinkConfig {
     /// Default [`arq::DEFAULT_MAX_RETRANSMIT`] (5).
     pub max_retransmit: u8,
     /// Retransmit timeout before the first round-trip sample, and the
-    /// CONNECT_REQ retry interval. Default [`arq::DEFAULT_RTO_SECS`] (5 s).
+    /// minimum CONNECT_REQ retry interval. Handshake retries also wait for
+    /// request/response airtime and two turnarounds. Default
+    /// [`arq::DEFAULT_RTO_SECS`] (5 s).
     pub initial_rto: Duration,
     /// CONNECT_REQ retries before the handshake fails.
     /// Default [`session::MAX_CONNECT_RETRIES`] (3).
@@ -606,7 +608,9 @@ impl Link {
     }
 
     fn is_from_peer(&self, pdu: &MacPdu) -> bool {
-        self.session.as_ref().is_some_and(|s| s.remote == pdu.src)
+        self.session.as_ref().is_some_and(|s| {
+            s.remote == pdu.src && s.local == pdu.dest && s.ssid & 0x0F == pdu.ssid
+        })
     }
 
     fn handle_pdu(&mut self, pdu: MacPdu, now: Instant) {
@@ -741,7 +745,23 @@ impl Link {
     fn run_timers(&mut self, now: Instant) {
         if self.phase == Phase::Calling {
             if let Some(keyed) = self.req_keyed_at {
-                if now.saturating_duration_since(keyed) >= self.config.initial_rto {
+                // Both handshake frames use this link's fixed level/profile.
+                // As for data ARQ, allow the request, ACK and both direction
+                // switches before a retry can interrupt the incoming ACK.
+                let level = self.core.speed_level();
+                let profile = CoppaCore::select_ofdm_profile(
+                    level,
+                    self.core.cp_mode(),
+                    self.core.config().ofdm_band,
+                );
+                let retry_interval = coppa_protocol::modem::frame_airtime_s(level, &profile)
+                    .map(|airtime| {
+                        Duration::from_secs_f64(2.0 * airtime)
+                            .saturating_add(self.config.turnaround.saturating_mul(2))
+                    })
+                    .unwrap_or_default()
+                    .max(self.config.initial_rto);
+                if now.saturating_duration_since(keyed) >= retry_interval {
                     if self.req_attempts <= self.config.connect_retries {
                         if let Some(req) = self.req_frame.clone() {
                             self.req_keyed_at = None;

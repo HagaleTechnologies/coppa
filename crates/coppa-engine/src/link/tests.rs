@@ -506,3 +506,81 @@ fn link_is_send() {
     fn assert_send<T: Send>() {}
     assert_send::<Link>();
 }
+
+#[test]
+fn connect_retry_waits_for_slow_turnaround_ack() {
+    let mut a = LinkConfig::new("N0AAA");
+    a.turnaround = Duration::from_secs(3);
+    let mut b = LinkConfig::new("N0BBB");
+    b.turnaround = a.turnaround;
+    let mut c = Cable::new(a, b);
+    c.b.set_listening(true);
+    c.connect();
+    assert_eq!(c.a.frames_transmitted(), 2, "only REQ and CFM, no retry");
+    assert_eq!(c.b.frames_transmitted(), 1, "only CONNECT_ACK");
+}
+
+#[test]
+fn peer_frames_must_match_session_ssid() {
+    let now = Instant::now();
+    let mut a = Link::new(LinkConfig::new("N0AAA")).unwrap();
+    let mut b = Link::new(LinkConfig::new("N0BBB")).unwrap();
+    b.set_listening(true);
+    a.connect("N0BBB", now).unwrap();
+    let req = MacPdu::from_bytes(&a.queue.pop_front().unwrap().bytes).unwrap();
+    b.handle_pdu(req.clone(), now);
+    let mut foreign_req = req.clone();
+    foreign_req.ssid = 1;
+    b.handle_pdu(foreign_req, now);
+    assert_eq!(
+        b.session.as_ref().unwrap().ssid,
+        0,
+        "foreign REQ replaced session"
+    );
+    // A repeat on the same SSID still gets a fresh ACK.
+    b.handle_pdu(req, now);
+    let ack = MacPdu::from_bytes(&b.queue.pop_front().unwrap().bytes).unwrap();
+    a.handle_pdu(ack, now);
+    let cfm = MacPdu::from_bytes(&a.queue.pop_front().unwrap().bytes).unwrap();
+    b.handle_pdu(cfm, now);
+    assert_eq!(b.state(), LinkState::Connected);
+
+    let data = session_data_frame(a.session.as_ref().unwrap(), 0, b"hello");
+    let mut foreign_data = MacPdu::from_bytes(&data).unwrap();
+    foreign_data.ssid = 1;
+    b.handle_pdu(foreign_data, now);
+    assert_eq!(b.received_len(), 0, "foreign DATA delivered");
+    b.handle_pdu(MacPdu::from_bytes(&data).unwrap(), now);
+    assert_eq!(Cable::recv_all(&mut b), b"hello");
+
+    // Put the matching segment in flight so a wrong-SSID ACK could discard it.
+    a.arq
+        .as_mut()
+        .unwrap()
+        .tx
+        .send(b"hello".to_vec(), now)
+        .unwrap();
+    let ack = session_ack_frame(b.session.as_ref().unwrap(), &b.arq.as_ref().unwrap().rx);
+    let mut foreign_ack = MacPdu::from_bytes(&ack).unwrap();
+    foreign_ack.ssid = 1;
+    a.handle_pdu(foreign_ack, now);
+    assert_eq!(
+        a.arq.as_ref().unwrap().tx.in_flight(),
+        1,
+        "foreign ACK accepted"
+    );
+    a.handle_pdu(MacPdu::from_bytes(&ack).unwrap(), now);
+    assert_eq!(a.arq.as_ref().unwrap().tx.in_flight(), 0);
+
+    let mut disconnect = b.session.as_mut().unwrap().disconnect(now).unwrap();
+    disconnect.ssid = 1;
+    a.handle_pdu(disconnect.clone(), now);
+    assert_eq!(
+        a.state(),
+        LinkState::Connected,
+        "foreign DISCONNECT accepted"
+    );
+    disconnect.ssid = 0;
+    a.handle_pdu(disconnect, now);
+    assert_eq!(a.state(), LinkState::Idle);
+}

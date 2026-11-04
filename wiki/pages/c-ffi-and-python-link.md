@@ -70,3 +70,13 @@ initializers. Use `memset` and field assignments, and set
 `coppa_stop_stream` are marked `COPPA_DEPRECATED`. A `-Werror` build that calls
 them needs `#pragma GCC diagnostic ignored "-Wdeprecated-declarations"` around
 the calls, as `crates/coppa-ffi/tests/c/error_strings.c` does.
+
+## Handshake retries must leave time for the reply
+
+The library link bounds CONNECT retries by request/response airtime plus two
+configured turnarounds, with `initial_rto` as the minimum. A five-second timer
+alone interrupts the level-1 ACK when the turnaround is three seconds.
+Session frames also match the wire SSID as well as both callsigns, including
+repeat CONNECT_REQs while accepting. See `link.rs` and the regressions
+`connect_retry_waits_for_slow_turnaround_ack` and
+`peer_frames_must_match_session_ssid` in `link/tests.rs`.
