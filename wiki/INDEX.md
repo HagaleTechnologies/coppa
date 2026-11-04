@@ -26,3 +26,4 @@
 - [What will bite you when persisting coppa CLI settings?](pages/cli-settings.md) — Profile, band and TNC gotchas.
 - [Which stream and exit code does coppa use?](pages/cli-output.md) — stdout is data only; broken pipe, Ctrl-C and 130 rules.
 - [What will bite you when testing coppad's mDNS discovery?](pages/mdns-discovery.md) — Loopback answers and glibc's missing .local lookup fool same-host tests.
+- [What will bite you when measuring coppa's TNC against Direwolf?](pages/tnc-direwolf-benchmark.md) — Misnamed track, two Direwolf defaults, 48 kHz input.
