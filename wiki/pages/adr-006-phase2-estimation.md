@@ -51,3 +51,15 @@ the most important open item in the receiver.
 Full decision record: `docs/adr/006-phase2-parametric-estimation-nr-bg2.md`;
 investigation detail in `.superpowers/sdd/p2-task-1-report.md`,
 `p2-task-7-report.md`, and `p2-cfo-level4-{investigation,fix}-report.md`.
+
+## Rate-loop residual experiment
+
+COP-133's reconstruction and incomplete-observation tests live in
+`crates/coppa-protocol/src/modem/transceiver.rs`. The bounded experiment requires
+CRC-verified payloads and complete current-transmission observations. Frame-sized
+HF inputs can lose the last payload symbol after RX filtering, so the candidate
+must fall back rather than truncate the reconstruction. Pooling must follow the
+alternating pilot map to keep physical carriers separate. Turbo observations must
+match the re-equalized frame, and HARQ reconstruction must use the current RV.
+See [the COP-133 benchmark record](../../BENCHMARKS.md#cop-133-same-frame-residual-experiment)
+for the outcome. The production recommendation remains pilot-based.

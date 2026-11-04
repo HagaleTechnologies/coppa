@@ -158,10 +158,8 @@ of the probe-accuracy and hysteresis-mechanism investigations above) that the re
 in the calibration table's own accuracy. The real next lever remains believed to be the raw
 per-frame recommendation signal's volatility/stability during fast fading, not further
 table-calibration or hysteresis-mechanism tuning. **UPDATE (2026-07-28): the per-frame signal's
-volatility itself was root-caused via a direct ground-truth comparison, and the estimator-vs-ceiling
-question this line of investigation had left open is now resolved in favor of "ceiling," reinforcing
-(via an independent methodology) the already-closed coarse-delay-drift investigation elsewhere in
-this list rather than opening a new fixable bug.** Two diagnostics were built
+volatility was investigated via a direct ground-truth comparison. The correlations below do
+not resolve whether a better recommendation measurement can meet the rate-loop bar.** Two diagnostics were built
 (`crates/coppa-bench/diagnostics/capacity_snr_reference_diagnosis.rs` and
 `capacity_ground_truth_diagnosis.rs`) to separate "is `channel_capacity`/`channel_selectivity` a
 noisy-but-fixable ESTIMATOR, or is ~0.24 same-frame correlation close to the true information
@@ -174,29 +172,29 @@ depth from the metric — was tested directly and **disconfirmed**: a clean-refe
 `corr(fade_ratio, capacity)`: -0.052 vs -0.021 on Poor, -0.268 vs -0.206 on Moderate; `corr(capacity,
 selectivity)`: 0.878 vs 0.893 on Poor, 0.734 vs 0.713 on Moderate — both conventions behave alike,
 and the positive capacity/selectivity correlation itself contradicts the hypothesis's predicted sign).
-Second, and decisively: `channel_capacity`/`channel_selectivity` (level-1 probe, Watterson
+Second: `channel_capacity`/`channel_selectivity` (level-1 probe, Watterson
 Good/Moderate/Poor, `snr_db=24`, `TRIALS=300`, `profile=robust`) were compared directly against
 GROUND TRUTH computed from the Watterson channel model's own per-tap fading gains (new
 `coppa_channel::watterson::watterson_with_gains`, exposing each tap's raw complex gain array so
 `H(f_k,t)` can be evaluated at the model level, calibrated against the real receiver's own
 measured unit-gain noise floor, not a theoretical guess — full method in the new file's module doc)
 — NOT against decode success, closing the one gap PR #57's diagnostic left open. The ground truth
-signal itself was verified stable within-frame (two disjoint time-window halves: corr 0.812-1.000,
-confirming the long-coherence-time assumption at the ground-truth level), yet
+signal's full-frame and second-half averages correlated at 0.812-1.000. Those windows overlap,
+so this is a limited stability check rather than an independent-halves test. In that run,
 `corr(measured capacity, ground-truth capacity)` was -0.019 (Poor) / 0.050 (Good) / -0.224
 (Moderate), and `corr(measured selectivity, ground-truth selectivity)` was 0.036 / 0.131 / -0.144 —
-statistically indistinguishable from zero on every preset, including the mildest (Good, 0.5 ms
-delay/0.1 Hz Doppler). The receiver's own per-carrier estimate is therefore not merely noisy but
-essentially uninformative about the real, same-frame channel it measured, regardless of fade
-severity — the same conclusion (genuine Rayleigh coherence time far shorter than one frame, not a
-fixable per-frame estimator bug) the now-closed "coarse-delay drift Kalman tracker" investigation
-reached via FER outcomes elsewhere in this list, now independently confirmed via a completely
-different, decode-independent method for the capacity-metric specifically. Per that investigation's
-own conclusion, this is **not re-opened** as a new measurement-layer bug to fix — the untried
-candidate levers remain what that investigation already identified (coherence-time/airtime
-reduction, e.g. shorter frames via `hf_standard_short_cp`, or fade-diversity interleaving), not
-further estimator tuning. No RateLoop or channel-estimation code changed as a result of this
-diagnosis; both new example files are diagnostics only. **UPDATE (2026-08-05): the first of those
+weak or negative in those runs. These historical statistics zero-filled failed demodulations, used
+all active carriers for model truth versus alternating data carriers for the measured noise,
+and called the raw modem without the transceiver's RX bandpass. They cannot establish a
+physical ceiling or rule out a measurement defect. COP-133 adds successful-observation-only
+correlations and states these method limits in the diagnostic output. The historical raw numbers
+above remain for comparison. COP-133's bounded residual experiment found no complete
+observations in 1,593 CRC-successful probes out of 2,880 attempts, so every candidate fell
+back to the pilot recommendation. A normal regression test reproduces the missing final
+OFDM payload symbol after RX filtering on a frame-sized HF input. The candidate was not
+adopted, and the rate-loop bar remains unmet. See BENCHMARKS.md's "COP-133: Same-frame
+residual experiment" for commands, counts and limitations. No RateLoop or channel-estimation
+code changed as a result of either diagnosis. **UPDATE (2026-08-05): the first of the previously proposed
 two levers — short CP — has moved from *untried* to tried and measured (COP-2), and the primary
 finding is that this bullet's own bar cannot express it.** `closed_loop_arq` was rebuilt around a CP
 contrast and its metric airtime-normalized; every figure above this update counts delivered info bits
