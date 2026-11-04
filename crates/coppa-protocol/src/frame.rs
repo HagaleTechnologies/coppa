@@ -103,7 +103,7 @@ impl Frame {
     /// **CRC scope:** the CRC-16 covers the length byte AND the `data` bytes
     /// (not just `data`), so a corrupted length field is itself detected by
     /// the CRC rather than relying solely on the truncation-length bounds
-    /// check in [`Self::parse_payload`]. (This folds in what used to be a
+    /// check in `Self::parse_payload`. (This folds in what used to be a
     /// separate `to_bits_split_v2`/`from_payload_bits_v2` pair that existed
     /// only to demonstrate a length-covering CRC over a wider "PHY header"
     /// layout with an extra reserved byte; that reserved byte carried no

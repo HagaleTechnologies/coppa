@@ -81,7 +81,7 @@ fn retry_permission_denied<T>(
 /// `GpioPtt` is generic over this trait so its PTT state-machine logic can be
 /// exercised in unit tests against a loopback mock, with no real
 /// `/sys/class/gpio` (or even Linux) required. The real sysfs-backed
-/// implementation ([`SysfsGpio`]) is only available on Linux.
+/// implementation (`SysfsGpio`) is only available on Linux.
 pub trait GpioWriter: Send {
     fn write_value(&mut self, high: bool) -> Result<()>;
 }
