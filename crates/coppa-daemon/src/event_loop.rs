@@ -2,6 +2,9 @@
 //!
 //! Uses `tokio::select!` to multiplex audio, host, and radio events.
 
+// COP-142: production code reads time only through clock_now().
+#![deny(clippy::disallowed_methods)]
+
 use anyhow::Result;
 use coppa_audio::{AudioRingConsumer, AudioRingProducer};
 use coppa_engine::{CoppaCore, OfdmBand};
@@ -41,6 +44,16 @@ use coppa_host::ardop::{
     queue_response as queue_ardop_response, ArdopCommand, ArdopResponse, Queued as ArdopQueued,
     COMMAND_QUEUE_DEPTH as ARDOP_COMMAND_QUEUE_DEPTH,
 };
+
+/// The daemon's one clock for everything it hands `coppa-protocol` as `now`
+/// (ARQ retransmit timers, session keepalive, handshake and session timeouts,
+/// CP negotiation, beacon and station-ID gates). It is tokio's clock, so a
+/// `start_paused` test moves these timers with virtual time instead of with
+/// the real time its compute burns (COP-142). Outside a paused test tokio's
+/// clock is the std clock, so production timing is unchanged.
+fn clock_now() -> Instant {
+    tokio::time::Instant::now().into_std()
+}
 
 /// Map of connected VARA command-port clients' response senders
 /// (`VaraServer::response_senders()`), used to broadcast `VaraResponse` telemetry.
@@ -1080,14 +1093,14 @@ impl EventLoop {
             max_frames_per_turn: 4,
             rx_turnaround_until: None,
             last_id_time: None,
-            last_beacon_time: Instant::now(),
+            last_beacon_time: clock_now(),
             pending_busy_wait_audio: Vec::new(),
             #[cfg(feature = "websocket")]
             spectrum_sensor,
             #[cfg(feature = "websocket")]
             spectrum_buffer: Vec::new(),
             #[cfg(feature = "websocket")]
-            last_spectrum_broadcast: Instant::now(),
+            last_spectrum_broadcast: clock_now(),
         })
     }
 
@@ -1518,13 +1531,12 @@ impl EventLoop {
     #[cfg(feature = "websocket")]
     fn ws_decode_failure(&mut self) {
         self.ws_decode_fail_count = self.ws_decode_fail_count.saturating_add(1);
-        if self
-            .ws_last_decode_fail
-            .is_some_and(|last| last.elapsed() < Duration::from_millis(500))
-        {
+        if self.ws_last_decode_fail.is_some_and(|last| {
+            clock_now().saturating_duration_since(last) < Duration::from_millis(500)
+        }) {
             return;
         }
-        self.ws_last_decode_fail = Some(Instant::now());
+        self.ws_last_decode_fail = Some(clock_now());
         if let Some(tx) = &self.ws_broadcast {
             let msg = coppa_host::websocket::WsServerMessage::DecodeFail {
                 count: self.ws_decode_fail_count,
@@ -1826,12 +1838,40 @@ impl EventLoop {
         }
     }
 
+    /// Send a keepalive for every active session that has been idle for its
+    /// keepalive interval (the 5 s session_cleanup arm of run()).
+    async fn send_due_keepalives(&mut self) {
+        let active = self.session_mgr.active_sessions();
+        for id in active {
+            // Read the clock per session: `transmit_samples` below
+            // can wait seconds for a clear channel and PTT.
+            let now = clock_now();
+            let needs = self
+                .session_mgr
+                .get(id)
+                .map(|s| s.needs_keepalive(now))
+                .unwrap_or(false);
+            if needs {
+                if let Some(session) = self.session_mgr.get_mut(id) {
+                    if let Ok(ka_pdu) = session.keepalive(now) {
+                        let ka_bytes = ka_pdu.to_bytes();
+                        if let Ok(samples) = self.engine.encode_bytes(&ka_bytes) {
+                            // COP-46: `tools/pat-loop` counts these.
+                            tracing::info!(session = id, "Sending session KEEPALIVE");
+                            self.transmit_samples(&samples).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     async fn reap_timed_out_sessions(&mut self) {
         // `cleanup_timed_out` returns only IDs, so note which sessions were
         // pending inbound handshakes first (COP-44: those end in
         // CANCELPENDING, not DISCONNECTED).
         let pending = self.accepting_sessions();
-        let removed = self.session_mgr.cleanup_timed_out(Instant::now());
+        let removed = self.session_mgr.cleanup_timed_out(clock_now());
         for id in removed {
             // COP-43: a drain that keyed nothing for `disconnect_timeout`
             // ends the way a drained one does, minus the unsent chunks.
@@ -2160,7 +2200,7 @@ impl EventLoop {
             // COP-69: remember the count the segment went out with, so a
             // retransmission re-encodes byte-identically at the same count.
             link.tx_codewords = codewords;
-            match link.tx.send(chunk, Instant::now()) {
+            match link.tx.send(chunk, clock_now()) {
                 Ok(sent) => debug_assert_eq!(sent, seq),
                 // Unreachable: `can_send` was checked before transmitting.
                 Err(e) => tracing::error!(error = %e, seq, "Session ARQ window full"),
@@ -2180,7 +2220,7 @@ impl EventLoop {
             .map(|l| l.session_id)
             .and_then(|id| self.session_mgr.get_mut(id))
         {
-            session.touch(Instant::now());
+            session.touch(clock_now());
         }
         tracing::debug!(
             seq,
@@ -2276,7 +2316,7 @@ impl EventLoop {
             rx: ArqRx::new(SESSION_ARQ_WINDOW),
             backlog: VecDeque::new(),
             fallback: None,
-            last_peer_evidence: Instant::now(),
+            last_peer_evidence: clock_now(),
             warned_legacy_payload: false,
             tx_codewords: 1,
         });
@@ -2329,7 +2369,7 @@ impl EventLoop {
     /// `SESSION_FALLBACK_NO_EVIDENCE` (default 180 s) with zero peer
     /// evidence tears the session down (`fail_session_link`).
     async fn check_session_retransmits(&mut self) {
-        let now = Instant::now();
+        let now = clock_now();
         let Some(link) = self.session_link.as_ref() else {
             return;
         };
@@ -2432,7 +2472,7 @@ impl EventLoop {
             // (COP-1 (d)): a budget only successful sends advance can never
             // run out.
             if let Some(link) = self.session_link.as_mut() {
-                let _ = link.tx.mark_retransmitted(seq, Instant::now());
+                let _ = link.tx.mark_retransmitted(seq, clock_now());
                 if link.tx.is_failed(seq) && link.fallback.is_none() {
                     // COP-68: first exhaustion enters the fade hold. The
                     // fittest level is computed over the segment's rebuilt
@@ -2516,7 +2556,7 @@ impl EventLoop {
         let was_pending = self.is_accepting(session_id);
         self.discard_session_tx(session_id).await;
         if let Some(session) = self.session_mgr.get_mut(session_id) {
-            match session.disconnect(Instant::now()) {
+            match session.disconnect(clock_now()) {
                 Ok(disc_pdu) => {
                     let pdu_bytes = disc_pdu.to_bytes();
                     match self.engine.encode_bytes(&pdu_bytes) {
@@ -2842,7 +2882,7 @@ impl EventLoop {
     fn touch_draining_session(&mut self, session_id: u8) {
         if let Some(session) = self.session_mgr.get_mut(session_id) {
             if session.state == SessionState::Disconnecting {
-                session.touch(Instant::now());
+                session.touch(clock_now());
             }
         }
     }
@@ -2880,7 +2920,7 @@ impl EventLoop {
                 .arq_tx
                 .as_mut()
                 .expect("can_send checked above")
-                .send(chunk.clone(), Instant::now())
+                .send(chunk.clone(), clock_now())
             {
                 Ok(seq) => {
                     let pdu =
@@ -3023,26 +3063,7 @@ impl EventLoop {
                 }
                 _ = session_cleanup.tick() => {
                     self.reap_timed_out_sessions().await;
-                    // Send keepalives for active sessions
-                    let active = self.session_mgr.active_sessions();
-                    for id in active {
-                        // Read the clock per session: `transmit_samples` below
-                        // can wait seconds for a clear channel and PTT.
-                        let now = Instant::now();
-                        let needs = self.session_mgr.get(id).map(|s| s.needs_keepalive(now)).unwrap_or(false);
-                        if needs {
-                            if let Some(session) = self.session_mgr.get_mut(id) {
-                                if let Ok(ka_pdu) = session.keepalive(now) {
-                                    let ka_bytes = ka_pdu.to_bytes();
-                                    if let Ok(samples) = self.engine.encode_bytes(&ka_bytes) {
-                                        // COP-46: `tools/pat-loop` counts these.
-                                        tracing::info!(session = id, "Sending session KEEPALIVE");
-                                        self.transmit_samples(&samples).await;
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    self.send_due_keepalives().await;
                 }
             }
         }
@@ -3422,7 +3443,7 @@ impl EventLoop {
                     self.ardop_clients.entry(client_id).or_default().refused = false;
                 }
                 let caps = local_link_caps();
-                let now = Instant::now();
+                let now = clock_now();
                 match self.session_mgr.create(local, remote.clone(), 0, caps, now) {
                     Ok(id) => {
                         if let Some(session) = self.session_mgr.get_mut(id) {
@@ -3511,7 +3532,7 @@ impl EventLoop {
                     let disconnect = self
                         .session_mgr
                         .get_mut(id)
-                        .map(|s| s.disconnect(Instant::now()));
+                        .map(|s| s.disconnect(clock_now()));
                     match disconnect {
                         Some(Ok(disc_pdu)) => {
                             // COP-43: VARA's `DISCONNECT` disconnects "once
@@ -3715,7 +3736,7 @@ impl EventLoop {
                     return;
                 }
                 if let Some(samples) = self.encode_id_beacon_frame() {
-                    let id_before = self.last_id_time.replace(Instant::now());
+                    let id_before = self.last_id_time.replace(clock_now());
                     let generation = self.tx_generation;
                     self.transmit_samples(&samples).await;
                     if self.tx_generation == generation {
@@ -3951,10 +3972,10 @@ impl EventLoop {
         }
 
         let period = Duration::from_secs_f64(1.0 / crate::spectrum::SPECTRUM_UPDATE_HZ);
-        if self.last_spectrum_broadcast.elapsed() < period {
+        if clock_now().saturating_duration_since(self.last_spectrum_broadcast) < period {
             return;
         }
-        self.last_spectrum_broadcast = Instant::now();
+        self.last_spectrum_broadcast = clock_now();
 
         let (freq_low_hz, freq_high_hz) = self.engine.occupied_band_edges_hz();
         let bins = crate::spectrum::compute_spectrum_bins(
@@ -4082,7 +4103,7 @@ impl EventLoop {
                                     CpRecommendation::LongCp => CpMode::LongCp,
                                 };
                                 let payload = CpNegotiator::propose_payload(mode);
-                                let now = Instant::now();
+                                let now = clock_now();
                                 match self.cp_control_arq_tx.send(payload.clone(), now) {
                                     Ok(seq) => {
                                         // COP-1 G1: remember the seq so
@@ -4218,7 +4239,7 @@ impl EventLoop {
                                                 let newly_acked = arq_tx.process_ack(
                                                     pdu.ack_num,
                                                     pdu.ack_bitmap,
-                                                    Instant::now(),
+                                                    clock_now(),
                                                 );
                                                 self.resolve_probe_if_acked(&newly_acked);
                                             }
@@ -4260,7 +4281,7 @@ impl EventLoop {
                                             let newly_acked = arq_tx.process_ack(
                                                 pdu.ack_num,
                                                 pdu.ack_bitmap,
-                                                Instant::now(),
+                                                clock_now(),
                                             );
                                             probe_resolved =
                                                 self.resolve_probe_if_acked(&newly_acked);
@@ -4667,7 +4688,7 @@ impl EventLoop {
         let samples: &[f32] = if self.id_due() {
             match self.encode_id_beacon_frame() {
                 Some(id_samples) => {
-                    self.last_id_time = Some(Instant::now());
+                    self.last_id_time = Some(clock_now());
                     let mut buf = id_samples;
                     buf.extend_from_slice(samples);
                     combined = buf;
@@ -4748,6 +4769,9 @@ impl EventLoop {
                     false
                 }
                 Some(feedback) => {
+                    // wait_for_playout adds tokio elapsed time to this base itself,
+                    // so it must stay a real std instant.
+                    #[allow(clippy::disallowed_methods)]
                     let watch = PlayoutWatch::new(target, Instant::now(), Some(max_tx));
                     let interval = IntervalProgress {
                         clock: &stall_clock,
@@ -4956,8 +4980,9 @@ impl EventLoop {
         if interval == 0 {
             return false;
         }
-        self.last_id_time
-            .is_none_or(|t| t.elapsed() >= Duration::from_secs(interval))
+        self.last_id_time.is_none_or(|t| {
+            clock_now().saturating_duration_since(t) >= Duration::from_secs(interval)
+        })
     }
 
     /// Build the `Beacon`-type `MacPdu` carrying this station's
@@ -5029,17 +5054,19 @@ impl EventLoop {
         if interval == 0 || self.local_callsign.is_none() {
             return;
         }
-        if self.last_beacon_time.elapsed() < Duration::from_secs(interval) {
+        if clock_now().saturating_duration_since(self.last_beacon_time)
+            < Duration::from_secs(interval)
+        {
             return;
         }
         if self.busy_gate.current() {
             return;
         }
         if let Some(samples) = self.encode_id_beacon_frame() {
-            self.last_beacon_time = Instant::now();
+            self.last_beacon_time = clock_now();
             // A beacon already fully identifies the station; avoid also
             // prepending a redundant separate ID frame to it.
-            let id_before = self.last_id_time.replace(Instant::now());
+            let id_before = self.last_id_time.replace(clock_now());
             let generation = self.tx_generation;
             self.transmit_samples(&samples).await;
             if self.tx_generation == generation {
@@ -5089,7 +5116,7 @@ impl EventLoop {
         if !self.config.engine.arq_enabled {
             return;
         }
-        let now = Instant::now();
+        let now = clock_now();
         // Collect retransmit data first to avoid borrow conflict. Sequence
         // numbers are threaded alongside the encoded PDU bytes so the second
         // loop (after the `arq_tx` borrow ends) can call
@@ -5172,7 +5199,7 @@ impl EventLoop {
                     // would understate `last_sent` and make the next RTO
                     // check fire early.
                     if let Some(ref mut arq_tx) = self.arq_tx {
-                        if let Err(e) = arq_tx.mark_retransmitted(seq, Instant::now()) {
+                        if let Err(e) = arq_tx.mark_retransmitted(seq, clock_now()) {
                             tracing::warn!(
                                 seq,
                                 error = %e,
@@ -5191,7 +5218,7 @@ impl EventLoop {
         // arq_tx block above, using the entirely separate cp_control_arq_tx/
         // cp_control_arq_rx pair (own sequence space, own small window).
         if self.config.engine.cp_negotiation_enabled {
-            let now = Instant::now();
+            let now = clock_now();
             let cp_retransmit_seqs = self.cp_control_arq_tx.get_retransmits(now);
             let mut cp_retransmit_pdus: Vec<(u8, Vec<u8>)> = Vec::new();
             if !cp_retransmit_seqs.is_empty() {
@@ -5231,10 +5258,7 @@ impl EventLoop {
                 // data `arq_tx` loop above keeps its encode-gated counting,
                 // where a frozen budget means retrying forever rather than
                 // wedging a two-slot control channel.
-                if let Err(e) = self
-                    .cp_control_arq_tx
-                    .mark_retransmitted(seq, Instant::now())
-                {
+                if let Err(e) = self.cp_control_arq_tx.mark_retransmitted(seq, clock_now()) {
                     tracing::warn!(
                         seq,
                         error = %e,
@@ -5249,7 +5273,7 @@ impl EventLoop {
         // segment gets its full retransmit budget spent this tick before
         // `is_failed` is consulted. Returns immediately when
         // `cp_negotiation_enabled` is false (the default).
-        self.drive_cp_negotiation(Instant::now());
+        self.drive_cp_negotiation(clock_now());
         // COP-2 review finding: publish the desync counter here too, not only on
         // the next successful decode -- see `publish_desync_episodes`'s doc.
         self.publish_desync_episodes().await;
@@ -5287,7 +5311,7 @@ impl EventLoop {
             return;
         }
 
-        let now = Instant::now();
+        let now = clock_now();
         let newly_acked = self
             .cp_control_arq_tx
             .process_ack(pdu.ack_num, pdu.ack_bitmap, now);
@@ -5865,7 +5889,7 @@ impl EventLoop {
         let Some(link) = self.session_link.as_mut() else {
             return;
         };
-        link.last_peer_evidence = Instant::now();
+        link.last_peer_evidence = clock_now();
         if link.fallback.is_some() && link.tx.in_flight() > 0 {
             let seq = link.tx.send_base();
             if let Some(count) = link.tx.transmit_count(seq) {
@@ -5980,7 +6004,7 @@ impl EventLoop {
 
         let remote = pdu.src.clone();
         let caps = local_link_caps();
-        let now = Instant::now();
+        let now = clock_now();
         match self
             .session_mgr
             .create(local, remote.clone(), pdu.ssid, caps, now)
@@ -6032,7 +6056,7 @@ impl EventLoop {
         let remote = pdu.src.clone();
         let session_id = self.session_id_for_frame(&pdu);
         if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
-            match session.handle_connect_ack(&pdu.payload, Instant::now()) {
+            match session.handle_connect_ack(&pdu.payload, clock_now()) {
                 Ok(cfm_pdu) => {
                     let notice = SessionNotice::Connected {
                         local: session.local.clone(),
@@ -6064,7 +6088,7 @@ impl EventLoop {
         let remote = pdu.src.clone();
         let session_id = self.session_id_for_frame(&pdu);
         if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
-            match session.handle_connect_cfm(&pdu.payload, Instant::now()) {
+            match session.handle_connect_cfm(&pdu.payload, clock_now()) {
                 Ok(()) => {
                     session.confirm_established();
                     tracing::info!(remote = %remote, "Session fully established (responder)");
@@ -6180,7 +6204,7 @@ impl EventLoop {
             return;
         }
         self.tx_frame_count = 0; // Our turn to transmit starts fresh
-        session.touch(Instant::now());
+        session.touch(clock_now());
         let session_id = session.id;
         self.ensure_session_link(session_id);
         let Some(link) = self.session_link.as_mut() else {
@@ -6233,7 +6257,7 @@ impl EventLoop {
         if !session.is_established() && !draining {
             return;
         }
-        session.touch(Instant::now());
+        session.touch(clock_now());
         let session_id = session.id;
         let Ok(ack) = TransportPdu::from_bytes(&pdu.payload) else {
             return;
@@ -6263,7 +6287,7 @@ impl EventLoop {
         }
         let acked = link
             .tx
-            .process_ack(ack.ack_num, ack.ack_bitmap, Instant::now());
+            .process_ack(ack.ack_num, ack.ack_bitmap, clock_now());
         if link.tx.in_flight() == 0 {
             // COP-68: an ACK that empties the window ends any fade hold and
             // restores the standard budget, so the next fade starts from 5
@@ -6286,7 +6310,7 @@ impl EventLoop {
     fn handle_keepalive_rx(&mut self, pdu: MacPdu) {
         let session_id = self.session_id_for_frame(&pdu);
         if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
-            session.touch(Instant::now());
+            session.touch(clock_now());
         }
     }
 
@@ -6359,6 +6383,8 @@ impl EventLoop {
 }
 
 #[cfg(test)]
+// COP-142: tests may seed std instants outside a paused runtime.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -8355,8 +8381,8 @@ mod tests {
         station.handle_mac_pdu(pdu).await;
     }
 
-    /// Sleep past `station`'s current session RTO (real time: ARQ timers are
-    /// `std::time::Instant`s).
+    /// Sleep past the session RTO in unpaused tests, where real sleep moves
+    /// tokio's clock. Paused tests use tokio::time::advance instead.
     fn sleep_past_session_rto(station: &EventLoop) {
         let rto = station
             .session_link
@@ -10680,9 +10706,7 @@ mod tests {
     /// `Instant`-gated periodic behavior (see `last_id_time`/`last_beacon_time`'s
     /// tests below, e.g. `event_loop.last_beacon_time = Instant::now() -
     /// Duration::from_secs(10)`): directly backdate the `Instant` field a
-    /// rate gate compares against, rather than `tokio::time::advance` (which
-    /// only affects `tokio::time::Instant`, not the `std::time::Instant`
-    /// these fields actually use, so it wouldn't do anything here).
+    /// rate gate compares against. Paused tests can instead advance tokio time.
     #[cfg(feature = "websocket")]
     #[tokio::test]
     async fn test_spectrum_broadcast_is_128_bins_and_rate_limited() {
@@ -14302,12 +14326,10 @@ mod tests {
         /// arm, which had the identical `handle_audio_out`-bypasses-PTT bug.
         /// Seeds one `Established` session whose `last_activity` is already
         /// well past a (deliberately tiny) `keepalive_interval`, so the very
-        /// next `session_cleanup` tick (real 5s wall-clock interval; this
-        /// event loop's periodic gates all use `std::time::Instant`, not
-        /// mockable via `tokio::time::pause`, per this file's own established
-        /// convention -- see `test_spectrum_broadcast_is_128_bins_and_rate_limited`'s
-        /// doc) sends a keepalive, and confirms it too now produces a real PTT
-        /// bracket instead of silently writing to the audio-out ring.
+        /// next session_cleanup tick sends a keepalive, and confirms it
+        /// produces a real PTT bracket. For virtual-time coverage, see
+        /// cop142_session_clock. The keepalive must key the radio rather
+        /// than silently write to the audio-out ring.
         #[tokio::test]
         async fn test_session_keepalive_asserts_ptt() {
             let config = fast_ptt_config();
@@ -16319,8 +16341,8 @@ mod tests {
                 ))
                 .unwrap();
 
-            // ARQ timers are real `std::time::Instant`s.
-            std::thread::sleep(Duration::from_millis(30));
+            // ARQ timers run on tokio's clock.
+            tokio::time::advance(Duration::from_millis(30)).await;
             rig.event_loop.check_session_retransmits().await;
             assert!(rig.event_loop.is_transmitting, "the retransmission keys");
             rig.deliver(retransmission.len(), &[480, 1000]);
@@ -19961,8 +19983,8 @@ mod tests {
             // ACK itself.
             mark_identified(&mut a);
             mark_identified(&mut b);
-            // ARQ timers run on real `std::time::Instant`s with a 5 s initial
-            // RTO; a slow runner must not add a retransmit key-up mid-test.
+            // Keep a retransmit out of the ACK timing on virtual time.
+            // The default initial RTO is 5 s.
             a.arq_tx = Some(
                 ArqTx::new(ArqConfig {
                     initial_rto: Duration::from_secs(60),
@@ -20634,6 +20656,80 @@ mod tests {
 
             assert!(drain(&mut a_rx).is_empty());
             assert_eq!(drain(&mut b_rx), vec![b"only b".to_vec()]);
+        }
+    }
+
+    /// COP-142: the session timers (retransmit, keepalive, handshake) read
+    /// tokio's clock, so a paused-clock test sees them fire on virtual time
+    /// and never on real compute time.
+    mod cop142_session_clock {
+        use super::*;
+
+        fn drain(consumer: &mut coppa_audio::AudioRingConsumer) -> usize {
+            let mut buf = vec![0.0f32; 1_000_000];
+            consumer.read(&mut buf)
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn session_retransmit_fires_on_virtual_time() {
+            let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+            a.handle_host_event(HostEvent::DataReceived {
+                client_id: 1,
+                data: b"lost on the air".to_vec(),
+            })
+            .await;
+            take_leg(&mut a_consumer, "the data frame that is lost");
+            a.handle_ptt_change(false).await;
+            let rto = a.session_link.as_ref().unwrap().tx.rto();
+            tokio::time::advance(rto + Duration::from_millis(5)).await;
+            a.check_session_retransmits().await;
+            assert!(
+                drain(&mut a_consumer) > 0,
+                "virtual time past the {rto:?} RTO must key a retransmission"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn session_keepalive_fires_on_virtual_time() {
+            let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+            drain(&mut a_consumer);
+            tokio::time::advance(Duration::from_secs(
+                coppa_protocol::session::DEFAULT_KEEPALIVE_SECS + 1,
+            ))
+            .await;
+            a.send_due_keepalives().await;
+            assert!(
+                drain(&mut a_consumer) > 0,
+                "an idle session must key a keepalive after its virtual keepalive interval"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn session_handshake_times_out_on_virtual_time() {
+            let mut config = DaemonConfig::default();
+            config.engine.callsign = "VK3ABC".into();
+            config.radio.ptt_pre_delay_ms = 0;
+            config.radio.ptt_tail_delay_ms = 0;
+            let mut a = EventLoop::new(config).unwrap();
+            a.listening = true;
+            let (a_producer, _a_consumer) = coppa_audio::audio_ring(4_000_000);
+            a.set_audio_out(a_producer);
+            a.handle_host_event(HostEvent::ConnectRequest {
+                client_id: 1,
+                source: "VK3ABC".into(),
+                destination: "W1AW".into(),
+            })
+            .await;
+            assert_eq!(a.session_mgr.active_sessions().len(), 1, "a is dialing");
+            tokio::time::advance(Duration::from_secs(
+                coppa_protocol::session::HANDSHAKE_TIMEOUT_SECS + 1,
+            ))
+            .await;
+            a.reap_timed_out_sessions().await;
+            assert!(
+                a.session_mgr.active_sessions().is_empty(),
+                "an unanswered dial must be reaped after the virtual handshake timeout"
+            );
         }
     }
 
