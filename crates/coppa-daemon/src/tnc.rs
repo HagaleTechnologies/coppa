@@ -2,11 +2,10 @@
 //! Wires AFSK 1200 modem <-> CPAL audio <-> KISS TCP server <-> PTT control.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "cpal-backend")]
 use anyhow::Context;
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -179,9 +178,20 @@ impl TncTx {
     }
 }
 
+// Cancels listeners on setup errors as well as normal shutdown. Listener-owned
+// AGW client tasks are cancelled when their JoinSet is dropped.
+struct ListenerTask(tokio::task::JoinHandle<Result<(), coppa_host::HostError>>);
+impl Drop for ListenerTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Configuration for TNC daemon mode.
 pub struct TncConfig {
     pub kiss_port: u16,
+    /// Optional connectionless AGWPE listener.
+    pub agw_port: Option<u16>,
     /// Address the KISS TCP server binds to. Defaults to "127.0.0.1" (loopback only).
     pub bind_address: String,
     pub rig_address: Option<String>,
@@ -203,6 +213,7 @@ impl Default for TncConfig {
     fn default() -> Self {
         Self {
             kiss_port: 8001,
+            agw_port: None,
             bind_address: "127.0.0.1".to_string(),
             rig_address: None,
             vox_mode: false,
@@ -232,6 +243,19 @@ fn kiss_to_air(payload: &[u8]) -> Vec<f32> {
 fn air_to_kiss(mut frame: Vec<u8>) -> Vec<u8> {
     frame.truncate(frame.len().saturating_sub(2));
     frame
+}
+
+// Both host adapters see exactly the same FCS-stripped demodulator output.
+fn forward_received(
+    frame: Vec<u8>,
+    kiss: &tokio::sync::broadcast::Sender<Vec<u8>>,
+    agw: Option<&tokio::sync::broadcast::Sender<Vec<u8>>>,
+) {
+    let payload = air_to_kiss(frame);
+    if let Some(sender) = agw {
+        let _ = sender.send(payload.clone());
+    }
+    let _ = kiss.send(payload);
 }
 
 /// Run the TNC daemon.
@@ -272,13 +296,32 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
         .expect("take_tx_receiver called twice");
     let rx_sender = kiss_server.rx_sender();
 
-    // Spawn the KISS TCP accept loop
-    tokio::spawn(async move {
-        if let Err(e) = kiss_server.start().await {
-            tracing::error!(error = %e, "KISS server error");
-        }
-    });
-
+    let kiss_addr = format!("{}:{}", config.bind_address, config.kiss_port);
+    let kiss_listener = tokio::net::TcpListener::bind(&kiss_addr)
+        .await
+        .with_context(|| format!("Cannot bind KISS listener at {kiss_addr} (--port)"))?;
+    let pending = Arc::new(AtomicUsize::new(0));
+    let mut agw_receiver = None;
+    let mut agw_sender = None;
+    let mut agw_task = None;
+    if let Some(port) = config.agw_port {
+        let addr = format!("{}:{port}", config.bind_address);
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .with_context(|| format!("Cannot bind AGWPE listener at {addr} (--agw-port)"))?;
+        let mut server =
+            coppa_host::agw::AgwServer::with_bind_addr(port, config.bind_address.clone())
+                .with_pending_frames(pending.clone());
+        agw_receiver = server.take_tx_receiver();
+        agw_sender = Some(server.rx_sender());
+        agw_task = Some(ListenerTask(tokio::spawn(async move {
+            server.run_with_listener(listener).await
+        })));
+        tracing::info!(%addr, "AGWPE server listening");
+    }
+    let mut kiss_task = ListenerTask(tokio::spawn(async move {
+        kiss_server.run_with_listener(kiss_listener).await
+    }));
     tracing::info!(port = config.kiss_port, "KISS server listening");
 
     // -------------------------------------------------------------------------
@@ -536,9 +579,24 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
 
     loop {
         tokio::select! {
+            result = &mut kiss_task.0 => {
+                shut_down_tnc(&shutdown, &tnc_tx, ptt.as_mut());
+                result.context("KISS listener task failed")??;
+                anyhow::bail!("KISS listener stopped unexpectedly");
+            }
+            result = async {
+                match &mut agw_task {
+                    Some(task) => (&mut task.0).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                shut_down_tnc(&shutdown, &tnc_tx, ptt.as_mut());
+                result.context("AGWPE listener task failed")??;
+                anyhow::bail!("AGWPE listener stopped unexpectedly");
+            }
             // RX path: demod thread produced a frame → forward to KISS clients
             Some(frame) = demod_rx.recv() => {
-                let _ = rx_sender.send(air_to_kiss(frame));
+                forward_received(frame, &rx_sender, agw_sender.as_ref());
             }
 
             // TX path: KISS client sent a frame → modulate and queue it;
@@ -546,6 +604,16 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
             // Not polled while the backlog is full, so later frames wait in
             // the KISS server's bounded channel.
             Some(ax25_data) = tx_receiver.recv(), if tnc_tx.has_room() => {
+                tnc_tx.submit(kiss_to_air(&ax25_data));
+                tnc_tx.poll(Instant::now(), &mut audio_out_prod, ptt.as_mut());
+            }
+
+            Some(ax25_data) = async {
+                match &mut agw_receiver {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if tnc_tx.has_room() => {
                 tnc_tx.submit(kiss_to_air(&ax25_data));
                 tnc_tx.poll(Instant::now(), &mut audio_out_prod, ptt.as_mut());
             }
@@ -568,6 +636,17 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
                 break;
             }
         }
+        pending.store(
+            tnc_tx.frames.len() + usize::from(tnc_tx.active.is_some()),
+            Ordering::Release,
+        );
+    }
+    pending.store(0, Ordering::Release);
+    kiss_task.0.abort();
+    let _ = (&mut kiss_task.0).await;
+    if let Some(mut task) = agw_task {
+        task.0.abort();
+        let _ = (&mut task.0).await;
     }
 
     Ok(())
@@ -711,6 +790,115 @@ mod tests {
         )
         .await
         .expect("the started workers must stop on a startup error");
+    }
+
+    #[tokio::test]
+    async fn agw_bind_failures_precede_audio_setup() {
+        assert_eq!(TncConfig::default().agw_port, None);
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = held.local_addr().unwrap().port();
+        for agw in [false, true] {
+            let config = TncConfig {
+                kiss_port: if agw { 0 } else { port },
+                agw_port: agw.then_some(port),
+                ..Default::default()
+            };
+            let error = run_tnc(config).await.unwrap_err();
+            let text = format!("{error:#}");
+            assert!(
+                text.contains(if agw {
+                    "Cannot bind AGWPE"
+                } else {
+                    "Cannot bind KISS"
+                }),
+                "{text}"
+            );
+            assert!(error.chain().any(|e| e
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::AddrInUse)));
+        }
+    }
+
+    #[tokio::test]
+    async fn agw_tcp_audio_round_trip() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::{TcpListener, TcpStream},
+        };
+        fn request(kind: u8, body: &[u8]) -> Vec<u8> {
+            let mut h = vec![0; 36];
+            h[4] = kind;
+            h[6] = 240;
+            h[8..14].copy_from_slice(b"N0CALL");
+            h[18..22].copy_from_slice(b"APRS");
+            h[28..32].copy_from_slice(&(body.len() as u32).to_le_bytes());
+            h.extend(body);
+            h
+        }
+        async fn read(s: &mut TcpStream) -> Vec<u8> {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut h = vec![0; 36];
+                s.read_exact(&mut h).await.unwrap();
+                let n = u32::from_le_bytes(h[28..32].try_into().unwrap()) as usize;
+                let mut b = vec![0; n];
+                s.read_exact(&mut b).await.unwrap();
+                h.extend(b);
+                h
+            })
+            .await
+            .unwrap()
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = coppa_host::agw::AgwServer::new(0);
+        let mut tx = server.take_tx_receiver().unwrap();
+        let rx = server.rx_sender();
+        let task = tokio::spawn(async move { server.run_with_listener(listener).await.unwrap() });
+        let mut a = TcpStream::connect(addr).await.unwrap();
+        let mut b = TcpStream::connect(addr).await.unwrap();
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        a.write_all(&request(b'X', &[])).await.unwrap();
+        assert_eq!(&read(&mut a).await[36..], &[1]);
+        for (client, kind) in [(&mut b, b'k'), (&mut c, b'm')] {
+            client
+                .write_all(&[request(kind, &[]), request(b'R', &[])].concat())
+                .await
+                .unwrap();
+            assert_eq!(read(client).await[4], b'R');
+        }
+        let (kiss, mut kiss_rx) = tokio::sync::broadcast::channel(4);
+        for info in [b"hello\0world".to_vec(), vec![0x42; 256]] {
+            a.write_all(&request(b'M', &info)).await.unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(5), tx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut expected = vec![
+                130, 160, 164, 166, 64, 64, 96, 156, 96, 134, 130, 152, 152, 97, 3, 240,
+            ];
+            expected.extend(&info);
+            assert_eq!(frame, expected);
+            let mut h = Harness::new();
+            h.tx.submit(kiss_to_air(&frame));
+            h.run_until_idle(1024);
+            assert_eq!(*h.ptt.0.lock().unwrap(), vec![PttState::Tx, PttState::Rx]);
+            let mut demod = coppa_codec::afsk::Demodulator::new();
+            demod.process(&h.sink.captured);
+            let frames = demod.take_frames();
+            assert_eq!(frames.len(), 1);
+            let decoded = air_to_kiss(frames[0].clone());
+            assert_eq!(decoded, expected);
+            forward_received(frames[0].clone(), &kiss, Some(&rx));
+            assert_eq!(kiss_rx.recv().await.unwrap(), decoded);
+            let raw = read(&mut b).await;
+            assert_eq!(raw[4], b'K');
+            assert_eq!(&raw[36..], [vec![0], expected].concat());
+            let monitor = read(&mut c).await;
+            assert_eq!(monitor[4], b'U');
+            assert!(monitor[36..].windows(info.len()).any(|w| w == info));
+        }
+        task.abort();
+        let _ = task.await;
     }
 
     /// PTT controller recording every state change.

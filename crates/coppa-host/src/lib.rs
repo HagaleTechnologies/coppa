@@ -37,6 +37,9 @@ mod http_route;
 #[cfg(feature = "kiss-tnc")]
 pub mod kiss;
 
+#[cfg(feature = "kiss-tnc")]
+pub mod agw;
+
 #[cfg(feature = "ardop")]
 pub mod ardop;
 

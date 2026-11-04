@@ -4,7 +4,7 @@
 
 `coppa tnc` runs a 1200-baud AFSK (Bell 202) AX.25 TNC behind a KISS TCP port. Use it for
 KISS bring-up and testing: checking that a KISS client, your audio routing and your PTT reach
-coppa. It is not a Direwolf replacement. It has no AGWPE interface, no channel-busy check (it
+coppa. It is not a Direwolf replacement. It has no channel-busy check (it
 ignores KISS TXDELAY, persistence and slot time), no digipeating or beaconing, and runs only at
 1200 baud. That parity work is planned as H-122 in the
 [2026-09-05 product review](reviews/2026-09-05-product-ux-market-review.md).
@@ -19,8 +19,8 @@ What it does:
 
 What it does not do:
 
-- No AGWPE interface. Clients that only speak AGW (Winlink Express packet, Outpost, UI-View)
-  cannot use it.
+- No AX.25 connected sessions. Winlink Express packet and Outpost BBS messaging require
+  a future link layer; UI-View interoperability has not been verified.
 - Only KISS port 0 carries data. A data frame addressed to any other KISS port is dropped.
 - KISS TXDELAY, persistence and slot time are accepted and ignored. There is no carrier sense:
   the TNC transmits as soon as a frame arrives.
@@ -187,3 +187,44 @@ paced relay). Exact ID selection and stereo channel wiring are covered by
 deterministic tests; they still need checking on a physical radio interface.
 The `modprobe` and `hw:Loopback` lines were not run in that container because
 it had no sound modules.
+
+## Optional connectionless AGWPE
+
+```sh
+coppa tnc --port 8001 --agw-port 8000 --bind-address 127.0.0.1
+# A second station on the same host uses distinct ports and audio devices:
+coppa tnc --port 18001 --agw-port 18000 --device coppa-loop-B
+```
+
+AGWPE is optional. Start it with `--agw-port 8000` and point your client at
+127.0.0.1, TCP port 8000, radio port 1. The wire protocol numbers that radio
+port as 0. Port 8001 is KISS and cannot accept AGWPE requests.
+
+The connectionless AGWPE subset supports callsign registration, UI-frame
+transmission, raw reception and UI-frame monitoring. Winlink Express packet
+sessions and Outpost BBS sessions require AX.25 connected mode, which is not
+implemented. UI-View interoperability has not been verified with the real client.
+
+These listeners have no authentication. Any client that can reach them can
+request a transmission. The default bind address is 127.0.0.1. Use a LAN
+address only on a trusted network. `--bind-address` changes both listeners.
+A bind failure names the listener address and flag and exits before readiness.
+A build without `cpal-backend` serves control requests but moves no audio.
+
+See [the AGW wire contract](HOST-API.md#agwpe-connectionless-afsk-tnc) for supported
+commands, limits, monitoring, queue counts and overload behavior.
+Run `python3 tools/agw-probe.py --host 127.0.0.1 --port 8000` from the repository
+root for a control-only check. It requests a transmission, without claiming delivery.
+
+Automated verification: `cargo test -p coppa-daemon --features kiss-tnc --lib tnc::`
+includes `agw_tcp_audio_round_trip`, which registers through TCP, transmits binary
+and 256-byte UI information, demodulates simulated output, checks PTT release and
+receives raw and monitor records through TCP. The CLI subprocess tests run with
+`cargo test -p coppa-cli --features kiss-tnc --test tnc_agw` without CPAL.
+
+Not run: Winlink Express, Outpost, UI-View, real sound hardware and RF.
+For a future field check, start two stations with distinct ports and audio devices,
+select AGWPE in UI-View with the first station's host, TCP port 8000 and radio port 1,
+send a UI packet and check the peer's bytes and display, then send a reply. Record
+client versions and packet captures. Connected-session checks require the future
+AX.25 link layer and are not a supported workflow today.

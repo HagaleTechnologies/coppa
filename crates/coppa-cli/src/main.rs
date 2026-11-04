@@ -671,6 +671,12 @@ enum Commands {
         /// KISS TCP port.
         #[arg(long, default_value = "8001")]
         port: u16,
+        /// Enable the AGWPE TCP server on this port (normally 8000)
+        #[arg(long)]
+        agw_port: Option<u16>,
+        /// Bind the KISS and AGWPE TCP servers to this address
+        #[arg(long, default_value = "127.0.0.1")]
+        bind_address: String,
         /// Input and output device name (unique substring).
         #[arg(long, conflicts_with_all = ["input_device_id", "output_device_id"])]
         device: Option<String>,
@@ -893,6 +899,8 @@ fn run() -> Result<()> {
         #[cfg(feature = "kiss-tnc")]
         Commands::Tnc {
             port,
+            agw_port,
+            bind_address,
             device,
             input_device_id,
             output_device_id,
@@ -902,6 +910,8 @@ fn run() -> Result<()> {
             vox,
         } => cmd_tnc(
             port,
+            agw_port,
+            bind_address,
             device,
             input_device_id,
             output_device_id,
@@ -2638,6 +2648,8 @@ fn render_profile_detail(name: &str, ladder: &[coppa_engine::ladder::LevelInfo])
 #[allow(clippy::too_many_arguments)]
 fn cmd_tnc(
     port: u16,
+    agw_port: Option<u16>,
+    bind_address: String,
     device: Option<String>,
     input_device_id: Option<String>,
     output_device_id: Option<String>,
@@ -2650,6 +2662,8 @@ fn cmd_tnc(
     rt.block_on(async {
         let config = coppa_daemon::tnc::TncConfig {
             kiss_port: port,
+            agw_port,
+            bind_address,
             audio_device: device,
             input_device_id,
             output_device_id,
@@ -2658,7 +2672,6 @@ fn cmd_tnc(
             rig_address: rig,
             vox_mode: vox,
             sample_rate: 48000,
-            ..Default::default()
         };
         coppa_daemon::tnc::run_tnc(config).await
     })

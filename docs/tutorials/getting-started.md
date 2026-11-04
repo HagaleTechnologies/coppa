@@ -446,3 +446,7 @@ frames that are not valid UTF-8.
 - Read [ARCHITECTURE.md](../../ARCHITECTURE.md) for system design details
 - Browse the crate documentation: `cargo doc --workspace --no-deps --open`
 - Run coppad as a service on a Raspberry Pi 4: [raspberry-pi-install.md](raspberry-pi-install.md)
+
+For connectionless AGWPE on the AFSK TNC, use `coppa tnc --agw-port 8000`.
+`--bind-address` changes both KISS and AGW listeners, defaulting to loopback.
+See [TNC setup and client limits](../TNC.md#optional-connectionless-agwpe).

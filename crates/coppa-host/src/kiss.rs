@@ -239,10 +239,20 @@ impl KissServer {
     pub async fn start(&self) -> Result<(), crate::HostError> {
         let addr = format!("{}:{}", self.bind_addr, self.port);
         let listener = TcpListener::bind(&addr).await?;
+        self.run_with_listener(listener).await
+    }
+
+    /// Serve a listener whose bind result has already been checked.
+    pub async fn run_with_listener(&self, listener: TcpListener) -> Result<(), crate::HostError> {
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
+        let mut clients = tokio::task::JoinSet::new();
         loop {
-            let (stream, peer) = listener.accept().await?;
+            let accepted = tokio::select! {
+                result = listener.accept() => result,
+                _ = clients.join_next(), if !clients.is_empty() => continue,
+            };
+            let (stream, peer) = accepted?;
             // Cap concurrent connections; drop the client if at capacity.
             let permit = match semaphore.clone().try_acquire_owned() {
                 Ok(p) => p,
@@ -255,7 +265,7 @@ impl KissServer {
             let tx_sender = self.tx_sender.clone();
             let rx_broadcast = self.rx_broadcast.clone();
 
-            tokio::spawn(async move {
+            clients.spawn(async move {
                 let _permit = permit;
                 handle_kiss_client(stream, peer.to_string(), tx_sender, rx_broadcast).await;
             });
