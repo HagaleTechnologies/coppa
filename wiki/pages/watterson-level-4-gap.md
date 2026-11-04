@@ -33,11 +33,12 @@ fix. AWGN performance at level 4 is unaffected and improved.
 
 ## Cause and workaround
 
-The residual gap at level 4 is plausibly explained by QPSK's denser decision
-regions being more sensitive to residual channel-estimate imperfection than
-BPSK (levels 1–2), but this has not been further investigated. The problem is
-not fully root-caused. Full measured data is in [BENCHMARKS, the hotfix section](../../BENCHMARKS.md#2026-07--hotfix-sparse-pilot-header-watterson-fading-regression-adr-004)
-and [ADR-004](../../docs/adr/004-strongest-path-timing.md).
+[COP-134's historical receiver ablations](../../docs/analysis/COP-134-fading-regressions.md#causal-diagnosis-on-recovered-historical-revisions)
+identify a timing/estimation contributor. The 30-sample timing backoff adds a
+phase ramp that the sparse-pilot linear interpolator handles poorly. At 30 dB
+Moderate, failures fell from 154/400 to 33/400 when the ramp was compensated
+without changing the timing window. This is a historical receiver experiment;
+no current-head remedy or reliability guarantee follows from it.
 
 Benchmark the intended profile and channel before relying on level 4. Levels 1–2
 are BPSK; level 3 is QPSK 1/2 and is also in the later Moderate regression.
@@ -56,6 +57,7 @@ before touching anything in the sync/estimation area.
 ## COP-134 evidence review
 
 [The COP-134 report](../../docs/analysis/COP-134-fading-regressions.md) keeps both
-fading gaps open and supplies a controlled diagnosis plan with an unfiled follow-up
-draft. QPSK sensitivity remains a hypothesis. The fixed CFO failure and later
-level-2/session experiments do not establish a cause or remedy for these gaps.
+fading gaps open and records causal historical ablations plus an unfiled remedy
+follow-up. The Phase-2 estimator/equalizer replacement introduces the levels
+3 to 6 loss before NR FEC changes; restoring its old symbol/noise outputs
+reproduces every baseline trial outcome. Current-head fixes still need validation.
