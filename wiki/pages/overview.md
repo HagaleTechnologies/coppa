@@ -51,3 +51,11 @@ New to the codebase: read [[coppa-engine]] to understand the encode/decode pipel
 on HF fading performance, read [[adr-004-strongest-path-timing]], [[adr-006-phase2-estimation]],
 and [[watterson-level-4-gap]] before touching `SyncDetector` or the channel estimator. If
 working on the daemon's TX path or real-radio behavior, read [[phase4-field-readiness]] first.
+
+## Transfer impairment measurements
+
+`BENCHMARKS.md`, "Synthetic transfer impairments", documents the
+`impairment_transfer` diagnostic and its versioned impulse, clipping, AGC and
+tilt presets. It resets the receiver for every frame, including the control.
+The legacy transfer baseline retains a different decoder policy, so comparing
+its numbers directly would confound impairments with HARQ state isolation.

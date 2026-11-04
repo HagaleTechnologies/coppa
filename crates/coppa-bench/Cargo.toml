@@ -180,3 +180,7 @@ path = "diagnostics/watterson_header_precise.rs"
 [[example]]
 name = "watterson_sanity_sweep"
 path = "diagnostics/watterson_sanity_sweep.rs"
+
+[[example]]
+name = "impairment_transfer"
+path = "diagnostics/impairment_transfer.rs"
