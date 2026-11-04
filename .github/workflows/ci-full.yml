@@ -130,11 +130,11 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install ALSA dev headers (for cpal)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - run: cargo test --workspace --features cpal-backend,websocket,ardop,mdns
+      - run: cargo test --workspace --features cpal-backend,websocket,ardop,mdns,kiss-tnc
       # cpal-backend compiles the daemon's WebSocket, /health and mDNS CLI
       # tests out of the step above; this step runs them (COP-140).
       - name: Daemon tests without audio (CLI, PTT release, reload, smoke)
-        run: cargo test -p coppa-daemon --features websocket,mdns --test cli --test ptt_release --test reload --test runtime_smoke
+        run: cargo test -p coppa-daemon --features websocket,mdns,kiss-tnc --test cli --test ptt_release --test reload --test runtime_smoke
 
   bench-fuzz:
     name: Bench & Fuzz Compilation

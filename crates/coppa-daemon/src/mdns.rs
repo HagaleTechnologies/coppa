@@ -224,7 +224,7 @@ mod responder {
         }
 
         /// Send goodbye packets and stop the responder thread, waiting at most
-        /// [`STOP_WAIT`] for each.
+        /// `STOP_WAIT` (one second) for each.
         pub async fn stop(self) {
             if let Ok(done) = self.daemon.unregister(&self.fullname) {
                 let _ = tokio::time::timeout(STOP_WAIT, done.recv_async()).await;

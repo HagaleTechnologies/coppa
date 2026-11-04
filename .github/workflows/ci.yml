@@ -48,6 +48,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
       - run: cargo check --workspace
       - run: cargo check --workspace --all-features
+      # COP-88: rustdoc must stay warning-free (broken intra-doc links, links
+      # to private items, stray HTML tags). serial-ptt needs the libudev
+      # headers installed above.
+      - name: rustdoc with warnings denied
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
       # COP-90 (H-136): the library crates compile for the browser target.
       # coppa-channel is left out (getrandom needs the wasm_js feature).
       # Compiling is not running: see coppa-protocol's "Portability" docs.

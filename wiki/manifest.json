@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-11-03T20:05:00Z",
-  "head_commit": "dc18b8b",
+  "generated_at": "2026-11-04T09:31:07Z",
+  "head_commit": "de6ad3d",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -328,7 +328,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:464b8d3b3b051e88ac3765987b3e532b3591b76b523d8dd349efe6322f204e93",
+      "hash": "sha256:8d291446f9febc4868ce782cfd1d8784deaab78984d90224e516e42f17651eab",
       "id": "coppa-engine",
       "kind": "subsystem",
       "links": [
@@ -350,7 +350,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:7477efa7bd7802b3e7d22d5e5d3bbed5232209e75b27f423a65310ac134db09c",
+      "hash": "sha256:681566d6e8792b71211acf058d96632a8ca1f31de73737297cf98769574454f6",
       "id": "coppa-protocol",
       "kind": "subsystem",
       "links": [
@@ -365,12 +365,13 @@
       "maintainer": "agent",
       "path": "pages/coppa-protocol.md",
       "sources": [
-        "crates/coppa-protocol/**"
+        "crates/coppa-protocol/**",
+        "docs/SPEC.md"
       ],
       "status": "current",
       "title": "How does coppa-protocol handle framing, FEC, and ARQ?",
-      "verified_commit": "be2141b",
-      "verified_date": "2026-08-05",
+      "verified_commit": "edb17bc",
+      "verified_date": "2026-11-04",
       "visibility": "public"
     },
     {
@@ -575,7 +576,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:ef55c7a0ce1f6a7f46bf351ab29ac09a824708f502b0917f8a77296b49a27164",
+      "hash": "sha256:9dbaaaff3bc7512ae0bf49a1c7f17d440c0613cbe0a8d6e4b9eed90b847da0c0",
       "id": "watterson-level-4-gap",
       "kind": "gotcha",
       "links": [
@@ -590,13 +591,13 @@
         "docs/adr/004-strongest-path-timing.md",
         "docs/adr/006-phase2-parametric-estimation-nr-bg2.md",
         "crates/coppa-codec/src/ofdm/sync_detector.rs",
-        ".superpowers/sdd/p1-fading-regression-fix-report.md",
+        "docs/analysis/COP-134-fading-regressions.md",
         "BENCHMARKS.md"
       ],
       "status": "current",
       "title": "What will bite you about Watterson fading at speed level 4?",
-      "verified_commit": "59b0b63",
-      "verified_date": "2026-07-14",
+      "verified_commit": "d837c89d388eaf9c70752c72db8537d910094cc8",
+      "verified_date": "2026-11-04",
       "visibility": "public"
     },
     {

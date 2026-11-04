@@ -94,6 +94,14 @@ turnaround_ms = 500
 # coppad at startup (COP-36); `--check` does not check profile names.
 
 [host]
+# KISS datagram interface on the OFDM modem, for Reticulum and other
+# KISS-over-TCP clients. One KISS data frame is one OFDM frame: broadcast to
+# every station in range, no acknowledgement, no retry. Off by default; needs
+# the kiss-tnc feature. Any process that can reach the port can key TX.
+# See docs/RETICULUM.md. bind_address applies to this port too.
+# kiss_enabled = true
+# kiss_port = 8100
+
 # What a host application sends and receives on each port: docs/HOST-API.md.
 # Address all host servers (VARA-style TCP, WebSocket) bind to.
 # Default "127.0.0.1" restricts access to this machine only.

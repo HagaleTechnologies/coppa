@@ -672,7 +672,7 @@ impl CoppaTransceiver {
     /// Force the intra-frame cross-codeword interleaving gate (Phase 3 Task
     /// 5, decision 6) on or off, overriding the normal `codewords > 1 &&
     /// level >= CROSS_CODEWORD_INTERLEAVE_MIN_LEVEL` rule -- see
-    /// [`Self::cross_codeword_interleave_override`]'s doc. `None` (the
+    /// `Self::cross_codeword_interleave_override`'s doc. `None` (the
     /// default) restores normal level-gated behavior. Builder-style, same
     /// pattern as [`Self::with_turbo`].
     #[must_use]
@@ -952,7 +952,7 @@ impl CoppaTransceiver {
     /// Evict `seq`'s in-flight IR-HARQ receive buffer, if any (Phase 3 Task 3,
     /// decision 3's "cumulative-ACK advance" eviction trigger, alongside CRC
     /// pass and LRU overflow -- both handled automatically by
-    /// [`Self::harq_combine_and_decode`]/[`HarqRxBuffers`]).
+    /// `Self::harq_combine_and_decode`/`HarqRxBuffers`).
     ///
     /// Once a higher layer's (e.g. [`crate::arq::ArqRx`]'s) cumulative ACK
     /// boundary has advanced past `seq` -- meaning it has been fully delivered

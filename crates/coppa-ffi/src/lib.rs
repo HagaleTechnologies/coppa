@@ -382,7 +382,7 @@ pub struct CoppaConfig {
 /// `coppa_free_samples`.
 ///
 /// `seq` is a per-handle monotonic counter this crate assigns (see
-/// [`QueuedFrame`]'s doc) — `coppa_engine::StreamFrame` itself has no
+/// `QueuedFrame`'s doc) — `coppa_engine::StreamFrame` itself has no
 /// sequence-number field.
 #[repr(C)]
 #[derive(Debug)]
@@ -443,7 +443,7 @@ unsafe fn resolve_engine_config(cfg: *const CoppaConfig) -> Option<coppa_engine:
 /// Construct a new engine handle from a [`CoppaConfig`] (`coppa_config_t`).
 ///
 /// Returns null if `cfg` is null, or for any config-rejection case (see
-/// [`resolve_engine_config`] and [`CoppaConfig`]'s field docs): invalid
+/// `resolve_engine_config` and [`CoppaConfig`]'s field docs): invalid
 /// UTF-8 in `profile` or `callsign`, an unrecognized non-empty `profile`
 /// name, or a non-zero `speed_level` that isn't a valid wire speed level
 /// (1-9), or level 9 on an HF-profile handle.
