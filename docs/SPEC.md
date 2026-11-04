@@ -77,8 +77,17 @@ compatibility across these boundaries:
   MAC `version` stay unchanged, following ADR-003/005; there is no
   negotiation. Both stations must run 0.3.0 to exchange session data.
 
+<<<<<<< HEAD
 Two further ADRs describe additions layered on top of the same wire format:
 `docs/adr/007-multi-codeword-frames.md` (multi-codeword
+=======
+- **COP-138 KISS datagrams (0.7.0)** adds MAC frame type 9 without a PHY
+  change. Datagram framing is defined in §11. Older stations deliver unknown
+  type-9 frames, including the MAC header, raw to their host data clients.
+
+Two further ADRs describe additions layered on top of the same wire format
+(no further breaks): `docs/adr/007-multi-codeword-frames.md` (multi-codeword
+>>>>>>> 951030cae7b73389cd84e377bd43a2ddcf76aee9
 framing + intra-frame cross-codeword interleaving, §9 below) and
 `docs/adr/008-phase3-system-layer.md` (payload integrity, ARQ, IR-HARQ, rate
 loop, SCO tracking — the system-layer behaviors this spec documents where
@@ -966,6 +975,16 @@ dropped without delivery and without an ACK. Handshake, `Disconnect`,
 defined capability flag bit 1 (`multi_frame_ack`, §20.1). §17–§20 are the
 full, current specification of these layers; this note is history.
 
+**Datagram framing (COP-138).** One KISS data frame becomes one uncompressed
+MAC `Datagram` PDU in a PHY `Data` frame, using the fewest codewords that fit
+from 1 through 8 at the current speed level. MAC byte 0 is `0x19` (version 1,
+frame type 9); bytes 1–6 are all zero for the broadcast destination; bytes
+7–12 hold the transmitting station's 6-bit packed source callsign; byte 13
+is SSID 0; bytes 14 onward contain the KISS data unchanged. There is no
+fragmentation, acknowledgement or retry. Receivers deliver broadcast
+Datagram payloads only to their KISS clients. Older stations do not recognise
+type 9 and forward the entire PDU raw to their host data clients.
+
 ---
 
 ## 12. Discrepancy note: stale `CodeRate` label for speed level 9
@@ -1138,7 +1157,7 @@ addition category, not a break), and compression is already on the air
 
 The layering is: application payload bytes → this section's envelope
 (§15.1) → the §4.2 header's `payload_len` counts **envelope bytes, not
-plaintext bytes** when compression applies. Station-ID/beacon frames are
+plaintext bytes** when compression applies. Station-ID/beacon and Datagram frames are
 never compressed (§15.5), and the header itself is never compressed.
 
 ### 15.1 Envelope byte layout
@@ -1309,7 +1328,10 @@ Compression is gated by each station's **own** configuration only; there
 is no in-band negotiation and no per-frame compression flag anywhere in
 the §4.2 header:
 
-- A transmitter compresses iff its own `compression_enabled` is set
+- Station-ID/beacon frames and Datagram MAC PDUs bypass compression. A
+  Datagram starts with `0x19`, so a compression-enabled receiver passes it
+  through unchanged.
+- For other payloads, a transmitter compresses iff its own `compression_enabled` is set
   (`crates/coppa-engine/src/config.rs:43`; library default `false`,
   `config.rs:93`; profile override `config.rs:115`).
 - A receiver decompresses iff its own `compression_enabled` is set **and**
