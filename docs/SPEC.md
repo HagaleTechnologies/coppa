@@ -972,6 +972,22 @@ label. `SPEED_LEVELS[8]`'s `ldpc_rate_num`/`ldpc_rate_den`
 `coppa_protocol::modem::code_rate_for_level` derives the real rate from
 `k_used`, and `coppa profiles` shows that rate.
 
+### CLI payload-budget mapping
+
+`coppa profiles` (and its deprecated `coppa config` alias) reports
+`max_payload_bytes` with `max_payload_scope: "encoded_bytes_per_codeword"`
+in profile and level JSON records. This is the one-codeword budget from §5.2
+and §9: bytes after compression and before FEC, including any transport headers
+but excluding the per-codeword CRC. Here `encoded` means the prepared payload,
+not encoded audio samples. The level JSON air-time fields (`hf_airtime_ms` and
+`vhf_airtime_ms`) describe a single-codeword frame, including frame overhead.
+
+This budget is not a cap on a daemon host write. Larger stream writes are chunked;
+how much raw input fits depends on compression and transport headers. See §9 for
+multi-codeword frames, §15 for compression and
+[ADR-010](adr/010-cop38-session-arq.md) for session transport/ARQ. KISS datagrams have their own refusal limit, documented
+in [RETICULUM.md](RETICULUM.md).
+
 ---
 
 ## 13. Conformance checklist
