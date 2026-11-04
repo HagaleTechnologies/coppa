@@ -3295,3 +3295,31 @@ at 367, `L2_poor25` at 274). 300 s each of white noise, SSB-band noise and a
 1 kHz tone with noise gave no candidate from either front end. This is an
 AWGN simulation, with no Watterson sweep of the streaming path and no
 hardware or on-air result.
+
+### `--cfo ±150` sweep (AWGN + ±150 Hz carrier offset, level 2)
+
+COP-128, 2026-11-04. `hf_standard`, seed `0x00C0FFEE`, 20 trials per cell,
+3 kHz reference-band SNR. The hypothesis search is per-profile and independent
+of speed level; this table measures level 2 only. Reproduce each sign with:
+
+```sh
+cargo run --release -p coppa-bench -- --level 2 --profile standard --cfo 150 --trials 20 --snr-min 0 --snr-max 18 --snr-step 3 --out-dir /tmp/cop128-plus
+cargo run --release -p coppa-bench -- --level 2 --profile standard --cfo -150 --trials 20 --snr-min 0 --snr-max 18 --snr-step 3 --out-dir /tmp/cop128-minus
+```
+
+| SNR (dB) | +150 Hz errors/trials | −150 Hz errors/trials | +150 Hz goodput (bps) | −150 Hz goodput (bps) |
+|---|---|---|---|---|
+| 0.0 | 20/20 | 20/20 | 0.00 | 0.00 |
+| 3.0 | 5/20 | 5/20 | 514.29 | 514.29 |
+| 6.0 | 1/20 | 1/20 | 651.43 | 651.43 |
+| 9.0 | 0/20 | 1/20 | 685.71 | 651.43 |
+| 12.0 | 0/20 | 0/20 | 685.71 | 685.71 |
+| 15.0 | 0/20 | 0/20 | 685.71 | 685.71 |
+| 18.0 | 0/20 | 0/20 | 685.71 | 685.71 |
+
+All observed errors were sync failures. Wilson 95% FER intervals are
+[83.89%, 100%] for 20/20 errors, [11.19%, 46.87%] for 5/20,
+[0.89%, 23.61%] for 1/20 and [0%, 16.11%] for 0/20. Twenty trials
+cannot establish either a 10% or a 1% FER ceiling at 95% confidence.
+At 12 dB both signs decoded all 20 frames. The CI guard
+`waterfall_cfo150_level_2` allows at most one error per 20-trial sign.
