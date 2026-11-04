@@ -6798,12 +6798,18 @@ impl EventLoop {
         let cwid_changed = plan.applies("station_id", "cwid");
         let turnaround_changed =
             plan.applies("radio", "turnaround_ms") || plan.applies("radio", "ptt_tail_delay_ms");
+        let timing_changed = turnaround_changed || plan.applies("radio", "ptt_pre_delay_ms");
         let crate::config::ReloadPlan {
             effective,
             applied,
             restart_required,
         } = plan;
         self.config = effective;
+        if timing_changed {
+            // Keep the active link and its RTT history; timing decreases may
+            // safely retain the higher floor until the session ends.
+            self.raise_session_rto_for_level(self.engine.speed_level());
+        }
         if cwid_changed {
             let policy = self.config.station_id.cwid;
             self.cw_id_on = policy == CwIdPolicy::Always;
@@ -20815,6 +20821,47 @@ mod tests {
             event_loop.apply_reload(file);
             assert_eq!(event_loop.config.radio.ptt_pre_delay_ms, 123);
             assert_eq!(event_loop.config.station_id.id_interval_secs, 300);
+        }
+
+        #[tokio::test]
+        async fn timing_reload_raises_active_session_rto_without_resetting_arq() {
+            for timing in ["turnaround", "pre", "tail"] {
+                let (mut station, _peer, _tx_audio, _rx_audio) = connected_pair(0).await;
+                let now = clock_now();
+                let tx = &mut station.session_link.as_mut().unwrap().tx;
+                let first = tx.send(b"acked".to_vec(), now).unwrap();
+                tx.process_ack(first.wrapping_add(1), 0, now + Duration::from_secs(1));
+                let sent = now + Duration::from_secs(2);
+                let pending = tx.send(b"pending".to_vec(), sent).unwrap();
+                let old_rto = tx.rto();
+                let mut file = station.config.clone();
+                match timing {
+                    "turnaround" => file.radio.turnaround_ms = 20_000,
+                    "pre" => file.radio.ptt_pre_delay_ms = 20_000,
+                    "tail" => file.radio.ptt_tail_delay_ms = 20_000,
+                    _ => unreachable!(),
+                }
+                station.apply_reload(file);
+                // Ordinary single-codeword frames clear the segment override.
+                station.set_session_segment_floor(100, 100, 1);
+                let level = station.engine.speed_level();
+                let expected = coppa_protocol::arq::rto_floor(
+                    SESSION_ARQ_WINDOW,
+                    level,
+                    level,
+                    Duration::from_secs(20),
+                    &coppa_codec::ofdm::CoppaProfile::hf_standard(),
+                );
+                let tx = &mut station.session_link.as_mut().unwrap().tx;
+                assert!(expected > old_rto);
+                assert!(tx.rto() >= expected, "{timing} reload left a stale RTO");
+                assert_eq!(tx.send_base(), pending);
+                assert_eq!(tx.next_seq(), pending.wrapping_add(1));
+                assert_eq!(tx.get_segment_data(pending), Some(b"pending".as_slice()));
+                assert!(tx.get_retransmits(sent + old_rto).is_empty());
+                tx.process_ack(pending.wrapping_add(1), 0, sent + Duration::from_secs(1));
+                assert!(tx.rto() >= expected, "RTT updates must retain the floor");
+            }
         }
 
         #[tokio::test]
