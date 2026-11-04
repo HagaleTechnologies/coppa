@@ -576,7 +576,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:ef55c7a0ce1f6a7f46bf351ab29ac09a824708f502b0917f8a77296b49a27164",
+      "hash": "sha256:9dbaaaff3bc7512ae0bf49a1c7f17d440c0613cbe0a8d6e4b9eed90b847da0c0",
       "id": "watterson-level-4-gap",
       "kind": "gotcha",
       "links": [
@@ -591,13 +591,13 @@
         "docs/adr/004-strongest-path-timing.md",
         "docs/adr/006-phase2-parametric-estimation-nr-bg2.md",
         "crates/coppa-codec/src/ofdm/sync_detector.rs",
-        ".superpowers/sdd/p1-fading-regression-fix-report.md",
+        "docs/analysis/COP-134-fading-regressions.md",
         "BENCHMARKS.md"
       ],
       "status": "current",
       "title": "What will bite you about Watterson fading at speed level 4?",
-      "verified_commit": "59b0b63",
-      "verified_date": "2026-07-14",
+      "verified_commit": "d837c89d388eaf9c70752c72db8537d910094cc8",
+      "verified_date": "2026-11-04",
       "visibility": "public"
     },
     {
