@@ -110,6 +110,13 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 - Streaming: `coppa_engine_feed_samples` + `coppa_next_frame` (binary frames), and `coppa_start_stream`/`coppa_feed_samples`/`coppa_get_decoded`/`coppa_stop_stream` (text)
 - `coppa_engine_destroy` takes a pointer to the handle pointer and nulls it, which prevents double-free
 - cdylib + staticlib output; `build.rs` regenerates `coppa.h` with cbindgen
+- Errors (COP-139): every fallible call clears and sets a per-thread message, read with `coppa_last_error()` as `"<function>: <reason>"`; `coppa_strerror(code)` describes each `COPPA_ERR_*` code
+- ABI (COP-139): `COPPA_ABI_VERSION_MAJOR`/`_MINOR` in the header and `coppa_abi_version()` at run time, independent of the crate version; policy in `docs/DECISIONS/2026-11-03-c-abi-versioning.md`
+- Links (COP-139): `coppa_link_*` drives `coppa_engine::link::Link`, a sans-IO connected session (coppad's CONNECT handshake, stop-and-wait ARQ, keepalive, disconnect) over audio samples and a caller clock; see ADR-011
+- Threads: any function from any thread; one handle's calls are serialized by its lock; destroy only after other calls on that handle finish; `coppa.h` states the full rule
+
+#### Python binding (`bindings/python`)
+- A stdlib-only `ctypes` package over the link API, with an ABI check at load; not published (COP-139)
 
 #### CLI (`coppa-cli`)
 - Binary `coppa`. Subcommands: `tx`, `rx`, `loopback`, `tune`, `devices`, `doctor`, `config`, plus `tnc` when built with `kiss-tnc`. `listen` survives one release as a hidden, deprecated alias of `rx` (COP-56)
