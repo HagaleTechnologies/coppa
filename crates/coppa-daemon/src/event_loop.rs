@@ -1653,7 +1653,11 @@ impl EventLoop {
             snap.mycall = self.local_callsign.as_ref().map(|c| c.to_string());
             snap.max_tx_s = Some(max_tx_s);
             snap.max_tune_s = Some(max_tune_seconds(max_tx_s) as u64);
-            snap.loop_heartbeat = Some(Instant::now());
+            // WsStatus::reply ages this with std `elapsed()`, so it must
+            // stay a real std instant.
+            #[allow(clippy::disallowed_methods)]
+            let heartbeat = Instant::now();
+            snap.loop_heartbeat = Some(heartbeat);
             snap.ptt.get_or_insert(self.is_transmitting);
             snap.busy.get_or_insert(self.busy_gate.current());
             snap.buffer.get_or_insert(self.last_reported_buffer as u64);
@@ -1679,7 +1683,11 @@ impl EventLoop {
         if let Some(ref status) = self.ws_status {
             let mut snap = status.lock().await;
             snap.waiting_for_clear_channel = Some(waiting);
-            snap.loop_heartbeat = Some(Instant::now());
+            // WsStatus::reply ages this with std `elapsed()`, so it must
+            // stay a real std instant.
+            #[allow(clippy::disallowed_methods)]
+            let heartbeat = Instant::now();
+            snap.loop_heartbeat = Some(heartbeat);
         }
     }
 
@@ -1858,6 +1866,9 @@ impl EventLoop {
                     VaraResponse::Ptt(state) => {
                         snap.ptt = Some(*state);
                         if *state {
+                            // WsStatus::reply ages this with std
+                            // `elapsed()`, so it must stay a real std instant.
+                            #[allow(clippy::disallowed_methods)]
                             snap.ptt_since.get_or_insert_with(Instant::now);
                         } else {
                             snap.ptt_since = None;

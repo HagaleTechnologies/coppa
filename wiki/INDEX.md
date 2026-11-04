@@ -26,8 +26,5 @@
 - [What will bite you when persisting coppa CLI settings?](pages/cli-settings.md) — Profile, band and TNC gotchas.
 - [Which stream and exit code does coppa use?](pages/cli-output.md) — stdout is data only; broken pipe, Ctrl-C and 130 rules.
 - [What will bite you when testing coppad's mDNS discovery?](pages/mdns-discovery.md) — Loopback answers and glibc's missing .local lookup fool same-host tests.
-<<<<<<< HEAD
 - [What will bite you when a paused-clock test drives the daemon's timers?](pages/paused-clock-timers.md) — Under start_paused only tokio's clock is virtual; daemon timers must use clock_now().
-=======
 - [What will bite you when measuring coppa's TNC against Direwolf?](pages/tnc-direwolf-benchmark.md) — Misnamed track, two Direwolf defaults, 48 kHz input.
->>>>>>> e1d391e5ae0eb23b95678856bb66806b2287beb1
