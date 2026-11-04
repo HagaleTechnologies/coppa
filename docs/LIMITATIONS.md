@@ -281,3 +281,28 @@ update.
 - **`coppa-protocol`'s `Session`, `ArqTx` and `CpNegotiator` compile for `wasm32-unknown-unknown` but cannot run there (COP-90, H-136).** Before COP-90, `Session::new` read the clock itself, and a Node 24 probe of a `wasm32-unknown-unknown` `cdylib` trapped with `RuntimeError: unreachable` on the first `Session::new` call. Since COP-90 every `Session`/`SessionManager` method that needs the time takes `now: std::time::Instant`, like `ArqTx` and `CpNegotiator` already did, and `crates/coppa-protocol/clippy.toml` bans `Instant::now`/`Instant::elapsed` in the library, so the crate itself never reads the clock. The trap has moved to the caller: on `wasm32-unknown-unknown` a caller cannot construct the `Instant` it must pass, because `Instant::now()` traps there too. `ci.yml` only compiles the crate for that target; it runs nothing. Follow-up: a crate-wide caller-supplied timestamp type for `Session`, `ArqTx` and `CpNegotiator`.
 - **coppa's AFSK 1200 TNC decodes 41.2 percent of Direwolf's packets on WA8LMF TNC Test CD track 2 (COP-112, 2026-11-03; COP-99's 95 percent bar is not met).** On the 25:50 de-emphasized traffic recording, coppa's demodulator, fed through the TNC's 44.1-to-48 kHz resampler, decodes 412 packets with a valid FCS. Dire Wolf 1.7 decodes 1000 as `direwolf` (its default profile `A+`) and 982 as `atest` (its default profile `A`). The bar is 950 packets. Coppa's count moves between 388 and 416 when the input starts up to 35 samples later, so a change of less than about 30 packets is alignment noise. The cause is not isolated. One untested candidate is in the code: the demodulator counts its symbol window from the first input sample and never adjusts it to the signal (`crates/coppa-codec/src/afsk.rs:278-305`). Method and pins: `docs/testing/tnc-direwolf-wa8lmf.md`. Reproduce with `tools/tnc-bench/run.sh`.
 - **Streaming-receive sync front end (COP-126).** `StreamingReceiver` now runs `SyncDetector::new_prefiltered`: a 121-tap 250-2850 Hz band-pass decimated by 4 ahead of the plateau search, with full-rate timing refinement, which moved the 50% sync point on full-band AWGN from about 12.3 dB to about 2.3 dB (levels 1-2, `hf_standard`; BENCHMARKS.md "COP-126"). Remaining gaps: the band is fixed for every HF profile, so `hf_narrow` (carriers 350-800 Hz) gains less (1/20 detected at 3 dB versus 15-19/20 on the other HF profiles in the plan-phase probe); false alarms were measured only on 300 s each of white noise, SSB-band noise and a tone with noise (0 candidates), not on real voice or digital interference; and the streaming path has no Watterson-channel sweep.
+
+## COP-119 session fade protection
+
+- RS(12,6) session protection is simulation and cable tested, with no RF trial.
+  `[session] fade_protection` defaults to `"accept"`; one peer must request it.
+- A receiver can key over a burst before it decodes its first packet. The
+  burst-end hold can only start once a packet supplies its index and level.
+- RS blocks bypass compression. The plain data path still shares PHY HARQ
+  key zero. The protected mode uses separate keys and clears them on delivery.
+- The original session bench uses bare frames, window eight and retry seeds
+  derived from sequence number. Its historical baseline is distinct from the
+  new window-one MAC/transport arms. New arms use independent channel seeds
+  per physical packet and a 1200-sample receive tail, not a continuous channel.
+- There is no host command to request protection; set the session config key.
+  Clean throughput, latency and ACK-loss results are recorded in BENCHMARKS.
+- Measured ACK loss: protected Good and Moderate completed 5/5 sessions,
+  at 1426.8 and 1379.6 B/min; protected Poor completed 4/5 at 790.1 B/min,
+  with one dropped session. The matched plain arm completed 2/5 Good,
+  2/5 Moderate and 3/5 Poor at 1019.0, 939.5 and 197.6 B/min. Clean protected
+  throughput was 1814.5 B/min in the bench, versus 1901.0 for matched plain
+  stop-and-wait. These are independent-per-packet simulated channels, not RF.
+- The session RTO budget still omits a peer's due station-ID prepend before
+  an ACK. This also affects the existing plain multi-codeword path. The new
+  protected-mode bound covers two slow HF ACKs, but does not reserve a third
+  frame for a peer ID. A lost first ACK during that prepend can cause a retry.

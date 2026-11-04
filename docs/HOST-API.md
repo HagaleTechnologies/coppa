@@ -412,3 +412,12 @@ At commit `b9fdb8d` (coppad 0.3.0), on Linux, with no radio, no sound card and n
   ([testing/pat-session.md](testing/pat-session.md#cop-76-run-record-2026-11-02)).
 
 Not run: real VARA, ARDOP at this commit, the C FFI, real radios, a real browser.
+
+### Session fade protection status
+
+The WebSocket status reply's `link.fade_protection` is `"rs12-6"` when the
+session negotiated erasure protection, and `"off"` otherwise. The field is
+present whenever `link` is present. It reports the negotiated mode even if a
+TX-duration guard sends an individual segment as a plain frame.
+`link.fade_hold` separately reports the retransmission fallback state.
+Configure the mode with `[session] fade_protection`; no host command changes it.

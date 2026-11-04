@@ -106,6 +106,7 @@
       "type": "object",
       "required": [
         "fade_hold",
+        "fade_protection",
         "in_flight",
         "max_retries",
         "retries",
@@ -115,6 +116,10 @@
         "fade_hold": {
           "description": "COP-68 fade hold: retransmitting at a lower level.",
           "type": "boolean"
+        },
+        "fade_protection": {
+          "description": "Negotiated session mode: \"rs12-6\" or \"off\".",
+          "type": "string"
         },
         "in_flight": {
           "description": "Segments sent and not yet acknowledged.",

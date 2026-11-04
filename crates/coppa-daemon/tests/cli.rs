@@ -804,6 +804,7 @@ fn print_default_config_prints_only_the_default_toml() {
         "cp_negotiation_enabled = false",
         "id_interval_secs = 540",
         "ptt_guardian = true",
+        "fade_protection = \"accept\"",
     ] {
         assert!(printed.contains(line), "missing {line:?}:\n{printed}");
     }

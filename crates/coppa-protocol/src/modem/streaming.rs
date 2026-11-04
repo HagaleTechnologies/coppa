@@ -210,6 +210,16 @@ impl std::fmt::Debug for StreamingReceiver {
 }
 
 impl StreamingReceiver {
+    /// Discard soft information for one packet when its outer block completes.
+    pub fn harq_evict(&mut self, seq: u8) {
+        self.transceiver.harq_evict(seq);
+    }
+
+    #[cfg(test)]
+    fn harq_buffer_count(&self) -> usize {
+        self.transceiver.harq_buffer_count()
+    }
+
     /// Create a receiver for `profile` whose sync detector and transceiver
     /// expect protocol `version` (the header nibble that keys the preamble
     /// PN). The ring starts empty.
@@ -478,7 +488,11 @@ impl StreamingReceiver {
                         }
                     }
                 }
-                self.resume_from = start + need as u64;
+                // Sync anchors vary slightly with the preceding packet's tail.
+                // Keep one symbol of overlap so a back-to-back preamble whose
+                // anchor is earlier than this frame's does not get discarded.
+                // This cannot revisit this frame's own preamble/header.
+                self.resume_from = start + need.saturating_sub(self.symbol_len) as u64;
                 self.pending = None;
             }
         }
@@ -716,6 +730,30 @@ mod tests {
             i = end;
         }
         out
+    }
+
+    #[test]
+    fn streaming_harq_evict_clears_only_the_requested_key() {
+        let profile = CoppaProfile::hf_standard();
+        let tx = CoppaTransceiver::new(profile.clone(), 1);
+        let mut rx = StreamingReceiver::new(profile.clone(), 1);
+        let symbol_len = profile.fft_size + profile.cp_samples;
+        let header_syms = header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(profile.data_carriers);
+        for seq in [0x10, 0x11] {
+            let mut h = header(5, 40);
+            h.seq_num = seq;
+            let mut frame = tx.transmit(&h, &[0x77; 40]).unwrap();
+            frame[(3 + header_syms) * symbol_len..].fill(0.0);
+            // Insert through the same receiver-owned transceiver used by streaming.
+            assert!(rx.transceiver.receive(&frame).is_err());
+        }
+        assert_eq!(rx.harq_buffer_count(), 2);
+        rx.harq_evict(0x10);
+        assert_eq!(rx.harq_buffer_count(), 1);
+        rx.harq_evict(0x10);
+        assert_eq!(rx.harq_buffer_count(), 1);
+        rx.harq_evict(0x11);
+        assert_eq!(rx.harq_buffer_count(), 0);
     }
 
     #[test]

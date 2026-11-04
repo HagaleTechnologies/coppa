@@ -52,6 +52,7 @@ pub mod cp_negotiator;
 pub mod fec;
 pub mod frame;
 pub mod mac;
+pub mod outer_code;
 pub mod session;
 pub mod transport;
 

@@ -514,11 +514,27 @@ pub const MIN_CWID_WPM: u32 = 10;
 /// 97.119(b)(1) caps an automatic CW ID at 20 WPM.
 pub const MAX_CWID_WPM: u32 = 20;
 
-/// Connected-session configuration (COP-69).
-///
-/// One operator-facing knob today: the cap on LDPC codewords per session
-/// data frame. Session parameters beyond this stay negotiated with the peer
-/// in the CONNECT handshake (see `coppa_protocol::session::LinkCapabilities`).
+/// Connected-session erasure protection policy (SPEC section 16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FadeProtection {
+    Off,
+    #[default]
+    Accept,
+    Request,
+}
+
+impl FadeProtection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Accept => "accept",
+            Self::Request => "request",
+        }
+    }
+}
+
+/// Connected-session codeword cap and negotiated fade-protection policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionConfig {
@@ -530,12 +546,28 @@ pub struct SessionConfig {
     /// advertise the `multi_frame_ack` capability; a mixed-version pair runs
     /// 1-codeword frames exactly as before regardless of this value.
     pub max_codewords_per_frame: u8,
+    /// Request, accept, or disable the negotiated RS(12,6) session mode.
+    #[serde(deserialize_with = "deserialize_fade_protection")]
+    pub fade_protection: FadeProtection,
+}
+
+fn deserialize_fade_protection<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<FadeProtection, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    match value.as_str() {
+        "off" => Ok(FadeProtection::Off),
+        "accept" => Ok(FadeProtection::Accept),
+        "request" => Ok(FadeProtection::Request),
+        _ => Err(serde::de::Error::custom(format!("invalid [session] fade_protection ({value:?}); must be one of \"off\", \"accept\", \"request\""))),
+    }
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             max_codewords_per_frame: 8,
+            fade_protection: FadeProtection::Accept,
         }
     }
 }
@@ -2608,5 +2640,31 @@ beacon_interval_secs = 600
             "{err}"
         );
         assert!(err.contains("set buffer_size = 8192"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod fade_protection_tests {
+    use super::*;
+    #[test]
+    fn fade_protection_config_modes() {
+        assert_eq!(
+            SessionConfig::default().fade_protection,
+            FadeProtection::Accept
+        );
+        for (value, mode) in [
+            ("off", FadeProtection::Off),
+            ("accept", FadeProtection::Accept),
+            ("request", FadeProtection::Request),
+        ] {
+            let config: DaemonConfig =
+                toml::from_str(&format!("[session]\nfade_protection = \"{}\"", value)).unwrap();
+            assert_eq!(config.session.fade_protection, mode);
+        }
+        let error = toml::from_str::<DaemonConfig>("[session]\nfade_protection = \"yes\"")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fade_protection"), "{error}");
+        toml::from_str::<DaemonConfig>(include_str!("../../../coppad.toml.example")).unwrap();
     }
 }

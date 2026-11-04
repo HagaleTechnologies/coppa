@@ -41,6 +41,8 @@ pub enum MacFrameType {
     /// Reserved for relayed traffic; no transmit or receive path builds one
     /// yet (type nibble 8).
     Relay = 8,
+    /// RS(12,6) session shard, negotiated by CONNECT flags bits 2 and 3.
+    OuterData = 9,
 }
 
 impl MacFrameType {
@@ -56,6 +58,7 @@ impl MacFrameType {
             6 => Ok(MacFrameType::Beacon),
             7 => Ok(MacFrameType::Keepalive),
             8 => Ok(MacFrameType::Relay),
+            9 => Ok(MacFrameType::OuterData),
             v => Err(ProtocolError::UnknownMacFrameType { value: v }),
         }
     }
@@ -499,6 +502,7 @@ mod tests {
             MacFrameType::Beacon,
             MacFrameType::Keepalive,
             MacFrameType::Relay,
+            MacFrameType::OuterData,
         ];
         for &ft in &types {
             let val = ft as u8;
@@ -510,8 +514,8 @@ mod tests {
     #[test]
     fn test_frame_type_invalid() {
         assert!(matches!(
-            MacFrameType::from_u8(9),
-            Err(ProtocolError::UnknownMacFrameType { value: 9 })
+            MacFrameType::from_u8(10),
+            Err(ProtocolError::UnknownMacFrameType { value: 10 })
         ));
         assert!(MacFrameType::from_u8(15).is_err());
     }
@@ -551,6 +555,7 @@ mod tests {
             MacFrameType::Beacon,
             MacFrameType::Keepalive,
             MacFrameType::Relay,
+            MacFrameType::OuterData,
         ] {
             let pdu = MacPdu::new(ft, dest.clone(), src.clone(), 0, vec![]);
             let bytes = pdu.to_bytes();
@@ -724,5 +729,18 @@ mod tests {
         let decoded = MacPdu::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.dest.as_str(), "");
         assert_eq!(decoded.frame_type, MacFrameType::Beacon);
+    }
+}
+
+#[cfg(test)]
+mod outer_tests {
+    use super::*;
+    #[test]
+    fn mac_frame_type_outer_data_round_trips() {
+        assert_eq!(
+            MacFrameType::from_u8(MacFrameType::OuterData as u8).unwrap(),
+            MacFrameType::OuterData
+        );
+        assert!(MacFrameType::from_u8(10).is_err());
     }
 }

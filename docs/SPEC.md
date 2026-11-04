@@ -25,6 +25,11 @@ modem; this spec describes only Coppa's own wire format.
 
 ### 0.1 Versioning and wire-format break history
 
+- **COP-119 session fade protection (0.7.0)** adds negotiated RS(12,6)
+  session packets, MAC type 9 and CONNECT flags bits 2 and 3. See §16.
+  PHY and MAC versions remain 1. Non-negotiating stations keep their
+  existing session data format.
+
 This spec describes **wire-format version 1** — the format produced when
 `CoppaTransceiver`/`CoppaModem` are constructed with `version: 1`, which is
 what every current production caller uses
@@ -903,6 +908,8 @@ receiver strategy choice (**SHOULD**, not **MUST**).
 
 ## 11. Byte/bit orders — cross-reference
 
+Negotiated outer-coded session framing is specified in §16.
+
 | Structure | Order | Source |
 |---|---|---|
 | `CoppaHeader` 6-byte packing | MSB-first per field and per byte | `crates/coppa-codec/src/ofdm/frame.rs:280-292` |
@@ -1338,3 +1345,99 @@ anywhere in the workspace, and it is not the compression of §15.1.
 Implementers MUST NOT build it expecting interop; the engine-layer `0xFE`
 envelope of §15.1 is the only compression on the air. This note follows
 §12's precedent for stale unused definitions.
+
+
+## 16. Session fade protection: RS(12,6) outer code
+
+### 16.1 Capability negotiation
+
+CONNECT capabilities remain seven bytes. In flags byte 5, bit 0 is compression,
+bit 1 is multi-frame ACK, bit 2 is `outer_code_rx` and bit 3 is `outer_code_req`.
+Bits 4 through 7 are reserved and MUST be transmitted as zero and ignored on
+receipt. An `off` station advertises neither outer-code bit, `accept` advertises
+bit 2 only, and `request` advertises both. The negotiated receive bit MUST be
+`a.rx AND b.rx`; the request bit MUST be `rx AND (a.req OR b.req)`. The mode is
+active only when both negotiated bits are true. CONNECT_CFM MUST carry those
+exact negotiated bits; the responder MUST reject a mismatch. An older peer
+with both bits clear never enables this mode. Default `accept` pairs therefore
+retain the ordinary Data format.
+
+### 16.2 OuterData packets
+
+Each packet MUST use MAC type nibble 9 (`OuterData`), with the ordinary session
+source, destination and SSID checks. Its MAC payload is:
+
+| Offset | Length | Meaning |
+|---|---|---|
+| 0 | 1 byte | High nibble format 1; low nibble shard index 0 through 11 |
+| 1 | 1 byte | ARQ segment sequence number |
+| 2 | 2 bytes | Unpadded segment length, unsigned big-endian |
+| 4 | S bytes | Shard |
+
+`S` is the single-codeword maximum PHY payload for the selected speed level
+minus the 14-byte MAC header and 4-byte outer header. At level 2, S is 99.
+The segment MUST be a serialized Reliable TransportPdu, including its seven
+header bytes, with sequence equal to the outer sequence. Its length MUST be
+between 1 and `6*S`, inclusive, and fit u16. It is padded with zeros to `6*S`
+and split consecutively into six source shards of S bytes. All twelve packets
+of a block MUST have equal S and segment length. Receivers MUST reject invalid
+format, index, zero or excessive length, short input, or inconsistent metadata.
+
+### 16.3 Erasure code
+
+Arithmetic is GF(256), with primitive polynomial `x^8+x^4+x^3+x^2+1` (0x11d)
+and primitive element 2. Addition is XOR. Generator rows 0 through 5 are the
+6-by-6 identity. For rows r = 6 through 11 and columns i = 0 through 5,
+`G[r][i] = inverse(r XOR i)` in that field. Shard r byte b is the XOR over i
+of `G[r][i] * source[i][b]`. Any six distinct CRC-valid shards reconstruct
+the source by inversion of their six generator rows, for example with
+Gauss-Jordan elimination. Fewer than six shards MUST NOT be delivered.
+After concatenating recovered source shards in index order, remove bytes
+beyond the declared segment length. For source one-byte shards
+`01 02 03 04 05 06`, parity shards are `f2 bb b8 8a 33 2c`.
+
+The receiver retains one block across retries. A new accepted sequence resets
+that block; inconsistent lengths on the same sequence MUST be rejected.
+Only the current receive-base sequence or its immediately preceding duplicate
+is accepted by a session. Reconstructed transport bytes feed normal Reliable
+ARQ delivery and MUST NOT cause duplicate host delivery.
+
+### 16.4 PHY keys, transmission and ACK timing
+
+The sender MUST transmit all twelve independently framed packets in index
+order, back to back in one keying, without compression. Packet i uses PHY
+`seq_num = 0x10 + (segment_seq modulo 20)*12 + i`. Retransmissions reuse the
+same shard bytes, level and keys. On delivery, the receiver evicts HARQ keys
+for the delivered sequence and its predecessor; teardown evicts all keys
+0x10 through 0xff.
+
+After accepting packet i, the receiver extends the estimated burst end to at
+least reception time plus `(11-i)*single_packet_airtime`. It MUST defer its
+own data and ACK transmission until burst end plus the configured turnaround.
+When the block has been delivered, or is a duplicate of the last delivered
+block, the receiver sends two copies of the ordinary session ACK back to back
+in one keying. An incomplete block receives no ACK. Sender timeout floor MUST
+cover keyed burst duration, two turnarounds, and two ACK frame durations. If the peer ACK rate is unknown,
+use the slowest supported HF ACK duration as the bound. After
+newly acknowledging an outer block, the sender MUST hold its transmitter for
+at least one further ACK frame duration plus turnaround, to avoid colliding
+with the second copy. Duplicate ACKs do not extend this extra hold. If only
+the second copy decoded, this rule conservatively waits one extra frame.
+
+If twelve packet durations plus a due station ID and a one-second margin
+exceed the configured maximum transmit duration, the sender uses an ordinary
+Data frame for that segment. Receivers in outer-code mode MUST also accept
+ordinary Data frames. The in-flight block level remains fixed across retries.
+
+### 16.5 Conformance checklist
+
+- Verify all 924 subsets of six shards reconstruct exactly.
+- Verify the known-answer vector in §16.3 and reject malformed packets.
+- Verify the nine `off`/`accept`/`request` pairs and legacy flags.
+- Verify twelve adjacent frames, six erasures, retained retry shards and lost ACKs.
+- Verify HARQ key isolation, burst-end turnaround, fixed retry level and length guard.
+- Verify default pairs retain ordinary frame bytes.
+
+Source: `crates/coppa-protocol/src/outer_code.rs`, `fec/outer_rs.rs`,
+`session.rs`, `mac.rs`; daemon integration in
+`crates/coppa-daemon/src/session_outer.rs` and `event_loop.rs`.

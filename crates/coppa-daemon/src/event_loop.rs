@@ -38,11 +38,15 @@ use crate::audio_output::{
 };
 use crate::config::{CwIdPolicy, DaemonConfig};
 use crate::level_meter::{self, LevelReading, LevelState, RxLevelMeter};
+use crate::session_outer::{encode_burst, OuterTx};
 use crate::tx_chunker::{chunk_to_fit, next_chunk_len, next_growing_chunk_len};
 #[cfg(feature = "ardop")]
 use coppa_host::ardop::{
     queue_response as queue_ardop_response, ArdopCommand, ArdopResponse, Queued as ArdopQueued,
     COMMAND_QUEUE_DEPTH as ARDOP_COMMAND_QUEUE_DEPTH,
+};
+use coppa_protocol::outer_code::{
+    harq_key, max_segment_len, InsertOutcome, OuterBlockRx, OuterPacket,
 };
 
 /// The daemon's one clock for everything it hands `coppa-protocol` as `now`
@@ -204,9 +208,11 @@ fn fittest_level_with_codewords(encoded_len: usize, current: u8, codewords: u8) 
 /// `compression`, so a peer that does not advertise it keeps today's exact
 /// 1-codeword wire behavior (the fallback is total, asserted on encoded
 /// samples).
-fn local_link_caps() -> LinkCapabilities {
+fn local_link_caps(config: &DaemonConfig) -> LinkCapabilities {
     LinkCapabilities {
         multi_frame_ack: true,
+        outer_code_rx: config.session.fade_protection.as_str() != "off",
+        outer_code_req: config.session.fade_protection.as_str() == "request",
         ..LinkCapabilities::default()
     }
 }
@@ -254,6 +260,12 @@ struct SessionLink {
     /// retransmission re-encodes at this count, keeping the rebuilt frame
     /// byte-identical to the original transmission.
     tx_codewords: u8,
+    tx_outer: Option<OuterTx>,
+    rx_block: OuterBlockRx,
+    block_ack_at: Option<Instant>,
+    block_ack_ready: bool,
+    warned_burst_too_long: bool,
+    rx_ack_pair_until: Option<Instant>,
 }
 
 /// COP-38 (D3): one session data frame. The ACK fields stay zero so a
@@ -1645,6 +1657,7 @@ impl EventLoop {
                 max_retries: link.tx.max_retransmit(),
                 rto_ms: link.tx.rto().as_millis() as u64,
                 fade_hold: link.fallback.is_some(),
+                fade_protection: self.session_fade_mode().into(),
             }
         });
         let max_tx_s = self.config.radio.max_tx_duration_s;
@@ -2115,6 +2128,11 @@ impl EventLoop {
     /// Send a keepalive for every active session that has been idle for its
     /// keepalive interval (the 5 s session_cleanup arm of run()).
     async fn send_due_keepalives(&mut self) {
+        if self.session_link.as_ref().is_some_and(|l| {
+            l.block_ack_at.is_some() || l.rx_ack_pair_until.is_some_and(|until| clock_now() < until)
+        }) {
+            return;
+        }
         let active = self.session_mgr.active_sessions();
         for id in active {
             // Read the clock per session: `transmit_samples` below
@@ -2377,7 +2395,223 @@ impl EventLoop {
     /// the bytes in the backlog with nothing to undo. Session frames take
     /// none of `rate_loop`'s or the probe machinery's levels: the engine's
     /// current level is the one the chunk is sized against.
+    fn session_fade_mode(&self) -> &'static str {
+        if self
+            .session_link
+            .as_ref()
+            .and_then(|l| self.session_mgr.get(l.session_id))
+            .and_then(|s| s.negotiated.as_ref())
+            .is_some_and(|c| c.outer_code_active())
+        {
+            "rs12-6"
+        } else {
+            "off"
+        }
+    }
+
+    /// Return false only when the duration guard selects the plain path.
+    async fn try_send_outer_block(&mut self) -> bool {
+        let level = self.engine.speed_level();
+        let Some(capacity) =
+            max_segment_len(level).and_then(|n| n.checked_sub(TRANSPORT_HEADER_SIZE))
+        else {
+            return false;
+        };
+        let Some(link) = self.session_link.as_mut() else {
+            return true;
+        };
+        let take = capacity.min(link.backlog.len());
+        let data: Vec<_> = link.backlog.iter().take(take).copied().collect();
+        let seq = link.tx.next_seq();
+        let encoded = encode_burst(
+            &self.engine,
+            (&link.remote, &link.local, link.ssid),
+            seq,
+            &data,
+            level,
+        );
+        let (samples, packet_len) = match encoded {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                tracing::warn!(%error, "Failed to encode session outer block");
+                return true;
+            }
+        };
+        let id_len = if self.id_due() {
+            self.build_beacon_mac_pdu()
+                .and_then(|p| self.engine.encode_bytes(&p.to_bytes()).ok())
+                .map_or(0, |s| s.len())
+        } else {
+            0
+        };
+        let duration =
+            (samples.len() + id_len) as f64 / self.engine.config().sample_rate as f64 + 1.0;
+        if duration > self.config.radio.max_tx_duration_s as f64 {
+            if let Some(link) = self.session_link.as_mut() {
+                if !std::mem::replace(&mut link.warned_burst_too_long, true) {
+                    tracing::warn!(
+                        duration,
+                        max = self.config.radio.max_tx_duration_s,
+                        "RS burst exceeds TX duration limit; sending plain session frames"
+                    );
+                }
+            }
+            return false;
+        }
+        let generation = self.tx_generation;
+        let keyed = Box::pin(self.transmit_samples_keyed(&samples)).await;
+        if self.tx_generation == generation {
+            self.session_tx_held_by_frequency_gate = true;
+            return true;
+        }
+        if let Some(link) = self.session_link.as_mut() {
+            link.tx_outer = Some(OuterTx {
+                level,
+                packets_len: packet_len,
+            });
+            link.tx_codewords = 1;
+        }
+        self.set_session_segment_floor(keyed, packet_len, 1);
+        if let Some(link) = self.session_link.as_mut() {
+            link.backlog.drain(..take);
+            if let Err(error) = link.tx.send(data, clock_now()) {
+                tracing::error!(%error, "Session outer ARQ window full");
+            }
+            let session_id = link.session_id;
+            self.touch_draining_session(session_id);
+            if let Some(session) = self.session_mgr.get_mut(session_id) {
+                session.touch(clock_now());
+            }
+        }
+        self.tx_frame_count += 1;
+        true
+    }
+
+    async fn flush_block_ack(&mut self) {
+        if self.is_transmitting {
+            return;
+        }
+        let Some(link) = self.session_link.as_ref() else {
+            return;
+        };
+        if !link.block_ack_at.is_some_and(|at| clock_now() >= at) {
+            return;
+        }
+        if !link.block_ack_ready {
+            if let Some(link) = self.session_link.as_mut() {
+                link.block_ack_at = None;
+            }
+            return;
+        }
+        let ack = session_ack_frame(link);
+        match self.engine.encode_bytes(&ack) {
+            Ok(samples) => {
+                let doubled = [samples.as_slice(), samples.as_slice()].concat();
+                let generation = self.tx_generation;
+                Box::pin(self.transmit_samples(&doubled)).await;
+                if self.tx_generation != generation {
+                    if let Some(link) = self.session_link.as_mut() {
+                        link.block_ack_at = None;
+                        link.block_ack_ready = false;
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%error, "Failed to encode outer block ACK"),
+        }
+    }
+
+    async fn handle_session_outer_data(&mut self, pdu: MacPdu, level: u8) {
+        let Some(id) = self.session_id_for_frame(&pdu) else {
+            return;
+        };
+        let Some(session) = self.session_mgr.get_mut(id) else {
+            return;
+        };
+        let draining = session.state == SessionState::Disconnecting
+            && self
+                .pending_disconnect
+                .as_ref()
+                .is_some_and(|p| p.session_id == id);
+        if (!session.is_established() && !draining)
+            || !session
+                .negotiated
+                .as_ref()
+                .is_some_and(|c| c.outer_code_active())
+        {
+            return;
+        }
+        let Ok(packet) = OuterPacket::from_bytes(&pdu.payload) else {
+            return;
+        };
+        session.touch(clock_now());
+        self.ensure_session_link(id);
+        let Some(link) = self.session_link.as_mut() else {
+            return;
+        };
+        let base = link.rx.recv_base();
+        let duplicate = packet.seq == base.wrapping_sub(1);
+        if packet.seq != base && !duplicate {
+            return;
+        }
+        let outcome = if duplicate {
+            InsertOutcome::Duplicate
+        } else {
+            link.rx_block.insert(&packet)
+        };
+        if matches!(outcome, InsertOutcome::Rejected(_)) {
+            return;
+        }
+        // Use the received frame's level. Peers may choose different TX levels.
+        let profile = if self.engine.on_vhf_profile() {
+            coppa_codec::ofdm::CoppaProfile::vhf_wide()
+        } else if self.engine.config().cp_mode == CpMode::ShortCp {
+            coppa_codec::ofdm::CoppaProfile::hf_standard_short_cp()
+        } else {
+            coppa_codec::ofdm::CoppaProfile::hf_standard()
+        };
+        let Some(packet_s) = coppa_protocol::modem::frame_airtime_s(level, &profile) else {
+            return;
+        };
+        let remaining = Duration::from_secs_f64((11 - packet.index) as f64 * packet_s);
+        let ack_at = clock_now() + remaining;
+        link.block_ack_at = Some(link.block_ack_at.map_or(ack_at, |old| old.max(ack_at)));
+        let until = tokio::time::Instant::now()
+            + remaining
+            + Duration::from_millis(self.config.radio.turnaround_ms);
+        self.rx_turnaround_until =
+            Some(self.rx_turnaround_until.map_or(until, |old| old.max(until)));
+        link.block_ack_ready |= duplicate;
+        if let InsertOutcome::Rebuilt(bytes) = outcome {
+            if let Ok(segment) = TransportPdu::from_bytes(&bytes) {
+                if segment.transport_type == TransportType::Reliable
+                    && segment.seq_num == packet.seq
+                {
+                    link.block_ack_ready = true;
+                    let delivered = link.rx.receive(segment.seq_num, segment.payload);
+                    for (_, data) in delivered {
+                        self.deliver_to_host(data);
+                    }
+                    for seq in [packet.seq, packet.seq.wrapping_sub(1)] {
+                        for index in 0..12 {
+                            self.engine.harq_evict(harq_key(seq, index));
+                        }
+                    }
+                }
+            }
+        }
+        self.tx_frame_count = 0;
+        self.note_peer_evidence();
+    }
+
     async fn drain_session_link(&mut self) {
+        // Keep decoding the remainder of an outer burst instead of entering a
+        // blocking key-up wait that would discard those packets.
+        if self.session_link.as_ref().is_some_and(|l| {
+            l.block_ack_at.is_some() || l.rx_ack_pair_until.is_some_and(|until| clock_now() < until)
+        }) {
+            self.session_tx_held_by_frequency_gate = true;
+            return;
+        }
         if self.is_transmitting {
             return;
         }
@@ -2391,6 +2625,9 @@ impl EventLoop {
         // next poll.
         self.session_tx_held_by_frequency_gate = ready && self.wideband_frequency_check().is_err();
         if !ready || self.session_tx_held_by_frequency_gate {
+            return;
+        }
+        if self.session_fade_mode() == "rs12-6" && self.try_send_outer_block().await {
             return;
         }
         // COP-69: the per-frame codeword count, gated by the negotiated
@@ -2472,6 +2709,11 @@ impl EventLoop {
         // to give the compiler a finite-sized future.
         let generation = self.tx_generation;
         let keyed = Box::pin(self.transmit_samples_keyed(&samples)).await;
+        if keyed > 0 {
+            if let Some(link) = self.session_link.as_mut() {
+                link.tx_outer = None;
+            }
+        }
         self.set_session_segment_floor(keyed, samples.len(), codewords);
         if self.tx_generation == generation {
             // The gate passed above but refused after the courtesy wait (the
@@ -2486,6 +2728,7 @@ impl EventLoop {
             // COP-69: remember the count the segment went out with, so a
             // retransmission re-encodes byte-identically at the same count.
             link.tx_codewords = codewords;
+            link.tx_outer = None;
             match link.tx.send(chunk, clock_now()) {
                 Ok(sent) => debug_assert_eq!(sent, seq),
                 // Unreachable: `can_send` was checked before transmitting.
@@ -2540,8 +2783,20 @@ impl EventLoop {
             return;
         }
         let data_s = keyed as f64 / self.engine.config().sample_rate as f64;
+        // RS peers choose their ACK level independently of our TX level.
+        // Budget both copies at the slowest HF level, including on retries
+        // after the local engine moved away from the block's pinned level.
+        let ack_level = if self
+            .session_link
+            .as_ref()
+            .is_some_and(|link| link.tx_outer.is_some())
+        {
+            1
+        } else {
+            self.engine.speed_level()
+        };
         let ack_s = coppa_protocol::modem::frame_airtime_s(
-            self.engine.speed_level(),
+            ack_level,
             &coppa_codec::ofdm::CoppaProfile::hf_standard(),
         )
         .expect("the engine's speed level is always a valid wire level");
@@ -2550,8 +2805,11 @@ impl EventLoop {
             as f64
             / 1000.0;
         if let Some(link) = self.session_link.as_mut() {
-            link.tx
-                .set_segment_floor(Duration::from_secs_f64(data_s + 2.0 * turnaround_s + ack_s));
+            link.tx.set_segment_floor(Duration::from_secs_f64(
+                data_s
+                    + 2.0 * turnaround_s
+                    + ack_s * if link.tx_outer.is_some() { 2.0 } else { 1.0 },
+            ));
         }
     }
 
@@ -2562,9 +2820,13 @@ impl EventLoop {
     /// reconnect to the same peer could deliver those stale bytes into the
     /// new session.
     async fn discard_session_tx(&mut self, session_id: u8) {
-        let Some(link) = self.session_link.take_if(|l| l.session_id == session_id) else {
+        let Some(mut link) = self.session_link.take_if(|l| l.session_id == session_id) else {
             return;
         };
+        link.rx_block.reset();
+        for key in 0x10..=u8::MAX {
+            self.engine.harq_evict(key);
+        }
         tracing::info!(
             session_id,
             backlog = link.backlog.len(),
@@ -2618,6 +2880,12 @@ impl EventLoop {
             last_peer_evidence: clock_now(),
             warned_legacy_payload: false,
             tx_codewords: 1,
+            tx_outer: None,
+            rx_block: OuterBlockRx::default(),
+            block_ack_at: None,
+            block_ack_ready: false,
+            warned_burst_too_long: false,
+            rx_ack_pair_until: None,
         });
     }
 
@@ -2668,6 +2936,12 @@ impl EventLoop {
     /// `SESSION_FALLBACK_NO_EVIDENCE` (default 180 s) with zero peer
     /// evidence tears the session down (`fail_session_link`).
     async fn check_session_retransmits(&mut self) {
+        self.flush_block_ack().await;
+        if self.session_link.as_ref().is_some_and(|l| {
+            l.block_ack_at.is_some() || l.rx_ack_pair_until.is_some_and(|until| clock_now() < until)
+        }) {
+            return;
+        }
         let now = clock_now();
         let Some(link) = self.session_link.as_ref() else {
             return;
@@ -2747,6 +3021,47 @@ impl EventLoop {
                 .session_link
                 .as_ref()
                 .map_or(1, |l| l.tx_codewords.max(1));
+            let outer = self.session_link.as_ref().and_then(|l| l.tx_outer);
+            if let Some(outer) = outer {
+                let link = self
+                    .session_link
+                    .as_ref()
+                    .expect("retransmission owns a link");
+                let data = link.tx.get_segment_data(seq).unwrap_or_default();
+                match encode_burst(
+                    &self.engine,
+                    (&link.remote, &link.local, link.ssid),
+                    seq,
+                    data,
+                    outer.level,
+                ) {
+                    Ok((samples, _)) => {
+                        let keyed = Box::pin(self.transmit_samples_keyed(&samples)).await;
+                        self.set_session_segment_floor(keyed, outer.packets_len, 1);
+                    }
+                    Err(error) => tracing::warn!(%error, "Failed to encode outer retransmission"),
+                }
+                if let Some(link) = self.session_link.as_mut() {
+                    if let Some(session) = self.session_mgr.get_mut(link.session_id) {
+                        session.touch(clock_now());
+                    }
+                    let _ = link.tx.mark_retransmitted(seq, clock_now());
+                    if link.tx.is_failed(seq) && link.fallback.is_none() {
+                        link.fallback = Some(SessionFallback {
+                            level: outer.level,
+                            no_evidence: SESSION_FALLBACK_NO_EVIDENCE,
+                            entered_at: now,
+                        });
+                        let grant = link
+                            .tx
+                            .transmit_count(seq)
+                            .unwrap_or(0)
+                            .saturating_add(SESSION_FALLBACK_ATTEMPT_GRANT);
+                        link.tx.set_max_retransmit(grant);
+                    }
+                }
+                continue;
+            }
             let encoded = match self.session_link.as_ref().and_then(|l| l.fallback.as_ref()) {
                 Some(fallback) => self.engine.encode_bytes_with_level_and_codewords(
                     &frame,
@@ -3760,7 +4075,7 @@ impl EventLoop {
                 if ardop_dial {
                     self.ardop_clients.entry(client_id).or_default().refused = false;
                 }
-                let caps = local_link_caps();
+                let caps = local_link_caps(&self.config);
                 let now = clock_now();
                 match self.session_mgr.create(local, remote.clone(), 0, caps, now) {
                     Ok(id) => {
@@ -4364,10 +4679,10 @@ impl EventLoop {
                     // COP-60: whoever sent this frame is still keyed for its PTT tail.
                     // Anchored at decode, which is never earlier than the frame's last
                     // sample arriving.
-                    self.rx_turnaround_until = Some(
-                        tokio::time::Instant::now()
-                            + Duration::from_millis(self.config.radio.turnaround_ms),
-                    );
+                    let until = tokio::time::Instant::now()
+                        + Duration::from_millis(self.config.radio.turnaround_ms);
+                    self.rx_turnaround_until =
+                        Some(self.rx_turnaround_until.map_or(until, |old| old.max(until)));
 
                     // Telemetry: SNR (decision 8) after every decoded frame,
                     // regardless of what the frame's payload turns out to be —
@@ -4512,7 +4827,15 @@ impl EventLoop {
 
                     // Try to parse as MAC PDU for session handling
                     if let Ok(mac_pdu) = MacPdu::from_bytes(decoded_bytes) {
-                        self.handle_mac_pdu(mac_pdu).await;
+                        if mac_pdu.frame_type == MacFrameType::OuterData {
+                            self.handle_session_outer_data(mac_pdu, frame.speed_level)
+                                .await;
+                        } else if mac_pdu.frame_type == MacFrameType::Ack {
+                            self.handle_session_ack_at_level(mac_pdu, frame.speed_level)
+                                .await;
+                        } else {
+                            self.handle_mac_pdu(mac_pdu).await;
+                        }
                         continue;
                     }
 
@@ -4939,6 +5262,26 @@ impl EventLoop {
     /// the wideband gate). COP-111: a session sizes the retransmit timeout of
     /// the frame it just sent from this count, so a prepended ID is covered.
     async fn transmit_samples_keyed(&mut self, samples: &[f32]) -> usize {
+        if self
+            .session_link
+            .as_ref()
+            .is_some_and(|l| l.rx_ack_pair_until.is_some_and(|until| clock_now() < until))
+        {
+            return 0;
+        }
+
+        // A decoded outer packet reserves the rest of its burst for RX.
+        // Refuse timer/control transmissions without a blocking audio-discard
+        // wait; reliable callers retain their payload for the next poll.
+        if self
+            .session_link
+            .as_ref()
+            .and_then(|l| l.block_ack_at)
+            .is_some_and(|at| clock_now() < at)
+        {
+            return 0;
+        }
+
         if self.local_callsign.is_none() {
             tracing::error!("{NO_CALLSIGN_TX_REFUSAL}");
             if !self.is_transmitting {
@@ -6260,6 +6603,10 @@ impl EventLoop {
             MacFrameType::ConnectCfm => self.handle_connect_cfm_rx(pdu).await,
             MacFrameType::Disconnect => self.handle_incoming_disconnect(pdu).await,
             MacFrameType::Data => self.handle_session_data(pdu).await,
+            MacFrameType::OuterData => {
+                self.handle_session_outer_data(pdu, self.engine.speed_level())
+                    .await
+            }
             MacFrameType::Ack => self.handle_session_ack(pdu).await,
             MacFrameType::Keepalive => self.handle_keepalive_rx(pdu),
             MacFrameType::Beacon => self.handle_beacon_rx(pdu),
@@ -6345,7 +6692,7 @@ impl EventLoop {
         }
 
         let remote = pdu.src.clone();
-        let caps = local_link_caps();
+        let caps = local_link_caps(&self.config);
         let now = clock_now();
         match self
             .session_mgr
@@ -6400,6 +6747,7 @@ impl EventLoop {
         if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
             match session.handle_connect_ack(&pdu.payload, clock_now()) {
                 Ok(cfm_pdu) => {
+                    tracing::info!(remote = %remote, role = "initiator", fade_protection = if session.negotiated.as_ref().is_some_and(|c| c.outer_code_active()) { "rs12-6" } else { "off" }, "Session established");
                     let notice = SessionNotice::Connected {
                         local: session.local.clone(),
                         remote,
@@ -6433,7 +6781,7 @@ impl EventLoop {
             match session.handle_connect_cfm(&pdu.payload, clock_now()) {
                 Ok(()) => {
                     session.confirm_established();
-                    tracing::info!(remote = %remote, "Session fully established (responder)");
+                    tracing::info!(remote = %remote, fade_protection = if session.negotiated.as_ref().is_some_and(|c| c.outer_code_active()) { "rs12-6" } else { "off" }, "Session fully established (responder)");
                     let notice = SessionNotice::Connected {
                         local: session.local.clone(),
                         remote,
@@ -6565,15 +6913,29 @@ impl EventLoop {
             }
             return;
         };
-        let delivered = link.rx.receive(segment.seq_num, segment.payload);
-        let ack = session_ack_frame(link);
-        for (_seq, data) in delivered {
-            self.deliver_to_host(data);
-        }
+        let Some(ack) = self.deliver_session_segment(segment) else {
+            return;
+        };
         match self.engine.encode_bytes(&ack) {
             Ok(samples) => Box::pin(self.transmit_samples(&samples)).await,
             Err(e) => tracing::warn!(error = %e, "Failed to encode session ACK"),
         }
+    }
+
+    /// Both plain frames and rebuilt outer blocks share ordered delivery.
+    fn deliver_session_segment(&mut self, segment: TransportPdu) -> Option<Vec<u8>> {
+        let link = self.session_link.as_mut()?;
+        let delivered = link.rx.receive(segment.seq_num, segment.payload);
+        // Once ARQ accepts the segment, release retained shards immediately.
+        // Subsequent packets of this burst are duplicates of recv_base - 1.
+        if !delivered.is_empty() && link.rx_block.holds() {
+            link.rx_block.reset();
+        }
+        let ack = session_ack_frame(link);
+        for (_, data) in delivered {
+            self.deliver_to_host(data);
+        }
+        Some(ack)
     }
 
     /// COP-38 (D7): the peer's ACK for session data. Frees the stop-and-wait
@@ -6583,6 +6945,18 @@ impl EventLoop {
     /// session is neither established nor that draining one, changes
     /// nothing.
     async fn handle_session_ack(&mut self, pdu: MacPdu) {
+        self.handle_session_ack_at_level(pdu, self.engine.speed_level())
+            .await;
+    }
+
+    async fn handle_session_ack_at_level(&mut self, pdu: MacPdu, level: u8) {
+        if self
+            .session_link
+            .as_ref()
+            .is_some_and(|l| pdu.src == l.remote)
+        {
+            self.note_peer_evidence();
+        }
         let session_id = self.session_id_for_frame(&pdu);
         let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) else {
             tracing::debug!(
@@ -6627,9 +7001,26 @@ impl EventLoop {
             );
             return;
         }
+        let outer_pending = link.tx_outer.is_some() && link.tx.in_flight() > 0;
         let acked = link
             .tx
             .process_ack(ack.ack_num, ack.ack_bitmap, clock_now());
+        if outer_pending && !acked.is_empty() {
+            // The first decoded ACK may be the first of two copies. Keep RX
+            // open for another frame rather than keying over the second copy.
+            let packet_s = coppa_protocol::modem::frame_airtime_s(
+                level,
+                &coppa_codec::ofdm::CoppaProfile::hf_standard(),
+            )
+            .unwrap_or(1.365);
+            let guard = Duration::from_secs_f64(packet_s)
+                + Duration::from_millis(self.config.radio.turnaround_ms);
+            link.rx_ack_pair_until = Some(clock_now() + guard);
+            let until = tokio::time::Instant::now() + guard;
+            self.rx_turnaround_until =
+                Some(self.rx_turnaround_until.map_or(until, |old| old.max(until)));
+        }
+
         if link.tx.in_flight() == 0 {
             // COP-68: an ACK that empties the window ends any fade hold and
             // restores the standard budget, so the next fade starts from 5
@@ -16129,6 +16520,12 @@ mod tests {
                 last_peer_evidence: Instant::now(),
                 warned_legacy_payload: false,
                 tx_codewords: 1,
+                tx_outer: None,
+                rx_block: OuterBlockRx::default(),
+                block_ack_at: None,
+                block_ack_ready: false,
+                warned_burst_too_long: false,
+                rx_ack_pair_until: None,
             }
         }
 
@@ -16298,6 +16695,200 @@ mod tests {
                     (seed >> 16) as u8
                 })
                 .collect()
+        }
+
+        fn rs_station() -> (EventLoop, coppa_audio::AudioRingConsumer) {
+            let (mut station, consumer) = cop69_station();
+            station.engine.set_speed_level(2).unwrap();
+            let id = station.session_link.as_ref().unwrap().session_id;
+            let caps = station
+                .session_mgr
+                .get_mut(id)
+                .unwrap()
+                .negotiated
+                .as_mut()
+                .unwrap();
+            caps.outer_code_rx = true;
+            caps.outer_code_req = true;
+            (station, consumer)
+        }
+
+        #[tokio::test]
+        async fn rs_session_sends_twelve_packets_in_one_keying() {
+            let (mut station, mut consumer) = rs_station();
+            let generation = station.tx_generation;
+            station
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![17; 200],
+                })
+                .await;
+            let audio = read_all(&mut consumer);
+            let link = station.session_link.as_ref().unwrap();
+            let outer = link.tx_outer.unwrap();
+            assert_eq!(audio.len(), 12 * outer.packets_len);
+            assert_eq!(station.tx_generation, generation + 1);
+            let turnaround = station.config.radio.turnaround_ms
+                + station.config.radio.ptt_pre_delay_ms
+                + station.config.radio.ptt_tail_delay_ms;
+            let floor = Duration::from_secs_f64(
+                audio.len() as f64 / 48000.0 + 2.0 * turnaround as f64 / 1000.0 + 2.0 * 1.365,
+            );
+            assert!(link.tx.rto() >= floor);
+        }
+
+        #[tokio::test]
+        async fn rs_rto_covers_a_slower_peer_ack_after_local_level_changes() {
+            let (mut station, _) = rs_station();
+            station.engine.set_speed_level(8).unwrap();
+            station.config.radio.turnaround_ms = 750;
+            station.config.radio.ptt_pre_delay_ms = 0;
+            station.config.radio.ptt_tail_delay_ms = 0;
+            let link = station.session_link.as_mut().unwrap();
+            let (burst, packet_len) = encode_burst(
+                &station.engine,
+                (&link.remote, &link.local, link.ssid),
+                0,
+                &[31; 200],
+                8,
+            )
+            .unwrap();
+            link.tx_outer = Some(OuterTx {
+                level: 8,
+                packets_len: packet_len,
+            });
+            let mut peer = EventLoop::new(cop69_station_config()).unwrap();
+            peer.engine.set_speed_level(2).unwrap();
+            let ack = peer.engine.encode_bytes(&session_ack_frame(link)).unwrap();
+            let floor =
+                Duration::from_secs_f64((burst.len() + 2 * ack.len()) as f64 / 48000.0 + 1.5);
+            station.set_session_segment_floor(burst.len(), packet_len, 1);
+            assert!(
+                station.session_link.as_ref().unwrap().tx.rto() >= floor,
+                "RS timeout must cover both level-2 peer ACKs"
+            );
+            station.engine.set_speed_level(7).unwrap();
+            station.set_session_segment_floor(burst.len(), packet_len, 1);
+            let link = station.session_link.as_ref().unwrap();
+            assert_eq!(link.tx_outer.unwrap().level, 8);
+            assert!(
+                link.tx.rto() >= floor,
+                "a local level change must not shrink the pinned block's ACK budget"
+            );
+        }
+
+        #[tokio::test]
+        async fn rs_burst_too_long_falls_back_to_a_plain_frame() {
+            let (mut station, mut consumer) = rs_station();
+            station.config.radio.max_tx_duration_s = 10;
+            station
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![17; 200],
+                })
+                .await;
+            let link = station.session_link.as_ref().unwrap();
+            assert!(link.tx_outer.is_none());
+            assert!(link.warned_burst_too_long);
+            let frame = session_data_frame(link, 0, link.tx.get_segment_data(0).unwrap());
+            let expected = station
+                .engine
+                .encode_bytes_with_codewords(&frame, link.tx_codewords)
+                .unwrap();
+            assert_eq!(read_all(&mut consumer), expected);
+        }
+
+        #[tokio::test]
+        async fn default_pair_session_frames_are_byte_identical_to_today() {
+            for legacy in [false, true] {
+                let (mut station, mut consumer) = cop69_station();
+                if legacy {
+                    let id = station.session_link.as_ref().unwrap().session_id;
+                    station
+                        .session_mgr
+                        .get_mut(id)
+                        .unwrap()
+                        .negotiated
+                        .as_mut()
+                        .unwrap()
+                        .multi_frame_ack = false;
+                }
+                station
+                    .handle_host_event(HostEvent::DataReceived {
+                        client_id: 1,
+                        data: vec![19; 80],
+                    })
+                    .await;
+                let actual = read_all(&mut consumer);
+                let link = station.session_link.as_ref().unwrap();
+                let frame = session_data_frame(link, 0, link.tx.get_segment_data(0).unwrap());
+                let expected = station
+                    .engine
+                    .encode_bytes_with_codewords(&frame, link.tx_codewords)
+                    .unwrap();
+                assert_eq!(actual, expected);
+                assert!(link.tx_outer.is_none());
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn receiver_holds_its_own_tx_until_burst_end() {
+            let (mut station, mut consumer) = rs_station();
+            station.config.radio.turnaround_ms = 500;
+            let link = station.session_link.as_ref().unwrap();
+            let segment = TransportPdu::new_reliable(0, 0, 0, vec![23; 40]).to_bytes();
+            let packets = coppa_protocol::outer_code::encode_block(0, &segment, 99).unwrap();
+            let frames: Vec<_> = packets
+                .iter()
+                .map(|p| {
+                    MacPdu::new(
+                        MacFrameType::OuterData,
+                        link.local.clone(),
+                        link.remote.clone(),
+                        link.ssid,
+                        p.to_bytes().unwrap(),
+                    )
+                })
+                .collect();
+            station
+                .handle_session_outer_data(frames[0].clone(), 2)
+                .await;
+            let generation = station.tx_generation;
+            station
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![29; 30],
+                })
+                .await;
+            assert_eq!(
+                station.tx_generation, generation,
+                "queued host data must wait for the burst"
+            );
+            assert!(read_all(&mut consumer).is_empty());
+            assert_eq!(
+                station.transmit_samples_keyed(&[0.1; 960]).await,
+                0,
+                "timer transmissions also wait without discarding RX"
+            );
+            for frame in frames.into_iter().skip(1) {
+                station.handle_session_outer_data(frame, 2).await;
+            }
+            let until = station.session_link.as_ref().unwrap().block_ack_at.unwrap();
+            let now = clock_now();
+            if until > now {
+                tokio::time::advance(until - now).await;
+            }
+            station.flush_block_ack().await;
+            assert!(
+                clock_now() >= until + Duration::from_millis(station.config.radio.turnaround_ms)
+            );
+            assert!(station.tx_generation > generation);
+            assert!(station
+                .session_link
+                .as_ref()
+                .unwrap()
+                .block_ack_at
+                .is_none());
         }
 
         /// COP-69 test rig: a station pinned to level 8 on `HF_STANDARD`
@@ -21487,6 +22078,10 @@ mod tests {
             DropFirstData,
             /// `b`'s first keyed interval after the write: its ACK.
             DropFirstAck,
+            /// Erase selected packets of the first burst only.
+            ZeroPackets(u16),
+            /// Different erasures on the first and second bursts.
+            RetainPackets(u16, u16),
         }
 
         struct SessionCableRun {
@@ -21518,12 +22113,38 @@ mod tests {
         /// (its last ACK decoded), or at `SESSION_CABLE_CAP`. No test-side
         /// retransmit call is made: any retransmission comes from `run()`.
         async fn run_session_cable(payload: Vec<u8>, fault: CableFault) -> SessionCableRun {
+            run_session_cable_modes(
+                payload,
+                fault,
+                crate::config::FadeProtection::Accept,
+                crate::config::FadeProtection::Accept,
+            )
+            .await
+        }
+
+        async fn run_session_cable_modes(
+            payload: Vec<u8>,
+            fault: CableFault,
+            a_mode: crate::config::FadeProtection,
+            b_mode: crate::config::FadeProtection,
+        ) -> SessionCableRun {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_test_writer()
+                .try_init();
             let mut config = DaemonConfig::default();
+            config.session.fade_protection = a_mode;
             assert!(!config.engine.arq_enabled);
             config.engine.callsign = "VK3ABC".into();
             let mut a = EventLoop::new(config.clone()).unwrap();
             config.engine.callsign = "W1AW".into();
+            config.session.fade_protection = b_mode;
             let mut b = EventLoop::new(config.clone()).unwrap();
+            let packet_samples = a
+                .engine
+                .encode_packet_with_seq(&[0; 117], 2, 16)
+                .unwrap()
+                .len();
             a.listening = true;
             b.listening = true;
             mark_identified(&mut a);
@@ -21567,6 +22188,9 @@ mod tests {
                 // Armed -> dropping (the faulted station keyed) -> spent.
                 let (mut armed, mut dropping) = (false, false);
                 let mut delivered_bytes = 0usize;
+                let mut burst_offset = 0usize;
+                let mut burst_number = 0usize;
+                let mut had_audio = false;
                 let mut done_at: Option<tokio::time::Instant> = None;
                 while start.elapsed() < SESSION_CABLE_CAP
                     && done_at.is_none_or(|t| t.elapsed() < Duration::from_secs(10))
@@ -21626,7 +22250,9 @@ mod tests {
                     let faulted_keyed = match fault {
                         CableFault::DropFirstData => a_ptt.keyed(),
                         CableFault::DropFirstAck => b_ptt.keyed(),
-                        CableFault::None => false,
+                        CableFault::None
+                        | CableFault::ZeroPackets(_)
+                        | CableFault::RetainPackets(_, _) => false,
                     };
                     if armed && faulted_keyed {
                         armed = false;
@@ -21635,6 +22261,28 @@ mod tests {
 
                     chunk.fill(0.0);
                     let a_read = a_out.read(&mut chunk);
+                    if written_at.is_some() && a_read > 0 {
+                        if !had_audio {
+                            burst_number += 1;
+                            burst_offset = 0;
+                        }
+                        had_audio = true;
+                        let mask = match fault {
+                            CableFault::ZeroPackets(mask) if burst_number == 1 => mask,
+                            CableFault::RetainPackets(first, _) if burst_number == 1 => first,
+                            CableFault::RetainPackets(_, second) if burst_number == 2 => second,
+                            _ => 0,
+                        };
+                        for (offset, sample) in chunk[..a_read].iter_mut().enumerate() {
+                            let index = (burst_offset + offset) / packet_samples;
+                            if index < 12 && mask & (1 << index) != 0 {
+                                *sample = 0.0;
+                            }
+                        }
+                        burst_offset += a_read;
+                    } else if a_read == 0 && !a_ptt.keyed() {
+                        had_audio = false;
+                    }
                     if b_ptt.keyed() || (dropping && fault == CableFault::DropFirstData) {
                         chunk.fill(0.0);
                     }
@@ -21669,6 +22317,26 @@ mod tests {
             b_result.unwrap();
 
             let keyups = |log: &PttLog| log.edges().iter().filter(|e| e.1 == PttState::Tx).count();
+            if a_mode == crate::config::FadeProtection::Request
+                && b_mode != crate::config::FadeProtection::Off
+            {
+                let intervals = |log: &PttLog| {
+                    let edges = log.edges();
+                    edges
+                        .windows(2)
+                        .filter_map(|pair| {
+                            (pair[0].1 == PttState::Tx && pair[1].1 == PttState::Rx)
+                                .then_some((pair[0].0, pair[1].0))
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for (a_start, a_end) in intervals(&a_ptt) {
+                    for (b_start, b_end) in intervals(&b_ptt) {
+                        assert!(a_end <= b_start || b_end <= a_start, "PTT intervals overlap: a {a_start:?}..{a_end:?}, b {b_start:?}..{b_end:?}");
+                    }
+                }
+            }
+
             SessionCableRun {
                 delivered,
                 a_in_flight: a.session_link.as_ref().map_or(0, |l| l.tx.in_flight()),
@@ -21734,6 +22402,131 @@ mod tests {
             assert!(run.delivered.len() >= 2, "{} frames", run.delivered.len());
             assert_eq!(run.a_in_flight, 0);
             assert_eq!(run.a_buffered, 0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn rs_cable_write_2000_bytes_arrives_intact() {
+            let payload: Vec<_> = (0..2000).map(|i| (i % 251) as u8).collect();
+            let run = run_session_cable_modes(
+                payload.clone(),
+                CableFault::None,
+                crate::config::FadeProtection::Request,
+                crate::config::FadeProtection::Accept,
+            )
+            .await;
+            assert_eq!(run.delivered.concat(), payload);
+            assert_eq!(run.a_in_flight, 0);
+            assert_eq!(run.a_buffered, 0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn rs_cable_six_erased_packets_need_no_retransmission() {
+            let payload = vec![42; 200];
+            let run = run_session_cable_modes(
+                payload.clone(),
+                CableFault::ZeroPackets(0x3f),
+                crate::config::FadeProtection::Request,
+                crate::config::FadeProtection::Accept,
+            )
+            .await;
+            assert_eq!(run.delivered, vec![payload]);
+            assert_eq!(run.a_keyups_after_write, 1);
+            assert_eq!(run.a_in_flight, 0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn rs_cable_retains_packets_across_attempts() {
+            let payload = vec![43; 200];
+            let run = run_session_cable_modes(
+                payload.clone(),
+                CableFault::RetainPackets(0x7f, 0xfc0),
+                crate::config::FadeProtection::Request,
+                crate::config::FadeProtection::Accept,
+            )
+            .await;
+            assert_eq!(run.delivered, vec![payload]);
+            assert_eq!(run.a_keyups_after_write, 2);
+            assert_eq!(run.a_in_flight, 0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn rs_cable_lost_double_ack_reacks_without_duplicate_delivery() {
+            let payload = vec![44; 200];
+            let run = run_session_cable_modes(
+                payload.clone(),
+                CableFault::DropFirstAck,
+                crate::config::FadeProtection::Request,
+                crate::config::FadeProtection::Accept,
+            )
+            .await;
+            assert_eq!(run.delivered, vec![payload]);
+            assert_eq!(run.a_keyups_after_write, 2);
+            assert_eq!(run.a_in_flight, 0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn rs_request_with_off_peer_uses_plain_delivery() {
+            let payload = vec![45; 200];
+            let run = run_session_cable_modes(
+                payload.clone(),
+                CableFault::None,
+                crate::config::FadeProtection::Request,
+                crate::config::FadeProtection::Off,
+            )
+            .await;
+            assert_eq!(run.delivered.concat(), payload);
+            assert_eq!(run.a_in_flight, 0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn rs_request_with_legacy_caps_uses_plain_delivery() {
+            let mut legacy_config = DaemonConfig::default();
+            legacy_config.session.fade_protection = crate::config::FadeProtection::Off;
+            let legacy_caps = LinkCapabilities {
+                multi_frame_ack: true,
+                ..LinkCapabilities::default()
+            };
+            // 0.6.0 has no outer bits; disabling them produces exactly its caps.
+            assert_eq!(
+                local_link_caps(&legacy_config).to_bytes(),
+                legacy_caps.to_bytes()
+            );
+            let payload = vec![47; 200];
+            let run = run_session_cable_modes(
+                payload.clone(),
+                CableFault::None,
+                crate::config::FadeProtection::Request,
+                crate::config::FadeProtection::Off,
+            )
+            .await;
+            assert_eq!(run.delivered.concat(), payload);
+            assert_eq!(run.a_in_flight, 0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        #[ignore = "throughput measurement"]
+        async fn rs_cable_clean_throughput_report() {
+            let payload: Vec<_> = (0..2000).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+            for mode in [
+                crate::config::FadeProtection::Accept,
+                crate::config::FadeProtection::Request,
+            ] {
+                let run = run_session_cable_modes(
+                    payload.clone(),
+                    CableFault::None,
+                    mode,
+                    crate::config::FadeProtection::Accept,
+                )
+                .await;
+                assert_eq!(run.delivered.concat(), payload);
+                let seconds = run.transfer_time.unwrap().as_secs_f64();
+                println!(
+                    "COP-119 clean cable {}: {:.1} B/min, {:.2} seconds",
+                    mode.as_str(),
+                    payload.len() as f64 * 60.0 / seconds,
+                    seconds
+                );
+            }
         }
 
         /// COP-38: virtual-time throughput of a 2000-byte connected-session
