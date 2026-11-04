@@ -15,7 +15,7 @@
 //! `H(f_k, t) = sum_taps sqrt(tap.power) * g_tap[t] * exp(-i*2*pi*f_k*tap.delay_s)`, sampled and
 //! power-averaged over many time points spanning the whole frame (valid because HF Watterson
 //! coherence time, ~1-10 s, is long relative to one frame -- see `watterson.rs`'s module doc, and
-//! cross-checked below by comparing two disjoint time-sampling windows). Ground-truth per-carrier
+//! cross-checked below by comparing overlapping full-frame and second-half windows). Ground-truth per-carrier
 //! SNR_k = `mean_t|H(f_k,t)|^2 * 10^(snr_db/10)` (the channel's taps are ensemble-normalized to
 //! unit average power, so this reproduces the same nominal-SNR convention the receiver's estimator
 //! is calibrated against). Ground-truth capacity/selectivity use the exact same
@@ -87,6 +87,7 @@ fn run(preset: WattersonPreset, label: &str) {
     let (mut gt_cap_half, mut gt_sel_half) =
         (Vec::with_capacity(TRIALS), Vec::with_capacity(TRIALS));
     let mut n_decoded_nv = 0usize;
+    let mut observed = Vec::with_capacity(TRIALS);
 
     for t in 0..TRIALS {
         let seed = 0x51DE_u64.wrapping_mul(t as u64 + 1);
@@ -98,14 +99,16 @@ fn run(preset: WattersonPreset, label: &str) {
             cap_meas.push(channel_capacity(&nv));
             sel_meas.push(channel_selectivity(&nv));
             n_decoded_nv += 1;
+            observed.push(true);
         } else {
+            observed.push(false);
             cap_meas.push(0.0);
             sel_meas.push(0.0);
         }
 
         let n = faded.len();
-        // Two disjoint time windows -- if ground truth is stable across them (as the
-        // long-coherence-time assumption predicts), the two should closely agree.
+        // Overlapping windows: the whole frame and its second half. Agreement
+        // is a limited stability check, not evidence from independent halves.
         let (c_full, s_full) = ground_truth_capacity(&gains, 0, n, &carrier_freqs, nv_ref);
         let (c_half, s_half) = ground_truth_capacity(&gains, n / 2, n, &carrier_freqs, nv_ref);
         gt_cap_full.push(c_full);
@@ -133,7 +136,7 @@ fn run(preset: WattersonPreset, label: &str) {
         "measured selectivity: mean={sm_mean:.3} std={sm_std:.3}   ground-truth selectivity: mean={gs_mean:.3} std={gs_std:.3}"
     );
     println!(
-        "cross-check: corr(gt_capacity_full_frame, gt_capacity_second_half) = {:.3}  (near 1.0 confirms coherence-time assumption)",
+        "cross-check: corr(gt_capacity_full_frame, gt_capacity_second_half) = {:.3}  (overlapping windows, not independent halves)",
         pearson(&gt_cap_full, &gt_cap_half)
     );
     println!(
@@ -148,6 +151,25 @@ fn run(preset: WattersonPreset, label: &str) {
         "corr(measured capacity, ground-truth selectivity)   = {:.3}  (cross-term sanity check)",
         pearson(&cap_meas, &gt_sel_full)
     );
+    // Keep the historical zero-filled correlations above reproducible, while
+    // distinguishing missing observations from genuine measured zero capacity.
+    let successful = |values: &[f32]| -> Vec<f32> {
+        values
+            .iter()
+            .zip(&observed)
+            .filter_map(|(&v, &ok)| ok.then_some(v))
+            .collect()
+    };
+    println!(
+        "demodulation failures: {} (historical correlations above zero-fill these)",
+        TRIALS - n_decoded_nv
+    );
+    println!(
+        "successful-only capacity correlation: {:.3}; selectivity correlation: {:.3}",
+        pearson(&successful(&cap_meas), &successful(&gt_cap_full)),
+        pearson(&successful(&sel_meas), &successful(&gt_sel_full))
+    );
+    println!("Method caveat: raw modem RX has no transceiver RX bandpass; model truth averages all active carriers, while measured noise uses alternating data carriers. AWGN references each faded frame's realized power. These correlations alone establish no physical ceiling.");
     println!();
 }
 
