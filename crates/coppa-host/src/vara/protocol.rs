@@ -27,7 +27,7 @@ pub enum VaraCommand {
     /// Closing Morse ID on or off: CWID ON|OFF. Any other argument parses as
     /// `Unknown`.
     CwId(bool),
-    /// Rig frequency or mode (coppa extension, not a VARA command): FREQ [hz]
+    /// Rig frequency or mode (coppa extension, not a VARA command): FREQ \[hz\]
     /// or MODE [USB|LSB|PKTUSB|PKTLSB]. Any other shape parses as `Unknown`.
     Rig(RigCommand),
     /// Unknown command.
