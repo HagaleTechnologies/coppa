@@ -17,7 +17,7 @@ links:
 ---
 Two default `accept` stations do not enable fade protection. One must set
 `[session] fade_protection = "request"`; either station's `off` disables it.
-See SPEC §16 for the wire rules and ADR-012 for the choices.
+See SPEC §22 for the wire rules and ADR-012 for the choices.
 
 Each packet needs its own PHY HARQ key. Sharing key zero lets failed payloads
 from unrelated packets combine. Retransmissions reuse the same block keys,

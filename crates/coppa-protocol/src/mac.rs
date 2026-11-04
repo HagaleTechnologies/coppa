@@ -41,13 +41,11 @@ pub enum MacFrameType {
     /// Reserved for relayed traffic; no transmit or receive path builds one
     /// yet (type nibble 8).
     Relay = 8,
-<<<<<<< HEAD
-    /// RS(12,6) session shard, negotiated by CONNECT flags bits 2 and 3.
-    OuterData = 9,
-=======
     /// Connectionless datagram from a KISS host, broadcast to every station (COP-138).
     Datagram = 9,
->>>>>>> 6969023d931c39c4a2b1743e5ebfe81d9486e79b
+    /// RS(12,6) session shard, negotiated by CONNECT flags bits 2 and 3
+    /// (COP-119). Nibble 10, since COP-138 took 9 for `Datagram`.
+    OuterData = 10,
 }
 
 impl MacFrameType {
@@ -63,11 +61,8 @@ impl MacFrameType {
             6 => Ok(MacFrameType::Beacon),
             7 => Ok(MacFrameType::Keepalive),
             8 => Ok(MacFrameType::Relay),
-<<<<<<< HEAD
-            9 => Ok(MacFrameType::OuterData),
-=======
             9 => Ok(MacFrameType::Datagram),
->>>>>>> 6969023d931c39c4a2b1743e5ebfe81d9486e79b
+            10 => Ok(MacFrameType::OuterData),
             v => Err(ProtocolError::UnknownMacFrameType { value: v }),
         }
     }
@@ -408,8 +403,8 @@ mod tests {
     fn datagram_frame_type_is_nibble_9() {
         assert_eq!(MacFrameType::from_u8(9).unwrap(), MacFrameType::Datagram);
         assert!(matches!(
-            MacFrameType::from_u8(10),
-            Err(ProtocolError::UnknownMacFrameType { value: 10 })
+            MacFrameType::from_u8(11),
+            Err(ProtocolError::UnknownMacFrameType { value: 11 })
         ));
     }
 
@@ -554,8 +549,8 @@ mod tests {
     #[test]
     fn test_frame_type_invalid() {
         assert!(matches!(
-            MacFrameType::from_u8(10),
-            Err(ProtocolError::UnknownMacFrameType { value: 10 })
+            MacFrameType::from_u8(11),
+            Err(ProtocolError::UnknownMacFrameType { value: 11 })
         ));
         assert!(MacFrameType::from_u8(15).is_err());
     }
@@ -781,6 +776,7 @@ mod outer_tests {
             MacFrameType::from_u8(MacFrameType::OuterData as u8).unwrap(),
             MacFrameType::OuterData
         );
-        assert!(MacFrameType::from_u8(10).is_err());
+        assert_eq!(MacFrameType::OuterData as u8, 10);
+        assert!(MacFrameType::from_u8(11).is_err());
     }
 }

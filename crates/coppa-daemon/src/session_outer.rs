@@ -1,4 +1,4 @@
-//! Session burst construction. Wire rules live in SPEC section 16.
+//! Session burst construction. Wire rules live in SPEC section 22.
 use anyhow::{Context, Result};
 use coppa_engine::CoppaCore;
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu};

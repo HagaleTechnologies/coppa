@@ -1,4 +1,4 @@
-//! Packetization and bounded reassembly for session fade protection, SPEC §16.
+//! Packetization and bounded reassembly for session fade protection, SPEC §22.
 use crate::{
     fec::outer_rs::OuterRs12x6, mac::MacPdu, modem::speed_levels::max_payload_for_level,
     ProtocolError,

@@ -3310,7 +3310,7 @@ The channel is reset per packet, not a continuous on-air fading realization.
 
 The ACK-loss arm sends ACK frames through the same channel. Protected blocks
 use two copies and the sender's conservative extra hold if only the second
-copy decodes. See SPEC §16.4. This arm is reported separately from the
+copy decodes. See SPEC §22.4. This arm is reported separately from the
 Moderate 5/5 acceptance policy. No seeds or retry constants were tuned.
 
 Clean cable, using the two real daemon event loops and a deterministic

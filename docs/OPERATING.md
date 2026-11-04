@@ -1183,7 +1183,8 @@ connection and logs `VARA data-port client is not reading; disconnecting it`.
 The command port stays connected. A host never sees a gap in received data
 while its data connection stays open.
 
-<<<<<<< HEAD
+For the OFDM KISS datagram port (8100), see [RETICULUM.md](RETICULUM.md).
+
 ## Session fade protection
 
 Set `[session] fade_protection = "request"` to ask a 0.7.0 peer for RS(12,6)
@@ -1197,7 +1198,4 @@ This trades clean-channel throughput and latency for fade tolerance. When
 `[radio] max_tx_duration_s` is too short for a burst with its safety margin,
 the daemon sends the segment as a plain frame and warns once. This is a
 session config setting; there is no VARA or ARDOP command to request it.
-See SPEC §16 and ADR-012 for the protocol and BENCHMARKS for measurements.
-=======
-For the OFDM KISS datagram port (8100), see [RETICULUM.md](RETICULUM.md).
->>>>>>> 6969023d931c39c4a2b1743e5ebfe81d9486e79b
+See SPEC §22 and ADR-012 for the protocol and BENCHMARKS for measurements.

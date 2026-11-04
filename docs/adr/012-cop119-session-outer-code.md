@@ -4,12 +4,12 @@ Status: accepted defaults for COP-119. Version: 0.7.0.
 
 COP-118 measured packet erasure coding as the useful fade-diversity arm.
 Frequency repetition was rejected. See `../analysis/COP-118-fade-diversity.md`.
-The normative wire definition is SPEC §16.
+The normative wire definition is SPEC §22.
 
 1. D1: advertise receive support and a request separately in CONNECT flags
    bits 2 and 3. Both peers must receive; either may request. An `off` peer
    wins. Default `accept` peers do not enable the mode with each other.
-2. D2: MAC type 9 carries a four-byte outer header followed by one shard.
+2. D2: MAC type 10 carries a four-byte outer header followed by one shard.
    The reconstructed segment is the existing Reliable transport PDU.
 3. D3: use systematic RS(12,6), GF(256), polynomial 0x11d, identity data
    rows and Cauchy parity rows. Any six distinct valid shards suffice.

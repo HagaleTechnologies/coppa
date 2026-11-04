@@ -11981,7 +11981,7 @@ mod tests {
         };
         assert_eq!(
             ws_status_reply(&mut ws).await["link"],
-            serde_json::json!({"in_flight":1,"retries":0,"max_retries":max_retries,"rto_ms":rto_ms,"fade_hold":false})
+            serde_json::json!({"in_flight":1,"retries":0,"max_retries":max_retries,"rto_ms":rto_ms,"fade_hold":false,"fade_protection":"off"})
         );
         a.session_link = None;
         a.publish_ws_snapshot().await;
@@ -16685,7 +16685,19 @@ mod tests {
                 hex(&session_ack_frame(&callee)),
                 "1158b7810830005dc0570000000002000200000000"
             );
-            assert_eq!(hex(&local_link_caps().to_bytes()), "00c80102080200");
+            // P23 is the 0.6.0 caps, which a 0.7.0 coppad emits with
+            // `fade_protection = "off"`; the 0.7.0 default `accept` also
+            // advertises the outer-code receive bit (SPEC §22.1).
+            let mut off_config = DaemonConfig::default();
+            off_config.session.fade_protection = crate::config::FadeProtection::Off;
+            assert_eq!(
+                hex(&local_link_caps(&off_config).to_bytes()),
+                "00c80102080200"
+            );
+            assert_eq!(
+                hex(&local_link_caps(&DaemonConfig::default()).to_bytes()),
+                "00c80102080600"
+            );
         }
 
         fn test_link() -> SessionLink {

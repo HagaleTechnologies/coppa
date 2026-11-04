@@ -342,7 +342,7 @@ impl CoppaCore {
         codewords: u8,
     ) -> Result<Vec<f32>, EngineError> {
         Self::check_codewords(codewords)?;
-        self.encode_payload_at(data, self.config.speed_level, codewords)
+        self.transmit_data_packet(data, self.config.speed_level, codewords, 0)
     }
 
     /// COP-69: shared codeword-count validation for the codeword-aware
@@ -433,16 +433,12 @@ impl CoppaCore {
         codewords: u8,
     ) -> Result<Vec<f32>, EngineError> {
         let payload = self.compress_payload(data);
-        self.encode_payload_at(&payload, level, codewords)
-    }
-
-<<<<<<< HEAD
         self.transmit_data_packet(&payload, level, codewords, 0)
     }
 
     /// Encode one uncompressed session packet with a distinct PHY HARQ key.
     /// Outer-code shards must retain their equal wire lengths, independent of
-    /// the engine's compression setting. See SPEC §16.
+    /// the engine's compression setting. See SPEC §22.
     pub fn encode_packet_with_seq(
         &self,
         data: &[u8],
@@ -453,25 +449,18 @@ impl CoppaCore {
         self.transmit_data_packet(data, level, 1, seq_num)
     }
 
+    /// Build and transmit a Data frame from an already prepared payload,
+    /// with an explicit PHY `seq_num` (the HARQ key; every pre-COP-119
+    /// caller passes `0`).
     fn transmit_data_packet(
-=======
-    /// Build and transmit a Data frame from an already prepared payload.
-    fn encode_payload_at(
->>>>>>> 6969023d931c39c4a2b1743e5ebfe81d9486e79b
         &self,
         payload: &[u8],
         level: u8,
         codewords: u8,
-<<<<<<< HEAD
         seq_num: u8,
     ) -> Result<Vec<f32>, EngineError> {
         let payload_len =
             u16::try_from(payload.len()).map_err(|_| EngineError::PayloadTooLarge {
-=======
-    ) -> Result<Vec<f32>, EngineError> {
-        if payload.len() > u16::MAX as usize {
-            return Err(EngineError::PayloadTooLarge {
->>>>>>> 6969023d931c39c4a2b1743e5ebfe81d9486e79b
                 len: payload.len(),
                 max: u16::MAX as usize,
             })?;
@@ -489,14 +478,9 @@ impl CoppaCore {
         Ok(self.transceiver.transmit(&header, payload)?)
     }
 
-<<<<<<< HEAD
     /// Drop the streaming receiver's stored soft information for a PHY key.
     pub fn harq_evict(&mut self, seq_num: u8) {
         self.streaming.harq_evict(seq_num);
-=======
-        let samples = self.transceiver.transmit(&header, payload)?;
-        Ok(samples)
->>>>>>> 6969023d931c39c4a2b1743e5ebfe81d9486e79b
     }
 
     /// Encode arbitrary binary data to audio samples at an explicit `level`

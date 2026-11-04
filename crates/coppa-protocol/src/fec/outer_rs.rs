@@ -1,4 +1,4 @@
-//! Systematic RS(12,6) erasure code over GF(256), SPEC §16.
+//! Systematic RS(12,6) erasure code over GF(256), SPEC §22.
 
 #[derive(Debug)]
 struct Gf256 {
@@ -35,7 +35,7 @@ impl Gf256 {
     }
 }
 
-/// Six systematic shards and six Cauchy parity shards. See SPEC §16.
+/// Six systematic shards and six Cauchy parity shards. See SPEC §22.
 #[derive(Debug)]
 pub struct OuterRs12x6 {
     gf: Gf256,

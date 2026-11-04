@@ -519,7 +519,7 @@ pub const MIN_CWID_WPM: u32 = 10;
 /// 97.119(b)(1) caps an automatic CW ID at 20 WPM.
 pub const MAX_CWID_WPM: u32 = 20;
 
-/// Connected-session erasure protection policy (SPEC section 16).
+/// Connected-session erasure protection policy (SPEC section 22).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FadeProtection {
