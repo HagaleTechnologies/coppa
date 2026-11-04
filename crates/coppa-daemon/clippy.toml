@@ -1,0 +1,6 @@
+# COP-142: event_loop production code must read time through clock_now().
+# lib.rs, main.rs and test roots allow this lint outside event_loop.
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "use clock_now() (COP-142)" },
+    { path = "std::time::Instant::elapsed", reason = "use clock_now().saturating_duration_since(t) (COP-142)" },
+]

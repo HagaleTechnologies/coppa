@@ -12,6 +12,7 @@
 - [What did Phase 2's channel-estimation work fix, break, and leave open?](pages/adr-006-phase2-estimation.md) — Phase 2 replaced the linear-interpolation channel estimator with a delay-domain
 - [Why do multi-codeword frames retransmit whole, not per codeword?](pages/adr-007-multi-codeword-frames.md) — Phase 3 added multi-codeword frames (up to `MAX_CODEWORDS=8` per frame, with
 - [What did Phase 3's system layer ship, and which targets did it miss?](pages/adr-008-phase3-system-layer.md) — Phase 3 shipped the system layer: payload CRC-32, half-duplex ARQ discipline
+- [Why does the streaming receiver's SyncDetector band-pass and decimate its input?](pages/adr-011-decimated-sync-prefilter.md) — Streaming sync searches a 250-2850 Hz copy decimated by 4; timing stays at 48 kHz.
 - [Which flags actually turn CP-switch negotiation on, and what does short CP buy?](pages/cp-negotiation-flags.md) — Two traps live one level up from the handshake itself — in the config flags that
 - [What will bite you about the CP-switch negotiation handshake?](pages/cp-negotiation-gotchas.md) — Four things about `coppa_protocol::cp_negotiator` have each already cost real
 - [What will bite you about the cpal-backend feature flag?](pages/cpal-feature-gate.md) — The daemon (`coppad`) compiles and runs without the `cpal-backend` feature flag,
@@ -25,3 +26,5 @@
 - [What will bite you when persisting coppa CLI settings?](pages/cli-settings.md) — Profile, band and TNC gotchas.
 - [Which stream and exit code does coppa use?](pages/cli-output.md) — stdout is data only; broken pipe, Ctrl-C and 130 rules.
 - [What will bite you when testing coppad's mDNS discovery?](pages/mdns-discovery.md) — Loopback answers and glibc's missing .local lookup fool same-host tests.
+- [What will bite you when a paused-clock test drives the daemon's timers?](pages/paused-clock-timers.md) — Under start_paused only tokio's clock is virtual; daemon timers must use clock_now().
+- [What will bite you when measuring coppa's TNC against Direwolf?](pages/tnc-direwolf-benchmark.md) — Misnamed track, two Direwolf defaults, 48 kHz input.

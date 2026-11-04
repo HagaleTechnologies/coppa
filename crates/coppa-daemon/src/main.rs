@@ -6,6 +6,8 @@
 // Diagnostics go through `tracing`; `--check` and `--print-default-config`
 // write their output with `writeln!`.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+// COP-142: the std-clock ban targets event_loop production code only.
+#![allow(clippy::disallowed_methods)]
 
 // Shared with the library target; the binary uses only part of its API
 // (and none of the output worker without `cpal-backend`).
@@ -28,6 +30,8 @@ mod startup_report;
 mod tnc;
 mod tx_chunker;
 mod vara_wiring;
+#[cfg(feature = "websocket")]
+mod web;
 
 use std::io::{IsTerminal, Write};
 
@@ -632,7 +636,7 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
             config.host.bind_address.clone(),
         )
         .with_auth(auth)
-        .with_index_html(include_str!("web/index.html"))
+        .with_index_html(web::INDEX_HTML)
         .with_health(health);
 
         // Pipe WebSocket events into the daemon event loop

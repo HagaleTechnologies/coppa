@@ -13,6 +13,54 @@ payload → OFDM modulate → AWGN → demodulate/decode. SNR is **audio-band SN
 Eb/N0), swept −6…30 dB in 3 dB steps. "Goodput" = `payload_bits × (1 − FER) / frame_airtime`.
 Raw per-point data is regenerable into `results/awgn.csv` (gitignored).
 
+## Engine processing and ideal frame goodput (COP-131)
+
+Run `cargo bench --bench throughput` for `engine_encode/1` through
+`engine_encode/9` and `engine_decode/1` through `engine_decode/9`, followed by
+the existing DSP component cases. These IDs start new Criterion histories.
+Each engine case uses the same uncompressed 32-byte ASCII payload,
+`0123456789ABCDEF0123456789ABCDEF`. Default level-derived routing selects
+`hf_standard` at levels 1–4 and `vhf_wide` at levels 5–9, at 48000 Hz with
+long CP. This workload does not force every level onto HF.
+
+Criterion's `time` is local encode or decode processing latency, including
+normal result allocation and disposal. Its `thrpt` is 32 application bytes
+divided by that processing time, displayed in binary byte units. Core setup,
+loopback verification and the frame report are outside the timed loops.
+Decode uses pre-encoded clean audio. CPU results depend on the host and build;
+there is no minimum throughput threshold.
+
+Before timing, the command verifies exact payload recovery at every level,
+then prints nine rows under `Engine frame metrics: ideal clean loopback`.
+Frame airtime is actual encoded sample count divided by configured sample
+rate. Ideal frame goodput is recovered application bytes times eight divided
+by that airtime. CPU time is not part of this denominator. For example, an
+implementation run on 2026-11-04 printed this row (seconds and bits/second):
+
+```text
+level,profile,payload_bytes,frame_samples,frame_airtime_s,ideal_frame_goodput_bps
+1,hf_standard,32,65520,1.365000,187.55
+```
+
+These fixed short frames are not maximum-capacity measurements. Framing and
+padding can give adjacent levels equal goodput. The report excludes channel
+losses, ARQ, radio turnaround and session overhead; it does not measure
+connected-session latency or real-radio goodput. Use the `coppa-bench` command
+above for loss-weighted channel measurements, and the connected-session
+measurements later in this document for session behavior.
+
+For a quick all-level smoke run rather than a stable CPU baseline:
+
+```sh
+cargo bench --bench throughput -- engine --warm-up-time 0.1 --measurement-time 0.2 --sample-size 10 --noplot
+```
+
+`cargo bench --bench throughput -- --list` lists all eighteen engine cases
+and eight component cases. `-- --test` exercises them without collecting
+statistics. An engine filter still prints the complete verified frame table.
+Any fixture encode/decode error, empty frame or payload mismatch aborts setup
+with the failing level, before any successful table is printed.
+
 ## COP-24: 64-QAM 5/6 dropped from HF; ladder renumbered 1-9
 
 Measured 2026-10-23 on the COP-24 implementation. Version 0.2.0 renumbers
@@ -3168,6 +3216,7 @@ plausible mechanism, but lower thresholds and their false-alarm trade-off
 were not measured. No operator profile was enabled. This is an AWGN batch
 simulation, with no hardware or on-air result.
 
+<<<<<<< HEAD
 ## Synthetic transfer impairments (COP-132)
 
 Run the independent-frame diagnostic with:
@@ -3229,3 +3278,84 @@ that airtime. Airtime excludes ARQ, turnaround, CPU time and session overhead.
 Failed transfers still have rows. These small synthetic runs impose no minimum
 recovery threshold and make no confidence-bound or real-radio performance claim.
 Physical rig/ALC behavior and group-delay ripple remain unmodeled.
+=======
+## COP-126: decimated sync pre-filter on the streaming receive path
+
+`StreamingReceiver` (the daemon, `coppa rx` and the FFI) now builds its
+sync detector with `SyncDetector::new_prefiltered`: a 121-tap 250-2850 Hz
+band-pass decimated by 4 ahead of the Schmidl-Cox plateau search, with the
+confirm and timing steps still at 48 kHz on raw samples
+(`docs/adr/011-cop126-decimated-sync-prefilter.md`). This section measures
+the sync threshold of both front ends on the input the streaming receiver
+sees: full-band white noise with no RX filter.
+
+Reproduce:
+
+```sh
+cargo run --release -p coppa-bench --example streaming_sync_threshold
+```
+
+The base seed is `12648430` (`0x00C0FFEE`), with 60 trials per point; trial
+`i` uses noise seed `0x00C0FFEE + i`. The SNR uses the same
+`coppa_channel::awgn_ref_seeded` convention as the other level sweeps: the
+whole clean frame's mean power is compared with noise in a 3 kHz reference
+bandwidth, and white noise is added across the 24 kHz Nyquist band. Each
+trial stream is 4 symbols of silence, the first 6 symbols of an
+`hf_standard` frame (preamble, probe and header) and 2 symbols of silence.
+A detection is correct when the first candidate lies within 60 samples of
+the candidate the same front end finds on the noise-free stream, which
+separates sync from FEC. "raw" is `SyncDetector::new`, the front end the
+streaming receiver used before COP-126.
+
+Output of the committed program (release build, this container):
+
+
+### Level 1
+
+| SNR (dB) | 1.5 | 2 | 2.5 | 3 | 3.5 | 4 | 4.5 | 5 | 5.5 | 6 | 6.5 | 7 | 11.5 | 11.75 | 12 | 12.25 | 12.5 | 12.75 | 13 | 13.25 | 13.5 | 13.75 | 14 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| raw | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 5 | 25 | 45 | 58 | 60 | 60 | 60 | 60 | 60 |
+| prefiltered | 10 | 19 | 36 | 47 | 57 | 59 | 60 | 60 | 59 | 60 | 60 | 60 | 60 | 60 | 60 | 60 | 60 | 60 | 60 | 60 | 60 | 60 | 60 |
+
+| front end | 50% point (dB) | 90% point (dB) | gain at 50% (dB) | gain at 90% (dB) |
+|---|---|---|---|---|
+| raw | 12.31 | 12.67 | 0.00 | 0.00 |
+| prefiltered | 2.32 | 3.35 | 9.99 | 9.32 |
+
+### Level 2
+
+| SNR (dB) | 1.5 | 2 | 2.5 | 3 | 3.5 | 4 | 4.5 | 5 | 5.5 | 6 | 6.5 | 7 | 11.5 | 11.75 | 12 | 12.25 | 12.5 | 12.75 | 13 | 13.25 | 13.5 | 13.75 | 14 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| raw | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 4 | 19 | 43 | 56 | 60 | 60 | 60 | 60 | 60 |
+| prefiltered | 9 | 18 | 36 | 46 | 56 | 60 | 60 | 60 | 60 | 60 | 60 | 60 | 60 | 60 | 60 | 60 | 60 | 60 | 60 | 60 | 60 | 60 | 60 |
+
+| front end | 50% point (dB) | 90% point (dB) | gain at 50% (dB) | gain at 90% (dB) |
+|---|---|---|---|---|
+| raw | 12.36 | 12.71 | 0.00 | 0.00 |
+| prefiltered | 2.33 | 3.40 | 10.03 | 9.31 |
+
+### Cost
+
+raw: SyncDetector::push realtime factor 0.00788x (10 s of noise, 512-sample chunks, best of 5)
+prefiltered: SyncDetector::push realtime factor 0.00557x (10 s of noise, 512-sample chunks, best of 5)
+
+The pre-filter moves the 50% sync point down by about 10 dB at both levels
+(9.3 dB at the 90% point), more than the 6 dB the ticket asked for. The
+pre-filtered detector also costs about 30% less per sample than the raw
+one, because the plateau search runs on a quarter of the samples. Neither
+front end changes what the batch path does: `CoppaTransceiver` still
+filters with its 601-tap `rx_bpf` and calls `SyncDetector::detect_all`,
+which uses `new`.
+
+Prototype measurements from the COP-126 plan phase, not re-run on the
+committed code: on `hf_standard` with full-band AWGN, 20 frames per cell
+fed in 4800-sample chunks, the streaming receiver decoded 0/20 at 3, 6 and
+10 dB for levels 1 to 7 before the change, and matched or beat the batch
+API in every cell after it (for example 20/20 at 6 dB for levels 1 to 6).
+The golden-vector candidates were sample-identical between the two front
+ends on every HF vector, including both Watterson-Poor vectors (`L1_poor25`
+at 367, `L2_poor25` at 274). 300 s each of white noise, SSB-band noise and a
+1 kHz tone with noise gave no candidate from either front end. This is an
+AWGN simulation, with no Watterson sweep of the streaming path and no
+hardware or on-air result.
+>>>>>>> edb17bc4d27b5b2f313601ff45a0705ba37c2b51
