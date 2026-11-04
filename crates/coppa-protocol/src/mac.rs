@@ -41,8 +41,13 @@ pub enum MacFrameType {
     /// Reserved for relayed traffic; no transmit or receive path builds one
     /// yet (type nibble 8).
     Relay = 8,
+<<<<<<< HEAD
     /// RS(12,6) session shard, negotiated by CONNECT flags bits 2 and 3.
     OuterData = 9,
+=======
+    /// Connectionless datagram from a KISS host, broadcast to every station (COP-138).
+    Datagram = 9,
+>>>>>>> 6969023d931c39c4a2b1743e5ebfe81d9486e79b
 }
 
 impl MacFrameType {
@@ -58,7 +63,11 @@ impl MacFrameType {
             6 => Ok(MacFrameType::Beacon),
             7 => Ok(MacFrameType::Keepalive),
             8 => Ok(MacFrameType::Relay),
+<<<<<<< HEAD
             9 => Ok(MacFrameType::OuterData),
+=======
+            9 => Ok(MacFrameType::Datagram),
+>>>>>>> 6969023d931c39c4a2b1743e5ebfe81d9486e79b
             v => Err(ProtocolError::UnknownMacFrameType { value: v }),
         }
     }
@@ -394,6 +403,37 @@ mod tests {
     use super::*;
 
     // ── Callsign encoding tests ─────────────────────────────────────
+
+    #[test]
+    fn datagram_frame_type_is_nibble_9() {
+        assert_eq!(MacFrameType::from_u8(9).unwrap(), MacFrameType::Datagram);
+        assert!(matches!(
+            MacFrameType::from_u8(10),
+            Err(ProtocolError::UnknownMacFrameType { value: 10 })
+        ));
+    }
+
+    #[test]
+    fn datagram_pdu_round_trips_with_a_broadcast_destination() {
+        let pdu = MacPdu::new(
+            MacFrameType::Datagram,
+            Callsign::broadcast(),
+            Callsign::new("N1CALL").unwrap(),
+            0,
+            vec![0xc0, 0xdb, 0xfe, 0],
+        );
+        let bytes = pdu.to_bytes();
+        assert_eq!(bytes[0], 0x19);
+        assert_eq!(&bytes[1..7], &[0; 6]);
+        assert_eq!(bytes[13], 0);
+        let decoded = MacPdu::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.version, pdu.version);
+        assert_eq!(decoded.frame_type, pdu.frame_type);
+        assert_eq!(decoded.dest, pdu.dest);
+        assert_eq!(decoded.src, pdu.src);
+        assert_eq!(decoded.ssid, pdu.ssid);
+        assert_eq!(decoded.payload, pdu.payload);
+    }
 
     #[test]
     fn test_callsign_roundtrip() {

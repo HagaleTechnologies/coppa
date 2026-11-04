@@ -28,6 +28,8 @@ mod spectrum;
 mod startup_report;
 
 #[cfg(feature = "kiss-tnc")]
+mod kiss_wiring;
+#[cfg(feature = "kiss-tnc")]
 mod tnc;
 mod tx_chunker;
 mod vara_wiring;
@@ -287,6 +289,9 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         .check_ardop_built(cfg!(feature = "ardop"))
         .map_err(anyhow::Error::msg)?;
     config
+        .check_kiss_built(cfg!(feature = "kiss-tnc"))
+        .map_err(anyhow::Error::msg)?;
+    config
         .check_mdns(cfg!(feature = "mdns"))
         .map_err(anyhow::Error::msg)?;
     #[cfg(not(feature = "cpal-backend"))]
@@ -382,6 +387,27 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     } else {
         None
     };
+    #[cfg(feature = "kiss-tnc")]
+    let kiss_listener = if config.host.kiss_enabled {
+        Some(
+            bind_host_port(
+                "KISS datagram port",
+                &config.host.bind_address,
+                config.host.kiss_port,
+                "kiss_port",
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    #[cfg(feature = "kiss-tnc")]
+    let kiss_state = match &kiss_listener {
+        Some(listener) => listener_state(listener)?,
+        None => startup_report::Listener::Disabled,
+    };
+    #[cfg(not(feature = "kiss-tnc"))]
+    let kiss_state = startup_report::Listener::NotBuilt;
     #[cfg(feature = "websocket")]
     let ws_listener = if config.host.websocket_enabled {
         Some(
@@ -596,6 +622,10 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
             &config.host,
         ));
     }
+    #[cfg(feature = "kiss-tnc")]
+    if let Some(listener) = kiss_listener {
+        kiss_wiring::serve_kiss(&mut event_loop, listener, &config.host);
+    }
     if host_surfaces_on {
         // The queue is unbounded, so it needs exactly one drainer.
         tokio::spawn(event_loop::forward_data_out(response_rx, data_out_senders));
@@ -700,6 +730,7 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         ardop_command = %ardop_state.0,
         ardop_data = %ardop_state.1,
         websocket = %ws_state,
+        kiss = %kiss_state,
         "Host listeners"
     );
     if startup_report::exposed([
@@ -708,6 +739,7 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         &ardop_state.0,
         &ardop_state.1,
         &ws_state,
+        &kiss_state,
     ]) {
         tracing::warn!(
             bind_address = %config.host.bind_address,

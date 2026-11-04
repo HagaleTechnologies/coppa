@@ -16,6 +16,8 @@ pub mod audio_output;
 pub mod build_info;
 pub mod config;
 pub mod event_loop;
+#[cfg(feature = "kiss-tnc")]
+pub mod kiss_wiring;
 pub mod level_meter;
 pub mod logging;
 pub mod mdns;
