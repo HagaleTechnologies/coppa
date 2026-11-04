@@ -271,6 +271,23 @@ fn spec_21_rows_match_frozen_vectors() {
             rows[0]
         );
     }
+    // The other direction: every §21 row ID has a frozen vector here, so a
+    // row added or renamed in SPEC.md without this file fails too.
+    for line in section.lines().map(str::trim) {
+        let Some(rest) = line.strip_prefix("| ") else {
+            continue;
+        };
+        let id = rest.split(" |").next().unwrap_or("");
+        let is_row_id = id.len() == 3
+            && (id.starts_with('P') || id.starts_with('N'))
+            && id[1..].bytes().all(|b| b.is_ascii_digit());
+        if is_row_id {
+            assert!(
+                VECTORS.iter().any(|(v, _)| *v == id),
+                "SPEC.md §21 row {id} has no frozen vector in this test"
+            );
+        }
+    }
 }
 
 // ── P01-P12: the conversation ──
@@ -811,4 +828,58 @@ fn negative_and_tolerance_rows_n01_to_n08() {
     assert_eq!(hex(&call("VK3ABC-1").encode()), "58b78108399c");
     assert_eq!(unpack_callsign(&unhex("58b78108399c")), "VK3ABC-1");
     assert_eq!(hex(&Callsign::broadcast().encode()), "000000000000");
+}
+
+// ── §16.3 and §19.5: the two documented sessionless hazards ──
+
+/// SPEC.md §16.3: a bare transport `Reliable` PDU's MAC `dest` field is the
+/// bytes `seq, 0, 0, 0, 0, 0`, which decode as a callsign for 118 of the 256
+/// sequence numbers (0-3, and 4-155 except those with both low bits set).
+#[test]
+fn bare_reliable_seq_gives_a_valid_mac_dest_for_118_values() {
+    let valid: Vec<u8> = (0..=255u8)
+        .filter(|&seq| Callsign::decode(&[seq, 0, 0, 0, 0, 0]).is_ok())
+        .collect();
+    assert_eq!(valid.len(), 118);
+    assert!(valid
+        .iter()
+        .all(|&seq| seq <= 3 || (seq <= 155 && seq & 3 != 3)));
+}
+
+/// SPEC.md §19.2/§19.5 and docs/LIMITATIONS.md: `ArqTx::process_ack`
+/// advances `send_base` across a distance of 1-128, so the all-zero ACK
+/// fields of a sessionless data PDU acknowledge in-flight segments that
+/// were never received once `send_base` reaches 128.
+#[test]
+fn sessionless_zero_ack_moves_send_base_from_128() {
+    let now = Instant::now();
+    // `base` segments sent and each acknowledged, then one more in flight.
+    let tx_with_one_in_flight = |base: u8| {
+        let config = ArqConfig::new(8, 5, Duration::from_secs(5)).unwrap();
+        let mut tx = ArqTx::new(config).unwrap();
+        for _ in 0..base {
+            let seq = tx.send(vec![0], now).unwrap();
+            assert_eq!(tx.process_ack(seq.wrapping_add(1), 0, now), vec![seq]);
+        }
+        assert_eq!(tx.send(vec![0], now).unwrap(), base);
+        assert_eq!((tx.send_base(), tx.in_flight()), (base, 1));
+        tx
+    };
+
+    // send_base 127: the distance to ack 0 is 129, so nothing moves.
+    let mut tx = tx_with_one_in_flight(127);
+    assert!(tx.process_ack(0, 0, now).is_empty());
+    assert_eq!((tx.send_base(), tx.in_flight()), (127, 1));
+
+    // send_base 128 (d = 128 for `is_acked`, which says "not acked"): the
+    // sender acknowledges 128 and wraps send_base to 0.
+    let mut tx = tx_with_one_in_flight(128);
+    assert!(!TransportPdu::new_ack(0, 0, 0).is_acked(128));
+    assert_eq!(tx.process_ack(0, 0, now), vec![128]);
+    assert_eq!((tx.send_base(), tx.in_flight()), (0, 129));
+
+    // The case docs/LIMITATIONS.md quotes: 130 acknowledged sends.
+    let mut tx = tx_with_one_in_flight(130);
+    assert_eq!(tx.process_ack(0, 0, now), vec![130]);
+    assert_eq!((tx.send_base(), tx.in_flight()), (0, 131));
 }

@@ -1429,7 +1429,7 @@ The reference daemon emits the following payload shapes
 | Station ID | MAC `Beacon` + station-ID payload (`build_beacon_mac_pdu`, `:5338`) | yes, at the first transmission and every `id_interval_secs` | §17.5 |
 | Sessionless data, ARQ off | raw host bytes, no MAC or transport header | no (`sessionless_tx_enabled = false`) | out of scope |
 | Sessionless data, ARQ on | bare transport `Reliable` | no (`arq_enabled = false`) | §18, §19.5 |
-| Sessionless ACK | bare transport `Ack`, optional 1-byte suggested level | no | §18.3, §19.5 |
+| Sessionless ACK | bare transport `Ack` with a 1-byte suggested level, 8 bytes | no | §18.3, §19.5 |
 | CP-switch control | bare transport `CpControl` | no (needs `arq_enabled` and `cp_negotiation_enabled`) | §20.4 |
 
 Every PHY header the reference stack writes carries `version = 1`,
@@ -1466,9 +1466,13 @@ bytes or more parses as a MAC frame whenever its first byte's low nibble is
 0–8 and bytes 1–12 decode as two valid callsigns. Vector N03 (§21.4) is a
 real example: `TransportPdu::new_reliable(0, 0, 0, b"ABCDEFGHIJ")` parses
 as a MAC `Ack` with version 0, an empty destination, source `PTICQDUF` and
-SSID 7, so step 1 claims it and the sessionless data is dropped. Research
-for COP-130 measured about 3% of sessionless `Reliable` PDUs with random
-sequence numbers and printable payloads taking this path. Retransmissions
+SSID 7, so step 1 claims it and the sessionless data is dropped. Every
+sessionless `Reliable` PDU passes the MAC type check, because its first
+byte `0x01` reads as MAC version 0, type `Ack`. Its MAC `dest` field is
+the bytes `seq_num, 0, 0, 0, 0, 0`, which decode as a callsign for 118 of
+the 256 sequence numbers (0–3, and 4–155 except those with both low bits
+set). Its MAC `src` field is the first six payload bytes, so whether a
+given PDU is misclassified depends on its payload. Retransmissions
 are byte-identical (§19.4), so a misclassified PDU fails the same way every
 time. Only the opt-in sessionless ARQ mode is affected. Connected-session
 traffic is always MAC-framed, and bare transport PDUs shorter than 14 bytes
@@ -1654,7 +1658,7 @@ MAC (`src`, `dest`, `ssid`) triple (§20.2).
 | 1 | `Reliable` | segment seq | 0, 0 from both reference senders | host bytes | session data; sessionless data (opt-in) |
 | 2 | `Ack` | 0 | receiver's ACK state | empty, or 1 byte suggested level (§18.3) | session ACK; sessionless ACK (opt-in) |
 | 3 | `Nak` | 0 | as `Ack` | as `Ack` | none; the receiver treats it exactly like `Ack` |
-| 4 | `Reset` | 0 | 0, 0 | empty | none; a receiver rebuilds its sessionless and CP-control ARQ state |
+| 4 | `Reset` | 0 | 0, 0 | empty | none; a receiver rebuilds its sessionless and CP-control ARQ state and returns to the long CP (§20.4) |
 | 5 | `CpControl` | segment seq (content) or 0 (bare ack) | piggybacked ACK state | 2 bytes (content) or empty (bare ack), §20.4 | CP-switch negotiation (opt-in) |
 | 6–15 | invalid | | | | parse error |
 
@@ -1716,11 +1720,18 @@ A sender decides whether segment `s` is acknowledged as follows, with
 |---|---|
 | 0 | no (`ack_num` is exclusive) |
 | 1–31 | bit `d - 1` of `ack_bitmap` |
-| 32–128 | no |
+| 32–127 | no |
+| 128 | see below |
 | 129–255 | yes (cumulative: `s` is before `ack_num`) |
 
-The boundary at `d = 128` is deliberate: 128 counts as ahead and 129 as
-behind. Example across the wrap: `ack_num = 252, ack_bitmap = 0x0000001b`
+The reference code is inconsistent at `d = 128`. `TransportPdu::is_acked`
+counts it as ahead (not acknowledged), but the sender's window update
+(`ArqTx::process_ack`, `arq.rs:450`) advances `send_base` toward
+`ack_num` across any distance of 1–128, so it treats `d = 128` as
+acknowledged. With windows of at most 32 (§19.4) a valid ACK never lands
+there; only a stale or zero ACK does (§19.5). A conforming sender SHOULD
+treat `d` in 128–255 as acknowledged, as `process_ack` does, and SHOULD
+NOT let 128 or more segments be outstanding. Example across the wrap: `ack_num = 252, ack_bitmap = 0x0000001b`
 acknowledges 250, 251, 253, 254, 0 and 1, and not 252 or 255. Vector P13
 (§21.3) carries those bytes with a worked decode.
 
@@ -1766,16 +1777,17 @@ With `arq_enabled`, host data sent outside a session is a bare transport
 `Reliable` PDU (§16.1) and the receiver answers with a bare transport `Ack`
 that carries a suggested level (§18.3). The rules of §19.1–§19.4 apply with
 W = 8. A `Reset` PDU tells the receiver to rebuild its sessionless and
-CP-control ARQ state.
+CP-control ARQ state, restart its sequence numbers at 0 and drop back to
+the long-CP profile (§20.4).
 
 **Discrepancy note: sessionless data PDUs move the sender's window.** The
 reference receiver passes the `ack_num` and `ack_bitmap` of every inbound
 sessionless `Reliable` PDU to its own sender's ACK processing
 (`event_loop.rs:4556-4564`), but data PDUs always carry `ack_num = 0,
-ack_bitmap = 0` (§18.2). By §19.2, `ack_num = 0` acknowledges segments
-129 to 255 cumulatively. Once the receiving station's own sender has
-segments numbered 129 to 255 in flight, an inbound data PDU acknowledges
-segments that were never received. Reproduced through `ArqTx` for COP-130:
+ack_bitmap = 0` (§18.2). By §19.2, the reference sender treats
+`ack_num = 0` as cumulatively acknowledging segments 128 to 255. Once the
+receiving station's own `send_base` reaches 128, an inbound data PDU
+acknowledges segments that were never received. Reproduced through `ArqTx` for COP-130:
 after 130 acknowledged sends with segment 130 in flight, processing
 `ack=0, bitmap=0` reports segment 130 as newly acknowledged and moves the
 window base back to 0, leaving 131 segments counted in flight, so the
@@ -1795,7 +1807,7 @@ MAY choose its own; the reference values are:
 | RTO estimator | RFC 6298 form, floored by airtime plus turnaround (`rto_floor`) | `arq.rs:131` |
 | Backoff | doubles per timeout, capped at 60 s | `arq.rs` |
 | Retransmissions before giving up | 5 (`DEFAULT_MAX_RETRANSMIT`) | `arq.rs:78` |
-| Observed schedule, no ACK ever | retransmit at 5, 15, 35, 75, 135 s, then fail | COP-130 research probe |
+| Worst case, no ACK ever | retransmit at 5, 15, 35, 75 and 135 s (5 + 10 + 20 + 40 + 60), then fail | `cp_negotiator.rs:262-270` |
 | Connected-session fade hold | COP-68: falls back in level and keeps retrying instead of giving up | `event_loop.rs:151,159` |
 
 ADR-010 D7's "one more RTO, then DISCONNECT" is superseded by the COP-68
@@ -1869,7 +1881,12 @@ for speed levels, profiles or the CP mode.
 **Responder admission.** The reference responder answers a `ConnectReq`
 only when it is listening, has a local callsign, and the request's `dest`
 is either empty or its own callsign (`handle_incoming_connect`,
-`event_loop.rs:6286`). It supports one session. While any session exists,
+`event_loop.rs:6286`). The empty `dest` is accepted, but a handshake that
+uses it does not complete with the reference initiator: the `ConnectAck`
+comes back with the responder's real callsign in `src`, which does not
+match the initiator's empty remote (§20.2), so it is dropped. An initiator
+SHOULD put the responder's callsign in `dest`. The reference responder
+supports one session. While any session exists,
 it does not answer a new `ConnectReq`, even from the current peer, and
 there is no reject frame (ADR-010 D2), except that a repeat `ConnectReq`
 from the same caller on the same SSID replaces a session still in
@@ -1964,8 +1981,12 @@ Give-up (reference policy): if the Propose, Confirm or Switched exhausts its
 retransmissions, or the proposer's probation expires before Switched
 arrives, that station reverts to the mode it had before the negotiation
 began. The module documentation's G1–G4 table (`cp_negotiator.rs:89-103`)
-lists each case. Note that `cp_negotiator.rs` calls the proposer "B" and the
-responder "A"; this spec uses the wire roles only.
+lists each case. A received transport `Reset` (§18.2) also ends any
+negotiation and puts the receiving station back on LongCp
+(`decode_and_dispatch_audio`'s `Reset` arm, `event_loop.rs:4637-4672`),
+whatever mode the peer is on; nothing tells the peer. Note that
+`cp_negotiator.rs` calls the proposer "B" and the responder "A"; this spec
+uses the wire roles only.
 
 ---
 
@@ -1978,8 +1999,11 @@ executable. `crates/coppa-protocol/tests/protocol_vectors.rs` (run with
 `cargo test --workspace`) asserts that the public encoders and session
 transitions produce each hex string, decodes every field again with an
 independent test-only unpacker, and reads this section to check that each
-row ID below still carries the same hex. Changing a row here or in the
-test without the other fails the suite.
+row ID below still carries the same hex, and that every row ID here has a
+vector in the test. Changing a row here or in the test without the other
+fails the suite. The daemon's own session builders and capabilities are
+pinned to P04–P07 and P23 by `session_builders_emit_spec_21_vectors`
+(`crates/coppa-daemon/src/event_loop.rs`).
 
 All rows are application payload bytes (§16): after §15 decompression and
 before PHY framing, except P28 (a PHY header) and P29 (a §15 envelope).
@@ -2063,8 +2087,9 @@ zero grid length, so no grid.
 (`fc`), and `0x1b` is bits 0, 1, 3 and 4: segments 253, 254, 0 and 1
 (252 + 1, + 2, + 4, + 5, mod 256) are buffered. By §19.2, 250 (d = 254)
 and 251 (d = 255) are acknowledged cumulatively, 252 (d = 0) and 255
-(d = 3, bit 2 clear) are not. Segment `ack_num - 128` (d = 128) is not
-acknowledged; `ack_num - 127` (d = 129) is.
+(d = 3, bit 2 clear) are not. For `is_acked`, segment `ack_num - 128`
+(d = 128) is not acknowledged and `ack_num - 127` (d = 129) is; see §19.2
+for the sender's different treatment of d = 128.
 
 **P18–P22.** All five have `session_id` 0 and `type` 5. P18 is seq 0 with
 nothing to acknowledge; P19's `ack_num` 1 acknowledges the Propose; P20
@@ -2092,7 +2117,7 @@ Each row states which parser it describes and what the reference returns.
 | N02 | P04 with `version` 15 | 26 | `f05dc05700000058b781083000000100000000000048454c4c4f` | MAC parse succeeds, `version` 15, `Data` (§17.6) |
 | N03 | bare transport `Reliable`, seq 0, `ABCDEFGHIJ` | 17 | `010000000000004142434445464748494a` | transport parse succeeds; MAC parse **also** succeeds as `Ack`, `version` 0, `dest` empty, `src = PTICQDUF`, `ssid` 7, so §16.2 classifies it as MAC (§16.3) |
 | N04 | first 13 bytes of P08 | 13 | `175dc05700000058b781083000` | MAC parse fails, `MacPduTooShort` |
-| N05 | P08 with `dest` byte 1 = `fc` | 14 | `17fc000000000058b78108300000` | MAC parse fails, `InvalidCallsignCode { code: 63 }` |
+| N05 | P08 with `dest` replaced by `fc 00 00 00 00 00` (first code 63) | 14 | `17fc000000000058b78108300000` | MAC parse fails, `InvalidCallsignCode { code: 63 }` |
 | N06 | transport `type` 6 | 7 | `06000000000000` | transport parse fails, `UnknownTransportType { value: 6 }` |
 | N07 | 6-byte transport input | 6 | `010000000000` | transport parse fails, `TransportPduTooShort` |
 | N08 | P08 with SSID byte `f3` | 14 | `175dc05700000058b781083000f3` | MAC parse succeeds, `Keepalive`, `ssid` 3 (§17.6) |
