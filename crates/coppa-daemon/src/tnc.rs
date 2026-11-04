@@ -205,7 +205,10 @@ pub struct TncConfig {
     pub input_device_id: Option<String>,
     /// Exact output device identity, overriding `audio_device` for this direction.
     pub output_device_id: Option<String>,
+    // Channel selection is consumed only by the optional CPAL audio backend.
+    #[cfg_attr(not(feature = "cpal-backend"), allow(dead_code))]
     pub input_channel: u16,
+    #[cfg_attr(not(feature = "cpal-backend"), allow(dead_code))]
     pub output_channel: u16,
 }
 

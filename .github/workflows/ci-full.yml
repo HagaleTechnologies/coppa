@@ -136,7 +136,7 @@ jobs:
       - name: Connectionless AGW CLI tests without audio
         run: cargo test -p coppa-cli --features kiss-tnc --test tnc_agw
       - name: Daemon CLI tests for WebSocket, health and mDNS
-        run: cargo test -p coppa-daemon --features websocket,mdns --test cli
+        run: cargo test -p coppa-daemon --features websocket,mdns,kiss-tnc --test cli
 
   bench-fuzz:
     name: Bench & Fuzz Compilation

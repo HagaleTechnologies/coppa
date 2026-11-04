@@ -21,18 +21,22 @@ Every table below was checked against coppad 0.3.0 at commit `b9fdb8d` (see
 | VARA-style data port | 8301 | the same key | none | none |
 | ARDOP command / data | 8515 / 8516 | `[host] ardop_enabled = true` | `ardop` | none |
 | WebSocket JSON (and the `GET /` page) | 8400 | `[host] websocket_enabled = true` and `websocket_token` | `websocket` | token; browsers also need an allowed `Origin` |
+<<<<<<< HEAD
 | AGWPE connectionless (AFSK TNC) | opt-in 8000 | `coppa tnc --agw-port 8000` | `kiss-tnc` and `cpal-backend` for audio | none |
+=======
+| KISS datagram (OFDM modem) | 8100 | `[host] kiss_enabled = true` | `kiss-tnc` | none |
+>>>>>>> 951030cae7b73389cd84e377bd43a2ddcf76aee9
 | KISS (AFSK 1200 TNC mode) | 8001 | `coppad --tnc`, or `coppa tnc --port N` | `kiss-tnc` (and `cpal-backend` for audio) | none |
 
 - Every `[host]` server is off by default and binds `bind_address`, which defaults to
   `127.0.0.1`. The keys and their defaults are in [coppad.toml.example](../coppad.toml.example);
   `coppad --print-default-config` prints them too.
 - `cargo build -p coppa-daemon` with no features has the VARA-style ports only. A config that
-  enables WebSocket or ARDOP in a build without that feature stops coppad at startup with an
+  enables WebSocket, ARDOP or KISS in a build without that feature stops coppad at startup with an
   error naming the feature, for example `[host] websocket_enabled = true is set, but this coppad
   was built without the websocket feature`.
-- KISS is a separate mode, not a `[host]` key. It runs the AFSK 1200 AX.25 TNC, not the OFDM
-  modem, and has no session. See [KISS](#kiss-afsk-1200-tnc-mode).
+- KISS datagrams on the OFDM modem use port 8100 and `[host] kiss_enabled`. The separate
+  AFSK 1200 AX.25 TNC uses port 8001 in `--tnc` mode. Both are sessionless.
 - Pick the VARA-style ports for Pat's `varahf` transport or any VARA host; ARDOP for Pat's
   `ardop` transport or an ARDOP host; WebSocket for a dashboard or a program that wants JSON.
   All three drive the same modem and its one session.
@@ -346,10 +350,17 @@ A <- {"type":"session","state":"disconnected"}   B <- {"type":"session","state":
 The field-by-field description, with more examples, is in
 [OPERATING.md](OPERATING.md#dashboard-protocol-v1).
 
+## KISS datagrams (OFDM modem)
+
+Build with `kiss-tnc` and set `[host] kiss_enabled = true`. The `kiss_port` default
+is 8100 on `bind_address`. One KISS port-0 data frame is one uncompressed OFDM
+broadcast frame, received by peer KISS clients only. There is no ACK or retry.
+See [RETICULUM.md](RETICULUM.md) for setup, size limits, timing and security.
+
 ## KISS (AFSK 1200 TNC mode)
 
 `coppad --tnc` (always port 8001) or `coppa tnc --port N` runs a 1200-baud AFSK AX.25 TNC behind
-a KISS TCP port. It is for bring-up and testing, not an interface to the OFDM modem, and Pat's
+a KISS TCP port. This AFSK mode is for bring-up and testing, and Pat's
 VARA path does not use it. [TNC.md](TNC.md) covers building and running it.
 
 - Standard KISS framing: `FEND` (`0xC0`) around each frame, `FESC TFEND` and `FESC TFESC` for
@@ -360,17 +371,12 @@ VARA path does not use it. [TNC.md](TNC.md) covers building and running it.
 - Up to 256 bytes of information field.
 - Every client gets each decoded frame, unless it falls more than 64 frames behind: then it
   silently skips the oldest. Up to 16 clients.
-- A client that sends 64 KiB with no `FEND` is disconnected.
+- A frame longer than 64 KiB is disconnected.
 - No authentication. Keep it on loopback.
 
-**Known defects** (both in [LIMITATIONS.md](LIMITATIONS.md); not fixed):
-
-- **A frame split across two TCP reads is sent truncated.** The decoder treats the end of what
-  it has read as the end of a frame, so the first part is keyed on its own and the rest is
-  dropped. A short frame written in one `write` on loopback arrives whole; a client that writes
-  a frame in pieces can hit this. Write each frame in one call.
-- **Frames on a KISS port other than 0 are dropped**, even when they are data frames. A host
-  that numbers its ports from 1 sends nothing.
+The streaming server decoder preserves frames split across TCP reads, including escapes
+split between reads (COP-138). Frames on a KISS port other than 0 are still dropped,
+even when they are data frames. See [LIMITATIONS.md](LIMITATIONS.md).
 
 ## ARDOP and the C FFI
 
@@ -383,7 +389,11 @@ VARA path does not use it. [TNC.md](TNC.md) covers building and running it.
 
 ## Security
 
+<<<<<<< HEAD
 - The VARA-style, ARDOP, AGWPE and KISS ports have **no authentication**. Anything that can open a TCP
+=======
+- The VARA-style, ARDOP and both KISS ports have **no authentication**. Anything that can open a TCP
+>>>>>>> 951030cae7b73389cd84e377bd43a2ddcf76aee9
   connection to them can key your transmitter. `bind_address` defaults to `127.0.0.1`; change it
   only on a trusted, firewalled network.
 - A web page in your own browser can still send a command line to the VARA-style command port
@@ -407,8 +417,9 @@ At commit `b9fdb8d` (coppad 0.3.0), on Linux, with no radio, no sound card and n
 - The two-station transcript and the WebSocket session came from two release coppads on the
   repo's userspace audio loop (`tools/pat-loop`), driven by raw-socket and WebSocket clients.
 - Every handshake row came from a hand-written WebSocket client.
-- The KISS split-frame and port-number defects were reproduced by feeding `KissServer` directly.
-  The KISS audio paths were not exercised.
+- COP-138 adds `kiss_datagram.rs` for byte-exact OFDM datagrams, split TCP writes, no local
+  echo and VARA isolation. `split_tcp_write_reaches_tx_whole` guards the shared server fix.
+  See [RETICULUM.md](RETICULUM.md) for the real RNS audio-loop run.
 - Real Pat v1.0.0 completed Winlink sessions in both directions through the harness
   ([testing/pat-session.md](testing/pat-session.md#cop-76-run-record-2026-11-02)).
 

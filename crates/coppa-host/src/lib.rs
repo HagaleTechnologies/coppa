@@ -79,6 +79,17 @@ pub enum HostEvent {
     },
     /// Disconnect request.
     DisconnectRequest { client_id: u32 },
+    /// COP-83: key a TX-level calibration tone (the WebSocket `tune`
+    /// request). `seconds` defaults to 10; the daemon bounds it. `single_hz`
+    /// selects a single tone instead of the two-tone.
+    Tune {
+        client_id: u32,
+        seconds: Option<f32>,
+        single_hz: Option<f32>,
+    },
+    /// COP-83: pin the TX speed level (the WebSocket `set_speed_level`
+    /// request). `None` returns the TX level to the rate loop.
+    SetSpeedLevel { client_id: u32, level: Option<u8> },
 }
 
 /// Responses sent from the engine back to host clients.
