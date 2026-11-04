@@ -6,6 +6,8 @@
 // Diagnostics go through `tracing`; `--check` and `--print-default-config`
 // write their output with `writeln!`.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+// COP-142: the std-clock ban targets event_loop production code only.
+#![allow(clippy::disallowed_methods)]
 
 // Shared with the library target; the binary uses only part of its API
 // (and none of the output worker without `cpal-backend`).

@@ -506,6 +506,27 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:b1fa92d938a3445339f1d05cc025443e43a96c9a4cec7f35b0ac9b430654f2aa",
+      "id": "paused-clock-timers",
+      "kind": "gotcha",
+      "links": [
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/paused-clock-timers.md",
+      "sources": [
+        "crates/coppa-daemon/src/event_loop.rs",
+        "crates/coppa-daemon/src/audio_output.rs",
+        "crates/coppa-daemon/clippy.toml"
+      ],
+      "status": "current",
+      "title": "What will bite you when a paused-clock test drives the daemon's timers?",
+      "verified_commit": "2526b50",
+      "verified_date": "2026-11-04",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:ece8378df1627dd56e8d8c10c4a995d5474ccc0993b6d4a7c2760fb7fefe9ec0",
       "id": "phase4-field-readiness",
       "kind": "gotcha",
