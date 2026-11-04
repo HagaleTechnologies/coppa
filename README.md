@@ -128,6 +128,8 @@ ignores KISS TXDELAY, persistence and slot time), no digipeating or beaconing, a
 
 ## Workspace Crates
 
+Each crate has a README in `crates/<name>/`; to call the modem from your own Rust program, see [docs/tutorials/embedding.md](docs/tutorials/embedding.md).
+
 | Crate | Description |
 |-------|-------------|
 | `coppa-dsp` | Pure DSP primitives: FFT/IFFT, FIR design and filtering (windowed-sinc bandpass, Hilbert, root-raised-cosine), AGC, Costas carrier recovery, Gardner timing recovery |
