@@ -72,7 +72,7 @@ const VECTORS: &[(&str, &str)] = &[
         "P29",
         "fe2b000000a002ff10ff5dffc0bffc030200e147fdbffc0ff846bff00ff00ff01f0600a00ff00ff00ff00a555540",
     ),
-    ("N01", "195dc05700000058b781083000000100000000000048454c4c4f"),
+    ("N01", "1a5dc05700000058b781083000000100000000000048454c4c4f"),
     ("N02", "f05dc05700000058b781083000000100000000000048454c4c4f"),
     ("N03", "010000000000004142434445464748494a"),
     ("N04", "175dc05700000058b781083000"),
@@ -762,10 +762,10 @@ fn compression_envelope_over_p04_is_p29() {
 
 #[test]
 fn negative_and_tolerance_rows_n01_to_n08() {
-    // N01: MAC type nibble 9 is unknown; coppad then tries transport/raw.
+    // N01: MAC type nibble 10 is unknown; coppad then tries transport/raw.
     assert!(matches!(
         MacPdu::from_bytes(&bytes_of("N01")),
-        Err(ProtocolError::UnknownMacFrameType { value: 9 })
+        Err(ProtocolError::UnknownMacFrameType { value: 10 })
     ));
 
     // N02: the MAC version nibble is not checked.

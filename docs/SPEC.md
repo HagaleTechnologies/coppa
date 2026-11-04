@@ -77,17 +77,12 @@ compatibility across these boundaries:
   MAC `version` stay unchanged, following ADR-003/005; there is no
   negotiation. Both stations must run 0.3.0 to exchange session data.
 
-<<<<<<< HEAD
-Two further ADRs describe additions layered on top of the same wire format:
-`docs/adr/007-multi-codeword-frames.md` (multi-codeword
-=======
 - **COP-138 KISS datagrams (0.7.0)** adds MAC frame type 9 without a PHY
   change. Datagram framing is defined in §11. Older stations deliver unknown
   type-9 frames, including the MAC header, raw to their host data clients.
 
-Two further ADRs describe additions layered on top of the same wire format
-(no further breaks): `docs/adr/007-multi-codeword-frames.md` (multi-codeword
->>>>>>> 951030cae7b73389cd84e377bd43a2ddcf76aee9
+Two further ADRs describe additions layered on top of the same wire format:
+`docs/adr/007-multi-codeword-frames.md` (multi-codeword
 framing + intra-frame cross-codeword interleaving, §9 below) and
 `docs/adr/008-phase3-system-layer.md` (payload integrity, ARQ, IR-HARQ, rate
 loop, SCO tracking — the system-layer behaviors this spec documents where
@@ -620,8 +615,9 @@ positions (`rate_dematch`'s doc, `crates/coppa-protocol/src/fec/ldpc/rate_match.
 The reference daemon does not exercise RV cycling. Its retransmissions are
 re-encoded through the engine, which writes `fec_type = 0` and `seq_num = 0`
 on every frame (`engine.rs:435,437`), so every on-air frame is RV0 and
-`rv_for_attempt` has no production caller. A retransmission is byte-identical
-at the MAC and transport layers (§19.4). A receiver MUST still decode any
+`rv_for_attempt` has no production caller. Data retransmissions are byte-identical
+at the MAC and transport layers; CP-control retries refresh their ACK fields
+(§19.4). A receiver MUST still decode any
 `rv` correctly, because a conforming transmitter MAY cycle it.
 
 ### 5.4 Scrambling and known-pad LLR pinning
@@ -1485,7 +1481,7 @@ MUST classify by this order, not by the PHY `frame_type`.
 
 The classification order has no discriminator. A bare transport PDU of 14
 bytes or more parses as a MAC frame whenever its first byte's low nibble is
-0–8 and bytes 1–12 decode as two valid callsigns. Vector N03 (§21.4) is a
+0–9 and bytes 1–12 decode as two valid callsigns. Vector N03 (§21.4) is a
 real example: `TransportPdu::new_reliable(0, 0, 0, b"ABCDEFGHIJ")` parses
 as a MAC `Ack` with version 0, an empty destination, source `PTICQDUF` and
 SSID 7, so step 1 claims it and the sessionless data is dropped. Every
@@ -1584,11 +1580,12 @@ identifier the session layer matches on (§20.2).
 | 6 | `Beacon` | station-ID payload (§17.5) | `build_beacon_mac_pdu` |
 | 7 | `Keepalive` | empty | `Session::keepalive` |
 | 8 | `Relay` | none defined | none |
-| 9–15 | invalid | | parse error |
+| 9 | `Datagram` | KISS data unchanged (§11) | KISS datagram path |
+| 10–15 | invalid | | parse error |
 
 `MacFrameType` is `mac.rs:24-44`. This enumeration is **not** the PHY
 header's `CoppaFrameType` (§4.2): the two disagree at values 2–4 and the
-MAC adds 7 and 8. `Relay` is recognized by the parser, but no code builds
+MAC adds 7–9. `Relay` is recognized by the parser, but no code builds
 one and the reference receiver only logs it ("Unhandled MAC frame type",
 `event_loop.rs:6267`). An implementer MUST NOT send `Relay` expecting any
 effect.
@@ -1627,7 +1624,7 @@ UTF-8 are errors; bytes after `level` are ignored (`StationIdPayload::from_bytes
 frame (§16.2 then tries the next shape), when:
 
 - the input is shorter than 14 bytes (`MacPduTooShort`, vector N04);
-- the `type` nibble is 9–15 (`UnknownMacFrameType`, vector N01);
+- the `type` nibble is 10–15 (`UnknownMacFrameType`, vector N01);
 - either callsign contains a code of 39 or more before its first padding
   code (`InvalidCallsignCode`, vector N05).
 
@@ -1784,9 +1781,15 @@ ACK: the sender's retransmission draws a fresh ACK.
   ARQ uses W = 8 (`event_loop.rs:985`) and CP control W = 2 (`:1055`).
   These are fixed constants on both ends. The `arq_window` capability
   (§20.1) is advertised and negotiated but does not change them.
-- A retransmission MUST be byte-identical to the first transmission at the
-  MAC and transport layers. It MAY be sent at a different PHY speed level,
-  so the PHY frame need not be identical.
+- A data retransmission MUST be byte-identical to the first transmission at
+  the MAC and transport layers. It MAY be sent at a different PHY speed
+  level, so the PHY frame need not be identical.
+- A CP-control content retransmission preserves its transport sequence
+  number and payload, but refreshes `ack_num` and `ack_bitmap` from the
+  current CP-control receive state (`check_arq_retransmits`,
+  `event_loop.rs:5717-5728`). For example, receiving a crossed Propose can
+  advance that state while the station's own Propose remains outstanding.
+  The retry's transport header therefore need not be byte-identical.
 - Every on-air frame of the reference stack is RV0 with PHY `seq_num` 0
   (§16.1, §5.3). Retransmissions do not cycle the redundancy version.
 - A connected-session sender ignores an `Ack` whose `ack_num` is beyond its
@@ -1943,9 +1946,25 @@ callsign, and its `ssid` matches (`session_id_for_frame`,
   idle timer. There is no reply and no miss counter.
 - `Disconnect` (MAC type 5, empty payload, 14 bytes, P09): sent once, best
   effort, with no reply (`Session::disconnect`, `session.rs:362`). The
-  receiver removes the session. The sender holds its session in
-  `Disconnecting` for at most 10 s without activity
-  (`DEFAULT_DISCONNECT_TIMEOUT_SECS`) before removing it.
+  receiver removes the session immediately. On a local host disconnect
+  request, the daemon enters `Disconnecting`, stops accepting new host data
+  for that session and stops its keepalives. It continues sending queued
+  data and receiving, delivering and ACKing peer data. It waits until the
+  backlog is empty, all in-flight data is acknowledged and the transmitter
+  is unkeyed before sending the final `Disconnect`
+  (`finish_drained_disconnect`, `event_loop.rs:3288`). It removes the local
+  session after that send attempt (`end_local_disconnect`, `:3307`), with
+  no post-send wait for a reply.
+- The reference drain timeout is 10 s without activity
+  (`DEFAULT_DISCONNECT_TIMEOUT_SECS`). Sending data and waiting within the
+  retry budget refresh the drain's activity timer, so a progressing backlog
+  may take longer than 10 s. If the drain stalls or the retry budget is
+  exhausted, the daemon drops the remaining queued and unacknowledged data,
+  attempts the final `Disconnect` once and removes the session. A transmit
+  gate that blocks data can also block that final frame
+  (`touch_draining_session`, `check_session_retransmits`,
+  `reap_timed_out_sessions`). This timeout bounds a stalled drain, not a
+  wait after transmitting `Disconnect`.
 - A session with no activity for 120 s (`DEFAULT_SESSION_TIMEOUT_SECS`)
   is removed locally. Because keepalives refresh that timer, a peer that
   has vanished is detected only while data is in flight.
@@ -2135,7 +2154,7 @@ Each row states which parser it describes and what the reference returns.
 
 | ID | Input | Bytes | Hex | Reference result |
 |---|---|---|---|---|
-| N01 | P04 with `type` 9 | 26 | `195dc05700000058b781083000000100000000000048454c4c4f` | MAC parse fails, `UnknownMacFrameType { value: 9 }` |
+| N01 | P04 with `type` 10 | 26 | `1a5dc05700000058b781083000000100000000000048454c4c4f` | MAC parse fails, `UnknownMacFrameType { value: 10 }` |
 | N02 | P04 with `version` 15 | 26 | `f05dc05700000058b781083000000100000000000048454c4c4f` | MAC parse succeeds, `version` 15, `Data` (§17.6) |
 | N03 | bare transport `Reliable`, seq 0, `ABCDEFGHIJ` | 17 | `010000000000004142434445464748494a` | transport parse succeeds; MAC parse **also** succeeds as `Ack`, `version` 0, `dest` empty, `src = PTICQDUF`, `ssid` 7, so §16.2 classifies it as MAC (§16.3) |
 | N04 | first 13 bytes of P08 | 13 | `175dc05700000058b781083000` | MAC parse fails, `MacPduTooShort` |
