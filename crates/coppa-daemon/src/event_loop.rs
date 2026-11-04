@@ -108,8 +108,27 @@ const VARA_KEEPALIVE_PERIOD: Duration = Duration::from_secs(60);
 /// in `transmit_samples` panicked before reporting.
 const PTT_BACKSTOP_GRACE: Duration = Duration::from_secs(2);
 
-/// COP-37: what every transmit path logs, at `ERROR`, when it refuses
-/// because no valid local callsign is in force (`local_callsign` is `None`).
+const KISS_DATAGRAM_QUEUE_DEPTH: usize = 8;
+
+/// Largest datagram that fits a single frame, after the MAC header.
+pub fn max_kiss_datagram_len(level: u8) -> usize {
+    if !(1..=8).contains(&level) {
+        return 0;
+    }
+    max_multi_payload_for_level(level, MAX_CODEWORDS)
+        .unwrap_or(0)
+        .saturating_sub(MacPdu::HEADER_SIZE)
+}
+
+fn kiss_datagram_codewords(len: usize, level: u8) -> Option<u8> {
+    if !(1..=8).contains(&level) {
+        return None;
+    }
+    (1..=MAX_CODEWORDS)
+        .find(|&cw| max_multi_payload_for_level(level, cw).is_some_and(|budget| len <= budget))
+}
+
+/// COP-37: every TX path logs this refusal when no local callsign is valid.
 const NO_CALLSIGN_TX_REFUSAL: &str = "Transmission refused: no valid local callsign; \
      set [engine] callsign or MYCALL before transmitting";
 
@@ -568,6 +587,8 @@ enum SessionNotice {
 #[derive(Debug)]
 #[allow(dead_code)] // AudioIn/AudioOut wired in future AFSK TX/RX path
 pub enum DaemonEvent {
+    /// One KISS data frame from the OFDM host interface.
+    KissDatagram(Vec<u8>),
     /// Event from a host interface.
     Host(HostEvent),
     /// Audio samples received from input.
@@ -860,6 +881,10 @@ pub struct EventLoop {
     /// transmission -- see `transmit_samples`. Nothing ever sets it back to
     /// `None`, so a payload accepted for TX keeps its callsign.
     local_callsign: Option<Callsign>,
+    /// Bounded broadcast datagrams waiting for the transmitter.
+    kiss_datagrams: VecDeque<Vec<u8>>,
+    /// Fan-out exclusively to KISS clients, separate from host DataOut.
+    kiss_rx: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
     /// How often `run()` sends `IAMALIVE` to every command-port client;
     /// `VARA_KEEPALIVE_PERIOD` outside tests.
     vara_keepalive_period: Duration,
@@ -1118,6 +1143,8 @@ impl EventLoop {
             ardop_responses: None,
             #[cfg(feature = "ardop")]
             ardop_clients: HashMap::new(),
+            kiss_datagrams: VecDeque::new(),
+            kiss_rx: None,
             tx_queue: VecDeque::new(),
             session_link: None,
             pending_disconnect: None,
@@ -2194,6 +2221,126 @@ impl EventLoop {
         if self.session_tx_held_by_frequency_gate {
             self.drain_session_link().await;
         }
+        self.try_drain_kiss_datagrams().await;
+    }
+
+    /// Connect received datagrams to the KISS server's client fan-out.
+    #[cfg_attr(not(feature = "kiss-tnc"), allow(dead_code))] // Binary copy has no KISS wiring without the feature.
+    pub fn set_kiss_rx(&mut self, tx: tokio::sync::broadcast::Sender<Vec<u8>>) {
+        self.kiss_rx = Some(tx);
+    }
+
+    /// Current transmit speed level, for host interface reporting.
+    #[cfg_attr(not(feature = "kiss-tnc"), allow(dead_code))] // Used by optional KISS startup reporting.
+    pub fn speed_level(&self) -> u8 {
+        self.engine.speed_level()
+    }
+
+    async fn handle_kiss_datagram(&mut self, data: Vec<u8>) {
+        if data.is_empty() {
+            tracing::debug!("Empty KISS datagram ignored");
+            return;
+        }
+        if let Some(remote) = self.active_session_remote() {
+            tracing::warn!(bytes = data.len(), %remote, "KISS datagram refused while a session is active; dropped");
+            return;
+        }
+        if self.local_callsign.is_none() {
+            tracing::error!(bytes = data.len(), "{NO_CALLSIGN_TX_REFUSAL}");
+            return;
+        }
+        let level = self.engine.speed_level();
+        let max_bytes = max_kiss_datagram_len(level);
+        if data.len() > max_bytes {
+            tracing::warn!(
+                bytes = data.len(),
+                max_bytes,
+                level,
+                "KISS datagram does not fit one frame at this speed level; dropped"
+            );
+            return;
+        }
+        if self.kiss_datagrams.len() == KISS_DATAGRAM_QUEUE_DEPTH {
+            tracing::warn!(
+                bytes = data.len(),
+                queued = self.kiss_datagrams.len(),
+                "KISS datagram queue full; newest datagram dropped"
+            );
+            return;
+        }
+        self.kiss_datagrams.push_back(data);
+        self.try_drain_kiss_datagrams().await;
+    }
+
+    async fn try_drain_kiss_datagrams(&mut self) {
+        if self.kiss_datagrams.is_empty() {
+            return;
+        }
+        // Clear even while keyed so no stale datagrams survive a short session.
+        if self.active_session_remote().is_some() {
+            tracing::warn!(
+                count = self.kiss_datagrams.len(),
+                bytes = self.kiss_datagrams.iter().map(Vec::len).sum::<usize>(),
+                "KISS datagrams discarded: a session started"
+            );
+            self.kiss_datagrams.clear();
+            return;
+        }
+        if self.is_transmitting {
+            return;
+        }
+        self.keep_level_derived_engine_hf_legal(self.engine.speed_level());
+        if self.wideband_frequency_check().is_err() {
+            return;
+        }
+        let Some(local) = self.local_callsign.clone() else {
+            self.kiss_datagrams.clear();
+            tracing::error!("{NO_CALLSIGN_TX_REFUSAL}");
+            return;
+        };
+        let payload = self.kiss_datagrams.pop_front().expect("queue checked");
+        let bytes = payload.len();
+        let pdu = MacPdu::new(
+            MacFrameType::Datagram,
+            Callsign::broadcast(),
+            local,
+            0,
+            payload,
+        )
+        .to_bytes();
+        let level = self.engine.speed_level();
+        let Some(codewords) = kiss_datagram_codewords(pdu.len(), level) else {
+            tracing::warn!(bytes, level, "Queued KISS datagram no longer fits; dropped");
+            return;
+        };
+        match self
+            .engine
+            .encode_uncompressed_with_codewords(&pdu, codewords)
+        {
+            Ok(samples) => {
+                tracing::info!(bytes, level, codewords, "Sending KISS datagram");
+                // PTT release drains this queue again through transmit_samples.
+                Box::pin(self.transmit_samples(&samples)).await;
+            }
+            Err(error) => tracing::warn!(%error, bytes, "KISS datagram encode failed; dropped"),
+        }
+    }
+
+    fn handle_kiss_datagram_rx(&self, pdu: MacPdu) {
+        if pdu.dest != Callsign::broadcast() {
+            tracing::debug!("Named-destination KISS datagram dropped");
+            return;
+        }
+        let Some(tx) = &self.kiss_rx else {
+            tracing::debug!("KISS datagram dropped: interface disabled");
+            return;
+        };
+        let bytes = pdu.payload.len();
+        let from = pdu.src;
+        match tx.send(pdu.payload) {
+            Ok(clients) => tracing::info!(%from, bytes, clients, "KISS datagram received"),
+            Err(_) => tracing::debug!(%from, bytes, "KISS datagram dropped: no clients"),
+        }
     }
 
     /// Push one raw payload onto the outbound TX queue, report the resulting
@@ -3261,6 +3408,9 @@ impl EventLoop {
                 // E5: Signal audio threads to stop
                 self.shutdown_flag.store(true, Ordering::Release);
                 self.running = false;
+            }
+            Some(DaemonEvent::KissDatagram(data)) => {
+                self.handle_kiss_datagram(data).await;
             }
             Some(DaemonEvent::Host(host_event)) => {
                 self.handle_host_event(host_event).await;
@@ -6263,6 +6413,7 @@ impl EventLoop {
             MacFrameType::Ack => self.handle_session_ack(pdu).await,
             MacFrameType::Keepalive => self.handle_keepalive_rx(pdu),
             MacFrameType::Beacon => self.handle_beacon_rx(pdu),
+            MacFrameType::Datagram => self.handle_kiss_datagram_rx(pdu),
             _ => {
                 tracing::debug!(frame_type = ?pdu.frame_type, "Unhandled MAC frame type");
             }
@@ -6664,6 +6815,7 @@ impl EventLoop {
             // sends only once its in-flight frame is ACKed, so this release
             // only resumes a frame a busy transmitter held back.
             self.try_drain_tx_queue().await;
+            self.try_drain_kiss_datagrams().await;
             self.drain_session_link().await;
             self.finish_drained_disconnect().await;
         }
@@ -23389,5 +23541,178 @@ mod tests {
                 "a dial after teardown proceeds"
             );
         }
+    }
+    fn kiss_station() -> (EventLoop, coppa_audio::AudioRingConsumer) {
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = "N1CALL".into();
+        config.radio.ptt_pre_delay_ms = 0;
+        config.radio.ptt_tail_delay_ms = 0;
+        config.radio.turnaround_ms = 0;
+        let mut station = EventLoop::new(config).unwrap();
+        let (tx, rx) = coppa_audio::audio_ring(4_000_000);
+        station.set_audio_out(tx);
+        (station, rx)
+    }
+
+    #[test]
+    fn kiss_datagram_codewords_are_the_fewest_that_fit() {
+        assert_eq!(kiss_datagram_codewords(417, 2), Some(4));
+        assert_eq!(kiss_datagram_codewords(514, 2), Some(5));
+        assert_eq!(kiss_datagram_codewords(448, 1), Some(8));
+        assert_eq!(kiss_datagram_codewords(449, 1), None);
+    }
+
+    #[test]
+    fn max_kiss_datagram_len_matches_the_level_table() {
+        assert_eq!(
+            (1..=8).map(max_kiss_datagram_len).collect::<Vec<_>>(),
+            vec![434, 922, 922, 1410, 1250, 922, 1410, 1250]
+        );
+        assert_eq!(max_kiss_datagram_len(0), 0);
+        assert_eq!(max_kiss_datagram_len(10), 0);
+    }
+
+    #[tokio::test]
+    async fn kiss_datagram_crosses_as_one_uncompressed_mac_frame() {
+        let (mut a, mut audio) = kiss_station();
+        let (mut b, _) = kiss_station();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        b.set_kiss_rx(tx);
+        let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+        b.set_response_tx(response_tx);
+        let mut payload = vec![0; 403];
+        for (i, byte) in payload.iter_mut().enumerate().skip(2) {
+            *byte = (i % 256) as u8;
+        }
+        a.dispatch_event(Some(DaemonEvent::KissDatagram(payload.clone())))
+            .await;
+        let leg = take_leg(&mut audio, "datagram");
+        let mut decoder = CoppaCore::from_profile(&coppa_engine::profiles::HF_STANDARD);
+        let frames = decoder.push_samples(&leg);
+        let datagrams: Vec<_> = frames
+            .iter()
+            .filter(|f| f.payload.as_ref().is_ok_and(|p| p.first() == Some(&0x19)))
+            .collect();
+        assert_eq!(datagrams.len(), 1);
+        assert_eq!(datagrams[0].payload.as_ref().unwrap().len(), 417);
+        b.decode_and_dispatch_audio(&leg).await;
+        assert_eq!(rx.try_recv().unwrap(), payload);
+        assert!(rx.try_recv().is_err());
+        while let Ok(response) = response_rx.try_recv() {
+            assert!(!matches!(response, HostResponse::DataOut { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn received_kiss_datagram_reaches_kiss_clients_only() {
+        let (mut b, _) = kiss_station();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        b.set_kiss_rx(tx);
+        let (tx, mut responses) = mpsc::unbounded_channel();
+        b.set_response_tx(tx);
+        b.handle_mac_pdu(MacPdu::new(
+            MacFrameType::Datagram,
+            Callsign::broadcast(),
+            Callsign::new("W1AW").unwrap(),
+            0,
+            vec![0xc0, 0xdb],
+        ))
+        .await;
+        assert_eq!(rx.try_recv().unwrap(), vec![0xc0, 0xdb]);
+        assert!(responses.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn datagram_to_a_named_callsign_is_not_delivered() {
+        let (mut b, _) = kiss_station();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        b.set_kiss_rx(tx);
+        b.handle_mac_pdu(MacPdu::new(
+            MacFrameType::Datagram,
+            Callsign::new("W1AW").unwrap(),
+            Callsign::new("N0CALL").unwrap(),
+            0,
+            vec![1],
+        ))
+        .await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn received_kiss_datagram_with_kiss_off_is_dropped() {
+        let (mut b, _) = kiss_station();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        b.set_response_tx(tx);
+        b.handle_mac_pdu(MacPdu::new(
+            MacFrameType::Datagram,
+            Callsign::broadcast(),
+            Callsign::new("W1AW").unwrap(),
+            0,
+            vec![1],
+        ))
+        .await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn oversize_kiss_datagram_is_dropped_not_sent() {
+        let (mut a, mut audio) = kiss_station();
+        a.engine.set_speed_level(1).unwrap();
+        a.handle_kiss_datagram(vec![1; 435]).await;
+        assert!(a.kiss_datagrams.is_empty());
+        assert_eq!(audio.available(), 0);
+        a.handle_kiss_datagram(vec![1; 434]).await;
+        assert!(!take_leg(&mut audio, "maximum datagram").is_empty());
+    }
+
+    #[tokio::test]
+    async fn kiss_datagram_is_refused_while_a_session_is_active() {
+        let (mut a, _, audio, _) = connected_pair(0).await;
+        a.handle_kiss_datagram(vec![1; 403]).await;
+        assert!(a.kiss_datagrams.is_empty());
+        assert_eq!(audio.available(), 0);
+    }
+
+    #[tokio::test]
+    async fn queued_kiss_datagrams_are_discarded_when_a_session_starts() {
+        let (mut a, _, audio, _) = connected_pair(0).await;
+        a.kiss_datagrams.push_back(vec![1; 403]);
+        a.kiss_datagrams.push_back(vec![2; 403]);
+        a.try_drain_kiss_datagrams().await;
+        assert!(a.kiss_datagrams.is_empty());
+        assert_eq!(audio.available(), 0);
+    }
+
+    #[tokio::test]
+    async fn kiss_datagram_queue_keeps_the_oldest_eight() {
+        let (mut a, _) = kiss_station();
+        a.is_transmitting = true;
+        for i in 0..9 {
+            a.handle_kiss_datagram(vec![i]).await;
+        }
+        assert_eq!(
+            a.kiss_datagrams,
+            (0..8).map(|i| vec![i]).collect::<VecDeque<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn kiss_datagram_without_a_callsign_is_refused() {
+        let mut a = EventLoop::new(DaemonConfig::default()).unwrap();
+        a.handle_kiss_datagram(vec![1]).await;
+        assert!(a.kiss_datagrams.is_empty());
+        assert!(!a.is_transmitting);
+    }
+
+    #[tokio::test]
+    async fn queued_kiss_datagrams_drain_one_per_ptt_release() {
+        let (mut a, mut audio) = kiss_station();
+        a.handle_kiss_datagram(vec![1; 100]).await;
+        a.handle_kiss_datagram(vec![2; 100]).await;
+        assert_eq!(a.kiss_datagrams.len(), 1);
+        take_leg(&mut audio, "first datagram");
+        a.handle_ptt_change(false).await;
+        assert!(a.kiss_datagrams.is_empty());
+        take_leg(&mut audio, "second datagram");
     }
 }
