@@ -554,6 +554,28 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:f51ed567b48a72ee5b1a0ed2113b57186a4f3bea82b65e8b75695b700aa4475e",
+      "id": "session-fade-protection",
+      "kind": "gotcha",
+      "links": [
+        "coppa-protocol",
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/session-fade-protection.md",
+      "sources": [
+        "docs/SPEC.md",
+        "docs/adr/012-cop119-session-outer-code.md",
+        "crates/coppa-daemon/src/event_loop.rs"
+      ],
+      "status": "current",
+      "title": "What will bite you about session fade protection?",
+      "verified_commit": "d837c89",
+      "verified_date": "2026-11-04",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:b352ed5416cfb4361ca06c059b10fc089ffed56f1474c9857b8e9cc1d588c949",
       "id": "tnc-direwolf-benchmark",
       "kind": "gotcha",
@@ -619,28 +641,6 @@
       "title": "What will bite you about waveform compatibility with pre-Phase-1 code?",
       "verified_commit": "c1d2676",
       "verified_date": "2026-07-07",
-      "visibility": "public"
-    },
-    {
-      "hash": "sha256:f51ed567b48a72ee5b1a0ed2113b57186a4f3bea82b65e8b75695b700aa4475e",
-      "id": "session-fade-protection",
-      "kind": "gotcha",
-      "links": [
-        "coppa-protocol",
-        "overview"
-      ],
-      "locked": false,
-      "maintainer": "agent",
-      "path": "pages/session-fade-protection.md",
-      "sources": [
-        "docs/SPEC.md",
-        "docs/adr/012-cop119-session-outer-code.md",
-        "crates/coppa-daemon/src/event_loop.rs"
-      ],
-      "status": "current",
-      "title": "What will bite you about session fade protection?",
-      "verified_commit": "d837c89",
-      "verified_date": "2026-11-04",
       "visibility": "public"
     }
   ],
