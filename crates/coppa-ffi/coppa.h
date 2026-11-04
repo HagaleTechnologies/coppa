@@ -8,6 +8,174 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#ifndef COPPA_API
+#define COPPA_API
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define COPPA_DEPRECATED(msg) __attribute__((deprecated(msg)))
+#elif defined(_MSC_VER)
+#define COPPA_DEPRECATED(msg) __declspec(deprecated(msg))
+#else
+#define COPPA_DEPRECATED(msg)
+#endif
+
+/*
+ * ABI versioning
+ *
+ * COPPA_ABI_VERSION_MAJOR changes when an exported function, struct layout
+ * or constant changes incompatibly or is removed. COPPA_ABI_VERSION_MINOR
+ * changes when something is added. coppa_abi_version() returns
+ * (MAJOR << 16) | MINOR for the library actually loaded. A program built
+ * against this header works with a loaded library whose major is equal and
+ * whose minor is equal or higher. The ABI version is separate from the
+ * crate version that coppa_version() returns. A library built before
+ * COP-139 does not export coppa_abi_version.
+ *
+ * Thread safety
+ *
+ * - Any function may be called from any thread. The library starts no
+ *   threads and never calls back into your code.
+ * - Calls on different handles are independent and may run at the same time.
+ * - Calls on one coppa_engine_t or coppa_link_t from several threads are
+ *   serialized by a lock inside the handle. They are memory-safe, but their
+ *   order is whatever the threads produce. Feeding one audio stream to one
+ *   handle from two threads interleaves blocks and corrupts the stream: use
+ *   one receiving handle per audio input, fed by one thread.
+ * - coppa_engine_destroy, coppa_link_destroy and coppa_stop_stream must not
+ *   run while any other call on the same handle is in progress, and no call
+ *   may use the handle after it. Join or stop the other threads first.
+ * - coppa_last_error is per thread: it reports the calling thread's last
+ *   failed call only.
+ * - coppa_version, coppa_abi_version and coppa_strerror return static
+ *   strings or values and are always safe to call.
+ *
+ * Errors
+ *
+ * Fallible functions return a negative COPPA_ERR_* code or NULL. After such
+ * a return, coppa_last_error() gives "<function>: <reason>" for the calling
+ * thread, and coppa_strerror(code) gives a fixed description of the code.
+ * Every fallible call clears the message on entry, so NULL with no message
+ * means "nothing" (for example coppa_get_decoded on an empty stream).
+ */
+
+
+/**
+ * Success.
+ */
+#define COPPA_OK 0
+
+/**
+ * A required pointer argument was null.
+ */
+#define COPPA_ERR_NULL_ARG -1
+
+/**
+ * A string argument was not valid UTF-8.
+ */
+#define COPPA_ERR_INVALID_UTF8 -2
+
+/**
+ * Encode or decode failed.
+ */
+#define COPPA_ERR_CODEC -3
+
+/**
+ * The handle's lock is poisoned: destroy the handle and create a new one.
+ */
+#define COPPA_ERR_POISONED -4
+
+/**
+ * An internal panic was caught: destroy the handle and create a new one.
+ */
+#define COPPA_ERR_PANIC -5
+
+/**
+ * An argument's value is out of range or not supported.
+ */
+#define COPPA_ERR_INVALID_PARAM -6
+
+/**
+ * The call is not valid in the link's current state (COP-139).
+ */
+#define COPPA_ERR_INVALID_STATE -7
+
+/**
+ * Not an error: nothing is pending (`coppa_next_frame`, `coppa_link_next_event`).
+ */
+#define COPPA_NONE_PENDING 1
+
+/**
+ * ABI major version: changes when an exported function, struct layout or
+ * constant changes incompatibly or is removed (COP-139).
+ */
+#define COPPA_ABI_VERSION_MAJOR 1
+
+/**
+ * ABI minor version: changes when something is added (COP-139).
+ */
+#define COPPA_ABI_VERSION_MINOR 0
+
+/**
+ * Link state: idle (`coppa_link_state`).
+ */
+#define COPPA_LINK_STATE_IDLE 0
+
+/**
+ * Link state: a CONNECT handshake is in progress.
+ */
+#define COPPA_LINK_STATE_CONNECTING 1
+
+/**
+ * Link state: connected; `coppa_link_send` is accepted.
+ */
+#define COPPA_LINK_STATE_CONNECTED 2
+
+/**
+ * Link state: draining queued data before the DISCONNECT frame.
+ */
+#define COPPA_LINK_STATE_DISCONNECTING 3
+
+/**
+ * Event kind: the link connected; `remote` names the peer.
+ */
+#define COPPA_LINK_EVENT_CONNECTED 1
+
+/**
+ * Event kind: the link ended; `reason` says why.
+ */
+#define COPPA_LINK_EVENT_DISCONNECTED 2
+
+/**
+ * Disconnect reason: none (the event is not a disconnect).
+ */
+#define COPPA_LINK_REASON_NONE 0
+
+/**
+ * Disconnect reason: this side called `coppa_link_disconnect`.
+ */
+#define COPPA_LINK_REASON_LOCAL 1
+
+/**
+ * Disconnect reason: the peer sent DISCONNECT.
+ */
+#define COPPA_LINK_REASON_REMOTE 2
+
+/**
+ * Disconnect reason: the session timed out.
+ */
+#define COPPA_LINK_REASON_TIMEOUT 3
+
+/**
+ * Disconnect reason: a data frame used up its retransmissions.
+ */
+#define COPPA_LINK_REASON_RETRIES_EXHAUSTED 4
+
+/**
+ * Disconnect reason: the CONNECT handshake got no answer.
+ */
+#define COPPA_LINK_REASON_HANDSHAKE_FAILED 5
+
 /**
  * Opaque handle to a Coppa engine instance (`coppa_engine_t` in the
  * generated C header — see `cbindgen.toml`'s `[export.rename]`).
@@ -19,8 +187,24 @@
  * `next_seq` exist only for the v2 event-style streaming API — v1
  * functions never touch them, so extending this struct changes no v1
  * signature or behavior.
+ *
+ * # Thread safety
+ *
+ * Calls on one handle from several threads are serialized by the mutexes
+ * inside it and are memory-safe; their order is whatever the threads
+ * produce. [`coppa_engine_destroy`] must not run while any other call on the
+ * handle is in progress. See the crate-level "Thread safety" section.
  */
 typedef struct coppa_engine_t coppa_engine_t;
+
+/**
+ * Opaque link handle (`coppa_link_t` in the generated header).
+ *
+ * One connected, reliable session (coppad's session protocol) over audio
+ * samples and a caller clock. Calls from several threads are serialized by
+ * the lock inside; feed one audio stream from one thread.
+ */
+typedef struct coppa_link_t coppa_link_t;
 
 /**
  * Opaque handle to a streaming decode session.
@@ -80,7 +264,8 @@ typedef struct CoppaStreamHandle CoppaStreamHandle;
  */
 typedef struct coppa_config_t {
   /**
-   * Sample rate in Hz; `0` keeps the resolved profile's rate (48000 today).
+   * Sample rate in Hz; `0` keeps the resolved profile's rate (48000).
+   * Any value other than `0` or `48000` is rejected (COP-139).
    */
   uint32_t sample_rate;
   /**
@@ -143,9 +328,80 @@ typedef struct coppa_frame_t {
   uint64_t seq;
 } coppa_frame_t;
 
+/**
+ * Settings for [`coppa_link_new`] (`coppa_link_config_t`).
+ */
+typedef struct coppa_link_config_t {
+  /**
+   * Set to `sizeof(coppa_link_config_t)`.
+   */
+  uint32_t struct_size;
+  /**
+   * Required: this station's callsign, 1-8 of A-Z 0-9 / -.
+   */
+  const char *callsign;
+  /**
+   * Optional profile name, as `coppa_config_t.profile`; null = defaults.
+   * Both ends of a link must use the same profile.
+   */
+  const char *profile;
+  /**
+   * Speed level; `0` keeps the profile's level.
+   */
+  uint8_t speed_level;
+  /**
+   * Receive-to-transmit turnaround in ms; `0` = 500.
+   */
+  uint32_t turnaround_ms;
+} coppa_link_config_t;
+
+/**
+ * One link event (`coppa_link_event_t`), filled by [`coppa_link_next_event`].
+ */
+typedef struct coppa_link_event_t {
+  /**
+   * `COPPA_LINK_EVENT_CONNECTED` or `COPPA_LINK_EVENT_DISCONNECTED`; 0 when none.
+   */
+  int32_t kind;
+  /**
+   * `COPPA_LINK_REASON_*` when `kind` is `_DISCONNECTED`, else 0.
+   */
+  int32_t reason;
+  /**
+   * NUL-terminated peer callsign.
+   */
+  char remote[16];
+} coppa_link_event_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
+
+/**
+ * The C ABI version of the loaded library, `(MAJOR << 16) | MINOR`.
+ *
+ * Compare it with `COPPA_ABI_VERSION_MAJOR`/`COPPA_ABI_VERSION_MINOR` from
+ * the header you compiled against: the majors must be equal and the
+ * library's minor equal or higher. Separate from [`coppa_version`]'s crate
+ * version. Always safe to call; never touches [`coppa_last_error`].
+ */
+COPPA_API uint32_t coppa_abi_version(void);
+
+/**
+ * The calling thread's message for its most recent failed `coppa_*` call,
+ * as `"<function>: <reason>"`, or null when that call succeeded.
+ *
+ * Every fallible function clears the slot on entry, so a null return value
+ * with a null `coppa_last_error()` means "nothing", not a failure. The
+ * string stays valid until this thread's next `coppa_*` call. Do not free
+ * it. The slot is per thread.
+ */
+COPPA_API const char *coppa_last_error(void);
+
+/**
+ * A fixed description of an error code. Never null. Do not free it.
+ */
+COPPA_API const char *coppa_strerror(int32_t code);
 
 /**
  * Create a new Coppa engine instance.
@@ -153,7 +409,7 @@ extern "C" {
  * Returns a pointer to the engine handle, or null on failure.
  * The caller must free the handle with [`coppa_engine_destroy`].
  */
- struct coppa_engine_t *coppa_engine_create(void);
+COPPA_API struct coppa_engine_t *coppa_engine_create(void);
 
 /**
  * Destroy a Coppa engine instance and free its resources.
@@ -166,7 +422,7 @@ extern "C" {
  * `handle_ptr` must be either null or a valid pointer to a variable that
  * holds a pointer returned by [`coppa_engine_create`].
  */
- void coppa_engine_destroy(struct coppa_engine_t **handle_ptr);
+COPPA_API void coppa_engine_destroy(struct coppa_engine_t **handle_ptr);
 
 /**
  * Get the library version string.
@@ -174,7 +430,7 @@ extern "C" {
  * Returns a pointer to a static null-terminated string. The caller must
  * not free or modify the returned pointer.
  */
- const char *coppa_version(void);
+COPPA_API const char *coppa_version(void);
 
 /**
  * Encode a message string to audio samples.
@@ -192,7 +448,7 @@ extern "C" {
  * `handle` must be a valid engine handle. `message` must be a valid
  * null-terminated C string.
  */
-
+COPPA_API
 int32_t coppa_encode(struct coppa_engine_t *handle,
                      const char *message,
                      float **out_samples,
@@ -213,7 +469,7 @@ int32_t coppa_encode(struct coppa_engine_t *handle,
  * `handle` must be a valid engine handle. `samples` must point to
  * `num_samples` valid f32 values.
  */
-
+COPPA_API
 int32_t coppa_decode(struct coppa_engine_t *handle,
                      const float *samples,
                      uintptr_t num_samples,
@@ -231,7 +487,7 @@ int32_t coppa_decode(struct coppa_engine_t *handle,
  * `samples` must be a pointer returned by `coppa_encode`, and `len` must
  * be the exact length returned alongside it in `out_len`.
  */
- void coppa_free_samples(float *samples, uintptr_t len);
+COPPA_API void coppa_free_samples(float *samples, uintptr_t len);
 
 /**
  * Free a string returned by `coppa_decode` or `coppa_get_decoded`.
@@ -244,7 +500,7 @@ int32_t coppa_decode(struct coppa_engine_t *handle,
  * `s` must be a pointer returned by `coppa_decode` or `coppa_get_decoded`,
  * and must not have been freed already.
  */
- void coppa_free_string(char *s);
+COPPA_API void coppa_free_string(char *s);
 
 /**
  * Construct a new engine handle from a [`CoppaConfig`] (`coppa_config_t`).
@@ -252,8 +508,11 @@ int32_t coppa_decode(struct coppa_engine_t *handle,
  * Returns null if `cfg` is null, or for any config-rejection case (see
  * `resolve_engine_config` and [`CoppaConfig`]'s field docs): invalid
  * UTF-8 in `profile` or `callsign`, an unrecognized non-empty `profile`
- * name, or a non-zero `speed_level` that isn't a valid wire speed level
- * (1-9), or level 9 on an HF-profile handle.
+ * name, a `sample_rate` other than `0` or `48000` (COP-139: coppa runs at
+ * 48 kHz only, so any other rate is refused instead of silently ignored),
+ * or a non-zero `speed_level` that isn't a valid wire speed level
+ * (1-9), or level 9 on an HF-profile handle. After a null return,
+ * [`coppa_last_error`] says which.
  *
  * The returned handle is a plain [`CoppaHandle`] (`coppa_engine_t`) —
  * exactly what [`coppa_engine_create`] returns, just built from an
@@ -267,7 +526,7 @@ int32_t coppa_decode(struct coppa_engine_t *handle,
  * `cfg->profile` and `cfg->callsign`, if non-null, must be valid
  * null-terminated C strings.
  */
- struct coppa_engine_t *coppa_engine_new_with(const struct coppa_config_t *cfg);
+COPPA_API struct coppa_engine_t *coppa_engine_new_with(const struct coppa_config_t *cfg);
 
 /**
  * Change an existing engine handle's configured speed level.
@@ -288,7 +547,7 @@ int32_t coppa_decode(struct coppa_engine_t *handle,
  *
  * `handle` must be a valid engine handle.
  */
- int32_t coppa_engine_set_speed_level(struct coppa_engine_t *handle, uint8_t level);
+COPPA_API int32_t coppa_engine_set_speed_level(struct coppa_engine_t *handle, uint8_t level);
 
 /**
  * Encode raw binary data to audio samples — binary counterpart to
@@ -310,7 +569,7 @@ int32_t coppa_decode(struct coppa_engine_t *handle,
  * `handle` must be a valid engine handle. `data` must point to `len` valid
  * bytes (`data` may be null only if `len == 0`).
  */
-
+COPPA_API
 int32_t coppa_encode_bytes(struct coppa_engine_t *handle,
                            const uint8_t *data,
                            uintptr_t len,
@@ -344,7 +603,7 @@ int32_t coppa_encode_bytes(struct coppa_engine_t *handle,
  * `handle` must be a valid engine handle. `samples` must point to `len`
  * valid f32 values.
  */
-
+COPPA_API
 int32_t coppa_engine_feed_samples(struct coppa_engine_t *handle,
                                   const float *samples,
                                   uintptr_t len);
@@ -375,7 +634,7 @@ int32_t coppa_engine_feed_samples(struct coppa_engine_t *handle,
  * `handle` must be a valid engine handle. `out` must point to valid,
  * writable [`CoppaFrame`] storage.
  */
- int32_t coppa_next_frame(struct coppa_engine_t *handle, struct coppa_frame_t *out);
+COPPA_API int32_t coppa_next_frame(struct coppa_engine_t *handle, struct coppa_frame_t *out);
 
 /**
  * Free a frame payload buffer returned by [`coppa_next_frame`].
@@ -390,7 +649,7 @@ int32_t coppa_engine_feed_samples(struct coppa_engine_t *handle,
  * `payload` must be a pointer returned by `coppa_next_frame`, and `len`
  * must be the exact length returned alongside it in `payload_len`.
  */
- void coppa_free_frame_payload(uint8_t *payload, uintptr_t len);
+COPPA_API void coppa_free_frame_payload(uint8_t *payload, uintptr_t len);
 
 /**
  * Start a streaming decode session.
@@ -404,7 +663,9 @@ int32_t coppa_engine_feed_samples(struct coppa_engine_t *handle,
  * contract silently drops real binary session/ARQ traffic that the v2 raw
  * byte API surfaces correctly (see [`coppa_feed_samples`]'s doc).
  */
- struct CoppaStreamHandle *coppa_start_stream(void);
+COPPA_API
+COPPA_DEPRECATED("use coppa_engine_new_with with coppa_engine_feed_samples and coppa_next_frame")
+struct CoppaStreamHandle *coppa_start_stream(void);
 
 /**
  * Feed samples into a streaming decode session.
@@ -431,7 +692,8 @@ int32_t coppa_engine_feed_samples(struct coppa_engine_t *handle,
  * requirement) via [`coppa_next_frame`] rather than dropping every frame
  * whose payload isn't valid UTF-8 (see the note in this function's body).
  */
-
+COPPA_API
+COPPA_DEPRECATED("use coppa_engine_feed_samples")
 int32_t coppa_feed_samples(struct CoppaStreamHandle *handle,
                            const float *samples,
                            uintptr_t num_samples);
@@ -450,7 +712,9 @@ int32_t coppa_feed_samples(struct CoppaStreamHandle *handle,
  * instead — pops a `coppa_frame_t` with the raw payload plus SNR/CFO/speed
  * level/seq metadata, instead of a bare text message.
  */
- char *coppa_get_decoded(struct CoppaStreamHandle *handle);
+COPPA_API
+COPPA_DEPRECATED("use coppa_next_frame")
+char *coppa_get_decoded(struct CoppaStreamHandle *handle);
 
 /**
  * Stop and destroy a streaming decode session.
@@ -463,7 +727,143 @@ int32_t coppa_feed_samples(struct CoppaStreamHandle *handle,
  * instead, if this handle was created via [`coppa_engine_new_with`]/
  * [`coppa_engine_create`].
  */
- void coppa_stop_stream(struct CoppaStreamHandle *handle);
+COPPA_API
+COPPA_DEPRECATED("use coppa_engine_destroy")
+void coppa_stop_stream(struct CoppaStreamHandle *handle);
+
+/**
+ * Create a link from `cfg`. Returns null on failure; `coppa_last_error()`
+ * says why. Free it with [`coppa_link_destroy`].
+ *
+ * # Safety
+ *
+ * `cfg` must be null or point to a `coppa_link_config_t` whose
+ * `struct_size` is set, with NUL-terminated (or null) strings.
+ */
+COPPA_API struct coppa_link_t *coppa_link_new(const struct coppa_link_config_t *cfg);
+
+/**
+ * Destroy a link and set `*link` to null. Null or already-null is a no-op.
+ *
+ * # Safety
+ *
+ * `link` must be null or point to a variable holding a pointer from
+ * [`coppa_link_new`]. No other call on that link may be in progress.
+ */
+COPPA_API void coppa_link_destroy(struct coppa_link_t **link);
+
+/**
+ * Accept (`on = true`) or refuse incoming connections while idle.
+ *
+ * # Safety
+ *
+ * `link` must be null or a live pointer from [`coppa_link_new`].
+ */
+COPPA_API int32_t coppa_link_listen(struct coppa_link_t *link, bool on);
+
+/**
+ * Start a CONNECT handshake to `remote` at time `now_ms`.
+ *
+ * # Safety
+ *
+ * `link` must be null or a live pointer from [`coppa_link_new`]; `remote`
+ * must be null or NUL-terminated.
+ */
+COPPA_API
+int32_t coppa_link_connect(struct coppa_link_t *link,
+                           const char *remote,
+                           uint64_t now_ms);
+
+/**
+ * Queue `len` bytes for reliable delivery. Needs `COPPA_LINK_STATE_CONNECTED`.
+ *
+ * # Safety
+ *
+ * `link` must be null or a live pointer from [`coppa_link_new`]; `data`
+ * must point to `len` readable bytes (or be null when `len` is 0).
+ */
+COPPA_API int32_t coppa_link_send(struct coppa_link_t *link, const uint8_t *data, uintptr_t len);
+
+/**
+ * Disconnect gracefully: queued data is delivered first, then DISCONNECT.
+ *
+ * # Safety
+ *
+ * `link` must be null or a live pointer from [`coppa_link_new`].
+ */
+COPPA_API int32_t coppa_link_disconnect(struct coppa_link_t *link, uint64_t now_ms);
+
+/**
+ * Run the link for one audio block: an audio callback.
+ *
+ * `rx` holds the 48 kHz mono samples captured since the last call (any
+ * count; ignored while the link transmits). The link writes its signal at
+ * the start of `tx`, zero-fills the rest, and stores the signal length in
+ * `*tx_active` when that pointer is not null. Key the transmitter while it
+ * is above 0. `now_ms` is a monotonic millisecond clock and must never
+ * decrease for one link.
+ *
+ * # Safety
+ *
+ * `link` must be null or a live pointer from [`coppa_link_new`]; `rx`
+ * must point to `rx_len` floats and `tx` to `tx_len` writable floats (either
+ * may be null when its length is 0); `tx_active` must be null or writable.
+ */
+COPPA_API
+int32_t coppa_link_process(struct coppa_link_t *link,
+                           uint64_t now_ms,
+                           const float *rx,
+                           uintptr_t rx_len,
+                           float *tx,
+                           uintptr_t tx_len,
+                           uintptr_t *tx_active);
+
+/**
+ * Copy up to `cap` received bytes into `buf` and store the count in
+ * `*out_len` (0 when nothing has arrived).
+ *
+ * # Safety
+ *
+ * `link` must be null or a live pointer from [`coppa_link_new`]; `buf`
+ * must point to `cap` writable bytes (or be null when `cap` is 0);
+ * `out_len` must be writable.
+ */
+COPPA_API
+int32_t coppa_link_recv(struct coppa_link_t *link,
+                        uint8_t *buf,
+                        uintptr_t cap,
+                        uintptr_t *out_len);
+
+/**
+ * Pop the next link event into `*out`: `0` when one was written,
+ * `COPPA_NONE_PENDING` (1, with `*out` zeroed) when none is pending.
+ *
+ * # Safety
+ *
+ * `link` must be null or a live pointer from [`coppa_link_new`]; `out`
+ * must be writable.
+ */
+COPPA_API int32_t coppa_link_next_event(struct coppa_link_t *link, struct coppa_link_event_t *out);
+
+/**
+ * The link's state, a `COPPA_LINK_STATE_*` value, or a negative error code.
+ *
+ * # Safety
+ *
+ * `link` must be null or a live pointer from [`coppa_link_new`].
+ */
+COPPA_API int32_t coppa_link_state(const struct coppa_link_t *link);
+
+/**
+ * Store the number of bytes queued or sent but not yet acknowledged in
+ * `*out_bytes`.
+ *
+ * # Safety
+ *
+ * `link` must be null or a live pointer from [`coppa_link_new`];
+ * `out_bytes` must be writable.
+ */
+COPPA_API int32_t coppa_link_pending(const struct coppa_link_t *link, uintptr_t *out_bytes);
 
 #ifdef __cplusplus
 }  // extern "C"
