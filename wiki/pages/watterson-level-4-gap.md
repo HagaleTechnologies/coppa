@@ -8,11 +8,11 @@ sources:
   - docs/adr/004-strongest-path-timing.md
   - docs/adr/006-phase2-parametric-estimation-nr-bg2.md
   - crates/coppa-codec/src/ofdm/sync_detector.rs
-  - .superpowers/sdd/p1-fading-regression-fix-report.md
+  - docs/analysis/COP-134-fading-regressions.md
   - BENCHMARKS.md
 verified:
-  commit: 59b0b63
-  date: 2026-07-14
+  commit: d837c89d388eaf9c70752c72db8537d910094cc8
+  date: 2026-11-04
 links:
   - adr-004-strongest-path-timing
   - adr-003-waveform-break
@@ -35,13 +35,13 @@ fix. AWGN performance at level 4 is unaffected and improved.
 
 The residual gap at level 4 is plausibly explained by QPSK's denser decision
 regions being more sensitive to residual channel-estimate imperfection than
-BPSK (levels 1–3), but this has not been further investigated. The problem is
-not fully root-caused. Full measured data in `BENCHMARKS.md` ("2026-07 —
-Hotfix: sparse-pilot header Watterson-fading regression" section) and in
-`.superpowers/sdd/p1-fading-regression-fix-report.md`.
+BPSK (levels 1–2), but this has not been further investigated. The problem is
+not fully root-caused. Full measured data is in [BENCHMARKS, the hotfix section](../../BENCHMARKS.md#2026-07--hotfix-sparse-pilot-header-watterson-fading-regression-adr-004)
+and [ADR-004](../../docs/adr/004-strongest-path-timing.md).
 
-Workaround: if reliable Watterson fading performance is required, use levels
-1–3 (BPSK). Do not assume level 4 is fully fixed; benchmark before relying on it.
+Benchmark the intended profile and channel before relying on level 4. Levels 1–2
+are BPSK; level 3 is QPSK 1/2 and is also in the later Moderate regression.
+The historical recovery of levels 1–3 is not a current reliability guarantee.
 
 ## Phase 2 update
 
@@ -52,3 +52,10 @@ gained (then had fixed) a CFO-interaction failure. The estimator side of that
 story — including the still-open 30 dB Moderate/level-2 threshold regression —
 belongs to [[adr-006-phase2-estimation]]; read it together with this page
 before touching anything in the sync/estimation area.
+
+## COP-134 evidence review
+
+[The COP-134 report](../../docs/analysis/COP-134-fading-regressions.md) keeps both
+fading gaps open and supplies a controlled diagnosis plan with an unfiled follow-up
+draft. QPSK sensitivity remains a hypothesis. The fixed CFO failure and later
+level-2/session experiments do not establish a cause or remedy for these gaps.
