@@ -13,6 +13,8 @@
 //! audio device, and on a machine without one the transmission ends at once,
 //! leaving no "mid-transmission" moment to stop the daemon in (the same
 //! reason `tests/cli.rs` skips its running-daemon tests there).
+// COP-142: the std-clock ban in clippy.toml targets event_loop only.
+#![allow(clippy::disallowed_methods)]
 #![cfg(all(unix, not(feature = "cpal-backend")))]
 
 use std::fs::File;

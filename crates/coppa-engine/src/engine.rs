@@ -331,6 +331,20 @@ impl CoppaCore {
         self.encode_bytes_at(data, self.config.speed_level, codewords)
     }
 
+    /// Encode a Data frame without applying compression, using 1..=8 codewords.
+    ///
+    /// A compression-enabled receiver decompresses payloads starting with `0xFE`.
+    /// Callers must frame their payload so its first byte cannot equal that marker.
+    /// The daemon's Datagram MAC header starts with `0x19` and provides this framing.
+    pub fn encode_uncompressed_with_codewords(
+        &self,
+        data: &[u8],
+        codewords: u8,
+    ) -> Result<Vec<f32>, EngineError> {
+        Self::check_codewords(codewords)?;
+        self.encode_payload_at(data, self.config.speed_level, codewords)
+    }
+
     /// COP-69: shared codeword-count validation for the codeword-aware
     /// encode twins (COP-19 surface: `Err`, never a panic).
     fn check_codewords(codewords: u8) -> Result<(), EngineError> {
@@ -419,7 +433,16 @@ impl CoppaCore {
         codewords: u8,
     ) -> Result<Vec<f32>, EngineError> {
         let payload = self.compress_payload(data);
+        self.encode_payload_at(&payload, level, codewords)
+    }
 
+    /// Build and transmit a Data frame from an already prepared payload.
+    fn encode_payload_at(
+        &self,
+        payload: &[u8],
+        level: u8,
+        codewords: u8,
+    ) -> Result<Vec<f32>, EngineError> {
         if payload.len() > u16::MAX as usize {
             return Err(EngineError::PayloadTooLarge {
                 len: payload.len(),
@@ -439,7 +462,7 @@ impl CoppaCore {
             codewords,
         };
 
-        let samples = self.transceiver.transmit(&header, &payload)?;
+        let samples = self.transceiver.transmit(&header, payload)?;
         Ok(samples)
     }
 
@@ -814,6 +837,62 @@ impl Default for CoppaCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn datagram_test_payload() -> Vec<u8> {
+        let mut state = 0x1380_abcd_u32;
+        let mut payload: Vec<u8> = (0..514)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        payload[0] = 0x19;
+        payload
+    }
+
+    #[test]
+    fn uncompressed_multi_codeword_encode_round_trips_on_a_compressing_engine() {
+        let core = CoppaCore::from_profile(&crate::profiles::HF_STANDARD);
+        let payload = datagram_test_payload();
+        let audio = core
+            .encode_uncompressed_with_codewords(&payload, 5)
+            .unwrap();
+        assert_eq!(core.decode_bytes(&audio).unwrap(), payload);
+    }
+
+    #[test]
+    fn uncompressed_encode_fits_where_the_compressed_path_does_not() {
+        let core = CoppaCore::from_profile(&crate::profiles::HF_STANDARD);
+        let payload = datagram_test_payload();
+        assert!(core.encoded_payload_len(&payload) > 585);
+        assert!(core.encode_uncompressed_with_codewords(&payload, 5).is_ok());
+    }
+
+    #[test]
+    fn uncompressed_encode_rejects_bad_codeword_counts() {
+        let core = CoppaCore::from_profile(&crate::profiles::HF_STANDARD);
+        assert!(matches!(
+            core.encode_uncompressed_with_codewords(b"x", 0),
+            Err(EngineError::ZeroCodewords)
+        ));
+        assert!(matches!(
+            core.encode_uncompressed_with_codewords(b"x", 9),
+            Err(EngineError::TooManyCodewords {
+                requested: 9,
+                max: 8
+            })
+        ));
+    }
+
+    #[test]
+    fn uncompressed_encode_rejects_a_payload_over_the_budget() {
+        let core = CoppaCore::from_profile(&crate::profiles::HF_STANDARD);
+        assert!(core
+            .encode_uncompressed_with_codewords(&vec![0x19; 937], 8)
+            .is_err());
+    }
 
     #[test]
     fn debug_output_is_short_and_names_the_config() {

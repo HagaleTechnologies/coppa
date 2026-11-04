@@ -7,6 +7,8 @@
 
 // Diagnostics go through `tracing`, never straight to stdout/stderr.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+// COP-142: the std-clock ban targets event_loop production code only.
+#![allow(clippy::disallowed_methods)]
 
 #[cfg(feature = "ardop")]
 pub mod ardop_wiring;
@@ -14,6 +16,8 @@ pub mod audio_output;
 pub mod build_info;
 pub mod config;
 pub mod event_loop;
+#[cfg(feature = "kiss-tnc")]
+pub mod kiss_wiring;
 pub mod level_meter;
 pub mod logging;
 pub mod mdns;

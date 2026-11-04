@@ -2,6 +2,9 @@
 //!
 //! Uses `tokio::select!` to multiplex audio, host, and radio events.
 
+// COP-142: production code reads time only through clock_now().
+#![deny(clippy::disallowed_methods)]
+
 use anyhow::Result;
 use coppa_audio::{AudioRingConsumer, AudioRingProducer};
 use coppa_engine::{CoppaCore, OfdmBand};
@@ -41,6 +44,16 @@ use coppa_host::ardop::{
     queue_response as queue_ardop_response, ArdopCommand, ArdopResponse, Queued as ArdopQueued,
     COMMAND_QUEUE_DEPTH as ARDOP_COMMAND_QUEUE_DEPTH,
 };
+
+/// The daemon's one clock for everything it hands `coppa-protocol` as `now`
+/// (ARQ retransmit timers, session keepalive, handshake and session timeouts,
+/// CP negotiation, beacon and station-ID gates). It is tokio's clock, so a
+/// `start_paused` test moves these timers with virtual time instead of with
+/// the real time its compute burns (COP-142). Outside a paused test tokio's
+/// clock is the std clock, so production timing is unchanged.
+fn clock_now() -> Instant {
+    tokio::time::Instant::now().into_std()
+}
 
 /// Map of connected VARA command-port clients' response senders
 /// (`VaraServer::response_senders()`), used to broadcast `VaraResponse` telemetry.
@@ -95,8 +108,27 @@ const VARA_KEEPALIVE_PERIOD: Duration = Duration::from_secs(60);
 /// in `transmit_samples` panicked before reporting.
 const PTT_BACKSTOP_GRACE: Duration = Duration::from_secs(2);
 
-/// COP-37: what every transmit path logs, at `ERROR`, when it refuses
-/// because no valid local callsign is in force (`local_callsign` is `None`).
+const KISS_DATAGRAM_QUEUE_DEPTH: usize = 8;
+
+/// Largest datagram that fits a single frame, after the MAC header.
+pub fn max_kiss_datagram_len(level: u8) -> usize {
+    if !(1..=8).contains(&level) {
+        return 0;
+    }
+    max_multi_payload_for_level(level, MAX_CODEWORDS)
+        .unwrap_or(0)
+        .saturating_sub(MacPdu::HEADER_SIZE)
+}
+
+fn kiss_datagram_codewords(len: usize, level: u8) -> Option<u8> {
+    if !(1..=8).contains(&level) {
+        return None;
+    }
+    (1..=MAX_CODEWORDS)
+        .find(|&cw| max_multi_payload_for_level(level, cw).is_some_and(|budget| len <= budget))
+}
+
+/// COP-37: every TX path logs this refusal when no local callsign is valid.
 const NO_CALLSIGN_TX_REFUSAL: &str = "Transmission refused: no valid local callsign; \
      set [engine] callsign or MYCALL before transmitting";
 
@@ -555,6 +587,8 @@ enum SessionNotice {
 #[derive(Debug)]
 #[allow(dead_code)] // AudioIn/AudioOut wired in future AFSK TX/RX path
 pub enum DaemonEvent {
+    /// One KISS data frame from the OFDM host interface.
+    KissDatagram(Vec<u8>),
     /// Event from a host interface.
     Host(HostEvent),
     /// Audio samples received from input.
@@ -847,6 +881,10 @@ pub struct EventLoop {
     /// transmission -- see `transmit_samples`. Nothing ever sets it back to
     /// `None`, so a payload accepted for TX keeps its callsign.
     local_callsign: Option<Callsign>,
+    /// Bounded broadcast datagrams waiting for the transmitter.
+    kiss_datagrams: VecDeque<Vec<u8>>,
+    /// Fan-out exclusively to KISS clients, separate from host DataOut.
+    kiss_rx: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
     /// How often `run()` sends `IAMALIVE` to every command-port client;
     /// `VARA_KEEPALIVE_PERIOD` outside tests.
     vara_keepalive_period: Duration,
@@ -1105,6 +1143,8 @@ impl EventLoop {
             ardop_responses: None,
             #[cfg(feature = "ardop")]
             ardop_clients: HashMap::new(),
+            kiss_datagrams: VecDeque::new(),
+            kiss_rx: None,
             tx_queue: VecDeque::new(),
             session_link: None,
             pending_disconnect: None,
@@ -1123,14 +1163,14 @@ impl EventLoop {
             max_frames_per_turn: 4,
             rx_turnaround_until: None,
             last_id_time: None,
-            last_beacon_time: Instant::now(),
+            last_beacon_time: clock_now(),
             pending_busy_wait_audio: Vec::new(),
             #[cfg(feature = "websocket")]
             spectrum_sensor,
             #[cfg(feature = "websocket")]
             spectrum_buffer: Vec::new(),
             #[cfg(feature = "websocket")]
-            last_spectrum_broadcast: Instant::now(),
+            last_spectrum_broadcast: clock_now(),
         })
     }
 
@@ -1640,7 +1680,11 @@ impl EventLoop {
             snap.mycall = self.local_callsign.as_ref().map(|c| c.to_string());
             snap.max_tx_s = Some(max_tx_s);
             snap.max_tune_s = Some(max_tune_seconds(max_tx_s) as u64);
-            snap.loop_heartbeat = Some(Instant::now());
+            // WsStatus::reply ages this with std `elapsed()`, so it must
+            // stay a real std instant.
+            #[allow(clippy::disallowed_methods)]
+            let heartbeat = Instant::now();
+            snap.loop_heartbeat = Some(heartbeat);
             snap.ptt.get_or_insert(self.is_transmitting);
             snap.busy.get_or_insert(self.busy_gate.current());
             snap.buffer.get_or_insert(self.last_reported_buffer as u64);
@@ -1666,7 +1710,11 @@ impl EventLoop {
         if let Some(ref status) = self.ws_status {
             let mut snap = status.lock().await;
             snap.waiting_for_clear_channel = Some(waiting);
-            snap.loop_heartbeat = Some(Instant::now());
+            // WsStatus::reply ages this with std `elapsed()`, so it must
+            // stay a real std instant.
+            #[allow(clippy::disallowed_methods)]
+            let heartbeat = Instant::now();
+            snap.loop_heartbeat = Some(heartbeat);
         }
     }
 
@@ -1750,13 +1798,12 @@ impl EventLoop {
     #[cfg(feature = "websocket")]
     fn ws_decode_failure(&mut self) {
         self.ws_decode_fail_count = self.ws_decode_fail_count.saturating_add(1);
-        if self
-            .ws_last_decode_fail
-            .is_some_and(|last| last.elapsed() < Duration::from_millis(500))
-        {
+        if self.ws_last_decode_fail.is_some_and(|last| {
+            clock_now().saturating_duration_since(last) < Duration::from_millis(500)
+        }) {
             return;
         }
-        self.ws_last_decode_fail = Some(Instant::now());
+        self.ws_last_decode_fail = Some(clock_now());
         if let Some(tx) = &self.ws_broadcast {
             let msg = coppa_host::websocket::WsServerMessage::DecodeFail {
                 count: self.ws_decode_fail_count,
@@ -1846,6 +1893,9 @@ impl EventLoop {
                     VaraResponse::Ptt(state) => {
                         snap.ptt = Some(*state);
                         if *state {
+                            // WsStatus::reply ages this with std
+                            // `elapsed()`, so it must stay a real std instant.
+                            #[allow(clippy::disallowed_methods)]
                             snap.ptt_since.get_or_insert_with(Instant::now);
                         } else {
                             snap.ptt_since = None;
@@ -2089,12 +2139,40 @@ impl EventLoop {
         }
     }
 
+    /// Send a keepalive for every active session that has been idle for its
+    /// keepalive interval (the 5 s session_cleanup arm of run()).
+    async fn send_due_keepalives(&mut self) {
+        let active = self.session_mgr.active_sessions();
+        for id in active {
+            // Read the clock per session: `transmit_samples` below
+            // can wait seconds for a clear channel and PTT.
+            let now = clock_now();
+            let needs = self
+                .session_mgr
+                .get(id)
+                .map(|s| s.needs_keepalive(now))
+                .unwrap_or(false);
+            if needs {
+                if let Some(session) = self.session_mgr.get_mut(id) {
+                    if let Ok(ka_pdu) = session.keepalive(now) {
+                        let ka_bytes = ka_pdu.to_bytes();
+                        if let Ok(samples) = self.engine.encode_bytes(&ka_bytes) {
+                            // COP-46: `tools/pat-loop` counts these.
+                            tracing::info!(session = id, "Sending session KEEPALIVE");
+                            self.transmit_samples(&samples).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     async fn reap_timed_out_sessions(&mut self) {
         // `cleanup_timed_out` returns only IDs, so note which sessions were
         // pending inbound handshakes first (COP-44: those end in
         // CANCELPENDING, not DISCONNECTED).
         let pending = self.accepting_sessions();
-        let removed = self.session_mgr.cleanup_timed_out(Instant::now());
+        let removed = self.session_mgr.cleanup_timed_out(clock_now());
         for id in removed {
             // COP-43: a drain that keyed nothing for `disconnect_timeout`
             // ends the way a drained one does, minus the unsent chunks.
@@ -2142,6 +2220,126 @@ impl EventLoop {
         }
         if self.session_tx_held_by_frequency_gate {
             self.drain_session_link().await;
+        }
+        self.try_drain_kiss_datagrams().await;
+    }
+
+    /// Connect received datagrams to the KISS server's client fan-out.
+    #[cfg_attr(not(feature = "kiss-tnc"), allow(dead_code))] // Binary copy has no KISS wiring without the feature.
+    pub fn set_kiss_rx(&mut self, tx: tokio::sync::broadcast::Sender<Vec<u8>>) {
+        self.kiss_rx = Some(tx);
+    }
+
+    /// Current transmit speed level, for host interface reporting.
+    #[cfg_attr(not(feature = "kiss-tnc"), allow(dead_code))] // Used by optional KISS startup reporting.
+    pub fn speed_level(&self) -> u8 {
+        self.engine.speed_level()
+    }
+
+    async fn handle_kiss_datagram(&mut self, data: Vec<u8>) {
+        if data.is_empty() {
+            tracing::debug!("Empty KISS datagram ignored");
+            return;
+        }
+        if let Some(remote) = self.active_session_remote() {
+            tracing::warn!(bytes = data.len(), %remote, "KISS datagram refused while a session is active; dropped");
+            return;
+        }
+        if self.local_callsign.is_none() {
+            tracing::error!(bytes = data.len(), "{NO_CALLSIGN_TX_REFUSAL}");
+            return;
+        }
+        let level = self.engine.speed_level();
+        let max_bytes = max_kiss_datagram_len(level);
+        if data.len() > max_bytes {
+            tracing::warn!(
+                bytes = data.len(),
+                max_bytes,
+                level,
+                "KISS datagram does not fit one frame at this speed level; dropped"
+            );
+            return;
+        }
+        if self.kiss_datagrams.len() == KISS_DATAGRAM_QUEUE_DEPTH {
+            tracing::warn!(
+                bytes = data.len(),
+                queued = self.kiss_datagrams.len(),
+                "KISS datagram queue full; newest datagram dropped"
+            );
+            return;
+        }
+        self.kiss_datagrams.push_back(data);
+        self.try_drain_kiss_datagrams().await;
+    }
+
+    async fn try_drain_kiss_datagrams(&mut self) {
+        if self.kiss_datagrams.is_empty() {
+            return;
+        }
+        // Clear even while keyed so no stale datagrams survive a short session.
+        if self.active_session_remote().is_some() {
+            tracing::warn!(
+                count = self.kiss_datagrams.len(),
+                bytes = self.kiss_datagrams.iter().map(Vec::len).sum::<usize>(),
+                "KISS datagrams discarded: a session started"
+            );
+            self.kiss_datagrams.clear();
+            return;
+        }
+        if self.is_transmitting {
+            return;
+        }
+        self.keep_level_derived_engine_hf_legal(self.engine.speed_level());
+        if self.wideband_frequency_check().is_err() {
+            return;
+        }
+        let Some(local) = self.local_callsign.clone() else {
+            self.kiss_datagrams.clear();
+            tracing::error!("{NO_CALLSIGN_TX_REFUSAL}");
+            return;
+        };
+        let payload = self.kiss_datagrams.pop_front().expect("queue checked");
+        let bytes = payload.len();
+        let pdu = MacPdu::new(
+            MacFrameType::Datagram,
+            Callsign::broadcast(),
+            local,
+            0,
+            payload,
+        )
+        .to_bytes();
+        let level = self.engine.speed_level();
+        let Some(codewords) = kiss_datagram_codewords(pdu.len(), level) else {
+            tracing::warn!(bytes, level, "Queued KISS datagram no longer fits; dropped");
+            return;
+        };
+        match self
+            .engine
+            .encode_uncompressed_with_codewords(&pdu, codewords)
+        {
+            Ok(samples) => {
+                tracing::info!(bytes, level, codewords, "Sending KISS datagram");
+                // PTT release drains this queue again through transmit_samples.
+                Box::pin(self.transmit_samples(&samples)).await;
+            }
+            Err(error) => tracing::warn!(%error, bytes, "KISS datagram encode failed; dropped"),
+        }
+    }
+
+    fn handle_kiss_datagram_rx(&self, pdu: MacPdu) {
+        if pdu.dest != Callsign::broadcast() {
+            tracing::debug!("Named-destination KISS datagram dropped");
+            return;
+        }
+        let Some(tx) = &self.kiss_rx else {
+            tracing::debug!("KISS datagram dropped: interface disabled");
+            return;
+        };
+        let bytes = pdu.payload.len();
+        let from = pdu.src;
+        match tx.send(pdu.payload) {
+            Ok(clients) => tracing::info!(%from, bytes, clients, "KISS datagram received"),
+            Err(_) => tracing::debug!(%from, bytes, "KISS datagram dropped: no clients"),
         }
     }
 
@@ -2435,7 +2633,7 @@ impl EventLoop {
             // COP-69: remember the count the segment went out with, so a
             // retransmission re-encodes byte-identically at the same count.
             link.tx_codewords = codewords;
-            match link.tx.send(chunk, Instant::now()) {
+            match link.tx.send(chunk, clock_now()) {
                 Ok(sent) => debug_assert_eq!(sent, seq),
                 // Unreachable: `can_send` was checked before transmitting.
                 Err(e) => tracing::error!(error = %e, seq, "Session ARQ window full"),
@@ -2455,7 +2653,7 @@ impl EventLoop {
             .map(|l| l.session_id)
             .and_then(|id| self.session_mgr.get_mut(id))
         {
-            session.touch(Instant::now());
+            session.touch(clock_now());
         }
         tracing::debug!(
             seq,
@@ -2564,7 +2762,7 @@ impl EventLoop {
             rx: ArqRx::new(SESSION_ARQ_WINDOW),
             backlog: VecDeque::new(),
             fallback: None,
-            last_peer_evidence: Instant::now(),
+            last_peer_evidence: clock_now(),
             warned_legacy_payload: false,
             tx_codewords: 1,
         });
@@ -2617,7 +2815,7 @@ impl EventLoop {
     /// `SESSION_FALLBACK_NO_EVIDENCE` (default 180 s) with zero peer
     /// evidence tears the session down (`fail_session_link`).
     async fn check_session_retransmits(&mut self) {
-        let now = Instant::now();
+        let now = clock_now();
         let Some(link) = self.session_link.as_ref() else {
             return;
         };
@@ -2720,7 +2918,7 @@ impl EventLoop {
             // (COP-1 (d)): a budget only successful sends advance can never
             // run out.
             if let Some(link) = self.session_link.as_mut() {
-                let _ = link.tx.mark_retransmitted(seq, Instant::now());
+                let _ = link.tx.mark_retransmitted(seq, clock_now());
                 if link.tx.is_failed(seq) && link.fallback.is_none() {
                     // COP-68: first exhaustion enters the fade hold. The
                     // fittest level is computed over the segment's rebuilt
@@ -2804,7 +3002,7 @@ impl EventLoop {
         let was_pending = self.is_accepting(session_id);
         self.discard_session_tx(session_id).await;
         if let Some(session) = self.session_mgr.get_mut(session_id) {
-            match session.disconnect(Instant::now()) {
+            match session.disconnect(clock_now()) {
                 Ok(disc_pdu) => {
                     let pdu_bytes = disc_pdu.to_bytes();
                     match self.engine.encode_bytes(&pdu_bytes) {
@@ -3130,7 +3328,7 @@ impl EventLoop {
     fn touch_draining_session(&mut self, session_id: u8) {
         if let Some(session) = self.session_mgr.get_mut(session_id) {
             if session.state == SessionState::Disconnecting {
-                session.touch(Instant::now());
+                session.touch(clock_now());
             }
         }
     }
@@ -3168,7 +3366,7 @@ impl EventLoop {
                 .arq_tx
                 .as_mut()
                 .expect("can_send checked above")
-                .send(chunk.clone(), Instant::now())
+                .send(chunk.clone(), clock_now())
             {
                 Ok(seq) => {
                     let pdu =
@@ -3210,6 +3408,9 @@ impl EventLoop {
                 // E5: Signal audio threads to stop
                 self.shutdown_flag.store(true, Ordering::Release);
                 self.running = false;
+            }
+            Some(DaemonEvent::KissDatagram(data)) => {
+                self.handle_kiss_datagram(data).await;
             }
             Some(DaemonEvent::Host(host_event)) => {
                 self.handle_host_event(host_event).await;
@@ -3314,26 +3515,7 @@ impl EventLoop {
                 }
                 _ = session_cleanup.tick() => {
                     self.reap_timed_out_sessions().await;
-                    // Send keepalives for active sessions
-                    let active = self.session_mgr.active_sessions();
-                    for id in active {
-                        // Read the clock per session: `transmit_samples` below
-                        // can wait seconds for a clear channel and PTT.
-                        let now = Instant::now();
-                        let needs = self.session_mgr.get(id).map(|s| s.needs_keepalive(now)).unwrap_or(false);
-                        if needs {
-                            if let Some(session) = self.session_mgr.get_mut(id) {
-                                if let Ok(ka_pdu) = session.keepalive(now) {
-                                    let ka_bytes = ka_pdu.to_bytes();
-                                    if let Ok(samples) = self.engine.encode_bytes(&ka_bytes) {
-                                        // COP-46: `tools/pat-loop` counts these.
-                                        tracing::info!(session = id, "Sending session KEEPALIVE");
-                                        self.transmit_samples(&samples).await;
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    self.send_due_keepalives().await;
                 }
             }
         }
@@ -3729,7 +3911,7 @@ impl EventLoop {
                     self.ardop_clients.entry(client_id).or_default().refused = false;
                 }
                 let caps = local_link_caps();
-                let now = Instant::now();
+                let now = clock_now();
                 match self.session_mgr.create(local, remote.clone(), 0, caps, now) {
                     Ok(id) => {
                         if let Some(session) = self.session_mgr.get_mut(id) {
@@ -3818,7 +4000,7 @@ impl EventLoop {
                     let disconnect = self
                         .session_mgr
                         .get_mut(id)
-                        .map(|s| s.disconnect(Instant::now()));
+                        .map(|s| s.disconnect(clock_now()));
                     match disconnect {
                         Some(Ok(disc_pdu)) => {
                             // COP-43: VARA's `DISCONNECT` disconnects "once
@@ -4022,7 +4204,7 @@ impl EventLoop {
                     return;
                 }
                 if let Some(samples) = self.encode_id_beacon_frame() {
-                    let id_before = self.last_id_time.replace(Instant::now());
+                    let id_before = self.last_id_time.replace(clock_now());
                     let generation = self.tx_generation;
                     self.transmit_samples(&samples).await;
                     if self.tx_generation == generation {
@@ -4258,10 +4440,10 @@ impl EventLoop {
         }
 
         let period = Duration::from_secs_f64(1.0 / crate::spectrum::SPECTRUM_UPDATE_HZ);
-        if self.last_spectrum_broadcast.elapsed() < period {
+        if clock_now().saturating_duration_since(self.last_spectrum_broadcast) < period {
             return;
         }
-        self.last_spectrum_broadcast = Instant::now();
+        self.last_spectrum_broadcast = clock_now();
 
         let (freq_low_hz, freq_high_hz) = self.engine.occupied_band_edges_hz();
         let bins = crate::spectrum::compute_spectrum_bins(
@@ -4389,7 +4571,7 @@ impl EventLoop {
                                     CpRecommendation::LongCp => CpMode::LongCp,
                                 };
                                 let payload = CpNegotiator::propose_payload(mode);
-                                let now = Instant::now();
+                                let now = clock_now();
                                 match self.cp_control_arq_tx.send(payload.clone(), now) {
                                     Ok(seq) => {
                                         // COP-1 G1: remember the seq so
@@ -4526,7 +4708,7 @@ impl EventLoop {
                                                 let newly_acked = arq_tx.process_ack(
                                                     pdu.ack_num,
                                                     pdu.ack_bitmap,
-                                                    Instant::now(),
+                                                    clock_now(),
                                                 );
                                                 self.resolve_probe_if_acked(&newly_acked);
                                             }
@@ -4568,7 +4750,7 @@ impl EventLoop {
                                             let newly_acked = arq_tx.process_ack(
                                                 pdu.ack_num,
                                                 pdu.ack_bitmap,
-                                                Instant::now(),
+                                                clock_now(),
                                             );
                                             probe_resolved =
                                                 self.resolve_probe_if_acked(&newly_acked);
@@ -4984,7 +5166,7 @@ impl EventLoop {
         let samples: &[f32] = if self.id_due() {
             match self.encode_id_beacon_frame() {
                 Some(id_samples) => {
-                    self.last_id_time = Some(Instant::now());
+                    self.last_id_time = Some(clock_now());
                     let mut buf = id_samples;
                     buf.extend_from_slice(samples);
                     combined = buf;
@@ -5065,6 +5247,9 @@ impl EventLoop {
                     false
                 }
                 Some(feedback) => {
+                    // wait_for_playout adds tokio elapsed time to this base itself,
+                    // so it must stay a real std instant.
+                    #[allow(clippy::disallowed_methods)]
                     let watch = PlayoutWatch::new(target, Instant::now(), Some(max_tx));
                     let interval = IntervalProgress {
                         clock: &stall_clock,
@@ -5287,8 +5472,9 @@ impl EventLoop {
         if interval == 0 {
             return false;
         }
-        self.last_id_time
-            .is_none_or(|t| t.elapsed() >= Duration::from_secs(interval))
+        self.last_id_time.is_none_or(|t| {
+            clock_now().saturating_duration_since(t) >= Duration::from_secs(interval)
+        })
     }
 
     /// Build the `Beacon`-type `MacPdu` carrying this station's
@@ -5360,17 +5546,19 @@ impl EventLoop {
         if interval == 0 || self.local_callsign.is_none() {
             return;
         }
-        if self.last_beacon_time.elapsed() < Duration::from_secs(interval) {
+        if clock_now().saturating_duration_since(self.last_beacon_time)
+            < Duration::from_secs(interval)
+        {
             return;
         }
         if self.busy_gate.current() {
             return;
         }
         if let Some(samples) = self.encode_id_beacon_frame() {
-            self.last_beacon_time = Instant::now();
+            self.last_beacon_time = clock_now();
             // A beacon already fully identifies the station; avoid also
             // prepending a redundant separate ID frame to it.
-            let id_before = self.last_id_time.replace(Instant::now());
+            let id_before = self.last_id_time.replace(clock_now());
             let generation = self.tx_generation;
             self.transmit_samples(&samples).await;
             if self.tx_generation == generation {
@@ -5420,7 +5608,7 @@ impl EventLoop {
         if !self.config.engine.arq_enabled {
             return;
         }
-        let now = Instant::now();
+        let now = clock_now();
         // Collect retransmit data first to avoid borrow conflict. Sequence
         // numbers are threaded alongside the encoded PDU bytes so the second
         // loop (after the `arq_tx` borrow ends) can call
@@ -5503,7 +5691,7 @@ impl EventLoop {
                     // would understate `last_sent` and make the next RTO
                     // check fire early.
                     if let Some(ref mut arq_tx) = self.arq_tx {
-                        if let Err(e) = arq_tx.mark_retransmitted(seq, Instant::now()) {
+                        if let Err(e) = arq_tx.mark_retransmitted(seq, clock_now()) {
                             tracing::warn!(
                                 seq,
                                 error = %e,
@@ -5522,7 +5710,7 @@ impl EventLoop {
         // arq_tx block above, using the entirely separate cp_control_arq_tx/
         // cp_control_arq_rx pair (own sequence space, own small window).
         if self.config.engine.cp_negotiation_enabled {
-            let now = Instant::now();
+            let now = clock_now();
             let cp_retransmit_seqs = self.cp_control_arq_tx.get_retransmits(now);
             let mut cp_retransmit_pdus: Vec<(u8, Vec<u8>)> = Vec::new();
             if !cp_retransmit_seqs.is_empty() {
@@ -5562,10 +5750,7 @@ impl EventLoop {
                 // data `arq_tx` loop above keeps its encode-gated counting,
                 // where a frozen budget means retrying forever rather than
                 // wedging a two-slot control channel.
-                if let Err(e) = self
-                    .cp_control_arq_tx
-                    .mark_retransmitted(seq, Instant::now())
-                {
+                if let Err(e) = self.cp_control_arq_tx.mark_retransmitted(seq, clock_now()) {
                     tracing::warn!(
                         seq,
                         error = %e,
@@ -5580,7 +5765,7 @@ impl EventLoop {
         // segment gets its full retransmit budget spent this tick before
         // `is_failed` is consulted. Returns immediately when
         // `cp_negotiation_enabled` is false (the default).
-        self.drive_cp_negotiation(Instant::now());
+        self.drive_cp_negotiation(clock_now());
         // COP-2 review finding: publish the desync counter here too, not only on
         // the next successful decode -- see `publish_desync_episodes`'s doc.
         self.publish_desync_episodes().await;
@@ -5618,7 +5803,7 @@ impl EventLoop {
             return;
         }
 
-        let now = Instant::now();
+        let now = clock_now();
         let newly_acked = self
             .cp_control_arq_tx
             .process_ack(pdu.ack_num, pdu.ack_bitmap, now);
@@ -6196,7 +6381,7 @@ impl EventLoop {
         let Some(link) = self.session_link.as_mut() else {
             return;
         };
-        link.last_peer_evidence = Instant::now();
+        link.last_peer_evidence = clock_now();
         if link.fallback.is_some() && link.tx.in_flight() > 0 {
             let seq = link.tx.send_base();
             if let Some(count) = link.tx.transmit_count(seq) {
@@ -6228,6 +6413,7 @@ impl EventLoop {
             MacFrameType::Ack => self.handle_session_ack(pdu).await,
             MacFrameType::Keepalive => self.handle_keepalive_rx(pdu),
             MacFrameType::Beacon => self.handle_beacon_rx(pdu),
+            MacFrameType::Datagram => self.handle_kiss_datagram_rx(pdu),
             _ => {
                 tracing::debug!(frame_type = ?pdu.frame_type, "Unhandled MAC frame type");
             }
@@ -6311,7 +6497,7 @@ impl EventLoop {
 
         let remote = pdu.src.clone();
         let caps = local_link_caps();
-        let now = Instant::now();
+        let now = clock_now();
         match self
             .session_mgr
             .create(local, remote.clone(), pdu.ssid, caps, now)
@@ -6363,7 +6549,7 @@ impl EventLoop {
         let remote = pdu.src.clone();
         let session_id = self.session_id_for_frame(&pdu);
         if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
-            match session.handle_connect_ack(&pdu.payload, Instant::now()) {
+            match session.handle_connect_ack(&pdu.payload, clock_now()) {
                 Ok(cfm_pdu) => {
                     let notice = SessionNotice::Connected {
                         local: session.local.clone(),
@@ -6395,7 +6581,7 @@ impl EventLoop {
         let remote = pdu.src.clone();
         let session_id = self.session_id_for_frame(&pdu);
         if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
-            match session.handle_connect_cfm(&pdu.payload, Instant::now()) {
+            match session.handle_connect_cfm(&pdu.payload, clock_now()) {
                 Ok(()) => {
                     session.confirm_established();
                     tracing::info!(remote = %remote, "Session fully established (responder)");
@@ -6511,7 +6697,7 @@ impl EventLoop {
             return;
         }
         self.tx_frame_count = 0; // Our turn to transmit starts fresh
-        session.touch(Instant::now());
+        session.touch(clock_now());
         let session_id = session.id;
         self.ensure_session_link(session_id);
         let Some(link) = self.session_link.as_mut() else {
@@ -6564,7 +6750,7 @@ impl EventLoop {
         if !session.is_established() && !draining {
             return;
         }
-        session.touch(Instant::now());
+        session.touch(clock_now());
         let session_id = session.id;
         let Ok(ack) = TransportPdu::from_bytes(&pdu.payload) else {
             return;
@@ -6594,7 +6780,7 @@ impl EventLoop {
         }
         let acked = link
             .tx
-            .process_ack(ack.ack_num, ack.ack_bitmap, Instant::now());
+            .process_ack(ack.ack_num, ack.ack_bitmap, clock_now());
         if link.tx.in_flight() == 0 {
             // COP-68: an ACK that empties the window ends any fade hold and
             // restores the standard budget, so the next fade starts from 5
@@ -6617,7 +6803,7 @@ impl EventLoop {
     fn handle_keepalive_rx(&mut self, pdu: MacPdu) {
         let session_id = self.session_id_for_frame(&pdu);
         if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
-            session.touch(Instant::now());
+            session.touch(clock_now());
         }
     }
 
@@ -6629,6 +6815,7 @@ impl EventLoop {
             // sends only once its in-flight frame is ACKed, so this release
             // only resumes a frame a busy transmitter held back.
             self.try_drain_tx_queue().await;
+            self.try_drain_kiss_datagrams().await;
             self.drain_session_link().await;
             self.finish_drained_disconnect().await;
         }
@@ -6692,6 +6879,8 @@ impl EventLoop {
 }
 
 #[cfg(test)]
+// COP-142: tests may seed std instants outside a paused runtime.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -8688,8 +8877,8 @@ mod tests {
         station.handle_mac_pdu(pdu).await;
     }
 
-    /// Sleep past `station`'s current session RTO (real time: ARQ timers are
-    /// `std::time::Instant`s).
+    /// Sleep past the session RTO in unpaused tests, where real sleep moves
+    /// tokio's clock. Paused tests use tokio::time::advance instead.
     fn sleep_past_session_rto(station: &EventLoop) {
         let rto = station
             .session_link
@@ -11017,9 +11206,7 @@ mod tests {
     /// `Instant`-gated periodic behavior (see `last_id_time`/`last_beacon_time`'s
     /// tests below, e.g. `event_loop.last_beacon_time = Instant::now() -
     /// Duration::from_secs(10)`): directly backdate the `Instant` field a
-    /// rate gate compares against, rather than `tokio::time::advance` (which
-    /// only affects `tokio::time::Instant`, not the `std::time::Instant`
-    /// these fields actually use, so it wouldn't do anything here).
+    /// rate gate compares against. Paused tests can instead advance tokio time.
     #[cfg(feature = "websocket")]
     #[tokio::test]
     async fn test_spectrum_broadcast_is_128_bins_and_rate_limited() {
@@ -15290,12 +15477,10 @@ mod tests {
         /// arm, which had the identical `handle_audio_out`-bypasses-PTT bug.
         /// Seeds one `Established` session whose `last_activity` is already
         /// well past a (deliberately tiny) `keepalive_interval`, so the very
-        /// next `session_cleanup` tick (real 5s wall-clock interval; this
-        /// event loop's periodic gates all use `std::time::Instant`, not
-        /// mockable via `tokio::time::pause`, per this file's own established
-        /// convention -- see `test_spectrum_broadcast_is_128_bins_and_rate_limited`'s
-        /// doc) sends a keepalive, and confirms it too now produces a real PTT
-        /// bracket instead of silently writing to the audio-out ring.
+        /// next session_cleanup tick sends a keepalive, and confirms it
+        /// produces a real PTT bracket. For virtual-time coverage, see
+        /// cop142_session_clock. The keepalive must key the radio rather
+        /// than silently write to the audio-out ring.
         #[tokio::test]
         async fn test_session_keepalive_asserts_ptt() {
             let config = fast_ptt_config();
@@ -16078,6 +16263,38 @@ mod tests {
             let seq = link.tx.send(b"identical".to_vec(), Instant::now()).unwrap();
             let rebuilt = session_data_frame(&link, seq, link.tx.get_segment_data(seq).unwrap());
             assert_eq!(first, rebuilt);
+        }
+
+        /// COP-130: coppad's own session builders and capabilities emit the
+        /// bytes SPEC.md §21 freezes (P04-P07, P23). The protocol crate's
+        /// `tests/protocol_vectors.rs` restates these builders, so this pins
+        /// the daemon's real ones to the same literals.
+        #[test]
+        fn session_builders_emit_spec_21_vectors() {
+            let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+            // VK3ABC's link sends the data; W1AW's (callsigns swapped) ACKs it.
+            let caller = test_link();
+            let mut callee = test_link();
+            std::mem::swap(&mut callee.local, &mut callee.remote);
+            assert_eq!(
+                hex(&session_data_frame(&caller, 0, b"HELLO")),
+                "105dc05700000058b781083000000100000000000048454c4c4f"
+            );
+            callee.rx.receive(0, b"HELLO".to_vec());
+            assert_eq!(
+                hex(&session_ack_frame(&callee)),
+                "1158b7810830005dc0570000000002000100000000"
+            );
+            assert_eq!(
+                hex(&session_data_frame(&caller, 1, b"73")),
+                "105dc05700000058b78108300000010100000000003733"
+            );
+            callee.rx.receive(1, b"73".to_vec());
+            assert_eq!(
+                hex(&session_ack_frame(&callee)),
+                "1158b7810830005dc0570000000002000200000000"
+            );
+            assert_eq!(hex(&local_link_caps().to_bytes()), "00c80102080200");
         }
 
         fn test_link() -> SessionLink {
@@ -17639,8 +17856,8 @@ mod tests {
                 ))
                 .unwrap();
 
-            // ARQ timers are real `std::time::Instant`s.
-            std::thread::sleep(Duration::from_millis(30));
+            // ARQ timers run on tokio's clock.
+            tokio::time::advance(Duration::from_millis(30)).await;
             rig.event_loop.check_session_retransmits().await;
             assert!(rig.event_loop.is_transmitting, "the retransmission keys");
             rig.deliver(retransmission.len(), &[480, 1000]);
@@ -21281,8 +21498,8 @@ mod tests {
             // ACK itself.
             mark_identified(&mut a);
             mark_identified(&mut b);
-            // ARQ timers run on real `std::time::Instant`s with a 5 s initial
-            // RTO; a slow runner must not add a retransmit key-up mid-test.
+            // Keep a retransmit out of the ACK timing on virtual time.
+            // The default initial RTO is 5 s.
             a.arq_tx = Some(
                 ArqTx::new(ArqConfig {
                     initial_rto: Duration::from_secs(60),
@@ -21945,6 +22162,80 @@ mod tests {
 
             assert!(drain(&mut a_rx).is_empty());
             assert_eq!(drain(&mut b_rx), vec![b"only b".to_vec()]);
+        }
+    }
+
+    /// COP-142: the session timers (retransmit, keepalive, handshake) read
+    /// tokio's clock, so a paused-clock test sees them fire on virtual time
+    /// and never on real compute time.
+    mod cop142_session_clock {
+        use super::*;
+
+        fn drain(consumer: &mut coppa_audio::AudioRingConsumer) -> usize {
+            let mut buf = vec![0.0f32; 1_000_000];
+            consumer.read(&mut buf)
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn session_retransmit_fires_on_virtual_time() {
+            let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+            a.handle_host_event(HostEvent::DataReceived {
+                client_id: 1,
+                data: b"lost on the air".to_vec(),
+            })
+            .await;
+            take_leg(&mut a_consumer, "the data frame that is lost");
+            a.handle_ptt_change(false).await;
+            let rto = a.session_link.as_ref().unwrap().tx.rto();
+            tokio::time::advance(rto + Duration::from_millis(5)).await;
+            a.check_session_retransmits().await;
+            assert!(
+                drain(&mut a_consumer) > 0,
+                "virtual time past the {rto:?} RTO must key a retransmission"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn session_keepalive_fires_on_virtual_time() {
+            let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+            drain(&mut a_consumer);
+            tokio::time::advance(Duration::from_secs(
+                coppa_protocol::session::DEFAULT_KEEPALIVE_SECS + 1,
+            ))
+            .await;
+            a.send_due_keepalives().await;
+            assert!(
+                drain(&mut a_consumer) > 0,
+                "an idle session must key a keepalive after its virtual keepalive interval"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn session_handshake_times_out_on_virtual_time() {
+            let mut config = DaemonConfig::default();
+            config.engine.callsign = "VK3ABC".into();
+            config.radio.ptt_pre_delay_ms = 0;
+            config.radio.ptt_tail_delay_ms = 0;
+            let mut a = EventLoop::new(config).unwrap();
+            a.listening = true;
+            let (a_producer, _a_consumer) = coppa_audio::audio_ring(4_000_000);
+            a.set_audio_out(a_producer);
+            a.handle_host_event(HostEvent::ConnectRequest {
+                client_id: 1,
+                source: "VK3ABC".into(),
+                destination: "W1AW".into(),
+            })
+            .await;
+            assert_eq!(a.session_mgr.active_sessions().len(), 1, "a is dialing");
+            tokio::time::advance(Duration::from_secs(
+                coppa_protocol::session::HANDSHAKE_TIMEOUT_SECS + 1,
+            ))
+            .await;
+            a.reap_timed_out_sessions().await;
+            assert!(
+                a.session_mgr.active_sessions().is_empty(),
+                "an unanswered dial must be reaped after the virtual handshake timeout"
+            );
         }
     }
 
@@ -23282,5 +23573,178 @@ mod tests {
                 "a dial after teardown proceeds"
             );
         }
+    }
+    fn kiss_station() -> (EventLoop, coppa_audio::AudioRingConsumer) {
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = "N1CALL".into();
+        config.radio.ptt_pre_delay_ms = 0;
+        config.radio.ptt_tail_delay_ms = 0;
+        config.radio.turnaround_ms = 0;
+        let mut station = EventLoop::new(config).unwrap();
+        let (tx, rx) = coppa_audio::audio_ring(4_000_000);
+        station.set_audio_out(tx);
+        (station, rx)
+    }
+
+    #[test]
+    fn kiss_datagram_codewords_are_the_fewest_that_fit() {
+        assert_eq!(kiss_datagram_codewords(417, 2), Some(4));
+        assert_eq!(kiss_datagram_codewords(514, 2), Some(5));
+        assert_eq!(kiss_datagram_codewords(448, 1), Some(8));
+        assert_eq!(kiss_datagram_codewords(449, 1), None);
+    }
+
+    #[test]
+    fn max_kiss_datagram_len_matches_the_level_table() {
+        assert_eq!(
+            (1..=8).map(max_kiss_datagram_len).collect::<Vec<_>>(),
+            vec![434, 922, 922, 1410, 1250, 922, 1410, 1250]
+        );
+        assert_eq!(max_kiss_datagram_len(0), 0);
+        assert_eq!(max_kiss_datagram_len(10), 0);
+    }
+
+    #[tokio::test]
+    async fn kiss_datagram_crosses_as_one_uncompressed_mac_frame() {
+        let (mut a, mut audio) = kiss_station();
+        let (mut b, _) = kiss_station();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        b.set_kiss_rx(tx);
+        let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+        b.set_response_tx(response_tx);
+        let mut payload = vec![0; 403];
+        for (i, byte) in payload.iter_mut().enumerate().skip(2) {
+            *byte = (i % 256) as u8;
+        }
+        a.dispatch_event(Some(DaemonEvent::KissDatagram(payload.clone())))
+            .await;
+        let leg = take_leg(&mut audio, "datagram");
+        let mut decoder = CoppaCore::from_profile(&coppa_engine::profiles::HF_STANDARD);
+        let frames = decoder.push_samples(&leg);
+        let datagrams: Vec<_> = frames
+            .iter()
+            .filter(|f| f.payload.as_ref().is_ok_and(|p| p.first() == Some(&0x19)))
+            .collect();
+        assert_eq!(datagrams.len(), 1);
+        assert_eq!(datagrams[0].payload.as_ref().unwrap().len(), 417);
+        b.decode_and_dispatch_audio(&leg).await;
+        assert_eq!(rx.try_recv().unwrap(), payload);
+        assert!(rx.try_recv().is_err());
+        while let Ok(response) = response_rx.try_recv() {
+            assert!(!matches!(response, HostResponse::DataOut { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn received_kiss_datagram_reaches_kiss_clients_only() {
+        let (mut b, _) = kiss_station();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        b.set_kiss_rx(tx);
+        let (tx, mut responses) = mpsc::unbounded_channel();
+        b.set_response_tx(tx);
+        b.handle_mac_pdu(MacPdu::new(
+            MacFrameType::Datagram,
+            Callsign::broadcast(),
+            Callsign::new("W1AW").unwrap(),
+            0,
+            vec![0xc0, 0xdb],
+        ))
+        .await;
+        assert_eq!(rx.try_recv().unwrap(), vec![0xc0, 0xdb]);
+        assert!(responses.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn datagram_to_a_named_callsign_is_not_delivered() {
+        let (mut b, _) = kiss_station();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        b.set_kiss_rx(tx);
+        b.handle_mac_pdu(MacPdu::new(
+            MacFrameType::Datagram,
+            Callsign::new("W1AW").unwrap(),
+            Callsign::new("N0CALL").unwrap(),
+            0,
+            vec![1],
+        ))
+        .await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn received_kiss_datagram_with_kiss_off_is_dropped() {
+        let (mut b, _) = kiss_station();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        b.set_response_tx(tx);
+        b.handle_mac_pdu(MacPdu::new(
+            MacFrameType::Datagram,
+            Callsign::broadcast(),
+            Callsign::new("W1AW").unwrap(),
+            0,
+            vec![1],
+        ))
+        .await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn oversize_kiss_datagram_is_dropped_not_sent() {
+        let (mut a, mut audio) = kiss_station();
+        a.engine.set_speed_level(1).unwrap();
+        a.handle_kiss_datagram(vec![1; 435]).await;
+        assert!(a.kiss_datagrams.is_empty());
+        assert_eq!(audio.available(), 0);
+        a.handle_kiss_datagram(vec![1; 434]).await;
+        assert!(!take_leg(&mut audio, "maximum datagram").is_empty());
+    }
+
+    #[tokio::test]
+    async fn kiss_datagram_is_refused_while_a_session_is_active() {
+        let (mut a, _, audio, _) = connected_pair(0).await;
+        a.handle_kiss_datagram(vec![1; 403]).await;
+        assert!(a.kiss_datagrams.is_empty());
+        assert_eq!(audio.available(), 0);
+    }
+
+    #[tokio::test]
+    async fn queued_kiss_datagrams_are_discarded_when_a_session_starts() {
+        let (mut a, _, audio, _) = connected_pair(0).await;
+        a.kiss_datagrams.push_back(vec![1; 403]);
+        a.kiss_datagrams.push_back(vec![2; 403]);
+        a.try_drain_kiss_datagrams().await;
+        assert!(a.kiss_datagrams.is_empty());
+        assert_eq!(audio.available(), 0);
+    }
+
+    #[tokio::test]
+    async fn kiss_datagram_queue_keeps_the_oldest_eight() {
+        let (mut a, _) = kiss_station();
+        a.is_transmitting = true;
+        for i in 0..9 {
+            a.handle_kiss_datagram(vec![i]).await;
+        }
+        assert_eq!(
+            a.kiss_datagrams,
+            (0..8).map(|i| vec![i]).collect::<VecDeque<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn kiss_datagram_without_a_callsign_is_refused() {
+        let mut a = EventLoop::new(DaemonConfig::default()).unwrap();
+        a.handle_kiss_datagram(vec![1]).await;
+        assert!(a.kiss_datagrams.is_empty());
+        assert!(!a.is_transmitting);
+    }
+
+    #[tokio::test]
+    async fn queued_kiss_datagrams_drain_one_per_ptt_release() {
+        let (mut a, mut audio) = kiss_station();
+        a.handle_kiss_datagram(vec![1; 100]).await;
+        a.handle_kiss_datagram(vec![2; 100]).await;
+        assert_eq!(a.kiss_datagrams.len(), 1);
+        take_leg(&mut audio, "first datagram");
+        a.handle_ptt_change(false).await;
+        assert!(a.kiss_datagrams.is_empty());
+        take_leg(&mut audio, "second datagram");
     }
 }

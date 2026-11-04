@@ -1,0 +1,30 @@
+---
+id: tnc-direwolf-benchmark
+title: What will bite you when measuring coppa's TNC against Direwolf?
+kind: gotcha
+status: current
+maintainer: agent
+sources:
+  - tools/tnc-bench/run.sh
+  - crates/coppa-bench/src/afsk_direwolf.rs
+  - crates/coppa-codec/src/afsk.rs
+  - docs/testing/tnc-direwolf-wa8lmf.md
+verified:
+  commit: 2526b50
+  date: 2026-11-03
+links:
+  - overview
+---
+The method and the latest counts are in
+[tnc-direwolf-wa8lmf.md](../../docs/testing/tnc-direwolf-wa8lmf.md); how to run it is in
+[tools/tnc-bench/README.md](../../tools/tnc-bench/README.md).
+
+- The ISO's `02_100-Mic-E-Bursts-DE-emphasized.flac` is CD track 2, the traffic recording, not
+  the bursts. `run.sh` pins it by SHA-256.
+- `direwolf` and `atest` choose different default profiles on this file (`A+` and `A`) and
+  count differently (1000 and 982). The record uses `direwolf`.
+- coppa's demodulator is fixed at 48 kHz. A 44.1 kHz file fed in directly decodes nothing.
+- `atest` colours its output even into a pipe, and both programs print payload bytes that are
+  not UTF-8. Strip escapes, decode lossily, and count `[0] ` or `[0.N] ` lines only.
+- Coppa's count moves by up to 28 packets with the start offset. Compare changes against the
+  spread the report prints.
