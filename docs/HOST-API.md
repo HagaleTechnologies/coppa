@@ -359,15 +359,16 @@ VARA path does not use it. [TNC.md](TNC.md) covers building and running it.
 - Up to 256 bytes of information field.
 - Every client gets each decoded frame, unless it falls more than 64 frames behind: then it
   silently skips the oldest. Up to 16 clients.
-- A client that sends 64 KiB with no `FEND` is disconnected.
+- A client that sends more than 64 KiB with no `FEND` is disconnected.
 - No authentication. Keep it on loopback.
 
-**Known defects** (both in [LIMITATIONS.md](LIMITATIONS.md); not fixed):
+TCP read boundaries do not delimit KISS frames. A frame is forwarded only after its closing
+`FEND` arrives, including when an escape sequence spans reads (COP-148). Unfinished input at
+EOF is discarded. The pending-byte cap is 64 KiB, excluding the retained opening delimiter;
+exceeding it closes the connection.
 
-- **A frame split across two TCP reads is sent truncated.** The decoder treats the end of what
-  it has read as the end of a frame, so the first part is keyed on its own and the rest is
-  dropped. A short frame written in one `write` on loopback arrives whole; a client that writes
-  a frame in pieces can hit this. Write each frame in one call.
+**Known defect** (see [LIMITATIONS.md](LIMITATIONS.md)):
+
 - **Frames on a KISS port other than 0 are dropped**, even when they are data frames. A host
   that numbers its ports from 1 sends nothing.
 
