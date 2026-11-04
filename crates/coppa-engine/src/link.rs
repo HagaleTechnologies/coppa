@@ -181,7 +181,9 @@ pub enum LinkEvent {
         /// The peer's callsign.
         remote: String,
     },
-    /// The session with `remote` ended.
+    /// The session with `remote` ended. When this end sends a DISCONNECT
+    /// frame, the event comes only after `process` has returned that frame's
+    /// last sample, so a caller may stop processing as soon as it sees it.
     Disconnected {
         /// The peer's callsign.
         remote: String,
@@ -233,6 +235,10 @@ enum Phase {
     Connected,
     /// `disconnect` called; draining the backlog before DISCONNECT.
     Draining,
+    /// The session is over and its DISCONNECT frame is queued or still
+    /// being played; `closing` holds the `Disconnected` event until the
+    /// last sample has been returned by `process`.
+    Closing,
 }
 
 /// What a queued frame is, for the bookkeeping done when it is keyed.
@@ -273,6 +279,8 @@ pub struct Link {
     /// Delivered bytes not yet read by `recv`.
     received: VecDeque<u8>,
     events: VecDeque<LinkEvent>,
+    /// The `Disconnected` event held back while in [`Phase::Closing`].
+    closing: Option<LinkEvent>,
     /// Frames waiting for the channel, in key order.
     queue: VecDeque<QueuedFrame>,
     /// Samples of the frame being transmitted; `tx_pos` is the next one.
@@ -321,6 +329,7 @@ impl Link {
             backlog: VecDeque::new(),
             received: VecDeque::new(),
             events: VecDeque::new(),
+            closing: None,
             queue: VecDeque::new(),
             tx_samples: Vec::new(),
             tx_pos: 0,
@@ -380,9 +389,10 @@ impl Link {
     }
 
     /// End the session. A connected link first sends every queued byte, then
-    /// DISCONNECT, then reports [`DisconnectReason::Local`]. A link still in
-    /// its handshake stops at once. Calling it while already disconnecting
-    /// does nothing. Returns [`LinkError::NotConnected`] on an idle link.
+    /// DISCONNECT, then reports [`DisconnectReason::Local`] once
+    /// [`Self::process`] has returned the DISCONNECT frame's last sample. A
+    /// link still in its handshake stops at once. Calling it while already
+    /// disconnecting does nothing. Returns [`LinkError::NotConnected`] on an idle link.
     pub fn disconnect(&mut self, now: Instant) -> Result<(), LinkError> {
         match self.phase {
             Phase::Idle => Err(LinkError::NotConnected {
@@ -399,7 +409,7 @@ impl Link {
                 }
                 Ok(())
             }
-            Phase::Draining => Ok(()),
+            Phase::Draining | Phase::Closing => Ok(()),
         }
     }
 
@@ -425,6 +435,12 @@ impl Link {
         if self.tx_pos >= self.tx_samples.len() {
             self.tx_samples.clear();
             self.tx_pos = 0;
+        }
+        // Report the end only after the DISCONNECT has fully left `tx`, so a
+        // caller that stops on `Disconnected` cannot truncate it.
+        if self.phase == Phase::Closing && !self.is_transmitting() && self.queue.is_empty() {
+            self.phase = Phase::Idle;
+            self.events.extend(self.closing.take());
         }
         n
     }
@@ -455,7 +471,7 @@ impl Link {
             Phase::Idle => LinkState::Idle,
             Phase::Calling | Phase::Accepting => LinkState::Connecting,
             Phase::Connected => LinkState::Connected,
-            Phase::Draining => LinkState::Disconnecting,
+            Phase::Draining | Phase::Closing => LinkState::Disconnecting,
         }
     }
 
@@ -545,7 +561,9 @@ impl Link {
     }
 
     /// End the session with `reason`. With `send_disconnect`, queue one
-    /// best-effort DISCONNECT frame, as coppad's `fail_session_link` does.
+    /// best-effort DISCONNECT frame, as coppad's `fail_session_link` does,
+    /// and hold the `Disconnected` event in [`Phase::Closing`] until
+    /// `process` has returned that frame's last sample.
     fn end_session(&mut self, reason: DisconnectReason, now: Instant, send_disconnect: bool) {
         let remote = self.remote_string();
         let frame = if send_disconnect {
@@ -558,15 +576,18 @@ impl Link {
         };
         self.reset_session_state();
         self.session = None;
-        self.phase = Phase::Idle;
+        let event = LinkEvent::Disconnected { remote, reason };
         if let Some(bytes) = frame {
             self.queue.push_back(QueuedFrame {
                 kind: FrameKind::Control,
                 bytes,
             });
+            self.phase = Phase::Closing;
+            self.closing = Some(event);
+        } else {
+            self.phase = Phase::Idle;
+            self.events.push_back(event);
         }
-        self.events
-            .push_back(LinkEvent::Disconnected { remote, reason });
     }
 
     fn established(&mut self) {
@@ -676,7 +697,9 @@ impl Link {
             {
                 self.on_ack(&pdu, now);
             }
-            MacFrameType::Disconnect if from_peer && self.phase != Phase::Idle => {
+            MacFrameType::Disconnect
+                if from_peer && !matches!(self.phase, Phase::Idle | Phase::Closing) =>
+            {
                 if let Some(s) = self.session.as_mut() {
                     s.handle_disconnect();
                 }
@@ -873,21 +896,10 @@ impl Link {
         if !self.backlog.is_empty() {
             self.key_new_chunk(now);
         } else if draining {
-            let frame = self
-                .session
-                .as_mut()
-                .and_then(|s| s.disconnect(now).ok())
-                .map(|p| p.to_bytes());
-            if let Some(bytes) = frame {
-                self.key(
-                    QueuedFrame {
-                        kind: FrameKind::Control,
-                        bytes,
-                    },
-                    now,
-                );
+            self.end_session(DisconnectReason::Local, now, true);
+            if let Some(frame) = self.queue.pop_front() {
+                self.key(frame, now);
             }
-            self.end_session(DisconnectReason::Local, now, false);
         }
     }
 
@@ -939,7 +951,7 @@ impl Link {
             Err(e) => {
                 // Every frame is sized by the link itself, so this is a bug.
                 debug_assert!(false, "link frame failed to encode: {e}");
-                if self.phase != Phase::Idle {
+                if !matches!(self.phase, Phase::Idle | Phase::Closing) {
                     self.end_session(DisconnectReason::Local, now, false);
                 }
                 false

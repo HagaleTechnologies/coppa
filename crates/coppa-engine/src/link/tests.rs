@@ -584,3 +584,71 @@ fn peer_frames_must_match_session_ssid() {
     a.handle_pdu(disconnect, now);
     assert_eq!(a.state(), LinkState::Idle);
 }
+
+/// Codex P2 on PR #210: with an audio-sized `tx` buffer the DISCONNECT
+/// waveform spans many `process` calls, and `Disconnected` must not be
+/// reported (nor the link go `Idle`) until its last sample has been returned.
+#[test]
+fn local_disconnect_is_reported_after_disconnect_frame_finishes() {
+    let mut ticks_while_sending_disconnect = 0;
+    let mut seen = Vec::new();
+    let mut c = Cable::pair();
+    c.connect();
+    events(&mut c.a);
+    events(&mut c.b);
+    let now = c.now();
+    c.a.disconnect(now).expect("disconnect");
+    let end = c.t + Duration::from_secs(60);
+    while c.t < end && seen.is_empty() {
+        c.tick();
+        seen = events(&mut c.a);
+        if c.a.is_transmitting() {
+            ticks_while_sending_disconnect += 1;
+            assert!(seen.is_empty(), "Disconnected reported mid-DISCONNECT");
+            assert_eq!(c.a.state(), LinkState::Disconnecting);
+        }
+    }
+    assert_eq!(seen, vec![disconnected("N0BBB", DisconnectReason::Local)]);
+    assert!(!c.a.is_transmitting());
+    assert_eq!(c.a.state(), LinkState::Idle);
+    assert!(
+        ticks_while_sending_disconnect > 1,
+        "DISCONNECT should span several 20 ms blocks"
+    );
+    // The peer heard the whole frame.
+    assert!(c.run_until(Duration::from_secs(10), |_, b| b.state() == LinkState::Idle));
+    assert_eq!(
+        events(&mut c.b),
+        vec![disconnected("N0AAA", DisconnectReason::Remote)]
+    );
+}
+
+/// The same hold applies to the best-effort DISCONNECT after retry
+/// exhaustion.
+#[test]
+fn retries_exhausted_is_reported_after_disconnect_frame_finishes() {
+    let mut a_cfg = LinkConfig::new("N0AAA");
+    a_cfg.max_retransmit = 1;
+    a_cfg.initial_rto = Duration::from_secs(4);
+    let mut c = Cable::new(a_cfg, LinkConfig::new("N0BBB"));
+    c.b.set_listening(true);
+    c.drop_b = (1..64).collect();
+    c.connect();
+    events(&mut c.a);
+    c.a.send(&payload(10)).expect("send");
+    let mut seen = Vec::new();
+    let end = c.t + Duration::from_secs(60);
+    while c.t < end && seen.is_empty() {
+        c.tick();
+        seen = events(&mut c.a);
+        if c.a.is_transmitting() {
+            assert!(seen.is_empty(), "Disconnected reported mid-frame");
+        }
+    }
+    assert_eq!(
+        seen,
+        vec![disconnected("N0BBB", DisconnectReason::RetriesExhausted)]
+    );
+    assert_eq!(c.a.state(), LinkState::Idle);
+    assert_eq!(c.a.frames_transmitted(), 6);
+}
