@@ -350,7 +350,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:7477efa7bd7802b3e7d22d5e5d3bbed5232209e75b27f423a65310ac134db09c",
+      "hash": "sha256:681566d6e8792b71211acf058d96632a8ca1f31de73737297cf98769574454f6",
       "id": "coppa-protocol",
       "kind": "subsystem",
       "links": [
@@ -365,12 +365,13 @@
       "maintainer": "agent",
       "path": "pages/coppa-protocol.md",
       "sources": [
-        "crates/coppa-protocol/**"
+        "crates/coppa-protocol/**",
+        "docs/SPEC.md"
       ],
       "status": "current",
       "title": "How does coppa-protocol handle framing, FEC, and ARQ?",
-      "verified_commit": "be2141b",
-      "verified_date": "2026-08-05",
+      "verified_commit": "edb17bc",
+      "verified_date": "2026-11-04",
       "visibility": "public"
     },
     {
