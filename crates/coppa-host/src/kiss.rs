@@ -286,11 +286,7 @@ impl KissServer {
         self.run_with_listener(listener).await
     }
 
-<<<<<<< HEAD
-    /// Serve a listener whose bind result has already been checked.
-=======
     /// Accept KISS clients using a listener already bound by the caller.
->>>>>>> 951030cae7b73389cd84e377bd43a2ddcf76aee9
     pub async fn run_with_listener(&self, listener: TcpListener) -> Result<(), crate::HostError> {
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 

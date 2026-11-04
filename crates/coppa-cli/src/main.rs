@@ -4645,6 +4645,71 @@ mod tests {
         );
     }
 
+    /// COP-137: the AGWPE flags are opt-in, default to off and loopback, and
+    /// leave the KISS port and device/channel arguments as they were.
+    #[cfg(feature = "kiss-tnc")]
+    #[test]
+    fn tnc_agw_port_and_bind_address_flags_parse() {
+        let Commands::Tnc {
+            port,
+            agw_port,
+            bind_address,
+            device,
+            input_channel,
+            output_channel,
+            ..
+        } = Cli::parse_from(["coppa", "tnc"]).command
+        else {
+            panic!("expected Tnc")
+        };
+        assert_eq!(port, 8001);
+        assert_eq!(agw_port, None);
+        assert_eq!(bind_address, "127.0.0.1");
+        assert_eq!(device, None);
+        assert_eq!((input_channel, output_channel), (0, 0));
+
+        let Commands::Tnc {
+            port,
+            agw_port,
+            bind_address,
+            device,
+            input_channel,
+            output_channel,
+            ..
+        } = Cli::parse_from([
+            "coppa",
+            "tnc",
+            "--port",
+            "8101",
+            "--agw-port",
+            "8000",
+            "--bind-address",
+            "0.0.0.0",
+            "--device",
+            "USB",
+            "--input-channel",
+            "1",
+            "--output-channel",
+            "1",
+        ])
+        .command
+        else {
+            panic!("expected Tnc")
+        };
+        assert_eq!(port, 8101);
+        assert_eq!(agw_port, Some(8000));
+        assert_eq!(bind_address, "0.0.0.0");
+        assert_eq!(device.as_deref(), Some("USB"));
+        assert_eq!((input_channel, output_channel), (1, 1));
+        assert_eq!(
+            Cli::try_parse_from(["coppa", "tnc", "--agw-port", "65536"])
+                .err()
+                .expect("out of range")
+                .kind(),
+            clap::error::ErrorKind::ValueValidation,
+        );
+    }
+
     #[test]
     fn device_inventory_shows_ids_and_clean_empty_state() {
         let unknown = || Err(anyhow::anyhow!("listing failed"));

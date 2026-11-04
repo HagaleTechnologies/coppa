@@ -21,11 +21,8 @@ Every table below was checked against coppad 0.3.0 at commit `b9fdb8d` (see
 | VARA-style data port | 8301 | the same key | none | none |
 | ARDOP command / data | 8515 / 8516 | `[host] ardop_enabled = true` | `ardop` | none |
 | WebSocket JSON (and the `GET /` page) | 8400 | `[host] websocket_enabled = true` and `websocket_token` | `websocket` | token; browsers also need an allowed `Origin` |
-<<<<<<< HEAD
 | AGWPE connectionless (AFSK TNC) | opt-in 8000 | `coppa tnc --agw-port 8000` | `kiss-tnc` and `cpal-backend` for audio | none |
-=======
 | KISS datagram (OFDM modem) | 8100 | `[host] kiss_enabled = true` | `kiss-tnc` | none |
->>>>>>> 951030cae7b73389cd84e377bd43a2ddcf76aee9
 | KISS (AFSK 1200 TNC mode) | 8001 | `coppad --tnc`, or `coppa tnc --port N` | `kiss-tnc` (and `cpal-backend` for audio) | none |
 
 - Every `[host]` server is off by default and binds `bind_address`, which defaults to
@@ -389,11 +386,7 @@ even when they are data frames. See [LIMITATIONS.md](LIMITATIONS.md).
 
 ## Security
 
-<<<<<<< HEAD
-- The VARA-style, ARDOP, AGWPE and KISS ports have **no authentication**. Anything that can open a TCP
-=======
-- The VARA-style, ARDOP and both KISS ports have **no authentication**. Anything that can open a TCP
->>>>>>> 951030cae7b73389cd84e377bd43a2ddcf76aee9
+- The VARA-style, ARDOP, AGWPE and both KISS ports have **no authentication**. Anything that can open a TCP
   connection to them can key your transmitter. `bind_address` defaults to `127.0.0.1`; change it
   only on a trusted, firewalled network.
 - A web page in your own browser can still send a command line to the VARA-style command port

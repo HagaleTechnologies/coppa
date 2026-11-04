@@ -89,6 +89,13 @@ impl TncTx {
         self.active.is_some() || !self.frames.is_empty()
     }
 
+    /// Frames keyed or queued: the transmitter's share of an AGWPE `y`
+    /// reply. The active frame counts until `poll` clears it, which is after
+    /// its PTT tail, or, for a cancelled frame, after its discard settles.
+    pub fn pending_frames(&self) -> usize {
+        self.frames.len() + usize::from(self.active.is_some())
+    }
+
     /// Advance TX: move retained samples into `out`, start the next frame,
     /// and complete or cancel the active one.
     pub fn poll(&mut self, now: Instant, out: &mut AudioRingProducer, ptt: &mut dyn PttControl) {
@@ -246,6 +253,19 @@ fn kiss_to_air(payload: &[u8]) -> Vec<f32> {
 fn air_to_kiss(mut frame: Vec<u8>) -> Vec<u8> {
     frame.truncate(frame.len().saturating_sub(2));
     frame
+}
+
+// KISS and AGWPE frames enter the same single modulation backlog; callers
+// take a frame only while `tnc_tx.has_room()`.
+fn submit_host_frame(
+    tnc_tx: &mut TncTx,
+    ax25: &[u8],
+    now: Instant,
+    out: &mut AudioRingProducer,
+    ptt: &mut dyn PttControl,
+) {
+    tnc_tx.submit(kiss_to_air(ax25));
+    tnc_tx.poll(now, out, ptt);
 }
 
 // Both host adapters see exactly the same FCS-stripped demodulator output.
@@ -607,8 +627,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
             // Not polled while the backlog is full, so later frames wait in
             // the KISS server's bounded channel.
             Some(ax25_data) = tx_receiver.recv(), if tnc_tx.has_room() => {
-                tnc_tx.submit(kiss_to_air(&ax25_data));
-                tnc_tx.poll(Instant::now(), &mut audio_out_prod, ptt.as_mut());
+                submit_host_frame(&mut tnc_tx, &ax25_data, Instant::now(), &mut audio_out_prod, ptt.as_mut());
             }
 
             Some(ax25_data) = async {
@@ -617,8 +636,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
                     None => std::future::pending().await,
                 }
             }, if tnc_tx.has_room() => {
-                tnc_tx.submit(kiss_to_air(&ax25_data));
-                tnc_tx.poll(Instant::now(), &mut audio_out_prod, ptt.as_mut());
+                submit_host_frame(&mut tnc_tx, &ax25_data, Instant::now(), &mut audio_out_prod, ptt.as_mut());
             }
 
             _ = tx_tick.tick(), if tnc_tx.is_busy() => {
@@ -639,10 +657,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
                 break;
             }
         }
-        pending.store(
-            tnc_tx.frames.len() + usize::from(tnc_tx.active.is_some()),
-            Ordering::Release,
-        );
+        pending.store(tnc_tx.pending_frames(), Ordering::Release);
     }
     pending.store(0, Ordering::Release);
     kiss_task.0.abort();
@@ -902,6 +917,274 @@ mod tests {
         }
         task.abort();
         let _ = task.await;
+    }
+
+    /// COP-137 phase 3: KISS and AGWPE asking for the same port fail on the
+    /// AGWPE bind, before audio setup, and the KISS listener already bound
+    /// is released.
+    #[tokio::test]
+    async fn same_port_for_kiss_and_agw_fails_and_releases_kiss() {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let error = run_tnc(TncConfig {
+            kiss_port: port,
+            agw_port: Some(port),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Cannot bind AGWPE"),
+            "{error:#}"
+        );
+        assert!(error.chain().any(|e| e
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::AddrInUse)));
+        tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("the KISS listener must be released on the AGWPE bind error");
+    }
+
+    fn agw_request(kind: u8, pid: u8, body: &[u8]) -> Vec<u8> {
+        let mut h = vec![0; 36];
+        h[4] = kind;
+        h[6] = pid;
+        h[8..14].copy_from_slice(b"N0CALL");
+        h[18..22].copy_from_slice(b"APRS");
+        h[28..32].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        h.extend(body);
+        h
+    }
+
+    async fn agw_read(s: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut h = vec![0; 36];
+            s.read_exact(&mut h).await.unwrap();
+            let n = u32::from_le_bytes(h[28..32].try_into().unwrap()) as usize;
+            let mut b = vec![0; n];
+            s.read_exact(&mut b).await.unwrap();
+            h.extend(b);
+            h
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn agw_barrier(s: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncWriteExt;
+        s.write_all(&agw_request(b'R', 0, &[])).await.unwrap();
+        assert_eq!(agw_read(s).await[4], b'R');
+    }
+
+    async fn agw_server(
+        pending: Arc<AtomicUsize>,
+    ) -> (
+        std::net::SocketAddr,
+        mpsc::Receiver<Vec<u8>>,
+        tokio::sync::broadcast::Sender<Vec<u8>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = coppa_host::agw::AgwServer::new(0).with_pending_frames(pending);
+        let tx = server.take_tx_receiver().unwrap();
+        let rx = server.rx_sender();
+        let task = tokio::spawn(async move { server.run_with_listener(listener).await.unwrap() });
+        (addr, tx, rx, task)
+    }
+
+    fn demodulate(samples: &[f32]) -> Vec<Vec<u8>> {
+        let mut demod = coppa_codec::afsk::Demodulator::new();
+        demod.process(samples);
+        demod.take_frames().into_iter().map(air_to_kiss).collect()
+    }
+
+    /// COP-137 phase 4: a raw non-UI `K` frame (SABM) goes through the
+    /// production submit path, the simulated audio sink and the demodulator
+    /// unchanged; it reaches a raw subscriber and no monitor record is made.
+    /// A maximum-info `M` frame matches `coppa-protocol`'s AX.25 encoder.
+    #[tokio::test]
+    async fn agw_raw_non_ui_and_max_info_round_trip_through_audio() {
+        use tokio::io::AsyncWriteExt;
+        let (addr, mut tx, rx, task) = agw_server(Arc::default()).await;
+        let mut a = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut raw = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut mon = tokio::net::TcpStream::connect(addr).await.unwrap();
+        for (client, kind) in [(&mut raw, b'k'), (&mut mon, b'm')] {
+            client.write_all(&agw_request(kind, 0, &[])).await.unwrap();
+            agw_barrier(client).await;
+        }
+        // SABM from N0CALL-2 to N0CALL-1: control 3F, no PID, no info.
+        let sabm = vec![
+            156, 96, 134, 130, 152, 152, 0xe2, 156, 96, 134, 130, 152, 152, 0x65, 0x3f,
+        ];
+        let mut body = vec![0];
+        body.extend(&sabm);
+        a.write_all(&agw_request(b'K', 0, &body)).await.unwrap();
+        let max_info = max_info_ax25_frame();
+        let max_info = &max_info[..max_info.len() - 2];
+        a.write_all(&agw_request(b'M', 0xf0, &max_info[16..]))
+            .await
+            .unwrap();
+        let mut h = Harness::new();
+        let mut sent = Vec::new();
+        for _ in 0..2 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), tx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(h.tx.has_room());
+            submit_host_frame(&mut h.tx, &frame, h.now, &mut h.out, &mut h.ptt);
+            sent.push(frame);
+        }
+        assert_eq!(sent, vec![sabm.clone(), max_info.to_vec()]);
+        h.run_until_idle(1024);
+        assert_eq!(
+            *h.ptt.0.lock().unwrap(),
+            vec![PttState::Tx, PttState::Rx, PttState::Tx, PttState::Rx]
+        );
+        let (kiss, mut kiss_rx) = tokio::sync::broadcast::channel(4);
+        let mut demod = coppa_codec::afsk::Demodulator::new();
+        demod.process(&h.sink.captured);
+        let frames = demod.take_frames();
+        assert_eq!(frames.len(), 2);
+        for on_air in frames {
+            forward_received(on_air, &kiss, Some(&rx));
+        }
+        assert_eq!(kiss_rx.recv().await.unwrap(), sabm);
+        assert_eq!(kiss_rx.recv().await.unwrap(), max_info);
+        for expected in [&sabm[..], max_info] {
+            let record = agw_read(&mut raw).await;
+            assert_eq!(record[4], b'K');
+            assert_eq!(&record[36..], [&[0][..], expected].concat());
+        }
+        // The SABM makes no monitor record: the first one is the UI frame.
+        let record = agw_read(&mut mon).await;
+        assert_eq!(record[4], b'U');
+        assert!(record[36..].starts_with(b" 1:Fm N0CALL To APRS <UI pid=F0 Len=256 "));
+        agw_barrier(&mut mon).await;
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// COP-137 phase 4: the `y` count includes the active frame through its
+    /// PTT tail and returns to zero once the tail completes.
+    #[tokio::test]
+    async fn agw_pending_count_tracks_the_active_frame_through_its_tail() {
+        use tokio::io::AsyncWriteExt;
+        let pending = Arc::new(AtomicUsize::new(0));
+        let (addr, _tx, _rx, task) = agw_server(pending.clone()).await;
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // `run_tnc` publishes `pending_frames()` after every loop step.
+        let publish = |count: usize| pending.store(count, Ordering::Release);
+        async fn ask(c: &mut tokio::net::TcpStream) -> u32 {
+            c.write_all(&agw_request(b'y', 0, &[])).await.unwrap();
+            let reply = agw_read(c).await;
+            assert_eq!(reply[4], b'y');
+            u32::from_le_bytes(reply[36..40].try_into().unwrap())
+        }
+        let mut h = Harness::new();
+        submit_host_frame(&mut h.tx, b"first", h.now, &mut h.out, &mut h.ptt);
+        assert!(h.tx.has_room());
+        submit_host_frame(&mut h.tx, b"second", h.now, &mut h.out, &mut h.ptt);
+        assert!(!h.tx.has_room());
+        publish(h.tx.pending_frames());
+        assert_eq!(ask(&mut c).await, 2);
+        // Run to the second frame's tail: every sample played, PTT still keyed.
+        let mut ticks = 0;
+        while !(h.tx.frames.is_empty() && matches!(h.tx.active, Some(TncPhase::Tail(_)))) {
+            h.tick(4096);
+            ticks += 1;
+            assert!(ticks < 200_000, "never reached the second tail");
+        }
+        assert_eq!(h.ptt.0.lock().unwrap().last(), Some(&PttState::Tx));
+        assert_eq!(h.ptt.0.lock().unwrap().len(), 3);
+        publish(h.tx.pending_frames());
+        assert_eq!(ask(&mut c).await, 1);
+        h.run_until_idle(4096);
+        assert_eq!(
+            *h.ptt.0.lock().unwrap(),
+            vec![PttState::Tx, PttState::Rx, PttState::Tx, PttState::Rx]
+        );
+        publish(h.tx.pending_frames());
+        assert_eq!(ask(&mut c).await, 0);
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// COP-137 phase 4: KISS and AGWPE clients submitting at the same time
+    /// share the single modulation backlog (never more than one frame queued
+    /// behind the active one) and every frame from both is transmitted.
+    #[tokio::test]
+    async fn simultaneous_kiss_and_agw_share_the_backlog() {
+        use tokio::io::AsyncWriteExt;
+        let (agw_addr, mut agw_rx, _rx, agw_task) = agw_server(Arc::default()).await;
+        let kiss_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let kiss_addr = kiss_listener.local_addr().unwrap();
+        let mut kiss_server = coppa_host::kiss::KissServer::new(0);
+        let mut kiss_rx = kiss_server.take_tx_receiver().unwrap();
+        let kiss_task = tokio::spawn(async move {
+            let _ = kiss_server.run_with_listener(kiss_listener).await;
+        });
+        let mut agw = tokio::net::TcpStream::connect(agw_addr).await.unwrap();
+        let mut kiss = tokio::net::TcpStream::connect(kiss_addr).await.unwrap();
+        let kiss_frames: Vec<Vec<u8>> = (0..3)
+            .map(|i| format!("kiss frame {i}").into_bytes())
+            .collect();
+        let agw_frames: Vec<Vec<u8>> = (0..3)
+            .map(|i| format!("agw frame {i}").into_bytes())
+            .collect();
+        let kiss_bytes: Vec<u8> = kiss_frames
+            .iter()
+            .flat_map(|f| coppa_host::kiss::kiss_encode_data(f))
+            .collect();
+        let agw_bytes: Vec<u8> = agw_frames
+            .iter()
+            .flat_map(|f| agw_request(b'K', 0, &[&[0][..], f].concat()))
+            .collect();
+        let (k, a) = tokio::join!(kiss.write_all(&kiss_bytes), agw.write_all(&agw_bytes));
+        k.unwrap();
+        a.unwrap();
+
+        let mut h = Harness::new();
+        let mut submitted = Vec::new();
+        let mut held_back = false;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while submitted.len() < 6 {
+                if !h.tx.has_room() {
+                    held_back = true;
+                    h.tick(4096);
+                    continue;
+                }
+                tokio::select! {
+                    Some(f) = kiss_rx.recv() => {
+                        submit_host_frame(&mut h.tx, &f, h.now, &mut h.out, &mut h.ptt);
+                        submitted.push(f);
+                    }
+                    Some(f) = agw_rx.recv() => {
+                        submit_host_frame(&mut h.tx, &f, h.now, &mut h.out, &mut h.ptt);
+                        submitted.push(f);
+                    }
+                }
+                assert!(h.tx.frames.len() <= MAX_QUEUED_FRAMES);
+            }
+        })
+        .await
+        .expect("both sources must make progress");
+        assert!(held_back, "the backlog never filled");
+        h.run_until_idle(4096);
+        let decoded = demodulate(&h.sink.captured);
+        assert_eq!(decoded, submitted, "transmitted in submission order");
+        for f in kiss_frames.iter().chain(&agw_frames) {
+            assert_eq!(decoded.iter().filter(|d| *d == f).count(), 1, "{f:?}");
+        }
+        assert_eq!(h.ptt.0.lock().unwrap().len(), 12);
+        agw_task.abort();
+        kiss_task.abort();
+        let _ = agw_task.await;
+        let _ = kiss_task.await;
     }
 
     /// PTT controller recording every state change.

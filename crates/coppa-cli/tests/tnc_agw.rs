@@ -28,17 +28,23 @@ fn help_and_bind_conflicts() {
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(help.contains("--agw-port"));
     assert!(help.contains("--bind-address"));
+    assert!(help.contains("Enable the AGWPE TCP server on this port (normally 8000)"));
+    assert!(help.contains("Bind the KISS and AGWPE TCP servers to this address"));
     let held = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = held.local_addr().unwrap().port().to_string();
-    for args in [
-        vec!["tnc", "--port", &port],
-        vec!["tnc", "--port", "0", "--agw-port", &port],
+    for (args, context) in [
+        (vec!["tnc", "--port", &port], "(--port)"),
+        (
+            vec!["tnc", "--port", "0", "--agw-port", &port],
+            "(--agw-port)",
+        ),
     ] {
         let output = binary().args(args).output().unwrap();
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
         let error = String::from_utf8_lossy(&output.stderr);
         assert!(error.contains("Cannot bind"), "{error}");
+        assert!(error.contains(context), "{error}");
         assert!(!error.contains("TNC ready."));
     }
 }
@@ -102,6 +108,50 @@ fn cli_registration_and_version_without_audio() {
         client.read_exact(&mut b).unwrap();
         assert_eq!(b, expected);
     }
+    p.0.kill().unwrap();
+    p.0.wait().unwrap();
+    logs.join().unwrap();
+}
+/// COP-137 phase 3: without `--agw-port` the TNC starts KISS only, as it
+/// did before, and opens no AGWPE listener.
+#[test]
+fn kiss_only_startup_is_unchanged_without_agw_port() {
+    let held = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = held.local_addr().unwrap().port();
+    drop(held);
+    let mut p = Process(
+        binary()
+            .args(["tnc", "--port", &port.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .env("RUST_LOG", "info")
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = p.0.stderr.take().unwrap();
+    let (send, recv) = std::sync::mpsc::channel();
+    let logs = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if send.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut log = String::new();
+    loop {
+        let line = recv
+            .recv_timeout(Duration::from_secs(10))
+            .expect("TNC startup");
+        let ready = line.contains("TNC ready.");
+        log.push_str(&line);
+        if ready {
+            break;
+        }
+    }
+    assert!(log.contains("KISS server listening"), "{log}");
+    assert!(!log.contains("AGWPE"), "{log}");
+    TcpStream::connect(("127.0.0.1", port)).expect("KISS port accepts");
     p.0.kill().unwrap();
     p.0.wait().unwrap();
     logs.join().unwrap();

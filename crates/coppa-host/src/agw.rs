@@ -527,4 +527,425 @@ mod tests {
         task.abort();
         let _ = task.await;
     }
+
+    // ---- COP-137 remediation: the planned fixture and socket matrix ----
+
+    /// Hand-assembled AX.25 address field: six shifted, space-padded
+    /// characters and an SSID byte with C/H bit `high` and end bit `last`.
+    fn ax_addr(base: &[u8], ssid: u8, high: bool, last: bool) -> Vec<u8> {
+        let mut out = [0x40u8; 7];
+        for (i, b) in base.iter().enumerate() {
+            out[i] = b << 1;
+        }
+        out[6] = 0x60 | (ssid << 1) | (u8::from(high) << 7) | u8::from(last);
+        out.to_vec()
+    }
+
+    async fn spawn_server(
+        pending: Arc<AtomicUsize>,
+    ) -> (
+        std::net::SocketAddr,
+        mpsc::Receiver<Vec<u8>>,
+        broadcast::Sender<Vec<u8>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = AgwServer::new(0).with_pending_frames(pending);
+        let tx = server.take_tx_receiver().unwrap();
+        let rx = server.rx_sender();
+        let task = tokio::spawn(async move { server.run_with_listener(listener).await.unwrap() });
+        (addr, tx, rx, task)
+    }
+
+    async fn barrier(c: &mut TcpStream) {
+        c.write_all(&packet(b'R', &[], &[], 0, &[])).await.unwrap();
+        assert_eq!(receive(c).await[4], b'R');
+    }
+
+    async fn assert_closed(c: &mut TcpStream) {
+        let mut sink = vec![0; 65536];
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match c.read(&mut sink).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("server must close this client");
+    }
+
+    /// Phase 1 golden monitor bytes, written by hand rather than by `ui()`:
+    /// a repeated digipeater gets `*`, the C bits select P or F, and the
+    /// P/F bit is read from the control byte.
+    #[test]
+    fn monitor_golden_digipeaters_and_poll_final() {
+        let mut f = ax_addr(b"APRS", 0, true, false);
+        f.extend(ax_addr(b"N0CALL", 0, false, false));
+        f.extend(ax_addr(b"WIDE1", 1, true, false));
+        f.extend(ax_addr(b"WIDE2", 2, false, true));
+        f.extend([0x03, 0xf0, b'h', b'i']);
+        let record = monitor(&f, "01:02:03").unwrap();
+        assert_eq!(&record[..8], &[0, 0, 0, 0, b'U', 0, 0xf0, 0]);
+        assert_eq!(&record[8..18], b"N0CALL\0\0\0\0");
+        assert_eq!(&record[18..28], b"APRS\0\0\0\0\0\0");
+        assert_eq!(
+            &record[36..],
+            b" 1:Fm N0CALL To APRS Via WIDE1-1*,WIDE2-2 <UI pid=F0 Len=2 P=0 >[01:02:03]\rhi\r\0"
+        );
+        assert_eq!(
+            u32::from_le_bytes(record[28..32].try_into().unwrap()) as usize,
+            record.len() - 36
+        );
+
+        let mut f = ax_addr(b"APRS", 0, false, false);
+        f.extend(ax_addr(b"N0CALL", 15, true, true));
+        f.extend([0x13, 0xcf]);
+        assert_eq!(
+            &monitor(&f, "23:59:59").unwrap()[36..],
+            b" 1:Fm N0CALL-15 To APRS <UI pid=CF Len=0 F=1 >[23:59:59]\r\r\0"
+        );
+
+        // Both C bits equal (old AX.25 v1 style): neither P nor F alone.
+        let mut f = ax_addr(b"APRS", 0, false, false);
+        f.extend(ax_addr(b"N0CALL", 0, false, true));
+        f.extend([0x03, 0xf0, 0, 0xff]);
+        let record = monitor(&f, "00:00:00").unwrap();
+        assert_eq!(
+            &record[36..],
+            b" 1:Fm N0CALL To APRS <UI pid=F0 Len=2 PF=0 >[00:00:00]\r\0\xff\r\0"
+        );
+    }
+
+    /// Non-UI and malformed frames produce no monitor record.
+    #[test]
+    fn monitor_rejects_non_ui_and_malformed_headers() {
+        let head = [
+            ax_addr(b"APRS", 0, true, false),
+            ax_addr(b"N0CALL", 0, false, true),
+        ]
+        .concat();
+        for control in [0x3f, 0x00, 0x01, 0x0f] {
+            let f = [head.clone(), vec![control, 0xf0, b'x']].concat();
+            assert!(monitor(&f, "00:00:00").is_none(), "control {control:#x}");
+        }
+        // Truncated address, no end bit, one address only, missing PID,
+        // low bit set inside a callsign, and an illegal callsign.
+        let no_end = [
+            ax_addr(b"APRS", 0, true, false),
+            ax_addr(b"N0CALL", 0, false, false),
+        ]
+        .concat();
+        let one = ax_addr(b"APRS", 0, true, true);
+        let mut odd = head.clone();
+        odd[0] |= 1;
+        let mut bad_call = head.clone();
+        bad_call[0] = b'!' << 1;
+        for f in [
+            head[..10].to_vec(),
+            no_end,
+            [one, vec![0x03, 0xf0]].concat(),
+            [head.clone(), vec![0x03]].concat(),
+            [odd, vec![0x03, 0xf0]].concat(),
+            [bad_call, vec![0x03, 0xf0]].concat(),
+            Vec::new(),
+        ] {
+            assert!(monitor(&f, "00:00:00").is_none(), "{f:02x?}");
+        }
+    }
+
+    /// An `M` frame matches an independently written AX.25 UI header: C bits
+    /// clear as `coppa-protocol`'s encoder writes them, end bit on the last
+    /// address, control 03 and the PID.
+    #[test]
+    fn ui_frame_matches_hand_assembled_header() {
+        let h = packet(b'M', b"n0call-7", b"APRS-15", 0xcf, &[]);
+        let expected = [
+            ax_addr(b"APRS", 15, false, false),
+            ax_addr(b"N0CALL", 7, false, true),
+            vec![0x03, 0xcf, 0, b'z', 0],
+        ]
+        .concat();
+        assert_eq!(ui(&h, &[0, b'z', 0]).unwrap(), expected);
+        let mut body = vec![2];
+        body.extend(b"WIDE1-1\0\0\0");
+        body.extend(b"WIDE2-2\0\0\0");
+        body.push(b'q');
+        let h = packet(b'V', b"N0CALL", b"APRS", 0xf0, &[]);
+        let expected = [
+            ax_addr(b"APRS", 0, false, false),
+            ax_addr(b"N0CALL", 0, false, false),
+            ax_addr(b"WIDE1", 1, false, false),
+            ax_addr(b"WIDE2", 2, false, true),
+            vec![0x03, 0xf0, b'q'],
+        ]
+        .concat();
+        assert_eq!(ui(&h, &body).unwrap(), expected);
+        // Malformed digipeater counts and truncated fields.
+        assert!(ui(&h, &[]).is_none());
+        assert!(ui(&h, &[2, 0, 0]).is_none());
+        assert!(ui(&h, &body[..20]).is_none());
+        let mut nine = vec![9];
+        for _ in 0..9 {
+            nine.extend(b"WIDE1-1\0\0\0");
+        }
+        assert!(ui(&h, &nine).is_none());
+        let mut bad = body.clone();
+        bad[1] = b'!';
+        assert!(ui(&h, &bad).is_none());
+    }
+
+    /// EOF at every offset of a request closes only that client and
+    /// transmits nothing; a complete request followed by EOF transmits.
+    #[tokio::test]
+    async fn eof_at_every_offset_closes_only_that_client() {
+        let (addr, mut tx, _rx, task) = spawn_server(Arc::default()).await;
+        let mut healthy = TcpStream::connect(addr).await.unwrap();
+        let req = packet(b'M', b"N0CALL", b"APRS", 0xf0, b"hello");
+        for split in 1..req.len() {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            c.write_all(&req[..split]).await.unwrap();
+            c.shutdown().await.unwrap();
+            assert_closed(&mut c).await;
+            barrier(&mut healthy).await;
+        }
+        assert!(tx.try_recv().is_err(), "a truncated request transmitted");
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(&req).await.unwrap();
+        c.shutdown().await.unwrap();
+        assert_closed(&mut c).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), tx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            ui(&req, &req[36..]).unwrap()
+        );
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// Unsupported ports and malformed transmit requests are consumed
+    /// without a reply or a transmission; raw `K` keeps non-UI bytes
+    /// unchanged with no FCS or extra trailing byte.
+    #[tokio::test]
+    async fn port_rejection_malformed_requests_and_raw_non_ui() {
+        let (addr, mut tx, _rx, task) = spawn_server(Arc::default()).await;
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        let mut wrong_port = Vec::new();
+        for &kind in b"GMKXy" {
+            let mut p = packet(kind, b"N0CALL", b"APRS", 0xf0, &[0, 1, 2]);
+            p[0] = 1;
+            wrong_port.extend(p);
+        }
+        let mut digi = vec![1];
+        digi.extend(b"WIDE");
+        let malformed = [
+            packet(b'M', b"N0CALL", b"APRS", 0xf0, &[0; 257]),
+            packet(b'M', b"BAD CALL", b"APRS", 0xf0, b"x"),
+            packet(b'V', b"N0CALL", b"APRS", 0xf0, &digi),
+            packet(b'K', &[], &[], 0, &[0]),
+            packet(b'K', &[], &[], 0, &[]),
+        ]
+        .concat();
+        c.write_all(&[wrong_port, malformed].concat())
+            .await
+            .unwrap();
+        barrier(&mut c).await;
+        assert!(tx.try_recv().is_err(), "a rejected request transmitted");
+
+        let sabm = [
+            ax_addr(b"N0CALL", 1, true, false),
+            ax_addr(b"N0CALL", 2, false, true),
+            vec![0x3f],
+        ]
+        .concat();
+        let mut body = vec![0];
+        body.extend(&sabm);
+        c.write_all(&packet(b'K', &[], &[], 0, &body))
+            .await
+            .unwrap();
+        barrier(&mut c).await;
+        assert_eq!(tx.try_recv().unwrap(), sabm);
+        assert!(tx.try_recv().is_err());
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// Toggles are per connection, start off and flip on each request;
+    /// registration and toggles reset on reconnect.
+    #[tokio::test]
+    async fn toggles_are_per_connection_and_reset_on_reconnect() {
+        let (addr, _tx, rx, task) = spawn_server(Arc::default()).await;
+        let frame = [
+            ax_addr(b"APRS", 0, true, false),
+            ax_addr(b"N0CALL", 0, false, true),
+            vec![0x03, 0xf0, b'o', b'k'],
+        ]
+        .concat();
+        let mut raw = TcpStream::connect(addr).await.unwrap();
+        let mut mon = TcpStream::connect(addr).await.unwrap();
+        let mut both = TcpStream::connect(addr).await.unwrap();
+        let mut neither = TcpStream::connect(addr).await.unwrap();
+        // `k` twice turns raw back off; `m` proves the frame was handled.
+        let mut raw_off = TcpStream::connect(addr).await.unwrap();
+        let toggle = |kinds: &[u8]| -> Vec<u8> {
+            kinds
+                .iter()
+                .map(|k| packet(*k, &[], &[], 0, &[]))
+                .collect::<Vec<_>>()
+                .concat()
+        };
+        for (c, kinds) in [
+            (&mut raw, &b"k"[..]),
+            (&mut mon, b"m"),
+            (&mut both, b"km"),
+            (&mut neither, b""),
+            (&mut raw_off, b"kkm"),
+        ] {
+            c.write_all(&toggle(kinds)).await.unwrap();
+            barrier(c).await;
+        }
+        for c in [&mut raw, &mut both] {
+            for x in 0..16 {
+                c.write_all(&packet(b'X', format!("R{x}").as_bytes(), &[], 0, &[]))
+                    .await
+                    .unwrap();
+                assert_eq!(receive(c).await[36], 1);
+            }
+        }
+        rx.send(frame.clone()).unwrap();
+        let k = receive(&mut raw).await;
+        assert_eq!(
+            (k[4], &k[36..]),
+            (b'K', &[vec![0], frame.clone()].concat()[..])
+        );
+        assert_eq!(receive(&mut mon).await[4], b'U');
+        assert_eq!(receive(&mut both).await[4], b'K');
+        assert_eq!(receive(&mut both).await[4], b'U');
+        assert_eq!(receive(&mut raw_off).await[4], b'U');
+        for c in [&mut raw, &mut mon, &mut both, &mut raw_off] {
+            barrier(c).await;
+        }
+        barrier(&mut neither).await;
+        let mut one = [0];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), neither.read(&mut one))
+                .await
+                .is_err(),
+            "an unsubscribed client received a record"
+        );
+
+        // Reconnect: the 17th registration is refused on the old
+        // connection but succeeds on a fresh one, and toggles start off.
+        raw.write_all(&packet(b'X', b"R16", &[], 0, &[]))
+            .await
+            .unwrap();
+        assert_eq!(receive(&mut raw).await[36], 0);
+        drop(raw);
+        let mut again = TcpStream::connect(addr).await.unwrap();
+        again
+            .write_all(&[toggle(b"m"), packet(b'X', b"R16", &[], 0, &[])].concat())
+            .await
+            .unwrap();
+        assert_eq!(receive(&mut again).await[36], 1);
+        rx.send(frame).unwrap();
+        assert_eq!(receive(&mut again).await[4], b'U');
+        barrier(&mut again).await;
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// Sixteen clients are served; a 17th is closed while the sixteen keep
+    /// working, and a disconnect frees its slot.
+    #[tokio::test]
+    async fn seventeenth_client_is_refused_and_slots_are_released() {
+        let (addr, _tx, _rx, task) = spawn_server(Arc::default()).await;
+        let mut clients = Vec::new();
+        for _ in 0..16 {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            barrier(&mut c).await;
+            clients.push(c);
+        }
+        let mut extra = TcpStream::connect(addr).await.unwrap();
+        let _ = extra.write_all(&packet(b'R', &[], &[], 0, &[])).await;
+        assert_closed(&mut extra).await;
+        for c in &mut clients {
+            barrier(c).await;
+        }
+        drop(clients.pop());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut c = TcpStream::connect(addr).await.unwrap();
+                c.write_all(&packet(b'R', &[], &[], 0, &[])).await.unwrap();
+                let mut h = [0; 36];
+                if c.read_exact(&mut h).await.is_ok() {
+                    assert_eq!(h[4], b'R');
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a released slot must admit a new client");
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// A raw subscriber that never reads fills its bounded outbound queue
+    /// and is disconnected; another client's version request is still
+    /// answered while that happens.
+    #[tokio::test]
+    async fn nonreading_client_is_dropped_without_blocking_others() {
+        let (addr, _tx, rx, task) = spawn_server(Arc::default()).await;
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        let mut stalled = socket.connect(addr).await.unwrap();
+        stalled
+            .write_all(&packet(b'k', &[], &[], 0, &[]))
+            .await
+            .unwrap();
+        barrier(&mut stalled).await;
+        let mut healthy = TcpStream::connect(addr).await.unwrap();
+        barrier(&mut healthy).await;
+        let big = vec![0x55; 60_000];
+        for i in 0..400 {
+            let _ = rx.send(big.clone());
+            tokio::task::yield_now().await;
+            if i % 50 == 0 {
+                barrier(&mut healthy).await;
+            }
+        }
+        barrier(&mut healthy).await;
+        assert_closed(&mut stalled).await;
+        barrier(&mut healthy).await;
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// `y` adds the shared transmitter snapshot to this server's queued
+    /// frames, and returns zero once both are drained.
+    #[tokio::test]
+    async fn outstanding_frames_count_drains_to_zero() {
+        let pending = Arc::new(AtomicUsize::new(2));
+        let (addr, mut tx, _rx, task) = spawn_server(pending.clone()).await;
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        let y = packet(b'y', &[], &[], 0, &[]);
+        let k = packet(b'K', &[], &[], 0, &[0, 1, 2]);
+        c.write_all(&[k.clone(), k.clone(), k, y.clone()].concat())
+            .await
+            .unwrap();
+        let reply = receive(&mut c).await;
+        assert_eq!((reply[4], &reply[36..]), (b'y', &5u32.to_le_bytes()[..]));
+        for _ in 0..3 {
+            assert_eq!(tx.recv().await.unwrap(), vec![1, 2]);
+        }
+        pending.store(0, Ordering::Release);
+        c.write_all(&y).await.unwrap();
+        assert_eq!(&receive(&mut c).await[36..], &0u32.to_le_bytes());
+        task.abort();
+        let _ = task.await;
+    }
 }
