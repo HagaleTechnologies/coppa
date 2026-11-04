@@ -33,7 +33,11 @@ INFO coppad: PTT method="rigctld 127.0.0.1:4532" active=rigctld state="released"
 | | `git_sha` | The commit HEAD pointed at when `coppad` was built (12 hex digits), or `unknown` for a build from a tree without `.git`. Packagers building from a tarball set `COPPA_GIT_SHA` (7-40 hex digits) at build time. It does not flag uncommitted changes. |
 | | `features` | `coppa-daemon`'s cargo features in this build (`cpal-backend`, `gpio-ptt`, `kiss-tnc`, `mdns`, `serial-ptt`, `websocket`), comma-separated, or `none`. |
 | `Host listeners` | `bind_address` | `[host] bind_address`. |
+<<<<<<< HEAD
 | | `vara_command`, `vara_data`, `ardop_command`, `ardop_data`, `websocket`, `kiss` | The bound `ip:port` (the real port when 0 is configured), `disabled`, or, `not-built` when the listener feature (`websocket`, `ardop` or `kiss-tnc`) is absent. The `websocket` port also serves the operator page over plain HTTP at `GET /` (COP-79) and answers `GET /health` (COP-140, see [Health check](#health-check)). |
+=======
+| | `vara_command`, `vara_data`, `websocket` | The bound `ip:port` (the real port when 0 is configured), `disabled`, or, for `websocket` only, `not-built` in a build without the `websocket` feature. The `websocket` port also serves the operator dashboard over plain HTTP at `GET /` (COP-79, COP-83; see [Operator dashboard](#operator-dashboard)) and answers `GET /health` (COP-140, see [Health check](#health-check)). |
+>>>>>>> d837c89d388eaf9c70752c72db8537d910094cc8
 | `Host listeners accept connections from other hosts; ...` (WARN) | `bind_address` | Logged when a listener is bound to a non-loopback address such as `0.0.0.0`: anyone who can reach it can key the transmitter. |
 | `mDNS advertisement` | `host`, `service`, `port`, `addresses` | Only with `[host] mdns_enabled = true` in an `mdns` build. The advertised host (`coppad.local.`), service instance (`coppad._coppa._tcp.local.`), bound WebSocket port, and `every non-loopback IPv4 address` (`bind_address = "0.0.0.0"`), `every non-loopback address` (`"[::]"`) or the single bound address. See [Finding coppad on the network](#finding-coppad-on-the-network-mdns). |
 | `mDNS name already in use on this network; ...` (WARN) | `original`, `new_name` | Another host answers for the name, so the responder renamed this daemon, for example to `coppad-2.local.`. Clients must use the new name. |
@@ -105,7 +109,10 @@ across all carriers at once and wrecks decode on every one of them.
    `--seconds N` still works for one release with a deprecation warning), or `TUNE` (or `TUNE <seconds>`) on the daemon's
    VARA command port. This transmits a standard two-tone signal (700 Hz +
    1900 Hz, equal amplitude) — the same drive-level convention hams use for
-   SSB two-tone tests.
+   SSB two-tone tests. The daemon caps a TUNE at `[radio] max_tx_duration_s`
+   (and never more than 120 s). From the dashboard or any WebSocket client,
+   send `{"type":"tune"}` (optional `seconds`, `single_hz`); see
+   [Operator dashboard](#operator-dashboard).
 4. Slowly advance your audio drive level until the ALC meter *just* begins to
    register (first needle movement / first LED).
 5. Back off slightly from that point — a few dB is enough. ALC actively
@@ -298,13 +305,9 @@ transmission:
 Send `{"type":"audio_level","enabled":false}` to stop. This stream is
 independent of the `spectrum` stream.
 
-A browser can show the same RX reading without a separate client: open
-`http://127.0.0.1:8400/` (`GET /` on the WebSocket port, COP-79), enter the
-token and press Connect. The page needs its own origin, exactly as the
-browser's address bar shows it, in `websocket_allowed_origins`: for example
-`http://127.0.0.1:8400`, and also `http://localhost:8400` if you open it by
-that name. Without it the page reports `Refused`. Loading the page needs no
-token and the page holds none; its `/ws` upgrade presents the token you type.
+A browser can show the same RX reading without a separate client: the
+operator dashboard at `GET /` on the WebSocket port draws it as a meter. See
+[Operator dashboard](#operator-dashboard).
 
 | Field | Meaning |
 |---|---|
@@ -474,7 +477,9 @@ After authentication the first text frame is a versioned greeting:
 All application messages are JSON text frames. The [protocol schema](schema/websocket-protocol-v1.json)
 defines requests and replies. Version 1 replaces the earlier unversioned API;
 `session` replaces the old `connected` and `disconnected` message types.
-Connecting subscribes the client to data and state events.
+Connecting subscribes the client to data and state events. Version 1 grows
+only by adding optional fields and new message types; a client must ignore
+fields and types it does not know.
 
 Requests may include an unsigned integer `id`. Each request with an id gets
 one reply with that id: `ack`, `status`, or `error`. An ack means accepted
@@ -499,6 +504,8 @@ can still be rejected there with a warning log.
 {"type":"snr","db":14}
 {"type":"level","level":2}
 {"type":"heard","stations":[{"call":"W1AW","last_heard_ms":1761452712300,"snr_db":14,"level":2}]}
+{"type":"buffer","bytes":15}
+{"type":"buffer","bytes":0}
 {"type":"disconnect","id":5}
 {"type":"ack","id":5}
 {"type":"session","state":"disconnected"}
@@ -510,12 +517,106 @@ invalid base64 produces an error with the request id. Received `data` always
 specifies its encoding and preserves every byte. Raw WebSocket binary frames
 are not payload messages. `heard` is a full snapshot of up to 32 recent session
 peers, including the last-heard timestamp, rather than a list of all RF activity.
+`buffer` is sent when the count of host bytes not yet sent or acknowledged
+changes, the same moment the VARA `BUFFER` line goes out.
 
-Data, session, PTT, busy, SNR, level and heard events use a reliable queue for
-each client. A client either receives them in order or its connection closes.
-If 256 pending messages fill that queue, the server disconnects that client;
-it never silently skips a state or data event. Replies go directly to the
-requesting socket. Reconnect and query `status` after losing a connection.
+Data, session, PTT, busy, SNR, level, heard, buffer and speed-level events use
+a reliable queue for each client. A client either receives them in order or
+its connection closes. If 256 pending messages fill that queue, the server
+disconnects that client; it never silently skips a state or data event.
+Replies go directly to the requesting socket. Reconnect and query `status`
+after losing a connection.
+
+#### What `status` reports
+
+A daemon fills in more of the `status` reply than the minimal example above.
+Each field appears only once the daemon has published it, so a server with no
+daemon behind it still sends `{"type":"status","id":2,"connected":false,"cp_desync_episodes":0}`.
+Idle, a reply looks like this:
+
+```json
+{"type":"status","id":1,"connected":false,"cp_desync_episodes":0,"ptt":false,"busy":false,"waiting_for_clear_channel":false,"buffer":0,"speed_level":2,"speed_level_mode":"auto","speed_levels":[1,2,3,4,5,6,7,8],"mycall":"N0CALL","max_tx_s":30,"max_tune_s":30,"loop_age_ms":212,"heard":[]}
+```
+
+A client that joins 1.2 s into a transmission learns it at once:
+
+```json
+{"type":"status","id":1,"connected":false,"cp_desync_episodes":0,"ptt":true,"ptt_keyed_ms":1234,"busy":false,"waiting_for_clear_channel":false,"buffer":0,"speed_level":2,"speed_level_mode":"auto","speed_levels":[1,2,3,4,5,6,7,8],"mycall":"N0CALL","max_tx_s":30,"max_tune_s":30,"loop_age_ms":95,"heard":[]}
+```
+
+In a session, `remote_call`, `snr`, `level` and `cfo` appear as before, and
+`link` is added while the session has an ARQ link:
+
+```json
+"link":{"in_flight":1,"retries":1,"max_retries":10,"rto_ms":5200,"fade_hold":false}
+```
+
+| Field | Meaning |
+|---|---|
+| `ptt` | PTT state the daemon last commanded |
+| `ptt_keyed_ms` | Milliseconds PTT has been keyed, computed when the reply is built. Present only while `ptt` is true |
+| `busy` | Last `busy` push value (RX-band occupancy) |
+| `waiting_for_clear_channel` | True while a transmission is held by `[station_id] busy_hold_ms` for a clear channel |
+| `buffer` | Host bytes not yet sent or acknowledged (the VARA `BUFFER` count) |
+| `speed_level` | Speed level our next frame is encoded at |
+| `speed_level_mode` | `auto` (the rate loop chooses) or `manual` (pinned by `set_speed_level`) |
+| `speed_levels` | Levels `set_speed_level` accepts on this engine (HF 1-8, VHF 1-9) |
+| `mycall` | Callsign in force; absent when none |
+| `max_tx_s` | `[radio] max_tx_duration_s` |
+| `max_tune_s` | Longest TUNE accepted: the smaller of `max_tx_s` and 120 |
+| `loop_age_ms` | Milliseconds since the daemon's event loop last completed its 500 ms housekeeping tick or a busy-channel wait step, computed when the reply is built |
+| `heard` | The same snapshot the `heard` push carries |
+| `link` | Session ARQ link: `in_flight`, `retries` (transmissions of the in-flight segment minus one), `max_retries`, `rto_ms`, `fade_hold`. Absent without a session link |
+
+Every reliable state push (`session`, `ptt`, `busy`, `snr`, `level`, `heard`,
+`buffer`, `speed_level`) has a matching `status` field, and the daemon updates
+the field before it pushes. A client that sends `status` after connecting
+therefore never ends on an older value than the pushes it then receives.
+
+#### TUNE and speed level requests
+
+`tune` keys the TX-level calibration tone, exactly like VARA `TUNE`.
+`seconds` defaults to 10 and must be greater than 0 and at most `max_tune_s`.
+Without `single_hz` the tone is the 700 + 1900 Hz two-tone; with it, a single
+tone at that frequency, between 300 and 3000 Hz (the CLI's
+`coppa tune --single`). A daemon with no callsign in force refuses it:
+
+```json
+{"type":"tune","id":2}
+{"type":"ack","id":2}
+{"type":"ptt","state":true}
+{"type":"ptt","state":false}
+{"type":"tune","seconds":5,"single_hz":1500,"id":3}
+{"type":"ack","id":3}
+{"type":"tune","seconds":120,"id":4}
+{"type":"error","message":"TUNE seconds must be greater than 0 and at most 30","id":4}
+{"type":"tune","seconds":5,"single_hz":5000,"id":5}
+{"type":"error","message":"TUNE single_hz must be between 300 and 3000 Hz","id":5}
+{"type":"tune","id":6}
+{"type":"error","message":"No callsign is set; set MYCALL before TUNE","id":6}
+```
+
+`set_speed_level` takes an integer level or the string `"auto"`. A request
+without `level` is an error, so a typo cannot silently mean `auto`:
+
+```json
+{"type":"set_speed_level","level":3,"id":7}
+{"type":"ack","id":7}
+{"type":"speed_level","level":3,"mode":"manual"}
+{"type":"set_speed_level","level":9,"id":8}
+{"type":"error","message":"Speed level 9 is not available on this profile (levels 1-8)","id":8}
+{"type":"set_speed_level","level":"auto","id":9}
+{"type":"ack","id":9}
+{"type":"speed_level","level":2,"mode":"auto"}
+```
+
+`set_speed_level` pins the level every new frame uses, sessionless or in a
+session, until `{"level":"auto"}` or a restart. While pinned, the rate loop
+keeps measuring but does not change the level and does not probe. COP-68
+fade-hold retransmissions still use the fade-hold level. `level` (push and
+`status`) is the peer's level as decoded; `speed_level` is ours. The
+`speed_level` push is sent whenever the level our next frame uses or the mode
+changes, including the rate loop's own changes.
 
 Spectrum, audio levels, logs and decode-failure aggregates are disposable
 telemetry on a separate lossy channel. Lag can skip these messages without
@@ -539,7 +640,14 @@ coarser bins, about 43.75 Hz each, sampled from an approximately 11.7 Hz FFT.
 {"type":"decode_fail","count":6,"timestamp_ms":1761452712300}
 ```
 
-Logs carry INFO, WARN and ERROR events, with each message truncated to 2 KiB.
+Logs carry INFO, WARN and ERROR events with the console line's `key=value`
+fields appended to the message, so a refusal shows its reason:
+
+```json
+{"type":"log","level":"warn","message":"coppad::event_loop: MYCALL rejected callsign=!!bad!! error=Invalid callsign character: '!'","timestamp_ms":1793600129709}
+```
+
+Each message is truncated to 2 KiB, fields included.
 `decode_fail` is unconditional and reports a cumulative failure count at most
 once per 500 ms. Neither diagnostic stream is a delivery receipt.
 
@@ -642,6 +750,75 @@ can still deliver a VARA command line to the command port inside an HTTP
 `POST` body, and the daemon executes it. Until that is fixed, if you enable
 `vara_enabled`, do not browse untrusted sites on the same machine, or run
 `coppad` on a host you do not browse from.
+
+## Operator dashboard
+
+`coppad` serves an operator dashboard at `GET /` on the WebSocket port
+(COP-79, COP-83): one static page that sets a speed level, shows S/N, keys
+TUNE and tells transmitting from a hang without a terminal.
+
+1. Build `coppad` with the `websocket` feature, and set `websocket_enabled =
+   true` and `websocket_token` under `[host]` (see
+   [Setting the token](#setting-the-token)).
+2. Add the page's own origin, exactly as the browser's address bar shows it,
+   to `websocket_allowed_origins`: for example `"http://127.0.0.1:8400"`, and
+   also `"http://localhost:8400"` if you open it by that name. The page's
+   refusal line names the exact string to add.
+3. Open `http://127.0.0.1:8400/`, type the token and press Connect. Loading
+   the page needs no token. The page keeps the token in memory only, so a
+   reload asks for it again; an automatic reconnect reuses it.
+
+The page makes no external requests. Each card:
+
+- **Header**: `Connection:`, `Daemon:`, `MYCALL`, the PTT lamp and the
+  Channel (BUSY) lamp. See the table below.
+- **Waterfall**: one row per `spectrum` frame (4 per second, only while the
+  daemon receives audio), with a spectrum line underneath, a red line where
+  PTT went on and a grey line where it went off.
+- **RX level**: the `audio_level` RX reading as a bar from -60 to 0 dBFS
+  (see [RX level](#rx-level)), and the last transmission's TX level.
+- **S/N**: the last decoded frame's S/N, how long ago it arrived, and a
+  sparkline of the last 2 minutes. When the connection drops the age is
+  dropped too; after a reconnect the page takes the S/N from `status`, which
+  has no arrival time, so the age is missing until the next frame decodes.
+  CFO is the last decoded frame's offset.
+- **Speed level**: `TX <n> · auto` or `TX <n> · manual` (ours), `RX <n>` (the
+  peer's last decoded frame), `Auto` plus one button per level the profile
+  accepts, and the buffer count.
+- **TUNE**: `Seconds` (default 10, at most `max_tune_s`), `Two-tone` and
+  `Single tone 1500 Hz`. Disabled while PTT is keyed. A TUNE cannot be stopped
+  early; it ends after its seconds.
+- **Session**: the session state, the ARQ link (in flight, retries, RTO, fade
+  hold) and the heard list of recent session peers.
+- **Log**: INFO, WARN and ERROR lines with their `key=value` fields, and
+  received data.
+- **Command box**: `MYCALL` and `Set`, `Call station` with `Call` and
+  `Disconnect`, and `Send` (enabled only while a session is connected).
+
+A request's result shows as `<request>: accepted` or
+`<request>: refused: <reason>`. Accepted means accepted for processing; a
+refusal the daemon makes later (an invalid `MYCALL`, for example) shows as a
+WARN line in the log pane.
+
+### Reading the header: transmitting or hung?
+
+| Header shows | What it means | What to check |
+|---|---|---|
+| `Connection: Not connected` | The page has not connected, or you closed it | Type the token and press Connect |
+| `Connection: Connecting…` | The WebSocket handshake is in progress | Wait; it should finish within a second |
+| `Connection: Connected` | The page speaks protocol version 1 with the daemon | Nothing |
+| `Connection: Refused or unreachable: check the token, and that [host] websocket_allowed_origins lists "<origin>"` | The socket never opened: wrong token (401), origin not allowed (403) or daemon not reachable. The browser cannot tell which | The token, the quoted origin in `websocket_allowed_origins`, and that `coppad` is running. The page does not retry |
+| `Connection: Connection lost; reconnecting in <n> s…` | The socket was open and closed | Whether `coppad` is still running. The page retries after 1, 2, 4, 8, then every 15 s |
+| `Connection: Connected, but the daemon speaks protocol version <n>; this page expects protocol version 1` | The daemon and the page are from different releases | Use the page the daemon serves |
+| `Daemon: —` | Not connected | The `Connection:` line |
+| `Daemon: running` | A `status` reply arrived within 5 s and the event loop ticked within 3 s | Nothing |
+| `Daemon: waiting for a clear channel to transmit` | A transmission is held by `[station_id] busy_hold_ms` until the channel clears | The Channel lamp; another station is on frequency |
+| `Daemon: event loop stalled for <n> s` | The process answers, but its event loop has not ticked for 3 s or more | The daemon log; a stuck radio, audio or PTT call. Restart `coppad` if it does not recover |
+| `Daemon: not answering for <n> s` | The socket is open but no `status` reply came for 5 s | Whether the `coppad` process is alive and not starved of CPU |
+| `PTT: —` | PTT state unknown (not connected) | The `Connection:` line |
+| `PTT: RX` | The transmitter is not keyed | Nothing |
+| `PTT: TX <x.x> s of <max_tx_s> s` | The transmitter is keyed, for that long, against `[radio] max_tx_duration_s` | Nothing; a frame or TUNE ends on its own |
+| `PTT: TX <n> s: past the <max_tx_s> s limit. Check the radio and the PTT line.` | PTT has been keyed more than 2 s past the limit, so the daemon's own backstop should already have released it | The radio, the PTT line and the daemon log; see [PTT safety](#ptt-safety-when-coppad-stops) |
 
 ## Connected sessions: delivery and BUFFER
 

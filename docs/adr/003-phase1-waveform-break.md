@@ -111,6 +111,7 @@ waveform decision).
   (does not affect false-positive rejection of noise/tones, which the confirm step already
   handles without pre-filtering). Recovering that margin (a cheaper/shorter filter, or
   downsampling before detection) is a reasonable future improvement, out of this phase's scope.
+  Update (COP-126): recovered on the streaming path by a decimated pre-filter; see ADR-011.
 - **CFO tolerance is now ±50 Hz, not unlimited.** Beyond that the two-stage ambiguity resolution
   itself wraps; sample-clock offset remains uncorrected. This comfortably covers realistic HF
   oscillator + tuning error but is still a bounded envelope, not a general PLL.

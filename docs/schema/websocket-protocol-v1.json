@@ -55,6 +55,13 @@
         }
       ]
     },
+    "AutoKeyword": {
+      "description": "The literal `\"auto\"` of [`SpeedLevelSetting::Auto`].",
+      "type": "string",
+      "enum": [
+        "auto"
+      ]
+    },
     "DataEncoding": {
       "type": "string",
       "enum": [
@@ -94,11 +101,90 @@
         }
       }
     },
+    "LinkStats": {
+      "description": "COP-83: the session ARQ link's state, for `status.link`.",
+      "type": "object",
+      "required": [
+        "fade_hold",
+        "in_flight",
+        "max_retries",
+        "retries",
+        "rto_ms"
+      ],
+      "properties": {
+        "fade_hold": {
+          "description": "COP-68 fade hold: retransmitting at a lower level.",
+          "type": "boolean"
+        },
+        "in_flight": {
+          "description": "Segments sent and not yet acknowledged.",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "max_retries": {
+          "description": "Retransmissions allowed before the link gives up.",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "retries": {
+          "description": "Transmissions of the oldest in-flight segment minus one.",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "rto_ms": {
+          "description": "Current retransmission timeout, ms.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
     "SessionState": {
       "type": "string",
       "enum": [
         "connected",
         "disconnected"
+      ]
+    },
+    "SpeedLevelMode": {
+      "description": "COP-83: who chose the TX speed level in force.",
+      "oneOf": [
+        {
+          "description": "The rate loop chooses.",
+          "type": "string",
+          "enum": [
+            "auto"
+          ]
+        },
+        {
+          "description": "Pinned by `set_speed_level`.",
+          "type": "string",
+          "enum": [
+            "manual"
+          ]
+        }
+      ]
+    },
+    "SpeedLevelSetting": {
+      "description": "COP-83: the `level` of a `set_speed_level` request: a speed level, or the string `\"auto\"`.",
+      "anyOf": [
+        {
+          "description": "Return the TX level to the rate loop.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AutoKeyword"
+            }
+          ]
+        },
+        {
+          "description": "Pin the TX level.",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        }
       ]
     },
     "WsRequest": {
@@ -259,6 +345,54 @@
               ]
             }
           }
+        },
+        {
+          "description": "COP-83: key the TX-level calibration tone. `seconds` defaults to 10 and must be greater than 0 and at most `status.max_tune_s`. Without `single_hz` the tone is the 700 + 1900 Hz two-tone; with it, a single tone at that frequency (300-3000 Hz). Needs a callsign in force.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "seconds": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "float"
+            },
+            "single_hz": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "float"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tune"
+              ]
+            }
+          }
+        },
+        {
+          "description": "COP-83: pin the TX speed level every new frame uses, or return it to the rate loop with `\"auto\"`. The level must be one of `status.speed_levels`.",
+          "type": "object",
+          "required": [
+            "level",
+            "type"
+          ],
+          "properties": {
+            "level": {
+              "$ref": "#/definitions/SpeedLevelSetting"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "set_speed_level"
+              ]
+            }
+          }
         }
       ],
       "properties": {
@@ -283,6 +417,22 @@
             "type"
           ],
           "properties": {
+            "buffer": {
+              "description": "COP-83: host bytes not yet sent or acknowledged (the VARA `BUFFER` count).",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "busy": {
+              "description": "COP-83: last `busy` push value (RX-band occupancy).",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "cfo": {
               "description": "Carrier frequency offset (Hz) estimated on the last decoded frame (decision 8).",
               "type": [
@@ -301,6 +451,16 @@
               "format": "uint32",
               "minimum": 0.0
             },
+            "heard": {
+              "description": "COP-83: the same snapshot the `heard` push carries.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/definitions/HeardStation"
+              }
+            },
             "id": {
               "type": [
                 "integer",
@@ -316,6 +476,67 @@
                 "null"
               ],
               "format": "uint8",
+              "minimum": 0.0
+            },
+            "link": {
+              "description": "COP-83: the session ARQ link; absent without one.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/LinkStats"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "loop_age_ms": {
+              "description": "COP-83: milliseconds since the daemon's event loop last completed its 500 ms housekeeping tick or a busy-channel wait step, computed when the reply is built.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "max_tune_s": {
+              "description": "COP-83: longest TUNE accepted, in seconds: the smaller of `max_tx_s` and 120.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "max_tx_s": {
+              "description": "COP-83: `[radio] max_tx_duration_s`.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "mycall": {
+              "description": "COP-83: callsign in force; absent when none.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ptt": {
+              "description": "COP-83: PTT state the daemon last commanded.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "ptt_keyed_ms": {
+              "description": "COP-83: milliseconds PTT has been keyed, computed when the reply is built. Present only while `ptt` is true.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
               "minimum": 0.0
             },
             "remote_call": {
@@ -338,10 +559,49 @@
               ],
               "format": "int32"
             },
+            "speed_level": {
+              "description": "COP-83: speed level our next frame is encoded at. `level` is the peer's, as decoded.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint8",
+              "minimum": 0.0
+            },
+            "speed_level_mode": {
+              "description": "COP-83: `auto` (the rate loop chooses) or `manual` (pinned by `set_speed_level`).",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/SpeedLevelMode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "speed_levels": {
+              "description": "COP-83: levels `set_speed_level` accepts on this engine.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "minimum": 0.0
+              }
+            },
             "type": {
               "type": "string",
               "enum": [
                 "status"
+              ]
+            },
+            "waiting_for_clear_channel": {
+              "description": "COP-83: true while a transmission is held by `[station_id] busy_hold_ms` for a clear channel.",
+              "type": [
+                "boolean",
+                "null"
               ]
             }
           }
@@ -560,6 +820,52 @@
               "type": "string",
               "enum": [
                 "heard"
+              ]
+            }
+          }
+        },
+        {
+          "description": "COP-83: host bytes not yet sent or acknowledged, sent when the count changes (the same moment VARA `BUFFER` goes out). Reliable.",
+          "type": "object",
+          "required": [
+            "bytes",
+            "type"
+          ],
+          "properties": {
+            "bytes": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "buffer"
+              ]
+            }
+          }
+        },
+        {
+          "description": "COP-83: the TX speed level our next frame uses and who chose it, sent whenever either changes. Reliable.",
+          "type": "object",
+          "required": [
+            "level",
+            "mode",
+            "type"
+          ],
+          "properties": {
+            "level": {
+              "type": "integer",
+              "format": "uint8",
+              "minimum": 0.0
+            },
+            "mode": {
+              "$ref": "#/definitions/SpeedLevelMode"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "speed_level"
               ]
             }
           }

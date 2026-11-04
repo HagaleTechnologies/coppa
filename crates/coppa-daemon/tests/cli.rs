@@ -6,6 +6,9 @@
 //! for the expected exit. Output goes to temporary files rather than pipes, so
 //! a full pipe cannot hide the process finishing.
 
+// COP-142: the std-clock ban in clippy.toml targets event_loop only.
+#![allow(clippy::disallowed_methods)]
+
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};

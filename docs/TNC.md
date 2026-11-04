@@ -11,6 +11,9 @@ coppa. It is not a Direwolf replacement. It has no AGWPE interface, no channel-b
 ignores KISS TXDELAY, persistence and slot time), no digipeating or beaconing, and runs only at
 1200 baud. That parity work is planned as H-122 in the
 [2026-09-05 product review](reviews/2026-09-05-product-ux-market-review.md).
+Measured against Direwolf 1.7 on track 2 of the WA8LMF TNC Test CD, coppa decodes 412 packets
+to Direwolf's 1000 (41.2 percent). The method and the script that reproduces it are in
+[testing/tnc-direwolf-wa8lmf.md](testing/tnc-direwolf-wa8lmf.md).
 
 What it does:
 
