@@ -506,9 +506,6 @@
       "visibility": "public"
     },
     {
-<<<<<<< HEAD
-      "hash": "sha256:1011e23c8debd0ee717dbcceff559f2988c21df216d04c28df6282b67fa548da",
-=======
       "hash": "sha256:b1fa92d938a3445339f1d05cc025443e43a96c9a4cec7f35b0ac9b430654f2aa",
       "id": "paused-clock-timers",
       "kind": "gotcha",
@@ -530,8 +527,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:ece8378df1627dd56e8d8c10c4a995d5474ccc0993b6d4a7c2760fb7fefe9ec0",
->>>>>>> d837c89d388eaf9c70752c72db8537d910094cc8
+      "hash": "sha256:1011e23c8debd0ee717dbcceff559f2988c21df216d04c28df6282b67fa548da",
       "id": "phase4-field-readiness",
       "kind": "gotcha",
       "links": [

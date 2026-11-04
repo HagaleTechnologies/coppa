@@ -5238,8 +5238,9 @@ impl EventLoop {
     }
 
     /// The body of `wait_for_clear_channel`: wait while the channel reads
-    /// busy, then a random holdoff. Returns `true` when an `ABORT` cut it.
-    async fn wait_until_channel_clear(&mut self, hold_ms: u64) -> bool {
+    /// busy, then a random holdoff. Returns the reason an `ABORT` or
+    /// `Shutdown` cut the wait, or `None` once the channel is clear.
+    async fn wait_until_channel_clear(&mut self, hold_ms: u64) -> Option<WaitCut> {
         loop {
             while self.busy_gate.current() {
                 if let Some(cut) = self.abort_waiting() {
