@@ -2111,6 +2111,7 @@ impl EventLoop {
                             last_heard_ms: crate::ws_log::timestamp_ms(),
                             snr_db,
                             level,
+                            grid: None,
                         },
                     );
                     self.ws_heard.truncate(32);
@@ -6412,7 +6413,7 @@ impl EventLoop {
             MacFrameType::Data => self.handle_session_data(pdu).await,
             MacFrameType::Ack => self.handle_session_ack(pdu).await,
             MacFrameType::Keepalive => self.handle_keepalive_rx(pdu),
-            MacFrameType::Beacon => self.handle_beacon_rx(pdu),
+            MacFrameType::Beacon => self.handle_beacon_rx(pdu).await,
             MacFrameType::Datagram => self.handle_kiss_datagram_rx(pdu),
             _ => {
                 tracing::debug!(frame_type = ?pdu.frame_type, "Unhandled MAC frame type");
@@ -6420,18 +6421,68 @@ impl EventLoop {
         }
     }
 
-    /// Received a station-ID/beacon frame (Phase 4 Task 3) from another
-    /// station. No session/state-machine effect (a beacon isn't directed at
-    /// this station specifically) -- just logged for operator visibility;
-    /// full decode of the inner `StationIdPayload` (grid/level) is left to
-    /// whatever's consuming the log/telemetry rather than surfaced further,
-    /// matching this task's "don't overbuild" guidance.
-    fn handle_beacon_rx(&self, pdu: MacPdu) {
+    /// Received a station-ID/beacon frame (COP-61 Phase 4 Task 3) from
+    /// another station. No session/state-machine effect (a beacon isn't
+    /// directed at this station specifically). COP-120: the payload is
+    /// decoded per SPEC §17.5 and the station is recorded in the heard list
+    /// (call, grid, level, SNR, time heard) for operator visibility. A
+    /// beacon whose payload fails to decode is still recorded under its MAC
+    /// source callsign, with a WARN naming the typed error.
+    async fn handle_beacon_rx(&mut self, pdu: MacPdu) {
+        let (call, grid, level) = match StationIdPayload::from_bytes(&pdu.payload) {
+            Ok(sid) => (sid.callsign, sid.grid, Some(sid.level)),
+            Err(error) => {
+                tracing::warn!(
+                    from = %pdu.src,
+                    error = %error,
+                    "Station-ID/beacon payload failed to decode; recording MAC source only"
+                );
+                (pdu.src.to_string(), None, None)
+            }
+        };
         tracing::info!(
             from = %pdu.src,
+            call = %call,
+            grid = grid.as_deref().unwrap_or(""),
+            level = ?level,
             bytes = pdu.payload.len(),
             "Station-ID/beacon frame received"
         );
+        #[cfg(feature = "websocket")]
+        {
+            use coppa_host::websocket::{HeardStation, WsServerMessage};
+            // Same writer rules as the session-connected arm of
+            // `notify_session`: dedupe by call, read SNR from the snapshot
+            // the decode loop already filled for this frame, insert at the
+            // front, cap at 32, mirror into `status`, then push `heard` on
+            // the reliable queue (heard is state, never lossy telemetry).
+            let (snr_db, snapshot_level) = if let Some(status) = &self.ws_status {
+                let snapshot = status.lock().await;
+                (snapshot.snr, snapshot.level)
+            } else {
+                (None, None)
+            };
+            let level = level.or(snapshot_level);
+            self.ws_heard.retain(|station| station.call != call);
+            self.ws_heard.insert(
+                0,
+                HeardStation {
+                    call: call.clone(),
+                    last_heard_ms: crate::ws_log::timestamp_ms(),
+                    snr_db,
+                    level,
+                    grid,
+                },
+            );
+            self.ws_heard.truncate(32);
+            if let Some(status) = &self.ws_status {
+                let mut snap = status.lock().await;
+                snap.heard = Some(self.ws_heard.clone());
+            }
+            self.ws_push_reliable(WsServerMessage::Heard {
+                stations: self.ws_heard.clone(),
+            });
+        }
     }
 
     async fn handle_incoming_connect(&mut self, pdu: MacPdu) {
@@ -14999,6 +15050,120 @@ mod tests {
             let snap = status.lock().await;
             assert!(!snap.connected);
             assert_eq!(snap.remote_call, None);
+            task.abort();
+        }
+
+        /// COP-120: SPEC §17.5 golden beacon vectors, injected one layer
+        /// below the modem exactly the way the session tests above inject
+        /// handshake frames.
+        #[cfg(feature = "websocket")]
+        const COP120_P10_HEX: &str = "1658b78108300058b7810830000006564b33414243045146323201";
+        #[cfg(feature = "websocket")]
+        const COP120_P11_HEX: &str = "165dc0570000005dc0570000000004573141570001";
+
+        #[cfg(feature = "websocket")]
+        fn cop120_pdu_from_hex(hex: &str) -> MacPdu {
+            let raw: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            MacPdu::from_bytes(&raw).expect("SPEC beacon vector must parse as a MacPdu")
+        }
+
+        /// A received beacon is decoded and recorded in the heard list with
+        /// the payload's callsign, grid and level plus the time heard, and
+        /// the same entry reaches operators as a reliable `heard` push and
+        /// in the `status` snapshot. P10 is the SPEC golden beacon
+        /// (VK3ABC, QF22, level 1).
+        #[cfg(feature = "websocket")]
+        #[tokio::test]
+        async fn cop120_beacon_populates_the_heard_list_with_grid_and_level() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            let (mut ws, task) = connect_ws(&mut station).await;
+            let pdu = cop120_pdu_from_hex(COP120_P10_HEX);
+            assert_eq!(pdu.frame_type, MacFrameType::Beacon);
+            station.handle_mac_pdu(pdu).await;
+            assert_eq!(station.ws_heard.len(), 1);
+            let entry = &station.ws_heard[0];
+            assert_eq!(entry.call, "VK3ABC");
+            assert_eq!(entry.grid.as_deref(), Some("QF22"));
+            assert_eq!(entry.level, Some(1));
+            assert!(entry.last_heard_ms > 0);
+            let heard = next_ws_type(&mut ws, "heard").await;
+            assert_eq!(heard["stations"][0]["call"], "VK3ABC");
+            assert_eq!(heard["stations"][0]["grid"], "QF22");
+            assert_eq!(heard["stations"][0]["level"], 1);
+            assert!(heard["stations"][0]["last_heard_ms"].as_u64().unwrap() > 0);
+            let snap = station.ws_status.as_ref().unwrap().lock().await;
+            assert_eq!(snap.heard.as_ref().unwrap()[0].call, "VK3ABC");
+            task.abort();
+        }
+
+        /// P11 (W1AW) carries no grid, so the heard entry and the push omit
+        /// the field entirely rather than serializing a null.
+        #[cfg(feature = "websocket")]
+        #[tokio::test]
+        async fn cop120_beacon_without_grid_leaves_grid_absent() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            let (mut ws, task) = connect_ws(&mut station).await;
+            station
+                .handle_mac_pdu(cop120_pdu_from_hex(COP120_P11_HEX))
+                .await;
+            assert_eq!(station.ws_heard.len(), 1);
+            let entry = &station.ws_heard[0];
+            assert_eq!(entry.call, "W1AW");
+            assert_eq!(entry.grid, None);
+            assert_eq!(entry.level, Some(1));
+            let heard = next_ws_type(&mut ws, "heard").await;
+            assert_eq!(heard["stations"][0]["call"], "W1AW");
+            assert!(heard["stations"][0].get("grid").is_none());
+            task.abort();
+        }
+
+        /// A beacon whose payload fails to decode is still evidence a
+        /// station exists: the entry is recorded under the MAC header's
+        /// callsign with no grid, and the `heard` push still goes out.
+        #[cfg(feature = "websocket")]
+        #[tokio::test]
+        async fn cop120_beacon_with_corrupt_payload_records_the_mac_source() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            let (mut ws, task) = connect_ws(&mut station).await;
+            let mut pdu = cop120_pdu_from_hex(COP120_P10_HEX);
+            assert_eq!(pdu.src.to_string(), "VK3ABC");
+            // callsign_len = 5 but only two callsign bytes follow, so
+            // `StationIdPayload::from_bytes` fails with a truncated error.
+            pdu.payload = vec![5, b'V', b'K'];
+            station.handle_mac_pdu(pdu).await;
+            assert_eq!(station.ws_heard.len(), 1);
+            let entry = &station.ws_heard[0];
+            assert_eq!(entry.call, "VK3ABC");
+            assert_eq!(entry.grid, None);
+            assert_eq!(entry.level, None);
+            let heard = next_ws_type(&mut ws, "heard").await;
+            assert_eq!(heard["stations"][0]["call"], "VK3ABC");
+            assert!(heard["stations"][0].get("grid").is_none());
+            task.abort();
+        }
+
+        /// A station that beacons again refreshes its single entry at the
+        /// front of the list instead of accumulating duplicates.
+        #[cfg(feature = "websocket")]
+        #[tokio::test]
+        async fn cop120_repeated_beacon_dedupes_to_one_refreshed_entry() {
+            let mut station = EventLoop::new(session_config()).unwrap();
+            let (_ws, task) = connect_ws(&mut station).await;
+            station
+                .handle_mac_pdu(cop120_pdu_from_hex(COP120_P11_HEX))
+                .await;
+            station
+                .handle_mac_pdu(cop120_pdu_from_hex(COP120_P10_HEX))
+                .await;
+            station
+                .handle_mac_pdu(cop120_pdu_from_hex(COP120_P10_HEX))
+                .await;
+            assert_eq!(station.ws_heard.len(), 2);
+            assert_eq!(station.ws_heard[0].call, "VK3ABC");
+            assert_eq!(station.ws_heard[1].call, "W1AW");
             task.abort();
         }
 

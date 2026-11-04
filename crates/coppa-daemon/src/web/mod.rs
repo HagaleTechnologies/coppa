@@ -70,7 +70,7 @@ mod tests {
         "RTO",
         "Fade hold: retransmitting at a lower level",
         "Heard",
-        "No stations heard yet. Stations appear here after a session connects.",
+        "No stations heard yet. Stations appear here after a session connects or a beacon is received.",
         "Log",
         "No log lines yet.",
         "RX data:",

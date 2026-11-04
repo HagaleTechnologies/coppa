@@ -315,7 +315,7 @@ also silent on WebSocket, as noted in the `connect` row.
 | `session` | `"state":"connected"` with `remote_call`, or `"state":"disconnected"` | reliable |
 | `data` | received session data, with `encoding` `utf8` or `base64`, every byte kept | reliable |
 | `ptt`, `busy`, `snr`, `level` | PTT edges, channel occupancy, SNR in dB, speed level | reliable |
-| `heard` | a full snapshot of up to 32 recent session peers | reliable |
+| `heard` | a full snapshot of up to 32 recent stations: session peers plus stations whose station-ID beacons were received (with the beacon's grid, when it carried one) | reliable |
 | `spectrum`, `audio_level`, `log` | only after the client opts in | lossy |
 | `decode_fail` | a cumulative count, at most every 500 ms | lossy |
 

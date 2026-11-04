@@ -511,8 +511,10 @@ can still be rejected there with a warning log.
 For `send`, omitted `encoding` means `utf8`. Use `base64` for arbitrary bytes;
 invalid base64 produces an error with the request id. Received `data` always
 specifies its encoding and preserves every byte. Raw WebSocket binary frames
-are not payload messages. `heard` is a full snapshot of up to 32 recent session
-peers, including the last-heard timestamp, rather than a list of all RF activity.
+are not payload messages. `heard` is a full snapshot of up to 32 recent
+stations -- session peers and stations whose station-ID beacons were received
+-- including the last-heard timestamp and, for beacon entries, the grid the
+beacon carried, rather than a list of all RF activity.
 `buffer` is sent when the count of host bytes not yet sent or acknowledged
 changes, the same moment the VARA `BUFFER` line goes out.
 
