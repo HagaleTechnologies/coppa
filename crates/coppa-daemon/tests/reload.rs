@@ -4,6 +4,8 @@
 //! directory, so the tests run in parallel. Unix only (SIGHUP), and skipped
 //! with `cpal-backend` for the same reason as `ptt_release.rs`.
 #![cfg(all(unix, not(feature = "cpal-backend")))]
+// COP-142: the std-clock ban in clippy.toml targets event_loop only.
+#![allow(clippy::disallowed_methods)]
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};

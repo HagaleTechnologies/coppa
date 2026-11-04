@@ -11730,10 +11730,10 @@ mod tests {
             for _ in 0..release_blocks {
                 audio_in_tx.write(&noise(0.01));
             }
-            let aborted = tokio::time::timeout(Duration::from_secs(5), wait)
+            let cut = tokio::time::timeout(Duration::from_secs(5), wait)
                 .await
                 .unwrap();
-            assert!(!aborted);
+            assert_eq!(cut, None, "the channel cleared; nothing cut the wait");
         }
         assert_eq!(status.lock().await.waiting_for_clear_channel, Some(false));
     }

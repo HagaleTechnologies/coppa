@@ -6,6 +6,8 @@
 //! Skipped with `cpal-backend`, as `ptt_release.rs` is: that build opens the
 //! host's default audio device, which a CI runner may not have.
 #![cfg(not(feature = "cpal-backend"))]
+// COP-142: the std-clock ban in clippy.toml targets event_loop only.
+#![allow(clippy::disallowed_methods)]
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
