@@ -181,6 +181,27 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:fa060b6c5bcdf002f2b2c27f358f5041101f37e5200aa77589e6dcf7740b6810",
+      "id": "adr-011-decimated-sync-prefilter",
+      "kind": "decision-digest",
+      "links": [
+        "adr-003-waveform-break",
+        "adr-004-strongest-path-timing"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/adr-011-decimated-sync-prefilter.md",
+      "sources": [
+        "docs/adr/011-cop126-decimated-sync-prefilter.md",
+        "crates/coppa-codec/src/ofdm/sync_detector.rs"
+      ],
+      "status": "current",
+      "title": "Why does the streaming receiver's SyncDetector band-pass and decimate its input?",
+      "verified_commit": "2526b50",
+      "verified_date": "2026-11-03",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:13a7fb2e979343d94243578e036c469e63abad53334d10e485f801fcfcf9f102",
       "id": "agent-tooling",
       "kind": "gotcha",
@@ -485,7 +506,32 @@
       "visibility": "public"
     },
     {
+<<<<<<< HEAD
       "hash": "sha256:1011e23c8debd0ee717dbcceff559f2988c21df216d04c28df6282b67fa548da",
+=======
+      "hash": "sha256:b1fa92d938a3445339f1d05cc025443e43a96c9a4cec7f35b0ac9b430654f2aa",
+      "id": "paused-clock-timers",
+      "kind": "gotcha",
+      "links": [
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/paused-clock-timers.md",
+      "sources": [
+        "crates/coppa-daemon/src/event_loop.rs",
+        "crates/coppa-daemon/src/audio_output.rs",
+        "crates/coppa-daemon/clippy.toml"
+      ],
+      "status": "current",
+      "title": "What will bite you when a paused-clock test drives the daemon's timers?",
+      "verified_commit": "2526b50",
+      "verified_date": "2026-11-04",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:ece8378df1627dd56e8d8c10c4a995d5474ccc0993b6d4a7c2760fb7fefe9ec0",
+>>>>>>> d837c89d388eaf9c70752c72db8537d910094cc8
       "id": "phase4-field-readiness",
       "kind": "gotcha",
       "links": [
@@ -507,6 +553,28 @@
       "status": "current",
       "title": "What will bite you in the daemon's real-radio TX/RX path?",
       "verified_commit": "dc18b8b",
+      "verified_date": "2026-11-03",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:b352ed5416cfb4361ca06c059b10fc089ffed56f1474c9857b8e9cc1d588c949",
+      "id": "tnc-direwolf-benchmark",
+      "kind": "gotcha",
+      "links": [
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/tnc-direwolf-benchmark.md",
+      "sources": [
+        "tools/tnc-bench/run.sh",
+        "crates/coppa-bench/src/afsk_direwolf.rs",
+        "crates/coppa-codec/src/afsk.rs",
+        "docs/testing/tnc-direwolf-wa8lmf.md"
+      ],
+      "status": "current",
+      "title": "What will bite you when measuring coppa's TNC against Direwolf?",
+      "verified_commit": "2526b50",
       "verified_date": "2026-11-03",
       "visibility": "public"
     },

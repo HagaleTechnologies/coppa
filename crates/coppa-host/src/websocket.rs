@@ -48,6 +48,65 @@ pub enum WsClientMessage {
     AudioLevel { enabled: bool },
     #[serde(rename = "log")]
     Log { enabled: bool },
+    /// COP-83: key the TX-level calibration tone. `seconds` defaults to 10
+    /// and must be greater than 0 and at most `status.max_tune_s`. Without
+    /// `single_hz` the tone is the 700 + 1900 Hz two-tone; with it, a single
+    /// tone at that frequency (300-3000 Hz). Needs a callsign in force.
+    #[serde(rename = "tune")]
+    Tune {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seconds: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        single_hz: Option<f32>,
+    },
+    /// COP-83: pin the TX speed level every new frame uses, or return it to
+    /// the rate loop with `"auto"`. The level must be one of
+    /// `status.speed_levels`.
+    #[serde(rename = "set_speed_level")]
+    SetSpeedLevel { level: SpeedLevelSetting },
+}
+
+/// COP-83: the `level` of a `set_speed_level` request: a speed level, or the
+/// string `"auto"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum SpeedLevelSetting {
+    /// Return the TX level to the rate loop.
+    Auto(AutoKeyword),
+    /// Pin the TX level.
+    Level(u8),
+}
+
+/// The literal `"auto"` of [`SpeedLevelSetting::Auto`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum AutoKeyword {
+    #[serde(rename = "auto")]
+    Auto,
+}
+
+/// COP-83: who chose the TX speed level in force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SpeedLevelMode {
+    /// The rate loop chooses.
+    Auto,
+    /// Pinned by `set_speed_level`.
+    Manual,
+}
+
+/// COP-83: the session ARQ link's state, for `status.link`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LinkStats {
+    /// Segments sent and not yet acknowledged.
+    pub in_flight: u8,
+    /// Transmissions of the oldest in-flight segment minus one.
+    pub retries: u8,
+    /// Retransmissions allowed before the link gives up.
+    pub max_retries: u8,
+    /// Current retransmission timeout, ms.
+    pub rto_ms: u64,
+    /// COP-68 fade hold: retransmitting at a lower level.
+    pub fade_hold: bool,
 }
 
 /// JSON message sent to a WebSocket client.
@@ -99,6 +158,56 @@ pub enum WsServerMessage {
         /// message over one new telemetry field.
         #[serde(default)]
         cp_desync_episodes: u32,
+        /// COP-83: PTT state the daemon last commanded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ptt: Option<bool>,
+        /// COP-83: milliseconds PTT has been keyed, computed when the reply
+        /// is built. Present only while `ptt` is true.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ptt_keyed_ms: Option<u64>,
+        /// COP-83: last `busy` push value (RX-band occupancy).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        busy: Option<bool>,
+        /// COP-83: true while a transmission is held by
+        /// `[station_id] busy_hold_ms` for a clear channel.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        waiting_for_clear_channel: Option<bool>,
+        /// COP-83: host bytes not yet sent or acknowledged (the VARA `BUFFER`
+        /// count).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        buffer: Option<u64>,
+        /// COP-83: speed level our next frame is encoded at. `level` is the
+        /// peer's, as decoded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        speed_level: Option<u8>,
+        /// COP-83: `auto` (the rate loop chooses) or `manual` (pinned by
+        /// `set_speed_level`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        speed_level_mode: Option<SpeedLevelMode>,
+        /// COP-83: levels `set_speed_level` accepts on this engine.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        speed_levels: Option<Vec<u8>>,
+        /// COP-83: callsign in force; absent when none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mycall: Option<String>,
+        /// COP-83: `[radio] max_tx_duration_s`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_tx_s: Option<u64>,
+        /// COP-83: longest TUNE accepted, in seconds: the smaller of
+        /// `max_tx_s` and 120.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_tune_s: Option<u64>,
+        /// COP-83: milliseconds since the daemon's event loop last completed
+        /// its 500 ms housekeeping tick or a busy-channel wait step, computed
+        /// when the reply is built.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        loop_age_ms: Option<u64>,
+        /// COP-83: the same snapshot the `heard` push carries.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        heard: Option<Vec<HeardStation>>,
+        /// COP-83: the session ARQ link; absent without one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<LinkStats>,
     },
     /// Data received from remote station.
     #[serde(rename = "data")]
@@ -134,6 +243,14 @@ pub enum WsServerMessage {
     Level { level: u8 },
     #[serde(rename = "heard")]
     Heard { stations: Vec<HeardStation> },
+    /// COP-83: host bytes not yet sent or acknowledged, sent when the count
+    /// changes (the same moment VARA `BUFFER` goes out). Reliable.
+    #[serde(rename = "buffer")]
+    Buffer { bytes: u64 },
+    /// COP-83: the TX speed level our next frame uses and who chose it, sent
+    /// whenever either changes. Reliable.
+    #[serde(rename = "speed_level")]
+    SpeedLevel { level: u8, mode: SpeedLevelMode },
     #[serde(rename = "log")]
     Log {
         level: String,
@@ -341,6 +458,125 @@ pub struct WsStatus {
     pub short_cp_ok: Option<bool>,
     /// See `WsServerMessage::Status::cp_desync_episodes`'s doc.
     pub cp_desync_episodes: u32,
+    /// COP-83: PTT state the daemon last commanded.
+    pub ptt: Option<bool>,
+    /// COP-83: when PTT was keyed; `status.ptt_keyed_ms` is its age.
+    pub ptt_since: Option<std::time::Instant>,
+    /// COP-83: last `busy` push value.
+    pub busy: Option<bool>,
+    /// COP-83: a transmission is waiting for a clear channel.
+    pub waiting_for_clear_channel: Option<bool>,
+    /// COP-83: host bytes not yet sent or acknowledged.
+    pub buffer: Option<u64>,
+    /// COP-83: speed level our next frame is encoded at.
+    pub speed_level: Option<u8>,
+    /// COP-83: who chose `speed_level`.
+    pub speed_level_mode: Option<SpeedLevelMode>,
+    /// COP-83: levels `set_speed_level` accepts.
+    pub speed_levels: Option<Vec<u8>>,
+    /// COP-83: callsign in force.
+    pub mycall: Option<String>,
+    /// COP-83: `[radio] max_tx_duration_s`.
+    pub max_tx_s: Option<u64>,
+    /// COP-83: longest TUNE accepted, seconds. `Some` once the daemon has
+    /// published, which turns on the WS task's `tune` checks.
+    pub max_tune_s: Option<u64>,
+    /// COP-83: when the event loop last ticked; `status.loop_age_ms` is its
+    /// age.
+    pub loop_heartbeat: Option<std::time::Instant>,
+    /// COP-83: the `heard` push's snapshot.
+    pub heard: Option<Vec<HeardStation>>,
+    /// COP-83: the session ARQ link.
+    pub link: Option<LinkStats>,
+}
+
+impl WsStatus {
+    /// COP-83: the `status` reply for this snapshot, with `ptt_keyed_ms` and
+    /// `loop_age_ms` computed now.
+    pub fn reply(self, id: Option<u64>) -> WsServerMessage {
+        let millis = |since: std::time::Instant| since.elapsed().as_millis() as u64;
+        let ptt_keyed_ms = match (self.ptt, self.ptt_since) {
+            (Some(true), Some(since)) => Some(millis(since)),
+            (Some(true), None) => Some(0),
+            _ => None,
+        };
+        WsServerMessage::Status {
+            id,
+            connected: self.connected,
+            remote_call: self.remote_call,
+            snr: self.snr,
+            level: self.level,
+            cfo: self.cfo,
+            short_cp_ok: self.short_cp_ok,
+            cp_desync_episodes: self.cp_desync_episodes,
+            ptt: self.ptt,
+            ptt_keyed_ms,
+            busy: self.busy,
+            waiting_for_clear_channel: self.waiting_for_clear_channel,
+            buffer: self.buffer,
+            speed_level: self.speed_level,
+            speed_level_mode: self.speed_level_mode,
+            speed_levels: self.speed_levels,
+            mycall: self.mycall,
+            max_tx_s: self.max_tx_s,
+            max_tune_s: self.max_tune_s,
+            loop_age_ms: self.loop_heartbeat.map(millis),
+            heard: self.heard,
+            link: self.link,
+        }
+    }
+
+    /// COP-83: refuse a `tune` this snapshot shows the daemon would refuse.
+    /// Checks nothing until the daemon has published (`max_tune_s` is
+    /// `Some`); the daemon re-validates everything.
+    pub fn check_tune(&self, seconds: Option<f32>, single_hz: Option<f32>) -> Result<(), String> {
+        let Some(max) = self.max_tune_s else {
+            return Ok(());
+        };
+        if self.mycall.is_none() {
+            return Err("No callsign is set; set MYCALL before TUNE".to_owned());
+        }
+        if let Some(seconds) = seconds {
+            if !(seconds > 0.0 && seconds <= max as f32) {
+                return Err(format!(
+                    "TUNE seconds must be greater than 0 and at most {max}"
+                ));
+            }
+        }
+        if let Some(hz) = single_hz {
+            if !(coppa_engine::TUNE_SINGLE_MIN_HZ..=coppa_engine::TUNE_SINGLE_MAX_HZ).contains(&hz)
+            {
+                return Err(format!(
+                    "TUNE single_hz must be between {} and {} Hz",
+                    coppa_engine::TUNE_SINGLE_MIN_HZ,
+                    coppa_engine::TUNE_SINGLE_MAX_HZ
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// COP-83: refuse a `set_speed_level` level outside `speed_levels`.
+    /// Checks nothing until the daemon has published the ladder.
+    pub fn check_speed_level(&self, level: SpeedLevelSetting) -> Result<(), String> {
+        match (level, &self.speed_levels) {
+            (SpeedLevelSetting::Level(n), Some(ladder)) if !ladder.contains(&n) => {
+                Err(speed_level_unavailable(n, ladder))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// COP-83: the refusal text for a speed level outside `ladder`, shared by the
+/// WS task and the daemon's log line.
+pub fn speed_level_unavailable(level: u8, ladder: &[u8]) -> String {
+    match (ladder.first(), ladder.last()) {
+        (Some(first), Some(last)) => {
+            format!("Speed level {level} is not available on this profile (levels {first}-{last})")
+        }
+        _ => format!("Speed level {level} is not available on this profile"),
+    }
 }
 
 /// Periodic broadcast streams a connection must opt into before
@@ -633,6 +869,7 @@ impl WebSocketServer {
     /// `{"status":"degraded"}`, for monitoring tools. The answer needs no
     /// token, so it carries the status and nothing else. Without this, such a
     /// request gets `404`.
+    #[must_use]
     pub fn with_health(mut self, health: Health) -> Self {
         self.health = Some(health);
         self
@@ -934,8 +1171,7 @@ impl WebSocketServer {
                                                 }
                                             }
                                             WsClientMessage::Status => {
-                                                let snapshot = status.lock().await.clone();
-                                                let response = WsServerMessage::Status {id, connected: snapshot.connected, remote_call: snapshot.remote_call, snr: snapshot.snr, level: snapshot.level, cfo: snapshot.cfo, short_cp_ok: snapshot.short_cp_ok, cp_desync_episodes: snapshot.cp_desync_episodes};
+                                                let response = status.lock().await.clone().reply(id);
                                                 let json = serde_json::to_string(&response).expect("status serializes");
                                                 if sink.send(tokio_tungstenite::tungstenite::Message::Text(json.into())).await.is_err() {break;}
                                                 continue;
@@ -943,6 +1179,14 @@ impl WebSocketServer {
                                             WsClientMessage::Spectrum {enabled} => spectrum_enabled = enabled,
                                             WsClientMessage::AudioLevel {enabled} => audio_level_enabled = enabled,
                                             WsClientMessage::Log {enabled} => log_enabled = enabled,
+                                            WsClientMessage::Tune {seconds, single_hz} => match status.lock().await.check_tune(seconds, single_hz) {
+                                                Ok(()) => host_event = Some(HostEvent::Tune {client_id, seconds, single_hz}),
+                                                Err(message) => error = Some(message),
+                                            },
+                                            WsClientMessage::SetSpeedLevel {level} => match status.lock().await.check_speed_level(level) {
+                                                Ok(()) => host_event = Some(HostEvent::SetSpeedLevel {client_id, level: match level {SpeedLevelSetting::Auto(_) => None, SpeedLevelSetting::Level(n) => Some(n)}}),
+                                                Err(message) => error = Some(message),
+                                            },
                                         }
                                         if let Some(event) = host_event {
                                             if event_tx.send(event).await.is_err() { error = Some("Daemon unavailable".to_owned()); }
@@ -1247,16 +1491,16 @@ mod tests {
 
     #[test]
     fn test_ws_server_message_format() {
-        let msg = WsServerMessage::Status {
-            id: None,
+        let msg = WsStatus {
             connected: true,
             remote_call: Some("VK3DEF".to_string()),
             snr: Some(15),
             level: Some(4),
             cfo: Some(12.5),
             short_cp_ok: Some(true),
-            cp_desync_episodes: 0,
-        };
+            ..WsStatus::default()
+        }
+        .reply(None);
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("connected"));
         assert!(json.contains("VK3DEF"));
@@ -1329,17 +1573,7 @@ mod tests {
         .unwrap();
         assert_eq!(opt_in_stream(&data_json), None);
 
-        let status_json = serde_json::to_string(&WsServerMessage::Status {
-            id: None,
-            connected: false,
-            remote_call: None,
-            snr: None,
-            level: None,
-            cfo: None,
-            short_cp_ok: None,
-            cp_desync_episodes: 0,
-        })
-        .unwrap();
+        let status_json = serde_json::to_string(&WsStatus::default().reply(None)).unwrap();
         assert_eq!(opt_in_stream(&status_json), None);
 
         assert_eq!(opt_in_stream("not valid json"), None);
@@ -1551,16 +1785,7 @@ mod tests {
 
     #[test]
     fn test_ws_status_omits_null_fields() {
-        let msg = WsServerMessage::Status {
-            id: None,
-            connected: false,
-            remote_call: None,
-            snr: None,
-            level: None,
-            cfo: None,
-            short_cp_ok: None,
-            cp_desync_episodes: 0,
-        };
+        let msg = WsStatus::default().reply(None);
         let json = serde_json::to_string(&msg).unwrap();
         assert!(!json.contains("remote_call"));
         assert!(!json.contains("snr"));
@@ -1608,6 +1833,10 @@ mod tests {
             r#"{"type":"busy","state":false}"#,
             r#"{"type":"snr","db":14}"#,
             r#"{"type":"level","level":2}"#,
+            r#"{"type":"buffer","bytes":15}"#,
+            r#"{"type":"speed_level","level":3,"mode":"manual"}"#,
+            r#"{"type":"speed_level","level":2,"mode":"auto"}"#,
+            r#"{"type":"status","id":1,"connected":true,"remote_call":"W1AW","snr":14,"level":2,"cfo":3.2,"cp_desync_episodes":0,"ptt":true,"ptt_keyed_ms":1234,"busy":false,"waiting_for_clear_channel":false,"buffer":412,"speed_level":3,"speed_level_mode":"manual","speed_levels":[1,2,3,4,5,6,7,8],"mycall":"N0CALL","max_tx_s":30,"max_tune_s":30,"loop_age_ms":95,"heard":[{"call":"W1AW","last_heard_ms":1761452712300,"snr_db":14,"level":2}],"link":{"in_flight":1,"retries":1,"max_retries":10,"rto_ms":5200,"fade_hold":false}}"#,
             r#"{"type":"heard","stations":[{"call":"W1AW","last_heard_ms":1,"snr_db":14,"level":2},{"call":"N0CALL","last_heard_ms":2}]}"#,
             r#"{"type":"log","level":"info","message":"decoded","timestamp_ms":3}"#,
             r#"{"type":"decode_fail","count":6,"timestamp_ms":4}"#,
@@ -1642,6 +1871,10 @@ mod tests {
             serde_json::json!({"type":"spectrum","enabled":true}),
             serde_json::json!({"type":"audio_level","enabled":true}),
             serde_json::json!({"type":"log","enabled":true}),
+            serde_json::json!({"type":"tune"}),
+            serde_json::json!({"type":"tune","seconds":5,"single_hz":1500}),
+            serde_json::json!({"type":"set_speed_level","level":3}),
+            serde_json::json!({"type":"set_speed_level","level":"auto"}),
         ] {
             let parsed: WsRequest = serde_json::from_value(request.clone()).unwrap();
             assert_eq!(parsed.id, None);
@@ -1703,6 +1936,9 @@ mod tests {
             r#"{"type":"send","data":"/wA=","encoding":"base64","id":1}"#,
             r#"{"type":"log","enabled":true,"id":2}"#,
             r#"{"type":"status","id":3}"#,
+            r#"{"type":"tune","seconds":5,"single_hz":1500,"id":4}"#,
+            r#"{"type":"set_speed_level","level":3,"id":5}"#,
+            r#"{"type":"set_speed_level","level":"auto","id":6}"#,
         ] {
             assert!(
                 validator.is_valid(&serde_json::from_str(request).unwrap()),
@@ -2991,6 +3227,375 @@ mod integration_tests {
         assert!(matches!(
             next_server_message(&mut b, "client").await,
             WsServerMessage::Data { .. }
+        ));
+    }
+}
+
+/// COP-83: `status` mirroring, `buffer`, and the `tune` and
+/// `set_speed_level` requests against a real server.
+#[cfg(test)]
+mod cop83_tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use std::time::{Duration, Instant};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+
+    const TOKEN: &str = "0123456789abcdef0123";
+
+    type Client = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// A real server whose snapshot is `snapshot`, a connected client past
+    /// `hello`, the server's event receiver (past `Connected`) and its push
+    /// handle.
+    async fn serve(snapshot: WsStatus) -> (Client, mpsc::Receiver<HostEvent>, WsPush) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server =
+            WebSocketServer::new(0).with_auth(WsAuth::new(TOKEN, Vec::<String>::new()));
+        *server.status().lock().await = snapshot;
+        let mut events = server.take_event_rx().unwrap();
+        let push = server.push_handle();
+        tokio::spawn(async move {
+            server.run_with_listener(listener).await.unwrap();
+        });
+        let mut request = format!("ws://{addr}").into_client_request().unwrap();
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {TOKEN}")).unwrap(),
+        );
+        let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let hello = next_json(&mut ws).await;
+        assert_eq!(hello["type"], "hello");
+        match tokio::time::timeout(Duration::from_secs(2), events.recv()).await {
+            Ok(Some(HostEvent::Connected { .. })) => {}
+            other => panic!("expected Connected, got {other:?}"),
+        }
+        (ws, events, push)
+    }
+
+    async fn next_json(ws: &mut Client) -> serde_json::Value {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(2), ws.next())
+                .await
+                .expect("a message within 2 s")
+                .unwrap()
+                .unwrap();
+            if let Message::Text(text) = msg {
+                return serde_json::from_str(&text).unwrap();
+            }
+        }
+    }
+
+    async fn ask(ws: &mut Client, request: serde_json::Value) -> serde_json::Value {
+        ws.send(Message::Text(request.to_string().into()))
+            .await
+            .unwrap();
+        next_json(ws).await
+    }
+
+    async fn no_event(events: &mut mpsc::Receiver<HostEvent>) {
+        let got = tokio::time::timeout(Duration::from_millis(200), events.recv()).await;
+        assert!(got.is_err(), "expected no host event, got {got:?}");
+    }
+
+    async fn next_event(events: &mut mpsc::Receiver<HostEvent>) -> HostEvent {
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("a host event within 2 s")
+            .unwrap()
+    }
+
+    fn published() -> WsStatus {
+        WsStatus {
+            mycall: Some("N0CALL".to_owned()),
+            max_tx_s: Some(30),
+            max_tune_s: Some(30),
+            speed_levels: Some((1..=8).collect()),
+            ..WsStatus::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn status_reply_mirrors_the_snapshot() {
+        let heard = vec![HeardStation {
+            call: "W1AW".to_owned(),
+            last_heard_ms: 1_761_452_712_300,
+            snr_db: Some(14),
+            level: Some(2),
+        }];
+        let link = LinkStats {
+            in_flight: 1,
+            retries: 1,
+            max_retries: 10,
+            rto_ms: 5200,
+            fade_hold: false,
+        };
+        let snapshot = WsStatus {
+            ptt: Some(true),
+            ptt_since: Some(Instant::now()),
+            busy: Some(true),
+            waiting_for_clear_channel: Some(false),
+            buffer: Some(412),
+            speed_level: Some(3),
+            speed_level_mode: Some(SpeedLevelMode::Manual),
+            loop_heartbeat: Some(Instant::now()),
+            heard: Some(heard),
+            link: Some(link),
+            ..published()
+        };
+        let (mut ws, _events, _push) = serve(snapshot).await;
+        let reply = ask(&mut ws, serde_json::json!({"type":"status","id":1})).await;
+        assert_eq!(reply["type"], "status");
+        assert_eq!(reply["id"], 1);
+        assert_eq!(reply["ptt"], true);
+        assert!(reply["ptt_keyed_ms"].as_u64().is_some());
+        assert_eq!(reply["busy"], true);
+        assert_eq!(reply["waiting_for_clear_channel"], false);
+        assert_eq!(reply["buffer"], 412);
+        assert_eq!(reply["speed_level"], 3);
+        assert_eq!(reply["speed_level_mode"], "manual");
+        assert_eq!(
+            reply["speed_levels"],
+            serde_json::json!([1, 2, 3, 4, 5, 6, 7, 8])
+        );
+        assert_eq!(reply["mycall"], "N0CALL");
+        assert_eq!(reply["max_tx_s"], 30);
+        assert_eq!(reply["max_tune_s"], 30);
+        assert!(reply["loop_age_ms"].as_u64().is_some_and(|ms| ms < 1000));
+        assert_eq!(reply["heard"][0]["call"], "W1AW");
+        assert_eq!(
+            reply["link"],
+            serde_json::json!({"in_flight":1,"retries":1,"max_retries":10,"rto_ms":5200,"fade_hold":false})
+        );
+    }
+
+    #[test]
+    fn status_reply_computes_ages_when_built() {
+        let now = Instant::now();
+        let reply = WsStatus {
+            ptt: Some(true),
+            ptt_since: Some(now - Duration::from_millis(1500)),
+            loop_heartbeat: Some(now - Duration::from_millis(4000)),
+            ..WsStatus::default()
+        }
+        .reply(Some(1));
+        let json = serde_json::to_value(&reply).unwrap();
+        assert!(json["ptt_keyed_ms"].as_u64().unwrap() >= 1500);
+        assert!(json["loop_age_ms"].as_u64().unwrap() >= 4000);
+
+        let reply = WsStatus {
+            ptt: Some(false),
+            ptt_since: Some(now),
+            ..WsStatus::default()
+        }
+        .reply(Some(1));
+        let json = serde_json::to_value(&reply).unwrap();
+        assert_eq!(json["ptt"], false);
+        assert!(json.get("ptt_keyed_ms").is_none());
+    }
+
+    #[test]
+    fn status_without_daemon_data_keeps_the_v1_shape() {
+        let json = serde_json::to_string(&WsStatus::default().reply(Some(1))).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"status","id":1,"connected":false,"cp_desync_episodes":0}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn buffer_travels_on_the_reliable_queue() {
+        assert!(!is_lossy_telemetry(&WsServerMessage::Buffer { bytes: 15 }));
+        assert!(!is_lossy_telemetry(&WsServerMessage::SpeedLevel {
+            level: 3,
+            mode: SpeedLevelMode::Manual
+        }));
+        let (mut ws, _events, push) = serve(WsStatus::default()).await;
+        push.push(&WsServerMessage::Buffer { bytes: 15 });
+        assert_eq!(
+            next_json(&mut ws).await,
+            serde_json::json!({"type":"buffer","bytes":15})
+        );
+    }
+
+    #[tokio::test]
+    async fn tune_request_becomes_a_tune_event() {
+        let (mut ws, mut events, _push) = serve(published()).await;
+        let reply = ask(&mut ws, serde_json::json!({"type":"tune","id":1})).await;
+        assert_eq!(reply, serde_json::json!({"type":"ack","id":1}));
+        assert!(matches!(
+            next_event(&mut events).await,
+            HostEvent::Tune {
+                seconds: None,
+                single_hz: None,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn tune_with_seconds_and_single_hz_is_forwarded() {
+        let (mut ws, mut events, _push) = serve(published()).await;
+        let reply = ask(
+            &mut ws,
+            serde_json::json!({"type":"tune","seconds":5,"single_hz":1500,"id":2}),
+        )
+        .await;
+        assert_eq!(reply, serde_json::json!({"type":"ack","id":2}));
+        match next_event(&mut events).await {
+            HostEvent::Tune {
+                seconds, single_hz, ..
+            } => {
+                assert_eq!(seconds, Some(5.0));
+                assert_eq!(single_hz, Some(1500.0));
+            }
+            other => panic!("expected Tune, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tune_without_a_callsign_is_refused() {
+        let snapshot = WsStatus {
+            mycall: None,
+            ..published()
+        };
+        let (mut ws, mut events, _push) = serve(snapshot).await;
+        let reply = ask(&mut ws, serde_json::json!({"type":"tune","id":3})).await;
+        assert_eq!(
+            reply,
+            serde_json::json!({"type":"error","message":"No callsign is set; set MYCALL before TUNE","id":3})
+        );
+        no_event(&mut events).await;
+    }
+
+    #[tokio::test]
+    async fn tune_seconds_out_of_range_is_refused() {
+        let (mut ws, mut events, _push) = serve(published()).await;
+        for (id, seconds) in [(10, 0.0), (11, -1.0), (12, 31.0), (13, 1e12)] {
+            let reply = ask(
+                &mut ws,
+                serde_json::json!({"type":"tune","seconds":seconds,"id":id}),
+            )
+            .await;
+            assert_eq!(
+                reply,
+                serde_json::json!({"type":"error","message":"TUNE seconds must be greater than 0 and at most 30","id":id})
+            );
+        }
+        no_event(&mut events).await;
+    }
+
+    #[tokio::test]
+    async fn tune_single_hz_out_of_range_is_refused() {
+        let (mut ws, mut events, _push) = serve(published()).await;
+        for (id, hz) in [(20, 299), (21, 3001)] {
+            let reply = ask(
+                &mut ws,
+                serde_json::json!({"type":"tune","seconds":5,"single_hz":hz,"id":id}),
+            )
+            .await;
+            assert_eq!(
+                reply,
+                serde_json::json!({"type":"error","message":"TUNE single_hz must be between 300 and 3000 Hz","id":id})
+            );
+        }
+        no_event(&mut events).await;
+    }
+
+    #[tokio::test]
+    async fn tune_is_forwarded_unchecked_without_daemon_data() {
+        let (mut ws, mut events, _push) = serve(WsStatus::default()).await;
+        let reply = ask(
+            &mut ws,
+            serde_json::json!({"type":"tune","seconds":500,"id":4}),
+        )
+        .await;
+        assert_eq!(reply, serde_json::json!({"type":"ack","id":4}));
+        assert!(matches!(
+            next_event(&mut events).await,
+            HostEvent::Tune { seconds: Some(s), .. } if s == 500.0
+        ));
+    }
+
+    #[test]
+    fn set_speed_level_parses_integer_and_auto() {
+        let parse = |json: &str| serde_json::from_str::<WsRequest>(json).map(|r| r.message);
+        assert!(matches!(
+            parse(r#"{"type":"set_speed_level","level":3}"#),
+            Ok(WsClientMessage::SetSpeedLevel {
+                level: SpeedLevelSetting::Level(3)
+            })
+        ));
+        assert!(matches!(
+            parse(r#"{"type":"set_speed_level","level":"auto"}"#),
+            Ok(WsClientMessage::SetSpeedLevel {
+                level: SpeedLevelSetting::Auto(AutoKeyword::Auto)
+            })
+        ));
+        assert!(parse(r#"{"type":"set_speed_level"}"#).is_err());
+        assert!(parse(r#"{"type":"set_speed_level","level":"fast"}"#).is_err());
+        assert!(parse(r#"{"type":"set_speed_level","level":-1}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn set_speed_level_becomes_a_host_event() {
+        let (mut ws, mut events, _push) = serve(published()).await;
+        let reply = ask(
+            &mut ws,
+            serde_json::json!({"type":"set_speed_level","level":3,"id":7}),
+        )
+        .await;
+        assert_eq!(reply, serde_json::json!({"type":"ack","id":7}));
+        assert!(matches!(
+            next_event(&mut events).await,
+            HostEvent::SetSpeedLevel { level: Some(3), .. }
+        ));
+        let reply = ask(
+            &mut ws,
+            serde_json::json!({"type":"set_speed_level","level":"auto","id":9}),
+        )
+        .await;
+        assert_eq!(reply, serde_json::json!({"type":"ack","id":9}));
+        assert!(matches!(
+            next_event(&mut events).await,
+            HostEvent::SetSpeedLevel { level: None, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_speed_level_outside_the_ladder_is_refused() {
+        let (mut ws, mut events, _push) = serve(published()).await;
+        for level in [9, 0] {
+            let reply = ask(
+                &mut ws,
+                serde_json::json!({"type":"set_speed_level","level":level,"id":8}),
+            )
+            .await;
+            let message =
+                format!("Speed level {level} is not available on this profile (levels 1-8)");
+            assert_eq!(
+                reply,
+                serde_json::json!({"type":"error","message":message,"id":8})
+            );
+        }
+        no_event(&mut events).await;
+    }
+
+    #[tokio::test]
+    async fn set_speed_level_is_forwarded_unchecked_without_daemon_data() {
+        let (mut ws, mut events, _push) = serve(WsStatus::default()).await;
+        let reply = ask(
+            &mut ws,
+            serde_json::json!({"type":"set_speed_level","level":9,"id":1}),
+        )
+        .await;
+        assert_eq!(reply, serde_json::json!({"type":"ack","id":1}));
+        assert!(matches!(
+            next_event(&mut events).await,
+            HostEvent::SetSpeedLevel { level: Some(9), .. }
         ));
     }
 }

@@ -21,6 +21,9 @@
 //! debug-build failure). `tools/pat-loop/run.sh`, which runs real Pat against
 //! two real release `coppad` processes, covers that.
 
+// COP-142: the std-clock ban in clippy.toml targets event_loop only.
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
