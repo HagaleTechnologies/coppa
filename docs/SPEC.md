@@ -6,7 +6,7 @@ PHY header (§4.2) and the MAC header (§17.1).
 | Spec revision | Date | Workspace version | Checked against source |
 |---|---|---|---|
 | 2 (adds §16–§21, COP-130) | 2026-11-04 | 0.6.0 | `edb17bc` |
-| 3 (adds §22, COP-119) | 2026-11-04 | 0.7.0 | `79ee3aa` |
+| 3 (adds §22, COP-119) | 2026-11-04 | 0.8.0 | `79ee3aa` |
 
 There is no in-band version negotiation and no changelog beyond §0.1's
 wire-break history.
@@ -34,7 +34,7 @@ modem; this spec describes only Coppa's own wire format.
 
 ### 0.1 Versioning and wire-format break history
 
-- **COP-119 session fade protection (0.7.0)** adds negotiated RS(12,6)
+- **COP-119 session fade protection (0.8.0)** adds negotiated RS(12,6)
   session packets, MAC type 10 and CONNECT flags bits 2 and 3. See §22.
   PHY and MAC versions remain 1. Non-negotiating stations keep their
   existing session data format.
@@ -1881,9 +1881,9 @@ complete exchange.
 | 6 | 1 | `mcs_index` | 0 | 0 |
 
 The library default encodes as `00c80102080000` (P24). coppad sets
-`multi_frame_ack` (`event_loop.rs:207-212`); a 0.6.0 station, and a 0.7.0
+`multi_frame_ack` (`event_loop.rs:207-212`); a 0.6.0 station, and a 0.8.0
 station with `[session] fade_protection = "off"`, sends `00c80102080200`
-(P23), while a 0.7.0 coppad at the default `accept` also sets bit 2 and
+(P23), while a 0.8.0 coppad at the default `accept` also sets bit 2 and
 sends `00c80102080600` (§22.1). Transmitters MUST send reserved flag bits
 as 0. Receivers ignore them, ignore bytes after offset 6, and reject fewer
 than 7 bytes (`CapabilitiesTooShort`). A zero `fec_rate_den` parses; the
@@ -2128,7 +2128,7 @@ zero grid length, so no grid.
 | P20 | `CpControl` bare ack, ack 1, proposer → responder (old profile) | 7 | `05000100000000` |
 | P21 | `CpControl` Switched ShortCp, seq 1, ack 1, responder → proposer (new profile) | 9 | `050101000000000301` |
 | P22 | `CpControl` bare ack, ack 2, proposer → responder (new profile) | 7 | `05000200000000` |
-| P23 | capabilities, coppad 0.6.0 / 0.7.0 with fade protection off | 7 | `00c80102080200` |
+| P23 | capabilities, coppad 0.6.0 / 0.8.0 with fade protection off | 7 | `00c80102080200` |
 | P24 | capabilities, library default | 7 | `00c80102080000` |
 | P25 | capabilities A: 200, 3/4, window 8, both flags, mcs 5 | 7 | `00c80304080305` |
 | P26 | capabilities B: 120, 1/2, window 4, `multi_frame_ack`, mcs 3 | 7 | `00780102040203` |

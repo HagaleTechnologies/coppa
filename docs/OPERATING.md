@@ -1187,7 +1187,7 @@ For the OFDM KISS datagram port (8100), see [RETICULUM.md](RETICULUM.md).
 
 ## Session fade protection
 
-Set `[session] fade_protection = "request"` to ask a 0.7.0 peer for RS(12,6)
+Set `[session] fade_protection = "request"` to ask a 0.8.0 peer for RS(12,6)
 erasure protection. The default `"accept"` uses it only when a peer asks.
 `"off"` disables it even if a peer requests it. Two default stations keep the
 existing session data path. Older peers cannot negotiate this mode.

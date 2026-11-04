@@ -3298,7 +3298,7 @@ hardware or on-air result.
 
 ## COP-119: RS(12,6) session fade protection
 
-Measured on 2026-11-04 with workspace version 0.7.0, based on d837c89.
+Measured on 2026-11-04 with workspace version 0.8.0, based on d837c89.
 Command: `cargo run --release -p coppa-bench --example session`.
 The original window-eight bare-frame baseline is unchanged. The new
 `stop-and-wait` and `rs12-6` arms include MAC and transport headers, window

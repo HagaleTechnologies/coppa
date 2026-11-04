@@ -1,6 +1,6 @@
 # ADR-012: negotiated session erasure protection
 
-Status: accepted defaults for COP-119. Version: 0.7.0.
+Status: accepted defaults for COP-119. Version: 0.8.0.
 
 COP-118 measured packet erasure coding as the useful fade-diversity arm.
 Frequency repetition was rejected. See `../analysis/COP-118-fade-diversity.md`.
@@ -29,8 +29,10 @@ The normative wire definition is SPEC §22.
    peer can transmit at a different level from the sender.
 9. D9: when the burst plus possible ID and one-second margin exceeds the
    configured TX duration, send that segment on the plain path. Warn once.
-10. D10: bump the minor version to 0.7.0 for new public Rust fields and
+10. D10: bump the minor version for new public Rust fields and
     enum variants, and record the negotiated wire extension in SPEC.
+    The branch's own 0.6.0 → 0.7.0 bump was taken by main's COP-138
+    (951030c) during the merge, so COP-119 ships as 0.8.0.
 11. D11: measure the ticket against ideal-ACK simulated ten-minute
     Moderate sessions. Separately report ACK loss and clean throughput.
 
