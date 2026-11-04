@@ -99,6 +99,8 @@ pub fn kiss_encode_data(data: &[u8]) -> Vec<u8> {
 /// - Multiple frames in a single buffer
 /// - Escape sequences within data payloads
 /// - FEND-only separators (empty frames are skipped)
+///
+/// Stream readers should use [`KissDecoder`] to retain incomplete frames.
 pub fn kiss_decode(data: &[u8]) -> Vec<KissFrame> {
     decode_closed_frames(data).0
 }
@@ -156,39 +158,9 @@ fn decode_closed_frames(data: &[u8]) -> (Vec<KissFrame>, usize) {
             continue;
         }
 
-        // First byte is the command/port nibble
-        let cmd = payload[0];
-        let body = &payload[1..];
-
-        let frame = match cmd {
-            CMD_DATA => KissFrame::Data(body.to_vec()),
-            CMD_TX_DELAY => {
-                if let Some(&v) = body.first() {
-                    KissFrame::TxDelay(v)
-                } else {
-                    KissFrame::TxDelay(0)
-                }
-            }
-            CMD_PERSISTENCE => {
-                if let Some(&v) = body.first() {
-                    KissFrame::Persistence(v)
-                } else {
-                    KissFrame::Persistence(0)
-                }
-            }
-            CMD_SLOT_TIME => {
-                if let Some(&v) = body.first() {
-                    KissFrame::SlotTime(v)
-                } else {
-                    KissFrame::SlotTime(0)
-                }
-            }
-            CMD_RETURN => KissFrame::Return,
-            // Unknown command — skip
-            _ => continue,
-        };
-
-        frames.push(frame);
+        if let Some(frame) = frame_from_payload(&payload) {
+            frames.push(frame);
+        }
     }
 
     (frames, consumed)
@@ -205,6 +177,78 @@ fn buffer_kiss_read(accum: &mut Vec<u8>, chunk: &[u8]) -> Result<Vec<KissFrame>,
         return Err(());
     }
     Ok(frames)
+}
+
+fn frame_from_payload(payload: &[u8]) -> Option<KissFrame> {
+    let (&cmd, body) = payload.split_first()?;
+    Some(match cmd {
+        CMD_DATA => KissFrame::Data(body.to_vec()),
+        CMD_TX_DELAY => KissFrame::TxDelay(body.first().copied().unwrap_or(0)),
+        CMD_PERSISTENCE => KissFrame::Persistence(body.first().copied().unwrap_or(0)),
+        CMD_SLOT_TIME => KissFrame::SlotTime(body.first().copied().unwrap_or(0)),
+        CMD_RETURN => KissFrame::Return,
+        _ => return None,
+    })
+}
+
+/// Streaming KISS decoder that retains partial frames and escapes across reads.
+///
+/// Frames larger than 64 KiB stop decoding. Their pending length remains above
+/// the limit so the TCP server can close the connection without buffering more.
+#[derive(Debug, Default)]
+pub struct KissDecoder {
+    inside_frame: bool,
+    escape_next: bool,
+    payload: Vec<u8>,
+    oversized: bool,
+}
+
+impl KissDecoder {
+    /// Create an empty decoder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decode complete, delimiter-terminated frames from the next stream bytes.
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<KissFrame> {
+        let mut frames = Vec::new();
+        for &b in bytes {
+            if self.oversized {
+                break;
+            }
+            if b == FEND {
+                if let Some(frame) = frame_from_payload(&self.payload) {
+                    frames.push(frame);
+                }
+                self.payload.clear();
+                self.escape_next = false;
+                self.inside_frame = true;
+            } else if self.inside_frame {
+                if self.escape_next {
+                    self.escape_next = false;
+                    match b {
+                        TFEND => self.payload.push(FEND),
+                        TFESC => self.payload.push(FESC),
+                        _ => {
+                            self.payload.push(FESC);
+                            self.payload.push(b);
+                        }
+                    }
+                } else if b == FESC {
+                    self.escape_next = true;
+                } else {
+                    self.payload.push(b);
+                }
+                self.oversized = self.pending_len() > MAX_KISS_FRAME_LEN;
+            }
+        }
+        frames
+    }
+
+    /// Bytes retained for the incomplete frame, including a pending escape.
+    pub fn pending_len(&self) -> usize {
+        self.payload.len() + usize::from(self.escape_next)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +312,11 @@ impl KissServer {
     pub async fn start(&self) -> Result<(), crate::HostError> {
         let addr = format!("{}:{}", self.bind_addr, self.port);
         let listener = TcpListener::bind(&addr).await?;
+        self.run_with_listener(listener).await
+    }
+
+    /// Accept KISS clients using a listener already bound by the caller.
+    pub async fn run_with_listener(&self, listener: TcpListener) -> Result<(), crate::HostError> {
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
         loop {
@@ -304,8 +353,7 @@ async fn handle_kiss_client(
 ) {
     let mut rx_receiver = rx_broadcast.subscribe();
     let mut buf = [0u8; 4096];
-    // Per-client accumulation buffer for partial KISS frames across TCP reads.
-    let mut accum: Vec<u8> = Vec::new();
+    let mut decoder = KissDecoder::new();
 
     loop {
         tokio::select! {
@@ -327,6 +375,7 @@ async fn handle_kiss_client(
                 match result {
                     Ok(0) => break, // EOF
                     Ok(n) => {
+<<<<<<< HEAD
                         let frames = match buffer_kiss_read(&mut accum, &buf[..n]) {
                             Ok(frames) => frames,
                             Err(()) => {
@@ -338,6 +387,9 @@ async fn handle_kiss_client(
                                 break;
                             }
                         };
+=======
+                        let frames = decoder.push(&buf[..n]);
+>>>>>>> 6969023d931c39c4a2b1743e5ebfe81d9486e79b
                         for frame in frames {
                             if let KissFrame::Data(payload) = frame {
                                 if tx_sender.send(payload).await.is_err() {
@@ -345,6 +397,17 @@ async fn handle_kiss_client(
                                 }
                             }
                         }
+<<<<<<< HEAD
+=======
+                        if decoder.pending_len() > MAX_KISS_FRAME_LEN {
+                            tracing::warn!(
+                                %peer,
+                                len = decoder.pending_len(),
+                                "KISS client exceeded max frame size, closing"
+                            );
+                            break;
+                        }
+>>>>>>> 6969023d931c39c4a2b1743e5ebfe81d9486e79b
                     }
                     Err(_) => break,
                 }
@@ -363,6 +426,7 @@ async fn handle_kiss_client(
 mod tests {
     use super::*;
 
+<<<<<<< HEAD
     #[test]
     fn test_kiss_decode_requires_closing_delimiter() {
         let wire = kiss_encode_data(&[0x41; 200]);
@@ -404,10 +468,30 @@ mod tests {
                     assert!(frames.is_empty());
                 }
             }
+=======
+    fn special_payload() -> Vec<u8> {
+        (0..500)
+            .map(|i| [FEND, FESC, TFEND, TFESC, 0][i % 5])
+            .collect()
+    }
+
+    #[test]
+    fn kiss_decoder_reassembles_a_frame_split_at_every_offset() {
+        let payload = special_payload();
+        let wire = kiss_encode_data(&payload);
+        for split in 1..wire.len() {
+            let mut decoder = KissDecoder::new();
+            assert!(decoder.push(&wire[..split]).is_empty());
+            assert_eq!(
+                decoder.push(&wire[split..]),
+                vec![KissFrame::Data(payload.clone())]
+            );
+>>>>>>> 6969023d931c39c4a2b1743e5ebfe81d9486e79b
         }
     }
 
     #[test]
+<<<<<<< HEAD
     fn test_kiss_buffer_shared_delimiters_and_partial_tail() {
         let mut pending = Vec::new();
         let first = [
@@ -458,10 +542,29 @@ mod tests {
         assert_eq!(
             kiss_decode(&[FEND, CMD_DATA, FESC, 0x12, FESC, FEND]),
             vec![KissFrame::Data(vec![FESC, 0x12])]
+=======
+    fn kiss_decoder_returns_two_frames_from_one_push() {
+        let wire = [kiss_encode_data(b"one"), kiss_encode_data(b"two")].concat();
+        assert_eq!(
+            KissDecoder::new().push(&wire),
+            vec![
+                KissFrame::Data(b"one".to_vec()),
+                KissFrame::Data(b"two".to_vec())
+            ]
         );
     }
 
     #[test]
+    fn kiss_decoder_skips_bytes_before_the_first_fend() {
+        assert_eq!(
+            KissDecoder::new().push(&[1, 2, FEND, CMD_DATA, 3, FEND]),
+            vec![KissFrame::Data(vec![3])]
+>>>>>>> 6969023d931c39c4a2b1743e5ebfe81d9486e79b
+        );
+    }
+
+    #[test]
+<<<<<<< HEAD
     fn test_kiss_buffer_pending_limit() {
         for prefix in [&[][..], &[FEND][..]] {
             let mut pending = prefix.to_vec();
@@ -562,6 +665,117 @@ mod tests {
                 "overflow must not forward a partial frame"
             );
         }
+=======
+    fn kiss_decoder_keeps_an_escape_split_across_pushes() {
+        let mut decoder = KissDecoder::new();
+        assert!(decoder.push(&[FEND, CMD_DATA, FESC]).is_empty());
+        assert_eq!(
+            decoder.push(&[TFEND, FEND]),
+            vec![KissFrame::Data(vec![FEND])]
+        );
+    }
+
+    #[test]
+    fn kiss_decoder_drops_data_on_a_nonzero_kiss_port() {
+        assert!(KissDecoder::new().push(&[FEND, 0x10, 1, FEND]).is_empty());
+    }
+
+    #[test]
+    fn kiss_decoder_reports_a_pending_frame_length() {
+        let mut decoder = KissDecoder::new();
+        decoder.push(&[FEND, CMD_DATA, 1]);
+        assert_eq!(decoder.pending_len(), 2);
+        decoder.push(&[2]);
+        assert_eq!(decoder.pending_len(), 3);
+        decoder.push(&[FEND]);
+        assert_eq!(decoder.pending_len(), 0);
+    }
+
+    #[test]
+    fn kiss_decoder_rejects_an_oversized_complete_frame() {
+        let wire = kiss_encode_data(&vec![1; MAX_KISS_FRAME_LEN + 1]);
+        let mut decoder = KissDecoder::new();
+        assert!(decoder.push(&wire).is_empty());
+        assert!(decoder.pending_len() > MAX_KISS_FRAME_LEN);
+    }
+
+    #[test]
+    fn kiss_decoder_keeps_malformed_escape_passthrough() {
+        assert_eq!(
+            KissDecoder::new().push(&[FEND, CMD_DATA, FESC, 1, FEND]),
+            vec![KissFrame::Data(vec![FESC, 1])]
+        );
+    }
+
+    async fn prebound_server() -> (
+        tokio::net::TcpStream,
+        mpsc::Receiver<Vec<u8>>,
+        broadcast::Sender<Vec<u8>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = KissServer::new(0);
+        let receiver = server.take_tx_receiver().unwrap();
+        let sender = server.rx_sender();
+        let task = tokio::spawn(async move {
+            server.run_with_listener(listener).await.unwrap();
+        });
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        (client, receiver, sender, task)
+    }
+
+    #[tokio::test]
+    async fn split_tcp_write_reaches_tx_whole() {
+        let (mut client, mut receiver, _, task) = prebound_server().await;
+        let payload = special_payload();
+        let wire = kiss_encode_data(&payload);
+        for split in [
+            wire.len() / 2,
+            wire.iter().position(|&b| b == FESC).unwrap() + 1,
+        ] {
+            client.write_all(&wire[..split]).await.unwrap();
+            client.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(receiver.try_recv().is_err());
+            client.write_all(&wire[split..]).await.unwrap();
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                payload
+            );
+            assert!(receiver.try_recv().is_err());
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_partial_frame_closes_the_client() {
+        let (mut client, _, _, task) = prebound_server().await;
+        let mut wire = vec![FEND, CMD_DATA];
+        wire.extend(vec![1; MAX_KISS_FRAME_LEN + 1]);
+        client.write_all(&wire).await.unwrap();
+        let mut buf = [0];
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .unwrap();
+        assert!(matches!(result, Ok(0)) || result.is_err());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn run_with_listener_serves_a_prebound_listener() {
+        let (mut client, mut receiver, sender, task) = prebound_server().await;
+        client.write_all(&kiss_encode_data(b"out")).await.unwrap();
+        assert_eq!(receiver.recv().await.unwrap(), b"out");
+        sender.send(b"in".to_vec()).unwrap();
+        let mut wire = vec![0; kiss_encode_data(b"in").len()];
+        client.read_exact(&mut wire).await.unwrap();
+        assert_eq!(kiss_decode(&wire), vec![KissFrame::Data(b"in".to_vec())]);
+        task.abort();
+>>>>>>> 6969023d931c39c4a2b1743e5ebfe81d9486e79b
     }
 
     // --- Encoding tests ---
