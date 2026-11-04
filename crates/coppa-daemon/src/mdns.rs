@@ -15,6 +15,33 @@ pub const HOST_NAME: &str = "coppad.local.";
 pub const SERVICE_TYPE: &str = "_coppa._tcp.local.";
 /// The advertised service instance name.
 pub const INSTANCE: &str = "coppad";
+/// COP-85: the advertised host and service instance names. Without an
+/// instance they are [`HOST_NAME`] and [`INSTANCE`]; `coppad --instance vhf`
+/// advertises `coppad-vhf.local.` and `coppad-vhf`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Names {
+    /// Host name, with the trailing dot.
+    pub host: String,
+    /// Service instance name.
+    pub instance: String,
+}
+
+impl Names {
+    /// The names for `coppad --instance NAME`, or the fixed names without one.
+    pub fn for_instance(instance: Option<&str>) -> Self {
+        match instance {
+            Some(name) => Self {
+                host: format!("{INSTANCE}-{name}.local."),
+                instance: format!("{INSTANCE}-{name}"),
+            },
+            None => Self {
+                host: HOST_NAME.to_string(),
+                instance: INSTANCE.to_string(),
+            },
+        }
+    }
+}
+
 /// The TXT record: no version, callsign or other station data, because any
 /// host on the network can read it.
 pub const TXT: [(&str, &str); 3] = [("txtvers", "1"), ("path", "/"), ("health", "/health")];
@@ -79,11 +106,11 @@ pub fn unreachable_bind_address(bind_address: &str) -> String {
 }
 
 #[cfg(feature = "mdns")]
-pub use responder::{describe, service_info, Note, Responder};
+pub use responder::{describe, service_info, service_info_named, Note, Responder};
 
 #[cfg(feature = "mdns")]
 mod responder {
-    use super::{Addresses, Advertisement, HOST_NAME, INSTANCE, SERVICE_TYPE, TXT};
+    use super::{Addresses, Advertisement, Names, SERVICE_TYPE, TXT};
     use mdns_sd::{DaemonEvent, IfKind, ServiceDaemon, ServiceInfo};
 
     /// How long [`Responder::stop`] waits for each of unregister and shutdown.
@@ -91,12 +118,18 @@ mod responder {
 
     /// The `mdns-sd` record set for `ad`. Building one opens no socket.
     pub fn service_info(ad: &Advertisement) -> Result<ServiceInfo, String> {
+        service_info_named(ad, &Names::for_instance(None))
+    }
+
+    /// COP-85: [`service_info`] under `names` (an instance's own names).
+    pub fn service_info_named(ad: &Advertisement, names: &Names) -> Result<ServiceInfo, String> {
+        let (instance, host) = (names.instance.as_str(), names.host.as_str());
         let info = match ad.addresses {
             Addresses::Only(ip) => {
-                ServiceInfo::new(SERVICE_TYPE, INSTANCE, HOST_NAME, ip, ad.port, &TXT[..])
+                ServiceInfo::new(SERVICE_TYPE, instance, host, ip, ad.port, &TXT[..])
             }
             Addresses::AllIpv4 | Addresses::All => {
-                ServiceInfo::new(SERVICE_TYPE, INSTANCE, HOST_NAME, "", ad.port, &TXT[..])
+                ServiceInfo::new(SERVICE_TYPE, instance, host, "", ad.port, &TXT[..])
                     .map(ServiceInfo::enable_addr_auto)
             }
         };
@@ -163,7 +196,12 @@ mod responder {
         /// responder's events from a task, and register `ad`. Must run inside
         /// a tokio runtime.
         pub fn start(ad: &Advertisement) -> Result<Self, String> {
-            let info = service_info(ad)?;
+            Self::start_named(ad, &Names::for_instance(None))
+        }
+
+        /// COP-85: [`Responder::start`] under `names`.
+        pub fn start_named(ad: &Advertisement, names: &Names) -> Result<Self, String> {
+            let info = service_info_named(ad, names)?;
             let fullname = info.get_fullname().to_string();
             let daemon = ServiceDaemon::new().map_err(|e| e.to_string())?;
             let started = (|| {
@@ -251,6 +289,24 @@ mod tests {
     #[test]
     fn the_port_is_the_bound_port() {
         assert_eq!(ad("0.0.0.0:41234").unwrap().port, 41234);
+    }
+
+    #[test]
+    fn instance_names_the_host_and_the_service() {
+        assert_eq!(
+            Names::for_instance(None),
+            Names {
+                host: "coppad.local.".to_string(),
+                instance: "coppad".to_string(),
+            }
+        );
+        assert_eq!(
+            Names::for_instance(Some("vhf")),
+            Names {
+                host: "coppad-vhf.local.".to_string(),
+                instance: "coppad-vhf".to_string(),
+            }
+        );
     }
 
     #[test]

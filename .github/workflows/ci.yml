@@ -174,3 +174,12 @@ jobs:
       - name: Test cpal-backend on macOS/Windows
         if: runner.os != 'Linux'
         run: cargo test -p coppa-audio --lib --features cpal-backend
+      - name: Release build of coppad with the release feature set (COP-85, Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release -p coppa-daemon --features cpal-backend,websocket,kiss-tnc,ardop,mdns,serial-ptt
+      - name: Serial PTT unit tests (COP-85, Windows)
+        if: runner.os == 'Windows'
+        run: cargo test -p coppa-radio --lib --features serial-ptt
+      - name: Run the real coppad (COP-85, macOS and Windows)
+        if: runner.os != 'Linux'
+        run: cargo test -p coppa-daemon --features serial-ptt --test runtime_smoke

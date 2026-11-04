@@ -310,6 +310,9 @@ fn assert_full_help(help: &str) {
         "Print built-in configuration as TOML, then exit",
         "--tnc",
         "Run KISS TNC mode with its own defaults; requires kiss-tnc",
+        "--instance <NAME>",
+        "Name this coppad: prefix its log lines, look for coppad-NAME.toml",
+        "With --instance NAME, look for coppad-NAME.toml in the same places.",
         "-h, --help",
         "Print help",
         "-V, --version",
@@ -1958,6 +1961,69 @@ fn startup_names_the_audio_devices_it_opened() {
         "{input}"
     );
 }
+
+// ── COP-85: instance names ──────────────────────────────────────────────
+
+/// Two instances started from one directory each find their own
+/// `coppad-NAME.toml` and prefix every line they log with `[NAME] `.
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn two_instances_find_their_own_files_and_prefix_their_logs() {
+    let dir = TempDir::new("instances");
+    for (name, call) in [("a", "N1AAA"), ("b", "N1BBB")] {
+        dir.write(
+            &format!("coppad-{name}.toml"),
+            &format!(
+                "[host]\nvara_enabled = true\nvara_command_port = 0\nvara_data_port = 0\n\
+                 [engine]\ncallsign = \"{call}\"\n"
+            ),
+        );
+    }
+    let env = [("NO_COLOR", "1")];
+    let (mut a, _) = start_until_ready(dir.path(), &["--instance", "a"], &env);
+    let (mut b, _) = start_until_ready(dir.path(), &["--instance", "b"], &env);
+    for (daemon, name) in [(&mut a, "a"), (&mut b, "b")] {
+        let (stdout, stderr) = daemon.kill();
+        assert!(
+            stdout.contains(&format!("Using configuration file path=coppad-{name}.toml")),
+            "{stdout}\n{stderr}"
+        );
+        assert!(stdout.contains("Daemon ready"), "{stdout}");
+        let prefix = format!("[{name}] ");
+        for line in stdout.lines().filter(|line| !line.is_empty()) {
+            assert!(
+                line.starts_with(&prefix),
+                "{line:?} lacks {prefix:?}\n{stdout}"
+            );
+        }
+    }
+}
+
+#[test]
+fn check_with_an_instance_checks_that_instances_file() {
+    let dir = dir_with_malformed_default();
+    dir.write("coppad-a.toml", "[engine]\ncallsign = \"N1AAA\"\n");
+    let stdout = run_ok(dir.path(), &["--instance", "a", "--check"]);
+    assert!(
+        stdout.starts_with("Using configuration file coppad-a.toml\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn an_invalid_instance_name_exits_2() {
+    let dir = dir_with_malformed_default();
+    let stderr = run_usage_error(dir.path(), &["--instance", "hf_1"]);
+    assert!(
+        stderr.contains(
+            "invalid value 'hf_1' for '--instance <NAME>': use 1 to 32 letters, digits and \
+             hyphens, not starting or ending with a hyphen"
+        ),
+        "{stderr}"
+    );
+}
+
+// ── COP-138: KISS datagram interface ───────────────────────────────────
 
 #[cfg(not(feature = "kiss-tnc"))]
 #[test]

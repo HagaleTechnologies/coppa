@@ -82,7 +82,7 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 #### Radio Control (`coppa-radio`)
 - **rigctld**: TCP client for hamlib CAT control (frequency, mode, PTT)
 - **Serial PTT** (`serial-ptt`): DTR/RTS line control through the `serialport` crate
-- **GPIO PTT** (`gpio-ptt`): `/sys/class/gpio` writes; real hardware access is Linux-only
+- **GPIO PTT** (`gpio-ptt`): the GPIO character device (`/dev/gpiochipN`, via `gpiocdev`) for `gpio:<chip>:<line>`, and deprecated `/sys/class/gpio` writes for the old `gpio:<number>` form; real hardware access is Linux-only
 - **VOX PTT** and a no-op PTT for soundcard-only operation
 
 #### Channel Adaptation (`coppa-ml`)

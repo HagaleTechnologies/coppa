@@ -22,7 +22,7 @@ Open-source ham radio digital communications system written in Rust.
 | Python binding | Implemented, not published | `bindings/python`: a stdlib-only `ctypes` binding that drives a connected link; Linux-tested; see [bindings/python/README.md](bindings/python/README.md) |
 | Operating profiles | Implemented | 48 kHz OFDM profiles with runtime speed-level selection within the configured band |
 | Link adaptation | Implemented, limited calibration | Measurement-driven speed selection and ACK-driven RateLoop with ARQ enabled; no model inference; performance targets remain unmet, see [BENCHMARKS.md](BENCHMARKS.md) |
-| Serial/GPIO PTT | Implemented, feature-gated | Daemon serial DTR/RTS uses `serial-ptt`; Linux sysfs GPIO uses `gpio-ptt` |
+| Serial/GPIO PTT | Implemented, feature-gated | Daemon serial DTR/RTS uses `serial-ptt`; Linux GPIO (character device, `gpio:<chip>:<line>`; deprecated sysfs `gpio:<number>`) uses `gpio-ptt` |
 | Service files | Provided, not hardware-verified | systemd unit and macOS launchd agent in `contrib/`; Raspberry Pi 4 install guide in [docs/tutorials/raspberry-pi-install.md](docs/tutorials/raspberry-pi-install.md) |
 | KISS datagrams (HF OFDM) | Implemented | Reticulum TCP KISS on port 8100; see [docs/RETICULUM.md](docs/RETICULUM.md) |
 | KISS TNC (AFSK 1200) | Implemented, bring-up and testing only | Needs the kiss-tnc and cpal-backend features; not a Direwolf replacement; see [docs/TNC.md](docs/TNC.md) |
@@ -139,7 +139,7 @@ Each crate has a README in `crates/<name>/`; to call the modem from your own Rus
 | `coppa-protocol` | OFDM transceiver, NR BG2 LDPC payload coding, framing, ARQ, compression and session management |
 | `coppa-channel` | Channel models for testing: AWGN, Watterson HF fading, SSB passband filter, frequency, timing and sample-clock offsets, sinusoidal fading |
 | `coppa-audio` | Audio backends: CPAL real-time I/O, WAV file read/write |
-| `coppa-radio` | Radio control: rigctld CAT, serial PTT (DTR/RTS, `serial-ptt` feature), GPIO PTT (Linux sysfs, `gpio-ptt` feature) |
+| `coppa-radio` | Radio control: rigctld CAT, serial PTT (DTR/RTS, `serial-ptt` feature), GPIO PTT (Linux GPIO character device, plus deprecated sysfs, `gpio-ptt` feature) |
 | `coppa-ml` | Measurement-driven speed selection, RateLoop, CpGate, BusyGate and spectrum sensing |
 | `coppa-engine` | CoppaTransceiver wrapper with compression, squelch and streaming receive |
 | `coppa-host` | Host interfaces: VARA-style TCP control server, WebSocket JSON API, KISS datagram and AFSK TNC TCP servers (`kiss-tnc` feature) |

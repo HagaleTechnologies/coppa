@@ -133,8 +133,8 @@ jobs:
       - run: cargo test --workspace --features cpal-backend,websocket,ardop,mdns,kiss-tnc
       # cpal-backend compiles the daemon's WebSocket, /health and mDNS CLI
       # tests out of the step above; this step runs them (COP-140).
-      - name: Daemon CLI tests for WebSocket, health and mDNS
-        run: cargo test -p coppa-daemon --features websocket,mdns,kiss-tnc --test cli
+      - name: Daemon tests without audio (CLI, PTT release, reload, smoke)
+        run: cargo test -p coppa-daemon --features websocket,mdns,kiss-tnc --test cli --test ptt_release --test reload --test runtime_smoke
 
   bench-fuzz:
     name: Bench & Fuzz Compilation

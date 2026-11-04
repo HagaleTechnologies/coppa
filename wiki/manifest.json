@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-11-04T18:45:02Z",
-  "head_commit": "463c661",
+  "generated_at": "2026-11-04T21:42:46Z",
+  "head_commit": "ca75de8",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -490,7 +490,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:9c525e41700a2dae28aac59a44ab07c2712620a03d8a3aab01d59a701fabdea9",
+      "hash": "sha256:8fc6a50b80a14c5af822cbd0abc7f759b460044997d49b01e0fe563ec0c3599c",
       "id": "mdns-discovery",
       "kind": "gotcha",
       "links": [
@@ -506,8 +506,8 @@
       ],
       "status": "current",
       "title": "What will bite you when testing coppad's mDNS discovery?",
-      "verified_commit": "b9fdb8d",
-      "verified_date": "2026-11-02",
+      "verified_commit": "2526b50",
+      "verified_date": "2026-11-03",
       "visibility": "public"
     },
     {
@@ -551,7 +551,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:ece8378df1627dd56e8d8c10c4a995d5474ccc0993b6d4a7c2760fb7fefe9ec0",
+      "hash": "sha256:1011e23c8debd0ee717dbcceff559f2988c21df216d04c28df6282b67fa548da",
       "id": "phase4-field-readiness",
       "kind": "gotcha",
       "links": [
@@ -572,8 +572,8 @@
       ],
       "status": "current",
       "title": "What will bite you in the daemon's real-radio TX/RX path?",
-      "verified_commit": "59b0b63",
-      "verified_date": "2026-07-14",
+      "verified_commit": "dc18b8b",
+      "verified_date": "2026-11-03",
       "visibility": "public"
     },
     {
