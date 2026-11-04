@@ -16265,6 +16265,38 @@ mod tests {
             assert_eq!(first, rebuilt);
         }
 
+        /// COP-130: coppad's own session builders and capabilities emit the
+        /// bytes SPEC.md §21 freezes (P04-P07, P23). The protocol crate's
+        /// `tests/protocol_vectors.rs` restates these builders, so this pins
+        /// the daemon's real ones to the same literals.
+        #[test]
+        fn session_builders_emit_spec_21_vectors() {
+            let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+            // VK3ABC's link sends the data; W1AW's (callsigns swapped) ACKs it.
+            let caller = test_link();
+            let mut callee = test_link();
+            std::mem::swap(&mut callee.local, &mut callee.remote);
+            assert_eq!(
+                hex(&session_data_frame(&caller, 0, b"HELLO")),
+                "105dc05700000058b781083000000100000000000048454c4c4f"
+            );
+            callee.rx.receive(0, b"HELLO".to_vec());
+            assert_eq!(
+                hex(&session_ack_frame(&callee)),
+                "1158b7810830005dc0570000000002000100000000"
+            );
+            assert_eq!(
+                hex(&session_data_frame(&caller, 1, b"73")),
+                "105dc05700000058b78108300000010100000000003733"
+            );
+            callee.rx.receive(1, b"73".to_vec());
+            assert_eq!(
+                hex(&session_ack_frame(&callee)),
+                "1158b7810830005dc0570000000002000200000000"
+            );
+            assert_eq!(hex(&local_link_caps().to_bytes()), "00c80102080200");
+        }
+
         fn test_link() -> SessionLink {
             SessionLink {
                 session_id: 0,

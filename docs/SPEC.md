@@ -1,13 +1,21 @@
-# Coppa Waveform &amp; Protocol Conformance Specification
+# Coppa Waveform & Protocol Conformance Specification
 
-**Status:** Normative, wire-format version 1 (as built through Phase 3 of the
-remediation roadmap, commit range ending at `f725f7c` on
-`feature/field-readiness`).
+**Status:** Normative. Wire-format version 1, the version carried in the
+PHY header (§4.2) and the MAC header (§17.1).
+
+| Spec revision | Date | Workspace version | Checked against source |
+|---|---|---|---|
+| 2 (adds §16–§21, COP-130) | 2026-11-04 | 0.6.0 | `edb17bc` |
+
+There is no in-band version negotiation and no changelog beyond §0.1's
+wire-break history.
 
 ## 0. Purpose, audience, and how to read this document
 
 This document specifies the Coppa PHY waveform, frame header, forward error
-correction (FEC), interleaving, and multi-codeword framing precisely enough
+correction (FEC), interleaving, multi-codeword framing, payload compression
+(§15) and the MAC, transport, ARQ and session layers carried in the payload
+(§16–§20, with byte-level vectors in §21) precisely enough
 for an independent implementer to build a bit-compatible, interoperable
 transmitter and receiver **without reading the Rust source**. It uses
 RFC 2119-style **MUST** / **SHOULD** / **MAY** language.
@@ -37,8 +45,8 @@ preamble-correlation stage, but this codec does not implement multi-version
 interop — a `CoppaTransceiver` instance decodes exactly the version it was
 constructed with.
 
-This codebase has already broken its own wire format three times before reaching
-version 1's current shape; a future implementer should not assume any wire
+This codebase has already broken its own wire format several times before
+reaching version 1's current shape, without changing the header `version`; a future implementer should not assume any wire
 compatibility across these boundaries:
 
 - **Phase 1 waveform break** (carrier offset, Newman-phase preamble, TX
@@ -73,12 +81,15 @@ compatibility across these boundaries:
   change. Datagram framing is defined in §11. Older stations deliver unknown
   type-9 frames, including the MAC header, raw to their host data clients.
 
-Two further ADRs describe additions layered on top of the same wire format
-(no further breaks): `docs/adr/007-multi-codeword-frames.md` (multi-codeword
+Two further ADRs describe additions layered on top of the same wire format:
+`docs/adr/007-multi-codeword-frames.md` (multi-codeword
 framing + intra-frame cross-codeword interleaving, §9 below) and
 `docs/adr/008-phase3-system-layer.md` (payload integrity, ARQ, IR-HARQ, rate
 loop, SCO tracking — the system-layer behaviors this spec documents where
-they touch the wire).
+they touch the wire). ADR-008's own Consequences section records two more
+wire breaks: the transport ACK bitmap widened from u8 to u32 (a 4-byte to a
+7-byte transport header, §18.1), and frames with `codewords > 1` (§9) cannot
+be decoded by a single-codeword-only receiver.
 
 ### 0.2 Two OFDM stacks — this spec covers only the canonical one
 
@@ -375,11 +386,19 @@ Field semantics:
 - `version` (4 bits): protocol version, keys the preamble/probe PN (§3).
 - `phy_mode` (4 bits): `0` = HF/SSB, `1` = VHF
   (`crates/coppa-codec/src/ofdm/mod.rs:166`). Self-describing only (§1.3).
+  The reference engine writes `0` in every header it sends, including on a
+  VHF profile (`CoppaCore::encode_bytes_at`,
+  `crates/coppa-engine/src/engine.rs:432,482`), so a receiver MUST NOT
+  rely on this field to pick the profile.
 - `frame_type` (4 bits): `CoppaFrameType` enum — `Data=0, Ack=1, Nak=2,
   Connect=3, ConnectAck=4, Disconnect=5, Beacon=6`
   (`crates/coppa-codec/src/ofdm/frame.rs:186-209`). Values `7..=15` are
   invalid; `from_bytes`/`from_bits` return `None` for them
-  (`CoppaFrameType::from_u8`, same file, `:197-208`).
+  (`CoppaFrameType::from_u8`, same file, `:197-208`). This PHY enumeration
+  is **not** the MAC frame type of §17.3, which differs at values 2–4. The
+  reference transmitter writes only `Data` and `Beacon` (§16.1), and the
+  reference receiver never reads this field; it classifies the payload by
+  §16.2 instead.
 - `bandwidth` (4 bits): `bandwidth_id` (§1.1). Self-describing only (§1.3).
 - `fec_type` (4 bits): low 2 bits (`fec_type & 0x03`, `RV_MASK`,
   `crates/coppa-protocol/src/modem/transceiver.rs:243`) are the IR-HARQ
@@ -388,7 +407,9 @@ Field semantics:
 - `speed_level` (4 bits): wire-encoded MCS/speed level, 1-9. Values 0 and 10-15
   are invalid; see §6 for the HF restriction. `CoppaTransceiver::transmit`
   rejects them with `TransmitError::InvalidSpeedLevel`.
-- `seq_num` (8 bits): sequence number, 0–255.
+- `seq_num` (8 bits): sequence number, 0–255. The reference engine always
+  writes `0` (`engine.rs:437,487`); ARQ sequence numbers are carried in
+  the transport header (§18.1), not here.
 - `payload_len` (12 bits, max 4095): **total** application-payload length in
   bytes, summed across **all** codewords for a multi-codeword frame (§9) —
   not any single codeword's share
@@ -590,6 +611,14 @@ the 4th retransmission. A receiver combines soft LLRs across retransmissions
 of the same `seq` by rate-dematching each transmission's LLRs at its own
 `rv` into the shared mother-length buffer and **summing** overlapping
 positions (`rate_dematch`'s doc, `crates/coppa-protocol/src/fec/ldpc/rate_match.rs:122-140`).
+
+The reference daemon does not exercise RV cycling. Its retransmissions are
+re-encoded through the engine, which writes `fec_type = 0` and `seq_num = 0`
+on every frame (`engine.rs:435,437`), so every on-air frame is RV0 and
+`rv_for_attempt` has no production caller. Data retransmissions are byte-identical
+at the MAC and transport layers; CP-control retries refresh their ACK fields
+(§19.4). A receiver MUST still decode any
+`rv` correctly, because a conforming transmitter MAY cycle it.
 
 ### 5.4 Scrambling and known-pad LLR pinning
 
@@ -915,17 +944,17 @@ receiver strategy choice (**SHOULD**, not **MUST**).
 | Golay(24,12) codeword packing | MSB-first (bit 23 down to 0) | `crates/coppa-codec/src/ofdm/header_fec.rs:101-104` |
 | Payload CRC-32 (`CRC_32_ISO_HDLC`) trailer | appended **big-endian** (`to_be_bytes()`) | `crates/coppa-protocol/src/modem/transceiver.rs:700-703` |
 | Payload info-bit packing (bytes → bits, pre-LDPC) | MSB-first | `crates/coppa-protocol/src/modem/transceiver.rs:706-710` |
-| `Callsign::encode` (8 chars × 6 bits → 6 bytes) | packed MSB-first, 6-bit codes concatenated big-endian across byte boundaries | `crates/coppa-protocol/src/mac.rs:100-123` (explicit bit-layout diagram at `:108-114`) |
-| `MacPdu::to_bytes` | byte 0 = `[version:4][frame_type:4]` (MSB-first), then dest (6B), src (6B), ssid (1B, low nibble), payload | `crates/coppa-protocol/src/mac.rs:210-229` |
+| `Callsign::encode` (8 chars × 6 bits → 6 bytes) | packed MSB-first, 6-bit codes concatenated big-endian across byte boundaries (§17.2) | `crates/coppa-protocol/src/mac.rs:109-132` |
+| `MacPdu::to_bytes` | byte 0 = `[version:4][frame_type:4]` (MSB-first), then dest (6B), src (6B), ssid (1B, low nibble), payload (§17.1) | `crates/coppa-protocol/src/mac.rs:219-238` |
+| `TransportPdu::to_bytes` | byte 0 = `[session_id:4][type:4]`, seq, ack, `ack_bitmap` u32 **big-endian**, payload (§18.1) | `crates/coppa-protocol/src/transport.rs:238-258` |
+| `LinkCapabilities::to_bytes` | `max_payload_size` u16 **big-endian**, then single bytes (§20.1) | `crates/coppa-protocol/src/session.rs:81-93` |
 | PRBS scrambler LFSR | `x^15 + x^14 + 1`, seed `0x4A80`, self-inverse XOR | `crates/coppa-protocol/src/fec/scrambler.rs:6-16` |
 | Preamble PN LFSR (`coppa_pn_sequence`) | 7-bit, `x^7 + x + 1`, seed `(version+1) & 0x7F` | `crates/coppa-codec/src/ofdm/sync.rs:21-51` |
 
-The MAC layer (`crates/coppa-protocol/src/mac.rs`) is **not** part of the
-PHY/FEC/header wire format this spec otherwise covers (§1–§10); it is
-included here only because the brief's "byte/bit orders everywhere"
-requirement extends to it — `MacPdu` is Coppa's link-layer PDU, carried as
-the OFDM payload's application bytes (§5.5's "payload"), not a PHY-layer
-structure.
+The MAC, transport, ARQ and session layers are carried as the OFDM
+payload's application bytes (§5.5's "payload"), not as PHY-layer
+structures. They are specified normatively in §16–§20, with frozen vectors
+in §21.
 
 **Session framing (COP-38, 0.3.0).** Inside an established session, a MAC
 `Data` frame's payload is a `TransportPdu` (`crates/coppa-protocol/src/transport.rs`)
@@ -938,7 +967,9 @@ whose payload is `TransportPdu::new_ack(0, ack_num, bitmap)` from its
 `ArqRx`. The window is 1 (stop-and-wait) on both sides. A `Data` payload
 that does not parse as a `Reliable` `TransportPdu` (a pre-0.3.0 sender) is
 dropped without delivery and without an ACK. Handshake, `Disconnect`,
-`Keepalive` and `Beacon` frames are unchanged.
+`Keepalive` and `Beacon` frames were unchanged by COP-38; COP-69 later
+defined capability flag bit 1 (`multi_frame_ack`, §20.1). §17–§20 are the
+full, current specification of these layers; this note is history.
 
 **Datagram framing (COP-138).** One KISS data frame becomes one uncompressed
 MAC `Datagram` PDU in a PHY `Data` frame, using the fewest codewords that fit
@@ -1007,6 +1038,12 @@ A conforming **transmitter** MUST:
       configuration), apply §15.2's exact transform order — Huffman encode
       (§15.3, table of §15.3.1) → LZ4 compress (§15.4) → prepend the `0xFE`
       marker — and count envelope bytes in the header's `payload_len` (§15.1).
+- [ ] To interoperate with coppad's connected sessions: build MAC frames
+      per §17, transport PDUs per §18 and capabilities per §20.1; run the
+      three-way handshake of §20.1; send session data as MAC `Data` +
+      transport `Reliable` with window 1 and byte-identical
+      retransmissions (§19.4); and send `version = 1` with reserved bits
+      and the SSID high nibble zero. §21's vectors are the byte-level check.
 
 A conforming **receiver** MUST:
 
@@ -1037,6 +1074,11 @@ A conforming **receiver** MUST:
       configuration), invert §15.2's transform order exactly — strip `0xFE`
       → LZ4 decompress (§15.4) → Huffman decode (§15.3) — and treat a
       payload whose first byte is not `0xFE` as raw application bytes.
+- [ ] To interoperate with coppad's connected sessions: classify payloads
+      in §16.2's order, match session frames on (`src`, `dest`, `ssid`)
+      (§20.2), deliver in order and answer every data segment, duplicates
+      included, with an ACK (§19.3), and decode §21's vectors to the
+      fields given there.
 
 A conforming implementation MAY:
 
@@ -1055,6 +1097,8 @@ A conforming implementation MAY:
 - [ ] Omit compression entirely (§15): such an implementation never emits
       the `0xFE` envelope of §15.1 and simply treats every payload as raw
       application bytes.
+- [ ] Omit the optional sessionless ARQ (§19.5) and CP-switch negotiation
+      (§20.4), which are off by default in coppad.
 
 ---
 
@@ -1088,6 +1132,9 @@ to their exact `payload_hex` is strong evidence of wire-format compatibility
 with this reference implementation. Vectors are regenerated
 (not hand-authored) via `cargo run -p coppa-bench --release --example
 golden_vectors_gen` (`crates/coppa-protocol/tests/golden_vectors.rs:3-4,129`).
+
+These WAVs carry random payload bytes, not MAC or transport frames. The
+byte-level vectors for §16–§20 are in §21, and those for §15 in §15.6.
 
 ---
 
@@ -1355,3 +1402,763 @@ anywhere in the workspace, and it is not the compression of §15.1.
 Implementers MUST NOT build it expecting interop; the engine-layer `0xFE`
 envelope of §15.1 is the only compression on the air. This note follows
 §12's precedent for stale unused definitions.
+
+---
+
+## 16. Layering and payload classification
+
+§16–§21 specify the link layers that ride inside the §4–§9 PHY payload:
+the MAC frame (§17), the transport PDU (§18), the ARQ rules that drive the
+transport fields (§19) and the connected-session handshake and control
+exchanges (§20). §21 freezes byte-level vectors for all of them. The bytes
+these sections describe are the **application payload** of §5.5: the bytes
+before the §15 compression envelope is applied on transmit, and after it is
+removed on receive. They are not whole audio frames, and they carry no
+PHY CRC (the PHY's per-codeword CRC-32, §5.5, protects them).
+
+### 16.1 Transmit stack
+
+A connected session (the default coppad path, `docs/adr/010-cop38-session-arq.md`)
+builds every frame from the inside out:
+
+```
+host bytes (one chunk, sized so the whole frame fits the level's budget)
+  → transport PDU, type Reliable, 7-byte header (§18)
+  → MAC frame, type Data, 14-byte header (§17)
+  → optional §15 envelope over the whole MAC frame
+  → PHY frame, §4 header + §5–§10 FEC and waveform
+```
+
+Handshake, `Disconnect`, `Keepalive` and `Beacon` frames are a MAC frame
+with no transport PDU inside. The session ACK is a MAC `Ack` frame carrying
+a transport `Ack` PDU. Because the §15 envelope wraps the entire MAC frame,
+the MAC and transport headers are compressed with the payload, and the
+PHY `payload_len` counts envelope bytes (§4.2, §15.1).
+
+The reference daemon emits the following payload shapes
+(`crates/coppa-daemon/src/event_loop.rs`):
+
+| Shape | Outer → inner | Default coppad | Spec |
+|---|---|---|---|
+| Session data | MAC `Data` + transport `Reliable` (`session_data_frame`, `:263`) | yes | §17, §18, §19 |
+| Session ACK | MAC `Ack` + transport `Ack`, 21 bytes (`session_ack_frame`, `:276`) | yes | §17, §18, §19 |
+| Handshake | MAC `ConnectReq`/`ConnectAck`/`ConnectCfm` + 7-byte capabilities | yes | §20.1 |
+| Teardown, liveness | MAC `Disconnect`/`Keepalive`, empty payload, 14 bytes | yes | §20.3 |
+| Station ID | MAC `Beacon` + station-ID payload (`build_beacon_mac_pdu`, `:5338`) | yes, at the first transmission and every `id_interval_secs` | §17.5 |
+| Sessionless data, ARQ off | raw host bytes, no MAC or transport header | no (`sessionless_tx_enabled = false`) | out of scope |
+| Sessionless data, ARQ on | bare transport `Reliable` | no (`arq_enabled = false`) | §18, §19.5 |
+| Sessionless ACK | bare transport `Ack` with a 1-byte suggested level, 8 bytes | no | §18.3, §19.5 |
+| CP-switch control | bare transport `CpControl` | no (needs `arq_enabled` and `cp_negotiation_enabled`) | §20.4 |
+
+Every PHY header the reference stack writes carries `version = 1`,
+`phy_mode = 0`, `fec_type = 0` (RV0) and `seq_num = 0`
+(`CoppaCore::encode_bytes_at`, `crates/coppa-engine/src/engine.rs:415-446`).
+`frame_type` is `Data` for every shape above except the station ID, which
+`encode_bytes_at_level` (`engine.rs:471-498`) sends as PHY `Beacon` at speed
+level 1 and never compresses. ARQ sequence numbers live in the transport
+header (§18), not in the PHY `seq_num`.
+
+### 16.2 Receive classification
+
+Nothing on the wire says which shape a PHY payload is. After the §15
+envelope is removed (when the receiver's own compression is enabled,
+§15.5), the reference receiver classifies the bytes in this fixed order
+(`decode_and_dispatch_audio`, `event_loop.rs:4342`, MAC attempt at `:4514`,
+transport attempt at `:4521`):
+
+1. Try the MAC parser (§17.6). If it succeeds, the frame is a MAC frame and
+   is dispatched by MAC type (§17.3). Nothing else is tried.
+2. Otherwise, if sessionless ARQ is enabled locally, try the transport
+   parser (§18.4). On success, dispatch by transport type (§18.2).
+3. Otherwise, deliver the bytes to the host as raw data.
+
+The receiver ignores the PHY header's `frame_type` (§4.2): a MAC
+`ConnectReq` arrives in a PHY `Data` frame. A conforming transmitter MUST
+still write the PHY `frame_type` values of §16.1, and a conforming receiver
+MUST classify by this order, not by the PHY `frame_type`.
+
+### 16.3 Discrepancy note: bare transport PDUs can parse as MAC frames
+
+The classification order has no discriminator. A bare transport PDU of 14
+bytes or more parses as a MAC frame whenever its first byte's low nibble is
+0–9 and bytes 1–12 decode as two valid callsigns. Vector N03 (§21.4) is a
+real example: `TransportPdu::new_reliable(0, 0, 0, b"ABCDEFGHIJ")` parses
+as a MAC `Ack` with version 0, an empty destination, source `PTICQDUF` and
+SSID 7, so step 1 claims it and the sessionless data is dropped. Every
+sessionless `Reliable` PDU passes the MAC type check, because its first
+byte `0x01` reads as MAC version 0, type `Ack`. Its MAC `dest` field is
+the bytes `seq_num, 0, 0, 0, 0, 0`, which decode as a callsign for 118 of
+the 256 sequence numbers (0–3, and 4–155 except those with both low bits
+set). Its MAC `src` field is the first six payload bytes, so whether a
+given PDU is misclassified depends on its payload. Retransmissions
+are byte-identical (§19.4), so a misclassified PDU fails the same way every
+time. Only the opt-in sessionless ARQ mode is affected. Connected-session
+traffic is always MAC-framed, and bare transport PDUs shorter than 14 bytes
+(ACKs, CP control) cannot be misclassified. See `docs/LIMITATIONS.md`.
+
+### 16.4 Out of scope
+
+These are not part of the OFDM link wire format and an implementer MUST NOT
+expect them on the air: the legacy `coppa_protocol::frame::Frame`
+(`[Preamble][Sync][Length][MAC PDU][CRC-16]`, used only by tests and a fuzz
+target, `crates/coppa-protocol/src/frame.rs`); `AppPdu` (§15.7; the
+module comments at `mac.rs:4` and `transport.rs:2-4` that show an `[App PDU]`
+inside the transport PDU are stale, the payload is opaque host bytes); the
+AX.25 codec and the AFSK 1200 TNC (`docs/TNC.md`); and the host interfaces
+(VARA-style TCP, KISS, WebSocket, ARDOP), which are local APIs, not
+over-the-air formats. Raw sessionless data (ARQ off) is host bytes with no
+header and needs no specification.
+
+---
+
+## 17. MAC frame format
+
+Source: `crates/coppa-protocol/src/mac.rs`. All multi-bit fields are
+MSB-first. Offsets are zero-based from the first MAC byte.
+
+### 17.1 Header layout (14 bytes)
+
+| Offset | Width | Field | Value |
+|---|---|---|---|
+| 0, bits 7–4 | 4 bits | `version` | MUST be transmitted as `1` (`MAC_VERSION`, `mac.rs:13`) |
+| 0, bits 3–0 | 4 bits | `type` | `MacFrameType`, §17.3 |
+| 1–6 | 6 bytes | `dest` | destination callsign, §17.2 |
+| 7–12 | 6 bytes | `src` | source callsign, §17.2 |
+| 13, bits 3–0 | 4 bits | `ssid` | 0–15; the high nibble MUST be transmitted as 0 |
+| 14– | rest | `payload` | every remaining byte; there is no length field |
+
+`HEADER_SIZE = 14` (`mac.rs:186`). Encoder: `MacPdu::to_bytes`
+(`mac.rs:219-238`). Decoder: `MacPdu::from_bytes` (`mac.rs:241-271`).
+
+### 17.2 Callsign encoding (6 bytes)
+
+A callsign is 0 to 8 characters from this alphabet, each mapped to a 6-bit
+code (`char_to_code`/`code_to_char`, `mac.rs:369-387`):
+
+| Characters | Codes |
+|---|---|
+| padding (end of text) | 0 |
+| `A`–`Z` | 1–26 |
+| `0`–`9` | 27–36 |
+| `/` | 37 |
+| `-` | 38 |
+| (invalid) | 39–63 |
+
+The transmitter uppercases the text, writes one code per character and pads
+with code 0 to exactly eight codes, then packs the eight 6-bit codes
+MSB-first into 48 bits, 6 bytes, crossing byte boundaries
+(`Callsign::encode`, `mac.rs:109`). Character `i` occupies bits
+`47 - 6i` down to `42 - 6i` of the 48-bit big-endian value.
+
+Worked example: `VK3ABC` is codes 22, 11, 30, 1, 2, 3, 0, 0, which is
+`010110 001011 011110 000001 000010 000011 000000 000000`, regrouped into
+bytes `58 b7 81 08 30 00`. `W1AW` is 23, 28, 1, 23, 0, 0, 0, 0, giving
+`5d c0 57 00 00 00`.
+
+The receiver unpacks eight codes and stops at the first code 0, ignoring
+any codes after it. A code of 39 or more before that point is an error that
+fails the whole MAC parse (`Callsign::decode`, `mac.rs:135`). Six zero
+bytes are the empty callsign, which the reference uses as broadcast or
+wildcard (§20.1). Callsign comparison is on the decoded text.
+
+There is no SSID suffix syntax in the callsign field. `VK3ABC-1` is an
+eight-character callsign whose `-` and `1` are codes 38 and 28
+(`58 b7 81 08 39 9c`), and it is a different station from `VK3ABC` with
+`ssid = 1`. The separate `ssid` field (§17.1) is the only sub-station
+identifier the session layer matches on (§20.2).
+
+### 17.3 MAC frame types
+
+| `type` | Name | Payload | Production sender |
+|---|---|---|---|
+| 0 | `Data` | transport `Reliable` PDU (§18) | session link |
+| 1 | `Ack` | transport `Ack` PDU (§18), 7 bytes | session link |
+| 2 | `ConnectReq` | 7-byte capabilities (§20.1) | `Session::initiate` |
+| 3 | `ConnectAck` | 7-byte capabilities | `Session::handle_connect_req` |
+| 4 | `ConnectCfm` | 7-byte negotiated capabilities | `Session::handle_connect_ack` |
+| 5 | `Disconnect` | empty | `Session::disconnect` |
+| 6 | `Beacon` | station-ID payload (§17.5) | `build_beacon_mac_pdu` |
+| 7 | `Keepalive` | empty | `Session::keepalive` |
+| 8 | `Relay` | none defined | none |
+| 9 | `Datagram` | KISS data unchanged (§11) | KISS datagram path |
+| 10–15 | invalid | | parse error |
+
+`MacFrameType` is `mac.rs:24-44`. This enumeration is **not** the PHY
+header's `CoppaFrameType` (§4.2): the two disagree at values 2–4 and the
+MAC adds 7–9. `Relay` is recognized by the parser, but no code builds
+one and the reference receiver only logs it ("Unhandled MAC frame type",
+`event_loop.rs:6267`). An implementer MUST NOT send `Relay` expecting any
+effect.
+
+### 17.4 Addressing
+
+A unicast frame carries the receiving station in `dest` and the sending
+station in `src`. A station-ID `Beacon` carries the sender's own callsign in
+both fields. Session frames are matched to a session by (`src`, `dest`,
+`ssid`), §20.2. The reference daemon dials with `ssid = 0`, and the
+responder copies the `ConnectReq`'s `ssid` into every frame of that session.
+
+### 17.5 Station-ID payload (`Beacon`)
+
+`StationIdPayload` (`mac.rs:287-365`), plain bytes, not 6-bit packed:
+
+| Offset | Width | Field |
+|---|---|---|
+| 0 | 1 | `callsign_len` = C |
+| 1 | C | callsign, UTF-8 |
+| 1+C | 1 | `grid_len` = G; 0 means no grid |
+| 2+C | G | Maidenhead grid locator, UTF-8 |
+| 2+C+G | 1 | `level`, the speed level the frame was sent at |
+
+The reference daemon sends `dest = src = ` its own callsign, `ssid = 0`,
+`level = 1`, at PHY speed level 1, PHY `frame_type = Beacon`, uncompressed
+(§16.1). A receiver decodes it as above. An empty payload, a payload that
+ends before the `grid_len` byte or before the `level` byte, and invalid
+UTF-8 are errors; bytes after `level` are ignored (`StationIdPayload::from_bytes`,
+`mac.rs:331`). The reference receiver only logs a received beacon
+(`handle_beacon_rx`, `event_loop.rs:6278`); it changes no state.
+
+### 17.6 Parse rules and receiver tolerance
+
+`MacPdu::from_bytes` (`mac.rs:241-271`) fails, and the frame is not a MAC
+frame (§16.2 then tries the next shape), when:
+
+- the input is shorter than 14 bytes (`MacPduTooShort`, vector N04);
+- the `type` nibble is 10–15 (`UnknownMacFrameType`, vector N01);
+- either callsign contains a code of 39 or more before its first padding
+  code (`InvalidCallsignCode`, vector N05).
+
+The reference parser is lenient in three places, and an independent
+receiver that wants to interoperate with it SHOULD be equally lenient:
+
+- `version` is read but not checked. A frame with `version = 15` parses
+  (vector N02). Transmitters MUST still send 1.
+- Only the low nibble of byte 13 is used as `ssid`; the high nibble is
+  ignored (vector N08).
+- The payload is every byte after offset 13, so trailing bytes become
+  payload. There is no per-frame length or checksum at this layer.
+
+The MAC frame has no authentication. Anyone who can transmit can send a
+`Data`, `Ack` or `Disconnect` with another station's callsigns (ADR-010,
+"Limits"; `docs/LIMITATIONS.md`).
+
+---
+
+## 18. Transport PDU format
+
+Source: `crates/coppa-protocol/src/transport.rs`.
+
+### 18.1 Header layout (7 bytes)
+
+| Offset | Width | Field | Value |
+|---|---|---|---|
+| 0, bits 7–4 | 4 bits | `session_id` | transmitted as 0 by the reference stack; ignored on receive |
+| 0, bits 3–0 | 4 bits | `type` | `TransportType`, §18.2 |
+| 1 | 1 byte | `seq_num` | segment sequence number, mod 256 (§19.1) |
+| 2 | 1 byte | `ack_num` | exclusive cumulative ACK boundary (§19.2) |
+| 3–6 | 4 bytes | `ack_bitmap` | u32 big-endian; bit N set means `ack_num + N + 1` was received; bits 0–30 used, bit 31 unused |
+| 7– | rest | `payload` | every remaining byte |
+
+`TRANSPORT_HEADER_SIZE = 7` (`transport.rs:82`). Encoder:
+`TransportPdu::to_bytes` (`transport.rs:238-258`). Decoder:
+`TransportPdu::from_bytes` (`transport.rs:261-284`).
+
+The `session_id` nibble does not identify a connected session. The
+reference daemon sends 0 inside session frames (`event_loop.rs:263-287`)
+and its sessionless and CP-control state (`arq_session_id`) is also always
+0; replies copy the received nibble. Session identity on the wire is the
+MAC (`src`, `dest`, `ssid`) triple (§20.2).
+
+### 18.2 Transport types
+
+| `type` | Name | `seq_num` | `ack_num`, `ack_bitmap` | Payload | Reference sender |
+|---|---|---|---|---|---|
+| 0 | `Unreliable` | set | 0, 0 | host bytes | none; the receiver treats it exactly like `Reliable` |
+| 1 | `Reliable` | segment seq | 0, 0 from both reference senders | host bytes | session data; sessionless data (opt-in) |
+| 2 | `Ack` | 0 | receiver's ACK state | empty, or 1 byte suggested level (§18.3) | session ACK; sessionless ACK (opt-in) |
+| 3 | `Nak` | 0 | as `Ack` | as `Ack` | none; the receiver treats it exactly like `Ack` |
+| 4 | `Reset` | 0 | 0, 0 | empty | none; a receiver rebuilds its sessionless and CP-control ARQ state and returns to the long CP (§20.4) |
+| 5 | `CpControl` | segment seq (content) or 0 (bare ack) | piggybacked ACK state | 2 bytes (content) or empty (bare ack), §20.4 | CP-switch negotiation (opt-in) |
+| 6–15 | invalid | | | | parse error |
+
+`TransportType` is `transport.rs:22-40`. A `Reliable` PDU's `ack_num` and
+`ack_bitmap` are always zero from the reference senders, so a
+retransmission is byte-identical to its first transmission (§19.4).
+
+### 18.3 Suggested level on an ACK
+
+An `Ack` PDU MAY carry one payload byte: the receiver's recommended speed
+level for the peer's next transmissions (`new_ack_with_rate`,
+`transport.rs:124`). A receiver reads the first payload byte of any `Ack`
+PDU as that suggestion (`suggested_rate`, `transport.rs:229`), clamps it to
+a legal level (1–9) and treats it as advice (`RateLoop::on_ack`,
+`crates/coppa-ml/src/rate_loop.rs`). The reference daemon sends it only on
+sessionless ACKs; session ACKs carry no payload (`session_ack_frame`).
+
+### 18.4 Parse rules
+
+`TransportPdu::from_bytes` fails when the input is shorter than 7 bytes
+(`TransportPduTooShort`, vector N07) or the `type` nibble is 6–15
+(`UnknownTransportType`, vector N06). It does not check `session_id`, and
+it does not check that `seq_num`, `ack_num`, `ack_bitmap` or the payload
+length fit the type. Inside a MAC `Data` frame, a payload that does not
+parse as a transport `Reliable` PDU (for example from a pre-0.3.0 peer) is
+dropped with no delivery and no ACK (`handle_session_data`,
+`event_loop.rs:6555`).
+
+---
+
+## 19. ARQ semantics
+
+Source: `crates/coppa-protocol/src/arq.rs` (`ArqTx`, `ArqRx`) and
+`TransportPdu::is_acked` (`transport.rs:206-225`). §19.1–§19.4 are
+normative wire behaviour. §19.6 is informative reference policy.
+
+### 19.1 Sequence numbers
+
+`seq_num` is a u8 that increments by 1 per new segment and wraps from 255
+to 0. All comparisons are modulo 256. Each ARQ stream starts at 0: a
+connected session's data stream at establishment, the sessionless stream at
+daemon start or `Reset`, and the CP-control stream (§20.4) separately. A
+sender never reuses a sequence number for a different segment.
+
+### 19.2 Cumulative ACK and selective bitmap
+
+An `Ack` reports the receiver's state with an **exclusive** cumulative
+boundary: `ack_num` is the lowest sequence number not yet delivered, so
+every segment before it is acknowledged and `ack_num` itself is not. Bit N
+of `ack_bitmap` (bit 0 = least significant bit of the big-endian u32)
+reports that segment `ack_num + N + 1` is buffered out of order. Bits 0–30
+are used (`SACK_RANGE = 31`, `arq.rs:72`); bit 31 is transmitted as 0 and
+ignored.
+
+A sender decides whether segment `s` is acknowledged as follows, with
+`d = (s - ack_num) mod 256`:
+
+| `d` | Acknowledged |
+|---|---|
+| 0 | no (`ack_num` is exclusive) |
+| 1–31 | bit `d - 1` of `ack_bitmap` |
+| 32–127 | no |
+| 128 | see below |
+| 129–255 | yes (cumulative: `s` is before `ack_num`) |
+
+The reference code is inconsistent at `d = 128`. `TransportPdu::is_acked`
+counts it as ahead (not acknowledged), but the sender's window update
+(`ArqTx::process_ack`, `arq.rs:450`) advances `send_base` toward
+`ack_num` across any distance of 1–128, so it treats `d = 128` as
+acknowledged. With windows of at most 32 (§19.4) a valid ACK never lands
+there; only a stale or zero ACK does (§19.5). A conforming sender SHOULD
+treat `d` in 128–255 as acknowledged, as `process_ack` does, and SHOULD
+NOT let 128 or more segments be outstanding. Example across the wrap: `ack_num = 252, ack_bitmap = 0x0000001b`
+acknowledges 250, 251, 253, 254, 0 and 1, and not 252 or 255. Vector P13
+(§21.3) carries those bytes with a worked decode.
+
+### 19.3 Receiver rules
+
+A receiver with window W keeps `recv_base`, the next sequence number to
+deliver (`ArqRx::receive`, `arq.rs:793`):
+
+1. If `(seq - recv_base) mod 256 >= W`, the segment is a duplicate or too
+   far ahead. It MUST NOT be delivered again.
+2. Otherwise it is buffered; the first copy wins.
+3. The contiguous run starting at `recv_base` is delivered to the host in
+   order, and `recv_base` advances past it.
+
+Its ACK state (`ArqRx::ack_info`, `arq.rs:829`) is `ack_num = recv_base`
+and a bitmap with bit N set when `recv_base + N + 1` is buffered. With
+W = 1 the bitmap is always 0.
+
+A receiver MUST answer **every** received data segment with an ACK,
+including duplicates and out-of-window segments (`handle_session_data`,
+`event_loop.rs:6526`). This is what lets stop-and-wait recover from a lost
+ACK: the sender's retransmission draws a fresh ACK.
+
+### 19.4 Sender rules
+
+- At most W segments may be unacknowledged. In connected sessions W = 1
+  (`SESSION_ARQ_WINDOW`, `event_loop.rs:139`): stop-and-wait. Sessionless
+  ARQ uses W = 8 (`event_loop.rs:985`) and CP control W = 2 (`:1055`).
+  These are fixed constants on both ends. The `arq_window` capability
+  (§20.1) is advertised and negotiated but does not change them.
+- A data retransmission MUST be byte-identical to the first transmission at
+  the MAC and transport layers. It MAY be sent at a different PHY speed
+  level, so the PHY frame need not be identical.
+- A CP-control content retransmission preserves its transport sequence
+  number and payload, but refreshes `ack_num` and `ack_bitmap` from the
+  current CP-control receive state (`check_arq_retransmits`,
+  `event_loop.rs:5717-5728`). For example, receiving a crossed Propose can
+  advance that state while the station's own Propose remains outstanding.
+  The retry's transport header therefore need not be byte-identical.
+- Every on-air frame of the reference stack is RV0 with PHY `seq_num` 0
+  (§16.1, §5.3). Retransmissions do not cycle the redundancy version.
+- A connected-session sender ignores an `Ack` whose `ack_num` is beyond its
+  next unsent sequence number (`event_loop.rs:6621`), and ignores the ACK
+  fields of incoming `Data` frames.
+
+### 19.5 Sessionless ARQ (optional)
+
+With `arq_enabled`, host data sent outside a session is a bare transport
+`Reliable` PDU (§16.1) and the receiver answers with a bare transport `Ack`
+that carries a suggested level (§18.3). The rules of §19.1–§19.4 apply with
+W = 8. A `Reset` PDU tells the receiver to rebuild its sessionless and
+CP-control ARQ state, restart its sequence numbers at 0 and drop back to
+the long-CP profile (§20.4).
+
+**Discrepancy note: sessionless data PDUs move the sender's window.** The
+reference receiver passes the `ack_num` and `ack_bitmap` of every inbound
+sessionless `Reliable` PDU to its own sender's ACK processing
+(`event_loop.rs:4556-4564`), but data PDUs always carry `ack_num = 0,
+ack_bitmap = 0` (§18.2). By §19.2, the reference sender treats
+`ack_num = 0` as cumulatively acknowledging segments 128 to 255. Once the
+receiving station's own `send_base` reaches 128, an inbound data PDU
+acknowledges segments that were never received. Reproduced through `ArqTx` for COP-130:
+after 130 acknowledged sends with segment 130 in flight, processing
+`ack=0, bitmap=0` reports segment 130 as newly acknowledged and moves the
+window base back to 0, leaving 131 segments counted in flight, so the
+sender can no longer send. This needs bidirectional sessionless ARQ traffic
+and is listed in `docs/LIMITATIONS.md`. Connected sessions are not affected
+(§19.4). An independent implementation SHOULD NOT process ACK fields on
+data PDUs whose `ack_num` and `ack_bitmap` are both zero.
+
+### 19.6 Retransmission policy (informative)
+
+Timer values are local policy and invisible to a peer. An implementation
+MAY choose its own; the reference values are:
+
+| Item | Reference value | Source |
+|---|---|---|
+| Initial RTO | 5 s (`DEFAULT_RTO_SECS`) | `arq.rs:75` |
+| RTO estimator | RFC 6298 form, floored by airtime plus turnaround (`rto_floor`) | `arq.rs:131` |
+| Backoff | doubles per timeout, capped at 60 s | `arq.rs` |
+| Retransmissions before giving up | 5 (`DEFAULT_MAX_RETRANSMIT`) | `arq.rs:78` |
+| Worst case, no ACK ever | retransmit at 5, 15, 35, 75 and 135 s (5 + 10 + 20 + 40 + 60), then fail | `cp_negotiator.rs:262-270` |
+| Connected-session fade hold | COP-68: falls back in level and keeps retrying instead of giving up | `event_loop.rs:151,159` |
+
+ADR-010 D7's "one more RTO, then DISCONNECT" is superseded by the COP-68
+fade hold (`docs/LIMITATIONS.md`).
+
+---
+
+## 20. Session establishment and control
+
+Source: `crates/coppa-protocol/src/session.rs` and the daemon's MAC
+handlers (`handle_mac_pdu`, `crates/coppa-daemon/src/event_loop.rs:6244`).
+Session states are `Idle`, `Connecting`, `Accepting`, `Established` and
+`Disconnecting` (`session.rs:27`).
+
+### 20.1 Three-way handshake
+
+| Step | Frame, direction | Fields | Effect at the receiver |
+|---|---|---|---|
+| 1 | `ConnectReq`, initiator → responder | `dest` = responder, `src` = initiator, `ssid` = session SSID, payload = initiator's capabilities | responder moves to `Accepting` and replies |
+| 2 | `ConnectAck`, responder → initiator | `dest` = REQ's `src`, `src` = responder, `ssid` copied from REQ, payload = responder's capabilities | initiator computes `negotiate(local, remote)`, sends step 3 and is `Established` |
+| 3 | `ConnectCfm`, initiator → responder | as step 1, payload = negotiated capabilities | responder validates and is `Established` |
+
+Builders: `Session::initiate` (`session.rs:235`),
+`Session::handle_connect_req` (`:288`), `Session::handle_connect_ack`
+(`:254`), `Session::handle_connect_cfm` (`:314`). Vectors P01–P03 are a
+complete exchange.
+
+**Capabilities (`LinkCapabilities`, 7 bytes, `session.rs:45-141`):**
+
+| Offset | Width | Field | Library default | coppad |
+|---|---|---|---|---|
+| 0–1 | u16 BE | `max_payload_size` | 200 | 200 |
+| 2 | 1 | `fec_rate_num` | 1 | 1 |
+| 3 | 1 | `fec_rate_den` | 2 | 2 |
+| 4 | 1 | `arq_window` | 8 | 8 |
+| 5 | 1 | flags: bit 0 `compression`, bit 1 `multi_frame_ack`, bits 2–7 reserved | `0x00` | `0x02` |
+| 6 | 1 | `mcs_index` | 0 | 0 |
+
+The library default encodes as `00c80102080000` (P24). coppad sets
+`multi_frame_ack` (`event_loop.rs:207-212`) and sends `00c80102080200`
+(P23). Transmitters MUST send reserved flag bits as 0. Receivers ignore
+them, ignore bytes after offset 6, and reject fewer than 7 bytes
+(`CapabilitiesTooShort`). A zero `fec_rate_den` parses; the reference
+treats that rate as 0 when comparing.
+
+**Negotiation** (`LinkCapabilities::negotiate`, `session.rs:115`), field by
+field: the minimum of `max_payload_size`, `arq_window` and `mcs_index`;
+the lower of the two FEC rates, taken as the (num, den) pair, with a tie
+keeping the initiator's own pair; and the logical AND of each flag. P25 and
+P26 negotiate to P27 in either order.
+
+**Responder validation** (`handle_connect_cfm`, `session.rs:314-357`): the
+responder recomputes `negotiate(local, remote)` and rejects the `ConnectCfm`
+if its `max_payload_size`, `arq_window`, `mcs_index` or FEC rate exceeds
+that bound, or if it sets `compression` when the bound does not. It does
+not check `multi_frame_ack`. On rejection the reference responder silently
+drops the session; it sends nothing.
+
+**What the negotiated values do.** Only `multi_frame_ack` changes on-air
+behaviour: when both stations set it, a session `Data` frame MAY use more
+than one PHY codeword (up to `min(max_codewords_per_frame, 8)`); otherwise
+every session `Data` frame is one codeword (`event_loop.rs:2405-2421`). It
+does not change the ACK format. A receiver decodes a multi-codeword frame
+from the PHY header alone (§4.2, §9). `arq_window` does not change the
+window (§19.4). `max_payload_size`, the FEC rate and `mcs_index` are parsed
+and validated but not used. `compression` is not used: each station
+compresses by its own configuration (§15.5), and coppad advertises
+`compression = false` while it may still compress. There is no capability
+for speed levels, profiles or the CP mode.
+
+**Responder admission.** The reference responder answers a `ConnectReq`
+only when it is listening, has a local callsign, and the request's `dest`
+is either empty or its own callsign (`handle_incoming_connect`,
+`event_loop.rs:6286`). The empty `dest` is accepted, but a handshake that
+uses it does not complete with the reference initiator: the `ConnectAck`
+comes back with the responder's real callsign in `src`, which does not
+match the initiator's empty remote (§20.2), so it is dropped. An initiator
+SHOULD put the responder's callsign in `dest`. The reference responder
+supports one session. While any session exists,
+it does not answer a new `ConnectReq`, even from the current peer, and
+there is no reject frame (ADR-010 D2), except that a repeat `ConnectReq`
+from the same caller on the same SSID replaces a session still in
+`Accepting` (COP-44). A
+`ConnectReq` whose payload is shorter than 7 bytes is dropped. An initiator
+that receives a `ConnectAck` with fewer than 7 capability bytes sends no
+`ConnectCfm` and stays in `Connecting` until the handshake timeout
+(`handle_connect_ack_rx`, `event_loop.rs:6396`). `ConnectAck` and
+`ConnectCfm` are matched to the pending session by (`src`, `dest`, `ssid`)
+like every session frame (§20.2).
+
+**Timing (informative).** The reference initiator and responder remove a
+session still in `Connecting` or `Accepting` after 30 s
+(`HANDSHAKE_TIMEOUT_SECS`, `session.rs:197`). A lost `ConnectCfm` is not retried: the initiator is
+already `Established` and the responder stays in `Accepting` until that
+timeout (ADR-010, "Limits"; `docs/LIMITATIONS.md`).
+
+### 20.2 Established session
+
+In `Established`, data flows as MAC `Data` + transport `Reliable` and is
+acknowledged by MAC `Ack` + transport `Ack` (§16.1, §19, vectors P04–P07).
+Both directions start at sequence number 0. A frame belongs to the session
+only when its `src` is the remote callsign, its `dest` is the local
+callsign, and its `ssid` matches (`session_id_for_frame`,
+`event_loop.rs:2637`). Frames that match no session are dropped.
+
+### 20.3 Keepalive and teardown
+
+- `Keepalive` (MAC type 7, empty payload, 14 bytes, P08): sent by a station
+  whose established session has been idle for 30 s
+  (`DEFAULT_KEEPALIVE_SECS`, `session.rs:183`). The receiver refreshes its
+  idle timer. There is no reply and no miss counter.
+- `Disconnect` (MAC type 5, empty payload, 14 bytes, P09): sent once, best
+  effort, with no reply (`Session::disconnect`, `session.rs:362`). The
+  receiver removes the session immediately. On a local host disconnect
+  request, the daemon enters `Disconnecting`, stops accepting new host data
+  for that session and stops its keepalives. It continues sending queued
+  data and receiving, delivering and ACKing peer data. It waits until the
+  backlog is empty, all in-flight data is acknowledged and the transmitter
+  is unkeyed before sending the final `Disconnect`
+  (`finish_drained_disconnect`, `event_loop.rs:3288`). It removes the local
+  session after that send attempt (`end_local_disconnect`, `:3307`), with
+  no post-send wait for a reply.
+- The reference drain timeout is 10 s without activity
+  (`DEFAULT_DISCONNECT_TIMEOUT_SECS`). Sending data and waiting within the
+  retry budget refresh the drain's activity timer, so a progressing backlog
+  may take longer than 10 s. If the drain stalls or the retry budget is
+  exhausted, the daemon drops the remaining queued and unacknowledged data,
+  attempts the final `Disconnect` once and removes the session. A transmit
+  gate that blocks data can also block that final frame
+  (`touch_draining_session`, `check_session_retransmits`,
+  `reap_timed_out_sessions`). This timeout bounds a stalled drain, not a
+  wait after transmitting `Disconnect`.
+- A session with no activity for 120 s (`DEFAULT_SESSION_TIMEOUT_SECS`)
+  is removed locally. Because keepalives refresh that timer, a peer that
+  has vanished is detected only while data is in flight.
+
+These timer values are reference policy (informative).
+
+### 20.4 Optional CP-switch negotiation
+
+Off by default. It runs only between stations that both enable
+`arq_enabled` and `cp_negotiation_enabled`; proposing also needs
+`cp_gate_enabled`. Nothing on the wire advertises support, so both
+operators must configure it. The messages are bare transport `CpControl`
+PDUs (§18.2), not MAC-framed, with their own ARQ stream: W = 2 and a
+sequence space separate from data (`event_loop.rs:1050-1055`). This is the
+only in-band profile change. Which profile family a station starts on is
+still configured out of band (§1.3), and a frame the engine routes to
+`vhf_wide` ignores the CP mode (`select_ofdm_profile`,
+`crates/coppa-engine/src/engine.rs:198`).
+
+A content PDU carries a 2-byte payload `[kind, mode]`
+(`crates/coppa-protocol/src/cp_negotiator.rs:252-259,352-383`):
+
+| `kind` | Name | Sent by |
+|---|---|---|
+| `0x01` | Propose | proposer |
+| `0x02` | Confirm | responder |
+| `0x03` | Switched | responder |
+
+| `mode` | CP mode | Profile |
+|---|---|---|
+| `0x00` | LongCp | `hf_standard`, 300-sample CP |
+| `0x01` | ShortCp | `hf_standard_short_cp`, 144-sample CP |
+
+A receiver reads any `mode` byte other than `0x01` as LongCp, and Confirm
+and Switched echo the normalized mode. A payload of any other length, or
+with any other `kind`, is ignored. A bare ack is a `CpControl` PDU with
+`seq_num = 0`, an empty payload and the sender's CP-control ACK state.
+
+The exchange, using the CP-control stream's own sequence numbers
+(vectors P18–P22):
+
+1. Proposer sends Propose(mode) under the old profile.
+2. Responder sends Confirm(mode) under the old profile, piggybacking the
+   ACK of the Propose. It does not switch yet. A responder with its own
+   negotiation in flight drops the Propose silently.
+3. Proposer, on the Confirm, sends a bare ack under the **old** profile,
+   then switches its transmit and receive profile and starts a 180 s
+   probation (`SWITCH_PROBATION_SECS`, `cp_negotiator.rs:277`).
+4. Responder, on that ack, switches and sends Switched(mode) under the
+   **new** profile.
+5. Proposer, on the Switched, ends probation and sends a bare ack under the
+   new profile.
+
+Give-up (reference policy): if the Propose, Confirm or Switched exhausts its
+retransmissions, or the proposer's probation expires before Switched
+arrives, that station reverts to the mode it had before the negotiation
+began. The module documentation's G1–G4 table (`cp_negotiator.rs:89-103`)
+lists each case. A received transport `Reset` (§18.2) also ends any
+negotiation and puts the receiving station back on LongCp
+(`decode_and_dispatch_audio`'s `Reset` arm, `event_loop.rs:4637-4672`),
+whatever mode the peer is on; nothing tells the peer. Note that
+`cp_negotiator.rs` calls the proposer "B" and the responder "A"; this spec
+uses the wire roles only.
+
+---
+
+## 21. Golden protocol vectors
+
+These vectors freeze the §16–§20 wire bytes. They are documentation first:
+a reader can decode every row from the tables above. They are also
+executable. `crates/coppa-protocol/tests/protocol_vectors.rs` (run with
+`cargo test -p coppa-protocol --test protocol_vectors`, or as part of
+`cargo test --workspace`) asserts that the public encoders and session
+transitions produce each hex string, decodes every field again with an
+independent test-only unpacker, and reads this section to check that each
+row ID below still carries the same hex, and that every row ID here has a
+vector in the test. Changing a row here or in the test without the other
+fails the suite. The daemon's own session builders and capabilities are
+pinned to P04–P07 and P23 by `session_builders_emit_spec_21_vectors`
+(`crates/coppa-daemon/src/event_loop.rs`).
+
+All rows are application payload bytes (§16): after §15 decompression and
+before PHY framing, except P28 (a PHY header) and P29 (a §15 envelope).
+Hex is one byte per two digits. The two stations are `VK3ABC` (initiator)
+and `W1AW` (responder), `ssid = 0`, with coppad's capabilities.
+
+### 21.1 Connected conversation
+
+| ID | Frame | Direction | Bytes | Hex |
+|---|---|---|---|---|
+| P01 | `ConnectReq` | VK3ABC → W1AW | 21 | `125dc05700000058b7810830000000c80102080200` |
+| P02 | `ConnectAck` | W1AW → VK3ABC | 21 | `1358b7810830005dc0570000000000c80102080200` |
+| P03 | `ConnectCfm` | VK3ABC → W1AW | 21 | `145dc05700000058b7810830000000c80102080200` |
+| P04 | `Data`, seq 0, `HELLO` | VK3ABC → W1AW | 26 | `105dc05700000058b781083000000100000000000048454c4c4f` |
+| P05 | `Ack`, ack 1 | W1AW → VK3ABC | 21 | `1158b7810830005dc0570000000002000100000000` |
+| P06 | `Data`, seq 1, `73` (its retransmission is identical) | VK3ABC → W1AW | 23 | `105dc05700000058b78108300000010100000000003733` |
+| P07 | `Ack`, ack 2 | W1AW → VK3ABC | 21 | `1158b7810830005dc0570000000002000200000000` |
+| P08 | `Keepalive` | VK3ABC → W1AW | 14 | `175dc05700000058b78108300000` |
+| P09 | `Disconnect` | VK3ABC → W1AW | 14 | `155dc05700000058b78108300000` |
+| P10 | `Beacon`, grid `QF22`, level 1 | VK3ABC | 27 | `1658b78108300058b7810830000006564b33414243045146323201` |
+| P11 | `Beacon`, no grid, level 1 | W1AW | 21 | `165dc0570000005dc0570000000004573141570001` |
+| P12 | `ConnectReq`, `ssid = 5` | VK3ABC → W1AW | 21 | `125dc05700000058b7810830000500c80102080200` |
+
+### 21.2 Worked decode
+
+**P04, session data.** Byte 0 `10`: `version` 1, `type` 0 (`Data`).
+Bytes 1–6 `5d c0 57 00 00 00` are bits `010111 011100 000001 010111 000000
+...`, codes 23, 28, 1, 23 then padding: `dest = W1AW`. Bytes 7–12
+`58 b7 81 08 30 00` are codes 22, 11, 30, 1, 2, 3, 0, 0: `src = VK3ABC`.
+Byte 13 `00`: `ssid` 0. The MAC payload is the transport PDU `01 00 00 00 00
+00 00 48 45 4c 4c 4f`: `session_id` 0, `type` 1 (`Reliable`), `seq_num` 0,
+`ack_num` 0, `ack_bitmap` 0, payload `48 45 4c 4c 4f` = `HELLO`. Length
+14 + 7 + 5 = 26.
+
+**P05, session ACK.** `11`: `version` 1, `type` 1 (`Ack`). `dest = VK3ABC`,
+`src = W1AW`, `ssid` 0. Transport `02 00 01 00 00 00 00`: `type` 2 (`Ack`),
+`seq_num` 0, `ack_num` 1 (segment 0 delivered, 1 is next), bitmap 0, no
+payload. Length 14 + 7 = 21.
+
+**P06/P07.** The second segment has `seq_num` 1 and payload `37 33` = `73`.
+A retransmission of it is the same 23 bytes (§19.4). The receiver answers
+the first copy and every duplicate with P07, `ack_num` 2.
+
+**P01, capabilities.** `12`: `version` 1, `type` 2 (`ConnectReq`),
+`dest = W1AW`, `src = VK3ABC`, `ssid` 0. Payload `00 c8 01 02 08 02 00`:
+`max_payload_size` `0x00c8` = 200, FEC rate 1/2, `arq_window` 8, flags
+`0x02` = `multi_frame_ack` only, `mcs_index` 0. P02 is the same with the
+callsigns swapped and `type` 3. P03 is `type` 4 carrying the negotiation of
+two identical sets, which is the same 7 bytes. P12 differs from P01 only in
+byte 13, `05`.
+
+**P10, beacon.** `16`: `type` 6 (`Beacon`), `dest = src = VK3ABC`, `ssid` 0.
+Payload `06 56 4b 33 41 42 43 04 51 46 32 32 01`: callsign length 6, `VK3ABC`,
+grid length 4, `QF22`, level 1. P11's payload `04 57 31 41 57 00 01` has a
+zero grid length, so no grid.
+
+### 21.3 Transport, ARQ and capability rows
+
+| ID | Content | Bytes | Hex |
+|---|---|---|---|
+| P13 | `Ack`, `ack_num` 252, `ack_bitmap` `0x0000001b` | 7 | `0200fc0000001b` |
+| P14 | `Ack`, `ack_num` 1, suggested level 5 | 8 | `0200010000000005` |
+| P15 | `Reliable`, `seq_num` 7, payload `HI` (codec example) | 9 | `010700000000004849` |
+| P16 | `Nak`, `ack_num` 9, `ack_bitmap` 5 (codec only, never sent) | 7 | `03000900000005` |
+| P17 | `Reset` (codec only, never sent) | 7 | `04000000000000` |
+| P18 | `CpControl` Propose ShortCp, seq 0, proposer → responder | 9 | `050000000000000101` |
+| P19 | `CpControl` Confirm ShortCp, seq 0, ack 1, responder → proposer | 9 | `050001000000000201` |
+| P20 | `CpControl` bare ack, ack 1, proposer → responder (old profile) | 7 | `05000100000000` |
+| P21 | `CpControl` Switched ShortCp, seq 1, ack 1, responder → proposer (new profile) | 9 | `050101000000000301` |
+| P22 | `CpControl` bare ack, ack 2, proposer → responder (new profile) | 7 | `05000200000000` |
+| P23 | capabilities, coppad | 7 | `00c80102080200` |
+| P24 | capabilities, library default | 7 | `00c80102080000` |
+| P25 | capabilities A: 200, 3/4, window 8, both flags, mcs 5 | 7 | `00c80304080305` |
+| P26 | capabilities B: 120, 1/2, window 4, `multi_frame_ack`, mcs 3 | 7 | `00780102040203` |
+| P27 | `negotiate(A, B)` and `negotiate(B, A)` | 7 | `00780102040203` |
+| P28 | PHY header (§4.2) over P04 at level 2, `hf_standard` | 6 | `1001020001a0` |
+| P29 | §15 envelope over the 26 bytes of P04 | 46 | `fe2b000000a002ff10ff5dffc0bffc030200e147fdbffc0ff846bff00ff00ff01f0600a00ff00ff00ff00a555540` |
+
+**P13, selective ACK across the wrap.** A sender with W = 8 sent 250 to
+255, 0 and 1; the receiver got all except 252 and 255. `ack_num` is 252
+(`fc`), and `0x1b` is bits 0, 1, 3 and 4: segments 253, 254, 0 and 1
+(252 + 1, + 2, + 4, + 5, mod 256) are buffered. By §19.2, 250 (d = 254)
+and 251 (d = 255) are acknowledged cumulatively, 252 (d = 0) and 255
+(d = 3, bit 2 clear) are not. For `is_acked`, segment `ack_num - 128`
+(d = 128) is not acknowledged and `ack_num - 127` (d = 129) is; see §19.2
+for the sender's different treatment of d = 128.
+
+**P18–P22.** All five have `session_id` 0 and `type` 5. P18 is seq 0 with
+nothing to acknowledge; P19's `ack_num` 1 acknowledges the Propose; P20
+acknowledges the Confirm; P21 is the responder's second segment; P22
+acknowledges it.
+
+**P28.** `10`: `version` 1, `phy_mode` 0. `01`: `frame_type` 0 (`Data`),
+`bandwidth` 1. `02`: `fec_type` 0, `speed_level` 2. `00`: `seq_num` 0.
+`01 a0`: `payload_len` `0x01a` = 26, `codewords - 1` = 0.
+
+**P29.** `fe` is the §15.1 marker and `2b000000` is the u32 little-endian
+length 43 of the Huffman stream; the rest is the LZ4 block. The whole MAC
+frame, headers included, is inside the envelope (§16.1). Like §15.6, this
+row pins `lz4_flex` 0.14's output; it is not the only valid LZ4 encoding.
+A dependency upgrade that changes it MUST regenerate this row and the test
+together.
+
+### 21.4 Error and tolerance rows
+
+Each row states which parser it describes and what the reference returns.
+
+| ID | Input | Bytes | Hex | Reference result |
+|---|---|---|---|---|
+| N01 | P04 with `type` 10 | 26 | `1a5dc05700000058b781083000000100000000000048454c4c4f` | MAC parse fails, `UnknownMacFrameType { value: 10 }` |
+| N02 | P04 with `version` 15 | 26 | `f05dc05700000058b781083000000100000000000048454c4c4f` | MAC parse succeeds, `version` 15, `Data` (§17.6) |
+| N03 | bare transport `Reliable`, seq 0, `ABCDEFGHIJ` | 17 | `010000000000004142434445464748494a` | transport parse succeeds; MAC parse **also** succeeds as `Ack`, `version` 0, `dest` empty, `src = PTICQDUF`, `ssid` 7, so §16.2 classifies it as MAC (§16.3) |
+| N04 | first 13 bytes of P08 | 13 | `175dc05700000058b781083000` | MAC parse fails, `MacPduTooShort` |
+| N05 | P08 with `dest` replaced by `fc 00 00 00 00 00` (first code 63) | 14 | `17fc000000000058b78108300000` | MAC parse fails, `InvalidCallsignCode { code: 63 }` |
+| N06 | transport `type` 6 | 7 | `06000000000000` | transport parse fails, `UnknownTransportType { value: 6 }` |
+| N07 | 6-byte transport input | 6 | `010000000000` | transport parse fails, `TransportPduTooShort` |
+| N08 | P08 with SSID byte `f3` | 14 | `175dc05700000058b781083000f3` | MAC parse succeeds, `Keepalive`, `ssid` 3 (§17.6) |
