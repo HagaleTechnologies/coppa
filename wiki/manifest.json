@@ -130,8 +130,8 @@
       ],
       "status": "current",
       "title": "What did Phase 2's channel-estimation work fix, break, and leave open?",
-      "verified_commit": "3b90adc",
-      "verified_date": "2026-11-04",
+      "verified_commit": "59b0b63",
+      "verified_date": "2026-07-14",
       "visibility": "public"
     },
     {
