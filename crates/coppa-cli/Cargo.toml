@@ -33,6 +33,7 @@ clap_complete = { workspace = true }
 clap_mangen = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 # Golden-vector manifest parsing (tests/rx_golden.rs), matching
 # crates/coppa-protocol/tests/golden_vectors.rs's approach.
 toml = { workspace = true }

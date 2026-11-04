@@ -5,6 +5,8 @@
 //! pipe ends the run quietly instead of panicking. Status goes to stderr.
 #![cfg_attr(not(test), deny(clippy::print_stdout))]
 
+#[cfg(feature = "kiss-tnc")]
+mod broadcast;
 mod doctor;
 mod interrupt;
 mod style;
@@ -665,8 +667,14 @@ enum Commands {
     },
     /// Print the coppa(1) man page in roff format.
     Man,
-    /// Start the AFSK 1200 TNC (KISS TCP server).
+    /// Send or receive a repeated file over OFDM KISS datagrams.
     #[cfg(feature = "kiss-tnc")]
+    Broadcast {
+        #[command(subcommand)]
+        command: broadcast::Command,
+    },
+    #[cfg(feature = "kiss-tnc")]
+    /// Start the AFSK 1200 TNC (KISS TCP server).
     Tnc {
         /// KISS TCP port.
         #[arg(long, default_value = "8001")]
@@ -890,6 +898,8 @@ fn run() -> Result<()> {
             style::warn(CONFIG_DEPRECATED);
             cmd_profiles(&args)?
         }
+        #[cfg(feature = "kiss-tnc")]
+        Commands::Broadcast { command } => broadcast::run(command, verbosity)?,
         #[cfg(feature = "kiss-tnc")]
         Commands::Tnc {
             port,

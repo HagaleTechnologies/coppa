@@ -48,6 +48,7 @@ pub use error::ProtocolError;
 
 pub mod app;
 pub mod arq;
+pub mod broadcast_file;
 pub mod cp_negotiator;
 pub mod fec;
 pub mod frame;
