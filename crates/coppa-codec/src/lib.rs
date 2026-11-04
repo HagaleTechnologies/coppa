@@ -9,6 +9,7 @@
 //!   `ChannelEstimator` traits,
 //! - `afsk`: the AFSK 1200 (Bell 202) modem with HDLC framing and NRZI coding
 //!   that the KISS TNC uses.
+//! - `g3ruh`: the 9600 baud direct-FSK modem for the KISS TNC.
 
 //! # Errors
 //!
@@ -36,6 +37,8 @@ pub use error::CodecError;
 
 pub mod afsk;
 pub mod bpsk;
+pub mod g3ruh;
+mod hdlc;
 pub mod ofdm;
 pub mod psk8;
 pub mod qam16;

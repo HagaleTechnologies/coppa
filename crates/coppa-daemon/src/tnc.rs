@@ -1,5 +1,5 @@
 //! TNC (Terminal Node Controller) daemon mode.
-//! Wires AFSK 1200 modem <-> CPAL audio <-> KISS TCP server <-> PTT control.
+//! Wires AFSK 1200 or G3RUH 9600 modem <-> CPAL audio <-> KISS TCP server <-> PTT control.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -179,14 +179,59 @@ impl TncTx {
     }
 }
 
+/// Physical layer used by the KISS TNC. Both modes run at 48 kHz.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TncBaud {
+    Afsk1200,
+    G3ruh9600,
+}
+
+impl TncBaud {
+    fn modem_name(self) -> &'static str {
+        match self {
+            Self::Afsk1200 => "afsk_1200",
+            Self::G3ruh9600 => "g3ruh_9600",
+        }
+    }
+}
+
+enum TncDemodulator {
+    Afsk(coppa_codec::afsk::Demodulator),
+    G3ruh(Box<coppa_codec::g3ruh::Demodulator>),
+}
+
+impl TncDemodulator {
+    fn new(baud: TncBaud) -> Self {
+        match baud {
+            TncBaud::Afsk1200 => Self::Afsk(coppa_codec::afsk::Demodulator::new()),
+            TncBaud::G3ruh9600 => Self::G3ruh(Box::default()),
+        }
+    }
+
+    fn process(&mut self, samples: &[f32]) {
+        match self {
+            Self::Afsk(demod) => demod.process(samples),
+            Self::G3ruh(demod) => demod.process(samples),
+        }
+    }
+
+    fn take_frames(&mut self) -> Vec<Vec<u8>> {
+        match self {
+            Self::Afsk(demod) => demod.take_frames(),
+            Self::G3ruh(demod) => demod.take_frames(),
+        }
+    }
+}
+
 /// Configuration for TNC daemon mode.
 pub struct TncConfig {
+    pub baud: TncBaud,
     pub kiss_port: u16,
     /// Address the KISS TCP server binds to. Defaults to "127.0.0.1" (loopback only).
     pub bind_address: String,
     pub rig_address: Option<String>,
     pub vox_mode: bool,
-    /// Preferred hardware rate; AFSK modem audio remains at 48 kHz.
+    /// Preferred hardware rate; modem audio remains at 48 kHz.
     pub sample_rate: u32,
     /// Audio device name substring (case-insensitive) for both input and
     /// output; `None` uses the default devices.
@@ -205,6 +250,7 @@ pub struct TncConfig {
 impl Default for TncConfig {
     fn default() -> Self {
         Self {
+            baud: TncBaud::Afsk1200,
             kiss_port: 8001,
             bind_address: "127.0.0.1".to_string(),
             rig_address: None,
@@ -223,8 +269,12 @@ impl Default for TncConfig {
 ///
 /// KISS frames carry no FCS: the TNC adds it on transmit and checks and
 /// strips it on receive (see [`air_to_kiss`]).
-fn kiss_to_air(payload: &[u8]) -> Vec<f32> {
-    coppa_codec::afsk::modulate(&coppa_codec::afsk::append_fcs(payload))
+fn kiss_to_air(payload: &[u8], baud: TncBaud) -> Vec<f32> {
+    let frame = coppa_codec::afsk::append_fcs(payload);
+    match baud {
+        TncBaud::Afsk1200 => coppa_codec::afsk::modulate(&frame),
+        TncBaud::G3ruh9600 => coppa_codec::g3ruh::modulate(&frame),
+    }
 }
 
 /// Turn a decoded on-air frame into a KISS data payload.
@@ -241,8 +291,8 @@ fn air_to_kiss(mut frame: Vec<u8>) -> Vec<u8> {
 ///
 /// Wires together:
 /// - KISS TCP server (accepts AX.25 frames from host apps)
-/// - AFSK 1200 demodulator (decodes audio → AX.25 frames)
-/// - AFSK 1200 modulator (encodes AX.25 frames → audio)
+/// - Selected demodulator (decodes audio → AX.25 frames)
+/// - Selected modulator (encodes AX.25 frames → audio)
 /// - PTT control (keys the radio during TX)
 /// - CPAL audio I/O (optional, enabled with `cpal-backend` feature)
 pub async fn run_tnc(config: TncConfig) -> Result<()> {
@@ -262,6 +312,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
         kiss_port = config.kiss_port,
         preferred_hardware_rate = config.sample_rate,
         engine_rate = 48_000,
+        modem = config.baud.modem_name(),
         "TNC mode"
     );
 
@@ -334,8 +385,9 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
     let (demod_tx, mut demod_rx) = mpsc::channel::<Vec<u8>>(64);
     let demod_shutdown = shutdown.clone();
 
+    let baud = config.baud;
     let demod_worker = tokio::task::spawn_blocking(move || {
-        run_demod_worker(audio_in_cons, demod_tx, &demod_shutdown)
+        run_demod_worker(audio_in_cons, demod_tx, &demod_shutdown, baud)
     });
 
     // -------------------------------------------------------------------------
@@ -549,7 +601,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
             // Not polled while the backlog is full, so later frames wait in
             // the KISS server's bounded channel.
             Some(ax25_data) = tx_receiver.recv(), if tnc_tx.has_room() => {
-                tnc_tx.submit(kiss_to_air(&ax25_data));
+                tnc_tx.submit(kiss_to_air(&ax25_data, config.baud));
                 tnc_tx.poll(Instant::now(), &mut audio_out_prod, ptt.as_mut());
             }
 
@@ -576,14 +628,15 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
     Ok(())
 }
 
-/// The demodulation worker: AFSK-decode the input ring until shutdown, the
+/// The demodulation worker: decode the input ring until shutdown, the
 /// input side is gone, or the main loop stops taking frames.
 fn run_demod_worker(
     mut audio_in: coppa_audio::AudioRingConsumer,
     demod_tx: mpsc::Sender<Vec<u8>>,
     shutdown: &AtomicBool,
+    baud: TncBaud,
 ) {
-    let mut demod = coppa_codec::afsk::Demodulator::new();
+    let mut demod = TncDemodulator::new(baud);
     let mut buf = vec![0.0f32; 1024];
     loop {
         if shutdown.load(Ordering::Acquire) || audio_in.is_abandoned() {
@@ -656,6 +709,49 @@ mod tests {
     use coppa_radio::PttState;
     use std::sync::Mutex;
 
+    #[test]
+    fn default_baud_is_afsk_1200() {
+        assert_eq!(TncConfig::default().baud, TncBaud::Afsk1200);
+    }
+
+    #[test]
+    fn kiss_to_air_9600_is_baseband() {
+        let samples = kiss_to_air(b"COP-116", TncBaud::G3ruh9600);
+        assert_eq!(samples.len() % 5, 0);
+        assert!(samples.iter().all(|s| (s.abs() - 0.5).abs() < 1e-6));
+        assert!(kiss_to_air(b"COP-116", TncBaud::Afsk1200)
+            .iter()
+            .any(|s| (s.abs() - 0.5).abs() > 0.01));
+    }
+
+    #[test]
+    fn tnc_round_trips_9600() {
+        let payload = b"COP-116 daemon round trip";
+        let mut demod = TncDemodulator::new(TncBaud::G3ruh9600);
+        demod.process(&kiss_to_air(payload, TncBaud::G3ruh9600));
+        let frames: Vec<_> = demod.take_frames().into_iter().map(air_to_kiss).collect();
+        assert_eq!(frames, vec![payload.to_vec()]);
+    }
+
+    #[test]
+    fn demod_worker_selects_by_baud() {
+        for baud in [TncBaud::Afsk1200, TncBaud::G3ruh9600] {
+            let audio = kiss_to_air(b"modem selection", baud);
+            for selected in [TncBaud::Afsk1200, TncBaud::G3ruh9600] {
+                let mut demod = TncDemodulator::new(selected);
+                for chunk in audio.chunks(1024) {
+                    demod.process(chunk);
+                }
+                let frames = demod.take_frames();
+                if selected == baud {
+                    assert_eq!(frames.len(), 1);
+                } else {
+                    assert!(frames.is_empty());
+                }
+            }
+        }
+    }
+
     #[cfg(not(feature = "cpal-backend"))]
     #[tokio::test]
     async fn explicit_audio_id_requires_a_cpal_build_before_tnc_starts() {
@@ -701,7 +797,7 @@ mod tests {
         let (demod_tx, _demod_rx) = mpsc::channel::<Vec<u8>>(1);
         let demod_shutdown = shutdown.clone();
         let demod = tokio::task::spawn_blocking(move || {
-            run_demod_worker(consumer, demod_tx, &demod_shutdown)
+            run_demod_worker(consumer, demod_tx, &demod_shutdown, TncBaud::Afsk1200)
         });
         let input_shutdown = shutdown.clone();
         let input = tokio::task::spawn_blocking(move || {
@@ -968,7 +1064,7 @@ mod tests {
         let frame = max_info_ax25_frame();
         let payload = &frame[..frame.len() - 2];
         let mut demod = coppa_codec::afsk::Demodulator::new();
-        demod.process(&kiss_to_air(payload));
+        demod.process(&kiss_to_air(payload, TncBaud::Afsk1200));
         let decoded: Vec<Vec<u8>> = demod.take_frames().into_iter().map(air_to_kiss).collect();
         assert_eq!(decoded, vec![payload.to_vec()]);
     }

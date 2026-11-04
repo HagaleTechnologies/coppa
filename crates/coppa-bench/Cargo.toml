@@ -192,3 +192,11 @@ path = "diagnostics/watterson_header_precise.rs"
 [[example]]
 name = "watterson_sanity_sweep"
 path = "diagnostics/watterson_sanity_sweep.rs"
+
+[[example]]
+name = "g3ruh_fixture_gen"
+path = "diagnostics/g3ruh_fixture_gen.rs"
+
+[[example]]
+name = "g3ruh_vs_direwolf"
+path = "diagnostics/g3ruh_vs_direwolf.rs"
