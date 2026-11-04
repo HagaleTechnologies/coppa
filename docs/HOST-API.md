@@ -367,27 +367,18 @@ VARA path does not use it. [TNC.md](TNC.md) covers building and running it.
 - Up to 256 bytes of information field.
 - Every client gets each decoded frame, unless it falls more than 64 frames behind: then it
   silently skips the oldest. Up to 16 clients.
-<<<<<<< HEAD
-- A client that sends more than 64 KiB with no `FEND` is disconnected.
+- A frame whose pending bytes exceed 64 KiB is disconnected.
 - No authentication. Keep it on loopback.
 
-TCP read boundaries do not delimit KISS frames. A frame is forwarded only after its closing
-`FEND` arrives, including when an escape sequence spans reads (COP-148). Unfinished input at
-EOF is discarded. The pending-byte cap is 64 KiB, excluding the retained opening delimiter;
-exceeding it closes the connection.
+TCP read boundaries do not delimit KISS frames. The streaming server decoder holds a partial
+frame, including an escape sequence split across reads, and forwards it only after its closing
+`FEND` arrives (COP-138, COP-148). Unfinished input at EOF is discarded. The standalone
+`kiss_decode` function likewise returns only frames closed by `FEND` (COP-148).
 
 **Known defect** (see [LIMITATIONS.md](LIMITATIONS.md)):
 
 - **Frames on a KISS port other than 0 are dropped**, even when they are data frames. A host
   that numbers its ports from 1 sends nothing.
-=======
-- A frame longer than 64 KiB is disconnected.
-- No authentication. Keep it on loopback.
-
-The streaming server decoder preserves frames split across TCP reads, including escapes
-split between reads (COP-138). Frames on a KISS port other than 0 are still dropped,
-even when they are data frames. See [LIMITATIONS.md](LIMITATIONS.md).
->>>>>>> 6969023d931c39c4a2b1743e5ebfe81d9486e79b
 
 ## ARDOP and the C FFI
 

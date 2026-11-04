@@ -166,19 +166,6 @@ fn decode_closed_frames(data: &[u8]) -> (Vec<KissFrame>, usize) {
     (frames, consumed)
 }
 
-/// Buffer one read, retaining raw unfinished bytes, including split escapes.
-fn buffer_kiss_read(accum: &mut Vec<u8>, chunk: &[u8]) -> Result<Vec<KissFrame>, ()> {
-    accum.extend_from_slice(chunk);
-    let (frames, consumed) = decode_closed_frames(accum);
-    accum.drain(..consumed);
-    // The retained opening delimiter is a sentinel, not a pending frame byte.
-    let pending = accum.len() - usize::from(accum.first() == Some(&FEND));
-    if pending > MAX_KISS_FRAME_LEN {
-        return Err(());
-    }
-    Ok(frames)
-}
-
 fn frame_from_payload(payload: &[u8]) -> Option<KissFrame> {
     let (&cmd, body) = payload.split_first()?;
     Some(match cmd {
@@ -375,21 +362,7 @@ async fn handle_kiss_client(
                 match result {
                     Ok(0) => break, // EOF
                     Ok(n) => {
-<<<<<<< HEAD
-                        let frames = match buffer_kiss_read(&mut accum, &buf[..n]) {
-                            Ok(frames) => frames,
-                            Err(()) => {
-                                tracing::warn!(
-                                    %peer,
-                                    len = accum.len(),
-                                    "KISS client exceeded max frame size, closing"
-                                );
-                                break;
-                            }
-                        };
-=======
                         let frames = decoder.push(&buf[..n]);
->>>>>>> 6969023d931c39c4a2b1743e5ebfe81d9486e79b
                         for frame in frames {
                             if let KissFrame::Data(payload) = frame {
                                 if tx_sender.send(payload).await.is_err() {
@@ -397,8 +370,6 @@ async fn handle_kiss_client(
                                 }
                             }
                         }
-<<<<<<< HEAD
-=======
                         if decoder.pending_len() > MAX_KISS_FRAME_LEN {
                             tracing::warn!(
                                 %peer,
@@ -407,7 +378,6 @@ async fn handle_kiss_client(
                             );
                             break;
                         }
->>>>>>> 6969023d931c39c4a2b1743e5ebfe81d9486e79b
                     }
                     Err(_) => break,
                 }
@@ -426,7 +396,6 @@ async fn handle_kiss_client(
 mod tests {
     use super::*;
 
-<<<<<<< HEAD
     #[test]
     fn test_kiss_decode_requires_closing_delimiter() {
         let wire = kiss_encode_data(&[0x41; 200]);
@@ -442,33 +411,34 @@ mod tests {
     }
 
     #[test]
-    fn test_kiss_buffer_every_split_and_byte_at_a_time() {
+    fn test_kiss_decoder_every_split_and_byte_at_a_time() {
         for payload in [vec![0x41; 200], vec![0x41, FEND, FESC, 0x42]] {
             let wire = kiss_encode_data(&payload);
             // Includes 120 and 121 wire-byte prefixes and both split escapes.
             for split in 0..wire.len() {
-                let mut pending = Vec::new();
-                assert!(buffer_kiss_read(&mut pending, &wire[..split])
-                    .unwrap()
-                    .is_empty());
+                let mut decoder = KissDecoder::new();
+                assert!(decoder.push(&wire[..split]).is_empty(), "split {split}");
                 assert_eq!(
-                    buffer_kiss_read(&mut pending, &wire[split..]).unwrap(),
+                    decoder.push(&wire[split..]),
                     vec![KissFrame::Data(payload.clone())],
                     "split {split}"
                 );
-                assert!(buffer_kiss_read(&mut pending, &[]).unwrap().is_empty());
-                assert_eq!(pending, [FEND]);
+                // The closing delimiter never replays the completed frame.
+                assert_eq!(decoder.pending_len(), 0, "split {split}");
+                assert!(decoder.push(&[]).is_empty());
             }
-            let mut pending = Vec::new();
+            let mut decoder = KissDecoder::new();
             for (i, byte) in wire.iter().enumerate() {
-                let frames = buffer_kiss_read(&mut pending, &[*byte]).unwrap();
+                let frames = decoder.push(&[*byte]);
                 if i + 1 == wire.len() {
                     assert_eq!(frames, vec![KissFrame::Data(payload.clone())]);
                 } else {
                     assert!(frames.is_empty());
                 }
             }
-=======
+        }
+    }
+
     fn special_payload() -> Vec<u8> {
         (0..500)
             .map(|i| [FEND, FESC, TFEND, TFESC, 0][i % 5])
@@ -486,32 +456,30 @@ mod tests {
                 decoder.push(&wire[split..]),
                 vec![KissFrame::Data(payload.clone())]
             );
->>>>>>> 6969023d931c39c4a2b1743e5ebfe81d9486e79b
         }
     }
 
     #[test]
-<<<<<<< HEAD
-    fn test_kiss_buffer_shared_delimiters_and_partial_tail() {
-        let mut pending = Vec::new();
+    fn test_kiss_decoder_shared_delimiters_and_partial_tail() {
+        let mut decoder = KissDecoder::new();
         let first = [
             0x99, FEND, FEND, CMD_DATA, 1, FEND, CMD_DATA, 2, FEND, FEND, CMD_DATA, FESC,
         ];
         assert_eq!(
-            buffer_kiss_read(&mut pending, &first).unwrap(),
+            decoder.push(&first),
             vec![KissFrame::Data(vec![1]), KissFrame::Data(vec![2])]
         );
-        assert_eq!(pending, [FEND, CMD_DATA, FESC]);
+        assert_eq!(decoder.pending_len(), 2);
         assert_eq!(
-            buffer_kiss_read(&mut pending, &[TFEND, FEND]).unwrap(),
+            decoder.push(&[TFEND, FEND]),
             vec![KissFrame::Data(vec![FEND])]
         );
         // The closing delimiter from the previous read opens this empty data frame.
         assert_eq!(
-            buffer_kiss_read(&mut pending, &[CMD_DATA, FEND, FEND]).unwrap(),
+            decoder.push(&[CMD_DATA, FEND, FEND]),
             vec![KissFrame::Data(vec![])]
         );
-        assert!(buffer_kiss_read(&mut pending, &[FEND]).unwrap().is_empty());
+        assert!(decoder.push(&[FEND]).is_empty());
     }
 
     #[test]
@@ -542,7 +510,10 @@ mod tests {
         assert_eq!(
             kiss_decode(&[FEND, CMD_DATA, FESC, 0x12, FESC, FEND]),
             vec![KissFrame::Data(vec![FESC, 0x12])]
-=======
+        );
+    }
+
+    #[test]
     fn kiss_decoder_returns_two_frames_from_one_push() {
         let wire = [kiss_encode_data(b"one"), kiss_encode_data(b"two")].concat();
         assert_eq!(
@@ -559,28 +530,27 @@ mod tests {
         assert_eq!(
             KissDecoder::new().push(&[1, 2, FEND, CMD_DATA, 3, FEND]),
             vec![KissFrame::Data(vec![3])]
->>>>>>> 6969023d931c39c4a2b1743e5ebfe81d9486e79b
         );
     }
 
     #[test]
-<<<<<<< HEAD
-    fn test_kiss_buffer_pending_limit() {
-        for prefix in [&[][..], &[FEND][..]] {
-            let mut pending = prefix.to_vec();
-            // Command plus data for the framed case, garbage otherwise.
-            assert!(buffer_kiss_read(&mut pending, &vec![0; MAX_KISS_FRAME_LEN])
-                .unwrap()
-                .is_empty());
-            assert_eq!(pending.len(), MAX_KISS_FRAME_LEN + prefix.len());
-            assert!(buffer_kiss_read(&mut pending, &[0]).is_err());
-        }
-        let mut pending = vec![FEND];
-        assert!(buffer_kiss_read(&mut pending, &vec![0; MAX_KISS_FRAME_LEN])
-            .unwrap()
-            .is_empty());
+    fn test_kiss_decoder_pending_cap_boundary() {
+        let mut decoder = KissDecoder::new();
+        decoder.push(&[FEND]);
+        // Pending bytes at the cap remain allowed.
+        assert!(decoder.push(&vec![0; MAX_KISS_FRAME_LEN]).is_empty());
+        assert_eq!(decoder.pending_len(), MAX_KISS_FRAME_LEN);
+        // One more pending byte exceeds the cap and stops decoding.
+        assert!(decoder.push(&[0]).is_empty());
+        assert!(decoder.pending_len() > MAX_KISS_FRAME_LEN);
+        assert!(decoder.push(&[FEND]).is_empty());
+
+        // A frame exactly at the cap still completes when it closes.
+        let mut decoder = KissDecoder::new();
+        decoder.push(&[FEND]);
+        assert!(decoder.push(&vec![0; MAX_KISS_FRAME_LEN]).is_empty());
         assert_eq!(
-            buffer_kiss_read(&mut pending, &[FEND]).unwrap(),
+            decoder.push(&[FEND]),
             vec![KissFrame::Data(vec![0; MAX_KISS_FRAME_LEN - 1])]
         );
     }
@@ -644,28 +614,28 @@ mod tests {
     async fn test_kiss_handler_pending_limit() {
         use std::time::Duration;
         use tokio::time::timeout;
-        for prefix in [&[][..], &[FEND][..]] {
-            let (mut client, mut tx, mut task) = test_client().await;
-            client.write_all(prefix).await.unwrap();
-            client
-                .write_all(&vec![0; MAX_KISS_FRAME_LEN])
-                .await
-                .unwrap();
-            // At the cap, neither TX nor connection closure is allowed.
-            assert!(timeout(Duration::from_millis(50), tx.recv()).await.is_err());
-            assert!(timeout(Duration::from_millis(50), &mut task).await.is_err());
-            client.write_all(&[0]).await.unwrap();
-            timeout(Duration::from_secs(2), task)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                tx.recv().await,
-                None,
-                "overflow must not forward a partial frame"
-            );
-        }
-=======
+        let (mut client, mut tx, mut task) = test_client().await;
+        client.write_all(&[FEND]).await.unwrap();
+        client
+            .write_all(&vec![0; MAX_KISS_FRAME_LEN])
+            .await
+            .unwrap();
+        // At the cap, neither TX nor connection closure is allowed.
+        assert!(timeout(Duration::from_millis(50), tx.recv()).await.is_err());
+        assert!(timeout(Duration::from_millis(50), &mut task).await.is_err());
+        client.write_all(&[0]).await.unwrap();
+        timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tx.recv().await,
+            None,
+            "overflow must not forward a partial frame"
+        );
+    }
+
+    #[test]
     fn kiss_decoder_keeps_an_escape_split_across_pushes() {
         let mut decoder = KissDecoder::new();
         assert!(decoder.push(&[FEND, CMD_DATA, FESC]).is_empty());
@@ -775,7 +745,6 @@ mod tests {
         client.read_exact(&mut wire).await.unwrap();
         assert_eq!(kiss_decode(&wire), vec![KissFrame::Data(b"in".to_vec())]);
         task.abort();
->>>>>>> 6969023d931c39c4a2b1743e5ebfe81d9486e79b
     }
 
     // --- Encoding tests ---
