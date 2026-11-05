@@ -405,7 +405,7 @@ impl CoppaCore {
     /// whose frame bytes are byte-identical to the original (rebuilt from
     /// the segment data) but whose PHY level drops to the most robust level
     /// whose payload budget still fits the frame. It shares
-    /// [`Self::encode_bytes_at`] with [`Self::encode_bytes`] so the two can
+    /// `Self::encode_bytes_at` with [`Self::encode_bytes`] so the two can
     /// never diverge -- unlike [`Self::encode_bytes_at_level`] (Beacon frame
     /// type, no compression, the station-ID/beacon path), which is left
     /// alone for its existing callers.
@@ -768,7 +768,7 @@ impl CoppaCore {
 
     /// Validate `level` for a frame sent on the VHF profile (`on_vhf_profile`)
     /// or on an HF profile, which carries levels 1-8 only.
-    fn check_level(&self, level: u8, on_vhf_profile: bool) -> Result<(), EngineError> {
+    pub(crate) fn check_level(&self, level: u8, on_vhf_profile: bool) -> Result<(), EngineError> {
         coppa_protocol::modem::speed_level_components(level)
             .map_err(|_| EngineError::InvalidSpeedLevel { level })?;
         if !on_vhf_profile && level > HF_MAX_SPEED_LEVEL {

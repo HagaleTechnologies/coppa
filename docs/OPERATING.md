@@ -42,7 +42,7 @@ INFO coppad: PTT method="rigctld 127.0.0.1:4532" active=rigctld state="released"
 | `Audio input/output started` | `hardware_rate`, `engine_rate` | The opened stream rate and modem profile rate; they differ when Coppa resamples. |
 | `Audio devices` | `input_hardware_rate`, `output_hardware_rate`, `engine_rate` | The effective input and output hardware rates and the modem profile rate. |
 | `Audio devices: none; ...` (WARN) | | A build without `cpal-backend`: the daemon runs but moves no audio. |
-| `PTT` | `method` | The configured method: `none`, `vox`, `rigctld <address>`, `serial <port> <dtr\|rts>` or `gpio <pin>`. |
+| `PTT` | `method` | The configured method: `none`, `vox`, `rigctld <address>`, `serial <port> <dtr\|rts>`, `gpio <chip>:<line>`, or `gpio <number> (sysfs)` for the deprecated sysfs form. |
 | | `active` | The backend actually in control: `none`, `vox`, `rigctld`, `serial` or `gpio`. An unreachable rigctld shows `active=none`. |
 | | `state` | `released` (the startup release succeeded), `release failed: <error>`, or `not controlled` (none, VOX, or an unreachable rigctld, where coppad drives no PTT line). |
 | | `guardian` | `running, pid <n>`, `failed to start: <error>`, `off ([radio] ptt_guardian = false)`, or `not used`. See [The PTT guardian](#the-ptt-guardian). |
@@ -150,7 +150,9 @@ transmission. What does the release depends on how it stops:
 
 | How coppad stops | What releases PTT |
 |---|---|
-| `systemctl stop`, SIGTERM or Ctrl-C (SIGINT) | coppad, before it exits. The log shows `Releasing PTT before shutdown`, and VARA hosts see `PTT OFF`. |
+| `systemctl stop`, SIGTERM or Ctrl-C (SIGINT) | coppad, before it exits. The log shows `Releasing PTT before shutdown`, and VARA hosts see `PTT OFF`. A frame waiting for a busy channel (`[station_id] busy_hold_ms`) is dropped: `Shutdown during the busy-channel wait: dropping the waiting frame`. |
+| A second Ctrl-C, SIGINT or SIGTERM while stopping | coppad, at once: it logs `Received SIGINT again; forcing exit` and `Releasing PTT for a forced exit`, drives PTT to RX on its own backend, tells the guardian, and exits with status 130 (COP-85). It skips the mDNS goodbye, so peers drop `coppad.local` when its records expire. If this cannot finish within 2 s, coppad logs `Shutdown did not finish within 2 s of the second stop signal; exiting now` and exits 130 without it; the guardian then releases rigctld or GPIO PTT. |
+| SIGHUP (`systemctl reload coppad`) | Not a stop. coppad re-reads its configuration and keeps running; see [Reloading the configuration](#reloading-the-configuration). |
 | An error or a panic | The PTT backend, as coppad unwinds. |
 | coppad keeps running, but the task that ends a transmission has died | A check that runs every 500 ms. Once PTT has been keyed for `max_tx_duration_s` plus 2 s, it forces PTT off and logs `PTT backstop: keyed past max_tx_duration_s plus grace with no release; forcing PTT off`. |
 | `kill -9`, an out-of-memory kill or a crash, with rigctld or GPIO PTT | The PTT guardian (below). |
@@ -162,7 +164,8 @@ Ctrl-C.
 
 ### The PTT guardian
 
-With `ptt_method = "rigctld"` or `"gpio:<pin>"`, coppad starts a helper
+With `ptt_method = "rigctld"` or `"gpio:<chip>:<line>"` (or the deprecated
+`"gpio:<number>"`), coppad starts a helper
 process, `coppad --ptt-guardian ...`, and logs:
 
 ```
@@ -171,7 +174,7 @@ INFO coppad: PTT guardian started pid=6441
 
 coppad tells the guardian each time it keys and releases PTT. If coppad exits
 while PTT is keyed, however it died, the guardian opens its own rigctld
-connection or GPIO pin, releases PTT and exits:
+connection or GPIO line, releases PTT and exits:
 
 ```
 WARN coppad::ptt_guardian: coppad exited while PTT was keyed; releasing it ptt_method=rigctld
@@ -214,7 +217,9 @@ Nothing in coppad can release PTT in these cases:
   when the port closes. This has not been checked on real hardware.
 - `ptt_guardian = false`, after `kill -9`, an out-of-memory kill or a crash.
 - A coppad that is still running but completely stuck (for example,
-  deadlocked) while PTT is keyed.
+  deadlocked) while PTT is keyed. A second stop signal still ends the
+  process after 2 s, but without its own release; the guardian, if
+  running, then releases rigctld or GPIO PTT.
 - A second Ctrl-C in `coppa tx` or `coppa tune`, which exits at once without
   cleanup. The first Ctrl-C (or SIGTERM) releases PTT and stops the audio
   before exiting with status 130 (COP-86). Errors and panics in them also
@@ -243,6 +248,117 @@ It cannot see your OS mixer or your radio's ALC, which is where over-drive
 actually happens. Steps 1-6 above remain the only drive-level check. If the
 daemon ever logs `TX audio is clipping before it leaves Coppa`, that is a Coppa
 bug, not a level setting; please report it.
+
+## Reloading the configuration
+
+On Linux and macOS, SIGHUP makes coppad re-read the configuration file it
+started from (COP-85). With the shipped systemd unit:
+
+```bash
+sudoedit /etc/coppa/coppad.toml
+sudo -u coppa coppad --config /etc/coppa/coppad.toml --check
+sudo systemctl reload coppad
+journalctl -u coppad -n 5   # a restart_required= line means: sudo systemctl restart coppad
+```
+
+Under launchd, `launchctl kill SIGHUP gui/$(id -u)/io.github.hagaletechnologies.coppad`
+sends the same signal (not tested here). Windows has no SIGHUP: restart
+coppad to apply a change there.
+
+A reload checks the file with the same checks as startup, plus the
+`[radio] ptt_method` and frequency parses. It does not open hardware or bind
+ports. It then applies these keys and keeps the running value of every other
+key until a restart:
+
+| Key | When it takes effect |
+|---|---|
+| `[radio] ptt_pre_delay_ms`, `ptt_tail_delay_ms` | the next transmission. A connected session keeps the ARQ timeout it computed from them when it started. |
+| `[radio] max_tx_duration_s` | the next transmission, and the 500 ms PTT backstop at once |
+| `[radio] turnaround_ms` | the next key-up. A connected session keeps the ARQ timeout it computed when it started. The startup warning about turnaround and tail delay is re-checked. |
+| `[radio] host_rig_control` | the next `FREQ`/`MODE` set from a host |
+| `[station_id] busy_hold_ms`, `id_interval_secs`, `beacon_interval_secs`, `cwid_wpm` | their next use |
+| `[station_id] cwid` | at once. CW ID is reset to what startup would choose for the new policy. |
+| `[engine] callsign` | at once, only when the file's value changed since the last load. It then replaces a callsign a host set with `MYCALL`. A connected session keeps the callsign it started with. |
+| `[engine] grid` | the next ID or beacon frame |
+| `[session] max_codewords_per_frame` | the next frame |
+| `[host] sessionless_tx_enabled` | the next host send |
+
+Restart-only: all of `[audio]`; `[host]` ports, `bind_address`, every
+`*_enabled` switch, `websocket_token`, `websocket_allowed_origins`,
+`mdns_enabled`; `[radio] ptt_method`, `rigctld_address`, `ptt_guardian`,
+`frequency_hz`, `band`; `[engine] profile`, `arq_enabled`,
+`rate_loop_probe_interval`, `rate_loop_probe_offset`, `cp_gate_enabled`,
+`cp_negotiation_enabled`. A key added to the config later is restart-only
+until it is added to the reload list (`RELOADABLE_KEYS` in
+`crates/coppa-daemon/src/config.rs`).
+
+What the log shows:
+
+| Log line | Meaning |
+|---|---|
+| `Received SIGHUP, reloading configuration`, then `Using configuration file path=...` | A reload started and read this file. |
+| `Configuration reloaded applied=[radio] ptt_tail_delay_ms, ...` | These keys changed and now apply. |
+| `Configuration reload kept the running values of settings that change only on restart restart_required=[host] vara_command_port, ...` (WARN) | These keys changed but need a restart. The line names keys only, never values, so a changed `websocket_token` is never logged. |
+| `Configuration reloaded; no settings changed` | The file matches the running settings. |
+| `Configuration reloaded; nothing changed that applies before a restart` | Only restart-only keys changed (named in the WARN line before it). |
+| `Configuration reload failed; coppad keeps running on its current settings error=...` (ERROR) | The file does not parse or fails a startup check, or (without `--config`) the search no longer finds a file. Nothing changed. |
+| `Received SIGHUP during shutdown; not reloading` | A SIGHUP after a stop request is ignored. |
+
+Closing the terminal that started a foreground coppad now sends it SIGHUP,
+which reloads instead of killing it. Stop it with Ctrl-C, `kill` or
+`systemctl stop`.
+
+## Running more than one coppad
+
+`coppad --instance NAME` (COP-85) names one daemon of several on a host:
+
+- Without `--config`, it looks for `coppad-NAME.toml` in the places it would
+  look for `coppad.toml` (`./`, the user config directory, `/etc/coppa/`; on
+  Windows `%APPDATA%\coppa\`). With `--config PATH`, the path wins and the
+  name only labels logs and mDNS.
+- Every log line, its PTT guardian's included, starts with `[NAME] `.
+- With `[host] mdns_enabled = true`, it advertises `coppad-NAME.local.` and
+  the service `coppad-NAME._coppa._tcp.local.`.
+- A name is 1 to 32 letters, digits and hyphens, not starting or ending with
+  a hyphen. Anything else is a usage error (exit status 2).
+
+Without `--instance`, file names, log lines and mDNS names are unchanged.
+
+The template unit `contrib/coppad@.service` runs one instance per name:
+`sudo systemctl enable --now coppad@vhf` starts `coppad --instance vhf --config
+/etc/coppa/coppad-vhf.toml`. `contrib/README.md` has the install steps.
+
+Plan the ports: every enabled listener (`vara_command_port`, `vara_data_port`,
+`ardop_command_port`, `ardop_data_port`, `websocket_port`) needs its own port per instance,
+for example 8300/8301 for one and 8310/8311 for the next. A serial port or a
+GPIO line can be held by one instance only. Two instances on one audio device,
+and two mDNS instances on one LAN, have not been tested.
+
+## Running coppad on Windows
+
+Build it with the release feature set:
+
+```powershell
+cargo build --release -p coppa-daemon --features cpal-backend,websocket,kiss-tnc,ardop,mdns,serial-ptt
+```
+
+- Stop it with Ctrl-C. A second Ctrl-C while it stops forces the exit after
+  releasing PTT (status 130). Ctrl-Break stops it the same way
+  (`Received Ctrl-Break, shutting down`).
+- Closing the console window or shutting Windows down logs
+  `Console window closing, shutting down` or
+  `Windows is shutting down; shutting down` and starts the same stop, but
+  Windows ends the process soon after, so the PTT release may not finish.
+  The guardian shares the console and ends with it. Stop coppad with Ctrl-C
+  before closing its window, and set the rig's TX time-out timer.
+- There is no reload: restart coppad to apply a change.
+- Serial PTT is written as `ptt_method = "serial:COM3:dtr"`.
+- The PTT guardian runs in its own process group, so a console Ctrl-C to
+  coppad does not reach it.
+
+No real Windows radio setup (audio device, COM port, rig) has been tested. CI
+builds the release binary and runs a headless smoke test of it
+(`crates/coppa-daemon/tests/runtime_smoke.rs`) on `windows-latest` (COP-85).
 
 ## RX level
 

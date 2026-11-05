@@ -33,9 +33,9 @@ cargo bench --workspace
 | `coppa-audio` | Audio backends: CPAL (feature-gated), WAV file I/O |
 | `coppa-radio` | Radio control via rigctld CAT; serial and GPIO PTT (feature-gated) |
 | `coppa-ml` | Adaptive link control: capacity-based MCS selection, closed-loop rate control, spread-gated short-CP, spectrum sensing |
-| `coppa-engine` | Core engine: thin wrapper around CoppaTransceiver |
+| `coppa-engine` | Core engine: CoppaCore around CoppaTransceiver, plus the library Link |
 | `coppa-host` | VARA-style TCP control server, WebSocket JSON API, KISS TNC server (feature-gated) |
-| `coppa-ffi` | C FFI (cdylib + staticlib) with streaming decode |
+| `coppa-ffi` | C FFI (cdylib + staticlib): streaming decode, links, error strings, ABI version |
 | `coppa-cli` | CLI binary (`coppa`) |
 | `coppa-daemon` | Daemon binary (`coppad`) |
 | `coppa-bench` | Measurement harness (not a product crate); its lib tests guard each level's FER waterfall |

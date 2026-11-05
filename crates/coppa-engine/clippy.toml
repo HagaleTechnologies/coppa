@@ -1,0 +1,8 @@
+# COP-139: coppa-engine takes time from its caller (`now: Instant`), as
+# coppa-protocol does (COP-90). `coppa_engine::link::Link` runs under a
+# caller clock, and wasm32-unknown-unknown has no clock, so a clock read
+# here traps at runtime there.
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "take now: Instant from the caller (COP-139, as COP-90 in coppa-protocol)" },
+    { path = "std::time::Instant::elapsed", reason = "compute from a caller-supplied now (COP-139, as COP-90 in coppa-protocol)" },
+]

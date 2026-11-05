@@ -64,10 +64,12 @@ pub const HF_STANDARD: Profile = Profile {
 };
 
 impl Profile {
-    /// Largest payload, in bytes, one frame at this profile's speed level
-    /// carries: the limit `CoppaTransceiver::transmit` enforces
-    /// (`coppa_protocol::modem::max_payload_for_level`). `None` only for an
-    /// invalid speed level.
+    /// Payload bytes per codeword at this profile's speed level, after
+    /// compression and before FEC. Includes any transport framing but excludes
+    /// the per-codeword CRC. Multi-codeword frames carry multiples of this budget;
+    /// it is not a limit on a daemon host write.
+    /// Derived from `coppa_protocol::modem::max_payload_for_level`.
+    /// `None` only for an invalid speed level.
     pub fn max_payload(&self) -> Option<usize> {
         coppa_protocol::modem::max_payload_for_level(self.speed_level)
     }
@@ -155,6 +157,22 @@ mod tests {
                 "{}",
                 p.name
             );
+        }
+    }
+
+    #[test]
+    fn profile_budget_is_per_codeword_without_compression() {
+        let core = crate::CoppaCore::from_profile(&HF_ROBUST);
+        assert!(!core.config().compression_enabled);
+        let n = HF_ROBUST.max_payload().unwrap();
+        for codewords in [1, 8] {
+            let budget = n * usize::from(codewords);
+            assert!(core
+                .encode_uncompressed_with_codewords(&vec![0x55; budget], codewords)
+                .is_ok());
+            assert!(core
+                .encode_uncompressed_with_codewords(&vec![0x55; budget + 1], codewords)
+                .is_err());
         }
     }
 

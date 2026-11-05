@@ -119,10 +119,11 @@ fn profiles_help_list_detail_and_error() {
     assert_eq!(records.len(), 4);
     for (record, name) in records.iter().zip(names) {
         assert_eq!(record["name"], name);
-        assert_eq!(record.as_object().unwrap().len(), 7);
+        assert_eq!(record.as_object().unwrap().len(), 8);
         assert!(record["description"].is_string());
         assert!(record["speed_level"].is_u64());
         assert!(record["max_payload_bytes"].is_u64());
+        assert_eq!(record["max_payload_scope"], "encoded_bytes_per_codeword");
         assert!(record["compression"].is_boolean());
         assert_eq!(record["sample_rate_hz"], 48_000);
         assert!(record["ofdm_profile"].is_string());
@@ -134,7 +135,7 @@ fn profiles_help_list_detail_and_error() {
     let detail = run(&["profiles", "-p", "hf_robust", "--json"], None);
     assert_eq!(json(&detail), records[0]);
     let detail_text = run(&["profiles", "-p", "HF_ROBUST"], None);
-    assert!(String::from_utf8_lossy(&detail_text.stdout).contains("Max bytes per frame: 56"));
+    assert!(String::from_utf8_lossy(&detail_text.stdout).contains("Payload bytes per codeword: 56"));
 
     let unknown = run(&["profiles", "-p", "BOGUS", "--json"], None);
     assert_eq!(unknown.status.code(), Some(1));
@@ -285,4 +286,39 @@ fn missing_wav_has_no_json_stdout() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Error:"));
+}
+
+#[test]
+fn profiles_json_scope_and_config_alias() {
+    for flags in [
+        vec!["--json"],
+        vec!["-p", "HF_ROBUST", "--json"],
+        vec!["--level", "1", "--json"],
+        vec!["--level", "9", "--json"],
+    ] {
+        let profiles = run(&[vec!["profiles"], flags.clone()].concat(), None);
+        let config = run(&[vec!["config"], flags.clone()].concat(), None);
+        let value = json(&profiles);
+        assert_eq!(json(&config), value);
+        assert!(profiles.stderr.is_empty());
+        assert_eq!(String::from_utf8_lossy(&config.stderr), "WARNING: 'coppa config' is deprecated and will be removed in the next release. Use 'coppa profiles' instead; it takes the same flags.\n");
+        if flags.contains(&"--level") {
+            assert_eq!(value["max_payload_scope"], "encoded_bytes_per_codeword");
+            assert_eq!(value.as_object().unwrap().len(), 9);
+            if flags.contains(&"1") {
+                assert_eq!(value["level"], 1);
+                assert_eq!(value["modulation"], "BPSK");
+                assert_eq!(value["code_rate"], "1/4");
+                assert_eq!(value["max_payload_bytes"], 56);
+                assert_eq!(value["hf_bandwidth_hz"], 2400);
+                assert_eq!(value["hf_airtime_ms"], 1365);
+                assert_eq!(value["vhf_bandwidth_hz"], 5600);
+                assert_eq!(value["vhf_airtime_ms"], 510);
+            } else {
+                assert!(value["hf_bandwidth_hz"].is_null());
+                assert!(value["hf_airtime_ms"].is_null());
+                assert!(value["max_payload_bytes"].is_u64());
+            }
+        }
+    }
 }
