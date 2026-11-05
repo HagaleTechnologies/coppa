@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-30T11:12:01Z",
-  "head_commit": "4d39fa7",
+  "generated_at": "2026-11-04T21:42:46Z",
+  "head_commit": "ca75de8",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -112,7 +112,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:66f02146c268eb0ab5968fa1c2d044910103399747d4731860aac4c6d811fc53",
+      "hash": "sha256:2f1b775d94cd61d8cc2106afad2a9c959e13214641341fcc907e3466c798f4b8",
       "id": "adr-006-phase2-estimation",
       "kind": "decision-digest",
       "links": [
@@ -244,6 +244,29 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:3f1a2496fc567ec226f9ebc89b64be1930e87aa819625542921a00c1a41e967d",
+      "id": "c-ffi-and-python-link",
+      "kind": "gotcha",
+      "links": [
+        "overview",
+        "coppa-engine"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/c-ffi-and-python-link.md",
+      "sources": [
+        "crates/coppa-ffi/src/lib.rs",
+        "crates/coppa-ffi/cbindgen.toml",
+        "crates/coppa-engine/src/link.rs",
+        "bindings/python/coppa/_ffi.py"
+      ],
+      "status": "current",
+      "title": "What will bite you when calling coppa from C or Python?",
+      "verified_commit": "2526b50",
+      "verified_date": "2026-11-03",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:904fee87bf54c08c38d8604aacea4ac0c0d721e1af546335b4b54e00dd780aba",
       "id": "cli-output",
       "kind": "gotcha",
@@ -328,7 +351,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:8d291446f9febc4868ce782cfd1d8784deaab78984d90224e516e42f17651eab",
+      "hash": "sha256:db8e1afcdcdccd8158b41349cc0aefc12c8746b1a6203804bef1826e30551c81",
       "id": "coppa-engine",
       "kind": "subsystem",
       "links": [
@@ -350,7 +373,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:7477efa7bd7802b3e7d22d5e5d3bbed5232209e75b27f423a65310ac134db09c",
+      "hash": "sha256:681566d6e8792b71211acf058d96632a8ca1f31de73737297cf98769574454f6",
       "id": "coppa-protocol",
       "kind": "subsystem",
       "links": [
@@ -365,12 +388,13 @@
       "maintainer": "agent",
       "path": "pages/coppa-protocol.md",
       "sources": [
-        "crates/coppa-protocol/**"
+        "crates/coppa-protocol/**",
+        "docs/SPEC.md"
       ],
       "status": "current",
       "title": "How does coppa-protocol handle framing, FEC, and ARQ?",
-      "verified_commit": "be2141b",
-      "verified_date": "2026-08-05",
+      "verified_commit": "edb17bc",
+      "verified_date": "2026-11-04",
       "visibility": "public"
     },
     {
@@ -466,7 +490,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:9c525e41700a2dae28aac59a44ab07c2712620a03d8a3aab01d59a701fabdea9",
+      "hash": "sha256:8fc6a50b80a14c5af822cbd0abc7f759b460044997d49b01e0fe563ec0c3599c",
       "id": "mdns-discovery",
       "kind": "gotcha",
       "links": [
@@ -482,12 +506,12 @@
       ],
       "status": "current",
       "title": "What will bite you when testing coppad's mDNS discovery?",
-      "verified_commit": "b9fdb8d",
-      "verified_date": "2026-11-02",
+      "verified_commit": "2526b50",
+      "verified_date": "2026-11-03",
       "visibility": "public"
     },
     {
-      "hash": "sha256:e8adc703ca6f9a6b097149842f8431013b0e6b894e881ff8cbf8c875e0a5501c",
+      "hash": "sha256:e6fe3f68dd9e109341a1b0f5002a37dc4559d321bacaae625807923fca3c5d0d",
       "id": "overview",
       "kind": "overview",
       "links": [],
@@ -527,7 +551,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:ece8378df1627dd56e8d8c10c4a995d5474ccc0993b6d4a7c2760fb7fefe9ec0",
+      "hash": "sha256:1011e23c8debd0ee717dbcceff559f2988c21df216d04c28df6282b67fa548da",
       "id": "phase4-field-readiness",
       "kind": "gotcha",
       "links": [
@@ -548,8 +572,8 @@
       ],
       "status": "current",
       "title": "What will bite you in the daemon's real-radio TX/RX path?",
-      "verified_commit": "59b0b63",
-      "verified_date": "2026-07-14",
+      "verified_commit": "dc18b8b",
+      "verified_date": "2026-11-03",
       "visibility": "public"
     },
     {
@@ -575,7 +599,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:ef55c7a0ce1f6a7f46bf351ab29ac09a824708f502b0917f8a77296b49a27164",
+      "hash": "sha256:9dbaaaff3bc7512ae0bf49a1c7f17d440c0613cbe0a8d6e4b9eed90b847da0c0",
       "id": "watterson-level-4-gap",
       "kind": "gotcha",
       "links": [
@@ -590,13 +614,13 @@
         "docs/adr/004-strongest-path-timing.md",
         "docs/adr/006-phase2-parametric-estimation-nr-bg2.md",
         "crates/coppa-codec/src/ofdm/sync_detector.rs",
-        ".superpowers/sdd/p1-fading-regression-fix-report.md",
+        "docs/analysis/COP-134-fading-regressions.md",
         "BENCHMARKS.md"
       ],
       "status": "current",
       "title": "What will bite you about Watterson fading at speed level 4?",
-      "verified_commit": "59b0b63",
-      "verified_date": "2026-07-14",
+      "verified_commit": "d837c89d388eaf9c70752c72db8537d910094cc8",
+      "verified_date": "2026-11-04",
       "visibility": "public"
     },
     {

@@ -1,6 +1,6 @@
 //! OFDM superframe structure.
 //!
-//! [STS][STS][LTS+CP][LTS+CP][SIGNAL+CP][DATA+CP]...[DATA+CP]
+//! `[STS][STS][LTS+CP][LTS+CP][SIGNAL+CP][DATA+CP]...[DATA+CP]`
 use super::OfdmProfile;
 use num_complex::Complex32;
 
@@ -153,7 +153,7 @@ pub fn generate_sts(profile: &OfdmProfile) -> Vec<Complex32> {
 /// Generates the Long Training Sequence (LTS) for fine timing and channel estimation.
 ///
 /// All active subcarriers are modulated with known BPSK values.
-/// Hermitian symmetry is enforced: X[N-k] = conj(X[k]) so the IFFT
+/// Hermitian symmetry is enforced: X\[N-k\] = conj(X\[k\]) so the IFFT
 /// produces a real-valued time-domain waveform.
 pub fn generate_lts(profile: &OfdmProfile) -> Vec<Complex32> {
     let n = profile.fft_size;

@@ -193,7 +193,7 @@ pub fn estimate_coarse_delay(nc: usize, probe_h: &[Complex32]) -> f32 {
 /// # Units: real samples, NOT [`estimate_coarse_delay`]'s "grid units"
 ///
 /// This is the one important, easy-to-get-wrong distinction from
-/// [`estimate_coarse_delay`]/[`tau_basis`]'s convention, which normalizes by
+/// [`estimate_coarse_delay`]/`tau_basis`'s convention, which normalizes by
 /// `nc` (the ACTIVE CARRIER COUNT) rather than the FFT size, i.e. its output
 /// is in "grid units" where 1 unit = `fft_size / nc` real ADC samples (for
 /// `hf_standard`: `960/48 = 20` samples/unit -- this is exactly why

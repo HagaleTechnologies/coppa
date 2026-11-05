@@ -89,7 +89,7 @@ pub trait ChannelEstimator: Send {
     /// `pilots` contains (subcarrier_index, received_value, known_value) tuples.
     fn update(&mut self, pilots: &[(usize, Complex32, Complex32)]);
 
-    /// Get the estimated channel response H[k] for a given subcarrier.
+    /// Get the estimated channel response H\[k\] for a given subcarrier.
     fn estimate(&self, subcarrier: usize) -> Complex32;
 
     /// Get noise variance estimate (sigma^2).
