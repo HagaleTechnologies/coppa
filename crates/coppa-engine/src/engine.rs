@@ -86,8 +86,7 @@ pub struct StreamFrame {
     /// `coppa_ml::RateLoop` on the peer's side can apply it.
     pub recommended_level: u8,
     /// This frame's measured multipath delay spread (ms), from
-    /// `DecodedFrame::delay_spread_ms`. Feeds `coppa_ml::CpGate` in the daemon —
-    /// see `docs/superpowers/specs/2026-07-25-cpgate-daemon-wiring-design.md`.
+    /// `DecodedFrame::delay_spread_ms`. Feeds `coppa_ml::CpGate` in the daemon.
     pub delay_spread_ms: f32,
 }
 

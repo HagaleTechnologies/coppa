@@ -1,5 +1,4 @@
-//! Standalone repro for the CFO x level-4 investigation
-//! (`.superpowers/sdd/p2-cfo-level4-investigation-report.md`): reproduces the
+//! Standalone repro for the CFO x level-4 investigation: reproduces the
 //! flat, SNR-unresponsive FER floor that a nonzero CFO induces at level 4
 //! (QPSK 3/4) via `CoppaModem::calibrated_bias`'s inability to represent the
 //! CFO-induced sync-timing jitter. Parametrized entirely by env vars so it can

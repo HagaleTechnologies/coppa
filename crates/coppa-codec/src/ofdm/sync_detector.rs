@@ -17,10 +17,8 @@
 //!   protected header's channel estimate; Task 5 originally anchored on the
 //!   first arrival unconditionally, which is what this ADR corrects).
 //!
-//! See `docs/superpowers/plans/2026-07-03-phase1-radio-reality.md` Task 5 (or its
-//! successor Phase-2 rate-loop plan) for the original design rationale and locked
-//! algorithm, and `docs/adr/004-strongest-path-timing.md` for the timing-anchor
-//! correction on top of it.
+//! See `docs/adr/004-strongest-path-timing.md` for the timing-anchor
+//! correction applied on top of the original Phase 1 Task 5 locked algorithm.
 //!
 //! # Two front ends
 //!
@@ -577,8 +575,7 @@ impl SyncDetector {
         // than anchoring at a possibly-much-weaker first arrival does — measured directly
         // to cut Watterson-Moderate/Poor header decode failures on `hf_standard` levels
         // 1-2 from a hard ~30% FER floor back to matching (or beating) pre-Phase-1
-        // levels, with real but smaller/partial gains for levels 3-4 (see
-        // `.superpowers/sdd/p1-fading-regression-fix-report.md` for the full numbers),
+        // levels, with real but smaller/partial gains for levels 3-4,
         // and zero AWGN cost (a single dominant path, where the two anchors coincide).
         // The `cp/2` bound preserves the original first-path SAFETY intent
         // (never anchor on a late, dominant echo that could carry the FFT window
@@ -902,8 +899,7 @@ mod tests {
     /// protected header's sparse-pilot (4-pilot `hf_standard`) 2D channel estimate
     /// badly enough to floor FER at ~30% regardless of SNR (level 1, BPSK 1/4), while
     /// anchoring on the strongest tap restores the pre-Phase-1 ~2-5% FER there. Levels
-    /// 3-4 recover most but not all of the gap (see
-    /// `.superpowers/sdd/p1-fading-regression-fix-report.md`). The two anchors coincide
+    /// 3-4 recover most but not all of the gap. The two anchors coincide
     /// (no behavior change at all) whenever one tap dominates, which is why AWGN
     /// and the VHF (denser-pilot) levels were and remain unaffected.
     #[test]

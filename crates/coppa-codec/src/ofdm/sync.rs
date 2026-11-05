@@ -81,7 +81,7 @@ fn newman_phases(k_tones: usize, rotation: usize) -> Vec<f32> {
 /// preamble per protocol version while preserving its low-PAPR envelope class.
 /// Returns 2 identical unit-RMS symbols, each with its cyclic prefix prepended; the
 /// two-identical-halves Schmidl-Cox structure and per-symbol period N/2 are both
-/// preserved (see docs/superpowers/plans/2026-07-03-phase1-radio-reality.md Task 2).
+/// preserved (see `docs/adr/003-phase1-waveform-break.md`, decision 2).
 pub fn generate_coppa_preamble(profile: &CoppaProfile, version: u8) -> Vec<f32> {
     let n = profile.fft_size;
     let cp = profile.cp_samples;
@@ -386,7 +386,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Newman-phase in-band preamble tests (Phase 1 Task 2; see
-    // docs/superpowers/plans/2026-07-03-phase1-radio-reality.md)
+    // `docs/adr/003-phase1-waveform-break.md`, decision 2)
     // -----------------------------------------------------------------------
 
     #[test]

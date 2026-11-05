@@ -776,11 +776,9 @@ pub struct EventLoop {
     /// station's own measured delay spread on every fully decoded frame when
     /// `[engine] cp_gate_enabled` is set. Measurement/telemetry only -- its
     /// live recommendation is exposed via `WsStatus::short_cp_ok`, but nothing
-    /// currently applies it to the engine's CP profile. See
-    /// `docs/superpowers/specs/2026-07-25-cpgate-daemon-wiring-design.md`.
+    /// currently applies it to the engine's CP profile.
     cp_gate: CpGate,
     /// Pure CP-switch negotiation decision state (`coppa_protocol::cp_negotiator`).
-    /// See `docs/superpowers/specs/2026-07-29-cp-switch-peer-negotiation-design.md`.
     cp_negotiator: CpNegotiator,
     /// Dedicated small ArqTx/ArqRx pair for `TransportType::CpControl`
     /// traffic -- entirely separate sequence space from the ordinary data
@@ -821,8 +819,7 @@ pub struct EventLoop {
     arq_next_seq: u8,
     /// At most one active-overshoot probe outstanding at a time: `(seq,
     /// probed_level)`. `None` when no probe is in flight. Only ever set/read
-    /// when ARQ is enabled -- see `docs/superpowers/specs/
-    /// 2026-07-25-rateloop-daemon-probe-wiring-design.md`.
+    /// when ARQ is enabled.
     #[allow(dead_code)] // used by Tasks 4-6
     probe_state: Option<(u8, u8)>,
     /// COP-83: TX speed level pinned by the WebSocket `set_speed_level`
@@ -1058,8 +1055,7 @@ impl EventLoop {
             engine.config().sample_rate as f32,
         );
 
-        // Active overshoot probing (see `docs/superpowers/specs/
-        // 2026-07-25-rateloop-daemon-probe-wiring-design.md`) is off by
+        // Active overshoot probing is off by
         // default -- `rate_loop_probe_interval == 0` matches
         // `RateLoop::with_probing`'s own "0 disables" convention.
         //
@@ -2445,8 +2441,7 @@ impl EventLoop {
             return;
         }
         if let Some((seq_opt, data)) = self.tx_queue.pop_front() {
-            // Active overshoot probing (see `docs/superpowers/specs/
-            // 2026-07-25-rateloop-daemon-probe-wiring-design.md`) only applies
+            // Active overshoot probing only applies
             // to a fresh ARQ-tracked segment's first transmission (never a
             // retransmit -- those go through `check_arq_retransmits` instead),
             // only one probe outstanding at a time, and only when ARQ is
@@ -4543,8 +4538,7 @@ impl EventLoop {
                     self.emit_vara(VaraResponse::Snr(snr_db.round() as i32))
                         .await;
 
-                    // `CpGate` (`docs/superpowers/specs/
-                    // 2026-07-25-cpgate-daemon-wiring-design.md`): feed this
+                    // `CpGate`: feed this
                     // frame's measured delay spread on the same "decode fully
                     // succeeded" event the SNR/level telemetry uses. Off
                     // by default (`cp_gate_enabled`). Runs regardless of
@@ -4787,9 +4781,7 @@ impl EventLoop {
                                         // stronger, direct ground truth than the
                                         // passive per-frame recommendation, and
                                         // `on_probe_result`/`on_ack` are mutually
-                                        // exclusive per event (see
-                                        // `docs/superpowers/specs/
-                                        // 2026-07-25-rateloop-daemon-probe-wiring-design.md`).
+                                        // exclusive per event.
                                         if !probe_resolved {
                                             if let Some(rate) = pdu.suggested_rate() {
                                                 self.rate_loop.on_ack(rate, true);
@@ -5616,8 +5608,7 @@ impl EventLoop {
     /// probe was resolved by this call -- the caller must then skip its own
     /// normal `on_ack` application for this event (mutually exclusive
     /// dispatch, matching `coppa_ml::RateLoop`'s `level_for_next_transmission`/
-    /// `on_probe_result` call-site contract). See `docs/superpowers/specs/
-    /// 2026-07-25-rateloop-daemon-probe-wiring-design.md`.
+    /// `on_probe_result` call-site contract).
     fn resolve_probe_if_acked(&mut self, newly_acked: &[u8]) -> bool {
         if let Some((seq, level)) = self.probe_state {
             if newly_acked.contains(&seq) {
@@ -5669,8 +5660,7 @@ impl EventLoop {
             // it normally, at whatever level `current_level()` now is), but
             // must not itself drop RateLoop's idx the way a genuine passive
             // timeout does (`on_probe_result`'s failure path is a no-op by
-            // design). See `docs/superpowers/specs/
-            // 2026-07-25-rateloop-daemon-probe-wiring-design.md`.
+            // design).
             let probe_failed_seq = self
                 .probe_state
                 .filter(|&(seq, _)| retransmit_seqs.contains(&seq))
@@ -15259,8 +15249,7 @@ mod tests {
         }
 
         /// `CpGate`'s live recommendation reaches `WsStatus.short_cp_ok` once
-        /// enabled and a frame has decoded (design doc: `docs/superpowers/
-        /// specs/2026-07-25-cpgate-daemon-wiring-design.md`). A single clean
+        /// enabled and a frame has decoded. A single clean
         /// loopback frame's real (near-zero) delay spread isn't enough on its
         /// own to flip `CpGate::default_coppa()`'s hysteresis to `ShortCp`
         /// (`consecutive_needed = 4`), so this only asserts the field is
