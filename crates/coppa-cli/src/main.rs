@@ -268,25 +268,29 @@ impl DeviceOutput {
     }
 }
 
+const PAYLOAD_SCOPE: &str = "encoded_bytes_per_codeword";
+
 #[derive(Serialize)]
 struct ProfileOutput {
     name: &'static str,
     description: &'static str,
     speed_level: u8,
     max_payload_bytes: usize,
+    max_payload_scope: &'static str,
     compression: bool,
     sample_rate_hz: u32,
     ofdm_profile: &'static str,
 }
 
 /// One speed level of `coppa_engine::ladder`, for `profiles --level N --json`.
-/// `hf_*` are `null` on a VHF-only level.
+/// `hf_*` are `null` on a VHF-only level. Air times describe a single-codeword frame.
 #[derive(Serialize)]
 struct LevelOutput {
     level: u8,
     modulation: &'static str,
     code_rate: String,
     max_payload_bytes: usize,
+    max_payload_scope: &'static str,
     hf_bandwidth_hz: Option<u32>,
     hf_airtime_ms: Option<u32>,
     vhf_bandwidth_hz: u32,
@@ -301,6 +305,7 @@ impl From<&coppa_engine::ladder::LevelInfo> for LevelOutput {
             modulation: row.modulation,
             code_rate: format!("{}/{}", row.code_rate.0, row.code_rate.1),
             max_payload_bytes: row.max_payload_bytes,
+            max_payload_scope: PAYLOAD_SCOPE,
             hf_bandwidth_hz: row.hf.map(|hf| hf.bandwidth_hz),
             hf_airtime_ms: row.hf.map(|hf| ms(hf.airtime_s)),
             vhf_bandwidth_hz: row.vhf.bandwidth_hz,
@@ -365,6 +370,7 @@ impl ProfileOutput {
             description: profile.description,
             speed_level: profile.speed_level,
             max_payload_bytes,
+            max_payload_scope: PAYLOAD_SCOPE,
             compression: profile.compression,
             sample_rate_hz: profile.sample_rate,
             ofdm_profile: profile.ofdm_profile,
@@ -2396,6 +2402,7 @@ fn render_profiles(args: &ProfilesArgs) -> Result<String> {
                 .ok_or_else(|| anyhow::anyhow!("no speed level {level}"))?;
             render_ladder_header(&mut out, &ladder);
             render_ladder_row(&mut out, row);
+            render_payload_budget_note(&mut out, true);
         }
         None => {
             render_ladder(&mut out, &ladder);
@@ -2467,6 +2474,21 @@ fn airtime_ms(airtime_s: f64) -> String {
     format!("{} ms", (airtime_s * 1000.0).round() as u32)
 }
 
+fn render_payload_budget_note(out: &mut String, ladder: bool) {
+    out.push('\n');
+    if ladder {
+        out.push_str("MAX BYTES is the payload budget per codeword at the listed speed level.\n");
+    }
+    out.push_str(concat!(
+        "Payload budgets are bytes after compression, before FEC, per codeword.\n",
+        "They include any transport headers, but exclude the per-codeword CRC.\n",
+        "With compression enabled, how much input fits depends on its contents.\n",
+        "These are not limits on a daemon host write. The daemon chunks stream data\n",
+        "for the current speed level and may use multiple codewords per frame.\n",
+        "KISS datagrams have a separate limit; see docs/RETICULUM.md.\n",
+    ));
+}
+
 fn render_ladder_header(out: &mut String, ladder: &[coppa_engine::ladder::LevelInfo]) {
     let hf_hz = ladder
         .iter()
@@ -2474,7 +2496,7 @@ fn render_ladder_header(out: &mut String, ladder: &[coppa_engine::ladder::LevelI
         .map_or(0, |hf| hf.bandwidth_hz);
     let vhf_hz = ladder.first().map_or(0, |row| row.vhf.bandwidth_hz);
     let vhf_header = format!("VHF, {vhf_hz} Hz");
-    out.push_str(&format!("{:41}AIR TIME PER FRAME\n", ""));
+    out.push_str(&format!("{:41}AIR TIME, 1-CODEWORD FRAME\n", ""));
     out.push_str(&format!(
         "{:<7}{:<12}{:<11}{:<11}{:<15}{}\n",
         "LEVEL",
@@ -2524,20 +2546,7 @@ fn render_ladder(out: &mut String, ladder: &[coppa_engine::ladder::LevelInfo]) {
     for row in ladder {
         render_ladder_row(out, row);
     }
-    let compressing: Vec<String> = named_profiles()
-        .into_iter()
-        .filter(|p| p.compression)
-        .map(|p| p.name.to_string())
-        .collect();
-    out.push('\n');
-    out.push_str("MAX BYTES is the payload one frame carries on the air.");
-    if !compressing.is_empty() {
-        out.push_str(&format!(
-            " {}\ncompress your message first, so how much text fits depends on the text.",
-            join_and(&compressing)
-        ));
-    }
-    out.push('\n');
+    render_payload_budget_note(out, true);
     let vhf_only: Vec<String> = ladder
         .iter()
         .filter(|row| row.hf.is_none())
@@ -2627,9 +2636,9 @@ fn render_profile_detail(name: &str, ladder: &[coppa_engine::ladder::LevelInfo])
         "  Speed level: {} ({}, code rate {}/{})\n",
         p.speed_level, row.modulation, row.code_rate.0, row.code_rate.1
     ));
-    out.push_str(&format!("  Max bytes per frame: {max_bytes}\n"));
+    out.push_str(&format!("  Payload bytes per codeword: {max_bytes}\n"));
     out.push_str(&format!(
-        "  Air time per frame: {}\n",
+        "  Air time, 1-codeword frame: {}\n",
         airtime_ms(cell.airtime_s)
     ));
     out.push_str(&format!(
@@ -2637,6 +2646,7 @@ fn render_profile_detail(name: &str, ladder: &[coppa_engine::ladder::LevelInfo])
         if p.compression { "on" } else { "off" }
     ));
     out.push_str(&format!("  Sample rate: {} Hz\n", p.sample_rate));
+    render_payload_budget_note(&mut out, false);
     Ok(out)
 }
 
@@ -3085,13 +3095,16 @@ mod tests {
             let out = rendered(&["profiles", "-p", name]);
             let max = coppa_protocol::modem::max_payload_for_level(p.speed_level).unwrap();
             assert!(
-                out.contains(&format!("Max bytes per frame: {max}\n")),
+                out.contains(&format!("Payload bytes per codeword: {max}\n")),
                 "{out}"
             );
             assert!(!out.contains("ARQ window"), "{out}");
         }
         let robust = rendered(&["profiles", "-p", "HF_ROBUST"]);
-        assert!(robust.contains("Max bytes per frame: 56\n"), "{robust}");
+        assert!(
+            robust.contains("Payload bytes per codeword: 56\n"),
+            "{robust}"
+        );
         assert!(!robust.contains("64 bytes"), "{robust}");
     }
 
@@ -3099,8 +3112,10 @@ mod tests {
     fn profiles_level_shows_one_row() {
         let out = rendered(&["profiles", "--level", "4"]);
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 3, "{out}");
-        assert!(lines[0].trim_start().starts_with("AIR TIME PER FRAME"));
+        assert_eq!(lines.len(), 11, "{out}");
+        assert!(lines[0]
+            .trim_start()
+            .starts_with("AIR TIME, 1-CODEWORD FRAME"));
         assert!(lines[1].starts_with("LEVEL"));
         assert!(lines[2].starts_with("4 "), "{out}");
     }

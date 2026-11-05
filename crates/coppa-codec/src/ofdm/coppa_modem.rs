@@ -189,15 +189,11 @@ const KALMAN_HEADER_ENABLED: bool = true;
 /// current baseline, not just a shortfall against the design's target. AWGN
 /// is unchanged (6.0 dB, both paths) and Watterson-Poor never clears
 /// either way, so this is isolated to Watterson-Moderate. See
-/// `.superpowers/sdd/task-5-report.md` and `BENCHMARKS.md`'s corresponding
-/// subsection for the full numbers, and
-/// `docs/superpowers/specs/2026-07-17-coarse-delay-drift-tracker-design.md`
-/// for the design.
+/// `BENCHMARKS.md`'s corresponding subsection for the full numbers.
 const DRIFT_TRACKER_ENABLED: bool = false;
 
-/// Payload-pass toggle for the Cascaded design
-/// (`docs/superpowers/specs/2026-07-18-cascaded-drift-tracker-design.md`):
-/// combines [`drift_tracker::DriftTracker`]'s per-window coarse-delay
+/// Payload-pass toggle for the Cascaded design: combines
+/// [`drift_tracker::DriftTracker`]'s per-window coarse-delay
 /// tracking with the AR(1) [`KalmanLagSmoother`] tap-amplitude tracker
 /// (instead of [`Self::equalize_payload_drift_tracked`]'s fresh per-window
 /// [`DelayDomainEstimator::fit`] refits). Takes priority over
@@ -220,10 +216,8 @@ const DRIFT_TRACKER_ENABLED: bool = false;
 /// all three paths) and Watterson-Poor never clears in any of them, so
 /// this is isolated to Watterson-Moderate. This is the third and, per the
 /// design plan's own framing, final attempt at this regression in this
-/// line of investigation — see `.superpowers/sdd/task-4-report.md` and
-/// `BENCHMARKS.md`'s corresponding subsection for the full numbers, and
-/// `docs/superpowers/specs/2026-07-18-cascaded-drift-tracker-design.md`
-/// for the design.
+/// line of investigation — see `BENCHMARKS.md`'s corresponding subsection
+/// for the full numbers.
 const DRIFT_CASCADE_ENABLED: bool = false;
 
 /// Process-noise variance on the tracked delay `τ` itself (grid units²/step)
@@ -237,8 +231,7 @@ const DRIFT_CASCADE_ENABLED: bool = false;
 /// disabled, see `DRIFT_TRACKER_ENABLED`) default because the sweep gave no
 /// evidence any other combination in the tested range does better — the
 /// same "tuning axis is close to exhausted" conclusion Task 7's own
-/// `DEFAULT_SIGMA_D_HZ` sweep reached. See `.superpowers/sdd/task-5-report.md`
-/// for the full sweep table.
+/// `DEFAULT_SIGMA_D_HZ` sweep reached.
 const DRIFT_Q_TAU: f32 = 1e-4;
 
 /// Process-noise variance on the tracked delay-rate `τ̇` (grid
@@ -391,8 +384,7 @@ struct ProbeCalibration {
     /// Measured multipath delay spread (ms), from this frame's own probe-symbol
     /// `DelayDomainEstimator` fit — see `DelayDomainEstimator::delay_spread_ms`'s
     /// doc (Task 6b: short-CP spread gate). Threaded out through
-    /// `demodulate_frame` for `coppa_ml::CpGate`'s daemon wiring; see
-    /// `docs/superpowers/specs/2026-07-25-cpgate-daemon-wiring-design.md`.
+    /// `demodulate_frame` for `coppa_ml::CpGate`'s daemon wiring.
     delay_spread_ms: f32,
 }
 
@@ -868,7 +860,7 @@ impl CoppaModem {
         };
 
         // 1. Sync: streaming O(1) detector (see `sync_detector` module docs), which now
-        // also produces a two-stage Moose CFO estimate (`cfo_hz`, ±50 Hz range) alongside
+        // also produces a two-stage Moose CFO estimate (`cfo_hz`, ±171 Hz standard-HF hypothesis-search range) alongside
         // timing — see `sync::estimate_cfo_two_stage` and `SyncDetector::estimate_cfo_from_ring`.
         let candidate = SyncDetector::detect_all(&self.profile, self.version, samples)
             .into_iter()
@@ -1098,11 +1090,11 @@ impl CoppaModem {
     /// `±EST_WINDOW`-symbol window `demodulate_header_llrs`'s non-Kalman
     /// fallback uses, adds any in-window virtual-pilot observations
     /// (`H_est = y/x̄`, weight `|x̄|²`), re-fits via
-    /// [`Self::estimate_and_equalize`], and re-extracts data/noise exactly as
+    /// `Self::estimate_and_equalize`, and re-extracts data/noise exactly as
     /// `demodulate_frame`'s payload pass does. Returns `(vec![], vec![])` if no
     /// frame has been demodulated yet (or the workspace was somehow empty).
     ///
-    /// See [`LastFrameWorkspace`]'s doc for why this reuses
+    /// See `LastFrameWorkspace`'s doc for why this reuses
     /// `DelayDomainEstimator` (via `estimate_and_equalize`) rather than the
     /// live per-frame `KalmanLagSmoother`.
     pub fn reequalize_with_virtual_pilots(
@@ -1267,9 +1259,7 @@ impl CoppaModem {
     /// real probe energy into a spurious second delay-domain tap, corrupting the
     /// LDPC input LLRs identically at every HF-profile level — level 4 (QPSK 3/4,
     /// the tightest-margin HF-profile code) is the first to lose LDPC convergence
-    /// entirely, producing a flat, SNR-unresponsive ~40–100% FER floor. See
-    /// `.superpowers/sdd/p2-cfo-level4-investigation-report.md` for the full
-    /// measurement.
+    /// entirely, producing a flat, SNR-unresponsive ~40–100% FER floor.
     ///
     /// # Why bounded rather than a full per-frame re-derivation
     ///
@@ -1312,8 +1302,7 @@ impl CoppaModem {
     /// measured Watterson header pass rate (98.50%, 591/600) statistically
     /// indistinguishable from the 99.00% unmodified-code baseline (binomial
     /// std ≈0.41% at n=600; the 0.5pp gap is ~1.2σ, not significant) — unlike
-    /// bound=0.2's ~1.67pp gap (~4σ, a real if still-passing regression). See
-    /// `.superpowers/sdd/p2-cfo-level4-fix-report.md` for the full sweep data.
+    /// bound=0.2's ~1.67pp gap (~4σ, a real if still-passing regression).
     ///
     /// # Combined CFO + Watterson-fading case (post-merge verification)
     ///
@@ -1328,9 +1317,7 @@ impl CoppaModem {
     /// reappear once real Watterson multipath is present — the pre-existing
     /// level-4 Watterson floor (~40-50% FER at high SNR, unrelated to this fix,
     /// see docs/LIMITATIONS.md) dominates and CFO adds no measurable
-    /// extra degradation on top of it. See
-    /// `.superpowers/sdd/p2-cfo-level4-fix-report.md`'s "Combined CFO + Watterson
-    /// fading" addendum for the raw data.
+    /// extra degradation on top of it.
     fn bounded_coarse_delay(&self, nc: usize, probe_h: &[Complex32]) -> f32 {
         const COARSE_DELAY_JITTER_BOUND: f32 = 0.15;
         let raw_estimate = super::delay_domain::estimate_coarse_delay(nc, probe_h);
@@ -1455,8 +1442,7 @@ impl CoppaModem {
     /// other — each window's raw per-symbol pilots are derotated by THAT
     /// window's own tracked delay (not one frame-fixed value) before being
     /// fed to the AR(1) tracker, restoring its validated lag-2
-    /// RTS-smoothing benefit on top of a correctly-evolving reference. See
-    /// `docs/superpowers/specs/2026-07-18-cascaded-drift-tracker-design.md`.
+    /// RTS-smoothing benefit on top of a correctly-evolving reference.
     ///
     /// # Known rough edge
     ///
@@ -1759,7 +1745,7 @@ impl CoppaModem {
     /// `demodulate_frame` itself uses (`demodulate_header_llrs` + `header_fec::
     /// decode_header_soft`), so both share one implementation.
     ///
-    /// Used standalone by [`super::transceiver::CoppaTransceiver::demodulate_header`],
+    /// Used standalone by `super::transceiver::CoppaTransceiver::demodulate_header`,
     /// which `StreamingReceiver` (`coppa-protocol`) calls to learn a candidate frame's
     /// speed level (and therefore its total length) before buffering the whole frame
     /// for a full [`Self::demodulate_frame`]/`receive` pass. Unlike `demodulate_frame`,
@@ -1776,9 +1762,7 @@ impl CoppaModem {
     /// `demodulate_header_llrs` returns per-bit LLRs, not hard-sliced 0/1 bits;
     /// `header_fec::decode_header_soft`'s soft-ML + CRC-assisted list decoder uses
     /// them directly (see that function's doc). This recovers headers the old hard
-    /// decoder's fixed 3-error-per-word budget could not — see
-    /// `.superpowers/sdd/p2-task-2-report.md` for the measured header-failure-share-
-    /// of-total-FER improvement. `header_fec::decode_header` (hard) is kept as a
+    /// decoder's fixed 3-error-per-word budget could not. `header_fec::decode_header` (hard) is kept as a
     /// reference implementation and is no longer called on this live path.
     pub fn demodulate_header(&self, samples: &[f32], data_start: usize) -> Option<CoppaHeader> {
         let data_per_sym = self.data_carriers_per_symbol();
@@ -2586,15 +2570,14 @@ mod tests {
 
     /// Statistical A/B comparison of soft-ML (`header_fec::decode_header_soft`) vs
     /// hard-decision (`header_fec::decode_header`) header decoding on Watterson-Poor
-    /// fading -- the scenario the soft-ML header was built for (see
-    /// `.superpowers/sdd/p2-task-2-brief.md`). Both decoders run on the exact same
+    /// fading -- the scenario the soft-ML header was built for. Both decoders run on the exact same
     /// demodulated LLRs (`demodulate_header_llrs`, hard-sliced by sign for the hard
     /// side) at the exact same sync position, so this isolates the FEC/decode-
     /// strategy gain from any estimation-quality difference.
     ///
     /// # Deviation from the brief's `>= 25 percentage points @ 8 dB` target
     ///
-    /// The brief's acceptance bar (`.superpowers/sdd/p2-task-2-brief.md`, Step 1)
+    /// The original acceptance bar (Task 2, Step 1)
     /// was `>= 25` percentage points at 8 dB. Measured directly (this test, plus a
     /// deliberate SNR/profile/frame-length sweep recorded in the Task 2 report):
     /// Task 1/7's Kalman-tracked 2D pilot estimation (already on this branch before

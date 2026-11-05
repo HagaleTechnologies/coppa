@@ -18,7 +18,7 @@ integrity check beyond LDPC convergence, a constant ARQ RTO floor untuned to hal
 realities, no retransmission combining, a fixed link rate, one codeword per frame regardless of
 modulation order, no sampling-clock-offset correction, a daemon that accepted telemetry types but
 never sent them, and no benchmark program that made "world-class" a falsifiable claim rather
-than a slogan. Phase 3 (`docs/superpowers/plans/2026-07-03-phase3-system-layer.md`, branch
+than a slogan. Phase 3 (branch
 `feature/system-layer`, 9 dev tasks + 1 phase-gate task) turns the PHY into an actual link:
 payload CRC-32, half-duplex-aware ARQ, IR-HARQ, a closed rate loop (a human decision gate — see
 decision 5), multi-codeword frames with intra-frame interleaving, SCO tracking, a spread-gated
@@ -123,8 +123,8 @@ airtime-efficient than the plan intended) and is a plausible candidate for a fut
 
 ### 5. Rate loop — HUMAN DECISION GATE (Task 4)
 
-**Plan**: two approved-but-divergent designs were on file — the pre-existing
-`docs/superpowers/plans/2026-07-01-coppa-closed-loop-adaptive-rate.md` (executed mechanically),
+**Plan**: two approved-but-divergent designs were on file — a pre-existing
+closed-loop-adaptive-rate plan (executed mechanically),
 or this phase's decision 5 (same architecture, amended for down-shift-on-timeout and
 per-codeword noise-variance-based recommendation). **Tony chose the amended design (option b)**
 at the decision gate.
@@ -504,19 +504,12 @@ apologizing for not being ML. **`coppa-protocol::fec::convolutional` (`ConvEncod
 assumption**: it is used by `benches/throughput.rs` (a `[[bench]]` target of the root package)
 and `fuzz/fuzz_targets/fuzz_viterbi.rs` (a real cargo-fuzz target, excluded from the Cargo
 workspace but still a maintained tool) — both outside the crate boundary a narrower grep might
-have checked. It was kept, unchanged. See `.superpowers/sdd/task-9-report.md` for the full
-verification trail.
+have checked. It was kept, unchanged.
 
 ## Related
 
-- `docs/superpowers/plans/2026-07-03-phase3-system-layer.md` — the plan this ADR records.
 - `docs/adr/007-multi-codeword-frames.md` — decision 6 in full detail.
 - `docs/adr/006-phase2-parametric-estimation-nr-bg2.md`, `005-nr-bg2-ldpc.md`,
   `004-strongest-path-timing.md`, `003-phase1-waveform-break.md` — the prior phases' wire-format
   breaks and the sparse-pilot/CFO fixes this phase's SCO-tracking work continues the pattern of.
-- `.superpowers/sdd/progress.md`'s Phase 3 section — the authoritative per-task ledger this ADR
-  summarizes; written by the coordinator after each task's review.
-- `.superpowers/sdd/task-{1,2,3,4,5,6,6b,7,8}-report.md` — full per-task investigation detail.
-- `.superpowers/sdd/task-9-report.md` — this task's full report, including the dead-code
-  verification trail and self-review.
 - `BENCHMARKS.md`'s "Phase 3 Task 4" and "Phase 3 Task 8" sections — full before/after tables.

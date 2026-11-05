@@ -86,8 +86,7 @@ pub struct StreamFrame {
     /// `coppa_ml::RateLoop` on the peer's side can apply it.
     pub recommended_level: u8,
     /// This frame's measured multipath delay spread (ms), from
-    /// `DecodedFrame::delay_spread_ms`. Feeds `coppa_ml::CpGate` in the daemon —
-    /// see `docs/superpowers/specs/2026-07-25-cpgate-daemon-wiring-design.md`.
+    /// `DecodedFrame::delay_spread_ms`. Feeds `coppa_ml::CpGate` in the daemon.
     pub delay_spread_ms: f32,
 }
 
@@ -405,7 +404,7 @@ impl CoppaCore {
     /// whose frame bytes are byte-identical to the original (rebuilt from
     /// the segment data) but whose PHY level drops to the most robust level
     /// whose payload budget still fits the frame. It shares
-    /// [`Self::encode_bytes_at`] with [`Self::encode_bytes`] so the two can
+    /// `Self::encode_bytes_at` with [`Self::encode_bytes`] so the two can
     /// never diverge -- unlike [`Self::encode_bytes_at_level`] (Beacon frame
     /// type, no compression, the station-ID/beacon path), which is left
     /// alone for its existing callers.
@@ -768,7 +767,7 @@ impl CoppaCore {
 
     /// Validate `level` for a frame sent on the VHF profile (`on_vhf_profile`)
     /// or on an HF profile, which carries levels 1-8 only.
-    fn check_level(&self, level: u8, on_vhf_profile: bool) -> Result<(), EngineError> {
+    pub(crate) fn check_level(&self, level: u8, on_vhf_profile: bool) -> Result<(), EngineError> {
         coppa_protocol::modem::speed_level_components(level)
             .map_err(|_| EngineError::InvalidSpeedLevel { level })?;
         if !on_vhf_profile && level > HF_MAX_SPEED_LEVEL {

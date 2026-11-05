@@ -186,14 +186,13 @@ pub fn estimate_coarse_delay(nc: usize, probe_h: &[Complex32]) -> f32 {
 /// SAMPLES, from a sparse set of pilot `(active_carrier_index, received_value)`
 /// pairs -- the fine-grained, per-symbol, real-sample-domain sibling of
 /// [`estimate_coarse_delay`]'s full-comb bulk-delay estimate. See
-/// `docs/superpowers/plans/2026-07-03-phase3-system-layer.md` decision 7 /
-/// `.superpowers/sdd/task-6-brief.md` ("Task 6: SCO tracking") for the design
-/// this implements.
+/// `docs/adr/008-phase3-system-layer.md` decision 7 ("Task 6: SCO tracking") for the
+/// design this implements.
 ///
 /// # Units: real samples, NOT [`estimate_coarse_delay`]'s "grid units"
 ///
 /// This is the one important, easy-to-get-wrong distinction from
-/// [`estimate_coarse_delay`]/[`tau_basis`]'s convention, which normalizes by
+/// [`estimate_coarse_delay`]/`tau_basis`'s convention, which normalizes by
 /// `nc` (the ACTIVE CARRIER COUNT) rather than the FFT size, i.e. its output
 /// is in "grid units" where 1 unit = `fft_size / nc` real ADC samples (for
 /// `hf_standard`: `960/48 = 20` samples/unit -- this is exactly why

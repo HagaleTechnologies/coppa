@@ -291,30 +291,64 @@ pub fn apply_transfer_channel(
     snr_db: f32,
     seed: u64,
 ) -> Vec<Vec<f32>> {
-    let l = frames.first().map(|f| f.len()).unwrap_or(0);
+    apply_transfer_channel_with_impairment(
+        frames,
+        channel,
+        snr_db,
+        seed,
+        crate::impairment::TransferImpairment::None,
+    )
+}
+
+/// Apply a versioned synthetic preset to the full transfer, using the original
+/// clean power for noise, clipping and impulses. State continues across frames.
+pub fn apply_transfer_channel_with_impairment(
+    frames: &[Vec<f32>],
+    channel: ChannelSpec,
+    snr_db: f32,
+    seed: u64,
+    impairment: crate::impairment::TransferImpairment,
+) -> Vec<Vec<f32>> {
+    use crate::impairment::TransferImpairment::*;
+    use coppa_channel::impairments::*;
     let concat: Vec<f32> = frames.iter().flatten().copied().collect();
-
-    // Same convention as runner::run_trial: 3 kHz-referenced SNR against clean power.
     let p_clean = coppa_channel::mean_power(&concat);
-    let noise_seed = seed ^ 0x5555_5555_5555_5555;
+    let rms = p_clean.sqrt();
     let sr = SAMPLE_RATE as f32;
-    let faded = match channel {
-        ChannelSpec::Awgn => {
-            coppa_channel::awgn_ref_seeded(&concat, snr_db, p_clean, sr, noise_seed)
-        }
-        ChannelSpec::Watterson(preset) => {
-            let f = coppa_channel::watterson::watterson(
-                &concat,
-                sr,
-                &preset.config(),
-                seed ^ 0x3333_3333_3333_3333,
-            );
-            coppa_channel::awgn_ref_seeded(&f, snr_db, p_clean, sr, noise_seed)
-        }
+    let shaped = match impairment {
+        Tilt => frequency_tilt(&concat, 12.0, sr).expect("valid tilt preset"),
+        Agc => coppa_channel::fading(&concat, 1.0, 20.0, sr),
+        _ => concat,
     };
-
-    (0..frames.len())
-        .map(|k| faded[k * l..(k + 1) * l].to_vec())
+    let faded = match channel {
+        ChannelSpec::Awgn => shaped,
+        ChannelSpec::Watterson(preset) => coppa_channel::watterson::watterson(
+            &shaped,
+            sr,
+            &preset.config(),
+            seed ^ 0x3333_3333_3333_3333,
+        ),
+    };
+    let noisy =
+        coppa_channel::awgn_ref_seeded(&faded, snr_db, p_clean, sr, seed ^ 0x5555_5555_5555_5555);
+    let output = match impairment {
+        // Independent impulse stream; baseline fading and noise draws stay paired.
+        Impulsive => {
+            impulsive_noise_seeded(&noisy, 0.001, 10.0 * rms, seed ^ 0x7777_7777_7777_7777)
+                .expect("valid impulse preset")
+        }
+        Clipping if rms > 0.0 => hard_clip(&noisy, 2.0 * rms).expect("valid clip preset"),
+        Agc => agc(&noisy, 0.5, 480).expect("valid AGC preset"),
+        _ => noisy,
+    };
+    let mut offset = 0;
+    frames
+        .iter()
+        .map(|f| {
+            let window = output[offset..offset + f.len()].to_vec();
+            offset += f.len();
+            window
+        })
         .collect()
 }
 
@@ -794,5 +828,47 @@ mod tests {
             moderate[0].v1_recovery,
             moderate[0].v2_recovery
         );
+    }
+}
+
+#[cfg(test)]
+mod impairment_compatibility {
+    use super::*;
+
+    #[test]
+    fn disabled_matches_original_channel_for_all_presets() {
+        let frames = vec![vec![0.1; 2000], vec![-0.2; 2000]];
+        let concat: Vec<f32> = frames.iter().flatten().copied().collect();
+        let seed = 42;
+        let sr = SAMPLE_RATE as f32;
+        let power = coppa_channel::mean_power(&concat);
+        for channel in [
+            ChannelSpec::Awgn,
+            ChannelSpec::Watterson(WattersonPreset::Good),
+            ChannelSpec::Watterson(WattersonPreset::Moderate),
+            ChannelSpec::Watterson(WattersonPreset::Poor),
+        ] {
+            let faded = match channel {
+                ChannelSpec::Awgn => concat.clone(),
+                ChannelSpec::Watterson(preset) => coppa_channel::watterson::watterson(
+                    &concat,
+                    sr,
+                    &preset.config(),
+                    seed ^ 0x3333_3333_3333_3333,
+                ),
+            };
+            let original = coppa_channel::awgn_ref_seeded(
+                &faded,
+                30.0,
+                power,
+                sr,
+                seed ^ 0x5555_5555_5555_5555,
+            );
+            let expected: Vec<Vec<f32>> = original.chunks(2000).map(<[f32]>::to_vec).collect();
+            assert_eq!(
+                apply_transfer_channel(&frames, channel, 30.0, seed),
+                expected
+            );
+        }
     }
 }

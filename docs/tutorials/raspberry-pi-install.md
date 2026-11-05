@@ -52,7 +52,7 @@ Pick the `coppad` features for the way you will run it:
 | Feature | When you need it |
 |---|---|
 | `cpal-backend` | Always. Without it coppad runs but moves no audio. |
-| `gpio-ptt` | `ptt_method = "gpio:<pin>"` |
+| `gpio-ptt` | `ptt_method = "gpio:<chip>:<line>"` |
 | `serial-ptt` | `ptt_method = "serial:<port>:<dtr\|rts>"` (needs `libudev-dev`) |
 | `websocket` | The WebSocket JSON API (`[host] websocket_enabled`) |
 | `mdns` | Finding the Pi as `coppad.local` (`[host] mdns_enabled`); turns on `websocket` |
@@ -79,7 +79,7 @@ to list sound devices.
 ## 4. Create the service user
 
 coppad runs as a dedicated system user, `coppa`, in the groups that own sound
-cards (`audio`), serial ports (`dialout`) and sysfs GPIO (`gpio`):
+cards (`audio`), serial ports (`dialout`) and GPIO (`gpio`):
 
 ```bash
 sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin \
@@ -216,31 +216,41 @@ The command contains no `$` or `%`, so systemd passes it to bash unchanged.
 A GPIO pin drives a transistor or relay that keys the radio. Never connect a
 GPIO pin straight to the rig's PTT line.
 
-The number in `ptt_method` is the kernel's sysfs GPIO number, not the BCM pin
-number: it is the GPIO chip's base plus the BCM pin. On Raspberry Pi OS with
-kernel 6.6 or later, the Pi 4's chip is registered at base 512, so BCM GPIO 17
-is sysfs GPIO 529. Read the base on your Pi rather than assuming it:
+coppad drives GPIO PTT through the GPIO character device (`/dev/gpiochipN`).
+`ptt_method` names a chip and a line on it: `gpio:<chip>:<line>`. The chip is
+a label, a name such as `gpiochip0`, or a path such as `/dev/gpiochip0`. On a
+Pi's header chip the line is the BCM GPIO number. Find the chip and line with
+the `gpiod` tools:
 
 ```bash
-grep -H . /sys/class/gpio/gpiochip*/label /sys/class/gpio/gpiochip*/base
+sudo apt install gpiod
+gpiodetect
+gpioinfo
 ```
 
-Take the `base` of the chip whose `label` is `pinctrl-bcm2711` and add the BCM
-pin. For BCM 17 on a base of 512:
+On a Pi 4, `gpiodetect` lists `pinctrl-bcm2711` with 58 lines, so BCM GPIO 17
+is:
 
 ```toml
 [radio]
-ptt_method = "gpio:529"
+ptt_method = "gpio:pinctrl-bcm2711:17"
 ```
 
-Raspberry Pi OS's udev rule (`99-com.rules`) gives the `gpio` group access to
-each pin as it is exported. It does so a moment after the export, so coppad
-waits up to 2 s for that access after exporting a pin itself.
+On a Pi 5, use the label `gpiodetect` shows for the header chip. This guide has
+not been run on a Pi 5.
 
-The sysfs GPIO interface is deprecated upstream, though still built into
-Raspberry Pi kernels. Test PTT on your image before relying on it, and use
-rigctld if a future kernel drops it. coppad must be built with the
+coppad requests the line at its RX level, as consumer `coppad`; its PTT
+guardian uses `coppad-guardian`, so `gpioinfo` shows who holds the line. A
+line another process holds is retried for 2 s, after which coppad names the
+holder. After coppad lets go of the line, its level is up to the kernel's GPIO
+driver: coppad drives it to RX first. coppad must be built with the
 `gpio-ptt` feature.
+
+**The older sysfs form.** `ptt_method = "gpio:529"` (the kernel's sysfs GPIO
+number: the chip's base, 512 on a Pi 4 with kernel 6.6 or later, plus the BCM
+pin) still works where the kernel has sysfs GPIO, and logs a warning naming the
+new form. The sysfs interface is deprecated upstream; where the kernel lacks
+it, coppad refuses to start and names the `gpio:<chip>:<line>` form to use.
 
 ### Serial (DTR or RTS)
 
@@ -311,13 +321,23 @@ UDP port 5353 through any firewall. A Linux client needs nss-mdns to resolve
 
 ## 9. Change the configuration
 
-coppad has no reload. Edit the file, check it, then restart:
+Edit the file, check it, then reload. coppad re-reads the file on SIGHUP
+and applies the settings it can change while running:
 
 ```bash
 sudoedit /etc/coppa/coppad.toml
 sudo -u coppa coppad --config /etc/coppa/coppad.toml --check
-sudo systemctl restart coppad
+sudo systemctl reload coppad
+journalctl -u coppad -n 5   # a restart_required= line means: sudo systemctl restart coppad
 ```
+
+[OPERATING.md](../OPERATING.md#reloading-the-configuration) lists which
+settings a reload applies. Audio devices, PTT method and listener ports need
+`sudo systemctl restart coppad`.
+
+To run a second coppad on the same Pi (for example, one radio on HF and one
+on VHF), use the template unit `contrib/coppad@.service`; see
+"More than one coppad" in `contrib/README.md`.
 
 ## 10. What the unit does
 
@@ -340,17 +360,19 @@ sudo systemctl restart coppad
   the guardian does and does not cover.
 - **A quick restart:** a guardian from the previous run can still be exiting
   when the new coppad starts. systemd then logs `Found left-over process ...
-  Ignoring.`, which is expected. With GPIO PTT, a guardian that is releasing
-  the pin also unexports it, which could pull the pin away from a coppad that
-  has just started. So if a stop had to end in a SIGKILL while transmitting,
-  use `sudo systemctl stop coppad`, wait a few seconds, then
-  `sudo systemctl start coppad`, rather than `systemctl restart`.
+  Ignoring.`, which is expected. With the character-device GPIO form, a line
+  the old guardian still holds is retried for 2 s. With the older sysfs form,
+  a guardian that is releasing the pin also unexports it, which could pull the
+  pin away from a coppad that has just started. So with that form, if a stop
+  had to end in a SIGKILL while transmitting, use `sudo systemctl stop coppad`,
+  wait a few seconds, then `sudo systemctl start coppad`, rather than
+  `systemctl restart`.
 - **Hardening:** the unit sets `NoNewPrivileges`, `ProtectSystem=strict`,
   `ProtectHome`, `PrivateTmp`, `ProtectControlGroups`, `ProtectKernelModules`,
   `ProtectKernelLogs`, `ProtectHostname` and `RestrictSUIDSGID`. It
   deliberately omits `ProtectKernelTunables` (it makes `/sys` read-only, so
-  GPIO PTT fails), `PrivateDevices` (it hides the sound card and serial
-  ports), `ProtectClock`, `DeviceAllow` and `DevicePolicy` (below systemd 252
+  the older sysfs GPIO form fails), `PrivateDevices` (it hides the sound card,
+  serial ports and GPIO chips), `ProtectClock`, `DeviceAllow` and `DevicePolicy` (below systemd 252
   `ProtectClock` alone shuts off every device except the RTC), and
   `DynamicUser` (there would be no fixed user to put in the device groups).
 - **Groups:** every group in `SupplementaryGroups=audio dialout gpio` must
@@ -366,8 +388,12 @@ sudo systemctl restart coppad
 |---|---|---|
 | `failed to open the default input device ...` | `[audio] input_device` is empty, and a Pi 4 has no built-in input | Set it to your USB card's name (step 6) |
 | `audio input device "..." not found ([audio] input_device); available input devices: ...` | The name matches no device | Use part of a name from the list |
-| `failed to open GPIO PTT pin N: failed to export GPIO pin N: Permission denied (os error 13)` | The user is not in `gpio` (or `gpio` is missing from `SupplementaryGroups`) | `sudo usermod -aG gpio coppa`, then restart |
-| `failed to open GPIO PTT pin N: failed to export GPIO pin N: Invalid argument (os error 22)` | `N` is a BCM pin number, not the sysfs number | Add the chip base (step 7, GPIO) |
+| `failed to open GPIO PTT line CHIP:N: failed to read GPIO chip /dev/gpiochip0: ... Permission denied (os error 13)` | The user is not in `gpio` (or `gpio` is missing from `SupplementaryGroups`) | `sudo usermod -aG gpio coppa`, then restart |
+| `failed to open GPIO PTT line CHIP:N: no GPIO chip matches "CHIP"; this system has ...` | No chip has that label, name or path | Use a chip from the list (step 7, GPIO) |
+| `failed to open GPIO PTT line CHIP:N: the line is in use by "..."` | Another program holds the line | Stop it (`gpioinfo` names it), then restart |
+| `ptt_method = "gpio:N" needs the sysfs GPIO interface ...` | The kernel has no sysfs GPIO | Use the `gpio:<chip>:<line>` form the message names |
+| `failed to open GPIO PTT pin N: failed to export GPIO pin N: Permission denied (os error 13)` | Older sysfs form: the user is not in `gpio` | `sudo usermod -aG gpio coppa`, then restart |
+| `failed to open GPIO PTT pin N: failed to export GPIO pin N: Invalid argument (os error 22)` | Older sysfs form: `N` is a BCM pin number, not the sysfs number | Use `gpio:<chip>:<line>` instead (step 7, GPIO) |
 | `failed to open serial PTT port ...: failed to open serial port ...: Permission denied` | The user is not in `dialout` | `sudo usermod -aG dialout coppa`, then restart |
 | `Failed to connect to rigctld; PTT is disabled ...`, then `Daemon running degraded` | rigctld was not listening when coppad started | Start rigctld, add the drop-in from step 7, restart coppad |
 | `status=216/GROUP` in `systemctl status` | A group in `SupplementaryGroups` does not exist | Remove it from the unit (step 10) |
