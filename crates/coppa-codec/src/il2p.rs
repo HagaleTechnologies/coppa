@@ -304,10 +304,13 @@ impl Slicer {
 }
 
 /// Streaming IL2P receiver. Input is mono 48 kHz audio; output excludes FCS.
-/// Four staggered symbol windows allow arbitrary initial sample alignment.
+/// Four staggered timing loops follow tone transitions throughout each packet.
 #[derive(Debug)]
 pub struct Demodulator {
-    windows: [[f32; 4]; 4],
+    history: [[f32; 4]; 40],
+    window: [f32; 4],
+    timing: [f32; 4],
+    previous_bit: u8,
     phase: [f32; 2],
     samples: usize,
     slicers: [Slicer; 4],
@@ -323,7 +326,10 @@ impl Demodulator {
     /// Start with no partial or queued frames.
     pub fn new() -> Self {
         Self {
-            windows: [[0.0; 4]; 4],
+            history: [[0.0; 4]; 40],
+            window: [0.0; 4],
+            timing: [0.0, 10.0, 20.0, 30.0],
+            previous_bit: 0,
             phase: [0.0; 2],
             samples: 0,
             slicers: std::array::from_fn(|_| Slicer::default()),
@@ -342,32 +348,50 @@ impl Demodulator {
             ];
             self.phase[0] = (self.phase[0] + TAU * 1200.0 / 48000.0) % TAU;
             self.phase[1] = (self.phase[1] + TAU * 2200.0 / 48000.0) % TAU;
-            for (lane, w) in self.windows.iter_mut().enumerate() {
-                if self.samples >= lane * 10 {
-                    for (a, b) in w.iter_mut().zip(products) {
-                        *a += b;
-                    }
-                }
+            // A sliding one-symbol correlator supplies a tone decision every
+            // sample. Its delay is half a symbol, shared by both the transition
+            // detector and the bit sampler below.
+            let slot = self.samples % 40;
+            for (i, product) in products.iter().enumerate() {
+                self.window[i] += product - self.history[slot][i];
             }
+            self.history[slot] = products;
             self.samples += 1;
-            if self.samples % 10 != 0 {
-                continue;
-            }
-            let lane = (self.samples / 10) % 4;
-            if self.samples < 40 + lane * 10 {
-                continue;
-            }
-            let w = self.windows[lane];
-            self.windows[lane] = [0.0; 4];
+            let w = self.window;
             let bit = u8::from(w[0] * w[0] + w[1] * w[1] >= w[2] * w[2] + w[3] * w[3]);
-            for f in self.slicers[lane].bit(bit) {
-                if !self
-                    .last
-                    .as_ref()
-                    .is_some_and(|(t, last)| self.samples - t <= 40 && *last == f)
-                {
-                    self.frames.push(f.clone());
-                    self.last = Some((self.samples, f));
+            let transition = bit != self.previous_bit;
+            self.previous_bit = bit;
+            for lane in 0..4 {
+                // Pull each clock toward a symbol boundary on transitions.
+                // Sampling halfway between boundaries centers the correlator
+                // on the received symbol. Continuing these corrections prevents
+                // independent audio clocks from drifting across long packets.
+                let clock = &mut self.timing[lane];
+                if transition {
+                    let error = if *clock < 20.0 {
+                        -*clock
+                    } else {
+                        40.0 - *clock
+                    };
+                    *clock += 0.1 * error;
+                }
+                let previous = *clock;
+                *clock += 1.0;
+                if *clock >= 40.0 {
+                    *clock -= 40.0;
+                }
+                if previous >= 20.0 || *clock < 20.0 || self.samples < 40 {
+                    continue;
+                }
+                for f in self.slicers[lane].bit(bit) {
+                    if !self
+                        .last
+                        .as_ref()
+                        .is_some_and(|(t, last)| self.samples - t <= 40 && *last == f)
+                    {
+                        self.frames.push(f.clone());
+                        self.last = Some((self.samples, f));
+                    }
                 }
             }
         }
@@ -510,6 +534,34 @@ mod tests {
         corrupt[4] ^= 1;
         corrupt[5] ^= 2;
         assert_eq!(decode(&corrupt[4..]), None);
+    }
+    #[test]
+    fn maximum_packet_tracks_sample_clock_drift() {
+        let f = include_bytes!("../../../testdata/il2p/maximum.ax25").to_vec();
+        let audio = modulate(&f).unwrap();
+        for ratio in [1.0, 1.000075, 0.999925] {
+            // Linear sample-rate conversion models independent TX/RX clocks.
+            let resampled: Vec<f32> = (0..((audio.len() - 1) as f64 * ratio) as usize)
+                .map(|i| {
+                    let position = i as f64 / ratio;
+                    let index = position as usize;
+                    let fraction = (position - index as f64) as f32;
+                    audio[index] * (1.0 - fraction) + audio[index + 1] * fraction
+                })
+                .collect();
+            for offset in [0, 7, 19, 35] {
+                let mut rx = Demodulator::new();
+                rx.process(&vec![0.0; offset]);
+                for chunk in resampled.chunks(137) {
+                    rx.process(chunk);
+                }
+                assert_eq!(
+                    rx.take_frames(),
+                    vec![f.clone()],
+                    "ratio {ratio}, offset {offset}"
+                );
+            }
+        }
     }
     #[test]
     fn streaming_audio_chunks_and_reset() {
