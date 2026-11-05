@@ -538,6 +538,24 @@ mod tests {
     }
 
     #[test]
+    fn waterfall_cfo150_level_2() {
+        for (sign, cfo_hz) in [-150.0, 150.0].into_iter().enumerate() {
+            let points = run_scenario(&Scenario {
+                level: 2,
+                channel: ChannelSpec::Awgn,
+                snr_db_points: vec![12.0],
+                trials: 20,
+                seed: 0x2710 + 20_000 + sign as u64 * 10_000,
+                profile_override: Some(coppa_codec::ofdm::CoppaProfile::hf_standard()),
+                cfo_hz,
+                sco_ppm: 0.0,
+                ssb: false,
+            });
+            assert!(points[0].frame_errors <= 1, "CFO {cfo_hz}: {points:?}");
+        }
+    }
+
+    #[test]
     fn waterfall_bracket_level_2() {
         bracket(2, 0.0, 8.0, 580.0);
     }

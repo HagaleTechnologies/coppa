@@ -868,7 +868,7 @@ impl CoppaModem {
         };
 
         // 1. Sync: streaming O(1) detector (see `sync_detector` module docs), which now
-        // also produces a two-stage Moose CFO estimate (`cfo_hz`, ±50 Hz range) alongside
+        // also produces a two-stage Moose CFO estimate (`cfo_hz`, ±171 Hz standard-HF hypothesis-search range) alongside
         // timing — see `sync::estimate_cfo_two_stage` and `SyncDetector::estimate_cfo_from_ring`.
         let candidate = SyncDetector::detect_all(&self.profile, self.version, samples)
             .into_iter()
@@ -1098,11 +1098,11 @@ impl CoppaModem {
     /// `±EST_WINDOW`-symbol window `demodulate_header_llrs`'s non-Kalman
     /// fallback uses, adds any in-window virtual-pilot observations
     /// (`H_est = y/x̄`, weight `|x̄|²`), re-fits via
-    /// [`Self::estimate_and_equalize`], and re-extracts data/noise exactly as
+    /// `Self::estimate_and_equalize`, and re-extracts data/noise exactly as
     /// `demodulate_frame`'s payload pass does. Returns `(vec![], vec![])` if no
     /// frame has been demodulated yet (or the workspace was somehow empty).
     ///
-    /// See [`LastFrameWorkspace`]'s doc for why this reuses
+    /// See `LastFrameWorkspace`'s doc for why this reuses
     /// `DelayDomainEstimator` (via `estimate_and_equalize`) rather than the
     /// live per-frame `KalmanLagSmoother`.
     pub fn reequalize_with_virtual_pilots(
@@ -1759,7 +1759,7 @@ impl CoppaModem {
     /// `demodulate_frame` itself uses (`demodulate_header_llrs` + `header_fec::
     /// decode_header_soft`), so both share one implementation.
     ///
-    /// Used standalone by [`super::transceiver::CoppaTransceiver::demodulate_header`],
+    /// Used standalone by `super::transceiver::CoppaTransceiver::demodulate_header`,
     /// which `StreamingReceiver` (`coppa-protocol`) calls to learn a candidate frame's
     /// speed level (and therefore its total length) before buffering the whole frame
     /// for a full [`Self::demodulate_frame`]/`receive` pass. Unlike `demodulate_frame`,
