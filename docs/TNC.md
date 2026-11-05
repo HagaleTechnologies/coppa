@@ -194,3 +194,22 @@ paced relay). Exact ID selection and stereo channel wiring are covered by
 deterministic tests; they still need checking on a physical radio interface.
 The `modprobe` and `hw:Loopback` lines were not run in that container because
 it had no sound modules.
+
+## FX.25 forward error correction
+
+Use `coppa tnc --fx25 --vox` to transmit FX.25. Reception automatically recognizes
+ordinary AX.25 and all eleven defined FX.25 profiles with 16, 32 or 64 parity
+bytes. Default transmission remains ordinary AX.25.
+
+FX.25 transmission selects the shortest fitting block with 32 parity bytes,
+using tags 8, 7, 6 or 5. The capacity is at most 223 data bytes including FCS,
+bit stuffing and inner HDLC flags. It is smaller for payloads with many one bits.
+An oversized KISS frame is sent intact as ordinary AX.25, with one warning:
+`TNC frame exceeds FX.25 capacity; transmitting plain AX.25`.
+
+The additive Rust APIs are `coppa_codec::afsk::modulate_fx25`, accepting a frame
+including its FCS, and `coppa_daemon::tnc::run_tnc_with_fx25`. Existing `run_tnc`
+and `TncConfig` callers keep their default behavior. Encoding rejects invalid FCS.
+See [the interoperability record](testing/tnc-fx25-direwolf.md) for independent
+Direwolf fixtures, correction tests and external decoder verification. These
+controlled byte errors do not measure general noisy-audio or RF performance.

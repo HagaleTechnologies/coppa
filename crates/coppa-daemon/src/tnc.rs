@@ -227,6 +227,18 @@ fn kiss_to_air(payload: &[u8]) -> Vec<f32> {
     coppa_codec::afsk::modulate(&coppa_codec::afsk::append_fcs(payload))
 }
 
+fn kiss_to_air_with_fx25(payload: &[u8]) -> Result<Vec<f32>> {
+    let frame = coppa_codec::afsk::append_fcs(payload);
+    match coppa_codec::afsk::modulate_fx25(&frame) {
+        Ok(audio) => Ok(audio),
+        Err(coppa_codec::afsk::Fx25Error::FrameTooLong) => {
+            tracing::warn!("TNC frame exceeds FX.25 capacity; transmitting plain AX.25");
+            Ok(kiss_to_air(payload))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Turn a decoded on-air frame into a KISS data payload.
 ///
 /// KISS frames carry no FCS: the TNC adds it on transmit (see
@@ -246,6 +258,16 @@ fn air_to_kiss(mut frame: Vec<u8>) -> Vec<u8> {
 /// - PTT control (keys the radio during TX)
 /// - CPAL audio I/O (optional, enabled with `cpal-backend` feature)
 pub async fn run_tnc(config: TncConfig) -> Result<()> {
+    run_tnc_mode(config, false).await
+}
+
+/// Run the TNC with FX.25 transmit and automatic AX.25/FX.25 receive.
+/// Frames exceeding the stuffed FX.25 capacity fall back to ordinary AX.25.
+pub async fn run_tnc_with_fx25(config: TncConfig) -> Result<()> {
+    run_tnc_mode(config, true).await
+}
+
+async fn run_tnc_mode(config: TncConfig, fx25: bool) -> Result<()> {
     #[cfg(not(feature = "cpal-backend"))]
     for (key, value) in [
         ("audio_device", config.audio_device.as_deref()),
@@ -549,7 +571,8 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
             // Not polled while the backlog is full, so later frames wait in
             // the KISS server's bounded channel.
             Some(ax25_data) = tx_receiver.recv(), if tnc_tx.has_room() => {
-                tnc_tx.submit(kiss_to_air(&ax25_data));
+                let audio = if fx25 { kiss_to_air_with_fx25(&ax25_data)? } else { kiss_to_air(&ax25_data) };
+                tnc_tx.submit(audio);
                 tnc_tx.poll(Instant::now(), &mut audio_out_prod, ptt.as_mut());
             }
 
@@ -992,5 +1015,71 @@ mod tests {
         h.tick(0);
         assert!(!h.tx.is_busy());
         assert_eq!(*h.ptt.0.lock().unwrap(), vec![PttState::Tx, PttState::Rx]);
+    }
+
+    #[test]
+    fn fx25_kiss_roundtrip_and_overflow_fallback() {
+        for payload in [b"COP-114".to_vec(), vec![0xff; 200], vec![0; 400]] {
+            let audio = kiss_to_air_with_fx25(&payload).unwrap();
+            if payload.len() >= 200 {
+                assert_eq!(audio, kiss_to_air(&payload));
+            }
+            let mut demod = coppa_codec::afsk::Demodulator::new();
+            for chunk in audio.chunks(1024) {
+                demod.process(chunk);
+            }
+            let frames: Vec<_> = demod.take_frames().into_iter().map(air_to_kiss).collect();
+            assert_eq!(frames, vec![payload]);
+        }
+    }
+    #[test]
+    fn old_tnc_config_literal_and_entrypoint_remain_compatible() {
+        let config = TncConfig {
+            kiss_port: 8001,
+            bind_address: "127.0.0.1".into(),
+            rig_address: None,
+            vox_mode: true,
+            sample_rate: 48000,
+            audio_device: None,
+            input_device_id: None,
+            output_device_id: None,
+            input_channel: 0,
+            output_channel: 0,
+        };
+        let future = run_tnc(config);
+        drop(future);
+    }
+    #[test]
+    fn damaged_direwolf_frame_reaches_kiss_without_fcs() {
+        // Exercise exactly the service loop's FCS-removal conversion on the
+        // independently generated damaged audio fixture.
+        for (bytes, offset) in [
+            (
+                include_bytes!("../../coppa-codec/tests/fixtures/fx25/direwolf-clean.wav")
+                    .as_slice(),
+                20,
+            ),
+            (
+                include_bytes!("../../coppa-codec/tests/fixtures/fx25/direwolf-damaged.wav")
+                    .as_slice(),
+                0,
+            ),
+        ] {
+            let samples: Vec<_> = bytes[44..]
+                .chunks_exact(2)
+                .map(|s| i16::from_le_bytes([s[0], s[1]]) as f32 / 32768.0)
+                .collect();
+            let mut demod = coppa_codec::afsk::Demodulator::new();
+            for chunk in samples[offset..].chunks(1024) {
+                demod.process(chunk);
+            }
+            let frames: Vec<_> = demod.take_frames().into_iter().map(air_to_kiss).collect();
+            let mut expected = vec![
+                0x82, 0xa0, 0xa4, 0xa6, 0x40, 0x40, 0xe0, 0x9c, 0x60, 0x86, 0x82, 0x98, 0x98, 0xe1,
+                3, 0xf0,
+            ];
+            expected.extend(b"coppa COP-114 FX25 fixture\n");
+            assert_eq!(frames, vec![expected]);
+        }
     }
 }

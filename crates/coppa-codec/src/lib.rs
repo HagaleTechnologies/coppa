@@ -79,6 +79,7 @@ pub use error::CodecError;
 
 pub mod afsk;
 pub mod bpsk;
+mod fx25;
 pub mod ofdm;
 pub mod psk8;
 pub mod qam16;

@@ -28,3 +28,10 @@ The method and the latest counts are in
   not UTF-8. Strip escapes, decode lossily, and count `[0] ` or `[0.N] ` lines only.
 - Coppa's count moves by up to 28 packets with the start offset. Compare changes against the
   spread the report prints.
+- **FX.25 vectors and audio have separate proofs (COP-114).** See
+  [the FX.25 record](../../docs/testing/tnc-fx25-direwolf.md) and
+  [regeneration instructions](../../tools/fx25-interop/README.md). Controlled
+  damaged-symbol correction and Direwolf's zero-error decode of coppa audio
+  prove wire compatibility. They do not measure acquisition on noisy audio.
+  The untouched Direwolf WAV needs a 20-sample receive-origin offset with the
+  existing fixed-window demodulator.
