@@ -577,7 +577,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:b352ed5416cfb4361ca06c059b10fc089ffed56f1474c9857b8e9cc1d588c949",
+      "hash": "sha256:dac783ef22958480dba0c921ccab69b90dcb440ff6b46019c29afeca451e953d",
       "id": "tnc-direwolf-benchmark",
       "kind": "gotcha",
       "links": [
@@ -590,12 +590,14 @@
         "tools/tnc-bench/run.sh",
         "crates/coppa-bench/src/afsk_direwolf.rs",
         "crates/coppa-codec/src/afsk.rs",
-        "docs/testing/tnc-direwolf-wa8lmf.md"
+        "docs/testing/tnc-direwolf-wa8lmf.md",
+        "docs/testing/tnc-fx25-direwolf.md",
+        "tools/fx25-interop/run.sh"
       ],
       "status": "current",
       "title": "What will bite you when measuring coppa's TNC against Direwolf?",
-      "verified_commit": "2526b50",
-      "verified_date": "2026-11-03",
+      "verified_commit": "25ee0e0",
+      "verified_date": "2026-11-05",
       "visibility": "public"
     },
     {
