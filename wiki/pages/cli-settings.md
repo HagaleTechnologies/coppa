@@ -13,8 +13,8 @@ sources:
   - coppad.toml.example
   - docs/tutorials/getting-started.md
 verified:
-  commit: b5144e3
-  date: 2026-10-28
+  commit: ee55ef488c5070227b113a0813f2c5c17c5cc877
+  date: 2026-11-05
 links:
 ---
 The full setup and search order are in [Getting started](../../docs/tutorials/getting-started.md#persisting-your-cli-settings).
