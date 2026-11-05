@@ -12,17 +12,24 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 serialport = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# COP-85: GPIO character device (/dev/gpiochipN) PTT, pure Rust, no libgpiod.
+gpiocdev = { version = "0.8", optional = true, default-features = false, features = ["uapi_v2"] }
+
 [features]
 default = []
 # Real hardware PTT backends, following the same one-feature-per-backend
 # pattern as coppa-audio's `cpal-backend`. Neither is compiled by default.
 #
 # `serial-ptt`: DTR/RTS PTT via the `serialport` crate (any OS it supports).
-# `gpio-ptt`: raw `/sys/class/gpio` sysfs PTT; real hardware access is
-# Linux-only (see `ptt_gpio`'s module docs), but the module itself compiles
-# on any OS so its state-machine logic can be unit-tested with a mock.
+# `gpio-ptt`: GPIO PTT through the Linux GPIO character device
+# (`gpio:<chip>:<line>`, via `gpiocdev`), and through the deprecated
+# `/sys/class/gpio` sysfs interface for the old `gpio:<number>` form. Real
+# hardware access is Linux-only (see `ptt_gpio`'s module docs), but the module
+# itself compiles on any OS so its state-machine and chip-selection logic can
+# be unit-tested with a mock.
 serial-ptt = ["dep:serialport"]
-gpio-ptt = []
+gpio-ptt = ["dep:gpiocdev"]
 
 [lints]
 workspace = true

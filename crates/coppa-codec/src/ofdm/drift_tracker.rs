@@ -33,7 +33,7 @@
 //! corrupted the LDPC-facing noise variance. This tracker's `advance`
 //! weights each observation by its own `r` (Kalman gain naturally
 //! down-weights a high-`r` observation) and additionally rejects any
-//! observation whose innovation exceeds [`DRIFT_INNOVATION_CLAMP`]
+//! observation whose innovation exceeds `DRIFT_INNOVATION_CLAMP`
 //! regardless of its claimed `r` — a defensive guard mirroring
 //! `coppa_modem.rs`'s `SCO_PER_SYMBOL_CLAMP` pattern for the same class of
 //! problem.

@@ -14,6 +14,7 @@
 
 #![warn(missing_docs, missing_debug_implementations)]
 
+pub mod impairments;
 pub mod watterson;
 
 use coppa_dsp::fft::FftProcessor;
@@ -160,7 +161,7 @@ const SSB_FILTER_TAPS: usize = 601;
 /// "communications quality" voice passband); this models that constraint for
 /// benching against a realistic channel instead of an idealized full-band one.
 ///
-/// Reuses [`coppa_dsp::fir::design_bandpass`] at [`SSB_FILTER_TAPS`] taps — see
+/// Reuses [`coppa_dsp::fir::design_bandpass`] at `SSB_FILTER_TAPS` taps — see
 /// that constant's doc for why 601 (not fewer) is justified here by direct
 /// measurement rather than assumption.
 pub fn ssb_filter(samples: &[f32], sample_rate: f32) -> Vec<f32> {

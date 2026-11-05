@@ -16,12 +16,14 @@ const AFTER_HELP: &str = "\
 Without CONFIG or --config, use the first file found of ./coppad.toml,
 $XDG_CONFIG_HOME/coppa/coppad.toml (default ~/.config/coppa/coppad.toml) and
 /etc/coppa/coppad.toml; otherwise use built-in defaults.
+With --instance NAME, look for coppad-NAME.toml in the same places.
 Explicit config paths must exist. --check does not verify hardware or runtime settings.";
 
 #[cfg(windows)]
 const AFTER_HELP: &str = "\
 Without CONFIG or --config, use the first file found of ./coppad.toml and
 %APPDATA%\\coppa\\coppad.toml; otherwise use built-in defaults.
+With --instance NAME, look for coppad-NAME.toml in the same places.
 Explicit config paths must exist. --check does not verify hardware or runtime settings.";
 
 // No doc comment here: clap would turn it into the `--help` long description.
@@ -45,6 +47,15 @@ pub struct Cli {
     /// Check TOML syntax and field types, then exit
     #[arg(long, conflicts_with = "print_default_config")]
     pub check: bool,
+
+    /// Name this coppad: prefix its log lines, look for coppad-NAME.toml
+    #[arg(
+        long,
+        value_name = "NAME",
+        value_parser = parse_instance,
+        conflicts_with_all = ["print_default_config", "tnc"]
+    )]
+    pub instance: Option<String>,
 
     /// Override RUST_LOG
     #[arg(long, value_name = "LEVEL", value_enum)]
@@ -160,6 +171,11 @@ impl Cli {
             Mode::Run(self.config_source())
         }
     }
+}
+
+/// COP-85: `--instance` values follow `config::check_instance_name`.
+fn parse_instance(name: &str) -> Result<String, String> {
+    crate::config::check_instance_name(name).map(|()| name.to_string())
 }
 
 /// Choose the tracing filter: `--log-level` wins; otherwise `rust_log` (the
@@ -391,9 +407,63 @@ mod tests {
             "--version",
             "--help",
             "[CONFIG]",
+            "--instance <NAME>",
+            "Name this coppad: prefix its log lines, look for coppad-NAME.toml",
+            "With --instance NAME, look for coppad-NAME.toml in the same places.",
         ] {
             assert!(help.contains(flag), "help lacks {flag}:\n{help}");
         }
+        for line in AFTER_HELP.lines() {
+            assert!(line.len() < 90, "help line too long: {line}");
+        }
+    }
+
+    #[test]
+    fn instance_is_accepted_with_run_check_and_the_guardian() {
+        let cli = parse(&["--instance", "hf"]).unwrap();
+        assert_eq!(cli.instance.as_deref(), Some("hf"));
+        assert_eq!(cli.mode(), Mode::Run(ConfigSource::Implicit));
+
+        let cli = parse(&["--instance", "hf", "--check"]).unwrap();
+        assert_eq!(cli.instance.as_deref(), Some("hf"));
+        assert_eq!(cli.mode(), Mode::Check(ConfigSource::Implicit));
+
+        let cli = parse(&["--instance", "hf", "-c", "x.toml"]).unwrap();
+        assert_eq!(cli.instance.as_deref(), Some("hf"));
+        assert_eq!(
+            cli.mode(),
+            Mode::Run(ConfigSource::Explicit(PathBuf::from("x.toml")))
+        );
+
+        let cli = parse(&["--ptt-guardian", "gpio:17", "--instance", "hf"]).unwrap();
+        assert_eq!(cli.instance.as_deref(), Some("hf"));
+        assert!(matches!(cli.mode(), Mode::PttGuardian { .. }));
+    }
+
+    #[test]
+    fn instance_conflicts_with_print_default_config_and_tnc() {
+        for args in [
+            &["--instance", "hf", "--print-default-config"][..],
+            &["--instance", "hf", "--tnc"][..],
+        ] {
+            assert_eq!(error_kind(args), ErrorKind::ArgumentConflict, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_instance_name_is_a_value_error() {
+        assert_eq!(
+            error_kind(&["--instance", "hf_1"]),
+            ErrorKind::ValueValidation
+        );
+        let message = parse(&["--instance", "hf_1"]).unwrap_err().to_string();
+        assert!(
+            message.contains(
+                "invalid value 'hf_1' for '--instance <NAME>': use 1 to 32 letters, digits and \
+                 hyphens, not starting or ending with a hyphen"
+            ),
+            "{message}"
+        );
     }
 
     #[test]
