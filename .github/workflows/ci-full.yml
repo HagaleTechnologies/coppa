@@ -169,6 +169,8 @@ jobs:
       - name: Install ALSA dev headers (for cpal)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy KISS TNC without audio backend
+        run: cargo clippy -p coppa-daemon --features kiss-tnc -- -D warnings
 
   msrv:
     name: MSRV Check
