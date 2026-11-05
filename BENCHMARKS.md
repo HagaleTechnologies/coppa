@@ -3296,7 +3296,6 @@ at 367, `L2_poor25` at 274). 300 s each of white noise, SSB-band noise and a
 AWGN simulation, with no Watterson sweep of the streaming path and no
 hardware or on-air result.
 
-<<<<<<< HEAD
 ### `--cfo ±150` sweep (AWGN + ±150 Hz carrier offset, level 2)
 
 COP-128, 2026-11-04. `hf_standard`, seed `0x00C0FFEE`, 20 trials per cell,
@@ -3324,7 +3323,7 @@ All observed errors were sync failures. Wilson 95% FER intervals are
 cannot establish either a 10% or a 1% FER ceiling at 95% confidence.
 At 12 dB both signs decoded all 20 frames. The CI guard
 `waterfall_cfo150_level_2` allows at most one error per 20-trial sign.
-=======
+
 ## COP-133: Same-frame residual experiment
 
 2026-11-04. Partial implementation; the rate-loop bar remains unmet. The candidate
@@ -3693,4 +3692,3 @@ that airtime. Airtime excludes ARQ, turnaround, CPU time and session overhead.
 Failed transfers still have rows. These small synthetic runs impose no minimum
 recovery threshold and make no confidence-bound or real-radio performance claim.
 Physical rig/ALC behavior and group-delay ripple remain unmodeled.
->>>>>>> e9e035b3e836fe5fc0790724e9c72bfa281e62c9
