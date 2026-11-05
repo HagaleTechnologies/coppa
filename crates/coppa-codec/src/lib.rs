@@ -9,9 +9,7 @@
 //!   `ChannelEstimator` traits,
 //! - `afsk`: the AFSK 1200 (Bell 202) modem with HDLC framing and NRZI coding
 //!   that the KISS TNC uses.
-<<<<<<< HEAD
 //! - `g3ruh`: the 9600 baud direct-FSK modem for the KISS TNC.
-=======
 //!
 //! # Example
 //!
@@ -55,7 +53,6 @@
 //!     .collect();
 //! assert_eq!(rx_bits, bits[..64]);
 //! ```
->>>>>>> 7f224a3e902d552a3406e69e132d14832cb1d30e
 
 //! # Errors
 //!
