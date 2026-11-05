@@ -208,3 +208,15 @@ fn plain_candidate_survives_failed_rs_and_variable_chunks_with_noise() {
     }
     assert_eq!(frames, vec![expected]);
 }
+
+#[test]
+fn correctable_embedded_tag_preserves_original_reception() {
+    let mut block = fixture("tag07.bin");
+    // Eight erroneous symbols remain within tag 7's sixteen-byte limit.
+    // The false long tag must not cancel the original reception.
+    block[8..16].copy_from_slice(&TAGS[0].to_le_bytes());
+    assert_eq!(
+        decode(&render(&wire(TAGS[6], &block)), 17),
+        vec![append_fcs(&payload(b"????~~~~\n"))]
+    );
+}

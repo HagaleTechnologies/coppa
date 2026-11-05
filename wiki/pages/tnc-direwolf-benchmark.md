@@ -9,9 +9,11 @@ sources:
   - crates/coppa-bench/src/afsk_direwolf.rs
   - crates/coppa-codec/src/afsk.rs
   - docs/testing/tnc-direwolf-wa8lmf.md
+  - docs/testing/tnc-fx25-direwolf.md
+  - tools/fx25-interop/run.sh
 verified:
-  commit: 2526b50
-  date: 2026-11-03
+  commit: 25ee0e0
+  date: 2026-11-05
 links:
   - overview
 ---

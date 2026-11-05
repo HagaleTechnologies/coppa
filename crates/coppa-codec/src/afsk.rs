@@ -3,7 +3,10 @@
 //! Implements HDLC framing (flags + bit stuffing), NRZI encoding,
 //! and continuous-phase FSK audio generation at 48 kHz.
 //! Also provides a streaming demodulator with correlator-based detection.
-use std::f32::consts::{PI, TAU};
+use std::{
+    collections::VecDeque,
+    f32::consts::{PI, TAU},
+};
 
 use crc::{Crc, CRC_16_IBM_SDLC};
 
@@ -260,13 +263,13 @@ struct ReceivedFrame {
 
 #[derive(Debug)]
 struct FxReception {
-    start: u64,
     profile: crate::fx25::Profile,
-    bits: Vec<u8>,
-    // Plain candidates are delayed only while their enclosing FX block is
-    // incomplete. They survive RS failure and are never payload-time deduped.
-    plain: Vec<ReceivedFrame>,
+    start: u64,
 }
+
+// Every defined profile has at most 255 transmitted bytes. Competing tags
+// retain only start positions; their bits share this one bounded window.
+const FX_WINDOW_BITS: usize = 255 * 8;
 
 // ---------------------------------------------------------------------------
 // Demodulator
@@ -301,7 +304,10 @@ pub struct Demodulator {
 
     fx_tag: u64,
     fx_tag_bits: usize,
-    fx: Option<FxReception>,
+    fx: Vec<FxReception>,
+    fx_bits: VecDeque<u8>,
+    pending_plain: Vec<ReceivedFrame>,
+    delivered_spans: VecDeque<(u64, u64)>,
 
     // Completed frames
     frames: Vec<ReceivedFrame>,
@@ -336,7 +342,10 @@ impl Demodulator {
             hdlc_start: 0,
             fx_tag: 0,
             fx_tag_bits: 0,
-            fx: None,
+            fx: Vec::new(),
+            fx_bits: VecDeque::new(),
+            pending_plain: Vec::new(),
+            delivered_spans: VecDeque::new(),
         }
     }
 
@@ -393,58 +402,84 @@ impl Demodulator {
         }
     }
 
+    fn emit_frame(&mut self, frame: ReceivedFrame) {
+        let span = (frame.start, frame.end);
+        if !self.delivered_spans.contains(&span) {
+            self.delivered_spans.push_back(span);
+            self.frames.push(frame);
+        }
+    }
+
     fn receive_bit(&mut self, bit: u8) {
         self.bit_position += 1;
+        // Keep only reception associations that a maximum-size FX.25 block
+        // could still reproduce. Identical later transmissions have new spans.
+        self.delivered_spans
+            .retain(|&(_, end)| self.bit_position - end <= FX_WINDOW_BITS as u64);
         self.hdlc_process_bit(bit);
-        if let Some(rx) = &mut self.fx {
-            rx.bits.push(bit);
-            if rx.bits.len() == (rx.profile.data + rx.profile.parity) * 8 {
-                let rx = self.fx.take().expect("complete reception");
-                let block: Vec<_> = rx.bits.chunks_exact(8).map(bits_to_byte_lsb).collect();
-                let corrected = crate::fx25::decode(&block, rx.profile).and_then(|data| {
-                    // Reuse exactly the ordinary HDLC/FCS parser, without
-                    // feeding the corrected bits back into tag detection.
-                    let mut parser = Self::new();
-                    for b in data {
-                        for bit in byte_to_bits_lsb(b) {
-                            parser.bit_position += 1;
-                            parser.hdlc_process_bit(bit);
-                        }
+        self.fx_bits.push_back(bit);
+        if self.fx_bits.len() > FX_WINDOW_BITS {
+            self.fx_bits.pop_front();
+        }
+        let candidates = std::mem::take(&mut self.fx);
+        for rx in candidates {
+            let length = (rx.profile.data + rx.profile.parity) * 8;
+            if self.bit_position - rx.start < length as u64 {
+                self.fx.push(rx);
+                continue;
+            }
+            let bits: Vec<_> = self
+                .fx_bits
+                .iter()
+                .skip(self.fx_bits.len() - length)
+                .copied()
+                .collect();
+            let block: Vec<_> = bits.chunks_exact(8).map(bits_to_byte_lsb).collect();
+            let corrected = crate::fx25::decode(&block, rx.profile).and_then(|data| {
+                // Reuse ordinary HDLC/FCS validation without tag detection.
+                let mut parser = Self::new();
+                for b in data {
+                    for bit in byte_to_bits_lsb(b) {
+                        parser.bit_position += 1;
+                        parser.hdlc_process_bit(bit);
                     }
-                    parser.frames.into_iter().next().map(|mut frame| {
-                        frame.start += rx.start;
-                        frame.end += rx.start;
-                        frame
-                    })
+                }
+                parser.frames.into_iter().next().map(|mut frame| {
+                    frame.start += rx.start;
+                    frame.end += rx.start;
+                    frame
+                })
+            });
+            if let Some(frame) = corrected {
+                self.pending_plain.retain(|plain| {
+                    !(plain.start == frame.start
+                        && plain.end == frame.end
+                        && plain.bytes == frame.bytes)
                 });
-                for frame in rx.plain {
-                    if !corrected.as_ref().is_some_and(|corrected| {
-                        corrected.start == frame.start
-                            && corrected.end == frame.end
-                            && corrected.bytes == frame.bytes
-                    }) {
-                        self.frames.push(frame);
-                    }
-                }
-                if let Some(frame) = corrected {
-                    self.frames.push(frame);
-                }
+                self.emit_frame(frame);
+            }
+        }
+        let pending = std::mem::take(&mut self.pending_plain);
+        for frame in pending {
+            if self.fx.iter().any(|rx| {
+                rx.start < frame.start
+                    && frame.end <= rx.start + ((rx.profile.data + rx.profile.parity) * 8) as u64
+            }) {
+                self.pending_plain.push(frame);
+            } else {
+                self.emit_frame(frame);
             }
         }
         self.fx_tag = (self.fx_tag >> 1) | ((bit as u64) << 63);
         self.fx_tag_bits = (self.fx_tag_bits + 1).min(64);
         if self.fx_tag_bits == 64 {
             if let Some(profile) = crate::fx25::find_tag(self.fx_tag) {
-                // Continuously search, even inside a truncated/false block.
-                // A new tag releases any verified ordinary candidates.
-                if let Some(old) = self.fx.take() {
-                    self.frames.extend(old.plain);
-                }
-                self.fx = Some(FxReception {
+                // Keep competing starts: even a correctable damaged block can
+                // contain a second tag. All candidates expire within one window,
+                // with at most one start per incoming bit.
+                self.fx.push(FxReception {
                     start: self.bit_position,
                     profile,
-                    bits: Vec::with_capacity((profile.data + profile.parity) * 8),
-                    plain: Vec::new(),
                 });
             }
         }
@@ -554,10 +589,10 @@ impl Demodulator {
                 start: self.hdlc_start,
                 end: self.bit_position,
             };
-            if let Some(rx) = &mut self.fx {
-                rx.plain.push(frame);
+            if self.fx.is_empty() {
+                self.emit_frame(frame);
             } else {
-                self.frames.push(frame);
+                self.pending_plain.push(frame);
             }
         }
     }
