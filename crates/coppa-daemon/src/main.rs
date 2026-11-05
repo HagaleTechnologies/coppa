@@ -22,11 +22,8 @@ mod event_loop;
 mod level_meter;
 mod logging;
 mod ptt_guardian;
-<<<<<<< HEAD
 mod session_outer;
-=======
 mod signals;
->>>>>>> e9e035b3e836fe5fc0790724e9c72bfa281e62c9
 #[cfg(feature = "websocket")]
 mod spectrum;
 mod startup_report;

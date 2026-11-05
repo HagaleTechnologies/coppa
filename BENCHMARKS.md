@@ -3296,7 +3296,6 @@ at 367, `L2_poor25` at 274). 300 s each of white noise, SSB-band noise and a
 AWGN simulation, with no Watterson sweep of the streaming path and no
 hardware or on-air result.
 
-<<<<<<< HEAD
 ## COP-119: RS(12,6) session fade protection
 
 Measured on 2026-11-04 with workspace version 0.8.0, based on d837c89.
@@ -3442,7 +3441,6 @@ Moderate and Poor are diagnostic-only; their results remain reported above.
 -> rs12-6 ACK-loss poor: 4/5 completed, 790.1 bytes/min
 MET: rs12-6 Moderate completed 5/5 sessions without a drop (required 5/5).
 ```
-=======
 ## COP-133: Same-frame residual experiment
 
 2026-11-04. Partial implementation; the rate-loop bar remains unmet. The candidate
@@ -3811,4 +3809,3 @@ that airtime. Airtime excludes ARQ, turnaround, CPU time and session overhead.
 Failed transfers still have rows. These small synthetic runs impose no minimum
 recovery threshold and make no confidence-bound or real-radio performance claim.
 Physical rig/ALC behavior and group-delay ripple remain unmodeled.
->>>>>>> e9e035b3e836fe5fc0790724e9c72bfa281e62c9

@@ -22,11 +22,8 @@ pub mod level_meter;
 pub mod logging;
 pub mod mdns;
 pub mod ptt_guardian;
-<<<<<<< HEAD
 mod session_outer;
-=======
 pub mod signals;
->>>>>>> e9e035b3e836fe5fc0790724e9c72bfa281e62c9
 #[cfg(feature = "websocket")]
 pub mod spectrum;
 pub mod startup_report;
