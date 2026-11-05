@@ -1,7 +1,7 @@
 #!/bin/sh
 # Usage: run.sh /path/to/pinned/direwolf/source
 set -eu
-root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 source_root=${1:?usage: run.sh DIREWOLF_SOURCE}
 sha=$(git -C "$source_root" rev-parse HEAD)
 [ "$sha" = de293a1f2526ec6639fe31fa411bd4f2319ecdf4 ] || { echo 'Direwolf 1.7 pinned commit required' >&2; exit 1; }
