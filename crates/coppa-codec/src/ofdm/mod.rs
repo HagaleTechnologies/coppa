@@ -172,7 +172,7 @@ pub struct CoppaProfile {
     /// `carrier_offset + 1 + i`. Bins `1..=carrier_offset` are unused guard bins.
     /// Set to 6 on all profiles so HF waveforms sit at 350-2700 Hz, clear of a
     /// typical SSB radio's passband filters (see
-    /// docs/superpowers/plans/2026-07-03-phase1-radio-reality.md Task 1).
+    /// `docs/adr/003-phase1-waveform-break.md`, decision 1).
     pub carrier_offset: usize,
 }
 
@@ -227,7 +227,7 @@ impl CoppaProfile {
     /// Redefined for Phase 1 (carrier_offset=6) to 46 data + 4 pilot carriers (50
     /// active, bins 7..=56, ~350-2800 Hz). This exceeds many radios' narrow TX
     /// filter passbands; hf_wide is documented as marginal for tighter SSB filters
-    /// (see docs/superpowers/plans/2026-07-03-phase1-radio-reality.md Task 1).
+    /// (see `docs/adr/003-phase1-waveform-break.md`, decision 1).
     pub fn hf_wide() -> Self {
         Self {
             fft_size: 960,
@@ -846,8 +846,8 @@ mod tests {
     #[test]
     fn test_coppa_hf_wide_profile() {
         let p = CoppaProfile::hf_wide();
-        // updated for Phase 1 carrier_offset=6, see
-        // docs/superpowers/plans/2026-07-03-phase1-radio-reality.md Task 1:
+        // updated for Phase 1 carrier_offset=6 (see
+        // `docs/adr/003-phase1-waveform-break.md`, decision 1):
         // hf_wide redefined to 46 data + 4 pilots (50 active, bins 7..=56, ~350-2800 Hz).
         assert_eq!(p.data_carriers, 46);
         assert_eq!(p.pilot_carriers, 4);

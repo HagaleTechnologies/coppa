@@ -135,6 +135,5 @@ waveform decision).
 
 - `docs/analysis/2026-07-03-world-class-gap-analysis.md` — the gap analysis that motivated this
   phase.
-- `docs/superpowers/plans/2026-07-03-phase1-radio-reality.md` — the phase's task-by-task plan.
 - `BENCHMARKS.md`, "2026-07 — Radio-reality Phase 1" and "Phase 1 (radio reality) — final
   acceptance sweep" sections — the measured regression, recovery, and final acceptance numbers.

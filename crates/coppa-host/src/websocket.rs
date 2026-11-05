@@ -1911,8 +1911,8 @@ mod tests {
     }
 
     /// The schema is a tracked, published contract: its doc-comment-derived
-    /// descriptions must not cite the gitignored `docs/superpowers/` or
-    /// `.superpowers/` working notes (AGENTS.md, "where docs live").
+    /// descriptions must not cite gitignored local working notes; see
+    /// CLAUDE.md's documentation policy.
     #[test]
     fn schema_cites_no_local_working_notes() {
         let schema = schemars::schema_for!(ProtocolMessage);

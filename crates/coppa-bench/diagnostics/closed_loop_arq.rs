@@ -78,8 +78,7 @@
 //! `RateLoop`'s hysteresis logic -- and fixing
 //! it is out of this task's scope (it would mean either a level-invariant capacity metric or a
 //! per-level-recalibrated threshold table, both belonging to the channel-estimation/MCS-calibration
-//! work, not the rate-loop controller). See `.superpowers/sdd/task-4-report.md` for the full
-//! measured evidence and reasoning.
+//! work, not the rate-loop controller).
 //!
 //! ## 2026-07-25 update: active overshoot probing closes most of the remaining gap, still short of
 //! the bar
@@ -100,9 +99,7 @@
 //! stall-gating) all converged on the same ~0.78/~0.93 plateau, suggesting this is a real ceiling for
 //! this family of designs on this bench, not a remaining tuning gap. Shipped anyway per the same
 //! honest-partial-progress precedent as the level-bias correction (PR #53): real, verified,
-//! substantial improvement, gap documented rather than hidden. See
-//! `docs/superpowers/specs/2026-07-25-rateloop-active-overshoot-probing-design.md`'s "Outcome"
-//! section for the full sweep data.
+//! substantial improvement, gap documented rather than hidden.
 //!
 //! # The ratio-invariance result (COP-2 Phase 1): why an airtime lever cannot move this bar
 //!
