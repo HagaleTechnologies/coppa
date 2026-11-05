@@ -15,7 +15,7 @@ Submitted 3 copies to KISS; delivery is unconfirmed.
 Each receiving station runs this independently, even after sending starts:
 
 ```text
-coppa broadcast receive --kiss 127.0.0.1:8100 --output received.txt --idle-timeout 600
+coppa broadcast receive --kiss 127.0.0.1:8100 --output received.txt --idle-timeout 86400
 Waiting for broadcast file chunks.
 Received 5 bytes into received.txt; checksum verified.
 ```
@@ -26,11 +26,16 @@ Stopping a sender cannot retract datagrams already accepted by coppad.
 Normal daemon PTT cleanup still applies.
 
 The shown KISS address, repeats, interval and idle timeout are the defaults.
+The receive timeout defaults to 86400 seconds (24 hours), longer than a
+complete 2731-chunk copy of the maximum-size file at the default 30-second
+pacing. This allows a missing chunk to arrive in the next copy even when
+only duplicates arrive in between. With slower pacing or longer channel
+outages, set `--idle-timeout` above the expected gap between new chunks.
 Repeats, interval and timeout must be positive. Output is required.
 The receiver accepts the first valid transfer and sends no commands or data.
 Only a new chunk resets its idle timer. Duplicates and unrelated traffic
 cannot keep an incomplete receive alive. On timeout it reports, for example,
-`Error: broadcast incomplete: no new chunks for 600 seconds`.
+`Error: broadcast incomplete: no new chunks for 86400 seconds`.
 
 Files may be empty or binary and must be at most 1048576 bytes.
 Oversize inputs fail before connecting with

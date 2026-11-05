@@ -27,7 +27,8 @@ pub(crate) enum Command {
         kiss: String,
         #[arg(long)]
         output: PathBuf,
-        #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..))]
+        /// Seconds without a new chunk. Default covers a 1 MiB copy at 30-second pacing.
+        #[arg(long, default_value_t = 86400, value_parser = clap::value_parser!(u64).range(1..))]
         idle_timeout: u64,
     },
 }
@@ -166,6 +167,65 @@ async fn execute(command: Command, verbosity: super::Verbosity) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn default_timeout_allows_repeated_copy_to_repair_chunk_31_of_64() {
+        use clap::Parser;
+        let output = std::env::temp_dir().join(format!("coppa-repair-{}", std::process::id()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cli = super::super::Cli::try_parse_from([
+            "coppa",
+            "broadcast",
+            "receive",
+            "--kiss",
+            &listener.local_addr().unwrap().to_string(),
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .unwrap();
+        let super::super::Commands::Broadcast { command } = cli.command else {
+            panic!("expected broadcast command");
+        };
+        let Command::Receive { idle_timeout, .. } = &command else {
+            panic!("expected receive command");
+        };
+        assert!(
+            *idle_timeout > 2731 * 30,
+            "default must cover the largest copy"
+        );
+        // Keep the virtual clock under explicit control while TCP I/O is pending.
+        let clock_guard = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        let task = tokio::spawn(execute(command, super::super::Verbosity::Quiet));
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let bytes = vec![0x5a; 64 * 384];
+        let packets = encode_file(&bytes).unwrap();
+        assert_eq!(packets.len(), 64);
+        for copy in 0..2 {
+            for (index, packet) in packets.iter().enumerate() {
+                if copy == 0 && index == 31 {
+                    // Lose a chunk well beyond the old timeout's 20 intervals.
+                } else {
+                    assert!(!task.is_finished(), "receiver timed out before repair");
+                    socket.write_all(&kiss_encode_data(packet)).await.unwrap();
+                }
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+                if copy == 1 && index == 31 {
+                    break;
+                }
+                tokio::time::advance(Duration::from_secs(30)).await;
+            }
+        }
+        task.await.unwrap().unwrap();
+        clock_guard.abort();
+        assert_eq!(std::fs::read(&output).unwrap(), bytes);
+        std::fs::remove_file(output).unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn submissions_are_paced_and_identical() {
         let path = std::env::temp_dir().join(format!("coppa-pace-{}", std::process::id()));
