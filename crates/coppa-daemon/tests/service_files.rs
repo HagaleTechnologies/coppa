@@ -27,6 +27,8 @@ const CHECK_OK: &str =
     "Configuration syntax and field types OK.\nHardware and runtime settings were not checked.\n";
 
 const UNIT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contrib/coppad.service");
+/// COP-85: the template unit, one coppad per `coppad@NAME`.
+const TEMPLATE_UNIT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contrib/coppad@.service");
 const PLIST: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../contrib/io.github.hagaletechnologies.coppad.plist"
@@ -111,7 +113,8 @@ fn unit_value(entries: &[(String, String, String)], section: &str, key: &str) ->
     assert_eq!(
         values.len(),
         1,
-        "contrib/coppad.service must set [{section}] {key} exactly once, found {values:?}"
+        "contrib/coppad.service and contrib/coppad@.service must each set [{section}] {key} \
+         exactly once, found {values:?}"
     );
     values[0].clone()
 }
@@ -215,7 +218,8 @@ fn run_check(args: &[String]) {
     let dir = TempDir::new("check");
     let config = dir.path().join("coppad.toml");
     std::fs::copy(EXAMPLE_CONFIG, &config).expect("copy coppad.toml.example");
-    let mut rest: Vec<String> = args[1..].to_vec();
+    // COP-85: a template unit's `%i` stands for the instance name.
+    let mut rest: Vec<String> = args[1..].iter().map(|a| a.replace("%i", "test")).collect();
     let at = rest
         .iter()
         .position(|a| a == "--config")
@@ -268,6 +272,51 @@ fn systemd_unit_execstart_is_accepted_by_coppad() {
 }
 
 #[test]
+fn template_unit_execstart_is_accepted_by_coppad() {
+    let entries = unit_entries(&read(TEMPLATE_UNIT));
+    run_check(&unit_exec_start(&entries));
+}
+
+/// COP-85: each instance runs under its own name and reads its own file.
+#[test]
+fn template_unit_names_the_instance_and_its_own_config() {
+    let entries = unit_entries(&read(TEMPLATE_UNIT));
+    let exec_start = unit_value(&entries, "Service", "ExecStart");
+    assert!(
+        exec_start.contains("--instance %i"),
+        "the instance name labels logs and mDNS: {exec_start}"
+    );
+    assert!(
+        exec_start.contains("--config /etc/coppa/coppad-%i.toml"),
+        "each instance needs its own config file: {exec_start}"
+    );
+    assert!(
+        !exec_start.contains("%I"),
+        "systemd's %I turns '-' into '/', which is not a valid instance name: {exec_start}"
+    );
+}
+
+/// COP-85: every directive the single unit's tests check holds for the
+/// template too, because the two differ only in Description and ExecStart.
+#[test]
+fn template_unit_matches_the_single_unit_except_name_and_command() {
+    let without = |path: &str| -> Vec<(String, String, String)> {
+        let mut entries: Vec<_> = unit_entries(&read(path))
+            .into_iter()
+            .filter(|(_, key, _)| key != "Description" && key != "ExecStart")
+            .collect();
+        entries.sort();
+        entries
+    };
+    assert_eq!(
+        without(TEMPLATE_UNIT),
+        without(UNIT),
+        "contrib/coppad@.service must match contrib/coppad.service apart from Description \
+         and ExecStart"
+    );
+}
+
+#[test]
 fn systemd_unit_runs_unprivileged_with_device_groups() {
     let entries = unit_entries(&read(UNIT));
     let user = unit_value(&entries, "Service", "User");
@@ -283,7 +332,7 @@ fn systemd_unit_runs_unprivileged_with_device_groups() {
         .collect();
     assert_eq!(
         groups, expected,
-        "coppad needs audio (sound cards), dialout (serial PTT) and gpio (sysfs GPIO PTT)"
+        "coppad needs audio (sound cards), dialout (serial PTT) and gpio (GPIO PTT)"
     );
 }
 
@@ -328,13 +377,25 @@ fn systemd_unit_leaves_the_ptt_guardian_alone_on_stop() {
     );
 }
 
+/// COP-85: `systemctl reload coppad` sends SIGHUP to coppad alone.
+#[test]
+fn systemd_unit_reloads_with_sighup_to_the_main_process() {
+    let entries = unit_entries(&read(UNIT));
+    assert_eq!(
+        unit_value(&entries, "Service", "ExecReload"),
+        "/bin/kill -HUP $MAINPID",
+        "systemctl reload must signal coppad alone; KillMode=process keeps the guardian out \
+         of it, and the guardian ignores SIGHUP anyway"
+    );
+}
+
 #[test]
 fn systemd_unit_omits_directives_that_break_audio_or_ptt() {
     let entries = unit_entries(&read(UNIT));
     let forbidden = [
         (
             "ProtectKernelTunables",
-            "it makes /sys read-only, so GPIO PTT writes fail",
+            "it makes /sys read-only, so sysfs GPIO PTT writes fail",
         ),
         (
             "PrivateDevices",

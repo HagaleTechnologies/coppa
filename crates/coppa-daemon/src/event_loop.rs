@@ -403,6 +403,30 @@ fn max_tune_seconds(max_tx_duration_s: u64) -> f32 {
 }
 
 /// COP-84: the CW ID state in words, for the startup line and change logs.
+/// `[engine] callsign` as the local callsign, at startup and on a reload
+/// (COP-85). A non-empty but unparseable string leaves it at `None`, exactly
+/// like an empty one: the daemon still starts and receives, but every
+/// transmission is refused (COP-37, `transmit_samples`), and with it station
+/// ID, beacons and connects. It warns so the operator learns why before the
+/// first refusal.
+fn configured_callsign(callsign: &str) -> Option<Callsign> {
+    if callsign.is_empty() {
+        return None;
+    }
+    match Callsign::new(callsign) {
+        Ok(cs) => Some(cs),
+        Err(e) => {
+            tracing::warn!(
+                callsign = %callsign,
+                error = %e,
+                "Invalid [engine] callsign; transmission disabled until a \
+                 valid MYCALL is set"
+            );
+            None
+        }
+    }
+}
+
 fn describe_cw_id(policy: CwIdPolicy, on: bool, wpm: u32) -> String {
     let state = match (policy, on) {
         (CwIdPolicy::Host, false) => "off until a host sends CWID ON",
@@ -605,6 +629,9 @@ pub enum DaemonEvent {
     TxComplete { generation: u64, completed: bool },
     /// Shutdown signal received.
     Shutdown,
+    /// COP-85: a SIGHUP reload, carrying the re-read configuration file
+    /// after `DaemonConfig::check_for_reload` accepted it.
+    Reload(Box<DaemonConfig>),
 }
 
 /// Lock the shared TX output, recovering from poisoning (its state is
@@ -645,6 +672,15 @@ fn log_rx_level_transition(state: LevelState, reading: &LevelReading) {
 /// Capacity of the daemon's event channel, and the most events
 /// `wait_for_clear_channel` sets aside in `deferred_events` (COP-42).
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// What cut a busy-channel wait short (COP-42, COP-85).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitCut {
+    /// An `ABORT` while a session is live.
+    Abort,
+    /// A stop request.
+    Shutdown,
+}
 
 /// The main daemon event loop.
 pub struct EventLoop {
@@ -1012,29 +1048,7 @@ impl EventLoop {
             (None, None)
         };
 
-        let local_callsign = if config.engine.callsign.is_empty() {
-            None
-        } else {
-            match Callsign::new(&config.engine.callsign) {
-                Ok(cs) => Some(cs),
-                Err(e) => {
-                    // A non-empty but unparseable callsign string leaves
-                    // `local_callsign` at `None`, exactly like an empty one:
-                    // the daemon still starts and receives, but every
-                    // transmission is refused (COP-37, `transmit_samples`),
-                    // and with it station ID, beacons and connects. Warn
-                    // once at startup so the operator learns why before the
-                    // first refusal.
-                    tracing::warn!(
-                        callsign = %config.engine.callsign,
-                        error = %e,
-                        "Invalid [engine] callsign; transmission disabled until a \
-                         valid MYCALL is set"
-                    );
-                    None
-                }
-            }
-        };
+        let local_callsign = configured_callsign(&config.engine.callsign);
 
         let busy_gate = BusyGate::new(engine.config().sample_rate as f32);
         let rx_level_meter = RxLevelMeter::new(engine.config().sample_rate);
@@ -1249,21 +1263,22 @@ impl EventLoop {
                     ))
                 }
             }
-            crate::config::PttConfig::Gpio { pin } => {
+            crate::config::PttConfig::Gpio { line } => {
                 #[cfg(all(feature = "gpio-ptt", target_os = "linux"))]
                 {
-                    let pin_num: u32 = pin.parse().map_err(|_| {
-                        anyhow::anyhow!(
-                            "invalid GPIO pin {pin:?}: expected a plain pin number, e.g. \"gpio:529\""
-                        )
-                    })?;
-                    let ptt = coppa_radio::ptt_gpio::GpioPtt::open(pin_num, false)
-                        .map_err(|e| anyhow::anyhow!("failed to open GPIO PTT pin {pin}: {e:#}"))?;
-                    Ok(PttBackend::Other(Box::new(ptt)))
+                    let ptt = open_gpio_ptt(&line, "coppad")?;
+                    if let crate::config::GpioLine::Sysfs(number) = line {
+                        let equivalent = coppa_radio::ptt_gpio::sysfs_number_to_chardev(
+                            number,
+                            &coppa_radio::ptt_gpio::read_sysfs_chips(),
+                        );
+                        tracing::warn!("{}", sysfs_gpio_deprecation(number, equivalent));
+                    }
+                    Ok(PttBackend::Other(ptt))
                 }
                 #[cfg(not(all(feature = "gpio-ptt", target_os = "linux")))]
                 {
-                    let _ = pin;
+                    let _ = line;
                     Err(anyhow::anyhow!(
                         "PTT method 'gpio' requires coppad to be built with \
                          --features gpio-ptt, on Linux"
@@ -3409,6 +3424,9 @@ impl EventLoop {
                 self.shutdown_flag.store(true, Ordering::Release);
                 self.running = false;
             }
+            Some(DaemonEvent::Reload(file)) => {
+                self.apply_reload(*file);
+            }
             Some(DaemonEvent::KissDatagram(data)) => {
                 self.handle_kiss_datagram(data).await;
             }
@@ -5103,14 +5121,22 @@ impl EventLoop {
             return 0;
         }
         let allowed = if self.wideband_frequency_check().is_ok() {
-            if self.wait_for_clear_channel().await {
+            if let Some(cut) = self.wait_for_clear_channel().await {
                 // COP-42: an ABORT reached us while this frame waited for a
                 // clear channel. It is dropped unsent; `run` then handles
                 // the ABORT, which ends the session this frame was most
                 // likely for. A sessionless ARQ frame is retransmitted as
                 // after any loss, and a due station ID stays due (its timer
-                // is only reset when an ID actually keys).
-                tracing::info!("ABORT during the busy-channel wait: dropping the waiting frame");
+                // is only reset when an ID actually keys). COP-85: a stop
+                // request drops it the same way; `run` then shuts down.
+                match cut {
+                    WaitCut::Abort => tracing::info!(
+                        "ABORT during the busy-channel wait: dropping the waiting frame"
+                    ),
+                    WaitCut::Shutdown => tracing::info!(
+                        "Shutdown during the busy-channel wait: dropping the waiting frame"
+                    ),
+                }
                 if !self.is_transmitting {
                     self.tx_on_air_bytes = 0;
                     self.report_buffer().await;
@@ -5342,13 +5368,16 @@ impl EventLoop {
     /// wait, so an `ABORT` would wait behind it and the cancelled frame would
     /// still key once the channel cleared. Each iteration therefore moves
     /// whatever `event_rx` holds into `deferred_events` (dispatched by `run`
-    /// afterwards, in order) and returns `true` as soon as one of them is an
-    /// `ABORT` while a session is live; the caller then drops the waiting
-    /// frame. `false` means the channel is clear.
-    async fn wait_for_clear_channel(&mut self) -> bool {
+    /// afterwards, in order) and returns [`WaitCut::Abort`] as soon as one of
+    /// them is an `ABORT` while a session is live; the caller then drops the
+    /// waiting frame. COP-85: a `Shutdown` among those events cuts the wait
+    /// too ([`WaitCut::Shutdown`]), with or without a session, so a stop
+    /// request is not held until the channel clears. `None` means the
+    /// channel is clear.
+    async fn wait_for_clear_channel(&mut self) -> Option<WaitCut> {
         let hold_ms = self.config.station_id.busy_hold_ms;
         if hold_ms == 0 || !self.busy_gate.current() {
-            return false;
+            return None;
         }
         // COP-83: `status.waiting_for_clear_channel` is true for exactly the
         // wait, and each step refreshes the heartbeat this wait blocks.
@@ -5359,12 +5388,13 @@ impl EventLoop {
     }
 
     /// The body of `wait_for_clear_channel`: wait while the channel reads
-    /// busy, then a random holdoff. Returns `true` when an `ABORT` cut it.
-    async fn wait_until_channel_clear(&mut self, hold_ms: u64) -> bool {
+    /// busy, then a random holdoff. Returns the reason an `ABORT` or
+    /// `Shutdown` cut the wait, or `None` once the channel is clear.
+    async fn wait_until_channel_clear(&mut self, hold_ms: u64) -> Option<WaitCut> {
         loop {
             while self.busy_gate.current() {
-                if self.abort_waiting() {
-                    return true;
+                if let Some(cut) = self.abort_waiting() {
+                    return Some(cut);
                 }
                 self.observe_busy_gate_from_audio_input().await;
                 tokio::time::sleep(Duration::from_millis(hold_ms)).await;
@@ -5377,12 +5407,12 @@ impl EventLoop {
             self.release_overdue_ptt_while_waiting().await;
             self.mark_clear_channel_wait(true).await;
             self.observe_busy_gate_from_audio_input().await; // pick up anything that arrived during the holdoff
-            if self.abort_waiting() {
-                return true;
+            if let Some(cut) = self.abort_waiting() {
+                return Some(cut);
             }
 
             if !self.busy_gate.current() {
-                return false;
+                return None;
             }
             // Busy again during the holdoff -- loop back and wait again.
         }
@@ -5392,22 +5422,32 @@ impl EventLoop {
     /// the channel's own capacity, so a long wait still applies
     /// back-pressure rather than buffering without bound) and say whether an
     /// `ABORT` is among them while a session is live. With no live session
-    /// `ABORT` does nothing, so it does not cut the wait either.
-    fn abort_waiting(&mut self) -> bool {
+    /// `ABORT` does nothing, so it does not cut the wait either. COP-85: a
+    /// `Shutdown` cuts it whether or not a session is live, and wins over an
+    /// `ABORT` set aside with it.
+    fn abort_waiting(&mut self) -> Option<WaitCut> {
         while self.deferred_events.len() < EVENT_CHANNEL_CAPACITY {
             match self.event_rx.try_recv() {
                 Ok(event) => self.deferred_events.push_back(event),
                 Err(_) => break,
             }
         }
-        self.live_session_id().is_some()
+        if self
+            .deferred_events
+            .iter()
+            .any(|event| matches!(event, DaemonEvent::Shutdown))
+        {
+            return Some(WaitCut::Shutdown);
+        }
+        let abort = self.live_session_id().is_some()
             && self.deferred_events.iter().any(|event| {
                 matches!(
                     event,
                     DaemonEvent::Host(HostEvent::VaraCommand { command, .. })
                         if matches!(VaraCommand::parse(command), VaraCommand::Abort)
                 )
-            })
+            });
+        abort.then_some(WaitCut::Abort)
     }
 
     /// COP-31: the PTT backstop inside `wait_for_clear_channel`, which can
@@ -6824,11 +6864,13 @@ impl EventLoop {
     /// Change physical PTT and the keyed-interval bookkeeping, without
     /// draining the TX queue on release (see `handle_ptt_change`).
     ///
-    /// COP-31: this is the only place the daemon drives its PTT backend, and
-    /// so the only place the PTT guardian hears about it: `K` before keying
-    /// (a keying whose reply is lost may still have keyed the rig) and `R`
-    /// only after an unkey that succeeded, so a failed unkey leaves the
-    /// guardian armed. A new direct `self.ptt.set_ptt` call must report too.
+    /// COP-31: this is the only place the daemon drives its PTT backend
+    /// while it runs, and so the only place the PTT guardian hears about it:
+    /// `K` before keying (a keying whose reply is lost may still have keyed
+    /// the rig) and `R` only after an unkey that succeeded, so a failed unkey
+    /// leaves the guardian armed. A new direct `self.ptt.set_ptt` call must
+    /// report too, as the exit-only `release_ptt_for_forced_exit` (COP-85)
+    /// does.
     async fn set_ptt(&mut self, tx: bool) {
         let state = if tx { PttState::Tx } else { PttState::Rx };
         if tx {
@@ -6871,10 +6913,172 @@ impl EventLoop {
         }
     }
 
+    /// COP-85: apply a reloaded configuration file. Keys in
+    /// [`crate::config::RELOADABLE_KEYS`] take the file's value (the event
+    /// loop reads them from `self.config` at their next use); every other
+    /// changed key keeps its running value and is named in one WARN line.
+    /// The callsign is replaced only when the file's value changed since the
+    /// last load, so a host's `MYCALL` survives an unrelated reload. A
+    /// changed CW ID policy resets CW ID to what startup would choose.
+    pub fn apply_reload(&mut self, file: DaemonConfig) {
+        let plan = match crate::config::plan_reload(&self.config, &file) {
+            Ok(plan) => plan,
+            Err(e) => {
+                tracing::error!(
+                    error = %format!("{e:#}"),
+                    "Configuration reload failed; coppad keeps running on its current settings"
+                );
+                return;
+            }
+        };
+        if plan.applies("engine", "callsign") {
+            // An invalid value warns (as at startup) and disables TX; so
+            // does a cleared one, which warns here.
+            self.local_callsign = configured_callsign(&plan.effective.engine.callsign);
+            if plan.effective.engine.callsign.is_empty() {
+                tracing::warn!(
+                    "[engine] callsign cleared by configuration reload; transmission disabled \
+                     until a valid MYCALL is set"
+                );
+            } else if self.local_callsign.is_some() {
+                tracing::info!(
+                    callsign = %plan.effective.engine.callsign,
+                    "Local callsign set by configuration reload"
+                );
+            }
+        }
+        let cwid_changed = plan.applies("station_id", "cwid");
+        let turnaround_changed =
+            plan.applies("radio", "turnaround_ms") || plan.applies("radio", "ptt_tail_delay_ms");
+        let timing_changed = turnaround_changed || plan.applies("radio", "ptt_pre_delay_ms");
+        let crate::config::ReloadPlan {
+            effective,
+            applied,
+            restart_required,
+        } = plan;
+        self.config = effective;
+        if timing_changed {
+            // Keep the active link and its RTT history; timing decreases may
+            // safely retain the higher floor until the session ends.
+            self.raise_session_rto_for_level(self.engine.speed_level());
+        }
+        if cwid_changed {
+            let policy = self.config.station_id.cwid;
+            self.cw_id_on = policy == CwIdPolicy::Always;
+            tracing::info!(
+                "CW ID after each session this station ends: {}",
+                describe_cw_id(policy, self.cw_id_on, self.config.station_id.cwid_wpm)
+            );
+        }
+        if turnaround_changed {
+            if let Some(warning) = self.config.radio.turnaround_warning() {
+                tracing::warn!("{warning}");
+            }
+        }
+        if !restart_required.is_empty() {
+            tracing::warn!(
+                restart_required = %restart_required.join(", "),
+                "Configuration reload kept the running values of settings that change only on \
+                 restart"
+            );
+        }
+        if !applied.is_empty() {
+            tracing::info!(applied = %applied.join(", "), "Configuration reloaded");
+        } else if restart_required.is_empty() {
+            tracing::info!("Configuration reloaded; no settings changed");
+        } else {
+            tracing::info!("Configuration reloaded; nothing changed that applies before a restart");
+        }
+    }
+
+    /// COP-85: release PTT for a forced exit (a second stop request), after
+    /// `run` was cancelled at an await point. Drives the backend to RX
+    /// whatever `is_transmitting` says, as `EventLoop::new` does at startup:
+    /// a cancelled `set_ptt` can leave the rig keyed with the flag still
+    /// false. Tells the guardian only after an unkey that succeeded, so a
+    /// failed one leaves it armed. Also tells audio threads to stop.
+    pub fn release_ptt_for_forced_exit(&mut self) {
+        tracing::warn!("Releasing PTT for a forced exit");
+        match self.ptt.set_ptt(PttState::Rx) {
+            Ok(()) => {
+                if let Some(guardian) = self.ptt_guardian.as_mut() {
+                    guardian.report(false);
+                }
+            }
+            Err(e) => tracing::error!(
+                error = %e,
+                "Could not release PTT for a forced exit; the PTT guardian, if running, will try"
+            ),
+        }
+        self.is_transmitting = false;
+        self.shutdown_flag.store(true, Ordering::Release);
+        self.running = false;
+    }
+
     /// Check if the loop is running.
     #[allow(dead_code)] // lifecycle API for daemon supervisors
     pub fn is_running(&self) -> bool {
         self.running
+    }
+}
+
+/// COP-85: the warning logged when `ptt_method` uses the deprecated sysfs
+/// form, naming the equivalent character-device form when the sysfs chip
+/// table maps the number to one.
+#[cfg_attr(not(all(feature = "gpio-ptt", target_os = "linux")), allow(dead_code))]
+pub(crate) fn sysfs_gpio_deprecation(number: u32, equivalent: Option<(String, u32)>) -> String {
+    let deprecated =
+        format!("ptt_method = \"gpio:{number}\" uses the deprecated sysfs GPIO interface");
+    match equivalent {
+        Some((chip, line)) => format!(
+            "{deprecated}; ptt_method = \"gpio:{chip}:{line}\" drives the same line through \
+             the GPIO character device"
+        ),
+        None => format!(
+            "{deprecated}; use \"gpio:<chip>:<line>\" to drive it through the GPIO character \
+             device (gpiodetect lists the chips)"
+        ),
+    }
+}
+
+/// COP-85: the startup error for the sysfs form on a kernel without sysfs
+/// GPIO.
+#[cfg_attr(not(all(feature = "gpio-ptt", target_os = "linux")), allow(dead_code))]
+pub(crate) fn sysfs_gpio_missing(number: u32) -> String {
+    format!(
+        "ptt_method = \"gpio:{number}\" needs the sysfs GPIO interface (/sys/class/gpio), which \
+         this kernel does not provide; use \"gpio:<chip>:<line>\", for example \
+         \"gpio:pinctrl-bcm2711:17\""
+    )
+}
+
+/// COP-85: open the GPIO PTT line `line` names, at its RX level, for the
+/// daemon (`consumer` `coppad`) or the guardian (`coppad-guardian`).
+///
+/// The character-device form requests the line through `/dev/gpiochipN`.
+/// The sysfs form fails with a migration message when the kernel has no
+/// `/sys/class/gpio/export`, and otherwise opens the pin as before COP-85.
+#[cfg(all(feature = "gpio-ptt", target_os = "linux"))]
+pub(crate) fn open_gpio_ptt(
+    line: &crate::config::GpioLine,
+    consumer: &str,
+) -> Result<Box<dyn PttControl>> {
+    use coppa_radio::ptt_gpio::GpioPtt;
+    match line {
+        crate::config::GpioLine::Chardev { chip, line } => {
+            let ptt = GpioPtt::open_chardev(chip, *line, false, consumer).map_err(|e| {
+                anyhow::anyhow!("failed to open GPIO PTT line {chip}:{line}: {e:#}")
+            })?;
+            Ok(Box::new(ptt))
+        }
+        crate::config::GpioLine::Sysfs(number) => {
+            if !std::path::Path::new("/sys/class/gpio/export").exists() {
+                anyhow::bail!("{}", sysfs_gpio_missing(*number));
+            }
+            let ptt = GpioPtt::open(*number, false)
+                .map_err(|e| anyhow::anyhow!("failed to open GPIO PTT pin {number}: {e:#}"))?;
+            Ok(Box::new(ptt))
+        }
     }
 }
 
@@ -7125,10 +7329,50 @@ mod tests {
             .err()
             .expect("an unexportable GPIO pin must be a startup error");
         let msg = err.to_string();
+        if !std::path::Path::new("/sys/class/gpio/export").exists() {
+            // COP-85: a kernel without sysfs GPIO gets the migration message.
+            assert_eq!(msg, sysfs_gpio_missing(999_999));
+            return;
+        }
         assert!(msg.contains("failed to open GPIO PTT pin 999999"), "{msg}");
         // EACCES (not in gpio group), EINVAL (wrong number) and EROFS/ENOENT
         // (no writable sysfs GPIO) must be distinguishable in the log.
         assert!(msg.contains("(os error "), "OS cause dropped: {msg}");
+    }
+
+    #[cfg(all(feature = "gpio-ptt", target_os = "linux"))]
+    #[test]
+    fn create_ptt_chardev_with_no_such_chip_fails_naming_it() {
+        let mut config = DaemonConfig::default();
+        config.radio.ptt_method = "gpio:coppa-test-no-such-chip:3".to_string();
+        let msg = EventLoop::create_ptt(&config)
+            .err()
+            .expect("a missing GPIO chip must be a startup error")
+            .to_string();
+        assert!(
+            msg.starts_with(
+                "failed to open GPIO PTT line coppa-test-no-such-chip:3: no GPIO chip matches \
+                 \"coppa-test-no-such-chip\""
+            ),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn sysfs_gpio_messages_name_the_character_device_form() {
+        assert_eq!(
+            sysfs_gpio_deprecation(529, Some(("pinctrl-bcm2711".into(), 17))),
+            "ptt_method = \"gpio:529\" uses the deprecated sysfs GPIO interface; ptt_method = \
+             \"gpio:pinctrl-bcm2711:17\" drives the same line through the GPIO character device"
+        );
+        let unmapped = sysfs_gpio_deprecation(529, None);
+        assert!(unmapped.contains("\"gpio:<chip>:<line>\""), "{unmapped}");
+        assert_eq!(
+            sysfs_gpio_missing(529),
+            "ptt_method = \"gpio:529\" needs the sysfs GPIO interface (/sys/class/gpio), which \
+             this kernel does not provide; use \"gpio:<chip>:<line>\", for example \
+             \"gpio:pinctrl-bcm2711:17\""
+        );
     }
 
     #[test]
@@ -11644,10 +11888,10 @@ mod tests {
             for _ in 0..release_blocks {
                 audio_in_tx.write(&noise(0.01));
             }
-            let aborted = tokio::time::timeout(Duration::from_secs(5), wait)
+            let cut = tokio::time::timeout(Duration::from_secs(5), wait)
                 .await
                 .unwrap();
-            assert!(!aborted);
+            assert_eq!(cut, None, "the channel cleared; nothing cut the wait");
         }
         assert_eq!(status.lock().await.waiting_for_clear_channel, Some(false));
     }
@@ -18407,6 +18651,71 @@ mod tests {
             );
         }
 
+        /// COP-85: a stop request sent while a frame waits for a clear
+        /// channel cuts the wait with no session live. The waiting frame
+        /// never keys and dispatching the set-aside `Shutdown` stops the
+        /// loop. Before, the `Shutdown` waited until the channel cleared.
+        #[tokio::test(start_paused = true)]
+        async fn shutdown_cuts_a_busy_channel_wait_and_the_waiting_frame_never_keys() {
+            let logs = LogCapture::default();
+            let _guard = logs.install();
+            let mut config = config_with_callsign();
+            config.station_id.busy_hold_ms = 10;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            mark_identified(&mut event_loop);
+            let (audio_out_tx, audio_out_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_out(audio_out_tx);
+            // Nothing feeds the input ring, so without the Shutdown this
+            // wait would never end.
+            let (_audio_in_tx, audio_in_rx) = coppa_audio::audio_ring(1_000_000);
+            event_loop.set_audio_in(audio_in_rx);
+            let mut counter = 13u32;
+            for _ in 0..10 {
+                event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.01, &mut counter));
+            }
+            for _ in 0..busy_burst_blocks(&event_loop.busy_gate) {
+                event_loop
+                    .busy_gate
+                    .observe(&noise_block(0.5, &mut counter));
+            }
+            assert!(event_loop.busy_gate.current());
+            assert!(event_loop.live_session_id().is_none());
+
+            event_loop
+                .event_tx
+                .send(DaemonEvent::Shutdown)
+                .await
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                event_loop.transmit_samples(&[0.25f32; 500]),
+            )
+            .await
+            .expect("a Shutdown must cut the busy-channel wait");
+            assert_eq!(
+                audio_out_rx.available(),
+                0,
+                "the waiting frame must not key"
+            );
+            assert!(!event_loop.is_transmitting);
+            let contents = logs.contents();
+            assert!(
+                contents
+                    .contains("Shutdown during the busy-channel wait: dropping the waiting frame"),
+                "{contents}"
+            );
+
+            assert!(!event_loop.shutdown_flag.load(Ordering::Acquire));
+            event_loop.running = true;
+            while let Some(event) = event_loop.deferred_events.pop_front() {
+                event_loop.dispatch_event(Some(event)).await;
+            }
+            assert!(!event_loop.running, "the deferred Shutdown stops the loop");
+            assert!(event_loop.shutdown_flag.load(Ordering::Acquire));
+        }
+
         /// COP-42: with no live session `ABORT` does nothing, so it does not
         /// cut a busy-channel wait either; the frame still goes out once the
         /// channel clears.
@@ -20677,6 +20986,187 @@ mod tests {
 
     // ── COP-31: PTT is released on every exit path ──
 
+    /// COP-85: applying a SIGHUP reload inside the event loop.
+    mod cop85_reload {
+        use super::*;
+
+        fn station() -> EventLoop {
+            let mut config = DaemonConfig::default();
+            config.engine.callsign = "N0CALL".to_string();
+            EventLoop::new(config).unwrap()
+        }
+
+        #[test]
+        fn reload_applies_ptt_timing_and_station_id_live() {
+            let mut event_loop = station();
+            let mut file = event_loop.config.clone();
+            file.radio.ptt_pre_delay_ms = 123;
+            file.station_id.id_interval_secs = 300;
+            event_loop.apply_reload(file);
+            assert_eq!(event_loop.config.radio.ptt_pre_delay_ms, 123);
+            assert_eq!(event_loop.config.station_id.id_interval_secs, 300);
+        }
+
+        #[tokio::test]
+        async fn timing_reload_raises_active_session_rto_without_resetting_arq() {
+            for timing in ["turnaround", "pre", "tail"] {
+                let (mut station, _peer, _tx_audio, _rx_audio) = connected_pair(0).await;
+                let now = clock_now();
+                let tx = &mut station.session_link.as_mut().unwrap().tx;
+                let first = tx.send(b"acked".to_vec(), now).unwrap();
+                tx.process_ack(first.wrapping_add(1), 0, now + Duration::from_secs(1));
+                let sent = now + Duration::from_secs(2);
+                let pending = tx.send(b"pending".to_vec(), sent).unwrap();
+                let old_rto = tx.rto();
+                let mut file = station.config.clone();
+                match timing {
+                    "turnaround" => file.radio.turnaround_ms = 20_000,
+                    "pre" => file.radio.ptt_pre_delay_ms = 20_000,
+                    "tail" => file.radio.ptt_tail_delay_ms = 20_000,
+                    _ => unreachable!(),
+                }
+                station.apply_reload(file);
+                // Ordinary single-codeword frames clear the segment override.
+                station.set_session_segment_floor(100, 100, 1);
+                let level = station.engine.speed_level();
+                let expected = coppa_protocol::arq::rto_floor(
+                    SESSION_ARQ_WINDOW,
+                    level,
+                    level,
+                    Duration::from_secs(20),
+                    &coppa_codec::ofdm::CoppaProfile::hf_standard(),
+                );
+                let tx = &mut station.session_link.as_mut().unwrap().tx;
+                assert!(expected > old_rto);
+                assert!(tx.rto() >= expected, "{timing} reload left a stale RTO");
+                assert_eq!(tx.send_base(), pending);
+                assert_eq!(tx.next_seq(), pending.wrapping_add(1));
+                assert_eq!(tx.get_segment_data(pending), Some(b"pending".as_slice()));
+                assert!(tx.get_retransmits(sent + old_rto).is_empty());
+                tx.process_ack(pending.wrapping_add(1), 0, sent + Duration::from_secs(1));
+                assert!(tx.rto() >= expected, "RTT updates must retain the floor");
+            }
+        }
+
+        #[tokio::test]
+        async fn reload_sets_the_callsign_only_when_the_file_changes_it() {
+            let logs = LogCapture::default();
+            let _guard = logs.install();
+            let mut event_loop = station();
+            event_loop
+                .handle_host_event(HostEvent::VaraCommand {
+                    client_id: 1,
+                    command: "MYCALL N2CALL".into(),
+                })
+                .await;
+            assert_eq!(
+                event_loop.local_callsign,
+                Some(Callsign::new("N2CALL").unwrap())
+            );
+
+            let mut file = event_loop.config.clone();
+            file.radio.ptt_tail_delay_ms += 1;
+            event_loop.apply_reload(file.clone());
+            assert_eq!(
+                event_loop.local_callsign,
+                Some(Callsign::new("N2CALL").unwrap()),
+                "an unchanged file callsign keeps the host's MYCALL"
+            );
+
+            file.engine.callsign = "N1CALL".to_string();
+            event_loop.apply_reload(file);
+            assert_eq!(
+                event_loop.local_callsign,
+                Some(Callsign::new("N1CALL").unwrap())
+            );
+            let contents = logs.contents();
+            assert!(
+                contents.contains("Local callsign set by configuration reload callsign=N1CALL"),
+                "{contents}"
+            );
+            assert!(
+                contents.contains("Configuration reloaded applied=[engine] callsign"),
+                "{contents}"
+            );
+        }
+
+        #[test]
+        fn reload_of_the_cwid_policy_resets_cw_id_as_at_startup() {
+            let mut config = DaemonConfig::default();
+            config.engine.callsign = "N0CALL".to_string();
+            config.station_id.cwid = CwIdPolicy::Host;
+            let mut event_loop = EventLoop::new(config).unwrap();
+            assert!(event_loop.apply_host_cwid(true, "a test"));
+            assert!(event_loop.cw_id_on);
+
+            let mut file = event_loop.config.clone();
+            file.station_id.cwid = CwIdPolicy::Never;
+            event_loop.apply_reload(file.clone());
+            assert!(!event_loop.cw_id_on);
+
+            file.station_id.cwid = CwIdPolicy::Host;
+            event_loop.apply_reload(file.clone());
+            assert!(
+                !event_loop.cw_id_on,
+                "host policy starts off, as at startup"
+            );
+
+            file.station_id.cwid = CwIdPolicy::Always;
+            event_loop.apply_reload(file);
+            assert!(event_loop.cw_id_on);
+        }
+
+        #[test]
+        fn reload_keeps_the_ptt_backend_and_profile() {
+            let logs = LogCapture::default();
+            let _guard = logs.install();
+            let mut event_loop = station();
+            event_loop.ptt = PttBackend::Other(Box::new(NullPtt::new()));
+            let running = event_loop.config.clone();
+            let mut file = running.clone();
+            file.radio.ptt_method = "rigctld".to_string();
+            file.engine.profile = "HF_ROBUST".to_string();
+            event_loop.apply_reload(file);
+            assert_eq!(event_loop.config.radio.ptt_method, running.radio.ptt_method);
+            assert_eq!(event_loop.config.engine.profile, running.engine.profile);
+            assert!(matches!(event_loop.ptt, PttBackend::Other(_)));
+            let contents = logs.contents();
+            assert!(
+                contents.contains("restart_required=[engine] profile, [radio] ptt_method"),
+                "{contents}"
+            );
+            assert!(
+                contents.contains("nothing changed that applies before a restart"),
+                "{contents}"
+            );
+        }
+
+        #[test]
+        fn reload_of_an_unchanged_file_reports_no_changes() {
+            let logs = LogCapture::default();
+            let _guard = logs.install();
+            let mut event_loop = station();
+            let file = event_loop.config.clone();
+            event_loop.apply_reload(file);
+            let contents = logs.contents();
+            assert!(
+                contents.contains("Configuration reloaded; no settings changed"),
+                "{contents}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_reload_event_is_dispatched_to_apply_reload() {
+            let mut event_loop = station();
+            let mut file = event_loop.config.clone();
+            file.radio.ptt_tail_delay_ms = 345;
+            event_loop
+                .dispatch_event(Some(DaemonEvent::Reload(Box::new(file))))
+                .await;
+            assert_eq!(event_loop.config.radio.ptt_tail_delay_ms, 345);
+        }
+    }
+
     mod cop31_ptt_release {
         use super::*;
         use crate::ptt_guardian::PttGuardian;
@@ -20777,6 +21267,30 @@ mod tests {
                 log.clone(),
             ))));
             (event_loop, log)
+        }
+
+        /// COP-85: a forced exit drives the backend to RX even when
+        /// `is_transmitting` is false (a cancelled `set_ptt` can leave the
+        /// rig keyed before the flag is set), then tells the guardian, and
+        /// stops audio threads.
+        #[test]
+        fn release_ptt_for_forced_exit_drives_rx_and_tells_the_guardian() {
+            let (mut event_loop, log) = guarded_event_loop(false);
+            assert!(!event_loop.is_transmitting);
+            event_loop.release_ptt_for_forced_exit();
+            assert_eq!(*log.lock().unwrap(), ["ptt:Rx", "guardian:R"]);
+            assert!(event_loop.shutdown_flag.load(Ordering::Acquire));
+            assert!(!event_loop.running);
+        }
+
+        /// COP-85: a failed unkey on a forced exit leaves the guardian
+        /// armed, so it still releases PTT after the process exits.
+        #[test]
+        fn a_failed_forced_exit_release_leaves_the_guardian_armed() {
+            let (mut event_loop, log) = guarded_event_loop(true);
+            event_loop.release_ptt_for_forced_exit();
+            assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+            assert!(event_loop.shutdown_flag.load(Ordering::Acquire));
         }
 
         /// Capture the VARA telemetry an event loop broadcasts.

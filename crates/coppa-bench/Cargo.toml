@@ -194,9 +194,14 @@ name = "watterson_sanity_sweep"
 path = "diagnostics/watterson_sanity_sweep.rs"
 
 [[example]]
+<<<<<<< HEAD
 name = "g3ruh_fixture_gen"
 path = "diagnostics/g3ruh_fixture_gen.rs"
 
 [[example]]
 name = "g3ruh_vs_direwolf"
 path = "diagnostics/g3ruh_vs_direwolf.rs"
+=======
+name = "impairment_transfer"
+path = "diagnostics/impairment_transfer.rs"
+>>>>>>> 7f224a3e902d552a3406e69e132d14832cb1d30e

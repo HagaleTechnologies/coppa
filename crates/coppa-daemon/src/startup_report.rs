@@ -107,7 +107,7 @@ impl PttStartup {
                 };
                 format!("serial {port} {line}")
             }
-            PttConfig::Gpio { pin } => format!("gpio {pin}"),
+            PttConfig::Gpio { line } => format!("gpio {line}"),
         }
     }
 
@@ -190,6 +190,16 @@ impl fmt::Display for Guardian {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GpioLine;
+
+    fn gpio_chardev() -> PttConfig {
+        PttConfig::Gpio {
+            line: GpioLine::Chardev {
+                chip: "pinctrl-bcm2711".into(),
+                line: 17,
+            },
+        }
+    }
 
     fn addr(s: &str) -> Listener {
         Listener::Listening(s.parse().unwrap())
@@ -228,7 +238,7 @@ mod tests {
         assert_eq!(fallback.active, PttActive::None);
         let connected = PttStartup::new(PttConfig::Rigctld, "127.0.0.1:1", true, Ok(()));
         assert_eq!(connected.active, PttActive::Rigctld);
-        let gpio = PttStartup::new(PttConfig::Gpio { pin: "17".into() }, "", false, Ok(()));
+        let gpio = PttStartup::new(gpio_chardev(), "", false, Ok(()));
         assert_eq!(gpio.active, PttActive::Gpio);
     }
 
@@ -251,8 +261,17 @@ mod tests {
             ptt(serial, PttActive::Serial, Ok(())).method(),
             "serial /dev/ttyUSB0 rts"
         );
-        let gpio = PttConfig::Gpio { pin: "17".into() };
-        assert_eq!(ptt(gpio, PttActive::Gpio, Ok(())).method(), "gpio 17");
+        assert_eq!(
+            ptt(gpio_chardev(), PttActive::Gpio, Ok(())).method(),
+            "gpio pinctrl-bcm2711:17"
+        );
+        let sysfs = PttConfig::Gpio {
+            line: GpioLine::Sysfs(529),
+        };
+        assert_eq!(
+            ptt(sysfs, PttActive::Gpio, Ok(())).method(),
+            "gpio 529 (sysfs)"
+        );
     }
 
     #[test]
@@ -311,9 +330,8 @@ mod tests {
             ptt(PttConfig::Rigctld, PttActive::Rigctld, Ok(())).guardian_not_started(false),
             Guardian::Off
         );
-        let gpio = PttConfig::Gpio { pin: "17".into() };
         assert_eq!(
-            ptt(gpio, PttActive::Gpio, Ok(())).guardian_not_started(false),
+            ptt(gpio_chardev(), PttActive::Gpio, Ok(())).guardian_not_started(false),
             Guardian::Off
         );
         let serial = PttConfig::Serial {

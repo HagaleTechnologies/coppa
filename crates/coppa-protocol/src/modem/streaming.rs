@@ -20,7 +20,7 @@
 //!
 //! 1. First `need = rx_group_delay + (3 + header_syms) * symbol_len` — just enough
 //!    for the preamble, probe/fine-sync symbol, and the protected header, PLUS the
-//!    RX bandpass filter's own group delay (see [`StreamingReceiver::header_peek`]'s
+//!    RX bandpass filter's own group delay (see `StreamingReceiver::header_peek`'s
 //!    doc for why that's needed). Once buffered, the header ALONE is demodulated
 //!    (`CoppaTransceiver::demodulate_header`) to learn the frame's speed level. A
 //!    header decode failure discards the candidate and
@@ -787,6 +787,25 @@ mod tests {
     /// discarded (header decode "failure") even though the full-frame path
     /// (reached only if the header peek succeeds) re-derives its own
     /// timing/CFO independently and would have decoded it fine.
+    #[test]
+    fn streaming_decodes_distant_cfo_offsets() {
+        let profile = CoppaProfile::hf_standard();
+        let tx = CoppaTransceiver::new(profile.clone(), 1);
+        let payload = vec![0xA7; 100];
+        let frame = make_frame(&tx, 2, &payload);
+        for off in [-150.0, 150.0] {
+            let shifted = coppa_channel::frequency_shift(&frame, off, 48_000.0);
+            let noisy = coppa_channel::awgn_seeded(&shifted, 12.0, 0xBEEF);
+            let mut stream = vec![0.0; 4 * (profile.fft_size + profile.cp_samples)];
+            stream.extend(noisy);
+            stream.extend(vec![0.0; 4 * (profile.fft_size + profile.cp_samples)]);
+            let mut rx = StreamingReceiver::new(profile.clone(), 1);
+            let decoded = rx.push_samples(&stream);
+            assert_eq!(decoded.len(), 1, "CFO {off}: no decoded frame");
+            assert_eq!(&decoded[0].payload[..payload.len()], &payload);
+        }
+    }
+
     #[test]
     fn streaming_decodes_a_frame_with_injected_cfo() {
         let profile = CoppaProfile::hf_standard();

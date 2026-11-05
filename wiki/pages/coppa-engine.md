@@ -62,7 +62,10 @@ FFI). The main encode/decode logic is in `coppa-protocol`, not here.
   sparse (see [[adr-004-strongest-path-timing]]).
 - **`coppa_engine::ladder`** assembles each speed level's modulation, code rate,
   max bytes, air time and bandwidth per band from the encoder's own functions;
-  `coppa profiles` prints it (COP-55).
+  `coppa profiles` prints it (COP-55). The payload budget is per codeword;
+  multi-codeword frames can carry multiples of it, and daemon stream writes
+  are chunked. See [SPEC §12](../../docs/SPEC.md#cli-payload-budget-mapping)
+  for the CLI/JSON units and their relation to the daemon contracts (COP-127).
 
 ## Why it is shaped this way
 
