@@ -19,6 +19,56 @@ pub const MAX_DIGIPEATERS: usize = 8;
 
 const AX25_CRC: Crc<u16> = Crc::<u16>::new(&CRC_16_IBM_SDLC);
 
+// Return the end of a complete address field, reserving ctrl, PID and FCS.
+fn address_end(frame: &[u8]) -> Option<usize> {
+    if frame.len() < 18 || frame[6] & 1 != 0 {
+        return None;
+    }
+    for index in 1..(2 + MAX_DIGIPEATERS) {
+        let end = (index + 1) * 7;
+        if end + 4 > frame.len() {
+            return None;
+        }
+        if frame[end - 1] & 1 != 0 {
+            return Some(end);
+        }
+    }
+    None
+}
+
+/// Mark the first unused path entry if it matches the alias, recomputing FCS.
+///
+/// Input and output include FCS. The caller must have verified the input FCS.
+/// Control, PID, payload and all other address bits are preserved.
+pub fn digipeat(frame: &[u8], alias_callsign: &str, alias_ssid: u8) -> Option<Vec<u8>> {
+    let end = address_end(frame)?;
+    let offset = (14..end).step_by(7).find(|&i| frame[i + 6] & 0x80 == 0)?;
+    let address = Ax25Address::from_bytes(&frame[offset..offset + 7])?;
+    if address.ssid != alias_ssid || !address.callsign.eq_ignore_ascii_case(alias_callsign) {
+        return None;
+    }
+    let mut marked = frame.to_vec();
+    marked[offset + 6] |= 0x80;
+    let len = marked.len();
+    let fcs = AX25_CRC.checksum(&marked[..len - 2]).to_le_bytes();
+    marked[len - 2..].copy_from_slice(&fcs);
+    Some(marked)
+}
+
+/// Duplicate identity excluding FCS and path H bits.
+///
+/// The caller must have verified the input FCS. Malformed address fields are
+/// left unchanged, apart from dropping the trailing FCS.
+pub fn dedupe_key(frame: &[u8]) -> Vec<u8> {
+    let mut key = frame[..frame.len().saturating_sub(2)].to_vec();
+    if let Some(end) = address_end(frame) {
+        for i in (14..end).step_by(7) {
+            key[i + 6] &= !0x80;
+        }
+    }
+    key
+}
+
 // ── Address ──────────────────────────────────────────────────────────────────
 
 /// An AX.25 address (callsign + SSID).
@@ -207,6 +257,99 @@ mod tests {
 
     // ── Address round-trips ───────────────────────────────────────────────────
 
+    fn repeat_frame() -> Vec<u8> {
+        Ax25Frame {
+            dest: Ax25Address {
+                callsign: "APRS".into(),
+                ssid: 0,
+            },
+            src: Ax25Address {
+                callsign: "W1AW".into(),
+                ssid: 0,
+            },
+            digipeaters: vec![Ax25Address {
+                callsign: "N0CALL".into(),
+                ssid: 2,
+            }],
+            info: b"test".to_vec(),
+        }
+        .to_bytes()
+    }
+
+    #[test]
+    fn digipeat_marks_first_unused_alias_and_recomputes_fcs() {
+        let frame = repeat_frame();
+        let marked = digipeat(&frame, "n0call", 2).unwrap();
+        assert_eq!(marked[20], frame[20] | 0x80);
+        for i in 0..frame.len() - 2 {
+            if i != 20 {
+                assert_eq!(marked[i], frame[i]);
+            }
+        }
+        let crc = Crc::<u16>::new(&CRC_16_IBM_SDLC);
+        assert_eq!(
+            crc.checksum(&marked[..marked.len() - 2]).to_le_bytes(),
+            marked[marked.len() - 2..]
+        );
+        // Non-UI control/PID bytes must survive too.
+        let mut other = frame;
+        other[21] = 0x13;
+        other[22] = 0xcf;
+        let marked = digipeat(&other, "N0CALL", 2).unwrap();
+        assert_eq!(&marked[21..23], &[0x13, 0xcf]);
+    }
+
+    #[test]
+    fn digipeat_refuses_when_alias_not_first_unused() {
+        assert!(digipeat(&repeat_frame(), "OTHER", 2).is_none());
+        let mut frame = repeat_frame();
+        frame[20] &= !1;
+        frame.splice(
+            21..21,
+            Ax25Address {
+                callsign: "OTHER".into(),
+                ssid: 0,
+            }
+            .to_bytes(true),
+        );
+        assert!(digipeat(&frame, "OTHER", 0).is_none());
+        frame[20] |= 0x80;
+        assert!(digipeat(&frame, "OTHER", 0).is_some());
+    }
+
+    #[test]
+    fn digipeat_refuses_used_alias() {
+        let marked = digipeat(&repeat_frame(), "N0CALL", 2).unwrap();
+        assert!(digipeat(&marked, "N0CALL", 2).is_none());
+        assert!(digipeat(&repeat_frame(), "N0CALL", 1).is_none());
+    }
+
+    #[test]
+    fn digipeat_returns_none_without_path_or_on_malformed_frames() {
+        let frame = repeat_frame();
+        for n in 0..25 {
+            assert!(digipeat(&frame[..n], "N0CALL", 2).is_none());
+        }
+        let mut no_path = frame.clone();
+        no_path[13] |= 1;
+        assert!(digipeat(&no_path, "N0CALL", 2).is_none());
+        let mut unterminated = frame.clone();
+        unterminated[20] &= !1;
+        assert!(digipeat(&unterminated, "N0CALL", 2).is_none());
+        let mut bad_dest = frame;
+        bad_dest[6] |= 1;
+        assert!(digipeat(&bad_dest, "N0CALL", 2).is_none());
+    }
+
+    #[test]
+    fn dedupe_key_ignores_h_bits_and_fcs() {
+        let frame = repeat_frame();
+        let marked = digipeat(&frame, "N0CALL", 2).unwrap();
+        assert_eq!(dedupe_key(&frame), dedupe_key(&marked));
+        let mut different = frame.clone();
+        different[23] ^= 1;
+        assert_ne!(dedupe_key(&frame), dedupe_key(&different));
+    }
     #[test]
     fn address_roundtrip_normal() {
         let addr = Ax25Address {

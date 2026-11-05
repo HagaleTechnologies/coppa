@@ -9,6 +9,7 @@ sources:
   - crates/coppa-cli/src/main.rs
   - crates/coppa-daemon/src/config.rs
   - crates/coppa-radio/src/band.rs
+  - docs/TNC.md
   - coppad.toml.example
   - docs/tutorials/getting-started.md
 verified:
@@ -21,3 +22,5 @@ The full setup and search order are in [Getting started](../../docs/tutorials/ge
 - Copying `coppad.toml.example` selects `HF_STANDARD`. The CLI's built-in no-file profile differs; both ends must use the same profile to decode each other.
 - `band = ""` is an explicit, invalid band label. Remove the key if you want no band evidence.
 - `coppa tnc` has a separate AFSK configuration path and does not read these settings. `devices` and `config` also ignore them.
+
+- AFSK digipeating uses an opt-in command flag, not persisted settings. See [TNC digipeating](../../docs/TNC.md#digipeating) for alias rules, carrier sense and repeat expiry.
