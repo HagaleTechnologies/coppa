@@ -11,7 +11,7 @@ per-frame overhead (preamble + probe + protected header, ~7-19 OFDM symbols depe
 large relative to one codeword's own payload span -- e.g. at level 6 (16-QAM) one codeword's payload
 is only 12 OFDM symbols, so a single-codeword frame spends roughly 7/19 (~37%) of its airtime on
 overhead that carries no payload bits at all. Phase 3's system-layer plan (decision 6,
-`docs/superpowers/plans/2026-07-03-phase3-system-layer.md`) calls for batching up to 8 codewords
+`docs/adr/008-phase3-system-layer.md`) calls for batching up to 8 codewords
 into one frame to amortize that fixed cost, and for reusing the already-built (but until now
 bench-only) `CrossFrameInterleaver` to spread each codeword's coded bits across all codewords'
 time-slots *within* that one frame, so a short, contiguous mid-frame fade damages every codeword a
@@ -115,5 +115,4 @@ little rather than one codeword a lot.
   pattern as the Phase 1 waveform break (ADR-003) and the Phase 2 NR BG2 break (ADR-005).
 - **Flagged, not silently dropped, gap**: `(seq, codeword-index)` ACK addressing (decision 4 above)
   and turbo/IR-HARQ extension to multi-codeword frames (decision 5 above) are real, deliberate scope
-  cuts for a future task, not oversights -- see the Task 5 report (`.superpowers/sdd/task-5-report.md`)
-  for the full reasoning behind each.
+  cuts for a future task, not oversights.

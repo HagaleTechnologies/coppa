@@ -395,8 +395,7 @@ pub struct EngineSection {
     /// `RateLoop::with_probing`). `0` (the default) disables probing entirely --
     /// an explicit opt-in. Only takes effect when `arq_enabled` is also
     /// `true` -- probing needs the ARQ ACK/timeout feedback loop to attribute a
-    /// probe's outcome. See `docs/superpowers/specs/
-    /// 2026-07-25-rateloop-daemon-probe-wiring-design.md`.
+    /// probe's outcome.
     pub rate_loop_probe_interval: u32,
     /// Index-steps up the speed-level ladder a probe reaches for (see
     /// `RateLoop::with_probing`'s `probe_offset`). Ignored when
@@ -411,9 +410,7 @@ pub struct EngineSection {
     /// automatically** -- it is measurement/telemetry only; actually
     /// switching `CoppaProfile` mid-session needs the peer-negotiation
     /// handshake in `coppa_protocol::cp_negotiator`, gated separately by
-    /// `cp_negotiation_enabled` (see that field's own doc). See
-    /// `docs/superpowers/specs/2026-07-25-cpgate-daemon-wiring-design.md`
-    /// for the full reasoning behind this module's own telemetry-only scope.
+    /// `cp_negotiation_enabled` (see that field's own doc).
     ///
     /// Reverse cross-reference (COP-2): `cp_negotiation_enabled` has no
     /// **proposer** without this flag. The only code that can send a `Propose`
@@ -421,8 +418,7 @@ pub struct EngineSection {
     /// can only ever *answer* a peer -- never start one.
     pub cp_gate_enabled: bool,
     /// Enable the CP-switch peer-negotiation handshake (see
-    /// `coppa_protocol::cp_negotiator` and `docs/superpowers/specs/
-    /// 2026-07-29-cp-switch-peer-negotiation-design.md`). `false` (the
+    /// `coppa_protocol::cp_negotiator`). `false` (the
     /// default) is an explicit opt-in, matching `cp_gate_enabled`'s and
     /// `rate_loop_probe_interval`'s convention exactly.
     ///
