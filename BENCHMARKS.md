@@ -1250,9 +1250,9 @@ issue already tracked as open in this document's "Known Limitations" (see
 docs/LIMITATIONS.md); it is **not** a bug in `RateLoop`'s hysteresis logic itself, and
 fixing the underlying metric is out of this task's scope (it belongs to the
 channel-estimation / MCS-calibration layer, not the rate-loop controller). See
-`crates/coppa-bench/diagnostics/closed_loop_arq.rs`'s module doc for the full investigation,
-including two
-unrelated real bugs found and fixed in the bench itself along the way (a
+`crates/coppa-bench/diagnostics/closed_loop_arq.rs`'s module doc for a summary of the
+capacity-bias hypothesis and its caveats. Two unrelated real bugs were found
+and fixed in the bench itself along the way (a
 constant `seq_num` corrupting IR-HARQ's per-seq accumulator across
 logically-independent simulated frames, and a shared transceiver risking the
 same cross-contamination across fixed-level runs).

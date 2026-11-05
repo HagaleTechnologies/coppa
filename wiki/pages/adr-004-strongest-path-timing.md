@@ -32,4 +32,4 @@ safety intent for genuine very-large-delay multipath. Levels 1–2 fully recover
 level 3 very close; level 4 substantially improved but with a residual ~25% gap
 not yet root-caused (see [[watterson-level-4-gap]]).
 
-Full bisection data and before/after tables: `docs/adr/004-strongest-path-timing.md`.
+Bisection results and timing-anchor decision: `docs/adr/004-strongest-path-timing.md`.

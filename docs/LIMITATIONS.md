@@ -134,8 +134,8 @@ still short of the plan's `>1.0`/`>=0.8` bar. Multiple refinements all converged
 remaining tuning gap. Shipped anyway per the same honest-partial-progress precedent as the
 capacity/selectivity level-bias correction above: real, verified, substantial improvement, gap
 documented rather than hidden. Real daemon wiring (applying a probe level to one live outgoing frame
-and reverting afterward) remains explicitly deferred to a future cycle. See `crates/coppa-bench/diagnostics/closed_loop_arq.rs`'s module doc for the complete sweep
-data. **`SPEED_LEVEL_MIN_CAPACITY` was since recalibrated from clean,
+and reverting afterward) remains explicitly deferred to a future cycle. See `crates/coppa-bench/diagnostics/closed_loop_arq.rs`'s module doc for a summary of the
+probing sweep and its winning configuration. **`SPEED_LEVEL_MIN_CAPACITY` was since recalibrated from clean,
 HARQ-fix-correct data (2026-07-26) and re-measured — a real, meaningful improvement on one metric,
 but it does not close this bench's gap.** PR #61/#62 (see the level-9 AWGN-waterfall bullet below)
 fixed a stale-IR-HARQ-accumulator bench-harness bug that had corrupted `mcs_calibration.rs`'s
