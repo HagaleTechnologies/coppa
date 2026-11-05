@@ -1631,8 +1631,12 @@ The reference daemon sends `dest = src = ` its own callsign, `ssid = 0`,
 (§16.1). A receiver decodes it as above. An empty payload, a payload that
 ends before the `grid_len` byte or before the `level` byte, and invalid
 UTF-8 are errors; bytes after `level` are ignored (`StationIdPayload::from_bytes`,
-`mac.rs:331`). The reference receiver only logs a received beacon
-(`handle_beacon_rx`, `event_loop.rs:6278`); it changes no state.
+`mac.rs:331`). The reference receiver decodes a received beacon
+(`handle_beacon_rx`, `event_loop.rs:6431`) and records the station -- callsign,
+grid, level, SNR and the time heard -- in its 32-entry heard list, with no
+session or state-machine effect (a beacon is not directed at the receiving
+station). A beacon whose payload fails to decode is recorded under its MAC
+source callsign.
 
 ### 17.6 Parse rules and receiver tolerance
 
