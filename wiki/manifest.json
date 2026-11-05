@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-11-04T21:42:46Z",
-  "head_commit": "ca75de8",
+  "generated_at": "2026-11-05T23:08:40Z",
+  "head_commit": "11a49f3",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -112,7 +112,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:89a211dcd2f3330f4d212adf6eda685504c3ae43d7445ef8b5e6408f4b50718c",
+      "hash": "sha256:7b6a5e05f5aa2c2279ff3eae30b40074533e09efef1bfc7674cd3d0602362cec",
       "id": "adr-006-phase2-estimation",
       "kind": "decision-digest",
       "links": [
