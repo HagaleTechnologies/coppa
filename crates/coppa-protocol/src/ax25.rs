@@ -19,14 +19,17 @@ pub const MAX_DIGIPEATERS: usize = 8;
 
 const AX25_CRC: Crc<u16> = Crc::<u16>::new(&CRC_16_IBM_SDLC);
 
-// Return the end of a complete address field, reserving ctrl, PID and FCS.
+// Return the end of a complete address field, reserving the minimum
+// one-byte control field and the two-byte FCS. U/S frames (SABM, UA, DISC,
+// modulo-8 supervisory) carry no PID, so only three trailing bytes are
+// guaranteed to exist.
 fn address_end(frame: &[u8]) -> Option<usize> {
-    if frame.len() < 18 || frame[6] & 1 != 0 {
+    if frame.len() < 17 || frame[6] & 1 != 0 {
         return None;
     }
     for index in 1..(2 + MAX_DIGIPEATERS) {
         let end = (index + 1) * 7;
-        if end + 4 > frame.len() {
+        if end + 3 > frame.len() {
             return None;
         }
         if frame[end - 1] & 1 != 0 {
@@ -39,7 +42,8 @@ fn address_end(frame: &[u8]) -> Option<usize> {
 /// Mark the first unused path entry if it matches the alias, recomputing FCS.
 ///
 /// Input and output include FCS. The caller must have verified the input FCS.
-/// Control, PID, payload and all other address bits are preserved.
+/// Control, PID, payload and all other address bits are preserved. PID-less
+/// control frames (U/S frames: no PID byte exists) are accepted.
 pub fn digipeat(frame: &[u8], alias_callsign: &str, alias_ssid: u8) -> Option<Vec<u8>> {
     let end = address_end(frame)?;
     let offset = (14..end).step_by(7).find(|&i| frame[i + 6] & 0x80 == 0)?;
@@ -317,6 +321,62 @@ mod tests {
         assert!(digipeat(&frame, "OTHER", 0).is_some());
     }
 
+    /// Build a raw PID-less control frame (SABM/UA/DISC/supervisory shape):
+    /// dest + src + one digipeater + control + FCS. No PID byte exists.
+    fn pid_less_control_frame(ctrl: u8) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(
+            &Ax25Address {
+                callsign: "APRS".into(),
+                ssid: 0,
+            }
+            .to_bytes(false),
+        );
+        buf.extend_from_slice(
+            &Ax25Address {
+                callsign: "W1AW".into(),
+                ssid: 0,
+            }
+            .to_bytes(false),
+        );
+        buf.extend_from_slice(
+            &Ax25Address {
+                callsign: "N0CALL".into(),
+                ssid: 2,
+            }
+            .to_bytes(true),
+        );
+        buf.push(ctrl);
+        let crc = AX25_CRC.checksum(&buf);
+        buf.push((crc & 0xFF) as u8);
+        buf.push((crc >> 8) as u8);
+        buf
+    }
+
+    #[test]
+    fn digipeat_marks_pid_less_control_frames() {
+        // SABM, UA, DISC and modulo-8 supervisory frames carry no PID:
+        // addresses + one control byte + FCS. They must still be repeated,
+        // or no connected-mode session can pass through this digipeater.
+        for ctrl in [0x2F, 0x63, 0x43, 0x81] {
+            let frame = pid_less_control_frame(ctrl);
+            assert_eq!(frame.len(), 24);
+            let marked = digipeat(&frame, "N0CALL", 2).unwrap();
+            assert_eq!(marked[20], frame[20] | 0x80);
+            for i in 0..frame.len() - 2 {
+                if i != 20 {
+                    assert_eq!(marked[i], frame[i]);
+                }
+            }
+            assert_eq!(
+                AX25_CRC.checksum(&marked[..marked.len() - 2]).to_le_bytes(),
+                marked[marked.len() - 2..]
+            );
+            assert!(digipeat(&marked, "N0CALL", 2).is_none());
+            assert_eq!(dedupe_key(&frame), dedupe_key(&marked));
+        }
+    }
+
     #[test]
     fn digipeat_refuses_used_alias() {
         let marked = digipeat(&repeat_frame(), "N0CALL", 2).unwrap();
@@ -327,7 +387,10 @@ mod tests {
     #[test]
     fn digipeat_returns_none_without_path_or_on_malformed_frames() {
         let frame = repeat_frame();
-        for n in 0..25 {
+        // Truncated prefixes are refused up to the shortest complete frame
+        // with a path entry: addresses + control + FCS (24 bytes), which is
+        // a valid PID-less control frame (see the test above).
+        for n in 0..24 {
             assert!(digipeat(&frame[..n], "N0CALL", 2).is_none());
         }
         let mut no_path = frame.clone();
