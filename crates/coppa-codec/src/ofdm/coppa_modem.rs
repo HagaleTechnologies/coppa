@@ -868,7 +868,7 @@ impl CoppaModem {
         };
 
         // 1. Sync: streaming O(1) detector (see `sync_detector` module docs), which now
-        // also produces a two-stage Moose CFO estimate (`cfo_hz`, ±50 Hz range) alongside
+        // also produces a two-stage Moose CFO estimate (`cfo_hz`, ±171 Hz standard-HF hypothesis-search range) alongside
         // timing — see `sync::estimate_cfo_two_stage` and `SyncDetector::estimate_cfo_from_ring`.
         let candidate = SyncDetector::detect_all(&self.profile, self.version, samples)
             .into_iter()

@@ -2059,6 +2059,27 @@ mod tests {
     }
 
     #[test]
+    fn loopback_decodes_distant_cfo_offsets() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let payload = vec![0xA7; 100];
+        let samples = tx.transmit(&make_header(2, 100), &payload).unwrap();
+        for off in [-150.0, -100.0, -60.0, 60.0, 100.0, 150.0] {
+            for noisy in [false, true] {
+                let shifted = coppa_channel::frequency_shift(&samples, off, 48_000.0);
+                let input = if noisy {
+                    coppa_channel::awgn_seeded(&shifted, 12.0, 0xBEEF)
+                } else {
+                    shifted
+                };
+                let (_, decoded, _) = tx
+                    .receive(&input)
+                    .unwrap_or_else(|e| panic!("CFO {off}, noisy {noisy}: {e:?}"));
+                assert_eq!(&decoded[..payload.len()], &payload);
+            }
+        }
+    }
+
+    #[test]
     fn loopback_survives_ssb_filter_and_50hz_mistune() {
         // The bar Phase 1 exists to clear: a real radio's passband + a realistic mistune.
         let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
