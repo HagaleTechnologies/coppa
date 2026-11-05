@@ -9,13 +9,14 @@ sources:
   - crates/coppa-daemon/tests/cli.rs
   - docs/OPERATING.md
 verified:
-  commit: b9fdb8d
-  date: 2026-11-02
+  commit: 2526b50
+  date: 2026-11-03
 links:
   - overview
 ---
 COP-140's `mdns` feature advertises `coppad.local.` and one `_coppa._tcp`
-service with the in-process `mdns-sd` crate. How to build, enable and probe it
+service with the in-process `mdns-sd` crate. With `coppad --instance NAME`
+(COP-85) both names become `coppad-NAME` (`mdns::Names::for_instance`). How to build, enable and probe it
 is in [OPERATING.md](../../docs/OPERATING.md#finding-coppad-on-the-network-mdns).
 Two traps make a same-host test pass or fail for the wrong reason.
 
@@ -33,7 +34,10 @@ Related, seen while probing: `mdns-sd` announces an explicit address only on
 the interface whose subnet holds it, so an address on no local interface is
 never announced. Two responders on one host with the same address raise no
 `NameChange`: identical records are not a conflict under RFC 6762, so the
-rename to `coppad-2.local.` cannot be staged on one host.
+rename to `coppad-2.local.` cannot be staged on one host. An instance named
+`2` advertises that same `coppad-2.local.` on purpose, so a renamed
+`coppad.local` and `coppad --instance 2` on one LAN look alike; pick instance
+names that are not bare digits.
 
 ## getent and glibc do not resolve .local without nss-mdns
 

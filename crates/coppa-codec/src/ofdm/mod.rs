@@ -505,8 +505,8 @@ impl OfdmModulator {
     /// Modulate one OFDM symbol from frequency-domain subcarrier values.
     /// Returns real-valued time-domain samples with cyclic prefix prepended.
     ///
-    /// Uses Hermitian symmetry: subcarrier[i] placed at bin i+1 (positive freq),
-    /// conj(subcarrier[i]) placed at bin N-i-1 (negative freq). This ensures
+    /// Uses Hermitian symmetry: subcarrier\[i\] placed at bin i+1 (positive freq),
+    /// conj(subcarrier\[i\]) placed at bin N-i-1 (negative freq). This ensures
     /// the IFFT output is real-valued for transmission over audio channels.
     pub fn modulate_symbol(&self, subcarriers: &[Complex32]) -> Vec<f32> {
         let n = self.profile.fft_size;

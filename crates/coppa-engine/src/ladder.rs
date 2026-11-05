@@ -27,7 +27,8 @@ use crate::engine::CoppaCore;
 pub struct LevelOnBand {
     /// Occupied bandwidth of the band's OFDM profile, in Hz.
     pub bandwidth_hz: u32,
-    /// Air time of one frame at this level on this band, in seconds.
+    /// Air time of a single-codeword frame at this level on this band, in seconds.
+    /// Includes the frame overhead, which is shared in multi-codeword frames.
     pub airtime_s: f64,
 }
 
@@ -40,7 +41,9 @@ pub struct LevelInfo {
     pub modulation: &'static str,
     /// LDPC code rate actually encoded, `(numerator, denominator)` in lowest terms.
     pub code_rate: (u16, u16),
-    /// Largest payload one frame carries, in bytes (what `transmit` enforces).
+    /// Payload bytes per codeword after compression and before FEC.
+    /// Includes any transport framing but excludes the per-codeword CRC.
+    /// Multi-codeword frames carry multiples of this budget.
     pub max_payload_bytes: usize,
     /// The level on the HF band, or `None` when HF does not carry it (level 9).
     pub hf: Option<LevelOnBand>,

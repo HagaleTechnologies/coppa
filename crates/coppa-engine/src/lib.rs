@@ -8,6 +8,8 @@
 //! - [`ladder`] - the real per-level facts (modulation, code rate, max bytes,
 //!   air time, bandwidth) that `coppa profiles` shows
 //! - [`morse`] - Morse (CW) keying for the station's closing CW ID
+//! - [`link`] - a connected, reliable session over audio samples (coppad's
+//!   session protocol, without the daemon)
 //!
 //! # Errors
 //!
@@ -26,10 +28,14 @@
 //! ```
 
 #![warn(missing_docs, missing_debug_implementations)]
+// COP-139: the crate takes `now: Instant` from its caller (clippy.toml); its
+// own tests may read the clock to anchor virtual time.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod config;
 pub mod engine;
 pub mod ladder;
+pub mod link;
 pub mod morse;
 
 pub mod profiles;
@@ -39,6 +45,7 @@ pub use engine::{
     CoppaCore, StreamFrame, MAX_TUNE_SECONDS, TUNE_SINGLE_MAX_HZ, TUNE_SINGLE_MIN_HZ,
     TUNE_TONE_HIGH_HZ, TUNE_TONE_LOW_HZ, WIRE_FORMAT_VERSION,
 };
+pub use link::{DisconnectReason, Link, LinkConfig, LinkError, LinkEvent, LinkState};
 pub use profiles::{Profile, EMERGENCY, HF_ROBUST, HF_STANDARD, VHF_FAST};
 
 pub mod error;
