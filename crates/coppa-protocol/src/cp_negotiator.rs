@@ -1,8 +1,6 @@
 //! Peer-negotiation handshake so `coppa_ml::CpGate`'s recommendation (PR
 //! #60, telemetry-only until this module) can actually switch the live
-//! OFDM CP profile between two Coppa stations. See
-//! `docs/superpowers/specs/2026-07-29-cp-switch-peer-negotiation-design.md`
-//! for the full design and rationale.
+//! OFDM CP profile between two Coppa stations.
 //!
 //! This module is pure decision logic -- no `ArqTx`/`ArqRx`/`TransportPdu`
 //! dependency, deliberately, so it's testable in isolation (mirrors

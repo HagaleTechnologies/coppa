@@ -11,8 +11,7 @@
 //! that completes a candidate pays that full demod/FEC cost synchronously before
 //! returning (see that method's doc).
 //!
-//! State machine (locked, see `docs/superpowers/plans/2026-07-03-phase1-radio-reality.md`
-//! Task 7): `Searching` (represented here as `pending: None`) feeds every pushed
+//! State machine (locked since Phase 1 Task 7): `Searching` (represented here as `pending: None`) feeds every pushed
 //! sample to the `SyncDetector` and queues whatever candidates it confirms.
 //! `Accumulating { start, need }` (represented as `pending: Some(Pending { .. })`)
 //! buffers samples from a candidate's `frame_start` until `need` are available, in
@@ -103,8 +102,7 @@ pub struct DecodedFrame {
     /// This frame's measured multipath delay spread (ms), from
     /// `CoppaTransceiver::receive_with_metrics`'s 5th element (originally
     /// `DelayDomainEstimator::delay_spread_ms`, Task 6b). Feeds `coppa_ml::CpGate`'s
-    /// daemon wiring -- see `docs/superpowers/specs/
-    /// 2026-07-25-cpgate-daemon-wiring-design.md`.
+    /// daemon wiring.
     pub delay_spread_ms: f32,
 }
 

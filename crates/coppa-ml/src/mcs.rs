@@ -4,7 +4,7 @@
 //! `select_speed_level_2d`) are the only selection path in this module. An earlier,
 //! now-deleted `MCS_TABLE`/`select_mcs` (a stale, SNR-only, 8 kHz-era 11-entry table) was
 //! superseded by this capacity-based approach and had no real caller left (only its own
-//! predictor test) — see `docs/superpowers/plans/2026-07-03-phase3-system-layer.md` decision 5.
+//! predictor test) — see `docs/adr/008-phase3-system-layer.md` decision 5.
 
 /// Average per-carrier Shannon capacity (bits/s/Hz) from RX per-carrier noise variances
 /// `nv[k] = sigma^2/|H[k]|^2` (per-carrier SNR = `1/nv[k]`). Captures BOTH effective SNR and
