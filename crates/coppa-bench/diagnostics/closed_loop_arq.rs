@@ -192,8 +192,8 @@
 //! `COPPA_CL_FRAMES` / `COPPA_CL_SEEDS` overrides exist so a wiring bug shows up in seconds instead
 //! of only at full scale -- a bench nobody will re-run is a bench that rots.
 use coppa_bench::adaptive_goodput::{
-    best_arm, best_arm_by_bits, delivered_bits, goodput_bps, oracle_bits, oracle_goodput_bps,
-    FrameSlot,
+    best_arm, best_arm_by_bits, delivered_bits, goodput_bps, legacy_rate_bars, oracle_bits,
+    oracle_goodput_bps, standard_rate_bars, FrameSlot,
 };
 use coppa_bench::cp_arm::{
     self, frame_seed, goodput_with_switch_cost_bps, same_profile, switch_airtime_s, CpPolicy,
@@ -919,7 +919,21 @@ fn main() {
     }
     println!();
 
-    let results: Vec<SeedResult> = seeds.iter().map(|&s| run_seed(&pair, s, n)).collect();
+    // Seeds have independent transceivers and RNGs. Join in seed order so
+    // concurrency changes runtime, not the comparisons or output ordering.
+    let results: Vec<SeedResult> = std::thread::scope(|scope| {
+        let handles: Vec<_> = seeds
+            .iter()
+            .map(|&s| {
+                let pair = &pair;
+                scope.spawn(move || run_seed(pair, s, n))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("seed worker failed"))
+            .collect()
+    });
 
     // ---- Per-seed primary table -------------------------------------------------
     println!("\n=== PRIMARY: airtime-normalized goodput (bits/s) ===");
@@ -1066,6 +1080,39 @@ fn main() {
          structurally blind to an airtime lever."
     );
 
+    // Segment evidence keeps failed frames' airtime. Charge each handshake
+    // to the segment of its deciding frame, matching run_arm's accounting.
+    for (si, r) in results.iter().enumerate() {
+        println!(
+            "COP-152 seed={} arm-B bits={} data_air={:.17} switch_air={:.17}",
+            seeds[si],
+            delivered_bits(&r.arm_b.slots),
+            total_airtime(&r.arm_b.slots),
+            r.arm_b.switch_air_s
+        );
+        for seg in [2, 3] {
+            let slots: Vec<_> = r
+                .arm_b
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(f, _)| segment(*f, n) == seg)
+                .map(|(_, s)| *s)
+                .collect();
+            let switch_air: f64 = r
+                .arm_b
+                .switches
+                .iter()
+                .filter(|sw| segment(sw.decided_at, n) == seg)
+                .map(|sw| {
+                    switch_airtime_s(sw, &pair.for_mode(sw.from), &pair.for_mode(sw.to)).unwrap()
+                })
+                .sum();
+            println!("COP-152 segment seed={} segment={seg} bits={} data_air={:.17} switch_air={switch_air:.17}",
+                seeds[si], delivered_bits(&slots), total_airtime(&slots));
+        }
+    }
+
     // ---- Legacy (airtime-blind) control ----------------------------------------
     println!("\n=== LEGACY CONTROL (airtime-blind bits-per-slot; proves the metric swap changed accounting only) ===");
     println!(
@@ -1077,6 +1124,12 @@ fn main() {
         let ab = delivered_bits(&r.arm_a.slots);
         let (bi, bb) = best_arm_by_bits(r.long_cells()).expect("9 long cells");
         let ob = oracle_bits(&SeedResult::oracle_frames(r.long_cells(), n));
+        let bars = if base == "robust" && seeds[si] == 0 && n == 300 && seeds == SEEDS {
+            legacy_rate_bars(ab, bb, ob)
+        } else {
+            None
+        };
+        println!("COP-152 legacy seed={} adaptive={ab} fixed={bb} oracle={ob} bars={bars:?} (None = non-decisional)", seeds[si]);
         println!(
             "seed {:<3} adaptive {:>7} bits | best fixed (L{:<2}) {:>7} bits | oracle {:>7} bits | \
              a/o = {:.3}  a/bf = {:.3}",
@@ -1194,6 +1247,19 @@ fn main() {
     let m_bf_joint = mean(&|s| s.bf_joint);
     let m_orc_long = mean(&|s| s.orc_long);
     let m_orc_joint = mean(&|s| s.orc_joint);
+
+    let operands: Vec<_> = agg
+        .iter()
+        .map(|v| [v.arm_b_x1, v.bf_joint, v.orc_joint])
+        .collect();
+    let bars = if base == "standard" {
+        standard_rate_bars(seeds, n, &operands)
+    } else {
+        None
+    };
+    println!(
+        "COP-152 standard arm-B-x1 operands={operands:?} bars={bars:?} (None = non-decisional)"
+    );
 
     println!("\n=== TICKET COP-2 DELTA ===");
     println!("Both answers below were PRE-COMMITTED in the plan (D4a) before this run.\n");

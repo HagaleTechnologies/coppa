@@ -22,6 +22,39 @@
 //! deliberate and left alone: it serves the whole FER/BER sweep harness, and
 //! unifying the two would silently re-base every table `runner.rs` feeds.
 
+/// Exact historical slot-count bars. Zero comparator totals are invalid.
+pub fn legacy_rate_bars(adaptive: usize, fixed: usize, oracle: usize) -> Option<(bool, bool)> {
+    if fixed == 0 || oracle == 0 {
+        return None;
+    }
+    Some((adaptive > fixed, 5 * adaptive as u128 >= 4 * oracle as u128))
+}
+
+/// Full standard-profile comparison. Inputs are per-seed goodputs, including
+/// failed-transmission airtime and the x1 handshake charge on the adaptive arm.
+/// Only the unchanged five-seed, 300-frame schedule is decisional. Ratios use
+/// sums of goodputs, equivalent to ratios of means, never means of ratios.
+pub fn standard_rate_bars(
+    seeds: &[u64],
+    frames: usize,
+    values: &[[f64; 3]],
+) -> Option<(bool, bool)> {
+    if seeds != [0, 1, 2, 3, 4]
+        || frames != 300
+        || values.len() != seeds.len()
+        || values
+            .iter()
+            .any(|v| v.iter().any(|x| !x.is_finite() || *x < 0.0) || v[1] == 0.0 || v[2] == 0.0)
+    {
+        return None;
+    }
+    let sums: [f64; 3] = std::array::from_fn(|i| values.iter().map(|v| v[i]).sum());
+    if sums.iter().any(|x| !x.is_finite()) {
+        return None;
+    }
+    Some((sums[0] / sums[1] > 1.0, sums[0] / sums[2] >= 0.8))
+}
+
 use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::modem::frame_airtime_s;
 use coppa_protocol::modem::speed_levels::max_payload_for_level;
@@ -730,5 +763,57 @@ mod tests {
 
         let no_arms: [Vec<FrameSlot>; 0] = [];
         assert_eq!(best_arm_by_bits(&no_arms), None);
+    }
+}
+
+#[cfg(test)]
+mod rate_bar_tests {
+    use super::{legacy_rate_bars, standard_rate_bars};
+
+    #[test]
+    fn legacy_boundaries_use_widened_integer_arithmetic() {
+        assert_eq!(legacy_rate_bars(80, 80, 100), Some((false, true)));
+        assert_eq!(legacy_rate_bars(79, 78, 100), Some((true, false)));
+        assert_eq!(
+            legacy_rate_bars(usize::MAX, usize::MAX - 1, usize::MAX),
+            Some((true, true))
+        );
+        assert_eq!(legacy_rate_bars(1, 0, 1), None);
+        assert_eq!(legacy_rate_bars(1, 1, 0), None);
+    }
+
+    #[test]
+    fn standard_boundaries_are_unrounded_and_require_the_full_schedule() {
+        let seeds = [0, 1, 2, 3, 4];
+        assert_eq!(
+            standard_rate_bars(&seeds, 300, &[[80.0, 80.0, 100.0]; 5]),
+            Some((false, true))
+        );
+        assert_eq!(
+            standard_rate_bars(&seeds, 300, &[[79.999999, 79.999998, 100.0]; 5]),
+            Some((true, false))
+        );
+        assert_eq!(
+            standard_rate_bars(&seeds, 300, &[[79.999999, 80.0, 100.0]; 5]),
+            Some((false, false))
+        );
+        assert_eq!(standard_rate_bars(&seeds, 299, &[[1.0; 3]; 5]), None);
+        assert_eq!(standard_rate_bars(&seeds[..1], 300, &[[1.0; 3]]), None);
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(standard_rate_bars(&seeds, 300, &[[1.0, bad, 1.0]; 5]), None);
+            assert_eq!(standard_rate_bars(&seeds, 300, &[[1.0, 1.0, bad]; 5]), None);
+        }
+        // Mean per-seed ratios favors adaptive, but the ratio of means fails.
+        let values = [
+            [2.0, 1.0, 2.0],
+            [1.0, 100.0, 100.0],
+            [2.0, 1.0, 2.0],
+            [2.0, 1.0, 2.0],
+            [2.0, 1.0, 2.0],
+        ];
+        assert_eq!(
+            standard_rate_bars(&seeds, 300, &values),
+            Some((false, false))
+        );
     }
 }
