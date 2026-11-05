@@ -28,3 +28,9 @@ The method and the latest counts are in
   not UTF-8. Strip escapes, decode lossily, and count `[0] ` or `[0.N] ` lines only.
 - Coppa's count moves by up to 28 packets with the start offset. Compare changes against the
   spread the report prints.
+
+COP-115 adds automatic IL2P receive and opt-in `coppa tnc --il2p` transmit.
+See [the IL2P interoperability record](../../docs/testing/tnc-direwolf-il2p.md).
+Compare KISS bytes for identity: Direwolf monitor output truncates long frames,
+and its 1.7 FEC status labels IL2P as FX.25. Decode counts alone prove neither
+frame identity nor zero corrections.

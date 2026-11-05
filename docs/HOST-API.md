@@ -363,8 +363,16 @@ VARA path does not use it. [TNC.md](TNC.md) covers building and running it.
   escaped bytes.
 - Only command byte `0x00` (port 0, data) carries frames. TXDELAY, persistence and slot time
   are parsed and ignored.
-- Send frames without an FCS. The TNC adds it on transmit, checks and strips it on receive.
-- Up to 256 bytes of information field.
+- Send complete AX.25 frames without FCS. Ordinary AX.25 adds it on transmit,
+  checks and strips it on receive. IL2P never adds or strips AX.25 FCS.
+- AX.25 and Direwolf 1.7 IL2P are received automatically. `coppa tnc --il2p`
+  selects maximum-FEC IL2P TX; the default and `coppad --tnc` transmit AX.25.
+- Ordinary AX.25 supports the standard 256-byte information field. IL2P supports
+  up to 1023 information bytes in lossless type-1 UI frames, or 1023 total AX.25
+  bytes in transparent type 0. Invalid or oversized IL2P requests are dropped
+  before PTT with `TNC frame cannot be encoded as IL2P; dropping frame`.
+- Direwolf 1.7 IL2P has Reed-Solomon FEC but no trailing CRC. Beyond-bound
+  corruption is not always detectable. See [the interop record](testing/tnc-direwolf-il2p.md).
 - Every client gets each decoded frame, unless it falls more than 64 frames behind: then it
   silently skips the oldest. Up to 16 clients.
 - A frame whose pending bytes exceed 64 KiB is disconnected.

@@ -29,8 +29,9 @@ mod startup_report;
 
 #[cfg(feature = "kiss-tnc")]
 mod kiss_wiring;
+// Use the library runner, also used by the CLI, rather than compiling it twice.
 #[cfg(feature = "kiss-tnc")]
-mod tnc;
+use coppa_daemon::tnc;
 mod tx_chunker;
 mod vara_wiring;
 #[cfg(feature = "websocket")]

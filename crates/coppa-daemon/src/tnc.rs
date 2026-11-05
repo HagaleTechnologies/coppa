@@ -246,6 +246,57 @@ fn air_to_kiss(mut frame: Vec<u8>) -> Vec<u8> {
 /// - PTT control (keys the radio during TX)
 /// - CPAL audio I/O (optional, enabled with `cpal-backend` feature)
 pub async fn run_tnc(config: TncConfig) -> Result<()> {
+    run_tnc_mode(config, TxMode::Ax25).await
+}
+
+/// Run the TNC with maximum-FEC IL2P transmission and automatic AX.25/IL2P RX.
+///
+/// Returns the same audio, KISS binding and rig setup errors as [`run_tnc`].
+pub async fn run_tnc_with_il2p(config: TncConfig) -> Result<()> {
+    run_tnc_mode(config, TxMode::Il2p).await
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TxMode {
+    Ax25,
+    Il2p,
+}
+impl TxMode {
+    fn encode(self, frame: &[u8]) -> Option<Vec<f32>> {
+        match self {
+            Self::Ax25 => Some(kiss_to_air(frame)),
+            Self::Il2p => match coppa_codec::il2p::modulate(frame) {
+                Ok(audio) => Some(audio),
+                Err(error) => {
+                    tracing::warn!(%error, "TNC frame cannot be encoded as IL2P; dropping frame");
+                    None
+                }
+            },
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PacketReceiver {
+    ax25: coppa_codec::afsk::Demodulator,
+    il2p: coppa_codec::il2p::Demodulator,
+}
+impl PacketReceiver {
+    fn process(&mut self, audio: &[f32]) -> Vec<Vec<u8>> {
+        self.ax25.process(audio);
+        self.il2p.process(audio);
+        let mut frames: Vec<_> = self
+            .ax25
+            .take_frames()
+            .into_iter()
+            .map(air_to_kiss)
+            .collect();
+        frames.extend(self.il2p.take_frames());
+        frames
+    }
+}
+
+async fn run_tnc_mode(config: TncConfig, mode: TxMode) -> Result<()> {
     #[cfg(not(feature = "cpal-backend"))]
     for (key, value) in [
         ("audio_device", config.audio_device.as_deref()),
@@ -541,7 +592,7 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
         tokio::select! {
             // RX path: demod thread produced a frame → forward to KISS clients
             Some(frame) = demod_rx.recv() => {
-                let _ = rx_sender.send(air_to_kiss(frame));
+                let _ = rx_sender.send(frame);
             }
 
             // TX path: KISS client sent a frame → modulate and queue it;
@@ -549,8 +600,10 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
             // Not polled while the backlog is full, so later frames wait in
             // the KISS server's bounded channel.
             Some(ax25_data) = tx_receiver.recv(), if tnc_tx.has_room() => {
-                tnc_tx.submit(kiss_to_air(&ax25_data));
-                tnc_tx.poll(Instant::now(), &mut audio_out_prod, ptt.as_mut());
+                if let Some(audio) = mode.encode(&ax25_data) {
+                    tnc_tx.submit(audio);
+                    tnc_tx.poll(Instant::now(), &mut audio_out_prod, ptt.as_mut());
+                }
             }
 
             _ = tx_tick.tick(), if tnc_tx.is_busy() => {
@@ -583,7 +636,7 @@ fn run_demod_worker(
     demod_tx: mpsc::Sender<Vec<u8>>,
     shutdown: &AtomicBool,
 ) {
-    let mut demod = coppa_codec::afsk::Demodulator::new();
+    let mut demod = PacketReceiver::default();
     let mut buf = vec![0.0f32; 1024];
     loop {
         if shutdown.load(Ordering::Acquire) || audio_in.is_abandoned() {
@@ -591,8 +644,7 @@ fn run_demod_worker(
         }
         let n = audio_in.read(&mut buf);
         if n > 0 {
-            demod.process(&buf[..n]);
-            for frame in demod.take_frames() {
+            for frame in demod.process(&buf[..n]) {
                 // Best-effort send; if the main loop is gone, stop.
                 if demod_tx.blocking_send(frame).is_err() {
                     return;
@@ -993,4 +1045,87 @@ mod tests {
         assert!(!h.tx.is_busy());
         assert_eq!(*h.ptt.0.lock().unwrap(), vec![PttState::Tx, PttState::Rx]);
     }
+    #[test]
+    fn il2p_and_ax25_share_fcs_free_kiss_adapter() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/il2p");
+        let binary = std::fs::read(root.join("ui-max.ax25")).unwrap();
+        let mut rx = PacketReceiver::default();
+        assert_eq!(
+            rx.process(&TxMode::Il2p.encode(&binary).unwrap()),
+            vec![binary.clone()]
+        );
+        assert_eq!(
+            rx.process(&TxMode::Ax25.encode(&binary).unwrap()),
+            vec![binary]
+        );
+        for name in [
+            "ui-max",
+            "ui-auto-inverted",
+            "i",
+            "s",
+            "u",
+            "transparent",
+            "maximum",
+        ] {
+            let mut reader = hound::WavReader::open(root.join(format!("{name}.wav"))).unwrap();
+            assert_eq!(reader.spec().sample_rate, 48000);
+            let samples: Vec<_> = reader
+                .samples::<i16>()
+                .map(|s| s.unwrap() as f32 / 32768.0)
+                .collect();
+            let mut frames = Vec::new();
+            for chunk in samples.chunks(1024) {
+                frames.extend(rx.process(chunk));
+            }
+            assert_eq!(
+                frames,
+                vec![std::fs::read(root.join(format!("{name}.ax25"))).unwrap()],
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn il2p_rejection_never_submits_or_keys_and_next_frame_plays_whole() {
+        let mut h = Harness::new();
+        for invalid in [vec![0; 20], {
+            let mut f = std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../testdata/il2p/maximum.ax25"),
+            )
+            .unwrap();
+            f.push(0);
+            f
+        }] {
+            if let Some(audio) = TxMode::Il2p.encode(&invalid) {
+                h.tx.submit(audio);
+            }
+            h.tx.poll(h.now, &mut h.out, &mut h.ptt);
+            assert!(!h.tx.is_busy());
+            assert!(h.ptt.0.lock().unwrap().is_empty());
+        }
+        let frame = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testdata/il2p/maximum.ax25"),
+        )
+        .unwrap();
+        let audio = TxMode::Il2p.encode(&frame).unwrap();
+        assert!(audio.len() > 65536);
+        h.tx.submit(audio.clone());
+        h.run_until_idle(240);
+        assert_eq!(h.sink.captured, audio);
+        let mut rx = PacketReceiver::default();
+        assert_eq!(rx.process(&h.sink.captured), vec![frame]);
+    }
+}
+
+#[cfg(test)]
+#[path = "../../../tests/support/il2p_direwolf.rs"]
+mod il2p_oracle;
+
+#[cfg(test)]
+#[test]
+#[ignore = "requires Direwolf 1.7; set DIREWOLF to its executable"]
+fn direwolf_accepts_tnc_il2p() {
+    il2p_oracle::verify(|frame| TxMode::Il2p.encode(frame).unwrap());
 }

@@ -698,6 +698,9 @@ enum Commands {
         /// Use VOX instead of CAT PTT.
         #[arg(long)]
         vox: bool,
+        /// Transmit IL2P with maximum FEC
+        #[arg(long)]
+        il2p: bool,
     },
 }
 
@@ -906,6 +909,7 @@ fn run() -> Result<()> {
             output_channel,
             rig,
             vox,
+            il2p,
         } => cmd_tnc(
             port,
             device,
@@ -915,6 +919,7 @@ fn run() -> Result<()> {
             output_channel,
             rig,
             vox,
+            il2p,
         )?,
         Commands::Completions { shell } => cmd_completions(shell)?,
         Commands::Man => cmd_man()?,
@@ -2655,6 +2660,7 @@ fn cmd_tnc(
     output_channel: u16,
     rig: Option<String>,
     vox: bool,
+    il2p: bool,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -2670,7 +2676,11 @@ fn cmd_tnc(
             sample_rate: 48000,
             ..Default::default()
         };
-        coppa_daemon::tnc::run_tnc(config).await
+        if il2p {
+            coppa_daemon::tnc::run_tnc_with_il2p(config).await
+        } else {
+            coppa_daemon::tnc::run_tnc(config).await
+        }
     })
 }
 
@@ -2678,6 +2688,22 @@ fn cmd_tnc(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "kiss-tnc")]
+    #[test]
+    fn tnc_il2p_is_opt_in_and_help_describes_maximum_fec() {
+        use clap::CommandFactory;
+        let default = Cli::try_parse_from(["coppa", "tnc", "--vox"]).unwrap();
+        assert!(matches!(default.command, Commands::Tnc { il2p: false, .. }));
+        let enabled = Cli::try_parse_from(["coppa", "tnc", "--vox", "--il2p"]).unwrap();
+        assert!(matches!(enabled.command, Commands::Tnc { il2p: true, .. }));
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("tnc")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--il2p") && help.contains("Transmit IL2P with maximum FEC"));
+    }
     #[test]
     fn device_json_escapes_names_and_empty_lists() {
         let empty: Vec<DeviceOutput> = Vec::new();
