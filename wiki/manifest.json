@@ -577,7 +577,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:f51ed567b48a72ee5b1a0ed2113b57186a4f3bea82b65e8b75695b700aa4475e",
+      "hash": "sha256:5f0af1acfa7a3e56172b9ddf44112b09d4c2af3b27927c0641fe3b2a3dd773cc",
       "id": "session-fade-protection",
       "kind": "gotcha",
       "links": [
