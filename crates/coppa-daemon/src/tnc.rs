@@ -239,6 +239,23 @@ fn kiss_to_air_with_fx25(payload: &[u8]) -> Result<Vec<f32>> {
     }
 }
 
+/// Audio for a KISS payload on the TX path, or `None` when the payload
+/// cannot be encoded. A KISS client can send arbitrary bytes (an empty
+/// data frame is not a valid AX.25 frame), so a client-input encoding
+/// error is logged and the frame is dropped; it never stops the TNC.
+fn tnc_tx_audio(payload: &[u8], fx25: bool) -> Option<Vec<f32>> {
+    if !fx25 {
+        return Some(kiss_to_air(payload));
+    }
+    match kiss_to_air_with_fx25(payload) {
+        Ok(audio) => Some(audio),
+        Err(error) => {
+            tracing::warn!(%error, "Dropping KISS frame that cannot be transmitted");
+            None
+        }
+    }
+}
+
 /// Turn a decoded on-air frame into a KISS data payload.
 ///
 /// KISS frames carry no FCS: the TNC adds it on transmit (see
@@ -571,9 +588,10 @@ async fn run_tnc_mode(config: TncConfig, fx25: bool) -> Result<()> {
             // Not polled while the backlog is full, so later frames wait in
             // the KISS server's bounded channel.
             Some(ax25_data) = tx_receiver.recv(), if tnc_tx.has_room() => {
-                let audio = if fx25 { kiss_to_air_with_fx25(&ax25_data)? } else { kiss_to_air(&ax25_data) };
-                tnc_tx.submit(audio);
-                tnc_tx.poll(Instant::now(), &mut audio_out_prod, ptt.as_mut());
+                if let Some(audio) = tnc_tx_audio(&ax25_data, fx25) {
+                    tnc_tx.submit(audio);
+                    tnc_tx.poll(Instant::now(), &mut audio_out_prod, ptt.as_mut());
+                }
             }
 
             _ = tx_tick.tick(), if tnc_tx.is_busy() => {
@@ -1031,6 +1049,25 @@ mod tests {
             let frames: Vec<_> = demod.take_frames().into_iter().map(air_to_kiss).collect();
             assert_eq!(frames, vec![payload]);
         }
+    }
+
+    /// A KISS client can send `c0 00 c0`, an empty data frame: not a valid
+    /// AX.25 payload, so FX.25 encoding rejects it. That is client input,
+    /// not a TNC-fatal error: the frame is dropped locally and the service
+    /// loop keeps running (the `?` that used to propagate this out of
+    /// `run_tnc_mode` terminated the whole TNC).
+    #[test]
+    fn empty_kiss_frame_is_dropped_not_fatal() {
+        assert!(kiss_to_air_with_fx25(&[]).is_err());
+        assert!(
+            tnc_tx_audio(&[], true).is_none(),
+            "FX.25 TX drops the frame"
+        );
+        assert!(
+            tnc_tx_audio(&[], false).is_some(),
+            "plain TX keeps the pre-FX.25 behavior"
+        );
+        assert!(tnc_tx_audio(b"COP-114", true).is_some());
     }
     #[test]
     fn old_tnc_config_literal_and_entrypoint_remain_compatible() {
