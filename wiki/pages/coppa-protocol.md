@@ -76,3 +76,12 @@ The speed-level abstraction lives here and in `coppa-engine`; see [[coppa-engine
   PDUs also carry `ack=0`, which moves the receiver's own send window once its
   sequence numbers pass 128 (§19.5). Both are bullets in `docs/LIMITATIONS.md`;
   connected sessions are not affected.
+
+## Repeated broadcast files
+
+COP-124 adds bounded file accumulation across repeated OFDM KISS datagrams,
+including late joining without a return channel. Wire format and CRC
+parameters are in [SPEC.md](../../docs/SPEC.md#broadcast-file-application);
+commands and finite-repetition limits are in
+[BROADCAST.md](../../docs/BROADCAST.md). The existing AppPdu fragmentation
+API is unchanged. This has virtual-audio coverage, not RF validation.
