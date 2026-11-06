@@ -52,12 +52,14 @@ Full decision record: `docs/adr/006-phase2-parametric-estimation-nr-bg2.md`.
 
 ## Rate-loop residual experiment
 
-COP-133's reconstruction and incomplete-observation tests live in
-`crates/coppa-protocol/src/modem/transceiver.rs`. The bounded experiment requires
-CRC-verified payloads and complete current-transmission observations. Frame-sized
-HF inputs can lose the last payload symbol after RX filtering, so the candidate
-must fall back rather than truncate the reconstruction. Pooling must follow the
-alternating pilot map to keep physical carriers separate. Turbo observations must
-match the re-equalized frame, and HARQ reconstruction must use the current RV.
-See [the COP-133 benchmark record](../../BENCHMARKS.md#cop-133-same-frame-residual-experiment)
-for the outcome. The production recommendation remains pilot-based.
+COP-152 tested CRC-verified reconstruction on the current transmission's bounded
+payload prefix. Full observations or exactly one missing final OFDM symbol are
+supported. Larger truncation, partial symbols and incomplete physical-carrier
+coverage require pilot fallback. Pooling follows both alternating pilot maps.
+HARQ reconstruction uses the current RV. Turbo rescues retain the matching pilot
+recommendation because the original observations no longer match re-equalization.
+The full loop failed both bars and regressed Poor-segment goodput, so production
+retains the pilot selector. SNR telemetry and LDPC noise retain their separate meaning.
+See [the COP-152 benchmark record](../../BENCHMARKS.md#cop-152-bounded-prefix-payload-residual)
+for screening coverage, full comparisons and their limits. The historical COP-133
+full-observation experiment remains a failed control, not the new contract.
