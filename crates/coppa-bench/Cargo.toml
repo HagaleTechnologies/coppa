@@ -204,3 +204,7 @@ path = "diagnostics/g3ruh_vs_direwolf.rs"
 [[example]]
 name = "impairment_transfer"
 path = "diagnostics/impairment_transfer.rs"
+
+[[example]]
+name = "fx25_wav"
+path = "diagnostics/fx25_wav.rs"

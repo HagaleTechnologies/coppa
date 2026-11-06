@@ -1,0 +1,21 @@
+[48;2;255;255;255m[0J[38;2;0;0;0m[38;2;0;0;0m[38;2;0;0;0m48000 samples per second.  16 bits per sample.  1 audio channels.
+90922 audio bytes in file.  Duration = 0.9 seconds.
+Fix Bits level = 0
+[38;2;0;192;0mChannel 0: 1200 baud, AFSK 1200 & 2200 Hz, A, 48000 sample rate.
+[38;2;0;0;0mFX.25[0.0]: Matched correlation tag 0x07 with 0 bit errors.  Expecting 64 data & 32 check bytes.
+[38;2;0;0;0mFX.25[0.0]: FEC complete with no errors.
+[38;2;0;192;0m
+DECODED[1] 0:00.941 N0CALL audio level = 50(14/14)   FX.25  0
+[38;2;0;192;0m[0] N0CALL>APRS:coppa COP-114 FX25 fixture<0x0a>
+[38;2;0;192;0m------
+U frame UI: p/f=0, No layer 3 protocol implemented., length = 43
+ dest    APRS    0 c/r=1 res=3 last=0
+ source  N0CALL  0 c/r=1 res=3 last=1
+  000:  82 a0 a4 a6 40 40 e0 9c 60 86 82 98 98 e1 03 f0  ....@@..`.......
+  010:  63 6f 70 70 61 20 43 4f 50 2d 31 31 34 20 46 58  coppa COP-114 FX
+  020:  32 35 20 66 69 78 74 75 72 65 0a                 25 fixture.
+------
+[38;2;0;0;0m
+
+1 from crates/coppa-codec/tests/fixtures/fx25/direwolf-clean.wav
+1 packets decoded in 0.010 seconds.  95.7 x realtime
