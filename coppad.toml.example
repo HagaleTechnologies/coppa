@@ -218,6 +218,11 @@ cwid_wpm = 20
 # (negotiated at connect); any other peer runs 1-codeword frames as
 # before, whatever this is set to.
 max_codewords_per_frame = 8
+# "request" sends twelve RS(12,6) packets per segment when the peer accepts.
+# Any six rebuild the segment. Clean-channel throughput costs about 45%.
+# Bursts last up to ~16.4 s. "accept" never asks but accepts a peer's request.
+# "off" disables the mode. Older peers always use plain session frames.
+fade_protection = "accept"
 # ARQ window size (1-32, default 8) -- not yet a real key
 # arq_window = 8
 # Max retransmit attempts per frame (default 5) -- not yet a real key

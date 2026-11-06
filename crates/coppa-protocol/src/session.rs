@@ -58,6 +58,10 @@ pub struct LinkCapabilities {
     /// Negotiated as an AND of both sides, exactly like `compression`, so a
     /// mixed-version pair runs today's protocol untouched.
     pub multi_frame_ack: bool,
+    /// Can receive RS(12,6) session blocks, flags bit 2.
+    pub outer_code_rx: bool,
+    /// Requests RS(12,6) session blocks, flags bit 3.
+    pub outer_code_req: bool,
     /// Modulation/coding scheme index.
     pub mcs_index: u8,
 }
@@ -71,6 +75,8 @@ impl Default for LinkCapabilities {
             arq_window: 8,
             compression: false,
             multi_frame_ack: false,
+            outer_code_rx: false,
+            outer_code_req: false,
             mcs_index: 0,
         }
     }
@@ -85,8 +91,11 @@ impl LinkCapabilities {
         out.push(self.fec_rate_num);
         out.push(self.fec_rate_den);
         out.push(self.arq_window);
-        // Flags byte (byte 5): [compression:1][multi_frame_ack:1][reserved:6].
-        let flags = (self.compression as u8) | ((self.multi_frame_ack as u8) << 1);
+        // Flags byte (byte 5): [compression:1][multi_frame_ack:1][outer_code_rx:1][outer_code_req:1][reserved:4].
+        let flags = (self.compression as u8)
+            | ((self.multi_frame_ack as u8) << 1)
+            | ((self.outer_code_rx as u8) << 2)
+            | ((self.outer_code_req as u8) << 3);
         out.push(flags);
         out.push(self.mcs_index);
         out
@@ -106,6 +115,8 @@ impl LinkCapabilities {
             arq_window: bytes[4],
             compression: bytes[5] & 0x01 != 0,
             multi_frame_ack: bytes[5] & 0x02 != 0,
+            outer_code_rx: bytes[5] & 0x04 != 0,
+            outer_code_req: bytes[5] & 0x08 != 0,
             mcs_index: bytes[6],
         })
     }
@@ -128,8 +139,17 @@ impl LinkCapabilities {
             arq_window: self.arq_window.min(peer.arq_window),
             compression: self.compression && peer.compression,
             multi_frame_ack: self.multi_frame_ack && peer.multi_frame_ack,
+            outer_code_rx: self.outer_code_rx && peer.outer_code_rx,
+            outer_code_req: self.outer_code_rx
+                && peer.outer_code_rx
+                && (self.outer_code_req || peer.outer_code_req),
             mcs_index: self.mcs_index.min(peer.mcs_index),
         }
+    }
+
+    /// Whether the negotiated session uses RS(12,6) fade protection.
+    pub fn outer_code_active(&self) -> bool {
+        self.outer_code_rx && self.outer_code_req
     }
 
     pub(crate) fn fec_rate(&self) -> f32 {
@@ -342,6 +362,11 @@ impl Session {
                     expected_numerator: expected.fec_rate_num,
                     expected_denominator: expected.fec_rate_den,
                 });
+            }
+            if negotiated.outer_code_rx != expected.outer_code_rx
+                || negotiated.outer_code_req != expected.outer_code_req
+            {
+                return Err(ProtocolError::OuterCodeMismatch);
             }
             // Compression must not be enabled unless both sides support it
             if negotiated.compression && !expected.compression {
@@ -604,6 +629,8 @@ mod tests {
             arq_window: 8,
             compression: true,
             multi_frame_ack: false,
+            outer_code_rx: false,
+            outer_code_req: false,
             mcs_index: 3,
         };
         let bytes = caps.to_bytes();
@@ -637,6 +664,8 @@ mod tests {
             arq_window: 8,
             compression: true,
             multi_frame_ack: true,
+            outer_code_rx: false,
+            outer_code_req: false,
             mcs_index: 5,
         };
         let b = LinkCapabilities {
@@ -646,6 +675,8 @@ mod tests {
             arq_window: 4,
             compression: false,
             multi_frame_ack: false,
+            outer_code_rx: false,
+            outer_code_req: false,
             mcs_index: 3,
         };
         let negotiated = a.negotiate(&b);
@@ -668,6 +699,8 @@ mod tests {
     fn link_capabilities_multi_frame_ack_negotiates_as_and() {
         let set = LinkCapabilities {
             multi_frame_ack: true,
+            outer_code_rx: false,
+            outer_code_req: false,
             ..LinkCapabilities::default()
         };
         let clear = LinkCapabilities::default();
@@ -1235,5 +1268,83 @@ mod tests {
         s.initiate(now).unwrap();
         s.touch(now + Duration::from_secs(5));
         assert!(!s.is_timed_out(now));
+    }
+}
+
+#[cfg(test)]
+mod outer_tests {
+    use super::*;
+    fn caps(mode: u8) -> LinkCapabilities {
+        LinkCapabilities {
+            outer_code_rx: mode > 0,
+            outer_code_req: mode == 2,
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn link_capabilities_outer_code_bits_round_trip() {
+        for a in 0..3 {
+            let caps = caps(a);
+            let bytes = caps.to_bytes();
+            assert_eq!(
+                bytes[5],
+                if a == 0 {
+                    0
+                } else if a == 1 {
+                    4
+                } else {
+                    12
+                }
+            );
+            assert_eq!(LinkCapabilities::from_bytes(&bytes).unwrap(), caps);
+        }
+    }
+    #[test]
+    fn negotiate_outer_code_truth_table() {
+        for a in 0..3 {
+            for b in 0..3 {
+                assert_eq!(
+                    caps(a).negotiate(&caps(b)).outer_code_active(),
+                    a > 0 && b > 0 && (a == 2 || b == 2)
+                );
+            }
+        }
+    }
+    #[test]
+    fn legacy_peer_caps_never_negotiate_outer_code() {
+        let legacy = LinkCapabilities::from_bytes(&[0, 200, 1, 2, 8, 0, 0]).unwrap();
+        for mode in 0..3 {
+            assert!(!caps(mode).negotiate(&legacy).outer_code_active());
+            assert!(!legacy.negotiate(&caps(mode)).outer_code_active());
+        }
+    }
+    #[test]
+    fn cfm_with_outer_code_mismatch_is_rejected() {
+        let now = Instant::now();
+        for mode in 0..3 {
+            let local = caps(mode);
+            let peer = caps(2);
+            let expected = local.negotiate(&peer);
+            for bit in [4, 8] {
+                let mut responder = Session::new(
+                    0,
+                    Callsign::new("W1AW").unwrap(),
+                    Callsign::new("VK3ABC").unwrap(),
+                    0,
+                    local.clone(),
+                    now,
+                );
+                responder.handle_connect_req(&peer.to_bytes(), now).unwrap();
+                let mut bytes = expected.to_bytes();
+                bytes[5] ^= bit;
+                assert!(matches!(
+                    responder.handle_connect_cfm(&bytes, now),
+                    Err(ProtocolError::OuterCodeMismatch)
+                ));
+                responder
+                    .handle_connect_cfm(&expected.to_bytes(), now)
+                    .unwrap();
+            }
+        }
     }
 }

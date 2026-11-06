@@ -977,6 +977,11 @@ impl CoppaTransceiver {
         self.harq_rx.borrow_mut().evict(seq);
     }
 
+    #[cfg(test)]
+    pub(crate) fn harq_buffer_count(&self) -> usize {
+        self.harq_rx.borrow().len()
+    }
+
     /// Like [`Self::receive`], but also returns the frame's SNR estimate (dB),
     /// derived from the per-carrier noise-variance estimates the payload equalizer
     /// already produces: `snr_db = 10*log10(1 / mean(noise_vars))`. Added for

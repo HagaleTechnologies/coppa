@@ -107,6 +107,8 @@ pub struct LinkStats {
     pub rto_ms: u64,
     /// COP-68 fade hold: retransmitting at a lower level.
     pub fade_hold: bool,
+    /// Negotiated session mode: "rs12-6" or "off".
+    pub fade_protection: String,
 }
 
 /// JSON message sent to a WebSocket client.
@@ -207,7 +209,7 @@ pub enum WsServerMessage {
         heard: Option<Vec<HeardStation>>,
         /// COP-83: the session ARQ link; absent without one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        link: Option<LinkStats>,
+        link: Option<Box<LinkStats>>,
     },
     /// Data received from remote station.
     #[serde(rename = "data")]
@@ -527,7 +529,7 @@ impl WsStatus {
             max_tune_s: self.max_tune_s,
             loop_age_ms: self.loop_heartbeat.map(millis),
             heard: self.heard,
-            link: self.link,
+            link: self.link.map(Box::new),
         }
     }
 
@@ -1841,7 +1843,7 @@ mod tests {
             r#"{"type":"buffer","bytes":15}"#,
             r#"{"type":"speed_level","level":3,"mode":"manual"}"#,
             r#"{"type":"speed_level","level":2,"mode":"auto"}"#,
-            r#"{"type":"status","id":1,"connected":true,"remote_call":"W1AW","snr":14,"level":2,"cfo":3.2,"cp_desync_episodes":0,"ptt":true,"ptt_keyed_ms":1234,"busy":false,"waiting_for_clear_channel":false,"buffer":412,"speed_level":3,"speed_level_mode":"manual","speed_levels":[1,2,3,4,5,6,7,8],"mycall":"N0CALL","max_tx_s":30,"max_tune_s":30,"loop_age_ms":95,"heard":[{"call":"W1AW","last_heard_ms":1761452712300,"snr_db":14,"level":2}],"link":{"in_flight":1,"retries":1,"max_retries":10,"rto_ms":5200,"fade_hold":false}}"#,
+            r#"{"type":"status","id":1,"connected":true,"remote_call":"W1AW","snr":14,"level":2,"cfo":3.2,"cp_desync_episodes":0,"ptt":true,"ptt_keyed_ms":1234,"busy":false,"waiting_for_clear_channel":false,"buffer":412,"speed_level":3,"speed_level_mode":"manual","speed_levels":[1,2,3,4,5,6,7,8],"mycall":"N0CALL","max_tx_s":30,"max_tune_s":30,"loop_age_ms":95,"heard":[{"call":"W1AW","last_heard_ms":1761452712300,"snr_db":14,"level":2}],"link":{"in_flight":1,"retries":1,"max_retries":10,"rto_ms":5200,"fade_hold":false,"fade_protection":"off"}}"#,
             r#"{"type":"heard","stations":[{"call":"W1AW","last_heard_ms":1,"snr_db":14,"level":2},{"call":"N0CALL","last_heard_ms":2},{"call":"VK3ABC","last_heard_ms":3,"snr_db":14,"level":1,"grid":"QF22"}]}"#,
             r#"{"type":"log","level":"info","message":"decoded","timestamp_ms":3}"#,
             r#"{"type":"decode_fail","count":6,"timestamp_ms":4}"#,
@@ -3338,6 +3340,7 @@ mod cop83_tests {
             max_retries: 10,
             rto_ms: 5200,
             fade_hold: false,
+            fade_protection: "off".into(),
         };
         let snapshot = WsStatus {
             ptt: Some(true),
@@ -3374,7 +3377,7 @@ mod cop83_tests {
         assert_eq!(reply["heard"][0]["call"], "W1AW");
         assert_eq!(
             reply["link"],
-            serde_json::json!({"in_flight":1,"retries":1,"max_retries":10,"rto_ms":5200,"fade_hold":false})
+            serde_json::json!({"in_flight":1,"retries":1,"max_retries":10,"rto_ms":5200,"fade_hold":false,"fade_protection":"off"})
         );
     }
 
