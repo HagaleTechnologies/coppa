@@ -250,6 +250,9 @@ impl AgwServer {
         }
     }
 }
+/// Longest a request reply waits for outbound queue space.
+const REPLY_WAIT: Duration = Duration::from_secs(5);
+
 async fn client(
     stream: TcpStream,
     tx: mpsc::Sender<Vec<u8>>,
@@ -295,7 +298,10 @@ async fn client(
                                 if let Some(frame)=frame {if tx.try_send(frame).is_err() {tracing::warn!("AGWPE TX queue unavailable");return;}} else {tracing::warn!("Malformed AGWPE transmit request");} None
                             }, _=>None
                         };
-                        if let Some(r)=response {if out.try_send(r).is_err() {return;}}
+                        // Await queue space so the writer can drain pipelined
+                        // replies; only a writer stalled past REPLY_WAIT (its
+                        // own write timeout has then fired) ends the client.
+                        if let Some(r)=response {if !matches!(tokio::time::timeout(REPLY_WAIT,out.send(r)).await,Ok(Ok(()))) {return;}}
                     }
                 },
                 received=rx.recv()=>match received {
@@ -921,6 +927,64 @@ mod tests {
         barrier(&mut healthy).await;
         assert_closed(&mut stalled).await;
         barrier(&mut healthy).await;
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// A client that pipelines more reply-producing requests than the
+    /// outbound queue holds, while reading replies, stays connected and gets
+    /// every reply: request handling waits for the writer instead of
+    /// treating a momentarily full queue as a stalled receiver.
+    #[tokio::test]
+    async fn pipelined_requests_beyond_queue_capacity_are_all_answered() {
+        let (addr, _tx, _rx, task) = spawn_server(Arc::default()).await;
+        let c = TcpStream::connect(addr).await.unwrap();
+        let (mut reader, mut writer) = c.into_split();
+        let burst = packet(b'R', &[], &[], 0, &[]).repeat(200);
+        let send = tokio::spawn(async move {
+            writer.write_all(&burst).await.unwrap();
+            writer
+        });
+        let mut reply = vec![0; 44];
+        for i in 0..200 {
+            tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut reply))
+                .await
+                .unwrap_or_else(|_| panic!("reply {i} timed out"))
+                .unwrap_or_else(|e| panic!("reply {i}: {e}"));
+            assert_eq!(reply[4], b'R');
+        }
+        let mut c = send.await.unwrap().reunite(reader).unwrap();
+        barrier(&mut c).await;
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// A client that floods requests but never reads replies is still
+    /// disconnected once its writes stall.
+    #[tokio::test]
+    async fn nonreading_request_flood_is_disconnected() {
+        let (addr, _tx, _rx, task) = spawn_server(Arc::default()).await;
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        let c = socket.connect(addr).await.unwrap();
+        let (mut reader, mut writer) = c.into_split();
+        let burst = packet(b'R', &[], &[], 0, &[]).repeat(20_000);
+        let flood = tokio::spawn(async move {
+            let _ = tokio::time::timeout(Duration::from_secs(20), writer.write_all(&burst)).await;
+        });
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        let mut sink = vec![0; 65536];
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match reader.read(&mut sink).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("server must close a client that never reads");
+        flood.abort();
         task.abort();
         let _ = task.await;
     }

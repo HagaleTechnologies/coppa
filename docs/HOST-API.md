@@ -486,8 +486,10 @@ channel and partial/unaccepted AGW requests. Standalone adapters may supply thei
 own transmitter snapshot with `AgwServer::with_pending_frames`.
 
 The server caps connections at 16, TX frames at 256, RX broadcast records at 64
-and each client's outbound queue at 64. A full TX or outbound queue disconnects
-the offending client. Writes time out after five seconds. Broadcast lag skips lost
+and each client's outbound queue at 64. A full TX queue, or an RX record that finds
+the outbound queue full, disconnects the offending client. A request reply waits up
+to five seconds for outbound space, so pipelined requests are all answered. Writes
+time out after five seconds. Broadcast lag skips lost
 records with a log; it never grows a queue. Partial requests survive interleaved RX.
 Winlink Express packet and Outpost BBS connected sessions are unsupported. Real
 UI-View interoperability and monitor formatting remain unverified with those clients.
