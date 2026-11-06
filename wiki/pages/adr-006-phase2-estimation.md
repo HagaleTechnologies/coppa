@@ -48,9 +48,7 @@ the most important open item in the receiver.
   OFDM sync, not LDPC, is the binding constraint — verify FEC/LLR improvements
   with an isolated (OFDM-bypassing) bench, not just the full pipeline.
 
-Full decision record: `docs/adr/006-phase2-parametric-estimation-nr-bg2.md`;
-investigation detail in `.superpowers/sdd/p2-task-1-report.md`,
-`p2-task-7-report.md`, and `p2-cfo-level4-{investigation,fix}-report.md`.
+Full decision record: `docs/adr/006-phase2-parametric-estimation-nr-bg2.md`.
 
 ## Rate-loop residual experiment
 

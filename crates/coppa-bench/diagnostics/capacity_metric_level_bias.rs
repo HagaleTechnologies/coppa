@@ -7,8 +7,6 @@
 //! Good/Moderate/Poor, many trials per cell, and reports whether mean capacity trends with
 //! level beyond each cell's own noise floor.
 //!
-//! See docs/superpowers/specs/2026-07-20-rateloop-capacity-metric-bias-diagnosis-design.md.
-//!
 //! Output: `DATA <channel> <snr> <level> <mean_capacity> <std_capacity> <mean_selectivity>`
 //! followed by a per-channel SUMMARY line. Pass a seed as arg 1 (default 0xCA11B, matching
 //! `mcs_calibration.rs`'s convention).

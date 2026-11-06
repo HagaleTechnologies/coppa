@@ -6,7 +6,7 @@
 //! probe symbol and reused unchanged for every window, but a per-window
 //! diagnostic showed the true bulk-delay reference drifting continuously
 //! within a frame (`|Ĥ(24)|²` decaying 3.2→0.13, `noise_var` climbing
-//! 44→360 across one frame — see `.superpowers/sdd/p2-task-1-report.md`).
+//! 44→360 across one frame).
 //! Task 7's AR(1) tap-amplitude Kalman tracker (`kalman_tracker.rs`) did
 //! not fix this — both task reports concluded the drift looks like a
 //! continuously-accumulating reference error, not stationary Rayleigh
