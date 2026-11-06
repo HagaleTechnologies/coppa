@@ -90,6 +90,12 @@ impl TncTx {
         self.active.is_some() || !self.frames.is_empty()
     }
 
+    // Repeats must start immediately after carrier sense, never wait behind a
+    // client frame whose playout could outlast the pending repeat deadline.
+    fn can_repeat(&self) -> bool {
+        self.has_room() && !self.is_busy()
+    }
+
     /// Advance TX: move retained samples into `out`, start the next frame,
     /// and complete or cancel the active one.
     pub fn poll(&mut self, now: Instant, out: &mut AudioRingProducer, ptt: &mut dyn PttControl) {
@@ -179,8 +185,95 @@ impl TncTx {
     }
 }
 
+fn format_address(address: &coppa_protocol::ax25::Ax25Address) -> String {
+    if address.ssid == 0 {
+        address.callsign.clone()
+    } else {
+        format!("{}-{}", address.callsign, address.ssid)
+    }
+}
+
+const DEDUPE_WINDOW: Duration = Duration::from_secs(30);
+const BUSY_WAIT: Duration = Duration::from_secs(5);
+
+struct Digipeater {
+    alias: (String, u8),
+    seen: VecDeque<(Vec<u8>, Instant)>,
+}
+
+impl Digipeater {
+    fn new(alias: (String, u8)) -> Self {
+        Self {
+            alias,
+            seen: VecDeque::new(),
+        }
+    }
+
+    fn on_air_frame(&mut self, now: Instant, frame: &[u8]) -> Option<Vec<u8>> {
+        self.seen
+            .retain(|(_, at)| now.duration_since(*at) < DEDUPE_WINDOW);
+        // Only UI traffic is deduplicated. Connected-mode senders retransmit
+        // byte-identical SABM, I and S frames after a loss; dropping those
+        // retries would end a session on a single lost frame.
+        if !coppa_protocol::ax25::is_ui(frame) {
+            return coppa_protocol::ax25::digipeat(frame, &self.alias.0, self.alias.1);
+        }
+        let key = coppa_protocol::ax25::dedupe_key(frame);
+        if self.seen.iter().any(|(old, _)| *old == key) {
+            tracing::debug!("digipeat duplicate dropped");
+            return None;
+        }
+        let marked = coppa_protocol::ax25::digipeat(frame, &self.alias.0, self.alias.1)?;
+        if self.seen.len() == 64 {
+            self.seen.pop_front();
+        }
+        self.seen.push_back((key, now));
+        Some(marked)
+    }
+
+    fn submit(&self, frame: Vec<u8>, tx: &mut TncTx) {
+        use coppa_protocol::ax25::Ax25Address;
+        let dest = Ax25Address::from_bytes(&frame[..7])
+            .map(|a| format_address(&a))
+            .unwrap_or_default();
+        let src = Ax25Address::from_bytes(&frame[7..14])
+            .map(|a| format_address(&a))
+            .unwrap_or_default();
+        let alias = Ax25Address {
+            callsign: self.alias.0.clone(),
+            ssid: self.alias.1,
+        };
+        tracing::info!("Digipeated {src}>{dest} via {}", format_address(&alias));
+        tx.submit(coppa_codec::afsk::modulate(&frame));
+    }
+}
+
+#[derive(Default)]
+struct PendingRepeat(Option<(Vec<u8>, Instant)>);
+
+impl PendingRepeat {
+    fn park(&mut self, frame: Vec<u8>, now: Instant) {
+        self.0 = Some((frame, now + BUSY_WAIT));
+    }
+
+    fn poll(&mut self, now: Instant, channel_busy: bool, has_room: bool) -> Option<Vec<u8>> {
+        let (_, deadline) = self.0.as_ref()?;
+        if now >= *deadline {
+            self.0 = None;
+            tracing::debug!("digipeat frame dropped: channel busy for 5s");
+            return None;
+        }
+        if channel_busy || !has_room {
+            return None;
+        }
+        self.0.take().map(|(frame, _)| frame)
+    }
+}
+
 /// Configuration for TNC daemon mode.
 pub struct TncConfig {
+    /// Opt-in exact callsign and SSID alias for automatic repeats.
+    pub digipeat_alias: Option<(String, u8)>,
     pub kiss_port: u16,
     /// Address the KISS TCP server binds to. Defaults to "127.0.0.1" (loopback only).
     pub bind_address: String,
@@ -205,6 +298,7 @@ pub struct TncConfig {
 impl Default for TncConfig {
     fn default() -> Self {
         Self {
+            digipeat_alias: None,
             kiss_port: 8001,
             bind_address: "127.0.0.1".to_string(),
             rig_address: None,
@@ -333,9 +427,29 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
     // -------------------------------------------------------------------------
     let (demod_tx, mut demod_rx) = mpsc::channel::<Vec<u8>>(64);
     let demod_shutdown = shutdown.clone();
+    let channel_busy = Arc::new(AtomicBool::new(false));
+    let worker_busy = channel_busy.clone();
+    let mut digipeater = config.digipeat_alias.clone().map(Digipeater::new);
+    let sense_channel = digipeater.is_some();
+    let mut pending_repeat = PendingRepeat::default();
+    if let Some(digi) = &digipeater {
+        let alias = coppa_protocol::ax25::Ax25Address {
+            callsign: digi.alias.0.clone(),
+            ssid: digi.alias.1,
+        };
+        tracing::info!(
+            "Digipeat enabled alias={} dedupe_window=30s busy_wait=5s",
+            format_address(&alias)
+        );
+    }
 
     let demod_worker = tokio::task::spawn_blocking(move || {
-        run_demod_worker(audio_in_cons, demod_tx, &demod_shutdown)
+        run_demod_worker(
+            audio_in_cons,
+            demod_tx,
+            &demod_shutdown,
+            sense_channel.then_some(worker_busy.as_ref()),
+        )
     });
 
     // -------------------------------------------------------------------------
@@ -541,7 +655,17 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
         tokio::select! {
             // RX path: demod thread produced a frame → forward to KISS clients
             Some(frame) = demod_rx.recv() => {
-                let _ = rx_sender.send(air_to_kiss(frame));
+                let _ = rx_sender.send(air_to_kiss(frame.clone()));
+                if let Some(digi) = &mut digipeater {
+                    let now = Instant::now();
+                    if let Some(marked) = digi.on_air_frame(now, &frame) {
+                        pending_repeat.park(marked, now);
+                        if let Some(ready) = pending_repeat.poll(now, channel_busy.load(Ordering::Acquire), tnc_tx.can_repeat()) {
+                            digi.submit(ready, &mut tnc_tx);
+                            tnc_tx.poll(now, &mut audio_out_prod, ptt.as_mut());
+                        }
+                    }
+                }
             }
 
             // TX path: KISS client sent a frame → modulate and queue it;
@@ -553,7 +677,10 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
                 tnc_tx.poll(Instant::now(), &mut audio_out_prod, ptt.as_mut());
             }
 
-            _ = tx_tick.tick(), if tnc_tx.is_busy() => {
+            _ = tx_tick.tick(), if tnc_tx.is_busy() || pending_repeat.0.is_some() => {
+                if let Some(ready) = pending_repeat.poll(Instant::now(), channel_busy.load(Ordering::Acquire), tnc_tx.can_repeat()) {
+                    if let Some(digi) = &digipeater { digi.submit(ready, &mut tnc_tx); }
+                }
                 tnc_tx.poll(Instant::now(), &mut audio_out_prod, ptt.as_mut());
             }
 
@@ -582,7 +709,9 @@ fn run_demod_worker(
     mut audio_in: coppa_audio::AudioRingConsumer,
     demod_tx: mpsc::Sender<Vec<u8>>,
     shutdown: &AtomicBool,
+    channel_busy: Option<&AtomicBool>,
 ) {
+    let mut gate = channel_busy.map(|_| coppa_ml::busy_gate::BusyGate::new(48_000.0));
     let mut demod = coppa_codec::afsk::Demodulator::new();
     let mut buf = vec![0.0f32; 1024];
     loop {
@@ -592,6 +721,10 @@ fn run_demod_worker(
         let n = audio_in.read(&mut buf);
         if n > 0 {
             demod.process(&buf[..n]);
+            if let (Some(gate), Some(busy)) = (&mut gate, channel_busy) {
+                gate.observe(&buf[..n]);
+                busy.store(gate.current(), Ordering::Release);
+            }
             for frame in demod.take_frames() {
                 // Best-effort send; if the main loop is gone, stop.
                 if demod_tx.blocking_send(frame).is_err() {
@@ -688,6 +821,150 @@ mod tests {
         }
     }
 
+    fn repeat_frame() -> Vec<u8> {
+        use coppa_protocol::ax25::{Ax25Address, Ax25Frame};
+        Ax25Frame {
+            dest: Ax25Address {
+                callsign: "APRS".into(),
+                ssid: 0,
+            },
+            src: Ax25Address {
+                callsign: "W1AW".into(),
+                ssid: 0,
+            },
+            digipeaters: vec![Ax25Address {
+                callsign: "N0CALL".into(),
+                ssid: 2,
+            }],
+            info: b"hello".to_vec(),
+        }
+        .to_bytes()
+    }
+
+    #[test]
+    fn default_config_leaves_digipeating_off() {
+        assert!(TncConfig::default().digipeat_alias.is_none());
+    }
+
+    #[test]
+    fn digipeated_frame_round_trips_through_the_modem() {
+        let mut digi = Digipeater::new(("N0CALL".into(), 2));
+        let marked = digi.on_air_frame(Instant::now(), &repeat_frame()).unwrap();
+        assert_ne!(marked, repeat_frame());
+        let mut demod = coppa_codec::afsk::Demodulator::new();
+        let mut samples = coppa_codec::afsk::modulate(&marked);
+        samples.extend(vec![0.0; 4800]);
+        demod.process(&samples);
+        assert_eq!(demod.take_frames(), vec![marked]);
+    }
+
+    #[test]
+    fn repeat_suppressed_within_dedupe_window() {
+        let mut digi = Digipeater::new(("N0CALL".into(), 2));
+        let now = Instant::now();
+        let frame = repeat_frame();
+        let marked = digi.on_air_frame(now, &frame).unwrap();
+        assert!(digi
+            .on_air_frame(now + Duration::from_secs(1), &marked)
+            .is_none());
+        assert!(digi
+            .on_air_frame(now + Duration::from_secs(29), &frame)
+            .is_none());
+        assert!(digi
+            .on_air_frame(now + Duration::from_secs(30), &frame)
+            .is_some());
+        assert!(digi.seen.len() <= 64);
+    }
+
+    #[test]
+    fn connected_mode_retries_are_not_deduplicated() {
+        let mut digi = Digipeater::new(("N0CALL".into(), 2));
+        let now = Instant::now();
+        // SABM through N0CALL-2: control byte follows the 21-byte address field.
+        let mut sabm = repeat_frame()[..21].to_vec();
+        sabm.push(0x3F);
+        // The digipeater trusts the demodulator's FCS check and recomputes FCS.
+        sabm.extend_from_slice(&[0, 0]);
+        assert!(!coppa_protocol::ax25::is_ui(&sabm));
+        let marked = digi.on_air_frame(now, &sabm).unwrap();
+        assert!(
+            digi.on_air_frame(now + Duration::from_secs(3), &sabm)
+                .is_some(),
+            "a retried SABM must be repeated again"
+        );
+        assert!(
+            digi.on_air_frame(now + Duration::from_secs(4), &marked)
+                .is_none(),
+            "our own repeat is already marked used"
+        );
+        assert!(digi.seen.is_empty());
+    }
+
+    #[test]
+    fn pending_repeat_waits_for_clear_and_expires() {
+        let now = Instant::now();
+        let mut pending = PendingRepeat::default();
+        pending.park(vec![1], now);
+        assert!(pending.poll(now, true, true).is_none());
+        assert!(pending.poll(now, false, false).is_none());
+        assert_eq!(
+            pending.poll(now + Duration::from_secs(1), false, true),
+            Some(vec![1])
+        );
+        assert!(pending.poll(now, false, true).is_none());
+        let mut tx = TncTx::new(None, 48_000);
+        let (mut out, _consumer) = coppa_audio::audio_ring(16);
+        let mut ptt = NullPtt::new();
+        tx.submit(vec![0.0; 48_000]);
+        tx.poll(now, &mut out, &mut ptt);
+        assert!(tx.has_room(), "the normal queue accepts a client frame");
+        assert!(
+            !tx.can_repeat(),
+            "a repeat must wait for actual transmitter idle"
+        );
+        pending.park(vec![9], now);
+        assert!(pending.poll(now, false, tx.can_repeat()).is_none());
+        tx.poll(now + Duration::from_secs(1), &mut out, &mut ptt);
+        tx.poll(now + Duration::from_secs(2), &mut out, &mut ptt);
+        assert_eq!(
+            pending.poll(now + Duration::from_secs(2), false, tx.can_repeat()),
+            Some(vec![9])
+        );
+        pending.park(vec![2], now);
+        pending.park(vec![3], now);
+        assert_eq!(pending.poll(now, false, true), Some(vec![3]));
+        pending.park(vec![4], now);
+        assert!(pending
+            .poll(now + Duration::from_secs(5), false, true)
+            .is_none());
+        assert!(pending.0.is_none());
+    }
+
+    #[test]
+    fn demod_worker_publishes_channel_busy() {
+        let (mut producer, consumer) = coppa_audio::audio_ring(262144);
+        let (tx, _rx) = mpsc::channel(64);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let busy = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = shutdown.clone();
+        let worker_busy = busy.clone();
+        let worker = std::thread::spawn(move || {
+            run_demod_worker(consumer, tx, &worker_shutdown, Some(&worker_busy));
+        });
+        // Calibrate on silence, then feed a full AFSK frame.
+        let mut samples = vec![0.0; 48000];
+        samples.extend(coppa_codec::afsk::modulate(&repeat_frame()));
+        assert_eq!(producer.write(&samples), samples.len());
+        let until = Instant::now() + Duration::from_secs(10);
+        while !busy.load(Ordering::Acquire) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let observed = busy.load(Ordering::Acquire);
+        shutdown.store(true, Ordering::Release);
+        worker.join().unwrap();
+        assert!(observed, "AFSK carrier must publish busy");
+    }
+
     /// COP-64 review (Codex P1 on #173): when input capture has started but
     /// the output then fails to open, the input worker holds the audio ring's
     /// producer and the demodulator its consumer, so neither sees the other
@@ -701,7 +978,7 @@ mod tests {
         let (demod_tx, _demod_rx) = mpsc::channel::<Vec<u8>>(1);
         let demod_shutdown = shutdown.clone();
         let demod = tokio::task::spawn_blocking(move || {
-            run_demod_worker(consumer, demod_tx, &demod_shutdown)
+            run_demod_worker(consumer, demod_tx, &demod_shutdown, None)
         });
         let input_shutdown = shutdown.clone();
         let input = tokio::task::spawn_blocking(move || {

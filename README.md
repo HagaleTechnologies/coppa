@@ -121,9 +121,11 @@ Build with `kiss-tnc`, enable `[host] kiss_enabled = true`, and follow
 
 `coppa tnc` runs a 1200-baud AFSK (Bell 202) AX.25 TNC behind a KISS TCP port. Use it for
 KISS bring-up and testing: checking that a KISS client, your audio routing and your PTT reach
-coppa. It is not a Direwolf replacement. It has no AGWPE interface, no channel-busy check (it
-ignores KISS TXDELAY, persistence and slot time), no digipeating or beaconing, and runs only at
-1200 baud. That parity work is planned as H-122 in the
+coppa. It is not a Direwolf replacement. Digipeating is opt-in with
+`--digipeat CALL[-SSID]`; a spectral busy check gates automatic repeats. KISS client
+transmissions still start immediately and ignore TXDELAY, persistence and slot time.
+It has no AGWPE interface or beaconing, and runs only at 1200 baud. Remaining parity work
+is planned as H-122 in the
 [2026-09-05 product review](docs/reviews/2026-09-05-product-ux-market-review.md).
 
 [docs/TNC.md](docs/TNC.md) covers building it and a demo that runs two TNCs on one Linux machine.

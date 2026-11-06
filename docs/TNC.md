@@ -7,9 +7,11 @@ This page covers the separate AFSK mode.
 
 `coppa tnc` runs a 1200-baud AFSK (Bell 202) AX.25 TNC behind a KISS TCP port. Use it for
 KISS bring-up and testing: checking that a KISS client, your audio routing and your PTT reach
-coppa. It is not a Direwolf replacement. It has no AGWPE interface, no channel-busy check (it
-ignores KISS TXDELAY, persistence and slot time), no digipeating or beaconing, and runs only at
-1200 baud. That parity work is planned as H-122 in the
+coppa. It is not a Direwolf replacement. Digipeating is opt-in with
+`--digipeat CALL[-SSID]`; a spectral busy check gates automatic repeats. KISS client
+transmissions still start immediately and ignore TXDELAY, persistence and slot time.
+It has no AGWPE interface or beaconing, and runs only at 1200 baud. Remaining parity work
+is planned as H-122 in the
 [2026-09-05 product review](reviews/2026-09-05-product-ux-market-review.md).
 Measured against Direwolf 1.7 on track 2 of the WA8LMF TNC Test CD, coppa decodes 412 packets
 to Direwolf's 1000 (41.2 percent). The method and the script that reproduces it are in
@@ -19,7 +21,7 @@ What it does:
 
 - Serves KISS over TCP on `127.0.0.1`, port 8001 by default (`--port` changes it).
 - Sends and receives AX.25 frames with up to 256 bytes of information field. The KISS client
-  builds the frames; the TNC does not parse them.
+  builds the frames; digipeating inspects only their address fields.
 - Modulates and demodulates Bell 202 (1200 Hz mark, 2200 Hz space) at 48 kHz.
 - Keys PTT through rigctld (`--rig localhost:4532`), or not at all.
 
@@ -28,13 +30,47 @@ What it does not do:
 - No AGWPE interface. Clients that only speak AGW (Winlink Express packet, Outpost, UI-View)
   cannot use it.
 - Only KISS port 0 carries data. A data frame addressed to any other KISS port is dropped.
-- KISS TXDELAY, persistence and slot time are accepted and ignored. There is no carrier sense:
-  the TNC transmits as soon as a frame arrives.
-- No digipeating, no beaconing and no configuration file.
+- KISS TXDELAY, persistence and slot time are accepted and ignored. Client-initiated
+  transmissions start immediately. Only automatic repeats wait for a clear channel.
+- No beaconing and no configuration file.
 - `--vox` keys nothing. It behaves like no PTT, so the radio's own VOX has to key it.
 - 1200 baud only.
 - No error correction beyond the AX.25 frame check sequence (FCS). A frame with a bad FCS is
   discarded.
+
+## Digipeating
+
+Enable exact callsign and SSID matching with an alias:
+
+```bash
+coppa tnc --rig localhost:4532 --digipeat N0CALL-2
+```
+
+The additional startup and repeat log lines are:
+
+```text
+ INFO Digipeat enabled alias=N0CALL-2 dedupe_window=30s busy_wait=5s
+ INFO Digipeated W1AW>APRS via N0CALL-2
+```
+
+Digipeating is off unless the flag is given. Only the first unused path entry can
+match. The repeat marks that entry used and recomputes FCS without changing the
+rest of the frame. There is no WIDEn-N alias substitution or counter decrement.
+All decoded frames still reach KISS clients, whether repeated or not.
+
+Duplicate UI frames are suppressed for 30 s, ignoring path used bits and FCS. The cache
+holds 64 frames. Connected-mode frames (SABM, I, S and other non-UI frames) are never
+deduplicated, because their senders retransmit identical frames after a loss. One pending repeat is retained; a newer repeat replaces it. Every automatic
+transmit checks the spectral channel-busy flag and available transmitter space. A
+repeat waiting for a busy channel is dropped after 5 s, with a DEBUG log line:
+`digipeat frame dropped: channel busy for 5s`.
+
+The detector reuses the daemon's BusyGate, with roughly 0.25 s detection latency
+on onset and release. The release delay provides a courtesy gap. Synthetic in-memory
+probes measured modulated Bell 202 detection at full scale and 0.1 full scale,
+a 5 s carrier staying busy throughout, and detection of a 400 ms burst.
+These measurements used a digital-silence quiet floor. Real-channel behavior
+on a physical radio is untested; they do not establish performance on a noisy band.
 
 ## Build
 

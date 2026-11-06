@@ -883,17 +883,14 @@ impl CoppaTransceiver {
     }
 
     /// Decode a frame, additionally surfacing a per-frame recommended speed level
-    /// (Phase 3 Task 4, closed-loop rate adaptation): `coppa_ml::recommend_speed_level`
-    /// applied to this frame's per-carrier noise-variance estimates (the same ones the
-    /// payload equalizer/LLR scaling already produce). A caller acting as the far end's
+    /// from this frame's pilot-based per-carrier noise estimates. Both public
+    /// receive wrappers use the same recommendation computed by the core.
+    /// A caller acting as the far end's
     /// receiver feeds this back to the sender on the ACK (`TransportPdu::
     /// new_ack_with_rate`); the sender applies it via `coppa_ml::RateLoop`.
     pub fn receive(&self, samples: &[f32]) -> Result<(CoppaHeader, Vec<u8>, u8), ReceiveError> {
         self.receive_core(samples)
-            .map(|(h, p, _snr, noise_vars, _delay_spread_ms)| {
-                let level = coppa_ml::recommend_speed_level(&noise_vars, h.speed_level);
-                (h, p, level)
-            })
+            .map(|(h, p, _snr, level, _delay_spread_ms)| (h, p, level))
     }
 
     /// Core IR-HARQ combining + decode step (Phase 3 Task 3).
@@ -1003,23 +1000,17 @@ impl CoppaTransceiver {
         samples: &[f32],
     ) -> Result<(CoppaHeader, Vec<u8>, f32, u8, f32), ReceiveError> {
         self.receive_core(samples)
-            .map(|(h, p, snr, noise_vars, delay_spread_ms)| {
-                let level = coppa_ml::recommend_speed_level(&noise_vars, h.speed_level);
-                (h, p, snr, level, delay_spread_ms)
-            })
     }
 
     /// Core decode pipeline shared by [`Self::receive`] and [`Self::receive_with_metrics`]:
-    /// returns the header, payload, SNR estimate (dB), AND this frame's per-carrier noise
-    /// variances (`nv[k] = sigma^2/|H[k]|^2`) -- the latter is what `receive` feeds to
-    /// `coppa_ml::recommend_speed_level` for the closed-loop rate-adaptation recommendation
-    /// (Phase 3 Task 4). Kept as one shared implementation so the two public methods can't
-    /// drift apart.
+    /// returns header, CRC-verified payload, SNR, recommendation and delay spread.
+    /// Recommendation computation is shared so the public wrappers cannot diverge.
+    /// LDPC noise and SNR telemetry retain their original meaning.
     #[allow(clippy::type_complexity)]
     fn receive_core(
         &self,
         samples: &[f32],
-    ) -> Result<(CoppaHeader, Vec<u8>, f32, Vec<f32>, f32), ReceiveError> {
+    ) -> Result<(CoppaHeader, Vec<u8>, f32, u8, f32), ReceiveError> {
         // 0. RX bandpass: reject out-of-passband noise/interference before demod, mirroring
         // the TX bandpass already applied at modulate time (HF profiles only).
         let filtered;
@@ -1062,7 +1053,10 @@ impl CoppaTransceiver {
         } else {
             self.receive_multi_codeword(header, eq_symbols, noise_vars)
         };
-        result.map(|(h, p, snr, nv)| (h, p, snr, nv, delay_spread_ms))
+        result.map(|(h, p, snr, nv)| {
+            let level = coppa_ml::recommend_speed_level(&nv, h.speed_level);
+            (h, p, snr, level, delay_spread_ms)
+        })
     }
 
     /// Pre-Task-5 single-codeword decode path (unchanged): resolves speed-level
@@ -1530,41 +1524,101 @@ mod tests {
     use crate::modem::speed_levels::max_payload_for_level;
     use coppa_codec::ofdm::frame::CoppaFrameType;
 
-    /// Pool by physical carrier, accounting for the alternating pilot pattern.
-    /// Missing coded positions are unavailable; unused trailing OFDM padding is ignored.
-    fn residual_by_carrier(
+    /// Experimental CRC-gated measurement. Observations must start at the
+    /// first payload symbol; only a single missing final symbol is supported.
+    #[derive(Debug)]
+    struct PrefixResidual {
+        measured_positions: usize,
+        sums: Vec<f64>,
+        counts: Vec<usize>,
+    }
+
+    impl PrefixResidual {
+        fn means(&self) -> Vec<f32> {
+            self.sums
+                .iter()
+                .zip(&self.counts)
+                .filter(|&(_, &n)| n > 0)
+                .map(|(s, &n)| (s / n as f64) as f32)
+                .collect()
+        }
+    }
+
+    fn prefix_residual(
         expected: &[Complex32],
         observed: &[Complex32],
         maps: &[Vec<usize>],
-    ) -> Option<Vec<f32>> {
+    ) -> Option<PrefixResidual> {
         let carriers = maps.first()?.len();
-        if carriers == 0
-            || maps.iter().any(|m| m.len() != carriers)
-            || expected.len() < carriers
-            || observed.len() != expected.len().div_ceil(carriers) * carriers
+        if carriers == 0 || maps.len() != 2 || maps.iter().any(|m| m.len() != carriers) {
+            return None;
+        }
+        // Sorted, distinct physical indices bounded by the two phase maps.
+        // Reject malformed maps before allocating or zipping observations.
+        let bound = carriers.checked_mul(2)?;
+        if maps
+            .iter()
+            .any(|m| m.iter().any(|&i| i >= bound) || m.windows(2).any(|w| w[0] >= w[1]))
+        {
+            return None;
+        }
+        let padded = expected.len().div_ceil(carriers).checked_mul(carriers)?;
+        if observed.len() < carriers.checked_mul(2)?
+            || observed.len() % carriers != 0
+            || !(observed.len() == padded || observed.len().checked_add(carriers) == Some(padded))
+            || expected
+                .iter()
+                .chain(observed)
+                .any(|v| !v.re.is_finite() || !v.im.is_finite())
         {
             return None;
         }
         let total = maps.iter().flatten().max()?.checked_add(1)?;
-        let mut sums = vec![0.0f64; total];
-        let mut counts = vec![0usize; total];
+        let mut result = PrefixResidual {
+            measured_positions: expected.len().min(observed.len()),
+            sums: vec![0.0; total],
+            counts: vec![0; total],
+        };
         for (i, (want, got)) in expected.iter().zip(observed).enumerate() {
             let error = (*got - *want).norm_sqr();
             if !error.is_finite() {
                 return None;
             }
-            let carrier = maps[(i / carriers) % maps.len()][i % carriers];
-            sums[carrier] += f64::from(error);
-            counts[carrier] += 1;
+            let carrier = maps[(i / carriers) % 2][i % carriers];
+            result.sums[carrier] += f64::from(error);
+            result.counts[carrier] += 1;
         }
-        // Never represent an unobserved carrier with zero noise.
-        Some(
-            sums.into_iter()
-                .zip(counts)
-                .filter(|&(_, n)| n > 0)
-                .map(|(s, n)| (s / n as f64) as f32)
-                .collect(),
-        )
+        // Every physical data carrier in either phase must be represented.
+        if maps.iter().flatten().any(|&i| result.counts[i] == 0) {
+            return None;
+        }
+        Some(result)
+    }
+
+    fn residual_by_carrier(
+        expected: &[Complex32],
+        observed: &[Complex32],
+        maps: &[Vec<usize>],
+    ) -> Option<Vec<f32>> {
+        let result = prefix_residual(expected, observed, maps)?;
+        debug_assert_eq!(
+            result.measured_positions,
+            expected.len().min(observed.len())
+        );
+        Some(result.means())
+    }
+
+    fn residual_level_or_pilot(measurement: Option<&[f32]>, pilot: u8) -> u8 {
+        measurement
+            .map(|nv| {
+                // Floor only at capacity conversion; zero remains exact in residual tests.
+                let nv: Vec<f32> = nv.iter().map(|&v| v.max(1e-6)).collect();
+                coppa_ml::select_speed_level_2d(
+                    coppa_ml::channel_capacity(&nv),
+                    coppa_ml::channel_selectivity(&nv),
+                )
+            })
+            .unwrap_or(pilot)
     }
 
     /// Independent brute-force reference: `sum_x x * P(x|LLRs)` over every
@@ -3203,78 +3257,104 @@ mod tests {
     /// Paired, CRC-gated experiment. No model truth enters the candidate.
     /// Run with --release --ignored --nocapture residual_recommendation_grid.
     #[test]
-    #[ignore = "paired calibration/held-out experiment, 2880 receive attempts"]
+    #[ignore = "paired calibration/held-out experiment, paired robust and standard receive attempts"]
     fn residual_recommendation_grid() {
         use coppa_channel::watterson::{watterson, WattersonPreset};
-        for base in [0xCA11Bu64, 0x5A1AD] {
-            for preset in [
-                None,
-                Some(WattersonPreset::Good),
-                Some(WattersonPreset::Moderate),
-                Some(WattersonPreset::Poor),
-            ] {
-                for snr in [6.0, 12.0, 18.0, 24.0, 30.0] {
-                    for trial in 0..8u64 {
-                        let seed = base + trial;
-                        let tx = CoppaTransceiver::new(CoppaProfile::hf_robust(), 1);
-                        let mut goodput = [0.0f64; 9];
-                        let mut records = Vec::new();
-                        for level in 1..=9u8 {
-                            let len = max_payload_for_level(level).unwrap();
-                            let h = make_header(level, len as u16);
-                            let payload: Vec<u8> = (0..len).map(|i| (i * 37) as u8).collect();
-                            let clean = tx.transmit(&h, &payload).unwrap();
-                            let faded = match preset {
-                                Some(p) => watterson(&clean, 48000.0, &p.config(), seed ^ 0x3333),
-                                None => clean.clone(),
-                            };
-                            let samples = coppa_channel::awgn_seeded(&faded, snr, seed ^ 0x5555);
-                            let before = tx.turbo_rescues.get();
-                            let result = tx.receive(&samples);
-                            tx.harq_evict(h.seq_num);
-                            if let Ok((verified_h, verified_payload, pilot)) = result {
-                                assert_eq!(verified_payload, payload);
-                                goodput[level as usize - 1] =
-                                    len as f64 * 8.0 / (clean.len() as f64 / 48000.0);
-                                // Repeat the exact production RX filtering, never demodulate
-                                // a different waveform or compare accumulated HARQ symbols.
-                                let filtered = tx.rx_bpf.as_ref().map(|b| b.filter_block(&samples));
-                                let input = filtered.as_deref().unwrap_or(&samples);
-                                let (_, eq, _, _) = tx.modem.demodulate_frame(input).unwrap();
-                                let residual = if tx.turbo_rescues.get() != before {
-                                    None // original observations do not match turbo's noise vector
-                                } else {
-                                    let expected =
-                                        tx.payload_symbols(&verified_h, &verified_payload).unwrap();
-                                    {
-                                        if trial == 0 {
-                                            println!("GEOMETRY level={level} expected={} observed={} carriers={}", expected.len(), eq.len(), tx.data_carriers_per_symbol());
-                                        }
-                                        let pattern =
-                                            coppa_codec::ofdm::pilots::CoppaPilotPattern::new(
-                                                tx.profile.total_active_carriers(),
-                                                tx.profile.pilot_carriers,
-                                            );
-                                        let first = coppa_codec::ofdm::header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(tx.data_carriers_per_symbol());
-                                        let maps = [
-                                            pattern.data_indices(first),
-                                            pattern.data_indices(first + 1),
-                                        ];
-                                        residual_by_carrier(&expected, &eq, &maps)
+        for (profile_name, profile) in [
+            ("robust", CoppaProfile::hf_robust()),
+            ("standard", CoppaProfile::hf_standard()),
+        ] {
+            for base in [0xCA11Bu64, 0x5A1AD] {
+                let mut totals = (0usize, 0usize, 0.0f64, 0.0f64);
+                for preset in [
+                    None,
+                    Some(WattersonPreset::Good),
+                    Some(WattersonPreset::Moderate),
+                    Some(WattersonPreset::Poor),
+                ] {
+                    for snr in [6.0, 12.0, 18.0, 24.0, 30.0] {
+                        for trial in 0..8u64 {
+                            let seed = base + trial;
+                            let tx = CoppaTransceiver::new(profile.clone(), 1);
+                            let mut goodput = [0.0f64; 9];
+                            let mut records = Vec::new();
+                            for level in 1..=9u8 {
+                                let len = max_payload_for_level(level).unwrap();
+                                let h = make_header(level, len as u16);
+                                let payload: Vec<u8> = (0..len).map(|i| (i * 37) as u8).collect();
+                                let clean = tx.transmit(&h, &payload).unwrap();
+                                let faded = match preset {
+                                    Some(p) => {
+                                        watterson(&clean, 48000.0, &p.config(), seed ^ 0x3333)
                                     }
+                                    None => clean.clone(),
                                 };
-                                let candidate = residual_level_or_pilot(residual.as_deref(), pilot);
-                                records.push((level, pilot, candidate, residual.is_some()));
-                            } else {
-                                println!("FAIL base={base:x} preset={preset:?} snr={snr} trial={trial} level={level}");
+                                let samples =
+                                    coppa_channel::awgn_seeded(&faded, snr, seed ^ 0x5555);
+                                let before = tx.turbo_rescues.get();
+                                let result = tx.receive(&samples);
+                                tx.harq_evict(h.seq_num);
+                                if let Ok((verified_h, verified_payload, pilot)) = result {
+                                    assert_eq!(verified_payload, payload);
+                                    goodput[level as usize - 1] =
+                                        len as f64 * 8.0 / (clean.len() as f64 / 48000.0);
+                                    // Repeat the exact production RX filtering, never demodulate
+                                    // a different waveform or compare accumulated HARQ symbols.
+                                    let filtered =
+                                        tx.rx_bpf.as_ref().map(|b| b.filter_block(&samples));
+                                    let input = filtered.as_deref().unwrap_or(&samples);
+                                    let (_, eq, pilot_nv, _) =
+                                        tx.modem.demodulate_frame(input).unwrap();
+                                    let pilot = if tx.turbo_rescues.get() != before {
+                                        pilot
+                                    } else {
+                                        coppa_ml::recommend_speed_level(
+                                            &pilot_nv,
+                                            verified_h.speed_level,
+                                        )
+                                    };
+                                    let residual = if tx.turbo_rescues.get() != before {
+                                        None // original observations do not match turbo's noise vector
+                                    } else {
+                                        let expected = tx
+                                            .payload_symbols(&verified_h, &verified_payload)
+                                            .unwrap();
+                                        {
+                                            if trial == 0 {
+                                                println!("GEOMETRY level={level} expected={} observed={} carriers={}", expected.len(), eq.len(), tx.data_carriers_per_symbol());
+                                            }
+                                            let pattern =
+                                                coppa_codec::ofdm::pilots::CoppaPilotPattern::new(
+                                                    tx.profile.total_active_carriers(),
+                                                    tx.profile.pilot_carriers,
+                                                );
+                                            let first = coppa_codec::ofdm::header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(tx.data_carriers_per_symbol());
+                                            let maps = [
+                                                pattern.data_indices(first),
+                                                pattern.data_indices(first + 1),
+                                            ];
+                                            residual_by_carrier(&expected, &eq, &maps)
+                                        }
+                                    };
+                                    let candidate =
+                                        residual_level_or_pilot(residual.as_deref(), pilot);
+                                    records.push((level, pilot, candidate, residual.is_some()));
+                                } else {
+                                    println!("FAIL profile={profile_name} base={base:x} preset={preset:?} snr={snr} trial={trial} level={level}");
+                                }
                             }
-                        }
-                        let oracle = goodput.iter().copied().fold(0.0f64, f64::max);
-                        for (level, pilot, candidate, available) in records {
-                            println!("PAIR base={base:x} preset={preset:?} snr={snr} trial={trial} level={level} pilot={pilot} candidate={candidate} available={available} pilot_bps={:.6} candidate_bps={:.6} oracle_bps={oracle:.6}", goodput[pilot as usize - 1], goodput[candidate as usize - 1]);
+                            let oracle = goodput.iter().copied().fold(0.0f64, f64::max);
+                            for (level, pilot, candidate, available) in records {
+                                totals.0 += 1;
+                                totals.1 += usize::from(available);
+                                totals.2 += goodput[pilot as usize - 1];
+                                totals.3 += goodput[candidate as usize - 1];
+                                println!("PAIR profile={profile_name} base={base:x} preset={preset:?} snr={snr} trial={trial} level={level} pilot={pilot} candidate={candidate} available={available} pilot_bps={:.6} candidate_bps={:.6} oracle_bps={oracle:.6}", goodput[pilot as usize - 1], goodput[candidate as usize - 1]);
+                            }
                         }
                     }
                 }
+                println!("SCREEN profile={profile_name} base={base:x} successes={} available={} pilot_bps_sum={:.9} candidate_bps_sum={:.9} improved={}", totals.0, totals.1, totals.2, totals.3, totals.3 > totals.2);
             }
         }
     }
@@ -3350,21 +3430,45 @@ mod tests {
 
     #[test]
     fn reconstructed_symbols_match_original_transmit_chain() {
-        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
-        for level in 1..=9 {
-            for codewords in [1, 2, MAX_CODEWORDS] {
-                let max = max_multi_payload_for_level(level, codewords).unwrap();
-                for len in [0, 1, max] {
-                    for rv in 0..=3 {
-                        let mut h = make_header_multi(level, len as u16, codewords);
-                        h.fec_type = rv;
-                        let payload: Vec<u8> = (0..len).map(|i| (i * 37) as u8).collect();
-                        let expected = original_transmit_symbols(&tx, &h, &payload);
-                        assert_eq!(
-                            tx.payload_symbols(&h, &payload).unwrap(),
-                            expected,
-                            "level={level} codewords={codewords} len={len} rv={rv}"
-                        );
+        for profile in [CoppaProfile::hf_standard(), CoppaProfile::hf_robust()] {
+            let tx = CoppaTransceiver::new(profile, 1);
+            for level in 1..=9 {
+                for codewords in [1, 2, MAX_CODEWORDS] {
+                    let max = max_multi_payload_for_level(level, codewords).unwrap();
+                    for len in [0, 1, max] {
+                        for rv in 0..=3 {
+                            let mut h = make_header_multi(level, len as u16, codewords);
+                            h.fec_type = rv;
+                            let payload: Vec<u8> = (0..len).map(|i| (i * 37) as u8).collect();
+                            let expected = original_transmit_symbols(&tx, &h, &payload);
+                            assert_eq!(
+                                tx.payload_symbols(&h, &payload).unwrap(),
+                                expected,
+                                "level={level} codewords={codewords} len={len} rv={rv}"
+                            );
+                            let carriers = tx.data_carriers_per_symbol();
+                            let pattern = coppa_codec::ofdm::pilots::CoppaPilotPattern::new(
+                                tx.profile.total_active_carriers(),
+                                tx.profile.pilot_carriers,
+                            );
+                            let first = coppa_codec::ofdm::header_fec::PROTECTED_HEADER_CODED_BITS
+                                .div_ceil(carriers);
+                            let maps =
+                                [pattern.data_indices(first), pattern.data_indices(first + 1)];
+                            let padded = expected.len().div_ceil(carriers) * carriers;
+                            let mut observed = expected.clone();
+                            observed.resize(padded, Complex32::new(1000.0, 0.0));
+                            for count in [padded, padded - carriers] {
+                                let result =
+                                    prefix_residual(&expected, &observed[..count], &maps).unwrap();
+                                assert_eq!(result.measured_positions, count.min(expected.len()));
+                                assert_eq!(
+                                    result.counts.iter().sum::<usize>(),
+                                    result.measured_positions
+                                );
+                                assert!(result.means().iter().all(|&v| v == 0.0));
+                            }
+                        }
                     }
                 }
             }
@@ -3380,22 +3484,67 @@ mod tests {
         // Last position is unused OFDM padding, and must not enter the mean.
         observed.push(Complex32::new(1000.0, 0.0));
         assert_eq!(
-            residual_by_carrier(&expected, &observed, &[vec![0, 1, 2]]),
+            residual_by_carrier(&expected, &observed, &[vec![0, 1, 2], vec![0, 1, 2]]),
             Some(vec![13.0, 0.0, 0.0])
         );
         assert_eq!(
-            residual_by_carrier(&expected, &expected, &[vec![0, 1, 2]]),
+            residual_by_carrier(&expected, &expected, &[vec![0, 1, 2], vec![0, 1, 2]]),
             None
         );
         let exact = vec![Complex32::new(1.0, 0.0); 6];
         assert_eq!(
-            residual_by_carrier(&expected, &exact, &[vec![0, 1, 2]]),
+            residual_by_carrier(&expected, &exact, &[vec![0, 1, 2], vec![0, 1, 2]]),
             Some(vec![0.0; 3])
         );
     }
 
     #[test]
-    fn residual_requires_complete_current_frame_observations() {
+    fn residual_prefix_counts_only_present_coded_positions() {
+        let expected = vec![Complex32::new(0.0, 0.0); 7];
+        let observed: Vec<_> = (1..=8).map(|v| Complex32::new(v as f32, 0.0)).collect();
+        let maps = [vec![0, 1], vec![1, 2]];
+        let full = prefix_residual(&expected, &observed, &maps).unwrap();
+        assert_eq!(full.measured_positions, 7);
+        assert_eq!(full.counts, [2, 4, 1]);
+        assert_eq!(full.sums, [26.0, 98.0, 16.0]);
+        let prefix = prefix_residual(&expected, &observed[..6], &maps).unwrap();
+        assert_eq!(prefix.measured_positions, 6);
+        assert_eq!(prefix.counts, [2, 3, 1]);
+        assert_eq!(prefix.sums, [26.0, 49.0, 16.0]);
+        assert_eq!(prefix.means(), [13.0, 49.0 / 3.0, 16.0]);
+    }
+
+    #[test]
+    fn residual_prefix_rejects_invalid_geometry() {
+        let expected = vec![Complex32::new(0.0, 0.0); 8];
+        let observed = expected.clone();
+        let maps = [vec![0, 1], vec![1, 2]];
+        for n in [0, 2, 4, 5, 7] {
+            assert!(
+                prefix_residual(&expected, &observed[..n], &maps).is_none(),
+                "n={n}"
+            );
+        }
+        assert!(prefix_residual(&expected, &[Complex32::new(0.0, 0.0); 10], &maps).is_none());
+        for maps in [
+            vec![vec![0, 1]],
+            vec![vec![0, 1], vec![2]],
+            vec![vec![0, 0], vec![1, 2]],
+            vec![vec![0, usize::MAX], vec![1, 2]],
+        ] {
+            assert!(prefix_residual(&expected, &observed, &maps).is_none());
+        }
+        // Two observed symbols, but only one coded position in phase two.
+        assert!(
+            prefix_residual(&expected[..3], &observed[..4], &[vec![0, 1], vec![2, 3]]).is_none()
+        );
+        let mut padded = observed.clone();
+        padded[7].re = f32::NAN;
+        assert!(prefix_residual(&expected[..7], &padded, &maps).is_none());
+    }
+
+    #[test]
+    fn residual_accepts_bounded_current_frame_prefix() {
         let tx = CoppaTransceiver::new(CoppaProfile::hf_robust(), 1);
         let h = make_header(1, 8);
         let payload = b"testdata";
@@ -3410,11 +3559,8 @@ mod tests {
         let first = coppa_codec::ofdm::header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(36);
         let maps = [pattern.data_indices(first), pattern.data_indices(first + 1)];
         let measurement = residual_by_carrier(&expected, &eq, &maps);
-        assert!(measurement.is_none());
-        assert_eq!(
-            residual_level_or_pilot(measurement.as_deref(), pilot),
-            pilot
-        );
+        assert!(measurement.is_some());
+        assert!((1..=9).contains(&residual_level_or_pilot(measurement.as_deref(), pilot)));
 
         // Test-only trailing receive context confirms the lost observation is
         // geometry, rather than reconstruction error. Production input is unchanged.
@@ -3426,17 +3572,29 @@ mod tests {
         assert!(measurement.iter().all(|v| v.is_finite() && *v >= 0.0));
     }
 
-    fn residual_level_or_pilot(measurement: Option<&[f32]>, pilot: u8) -> u8 {
-        measurement
-            .map(|nv| {
-                // Floor only at capacity conversion; zero remains exact in residual tests.
-                let nv: Vec<f32> = nv.iter().map(|&v| v.max(1e-6)).collect();
-                coppa_ml::select_speed_level_2d(
-                    coppa_ml::channel_capacity(&nv),
-                    coppa_ml::channel_selectivity(&nv),
-                )
-            })
-            .unwrap_or(pilot)
+    #[test]
+    fn standard_crc_success_has_bounded_prefix_measurement() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let h = make_header(1, 8);
+        let samples = tx.transmit(&h, b"testdata").unwrap();
+        let (header, payload, _) = tx.receive(&samples).unwrap();
+        let filtered = tx.rx_bpf.as_ref().unwrap().filter_block(&samples);
+        let (_, observed, _, _) = tx.modem.demodulate_frame(&filtered).unwrap();
+        let expected = tx.payload_symbols(&header, &payload).unwrap();
+        let carriers = tx.data_carriers_per_symbol();
+        let pattern = coppa_codec::ofdm::pilots::CoppaPilotPattern::new(
+            tx.profile.total_active_carriers(),
+            tx.profile.pilot_carriers,
+        );
+        let first = coppa_codec::ofdm::header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(carriers);
+        let maps = [pattern.data_indices(first), pattern.data_indices(first + 1)];
+        let result = prefix_residual(&expected, &observed, &maps).unwrap();
+        assert_eq!(
+            observed.len() + carriers,
+            expected.len().div_ceil(carriers) * carriers
+        );
+        assert_eq!(result.measured_positions, observed.len());
+        assert!(result.means().iter().all(|v| v.is_finite() && *v >= 0.0));
     }
 
     #[test]
@@ -3456,27 +3614,133 @@ mod tests {
 
     #[test]
     fn residual_rejects_untrustworthy_observations() {
-        let expected = vec![Complex32::new(1.0, 0.0); 3];
-        assert_eq!(residual_by_carrier(&[], &[], &[vec![0, 1, 2]]), None);
+        let expected = vec![Complex32::new(1.0, 0.0); 6];
+        assert_eq!(
+            residual_by_carrier(&[], &[], &[vec![0, 1, 2], vec![0, 1, 2]]),
+            None
+        );
         assert_eq!(residual_by_carrier(&expected, &expected, &[]), None);
         assert_eq!(
-            residual_by_carrier(&expected, &expected[..2], &[vec![0, 1, 2]]),
+            residual_by_carrier(&expected, &expected[..2], &[vec![0, 1, 2], vec![0, 1, 2]]),
             None
         );
         for bad in [f32::NAN, f32::INFINITY, f32::MAX] {
             let mut observed = expected.clone();
             observed[1].re = bad;
             assert_eq!(
-                residual_by_carrier(&expected, &observed, &[vec![0, 1, 2]]),
+                residual_by_carrier(&expected, &observed, &[vec![0, 1, 2], vec![0, 1, 2]]),
                 None
             );
         }
-        let observed = vec![Complex32::new(1001.0, 0.0); 3];
+        let observed = vec![Complex32::new(1001.0, 0.0); 6];
         assert_eq!(
-            residual_by_carrier(&expected, &observed, &[vec![0, 1, 2]]),
+            residual_by_carrier(&expected, &observed, &[vec![0, 1, 2], vec![0, 1, 2]]),
             Some(vec![1e6; 3])
         );
         assert_eq!(residual_level_or_pilot(Some(&[1e6; 3]), 9), 1);
+        for pilot in 1..=9 {
+            assert_eq!(residual_level_or_pilot(None, pilot), pilot);
+        }
+    }
+
+    #[test]
+    fn harq_success_measures_current_rv_symbols() {
+        let payload = vec![0x42; 198];
+        let (tx, mother, k_used, payload_bits) = harq_test_fixture(&payload);
+        let mut h = make_header(9, payload.len() as u16);
+        let prior = erased_coded_llrs(&mother, k_used, 0, 0.30, 8.0, 0xA11CE);
+        let (_, _, converged, _) =
+            tx.harq_combine_and_decode(h.seq_num, 9, 0, k_used, payload_bits, &prior);
+        assert!(!converged);
+        assert!(tx.harq_rx.borrow().contains(h.seq_num));
+        h.fec_type = 1;
+        let samples = tx.transmit(&h, &payload).unwrap();
+        let (verified, decoded, level) = tx.receive(&samples).unwrap();
+        assert_eq!(decoded, payload);
+        assert_eq!(verified.fec_type & RV_MASK, 1);
+        assert_eq!(tx.turbo_rescues.get(), 0);
+        let filtered = tx.rx_bpf.as_ref().unwrap().filter_block(&samples);
+        let (_, observed, nv, _) = tx.modem.demodulate_frame(&filtered).unwrap();
+        let expected = tx.payload_symbols(&verified, &decoded).unwrap();
+        let pattern = coppa_codec::ofdm::pilots::CoppaPilotPattern::new(
+            tx.profile.total_active_carriers(),
+            tx.profile.pilot_carriers,
+        );
+        let first = coppa_codec::ofdm::header_fec::PROTECTED_HEADER_CODED_BITS
+            .div_ceil(tx.data_carriers_per_symbol());
+        let maps = [pattern.data_indices(first), pattern.data_indices(first + 1)];
+        let residual = residual_by_carrier(&expected, &observed, &maps).unwrap();
+        assert!(residual.iter().all(|v| v.is_finite() && *v >= 0.0));
+        assert_eq!(level, coppa_ml::recommend_speed_level(&nv, 9));
+        assert!(!tx.harq_rx.borrow().contains(h.seq_num));
+    }
+
+    #[test]
+    fn turbo_rescue_retains_pilot_recommendation() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_robust(), 1);
+        let len = max_payload_for_level(8).unwrap();
+        let payload: Vec<u8> = (0..len).map(|i| (i * 37) as u8).collect();
+        let h = make_header(8, len as u16);
+        let clean = tx.transmit(&h, &payload).unwrap();
+        let samples = coppa_channel::awgn_seeded(&clean, 6.0, (0xCA11Bu64 + 2) ^ 0x5555);
+        let (_, decoded, level) = tx.receive(&samples).unwrap();
+        assert_eq!(decoded, payload);
+        assert_eq!(tx.turbo_rescues.get(), 1);
+        let reference = CoppaTransceiver::new(CoppaProfile::hf_robust(), 1);
+        let filtered = reference.rx_bpf.as_ref().unwrap().filter_block(&samples);
+        let (h, eq, nv, _) = reference.modem.demodulate_frame(&filtered).unwrap();
+        let (_, _, _, nv) = reference.receive_single_codeword(h, eq, nv).unwrap();
+        assert_eq!(level, coppa_ml::recommend_speed_level(&nv, 8));
+    }
+
+    #[test]
+    #[ignore = "CPU corpus, run explicitly in release mode"]
+    fn receive_cpu_corpus() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_robust(), 1);
+        let samples = tx.transmit(&make_header(2, 8), b"testdata").unwrap();
+        for _ in 0..500 {
+            let (_, payload, _) = tx.receive(&samples).unwrap();
+            assert_eq!(payload, b"testdata");
+        }
+    }
+
+    #[test]
+    fn training_fixture_residual_choice_delivers_more_goodput() {
+        let seed = 0xCA11Bu64;
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_robust(), 1);
+        let transmit = |level| {
+            let len = max_payload_for_level(level).unwrap();
+            let payload: Vec<u8> = (0..len).map(|i| (i * 37) as u8).collect();
+            let clean = tx
+                .transmit(&make_header(level, len as u16), &payload)
+                .unwrap();
+            let noisy = coppa_channel::awgn_seeded(&clean, 12.0, seed ^ 0x5555);
+            (clean, noisy, payload)
+        };
+        let (_, samples, _) = transmit(5);
+        let (verified, decoded, public_level) = tx.receive(&samples).unwrap();
+        let filtered = tx.rx_bpf.as_ref().unwrap().filter_block(&samples);
+        let (_, observed, nv, _) = tx.modem.demodulate_frame(&filtered).unwrap();
+        let pilot = coppa_ml::recommend_speed_level(&nv, 5);
+        let expected = tx.payload_symbols(&verified, &decoded).unwrap();
+        let pattern = coppa_codec::ofdm::pilots::CoppaPilotPattern::new(48, 12);
+        let first = coppa_codec::ofdm::header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(36);
+        let maps = [pattern.data_indices(first), pattern.data_indices(first + 1)];
+        let residual = residual_by_carrier(&expected, &observed, &maps).unwrap();
+        let candidate = residual_level_or_pilot(Some(&residual), pilot);
+        assert_eq!(public_level, pilot); // Full-loop experiment rejected adoption.
+        assert_eq!((pilot, candidate), (7, 8));
+        let delivered = |level| {
+            let (clean, samples, payload) = transmit(level);
+            let rx = CoppaTransceiver::new(CoppaProfile::hf_robust(), 1);
+            if let Ok((_, decoded, _)) = rx.receive(&samples) {
+                assert_eq!(decoded, payload);
+                payload.len() as f64 * 8.0 / (clean.len() as f64 / 48000.0)
+            } else {
+                0.0
+            }
+        };
+        assert!(delivered(candidate) > delivered(pilot));
     }
 
     #[test]
@@ -3489,28 +3753,31 @@ mod tests {
                 (CoppaProfile::hf_robust(), true),
             ] {
                 let tx = CoppaTransceiver::new(profile.clone(), 1);
-                let header = make_header_multi(2, 8, codewords);
-                let payload = b"testdata";
-                let clean = tx.transmit(&header, payload).unwrap();
-                let samples = if fading {
-                    let faded = watterson(&clean, 48000.0, &WattersonPreset::Good.config(), 42);
-                    coppa_channel::awgn_seeded(&faded, 30.0, 43)
-                } else {
-                    clean
-                };
-                // Independent receivers prevent accidental cross-call HARQ combining.
-                let (_, batch_payload, batch_level) = CoppaTransceiver::new(profile.clone(), 1)
-                    .receive(&samples)
-                    .unwrap();
-                let (_, metrics_payload, snr, metrics_level, delay) =
-                    CoppaTransceiver::new(profile, 1)
-                        .receive_with_metrics(&samples)
+                for rv in 0..=3 {
+                    let mut header = make_header_multi(2, 8, codewords);
+                    header.fec_type = rv;
+                    let payload = b"testdata";
+                    let clean = tx.transmit(&header, payload).unwrap();
+                    let samples = if fading {
+                        let faded = watterson(&clean, 48000.0, &WattersonPreset::Good.config(), 42);
+                        coppa_channel::awgn_seeded(&faded, 30.0, 43)
+                    } else {
+                        clean
+                    };
+                    // Independent receivers prevent accidental cross-call HARQ combining.
+                    let (_, batch_payload, batch_level) = CoppaTransceiver::new(profile.clone(), 1)
+                        .receive(&samples)
                         .unwrap();
-                assert_eq!(batch_payload, payload);
-                assert_eq!(metrics_payload, payload);
-                assert_eq!(batch_level, metrics_level);
-                assert!((1..=9).contains(&batch_level));
-                assert!(snr.is_finite() && delay.is_finite());
+                    let (_, metrics_payload, snr, metrics_level, delay) =
+                        CoppaTransceiver::new(profile.clone(), 1)
+                            .receive_with_metrics(&samples)
+                            .unwrap();
+                    assert_eq!(batch_payload, payload);
+                    assert_eq!(metrics_payload, payload);
+                    assert_eq!(batch_level, metrics_level);
+                    assert!((1..=9).contains(&batch_level));
+                    assert!(snr.is_finite() && delay.is_finite());
+                }
             }
         }
     }
