@@ -72,6 +72,8 @@ test_audio/
 # Golden decode-regression vectors (Task 8, decision 9c) ARE committed --
 # small, frozen reference WAVs read by crates/coppa-protocol/tests/golden_vectors.rs.
 !testdata/golden/*.wav
+# COP-115 independent Direwolf interoperability recordings.
+!testdata/il2p/*.wav
 # COP-116 pinned synthetic Direwolf acceptance recording.
 !testdata/g3ruh/g3ruh_9600_100frames_10db.wav
 

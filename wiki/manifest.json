@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-11-05T23:08:40Z",
-  "head_commit": "11a49f3",
+  "generated_at": "2026-11-06T09:21:18Z",
+  "head_commit": "14d87c5",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -600,7 +600,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:dac783ef22958480dba0c921ccab69b90dcb440ff6b46019c29afeca451e953d",
+      "hash": "sha256:ba937b9af743dc0a184d474f47320e62559c0cc5846ba908521ff970074b0399",
       "id": "tnc-direwolf-benchmark",
       "kind": "gotcha",
       "links": [

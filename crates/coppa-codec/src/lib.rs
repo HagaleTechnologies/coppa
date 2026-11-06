@@ -83,6 +83,7 @@ pub mod bpsk;
 mod fx25;
 pub mod g3ruh;
 mod hdlc;
+pub mod il2p;
 pub mod ofdm;
 pub mod psk8;
 pub mod qam16;

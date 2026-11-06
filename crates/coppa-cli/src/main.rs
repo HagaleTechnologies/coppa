@@ -715,6 +715,9 @@ enum Commands {
         /// Use VOX instead of CAT PTT.
         #[arg(long)]
         vox: bool,
+        /// Transmit IL2P with maximum FEC
+        #[arg(long, conflicts_with = "fx25")]
+        il2p: bool,
         /// Transmit FX.25 when the frame fits; otherwise transmit AX.25
         #[arg(long)]
         fx25: bool,
@@ -955,6 +958,7 @@ fn run() -> Result<()> {
             output_channel,
             rig,
             vox,
+            il2p,
             fx25,
             digipeat,
         } => cmd_tnc(
@@ -969,6 +973,7 @@ fn run() -> Result<()> {
             output_channel,
             rig,
             vox,
+            il2p,
             fx25,
             digipeat,
         )?,
@@ -2741,6 +2746,7 @@ fn cmd_tnc(
     output_channel: u16,
     rig: Option<String>,
     vox: bool,
+    il2p: bool,
     fx25: bool,
     digipeat: Option<String>,
 ) -> Result<()> {
@@ -2762,7 +2768,9 @@ fn cmd_tnc(
             vox_mode: vox,
             sample_rate: 48000,
         };
-        if fx25 {
+        if il2p {
+            coppa_daemon::tnc::run_tnc_with_il2p(config).await
+        } else if fx25 {
             coppa_daemon::tnc::run_tnc_with_fx25(config).await
         } else {
             coppa_daemon::tnc::run_tnc(config).await
@@ -2773,6 +2781,29 @@ fn cmd_tnc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "kiss-tnc")]
+    #[test]
+    fn tnc_il2p_is_opt_in_and_help_describes_maximum_fec() {
+        use clap::CommandFactory;
+        let default = Cli::try_parse_from(["coppa", "tnc", "--vox"]).unwrap();
+        assert!(matches!(default.command, Commands::Tnc { il2p: false, .. }));
+        let enabled = Cli::try_parse_from(["coppa", "tnc", "--vox", "--il2p"]).unwrap();
+        assert!(matches!(enabled.command, Commands::Tnc { il2p: true, .. }));
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("tnc")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--il2p") && help.contains("Transmit IL2P with maximum FEC"));
+    }
+
+    #[cfg(feature = "kiss-tnc")]
+    #[test]
+    fn tnc_il2p_and_fx25_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from(["coppa", "tnc", "--il2p", "--fx25"]).is_err());
+    }
 
     #[cfg(feature = "kiss-tnc")]
     #[test]

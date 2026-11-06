@@ -37,3 +37,14 @@ The method and the latest counts are in
   prove wire compatibility. They do not measure acquisition on noisy audio.
   The untouched Direwolf WAV needs a 20-sample receive-origin offset with the
   existing fixed-window demodulator.
+
+COP-115 adds automatic IL2P receive and opt-in `coppa tnc --il2p` transmit.
+See [the IL2P interoperability record](../../docs/testing/tnc-direwolf-il2p.md).
+Compare KISS bytes for identity: Direwolf monitor output truncates long frames,
+and its 1.7 FEC status labels IL2P as FX.25. Decode counts alone prove neither
+frame identity nor zero corrections.
+
+Staggered receive windows alone do not cover sample-clock drift over long IL2P
+packets. The codec regression `maximum_packet_tracks_sample_clock_drift` exercises
+a maximum-length packet at both +75 and -75 ppm using linear resampling. This
+is clean-audio coverage, not a noisy-channel or live RF result.

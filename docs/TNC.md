@@ -21,9 +21,15 @@ to Direwolf's 1000 (41.2 percent). The method and the script that reproduces it 
 What it does:
 
 - Serves KISS over TCP on `127.0.0.1`, port 8001 by default (`--port` changes it).
-- Sends and receives AX.25 frames with up to 256 bytes of information field. The KISS client
-  builds the frames; digipeating inspects only their address fields.
+- Sends ordinary AX.25 by default and automatically receives AX.25 and Direwolf 1.7 IL2P.
+  The KISS client builds complete AX.25 frames without FCS; digipeating
+  inspects only their address fields.
+- `--il2p` selects maximum-FEC IL2P transmission with up to 1023 information bytes
+  for losslessly representable two-address UI frames. Other frames use transparent
+  encapsulation with a 1023-byte limit on the entire AX.25 frame.
+  `--il2p` and `--fx25` are mutually exclusive.
 - Modulates and demodulates Bell 202 (1200 Hz mark, 2200 Hz space) or G3RUH 9600 at 48 kHz.
+  IL2P transmit and receive are 1200-baud only; `--il2p` is refused at 9600.
 - Keys PTT through rigctld (`--rig localhost:4532`), or not at all.
 
 What it does not do:
@@ -35,8 +41,10 @@ What it does not do:
   transmissions start immediately. Only automatic repeats wait for a clear channel.
 - No beaconing and no configuration file.
 - `--vox` keys nothing. It behaves like no PTT, so the radio's own VOX has to key it.
-- No error correction beyond the AX.25 frame check sequence (FCS). A frame with a bad FCS is
-  discarded.
+- IL2P is 1200 baud only.
+- Ordinary AX.25 uses FCS validation. IL2P uses Reed-Solomon correction and has no
+  trailing CRC in the Direwolf 1.7 format. Some corruption beyond its correction
+  bound can be delivered undetected. See [the measured coverage](testing/tnc-direwolf-il2p.md).
 
 ## 9600 baud (G3RUH)
 
@@ -122,6 +130,25 @@ above.
 
 Use `coppa tnc`, not `coppad --tnc`, for this guide. `coppad --tnc` always listens on port
 8001 and uses the default audio device, so two of them cannot run on one machine.
+
+## IL2P with Direwolf
+
+Start the same service with `coppa tnc --il2p --vox` to transmit IL2P with
+16 parity bytes per payload block. Device, channel, port and PTT options work
+as before. Both this command and the default `coppa tnc --vox` receive IL2P
+automatically alongside ordinary AX.25. `coppad --tnc` also receives both,
+while retaining ordinary AX.25 transmission.
+
+KISS payloads are complete AX.25 frames without FCS in either mode. IL2P adds
+neither AX.25 FCS nor HDLC stuffing. It receives both automatic and maximum
+FEC modes, either tone polarity, and type-1 UI/I/S/U and transparent type-0
+headers. TX uses type 1 for lossless UI headers and type 0 for other frames,
+including digipeater paths. Invalid or oversized IL2P requests are dropped
+before PTT with `TNC frame cannot be encoded as IL2P; dropping frame`.
+They are never truncated or sent using a different encoding.
+
+[Byte-level interoperability tests](testing/tnc-direwolf-il2p.md) cover clean
+48 kHz audio with Direwolf 1.7. No noisy-channel or live RF result is claimed.
 
 ## Demo: two TNCs on one Linux machine
 
@@ -217,9 +244,9 @@ See also [HOST-API.md](HOST-API.md#kiss-afsk-1200-tnc-mode), which lists these d
 authors. The shared server now keeps a frame whole across split TCP reads, including
 escapes. Nonzero KISS ports remain unsupported.
 
-- Frames carry no FCS, as the KISS protocol specifies. The TNC adds the FCS on transmit, and
-  on receive it checks the FCS, drops frames that fail, and strips it before passing the frame
-  to clients. A host that appends its own FCS gets two on air.
+- Frames carry no FCS, as the KISS protocol specifies. For ordinary AX.25 the TNC
+  adds FCS on transmit and checks and strips it on receive. For IL2P it passes
+  the reconstructed AX.25 bytes unchanged. Hosts must not append their own FCS.
 - Data travels on KISS port 0 only (command byte `0x00`).
 - Every connected client receives every decoded frame. Up to 16 clients can connect at once.
 - The server binds `127.0.0.1` and has no authentication: anything that can open a TCP
