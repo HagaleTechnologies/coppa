@@ -193,7 +193,13 @@ observations in 1,593 CRC-successful probes out of 2,880 attempts, so every cand
 back to the pilot recommendation. A normal regression test reproduces the missing final
 OFDM payload symbol after RX filtering on a frame-sized HF input. The candidate was not
 adopted, and the rate-loop bar remains unmet. See BENCHMARKS.md's "COP-133: Same-frame
-residual experiment" for commands, counts and limitations. No RateLoop or channel-estimation
+residual experiment" for commands, counts and limitations. COP-152's bounded-prefix candidate
+has usable measurements and improves held-out selected goodput on robust and
+standard profiles. Full frozen-candidate controls still fail both bars and regress
+pooled standard Poor-segment goodput by 19.96%. Production adoption was rejected;
+the pilot selector remains active. It omits one final symbol and conditions on CRC success; both can bias the
+measurement. See BENCHMARKS.md's "COP-152: Bounded-prefix payload residual" for
+coverage and the separate full-run acceptance evidence. No RateLoop or channel-estimation
 code changed as a result of either diagnosis. **UPDATE (2026-08-05): the first of the previously proposed
 two levers — short CP — has moved from *untried* to tried and measured (COP-2), and the primary
 finding is that this bullet's own bar cannot express it.** `closed_loop_arq` was rebuilt around a CP
