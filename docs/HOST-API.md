@@ -21,6 +21,7 @@ Every table below was checked against coppad 0.3.0 at commit `b9fdb8d` (see
 | VARA-style data port | 8301 | the same key | none | none |
 | ARDOP command / data | 8515 / 8516 | `[host] ardop_enabled = true` | `ardop` | none |
 | WebSocket JSON (and the `GET /` page) | 8400 | `[host] websocket_enabled = true` and `websocket_token` | `websocket` | token; browsers also need an allowed `Origin` |
+| AGWPE connectionless (AFSK TNC) | opt-in 8000 | `coppa tnc --agw-port 8000` | `kiss-tnc` and `cpal-backend` for audio | none |
 | KISS datagram (OFDM modem) | 8100 | `[host] kiss_enabled = true` | `kiss-tnc` | none |
 | KISS (AFSK 1200 or G3RUH 9600 TNC mode) | 8001 | `coppad --tnc`, or `coppa tnc --port N --baud 9600` for G3RUH | `kiss-tnc` (and `cpal-backend` for audio) | none |
 
@@ -400,7 +401,7 @@ frame, including an escape sequence split across reads, and forwards it only aft
 
 ## Security
 
-- The VARA-style, ARDOP and both KISS ports have **no authentication**. Anything that can open a TCP
+- The VARA-style, ARDOP, AGWPE and both KISS ports have **no authentication**. Anything that can open a TCP
   connection to them can key your transmitter. `bind_address` defaults to `127.0.0.1`; change it
   only on a trusted, firewalled network.
 - A web page in your own browser can still send a command line to the VARA-style command port
@@ -440,3 +441,63 @@ present whenever `link` is present. It reports the negotiated mode even if a
 TX-duration guard sends an individual segment as a plain frame.
 `link.fade_hold` separately reports the retransmission fallback state.
 Configure the mode with `[session] fade_protection`; no host command changes it.
+
+## AGWPE connectionless AFSK TNC
+
+`coppa tnc --agw-port 8000` adds AGWPE to the AFSK TNC, alongside KISS on 8001.
+It is disabled by default. `--bind-address` selects both listeners' address,
+defaulting to loopback. See [TNC setup and verification](TNC.md#optional-connectionless-agwpe).
+There is no authentication. Reachable clients can key the transmitter.
+
+Packets have a 36-byte header followed by exactly DataLen body bytes. Offsets:
+port at 0, ASCII command at 4, PID at 6, NUL-padded source callsign at 8..18,
+destination at 18..28, little-endian u32 DataLen at 28..32. Remaining bytes
+are reserved and replies set them to zero. Only wire port 0, shown as radio
+port 1 in clients, is supported. Other ports are consumed without reply.
+
+| Command | Behavior |
+| --- | --- |
+| `R` | Reply body little-endian u32 2005 followed by u32 127 |
+| `G` | Reply `1;Port1 coppa AFSK 1200;` plus NUL |
+| `g` | Reply 12 bytes: `00 FF` then ten zeroes; 1200 baud, unavailable traffic/timing statistics |
+| `X` | Register source callsign; reply normalized source and one byte 01 on success, 00 on failure |
+| `x` | Unregister source, no reply; idempotent |
+| `k` | Toggle raw RX, initially off |
+| `m` | Toggle UI monitoring, initially off |
+| `M` | Build UI frame from source, destination, PID and body; no acknowledgement |
+| `V` | As M, body starts with digipeater count then that many ten-byte callsigns |
+| `K` | Raw TX, discard first body byte, transmit remaining FCS-free AX.25 bytes unchanged |
+| `y` | Reply little-endian u32 pending-frame snapshot |
+
+Callsigns are 1..6 ASCII alphanumerics with optional SSID 0..15, normalized to
+uppercase. Sixteen distinct registrations are permitted per connection. Duplicates
+succeed, including across clients. Registration is not required for TX or RX.
+UI information is limited to 256 bytes and paths to eight digipeaters. Invalid
+transmit requests are consumed with a warning and never transmitted. Empty raw
+payloads are invalid. DataLen above 1024 closes the connection before body allocation.
+Truncated EOF affects only that client. Unknown commands, including `P` and
+connected-mode `C v c D d Y`, are consumed without reply.
+
+Raw subscribers get `K` records with body zero plus the complete FCS-stripped
+frame, including non-UI control types. UI subscribers get `U` records whose header
+contains source, destination and PID. Their body is ASCII metadata followed by
+binary information, CR and NUL, for example:
+` 1:Fm N0CALL To APRS <UI pid=F0 Len=5 PF=0 >[12:34:56]` then CR, `hello`, CR, NUL.
+Timestamps are UTC. Digipeater paths appear as ` Via A,B*`, with the last repeated
+address marked. Command/response bits select P, F or PF. Malformed/non-UI frames
+have no textual monitor record; raw subscribers still receive them. Toggles and
+registrations reset on disconnect. Both subscriptions may be enabled together.
+
+`y` counts the AGW TX channel plus all active/queued transmitter frames from either
+host protocol, including the active PTT tail. It excludes KISS's own waiting
+channel and partial/unaccepted AGW requests. Standalone adapters may supply their
+own transmitter snapshot with `AgwServer::with_pending_frames`.
+
+The server caps connections at 16, TX frames at 256, RX broadcast records at 64
+and each client's outbound queue at 64. A full TX queue disconnects the offending
+client. Replies and RX records wait up to five seconds for outbound space, so
+pipelined requests and receive bursts reach a client that is reading. Writes time
+out after five seconds; a client whose writes stay stalled is disconnected. Broadcast lag skips lost
+records with a log; it never grows a queue. Partial requests survive interleaved RX.
+Winlink Express packet and Outpost BBS connected sessions are unsupported. Real
+UI-View interoperability and monitor formatting remain unverified with those clients.

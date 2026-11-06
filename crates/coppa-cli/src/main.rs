@@ -688,6 +688,12 @@ enum Commands {
         /// KISS TCP port.
         #[arg(long, default_value = "8001")]
         port: u16,
+        /// Enable the AGWPE TCP server on this port (normally 8000)
+        #[arg(long)]
+        agw_port: Option<u16>,
+        /// Bind the KISS and AGWPE TCP servers to this address
+        #[arg(long, default_value = "127.0.0.1")]
+        bind_address: String,
         /// Input and output device name (unique substring).
         #[arg(long, conflicts_with_all = ["input_device_id", "output_device_id"])]
         device: Option<String>,
@@ -943,6 +949,8 @@ fn run() -> Result<()> {
         Commands::Tnc {
             baud,
             port,
+            agw_port,
+            bind_address,
             device,
             input_device_id,
             output_device_id,
@@ -956,6 +964,8 @@ fn run() -> Result<()> {
         } => cmd_tnc(
             baud,
             port,
+            agw_port,
+            bind_address,
             device,
             input_device_id,
             output_device_id,
@@ -2727,6 +2737,8 @@ fn parse_digipeat_alias(s: &str) -> Result<(String, u8)> {
 fn cmd_tnc(
     baud: TncBaud,
     port: u16,
+    agw_port: Option<u16>,
+    bind_address: String,
     device: Option<String>,
     input_device_id: Option<String>,
     output_device_id: Option<String>,
@@ -2745,6 +2757,8 @@ fn cmd_tnc(
             baud: baud.into(),
             digipeat_alias,
             kiss_port: port,
+            agw_port,
+            bind_address,
             audio_device: device,
             input_device_id,
             output_device_id,
@@ -2753,7 +2767,6 @@ fn cmd_tnc(
             rig_address: rig,
             vox_mode: vox,
             sample_rate: 48000,
-            ..Default::default()
         };
         if il2p {
             coppa_daemon::tnc::run_tnc_with_il2p(config).await
@@ -4829,6 +4842,71 @@ mod tests {
             .expect("conflict")
             .kind(),
             clap::error::ErrorKind::ArgumentConflict,
+        );
+    }
+
+    /// COP-137: the AGWPE flags are opt-in, default to off and loopback, and
+    /// leave the KISS port and device/channel arguments as they were.
+    #[cfg(feature = "kiss-tnc")]
+    #[test]
+    fn tnc_agw_port_and_bind_address_flags_parse() {
+        let Commands::Tnc {
+            port,
+            agw_port,
+            bind_address,
+            device,
+            input_channel,
+            output_channel,
+            ..
+        } = Cli::parse_from(["coppa", "tnc"]).command
+        else {
+            panic!("expected Tnc")
+        };
+        assert_eq!(port, 8001);
+        assert_eq!(agw_port, None);
+        assert_eq!(bind_address, "127.0.0.1");
+        assert_eq!(device, None);
+        assert_eq!((input_channel, output_channel), (0, 0));
+
+        let Commands::Tnc {
+            port,
+            agw_port,
+            bind_address,
+            device,
+            input_channel,
+            output_channel,
+            ..
+        } = Cli::parse_from([
+            "coppa",
+            "tnc",
+            "--port",
+            "8101",
+            "--agw-port",
+            "8000",
+            "--bind-address",
+            "0.0.0.0",
+            "--device",
+            "USB",
+            "--input-channel",
+            "1",
+            "--output-channel",
+            "1",
+        ])
+        .command
+        else {
+            panic!("expected Tnc")
+        };
+        assert_eq!(port, 8101);
+        assert_eq!(agw_port, Some(8000));
+        assert_eq!(bind_address, "0.0.0.0");
+        assert_eq!(device.as_deref(), Some("USB"));
+        assert_eq!((input_channel, output_channel), (1, 1));
+        assert_eq!(
+            Cli::try_parse_from(["coppa", "tnc", "--agw-port", "65536"])
+                .err()
+                .expect("out of range")
+                .kind(),
+            clap::error::ErrorKind::ValueValidation,
         );
     }
 
