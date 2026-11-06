@@ -212,6 +212,12 @@ impl Digipeater {
     fn on_air_frame(&mut self, now: Instant, frame: &[u8]) -> Option<Vec<u8>> {
         self.seen
             .retain(|(_, at)| now.duration_since(*at) < DEDUPE_WINDOW);
+        // Only UI traffic is deduplicated. Connected-mode senders retransmit
+        // byte-identical SABM, I and S frames after a loss; dropping those
+        // retries would end a session on a single lost frame.
+        if !coppa_protocol::ax25::is_ui(frame) {
+            return coppa_protocol::ax25::digipeat(frame, &self.alias.0, self.alias.1);
+        }
         let key = coppa_protocol::ax25::dedupe_key(frame);
         if self.seen.iter().any(|(old, _)| *old == key) {
             tracing::debug!("digipeat duplicate dropped");
@@ -868,6 +874,30 @@ mod tests {
             .on_air_frame(now + Duration::from_secs(30), &frame)
             .is_some());
         assert!(digi.seen.len() <= 64);
+    }
+
+    #[test]
+    fn connected_mode_retries_are_not_deduplicated() {
+        let mut digi = Digipeater::new(("N0CALL".into(), 2));
+        let now = Instant::now();
+        // SABM through N0CALL-2: control byte follows the 21-byte address field.
+        let mut sabm = repeat_frame()[..21].to_vec();
+        sabm.push(0x3F);
+        // The digipeater trusts the demodulator's FCS check and recomputes FCS.
+        sabm.extend_from_slice(&[0, 0]);
+        assert!(!coppa_protocol::ax25::is_ui(&sabm));
+        let marked = digi.on_air_frame(now, &sabm).unwrap();
+        assert!(
+            digi.on_air_frame(now + Duration::from_secs(3), &sabm)
+                .is_some(),
+            "a retried SABM must be repeated again"
+        );
+        assert!(
+            digi.on_air_frame(now + Duration::from_secs(4), &marked)
+                .is_none(),
+            "our own repeat is already marked used"
+        );
+        assert!(digi.seen.is_empty());
     }
 
     #[test]

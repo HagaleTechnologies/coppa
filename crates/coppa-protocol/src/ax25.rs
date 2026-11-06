@@ -59,6 +59,15 @@ pub fn digipeat(frame: &[u8], alias_callsign: &str, alias_ssid: u8) -> Option<Ve
     Some(marked)
 }
 
+/// True for a UI frame (control 0x03, with or without the P/F bit).
+///
+/// Connected-mode frames (I, S and U frames other than UI) return false: their
+/// senders retransmit byte-identical frames after a loss, so they must not be
+/// treated as duplicates. Malformed address fields return false.
+pub fn is_ui(frame: &[u8]) -> bool {
+    address_end(frame).is_some_and(|end| frame[end] & !0x10 == 0x03)
+}
+
 /// Duplicate identity excluding FCS and path H bits.
 ///
 /// The caller must have verified the input FCS. Malformed address fields are
@@ -351,6 +360,16 @@ mod tests {
         buf.push((crc & 0xFF) as u8);
         buf.push((crc >> 8) as u8);
         buf
+    }
+
+    #[test]
+    fn is_ui_matches_only_ui_control() {
+        assert!(is_ui(&pid_less_control_frame(0x03)));
+        assert!(is_ui(&pid_less_control_frame(0x13)));
+        for ctrl in [0x2F, 0x3F, 0x63, 0x43, 0x81, 0x00] {
+            assert!(!is_ui(&pid_less_control_frame(ctrl)), "ctrl {ctrl:#04x}");
+        }
+        assert!(!is_ui(&[0u8; 4]));
     }
 
     #[test]

@@ -58,8 +58,9 @@ match. The repeat marks that entry used and recomputes FCS without changing the
 rest of the frame. There is no WIDEn-N alias substitution or counter decrement.
 All decoded frames still reach KISS clients, whether repeated or not.
 
-Duplicates are suppressed for 30 s, ignoring path used bits and FCS. The cache holds
-64 frames. One pending repeat is retained; a newer repeat replaces it. Every automatic
+Duplicate UI frames are suppressed for 30 s, ignoring path used bits and FCS. The cache
+holds 64 frames. Connected-mode frames (SABM, I, S and other non-UI frames) are never
+deduplicated, because their senders retransmit identical frames after a loss. One pending repeat is retained; a newer repeat replaces it. Every automatic
 transmit checks the spectral channel-busy flag and available transmitter space. A
 repeat waiting for a busy channel is dropped after 5 s, with a DEBUG log line:
 `digipeat frame dropped: channel busy for 5s`.
