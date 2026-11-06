@@ -219,10 +219,15 @@ fn decode(bytes: &[u8]) -> Option<Vec<u8>> {
 pub fn modulate(frame_bytes: &[u8]) -> Result<Vec<f32>, Il2pError> {
     Ok(audio(&encode(frame_bytes, true)?, false))
 }
+/// Audible 0x55 lead-in before the packet's own preamble byte: 29 bytes is
+/// about 193 ms at 1200 baud, so VOX keys and the receiver settles before the
+/// sync word (the AX.25 path sends a comparable flag preamble).
+const LEAD_IN_BYTES: usize = 29;
+
 fn audio(packet: &[u8], inverted: bool) -> Vec<f32> {
-    let mut out = vec![0.0; 9600];
+    let mut out = Vec::with_capacity((LEAD_IN_BYTES + packet.len()) * 320 + 4800);
     let mut phase: f32 = 0.0;
-    for &byte in packet {
+    for &byte in std::iter::repeat_n(&0x55, LEAD_IN_BYTES).chain(packet) {
         for bit in (0..8).rev() {
             let mark = ((byte >> bit) & 1 != 0) ^ inverted;
             let step = TAU * if mark { 1200.0 } else { 2200.0 } / 48000.0;
@@ -490,6 +495,17 @@ mod tests {
             slicer.bit((i % 2) as u8);
         }
         assert!(slicer.candidates.iter().all(|c| c.bytes.len() <= 1118));
+    }
+    #[test]
+    fn transmission_starts_with_audible_lead_in() {
+        // VOX needs audio, not silence, before the sync word arrives.
+        let audio = modulate(&frame(20)).unwrap();
+        let sync_at = (LEAD_IN_BYTES + 1) * 8 * 40;
+        assert!(sync_at >= 9_000, "lead-in shorter than ~190 ms");
+        for window in audio[..sync_at].chunks(480) {
+            let peak = window.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            assert!(peak > 0.5, "silent 10 ms window before sync");
+        }
     }
     #[test]
     fn payload_sync_patterns_do_not_evict_validated_frame() {
