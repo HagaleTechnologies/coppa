@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use coppa_bench::afsk_direwolf::{
-    coppa_counts_by_offset, load_channel0, open_pcm16, run_atest, run_direwolf, Report,
+    coppa_counts_by_offset, load_channel0, open_pcm16, run_atest, run_direwolf, DemodKind, Report,
     START_OFFSETS,
 };
 
@@ -72,7 +72,8 @@ fn run(args: &Args) -> Result<Report> {
     drop(open_pcm16(&args.wav)?);
     let (samples, input) = load_channel0(&args.wav)?;
     let offsets = START_OFFSETS.to_vec();
-    let coppa_by_offset = coppa_counts_by_offset(&samples, input.rate, &offsets)?;
+    let coppa_by_offset =
+        coppa_counts_by_offset(&samples, input.rate, &offsets, DemodKind::Afsk1200)?;
     drop(samples);
 
     let temp;
@@ -94,8 +95,8 @@ fn run(args: &Args) -> Result<Report> {
         }
     };
 
-    let direwolf = run_direwolf(&args.direwolf, &args.wav, work_dir)?;
-    let atest = run_atest(&args.atest, &args.wav)?;
+    let direwolf = run_direwolf(&args.direwolf, &args.wav, work_dir, DemodKind::Afsk1200)?;
+    let atest = run_atest(&args.atest, &args.wav, &[])?;
     if let Some(dir) = &args.log_dir {
         for (name, bytes) in [
             ("direwolf.txt", &direwolf.output),
@@ -106,6 +107,7 @@ fn run(args: &Args) -> Result<Report> {
         }
     }
     Ok(Report {
+        kind: DemodKind::Afsk1200,
         input,
         offsets,
         coppa_by_offset,

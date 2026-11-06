@@ -1,16 +1,17 @@
-# KISS TNC (AFSK 1200)
+# KISS TNC (AFSK 1200 and G3RUH 9600)
 
 For KISS datagrams on the HF OFDM modem, see [RETICULUM.md](RETICULUM.md).
-This page covers the separate AFSK mode.
+This page covers the separate packet TNC mode.
 
 ## What this mode is for
 
-`coppa tnc` runs a 1200-baud AFSK (Bell 202) AX.25 TNC behind a KISS TCP port. Use it for
+`coppa tnc` runs an AX.25 TNC behind a KISS TCP port. It defaults to 1200-baud AFSK
+(Bell 202); `--baud 9600` selects G3RUH. Use it for
 KISS bring-up and testing: checking that a KISS client, your audio routing and your PTT reach
 coppa. It is not a Direwolf replacement. Digipeating is opt-in with
 `--digipeat CALL[-SSID]`; a spectral busy check gates automatic repeats. KISS client
 transmissions still start immediately and ignore TXDELAY, persistence and slot time.
-It has no AGWPE interface or beaconing, and runs only at 1200 baud. Remaining parity work
+It has no AGWPE interface or beaconing. It runs at 1200 baud (AFSK) or 9600 baud (G3RUH). Remaining parity work
 is planned as H-122 in the
 [2026-09-05 product review](reviews/2026-09-05-product-ux-market-review.md).
 Measured against Direwolf 1.7 on track 2 of the WA8LMF TNC Test CD, coppa decodes 412 packets
@@ -26,7 +27,8 @@ What it does:
 - `--il2p` selects maximum-FEC IL2P transmission with up to 1023 information bytes
   for losslessly representable two-address UI frames. Other frames use transparent
   encapsulation with a 1023-byte limit on the entire AX.25 frame.
-- Modulates and demodulates Bell 202 (1200 Hz mark, 2200 Hz space) at 48 kHz.
+- Modulates and demodulates Bell 202 (1200 Hz mark, 2200 Hz space) or G3RUH 9600 at 48 kHz.
+  IL2P transmit and receive are 1200-baud only; `--il2p` is refused at 9600.
 - Keys PTT through rigctld (`--rig localhost:4532`), or not at all.
 
 What it does not do:
@@ -38,10 +40,27 @@ What it does not do:
   transmissions start immediately. Only automatic repeats wait for a clear channel.
 - No beaconing and no configuration file.
 - `--vox` keys nothing. It behaves like no PTT, so the radio's own VOX has to key it.
-- 1200 baud only.
+- IL2P is 1200 baud only.
 - Ordinary AX.25 uses FCS validation. IL2P uses Reed-Solomon correction and has no
   trailing CRC in the Direwolf 1.7 format. Some corruption beyond its correction
   bound can be delivered undetected. See [the measured coverage](testing/tnc-direwolf-il2p.md).
+
+## 9600 baud (G3RUH)
+
+Select `coppa tnc --baud 9600`. G3RUH uses direct FSK: connect the radio's
+9600-capable discriminator input/output path. Microphone audio paths generally
+filter out the required baseband signal. Device selection with `--device`,
+`--input-device-id` and `--output-device-id` works the same way at both rates.
+
+On the pinned Direwolf-generated 100-frame recording at 10 dB SNR, coppa delivers
+100 frames to Direwolf's 100, meeting the 95 percent bar. See the
+[measurement record](testing/tnc-direwolf-g3ruh-9600.md) for the fixture and method.
+This synthetic result does not measure real radio performance or clock drift.
+
+The KISS contract, PTT controls and ignored TXDELAY are unchanged. Both modems run
+at a 48 kHz engine rate. The 9600 receiver merges five fixed sampling phases and
+suppresses identical frames received within 150 ms; see
+[LIMITATIONS.md](LIMITATIONS.md) for the timing limits.
 
 ## Digipeating
 
@@ -96,7 +115,7 @@ levelled log lines (coloured only on a terminal; `RUST_LOG` overrides the `info`
 
 ```text
 $ coppa tnc --port 8001 --device coppa-loop-A
- INFO TNC mode kiss_port=8001 preferred_hardware_rate=48000 engine_rate=48000
+ INFO TNC mode kiss_port=8001 preferred_hardware_rate=48000 engine_rate=48000 modem=afsk_1200
  INFO KISS server listening port=8001
  INFO PTT: null (no PTT configured)
  INFO Audio input started input_hardware_rate=48000 engine_rate=48000

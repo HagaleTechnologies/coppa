@@ -1,5 +1,5 @@
 //! TNC (Terminal Node Controller) daemon mode.
-//! Wires AFSK 1200 modem <-> CPAL audio <-> KISS TCP server <-> PTT control.
+//! Wires AFSK 1200 or G3RUH 9600 modem <-> CPAL audio <-> KISS TCP server <-> PTT control.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -185,6 +185,50 @@ impl TncTx {
     }
 }
 
+/// Physical layer used by the KISS TNC. Both modes run at 48 kHz.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TncBaud {
+    Afsk1200,
+    G3ruh9600,
+}
+
+impl TncBaud {
+    fn modem_name(self) -> &'static str {
+        match self {
+            Self::Afsk1200 => "afsk_1200",
+            Self::G3ruh9600 => "g3ruh_9600",
+        }
+    }
+}
+
+enum TncDemodulator {
+    Afsk(coppa_codec::afsk::Demodulator),
+    G3ruh(Box<coppa_codec::g3ruh::Demodulator>),
+}
+
+impl TncDemodulator {
+    fn new(baud: TncBaud) -> Self {
+        match baud {
+            TncBaud::Afsk1200 => Self::Afsk(coppa_codec::afsk::Demodulator::new()),
+            TncBaud::G3ruh9600 => Self::G3ruh(Box::default()),
+        }
+    }
+
+    fn process(&mut self, samples: &[f32]) {
+        match self {
+            Self::Afsk(demod) => demod.process(samples),
+            Self::G3ruh(demod) => demod.process(samples),
+        }
+    }
+
+    fn take_frames(&mut self) -> Vec<Vec<u8>> {
+        match self {
+            Self::Afsk(demod) => demod.take_frames(),
+            Self::G3ruh(demod) => demod.take_frames(),
+        }
+    }
+}
+
 fn format_address(address: &coppa_protocol::ax25::Ax25Address) -> String {
     if address.ssid == 0 {
         address.callsign.clone()
@@ -231,7 +275,7 @@ impl Digipeater {
         Some(marked)
     }
 
-    fn submit(&self, frame: Vec<u8>, tx: &mut TncTx, mode: TxMode) {
+    fn submit(&self, frame: Vec<u8>, tx: &mut TncTx, mode: TxMode, baud: TncBaud) {
         use coppa_protocol::ax25::Ax25Address;
         let dest = Ax25Address::from_bytes(&frame[..7])
             .map(|a| format_address(&a))
@@ -244,7 +288,7 @@ impl Digipeater {
             ssid: self.alias.1,
         };
         // Repeat in the configured transmit mode, like a client frame.
-        if let Some(audio) = mode.encode(&air_to_kiss(frame)) {
+        if let Some(audio) = mode.encode(&air_to_kiss(frame), baud) {
             tracing::info!("Digipeated {src}>{dest} via {}", format_address(&alias));
             tx.submit(audio);
         }
@@ -275,6 +319,7 @@ impl PendingRepeat {
 
 /// Configuration for TNC daemon mode.
 pub struct TncConfig {
+    pub baud: TncBaud,
     /// Opt-in exact callsign and SSID alias for automatic repeats.
     pub digipeat_alias: Option<(String, u8)>,
     pub kiss_port: u16,
@@ -282,7 +327,7 @@ pub struct TncConfig {
     pub bind_address: String,
     pub rig_address: Option<String>,
     pub vox_mode: bool,
-    /// Preferred hardware rate; AFSK modem audio remains at 48 kHz.
+    /// Preferred hardware rate; modem audio remains at 48 kHz.
     pub sample_rate: u32,
     /// Audio device name substring (case-insensitive) for both input and
     /// output; `None` uses the default devices.
@@ -301,6 +346,7 @@ pub struct TncConfig {
 impl Default for TncConfig {
     fn default() -> Self {
         Self {
+            baud: TncBaud::Afsk1200,
             digipeat_alias: None,
             kiss_port: 8001,
             bind_address: "127.0.0.1".to_string(),
@@ -320,8 +366,16 @@ impl Default for TncConfig {
 ///
 /// KISS frames carry no FCS: the TNC adds it on transmit and checks and
 /// strips it on receive (see [`air_to_kiss`]).
-fn kiss_to_air(payload: &[u8]) -> Vec<f32> {
-    coppa_codec::afsk::modulate(&coppa_codec::afsk::append_fcs(payload))
+fn kiss_to_air(payload: &[u8], baud: TncBaud) -> Vec<f32> {
+    frame_to_air(&coppa_codec::afsk::append_fcs(payload), baud)
+}
+
+/// Modulate an AX.25 frame that already carries its FCS.
+fn frame_to_air(frame: &[u8], baud: TncBaud) -> Vec<f32> {
+    match baud {
+        TncBaud::Afsk1200 => coppa_codec::afsk::modulate(frame),
+        TncBaud::G3ruh9600 => coppa_codec::g3ruh::modulate(frame),
+    }
 }
 
 /// Turn a decoded on-air frame into a KISS data payload.
@@ -338,8 +392,8 @@ fn air_to_kiss(mut frame: Vec<u8>) -> Vec<u8> {
 ///
 /// Wires together:
 /// - KISS TCP server (accepts AX.25 frames from host apps)
-/// - AFSK 1200 demodulator (decodes audio → AX.25 frames)
-/// - AFSK 1200 modulator (encodes AX.25 frames → audio)
+/// - Selected demodulator (decodes audio → AX.25 frames)
+/// - Selected modulator (encodes AX.25 frames → audio)
 /// - PTT control (keys the radio during TX)
 /// - CPAL audio I/O (optional, enabled with `cpal-backend` feature)
 pub async fn run_tnc(config: TncConfig) -> Result<()> {
@@ -359,9 +413,10 @@ enum TxMode {
     Il2p,
 }
 impl TxMode {
-    fn encode(self, frame: &[u8]) -> Option<Vec<f32>> {
+    /// IL2P is an AFSK format; run_tnc_mode refuses it at 9600 baud.
+    fn encode(self, frame: &[u8], baud: TncBaud) -> Option<Vec<f32>> {
         match self {
-            Self::Ax25 => Some(kiss_to_air(frame)),
+            Self::Ax25 => Some(kiss_to_air(frame, baud)),
             Self::Il2p => match coppa_codec::il2p::modulate(frame) {
                 Ok(audio) => Some(audio),
                 Err(error) => {
@@ -373,27 +428,46 @@ impl TxMode {
     }
 }
 
-#[derive(Debug, Default)]
+/// AX.25 at the configured baud, plus automatic IL2P receive at 1200 baud
+/// (IL2P is an AFSK format). Yields FCS-free KISS payloads.
 struct PacketReceiver {
-    ax25: coppa_codec::afsk::Demodulator,
-    il2p: coppa_codec::il2p::Demodulator,
+    ax25: TncDemodulator,
+    il2p: Option<coppa_codec::il2p::Demodulator>,
+}
+impl Default for PacketReceiver {
+    fn default() -> Self {
+        Self::new(TncBaud::Afsk1200)
+    }
 }
 impl PacketReceiver {
+    fn new(baud: TncBaud) -> Self {
+        Self {
+            ax25: TncDemodulator::new(baud),
+            il2p: (baud == TncBaud::Afsk1200).then(Default::default),
+        }
+    }
     fn process(&mut self, audio: &[f32]) -> Vec<Vec<u8>> {
         self.ax25.process(audio);
-        self.il2p.process(audio);
         let mut frames: Vec<_> = self
             .ax25
             .take_frames()
             .into_iter()
             .map(air_to_kiss)
             .collect();
-        frames.extend(self.il2p.take_frames());
+        if let Some(il2p) = &mut self.il2p {
+            il2p.process(audio);
+            frames.extend(il2p.take_frames());
+        }
         frames
     }
 }
 
 async fn run_tnc_mode(config: TncConfig, mode: TxMode) -> Result<()> {
+    if matches!(mode, TxMode::Il2p) && config.baud != TncBaud::Afsk1200 {
+        anyhow::bail!(
+            "IL2P is only supported at 1200 baud (AFSK); remove --il2p or use --baud 1200"
+        );
+    }
     #[cfg(not(feature = "cpal-backend"))]
     for (key, value) in [
         ("audio_device", config.audio_device.as_deref()),
@@ -410,6 +484,7 @@ async fn run_tnc_mode(config: TncConfig, mode: TxMode) -> Result<()> {
         kiss_port = config.kiss_port,
         preferred_hardware_rate = config.sample_rate,
         engine_rate = 48_000,
+        modem = config.baud.modem_name(),
         "TNC mode"
     );
 
@@ -497,11 +572,13 @@ async fn run_tnc_mode(config: TncConfig, mode: TxMode) -> Result<()> {
         );
     }
 
+    let baud = config.baud;
     let demod_worker = tokio::task::spawn_blocking(move || {
         run_demod_worker(
             audio_in_cons,
             demod_tx,
             &demod_shutdown,
+            baud,
             sense_channel.then_some(worker_busy.as_ref()),
         )
     });
@@ -717,7 +794,7 @@ async fn run_tnc_mode(config: TncConfig, mode: TxMode) -> Result<()> {
                     if let Some(marked) = digi.on_air_frame(now, &coppa_codec::afsk::append_fcs(&frame)) {
                         pending_repeat.park(marked, now);
                         if let Some(ready) = pending_repeat.poll(now, channel_busy.load(Ordering::Acquire), tnc_tx.can_repeat()) {
-                            digi.submit(ready, &mut tnc_tx, mode);
+                            digi.submit(ready, &mut tnc_tx, mode, config.baud);
                             tnc_tx.poll(now, &mut audio_out_prod, ptt.as_mut());
                         }
                     }
@@ -729,7 +806,7 @@ async fn run_tnc_mode(config: TncConfig, mode: TxMode) -> Result<()> {
             // Not polled while the backlog is full, so later frames wait in
             // the KISS server's bounded channel.
             Some(ax25_data) = tx_receiver.recv(), if tnc_tx.has_room() => {
-                if let Some(audio) = mode.encode(&ax25_data) {
+                if let Some(audio) = mode.encode(&ax25_data, config.baud) {
                     tnc_tx.submit(audio);
                     tnc_tx.poll(Instant::now(), &mut audio_out_prod, ptt.as_mut());
                 }
@@ -737,7 +814,7 @@ async fn run_tnc_mode(config: TncConfig, mode: TxMode) -> Result<()> {
 
             _ = tx_tick.tick(), if tnc_tx.is_busy() || pending_repeat.0.is_some() => {
                 if let Some(ready) = pending_repeat.poll(Instant::now(), channel_busy.load(Ordering::Acquire), tnc_tx.can_repeat()) {
-                    if let Some(digi) = &digipeater { digi.submit(ready, &mut tnc_tx, mode); }
+                    if let Some(digi) = &digipeater { digi.submit(ready, &mut tnc_tx, mode, config.baud); }
                 }
                 tnc_tx.poll(Instant::now(), &mut audio_out_prod, ptt.as_mut());
             }
@@ -761,16 +838,17 @@ async fn run_tnc_mode(config: TncConfig, mode: TxMode) -> Result<()> {
     Ok(())
 }
 
-/// The demodulation worker: AFSK-decode the input ring until shutdown, the
+/// The demodulation worker: decode the input ring until shutdown, the
 /// input side is gone, or the main loop stops taking frames.
 fn run_demod_worker(
     mut audio_in: coppa_audio::AudioRingConsumer,
     demod_tx: mpsc::Sender<Vec<u8>>,
     shutdown: &AtomicBool,
+    baud: TncBaud,
     channel_busy: Option<&AtomicBool>,
 ) {
     let mut gate = channel_busy.map(|_| coppa_ml::busy_gate::BusyGate::new(48_000.0));
-    let mut demod = PacketReceiver::default();
+    let mut demod = PacketReceiver::new(baud);
     let mut buf = vec![0.0f32; 1024];
     loop {
         if shutdown.load(Ordering::Acquire) || audio_in.is_abandoned() {
@@ -847,6 +925,49 @@ mod tests {
     use coppa_radio::PttState;
     use std::sync::Mutex;
 
+    #[test]
+    fn default_baud_is_afsk_1200() {
+        assert_eq!(TncConfig::default().baud, TncBaud::Afsk1200);
+    }
+
+    #[test]
+    fn kiss_to_air_9600_is_baseband() {
+        let samples = kiss_to_air(b"COP-116", TncBaud::G3ruh9600);
+        assert_eq!(samples.len() % 5, 0);
+        assert!(samples.iter().all(|s| (s.abs() - 0.5).abs() < 1e-6));
+        assert!(kiss_to_air(b"COP-116", TncBaud::Afsk1200)
+            .iter()
+            .any(|s| (s.abs() - 0.5).abs() > 0.01));
+    }
+
+    #[test]
+    fn tnc_round_trips_9600() {
+        let payload = b"COP-116 daemon round trip";
+        let mut demod = TncDemodulator::new(TncBaud::G3ruh9600);
+        demod.process(&kiss_to_air(payload, TncBaud::G3ruh9600));
+        let frames: Vec<_> = demod.take_frames().into_iter().map(air_to_kiss).collect();
+        assert_eq!(frames, vec![payload.to_vec()]);
+    }
+
+    #[test]
+    fn demod_worker_selects_by_baud() {
+        for baud in [TncBaud::Afsk1200, TncBaud::G3ruh9600] {
+            let audio = kiss_to_air(b"modem selection", baud);
+            for selected in [TncBaud::Afsk1200, TncBaud::G3ruh9600] {
+                let mut demod = TncDemodulator::new(selected);
+                for chunk in audio.chunks(1024) {
+                    demod.process(chunk);
+                }
+                let frames = demod.take_frames();
+                if selected == baud {
+                    assert_eq!(frames.len(), 1);
+                } else {
+                    assert!(frames.is_empty());
+                }
+            }
+        }
+    }
+
     #[cfg(not(feature = "cpal-backend"))]
     #[tokio::test]
     async fn explicit_audio_id_requires_a_cpal_build_before_tnc_starts() {
@@ -917,6 +1038,26 @@ mod tests {
     }
 
     #[test]
+    fn il2p_is_refused_at_9600_and_9600_rx_is_fcs_free() {
+        let config = TncConfig {
+            baud: TncBaud::G3ruh9600,
+            ..Default::default()
+        };
+        let error = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run_tnc_with_il2p(config))
+            .unwrap_err();
+        assert!(error.to_string().contains("only supported at 1200 baud"));
+        let mut rx = PacketReceiver::new(TncBaud::G3ruh9600);
+        assert!(rx.il2p.is_none());
+        let mut audio = TxMode::Ax25
+            .encode(b"COP-115 9600", TncBaud::G3ruh9600)
+            .unwrap();
+        audio.extend(vec![0.0; 4800]);
+        assert_eq!(rx.process(&audio), vec![b"COP-115 9600".to_vec()]);
+    }
+
+    #[test]
     fn fcs_free_rx_frame_is_digipeated_in_il2p_mode() {
         // PacketReceiver yields FCS-free KISS payloads; the RX path restores
         // the FCS before digipeating and the repeat uses the TX mode.
@@ -926,9 +1067,22 @@ mod tests {
             .on_air_frame(Instant::now(), &coppa_codec::afsk::append_fcs(&kiss))
             .unwrap();
         let mut rx = PacketReceiver::default();
-        let mut audio = TxMode::Il2p.encode(&air_to_kiss(marked.clone())).unwrap();
+        let mut audio = TxMode::Il2p
+            .encode(&air_to_kiss(marked.clone()), TncBaud::Afsk1200)
+            .unwrap();
         audio.extend(vec![0.0; 4800]);
         assert_eq!(rx.process(&audio), vec![air_to_kiss(marked)]);
+    }
+
+    #[test]
+    fn digipeated_frame_uses_the_configured_baud() {
+        let mut digi = Digipeater::new(("N0CALL".into(), 2));
+        let marked = digi.on_air_frame(Instant::now(), &repeat_frame()).unwrap();
+        let mut demod = TncDemodulator::new(TncBaud::G3ruh9600);
+        let mut samples = frame_to_air(&marked, TncBaud::G3ruh9600);
+        samples.extend(vec![0.0; 4800]);
+        demod.process(&samples);
+        assert_eq!(demod.take_frames(), vec![marked]);
     }
 
     #[test]
@@ -1022,7 +1176,13 @@ mod tests {
         let worker_shutdown = shutdown.clone();
         let worker_busy = busy.clone();
         let worker = std::thread::spawn(move || {
-            run_demod_worker(consumer, tx, &worker_shutdown, Some(&worker_busy));
+            run_demod_worker(
+                consumer,
+                tx,
+                &worker_shutdown,
+                TncBaud::Afsk1200,
+                Some(&worker_busy),
+            );
         });
         // Calibrate on silence, then feed a full AFSK frame.
         let mut samples = vec![0.0; 48000];
@@ -1051,7 +1211,7 @@ mod tests {
         let (demod_tx, _demod_rx) = mpsc::channel::<Vec<u8>>(1);
         let demod_shutdown = shutdown.clone();
         let demod = tokio::task::spawn_blocking(move || {
-            run_demod_worker(consumer, demod_tx, &demod_shutdown, None)
+            run_demod_worker(consumer, demod_tx, &demod_shutdown, TncBaud::Afsk1200, None)
         });
         let input_shutdown = shutdown.clone();
         let input = tokio::task::spawn_blocking(move || {
@@ -1318,7 +1478,7 @@ mod tests {
         let frame = max_info_ax25_frame();
         let payload = &frame[..frame.len() - 2];
         let mut demod = coppa_codec::afsk::Demodulator::new();
-        demod.process(&kiss_to_air(payload));
+        demod.process(&kiss_to_air(payload, TncBaud::Afsk1200));
         let decoded: Vec<Vec<u8>> = demod.take_frames().into_iter().map(air_to_kiss).collect();
         assert_eq!(decoded, vec![payload.to_vec()]);
     }
@@ -1349,11 +1509,11 @@ mod tests {
         let binary = std::fs::read(root.join("ui-max.ax25")).unwrap();
         let mut rx = PacketReceiver::default();
         assert_eq!(
-            rx.process(&TxMode::Il2p.encode(&binary).unwrap()),
+            rx.process(&TxMode::Il2p.encode(&binary, TncBaud::Afsk1200).unwrap()),
             vec![binary.clone()]
         );
         assert_eq!(
-            rx.process(&TxMode::Ax25.encode(&binary).unwrap()),
+            rx.process(&TxMode::Ax25.encode(&binary, TncBaud::Afsk1200).unwrap()),
             vec![binary]
         );
         for name in [
@@ -1395,7 +1555,7 @@ mod tests {
             f.push(0);
             f
         }] {
-            if let Some(audio) = TxMode::Il2p.encode(&invalid) {
+            if let Some(audio) = TxMode::Il2p.encode(&invalid, TncBaud::Afsk1200) {
                 h.tx.submit(audio);
             }
             h.tx.poll(h.now, &mut h.out, &mut h.ptt);
@@ -1407,7 +1567,7 @@ mod tests {
                 .join("../../testdata/il2p/maximum.ax25"),
         )
         .unwrap();
-        let audio = TxMode::Il2p.encode(&frame).unwrap();
+        let audio = TxMode::Il2p.encode(&frame, TncBaud::Afsk1200).unwrap();
         assert!(audio.len() > 65536);
         h.tx.submit(audio.clone());
         h.run_until_idle(240);
@@ -1425,5 +1585,5 @@ mod il2p_oracle;
 #[test]
 #[ignore = "requires Direwolf 1.7; set DIREWOLF to its executable"]
 fn direwolf_accepts_tnc_il2p() {
-    il2p_oracle::verify(|frame| TxMode::Il2p.encode(frame).unwrap());
+    il2p_oracle::verify(|frame| TxMode::Il2p.encode(frame, TncBaud::Afsk1200).unwrap());
 }
