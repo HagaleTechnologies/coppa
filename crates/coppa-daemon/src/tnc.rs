@@ -202,14 +202,14 @@ impl TncBaud {
 }
 
 enum TncDemodulator {
-    Afsk(coppa_codec::afsk::Demodulator),
+    Afsk(Box<coppa_codec::afsk::Demodulator>),
     G3ruh(Box<coppa_codec::g3ruh::Demodulator>),
 }
 
 impl TncDemodulator {
     fn new(baud: TncBaud) -> Self {
         match baud {
-            TncBaud::Afsk1200 => Self::Afsk(coppa_codec::afsk::Demodulator::new()),
+            TncBaud::Afsk1200 => Self::Afsk(Box::new(coppa_codec::afsk::Demodulator::new())),
             TncBaud::G3ruh9600 => Self::G3ruh(Box::default()),
         }
     }
