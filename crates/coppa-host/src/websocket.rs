@@ -334,6 +334,11 @@ pub struct HeardStation {
     pub snr_db: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub level: Option<u8>,
+    /// COP-120: Maidenhead grid decoded from a received station-ID beacon.
+    /// Absent (`None`) for session peers, which carry no grid, and for
+    /// beacons whose payload failed to decode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grid: Option<String>,
 }
 
 /// Optional correlation id applies to every request without changing its shape.
@@ -1839,7 +1844,7 @@ mod tests {
             r#"{"type":"speed_level","level":3,"mode":"manual"}"#,
             r#"{"type":"speed_level","level":2,"mode":"auto"}"#,
             r#"{"type":"status","id":1,"connected":true,"remote_call":"W1AW","snr":14,"level":2,"cfo":3.2,"cp_desync_episodes":0,"ptt":true,"ptt_keyed_ms":1234,"busy":false,"waiting_for_clear_channel":false,"buffer":412,"speed_level":3,"speed_level_mode":"manual","speed_levels":[1,2,3,4,5,6,7,8],"mycall":"N0CALL","max_tx_s":30,"max_tune_s":30,"loop_age_ms":95,"heard":[{"call":"W1AW","last_heard_ms":1761452712300,"snr_db":14,"level":2}],"link":{"in_flight":1,"retries":1,"max_retries":10,"rto_ms":5200,"fade_hold":false,"fade_protection":"off"}}"#,
-            r#"{"type":"heard","stations":[{"call":"W1AW","last_heard_ms":1,"snr_db":14,"level":2},{"call":"N0CALL","last_heard_ms":2}]}"#,
+            r#"{"type":"heard","stations":[{"call":"W1AW","last_heard_ms":1,"snr_db":14,"level":2},{"call":"N0CALL","last_heard_ms":2},{"call":"VK3ABC","last_heard_ms":3,"snr_db":14,"level":1,"grid":"QF22"}]}"#,
             r#"{"type":"log","level":"info","message":"decoded","timestamp_ms":3}"#,
             r#"{"type":"decode_fail","count":6,"timestamp_ms":4}"#,
             r#"{"type":"spectrum","freq_low_hz":350.0,"freq_high_hz":5950.0,"bins":[-90.0],"timestamp_ms":5}"#,
@@ -1913,8 +1918,8 @@ mod tests {
     }
 
     /// The schema is a tracked, published contract: its doc-comment-derived
-    /// descriptions must not cite the gitignored `docs/superpowers/` or
-    /// `.superpowers/` working notes (AGENTS.md, "where docs live").
+    /// descriptions must not cite gitignored local working notes; see
+    /// CLAUDE.md's documentation policy.
     #[test]
     fn schema_cites_no_local_working_notes() {
         let schema = schemars::schema_for!(ProtocolMessage);
@@ -3327,6 +3332,7 @@ mod cop83_tests {
             last_heard_ms: 1_761_452_712_300,
             snr_db: Some(14),
             level: Some(2),
+            grid: None,
         }];
         let link = LinkStats {
             in_flight: 1,

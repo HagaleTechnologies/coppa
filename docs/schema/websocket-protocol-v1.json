@@ -79,6 +79,13 @@
         "call": {
           "type": "string"
         },
+        "grid": {
+          "description": "COP-120: Maidenhead grid decoded from a received station-ID beacon. Absent (`None`) for session peers, which carry no grid, and for beacons whose payload failed to decode.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "last_heard_ms": {
           "type": "integer",
           "format": "uint64",

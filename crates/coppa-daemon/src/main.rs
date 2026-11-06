@@ -829,9 +829,11 @@ async fn run_daemon(
     ]) {
         tracing::warn!(
             bind_address = %config.host.bind_address,
-            "Host listeners accept connections from other hosts; anyone who can reach them \
-             can key the transmitter. Use bind_address = \"127.0.0.1\" unless this network \
-             is trusted and firewalled"
+            "Host listeners accept connections from other hosts; exposed VARA-style, ARDOP \
+             and KISS ports have no authentication and let anyone who can reach them key \
+             the transmitter. WebSocket requires websocket_token; over ws:// the token \
+             crosses the network in clear text. Use bind_address = \"127.0.0.1\" unless \
+             this network is trusted and firewalled"
         );
     }
     #[cfg(feature = "cpal-backend")]

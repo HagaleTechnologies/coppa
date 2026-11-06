@@ -346,20 +346,11 @@ investigated and fixed, in two follow-up commits on top of this ADR's own Phase 
 
 This does not change this ADR's own decisions or its Watterson-Moderate/level-2 regression
 (decisions 1/3, still open) — it closes out only the separate, later-discovered CFO×level-4
-finding. See `.superpowers/sdd/p2-cfo-level4-investigation-report.md` and
-`p2-cfo-level4-fix-report.md` for full measurement detail, and `BENCHMARKS.md`'s `--cfo 40`
-sweep section for the before/after numbers.
+finding. See `BENCHMARKS.md`'s `--cfo 40` sweep section for the before/after numbers.
 
 ## Related
 
 - `docs/adr/003-phase1-waveform-break.md`, `docs/adr/004-strongest-path-timing.md` — Phase 1's
   own wire-format break and its fading-regression hotfix.
 - `docs/adr/005-nr-bg2-ldpc.md` — the NR BG2 LDPC decision in full detail (decisions 5-7 above).
-- `.superpowers/sdd/p2-task-{1,2,3,4,5,6,7}-report.md` — full per-task investigation detail this
-  ADR summarizes.
-- `.superpowers/sdd/p2-task-8-report.md` — this task's full report, including the complete
-  cumulative re-baseline data.
-- `.superpowers/sdd/p2-cfo-level4-investigation-report.md`,
-  `.superpowers/sdd/p2-cfo-level4-fix-report.md` — the CFO×level-4 regression's investigation
-  and fix (see "Addendum" above).
 - `BENCHMARKS.md`'s Phase 2 section — full before/after tables.
