@@ -44,7 +44,13 @@ use coppa_bench::scenario::{mode_for_level, select_profile, SAMPLE_RATE};
 use coppa_channel::watterson::WattersonPreset;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx};
+use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu};
 use coppa_protocol::modem::{frame_airtime_s, CoppaTransceiver};
+use coppa_protocol::outer_code::{
+    encode_block, harq_key, max_segment_len, shard_len_for_level, InsertOutcome, OuterBlockRx,
+    OuterPacket,
+};
+use coppa_protocol::transport::{TransportPdu, TRANSPORT_HEADER_SIZE};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
@@ -142,6 +148,12 @@ struct SessionResult {
     dropped: bool,
     elapsed_s: f64,
     bytes_delivered: usize,
+    /// Transmission attempts of the segment whose exhausted retry budget
+    /// dropped a framed session: one per physical send of the segment (a
+    /// whole 12-packet burst counts as one attempt in the protected arm).
+    /// `None` when the session completed, and always `None` for the
+    /// unchanged baseline arms.
+    drop_segment_sends: Option<u8>,
 }
 
 /// Run one simulated 10-minute ARQ session over `preset`, seeded by `seed`.
@@ -231,6 +243,7 @@ fn run_session(preset: WattersonPreset, seed: u64) -> SessionResult {
         dropped,
         elapsed_s: now.duration_since(start).as_secs_f64(),
         bytes_delivered,
+        drop_segment_sends: None,
     }
 }
 
@@ -310,11 +323,343 @@ fn main() {
         );
     }
     println!("Moderate and Poor are diagnostic-only; their results remain reported above.");
+    run_fade_protection_arms();
+}
+
+fn rs_sessions_meet_acceptance(completed: usize) -> bool {
+    completed == SESSIONS_PER_PRESET
+}
+
+fn session_mac(kind: MacFrameType, payload: Vec<u8>) -> Vec<u8> {
+    let (dest, src) = if kind == MacFrameType::Ack {
+        ("VK3ABC", "W1AW")
+    } else {
+        ("W1AW", "VK3ABC")
+    };
+    MacPdu::new(
+        kind,
+        Callsign::new(dest).unwrap(),
+        Callsign::new(src).unwrap(),
+        0,
+        payload,
+    )
+    .to_bytes()
+}
+
+/// One independent physical transmission. A new seed is used on every call,
+/// including retries and ACK copies; the original baseline above is unchanged.
+struct SessionChannel {
+    preset: Option<WattersonPreset>,
+    seed: u64,
+    transmission: u64,
+}
+
+impl SessionChannel {
+    fn send(&mut self, phy: &CoppaTransceiver, data: &[u8], key: u8, snr: f32) -> Option<Vec<u8>> {
+        let clean = phy
+            .transmit(&make_header(LEVEL, data.len() as u16, key), data)
+            .unwrap();
+        let seed = self.seed ^ self.transmission.wrapping_mul(0x9E37_79B9);
+        self.transmission += 1;
+        let mut samples = if let Some(preset) = self.preset {
+            let power = coppa_channel::mean_power(&clean);
+            let faded = coppa_channel::watterson::watterson_preset(
+                &clean,
+                SAMPLE_RATE as f32,
+                preset,
+                seed ^ 0x3333_3333_3333_3333,
+            );
+            coppa_channel::awgn_ref_seeded(
+                &faded,
+                snr,
+                power,
+                SAMPLE_RATE as f32,
+                seed ^ 0x5555_5555_5555_5555,
+            )
+        } else {
+            clean
+        };
+        samples.resize(samples.len() + 1200, 0.0);
+        phy.receive(&samples).ok().map(|(_, bytes, _)| bytes)
+    }
+}
+
+/// Daemon-matched framing and window, using the shipped packetizer and ARQ.
+/// This isolates the bench's independent-per-packet fading convention, rather
+/// than claiming to model a continuous channel or the daemon's event loop.
+/// A retry is transmitted, and given its ACK opportunity, before an exhausted
+/// budget records the drop, matching the daemon's send-then-mark order.
+fn run_framed_session(
+    preset: Option<WattersonPreset>,
+    seed: u64,
+    outer: bool,
+    ack_loss: bool,
+) -> SessionResult {
+    let profile = select_profile(LEVEL);
+    let receiver = CoppaTransceiver::new(profile.clone(), 1);
+    let ack_receiver = CoppaTransceiver::new(profile.clone(), 1);
+    let airtime = Duration::from_secs_f64(frame_airtime_s(LEVEL, &profile).unwrap());
+    let config = ArqConfig::new(1, 5, Duration::from_secs(5))
+        .unwrap()
+        .with_airtime_params(LEVEL, TURNAROUND, profile);
+    let mut tx = ArqTx::new(config).unwrap();
+    let mut rx = ArqRx::new(1);
+    let mut block = OuterBlockRx::default();
+    let mut channel = SessionChannel {
+        preset,
+        seed,
+        transmission: 0,
+    };
+    let shard_len = shard_len_for_level(LEVEL).unwrap();
+    let host_len = if outer {
+        max_segment_len(LEVEL).unwrap()
+    } else {
+        mode_for_level(LEVEL).unwrap().payload_bytes() - MacPdu::HEADER_SIZE
+    } - TRANSPORT_HEADER_SIZE;
+    let copies = if outer { 2 } else { 1 };
+    let packet_count = if outer { 12 } else { 1 };
+    tx.set_segment_floor(airtime * (packet_count + copies) + TURNAROUND * 2);
+    let start = Instant::now();
+    let mut now = start;
+    let mut bytes_delivered = 0;
+    let mut dropped = false;
+    let mut block_no = 0u64;
+    let mut sends_by_seq = [0u8; 256];
+    let mut drop_segment_sends = None;
+    while now.duration_since(start) < SESSION_DURATION {
+        let mut retried = false;
+        let seq = if tx.can_send() {
+            let mut rng = StdRng::seed_from_u64(seed ^ block_no ^ 0xACE_0000);
+            block_no += 1;
+            let payload = (0..host_len).map(|_| rng.random::<u8>()).collect();
+            tx.send(payload, now).unwrap()
+        } else {
+            let retries = tx.get_retransmits(now);
+            let Some(&seq) = retries.first() else {
+                now += Duration::from_millis(500);
+                continue;
+            };
+            // A retry `get_retransmits` hands out is still permitted (its
+            // transmit_count has not passed max_retransmit yet), so mark it
+            // and transmit it below, the way the daemon sends a retry before
+            // marking it. Only after the attempt and its ACK opportunity may
+            // the drop be recorded (post-loop check).
+            tx.mark_retransmitted(seq, now).unwrap();
+            retried = true;
+            seq
+        };
+        sends_by_seq[seq as usize] = sends_by_seq[seq as usize].saturating_add(1);
+        let host = tx.get_segment_data(seq).unwrap().to_vec();
+        let segment = TransportPdu::new_reliable(0, seq, 0, host).to_bytes();
+        let packets: Vec<(u8, Vec<u8>)> = if outer {
+            encode_block(seq, &segment, shard_len)
+                .unwrap()
+                .into_iter()
+                .map(|packet| {
+                    (
+                        harq_key(seq, packet.index),
+                        session_mac(MacFrameType::OuterData, packet.to_bytes().unwrap()),
+                    )
+                })
+                .collect()
+        } else {
+            vec![(0, session_mac(MacFrameType::Data, segment))]
+        };
+        let mut ack_due = false;
+        for (key, wire) in packets {
+            let snr = ramp_snr_db(
+                now.duration_since(start).as_secs_f64(),
+                SESSION_DURATION.as_secs_f64(),
+            );
+            let decoded = channel.send(&receiver, &wire, key, snr);
+            now += airtime;
+            if let Some(decoded) = decoded {
+                let mac = MacPdu::from_bytes(&decoded).unwrap();
+                let rebuilt = if outer {
+                    let packet = OuterPacket::from_bytes(&mac.payload).unwrap();
+                    if packet.seq == rx.recv_base().wrapping_sub(1) {
+                        ack_due = true;
+                        None
+                    } else if let InsertOutcome::Rebuilt(bytes) = block.insert(&packet) {
+                        Some(bytes)
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(mac.payload)
+                };
+                if let Some(bytes) = rebuilt {
+                    let transport = TransportPdu::from_bytes(&bytes).unwrap();
+                    assert_eq!(transport.seq_num, seq);
+                    for (_, host) in rx.receive(seq, transport.payload) {
+                        bytes_delivered += host.len();
+                    }
+                    ack_due = true;
+                    if outer {
+                        for previous in [seq, seq.wrapping_sub(1)] {
+                            for i in 0..12 {
+                                receiver.harq_evict(harq_key(previous, i));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if ack_due {
+            now += TURNAROUND;
+            let (ack, bitmap) = rx.ack_info();
+            let wire = session_mac(
+                MacFrameType::Ack,
+                TransportPdu::new_ack(0, ack, bitmap).to_bytes(),
+            );
+            let mut ack_received = false;
+            let mut first_ack_copy = None;
+            for copy in 0..copies {
+                if ack_loss {
+                    let snr = ramp_snr_db(
+                        now.duration_since(start).as_secs_f64(),
+                        SESSION_DURATION.as_secs_f64(),
+                    );
+                    if let Some(bytes) = channel.send(&ack_receiver, &wire, 0, snr) {
+                        let mac = MacPdu::from_bytes(&bytes).unwrap();
+                        let decoded = TransportPdu::from_bytes(&mac.payload).unwrap();
+                        let valid = decoded.ack_num == ack && decoded.ack_bitmap == bitmap;
+                        if valid && first_ack_copy.is_none() {
+                            first_ack_copy = Some(copy);
+                        }
+                        ack_received |= valid;
+                    }
+                } else {
+                    ack_received = true;
+                }
+                now += airtime;
+            }
+            // After its first decoded ACK, the daemon holds one more frame.
+            // If only the second copy arrived, that hold extends past the pair.
+            if outer && first_ack_copy == Some(1) {
+                now += airtime;
+            }
+            now += TURNAROUND;
+            if ack_received {
+                tx.process_ack(ack, bitmap, now);
+            }
+        }
+        // The retry has now been transmitted and given its ACK opportunity.
+        // Recording the drop earlier would skip the final permitted
+        // retransmission entirely, which `get_retransmits` still owes at
+        // that point; the daemon, too, sends a retry before acting on the
+        // exhausted budget.
+        if retried && tx.is_failed(seq) {
+            drop_segment_sends = Some(sends_by_seq[seq as usize]);
+            dropped = true;
+            break;
+        }
+    }
+    SessionResult {
+        dropped,
+        elapsed_s: now.duration_since(start).as_secs_f64(),
+        bytes_delivered,
+        drop_segment_sends,
+    }
+}
+
+fn run_fade_protection_arms() {
+    println!("\n=== COP-119 daemon-matched window-1 session arms ===");
+    let mut moderate_completed = 0;
+    for outer in [false, true] {
+        for ack_loss in [false, true] {
+            let arm = if outer { "rs12-6" } else { "stop-and-wait" };
+            let ack = if ack_loss { "ACK-loss" } else { "ideal-ACK" };
+            let clean = run_framed_session(None, 0x5E55_1000, outer, ack_loss);
+            println!(
+                "-> {arm} {ack} clean: {:.1} bytes/min",
+                clean.bytes_delivered as f64 * 60.0 / clean.elapsed_s
+            );
+            for preset in [
+                WattersonPreset::Good,
+                WattersonPreset::Moderate,
+                WattersonPreset::Poor,
+            ] {
+                let results = std::thread::scope(|scope| {
+                    let handles: Vec<_> = (0..SESSIONS_PER_PRESET)
+                        .map(|trial| {
+                            scope.spawn(move || {
+                                run_framed_session(
+                                    Some(preset),
+                                    0x5E55_1000 ^ ((preset as u64) << 16) ^ trial as u64,
+                                    outer,
+                                    ack_loss,
+                                )
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|handle| handle.join().unwrap())
+                        .collect::<Vec<_>>()
+                });
+                let mut completed = 0;
+                let mut goodput = 0.0;
+                for (trial, result) in results.iter().enumerate() {
+                    let rate = result.bytes_delivered as f64 * 60.0 / result.elapsed_s;
+                    completed += usize::from(!result.dropped);
+                    goodput += rate;
+                    let outcome = if result.dropped {
+                        format!(
+                            "DROPPED after {} sends",
+                            result.drop_segment_sends.unwrap_or(0)
+                        )
+                    } else {
+                        "completed".to_string()
+                    };
+                    println!("  {arm} {ack} [{}] trial {trial}: {outcome} ({:.1}s, {} bytes, {rate:.1} bytes/min)", preset_name(preset), result.elapsed_s, result.bytes_delivered);
+                }
+                println!(
+                    "-> {arm} {ack} {}: {completed}/5 completed, {:.1} bytes/min",
+                    preset_name(preset),
+                    goodput / SESSIONS_PER_PRESET as f64
+                );
+                if outer && !ack_loss && matches!(preset, WattersonPreset::Moderate) {
+                    moderate_completed = completed;
+                }
+            }
+        }
+    }
+    println!("{}: rs12-6 Moderate completed {moderate_completed}/5 sessions without a drop (required 5/5).", if rs_sessions_meet_acceptance(moderate_completed) { "MET" } else { "NOT MET" });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn framed_drop_sends_the_final_permitted_retransmission() {
+        // `max_retransmit` is 5, so a segment that exhausts its budget must
+        // have been physically sent six times: the original plus all five
+        // permitted retransmissions. `get_retransmits` hands the final retry
+        // out while it is still permitted, and the daemon transmits a retry
+        // before marking it, so a drop recorded before that send would skip
+        // the last permitted attempt entirely. Stop-and-wait Poor trial 2
+        // drops; before the COP-119 review fix it dropped after only five
+        // sends of that segment.
+        let result = run_framed_session(
+            Some(WattersonPreset::Poor),
+            0x5E55_1000 ^ ((WattersonPreset::Poor as u64) << 16) ^ 2,
+            false,
+            false,
+        );
+        assert!(
+            result.dropped,
+            "Poor trial 2 must drop for this to test the drop path"
+        );
+        assert_eq!(result.drop_segment_sends, Some(6));
+    }
+
+    #[test]
+    fn rs_moderate_requires_all_five_sessions() {
+        assert!(!rs_sessions_meet_acceptance(4));
+        assert!(rs_sessions_meet_acceptance(5));
+    }
 
     #[test]
     fn good_baseline_meets_acceptance() {

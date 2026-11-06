@@ -341,7 +341,7 @@ impl CoppaCore {
         codewords: u8,
     ) -> Result<Vec<f32>, EngineError> {
         Self::check_codewords(codewords)?;
-        self.encode_payload_at(data, self.config.speed_level, codewords)
+        self.transmit_data_packet(data, self.config.speed_level, codewords, 0)
     }
 
     /// COP-69: shared codeword-count validation for the codeword-aware
@@ -432,23 +432,37 @@ impl CoppaCore {
         codewords: u8,
     ) -> Result<Vec<f32>, EngineError> {
         let payload = self.compress_payload(data);
-        self.encode_payload_at(&payload, level, codewords)
+        self.transmit_data_packet(&payload, level, codewords, 0)
     }
 
-    /// Build and transmit a Data frame from an already prepared payload.
-    fn encode_payload_at(
+    /// Encode one uncompressed session packet with a distinct PHY HARQ key.
+    /// Outer-code shards must retain their equal wire lengths, independent of
+    /// the engine's compression setting. See SPEC §22.
+    pub fn encode_packet_with_seq(
+        &self,
+        data: &[u8],
+        level: u8,
+        seq_num: u8,
+    ) -> Result<Vec<f32>, EngineError> {
+        self.check_level(level, self.on_vhf_profile())?;
+        self.transmit_data_packet(data, level, 1, seq_num)
+    }
+
+    /// Build and transmit a Data frame from an already prepared payload,
+    /// with an explicit PHY `seq_num` (the HARQ key; every pre-COP-119
+    /// caller passes `0`).
+    fn transmit_data_packet(
         &self,
         payload: &[u8],
         level: u8,
         codewords: u8,
+        seq_num: u8,
     ) -> Result<Vec<f32>, EngineError> {
-        if payload.len() > u16::MAX as usize {
-            return Err(EngineError::PayloadTooLarge {
+        let payload_len =
+            u16::try_from(payload.len()).map_err(|_| EngineError::PayloadTooLarge {
                 len: payload.len(),
                 max: u16::MAX as usize,
-            });
-        }
-
+            })?;
         let header = CoppaHeader {
             version: WIRE_FORMAT_VERSION,
             phy_mode: 0,
@@ -456,13 +470,16 @@ impl CoppaCore {
             bandwidth: self.transceiver.profile().bandwidth_id,
             fec_type: 0,
             speed_level: level,
-            seq_num: 0,
-            payload_len: payload.len() as u16,
+            seq_num,
+            payload_len,
             codewords,
         };
+        Ok(self.transceiver.transmit(&header, payload)?)
+    }
 
-        let samples = self.transceiver.transmit(&header, payload)?;
-        Ok(samples)
+    /// Drop the streaming receiver's stored soft information for a PHY key.
+    pub fn harq_evict(&mut self, seq_num: u8) {
+        self.streaming.harq_evict(seq_num);
     }
 
     /// Encode arbitrary binary data to audio samples at an explicit `level`
@@ -1197,6 +1214,79 @@ mod tests {
         out.extend_from_slice(samples);
         out.extend(std::iter::repeat_n(0.0f32, 2048));
         out
+    }
+
+    #[test]
+    fn encode_packet_with_seq_is_uncompressed_and_keyed() {
+        let mut core = CoppaCore::with_config(EngineConfig {
+            compression_enabled: true,
+            ..Default::default()
+        });
+        let payload = b"uncompressed packet uncompressed packet";
+        let samples = core.encode_packet_with_seq(payload, 2, 0x20).unwrap();
+        let mut padded = samples.clone();
+        padded.extend(vec![0.0; 2048]);
+        let (header, decoded, _) = core.transceiver.receive(&padded).unwrap();
+        assert_eq!(header.seq_num, 0x20);
+        assert_eq!(header.codewords, 1);
+        assert_eq!(decoded, payload);
+        let frames = core.push_samples(&with_lead_and_trail(&samples));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload.as_deref().unwrap(), payload);
+        assert!(core.encode_packet_with_seq(payload, 0, 1).is_err());
+        assert!(core.encode_packet_with_seq(payload, 9, 1).is_err());
+    }
+
+    #[test]
+    fn twelve_back_to_back_outer_packets_decode_with_six_erasures() {
+        use coppa_protocol::outer_code::{
+            encode_block, harq_key, shard_len_for_level, InsertOutcome, OuterBlockRx, OuterPacket,
+        };
+        let config = EngineConfig {
+            speed_level: 2,
+            ofdm_band: OfdmBand::Hf,
+            ..Default::default()
+        };
+        let tx = CoppaCore::with_config(config.clone());
+        let segment: Vec<_> = (0..587).map(|i| (i % 251) as u8).collect();
+        let packets = encode_block(7, &segment, shard_len_for_level(2).unwrap()).unwrap();
+        let encoded: Vec<_> = packets
+            .iter()
+            .map(|p| {
+                tx.encode_packet_with_seq(&p.to_bytes().unwrap(), 2, harq_key(7, p.index))
+                    .unwrap()
+            })
+            .collect();
+        for erased in [vec![], vec![3, 4, 7, 8, 10, 11]] {
+            let mut rx = CoppaCore::with_config(config.clone());
+            let mut samples = vec![0.0; 8192];
+            let mut expected = Vec::new();
+            for (i, frame) in encoded.iter().enumerate() {
+                if erased.contains(&i) {
+                    samples.extend(vec![0.0; frame.len()]);
+                } else {
+                    samples.extend_from_slice(frame);
+                    expected.push(packets[i].to_bytes().unwrap());
+                }
+            }
+            samples.extend(vec![0.0; 24_000]);
+            let frames: Vec<_> = samples
+                .chunks(960)
+                .flat_map(|chunk| rx.push_samples(chunk))
+                .collect();
+            let payloads: Vec<_> = frames.into_iter().map(|f| f.payload.unwrap()).collect();
+            assert_eq!(payloads, expected);
+            let mut block = OuterBlockRx::default();
+            let mut rebuilt = None;
+            for payload in payloads {
+                if let InsertOutcome::Rebuilt(bytes) =
+                    block.insert(&OuterPacket::from_bytes(&payload).unwrap())
+                {
+                    rebuilt = Some(bytes);
+                }
+            }
+            assert_eq!(rebuilt.as_deref(), Some(segment.as_slice()));
+        }
     }
 
     #[test]

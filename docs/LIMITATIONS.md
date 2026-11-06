@@ -309,3 +309,29 @@ update.
   when all missing chunks still arrive. Default pacing makes a 1 MiB copy
   take about 22.8 hours. Validation is virtual-audio bench only, with no
   RF, fading or real-time audio claim. See [BROADCAST.md](BROADCAST.md).
+
+## COP-119 session fade protection
+
+- RS(12,6) session protection is simulation and cable tested, with no RF trial.
+  `[session] fade_protection` defaults to `"accept"`; one peer must request it.
+- A receiver can key over a burst before it decodes its first packet. The
+  burst-end hold can only start once a packet supplies its index and level.
+- RS blocks bypass compression. The plain data path still shares PHY HARQ
+  key zero. The protected mode uses separate keys and clears them on delivery.
+- The original session bench uses bare frames, window eight and retry seeds
+  derived from sequence number. Its historical baseline is distinct from the
+  new window-one MAC/transport arms. New arms use independent channel seeds
+  per physical packet and a 1200-sample receive tail, not a continuous channel.
+  A retry is transmitted, and given its ACK opportunity, before a drop is
+  recorded, matching the daemon's send-then-mark order.
+- There is no host command to request protection; set the session config key.
+  Clean throughput, latency and ACK-loss results are recorded in BENCHMARKS.
+- Measured ACK loss: protected Good, Moderate and Poor completed 5/5 sessions,
+  at 1395.7, 1379.6 and 738.1 B/min. The matched plain arm completed 2/5 Good,
+  2/5 Moderate and 3/5 Poor at 1015.3, 935.6 and 196.6 B/min. Clean protected
+  throughput was 1814.5 B/min in the bench, versus 1901.0 for matched plain
+  stop-and-wait. These are independent-per-packet simulated channels, not RF.
+- The session RTO budget still omits a peer's due station-ID prepend before
+  an ACK. This also affects the existing plain multi-codeword path. The new
+  protected-mode bound covers two slow HF ACKs, but does not reserve a third
+  frame for a peer ID. A lost first ACK during that prepend can cause a retry.

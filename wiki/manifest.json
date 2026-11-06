@@ -578,6 +578,28 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:5f0af1acfa7a3e56172b9ddf44112b09d4c2af3b27927c0641fe3b2a3dd773cc",
+      "id": "session-fade-protection",
+      "kind": "gotcha",
+      "links": [
+        "coppa-protocol",
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/session-fade-protection.md",
+      "sources": [
+        "docs/SPEC.md",
+        "docs/adr/012-cop119-session-outer-code.md",
+        "crates/coppa-daemon/src/event_loop.rs"
+      ],
+      "status": "current",
+      "title": "What will bite you about session fade protection?",
+      "verified_commit": "d837c89",
+      "verified_date": "2026-11-04",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:b352ed5416cfb4361ca06c059b10fc089ffed56f1474c9857b8e9cc1d588c949",
       "id": "tnc-direwolf-benchmark",
       "kind": "gotcha",
