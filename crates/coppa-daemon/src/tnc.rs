@@ -1352,6 +1352,7 @@ mod tests {
     #[test]
     fn old_tnc_config_literal_and_entrypoint_remain_compatible() {
         let config = TncConfig {
+            digipeat_alias: None,
             kiss_port: 8001,
             bind_address: "127.0.0.1".into(),
             rig_address: None,
