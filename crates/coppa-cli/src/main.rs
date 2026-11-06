@@ -706,6 +706,10 @@ enum Commands {
         /// Use VOX instead of CAT PTT.
         #[arg(long)]
         vox: bool,
+        /// Digipeat as this alias: repeat a frame whose first unused path
+        /// entry matches, marking it used. Off unless given.
+        #[arg(long, value_name = "CALL[-SSID]")]
+        digipeat: Option<String>,
     },
 }
 
@@ -916,6 +920,7 @@ fn run() -> Result<()> {
             output_channel,
             rig,
             vox,
+            digipeat,
         } => cmd_tnc(
             port,
             device,
@@ -925,6 +930,7 @@ fn run() -> Result<()> {
             output_channel,
             rig,
             vox,
+            digipeat,
         )?,
         Commands::Completions { shell } => cmd_completions(shell)?,
         Commands::Man => cmd_man()?,
@@ -2655,6 +2661,29 @@ fn render_profile_detail(name: &str, ladder: &[coppa_engine::ladder::LevelInfo])
 }
 
 #[cfg(feature = "kiss-tnc")]
+fn parse_digipeat_alias(s: &str) -> Result<(String, u8)> {
+    let invalid = || {
+        anyhow::anyhow!(
+            "--digipeat expects CALL[-SSID] with a 1-6 character callsign and SSID 0-15, got '{s}'"
+        )
+    };
+    let (call, suffix) = s.split_once('-').map_or((s, None), |(c, n)| (c, Some(n)));
+    if call.is_empty() || call.len() > 6 || !call.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(invalid());
+    }
+    let ssid = match suffix {
+        None => 0,
+        Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => n
+            .parse::<u8>()
+            .ok()
+            .filter(|n| *n <= 15)
+            .ok_or_else(invalid)?,
+        Some(_) => return Err(invalid()),
+    };
+    Ok((call.to_ascii_uppercase(), ssid))
+}
+
+#[cfg(feature = "kiss-tnc")]
 #[allow(clippy::too_many_arguments)]
 fn cmd_tnc(
     port: u16,
@@ -2665,10 +2694,13 @@ fn cmd_tnc(
     output_channel: u16,
     rig: Option<String>,
     vox: bool,
+    digipeat: Option<String>,
 ) -> Result<()> {
+    let digipeat_alias = digipeat.as_deref().map(parse_digipeat_alias).transpose()?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let config = coppa_daemon::tnc::TncConfig {
+            digipeat_alias,
             kiss_port: port,
             audio_device: device,
             input_device_id,
@@ -4611,6 +4643,51 @@ mod tests {
             "{output}"
         );
         assert!(output.to_string().contains(id), "{output}");
+    }
+
+    #[cfg(feature = "kiss-tnc")]
+    #[test]
+    fn tnc_digipeat_flag_parses() {
+        for (args, expected) in [
+            (vec!["coppa", "tnc"], None),
+            (
+                vec!["coppa", "tnc", "--digipeat", "WIDE1"],
+                Some(("WIDE1".to_string(), 0)),
+            ),
+            (
+                vec!["coppa", "tnc", "--digipeat", "WIDE1-1"],
+                Some(("WIDE1".to_string(), 1)),
+            ),
+        ] {
+            let Commands::Tnc { digipeat, .. } = Cli::try_parse_from(args).unwrap().command else {
+                panic!("expected TNC")
+            };
+            assert_eq!(
+                digipeat
+                    .as_deref()
+                    .map(parse_digipeat_alias)
+                    .transpose()
+                    .unwrap(),
+                expected
+            );
+        }
+        for invalid in [
+            "toolongcallsign",
+            "",
+            "A-16",
+            "A--1",
+            "A-",
+            "A-1-2",
+            "A_B",
+            "é",
+        ] {
+            let error = parse_digipeat_alias(invalid).unwrap_err().to_string();
+            assert!(error.contains("--digipeat expects CALL[-SSID]"));
+        }
+        assert_eq!(
+            parse_digipeat_alias("n0call-15").unwrap(),
+            ("N0CALL".into(), 15)
+        );
     }
 
     #[cfg(feature = "kiss-tnc")]

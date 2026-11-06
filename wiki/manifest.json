@@ -289,7 +289,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:9bd2a246313cba83361f290f438daa8cd882616d0cec880bf0be39aff794efea",
+      "hash": "sha256:38ccc87f64332de4942ad9711c2e623bd06adce2306eb9de7a4d056c84c15432",
       "id": "cli-settings",
       "kind": "gotcha",
       "links": [],
@@ -301,13 +301,14 @@
         "crates/coppa-cli/src/main.rs",
         "crates/coppa-daemon/src/config.rs",
         "crates/coppa-radio/src/band.rs",
+        "docs/TNC.md",
         "coppad.toml.example",
         "docs/tutorials/getting-started.md"
       ],
       "status": "current",
       "title": "What will bite you when persisting coppa CLI settings?",
-      "verified_commit": "b5144e3",
-      "verified_date": "2026-10-28",
+      "verified_commit": "ee55ef488c5070227b113a0813f2c5c17c5cc877",
+      "verified_date": "2026-11-05",
       "visibility": "public"
     },
     {
