@@ -1302,3 +1302,18 @@ The command port stays connected. A host never sees a gap in received data
 while its data connection stays open.
 
 For the OFDM KISS datagram port (8100), see [RETICULUM.md](RETICULUM.md).
+
+## Session fade protection
+
+Set `[session] fade_protection = "request"` to ask a 0.9.0 peer for RS(12,6)
+erasure protection. The default `"accept"` uses it only when a peer asks.
+`"off"` disables it even if a peer requests it. Two default stations keep the
+existing session data path. Older peers cannot negotiate this mode.
+
+Protection sends twelve packets in one keying and rebuilds a segment from any
+six. At level 2 a burst takes about 16.4 seconds, before turnaround and ACKs.
+This trades clean-channel throughput and latency for fade tolerance. When
+`[radio] max_tx_duration_s` is too short for a burst with its safety margin,
+the daemon sends the segment as a plain frame and warns once. This is a
+session config setting; there is no VARA or ARDOP command to request it.
+See SPEC §22 and ADR-012 for the protocol and BENCHMARKS for measurements.

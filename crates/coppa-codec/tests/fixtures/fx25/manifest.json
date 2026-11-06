@@ -1,0 +1,25 @@
+{
+  "reference": "Direwolf 1.7 de293a1f2526ec6639fe31fa411bd4f2319ecdf4",
+  "license": "Generated test data; no Direwolf source distributed. Direwolf is GPL-2.0-or-later.",
+  "recipe": "tools/fx25-interop/generate.py SOURCE OUTPUT",
+  "vectors": "N0CALL>APRS:????~~~~; binary transmitted data then parity; tags 1 through 11",
+  "audio": "N0CALL>APRS:coppa COP-114 FX25 fixture; tag 7; clean WAV untouched gen_packets output",
+  "damage": "data byte offsets 8..15 XOR ff; independently re-rendered in Python, not RF",
+  "sha256": {
+    "audio-block.bin": "bf5e718ea9f0925509f3d64b5892f2e97bcd788be4d6d4a460cb3bc0886602eb",
+    "audio-damaged.bin": "9f6b1e8347e288a2cdedfbeab63ddfe3327ffde81392249570e73238b199538d",
+    "direwolf-clean.wav": "300dd0668e44e2bdbdbe2aa9d29e83ec3c8649acfe63bfc5cb2c23527c2a3bd2",
+    "direwolf-damaged.wav": "6f022e6a98321d6a6af23e80501862bc07a695f6e3997f3523e958b8a24f732e",
+    "tag01.bin": "fc9f24d882e41e5f2aff9e89df7b97de37d94ba432c5534627d8784025b0eb4d",
+    "tag02.bin": "8d1b1e0a7c074c83891b6253822c9317f365f23762849f1d300cba0da063af05",
+    "tag03.bin": "2eb1c4f238132ade74074baca8f7101a4b864efdc12d7b4f60df0fc936f7680f",
+    "tag04.bin": "7abe442569656a53dc64dc8e672a7cfa6fe1a1bc6bcdcfb6cc71e15ad5cda36a",
+    "tag05.bin": "cca4d25c442f04e64f516ef3e64a9ab31c4b0c06550317de7d8d3570633a43d4",
+    "tag06.bin": "81ff1f1cf8c83aad1d21638f8ad9b53460c201e98825f93ae438e299543fdc3b",
+    "tag07.bin": "ee8c9d4c5060dfa387a938c846bc312dcc5cea92a867ce1de9ba43b4a0e1f285",
+    "tag08.bin": "e80dec0c5285931deb151a95d539b717b97efd6ff89aa5df6bb4449f83179156",
+    "tag09.bin": "58dc777ec28a73b4ed801c9c8953f77a02a0fd85d3cef6dce264c6ac983e83d3",
+    "tag10.bin": "f5ee4841d0b46ec784c1571034c7b8a8b7f6fc57b37c43c3e81212ae69dd7b95",
+    "tag11.bin": "19d9c78bdcaf2561353c0b6e6f1dbe1779d885979eb8f4778c4a291361bb1ba1"
+  }
+}

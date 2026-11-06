@@ -1,0 +1,10 @@
+[48;2;255;255;255m[0J[38;2;0;0;0m[38;2;0;0;0m[38;2;0;0;0m48000 samples per second.  16 bits per sample.  1 audio channels.
+96000 audio bytes in file.  Duration = 1.0 seconds.
+Fix Bits level = 0
+[38;2;0;192;0mChannel 0: 1200 baud, AFSK 1200 & 2200 Hz, A, 48000 sample rate.
+[38;2;0;0;0m
+
+0 from /tmp/cop114-silence.wav
+0 packets decoded in 0.010 seconds.  96.4 x realtime
+[38;2;255;0;0m
+ * * * TEST FAILED: number decoded is less than 1 * * * 

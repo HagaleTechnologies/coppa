@@ -710,8 +710,11 @@ enum Commands {
         #[arg(long)]
         vox: bool,
         /// Transmit IL2P with maximum FEC
-        #[arg(long)]
+        #[arg(long, conflicts_with = "fx25")]
         il2p: bool,
+        /// Transmit FX.25 when the frame fits; otherwise transmit AX.25
+        #[arg(long)]
+        fx25: bool,
         /// Digipeat as this alias: repeat a frame whose first unused path
         /// entry matches, marking it used. Off unless given.
         #[arg(long, value_name = "CALL[-SSID]")]
@@ -948,6 +951,7 @@ fn run() -> Result<()> {
             rig,
             vox,
             il2p,
+            fx25,
             digipeat,
         } => cmd_tnc(
             baud,
@@ -960,6 +964,7 @@ fn run() -> Result<()> {
             rig,
             vox,
             il2p,
+            fx25,
             digipeat,
         )?,
         Commands::Completions { shell } => cmd_completions(shell)?,
@@ -2730,6 +2735,7 @@ fn cmd_tnc(
     rig: Option<String>,
     vox: bool,
     il2p: bool,
+    fx25: bool,
     digipeat: Option<String>,
 ) -> Result<()> {
     let digipeat_alias = digipeat.as_deref().map(parse_digipeat_alias).transpose()?;
@@ -2751,6 +2757,8 @@ fn cmd_tnc(
         };
         if il2p {
             coppa_daemon::tnc::run_tnc_with_il2p(config).await
+        } else if fx25 {
+            coppa_daemon::tnc::run_tnc_with_fx25(config).await
         } else {
             coppa_daemon::tnc::run_tnc(config).await
         }
@@ -2776,6 +2784,12 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(help.contains("--il2p") && help.contains("Transmit IL2P with maximum FEC"));
+    }
+
+    #[cfg(feature = "kiss-tnc")]
+    #[test]
+    fn tnc_il2p_and_fx25_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from(["coppa", "tnc", "--il2p", "--fx25"]).is_err());
     }
 
     #[cfg(feature = "kiss-tnc")]
@@ -5348,5 +5362,45 @@ mod tests {
             help.lines().any(|l| l.trim_start().starts_with("rx ")),
             "{help}"
         );
+    }
+
+    #[cfg(feature = "kiss-tnc")]
+    #[test]
+    fn tnc_fx25_flag_defaults_and_help() {
+        use clap::CommandFactory;
+        for enabled in [false, true] {
+            let mut args = vec![
+                "coppa", "tnc", "--vox", "--port", "8123", "--device", "radio",
+            ];
+            if enabled {
+                args.push("--fx25");
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Commands::Tnc {
+                fx25,
+                port,
+                vox,
+                device,
+                ..
+            } = cli.command
+            else {
+                panic!("tnc")
+            };
+            assert_eq!(fx25, enabled);
+            assert_eq!(port, 8123);
+            assert!(vox);
+            assert_eq!(device.as_deref(), Some("radio"));
+        }
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("tnc")
+            .unwrap()
+            .render_help()
+            .to_string();
+        assert!(help
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("--fx25 Transmit FX.25 when the frame fits; otherwise transmit AX.25"));
     }
 }

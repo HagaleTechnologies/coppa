@@ -101,3 +101,6 @@ docs/superpowers/
 
 # Catalyst thoughts/ symlink (points outside the repo to the shared diario store)
 thoughts/
+
+# COP-114 independent FX.25 audio regression fixtures.
+!crates/coppa-codec/tests/fixtures/fx25/*.wav

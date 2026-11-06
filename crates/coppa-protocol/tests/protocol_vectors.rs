@@ -72,7 +72,7 @@ const VECTORS: &[(&str, &str)] = &[
         "P29",
         "fe2b000000a002ff10ff5dffc0bffc030200e147fdbffc0ff846bff00ff00ff01f0600a00ff00ff00ff00a555540",
     ),
-    ("N01", "1a5dc05700000058b781083000000100000000000048454c4c4f"),
+    ("N01", "1b5dc05700000058b781083000000100000000000048454c4c4f"),
     ("N02", "f05dc05700000058b781083000000100000000000048454c4c4f"),
     ("N03", "010000000000004142434445464748494a"),
     ("N04", "175dc05700000058b781083000"),
@@ -675,6 +675,8 @@ fn capabilities_are_p23_to_p27() {
         arq_window: 8,
         compression: true,
         multi_frame_ack: true,
+        outer_code_rx: false,
+        outer_code_req: false,
         mcs_index: 5,
     };
     let b = LinkCapabilities {
@@ -684,6 +686,8 @@ fn capabilities_are_p23_to_p27() {
         arq_window: 4,
         compression: false,
         multi_frame_ack: true,
+        outer_code_rx: false,
+        outer_code_req: false,
         mcs_index: 3,
     };
     assert_eq!(hex(&a.to_bytes()), vector("P25"));
@@ -699,10 +703,11 @@ fn capabilities_are_p23_to_p27() {
         (120, 1, 2, 4, false, true, 0, 3)
     );
 
-    // Reserved flag bits and trailing bytes are ignored on read; fewer than
-    // 7 bytes is an error.
+    // Reserved flag bits (4–7; bits 2–3 are the outer-code capability of
+    // §22.1) and trailing bytes are ignored on read; fewer than 7 bytes is
+    // an error.
     let mut lenient = bytes_of("P23");
-    lenient[5] |= 0xFC;
+    lenient[5] |= 0xF0;
     lenient.push(0xAA);
     assert_eq!(
         LinkCapabilities::from_bytes(&lenient).unwrap(),
@@ -762,10 +767,10 @@ fn compression_envelope_over_p04_is_p29() {
 
 #[test]
 fn negative_and_tolerance_rows_n01_to_n08() {
-    // N01: MAC type nibble 10 is unknown; coppad then tries transport/raw.
+    // N01: MAC type nibble 11 is unknown; coppad then tries transport/raw.
     assert!(matches!(
         MacPdu::from_bytes(&bytes_of("N01")),
-        Err(ProtocolError::UnknownMacFrameType { value: 10 })
+        Err(ProtocolError::UnknownMacFrameType { value: 11 })
     ));
 
     // N02: the MAC version nibble is not checked.

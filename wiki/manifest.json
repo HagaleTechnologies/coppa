@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-11-06T03:35:36Z",
-  "head_commit": "ff81df7",
+  "generated_at": "2026-11-06T09:21:18Z",
+  "head_commit": "14d87c5",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -578,7 +578,29 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:34dd6685e93e72dc289fa6e4b16399f901a5d87424a621ce38e57f4b09031f79",
+      "hash": "sha256:5f0af1acfa7a3e56172b9ddf44112b09d4c2af3b27927c0641fe3b2a3dd773cc",
+      "id": "session-fade-protection",
+      "kind": "gotcha",
+      "links": [
+        "coppa-protocol",
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/session-fade-protection.md",
+      "sources": [
+        "docs/SPEC.md",
+        "docs/adr/012-cop119-session-outer-code.md",
+        "crates/coppa-daemon/src/event_loop.rs"
+      ],
+      "status": "current",
+      "title": "What will bite you about session fade protection?",
+      "verified_commit": "d837c89",
+      "verified_date": "2026-11-04",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:ba937b9af743dc0a184d474f47320e62559c0cc5846ba908521ff970074b0399",
       "id": "tnc-direwolf-benchmark",
       "kind": "gotcha",
       "links": [
@@ -591,12 +613,14 @@
         "tools/tnc-bench/run.sh",
         "crates/coppa-bench/src/afsk_direwolf.rs",
         "crates/coppa-codec/src/afsk.rs",
-        "docs/testing/tnc-direwolf-wa8lmf.md"
+        "docs/testing/tnc-direwolf-wa8lmf.md",
+        "docs/testing/tnc-fx25-direwolf.md",
+        "tools/fx25-interop/run.sh"
       ],
       "status": "current",
       "title": "What will bite you when measuring coppa's TNC against Direwolf?",
-      "verified_commit": "2526b50",
-      "verified_date": "2026-11-03",
+      "verified_commit": "25ee0e0",
+      "verified_date": "2026-11-05",
       "visibility": "public"
     },
     {

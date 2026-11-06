@@ -202,14 +202,14 @@ impl TncBaud {
 }
 
 enum TncDemodulator {
-    Afsk(coppa_codec::afsk::Demodulator),
+    Afsk(Box<coppa_codec::afsk::Demodulator>),
     G3ruh(Box<coppa_codec::g3ruh::Demodulator>),
 }
 
 impl TncDemodulator {
     fn new(baud: TncBaud) -> Self {
         match baud {
-            TncBaud::Afsk1200 => Self::Afsk(coppa_codec::afsk::Demodulator::new()),
+            TncBaud::Afsk1200 => Self::Afsk(Box::new(coppa_codec::afsk::Demodulator::new())),
             TncBaud::G3ruh9600 => Self::G3ruh(Box::default()),
         }
     }
@@ -378,6 +378,36 @@ fn frame_to_air(frame: &[u8], baud: TncBaud) -> Vec<f32> {
     }
 }
 
+fn kiss_to_air_with_fx25(payload: &[u8]) -> Result<Vec<f32>> {
+    let frame = coppa_codec::afsk::append_fcs(payload);
+    match coppa_codec::afsk::modulate_fx25(&frame) {
+        Ok(audio) => Ok(audio),
+        Err(coppa_codec::afsk::Fx25Error::FrameTooLong) => {
+            tracing::warn!("TNC frame exceeds FX.25 capacity; transmitting plain AX.25");
+            Ok(kiss_to_air(payload, TncBaud::Afsk1200))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Audio for a KISS payload on the TX path, or `None` when the payload
+/// cannot be encoded. A KISS client can send arbitrary bytes (an empty
+/// data frame is not a valid AX.25 frame), so a client-input encoding
+/// error is logged and the frame is dropped; it never stops the TNC.
+fn tnc_tx_audio(payload: &[u8], fx25: bool, baud: TncBaud) -> Option<Vec<f32>> {
+    // FX.25 is AFSK-only; run_tnc_mode refuses it at 9600 baud.
+    if !fx25 || baud != TncBaud::Afsk1200 {
+        return Some(kiss_to_air(payload, baud));
+    }
+    match kiss_to_air_with_fx25(payload) {
+        Ok(audio) => Some(audio),
+        Err(error) => {
+            tracing::warn!(%error, "Dropping KISS frame that cannot be transmitted");
+            None
+        }
+    }
+}
+
 /// Turn a decoded on-air frame into a KISS data payload.
 ///
 /// KISS frames carry no FCS: the TNC adds it on transmit (see
@@ -407,16 +437,27 @@ pub async fn run_tnc_with_il2p(config: TncConfig) -> Result<()> {
     run_tnc_mode(config, TxMode::Il2p).await
 }
 
+/// Run the TNC with FX.25 transmit and automatic AX.25/FX.25 receive.
+/// Frames exceeding the stuffed FX.25 capacity fall back to ordinary AX.25.
+// Library API for `coppa tnc --fx25`; the coppad binary compiles this module
+// privately and only starts the plain TNC, so it would flag this as dead code.
+#[allow(dead_code)]
+pub async fn run_tnc_with_fx25(config: TncConfig) -> Result<()> {
+    run_tnc_mode(config, TxMode::Fx25).await
+}
+
 #[derive(Debug, Clone, Copy)]
 enum TxMode {
     Ax25,
+    Fx25,
     Il2p,
 }
 impl TxMode {
-    /// IL2P is an AFSK format; run_tnc_mode refuses it at 9600 baud.
+    /// FX.25 and IL2P are AFSK formats; run_tnc_mode refuses them at 9600 baud.
     fn encode(self, frame: &[u8], baud: TncBaud) -> Option<Vec<f32>> {
         match self {
             Self::Ax25 => Some(kiss_to_air(frame, baud)),
+            Self::Fx25 => tnc_tx_audio(frame, true, baud),
             Self::Il2p => match coppa_codec::il2p::modulate(frame) {
                 Ok(audio) => Some(audio),
                 Err(error) => {
@@ -463,6 +504,11 @@ impl PacketReceiver {
 }
 
 async fn run_tnc_mode(config: TncConfig, mode: TxMode) -> Result<()> {
+    if matches!(mode, TxMode::Fx25) && config.baud != TncBaud::Afsk1200 {
+        anyhow::bail!(
+            "FX.25 is only supported at 1200 baud (AFSK); remove --fx25 or use --baud 1200"
+        );
+    }
     if matches!(mode, TxMode::Il2p) && config.baud != TncBaud::Afsk1200 {
         anyhow::bail!(
             "IL2P is only supported at 1200 baud (AFSK); remove --il2p or use --baud 1200"
@@ -1574,6 +1620,130 @@ mod tests {
         assert_eq!(h.sink.captured, audio);
         let mut rx = PacketReceiver::default();
         assert_eq!(rx.process(&h.sink.captured), vec![frame]);
+    }
+
+    #[test]
+    fn fx25_tx_mode_is_received_alongside_il2p() {
+        let mut rx = PacketReceiver::default();
+        let mut audio = TxMode::Fx25
+            .encode(b"COP-115+114", TncBaud::Afsk1200)
+            .unwrap();
+        audio.extend(
+            TxMode::Il2p
+                .encode(&il2p_ui_frame(), TncBaud::Afsk1200)
+                .unwrap(),
+        );
+        let frames: Vec<_> = audio.chunks(1024).flat_map(|c| rx.process(c)).collect();
+        assert_eq!(frames, vec![b"COP-115+114".to_vec(), il2p_ui_frame()]);
+    }
+
+    fn il2p_ui_frame() -> Vec<u8> {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testdata/il2p/ui-max.ax25"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn fx25_kiss_roundtrip_and_overflow_fallback() {
+        for payload in [b"COP-114".to_vec(), vec![0xff; 200], vec![0; 400]] {
+            let audio = kiss_to_air_with_fx25(&payload).unwrap();
+            if payload.len() >= 200 {
+                assert_eq!(audio, kiss_to_air(&payload, TncBaud::Afsk1200));
+            }
+            let mut demod = coppa_codec::afsk::Demodulator::new();
+            for chunk in audio.chunks(1024) {
+                demod.process(chunk);
+            }
+            let frames: Vec<_> = demod.take_frames().into_iter().map(air_to_kiss).collect();
+            assert_eq!(frames, vec![payload]);
+        }
+    }
+
+    /// A KISS client can send `c0 00 c0`, an empty data frame: not a valid
+    /// AX.25 payload, so FX.25 encoding rejects it. That is client input,
+    /// not a TNC-fatal error: the frame is dropped locally and the service
+    /// loop keeps running (the `?` that used to propagate this out of
+    /// `run_tnc_mode` terminated the whole TNC).
+    #[test]
+    fn empty_kiss_frame_is_dropped_not_fatal() {
+        assert!(kiss_to_air_with_fx25(&[]).is_err());
+        assert!(
+            tnc_tx_audio(&[], true, TncBaud::Afsk1200).is_none(),
+            "FX.25 TX drops the frame"
+        );
+        assert!(
+            tnc_tx_audio(&[], false, TncBaud::Afsk1200).is_some(),
+            "plain TX keeps the pre-FX.25 behavior"
+        );
+        assert!(tnc_tx_audio(b"COP-114", true, TncBaud::Afsk1200).is_some());
+    }
+    #[test]
+    fn fx25_is_refused_at_9600_baud() {
+        let config = TncConfig {
+            baud: TncBaud::G3ruh9600,
+            ..Default::default()
+        };
+        let error = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run_tnc_with_fx25(config))
+            .unwrap_err();
+        assert!(error.to_string().contains("only supported at 1200 baud"));
+        assert!(tnc_tx_audio(b"COP-114", true, TncBaud::G3ruh9600).is_some());
+    }
+
+    #[test]
+    fn old_tnc_config_literal_and_entrypoint_remain_compatible() {
+        let config = TncConfig {
+            baud: TncBaud::Afsk1200,
+            digipeat_alias: None,
+            kiss_port: 8001,
+            bind_address: "127.0.0.1".into(),
+            rig_address: None,
+            vox_mode: true,
+            sample_rate: 48000,
+            audio_device: None,
+            input_device_id: None,
+            output_device_id: None,
+            input_channel: 0,
+            output_channel: 0,
+        };
+        let future = run_tnc(config);
+        drop(future);
+    }
+    #[test]
+    fn damaged_direwolf_frame_reaches_kiss_without_fcs() {
+        // Exercise exactly the service loop's FCS-removal conversion on the
+        // independently generated damaged audio fixture.
+        for (bytes, offset) in [
+            (
+                include_bytes!("../../coppa-codec/tests/fixtures/fx25/direwolf-clean.wav")
+                    .as_slice(),
+                20,
+            ),
+            (
+                include_bytes!("../../coppa-codec/tests/fixtures/fx25/direwolf-damaged.wav")
+                    .as_slice(),
+                0,
+            ),
+        ] {
+            let samples: Vec<_> = bytes[44..]
+                .chunks_exact(2)
+                .map(|s| i16::from_le_bytes([s[0], s[1]]) as f32 / 32768.0)
+                .collect();
+            let mut demod = coppa_codec::afsk::Demodulator::new();
+            for chunk in samples[offset..].chunks(1024) {
+                demod.process(chunk);
+            }
+            let frames: Vec<_> = demod.take_frames().into_iter().map(air_to_kiss).collect();
+            let mut expected = vec![
+                0x82, 0xa0, 0xa4, 0xa6, 0x40, 0x40, 0xe0, 0x9c, 0x60, 0x86, 0x82, 0x98, 0x98, 0xe1,
+                3, 0xf0,
+            ];
+            expected.extend(b"coppa COP-114 FX25 fixture\n");
+            assert_eq!(frames, vec![expected]);
+        }
     }
 }
 
