@@ -8,9 +8,7 @@
 //! `on_probe_result`) periodically transmits above the current level on purpose, trading an
 //! occasional real decode failure (an ordinary ARQ-retransmitted loss, no protocol change) for
 //! much stronger ground truth than the passive per-frame recommendation can give when it's pinned
-//! low on a fading channel -- see
-//! `docs/superpowers/specs/2026-07-25-rateloop-active-overshoot-probing-design.md` for the full
-//! measured rationale.
+//! low on a fading channel.
 
 /// Ordered ascending valid coppa speed levels (1-9).
 pub const VALID_SPEED_LEVELS: [u8; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
@@ -87,8 +85,7 @@ impl RateLoop {
     /// `level_for_next_transmission` (skipped, per `level_for_next_transmission`'s stall-gating, if
     /// the passive `raise_run` is already making progress), transmit `probe_offset` index-steps
     /// above the current level instead of at it, to get real ground truth where the passive
-    /// per-frame recommendation is weak (see
-    /// `docs/superpowers/specs/2026-07-25-rateloop-active-overshoot-probing-design.md`).
+    /// per-frame recommendation is weak.
     /// `probe_interval = 0` (the default from `new`) disables probing entirely.
     #[must_use]
     pub fn with_probing(mut self, probe_interval: u32, probe_offset: usize) -> Self {

@@ -71,8 +71,7 @@ pub struct EngineConfig {
     /// Consequence worth knowing: while `CoppaCore::on_vhf_profile()` is true this
     /// field describes the peer agreement, NOT the waveform on air. See
     /// `CoppaCore::set_speed_level`/`CoppaCore::cp_mode`'s docs,
-    /// `coppa_protocol::cp_negotiator`, and
-    /// `docs/superpowers/specs/2026-07-29-cp-switch-peer-negotiation-design.md`.
+    /// and `coppa_protocol::cp_negotiator`.
     /// The HF<->VHF *profile* desync (a `RateLoop` climb across the boundary
     /// put this station on `vhf_wide` while the peer was still on an HF profile)
     /// is closed by COP-23 for every engine whose `ofdm_band` is `Hf` or `Vhf`,

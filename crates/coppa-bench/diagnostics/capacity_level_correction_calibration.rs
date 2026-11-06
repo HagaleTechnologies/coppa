@@ -1,7 +1,6 @@
 //! Generates the `CAPACITY_LEVEL_CORRECTION`/`SELECTIVITY_LEVEL_CORRECTION` tables
 //! `coppa_ml::mcs::recommend_speed_level` uses to correct for the AWGN level-dependent bias
-//! PR #51 confirmed and PR #52 root-caused to `SPEED_LEVELS[level].papr_target_db` (see
-//! `docs/superpowers/specs/2026-07-22-rateloop-capacity-level-bias-correction-design.md`).
+//! PR #51 confirmed and PR #52 root-caused to `SPEED_LEVELS[level].papr_target_db`.
 //!
 //! Sounds every real speed level via `CoppaTransceiver::transmit` (so each level's own natural
 //! `papr_target_db` applies, exactly as production does) at 5 AWGN SNR points (6/12/18/24/30 dB),

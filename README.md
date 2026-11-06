@@ -178,3 +178,6 @@ for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
 dual licensed as above, without any additional terms or conditions.
 
 **MSRV**: 1.85.0
+
+Send a small file to multiple OFDM stations with the
+[broadcast file commands](docs/BROADCAST.md), using a configured KISS service.
