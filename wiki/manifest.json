@@ -622,6 +622,28 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:c2b42e053c4b494d5eda1bb5c21db27617bd9423f482b1ecc99b13e8514027e6",
+      "id": "tnc-g3ruh-9600",
+      "kind": "gotcha",
+      "links": [
+        "tnc-direwolf-benchmark",
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/tnc-g3ruh-9600.md",
+      "sources": [
+        "crates/coppa-codec/src/g3ruh.rs",
+        "docs/TNC.md",
+        "docs/testing/tnc-direwolf-g3ruh-9600.md"
+      ],
+      "status": "current",
+      "title": "What will bite you about the 9600 baud G3RUH TNC?",
+      "verified_commit": "7b00317",
+      "verified_date": "2026-11-04",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:9dbaaaff3bc7512ae0bf49a1c7f17d440c0613cbe0a8d6e4b9eed90b847da0c0",
       "id": "watterson-level-4-gap",
       "kind": "gotcha",

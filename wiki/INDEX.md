@@ -29,4 +29,5 @@
 - [What will bite you when calling coppa from C or Python?](pages/c-ffi-and-python-link.md) — SONAME, struct_size, stale header, debug speed, profile and C++ traps.
 - [What will bite you when a paused-clock test drives the daemon's timers?](pages/paused-clock-timers.md) — Under start_paused only tokio's clock is virtual; daemon timers must use clock_now().
 - [What will bite you when measuring coppa's TNC against Direwolf?](pages/tnc-direwolf-benchmark.md) — Misnamed track, two Direwolf defaults, 48 kHz input.
+- [What will bite you about the 9600 baud G3RUH TNC?](pages/tnc-g3ruh-9600.md) — Discriminator wiring, duplicate window and fixed phases.
 - [What will bite you about session fade protection?](pages/session-fade-protection.md) — HARQ keys, delayed ACKs and the burst-duration guard.
