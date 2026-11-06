@@ -280,6 +280,9 @@ pub async fn run_tnc(config: TncConfig) -> Result<()> {
 
 /// Run the TNC with FX.25 transmit and automatic AX.25/FX.25 receive.
 /// Frames exceeding the stuffed FX.25 capacity fall back to ordinary AX.25.
+// Library API for `coppa tnc --fx25`; the coppad binary compiles this module
+// privately and only starts the plain TNC, so it would flag this as dead code.
+#[allow(dead_code)]
 pub async fn run_tnc_with_fx25(config: TncConfig) -> Result<()> {
     run_tnc_mode(config, true).await
 }
