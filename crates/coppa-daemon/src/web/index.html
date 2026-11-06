@@ -575,11 +575,12 @@ function renderSession() {
     const box = $("heard");
     box.replaceChildren();
     if (rows.length === 0) {
-      box.textContent = "No stations heard yet. Stations appear here after a session connects.";
+      box.textContent = "No stations heard yet. Stations appear here after a session connects or a beacon is received.";
     }
     for (const station of rows) {
       const row = document.createElement("div");
       row.textContent = String(station.call).padEnd(8) + " " +
+        (station.grid != null ? station.grid : "—").padEnd(6) + " " +
         (station.snr_db != null ? station.snr_db + " dB" : "— dB").padEnd(7) + " " +
         "level " + (station.level != null ? station.level : "—") + "   " + clock(station.last_heard_ms);
       box.appendChild(row);

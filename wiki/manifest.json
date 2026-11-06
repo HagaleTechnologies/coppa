@@ -373,7 +373,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:681566d6e8792b71211acf058d96632a8ca1f31de73737297cf98769574454f6",
+      "hash": "sha256:591e1e6483a2ba3c7f0cbf7178e288a6d1e764aadb791f3b83c9ef388e1b8664",
       "id": "coppa-protocol",
       "kind": "subsystem",
       "links": [

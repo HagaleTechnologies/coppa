@@ -23,6 +23,7 @@ struct Station {
     kiss_addr: std::net::SocketAddr,
     data_addr: std::net::SocketAddr,
     keyed: Arc<AtomicBool>,
+    ever_keyed: Arc<AtomicBool>,
 }
 
 /// A station's audio ring ends, for the cable: what it hears, what it sends.
@@ -72,6 +73,8 @@ async fn station(call: &'static str) -> (Station, StationAudio) {
     let keyed = Arc::new(AtomicBool::new(false));
     let monitor = TcpStream::connect(cmd_addr).await.unwrap();
     let flag = keyed.clone();
+    let ever_keyed = Arc::new(AtomicBool::new(false));
+    let ever_flag = ever_keyed.clone();
     tokio::task::spawn_local(async move {
         let (read_half, _write_half) = monitor.into_split();
         let mut reader = BufReader::new(read_half);
@@ -80,7 +83,10 @@ async fn station(call: &'static str) -> (Station, StationAudio) {
             match reader.read_until(b'\r', &mut line).await {
                 Ok(0) | Err(_) => break,
                 Ok(_) => match String::from_utf8_lossy(&line).trim_end() {
-                    "PTT ON" => flag.store(true, Ordering::SeqCst),
+                    "PTT ON" => {
+                        ever_flag.store(true, Ordering::SeqCst);
+                        flag.store(true, Ordering::SeqCst);
+                    }
                     "PTT OFF" => flag.store(false, Ordering::SeqCst),
                     _ => {}
                 },
@@ -93,6 +99,7 @@ async fn station(call: &'static str) -> (Station, StationAudio) {
             kiss_addr,
             data_addr,
             keyed,
+            ever_keyed,
         },
         StationAudio {
             input: in_producer,
@@ -231,5 +238,134 @@ async fn a_kiss_frame_split_across_tcp_writes_crosses_whole() {
             tx.write_all(&wire[split..]).await.unwrap();
             assert_eq!(read_frame(&mut rx).await, data);
         })
+        .await;
+}
+
+/// Preserve decoder state and consume every frame, including coalesced reads.
+async fn receive_file(
+    mut socket: TcpStream,
+    progress: tokio::sync::mpsc::UnboundedSender<()>,
+) -> Vec<u8> {
+    use coppa_protocol::broadcast_file::FileReceiver;
+    let mut decoder = KissDecoder::new();
+    let mut file = FileReceiver::new();
+    let mut buffer = [0; 4096];
+    loop {
+        let n = socket.read(&mut buffer).await.unwrap();
+        assert_ne!(n, 0);
+        for frame in decoder.push(&buffer[..n]) {
+            if let KissFrame::Data(packet) = frame {
+                let result = file.push(&packet).unwrap();
+                let _ = progress.send(());
+                if let Some(bytes) = result {
+                    return bytes;
+                }
+            }
+        }
+    }
+}
+
+async fn broadcast_bench(drop_first_copy_chunk: bool) {
+    use coppa_protocol::broadcast_file::encode_file;
+    let (sender, mut sa) = station("N1CALL").await;
+    let (a, mut aa) = station("N0CALL").await;
+    let a_socket = TcpStream::connect(a.kiss_addr).await.unwrap();
+    let (a_progress, mut received_a) = tokio::sync::mpsc::unbounded_channel();
+    let a_done = tokio::task::spawn_local(receive_file(a_socket, a_progress));
+    let mut tx = TcpStream::connect(sender.kiss_addr).await.unwrap();
+    let (join_tx, mut join_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(StationAudio, Arc<AtomicBool>)>();
+    let muted = Arc::new(AtomicBool::new(false));
+    let mute = muted.clone();
+    let a_keyed = a.keyed.clone();
+    // One consumed sender block is copied to both receivers. There is no
+    // reverse cable, even while a receiver is acquiring or missing a chunk.
+    tokio::task::spawn_local(async move {
+        let mut b: Option<(StationAudio, Arc<AtomicBool>)> = None;
+        let mut tick = tokio::time::interval(CABLE_TICK);
+        let mut buf = vec![0.0; CABLE_SAMPLES];
+        loop {
+            tick.tick().await;
+            if let Ok(joined) = join_rx.try_recv() {
+                b = Some(joined);
+            }
+            buf.fill(0.0);
+            sa.output.read(&mut buf);
+            assert!(!a_keyed.load(Ordering::SeqCst), "receiver A keyed");
+            if mute.load(Ordering::SeqCst) {
+                aa.input.write(&vec![0.0; CABLE_SAMPLES]);
+            } else {
+                aa.input.write(&buf);
+            }
+            if let Some((audio, keyed)) = &mut b {
+                assert!(!keyed.load(Ordering::SeqCst), "receiver B keyed");
+                audio.input.write(&buf);
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let bytes = payload(1000, 29);
+    let packets = encode_file(&bytes).unwrap();
+    assert_eq!(packets.len(), 3);
+    let mut b_done = None;
+    let mut b_keyed = None;
+    let mut b_ever_keyed = None;
+    for copy in 0..2 {
+        for (index, packet) in packets.iter().enumerate() {
+            muted.store(
+                drop_first_copy_chunk && copy == 0 && index == 1,
+                Ordering::SeqCst,
+            );
+            tx.write_all(&kiss_encode_data(packet)).await.unwrap();
+            if copy == 0 && index == 1 {
+                // Chunk zero has crossed during the previous 30-second slot.
+                // Begin B's entire station, TCP decoder and audio mid-frame.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                assert!(
+                    sender.keyed.load(Ordering::SeqCst),
+                    "B must join during a keyed frame"
+                );
+                let (b, ba) = station("N2CALL").await;
+                let socket = TcpStream::connect(b.kiss_addr).await.unwrap();
+                b_keyed = Some(b.keyed.clone());
+                b_ever_keyed = Some(b.ever_keyed.clone());
+                join_tx.send((ba, b.keyed)).unwrap();
+                let (progress, _) = tokio::sync::mpsc::unbounded_channel();
+                b_done = Some(tokio::task::spawn_local(receive_file(socket, progress)));
+                tokio::time::sleep(Duration::from_millis(29500)).await;
+            } else {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            if copy == 0 && index == 0 {
+                received_a
+                    .try_recv()
+                    .expect("chunk zero crossed before B exists");
+            }
+        }
+    }
+    let (ar, br) = tokio::time::timeout(Duration::from_secs(30), async {
+        (a_done.await.unwrap(), b_done.unwrap().await.unwrap())
+    })
+    .await
+    .expect("both receivers must finish within two copies");
+    assert_eq!(ar, bytes);
+    assert_eq!(br, bytes);
+    assert!(!a.keyed.load(Ordering::SeqCst));
+    assert!(!b_keyed.unwrap().load(Ordering::SeqCst));
+    assert!(!a.ever_keyed.load(Ordering::SeqCst));
+    assert!(!b_ever_keyed.unwrap().load(Ordering::SeqCst));
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_file_reaches_two_stations_including_mid_frame_joiner() {
+    tokio::task::LocalSet::new()
+        .run_until(broadcast_bench(false))
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropped_file_chunk_is_repaired_by_next_copy_without_return_channel() {
+    tokio::task::LocalSet::new()
+        .run_until(broadcast_bench(true))
         .await;
 }
