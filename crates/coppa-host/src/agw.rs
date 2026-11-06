@@ -250,8 +250,18 @@ impl AgwServer {
         }
     }
 }
-/// Longest a request reply waits for outbound queue space.
+/// Longest an outbound record waits for queue space.
 const REPLY_WAIT: Duration = Duration::from_secs(5);
+
+/// Queue one outbound record, waiting so the writer can drain request or
+/// receive bursts. False means the client must be dropped: the writer has
+/// gone (its own write timed out) or stayed stalled for `REPLY_WAIT`.
+async fn enqueue(out: &mpsc::Sender<Vec<u8>>, record: Vec<u8>) -> bool {
+    matches!(
+        tokio::time::timeout(REPLY_WAIT, out.send(record)).await,
+        Ok(Ok(()))
+    )
+}
 
 async fn client(
     stream: TcpStream,
@@ -298,16 +308,13 @@ async fn client(
                                 if let Some(frame)=frame {if tx.try_send(frame).is_err() {tracing::warn!("AGWPE TX queue unavailable");return;}} else {tracing::warn!("Malformed AGWPE transmit request");} None
                             }, _=>None
                         };
-                        // Await queue space so the writer can drain pipelined
-                        // replies; only a writer stalled past REPLY_WAIT (its
-                        // own write timeout has then fired) ends the client.
-                        if let Some(r)=response {if !matches!(tokio::time::timeout(REPLY_WAIT,out.send(r)).await,Ok(Ok(()))) {return;}}
+                        if let Some(r)=response {if !enqueue(&out,r).await {return;}}
                     }
                 },
                 received=rx.recv()=>match received {
                     Ok(frame)=> {
-                        if raw {let mut b=vec![0]; b.extend(&frame); if out.try_send(packet(b'K',&[],&[],0,&b)).is_err() {return;}}
-                        if mon {if let Some(record)=monitor(&frame,&utc_time()) {if out.try_send(record).is_err() {return;}}}
+                        if raw {let mut b=vec![0]; b.extend(&frame); if !enqueue(&out,packet(b'K',&[],&[],0,&b)).await {return;}}
+                        if mon {if let Some(record)=monitor(&frame,&utc_time()) {if !enqueue(&out,record).await {return;}}}
                     },
                     Err(broadcast::error::RecvError::Lagged(n))=>tracing::warn!(n,"AGWPE receiver lagged"),
                     Err(broadcast::error::RecvError::Closed)=>return,
@@ -901,8 +908,9 @@ mod tests {
     }
 
     /// A raw subscriber that never reads fills its bounded outbound queue
-    /// and is disconnected; another client's version request is still
-    /// answered while that happens.
+    /// and is disconnected once its writes stay stalled past the write
+    /// timeout; another client's version request is still answered while
+    /// that happens.
     #[tokio::test]
     async fn nonreading_client_is_dropped_without_blocking_others() {
         let (addr, _tx, rx, task) = spawn_server(Arc::default()).await;
@@ -924,6 +932,10 @@ mod tests {
                 barrier(&mut healthy).await;
             }
         }
+        barrier(&mut healthy).await;
+        // Keep not reading past the 5 s write timeout and REPLY_WAIT; a
+        // briefly slow reader is not dropped.
+        tokio::time::sleep(Duration::from_secs(7)).await;
         barrier(&mut healthy).await;
         assert_closed(&mut stalled).await;
         barrier(&mut healthy).await;
@@ -954,6 +966,44 @@ mod tests {
             assert_eq!(reply[4], b'R');
         }
         let mut c = send.await.unwrap().reunite(reader).unwrap();
+        barrier(&mut c).await;
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// A raw+monitor subscriber that is reading gets every record of a
+    /// buffered receive burst larger than its outbound queue.
+    #[tokio::test]
+    async fn buffered_receive_burst_reaches_a_reading_subscriber() {
+        let (addr, _tx, rx, task) = spawn_server(Arc::default()).await;
+        let frame = [
+            ax_addr(b"APRS", 0, true, false),
+            ax_addr(b"N0CALL", 0, false, true),
+            vec![0x03, 0xf0, b'o', b'k'],
+        ]
+        .concat();
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(
+            &[
+                packet(b'k', &[], &[], 0, &[]),
+                packet(b'm', &[], &[], 0, &[]),
+            ]
+            .concat(),
+        )
+        .await
+        .unwrap();
+        barrier(&mut c).await;
+        for _ in 0..40 {
+            rx.send(frame.clone()).unwrap();
+        }
+        for i in 0..80 {
+            let record = receive(&mut c).await;
+            assert_eq!(
+                record[4],
+                if i % 2 == 0 { b'K' } else { b'U' },
+                "record {i}"
+            );
+        }
         barrier(&mut c).await;
         task.abort();
         let _ = task.await;
