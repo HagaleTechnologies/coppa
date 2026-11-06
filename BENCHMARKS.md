@@ -3319,7 +3319,7 @@ At 12 dB both signs decoded all 20 frames. The CI guard
 
 ## COP-119: RS(12,6) session fade protection
 
-Measured on 2026-11-04 with workspace version 0.8.0, based on d837c89.
+Measured on 2026-11-06 with workspace version 0.8.0, on the COP-119 branch.
 Command: `cargo run --release -p coppa-bench --example session`.
 The original window-eight bare-frame baseline is unchanged. The new
 `stop-and-wait` and `rs12-6` arms include MAC and transport headers, window
@@ -3328,6 +3328,11 @@ transmission. They use the production outer packetizer, reassembler and ARQ.
 Each fading summary row averages five trials, including dropped trials. These are simulated
 ten-minute sessions with ideal ACKs unless explicitly labeled ACK-loss.
 The channel is reset per packet, not a continuous on-air fading realization.
+A retry that `get_retransmits` hands out is still permitted, so the framed
+arms transmit it and give it its ACK opportunity before a drop is recorded,
+matching the daemon's send-then-mark order (the 2026-11-04 run predated this
+and recorded drops one retransmission early); dropped trials print the number
+of sends of the segment that exhausted the budget.
 
 The ACK-loss arm sends ACK frames through the same channel. Protected blocks
 use two copies and the sender's conservative extra hold if only the second
@@ -3345,10 +3350,10 @@ that keyed intervals from the two stations did not overlap.
 Reproduce the cable report with
 `cargo test -p coppa-daemon --lib --features cpal-backend,websocket rs_cable_clean_throughput_report -- --ignored --nocapture`.
 
-Measurement wall time: 443.1 seconds for the session executable, excluding its release build.
+Measurement wall time: 511.2 seconds for the session executable, excluding its release build.
 
 The protected ideal-ACK arm completed Good, Moderate and Poor at 5/5.
-With ACK loss it completed Good and Moderate at 5/5, but Poor at 4/5.
+With ACK loss it completed Good, Moderate and Poor at 5/5.
 This does not prove RF reliability or survival through a continuous channel.
 
 Full session output:
@@ -3385,43 +3390,43 @@ Moderate and Poor are diagnostic-only; their results remain reported above.
 
 === COP-119 daemon-matched window-1 session arms ===
 -> stop-and-wait ideal-ACK clean: 1901.0 bytes/min
-  stop-and-wait ideal-ACK [good] trial 0: DROPPED (395.2s, 6048 bytes, 918.1 bytes/min)
+  stop-and-wait ideal-ACK [good] trial 0: completed (601.9s, 12384 bytes, 1234.4 bytes/min)
   stop-and-wait ideal-ACK [good] trial 1: completed (601.7s, 7968 bytes, 794.5 bytes/min)
-  stop-and-wait ideal-ACK [good] trial 2: DROPPED (401.0s, 6528 bytes, 976.7 bytes/min)
-  stop-and-wait ideal-ACK [good] trial 3: DROPPED (324.2s, 6624 bytes, 1225.8 bytes/min)
+  stop-and-wait ideal-ACK [good] trial 2: DROPPED after 6 sends (402.4s, 6528 bytes, 973.4 bytes/min)
+  stop-and-wait ideal-ACK [good] trial 3: DROPPED after 6 sends (325.6s, 6624 bytes, 1220.7 bytes/min)
   stop-and-wait ideal-ACK [good] trial 4: completed (600.7s, 13152 bytes, 1313.6 bytes/min)
--> stop-and-wait ideal-ACK good: 2/5 completed, 1045.8 bytes/min
+-> stop-and-wait ideal-ACK good: 3/5 completed, 1107.3 bytes/min
   stop-and-wait ideal-ACK [moderate] trial 0: completed (602.5s, 10944 bytes, 1089.8 bytes/min)
   stop-and-wait ideal-ACK [moderate] trial 1: completed (601.6s, 12864 bytes, 1283.0 bytes/min)
   stop-and-wait ideal-ACK [moderate] trial 2: completed (601.5s, 11232 bytes, 1120.4 bytes/min)
-  stop-and-wait ideal-ACK [moderate] trial 3: DROPPED (351.9s, 6336 bytes, 1080.4 bytes/min)
+  stop-and-wait ideal-ACK [moderate] trial 3: DROPPED after 6 sends (353.2s, 6336 bytes, 1076.3 bytes/min)
   stop-and-wait ideal-ACK [moderate] trial 4: completed (600.5s, 11328 bytes, 1131.8 bytes/min)
--> stop-and-wait ideal-ACK moderate: 4/5 completed, 1141.1 bytes/min
+-> stop-and-wait ideal-ACK moderate: 4/5 completed, 1140.3 bytes/min
   stop-and-wait ideal-ACK [poor] trial 0: completed (600.0s, 1920 bytes, 192.0 bytes/min)
   stop-and-wait ideal-ACK [poor] trial 1: completed (601.1s, 5280 bytes, 527.0 bytes/min)
-  stop-and-wait ideal-ACK [poor] trial 2: DROPPED (344.1s, 576 bytes, 100.4 bytes/min)
+  stop-and-wait ideal-ACK [poor] trial 2: DROPPED after 6 sends (345.5s, 576 bytes, 100.0 bytes/min)
   stop-and-wait ideal-ACK [poor] trial 3: completed (600.8s, 4896 bytes, 488.9 bytes/min)
-  stop-and-wait ideal-ACK [poor] trial 4: DROPPED (449.3s, 2976 bytes, 397.4 bytes/min)
--> stop-and-wait ideal-ACK poor: 3/5 completed, 341.2 bytes/min
+  stop-and-wait ideal-ACK [poor] trial 4: DROPPED after 6 sends (450.7s, 2976 bytes, 396.2 bytes/min)
+-> stop-and-wait ideal-ACK poor: 3/5 completed, 340.8 bytes/min
 -> stop-and-wait ACK-loss clean: 1901.0 bytes/min
-  stop-and-wait ACK-loss [good] trial 0: DROPPED (340.1s, 5856 bytes, 1033.1 bytes/min)
+  stop-and-wait ACK-loss [good] trial 0: DROPPED after 6 sends (341.5s, 5856 bytes, 1029.0 bytes/min)
   stop-and-wait ACK-loss [good] trial 1: completed (601.9s, 9024 bytes, 899.5 bytes/min)
   stop-and-wait ACK-loss [good] trial 2: completed (600.3s, 9888 bytes, 988.4 bytes/min)
-  stop-and-wait ACK-loss [good] trial 3: DROPPED (340.2s, 5952 bytes, 1049.7 bytes/min)
-  stop-and-wait ACK-loss [good] trial 4: DROPPED (322.8s, 6048 bytes, 1124.3 bytes/min)
--> stop-and-wait ACK-loss good: 2/5 completed, 1019.0 bytes/min
-  stop-and-wait ACK-loss [moderate] trial 0: DROPPED (318.4s, 4896 bytes, 922.6 bytes/min)
+  stop-and-wait ACK-loss [good] trial 3: DROPPED after 6 sends (341.6s, 5952 bytes, 1045.5 bytes/min)
+  stop-and-wait ACK-loss [good] trial 4: DROPPED after 6 sends (325.8s, 6048 bytes, 1113.8 bytes/min)
+-> stop-and-wait ACK-loss good: 2/5 completed, 1015.3 bytes/min
+  stop-and-wait ACK-loss [moderate] trial 0: DROPPED after 6 sends (319.8s, 4896 bytes, 918.7 bytes/min)
   stop-and-wait ACK-loss [moderate] trial 1: completed (600.0s, 8832 bytes, 883.2 bytes/min)
-  stop-and-wait ACK-loss [moderate] trial 2: DROPPED (323.5s, 4800 bytes, 890.4 bytes/min)
-  stop-and-wait ACK-loss [moderate] trial 3: DROPPED (282.8s, 5088 bytes, 1079.6 bytes/min)
+  stop-and-wait ACK-loss [moderate] trial 2: DROPPED after 6 sends (324.8s, 4800 bytes, 886.6 bytes/min)
+  stop-and-wait ACK-loss [moderate] trial 3: DROPPED after 6 sends (285.8s, 5088 bytes, 1068.2 bytes/min)
   stop-and-wait ACK-loss [moderate] trial 4: completed (600.1s, 9216 bytes, 921.5 bytes/min)
--> stop-and-wait ACK-loss moderate: 2/5 completed, 939.5 bytes/min
+-> stop-and-wait ACK-loss moderate: 2/5 completed, 935.6 bytes/min
   stop-and-wait ACK-loss [poor] trial 0: completed (600.3s, 672 bytes, 67.2 bytes/min)
-  stop-and-wait ACK-loss [poor] trial 1: DROPPED (450.6s, 672 bytes, 89.5 bytes/min)
+  stop-and-wait ACK-loss [poor] trial 1: DROPPED after 6 sends (451.9s, 672 bytes, 89.2 bytes/min)
   stop-and-wait ACK-loss [poor] trial 2: completed (600.3s, 672 bytes, 67.2 bytes/min)
   stop-and-wait ACK-loss [poor] trial 3: completed (600.2s, 2016 bytes, 201.5 bytes/min)
-  stop-and-wait ACK-loss [poor] trial 4: DROPPED (174.1s, 1632 bytes, 562.5 bytes/min)
--> stop-and-wait ACK-loss poor: 3/5 completed, 197.6 bytes/min
+  stop-and-wait ACK-loss [poor] trial 4: DROPPED after 6 sends (175.5s, 1632 bytes, 558.1 bytes/min)
+-> stop-and-wait ACK-loss poor: 3/5 completed, 196.6 bytes/min
 -> rs12-6 ideal-ACK clean: 1814.5 bytes/min
   rs12-6 ideal-ACK [good] trial 0: completed (607.9s, 14675 bytes, 1448.5 bytes/min)
   rs12-6 ideal-ACK [good] trial 1: completed (604.7s, 16436 bytes, 1630.7 bytes/min)
@@ -3445,21 +3450,21 @@ Moderate and Poor are diagnostic-only; their results remain reported above.
   rs12-6 ACK-loss [good] trial 0: completed (613.8s, 14675 bytes, 1434.5 bytes/min)
   rs12-6 ACK-loss [good] trial 1: completed (600.9s, 12327 bytes, 1230.8 bytes/min)
   rs12-6 ACK-loss [good] trial 2: completed (613.3s, 14675 bytes, 1435.6 bytes/min)
-  rs12-6 ACK-loss [good] trial 3: completed (618.7s, 16436 bytes, 1593.8 bytes/min)
+  rs12-6 ACK-loss [good] trial 3: completed (612.3s, 14675 bytes, 1438.1 bytes/min)
   rs12-6 ACK-loss [good] trial 4: completed (611.8s, 14675 bytes, 1439.2 bytes/min)
--> rs12-6 ACK-loss good: 5/5 completed, 1426.8 bytes/min
+-> rs12-6 ACK-loss good: 5/5 completed, 1395.7 bytes/min
   rs12-6 ACK-loss [moderate] trial 0: completed (602.0s, 14088 bytes, 1404.1 bytes/min)
   rs12-6 ACK-loss [moderate] trial 1: completed (606.1s, 13501 bytes, 1336.6 bytes/min)
   rs12-6 ACK-loss [moderate] trial 2: completed (615.0s, 14675 bytes, 1431.7 bytes/min)
   rs12-6 ACK-loss [moderate] trial 3: completed (605.4s, 13501 bytes, 1338.0 bytes/min)
   rs12-6 ACK-loss [moderate] trial 4: completed (609.1s, 14088 bytes, 1387.8 bytes/min)
 -> rs12-6 ACK-loss moderate: 5/5 completed, 1379.6 bytes/min
-  rs12-6 ACK-loss [poor] trial 0: DROPPED (443.2s, 2348 bytes, 317.9 bytes/min)
+  rs12-6 ACK-loss [poor] trial 0: completed (614.4s, 5283 bytes, 515.9 bytes/min)
   rs12-6 ACK-loss [poor] trial 1: completed (602.2s, 7631 bytes, 760.3 bytes/min)
-  rs12-6 ACK-loss [poor] trial 2: completed (616.7s, 11740 bytes, 1142.2 bytes/min)
+  rs12-6 ACK-loss [poor] trial 2: completed (618.0s, 7044 bytes, 683.9 bytes/min)
   rs12-6 ACK-loss [poor] trial 3: completed (613.8s, 8805 bytes, 860.7 bytes/min)
   rs12-6 ACK-loss [poor] trial 4: completed (607.5s, 8805 bytes, 869.6 bytes/min)
--> rs12-6 ACK-loss poor: 4/5 completed, 790.1 bytes/min
+-> rs12-6 ACK-loss poor: 5/5 completed, 738.1 bytes/min
 MET: rs12-6 Moderate completed 5/5 sessions without a drop (required 5/5).
 ```
 

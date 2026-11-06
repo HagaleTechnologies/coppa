@@ -148,6 +148,12 @@ struct SessionResult {
     dropped: bool,
     elapsed_s: f64,
     bytes_delivered: usize,
+    /// Transmission attempts of the segment whose exhausted retry budget
+    /// dropped a framed session: one per physical send of the segment (a
+    /// whole 12-packet burst counts as one attempt in the protected arm).
+    /// `None` when the session completed, and always `None` for the
+    /// unchanged baseline arms.
+    drop_segment_sends: Option<u8>,
 }
 
 /// Run one simulated 10-minute ARQ session over `preset`, seeded by `seed`.
@@ -237,6 +243,7 @@ fn run_session(preset: WattersonPreset, seed: u64) -> SessionResult {
         dropped,
         elapsed_s: now.duration_since(start).as_secs_f64(),
         bytes_delivered,
+        drop_segment_sends: None,
     }
 }
 
@@ -380,6 +387,8 @@ impl SessionChannel {
 /// Daemon-matched framing and window, using the shipped packetizer and ARQ.
 /// This isolates the bench's independent-per-packet fading convention, rather
 /// than claiming to model a continuous channel or the daemon's event loop.
+/// A retry is transmitted, and given its ACK opportunity, before an exhausted
+/// budget records the drop, matching the daemon's send-then-mark order.
 fn run_framed_session(
     preset: Option<WattersonPreset>,
     seed: u64,
@@ -415,7 +424,10 @@ fn run_framed_session(
     let mut bytes_delivered = 0;
     let mut dropped = false;
     let mut block_no = 0u64;
+    let mut sends_by_seq = [0u8; 256];
+    let mut drop_segment_sends = None;
     while now.duration_since(start) < SESSION_DURATION {
+        let mut retried = false;
         let seq = if tx.can_send() {
             let mut rng = StdRng::seed_from_u64(seed ^ block_no ^ 0xACE_0000);
             block_no += 1;
@@ -427,13 +439,16 @@ fn run_framed_session(
                 now += Duration::from_millis(500);
                 continue;
             };
+            // A retry `get_retransmits` hands out is still permitted (its
+            // transmit_count has not passed max_retransmit yet), so mark it
+            // and transmit it below, the way the daemon sends a retry before
+            // marking it. Only after the attempt and its ACK opportunity may
+            // the drop be recorded (post-loop check).
             tx.mark_retransmitted(seq, now).unwrap();
-            if tx.is_failed(seq) {
-                dropped = true;
-                break;
-            }
+            retried = true;
             seq
         };
+        sends_by_seq[seq as usize] = sends_by_seq[seq as usize].saturating_add(1);
         let host = tx.get_segment_data(seq).unwrap().to_vec();
         let segment = TransportPdu::new_reliable(0, seq, 0, host).to_bytes();
         let packets: Vec<(u8, Vec<u8>)> = if outer {
@@ -529,11 +544,22 @@ fn run_framed_session(
                 tx.process_ack(ack, bitmap, now);
             }
         }
+        // The retry has now been transmitted and given its ACK opportunity.
+        // Recording the drop earlier would skip the final permitted
+        // retransmission entirely, which `get_retransmits` still owes at
+        // that point; the daemon, too, sends a retry before acting on the
+        // exhausted budget.
+        if retried && tx.is_failed(seq) {
+            drop_segment_sends = Some(sends_by_seq[seq as usize]);
+            dropped = true;
+            break;
+        }
     }
     SessionResult {
         dropped,
         elapsed_s: now.duration_since(start).as_secs_f64(),
         bytes_delivered,
+        drop_segment_sends,
     }
 }
 
@@ -578,7 +604,15 @@ fn run_fade_protection_arms() {
                     let rate = result.bytes_delivered as f64 * 60.0 / result.elapsed_s;
                     completed += usize::from(!result.dropped);
                     goodput += rate;
-                    println!("  {arm} {ack} [{}] trial {trial}: {} ({:.1}s, {} bytes, {rate:.1} bytes/min)", preset_name(preset), if result.dropped { "DROPPED" } else { "completed" }, result.elapsed_s, result.bytes_delivered);
+                    let outcome = if result.dropped {
+                        format!(
+                            "DROPPED after {} sends",
+                            result.drop_segment_sends.unwrap_or(0)
+                        )
+                    } else {
+                        "completed".to_string()
+                    };
+                    println!("  {arm} {ack} [{}] trial {trial}: {outcome} ({:.1}s, {} bytes, {rate:.1} bytes/min)", preset_name(preset), result.elapsed_s, result.bytes_delivered);
                 }
                 println!(
                     "-> {arm} {ack} {}: {completed}/5 completed, {:.1} bytes/min",
@@ -597,6 +631,29 @@ fn run_fade_protection_arms() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn framed_drop_sends_the_final_permitted_retransmission() {
+        // `max_retransmit` is 5, so a segment that exhausts its budget must
+        // have been physically sent six times: the original plus all five
+        // permitted retransmissions. `get_retransmits` hands the final retry
+        // out while it is still permitted, and the daemon transmits a retry
+        // before marking it, so a drop recorded before that send would skip
+        // the last permitted attempt entirely. Stop-and-wait Poor trial 2
+        // drops; before the COP-119 review fix it dropped after only five
+        // sends of that segment.
+        let result = run_framed_session(
+            Some(WattersonPreset::Poor),
+            0x5E55_1000 ^ ((WattersonPreset::Poor as u64) << 16) ^ 2,
+            false,
+            false,
+        );
+        assert!(
+            result.dropped,
+            "Poor trial 2 must drop for this to test the drop path"
+        );
+        assert_eq!(result.drop_segment_sends, Some(6));
+    }
 
     #[test]
     fn rs_moderate_requires_all_five_sessions() {

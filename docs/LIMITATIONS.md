@@ -308,12 +308,13 @@ update.
   derived from sequence number. Its historical baseline is distinct from the
   new window-one MAC/transport arms. New arms use independent channel seeds
   per physical packet and a 1200-sample receive tail, not a continuous channel.
+  A retry is transmitted, and given its ACK opportunity, before a drop is
+  recorded, matching the daemon's send-then-mark order.
 - There is no host command to request protection; set the session config key.
   Clean throughput, latency and ACK-loss results are recorded in BENCHMARKS.
-- Measured ACK loss: protected Good and Moderate completed 5/5 sessions,
-  at 1426.8 and 1379.6 B/min; protected Poor completed 4/5 at 790.1 B/min,
-  with one dropped session. The matched plain arm completed 2/5 Good,
-  2/5 Moderate and 3/5 Poor at 1019.0, 939.5 and 197.6 B/min. Clean protected
+- Measured ACK loss: protected Good, Moderate and Poor completed 5/5 sessions,
+  at 1395.7, 1379.6 and 738.1 B/min. The matched plain arm completed 2/5 Good,
+  2/5 Moderate and 3/5 Poor at 1015.3, 935.6 and 196.6 B/min. Clean protected
   throughput was 1814.5 B/min in the bench, versus 1901.0 for matched plain
   stop-and-wait. These are independent-per-packet simulated channels, not RF.
 - The session RTO budget still omits a peer's due station-ID prepend before
