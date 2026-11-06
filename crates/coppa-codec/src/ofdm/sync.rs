@@ -53,7 +53,8 @@ pub fn coppa_pn_sequence(version: u8) -> Vec<f32> {
 /// Even FFT bins inside the profile's active band — the preamble comb.
 /// Even-only placement makes the symbol body periodic with N/2, which both
 /// preserves the two-identical-halves Schmidl-Cox structure and enables the
-/// lag-N/2 coarse CFO estimate (±fs/(2·(N/2)) = ±50 Hz at N=960/48k).
+/// lag-N/2 coarse CFO utility. Acquisition instead searches fine-stage hypotheses
+/// through ±171 Hz on standard HF, without changing this transmitted comb.
 pub fn preamble_comb_bins(profile: &CoppaProfile) -> Vec<usize> {
     let first = profile.first_active_bin();
     let last = profile.carrier_offset + profile.total_active_carriers();
@@ -80,7 +81,7 @@ fn newman_phases(k_tones: usize, rotation: usize) -> Vec<f32> {
 /// preamble per protocol version while preserving its low-PAPR envelope class.
 /// Returns 2 identical unit-RMS symbols, each with its cyclic prefix prepended; the
 /// two-identical-halves Schmidl-Cox structure and per-symbol period N/2 are both
-/// preserved (see docs/superpowers/plans/2026-07-03-phase1-radio-reality.md Task 2).
+/// preserved (see `docs/adr/003-phase1-waveform-break.md`, decision 2).
 pub fn generate_coppa_preamble(profile: &CoppaProfile, version: u8) -> Vec<f32> {
     let n = profile.fft_size;
     let cp = profile.cp_samples;
@@ -220,6 +221,8 @@ pub fn estimate_cfo_hz(
 /// one from real samples. `k = round((f_coarse-f_fine)/Delta)` picks the fine estimate's
 /// wrap count using the coarse (wide-range, low-precision) estimate as a coarse compass;
 /// `f_hat = f_fine + k*Delta` is the final, wide-range AND precise estimate.
+/// Retained as a public utility with isolated test coverage. Acquisition uses
+/// fine-stage hypotheses selected by confirm correlation instead.
 pub fn estimate_cfo_two_stage(
     analytic: &[Complex32],
     coarse_start: usize,
@@ -233,7 +236,7 @@ pub fn estimate_cfo_two_stage(
     let body_start = coarse_start + cp;
 
     let f_coarse = moose_lag_estimate(analytic, body_start, n_half, coarse_len, sample_rate);
-    let f_fine = moose_lag_estimate(analytic, coarse_start, symbol_len, symbol_len, sample_rate);
+    let f_fine = estimate_cfo_fine(analytic, coarse_start, symbol_len, sample_rate);
 
     let delta = sample_rate / symbol_len as f32;
     if delta <= 0.0 {
@@ -241,6 +244,16 @@ pub fn estimate_cfo_two_stage(
     }
     let k = ((f_coarse - f_fine) / delta).round();
     f_fine + k * delta
+}
+
+/// Fine Moose estimate, wrapped into ±sample_rate/(2*symbol_len).
+pub(crate) fn estimate_cfo_fine(
+    analytic: &[Complex32],
+    coarse_start: usize,
+    symbol_len: usize,
+    sample_rate: f32,
+) -> f32 {
+    moose_lag_estimate(analytic, coarse_start, symbol_len, symbol_len, sample_rate)
 }
 
 /// Remove a carrier frequency offset of `cfo_hz` from a real passband signal (de-rotate the
@@ -373,7 +386,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Newman-phase in-band preamble tests (Phase 1 Task 2; see
-    // docs/superpowers/plans/2026-07-03-phase1-radio-reality.md)
+    // `docs/adr/003-phase1-waveform-break.md`, decision 2)
     // -----------------------------------------------------------------------
 
     #[test]

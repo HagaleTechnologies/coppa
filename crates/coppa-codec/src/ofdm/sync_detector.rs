@@ -17,10 +17,8 @@
 //!   protected header's channel estimate; Task 5 originally anchored on the
 //!   first arrival unconditionally, which is what this ADR corrects).
 //!
-//! See `docs/superpowers/plans/2026-07-03-phase1-radio-reality.md` Task 5 (or its
-//! successor Phase-2 rate-loop plan) for the original design rationale and locked
-//! algorithm, and `docs/adr/004-strongest-path-timing.md` for the timing-anchor
-//! correction on top of it.
+//! See `docs/adr/004-strongest-path-timing.md` for the timing-anchor
+//! correction applied on top of the original Phase 1 Task 5 locked algorithm.
 //!
 //! # Two front ends
 //!
@@ -74,8 +72,11 @@ const PREFILTER_DECIMATION: NonZeroUsize = match NonZeroUsize::new(4) {
 const PREFILTER_LO_HZ: f32 = 250.0;
 /// Upper edge (Hz) of the coarse-stage band-pass (see `PREFILTER_LO_HZ`).
 const PREFILTER_HI_HZ: f32 = 2850.0;
-/// Confirmation cross-correlation threshold: rejects steady tones and other
-/// non-preamble self-similar signals (measured tone-vs-Newman-comb xcorr <= ~0.1).
+/// Fine wrap ±Δ/2 plus four steps each way covers ±4.5Δ:
+/// ±171.4 Hz on HF, ±195.7 Hz short-CP, ±211.8 Hz VHF.
+const CFO_HYPOTHESIS_STEPS: i32 = 4;
+
+/// Confirmation threshold, rejecting tones and non-preamble self-similar signals.
 const CONFIRM_THRESHOLD: f32 = 0.25;
 /// First-path local-peak acceptance fraction of the window's global xcorr max.
 /// Only used to compute the FALLBACK anchor when the strongest tap is too far
@@ -184,9 +185,9 @@ pub struct SyncDetector {
     in_plateau: bool,
     plateau_best_m: f32,
     plateau_best_d: u64,
-    /// Two-stage CFO estimate captured at `plateau_best_d`'s analytic window (see
-    /// `estimate_cfo_from_ring`); carried through to the resolved `SyncCandidate`.
-    plateau_best_cfo: f32,
+    /// Wrapped fine CFO estimate captured at `plateau_best_d`'s analytic window (see
+    /// `estimate_fine_from_ring`); disambiguated during confirmation.
+    plateau_best_fine: f32,
 
     /// Raw (real) sample history, needed for the confirm/first-path steps
     /// (which correlate against the real-valued cached preamble).
@@ -198,7 +199,7 @@ pub struct SyncDetector {
 
     /// Coarse peak estimates (raw-domain) awaiting enough future samples to
     /// run the confirm + first-path refinement steps, paired with the
-    /// two-stage CFO estimate captured when each peak was recorded.
+    /// fine CFO estimate captured when each peak was recorded.
     pending: VecDeque<(u64, f32)>,
 
     /// Total raw samples ever pushed.
@@ -245,7 +246,7 @@ impl SyncDetector {
             in_plateau: false,
             plateau_best_m: 0.0,
             plateau_best_d: 0,
-            plateau_best_cfo: 0.0,
+            plateau_best_fine: 0.0,
             history: VecDeque::with_capacity(retain_samples as usize + 64),
             history_base: 0,
             retain_samples,
@@ -419,7 +420,7 @@ impl SyncDetector {
             if !self.in_plateau || m > self.plateau_best_m {
                 self.plateau_best_m = m;
                 self.plateau_best_d = self.d;
-                self.plateau_best_cfo = self.estimate_cfo_from_ring();
+                self.plateau_best_fine = self.estimate_fine_from_ring();
             }
             self.in_plateau = true;
         } else if self.in_plateau {
@@ -434,28 +435,27 @@ impl SyncDetector {
             let coarse_peak = (self.plateau_best_d.saturating_sub(GROUP_DELAY)
                 * self.coarse.decimation)
                 .saturating_sub(self.coarse.prefilter_delay);
-            let cfo_hz = self.plateau_best_cfo;
+            let cfo_hz = self.plateau_best_fine;
             if !self.try_resolve_one(coarse_peak, cfo_hz, out) {
                 self.pending.push_back((coarse_peak, cfo_hz));
             }
         }
     }
 
-    /// Two-stage CFO estimate (`estimate_cfo_two_stage`) from the ring's CURRENT
+    /// Fine CFO estimate (`estimate_cfo_fine`) from the ring's CURRENT
     /// contents. Whenever `evaluate_metric` runs, `self.ring` holds exactly
     /// `2*coarse.lag` analytic samples spanning the window `[self.d, self.d+2*coarse.lag)`
     /// (see the recurrence comment in `ingest_analytic_sample`), which is exactly the
-    /// analytic window `estimate_cfo_two_stage` needs for `coarse_start = 0`. The
+    /// analytic window `estimate_cfo_fine` needs for `coarse_start = 0`. The
     /// coarse stage's FFT size, cyclic prefix and sample rate all scale by the
     /// same decimation factor, so the bin spacing and the estimate's ambiguity
     /// step are the same as at the full rate.
-    fn estimate_cfo_from_ring(&self) -> f32 {
+    fn estimate_fine_from_ring(&self) -> f32 {
         let window: Vec<Complex32> = self.ring.iter().copied().collect();
-        super::sync::estimate_cfo_two_stage(
+        super::sync::estimate_cfo_fine(
             &window,
             0,
-            self.coarse.fft_size,
-            self.coarse.cp_samples,
+            self.coarse.fft_size + self.coarse.cp_samples,
             self.coarse.sample_rate,
         )
     }
@@ -479,15 +479,15 @@ impl SyncDetector {
     /// case nothing is pushed to `out`), or `false` if more future samples
     /// are still needed (caller should keep it pending).
     ///
-    /// `cfo_hz` is the two-stage CFO estimate captured at this peak (see
-    /// `estimate_cfo_from_ring`); per the locked order (coarse peak -> CFO
+    /// `fine_hz` is the wrapped fine CFO estimate captured at this peak (see
+    /// `estimate_fine_from_ring`); per the locked order (coarse peak -> CFO
     /// estimate -> derotate -> confirm/refine), the confirmation window is
-    /// derotated by it BEFORE correlating against the (CFO-free) cached
+    /// derotated by each integer-step hypothesis BEFORE correlating against the cached
     /// reference preamble, so a real mistune doesn't rot the confirm xcorr.
     fn try_resolve_one(
         &mut self,
         coarse_peak: u64,
-        cfo_hz: f32,
+        fine_hz: f32,
         out: &mut Vec<SyncCandidate>,
     ) -> bool {
         let cp = self.profile.cp_samples as u64;
@@ -520,27 +520,43 @@ impl SyncDetector {
         // the convention `remove_cfo` uses when the modem later de-rotates the WHOLE
         // buffer once with this same `cfo_hz` — a window-local origin would leave an
         // arbitrary residual phase that a constant per-window offset can't correct.
-        let derotated = derotate_window(&raw_window, lo, cfo_hz, self.profile.sample_rate as f32);
-
+        let analytic = super::sync::analytic_signal(&raw_window);
+        let delta =
+            self.coarse.sample_rate / (self.coarse.fft_size + self.coarse.cp_samples) as f32;
         let n_positions = (hi - lo + 1) as usize;
-        let mut xcorr = Vec::with_capacity(n_positions);
         let mut best = 0.0f32;
         let mut best_idx = 0usize;
-        for d in lo..=hi {
-            let start = (d - lo) as usize;
-            let mut corr = 0.0f32;
-            let mut sig_e = 0.0f32;
-            for (i, &r) in self.reference.iter().enumerate() {
-                let s = derotated[start + i];
-                corr += s * r;
-                sig_e += s * s;
+        let mut best_j = 0i32;
+        let mut cfo_hz = fine_hz;
+        let mut xcorr = Vec::new();
+        for j in -CFO_HYPOTHESIS_STEPS..=CFO_HYPOTHESIS_STEPS {
+            let hypothesis = fine_hz + j as f32 * delta;
+            let derotated =
+                derotate_window(&analytic, lo, hypothesis, self.profile.sample_rate as f32);
+            let mut scores = Vec::with_capacity(n_positions);
+            let mut peak = 0.0f32;
+            let mut peak_idx = 0;
+            for start in 0..n_positions {
+                let mut corr = 0.0f32;
+                let mut sig_e = 0.0f32;
+                for (i, &r) in self.reference.iter().enumerate() {
+                    let s = derotated[start + i];
+                    corr += s * r;
+                    sig_e += s * s;
+                }
+                let nc = corr.abs() / (self.ref_energy * sig_e).sqrt().max(1e-20);
+                scores.push(nc);
+                if nc > peak {
+                    peak = nc;
+                    peak_idx = start;
+                }
             }
-            let denom = (self.ref_energy * sig_e).sqrt().max(1e-20);
-            let nc = corr.abs() / denom;
-            xcorr.push(nc);
-            if nc > best {
-                best = nc;
-                best_idx = start;
+            if peak > best + 1e-6 || ((peak - best).abs() <= 1e-6 && j.abs() < best_j.abs()) {
+                best = peak;
+                best_idx = peak_idx;
+                best_j = j;
+                cfo_hz = hypothesis;
+                xcorr = scores;
             }
         }
 
@@ -559,8 +575,7 @@ impl SyncDetector {
         // than anchoring at a possibly-much-weaker first arrival does — measured directly
         // to cut Watterson-Moderate/Poor header decode failures on `hf_standard` levels
         // 1-2 from a hard ~30% FER floor back to matching (or beating) pre-Phase-1
-        // levels, with real but smaller/partial gains for levels 3-4 (see
-        // `.superpowers/sdd/p1-fading-regression-fix-report.md` for the full numbers),
+        // levels, with real but smaller/partial gains for levels 3-4,
         // and zero AWGN cost (a single dominant path, where the two anchors coincide).
         // The `cp/2` bound preserves the original first-path SAFETY intent
         // (never anchor on a late, dominant echo that could carry the FFT window
@@ -622,16 +637,16 @@ struct CoarseStage {
     stride: u64,
 }
 
-/// De-rotate a real-valued window by `e^{-j*2*pi*cfo_hz*t/sample_rate}` (converting to
-/// analytic first, as `sync::remove_cfo` does), using `t = abs_start + i` — the ABSOLUTE
-/// sample index — as the phase origin, not a window-local `i` starting at 0. `samples[0]`
+/// De-rotate an analytic window by `e^{-j*2*pi*cfo_hz*t/sample_rate}` (as `sync::remove_cfo` does), using `t = abs_start + i` — the ABSOLUTE
+/// sample index — as the phase origin, not a window-local `i` starting at 0. `analytic[0]`
 /// is sample `abs_start` of the overall stream.
-fn derotate_window(samples: &[f32], abs_start: u64, cfo_hz: f32, sample_rate: f32) -> Vec<f32> {
+fn derotate_window(
+    analytic: &[Complex32],
+    abs_start: u64,
+    cfo_hz: f32,
+    sample_rate: f32,
+) -> Vec<f32> {
     use std::f32::consts::TAU;
-    if cfo_hz == 0.0 {
-        return samples.to_vec();
-    }
-    let analytic = super::sync::analytic_signal(samples);
     analytic
         .iter()
         .enumerate()
@@ -884,8 +899,7 @@ mod tests {
     /// protected header's sparse-pilot (4-pilot `hf_standard`) 2D channel estimate
     /// badly enough to floor FER at ~30% regardless of SNR (level 1, BPSK 1/4), while
     /// anchoring on the strongest tap restores the pre-Phase-1 ~2-5% FER there. Levels
-    /// 3-4 recover most but not all of the gap (see
-    /// `.superpowers/sdd/p1-fading-regression-fix-report.md`). The two anchors coincide
+    /// 3-4 recover most but not all of the gap. The two anchors coincide
     /// (no behavior change at all) whenever one tap dominates, which is why AWGN
     /// and the VHF (denser-pilot) levels were and remain unaffected.
     #[test]
@@ -1130,6 +1144,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn check_distant_cfo(prefiltered: bool, offsets: &[f32]) {
+        let profile = CoppaProfile::hf_standard();
+        let (_, clean) = leading_clean_frame(&profile);
+        for &off in offsets {
+            let shifted = coppa_channel::frequency_shift(&clean, off, 48_000.0);
+            let noisy = coppa_channel::awgn_seeded(&shifted, 20.0, 0xBEEF);
+            let mut detector = if prefiltered {
+                SyncDetector::new_prefiltered(profile.clone(), 1)
+            } else {
+                SyncDetector::new(profile.clone(), 1)
+            };
+            let candidates = push_chunked(&mut detector, &noisy, 512);
+            eprintln!("prefiltered={prefiltered} CFO {off}: {candidates:?}");
+            assert_eq!(candidates.len(), 1, "CFO {off}: {candidates:?}");
+            assert!(
+                (candidates[0].cfo_hz - off).abs() <= 2.0,
+                "CFO {off}: {candidates:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn detector_resolves_distant_cfo_estimates() {
+        check_distant_cfo(false, &[-150.0, -100.0, -60.0, 60.0, 100.0, 150.0]);
+    }
+
+    #[test]
+    fn prefiltered_detector_resolves_distant_cfo() {
+        check_distant_cfo(true, &[-150.0, -100.0, -60.0, 150.0]);
+        // Non-gating band-edge measurement: narrow loses its lowest carriers
+        // at -150 Hz through the fixed 250 Hz prefilter edge.
+        let profile = CoppaProfile::hf_narrow();
+        let (_, clean) = leading_clean_frame(&profile);
+        let shifted = coppa_channel::frequency_shift(&clean, -150.0, 48_000.0);
+        let noisy = coppa_channel::awgn_seeded(&shifted, 20.0, 0xBEEF);
+        let candidates = push_chunked(&mut SyncDetector::new_prefiltered(profile, 1), &noisy, 512);
+        eprintln!("hf_narrow prefiltered CFO -150: {candidates:?}");
     }
 
     #[test]

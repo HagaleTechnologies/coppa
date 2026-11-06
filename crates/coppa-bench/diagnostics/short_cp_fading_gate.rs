@@ -6,12 +6,11 @@
 //! FER *and* goodput per profile variant, since hf_standard_short_cp costs
 //! ~12% less airtime regardless of any FER effect.
 //!
-//! Phase 1 of the coherence-time lever investigated in
-//! docs/superpowers/specs/2026-07-19-short-cp-fading-coherence-design.md,
-//! following the fading-root-cause investigation (BENCHMARKS.md's "Fading
-//! root-cause investigation" section) that found Watterson-Moderate/Poor's
-//! real Doppler coherence time is much shorter than a frame -- this bench
-//! measures whether hf_standard_short_cp's shorter frame duration helps.
+//! Phase 1 of the coherence-time lever, following the fading-root-cause
+//! investigation (BENCHMARKS.md's "Fading root-cause investigation" section)
+//! that found Watterson-Moderate/Poor's real Doppler coherence time is much
+//! shorter than a frame -- this bench measures whether hf_standard_short_cp's
+//! shorter frame duration helps.
 //!
 //! 400 trials per SNR point, -6..30 dB step 3, seed 0x00C0FFEE, levels 2/4,
 //! channels awgn/watterson-moderate/watterson-poor. Writes CSV to

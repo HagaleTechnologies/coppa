@@ -356,9 +356,8 @@ updated framing.
 
 docs/LIMITATIONS.md's `RateLoop` known-limitation bullet root-causes its unmet acceptance bar to
 `coppa_ml::channel_capacity` possibly "not being invariant to which speed level a measured frame
-happened to use" — a hypothesis that was, until now, an informal, uncommitted diagnostic (see
-`docs/superpowers/specs/2026-07-20-rateloop-capacity-metric-bias-diagnosis-design.md` for the full
-design rationale). This entry is that diagnostic, committed and run for real:
+happened to use" — a hypothesis that was, until now, an informal, uncommitted diagnostic. This
+entry is that diagnostic, committed and run for real:
 `cargo run -p coppa-bench --release --example capacity_metric_level_bias` sounds *every* real
 speed level (1-7, 9-10 — level 8 is not a defined mode) — not just `mcs_calibration.rs`'s fixed
 level-2 probe — against AWGN and Watterson Good/Moderate/Poor, at 5 SNR points (6/12/18/24/30 dB),
@@ -633,9 +632,9 @@ One nuance worth flagging for whoever picks up Phase 2: `CpGate` (`crates/coppa-
 
 Reproduce: `cargo run -p coppa-bench --release --example short_cp_fading_gate` (~46 min wall-clock for the full 2×3×2×13×400 sweep on a 10-core Apple Silicon machine, single-threaded).
 
-**2026-07-25 — `CpGate` daemon wiring, SHIPPED (measurement/telemetry only).** Following this section's own recommendation, `CpGate`'s recommendation is now wired into `coppa-daemon`: every fully decoded frame's measured delay spread (`DelayDomainEstimator::delay_spread_ms`, threaded out of `CoppaModem::demodulate_frame` through `StreamFrame::delay_spread_ms`) feeds a live `CpGate` instance, gated off by default behind a new `[engine] cp_gate_enabled` config flag, with the current recommendation exposed on the WebSocket `status` reply's new `short_cp_ok` field. Two judgment calls from this section's own open nuance were resolved (not silently picked): (1) wired **as-is on delay spread**, not paired with a new Doppler-rate signal — no such signal exists anywhere in this codebase today, and building one is a materially larger, undesigned scope addition, deliberately deferred; (2) **does not implement automatic CP-profile switching** — investigation found CP length, unlike speed level, is not in-band/receiver-transparent (`StreamingReceiver`'s `SyncDetector` needs `cp_samples` to even locate the header, so a receiver built for one CP length cannot self-detect a sender that silently switches to the other), and no peer-negotiation handshake exists to resolve that chicken-and-egg problem safely. Both are recorded as explicit, deliberate scope cuts, not oversights — see `docs/superpowers/specs/2026-07-25-cpgate-daemon-wiring-design.md` for the full reasoning and the concrete follow-up work (a peer-negotiation handshake, and re-evaluating the Doppler-rate question against real telemetry from this wiring) this used to leave open.
+**2026-07-25 — `CpGate` daemon wiring, SHIPPED (measurement/telemetry only).** Following this section's own recommendation, `CpGate`'s recommendation is now wired into `coppa-daemon`: every fully decoded frame's measured delay spread (`DelayDomainEstimator::delay_spread_ms`, threaded out of `CoppaModem::demodulate_frame` through `StreamFrame::delay_spread_ms`) feeds a live `CpGate` instance, gated off by default behind a new `[engine] cp_gate_enabled` config flag, with the current recommendation exposed on the WebSocket `status` reply's new `short_cp_ok` field. Two judgment calls from this section's own open nuance were resolved (not silently picked): (1) wired **as-is on delay spread**, not paired with a new Doppler-rate signal — no such signal exists anywhere in this codebase today, and building one is a materially larger, undesigned scope addition, deliberately deferred; (2) **does not implement automatic CP-profile switching** — investigation found CP length, unlike speed level, is not in-band/receiver-transparent (`StreamingReceiver`'s `SyncDetector` needs `cp_samples` to even locate the header, so a receiver built for one CP length cannot self-detect a sender that silently switches to the other), and no peer-negotiation handshake exists to resolve that chicken-and-egg problem safely. Both are recorded as explicit, deliberate scope cuts, not oversights.
 
-**UPDATE (2026-07-29): the peer-negotiation handshake is now shipped.** `coppa_protocol::cp_negotiator` implements a receiver-initiated propose/confirm handshake (`CpNegotiator`), wired into `coppa-daemon` behind its own `cp_negotiation_enabled` flag (off by default, independent of `cp_gate_enabled`), resolving the chicken-and-egg problem flagged above by having both stations explicitly agree before either one switches. The Doppler-rate question is still open and untouched by this work. Building the handshake surfaced a real handshake-deadlock bug, found only by driving the integration test through the real `decode_and_dispatch_audio` path instead of lower-level primitives: the confirming station was rebuilding its own transmitter *and* receiver onto the new CP profile before sending its bare ack, so the peer waiting on that exact ack (proof its Confirm was delivered) was still listening on the old profile and could never decode it. Fixed by sending the ack first, then switching (commit `e59bf56`). See `docs/superpowers/specs/2026-07-29-cp-switch-peer-negotiation-design.md`.
+**UPDATE (2026-07-29): the peer-negotiation handshake is now shipped.** `coppa_protocol::cp_negotiator` implements a receiver-initiated propose/confirm handshake (`CpNegotiator`), wired into `coppa-daemon` behind its own `cp_negotiation_enabled` flag (off by default, independent of `cp_gate_enabled`), resolving the chicken-and-egg problem flagged above by having both stations explicitly agree before either one switches. The Doppler-rate question is still open and untouched by this work. Building the handshake surfaced a real handshake-deadlock bug, found only by driving the integration test through the real `decode_and_dispatch_audio` path instead of lower-level primitives: the confirming station was rebuilding its own transmitter *and* receiver onto the new CP profile before sending its bare ack, so the peer waiting on that exact ack (proof its Confirm was delivered) was still listening on the old profile and could never decode it. Fixed by sending the ack first, then switching (commit `e59bf56`).
 
 ## 2026-07 — Fading root-cause investigation: the coarse-delay-reference theory falsified
 
@@ -671,9 +670,8 @@ Reproduce: `cargo run -p coppa-bench --release --example drift_estimate_quality_
 
 ## 2026-07 — Cascaded coarse-delay drift + AR(1) tap tracker (measured, gate NOT met, shipped disabled — third and final attempt in this line)
 
-`docs/superpowers/specs/2026-07-18-cascaded-drift-tracker-design.md` proposed a third architecture
-for the still-open Watterson-Moderate/level 2 coarse-delay-drift regression documented in
-docs/LIMITATIONS.md: a Cascaded payload path
+A third architecture was proposed for the still-open Watterson-Moderate/level 2
+coarse-delay-drift regression documented in docs/LIMITATIONS.md: a Cascaded payload path
 (`crate::ofdm::coppa_modem::CoppaModem::equalize_payload_cascaded`, `DRIFT_CASCADE_ENABLED`
 toggle) combining `drift_tracker::DriftTracker`'s per-window coarse-delay tracking with the AR(1)
 `KalmanLagSmoother` tap-amplitude tracker, instead of `equalize_payload_drift_tracked`'s fresh
@@ -739,15 +737,14 @@ without any of these three tracker variants contributing anything positive to th
 metric.
 
 Reproduce: `cargo run -p coppa-bench --release --example drift_cascade_gate` (toggle
-`DRIFT_CASCADE_ENABLED` in `coppa_modem.rs` to select which path is measured). Full report:
-`.superpowers/sdd/task-4-report.md`.
+`DRIFT_CASCADE_ENABLED` in `coppa_modem.rs` to select which path is measured).
 
 ## 2026-07 — Coarse-delay drift Kalman tracker (Task 5: measured, gate NOT met, shipped disabled)
 
-`docs/superpowers/specs/2026-07-17-coarse-delay-drift-tracker-design.md` proposed a second,
-independent Kalman tracker (`crate::ofdm::drift_tracker::DriftTracker`, 2-state `[τ, τ̇]`
+A second, independent Kalman tracker
+(`crate::ofdm::drift_tracker::DriftTracker`, 2-state `[τ, τ̇]`
 integrated-random-walk model, `coppa_modem.rs`'s `DRIFT_TRACKER_ENABLED` payload-pass toggle)
-aimed at the still-open Phase 2 Task 1/7 coarse-delay-reference-drift regression documented in
+was proposed, aimed at the still-open Phase 2 Task 1/7 coarse-delay-reference-drift regression documented in
 docs/LIMITATIONS.md (Task 7's AR(1) tap-amplitude Kalman tracker measured
 Watterson-Moderate/level 2 FER≤10% at 30.0 dB in isolated testing, worse than both the
 pre-Phase-2 18.0 dB baseline and Task 1's own 24.0 dB). This task (Task 5) ran the design's own
@@ -853,8 +850,7 @@ above, which measured the same 18.0 dB and closes out this line of investigation
 final attempt.
 
 Reproduce: `cargo run -p coppa-bench --release --example drift_tracker_gate` (toggle
-`DRIFT_TRACKER_ENABLED` in `coppa_modem.rs` to select which path is measured). Full report:
-`.superpowers/sdd/task-5-report.md`.
+`DRIFT_TRACKER_ENABLED` in `coppa_modem.rs` to select which path is measured).
 
 ## 2026-07 — Phase 4 (field readiness): what changed vs. the 2026-07-03 world-class analysis
 
@@ -973,9 +969,8 @@ dispatch instructions as an explicit, named check, not just a features-enabled o
 Task 8 built three new benchmark-program deliverables (decision 9): a MIL-STD-188-110-style
 operating-point ladder (`milstd`), a simulated-session ARQ-robustness bench (`session`), and a
 frozen golden-vector corpus (20 WAVs + manifest, CI-checked). All three surfaced real, honestly
-measured results rather than curve-fit passes — see
-`.superpowers/sdd/task-8-report.md` for the full (twice-corrected) investigation this section
-condenses.
+measured results rather than curve-fit passes; this section condenses the full (twice-corrected)
+investigation.
 
 ### `milstd`: 0/27 operating points pass (not a bug — a calibration mismatch)
 
@@ -1255,9 +1250,9 @@ issue already tracked as open in this document's "Known Limitations" (see
 docs/LIMITATIONS.md); it is **not** a bug in `RateLoop`'s hysteresis logic itself, and
 fixing the underlying metric is out of this task's scope (it belongs to the
 channel-estimation / MCS-calibration layer, not the rate-loop controller). See
-`crates/coppa-bench/diagnostics/closed_loop_arq.rs`'s module doc and
-`.superpowers/sdd/task-4-report.md` for the full investigation, including two
-unrelated real bugs found and fixed in the bench itself along the way (a
+`crates/coppa-bench/diagnostics/closed_loop_arq.rs`'s module doc for a summary of the
+capacity-bias hypothesis and its caveats. Two unrelated real bugs were found
+and fixed in the bench itself along the way (a
 constant `seq_num` corrupting IR-HARQ's per-seq accumulator across
 logically-independent simulated frames, and a shared transceiver risking the
 same cross-contamination across fixed-level runs).
@@ -1503,8 +1498,7 @@ know about or correct for — plausibly compounding with level 4's already-tight
 further here.
 
 **UPDATE (2026-07-08): this speculated mechanism was confirmed correct, and the floor is
-FIXED.** A follow-up investigation (`.superpowers/sdd/p2-cfo-level4-investigation-report.md`)
-directly measured the mechanism above rather than leaving it speculative: a nonzero CFO induces
+FIXED.** A follow-up investigation directly measured the mechanism above rather than leaving it speculative: a nonzero CFO induces
 several-sample sync-timing jitter in `SyncDetector`'s strongest-path `frame_start` (worst
 observed `|delta|` from `calibrated_bias` ≈ 0.36 grid units, at CFO=39/39.5 Hz — exactly the
 worst-FER CFO values), which the single frame-global `calibrated_bias` cannot represent; the
@@ -1513,9 +1507,9 @@ input LLRs identically at every level, and level 4's tight rate-3/4 margin is th
 convergence outright (confirmed deterministic: near-identical fitted taps/`noise_var` across 10
 independent seeds at the same CFO — not an SNR effect, which is why more SNR never helped).
 CFO estimation itself, turbo re-estimation, and LDPC alpha/iteration tuning were all directly
-ruled out as the cause (see the investigation report).
+ruled out as the cause.
 
-The fix (`.superpowers/sdd/p2-cfo-level4-fix-report.md`, commit `5e7ba93`) adds
+The fix (commit `5e7ba93`) adds
 `CoppaModem::bounded_coarse_delay`, which clamps the per-frame coarse-delay correction to
 `±COARSE_DELAY_JITTER_BOUND = 0.15` grid units instead of trusting the raw per-frame estimate —
 small enough that it cannot reach the multi-grid-unit swings a real two-tap Watterson channel
@@ -2069,8 +2063,7 @@ correction budget is 3 per 24-bit word); strongest-path anchoring on the *same* 
 signal, channel draw, and noise produces 6 of 144 — decodable. Two other hypotheses (RC-overlap
 smearing the header's OFDM symbols; Cartesian pilot-interpolation phase-wrap aliasing) were
 implemented and bench-tested, and both were ruled out — see
-`docs/adr/004-strongest-path-timing.md` for the full investigation and
-`.superpowers/sdd/p1-fading-regression-fix-report.md` for the complete trail.
+`docs/adr/004-strongest-path-timing.md` for the full investigation and the complete trail.
 
 **Fix**: prefer the strongest correlation peak as the timing anchor, falling back to first-path
 only when the two are separated by more than half the cyclic prefix (150 samples on the
@@ -3295,6 +3288,34 @@ at 367, `L2_poor25` at 274). 300 s each of white noise, SSB-band noise and a
 1 kHz tone with noise gave no candidate from either front end. This is an
 AWGN simulation, with no Watterson sweep of the streaming path and no
 hardware or on-air result.
+
+### `--cfo ±150` sweep (AWGN + ±150 Hz carrier offset, level 2)
+
+COP-128, 2026-11-04. `hf_standard`, seed `0x00C0FFEE`, 20 trials per cell,
+3 kHz reference-band SNR. The hypothesis search is per-profile and independent
+of speed level; this table measures level 2 only. Reproduce each sign with:
+
+```sh
+cargo run --release -p coppa-bench -- --level 2 --profile standard --cfo 150 --trials 20 --snr-min 0 --snr-max 18 --snr-step 3 --out-dir /tmp/cop128-plus
+cargo run --release -p coppa-bench -- --level 2 --profile standard --cfo -150 --trials 20 --snr-min 0 --snr-max 18 --snr-step 3 --out-dir /tmp/cop128-minus
+```
+
+| SNR (dB) | +150 Hz errors/trials | −150 Hz errors/trials | +150 Hz goodput (bps) | −150 Hz goodput (bps) |
+|---|---|---|---|---|
+| 0.0 | 20/20 | 20/20 | 0.00 | 0.00 |
+| 3.0 | 5/20 | 5/20 | 514.29 | 514.29 |
+| 6.0 | 1/20 | 1/20 | 651.43 | 651.43 |
+| 9.0 | 0/20 | 1/20 | 685.71 | 651.43 |
+| 12.0 | 0/20 | 0/20 | 685.71 | 685.71 |
+| 15.0 | 0/20 | 0/20 | 685.71 | 685.71 |
+| 18.0 | 0/20 | 0/20 | 685.71 | 685.71 |
+
+All observed errors were sync failures. Wilson 95% FER intervals are
+[83.89%, 100%] for 20/20 errors, [11.19%, 46.87%] for 5/20,
+[0.89%, 23.61%] for 1/20 and [0%, 16.11%] for 0/20. Twenty trials
+cannot establish either a 10% or a 1% FER ceiling at 95% confidence.
+At 12 dB both signs decoded all 20 frames. The CI guard
+`waterfall_cfo150_level_2` allows at most one error per 20-trial sign.
 
 ## COP-133: Same-frame residual experiment
 

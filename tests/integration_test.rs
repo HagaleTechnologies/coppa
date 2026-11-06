@@ -117,16 +117,14 @@ fn test_clean_loopback_baseline() {
 }
 
 #[test]
-#[ignore = "OFDM sync has no CFO correction yet"]
 fn test_loopback_with_freq_offset() {
-    use coppa_channel::freq_offset;
+    use coppa_channel::frequency_shift;
 
     let core = CoppaCore::new();
     let message = "Freq test";
     let samples = core.encode(message).unwrap();
-    // Apply a real carrier frequency offset. This currently breaks OFDM
-    // preamble sync, so the test is #[ignore]d until CFO correction exists.
-    let shifted = freq_offset(&samples, 5.0, 48000.0, 1500.0);
+    // Shift the whole passband to exercise acquisition and CFO correction.
+    let shifted = frequency_shift(&samples, 5.0, 48_000.0);
     let decoded = core
         .decode(&shifted)
         .expect("Should decode with CFO correction");

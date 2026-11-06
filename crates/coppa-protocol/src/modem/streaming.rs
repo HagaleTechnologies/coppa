@@ -11,8 +11,7 @@
 //! that completes a candidate pays that full demod/FEC cost synchronously before
 //! returning (see that method's doc).
 //!
-//! State machine (locked, see `docs/superpowers/plans/2026-07-03-phase1-radio-reality.md`
-//! Task 7): `Searching` (represented here as `pending: None`) feeds every pushed
+//! State machine (locked since Phase 1 Task 7): `Searching` (represented here as `pending: None`) feeds every pushed
 //! sample to the `SyncDetector` and queues whatever candidates it confirms.
 //! `Accumulating { start, need }` (represented as `pending: Some(Pending { .. })`)
 //! buffers samples from a candidate's `frame_start` until `need` are available, in
@@ -103,8 +102,7 @@ pub struct DecodedFrame {
     /// This frame's measured multipath delay spread (ms), from
     /// `CoppaTransceiver::receive_with_metrics`'s 5th element (originally
     /// `DelayDomainEstimator::delay_spread_ms`, Task 6b). Feeds `coppa_ml::CpGate`'s
-    /// daemon wiring -- see `docs/superpowers/specs/
-    /// 2026-07-25-cpgate-daemon-wiring-design.md`.
+    /// daemon wiring.
     pub delay_spread_ms: f32,
 }
 
@@ -787,6 +785,25 @@ mod tests {
     /// discarded (header decode "failure") even though the full-frame path
     /// (reached only if the header peek succeeds) re-derives its own
     /// timing/CFO independently and would have decoded it fine.
+    #[test]
+    fn streaming_decodes_distant_cfo_offsets() {
+        let profile = CoppaProfile::hf_standard();
+        let tx = CoppaTransceiver::new(profile.clone(), 1);
+        let payload = vec![0xA7; 100];
+        let frame = make_frame(&tx, 2, &payload);
+        for off in [-150.0, 150.0] {
+            let shifted = coppa_channel::frequency_shift(&frame, off, 48_000.0);
+            let noisy = coppa_channel::awgn_seeded(&shifted, 12.0, 0xBEEF);
+            let mut stream = vec![0.0; 4 * (profile.fft_size + profile.cp_samples)];
+            stream.extend(noisy);
+            stream.extend(vec![0.0; 4 * (profile.fft_size + profile.cp_samples)]);
+            let mut rx = StreamingReceiver::new(profile.clone(), 1);
+            let decoded = rx.push_samples(&stream);
+            assert_eq!(decoded.len(), 1, "CFO {off}: no decoded frame");
+            assert_eq!(&decoded[0].payload[..payload.len()], &payload);
+        }
+    }
+
     #[test]
     fn streaming_decodes_a_frame_with_injected_cfo() {
         let profile = CoppaProfile::hf_standard();

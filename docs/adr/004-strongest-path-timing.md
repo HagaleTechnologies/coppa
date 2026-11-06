@@ -134,9 +134,8 @@ and amateur HF practice does not typically present at this modem's bandwidths.
   Poor) and very close for level 3 (within normal trial-to-trial variance). Level 4 (QPSK 3/4)
   improves substantially (peak goodput roughly 1.7-2x the broken state) but retains a real,
   smaller residual gap — 72-76% of pre-Phase-1 peak goodput, not full recovery — on both
-  channels. This is honestly a **partial** fix for level 4, not fully closed by this change; see
-  `.superpowers/sdd/p1-fading-regression-fix-report.md` for the full before/after sweep tables
-  and a discussion of why level 4 likely has a separate, smaller-scope contributing issue
+  channels. This is honestly a **partial** fix for level 4, not fully closed by this change; level 4
+  likely has a separate, smaller-scope contributing issue
   (plausibly QPSK's denser decision regions being more sensitive to residual channel-estimate
   imperfection than BPSK) not investigated further here.
 - AWGN performance (which Phase 1's Task 4 RX bandpass improved) is unaffected by this change —
@@ -153,7 +152,3 @@ and amateur HF practice does not typically present at this modem's bandwidths.
 ## Related
 
 - `docs/adr/003-phase1-waveform-break.md` — the phase this corrects a defect in.
-- `docs/superpowers/plans/2026-07-03-phase1-radio-reality.md` — Task 5's original plan and
-  rationale.
-- `.superpowers/sdd/p1-fading-regression-fix-report.md` — full bisection data, root-cause
-  verification, and before/after benchmark tables for this fix.

@@ -1631,8 +1631,12 @@ The reference daemon sends `dest = src = ` its own callsign, `ssid = 0`,
 (§16.1). A receiver decodes it as above. An empty payload, a payload that
 ends before the `grid_len` byte or before the `level` byte, and invalid
 UTF-8 are errors; bytes after `level` are ignored (`StationIdPayload::from_bytes`,
-`mac.rs:331`). The reference receiver only logs a received beacon
-(`handle_beacon_rx`, `event_loop.rs:6278`); it changes no state.
+`mac.rs:331`). The reference receiver decodes a received beacon
+(`handle_beacon_rx`, `event_loop.rs:6431`) and records the station -- callsign,
+grid, level, SNR and the time heard -- in its 32-entry heard list, with no
+session or state-machine effect (a beacon is not directed at the receiving
+station). A beacon whose payload fails to decode is recorded under its MAC
+source callsign.
 
 ### 17.6 Parse rules and receiver tolerance
 
@@ -2178,3 +2182,45 @@ Each row states which parser it describes and what the reference returns.
 | N06 | transport `type` 6 | 7 | `06000000000000` | transport parse fails, `UnknownTransportType { value: 6 }` |
 | N07 | 6-byte transport input | 6 | `010000000000` | transport parse fails, `TransportPduTooShort` |
 | N08 | P08 with SSID byte `f3` | 14 | `175dc05700000058b781083000f3` | MAC parse succeeds, `Keepalive`, `ssid` 3 (§17.6) |
+
+### Broadcast file application
+
+COP-124 file broadcasts use unchanged MAC Datagram frames and complete
+AppPDUs. The canonical four-byte AppPdu header is `30 00 00 01` in hex:
+FileTransfer, no compression, Complete, ID/index zero and total one.
+Application fragmentation fields do not group file chunks.
+
+The inner header repeats in every packet. All integers are big-endian:
+
+| Field | Bytes |
+|---|---:|
+| Magic ASCII CPBF | 4 |
+| Version, currently 1 | 1 |
+| Complete content CRC64 | 8 |
+| Complete file length | 4 |
+| Zero-based chunk index | 2 |
+| Chunk count | 2 |
+| Chunk data | 0 to 384 |
+
+Files are bounded to 1048576 bytes. Count is max(1, ceil(length/384)).
+All chunks except the last have exactly 384 bytes; the last has the
+remaining bytes. An empty file has one empty chunk. Maximum AppPdu size
+is 409 bytes, below the level-1 KISS capacity of 434. No filename is sent.
+
+CRC-64/ECMA-182 has polynomial 0x42F0E1EBA9EA3693, init 0, xorout 0,
+refin false and refout false. It covers the complete content in file order
+and is both transfer identity and final integrity check. It is not
+authentication. The fixed packet for ASCII `123456789` is:
+
+```text
+30 00 00 01 43 50 42 46 01 6c 40 df 5f 0b 49 73 47
+00 00 00 09 00 00 00 01 31 32 33 34 35 36 37 38 39
+```
+
+Receivers validate the wrapper, version, file bound, derived count, index
+and exact data length before allocating or selecting a transfer. They
+retain one file and its bitmap, ignore other identities and identical
+duplicates, and reject conflicting duplicates without replacing data.
+They emit a file once, only after all chunks and the complete CRC match.
+No response is transmitted. Finite repeated copies repair loss only if
+enough chunks remain on air. See [BROADCAST.md](BROADCAST.md) for operation.

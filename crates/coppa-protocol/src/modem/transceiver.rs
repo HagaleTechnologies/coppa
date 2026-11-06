@@ -992,8 +992,7 @@ impl CoppaTransceiver {
     /// for the streaming/daemon path to feed back on an outgoing ACK -- see
     /// `DecodedFrame::recommended_level` -- and this frame's measured delay spread
     /// (ms), for `coppa_ml::CpGate`'s daemon wiring -- see `DecodedFrame::
-    /// delay_spread_ms` and `docs/superpowers/specs/
-    /// 2026-07-25-cpgate-daemon-wiring-design.md`.
+    /// delay_spread_ms`.
     pub fn receive_with_metrics(
         &self,
         samples: &[f32],
@@ -1030,8 +1029,7 @@ impl CoppaTransceiver {
         // 1. Demodulate to soft symbols (coded symbol count derived from header speed level
         // AND, since Phase 3 Task 5, header.codewords -- see `CoppaModem::demodulate_frame`'s
         // doc for the multi-codeword symbol-count change). `delay_spread_ms` is this frame's
-        // measured multipath delay spread (`coppa_ml::CpGate`'s daemon wiring input -- see
-        // `docs/superpowers/specs/2026-07-25-cpgate-daemon-wiring-design.md`), captured here
+        // measured multipath delay spread (`coppa_ml::CpGate`'s daemon wiring input), captured here
         // (before the codeword dispatch below) and reattached to whichever result that
         // dispatch produces, since neither `receive_single_codeword` nor
         // `receive_multi_codeword` need to know about it.
@@ -2056,6 +2054,27 @@ mod tests {
             .receive(&samples)
             .expect("exact-max payload should round-trip");
         assert_eq!(&rx[..payload.len()], payload.as_slice());
+    }
+
+    #[test]
+    fn loopback_decodes_distant_cfo_offsets() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let payload = vec![0xA7; 100];
+        let samples = tx.transmit(&make_header(2, 100), &payload).unwrap();
+        for off in [-150.0, -100.0, -60.0, 60.0, 100.0, 150.0] {
+            for noisy in [false, true] {
+                let shifted = coppa_channel::frequency_shift(&samples, off, 48_000.0);
+                let input = if noisy {
+                    coppa_channel::awgn_seeded(&shifted, 12.0, 0xBEEF)
+                } else {
+                    shifted
+                };
+                let (_, decoded, _) = tx
+                    .receive(&input)
+                    .unwrap_or_else(|e| panic!("CFO {off}, noisy {noisy}: {e:?}"));
+                assert_eq!(&decoded[..payload.len()], &payload);
+            }
+        }
     }
 
     #[test]
