@@ -578,9 +578,6 @@
       "visibility": "public"
     },
     {
-<<<<<<< HEAD
-      "hash": "sha256:dac783ef22958480dba0c921ccab69b90dcb440ff6b46019c29afeca451e953d",
-=======
       "hash": "sha256:5f0af1acfa7a3e56172b9ddf44112b09d4c2af3b27927c0641fe3b2a3dd773cc",
       "id": "session-fade-protection",
       "kind": "gotcha",
@@ -603,8 +600,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:b352ed5416cfb4361ca06c059b10fc089ffed56f1474c9857b8e9cc1d588c949",
->>>>>>> 5d2321133c35e5789a472fb90d83db5a11abd428
+      "hash": "sha256:dac783ef22958480dba0c921ccab69b90dcb440ff6b46019c29afeca451e953d",
       "id": "tnc-direwolf-benchmark",
       "kind": "gotcha",
       "links": [
