@@ -80,6 +80,7 @@ pub use error::CodecError;
 
 pub mod afsk;
 pub mod bpsk;
+mod fx25;
 pub mod g3ruh;
 mod hdlc;
 pub mod ofdm;
