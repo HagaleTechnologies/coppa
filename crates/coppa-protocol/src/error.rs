@@ -4,6 +4,12 @@
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProtocolError {
+    /// Invalid outer-code packet header or length.
+    #[error("Malformed outer-code packet")]
+    MalformedOuterPacket,
+    /// CONNECT_CFM did not confirm the outer-code intersection.
+    #[error("Outer-code capabilities do not match negotiation")]
+    OuterCodeMismatch,
     /// Unknown MAC frame type.
     #[error("Unknown MAC frame type: {value}")]
     UnknownMacFrameType {

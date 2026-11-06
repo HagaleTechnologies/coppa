@@ -43,6 +43,9 @@ pub enum MacFrameType {
     Relay = 8,
     /// Connectionless datagram from a KISS host, broadcast to every station (COP-138).
     Datagram = 9,
+    /// RS(12,6) session shard, negotiated by CONNECT flags bits 2 and 3
+    /// (COP-119). Nibble 10, since COP-138 took 9 for `Datagram`.
+    OuterData = 10,
 }
 
 impl MacFrameType {
@@ -59,6 +62,7 @@ impl MacFrameType {
             7 => Ok(MacFrameType::Keepalive),
             8 => Ok(MacFrameType::Relay),
             9 => Ok(MacFrameType::Datagram),
+            10 => Ok(MacFrameType::OuterData),
             v => Err(ProtocolError::UnknownMacFrameType { value: v }),
         }
     }
@@ -399,8 +403,8 @@ mod tests {
     fn datagram_frame_type_is_nibble_9() {
         assert_eq!(MacFrameType::from_u8(9).unwrap(), MacFrameType::Datagram);
         assert!(matches!(
-            MacFrameType::from_u8(10),
-            Err(ProtocolError::UnknownMacFrameType { value: 10 })
+            MacFrameType::from_u8(11),
+            Err(ProtocolError::UnknownMacFrameType { value: 11 })
         ));
     }
 
@@ -533,6 +537,7 @@ mod tests {
             MacFrameType::Beacon,
             MacFrameType::Keepalive,
             MacFrameType::Relay,
+            MacFrameType::OuterData,
         ];
         for &ft in &types {
             let val = ft as u8;
@@ -544,8 +549,8 @@ mod tests {
     #[test]
     fn test_frame_type_invalid() {
         assert!(matches!(
-            MacFrameType::from_u8(10),
-            Err(ProtocolError::UnknownMacFrameType { value: 10 })
+            MacFrameType::from_u8(11),
+            Err(ProtocolError::UnknownMacFrameType { value: 11 })
         ));
         assert!(MacFrameType::from_u8(15).is_err());
     }
@@ -585,6 +590,7 @@ mod tests {
             MacFrameType::Beacon,
             MacFrameType::Keepalive,
             MacFrameType::Relay,
+            MacFrameType::OuterData,
         ] {
             let pdu = MacPdu::new(ft, dest.clone(), src.clone(), 0, vec![]);
             let bytes = pdu.to_bytes();
@@ -758,5 +764,19 @@ mod tests {
         let decoded = MacPdu::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.dest.as_str(), "");
         assert_eq!(decoded.frame_type, MacFrameType::Beacon);
+    }
+}
+
+#[cfg(test)]
+mod outer_tests {
+    use super::*;
+    #[test]
+    fn mac_frame_type_outer_data_round_trips() {
+        assert_eq!(
+            MacFrameType::from_u8(MacFrameType::OuterData as u8).unwrap(),
+            MacFrameType::OuterData
+        );
+        assert_eq!(MacFrameType::OuterData as u8, 10);
+        assert!(MacFrameType::from_u8(11).is_err());
     }
 }

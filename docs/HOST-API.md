@@ -425,6 +425,15 @@ At commit `b9fdb8d` (coppad 0.3.0), on Linux, with no radio, no sound card and n
 
 Not run: real VARA, ARDOP at this commit, the C FFI, real radios, a real browser.
 
+### Session fade protection status
+
+The WebSocket status reply's `link.fade_protection` is `"rs12-6"` when the
+session negotiated erasure protection, and `"off"` otherwise. The field is
+present whenever `link` is present. It reports the negotiated mode even if a
+TX-duration guard sends an individual segment as a plain frame.
+`link.fade_hold` separately reports the retransmission fallback state.
+Configure the mode with `[session] fade_protection`; no host command changes it.
+
 ## AGWPE connectionless AFSK TNC
 
 `coppa tnc --agw-port 8000` adds AGWPE to the AFSK TNC, alongside KISS on 8001.

@@ -26,3 +26,8 @@ doc = false
 name = "fuzz_callsign"
 path = "fuzz_targets/fuzz_callsign.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_outer_packet"
+path = "fuzz_targets/fuzz_outer_packet.rs"
+doc = false
