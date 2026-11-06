@@ -8,6 +8,12 @@ use std::{
     f32::consts::{PI, TAU},
 };
 
+pub use crate::hdlc::append_fcs;
+// The AFSK receiver keeps its own HDLC parser: FX.25 needs bit positions
+// and reception spans that the shared HdlcDecoder does not expose.
+use crate::hdlc::{bit_stuff, bits_to_byte_lsb, byte_to_bits_lsb, nrzi_encode};
+#[cfg(test)]
+use crate::hdlc::{bit_unstuff, nrzi_decode};
 use crc::{Crc, CRC_16_IBM_SDLC};
 
 const BAUD_RATE: u32 = 1200;
@@ -22,120 +28,6 @@ const POSTAMBLE_FLAGS: usize = 2;
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
-
-/// Convert a byte to 8 bits, LSB first (AX.25 standard).
-fn byte_to_bits_lsb(byte: u8) -> [u8; 8] {
-    let mut bits = [0u8; 8];
-    for (i, b) in bits.iter_mut().enumerate() {
-        *b = (byte >> i) & 1;
-    }
-    bits
-}
-
-/// Convert 8 bits (LSB first) back to a byte.
-fn bits_to_byte_lsb(bits: &[u8]) -> u8 {
-    debug_assert!(bits.len() >= 8);
-    let mut byte = 0u8;
-    for (i, &b) in bits.iter().enumerate().take(8) {
-        byte |= b << i;
-    }
-    byte
-}
-
-/// Insert a zero bit after every run of five consecutive 1s (HDLC bit stuffing).
-/// Operates on the frame body only; flag sequences are exempt.
-fn bit_stuff(bits: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bits.len() + bits.len() / 5);
-    let mut ones_run = 0u32;
-    for &bit in bits {
-        out.push(bit);
-        if bit == 1 {
-            ones_run += 1;
-            if ones_run == 5 {
-                out.push(0); // stuffed zero
-                ones_run = 0;
-            }
-        } else {
-            ones_run = 0;
-        }
-    }
-    out
-}
-
-/// Remove stuffed zero bits.  Returns `None` if 6 or more consecutive 1s are
-/// encountered (which would indicate a flag or an abort sequence, not data).
-#[allow(dead_code)] // used in tests
-fn bit_unstuff(bits: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(bits.len());
-    let mut ones_run = 0u32;
-    let mut i = 0;
-    while i < bits.len() {
-        let bit = bits[i];
-        if bit == 1 {
-            ones_run += 1;
-            if ones_run == 6 {
-                // Six consecutive 1s — invalid in data context.
-                return None;
-            }
-            out.push(1);
-        } else {
-            if ones_run == 5 {
-                // This is a stuffed zero — skip it (do not push).
-                ones_run = 0;
-                i += 1;
-                continue;
-            }
-            ones_run = 0;
-            out.push(0);
-        }
-        i += 1;
-    }
-    Some(out)
-}
-
-/// NRZI encode: bit 1 means *no change*, bit 0 means *transition*.
-/// Initial state is `true` (mark frequency).
-fn nrzi_encode(bits: &[u8]) -> Vec<bool> {
-    let mut out = Vec::with_capacity(bits.len());
-    let mut state = true;
-    for &bit in bits {
-        if bit == 0 {
-            state = !state; // transition
-        }
-        // bit == 1: no change
-        out.push(state);
-    }
-    out
-}
-
-/// NRZI decode: same consecutive value → 1, different → 0.
-/// Previous symbol starts as `true` (mark).
-#[allow(dead_code)] // used in tests
-fn nrzi_decode(symbols: &[bool]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(symbols.len());
-    let mut prev = true;
-    for &sym in symbols {
-        out.push(if sym == prev { 1 } else { 0 });
-        prev = sym;
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/// Append the AX.25 FCS (CRC-16/X.25, low byte first) to `frame`.
-///
-/// This is the same check [`Demodulator`] verifies, so
-/// `modulate(&append_fcs(frame))` decodes back to `append_fcs(frame)`.
-pub fn append_fcs(frame: &[u8]) -> Vec<u8> {
-    let fcs = Crc::<u16>::new(&CRC_16_IBM_SDLC).checksum(frame);
-    let mut out = Vec::with_capacity(frame.len() + 2);
-    out.extend_from_slice(frame);
-    out.extend_from_slice(&fcs.to_le_bytes());
-    out
-}
 
 /// Modulate raw AX.25 frame bytes (CRC already appended, e.g. by [`append_fcs`])
 /// into 48 kHz audio.
@@ -618,6 +510,7 @@ impl Demodulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crc::{Crc, CRC_16_IBM_SDLC};
 
     #[test]
     fn test_byte_to_bits_lsb() {
