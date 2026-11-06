@@ -1,4 +1,4 @@
-//! coppa's AFSK 1200 TNC measured against Direwolf on the same recording (COP-112).
+//! coppa's AFSK 1200 and G3RUH 9600 TNC measured against Direwolf on the same recording.
 //!
 //! Counts the AX.25 packets with a valid FCS that coppa's TNC receive chain decodes from a WAV, and
 //! the packets Direwolf's `direwolf` and `atest` programs decode from the same file, then formats a
@@ -13,13 +13,29 @@
 use anyhow::{anyhow, bail, Context, Result};
 use coppa_audio::resampler::ResamplingSource;
 use coppa_audio::{AudioSource, WavSource};
-use coppa_codec::afsk::Demodulator;
+use coppa_codec::{afsk, g3ruh};
 use std::fmt;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 
-/// The AFSK demodulator's fixed input rate (`coppa_codec::afsk`).
+/// TNC physical layer selected for both sides of the comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DemodKind {
+    Afsk1200,
+    G3ruh9600,
+}
+
+impl DemodKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Afsk1200 => "AFSK 1200",
+            Self::G3ruh9600 => "G3RUH 9600",
+        }
+    }
+}
+
+/// Both TNC demodulators' fixed input rate.
 pub const ENGINE_RATE: u32 = 48_000;
 /// Samples per read, as in the TNC's demod worker (`crates/coppa-daemon/src/tnc.rs`,
 /// `run_demod_worker`).
@@ -76,8 +92,9 @@ impl AudioSource for SliceSource<'_> {
 
 /// Feeds `src` to a fresh demodulator in `BLOCK`-sample reads until it returns 0, as
 /// `run_demod_worker` in `crates/coppa-daemon/src/tnc.rs` does, and counts the frames.
-fn drain_and_count<S: AudioSource>(mut src: S) -> Result<usize> {
-    let mut demod = Demodulator::new();
+fn drain_and_count<S: AudioSource>(mut src: S, kind: DemodKind) -> Result<usize> {
+    let mut afsk = afsk::Demodulator::new();
+    let mut g3ruh = g3ruh::Demodulator::new();
     let mut buf = vec![0.0f32; BLOCK];
     let mut count = 0;
     loop {
@@ -85,8 +102,16 @@ fn drain_and_count<S: AudioSource>(mut src: S) -> Result<usize> {
         if n == 0 {
             break;
         }
-        demod.process(&buf[..n]);
-        count += demod.take_frames().len();
+        count += match kind {
+            DemodKind::Afsk1200 => {
+                afsk.process(&buf[..n]);
+                afsk.take_frames().len()
+            }
+            DemodKind::G3ruh9600 => {
+                g3ruh.process(&buf[..n]);
+                g3ruh.take_frames().len()
+            }
+        };
     }
     Ok(count)
 }
@@ -97,22 +122,27 @@ fn drain_and_count<S: AudioSource>(mut src: S) -> Result<usize> {
 /// first, the type `LiveSource` uses for a card that cannot run at 48 kHz
 /// (`crates/coppa-audio/src/cpal_backend.rs`). The demodulator then takes `BLOCK`-sample reads, as
 /// `run_demod_worker` in `crates/coppa-daemon/src/tnc.rs` does. Every FCS-valid frame counts,
-/// repeats included.
-pub fn count_coppa_packets(samples: &[f32], rate: u32) -> Result<usize> {
+/// repeats included, except the G3RUH phase bank suppresses identical copies within 150 ms.
+pub fn count_coppa_packets(samples: &[f32], rate: u32, kind: DemodKind) -> Result<usize> {
     let src = SliceSource::new(samples, rate);
     if rate == ENGINE_RATE {
-        drain_and_count(src)
+        drain_and_count(src, kind)
     } else {
-        drain_and_count(ResamplingSource::new(src, ENGINE_RATE)?)
+        drain_and_count(ResamplingSource::new(src, ENGINE_RATE)?, kind)
     }
 }
 
 /// `count_coppa_packets` on `samples[offset..]` for each offset. An offset past the end counts an
 /// empty input.
-pub fn coppa_counts_by_offset(samples: &[f32], rate: u32, offsets: &[usize]) -> Result<Vec<usize>> {
+pub fn coppa_counts_by_offset(
+    samples: &[f32],
+    rate: u32,
+    offsets: &[usize],
+    kind: DemodKind,
+) -> Result<Vec<usize>> {
     offsets
         .iter()
-        .map(|&offset| count_coppa_packets(samples.get(offset..).unwrap_or(&[]), rate))
+        .map(|&offset| count_coppa_packets(samples.get(offset..).unwrap_or(&[]), rate, kind))
         .collect()
 }
 
@@ -270,6 +300,7 @@ pub struct DecoderRun {
 /// The benchmark's report; `Display` renders the seven report lines.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Report {
+    pub kind: DemodKind,
     pub input: WavInfo,
     pub offsets: Vec<usize>,
     /// coppa's count at each of `offsets`; the first entry (offset 0) is the headline count.
@@ -319,15 +350,16 @@ impl fmt::Display for Report {
             input.file_name, input.rate, input.channels, input.bits
         )?;
         let coppa = self.coppa_packets();
+        let label = self.kind.label();
         if input.rate == ENGINE_RATE {
             writeln!(
                 f,
-                "coppa:    {coppa} packets (AFSK 1200 demodulator, input at {ENGINE_RATE} Hz)"
+                "coppa:    {coppa} packets ({label} demodulator, input at {ENGINE_RATE} Hz)"
             )?;
         } else {
             writeln!(
                 f,
-                "coppa:    {coppa} packets (AFSK 1200 demodulator, resampled {} -> {ENGINE_RATE} Hz)",
+                "coppa:    {coppa} packets ({label} demodulator, resampled {} -> {ENGINE_RATE} Hz)",
                 input.rate
             )?;
         }
@@ -374,9 +406,13 @@ impl fmt::Display for Report {
 // ---------------------------------------------------------------------------------------------
 
 /// The `direwolf` config: input on stdin at the WAV's rate, no network ports, nothing else, so
-/// every demodulator setting is Direwolf's own default.
-pub fn direwolf_config(rate: u32) -> String {
-    format!("ADEVICE stdin null\nACHANNELS 1\nARATE {rate}\nAGWPORT 0\nKISSPORT 0\n")
+/// AFSK keeps every demodulator setting at Direwolf's default. G3RUH selects MODEM 9600.
+pub fn direwolf_config(rate: u32, kind: DemodKind) -> String {
+    let modem = match kind {
+        DemodKind::Afsk1200 => "",
+        DemodKind::G3ruh9600 => "CHANNEL 0\nMODEM 9600\n",
+    };
+    format!("ADEVICE stdin null\nACHANNELS 1\nARATE {rate}\n{modem}AGWPORT 0\nKISSPORT 0\n")
 }
 
 /// Maps a spawn failure to an error naming the flag that picks the program.
@@ -443,7 +479,7 @@ fn write_channel0<R: io::Read, W: Write>(
 }
 
 /// Opens `wav` and checks that it is 16-bit PCM, the only input `run_direwolf` streams to
-/// `direwolf`. The `afsk_vs_direwolf` diagnostic calls it before coppa's pass, so a wrong file
+/// `direwolf`. Each diagnostic calls it before coppa's pass, so a wrong file
 /// fails at once instead of after minutes of decoding.
 pub fn open_pcm16(wav: &Path) -> Result<hound::WavReader<io::BufReader<std::fs::File>>> {
     let reader = hound::WavReader::open(wav)
@@ -457,11 +493,16 @@ pub fn open_pcm16(wav: &Path) -> Result<hound::WavReader<io::BufReader<std::fs::
 
 /// Runs `program -c <work_dir>/direwolf.conf -t 0` with channel 0 of `wav` on stdin as 16-bit
 /// little-endian samples, and counts its channel 0 frame lines.
-pub fn run_direwolf(program: &Path, wav: &Path, work_dir: &Path) -> Result<DecoderRun> {
+pub fn run_direwolf(
+    program: &Path,
+    wav: &Path,
+    work_dir: &Path,
+    kind: DemodKind,
+) -> Result<DecoderRun> {
     let reader = open_pcm16(wav)?;
     let spec = reader.spec();
     let conf = work_dir.join("direwolf.conf");
-    std::fs::write(&conf, direwolf_config(spec.sample_rate))
+    std::fs::write(&conf, direwolf_config(spec.sample_rate, kind))
         .with_context(|| format!("writing {}", conf.display()))?;
 
     let mut child = Command::new(program)
@@ -507,10 +548,11 @@ pub fn run_direwolf(program: &Path, wav: &Path, work_dir: &Path) -> Result<Decod
     })
 }
 
-/// Runs `program <wav>` (Direwolf's `atest`, no options) and cross-checks its channel 0 frame
+/// Runs `program <extra_args> <wav>` (Direwolf's `atest`) and cross-checks its channel 0 frame
 /// lines against its `N packets decoded in` summary.
-pub fn run_atest(program: &Path, wav: &Path) -> Result<DecoderRun> {
+pub fn run_atest(program: &Path, wav: &Path, extra_args: &[&str]) -> Result<DecoderRun> {
     let out = Command::new(program)
+        .args(extra_args)
         .arg(wav)
         .stdin(Stdio::null())
         .output()
@@ -584,20 +626,79 @@ mod tests {
     }
 
     #[test]
+    fn direwolf_config_carries_the_modem() {
+        assert_eq!(
+            direwolf_config(44_100, DemodKind::Afsk1200),
+            "ADEVICE stdin null\nACHANNELS 1\nARATE 44100\nAGWPORT 0\nKISSPORT 0\n"
+        );
+        assert_eq!(direwolf_config(48_000, DemodKind::G3ruh9600),
+            "ADEVICE stdin null\nACHANNELS 1\nARATE 48000\nCHANNEL 0\nMODEM 9600\nAGWPORT 0\nKISSPORT 0\n");
+    }
+
+    #[test]
+    fn count_coppa_packets_selects_the_demodulator() {
+        let mut samples = Vec::new();
+        for i in 0..3 {
+            samples.extend(coppa_codec::g3ruh::modulate(&append_fcs(
+                format!("packet {i}").as_bytes(),
+            )));
+        }
+        assert_eq!(
+            count_coppa_packets(&samples, 48_000, DemodKind::G3ruh9600).unwrap(),
+            3
+        );
+        assert_eq!(
+            count_coppa_packets(&samples, 48_000, DemodKind::Afsk1200).unwrap(),
+            0
+        );
+        let afsk = synthetic_48k(3);
+        assert_eq!(
+            count_coppa_packets(&afsk, 48_000, DemodKind::Afsk1200).unwrap(),
+            3
+        );
+        assert_eq!(
+            count_coppa_packets(&afsk, 48_000, DemodKind::G3ruh9600).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn report_labels_the_modem() {
+        for rate in [48_000, 44_100] {
+            let mut report = baseline_report(rate);
+            let afsk = report.to_string();
+            report.kind = DemodKind::G3ruh9600;
+            assert_eq!(
+                report.to_string(),
+                afsk.replace("AFSK 1200 demodulator", "G3RUH 9600 demodulator")
+            );
+        }
+    }
+
+    #[test]
     fn counts_every_packet_at_48k() {
-        assert_eq!(count_coppa_packets(&synthetic_48k(20), 48_000).unwrap(), 20);
+        assert_eq!(
+            count_coppa_packets(&synthetic_48k(20), 48_000, DemodKind::Afsk1200).unwrap(),
+            20
+        );
     }
 
     #[test]
     fn resamples_44k1_input_like_the_tnc() {
         let s = resample(&synthetic_48k(20), 48_000, 44_100);
-        assert_eq!(count_coppa_packets(&s, 44_100).unwrap(), 20);
+        assert_eq!(
+            count_coppa_packets(&s, 44_100, DemodKind::Afsk1200).unwrap(),
+            20
+        );
     }
 
     #[test]
     fn unresampled_44k1_input_decodes_nothing() {
         let s = resample(&synthetic_48k(20), 48_000, 44_100);
-        assert_eq!(count_coppa_packets(&s, 48_000).unwrap(), 0);
+        assert_eq!(
+            count_coppa_packets(&s, 48_000, DemodKind::Afsk1200).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -606,15 +707,19 @@ mod tests {
         assert_eq!(START_OFFSETS.len(), 8);
         assert!(START_OFFSETS.iter().all(|&o| o < 37));
         let s = synthetic_48k(3);
-        let counts = coppa_counts_by_offset(&s, 48_000, &START_OFFSETS).unwrap();
+        let counts =
+            coppa_counts_by_offset(&s, 48_000, &START_OFFSETS, DemodKind::Afsk1200).unwrap();
         assert_eq!(counts.len(), 8);
-        assert_eq!(counts[0], count_coppa_packets(&s, 48_000).unwrap());
+        assert_eq!(
+            counts[0],
+            count_coppa_packets(&s, 48_000, DemodKind::Afsk1200).unwrap()
+        );
     }
 
     #[test]
     fn offset_past_the_end_counts_zero() {
         assert_eq!(
-            coppa_counts_by_offset(&[0.0; 10], 48_000, &[20]).unwrap(),
+            coppa_counts_by_offset(&[0.0; 10], 48_000, &[20], DemodKind::Afsk1200).unwrap(),
             vec![0]
         );
     }
@@ -650,7 +755,10 @@ mod tests {
             }
         );
         assert_eq!(samples.len(), left.len());
-        assert_eq!(count_coppa_packets(&samples, 44_100).unwrap(), 5);
+        assert_eq!(
+            count_coppa_packets(&samples, 44_100, DemodKind::Afsk1200).unwrap(),
+            5
+        );
     }
 
     pub(super) const ATEST_FIXTURE: &str = concat!(
@@ -741,6 +849,7 @@ mod tests {
 
     fn baseline_report(rate: u32) -> Report {
         Report {
+            kind: DemodKind::Afsk1200,
             input: WavInfo {
                 file_name: "track2.wav".to_owned(),
                 rate,
@@ -901,7 +1010,7 @@ mod process_tests {
                  echo \"stdin_bytes=$(wc -c | tr -d ' ')\" >&2\n"
             ),
         );
-        let run = run_direwolf(&fake, &wav, &s.0).unwrap();
+        let run = run_direwolf(&fake, &wav, &s.0, DemodKind::Afsk1200).unwrap();
         assert_eq!(run.packets, 2);
         assert_eq!(run.profile.as_deref(), Some("A+"));
         assert_eq!(run.version.as_deref(), Some("Dire Wolf version 1.7"));
@@ -922,7 +1031,9 @@ mod process_tests {
         let work = s.0.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(run_direwolf(&fake, &wav, &work).map(|r| r.output.len()));
+            let _ = tx.send(
+                run_direwolf(&fake, &wav, &work, DemodKind::Afsk1200).map(|r| r.output.len()),
+            );
         });
         let len = rx
             .recv_timeout(Duration::from_secs(60))
@@ -937,7 +1048,10 @@ mod process_tests {
         let s = Scratch::new("dw_failure");
         let wav = s.wav("in.wav", pcm16(1), 1000);
         let fake = s.script("direwolf", "echo 'bad config'\nexit 1\n");
-        let err = format!("{:#}", run_direwolf(&fake, &wav, &s.0).unwrap_err());
+        let err = format!(
+            "{:#}",
+            run_direwolf(&fake, &wav, &s.0, DemodKind::Afsk1200).unwrap_err()
+        );
         assert!(err.contains("exited with"), "{err}");
         assert!(err.contains("bad config"), "{err}");
     }
@@ -948,13 +1062,19 @@ mod process_tests {
         let wav = s.wav("in.wav", pcm16(1), 100);
         let err = format!(
             "{:#}",
-            run_direwolf(Path::new("/nonexistent/direwolf"), &wav, &s.0).unwrap_err()
+            run_direwolf(
+                Path::new("/nonexistent/direwolf"),
+                &wav,
+                &s.0,
+                DemodKind::Afsk1200
+            )
+            .unwrap_err()
         );
         assert!(err.contains("not found"), "{err}");
         assert!(err.contains("--direwolf"), "{err}");
         let err = format!(
             "{:#}",
-            run_atest(Path::new("/nonexistent/atest"), &wav).unwrap_err()
+            run_atest(Path::new("/nonexistent/atest"), &wav, &[]).unwrap_err()
         );
         assert!(err.contains("not found"), "{err}");
         assert!(err.contains("--atest"), "{err}");
@@ -972,9 +1092,25 @@ mod process_tests {
         let wav = s.wav("in.wav", spec, 100);
         let err = format!(
             "{:#}",
-            run_direwolf(Path::new("/nonexistent/direwolf"), &wav, &s.0).unwrap_err()
+            run_direwolf(
+                Path::new("/nonexistent/direwolf"),
+                &wav,
+                &s.0,
+                DemodKind::Afsk1200
+            )
+            .unwrap_err()
         );
         assert!(err.contains("16-bit PCM"), "{err}");
+    }
+
+    #[test]
+    fn run_atest_passes_baud_arguments() {
+        let _guard = lock();
+        let s = Scratch::new("atest_baud");
+        let wav = s.wav("in.wav", pcm16(1), 100);
+        let fake = s.script("atest", &format!(
+            "[ \"$#\" = 3 ] || exit 3\n[ \"$1\" = -B ] || exit 3\n[ \"$2\" = 9600 ] || exit 3\n[ \"$3\" = '{}' ] || exit 3\ncat <<'OUT'\n{ATEST_FIXTURE}OUT\n", wav.display()));
+        assert_eq!(run_atest(&fake, &wav, &["-B", "9600"]).unwrap().packets, 2);
     }
 
     #[test]
@@ -992,20 +1128,20 @@ mod process_tests {
                  cat <<'OUT'\n{ATEST_FIXTURE}OUT\n"
             ),
         );
-        let run = run_atest(&fake, &wav).unwrap();
+        let run = run_atest(&fake, &wav, &[]).unwrap();
         assert_eq!(run.packets, 2);
         assert_eq!(run.profile.as_deref(), Some("A"));
         assert_eq!(run.version, None);
 
         let wrong = ATEST_FIXTURE.replace("2 packets decoded in", "3 packets decoded in");
         let fake = s.script("atest_wrong", &format!("cat <<'OUT'\n{wrong}OUT\n"));
-        let err = format!("{:#}", run_atest(&fake, &wav).unwrap_err());
+        let err = format!("{:#}", run_atest(&fake, &wav, &[]).unwrap_err());
         assert!(err.contains("says 3 packets"), "{err}");
         assert!(err.contains("but 2 channel 0 frame lines"), "{err}");
 
         let nosummary = ATEST_FIXTURE.replace("2 packets decoded in", "2 packets seen in");
         let fake = s.script("atest_nosummary", &format!("cat <<'OUT'\n{nosummary}OUT\n"));
-        let err = format!("{:#}", run_atest(&fake, &wav).unwrap_err());
+        let err = format!("{:#}", run_atest(&fake, &wav, &[]).unwrap_err());
         assert!(err.contains("packets decoded in"), "{err}");
     }
 }

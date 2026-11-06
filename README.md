@@ -124,7 +124,7 @@ KISS bring-up and testing: checking that a KISS client, your audio routing and y
 coppa. It is not a Direwolf replacement. Digipeating is opt-in with
 `--digipeat CALL[-SSID]`; a spectral busy check gates automatic repeats. KISS client
 transmissions still start immediately and ignore TXDELAY, persistence and slot time.
-AGWPE is connectionless only. It has no beaconing and runs only at 1200 baud. Remaining parity work
+AGWPE is connectionless only. It has no beaconing. It runs at 1200 baud (AFSK) or 9600 baud (G3RUH). Remaining parity work
 is planned as H-122 in the
 [2026-09-05 product review](docs/reviews/2026-09-05-product-ux-market-review.md).
 

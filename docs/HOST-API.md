@@ -23,7 +23,7 @@ Every table below was checked against coppad 0.3.0 at commit `b9fdb8d` (see
 | WebSocket JSON (and the `GET /` page) | 8400 | `[host] websocket_enabled = true` and `websocket_token` | `websocket` | token; browsers also need an allowed `Origin` |
 | AGWPE connectionless (AFSK TNC) | opt-in 8000 | `coppa tnc --agw-port 8000` | `kiss-tnc` and `cpal-backend` for audio | none |
 | KISS datagram (OFDM modem) | 8100 | `[host] kiss_enabled = true` | `kiss-tnc` | none |
-| KISS (AFSK 1200 TNC mode) | 8001 | `coppad --tnc`, or `coppa tnc --port N` | `kiss-tnc` (and `cpal-backend` for audio) | none |
+| KISS (AFSK 1200 or G3RUH 9600 TNC mode) | 8001 | `coppad --tnc`, or `coppa tnc --port N --baud 9600` for G3RUH | `kiss-tnc` (and `cpal-backend` for audio) | none |
 
 - Every `[host]` server is off by default and binds `bind_address`, which defaults to
   `127.0.0.1`. The keys and their defaults are in [coppad.toml.example](../coppad.toml.example);
@@ -357,7 +357,8 @@ See [RETICULUM.md](RETICULUM.md) for setup, size limits, timing and security.
 ## KISS (AFSK 1200 TNC mode)
 
 `coppad --tnc` (always port 8001) or `coppa tnc --port N` runs a 1200-baud AFSK AX.25 TNC behind
-a KISS TCP port. This AFSK mode is for bring-up and testing, and Pat's
+a KISS TCP port. `coppa tnc --baud 9600` selects G3RUH with the same KISS contract.
+This TNC mode is for bring-up and testing, and Pat's
 VARA path does not use it. [TNC.md](TNC.md) covers building and running it.
 
 - Standard KISS framing: `FEND` (`0xC0`) around each frame, `FESC TFEND` and `FESC TFESC` for

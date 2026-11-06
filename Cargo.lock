@@ -500,6 +500,7 @@ dependencies = [
  "coppa-channel",
  "coppa-dsp",
  "crc",
+ "hound",
  "num-complex",
  "rand 0.10.3",
  "rustfft",
