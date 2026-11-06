@@ -116,3 +116,27 @@ cargo run --release -q -p coppa-bench --example afsk_vs_direwolf -- --wav FILE.w
   change against the spread the report prints.
 - A change to the resampler (`rubato` in `Cargo.lock`) can move coppa's count. Record the
   version with any new result.
+
+## 9600 G3RUH fixture (COP-116)
+
+The synthetic 100-frame recording lives in `testdata/g3ruh/`. It uses Direwolf
+1.7 `gen_packets -B 9600 -r 48000 -a 50`, followed by coppa's seeded AWGN at
+10 dB, seed 42. Noise power is mean-square clean signal power divided by 10.
+The WAV SHA-256 is
+`11487f60768c86e6eb841fab197016232f85f0447565806eab2fcff28b7d80e5`.
+
+```sh
+tools/tnc-bench/gen_g3ruh_9600.sh --parity
+cargo run --release -q -p coppa-bench --example g3ruh_vs_direwolf -- \
+    --wav testdata/g3ruh/g3ruh_9600_100frames_10db.wav
+```
+
+Use the rootless Direwolf bundle recipe in Requirements above. Only `direwolf`
+and its libraries are needed for this fixture; `flac` is unnecessary.
+Generation requires `gen_packets`, `cargo`, and `sha256sum`. Parity runs by default
+when `direwolf` is on PATH. `--no-parity` skips it; `--force` permits deliberate
+replacement after a mismatch. A mismatch without `--force` exits 2.
+The parity diagnostic accepts `--direwolf`, `--atest`, and `--log-dir` as well.
+The measured counts and exact decoder settings are in
+[the COP-116 record](../../docs/testing/tnc-direwolf-g3ruh-9600.md).
+The ordinary fixture tests require no Direwolf installation.

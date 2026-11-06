@@ -680,8 +680,11 @@ enum Commands {
         command: broadcast::Command,
     },
     #[cfg(feature = "kiss-tnc")]
-    /// Start the AFSK 1200 TNC (KISS TCP server).
+    /// Start the KISS TNC (AFSK 1200 or G3RUH 9600).
     Tnc {
+        /// TNC baud rate: 1200 (AFSK) or 9600 (G3RUH).
+        #[arg(long, short, value_enum, default_value = "1200")]
+        baud: TncBaud,
         /// KISS TCP port.
         #[arg(long, default_value = "8001")]
         port: u16,
@@ -711,6 +714,26 @@ enum Commands {
         #[arg(long, value_name = "CALL[-SSID]")]
         digipeat: Option<String>,
     },
+}
+
+/// CLI spelling of the daemon's modem selection.
+#[cfg(feature = "kiss-tnc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum TncBaud {
+    #[value(name = "1200")]
+    Afsk1200,
+    #[value(name = "9600")]
+    G3ruh9600,
+}
+
+#[cfg(feature = "kiss-tnc")]
+impl From<TncBaud> for coppa_daemon::tnc::TncBaud {
+    fn from(value: TncBaud) -> Self {
+        match value {
+            TncBaud::Afsk1200 => Self::Afsk1200,
+            TncBaud::G3ruh9600 => Self::G3ruh9600,
+        }
+    }
 }
 
 /// Resolve a profile name to an EngineConfig, or use the default.
@@ -912,6 +935,7 @@ fn run() -> Result<()> {
         Commands::Broadcast { command } => broadcast::run(command, verbosity)?,
         #[cfg(feature = "kiss-tnc")]
         Commands::Tnc {
+            baud,
             port,
             device,
             input_device_id,
@@ -922,6 +946,7 @@ fn run() -> Result<()> {
             vox,
             digipeat,
         } => cmd_tnc(
+            baud,
             port,
             device,
             input_device_id,
@@ -1001,6 +1026,10 @@ fn cmd_man() -> Result<()> {
     use clap::CommandFactory;
     let mut buf = Vec::new();
     clap_mangen::Man::new(Cli::command()).render(&mut buf)?;
+    #[cfg(feature = "kiss-tnc")]
+    if let Some(tnc) = Cli::command().find_subcommand("tnc") {
+        clap_mangen::Man::new(tnc.clone()).render(&mut buf)?;
+    }
     emit_raw(&buf)
 }
 
@@ -2686,6 +2715,7 @@ fn parse_digipeat_alias(s: &str) -> Result<(String, u8)> {
 #[cfg(feature = "kiss-tnc")]
 #[allow(clippy::too_many_arguments)]
 fn cmd_tnc(
+    baud: TncBaud,
     port: u16,
     device: Option<String>,
     input_device_id: Option<String>,
@@ -2700,6 +2730,7 @@ fn cmd_tnc(
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let config = coppa_daemon::tnc::TncConfig {
+            baud: baud.into(),
             digipeat_alias,
             kiss_port: port,
             audio_device: device,
@@ -2719,6 +2750,32 @@ fn cmd_tnc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "kiss-tnc")]
+    #[test]
+    fn tnc_parses_baud_flag() {
+        for (args, expected) in [
+            (vec!["coppa", "tnc", "--baud", "9600"], TncBaud::G3ruh9600),
+            (vec!["coppa", "tnc", "-b", "1200"], TncBaud::Afsk1200),
+            (vec!["coppa", "tnc"], TncBaud::Afsk1200),
+        ] {
+            let Commands::Tnc { baud, .. } = Cli::try_parse_from(args).unwrap().command else {
+                panic!("expected Tnc");
+            };
+            assert_eq!(baud, expected);
+        }
+    }
+
+    #[cfg(feature = "kiss-tnc")]
+    #[test]
+    fn tnc_rejects_other_bauds() {
+        let error = Cli::try_parse_from(["coppa", "tnc", "--baud", "300"])
+            .err()
+            .expect("unsupported baud must fail")
+            .to_string();
+        assert!(error.contains("possible values"), "{error}");
+        assert!(error.contains("1200") && error.contains("9600"), "{error}");
+    }
 
     #[test]
     fn device_json_escapes_names_and_empty_lists() {
