@@ -17083,8 +17083,8 @@ mod tests {
                 hex(&session_ack_frame(&callee)),
                 "1158b7810830005dc0570000000002000200000000"
             );
-            // P23 is the 0.6.0 caps, which a 0.8.0 coppad emits with
-            // `fade_protection = "off"`; the 0.8.0 default `accept` also
+            // P23 is the 0.6.0 caps, which a 0.9.0 coppad emits with
+            // `fade_protection = "off"`; the 0.9.0 default `accept` also
             // advertises the outer-code receive bit (SPEC §22.1).
             let mut off_config = DaemonConfig::default();
             off_config.session.fade_protection = crate::config::FadeProtection::Off;
