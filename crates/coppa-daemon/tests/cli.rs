@@ -6,6 +6,9 @@
 //! for the expected exit. Output goes to temporary files rather than pipes, so
 //! a full pipe cannot hide the process finishing.
 
+// COP-142: the std-clock ban in clippy.toml targets event_loop only.
+#![allow(clippy::disallowed_methods)]
+
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -307,6 +310,9 @@ fn assert_full_help(help: &str) {
         "Print built-in configuration as TOML, then exit",
         "--tnc",
         "Run KISS TNC mode with its own defaults; requires kiss-tnc",
+        "--instance <NAME>",
+        "Name this coppad: prefix its log lines, look for coppad-NAME.toml",
+        "With --instance NAME, look for coppad-NAME.toml in the same places.",
         "-h, --help",
         "Print help",
         "-V, --version",
@@ -801,6 +807,7 @@ fn print_default_config_prints_only_the_default_toml() {
         "cp_negotiation_enabled = false",
         "id_interval_secs = 540",
         "ptt_guardian = true",
+        "fade_protection = \"accept\"",
     ] {
         assert!(printed.contains(line), "missing {line:?}:\n{printed}");
     }
@@ -1813,6 +1820,14 @@ fn the_default_config_states_that_nothing_is_listening() {
         host.contains("vara_command=disabled vara_data=disabled"),
         "{host}"
     );
+    assert!(
+        host.contains(if cfg!(feature = "kiss-tnc") {
+            "kiss=disabled"
+        } else {
+            "kiss=not-built"
+        }),
+        "{host}"
+    );
 }
 
 #[cfg(not(feature = "cpal-backend"))]
@@ -1945,5 +1960,111 @@ fn startup_names_the_audio_devices_it_opened() {
     assert!(
         input.contains("hardware_rate=") && input.contains("engine_rate=48000"),
         "{input}"
+    );
+}
+
+// ── COP-85: instance names ──────────────────────────────────────────────
+
+/// Two instances started from one directory each find their own
+/// `coppad-NAME.toml` and prefix every line they log with `[NAME] `.
+#[cfg(not(feature = "cpal-backend"))]
+#[test]
+fn two_instances_find_their_own_files_and_prefix_their_logs() {
+    let dir = TempDir::new("instances");
+    for (name, call) in [("a", "N1AAA"), ("b", "N1BBB")] {
+        dir.write(
+            &format!("coppad-{name}.toml"),
+            &format!(
+                "[host]\nvara_enabled = true\nvara_command_port = 0\nvara_data_port = 0\n\
+                 [engine]\ncallsign = \"{call}\"\n"
+            ),
+        );
+    }
+    let env = [("NO_COLOR", "1")];
+    let (mut a, _) = start_until_ready(dir.path(), &["--instance", "a"], &env);
+    let (mut b, _) = start_until_ready(dir.path(), &["--instance", "b"], &env);
+    for (daemon, name) in [(&mut a, "a"), (&mut b, "b")] {
+        let (stdout, stderr) = daemon.kill();
+        assert!(
+            stdout.contains(&format!("Using configuration file path=coppad-{name}.toml")),
+            "{stdout}\n{stderr}"
+        );
+        assert!(stdout.contains("Daemon ready"), "{stdout}");
+        let prefix = format!("[{name}] ");
+        for line in stdout.lines().filter(|line| !line.is_empty()) {
+            assert!(
+                line.starts_with(&prefix),
+                "{line:?} lacks {prefix:?}\n{stdout}"
+            );
+        }
+    }
+}
+
+#[test]
+fn check_with_an_instance_checks_that_instances_file() {
+    let dir = dir_with_malformed_default();
+    dir.write("coppad-a.toml", "[engine]\ncallsign = \"N1AAA\"\n");
+    let stdout = run_ok(dir.path(), &["--instance", "a", "--check"]);
+    assert!(
+        stdout.starts_with("Using configuration file coppad-a.toml\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn an_invalid_instance_name_exits_2() {
+    let dir = dir_with_malformed_default();
+    let stderr = run_usage_error(dir.path(), &["--instance", "hf_1"]);
+    assert!(
+        stderr.contains(
+            "invalid value 'hf_1' for '--instance <NAME>': use 1 to 32 letters, digits and \
+             hyphens, not starting or ending with a hyphen"
+        ),
+        "{stderr}"
+    );
+}
+
+// ── COP-138: KISS datagram interface ───────────────────────────────────
+
+#[cfg(not(feature = "kiss-tnc"))]
+#[test]
+fn kiss_enabled_without_the_kiss_tnc_feature_is_a_startup_error() {
+    run_startup_error(
+        "[host]\nkiss_enabled = true\n",
+        "[host] kiss_enabled = true is set, but this coppad was built without the kiss-tnc feature",
+    );
+}
+
+#[cfg(all(feature = "kiss-tnc", not(feature = "cpal-backend")))]
+#[test]
+fn the_kiss_listener_is_reported_at_startup() {
+    let dir = TempDir::new("kiss-summary");
+    dir.write(
+        "station.toml",
+        "[engine]\ncallsign = \"N1CALL\"\n[host]\nkiss_enabled = true\nkiss_port = 0\n",
+    );
+    let (mut daemon, _) = start_until_ready(
+        dir.path(),
+        &["--config", "station.toml"],
+        &[("NO_COLOR", "1")],
+    );
+    let (stdout, _) = daemon.kill();
+    let (kiss_at, _) = line_with(&stdout, "KISS datagram interface listening");
+    let (_, host) = line_with(&stdout, "Host listeners");
+    let (ready_at, _) = line_with(&stdout, "Daemon ready");
+    assert!(host.contains("kiss=127.0.0.1:"), "{host}");
+    assert!(kiss_at < ready_at);
+}
+
+#[cfg(feature = "kiss-tnc")]
+#[test]
+fn a_taken_kiss_datagram_port_is_a_startup_error() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    run_startup_error(
+        &format!(
+            "[host]\nkiss_enabled = true\nkiss_port = {}\n",
+            listener.local_addr().unwrap().port()
+        ),
+        "failed to bind the KISS datagram port to 127.0.0.1:",
     );
 }

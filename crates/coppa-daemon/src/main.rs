@@ -6,6 +6,8 @@
 // Diagnostics go through `tracing`; `--check` and `--print-default-config`
 // write their output with `writeln!`.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+// COP-142: the std-clock ban targets event_loop production code only.
+#![allow(clippy::disallowed_methods)]
 
 // Shared with the library target; the binary uses only part of its API
 // (and none of the output worker without `cpal-backend`).
@@ -20,14 +22,21 @@ mod event_loop;
 mod level_meter;
 mod logging;
 mod ptt_guardian;
+mod session_outer;
+mod signals;
 #[cfg(feature = "websocket")]
 mod spectrum;
 mod startup_report;
 
 #[cfg(feature = "kiss-tnc")]
-mod tnc;
+mod kiss_wiring;
+// Use the library runner, also used by the CLI, rather than compiling it twice.
+#[cfg(feature = "kiss-tnc")]
+use coppa_daemon::tnc;
 mod tx_chunker;
 mod vara_wiring;
+#[cfg(feature = "websocket")]
+mod web;
 
 use std::io::{IsTerminal, Write};
 
@@ -48,22 +57,40 @@ async fn main() -> Result<()> {
 
     match cli.mode() {
         Mode::PrintDefaultConfig => print_default_config(),
-        Mode::Check(source) => check_config(&source),
+        Mode::Check(source) => check_config(&source, cli.instance.as_deref()),
         Mode::Tnc => run_tnc(cli.log_level).await,
         Mode::PttGuardian {
             ptt_method,
             rigctld_address,
             ptt_invert,
-        } => run_ptt_guardian(cli.log_level, ptt_method, rigctld_address, ptt_invert).await,
+        } => {
+            run_ptt_guardian(
+                cli.log_level,
+                cli.instance.as_deref(),
+                ptt_method,
+                rigctld_address,
+                ptt_invert,
+            )
+            .await
+        }
         Mode::Run(source) => {
+            // COP-85: from here on SIGHUP never kills coppad, even before
+            // the reload handler runs (`systemctl reload` during startup is
+            // ignored). Tokio keeps the handler installed for the life of
+            // the process.
+            #[cfg(unix)]
+            let _startup_hangup =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                    .context("failed to register the SIGHUP handler")?;
+            let instance = cli.instance.as_deref();
             // Load before logging so a config error is the only output.
-            let (config, discovered) = load_config(&source)?;
-            init_tracing(cli.log_level);
+            let (config, discovered) = load_config(&source, instance)?;
+            init_tracing(cli.log_level, instance);
             log_banner();
             log_config_source(&source, discovered.as_ref());
             // COP-32: a fatal error after logging starts is logged at ERROR,
             // then returned so `main` prints `Error: ...` and exits 1.
-            run_daemon(config)
+            run_daemon(config, source, cli.instance.clone())
                 .await
                 .inspect_err(|e| tracing::error!("{e:#}"))
         }
@@ -74,7 +101,12 @@ async fn main() -> Result<()> {
 /// without one, the first file found by the COP-49 search is used, falling
 /// back to defaults only when none exists. The search record is returned for
 /// an implicit source only.
-fn load_config(source: &ConfigSource) -> Result<(DaemonConfig, Option<Discovered>)> {
+/// COP-85: with an instance, the implicit search looks for
+/// `coppad-NAME.toml` in the same places.
+fn load_config(
+    source: &ConfigSource,
+    instance: Option<&str>,
+) -> Result<(DaemonConfig, Option<Discovered>)> {
     match source {
         ConfigSource::Explicit(path) => {
             let config = DaemonConfig::load(path)
@@ -82,8 +114,14 @@ fn load_config(source: &ConfigSource) -> Result<(DaemonConfig, Option<Discovered
             Ok((config, None))
         }
         ConfigSource::Implicit => {
-            let discovered =
-                DaemonConfig::discover(&config_candidates(&ConfigEnv::from_process()))?;
+            let env = ConfigEnv::from_process();
+            let candidates = match instance {
+                None => config_candidates(&env),
+                Some(_) => {
+                    config::config_candidates_named(&env, &config::config_file_name(instance))
+                }
+            };
+            let discovered = DaemonConfig::discover(&candidates)?;
             Ok((discovered.config.clone(), Some(discovered)))
         }
     }
@@ -110,8 +148,8 @@ fn log_config_source(source: &ConfigSource, discovered: Option<&Discovered>) {
 /// `--check`: read and deserialize the configuration only. Deliberately
 /// returns before PTT parsing or `EventLoop::new`, which can touch hardware.
 /// For an implicit source it first says which file it checked (COP-49).
-fn check_config(source: &ConfigSource) -> Result<()> {
-    let (_, discovered) = load_config(source)?;
+fn check_config(source: &ConfigSource, instance: Option<&str>) -> Result<()> {
+    let (_, discovered) = load_config(source, instance)?;
     let mut stdout = std::io::stdout().lock();
     if let Some(discovered) = discovered {
         match &discovered.source {
@@ -139,16 +177,32 @@ fn print_default_config() -> Result<()> {
 
 /// Structured logging for the run modes: `--log-level` overrides `RUST_LOG`,
 /// which falls back to `info` when absent or invalid.
-fn init_tracing(level: Option<LogLevel>) {
+/// COP-85: with an instance, every line starts with `[NAME] `.
+fn init_tracing(level: Option<LogLevel>, instance: Option<&str>) {
     let rust_log = std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).ok();
     use tracing_subscriber::prelude::*;
-    let format = tracing_subscriber::fmt::layer().with_ansi(logging::ansi_enabled(
+    let ansi = logging::ansi_enabled(
         std::io::stdout().is_terminal(),
         std::env::var_os("NO_COLOR").as_deref(),
-    ));
+    );
+    let (plain, prefixed) = match instance {
+        None => (Some(tracing_subscriber::fmt::layer().with_ansi(ansi)), None),
+        Some(name) => (
+            None,
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(ansi)
+                    .event_format(logging::InstanceFormat::new(
+                        name,
+                        tracing_subscriber::fmt::format().with_ansi(ansi),
+                    )),
+            ),
+        ),
+    };
     let subscriber = tracing_subscriber::registry()
         .with(cli::log_filter(level, rust_log.as_deref()))
-        .with(format);
+        .with(plain)
+        .with(prefixed);
     #[cfg(feature = "websocket")]
     let subscriber = subscriber.with(ws_log::WsLogLayer::global().clone());
     subscriber.init();
@@ -166,7 +220,7 @@ fn log_banner() {
 /// `--tnc`: the KISS TNC with its own defaults (no daemon config file).
 #[cfg(feature = "kiss-tnc")]
 async fn run_tnc(level: Option<LogLevel>) -> Result<()> {
-    init_tracing(level);
+    init_tracing(level, None);
     log_banner();
     tnc::run_tnc(tnc::TncConfig::default()).await
 }
@@ -184,11 +238,12 @@ async fn run_tnc(_level: Option<LogLevel>) -> Result<()> {
 /// RX level.
 async fn run_ptt_guardian(
     level: Option<LogLevel>,
+    instance: Option<&str>,
     ptt_method: String,
     rigctld_address: String,
     ptt_invert: bool,
 ) -> Result<()> {
-    init_tracing(level);
+    init_tracing(level, instance);
 
     // Replace the default actions of SIGINT, SIGTERM and SIGHUP for the
     // guardian's whole life: it must outlive the daemon, and only stdin EOF
@@ -202,6 +257,17 @@ async fn run_ptt_guardian(
             signal(SignalKind::interrupt()).context("failed to register SIGINT handler")?,
             signal(SignalKind::terminate()).context("failed to register SIGTERM handler")?,
             signal(SignalKind::hangup()).context("failed to register SIGHUP handler")?,
+        )
+    };
+    // COP-85: the Windows counterpart. The guardian runs in its own process
+    // group, so a console Ctrl-C does not reach it, but a Ctrl-Break or a
+    // Ctrl-C sent to its group must not stop it either.
+    #[cfg(windows)]
+    let (_ctrl_c, _ctrl_break) = {
+        use tokio::signal::windows;
+        (
+            windows::ctrl_c().context("failed to register the Ctrl-C handler")?,
+            windows::ctrl_break().context("failed to register the Ctrl-Break handler")?,
         )
     };
 
@@ -251,7 +317,62 @@ async fn run_ptt_guardian(
     }
 }
 
-async fn run_daemon(config: DaemonConfig) -> Result<()> {
+/// COP-85: SIGHUP. Re-read the configuration source the daemon started
+/// from, log which file it read as startup does, and validate it with the
+/// run gates plus the PTT-method and frequency parses. Blocking file I/O:
+/// run it off the async workers. An implicit search that now finds no file
+/// is refused rather than reverting every setting to the built-in defaults.
+fn load_for_reload(source: &ConfigSource, instance: Option<&str>) -> Result<DaemonConfig> {
+    let (config, discovered) = load_config(source, instance)?;
+    if let Some(discovered) = discovered.as_ref().filter(|d| d.source.is_none()) {
+        anyhow::bail!(
+            "no configuration file found (searched: {})",
+            discovered.search_summary()
+        );
+    }
+    log_config_source(source, discovered.as_ref());
+    config.check_for_reload().map_err(anyhow::Error::msg)?;
+    Ok(config)
+}
+
+/// COP-85: serve reload requests one at a time, in arrival order, so an
+/// older file is never applied after a newer one. Each accepted file goes to
+/// the event loop as `DaemonEvent::Reload`; a refused one changes nothing.
+async fn serve_reloads(
+    mut requests: tokio::sync::mpsc::UnboundedReceiver<()>,
+    source: ConfigSource,
+    instance: Option<String>,
+    event_tx: tokio::sync::mpsc::Sender<DaemonEvent>,
+) {
+    while requests.recv().await.is_some() {
+        let (source, instance) = (source.clone(), instance.clone());
+        let loaded =
+            tokio::task::spawn_blocking(move || load_for_reload(&source, instance.as_deref()))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("reload task failed: {e}")));
+        match loaded {
+            Ok(config) => {
+                if event_tx
+                    .send(DaemonEvent::Reload(Box::new(config)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(e) => tracing::error!(
+                error = %format!("{e:#}"),
+                "Configuration reload failed; coppad keeps running on its current settings"
+            ),
+        }
+    }
+}
+
+async fn run_daemon(
+    config: DaemonConfig,
+    source: ConfigSource,
+    instance: Option<String>,
+) -> Result<()> {
     if config.engine.callsign.is_empty() {
         tracing::warn!("No callsign configured. Set [engine] callsign in config.");
     }
@@ -268,28 +389,10 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     );
 
     // COP-32/COP-36: config checks first, before any hardware or socket is
-    // touched. The profile check comes first so a typo'd name is reported as
-    // an unknown profile, not through check_sample_rate's fallback rate.
-    // COP-53: a WebSocket-enabled config needs a valid token and origin list,
-    // checked in every build (the keys deserialize in every build).
-    config.check_profile().map_err(anyhow::Error::msg)?;
-    config.check_buffer_size().map_err(anyhow::Error::msg)?;
-    config.check_sample_rate().map_err(anyhow::Error::msg)?;
-    config.check_audio_selectors().map_err(anyhow::Error::msg)?;
-    config.check_session().map_err(anyhow::Error::msg)?;
-    config.check_station_id().map_err(anyhow::Error::msg)?;
-    config.check_websocket_auth().map_err(anyhow::Error::msg)?;
-    config
-        .check_websocket_built(cfg!(feature = "websocket"))
-        .map_err(anyhow::Error::msg)?;
-    config
-        .check_ardop_built(cfg!(feature = "ardop"))
-        .map_err(anyhow::Error::msg)?;
-    config
-        .check_mdns(cfg!(feature = "mdns"))
-        .map_err(anyhow::Error::msg)?;
-    #[cfg(not(feature = "cpal-backend"))]
-    check_no_selected_devices(&config.audio)?;
+    // touched. COP-53: a WebSocket-enabled config needs a valid token and
+    // origin list, checked in every build (the keys deserialize in every
+    // build). COP-85: the gates live in one function a reload reuses.
+    config.check_for_run().map_err(anyhow::Error::msg)?;
 
     // Create event loop. Fails loudly (rather than silently falling back to
     // NullPtt) if [radio] ptt_method doesn't parse or names an
@@ -304,7 +407,7 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     // Failing to start it is logged, not fatal.
     // COP-50: the guardian's state is kept for the startup summary.
     let guardian = if event_loop.ptt_guardian_eligible() {
-        match ptt_guardian::PttGuardian::spawn(&config.radio) {
+        match ptt_guardian::PttGuardian::spawn(&config.radio, instance.as_deref()) {
             Ok(guardian) => {
                 let pid = guardian.pid().unwrap_or_default();
                 tracing::info!(pid, "PTT guardian started");
@@ -381,6 +484,27 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     } else {
         None
     };
+    #[cfg(feature = "kiss-tnc")]
+    let kiss_listener = if config.host.kiss_enabled {
+        Some(
+            bind_host_port(
+                "KISS datagram port",
+                &config.host.bind_address,
+                config.host.kiss_port,
+                "kiss_port",
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    #[cfg(feature = "kiss-tnc")]
+    let kiss_state = match &kiss_listener {
+        Some(listener) => listener_state(listener)?,
+        None => startup_report::Listener::Disabled,
+    };
+    #[cfg(not(feature = "kiss-tnc"))]
+    let kiss_state = startup_report::Listener::NotBuilt;
     #[cfg(feature = "websocket")]
     let ws_listener = if config.host.websocket_enabled {
         Some(
@@ -595,6 +719,10 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
             &config.host,
         ));
     }
+    #[cfg(feature = "kiss-tnc")]
+    if let Some(listener) = kiss_listener {
+        kiss_wiring::serve_kiss(&mut event_loop, listener, &config.host);
+    }
     if host_surfaces_on {
         // The queue is unbounded, so it needs exactly one drainer.
         tokio::spawn(event_loop::forward_data_out(response_rx, data_out_senders));
@@ -636,7 +764,7 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
             config.host.bind_address.clone(),
         )
         .with_auth(auth)
-        .with_index_html(include_str!("web/index.html"))
+        .with_index_html(web::INDEX_HTML)
         .with_health(health);
 
         // Pipe WebSocket events into the daemon event loop
@@ -670,26 +798,21 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         });
     }
 
-    // Handle shutdown signals
-    let shutdown_tx = event_tx.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        tracing::info!("Received SIGINT, shutting down");
-        let _ = shutdown_tx.send(DaemonEvent::Shutdown).await;
-    });
-
-    #[cfg(unix)]
-    {
-        let sigterm_tx = event_tx.clone();
-        tokio::spawn(async move {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm =
-                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
-            sigterm.recv().await;
-            tracing::info!("Received SIGTERM, shutting down");
-            let _ = sigterm_tx.send(DaemonEvent::Shutdown).await;
-        });
-    }
+    // COP-85: every stop and reload handler is installed here, before
+    // "Daemon ready", so a signal sent right after that line never meets a
+    // default action. A second stop request wakes `force`.
+    let signals = signals::Signals::register()?;
+    let force = std::sync::Arc::new(tokio::sync::Notify::new());
+    let (reload_requests, reload_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(serve_reloads(
+        reload_rx,
+        source,
+        instance.clone(),
+        event_tx.clone(),
+    ));
+    tokio::spawn(signals.run(event_tx.clone(), force.clone(), move || {
+        let _ = reload_requests.send(());
+    }));
 
     // COP-50: state what startup actually did, then ready or degraded.
     tracing::info!(
@@ -699,6 +822,7 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         ardop_command = %ardop_state.0,
         ardop_data = %ardop_state.1,
         websocket = %ws_state,
+        kiss = %kiss_state,
         "Host listeners"
     );
     if startup_report::exposed([
@@ -707,12 +831,15 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         &ardop_state.0,
         &ardop_state.1,
         &ws_state,
+        &kiss_state,
     ]) {
         tracing::warn!(
             bind_address = %config.host.bind_address,
-            "Host listeners accept connections from other hosts; anyone who can reach them \
-             can key the transmitter. Use bind_address = \"127.0.0.1\" unless this network \
-             is trusted and firewalled"
+            "Host listeners accept connections from other hosts; exposed VARA-style, ARDOP \
+             and KISS ports have no authentication and let anyone who can reach them key \
+             the transmitter. WebSocket requires websocket_token; over ws:// the token \
+             crosses the network in clear text. Use bind_address = \"127.0.0.1\" unless \
+             this network is trusted and firewalled"
         );
     }
     #[cfg(feature = "cpal-backend")]
@@ -758,11 +885,12 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
             let ad = mdns::advertisement(*addr).map_err(|_| {
                 anyhow::anyhow!(mdns::unreachable_bind_address(&addr.ip().to_string()))
             })?;
-            let responder = mdns::Responder::start(&ad)
+            let names = mdns::Names::for_instance(instance.as_deref());
+            let responder = mdns::Responder::start_named(&ad, &names)
                 .map_err(|e| anyhow::anyhow!("failed to start the mDNS responder: {e}"))?;
             tracing::info!(
-                host = %mdns::HOST_NAME,
-                service = %format!("{}.{}", mdns::INSTANCE, mdns::SERVICE_TYPE),
+                host = %names.host,
+                service = %format!("{}.{}", names.instance, mdns::SERVICE_TYPE),
                 port = ad.port,
                 addresses = ?ad.addresses.to_string(),
                 "mDNS advertisement"
@@ -780,8 +908,24 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
         tracing::error!(problems = %problems.join("; "), "Daemon running degraded");
     }
 
-    // Run the event loop
-    let run = event_loop.run().await;
+    // Run the event loop. COP-85: a second stop request cancels it at its
+    // next await point; PTT is then released here and the process exits.
+    let finished = {
+        let run = event_loop.run();
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => Some(result),
+            () = force.notified() => None,
+        }
+    };
+    let Some(run) = finished else {
+        event_loop.release_ptt_for_forced_exit();
+        // The backend's Drop releases again if needed; the guardian pipe
+        // closes with an `R` already sent. The mDNS goodbye is skipped.
+        drop(event_loop);
+        tracing::warn!("Daemon stopped before its shutdown finished");
+        std::process::exit(signals::FORCED_EXIT_STATUS);
+    };
 
     // COP-140: goodbye packets, on an event-loop error too, so peers drop
     // coppad.local now rather than when its records expire.
@@ -792,27 +936,6 @@ async fn run_daemon(config: DaemonConfig) -> Result<()> {
     run?;
 
     tracing::info!("Daemon stopped");
-    Ok(())
-}
-
-/// COP-32: a build without `cpal-backend` opens no audio device, so a named
-/// one can never be found.
-#[cfg(not(feature = "cpal-backend"))]
-fn check_no_selected_devices(audio: &config::AudioConfig) -> Result<()> {
-    for (key, name) in [
-        ("input_device", &audio.input_device),
-        ("output_device", &audio.output_device),
-        ("input_device_id", &audio.input_device_id),
-        ("output_device_id", &audio.output_device_id),
-    ] {
-        if !name.is_empty() {
-            anyhow::bail!(
-                "[audio] {key} = {name:?} is set, but this coppad was built without the \
-                 cpal-backend feature and opens no audio devices; rebuild with \
-                 --features cpal-backend, or clear [audio] {key}"
-            );
-        }
-    }
     Ok(())
 }
 

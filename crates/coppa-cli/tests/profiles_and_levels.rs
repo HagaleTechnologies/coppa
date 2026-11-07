@@ -129,7 +129,7 @@ fn shown_max_bytes_is_the_tx_limit() {
         let detail = stdout(&coppa(&["profiles", "-p", name]));
         let max: usize = detail
             .lines()
-            .find_map(|line| line.trim().strip_prefix("Max bytes per frame: "))
+            .find_map(|line| line.trim().strip_prefix("Payload bytes per codeword: "))
             .unwrap_or_else(|| panic!("no max bytes line:\n{detail}"))
             .parse()
             .expect("max bytes is a number");
@@ -217,4 +217,39 @@ fn tx_level_9_on_vhf_fast_decodes() {
 fn level_out_of_range_is_a_usage_error() {
     let output = coppa(&["tx", "CQ", "--level", "10"]);
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+}
+
+#[test]
+fn every_text_view_explains_the_codeword_budget() {
+    let note = "Payload budgets are bytes after compression, before FEC, per codeword.\nThey include any transport headers, but exclude the per-codeword CRC.\nWith compression enabled, how much input fits depends on its contents.\nThese are not limits on a daemon host write. The daemon chunks stream data\nfor the current speed level and may use multiple codewords per frame.\nKISS datagrams have a separate limit; see docs/RETICULUM.md.\n";
+    for command in ["profiles", "config"] {
+        let mut views = vec![vec![command]];
+        let levels: Vec<String> = (1..=9).map(|n| n.to_string()).collect();
+        for level in &levels {
+            views.push(vec![command, "--level", level]);
+        }
+        for name in ["HF_ROBUST", "HF_STANDARD", "VHF_FAST", "EMERGENCY"] {
+            views.push(vec![command, "-p", name]);
+        }
+        for args in views {
+            let output = coppa(&args);
+            assert!(output.status.success(), "{}", stderr(&output));
+            let out = stdout(&output);
+            assert_eq!(out.matches(note).count(), 1, "{args:?}: {out}");
+            assert!(!out.contains("Max bytes per frame"), "{out}");
+            assert!(!out.contains("payload one frame carries"), "{out}");
+            if args.contains(&"-p") {
+                assert!(out.contains("Payload bytes per codeword:"), "{out}");
+                assert!(out.contains("Air time, 1-codeword frame:"), "{out}");
+            } else {
+                assert!(out.contains("AIR TIME, 1-CODEWORD FRAME"), "{out}");
+                assert!(
+                    out.contains(
+                        "MAX BYTES is the payload budget per codeword at the listed speed level.\n"
+                    ),
+                    "{out}"
+                );
+            }
+        }
+    }
 }

@@ -53,5 +53,4 @@ on a clean channel (highest rate, least redundancy, heaviest known-pad pinning).
 Any future alpha/decoder-parameter change must be validated across the whole
 speed ladder and payload-size extremes before shipping as the default.
 
-Full rationale, the audited `k_used` table, and the i_LS cross-validation:
-`docs/adr/005-nr-bg2-ldpc.md` and `.superpowers/sdd/p2-task-4-report.md`.
+Full rationale and decision record: `docs/adr/005-nr-bg2-ldpc.md`.

@@ -3,8 +3,17 @@
 //! Implements HDLC framing (flags + bit stuffing), NRZI encoding,
 //! and continuous-phase FSK audio generation at 48 kHz.
 //! Also provides a streaming demodulator with correlator-based detection.
-use std::f32::consts::{PI, TAU};
+use std::{
+    collections::VecDeque,
+    f32::consts::{PI, TAU},
+};
 
+pub use crate::hdlc::append_fcs;
+// The AFSK receiver keeps its own HDLC parser: FX.25 needs bit positions
+// and reception spans that the shared HdlcDecoder does not expose.
+use crate::hdlc::{bit_stuff, bits_to_byte_lsb, byte_to_bits_lsb, nrzi_encode};
+#[cfg(test)]
+use crate::hdlc::{bit_unstuff, nrzi_decode};
 use crc::{Crc, CRC_16_IBM_SDLC};
 
 const BAUD_RATE: u32 = 1200;
@@ -19,120 +28,6 @@ const POSTAMBLE_FLAGS: usize = 2;
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
-
-/// Convert a byte to 8 bits, LSB first (AX.25 standard).
-fn byte_to_bits_lsb(byte: u8) -> [u8; 8] {
-    let mut bits = [0u8; 8];
-    for (i, b) in bits.iter_mut().enumerate() {
-        *b = (byte >> i) & 1;
-    }
-    bits
-}
-
-/// Convert 8 bits (LSB first) back to a byte.
-fn bits_to_byte_lsb(bits: &[u8]) -> u8 {
-    debug_assert!(bits.len() >= 8);
-    let mut byte = 0u8;
-    for (i, &b) in bits.iter().enumerate().take(8) {
-        byte |= b << i;
-    }
-    byte
-}
-
-/// Insert a zero bit after every run of five consecutive 1s (HDLC bit stuffing).
-/// Operates on the frame body only; flag sequences are exempt.
-fn bit_stuff(bits: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bits.len() + bits.len() / 5);
-    let mut ones_run = 0u32;
-    for &bit in bits {
-        out.push(bit);
-        if bit == 1 {
-            ones_run += 1;
-            if ones_run == 5 {
-                out.push(0); // stuffed zero
-                ones_run = 0;
-            }
-        } else {
-            ones_run = 0;
-        }
-    }
-    out
-}
-
-/// Remove stuffed zero bits.  Returns `None` if 6 or more consecutive 1s are
-/// encountered (which would indicate a flag or an abort sequence, not data).
-#[allow(dead_code)] // used in tests
-fn bit_unstuff(bits: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(bits.len());
-    let mut ones_run = 0u32;
-    let mut i = 0;
-    while i < bits.len() {
-        let bit = bits[i];
-        if bit == 1 {
-            ones_run += 1;
-            if ones_run == 6 {
-                // Six consecutive 1s — invalid in data context.
-                return None;
-            }
-            out.push(1);
-        } else {
-            if ones_run == 5 {
-                // This is a stuffed zero — skip it (do not push).
-                ones_run = 0;
-                i += 1;
-                continue;
-            }
-            ones_run = 0;
-            out.push(0);
-        }
-        i += 1;
-    }
-    Some(out)
-}
-
-/// NRZI encode: bit 1 means *no change*, bit 0 means *transition*.
-/// Initial state is `true` (mark frequency).
-fn nrzi_encode(bits: &[u8]) -> Vec<bool> {
-    let mut out = Vec::with_capacity(bits.len());
-    let mut state = true;
-    for &bit in bits {
-        if bit == 0 {
-            state = !state; // transition
-        }
-        // bit == 1: no change
-        out.push(state);
-    }
-    out
-}
-
-/// NRZI decode: same consecutive value → 1, different → 0.
-/// Previous symbol starts as `true` (mark).
-#[allow(dead_code)] // used in tests
-fn nrzi_decode(symbols: &[bool]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(symbols.len());
-    let mut prev = true;
-    for &sym in symbols {
-        out.push(if sym == prev { 1 } else { 0 });
-        prev = sym;
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/// Append the AX.25 FCS (CRC-16/X.25, low byte first) to `frame`.
-///
-/// This is the same check [`Demodulator`] verifies, so
-/// `modulate(&append_fcs(frame))` decodes back to `append_fcs(frame)`.
-pub fn append_fcs(frame: &[u8]) -> Vec<u8> {
-    let fcs = Crc::<u16>::new(&CRC_16_IBM_SDLC).checksum(frame);
-    let mut out = Vec::with_capacity(frame.len() + 2);
-    out.extend_from_slice(frame);
-    out.extend_from_slice(&fcs.to_le_bytes());
-    out
-}
 
 /// Modulate raw AX.25 frame bytes (CRC already appended, e.g. by [`append_fcs`])
 /// into 48 kHz audio.
@@ -168,8 +63,12 @@ pub fn modulate(frame_bytes: &[u8]) -> Vec<f32> {
         bits.extend_from_slice(&flag_bits);
     }
 
+    bits_to_audio(&bits)
+}
+
+fn bits_to_audio(bits: &[u8]) -> Vec<f32> {
     // --- 2. NRZI encode -------------------------------------------------------
-    let symbols = nrzi_encode(&bits);
+    let symbols = nrzi_encode(bits);
 
     // --- 3. Generate continuous-phase FSK audio -------------------------------
     let total_samples = symbols.len() * SAMPLES_PER_SYMBOL as usize;
@@ -191,6 +90,78 @@ pub fn modulate(frame_bytes: &[u8]) -> Vec<f32> {
 
     samples
 }
+
+/// Failure to construct an FX.25 frame.
+#[derive(Debug, thiserror::Error)]
+pub enum Fx25Error {
+    /// Stuffed frame and inner flags exceed 223 bytes.
+    #[error("AX.25 frame does not fit FX.25 with 32 parity bytes")]
+    FrameTooLong,
+    /// Input must include a valid AX.25 FCS.
+    #[error("AX.25 frame has an invalid FCS")]
+    InvalidFcs,
+}
+
+/// Encode a frame including its FCS as FX.25, mono 48 kHz AFSK 1200.
+/// Uses the shortest fitting profile with 32 parity bytes.
+pub fn modulate_fx25(frame_bytes: &[u8]) -> Result<Vec<f32>, Fx25Error> {
+    if !valid_fcs(frame_bytes) {
+        return Err(Fx25Error::InvalidFcs);
+    }
+    let flag = byte_to_bits_lsb(HDLC_FLAG);
+    let mut inner = flag.to_vec();
+    inner.extend(bit_stuff(
+        &frame_bytes
+            .iter()
+            .flat_map(|&b| byte_to_bits_lsb(b))
+            .collect::<Vec<_>>(),
+    ));
+    inner.extend(flag);
+    let profile = [7, 6, 5, 4]
+        .into_iter()
+        .map(|i| crate::fx25::PROFILES[i])
+        .find(|p| inner.len() <= p.data * 8)
+        .ok_or(Fx25Error::FrameTooLong)?;
+    let mut i = 0;
+    while inner.len() < profile.data * 8 {
+        inner.push(flag[i % 8]);
+        i += 1;
+    }
+    let data: Vec<_> = inner.chunks_exact(8).map(bits_to_byte_lsb).collect();
+    let block = crate::fx25::encode(&data, profile);
+    let mut outer = flag.repeat(PREAMBLE_FLAGS);
+    outer.extend(
+        profile
+            .tag
+            .to_le_bytes()
+            .iter()
+            .flat_map(|&b| byte_to_bits_lsb(b)),
+    );
+    outer.extend(block.iter().flat_map(|&b| byte_to_bits_lsb(b)));
+    outer.extend(flag.repeat(POSTAMBLE_FLAGS));
+    Ok(bits_to_audio(&outer))
+}
+
+fn valid_fcs(bytes: &[u8]) -> bool {
+    bytes.len() >= 3 && append_fcs(&bytes[..bytes.len() - 2]) == bytes
+}
+
+#[derive(Debug)]
+struct ReceivedFrame {
+    bytes: Vec<u8>,
+    start: u64,
+    end: u64,
+}
+
+#[derive(Debug)]
+struct FxReception {
+    profile: crate::fx25::Profile,
+    start: u64,
+}
+
+// Every defined profile has at most 255 transmitted bytes. Competing tags
+// retain only start positions; their bits share this one bounded window.
+const FX_WINDOW_BITS: usize = 255 * 8;
 
 // ---------------------------------------------------------------------------
 // Demodulator
@@ -223,8 +194,17 @@ pub struct Demodulator {
     bit_buffer: Vec<u8>, // accumulated data bits for current frame
     ones_count: u32,     // consecutive 1-bits for flag/stuffing detection
 
+    fx_tag: u64,
+    fx_tag_bits: usize,
+    fx: Vec<FxReception>,
+    fx_bits: VecDeque<u8>,
+    pending_plain: Vec<ReceivedFrame>,
+    delivered_spans: VecDeque<(u64, u64)>,
+
     // Completed frames
-    frames: Vec<Vec<u8>>,
+    frames: Vec<ReceivedFrame>,
+    bit_position: u64,
+    hdlc_start: u64,
 }
 
 impl Default for Demodulator {
@@ -250,6 +230,14 @@ impl Demodulator {
             bit_buffer: Vec::new(),
             ones_count: 0,
             frames: Vec::new(),
+            bit_position: 0,
+            hdlc_start: 0,
+            fx_tag: 0,
+            fx_tag_bits: 0,
+            fx: Vec::new(),
+            fx_bits: VecDeque::new(),
+            pending_plain: Vec::new(),
+            delivered_spans: VecDeque::new(),
         }
     }
 
@@ -294,7 +282,7 @@ impl Demodulator {
                 self.prev_symbol = is_mark;
 
                 // Feed bit into HDLC state machine
-                self.hdlc_process_bit(bit);
+                self.receive_bit(bit);
 
                 // Reset correlator for next symbol
                 self.mark_sin_acc = 0.0;
@@ -302,6 +290,89 @@ impl Demodulator {
                 self.space_sin_acc = 0.0;
                 self.space_cos_acc = 0.0;
                 self.sample_count = 0;
+            }
+        }
+    }
+
+    fn emit_frame(&mut self, frame: ReceivedFrame) {
+        let span = (frame.start, frame.end);
+        if !self.delivered_spans.contains(&span) {
+            self.delivered_spans.push_back(span);
+            self.frames.push(frame);
+        }
+    }
+
+    fn receive_bit(&mut self, bit: u8) {
+        self.bit_position += 1;
+        // Keep only reception associations that a maximum-size FX.25 block
+        // could still reproduce. Identical later transmissions have new spans.
+        self.delivered_spans
+            .retain(|&(_, end)| self.bit_position - end <= FX_WINDOW_BITS as u64);
+        self.hdlc_process_bit(bit);
+        self.fx_bits.push_back(bit);
+        if self.fx_bits.len() > FX_WINDOW_BITS {
+            self.fx_bits.pop_front();
+        }
+        let candidates = std::mem::take(&mut self.fx);
+        for rx in candidates {
+            let length = (rx.profile.data + rx.profile.parity) * 8;
+            if self.bit_position - rx.start < length as u64 {
+                self.fx.push(rx);
+                continue;
+            }
+            let bits: Vec<_> = self
+                .fx_bits
+                .iter()
+                .skip(self.fx_bits.len() - length)
+                .copied()
+                .collect();
+            let block: Vec<_> = bits.chunks_exact(8).map(bits_to_byte_lsb).collect();
+            let corrected = crate::fx25::decode(&block, rx.profile).and_then(|data| {
+                // Reuse ordinary HDLC/FCS validation without tag detection.
+                let mut parser = Self::new();
+                for b in data {
+                    for bit in byte_to_bits_lsb(b) {
+                        parser.bit_position += 1;
+                        parser.hdlc_process_bit(bit);
+                    }
+                }
+                parser.frames.into_iter().next().map(|mut frame| {
+                    frame.start += rx.start;
+                    frame.end += rx.start;
+                    frame
+                })
+            });
+            if let Some(frame) = corrected {
+                self.pending_plain.retain(|plain| {
+                    !(plain.start == frame.start
+                        && plain.end == frame.end
+                        && plain.bytes == frame.bytes)
+                });
+                self.emit_frame(frame);
+            }
+        }
+        let pending = std::mem::take(&mut self.pending_plain);
+        for frame in pending {
+            if self.fx.iter().any(|rx| {
+                rx.start < frame.start
+                    && frame.end <= rx.start + ((rx.profile.data + rx.profile.parity) * 8) as u64
+            }) {
+                self.pending_plain.push(frame);
+            } else {
+                self.emit_frame(frame);
+            }
+        }
+        self.fx_tag = (self.fx_tag >> 1) | ((bit as u64) << 63);
+        self.fx_tag_bits = (self.fx_tag_bits + 1).min(64);
+        if self.fx_tag_bits == 64 {
+            if let Some(profile) = crate::fx25::find_tag(self.fx_tag) {
+                // Keep competing starts: even a correctable damaged block can
+                // contain a second tag. All candidates expire within one window,
+                // with at most one start per incoming bit.
+                self.fx.push(FxReception {
+                    start: self.bit_position,
+                    profile,
+                });
             }
         }
     }
@@ -349,6 +420,7 @@ impl Demodulator {
                         self.try_extract_frame();
                     }
                 }
+                self.hdlc_start = self.bit_position;
                 self.in_frame = true;
                 self.bit_buffer.clear();
                 self.ones_count = 0;
@@ -404,13 +476,25 @@ impl Demodulator {
 
         if computed_fcs == received_fcs {
             // Push the full frame including CRC (as the modulator expects)
-            self.frames.push(bytes);
+            let frame = ReceivedFrame {
+                bytes,
+                start: self.hdlc_start,
+                end: self.bit_position,
+            };
+            if self.fx.is_empty() {
+                self.emit_frame(frame);
+            } else {
+                self.pending_plain.push(frame);
+            }
         }
     }
 
     /// Extract all completed frames, draining the internal buffer.
     pub fn take_frames(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.frames)
+            .into_iter()
+            .map(|frame| frame.bytes)
+            .collect()
     }
 
     /// Reset the demodulator to its initial state.
@@ -426,6 +510,7 @@ impl Demodulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crc::{Crc, CRC_16_IBM_SDLC};
 
     #[test]
     fn test_byte_to_bits_lsb() {
@@ -674,5 +759,73 @@ mod tests {
             crossings,
             min_crossings
         );
+    }
+
+    #[test]
+    fn fx25_rs_success_still_requires_inner_fcs() {
+        let mut frame = append_fcs(b"invalid inner FCS");
+        frame[0] ^= 1;
+        let flag = byte_to_bits_lsb(0x7e);
+        let mut inner = flag.to_vec();
+        inner.extend(bit_stuff(
+            &frame
+                .iter()
+                .flat_map(|&b| byte_to_bits_lsb(b))
+                .collect::<Vec<_>>(),
+        ));
+        inner.extend(flag);
+        let p = crate::fx25::PROFILES[7];
+        let mut i = 0;
+        while inner.len() < p.data * 8 {
+            inner.push(flag[i % 8]);
+            i += 1;
+        }
+        let block = crate::fx25::encode(
+            &inner
+                .chunks_exact(8)
+                .map(bits_to_byte_lsb)
+                .collect::<Vec<_>>(),
+            p,
+        );
+        let mut receiver = Demodulator::new();
+        for byte in p.tag.to_le_bytes().into_iter().chain(block) {
+            for bit in byte_to_bits_lsb(byte) {
+                receiver.receive_bit(bit);
+            }
+        }
+        assert!(receiver.take_frames().is_empty());
+    }
+
+    #[test]
+    fn fx25_exact_stuffed_capacity_boundaries() {
+        for byte in [0, 0xff] {
+            let mut seen = [false; 4];
+            for len in 1..=224 {
+                let frame = append_fcs(&vec![byte; len]);
+                let raw: Vec<_> = frame.iter().flat_map(|&b| byte_to_bits_lsb(b)).collect();
+                let size = (16 + bit_stuff(&raw).len()).div_ceil(8);
+                let capacities = [32, 64, 128, 223];
+                let fitting = capacities.iter().position(|&capacity| size <= capacity);
+                match (fitting, modulate_fx25(&frame)) {
+                    (Some(i), Ok(audio)) => {
+                        seen[i] = true;
+                        assert_eq!(
+                            audio.len(),
+                            (36 * 8 + 64 + (capacities[i] + 32) * 8 + 2 * 8) * 40
+                        );
+                        // All-ones bodies exercise extra stuffing; the FCS
+                        // and closing flag must survive every size transition.
+                        if len % 17 == 0 {
+                            let mut receiver = Demodulator::new();
+                            receiver.process(&audio);
+                            assert_eq!(receiver.take_frames(), vec![frame]);
+                        }
+                    }
+                    (None, Err(Fx25Error::FrameTooLong)) => {}
+                    other => panic!("wrong stuffed-capacity result for {len} x {byte}: {other:?}"),
+                }
+            }
+            assert!(seen.into_iter().all(|seen| seen));
+        }
     }
 }

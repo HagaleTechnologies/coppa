@@ -110,20 +110,19 @@ pub fn release_once(ptt: &PttConfig, rigctld_address: &str, inverted: bool) -> a
             )?;
             PttControl::set_ptt(&mut client, PttState::Rx)
         }
-        PttConfig::Gpio { pin } => {
+        PttConfig::Gpio { line } => {
             #[cfg(all(feature = "gpio-ptt", target_os = "linux"))]
             {
-                let pin_num: u32 = pin
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("invalid GPIO pin {pin:?}"))?;
-                let mut gpio = coppa_radio::ptt_gpio::GpioPtt::open(pin_num, inverted)?;
+                // COP-85: the guardian's own consumer label, so `gpioinfo`
+                // tells it apart from the daemon.
+                let mut gpio = crate::event_loop::open_gpio_ptt(line, inverted, "coppad-guardian")?;
                 gpio.set_ptt(PttState::Rx)
             }
             #[cfg(not(all(feature = "gpio-ptt", target_os = "linux")))]
             {
                 let _ = inverted;
                 anyhow::bail!(
-                    "GPIO pin {pin}: PTT method 'gpio' requires coppad to be built with \
+                    "GPIO line {line}: PTT method 'gpio' requires coppad to be built with \
                      --features gpio-ptt, on Linux"
                 )
             }
@@ -161,10 +160,16 @@ pub fn ptt_guardian_eligible(radio: &RadioConfig, backend_is_rigctld: bool) -> b
     }
 }
 
-/// The arguments `PttGuardian::spawn` starts `coppad` with: the method, the
-/// rigctld address, and `--guardian-ptt-invert` when `[radio] ptt_invert` is
-/// set.
-fn guardian_args(radio: &RadioConfig) -> Vec<String> {
+/// COP-85: Windows `CREATE_NEW_PROCESS_GROUP` process creation flag. A new
+/// process group does not receive the console's Ctrl-C, the Windows
+/// counterpart of Unix's `process_group(0)`.
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+/// COP-85: the guardian's command line after the program name: the method,
+/// the rigctld address, `--guardian-ptt-invert` when `[radio] ptt_invert` is
+/// set (COP-52), and the instance name.
+pub fn guardian_args(radio: &RadioConfig, instance: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "--ptt-guardian".to_string(),
         radio.ptt_method.clone(),
@@ -173,6 +178,9 @@ fn guardian_args(radio: &RadioConfig) -> Vec<String> {
     ];
     if radio.ptt_invert {
         args.push("--guardian-ptt-invert".to_string());
+    }
+    if let Some(name) = instance {
+        args.extend(["--instance".to_string(), name.to_string()]);
     }
     args
 }
@@ -184,15 +192,21 @@ pub struct PttGuardian {
 }
 
 impl PttGuardian {
-    /// Start `coppad --ptt-guardian …` for `radio`, in its own process group
-    /// on Unix so a signal to the daemon's group does not reach it. Its
-    /// stdout and stderr are inherited, so its log lines land with the
-    /// daemon's.
-    pub fn spawn(radio: &RadioConfig) -> io::Result<Self> {
+    /// Start `coppad --ptt-guardian …` for `radio`, in its own process
+    /// group, so a signal to the daemon's group (Unix) or a console Ctrl-C to
+    /// the daemon (Windows, COP-85) does not reach it. Its stdout and stderr
+    /// are inherited, so its log lines land with the daemon's.
+    ///
+    /// COP-85: for `coppad --instance NAME`, the guardian gets the same
+    /// `--instance`, so its log lines carry the same prefix.
+    pub fn spawn(radio: &RadioConfig, instance: Option<&str>) -> io::Result<Self> {
         let mut cmd = Command::new(std::env::current_exe()?);
-        cmd.args(guardian_args(radio)).stdin(Stdio::piped());
+        cmd.args(guardian_args(radio, instance))
+            .stdin(Stdio::piped());
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut cmd, CREATE_NEW_PROCESS_GROUP);
         let mut child = cmd.spawn()?;
         let stdin = child
             .stdin
@@ -418,7 +432,7 @@ mod tests {
             ..RadioConfig::default()
         };
         assert_eq!(
-            guardian_args(&radio),
+            guardian_args(&radio, None),
             [
                 "--ptt-guardian",
                 "gpio:17",
@@ -428,7 +442,7 @@ mod tests {
         );
         radio.ptt_invert = true;
         assert_eq!(
-            guardian_args(&radio),
+            guardian_args(&radio, None),
             [
                 "--ptt-guardian",
                 "gpio:17",
@@ -436,6 +450,21 @@ mod tests {
                 "127.0.0.1:4532",
                 "--guardian-ptt-invert"
             ]
+        );
+    }
+
+    #[cfg(all(feature = "gpio-ptt", target_os = "linux"))]
+    #[test]
+    fn release_once_opens_the_chardev_form() {
+        let ptt = PttConfig::parse("gpio:coppa-test-no-such-chip:3").unwrap();
+        let msg = release_once(&ptt, "127.0.0.1:1", false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.starts_with(
+                "failed to open GPIO PTT line coppa-test-no-such-chip:3: no GPIO chip matches"
+            ),
+            "{msg}"
         );
     }
 
@@ -533,6 +562,35 @@ mod tests {
                 .expect("guardian connect exceeded its two-second timeout")
                 .is_err(),
             "a saturated listener cannot accept the release connection"
+        );
+    }
+
+    #[test]
+    fn guardian_args_carry_the_instance() {
+        let radio = RadioConfig {
+            ptt_method: "rigctld".to_string(),
+            rigctld_address: "127.0.0.1:4532".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            guardian_args(&radio, None),
+            [
+                "--ptt-guardian",
+                "rigctld",
+                "--guardian-rigctld-address",
+                "127.0.0.1:4532"
+            ]
+        );
+        assert_eq!(
+            guardian_args(&radio, Some("hf")),
+            [
+                "--ptt-guardian",
+                "rigctld",
+                "--guardian-rigctld-address",
+                "127.0.0.1:4532",
+                "--instance",
+                "hf"
+            ]
         );
     }
 }

@@ -14,6 +14,10 @@ coppa-codec = { path = "../coppa-codec" }
 coppa-protocol = { path = "../coppa-protocol" }
 coppa-channel = { path = "../coppa-channel" }
 coppa-ml = { path = "../coppa-ml" }
+# default-features = false: coppa-audio's defaults turn on cpal-backend (ALSA on
+# Linux). The COP-112 TNC benchmark needs only the WAV file backend and the resampler.
+coppa-audio = { path = "../coppa-audio", default-features = false, features = ["file-backend"] }
+anyhow = { workspace = true }
 rand = { workspace = true }
 clap = { workspace = true }
 num-complex = { workspace = true }
@@ -28,6 +32,10 @@ workspace = true
 [[example]]
 name = "adaptive_mcs_validation"
 path = "diagnostics/adaptive_mcs_validation.rs"
+
+[[example]]
+name = "afsk_vs_direwolf"
+path = "diagnostics/afsk_vs_direwolf.rs"
 
 [[example]]
 name = "capacity_ground_truth_diagnosis"
@@ -130,6 +138,10 @@ name = "short_cp_fading_gate"
 path = "diagnostics/short_cp_fading_gate.rs"
 
 [[example]]
+name = "streaming_sync_threshold"
+path = "diagnostics/streaming_sync_threshold.rs"
+
+[[example]]
 name = "task1_gate"
 path = "diagnostics/task1_gate.rs"
 
@@ -180,3 +192,19 @@ path = "diagnostics/watterson_header_precise.rs"
 [[example]]
 name = "watterson_sanity_sweep"
 path = "diagnostics/watterson_sanity_sweep.rs"
+
+[[example]]
+name = "g3ruh_fixture_gen"
+path = "diagnostics/g3ruh_fixture_gen.rs"
+
+[[example]]
+name = "g3ruh_vs_direwolf"
+path = "diagnostics/g3ruh_vs_direwolf.rs"
+
+[[example]]
+name = "impairment_transfer"
+path = "diagnostics/impairment_transfer.rs"
+
+[[example]]
+name = "fx25_wav"
+path = "diagnostics/fx25_wav.rs"

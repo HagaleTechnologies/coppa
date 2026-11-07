@@ -18,8 +18,7 @@
 //! length-covering CRC scope in from a since-deleted `to_bits_split_v2`/
 //! `from_payload_bits_v2` duplicate pair that also added an always-zero,
 //! never-used "reserved" byte to the header; that byte carried no real
-//! information, so it was dropped rather than folded in too -- see
-//! `.superpowers/sdd/task-9-report.md`.)
+//! information, so it was dropped rather than folded in too.)
 //!
 //! The preamble and sync word are transmitted uncoded so the receiver can find
 //! the frame boundary before invoking FEC decoding.
@@ -103,14 +102,13 @@ impl Frame {
     /// **CRC scope:** the CRC-16 covers the length byte AND the `data` bytes
     /// (not just `data`), so a corrupted length field is itself detected by
     /// the CRC rather than relying solely on the truncation-length bounds
-    /// check in [`Self::parse_payload`]. (This folds in what used to be a
+    /// check in `Self::parse_payload`. (This folds in what used to be a
     /// separate `to_bits_split_v2`/`from_payload_bits_v2` pair that existed
     /// only to demonstrate a length-covering CRC over a wider "PHY header"
     /// layout with an extra reserved byte; that reserved byte carried no
     /// information and was always discarded on read, so Task 9 folded its one
     /// real difference -- CRC covering the length field -- into this method
-    /// directly and deleted the duplicate. See
-    /// `.superpowers/sdd/task-9-report.md` for the fold decision.)
+    /// directly and deleted the duplicate.)
     pub fn to_bits_split(&self) -> Result<(Vec<u8>, Vec<u8>), ProtocolError> {
         let mut header = Vec::new();
         let mut payload = Vec::new();

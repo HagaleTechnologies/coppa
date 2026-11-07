@@ -62,7 +62,10 @@ FFI). The main encode/decode logic is in `coppa-protocol`, not here.
   sparse (see [[adr-004-strongest-path-timing]]).
 - **`coppa_engine::ladder`** assembles each speed level's modulation, code rate,
   max bytes, air time and bandwidth per band from the encoder's own functions;
-  `coppa profiles` prints it (COP-55).
+  `coppa profiles` prints it (COP-55). The payload budget is per codeword;
+  multi-codeword frames can carry multiples of it, and daemon stream writes
+  are chunked. See [SPEC §12](../../docs/SPEC.md#cli-payload-budget-mapping)
+  for the CLI/JSON units and their relation to the daemon contracts (COP-127).
 
 ## Why it is shaped this way
 
@@ -71,3 +74,12 @@ coupling the test infrastructure to the full engine stack. Applications that
 need only encode/decode (FFI, CLI loopback) get a minimal API surface. The
 daemon and FFI both route streaming decode through `CoppaCore::push_samples`
 rather than duplicating squelch/decompression/payload contracts.
+
+## Benchmark denominators
+
+`cargo bench --bench throughput` covers encode and decode at all nine levels.
+Criterion throughput divides the common 32-byte payload by CPU processing time;
+the ideal clean-loopback frame report divides recovered payload bits by encoded
+audio airtime. These denominators differ, and neither includes session overhead.
+See [Engine processing and ideal frame goodput](../../BENCHMARKS.md#engine-processing-and-ideal-frame-goodput-cop-131)
+for the workload, profile routing, units and reproducible commands.

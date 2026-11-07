@@ -21,17 +21,19 @@ Every table below was checked against coppad 0.3.0 at commit `b9fdb8d` (see
 | VARA-style data port | 8301 | the same key | none | none |
 | ARDOP command / data | 8515 / 8516 | `[host] ardop_enabled = true` | `ardop` | none |
 | WebSocket JSON (and the `GET /` page) | 8400 | `[host] websocket_enabled = true` and `websocket_token` | `websocket` | token; browsers also need an allowed `Origin` |
-| KISS (AFSK 1200 TNC mode) | 8001 | `coppad --tnc`, or `coppa tnc --port N` | `kiss-tnc` (and `cpal-backend` for audio) | none |
+| AGWPE connectionless (AFSK TNC) | opt-in 8000 | `coppa tnc --agw-port 8000` | `kiss-tnc` and `cpal-backend` for audio | none |
+| KISS datagram (OFDM modem) | 8100 | `[host] kiss_enabled = true` | `kiss-tnc` | none |
+| KISS (AFSK 1200 or G3RUH 9600 TNC mode) | 8001 | `coppad --tnc`, or `coppa tnc --port N --baud 9600` for G3RUH | `kiss-tnc` (and `cpal-backend` for audio) | none |
 
 - Every `[host]` server is off by default and binds `bind_address`, which defaults to
   `127.0.0.1`. The keys and their defaults are in [coppad.toml.example](../coppad.toml.example);
   `coppad --print-default-config` prints them too.
 - `cargo build -p coppa-daemon` with no features has the VARA-style ports only. A config that
-  enables WebSocket or ARDOP in a build without that feature stops coppad at startup with an
+  enables WebSocket, ARDOP or KISS in a build without that feature stops coppad at startup with an
   error naming the feature, for example `[host] websocket_enabled = true is set, but this coppad
   was built without the websocket feature`.
-- KISS is a separate mode, not a `[host]` key. It runs the AFSK 1200 AX.25 TNC, not the OFDM
-  modem, and has no session. See [KISS](#kiss-afsk-1200-tnc-mode).
+- KISS datagrams on the OFDM modem use port 8100 and `[host] kiss_enabled`. The separate
+  AFSK 1200 AX.25 TNC uses port 8001 in `--tnc` mode. Both are sessionless.
 - Pick the VARA-style ports for Pat's `varahf` transport or any VARA host; ARDOP for Pat's
   `ardop` transport or an ARDOP host; WebSocket for a dashboard or a program that wants JSON.
   All three drive the same modem and its one session.
@@ -314,7 +316,7 @@ also silent on WebSocket, as noted in the `connect` row.
 | `session` | `"state":"connected"` with `remote_call`, or `"state":"disconnected"` | reliable |
 | `data` | received session data, with `encoding` `utf8` or `base64`, every byte kept | reliable |
 | `ptt`, `busy`, `snr`, `level` | PTT edges, channel occupancy, SNR in dB, speed level | reliable |
-| `heard` | a full snapshot of up to 32 recent session peers | reliable |
+| `heard` | a full snapshot of up to 32 recent stations: session peers plus stations whose station-ID beacons were received (with the beacon's grid, when it carried one) | reliable |
 | `spectrum`, `audio_level`, `log` | only after the client opts in | lossy |
 | `decode_fail` | a cumulative count, at most every 500 ms | lossy |
 
@@ -345,29 +347,46 @@ A <- {"type":"session","state":"disconnected"}   B <- {"type":"session","state":
 The field-by-field description, with more examples, is in
 [OPERATING.md](OPERATING.md#dashboard-protocol-v1).
 
+## KISS datagrams (OFDM modem)
+
+Build with `kiss-tnc` and set `[host] kiss_enabled = true`. The `kiss_port` default
+is 8100 on `bind_address`. One KISS port-0 data frame is one uncompressed OFDM
+broadcast frame, received by peer KISS clients only. There is no ACK or retry.
+See [RETICULUM.md](RETICULUM.md) for setup, size limits, timing and security.
+
 ## KISS (AFSK 1200 TNC mode)
 
 `coppad --tnc` (always port 8001) or `coppa tnc --port N` runs a 1200-baud AFSK AX.25 TNC behind
-a KISS TCP port. It is for bring-up and testing, not an interface to the OFDM modem, and Pat's
+a KISS TCP port. `coppa tnc --baud 9600` selects G3RUH with the same KISS contract.
+This TNC mode is for bring-up and testing, and Pat's
 VARA path does not use it. [TNC.md](TNC.md) covers building and running it.
 
 - Standard KISS framing: `FEND` (`0xC0`) around each frame, `FESC TFEND` and `FESC TFESC` for
   escaped bytes.
 - Only command byte `0x00` (port 0, data) carries frames. TXDELAY, persistence and slot time
   are parsed and ignored.
-- Send frames without an FCS. The TNC adds it on transmit, checks and strips it on receive.
-- Up to 256 bytes of information field.
+- Send complete AX.25 frames without FCS. Ordinary AX.25 adds it on transmit,
+  checks and strips it on receive. IL2P never adds or strips AX.25 FCS.
+- AX.25 and Direwolf 1.7 IL2P are received automatically. `coppa tnc --il2p`
+  selects maximum-FEC IL2P TX; the default and `coppad --tnc` transmit AX.25.
+- Ordinary AX.25 supports the standard 256-byte information field. IL2P supports
+  up to 1023 information bytes in lossless type-1 UI frames, or 1023 total AX.25
+  bytes in transparent type 0. Invalid or oversized IL2P requests are dropped
+  before PTT with `TNC frame cannot be encoded as IL2P; dropping frame`.
+- Direwolf 1.7 IL2P has Reed-Solomon FEC but no trailing CRC. Beyond-bound
+  corruption is not always detectable. See [the interop record](testing/tnc-direwolf-il2p.md).
 - Every client gets each decoded frame, unless it falls more than 64 frames behind: then it
   silently skips the oldest. Up to 16 clients.
-- A client that sends 64 KiB with no `FEND` is disconnected.
+- A frame whose pending bytes exceed 64 KiB is disconnected.
 - No authentication. Keep it on loopback.
 
-**Known defects** (both in [LIMITATIONS.md](LIMITATIONS.md); not fixed):
+TCP read boundaries do not delimit KISS frames. The streaming server decoder holds a partial
+frame, including an escape sequence split across reads, and forwards it only after its closing
+`FEND` arrives (COP-138, COP-148). Unfinished input at EOF is discarded. The standalone
+`kiss_decode` function likewise returns only frames closed by `FEND` (COP-148).
 
-- **A frame split across two TCP reads is sent truncated.** The decoder treats the end of what
-  it has read as the end of a frame, so the first part is keyed on its own and the rest is
-  dropped. A short frame written in one `write` on loopback arrives whole; a client that writes
-  a frame in pieces can hit this. Write each frame in one call.
+**Known defect** (see [LIMITATIONS.md](LIMITATIONS.md)):
+
 - **Frames on a KISS port other than 0 are dropped**, even when they are data frames. A host
   that numbers its ports from 1 sends nothing.
 
@@ -382,7 +401,7 @@ VARA path does not use it. [TNC.md](TNC.md) covers building and running it.
 
 ## Security
 
-- The VARA-style, ARDOP and KISS ports have **no authentication**. Anything that can open a TCP
+- The VARA-style, ARDOP, AGWPE and both KISS ports have **no authentication**. Anything that can open a TCP
   connection to them can key your transmitter. `bind_address` defaults to `127.0.0.1`; change it
   only on a trusted, firewalled network.
 - A web page in your own browser can still send a command line to the VARA-style command port
@@ -406,9 +425,79 @@ At commit `b9fdb8d` (coppad 0.3.0), on Linux, with no radio, no sound card and n
 - The two-station transcript and the WebSocket session came from two release coppads on the
   repo's userspace audio loop (`tools/pat-loop`), driven by raw-socket and WebSocket clients.
 - Every handshake row came from a hand-written WebSocket client.
-- The KISS split-frame and port-number defects were reproduced by feeding `KissServer` directly.
-  The KISS audio paths were not exercised.
+- COP-138 adds `kiss_datagram.rs` for byte-exact OFDM datagrams, split TCP writes, no local
+  echo and VARA isolation. `split_tcp_write_reaches_tx_whole` guards the shared server fix.
+  See [RETICULUM.md](RETICULUM.md) for the real RNS audio-loop run.
 - Real Pat v1.0.0 completed Winlink sessions in both directions through the harness
   ([testing/pat-session.md](testing/pat-session.md#cop-76-run-record-2026-11-02)).
 
 Not run: real VARA, ARDOP at this commit, the C FFI, real radios, a real browser.
+
+### Session fade protection status
+
+The WebSocket status reply's `link.fade_protection` is `"rs12-6"` when the
+session negotiated erasure protection, and `"off"` otherwise. The field is
+present whenever `link` is present. It reports the negotiated mode even if a
+TX-duration guard sends an individual segment as a plain frame.
+`link.fade_hold` separately reports the retransmission fallback state.
+Configure the mode with `[session] fade_protection`; no host command changes it.
+
+## AGWPE connectionless AFSK TNC
+
+`coppa tnc --agw-port 8000` adds AGWPE to the AFSK TNC, alongside KISS on 8001.
+It is disabled by default. `--bind-address` selects both listeners' address,
+defaulting to loopback. See [TNC setup and verification](TNC.md#optional-connectionless-agwpe).
+There is no authentication. Reachable clients can key the transmitter.
+
+Packets have a 36-byte header followed by exactly DataLen body bytes. Offsets:
+port at 0, ASCII command at 4, PID at 6, NUL-padded source callsign at 8..18,
+destination at 18..28, little-endian u32 DataLen at 28..32. Remaining bytes
+are reserved and replies set them to zero. Only wire port 0, shown as radio
+port 1 in clients, is supported. Other ports are consumed without reply.
+
+| Command | Behavior |
+| --- | --- |
+| `R` | Reply body little-endian u32 2005 followed by u32 127 |
+| `G` | Reply `1;Port1 coppa AFSK 1200;` plus NUL |
+| `g` | Reply 12 bytes: `00 FF` then ten zeroes; 1200 baud, unavailable traffic/timing statistics |
+| `X` | Register source callsign; reply normalized source and one byte 01 on success, 00 on failure |
+| `x` | Unregister source, no reply; idempotent |
+| `k` | Toggle raw RX, initially off |
+| `m` | Toggle UI monitoring, initially off |
+| `M` | Build UI frame from source, destination, PID and body; no acknowledgement |
+| `V` | As M, body starts with digipeater count then that many ten-byte callsigns |
+| `K` | Raw TX, discard first body byte, transmit remaining FCS-free AX.25 bytes unchanged |
+| `y` | Reply little-endian u32 pending-frame snapshot |
+
+Callsigns are 1..6 ASCII alphanumerics with optional SSID 0..15, normalized to
+uppercase. Sixteen distinct registrations are permitted per connection. Duplicates
+succeed, including across clients. Registration is not required for TX or RX.
+UI information is limited to 256 bytes and paths to eight digipeaters. Invalid
+transmit requests are consumed with a warning and never transmitted. Empty raw
+payloads are invalid. DataLen above 1024 closes the connection before body allocation.
+Truncated EOF affects only that client. Unknown commands, including `P` and
+connected-mode `C v c D d Y`, are consumed without reply.
+
+Raw subscribers get `K` records with body zero plus the complete FCS-stripped
+frame, including non-UI control types. UI subscribers get `U` records whose header
+contains source, destination and PID. Their body is ASCII metadata followed by
+binary information, CR and NUL, for example:
+` 1:Fm N0CALL To APRS <UI pid=F0 Len=5 PF=0 >[12:34:56]` then CR, `hello`, CR, NUL.
+Timestamps are UTC. Digipeater paths appear as ` Via A,B*`, with the last repeated
+address marked. Command/response bits select P, F or PF. Malformed/non-UI frames
+have no textual monitor record; raw subscribers still receive them. Toggles and
+registrations reset on disconnect. Both subscriptions may be enabled together.
+
+`y` counts the AGW TX channel plus all active/queued transmitter frames from either
+host protocol, including the active PTT tail. It excludes KISS's own waiting
+channel and partial/unaccepted AGW requests. Standalone adapters may supply their
+own transmitter snapshot with `AgwServer::with_pending_frames`.
+
+The server caps connections at 16, TX frames at 256, RX broadcast records at 64
+and each client's outbound queue at 64. A full TX queue disconnects the offending
+client. Replies and RX records wait up to five seconds for outbound space, so
+pipelined requests and receive bursts reach a client that is reading. Writes time
+out after five seconds; a client whose writes stay stalled is disconnected. Broadcast lag skips lost
+records with a log; it never grows a queue. Partial requests survive interleaved RX.
+Winlink Express packet and Outpost BBS connected sessions are unsupported. Real
+UI-View interoperability and monitor formatting remain unverified with those clients.

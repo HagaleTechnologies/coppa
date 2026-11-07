@@ -131,3 +131,16 @@ async fn ardop_framing_errors_preserve_fields_display_and_sources() {
         matches!(err, HostError::Io(source) if source.kind() == std::io::ErrorKind::UnexpectedEof)
     );
 }
+
+#[cfg(feature = "kiss-tnc")]
+#[tokio::test]
+async fn agw_bind_conflict_is_typed() {
+    let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let error = coppa_host::agw::AgwServer::new(held.local_addr().unwrap().port())
+        .start()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, coppa_host::HostError::Io(e) if e.kind() == std::io::ErrorKind::AddrInUse)
+    );
+}

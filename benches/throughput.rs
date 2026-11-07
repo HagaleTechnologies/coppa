@@ -5,33 +5,39 @@ use coppa_codec::BpskModem;
 use coppa_dsp::agc::AdaptiveAgc;
 use coppa_dsp::fft::FftProcessor;
 use coppa_dsp::filter::RrcFilter;
-use coppa_engine::CoppaCore;
 use coppa_protocol::fec::convolutional::{ConvEncoder, ViterbiDecoder};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use num_complex::Complex32;
 use std::hint::black_box;
 
-fn bench_encode(c: &mut Criterion) {
-    let core = CoppaCore::new();
-    let message = "CQ CQ CQ DE VK2ABC VK2ABC K";
+#[path = "support/engine_cases.rs"]
+mod engine_cases;
 
-    c.bench_function("engine_encode", |b| {
-        b.iter(|| {
-            let _ = core.encode(black_box(message)).unwrap();
+fn bench_engine(c: &mut Criterion) {
+    let cases = engine_cases::prepare_cases().expect("engine benchmark setup");
+    print!("{}", engine_cases::frame_report(&cases));
+
+    let mut encode = c.benchmark_group("engine_encode");
+    encode.throughput(Throughput::Bytes(engine_cases::PAYLOAD.len() as u64));
+    for case in &cases {
+        encode.bench_function(BenchmarkId::from_parameter(case.level), |b| {
+            b.iter(|| {
+                black_box(case.core.encode(black_box(engine_cases::PAYLOAD)).unwrap());
+            });
         });
-    });
-}
+    }
+    encode.finish();
 
-fn bench_decode(c: &mut Criterion) {
-    let core = CoppaCore::new();
-    let message = "CQ CQ CQ DE VK2ABC K";
-    let samples = core.encode(message).unwrap();
-
-    c.bench_function("engine_decode", |b| {
-        b.iter(|| {
-            let _ = core.decode(black_box(&samples)).unwrap();
+    let mut decode = c.benchmark_group("engine_decode");
+    decode.throughput(Throughput::Bytes(engine_cases::PAYLOAD.len() as u64));
+    for case in &cases {
+        decode.bench_function(BenchmarkId::from_parameter(case.level), |b| {
+            b.iter(|| {
+                black_box(case.core.decode(black_box(&case.samples)).unwrap());
+            });
         });
-    });
+    }
+    decode.finish();
 }
 
 fn bench_agc(c: &mut Criterion) {
@@ -135,8 +141,7 @@ fn bench_bpsk_demodulate(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_encode,
-    bench_decode,
+    bench_engine,
     bench_agc,
     bench_rrc_filter,
     bench_fft,

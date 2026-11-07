@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-11-02T22:01:59Z",
-  "head_commit": "df64ba7",
+  "generated_at": "2026-11-06T09:21:18Z",
+  "head_commit": "14d87c5",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -67,7 +67,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:d3aeb14d2a024d73f6e55a29f86211d6cd2297fe4945ffa6385ff2d6156e4fd0",
+      "hash": "sha256:7bd406177f9a15a3c3b6dedc8b500d743f3b5d1956350918d877c03e4a6bcca5",
       "id": "adr-004-strongest-path-timing",
       "kind": "decision-digest",
       "links": [
@@ -89,7 +89,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:0ff4615b291b99f8f57e5d372badf48c198131ef8b784723fc8929a7e0f085c0",
+      "hash": "sha256:fdca8c0c1c87ab3b8e767a4965f63c3ee826356abbab2383451b4daaeb9512aa",
       "id": "adr-005-nr-bg2-ldpc",
       "kind": "decision-digest",
       "links": [
@@ -112,7 +112,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:66f02146c268eb0ab5968fa1c2d044910103399747d4731860aac4c6d811fc53",
+      "hash": "sha256:7b6a5e05f5aa2c2279ff3eae30b40074533e09efef1bfc7674cd3d0602362cec",
       "id": "adr-006-phase2-estimation",
       "kind": "decision-digest",
       "links": [
@@ -181,6 +181,27 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:fa060b6c5bcdf002f2b2c27f358f5041101f37e5200aa77589e6dcf7740b6810",
+      "id": "adr-011-decimated-sync-prefilter",
+      "kind": "decision-digest",
+      "links": [
+        "adr-003-waveform-break",
+        "adr-004-strongest-path-timing"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/adr-011-decimated-sync-prefilter.md",
+      "sources": [
+        "docs/adr/011-cop126-decimated-sync-prefilter.md",
+        "crates/coppa-codec/src/ofdm/sync_detector.rs"
+      ],
+      "status": "current",
+      "title": "Why does the streaming receiver's SyncDetector band-pass and decimate its input?",
+      "verified_commit": "2526b50",
+      "verified_date": "2026-11-03",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:13a7fb2e979343d94243578e036c469e63abad53334d10e485f801fcfcf9f102",
       "id": "agent-tooling",
       "kind": "gotcha",
@@ -223,6 +244,29 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:3f1a2496fc567ec226f9ebc89b64be1930e87aa819625542921a00c1a41e967d",
+      "id": "c-ffi-and-python-link",
+      "kind": "gotcha",
+      "links": [
+        "overview",
+        "coppa-engine"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/c-ffi-and-python-link.md",
+      "sources": [
+        "crates/coppa-ffi/src/lib.rs",
+        "crates/coppa-ffi/cbindgen.toml",
+        "crates/coppa-engine/src/link.rs",
+        "bindings/python/coppa/_ffi.py"
+      ],
+      "status": "current",
+      "title": "What will bite you when calling coppa from C or Python?",
+      "verified_commit": "2526b50",
+      "verified_date": "2026-11-03",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:904fee87bf54c08c38d8604aacea4ac0c0d721e1af546335b4b54e00dd780aba",
       "id": "cli-output",
       "kind": "gotcha",
@@ -245,7 +289,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:9bd2a246313cba83361f290f438daa8cd882616d0cec880bf0be39aff794efea",
+      "hash": "sha256:38ccc87f64332de4942ad9711c2e623bd06adce2306eb9de7a4d056c84c15432",
       "id": "cli-settings",
       "kind": "gotcha",
       "links": [],
@@ -257,13 +301,14 @@
         "crates/coppa-cli/src/main.rs",
         "crates/coppa-daemon/src/config.rs",
         "crates/coppa-radio/src/band.rs",
+        "docs/TNC.md",
         "coppad.toml.example",
         "docs/tutorials/getting-started.md"
       ],
       "status": "current",
       "title": "What will bite you when persisting coppa CLI settings?",
-      "verified_commit": "b5144e3",
-      "verified_date": "2026-10-28",
+      "verified_commit": "ee55ef488c5070227b113a0813f2c5c17c5cc877",
+      "verified_date": "2026-11-05",
       "visibility": "public"
     },
     {
@@ -307,7 +352,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:464b8d3b3b051e88ac3765987b3e532b3591b76b523d8dd349efe6322f204e93",
+      "hash": "sha256:db8e1afcdcdccd8158b41349cc0aefc12c8746b1a6203804bef1826e30551c81",
       "id": "coppa-engine",
       "kind": "subsystem",
       "links": [
@@ -329,7 +374,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:7477efa7bd7802b3e7d22d5e5d3bbed5232209e75b27f423a65310ac134db09c",
+      "hash": "sha256:591e1e6483a2ba3c7f0cbf7178e288a6d1e764aadb791f3b83c9ef388e1b8664",
       "id": "coppa-protocol",
       "kind": "subsystem",
       "links": [
@@ -344,12 +389,13 @@
       "maintainer": "agent",
       "path": "pages/coppa-protocol.md",
       "sources": [
-        "crates/coppa-protocol/**"
+        "crates/coppa-protocol/**",
+        "docs/SPEC.md"
       ],
       "status": "current",
       "title": "How does coppa-protocol handle framing, FEC, and ARQ?",
-      "verified_commit": "be2141b",
-      "verified_date": "2026-08-05",
+      "verified_commit": "edb17bc",
+      "verified_date": "2026-11-04",
       "visibility": "public"
     },
     {
@@ -445,7 +491,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:9c525e41700a2dae28aac59a44ab07c2712620a03d8a3aab01d59a701fabdea9",
+      "hash": "sha256:8fc6a50b80a14c5af822cbd0abc7f759b460044997d49b01e0fe563ec0c3599c",
       "id": "mdns-discovery",
       "kind": "gotcha",
       "links": [
@@ -461,12 +507,12 @@
       ],
       "status": "current",
       "title": "What will bite you when testing coppad's mDNS discovery?",
-      "verified_commit": "b9fdb8d",
-      "verified_date": "2026-11-02",
+      "verified_commit": "2526b50",
+      "verified_date": "2026-11-03",
       "visibility": "public"
     },
     {
-      "hash": "sha256:e8adc703ca6f9a6b097149842f8431013b0e6b894e881ff8cbf8c875e0a5501c",
+      "hash": "sha256:e6fe3f68dd9e109341a1b0f5002a37dc4559d321bacaae625807923fca3c5d0d",
       "id": "overview",
       "kind": "overview",
       "links": [],
@@ -485,7 +531,28 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:148c89cbe62e7a086be41104161ff888f6fca5758a3a628ca9fe229356f46306",
+      "hash": "sha256:b1fa92d938a3445339f1d05cc025443e43a96c9a4cec7f35b0ac9b430654f2aa",
+      "id": "paused-clock-timers",
+      "kind": "gotcha",
+      "links": [
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/paused-clock-timers.md",
+      "sources": [
+        "crates/coppa-daemon/src/event_loop.rs",
+        "crates/coppa-daemon/src/audio_output.rs",
+        "crates/coppa-daemon/clippy.toml"
+      ],
+      "status": "current",
+      "title": "What will bite you when a paused-clock test drives the daemon's timers?",
+      "verified_commit": "2526b50",
+      "verified_date": "2026-11-04",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:7ee5ea01ab20a4806a276627bddfbe6dfd75891ab9d4bf570d13b0ce74cac38a",
       "id": "phase4-field-readiness",
       "kind": "gotcha",
       "links": [
@@ -506,12 +573,80 @@
       ],
       "status": "current",
       "title": "What will bite you in the daemon's real-radio TX/RX path?",
-      "verified_commit": "59b0b63",
-      "verified_date": "2026-07-14",
+      "verified_commit": "dc18b8b",
+      "verified_date": "2026-11-03",
       "visibility": "public"
     },
     {
-      "hash": "sha256:ef55c7a0ce1f6a7f46bf351ab29ac09a824708f502b0917f8a77296b49a27164",
+      "hash": "sha256:5f0af1acfa7a3e56172b9ddf44112b09d4c2af3b27927c0641fe3b2a3dd773cc",
+      "id": "session-fade-protection",
+      "kind": "gotcha",
+      "links": [
+        "coppa-protocol",
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/session-fade-protection.md",
+      "sources": [
+        "docs/SPEC.md",
+        "docs/adr/012-cop119-session-outer-code.md",
+        "crates/coppa-daemon/src/event_loop.rs"
+      ],
+      "status": "current",
+      "title": "What will bite you about session fade protection?",
+      "verified_commit": "d837c89",
+      "verified_date": "2026-11-04",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:ba937b9af743dc0a184d474f47320e62559c0cc5846ba908521ff970074b0399",
+      "id": "tnc-direwolf-benchmark",
+      "kind": "gotcha",
+      "links": [
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/tnc-direwolf-benchmark.md",
+      "sources": [
+        "tools/tnc-bench/run.sh",
+        "crates/coppa-bench/src/afsk_direwolf.rs",
+        "crates/coppa-codec/src/afsk.rs",
+        "docs/testing/tnc-direwolf-wa8lmf.md",
+        "docs/testing/tnc-fx25-direwolf.md",
+        "tools/fx25-interop/run.sh"
+      ],
+      "status": "current",
+      "title": "What will bite you when measuring coppa's TNC against Direwolf?",
+      "verified_commit": "25ee0e0",
+      "verified_date": "2026-11-05",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:c2b42e053c4b494d5eda1bb5c21db27617bd9423f482b1ecc99b13e8514027e6",
+      "id": "tnc-g3ruh-9600",
+      "kind": "gotcha",
+      "links": [
+        "tnc-direwolf-benchmark",
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/tnc-g3ruh-9600.md",
+      "sources": [
+        "crates/coppa-codec/src/g3ruh.rs",
+        "docs/TNC.md",
+        "docs/testing/tnc-direwolf-g3ruh-9600.md"
+      ],
+      "status": "current",
+      "title": "What will bite you about the 9600 baud G3RUH TNC?",
+      "verified_commit": "7b00317",
+      "verified_date": "2026-11-04",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:9dbaaaff3bc7512ae0bf49a1c7f17d440c0613cbe0a8d6e4b9eed90b847da0c0",
       "id": "watterson-level-4-gap",
       "kind": "gotcha",
       "links": [
@@ -526,13 +661,13 @@
         "docs/adr/004-strongest-path-timing.md",
         "docs/adr/006-phase2-parametric-estimation-nr-bg2.md",
         "crates/coppa-codec/src/ofdm/sync_detector.rs",
-        ".superpowers/sdd/p1-fading-regression-fix-report.md",
+        "docs/analysis/COP-134-fading-regressions.md",
         "BENCHMARKS.md"
       ],
       "status": "current",
       "title": "What will bite you about Watterson fading at speed level 4?",
-      "verified_commit": "59b0b63",
-      "verified_date": "2026-07-14",
+      "verified_commit": "d837c89d388eaf9c70752c72db8537d910094cc8",
+      "verified_date": "2026-11-04",
       "visibility": "public"
     },
     {

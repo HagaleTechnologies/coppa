@@ -12,6 +12,9 @@ workspace = true
 [[bin]]
 name = "coppa"
 path = "src/main.rs"
+# COP-88: the root `coppa` lib owns target/doc/coppa; documenting this bin too
+# is a cargo output filename collision (rust-lang/cargo#6313).
+doc = false
 
 [dependencies]
 coppa-engine = { path = "../coppa-engine" }
@@ -33,6 +36,7 @@ clap_complete = { workspace = true }
 clap_mangen = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 # Golden-vector manifest parsing (tests/rx_golden.rs), matching
 # crates/coppa-protocol/tests/golden_vectors.rs's approach.
 toml = { workspace = true }

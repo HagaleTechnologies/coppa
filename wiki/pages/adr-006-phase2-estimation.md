@@ -48,6 +48,18 @@ the most important open item in the receiver.
   OFDM sync, not LDPC, is the binding constraint — verify FEC/LLR improvements
   with an isolated (OFDM-bypassing) bench, not just the full pipeline.
 
-Full decision record: `docs/adr/006-phase2-parametric-estimation-nr-bg2.md`;
-investigation detail in `.superpowers/sdd/p2-task-1-report.md`,
-`p2-task-7-report.md`, and `p2-cfo-level4-{investigation,fix}-report.md`.
+Full decision record: `docs/adr/006-phase2-parametric-estimation-nr-bg2.md`.
+
+## Rate-loop residual experiment
+
+COP-152 tested CRC-verified reconstruction on the current transmission's bounded
+payload prefix. Full observations or exactly one missing final OFDM symbol are
+supported. Larger truncation, partial symbols and incomplete physical-carrier
+coverage require pilot fallback. Pooling follows both alternating pilot maps.
+HARQ reconstruction uses the current RV. Turbo rescues retain the matching pilot
+recommendation because the original observations no longer match re-equalization.
+The full loop failed both bars and regressed Poor-segment goodput, so production
+retains the pilot selector. SNR telemetry and LDPC noise retain their separate meaning.
+See [the COP-152 benchmark record](../../BENCHMARKS.md#cop-152-bounded-prefix-payload-residual)
+for screening coverage, full comparisons and their limits. The historical COP-133
+full-observation experiment remains a failed control, not the new contract.

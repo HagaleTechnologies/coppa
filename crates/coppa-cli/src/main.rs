@@ -5,6 +5,8 @@
 //! pipe ends the run quietly instead of panicking. Status goes to stderr.
 #![cfg_attr(not(test), deny(clippy::print_stdout))]
 
+#[cfg(feature = "kiss-tnc")]
+mod broadcast;
 mod doctor;
 mod interrupt;
 mod style;
@@ -268,25 +270,29 @@ impl DeviceOutput {
     }
 }
 
+const PAYLOAD_SCOPE: &str = "encoded_bytes_per_codeword";
+
 #[derive(Serialize)]
 struct ProfileOutput {
     name: &'static str,
     description: &'static str,
     speed_level: u8,
     max_payload_bytes: usize,
+    max_payload_scope: &'static str,
     compression: bool,
     sample_rate_hz: u32,
     ofdm_profile: &'static str,
 }
 
 /// One speed level of `coppa_engine::ladder`, for `profiles --level N --json`.
-/// `hf_*` are `null` on a VHF-only level.
+/// `hf_*` are `null` on a VHF-only level. Air times describe a single-codeword frame.
 #[derive(Serialize)]
 struct LevelOutput {
     level: u8,
     modulation: &'static str,
     code_rate: String,
     max_payload_bytes: usize,
+    max_payload_scope: &'static str,
     hf_bandwidth_hz: Option<u32>,
     hf_airtime_ms: Option<u32>,
     vhf_bandwidth_hz: u32,
@@ -301,6 +307,7 @@ impl From<&coppa_engine::ladder::LevelInfo> for LevelOutput {
             modulation: row.modulation,
             code_rate: format!("{}/{}", row.code_rate.0, row.code_rate.1),
             max_payload_bytes: row.max_payload_bytes,
+            max_payload_scope: PAYLOAD_SCOPE,
             hf_bandwidth_hz: row.hf.map(|hf| hf.bandwidth_hz),
             hf_airtime_ms: row.hf.map(|hf| ms(hf.airtime_s)),
             vhf_bandwidth_hz: row.vhf.bandwidth_hz,
@@ -365,6 +372,7 @@ impl ProfileOutput {
             description: profile.description,
             speed_level: profile.speed_level,
             max_payload_bytes,
+            max_payload_scope: PAYLOAD_SCOPE,
             compression: profile.compression,
             sample_rate_hz: profile.sample_rate,
             ofdm_profile: profile.ofdm_profile,
@@ -665,12 +673,27 @@ enum Commands {
     },
     /// Print the coppa(1) man page in roff format.
     Man,
-    /// Start the AFSK 1200 TNC (KISS TCP server).
+    /// Send or receive a repeated file over OFDM KISS datagrams.
     #[cfg(feature = "kiss-tnc")]
+    Broadcast {
+        #[command(subcommand)]
+        command: broadcast::Command,
+    },
+    #[cfg(feature = "kiss-tnc")]
+    /// Start the KISS TNC (AFSK 1200 or G3RUH 9600).
     Tnc {
+        /// TNC baud rate: 1200 (AFSK) or 9600 (G3RUH).
+        #[arg(long, short, value_enum, default_value = "1200")]
+        baud: TncBaud,
         /// KISS TCP port.
         #[arg(long, default_value = "8001")]
         port: u16,
+        /// Enable the AGWPE TCP server on this port (normally 8000)
+        #[arg(long)]
+        agw_port: Option<u16>,
+        /// Bind the KISS and AGWPE TCP servers to this address
+        #[arg(long, default_value = "127.0.0.1")]
+        bind_address: String,
         /// Input and output device name (unique substring).
         #[arg(long, conflicts_with_all = ["input_device_id", "output_device_id"])]
         device: Option<String>,
@@ -692,7 +715,37 @@ enum Commands {
         /// Use VOX instead of CAT PTT.
         #[arg(long)]
         vox: bool,
+        /// Transmit IL2P with maximum FEC
+        #[arg(long, conflicts_with = "fx25")]
+        il2p: bool,
+        /// Transmit FX.25 when the frame fits; otherwise transmit AX.25
+        #[arg(long)]
+        fx25: bool,
+        /// Digipeat as this alias: repeat a frame whose first unused path
+        /// entry matches, marking it used. Off unless given.
+        #[arg(long, value_name = "CALL[-SSID]")]
+        digipeat: Option<String>,
     },
+}
+
+/// CLI spelling of the daemon's modem selection.
+#[cfg(feature = "kiss-tnc")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum TncBaud {
+    #[value(name = "1200")]
+    Afsk1200,
+    #[value(name = "9600")]
+    G3ruh9600,
+}
+
+#[cfg(feature = "kiss-tnc")]
+impl From<TncBaud> for coppa_daemon::tnc::TncBaud {
+    fn from(value: TncBaud) -> Self {
+        match value {
+            TncBaud::Afsk1200 => Self::Afsk1200,
+            TncBaud::G3ruh9600 => Self::G3ruh9600,
+        }
+    }
 }
 
 /// Resolve a profile name to an EngineConfig, or use the default.
@@ -891,8 +944,13 @@ fn run() -> Result<()> {
             cmd_profiles(&args)?
         }
         #[cfg(feature = "kiss-tnc")]
+        Commands::Broadcast { command } => broadcast::run(command, verbosity)?,
+        #[cfg(feature = "kiss-tnc")]
         Commands::Tnc {
+            baud,
             port,
+            agw_port,
+            bind_address,
             device,
             input_device_id,
             output_device_id,
@@ -900,8 +958,14 @@ fn run() -> Result<()> {
             output_channel,
             rig,
             vox,
+            il2p,
+            fx25,
+            digipeat,
         } => cmd_tnc(
+            baud,
             port,
+            agw_port,
+            bind_address,
             device,
             input_device_id,
             output_device_id,
@@ -909,6 +973,9 @@ fn run() -> Result<()> {
             output_channel,
             rig,
             vox,
+            il2p,
+            fx25,
+            digipeat,
         )?,
         Commands::Completions { shell } => cmd_completions(shell)?,
         Commands::Man => cmd_man()?,
@@ -979,6 +1046,10 @@ fn cmd_man() -> Result<()> {
     use clap::CommandFactory;
     let mut buf = Vec::new();
     clap_mangen::Man::new(Cli::command()).render(&mut buf)?;
+    #[cfg(feature = "kiss-tnc")]
+    if let Some(tnc) = Cli::command().find_subcommand("tnc") {
+        clap_mangen::Man::new(tnc.clone()).render(&mut buf)?;
+    }
     emit_raw(&buf)
 }
 
@@ -2390,6 +2461,7 @@ fn render_profiles(args: &ProfilesArgs) -> Result<String> {
                 .ok_or_else(|| anyhow::anyhow!("no speed level {level}"))?;
             render_ladder_header(&mut out, &ladder);
             render_ladder_row(&mut out, row);
+            render_payload_budget_note(&mut out, true);
         }
         None => {
             render_ladder(&mut out, &ladder);
@@ -2461,6 +2533,21 @@ fn airtime_ms(airtime_s: f64) -> String {
     format!("{} ms", (airtime_s * 1000.0).round() as u32)
 }
 
+fn render_payload_budget_note(out: &mut String, ladder: bool) {
+    out.push('\n');
+    if ladder {
+        out.push_str("MAX BYTES is the payload budget per codeword at the listed speed level.\n");
+    }
+    out.push_str(concat!(
+        "Payload budgets are bytes after compression, before FEC, per codeword.\n",
+        "They include any transport headers, but exclude the per-codeword CRC.\n",
+        "With compression enabled, how much input fits depends on its contents.\n",
+        "These are not limits on a daemon host write. The daemon chunks stream data\n",
+        "for the current speed level and may use multiple codewords per frame.\n",
+        "KISS datagrams have a separate limit; see docs/RETICULUM.md.\n",
+    ));
+}
+
 fn render_ladder_header(out: &mut String, ladder: &[coppa_engine::ladder::LevelInfo]) {
     let hf_hz = ladder
         .iter()
@@ -2468,7 +2555,7 @@ fn render_ladder_header(out: &mut String, ladder: &[coppa_engine::ladder::LevelI
         .map_or(0, |hf| hf.bandwidth_hz);
     let vhf_hz = ladder.first().map_or(0, |row| row.vhf.bandwidth_hz);
     let vhf_header = format!("VHF, {vhf_hz} Hz");
-    out.push_str(&format!("{:41}AIR TIME PER FRAME\n", ""));
+    out.push_str(&format!("{:41}AIR TIME, 1-CODEWORD FRAME\n", ""));
     out.push_str(&format!(
         "{:<7}{:<12}{:<11}{:<11}{:<15}{}\n",
         "LEVEL",
@@ -2518,20 +2605,7 @@ fn render_ladder(out: &mut String, ladder: &[coppa_engine::ladder::LevelInfo]) {
     for row in ladder {
         render_ladder_row(out, row);
     }
-    let compressing: Vec<String> = named_profiles()
-        .into_iter()
-        .filter(|p| p.compression)
-        .map(|p| p.name.to_string())
-        .collect();
-    out.push('\n');
-    out.push_str("MAX BYTES is the payload one frame carries on the air.");
-    if !compressing.is_empty() {
-        out.push_str(&format!(
-            " {}\ncompress your message first, so how much text fits depends on the text.",
-            join_and(&compressing)
-        ));
-    }
-    out.push('\n');
+    render_payload_budget_note(out, true);
     let vhf_only: Vec<String> = ladder
         .iter()
         .filter(|row| row.hf.is_none())
@@ -2621,9 +2695,9 @@ fn render_profile_detail(name: &str, ladder: &[coppa_engine::ladder::LevelInfo])
         "  Speed level: {} ({}, code rate {}/{})\n",
         p.speed_level, row.modulation, row.code_rate.0, row.code_rate.1
     ));
-    out.push_str(&format!("  Max bytes per frame: {max_bytes}\n"));
+    out.push_str(&format!("  Payload bytes per codeword: {max_bytes}\n"));
     out.push_str(&format!(
-        "  Air time per frame: {}\n",
+        "  Air time, 1-codeword frame: {}\n",
         airtime_ms(cell.airtime_s)
     ));
     out.push_str(&format!(
@@ -2631,13 +2705,40 @@ fn render_profile_detail(name: &str, ladder: &[coppa_engine::ladder::LevelInfo])
         if p.compression { "on" } else { "off" }
     ));
     out.push_str(&format!("  Sample rate: {} Hz\n", p.sample_rate));
+    render_payload_budget_note(&mut out, false);
     Ok(out)
+}
+
+#[cfg(feature = "kiss-tnc")]
+fn parse_digipeat_alias(s: &str) -> Result<(String, u8)> {
+    let invalid = || {
+        anyhow::anyhow!(
+            "--digipeat expects CALL[-SSID] with a 1-6 character callsign and SSID 0-15, got '{s}'"
+        )
+    };
+    let (call, suffix) = s.split_once('-').map_or((s, None), |(c, n)| (c, Some(n)));
+    if call.is_empty() || call.len() > 6 || !call.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(invalid());
+    }
+    let ssid = match suffix {
+        None => 0,
+        Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => n
+            .parse::<u8>()
+            .ok()
+            .filter(|n| *n <= 15)
+            .ok_or_else(invalid)?,
+        Some(_) => return Err(invalid()),
+    };
+    Ok((call.to_ascii_uppercase(), ssid))
 }
 
 #[cfg(feature = "kiss-tnc")]
 #[allow(clippy::too_many_arguments)]
 fn cmd_tnc(
+    baud: TncBaud,
     port: u16,
+    agw_port: Option<u16>,
+    bind_address: String,
     device: Option<String>,
     input_device_id: Option<String>,
     output_device_id: Option<String>,
@@ -2645,11 +2746,19 @@ fn cmd_tnc(
     output_channel: u16,
     rig: Option<String>,
     vox: bool,
+    il2p: bool,
+    fx25: bool,
+    digipeat: Option<String>,
 ) -> Result<()> {
+    let digipeat_alias = digipeat.as_deref().map(parse_digipeat_alias).transpose()?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let config = coppa_daemon::tnc::TncConfig {
+            baud: baud.into(),
+            digipeat_alias,
             kiss_port: port,
+            agw_port,
+            bind_address,
             audio_device: device,
             input_device_id,
             output_device_id,
@@ -2658,15 +2767,69 @@ fn cmd_tnc(
             rig_address: rig,
             vox_mode: vox,
             sample_rate: 48000,
-            ..Default::default()
         };
-        coppa_daemon::tnc::run_tnc(config).await
+        if il2p {
+            coppa_daemon::tnc::run_tnc_with_il2p(config).await
+        } else if fx25 {
+            coppa_daemon::tnc::run_tnc_with_fx25(config).await
+        } else {
+            coppa_daemon::tnc::run_tnc(config).await
+        }
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "kiss-tnc")]
+    #[test]
+    fn tnc_il2p_is_opt_in_and_help_describes_maximum_fec() {
+        use clap::CommandFactory;
+        let default = Cli::try_parse_from(["coppa", "tnc", "--vox"]).unwrap();
+        assert!(matches!(default.command, Commands::Tnc { il2p: false, .. }));
+        let enabled = Cli::try_parse_from(["coppa", "tnc", "--vox", "--il2p"]).unwrap();
+        assert!(matches!(enabled.command, Commands::Tnc { il2p: true, .. }));
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("tnc")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--il2p") && help.contains("Transmit IL2P with maximum FEC"));
+    }
+
+    #[cfg(feature = "kiss-tnc")]
+    #[test]
+    fn tnc_il2p_and_fx25_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from(["coppa", "tnc", "--il2p", "--fx25"]).is_err());
+    }
+
+    #[cfg(feature = "kiss-tnc")]
+    #[test]
+    fn tnc_parses_baud_flag() {
+        for (args, expected) in [
+            (vec!["coppa", "tnc", "--baud", "9600"], TncBaud::G3ruh9600),
+            (vec!["coppa", "tnc", "-b", "1200"], TncBaud::Afsk1200),
+            (vec!["coppa", "tnc"], TncBaud::Afsk1200),
+        ] {
+            let Commands::Tnc { baud, .. } = Cli::try_parse_from(args).unwrap().command else {
+                panic!("expected Tnc");
+            };
+            assert_eq!(baud, expected);
+        }
+    }
+
+    #[cfg(feature = "kiss-tnc")]
+    #[test]
+    fn tnc_rejects_other_bauds() {
+        let error = Cli::try_parse_from(["coppa", "tnc", "--baud", "300"])
+            .err()
+            .expect("unsupported baud must fail")
+            .to_string();
+        assert!(error.contains("possible values"), "{error}");
+        assert!(error.contains("1200") && error.contains("9600"), "{error}");
+    }
 
     #[test]
     fn device_json_escapes_names_and_empty_lists() {
@@ -3053,13 +3216,16 @@ mod tests {
             let out = rendered(&["profiles", "-p", name]);
             let max = coppa_protocol::modem::max_payload_for_level(p.speed_level).unwrap();
             assert!(
-                out.contains(&format!("Max bytes per frame: {max}\n")),
+                out.contains(&format!("Payload bytes per codeword: {max}\n")),
                 "{out}"
             );
             assert!(!out.contains("ARQ window"), "{out}");
         }
         let robust = rendered(&["profiles", "-p", "HF_ROBUST"]);
-        assert!(robust.contains("Max bytes per frame: 56\n"), "{robust}");
+        assert!(
+            robust.contains("Payload bytes per codeword: 56\n"),
+            "{robust}"
+        );
         assert!(!robust.contains("64 bytes"), "{robust}");
     }
 
@@ -3067,8 +3233,10 @@ mod tests {
     fn profiles_level_shows_one_row() {
         let out = rendered(&["profiles", "--level", "4"]);
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 3, "{out}");
-        assert!(lines[0].trim_start().starts_with("AIR TIME PER FRAME"));
+        assert_eq!(lines.len(), 11, "{out}");
+        assert!(lines[0]
+            .trim_start()
+            .starts_with("AIR TIME, 1-CODEWORD FRAME"));
         assert!(lines[1].starts_with("LEVEL"));
         assert!(lines[2].starts_with("4 "), "{out}");
     }
@@ -4590,6 +4758,51 @@ mod tests {
 
     #[cfg(feature = "kiss-tnc")]
     #[test]
+    fn tnc_digipeat_flag_parses() {
+        for (args, expected) in [
+            (vec!["coppa", "tnc"], None),
+            (
+                vec!["coppa", "tnc", "--digipeat", "WIDE1"],
+                Some(("WIDE1".to_string(), 0)),
+            ),
+            (
+                vec!["coppa", "tnc", "--digipeat", "WIDE1-1"],
+                Some(("WIDE1".to_string(), 1)),
+            ),
+        ] {
+            let Commands::Tnc { digipeat, .. } = Cli::try_parse_from(args).unwrap().command else {
+                panic!("expected TNC")
+            };
+            assert_eq!(
+                digipeat
+                    .as_deref()
+                    .map(parse_digipeat_alias)
+                    .transpose()
+                    .unwrap(),
+                expected
+            );
+        }
+        for invalid in [
+            "toolongcallsign",
+            "",
+            "A-16",
+            "A--1",
+            "A-",
+            "A-1-2",
+            "A_B",
+            "é",
+        ] {
+            let error = parse_digipeat_alias(invalid).unwrap_err().to_string();
+            assert!(error.contains("--digipeat expects CALL[-SSID]"));
+        }
+        assert_eq!(
+            parse_digipeat_alias("n0call-15").unwrap(),
+            ("N0CALL".into(), 15)
+        );
+    }
+
+    #[cfg(feature = "kiss-tnc")]
+    #[test]
     fn tnc_directional_device_and_channel_flags_parse() {
         let Commands::Tnc {
             input_device_id,
@@ -4629,6 +4842,71 @@ mod tests {
             .expect("conflict")
             .kind(),
             clap::error::ErrorKind::ArgumentConflict,
+        );
+    }
+
+    /// COP-137: the AGWPE flags are opt-in, default to off and loopback, and
+    /// leave the KISS port and device/channel arguments as they were.
+    #[cfg(feature = "kiss-tnc")]
+    #[test]
+    fn tnc_agw_port_and_bind_address_flags_parse() {
+        let Commands::Tnc {
+            port,
+            agw_port,
+            bind_address,
+            device,
+            input_channel,
+            output_channel,
+            ..
+        } = Cli::parse_from(["coppa", "tnc"]).command
+        else {
+            panic!("expected Tnc")
+        };
+        assert_eq!(port, 8001);
+        assert_eq!(agw_port, None);
+        assert_eq!(bind_address, "127.0.0.1");
+        assert_eq!(device, None);
+        assert_eq!((input_channel, output_channel), (0, 0));
+
+        let Commands::Tnc {
+            port,
+            agw_port,
+            bind_address,
+            device,
+            input_channel,
+            output_channel,
+            ..
+        } = Cli::parse_from([
+            "coppa",
+            "tnc",
+            "--port",
+            "8101",
+            "--agw-port",
+            "8000",
+            "--bind-address",
+            "0.0.0.0",
+            "--device",
+            "USB",
+            "--input-channel",
+            "1",
+            "--output-channel",
+            "1",
+        ])
+        .command
+        else {
+            panic!("expected Tnc")
+        };
+        assert_eq!(port, 8101);
+        assert_eq!(agw_port, Some(8000));
+        assert_eq!(bind_address, "0.0.0.0");
+        assert_eq!(device.as_deref(), Some("USB"));
+        assert_eq!((input_channel, output_channel), (1, 1));
+        assert_eq!(
+            Cli::try_parse_from(["coppa", "tnc", "--agw-port", "65536"])
+                .err()
+                .expect("out of range")
+                .kind(),
+            clap::error::ErrorKind::ValueValidation,
         );
     }
 
@@ -5162,5 +5440,45 @@ mod tests {
             help.lines().any(|l| l.trim_start().starts_with("rx ")),
             "{help}"
         );
+    }
+
+    #[cfg(feature = "kiss-tnc")]
+    #[test]
+    fn tnc_fx25_flag_defaults_and_help() {
+        use clap::CommandFactory;
+        for enabled in [false, true] {
+            let mut args = vec![
+                "coppa", "tnc", "--vox", "--port", "8123", "--device", "radio",
+            ];
+            if enabled {
+                args.push("--fx25");
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Commands::Tnc {
+                fx25,
+                port,
+                vox,
+                device,
+                ..
+            } = cli.command
+            else {
+                panic!("tnc")
+            };
+            assert_eq!(fx25, enabled);
+            assert_eq!(port, 8123);
+            assert!(vox);
+            assert_eq!(device.as_deref(), Some("radio"));
+        }
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("tnc")
+            .unwrap()
+            .render_help()
+            .to_string();
+        assert!(help
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("--fx25 Transmit FX.25 when the frame fits; otherwise transmit AX.25"));
     }
 }

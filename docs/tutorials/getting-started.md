@@ -438,12 +438,84 @@ This example uses the FFI v1 batch API — `coppa_engine_create`, `coppa_encode`
 `coppa_encode_bytes` (binary payloads), `coppa_engine_feed_samples` with
 `coppa_next_frame` (streaming decode) and `coppa_engine_set_speed_level`; the
 older v1 streaming quartet — `coppa_start_stream`, `coppa_feed_samples`,
-`coppa_get_decoded`, `coppa_stop_stream` — is deprecated since FFI v2. Note that
-`coppa_encode` and `coppa_decode` carry text only, and `coppa_decode` drops
-frames that are not valid UTF-8.
+`coppa_get_decoded`, `coppa_stop_stream` — is deprecated since FFI v2, and
+`coppa.h` marks it `COPPA_DEPRECATED`, so GCC, Clang and MSVC warn at each call.
+Note that `coppa_encode` and `coppa_decode` carry text only, and `coppa_decode`
+drops frames that are not valid UTF-8.
+
+### When a call fails
+
+A failed call returns a negative code or `NULL`. `coppa_last_error()` then
+returns the calling thread's message for that call, as `"<function>: <reason>"`,
+and `coppa_strerror(code)` returns a fixed description of a code:
+
+```c
+coppa_engine_t *engine = coppa_engine_new_with(&cfg);
+if (engine == NULL) {
+    const char *why = coppa_last_error();
+    fprintf(stderr, "%s\n", why ? why : "unknown error");
+    return 1;
+}
+```
+
+With `cfg.profile = "NOPE"` this prints `coppa_engine_new_with: unknown profile
+"NOPE" (expected HF_ROBUST, HF_STANDARD, VHF_FAST or EMERGENCY)`. The string
+stays valid until the same thread's next `coppa_*` call; do not free it. A
+successful call clears it, so a `NULL` from `coppa_get_decoded` with no message
+means "nothing queued". `crates/coppa-ffi/tests/c/error_strings.c` checks every
+case.
+
+`coppa_abi_version()` returns `(COPPA_ABI_VERSION_MAJOR << 16) | COPPA_ABI_VERSION_MINOR`
+for the library actually loaded; compare its major with the header's
+`COPPA_ABI_VERSION_MAJOR` before calling anything else. The header's top
+comment states the ABI rule and the thread-safety rules.
+
+### Driving a link from C
+
+`coppa_link_*` runs coppad's connected session (CONNECT handshake,
+stop-and-wait ARQ, retransmission, keepalive, disconnect) over audio samples
+and a clock you pass in. `crates/coppa-ffi/examples/c/link_loopback.c` joins two
+links in one process with an in-memory cable and prints:
+
+```text
+N0AAA connected to N0BBB
+N0BBB connected to N0AAA
+N0BBB received 23 bytes: hello over a coppa link
+N0AAA disconnected (local)
+N0BBB disconnected (remote)
+```
+
+## Driving a link from Python
+
+`bindings/python` is a standard-library-only (`ctypes`) binding over the link
+API. It is not published; [bindings/python/README.md](../../bindings/python/README.md)
+covers setup. This demo starts two processes joined by a `socketpair` audio
+cable; one connects and sends, the other prints what it received:
+
+```bash
+cargo build -p coppa-ffi --release
+COPPA_LIB=target/release/libcoppa_ffi.so python3 bindings/python/examples/two_process_link.py
+```
+
+```text
+[listener pid 4242] listening as N0BBB
+[sender pid 4241] connecting to N0BBB
+[listener pid 4242] connected to N0AAA
+[sender pid 4241] connected to N0BBB
+[sender pid 4241] sent 24 bytes
+[listener pid 4242] received 24 bytes: 68656c6c6f2066726f6d2070726f63657373204100fffe0a
+[sender pid 4241] disconnected (local)
+[listener pid 4242] disconnected (remote)
+```
+
+The pids and line order vary from run to run.
 
 ## Next Steps
 
 - Read [ARCHITECTURE.md](../../ARCHITECTURE.md) for system design details
 - Browse the crate documentation: `cargo doc --workspace --no-deps --open`
 - Run coppad as a service on a Raspberry Pi 4: [raspberry-pi-install.md](raspberry-pi-install.md)
+
+For connectionless AGWPE on the AFSK TNC, use `coppa tnc --agw-port 8000`.
+`--bind-address` changes both KISS and AGW listeners, defaulting to loopback.
+See [TNC setup and client limits](../TNC.md#optional-connectionless-agwpe).

@@ -13,8 +13,7 @@ pub enum Listener {
     Listening(SocketAddr),
     /// Turned off in `[host]`.
     Disabled,
-    /// This build lacks the cargo feature the listener needs. Only the
-    /// WebSocket listener has one, so a `websocket` build never constructs it.
+    /// This build lacks the feature for a WebSocket, ARDOP or KISS listener.
     #[cfg_attr(feature = "websocket", allow(dead_code))]
     NotBuilt,
 }
@@ -129,7 +128,7 @@ impl PttStartup {
                 };
                 format!("serial {port} {line}")
             }
-            PttConfig::Gpio { pin } => format!("gpio {pin}"),
+            PttConfig::Gpio { line } => format!("gpio {line}"),
             PttConfig::Cm108 { device, gpio } => format!("cm108 {device} gpio {gpio}"),
         }
     }
@@ -217,6 +216,16 @@ impl fmt::Display for Guardian {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GpioLine;
+
+    fn gpio_chardev() -> PttConfig {
+        PttConfig::Gpio {
+            line: GpioLine::Chardev {
+                chip: "pinctrl-bcm2711".into(),
+                line: 17,
+            },
+        }
+    }
 
     fn addr(s: &str) -> Listener {
         Listener::Listening(s.parse().unwrap())
@@ -263,13 +272,7 @@ mod tests {
         assert_eq!(fallback.active, PttActive::None);
         let connected = PttStartup::new(PttConfig::Rigctld, "127.0.0.1:1", true, Ok(()), false);
         assert_eq!(connected.active, PttActive::Rigctld);
-        let gpio = PttStartup::new(
-            PttConfig::Gpio { pin: "17".into() },
-            "",
-            false,
-            Ok(()),
-            false,
-        );
+        let gpio = PttStartup::new(gpio_chardev(), "", false, Ok(()), false);
         assert_eq!(gpio.active, PttActive::Gpio);
         let cm108 = PttStartup::new(cm108_config(), "", false, Ok(()), true);
         assert_eq!(cm108.active, PttActive::Cm108);
@@ -310,8 +313,8 @@ mod tests {
             ..ptt(configured, active, Ok(()))
         };
         assert_eq!(
-            inverted(PttConfig::Gpio { pin: "17".into() }, PttActive::Gpio).method(),
-            "gpio 17 inverted"
+            inverted(gpio_chardev(), PttActive::Gpio).method(),
+            "gpio pinctrl-bcm2711:17 inverted"
         );
         let serial = PttConfig::Serial {
             port: "/dev/ttyUSB0".into(),
@@ -350,8 +353,17 @@ mod tests {
             ptt(serial, PttActive::Serial, Ok(())).method(),
             "serial /dev/ttyUSB0 rts"
         );
-        let gpio = PttConfig::Gpio { pin: "17".into() };
-        assert_eq!(ptt(gpio, PttActive::Gpio, Ok(())).method(), "gpio 17");
+        assert_eq!(
+            ptt(gpio_chardev(), PttActive::Gpio, Ok(())).method(),
+            "gpio pinctrl-bcm2711:17"
+        );
+        let sysfs = PttConfig::Gpio {
+            line: GpioLine::Sysfs(529),
+        };
+        assert_eq!(
+            ptt(sysfs, PttActive::Gpio, Ok(())).method(),
+            "gpio 529 (sysfs)"
+        );
     }
 
     #[test]
@@ -410,9 +422,8 @@ mod tests {
             ptt(PttConfig::Rigctld, PttActive::Rigctld, Ok(())).guardian_not_started(false),
             Guardian::Off
         );
-        let gpio = PttConfig::Gpio { pin: "17".into() };
         assert_eq!(
-            ptt(gpio, PttActive::Gpio, Ok(())).guardian_not_started(false),
+            ptt(gpio_chardev(), PttActive::Gpio, Ok(())).guardian_not_started(false),
             Guardian::Off
         );
         assert_eq!(

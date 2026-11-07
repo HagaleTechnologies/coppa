@@ -48,7 +48,7 @@
 //!   exactly the mechanism that corrupted Task 1's rejected per-window re-fit).
 //! - **Recursion**: standard complex Kalman filter, implemented via the same
 //!   information-form (normal-equations) linear algebra
-//!   [`super::delay_domain::solve_ridge`] uses (`L≤8`, so direct Gaussian
+//!   `super::delay_domain::solve_ridge` uses (`L≤8`, so direct Gaussian
 //!   elimination/LU is exact and cheap) — predict: `h_pred=a·h_prev`,
 //!   `P_pred=a²·P_prev+Q`; update: MAP combination of the Gaussian prior
 //!   `N(h_pred,P_pred)` with the weighted-least-squares observation likelihood,
@@ -437,9 +437,8 @@ impl TrackedTaps {
     /// the actual receiver noise floor.
     ///
     /// Previously fed directly into [`Self::equalize`]'s LLR-facing noise output —
-    /// flagged as a suspected overconfidence source since Task 7 (see
-    /// `.superpowers/sdd/p2-task-7-report.md`), fixed by the Cascaded design
-    /// (`docs/superpowers/specs/2026-07-18-cascaded-drift-tracker-design.md`):
+    /// flagged as a suspected overconfidence source since Task 7,
+    /// fixed by the Cascaded design:
     /// `equalize` now uses the tracker's fixed `sigma_v2` observation-noise floor
     /// instead. This accessor is kept, unchanged, as an honest diagnostic for the
     /// tracker's own posterior tap uncertainty — just no longer what feeds the
@@ -469,14 +468,12 @@ impl TrackedTaps {
     /// Earlier versions of this method used `noise_at(k)/|Ĥ(k)|²` (the
     /// Kalman covariance's posterior tap-variance estimate) here instead —
     /// a suspected LLR-overconfidence bug, flagged but not fixed since Task
-    /// 7 (see `.superpowers/sdd/p2-task-7-report.md`'s addendum): as the
+    /// 7: as the
     /// tracker accumulates evidence within a frame, its posterior
     /// confidence about the channel TAP shrinks regardless of the actual
     /// receiver noise floor, which is a different quantity from the
     /// observation noise the LLR calculation actually wants. Fixed as part
-    /// of the Cascaded design
-    /// (`docs/superpowers/specs/2026-07-18-cascaded-drift-tracker-design.md`),
-    /// which reintroduces this tracker as a live payload path.
+    /// of the Cascaded design, which reintroduces this tracker as a live payload path.
     /// [`Self::noise_at`] itself is unchanged and still available as an
     /// honest accessor for the tracker's own posterior tap uncertainty — it
     /// simply no longer feeds the decoder.

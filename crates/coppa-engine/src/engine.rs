@@ -32,6 +32,15 @@ pub const WIRE_FORMAT_VERSION: u8 = 1;
 pub const TUNE_TONE_LOW_HZ: f32 = 700.0;
 /// High tone of the standard SSB two-tone TX-level calibration signal (Hz).
 pub const TUNE_TONE_HIGH_HZ: f32 = 1900.0;
+/// Longest TX-level calibration tone [`CoppaCore::tune_tone`] generates, in
+/// seconds. Longer (or infinite) requests are cut to this, so no caller can
+/// make the engine allocate without bound (COP-83: VARA `TUNE 1e12` aborted
+/// the daemon on a 192 EB allocation).
+pub const MAX_TUNE_SECONDS: f32 = 120.0;
+/// Lowest single-tone TUNE frequency a host interface accepts (Hz).
+pub const TUNE_SINGLE_MIN_HZ: f32 = 300.0;
+/// Highest single-tone TUNE frequency a host interface accepts (Hz).
+pub const TUNE_SINGLE_MAX_HZ: f32 = 3000.0;
 
 /// One decode result surfaced by [`CoppaCore::push_samples`] for a single frame
 /// `StreamingReceiver` completed.
@@ -77,8 +86,7 @@ pub struct StreamFrame {
     /// `coppa_ml::RateLoop` on the peer's side can apply it.
     pub recommended_level: u8,
     /// This frame's measured multipath delay spread (ms), from
-    /// `DecodedFrame::delay_spread_ms`. Feeds `coppa_ml::CpGate` in the daemon —
-    /// see `docs/superpowers/specs/2026-07-25-cpgate-daemon-wiring-design.md`.
+    /// `DecodedFrame::delay_spread_ms`. Feeds `coppa_ml::CpGate` in the daemon.
     pub delay_spread_ms: f32,
 }
 
@@ -322,6 +330,20 @@ impl CoppaCore {
         self.encode_bytes_at(data, self.config.speed_level, codewords)
     }
 
+    /// Encode a Data frame without applying compression, using 1..=8 codewords.
+    ///
+    /// A compression-enabled receiver decompresses payloads starting with `0xFE`.
+    /// Callers must frame their payload so its first byte cannot equal that marker.
+    /// The daemon's Datagram MAC header starts with `0x19` and provides this framing.
+    pub fn encode_uncompressed_with_codewords(
+        &self,
+        data: &[u8],
+        codewords: u8,
+    ) -> Result<Vec<f32>, EngineError> {
+        Self::check_codewords(codewords)?;
+        self.transmit_data_packet(data, self.config.speed_level, codewords, 0)
+    }
+
     /// COP-69: shared codeword-count validation for the codeword-aware
     /// encode twins (COP-19 surface: `Err`, never a panic).
     fn check_codewords(codewords: u8) -> Result<(), EngineError> {
@@ -382,7 +404,7 @@ impl CoppaCore {
     /// whose frame bytes are byte-identical to the original (rebuilt from
     /// the segment data) but whose PHY level drops to the most robust level
     /// whose payload budget still fits the frame. It shares
-    /// [`Self::encode_bytes_at`] with [`Self::encode_bytes`] so the two can
+    /// `Self::encode_bytes_at` with [`Self::encode_bytes`] so the two can
     /// never diverge -- unlike [`Self::encode_bytes_at_level`] (Beacon frame
     /// type, no compression, the station-ID/beacon path), which is left
     /// alone for its existing callers.
@@ -410,14 +432,37 @@ impl CoppaCore {
         codewords: u8,
     ) -> Result<Vec<f32>, EngineError> {
         let payload = self.compress_payload(data);
+        self.transmit_data_packet(&payload, level, codewords, 0)
+    }
 
-        if payload.len() > u16::MAX as usize {
-            return Err(EngineError::PayloadTooLarge {
+    /// Encode one uncompressed session packet with a distinct PHY HARQ key.
+    /// Outer-code shards must retain their equal wire lengths, independent of
+    /// the engine's compression setting. See SPEC §22.
+    pub fn encode_packet_with_seq(
+        &self,
+        data: &[u8],
+        level: u8,
+        seq_num: u8,
+    ) -> Result<Vec<f32>, EngineError> {
+        self.check_level(level, self.on_vhf_profile())?;
+        self.transmit_data_packet(data, level, 1, seq_num)
+    }
+
+    /// Build and transmit a Data frame from an already prepared payload,
+    /// with an explicit PHY `seq_num` (the HARQ key; every pre-COP-119
+    /// caller passes `0`).
+    fn transmit_data_packet(
+        &self,
+        payload: &[u8],
+        level: u8,
+        codewords: u8,
+        seq_num: u8,
+    ) -> Result<Vec<f32>, EngineError> {
+        let payload_len =
+            u16::try_from(payload.len()).map_err(|_| EngineError::PayloadTooLarge {
                 len: payload.len(),
                 max: u16::MAX as usize,
-            });
-        }
-
+            })?;
         let header = CoppaHeader {
             version: WIRE_FORMAT_VERSION,
             phy_mode: 0,
@@ -425,13 +470,16 @@ impl CoppaCore {
             bandwidth: self.transceiver.profile().bandwidth_id,
             fec_type: 0,
             speed_level: level,
-            seq_num: 0,
-            payload_len: payload.len() as u16,
+            seq_num,
+            payload_len,
             codewords,
         };
+        Ok(self.transceiver.transmit(&header, payload)?)
+    }
 
-        let samples = self.transceiver.transmit(&header, &payload)?;
-        Ok(samples)
+    /// Drop the streaming receiver's stored soft information for a PHY key.
+    pub fn harq_evict(&mut self, seq_num: u8) {
+        self.streaming.harq_evict(seq_num);
     }
 
     /// Encode arbitrary binary data to audio samples at an explicit `level`
@@ -495,8 +543,16 @@ impl CoppaCore {
     ///
     /// Peak-normalized to the same [`TX_PEAK`] frames use, so the drive level
     /// an operator sets here transfers directly to real traffic.
+    ///
+    /// `seconds` is capped at [`MAX_TUNE_SECONDS`]; a NaN or negative
+    /// duration gives an empty buffer.
     pub fn tune_tone(&self, seconds: f32, single_hz: Option<f32>) -> Vec<f32> {
         let sample_rate = self.config.sample_rate as f32;
+        let seconds = if seconds.is_nan() {
+            0.0
+        } else {
+            seconds.clamp(0.0, MAX_TUNE_SECONDS)
+        };
         let n = (seconds * sample_rate).round().max(0.0) as usize;
         let two_pi = std::f32::consts::TAU;
 
@@ -728,7 +784,7 @@ impl CoppaCore {
 
     /// Validate `level` for a frame sent on the VHF profile (`on_vhf_profile`)
     /// or on an HF profile, which carries levels 1-8 only.
-    fn check_level(&self, level: u8, on_vhf_profile: bool) -> Result<(), EngineError> {
+    pub(crate) fn check_level(&self, level: u8, on_vhf_profile: bool) -> Result<(), EngineError> {
         coppa_protocol::modem::speed_level_components(level)
             .map_err(|_| EngineError::InvalidSpeedLevel { level })?;
         if !on_vhf_profile && level > HF_MAX_SPEED_LEVEL {
@@ -797,6 +853,62 @@ impl Default for CoppaCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn datagram_test_payload() -> Vec<u8> {
+        let mut state = 0x1380_abcd_u32;
+        let mut payload: Vec<u8> = (0..514)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        payload[0] = 0x19;
+        payload
+    }
+
+    #[test]
+    fn uncompressed_multi_codeword_encode_round_trips_on_a_compressing_engine() {
+        let core = CoppaCore::from_profile(&crate::profiles::HF_STANDARD);
+        let payload = datagram_test_payload();
+        let audio = core
+            .encode_uncompressed_with_codewords(&payload, 5)
+            .unwrap();
+        assert_eq!(core.decode_bytes(&audio).unwrap(), payload);
+    }
+
+    #[test]
+    fn uncompressed_encode_fits_where_the_compressed_path_does_not() {
+        let core = CoppaCore::from_profile(&crate::profiles::HF_STANDARD);
+        let payload = datagram_test_payload();
+        assert!(core.encoded_payload_len(&payload) > 585);
+        assert!(core.encode_uncompressed_with_codewords(&payload, 5).is_ok());
+    }
+
+    #[test]
+    fn uncompressed_encode_rejects_bad_codeword_counts() {
+        let core = CoppaCore::from_profile(&crate::profiles::HF_STANDARD);
+        assert!(matches!(
+            core.encode_uncompressed_with_codewords(b"x", 0),
+            Err(EngineError::ZeroCodewords)
+        ));
+        assert!(matches!(
+            core.encode_uncompressed_with_codewords(b"x", 9),
+            Err(EngineError::TooManyCodewords {
+                requested: 9,
+                max: 8
+            })
+        ));
+    }
+
+    #[test]
+    fn uncompressed_encode_rejects_a_payload_over_the_budget() {
+        let core = CoppaCore::from_profile(&crate::profiles::HF_STANDARD);
+        assert!(core
+            .encode_uncompressed_with_codewords(&vec![0x19; 937], 8)
+            .is_err());
+    }
 
     #[test]
     fn debug_output_is_short_and_names_the_config() {
@@ -1102,6 +1214,79 @@ mod tests {
         out.extend_from_slice(samples);
         out.extend(std::iter::repeat_n(0.0f32, 2048));
         out
+    }
+
+    #[test]
+    fn encode_packet_with_seq_is_uncompressed_and_keyed() {
+        let mut core = CoppaCore::with_config(EngineConfig {
+            compression_enabled: true,
+            ..Default::default()
+        });
+        let payload = b"uncompressed packet uncompressed packet";
+        let samples = core.encode_packet_with_seq(payload, 2, 0x20).unwrap();
+        let mut padded = samples.clone();
+        padded.extend(vec![0.0; 2048]);
+        let (header, decoded, _) = core.transceiver.receive(&padded).unwrap();
+        assert_eq!(header.seq_num, 0x20);
+        assert_eq!(header.codewords, 1);
+        assert_eq!(decoded, payload);
+        let frames = core.push_samples(&with_lead_and_trail(&samples));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload.as_deref().unwrap(), payload);
+        assert!(core.encode_packet_with_seq(payload, 0, 1).is_err());
+        assert!(core.encode_packet_with_seq(payload, 9, 1).is_err());
+    }
+
+    #[test]
+    fn twelve_back_to_back_outer_packets_decode_with_six_erasures() {
+        use coppa_protocol::outer_code::{
+            encode_block, harq_key, shard_len_for_level, InsertOutcome, OuterBlockRx, OuterPacket,
+        };
+        let config = EngineConfig {
+            speed_level: 2,
+            ofdm_band: OfdmBand::Hf,
+            ..Default::default()
+        };
+        let tx = CoppaCore::with_config(config.clone());
+        let segment: Vec<_> = (0..587).map(|i| (i % 251) as u8).collect();
+        let packets = encode_block(7, &segment, shard_len_for_level(2).unwrap()).unwrap();
+        let encoded: Vec<_> = packets
+            .iter()
+            .map(|p| {
+                tx.encode_packet_with_seq(&p.to_bytes().unwrap(), 2, harq_key(7, p.index))
+                    .unwrap()
+            })
+            .collect();
+        for erased in [vec![], vec![3, 4, 7, 8, 10, 11]] {
+            let mut rx = CoppaCore::with_config(config.clone());
+            let mut samples = vec![0.0; 8192];
+            let mut expected = Vec::new();
+            for (i, frame) in encoded.iter().enumerate() {
+                if erased.contains(&i) {
+                    samples.extend(vec![0.0; frame.len()]);
+                } else {
+                    samples.extend_from_slice(frame);
+                    expected.push(packets[i].to_bytes().unwrap());
+                }
+            }
+            samples.extend(vec![0.0; 24_000]);
+            let frames: Vec<_> = samples
+                .chunks(960)
+                .flat_map(|chunk| rx.push_samples(chunk))
+                .collect();
+            let payloads: Vec<_> = frames.into_iter().map(|f| f.payload.unwrap()).collect();
+            assert_eq!(payloads, expected);
+            let mut block = OuterBlockRx::default();
+            let mut rebuilt = None;
+            for payload in payloads {
+                if let InsertOutcome::Rebuilt(bytes) =
+                    block.insert(&OuterPacket::from_bytes(&payload).unwrap())
+                {
+                    rebuilt = Some(bytes);
+                }
+            }
+            assert_eq!(rebuilt.as_deref(), Some(segment.as_slice()));
+        }
     }
 
     #[test]
@@ -1487,6 +1672,22 @@ mod tests {
             let fft = FftProcessor::new(sample_rate);
             let input: Vec<Complex32> = samples.iter().map(|&s| Complex32::new(s, 0.0)).collect();
             fft.forward(&input).iter().map(|c| c.norm()).collect()
+        }
+
+        #[test]
+        fn caps_duration_at_max_tune_seconds() {
+            let core = CoppaCore::new();
+            let sample_rate = core.config().sample_rate as f32;
+            let capped = (MAX_TUNE_SECONDS * sample_rate).round() as usize;
+
+            assert_eq!(core.tune_tone(f32::INFINITY, None).len(), capped);
+            assert_eq!(core.tune_tone(1e12, None).len(), capped);
+            assert!(core.tune_tone(f32::NAN, None).is_empty());
+            assert!(core.tune_tone(-5.0, None).is_empty());
+            assert_eq!(
+                core.tune_tone(10.0, None).len(),
+                (10.0 * sample_rate).round() as usize
+            );
         }
 
         #[test]

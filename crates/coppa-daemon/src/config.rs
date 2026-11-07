@@ -66,7 +66,8 @@ pub struct RadioConfig {
     /// `"none"`, `"vox"`, `"rigctld"` -- for backward compatibility, or an
     /// extended `method:args` form for backends that need extra parameters:
     /// `"serial:/dev/ttyUSB0:dtr"`, `"serial:/dev/ttyUSB0:rts"`,
-    /// `"gpio:17"`, `"cm108:/dev/hidraw0"`, `"cm108:/dev/hidraw0:4"`. See
+    /// `"gpio:pinctrl-bcm2711:17"` (or the deprecated sysfs `"gpio:529"`),
+    /// `"cm108:/dev/hidraw0"`, `"cm108:/dev/hidraw0:4"`. See
     /// [`PttConfig::parse`].
     pub ptt_method: String,
     /// rigctld address (e.g., "127.0.0.1:4532").
@@ -132,7 +133,7 @@ pub enum PttConfig {
         line: PttSerialLine,
     },
     Gpio {
-        pin: String,
+        line: GpioLine,
     },
     /// COP-52: CM108/CM119 HID GPIO PTT through a Linux hidraw node.
     Cm108 {
@@ -140,6 +141,60 @@ pub enum PttConfig {
         /// The chip's GPIO pin wired to PTT, 1 to 8.
         gpio: u8,
     },
+}
+
+/// Which GPIO line `ptt_method = "gpio:..."` names (COP-85).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpioLine {
+    /// `gpio:<number>`: a kernel sysfs GPIO number, driven through the
+    /// deprecated `/sys/class/gpio` interface.
+    Sysfs(u32),
+    /// `gpio:<chip>:<line>`: a line offset on a GPIO character device. The
+    /// chip is a path (`/dev/gpiochip0`), a name (`gpiochip0`) or a label
+    /// (`pinctrl-bcm2711`).
+    Chardev { chip: String, line: u32 },
+}
+
+impl std::fmt::Display for GpioLine {
+    /// `pinctrl-bcm2711:17`, or `529 (sysfs)` for the old form.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GpioLine::Sysfs(number) => write!(f, "{number} (sysfs)"),
+            GpioLine::Chardev { chip, line } => write!(f, "{chip}:{line}"),
+        }
+    }
+}
+
+/// The GPIO form every `gpio` parse error points at.
+const GPIO_EXPECTED: &str =
+    "expected \"gpio:<chip>:<line>\", for example \"gpio:pinctrl-bcm2711:17\"";
+
+impl GpioLine {
+    /// Parse the part of `ptt_method` after `gpio:`. `whole` is the full
+    /// config string, quoted in errors.
+    fn parse(arg: &str, whole: &str) -> Result<Self, PttConfigError> {
+        let fail = |what: &str| {
+            Err(PttConfigError(format!(
+                "gpio PTT config {whole:?} {what}; {GPIO_EXPECTED}"
+            )))
+        };
+        match arg.rsplit_once(':') {
+            None if arg.is_empty() => fail("is missing the chip and line"),
+            None => match arg.parse() {
+                Ok(number) => Ok(GpioLine::Sysfs(number)),
+                Err(_) => fail("has no line number"),
+            },
+            Some(("", _)) => fail("is missing the chip"),
+            Some((_, "")) => fail("is missing the line"),
+            Some((chip, line)) => match line.parse() {
+                Ok(line) => Ok(GpioLine::Chardev {
+                    chip: chip.to_string(),
+                    line,
+                }),
+                Err(_) => fail("has a line that is not a number"),
+            },
+        }
+    }
 }
 
 impl PttConfig {
@@ -191,16 +246,9 @@ impl PttConfig {
                     line,
                 })
             }
-            ("gpio", Some(pin)) => {
-                if pin.is_empty() {
-                    return Err(PttConfigError(format!(
-                        "gpio PTT config {s:?} is missing the pin; expected \"gpio:<pin>\""
-                    )));
-                }
-                Ok(PttConfig::Gpio {
-                    pin: pin.to_string(),
-                })
-            }
+            ("gpio", Some(arg)) => Ok(PttConfig::Gpio {
+                line: GpioLine::parse(arg, s)?,
+            }),
             ("cm108", Some(rest)) => {
                 let (device, gpio) = match rest.rsplit_once(':') {
                     Some((device, gpio)) => {
@@ -230,7 +278,7 @@ impl PttConfig {
             }
             _ => Err(PttConfigError(format!(
                 "unknown PTT method {s:?}; expected one of \"none\", \"vox\", \"rigctld\", \
-                 \"serial:<port>:<dtr|rts>\", \"gpio:<pin>\", \
+                 \"serial:<port>:<dtr|rts>\", \"gpio:<chip>:<line>\", \
                  \"cm108:<hidraw-path>[:<gpio 1-8>]\""
             ))),
         }
@@ -362,7 +410,7 @@ pub struct HostConfig {
     /// Address all host servers bind to. Defaults to "127.0.0.1" (loopback only).
     ///
     /// WARNING: binding to a non-loopback address (e.g. "0.0.0.0") exposes the
-    /// VARA-style and ARDOP ports, which have no authentication and can key a
+    /// VARA-style, ARDOP and KISS ports, which have no authentication and can key a
     /// transmitter, to anyone who can reach this host. The WebSocket port needs
     /// `websocket_token`, but over `ws://` the token crosses the network in
     /// clear text. Only change this on a trusted, firewalled network.
@@ -384,6 +432,11 @@ pub struct HostConfig {
     pub ardop_command_port: u16,
     /// COP-97: ARDOP data port (the ARDOP convention is command port + 1).
     pub ardop_data_port: u16,
+    /// COP-138: enable broadcast KISS datagrams on the OFDM modem.
+    /// No authentication; any client can key TX. See docs/RETICULUM.md.
+    pub kiss_enabled: bool,
+    /// TCP port for the OFDM KISS datagram interface.
+    pub kiss_port: u16,
     /// Enable WebSocket interface.
     pub websocket_enabled: bool,
     /// WebSocket port.
@@ -437,8 +490,7 @@ pub struct EngineSection {
     /// `RateLoop::with_probing`). `0` (the default) disables probing entirely --
     /// an explicit opt-in. Only takes effect when `arq_enabled` is also
     /// `true` -- probing needs the ARQ ACK/timeout feedback loop to attribute a
-    /// probe's outcome. See `docs/superpowers/specs/
-    /// 2026-07-25-rateloop-daemon-probe-wiring-design.md`.
+    /// probe's outcome.
     pub rate_loop_probe_interval: u32,
     /// Index-steps up the speed-level ladder a probe reaches for (see
     /// `RateLoop::with_probing`'s `probe_offset`). Ignored when
@@ -453,9 +505,7 @@ pub struct EngineSection {
     /// automatically** -- it is measurement/telemetry only; actually
     /// switching `CoppaProfile` mid-session needs the peer-negotiation
     /// handshake in `coppa_protocol::cp_negotiator`, gated separately by
-    /// `cp_negotiation_enabled` (see that field's own doc). See
-    /// `docs/superpowers/specs/2026-07-25-cpgate-daemon-wiring-design.md`
-    /// for the full reasoning behind this module's own telemetry-only scope.
+    /// `cp_negotiation_enabled` (see that field's own doc).
     ///
     /// Reverse cross-reference (COP-2): `cp_negotiation_enabled` has no
     /// **proposer** without this flag. The only code that can send a `Propose`
@@ -463,8 +513,7 @@ pub struct EngineSection {
     /// can only ever *answer* a peer -- never start one.
     pub cp_gate_enabled: bool,
     /// Enable the CP-switch peer-negotiation handshake (see
-    /// `coppa_protocol::cp_negotiator` and `docs/superpowers/specs/
-    /// 2026-07-29-cp-switch-peer-negotiation-design.md`). `false` (the
+    /// `coppa_protocol::cp_negotiator`). `false` (the
     /// default) is an explicit opt-in, matching `cp_gate_enabled`'s and
     /// `rate_loop_probe_interval`'s convention exactly.
     ///
@@ -609,11 +658,27 @@ pub const MIN_CWID_WPM: u32 = 10;
 /// 97.119(b)(1) caps an automatic CW ID at 20 WPM.
 pub const MAX_CWID_WPM: u32 = 20;
 
-/// Connected-session configuration (COP-69).
-///
-/// One operator-facing knob today: the cap on LDPC codewords per session
-/// data frame. Session parameters beyond this stay negotiated with the peer
-/// in the CONNECT handshake (see `coppa_protocol::session::LinkCapabilities`).
+/// Connected-session erasure protection policy (SPEC section 22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FadeProtection {
+    Off,
+    #[default]
+    Accept,
+    Request,
+}
+
+impl FadeProtection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Accept => "accept",
+            Self::Request => "request",
+        }
+    }
+}
+
+/// Connected-session codeword cap and negotiated fade-protection policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionConfig {
@@ -625,12 +690,28 @@ pub struct SessionConfig {
     /// advertise the `multi_frame_ack` capability; a mixed-version pair runs
     /// 1-codeword frames exactly as before regardless of this value.
     pub max_codewords_per_frame: u8,
+    /// Request, accept, or disable the negotiated RS(12,6) session mode.
+    #[serde(deserialize_with = "deserialize_fade_protection")]
+    pub fade_protection: FadeProtection,
+}
+
+fn deserialize_fade_protection<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<FadeProtection, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    match value.as_str() {
+        "off" => Ok(FadeProtection::Off),
+        "accept" => Ok(FadeProtection::Accept),
+        "request" => Ok(FadeProtection::Request),
+        _ => Err(serde::de::Error::custom(format!("invalid [session] fade_protection ({value:?}); must be one of \"off\", \"accept\", \"request\""))),
+    }
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             max_codewords_per_frame: 8,
+            fade_protection: FadeProtection::Accept,
         }
     }
 }
@@ -709,6 +790,8 @@ impl Default for HostConfig {
             ardop_enabled: false,
             ardop_command_port: 8515,
             ardop_data_port: 8516,
+            kiss_enabled: false,
+            kiss_port: 8100,
             websocket_enabled: false,
             websocket_port: 8400,
             websocket_token: None,
@@ -785,21 +868,62 @@ impl ConfigEnv {
 /// `HOME` values (the XDG spec says to ignore relative paths). `APPDATA` is
 /// set by the OS and only needs to be non-empty.
 pub fn config_candidates(env: &ConfigEnv) -> Vec<PathBuf> {
-    let mut candidates = vec![PathBuf::from(CONFIG_FILE_NAME)];
+    config_candidates_named(env, CONFIG_FILE_NAME)
+}
+
+/// COP-85: [`config_candidates`] for a file named `file_name` (for an
+/// instance, `coppad-NAME.toml`), in the same directories and order.
+pub fn config_candidates_named(env: &ConfigEnv, file_name: &str) -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from(file_name)];
     if env.windows {
         if let Some(appdata) = non_empty(&env.appdata) {
-            candidates.push(Path::new(appdata).join("coppa").join(CONFIG_FILE_NAME));
+            candidates.push(Path::new(appdata).join("coppa").join(file_name));
         }
     } else {
         let user_dir = rooted(&env.xdg_config_home)
             .map(PathBuf::from)
             .or_else(|| rooted(&env.home).map(|home| Path::new(home).join(".config")));
         if let Some(dir) = user_dir {
-            candidates.push(dir.join("coppa").join(CONFIG_FILE_NAME));
+            candidates.push(dir.join("coppa").join(file_name));
         }
-        candidates.push(PathBuf::from(SYSTEM_CONFIG_PATH));
+        candidates.push(
+            Path::new(SYSTEM_CONFIG_PATH)
+                .parent()
+                .unwrap_or(Path::new("/"))
+                .join(file_name),
+        );
     }
     candidates
+}
+
+/// COP-85: the config file name an instance searches for: `coppad.toml`
+/// without an instance, `coppad-NAME.toml` with one.
+pub fn config_file_name(instance: Option<&str>) -> String {
+    match instance {
+        Some(name) => format!("coppad-{name}.toml"),
+        None => CONFIG_FILE_NAME.to_string(),
+    }
+}
+
+/// The longest `--instance` name.
+pub const MAX_INSTANCE_NAME_CHARS: usize = 32;
+
+/// COP-85: an instance name is 1 to 32 ASCII letters, digits and hyphens,
+/// not starting or ending with a hyphen, so it is safe in a file name, a log
+/// prefix, a systemd `%i` and an mDNS host label.
+pub fn check_instance_name(name: &str) -> Result<(), String> {
+    let valid = (1..=MAX_INSTANCE_NAME_CHARS).contains(&name.len())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !name.starts_with('-')
+        && !name.ends_with('-');
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "use 1 to {MAX_INSTANCE_NAME_CHARS} letters, digits and hyphens, not starting or \
+             ending with a hyphen"
+        ))
+    }
 }
 
 fn non_empty(value: &Option<OsString>) -> Option<&OsStr> {
@@ -918,6 +1042,125 @@ impl Discovered {
     }
 }
 
+/// COP-85: keys a SIGHUP reload applies to the running daemon, as
+/// (section, key). Every other key keeps its running value until a restart,
+/// so a key added later is restart-only until it is listed here.
+/// `cp_gate_enabled` and `cp_negotiation_enabled` stay out: turning
+/// negotiation off mid-handshake could leave two stations on different CP
+/// profiles.
+pub const RELOADABLE_KEYS: &[(&str, &str)] = &[
+    ("radio", "ptt_pre_delay_ms"),
+    ("radio", "ptt_tail_delay_ms"),
+    ("radio", "max_tx_duration_s"),
+    ("radio", "turnaround_ms"),
+    ("radio", "host_rig_control"),
+    ("station_id", "busy_hold_ms"),
+    ("station_id", "id_interval_secs"),
+    ("station_id", "beacon_interval_secs"),
+    ("station_id", "cwid"),
+    ("station_id", "cwid_wpm"),
+    ("engine", "callsign"),
+    ("engine", "grid"),
+    ("session", "max_codewords_per_frame"),
+    ("host", "sessionless_tx_enabled"),
+];
+
+/// COP-85: what a reload changes. Labels are `[section] key` and never carry
+/// a value, so a changed `websocket_token` is never logged.
+#[derive(Debug, Clone)]
+pub struct ReloadPlan {
+    /// The running configuration with every changed reloadable key taken
+    /// from the file.
+    pub effective: DaemonConfig,
+    /// Reloadable keys whose value changed, in section and key order.
+    pub applied: Vec<String>,
+    /// Restart-only keys whose value changed; they keep their running value.
+    pub restart_required: Vec<String>,
+}
+
+impl ReloadPlan {
+    /// Whether the reload applied `[section] key`.
+    pub fn applies(&self, section: &str, key: &str) -> bool {
+        let label = reload_label(section, key);
+        self.applied.contains(&label)
+    }
+}
+
+fn reload_label(section: &str, key: &str) -> String {
+    format!("[{section}] {key}")
+}
+
+/// COP-85: compare the running configuration with a freshly loaded `file`
+/// key by key. A changed key in [`RELOADABLE_KEYS`] is copied into the
+/// result; any other changed key is reported as restart-only and keeps its
+/// running value.
+pub fn plan_reload(running: &DaemonConfig, file: &DaemonConfig) -> anyhow::Result<ReloadPlan> {
+    use std::collections::BTreeSet;
+    use toml::{Table, Value};
+
+    fn as_table(config: &DaemonConfig) -> anyhow::Result<Table> {
+        match Value::try_from(config)? {
+            Value::Table(table) => Ok(table),
+            other => anyhow::bail!("configuration serialized as {}", other.type_str()),
+        }
+    }
+
+    let mut effective = as_table(running)?;
+    let file = as_table(file)?;
+    let mut applied = Vec::new();
+    let mut restart_required = Vec::new();
+    let sections: BTreeSet<String> = effective.keys().chain(file.keys()).cloned().collect();
+    for section in sections {
+        let old = effective.get(&section).cloned();
+        let new = file.get(&section).cloned();
+        if old == new {
+            continue;
+        }
+        let (old_keys, new_keys) = match (old, new) {
+            (Some(Value::Table(old)), Some(Value::Table(new))) => (old, new),
+            (Some(Value::Table(old)), None) => (old, Table::new()),
+            (None, Some(Value::Table(new))) => (Table::new(), new),
+            // Not a section table: compared whole, and restart-only.
+            _ => {
+                restart_required.push(format!("[{section}]"));
+                continue;
+            }
+        };
+        let keys: BTreeSet<&String> = old_keys.keys().chain(new_keys.keys()).collect();
+        for key in keys {
+            let new_value = new_keys.get(key);
+            if old_keys.get(key) == new_value {
+                continue;
+            }
+            let label = reload_label(&section, key);
+            if !RELOADABLE_KEYS.contains(&(section.as_str(), key.as_str())) {
+                restart_required.push(label);
+                continue;
+            }
+            let table = effective
+                .entry(section.clone())
+                .or_insert_with(|| Value::Table(Table::new()));
+            if let Value::Table(table) = table {
+                match new_value {
+                    Some(value) => {
+                        table.insert(key.clone(), value.clone());
+                    }
+                    None => {
+                        table.remove(key);
+                    }
+                }
+            }
+            applied.push(label);
+        }
+    }
+    let effective: DaemonConfig = Value::Table(effective).try_into()?;
+    Ok(ReloadPlan {
+        effective,
+        applied,
+        restart_required,
+    })
+}
+
 impl DaemonConfig {
     /// Load configuration from a TOML file.
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
@@ -976,6 +1219,63 @@ impl DaemonConfig {
             searched,
             permission_denied,
         })
+    }
+
+    /// COP-85: every config gate run mode applies before it touches hardware
+    /// or binds a socket, in the order startup reports them. The profile
+    /// check comes first so a typo'd name is reported as an unknown profile,
+    /// not through `check_sample_rate`'s fallback rate. The build checks read
+    /// this binary's own features. `--check` does not call it.
+    pub fn check_for_run(&self) -> Result<(), String> {
+        self.check_profile()?;
+        self.check_buffer_size()?;
+        self.check_sample_rate()?;
+        self.check_audio_selectors()?;
+        self.check_session()?;
+        self.check_station_id()?;
+        self.check_websocket_auth()?;
+        self.check_websocket_built(cfg!(feature = "websocket"))?;
+        self.check_ardop_built(cfg!(feature = "ardop"))?;
+        self.check_kiss_built(cfg!(feature = "kiss-tnc"))?;
+        self.check_mdns(cfg!(feature = "mdns"))?;
+        self.check_devices_built(cfg!(feature = "cpal-backend"))
+    }
+
+    /// COP-85: the gates a SIGHUP reload applies before it changes anything:
+    /// [`Self::check_for_run`], then the `[radio] ptt_method` and frequency
+    /// parses `EventLoop::new` would otherwise reject. Hardware (port binds,
+    /// device opens, rigctld) is not checked.
+    pub fn check_for_reload(&self) -> Result<(), String> {
+        self.check_for_run()?;
+        self.radio
+            .ptt_config()
+            .map_err(|e| format!("invalid [radio] ptt_method: {e}"))?;
+        self.radio.frequency_config()?;
+        Ok(())
+    }
+
+    /// COP-32: a build without `cpal-backend` opens no audio device, so a
+    /// named one can never be found. `cpal_built` is whether this binary has
+    /// the feature.
+    pub fn check_devices_built(&self, cpal_built: bool) -> Result<(), String> {
+        if cpal_built {
+            return Ok(());
+        }
+        for (key, name) in [
+            ("input_device", &self.audio.input_device),
+            ("output_device", &self.audio.output_device),
+            ("input_device_id", &self.audio.input_device_id),
+            ("output_device_id", &self.audio.output_device_id),
+        ] {
+            if !name.is_empty() {
+                return Err(format!(
+                    "[audio] {key} = {name:?} is set, but this coppad was built without the \
+                     cpal-backend feature and opens no audio devices; rebuild with \
+                     --features cpal-backend, or clear [audio] {key}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// COP-36: `[engine] profile` must name a built-in profile
@@ -1058,6 +1358,14 @@ impl DaemonConfig {
              ardop, or set ardop_enabled = false"
                 .to_string(),
         )
+    }
+
+    /// An enabled KISS interface requires the kiss-tnc build feature.
+    pub fn check_kiss_built(&self, built: bool) -> Result<(), String> {
+        if built || !self.host.kiss_enabled {
+            return Ok(());
+        }
+        Err("[host] kiss_enabled = true is set, but this coppad was built without the kiss-tnc feature and starts no KISS datagram interface; rebuild with --features kiss-tnc, or set kiss_enabled = false".into())
     }
 
     /// COP-140: `[host] mdns_enabled = true` needs a build with the `mdns`
@@ -1548,19 +1856,66 @@ beacon_interval_secs = 600
     }
 
     #[test]
-    fn test_ptt_parse_gpio_pin() {
+    fn gpio_chardev_form_parses_chip_and_line() {
+        for chip in ["pinctrl-bcm2711", "gpiochip0", "/dev/gpiochip0"] {
+            assert_eq!(
+                PttConfig::parse(&format!("gpio:{chip}:17")).unwrap(),
+                PttConfig::Gpio {
+                    line: GpioLine::Chardev {
+                        chip: chip.to_string(),
+                        line: 17
+                    }
+                },
+                "{chip}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpio_number_form_is_the_legacy_sysfs_number() {
         assert_eq!(
-            PttConfig::parse("gpio:17").unwrap(),
+            PttConfig::parse("gpio:529").unwrap(),
             PttConfig::Gpio {
-                pin: "17".to_string()
+                line: GpioLine::Sysfs(529)
             }
         );
     }
 
     #[test]
-    fn test_ptt_parse_gpio_missing_pin_errors() {
-        let err = PttConfig::parse("gpio").unwrap_err();
-        assert!(err.to_string().contains("gpio:<pin>"));
+    fn gpio_parse_errors_name_the_expected_forms() {
+        for bad in [
+            "gpio:",
+            "gpio::17",
+            "gpio:chip:",
+            "gpio:chip:x",
+            "gpio:abc",
+            "gpio:pinctrl-bcm2711:-1",
+        ] {
+            let err = PttConfig::parse(bad).unwrap_err().to_string();
+            assert!(err.contains("\"gpio:<chip>:<line>\""), "{bad}: {err}");
+            assert!(err.contains(&format!("{bad:?}")), "{bad}: {err}");
+        }
+        let err = PttConfig::parse("gpio:pinctrl-bcm2711:x")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "gpio PTT config \"gpio:pinctrl-bcm2711:x\" has a line that is not a number; \
+             expected \"gpio:<chip>:<line>\", for example \"gpio:pinctrl-bcm2711:17\""
+        );
+        // A bare "gpio" is an unknown method, and that error lists the form.
+        let err = PttConfig::parse("gpio").unwrap_err().to_string();
+        assert!(err.contains("\"gpio:<chip>:<line>\""), "{err}");
+    }
+
+    #[test]
+    fn gpio_line_display_marks_the_sysfs_form() {
+        assert_eq!(GpioLine::Sysfs(529).to_string(), "529 (sysfs)");
+        let chardev = GpioLine::Chardev {
+            chip: "pinctrl-bcm2711".into(),
+            line: 17,
+        };
+        assert_eq!(chardev.to_string(), "pinctrl-bcm2711:17");
     }
 
     #[test]
@@ -1726,7 +2081,7 @@ beacon_interval_secs = 600
         assert_eq!(
             radio.ptt_config().unwrap(),
             PttConfig::Gpio {
-                pin: "4".to_string()
+                line: GpioLine::Sysfs(4)
             }
         );
     }
@@ -2878,5 +3233,280 @@ beacon_interval_secs = 600
             "{err}"
         );
         assert!(err.contains("set buffer_size = 8192"), "{err}");
+    }
+
+    /// COP-85: `check_for_run` reports each gate with the text the
+    /// individual check produces, as run mode did before it was gathered.
+    #[test]
+    fn check_for_run_reports_each_gate_with_its_startup_text() {
+        let mut config = DaemonConfig::default();
+        assert_eq!(config.check_for_run(), Ok(()));
+
+        config.engine.profile = "HF_STANDRD".to_string();
+        assert_eq!(config.check_for_run(), config.check_profile());
+        assert!(config.check_for_run().is_err());
+
+        let mut config = DaemonConfig::default();
+        config.audio.buffer_size = 0;
+        assert_eq!(config.check_for_run(), config.check_buffer_size());
+        assert!(config.check_for_run().is_err());
+
+        let mut config = DaemonConfig::default();
+        config.host.websocket_enabled = true;
+        assert_eq!(config.check_for_run(), config.check_websocket_auth());
+        assert!(config.check_for_run().is_err());
+    }
+
+    /// COP-85: the no-audio build refuses a named device with the text
+    /// run mode always used, and an audio build accepts it.
+    #[test]
+    fn check_for_run_refuses_a_named_device_without_cpal_backend() {
+        let mut config = DaemonConfig::default();
+        assert_eq!(config.check_devices_built(false), Ok(()));
+        config.audio.input_device = "x".to_string();
+        assert_eq!(config.check_devices_built(true), Ok(()));
+        assert_eq!(
+            config.check_devices_built(false).unwrap_err(),
+            "[audio] input_device = \"x\" is set, but this coppad was built without the \
+             cpal-backend feature and opens no audio devices; rebuild with \
+             --features cpal-backend, or clear [audio] input_device"
+        );
+        if !cfg!(feature = "cpal-backend") {
+            assert_eq!(config.check_for_run(), config.check_devices_built(false));
+        }
+    }
+
+    /// COP-85: a reload also refuses what `EventLoop::new` would refuse.
+    #[test]
+    fn check_for_reload_also_parses_ptt_method_and_frequency() {
+        let config = DaemonConfig::default();
+        assert_eq!(config.check_for_reload(), Ok(()));
+
+        let mut config = DaemonConfig::default();
+        config.radio.ptt_method = "bogus".to_string();
+        assert_eq!(config.check_for_run(), Ok(()));
+        let err = config.check_for_reload().unwrap_err();
+        assert!(err.starts_with("invalid [radio] ptt_method: "), "{err}");
+
+        let mut config = DaemonConfig::default();
+        config.radio.band = Some("11m".to_string());
+        assert_eq!(config.check_for_run(), Ok(()));
+        assert_eq!(
+            config.check_for_reload(),
+            Err(config.radio.frequency_config().unwrap_err())
+        );
+    }
+
+    fn toml_of(config: &DaemonConfig) -> String {
+        toml::to_string(config).unwrap()
+    }
+
+    /// COP-85: a reload copies changed live keys and keeps restart-only ones.
+    #[test]
+    fn reload_plan_applies_live_keys_and_keeps_restart_only_keys() {
+        let running = DaemonConfig::default();
+        let mut file = DaemonConfig::default();
+        file.radio.ptt_tail_delay_ms = 300;
+        file.station_id.busy_hold_ms = 750;
+        file.host.vara_command_port = 8310;
+        file.engine.profile = "HF_ROBUST".to_string();
+
+        let plan = plan_reload(&running, &file).unwrap();
+        assert_eq!(
+            plan.applied,
+            ["[radio] ptt_tail_delay_ms", "[station_id] busy_hold_ms"]
+        );
+        assert_eq!(
+            plan.restart_required,
+            ["[engine] profile", "[host] vara_command_port"]
+        );
+        assert!(plan.applies("radio", "ptt_tail_delay_ms"));
+        assert!(!plan.applies("host", "vara_command_port"));
+        assert_eq!(plan.effective.radio.ptt_tail_delay_ms, 300);
+        assert_eq!(plan.effective.station_id.busy_hold_ms, 750);
+        assert_eq!(
+            plan.effective.host.vara_command_port,
+            running.host.vara_command_port
+        );
+        assert_eq!(plan.effective.engine.profile, running.engine.profile);
+    }
+
+    #[test]
+    fn reload_plan_of_an_unchanged_file_changes_nothing() {
+        let mut running = DaemonConfig::default();
+        running.engine.callsign = "N0CALL".to_string();
+        running.engine.grid = Some("FN20".to_string());
+        let plan = plan_reload(&running, &running.clone()).unwrap();
+        assert!(plan.applied.is_empty(), "{:?}", plan.applied);
+        assert!(
+            plan.restart_required.is_empty(),
+            "{:?}",
+            plan.restart_required
+        );
+        assert_eq!(toml_of(&plan.effective), toml_of(&running));
+    }
+
+    /// COP-85: an optional reloadable key that the file clears is cleared.
+    #[test]
+    fn reload_plan_clears_an_optional_live_key_the_file_drops() {
+        let mut running = DaemonConfig::default();
+        running.engine.grid = Some("FN20".to_string());
+        let plan = plan_reload(&running, &DaemonConfig::default()).unwrap();
+        assert_eq!(plan.applied, ["[engine] grid"]);
+        assert_eq!(plan.effective.engine.grid, None);
+    }
+
+    /// COP-85: a renamed config field must not leave a dead reload entry.
+    #[test]
+    fn every_reloadable_key_names_a_real_config_key() {
+        let mut config = DaemonConfig::default();
+        config.engine.grid = Some("FN20".to_string());
+        let toml::Value::Table(table) = toml::Value::try_from(&config).unwrap() else {
+            panic!("config is not a table");
+        };
+        for (section, key) in RELOADABLE_KEYS {
+            let section_table = table
+                .get(*section)
+                .and_then(toml::Value::as_table)
+                .unwrap_or_else(|| panic!("no [{section}] section"));
+            assert!(
+                section_table.contains_key(*key),
+                "[{section}] {key} is in RELOADABLE_KEYS but not in the config"
+            );
+        }
+    }
+
+    #[test]
+    fn reload_plan_names_a_changed_token_without_its_value() {
+        let secret = "s3cretTokenValue-0123456789abcdef";
+        let running = DaemonConfig::default();
+        let file: DaemonConfig =
+            toml::from_str(&format!("[host]\nwebsocket_token = \"{secret}\"\n")).unwrap();
+        let plan = plan_reload(&running, &file).unwrap();
+        assert_eq!(plan.restart_required, ["[host] websocket_token"]);
+        assert!(plan.applied.is_empty());
+        for label in plan.applied.iter().chain(&plan.restart_required) {
+            assert!(!label.contains(secret), "{label}");
+        }
+        assert!(plan.effective.host.websocket_token.is_none());
+    }
+
+    #[test]
+    fn instance_names_are_letters_digits_and_inner_hyphens() {
+        for name in ["hf", "vhf-2", "A1", &"a".repeat(32)] {
+            assert_eq!(check_instance_name(name), Ok(()), "{name}");
+        }
+        for name in [
+            "",
+            "-hf",
+            "hf-",
+            "hf_1",
+            "hf.1",
+            "hf/1",
+            "h\u{e9}",
+            &"a".repeat(33),
+        ] {
+            assert_eq!(
+                check_instance_name(name).unwrap_err(),
+                "use 1 to 32 letters, digits and hyphens, not starting or ending with a hyphen",
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn instance_config_candidates_use_coppad_name_toml() {
+        assert_eq!(config_file_name(None), "coppad.toml");
+        assert_eq!(config_file_name(Some("hf")), "coppad-hf.toml");
+        let unix = ConfigEnv {
+            windows: false,
+            home: Some("/home/op".into()),
+            xdg_config_home: None,
+            appdata: None,
+        };
+        let windows = ConfigEnv {
+            windows: true,
+            home: None,
+            xdg_config_home: None,
+            appdata: Some("C:\\Users\\op\\AppData\\Roaming".into()),
+        };
+        for env in [&unix, &windows] {
+            let named = config_candidates_named(env, &config_file_name(Some("hf")));
+            assert!(!named.is_empty());
+            for path in &named {
+                assert!(path.ends_with("coppad-hf.toml"), "{}", path.display());
+            }
+            let plain = config_candidates(env);
+            assert_eq!(plain.len(), named.len());
+            for (plain, named) in plain.iter().zip(&named) {
+                assert_eq!(plain.parent(), named.parent());
+            }
+        }
+        assert_eq!(
+            config_candidates(&unix),
+            [
+                PathBuf::from("coppad.toml"),
+                PathBuf::from("/home/op/.config/coppa/coppad.toml"),
+                PathBuf::from("/etc/coppa/coppad.toml"),
+            ]
+        );
+        assert_eq!(
+            config_candidates_named(&unix, "coppad-hf.toml").last(),
+            Some(&PathBuf::from("/etc/coppa/coppad-hf.toml"))
+        );
+    }
+
+    #[test]
+    fn kiss_keys_default_off_on_port_8100() {
+        let c = DaemonConfig::default();
+        assert!(!c.host.kiss_enabled);
+        assert_eq!(c.host.kiss_port, 8100);
+    }
+
+    #[test]
+    fn check_kiss_built_gates_an_enabled_config() {
+        let mut c = DaemonConfig::default();
+        assert!(c.check_kiss_built(false).is_ok());
+        c.host.kiss_enabled = true;
+        assert!(c.check_kiss_built(true).is_ok());
+        assert!(c
+            .check_kiss_built(false)
+            .unwrap_err()
+            .contains("kiss-tnc feature"));
+    }
+
+    #[test]
+    fn example_config_documents_the_kiss_keys() {
+        let text = include_str!("../../../coppad.toml.example");
+        let _: DaemonConfig = toml::from_str(text).unwrap();
+        let host = text.split("[host]").nth(1).unwrap();
+        assert!(host.contains("# kiss_enabled = true"));
+        assert!(host.contains("# kiss_port = 8100"));
+    }
+}
+
+#[cfg(test)]
+mod fade_protection_tests {
+    use super::*;
+    #[test]
+    fn fade_protection_config_modes() {
+        assert_eq!(
+            SessionConfig::default().fade_protection,
+            FadeProtection::Accept
+        );
+        for (value, mode) in [
+            ("off", FadeProtection::Off),
+            ("accept", FadeProtection::Accept),
+            ("request", FadeProtection::Request),
+        ] {
+            let config: DaemonConfig =
+                toml::from_str(&format!("[session]\nfade_protection = \"{}\"", value)).unwrap();
+            assert_eq!(config.session.fade_protection, mode);
+        }
+        let error = toml::from_str::<DaemonConfig>("[session]\nfade_protection = \"yes\"")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fade_protection"), "{error}");
+        toml::from_str::<DaemonConfig>(include_str!("../../../coppad.toml.example")).unwrap();
     }
 }

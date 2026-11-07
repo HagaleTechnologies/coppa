@@ -11,8 +11,7 @@
 //! that completes a candidate pays that full demod/FEC cost synchronously before
 //! returning (see that method's doc).
 //!
-//! State machine (locked, see `docs/superpowers/plans/2026-07-03-phase1-radio-reality.md`
-//! Task 7): `Searching` (represented here as `pending: None`) feeds every pushed
+//! State machine (locked since Phase 1 Task 7): `Searching` (represented here as `pending: None`) feeds every pushed
 //! sample to the `SyncDetector` and queues whatever candidates it confirms.
 //! `Accumulating { start, need }` (represented as `pending: Some(Pending { .. })`)
 //! buffers samples from a candidate's `frame_start` until `need` are available, in
@@ -20,7 +19,7 @@
 //!
 //! 1. First `need = rx_group_delay + (3 + header_syms) * symbol_len` — just enough
 //!    for the preamble, probe/fine-sync symbol, and the protected header, PLUS the
-//!    RX bandpass filter's own group delay (see [`StreamingReceiver::header_peek`]'s
+//!    RX bandpass filter's own group delay (see `StreamingReceiver::header_peek`'s
 //!    doc for why that's needed). Once buffered, the header ALONE is demodulated
 //!    (`CoppaTransceiver::demodulate_header`) to learn the frame's speed level. A
 //!    header decode failure discards the candidate and
@@ -103,8 +102,7 @@ pub struct DecodedFrame {
     /// This frame's measured multipath delay spread (ms), from
     /// `CoppaTransceiver::receive_with_metrics`'s 5th element (originally
     /// `DelayDomainEstimator::delay_spread_ms`, Task 6b). Feeds `coppa_ml::CpGate`'s
-    /// daemon wiring -- see `docs/superpowers/specs/
-    /// 2026-07-25-cpgate-daemon-wiring-design.md`.
+    /// daemon wiring.
     pub delay_spread_ms: f32,
 }
 
@@ -149,23 +147,20 @@ pub struct StreamingReceiver {
     /// coordinate system `total_pushed`, candidate `frame_start`s, `resume_from`,
     /// and `Pending::start` all use.
     ///
-    /// This receiver does NOT run any continuous filter over the incoming stream:
-    /// an earlier version of this code did (to keep `SyncDetector` and the ring in
-    /// a consistent "filtered" domain matching `CoppaTransceiver::receive`'s own
-    /// internal detection), but measured directly (see the Task 7 report), a
-    /// continuous 601-tap HF RX-bandpass filter over 10 s of audio cost ~13x more
-    /// than a bare `SyncDetector` pass (0.020x realtime vs. the 0.005x target) —
-    /// disproportionate to the small fraction of incoming audio that's ever inside
-    /// an actual candidate window. Instead:
-    /// - `SyncDetector` runs on raw samples too. This gives up some detection
-    ///   margin on a genuinely noisy channel relative to filtering first (the
-    ///   `sync_detector` module's own tests measure ~9 dB) — a real, deliberate,
-    ///   documented trade-off, not a correctness bug: it affects miss rate on a
-    ///   weak real signal, not the false-positive rejection of noise/tones (which
-    ///   `SyncDetector`'s own cross-correlation confirm step already handles
-    ///   without pre-filtering — see `detector_rejects_steady_tone`). Recovering
-    ///   that margin (e.g. a cheaper/shorter continuous filter) is a reasonable
-    ///   future improvement but out of Task 7's scope.
+    /// This receiver does NOT run a full-rate continuous filter over the incoming
+    /// stream: an earlier version of this code did (to keep `SyncDetector` and
+    /// the ring in a consistent "filtered" domain matching
+    /// `CoppaTransceiver::receive`'s own internal detection), but measured
+    /// directly (see the Task 7 report), a continuous 601-tap HF RX-bandpass
+    /// filter over 10 s of audio cost ~13x more than a bare `SyncDetector` pass.
+    /// Instead:
+    /// - The ring keeps raw samples, and `SyncDetector` is fed raw samples. The
+    ///   detector is built with `SyncDetector::new_prefiltered`, which runs its
+    ///   own 121-tap band-pass decimated by 4 ahead of the plateau search and
+    ///   keeps the confirm and timing steps at the full rate on raw samples
+    ///   (COP-126, `docs/adr/011-cop126-decimated-sync-prefilter.md`). That
+    ///   recovers the detection margin the unfiltered detector gave up, at a
+    ///   lower cost than the unfiltered detector (BENCHMARKS.md, "COP-126").
     /// - The one-shot (block) `Fir` filtering `CoppaTransceiver::demodulate_header`/
     ///   `receive_with_metrics` already do internally is applied only to each
     ///   candidate's own small slice, not the whole stream — the same total
@@ -213,6 +208,16 @@ impl std::fmt::Debug for StreamingReceiver {
 }
 
 impl StreamingReceiver {
+    /// Discard soft information for one packet when its outer block completes.
+    pub fn harq_evict(&mut self, seq: u8) {
+        self.transceiver.harq_evict(seq);
+    }
+
+    #[cfg(test)]
+    fn harq_buffer_count(&self) -> usize {
+        self.transceiver.harq_buffer_count()
+    }
+
     /// Create a receiver for `profile` whose sync detector and transceiver
     /// expect protocol `version` (the header nibble that keys the preamble
     /// PN). The ring starts empty.
@@ -228,7 +233,9 @@ impl StreamingReceiver {
         } else {
             0
         };
-        let sync = SyncDetector::new(profile.clone(), version);
+        // The detector runs its own decimated band-pass ahead of the plateau
+        // search (COP-126, ADR-011), because this receiver feeds it raw audio.
+        let sync = SyncDetector::new_prefiltered(profile.clone(), version);
         let transceiver = CoppaTransceiver::new(profile, version);
 
         // Cross-crate invariant: `data_carriers` (used here for frame-length
@@ -479,7 +486,11 @@ impl StreamingReceiver {
                         }
                     }
                 }
-                self.resume_from = start + need as u64;
+                // Sync anchors vary slightly with the preceding packet's tail.
+                // Keep one symbol of overlap so a back-to-back preamble whose
+                // anchor is earlier than this frame's does not get discarded.
+                // This cannot revisit this frame's own preamble/header.
+                self.resume_from = start + need.saturating_sub(self.symbol_len) as u64;
                 self.pending = None;
             }
         }
@@ -720,6 +731,30 @@ mod tests {
     }
 
     #[test]
+    fn streaming_harq_evict_clears_only_the_requested_key() {
+        let profile = CoppaProfile::hf_standard();
+        let tx = CoppaTransceiver::new(profile.clone(), 1);
+        let mut rx = StreamingReceiver::new(profile.clone(), 1);
+        let symbol_len = profile.fft_size + profile.cp_samples;
+        let header_syms = header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(profile.data_carriers);
+        for seq in [0x10, 0x11] {
+            let mut h = header(5, 40);
+            h.seq_num = seq;
+            let mut frame = tx.transmit(&h, &[0x77; 40]).unwrap();
+            frame[(3 + header_syms) * symbol_len..].fill(0.0);
+            // Insert through the same receiver-owned transceiver used by streaming.
+            assert!(rx.transceiver.receive(&frame).is_err());
+        }
+        assert_eq!(rx.harq_buffer_count(), 2);
+        rx.harq_evict(0x10);
+        assert_eq!(rx.harq_buffer_count(), 1);
+        rx.harq_evict(0x10);
+        assert_eq!(rx.harq_buffer_count(), 1);
+        rx.harq_evict(0x11);
+        assert_eq!(rx.harq_buffer_count(), 0);
+    }
+
+    #[test]
     fn streaming_decodes_frames_fed_in_odd_chunks() {
         let profile = CoppaProfile::hf_standard();
         let tx = CoppaTransceiver::new(profile.clone(), 1);
@@ -788,6 +823,25 @@ mod tests {
     /// discarded (header decode "failure") even though the full-frame path
     /// (reached only if the header peek succeeds) re-derives its own
     /// timing/CFO independently and would have decoded it fine.
+    #[test]
+    fn streaming_decodes_distant_cfo_offsets() {
+        let profile = CoppaProfile::hf_standard();
+        let tx = CoppaTransceiver::new(profile.clone(), 1);
+        let payload = vec![0xA7; 100];
+        let frame = make_frame(&tx, 2, &payload);
+        for off in [-150.0, 150.0] {
+            let shifted = coppa_channel::frequency_shift(&frame, off, 48_000.0);
+            let noisy = coppa_channel::awgn_seeded(&shifted, 12.0, 0xBEEF);
+            let mut stream = vec![0.0; 4 * (profile.fft_size + profile.cp_samples)];
+            stream.extend(noisy);
+            stream.extend(vec![0.0; 4 * (profile.fft_size + profile.cp_samples)]);
+            let mut rx = StreamingReceiver::new(profile.clone(), 1);
+            let decoded = rx.push_samples(&stream);
+            assert_eq!(decoded.len(), 1, "CFO {off}: no decoded frame");
+            assert_eq!(&decoded[0].payload[..payload.len()], &payload);
+        }
+    }
+
     #[test]
     fn streaming_decodes_a_frame_with_injected_cfo() {
         let profile = CoppaProfile::hf_standard();
@@ -1132,5 +1186,55 @@ mod tests {
             rx.len(),
             2 * max_frame
         );
+    }
+
+    /// Silence, the frame and silence (4 symbols each side), plus full-band
+    /// white noise at `snr_db` (3 kHz convention) with no RX filter, pushed
+    /// in 4800-sample chunks. Returns whether the payload decoded.
+    fn decodes_in_full_band_awgn(level: u8, snr_db: f32, seed: u64) -> bool {
+        let profile = CoppaProfile::hf_standard();
+        let tx = CoppaTransceiver::new(profile.clone(), 1);
+        let payload: Vec<u8> = (0..20u8).map(|i| i.wrapping_mul(37) ^ level).collect();
+        let frame = make_frame(&tx, level, &payload);
+        let sym = profile.fft_size + profile.cp_samples;
+        let mut clean = vec![0.0f32; 4 * sym];
+        clean.extend_from_slice(&frame);
+        clean.extend(std::iter::repeat_n(0.0f32, 4 * sym));
+        let noisy = coppa_channel::awgn_ref_seeded(
+            &clean,
+            snr_db,
+            coppa_channel::mean_power(&frame),
+            48_000.0,
+            seed,
+        );
+        let mut rx = StreamingReceiver::new(profile, 1);
+        let decoded = push_in_chunks(&mut rx, &noisy, &[4800]);
+        decoded.len() == 1 && decoded[0].payload[..payload.len()] == payload[..]
+    }
+
+    /// COP-126: the streaming receiver feeds its sync detector raw audio. On
+    /// main the unfiltered plateau search decoded 0/20 frames at 6 dB on
+    /// full-band noise, where the batch API decoded 20/20.
+    #[test]
+    fn streaming_decodes_levels_1_and_2_in_full_band_awgn_at_6_db() {
+        for level in [1u8, 2] {
+            for seed in 0..3u64 {
+                assert!(
+                    decodes_in_full_band_awgn(level, 6.0, 0x00C0_FFEE + seed),
+                    "level {level}, seed {seed}: no decode at 6 dB full-band AWGN"
+                );
+            }
+        }
+    }
+
+    /// COP-126: the gap covered levels 1 to 7, so check a higher level too.
+    #[test]
+    fn streaming_decodes_level_4_in_full_band_awgn_at_6_db() {
+        for seed in 0..3u64 {
+            assert!(
+                decodes_in_full_band_awgn(4, 6.0, 0x00C0_FFEE + seed),
+                "level 4, seed {seed}: no decode at 6 dB full-band AWGN"
+            );
+        }
     }
 }

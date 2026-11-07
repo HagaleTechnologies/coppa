@@ -82,7 +82,7 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 #### Radio Control (`coppa-radio`)
 - **rigctld**: TCP client for hamlib CAT control (frequency, mode, PTT)
 - **Serial PTT** (`serial-ptt`): DTR/RTS line control through the `serialport` crate
-- **GPIO PTT** (`gpio-ptt`): `/sys/class/gpio` writes; real hardware access is Linux-only
+- **GPIO PTT** (`gpio-ptt`): the GPIO character device (`/dev/gpiochipN`, via `gpiocdev`) for `gpio:<chip>:<line>`, and deprecated `/sys/class/gpio` writes for the old `gpio:<number>` form; real hardware access is Linux-only
 - **CM108 PTT** (no feature, `ptt_method = "cm108:<hidraw-path>[:<gpio>]"`): CM108/CM119 HID GPIO output reports written to a `/dev/hidraw` node with `std::fs`; real hardware access is Linux-only
 - **VOX PTT** and a no-op PTT for soundcard-only operation
 
@@ -102,8 +102,9 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 
 #### Host Interfaces (`coppa-host`)
 - **VARA-style TCP** (`vara-tcp`, default): command port 8300 and data port 8301, a VARA-inspired command set. The modem is not RF/waveform-compatible with VARA and does not interoperate with it over the air
-- **WebSocket** (`websocket`): a JSON API server built on `tokio-tungstenite`, carrying callsign, connect/disconnect, send, received-data, status and spectrum messages; every handshake must present the `[host] websocket_token` and, from a browser, an allowlisted `Origin` (COP-53). The same port answers a plain HTTP `GET /` (or `GET /index.html`) with an embedded operator page (COP-79, `crates/coppa-daemon/src/web/index.html`), which upgrades at `/ws`; the accept loop reads each request head once and hands upgrades, byte for byte, to the unchanged gate (`crates/coppa-host/src/http_route.rs`). It also answers `GET`/`HEAD /health` with `{"status":"ok"}` or `{"status":"degraded"}`, unauthenticated, when the embedder calls `WebSocketServer::with_health` (COP-140), and closes any connection that has not sent its request head within 5 s
-- **KISS over TCP** (`kiss-tnc`): the host side of the AFSK TNC mode
+- **WebSocket** (`websocket`): a JSON API server built on `tokio-tungstenite`, carrying callsign, connect/disconnect, send, received-data, status and spectrum messages; every handshake must present the `[host] websocket_token` and, from a browser, an allowlisted `Origin` (COP-53). The same port answers a plain HTTP `GET /` (or `GET /index.html`) with the embedded operator dashboard (COP-79, COP-83, `crates/coppa-daemon/src/web/index.html`, one static page with a canvas waterfall), which upgrades at `/ws`; the accept loop reads each request head once and hands upgrades, byte for byte, to the unchanged gate (`crates/coppa-host/src/http_route.rs`). Protocol v1 also carries the `tune` and `set_speed_level` requests (COP-83; a manual speed level pins every new frame until `auto`) and the reliable `buffer` and `speed_level` pushes, and `status` mirrors every reliable state push (PTT, BUSY, buffer, speed level, heard, plus an event-loop heartbeat age and session-link stats), written before the push, so a client that connects mid-transmission learns PTT at once. It also answers `GET`/`HEAD /health` with `{"status":"ok"}` or `{"status":"degraded"}`, unauthenticated, when the embedder calls `WebSocketServer::with_health` (COP-140), and closes any connection that has not sent its request head within 5 s
+- **Connectionless AGWPE** (`kiss-tnc`): opt-in AFSK host adapter sharing the KISS transmitter and RX fanout; see [HOST-API](docs/HOST-API.md#agwpe-connectionless-afsk-tnc).
+- **KISS over TCP** (`kiss-tnc`): OFDM broadcast datagrams on port 8100 and the host side of the AFSK TNC mode
 - [docs/HOST-API.md](docs/HOST-API.md) documents what a host sends and receives on each of these ports
 
 #### C FFI (`coppa-ffi`)
@@ -111,6 +112,13 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 - Streaming: `coppa_engine_feed_samples` + `coppa_next_frame` (binary frames), and `coppa_start_stream`/`coppa_feed_samples`/`coppa_get_decoded`/`coppa_stop_stream` (text)
 - `coppa_engine_destroy` takes a pointer to the handle pointer and nulls it, which prevents double-free
 - cdylib + staticlib output; `build.rs` regenerates `coppa.h` with cbindgen
+- Errors (COP-139): every fallible call clears and sets a per-thread message, read with `coppa_last_error()` as `"<function>: <reason>"`; `coppa_strerror(code)` describes each `COPPA_ERR_*` code
+- ABI (COP-139): `COPPA_ABI_VERSION_MAJOR`/`_MINOR` in the header and `coppa_abi_version()` at run time, independent of the crate version; policy in `docs/DECISIONS/2026-11-03-c-abi-versioning.md`
+- Links (COP-139): `coppa_link_*` drives `coppa_engine::link::Link`, a sans-IO connected session (coppad's CONNECT handshake, stop-and-wait ARQ, keepalive, disconnect) over audio samples and a caller clock; see ADR-011
+- Threads: any function from any thread; one handle's calls are serialized by its lock; destroy only after other calls on that handle finish; `coppa.h` states the full rule
+
+#### Python binding (`bindings/python`)
+- A stdlib-only `ctypes` package over the link API, with an ABI check at load; not published (COP-139)
 
 #### CLI (`coppa-cli`)
 - Binary `coppa`. Subcommands: `tx`, `rx`, `loopback`, `tune`, `devices`, `doctor`, `config`, plus `tnc` when built with `kiss-tnc`. `listen` survives one release as a hidden, deprecated alias of `rx` (COP-56)
@@ -126,6 +134,7 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 - RX/TX audio level meter with clipping/underdrive warnings (logs + opt-in WebSocket `audio_level` stream)
 
 #### AFSK 1200 / AX.25 TNC mode
+- The OFDM event loop accepts KISS datagrams when `[host] kiss_enabled = true`. One port-0 KISS frame becomes one uncompressed broadcast MAC Datagram frame, through the normal TX gates. RX reaches KISS clients only. See [docs/RETICULUM.md](docs/RETICULUM.md).
 - `coppad --tnc` or `coppa tnc`, both built with `kiss-tnc`, runs a separate mode: AFSK 1200 audio ↔ KISS TCP server (port 8001 by default) ↔ PTT. The KISS client supplies the AX.25 frames without an FCS, as KISS specifies. The TNC does not parse them, but it adds the FCS on transmit and checks and strips it on receive
 - This mode does not use the OFDM pipeline below
 
@@ -154,7 +163,7 @@ payload bytes
   → f32 audio samples
 ```
 
-`CoppaCore::encode_bytes` builds every frame with one codeword, redundancy version 0 and `seq_num` 0; the daemon's connected-session link encodes its frames through the codeword-aware twins (`encode_bytes_with_codewords`, `encode_bytes_with_level_and_codewords`, COP-69) with 1-8 codewords per frame, negotiated with the peer. The multi-codeword and redundancy-version stages are exercised by `CoppaTransceiver`'s own callers and tests.
+`CoppaCore::encode_bytes` builds every frame with one codeword, redundancy version 0 and `seq_num` 0; the daemon's connected-session link encodes its frames through the codeword-aware twins (`encode_bytes_with_codewords`, `encode_bytes_with_level_and_codewords`, COP-69) with 1-8 codewords per frame, negotiated with the peer: the fewest that hold the compressed frame (COP-110). The multi-codeword and redundancy-version stages are exercised by `CoppaTransceiver`'s own callers and tests.
 
 ## RX Pipeline
 
@@ -219,7 +228,7 @@ These components still compile and have tests, but no production TX or RX path c
 - The streaming receiver corrects carrier-frequency offset up to ±50 Hz, tracks sample-clock offset within each frame, and runs one turbo re-estimation round when LDPC does not converge
 - Selective-repeat ARQ for connected-session data (always, stop-and-wait; COP-38) and for no-session data (`arq_enabled`), closed-loop rate control from ACK-carried recommendations, and a CP negotiation handshake (off by default)
 - Huffman + LZ4 compression; binary payloads through `encode_bytes`/`decode_bytes`
-- Host interfaces: VARA-style TCP, a WebSocket JSON server, and KISS over TCP for the AFSK 1200 TNC mode
+- Host interfaces: VARA-style TCP, a WebSocket JSON server, and KISS over TCP for OFDM datagrams and the AFSK 1200 TNC mode
 - Radio control: rigctld CAT, plus serial, GPIO, CM108 and VOX PTT
 - Tests: unit tests, workspace and per-crate integration tests, proptest round trips, 20 frozen golden WAV vectors (`testdata/golden/`, SPEC §14), cargo-fuzz targets, criterion benchmarks, and the `coppa-bench` harness. Simulated AWGN and Watterson results are in [BENCHMARKS.md](BENCHMARKS.md)
 - CI: `ci.yml` runs check, lib tests with features, fmt and the platform matrix (Linux, macOS, Windows); `ci-full.yml` runs the full test suite, clippy, MSRV (1.85.0), bench and fuzz builds, cargo-deny, the security audit and the wiki lint

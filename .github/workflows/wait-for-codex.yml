@@ -970,8 +970,29 @@ jobs:
             exit 0
           fi
 
-          echo "$result" | jq -r '.resolvable[] | [.id, .path, .findingSha] | @tsv' | while IFS=$'\t' read -r thread_id path finding_sha; do
+          # Captured, not piped: the loop below can `break`, and closing a pipe's read
+          # end early would SIGPIPE jq, which `set -o pipefail` turns into a failed step
+          # after outcome=success is already written.
+          resolvable_tsv=$(echo "$result" | jq -r '.resolvable[] | [.id, .path, .findingSha] | @tsv')
+          while IFS=$'\t' read -r thread_id path finding_sha; do
             [ -z "$thread_id" ] && continue
+            # COP-141 (ported from propagation f8e1243): pr-context reads the PR head once,
+            # at job start, and nothing after it re-reads the head. Each thread below costs
+            # about five API calls, so a push that lands mid-loop would otherwise go
+            # unnoticed, and the remaining threads would be resolved with a reply naming a
+            # commit that is no longer the head. Threads are PR-global, so that can resolve a
+            # finding the new head reintroduced. The live re-reads below check the thread,
+            # never the head. `break`, not `continue`: once the head has moved, every
+            # remaining thread is equally stale. A failed lookup fails open and the next
+            # iteration checks again. The lookup's exit status decides failure, not empty
+            # output: on an HTTP error `gh api` still prints the JSON error body to stdout.
+            LIVE_HEAD_SHA=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/tmp/loop-freshness-err.log) || LIVE_HEAD_SHA=""
+            if [ -z "$LIVE_HEAD_SHA" ]; then
+              echo "::warning::Could not re-verify PR #$PR's live head mid-loop -- continuing with the originally captured head rather than aborting a partially-completed auto-resolve pass: $(cat /tmp/loop-freshness-err.log 2>/dev/null)"
+            elif [ "$LIVE_HEAD_SHA" != "$HEAD_SHA" ]; then
+              echo "::notice::PR #$PR's head advanced from $HEAD_SHA to $LIVE_HEAD_SHA mid-loop -- stopping auto-resolve here. Remaining threads stay unresolved for the new head's own request/response cycle to re-evaluate."
+              break
+            fi
             if [ -z "$finding_sha" ]; then
               echo "::warning::Thread $thread_id has no recorded originating commit — leaving unresolved."
               continue
@@ -1048,7 +1069,7 @@ jobs:
               continue
             fi
             echo "Auto-resolved thread $thread_id"
-          done
+          done <<< "$resolvable_tsv"
 
       - name: Update the check-run
         if: always() && steps.head-check.outputs.stale != 'true' && steps.verdict.outputs.responded == 'true'

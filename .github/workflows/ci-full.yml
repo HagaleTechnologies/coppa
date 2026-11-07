@@ -130,11 +130,13 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install ALSA dev headers (for cpal)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - run: cargo test --workspace --features cpal-backend,websocket,ardop,mdns
+      - run: cargo test --workspace --features cpal-backend,websocket,ardop,mdns,kiss-tnc
       # cpal-backend compiles the daemon's WebSocket, /health and mDNS CLI
       # tests out of the step above; this step runs them (COP-140).
-      - name: Daemon CLI tests for WebSocket, health and mDNS
-        run: cargo test -p coppa-daemon --features websocket,mdns --test cli
+      - name: Connectionless AGW CLI tests without audio
+        run: cargo test -p coppa-cli --features kiss-tnc --test tnc_agw
+      - name: Daemon tests without audio (CLI, PTT release, reload, smoke)
+        run: cargo test -p coppa-daemon --features websocket,mdns,kiss-tnc --test cli --test ptt_release --test reload --test runtime_smoke
 
   bench-fuzz:
     name: Bench & Fuzz Compilation
@@ -169,6 +171,8 @@ jobs:
       - name: Install ALSA dev headers (for cpal)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy KISS TNC without audio backend
+        run: cargo clippy -p coppa-daemon --features kiss-tnc -- -D warnings
 
   msrv:
     name: MSRV Check

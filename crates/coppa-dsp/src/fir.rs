@@ -1,5 +1,7 @@
 //! Linear-phase FIR design (windowed sinc) and block filtering.
 
+use std::num::NonZeroUsize;
+
 /// Odd-length linear-phase bandpass via Blackman-windowed sinc.
 #[must_use]
 pub fn design_bandpass(taps: usize, fs: f32, f_lo: f32, f_hi: f32) -> Vec<f32> {
@@ -24,7 +26,7 @@ pub fn design_bandpass(taps: usize, fs: f32, f_lo: f32, f_hi: f32) -> Vec<f32> {
         .collect()
 }
 
-/// Odd-length Hilbert transformer (type-III FIR): h[k] = 2/(pi*k) for odd k, else 0,
+/// Odd-length Hilbert transformer (type-III FIR): h\[k\] = 2/(pi*k) for odd k, else 0,
 /// Blackman-windowed. Pass real x; get the quadrature component with (taps-1)/2 delay.
 #[must_use]
 pub fn design_hilbert(taps: usize) -> Vec<f32> {
@@ -106,6 +108,101 @@ impl StreamingFir {
             let total = buf.len();
             self.history.copy_from_slice(&buf[total - hist_len..]);
         }
+    }
+}
+
+/// Streaming FIR filter that keeps one output in every `factor` and computes
+/// only the outputs it keeps.
+///
+/// Output `k` is the filter output at input index `k * factor`, counting every
+/// sample passed to `process` since construction. Like [`StreamingFir`], it
+/// carries `taps - 1` input samples between calls, so the output does not
+/// depend on how the input is split into chunks. Each output's content is
+/// delayed by [`group_delay`](Self::group_delay) input samples. With no taps,
+/// `process` appends nothing. No argument can make it panic.
+///
+/// ```
+/// use std::num::NonZeroUsize;
+/// use coppa_dsp::fir::{design_bandpass, DecimatingFir};
+///
+/// let mut fir = DecimatingFir::new(
+///     design_bandpass(121, 48_000.0, 250.0, 2850.0),
+///     NonZeroUsize::new(4).expect("4 is non-zero"),
+/// );
+/// let mut out = Vec::new();
+/// fir.process(&[0.0; 4800], &mut out);
+/// assert_eq!(out.len(), 1200); // 48 kHz in, 12 kHz out
+/// assert_eq!(fir.group_delay(), 60);
+/// ```
+#[derive(Debug, Clone)]
+pub struct DecimatingFir {
+    coeffs: Vec<f32>,
+    factor: NonZeroUsize,
+    /// The last `coeffs.len() - 1` input samples seen, oldest first.
+    history: Vec<f32>,
+    /// Input samples passed to `process` since construction.
+    consumed: u64,
+}
+
+impl DecimatingFir {
+    /// Creates a filter with taps `coeffs` that keeps one output in every
+    /// `factor`, with an all-zero history.
+    #[must_use]
+    pub fn new(coeffs: Vec<f32>, factor: NonZeroUsize) -> Self {
+        let hist_len = coeffs.len().saturating_sub(1);
+        Self {
+            coeffs,
+            factor,
+            history: vec![0.0; hist_len],
+            consumed: 0,
+        }
+    }
+
+    /// Filter `x` and append the kept outputs to `out`.
+    pub fn process(&mut self, x: &[f32], out: &mut Vec<f32>) {
+        let taps = self.coeffs.len();
+        if taps == 0 || x.is_empty() {
+            self.consumed = self.consumed.wrapping_add(x.len() as u64);
+            return;
+        }
+        let hist_len = self.history.len();
+        let mut buf = Vec::with_capacity(hist_len + x.len());
+        buf.extend_from_slice(&self.history);
+        buf.extend_from_slice(x);
+
+        let factor = self.factor.get();
+        let f = factor as u64;
+        // First index in this chunk whose absolute input index is a multiple
+        // of `factor`. The remainder is below `factor`, so it fits a usize.
+        let mut n = ((f - self.consumed % f) % f) as usize;
+        out.reserve(x.len() / factor + 1);
+        while n < x.len() {
+            let window = &buf[n..n + taps];
+            let mut acc = 0.0f32;
+            for (k, &c) in self.coeffs.iter().enumerate() {
+                acc += c * window[taps - 1 - k];
+            }
+            out.push(acc);
+            n += factor;
+        }
+        self.consumed = self.consumed.wrapping_add(x.len() as u64);
+
+        if hist_len > 0 {
+            let total = buf.len();
+            self.history.copy_from_slice(&buf[total - hist_len..]);
+        }
+    }
+
+    /// The decimation factor: one output is kept per `factor` inputs.
+    #[must_use]
+    pub fn factor(&self) -> usize {
+        self.factor.get()
+    }
+
+    /// `(taps - 1) / 2` input samples (0 with no taps).
+    #[must_use]
+    pub fn group_delay(&self) -> usize {
+        self.coeffs.len().saturating_sub(1) / 2
     }
 }
 
@@ -269,5 +366,85 @@ mod tests {
                 "streaming vs single-shot mismatch at {i}: {a} vs {b}"
             );
         }
+    }
+
+    /// A deterministic two-tone-plus-ramp test signal.
+    fn two_tone_ramp(n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / 48_000.0;
+                (std::f32::consts::TAU * 700.0 * t).sin()
+                    + 0.5 * (std::f32::consts::TAU * 5300.0 * t).sin()
+                    + (i % 97) as f32 / 97.0
+                    - 0.5
+            })
+            .collect()
+    }
+
+    fn four() -> NonZeroUsize {
+        NonZeroUsize::new(4).expect("non-zero")
+    }
+
+    #[test]
+    fn decimating_fir_keeps_every_factor_th_streaming_fir_output() {
+        let h = design_bandpass(121, 48_000.0, 250.0, 2850.0);
+        let x = two_tone_ramp(10_000);
+        let mut full = Vec::new();
+        StreamingFir::new(h.clone()).process(&x, &mut full);
+        let mut dec = Vec::new();
+        DecimatingFir::new(h, four()).process(&x, &mut dec);
+        assert_eq!(dec.len(), 10_000_usize.div_ceil(4));
+        for (k, &v) in dec.iter().enumerate() {
+            assert!(
+                (v - full[4 * k]).abs() < 1e-5,
+                "output {k}: decimated {v} vs full {}",
+                full[4 * k]
+            );
+        }
+    }
+
+    #[test]
+    fn decimating_fir_output_does_not_depend_on_chunk_boundaries() {
+        let h = design_bandpass(121, 48_000.0, 250.0, 2850.0);
+        let x = two_tone_ramp(10_000);
+        let mut whole = Vec::new();
+        DecimatingFir::new(h.clone(), four()).process(&x, &mut whole);
+
+        let mut chunked = Vec::new();
+        let mut fir = DecimatingFir::new(h, four());
+        let sizes = [1usize, 3, 7, 37, 512];
+        let mut pos = 0;
+        let mut i = 0;
+        while pos < x.len() {
+            let end = (pos + sizes[i % sizes.len()]).min(x.len());
+            fir.process(&x[pos..end], &mut chunked);
+            pos = end;
+            i += 1;
+        }
+        assert_eq!(whole, chunked);
+    }
+
+    #[test]
+    fn decimating_fir_with_factor_one_matches_streaming_fir() {
+        let h = design_bandpass(121, 48_000.0, 250.0, 2850.0);
+        let x = two_tone_ramp(3_000);
+        let mut full = Vec::new();
+        StreamingFir::new(h.clone()).process(&x, &mut full);
+        let mut dec = Vec::new();
+        DecimatingFir::new(h, NonZeroUsize::MIN).process(&x, &mut dec);
+        assert_eq!(dec.len(), full.len());
+        for (a, b) in dec.iter().zip(&full) {
+            assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn decimating_fir_with_no_taps_emits_nothing() {
+        let mut fir = DecimatingFir::new(vec![], NonZeroUsize::new(4).expect("non-zero"));
+        let mut out = Vec::new();
+        fir.process(&[1.0; 100], &mut out);
+        assert!(out.is_empty());
+        assert_eq!(fir.group_delay(), 0);
+        assert_eq!(fir.factor(), 4);
     }
 }

@@ -2,14 +2,17 @@
 //! speed level's one-codeword payload budget after framing and compression.
 //!
 //! One TCP read (<= 4096 B) is not one over-the-air frame: every TX path
-//! but the connected-session link encodes with `codewords: 1` (the session
-//! link picks 1-8 per frame, COP-69, against the same budget rule), and
+//! but the connected-session link encodes with `codewords: 1`, and
 //! `CoppaTransceiver::transmit` rejects encoded payloads above the level
 //! budget (56-198 bytes per codeword across levels 1-9). Every TX
 //! path in `event_loop.rs` runs its host bytes through [`chunk_to_fit`] so an
 //! ordinary Pat/B2F chunk becomes several properly-sized frames instead of
 //! one that silently fails to encode (or squeezes through as a single
-//! oversized frame).
+//! oversized frame). The session link with a negotiated multi-codeword cap
+//! (COP-69) cuts against the cap's full budget instead, through
+//! [`next_growing_chunk_len`]: the chunk may grow past the raw target while
+//! its compressed frame still fits, up to 4096 raw bytes, and the link then
+//! sends the fewest codewords that hold the compressed frame (COP-110).
 //!
 //! Sizing measures rather than predicts: post-compression size is
 //! content-dependent by ~2x (102 random bytes -> 182 encoded; 102 cycling
@@ -86,6 +89,52 @@ pub fn next_chunk_len(
         }
     }
     target.max(1)
+}
+
+/// COP-110: like [`next_chunk_len`], but a chunk that compresses well may
+/// grow past the optimistic target. `rest` is first limited to `max_len`
+/// bytes. When [`next_chunk_len`] returns its unshrunk optimistic target and
+/// input remains, the length doubles while `fits` accepts it, then bisects
+/// between the last accepted and the first rejected length. The result is
+/// always a length `fits` accepted, or [`next_chunk_len`]'s own answer
+/// (including its 1-byte fallback). The session link uses it to fill a
+/// multi-codeword frame with compressible data, where the raw-byte target
+/// leaves most of the frame as padding.
+pub fn next_growing_chunk_len(
+    rest: &[u8],
+    header_len: usize,
+    budget: usize,
+    max_len: usize,
+    fits: impl Fn(&[u8]) -> bool,
+) -> usize {
+    let rest = &rest[..rest.len().min(max_len.max(1))];
+    let first = next_chunk_len(rest, header_len, budget, &fits);
+    let optimistic = budget.saturating_sub(header_len + 1).max(1);
+    if first < optimistic || first >= rest.len() {
+        return first;
+    }
+    // The optimistic target fitted unshrunk: double while the frame still
+    // fits, then search (lo, hi) for the largest accepted prefix.
+    let mut lo = first;
+    let mut hi = loop {
+        let next = (lo * 2).min(rest.len());
+        if !fits(&rest[..next]) {
+            break next;
+        }
+        lo = next;
+        if lo == rest.len() {
+            return lo;
+        }
+    };
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(&rest[..mid]) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
 }
 
 #[cfg(test)]
@@ -191,6 +240,46 @@ mod tests {
         for chunk in chunk_to_fit(&[0u8; 500], 0, 100, fits) {
             assert!(fits(&chunk), "{} bytes", chunk.len());
         }
+    }
+
+    #[test]
+    fn a_growing_chunk_stops_at_max_len() {
+        // `fits` accepts anything: the chunk grows past the optimistic target
+        // (99) but never past `max_len`.
+        assert_eq!(
+            next_growing_chunk_len(&[0u8; 5000], 0, 100, 4096, |_| true),
+            4096
+        );
+    }
+
+    #[test]
+    fn a_growing_chunk_bisects_to_the_largest_fitting_prefix() {
+        // Doubling from 99 reaches 792 (accepted) and 1584 (rejected); the
+        // bisection between them finds 1500.
+        let data = vec![6u8; 5000];
+        assert_eq!(
+            next_growing_chunk_len(&data, 0, 100, 4096, fits_up_to(1500)),
+            1500
+        );
+    }
+
+    #[test]
+    fn a_shrunk_chunk_does_not_grow() {
+        // The optimistic target was rejected, so growth never starts: the
+        // answer is `next_chunk_len`'s.
+        let data = vec![8u8; 300];
+        assert_eq!(
+            next_growing_chunk_len(&data, 0, 100, 4096, fits_up_to(10)),
+            next_chunk_len(&data, 0, 100, fits_up_to(10))
+        );
+    }
+
+    #[test]
+    fn a_growing_chunk_takes_all_of_a_short_input() {
+        assert_eq!(
+            next_growing_chunk_len(&[2u8; 300], 0, 100, 4096, |_| true),
+            300
+        );
     }
 
     /// Property-style check across sizes and header lengths: concatenating

@@ -28,11 +28,11 @@ keeps the report private until a fix is available.
 Coppa is a **reference implementation**, not a hardened production modem. The
 most security-relevant surfaces are:
 
-- The host servers in `coppa-host` (VARA-style TCP, WebSocket, KISS TNC). These
+- The host servers in `coppa-host` (VARA-style TCP, WebSocket, KISS datagram, AFSK TNC and AGWPE). These
   default to binding `127.0.0.1`. The WebSocket server requires a shared-secret
   token (`[host] websocket_token`) on every handshake and refuses browser pages
   whose origin is not in `[host] websocket_allowed_origins` (COP-53). The
-  VARA-style ports and the KISS TNC port have **no authentication**. Loopback
+  VARA-style ports and both KISS ports (OFDM datagrams 8100, AFSK TNC 8001) and the AGWPE port have **no authentication**. Loopback
   binding stops other hosts, not local processes, and a web page can reach the
   VARA command port with a cross-protocol HTTP request (tracked as a
   follow-up). Exposing any of them on a network is at the operator's risk.

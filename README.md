@@ -18,12 +18,14 @@ Open-source ham radio digital communications system written in Rust.
 | Daemon event loop | Implemented | Processes audio and host events; live audio requires `cpal-backend` |
 | ARDOP TNC host interface | Implemented, opt-in | Command/data ports default to 8515/8516; `ardop` feature, disabled by default; host-protocol interface only — both ends of a session run coppa — see [docs/ARDOP.md](docs/ARDOP.md) |
 | VARA-style TCP interface | Implemented, opt-in | Control/data ports default to 8300/8301; server disabled by default; not RF-compatible with VARA; verified with Pat (Winlink) — see [docs/PAT.md](docs/PAT.md); protocol guide in [docs/HOST-API.md](docs/HOST-API.md) |
-| C FFI | Implemented | Shared/static library with one-shot encode/decode and streaming decode |
+| C FFI | Implemented | Shared/static library with one-shot encode/decode, streaming decode, connected links (`coppa_link_*`), readable errors and an ABI version |
+| Python binding | Implemented, not published | `bindings/python`: a stdlib-only `ctypes` binding that drives a connected link; Linux-tested; see [bindings/python/README.md](bindings/python/README.md) |
 | Operating profiles | Implemented | 48 kHz OFDM profiles with runtime speed-level selection within the configured band |
 | Link adaptation | Implemented, limited calibration | Measurement-driven speed selection and ACK-driven RateLoop with ARQ enabled; no model inference; performance targets remain unmet, see [BENCHMARKS.md](BENCHMARKS.md) |
-| Serial/GPIO PTT | Implemented, feature-gated | Daemon serial DTR/RTS uses `serial-ptt`; Linux sysfs GPIO uses `gpio-ptt` |
+| Serial/GPIO PTT | Implemented, feature-gated | Daemon serial DTR/RTS uses `serial-ptt`; Linux GPIO (character device, `gpio:<chip>:<line>`; deprecated sysfs `gpio:<number>`) uses `gpio-ptt` |
 | CM108 PTT | Implemented, no feature flag | Daemon CM108/CM119 HID GPIO PTT (AIOC, Digirig Lite, DRA) through a Linux `/dev/hidraw` node (`ptt_method = "cm108:<hidraw-path>[:<gpio>]"`); tested only against a regular-file stand-in |
 | Service files | Provided, not hardware-verified | systemd unit and macOS launchd agent in `contrib/`; Raspberry Pi 4 install guide in [docs/tutorials/raspberry-pi-install.md](docs/tutorials/raspberry-pi-install.md) |
+| KISS datagrams (HF OFDM) | Implemented | Reticulum TCP KISS on port 8100; see [docs/RETICULUM.md](docs/RETICULUM.md) |
 | KISS TNC (AFSK 1200) | Implemented, bring-up and testing only | Needs the kiss-tnc and cpal-backend features; not a Direwolf replacement; see [docs/TNC.md](docs/TNC.md) |
 | IR-HARQ | Unwired codec primitive | Redundancy-version and combining support exists in the codec; engine/daemon retransmissions do not wire it into an operational IR-HARQ feature |
 | VARA RF/waveform compatibility | Not supported | The TCP control interface is VARA-style; Coppa does not interoperate with VARA over RF |
@@ -36,7 +38,8 @@ Open-source ham radio digital communications system written in Rust.
 - Selective-repeat ARQ and session management, with optional Huffman + LZ4 compression. Connected-session data is always acknowledged and retransmitted; sessionless ARQ is disabled by default.
 - WAV file I/O and live CPAL audio with `cpal-backend`, including exact device IDs, selectable input/output channels, and hardware sample-rate conversion; daemon serial and Linux GPIO PTT with their respective feature flags, and Linux CM108 HID PTT with no feature flag.
 - VARA-style TCP command/data interface for host applications, disabled by default and not RF-compatible with VARA.
-- C FFI shared/static library with one-shot encode/decode and streaming decode.
+- C FFI shared/static library with one-shot encode/decode, streaming decode, connected links (`coppa_link_*`), readable errors and an ABI version.
+- Python binding (`bindings/python`, not published) that drives a connected link over audio samples.
 - Deterministic link adaptation and spectrum sensing. Short-CP recommendation and negotiation are opt-in; IR-HARQ remains an unwired codec primitive.
 
 ## Quick Start
@@ -109,18 +112,30 @@ arrays; `profiles -p NAME --json` and `profiles --level N --json` write one
 object. `config` is a deprecated alias for `profiles` and accepts the same
 flags; `listen` is a deprecated alias for `rx` and accepts the same flags.
 
+## KISS datagrams on HF OFDM
+
+`coppad` offers broadcast KISS datagrams over the OFDM modem on port 8100.
+Build with `kiss-tnc`, enable `[host] kiss_enabled = true`, and follow
+[docs/RETICULUM.md](docs/RETICULUM.md) for Reticulum setup and packet limits.
+
 ## KISS TNC (AFSK 1200)
 
 `coppa tnc` runs a 1200-baud AFSK (Bell 202) AX.25 TNC behind a KISS TCP port. Use it for
 KISS bring-up and testing: checking that a KISS client, your audio routing and your PTT reach
-coppa. It is not a Direwolf replacement. It has no AGWPE interface, no channel-busy check (it
-ignores KISS TXDELAY, persistence and slot time), no digipeating or beaconing, and runs only at
-1200 baud. That parity work is planned as H-122 in the
+coppa. It is not a Direwolf replacement. Digipeating is opt-in with
+`--digipeat CALL[-SSID]`; a spectral busy check gates automatic repeats. KISS client
+transmissions still start immediately and ignore TXDELAY, persistence and slot time.
+AGWPE is connectionless only. It has no beaconing. It runs at 1200 baud (AFSK) or 9600 baud (G3RUH). Remaining parity work
+is planned as H-122 in the
 [2026-09-05 product review](docs/reviews/2026-09-05-product-ux-market-review.md).
 
+Optional connectionless AGWPE is enabled with `--agw-port 8000`. Connected Winlink
+Express packet and Outpost BBS sessions are unsupported; UI-View is unverified.
 [docs/TNC.md](docs/TNC.md) covers building it and a demo that runs two TNCs on one Linux machine.
 
 ## Workspace Crates
+
+Each crate has a README in `crates/<name>/`; to call the modem from your own Rust program, see [docs/tutorials/embedding.md](docs/tutorials/embedding.md).
 
 | Crate | Description |
 |-------|-------------|
@@ -129,11 +144,11 @@ ignores KISS TXDELAY, persistence and slot time), no digipeating or beaconing, a
 | `coppa-protocol` | OFDM transceiver, NR BG2 LDPC payload coding, framing, ARQ, compression and session management |
 | `coppa-channel` | Channel models for testing: AWGN, Watterson HF fading, SSB passband filter, frequency, timing and sample-clock offsets, sinusoidal fading |
 | `coppa-audio` | Audio backends: CPAL real-time I/O, WAV file read/write |
-| `coppa-radio` | Radio control: rigctld CAT, serial PTT (DTR/RTS, `serial-ptt` feature), GPIO PTT (Linux sysfs, `gpio-ptt` feature), CM108 PTT (Linux hidraw, no feature) |
+| `coppa-radio` | Radio control: rigctld CAT, serial PTT (DTR/RTS, `serial-ptt` feature), GPIO PTT (Linux GPIO character device, plus deprecated sysfs, `gpio-ptt` feature), CM108 PTT (Linux hidraw, no feature) |
 | `coppa-ml` | Measurement-driven speed selection, RateLoop, CpGate, BusyGate and spectrum sensing |
 | `coppa-engine` | CoppaTransceiver wrapper with compression, squelch and streaming receive |
-| `coppa-host` | Host interfaces: VARA-style TCP control server, WebSocket JSON API, KISS TNC TCP server (`kiss-tnc` feature) |
-| `coppa-ffi` | C FFI bindings (cdylib + staticlib) with streaming decode API |
+| `coppa-host` | Host interfaces: VARA-style TCP control server, WebSocket JSON API, KISS datagram and AFSK TNC TCP servers (`kiss-tnc` feature) |
+| `coppa-ffi` | C FFI bindings (cdylib + staticlib) with streaming decode, connected links (`coppa_link_*`), readable errors and an ABI version; the Python binding (`bindings/python`, not published) wraps it |
 | `coppa-cli` | CLI binary (`coppa`): `tx`, `rx`, `loopback`, `tune`, `devices`, `profiles`, `config`, and `tnc` (`kiss-tnc` feature) |
 | `coppa-daemon` | Long-running daemon (`coppad`) with event loop, audio, and host integration |
 | `coppa-bench` | Measurement harness, not a product crate: BER/FER/goodput-vs-SNR scenarios, benchmark examples, and the lib tests that guard each speed level's AWGN waterfall on every push |
@@ -148,7 +163,7 @@ See [wiki/INDEX.md](wiki/INDEX.md) for short, question-titled pages on gotchas a
 
 See [docs/SPEC.md](docs/SPEC.md) for the normative waveform/FEC/protocol conformance specification — the reference for building an independent, interoperable implementation.
 
-See [docs/HOST-API.md](docs/HOST-API.md) to connect a host application (Pat, a dashboard or your own program) to coppad: the VARA-style command and data ports, the WebSocket API and KISS, with an `nc` walkthrough. For Pat and Winlink specifically, see [docs/PAT.md](docs/PAT.md).
+See [docs/HOST-API.md](docs/HOST-API.md) to connect a host application (Pat, a dashboard or your own program) to coppad: the VARA-style command and data ports, the WebSocket API and KISS, with an `nc` walkthrough. For Reticulum over OFDM, see [docs/RETICULUM.md](docs/RETICULUM.md). For Pat and Winlink specifically, see [docs/PAT.md](docs/PAT.md).
 
 See [docs/OPERATING.md](docs/OPERATING.md) for field-operation guidance, including TX level calibration (`coppa tune`). To run coppad as a service (systemd or launchd), see [contrib/README.md](contrib/README.md); for a full Raspberry Pi 4 install, see [docs/tutorials/raspberry-pi-install.md](docs/tutorials/raspberry-pi-install.md).
 
@@ -168,3 +183,6 @@ for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
 dual licensed as above, without any additional terms or conditions.
 
 **MSRV**: 1.85.0
+
+Send a small file to multiple OFDM stations with the
+[broadcast file commands](docs/BROADCAST.md), using a configured KISS service.

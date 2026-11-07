@@ -41,6 +41,11 @@ pub enum MacFrameType {
     /// Reserved for relayed traffic; no transmit or receive path builds one
     /// yet (type nibble 8).
     Relay = 8,
+    /// Connectionless datagram from a KISS host, broadcast to every station (COP-138).
+    Datagram = 9,
+    /// RS(12,6) session shard, negotiated by CONNECT flags bits 2 and 3
+    /// (COP-119). Nibble 10, since COP-138 took 9 for `Datagram`.
+    OuterData = 10,
 }
 
 impl MacFrameType {
@@ -56,6 +61,8 @@ impl MacFrameType {
             6 => Ok(MacFrameType::Beacon),
             7 => Ok(MacFrameType::Keepalive),
             8 => Ok(MacFrameType::Relay),
+            9 => Ok(MacFrameType::Datagram),
+            10 => Ok(MacFrameType::OuterData),
             v => Err(ProtocolError::UnknownMacFrameType { value: v }),
         }
     }
@@ -393,6 +400,37 @@ mod tests {
     // ── Callsign encoding tests ─────────────────────────────────────
 
     #[test]
+    fn datagram_frame_type_is_nibble_9() {
+        assert_eq!(MacFrameType::from_u8(9).unwrap(), MacFrameType::Datagram);
+        assert!(matches!(
+            MacFrameType::from_u8(11),
+            Err(ProtocolError::UnknownMacFrameType { value: 11 })
+        ));
+    }
+
+    #[test]
+    fn datagram_pdu_round_trips_with_a_broadcast_destination() {
+        let pdu = MacPdu::new(
+            MacFrameType::Datagram,
+            Callsign::broadcast(),
+            Callsign::new("N1CALL").unwrap(),
+            0,
+            vec![0xc0, 0xdb, 0xfe, 0],
+        );
+        let bytes = pdu.to_bytes();
+        assert_eq!(bytes[0], 0x19);
+        assert_eq!(&bytes[1..7], &[0; 6]);
+        assert_eq!(bytes[13], 0);
+        let decoded = MacPdu::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.version, pdu.version);
+        assert_eq!(decoded.frame_type, pdu.frame_type);
+        assert_eq!(decoded.dest, pdu.dest);
+        assert_eq!(decoded.src, pdu.src);
+        assert_eq!(decoded.ssid, pdu.ssid);
+        assert_eq!(decoded.payload, pdu.payload);
+    }
+
+    #[test]
     fn test_callsign_roundtrip() {
         for cs in &["VK3ABC", "W1AW", "JA1YAF", "N0CALL", "A", "ZZ9ZZZ"] {
             let callsign = Callsign::new(cs).unwrap();
@@ -499,6 +537,7 @@ mod tests {
             MacFrameType::Beacon,
             MacFrameType::Keepalive,
             MacFrameType::Relay,
+            MacFrameType::OuterData,
         ];
         for &ft in &types {
             let val = ft as u8;
@@ -510,8 +549,8 @@ mod tests {
     #[test]
     fn test_frame_type_invalid() {
         assert!(matches!(
-            MacFrameType::from_u8(9),
-            Err(ProtocolError::UnknownMacFrameType { value: 9 })
+            MacFrameType::from_u8(11),
+            Err(ProtocolError::UnknownMacFrameType { value: 11 })
         ));
         assert!(MacFrameType::from_u8(15).is_err());
     }
@@ -551,6 +590,7 @@ mod tests {
             MacFrameType::Beacon,
             MacFrameType::Keepalive,
             MacFrameType::Relay,
+            MacFrameType::OuterData,
         ] {
             let pdu = MacPdu::new(ft, dest.clone(), src.clone(), 0, vec![]);
             let bytes = pdu.to_bytes();
@@ -724,5 +764,19 @@ mod tests {
         let decoded = MacPdu::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.dest.as_str(), "");
         assert_eq!(decoded.frame_type, MacFrameType::Beacon);
+    }
+}
+
+#[cfg(test)]
+mod outer_tests {
+    use super::*;
+    #[test]
+    fn mac_frame_type_outer_data_round_trips() {
+        assert_eq!(
+            MacFrameType::from_u8(MacFrameType::OuterData as u8).unwrap(),
+            MacFrameType::OuterData
+        );
+        assert_eq!(MacFrameType::OuterData as u8, 10);
+        assert!(MacFrameType::from_u8(11).is_err());
     }
 }
