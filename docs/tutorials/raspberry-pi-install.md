@@ -57,7 +57,7 @@ Pick the `coppad` features for the way you will run it:
 | `websocket` | The WebSocket JSON API (`[host] websocket_enabled`) |
 | `mdns` | Finding the Pi as `coppad.local` (`[host] mdns_enabled`); turns on `websocket` |
 
-rigctld and VOX PTT need no extra feature.
+rigctld, VOX and CM108 PTT need no extra feature.
 
 The build time on a Pi has not been measured; expect a long build. On a 1 or
 2 GB Pi, if the compiler is killed for lack of memory, run the `cargo build`
@@ -270,6 +270,69 @@ release depends on the operating system dropping DTR/RTS when it closes the
 port, which has not been checked on real hardware (see
 [OPERATING.md](../OPERATING.md#what-is-not-covered)).
 
+### CM108 USB interface (AIOC, Digirig Lite, DRA)
+
+Many USB sound-card interfaces key the rig from a GPIO pin on their C-Media
+CM108 or CM119 chip (or a chip that copies it, like the AIOC). coppad drives
+that pin by writing to the interface's Linux hidraw node:
+
+```toml
+[radio]
+ptt_method = "cm108:/dev/cm108ptt"
+```
+
+You can also give the node directly, `cm108:/dev/hidraw0`, and another pin
+after a second colon, `cm108:/dev/hidraw0:4`. The pin defaults to GPIO 3,
+which the AIOC, Digirig Lite and DRA-style interfaces use for PTT. No cargo
+feature is needed. CM108 PTT is Linux only.
+
+hidraw numbers can change between boots and when USB devices are plugged in,
+and the nodes are readable and writable by root only by default. A udev rule
+fixes both: it gives the `audio` group access and adds a stable
+`/dev/cm108ptt` symlink. Find your interface's vendor ID with `lsusb` (the
+four hex digits before the colon in `ID 0d8c:013c`), then install this rule
+as `/etc/udev/rules.d/60-coppa-cm108.rules`:
+
+```
+# C-Media CM108/CM119 family. Replace 0d8c with the vendor ID `lsusb` shows for
+# your interface (an AIOC shows 1209), and add ATTRS{idProduct}=="xxxx" if more
+# than one matching device is plugged in.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0d8c", GROUP="audio", MODE="0660", SYMLINK+="cm108ptt"
+```
+
+Apply it and check the symlink:
+
+```bash
+sudo udevadm control --reload
+sudo udevadm trigger
+ls -l /dev/cm108ptt
+```
+
+The shipped unit already gives the `coppa` user the `audio` group.
+
+- An AIOC needs firmware 1.2.0 or later for CM108-style PTT.
+- A Digirig Mobile keys through serial RTS, not a CM108 pin. Use
+  `serial:<port>:rts` for it (above).
+- coppad starts a PTT guardian for CM108, as for rigctld and GPIO: the chip
+  holds its pin until something writes it again, so the guardian writes the
+  RX report if coppad dies while keyed.
+
+### Inverted (active-low) PTT
+
+If your interface keys the rig when its PTT line is low, add:
+
+```toml
+[radio]
+ptt_invert = true
+```
+
+TX then drives the line low and RX drives it high. It applies to gpio and
+cm108 PTT, and the PTT guardian is told about it. With serial PTT, coppad
+refuses to start, because closing the port would leave an active-low rig
+keyed. With `none`, `vox` or `rigctld`, coppad logs a warning and ignores
+it. See
+[OPERATING.md](../OPERATING.md#active-low-ptt-lines-ptt_invert).
+
 ### VOX
 
 ```toml
@@ -395,12 +458,14 @@ on VHF), use the template unit `contrib/coppad@.service`; see
 | `failed to open GPIO PTT pin N: failed to export GPIO pin N: Permission denied (os error 13)` | Older sysfs form: the user is not in `gpio` | `sudo usermod -aG gpio coppa`, then restart |
 | `failed to open GPIO PTT pin N: failed to export GPIO pin N: Invalid argument (os error 22)` | Older sysfs form: `N` is a BCM pin number, not the sysfs number | Use `gpio:<chip>:<line>` instead (step 7, GPIO) |
 | `failed to open serial PTT port ...: failed to open serial port ...: Permission denied` | The user is not in `dialout` | `sudo usermod -aG dialout coppa`, then restart |
+| `failed to open CM108 PTT device ...: cannot open ... for writing: Permission denied (os error 13)` | No udev rule gives the `audio` group the hidraw node, or the user is not in `audio` | Install the rule from step 7 (CM108), or `sudo usermod -aG audio coppa`, then restart |
+| `failed to open CM108 PTT device ...: cannot open ... for writing: No such file or directory (os error 2)` | The path is wrong, or the interface is unplugged | Check `ls -l /dev/hidraw* /dev/cm108ptt` and the cable |
 | `Failed to connect to rigctld; PTT is disabled ...`, then `Daemon running degraded` | rigctld was not listening when coppad started | Start rigctld, add the drop-in from step 7, restart coppad |
 | `status=216/GROUP` in `systemctl status` | A group in `SupplementaryGroups` does not exist | Remove it from the unit (step 10) |
 | `RX audio input is silent: ...` | No audio is reaching the card | Check the cable, the ALSA mixer (`alsamixer`) and any mute switch |
 
-The GPIO, serial, `216/GROUP` and silent-input rows describe what the code
-and systemd print, but have not been reproduced on a Pi.
+The GPIO, serial, CM108, `216/GROUP` and silent-input rows describe what the
+code and systemd print, but have not been reproduced on a Pi.
 
 Whatever the PTT method, turn on your rig's TX time-out timer, set a little
 longer than `max_tx_duration_s`, as [OPERATING.md](../OPERATING.md) explains.

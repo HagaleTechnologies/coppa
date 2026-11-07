@@ -83,6 +83,7 @@ gen_nr_bg2       (tools/gen_nr_bg2, no internal dependencies)     code generator
 - **rigctld**: TCP client for hamlib CAT control (frequency, mode, PTT)
 - **Serial PTT** (`serial-ptt`): DTR/RTS line control through the `serialport` crate
 - **GPIO PTT** (`gpio-ptt`): the GPIO character device (`/dev/gpiochipN`, via `gpiocdev`) for `gpio:<chip>:<line>`, and deprecated `/sys/class/gpio` writes for the old `gpio:<number>` form; real hardware access is Linux-only
+- **CM108 PTT** (no feature, `ptt_method = "cm108:<hidraw-path>[:<gpio>]"`): CM108/CM119 HID GPIO output reports written to a `/dev/hidraw` node with `std::fs`; real hardware access is Linux-only
 - **VOX PTT** and a no-op PTT for soundcard-only operation
 
 #### Channel Adaptation (`coppa-ml`)
@@ -228,7 +229,7 @@ These components still compile and have tests, but no production TX or RX path c
 - Selective-repeat ARQ for connected-session data (always, stop-and-wait; COP-38) and for no-session data (`arq_enabled`), closed-loop rate control from ACK-carried recommendations, and a CP negotiation handshake (off by default)
 - Huffman + LZ4 compression; binary payloads through `encode_bytes`/`decode_bytes`
 - Host interfaces: VARA-style TCP, a WebSocket JSON server, and KISS over TCP for OFDM datagrams and the AFSK 1200 TNC mode
-- Radio control: rigctld CAT, plus serial, GPIO and VOX PTT
+- Radio control: rigctld CAT, plus serial, GPIO, CM108 and VOX PTT
 - Tests: unit tests, workspace and per-crate integration tests, proptest round trips, 20 frozen golden WAV vectors (`testdata/golden/`, SPEC §14), cargo-fuzz targets, criterion benchmarks, and the `coppa-bench` harness. Simulated AWGN and Watterson results are in [BENCHMARKS.md](BENCHMARKS.md)
 - CI: `ci.yml` runs check, lib tests with features, fmt and the platform matrix (Linux, macOS, Windows); `ci-full.yml` runs the full test suite, clippy, MSRV (1.85.0), bench and fuzz builds, cargo-deny, the security audit and the wiki lint
 
@@ -311,7 +312,7 @@ coppa/
 │   │   └── src/fec/              # NR BG2 LDPC, scrambler, legacy codecs
 │   ├── coppa-channel/            # AWGN, Watterson, SSB filter, CFO/SCO impairments (test and bench only)
 │   ├── coppa-audio/              # CPAL and WAV backends, ring buffers, loopback, VOX
-│   ├── coppa-radio/              # rigctld CAT, serial/GPIO/VOX PTT
+│   ├── coppa-radio/              # rigctld CAT, serial/GPIO/CM108/VOX PTT
 │   ├── coppa-ml/                 # RateLoop, CpGate, BusyGate, MCS selection, spectrum sensing
 │   ├── coppa-engine/             # CoppaCore, EngineConfig, named profiles
 │   ├── coppa-host/               # VARA-style TCP, WebSocket, KISS

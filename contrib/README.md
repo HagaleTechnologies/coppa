@@ -99,7 +99,7 @@ Caveats:
   launchd. That can show up as silence (coppad logs `RX audio input is
   silent: ...`), as a permission prompt, or as coppad being terminated. This
   has not been checked on a Mac.
-- There is no GPIO PTT on macOS; use rigctld, serial or VOX.
+- There is no GPIO or CM108 PTT on macOS; use rigctld, serial or VOX.
 - launchd restarts coppad after a non-zero exit, no more often than every
   10 s (`ThrottleInterval`), and never gives up. A clean exit is not
   restarted.

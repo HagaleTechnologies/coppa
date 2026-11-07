@@ -28,6 +28,10 @@ default = []
 # hardware access is Linux-only (see `ptt_gpio`'s module docs), but the module
 # itself compiles on any OS so its state-machine and chip-selection logic can
 # be unit-tested with a mock.
+#
+# CM108/CM119 HID PTT (`ptt_cm108`) needs no feature: it has no dependency
+# (plain `std::fs` writes to a Linux `/dev/hidrawN` node) and is always
+# compiled, with only the real device access limited to Linux.
 serial-ptt = ["dep:serialport"]
 gpio-ptt = ["dep:gpiocdev"]
 

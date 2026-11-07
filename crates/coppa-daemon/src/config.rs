@@ -66,8 +66,9 @@ pub struct RadioConfig {
     /// `"none"`, `"vox"`, `"rigctld"` -- for backward compatibility, or an
     /// extended `method:args` form for backends that need extra parameters:
     /// `"serial:/dev/ttyUSB0:dtr"`, `"serial:/dev/ttyUSB0:rts"`,
-    /// `"gpio:pinctrl-bcm2711:17"` (or the deprecated sysfs `"gpio:529"`).
-    /// See [`PttConfig::parse`].
+    /// `"gpio:pinctrl-bcm2711:17"` (or the deprecated sysfs `"gpio:529"`),
+    /// `"cm108:/dev/hidraw0"`, `"cm108:/dev/hidraw0:4"`. See
+    /// [`PttConfig::parse`].
     pub ptt_method: String,
     /// rigctld address (e.g., "127.0.0.1:4532").
     pub rigctld_address: String,
@@ -92,10 +93,16 @@ pub struct RadioConfig {
     /// for the HF/VHF wideband gate when the exact dial frequency is not
     /// stated.
     pub band: Option<String>,
-    /// COP-31: spawn the PTT guardian for rigctld/GPIO PTT (see
+    /// COP-31: spawn the PTT guardian for rigctld, GPIO and CM108 PTT (see
     /// `ptt_guardian`): a helper process that releases PTT if coppad dies
     /// while transmitting. Ignored for `none`, `vox` and serial PTT.
     pub ptt_guardian: bool,
+    /// COP-52: active-low PTT line: TX drives the line low, RX drives it
+    /// high. Applies to gpio and cm108 PTT. With serial PTT coppad refuses
+    /// to start (see [`RadioConfig::ptt_invert_error`]); for the other
+    /// methods it has no effect and coppad logs a warning (see
+    /// [`RadioConfig::ptt_invert_warning`]).
+    pub ptt_invert: bool,
     /// COP-84: let a VARA command-port client set the rig's frequency
     /// (`FREQ <hz>`) or mode (`MODE <name>`) through rigctld. Off by default:
     /// the command port is unauthenticated and any web page can send it a
@@ -127,6 +134,12 @@ pub enum PttConfig {
     },
     Gpio {
         line: GpioLine,
+    },
+    /// COP-52: CM108/CM119 HID GPIO PTT through a Linux hidraw node.
+    Cm108 {
+        device: String,
+        /// The chip's GPIO pin wired to PTT, 1 to 8.
+        gpio: u8,
     },
 }
 
@@ -188,8 +201,13 @@ impl PttConfig {
     /// Parse a `ptt_method` config string.
     ///
     /// Backward-compatible with the pre-Phase-4 flat values (`"none"`,
-    /// `"vox"`, `"rigctld"`); `"serial"`/`"gpio"` require the extended
-    /// `method:args` syntax since they need extra parameters.
+    /// `"vox"`, `"rigctld"`); `"serial"`/`"gpio"`/`"cm108"` require the
+    /// extended `method:args` syntax since they need extra parameters.
+    ///
+    /// `cm108:<hidraw-path>[:<gpio 1-8>]` splits on the last colon, as
+    /// `serial:` does: a trailing `:<gpio>` is the pin (default
+    /// [`coppa_radio::ptt_cm108::DEFAULT_GPIO`]), so a path that contains a
+    /// colon must give the pin explicitly.
     pub fn parse(s: &str) -> Result<Self, PttConfigError> {
         let trimmed = s.trim();
         let (method, rest) = match trimmed.split_once(':') {
@@ -231,11 +249,48 @@ impl PttConfig {
             ("gpio", Some(arg)) => Ok(PttConfig::Gpio {
                 line: GpioLine::parse(arg, s)?,
             }),
+            ("cm108", Some(rest)) => {
+                let (device, gpio) = match rest.rsplit_once(':') {
+                    Some((device, gpio)) => {
+                        let digits = !gpio.is_empty() && gpio.bytes().all(|b| b.is_ascii_digit());
+                        match gpio.parse::<u8>() {
+                            Ok(n) if digits && (1..=8).contains(&n) => (device, n),
+                            _ => {
+                                return Err(PttConfigError(format!(
+                                    "invalid CM108 GPIO {gpio:?} in {s:?}; expected a number \
+                                     from 1 to 8 (most interfaces use 3)"
+                                )))
+                            }
+                        }
+                    }
+                    None => (rest, coppa_radio::ptt_cm108::DEFAULT_GPIO),
+                };
+                if device.is_empty() {
+                    return Err(PttConfigError(format!(
+                        "cm108 PTT config {s:?} is missing the device; expected \
+                         \"cm108:<hidraw-path>[:<gpio 1-8>]\""
+                    )));
+                }
+                Ok(PttConfig::Cm108 {
+                    device: device.to_string(),
+                    gpio,
+                })
+            }
             _ => Err(PttConfigError(format!(
                 "unknown PTT method {s:?}; expected one of \"none\", \"vox\", \"rigctld\", \
-                 \"serial:<port>:<dtr|rts>\", \"gpio:<chip>:<line>\""
+                 \"serial:<port>:<dtr|rts>\", \"gpio:<chip>:<line>\", \
+                 \"cm108:<hidraw-path>[:<gpio 1-8>]\""
             ))),
         }
+    }
+
+    /// COP-52: whether `[radio] ptt_invert` changes this backend: true for
+    /// the methods that drive a PTT line (serial, gpio, cm108).
+    pub fn applies_ptt_invert(&self) -> bool {
+        matches!(
+            self,
+            PttConfig::Serial { .. } | PttConfig::Gpio { .. } | PttConfig::Cm108 { .. }
+        )
     }
 }
 
@@ -257,6 +312,46 @@ impl RadioConfig {
     /// Parse [`Self::ptt_method`] into a [`PttConfig`].
     pub fn ptt_config(&self) -> Result<PttConfig, PttConfigError> {
         PttConfig::parse(&self.ptt_method)
+    }
+
+    /// COP-52: the warning to log when `ptt_invert = true` is set with a
+    /// method it does not apply to (`none`, `vox`, `rigctld`). `None` when the
+    /// key is off, applies, or `ptt_method` does not parse (that error is
+    /// reported on its own).
+    pub fn ptt_invert_warning(&self) -> Option<String> {
+        if !self.ptt_invert {
+            return None;
+        }
+        match self.ptt_config() {
+            Ok(ptt) if !ptt.applies_ptt_invert() => Some(format!(
+                "[radio] ptt_invert = true has no effect with ptt_method {:?}; it applies to \
+                 gpio and cm108 PTT",
+                self.ptt_method
+            )),
+            _ => None,
+        }
+    }
+
+    /// COP-144 (owner decision, option A): the startup error for
+    /// `ptt_invert = true` with serial PTT. Inverted serial PTT holds DTR or
+    /// RTS asserted for RX, and the operating system deasserts both lines when
+    /// the port closes, so after coppad exits, by any path, an active-low rig
+    /// sits keyed. `None` for every other combination, or when `ptt_method`
+    /// does not parse (that error is reported on its own).
+    pub fn ptt_invert_error(&self) -> Option<String> {
+        if !self.ptt_invert {
+            return None;
+        }
+        match self.ptt_config() {
+            Ok(PttConfig::Serial { .. }) => Some(format!(
+                "[radio] ptt_invert = true is refused with ptt_method {:?}: inverted serial PTT \
+                 holds the line asserted for receive, and the operating system deasserts it \
+                 when the port closes, so an active-low rig would be left keyed after coppad \
+                 exits; use gpio or cm108 PTT for an active-low line",
+                self.ptt_method
+            )),
+            _ => None,
+        }
     }
 
     /// Validate [`Self::frequency_hz`] and [`Self::band`] into the stated
@@ -679,6 +774,7 @@ impl Default for RadioConfig {
             frequency_hz: None,
             band: None,
             ptt_guardian: true,
+            ptt_invert: false,
             host_rig_control: false,
         }
     }
@@ -1827,6 +1923,153 @@ beacon_interval_secs = 600
         let err = PttConfig::parse("carrier-pigeon").unwrap_err();
         assert!(err.to_string().contains("carrier-pigeon"));
         assert!(err.to_string().contains("none"));
+        assert!(
+            err.to_string()
+                .contains("\"cm108:<hidraw-path>[:<gpio 1-8>]\""),
+            "{err}"
+        );
+
+        // A bare `cm108` has no device: the unknown-method error, like `gpio`.
+        let err = PttConfig::parse("cm108").unwrap_err();
+        assert!(err.to_string().contains("unknown PTT method"), "{err}");
+    }
+
+    // ── COP-52: cm108:<hidraw-path>[:<gpio>] ────────────────────────────
+
+    fn cm108(device: &str, gpio: u8) -> PttConfig {
+        PttConfig::Cm108 {
+            device: device.to_string(),
+            gpio,
+        }
+    }
+
+    #[test]
+    fn test_ptt_parse_cm108_default_gpio() {
+        assert_eq!(
+            PttConfig::parse("cm108:/dev/hidraw0").unwrap(),
+            cm108("/dev/hidraw0", 3)
+        );
+        assert_eq!(
+            PttConfig::parse("CM108:/dev/hidraw0").unwrap(),
+            cm108("/dev/hidraw0", 3)
+        );
+    }
+
+    #[test]
+    fn test_ptt_parse_cm108_explicit_gpio() {
+        assert_eq!(
+            PttConfig::parse("cm108:/dev/hidraw0:4").unwrap(),
+            cm108("/dev/hidraw0", 4)
+        );
+        assert_eq!(
+            PttConfig::parse("cm108:/dev/a:b:3").unwrap(),
+            cm108("/dev/a:b", 3)
+        );
+    }
+
+    #[test]
+    fn test_ptt_parse_cm108_rejects_a_missing_device() {
+        for method in ["cm108:", "cm108::3"] {
+            let err = PttConfig::parse(method).unwrap_err().to_string();
+            assert!(err.contains("is missing the device"), "{method}: {err}");
+            assert!(
+                err.contains("cm108:<hidraw-path>[:<gpio 1-8>]"),
+                "{method}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ptt_parse_cm108_rejects_a_bad_gpio() {
+        for method in [
+            "cm108:/dev/hidraw0:0",
+            "cm108:/dev/hidraw0:9",
+            "cm108:/dev/hidraw0:x",
+            "cm108:/dev/hidraw0:",
+            "cm108:/dev/hidraw0:+3",
+            "cm108:/dev/hidraw0:300",
+        ] {
+            let err = PttConfig::parse(method).unwrap_err().to_string();
+            assert!(err.contains("invalid CM108 GPIO"), "{method}: {err}");
+            assert!(
+                err.contains("expected a number from 1 to 8"),
+                "{method}: {err}"
+            );
+        }
+        assert_eq!(
+            PttConfig::parse("cm108:/dev/hidraw0:9")
+                .unwrap_err()
+                .to_string(),
+            "invalid CM108 GPIO \"9\" in \"cm108:/dev/hidraw0:9\"; expected a number from 1 to 8 \
+             (most interfaces use 3)"
+        );
+    }
+
+    // ── COP-52: [radio] ptt_invert ──────────────────────────────────────
+
+    #[test]
+    fn ptt_invert_defaults_to_false_and_parses() {
+        assert!(!RadioConfig::default().ptt_invert);
+        let config: DaemonConfig = toml::from_str("[radio]\nptt_method = \"none\"\n").unwrap();
+        assert!(!config.radio.ptt_invert, "absent key keeps the default");
+        let config: DaemonConfig = toml::from_str("[radio]\nptt_invert = true\n").unwrap();
+        assert!(config.radio.ptt_invert);
+    }
+
+    #[test]
+    fn applies_ptt_invert_only_to_line_backends() {
+        for method in ["serial:/dev/ttyUSB0:rts", "gpio:17", "cm108:/dev/hidraw0"] {
+            assert!(
+                PttConfig::parse(method).unwrap().applies_ptt_invert(),
+                "{method}"
+            );
+        }
+        for method in ["none", "vox", "rigctld"] {
+            assert!(
+                !PttConfig::parse(method).unwrap().applies_ptt_invert(),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn ptt_invert_warning_names_the_method() {
+        let radio = |method: &str, ptt_invert: bool| RadioConfig {
+            ptt_method: method.to_string(),
+            ptt_invert,
+            ..RadioConfig::default()
+        };
+        assert_eq!(
+            radio("rigctld", true).ptt_invert_warning().as_deref(),
+            Some(
+                "[radio] ptt_invert = true has no effect with ptt_method \"rigctld\"; it applies \
+                 to gpio and cm108 PTT"
+            )
+        );
+        assert_eq!(radio("cm108:/dev/hidraw0", true).ptt_invert_warning(), None);
+        assert_eq!(radio("rigctld", false).ptt_invert_warning(), None);
+    }
+
+    #[test]
+    fn ptt_invert_error_refuses_only_inverted_serial_ptt() {
+        let radio = |method: &str, ptt_invert: bool| RadioConfig {
+            ptt_method: method.to_string(),
+            ptt_invert,
+            ..RadioConfig::default()
+        };
+        for method in ["serial:/dev/ttyUSB0:dtr", "serial:/dev/ttyUSB0:rts"] {
+            let error = radio(method, true)
+                .ptt_invert_error()
+                .unwrap_or_else(|| panic!("{method} with ptt_invert must be refused"));
+            assert!(error.contains(&format!("{method:?}")), "{error}");
+            assert!(error.contains("left keyed after coppad exits"), "{error}");
+            assert_eq!(radio(method, false).ptt_invert_error(), None);
+        }
+        for method in ["gpio:529", "cm108:/dev/hidraw0", "none", "vox", "rigctld"] {
+            assert_eq!(radio(method, true).ptt_invert_error(), None, "{method}");
+        }
+        // An unparsable method reports its own error, not this one.
+        assert_eq!(radio("serial", true).ptt_invert_error(), None);
     }
 
     #[test]
@@ -2492,6 +2735,33 @@ beacon_interval_secs = 600
 
         let config: DaemonConfig = toml::from_str(&text).unwrap();
         assert!(!config.host.websocket_enabled);
+    }
+
+    #[test]
+    fn example_config_documents_ptt_invert() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../coppad.toml.example");
+        let text = std::fs::read_to_string(path).unwrap();
+
+        // A real (uncommented) `ptt_invert = false` line inside [radio].
+        let mut table = String::new();
+        let mut invert_line = false;
+        for line in text.lines() {
+            let trimmed = line.trim_start_matches('#').trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.contains(' ') {
+                table = trimmed.to_string();
+            }
+            let commented = line.trim_start().starts_with('#');
+            if !commented && trimmed.starts_with("ptt_invert = ") {
+                assert_eq!(table, "[radio]", "ptt_invert outside [radio]: {line:?}");
+                assert_eq!(trimmed, "ptt_invert = false");
+                invert_line = true;
+            }
+        }
+        assert!(invert_line, "no uncommented ptt_invert line in [radio]");
+        assert!(text.contains("cm108:<hidraw-path>"));
+
+        let config: DaemonConfig = toml::from_str(&text).unwrap();
+        assert!(!config.radio.ptt_invert);
     }
 
     #[test]

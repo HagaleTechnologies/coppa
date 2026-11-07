@@ -1,6 +1,11 @@
 //! COP-31: drive the real `coppad` binary against a recording fake rigctld
 //! and check that PTT is released on each way the daemon can stop.
 //!
+//! COP-52: the same for CM108 PTT (Linux only), with a regular file standing
+//! in for `/dev/hidrawN`. Every report reopens the node and writes at offset
+//! 0, so the file always holds the last report any process wrote, the way the
+//! chip latches its pin.
+//!
 //! Every test keys PTT the way an operator would: it sends `TUNE 20` on the
 //! VARA command port, which uses the same `transmit_samples` path as real
 //! traffic, then stops the daemon while the 20 s tone is still playing.
@@ -21,6 +26,8 @@ use std::fs::File;
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::process::CommandExt;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -55,7 +62,8 @@ enum Group {
     Own,
 }
 
-/// A running `coppad` with rigctld PTT and the VARA server on.
+/// A running `coppad` with the VARA server on (rigctld PTT unless started
+/// with [`Coppad::start_with_radio`]).
 struct Coppad {
     child: Child,
     dir: TempDir,
@@ -79,14 +87,31 @@ impl Coppad {
         group: Group,
         ptt_pre_delay_ms: u64,
     ) -> Self {
+        let radio = format!(
+            "ptt_method = \"rigctld\"\n\
+             rigctld_address = \"{}\"\n\
+             ptt_guardian = {ptt_guardian}\n",
+            fake.address()
+        );
+        Self::start_with_radio_and_pre_delay(&radio, group, ptt_pre_delay_ms)
+    }
+
+    /// Start coppad with `radio` as the body of its `[radio]` table, after
+    /// `ptt_pre_delay_ms = 0`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn start_with_radio(radio: &str, group: Group) -> Self {
+        Self::start_with_radio_and_pre_delay(radio, group, 0)
+    }
+
+    /// Start coppad with `radio` as the body of its `[radio]` table, after
+    /// `ptt_pre_delay_ms`.
+    fn start_with_radio_and_pre_delay(radio: &str, group: Group, ptt_pre_delay_ms: u64) -> Self {
         let dir = TempDir::new("daemon");
         let (command_port, data_port) = free_ports();
         let config = format!(
             "[radio]\n\
-             ptt_method = \"rigctld\"\n\
-             rigctld_address = \"{}\"\n\
              ptt_pre_delay_ms = {ptt_pre_delay_ms}\n\
-             ptt_guardian = {ptt_guardian}\n\
+             {radio}\
              \n\
              [host]\n\
              vara_enabled = true\n\
@@ -95,8 +120,7 @@ impl Coppad {
              \n\
              [engine]\n\
              # COP-37: no transmission without a valid callsign.\n\
-             callsign = \"N0CALL\"\n",
-            fake.address()
+             callsign = \"N0CALL\"\n"
         );
         let config_path = dir.path().join("coppad.toml");
         std::fs::write(&config_path, config).expect("write coppad.toml");
@@ -179,6 +203,19 @@ impl Coppad {
     /// Send `TUNE 20` on the VARA command port and wait for the rig to be
     /// keyed.
     fn key(&mut self, fake: &FakeRigctld) {
+        self.send_tune();
+        assert!(
+            wait_until(KEY_DEADLINE, || fake
+                .ptt_commands(0)
+                .contains(&"T 1".to_string())),
+            "TUNE did not key PTT within {KEY_DEADLINE:?}; rigctld log {:?}\n{}",
+            fake.log(),
+            self.output()
+        );
+    }
+
+    /// Send `TUNE 20` on the VARA command port, keeping the connection open.
+    fn send_tune(&mut self) {
         let addr = SocketAddr::from(([127, 0, 0, 1], self.command_port));
         let mut stream = None;
         wait_until(Duration::from_secs(5), || {
@@ -193,14 +230,6 @@ impl Coppad {
         });
         stream.write_all(b"TUNE 20\r").expect("send TUNE");
         self.vara = Some(stream);
-        assert!(
-            wait_until(KEY_DEADLINE, || fake
-                .ptt_commands(0)
-                .contains(&"T 1".to_string())),
-            "TUNE did not key PTT within {KEY_DEADLINE:?}; rigctld log {:?}\n{}",
-            fake.log(),
-            self.output()
-        );
     }
 
     fn try_exit(&mut self) -> Option<ExitStatus> {
@@ -369,6 +398,140 @@ fn guardian_disabled_by_config_leaves_sigkill_unreleased() {
     );
     assert_eq!(fake.ptt_at_eof(0), Some(1), "rigctld log {:?}", fake.log());
     assert_eq!(fake.ptt(), 1, "rigctld log {:?}", fake.log());
+}
+
+// ---------------------------------------------------------------------------
+// COP-52: CM108 PTT against a regular-file stand-in
+// ---------------------------------------------------------------------------
+
+/// GPIO 3's reports: the pin driven high and low.
+#[cfg(target_os = "linux")]
+const CM108_HIGH: [u8; 5] = [0, 0, 4, 4, 0];
+#[cfg(target_os = "linux")]
+const CM108_LOW: [u8; 5] = [0, 0, 0, 4, 0];
+
+/// A regular file standing in for `/dev/hidrawN`, pre-filled with junk, in
+/// its own temporary directory.
+#[cfg(target_os = "linux")]
+struct Cm108StandIn {
+    dir: TempDir,
+}
+
+#[cfg(target_os = "linux")]
+impl Cm108StandIn {
+    fn new() -> Self {
+        let dir = TempDir::new("cm108");
+        std::fs::write(dir.path().join("hidraw"), [0xff; 5]).expect("write stand-in");
+        Self { dir }
+    }
+
+    fn path(&self) -> PathBuf {
+        self.dir.path().join("hidraw")
+    }
+
+    /// The `[radio]` body for this stand-in.
+    fn radio(&self, ptt_invert: bool) -> String {
+        format!(
+            "ptt_method = \"cm108:{}\"\nptt_invert = {ptt_invert}\n",
+            self.path().display()
+        )
+    }
+
+    fn read(&self) -> Vec<u8> {
+        std::fs::read(self.path()).unwrap_or_default()
+    }
+
+    /// Whether the stand-in holds `report` within `timeout`.
+    fn holds_within(&self, report: [u8; 5], timeout: Duration) -> bool {
+        wait_until(timeout, || self.read() == report)
+    }
+}
+
+/// Start coppad on `stand_in`, check the startup RX report, then key it with
+/// `TUNE 20` and check the TX report.
+#[cfg(target_os = "linux")]
+fn start_and_key_cm108(stand_in: &Cm108StandIn, ptt_invert: bool) -> Coppad {
+    let (rx, tx) = if ptt_invert {
+        (CM108_HIGH, CM108_LOW)
+    } else {
+        (CM108_LOW, CM108_HIGH)
+    };
+    let mut daemon = Coppad::start_with_radio(&stand_in.radio(ptt_invert), Group::Inherit);
+    assert_eq!(
+        stand_in.read(),
+        rx,
+        "startup must write the RX report\n{}",
+        daemon.output()
+    );
+    assert!(
+        daemon.output().contains("active=cm108"),
+        "{}",
+        daemon.output()
+    );
+    daemon.send_tune();
+    assert!(
+        stand_in.holds_within(tx, KEY_DEADLINE),
+        "TUNE did not write the TX report within {KEY_DEADLINE:?}; stand-in holds {:?}\n{}",
+        stand_in.read(),
+        daemon.output()
+    );
+    daemon
+}
+
+#[cfg(target_os = "linux")]
+fn cm108_sigkill_is_released_by_the_guardian(ptt_invert: bool) {
+    let rx = if ptt_invert { CM108_HIGH } else { CM108_LOW };
+    let stand_in = Cm108StandIn::new();
+    let mut daemon = start_and_key_cm108(&stand_in, ptt_invert);
+    assert!(daemon.guardian_pid().is_some(), "{}", daemon.output());
+
+    daemon.sigkill();
+
+    assert!(
+        stand_in.holds_within(rx, GUARDIAN_DEADLINE),
+        "the guardian did not write the RX report within {GUARDIAN_DEADLINE:?}; \
+         stand-in holds {:?}\n{}",
+        stand_in.read(),
+        daemon.output()
+    );
+    assert!(
+        wait_until(Duration::from_secs(2), || daemon
+            .output()
+            .contains("PTT released")),
+        "{}",
+        daemon.output()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cm108_sigkill_mid_transmission_is_released_by_the_guardian() {
+    cm108_sigkill_is_released_by_the_guardian(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn inverted_cm108_sigkill_mid_transmission_is_released_by_the_guardian() {
+    cm108_sigkill_is_released_by_the_guardian(true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cm108_sigterm_mid_transmission_releases_ptt_before_exit() {
+    let stand_in = Cm108StandIn::new();
+    let mut daemon = start_and_key_cm108(&stand_in, false);
+
+    send_signal("-TERM", &daemon.pid().to_string());
+    let status = daemon.wait_exit(EXIT_DEADLINE);
+    assert_eq!(status.code(), Some(0), "exit status\n{}", daemon.output());
+
+    // The daemon has exited, so this is what it left behind.
+    assert_eq!(stand_in.read(), CM108_LOW, "{}", daemon.output());
+    assert!(
+        daemon.output().contains("Releasing PTT before shutdown"),
+        "{}",
+        daemon.output()
+    );
 }
 
 /// COP-85: a second stop request while the first waits behind a long

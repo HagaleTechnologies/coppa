@@ -716,7 +716,8 @@ pub struct EventLoop {
     /// frequency (COP-40).
     ptt: PttBackend,
     /// COP-31: the out-of-process PTT guardian, told about every PTT
-    /// transition from `set_ptt` (rigctld/GPIO PTT only; `None` otherwise).
+    /// transition from `set_ptt` (rigctld, GPIO or CM108 PTT only; `None`
+    /// otherwise).
     /// Declared immediately after `ptt` on purpose: fields drop in
     /// declaration order, so the backend's own `Drop` release runs first and
     /// only then does the guardian see EOF on its stdin.
@@ -1032,6 +1033,7 @@ impl EventLoop {
             &config.radio.rigctld_address,
             ptt.is_rigctld(),
             release,
+            config.radio.ptt_invert,
         );
         // COP-32: conditions the daemon runs through but must not call ready.
         // COP-50: a backend that refused the release is one of them.
@@ -1217,14 +1219,26 @@ impl EventLoop {
     ///
     /// COP-31: creating a backend does not touch the line; `EventLoop::new`
     /// drives it to RX right after this returns (a failure there is a
-    /// warning, not a startup error). The rigctld, serial and GPIO backends
-    /// also release PTT on drop if they may have left it keyed, so an error
-    /// return or a panic after this point still un-keys the rig.
+    /// warning, not a startup error). The rigctld, serial, GPIO and CM108
+    /// backends also release PTT on drop if they may have left it keyed, so an
+    /// error return or a panic after this point still un-keys the rig.
+    ///
+    /// COP-52: `[radio] ptt_invert` reaches the GPIO and CM108 backends; with
+    /// serial PTT it is a startup error (COP-144, see
+    /// `RadioConfig::ptt_invert_error`), and with any other method it only
+    /// logs a warning.
     fn create_ptt(config: &DaemonConfig) -> Result<PttBackend> {
         let parsed = config
             .radio
             .ptt_config()
             .map_err(|e| anyhow::anyhow!("invalid [radio] ptt_method: {e}"))?;
+        if let Some(error) = config.radio.ptt_invert_error() {
+            return Err(anyhow::anyhow!("{error}"));
+        }
+        if let Some(warning) = config.radio.ptt_invert_warning() {
+            tracing::warn!("{warning}");
+        }
+        let inverted = config.radio.ptt_invert;
 
         match parsed {
             crate::config::PttConfig::None => Ok(PttBackend::Other(Box::new(NullPtt::new()))),
@@ -1256,15 +1270,16 @@ impl EventLoop {
                             coppa_radio::ptt_serial::SerialPttLine::Rts
                         }
                     };
-                    let ptt = coppa_radio::ptt_serial::SerialPtt::open(&port, serial_line, false)
-                        .map_err(|e| {
-                        anyhow::anyhow!("failed to open serial PTT port {port}: {e:#}")
-                    })?;
+                    let ptt =
+                        coppa_radio::ptt_serial::SerialPtt::open(&port, serial_line, inverted)
+                            .map_err(|e| {
+                                anyhow::anyhow!("failed to open serial PTT port {port}: {e:#}")
+                            })?;
                     Ok(PttBackend::Other(Box::new(ptt)))
                 }
                 #[cfg(not(feature = "serial-ptt"))]
                 {
-                    let _ = (port, line);
+                    let _ = (port, line, inverted);
                     Err(anyhow::anyhow!(
                         "PTT method 'serial' requires coppad to be built with \
                          --features serial-ptt"
@@ -1274,7 +1289,7 @@ impl EventLoop {
             crate::config::PttConfig::Gpio { line } => {
                 #[cfg(all(feature = "gpio-ptt", target_os = "linux"))]
                 {
-                    let ptt = open_gpio_ptt(&line, "coppad")?;
+                    let ptt = open_gpio_ptt(&line, inverted, "coppad")?;
                     if let crate::config::GpioLine::Sysfs(number) = line {
                         let equivalent = coppa_radio::ptt_gpio::sysfs_number_to_chardev(
                             number,
@@ -1290,6 +1305,24 @@ impl EventLoop {
                     Err(anyhow::anyhow!(
                         "PTT method 'gpio' requires coppad to be built with \
                          --features gpio-ptt, on Linux"
+                    ))
+                }
+            }
+            crate::config::PttConfig::Cm108 { device, gpio } => {
+                #[cfg(target_os = "linux")]
+                {
+                    let ptt = coppa_radio::ptt_cm108::Cm108Ptt::open(&device, gpio, inverted)
+                        .map_err(|e| {
+                            anyhow::anyhow!("failed to open CM108 PTT device {device}: {e:#}")
+                        })?;
+                    Ok(PttBackend::Other(Box::new(ptt)))
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = (device, gpio);
+                    Err(anyhow::anyhow!(
+                        "PTT method 'cm108' writes Linux /dev/hidraw devices and is only \
+                         available on Linux"
                     ))
                 }
             }
@@ -1769,8 +1802,8 @@ impl EventLoop {
     }
 
     /// COP-31: whether this daemon should run a PTT guardian: `[radio]
-    /// ptt_guardian` is on and the PTT backend is a connected rigctld client
-    /// or GPIO (see `ptt_guardian::ptt_guardian_eligible`).
+    /// ptt_guardian` is on and the PTT backend is a connected rigctld client,
+    /// GPIO or CM108 (see `ptt_guardian::ptt_guardian_eligible`).
     pub fn ptt_guardian_eligible(&self) -> bool {
         crate::ptt_guardian::ptt_guardian_eligible(&self.config.radio, self.ptt.is_rigctld())
     }
@@ -7486,6 +7519,7 @@ pub(crate) fn sysfs_gpio_missing(number: u32) -> String {
 
 /// COP-85: open the GPIO PTT line `line` names, at its RX level, for the
 /// daemon (`consumer` `coppad`) or the guardian (`coppad-guardian`).
+/// COP-52: `inverted` is `[radio] ptt_invert`; the RX level is high when set.
 ///
 /// The character-device form requests the line through `/dev/gpiochipN`.
 /// The sysfs form fails with a migration message when the kernel has no
@@ -7493,12 +7527,13 @@ pub(crate) fn sysfs_gpio_missing(number: u32) -> String {
 #[cfg(all(feature = "gpio-ptt", target_os = "linux"))]
 pub(crate) fn open_gpio_ptt(
     line: &crate::config::GpioLine,
+    inverted: bool,
     consumer: &str,
 ) -> Result<Box<dyn PttControl>> {
     use coppa_radio::ptt_gpio::GpioPtt;
     match line {
         crate::config::GpioLine::Chardev { chip, line } => {
-            let ptt = GpioPtt::open_chardev(chip, *line, false, consumer).map_err(|e| {
+            let ptt = GpioPtt::open_chardev(chip, *line, inverted, consumer).map_err(|e| {
                 anyhow::anyhow!("failed to open GPIO PTT line {chip}:{line}: {e:#}")
             })?;
             Ok(Box::new(ptt))
@@ -7507,7 +7542,7 @@ pub(crate) fn open_gpio_ptt(
             if !std::path::Path::new("/sys/class/gpio/export").exists() {
                 anyhow::bail!("{}", sysfs_gpio_missing(*number));
             }
-            let ptt = GpioPtt::open(*number, false)
+            let ptt = GpioPtt::open(*number, inverted)
                 .map_err(|e| anyhow::anyhow!("failed to open GPIO PTT pin {number}: {e:#}"))?;
             Ok(Box::new(ptt))
         }
@@ -7770,6 +7805,147 @@ mod tests {
         // EACCES (not in gpio group), EINVAL (wrong number) and EROFS/ENOENT
         // (no writable sysfs GPIO) must be distinguishable in the log.
         assert!(msg.contains("(os error "), "OS cause dropped: {msg}");
+    }
+
+    // ── COP-52: CM108 PTT and [radio] ptt_invert ────────────────────────
+
+    /// A per-test regular file standing in for `/dev/hidrawN`, pre-filled with
+    /// junk. Removed on drop.
+    #[cfg(target_os = "linux")]
+    struct HidrawStandIn(std::path::PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl HidrawStandIn {
+        fn new(name: &str) -> Self {
+            let stand_in = Self::missing(name);
+            std::fs::write(&stand_in.0, [0xff; 5]).unwrap();
+            stand_in
+        }
+
+        /// A path that does not exist (nothing is created).
+        fn missing(name: &str) -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "coppa-event-loop-cm108-{}-{name}",
+                std::process::id()
+            )))
+        }
+
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+
+        fn method(&self) -> String {
+            format!("cm108:{}", self.path())
+        }
+
+        fn read(&self) -> Vec<u8> {
+            std::fs::read(&self.0).unwrap()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for HidrawStandIn {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_create_ptt_cm108_missing_device_names_the_path_and_os_error() {
+        let missing = HidrawStandIn::missing("no-such-hidraw");
+        let mut config = DaemonConfig::default();
+        config.radio.ptt_method = missing.method();
+        let err = EventLoop::create_ptt(&config)
+            .err()
+            .expect("a missing hidraw node must be a startup error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!(
+                "failed to open CM108 PTT device {}",
+                missing.path()
+            )),
+            "{msg}"
+        );
+        assert!(msg.contains("(os error "), "OS cause dropped: {msg}");
+        assert!(!missing.0.exists(), "create_ptt must never create the node");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_create_ptt_cm108_keys_and_releases_a_stand_in() {
+        let stand_in = HidrawStandIn::new("keys");
+        let mut config = DaemonConfig::default();
+        config.radio.ptt_method = stand_in.method();
+        let mut ptt = EventLoop::create_ptt(&config).unwrap();
+        ptt.set_ptt(PttState::Tx).unwrap();
+        assert_eq!(stand_in.read(), [0, 0, 4, 4, 0]);
+        ptt.set_ptt(PttState::Rx).unwrap();
+        assert_eq!(stand_in.read(), [0, 0, 0, 4, 0]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn event_loop_new_writes_the_cm108_rx_report_at_startup() {
+        let stand_in = HidrawStandIn::new("startup");
+        let mut config = DaemonConfig::default();
+        config.radio.ptt_method = stand_in.method();
+        let event_loop = EventLoop::new(config).unwrap();
+        assert_eq!(stand_in.read(), [0, 0, 0, 4, 0]);
+        let ptt = event_loop.ptt_startup();
+        assert_eq!(ptt.active(), "cm108");
+        assert_eq!(ptt.state(), "released");
+        assert_eq!(ptt.method(), format!("cm108 {} gpio 3", stand_in.path()));
+        assert!(event_loop.startup_problems().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inverted_cm108_startup_writes_the_high_rx_report() {
+        let stand_in = HidrawStandIn::new("inverted-startup");
+        let mut config = DaemonConfig::default();
+        config.radio.ptt_method = stand_in.method();
+        config.radio.ptt_invert = true;
+        let event_loop = EventLoop::new(config).unwrap();
+        assert_eq!(stand_in.read(), [0, 0, 4, 4, 0]);
+        assert!(
+            event_loop.ptt_startup().method().ends_with(" inverted"),
+            "{}",
+            event_loop.ptt_startup().method()
+        );
+    }
+
+    #[test]
+    fn create_ptt_accepts_ptt_invert_on_a_line_less_method() {
+        let mut config = DaemonConfig::default();
+        config.radio.ptt_method = "none".to_string();
+        config.radio.ptt_invert = true;
+        assert!(EventLoop::create_ptt(&config).is_ok());
+    }
+
+    /// COP-144 option A: inverted serial PTT is refused before the port is
+    /// opened, with or without the `serial-ptt` feature.
+    #[test]
+    fn create_ptt_refuses_ptt_invert_with_serial_ptt() {
+        let mut config = DaemonConfig::default();
+        config.radio.ptt_method = "serial:/dev/ttyUSB0:rts".to_string();
+        config.radio.ptt_invert = true;
+        let Err(error) = EventLoop::create_ptt(&config) else {
+            panic!("inverted serial PTT must be a startup error");
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("ptt_invert = true is refused"),
+            "{message}"
+        );
+        assert!(
+            message.contains("left keyed after coppad exits"),
+            "{message}"
+        );
+        assert!(
+            EventLoop::new(config).is_err(),
+            "EventLoop::new must refuse it too"
+        );
     }
 
     #[cfg(all(feature = "gpio-ptt", target_os = "linux"))]
@@ -20764,9 +20940,13 @@ mod tests {
                     "{line:?}"
                 );
             }
-            assert!(logs
-                .contents()
-                .contains("the frequency is 0 or above 30 GHz"));
+            // Name the refusal that was logged instead: a Windows CI run once
+            // failed here with no clue which check refused the set.
+            let contents = logs.contents();
+            assert!(
+                contents.contains("the frequency is 0 or above 30 GHz"),
+                "{contents}"
+            );
 
             station.is_transmitting = true;
             assert_eq!(

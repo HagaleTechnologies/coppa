@@ -38,7 +38,8 @@
 //! sysfs number to the equivalent character-device chip and line.
 //!
 //! `GpioPtt::open` exports the pin if it isn't already exported and sets its
-//! direction to `out`. The process running `coppad` needs write access to
+//! direction to `out` (`high` for an inverted line, so it starts at its RX
+//! level). The process running `coppad` needs write access to
 //! `/sys/class/gpio/export` and `/sys/class/gpio/gpioN/{direction,value}`: on
 //! Raspberry Pi OS that means membership of the `gpio` group, not root.
 //! Raspberry Pi OS's udev rule (`99-com.rules`) grants the group access to a
@@ -102,6 +103,29 @@ fn retry_on<T>(
             result => return result,
         }
     }
+}
+
+/// What `SysfsGpio::open` writes to the pin's `direction` file. The kernel
+/// makes a line written `"out"` an output driven low, which is TX on an
+/// active-low (inverted) rig, so a line whose RX level is high is opened with
+/// `"high"` instead: an output at that level, with no glitch.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn output_direction(idle_high: bool) -> &'static str {
+    if idle_high {
+        "high"
+    } else {
+        "out"
+    }
+}
+
+/// Whether `SysfsGpio::drop` unexports the pin. Unexporting hands the pin
+/// back to the kernel, which on a Raspberry Pi makes it an input again; with
+/// the SoC's default pull-down that reads low, which is TX on an active-low
+/// (inverted) rig. So a line whose RX level is high stays exported, driven
+/// high, after coppad lets go of it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn unexport_on_drop(idle_high: bool) -> bool {
+    !idle_high
 }
 
 /// One GPIO character device, as `gpiodetect` lists it.
@@ -250,18 +274,29 @@ pub trait GpioWriter: Send {
 
 /// Real sysfs-backed GPIO line: writes `"1"`/`"0"` to
 /// `/sys/class/gpio/gpio<N>/value`. See the module docs for the export/
-/// permissions setup this assumes. Unexports the pin on drop; `GpioPtt::drop`
-/// lowers it first.
+/// permissions setup this assumes. Unexports the pin on drop, unless its RX
+/// level is high (see `unexport_on_drop`); `GpioPtt::drop` drives it to RX
+/// first.
 #[cfg(target_os = "linux")]
 pub struct SysfsGpio {
     pin: u32,
     value_path: std::path::PathBuf,
+    idle_high: bool,
 }
 
 #[cfg(target_os = "linux")]
 impl SysfsGpio {
     /// Export (if not already exported) and configure GPIO pin `pin` for
-    /// output.
+    /// output, driven low: the RX level of a non-inverted rig. Same as
+    /// [`SysfsGpio::open_at_rx_level`] with `idle_high = false`.
+    pub fn open(pin: u32) -> Result<Self> {
+        Self::open_at_rx_level(pin, false)
+    }
+
+    /// COP-52: export (if not already exported) and configure GPIO pin `pin`
+    /// for output, at its RX level: high when `idle_high` (an inverted, active-low
+    /// rig), low otherwise. Writing a bare `"out"` would drive the line low,
+    /// which keys an active-low rig until the first RX write.
     ///
     /// When this call exports the pin, the `direction` write and the `value`
     /// open are re-tried for up to 2 s while they are refused with
@@ -269,7 +304,7 @@ impl SysfsGpio {
     /// group access to the new pin. The export write itself is not re-tried,
     /// so a process outside the `gpio` group still fails at once. On failure
     /// the pin is left exported.
-    pub fn open(pin: u32) -> Result<Self> {
+    pub fn open_at_rx_level(pin: u32, idle_high: bool) -> Result<Self> {
         use anyhow::Context;
 
         let gpio_dir = std::path::PathBuf::from(format!("/sys/class/gpio/gpio{pin}"));
@@ -285,10 +320,11 @@ impl SysfsGpio {
             1
         };
         let direction_path = gpio_dir.join("direction");
+        let direction = output_direction(idle_high);
         retry_permission_denied(attempts, EXPORT_SETTLE_INTERVAL, || {
-            std::fs::write(&direction_path, "out")
+            std::fs::write(&direction_path, direction)
         })
-        .with_context(|| format!("failed to set GPIO pin {pin} direction to \"out\""))?;
+        .with_context(|| format!("failed to set GPIO pin {pin} direction to \"{direction}\""))?;
         // Open `value` without writing a level (an inverted rig would key), so
         // the first real write from `EventLoop::new` cannot land in the same
         // udev window.
@@ -300,7 +336,11 @@ impl SysfsGpio {
                 .map(drop)
         })
         .with_context(|| format!("GPIO pin {pin} value is not writable"))?;
-        Ok(Self { pin, value_path })
+        Ok(Self {
+            pin,
+            value_path,
+            idle_high,
+        })
     }
 }
 
@@ -316,6 +356,11 @@ impl GpioWriter for SysfsGpio {
 #[cfg(target_os = "linux")]
 impl Drop for SysfsGpio {
     fn drop(&mut self) {
+        // COP-52: an inverted line stays exported and high (see
+        // `unexport_on_drop`).
+        if !unexport_on_drop(self.idle_high) {
+            return;
+        }
         // Best-effort unexport; nothing useful to do if this fails (e.g. pin
         // was already unexported by another process).
         let _ = std::fs::write("/sys/class/gpio/unexport", self.pin.to_string());
@@ -503,9 +548,10 @@ impl<W: GpioWriter> GpioPtt<W> {
 
 #[cfg(target_os = "linux")]
 impl GpioPtt<SysfsGpio> {
-    /// Export and open a real GPIO pin via sysfs.
+    /// Export and open a real GPIO pin via sysfs. The pin starts as an output
+    /// at its RX level, which is high exactly when `inverted`.
     pub fn open(pin: u32, inverted: bool) -> Result<Self> {
-        let writer = SysfsGpio::open(pin)?;
+        let writer = SysfsGpio::open_at_rx_level(pin, inverted)?;
         Ok(Self::with_writer(pin, inverted, writer))
     }
 }
@@ -963,6 +1009,15 @@ mod tests {
         backend.set_ptt(PttState::Tx).unwrap();
         drop(backend);
         assert_eq!(*mock.writes.lock().unwrap(), vec![true, false]);
+    }
+
+    #[test]
+    fn an_inverted_line_starts_as_an_output_at_its_rx_level() {
+        assert_eq!(output_direction(true), "high");
+        assert_eq!(output_direction(false), "out");
+        // ...and an inverted line is left exported, still high, on drop.
+        assert!(!unexport_on_drop(true));
+        assert!(unexport_on_drop(false));
     }
 
     #[cfg(all(target_os = "linux", feature = "gpio-ptt"))]

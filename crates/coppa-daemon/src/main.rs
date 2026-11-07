@@ -62,12 +62,14 @@ async fn main() -> Result<()> {
         Mode::PttGuardian {
             ptt_method,
             rigctld_address,
+            ptt_invert,
         } => {
             run_ptt_guardian(
                 cli.log_level,
                 cli.instance.as_deref(),
                 ptt_method,
                 rigctld_address,
+                ptt_invert,
             )
             .await
         }
@@ -231,12 +233,15 @@ async fn run_tnc(_level: Option<LogLevel>) -> Result<()> {
 
 /// `--ptt-guardian` (internal, COP-31): read the daemon's PTT reports on
 /// stdin until it exits, then release PTT if it exited keyed. Exits 1 if the
-/// release fails after its bounded retries.
+/// release fails after its bounded retries. `ptt_invert` is the daemon's
+/// `[radio] ptt_invert` (COP-52), so the release drives the line to its real
+/// RX level.
 async fn run_ptt_guardian(
     level: Option<LogLevel>,
     instance: Option<&str>,
     ptt_method: String,
     rigctld_address: String,
+    ptt_invert: bool,
 ) -> Result<()> {
     init_tracing(level, instance);
 
@@ -283,7 +288,7 @@ async fn run_ptt_guardian(
                     "coppad exited while PTT was keyed; releasing it"
                 );
             }
-            ptt_guardian::release_once(&ptt, &rigctld_address)
+            ptt_guardian::release_once(&ptt, &rigctld_address, ptt_invert)
         })
     })
     .await
@@ -397,7 +402,7 @@ async fn run_daemon(
     let mut event_loop = EventLoop::new(config.clone())
         .map_err(|e| anyhow::anyhow!("failed to start daemon event loop: {e}"))?;
 
-    // COP-31: for rigctld or GPIO PTT, start the out-of-process guardian
+    // COP-31: for rigctld, GPIO or CM108 PTT, start the out-of-process guardian
     // that releases PTT if this process dies keyed (SIGKILL, OOM, crash).
     // Failing to start it is logged, not fatal.
     // COP-50: the guardian's state is kept for the startup summary.

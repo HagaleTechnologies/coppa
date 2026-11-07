@@ -42,8 +42,8 @@ INFO coppad: PTT method="rigctld 127.0.0.1:4532" active=rigctld state="released"
 | `Audio input/output started` | `hardware_rate`, `engine_rate` | The opened stream rate and modem profile rate; they differ when Coppa resamples. |
 | `Audio devices` | `input_hardware_rate`, `output_hardware_rate`, `engine_rate` | The effective input and output hardware rates and the modem profile rate. |
 | `Audio devices: none; ...` (WARN) | | A build without `cpal-backend`: the daemon runs but moves no audio. |
-| `PTT` | `method` | The configured method: `none`, `vox`, `rigctld <address>`, `serial <port> <dtr\|rts>`, `gpio <chip>:<line>`, or `gpio <number> (sysfs)` for the deprecated sysfs form. |
-| | `active` | The backend actually in control: `none`, `vox`, `rigctld`, `serial` or `gpio`. An unreachable rigctld shows `active=none`. |
+| `PTT` | `method` | The configured method: `none`, `vox`, `rigctld <address>`, `serial <port> <dtr\|rts>`, `gpio <chip>:<line>`, `gpio <number> (sysfs)` for the deprecated sysfs form, or `cm108 <device> gpio <n>`. With `[radio] ptt_invert = true`, the gpio and cm108 forms end in ` inverted`, for example `gpio pinctrl-bcm2711:17 inverted`. |
+| | `active` | The backend actually in control: `none`, `vox`, `rigctld`, `serial`, `gpio` or `cm108`. An unreachable rigctld shows `active=none`. |
 | | `state` | `released` (the startup release succeeded), `release failed: <error>`, or `not controlled` (none, VOX, or an unreachable rigctld, where coppad drives no PTT line). |
 | | `guardian` | `running, pid <n>`, `failed to start: <error>`, `off ([radio] ptt_guardian = false)`, or `not used`. See [The PTT guardian](#the-ptt-guardian). |
 
@@ -143,6 +143,36 @@ same segments as wide-class VARA signals, not the narrow-digimode
 convention frequencies. Always check the current IARU R1 band plan for
 segment edges before settling on a frequency.
 
+## Active-low PTT lines (`ptt_invert`)
+
+Some interfaces key the rig when the PTT line is low. Set this for them:
+
+```toml
+[radio]
+ptt_invert = true
+```
+
+TX then drives the line low and RX drives it high. It defaults to `false`,
+and it applies to gpio and cm108 PTT. With `none`, `vox` or `rigctld`,
+coppad starts and logs one warning:
+
+```
+WARN coppad::event_loop: [radio] ptt_invert = true has no effect with ptt_method "rigctld"; it applies to gpio and cm108 PTT
+```
+
+With serial PTT, coppad refuses to start (COP-144). Inverted serial PTT
+would hold DTR or RTS asserted for RX, and the operating system deasserts
+both lines when the port closes, so an active-low rig would sit keyed after
+coppad exits, by any path. The error names the method and that hazard. Use
+gpio or cm108 PTT for an active-low line.
+
+An inverted sysfs GPIO line is opened with `direction` set to `high`, its RX
+level, so it does not key the rig while coppad starts. A non-inverted line is
+still opened with `out`, which drives it low. When coppad lets go of an
+inverted line, it leaves the pin exported and high instead of unexporting it,
+because an unexported Raspberry Pi pin turns back into an input that its
+default pull-down can hold low.
+
 ## PTT safety when coppad stops
 
 coppad releases PTT when it stops, including in the middle of a
@@ -155,18 +185,18 @@ transmission. What does the release depends on how it stops:
 | SIGHUP (`systemctl reload coppad`) | Not a stop. coppad re-reads its configuration and keeps running; see [Reloading the configuration](#reloading-the-configuration). |
 | An error or a panic | The PTT backend, as coppad unwinds. |
 | coppad keeps running, but the task that ends a transmission has died | A check that runs every 500 ms. Once PTT has been keyed for `max_tx_duration_s` plus 2 s, it forces PTT off and logs `PTT backstop: keyed past max_tx_duration_s plus grace with no release; forcing PTT off`. |
-| `kill -9`, an out-of-memory kill or a crash, with rigctld or GPIO PTT | The PTT guardian (below). |
+| `kill -9`, an out-of-memory kill or a crash, with rigctld, GPIO or CM108 PTT | The PTT guardian (below). |
 | The same, with serial PTT | The operating system, which drops DTR/RTS when it closes the port. This has not been checked on real hardware. |
-| Restart after any of the above | coppad releases PTT at startup (rigctld `T 0`, or the serial/GPIO line lowered). If that fails, it logs `Could not release PTT at startup; ...`, keeps running, and logs `Daemon running degraded` with `PTT release at startup failed: ...` in place of `Daemon ready`. |
+| Restart after any of the above | coppad releases PTT at startup (rigctld `T 0`, the serial/GPIO line set to its RX level, or the CM108 report written). If that fails, it logs `Could not release PTT at startup; ...`, keeps running, and logs `Daemon running degraded` with `PTT release at startup failed: ...` in place of `Daemon ready`. |
 
 The KISS TNC (`coppad --tnc`, `coppa tnc`) also releases PTT on SIGTERM and
 Ctrl-C.
 
 ### The PTT guardian
 
-With `ptt_method = "rigctld"` or `"gpio:<chip>:<line>"` (or the deprecated
-`"gpio:<number>"`), coppad starts a helper
-process, `coppad --ptt-guardian ...`, and logs:
+With `ptt_method = "rigctld"`, `"gpio:<chip>:<line>"` (or the deprecated
+`"gpio:<number>"`) or `"cm108:<path>"`, coppad starts a helper process,
+`coppad --ptt-guardian ...`, and logs:
 
 ```
 INFO coppad: PTT guardian started pid=6441
@@ -174,12 +204,18 @@ INFO coppad: PTT guardian started pid=6441
 
 coppad tells the guardian each time it keys and releases PTT. If coppad exits
 while PTT is keyed, however it died, the guardian opens its own rigctld
-connection or GPIO line, releases PTT and exits:
+connection, GPIO line or CM108 hidraw node, releases PTT and exits:
 
 ```
 WARN coppad::ptt_guardian: coppad exited while PTT was keyed; releasing it ptt_method=rigctld
 INFO coppad::ptt_guardian: PTT released
 ```
+
+coppad also tells the guardian `[radio] ptt_invert`, through the hidden
+`--guardian-ptt-invert` argument, so it releases an active-low line at the
+right level. A CM108 holds its pin until something writes it again, so
+closing the device never unkeys the rig; the guardian has to write the RX
+report.
 
 If every release attempt fails, it logs `Could not release PTT after coppad
 exited; the transmitter may still be keyed` and exits with status 1. When

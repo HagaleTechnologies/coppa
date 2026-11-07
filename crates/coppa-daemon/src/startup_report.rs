@@ -46,6 +46,8 @@ pub enum PttActive {
     Rigctld,
     Serial,
     Gpio,
+    /// COP-52: CM108/CM119 HID GPIO PTT.
+    Cm108,
 }
 
 impl PttActive {
@@ -56,6 +58,7 @@ impl PttActive {
             PttActive::Rigctld => "rigctld",
             PttActive::Serial => "serial",
             PttActive::Gpio => "gpio",
+            PttActive::Cm108 => "cm108",
         }
     }
 }
@@ -68,16 +71,21 @@ pub struct PttStartup {
     pub rigctld_address: String,
     pub active: PttActive,
     pub release: Result<(), String>,
+    /// COP-52: `[radio] ptt_invert`, shown by [`PttStartup::method`] for the
+    /// backends it applies to.
+    pub inverted: bool,
 }
 
 impl PttStartup {
     /// `backend_is_rigctld` is `PttBackend::is_rigctld()`: false for a rigctld
     /// that could not be reached, which `create_ptt` replaced with NullPtt.
+    /// `inverted` is `[radio] ptt_invert`.
     pub fn new(
         configured: PttConfig,
         rigctld_address: &str,
         backend_is_rigctld: bool,
         release: Result<(), String>,
+        inverted: bool,
     ) -> Self {
         let active = match &configured {
             PttConfig::Rigctld if backend_is_rigctld => PttActive::Rigctld,
@@ -85,17 +93,30 @@ impl PttStartup {
             PttConfig::Vox => PttActive::Vox,
             PttConfig::Serial { .. } => PttActive::Serial,
             PttConfig::Gpio { .. } => PttActive::Gpio,
+            PttConfig::Cm108 { .. } => PttActive::Cm108,
         };
         Self {
             configured,
             rigctld_address: rigctld_address.to_string(),
             active,
             release,
+            inverted,
         }
     }
 
     /// The configured method and its target, e.g. `rigctld 127.0.0.1:4532`.
+    /// COP-52: a serial, gpio or cm108 method gains ` inverted` when
+    /// `[radio] ptt_invert` is set, e.g. `gpio 529 inverted`.
     pub fn method(&self) -> String {
+        let method = self.base_method();
+        if self.inverted && self.configured.applies_ptt_invert() {
+            format!("{method} inverted")
+        } else {
+            method
+        }
+    }
+
+    fn base_method(&self) -> String {
         match &self.configured {
             PttConfig::None => "none".to_string(),
             PttConfig::Vox => "vox".to_string(),
@@ -108,10 +129,12 @@ impl PttStartup {
                 format!("serial {port} {line}")
             }
             PttConfig::Gpio { line } => format!("gpio {line}"),
+            PttConfig::Cm108 { device, gpio } => format!("cm108 {device} gpio {gpio}"),
         }
     }
 
-    /// The backend in control: `none`, `vox`, `rigctld`, `serial` or `gpio`.
+    /// The backend in control: `none`, `vox`, `rigctld`, `serial`, `gpio` or
+    /// `cm108`.
     pub fn active(&self) -> &'static str {
         self.active.as_str()
     }
@@ -121,7 +144,7 @@ impl PttStartup {
     pub fn controls_a_line(&self) -> bool {
         matches!(
             self.active,
-            PttActive::Rigctld | PttActive::Serial | PttActive::Gpio
+            PttActive::Rigctld | PttActive::Serial | PttActive::Gpio | PttActive::Cm108
         )
     }
 
@@ -157,7 +180,9 @@ impl PttStartup {
     /// one, `NotUsed` everywhere else.
     pub fn guardian_not_started(&self, enabled_in_config: bool) -> Guardian {
         match self.active {
-            PttActive::Rigctld | PttActive::Gpio if !enabled_in_config => Guardian::Off,
+            PttActive::Rigctld | PttActive::Gpio | PttActive::Cm108 if !enabled_in_config => {
+                Guardian::Off
+            }
             _ => Guardian::NotUsed,
         }
     }
@@ -173,6 +198,7 @@ pub enum Guardian {
     /// Eligible, but `[radio] ptt_guardian = false`.
     Off,
     /// The PTT backend has no guardian (none, VOX, serial, unreachable rigctld).
+    /// rigctld, GPIO and CM108 PTT are guarded.
     NotUsed,
 }
 
@@ -211,6 +237,14 @@ mod tests {
             rigctld_address: "127.0.0.1:4532".into(),
             active,
             release,
+            inverted: false,
+        }
+    }
+
+    fn cm108_config() -> PttConfig {
+        PttConfig::Cm108 {
+            device: "/dev/hidraw0".into(),
+            gpio: 3,
         }
     }
 
@@ -234,12 +268,70 @@ mod tests {
 
     #[test]
     fn new_maps_an_unreachable_rigctld_to_no_active_backend() {
-        let fallback = PttStartup::new(PttConfig::Rigctld, "127.0.0.1:1", false, Ok(()));
+        let fallback = PttStartup::new(PttConfig::Rigctld, "127.0.0.1:1", false, Ok(()), false);
         assert_eq!(fallback.active, PttActive::None);
-        let connected = PttStartup::new(PttConfig::Rigctld, "127.0.0.1:1", true, Ok(()));
+        let connected = PttStartup::new(PttConfig::Rigctld, "127.0.0.1:1", true, Ok(()), false);
         assert_eq!(connected.active, PttActive::Rigctld);
-        let gpio = PttStartup::new(gpio_chardev(), "", false, Ok(()));
+        let gpio = PttStartup::new(gpio_chardev(), "", false, Ok(()), false);
         assert_eq!(gpio.active, PttActive::Gpio);
+        let cm108 = PttStartup::new(cm108_config(), "", false, Ok(()), true);
+        assert_eq!(cm108.active, PttActive::Cm108);
+        assert!(cm108.inverted);
+    }
+
+    #[test]
+    fn cm108_method_names_the_device_and_gpio() {
+        let cm108 = ptt(cm108_config(), PttActive::Cm108, Ok(()));
+        assert_eq!(cm108.method(), "cm108 /dev/hidraw0 gpio 3");
+        assert_eq!(cm108.active(), "cm108");
+        assert!(cm108.controls_a_line());
+        assert_eq!(cm108.state(), "released");
+        assert_eq!(cm108.problem(), None);
+
+        let failed = ptt(
+            cm108_config(),
+            PttActive::Cm108,
+            Err("failed to write CM108 report to /dev/hidraw0".into()),
+        );
+        assert_eq!(
+            failed.state(),
+            "release failed: failed to write CM108 report to /dev/hidraw0"
+        );
+        assert_eq!(
+            failed.problem(),
+            Some(
+                "PTT release at startup failed: failed to write CM108 report to /dev/hidraw0"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn inverted_line_methods_say_so() {
+        let inverted = |configured: PttConfig, active: PttActive| PttStartup {
+            inverted: true,
+            ..ptt(configured, active, Ok(()))
+        };
+        assert_eq!(
+            inverted(gpio_chardev(), PttActive::Gpio).method(),
+            "gpio pinctrl-bcm2711:17 inverted"
+        );
+        let serial = PttConfig::Serial {
+            port: "/dev/ttyUSB0".into(),
+            line: PttSerialLine::Rts,
+        };
+        assert_eq!(
+            inverted(serial, PttActive::Serial).method(),
+            "serial /dev/ttyUSB0 rts inverted"
+        );
+        assert_eq!(
+            inverted(cm108_config(), PttActive::Cm108).method(),
+            "cm108 /dev/hidraw0 gpio 3 inverted"
+        );
+        assert_eq!(
+            inverted(PttConfig::Rigctld, PttActive::Rigctld).method(),
+            "rigctld 127.0.0.1:4532"
+        );
     }
 
     #[test]
@@ -333,6 +425,14 @@ mod tests {
         assert_eq!(
             ptt(gpio_chardev(), PttActive::Gpio, Ok(())).guardian_not_started(false),
             Guardian::Off
+        );
+        assert_eq!(
+            ptt(cm108_config(), PttActive::Cm108, Ok(())).guardian_not_started(false),
+            Guardian::Off
+        );
+        assert_eq!(
+            ptt(cm108_config(), PttActive::Cm108, Ok(())).guardian_not_started(true),
+            Guardian::NotUsed
         );
         let serial = PttConfig::Serial {
             port: "/dev/ttyUSB0".into(),
