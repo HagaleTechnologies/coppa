@@ -18,7 +18,7 @@ futures-util = { version = "0.3", optional = true }
 # COP-79: parses the request head before routing; already in the graph via tungstenite.
 httparse = { version = "1", optional = true }
 base64 = { version = "0.23", optional = true }
-schemars = { version = "0.8.22", optional = true }
+schemars = { version = "1.2.3", optional = true }
 
 [features]
 default = ["vara-tcp"]
@@ -36,7 +36,7 @@ kiss-tnc = []
 ardop = []
 
 [dev-dependencies]
-jsonschema = { version = "0.18.3", default-features = false }
+jsonschema = { version = "0.49.4", default-features = false }
 
 [lints]
 workspace = true

@@ -1934,7 +1934,7 @@ mod tests {
     fn golden_examples_validate_against_schema() {
         let schema: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(schema_path()).unwrap()).unwrap();
-        let validator = jsonschema::JSONSchema::compile(&schema).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
         for golden in golden_messages() {
             let instance: serde_json::Value = serde_json::from_str(golden).unwrap();
             assert!(validator.is_valid(&instance), "invalid golden: {golden}");
