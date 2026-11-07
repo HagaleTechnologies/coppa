@@ -287,7 +287,14 @@ pub struct SysfsGpio {
 #[cfg(target_os = "linux")]
 impl SysfsGpio {
     /// Export (if not already exported) and configure GPIO pin `pin` for
-    /// output, at its RX level: high when `idle_high` (an inverted, active-low
+    /// output, driven low: the RX level of a non-inverted rig. Same as
+    /// [`SysfsGpio::open_at_rx_level`] with `idle_high = false`.
+    pub fn open(pin: u32) -> Result<Self> {
+        Self::open_at_rx_level(pin, false)
+    }
+
+    /// COP-52: export (if not already exported) and configure GPIO pin `pin`
+    /// for output, at its RX level: high when `idle_high` (an inverted, active-low
     /// rig), low otherwise. Writing a bare `"out"` would drive the line low,
     /// which keys an active-low rig until the first RX write.
     ///
@@ -297,7 +304,7 @@ impl SysfsGpio {
     /// group access to the new pin. The export write itself is not re-tried,
     /// so a process outside the `gpio` group still fails at once. On failure
     /// the pin is left exported.
-    pub fn open(pin: u32, idle_high: bool) -> Result<Self> {
+    pub fn open_at_rx_level(pin: u32, idle_high: bool) -> Result<Self> {
         use anyhow::Context;
 
         let gpio_dir = std::path::PathBuf::from(format!("/sys/class/gpio/gpio{pin}"));
@@ -544,7 +551,7 @@ impl GpioPtt<SysfsGpio> {
     /// Export and open a real GPIO pin via sysfs. The pin starts as an output
     /// at its RX level, which is high exactly when `inverted`.
     pub fn open(pin: u32, inverted: bool) -> Result<Self> {
-        let writer = SysfsGpio::open(pin, inverted)?;
+        let writer = SysfsGpio::open_at_rx_level(pin, inverted)?;
         Ok(Self::with_writer(pin, inverted, writer))
     }
 }
