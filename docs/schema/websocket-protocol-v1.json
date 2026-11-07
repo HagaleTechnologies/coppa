@@ -1,31 +1,27 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ProtocolMessage",
   "anyOf": [
     {
-      "$ref": "#/definitions/WsRequest"
+      "$ref": "#/$defs/WsRequest"
     },
     {
-      "$ref": "#/definitions/WsServerMessage"
+      "$ref": "#/$defs/WsServerMessage"
     }
   ],
-  "definitions": {
+  "$defs": {
     "AudioLevelDirection": {
       "description": "Which audio stream an [`WsServerMessage::AudioLevel`] reading measures.",
       "oneOf": [
         {
           "description": "Received audio (sound-card input).",
           "type": "string",
-          "enum": [
-            "rx"
-          ]
+          "const": "rx"
         },
         {
           "description": "Transmitted audio (as Coppa queues it for the sound-card output).",
           "type": "string",
-          "enum": [
-            "tx"
-          ]
+          "const": "tx"
         }
       ]
     },
@@ -35,23 +31,17 @@
         {
           "description": "Level is usable.",
           "type": "string",
-          "enum": [
-            "ok"
-          ]
+          "const": "ok"
         },
         {
           "description": "Samples are reaching full scale.",
           "type": "string",
-          "enum": [
-            "clipping"
-          ]
+          "const": "clipping"
         },
         {
           "description": "RX input is too quiet (RX only).",
           "type": "string",
-          "enum": [
-            "underdrive"
-          ]
+          "const": "underdrive"
         }
       ]
     },
@@ -71,16 +61,12 @@
     },
     "HeardStation": {
       "type": "object",
-      "required": [
-        "call",
-        "last_heard_ms"
-      ],
       "properties": {
         "call": {
           "type": "string"
         },
         "grid": {
-          "description": "COP-120: Maidenhead grid decoded from a received station-ID beacon. Absent (`None`) for session peers, which carry no grid, and for beacons whose payload failed to decode.",
+          "description": "COP-120: Maidenhead grid decoded from a received station-ID beacon.\nAbsent (`None`) for session peers, which carry no grid, and for\nbeacons whose payload failed to decode.",
           "type": [
             "string",
             "null"
@@ -89,7 +75,7 @@
         "last_heard_ms": {
           "type": "integer",
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0
         },
         "level": {
           "type": [
@@ -97,7 +83,8 @@
             "null"
           ],
           "format": "uint8",
-          "minimum": 0.0
+          "maximum": 255,
+          "minimum": 0
         },
         "snr_db": {
           "type": [
@@ -106,19 +93,15 @@
           ],
           "format": "int32"
         }
-      }
+      },
+      "required": [
+        "call",
+        "last_heard_ms"
+      ]
     },
     "LinkStats": {
       "description": "COP-83: the session ARQ link's state, for `status.link`.",
       "type": "object",
-      "required": [
-        "fade_hold",
-        "fade_protection",
-        "in_flight",
-        "max_retries",
-        "retries",
-        "rto_ms"
-      ],
       "properties": {
         "fade_hold": {
           "description": "COP-68 fade hold: retransmitting at a lower level.",
@@ -132,27 +115,38 @@
           "description": "Segments sent and not yet acknowledged.",
           "type": "integer",
           "format": "uint8",
-          "minimum": 0.0
+          "maximum": 255,
+          "minimum": 0
         },
         "max_retries": {
           "description": "Retransmissions allowed before the link gives up.",
           "type": "integer",
           "format": "uint8",
-          "minimum": 0.0
+          "maximum": 255,
+          "minimum": 0
         },
         "retries": {
           "description": "Transmissions of the oldest in-flight segment minus one.",
           "type": "integer",
           "format": "uint8",
-          "minimum": 0.0
+          "maximum": 255,
+          "minimum": 0
         },
         "rto_ms": {
           "description": "Current retransmission timeout, ms.",
           "type": "integer",
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0
         }
-      }
+      },
+      "required": [
+        "in_flight",
+        "retries",
+        "max_retries",
+        "rto_ms",
+        "fade_hold",
+        "fade_protection"
+      ]
     },
     "SessionState": {
       "type": "string",
@@ -167,69 +161,65 @@
         {
           "description": "The rate loop chooses.",
           "type": "string",
-          "enum": [
-            "auto"
-          ]
+          "const": "auto"
         },
         {
           "description": "Pinned by `set_speed_level`.",
           "type": "string",
-          "enum": [
-            "manual"
-          ]
+          "const": "manual"
         }
       ]
     },
     "SpeedLevelSetting": {
-      "description": "COP-83: the `level` of a `set_speed_level` request: a speed level, or the string `\"auto\"`.",
+      "description": "COP-83: the `level` of a `set_speed_level` request: a speed level, or the\nstring `\"auto\"`.",
       "anyOf": [
         {
           "description": "Return the TX level to the rate loop.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/AutoKeyword"
-            }
-          ]
+          "$ref": "#/$defs/AutoKeyword"
         },
         {
           "description": "Pin the TX level.",
           "type": "integer",
           "format": "uint8",
-          "minimum": 0.0
+          "maximum": 255,
+          "minimum": 0
         }
       ]
     },
     "WsRequest": {
       "description": "Optional correlation id applies to every request without changing its shape.",
       "type": "object",
+      "properties": {
+        "id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
       "oneOf": [
         {
           "description": "Set station callsign.",
           "type": "object",
-          "required": [
-            "callsign",
-            "type"
-          ],
           "properties": {
             "callsign": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "mycall"
-              ]
+              "const": "mycall"
             }
-          }
+          },
+          "required": [
+            "type",
+            "callsign"
+          ]
         },
         {
           "description": "Connect to remote station.",
           "type": "object",
-          "required": [
-            "destination",
-            "source",
-            "type"
-          ],
           "properties": {
             "destination": {
               "type": "string"
@@ -239,131 +229,115 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "connect"
-              ]
+              "const": "connect"
             }
-          }
+          },
+          "required": [
+            "type",
+            "source",
+            "destination"
+          ]
         },
         {
           "description": "Disconnect.",
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "disconnect"
-              ]
+              "const": "disconnect"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
           "description": "Send data.",
           "type": "object",
-          "required": [
-            "data",
-            "type"
-          ],
           "properties": {
             "data": {
               "type": "string"
             },
             "encoding": {
-              "default": "utf8",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/DataEncoding"
-                }
-              ]
+              "$ref": "#/$defs/DataEncoding",
+              "default": "utf8"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "send"
-              ]
+              "const": "send"
             }
-          }
+          },
+          "required": [
+            "type",
+            "data"
+          ]
         },
         {
           "description": "Get status.",
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "type": {
               "type": "string",
-              "enum": [
-                "status"
-              ]
+              "const": "status"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
-          "description": "Opt in/out of periodic `spectrum` broadcast messages (Phase 4 Task 4). See [`WsServerMessage::Spectrum`]'s doc for why this is opt-in rather than broadcast to every client unconditionally.",
+          "description": "Opt in/out of periodic `spectrum` broadcast messages (Phase 4 Task 4).\nSee [`WsServerMessage::Spectrum`]'s doc for why this is opt-in rather\nthan broadcast to every client unconditionally.",
           "type": "object",
-          "required": [
-            "enabled",
-            "type"
-          ],
           "properties": {
             "enabled": {
               "type": "boolean"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "spectrum"
-              ]
+              "const": "spectrum"
             }
-          }
+          },
+          "required": [
+            "type",
+            "enabled"
+          ]
         },
         {
-          "description": "Opt in/out of periodic `audio_level` broadcast messages (COP-65). See [`WsServerMessage::AudioLevel`].",
+          "description": "Opt in/out of periodic `audio_level` broadcast messages (COP-65). See\n[`WsServerMessage::AudioLevel`].",
           "type": "object",
-          "required": [
-            "enabled",
-            "type"
-          ],
           "properties": {
             "enabled": {
               "type": "boolean"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "audio_level"
-              ]
+              "const": "audio_level"
             }
-          }
+          },
+          "required": [
+            "type",
+            "enabled"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "enabled",
-            "type"
-          ],
           "properties": {
             "enabled": {
               "type": "boolean"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "log"
-              ]
+              "const": "log"
             }
-          }
+          },
+          "required": [
+            "type",
+            "enabled"
+          ]
         },
         {
-          "description": "COP-83: key the TX-level calibration tone. `seconds` defaults to 10 and must be greater than 0 and at most `status.max_tune_s`. Without `single_hz` the tone is the 700 + 1900 Hz two-tone; with it, a single tone at that frequency (300-3000 Hz). Needs a callsign in force.",
+          "description": "COP-83: key the TX-level calibration tone. `seconds` defaults to 10\nand must be greater than 0 and at most `status.max_tune_s`. Without\n`single_hz` the tone is the 700 + 1900 Hz two-tone; with it, a single\ntone at that frequency (300-3000 Hz). Needs a callsign in force.",
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "seconds": {
               "type": [
@@ -381,42 +355,31 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "tune"
-              ]
+              "const": "tune"
             }
-          }
+          },
+          "required": [
+            "type"
+          ]
         },
         {
-          "description": "COP-83: pin the TX speed level every new frame uses, or return it to the rate loop with `\"auto\"`. The level must be one of `status.speed_levels`.",
+          "description": "COP-83: pin the TX speed level every new frame uses, or return it to\nthe rate loop with `\"auto\"`. The level must be one of\n`status.speed_levels`.",
           "type": "object",
-          "required": [
-            "level",
-            "type"
-          ],
           "properties": {
             "level": {
-              "$ref": "#/definitions/SpeedLevelSetting"
+              "$ref": "#/$defs/SpeedLevelSetting"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "set_speed_level"
-              ]
+              "const": "set_speed_level"
             }
-          }
+          },
+          "required": [
+            "type",
+            "level"
+          ]
         }
-      ],
-      "properties": {
-        "id": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0.0
-        }
-      }
+      ]
     },
     "WsServerMessage": {
       "description": "JSON message sent to a WebSocket client.",
@@ -424,19 +387,15 @@
         {
           "description": "Connection status update.",
           "type": "object",
-          "required": [
-            "connected",
-            "type"
-          ],
           "properties": {
             "buffer": {
-              "description": "COP-83: host bytes not yet sent or acknowledged (the VARA `BUFFER` count).",
+              "description": "COP-83: host bytes not yet sent or acknowledged (the VARA `BUFFER`\ncount).",
               "type": [
                 "integer",
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "busy": {
               "description": "COP-83: last `busy` push value (RX-band occupancy).",
@@ -446,7 +405,7 @@
               ]
             },
             "cfo": {
-              "description": "Carrier frequency offset (Hz) estimated on the last decoded frame (decision 8).",
+              "description": "Carrier frequency offset (Hz) estimated on the last decoded frame\n(decision 8).",
               "type": [
                 "number",
                 "null"
@@ -457,11 +416,11 @@
               "type": "boolean"
             },
             "cp_desync_episodes": {
-              "description": "COP-2: count of distinct CP-mode desync episodes the daemon has observed since start (`EventLoop::check_cp_desync`). A non-zero value means this station has, at least once, been transmitting a waveform its peer could not decode -- see that method's doc for the two conditions. `0` is the healthy value and the only one an operator should ever see.\n\nAlways serialized (not `skip_serializing_if`), unlike `short_cp_ok`: an absent field is indistinguishable from \"no episodes\" to a client, and the whole point of surfacing this is that the daemon used to report a healthy station through every operator-facing channel while the link was dead.\n\n`#[serde(default)]` on the READ side only: a client built against this version still always SERIALIZES the field (no `skip_serializing_if` above), but deserializing an older daemon's reply (or a persisted pre-COP-2 status message) that lacks it must not fail outright -- default to `0`, the healthy value, rather than erroring the whole message over one new telemetry field.",
-              "default": 0,
+              "description": "COP-2: count of distinct CP-mode desync episodes the daemon has observed\nsince start (`EventLoop::check_cp_desync`). A non-zero value means this\nstation has, at least once, been transmitting a waveform its peer could\nnot decode -- see that method's doc for the two conditions. `0` is the\nhealthy value and the only one an operator should ever see.\n\nAlways serialized (not `skip_serializing_if`), unlike `short_cp_ok`: an\nabsent field is indistinguishable from \"no episodes\" to a client, and the\nwhole point of surfacing this is that the daemon used to report a healthy\nstation through every operator-facing channel while the link was dead.\n\n`#[serde(default)]` on the READ side only: a client built against this\nversion still always SERIALIZES the field (no `skip_serializing_if`\nabove), but deserializing an older daemon's reply (or a persisted\npre-COP-2 status message) that lacks it must not fail outright --\ndefault to `0`, the healthy value, rather than erroring the whole\nmessage over one new telemetry field.",
               "type": "integer",
               "format": "uint32",
-              "minimum": 0.0
+              "default": 0,
+              "minimum": 0
             },
             "heard": {
               "description": "COP-83: the same snapshot the `heard` push carries.",
@@ -470,7 +429,7 @@
                 "null"
               ],
               "items": {
-                "$ref": "#/definitions/HeardStation"
+                "$ref": "#/$defs/HeardStation"
               }
             },
             "id": {
@@ -479,7 +438,7 @@
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "level": {
               "description": "Current speed level (1-9) of the last decoded frame (decision 8).",
@@ -488,13 +447,14 @@
                 "null"
               ],
               "format": "uint8",
-              "minimum": 0.0
+              "maximum": 255,
+              "minimum": 0
             },
             "link": {
               "description": "COP-83: the session ARQ link; absent without one.",
               "anyOf": [
                 {
-                  "$ref": "#/definitions/LinkStats"
+                  "$ref": "#/$defs/LinkStats"
                 },
                 {
                   "type": "null"
@@ -502,22 +462,22 @@
               ]
             },
             "loop_age_ms": {
-              "description": "COP-83: milliseconds since the daemon's event loop last completed its 500 ms housekeeping tick or a busy-channel wait step, computed when the reply is built.",
+              "description": "COP-83: milliseconds since the daemon's event loop last completed\nits 500 ms housekeeping tick or a busy-channel wait step, computed\nwhen the reply is built.",
               "type": [
                 "integer",
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "max_tune_s": {
-              "description": "COP-83: longest TUNE accepted, in seconds: the smaller of `max_tx_s` and 120.",
+              "description": "COP-83: longest TUNE accepted, in seconds: the smaller of\n`max_tx_s` and 120.",
               "type": [
                 "integer",
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "max_tx_s": {
               "description": "COP-83: `[radio] max_tx_duration_s`.",
@@ -526,7 +486,7 @@
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "mycall": {
               "description": "COP-83: callsign in force; absent when none.",
@@ -543,13 +503,13 @@
               ]
             },
             "ptt_keyed_ms": {
-              "description": "COP-83: milliseconds PTT has been keyed, computed when the reply is built. Present only while `ptt` is true.",
+              "description": "COP-83: milliseconds PTT has been keyed, computed when the reply\nis built. Present only while `ptt` is true.",
               "type": [
                 "integer",
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "remote_call": {
               "type": [
@@ -558,7 +518,7 @@
               ]
             },
             "short_cp_ok": {
-              "description": "`coppa_ml::CpGate`'s live short-CP recommendation: `Some(true)` = `CpRecommendation::ShortCp`, `Some(false)` = `CpRecommendation:: LongCp`, `None` = `[engine] cp_gate_enabled` is off or no frame has decoded yet. Measurement/telemetry only -- does not mean the daemon has switched (or will switch) CP profile. See `BENCHMARKS.md`'s \"Short-CP coherence-time lever\" section (2026-07-25 `CpGate` daemon wiring entry).",
+              "description": "`coppa_ml::CpGate`'s live short-CP recommendation: `Some(true)` =\n`CpRecommendation::ShortCp`, `Some(false)` = `CpRecommendation::\nLongCp`, `None` = `[engine] cp_gate_enabled` is off or no frame has\ndecoded yet. Measurement/telemetry only -- does not mean the daemon\nhas switched (or will switch) CP profile. See `BENCHMARKS.md`'s\n\"Short-CP coherence-time lever\" section (2026-07-25 `CpGate` daemon\nwiring entry).",
               "type": [
                 "boolean",
                 "null"
@@ -572,19 +532,20 @@
               "format": "int32"
             },
             "speed_level": {
-              "description": "COP-83: speed level our next frame is encoded at. `level` is the peer's, as decoded.",
+              "description": "COP-83: speed level our next frame is encoded at. `level` is the\npeer's, as decoded.",
               "type": [
                 "integer",
                 "null"
               ],
               "format": "uint8",
-              "minimum": 0.0
+              "maximum": 255,
+              "minimum": 0
             },
             "speed_level_mode": {
-              "description": "COP-83: `auto` (the rate loop chooses) or `manual` (pinned by `set_speed_level`).",
+              "description": "COP-83: `auto` (the rate loop chooses) or `manual` (pinned by\n`set_speed_level`).",
               "anyOf": [
                 {
-                  "$ref": "#/definitions/SpeedLevelMode"
+                  "$ref": "#/$defs/SpeedLevelMode"
                 },
                 {
                   "type": "null"
@@ -600,58 +561,51 @@
               "items": {
                 "type": "integer",
                 "format": "uint8",
-                "minimum": 0.0
+                "maximum": 255,
+                "minimum": 0
               }
             },
             "type": {
               "type": "string",
-              "enum": [
-                "status"
-              ]
+              "const": "status"
             },
             "waiting_for_clear_channel": {
-              "description": "COP-83: true while a transmission is held by `[station_id] busy_hold_ms` for a clear channel.",
+              "description": "COP-83: true while a transmission is held by\n`[station_id] busy_hold_ms` for a clear channel.",
               "type": [
                 "boolean",
                 "null"
               ]
             }
-          }
+          },
+          "required": [
+            "type",
+            "connected"
+          ]
         },
         {
           "description": "Data received from remote station.",
           "type": "object",
-          "required": [
-            "data",
-            "type"
-          ],
           "properties": {
             "data": {
               "type": "string"
             },
             "encoding": {
-              "default": "utf8",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/DataEncoding"
-                }
-              ]
+              "$ref": "#/$defs/DataEncoding",
+              "default": "utf8"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "data"
-              ]
+              "const": "data"
             }
-          }
+          },
+          "required": [
+            "type",
+            "data"
+          ]
         },
         {
           "description": "Error message.",
           "type": "object",
-          "required": [
-            "message",
-            "type"
-          ],
           "properties": {
             "id": {
               "type": [
@@ -659,69 +613,63 @@
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "message": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "error"
-              ]
+              "const": "error"
             }
-          }
+          },
+          "required": [
+            "type",
+            "message"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "server",
-            "type",
-            "version"
-          ],
           "properties": {
             "server": {
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "hello"
-              ]
+              "const": "hello"
             },
             "version": {
               "type": "integer",
               "format": "uint32",
-              "minimum": 0.0
+              "minimum": 0
             }
-          }
+          },
+          "required": [
+            "type",
+            "version",
+            "server"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "id",
-            "type"
-          ],
           "properties": {
             "id": {
               "type": "integer",
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "type": {
               "type": "string",
-              "enum": [
-                "ack"
-              ]
+              "const": "ack"
             }
-          }
+          },
+          "required": [
+            "type",
+            "id"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "state",
-            "type"
-          ],
           "properties": {
             "remote_call": {
               "type": [
@@ -730,58 +678,52 @@
               ]
             },
             "state": {
-              "$ref": "#/definitions/SessionState"
+              "$ref": "#/$defs/SessionState"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "session"
-              ]
+              "const": "session"
             }
-          }
+          },
+          "required": [
+            "type",
+            "state"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "state",
-            "type"
-          ],
           "properties": {
             "state": {
               "type": "boolean"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "ptt"
-              ]
+              "const": "ptt"
             }
-          }
+          },
+          "required": [
+            "type",
+            "state"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "state",
-            "type"
-          ],
           "properties": {
             "state": {
               "type": "boolean"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "busy"
-              ]
+              "const": "busy"
             }
-          }
+          },
+          "required": [
+            "type",
+            "state"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "db",
-            "type"
-          ],
           "properties": {
             "db": {
               "type": "integer",
@@ -789,107 +731,97 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "snr"
-              ]
+              "const": "snr"
             }
-          }
+          },
+          "required": [
+            "type",
+            "db"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "level",
-            "type"
-          ],
           "properties": {
             "level": {
               "type": "integer",
               "format": "uint8",
-              "minimum": 0.0
+              "maximum": 255,
+              "minimum": 0
             },
             "type": {
               "type": "string",
-              "enum": [
-                "level"
-              ]
+              "const": "level"
             }
-          }
+          },
+          "required": [
+            "type",
+            "level"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "stations",
-            "type"
-          ],
           "properties": {
             "stations": {
               "type": "array",
               "items": {
-                "$ref": "#/definitions/HeardStation"
+                "$ref": "#/$defs/HeardStation"
               }
             },
             "type": {
               "type": "string",
-              "enum": [
-                "heard"
-              ]
+              "const": "heard"
             }
-          }
+          },
+          "required": [
+            "type",
+            "stations"
+          ]
         },
         {
-          "description": "COP-83: host bytes not yet sent or acknowledged, sent when the count changes (the same moment VARA `BUFFER` goes out). Reliable.",
+          "description": "COP-83: host bytes not yet sent or acknowledged, sent when the count\nchanges (the same moment VARA `BUFFER` goes out). Reliable.",
           "type": "object",
-          "required": [
-            "bytes",
-            "type"
-          ],
           "properties": {
             "bytes": {
               "type": "integer",
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "type": {
               "type": "string",
-              "enum": [
-                "buffer"
-              ]
+              "const": "buffer"
             }
-          }
+          },
+          "required": [
+            "type",
+            "bytes"
+          ]
         },
         {
-          "description": "COP-83: the TX speed level our next frame uses and who chose it, sent whenever either changes. Reliable.",
+          "description": "COP-83: the TX speed level our next frame uses and who chose it, sent\nwhenever either changes. Reliable.",
           "type": "object",
-          "required": [
-            "level",
-            "mode",
-            "type"
-          ],
           "properties": {
             "level": {
               "type": "integer",
               "format": "uint8",
-              "minimum": 0.0
+              "maximum": 255,
+              "minimum": 0
             },
             "mode": {
-              "$ref": "#/definitions/SpeedLevelMode"
+              "$ref": "#/$defs/SpeedLevelMode"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "speed_level"
-              ]
+              "const": "speed_level"
             }
-          }
+          },
+          "required": [
+            "type",
+            "level",
+            "mode"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "level",
-            "message",
-            "timestamp_ms",
-            "type"
-          ],
           "properties": {
             "level": {
               "type": "string"
@@ -900,55 +832,50 @@
             "timestamp_ms": {
               "type": "integer",
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "type": {
               "type": "string",
-              "enum": [
-                "log"
-              ]
+              "const": "log"
             }
-          }
+          },
+          "required": [
+            "type",
+            "level",
+            "message",
+            "timestamp_ms"
+          ]
         },
         {
           "type": "object",
-          "required": [
-            "count",
-            "timestamp_ms",
-            "type"
-          ],
           "properties": {
             "count": {
               "type": "integer",
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "timestamp_ms": {
               "type": "integer",
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "type": {
               "type": "string",
-              "enum": [
-                "decode_fail"
-              ]
+              "const": "decode_fail"
             }
-          }
+          },
+          "required": [
+            "type",
+            "count",
+            "timestamp_ms"
+          ]
         },
         {
-          "description": "Opt-in 128-bin spectrum of the engine's current occupied band. Bins span [freq_low_hz, freq_high_hz), lowest frequency first.",
+          "description": "Opt-in 128-bin spectrum of the engine's current occupied band.\nBins span [freq_low_hz, freq_high_hz), lowest frequency first.",
           "type": "object",
-          "required": [
-            "bins",
-            "freq_high_hz",
-            "freq_low_hz",
-            "timestamp_ms",
-            "type"
-          ],
           "properties": {
             "bins": {
-              "description": "128 log-magnitude (dB) bins spanning the reported occupied band. A wider waveform uses wider bins at the same bin count.",
+              "description": "128 log-magnitude (dB) bins spanning the reported occupied band.\nA wider waveform uses wider bins at the same bin count.",
               "type": "array",
               "items": {
                 "type": "number",
@@ -967,80 +894,75 @@
               "description": "Wall-clock time this spectrum was computed (Unix epoch, ms).",
               "type": "integer",
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "type": {
               "type": "string",
-              "enum": [
-                "spectrum"
-              ]
+              "const": "spectrum"
             }
-          }
+          },
+          "required": [
+            "type",
+            "freq_low_hz",
+            "freq_high_hz",
+            "bins",
+            "timestamp_ms"
+          ]
         },
         {
-          "description": "RX/TX audio level (COP-65): `rx` once per 100 ms of received audio (not while transmitting), `tx` once per transmission. Opt-in per client (`WsClientMessage::AudioLevel { enabled: true }`), like `spectrum`, because it is periodic. Named `audio_level`, not `level`, because `status`'s `level` is the speed level.\n\nFull scale is sample value 1.0 for every dBFS field. The daemon computes these in `crates/coppa-daemon/src/level_meter.rs`.",
+          "description": "RX/TX audio level (COP-65): `rx` once per 100 ms of received audio (not\nwhile transmitting), `tx` once per transmission. Opt-in per client\n(`WsClientMessage::AudioLevel { enabled: true }`), like `spectrum`,\nbecause it is periodic. Named `audio_level`, not `level`, because\n`status`'s `level` is the speed level.\n\nFull scale is sample value 1.0 for every dBFS field. The daemon computes\nthese in `crates/coppa-daemon/src/level_meter.rs`.",
           "type": "object",
-          "required": [
-            "clip_fraction",
-            "direction",
-            "duration_ms",
-            "peak_dbfs",
-            "rms_dbfs",
-            "state",
-            "timestamp_ms",
-            "type"
-          ],
           "properties": {
             "clip_fraction": {
-              "description": "Fraction (0.0-1.0) of samples in the span with `|s| >= 0.99`. Non-finite samples count as clipped.",
+              "description": "Fraction (0.0-1.0) of samples in the span with `|s| >= 0.99`.\nNon-finite samples count as clipped.",
               "type": "number",
               "format": "float"
             },
             "direction": {
-              "description": "`rx`: one 100 ms window of raw received audio. `tx`: one whole transmission as queued for the sound card, including any prepended station-ID frame.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/AudioLevelDirection"
-                }
-              ]
+              "description": "`rx`: one 100 ms window of raw received audio. `tx`: one whole\ntransmission as queued for the sound card, including any prepended\nstation-ID frame.",
+              "$ref": "#/$defs/AudioLevelDirection"
             },
             "duration_ms": {
-              "description": "Audio span this reading covers: 100 for `rx`, the transmission's length for `tx`.",
+              "description": "Audio span this reading covers: 100 for `rx`, the transmission's\nlength for `tx`.",
               "type": "integer",
               "format": "uint32",
-              "minimum": 0.0
+              "minimum": 0
             },
             "peak_dbfs": {
-              "description": "`20·log10(max |s|)` over the span, floored at -120.0, rounded to 0.1 dB.",
+              "description": "`20·log10(max |s|)` over the span, floored at -120.0, rounded to\n0.1 dB.",
               "type": "number",
               "format": "float"
             },
             "rms_dbfs": {
-              "description": "`20·log10(sqrt(mean(s²)))` over the span, floored at -120.0, rounded to 0.1 dB. A full-scale sine reads -3.0 (no AES17 +3 dB correction).",
+              "description": "`20·log10(sqrt(mean(s²)))` over the span, floored at -120.0, rounded\nto 0.1 dB. A full-scale sine reads -3.0 (no AES17 +3 dB correction).",
               "type": "number",
               "format": "float"
             },
             "state": {
-              "description": "`rx`: the daemon's hysteresis state after this window. `tx`: `clipping` if any sample of the transmission is clipped, else `ok` (never `underdrive`).",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/AudioLevelState"
-                }
-              ]
+              "description": "`rx`: the daemon's hysteresis state after this window. `tx`:\n`clipping` if any sample of the transmission is clipped, else `ok`\n(never `underdrive`).",
+              "$ref": "#/$defs/AudioLevelState"
             },
             "timestamp_ms": {
               "description": "Wall-clock time this message was produced (Unix epoch, ms).",
               "type": "integer",
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "type": {
               "type": "string",
-              "enum": [
-                "audio_level"
-              ]
+              "const": "audio_level"
             }
-          }
+          },
+          "required": [
+            "type",
+            "direction",
+            "peak_dbfs",
+            "rms_dbfs",
+            "clip_fraction",
+            "state",
+            "duration_ms",
+            "timestamp_ms"
+          ]
         }
       ]
     }
