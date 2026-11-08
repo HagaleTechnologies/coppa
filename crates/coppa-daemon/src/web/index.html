@@ -62,6 +62,11 @@
   #log { height: 14rem; overflow-y: auto; font-size: 0.85rem; }
   .row { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; margin: 0.25rem 0; }
   #send-data { flex: 1; min-width: 12rem; }
+  /* COP-122: 44 px touch targets; [hidden] must win over .row's display: flex. */
+  [hidden] { display: none !important; }
+  button, input { min-height: 44px; }
+  button { min-width: 44px; padding: 0.5rem 0.9rem; }
+  .buttons { gap: 0.5rem; }
 </style>
 </head>
 <body>

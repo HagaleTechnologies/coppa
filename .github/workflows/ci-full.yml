@@ -120,6 +120,11 @@ jobs:
   test-full:
     name: Full test suite
     runs-on: ubuntu-latest
+    # COP-122: crates/coppa-daemon/tests/dashboard_touch.rs skips when no
+    # Chrome or Chromium is found; here a missing browser fails it instead.
+    # The first step below runs it (websocket feature on).
+    env:
+      COPPA_REQUIRE_BROWSER: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

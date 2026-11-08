@@ -918,6 +918,14 @@ TUNE and tells transmitting from a hang without a terminal.
    the page needs no token. The page keeps the token in memory only, so a
    reload asks for it again; an automatic reconnect reuses it.
 
+**From a phone or tablet** (COP-122): set up mDNS as in
+[Finding coppad on the network](#finding-coppad-on-the-network-mdns), open
+`http://coppad.local:8400/`, and add that exact origin,
+`"http://coppad.local:8400"`, to `websocket_allowed_origins`. Below 800 px
+wide the page is one column, and every button and input is at least 44 px
+in both directions. This is tested at 390 px in headless Chrome
+(`crates/coppa-daemon/tests/dashboard_touch.rs`), not on a physical phone.
+
 The page makes no external requests. Each card:
 
 - **Header**: `Connection:`, `Daemon:`, `MYCALL`, the PTT lamp and the

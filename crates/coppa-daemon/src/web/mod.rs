@@ -234,6 +234,22 @@ mod tests {
         );
     }
 
+    /// COP-122: every control is a 44 px touch target, and `hidden` hides
+    /// the token form even though `.row` sets `display: flex`.
+    /// `tests/dashboard_touch.rs` measures the rendered page in a real
+    /// browser; this guard runs in `ci.yml`'s `--lib` job, where no browser
+    /// does, so a deleted rule still fails CI.
+    #[test]
+    fn page_keeps_touch_sized_controls() {
+        for rule in [
+            "[hidden] { display: none !important; }",
+            "min-height: 44px",
+            "min-width: 44px",
+        ] {
+            assert!(INDEX_HTML.contains(rule), "page stylesheet lacks {rule:?}");
+        }
+    }
+
     #[test]
     fn page_shows_the_reviewed_wording() {
         for text in WORDING {
