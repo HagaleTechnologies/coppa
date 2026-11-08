@@ -33,16 +33,19 @@
 //!   - `--profile VHF_FAST` => speed_level 9 => vhf_wide
 //!
 //! `golden_manifest_covers_the_full_grid` (in the `coppa-protocol` test)
-//! already guarantees the manifest's exact 5-level x 4-channel shape, so
+//! already guarantees the manifest's exact shape (every speed level,
+//! multi-codeword frames and retransmissions, COP-129), so
 //! `test_rx_golden_vectors_cover_every_vector_exactly_once` below is a
 //! self-check that this test's partition doesn't silently drop a vector, not
 //! a re-statement of that shape guarantee.
 //!
 //! ## Every vector runs
 //!
-//! All 20 vectors run through `coppa rx` since COP-126, which gave the
+//! Every manifest vector runs through `coppa rx` since COP-126, which gave the
 //! streaming receiver's sync detector its own decimated band-pass
-//! (`docs/adr/011-cop126-decimated-sync-prefilter.md`).
+//! (`docs/adr/011-cop126-decimated-sync-prefilter.md`). That includes the
+//! COP-129 retransmission vectors, whose WAV holds two frames of one payload:
+//! `coppa rx` must combine them and print exactly one line, the payload.
 
 mod common;
 
@@ -132,9 +135,11 @@ fn golden_vectors_rx_cli_decodes_and_prints_payloads() {
         };
 
         let stdout = run_rx(&wav_path, profile);
-        if !stdout.starts_with(&v.payload_hex) {
+        // Exactly one line, the payload: no missed frame, no duplicate and no
+        // trailing bytes.
+        if stdout != v.payload_hex {
             failures.push(format!(
-                "{}: coppa rx stdout does not start with expected payload\n  expected: {}\n  got:      {}",
+                "{}: coppa rx stdout is not exactly the expected payload\n  expected: {}\n  got:      {}",
                 v.id, v.payload_hex, stdout
             ));
         }
@@ -149,22 +154,20 @@ fn golden_vectors_rx_cli_decodes_and_prints_payloads() {
     );
 }
 
-/// Self-check: of the manifest's 20 vectors, all 20 are `expected_decode_ok`
-/// (as of 2026-07-26 -- see `golden_vectors_gen.rs`'s module doc: the
-/// previous `L9_poor25` "structurally undecodable" classification was a
-/// stale-IR-HARQ-accumulator bench bug, fixed, and that vector now decodes
-/// like every other), and all 20 are what
+/// Self-check: every manifest vector is `expected_decode_ok` (as of
+/// 2026-07-26 -- see `golden_vectors_gen.rs`'s module doc: the previous
+/// `L8_poor25` (`L9_poor25` before the COP-24 renumber) "structurally
+/// undecodable" classification was a stale-IR-HARQ-accumulator bench bug,
+/// fixed, and that vector now decodes like every other), and every one is what
 /// `golden_vectors_rx_cli_decodes_and_prints_payloads` above exercises, with
 /// no exclusion (COP-126 removed the last one) -- catches the test silently
-/// dropping a vector, or a regenerated manifest changing which vectors exist.
+/// dropping a vector. The total is not pinned here:
+/// `golden_manifest_covers_the_full_grid` in `coppa-protocol` owns the shape.
 #[test]
 fn test_rx_golden_vectors_cover_every_vector_exactly_once() {
     let manifest = read_manifest();
-    assert_eq!(
-        manifest.vectors.len(),
-        20,
-        "expected 20 total golden vectors"
-    );
+    let total = manifest.vectors.len();
+    assert!(total > 0, "golden manifest has no vectors");
 
     let expected_ok: Vec<&VectorEntry> = manifest
         .vectors
@@ -173,16 +176,16 @@ fn test_rx_golden_vectors_cover_every_vector_exactly_once() {
         .collect();
     assert_eq!(
         expected_ok.len(),
-        20,
-        "expected 20 known-good golden vectors"
+        total,
+        "expected every golden vector to be known-good"
     );
 
     // `golden_vectors_rx_cli_decodes_and_prints_payloads` skips only vectors
     // that are not `expected_decode_ok`, so every one of these is covered.
     let covered = expected_ok.len();
     assert_eq!(
-        covered, 20,
-        "expected all 20 vectors covered by the rx CLI test, with no exclusion"
+        covered, total,
+        "expected all {total} vectors covered by the rx CLI test, with no exclusion"
     );
 
     for v in &expected_ok {
