@@ -52,6 +52,95 @@
         "auto"
       ]
     },
+    "ChatDirection": {
+      "description": "COP-121: which way a chat message went.",
+      "oneOf": [
+        {
+          "description": "Sent by this station.",
+          "type": "string",
+          "const": "out"
+        },
+        {
+          "description": "Received from the session peer.",
+          "type": "string",
+          "const": "in"
+        }
+      ]
+    },
+    "ChatEntry": {
+      "description": "COP-121: one chat message, as the `chat` push, the `chat_history` reply\nand [`ChatLog`] carry it.",
+      "type": "object",
+      "properties": {
+        "direction": {
+          "description": "`out` (sent) or `in` (received).",
+          "$ref": "#/$defs/ChatDirection"
+        },
+        "message_id": {
+          "description": "This station's id for the message; ids are per station and start at 1\neach time the daemon starts.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "reason": {
+          "description": "Why the message failed; absent unless `state` is `failed`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remote_call": {
+          "description": "The session peer's callsign.",
+          "type": "string"
+        },
+        "state": {
+          "description": "Current state.",
+          "$ref": "#/$defs/ChatState"
+        },
+        "text": {
+          "description": "The message text.",
+          "type": "string"
+        },
+        "timestamp_ms": {
+          "description": "Wall-clock time the message was queued or received (Unix epoch, ms).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "message_id",
+        "direction",
+        "text",
+        "remote_call",
+        "timestamp_ms",
+        "state"
+      ]
+    },
+    "ChatState": {
+      "description": "COP-121: a chat message's state.",
+      "oneOf": [
+        {
+          "description": "Queued; the peer has not acknowledged its last byte yet.",
+          "type": "string",
+          "const": "sending"
+        },
+        {
+          "description": "The peer's ARQ ACK covered the message's last byte.",
+          "type": "string",
+          "const": "delivered"
+        },
+        {
+          "description": "Refused, or the session ended before the peer acknowledged it.",
+          "type": "string",
+          "const": "failed"
+        },
+        {
+          "description": "Received from the peer.",
+          "type": "string",
+          "const": "received"
+        }
+      ]
+    },
     "DataEncoding": {
       "type": "string",
       "enum": [
@@ -378,6 +467,36 @@
             "type",
             "level"
           ]
+        },
+        {
+          "description": "COP-121: send a chat message to the session peer. 1 to 512 UTF-8\nbytes with at least one non-whitespace character; needs a session\nwhose peer accepts chat (`status.chat` is `true`). The message itself\narrives as a `chat` push with `\"state\":\"sending\"`.",
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "chat"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ]
+        },
+        {
+          "description": "COP-121: the last [`CHAT_HISTORY_LEN`] chat messages since the daemon\nstarted, oldest first, each with its current state.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "chat_history"
+            }
+          },
+          "required": [
+            "type"
+          ]
         }
       ]
     },
@@ -411,6 +530,13 @@
                 "null"
               ],
               "format": "float"
+            },
+            "chat": {
+              "description": "COP-121: `true` while a session that negotiated chat is up,\n`false` while a session without it is up, absent with no session.",
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "connected": {
               "type": "boolean"
@@ -962,6 +1088,87 @@
             "state",
             "duration_ms",
             "timestamp_ms"
+          ]
+        },
+        {
+          "description": "COP-121: a chat message this station queued (`\"direction\":\"out\"`)\nor received (`\"direction\":\"in\"`). Reliable.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "chat"
+            }
+          },
+          "$ref": "#/$defs/ChatEntry",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "COP-121: an outgoing chat message's state became `delivered` or\n`failed` (`reason` with `failed`). Reliable.",
+          "type": "object",
+          "properties": {
+            "message_id": {
+              "description": "This station's id for the message (the `chat` push's).",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "reason": {
+              "description": "Why the message failed; absent unless `state` is `failed`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "description": "`delivered` or `failed`.",
+              "$ref": "#/$defs/ChatState"
+            },
+            "timestamp_ms": {
+              "description": "Wall-clock time the state changed (Unix epoch, ms).",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "chat_receipt"
+            }
+          },
+          "required": [
+            "type",
+            "message_id",
+            "state",
+            "timestamp_ms"
+          ]
+        },
+        {
+          "description": "COP-121: reply to `chat_history`: the last [`CHAT_HISTORY_LEN`] chat\nmessages since the daemon started, oldest first.",
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "messages": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ChatEntry"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "chat_history"
+            }
+          },
+          "required": [
+            "type",
+            "messages"
           ]
         }
       ]

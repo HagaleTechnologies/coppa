@@ -15,6 +15,10 @@ use coppa_host::vara::{
 use coppa_host::{HostEvent, HostResponse};
 use coppa_ml::CpRecommendation;
 use coppa_ml::{BusyGate, CpGate, RateLoop};
+use coppa_protocol::app::AppProtocol;
+use coppa_protocol::app_stream::{
+    self, chat_reason, DeliveryTracker, RecordReader, APP_STREAM, HOST_STREAM,
+};
 use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx, DEFAULT_MAX_RETRANSMIT};
 use coppa_protocol::cp_negotiator::{ContentAction, CpMode, CpNegotiator};
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu, StationIdPayload};
@@ -161,6 +165,13 @@ fn min_level_budget() -> usize {
 /// turnaround") make a second in-flight frame collide with the peer's ACK.
 const SESSION_ARQ_WINDOW: u8 = 1;
 
+// COP-121: `SessionLink::tx_stream` and the ACK handler's per-ACK byte count
+// assume one segment in flight. Raising the window needs per-seq streams.
+const _: () = assert!(
+    SESSION_ARQ_WINDOW == 1,
+    "COP-121 receipts assume stop-and-wait"
+);
+
 /// COP-68: how long a fade-held session link waits with ZERO peer evidence
 /// (no fully decoded MAC PDU from the peer, no header-only PHY decode)
 /// before tearing down. Derived like `SWITCH_PROBATION_SECS`'s margin: the
@@ -232,8 +243,20 @@ fn local_link_caps(config: &DaemonConfig) -> LinkCapabilities {
         multi_frame_ack: true,
         outer_code_rx: config.session.fade_protection.as_str() != "off",
         outer_code_req: config.session.fade_protection.as_str() == "request",
+        // COP-121 (D3): chat is advertised only when a WebSocket client can
+        // see it, so "Delivered" always means a dashboard can show it.
+        app_messages: cfg!(feature = "websocket") && config.host.websocket_enabled,
         ..LinkCapabilities::default()
     }
+}
+
+/// COP-121: a chat message's final outcome, as the sender reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChatOutcome {
+    /// The peer's ARQ ACK covered the message's last byte (D5).
+    Delivered,
+    /// The daemon refused it, or the session ended first (D6).
+    Failed(String),
 }
 
 /// COP-110: the most raw host bytes one multi-codeword session frame takes.
@@ -261,6 +284,22 @@ struct SessionLink {
     /// Host bytes not yet cut into a segment. Chunked at drain time with the
     /// exact seq that will carry them (D5).
     backlog: VecDeque<u8>,
+    /// COP-121: chat records (stream 1) not yet cut into a segment. Cut
+    /// ahead of `backlog` (D7) and never counted in `BUFFER` (D8).
+    app_backlog: VecDeque<u8>,
+    /// COP-121: the stream of the in-flight segment. Stop-and-wait
+    /// (`SESSION_ARQ_WINDOW = 1`) keeps one segment in flight, so one field
+    /// suffices, as for `tx_codewords`; a retransmission rebuilds the frame
+    /// with this stream, byte-identical to the original.
+    tx_stream: u8,
+    /// COP-121: splits delivered stream 1 bytes back into records.
+    app_rx: RecordReader,
+    /// COP-121: where each queued chat message ends in stream 1.
+    chat_tx: DeliveryTracker,
+    /// COP-121: one warning per link for a reserved stream (2 to 15).
+    warned_unknown_stream: bool,
+    /// COP-121: one warning per link for an unreadable stream 1.
+    warned_broken_app_stream: bool,
     /// COP-68: fade-hold state, entered when the in-flight segment first
     /// exhausts the normal retransmit budget (replaces COP-38's
     /// `give_up_at` one-RTO death). `None` in the normal regime.
@@ -291,8 +330,16 @@ struct SessionLink {
 /// retransmission is byte-identical and keeps the size `next_chunk_len`
 /// measured; the transport `session_id` is 0 because session ids are local
 /// slot numbers that differ between the two stations.
+#[cfg(test)]
 fn session_data_frame(link: &SessionLink, seq: u8, data: &[u8]) -> Vec<u8> {
-    let segment = TransportPdu::new_reliable(0, seq, 0, data.to_vec());
+    session_stream_frame(link, HOST_STREAM, seq, data)
+}
+
+/// COP-121: a session data frame on `stream`, carried in the transport
+/// `session_id` nibble (SPEC §23). Stream 0 (`HOST_STREAM`) is today's frame,
+/// byte for byte; stream 1 is sent only with `app_messages` negotiated.
+fn session_stream_frame(link: &SessionLink, stream: u8, seq: u8, data: &[u8]) -> Vec<u8> {
+    let segment = TransportPdu::new_reliable(stream, seq, 0, data.to_vec());
     MacPdu::new_data(
         link.remote.clone(),
         link.local.clone(),
@@ -300,6 +347,56 @@ fn session_data_frame(link: &SessionLink, seq: u8, data: &[u8]) -> Vec<u8> {
         segment.to_bytes(),
     )
     .to_bytes()
+}
+
+/// COP-121: the payload a session segment hands `ArqRx`: one leading
+/// stream byte, then the segment payload, so a buffered segment keeps its
+/// stream. With `app_messages` negotiated the stream is the transport
+/// `session_id` nibble; without it every segment is host bytes, as before
+/// (SPEC §18.1, §23).
+fn stream_tagged(app_messages: bool, segment: TransportPdu) -> Vec<u8> {
+    let stream = if app_messages {
+        segment.session_id
+    } else {
+        HOST_STREAM
+    };
+    let mut tagged = Vec::with_capacity(1 + segment.payload.len());
+    tagged.push(stream);
+    tagged.extend(segment.payload);
+    tagged
+}
+
+impl SessionLink {
+    /// COP-121 (D7): the stream the next segment carries. Queued chat goes
+    /// ahead of queued host bytes; each segment carries one stream.
+    fn next_stream(&self) -> u8 {
+        if self.app_backlog.is_empty() {
+            HOST_STREAM
+        } else {
+            APP_STREAM
+        }
+    }
+
+    /// Whether either stream has bytes not yet cut into a segment.
+    fn has_backlog(&self) -> bool {
+        !self.backlog.is_empty() || !self.app_backlog.is_empty()
+    }
+
+    fn stream_backlog(&self, stream: u8) -> &VecDeque<u8> {
+        if stream == APP_STREAM {
+            &self.app_backlog
+        } else {
+            &self.backlog
+        }
+    }
+
+    fn stream_backlog_mut(&mut self, stream: u8) -> &mut VecDeque<u8> {
+        if stream == APP_STREAM {
+            &mut self.app_backlog
+        } else {
+            &mut self.backlog
+        }
+    }
 }
 
 /// COP-38 (D3): the session ACK frame for everything `link.rx` holds, a MAC
@@ -861,6 +958,13 @@ pub struct EventLoop {
     /// transition (`notify_session`).
     #[cfg(feature = "websocket")]
     ws_status: Option<Arc<Mutex<coppa_host::websocket::WsStatus>>>,
+    /// COP-121: the chat history the WebSocket `chat_history` reply reads
+    /// (`WebSocketServer::chat_log()`), updated before every chat push.
+    #[cfg(feature = "websocket")]
+    ws_chat_log: Option<Arc<std::sync::Mutex<coppa_host::websocket::ChatLog>>>,
+    /// COP-121: the next chat `message_id`. Starts at 1, never reused in a
+    /// run; ids are per station.
+    next_chat_id: u64,
     /// Optional map of connected VARA command-port clients' response senders, for
     /// broadcasting `VaraResponse` telemetry (SNR/PTT/BUFFER/BUSY — decision 8).
     /// Wired by `main.rs` from `VaraServer::response_senders()`.
@@ -1162,6 +1266,9 @@ impl EventLoop {
             ws_last_decode_fail: None,
             #[cfg(feature = "websocket")]
             ws_status: None,
+            #[cfg(feature = "websocket")]
+            ws_chat_log: None,
+            next_chat_id: 1,
             vara_responses: None,
             #[cfg(feature = "ardop")]
             ardop_responses: None,
@@ -1732,8 +1839,10 @@ impl EventLoop {
             }
         });
         let max_tx_s = self.config.radio.max_tx_duration_s;
+        let chat = self.established_chat();
         if let Some(ref status) = self.ws_status {
             let mut snap = status.lock().await;
+            snap.chat = chat;
             snap.mycall = self.local_callsign.as_ref().map(|c| c.to_string());
             snap.max_tx_s = Some(max_tx_s);
             snap.max_tune_s = Some(max_tune_seconds(max_tx_s) as u64);
@@ -1877,6 +1986,13 @@ impl EventLoop {
     #[cfg(feature = "websocket")]
     pub fn set_ws_status(&mut self, status: Arc<Mutex<coppa_host::websocket::WsStatus>>) {
         self.ws_status = Some(status);
+    }
+
+    /// COP-121: attach the chat history the WebSocket server answers
+    /// `chat_history` from (`WebSocketServer::chat_log()`).
+    #[cfg(feature = "websocket")]
+    pub fn set_ws_chat_log(&mut self, log: Arc<std::sync::Mutex<coppa_host::websocket::ChatLog>>) {
+        self.ws_chat_log = Some(log);
     }
 
     /// Publish `cp_desync_episodes` to the WebSocket status snapshot, independent
@@ -2038,6 +2154,219 @@ impl EventLoop {
     }
 
     #[cfg(feature = "websocket")]
+    /// COP-121: `Some(app_messages)` of the established session, `None`
+    /// with no session (the WebSocket `status.chat` field).
+    fn established_chat(&self) -> Option<bool> {
+        self.session_mgr.active_sessions().iter().find_map(|&id| {
+            self.session_mgr
+                .get(id)
+                .filter(|session| session.is_established())
+                .map(|session| session.negotiated.as_ref().is_some_and(|c| c.app_messages))
+        })
+    }
+
+    /// COP-121: whether the session link's session negotiated
+    /// `app_messages`, so the transport stream nibble is meaningful.
+    fn session_app_messages(&self) -> bool {
+        self.session_link
+            .as_ref()
+            .map(|l| l.session_id)
+            .and_then(|id| self.session_mgr.get(id))
+            .and_then(|s| s.negotiated.as_ref())
+            .is_some_and(|c| c.app_messages)
+    }
+
+    fn take_chat_id(&mut self) -> u64 {
+        let id = self.next_chat_id;
+        self.next_chat_id = self.next_chat_id.wrapping_add(1).max(1);
+        id
+    }
+
+    /// COP-121: a WebSocket client's `chat` request. The daemon re-checks
+    /// everything the WebSocket task pre-checked; a refusal is pushed as a
+    /// `failed` outgoing `chat` and queues nothing (D6). An accepted message
+    /// joins stream 1 ahead of queued host bytes (D7) and is pushed as
+    /// `sending`; its receipt follows the peer's ACK (D5) or the session's
+    /// end.
+    async fn handle_chat_send(&mut self, client_id: u32, text: String) {
+        let id = self.take_chat_id();
+        tracing::debug!(
+            client_id,
+            message_id = id,
+            bytes = text.len(),
+            "Chat message requested"
+        );
+        let established = self.session_mgr.active_sessions().iter().find_map(|&sid| {
+            self.session_mgr
+                .get(sid)
+                .filter(|s| s.is_established())
+                .map(|s| {
+                    (
+                        s.id,
+                        s.remote.to_string(),
+                        s.negotiated.as_ref().is_some_and(|c| c.app_messages),
+                    )
+                })
+        });
+        let closing = self.pending_disconnect.is_some();
+        let (session_id, remote) = match established {
+            _ if closing => {
+                let remote = self.pending_disconnect_remote().unwrap_or_default();
+                self.chat_refuse(id, text, &remote, chat_reason::SESSION_CLOSING);
+                return;
+            }
+            None => {
+                self.chat_refuse(id, text, "", chat_reason::NO_SESSION);
+                return;
+            }
+            Some((_, remote, false)) => {
+                self.chat_refuse(id, text, &remote, chat_reason::PEER_WITHOUT_CHAT);
+                return;
+            }
+            Some((session_id, remote, true)) => (session_id, remote),
+        };
+        let record = match app_stream::chat_record(&text) {
+            Ok(record) => record,
+            Err(error) => {
+                self.chat_refuse(id, text, &remote, &error.to_string());
+                return;
+            }
+        };
+        self.ensure_session_link(session_id);
+        let Some(link) = self
+            .session_link
+            .as_mut()
+            .filter(|l| l.session_id == session_id)
+        else {
+            self.chat_refuse(id, text, &remote, chat_reason::NO_SESSION);
+            return;
+        };
+        if link.chat_tx.pending() >= app_stream::CHAT_MAX_WAITING {
+            self.chat_refuse(id, text, &remote, chat_reason::TOO_MANY_WAITING);
+            return;
+        }
+        link.app_backlog.extend(record.iter().copied());
+        link.chat_tx.queue(id, record.len());
+        self.chat_publish(id, true, text, &remote, None);
+        self.drain_session_link().await;
+    }
+
+    /// The remote of the session a pending host DISCONNECT is draining.
+    fn pending_disconnect_remote(&self) -> Option<String> {
+        let pending = self.pending_disconnect.as_ref()?;
+        self.session_mgr
+            .get(pending.session_id)
+            .map(|s| s.remote.to_string())
+    }
+
+    fn chat_refuse(&mut self, id: u64, text: String, remote: &str, reason: &str) {
+        tracing::debug!(message_id = id, reason, "Chat message refused");
+        self.chat_publish(id, true, text, remote, Some(reason.to_string()));
+    }
+
+    /// COP-121 (D6): every message still unacknowledged when its link is
+    /// dropped turns `failed`; nothing stays `sending` after the session.
+    fn fail_pending_chat(&mut self, link: &mut SessionLink) {
+        for id in link.chat_tx.fail_all() {
+            self.chat_receipt(
+                id,
+                ChatOutcome::Failed(chat_reason::SESSION_ENDED.to_string()),
+            );
+        }
+        link.app_backlog.clear();
+    }
+
+    /// COP-121: record a chat message in the shared history, then push it as
+    /// `chat` (D11: the log first, so `chat_history` is never older than a
+    /// push). `failed` carries a refusal's reason; `None` means `sending` for
+    /// an outgoing message and `received` for an incoming one.
+    #[cfg(feature = "websocket")]
+    fn chat_publish(
+        &mut self,
+        id: u64,
+        outgoing: bool,
+        text: String,
+        remote: &str,
+        failed: Option<String>,
+    ) {
+        use coppa_host::websocket::{ChatDirection, ChatEntry, ChatState, WsServerMessage};
+        let state = match (&failed, outgoing) {
+            (Some(_), _) => ChatState::Failed,
+            (None, true) => ChatState::Sending,
+            (None, false) => ChatState::Received,
+        };
+        let entry = ChatEntry {
+            message_id: id,
+            direction: if outgoing {
+                ChatDirection::Out
+            } else {
+                ChatDirection::In
+            },
+            text,
+            remote_call: remote.to_string(),
+            timestamp_ms: crate::ws_log::timestamp_ms(),
+            state,
+            reason: failed,
+        };
+        if let Some(log) = &self.ws_chat_log {
+            log.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(entry.clone());
+        }
+        self.ws_push_reliable(WsServerMessage::Chat(entry));
+    }
+
+    #[cfg(not(feature = "websocket"))]
+    fn chat_publish(
+        &mut self,
+        id: u64,
+        outgoing: bool,
+        text: String,
+        remote: &str,
+        failed: Option<String>,
+    ) {
+        tracing::debug!(
+            message_id = id,
+            outgoing,
+            bytes = text.len(),
+            remote,
+            failed = failed.is_some(),
+            "Chat message without a WebSocket API"
+        );
+    }
+
+    /// COP-121: an outgoing message's final state: update the shared history,
+    /// then push `chat_receipt`.
+    #[cfg(feature = "websocket")]
+    fn chat_receipt(&self, id: u64, outcome: ChatOutcome) {
+        use coppa_host::websocket::{ChatState, WsServerMessage};
+        let (state, reason) = match outcome {
+            ChatOutcome::Delivered => (ChatState::Delivered, None),
+            ChatOutcome::Failed(reason) => (ChatState::Failed, Some(reason)),
+        };
+        if let Some(log) = &self.ws_chat_log {
+            log.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .update(id, state, reason.clone());
+        }
+        self.ws_push_reliable(WsServerMessage::ChatReceipt {
+            message_id: id,
+            state,
+            reason,
+            timestamp_ms: crate::ws_log::timestamp_ms(),
+        });
+    }
+
+    #[cfg(not(feature = "websocket"))]
+    fn chat_receipt(&self, id: u64, outcome: ChatOutcome) {
+        tracing::debug!(
+            message_id = id,
+            ?outcome,
+            "Chat receipt without a WebSocket API"
+        );
+    }
+
+    #[cfg(feature = "websocket")]
     fn established_remote(&self) -> Option<Callsign> {
         self.session_mgr.active_sessions().iter().find_map(|&id| {
             self.session_mgr
@@ -2184,10 +2513,12 @@ impl EventLoop {
                 SessionNotice::Pending { .. } | SessionNotice::PendingCancelled => return,
             };
             let remote = self.established_remote();
+            let chat = self.established_chat();
             if let Some(ref status) = self.ws_status {
                 let mut snap = status.lock().await;
                 snap.connected = remote.is_some();
                 snap.remote_call = remote.map(|cs| cs.to_string());
+                snap.chat = chat;
                 snap.heard = Some(self.ws_heard.clone());
             }
             self.ws_push_reliable(msg);
@@ -2446,7 +2777,15 @@ impl EventLoop {
         let session = self
             .session_link
             .as_ref()
-            .map_or(0, |l| l.backlog.len() + l.tx.unacked_bytes());
+            // COP-121 (D8): chat bytes stay out of `BUFFER`.
+            .map_or(0, |l| {
+                l.backlog.len()
+                    + if l.tx_stream == HOST_STREAM {
+                        l.tx.unacked_bytes()
+                    } else {
+                        0
+                    }
+            });
         let unacked = self.arq_tx.as_ref().map_or(0, ArqTx::unacked_bytes);
         queued + session + self.arq_tx_backlog.len() + self.tx_on_air_bytes + unacked
     }
@@ -2611,13 +2950,15 @@ impl EventLoop {
         let Some(link) = self.session_link.as_mut() else {
             return true;
         };
-        let take = capacity.min(link.backlog.len());
-        let data: Vec<_> = link.backlog.iter().take(take).copied().collect();
+        let stream = link.next_stream();
+        let backlog = link.stream_backlog(stream);
+        let take = capacity.min(backlog.len());
+        let data: Vec<_> = backlog.iter().take(take).copied().collect();
         let seq = link.tx.next_seq();
         let encoded = encode_burst(
             &self.engine,
             (&link.remote, &link.local, link.ssid),
-            seq,
+            (stream, seq),
             &data,
             level,
         );
@@ -2664,7 +3005,8 @@ impl EventLoop {
         }
         self.set_session_segment_floor(keyed, packet_len, 1);
         if let Some(link) = self.session_link.as_mut() {
-            link.backlog.drain(..take);
+            link.stream_backlog_mut(stream).drain(..take);
+            link.tx_stream = stream;
             if let Err(error) = link.tx.send(data, clock_now()) {
                 tracing::error!(%error, "Session outer ARQ window full");
             }
@@ -2778,10 +3120,15 @@ impl EventLoop {
                     && segment.seq_num == packet.seq
                 {
                     link.block_ack_ready = true;
-                    let delivered = link.rx.receive(segment.seq_num, segment.payload);
-                    for (_, data) in delivered {
-                        self.deliver_to_host(data);
-                    }
+                    // COP-121: a rebuilt block carries its stream too.
+                    let app_messages = self
+                        .session_mgr
+                        .get(link.session_id)
+                        .and_then(|s| s.negotiated.as_ref())
+                        .is_some_and(|c| c.app_messages);
+                    let seq = segment.seq_num;
+                    let delivered = link.rx.receive(seq, stream_tagged(app_messages, segment));
+                    self.route_session_delivery(delivered);
                     for seq in [packet.seq, packet.seq.wrapping_sub(1)] {
                         for index in 0..12 {
                             self.engine.harq_evict(harq_key(seq, index));
@@ -2809,7 +3156,7 @@ impl EventLoop {
         let ready = self
             .session_link
             .as_ref()
-            .is_some_and(|l| !l.backlog.is_empty() && l.tx.can_send());
+            .is_some_and(|l| l.has_backlog() && l.tx.can_send());
         // COP-40, as in `try_drain_tx_queue`: hold the backlog (rather than
         // cut a frame and have `transmit_samples` refuse it) while the
         // wideband gate refuses; `retry_held_tx_drain` tries again on the
@@ -2849,19 +3196,22 @@ impl EventLoop {
         };
         let cap_budget = max_multi_payload_for_level(level, cap)
             .expect("the engine's speed level is always a valid wire level");
-        let (seq, take, frame, codewords) = {
+        let (seq, take, frame, codewords, stream) = {
             let Some(link) = self.session_link.as_mut() else {
                 return;
             };
-            link.backlog.make_contiguous();
+            let stream = link.next_stream();
+            link.stream_backlog_mut(stream).make_contiguous();
             let link = &*link;
             let seq = link.tx.next_seq();
             let engine = &self.engine;
-            let backlog = link.backlog.as_slices().0;
+            let backlog = link.stream_backlog(stream).as_slices().0;
             let header_len = MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE;
             let fits = |c: &[u8]| {
-                engine.encoded_payload_len_with_codewords(&session_data_frame(link, seq, c), cap)
-                    <= cap_budget
+                engine.encoded_payload_len_with_codewords(
+                    &session_stream_frame(link, stream, seq, c),
+                    cap,
+                ) <= cap_budget
             };
             let take = if cap == 1 {
                 next_chunk_len(backlog, header_len, cap_budget, fits)
@@ -2874,7 +3224,7 @@ impl EventLoop {
                     fits,
                 )
             };
-            let frame = session_data_frame(link, seq, &backlog[..take]);
+            let frame = session_stream_frame(link, stream, seq, &backlog[..take]);
             let codewords = if cap == 1 {
                 1
             } else {
@@ -2883,7 +3233,7 @@ impl EventLoop {
                     .find(|&c| max_multi_payload_for_level(level, c).is_some_and(|b| b >= encoded))
                     .unwrap_or(cap)
             };
-            (seq, take, frame, codewords)
+            (seq, take, frame, codewords, stream)
         };
         let samples = match self.engine.encode_bytes_with_codewords(&frame, codewords) {
             Ok(samples) => samples,
@@ -2915,7 +3265,8 @@ impl EventLoop {
             return;
         }
         if let Some(link) = self.session_link.as_mut() {
-            let chunk: Vec<u8> = link.backlog.drain(..take).collect();
+            let chunk: Vec<u8> = link.stream_backlog_mut(stream).drain(..take).collect();
+            link.tx_stream = stream;
             // COP-69: remember the count the segment went out with, so a
             // retransmission re-encodes byte-identically at the same count.
             link.tx_codewords = codewords;
@@ -3014,6 +3365,7 @@ impl EventLoop {
         let Some(mut link) = self.session_link.take_if(|l| l.session_id == session_id) else {
             return;
         };
+        self.fail_pending_chat(&mut link);
         link.rx_block.reset();
         for key in 0x10..=u8::MAX {
             self.engine.harq_evict(key);
@@ -3067,6 +3419,12 @@ impl EventLoop {
             tx: ArqTx::new(config).expect("SESSION_ARQ_WINDOW is within 1..=MAX_WINDOW_SIZE"),
             rx: ArqRx::new(SESSION_ARQ_WINDOW),
             backlog: VecDeque::new(),
+            app_backlog: VecDeque::new(),
+            tx_stream: HOST_STREAM,
+            app_rx: RecordReader::default(),
+            chat_tx: DeliveryTracker::default(),
+            warned_unknown_stream: false,
+            warned_broken_app_stream: false,
             fallback: None,
             last_peer_evidence: clock_now(),
             warned_legacy_payload: false,
@@ -3083,7 +3441,9 @@ impl EventLoop {
     /// COP-38 (D2): a newly established session starts at seq 0 on both
     /// ends, whatever link an earlier session left behind.
     fn reset_session_link(&mut self, session_id: u8) {
-        self.session_link = None;
+        if let Some(mut link) = self.session_link.take() {
+            self.fail_pending_chat(&mut link);
+        }
         self.ensure_session_link(session_id);
     }
 
@@ -3190,7 +3550,7 @@ impl EventLoop {
             .filter_map(|seq| {
                 link.tx
                     .get_segment_data(seq)
-                    .map(|data| (seq, session_data_frame(link, seq, data)))
+                    .map(|data| (seq, session_stream_frame(link, link.tx_stream, seq, data)))
             })
             .collect();
         for (seq, frame) in frames {
@@ -3222,7 +3582,7 @@ impl EventLoop {
                 match encode_burst(
                     &self.engine,
                     (&link.remote, &link.local, link.ssid),
-                    seq,
+                    (link.tx_stream, seq),
                     data,
                     outer.level,
                 ) {
@@ -3650,7 +4010,7 @@ impl EventLoop {
                 self.session_link
                     .as_ref()
                     .filter(|l| l.session_id == p.session_id)
-                    .is_none_or(|l| l.backlog.is_empty() && l.tx.in_flight() == 0)
+                    .is_none_or(|l| !l.has_backlog() && l.tx.in_flight() == 0)
             });
         if let Some(pending) = self.pending_disconnect.take_if(|_| drained) {
             self.end_local_disconnect(pending).await;
@@ -3984,6 +4344,9 @@ impl EventLoop {
 
     async fn handle_host_event(&mut self, event: HostEvent) {
         match event {
+            HostEvent::ChatSend { client_id, text } => {
+                self.handle_chat_send(client_id, text).await;
+            }
             HostEvent::Connected { client_id } => {
                 tracing::info!(client_id, "Client connected");
             }
@@ -5516,7 +5879,7 @@ impl EventLoop {
                     self.session_tx_held_by_frequency_gate = self
                         .session_link
                         .as_ref()
-                        .is_some_and(|l| !l.backlog.is_empty());
+                        .is_some_and(SessionLink::has_backlog);
                 }
                 return 0;
             }
@@ -5548,7 +5911,7 @@ impl EventLoop {
                 self.session_tx_held_by_frequency_gate = self
                     .session_link
                     .as_ref()
-                    .is_some_and(|l| !l.backlog.is_empty());
+                    .is_some_and(SessionLink::has_backlog);
             }
             return 0;
         }
@@ -7012,7 +7375,7 @@ impl EventLoop {
         if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
             match session.handle_connect_ack(&pdu.payload, clock_now()) {
                 Ok(cfm_pdu) => {
-                    tracing::info!(remote = %remote, role = "initiator", fade_protection = if session.negotiated.as_ref().is_some_and(|c| c.outer_code_active()) { "rs12-6" } else { "off" }, "Session established");
+                    tracing::info!(remote = %remote, role = "initiator", fade_protection = if session.negotiated.as_ref().is_some_and(|c| c.outer_code_active()) { "rs12-6" } else { "off" }, chat = session.negotiated.as_ref().is_some_and(|c| c.app_messages), "Session established");
                     let notice = SessionNotice::Connected {
                         local: session.local.clone(),
                         remote,
@@ -7046,7 +7409,7 @@ impl EventLoop {
             match session.handle_connect_cfm(&pdu.payload, clock_now()) {
                 Ok(()) => {
                     session.confirm_established();
-                    tracing::info!(remote = %remote, fade_protection = if session.negotiated.as_ref().is_some_and(|c| c.outer_code_active()) { "rs12-6" } else { "off" }, "Session fully established (responder)");
+                    tracing::info!(remote = %remote, fade_protection = if session.negotiated.as_ref().is_some_and(|c| c.outer_code_active()) { "rs12-6" } else { "off" }, chat = session.negotiated.as_ref().is_some_and(|c| c.app_messages), "Session fully established (responder)");
                     let notice = SessionNotice::Connected {
                         local: session.local.clone(),
                         remote,
@@ -7188,19 +7551,90 @@ impl EventLoop {
     }
 
     /// Both plain frames and rebuilt outer blocks share ordered delivery.
+    ///
+    /// COP-121: with `app_messages` negotiated the transport `session_id`
+    /// nibble is the segment's stream; without it every segment is host
+    /// bytes, as before. The stream rides as one leading byte through
+    /// `ArqRx`, so a buffered segment keeps it. Every segment is ACKed,
+    /// whatever its stream.
     fn deliver_session_segment(&mut self, segment: TransportPdu) -> Option<Vec<u8>> {
+        let app_messages = self.session_app_messages();
         let link = self.session_link.as_mut()?;
-        let delivered = link.rx.receive(segment.seq_num, segment.payload);
+        let seq = segment.seq_num;
+        let delivered = link.rx.receive(seq, stream_tagged(app_messages, segment));
         // Once ARQ accepts the segment, release retained shards immediately.
         // Subsequent packets of this burst are duplicates of recv_base - 1.
         if !delivered.is_empty() && link.rx_block.holds() {
             link.rx_block.reset();
         }
         let ack = session_ack_frame(link);
-        for (_, data) in delivered {
-            self.deliver_to_host(data);
-        }
+        self.route_session_delivery(delivered);
         Some(ack)
+    }
+
+    /// COP-121: hand segments `ArqRx` released, in order, to their stream:
+    /// host bytes to the host, stream 1 to the record reader, reserved
+    /// streams dropped with one warning per link.
+    fn route_session_delivery(&mut self, delivered: Vec<(u8, Vec<u8>)>) {
+        for (_, mut data) in delivered {
+            if data.is_empty() {
+                continue;
+            }
+            let stream = data.remove(0);
+            match stream {
+                HOST_STREAM => self.deliver_to_host(data),
+                APP_STREAM => self.deliver_app_records(&data),
+                other => {
+                    if let Some(link) = self.session_link.as_mut() {
+                        if !std::mem::replace(&mut link.warned_unknown_stream, true) {
+                            tracing::warn!(
+                                stream = other,
+                                "Session segment on a reserved stream; ACKed and dropped"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// COP-121: feed delivered stream 1 bytes to the link's record reader and
+    /// publish each chat record as an incoming `chat` (SPEC §23). Records of
+    /// another application protocol are skipped; a too-short length makes the
+    /// rest of the session's stream 1 unreadable and warns once.
+    fn deliver_app_records(&mut self, bytes: &[u8]) {
+        let Some(link) = self.session_link.as_mut() else {
+            return;
+        };
+        let remote = link.remote.to_string();
+        let records = link.app_rx.push(bytes);
+        let mut texts = Vec::new();
+        for record in records {
+            match record {
+                Ok(pdu) if pdu.protocol == AppProtocol::Text => {
+                    texts.push(String::from_utf8_lossy(&pdu.payload).into_owned());
+                }
+                Ok(pdu) => {
+                    tracing::debug!(protocol = ?pdu.protocol, "Skipping an application record");
+                }
+                Err(coppa_protocol::ProtocolError::AppRecordTooShort { len }) => {
+                    if !std::mem::replace(&mut link.warned_broken_app_stream, true) {
+                        tracing::warn!(
+                            len,
+                            "Application record length below the AppPdu header; \
+                             dropping the rest of this session's chat stream"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "Skipping an unreadable application record");
+                }
+            }
+        }
+        for text in texts {
+            let id = self.take_chat_id();
+            self.chat_publish(id, false, text, &remote, None);
+        }
     }
 
     /// COP-38 (D7): the peer's ACK for session data. Frees the stop-and-wait
@@ -7267,9 +7701,19 @@ impl EventLoop {
             return;
         }
         let outer_pending = link.tx_outer.is_some() && link.tx.in_flight() > 0;
+        // COP-121 (D5): the in-flight segment's stream and length, read
+        // before `process_ack` frees it.
+        let base = link.tx.send_base();
+        let base_stream = link.tx_stream;
+        let base_len = link.tx.get_segment_data(base).map_or(0, <[u8]>::len);
         let acked = link
             .tx
             .process_ack(ack.ack_num, ack.ack_bitmap, clock_now());
+        let delivered_chat = if base_stream == APP_STREAM && acked.contains(&base) {
+            link.chat_tx.ack(base_len)
+        } else {
+            Vec::new()
+        };
         if outer_pending && !acked.is_empty() {
             // The first decoded ACK may be the first of two copies. Keep RX
             // open for another frame rather than keying over the second copy.
@@ -7297,6 +7741,9 @@ impl EventLoop {
                     DEFAULT_MAX_RETRANSMIT
                 );
             }
+        }
+        for id in delivered_chat {
+            self.chat_receipt(id, ChatOutcome::Delivered);
         }
         if !acked.is_empty() {
             self.report_buffer().await;
@@ -7554,6 +8001,10 @@ pub(crate) fn open_gpio_ptt(
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+
+    /// COP-121: dashboard chat over a session (fixtures and tests).
+    #[cfg(feature = "websocket")]
+    mod chat;
 
     #[cfg(feature = "websocket")]
     type WsClient = tokio_tungstenite::WebSocketStream<
@@ -9661,6 +10112,38 @@ mod tests {
         coppa_audio::AudioRingConsumer,
         coppa_audio::AudioRingConsumer,
     ) {
+        connected_pair_configured(turnaround_ms, |_| {}, |_| {}).await
+    }
+
+    /// COP-121: `connected_pair` with per-station config changes.
+    async fn connected_pair_configured(
+        turnaround_ms: u64,
+        configure_a: impl FnOnce(&mut DaemonConfig),
+        configure_b: impl FnOnce(&mut DaemonConfig),
+    ) -> (
+        EventLoop,
+        EventLoop,
+        coppa_audio::AudioRingConsumer,
+        coppa_audio::AudioRingConsumer,
+    ) {
+        let (mut a, mut b, mut a_consumer, mut b_consumer) =
+            unconnected_pair(turnaround_ms, configure_a, configure_b);
+        handshake_pair(&mut a, &mut b, &mut a_consumer, &mut b_consumer).await;
+        (a, b, a_consumer, b_consumer)
+    }
+
+    /// Two listening stations, VK3ABC (`a`) and W1AW (`b`), each with an
+    /// audio sink, before any session.
+    fn unconnected_pair(
+        turnaround_ms: u64,
+        configure_a: impl FnOnce(&mut DaemonConfig),
+        configure_b: impl FnOnce(&mut DaemonConfig),
+    ) -> (
+        EventLoop,
+        EventLoop,
+        coppa_audio::AudioRingConsumer,
+        coppa_audio::AudioRingConsumer,
+    ) {
         let mut config = DaemonConfig::default();
         assert!(
             !config.engine.arq_enabled,
@@ -9670,33 +10153,44 @@ mod tests {
         config.radio.ptt_pre_delay_ms = 0;
         config.radio.ptt_tail_delay_ms = 0;
         config.radio.turnaround_ms = turnaround_ms;
-        let mut a = EventLoop::new(config.clone()).unwrap();
+        let mut a_config = config.clone();
+        configure_a(&mut a_config);
+        let mut a = EventLoop::new(a_config).unwrap();
         config.engine.callsign = "W1AW".into();
+        configure_b(&mut config);
         let mut b = EventLoop::new(config).unwrap();
         a.listening = true;
         b.listening = true;
-        let (a_producer, mut a_consumer) = coppa_audio::audio_ring(4_000_000);
-        let (b_producer, mut b_consumer) = coppa_audio::audio_ring(4_000_000);
+        let (a_producer, a_consumer) = coppa_audio::audio_ring(4_000_000);
+        let (b_producer, b_consumer) = coppa_audio::audio_ring(4_000_000);
         a.set_audio_out(a_producer);
         b.set_audio_out(b_producer);
+        (a, b, a_consumer, b_consumer)
+    }
 
+    /// `a` calls `b` and both reach an established session.
+    async fn handshake_pair(
+        a: &mut EventLoop,
+        b: &mut EventLoop,
+        a_consumer: &mut coppa_audio::AudioRingConsumer,
+        b_consumer: &mut coppa_audio::AudioRingConsumer,
+    ) {
         a.handle_host_event(HostEvent::ConnectRequest {
             client_id: 1,
             source: "VK3ABC".into(),
             destination: "W1AW".into(),
         })
         .await;
-        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_REQ"))
+        b.decode_and_dispatch_audio(&take_leg(a_consumer, "CONNECT_REQ"))
             .await;
-        a.decode_and_dispatch_audio(&take_leg(&mut b_consumer, "CONNECT_ACK"))
+        a.decode_and_dispatch_audio(&take_leg(b_consumer, "CONNECT_ACK"))
             .await;
-        unstick_decoder(&mut b);
-        b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "CONNECT_CFM"))
+        unstick_decoder(b);
+        b.decode_and_dispatch_audio(&take_leg(a_consumer, "CONNECT_CFM"))
             .await;
         a.handle_ptt_change(false).await;
         b.handle_ptt_change(false).await;
         assert!(a.session_link.is_some() && b.session_link.is_some());
-        (a, b, a_consumer, b_consumer)
     }
 
     /// COP-38: give `station`'s session link a 20 ms initial RTO, so a test
@@ -17272,6 +17766,32 @@ mod tests {
                 hex(&local_link_caps(&DaemonConfig::default()).to_bytes()),
                 "00c80102080600"
             );
+            // COP-121: host bytes on stream 0 are still P04, byte for byte,
+            // and a chat record on stream 1 is SPEC §23's A02.
+            assert_eq!(
+                hex(&session_stream_frame(&caller, HOST_STREAM, 0, b"HELLO")),
+                "105dc05700000058b781083000000100000000000048454c4c4f"
+            );
+            assert_eq!(
+                hex(&session_stream_frame(
+                    &caller,
+                    APP_STREAM,
+                    0,
+                    &app_stream::chat_record("73").unwrap()
+                )),
+                "105dc05700000058b78108300000110000000000000006000000013733"
+            );
+            // COP-121: with the WebSocket API on, coppad advertises
+            // `app_messages` (A03); a default config does not.
+            #[cfg(feature = "websocket")]
+            {
+                let mut chat_config = DaemonConfig::default();
+                chat_config.host.websocket_enabled = true;
+                assert_eq!(
+                    hex(&local_link_caps(&chat_config).to_bytes()),
+                    "00c80102081600"
+                );
+            }
         }
 
         fn test_link() -> SessionLink {
@@ -17286,6 +17806,12 @@ mod tests {
                 .unwrap(),
                 rx: ArqRx::new(SESSION_ARQ_WINDOW),
                 backlog: VecDeque::new(),
+                app_backlog: VecDeque::new(),
+                tx_stream: HOST_STREAM,
+                app_rx: RecordReader::default(),
+                chat_tx: DeliveryTracker::default(),
+                warned_unknown_stream: false,
+                warned_broken_app_stream: false,
                 fallback: None,
                 last_peer_evidence: Instant::now(),
                 warned_legacy_payload: false,
@@ -17518,7 +18044,7 @@ mod tests {
             let (burst, packet_len) = encode_burst(
                 &station.engine,
                 (&link.remote, &link.local, link.ssid),
-                0,
+                (HOST_STREAM, 0),
                 &[31; 200],
                 8,
             )
