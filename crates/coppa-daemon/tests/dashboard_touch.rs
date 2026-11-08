@@ -39,6 +39,8 @@ const MIN_TARGET: f64 = 44.0;
 const STARTUP: Duration = Duration::from_secs(30);
 /// How long any one DevTools command or awaited event may take.
 const STEP: Duration = Duration::from_secs(10);
+/// How long the browser's helper processes may take to exit after the kill.
+const SHUTDOWN: Duration = Duration::from_secs(10);
 
 /// Browser names searched on `PATH` when `COPPA_CHROME` is not set.
 const BROWSERS: [&str; 4] = [
@@ -154,7 +156,7 @@ async fn every_dashboard_control_is_a_44px_touch_target_at_390px() {
     };
 
     let url = serve_page();
-    let (_browser, devtools_url) = Browser::launch(&binary);
+    let (browser, devtools_url) = Browser::launch(&binary);
     let mut cdp = Cdp::connect(&devtools_url).await;
 
     let target = cdp
@@ -220,11 +222,18 @@ async fn every_dashboard_control_is_a_44px_touch_target_at_390px() {
         check_state(expected, state, &mut problems);
     }
     tap_level_3(&mut cdp, session, &mut problems).await;
+    let profile = browser.profile.clone();
+    drop(browser);
 
     assert!(
         problems.is_empty(),
         "the dashboard at {WIDTH} px fails COP-122's touch bar:\n  {}",
         problems.join("\n  ")
+    );
+    assert!(
+        !profile.exists(),
+        "closing the browser left its profile directory {} behind",
+        profile.display()
     );
 }
 
@@ -399,11 +408,17 @@ fn answer(mut stream: TcpStream) -> std::io::Result<()> {
     stream.flush()
 }
 
-/// A headless browser child and its profile directory; dropping it kills
-/// the browser and removes the directory.
+/// A headless browser child and its profile directory. Dropping it kills
+/// the browser, waits up to `SHUTDOWN` for its helper processes to exit,
+/// and removes the directory.
 struct Browser {
     child: Child,
     profile: PathBuf,
+    /// Disconnects when the stderr drain thread ends. The helper processes
+    /// (zygote, renderer, GPU, network and storage services, crash handler)
+    /// inherit the browser's stderr, so the pipe reaches EOF only once the
+    /// last of them has exited and stopped writing into the profile.
+    stderr_closed: mpsc::Receiver<()>,
 }
 
 impl Browser {
@@ -436,15 +451,23 @@ impl Browser {
             .spawn()
             .unwrap_or_else(|error| panic!("start {}: {error}", binary.display()));
         let stderr = child.stderr.take().expect("the browser's stderr is piped");
-        let browser = Self { child, profile };
+        let (stderr_open, stderr_closed) = mpsc::channel::<()>();
+        let browser = Self {
+            child,
+            profile,
+            stderr_closed,
+        };
 
         // Read stderr on a thread so the wait is bounded, and keep draining
         // it afterwards so a full pipe never stalls the browser.
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
+            // Dropped when this thread ends, at EOF: see `stderr_closed`.
+            let _stderr_open = stderr_open;
             let mut sent = false;
             let mut before = Vec::new();
-            for line in BufReader::new(stderr).lines() {
+            let mut reader = BufReader::new(stderr);
+            for line in reader.by_ref().lines() {
                 let Ok(line) = line else { break };
                 if sent {
                     continue;
@@ -460,6 +483,8 @@ impl Browser {
             if !sent {
                 let _ = sender.send(Err(before.join("\n")));
             }
+            // A line that is not UTF-8 ends the loop early; read on to EOF.
+            let _ = std::io::copy(&mut reader, &mut std::io::sink());
         });
         let url = match receiver.recv_timeout(STARTUP) {
             Ok(Ok(url)) => url,
@@ -480,6 +505,9 @@ impl Drop for Browser {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // Nothing is ever sent, so this returns once every browser process
+        // has exited, or after `SHUTDOWN`.
+        let _ = self.stderr_closed.recv_timeout(SHUTDOWN);
         let _ = std::fs::remove_dir_all(&self.profile);
     }
 }
