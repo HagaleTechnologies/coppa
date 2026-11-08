@@ -243,8 +243,8 @@ mod tests {
     fn page_keeps_touch_sized_controls() {
         for rule in [
             "[hidden] { display: none !important; }",
-            "min-height: 44px",
-            "min-width: 44px",
+            "button, input { min-height: 44px; }",
+            "button { min-width: 44px;",
         ] {
             assert!(INDEX_HTML.contains(rule), "page stylesheet lacks {rule:?}");
         }

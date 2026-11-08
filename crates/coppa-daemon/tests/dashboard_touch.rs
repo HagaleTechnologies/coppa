@@ -286,6 +286,11 @@ fn check_state(expected: &Expected, state: &Value, problems: &mut Vec<String>) {
             "{label}: the token form is still shown (display: {token_form}) after hello hid it"
         ));
     }
+    if !expected.token_form_hidden && token_form == "none" {
+        problems.push(format!(
+            "{label}: the token form is hidden, so the operator cannot type the token"
+        ));
+    }
 }
 
 /// Taps speed level 3 with a touch event and checks the page's answer.
@@ -407,7 +412,15 @@ impl Browser {
         let profile =
             std::env::temp_dir().join(format!("coppa-dashboard-touch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&profile);
-        std::fs::create_dir_all(&profile).expect("create the browser profile directory");
+        // `create_dir`, not `create_dir_all`: a path that survived the
+        // removal (another user's directory or symlink in a shared temp
+        // dir) fails here instead of becoming the browser's profile.
+        std::fs::create_dir(&profile).unwrap_or_else(|error| {
+            panic!(
+                "create the browser profile directory {}: {error}",
+                profile.display()
+            )
+        });
         let mut child = Command::new(binary)
             .args([
                 "--headless=new",
