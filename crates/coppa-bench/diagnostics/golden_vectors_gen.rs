@@ -105,8 +105,9 @@
 //!   ordinary waterfall -- 100% FER at 12/15 dB (genuinely below threshold),
 //!   6% at 18 dB, then a clean 0% from 21-27 dB, 1% at 30 dB. Real threshold
 //!   is ~18-21 dB, not "30 dB and still mostly failing." `LEVEL8_AWGN_SNR_DB`
-//!   is corrected to 24 dB (comfortably clear, matching the margin other
-//!   levels' reference SNRs use).
+//!   (renamed `HIGH_ORDER_AWGN_SNR_DB` by COP-129, which applies it to levels
+//!   7 and 9 too) is corrected to 24 dB (comfortably clear, matching the
+//!   margin other levels' reference SNRs use).
 //! - **ssb+cfo** (`hf_standard` forced, 15 Hz CFO): even cleaner -- 0% FER
 //!   at every tested point from 18-33 dB. `LEVEL8_SSBCFO_SNR_DB` corrected
 //!   to 24 dB.
@@ -613,7 +614,13 @@ fn main() {
     let manifest_path = out_dir.join("manifest.toml");
 
     // Everything from the first `[[vectors]]` on is kept byte for byte.
-    let existing_text = std::fs::read_to_string(&manifest_path).unwrap_or_default();
+    // Only a missing manifest means "start empty". Any other read error must
+    // stop the run, or it would regenerate and overwrite every committed WAV.
+    let existing_text = match std::fs::read_to_string(&manifest_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => panic!("read {}: {e}", manifest_path.display()),
+    };
     let existing_ids: HashSet<String> = manifest_ids(&existing_text).into_iter().collect();
     let mut entries = match existing_text.find("[[vectors]]") {
         Some(i) => existing_text[i..].to_string(),

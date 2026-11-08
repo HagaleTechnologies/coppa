@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 
 use coppa_bench::scenario::select_profile;
 use coppa_codec::ofdm::CoppaProfile;
-use coppa_protocol::modem::streaming::StreamingReceiver;
+use coppa_protocol::modem::streaming::{DecodedFrame, StreamingReceiver};
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 
 #[derive(serde::Deserialize)]
@@ -366,6 +366,31 @@ const STREAM_CHUNK: usize = 4800;
 /// Trailing zeros after each WAV, matching the CLI's `TRAILING_FLUSH_SAMPLES`,
 /// so a frame that ends near the end of the file still completes.
 const TRAILING_FLUSH_SAMPLES: usize = 8192;
+/// Silence before, between and after the frames of a retransmission WAV
+/// (100 ms at 48 kHz, SPEC §14).
+const RTX_GAP_SAMPLES: usize = 4800;
+
+/// Decode `samples` through a fresh `StreamingReceiver`, in `STREAM_CHUNK`
+/// pushes followed by `TRAILING_FLUSH_SAMPLES` zeros.
+fn stream_decode(v: &VectorEntry, samples: &[f32]) -> Vec<DecodedFrame> {
+    let mut buf = samples.to_vec();
+    buf.extend(std::iter::repeat_n(0.0f32, TRAILING_FLUSH_SAMPLES));
+    let mut rx = StreamingReceiver::new(profile_for(v.level, &v.channel), 1);
+    let mut decoded = Vec::new();
+    for chunk in buf.chunks(STREAM_CHUNK) {
+        decoded.extend(rx.push_samples(chunk));
+    }
+    decoded
+}
+
+/// End of the first frame's trailing gap in a retransmission WAV. Every frame
+/// has the same level and codeword count, so the same length:
+/// `len = (n + 1) * gap + n * frame_len`.
+fn first_frame_end(v: &VectorEntry, len: usize) -> Option<usize> {
+    let n = v.rv_sequence.len();
+    let frames = len.checked_sub((n + 1) * RTX_GAP_SAMPLES)?;
+    (frames % n == 0).then(|| RTX_GAP_SAMPLES + frames / n + RTX_GAP_SAMPLES)
+}
 
 /// COP-126: every golden vector decodes through `StreamingReceiver`, the
 /// receive path the daemon, `coppa rx` and the FFI share, not only through
@@ -374,9 +399,9 @@ const TRAILING_FLUSH_SAMPLES: usize = 8192;
 ///
 /// COP-129: each WAV must give exactly one frame with the exact payload and
 /// codeword count. For a retransmission entry that frame must carry the last
-/// RV in `rv_sequence`. A lone RV1-RV3 frame does not decode at L4 or L9, and
-/// the generator only accepts a seed whose first frame alone gives nothing, so
-/// this proves the receiver combined the two transmissions.
+/// RV in `rv_sequence`, and the WAV cut after the first frame's trailing gap
+/// must give no frame at all, which proves the receiver combined the two
+/// transmissions (a lone RV1-RV3 frame does not decode at L4 or L9 either).
 #[test]
 fn golden_vectors_decode_through_the_streaming_receiver() {
     let dir = golden_dir();
@@ -388,18 +413,41 @@ fn golden_vectors_decode_through_the_streaming_receiver() {
 
     let mut failures = Vec::new();
     for v in &manifest.vectors {
-        let (mut samples, _) = read_wav_f32(&dir.join(&v.wav_file));
-        samples.extend(std::iter::repeat_n(0.0f32, TRAILING_FLUSH_SAMPLES));
+        let (samples, _) = read_wav_f32(&dir.join(&v.wav_file));
         let expected_payload = decode_hex(&v.payload_hex);
 
-        let mut rx = StreamingReceiver::new(profile_for(v.level, &v.channel), 1);
-        let mut decoded = Vec::new();
-        for chunk in samples.chunks(STREAM_CHUNK) {
-            decoded.extend(rx.push_samples(chunk));
+        if v.is_retransmission() {
+            // The first frame alone must give nothing, so the one frame the
+            // whole WAV gives can only come from combining. This is what makes
+            // the Chase entry (RV0 then RV0) meaningful.
+            match first_frame_end(v, samples.len()) {
+                None => {
+                    failures.push(format!(
+                        "{}: {} samples do not fit the SPEC §14 retransmission layout",
+                        v.id,
+                        samples.len()
+                    ));
+                    continue;
+                }
+                Some(end) => {
+                    let alone = stream_decode(v, &samples[..end]);
+                    if !alone.is_empty() {
+                        failures.push(format!(
+                            "{}: the first frame alone decoded {} frame(s); \
+                             the vector no longer tests combining",
+                            v.id,
+                            alone.len()
+                        ));
+                        continue;
+                    }
+                }
+            }
         }
 
+        let decoded = stream_decode(v, &samples);
         let ok = decoded.len() == 1
             && decoded[0].payload == expected_payload
+            && decoded[0].header.speed_level == v.level
             && decoded[0].header.codewords == v.codewords
             && (!v.is_retransmission() || decoded[0].header.fec_type & 0x03 == v.last_rv());
         if ok != v.expected_decode_ok {
@@ -407,8 +455,9 @@ fn golden_vectors_decode_through_the_streaming_receiver() {
                 .iter()
                 .map(|f| {
                     format!(
-                        "[{} bytes, codewords {}, rv {}]",
+                        "[{} bytes, level {}, codewords {}, rv {}]",
                         f.payload.len(),
+                        f.header.speed_level,
                         f.header.codewords,
                         f.header.fec_type & 0x03
                     )

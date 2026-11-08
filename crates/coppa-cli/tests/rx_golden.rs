@@ -156,9 +156,9 @@ fn golden_vectors_rx_cli_decodes_and_prints_payloads() {
 
 /// Self-check: every manifest vector is `expected_decode_ok` (as of
 /// 2026-07-26 -- see `golden_vectors_gen.rs`'s module doc: the previous
-/// `L9_poor25` "structurally undecodable" classification was a
-/// stale-IR-HARQ-accumulator bench bug, fixed, and that vector now decodes
-/// like every other), and every one is what
+/// `L8_poor25` (`L9_poor25` before the COP-24 renumber) "structurally
+/// undecodable" classification was a stale-IR-HARQ-accumulator bench bug,
+/// fixed, and that vector now decodes like every other), and every one is what
 /// `golden_vectors_rx_cli_decodes_and_prints_payloads` above exercises, with
 /// no exclusion (COP-126 removed the last one) -- catches the test silently
 /// dropping a vector. The total is not pinned here:
