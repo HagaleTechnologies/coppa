@@ -285,9 +285,10 @@ After `101` the first frame is:
 ### Requests
 
 Any request may carry an unsigned integer `id`. A request with an `id` gets exactly one reply
-with that `id`: `ack`, `status` or `error`. An `ack` means accepted, not done. A request without
-an `id` gets no `ack`. A `status` request is still answered and a rejected request still gets an
-`error`, both without an `id`; every other request is accepted silently.
+with that `id`: `ack`, `status`, `chat_history` or `error`. An `ack` means accepted, not done. A
+request without an `id` gets no `ack`. A `status` or `chat_history` request is still answered and
+a rejected request still gets an `error`, all without an `id`; every other request is accepted
+silently.
 
 | Request | Reply | Notes |
 |---|---|---|
@@ -299,6 +300,8 @@ an `id` gets no `ack`. A `status` request is still answered and a rejected reque
 | `{"type":"spectrum","enabled":true,"id":6}` | `ack` | opt in to (or, with `false`, out of) `spectrum` messages |
 | `{"type":"audio_level","enabled":true,"id":7}` | `ack` | the same for `audio_level` |
 | `{"type":"log","enabled":true,"id":8}` | `ack` | the same for `log` |
+| `{"type":"chat","text":"hello","id":9}` | `ack` | 1 to 512 UTF-8 bytes with at least one non-space character; needs a session whose peer accepts chat; the message itself arrives as a `chat` push with `"state":"sending"` |
+| `{"type":"chat_history","id":10}` | `{"type":"chat_history","id":10,"messages":[...]}` | the last 100 chat messages since coppad started, oldest first |
 
 Anything else gets an `error`, with the request's `id` if it had one, for example
 `{"type":"error","message":"Invalid message: unknown variant ...","id":9}`. Binary frames are
@@ -317,6 +320,8 @@ also silent on WebSocket, as noted in the `connect` row.
 | `data` | received session data, with `encoding` `utf8` or `base64`, every byte kept | reliable |
 | `ptt`, `busy`, `snr`, `level` | PTT edges, channel occupancy, SNR in dB, speed level | reliable |
 | `heard` | a full snapshot of up to 32 recent stations: session peers plus stations whose station-ID beacons were received (with the beacon's grid, when it carried one) | reliable |
+| `chat` | a message this station queued (`"direction":"out"`) or received (`"direction":"in"`) | reliable |
+| `chat_receipt` | an outgoing message's `"state"` became `delivered` or `failed` (`reason` with `failed`) | reliable |
 | `spectrum`, `audio_level`, `log` | only after the client opts in | lossy |
 | `decode_fail` | a cumulative count, at most every 500 ms | lossy |
 
@@ -334,6 +339,24 @@ B <- {"type":"data","data":"Hello N0CALL over WebSocket","encoding":"utf8"}
 A -> {"type":"disconnect","id":7}   A <- {"type":"ack","id":7}
 A <- {"type":"session","state":"disconnected"}   B <- {"type":"session","state":"disconnected"}
 ```
+
+Chat (COP-121) needs coppad 0.11.0 or later with `[host] websocket_enabled = true` on both
+stations; `status` carries `"chat":true` while such a session is up. Message ids are per station.
+A chat between VK3ABC (A) and W1AW (B):
+
+```text
+A -> {"type":"chat","text":"Good morning, 5/9 here","id":12}
+A <- {"type":"ack","id":12}
+A <- {"type":"chat","message_id":7,"direction":"out","text":"Good morning, 5/9 here","remote_call":"W1AW","timestamp_ms":1762600921000,"state":"sending"}
+B <- {"type":"chat","message_id":3,"direction":"in","text":"Good morning, 5/9 here","remote_call":"VK3ABC","timestamp_ms":1762600923400,"state":"received"}
+A <- {"type":"chat_receipt","message_id":7,"state":"delivered","timestamp_ms":1762600926700}
+A -> {"type":"chat_history","id":17}
+A <- {"type":"chat_history","id":17,"messages":[{"message_id":7,"direction":"out","text":"Good morning, 5/9 here","remote_call":"W1AW","timestamp_ms":1762600921000,"state":"delivered"}]}
+```
+
+`delivered` means the peer's coppad acknowledged the message, not that someone read it. A message
+still unacknowledged when the session ends gets `"state":"failed"` with a `reason`. The refusal
+and failure reasons are listed in [OPERATING.md](OPERATING.md#chat).
 
 ### Delivery and limits
 

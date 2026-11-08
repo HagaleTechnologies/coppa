@@ -62,6 +62,9 @@ pub struct LinkCapabilities {
     pub outer_code_rx: bool,
     /// Requests RS(12,6) session blocks, flags bit 3.
     pub outer_code_req: bool,
+    /// COP-121: carries stream 1 application records, flags bit 4, SPEC §23.
+    /// Negotiated as an AND of both sides; CONNECT_CFM must carry exactly it.
+    pub app_messages: bool,
     /// Modulation/coding scheme index.
     pub mcs_index: u8,
 }
@@ -77,6 +80,7 @@ impl Default for LinkCapabilities {
             multi_frame_ack: false,
             outer_code_rx: false,
             outer_code_req: false,
+            app_messages: false,
             mcs_index: 0,
         }
     }
@@ -91,11 +95,12 @@ impl LinkCapabilities {
         out.push(self.fec_rate_num);
         out.push(self.fec_rate_den);
         out.push(self.arq_window);
-        // Flags byte (byte 5): [compression:1][multi_frame_ack:1][outer_code_rx:1][outer_code_req:1][reserved:4].
+        // Flags byte (byte 5): [compression:1][multi_frame_ack:1][outer_code_rx:1][outer_code_req:1][app_messages:1][reserved:3].
         let flags = (self.compression as u8)
             | ((self.multi_frame_ack as u8) << 1)
             | ((self.outer_code_rx as u8) << 2)
-            | ((self.outer_code_req as u8) << 3);
+            | ((self.outer_code_req as u8) << 3)
+            | ((self.app_messages as u8) << 4);
         out.push(flags);
         out.push(self.mcs_index);
         out
@@ -117,6 +122,7 @@ impl LinkCapabilities {
             multi_frame_ack: bytes[5] & 0x02 != 0,
             outer_code_rx: bytes[5] & 0x04 != 0,
             outer_code_req: bytes[5] & 0x08 != 0,
+            app_messages: bytes[5] & 0x10 != 0,
             mcs_index: bytes[6],
         })
     }
@@ -143,6 +149,7 @@ impl LinkCapabilities {
             outer_code_req: self.outer_code_rx
                 && peer.outer_code_rx
                 && (self.outer_code_req || peer.outer_code_req),
+            app_messages: self.app_messages && peer.app_messages,
             mcs_index: self.mcs_index.min(peer.mcs_index),
         }
     }
@@ -367,6 +374,11 @@ impl Session {
                 || negotiated.outer_code_req != expected.outer_code_req
             {
                 return Err(ProtocolError::OuterCodeMismatch);
+            }
+            // COP-121: a mismatch would make one side read stream 1 records
+            // as host bytes, so CONNECT_CFM must carry exactly the AND.
+            if negotiated.app_messages != expected.app_messages {
+                return Err(ProtocolError::AppMessagesMismatch);
             }
             // Compression must not be enabled unless both sides support it
             if negotiated.compression && !expected.compression {
@@ -631,6 +643,7 @@ mod tests {
             multi_frame_ack: false,
             outer_code_rx: false,
             outer_code_req: false,
+            app_messages: false,
             mcs_index: 3,
         };
         let bytes = caps.to_bytes();
@@ -666,6 +679,7 @@ mod tests {
             multi_frame_ack: true,
             outer_code_rx: false,
             outer_code_req: false,
+            app_messages: false,
             mcs_index: 5,
         };
         let b = LinkCapabilities {
@@ -677,6 +691,7 @@ mod tests {
             multi_frame_ack: false,
             outer_code_rx: false,
             outer_code_req: false,
+            app_messages: false,
             mcs_index: 3,
         };
         let negotiated = a.negotiate(&b);
@@ -1345,6 +1360,76 @@ mod outer_tests {
                     .handle_connect_cfm(&expected.to_bytes(), now)
                     .unwrap();
             }
+        }
+    }
+}
+
+/// COP-121: the `app_messages` capability, flags bit 4 (SPEC §23).
+#[cfg(test)]
+mod app_messages_tests {
+    use super::*;
+
+    fn caps(app_messages: bool) -> LinkCapabilities {
+        LinkCapabilities {
+            multi_frame_ack: true,
+            outer_code_rx: true,
+            app_messages,
+            ..LinkCapabilities::default()
+        }
+    }
+
+    #[test]
+    fn app_messages_is_flags_bit_4() {
+        let bytes = caps(true).to_bytes();
+        assert_eq!(bytes[5] & 0x10, 0x10);
+        assert_eq!(caps(false).to_bytes()[5] & 0x10, 0);
+        assert!(LinkCapabilities::from_bytes(&bytes).unwrap().app_messages);
+        // P23 (SPEC §21), coppad 0.10.0's fade-off capabilities: bit 4 clear.
+        let p23 = [0x00, 0xc8, 0x01, 0x02, 0x08, 0x02, 0x00];
+        assert!(!LinkCapabilities::from_bytes(&p23).unwrap().app_messages);
+    }
+
+    #[test]
+    fn app_messages_negotiates_as_and() {
+        for a in [false, true] {
+            for b in [false, true] {
+                assert_eq!(caps(a).negotiate(&caps(b)).app_messages, a && b);
+                assert_eq!(caps(b).negotiate(&caps(a)).app_messages, a && b);
+            }
+        }
+    }
+
+    #[test]
+    fn connect_cfm_with_mismatched_app_messages_is_rejected() {
+        let now = Instant::now();
+        for (local, peer) in [(true, false), (false, true), (true, true)] {
+            let local = caps(local);
+            let peer = caps(peer);
+            let expected = local.negotiate(&peer);
+            let mut responder = Session::new(
+                0,
+                Callsign::new("W1AW").unwrap(),
+                Callsign::new("VK3ABC").unwrap(),
+                0,
+                local.clone(),
+                now,
+            );
+            responder.handle_connect_req(&peer.to_bytes(), now).unwrap();
+            let mut bad = expected.clone();
+            bad.app_messages = !expected.app_messages;
+            assert!(matches!(
+                responder.handle_connect_cfm(&bad.to_bytes(), now),
+                Err(ProtocolError::AppMessagesMismatch)
+            ));
+            assert_eq!(responder.state, SessionState::Accepting);
+            responder
+                .handle_connect_cfm(&expected.to_bytes(), now)
+                .unwrap();
+            assert_eq!(responder.state, SessionState::Established);
+            assert_eq!(
+                responder.negotiated.as_ref().unwrap().app_messages,
+                expected.app_messages
+            );
         }
     }
 }

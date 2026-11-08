@@ -578,6 +578,31 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:bb4b72d6f004630b69e6297b84d9c7edce0e4428cebd943152cb1e04a1bff18b",
+      "id": "session-chat-streams",
+      "kind": "gotcha",
+      "links": [
+        "coppa-protocol",
+        "session-fade-protection",
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/session-chat-streams.md",
+      "sources": [
+        "docs/SPEC.md",
+        "docs/adr/013-cop121-session-app-messages.md",
+        "crates/coppa-protocol/src/app_stream.rs",
+        "crates/coppa-daemon/src/event_loop.rs",
+        "crates/coppa-daemon/src/web/index.html"
+      ],
+      "status": "current",
+      "title": "What will bite you about session chat streams?",
+      "verified_commit": "f6e9951",
+      "verified_date": "2026-11-08",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:5f0af1acfa7a3e56172b9ddf44112b09d4c2af3b27927c0641fe3b2a3dd773cc",
       "id": "session-fade-protection",
       "kind": "gotcha",

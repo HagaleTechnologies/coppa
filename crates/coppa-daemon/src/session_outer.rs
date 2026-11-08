@@ -14,12 +14,13 @@ pub(crate) struct OuterTx {
 pub(crate) fn encode_burst(
     engine: &CoppaCore,
     addresses: (&Callsign, &Callsign, u8),
-    seq: u8,
+    (stream, seq): (u8, u8),
     data: &[u8],
     level: u8,
 ) -> Result<(Vec<f32>, usize)> {
     let (remote, local, ssid) = addresses;
-    let segment = TransportPdu::new_reliable(0, seq, 0, data.to_vec()).to_bytes();
+    // COP-121: the transport `session_id` nibble is the segment's stream.
+    let segment = TransportPdu::new_reliable(stream, seq, 0, data.to_vec()).to_bytes();
     let shard_len = shard_len_for_level(level).context("invalid outer packet level")?;
     let packets = encode_block(seq, &segment, shard_len)?;
     let mut burst = Vec::new();
@@ -60,7 +61,7 @@ mod tests {
         let remote = Callsign::new("N0BBB").unwrap();
         let host: Vec<_> = (0..587).map(|i| (i % 251) as u8).collect();
         let (burst, packet_len) =
-            encode_burst(&engine, (&remote, &local, 3), 19, &host, 2).unwrap();
+            encode_burst(&engine, (&remote, &local, 3), (0, 19), &host, 2).unwrap();
         assert_eq!(burst.len(), OUTER_N * packet_len);
         let mut samples = vec![0.0; 8192];
         samples.extend(burst);
@@ -101,10 +102,10 @@ mod tests {
         let local = Callsign::new("N0AAA").unwrap();
         let remote = Callsign::new("N0BBB").unwrap();
         let original =
-            encode_burst(&engine, (&remote, &local, 0), 255, b"pinned block", 2).unwrap();
+            encode_burst(&engine, (&remote, &local, 0), (0, 255), b"pinned block", 2).unwrap();
         engine.set_speed_level(5).unwrap();
         let retransmit =
-            encode_burst(&engine, (&remote, &local, 0), 255, b"pinned block", 2).unwrap();
+            encode_burst(&engine, (&remote, &local, 0), (0, 255), b"pinned block", 2).unwrap();
         assert_eq!(original, retransmit);
     }
 }

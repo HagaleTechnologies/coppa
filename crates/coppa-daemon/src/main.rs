@@ -790,6 +790,7 @@ async fn run_daemon(
         // Wire the live status snapshot so `status` replies carry real values
         // (decision 8, Phase 3 Task 7).
         event_loop.set_ws_status(ws_server.status());
+        event_loop.set_ws_chat_log(ws_server.chat_log());
 
         tokio::spawn(async move {
             if let Err(e) = ws_server.run_with_listener(ws_listener).await {

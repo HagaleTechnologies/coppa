@@ -90,6 +90,9 @@ pub enum HostEvent {
     /// COP-83: pin the TX speed level (the WebSocket `set_speed_level`
     /// request). `None` returns the TX level to the rate loop.
     SetSpeedLevel { client_id: u32, level: Option<u8> },
+    /// COP-121: queue a chat message to the session peer (the WebSocket `chat`
+    /// request). The daemon validates it again and answers with `chat` pushes.
+    ChatSend { client_id: u32, text: String },
 }
 
 /// Responses sent from the engine back to host clients.
