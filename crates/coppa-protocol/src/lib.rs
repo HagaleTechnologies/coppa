@@ -78,6 +78,7 @@ pub mod error;
 pub use error::ProtocolError;
 
 pub mod app;
+pub mod app_stream;
 pub mod arq;
 pub mod broadcast_file;
 pub mod cp_negotiator;

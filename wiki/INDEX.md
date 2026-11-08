@@ -31,3 +31,4 @@
 - [What will bite you when measuring coppa's TNC against Direwolf?](pages/tnc-direwolf-benchmark.md) — Misnamed track, two Direwolf defaults, 48 kHz input.
 - [What will bite you about the 9600 baud G3RUH TNC?](pages/tnc-g3ruh-9600.md) — Discriminator wiring, duplicate window and fixed phases.
 - [What will bite you about session fade protection?](pages/session-fade-protection.md) — HARQ keys, delayed ACKs and the burst-duration guard.
+- [What will bite you about session chat streams?](pages/session-chat-streams.md) — Stream nibble needs app_messages; chat bytes stay out of BUFFER.

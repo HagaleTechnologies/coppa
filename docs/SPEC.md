@@ -7,6 +7,7 @@ PHY header (§4.2) and the MAC header (§17.1).
 |---|---|---|---|
 | 2 (adds §16–§21, COP-130) | 2026-11-04 | 0.6.0 | `edb17bc` |
 | 3 (adds §22, COP-119) | 2026-11-04 | 0.9.0 | `79ee3aa` |
+| 4 (adds §23, COP-121) | 2026-11-08 | 0.11.0 | COP-121 branch, based on `f6e9951` |
 
 There is no in-band version negotiation and no changelog beyond §0.1's
 wire-break history.
@@ -38,6 +39,9 @@ modem; this spec describes only Coppa's own wire format.
   session packets, MAC type 10 and CONNECT flags bits 2 and 3. See §22.
   PHY and MAC versions remain 1. Non-negotiating stations keep their
   existing session data format.
+- **COP-121 session chat (0.11.0)** adds negotiated application records on
+  transport stream 1 and CONNECT flags bit 4. See §23. PHY and MAC versions
+  remain 1. Non-negotiating stations keep their existing session data format.
 
 This spec describes **wire-format version 1** — the format produced when
 `CoppaTransceiver`/`CoppaModem` are constructed with `version: 1`, which is
@@ -625,6 +629,11 @@ on every frame (`engine.rs:435,437`), so every on-air frame is RV0 and
 at the MAC and transport layers; CP-control retries refresh their ACK fields
 (§19.4). A receiver MUST still decode any
 `rv` correctly, because a conforming transmitter MAY cycle it.
+An RV1-RV3 frame is not self-decodable at every level: measured on a clean
+channel, a lone RV1, RV2 or RV3 frame fails to converge at L4, L5 and L7-L9,
+and a lone RV2 frame fails at L2, L3 and L6. Such a frame decodes by
+combining with the earlier transmission of the same `seq`, and the §14
+retransmission vectors test exactly that.
 
 ### 5.4 Scrambling and known-pad LLR pinning
 
@@ -942,7 +951,8 @@ receiver strategy choice (**SHOULD**, not **MUST**).
 
 ## 11. Byte/bit orders — cross-reference
 
-Negotiated outer-coded session framing is specified in §22.
+Negotiated outer-coded session framing is specified in §22, and session
+application records (stream 1) in §23.
 
 | Structure | Order | Source |
 |---|---|---|
@@ -1128,34 +1138,80 @@ A conforming implementation MAY:
 
 ## 14. Executable conformance vectors
 
-`testdata/golden/manifest.toml` (20 entries: the cross product of levels
-`{1, 2, 5, 6, 8}` × channel conditions `{clean, awgn12, poor25, ssbcfo}`,
-enforced by `golden_manifest_covers_the_full_grid`,
-`crates/coppa-protocol/tests/golden_vectors.rs:205-232`) is a set of
-**frozen, committed reference vectors** for exactly this spec's wire
-format: each entry names a 48 kHz/16-bit-PCM WAV file
-(`testdata/golden/<id>.wav`) containing one complete Coppa frame (encoded
-per this spec, then passed through a documented channel condition —
-`clean`, 12 dB AWGN, a 25 dB "poor" Watterson-fading preset, or a 20 dB SSB
-+15 Hz-CFO condition) plus the exact application payload
-(`payload_hex`) that frame **MUST** decode back to.
+`testdata/golden/manifest.toml` is a set of **frozen, committed reference
+vectors** for exactly this spec's wire format. Each entry names a
+48 kHz/16-bit-PCM WAV file (`testdata/golden/<id>.wav`), encoded per this
+spec and then passed through a documented channel condition (`clean`, AWGN,
+a 25 dB "poor" Watterson-fading preset, or a 20 dB SSB +15 Hz-CFO
+condition), plus the exact application payload (`payload_hex`) the WAV
+**MUST** decode back to. The `channel` key names the condition type; for the
+AWGN entries the operating point is `snr_db`: 12 dB for levels 1-6, 24 dB
+for levels 7-9, and for the retransmission entries a point where the first
+frame alone fails (3 dB at L4, 19 or 20 dB at L9).
 
-`crates/coppa-protocol/tests/golden_vectors.rs`'s
-`golden_vectors_decode_to_expected_payloads` test
+The manifest holds 42 entries in three families (COP-129):
+
+- **Speed levels (34):** levels 1-8 × channel conditions `{clean, awgn12,
+  poor25, ssbcfo}`, plus level 9 on `{clean, awgn12}` only. Level 9 is
+  VHF-only (`docs/adr/009-cop24-speed-ladder-renumber.md`), so it has no
+  HF fading or SSB vector. Each WAV holds one single-codeword RV0 frame
+  with a full-capacity payload.
+- **Multi-codeword (3):** `L4_awgn12_cw3`, `L7_awgn12_cw3` and
+  `L9_awgn12_cw8`. Each WAV holds one frame with `codewords > 1` (§9), and
+  no payload length is a multiple of the codeword count, so each exercises
+  §9.1's `+1` split. L4 sits below and L7 and L9 above the cross-codeword
+  interleave gate (§9.3).
+- **Retransmission (5):** `L9_awgn12_rtx_rv1`, `_rv2` and `_rv3` (IR-HARQ),
+  `L9_awgn12_rtx_rv0` (Chase, the form the reference daemon sends, §5.3)
+  and `L4_awgn12_rtx_rv2` (an HF level). Each WAV holds two frames, as
+  described below.
+
+Two optional keys describe the newer entries; an entry without them has
+the default:
+
+- `codewords` (default 1): the frame's LDPC codeword count (§4.2, §9).
+- `rv_sequence` (default `[0]`): the RV (§5.3) of each frame in the WAV,
+  one element per frame, in on-air order.
+
+A retransmission entry's WAV is 100 ms of silence, the RV0 frame, 100 ms of
+silence, the retransmission frame, then 100 ms of silence (4,800 samples
+per gap). Both frames carry the same payload and `seq_num` 0. AWGN covers
+the whole WAV, gaps included, referenced to the first frame's mean power.
+The first frame alone decodes to nothing, and a lone RV1-RV3 frame is not
+self-decodable at L4 or L9 (§5.3). A conforming receiver **MUST** combine
+the two frames' soft values (§5.3) and deliver exactly one frame, carrying
+the payload and the last RV in `rv_sequence`.
+
+`crates/coppa-protocol/tests/golden_vectors.rs` is the executable check
 (run via `cargo test -p coppa-protocol --test golden_vectors`, or as part
-of `cargo test --workspace`) is the executable check: for every manifest
-entry it constructs a `CoppaTransceiver` for that level's profile, calls
-`receive()` on the WAV samples, and asserts the recovered `speed_level` and
-payload bytes exactly match the manifest (`crates/coppa-protocol/tests/golden_vectors.rs:144-190`).
-All 20 entries, including `L8_poor25`, have `expected_decode_ok = true`.
-The test requires every vector to decode to its exact manifest payload.
+of `cargo test --workspace`):
+
+- `golden_manifest_covers_the_full_grid` asserts the 42-entry shape above.
+- `golden_vectors_decode_to_expected_payloads` checks every single-frame
+  entry: it constructs a `CoppaTransceiver` for that level's profile, calls
+  `receive()` on the WAV samples, and asserts the recovered `speed_level`,
+  `codewords` and payload bytes exactly match the manifest. It skips
+  retransmission entries, because the batch `receive()` is single-frame by
+  design.
+- `golden_vectors_decode_through_the_streaming_receiver` checks every
+  entry, retransmissions included: a `StreamingReceiver` fed the WAV in
+  100 ms chunks must deliver exactly one frame with the exact payload and
+  `codewords`, and for a retransmission entry that frame must carry the
+  last RV in `rv_sequence`.
+
+`crates/coppa-cli/tests/rx_golden.rs` runs `coppa rx --raw` on every entry
+and requires its output to be exactly the payload, one line. All 42
+entries have `expected_decode_ok = true`.
 
 An independent implementer **SHOULD** treat this manifest + WAV set as the
-primary interoperability conformance suite: correctly demodulating all 20 WAVs
-to their exact `payload_hex` is strong evidence of wire-format compatibility
-with this reference implementation. Vectors are regenerated
+primary interoperability conformance suite: correctly demodulating all 42
+WAVs to their exact `payload_hex` is strong evidence of wire-format
+compatibility with this reference implementation. Vectors are generated
 (not hand-authored) via `cargo run -p coppa-bench --release --example
-golden_vectors_gen` (`crates/coppa-protocol/tests/golden_vectors.rs:3-4,129`).
+golden_vectors_gen` (`crates/coppa-bench/diagnostics/golden_vectors_gen.rs`).
+The generator is additive: it keeps every entry already in the manifest and
+appends only missing ones, because regenerating on another machine does not
+reproduce the committed WAVs bit for bit.
 
 These WAVs carry random payload bytes, not MAC or transport frames. The
 byte-level vectors for §16–§20 are in §21, and those for §15 in §15.6.
@@ -1427,6 +1483,11 @@ Implementers MUST NOT build it expecting interop; the engine-layer `0xFE`
 envelope of §15.1 is the only compression on the air. This note follows
 §12's precedent for stale unused definitions.
 
+`AppPdu` itself is on the air in two places: the COP-124 broadcast-file
+application ("Broadcast file application", after §21.4) and the session
+stream 1 records of §23 (COP-121). Both send the compression field as 0
+(`None`), so it stays dead there too.
+
 ---
 
 ## 16. Layering and payload classification
@@ -1466,6 +1527,7 @@ The reference daemon emits the following payload shapes
 |---|---|---|---|
 | Session data | MAC `Data` + transport `Reliable` (`session_data_frame`, `:263`) | yes | §17, §18, §19 |
 | Session ACK | MAC `Ack` + transport `Ack`, 21 bytes (`session_ack_frame`, `:276`) | yes | §17, §18, §19 |
+| Session application records | MAC `Data` + transport `Reliable` with `session_id` 1, only with `app_messages` negotiated | no (both stations need the WebSocket API on, §23.1) | §23 |
 | Handshake | MAC `ConnectReq`/`ConnectAck`/`ConnectCfm` + 7-byte capabilities | yes | §20.1 |
 | Teardown, liveness | MAC `Disconnect`/`Keepalive`, empty payload, 14 bytes | yes | §20.3 |
 | Station ID | MAC `Beacon` + station-ID payload (`build_beacon_mac_pdu`, `:5338`) | yes, at the first transmission and every `id_interval_secs` | §17.5 |
@@ -1525,9 +1587,11 @@ traffic is always MAC-framed, and bare transport PDUs shorter than 14 bytes
 These are not part of the OFDM link wire format and an implementer MUST NOT
 expect them on the air: the legacy `coppa_protocol::frame::Frame`
 (`[Preamble][Sync][Length][MAC PDU][CRC-16]`, used only by tests and a fuzz
-target, `crates/coppa-protocol/src/frame.rs`); `AppPdu` (§15.7; the
-module comments at `mac.rs:4` and `transport.rs:2-4` that show an `[App PDU]`
-inside the transport PDU are stale, the payload is opaque host bytes); the
+target, `crates/coppa-protocol/src/frame.rs`); `AppPdu` outside the two
+places that carry it, §23's session stream 1 records and the broadcast-file
+application (§15.7; the module comments at `mac.rs:4` and `transport.rs:2-4`
+that show an `[App PDU]` inside every transport PDU are stale, a stream 0
+payload is opaque host bytes); the
 AX.25 codec and the AFSK 1200 TNC (`docs/TNC.md`); and the host interfaces
 (VARA-style TCP, KISS, WebSocket, ARDOP), which are local APIs, not
 over-the-air formats. Raw sessionless data (ARQ off) is host bytes with no
@@ -1681,7 +1745,7 @@ Source: `crates/coppa-protocol/src/transport.rs`.
 
 | Offset | Width | Field | Value |
 |---|---|---|---|
-| 0, bits 7–4 | 4 bits | `session_id` | transmitted as 0 by the reference stack; ignored on receive |
+| 0, bits 7–4 | 4 bits | `session_id` | on a session that negotiated `app_messages`, the segment's stream (§23.2): 0 host bytes, 1 application records; otherwise transmitted as 0 by the reference stack and ignored on receive |
 | 0, bits 3–0 | 4 bits | `type` | `TransportType`, §18.2 |
 | 1 | 1 byte | `seq_num` | segment sequence number, mod 256 (§19.1) |
 | 2 | 1 byte | `ack_num` | exclusive cumulative ACK boundary (§19.2) |
@@ -1693,10 +1757,14 @@ Source: `crates/coppa-protocol/src/transport.rs`.
 `TransportPdu::from_bytes` (`transport.rs:261-284`).
 
 The `session_id` nibble does not identify a connected session. The
-reference daemon sends 0 inside session frames (`event_loop.rs:263-287`)
-and its sessionless and CP-control state (`arq_session_id`) is also always
-0; replies copy the received nibble. Session identity on the wire is the
-MAC (`src`, `dest`, `ssid`) triple (§20.2).
+reference daemon sends 0 inside session frames (`event_loop.rs:263-287`),
+except a `Reliable` segment of stream 1 on a session that negotiated
+`app_messages` (COP-121, §23.2), which carries 1. Session ACKs carry 0
+whatever stream they acknowledge. Its sessionless and CP-control state
+(`arq_session_id`) is also always 0; replies copy the received nibble. A
+receiver reads the nibble as a stream only when `app_messages` was
+negotiated; otherwise it ignores it, as before. Session identity on the wire
+is the MAC (`src`, `dest`, `ssid`) triple (§20.2).
 
 ### 18.2 Transport types
 
@@ -1897,15 +1965,17 @@ complete exchange.
 | 2 | 1 | `fec_rate_num` | 1 | 1 |
 | 3 | 1 | `fec_rate_den` | 2 | 2 |
 | 4 | 1 | `arq_window` | 8 | 8 |
-| 5 | 1 | flags: bit 0 `compression`, bit 1 `multi_frame_ack`, bits 2–3 outer-code capability (§22.1, COP-119), bits 4–7 reserved | `0x00` | `0x02` |
+| 5 | 1 | flags: bit 0 `compression`, bit 1 `multi_frame_ack`, bits 2–3 outer-code capability (§22.1, COP-119), bit 4 `app_messages` (§23.1, COP-121), bits 5–7 reserved | `0x00` | `0x06`; `0x16` with the WebSocket API on |
 | 6 | 1 | `mcs_index` | 0 | 0 |
 
 The library default encodes as `00c80102080000` (P24). coppad sets
 `multi_frame_ack` (`event_loop.rs:207-212`); a 0.6.0 station, and a 0.9.0
 station with `[session] fade_protection = "off"`, sends `00c80102080200`
 (P23), while a 0.9.0 coppad at the default `accept` also sets bit 2 and
-sends `00c80102080600` (§22.1). Transmitters MUST send reserved flag bits
-as 0. Receivers ignore them, ignore bytes after offset 6, and reject fewer
+sends `00c80102080600` (§22.1). A 0.11.0 coppad sets bit 4 as well when it
+was built with the `websocket` feature and `[host] websocket_enabled = true`
+(row A03, §23.7); with the default configuration it still sends the 0.9.0
+bytes. Transmitters MUST send reserved flag bits as 0. Receivers ignore them, ignore bytes after offset 6, and reject fewer
 than 7 bytes (`CapabilitiesTooShort`). A zero `fec_rate_den` parses; the
 reference treats that rate as 0 when comparing.
 
@@ -1914,18 +1984,22 @@ field: the minimum of `max_payload_size`, `arq_window` and `mcs_index`;
 the lower of the two FEC rates, taken as the (num, den) pair, with a tie
 keeping the initiator's own pair; and the logical AND of each flag. The
 outer-code bits 2–3 follow §22.1 instead: receive is ANDed, and the
-request bit is set when receive holds and either side requests. P25 and
-P26 negotiate to P27 in either order.
+request bit is set when receive holds and either side requests. Bit 4,
+`app_messages`, is ANDed like the others (§23.1). P25 and P26 negotiate to
+P27 in either order.
 
 **Responder validation** (`handle_connect_cfm`, `session.rs:314-357`): the
 responder recomputes `negotiate(local, remote)` and rejects the `ConnectCfm`
 if its `max_payload_size`, `arq_window`, `mcs_index` or FEC rate exceeds
-that bound, or if it sets `compression` when the bound does not. It does
-not check `multi_frame_ack`. On rejection the reference responder silently
+that bound, if it sets `compression` when the bound does not, if its
+outer-code bits differ from the bound (`OuterCodeMismatch`, §22.1), or if
+its `app_messages` bit differs from the bound (`AppMessagesMismatch`,
+§23.1). It does not check `multi_frame_ack`. On rejection the reference responder silently
 drops the session; it sends nothing.
 
-**What the negotiated values do.** Only `multi_frame_ack` changes on-air
-behaviour: when both stations set it, a session `Data` frame MAY use more
+**What the negotiated values do.** The outer-code bits enable §22 and
+`app_messages` enables §23's stream 1; outside those sections, only
+`multi_frame_ack` changes on-air behaviour: when both stations set it, a session `Data` frame MAY use more
 than one PHY codeword (up to `min(max_codewords_per_frame, 8)`); otherwise
 every session `Data` frame is one codeword (`event_loop.rs:2405-2421`). It
 does not change the ACK format. A receiver decodes a multi-codeword frame
@@ -2246,8 +2320,8 @@ enough chunks remain on air. See [BROADCAST.md](BROADCAST.md) for operation.
 
 CONNECT capabilities remain seven bytes. In flags byte 5, bit 0 is compression,
 bit 1 is multi-frame ACK, bit 2 is `outer_code_rx` and bit 3 is `outer_code_req`.
-Bits 4 through 7 are reserved and MUST be transmitted as zero and ignored on
-receipt. An `off` station advertises neither outer-code bit, `accept` advertises
+Bit 4 is `app_messages` (§23.1, COP-121). Bits 5 through 7 are reserved and
+MUST be transmitted as zero and ignored on receipt. An `off` station advertises neither outer-code bit, `accept` advertises
 bit 2 only, and `request` advertises both. The negotiated receive bit MUST be
 `a.rx AND b.rx`; the request bit MUST be `rx AND (a.req OR b.req)`. The mode is
 active only when both negotiated bits are true. CONNECT_CFM MUST carry those
@@ -2334,3 +2408,186 @@ ordinary Data frames. The in-flight block level remains fixed across retries.
 Source: `crates/coppa-protocol/src/outer_code.rs`, `fec/outer_rs.rs`,
 `session.rs`, `mac.rs`; daemon integration in
 `crates/coppa-daemon/src/session_outer.rs` and `event_loop.rs`.
+
+---
+
+## 23. Application messages on a session
+
+COP-121 (0.11.0) adds a second byte stream inside the connected-session ARQ
+of §19 and §20, used for operator chat. Host bytes keep their format byte
+for byte. The decisions behind this section, with the alternatives that
+were rejected, are in `docs/adr/013-cop121-session-app-messages.md`.
+
+### 23.1 Capability
+
+CONNECT capabilities remain seven bytes (§20.1). Flags byte 5 bit 4 is
+`app_messages`. The negotiated value MUST be `a.app_messages AND
+b.app_messages`. CONNECT_CFM MUST carry exactly that AND, and the responder
+MUST reject a CONNECT_CFM whose bit 4 differs from it
+(`ProtocolError::AppMessagesMismatch`, `Session::handle_connect_cfm`,
+`crates/coppa-protocol/src/session.rs`); like every §20.1 rejection, the
+reference responder then drops the session and sends nothing. A mismatch
+would make one station read stream 1 records as host bytes. An older peer
+sends bit 4 as a reserved zero and never enables this section. The library
+`Link` advertises `LinkCapabilities::default()`, so it never enables it
+either.
+
+coppad sets bit 4 only when it was built with the `websocket` feature and
+`[host] websocket_enabled = true` (`local_link_caps`,
+`crates/coppa-daemon/src/event_loop.rs`), so a delivered message always
+reached a station whose dashboard can show it. A default-configuration
+coppad sends the same capability bytes as 0.9.0 (row A04).
+
+### 23.2 Streams
+
+With `app_messages` negotiated, the transport `session_id` nibble (§18.1) of
+a session `Reliable` segment names its stream. This holds for a segment in a
+MAC `Data` frame and for one reconstructed from a §22 RS(12,6) block, which
+carries the whole transport PDU.
+
+| Nibble | Stream | Contents |
+|---|---|---|
+| 0 | host | host bytes, unchanged from §16.1 |
+| 1 | application | records (§23.3) |
+| 2–15 | reserved | a transmitter MUST NOT send them; a receiver MUST acknowledge them like any segment (§19) and drop their payload |
+
+Without `app_messages`, the nibble keeps its §18.1 meaning: a transmitter
+MUST send 0, and a receiver MUST ignore it and deliver every segment as host
+bytes. A 0.10.0 receiver already does exactly that, which is why stream 1
+MUST NOT be sent unless both stations negotiated it.
+
+Both streams share one ARQ sequence space: each segment has one `seq_num`,
+whatever its stream, and the session `Ack` (which carries `session_id` 0)
+acknowledges by sequence number only (§19.2). A segment carries bytes of one
+stream only. A retransmission is byte-identical to the first transmission,
+nibble included (§19.4). A receiver MUST keep each segment's stream while it
+buffers out-of-order segments, and delivers each stream's bytes in sequence
+order. There is no ordering between the two streams.
+
+**(Informative)** The reference sender cuts the next segment from queued
+stream 1 bytes before queued stream 0 bytes, so a chat message waits for at
+most the segment already in flight (`drain_session_link`,
+`try_send_outer_block`, `event_loop.rs`).
+
+### 23.3 Record format
+
+The stream 1 payloads, concatenated in sequence order, form a byte stream of
+records. A record MAY span segments, and a segment MAY hold several records.
+
+| Offset | Width | Field | Value |
+|---|---|---|---|
+| 0 | 2 bytes | `length` | u16 big-endian, the `AppPdu` length in bytes; at least 4 |
+| 2 | 1 byte | `AppPdu` byte 0 | protocol (bits 7–4), compression (bits 3–2), fragment flags (bits 1–0) |
+| 3 | 1 byte | `frag_id` | 0 |
+| 4 | 1 byte | `frag_index` | 0 |
+| 5 | 1 byte | `frag_total` | 1 |
+| 6 | `length` − 4 bytes | payload | per protocol |
+
+The `AppPdu` layout is `crates/coppa-protocol/src/app.rs` (`AppPdu::to_bytes`,
+`AppProtocol`). On stream 1 a transmitter MUST send compression 0 (§15.7),
+fragment flags 0 (`Complete`), `frag_id` 0, `frag_index` 0 and
+`frag_total` 1; a receiver ignores the fragment fields. Encoder:
+`encode_record`; reader: `RecordReader`
+(`crates/coppa-protocol/src/app_stream.rs`).
+
+### 23.4 Chat records
+
+A record with protocol `AppProtocol::Text` (0) is one chat message. Its
+`AppPdu` header is always the four bytes `00 00 00 01`. Its payload is UTF-8
+text of 1 to 512 bytes with at least one non-whitespace character
+(`check_chat_text`, `chat_record`, `CHAT_MAX_BYTES`). A receiver MUST NOT
+fail the stream on invalid UTF-8; the reference replaces each invalid
+sequence with U+FFFD.
+
+### 23.5 Receiver rules
+
+1. Acknowledge every session `Reliable` segment exactly as §19 requires,
+   whatever its stream.
+2. When `app_messages` was negotiated, route each delivered segment by its
+   stream: 0 to the host, exactly as before; 1 to the record reader;
+   2–15 dropped.
+3. Skip a record whose protocol is not one the receiver handles, including
+   the unassigned nibbles 8–15, by its `length`, and continue with the next
+   record. The reference handles `Text` only.
+4. A `length` below 4 makes the rest of that session's stream 1 unreadable.
+   The receiver MUST discard every later stream 1 byte of the session (it
+   still acknowledges the segments). The reference warns once.
+5. Record state is per session. A partial record at teardown is discarded.
+6. A `Text` record whose payload is longer than 512 bytes, or has no
+   non-whitespace character, is skipped like an unhandled protocol (the
+   reference logs it at debug). It is still acknowledged, so the sender
+   reports it delivered.
+
+### 23.6 Delivery
+
+A message is **delivered** when the sender's ARQ acknowledges the segment
+that holds the last byte of its record. There is no receipt frame. The
+reference sender counts the stream 1 bytes each ACK newly covers
+(`DeliveryTracker`), which relies on one segment in flight
+(`SESSION_ARQ_WINDOW = 1`, §19.4). Delivered means the peer's stack accepted
+the record; it does not mean a person read it.
+
+A message whose last byte is still unacknowledged when the session ends, for
+any reason (§20.3, or the link failing), has **failed**. It is not resent in
+a later session.
+
+**(Informative)** Reference limits and reasons. coppad holds at most 32
+unacknowledged messages per session (`CHAT_MAX_WAITING`). A host
+`DISCONNECT` waits for queued stream 1 bytes to be acknowledged, as it does
+for host bytes. Stream 1 bytes are not counted in the VARA `BUFFER` or the
+WebSocket `buffer` value. The local API reports these reasons verbatim
+(`chat_reason`, `app_stream.rs`): `No session: call a station first`,
+`The session is closing`, `The peer's coppad does not accept chat: it needs
+coppad 0.11.0 or later with its WebSocket API enabled`, `The session ended
+before the peer acknowledged the message`, `Too many messages are waiting to
+be delivered (32)`, `Message is empty` and `Message is <n> bytes; the limit
+is 512`. They are not on the air.
+
+### 23.7 Vectors
+
+The stations and conventions are §21's: `VK3ABC` is the initiator, `W1AW`
+the responder, `ssid = 0`.
+
+| ID | Content | Bytes | Hex |
+|---|---|---|---|
+| A01 | chat record, text `73` | 8 | `0006000000013733` |
+| A02 | `Data`, seq 0, stream 1, carrying A01, VK3ABC to W1AW | 29 | `105dc05700000058b78108300000110000000000000006000000013733` |
+| A03 | capabilities, coppad 0.11.0, WebSocket API on, fade protection `accept` | 7 | `00c80102081600` |
+| A04 | A03 negotiated with a coppad 0.10.0 at `accept` (chat off) | 7 | `00c80102080600` |
+
+**A01.** `00 06`: `length` 6. `00`: protocol 0 (`Text`), compression 0,
+`Complete`. `00 00 01`: `frag_id` 0, `frag_index` 0, `frag_total` 1.
+`37 33` = `73`.
+
+**A02.** Bytes 0–13 are P04's MAC header (§21.2). Transport byte 0 `11`:
+`session_id` 1 (stream 1), `type` 1 (`Reliable`); `seq_num` 0, `ack_num` 0,
+`ack_bitmap` 0. The payload is A01. Length 14 + 7 + 8 = 29.
+
+**A03 and A04.** Flags `0x16` are `multi_frame_ack`, `outer_code_rx` and
+`app_messages`. A 0.10.0 peer at `accept` sends flags `0x06`, so the AND
+clears bit 4.
+
+`crates/coppa-protocol/tests/app_stream_vectors.rs` (`cargo test -p
+coppa-protocol --test app_stream_vectors`) builds each row with the public
+encoders and reads this section to check that each row still carries the
+same hex.
+
+### 23.8 Conformance checklist
+
+- Verify bit 4 is ANDed in both orders and that a mismatched CONNECT_CFM is
+  rejected.
+- Verify a session without `app_messages` sends nibble 0 and delivers a
+  nibble-1 segment as host bytes.
+- Verify records split at every byte boundary reassemble, and several
+  records in one segment come out in order.
+- Verify an unknown protocol is skipped, a `length` below 4 stops stream 1,
+  and an unknown stream is acknowledged and dropped.
+- Verify a message is delivered only after the ACK covering its last byte,
+  and fails when the session ends first.
+- Verify a retransmitted stream 1 segment is byte-identical, and that a
+  stream 1 segment survives a §22 RS(12,6) block.
+
+Source: `crates/coppa-protocol/src/app_stream.rs`, `app.rs`, `session.rs`;
+daemon integration in `crates/coppa-daemon/src/event_loop.rs`
+(`deliver_session_segment`, `drain_session_link`, `handle_chat_send`) and
+`session_outer.rs`.

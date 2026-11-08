@@ -10,6 +10,32 @@ pub enum ProtocolError {
     /// CONNECT_CFM did not confirm the outer-code intersection.
     #[error("Outer-code capabilities do not match negotiation")]
     OuterCodeMismatch,
+    /// COP-121: CONNECT_CFM did not confirm the `app_messages` AND.
+    #[error("Application-message capability does not match negotiation")]
+    AppMessagesMismatch,
+    /// COP-121: a chat message has no non-whitespace character.
+    #[error("Message is empty")]
+    ChatEmpty,
+    /// COP-121: a chat message is longer than the limit, in UTF-8 bytes.
+    #[error("Message is {len} bytes; the limit is {max}")]
+    ChatTooLong {
+        /// Length of the message, in UTF-8 bytes.
+        len: usize,
+        /// Longest message accepted (`app_stream::CHAT_MAX_BYTES`), in bytes.
+        max: usize,
+    },
+    /// COP-121: a stream 1 record length is shorter than the `AppPdu` header.
+    #[error("Application record too short: length {len} (min 4)")]
+    AppRecordTooShort {
+        /// The record's length field.
+        len: u16,
+    },
+    /// COP-121: an `AppPdu` is too long for a record's 16-bit length field.
+    #[error("Application record too long: {len} bytes (max 65535)")]
+    AppRecordTooLong {
+        /// Length of the encoded `AppPdu`, in bytes.
+        len: usize,
+    },
     /// Unknown MAC frame type.
     #[error("Unknown MAC frame type: {value}")]
     UnknownMacFrameType {

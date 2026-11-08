@@ -64,6 +64,16 @@ pub enum WsClientMessage {
     /// `status.speed_levels`.
     #[serde(rename = "set_speed_level")]
     SetSpeedLevel { level: SpeedLevelSetting },
+    /// COP-121: send a chat message to the session peer. 1 to 512 UTF-8
+    /// bytes with at least one non-whitespace character; needs a session
+    /// whose peer accepts chat (`status.chat` is `true`). The message itself
+    /// arrives as a `chat` push with `"state":"sending"`.
+    #[serde(rename = "chat")]
+    Chat { text: String },
+    /// COP-121: the last [`CHAT_HISTORY_LEN`] chat messages since the daemon
+    /// started, oldest first, each with its current state.
+    #[serde(rename = "chat_history")]
+    ChatHistory,
 }
 
 /// COP-83: the `level` of a `set_speed_level` request: a speed level, or the
@@ -210,6 +220,10 @@ pub enum WsServerMessage {
         /// COP-83: the session ARQ link; absent without one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         link: Option<Box<LinkStats>>,
+        /// COP-121: `true` while a session that negotiated chat is up,
+        /// `false` while a session without it is up, absent with no session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat: Option<bool>,
     },
     /// Data received from remote station.
     #[serde(rename = "data")]
@@ -306,6 +320,123 @@ pub enum WsServerMessage {
         /// Wall-clock time this message was produced (Unix epoch, ms).
         timestamp_ms: u64,
     },
+    /// COP-121: a chat message this station queued (`"direction":"out"`)
+    /// or received (`"direction":"in"`). Reliable.
+    #[serde(rename = "chat")]
+    Chat(ChatEntry),
+    /// COP-121: an outgoing chat message's state became `delivered` or
+    /// `failed` (`reason` with `failed`). Reliable.
+    #[serde(rename = "chat_receipt")]
+    ChatReceipt {
+        /// This station's id for the message (the `chat` push's).
+        message_id: u64,
+        /// `delivered` or `failed`.
+        state: ChatState,
+        /// Why the message failed; absent unless `state` is `failed`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// Wall-clock time the state changed (Unix epoch, ms).
+        timestamp_ms: u64,
+    },
+    /// COP-121: reply to `chat_history`: the last [`CHAT_HISTORY_LEN`] chat
+    /// messages since the daemon started, oldest first.
+    #[serde(rename = "chat_history")]
+    ChatHistory {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
+        messages: Vec<ChatEntry>,
+    },
+}
+
+/// COP-121: which way a chat message went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatDirection {
+    /// Sent by this station.
+    Out,
+    /// Received from the session peer.
+    In,
+}
+
+/// COP-121: a chat message's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatState {
+    /// Queued; the peer has not acknowledged its last byte yet.
+    Sending,
+    /// The peer's ARQ ACK covered the message's last byte.
+    Delivered,
+    /// Refused, or the session ended before the peer acknowledged it.
+    Failed,
+    /// Received from the peer.
+    Received,
+}
+
+/// COP-121: one chat message, as the `chat` push, the `chat_history` reply
+/// and [`ChatLog`] carry it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ChatEntry {
+    /// This station's id for the message; ids are per station and start at 1
+    /// each time the daemon starts.
+    pub message_id: u64,
+    /// `out` (sent) or `in` (received).
+    pub direction: ChatDirection,
+    /// The message text.
+    pub text: String,
+    /// The session peer's callsign.
+    pub remote_call: String,
+    /// Wall-clock time the message was queued or received (Unix epoch, ms).
+    pub timestamp_ms: u64,
+    /// Current state.
+    pub state: ChatState,
+    /// Why the message failed; absent unless `state` is `failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// COP-121: how many chat messages [`ChatLog`] keeps.
+pub const CHAT_HISTORY_LEN: usize = 100;
+
+/// COP-121: the last [`CHAT_HISTORY_LEN`] chat messages, oldest first, shared
+/// between the daemon (which writes it before each `chat` or `chat_receipt`
+/// push) and the WebSocket task (which answers `chat_history` from it).
+#[derive(Debug, Clone, Default)]
+pub struct ChatLog {
+    entries: std::collections::VecDeque<ChatEntry>,
+}
+
+impl ChatLog {
+    /// Append `entry`, dropping the oldest once the log holds
+    /// [`CHAT_HISTORY_LEN`] messages.
+    pub fn push(&mut self, entry: ChatEntry) {
+        while self.entries.len() >= CHAT_HISTORY_LEN {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(entry);
+    }
+
+    /// Set message `message_id`'s state and reason. Returns `false` when the
+    /// log no longer holds it.
+    pub fn update(&mut self, message_id: u64, state: ChatState, reason: Option<String>) -> bool {
+        match self
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|e| e.message_id == message_id)
+        {
+            Some(entry) => {
+                entry.state = state;
+                entry.reason = reason;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Every message held, oldest first.
+    pub fn snapshot(&self) -> Vec<ChatEntry> {
+        self.entries.iter().cloned().collect()
+    }
 }
 
 /// Version of the JSON text protocol announced after authentication.
@@ -495,6 +626,8 @@ pub struct WsStatus {
     pub heard: Option<Vec<HeardStation>>,
     /// COP-83: the session ARQ link.
     pub link: Option<LinkStats>,
+    /// COP-121: whether the session negotiated chat; `None` with no session.
+    pub chat: Option<bool>,
 }
 
 impl WsStatus {
@@ -530,6 +663,7 @@ impl WsStatus {
             loop_age_ms: self.loop_heartbeat.map(millis),
             heard: self.heard,
             link: self.link.map(Box::new),
+            chat: self.chat,
         }
     }
 
@@ -559,6 +693,25 @@ impl WsStatus {
                     coppa_engine::TUNE_SINGLE_MAX_HZ
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// COP-121: refuse a `chat` this snapshot shows the daemon would refuse.
+    /// The text is always checked; the session checks wait until the daemon
+    /// has published (`max_tune_s` is `Some`). The daemon re-checks
+    /// everything.
+    pub fn check_chat(&self, text: &str) -> Result<(), String> {
+        use coppa_protocol::app_stream::{chat_reason, check_chat_text};
+        check_chat_text(text).map_err(|e| e.to_string())?;
+        if self.max_tune_s.is_none() {
+            return Ok(());
+        }
+        if !self.connected {
+            return Err(chat_reason::NO_SESSION.to_owned());
+        }
+        if self.chat == Some(false) {
+            return Err(chat_reason::PEER_WITHOUT_CHAT.to_owned());
         }
         Ok(())
     }
@@ -814,6 +967,8 @@ pub struct WebSocketServer {
     /// Shared live status snapshot; see [`WsStatus`]. The daemon holds the sender
     /// side (via [`Self::status`]) and updates it as frames decode.
     status: std::sync::Arc<tokio::sync::Mutex<WsStatus>>,
+    /// COP-121: chat history; see [`ChatLog`] and [`Self::chat_log`].
+    chat_log: Arc<Mutex<ChatLog>>,
     /// COP-53 handshake gate; see [`WsAuth`]. `None` refuses every handshake.
     auth: Option<std::sync::Arc<WsAuth>>,
     /// COP-79: the page served to a plain (non-upgrade) `GET /`. `None`
@@ -845,6 +1000,7 @@ impl WebSocketServer {
             event_rx: Some(event_rx),
             broadcast_tx,
             status: std::sync::Arc::new(tokio::sync::Mutex::new(WsStatus::default())),
+            chat_log: Arc::new(Mutex::new(ChatLog::default())),
             auth: None,
             index_html: None,
             health: None,
@@ -929,6 +1085,13 @@ impl WebSocketServer {
         self.status.clone()
     }
 
+    /// COP-121: the shared chat history. The daemon writes each message and
+    /// state change here before pushing it, and the server answers
+    /// `chat_history` requests from it.
+    pub fn chat_log(&self) -> Arc<Mutex<ChatLog>> {
+        self.chat_log.clone()
+    }
+
     /// Run the WebSocket server, accepting connections and piping events.
     ///
     /// Every handshake is gated by the [`WsAuth`] set with [`Self::with_auth`]
@@ -992,6 +1155,7 @@ impl WebSocketServer {
             let broadcast_tx = self.broadcast_tx.clone();
             let event_tx = self.event_tx.clone();
             let status = self.status.clone();
+            let chat_log = self.chat_log.clone();
             let index_html = self.index_html.clone();
             let health = self.health;
             let head_read_timeout = self.head_read_timeout;
@@ -1194,6 +1358,17 @@ impl WebSocketServer {
                                                 Ok(()) => host_event = Some(HostEvent::SetSpeedLevel {client_id, level: match level {SpeedLevelSetting::Auto(_) => None, SpeedLevelSetting::Level(n) => Some(n)}}),
                                                 Err(message) => error = Some(message),
                                             },
+                                            WsClientMessage::Chat {text} => match status.lock().await.check_chat(&text) {
+                                                Ok(()) => host_event = Some(HostEvent::ChatSend {client_id, text}),
+                                                Err(message) => error = Some(message),
+                                            },
+                                            WsClientMessage::ChatHistory => {
+                                                let messages = chat_log.lock().unwrap_or_else(std::sync::PoisonError::into_inner).snapshot();
+                                                let response = WsServerMessage::ChatHistory {id, messages};
+                                                let json = serde_json::to_string(&response).expect("chat history serializes");
+                                                if sink.send(tokio_tungstenite::tungstenite::Message::Text(json.into())).await.is_err() {break;}
+                                                continue;
+                                            }
                                         }
                                         if let Some(event) = host_event {
                                             if event_tx.send(event).await.is_err() { error = Some("Daemon unavailable".to_owned()); }
@@ -1851,6 +2026,12 @@ mod tests {
             r#"{"type":"status","connected":false,"cp_desync_episodes":0}"#,
             r#"{"type":"status","id":2,"connected":false,"cp_desync_episodes":0}"#,
             r#"{"type":"audio_level","direction":"rx","peak_dbfs":-6.0,"rms_dbfs":-9.0,"clip_fraction":0.0,"state":"ok","duration_ms":100,"timestamp_ms":6}"#,
+            r#"{"type":"chat","message_id":7,"direction":"out","text":"Good morning","remote_call":"W1AW","timestamp_ms":7,"state":"sending"}"#,
+            r#"{"type":"chat","message_id":3,"direction":"in","text":"73","remote_call":"VK3ABC","timestamp_ms":8,"state":"received"}"#,
+            r#"{"type":"chat_receipt","message_id":7,"state":"delivered","timestamp_ms":9}"#,
+            r#"{"type":"chat_receipt","message_id":8,"state":"failed","reason":"The session ended before the peer acknowledged the message","timestamp_ms":10}"#,
+            r#"{"type":"chat_history","id":4,"messages":[{"message_id":7,"direction":"out","text":"Good morning","remote_call":"W1AW","timestamp_ms":7,"state":"delivered"}]}"#,
+            r#"{"type":"status","id":3,"connected":true,"remote_call":"W1AW","cp_desync_episodes":0,"chat":true}"#,
         ]
     }
 
@@ -1882,6 +2063,8 @@ mod tests {
             serde_json::json!({"type":"tune","seconds":5,"single_hz":1500}),
             serde_json::json!({"type":"set_speed_level","level":3}),
             serde_json::json!({"type":"set_speed_level","level":"auto"}),
+            serde_json::json!({"type":"chat","text":"hi"}),
+            serde_json::json!({"type":"chat_history"}),
         ] {
             let parsed: WsRequest = serde_json::from_value(request.clone()).unwrap();
             assert_eq!(parsed.id, None);
@@ -1891,6 +2074,128 @@ mod tests {
             assert_eq!(parsed.id, Some(17));
         }
         assert!(serde_json::from_str::<WsRequest>(r#"{"type":"unknown","id":1}"#).is_err());
+    }
+
+    pub(super) fn chat_entry(message_id: u64, state: ChatState) -> ChatEntry {
+        ChatEntry {
+            message_id,
+            direction: ChatDirection::Out,
+            text: format!("message {message_id}"),
+            remote_call: "W1AW".to_owned(),
+            timestamp_ms: message_id,
+            state,
+            reason: None,
+        }
+    }
+
+    /// The daemon has published: `max_tune_s` is `Some`.
+    pub(super) fn published_status(connected: bool, chat: Option<bool>) -> WsStatus {
+        WsStatus {
+            max_tune_s: Some(30),
+            connected,
+            chat,
+            ..WsStatus::default()
+        }
+    }
+
+    #[test]
+    fn check_chat_refuses_bad_text_before_the_daemon_publishes() {
+        let status = WsStatus::default();
+        assert_eq!(status.max_tune_s, None);
+        assert_eq!(status.check_chat("  ").unwrap_err(), "Message is empty");
+        assert_eq!(
+            status.check_chat(&"a".repeat(513)).unwrap_err(),
+            "Message is 513 bytes; the limit is 512"
+        );
+        // Nothing about the session is checked before the daemon publishes.
+        assert_eq!(status.check_chat("hello"), Ok(()));
+    }
+
+    #[test]
+    fn check_chat_refuses_without_a_session_once_published() {
+        assert_eq!(
+            published_status(false, None)
+                .check_chat("hello")
+                .unwrap_err(),
+            "No session: call a station first"
+        );
+    }
+
+    #[test]
+    fn check_chat_refuses_a_peer_without_chat() {
+        assert_eq!(
+            published_status(true, Some(false)).check_chat("hello").unwrap_err(),
+            "The peer's coppad does not accept chat: it needs coppad 0.11.0 or later with its WebSocket API enabled"
+        );
+    }
+
+    #[test]
+    fn check_chat_accepts_a_chat_session() {
+        assert_eq!(
+            published_status(true, Some(true)).check_chat("hello"),
+            Ok(())
+        );
+        // `chat` not yet published with a session: the daemon re-checks.
+        assert_eq!(published_status(true, None).check_chat("hello"), Ok(()));
+    }
+
+    #[test]
+    fn chat_log_keeps_the_last_100_oldest_first() {
+        let mut log = ChatLog::default();
+        for id in 1..=(CHAT_HISTORY_LEN as u64 + 5) {
+            log.push(chat_entry(id, ChatState::Sending));
+        }
+        let ids: Vec<u64> = log.snapshot().iter().map(|e| e.message_id).collect();
+        assert_eq!(ids.len(), CHAT_HISTORY_LEN);
+        assert_eq!(ids.first(), Some(&6));
+        assert_eq!(ids.last(), Some(&(CHAT_HISTORY_LEN as u64 + 5)));
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn chat_log_update_changes_state_and_reason() {
+        let mut log = ChatLog::default();
+        log.push(chat_entry(1, ChatState::Sending));
+        log.push(chat_entry(2, ChatState::Sending));
+        assert!(log.update(1, ChatState::Delivered, None));
+        assert!(log.update(
+            2,
+            ChatState::Failed,
+            Some("The session ended before the peer acknowledged the message".to_owned())
+        ));
+        assert!(!log.update(3, ChatState::Delivered, None));
+        let snapshot = log.snapshot();
+        assert_eq!(snapshot[0].state, ChatState::Delivered);
+        assert_eq!(snapshot[0].reason, None);
+        assert_eq!(snapshot[1].state, ChatState::Failed);
+        assert_eq!(
+            snapshot[1].reason.as_deref(),
+            Some("The session ended before the peer acknowledged the message")
+        );
+    }
+
+    #[test]
+    fn status_carries_chat_only_when_set() {
+        let json = serde_json::to_value(WsStatus::default().reply(None)).unwrap();
+        assert!(json.get("chat").is_none(), "{json}");
+        let json = serde_json::to_value(
+            WsStatus {
+                chat: Some(false),
+                ..WsStatus::default()
+            }
+            .reply(None),
+        )
+        .unwrap();
+        assert_eq!(json["chat"], false);
+        let json = serde_json::to_value(
+            WsStatus {
+                chat: Some(true),
+                ..WsStatus::default()
+            }
+            .reply(None),
+        )
+        .unwrap();
+        assert_eq!(json["chat"], true);
     }
 
     #[derive(JsonSchema)]
@@ -3000,6 +3305,123 @@ mod integration_tests {
         assert!(
             matches!(events.recv().await.unwrap(), HostEvent::DataReceived {data,..} if data == [255,0])
         );
+    }
+
+    /// COP-121: a real server whose status snapshot and chat log the test
+    /// can reach, with one authenticated client past its `hello`.
+    use super::tests::{chat_entry, published_status};
+
+    async fn start_chat_server() -> (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        mpsc::Receiver<HostEvent>,
+        Arc<tokio::sync::Mutex<WsStatus>>,
+        Arc<Mutex<ChatLog>>,
+    ) {
+        use futures_util::StreamExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = WebSocketServer::new(0).with_auth(test_auth());
+        let mut events = server.take_event_rx().unwrap();
+        let status = server.status();
+        let chat_log = server.chat_log();
+        tokio::spawn(async move {
+            server.run_with_listener(listener).await.unwrap();
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(client_request(
+            &format!("ws://{addr}"),
+            None,
+            Some(TOKEN),
+        ))
+        .await
+        .unwrap();
+        expect_connected(&mut events).await;
+        let hello = ws.next().await.unwrap().unwrap();
+        assert!(hello.to_text().unwrap().contains(r#""type":"hello""#));
+        (ws, events, status, chat_log)
+    }
+
+    async fn chat_reply(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        request: &str,
+    ) -> serde_json::Value {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        ws.send(Message::Text(request.into())).await.unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+            .await
+            .expect("reply in time")
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(reply.to_text().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn chat_request_becomes_a_chat_send_event() {
+        let (mut ws, mut events, status, _) = start_chat_server().await;
+        *status.lock().await = published_status(true, Some(true));
+        let reply = chat_reply(&mut ws, r#"{"type":"chat","text":"hi","id":9}"#).await;
+        assert_eq!(reply, serde_json::json!({"type":"ack","id":9}));
+        match events.recv().await.unwrap() {
+            HostEvent::ChatSend { text, .. } => assert_eq!(text, "hi"),
+            other => panic!("expected ChatSend, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_chat_gets_an_error_with_its_id_and_no_event() {
+        let (mut ws, mut events, status, _) = start_chat_server().await;
+        let reply = chat_reply(&mut ws, r#"{"type":"chat","text":"   ","id":13}"#).await;
+        assert_eq!(
+            reply,
+            serde_json::json!({"type":"error","message":"Message is empty","id":13})
+        );
+        *status.lock().await = published_status(false, None);
+        let reply = chat_reply(&mut ws, r#"{"type":"chat","text":"hello","id":15}"#).await;
+        assert_eq!(
+            reply,
+            serde_json::json!({"type":"error","message":"No session: call a station first","id":15})
+        );
+        *status.lock().await = published_status(true, Some(false));
+        let reply = chat_reply(&mut ws, r#"{"type":"chat","text":"hello","id":16}"#).await;
+        assert_eq!(reply["type"], "error");
+        assert_eq!(reply["id"], 16);
+        assert_eq!(
+            reply["message"],
+            coppa_protocol::app_stream::chat_reason::PEER_WITHOUT_CHAT
+        );
+        expect_no_event(&mut events).await;
+    }
+
+    #[tokio::test]
+    async fn chat_history_is_answered_from_the_shared_log() {
+        let (mut ws, mut events, _, chat_log) = start_chat_server().await;
+        {
+            let mut log = chat_log.lock().unwrap();
+            log.push(chat_entry(1, ChatState::Delivered));
+            log.push(ChatEntry {
+                direction: ChatDirection::In,
+                state: ChatState::Received,
+                ..chat_entry(2, ChatState::Received)
+            });
+        }
+        let reply = chat_reply(&mut ws, r#"{"type":"chat_history","id":17}"#).await;
+        let message: WsServerMessage = serde_json::from_value(reply.clone()).unwrap();
+        match message {
+            WsServerMessage::ChatHistory { id, messages } => {
+                assert_eq!(id, Some(17));
+                assert_eq!(messages, chat_log.lock().unwrap().snapshot());
+                assert_eq!(messages.len(), 2);
+                assert_eq!(messages[0].message_id, 1);
+                assert_eq!(messages[0].state, ChatState::Delivered);
+                assert_eq!(messages[1].direction, ChatDirection::In);
+            }
+            other => panic!("expected chat_history, got {other:?}"),
+        }
+        expect_no_event(&mut events).await;
     }
 
     async fn start_push_server() -> (

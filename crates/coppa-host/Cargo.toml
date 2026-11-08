@@ -8,6 +8,8 @@ rust-version.workspace = true
 
 [dependencies]
 coppa-engine = { path = "../coppa-engine" }
+# COP-121: the WebSocket task pre-checks chat text with `app_stream::check_chat_text`.
+coppa-protocol = { path = "../coppa-protocol" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
