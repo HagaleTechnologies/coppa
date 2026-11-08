@@ -625,6 +625,11 @@ on every frame (`engine.rs:435,437`), so every on-air frame is RV0 and
 at the MAC and transport layers; CP-control retries refresh their ACK fields
 (§19.4). A receiver MUST still decode any
 `rv` correctly, because a conforming transmitter MAY cycle it.
+An RV1-RV3 frame is not self-decodable at every level: measured on a clean
+channel, a lone RV1, RV2 or RV3 frame fails to converge at L4, L5 and L7-L9,
+and a lone RV2 frame fails at L2, L3 and L6. Such a frame decodes by
+combining with the earlier transmission of the same `seq`, and the §14
+retransmission vectors test exactly that.
 
 ### 5.4 Scrambling and known-pad LLR pinning
 
@@ -1128,34 +1133,80 @@ A conforming implementation MAY:
 
 ## 14. Executable conformance vectors
 
-`testdata/golden/manifest.toml` (20 entries: the cross product of levels
-`{1, 2, 5, 6, 8}` × channel conditions `{clean, awgn12, poor25, ssbcfo}`,
-enforced by `golden_manifest_covers_the_full_grid`,
-`crates/coppa-protocol/tests/golden_vectors.rs:205-232`) is a set of
-**frozen, committed reference vectors** for exactly this spec's wire
-format: each entry names a 48 kHz/16-bit-PCM WAV file
-(`testdata/golden/<id>.wav`) containing one complete Coppa frame (encoded
-per this spec, then passed through a documented channel condition —
-`clean`, 12 dB AWGN, a 25 dB "poor" Watterson-fading preset, or a 20 dB SSB
-+15 Hz-CFO condition) plus the exact application payload
-(`payload_hex`) that frame **MUST** decode back to.
+`testdata/golden/manifest.toml` is a set of **frozen, committed reference
+vectors** for exactly this spec's wire format. Each entry names a
+48 kHz/16-bit-PCM WAV file (`testdata/golden/<id>.wav`), encoded per this
+spec and then passed through a documented channel condition (`clean`, AWGN,
+a 25 dB "poor" Watterson-fading preset, or a 20 dB SSB +15 Hz-CFO
+condition), plus the exact application payload (`payload_hex`) the WAV
+**MUST** decode back to. The `channel` key names the condition type; for the
+AWGN entries the operating point is `snr_db`: 12 dB for levels 1-6, 24 dB
+for levels 7-9, and for the retransmission entries a point where the first
+frame alone fails (3 dB at L4, 19 or 20 dB at L9).
 
-`crates/coppa-protocol/tests/golden_vectors.rs`'s
-`golden_vectors_decode_to_expected_payloads` test
+The manifest holds 42 entries in three families (COP-129):
+
+- **Speed levels (34):** levels 1-8 × channel conditions `{clean, awgn12,
+  poor25, ssbcfo}`, plus level 9 on `{clean, awgn12}` only. Level 9 is
+  VHF-only (`docs/adr/009-cop24-speed-ladder-renumber.md`), so it has no
+  HF fading or SSB vector. Each WAV holds one single-codeword RV0 frame
+  with a full-capacity payload.
+- **Multi-codeword (3):** `L4_awgn12_cw3`, `L7_awgn12_cw3` and
+  `L9_awgn12_cw8`. Each WAV holds one frame with `codewords > 1` (§9), and
+  no payload length is a multiple of the codeword count, so each exercises
+  §9.1's `+1` split. L4 sits below and L7 and L9 above the cross-codeword
+  interleave gate (§9.3).
+- **Retransmission (5):** `L9_awgn12_rtx_rv1`, `_rv2` and `_rv3` (IR-HARQ),
+  `L9_awgn12_rtx_rv0` (Chase, the form the reference daemon sends, §5.3)
+  and `L4_awgn12_rtx_rv2` (an HF level). Each WAV holds two frames, as
+  described below.
+
+Two optional keys describe the newer entries; an entry without them has
+the default:
+
+- `codewords` (default 1): the frame's LDPC codeword count (§4.2, §9).
+- `rv_sequence` (default `[0]`): the RV (§5.3) of each frame in the WAV,
+  one element per frame, in on-air order.
+
+A retransmission entry's WAV is 100 ms of silence, the RV0 frame, 100 ms of
+silence, the retransmission frame, then 100 ms of silence (4,800 samples
+per gap). Both frames carry the same payload and `seq_num` 0. AWGN covers
+the whole WAV, gaps included, referenced to the first frame's mean power.
+The first frame alone decodes to nothing, and a lone RV1-RV3 frame is not
+self-decodable at L4 or L9 (§5.3). A conforming receiver **MUST** combine
+the two frames' soft values (§5.3) and deliver exactly one frame, carrying
+the payload and the last RV in `rv_sequence`.
+
+`crates/coppa-protocol/tests/golden_vectors.rs` is the executable check
 (run via `cargo test -p coppa-protocol --test golden_vectors`, or as part
-of `cargo test --workspace`) is the executable check: for every manifest
-entry it constructs a `CoppaTransceiver` for that level's profile, calls
-`receive()` on the WAV samples, and asserts the recovered `speed_level` and
-payload bytes exactly match the manifest (`crates/coppa-protocol/tests/golden_vectors.rs:144-190`).
-All 20 entries, including `L8_poor25`, have `expected_decode_ok = true`.
-The test requires every vector to decode to its exact manifest payload.
+of `cargo test --workspace`):
+
+- `golden_manifest_covers_the_full_grid` asserts the 42-entry shape above.
+- `golden_vectors_decode_to_expected_payloads` checks every single-frame
+  entry: it constructs a `CoppaTransceiver` for that level's profile, calls
+  `receive()` on the WAV samples, and asserts the recovered `speed_level`,
+  `codewords` and payload bytes exactly match the manifest. It skips
+  retransmission entries, because the batch `receive()` is single-frame by
+  design.
+- `golden_vectors_decode_through_the_streaming_receiver` checks every
+  entry, retransmissions included: a `StreamingReceiver` fed the WAV in
+  100 ms chunks must deliver exactly one frame with the exact payload and
+  `codewords`, and for a retransmission entry that frame must carry the
+  last RV in `rv_sequence`.
+
+`crates/coppa-cli/tests/rx_golden.rs` runs `coppa rx --raw` on every entry
+and requires its output to be exactly the payload, one line. All 42
+entries have `expected_decode_ok = true`.
 
 An independent implementer **SHOULD** treat this manifest + WAV set as the
-primary interoperability conformance suite: correctly demodulating all 20 WAVs
-to their exact `payload_hex` is strong evidence of wire-format compatibility
-with this reference implementation. Vectors are regenerated
+primary interoperability conformance suite: correctly demodulating all 42
+WAVs to their exact `payload_hex` is strong evidence of wire-format
+compatibility with this reference implementation. Vectors are generated
 (not hand-authored) via `cargo run -p coppa-bench --release --example
-golden_vectors_gen` (`crates/coppa-protocol/tests/golden_vectors.rs:3-4,129`).
+golden_vectors_gen` (`crates/coppa-bench/diagnostics/golden_vectors_gen.rs`).
+The generator is additive: it keeps every entry already in the manifest and
+appends only missing ones, because regenerating on another machine does not
+reproduce the committed WAVs bit for bit.
 
 These WAVs carry random payload bytes, not MAC or transport frames. The
 byte-level vectors for §16–§20 are in §21, and those for §15 in §15.6.

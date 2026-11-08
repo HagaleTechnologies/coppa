@@ -1,9 +1,10 @@
-//! Golden-vector generator (Task 8, decision 9c): writes 20 reference WAV
-//! files + a manifest under `testdata/golden/`, used by
-//! `crates/coppa-protocol/tests/golden_vectors.rs` as a frozen decode
-//! regression corpus -- a future PHY/FEC change that silently breaks decoding
-//! of these exact frames is now a visible, committed-test failure, not
-//! something only a full bench sweep would notice.
+//! Golden-vector generator (Task 8, decision 9c; extended by COP-129): writes
+//! the reference WAV files + a manifest under `testdata/golden/`, used by
+//! `crates/coppa-protocol/tests/golden_vectors.rs` and
+//! `crates/coppa-cli/tests/rx_golden.rs` as a frozen decode regression
+//! corpus -- a future PHY/FEC change that silently breaks decoding of these
+//! exact frames is now a visible, committed-test failure, not something only
+//! a full bench sweep would notice.
 //!
 //! Run from the workspace root (writes to `testdata/golden/`, a relative path):
 //! `cargo run -p coppa-bench --release --example golden_vectors_gen`
@@ -16,10 +17,52 @@
 //!
 //! ## Combinations
 //!
-//! levels {1, 2, 5, 6, 8} x channels {clean, awgn@12dB, poor@25dB, ssb+cfo} = 20
-//! WAVs, each 48 kHz / 16-bit PCM mono (`hound`, matching
-//! `coppa_audio::file_backend`'s read/write conventions but 16-bit int rather
-//! than that module's `WavSink`'s 32-bit float, per this task's brief).
+//! The declared set is `specs()`, 42 vectors in three families. Every WAV is
+//! 48 kHz / 16-bit PCM mono (`hound`, matching `coppa_audio::file_backend`'s
+//! read/write conventions but 16-bit int rather than that module's
+//! `WavSink`'s 32-bit float, per this task's brief).
+//!
+//! - **Level grid (34):** levels 1-8 x channels {clean, awgn@12dB, poor@25dB,
+//!   ssb+cfo}, plus level 9 x {clean, awgn}. Level 9 is VHF-only
+//!   (`docs/adr/009-cop24-speed-ladder-renumber.md`), so it has no `poor25`
+//!   or `ssbcfo` vector; `L9_ssbcfo` found no decoding seed in 500 attempts
+//!   (COP-129 research). The original 20 (levels {1, 2, 5, 6, 8}) date from
+//!   Task 8; COP-129 added levels 3, 4, 7 and 9. Each is one single-codeword
+//!   RV0 frame carrying a full-capacity payload.
+//! - **Multi-codeword (3):** `L4_awgn12_cw3` (532 bytes), `L7_awgn12_cw3`
+//!   (533 bytes) and `L9_awgn12_cw8` (1577 bytes). No payload length is a
+//!   multiple of the codeword count, so each exercises SPEC §9.1's `+1`
+//!   split; L4 sits below and L7/L9 above the level-5 cross-codeword
+//!   interleave gate (SPEC §9.3). The manifest records `codewords = N`.
+//! - **Retransmission (5):** `L9_awgn12_rtx_rv1`/`_rv2`/`_rv3` (IR-HARQ, RV0
+//!   then RVk at 19 dB), `L9_awgn12_rtx_rv0` (Chase, RV0 then RV0 at 20 dB,
+//!   the form production sends) and `L4_awgn12_rtx_rv2` (the HF-level pair,
+//!   3 dB). The manifest records `rv_sequence = [0, k]`. These are
+//!   single-codeword because multi-codeword frames do no cross-retransmission
+//!   combining (`docs/LIMITATIONS.md`, ADR-007).
+//!
+//! ## Retransmission WAV layout
+//!
+//! One WAV holds the whole on-air sequence: 100 ms (4,800 samples) of
+//! silence, the RV0 frame, 100 ms of silence, the retransmission frame, then
+//! 100 ms of silence. Both frames carry the same payload and `seq_num` 0.
+//! AWGN covers the whole buffer, gaps included, referenced to the first
+//! frame's mean power. The generator only accepts a seed where the first
+//! frame alone decodes to nothing, so a receiver passes the vector only by
+//! combining soft values across the two frames (SPEC §5.3). The batch
+//! `CoppaTransceiver::receive` call is single-frame, so only the streaming
+//! receiver (and `coppa rx`) decodes these.
+//!
+//! ## Additive generation
+//!
+//! Regenerating on a different machine does not reproduce the committed
+//! WAVs bit for bit (1-LSB differences, and a different `L5_awgn12` seed;
+//! COP-129 research §5). So this generator never rewrites a vector the
+//! manifest already lists: if `testdata/golden/manifest.toml` exists, every
+//! id in it is kept as is, only the comment header above the first
+//! `[[vectors]]` is rewritten, and missing ids are generated and appended.
+//! To regenerate one vector, delete its manifest entry and rerun. The
+//! process exits 1 if any declared id is missing from the final manifest.
 //!
 //! ## Profile override for the `poor25` and `ssbcfo` conditions
 //!
@@ -97,18 +140,34 @@
 //! clean decode is skipped with a warning rather than silently committed --
 //! see the bug this replaced above for why that skip condition itself needs
 //! a HARQ-buffer-eviction guarantee to be trustworthy.
+//!
+//! Since COP-129 every attempt decodes with fresh receivers (a new
+//! `CoppaTransceiver` and a new `StreamingReceiver`), which replaces the
+//! `harq_evict` guard: no attempt can inherit another attempt's IR-HARQ
+//! accumulator. A seed is accepted only if the receivers the tests use
+//! decode it from the 16-bit-quantized samples the WAV stores: the batch
+//! receiver returns the exact payload (single-frame specs), and the
+//! streaming receiver, fed 4,800-sample chunks plus 8,192 trailing zeros,
+//! returns exactly one frame with the exact payload.
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use coppa_bench::scenario::{mode_for_level, select_profile, SAMPLE_RATE};
 use coppa_channel::watterson::WattersonPreset;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_codec::ofdm::CoppaProfile;
+use coppa_protocol::modem::streaming::{DecodedFrame, StreamingReceiver};
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-const LEVELS: &[u8] = &[1, 2, 5, 6, 8];
+/// Levels that get the full four-channel grid.
+const GRID_LEVELS: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8];
+
+/// Level 9 is VHF-only (ADR-009), so it gets only the channels that keep
+/// its own `vhf_wide` profile.
+const LEVEL9_CHANNELS: &[Channel] = &[Channel::Clean, Channel::Awgn12];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Channel {
@@ -147,31 +206,159 @@ const DEFAULT_SSBCFO_SNR_DB: f32 = 20.0;
 /// +-50 Hz two-stage-acquisition tolerance (docs/LIMITATIONS.md).
 const SSB_CFO_HZ: f32 = 15.0;
 
-/// Level 8's AWGN/ssb+cfo operating points. Corrected 2026-07-26 (see module
-/// doc's "Level 8's exception" section): the literal 12/20 dB grid values
-/// are still too low for 64QAM 2/3, but the level's real threshold is an
-/// ordinary ~18-21 dB AWGN / ~18 dB ssb+cfo -- NOT the ~30 dB "late, steep,
-/// seed-dependent waterfall" this generator previously (incorrectly)
-/// characterized. These values are comfortably above that real threshold
-/// (verified 0% FER over 100 trials at both), not marginal seed-search
-/// anchors.
-const LEVEL8_AWGN_SNR_DB: f32 = 24.0;
+/// AWGN operating point for the `awgn12` channel at levels 7, 8 and 9.
+/// Level 8's value was corrected 2026-07-26 (see module doc's "Level 8's
+/// exception" section): the literal 12 dB grid value is too low for 64QAM
+/// 2/3, but the level's real threshold is an ordinary ~18-21 dB AWGN -- NOT
+/// the ~30 dB "late, steep, seed-dependent waterfall" this generator
+/// previously (incorrectly) characterized. 24 dB is comfortably above that
+/// real threshold (verified 0% FER over 100 trials), not a marginal
+/// seed-search anchor. COP-129 applied the same value to levels 7 and 9 on
+/// `vhf_wide`: at 12 dB neither found a seed in 500 attempts, at 24 dB both
+/// decode at attempt 1.
+const HIGH_ORDER_AWGN_SNR_DB: f32 = 24.0;
+/// Level 8's ssb+cfo operating point (see `HIGH_ORDER_AWGN_SNR_DB`).
 const LEVEL8_SSBCFO_SNR_DB: f32 = 24.0;
+
+/// Operating points for the retransmission vectors: where the first frame
+/// alone fails to decode (COP-129 plan probe: 30 of 30 at L9 19 dB and 20 dB,
+/// 28 of 30 at L4 3 dB) and the pair still combines.
+const L9_IR_RTX_SNR_DB: f32 = 19.0;
+const L9_CHASE_RTX_SNR_DB: f32 = 20.0;
+const L4_IR_RTX_SNR_DB: f32 = 3.0;
+
+/// Silence before, between and after the frames of a retransmission vector:
+/// 100 ms at 48 kHz.
+const RTX_GAP_SAMPLES: usize = 4800;
+
+/// Streaming chunk size, mirroring `golden_vectors.rs` (100 ms at 48 kHz,
+/// what `coppa rx` and the daemon's audio loop push).
+const STREAM_CHUNK: usize = 4800;
+/// Trailing zeros after each WAV, mirroring `golden_vectors.rs` and the
+/// CLI's `TRAILING_FLUSH_SAMPLES`.
+const TRAILING_FLUSH_SAMPLES: usize = 8192;
 
 /// Deterministic payload seeds to try per combination before giving up.
 const MAX_SEED_ATTEMPTS: u64 = 500;
 
-fn make_header(level: u8, payload_len: u16) -> CoppaHeader {
+/// One declared golden vector.
+struct Spec {
+    id: String,
+    level: u8,
+    channel: Channel,
+    codewords: u8,
+    payload_len: usize,
+    /// One frame per element, in on-air order. `[0]` for a single frame.
+    rv_sequence: &'static [u8],
+    snr_db: f32,
+    base_seed: u64,
+}
+
+impl Spec {
+    fn is_retransmission(&self) -> bool {
+        self.rv_sequence.len() > 1
+    }
+}
+
+/// Base seed for a grid id: the original Task 8 per-(level, channel) mix,
+/// kept so the formula still describes the committed grid entries.
+fn grid_base_seed(level: u8, channel: Channel) -> u64 {
+    let mut h = 0x9E3779B97F4A7C15u64;
+    h ^= level as u64;
+    h = h.wrapping_mul(0x100_0000_01B3);
+    h ^= channel
+        .id()
+        .bytes()
+        .fold(0u64, |a, b| a.wrapping_add(b as u64));
+    h
+}
+
+/// Base seed for a non-grid id: FNV-1a over the whole id string, so
+/// `L9_awgn12_rtx_rv2` and `L9_awgn12_rtx_rv3` search different seeds.
+fn id_base_seed(id: &str) -> u64 {
+    id.bytes().fold(0xCBF2_9CE4_8422_2325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x100_0000_01B3)
+    })
+}
+
+fn full_payload(level: u8) -> usize {
+    mode_for_level(level).expect("valid level").payload_bytes()
+}
+
+/// Every vector the corpus must hold, in manifest order for new entries.
+fn specs() -> Vec<Spec> {
+    let mut out = Vec::new();
+    let grid = GRID_LEVELS
+        .iter()
+        .flat_map(|&l| CHANNELS.iter().map(move |&c| (l, c)))
+        .chain(LEVEL9_CHANNELS.iter().map(|&c| (9u8, c)));
+    for (level, channel) in grid {
+        out.push(Spec {
+            id: format!("L{level}_{}", channel.id()),
+            level,
+            channel,
+            codewords: 1,
+            payload_len: full_payload(level),
+            rv_sequence: &[0],
+            snr_db: awgn_snr_for(level, channel),
+            base_seed: grid_base_seed(level, channel),
+        });
+    }
+
+    // Multi-codeword: (level, codewords, payload_len). None of the lengths
+    // is a multiple of the codeword count (SPEC §9.1's `+1` split).
+    for &(level, codewords, payload_len) in &[(4u8, 3u8, 532usize), (7, 3, 533), (9, 8, 1577)] {
+        let channel = Channel::Awgn12;
+        let id = format!("L{level}_{}_cw{codewords}", channel.id());
+        out.push(Spec {
+            base_seed: id_base_seed(&id),
+            id,
+            level,
+            channel,
+            codewords,
+            payload_len,
+            rv_sequence: &[0],
+            snr_db: awgn_snr_for(level, channel),
+        });
+    }
+
+    // Retransmission: (level, rv_sequence, snr_db).
+    let rtx: &[(u8, &'static [u8], f32)] = &[
+        (9, &[0, 2], L9_IR_RTX_SNR_DB),
+        (9, &[0, 3], L9_IR_RTX_SNR_DB),
+        (9, &[0, 1], L9_IR_RTX_SNR_DB),
+        (9, &[0, 0], L9_CHASE_RTX_SNR_DB),
+        (4, &[0, 2], L4_IR_RTX_SNR_DB),
+    ];
+    for &(level, rv_sequence, snr_db) in rtx {
+        let channel = Channel::Awgn12;
+        let last_rv = *rv_sequence.last().expect("non-empty rv_sequence");
+        let id = format!("L{level}_{}_rtx_rv{last_rv}", channel.id());
+        out.push(Spec {
+            base_seed: id_base_seed(&id),
+            id,
+            level,
+            channel,
+            codewords: 1,
+            payload_len: full_payload(level),
+            rv_sequence,
+            snr_db,
+        });
+    }
+    out
+}
+
+fn make_header(level: u8, codewords: u8, rv: u8, payload_len: u16) -> CoppaHeader {
     CoppaHeader {
         version: 1,
         phy_mode: 0,
         frame_type: CoppaFrameType::Data,
         bandwidth: 1,
-        fec_type: 0,
+        fec_type: rv & 0x03,
         speed_level: level,
         seq_num: 0,
         payload_len,
-        codewords: 1,
+        codewords,
     }
 }
 
@@ -185,10 +372,11 @@ fn profile_for(level: u8, channel: Channel) -> CoppaProfile {
 }
 
 /// AWGN SNR (dB) to use for `level`/`channel`'s AWGN component. See module
-/// doc: level 8 needs a documented, verified exception for `awgn12`/`ssbcfo`.
+/// doc: levels 7-9 need a documented, verified exception for `awgn12`, and
+/// level 8 for `ssbcfo`.
 fn awgn_snr_for(level: u8, channel: Channel) -> f32 {
     match (level, channel) {
-        (8, Channel::Awgn12) => LEVEL8_AWGN_SNR_DB,
+        (7..=9, Channel::Awgn12) => HIGH_ORDER_AWGN_SNR_DB,
         (8, Channel::SsbCfo) => LEVEL8_SSBCFO_SNR_DB,
         (_, Channel::Awgn12) => DEFAULT_AWGN_SNR_DB,
         (_, Channel::Poor25) => DEFAULT_POOR_SNR_DB,
@@ -227,7 +415,114 @@ fn apply_channel(channel: Channel, clean: &[f32], snr_db: f32, seed: u64) -> Vec
     }
 }
 
-fn write_wav_i16(path: &std::path::Path, samples: &[f32], sample_rate: u32) {
+/// One f32 sample to the 16-bit integer `write_wav_i16` stores.
+fn to_i16(s: f32) -> i16 {
+    (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16
+}
+
+/// The samples a reader gets back from the WAV: `write_wav_i16`'s rounding
+/// followed by the tests' `/ 32768` full-scale normalization.
+fn quantize_i16(samples: &[f32]) -> Vec<f32> {
+    samples
+        .iter()
+        .map(|&s| to_i16(s) as f32 / 32768.0)
+        .collect()
+}
+
+/// Decode `samples` the way `golden_vectors.rs`'s streaming test does: a fresh
+/// receiver, `STREAM_CHUNK`-sample pushes and `TRAILING_FLUSH_SAMPLES` zeros.
+fn stream_decode(profile: CoppaProfile, samples: &[f32]) -> Vec<DecodedFrame> {
+    let mut buf = samples.to_vec();
+    buf.extend(std::iter::repeat_n(0.0f32, TRAILING_FLUSH_SAMPLES));
+    let mut rx = StreamingReceiver::new(profile, 1);
+    let mut decoded = Vec::new();
+    for chunk in buf.chunks(STREAM_CHUNK) {
+        decoded.extend(rx.push_samples(chunk));
+    }
+    decoded
+}
+
+/// Build the RX-side signal for `spec` with this attempt's `payload`.
+/// Returns the samples and, for a retransmission, the sample index where the
+/// gap after the first frame ends.
+fn build_signal(
+    spec: &Spec,
+    tx: &CoppaTransceiver,
+    payload: &[u8],
+    seed: u64,
+) -> (Vec<f32>, Option<usize>) {
+    let frame = |rv: u8| {
+        let header = make_header(spec.level, spec.codewords, rv, spec.payload_len as u16);
+        tx.transmit(&header, payload)
+            .expect("payload within this level's capacity")
+    };
+    if !spec.is_retransmission() {
+        let clean = frame(spec.rv_sequence[0]);
+        return (apply_channel(spec.channel, &clean, spec.snr_db, seed), None);
+    }
+
+    assert!(
+        spec.channel == Channel::Awgn12,
+        "{}: retransmission vectors are AWGN-only",
+        spec.id
+    );
+    let mut clean = vec![0.0f32; RTX_GAP_SAMPLES];
+    let mut first_end = None;
+    let mut p_ref = 0.0f32;
+    for (i, &rv) in spec.rv_sequence.iter().enumerate() {
+        let f = frame(rv);
+        if i == 0 {
+            p_ref = coppa_channel::mean_power(&f);
+        }
+        clean.extend_from_slice(&f);
+        clean.extend(std::iter::repeat_n(0.0f32, RTX_GAP_SAMPLES));
+        if i == 0 {
+            first_end = Some(clean.len());
+        }
+    }
+    let noisy = coppa_channel::awgn_ref_seeded(
+        &clean,
+        spec.snr_db,
+        p_ref,
+        SAMPLE_RATE as f32,
+        seed ^ 0x5555,
+    );
+    (noisy, first_end)
+}
+
+/// Decision 6 of the COP-129 plan: accept a seed only if the receivers the
+/// tests use decode it from the quantized samples, each built fresh.
+fn accepts(spec: &Spec, payload: &[u8], quantized: &[f32], first_end: Option<usize>) -> bool {
+    let profile = profile_for(spec.level, spec.channel);
+    let stream_ok = |frames: &[DecodedFrame], rv: u8| {
+        frames.len() == 1
+            && frames[0].payload == payload
+            && frames[0].header.speed_level == spec.level
+            && frames[0].header.codewords == spec.codewords
+            && frames[0].header.fec_type & 0x03 == rv
+    };
+
+    if let Some(first_end) = first_end {
+        // The first frame alone must give nothing, so only combining decodes.
+        if !stream_decode(profile.clone(), &quantized[..first_end]).is_empty() {
+            return false;
+        }
+        let last_rv = *spec.rv_sequence.last().expect("non-empty rv_sequence");
+        return stream_ok(&stream_decode(profile, quantized), last_rv);
+    }
+
+    let batch_ok = match CoppaTransceiver::new(profile.clone(), 1).receive(quantized) {
+        Ok((header, bytes, _lvl)) => {
+            header.speed_level == spec.level
+                && header.codewords == spec.codewords
+                && bytes == payload
+        }
+        Err(_) => false,
+    };
+    batch_ok && stream_ok(&stream_decode(profile, quantized), spec.rv_sequence[0])
+}
+
+fn write_wav_i16(path: &Path, samples: &[f32], sample_rate: u32) {
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate,
@@ -236,9 +531,9 @@ fn write_wav_i16(path: &std::path::Path, samples: &[f32], sample_rate: u32) {
     };
     let mut writer = hound::WavWriter::create(path, spec).expect("create golden WAV");
     for &s in samples {
-        let clamped = s.clamp(-1.0, 1.0);
-        let v = (clamped * i16::MAX as f32).round() as i16;
-        writer.write_sample(v).expect("write golden WAV sample");
+        writer
+            .write_sample(to_i16(s))
+            .expect("write golden WAV sample");
     }
     writer.finalize().expect("finalize golden WAV");
 }
@@ -247,17 +542,66 @@ fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-struct GeneratedVector {
+/// Ids already in a manifest. Only `id` is read; every other key is
+/// preserved byte for byte by the additive writer.
+#[derive(serde::Deserialize)]
+struct IdManifest {
+    #[serde(default)]
+    vectors: Vec<IdEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct IdEntry {
     id: String,
-    level: u8,
-    channel: &'static str,
-    seed: u64,
-    attempts: u64,
-    payload_hex: String,
-    wav_file: String,
-    snr_db: Option<f32>,
-    cfo_hz: Option<f32>,
-    expected_decode_ok: bool,
+}
+
+fn manifest_ids(text: &str) -> Vec<String> {
+    let parsed: IdManifest = toml::from_str(text).expect("parse existing manifest.toml");
+    parsed.vectors.into_iter().map(|v| v.id).collect()
+}
+
+const MANIFEST_HEADER: &str = "\
+# Golden decode-regression vectors (Task 8, decision 9c; extended by COP-129).
+# Generated by `cargo run -p coppa-bench --release --example golden_vectors_gen`.
+# The generator is additive: it keeps every entry below as is and appends only
+# missing ids. Delete an entry to regenerate it.
+# Each vector: a 48kHz/16-bit-PCM WAV through a fixed channel condition, plus the
+# payload it must decode back to exactly (see golden_vectors.rs and rx_golden.rs).
+# Optional keys: `codewords` (default 1) is the frame's LDPC codeword count.
+# `rv_sequence` (default [0]) lists one frame per element in on-air order: the WAV
+# holds 100 ms of silence, then each frame followed by 100 ms of silence, all with
+# the same payload and seq_num 0. A receiver decodes it only by combining frames.
+
+";
+
+/// Format one manifest block in the existing key order. `codewords` and
+/// `rv_sequence` appear only when they differ from their defaults.
+fn manifest_block(spec: &Spec, seed: u64, attempts: u64, payload: &[u8]) -> String {
+    let mut b = String::new();
+    b.push_str("[[vectors]]\n");
+    b.push_str(&format!("id = \"{}\"\n", spec.id));
+    b.push_str(&format!("level = {}\n", spec.level));
+    b.push_str(&format!("channel = \"{}\"\n", spec.channel.id()));
+    b.push_str(&format!("seed = {seed}\n"));
+    b.push_str(&format!("seed_attempts = {attempts}\n"));
+    if spec.channel != Channel::Clean {
+        b.push_str(&format!("snr_db = {}\n", spec.snr_db));
+    }
+    if spec.channel == Channel::SsbCfo {
+        b.push_str(&format!("cfo_hz = {SSB_CFO_HZ}\n"));
+    }
+    if spec.codewords > 1 {
+        b.push_str(&format!("codewords = {}\n", spec.codewords));
+    }
+    if spec.is_retransmission() {
+        b.push_str(&format!("rv_sequence = {:?}\n", spec.rv_sequence));
+    }
+    b.push_str(&format!("payload_hex = \"{}\"\n", to_hex(payload)));
+    b.push_str(&format!("wav_file = \"{}.wav\"\n", spec.id));
+    b.push_str(&format!("sample_rate = {SAMPLE_RATE}\n"));
+    // Always true: a block is only written for a seed that decoded.
+    b.push_str("expected_decode_ok = true\n\n");
+    b
 }
 
 fn main() {
@@ -266,155 +610,96 @@ fn main() {
         "create testdata/golden (run this from the workspace root: \
          `cargo run -p coppa-bench --release --example golden_vectors_gen`)",
     );
-
-    let mut generated = Vec::new();
-
-    for &level in LEVELS {
-        let mode = mode_for_level(level).expect("valid level");
-        let payload_bytes = mode.payload_bytes();
-
-        for &channel in CHANNELS {
-            let profile = profile_for(level, channel);
-            let tx = CoppaTransceiver::new(profile, 1);
-            let id = format!("L{level}_{}", channel.id());
-            let snr_db = awgn_snr_for(level, channel);
-
-            // Deterministic per-(level,channel) base seed (FNV-ish mix).
-            let base_seed = {
-                let mut h = 0x9E3779B97F4A7C15u64;
-                h ^= level as u64;
-                h = h.wrapping_mul(0x100_0000_01B3);
-                h ^= channel
-                    .id()
-                    .bytes()
-                    .fold(0u64, |a, b| a.wrapping_add(b as u64));
-                h
-            };
-
-            let mut found = None;
-            for attempt in 0..MAX_SEED_ATTEMPTS {
-                let seed = base_seed.wrapping_add(attempt);
-                let mut rng = StdRng::seed_from_u64(seed);
-                let payload: Vec<u8> = (0..payload_bytes).map(|_| rng.random::<u8>()).collect();
-                let header = make_header(level, payload_bytes as u16);
-                let clean = tx
-                    .transmit(&header, &payload)
-                    .expect("payload within this level's capacity");
-                let rx_signal = apply_channel(channel, &clean, snr_db, seed);
-
-                let decoded_ok = if let Ok((_h, bytes, _lvl)) = tx.receive(&rx_signal) {
-                    bytes.len() >= payload.len() && bytes[..payload.len()] == payload[..]
-                } else {
-                    false
-                };
-                // Every attempt here is an independent random-payload draw sharing
-                // seq_num 0 on one `tx` reused across `MAX_SEED_ATTEMPTS` attempts --
-                // not a real retransmission. Evict unconditionally so an attempt
-                // that fails to converge (expected during a search at a marginal
-                // operating point) can't corrupt the next attempt's IR-HARQ
-                // accumulator. See coppa-bench's
-                // `runner.rs::ascending_sweep_low_snr_failure_does_not_poison_later_high_snr_trials`
-                // for the bug this mirrors.
-                tx.harq_evict(0);
-                if decoded_ok {
-                    found = Some((seed, attempt, payload, rx_signal));
-                    break;
-                }
-            }
-
-            let Some((seed, attempts, payload, rx_signal)) = found else {
-                eprintln!(
-                    "WARNING: {id}: no seed in {MAX_SEED_ATTEMPTS} attempts decoded cleanly -- SKIPPED"
-                );
-                continue;
-            };
-
-            let wav_name = format!("{id}.wav");
-            write_wav_i16(&out_dir.join(&wav_name), &rx_signal, SAMPLE_RATE);
-
-            println!(
-                "{id}: seed=0x{seed:016X} attempts={} payload_bytes={} samples={}",
-                attempts + 1,
-                payload.len(),
-                rx_signal.len(),
-            );
-
-            generated.push(GeneratedVector {
-                id: id.clone(),
-                level,
-                channel: channel.id(),
-                seed,
-                attempts: attempts + 1,
-                payload_hex: to_hex(&payload),
-                wav_file: wav_name,
-                snr_db: if matches!(channel, Channel::Clean) {
-                    None
-                } else {
-                    Some(snr_db)
-                },
-                cfo_hz: if matches!(channel, Channel::SsbCfo) {
-                    Some(SSB_CFO_HZ)
-                } else {
-                    None
-                },
-                // Always true: `found` above only sets when a seed actually
-                // decoded correctly (there is no longer a deliberately-failing
-                // combination -- see this generator's 2026-07-26 correction in
-                // the module doc's "Level 8's exception" section).
-                expected_decode_ok: true,
-            });
-        }
-    }
-
-    let mut manifest_toml = String::new();
-    manifest_toml.push_str("# Golden decode-regression vectors (Task 8, decision 9c).\n");
-    manifest_toml.push_str(
-        "# Generated by `cargo run -p coppa-bench --release --example golden_vectors_gen`.\n",
-    );
-    manifest_toml.push_str(
-        "# Each vector: a 48kHz/16-bit-PCM WAV of one Coppa frame through a fixed channel\n",
-    );
-    manifest_toml.push_str(
-        "# condition, plus the payload it must decode back to exactly (see golden_vectors.rs).\n\n",
-    );
-    for v in &generated {
-        manifest_toml.push_str("[[vectors]]\n");
-        manifest_toml.push_str(&format!("id = \"{}\"\n", v.id));
-        manifest_toml.push_str(&format!("level = {}\n", v.level));
-        manifest_toml.push_str(&format!("channel = \"{}\"\n", v.channel));
-        manifest_toml.push_str(&format!("seed = {}\n", v.seed));
-        manifest_toml.push_str(&format!("seed_attempts = {}\n", v.attempts));
-        if let Some(snr) = v.snr_db {
-            manifest_toml.push_str(&format!("snr_db = {snr}\n"));
-        }
-        if let Some(cfo) = v.cfo_hz {
-            manifest_toml.push_str(&format!("cfo_hz = {cfo}\n"));
-        }
-        manifest_toml.push_str(&format!("payload_hex = \"{}\"\n", v.payload_hex));
-        manifest_toml.push_str(&format!("wav_file = \"{}\"\n", v.wav_file));
-        manifest_toml.push_str("sample_rate = 48000\n");
-        manifest_toml.push_str(&format!(
-            "expected_decode_ok = {}\n\n",
-            v.expected_decode_ok
-        ));
-    }
-
     let manifest_path = out_dir.join("manifest.toml");
-    std::fs::write(&manifest_path, manifest_toml).expect("write manifest.toml");
 
-    let ok_count = generated.iter().filter(|v| v.expected_decode_ok).count();
+    // Everything from the first `[[vectors]]` on is kept byte for byte.
+    let existing_text = std::fs::read_to_string(&manifest_path).unwrap_or_default();
+    let existing_ids: HashSet<String> = manifest_ids(&existing_text).into_iter().collect();
+    let mut entries = match existing_text.find("[[vectors]]") {
+        Some(i) => existing_text[i..].to_string(),
+        None => String::new(),
+    };
+    if !entries.is_empty() && !entries.ends_with("\n\n") {
+        entries.push_str(if entries.ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        });
+    }
+
+    let specs = specs();
+    let mut kept = 0usize;
+    let mut written = 0usize;
+    for spec in &specs {
+        if existing_ids.contains(&spec.id) {
+            println!("{}: kept", spec.id);
+            kept += 1;
+            continue;
+        }
+
+        let tx = CoppaTransceiver::new(profile_for(spec.level, spec.channel), 1);
+        let mut found = None;
+        for attempt in 0..MAX_SEED_ATTEMPTS {
+            let seed = spec.base_seed.wrapping_add(attempt);
+            let mut rng = StdRng::seed_from_u64(seed);
+            let payload: Vec<u8> = (0..spec.payload_len).map(|_| rng.random::<u8>()).collect();
+            let (rx_signal, first_end) = build_signal(spec, &tx, &payload, seed);
+            let quantized = quantize_i16(&rx_signal);
+            if accepts(spec, &payload, &quantized, first_end) {
+                found = Some((seed, attempt + 1, payload, rx_signal));
+                break;
+            }
+        }
+
+        let Some((seed, attempts, payload, rx_signal)) = found else {
+            eprintln!(
+                "WARNING: {}: no seed in {MAX_SEED_ATTEMPTS} attempts decoded cleanly -- SKIPPED",
+                spec.id
+            );
+            continue;
+        };
+
+        write_wav_i16(
+            &out_dir.join(format!("{}.wav", spec.id)),
+            &rx_signal,
+            SAMPLE_RATE,
+        );
+        let mut extra = String::new();
+        if spec.codewords > 1 {
+            extra.push_str(&format!(" codewords={}", spec.codewords));
+        }
+        if spec.is_retransmission() {
+            extra.push_str(&format!(" rv_sequence={:?}", spec.rv_sequence));
+        }
+        println!(
+            "{}: seed=0x{seed:016X} attempts={attempts} payload_bytes={} samples={}{extra}",
+            spec.id,
+            payload.len(),
+            rx_signal.len(),
+        );
+        entries.push_str(&manifest_block(spec, seed, attempts, &payload));
+        written += 1;
+    }
+
+    let manifest_text = format!("{MANIFEST_HEADER}{entries}");
+    std::fs::write(&manifest_path, &manifest_text).expect("write manifest.toml");
+
+    let final_ids: HashSet<String> = manifest_ids(&manifest_text).into_iter().collect();
     println!(
-        "\nWrote {} golden vectors to {} ({} expected to decode, {} documented known-failures)",
-        generated.len(),
+        "\nKept {kept}, wrote {written} golden vectors to {} ({} in manifest)",
         out_dir.display(),
-        ok_count,
-        generated.len() - ok_count,
+        final_ids.len(),
     );
-    let expected_total = LEVELS.len() * CHANNELS.len();
-    if generated.len() != expected_total {
+    let missing: Vec<&str> = specs
+        .iter()
+        .map(|s| s.id.as_str())
+        .filter(|id| !final_ids.contains(*id))
+        .collect();
+    if !missing.is_empty() {
         eprintln!(
-            "WARNING: expected {expected_total} vectors, only generated {} -- see WARNINGs above",
-            generated.len()
+            "WARNING: {} declared vector(s) missing from the manifest: {} -- see WARNINGs above",
+            missing.len(),
+            missing.join(", ")
         );
         std::process::exit(1);
     }

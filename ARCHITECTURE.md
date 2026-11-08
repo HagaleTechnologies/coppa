@@ -230,7 +230,7 @@ These components still compile and have tests, but no production TX or RX path c
 - Huffman + LZ4 compression; binary payloads through `encode_bytes`/`decode_bytes`
 - Host interfaces: VARA-style TCP, a WebSocket JSON server, and KISS over TCP for OFDM datagrams and the AFSK 1200 TNC mode
 - Radio control: rigctld CAT, plus serial, GPIO, CM108 and VOX PTT
-- Tests: unit tests, workspace and per-crate integration tests, proptest round trips, 20 frozen golden WAV vectors (`testdata/golden/`, SPEC §14), cargo-fuzz targets, criterion benchmarks, and the `coppa-bench` harness. Simulated AWGN and Watterson results are in [BENCHMARKS.md](BENCHMARKS.md)
+- Tests: unit tests, workspace and per-crate integration tests, proptest round trips, 42 frozen golden WAV vectors (every speed level, multi-codeword frames and retransmissions; `testdata/golden/`, SPEC §14), cargo-fuzz targets, criterion benchmarks, and the `coppa-bench` harness. Simulated AWGN and Watterson results are in [BENCHMARKS.md](BENCHMARKS.md)
 - CI: `ci.yml` runs check, lib tests with features, fmt and the platform matrix (Linux, macOS, Windows); `ci-full.yml` runs the full test suite, clippy, MSRV (1.85.0), bench and fuzz builds, cargo-deny, the security audit and the wiki lint
 
 ## Not implemented and known gaps
