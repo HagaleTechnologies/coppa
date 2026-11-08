@@ -405,4 +405,24 @@ async fn host_bytes_keep_stream_0_on_a_chat_session() {
     assert_eq!(segment_of(&frame).session_id, HOST_STREAM);
 }
 
+/// A peer's chat record over the 512-byte limit is ACKed and skipped:
+/// nothing reaches the dashboard or the history.
+#[tokio::test]
+async fn an_oversized_incoming_chat_record_is_skipped() {
+    let mut p = connected_chat_pair().await;
+    let record =
+        app_stream::encode_record(&coppa_protocol::app::AppPdu::new_text(&[b'x'; 600])).unwrap();
+    let frame = session_stream_frame(p.a.session_link.as_ref().unwrap(), APP_STREAM, 0, &record);
+    p.b.handle_mac_pdu(MacPdu::from_bytes(&frame).unwrap())
+        .await;
+    assert!(transmitted(&mut p.b_out) > 0, "B ACKed the segment");
+    assert!(drain_ws(&mut p.b_dash.ws, 200)
+        .await
+        .iter()
+        .all(|m| m["type"] != "chat" && m["type"] != "data"));
+    send_json(&mut p.b_dash.ws, r#"{"type":"chat_history","id":9}"#).await;
+    let history = next_of(&mut p.b_dash.ws, &["chat_history"]).await;
+    assert!(history["messages"].as_array().unwrap().is_empty());
+}
+
 mod more;

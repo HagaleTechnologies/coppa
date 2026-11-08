@@ -2513,6 +2513,10 @@ sequence with U+FFFD.
    The receiver MUST discard every later stream 1 byte of the session (it
    still acknowledges the segments). The reference warns once.
 5. Record state is per session. A partial record at teardown is discarded.
+6. A `Text` record whose payload is longer than 512 bytes, or has no
+   non-whitespace character, is skipped like an unhandled protocol (the
+   reference logs it at debug). It is still acknowledged, so the sender
+   reports it delivered.
 
 ### 23.6 Delivery
 

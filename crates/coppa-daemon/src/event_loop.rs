@@ -3394,6 +3394,14 @@ impl EventLoop {
         {
             return;
         }
+        if self.session_mgr.get(session_id).is_none() {
+            return;
+        }
+        // COP-121 (D6): a link replaced here belonged to another session;
+        // its unacknowledged chat fails rather than stay `sending`.
+        if let Some(mut stale) = self.session_link.take() {
+            self.fail_pending_chat(&mut stale);
+        }
         let Some(session) = self.session_mgr.get(session_id) else {
             return;
         };
@@ -7612,7 +7620,17 @@ impl EventLoop {
         for record in records {
             match record {
                 Ok(pdu) if pdu.protocol == AppProtocol::Text => {
-                    texts.push(String::from_utf8_lossy(&pdu.payload).into_owned());
+                    // SPEC §23: a chat is 1 to 512 bytes with a non-space
+                    // character; a peer's record outside that is skipped.
+                    let text = String::from_utf8_lossy(&pdu.payload);
+                    if pdu.payload.len() > app_stream::CHAT_MAX_BYTES || text.trim().is_empty() {
+                        tracing::debug!(
+                            bytes = pdu.payload.len(),
+                            "Skipping a chat record outside the SPEC §23 limits"
+                        );
+                    } else {
+                        texts.push(text.into_owned());
+                    }
                 }
                 Ok(pdu) => {
                     tracing::debug!(protocol = ?pdu.protocol, "Skipping an application record");
