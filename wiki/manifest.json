@@ -244,7 +244,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:3f1a2496fc567ec226f9ebc89b64be1930e87aa819625542921a00c1a41e967d",
+      "hash": "sha256:3d74c0ea571628ad938be867e94a4bb8e0d3c08084fd0b95d5531ed729526a6c",
       "id": "c-ffi-and-python-link",
       "kind": "gotcha",
       "links": [
@@ -256,14 +256,15 @@
       "path": "pages/c-ffi-and-python-link.md",
       "sources": [
         "crates/coppa-ffi/src/lib.rs",
+        "docs/SPEC.md",
         "crates/coppa-ffi/cbindgen.toml",
         "crates/coppa-engine/src/link.rs",
         "bindings/python/coppa/_ffi.py"
       ],
       "status": "current",
       "title": "What will bite you when calling coppa from C or Python?",
-      "verified_commit": "2526b50",
-      "verified_date": "2026-11-03",
+      "verified_commit": "4237273",
+      "verified_date": "2026-11-09",
       "visibility": "public"
     },
     {
@@ -374,7 +375,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:591e1e6483a2ba3c7f0cbf7178e288a6d1e764aadb791f3b83c9ef388e1b8664",
+      "hash": "sha256:bdfe23f9286aaa707814410732be300ff66d816d1b4563bbb8c0e8817961e7bb",
       "id": "coppa-protocol",
       "kind": "subsystem",
       "links": [
@@ -394,8 +395,8 @@
       ],
       "status": "current",
       "title": "How does coppa-protocol handle framing, FEC, and ARQ?",
-      "verified_commit": "edb17bc",
-      "verified_date": "2026-11-04",
+      "verified_commit": "4237273",
+      "verified_date": "2026-11-09",
       "visibility": "public"
     },
     {

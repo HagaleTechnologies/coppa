@@ -13,7 +13,8 @@ import sys
 from pathlib import Path
 
 # ABI this binding was written against: major must match, minor must be >= this.
-REQUIRED_ABI = (1, 0)
+# 1.1 (COP-178) adds coppa_air_protocol_version and coppa_host_api_version.
+REQUIRED_ABI = (1, 1)
 
 # Error codes (coppa.h COPPA_ERR_*).
 OK = 0
@@ -28,7 +29,7 @@ NONE_PENDING = 1
 
 # ABI version (coppa.h COPPA_ABI_VERSION_*).
 ABI_VERSION_MAJOR = 1
-ABI_VERSION_MINOR = 0
+ABI_VERSION_MINOR = 1
 
 # Link states, events and disconnect reasons (coppa.h COPPA_LINK_*).
 LINK_STATE_IDLE = 0
@@ -103,6 +104,8 @@ _i32 = ctypes.c_int32
 _DECLS = {
     "coppa_version": (ctypes.c_char_p, []),
     "coppa_abi_version": (ctypes.c_uint32, []),
+    "coppa_air_protocol_version": (ctypes.c_uint32, []),
+    "coppa_host_api_version": (ctypes.c_uint32, []),
     "coppa_last_error": (ctypes.c_char_p, []),
     "coppa_strerror": (ctypes.c_char_p, [_i32]),
     "coppa_engine_new_with": (_vp, [ctypes.POINTER(ConfigStruct)]),

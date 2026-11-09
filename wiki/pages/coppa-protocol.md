@@ -8,8 +8,8 @@ sources:
   - crates/coppa-protocol/**
   - docs/SPEC.md
 verified:
-  commit: edb17bc
-  date: 2026-11-04
+  commit: 4237273
+  date: 2026-11-09
 links:
   - overview
   - adr-002-fec-strategy
@@ -76,6 +76,16 @@ The speed-level abstraction lives here and in `coppa-engine`; see [[coppa-engine
   PDUs also carry `ack=0`, which moves the receiver's own send window once its
   sequence numbers pass 128 (§19.5). Both are bullets in `docs/LIMITATIONS.md`;
   connected sessions are not affected.
+
+## The air-protocol version is a frozen contract
+
+`coppa_protocol::AIR_PROTOCOL_VERSION` (1) is the number in the PHY and MAC
+headers. Since crate 0.12.0 (COP-178) [SPEC §0.3](../../docs/SPEC.md) freezes
+every on-air field of version 1 and lists the test guarding each one, mostly in
+`tests/air_v1_conformance.rs`. When one of those tests fails, the change is an
+air-protocol break: do not edit the literal, allocate a new version and follow
+§0.3's signalling rule. Releases before 0.12.0 also sent version 1 but are not
+compatible with each other (§0.1), so the promise starts at 0.12.0.
 
 ## Repeated broadcast files
 

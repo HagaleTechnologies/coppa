@@ -24,6 +24,10 @@ pub enum VaraCommand {
     Abort,
     /// Get the software version.
     Version,
+    /// Get the separate crate, air-protocol and host-API versions (coppa
+    /// extension, not a VARA command, COP-178): `VERSIONINFO` with no
+    /// arguments. With any argument it parses as `Unknown`.
+    VersionInfo,
     /// Closing Morse ID on or off: CWID ON|OFF. Any other argument parses as
     /// `Unknown`.
     CwId(bool),
@@ -94,6 +98,17 @@ pub enum VaraResponse {
     Wrong,
     /// VARA version string.
     Version(String),
+    /// Reply to `VERSIONINFO` (coppa extension, COP-178):
+    /// `VERSIONINFO crate_version=<semver> air_protocol_version=<n>
+    /// host_api_version=<n>`. Clients must ignore keys they do not know.
+    VersionInfo {
+        /// The crate semver, e.g. `0.12.0`.
+        crate_version: String,
+        /// The air-protocol version (`docs/SPEC.md` §0.3).
+        air_protocol_version: u32,
+        /// The host-API version (`docs/HOST-API.md`).
+        host_api_version: u32,
+    },
     /// A remote station's connect request was accepted and the handshake
     /// is under way (pushed by a listening station, not a reply to an
     /// outbound `CONNECT`). Followed by `CONNECTED` or `CANCELPENDING`.
@@ -168,6 +183,9 @@ impl VaraCommand {
             Some("BW2750") => VaraCommand::Bandwidth(2750),
             Some("ABORT") => VaraCommand::Abort,
             Some("VERSION") => VaraCommand::Version,
+            Some("VERSIONINFO") if trimmed.split_whitespace().nth(1).is_none() => {
+                VaraCommand::VersionInfo
+            }
             Some("CWID") => {
                 let args: Vec<&str> = trimmed.split_whitespace().skip(1).collect();
                 match args.as_slice() {
@@ -214,6 +232,15 @@ impl VaraResponse {
             VaraResponse::Ok => "OK\r".to_string(),
             VaraResponse::Wrong => "WRONG\r".to_string(),
             VaraResponse::Version(v) => format!("VERSION {}\r", v),
+            VaraResponse::VersionInfo {
+                crate_version,
+                air_protocol_version,
+                host_api_version,
+            } => format!(
+                "VERSIONINFO crate_version={crate_version} \
+                 air_protocol_version={air_protocol_version} \
+                 host_api_version={host_api_version}\r"
+            ),
             VaraResponse::Pending => "PENDING\r".to_string(),
             VaraResponse::CancelPending => "CANCELPENDING\r".to_string(),
             VaraResponse::Connected(src, dst, bw) => {
@@ -234,6 +261,17 @@ impl VaraResponse {
     /// `VERSION` command.
     pub fn coppa_version() -> Self {
         VaraResponse::Version(concat!("Coppa ", env!("CARGO_PKG_VERSION")).to_string())
+    }
+
+    /// The reply to `VERSIONINFO` (COP-178): this build's crate semver, the
+    /// air-protocol version and the host-API version, each from its shared
+    /// constant.
+    pub fn coppa_version_info() -> Self {
+        VaraResponse::VersionInfo {
+            crate_version: env!("CARGO_PKG_VERSION").to_string(),
+            air_protocol_version: u32::from(coppa_engine::AIR_PROTOCOL_VERSION),
+            host_api_version: coppa_engine::HOST_API_VERSION,
+        }
     }
 
     /// True for the telemetry lines a client may miss: `BUSY` and `SNR`. The
@@ -296,6 +334,58 @@ mod tests {
     #[test]
     fn test_parse_version() {
         assert_eq!(VaraCommand::parse("VERSION"), VaraCommand::Version);
+    }
+
+    /// COP-178: `VERSIONINFO` takes no arguments, is case-insensitive and
+    /// tolerates surrounding whitespace; any argument makes it `Unknown`
+    /// (answered `WRONG`).
+    #[test]
+    fn cop178_parse_versioninfo() {
+        for line in [
+            "VERSIONINFO",
+            "versioninfo",
+            "VersionInfo",
+            "  VERSIONINFO \r\n",
+        ] {
+            assert_eq!(
+                VaraCommand::parse(line),
+                VaraCommand::VersionInfo,
+                "{line:?}"
+            );
+        }
+        for line in ["VERSIONINFO extra", "VERSIONINFO 1", "VERSIONINFO  a b"] {
+            assert!(
+                matches!(VaraCommand::parse(line), VaraCommand::Unknown(_)),
+                "{line:?} must not parse as VERSIONINFO"
+            );
+        }
+        assert_eq!(VaraCommand::parse("VERSION"), VaraCommand::Version);
+    }
+
+    #[test]
+    fn cop178_format_versioninfo() {
+        assert_eq!(
+            VaraResponse::VersionInfo {
+                crate_version: "0.12.0".to_string(),
+                air_protocol_version: 1,
+                host_api_version: 1,
+            }
+            .format(),
+            "VERSIONINFO crate_version=0.12.0 air_protocol_version=1 host_api_version=1\r"
+        );
+        assert_eq!(
+            VaraResponse::coppa_version_info().format(),
+            format!(
+                "VERSIONINFO crate_version={} air_protocol_version=1 host_api_version=1\r",
+                env!("CARGO_PKG_VERSION")
+            ),
+            "air protocol v1 / host API v1"
+        );
+        // The legacy VERSION line is unchanged.
+        assert_eq!(
+            VaraResponse::coppa_version().format(),
+            format!("VERSION Coppa {}\r", env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]

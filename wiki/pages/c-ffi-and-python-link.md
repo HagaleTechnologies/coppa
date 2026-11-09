@@ -6,12 +6,13 @@ status: current
 maintainer: agent
 sources:
   - crates/coppa-ffi/src/lib.rs
+  - docs/SPEC.md
   - crates/coppa-ffi/cbindgen.toml
   - crates/coppa-engine/src/link.rs
   - bindings/python/coppa/_ffi.py
 verified:
-  commit: 2526b50
-  date: 2026-11-03
+  commit: 4237273
+  date: 2026-11-09
 links:
   - overview
   - coppa-engine
@@ -38,12 +39,32 @@ Adding a field to the public `CoppaConfig` fails `cargo-semver-checks`
 structs start with `uint32_t struct_size` instead; `coppa_config_t` waits for
 the next ABI major.
 
+`struct_size` does not make growth free either. `coppa_link_new` refuses a
+caller whose `struct_size` is smaller than the current struct, so a tail field
+added to `coppa_link_config_t` breaks an older binary too. Since COP-178 every
+layout change to an existing public struct counts as an ABI major (the
+[C ABI decision](../../docs/DECISIONS/2026-11-03-c-abi-versioning.md)); add a
+new function instead.
+
+## Four version numbers, four meanings
+
+`coppa_version()` is the crate semver, `coppa_abi_version()` the C ABI,
+`coppa_air_protocol_version()` the on-air format and
+`coppa_host_api_version()` the TCP/WebSocket host API. They move
+independently: an ABI minor bump says nothing about the air protocol. The two
+newer accessors need ABI 1.1, so check `coppa_abi_version()` before resolving
+them from an older library. What air version 1 freezes is in
+[SPEC §0.3](../../docs/SPEC.md); the TCP and WebSocket forms are in
+[HOST-API](../../docs/HOST-API.md).
+
 ## `build.rs` can leave a stale header
 
 `build.rs` prints `cbindgen: skipping header generation (parse error)` and keeps
 the old `coppa.h` when cbindgen cannot parse `lib.rs`. After an FFI change,
 check that `coppa.h` actually changed; CI's `git diff --exit-code` step catches
 a stale header only if the build regenerated it.
+A stale header also hides a removed export, so a header diff alone is not an
+ABI check: compare the built library's `coppa_*` symbols as well.
 
 ## Link tests are about 11 times slower in debug
 

@@ -32,12 +32,16 @@ fn assert_huffman_vector(input: &[u8], expected_hex: &str) {
     assert_eq!(
         hex(&encoded),
         expected_hex,
-        "Huffman vector for {:?} drifted from SPEC.md §15.6",
+        "air protocol v1: Huffman vector for {:?} drifted from SPEC.md §15.6",
         String::from_utf8_lossy(input)
     );
     // A frozen vector that no longer round-trips would be a bug, not a
     // documentation drift: the lossy `decode` is the shipped decoder (§15.3).
-    assert_eq!(codec.decode(&encoded), input);
+    assert_eq!(
+        codec.decode(&encoded),
+        input,
+        "air protocol v1: codec.decode(&encoded), input"
+    );
 }
 
 /// The four Huffman-layer vectors of SPEC.md §15.6: empty input, plain ham
@@ -65,7 +69,7 @@ fn envelope_vector_matches_spec_15_6() {
     assert_eq!(
         hex(&envelope),
         "fe0c000000c000b3496692cd2568bf63de66",
-        "envelope vector for \"CQ CQ CQ DE W1AW K\" drifted from SPEC.md §15.6"
+        "air protocol v1: envelope vector for \"CQ CQ CQ DE W1AW K\" drifted from SPEC.md §15.6"
     );
 
     // Inverting per §15.2 must recover the plaintext: LZ4 decompress, then
@@ -73,5 +77,9 @@ fn envelope_vector_matches_spec_15_6() {
     let lz4 = &envelope[1..];
     let recovered_huffman =
         coppa_protocol::compression::lz4_decompress(lz4).expect("frozen envelope must decompress");
-    assert_eq!(codec.decode(&recovered_huffman), b"CQ CQ CQ DE W1AW K");
+    assert_eq!(
+        codec.decode(&recovered_huffman),
+        b"CQ CQ CQ DE W1AW K",
+        "air protocol v1: codec.decode(&recovered_huffman), b\"CQ CQ CQ DE W1AW K\""
+    );
 }

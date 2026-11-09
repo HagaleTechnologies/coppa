@@ -572,8 +572,17 @@ const MANIFEST_HEADER: &str = "\
 # `rv_sequence` (default [0]) lists one frame per element in on-air order: the WAV
 # holds 100 ms of silence, then each frame followed by 100 ms of silence, all with
 # the same payload and seq_num 0. A receiver decodes it only by combining frames.
+# `air_protocol_version` (COP-178) names the air-protocol version every vector
+# was encoded with and guards (docs/SPEC.md §0.3). Readers refuse a manifest
+# without it.
+
+air_protocol_version = 1
 
 ";
+
+/// Air-protocol version every generated vector is encoded with. It must match
+/// the `air_protocol_version` line in [`MANIFEST_HEADER`] (COP-178).
+const AIR_PROTOCOL_VERSION: u8 = 1;
 
 /// Format one manifest block in the existing key order. `codewords` and
 /// `rv_sequence` appear only when they differ from their defaults.
@@ -644,7 +653,7 @@ fn main() {
             continue;
         }
 
-        let tx = CoppaTransceiver::new(profile_for(spec.level, spec.channel), 1);
+        let tx = CoppaTransceiver::new(profile_for(spec.level, spec.channel), AIR_PROTOCOL_VERSION);
         let mut found = None;
         for attempt in 0..MAX_SEED_ATTEMPTS {
             let seed = spec.base_seed.wrapping_add(attempt);
@@ -688,6 +697,12 @@ fn main() {
         written += 1;
     }
 
+    assert!(
+        MANIFEST_HEADER.contains(&format!(
+            "\nair_protocol_version = {AIR_PROTOCOL_VERSION}\n"
+        )),
+        "MANIFEST_HEADER must declare the air-protocol version the vectors are encoded with"
+    );
     let manifest_text = format!("{MANIFEST_HEADER}{entries}");
     std::fs::write(&manifest_path, &manifest_text).expect("write manifest.toml");
 

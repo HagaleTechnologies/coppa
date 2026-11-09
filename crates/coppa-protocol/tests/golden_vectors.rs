@@ -37,9 +37,36 @@ use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::modem::streaming::{DecodedFrame, StreamingReceiver};
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 
+/// The air-protocol version these committed vectors guard (COP-178,
+/// `docs/SPEC.md` §0.3). A literal, not the production constant: if the
+/// production version changes, these frozen version-1 vectors still claim
+/// version 1, and the decode with `CoppaTransceiver::new(_, 1)` below keeps
+/// checking the version-1 receiver.
+const GUARDED_AIR_PROTOCOL_VERSION: u8 = 1;
+
 #[derive(serde::Deserialize)]
 struct ManifestFile {
+    /// Air-protocol version every vector in the manifest was encoded with
+    /// (COP-178). Required: a manifest without it is not a version-1 vector set.
+    air_protocol_version: Option<u8>,
     vectors: Vec<VectorEntry>,
+}
+
+/// Parse the manifest and refuse it unless it declares air-protocol version 1.
+fn parse_manifest(manifest_text: &str) -> ManifestFile {
+    let manifest: ManifestFile = toml::from_str(manifest_text)
+        .expect("air protocol v1: failed to parse golden manifest.toml");
+    match manifest.air_protocol_version {
+        Some(GUARDED_AIR_PROTOCOL_VERSION) => manifest,
+        Some(other) => panic!(
+            "air protocol v1: golden manifest declares air_protocol_version = {other}; \
+             these vectors guard version {GUARDED_AIR_PROTOCOL_VERSION} (docs/SPEC.md §0.3)"
+        ),
+        None => panic!(
+            "air protocol v1: golden manifest is missing its top-level \
+             `air_protocol_version = {GUARDED_AIR_PROTOCOL_VERSION}` key (docs/SPEC.md §0.3)"
+        ),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -83,7 +110,7 @@ impl VectorEntry {
 fn read_manifest() -> ManifestFile {
     let manifest_text = std::fs::read_to_string(golden_dir().join("manifest.toml"))
         .expect("failed to read golden manifest.toml");
-    toml::from_str(&manifest_text).expect("failed to parse golden manifest.toml")
+    parse_manifest(&manifest_text)
 }
 
 /// Golden-vector root directory, relative to this crate's own manifest dir.
@@ -166,8 +193,7 @@ fn golden_vectors_decode_to_expected_payloads() {
             manifest_path.display()
         )
     });
-    let manifest: ManifestFile =
-        toml::from_str(&manifest_text).expect("failed to parse golden manifest.toml");
+    let manifest = parse_manifest(&manifest_text);
 
     assert!(
         !manifest.vectors.is_empty(),
@@ -237,11 +263,36 @@ fn golden_vectors_decode_to_expected_payloads() {
 
     assert!(
         failures.is_empty(),
-        "golden vector failures ({}/{}):\n{}",
+        "air protocol v1: golden vector failures ({}/{}):\n{}",
         failures.len(),
         manifest.vectors.len(),
         failures.join("\n")
     );
+}
+
+#[test]
+fn golden_manifest_requires_air_protocol_version_1() {
+    let entry_free = "vectors = []\n";
+    let missing = std::panic::catch_unwind(|| parse_manifest(entry_free));
+    let msg = missing
+        .err()
+        .and_then(|e| e.downcast::<String>().ok())
+        .expect("a manifest without air_protocol_version must be refused");
+    assert!(msg.contains("air protocol v1"), "{msg}");
+    assert!(msg.contains("missing"), "{msg}");
+
+    let wrong =
+        std::panic::catch_unwind(|| parse_manifest("air_protocol_version = 2\nvectors = []\n"));
+    let msg = wrong
+        .err()
+        .and_then(|e| e.downcast::<String>().ok())
+        .expect("a manifest declaring another air-protocol version must be refused");
+    assert!(msg.contains("air protocol v1"), "{msg}");
+    assert!(msg.contains("air_protocol_version = 2"), "{msg}");
+
+    let ok = parse_manifest("air_protocol_version = 1\nvectors = []\n");
+    assert_eq!(ok.air_protocol_version, Some(1));
+    assert_eq!(read_manifest().air_protocol_version, Some(1));
 }
 
 /// Multi-codeword ids the corpus must hold, with their codeword counts.
@@ -356,7 +407,7 @@ fn golden_manifest_covers_the_full_grid() {
     assert_eq!(
         manifest.vectors.len(),
         8 * channels.len() + 2 + MULTI_CODEWORD_VECTORS.len() + RETRANSMISSION_VECTORS.len(),
-        "manifest has unexpected extra/missing entries"
+        "air protocol v1: manifest has unexpected extra/missing entries"
     );
 }
 
@@ -474,7 +525,7 @@ fn golden_vectors_decode_through_the_streaming_receiver() {
 
     assert!(
         failures.is_empty(),
-        "streaming golden vector failures ({}/{}):\n{}",
+        "air protocol v1: streaming golden vector failures ({}/{}):\n{}",
         failures.len(),
         manifest.vectors.len(),
         failures.join("\n")
