@@ -435,3 +435,48 @@ fn arq_and_decompression_failures() {
     );
     assert!(matches!(error, ProtocolError::Lz4Decompression { .. }));
 }
+
+/// COP-121: chat text, stream 1 record and `app_messages` CFM failures.
+#[test]
+fn chat_record_and_app_messages_failures() {
+    use coppa_protocol::app_stream::{check_chat_text, encode_record, RecordReader};
+
+    failure!(
+        check_chat_text(" \n"),
+        ProtocolError::ChatEmpty,
+        "Message is empty"
+    );
+    failure!(
+        check_chat_text(&"a".repeat(600)),
+        ProtocolError::ChatTooLong { len: 600, max: 512 },
+        "Message is 600 bytes; the limit is 512"
+    );
+    failure!(
+        encode_record(&AppPdu::new_text(&vec![0; 65_536])).map(|_| ()),
+        ProtocolError::AppRecordTooLong { len: 65_540 },
+        "Application record too long: 65540 bytes (max 65535)"
+    );
+    let mut reader = RecordReader::default();
+    let mut out = reader.push(&[0x00, 0x02, 0x00, 0x00]);
+    assert_eq!(out.len(), 1);
+    failure!(
+        out.remove(0).map(|_| ()),
+        ProtocolError::AppRecordTooShort { len: 2 },
+        "Application record too short: length 2 (min 4)"
+    );
+
+    let caps = LinkCapabilities {
+        app_messages: true,
+        ..LinkCapabilities::default()
+    };
+    let mut s = session(caps.clone());
+    s.handle_connect_req(&caps.to_bytes(), Instant::now())
+        .unwrap();
+    let mut bad = caps;
+    bad.app_messages = false;
+    failure!(
+        s.handle_connect_cfm(&bad.to_bytes(), Instant::now()),
+        ProtocolError::AppMessagesMismatch,
+        "Application-message capability does not match negotiation"
+    );
+}

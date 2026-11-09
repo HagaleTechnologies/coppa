@@ -24,6 +24,8 @@ mod tests {
         "log",
         "tune",
         "set_speed_level",
+        "chat",
+        "chat_history",
     ];
 
     const WORDING: &[&str] = &[
@@ -82,6 +84,27 @@ mod tests {
         "Connect a session to send",
         ": accepted",
         ": refused: ",
+        // COP-121: the tab bar and the Chat tab.
+        "Station",
+        "Chat",
+        "Chatting with",
+        "Not connected to coppad.",
+        "Loading messages…",
+        "No messages yet. Messages you send and receive appear here.",
+        "No session. Call a station on the Station tab to chat.",
+        "'s coppad does not accept chat: it needs coppad 0.11.0 or later with its WebSocket API enabled.",
+        "Connect a session to chat",
+        "Type a message",
+        "Message",
+        " of 512 bytes",
+        "Too long: ",
+        "Sending…",
+        "Delivered",
+        "Not delivered: ",
+        "Not sent: ",
+        "To ",
+        "From ",
+        "Delivered means the other station's coppad received the message. It does not mean someone read it.",
     ];
 
     #[test]
@@ -232,6 +255,106 @@ mod tests {
             reset_live.contains("state.lastSnrAt = 0;"),
             "resetLive keeps the S/N arrival time across a socket loss"
         );
+    }
+
+    /// COP-122: every control is a 44 px touch target, and `hidden` hides
+    /// the token form even though `.row` sets `display: flex`.
+    /// `tests/dashboard_touch.rs` measures the rendered page in a real
+    /// browser; this guard runs in `ci.yml`'s `--lib` job, where no browser
+    /// does, so a deleted rule still fails CI.
+    #[test]
+    fn page_keeps_touch_sized_controls() {
+        for rule in [
+            "[hidden] { display: none !important; }",
+            "button, input { min-height: 44px; }",
+            "button { min-width: 44px;",
+        ] {
+            assert!(INDEX_HTML.contains(rule), "page stylesheet lacks {rule:?}");
+        }
+    }
+
+    /// COP-121: every `hello` (first connect and every reconnect) asks for
+    /// the chat history, which carries every receipt the page missed.
+    #[test]
+    fn page_reloads_chat_history_on_every_hello() {
+        assert!(
+            page_function("onHello").contains("request(\"chat_history\""),
+            "onHello never requests chat_history"
+        );
+    }
+
+    /// A `chat_history` reply replaces the page's messages; `chat` pushes
+    /// upsert by `message_id` (D12).
+    #[test]
+    fn page_replaces_chat_from_history_and_upserts_pushes() {
+        let history = page_function("applyChatHistory");
+        let clear = history
+            .find("state.chat.clear();")
+            .expect("applyChatHistory clears the map");
+        let fill = history
+            .find("state.chat.set(")
+            .expect("applyChatHistory fills the map");
+        assert!(clear < fill, "applyChatHistory fills before it clears");
+
+        let push = page_function("applyChat");
+        assert!(
+            push.contains("state.chat.set(msg.message_id"),
+            "applyChat does not upsert by message_id"
+        );
+        assert!(!push.contains(".clear()"), "applyChat clears the map");
+    }
+
+    #[test]
+    fn page_applies_receipts_by_message_id() {
+        assert!(
+            page_function("applyChatReceipt").contains("state.chat.get(msg.message_id)"),
+            "applyChatReceipt does not look the message up by message_id"
+        );
+    }
+
+    /// The limit is 512 UTF-8 bytes, not 512 characters.
+    #[test]
+    fn page_counts_chat_in_utf8_bytes() {
+        assert!(INDEX_HTML.contains("new TextEncoder().encode("));
+        assert!(
+            page_function("renderChat").contains("new TextEncoder().encode(input.value).length")
+        );
+    }
+
+    /// `main { display: grid; }` overrides the browser's `[hidden]` rule, so
+    /// the tab panels need their own rule.
+    #[test]
+    fn page_hides_tab_panels_with_a_scoped_rule() {
+        let style = &INDEX_HTML[..INDEX_HTML.find("</style>").expect("page has a stylesheet")];
+        assert!(style.contains("[role=\"tabpanel\"][hidden] { display: none; }"));
+        let tabs: Vec<&str> = INDEX_HTML
+            .match_indices("role=\"tab\"")
+            .map(|(at, _)| {
+                let open = INDEX_HTML[..at].rfind('<').expect("tag start");
+                let close = at + INDEX_HTML[at..].find('>').expect("tag end");
+                &INDEX_HTML[open..=close]
+            })
+            .collect();
+        assert_eq!(tabs.len(), 2, "page must have exactly two tabs");
+        for tag in tabs {
+            assert!(tag.starts_with("<button"), "tab is not a button: {tag}");
+            assert!(
+                tag.contains("aria-selected="),
+                "tab lacks aria-selected: {tag}"
+            );
+        }
+        let body = &INDEX_HTML[INDEX_HTML.find("</style>").expect("stylesheet ends")..];
+        assert_eq!(body.matches("role=\"tabpanel\"").count(), 2);
+    }
+
+    /// A socket loss keeps the messages on screen and waits for the next
+    /// `chat_history` instead of clearing them.
+    #[test]
+    fn page_keeps_chat_across_a_socket_loss() {
+        let reset_live = page_function("resetLive");
+        assert!(reset_live.contains("state.chatLoaded = false;"));
+        assert!(!reset_live.contains("state.chat.clear()"));
+        assert!(!reset_live.contains("state.chat = "));
     }
 
     #[test]

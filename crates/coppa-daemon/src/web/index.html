@@ -10,6 +10,10 @@
   attribute setters only. Every request goes through request(type, fields).
   The wire format is WebSocket protocol v1 (docs/OPERATING.md, "Dashboard
   protocol v1"); unknown fields and message types are ignored.
+
+  COP-121: two tabs, Station (every card) and Chat. Chat messages are kept in
+  a map keyed by message_id: a chat_history reply replaces it, chat and
+  chat_receipt pushes update it, and a socket loss keeps it.
 -->
 <html lang="en">
 <head>
@@ -62,6 +66,24 @@
   #log { height: 14rem; overflow-y: auto; font-size: 0.85rem; }
   .row { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; margin: 0.25rem 0; }
   #send-data { flex: 1; min-width: 12rem; }
+  /* COP-122: 44 px touch targets; [hidden] must win over .row's display: flex. */
+  [hidden] { display: none !important; }
+  button, input { min-height: 44px; }
+  button { min-width: 44px; padding: 0.5rem 0.9rem; }
+  .buttons { gap: 0.5rem; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 0.25rem; padding: 0.5rem 1rem 0; border-bottom: 1px solid var(--line); background: var(--card); }
+  .tabs button { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+  .tabs button[aria-selected="true"] { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 700; }
+  [role="tabpanel"][hidden] { display: none; }
+  #chat-panel { margin: 0.75rem; }
+  #chat-list { max-height: 60vh; overflow-y: auto; }
+  .chat-line { display: flex; flex-wrap: wrap; gap: 0 0.75rem; padding: 0.25rem 0; border-bottom: 1px solid var(--line); }
+  .chat-body { flex: 1 1 12rem; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .chat-state.delivered { color: var(--ok); }
+  .chat-state.failed { color: var(--bad); }
+  #chat-text { flex: 1; min-width: 12rem; }
+  #chat-count.bad { color: var(--bad); }
+  @media (max-width: 600px) { .chat-body { flex-basis: 100%; } }
 </style>
 </head>
 <body>
@@ -80,7 +102,11 @@
     <span id="busy-lamp" class="lamp">Channel: —</span>
   </div>
 </header>
-<main>
+<nav class="tabs" role="tablist" aria-label="Views">
+  <button id="tab-station" type="button" role="tab" aria-selected="true" aria-controls="station-panel">Station</button>
+  <button id="tab-chat" type="button" role="tab" aria-selected="false" aria-controls="chat-panel">Chat</button>
+</nav>
+<main id="station-panel" role="tabpanel" aria-labelledby="tab-station">
   <section>
     <h2 id="wf-title">Waterfall</h2>
     <p id="wf-empty" class="muted">No spectrum received yet. The daemon sends one only while it receives audio.</p>
@@ -154,6 +180,19 @@
     <div id="command-result" class="muted"></div>
   </section>
 </main>
+<section id="chat-panel" role="tabpanel" aria-labelledby="tab-chat" hidden>
+  <h2>Chat</h2>
+  <div id="chat-state">Not connected to coppad.</div>
+  <div id="chat-list" aria-live="polite"></div>
+  <p class="muted">Delivered means the other station's coppad received the message. It does not mean someone read it.</p>
+  <form id="chat-form" class="row">
+    <label for="chat-text">Message</label>
+    <input id="chat-text" autocomplete="off" placeholder="Connect a session to chat" disabled>
+    <button id="chat-send" type="submit" disabled>Send</button>
+  </form>
+  <div id="chat-count" class="muted">0 of 512 bytes</div>
+  <div id="chat-result" class="muted"></div>
+</section>
 <script>
 "use strict";
 
@@ -162,6 +201,8 @@
 const RETRY_S = [1, 2, 4, 8, 15];
 const SNR_WINDOW_MS = 120000;
 const LOG_CAP = 500;
+const CHAT_CAP = 200;
+const CHAT_MAX_BYTES = 512;
 const $ = (id) => document.getElementById(id);
 
 const state = {
@@ -199,6 +240,14 @@ const state = {
   rxAudio: null,
   txAudio: null,
   wf: { have: false, low: null, high: null, floor: 0, ceil: 0 },
+  tab: "station",
+  // COP-121: message_id -> chat entry. Kept across a socket loss.
+  chat: new Map(),
+  chatLoaded: false,
+  chatUnread: 0,
+  chatKey: "",
+  // `status.chat`: true, false, or undefined with no session.
+  chatAvailable: undefined,
 };
 
 function now() { return performance.now(); }
@@ -296,6 +345,9 @@ function resetLive() {
   // A frame decoded while the socket is down reaches the page only as
   // `status.snr`, which carries no time, so the next status sets the reading.
   state.lastSnrAt = 0;
+  // Receipts missed while the socket is down arrive in the next chat_history.
+  state.chatLoaded = false;
+  state.chatAvailable = undefined;
 }
 
 function onHello(msg) {
@@ -311,6 +363,10 @@ function onHello(msg) {
   request("audio_level", { enabled: true });
   request("log", { enabled: true });
   request("status");
+  request("chat_history", {}, (error) => {
+    // An error reply ends the wait; the list shows what the page has.
+    if (error != null) state.chatLoaded = true;
+  });
 }
 
 $("token-form").addEventListener("submit", (event) => {
@@ -340,6 +396,9 @@ function handle(msg) {
     case "speed_level": state.speedLevel = msg.level; state.speedMode = msg.mode; break;
     case "session": applySession(msg.state === "connected", msg.remote_call || null, true); break;
     case "heard": if (Array.isArray(msg.stations)) state.heard = msg.stations; break;
+    case "chat": applyChat(msg); break;
+    case "chat_receipt": applyChatReceipt(msg); break;
+    case "chat_history": applyChatHistory(msg); break;
     case "data":
       addLog(Date.now(), null, msg.encoding === "base64"
         ? "RX data (base64): " + msg.data : "RX data: " + msg.data);
@@ -387,6 +446,7 @@ function applyStatus(msg) {
   if (msg.connected !== state.session.connected || (msg.connected === true && call !== state.session.call)) {
     applySession(msg.connected === true, call, false);
   }
+  state.chatAvailable = typeof msg.chat === "boolean" ? msg.chat : undefined;
   if (typeof msg.max_tune_s === "number") $("tune-seconds").max = String(msg.max_tune_s);
   const input = $("mycall-input");
   if (state.mycall && input.value === "" && document.activeElement !== input) input.value = state.mycall;
@@ -407,6 +467,38 @@ function applySession(connected, call, fromPush) {
     state.session = { connected: true, call: call, since: fromPush ? now() : 0, calling: null };
   } else if (fromPush || !state.session.calling) {
     state.session = { connected: false, call: null, since: 0, calling: null };
+  }
+}
+
+function applyChat(msg) {
+  const fresh = !state.chat.has(msg.message_id);
+  state.chat.set(msg.message_id, msg);
+  if (fresh && msg.direction === "in" && state.tab !== "chat") state.chatUnread += 1;
+  trimChat();
+}
+
+function applyChatReceipt(msg) {
+  const entry = state.chat.get(msg.message_id);
+  // An entry the page never saw comes back with the next chat_history.
+  if (!entry) return;
+  entry.state = msg.state;
+  entry.reason = msg.reason;
+}
+
+function applyChatHistory(msg) {
+  state.pending.delete(msg.id);
+  if (!Array.isArray(msg.messages)) return;
+  state.chat.clear();
+  for (const entry of msg.messages) state.chat.set(entry.message_id, entry);
+  state.chatLoaded = true;
+  trimChat();
+}
+
+function trimChat() {
+  while (state.chat.size > CHAT_CAP) {
+    let lowest = null;
+    for (const id of state.chat.keys()) if (lowest === null || id < lowest) lowest = id;
+    state.chat.delete(lowest);
   }
 }
 
@@ -601,6 +693,76 @@ function renderTune() {
   $("tune-note").hidden = !keyed;
 }
 
+function chatStateWord(entry) {
+  if (entry.direction !== "out") return "";
+  if (entry.state === "sending") return "Sending…";
+  if (entry.state === "delivered") return "Delivered";
+  if (entry.state === "failed") return "Not delivered: " + (entry.reason || "no reason given");
+  return "";
+}
+
+function chatLine(entry) {
+  const row = document.createElement("div");
+  row.className = "chat-line";
+  const time = document.createElement("span");
+  time.className = "muted";
+  time.textContent = clock(Number(entry.timestamp_ms) || Date.now());
+  const who = document.createElement("span");
+  who.textContent = (entry.direction === "out" ? "To " : "From ") + String(entry.remote_call);
+  const body = document.createElement("span");
+  body.className = "chat-body";
+  body.textContent = String(entry.text);
+  row.append(time, who, body);
+  const word = chatStateWord(entry);
+  if (word) {
+    const mark = document.createElement("span");
+    mark.className = "chat-state " + String(entry.state);
+    mark.textContent = word;
+    row.appendChild(mark);
+  }
+  return row;
+}
+
+function renderChat() {
+  $("tab-chat").textContent = state.chatUnread > 0 ? "Chat (" + state.chatUnread + ")" : "Chat";
+  const s = state.session;
+  const call = s.call || "—";
+  let line;
+  if (!isOpen()) line = "Not connected to coppad.";
+  else if (!s.connected) line = "No session. Call a station on the Station tab to chat.";
+  else if (state.chatAvailable === false) {
+    line = call + "'s coppad does not accept chat: it needs coppad 0.11.0 or later with its WebSocket API enabled.";
+  } else line = "Chatting with " + call;
+  $("chat-state").textContent = line;
+
+  const entries = Array.from(state.chat.values()).sort((a, b) => a.message_id - b.message_id);
+  const loading = isOpen() && !state.chatLoaded;
+  const key = (loading ? "loading" : "list") + "|" +
+    entries.map((e) => e.message_id + ":" + e.state + ":" + (e.reason || "")).join(",");
+  if (key !== state.chatKey) {
+    state.chatKey = key;
+    const list = $("chat-list");
+    const stick = list.scrollTop + list.clientHeight >= list.scrollHeight - 4;
+    list.replaceChildren();
+    if (loading) list.textContent = "Loading messages…";
+    else if (entries.length === 0) list.textContent = "No messages yet. Messages you send and receive appear here.";
+    else for (const entry of entries) list.appendChild(chatLine(entry));
+    if (stick) list.scrollTop = list.scrollHeight;
+  }
+
+  const sessionUp = isOpen() && s.connected;
+  const canChat = sessionUp && state.chatAvailable !== false;
+  const input = $("chat-text");
+  input.disabled = !canChat;
+  input.placeholder = sessionUp ? "Type a message" : "Connect a session to chat";
+  const bytes = new TextEncoder().encode(input.value).length;
+  const tooLong = bytes > CHAT_MAX_BYTES;
+  const count = $("chat-count");
+  count.textContent = tooLong ? "Too long: " + bytes + " of 512 bytes" : bytes + " of 512 bytes";
+  count.className = tooLong ? "bad" : "muted";
+  $("chat-send").disabled = !canChat || tooLong;
+}
+
 function render() {
   renderHeader();
   renderLevels();
@@ -608,6 +770,7 @@ function render() {
   renderSpeed();
   renderSession();
   renderTune();
+  renderChat();
 }
 
 // ---- Controls ----------------------------------------------------------
@@ -653,6 +816,38 @@ $("send-form").addEventListener("submit", (event) => {
   request("send", { data: input.value }, (error) => {
     show(error);
     if (error == null) input.value = "";
+  });
+});
+
+function showTab(name) {
+  state.tab = name;
+  $("station-panel").hidden = name !== "station";
+  $("chat-panel").hidden = name !== "chat";
+  $("tab-station").setAttribute("aria-selected", name === "station" ? "true" : "false");
+  $("tab-chat").setAttribute("aria-selected", name === "chat" ? "true" : "false");
+  if (name === "chat") state.chatUnread = 0;
+  render();
+}
+
+$("tab-station").addEventListener("click", () => showTab("station"));
+$("tab-chat").addEventListener("click", () => showTab("chat"));
+
+$("chat-text").addEventListener("input", () => renderChat());
+
+$("chat-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const input = $("chat-text");
+  const text = input.value;
+  if (new TextEncoder().encode(text).length > CHAT_MAX_BYTES) return;
+  request("chat", { text: text }, (error) => {
+    if (error == null) {
+      // Keep anything typed while the request was in flight.
+      if (input.value === text) input.value = "";
+      $("chat-result").textContent = "";
+    } else {
+      $("chat-result").textContent = "Not sent: " + error;
+    }
+    render();
   });
 });
 

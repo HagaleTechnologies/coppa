@@ -630,7 +630,7 @@ only by adding optional fields and new message types; a client must ignore
 fields and types it does not know.
 
 Requests may include an unsigned integer `id`. Each request with an id gets
-one reply with that id: `ack`, `status`, or `error`. An ack means accepted
+one reply with that id: `ack`, `status`, `chat_history` or `error`. An ack means accepted
 for processing. It does not mean a connection or transmission completed.
 Callsign validation happens in the daemon; an accepted but invalid `mycall`
 can still be rejected there with a warning log.
@@ -670,8 +670,8 @@ beacon carried, rather than a list of all RF activity.
 `buffer` is sent when the count of host bytes not yet sent or acknowledged
 changes, the same moment the VARA `BUFFER` line goes out.
 
-Data, session, PTT, busy, SNR, level, heard, buffer and speed-level events use
-a reliable queue for each client. A client either receives them in order or
+Data, session, PTT, busy, SNR, level, heard, buffer, speed-level, `chat` and
+`chat_receipt` events use a reliable queue for each client. A client either receives them in order or
 its connection closes. If 256 pending messages fill that queue, the server
 disconnects that client; it never silently skips a state or data event.
 Replies go directly to the requesting socket. Reconnect and query `status`
@@ -717,11 +717,14 @@ In a session, `remote_call`, `snr`, `level` and `cfo` appear as before, and
 | `loop_age_ms` | Milliseconds since the daemon's event loop last completed its 500 ms housekeeping tick or a busy-channel wait step, computed when the reply is built |
 | `heard` | The same snapshot the `heard` push carries |
 | `link` | Session ARQ link: `in_flight`, `retries` (transmissions of the in-flight segment minus one), `max_retries`, `rto_ms`, `fade_hold`. Absent without a session link |
+| `chat` | `true` while a session that negotiated chat is up, `false` while a session without it is up; absent with no session. See [Chat](#chat) |
 
 Every reliable state push (`session`, `ptt`, `busy`, `snr`, `level`, `heard`,
 `buffer`, `speed_level`) has a matching `status` field, and the daemon updates
 the field before it pushes. A client that sends `status` after connecting
 therefore never ends on an older value than the pushes it then receives.
+`chat` and `chat_receipt` pushes match the `chat_history` reply instead: the
+daemon updates the history before it pushes.
 
 #### TUNE and speed level requests
 
@@ -800,6 +803,82 @@ fields appended to the message, so a refusal shows its reason:
 Each message is truncated to 2 KiB, fields included.
 `decode_fail` is unconditional and reports a cumulative failure count at most
 once per 500 ms. Neither diagnostic stream is a delivery receipt.
+
+#### Chat
+
+COP-121 adds chat with the session peer, with a delivery receipt for each
+message. Both stations must run coppad 0.11.0 or later, built with the
+`websocket` feature and with `[host] websocket_enabled = true`: only then do
+they agree on chat when the session connects (SPEC §23, ADR-013). `status`
+says whether the current session has it.
+
+Message ids are per station: A's `message_id` 7 and B's `message_id` 3 below
+are the same message. A chat between VK3ABC (A) and W1AW (B), each with a
+dashboard open:
+
+```text
+A -> {"type":"chat","text":"Good morning, 5/9 here","id":12}
+A <- {"type":"ack","id":12}
+A <- {"type":"chat","message_id":7,"direction":"out","text":"Good morning, 5/9 here","remote_call":"W1AW","timestamp_ms":1762600921000,"state":"sending"}
+B <- {"type":"chat","message_id":3,"direction":"in","text":"Good morning, 5/9 here","remote_call":"VK3ABC","timestamp_ms":1762600923400,"state":"received"}
+A <- {"type":"chat_receipt","message_id":7,"state":"delivered","timestamp_ms":1762600926700}
+```
+
+`delivered` means the other station's coppad acknowledged the last frame
+carrying the message. It does not mean someone read it.
+
+A message is 1 to 512 UTF-8 bytes with at least one non-space character.
+Refusals the WebSocket task can see from its `status` snapshot get an
+`error` with the request's `id`, and nothing is queued:
+
+```text
+A -> {"type":"chat","text":"   ","id":13}
+A <- {"type":"error","message":"Message is empty","id":13}
+A -> {"type":"chat","text":"<600 bytes of text>","id":14}
+A <- {"type":"error","message":"Message is 600 bytes; the limit is 512","id":14}
+A -> {"type":"chat","text":"hello","id":15}        (no session)
+A <- {"type":"error","message":"No session: call a station first","id":15}
+A -> {"type":"chat","text":"hello","id":16}        (peer runs coppad 0.10.0)
+A <- {"type":"error","message":"The peer's coppad does not accept chat: it needs coppad 0.11.0 or later with its WebSocket API enabled","id":16}
+```
+
+The daemon checks every request again. A message it accepted but could not
+deliver gets a `failed` receipt with a reason:
+
+```text
+A <- {"type":"chat_receipt","message_id":8,"state":"failed","reason":"The session ended before the peer acknowledged the message","timestamp_ms":1762601102000}
+```
+
+The reasons are, verbatim:
+
+- `The session ended before the peer acknowledged the message`
+- `No session: call a station first`
+- `The session is closing` (a disconnect is draining the link)
+- `The peer's coppad does not accept chat: it needs coppad 0.11.0 or later with its WebSocket API enabled`
+- `Too many messages are waiting to be delivered (32)`
+- `Message is empty`, and `Message is <n> bytes; the limit is 512`
+
+`chat_history` returns the last 100 messages since coppad started, oldest
+first, each with its current state. It is answered directly with the
+request's `id`. The dashboard sends it after every `hello`, so a reload or
+reconnect shows every receipt it missed:
+
+```text
+A -> {"type":"chat_history","id":17}
+A <- {"type":"chat_history","id":17,"messages":[{"message_id":7,"direction":"out","text":"Good morning, 5/9 here","remote_call":"W1AW","timestamp_ms":1762600921000,"state":"delivered"},{"message_id":8,"direction":"out","text":"73","remote_call":"W1AW","timestamp_ms":1762601050000,"state":"failed","reason":"The session ended before the peer acknowledged the message"}]}
+```
+
+`status` gains one optional field, `chat`:
+
+```text
+{"type":"status","id":5,"connected":true,"remote_call":"W1AW", ... ,"chat":true}
+```
+
+Chat travels on its own stream inside the session, so the order between
+`send` data and `chat` messages from the same operator is not kept. Only
+WebSocket clients send and see chat; VARA data-port clients keep receiving
+host bytes only. History is in memory and is lost when coppad restarts, and
+ids start again at 1.
 
 ### Setting the token
 
@@ -918,7 +997,18 @@ TUNE and tells transmitting from a hang without a terminal.
    the page needs no token. The page keeps the token in memory only, so a
    reload asks for it again; an automatic reconnect reuses it.
 
-The page makes no external requests. Each card:
+**From a phone or tablet** (COP-122): set up mDNS as in
+[Finding coppad on the network](#finding-coppad-on-the-network-mdns), open
+`http://coppad.local:8400/`, and add that exact origin,
+`"http://coppad.local:8400"`, to `websocket_allowed_origins`. Below 800 px
+wide the page is one column, and every button and input is at least 44 px
+in both directions. This is tested at 390 px in headless Chrome on the
+Station tab (`crates/coppa-daemon/tests/dashboard_touch.rs`), not on the
+Chat tab and not on a physical phone.
+
+The page has two tabs under the header, `Station` (the default) and
+`Chat`. The header stays visible on both. The Station tab holds every card
+below. The page makes no external requests. Each card:
 
 - **Header**: `Connection:`, `Daemon:`, `MYCALL`, the PTT lamp and the
   Channel (BUSY) lamp. See the table below.
@@ -949,6 +1039,41 @@ A request's result shows as `<request>: accepted` or
 `<request>: refused: <reason>`. Accepted means accepted for processing; a
 refusal the daemon makes later (an invalid `MYCALL`, for example) shows as a
 WARN line in the log pane.
+
+### The Chat tab
+
+The Chat tab sends text messages to the session peer and shows whether each
+one arrived (COP-121). To chat:
+
+1. Run coppad 0.11.0 or later on both stations, built with the `websocket`
+   feature and with `[host] websocket_enabled = true`. A peer without that
+   connects as usual, but the Chat tab says
+   `W1AW's coppad does not accept chat: it needs coppad 0.11.0 or later with its WebSocket API enabled.`
+2. Connect a session from the Station tab (`Call station`, then `Call`). The
+   called station must be listening; WebSocket cannot turn listening on, so
+   it needs `LISTEN ON` on its VARA command port (see
+   [LIMITATIONS.md](LIMITATIONS.md)).
+3. Open `Chat`. The status line reads `Chatting with W1AW`. Type in
+   `Message` and press `Send`. The counter under the input shows the size,
+   for example `14 of 512 bytes`, and `Send` is disabled past 512 bytes.
+
+Each line shows the time, `To <call>` or `From <call>`, the text and, for
+messages you sent, its state:
+
+| State word | Meaning |
+|---|---|
+| `Sending…` | coppad queued the message and is waiting for the peer's acknowledgement |
+| `Delivered` | the other station's coppad received the message. It does not mean someone read it |
+| `Not delivered: <reason>` | the session ended first, or coppad refused it; the reason is one of those in [Chat](#chat) |
+
+A refused request leaves the text in the input and shows `Not sent: <reason>`
+under the counter. A message received while the Station tab is showing raises
+the tab's count, `Chat (2)`, which clears when you open the Chat tab; it does
+not add a Log line. The page keeps the list across a lost connection and,
+after it reconnects or reloads, replaces it from coppad's history (the last
+100 messages since coppad started), with every state it missed. A message
+can stay `Sending…` while coppad holds a fading link (see below); it turns
+`Not delivered` when that session ends.
 
 ### Reading the header: transmitting or hung?
 
@@ -1010,6 +1135,12 @@ station's host gets every byte once, in order.
   host sends `DISCONNECT`.
 - `[engine] arq_enabled` does not affect connected sessions; it only enables
   ARQ for sessionless traffic (`[host] sessionless_tx_enabled`).
+- Dashboard chat (COP-121, see [Chat](#chat)) rides the same session but is
+  not host data: its bytes are never counted in `BUFFER` or the WebSocket
+  `buffer` value, so Pat's wait for `BUFFER 0` is unchanged. Queued chat goes
+  out ahead of queued host bytes, one frame at a time. A host `DISCONNECT`
+  still waits until queued chat is acknowledged, so a `73` sent just before
+  it is delivered or reported as not delivered, never dropped silently.
 - Both stations must run coppad 0.3.0 or later. An older station cannot
   decode this session format: its host receives extra header bytes in the
   data, it never acknowledges, and the newer station disconnects after the

@@ -677,6 +677,7 @@ fn capabilities_are_p23_to_p27() {
         multi_frame_ack: true,
         outer_code_rx: false,
         outer_code_req: false,
+        app_messages: false,
         mcs_index: 5,
     };
     let b = LinkCapabilities {
@@ -688,6 +689,7 @@ fn capabilities_are_p23_to_p27() {
         multi_frame_ack: true,
         outer_code_rx: false,
         outer_code_req: false,
+        app_messages: false,
         mcs_index: 3,
     };
     assert_eq!(hex(&a.to_bytes()), vector("P25"));
@@ -703,15 +705,24 @@ fn capabilities_are_p23_to_p27() {
         (120, 1, 2, 4, false, true, 0, 3)
     );
 
-    // Reserved flag bits (4–7; bits 2–3 are the outer-code capability of
-    // §22.1) and trailing bytes are ignored on read; fewer than 7 bytes is
-    // an error.
+    // Reserved flag bits (5–7; bits 2–3 are the outer-code capability of
+    // §22.1 and bit 4 is COP-121's `app_messages`, §23) and trailing bytes
+    // are ignored on read; fewer than 7 bytes is an error.
     let mut lenient = bytes_of("P23");
-    lenient[5] |= 0xF0;
+    lenient[5] |= 0xE0;
     lenient.push(0xAA);
     assert_eq!(
         LinkCapabilities::from_bytes(&lenient).unwrap(),
         coppad_caps()
+    );
+    let mut chat = bytes_of("P23");
+    chat[5] |= 0x10;
+    assert_eq!(
+        LinkCapabilities::from_bytes(&chat).unwrap(),
+        LinkCapabilities {
+            app_messages: true,
+            ..coppad_caps()
+        }
     );
     assert!(matches!(
         LinkCapabilities::from_bytes(&bytes_of("P23")[..6]),
