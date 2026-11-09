@@ -64,15 +64,15 @@ tnc-bench: downloading http://wa8lmf.net/TNCtest/TNC_Test_2.iso to /home/op/.cac
 tnc-bench: TNC_Test_2.iso sha256 OK
 tnc-bench: track 2 is Audio-Tracks/02_100-Mic-E-Bursts-DE-emphasized.flac, sha256 OK
 tnc-bench: flac 1.4.3 decoded track2.wav, sha256 OK
-tnc-bench: coppa 2526b50 (uncommitted changes), direwolf /usr/bin/direwolf, atest /usr/bin/atest
+tnc-bench: coppa f6e9951 (uncommitted changes), direwolf /usr/bin/direwolf, atest /usr/bin/atest
 tnc-bench: building and running coppa-bench --example afsk_vs_direwolf (release)
 input: track2.wav, 44100 Hz, 2 channels, 16-bit, 1549.9 s
-coppa:    412 packets (AFSK 1200 demodulator, resampled 44100 -> 48000 Hz)
-coppa by start offset: 0:412 5:416 10:398 15:399 20:390 25:397 30:388 35:407 (spread 388 to 416)
+coppa:    1000 packets (AFSK 1200 demodulator, resampled 44100 -> 48000 Hz)
+coppa by start offset: 0:1000 5:1000 10:999 15:998 20:999 25:999 30:999 35:1000 (spread 998 to 1000)
 direwolf: 1000 packets (Dire Wolf version 1.7, profile A+)
 atest:    982 packets (profile A)
-coppa / direwolf: 41.2% (95% bar: 950 packets, not met)
-coppa / atest:    42.0% (95% bar: 933 packets, not met)
+coppa / direwolf: 100.0% (95% bar: 950 packets, met)
+coppa / atest:    101.8% (95% bar: 933 packets, met)
 ```
 
 The `tnc-bench:` progress lines go to stderr and the seven report lines go to stdout. The

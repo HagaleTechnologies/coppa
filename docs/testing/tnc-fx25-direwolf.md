@@ -27,10 +27,11 @@ All eleven independently exported profile vectors also match coppa's parity and
 recover zero, one and parity/2 errors, including first and last wire symbols.
 
 The untouched reference starts its tone at sample 1300, which is 20 modulo the
-receiver's 40-sample symbol period. It fails at input offset zero and succeeds
-at offset 20. The test explicitly uses offset 20 without altering the fixture.
-The damaged renderer starts at a symbol boundary and uses offset zero. No new
-acquisition claim is made. The existing WA8LMF acquisition gap remains.
+receiver's 40-sample symbol period. Since COP-113's recovered symbol clock, the
+receiver decodes it from input sample 0, and the test reads it from sample 0
+without altering the fixture. The damaged renderer starts at a symbol boundary
+and also uses sample 0. WA8LMF track 2 counts are in
+[tnc-direwolf-wa8lmf.md](tnc-direwolf-wa8lmf.md).
 
 ## Coppa to Direwolf
 

@@ -12,8 +12,8 @@ sources:
   - docs/testing/tnc-fx25-direwolf.md
   - tools/fx25-interop/run.sh
 verified:
-  commit: 25ee0e0
-  date: 2026-11-05
+  commit: 0ca254e
+  date: 2026-11-09
 links:
   - overview
 ---
@@ -28,15 +28,18 @@ The method and the latest counts are in
 - coppa's demodulator is fixed at 48 kHz. A 44.1 kHz file fed in directly decodes nothing.
 - `atest` colours its output even into a pipe, and both programs print payload bytes that are
   not UTF-8. Strip escapes, decode lossily, and count `[0] ` or `[0.N] ` lines only.
-- Coppa's count moves by up to 28 packets with the start offset. Compare changes against the
+- Since COP-113, coppa's count moves by at most 2 packets with the start offset (998 to 1000;
+  it moved by 28 before the receiver recovered a symbol clock). Compare changes against the
   spread the report prints.
+- coppa's receiver runs six slicers, each with its own HDLC and FX.25 receiver. An FX.25 slicer
+  reports its corrected frame up to 1.7 s after a plain slicer reports the same inner frame, so
+  duplicates are merged by where the frame ended in the input, not by when it was reported.
 - **FX.25 vectors and audio have separate proofs (COP-114).** See
   [the FX.25 record](../../docs/testing/tnc-fx25-direwolf.md) and
   [regeneration instructions](../../tools/fx25-interop/README.md). Controlled
   damaged-symbol correction and Direwolf's zero-error decode of coppa audio
   prove wire compatibility. They do not measure acquisition on noisy audio.
-  The untouched Direwolf WAV needs a 20-sample receive-origin offset with the
-  existing fixed-window demodulator.
+  Since COP-113 the untouched Direwolf WAV decodes from input sample 0.
 
 COP-115 adds automatic IL2P receive and opt-in `coppa tnc --il2p` transmit.
 See [the IL2P interoperability record](../../docs/testing/tnc-direwolf-il2p.md).
