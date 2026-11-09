@@ -257,7 +257,6 @@ mod tests {
         );
     }
 
-<<<<<<< HEAD
     /// COP-122: every control is a 44 px touch target, and `hidden` hides
     /// the token form even though `.row` sets `display: flex`.
     /// `tests/dashboard_touch.rs` measures the rendered page in a real
@@ -272,7 +271,8 @@ mod tests {
         ] {
             assert!(INDEX_HTML.contains(rule), "page stylesheet lacks {rule:?}");
         }
-=======
+    }
+
     /// COP-121: every `hello` (first connect and every reconnect) asks for
     /// the chat history, which carries every receipt the page missed.
     #[test]
@@ -355,7 +355,6 @@ mod tests {
         assert!(reset_live.contains("state.chatLoaded = false;"));
         assert!(!reset_live.contains("state.chat.clear()"));
         assert!(!reset_live.contains("state.chat = "));
->>>>>>> 2f002b5d107c59af91bb1c3947ab24e75762c3b6
     }
 
     #[test]

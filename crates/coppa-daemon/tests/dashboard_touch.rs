@@ -58,25 +58,26 @@ struct Expected {
 }
 
 /// The states `MEASURE` returns, in order. Before the first `status` the
-/// page shows the token form (input and Connect), `Auto`, TUNE (Seconds,
-/// Two-tone, Single tone) and the command box (MYCALL, Set, Call station,
-/// Call, Disconnect, Send input, Send). `hello` hides the token form and
-/// each `status` adds one button per speed level: 8 on HF, 9 on VHF
-/// (`coppa-engine`'s `engine.rs`).
+/// page shows the token form (input and Connect), the Station and Chat tabs
+/// (COP-121), `Auto`, TUNE (Seconds, Two-tone, Single tone) and the command
+/// box (MYCALL, Set, Call station, Call, Disconnect, Send input, Send). The
+/// Chat tab's panel is hidden, so its controls render no box. `hello` hides
+/// the token form and each `status` adds one button per speed level: 8 on
+/// HF, 9 on VHF (`coppa-engine`'s `engine.rs`).
 const STATES: [Expected; 3] = [
     Expected {
         label: "before the first status",
-        controls: 13,
+        controls: 15,
         token_form_hidden: false,
     },
     Expected {
         label: "after hello and an HF status (levels 1 to 8)",
-        controls: 19,
+        controls: 21,
         token_form_hidden: true,
     },
     Expected {
         label: "after a VHF status (levels 1 to 9)",
-        controls: 20,
+        controls: 22,
         token_form_hidden: true,
     },
 ];
