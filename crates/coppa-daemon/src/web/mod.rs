@@ -257,6 +257,22 @@ mod tests {
         );
     }
 
+    /// COP-122: every control is a 44 px touch target, and `hidden` hides
+    /// the token form even though `.row` sets `display: flex`.
+    /// `tests/dashboard_touch.rs` measures the rendered page in a real
+    /// browser; this guard runs in `ci.yml`'s `--lib` job, where no browser
+    /// does, so a deleted rule still fails CI.
+    #[test]
+    fn page_keeps_touch_sized_controls() {
+        for rule in [
+            "[hidden] { display: none !important; }",
+            "button, input { min-height: 44px; }",
+            "button { min-width: 44px;",
+        ] {
+            assert!(INDEX_HTML.contains(rule), "page stylesheet lacks {rule:?}");
+        }
+    }
+
     /// COP-121: every `hello` (first connect and every reconnect) asks for
     /// the chat history, which carries every receipt the page missed.
     #[test]
