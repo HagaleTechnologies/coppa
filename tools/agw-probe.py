@@ -25,17 +25,27 @@ def reply(sock, kind):
     return bytes(exact(length))
 
 
+# The G port description and g baud code (byte 0) the TNC reports at each
+# --baud (COP-164).
+PORTS = {1200: (b"1;Port1 coppa AFSK 1200;\0", 0),
+         9600: (b"1;Port1 coppa G3RUH 9600;\0", 3)}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--baud", type=int, choices=sorted(PORTS), default=1200,
+                        help="the --baud the TNC was started with (default 1200)")
     args = parser.parse_args()
+    port_text, baud_code = PORTS[args.baud]
     with socket.create_connection((args.host, args.port), timeout=3) as sock:
         for kind, expected in [("R", struct.pack("<II", 2005, 127)),
-                               ("G", b"1;Port1 coppa AFSK 1200;\0"),
-                               ("g", bytes([0, 255]) + bytes(10)), ("X", b"\1")]:
+                               ("G", port_text),
+                               ("g", bytes([baud_code, 255]) + bytes(10)), ("X", b"\1")]:
             sock.sendall(packet(kind))
-            assert reply(sock, kind) == expected, kind
+            got = reply(sock, kind)
+            assert got == expected, f"{kind}: got {got!r}, expected {expected!r}"
         sock.sendall(packet("k") + packet("m") + packet("M", b">coppa AGW probe"))
     print("Control replies verified; UI transmission requested. Audio and RF delivery NOT tested.")
 

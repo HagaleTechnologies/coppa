@@ -321,6 +321,8 @@ See [the AGW wire contract](HOST-API.md#agwpe-connectionless-afsk-tnc) for suppo
 commands, limits, monitoring, queue counts and overload behavior.
 Run `python3 tools/agw-probe.py --host 127.0.0.1 --port 8000` from the repository
 root for a control-only check. It requests a transmission, without claiming delivery.
+A TNC started with `--baud 9600` needs `--baud 9600` on the probe too, since the
+`G` and `g` replies then describe a G3RUH 9600 port.
 
 Automated verification: `cargo test -p coppa-daemon --features kiss-tnc --lib tnc::`
 includes `agw_tcp_audio_round_trip`, which registers through TCP, transmits binary

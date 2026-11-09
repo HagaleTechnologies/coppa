@@ -156,3 +156,77 @@ fn kiss_only_startup_is_unchanged_without_agw_port() {
     p.0.wait().unwrap();
     logs.join().unwrap();
 }
+/// COP-164: the AGWPE `G` and `g` replies describe the modem `--baud`
+/// selects, so a 9600 TNC reports a G3RUH 9600 port and baud code 3, and
+/// the 1200 default keeps COP-137's bytes.
+#[test]
+fn agw_port_replies_report_the_configured_baud() {
+    fn start_tnc(baud: &str, agw_port: u16) -> (Process, std::thread::JoinHandle<()>) {
+        let mut p = Process(
+            binary()
+                .args([
+                    "tnc",
+                    "--baud",
+                    baud,
+                    "--port",
+                    "0",
+                    "--agw-port",
+                    &agw_port.to_string(),
+                    "--bind-address",
+                    "127.0.0.1",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .env("RUST_LOG", "info")
+                .spawn()
+                .unwrap(),
+        );
+        let stderr = p.0.stderr.take().unwrap();
+        let (send, recv) = std::sync::mpsc::channel();
+        // Keep draining stderr after readiness, when `recv` is gone, so the
+        // child never writes into a closed or full pipe while the test runs.
+        let logs = std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                let Ok(line) = line else { break };
+                let _ = send.send(line);
+            }
+        });
+        loop {
+            let line = recv
+                .recv_timeout(Duration::from_secs(10))
+                .expect("TNC startup");
+            if line.contains("TNC ready.") {
+                break;
+            }
+        }
+        (p, logs)
+    }
+    for (baud, port_text, code) in [
+        ("9600", &b"1;Port1 coppa G3RUH 9600;\0"[..], 3u8),
+        ("1200", &b"1;Port1 coppa AFSK 1200;\0"[..], 0u8),
+    ] {
+        let held = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        drop(held);
+        let (mut p, logs) = start_tnc(baud, port);
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut capabilities = vec![0; 12];
+        capabilities[0] = code;
+        capabilities[1] = 0xFF;
+        for (kind, expected) in [(b'G', port_text.to_vec()), (b'g', capabilities)] {
+            client.write_all(&packet(kind)).unwrap();
+            let mut h = [0; 36];
+            client.read_exact(&mut h).unwrap();
+            assert_eq!(h[4], kind, "--baud {baud}");
+            let mut b = vec![0; u32::from_le_bytes(h[28..32].try_into().unwrap()) as usize];
+            client.read_exact(&mut b).unwrap();
+            assert_eq!(b, expected, "--baud {baud}, request {}", kind as char);
+        }
+        p.0.kill().unwrap();
+        p.0.wait().unwrap();
+        logs.join().unwrap();
+    }
+}

@@ -1,4 +1,5 @@
-//! Connectionless AGWPE adapter for the AFSK TNC. Frames exclude FCS.
+//! Connectionless AGWPE adapter for the KISS TNC (AFSK 1200 or G3RUH 9600).
+//! Frames exclude FCS.
 use crate::HostError;
 use std::{
     collections::HashSet,
@@ -181,6 +182,44 @@ fn utc_time() -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }
 
+/// The single radio port an [`AgwServer`] describes in its `G` (port
+/// information) and `g` (port capabilities) replies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgwPortInfo {
+    description: &'static str,
+    baud_code: u8,
+}
+impl AgwPortInfo {
+    /// AFSK 1200, the default: `G` replies `1;Port1 coppa AFSK 1200;` plus
+    /// NUL, and `g` byte 0 is baud code 0 (1200).
+    pub fn afsk_1200() -> Self {
+        Self {
+            description: "coppa AFSK 1200",
+            baud_code: 0,
+        }
+    }
+    /// G3RUH 9600: `G` replies `1;Port1 coppa G3RUH 9600;` plus NUL, and
+    /// `g` byte 0 is baud code 3 (9600).
+    pub fn g3ruh_9600() -> Self {
+        Self {
+            description: "coppa G3RUH 9600",
+            baud_code: 3,
+        }
+    }
+    /// `G` reply body: one port, this description, then NUL.
+    fn port_reply(&self) -> Vec<u8> {
+        format!("1;Port1 {};\0", self.description).into_bytes()
+    }
+    /// `g` reply body: the on-air baud code, `FF`, then ten zeroes for
+    /// traffic and timing statistics coppa does not report.
+    fn capabilities_reply(&self) -> [u8; 12] {
+        let mut caps = [0; 12];
+        caps[0] = self.baud_code;
+        caps[1] = 0xFF;
+        caps
+    }
+}
+
 /// Bounded connectionless AGWPE TCP server, disabled unless explicitly started.
 pub struct AgwServer {
     port: u16,
@@ -189,13 +228,15 @@ pub struct AgwServer {
     receiver: Option<mpsc::Receiver<Vec<u8>>>,
     rx: broadcast::Sender<Vec<u8>>,
     pending: Arc<AtomicUsize>,
+    info: AgwPortInfo,
 }
 impl AgwServer {
     /// Bind to loopback when started.
     pub fn new(port: u16) -> Self {
         Self::with_bind_addr(port, "127.0.0.1".into())
     }
-    /// Select the listening address.
+    /// Select the listening address. The port is described as AFSK 1200
+    /// until [`AgwServer::with_port_info`] says otherwise.
     pub fn with_bind_addr(port: u16, bind_addr: String) -> Self {
         let (tx, receiver) = mpsc::channel(TX_CAP);
         let (rx, _) = broadcast::channel(64);
@@ -206,12 +247,19 @@ impl AgwServer {
             receiver: Some(receiver),
             rx,
             pending: Arc::new(AtomicUsize::new(0)),
+            info: AgwPortInfo::afsk_1200(),
         }
     }
     /// Share the transmitter's active and queued frame snapshot.
     #[must_use]
     pub fn with_pending_frames(mut self, pending: Arc<AtomicUsize>) -> Self {
         self.pending = pending;
+        self
+    }
+    /// Describe the TNC's modem in the `G` and `g` replies.
+    #[must_use]
+    pub fn with_port_info(mut self, info: AgwPortInfo) -> Self {
+        self.info = info;
         self
     }
     /// Take the FCS-free AX.25 transmit channel once.
@@ -243,9 +291,10 @@ impl AgwServer {
             let tx = self.tx.clone();
             let rx = self.rx.subscribe();
             let pending = self.pending.clone();
+            let info = self.info.clone();
             clients.spawn(async move {
                 let _permit = permit;
-                client(stream, tx, rx, pending).await;
+                client(stream, tx, rx, pending, info).await;
             });
         }
     }
@@ -268,6 +317,7 @@ async fn client(
     tx: mpsc::Sender<Vec<u8>>,
     mut rx: broadcast::Receiver<Vec<u8>>,
     pending: Arc<AtomicUsize>,
+    info: AgwPortInfo,
 ) {
     let (mut reader, mut writer) = stream.into_split();
     let (out, mut outgoing) = mpsc::channel::<Vec<u8>>(64);
@@ -297,8 +347,8 @@ async fn client(
                         if h[0]!=0 {continue;}
                         let response=match h[4] {
                             b'R'=>Some(packet(b'R',&[],&[],0,&[0xd5,7,0,0,127,0,0,0])),
-                            b'G'=>Some(packet(b'G',&[],&[],0,b"1;Port1 coppa AFSK 1200;\0")),
-                            b'g'=>Some(packet(b'g',&[],&[],0,&[0,255,0,0,0,0,0,0,0,0,0,0])),
+                            b'G'=>Some(packet(b'G',&[],&[],0,&info.port_reply())),
+                            b'g'=>Some(packet(b'g',&[],&[],0,&info.capabilities_reply())),
                             b'X'=> {let c=call(&h[8..18]); let ok=c.as_ref().is_some_and(|c| calls.contains(c)||calls.len()<16); if ok {calls.insert(c.clone().unwrap());} Some(packet(b'X',c.as_deref().unwrap_or("").as_bytes(),&[],0,&[u8::from(ok)]))},
                             b'x'=>{if let Some(c)=call(&h[8..18]) {calls.remove(&c);} None},
                             b'k'=>{raw = !raw;None}, b'm'=>{mon = !mon;None},
@@ -1037,6 +1087,50 @@ mod tests {
         flood.abort();
         task.abort();
         let _ = task.await;
+    }
+
+    /// COP-164: `G` and `g` describe the modem the server was built with.
+    /// The 9600 G3RUH port says so in `G` and carries baud code 3 in `g`
+    /// byte 0; the 1200 AFSK port keeps COP-137's bytes.
+    #[tokio::test]
+    async fn port_info_and_capabilities_follow_the_configured_modem() {
+        for (info, port, code) in [
+            (
+                AgwPortInfo::g3ruh_9600(),
+                &b"1;Port1 coppa G3RUH 9600;\0"[..],
+                3,
+            ),
+            (
+                AgwPortInfo::afsk_1200(),
+                &b"1;Port1 coppa AFSK 1200;\0"[..],
+                0,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = AgwServer::new(0).with_port_info(info.clone());
+            let task =
+                tokio::spawn(async move { server.run_with_listener(listener).await.unwrap() });
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            c.write_all(
+                &[
+                    packet(b'G', &[], &[], 0, &[]),
+                    packet(b'g', &[], &[], 0, &[]),
+                ]
+                .concat(),
+            )
+            .await
+            .unwrap();
+            let g = receive(&mut c).await;
+            assert_eq!((g[4], &g[36..]), (b'G', port), "{info:?}");
+            let caps = receive(&mut c).await;
+            let mut expected = [0; 12];
+            expected[0] = code;
+            expected[1] = 0xFF;
+            assert_eq!((caps[4], &caps[36..]), (b'g', &expected[..]), "{info:?}");
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     /// `y` adds the shared transmitter snapshot to this server's queued
