@@ -183,12 +183,12 @@ fn agw_port_replies_report_the_configured_baud() {
         );
         let stderr = p.0.stderr.take().unwrap();
         let (send, recv) = std::sync::mpsc::channel();
+        // Keep draining stderr after readiness, when `recv` is gone, so the
+        // child never writes into a closed or full pipe while the test runs.
         let logs = std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines() {
                 let Ok(line) = line else { break };
-                if send.send(line).is_err() {
-                    break;
-                }
+                let _ = send.send(line);
             }
         });
         loop {

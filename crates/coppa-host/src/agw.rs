@@ -1124,7 +1124,7 @@ mod tests {
             let g = receive(&mut c).await;
             assert_eq!((g[4], &g[36..]), (b'G', port), "{info:?}");
             let caps = receive(&mut c).await;
-            let mut expected = vec![0; 12];
+            let mut expected = [0; 12];
             expected[0] = code;
             expected[1] = 0xFF;
             assert_eq!((caps[4], &caps[36..]), (b'g', &expected[..]), "{info:?}");
