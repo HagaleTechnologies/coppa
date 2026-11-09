@@ -38,7 +38,7 @@ kiss-tnc = []
 ardop = []
 
 [dev-dependencies]
-jsonschema = { version = "0.49.4", default-features = false }
+jsonschema = { version = "0.60.2", default-features = false }
 
 [lints]
 workspace = true
