@@ -200,6 +200,10 @@ const MIXER_PERIOD: usize = 240;
 // Per-tone level tracker: fast attack, slow decay (profile A).
 const LEVEL_ATTACK: f32 = 0.70;
 const LEVEL_DECAY: f32 = 0.000_09;
+// Tracked levels below this are flushed to zero. Through long digital
+// silence the slow decay would otherwise stall in subnormal floats, which
+// are slow on x86. Real audio never comes near this level.
+const LEVEL_FLOOR: f32 = 1e-30;
 // Symbol clock: on every change of the decision, the clock's distance from
 // the half-symbol point shrinks by this factor (profile A while receiving).
 const DPLL_INERTIA: f32 = 0.74;
@@ -364,7 +368,18 @@ impl ToneLevel {
     /// Updates the tracker with `x` and returns `x` normalised to the
     /// tracked range, centred on zero.
     fn norm(&mut self, x: f32) -> f32 {
-        let step = |level: f32, rate: f32| level + (x - level) * rate;
+        if !x.is_finite() {
+            // Never let a bad level poison the trackers for good.
+            return 0.0;
+        }
+        let step = |level: f32, rate: f32| {
+            let next = level + (x - level) * rate;
+            if next.abs() < LEVEL_FLOOR {
+                0.0
+            } else {
+                next
+            }
+        };
         self.peak = step(
             self.peak,
             if x >= self.peak {
@@ -522,6 +537,9 @@ impl Demodulator {
     /// Feed audio samples into the demodulator.
     pub fn process(&mut self, samples: &[f32]) {
         for &x in samples {
+            // A NaN or infinite input sample would stay in the filter rings
+            // for hundreds of samples; treat it as silence instead.
+            let x = if x.is_finite() { x } else { 0.0 };
             self.sample += 1;
             let bp = self.bandpass.push(x);
             let m = self.mixer[self.mixer_index];
@@ -630,6 +648,9 @@ impl BitReceiver {
             .into_iter()
             .map(|frame| {
                 let back = self.bit_position.saturating_sub(frame.end) as usize;
+                // Plain frames end at the current bit and FX.25 frames at
+                // most one FX.25 window back, so the history covers them.
+                debug_assert!(back < self.bit_samples.len(), "frame end {back} bits back");
                 let end = self
                     .bit_samples
                     .len()
@@ -1229,6 +1250,31 @@ mod tests {
                 assert!((got as f64 - want).abs() <= 1e-6, "k {k}: {got} vs {want}");
             }
         }
+    }
+
+    #[test]
+    fn non_finite_input_does_not_disable_the_receiver() {
+        let frame = append_fcs(b"N0CALL>APRS:after a bad sample");
+        let mut demod = Demodulator::new();
+        demod.process(&[f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0]);
+        demod.process(&vec![0.0; 4800]);
+        demod.process(&modulate(&frame));
+        demod.process(&vec![0.0; 4800]);
+        assert_eq!(demod.take_frames(), vec![frame]);
+        let mut level = ToneLevel::default();
+        assert_eq!(level.norm(f32::NAN), 0.0);
+        assert!(level.peak.is_finite() && level.valley.is_finite());
+    }
+
+    #[test]
+    fn level_tracker_flushes_to_zero_in_silence() {
+        let mut level = ToneLevel::default();
+        level.norm(1.0);
+        for _ in 0..2_000_000 {
+            level.norm(0.0);
+        }
+        assert_eq!(level.peak, 0.0);
+        assert_eq!(level.valley, 0.0);
     }
 
     #[test]
