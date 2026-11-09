@@ -214,6 +214,14 @@ impl TncBaud {
             Self::G3ruh9600 => "g3ruh_9600",
         }
     }
+
+    /// The port the AGWPE `G` and `g` replies describe (COP-164).
+    fn agw_port_info(self) -> coppa_host::agw::AgwPortInfo {
+        match self {
+            Self::Afsk1200 => coppa_host::agw::AgwPortInfo::afsk_1200(),
+            Self::G3ruh9600 => coppa_host::agw::AgwPortInfo::g3ruh_9600(),
+        }
+    }
 }
 
 enum TncDemodulator {
@@ -609,7 +617,8 @@ async fn run_tnc_mode(config: TncConfig, mode: TxMode) -> Result<()> {
             .with_context(|| format!("Cannot bind AGWPE listener at {addr} (--agw-port)"))?;
         let mut server =
             coppa_host::agw::AgwServer::with_bind_addr(port, config.bind_address.clone())
-                .with_pending_frames(pending.clone());
+                .with_pending_frames(pending.clone())
+                .with_port_info(config.baud.agw_port_info());
         agw_receiver = server.take_tx_receiver();
         agw_sender = Some(server.rx_sender());
         agw_task = Some(ListenerTask(tokio::spawn(async move {
@@ -1072,6 +1081,17 @@ mod tests {
     #[test]
     fn default_baud_is_afsk_1200() {
         assert_eq!(TncConfig::default().baud, TncBaud::Afsk1200);
+    }
+
+    /// COP-164: the AGWPE `G` and `g` replies follow `--baud`.
+    #[test]
+    fn agw_port_info_follows_the_baud() {
+        use coppa_host::agw::AgwPortInfo;
+        assert_eq!(
+            TncBaud::G3ruh9600.agw_port_info(),
+            AgwPortInfo::g3ruh_9600()
+        );
+        assert_eq!(TncBaud::Afsk1200.agw_port_info(), AgwPortInfo::afsk_1200());
     }
 
     #[test]

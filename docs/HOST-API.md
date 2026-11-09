@@ -467,7 +467,8 @@ Configure the mode with `[session] fade_protection`; no host command changes it.
 
 ## AGWPE connectionless AFSK TNC
 
-`coppa tnc --agw-port 8000` adds AGWPE to the AFSK TNC, alongside KISS on 8001.
+`coppa tnc --agw-port 8000` adds AGWPE to the TNC at `--baud 1200` (AFSK) or
+`--baud 9600` (G3RUH), alongside KISS on 8001.
 It is disabled by default. `--bind-address` selects both listeners' address,
 defaulting to loopback. See [TNC setup and verification](TNC.md#optional-connectionless-agwpe).
 There is no authentication. Reachable clients can key the transmitter.
@@ -481,8 +482,8 @@ port 1 in clients, is supported. Other ports are consumed without reply.
 | Command | Behavior |
 | --- | --- |
 | `R` | Reply body little-endian u32 2005 followed by u32 127 |
-| `G` | Reply `1;Port1 coppa AFSK 1200;` plus NUL |
-| `g` | Reply 12 bytes: `00 FF` then ten zeroes; 1200 baud, unavailable traffic/timing statistics |
+| `G` | Reply `1;Port1 coppa AFSK 1200;` plus NUL at `--baud 1200`, or `1;Port1 coppa G3RUH 9600;` plus NUL at `--baud 9600` |
+| `g` | Reply 12 bytes: on-air baud code (`00` at 1200, `03` at 9600), `FF`, then ten zeroes; unavailable traffic/timing statistics |
 | `X` | Register source callsign; reply normalized source and one byte 01 on success, 00 on failure |
 | `x` | Unregister source, no reply; idempotent |
 | `k` | Toggle raw RX, initially off |
