@@ -1,4 +1,4 @@
-# coppa's AFSK 1200 TNC against Direwolf on WA8LMF TNC Test CD track 2: measurement record (COP-112)
+# coppa's AFSK 1200 TNC against Direwolf on WA8LMF TNC Test CD track 2: measurement record (COP-112, COP-113)
 
 This records the baseline that COP-99 measures against: how many AX.25 packets coppa's AFSK
 1200 demodulator decodes from track 2 of the WA8LMF TNC Test CD, next to Direwolf's count from
@@ -7,9 +7,12 @@ the AFSK demodulator, not about RF performance.
 
 ## Setup
 
-- Date: 2026-11-03. One Linux x86_64 container (Ubuntu 24.04.5 LTS), no sound card, no radios.
-- coppa: `coppa-bench --example afsk_vs_direwolf`, release build, on the COP-112 branch (main
-  at `2526b50` plus this change).
+- Date: 2026-11-09. One Linux x86_64 container (Ubuntu 24.04.5 LTS), no sound card, no radios.
+- coppa: `coppa-bench --example afsk_vs_direwolf`, release build, on the COP-113 branch (main
+  at `f6e9951` plus COP-113's receiver change, uncommitted when it ran).
+- History: COP-112 (2026-11-03, main at `2526b50`) measured 412 packets, 41.2 percent of
+  `direwolf`, with a spread of 388 to 416, using the fixed-window receiver that COP-113
+  replaced.
 - Resampler: `rubato` 0.16.2 (from `Cargo.lock`). A change to the resampler can move coppa's
   count, so a new result must name the version it ran with.
 - Direwolf: Ubuntu noble's `direwolf` package `1.7+dfsg-2build2` (banner `Dire Wolf version
@@ -89,41 +92,42 @@ Verbatim `tools/tnc-bench/run.sh --keep` output, stderr and stdout together (scr
 package paths shortened):
 
 ```text
-$ tools/tnc-bench/run.sh --keep
-tnc-bench: downloading http://wa8lmf.net/TNCtest/TNC_Test_2.iso to …/coppa-tnc-bench/
+$ tools/tnc-bench/run.sh --iso …/TNC_Test_2.iso --keep
 tnc-bench: TNC_Test_2.iso sha256 OK
 tnc-bench: track 2 is Audio-Tracks/02_100-Mic-E-Bursts-DE-emphasized.flac, sha256 OK
 tnc-bench: flac 1.4.3 decoded track2.wav, sha256 OK
-tnc-bench: coppa 2526b50 (uncommitted changes), direwolf …/usr/bin/direwolf, atest …/usr/bin/atest
+tnc-bench: coppa f6e9951 (uncommitted changes), direwolf …/usr/bin/direwolf, atest …/usr/bin/atest
 tnc-bench: building and running coppa-bench --example afsk_vs_direwolf (release)
 input: track2.wav, 44100 Hz, 2 channels, 16-bit, 1549.9 s
-coppa:    412 packets (AFSK 1200 demodulator, resampled 44100 -> 48000 Hz)
-coppa by start offset: 0:412 5:416 10:398 15:399 20:390 25:397 30:388 35:407 (spread 388 to 416)
+coppa:    1000 packets (AFSK 1200 demodulator, resampled 44100 -> 48000 Hz)
+coppa by start offset: 0:1000 5:1000 10:999 15:998 20:999 25:999 30:999 35:1000 (spread 998 to 1000)
 direwolf: 1000 packets (Dire Wolf version 1.7, profile A+)
 atest:    982 packets (profile A)
-coppa / direwolf: 41.2% (95% bar: 950 packets, not met)
-coppa / atest:    42.0% (95% bar: 933 packets, not met)
-tnc-bench: kept …/tnc-bench.NJKpzW
+coppa / direwolf: 100.0% (95% bar: 950 packets, met)
+coppa / atest:    101.8% (95% bar: 933 packets, met)
+tnc-bench: kept …/tnc-bench.lj9G05
 ```
 
-The run exited 0 and took 62 s of wall time on this container, including the download and
-`cargo run --release`.
+The run exited 0 and took 149 s of wall time on this container, including the release build
+of `coppa-bench`. The ISO was downloaded beforehand (9 s) and passed with `--iso`.
 
 | Decoder | Settings | Packets | coppa as a percentage of it | 95 percent bar |
 |---|---|---:|---:|---|
-| coppa AFSK 1200 demodulator | input resampled 44100 to 48000 Hz | 412 | | |
-| Dire Wolf 1.7, `direwolf` | its default profile, `A+` | 1000 | 41.2 | 950, not met |
-| Dire Wolf 1.7, `atest` | its default profile, `A` | 982 | 42.0 | 933, not met |
+| coppa AFSK 1200 demodulator | input resampled 44100 to 48000 Hz | 1000 | | |
+| Dire Wolf 1.7, `direwolf` | its default profile, `A+` | 1000 | 100.0 | 950, met |
+| Dire Wolf 1.7, `atest` | its default profile, `A` | 982 | 101.8 | 933, met |
 
 The headline reference is `direwolf`: it is the program an operator runs, and it gives the
 stricter bar.
 
 ## Noise
 
-coppa's count depends on where the input starts. With the input starting 0, 5, 10, 15, 20, 25,
-30 and 35 samples later (all under one 1200-baud symbol at 44.1 kHz), coppa decodes 412, 416,
-398, 399, 390, 397, 388 and 407 packets: a spread of 388 to 416, or 28 packets. The headline
-count is the one at offset 0. A change smaller than this spread does not show an improvement.
+coppa's count depends a little on where the input starts. With the input starting 0, 5, 10,
+15, 20, 25, 30 and 35 samples later (all under one 1200-baud symbol at 44.1 kHz), coppa decodes
+1000, 1000, 999, 998, 999, 999, 999 and 1000 packets: a spread of 998 to 1000, or 2 packets.
+The headline count is the one at offset 0. A change smaller than this spread does not show an
+improvement. COP-112's spread was 28 packets, because its receiver never aligned its symbol
+window to the signal.
 
 ## Not covered
 
@@ -131,7 +135,10 @@ count is the one at offset 0. A change smaller than this spread does not show an
 - One Direwolf build (Ubuntu noble's 1.7) on one platform.
 - No sound card, KISS stage, running `coppa tnc` process or RF.
 - No frame-by-frame comparison of which packets each decoder finds.
-- No cause for the gap. The record states counts only.
+- COP-112's gap (412 packets) was closed by COP-113's receiver in
+  `crates/coppa-codec/src/afsk.rs`: a band-pass pre-filter, a matched filter and a level
+  tracker per tone, and six slicers that each recover their own symbol clock. This record
+  states counts only.
 
 ## Reproduce
 

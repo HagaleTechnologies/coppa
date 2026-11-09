@@ -625,7 +625,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:ba937b9af743dc0a184d474f47320e62559c0cc5846ba908521ff970074b0399",
+      "hash": "sha256:8e18578e3d6859eb46c4707a69cd6f9a7d75d01f662c3fa5c60bcd6088817125",
       "id": "tnc-direwolf-benchmark",
       "kind": "gotcha",
       "links": [
@@ -644,8 +644,8 @@
       ],
       "status": "current",
       "title": "What will bite you when measuring coppa's TNC against Direwolf?",
-      "verified_commit": "25ee0e0",
-      "verified_date": "2026-11-05",
+      "verified_commit": "0ca254e",
+      "verified_date": "2026-11-09",
       "visibility": "public"
     },
     {

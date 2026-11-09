@@ -2,11 +2,14 @@
 //!
 //! Implements HDLC framing (flags + bit stuffing), NRZI encoding,
 //! and continuous-phase FSK audio generation at 48 kHz.
-//! Also provides a streaming demodulator with correlator-based detection.
-use std::{
-    collections::VecDeque,
-    f32::consts::{PI, TAU},
-};
+//!
+//! The streaming demodulator band-pass filters the input, mixes each tone to
+//! baseband through a root-raised-cosine matched filter, and tracks each
+//! tone's level. Six parallel slicers (one on the level-normalised tones,
+//! five on fixed mark-to-space gains) each recover their own symbol clock
+//! and run their own HDLC and FX.25 receiver. A merge step delivers each
+//! reception once.
+use std::{collections::VecDeque, f32::consts::PI};
 
 pub use crate::hdlc::append_fcs;
 // The AFSK receiver keeps its own HDLC parser: FX.25 needs bit positions
@@ -163,6 +166,318 @@ struct FxReception {
 // retain only start positions; their bits share this one bounded window.
 const FX_WINDOW_BITS: usize = 255 * 8;
 
+// Bit-to-sample history per lane. A delivered frame ends at most one FX.25
+// window back, so the window plus a small margin always covers it.
+const BIT_SAMPLE_HISTORY: usize = FX_WINDOW_BITS + 64;
+
+// ---------------------------------------------------------------------------
+// Receive front end
+// ---------------------------------------------------------------------------
+//
+// The constants are the published values of Direwolf's profile A (WB2OSZ,
+// "A Better APRS Packet Demodulator, Part 1"), used as numbers only.
+// COP-113 measured them on WA8LMF TNC Test CD track 2.
+
+// Pre-filter edges: the tones minus and plus 0.155 baud (186 Hz).
+const BANDPASS_LOW_HZ: f64 = 1014.0;
+const BANDPASS_HIGH_HZ: f64 = 2386.0;
+// 417 taps at 48 kHz, rectangular window. Scored 1000 on track 2 against 991
+// for a Blackman window of the same length.
+const BANDPASS_TAPS: usize = 417;
+// Unity gain at the centre of the band, half-way between the tones.
+const BANDPASS_CENTRE_HZ: f64 = 1700.0;
+// Root-raised-cosine matched filter on each tone's I and Q: roll-off 0.2,
+// 2.8 symbols wide (113 taps at 40 samples per symbol).
+const RRC_ROLL_OFF: f64 = 0.2;
+const RRC_TAPS: usize = 113;
+// Delay from the input to the front end's output, in samples: half of each
+// linear-phase filter.
+#[cfg(test)]
+const FRONT_END_DELAY: u64 = ((BANDPASS_TAPS - 1) / 2 + (RRC_TAPS - 1) / 2) as u64;
+// 240 samples hold a whole number of cycles of both tones at 48 kHz (6 of
+// 1200 Hz, 11 of 2200 Hz), so a 240-entry table is an exact oscillator.
+const MIXER_PERIOD: usize = 240;
+// Per-tone level tracker: fast attack, slow decay (profile A).
+const LEVEL_ATTACK: f32 = 0.70;
+const LEVEL_DECAY: f32 = 0.000_09;
+// Tracked levels below this are flushed to zero. Through long digital
+// silence the slow decay would otherwise stall in subnormal floats, which
+// are slow on x86. Real audio never comes near this level.
+const LEVEL_FLOOR: f32 = 1e-30;
+// Symbol clock: on every change of the decision, the clock's distance from
+// the half-symbol point shrinks by this factor (profile A while receiving).
+const DPLL_INERTIA: f32 = 0.74;
+const SYMBOL_PERIOD: f32 = SAMPLES_PER_SYMBOL as f32;
+const TRANSITION_TARGET: f32 = SYMBOL_PERIOD / 2.0;
+// Gain slicers decide on `mark - g * space`. These are steps 2 to 6 of the
+// geometric ladder 0.5 * 8^(k/8), k = 0..=8. With the level-normalised lane
+// they decoded 1000 frames on track 2; nine gains decoded no more.
+const SLICER_GAINS: [f32; 5] = [0.841, 1.091, 1.414, 1.834, 2.378];
+const LANES: usize = SLICER_GAINS.len() + 1;
+// Two lanes report the same reception when their frames carry the same
+// bytes and end within 10 symbols. Separate receptions of one frame end at
+// least 160 bits (6400 samples) apart: the smallest valid frame plus a flag.
+const MERGE_TOLERANCE_SAMPLES: u64 = 10 * SAMPLES_PER_SYMBOL as u64;
+// Delivered receptions stay in the merge history for 3 s, longer than the
+// largest FX.25 block (2040 bits, 1.7 s): an FX.25 lane reports its corrected
+// copy only after the whole block, well after a plain lane reported the
+// same inner frame at its closing flag.
+const MERGE_HISTORY_SAMPLES: u64 = 3 * SAMPLE_RATE as u64;
+
+/// Linear-phase FIR filter over a double-length ring buffer, so every output
+/// is one contiguous dot product.
+struct Fir {
+    taps: Vec<f32>,
+    ring: Vec<f32>,
+    pos: usize,
+}
+
+impl std::fmt::Debug for Fir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fir")
+            .field("taps", &self.taps.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Fir {
+    fn new(taps: Vec<f32>) -> Self {
+        let ring = vec![0.0; 2 * taps.len()];
+        Self { taps, ring, pos: 0 }
+    }
+
+    fn push(&mut self, x: f32) -> f32 {
+        let n = self.taps.len();
+        self.pos = if self.pos == 0 { n - 1 } else { self.pos - 1 };
+        self.ring[self.pos] = x;
+        self.ring[self.pos + n] = x;
+        // window[k] is the sample k pushes ago.
+        let window = &self.ring[self.pos..self.pos + n];
+        let mut acc = [0.0_f32; 8];
+        let taps = self.taps.chunks_exact(8);
+        let rest = taps.remainder();
+        let samples = window.chunks_exact(8);
+        let tail = samples.remainder();
+        for (t, s) in taps.zip(samples) {
+            for i in 0..8 {
+                acc[i] += t[i] * s[i];
+            }
+        }
+        let mut y = acc.iter().sum::<f32>();
+        for (t, s) in rest.iter().zip(tail) {
+            y += t * s;
+        }
+        y
+    }
+}
+
+/// Ideal (truncated sinc) band-pass, rectangular window, scaled to unity
+/// gain at [`BANDPASS_CENTRE_HZ`].
+fn bandpass_taps() -> Vec<f32> {
+    let fs = SAMPLE_RATE as f64;
+    let mid = (BANDPASS_TAPS / 2) as f64;
+    let low = BANDPASS_LOW_HZ / fs;
+    let high = BANDPASS_HIGH_HZ / fs;
+    let lowpass = |fc: f64, t: f64| {
+        if t == 0.0 {
+            2.0 * fc
+        } else {
+            (std::f64::consts::TAU * fc * t).sin() / (std::f64::consts::PI * t)
+        }
+    };
+    let taps: Vec<f64> = (0..BANDPASS_TAPS)
+        .map(|n| {
+            let t = n as f64 - mid;
+            lowpass(high, t) - lowpass(low, t)
+        })
+        .collect();
+    let gain = response(&taps, BANDPASS_CENTRE_HZ);
+    taps.iter().map(|&h| (h / gain) as f32).collect()
+}
+
+/// Root-raised-cosine impulse response, taps normalised to sum to 1.
+fn matched_filter_taps() -> Vec<f32> {
+    let beta = RRC_ROLL_OFF;
+    let period = SAMPLES_PER_SYMBOL as f64;
+    let mid = (RRC_TAPS / 2) as f64;
+    let pi = std::f64::consts::PI;
+    let taps: Vec<f64> = (0..RRC_TAPS)
+        .map(|n| {
+            let t = (n as f64 - mid) / period;
+            if t == 0.0 {
+                1.0 - beta + 4.0 * beta / pi
+            } else if ((4.0 * beta * t).abs() - 1.0).abs() < 1e-9 {
+                beta / 2f64.sqrt()
+                    * ((1.0 + 2.0 / pi) * (pi / (4.0 * beta)).sin()
+                        + (1.0 - 2.0 / pi) * (pi / (4.0 * beta)).cos())
+            } else {
+                ((pi * t * (1.0 - beta)).sin() + 4.0 * beta * t * (pi * t * (1.0 + beta)).cos())
+                    / (pi * t * (1.0 - (4.0 * beta * t).powi(2)))
+            }
+        })
+        .collect();
+    let sum: f64 = taps.iter().sum();
+    taps.iter().map(|&h| (h / sum) as f32).collect()
+}
+
+/// Magnitude of a filter's frequency response at `hz`.
+fn response(taps: &[f64], hz: f64) -> f64 {
+    let w = std::f64::consts::TAU * hz / SAMPLE_RATE as f64;
+    let (re, im) = taps
+        .iter()
+        .enumerate()
+        .fold((0.0, 0.0), |(re, im), (n, &h)| {
+            (re + h * (w * n as f64).cos(), im - h * (w * n as f64).sin())
+        });
+    re.hypot(im)
+}
+
+/// Mixer table entry `k`: cos and sin of both tones at sample `k`.
+#[derive(Debug, Clone, Copy)]
+struct MixerEntry {
+    mark_cos: f32,
+    mark_sin: f32,
+    space_cos: f32,
+    space_sin: f32,
+}
+
+fn mixer_table() -> Vec<MixerEntry> {
+    let fs = SAMPLE_RATE as f64;
+    (0..MIXER_PERIOD)
+        .map(|k| {
+            let mark = std::f64::consts::TAU * MARK_FREQ as f64 * k as f64 / fs;
+            let space = std::f64::consts::TAU * SPACE_FREQ as f64 * k as f64 / fs;
+            MixerEntry {
+                mark_cos: mark.cos() as f32,
+                mark_sin: mark.sin() as f32,
+                space_cos: space.cos() as f32,
+                space_sin: space.sin() as f32,
+            }
+        })
+        .collect()
+}
+
+/// Fast-attack, slow-decay peak and valley tracker for one tone's level.
+#[derive(Debug, Default)]
+struct ToneLevel {
+    peak: f32,
+    valley: f32,
+}
+
+impl ToneLevel {
+    /// Updates the tracker with `x` and returns `x` normalised to the
+    /// tracked range, centred on zero.
+    fn norm(&mut self, x: f32) -> f32 {
+        if !x.is_finite() {
+            // Never let a bad level poison the trackers for good.
+            return 0.0;
+        }
+        let step = |level: f32, rate: f32| {
+            let next = level + (x - level) * rate;
+            if next.abs() < LEVEL_FLOOR {
+                0.0
+            } else {
+                next
+            }
+        };
+        self.peak = step(
+            self.peak,
+            if x >= self.peak {
+                LEVEL_ATTACK
+            } else {
+                LEVEL_DECAY
+            },
+        );
+        self.valley = step(
+            self.valley,
+            if x <= self.valley {
+                LEVEL_ATTACK
+            } else {
+                LEVEL_DECAY
+            },
+        );
+        if self.peak <= self.valley {
+            0.0
+        } else {
+            (x - (self.peak + self.valley) / 2.0) / (self.peak - self.valley)
+        }
+    }
+}
+
+/// One slicer with its own symbol clock and bit receiver.
+#[derive(Debug)]
+struct Lane {
+    /// `None` for the level-normalised lane, else the space-tone gain.
+    gain: Option<f32>,
+    clock: f32,
+    prev_sign: bool,
+    prev_symbol: bool,
+    rx: BitReceiver,
+}
+
+impl Lane {
+    fn new(gain: Option<f32>) -> Self {
+        Self {
+            gain,
+            clock: 0.0,
+            prev_sign: true,
+            prev_symbol: true, // initial NRZI state = mark
+            rx: BitReceiver::new(),
+        }
+    }
+
+    /// Advances the lane by one sample. `sample` is the input sample count
+    /// so far, recorded against any bit decided now.
+    fn step(&mut self, soft: f32, sample: u64) {
+        let sign = soft > 0.0;
+        self.clock += 1.0;
+        if self.clock >= SYMBOL_PERIOD {
+            self.clock -= SYMBOL_PERIOD;
+            // NRZI decode: same symbol as previous = 1, a change = 0.
+            let bit = u8::from(sign == self.prev_symbol);
+            self.prev_symbol = sign;
+            self.rx.sample = sample;
+            self.rx.receive_bit(bit);
+        }
+        if sign != self.prev_sign {
+            // Pull the clock so transitions land half-way between decisions.
+            self.clock = TRANSITION_TARGET + (self.clock - TRANSITION_TARGET) * DPLL_INERTIA;
+        }
+        self.prev_sign = sign;
+    }
+}
+
+/// Delivers each reception once across lanes. Keyed on where a frame ended
+/// in the input, not on when a lane reported it, because an FX.25 lane
+/// reports late.
+#[derive(Debug, Default)]
+struct Merge {
+    /// (bytes, end sample, delivered at sample).
+    recent: VecDeque<(Vec<u8>, u64, u64)>,
+}
+
+impl Merge {
+    /// Returns true when `bytes` ending at `end` is a new reception.
+    fn offer(&mut self, bytes: &[u8], end: u64, now: u64) -> bool {
+        while self
+            .recent
+            .front()
+            .is_some_and(|&(_, _, at)| now.saturating_sub(at) > MERGE_HISTORY_SAMPLES)
+        {
+            self.recent.pop_front();
+        }
+        if self
+            .recent
+            .iter()
+            .any(|(b, e, _)| e.abs_diff(end) <= MERGE_TOLERANCE_SAMPLES && b == bytes)
+        {
+            return false;
+        }
+        self.recent.push_back((bytes.to_vec(), end, now));
+        true
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Demodulator
 // ---------------------------------------------------------------------------
@@ -173,22 +488,116 @@ const FX_WINDOW_BITS: usize = 255 * 8;
 /// [`Demodulator::take_frames`] to retrieve any fully decoded frames.
 #[derive(Debug)]
 pub struct Demodulator {
-    // Correlator accumulators
-    mark_sin_acc: f32,
-    mark_cos_acc: f32,
-    space_sin_acc: f32,
-    space_cos_acc: f32,
+    bandpass: Fir,
+    mark_i: Fir,
+    mark_q: Fir,
+    space_i: Fir,
+    space_q: Fir,
+    mixer: Vec<MixerEntry>,
+    mixer_index: usize,
+    mark_level: ToneLevel,
+    space_level: ToneLevel,
+    lanes: [Lane; LANES],
+    merge: Merge,
+    // Input samples consumed so far.
+    sample: u64,
+    // Delivered frames with the input sample where each ended.
+    frames: Vec<(Vec<u8>, u64)>,
+}
 
-    // Reference oscillator phases
-    mark_phase: f32,
-    space_phase: f32,
+impl Default for Demodulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-    // Sample counter within current symbol period
-    sample_count: u32,
+impl Demodulator {
+    /// Creates a demodulator in the idle state: no frame in progress, NRZI
+    /// reference set to mark, and no decoded frames queued.
+    pub fn new() -> Self {
+        let rrc = matched_filter_taps();
+        Self {
+            bandpass: Fir::new(bandpass_taps()),
+            mark_i: Fir::new(rrc.clone()),
+            mark_q: Fir::new(rrc.clone()),
+            space_i: Fir::new(rrc.clone()),
+            space_q: Fir::new(rrc),
+            mixer: mixer_table(),
+            mixer_index: 0,
+            mark_level: ToneLevel::default(),
+            space_level: ToneLevel::default(),
+            // Lane 0 is the level-normalised lane; lanes 1.. carry the gains.
+            lanes: std::array::from_fn(|i| Lane::new(i.checked_sub(1).map(|g| SLICER_GAINS[g]))),
+            merge: Merge::default(),
+            sample: 0,
+            frames: Vec::new(),
+        }
+    }
 
-    // NRZI state: last detected symbol (true = mark)
-    prev_symbol: bool,
+    /// Feed audio samples into the demodulator.
+    pub fn process(&mut self, samples: &[f32]) {
+        for &x in samples {
+            // A NaN or infinite input sample would stay in the filter rings
+            // for hundreds of samples; treat it as silence instead.
+            let x = if x.is_finite() { x } else { 0.0 };
+            self.sample += 1;
+            let bp = self.bandpass.push(x);
+            let m = self.mixer[self.mixer_index];
+            self.mixer_index = (self.mixer_index + 1) % MIXER_PERIOD;
+            let mark = self
+                .mark_i
+                .push(bp * m.mark_cos)
+                .hypot(self.mark_q.push(bp * m.mark_sin));
+            let space = self
+                .space_i
+                .push(bp * m.space_cos)
+                .hypot(self.space_q.push(bp * m.space_sin));
+            let norm_mark = self.mark_level.norm(mark);
+            let norm_space = self.space_level.norm(space);
+            for lane in &mut self.lanes {
+                let soft = match lane.gain {
+                    None => norm_mark - norm_space,
+                    Some(g) => mark - g * space,
+                };
+                lane.step(soft, self.sample);
+                if !lane.rx.frames.is_empty() {
+                    for (bytes, end) in lane.rx.take_received() {
+                        if self.merge.offer(&bytes, end, self.sample) {
+                            self.frames.push((bytes, end));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
+    /// Delivered frames with the input sample where each ended.
+    #[cfg(test)]
+    fn take_received(&mut self) -> Vec<(Vec<u8>, u64)> {
+        std::mem::take(&mut self.frames)
+    }
+
+    /// Extract all completed frames, draining the internal buffer.
+    pub fn take_frames(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.frames)
+            .into_iter()
+            .map(|(bytes, _)| bytes)
+            .collect()
+    }
+
+    /// Reset the demodulator to its initial state.
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bit receiver: HDLC and FX.25 for one lane
+// ---------------------------------------------------------------------------
+
+/// HDLC and FX.25 state for one stream of decided bits.
+#[derive(Debug)]
+struct BitReceiver {
     // HDLC state machine
     in_frame: bool,      // currently receiving frame data
     bit_buffer: Vec<u8>, // accumulated data bits for current frame
@@ -205,27 +614,16 @@ pub struct Demodulator {
     frames: Vec<ReceivedFrame>,
     bit_position: u64,
     hdlc_start: u64,
+
+    // Input sample index of each recent bit; the back is `bit_position`.
+    bit_samples: VecDeque<u64>,
+    // Input sample index of the bit being received.
+    sample: u64,
 }
 
-impl Default for Demodulator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Demodulator {
-    /// Creates a demodulator in the idle state: no frame in progress, NRZI
-    /// reference set to mark, and no decoded frames queued.
-    pub fn new() -> Self {
+impl BitReceiver {
+    fn new() -> Self {
         Self {
-            mark_sin_acc: 0.0,
-            mark_cos_acc: 0.0,
-            space_sin_acc: 0.0,
-            space_cos_acc: 0.0,
-            mark_phase: 0.0,
-            space_phase: 0.0,
-            sample_count: 0,
-            prev_symbol: true, // initial NRZI state = mark
             in_frame: false,
             bit_buffer: Vec::new(),
             ones_count: 0,
@@ -238,60 +636,32 @@ impl Demodulator {
             fx_bits: VecDeque::new(),
             pending_plain: Vec::new(),
             delivered_spans: VecDeque::new(),
+            bit_samples: VecDeque::new(),
+            sample: 0,
         }
     }
 
-    /// Feed audio samples into the demodulator.
-    pub fn process(&mut self, samples: &[f32]) {
-        let mark_inc = TAU * MARK_FREQ / SAMPLE_RATE as f32;
-        let space_inc = TAU * SPACE_FREQ / SAMPLE_RATE as f32;
-
-        for &s in samples {
-            // Accumulate correlator products
-            self.mark_sin_acc += s * self.mark_phase.sin();
-            self.mark_cos_acc += s * self.mark_phase.cos();
-            self.space_sin_acc += s * self.space_phase.sin();
-            self.space_cos_acc += s * self.space_phase.cos();
-
-            // Advance reference phases
-            self.mark_phase += mark_inc;
-            if self.mark_phase >= TAU {
-                self.mark_phase -= TAU;
-            }
-            self.space_phase += space_inc;
-            if self.space_phase >= TAU {
-                self.space_phase -= TAU;
-            }
-
-            self.sample_count += 1;
-
-            if self.sample_count >= SAMPLES_PER_SYMBOL {
-                // Symbol decision
-                let mark_energy =
-                    self.mark_sin_acc * self.mark_sin_acc + self.mark_cos_acc * self.mark_cos_acc;
-                let space_energy = self.space_sin_acc * self.space_sin_acc
-                    + self.space_cos_acc * self.space_cos_acc;
-                let is_mark = mark_energy >= space_energy;
-
-                // NRZI decode: same as previous = 1, different = 0
-                let bit = if is_mark == self.prev_symbol {
-                    1u8
-                } else {
-                    0u8
-                };
-                self.prev_symbol = is_mark;
-
-                // Feed bit into HDLC state machine
-                self.receive_bit(bit);
-
-                // Reset correlator for next symbol
-                self.mark_sin_acc = 0.0;
-                self.mark_cos_acc = 0.0;
-                self.space_sin_acc = 0.0;
-                self.space_cos_acc = 0.0;
-                self.sample_count = 0;
-            }
-        }
+    /// Drains delivered frames as (bytes, input sample where the frame ended).
+    fn take_received(&mut self) -> Vec<(Vec<u8>, u64)> {
+        let frames = std::mem::take(&mut self.frames);
+        frames
+            .into_iter()
+            .map(|frame| {
+                let back = self.bit_position.saturating_sub(frame.end) as usize;
+                // Plain frames end at the current bit and FX.25 frames at
+                // most one FX.25 window back, so the history covers them.
+                debug_assert!(back < self.bit_samples.len(), "frame end {back} bits back");
+                let end = self
+                    .bit_samples
+                    .len()
+                    .checked_sub(back + 1)
+                    .and_then(|i| self.bit_samples.get(i))
+                    .or(self.bit_samples.front())
+                    .copied()
+                    .unwrap_or(self.sample);
+                (frame.bytes, end)
+            })
+            .collect()
     }
 
     fn emit_frame(&mut self, frame: ReceivedFrame) {
@@ -304,6 +674,10 @@ impl Demodulator {
 
     fn receive_bit(&mut self, bit: u8) {
         self.bit_position += 1;
+        self.bit_samples.push_back(self.sample);
+        if self.bit_samples.len() > BIT_SAMPLE_HISTORY {
+            self.bit_samples.pop_front();
+        }
         // Keep only reception associations that a maximum-size FX.25 block
         // could still reproduce. Identical later transmissions have new spans.
         self.delivered_spans
@@ -487,19 +861,6 @@ impl Demodulator {
                 self.pending_plain.push(frame);
             }
         }
-    }
-
-    /// Extract all completed frames, draining the internal buffer.
-    pub fn take_frames(&mut self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut self.frames)
-            .into_iter()
-            .map(|frame| frame.bytes)
-            .collect()
-    }
-
-    /// Reset the demodulator to its initial state.
-    pub fn reset(&mut self) {
-        *self = Self::new();
     }
 }
 
@@ -787,13 +1148,180 @@ mod tests {
                 .collect::<Vec<_>>(),
             p,
         );
-        let mut receiver = Demodulator::new();
+        let mut receiver = BitReceiver::new();
         for byte in p.tag.to_le_bytes().into_iter().chain(block) {
             for bit in byte_to_bits_lsb(byte) {
                 receiver.receive_bit(bit);
             }
         }
-        assert!(receiver.take_frames().is_empty());
+        assert!(receiver.take_received().is_empty());
+    }
+
+    fn stuffed_len(frame: &[u8]) -> u64 {
+        let raw: Vec<_> = frame.iter().flat_map(|&b| byte_to_bits_lsb(b)).collect();
+        bit_stuff(&raw).len() as u64
+    }
+
+    fn assert_near(end: u64, expected: u64) {
+        assert!(
+            end.abs_diff(expected) <= SAMPLES_PER_SYMBOL as u64,
+            "end sample {end}, expected {expected} within one symbol"
+        );
+    }
+
+    #[test]
+    fn bit_receiver_reports_plain_frame_end_sample() {
+        const N: u64 = 4800;
+        let frame = append_fcs(b"N0CALL>APRS:end sample");
+        let mut audio = vec![0.0; N as usize];
+        audio.extend(modulate(&frame));
+        let mut demod = Demodulator::new();
+        demod.process(&audio);
+        let received = demod.take_received();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].0, frame);
+        let closing_flag_end =
+            N + (PREAMBLE_FLAGS as u64 * 8 + stuffed_len(&frame) + 8) * SAMPLES_PER_SYMBOL as u64;
+        assert_near(received[0].1, closing_flag_end + FRONT_END_DELAY);
+    }
+
+    #[test]
+    fn fx25_frame_end_sample_matches_inner_frame() {
+        const N: u64 = 4800;
+        let frame = append_fcs(b"N0CALL>APRS:fx25 end sample");
+        let mut audio = vec![0.0; N as usize];
+        audio.extend(modulate_fx25(&frame).unwrap());
+        let mut demod = Demodulator::new();
+        demod.process(&audio);
+        let received = demod.take_received();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].0, frame);
+        // Preamble, tag, inner opening flag, stuffed frame, inner closing flag.
+        let inner_end = N
+            + (PREAMBLE_FLAGS as u64 * 8 + 64 + 8 + stuffed_len(&frame) + 8)
+                * SAMPLES_PER_SYMBOL as u64;
+        assert_near(received[0].1, inner_end + FRONT_END_DELAY);
+    }
+
+    fn gain_db(taps: &[f32], hz: f64) -> f64 {
+        let taps: Vec<f64> = taps.iter().map(|&t| t as f64).collect();
+        20.0 * response(&taps, hz).log10()
+    }
+
+    #[test]
+    fn bandpass_taps_pass_both_tones() {
+        let taps = bandpass_taps();
+        assert_eq!(taps.len(), BANDPASS_TAPS);
+        for hz in [1200.0, 2200.0] {
+            let g = gain_db(&taps, hz);
+            assert!(g.abs() <= 1.0, "{hz} Hz gain {g:.2} dB");
+        }
+        for hz in [300.0, 4000.0] {
+            let g = gain_db(&taps, hz);
+            assert!(g <= -20.0, "{hz} Hz gain {g:.2} dB");
+        }
+    }
+
+    #[test]
+    fn matched_filter_taps_sum_to_one_and_are_symmetric() {
+        let taps = matched_filter_taps();
+        assert_eq!(taps.len(), 113);
+        let sum: f32 = taps.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "sum {sum}");
+        for i in 0..taps.len() {
+            assert!((taps[i] - taps[taps.len() - 1 - i]).abs() < 1e-7, "tap {i}");
+        }
+        assert!(taps.iter().all(|t| t.is_finite()));
+    }
+
+    #[test]
+    fn mixer_table_matches_direct_oscillator() {
+        let table = mixer_table();
+        assert_eq!(table.len(), MIXER_PERIOD);
+        for k in 0..480 {
+            let e = table[k % MIXER_PERIOD];
+            let at = |f: f32| std::f64::consts::TAU * f as f64 * k as f64 / SAMPLE_RATE as f64;
+            for (got, want) in [
+                (e.mark_cos, at(MARK_FREQ).cos()),
+                (e.mark_sin, at(MARK_FREQ).sin()),
+                (e.space_cos, at(SPACE_FREQ).cos()),
+                (e.space_sin, at(SPACE_FREQ).sin()),
+            ] {
+                assert!((got as f64 - want).abs() <= 1e-6, "k {k}: {got} vs {want}");
+            }
+        }
+    }
+
+    #[test]
+    fn non_finite_input_does_not_disable_the_receiver() {
+        let frame = append_fcs(b"N0CALL>APRS:after a bad sample");
+        let mut demod = Demodulator::new();
+        demod.process(&[f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0]);
+        demod.process(&vec![0.0; 4800]);
+        demod.process(&modulate(&frame));
+        demod.process(&vec![0.0; 4800]);
+        assert_eq!(demod.take_frames(), vec![frame]);
+        let mut level = ToneLevel::default();
+        assert_eq!(level.norm(f32::NAN), 0.0);
+        assert!(level.peak.is_finite() && level.valley.is_finite());
+    }
+
+    #[test]
+    fn level_tracker_flushes_to_zero_in_silence() {
+        let mut level = ToneLevel::default();
+        level.norm(1.0);
+        for _ in 0..2_000_000 {
+            level.norm(0.0);
+        }
+        assert_eq!(level.peak, 0.0);
+        assert_eq!(level.valley, 0.0);
+    }
+
+    #[test]
+    fn merge_drops_same_reception_from_another_lane() {
+        let mut merge = Merge::default();
+        assert!(merge.offer(b"frame", 10_000, 10_000));
+        assert!(!merge.offer(b"frame", 10_030, 10_030));
+    }
+
+    #[test]
+    fn merge_drops_late_fx25_copy_of_same_reception() {
+        let mut merge = Merge::default();
+        let (end, t) = (50_000, 50_000);
+        assert!(merge.offer(b"frame", end, t));
+        // The FX.25 lane reports 1.7 s later; an emission-time window would
+        // deliver this copy a second time.
+        assert!(!merge.offer(b"frame", end + 10, t + 80_000));
+    }
+
+    #[test]
+    fn merge_keeps_separate_receptions() {
+        let mut merge = Merge::default();
+        assert!(merge.offer(b"frame", 10_000, 10_000));
+        assert!(merge.offer(b"frame", 16_400, 16_400));
+    }
+
+    #[test]
+    fn merge_keeps_different_frames_with_same_end() {
+        let mut merge = Merge::default();
+        assert!(merge.offer(b"frame one", 10_000, 10_000));
+        assert!(merge.offer(b"frame two", 10_000, 10_000));
+    }
+
+    #[test]
+    fn merge_history_is_bounded() {
+        let mut merge = Merge::default();
+        let span = 10 * 60 * SAMPLE_RATE as u64;
+        let mut now = 0;
+        for i in 0..10_000u64 {
+            now = i * span / 10_000;
+            assert!(merge.offer(&i.to_le_bytes(), now, now));
+        }
+        assert!(merge
+            .recent
+            .iter()
+            .all(|&(_, _, at)| now - at <= MERGE_HISTORY_SAMPLES));
+        assert!(merge.recent.len() < 10_000);
     }
 
     #[test]

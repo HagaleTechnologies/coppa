@@ -36,10 +36,10 @@ retained; no GPL implementation code is copied into this repository.
 The untouched WAV is from Direwolf `gen_packets`. Its damaged derivative keeps
 the independent tag-7 block, XORs eight data bytes with ff and uses the separate
 Python NRZI/AFSK renderer. The source packet reader retains a trailing newline;
-the expected AX.25 payload includes it. The fixed-window coppa receiver needs a
-20-sample origin offset for the untouched Direwolf recording, and zero offset
-for the independently rendered derivative. This is an acquisition limitation,
-not an error correction requirement. See `docs/testing/tnc-fx25-direwolf.md`.
+the expected AX.25 payload includes it. Since COP-113's recovered symbol clock,
+coppa's receiver decodes both the untouched Direwolf recording and the
+independently rendered derivative from input sample 0. See
+`docs/testing/tnc-fx25-direwolf.md`.
 
 `python3 -m unittest discover -s tools/fx25-interop` tests the output parser using
 captured reference output and negative cases. A plain HDLC decode, a successful
