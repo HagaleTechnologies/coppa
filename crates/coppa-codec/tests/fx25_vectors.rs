@@ -169,14 +169,7 @@ fn recorded_direwolf_clean_and_damaged_audio() {
     let expected = append_fcs(&payload(b"coppa COP-114 FX25 fixture\n"));
     for name in ["direwolf-clean.wav", "direwolf-damaged.wav"] {
         let audio = wav(name);
-        // Direwolf starts its first tone at sample 1300 (20 modulo 40).
-        // The existing fixed-window receiver needs a matching sample origin.
-        let offset = if name == "direwolf-clean.wav" { 20 } else { 0 };
-        assert_eq!(
-            decode(&audio[offset..], 1024),
-            vec![expected.clone()],
-            "{name}"
-        );
+        assert_eq!(decode(&audio, 1024), vec![expected.clone()], "{name}");
     }
     // Remove only the tag, leaving the damaged inner HDLC bytes unchanged.
     // Ordinary HDLC cannot recover the original frame.
