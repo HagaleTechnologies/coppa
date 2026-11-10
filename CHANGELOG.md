@@ -14,6 +14,23 @@ numbers separately, because they move independently:
 Older releases have no entry here. Their on-air breaks are listed in
 `docs/SPEC.md` §0.1.
 
+## Unreleased: 0.13.0
+
+- **Crate version:** 0.13.0. Minor bump because `coppa_protocol::session::LinkCapabilities`
+  gains a public field, `windowed_arq`, which breaks struct-literal callers that do not use
+  `..LinkCapabilities::default()`.
+- **Air-protocol version:** 1, unchanged. CONNECT capability flags bit 5 is now named
+  `windowed_arq` (COP-168, SPEC §20.1). It is negotiated as an AND and CONNECT_CFM must
+  carry exactly the AND (`ProtocolError::WindowedArqMismatch`). No release sets it yet,
+  so every coppad still sends the 0.12.0 bytes.
+- **Host-API version:** 1, unchanged.
+- **C ABI version:** unchanged.
+- **Rust API, additive:** `LinkCapabilities::windowed_window`, `arq::MAX_SESSION_WINDOW`,
+  `arq::windowed_phy_seq`, `arq::windowed_harq_key`, `arq::phy_following`,
+  `arq::RV_SCHEDULE`, `arq::rv_for_session_attempt` and `ArqTx::unacked`: the wire
+  primitives for windowed session ARQ. The windowed sender and receiver are not built yet
+  (`docs/LIMITATIONS.md`).
+
 ## Unreleased: 0.12.0
 
 The first release covered by the air-protocol version 1 compatibility

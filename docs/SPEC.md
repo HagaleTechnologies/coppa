@@ -9,6 +9,7 @@ PHY header (§4.2) and the MAC header (§17.1).
 | 3 (adds §22, COP-119) | 2026-11-04 | 0.9.0 | `79ee3aa` |
 | 4 (adds §23, COP-121) | 2026-11-08 | 0.11.0 | COP-121 branch, based on `f6e9951` |
 | 5 (adds §0.3 air-protocol v1 contract, COP-178) | 2026-11-09 | 0.12.0 | COP-178 branch, based on `4237273` |
+| 6 (names capability flag bit 5 `windowed_arq` in §20.1, COP-168) | 2026-11-10 | 0.13.0 | COP-168 branch, based on `28d4c9a` |
 
 There is no in-band version negotiation. §0.1 records the wire-break
 history; §0.3 states what air-protocol version 1 freezes from crate 0.12.0
@@ -2100,7 +2101,7 @@ complete exchange.
 | 2 | 1 | `fec_rate_num` | 1 | 1 |
 | 3 | 1 | `fec_rate_den` | 2 | 2 |
 | 4 | 1 | `arq_window` | 8 | 8 |
-| 5 | 1 | flags: bit 0 `compression`, bit 1 `multi_frame_ack`, bits 2–3 outer-code capability (§22.1, COP-119), bit 4 `app_messages` (§23.1, COP-121), bits 5–7 reserved | `0x00` | `0x06`; `0x16` with the WebSocket API on |
+| 5 | 1 | flags: bit 0 `compression`, bit 1 `multi_frame_ack`, bits 2–3 outer-code capability (§22.1, COP-119), bit 4 `app_messages` (§23.1, COP-121), bit 5 `windowed_arq` (COP-168), bits 6–7 reserved | `0x00` | `0x06`; `0x16` with the WebSocket API on |
 | 6 | 1 | `mcs_index` | 0 | 0 |
 
 The library default encodes as `00c80102080000` (P24). coppad sets
@@ -2110,7 +2111,10 @@ station with `[session] fade_protection = "off"`, sends `00c80102080200`
 sends `00c80102080600` (§22.1). A 0.11.0 coppad sets bit 4 as well when it
 was built with the `websocket` feature and `[host] websocket_enabled = true`
 (row A03, §23.7); with the default configuration it still sends the 0.9.0
-bytes. Transmitters MUST send reserved flag bits as 0. Receivers ignore them, ignore bytes after offset 6, and reject fewer
+bytes. Bit 5, `windowed_arq` (COP-168), names the windowed session ARQ
+capability. Its rules are not specified yet, so a transmitter MUST send it
+as 0 until a later revision adds them; no coppad release sets it. A receiver
+parses it and ANDs it like bit 4. Transmitters MUST send reserved flag bits as 0. Receivers ignore them, ignore bytes after offset 6, and reject fewer
 than 7 bytes (`CapabilitiesTooShort`). A zero `fec_rate_den` parses; the
 reference treats that rate as 0 when comparing.
 
@@ -2120,8 +2124,9 @@ the lower of the two FEC rates, taken as the (num, den) pair, with a tie
 keeping the initiator's own pair; and the logical AND of each flag. The
 outer-code bits 2–3 follow §22.1 instead: receive is ANDed, and the
 request bit is set when receive holds and either side requests. Bit 4,
-`app_messages`, is ANDed like the others (§23.1). P25 and P26 negotiate to
-P27 in either order.
+`app_messages`, is ANDed like the others (§23.1), and so is bit 5,
+`windowed_arq`; CONNECT_CFM must carry exactly the AND of bit 5
+(`WindowedArqMismatch`). P25 and P26 negotiate to P27 in either order.
 
 **Responder validation** (`handle_connect_cfm`, `session.rs:314-357`): the
 responder recomputes `negotiate(local, remote)` and rejects the `ConnectCfm`

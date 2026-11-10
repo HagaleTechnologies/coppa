@@ -550,7 +550,7 @@ fn air_v1_capability_bits() {
         "00c80102080000",
         "{AIR}: default capabilities blob"
     );
-    let flags: [(&str, LinkCapabilities, u8); 5] = [
+    let flags: [(&str, LinkCapabilities, u8); 6] = [
         (
             "compression (bit 0)",
             LinkCapabilities {
@@ -590,6 +590,14 @@ fn air_v1_capability_bits() {
                 ..base.clone()
             },
             0x10,
+        ),
+        (
+            "windowed_arq (bit 5, COP-168)",
+            LinkCapabilities {
+                windowed_arq: true,
+                ..base.clone()
+            },
+            0x20,
         ),
     ];
     for (name, caps, bit) in flags {
