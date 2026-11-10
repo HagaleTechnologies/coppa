@@ -69,7 +69,7 @@ inspect() {
       done
       $ok || die "$f links $lib, which is not in the allowed set: ${ALLOWED_NEEDED[*]}"
     done
-    echo "$f: $got, highest GLIBC_$highest, NEEDED: $(echo $needed)"
+    echo "$f: $got, highest GLIBC_$highest, NEEDED: ${needed//$'\n'/ }"
   done
 }
 
@@ -100,7 +100,7 @@ set_runner() {
 }
 
 run() {
-  local target=$1 bindir=$2 root=$3 version=$4 out line1 line3 first
+  local target=$1 bindir=$2 root=$3 version=$4 out line1 line3 first status
   # Absolute paths: the loopback and the daemon run from a scratch directory.
   root=$(cd "$root" && pwd)
   bindir=$(cd "$bindir" && pwd)
@@ -125,10 +125,20 @@ run() {
   grep -q "^coppad $version\$" <<<"$(sed -n 1p <<<"$out")" || die "coppad --version prints '$out', expected 'coppad $version'"
 
   # The daemon's first log line is its build banner. With an empty config and
-  # no sound card it may exit with an error after that line; only the banner
-  # is checked.
+  # no sound card it exits 1 after that line (it cannot open the default input
+  # device); a daemon that is still running at the timeout gives 124. Any other
+  # status fails: 0 (it stopped by itself), a panic's 101, timeout's 125, 126 or
+  # 127 (the runner could not start coppad) or a signal's 128+N.
   : > "$tmp/empty.toml"
-  (cd "$tmp" && NO_COLOR=1 timeout 30 "${runner[@]}" "$bindir/coppad" "$tmp/empty.toml" > "$tmp/coppad.log" 2>&1) || true
+  status=0
+  (cd "$tmp" && NO_COLOR=1 timeout 30 "${runner[@]}" "$bindir/coppad" "$tmp/empty.toml" > "$tmp/coppad.log" 2>&1) || status=$?
+  case $status in
+    1|124) ;;
+    *)
+      cat "$tmp/coppad.log" >&2
+      die "coppad exited with status $status; expected 1 (startup error) or 124 (timeout)"
+      ;;
+  esac
   first=$(sed -n 1p "$tmp/coppad.log")
   echo "$first"
   grep -qF "version=\"$version\"" <<<"$first" || die "coppad banner lacks version=\"$version\": $first"

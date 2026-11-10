@@ -464,6 +464,64 @@ class Workflow(unittest.TestCase):
                 self.assertNotIn("${{", body)
 
 
+SMOKE = HERE / "smoke-linux.sh"
+
+# Stands in for the Debian 11 ld-2.31.so: drop `--library-path DIR`, run the rest.
+FAKE_LOADER = '#!/bin/sh\nshift 2\nexec "$@"\n'
+FAKE_COPPA = """#!/bin/sh
+case $1 in
+  --version) printf 'coppa 0.11.0\\ncommit: 0123456789ab\\nfeatures: cpal-backend,file-backend,kiss-tnc\\n' ;;
+  loopback) echo 'PASS: Loopback test successful!' ;;
+esac
+"""
+# Prints a good banner, then exits with $FAKE_COPPAD_STATUS.
+FAKE_COPPAD = """#!/bin/sh
+if [ "$1" = --version ]; then echo 'coppad 0.11.0'; exit 0; fi
+echo 'INFO coppad: coppad - Coppa Daemon starting version="0.11.0" git_sha="0123456789ab" \
+features=ardop,cpal-backend,gpio-ptt,kiss-tnc,mdns,serial-ptt,websocket'
+exit "$FAKE_COPPAD_STATUS"
+"""
+
+
+class SmokeRun(unittest.TestCase):
+    def _smoke_run(self, coppad_status: int) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            bindir = Path(tmp) / "bin"
+            (root / "lib" / "x86_64-linux-gnu").mkdir(parents=True)
+            bindir.mkdir()
+            for path, body in (
+                (root / "lib" / "x86_64-linux-gnu" / "ld-2.31.so", FAKE_LOADER),
+                (bindir / "coppa", FAKE_COPPA),
+                (bindir / "coppad", FAKE_COPPAD),
+            ):
+                path.write_text(body, encoding="utf-8")
+                path.chmod(0o755)
+            return subprocess.run(
+                ["bash", str(SMOKE), "run", "x86_64-unknown-linux-gnu", str(bindir), str(root), "0.11.0"],
+                capture_output=True,
+                text=True,
+                env={**os.environ, "FAKE_COPPAD_STATUS": str(coppad_status)},
+                check=False,
+            )
+
+    def test_coppad_banner_run_accepts_only_expected_exit_statuses(self) -> None:
+        # 1: no sound card, startup error after the banner. 124: timeout
+        # stopped a daemon that was still running.
+        for status in (1, 124):
+            with self.subTest(status=status):
+                result = self._smoke_run(status)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("smoke run passed", result.stdout)
+        # Stopping by itself (0), a panic (101), timeout failing (125) or a
+        # crash (139) fails the run even though the banner printed.
+        for status in (0, 101, 125, 139):
+            with self.subTest(status=status):
+                result = self._smoke_run(status)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"coppad exited with status {status}", result.stderr)
+
+
 def run_blocks(lines: list[str]) -> list[tuple[int, str]]:
     """(line index, text) of every `run:` value, including block scalars."""
     blocks = []
