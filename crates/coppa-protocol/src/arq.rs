@@ -207,11 +207,11 @@ pub fn phy_following(phy_seq: u8) -> u8 {
 ///
 /// **Provisional.** Every row is `[0, 1, 3, 2]` until the per-level
 /// `session_harq` measurement (COP-168 Phase 2) replaces it. The order puts
-/// RV2 last because the plan-phase probe (BENCHMARKS.md, COP-168 section,
-/// Table 2 probe rows) found RV2 the worst first retransmission at levels
-/// 2 and 3 on Watterson Moderate and useless at level 3 on AWGN (0 of 36
-/// failed frames rescued, against 21 for a same-RV repeat), which is the
-/// COP-129 anomaly in `docs/LIMITATIONS.md`. 3GPP's `[0, 2, 3, 1]`
+/// RV2 last because the COP-168 plan-phase probe, recorded in
+/// `docs/LIMITATIONS.md`'s COP-129 bullet, found RV2 the worst first
+/// retransmission at levels 2 and 3 on Watterson Moderate and useless at
+/// level 3 on AWGN (0 of 36 failed frames rescued, against 21 for a same-RV
+/// repeat). 3GPP's `[0, 2, 3, 1]`
 /// ([`rv_for_attempt`]) would make those retransmissions worse than today's.
 pub const RV_SCHEDULE: [[u8; 4]; 10] = [[0, 1, 3, 2]; 10];
 
