@@ -57,6 +57,11 @@ inspect() {
       die "$f needs GLIBC_$highest, above the $GLIBC_FLOOR floor; build with cargo zigbuild --target $target.$GLIBC_FLOOR"
     fi
     needed=$(readelf -d "$f" | sed -n 's/.*(NEEDED).*\[\(.*\)\].*/\1/p')
+    # Checked by name first so the message says why (serialport's libudev
+    # feature must stay off), not just "not in the allowed set".
+    if grep -qx 'libudev.so.1' <<<"$needed"; then
+      die "$f links libudev.so.1; keep serialport at default-features = false"
+    fi
     for lib in $needed; do
       ok=false
       for allowed in "${ALLOWED_NEEDED[@]}"; do
@@ -64,9 +69,6 @@ inspect() {
       done
       $ok || die "$f links $lib, which is not in the allowed set: ${ALLOWED_NEEDED[*]}"
     done
-    if grep -qx 'libudev.so.1' <<<"$needed"; then
-      die "$f links libudev.so.1"
-    fi
     echo "$f: $got, highest GLIBC_$highest, NEEDED: $(echo $needed)"
   done
 }
@@ -98,11 +100,14 @@ set_runner() {
 }
 
 run() {
-  local target=$1 bindir=$2 root=$3 version=$4 out line1 line3 tmp first
+  local target=$1 bindir=$2 root=$3 version=$4 out line1 line3 first
+  # Absolute paths: the loopback and the daemon run from a scratch directory.
   root=$(cd "$root" && pwd)
+  bindir=$(cd "$bindir" && pwd)
   set_runner "$target" "$root"
   tmp=$(mktemp -d)
-  trap 'rm -rf "$tmp"' RETURN
+  # EXIT, not RETURN: die() exits, and the scratch directory goes either way.
+  trap 'rm -rf "$tmp"' EXIT
 
   out=$("${runner[@]}" "$bindir/coppa" --version)
   echo "$out"

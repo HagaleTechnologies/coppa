@@ -75,18 +75,25 @@ jobs:
             # fetch-depth 0 fetched origin/main; release.py exits 2 ("cannot
             # judge") if it is missing, so this fails closed.
             version=$(python3 tools/release/release.py version --tag "$TAG" --require-on-main origin/main)
-            if draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
-              if [ "$draft" = false ]; then
-                echo "::error::release $TAG is already published; cut a new version instead"
-                exit 1
-              fi
-              echo "::warning::a draft release for $TAG exists; publish will fail until it is deleted (docs/RELEASING.md, recovery)"
+            # A read-only token sees published releases only. Any gh error
+            # other than "release not found" stops the run (fail closed).
+            if gh release view "$TAG" --json isDraft --jq .isDraft > "$RUNNER_TEMP/view.out" 2> "$RUNNER_TEMP/view.err"; then
+              echo "::error::release $TAG already exists ($(cat "$RUNNER_TEMP/view.out")); cut a new version instead"
+              exit 1
+            elif ! grep -q 'release not found' "$RUNNER_TEMP/view.err"; then
+              cat "$RUNNER_TEMP/view.err"
+              echo "::error::could not check whether release $TAG exists"
+              exit 1
             fi
             publish=true
-            if git tag --list 'v[0-9]*' | grep -vxF "$TAG" | grep -q .; then
-              first=false
-            else
+            # "First" means no published release yet, not "no other tag": a
+            # tag whose run failed must not switch on generated notes, which
+            # would then list every merged PR.
+            published=$(gh release list --exclude-drafts --limit 1 --json tagName --jq length)
+            if [ "$published" = 0 ]; then
               first=true
+            else
+              first=false
             fi
           else
             version=$(python3 tools/release/release.py version)
@@ -448,5 +455,9 @@ jobs:
           fi
           gh release create "$TAG" dist/* --draft --verify-tag --title "coppa $VERSION" \
             --notes-file "$RUNNER_TEMP/notes.md" "${generate[@]}"
-          gh release edit "$TAG" --draft=false --latest
+          # Latest only when this is the highest v* tag, so a late patch
+          # release on an older line does not displace a newer one.
+          highest=$(git tag --list 'v[0-9]*' | sort -V | tail -n 1)
+          if [ "$highest" = "$TAG" ]; then latest=--latest; else latest=--latest=false; fi
+          gh release edit "$TAG" --draft=false "$latest"
           gh release view "$TAG"
