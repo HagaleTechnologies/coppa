@@ -755,9 +755,36 @@
           ]
         },
         {
+          "description": "Sent once after successful authentication (COP-178 adds the three\nseparate version fields). Clients must ignore fields they do not\nknow; a field missing from an older server means unknown, not zero.",
           "type": "object",
           "properties": {
+            "air_protocol_version": {
+              "description": "The air-protocol version (`docs/SPEC.md` §0.3). Absent from a\nserver older than 0.12.0: unknown, not zero.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "crate_version": {
+              "description": "The crate semver, e.g. `0.12.0`. Absent (`None`) from a server\nolder than 0.12.0: unknown, not empty.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host_api_version": {
+              "description": "The host-API version (`docs/HOST-API.md`). Absent from a server\nolder than 0.12.0: unknown, not zero (`version` carries the same\nnumber there).",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
             "server": {
+              "description": "Human-readable `coppa <crate version>`; do not parse it.",
               "type": "string"
             },
             "type": {
@@ -765,6 +792,7 @@
               "const": "hello"
             },
             "version": {
+              "description": "Legacy alias of `host_api_version`.",
               "type": "integer",
               "format": "uint32",
               "minimum": 0

@@ -8,6 +8,11 @@
 # `rv_sequence` (default [0]) lists one frame per element in on-air order: the WAV
 # holds 100 ms of silence, then each frame followed by 100 ms of silence, all with
 # the same payload and seq_num 0. A receiver decodes it only by combining frames.
+# `air_protocol_version` (COP-178) names the air-protocol version every vector
+# was encoded with and guards (docs/SPEC.md §0.3). Readers refuse a manifest
+# without it.
+
+air_protocol_version = 1
 
 [[vectors]]
 id = "L1_clean"

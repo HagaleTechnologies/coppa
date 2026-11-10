@@ -46,7 +46,22 @@ class _FakeLib:
 class LinkTests(unittest.TestCase):
     def test_version_and_abi(self):
         self.assertEqual(coppa.version(), workspace_version())
-        self.assertEqual(coppa.abi_version(), (1, 0))
+        self.assertEqual(coppa.abi_version(), (1, 1))
+
+    def test_air_protocol_and_host_api_versions(self):
+        # COP-178: separate fields, the same values TCP and WebSocket report.
+        self.assertEqual(coppa.air_protocol_version(), 1, "air protocol v1")
+        self.assertEqual(coppa.host_api_version(), 1, "host API v1")
+        self.assertIsInstance(coppa.version(), str)
+
+    def test_abi_check_rejects_abi_1_0_before_resolving_new_symbols(self):
+        # An ABI 1.0 library lacks coppa_air_protocol_version: the check must
+        # refuse it by its ABI number, before any symbol is resolved.
+        self.assertEqual(_ffi.REQUIRED_ABI, (1, 1))
+        with self.assertRaises(coppa.CoppaError) as cm:
+            _ffi.check_abi(_FakeLib(1 << 16), "/old/libcoppa_ffi.so")
+        self.assertIn("has ABI 1.0", str(cm.exception))
+        self.assertIn("x >= 1", str(cm.exception))
 
     def test_abi_check_rejects_old_library(self):
         with self.assertRaises(coppa.CoppaError) as cm:

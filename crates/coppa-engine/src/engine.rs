@@ -22,7 +22,18 @@ const COMPRESSION_MARKER: u8 = 0xFE;
 /// Coppa wire-format version this engine transmits and decodes
 /// (`docs/SPEC.md` §0.1). It keys the preamble and probe sequences and is
 /// carried in `CoppaHeader::version`, so changing it is a wire-format break.
-pub const WIRE_FORMAT_VERSION: u8 = 1;
+/// An alias of [`coppa_protocol::AIR_PROTOCOL_VERSION`] (COP-178).
+pub const WIRE_FORMAT_VERSION: u8 = coppa_protocol::AIR_PROTOCOL_VERSION;
+
+/// The host-API version (COP-178): the version of the command and event
+/// contract coppad's VARA-style TCP port, WebSocket API and the C FFI give a
+/// host application (`docs/HOST-API.md`).
+///
+/// Version 1 permits additive changes (new commands, new response fields,
+/// new functions); an incompatible change to an existing command, field or
+/// event increments it. It is independent of the crate semver, the
+/// air-protocol version ([`WIRE_FORMAT_VERSION`]) and the C ABI version.
+pub const HOST_API_VERSION: u32 = 1;
 
 /// Low tone of the standard SSB two-tone TX-level calibration signal (Hz).
 /// 700 Hz + 1900 Hz is standard amateur-radio TUNE/two-tone practice: both
@@ -1962,6 +1973,42 @@ mod tests {
     #[test]
     fn wire_format_version_is_1() {
         assert_eq!(WIRE_FORMAT_VERSION, 1);
+    }
+
+    /// COP-178: one air-protocol version stamps both the PHY header (via
+    /// the engine's wire constant) and the MAC header, and the host-API
+    /// version is its own number. Literal expectations, not a comparison
+    /// with the production constant alone.
+    #[test]
+    fn version_identities_agree_for_air_protocol_v1() {
+        assert_eq!(
+            coppa_protocol::AIR_PROTOCOL_VERSION,
+            1,
+            "air protocol v1: AIR_PROTOCOL_VERSION changed"
+        );
+        assert_eq!(
+            WIRE_FORMAT_VERSION,
+            coppa_protocol::AIR_PROTOCOL_VERSION,
+            "air protocol v1: PHY wire version must equal AIR_PROTOCOL_VERSION"
+        );
+        assert_eq!(
+            coppa_protocol::mac::MAC_VERSION,
+            coppa_protocol::AIR_PROTOCOL_VERSION,
+            "air protocol v1: MAC version must equal AIR_PROTOCOL_VERSION"
+        );
+        assert_eq!(HOST_API_VERSION, 1, "host API v1: HOST_API_VERSION changed");
+        // The MAC header carries the version in its top nibble.
+        let pdu = coppa_protocol::mac::MacPdu::new_data(
+            coppa_protocol::mac::Callsign::new("N0CALL").unwrap(),
+            coppa_protocol::mac::Callsign::new("W1AW").unwrap(),
+            0,
+            vec![0xAA],
+        );
+        assert_eq!(
+            pdu.to_bytes()[0] >> 4,
+            1,
+            "air protocol v1: MAC header version nibble"
+        );
     }
 
     /// The constant is the version the engine actually uses: a receiver built
