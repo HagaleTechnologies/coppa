@@ -59,6 +59,13 @@ cargo bench --workspace
 - Decisions: `docs/adr/` (design), `docs/DECISIONS/` (process and owner calls). Measurements: `BENCHMARKS.md`. Normative wire format: `docs/SPEC.md`.
 - `.superpowers/` and `docs/superpowers/` are local working notes and are gitignored. Never cite them from a tracked file; cite the ADR, BENCHMARKS.md section or PR instead (`docs/DECISIONS/2026-10-14-docs-architecture.md`).
 
+## Clean-room and licensing
+
+Implement from public documentation only. Never read, port or copy copyleft or
+proprietary modem code. Copying code from any source needs the owner's approval first.
+`gh pr create --body` skips the PR template, so paste its checklist into the body.
+Full rules: docs/DECISIONS/2026-11-09-clean-room-and-licensing-policy.md.
+
 ## Knowledge wiki
 
 `wiki/INDEX.md` is the map of accumulated knowledge — read it before deep

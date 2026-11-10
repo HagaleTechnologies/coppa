@@ -5,10 +5,20 @@ dashboard, a script, or your own host. It lists every TCP interface coppad serve
 one accepts, what it sends back, and where coppa's VARA-style port differs from VARA. To set up
 Pat itself, read [PAT.md](PAT.md) first; it links back here for the protocol details.
 
-coppa is **not** RF- or waveform-compatible with VARA or ARDOP. The VARA-style and ARDOP ports
-copy those modems' TCP control interfaces so existing hosts can drive coppa. Both ends of a
-radio link must run coppa, and both stations need coppad 0.3.0 or later
+coppa is **not** RF- or waveform-compatible with VARA or ARDOP. Its VARA-style and ARDOP ports
+implement the TCP command sets those hosts already speak, so existing hosts can drive coppa. The
+VARA-style port follows EA5HVK's published command list (see
+[How coppa differs from VARA](#how-coppa-differs-from-vara)). Both ends of a radio link must run
+coppa, and both stations need coppad 0.3.0 or later
 ([OPERATING.md](OPERATING.md#connected-sessions-delivery-and-buffer)).
+
+Two things let you embed coppa in a host application or implement its protocol natively. First,
+its licensing: coppa's code is MIT OR Apache-2.0, every dependency must pass the licence
+allowlist in `deny.toml`, and every contribution follows the
+[clean-room and licensing policy](DECISIONS/2026-11-09-clean-room-and-licensing-policy.md).
+Second, the [versioned wire specification](SPEC.md) (wire-format version 1, with a revision
+table) defines the waveform, FEC and protocol well enough to build an interoperable
+implementation without reading the Rust source.
 
 Every table below was checked against coppad 0.3.0 at commit `b9fdb8d` (see
 [How this was verified](#how-this-was-verified)).
