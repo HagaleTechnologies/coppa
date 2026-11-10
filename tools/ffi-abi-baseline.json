@@ -1,0 +1,5 @@
+{
+  "ref": "42372733033dcac0908fe1b05a622fb17f34a2ee",
+  "abi_version": "1.0",
+  "rationale": "COP-178 bootstrap baseline. The repository has no release tag yet, so tools/check_ffi_abi.py compares against this main commit (C ABI 1.0, crate 0.11.0, the last commit before the COP-178 compatibility contract) until a stable vX.Y.Z tag whose workspace version matches exists in the history being checked. The checker reads this commit's crates/coppa-ffi/coppa.h from git; it never copies the pull request's own declarations. Replace this only by tagging a release, not by moving the ref forward."
+}

@@ -9,8 +9,9 @@
 
 use crate::ProtocolError;
 
-/// Current MAC protocol version.
-pub const MAC_VERSION: u8 = 1;
+/// Current MAC protocol version: the air-protocol version
+/// ([`crate::AIR_PROTOCOL_VERSION`]) stamped in the MAC header.
+pub const MAC_VERSION: u8 = crate::AIR_PROTOCOL_VERSION;
 
 /// Maximum callsign length in characters.
 pub const MAX_CALLSIGN_LEN: usize = 8;

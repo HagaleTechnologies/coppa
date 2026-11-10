@@ -3,6 +3,7 @@
  *
  * Makes 9 invalid or edge-case calls, prints each result with
  * coppa_last_error(), and checks the text. Exits 1 at the first mismatch.
+ * Then prints and checks the four version numbers (COP-178).
  * Builds as C11 and as C++17 with -Wall -Wextra -Wpedantic -Werror; CI runs
  * both (.github/workflows/ci.yml).
  */
@@ -120,6 +121,40 @@ int main(void) {
     return 1;
   }
   passed++;
+
+  /* COP-178: four separate version numbers, none needing a handle. The two
+   * scalar accessors need ABI 1.1, so check the loaded library first. */
+  {
+    const char *err_before = coppa_last_error();
+    uint32_t abi = coppa_abi_version();
+    const char *crate = coppa_version();
+    int has_v11 = (abi >> 16) == 1u && (abi & 0xFFFFu) >= 1u;
+    printf("versions: crate=%s air_protocol=%u host_api=%u abi=%u.%u\n", crate ? crate : "(null)",
+           has_v11 ? (unsigned)coppa_air_protocol_version() : 0u,
+           has_v11 ? (unsigned)coppa_host_api_version() : 0u, (unsigned)(abi >> 16),
+           (unsigned)(abi & 0xFFFFu));
+    if ((abi >> 16) != COPPA_ABI_VERSION_MAJOR || (abi & 0xFFFFu) < COPPA_ABI_VERSION_MINOR ||
+        !has_v11) {
+      fprintf(stderr, "FAIL: loaded ABI %u.%u is older than this header's %u.%u\n",
+              (unsigned)(abi >> 16), (unsigned)(abi & 0xFFFFu), (unsigned)COPPA_ABI_VERSION_MAJOR,
+              (unsigned)COPPA_ABI_VERSION_MINOR);
+      return 1;
+    }
+    if (crate == NULL || crate[0] == '\0' || strchr(crate, '.') == NULL) {
+      fprintf(stderr, "FAIL: coppa_version() is not a semver string\n");
+      return 1;
+    }
+    /* Only "set": a later library may carry a newer air or host-API version
+     * without a C ABI break, and this file runs as the old-caller smoke. */
+    if (coppa_air_protocol_version() == 0 || coppa_host_api_version() == 0) {
+      fprintf(stderr, "FAIL: air protocol and host API versions must be nonzero\n");
+      return 1;
+    }
+    if (coppa_last_error() != err_before) {
+      fprintf(stderr, "FAIL: version accessors must not touch coppa_last_error\n");
+      return 1;
+    }
+  }
 
   printf("all %d checks passed\n", passed);
   return passed == 9 ? 0 : 1;

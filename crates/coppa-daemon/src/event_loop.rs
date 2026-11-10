@@ -454,6 +454,9 @@ struct PendingDisconnect {
 ///   preceded by `CANCELPENDING` when it was a pending inbound one; see
 ///   `abort_session`).
 /// - `VERSION` → a `VERSION Coppa <pkg version>` line, never `OK`.
+/// - `VERSIONINFO` (coppa extension, COP-178) → one `VERSIONINFO
+///   crate_version=… air_protocol_version=… host_api_version=…` line, never
+///   `OK`; with arguments it parses as unknown → `WRONG`.
 /// - `COMPRESSION …`, `BW500`, `BW2300`, `BW2750` → `OK`: accepted, not
 ///   implemented (matches VARA's own replies to commands Pat sends every
 ///   session).
@@ -468,6 +471,7 @@ struct PendingDisconnect {
 fn vara_reply(command: &VaraCommand, cwid: CwIdPolicy) -> Option<VaraResponse> {
     Some(match command {
         VaraCommand::Version => VaraResponse::coppa_version(),
+        VaraCommand::VersionInfo => VaraResponse::coppa_version_info(),
         VaraCommand::MyCall(call) if Callsign::new(call).is_ok() => VaraResponse::Ok,
         VaraCommand::MyCall(_) | VaraCommand::Unknown(_) => VaraResponse::Wrong,
         VaraCommand::CwId(on) if cwid_request_allowed(cwid, *on) => VaraResponse::Ok,
@@ -4496,7 +4500,8 @@ impl EventLoop {
                             );
                         }
                     }
-                    // VERSION is answered by the reply itself. COMPRESSION
+                    // VERSION and VERSIONINFO are answered by the reply
+                    // itself. COMPRESSION
                     // and BW* are accepted but not implemented.
                     // CONNECT/DISCONNECT arrive as
                     // ConnectRequest/DisconnectRequest.
@@ -12745,6 +12750,38 @@ mod tests {
             ),
             "the daemon must keep answering after a huge TUNE"
         );
+    }
+
+    /// COP-178: `VERSIONINFO` gets exactly one reply in any daemon state
+    /// (`vara_reply` does not read session state), the legacy `VERSION`
+    /// keeps its shape, and a malformed `VERSIONINFO` is one `WRONG`.
+    #[tokio::test]
+    async fn cop178_versioninfo_gets_exactly_one_reply() {
+        let (mut station, _audio_rx, mut vara_rx) = wired_station(tx_config());
+        mark_identified(&mut station);
+        send_vara_command(&mut station, "VERSIONINFO").await;
+        assert_eq!(
+            drain_vara(&mut vara_rx),
+            vec![VaraResponse::VersionInfo {
+                crate_version: env!("CARGO_PKG_VERSION").to_string(),
+                air_protocol_version: 1,
+                host_api_version: 1,
+            }],
+            "air protocol v1, host API v1"
+        );
+        send_vara_command(&mut station, "VERSION").await;
+        assert_eq!(
+            drain_vara(&mut vara_rx),
+            vec![VaraResponse::coppa_version()]
+        );
+        send_vara_command(&mut station, "VERSIONINFO extra").await;
+        assert_eq!(drain_vara(&mut vara_rx), vec![VaraResponse::Wrong]);
+        for cwid in [CwIdPolicy::Host, CwIdPolicy::Always, CwIdPolicy::Never] {
+            assert_eq!(
+                vara_reply(&VaraCommand::VersionInfo, cwid),
+                Some(VaraResponse::coppa_version_info())
+            );
+        }
     }
 
     #[cfg(feature = "websocket")]

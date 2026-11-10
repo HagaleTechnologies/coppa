@@ -89,7 +89,7 @@ fn vector(id: &str) -> &'static str {
         .iter()
         .find(|(row, _)| *row == id)
         .map(|(_, hex)| *hex)
-        .unwrap_or_else(|| panic!("no vector {id}"))
+        .unwrap_or_else(|| panic!("air protocol v1: no vector {id}"))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -116,7 +116,7 @@ fn call(s: &str) -> Callsign {
 /// §17.2: eight 6-bit codes packed MSB-first into 6 bytes; 0 pads, A-Z are
 /// 1-26, 0-9 are 27-36, '/' is 37, '-' is 38. Decoding stops at the first 0.
 fn unpack_callsign(field: &[u8]) -> String {
-    assert_eq!(field.len(), 6);
+    assert_eq!(field.len(), 6, "air protocol v1: field.len(), 6");
     let bits = field.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
     let mut text = String::new();
     for i in 0..8 {
@@ -144,7 +144,10 @@ struct MacFields<'a> {
 }
 
 fn split_mac(b: &[u8]) -> MacFields<'_> {
-    assert!(b.len() >= 14, "a MAC PDU is at least 14 bytes");
+    assert!(
+        b.len() >= 14,
+        "air protocol v1: a MAC PDU is at least 14 bytes",
+    );
     MacFields {
         version: b[0] >> 4,
         frame_type: b[0] & 0x0F,
@@ -166,7 +169,10 @@ struct TransportFields<'a> {
 }
 
 fn split_transport(b: &[u8]) -> TransportFields<'_> {
-    assert!(b.len() >= 7, "a transport PDU is at least 7 bytes");
+    assert!(
+        b.len() >= 7,
+        "air protocol v1: a transport PDU is at least 7 bytes",
+    );
     TransportFields {
         session_id: b[0] >> 4,
         transport_type: b[0] & 0x0F,
@@ -180,7 +186,11 @@ fn split_transport(b: &[u8]) -> TransportFields<'_> {
 /// §20.1 capability fields: (max_payload, fec_num, fec_den, window,
 /// compression, multi_frame_ack, reserved flag bits, mcs_index).
 fn split_caps(b: &[u8]) -> (u16, u8, u8, u8, bool, bool, u8, u8) {
-    assert_eq!(b.len(), 7, "a capabilities blob is 7 bytes");
+    assert_eq!(
+        b.len(),
+        7,
+        "air protocol v1: a capabilities blob is 7 bytes"
+    );
     (
         u16::from_be_bytes([b[0], b[1]]),
         b[2],
@@ -196,7 +206,7 @@ fn split_caps(b: &[u8]) -> (u16, u8, u8, u8, bool, bool, u8, u8) {
 /// Assert a MAC header by hand: (version 1, type, dest, src, ssid).
 fn assert_mac(id: &str, frame_type: u8, dest: &str, src: &str, ssid: u8, len: usize) {
     let b = bytes_of(id);
-    assert_eq!(b.len(), len, "{id} length");
+    assert_eq!(b.len(), len, "air protocol v1: {id} length");
     let m = split_mac(&b);
     assert_eq!(
         (
@@ -207,7 +217,7 @@ fn assert_mac(id: &str, frame_type: u8, dest: &str, src: &str, ssid: u8, len: us
             m.ssid
         ),
         (1, frame_type, dest, src, ssid),
-        "{id} MAC header"
+        "air protocol v1: {id} MAC header"
     );
 }
 
@@ -264,10 +274,14 @@ fn spec_21_rows_match_frozen_vectors() {
             .map(str::trim)
             .filter(|line| line.starts_with(&prefix))
             .collect();
-        assert_eq!(rows.len(), 1, "SPEC.md §21 must have one row for {id}");
+        assert_eq!(
+            rows.len(),
+            1,
+            "air protocol v1: SPEC.md §21 must have one row for {id}"
+        );
         assert!(
             rows[0].contains(&format!("`{expected}`")),
-            "SPEC.md §21 row {id} does not carry `{expected}`: {}",
+            "air protocol v1: SPEC.md §21 row {id} does not carry `{expected}`: {}",
             rows[0]
         );
     }
@@ -284,7 +298,7 @@ fn spec_21_rows_match_frozen_vectors() {
         if is_row_id {
             assert!(
                 VECTORS.iter().any(|(v, _)| *v == id),
-                "SPEC.md §21 row {id} has no frozen vector in this test"
+                "air protocol v1: SPEC.md §21 row {id} has no frozen vector in this test",
             );
         }
     }
@@ -303,16 +317,40 @@ fn handshake_emits_p01_to_p03_and_establishes() {
     let mut rsp = Session::new(0, b, a, 0, coppad_caps(), now);
 
     let req = ini.initiate(now).unwrap();
-    assert_eq!(hex(&req.to_bytes()), vector("P01"));
+    assert_eq!(
+        hex(&req.to_bytes()),
+        vector("P01"),
+        "air protocol v1: vector P01",
+    );
     let ack = rsp.handle_connect_req(&req.payload, now).unwrap();
-    assert_eq!(hex(&ack.to_bytes()), vector("P02"));
+    assert_eq!(
+        hex(&ack.to_bytes()),
+        vector("P02"),
+        "air protocol v1: vector P02",
+    );
     let cfm = ini.handle_connect_ack(&ack.payload, now).unwrap();
-    assert_eq!(hex(&cfm.to_bytes()), vector("P03"));
+    assert_eq!(
+        hex(&cfm.to_bytes()),
+        vector("P03"),
+        "air protocol v1: vector P03",
+    );
     rsp.handle_connect_cfm(&cfm.payload, now).unwrap();
 
-    assert_eq!(ini.state, SessionState::Established);
-    assert_eq!(rsp.state, SessionState::Established);
-    assert_eq!(ini.negotiated.as_ref().unwrap().to_bytes(), bytes_of("P23"));
+    assert_eq!(
+        ini.state,
+        SessionState::Established,
+        "air protocol v1: ini.state, SessionState::Established"
+    );
+    assert_eq!(
+        rsp.state,
+        SessionState::Established,
+        "air protocol v1: rsp.state, SessionState::Established"
+    );
+    assert_eq!(
+        ini.negotiated.as_ref().unwrap().to_bytes(),
+        bytes_of("P23"),
+        "air protocol v1: ini.negotiated.as_ref().unwrap().to_bytes(), bytes_of(\"P23\")"
+    );
 
     // Hand decode: direction, type and the 7-byte caps payload.
     assert_mac("P01", 2, "W1AW", "VK3ABC", 0, 21);
@@ -323,7 +361,7 @@ fn handshake_emits_p01_to_p03_and_establishes() {
         assert_eq!(
             split_caps(split_mac(&b).payload),
             (200, 1, 2, 8, false, true, 0, 0),
-            "{id} capabilities"
+            "air protocol v1: {id} capabilities"
         );
     }
 }
@@ -333,7 +371,11 @@ fn handshake_emits_p01_to_p03_and_establishes() {
 fn connect_req_with_ssid_5_is_p12() {
     let now = Instant::now();
     let mut ini = Session::new(0, call("VK3ABC"), call("W1AW"), 5, coppad_caps(), now);
-    assert_eq!(hex(&ini.initiate(now).unwrap().to_bytes()), vector("P12"));
+    assert_eq!(
+        hex(&ini.initiate(now).unwrap().to_bytes()),
+        vector("P12"),
+        "air protocol v1: vector P12",
+    );
     assert_mac("P12", 2, "W1AW", "VK3ABC", 5, 21);
 }
 
@@ -346,28 +388,63 @@ fn data_ack_exchange_is_p04_to_p07() {
     let mut rx = ArqRx::new(1);
 
     let data0 = session_data(&a, &b, 0, b"HELLO");
-    assert_eq!(hex(&data0), vector("P04"));
+    assert_eq!(hex(&data0), vector("P04"), "air protocol v1: vector P04");
     assert_eq!(
         rx.receive(0, b"HELLO".to_vec()),
-        vec![(0, b"HELLO".to_vec())]
+        vec![(0, b"HELLO".to_vec())],
+        "air protocol v1: rx.receive(0, b\"HELLO\".to_vec())"
     );
-    assert_eq!(rx.ack_info(), (1, 0));
-    assert_eq!(hex(&session_ack(&b, &a, &rx)), vector("P05"));
+    assert_eq!(
+        rx.ack_info(),
+        (1, 0),
+        "air protocol v1: rx.ack_info(), (1, 0)"
+    );
+    assert_eq!(
+        hex(&session_ack(&b, &a, &rx)),
+        vector("P05"),
+        "air protocol v1: vector P05",
+    );
 
     // A duplicate of seq 0 delivers nothing and is ACKed with the same bytes.
-    assert!(rx.receive(0, b"HELLO".to_vec()).is_empty());
-    assert_eq!(hex(&session_ack(&b, &a, &rx)), vector("P05"));
+    assert!(
+        rx.receive(0, b"HELLO".to_vec()).is_empty(),
+        "air protocol v1: rx.receive(0, b\"HELLO\".to_vec()).is_empty()",
+    );
+    assert_eq!(
+        hex(&session_ack(&b, &a, &rx)),
+        vector("P05"),
+        "air protocol v1: vector P05",
+    );
 
     let data1 = session_data(&a, &b, 1, b"73");
-    assert_eq!(hex(&data1), vector("P06"));
+    assert_eq!(hex(&data1), vector("P06"), "air protocol v1: vector P06");
     // A retransmission is rebuilt byte-identical (§19.4).
-    assert_eq!(session_data(&a, &b, 1, b"73"), data1);
+    assert_eq!(
+        session_data(&a, &b, 1, b"73"),
+        data1,
+        "air protocol v1: session_data(&a, &b, 1, b\"73\"), data1"
+    );
     // Out of window (seq 2 while 1 is expected, window 1) is dropped and the
     // ACK does not move.
-    assert!(rx.receive(2, b"x".to_vec()).is_empty());
-    assert_eq!(rx.ack_info(), (1, 0));
-    assert_eq!(rx.receive(1, b"73".to_vec()), vec![(1, b"73".to_vec())]);
-    assert_eq!(hex(&session_ack(&b, &a, &rx)), vector("P07"));
+    assert!(
+        rx.receive(2, b"x".to_vec()).is_empty(),
+        "air protocol v1: rx.receive(2, b\"x\".to_vec()).is_empty()",
+    );
+    assert_eq!(
+        rx.ack_info(),
+        (1, 0),
+        "air protocol v1: rx.ack_info(), (1, 0)"
+    );
+    assert_eq!(
+        rx.receive(1, b"73".to_vec()),
+        vec![(1, b"73".to_vec())],
+        "air protocol v1: rx.receive(1, b\"73\".to_vec()), vec![(1, b\"73\".to_vec())]"
+    );
+    assert_eq!(
+        hex(&session_ack(&b, &a, &rx)),
+        vector("P07"),
+        "air protocol v1: vector P07",
+    );
 
     // Hand decode.
     for (id, seq, body) in [("P04", 0u8, &b"HELLO"[..]), ("P06", 1, b"73")] {
@@ -384,7 +461,7 @@ fn data_ack_exchange_is_p04_to_p07() {
                 t.payload
             ),
             (0, 1, seq, 0, 0, body),
-            "{id} transport"
+            "air protocol v1: {id} transport"
         );
     }
     for (id, ack) in [("P05", 1u8), ("P07", 2)] {
@@ -401,7 +478,7 @@ fn data_ack_exchange_is_p04_to_p07() {
                 t.payload
             ),
             (0, 2, 0, ack, 0, &[][..]),
-            "{id} transport"
+            "air protocol v1: {id} transport"
         );
     }
 }
@@ -418,8 +495,16 @@ fn keepalive_and_disconnect_are_p08_p09() {
     let ack = rsp.handle_connect_req(&req.payload, now).unwrap();
     ini.handle_connect_ack(&ack.payload, now).unwrap();
 
-    assert_eq!(hex(&ini.keepalive(now).unwrap().to_bytes()), vector("P08"));
-    assert_eq!(hex(&ini.disconnect(now).unwrap().to_bytes()), vector("P09"));
+    assert_eq!(
+        hex(&ini.keepalive(now).unwrap().to_bytes()),
+        vector("P08"),
+        "air protocol v1: vector P08",
+    );
+    assert_eq!(
+        hex(&ini.disconnect(now).unwrap().to_bytes()),
+        vector("P09"),
+        "air protocol v1: vector P09",
+    );
     assert_mac("P08", 7, "W1AW", "VK3ABC", 0, 14);
     assert_mac("P09", 5, "W1AW", "VK3ABC", 0, 14);
 }
@@ -442,21 +527,45 @@ fn beacons_are_p10_p11() {
             0,
             sid.to_bytes().unwrap(),
         );
-        assert_eq!(hex(&pdu.to_bytes()), vector(id));
+        assert_eq!(
+            hex(&pdu.to_bytes()),
+            vector(id),
+            "air protocol v1: vector {id}",
+        );
 
         let b = bytes_of(id);
         let m = split_mac(&b);
-        assert_eq!((m.version, m.frame_type, m.ssid), (1, 6, 0));
-        assert_eq!((m.dest.as_str(), m.src.as_str()), (cs, cs));
+        assert_eq!(
+            (m.version, m.frame_type, m.ssid),
+            (1, 6, 0),
+            "air protocol v1: (m.version, m.frame_type, m.ssid), (1, 6, 0)"
+        );
+        assert_eq!(
+            (m.dest.as_str(), m.src.as_str()),
+            (cs, cs),
+            "air protocol v1: (m.dest.as_str(), m.src.as_str()), (cs, cs)"
+        );
         let p = m.payload;
         let cl = p[0] as usize;
-        assert_eq!(&p[1..1 + cl], cs.as_bytes());
+        assert_eq!(
+            &p[1..1 + cl],
+            cs.as_bytes(),
+            "air protocol v1: &p[1..1 + cl], cs.as_bytes()"
+        );
         let gl = p[1 + cl] as usize;
         let parsed_grid = (gl > 0).then(|| std::str::from_utf8(&p[2 + cl..2 + cl + gl]).unwrap());
-        assert_eq!(parsed_grid, grid);
-        assert_eq!(p[2 + cl + gl], 1, "level");
-        assert_eq!(p.len(), 3 + cl + gl);
-        assert_eq!(StationIdPayload::from_bytes(p).unwrap(), sid);
+        assert_eq!(parsed_grid, grid, "air protocol v1: parsed_grid, grid");
+        assert_eq!(p[2 + cl + gl], 1, "air protocol v1: level");
+        assert_eq!(
+            p.len(),
+            3 + cl + gl,
+            "air protocol v1: p.len(), 3 + cl + gl"
+        );
+        assert_eq!(
+            StationIdPayload::from_bytes(p).unwrap(),
+            sid,
+            "air protocol v1: StationIdPayload::from_bytes(p).unwrap(), sid"
+        );
     }
 }
 
@@ -472,15 +581,31 @@ fn sack_across_wrap_is_p13() {
     for seq in [250u8, 251, 253, 254, 0, 1] {
         rx.receive(seq, vec![seq]);
     }
-    assert_eq!(rx.ack_info(), (252, 0x0000_001b));
+    assert_eq!(
+        rx.ack_info(),
+        (252, 0x0000_001b),
+        "air protocol v1: rx.ack_info(), (252, 0x0000_001b)"
+    );
     let (ack_num, bitmap) = rx.ack_info();
     let pdu = TransportPdu::new_ack(0, ack_num, bitmap);
-    assert_eq!(hex(&pdu.to_bytes()), vector("P13"));
+    assert_eq!(
+        hex(&pdu.to_bytes()),
+        vector("P13"),
+        "air protocol v1: vector P13",
+    );
 
     let b = bytes_of("P13");
     let t = split_transport(&b);
-    assert_eq!((t.session_id, t.transport_type, t.seq), (0, 2, 0));
-    assert_eq!((t.ack, t.bitmap, t.payload.len()), (252, 0x1b, 0));
+    assert_eq!(
+        (t.session_id, t.transport_type, t.seq),
+        (0, 2, 0),
+        "air protocol v1: (t.session_id, t.transport_type, t.seq), (0, 2, 0)"
+    );
+    assert_eq!(
+        (t.ack, t.bitmap, t.payload.len()),
+        (252, 0x1b, 0),
+        "air protocol v1: (t.ack, t.bitmap, t.payload.len()), (252, 0x1b, 0)"
+    );
     // §19.2 by hand: diff = seq - ack (mod 256); 0 → no, >128 → yes,
     // 1..=31 → bit diff-1, else no.
     let by_hand = |seq: u8| {
@@ -503,34 +628,70 @@ fn sack_across_wrap_is_p13() {
         (0, true),
         (1, true),
     ] {
-        assert_eq!(parsed.is_acked(seq), acked, "is_acked({seq})");
-        assert_eq!(by_hand(seq), acked, "hand rule for {seq}");
+        assert_eq!(
+            parsed.is_acked(seq),
+            acked,
+            "air protocol v1: is_acked({seq})"
+        );
+        assert_eq!(by_hand(seq), acked, "air protocol v1: hand rule for {seq}");
     }
     // The 128 boundary: diff 128 is not acked, diff 129 is.
-    assert!(!parsed.is_acked(252u8.wrapping_add(128)));
-    assert!(parsed.is_acked(252u8.wrapping_add(129)));
+    assert!(
+        !parsed.is_acked(252u8.wrapping_add(128)),
+        "air protocol v1: !parsed.is_acked(252u8.wrapping_add(128))",
+    );
+    assert!(
+        parsed.is_acked(252u8.wrapping_add(129)),
+        "air protocol v1: parsed.is_acked(252u8.wrapping_add(129))",
+    );
     // Bit 31 is never read: diff 32 is false even with every bit set.
     let all = TransportPdu::new_ack(0, 10, u32::MAX);
-    assert!(all.is_acked(10 + 31));
-    assert!(!all.is_acked(10 + 32));
+    assert!(
+        all.is_acked(10 + 31),
+        "air protocol v1: all.is_acked(10 + 31)",
+    );
+    assert!(
+        !all.is_acked(10 + 32),
+        "air protocol v1: !all.is_acked(10 + 32)",
+    );
 }
 
 /// P14-P17: ACK with suggested level, standalone Reliable, Nak, Reset.
 #[test]
 fn transport_rows_p14_to_p17() {
     let with_rate = TransportPdu::new_ack_with_rate(0, 1, 0, 5);
-    assert_eq!(hex(&with_rate.to_bytes()), vector("P14"));
+    assert_eq!(
+        hex(&with_rate.to_bytes()),
+        vector("P14"),
+        "air protocol v1: vector P14",
+    );
     let parsed = TransportPdu::from_bytes(&bytes_of("P14")).unwrap();
-    assert_eq!(parsed.suggested_rate(), Some(5));
+    assert_eq!(
+        parsed.suggested_rate(),
+        Some(5),
+        "air protocol v1: parsed.suggested_rate(), Some(5)"
+    );
 
     let reliable = TransportPdu::new_reliable(0, 7, 0, b"HI".to_vec());
-    assert_eq!(hex(&reliable.to_bytes()), vector("P15"));
+    assert_eq!(
+        hex(&reliable.to_bytes()),
+        vector("P15"),
+        "air protocol v1: vector P15",
+    );
 
     let nak = TransportPdu::new_nak(0, 9, 5);
-    assert_eq!(hex(&nak.to_bytes()), vector("P16"));
+    assert_eq!(
+        hex(&nak.to_bytes()),
+        vector("P16"),
+        "air protocol v1: vector P16",
+    );
 
     let reset = TransportPdu::new_reset(0);
-    assert_eq!(hex(&reset.to_bytes()), vector("P17"));
+    assert_eq!(
+        hex(&reset.to_bytes()),
+        vector("P17"),
+        "air protocol v1: vector P17",
+    );
 
     for (id, ty, seq, ack, bitmap, payload) in [
         ("P14", 2u8, 0u8, 1u8, 0u32, &[5u8][..]),
@@ -550,7 +711,7 @@ fn transport_rows_p14_to_p17() {
                 t.payload
             ),
             (0, ty, seq, ack, bitmap, payload),
-            "{id}"
+            "air protocol v1: transport fields of {id}"
         );
     }
 }
@@ -572,7 +733,11 @@ fn cp_negotiation_is_p18_to_p22() {
     let seq = p_tx.send(propose.clone(), now).unwrap();
     let (an, bm) = p_rx.ack_info();
     let pdu1 = TransportPdu::new_cp_control_content(0, seq, an, bm, propose);
-    assert_eq!(hex(&pdu1.to_bytes()), vector("P18"));
+    assert_eq!(
+        hex(&pdu1.to_bytes()),
+        vector("P18"),
+        "air protocol v1: vector P18",
+    );
 
     // 2. R → P: Confirm, piggybacking R's ack of P's seq 0.
     r_rx.receive(pdu1.seq_num, pdu1.payload.clone());
@@ -584,24 +749,35 @@ fn cp_negotiation_is_p18_to_p22() {
     let seq = r_tx.send(confirm.clone(), now).unwrap();
     let (an, bm) = r_rx.ack_info();
     let pdu2 = TransportPdu::new_cp_control_content(pdu1.session_id, seq, an, bm, confirm);
-    assert_eq!(hex(&pdu2.to_bytes()), vector("P19"));
+    assert_eq!(
+        hex(&pdu2.to_bytes()),
+        vector("P19"),
+        "air protocol v1: vector P19",
+    );
     assert_eq!(
         p_tx.process_ack(pdu2.ack_num, pdu2.ack_bitmap, now),
-        vec![0]
+        vec![0],
+        "air protocol v1: p_tx.process_ack(pdu2.ack_num, pdu2.ack_bitmap, now)"
     );
 
     // 3. P → R: bare ack of the Confirm (old profile).
     p_rx.receive(pdu2.seq_num, pdu2.payload.clone());
     assert_eq!(
         CpNegotiator::on_content_received(&pdu2.payload),
-        Some(ContentAction::ApplyAsConfirmer(CpMode::ShortCp))
+        Some(ContentAction::ApplyAsConfirmer(CpMode::ShortCp)),
+        "air protocol v1: CpNegotiator::on_content_received(&pdu2.payload)"
     );
     let (an, bm) = p_rx.ack_info();
     let pdu3 = TransportPdu::new_cp_control_ack(pdu2.session_id, an, bm);
-    assert_eq!(hex(&pdu3.to_bytes()), vector("P20"));
+    assert_eq!(
+        hex(&pdu3.to_bytes()),
+        vector("P20"),
+        "air protocol v1: vector P20",
+    );
     assert_eq!(
         r_tx.process_ack(pdu3.ack_num, pdu3.ack_bitmap, now),
-        vec![0]
+        vec![0],
+        "air protocol v1: r_tx.process_ack(pdu3.ack_num, pdu3.ack_bitmap, now)"
     );
 
     // 4. R → P: Switched (new profile).
@@ -609,20 +785,30 @@ fn cp_negotiation_is_p18_to_p22() {
     let seq = r_tx.send(switched.clone(), now).unwrap();
     let (an, bm) = r_rx.ack_info();
     let pdu4 = TransportPdu::new_cp_control_content(0, seq, an, bm, switched);
-    assert_eq!(hex(&pdu4.to_bytes()), vector("P21"));
+    assert_eq!(
+        hex(&pdu4.to_bytes()),
+        vector("P21"),
+        "air protocol v1: vector P21",
+    );
 
     // 5. P → R: bare ack of Switched (new profile).
     p_rx.receive(pdu4.seq_num, pdu4.payload.clone());
     assert_eq!(
         CpNegotiator::on_content_received(&pdu4.payload),
-        Some(ContentAction::PeerSwitched(CpMode::ShortCp))
+        Some(ContentAction::PeerSwitched(CpMode::ShortCp)),
+        "air protocol v1: CpNegotiator::on_content_received(&pdu4.payload)"
     );
     let (an, bm) = p_rx.ack_info();
     let pdu5 = TransportPdu::new_cp_control_ack(0, an, bm);
-    assert_eq!(hex(&pdu5.to_bytes()), vector("P22"));
+    assert_eq!(
+        hex(&pdu5.to_bytes()),
+        vector("P22"),
+        "air protocol v1: vector P22",
+    );
     assert_eq!(
         r_tx.process_ack(pdu5.ack_num, pdu5.ack_bitmap, now),
-        vec![1]
+        vec![1],
+        "air protocol v1: r_tx.process_ack(pdu5.ack_num, pdu5.ack_bitmap, now)"
     );
 
     // Hand decode: (seq, ack, [kind, mode]) per row, all type 5, bitmap 0.
@@ -645,27 +831,45 @@ fn cp_negotiation_is_p18_to_p22() {
                 t.payload
             ),
             (0, 5, seq, ack, 0, payload),
-            "{id}"
+            "air protocol v1: transport fields of {id}"
         );
     }
     // A mode byte other than 0x01 is LongCp; any non-2-byte payload is ignored.
     assert_eq!(
         CpNegotiator::on_content_received(&[0x01, 0x7f]),
-        Some(ContentAction::SendConfirm(vec![0x02, 0x00]))
+        Some(ContentAction::SendConfirm(vec![0x02, 0x00])),
+        "air protocol v1: CpNegotiator::on_content_received(&[0x01, 0x7f])"
     );
-    assert_eq!(CpNegotiator::on_content_received(&[0x01]), None);
-    assert_eq!(CpNegotiator::on_content_received(&[0x04, 0x01]), None);
+    assert_eq!(
+        CpNegotiator::on_content_received(&[0x01]),
+        None,
+        "air protocol v1: CpNegotiator::on_content_received(&[0x01]), None"
+    );
+    assert_eq!(
+        CpNegotiator::on_content_received(&[0x04, 0x01]),
+        None,
+        "air protocol v1: CpNegotiator::on_content_received(&[0x04, 0x01]), None"
+    );
 }
 
 // ── P23-P27: capabilities and negotiation ──
 
 #[test]
 fn capabilities_are_p23_to_p27() {
-    assert_eq!(hex(&coppad_caps().to_bytes()), vector("P23"));
-    assert_eq!(hex(&LinkCapabilities::default().to_bytes()), vector("P24"));
+    assert_eq!(
+        hex(&coppad_caps().to_bytes()),
+        vector("P23"),
+        "air protocol v1: vector P23",
+    );
+    assert_eq!(
+        hex(&LinkCapabilities::default().to_bytes()),
+        vector("P24"),
+        "air protocol v1: vector P24",
+    );
     assert_eq!(
         split_caps(&bytes_of("P24")),
-        (200, 1, 2, 8, false, false, 0, 0)
+        (200, 1, 2, 8, false, false, 0, 0),
+        "air protocol v1: split_caps(&bytes_of(\"P24\"))"
     );
 
     let a = LinkCapabilities {
@@ -694,17 +898,35 @@ fn capabilities_are_p23_to_p27() {
         windowed_arq: false,
         mcs_index: 3,
     };
-    assert_eq!(hex(&a.to_bytes()), vector("P25"));
-    assert_eq!(hex(&b.to_bytes()), vector("P26"));
-    assert_eq!(hex(&a.negotiate(&b).to_bytes()), vector("P27"));
-    assert_eq!(hex(&b.negotiate(&a).to_bytes()), vector("P27"));
+    assert_eq!(
+        hex(&a.to_bytes()),
+        vector("P25"),
+        "air protocol v1: vector P25",
+    );
+    assert_eq!(
+        hex(&b.to_bytes()),
+        vector("P26"),
+        "air protocol v1: vector P26",
+    );
+    assert_eq!(
+        hex(&a.negotiate(&b).to_bytes()),
+        vector("P27"),
+        "air protocol v1: vector P27",
+    );
+    assert_eq!(
+        hex(&b.negotiate(&a).to_bytes()),
+        vector("P27"),
+        "air protocol v1: vector P27",
+    );
     assert_eq!(
         split_caps(&bytes_of("P25")),
-        (200, 3, 4, 8, true, true, 0, 5)
+        (200, 3, 4, 8, true, true, 0, 5),
+        "air protocol v1: split_caps(&bytes_of(\"P25\"))"
     );
     assert_eq!(
         split_caps(&bytes_of("P27")),
-        (120, 1, 2, 4, false, true, 0, 3)
+        (120, 1, 2, 4, false, true, 0, 3),
+        "air protocol v1: split_caps(&bytes_of(\"P27\"))"
     );
 
     // Reserved flag bits (6–7; bits 2–3 are the outer-code capability of
@@ -716,7 +938,8 @@ fn capabilities_are_p23_to_p27() {
     lenient.push(0xAA);
     assert_eq!(
         LinkCapabilities::from_bytes(&lenient).unwrap(),
-        coppad_caps()
+        coppad_caps(),
+        "air protocol v1: LinkCapabilities::from_bytes(&lenient).unwrap()"
     );
     let mut chat = bytes_of("P23");
     chat[5] |= 0x10;
@@ -725,12 +948,16 @@ fn capabilities_are_p23_to_p27() {
         LinkCapabilities {
             app_messages: true,
             ..coppad_caps()
-        }
+        },
+        "air protocol v1: LinkCapabilities::from_bytes(&chat).unwrap()"
     );
-    assert!(matches!(
-        LinkCapabilities::from_bytes(&bytes_of("P23")[..6]),
-        Err(ProtocolError::CapabilitiesTooShort { actual: 6 })
-    ));
+    assert!(
+        matches!(
+            LinkCapabilities::from_bytes(&bytes_of("P23")[..6]),
+            Err(ProtocolError::CapabilitiesTooShort { actual: 6 })
+        ),
+        "air protocol v1: a 6-byte capabilities blob is too short"
+    );
 }
 
 /// COP-168 W01: coppad's default capabilities with windowed session ARQ
@@ -767,18 +994,34 @@ fn phy_header_over_p04_is_p28() {
         payload_len: bytes_of("P04").len() as u16,
         codewords: 1,
     };
-    assert_eq!(hex(&header.to_bytes()), vector("P28"));
+    assert_eq!(
+        hex(&header.to_bytes()),
+        vector("P28"),
+        "air protocol v1: vector P28",
+    );
     let h = bytes_of("P28");
-    assert_eq!((h[0] >> 4, h[0] & 0x0F), (1, 0), "version, phy_mode");
-    assert_eq!((h[1] >> 4, h[1] & 0x0F), (0, 1), "frame_type, bandwidth");
-    assert_eq!((h[2] >> 4, h[2] & 0x0F), (0, 2), "fec_type, speed_level");
-    assert_eq!(h[3], 0, "seq_num");
+    assert_eq!(
+        (h[0] >> 4, h[0] & 0x0F),
+        (1, 0),
+        "air protocol v1: version, phy_mode"
+    );
+    assert_eq!(
+        (h[1] >> 4, h[1] & 0x0F),
+        (0, 1),
+        "air protocol v1: frame_type, bandwidth"
+    );
+    assert_eq!(
+        (h[2] >> 4, h[2] & 0x0F),
+        (0, 2),
+        "air protocol v1: fec_type, speed_level"
+    );
+    assert_eq!(h[3], 0, "air protocol v1: seq_num");
     assert_eq!(
         (u16::from(h[4]) << 4) | u16::from(h[5] >> 4),
         26,
-        "payload_len"
+        "air protocol v1: payload_len"
     );
-    assert_eq!((h[5] & 0x0F) + 1, 1, "codewords");
+    assert_eq!((h[5] & 0x0F) + 1, 1, "air protocol v1: codewords");
 }
 
 /// P29: the §15 envelope wraps the whole MAC PDU (headers included). Pins
@@ -788,9 +1031,13 @@ fn compression_envelope_over_p04_is_p29() {
     let codec = HuffmanCodec::new();
     let mut envelope = vec![0xFE];
     envelope.extend_from_slice(&lz4_compress(&codec.encode(&bytes_of("P04"))));
-    assert_eq!(hex(&envelope), vector("P29"));
+    assert_eq!(hex(&envelope), vector("P29"), "air protocol v1: vector P29");
     let inner = lz4_decompress(&envelope[1..]).unwrap();
-    assert_eq!(codec.decode(&inner), bytes_of("P04"));
+    assert_eq!(
+        codec.decode(&inner),
+        bytes_of("P04"),
+        "air protocol v1: codec.decode(&inner), bytes_of(\"P04\")"
+    );
 }
 
 // ── N01-N08: parser results the reference receiver gives ──
@@ -798,21 +1045,29 @@ fn compression_envelope_over_p04_is_p29() {
 #[test]
 fn negative_and_tolerance_rows_n01_to_n08() {
     // N01: MAC type nibble 11 is unknown; coppad then tries transport/raw.
-    assert!(matches!(
-        MacPdu::from_bytes(&bytes_of("N01")),
-        Err(ProtocolError::UnknownMacFrameType { value: 11 })
-    ));
+    assert!(
+        matches!(
+            MacPdu::from_bytes(&bytes_of("N01")),
+            Err(ProtocolError::UnknownMacFrameType { value: 11 })
+        ),
+        "air protocol v1: N01 MAC type nibble 11 is unknown"
+    );
 
     // N02: the MAC version nibble is not checked.
     let n02 = MacPdu::from_bytes(&bytes_of("N02")).unwrap();
-    assert_eq!((n02.version, n02.frame_type), (15, MacFrameType::Data));
+    assert_eq!(
+        (n02.version, n02.frame_type),
+        (15, MacFrameType::Data),
+        "air protocol v1: (n02.version, n02.frame_type), (15, MacFrameType::Data)"
+    );
 
     // N03: a bare transport Reliable that is also a valid MAC Ack (§16.3).
     let n03 = bytes_of("N03");
     let t = TransportPdu::from_bytes(&n03).unwrap();
     assert_eq!(
         (t.transport_type, t.seq_num, t.payload.as_slice()),
-        (TransportType::Reliable, 0, &b"ABCDEFGHIJ"[..])
+        (TransportType::Reliable, 0, &b"ABCDEFGHIJ"[..]),
+        "air protocol v1: (t.transport_type, t.seq_num, t.payload.as_slice())"
     );
     let m = MacPdu::from_bytes(&n03).unwrap();
     assert_eq!(
@@ -823,10 +1078,15 @@ fn negative_and_tolerance_rows_n01_to_n08() {
             m.src.as_str(),
             m.ssid
         ),
-        (0, MacFrameType::Ack, "", "PTICQDUF", 7)
+        (0, MacFrameType::Ack, "", "PTICQDUF", 7),
+        "air protocol v1: ( m.version, m.frame_type, m.dest.as_str(), m.src.as_str(), "
     );
     let hand = split_mac(&n03);
-    assert_eq!((hand.dest.as_str(), hand.src.as_str()), ("", "PTICQDUF"));
+    assert_eq!(
+        (hand.dest.as_str(), hand.src.as_str()),
+        ("", "PTICQDUF"),
+        "air protocol v1: (hand.dest.as_str(), hand.src.as_str()), (\"\", \"PTICQDUF\")"
+    );
 
     // N04: 13 bytes is shorter than the MAC header.
     assert!(matches!(
@@ -857,12 +1117,28 @@ fn negative_and_tolerance_rows_n01_to_n08() {
 
     // N08: only the SSID byte's low nibble is read.
     let n08 = MacPdu::from_bytes(&bytes_of("N08")).unwrap();
-    assert_eq!((n08.frame_type, n08.ssid), (MacFrameType::Keepalive, 3));
+    assert_eq!(
+        (n08.frame_type, n08.ssid),
+        (MacFrameType::Keepalive, 3),
+        "air protocol v1: (n08.frame_type, n08.ssid), (MacFrameType::Keepalive, 3)"
+    );
 
     // Callsign text, not SSID: "VK3ABC-1" is an 8-character callsign.
-    assert_eq!(hex(&call("VK3ABC-1").encode()), "58b78108399c");
-    assert_eq!(unpack_callsign(&unhex("58b78108399c")), "VK3ABC-1");
-    assert_eq!(hex(&Callsign::broadcast().encode()), "000000000000");
+    assert_eq!(
+        hex(&call("VK3ABC-1").encode()),
+        "58b78108399c",
+        "air protocol v1: hex(&call(\"VK3ABC-1\").encode()), \"58b78108399c\""
+    );
+    assert_eq!(
+        unpack_callsign(&unhex("58b78108399c")),
+        "VK3ABC-1",
+        "air protocol v1: unpack_callsign(&unhex(\"58b78108399c\")), \"VK3ABC-1\""
+    );
+    assert_eq!(
+        hex(&Callsign::broadcast().encode()),
+        "000000000000",
+        "air protocol v1: hex(&Callsign::broadcast().encode()), \"000000000000\""
+    );
 }
 
 // ── §16.3 and §19.5: the two documented sessionless hazards ──
@@ -875,7 +1151,7 @@ fn bare_reliable_seq_gives_a_valid_mac_dest_for_118_values() {
     let valid: Vec<u8> = (0..=255u8)
         .filter(|&seq| Callsign::decode(&[seq, 0, 0, 0, 0, 0]).is_ok())
         .collect();
-    assert_eq!(valid.len(), 118);
+    assert_eq!(valid.len(), 118, "air protocol v1: valid.len(), 118");
     assert!(valid
         .iter()
         .all(|&seq| seq <= 3 || (seq <= 155 && seq & 3 != 3)));
@@ -894,27 +1170,65 @@ fn sessionless_zero_ack_moves_send_base_from_128() {
         let mut tx = ArqTx::new(config).unwrap();
         for _ in 0..base {
             let seq = tx.send(vec![0], now).unwrap();
-            assert_eq!(tx.process_ack(seq.wrapping_add(1), 0, now), vec![seq]);
+            assert_eq!(
+                tx.process_ack(seq.wrapping_add(1), 0, now),
+                vec![seq],
+                "air protocol v1: tx.process_ack(seq.wrapping_add(1), 0, now), vec![seq]"
+            );
         }
-        assert_eq!(tx.send(vec![0], now).unwrap(), base);
-        assert_eq!((tx.send_base(), tx.in_flight()), (base, 1));
+        assert_eq!(
+            tx.send(vec![0], now).unwrap(),
+            base,
+            "air protocol v1: tx.send(vec![0], now).unwrap(), base"
+        );
+        assert_eq!(
+            (tx.send_base(), tx.in_flight()),
+            (base, 1),
+            "air protocol v1: (tx.send_base(), tx.in_flight()), (base, 1)"
+        );
         tx
     };
 
     // send_base 127: the distance to ack 0 is 129, so nothing moves.
     let mut tx = tx_with_one_in_flight(127);
-    assert!(tx.process_ack(0, 0, now).is_empty());
-    assert_eq!((tx.send_base(), tx.in_flight()), (127, 1));
+    assert!(
+        tx.process_ack(0, 0, now).is_empty(),
+        "air protocol v1: tx.process_ack(0, 0, now).is_empty()",
+    );
+    assert_eq!(
+        (tx.send_base(), tx.in_flight()),
+        (127, 1),
+        "air protocol v1: (tx.send_base(), tx.in_flight()), (127, 1)"
+    );
 
     // send_base 128 (d = 128 for `is_acked`, which says "not acked"): the
     // sender acknowledges 128 and wraps send_base to 0.
     let mut tx = tx_with_one_in_flight(128);
-    assert!(!TransportPdu::new_ack(0, 0, 0).is_acked(128));
-    assert_eq!(tx.process_ack(0, 0, now), vec![128]);
-    assert_eq!((tx.send_base(), tx.in_flight()), (0, 129));
+    assert!(
+        !TransportPdu::new_ack(0, 0, 0).is_acked(128),
+        "air protocol v1: !TransportPdu::new_ack(0, 0, 0).is_acked(128)",
+    );
+    assert_eq!(
+        tx.process_ack(0, 0, now),
+        vec![128],
+        "air protocol v1: tx.process_ack(0, 0, now), vec![128]"
+    );
+    assert_eq!(
+        (tx.send_base(), tx.in_flight()),
+        (0, 129),
+        "air protocol v1: (tx.send_base(), tx.in_flight()), (0, 129)"
+    );
 
     // The case docs/LIMITATIONS.md quotes: 130 acknowledged sends.
     let mut tx = tx_with_one_in_flight(130);
-    assert_eq!(tx.process_ack(0, 0, now), vec![130]);
-    assert_eq!((tx.send_base(), tx.in_flight()), (0, 131));
+    assert_eq!(
+        tx.process_ack(0, 0, now),
+        vec![130],
+        "air protocol v1: tx.process_ack(0, 0, now), vec![130]"
+    );
+    assert_eq!(
+        (tx.send_base(), tx.in_flight()),
+        (0, 131),
+        "air protocol v1: (tx.send_base(), tx.in_flight()), (0, 131)"
+    );
 }

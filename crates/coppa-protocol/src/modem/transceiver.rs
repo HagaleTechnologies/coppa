@@ -2923,6 +2923,24 @@ mod tests {
         }
     }
 
+    /// COP-178, SPEC §5.5 and §0.3: the per-codeword payload CRC is
+    /// CRC-32/ISO-HDLC with a 4-byte trailer. The check value is the
+    /// algorithm's published literal for "123456789", not a second
+    /// computation; the big-endian trailer order is pinned end to end by the
+    /// committed golden vectors.
+    #[test]
+    fn air_v1_payload_crc32_check_value() {
+        assert_eq!(
+            PAYLOAD_CRC32.checksum(b"123456789"),
+            0xCBF4_3926,
+            "air protocol v1: payload CRC-32/ISO-HDLC check value (§5.5)"
+        );
+        assert_eq!(
+            PAYLOAD_CRC_LEN, 4,
+            "air protocol v1: payload CRC trailer length (§5.5)"
+        );
+    }
+
     #[test]
     fn split_payload_across_codewords_matches_800_byte_level6_example() {
         // The scenario (b)/(c) fixture: 800 bytes across 7 codewords at level 6

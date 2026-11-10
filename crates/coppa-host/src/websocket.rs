@@ -239,8 +239,29 @@ pub enum WsServerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<u64>,
     },
+    /// Sent once after successful authentication (COP-178 adds the three
+    /// separate version fields). Clients must ignore fields they do not
+    /// know; a field missing from an older server means unknown, not zero.
     #[serde(rename = "hello")]
-    Hello { version: u32, server: String },
+    Hello {
+        /// Legacy alias of `host_api_version`.
+        version: u32,
+        /// Human-readable `coppa <crate version>`; do not parse it.
+        server: String,
+        /// The crate semver, e.g. `0.12.0`. Absent (`None`) from a server
+        /// older than 0.12.0: unknown, not empty.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        crate_version: Option<String>,
+        /// The air-protocol version (`docs/SPEC.md` §0.3). Absent from a
+        /// server older than 0.12.0: unknown, not zero.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        air_protocol_version: Option<u32>,
+        /// The host-API version (`docs/HOST-API.md`). Absent from a server
+        /// older than 0.12.0: unknown, not zero (`version` carries the same
+        /// number there).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_api_version: Option<u32>,
+    },
     #[serde(rename = "ack")]
     Ack { id: u64 },
     #[serde(rename = "session")]
@@ -439,8 +460,24 @@ impl ChatLog {
     }
 }
 
-/// Version of the JSON text protocol announced after authentication.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Version of the JSON text protocol announced after authentication: the
+/// host-API version ([`coppa_engine::HOST_API_VERSION`], COP-178).
+pub const PROTOCOL_VERSION: u32 = coppa_engine::HOST_API_VERSION;
+
+impl WsServerMessage {
+    /// The `hello` this build sends after authentication: the legacy
+    /// `version`/`server` pair plus the crate semver, air-protocol version
+    /// and host-API version as separate fields (COP-178).
+    pub fn hello() -> Self {
+        WsServerMessage::Hello {
+            version: PROTOCOL_VERSION,
+            server: format!("coppa {}", env!("CARGO_PKG_VERSION")),
+            crate_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            air_protocol_version: Some(u32::from(coppa_engine::AIR_PROTOCOL_VERSION)),
+            host_api_version: Some(coppa_engine::HOST_API_VERSION),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -1258,11 +1295,8 @@ impl WebSocketServer {
                     _ = async {
                 let _ = event_tx.send(HostEvent::Connected { client_id }).await;
 
-                let hello = serde_json::to_string(&WsServerMessage::Hello {
-                    version: PROTOCOL_VERSION,
-                    server: format!("coppa {}", env!("CARGO_PKG_VERSION")),
-                })
-                .expect("hello serializes");
+                let hello =
+                    serde_json::to_string(&WsServerMessage::hello()).expect("hello serializes");
                 if sink
                     .send(tokio_tungstenite::tungstenite::Message::Text(hello.into()))
                     .await
@@ -2004,6 +2038,7 @@ mod tests {
     fn golden_messages() -> Vec<&'static str> {
         vec![
             r#"{"type":"hello","version":1,"server":"coppa 0.3.0"}"#,
+            r#"{"type":"hello","version":1,"server":"coppa 0.12.0","crate_version":"0.12.0","air_protocol_version":1,"host_api_version":1}"#,
             r#"{"type":"ack","id":1}"#,
             r#"{"type":"error","message":"bad"}"#,
             r#"{"type":"error","message":"bad","id":2}"#,
@@ -2033,6 +2068,57 @@ mod tests {
             r#"{"type":"chat_history","id":4,"messages":[{"message_id":7,"direction":"out","text":"Good morning","remote_call":"W1AW","timestamp_ms":7,"state":"delivered"}]}"#,
             r#"{"type":"status","id":3,"connected":true,"remote_call":"W1AW","cp_desync_episodes":0,"chat":true}"#,
         ]
+    }
+
+    /// COP-178: the hello carries the crate semver, the air-protocol
+    /// version and the host-API version as separate fields; the legacy
+    /// `version` equals `host_api_version`.
+    #[test]
+    fn cop178_hello_carries_separate_versions() {
+        let hello = serde_json::to_value(WsServerMessage::hello()).unwrap();
+        assert_eq!(hello["type"], "hello");
+        assert_eq!(hello["crate_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(hello["air_protocol_version"], 1, "air protocol v1");
+        assert_eq!(hello["host_api_version"], 1, "host API v1");
+        assert_eq!(hello["version"], hello["host_api_version"]);
+        assert_eq!(
+            hello["server"],
+            format!("coppa {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// A client written against the pre-COP-178 hello (`version` and
+    /// `server` only) still reads the new one: the added fields are ignored.
+    #[test]
+    fn cop178_legacy_hello_reader_ignores_new_fields() {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename = "hello")]
+        struct LegacyHello {
+            version: u32,
+            server: String,
+        }
+        let json = serde_json::to_string(&WsServerMessage::hello()).unwrap();
+        let legacy: LegacyHello = serde_json::from_str(&json).unwrap();
+        assert_eq!(legacy.version, 1);
+        assert!(legacy.server.starts_with("coppa "));
+        // And the new type reads an older server's hello, with the added
+        // fields unknown rather than zero.
+        let old: WsServerMessage =
+            serde_json::from_str(r#"{"type":"hello","version":1,"server":"coppa 0.11.0"}"#)
+                .unwrap();
+        match old {
+            WsServerMessage::Hello {
+                crate_version,
+                air_protocol_version,
+                host_api_version,
+                ..
+            } => {
+                assert_eq!(crate_version, None);
+                assert_eq!(air_protocol_version, None);
+                assert_eq!(host_api_version, None);
+            }
+            other => panic!("expected hello, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2340,6 +2426,10 @@ mod integration_tests {
         let message = ws.next().await.unwrap()?;
         let hello: WsServerMessage = serde_json::from_str(message.to_text().unwrap()).unwrap();
         assert!(matches!(hello, WsServerMessage::Hello { version: 1, .. }));
+        assert_eq!(
+            serde_json::to_value(&hello).unwrap(),
+            serde_json::to_value(WsServerMessage::hello()).unwrap()
+        );
         Ok((ws, response))
     }
 
@@ -3277,6 +3367,10 @@ mod integration_tests {
         let hello: serde_json::Value = serde_json::from_str(hello.to_text().unwrap()).unwrap();
         assert_eq!(hello["type"], "hello");
         assert_eq!(hello["version"], 1);
+        // COP-178: the same values the FFI and VERSIONINFO report.
+        assert_eq!(hello["crate_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(hello["air_protocol_version"], 1);
+        assert_eq!(hello["host_api_version"], 1);
         println!("{hello}");
         for (request, kind) in [
             (r#"{"type":"mycall","callsign":"N0CALL","id":1}"#, "ack"),

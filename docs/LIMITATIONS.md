@@ -354,3 +354,27 @@ update. The re-measure and redesign of this bar is tracked as COP-183, the succe
   an ACK. This also affects the existing plain multi-codeword path. The new
   protected-mode bound covers two slow HF ACKs, but does not reserve a third
   frame for a peer ID. A lost first ACK during that prepend can cause a retry.
+
+## COP-178 versioned wire contract
+
+- There is no in-band air-protocol version negotiation and no automatic
+  downgrade. The receiver decodes exactly one air-protocol version. A peer
+  sending another version most likely just fails preamble acquisition: the
+  receiver does not reliably report the mismatch to its host. SPEC §0.3.
+- The air-protocol version 1 promise starts at crate 0.12.0. Earlier releases
+  also put `version: 1` in their headers but broke the format several times
+  (SPEC §0.1), so a pre-0.12.0 peer is not covered even though it claims
+  version 1.
+- The PHY header version field is four bits. Versions 2 to 15 remain; a
+  framing decision is needed before version 15 is allocated.
+- The per-codeword payload CRC-32 (SPEC §5.5) has a literal guard for its
+  polynomial and trailer length only. Its big-endian trailer byte order is
+  pinned end to end by the golden WAV vectors, not by a standalone test.
+- The C ABI compatibility check compares the header and exported symbols on
+  Linux x86_64 only. It does not prove the ABI on macOS, Windows or other
+  architectures. While the repository has no release tag, it compares against
+  a pinned pre-release baseline commit (C ABI 1.0) rather than a published
+  release. Until the first release tag exists, anything added after that
+  commit, including the ABI 1.1 accessors `coppa_air_protocol_version` and
+  `coppa_host_api_version`, is compared only as an addition: a later change
+  to one of them is not caught. Tagging the 0.12.0 release closes this.
