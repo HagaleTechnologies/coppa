@@ -27,7 +27,8 @@ Older releases have no entry here. Their on-air breaks are listed in
 - **C ABI version:** unchanged.
 - **Rust API, additive:** `LinkCapabilities::windowed_window`, `arq::MAX_SESSION_WINDOW`,
   `arq::windowed_phy_seq`, `arq::windowed_harq_key`, `arq::phy_following`,
-  `arq::RV_SCHEDULE`, `arq::rv_for_session_attempt` and `ArqTx::unacked`: the wire
+  `arq::RV_SCHEDULE`, `arq::rv_for_session_attempt`, `ArqTx::unacked` and the
+  `ProtocolError::WindowedArqMismatch` variant: the wire
   primitives for windowed session ARQ. The windowed sender and receiver are not built yet
   (`docs/LIMITATIONS.md`).
 

@@ -960,19 +960,21 @@ fn capabilities_are_p23_to_p27() {
     );
 }
 
-/// COP-168 W01: coppad's default capabilities with windowed session ARQ
-/// (SPEC §24): `arq_window` 4, flags 0x26 (bit 1 `multi_frame_ack`, bit 2
-/// `outer_code_rx`, bit 5 `windowed_arq`).
+/// COP-168 W01: the capabilities blob a windowed-ARQ coppad would send with
+/// a window of 4 (`arq_window` 4, flags 0x26: bit 1 `multi_frame_ack`, bit 2
+/// `outer_code_rx`, bit 5 `windowed_arq`). No release sends it yet: SPEC
+/// §20.1 keeps bit 5 at 0 on send until the windowed rules are specified, and
+/// the vector joins SPEC §21 with them. This pins how bit 5 parses today.
 #[test]
 fn capabilities_with_windowed_bit_are_w01() {
     const W01: &str = "00c80102042600";
     let caps = LinkCapabilities::from_bytes(&unhex(W01)).unwrap();
-    assert!(caps.windowed_arq, "air protocol v1 W01: flags bit 5");
-    assert_eq!(caps.arq_window, 4, "air protocol v1 W01: arq_window");
-    assert!(caps.multi_frame_ack, "air protocol v1 W01: flags bit 1");
-    assert!(caps.outer_code_rx, "air protocol v1 W01: flags bit 2");
+    assert!(caps.windowed_arq, "W01: flags bit 5");
+    assert_eq!(caps.arq_window, 4, "W01: arq_window");
+    assert!(caps.multi_frame_ack, "W01: flags bit 1");
+    assert!(caps.outer_code_rx, "W01: flags bit 2");
     assert!(!caps.outer_code_req && !caps.app_messages && !caps.compression);
-    assert_eq!(hex(&caps.to_bytes()), W01, "air protocol v1 W01 round trip");
+    assert_eq!(hex(&caps.to_bytes()), W01, "W01 round trip");
     assert_eq!(caps.windowed_window(), Some(4));
 }
 

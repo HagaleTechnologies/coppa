@@ -166,7 +166,7 @@ pub fn rv_for_attempt(attempt: u8) -> u8 {
     CYCLE[(attempt % 4) as usize]
 }
 
-/// COP-168 (SPEC §24 rule 1): the largest data-frame window a connected
+/// COP-168 (COP-168 design rule 1): the largest data-frame window a connected
 /// session may negotiate for windowed ARQ.
 ///
 /// The PHY HARQ key of a windowed session frame is 4 bits wide
@@ -176,29 +176,35 @@ pub fn rv_for_attempt(attempt: u8) -> u8 {
 /// receive window `[recv_base, recv_base + W)`.
 pub const MAX_SESSION_WINDOW: u8 = 8;
 
-/// COP-168 (SPEC §24 rule 2): the PHY header `seq_num` byte of a frame in a
+/// COP-168 (COP-168 design rule 2): the PHY header `seq_num` byte of a frame in a
 /// windowed session keying.
 ///
 /// The high nibble is `following`, the number of further frames in the same
 /// keying (saturating at 15). The low nibble is the HARQ key:
 /// `transport_seq & 0x0F` for a data frame, 0 for an ACK.
+///
+/// An ACK's key 0 equals the key of data segments 0, 16, 32 and so on, so
+/// in a session with data flowing both ways a receiver that let an ACK's
+/// RV0 frame reset key 0 would drop that data segment's soft buffer. The
+/// receiver side (not built yet) must keep ACK frames out of HARQ combining
+/// and the RV0 reset; `docs/LIMITATIONS.md` records this.
 pub fn windowed_phy_seq(following: u8, transport_seq: u8) -> u8 {
     (following.min(15) << 4) | (transport_seq & 0x0F)
 }
 
-/// COP-168 (SPEC §24 rule 5): the HARQ key of a windowed session frame, the
+/// COP-168 (COP-168 design rule 5): the HARQ key of a windowed session frame, the
 /// low nibble of its PHY `seq_num`.
 pub fn windowed_harq_key(phy_seq: u8) -> u8 {
     phy_seq & 0x0F
 }
 
-/// COP-168 (SPEC §24 rule 2): how many further frames follow this one in the
+/// COP-168 (COP-168 design rule 2): how many further frames follow this one in the
 /// same keying, the high nibble of its PHY `seq_num`.
 pub fn phy_following(phy_seq: u8) -> u8 {
     phy_seq >> 4
 }
 
-/// COP-168 (SPEC §24.4): the redundancy-version order per speed level for a
+/// COP-168 (COP-168 design, RV table): the redundancy-version order per speed level for a
 /// windowed session, indexed by level (index 0 is unused).
 ///
 /// Entry 0 of every row is RV0, the first transmission. Retransmission
@@ -215,7 +221,7 @@ pub fn phy_following(phy_seq: u8) -> u8 {
 /// ([`rv_for_attempt`]) would make those retransmissions worse than today's.
 pub const RV_SCHEDULE: [[u8; 4]; 10] = [[0, 1, 3, 2]; 10];
 
-/// COP-168 (SPEC §24 rule 4): the redundancy version for transmission
+/// COP-168 (COP-168 design rule 4): the redundancy version for transmission
 /// `attempt` of a segment at speed `level` in a windowed session.
 ///
 /// `attempt` 0 is the first transmission and is always RV0. Attempt `k >= 1`
@@ -798,7 +804,7 @@ impl ArqTx {
     /// oldest first.
     ///
     /// A selectively-acked segment is left out, so after a burst ACK this is
-    /// the set of segments the burst lost (SPEC §24 rule 7). A segment that
+    /// the set of segments the burst lost (COP-168 design rule 7). A segment that
     /// has used up its retransmit budget is still listed.
     pub fn unacked(&self) -> Vec<u8> {
         let mut out = Vec::new();

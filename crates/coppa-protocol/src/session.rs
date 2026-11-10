@@ -66,7 +66,7 @@ pub struct LinkCapabilities {
     /// Negotiated as an AND of both sides; CONNECT_CFM must carry exactly it.
     pub app_messages: bool,
     /// COP-168: windowed session ARQ with IR-HARQ retransmissions, flags
-    /// bit 5 (SPEC §24). Negotiated as an AND of both sides, like
+    /// bit 5 (SPEC §20.1). Negotiated as an AND of both sides, like
     /// `app_messages`; CONNECT_CFM must carry exactly the AND. See
     /// [`Self::windowed_window`] for when the negotiated session uses it.
     pub windowed_arq: bool,
@@ -168,7 +168,7 @@ impl LinkCapabilities {
         self.outer_code_rx && self.outer_code_req
     }
 
-    /// COP-168 (SPEC §24 rule 1): the data-frame window of a negotiated
+    /// COP-168 (COP-168 design rule 1): the data-frame window of a negotiated
     /// session that runs windowed ARQ, or `None` for stop-and-wait.
     ///
     /// Windowed ARQ is active only when both peers set flags bit 5, the
@@ -1465,7 +1465,7 @@ mod app_messages_tests {
     }
 }
 
-/// COP-168: the `windowed_arq` capability, flags bit 5 (SPEC §24).
+/// COP-168: the `windowed_arq` capability, flags bit 5 (SPEC §20.1).
 #[cfg(test)]
 mod windowed_arq_tests {
     use super::*;

@@ -2134,7 +2134,8 @@ if its `max_payload_size`, `arq_window`, `mcs_index` or FEC rate exceeds
 that bound, if it sets `compression` when the bound does not, if its
 outer-code bits differ from the bound (`OuterCodeMismatch`, §22.1), or if
 its `app_messages` bit differs from the bound (`AppMessagesMismatch`,
-§23.1). It does not check `multi_frame_ack`. On rejection the reference responder silently
+§23.1), or if its `windowed_arq` bit differs from the bound
+(`WindowedArqMismatch`, COP-168). It does not check `multi_frame_ack`. On rejection the reference responder silently
 drops the session; it sends nothing.
 
 **What the negotiated values do.** The outer-code bits enable §22 and
@@ -2144,7 +2145,8 @@ than one PHY codeword (up to `min(max_codewords_per_frame, 8)`); otherwise
 every session `Data` frame is one codeword (`event_loop.rs:2405-2421`). It
 does not change the ACK format. A receiver decodes a multi-codeword frame
 from the PHY header alone (§4.2, §9). `arq_window` does not change the
-window (§19.4). `max_payload_size`, the FEC rate and `mcs_index` are parsed
+window (§19.4); `windowed_arq` (bit 5), which would make it the session
+window, is sent as 0 until its rules are specified. `max_payload_size`, the FEC rate and `mcs_index` are parsed
 and validated but not used. `compression` is not used: each station
 compresses by its own configuration (§15.5), and coppad advertises
 `compression = false` while it may still compress. There is no capability
