@@ -13,6 +13,9 @@ pub enum ProtocolError {
     /// COP-121: CONNECT_CFM did not confirm the `app_messages` AND.
     #[error("Application-message capability does not match negotiation")]
     AppMessagesMismatch,
+    /// COP-168: CONNECT_CFM did not confirm the `windowed_arq` AND.
+    #[error("Windowed-ARQ capability does not match negotiation")]
+    WindowedArqMismatch,
     /// COP-121: a chat message has no non-whitespace character.
     #[error("Message is empty")]
     ChatEmpty,

@@ -678,6 +678,7 @@ fn capabilities_are_p23_to_p27() {
         outer_code_rx: false,
         outer_code_req: false,
         app_messages: false,
+        windowed_arq: false,
         mcs_index: 5,
     };
     let b = LinkCapabilities {
@@ -690,6 +691,7 @@ fn capabilities_are_p23_to_p27() {
         outer_code_rx: false,
         outer_code_req: false,
         app_messages: false,
+        windowed_arq: false,
         mcs_index: 3,
     };
     assert_eq!(hex(&a.to_bytes()), vector("P25"));
@@ -705,11 +707,12 @@ fn capabilities_are_p23_to_p27() {
         (120, 1, 2, 4, false, true, 0, 3)
     );
 
-    // Reserved flag bits (5–7; bits 2–3 are the outer-code capability of
-    // §22.1 and bit 4 is COP-121's `app_messages`, §23) and trailing bytes
-    // are ignored on read; fewer than 7 bytes is an error.
+    // Reserved flag bits (6–7; bits 2–3 are the outer-code capability of
+    // §22.1, bit 4 is COP-121's `app_messages`, §23, and bit 5 is COP-168's
+    // `windowed_arq`, §24) and trailing bytes are ignored on read; fewer
+    // than 7 bytes is an error.
     let mut lenient = bytes_of("P23");
-    lenient[5] |= 0xE0;
+    lenient[5] |= 0xC0;
     lenient.push(0xAA);
     assert_eq!(
         LinkCapabilities::from_bytes(&lenient).unwrap(),
@@ -728,6 +731,22 @@ fn capabilities_are_p23_to_p27() {
         LinkCapabilities::from_bytes(&bytes_of("P23")[..6]),
         Err(ProtocolError::CapabilitiesTooShort { actual: 6 })
     ));
+}
+
+/// COP-168 W01: coppad's default capabilities with windowed session ARQ
+/// (SPEC §24): `arq_window` 4, flags 0x26 (bit 1 `multi_frame_ack`, bit 2
+/// `outer_code_rx`, bit 5 `windowed_arq`).
+#[test]
+fn capabilities_with_windowed_bit_are_w01() {
+    const W01: &str = "00c80102042600";
+    let caps = LinkCapabilities::from_bytes(&unhex(W01)).unwrap();
+    assert!(caps.windowed_arq, "air protocol v1 W01: flags bit 5");
+    assert_eq!(caps.arq_window, 4, "air protocol v1 W01: arq_window");
+    assert!(caps.multi_frame_ack, "air protocol v1 W01: flags bit 1");
+    assert!(caps.outer_code_rx, "air protocol v1 W01: flags bit 2");
+    assert!(!caps.outer_code_req && !caps.app_messages && !caps.compression);
+    assert_eq!(hex(&caps.to_bytes()), W01, "air protocol v1 W01 round trip");
+    assert_eq!(caps.windowed_window(), Some(4));
 }
 
 // ── P28/P29: the layers below MAC ──

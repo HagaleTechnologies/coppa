@@ -65,6 +65,11 @@ pub struct LinkCapabilities {
     /// COP-121: carries stream 1 application records, flags bit 4, SPEC §23.
     /// Negotiated as an AND of both sides; CONNECT_CFM must carry exactly it.
     pub app_messages: bool,
+    /// COP-168: windowed session ARQ with IR-HARQ retransmissions, flags
+    /// bit 5 (SPEC §24). Negotiated as an AND of both sides, like
+    /// `app_messages`; CONNECT_CFM must carry exactly the AND. See
+    /// [`Self::windowed_window`] for when the negotiated session uses it.
+    pub windowed_arq: bool,
     /// Modulation/coding scheme index.
     pub mcs_index: u8,
 }
@@ -81,6 +86,7 @@ impl Default for LinkCapabilities {
             outer_code_rx: false,
             outer_code_req: false,
             app_messages: false,
+            windowed_arq: false,
             mcs_index: 0,
         }
     }
@@ -95,12 +101,13 @@ impl LinkCapabilities {
         out.push(self.fec_rate_num);
         out.push(self.fec_rate_den);
         out.push(self.arq_window);
-        // Flags byte (byte 5): [compression:1][multi_frame_ack:1][outer_code_rx:1][outer_code_req:1][app_messages:1][reserved:3].
+        // Flags byte (byte 5): [compression:1][multi_frame_ack:1][outer_code_rx:1][outer_code_req:1][app_messages:1][windowed_arq:1][reserved:2].
         let flags = (self.compression as u8)
             | ((self.multi_frame_ack as u8) << 1)
             | ((self.outer_code_rx as u8) << 2)
             | ((self.outer_code_req as u8) << 3)
-            | ((self.app_messages as u8) << 4);
+            | ((self.app_messages as u8) << 4)
+            | ((self.windowed_arq as u8) << 5);
         out.push(flags);
         out.push(self.mcs_index);
         out
@@ -123,6 +130,7 @@ impl LinkCapabilities {
             outer_code_rx: bytes[5] & 0x04 != 0,
             outer_code_req: bytes[5] & 0x08 != 0,
             app_messages: bytes[5] & 0x10 != 0,
+            windowed_arq: bytes[5] & 0x20 != 0,
             mcs_index: bytes[6],
         })
     }
@@ -150,6 +158,7 @@ impl LinkCapabilities {
                 && peer.outer_code_rx
                 && (self.outer_code_req || peer.outer_code_req),
             app_messages: self.app_messages && peer.app_messages,
+            windowed_arq: self.windowed_arq && peer.windowed_arq,
             mcs_index: self.mcs_index.min(peer.mcs_index),
         }
     }
@@ -157,6 +166,19 @@ impl LinkCapabilities {
     /// Whether the negotiated session uses RS(12,6) fade protection.
     pub fn outer_code_active(&self) -> bool {
         self.outer_code_rx && self.outer_code_req
+    }
+
+    /// COP-168 (SPEC §24 rule 1): the data-frame window of a negotiated
+    /// session that runs windowed ARQ, or `None` for stop-and-wait.
+    ///
+    /// Windowed ARQ is active only when both peers set flags bit 5, the
+    /// negotiated `arq_window` is 2 or more, and RS(12,6) fade protection is
+    /// off (that mode keeps one block in flight, ADR-012). The window is
+    /// capped at [`crate::arq::MAX_SESSION_WINDOW`] so the 4-bit PHY HARQ key
+    /// always has at least twice as many values as the window.
+    pub fn windowed_window(&self) -> Option<u8> {
+        (self.windowed_arq && !self.outer_code_active() && self.arq_window >= 2)
+            .then(|| self.arq_window.min(crate::arq::MAX_SESSION_WINDOW))
     }
 
     pub(crate) fn fec_rate(&self) -> f32 {
@@ -379,6 +401,12 @@ impl Session {
             // as host bytes, so CONNECT_CFM must carry exactly the AND.
             if negotiated.app_messages != expected.app_messages {
                 return Err(ProtocolError::AppMessagesMismatch);
+            }
+            // COP-168: a mismatch would make one side send bursts with
+            // packed PHY `seq_num` bytes and next-RV retransmissions that the
+            // other does not expect, so CONNECT_CFM must carry exactly the AND.
+            if negotiated.windowed_arq != expected.windowed_arq {
+                return Err(ProtocolError::WindowedArqMismatch);
             }
             // Compression must not be enabled unless both sides support it
             if negotiated.compression && !expected.compression {
@@ -644,6 +672,7 @@ mod tests {
             outer_code_rx: false,
             outer_code_req: false,
             app_messages: false,
+            windowed_arq: false,
             mcs_index: 3,
         };
         let bytes = caps.to_bytes();
@@ -680,6 +709,7 @@ mod tests {
             outer_code_rx: false,
             outer_code_req: false,
             app_messages: false,
+            windowed_arq: false,
             mcs_index: 5,
         };
         let b = LinkCapabilities {
@@ -692,6 +722,7 @@ mod tests {
             outer_code_rx: false,
             outer_code_req: false,
             app_messages: false,
+            windowed_arq: false,
             mcs_index: 3,
         };
         let negotiated = a.negotiate(&b);
@@ -1429,6 +1460,105 @@ mod app_messages_tests {
             assert_eq!(
                 responder.negotiated.as_ref().unwrap().app_messages,
                 expected.app_messages
+            );
+        }
+    }
+}
+
+/// COP-168: the `windowed_arq` capability, flags bit 5 (SPEC §24).
+#[cfg(test)]
+mod windowed_arq_tests {
+    use super::*;
+
+    fn caps(windowed_arq: bool, arq_window: u8) -> LinkCapabilities {
+        LinkCapabilities {
+            multi_frame_ack: true,
+            outer_code_rx: true,
+            windowed_arq,
+            arq_window,
+            ..LinkCapabilities::default()
+        }
+    }
+
+    #[test]
+    fn windowed_arq_is_flags_bit_5() {
+        let only = LinkCapabilities {
+            windowed_arq: true,
+            ..LinkCapabilities::default()
+        };
+        let bytes = only.to_bytes();
+        assert_eq!(bytes[5], 0x20);
+        assert_eq!(bytes[5] & 0xC0, 0, "bits 6-7 stay reserved");
+        let back = LinkCapabilities::from_bytes(&bytes).unwrap();
+        assert!(back.windowed_arq);
+        assert_eq!(back, only);
+        assert_eq!(caps(false, 4).to_bytes()[5] & 0x20, 0);
+        // The default still serializes to the pre-COP-168 bytes.
+        assert_eq!(
+            LinkCapabilities::default().to_bytes(),
+            vec![0x00, 0xc8, 0x01, 0x02, 0x08, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn windowed_arq_negotiates_as_and() {
+        for a in [false, true] {
+            for b in [false, true] {
+                let n = caps(a, 4).negotiate(&caps(b, 6));
+                assert_eq!(n.windowed_arq, a && b);
+                assert_eq!(n.arq_window, 4, "arq_window is the minimum");
+                let n = caps(b, 6).negotiate(&caps(a, 4));
+                assert_eq!(n.windowed_arq, a && b);
+                assert_eq!(n.arq_window, 4);
+            }
+        }
+    }
+
+    #[test]
+    fn windowed_window_needs_bit_5_a_window_of_2_and_no_rs() {
+        assert_eq!(caps(true, 4).windowed_window(), Some(4));
+        assert_eq!(caps(false, 4).windowed_window(), None);
+        assert_eq!(caps(true, 1).windowed_window(), None);
+        assert_eq!(caps(true, 2).windowed_window(), Some(2));
+        assert_eq!(
+            caps(true, 32).windowed_window(),
+            Some(crate::arq::MAX_SESSION_WINDOW)
+        );
+        let mut rs = caps(true, 4);
+        rs.outer_code_req = true;
+        assert!(rs.outer_code_active());
+        assert_eq!(rs.windowed_window(), None);
+    }
+
+    #[test]
+    fn cfm_with_windowed_bit_not_in_intersection_is_rejected() {
+        let now = Instant::now();
+        for (local, peer) in [(true, false), (false, true), (true, true)] {
+            let local = caps(local, 4);
+            let peer = caps(peer, 4);
+            let expected = local.negotiate(&peer);
+            let mut responder = Session::new(
+                0,
+                Callsign::new("W1AW").unwrap(),
+                Callsign::new("VK3ABC").unwrap(),
+                0,
+                local.clone(),
+                now,
+            );
+            responder.handle_connect_req(&peer.to_bytes(), now).unwrap();
+            let mut bad = expected.clone();
+            bad.windowed_arq = !expected.windowed_arq;
+            assert!(matches!(
+                responder.handle_connect_cfm(&bad.to_bytes(), now),
+                Err(ProtocolError::WindowedArqMismatch)
+            ));
+            assert_eq!(responder.state, SessionState::Accepting);
+            responder
+                .handle_connect_cfm(&expected.to_bytes(), now)
+                .unwrap();
+            assert_eq!(
+                responder.negotiated.as_ref().unwrap().windowed_arq,
+                expected.windowed_arq
             );
         }
     }
