@@ -12,9 +12,11 @@ on a Raspberry Pi 4, see
 
 ## Any systemd host
 
-The Pi guide explains each step; in brief, from a checkout with coppad built
-(`cargo build --release -p coppa-daemon --features cpal-backend` plus any PTT
-features you need):
+The Pi guide explains each step; in brief, from an unpacked release archive
+(it carries `contrib/` and `coppad.toml.example`; install `coppad` from the
+archive's top directory instead of `target/release/`) or from a checkout with
+coppad built (`cargo build --release -p coppa-daemon --features cpal-backend`
+plus any PTT features you need):
 
 ```bash
 sudo install -m 0755 target/release/coppad /usr/local/bin/

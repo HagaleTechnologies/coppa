@@ -578,6 +578,29 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:17e200875bb0c1dc97fd53d3ec8bf997bddfcc26b83b800ad47adf45bc586954",
+      "id": "release-binaries",
+      "kind": "gotcha",
+      "links": [
+        "cpal-feature-gate",
+        "phase4-field-readiness",
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/release-binaries.md",
+      "sources": [
+        ".github/workflows/release.yml",
+        "tools/release/release.py",
+        "docs/RELEASING.md"
+      ],
+      "status": "current",
+      "title": "What will bite you when building or installing coppa release binaries?",
+      "verified_commit": "4237273",
+      "verified_date": "2026-11-09",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:bb4b72d6f004630b69e6297b84d9c7edce0e4428cebd943152cb1e04a1bff18b",
       "id": "session-chat-streams",
       "kind": "gotcha",

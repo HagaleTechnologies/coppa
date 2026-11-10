@@ -32,3 +32,4 @@
 - [What will bite you about the 9600 baud G3RUH TNC?](pages/tnc-g3ruh-9600.md) — Discriminator wiring, duplicate window and fixed phases.
 - [What will bite you about session fade protection?](pages/session-fade-protection.md) — HARQ keys, delayed ACKs and the burst-duration guard.
 - [What will bite you about session chat streams?](pages/session-chat-streams.md) — Stream nibble needs app_messages; chat bytes stay out of BUFFER.
+- [What will bite you when building or installing coppa release binaries?](pages/release-binaries.md) — glibc 2.39 trap, no libudev, binstall needs @version.

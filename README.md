@@ -24,6 +24,7 @@ Open-source ham radio digital communications system written in Rust.
 | Link adaptation | Implemented, limited calibration | Measurement-driven speed selection and ACK-driven RateLoop with ARQ enabled; no model inference; performance targets remain unmet, see [BENCHMARKS.md](BENCHMARKS.md) |
 | Serial/GPIO PTT | Implemented, feature-gated | Daemon serial DTR/RTS uses `serial-ptt`; Linux GPIO (character device, `gpio:<chip>:<line>`; deprecated sysfs `gpio:<number>`) uses `gpio-ptt` |
 | CM108 PTT | Implemented, no feature flag | Daemon CM108/CM119 HID GPIO PTT (AIOC, Digirig Lite, DRA) through a Linux `/dev/hidraw` node (`ptt_method = "cm108:<hidraw-path>[:<gpio>]"`); tested only against a regular-file stand-in |
+| Release binaries | Provided, not hardware-verified | Linux x86-64/aarch64/armv7 (glibc 2.31+), Windows x86-64, macOS 11+ universal; see [Install](#install) |
 | Service files | Provided, not hardware-verified | systemd unit and macOS launchd agent in `contrib/`; Raspberry Pi 4 install guide in [docs/tutorials/raspberry-pi-install.md](docs/tutorials/raspberry-pi-install.md) |
 | KISS datagrams (HF OFDM) | Implemented | Reticulum TCP KISS on port 8100; see [docs/RETICULUM.md](docs/RETICULUM.md) |
 | KISS TNC (AFSK 1200) | Implemented, bring-up and testing only | Needs the kiss-tnc and cpal-backend features; not a Direwolf replacement; see [docs/TNC.md](docs/TNC.md) |
@@ -42,7 +43,63 @@ Open-source ham radio digital communications system written in Rust.
 - Python binding (`bindings/python`, not published) that drives a connected link over audio samples.
 - Deterministic link adaptation and spectrum sensing. Short-CP recommendation and negotiation are opt-in; IR-HARQ remains an unwired codec primitive.
 
-## Quick Start
+## Install
+
+Prebuilt `coppa` (the CLI) and `coppad` (the daemon) binaries are on the
+[Releases page](https://github.com/HagaleTechnologies/coppa/releases). coppa
+is pre-1.0 and simulation-validated only: there has been no over-the-air
+validation yet (COP-20). Each archive holds both binaries, the licences,
+`coppad.toml.example` and the service files from `contrib/`.
+
+| Platform | File |
+|---|---|
+| Linux x86-64, glibc 2.31 or later | `coppa-0.11.0-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64, e.g. Raspberry Pi 3/4/5 on a 64-bit OS | `coppa-0.11.0-aarch64-unknown-linux-gnu.tar.gz` |
+| Linux armv7, e.g. Raspberry Pi 2/3/4 on a 32-bit OS | `coppa-0.11.0-armv7-unknown-linux-gnueabihf.tar.gz` |
+| Windows 10 or later, x86-64 | `coppa-0.11.0-x86_64-pc-windows-msvc.zip` |
+| macOS 11 or later, Apple silicon and Intel | `coppa-0.11.0-universal-apple-darwin.tar.gz` |
+
+`coppad` is built with `cpal-backend`, `websocket`, `serial-ptt`, `gpio-ptt`,
+`kiss-tnc`, `ardop` and `mdns`; `coppa` with `cpal-backend` and `kiss-tnc`.
+GPIO PTT works on Linux only. The Linux binaries need `libasound.so.2`
+(package `libasound2`, or `libasound2t64` on newer distributions) and do not
+run on ARMv6 boards (Raspberry Pi 1, Zero, Zero W).
+
+Linux (pick `t` for your machine; on a Raspberry Pi, see the
+[Pi guide](docs/tutorials/raspberry-pi-install.md)):
+
+```bash
+v=0.11.0; t=x86_64-unknown-linux-gnu
+curl -fLO https://github.com/HagaleTechnologies/coppa/releases/download/v$v/coppa-$v-$t.tar.gz
+curl -fLO https://github.com/HagaleTechnologies/coppa/releases/download/v$v/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+tar -xzf coppa-$v-$t.tar.gz
+sudo install -m 0755 coppa-$v-$t/coppa coppa-$v-$t/coppad /usr/local/bin/
+coppa --version
+```
+
+macOS: the same steps with `t=universal-apple-darwin` (use `shasum -a 256 -c
+SHA256SUMS --ignore-missing` to check the download). The binaries are not
+signed; if macOS refuses to open one you downloaded with a browser, run
+`xattr -d com.apple.quarantine coppa coppad`.
+
+Windows: download the `.zip`, extract it, and run `coppa.exe --version` from
+PowerShell. The binaries are not signed, so Windows may show a SmartScreen
+warning.
+
+With [cargo-binstall](https://github.com/cargo-bins/cargo-binstall). The
+crates are not on crates.io, so name the version, one crate per command:
+
+```bash
+cargo binstall --git https://github.com/HagaleTechnologies/coppa coppa-cli@0.11.0
+cargo binstall --git https://github.com/HagaleTechnologies/coppa coppa-daemon@0.11.0
+```
+
+Each release's assets can be checked with `gh attestation verify <file> --repo
+HagaleTechnologies/coppa`. Maintainers cut releases with
+[docs/RELEASING.md](docs/RELEASING.md).
+
+## Build from source
 
 ```bash
 cargo build --workspace
